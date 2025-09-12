@@ -635,9 +635,13 @@ def _ragged_paged_attention_kernel(
         )
 
         # Then reshape for strided access: [bkv_sz * num_heads_interleaved, head_dim]
-        kv_fused_ref = kv_fused_reshaped.bitcast(jnp.uint32).reshape(
-            bkv_sz_actual * (num_kv_heads_packed * kv_packing_actual), head_dim_actual
+        # Shape: (bkv_sz_actual, num_kv_heads_packed * kv_packing_actual, head_dim_actual)
+        # -> (bkv_sz_actual * num_kv_heads_packed * kv_packing_actual, head_dim_actual)
+        flattened_shape = (
+            bkv_sz_actual * num_kv_heads_packed * kv_packing_actual,
+            head_dim_actual,
         )
+        kv_fused_ref = kv_fused_reshaped.bitcast(jnp.uint32).reshape(flattened_shape)
 
         def _mask_kv_uint32(k_uint32, v_uint32):
             """Apply masking to uint32 KV data"""
