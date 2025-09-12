@@ -615,33 +615,27 @@ def _ragged_paged_attention_kernel(
         return vec
 
     def strided_load_bkv_fused(bkv_sem_idx, start, step, *, bkv_bitmask):
-        """Head interleaving strided load for fused KV: [K1,V1,K2,V2,...]"""
-        assert start % kv_packing == 0
-        assert step % kv_packing == 0
-        start //= kv_packing
-        step //= kv_packing
-
-        # Fused KV reference with head interleaving - simplify by working directly with original format
+        """New version: direct K,V extraction for new data layout"""
         kv_fused_buf = bkv_fused_x2_ref.at[
             bkv_sem_idx
-        ]  # [bkv_sz, num_kv_heads_interleaved//kv_packing, kv_packing, head_dim]
+        ]  # [bkv_sz, num_kv_heads_packed, kv_packing, head_dim]
 
-        # New version reshape logic - different from old version due to different data layout
         bkv_sz_actual, num_kv_heads_packed, kv_packing_actual, head_dim_actual = (
             kv_fused_buf.shape
         )
+
+        # CORRECTED understanding: 回到接近老版本的逻辑，但修正数据布局理解
+        # (2048, 2, 1, 128) → (2048, 2, 128) → flatten
         kv_fused_reshaped = kv_fused_buf.reshape(
             bkv_sz_actual, num_kv_heads_packed * kv_packing_actual, head_dim_actual
         )
-        # Simply flatten to 2D for strided access: (2048, 2, 128) -> (4096, 128)
-        # Use explicit dimensions - Pallas VMEM doesn't support -1
-        flattened_size = bkv_sz_actual * num_kv_heads_packed * kv_packing_actual
+        # Flatten for strided access: (2048, 2, 128) → (4096, 128)
         kv_fused_ref = kv_fused_reshaped.bitcast(jnp.uint32).reshape(
-            flattened_size, head_dim_actual
+            bkv_sz_actual * num_kv_heads_packed * kv_packing_actual, head_dim_actual
         )
 
         def _mask_kv_uint32(k_uint32, v_uint32):
-            """Apply masking to uint32 KV data - follow old version pattern"""
+            """Apply masking to uint32 KV data"""
             if bkv_bitmask is not None:
                 k_uint32 = k_uint32 & bkv_bitmask
                 v_uint32 = v_uint32 & bkv_bitmask
@@ -650,45 +644,38 @@ def _ragged_paged_attention_kernel(
             v = pltpu.bitcast(v_uint32, jnp.float32).astype(kv_dtype)
             return (k, v)
 
-        if kv_packing == 1:
-            # Head interleaving: K at even indices, V at odd indices - follow old version pattern
-            k = strided_load(
-                kv_fused_ref, start, step, dtype=kv_dtype
-            )  # K heads: start
-            v = strided_load(
-                kv_fused_ref, start + 1, step, dtype=kv_dtype
-            )  # V heads: start + 1
+        if kv_packing_actual == 1:
+            # 简单情况：直接 strided load
+            k = strided_load(kv_fused_ref, start, step, dtype=kv_dtype)
+            v = strided_load(kv_fused_ref, start + 1, step, dtype=kv_dtype)
 
-            # Apply masking if needed
             if bkv_bitmask is not None:
                 k_uint32 = pltpu.bitcast(k.astype(jnp.float32), jnp.uint32)
                 v_uint32 = pltpu.bitcast(v.astype(jnp.float32), jnp.uint32)
                 return [_mask_kv_uint32(k_uint32, v_uint32)]
             else:
                 return [(k, v)]
+        else:
+            # Complex packing case
+            kv = strided_load(kv_fused_ref, start, step)  # uint32
+            bitwidth = 32 // kv_packing_actual
+            mask = (1 << bitwidth) - 1
+            lst = []
 
-        # Complex bit packing case - operate at uint32 level
-        kv = strided_load(kv_fused_ref, start, step)  # Load as uint32
-        bitwidth = 32 // kv_packing
-        mask = (1 << bitwidth) - 1  # Create mask for extracting bits
-        lst = []
+            for i in range(0, kv_packing_actual, 2):
+                k_bits = (kv >> (i * bitwidth)) & mask
+                v_bits = (kv >> ((i + 1) * bitwidth)) & mask
 
-        for i in range(0, kv_packing, 2):  # Process K,V pairs
-            # Extract K and V bits from head interleaving
-            k_bits = (kv >> (i * bitwidth)) & mask
-            v_bits = (kv >> ((i + 1) * bitwidth)) & mask
+                if kv_dtype == jnp.bfloat16:
+                    k_uint32 = k_bits << 16
+                    v_uint32 = v_bits << 16
+                else:
+                    k_uint32 = k_bits
+                    v_uint32 = v_bits
 
-            # Align bits to correct position (for bfloat16, high 16 bits are valid)
-            if kv_dtype == jnp.bfloat16:
-                k_uint32 = k_bits << 16  # Move to high 16 bits
-                v_uint32 = v_bits << 16  # Move to high 16 bits
-            else:
-                k_uint32 = k_bits
-                v_uint32 = v_bits
+                lst.append(_mask_kv_uint32(k_uint32, v_uint32))
 
-            lst.append(_mask_kv_uint32(k_uint32, v_uint32))
-
-        return lst
+            return lst
 
     def broadcast_minor(src, shape):
         if src.shape == shape:
