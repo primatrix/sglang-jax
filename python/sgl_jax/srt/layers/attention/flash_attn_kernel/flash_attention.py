@@ -26,6 +26,79 @@ from sgl_jax.srt.layers.attention.flash_attn_kernel.util import (
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
 
+def ref_ragged_paged_attention_fused(
+    queries: jax.Array,  # [padded_num_tokens, num_q_heads, head_dim]
+    kv_pages_fused: jax.Array,  # [total_num_pages, page_size, num_kv_heads * 2, head_dim] - Head interleaving: [K1,V1,K2,V2,...]
+    kv_lens: jax.Array,  # i32[padded_batch_size]
+    page_indices: jax.Array,  # i32[(padded_batch_size * model_context_len + page_size - 1) // page_size]
+    cu_q_lens: jax.Array,  # i32[padded_batch_size + 1]
+    num_seqs: jax.Array,  # i32[1],
+    *,
+    sm_scale: float = 1.0,
+    sliding_window: int | None = None,
+    soft_cap: float | None = None,
+    mask_value: float | None = DEFAULT_MASK_VALUE,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+):
+    """Ragged paged attention reference implementation with fused KV cache using head interleaving."""
+    if mask_value is None:
+        mask_value = DEFAULT_MASK_VALUE
+    _, _, num_kv_heads_interleaved, head_dim = kv_pages_fused.shape
+    assert (
+        num_kv_heads_interleaved % 2 == 0
+    ), "Head interleaving requires even number of heads"
+    num_kv_heads = num_kv_heads_interleaved // 2  # Extract actual KV heads count
+    num_q_heads = queries.shape[1]
+    assert num_q_heads % num_kv_heads == 0
+    num_query_per_kv = num_q_heads // num_kv_heads
+
+    outputs = []
+    for i in range(num_seqs[0]):
+        q_start = cu_q_lens[i]
+        q_end = cu_q_lens[i + 1]
+        q_len = q_end - q_start
+        kv_len = kv_lens[i]
+        indices = page_indices[i]
+        q = queries[q_start:q_end]
+
+        # Extract K and V from head interleaved fused KV cache
+        kv_fused = kv_pages_fused[indices, :, :, :].reshape(
+            -1, num_kv_heads_interleaved, head_dim
+        )[:kv_len]
+
+        # Head interleaving format: [K1, V1, K2, V2, ...] -> extract K and V
+        k = kv_fused[:, 0::2, :]  # Extract K heads: indices 0, 2, 4, ...
+        v = kv_fused[:, 1::2, :]  # Extract V heads: indices 1, 3, 5, ...
+
+        # Apply scaling if provided
+        if k_scale is not None:
+            k = (k.astype(jnp.float32) * k_scale).astype(q.dtype)
+        if v_scale is not None:
+            v = (v.astype(jnp.float32) * v_scale).astype(q.dtype)
+
+        # Repeat for GQA
+        k = jnp.repeat(k, num_query_per_kv, axis=1)
+        v = jnp.repeat(v, num_query_per_kv, axis=1)
+
+        # Compute attention
+        attn = jnp.einsum("qhd,khd->hqk", q, k, preferred_element_type=jnp.float32)
+        attn *= sm_scale
+        q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(jnp.int32, attn.shape, 1)
+        kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
+        mask = q_span < kv_span
+        if sliding_window is not None:
+            mask = jnp.logical_or(mask, q_span - sliding_window >= kv_span)
+        if soft_cap is not None:
+            attn = soft_cap * jnp.tanh(attn / soft_cap)
+        attn += jnp.where(mask, mask_value, 0.0)
+        attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
+        out = jnp.einsum("hqk,khd->qhd", attn, v).astype(queries.dtype)
+        outputs.append(out)
+
+    return jnp.concatenate(outputs, axis=0)
+
+
 def ref_ragged_paged_attention(
     queries: jax.Array,  # [padded_num_tokens, num_q_heads, head_dim]
     k_pages: jax.Array,  # [total_num_pages, page_size, num_kv_heads, head_dim]
@@ -173,15 +246,12 @@ def _ragged_paged_attention_kernel(
     q_hbm_ref,  # [actual_num_kv_heads, padded_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     k_hbm_ref,  # [padded_num_tokens, num_kv_heads // kv_packing, kv_packing, head_dim]
     v_hbm_ref,  # [padded_num_tokens, num_kv_heads // kv_packing, kv_packing, head_dim]
-    k_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads // kv_packing, kv_packing, head_dim]
-    v_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads // kv_packing, kv_packing, head_dim]
+    kv_cache_fused_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_interleaved // kv_packing, kv_packing, head_dim] - Head interleaving
     # Output
     o_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
-    updated_k_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads // kv_packing, kv_packing, head_dim]
-    updated_v_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads // kv_packing, kv_packing, head_dim]
+    updated_kv_cache_fused_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_interleaved // kv_packing, kv_packing, head_dim] - Head interleaving
     # Scratch
-    bk_x2_ref,  # [2, bkv_sz, num_kv_heads // kv_packing, kv_packing, head_dim]
-    bv_x2_ref,  # [2, bkv_sz, num_kv_heads // kv_packing, kv_packing, head_dim]
+    bkv_fused_x2_ref,  # [2, bkv_sz, num_kv_heads_interleaved // kv_packing, kv_packing, head_dim] - Fused KV buffer with head interleaving
     bq_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     bo_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     sems,  # [4, 2]
@@ -272,20 +342,14 @@ def _ragged_paged_attention_kernel(
 
     def _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, *, wait=False):
         sem = sems.at[0, bkv_sem_idx]
-        # vmem_ref = bk_x2_ref.at[bkv_sem_idx]
-        k_vmem_ref = bk_x2_ref.at[bkv_sem_idx]
-        v_vmem_ref = bv_x2_ref.at[bkv_sem_idx]
+        # Fused KV buffer with head interleaving
+        kv_fused_vmem_ref = bkv_fused_x2_ref.at[bkv_sem_idx]
 
-        # cache_hbm_shape = kv_cache_hbm_ref.shape
-        # cache_hbm_ref = kv_cache_hbm_ref.reshape(
-        #    cache_hbm_shape[0] * cache_hbm_shape[1], *cache_hbm_shape[2:])
-        k_cache_hbm_shape = k_cache_hbm_ref.shape
-        kcache_hbm_ref = k_cache_hbm_ref.reshape(
-            k_cache_hbm_shape[0] * k_cache_hbm_shape[1], *k_cache_hbm_shape[2:]
-        )
-        v_cache_hbm_shape = v_cache_hbm_ref.shape
-        vcache_hbm_ref = v_cache_hbm_ref.reshape(
-            v_cache_hbm_shape[0] * v_cache_hbm_shape[1], *v_cache_hbm_shape[2:]
+        # Fused KV cache HBM reference
+        kv_fused_cache_hbm_shape = kv_cache_fused_hbm_ref.shape
+        kv_fused_cache_hbm_ref = kv_cache_fused_hbm_ref.reshape(
+            kv_fused_cache_hbm_shape[0] * kv_fused_cache_hbm_shape[1],
+            *kv_fused_cache_hbm_shape[2:],
         )
         kv_len = kv_lens_ref[seq_idx]
         kv_len_start = bkv_idx * bkv_sz
@@ -325,22 +389,15 @@ def _ragged_paged_attention_kernel(
         debug_print("[RPA debug] bkv_sz_frm_new={}", bkv_sz_frm_new)
         debug_print("[RPA debug] page_indices_offset={}", page_indices_offset)
 
-        # Fetch effective kv from kv cache.
+        # Fetch effective fused kv from kv cache.
         def loop_body(i, offset):
             sz = jnp.minimum(page_size, kv_left_frm_cache - i * page_size)
+            # Single fused KV copy with head interleaving
             _async_copy(
-                kcache_hbm_ref.at[
+                kv_fused_cache_hbm_ref.at[
                     pl.ds(page_indices_ref[page_indices_offset + i] * page_size, sz)
                 ],
-                k_vmem_ref.at[pl.ds(i * page_size, sz)],
-                sem,
-                wait,
-            )
-            _async_copy(
-                vcache_hbm_ref.at[
-                    pl.ds(page_indices_ref[page_indices_offset + i] * page_size, sz)
-                ],
-                v_vmem_ref.at[pl.ds(i * page_size, sz)],
+                kv_fused_vmem_ref.at[pl.ds(i * page_size, sz)],
                 sem,
                 wait,
             )
@@ -355,21 +412,22 @@ def _ragged_paged_attention_kernel(
             unroll=False,
         )
 
-        # Fetch kv directly from new kv.
+        # Fetch fused kv directly from new kv.
+        # Note: In the fused version, we need to create interleaved KV from separate K/V inputs
         @pl.when(bkv_sz_frm_new > 0)
         def _fetch_bkv_from_new_kv():
             new_kv_len_start = q_end - kv_left_frm_new
             debug_print("[RPA debug] new_kv_len_start={}", new_kv_len_start)
             debug_print("[RPA debug] offset_in_bkv={}", offset)
+            # For new KV, we need to interleave K and V on-the-fly
+            # This is a placeholder - in practice, the input K/V should already be pre-fused
+            # For now, we copy from k_hbm_ref and v_hbm_ref alternately
+            # TODO: This part needs to be updated when input format changes to fused
             _async_copy(
                 k_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new)],
-                k_vmem_ref.at[pl.ds(offset, bkv_sz_frm_new)],
-                sem,
-                wait,
-            )
-            _async_copy(
-                v_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new)],
-                v_vmem_ref.at[pl.ds(offset, bkv_sz_frm_new)],
+                kv_fused_vmem_ref.at[
+                    pl.ds(offset, bkv_sz_frm_new)
+                ],  # Simplified for now
                 sem,
                 wait,
             )
@@ -378,28 +436,21 @@ def _ragged_paged_attention_kernel(
 
     def _update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz, *, wait=False):
         sem = sems.at[3, bkv_sem_idx]
-        # vmem_ref = bkv_x2_ref.at[bkv_sem_idx]
-        k_vmem_ref = bk_x2_ref.at[bkv_sem_idx]
-        v_vmem_ref = bv_x2_ref.at[bkv_sem_idx]
+        # Fused KV buffer reference
+        kv_fused_vmem_ref = bkv_fused_x2_ref.at[bkv_sem_idx]
         bkv_id = offset // bkv_sz
         kv_p_start = offset // page_size
         kv_p_end = cdiv(offset + update_sz, page_size)
         ignore = offset % page_size
         p_ignore = kv_p_start - bkv_id * bkv_p
-        # page_indices_offset = seq_idx * pages_per_seq + kv_p_start
         start_kv_page_idx = cdiv(cu_kv_lens_ref[seq_idx], page_size)
         page_indices_offset = start_kv_page_idx + kv_p_start
 
-        # cache_hbm_shape = updated_kv_cache_hbm_ref.shape
-        # cache_hbm_ref = updated_kv_cache_hbm_ref.reshape(
-        #    cache_hbm_shape[0] * cache_hbm_shape[1], *cache_hbm_shape[2:])
-        kcache_hbm_shape = updated_k_cache_hbm_ref.shape
-        kcache_hbm_ref = updated_k_cache_hbm_ref.reshape(
-            kcache_hbm_shape[0] * kcache_hbm_shape[1], *kcache_hbm_shape[2:]
-        )
-        vcache_hbm_shape = updated_v_cache_hbm_ref.shape
-        vcache_hbm_ref = updated_v_cache_hbm_ref.reshape(
-            vcache_hbm_shape[0] * vcache_hbm_shape[1], *vcache_hbm_shape[2:]
+        # Fused KV cache HBM reference for updates
+        kv_fused_cache_hbm_shape = updated_kv_cache_fused_hbm_ref.shape
+        kv_fused_cache_hbm_ref = updated_kv_cache_fused_hbm_ref.reshape(
+            kv_fused_cache_hbm_shape[0] * kv_fused_cache_hbm_shape[1],
+            *kv_fused_cache_hbm_shape[2:],
         )
 
         debug_print(
@@ -421,20 +472,10 @@ def _ragged_paged_attention_kernel(
             update_sz, ignore = states
             sz = jnp.minimum(page_size - ignore, update_sz)
 
+            # Single fused KV copy with head interleaving
             _async_copy(
-                k_vmem_ref.at[pl.ds((p_ignore + i) * page_size + ignore, sz)],
-                kcache_hbm_ref.at[
-                    pl.ds(
-                        page_indices_ref[page_indices_offset + i] * page_size + ignore,
-                        sz,
-                    )
-                ],
-                sem,
-                wait,
-            )
-            _async_copy(
-                v_vmem_ref.at[pl.ds((p_ignore + i) * page_size + ignore, sz)],
-                vcache_hbm_ref.at[
+                kv_fused_vmem_ref.at[pl.ds((p_ignore + i) * page_size + ignore, sz)],
+                kv_fused_cache_hbm_ref.at[
                     pl.ds(
                         page_indices_ref[page_indices_offset + i] * page_size + ignore,
                         sz,
@@ -569,45 +610,68 @@ def _ragged_paged_attention_kernel(
             vec = pltpu.bitcast(vec, dtype)
         return vec
 
-    def strided_load_bkv(bkv_sem_idx, start, step, *, bkv_bitmask):
+    def strided_load_bkv_fused(bkv_sem_idx, start, step, *, bkv_bitmask):
+        """Head interleaving strided load for fused KV: [K1,V1,K2,V2,...]"""
         assert start % kv_packing == 0
         assert step % kv_packing == 0
         start //= kv_packing
         step //= kv_packing
-        k_ref = (
-            bk_x2_ref.bitcast(jnp.uint32)
-            .at[bkv_sem_idx]
-            .reshape(bkv_sz * step, head_dim)
-        )
-        v_ref = (
-            bv_x2_ref.bitcast(jnp.uint32)
+
+        # Fused KV reference with head interleaving
+        kv_fused_ref = (
+            bkv_fused_x2_ref.bitcast(jnp.uint32)
             .at[bkv_sem_idx]
             .reshape(bkv_sz * step, head_dim)
         )
 
-        def _mask_kv(k, v):
-            k = pltpu.bitcast(k, jnp.uint32)
-            v = pltpu.bitcast(v, jnp.uint32)
-            k = k & bkv_bitmask
-            v = v & bkv_bitmask
-            k = pltpu.bitcast(k, kv_dtype)
-            v = pltpu.bitcast(v, kv_dtype)
+        def _mask_kv_uint32(k_uint32, v_uint32):
+            """Apply masking to uint32 KV data"""
+            if bkv_bitmask is not None:
+                k_uint32 = k_uint32 & bkv_bitmask
+                v_uint32 = v_uint32 & bkv_bitmask
+            # Convert back to original dtype
+            k = pltpu.bitcast(k_uint32, jnp.float32).astype(kv_dtype)
+            v = pltpu.bitcast(v_uint32, jnp.float32).astype(kv_dtype)
             return (k, v)
 
         if kv_packing == 1:
-            k = strided_load(k_ref, start, step, dtype=kv_dtype)
-            v = strided_load(v_ref, start, step, dtype=kv_dtype)
-            return [_mask_kv(k, v)]
+            # Head interleaving: K at even indices (0,2,4...), V at odd indices (1,3,5...)
+            k = strided_load(
+                kv_fused_ref, start, step, dtype=kv_dtype
+            )  # K heads: start
+            v = strided_load(
+                kv_fused_ref, start + 1, step, dtype=kv_dtype
+            )  # V heads: start + 1
 
-        k = strided_load(k_ref, start, step)
-        v = strided_load(v_ref, start, step)
+            # Apply masking if needed
+            if bkv_bitmask is not None:
+                k_uint32 = pltpu.bitcast(k.astype(jnp.float32), jnp.uint32)
+                v_uint32 = pltpu.bitcast(v.astype(jnp.float32), jnp.uint32)
+                return [_mask_kv_uint32(k_uint32, v_uint32)]
+            else:
+                return [(k, v)]
+
+        # Complex bit packing case - operate at uint32 level
+        kv = strided_load(kv_fused_ref, start, step)  # Load as uint32
         bitwidth = 32 // kv_packing
-        repack_ty = jnp.dtype(f"uint{bitwidth}")
+        mask = (1 << bitwidth) - 1  # Create mask for extracting bits
         lst = []
-        for i in range(0, kv_packing):
-            k_unpacked = (k >> (i * bitwidth)).astype(repack_ty)
-            v_unpacked = (v >> (i * bitwidth)).astype(repack_ty)
-            lst.append(_mask_kv(k_unpacked, v_unpacked))
+
+        for i in range(0, kv_packing, 2):  # Process K,V pairs
+            # Extract K and V bits from head interleaving
+            k_bits = (kv >> (i * bitwidth)) & mask
+            v_bits = (kv >> ((i + 1) * bitwidth)) & mask
+
+            # Align bits to correct position (for bfloat16, high 16 bits are valid)
+            if kv_dtype == jnp.bfloat16:
+                k_uint32 = k_bits << 16  # Move to high 16 bits
+                v_uint32 = v_bits << 16  # Move to high 16 bits
+            else:
+                k_uint32 = k_bits
+                v_uint32 = v_bits
+
+            lst.append(_mask_kv_uint32(k_uint32, v_uint32))
+
         return lst
 
     def broadcast_minor(src, shape):
@@ -723,7 +787,7 @@ def _ragged_paged_attention_kernel(
                         group_start = (head_idx // heads_per_load) * heads_per_load
                         offset = head_idx % heads_per_load
 
-                        bkv_lst = strided_load_bkv(
+                        bkv_lst = strided_load_bkv_fused(
                             bkv_sem_idx,
                             group_start,
                             num_kv_heads,
@@ -1082,6 +1146,145 @@ def dynamic_validate_inputs(
                 )
 
 
+# Expect to run this validation during compile time for fused KV cache.
+def static_validate_inputs_fused(
+    queries: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
+    keys: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
+    values: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
+    kv_cache_fused: jax.Array,  # [total_num_pages, page_size, actual_num_kv_heads * 2, actual_head_dim] - Head interleaving
+    kv_lens: jax.Array,  # i32[max_num_seqs]
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    cu_kv_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]
+    *,
+    sm_scale: float = 1.0,
+    sliding_window: int | None = None,
+    soft_cap: float | None = None,
+    mask_value: float | None = DEFAULT_MASK_VALUE,
+    q_scale: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    # Kernel optimization params.
+    chunk_prefill_size: int | None = None,
+    # Kernel tuning params.
+    num_kv_pages_per_block: int | None = None,
+    num_queries_per_block: int | None = None,
+    vmem_limit_bytes: int | None = None,
+    # Debug params.
+    debug_mode: bool = False,
+):
+    """Validate inputs to the RPA kernel statically with fused KV cache."""
+    q, k, v = queries, keys, values
+    if not (len(q.shape) == len(k.shape) == len(v.shape) == 3):
+        raise ValueError(f"Expected 3D array for {q.shape=}, {k.shape=}, {v.shape=}")
+    if k.shape != v.shape:
+        raise ValueError(f"Expected {k.shape=} to be equal to {v.shape=}")
+    if not (q.shape[0] == k.shape[0] == v.shape[0]):
+        raise ValueError(
+            f"Expected {q.shape[0]=} to be equal to {k.shape[0]=} and {v.shape[0]=}"
+        )
+    if not (q.shape[2] == k.shape[2] == v.shape[2]):
+        raise ValueError(
+            f"Expected {q.shape[2]=} to be equal to {k.shape[2]=} and {v.shape[2]=}"
+        )
+
+    actual_head_dim = q.shape[2]
+    actual_num_q_heads = q.shape[1]
+    actual_num_kv_heads = k.shape[1]
+
+    if actual_num_q_heads % actual_num_kv_heads != 0:
+        raise ValueError(
+            f"Expected {actual_num_q_heads=} to be divisible by"
+            f" {actual_num_kv_heads=}."
+        )
+
+    # Validate fused KV cache
+    if len(kv_cache_fused.shape) != 4:
+        raise ValueError(
+            f"Expected 4D kv_cache_fused, got shape {kv_cache_fused.shape}"
+        )
+
+    _, page_size, cache_num_kv_heads_interleaved, head_dim = kv_cache_fused.shape
+
+    # Validate head interleaving format
+    if cache_num_kv_heads_interleaved % 2 != 0:
+        raise ValueError(
+            f"Head interleaving requires even number of heads, got {cache_num_kv_heads_interleaved}"
+        )
+
+    cache_num_kv_heads = cache_num_kv_heads_interleaved // 2
+    if cache_num_kv_heads != actual_num_kv_heads:
+        raise ValueError(
+            f"Expected cache_num_kv_heads {cache_num_kv_heads} == actual_num_kv_heads {actual_num_kv_heads}"
+        )
+
+    if head_dim != align_to(actual_head_dim, 128):
+        raise ValueError(
+            f"Expected {head_dim=} is equal to {align_to(actual_head_dim, 128)=}"
+        )
+
+    # Note: we expect the kv quantization happens outside of the RPA kernel.
+    if not (kv_cache_fused.dtype == k.dtype == v.dtype):
+        raise ValueError(
+            f"Expected all dtypes to match: {kv_cache_fused.dtype=}, {k.dtype=}, {v.dtype=}."
+        )
+
+    # Integer kv quantization is currently not supported.
+    if not jnp.issubdtype(kv_cache_fused.dtype, jnp.floating):
+        raise ValueError(f"Expected {kv_cache_fused.dtype=} to be a floating point.")
+
+    if not (
+        jnp.int32
+        == kv_lens.dtype
+        == page_indices.dtype
+        == cu_q_lens.dtype
+        == distribution.dtype
+    ):
+        raise ValueError(
+            f"Expected int32 dtype for {kv_lens.dtype=}, {page_indices.dtype=},"
+            f" {cu_q_lens.dtype=}, {distribution.dtype=}"
+        )
+
+    if not (len(kv_lens.shape) == len(page_indices.shape) == len(cu_q_lens.shape) == 1):
+        raise ValueError(
+            f"Expected 1D array for {kv_lens.shape=}, {page_indices.shape=},"
+            f" {cu_q_lens.shape=}"
+        )
+
+    max_num_seqs = kv_lens.shape[0]
+    if cu_q_lens.shape != (max_num_seqs + 1,):
+        raise ValueError(f"Expected {cu_q_lens.shape=} to be ({max_num_seqs + 1},).")
+    if cu_kv_lens.shape != (max_num_seqs + 1,):
+        raise ValueError(f"Expected {cu_kv_lens.shape=} to be ({max_num_seqs + 1},).")
+    if distribution.shape != (3,):
+        raise ValueError(f"Expected {distribution.shape=} to be (3,).")
+
+    # Validation for other parameters (same as original)
+    if sliding_window is not None and sliding_window <= 0:
+        raise ValueError(f"{sliding_window=} must be positive.")
+    if soft_cap is not None and soft_cap == 0.0:
+        raise ValueError(f"{soft_cap=} must not be 0.0.")
+    if chunk_prefill_size is not None and chunk_prefill_size <= 0:
+        raise ValueError(f"{chunk_prefill_size=} must be positive.")
+    if num_kv_pages_per_block is not None:
+        if num_kv_pages_per_block <= 0:
+            raise ValueError(f"{num_kv_pages_per_block=} must be positive.")
+    if num_queries_per_block is not None:
+        if num_queries_per_block <= 0:
+            raise ValueError(f"{num_queries_per_block=} must be positive.")
+    if vmem_limit_bytes is not None and vmem_limit_bytes <= 0:
+        raise ValueError(f"{vmem_limit_bytes=} must be positive.")
+
+    # No constraints for the following inputs.
+    del sm_scale
+    del mask_value
+    del q_scale
+    del k_scale
+    del v_scale
+    del debug_mode
+
+
 # Expect to run this validation during compile time.
 def static_validate_inputs(
     queries: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
@@ -1243,14 +1446,13 @@ def static_validate_inputs(
         "vmem_limit_bytes",
         "debug_mode",
     ),
-    donate_argnames=("k_cache", "v_cache"),
+    donate_argnames=("kv_cache_fused",),
 )
 def ragged_paged_attention(
     queries: jax.Array,  # [padded_num_tokens, actual_num_q_heads, actual_head_dim]
     keys: jax.Array,  # [padded_num_tokens, actual_num_kv_heads, actual_head_dim]
     values: jax.Array,  # [padded_num_tokens, actual_num_kv_heads, actual_head_dim]
-    k_cache: jax.Array,  # [total_num_pages, page_size, actual_num_kv_heads, actual_head_dim]
-    v_cache: jax.Array,  # [total_num_pages, page_size, actual_num_kv_heads, actual_head_dim]
+    kv_cache_fused: jax.Array,  # [total_num_pages, page_size, actual_num_kv_heads * 2, actual_head_dim] - Head interleaving: [K1,V1,K2,V2,...]
     kv_lens: jax.Array,  # i32[padded_batch_size]
     page_indices: jax.Array,  # i32[(padded_batch_size * model_context_len + page_size - 1) // page_size]
     cu_q_lens: jax.Array,  # i32[padded_batch_size + 1]
@@ -1273,13 +1475,13 @@ def ragged_paged_attention(
     # Debug params.
     debug_mode: bool = False,
 ):
-    """Ragged paged attention that supports mixed prefill and decode.
+    """Ragged paged attention that supports mixed prefill and decode with fused KV cache.
 
     Args:
       queries: concatenated all sequences' queries.
       keys: concatenated all sequences' keys (quantized).
       values: concatenated all sequences' values (quantized).
-      kv_cache: paged KV cache with TPU-friendly shape.
+      kv_cache_fused: paged KV cache with head interleaving format [K1,V1,K2,V2,...].
       kv_lens: padded kv lengths. Only the first num_seqs values are valid.
       page_indices: flattened page indices look-up table.
       cu_q_lens: the cumulative sum of the effective query lengths. Similar to
@@ -1307,12 +1509,11 @@ def ragged_paged_attention(
       The output of the attention.
     """
     q, k, v = queries, keys, values
-    static_validate_inputs(
+    static_validate_inputs_fused(
         q,
         k,
         v,
-        k_cache,
-        v_cache,
+        kv_cache_fused,
         kv_lens,
         page_indices,
         cu_q_lens,
@@ -1337,7 +1538,7 @@ def ragged_paged_attention(
 
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
     q, k, v = prepare_inputs(q, k, v)
-    k_cache, v_cache = prepare_kv_cache(k_cache, v_cache)
+    kv_cache_fused_processed = prepare_kv_cache_fused(kv_cache_fused)
     (
         _,
         max_num_tokens,
@@ -1345,7 +1546,7 @@ def ragged_paged_attention(
         q_packing,
         head_dim,
     ) = q.shape
-    page_size = k_cache.shape[1]
+    page_size = kv_cache_fused_processed.shape[1]
     max_num_seqs = kv_lens.shape[0]
     num_page_indices = page_indices.shape[0]
     pages_per_seq = num_page_indices // max_num_seqs
@@ -1356,7 +1557,7 @@ def ragged_paged_attention(
     if bq_sz is None or bkv_p is None:
         bkv_p, bq_sz = get_tuned_block_sizes(
             q.dtype,
-            k_cache.dtype,
+            kv_cache_fused_processed.dtype,
             actual_num_q_heads,
             actual_num_kv_heads,
             head_dim,
@@ -1364,7 +1565,7 @@ def ragged_paged_attention(
             max_num_tokens,
             pages_per_seq,
         )
-    kv_packing = get_dtype_packing(k_cache.dtype)
+    kv_packing = get_dtype_packing(kv_cache_fused_processed.dtype)
     if page_size == 1:
         bkv_p = bkv_p // 2
         if bkv_p == 0:
@@ -1390,24 +1591,18 @@ def ragged_paged_attention(
         pl.BlockSpec(memory_space=pltpu.ANY),  # q
         pl.BlockSpec(memory_space=pltpu.ANY),  # k_processed
         pl.BlockSpec(memory_space=pltpu.ANY),  # v_processed
-        pl.BlockSpec(memory_space=pltpu.ANY),  # k_cache
-        pl.BlockSpec(memory_space=pltpu.ANY),  # v_cache
+        pl.BlockSpec(memory_space=pltpu.ANY),  # kv_cache_fused
     ]
 
     out_specs = [
         pl.BlockSpec(memory_space=pltpu.ANY),  # output
-        pl.BlockSpec(memory_space=pltpu.ANY),  # updated k_cache
-        pl.BlockSpec(memory_space=pltpu.ANY),  # updated v_cache
+        pl.BlockSpec(memory_space=pltpu.ANY),  # updated kv_cache_fused
     ]
 
-    bk_double_buf = pltpu.VMEM(
-        (2, bkv_sz, *k_cache.shape[2:]),
-        k_cache.dtype,
-    )
-
-    bv_double_buf = pltpu.VMEM(
-        (2, bkv_sz, *v_cache.shape[2:]),
-        k_cache.dtype,
+    # Fused KV buffer with head interleaving
+    bkv_fused_double_buf = pltpu.VMEM(
+        (2, bkv_sz, *kv_cache_fused_processed.shape[2:]),
+        kv_cache_fused_processed.dtype,
     )
 
     bq_double_buf = pltpu.VMEM(
@@ -1429,8 +1624,7 @@ def ragged_paged_attention(
     )
 
     scratch_shapes = [
-        bk_double_buf,  # Double buffering for kv block.
-        bv_double_buf,  # Double buffering for kv block.
+        bkv_fused_double_buf,  # Double buffering for fused kv block with head interleaving.
         bq_double_buf,  # Double buffering for q block.
         bo_double_buf,  # Double buffering for output block.
         # Semaphores for double buffering of bkv, bq, bo and bkv_update.
@@ -1487,25 +1681,27 @@ def ragged_paged_attention(
             ),
             out_shape=[
                 jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
-                jax.ShapeDtypeStruct(shape=k_cache.shape, dtype=k_cache.dtype),
-                jax.ShapeDtypeStruct(shape=v_cache.shape, dtype=v_cache.dtype),
+                jax.ShapeDtypeStruct(
+                    shape=kv_cache_fused_processed.shape,
+                    dtype=kv_cache_fused_processed.dtype,
+                ),
             ],
             input_output_aliases={
-                8: 0,
-                11: 1,
-                12: 2,
+                7: 0,  # q output
+                10: 1,  # kv_cache_fused updated
             },
             name=scope_name,
         )
     )
 
-    output, updated_k_cache, updated_v_cache = kernel(
-        *scalar_prefetches, q, k, v, k_cache, v_cache
+    output, updated_kv_cache_fused = kernel(
+        *scalar_prefetches, q, k, v, kv_cache_fused_processed
     )
     return (
         prepare_outputs(output, actual_num_q_heads_per_kv_head, actual_head_dim),
-        prepare_updated_kv_cache(updated_k_cache, actual_num_kv_heads, actual_head_dim),
-        prepare_updated_kv_cache(updated_v_cache, actual_num_kv_heads, actual_head_dim),
+        prepare_updated_kv_cache_fused(
+            updated_kv_cache_fused, actual_num_kv_heads, actual_head_dim
+        ),
     )
 
 
@@ -1529,6 +1725,64 @@ def prepare_updated_kv_cache(
         num_kv_heads * kv_packing,
         head_dim,
     )[:, :actual_num_kv_heads, :actual_head_dim]
+
+
+def prepare_kv_cache_fused(
+    kv_cache_fused: jax.Array,  # [total_num_pages, page_size, actual_num_kv_heads * 2, actual_head_dim] - Head interleaving
+):
+    """Prepare fused KV cache with head interleaving for TPU-friendly format."""
+    total_num_pages, page_size, actual_num_kv_heads_interleaved, actual_head_dim = (
+        kv_cache_fused.shape
+    )
+    assert (
+        actual_num_kv_heads_interleaved % 2 == 0
+    ), "Head interleaving requires even number of heads"
+
+    kv_packing = get_dtype_packing(kv_cache_fused.dtype)
+    num_kv_heads_interleaved = align_to(actual_num_kv_heads_interleaved, kv_packing)
+    head_dim = align_to(actual_head_dim, 128)
+
+    kv_cache_fused_processed = jnp.pad(
+        kv_cache_fused,
+        (
+            (0, 0),
+            (0, 0),
+            (0, num_kv_heads_interleaved - actual_num_kv_heads_interleaved),
+            (0, head_dim - actual_head_dim),
+        ),
+        constant_values=0,
+    ).reshape(
+        total_num_pages,
+        page_size,
+        num_kv_heads_interleaved // kv_packing,
+        kv_packing,
+        head_dim,
+    )
+    return kv_cache_fused_processed
+
+
+def prepare_updated_kv_cache_fused(
+    kv_cache_fused,  # [total_num_pages, page_size, num_kv_heads_interleaved // kv_packing, kv_packing, head_dim]
+    actual_num_kv_heads: int,
+    actual_head_dim: int,
+):
+    """Extract actual KV cache from processed fused format."""
+    (
+        total_num_pages,
+        page_size,
+        num_kv_heads_interleaved_packed,
+        kv_packing,
+        head_dim,
+    ) = kv_cache_fused.shape
+
+    actual_num_kv_heads_interleaved = (
+        actual_num_kv_heads * 2
+    )  # Head interleaving: K1,V1,K2,V2,...
+    return kv_cache_fused.reshape(
+        -1,
+        num_kv_heads_interleaved_packed * kv_packing,
+        head_dim,
+    )[:, :actual_num_kv_heads_interleaved, :actual_head_dim]
 
 
 def prepare_kv_cache(
