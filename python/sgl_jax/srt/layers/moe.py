@@ -109,8 +109,9 @@ class EPMoE(nnx.Module):
         intermediate_dim: int = 2048,
         weight_dtype: jnp.dtype = jnp.bfloat16,
         dtype: jnp.dtype = jnp.bfloat16,
+        activation: str = "silu",
         layer_id: int = 0,
-        rngs: nnx.Rngs = None,
+        rngs: Optional[nnx.Rngs] = None,
     ):
 
         self.config = config
@@ -119,6 +120,7 @@ class EPMoE(nnx.Module):
         self.intermediate_dim = intermediate_dim
         self.weight_dtype = weight_dtype
         self.dtype = dtype
+        self.activation = activation
         self.layer_id = layer_id
         self.expert_parallel_size = expert_parallel_size
         self.mesh = mesh
@@ -300,7 +302,12 @@ class EPMoE(nnx.Module):
         )
 
         # activation
-        layer_act = jax.nn.silu(layer_w0)
+        if self.activation == "silu":
+            layer_act = jax.nn.silu(layer_w0)
+        elif self.activation == "gelu":
+            layer_act = jax.nn.gelu(layer_w0)
+        else:
+            raise ValueError(self.activation)
         intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
         # down
@@ -346,7 +353,13 @@ class EPMoE(nnx.Module):
         layer_w0 = jnp.einsum("th,ehd->ted", inputs_flat, all_wi_0)
         layer_w1 = jnp.einsum("th,ehd->ted", inputs_flat, all_wi_1)
 
-        activated = jax.nn.silu(layer_w0) * layer_w1
+        if self.activation == "silu":
+            activated = jax.nn.silu(layer_w0) * layer_w1
+        elif self.activation == "gelu":
+            activated = jax.nn.gelu(layer_w0) * layer_w1
+        else:
+            raise NotImplementedError(self.activation)
+
         expert_outputs = jnp.einsum("ted,edh->teh", activated, all_wo)
         final_output = jnp.einsum("te,teh->th", expert_weights, expert_outputs)
 
