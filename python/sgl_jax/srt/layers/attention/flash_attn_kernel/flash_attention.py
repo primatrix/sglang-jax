@@ -622,10 +622,21 @@ def _ragged_paged_attention_kernel(
         step //= kv_packing
 
         # Fused KV reference with head interleaving
-        kv_fused_ref = (
-            bkv_fused_x2_ref.bitcast(jnp.uint32)
-            .at[bkv_sem_idx]
-            .reshape(bkv_sz * step, head_dim)
+        kv_fused_buf = bkv_fused_x2_ref.at[
+            bkv_sem_idx
+        ]  # [bkv_sz, num_kv_heads_interleaved//kv_packing, kv_packing, head_dim]
+
+        # First reshape to collapse the KV head dimensions: [bkv_sz, num_kv_heads_interleaved, head_dim]
+        bkv_sz_actual, num_kv_heads_packed, kv_packing_actual, head_dim_actual = (
+            kv_fused_buf.shape
+        )
+        kv_fused_reshaped = kv_fused_buf.reshape(
+            bkv_sz_actual, num_kv_heads_packed * kv_packing_actual, head_dim_actual
+        )
+
+        # Then reshape for strided access: [bkv_sz * step, head_dim]
+        kv_fused_ref = kv_fused_reshaped.bitcast(jnp.uint32).reshape(
+            bkv_sz * step, head_dim_actual
         )
 
         def _mask_kv_uint32(k_uint32, v_uint32):
