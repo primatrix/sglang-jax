@@ -634,9 +634,10 @@ def _ragged_paged_attention_kernel(
             bkv_sz_actual, num_kv_heads_packed * kv_packing_actual, head_dim_actual
         )
         # Simply flatten to 2D for strided access: (2048, 2, 128) -> (4096, 128)
-        # Don't use old version's "total_tokens * step" - it doesn't apply to new layout
+        # Use explicit dimensions - Pallas VMEM doesn't support -1
+        flattened_size = bkv_sz_actual * num_kv_heads_packed * kv_packing_actual
         kv_fused_ref = kv_fused_reshaped.bitcast(jnp.uint32).reshape(
-            -1, head_dim_actual
+            flattened_size, head_dim_actual
         )
 
         def _mask_kv_uint32(k_uint32, v_uint32):
