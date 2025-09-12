@@ -272,7 +272,9 @@ def _ragged_paged_attention_kernel(
     debug_mode: bool = False,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
-    assert q_hbm_ref.shape[-1] == k_cache_hbm_ref.shape[-1] == v_cache_hbm_ref.shape[-1]
+    assert (
+        q_hbm_ref.shape[-1] == kv_cache_fused_hbm_ref.shape[-1]
+    )  # head_dim should match
     (
         actual_num_kv_heads,
         max_num_tokens,
@@ -286,15 +288,17 @@ def _ragged_paged_attention_kernel(
         num_kv_heads_per_kv_packing,
         kv_packing,
         _,
-    ) = k_cache_hbm_ref.shape
+    ) = kv_cache_fused_hbm_ref.shape
     max_num_seqs = kv_lens_ref.shape[0]
     num_page_indices = page_indices_ref.shape[0]
     # assert num_page_indices % max_num_seqs == 0
     pages_per_seq = num_page_indices // max_num_seqs
-    num_kv_heads = num_kv_heads_per_kv_packing * kv_packing
+    # For fused KV cache: num_kv_heads_per_kv_packing * 2 (head interleaving) * kv_packing
+    num_kv_heads_interleaved = num_kv_heads_per_kv_packing * kv_packing
+    num_kv_heads = num_kv_heads_interleaved // 2  # Divide by 2 due to head interleaving
     num_q_heads_per_kv_head = num_q_heads_per_kv_head_per_packing * q_packing
     q_dtype = q_hbm_ref.dtype
-    kv_dtype = k_cache_hbm_ref.dtype
+    kv_dtype = kv_cache_fused_hbm_ref.dtype
     assert o_hbm_ref.dtype == q_dtype
     assert get_dtype_packing(q_dtype) == q_packing
     assert get_dtype_packing(kv_dtype) == kv_packing
