@@ -621,32 +621,25 @@ def _ragged_paged_attention_kernel(
         start //= kv_packing
         step //= kv_packing
 
-        # Fused KV reference with head interleaving
+        # Fused KV reference with head interleaving - simplify by working directly with original format
         kv_fused_buf = bkv_fused_x2_ref.at[
             bkv_sem_idx
         ]  # [bkv_sz, num_kv_heads_interleaved//kv_packing, kv_packing, head_dim]
 
-        # First reshape to collapse the KV head dimensions: [bkv_sz, num_kv_heads_interleaved, head_dim]
-        bkv_sz_actual, num_kv_heads_packed, kv_packing_actual, head_dim_actual = (
-            kv_fused_buf.shape
-        )
-        kv_fused_reshaped = kv_fused_buf.reshape(
-            bkv_sz_actual, num_kv_heads_packed * kv_packing_actual, head_dim_actual
-        )
-
-        # Reshape for strided access - flatten first two dimensions based on actual shape
-        # Use actual shape after bitcast to ensure element count preservation
-        kv_fused_uint32 = kv_fused_reshaped.bitcast(jnp.uint32)
-        actual_shape = kv_fused_uint32.shape
-        kv_fused_ref = kv_fused_uint32.reshape(
-            actual_shape[0] * actual_shape[1], actual_shape[2]
+        # Directly flatten to match old version format: [total_elements, head_dim]
+        # This is much simpler than the complex reshaping above
+        total_elements = kv_fused_buf.size // kv_fused_buf.shape[-1]
+        kv_fused_ref = kv_fused_buf.bitcast(jnp.uint32).reshape(
+            total_elements, kv_fused_buf.shape[-1]
         )
 
         def _mask_kv_uint32(k_uint32, v_uint32):
-            """Apply masking to uint32 KV data"""
+            """Apply masking to uint32 KV data - simplified version"""
             if bkv_bitmask is not None:
-                k_uint32 = k_uint32 & bkv_bitmask
-                v_uint32 = v_uint32 & bkv_bitmask
+                # Simple flattened bitmask to match flattened data
+                bitmask_flat = bkv_bitmask.reshape(-1, bkv_bitmask.shape[-1])
+                k_uint32 = k_uint32 & bitmask_flat
+                v_uint32 = v_uint32 & bitmask_flat
             # Convert back to original dtype
             k = pltpu.bitcast(k_uint32, jnp.float32).astype(kv_dtype)
             v = pltpu.bitcast(v_uint32, jnp.float32).astype(kv_dtype)
