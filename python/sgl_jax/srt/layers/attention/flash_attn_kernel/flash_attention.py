@@ -626,20 +626,24 @@ def _ragged_paged_attention_kernel(
             bkv_sem_idx
         ]  # [bkv_sz, num_kv_heads_interleaved//kv_packing, kv_packing, head_dim]
 
-        # Directly flatten to match old version format: [total_elements, head_dim]
-        # This is much simpler than the complex reshaping above
-        total_elements = kv_fused_buf.size // kv_fused_buf.shape[-1]
-        kv_fused_ref = kv_fused_buf.bitcast(jnp.uint32).reshape(
-            total_elements, kv_fused_buf.shape[-1]
+        # Follow old version pattern but use actual dimensions, not step parameter
+        bkv_sz_actual, num_kv_heads_packed, kv_packing_actual, head_dim_actual = (
+            kv_fused_buf.shape
+        )
+        kv_fused_reshaped = kv_fused_buf.reshape(
+            bkv_sz_actual, num_kv_heads_packed * kv_packing_actual, head_dim_actual
+        )
+        # Use actual dimensions for reshape: (2048, 2, 128) -> (4096, 128)
+        total_tokens = bkv_sz_actual * num_kv_heads_packed * kv_packing_actual
+        kv_fused_ref = kv_fused_reshaped.bitcast(jnp.uint32).reshape(
+            total_tokens, head_dim_actual
         )
 
         def _mask_kv_uint32(k_uint32, v_uint32):
-            """Apply masking to uint32 KV data - simplified version"""
+            """Apply masking to uint32 KV data - follow old version pattern"""
             if bkv_bitmask is not None:
-                # Simple flattened bitmask to match flattened data
-                bitmask_flat = bkv_bitmask.reshape(-1, bkv_bitmask.shape[-1])
-                k_uint32 = k_uint32 & bitmask_flat
-                v_uint32 = v_uint32 & bitmask_flat
+                k_uint32 = k_uint32 & bkv_bitmask
+                v_uint32 = v_uint32 & bkv_bitmask
             # Convert back to original dtype
             k = pltpu.bitcast(k_uint32, jnp.float32).astype(kv_dtype)
             v = pltpu.bitcast(v_uint32, jnp.float32).astype(kv_dtype)
