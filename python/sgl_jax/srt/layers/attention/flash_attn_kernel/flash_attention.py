@@ -626,17 +626,17 @@ def _ragged_paged_attention_kernel(
             bkv_sem_idx
         ]  # [bkv_sz, num_kv_heads_interleaved//kv_packing, kv_packing, head_dim]
 
-        # Follow old version pattern but use actual dimensions, not step parameter
+        # New version reshape logic - different from old version due to different data layout
         bkv_sz_actual, num_kv_heads_packed, kv_packing_actual, head_dim_actual = (
             kv_fused_buf.shape
         )
         kv_fused_reshaped = kv_fused_buf.reshape(
             bkv_sz_actual, num_kv_heads_packed * kv_packing_actual, head_dim_actual
         )
-        # Use actual dimensions for reshape: (2048, 2, 128) -> (4096, 128)
-        total_tokens = bkv_sz_actual * num_kv_heads_packed * kv_packing_actual
+        # Simply flatten to 2D for strided access: (2048, 2, 128) -> (4096, 128)
+        # Don't use old version's "total_tokens * step" - it doesn't apply to new layout
         kv_fused_ref = kv_fused_reshaped.bitcast(jnp.uint32).reshape(
-            total_tokens, head_dim_actual
+            -1, head_dim_actual
         )
 
         def _mask_kv_uint32(k_uint32, v_uint32):
