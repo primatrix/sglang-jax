@@ -634,10 +634,11 @@ def _ragged_paged_attention_kernel(
             bkv_sz_actual, num_kv_heads_packed * kv_packing_actual, head_dim_actual
         )
 
-        # Then reshape for strided access following the old implementation pattern
-        # Use step parameter like the old version to ensure correct shape calculation
+        # Reshape for strided access - preserve total element count
+        # Original: (bkv_sz_actual, num_kv_heads_packed * kv_packing_actual, head_dim_actual)
+        # Target: (bkv_sz_actual * num_kv_heads_packed * kv_packing_actual, head_dim_actual)
         kv_fused_ref = kv_fused_reshaped.bitcast(jnp.uint32).reshape(
-            bkv_sz_actual * step, head_dim_actual
+            bkv_sz_actual * num_kv_heads_packed * kv_packing_actual, head_dim_actual
         )
 
         def _mask_kv_uint32(k_uint32, v_uint32):
@@ -652,12 +653,14 @@ def _ragged_paged_attention_kernel(
 
         if kv_packing == 1:
             # Head interleaving: K at even indices (0,2,4...), V at odd indices (1,3,5...)
+            # For head interleaving, step should be 2 (K-V pairs), not num_kv_heads
+            actual_step = 2  # Step between K and V in interleaved format
             k = strided_load(
-                kv_fused_ref, start, step, dtype=kv_dtype
-            )  # K heads: start
+                kv_fused_ref, start * 2, actual_step, dtype=kv_dtype
+            )  # K heads: start * 2 (even indices)
             v = strided_load(
-                kv_fused_ref, start + 1, step, dtype=kv_dtype
-            )  # V heads: start + 1
+                kv_fused_ref, start * 2 + 1, actual_step, dtype=kv_dtype
+            )  # V heads: start * 2 + 1 (odd indices)
 
             # Apply masking if needed
             if bkv_bitmask is not None:
