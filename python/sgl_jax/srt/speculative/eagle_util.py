@@ -79,10 +79,41 @@ class EagleDraftInput:
         pass
 
     def filter_batch(self, new_indices: jax.Array, has_been_filtered: bool = True):
-        pass
+        if has_been_filtered:
+            # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
+            # therefore, we don't need to filter the batch again in scheduler
+            if len(new_indices) != len(self.topk_p):
+                logger.warning(
+                    f"length of new_indices: {len(new_indices)} != length of topk_p: {len(self.topk_p)}, this should not happen"
+                )
+            self.topk_p = self.topk_p[: len(new_indices)]
+            self.topk_index = self.topk_index[: len(new_indices)]
+            self.hidden_states = self.hidden_states[: len(new_indices)]
+            self.verified_id = self.verified_id[: len(new_indices)]
+        else:
+            # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
+            self.topk_p = self.topk_p[new_indices]
+            self.topk_index = self.topk_index[new_indices]
+            self.hidden_states = self.hidden_states[new_indices]
+            self.verified_id = self.verified_id[new_indices]
 
-    def merge_batch(self, spec_info: Any):
-        pass
+    def merge_batch(self, spec_info: EagleDraftInput):
+        if self.hidden_states is None:
+            self.hidden_states = spec_info.hidden_states
+            self.verified_id = spec_info.verified_id
+            self.topk_p = spec_info.topk_p
+            self.topk_index = spec_info.topk_index
+            return
+        if spec_info.hidden_states is None:
+            return
+        self.hidden_states = jnp.concatenate(
+            [self.hidden_states, spec_info.hidden_states], axis=0
+        )
+        self.verified_id = jnp.concatenate(
+            [self.verified_id, spec_info.verified_id], axis=0
+        )
+        self.topk_p = jnp.concatenate([self.topk_p, spec_info.topk_p])
+        self.topk_index = jnp.concatenate([self.topk_index, spec_info.topk_index])
 
 
 @dataclass
