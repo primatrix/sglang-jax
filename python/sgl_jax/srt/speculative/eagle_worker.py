@@ -192,7 +192,12 @@ class EAGLEWorker(ModelWorker):
         )
         if not forward_batch.forward_mode.is_idle():
             # Initialize attention backend
-            self.draft_attn_backend.init_forward_metadata(forward_batch)
+            forward_metadata = (
+                self.draft_model_runner.attn_backend.get_forward_metadata(
+                    model_worker_batch, self.mesh
+                )
+            )
+            self.draft_model_runner.attn_backend.forward_metadata = forward_metadata
         # Run forward steps
         score_list, token_list, parents_list = self.draft_forward(forward_batch)
 
