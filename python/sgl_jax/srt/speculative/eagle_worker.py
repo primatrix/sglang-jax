@@ -2,6 +2,7 @@ import logging
 from typing import Optional, Tuple
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
@@ -22,6 +23,7 @@ class EAGLEWorker(ModelWorker):
     def __init__(self, server_args, target_worker: ModelWorker):
         self.target_worker = target_worker
         self.speculative_num_steps = server_args.speculative_num_steps
+        self.topk = server_args.speculative_eagle_topk
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.page_size = server_args.page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
@@ -168,10 +170,107 @@ class EAGLEWorker(ModelWorker):
         pass
 
     def draft(self, batch: ScheduleBatch):
-        pass
+        if batch.forward_mode.is_idle():
+            self._draft_preprocess_idle(batch)
+        else:
+            self._draft_preprocess_decode(batch)
+
+        spec_info = batch.spec_info
+        assert isinstance(spec_info, EagleDraftInput)
+
+        spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        spec_info.num_tokens_per_batch = self.topk
+        spec_info.num_tokens_for_logprob_per_batch = self.topk
+        batch.return_hidden_states = False
+
+        # Get forward batch
+        model_worker_batch = batch.get_model_worker_batch()
+        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
+        forward_batch = ForwardBatch.init_new(
+            model_worker_batch, self.draft_model_runner
+        )
+        if not forward_batch.forward_mode.is_idle():
+            # Initialize attention backend
+            self.draft_attn_backend.init_forward_metadata(forward_batch)
+        # Run forward steps
+        score_list, token_list, parents_list = self.draft_forward(forward_batch)
+
+        # build tree
+
+        return EagleVerifyInput()
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleDraftInput):
         pass
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         pass
+
+    def draft_forward(self, forward_batch: ForwardBatch):
+        pass
+
+    def _draft_preprocess_idle(self, batch: ScheduleBatch):
+        pass
+
+    def _draft_preprocess_decode(self, batch: ScheduleBatch):
+        # Parse args
+        num_seqs = batch.batch_size()
+        spec_info = batch.spec_info
+
+        # todo: add penalty
+
+        if self.page_size == 1:
+            out_cache_loc, token_to_kv_pool_state_backup = batch.alloc_token_slots(
+                num_seqs * self.speculative_num_steps * self.topk, backup_state=True
+            )
+        else:
+            # todo: page size > 1
+            self.extend_lens = 1
+            self.num_new_pages_per_topk = 1
+            pass
+
+        assign_draft_cache_locs[(num_seqs,)](
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            self.extend_lens,
+            self.num_new_pages_per_topk,
+            out_cache_loc,
+            batch.req_to_token_pool.req_to_token.shape[1],
+            self.topk,
+            self.speculative_num_steps,
+            self.page_size,
+            next_power_of_2(num_seqs),
+            next_power_of_2(self.speculative_num_steps),
+        )
+
+        if self.page_size > 1 and self.topk > 1:
+            # Remove padded slots
+            out_cache_loc = out_cache_loc[
+                : num_seqs * self.topk * self.speculative_num_steps
+            ]
+
+        batch.out_cache_loc = out_cache_loc
+        batch.seq_lens_sum = jnp.sum(batch.seq_lens).item()
+        batch.return_hidden_states = False
+        spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, axis=0)
+        self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
+
+
+def assign_draft_cache_locs(
+    req_pool_indices: jax.Array,
+    req_to_token: jax.Array,
+    seq_lens: jax.Array,
+    extend_lens: jax.Array,
+    num_new_pages_per_topk: jax.Array,
+    out_cache_loc: jax.Array,
+    req_to_token_shape: int,
+    topk: int,
+    speculative_num_steps: int,
+    page_size: int,
+    bs: int,
+) -> None:
+    pass
+
+
+def next_power_of_2(n: int):
+    return 1 << (n - 1).bit_length() if n > 0 else 1
