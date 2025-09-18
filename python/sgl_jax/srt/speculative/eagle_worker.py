@@ -1,5 +1,5 @@
 import logging
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -32,6 +32,7 @@ class EAGLEWorker(ModelWorker):
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
+        self.hot_token_id = None
         super().__init__(server_args, target_worker.mesh, True, self.req_to_token_pool)
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
@@ -206,7 +207,56 @@ class EAGLEWorker(ModelWorker):
         pass
 
     def draft_forward(self, forward_batch: ForwardBatch):
-        pass
+        spec_info = forward_batch.spec_info
+        assert isinstance(spec_info, EagleDraftInput)
+        out_cache_loc = forward_batch.out_cache_loc
+        topk_p, topk_index, hidden_states = (
+            spec_info.topk_p,
+            spec_info.topk_index,
+            spec_info.hidden_states,
+        )
+        if self.hot_token_id is not None:
+            topk_index = self.hot_token_id[topk_index]
+        out_cache_loc = out_cache_loc.reshape(
+            forward_batch.batch_size, self.topk, self.speculative_num_steps
+        )
+        out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
+            self.speculative_num_steps, -1
+        )
+        # Return values
+        score_list: List[jax.Array] = []
+        token_list: List[jax.Array] = []
+        parents_list: List[jax.Array] = []
+        # Forward multiple steps
+        scores = None
+        for i in range(self.speculative_num_steps):
+            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                i, topk_p, topk_index, hidden_states, scores, self.topk
+            )
+            score_list.append(tree_info[0])
+            token_list.append(tree_info[1])
+            parents_list.append(tree_info[2])
+
+            if i == self.speculative_num_steps - 1:
+                break
+            forward_batch.input_ids = input_ids
+            forward_batch.out_cache_loc = out_cache_loc[i]
+            forward_batch.positions.add(1)
+            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+            spec_info.hidden_states = hidden_states
+
+            # Run forward
+            logits_output, _ = self.draft_model_runner.forward(
+                forward_batch, skip_attn_backend_init=True
+            )
+            self._detect_nan_if_needed(logits_output)
+            probs = jnp.softmax(logits_output.next_token_logits, dim=-1)
+            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            if self.hot_token_id is not None:
+                topk_index = self.hot_token_id[topk_index]
+            hidden_states = logits_output.hidden_states
+
+        return score_list, token_list, parents_list
 
     def _draft_preprocess_idle(self, batch: ScheduleBatch):
         pass
@@ -274,3 +324,14 @@ def assign_draft_cache_locs(
 
 def next_power_of_2(n: int):
     return 1 << (n - 1).bit_length() if n > 0 else 1
+
+
+def select_top_k_tokens(
+    step: int,
+    topk_p: jax.Array,
+    topk_index: jax.Array,
+    hidden_states: jax.Array,
+    scores: jax.Array,
+    topk: int,
+) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    pass
