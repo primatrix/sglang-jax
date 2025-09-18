@@ -317,10 +317,6 @@ class EAGLEWorker(ModelWorker):
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
 
-def next_power_of_2(n: int):
-    return 1 << (n - 1).bit_length() if n > 0 else 1
-
-
 def select_top_k_tokens(
     step: int,
     topk_p: jax.Array,
