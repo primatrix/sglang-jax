@@ -129,7 +129,12 @@ class QWen3Attention(nnx.Module):
         k = self.k_norm(k)
 
         q, k = self.rotary_emb(positions, q, k)
-        attn_output, kv_fused = self.attn(q, k, v, forward_batch=forward_batch)
+        attn_output, kv_fused = self.attn(
+            q,
+            k,
+            v,
+            forward_batch=forward_batch,
+        )
 
         output, _ = self.o_proj(attn_output)
         return output, kv_fused
@@ -495,6 +500,29 @@ class Qwen3ForCausalLM(nnx.Module):
             mappings.update(bias_mappings)
 
         return mappings
+
+    def get_embed_and_head(self):
+        return (
+            self.transformer.embed_tokens.embedding.value,
+            self.lm_head.embedding.value,
+        )
+
+    def set_embed_and_head(
+        self,
+        embed_weight: Optional[jax.Array] = None,
+        head_weight: Optional[jax.Array] = None,
+    ) -> None:
+        """Set word embedding and LM Head weights.
+
+        Args:
+            embed_weight: Embedding matrix with shape [vocab_size, hidden_size].
+            head_weight:  LM Head matrix with shape [vocab_size, hidden_size].
+        """
+        if embed_weight is not None:
+            self.transformer.embed_tokens.embedding.value = embed_weight
+
+        if head_weight is not None:
+            self.lm_head.embedding.value = head_weight
 
     def __call__(
         self,

@@ -133,6 +133,13 @@ class ServerArgs:
     # For deterministic sampling
     enable_deterministic_sampling: bool = False
 
+    # Speculative decoding
+    speculative_algorithm: Optional[str] = None
+    speculative_draft_model_path: Optional[str] = None
+    speculative_num_steps: int = 4
+    speculative_eagle_topk: int = 5
+    speculative_num_draft_tokens: int = 4
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -189,6 +196,13 @@ class ServerArgs:
         os.environ["SGLANG_ENABLE_DETERMINISTIC_SAMPLING"] = (
             "1" if self.enable_deterministic_sampling else "0"
         )
+
+        # Normalize speculative_algorithm: treat empty string as None
+        if (
+            isinstance(self.speculative_algorithm, str)
+            and self.speculative_algorithm.strip() == ""
+        ):
+            self.speculative_algorithm = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -771,6 +785,40 @@ class ServerArgs:
             help="Enable deterministic sampling",
         )
 
+        # Speculative decoding
+        parser.add_argument(
+            "--speculative-algorithm",
+            type=str,
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE"],
+            help="Speculative algorithm.",
+            default=ServerArgs.speculative_algorithm,
+        )
+        parser.add_argument(
+            "--speculative-draft-model-path",
+            "--speculative-draft-model",
+            type=str,
+            help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
+            default=ServerArgs.speculative_draft_model_path,
+        )
+        parser.add_argument(
+            "--speculative-num-steps",
+            type=int,
+            help="The number of steps sampled from draft model in Speculative Decoding.",
+            default=ServerArgs.speculative_num_steps,
+        )
+        parser.add_argument(
+            "--speculative-eagle-topk",
+            type=int,
+            help="The number of tokens sampled from the draft model in eagle2 each step.",
+            default=ServerArgs.speculative_eagle_topk,
+        )
+        parser.add_argument(
+            "--speculative-num-draft-tokens",
+            type=int,
+            help="The number of tokens sampled from the draft model in Speculative Decoding.",
+            default=ServerArgs.speculative_num_draft_tokens,
+        )
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
@@ -806,6 +854,13 @@ class ServerArgs:
             assert (
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
+
+        # Disallow overlap scheduler when speculative decoding is enabled
+        if self.speculative_algorithm is not None and not self.disable_overlap_schedule:
+            raise ValueError(
+                "Speculative decoding does not support overlap scheduler. "
+                "Please pass --disable-overlap-schedule when using --speculative-algorithm."
+            )
 
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:

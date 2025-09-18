@@ -73,6 +73,10 @@ class NativeAttention(AttentionBackend):
         if (
             forward_batch.forward_mode == ForwardMode.DECODE
             or layer.attn_type == AttentionType.ENCODER_ONLY
+            or (
+                forward_batch.spec_info is not None
+                and forward_batch.spec_info.custom_mask is not None
+            )
         ):
             is_causal = False
 
@@ -89,6 +93,11 @@ class NativeAttention(AttentionBackend):
             scale,
             is_causal,
             forward_batch.forward_mode,
+            attention_mask=(
+                forward_batch.spec_info.custom_mask
+                if forward_batch.spec_info is not None
+                else None
+            ),
         )
 
         kv_fused = merge_kv(k, v)
@@ -142,6 +151,7 @@ def forward_attention(
     scale=None,
     is_causal=True,
     mode=ForwardMode.DECODE,
+    attention_mask: jax.Array = None,
 ):
     """
     Forward pass using native JAX implementation with block-diagonal attention.
@@ -207,8 +217,16 @@ def forward_attention(
         attn_weights = _apply_extend_mask(
             attn_weights, seq_lengths, extend_prefix_lens, extend_seq_lens, is_causal
         )
-    else:
+    elif mode == ForwardMode.DECODE:
         attn_weights = _apply_decode_mask(attn_weights, seq_lengths)
+    elif mode == ForwardMode.TARGET_VERIFY:
+        attn_weights = _apply_uncasual_mask(
+            attn_weights,
+            seq_lengths,
+            extend_prefix_lens,
+            extend_seq_lens,
+            attention_mask,
+        )
 
     # Softmax
     attn_weights = jax.nn.softmax(attn_weights, axis=-1)
@@ -293,3 +311,106 @@ def _apply_decode_mask(attn_weights: jax.Array, seq_lengths: jax.Array):
     mask_value = jnp.finfo(attn_weights.dtype).min
     final_mask = final_mask[None, :, :]
     return jnp.where(final_mask, attn_weights, mask_value)
+
+
+def _apply_uncasual_mask(
+    attn_weights: jax.Array,
+    seq_lengths: jax.Array,
+    extend_prefix_lens: jax.Array,
+    extend_seq_lens: jax.Array,
+    attn_mask: jax.Array,
+):
+    """
+    Apply tree-based attention mask for EAGLE speculative decoding.
+
+    The attn_mask is a 1D flattened boolean array representing the tree mask
+    constructed by build_eagle_tree_structure in eagle_util.py.
+
+    The tree_mask is organized as a flattened 2D array where for each query token:
+    - It has a row in the conceptual 2D mask
+    - The row is stored sequentially in the 1D array
+    - Each row represents which key positions this query can attend to
+
+    For FULL_MASK mode (tree_mask_mode==0):
+    - tree_mask_size = seq_lens_sum * draft_token_num + draft_token_num^2 * batch_size
+    - For each batch and each draft token, the mask row starts at token_tree_idx
+    - token_tree_idx = seq_tree_idx + (seq_len + draft_token_num) * tid
+    - where seq_tree_idx = draft_token_num^2 * bid + sum(seq_len[:bid]) * draft_token_num
+
+    Args:
+        attn_weights: Attention weights of shape [num_heads, query_len, key_len]
+        seq_lengths: Sequence lengths including draft tokens [batch_size]
+        extend_prefix_lens: Prefix lengths before draft tokens [batch_size]
+        extend_seq_lens: Number of draft tokens per sequence [batch_size]
+        attn_mask: Flattened tree mask [tree_mask_size]
+
+    Returns:
+        Masked attention weights with -inf at invalid positions
+    """
+    _, query_len, key_len = attn_weights.shape
+    batch_size = seq_lengths.shape[0]
+    draft_token_num = query_len // batch_size
+
+    # Calculate cumulative sequence starts for key positions
+    k_starts = jnp.cumsum(seq_lengths, dtype=jnp.int32) - seq_lengths
+
+    # Create query indices
+    q_indices = jnp.arange(query_len, dtype=jnp.int32)
+
+    # Determine batch id and token id for each query position
+    q_batch_ids = q_indices // draft_token_num  # [query_len]
+    q_token_ids = q_indices % draft_token_num  # [query_len]
+
+    # Calculate seq_tree_idx for each query: base index in tree_mask for this batch
+    cumsum_prefix_lens = (
+        jnp.cumsum(extend_prefix_lens, dtype=jnp.int32) - extend_prefix_lens
+    )
+    seq_tree_idx = (
+        draft_token_num * draft_token_num * q_batch_ids
+        + cumsum_prefix_lens[q_batch_ids] * draft_token_num
+    )  # [query_len]
+
+    # Get the prefix length for each query position
+    q_prefix_lens = extend_prefix_lens[q_batch_ids]  # [query_len]
+
+    # Calculate token_tree_idx: start of this query's row in the tree_mask
+    # This is where the attention pattern for this token starts
+    token_tree_idx = (
+        seq_tree_idx + (q_prefix_lens + draft_token_num) * q_token_ids
+    )  # [query_len]
+
+    # For each query, we need to extract its attention pattern from the tree_mask
+    # The pattern spans (seq_len + draft_token_num) positions
+    # We'll create a 2D mask by gathering the appropriate indices
+
+    # Create a matrix of relative indices [query_len, key_len]
+    # For each query, we need to map each key position to the corresponding index in tree_mask
+    k_indices = jnp.arange(key_len, dtype=jnp.int32)  # [key_len]
+
+    # Determine which batch each key belongs to using the same method as _apply_extend_mask
+    k_batch_indicators = jnp.zeros(key_len, dtype=jnp.int32).at[k_starts].set(1)
+    k_batch_ids = jnp.cumsum(k_batch_indicators, dtype=jnp.int32) - 1  # [key_len]
+
+    # Check if query and key are from the same batch
+    same_batch_mask = (
+        q_batch_ids[:, None] == k_batch_ids[None, :]
+    )  # [query_len, key_len]
+
+    # For keys in the same batch, calculate relative position within the sequence
+    k_rel_pos = k_indices[None, :] - k_starts[k_batch_ids][None, :]  # [1, key_len]
+
+    # The tree_mask index for each (query, key) pair is:
+    # token_tree_idx[query] + k_rel_pos[key]
+    tree_mask_indices = token_tree_idx[:, None] + k_rel_pos  # [query_len, key_len]
+
+    # Clamp indices to valid range and extract mask values
+    tree_mask_indices = jnp.clip(tree_mask_indices, 0, attn_mask.shape[0] - 1)
+    mask_2d = attn_mask[tree_mask_indices]  # [query_len, key_len]
+
+    # Apply same_batch_mask to ensure only attending within the same batch
+    mask_2d = mask_2d & same_batch_mask
+
+    # Apply the mask to attention weights
+    mask_value = jnp.finfo(attn_weights.dtype).min
+    mask_2d = mask_2d[None, :, :]  # Add head dimension [1, query_len, key_len]
+    return jnp.where(mask_2d, attn_weights, mask_value)

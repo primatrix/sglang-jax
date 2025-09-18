@@ -7,7 +7,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 - ScheduleBatch is managed by `scheduler.py::Scheduler`.
   It contains high-level scheduling data. Most of the data is on the CPU.
-- ModelWorkerBatch is managed by `tp_worker.py::TpModelWorker`.
+- ModelWorkerBatch is managed by `tp_worker.py::ModelWorker`.
   It is a subset of `ScheduleBatch` that only contains data related to the model forward on GPU.
   It will be transformed from CPU scheduler to GPU model runner.
 - ForwardBatch is managed by `model_runner.py::ModelRunner`.
@@ -20,9 +20,11 @@ import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import jax
+
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +37,14 @@ if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.mem_cache.memory_pool import KVCache
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
+    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
 
 from jax.tree_util import register_pytree_node_class
+
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
+if TYPE_CHECKING:
+    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
 
 
 class ForwardMode(IntEnum):
@@ -165,6 +173,10 @@ class ForwardBatch:
     trace_request_ids: Optional[List[str]] = None
     trace_request_objects: Optional[List] = None
 
+    spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
+    spec_algorithm: SpeculativeAlgorithm = None
+    capture_hidden_mode: CaptureHiddenMode = None
+
     def tree_flatten(self):
         children = (
             self.input_ids,
@@ -178,11 +190,14 @@ class ForwardBatch:
             self.cache_loc,
             self.extend_prefix_lens,
             self.extend_seq_lens,
+            self.spec_info,
         )
 
         aux_data = {
             "forward_mode": self.forward_mode,
             "batch_size": self.batch_size,
+            "spec_algorithm": self.spec_algorithm,
+            "capture_hidden_mode": self.capture_hidden_mode,
         }
         return (children, aux_data)
 
@@ -192,6 +207,8 @@ class ForwardBatch:
 
         obj.forward_mode = aux_data["forward_mode"]
         obj.batch_size = aux_data["batch_size"]
+        obj.spec_algorithm = aux_data["spec_algorithm"]
+        obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
         obj.trace_request_ids = None
         obj.trace_request_objects = None
 
@@ -206,6 +223,7 @@ class ForwardBatch:
         obj.cache_loc = children[8]
         obj.extend_prefix_lens = children[9]
         obj.extend_seq_lens = children[10]
+        obj.spec_info = children[11]
 
         return obj
 
@@ -280,6 +298,9 @@ class ForwardBatch:
             extend_seq_lens=extend_seq_lens,
             token_to_kv_pool=model_runner.token_to_kv_pool,
             attn_backend=model_runner.attn_backend,
+            spec_info=batch.spec_info,
+            spec_algorithm=batch.spec_algorithm,
+            capture_hidden_mode=batch.capture_hidden_mode,
         )
 
         return obj
