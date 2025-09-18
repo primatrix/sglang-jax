@@ -157,9 +157,9 @@ class EAGLEWorker(ModelWorker):
             else:
                 unfinished_req_index.append(i)
         if has_finished:
-            unfinished_index_device = jax.numpy.array(
+            unfinished_index_device = jnp.array(
                 unfinished_req_index,
-                dtype=jax.numpy.int64,
+                dtype=jnp.int64,
                 device=batch.spec_info.topk_p.device,
             )
             batch.spec_info.filter_batch(
@@ -188,19 +188,30 @@ class EAGLEWorker(ModelWorker):
         )
         batch.spec_info = spec_info
 
+        (
+            precompile_token_paddings,
+            precompile_bs_paddings,
+            precompile_cache_loc_paddings,
+        ) = self.target_worker.get_precompile_paddings()
+
         model_worker_batch = batch.get_model_worker_batch(
-            seq_lens_cpu_cache=spec_info.seq_lens_cpu
+            precompile_token_paddings,
+            precompile_bs_paddings,
+            precompile_cache_loc_paddings,
+            self.page_size,
         )
 
         assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
 
         # forward
-        logits_output, _, _ = self.target_worker.forward_batch_generation(
-            model_worker_batch, skip_sample=True
+        logits_output, _, cache_miss_count = (
+            self.target_worker.forward_batch_generation(
+                model_worker_batch, skip_sample=True
+            )
         )
 
-        vocab_mask = None
         # TODO: support grammar mask
+        # vocab_mask = None
         # if batch.has_grammar:
         #     pass
 
@@ -210,7 +221,6 @@ class EAGLEWorker(ModelWorker):
             logits_output,
             self.token_to_kv_pool_allocator,
             self.page_size,
-            vocab_mask,
         )
 
         # Post process based on verified outputs.

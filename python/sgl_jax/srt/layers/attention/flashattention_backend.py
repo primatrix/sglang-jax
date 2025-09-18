@@ -96,7 +96,10 @@ class FlashAttention(AttentionBackend):
         selected_cache_locs = batch.cache_loc[indices]
         page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
 
-        if batch.forward_mode == ForwardMode.EXTEND:
+        if (
+            batch.forward_mode == ForwardMode.EXTEND
+            or batch.forward_mode == ForwardMode.TARGET_VERIFY
+        ):
             cu_q_lens = np.concatenate(
                 [
                     np.array([0], dtype=np.int32),

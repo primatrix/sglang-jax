@@ -80,6 +80,7 @@ class EagleDraftInput:
         pt = 0
         for i, extend_len in enumerate(batch.extend_lens):
             input_ids = batch.input_ids[pt : pt + extend_len]
+            # TODO: batch.input_ids should on tpu
             batch.input_ids[pt : pt + extend_len] = jnp.concatenate(
                 (input_ids[1:], self.verified_id[i].reshape(1))
             )
@@ -162,33 +163,38 @@ class EagleVerifyInput:
         if batch.forward_mode.is_idle():
             return
 
+        # TODO: keep draft_token on TPU
         batch.input_ids = self.draft_token
+
+        bs = batch.batch_size()
+        prefix_lens = batch.seq_lens
+        seq_lens_with_draft_token = batch.seq_lens + self.draft_token_num
+        extend_lens = jnp.array([self.draft_token_num] * bs)
 
         if page_size == 1:
             batch.out_cache_loc = batch.alloc_token_slots(len(batch.input_ids))
-            end_offset = batch.seq_lens + self.draft_token_num
         else:
-            prefix_lens = batch.seq_lens
-            end_offset = prefix_lens + self.draft_token_num
             last_loc = get_last_loc(
                 batch.req_to_token_pool.req_to_token,
                 batch.req_pool_indices,
                 prefix_lens,
             )
             batch.out_cache_loc = batch.alloc_paged_token_slots_extend(
-                prefix_lens, end_offset, last_loc, len(batch.input_ids)
+                prefix_lens.tolist(),
+                seq_lens_with_draft_token.tolist(),
+                last_loc.tolist(),
+                len(batch.input_ids),
             )
             self.last_loc = last_loc
 
-        bs = batch.batch_size()
-        assign_req_to_token_pool[(bs,)](
+        assign_req_to_token_pool(
+            bs,
+            batch.req_to_token_pool,
             batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            end_offset,
+            prefix_lens,
+            seq_lens_with_draft_token,
+            extend_lens,
             batch.out_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
-            next_power_of_2(bs),
         )
 
     def verify(

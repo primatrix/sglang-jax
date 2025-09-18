@@ -1,13 +1,19 @@
 def assign_req_to_token_pool(
+    bs,
+    req_to_token_pool,
     req_pool_indices,
-    req_to_token,
-    start_offset,
-    end_offset,
+    prefix_lens,
+    seq_lens,
+    extend_lens,
     out_cache_loc,
-    pool_len: tl.constexpr,
-    bs_upper: tl.constexpr,
 ):
-    pass
+    pt = 0
+    for i in range(bs):
+        req_to_token_pool.write(
+            (req_pool_indices[i], slice(prefix_lens[i], seq_lens[i])),
+            out_cache_loc[pt : pt + extend_lens[i]],
+        )
+        pt += extend_lens[i]
 
 
 def verify_tree_greedy():
