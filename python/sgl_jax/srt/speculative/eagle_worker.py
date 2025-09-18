@@ -278,20 +278,29 @@ class EAGLEWorker(ModelWorker):
             self.num_new_pages_per_topk = 1
             pass
 
-        assign_draft_cache_locs[(num_seqs,)](
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            self.extend_lens,
-            self.num_new_pages_per_topk,
-            out_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
-            self.topk,
-            self.speculative_num_steps,
-            self.page_size,
-            next_power_of_2(num_seqs),
-            next_power_of_2(self.speculative_num_steps),
+        # [       topk 0         ] [       topk 1         ]
+        # [iter=0, iter=1, iter=2] [iter=0, iter=1, iter=2]
+
+        # Reshape out_cache_loc to [num_seqs, topk, speculative_num_steps]
+        out_cache_loc_reshaped = out_cache_loc.reshape(
+            num_seqs, self.topk, self.speculative_num_steps
         )
+
+        # Update req_to_token_pool with the cache locations
+        for i in range(num_seqs):
+            req_idx = batch.req_pool_indices[i].item()
+            start_pos = batch.seq_lens[i].item()
+
+            # For each topk branch
+            for k in range(self.topk):
+                # For each speculative step
+                for step in range(self.speculative_num_steps):
+                    token_pos = start_pos + step
+                    cache_loc = out_cache_loc_reshaped[i, k, step].item()
+
+                    # Update req_to_token mapping
+                    if token_pos < batch.req_to_token_pool.req_to_token.shape[1]:
+                        batch.req_to_token_pool[req_idx, token_pos] = cache_loc
 
         if self.page_size > 1 and self.topk > 1:
             # Remove padded slots
@@ -302,7 +311,7 @@ class EAGLEWorker(ModelWorker):
         batch.out_cache_loc = out_cache_loc
         batch.seq_lens_sum = jnp.sum(batch.seq_lens).item()
         batch.return_hidden_states = False
-        spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, axis=0)
+        spec_info.positions = jnp.repeat(batch.seq_lens, self.topk)
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
 
