@@ -1,6 +1,6 @@
 import dataclasses
 from functools import partial
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import jax
 import jax.nn as nn
@@ -11,9 +11,11 @@ from jax.sharding import Mesh
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.embeddings import Embed
-from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.utils.jax_utils import device_array
+
+if TYPE_CHECKING:
+    from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 
 
 @register_pytree_node_class
@@ -90,7 +92,7 @@ class LogitsProcessorOutput:
 
         return obj
 
-    def truncate_logits_processor_output(self, batch: ModelWorkerBatch):
+    def truncate_logits_processor_output(self, batch: "ModelWorkerBatch"):
         # note: here only need to truncate next_token_logits and hidden_states
         self.next_token_logits = jax.lax.dynamic_slice_in_dim(
             self.next_token_logits, 0, batch.real_bs, axis=0
@@ -171,7 +173,7 @@ class LogitsMetadata:
         return obj
 
     @classmethod
-    def from_model_worker_batch(cls, batch: ModelWorkerBatch, mesh: Mesh = None):
+    def from_model_worker_batch(cls, batch: "ModelWorkerBatch", mesh: Mesh = None):
         if batch.forward_mode.is_extend() and batch.return_logprob:
             extend_seq_lens_cpu = batch.extend_seq_lens.tolist()
 
@@ -229,9 +231,15 @@ class LogitsProcessor(nnx.Module):
         self,
         hidden_states: jax.Array,
         logits_metadata: LogitsMetadata,
+        aux_hidden_states: Optional[jax.Array] = None,
     ) -> LogitsProcessorOutput:
-        if logits_metadata.forward_mode.is_decode_or_idle():
+        if (
+            logits_metadata.forward_mode.is_decode_or_idle()
+            or logits_metadata.forward_mode.is_target_verify()
+        ):
             pruned_states = hidden_states
+            if aux_hidden_states is not None:
+                aux_pruned_states = [hidden for hidden in aux_hidden_states]
             sample_indices = None
             input_logprob_indices = None
         elif (
@@ -240,6 +248,8 @@ class LogitsProcessor(nnx.Module):
         ):
             last_index = jnp.cumsum(logits_metadata.extend_seq_lens, axis=0) - 1
             pruned_states = hidden_states[last_index]
+            if aux_hidden_states is not None:
+                aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
             sample_indices = None
             input_logprob_indices = None
         else:
@@ -299,15 +309,26 @@ class LogitsProcessor(nnx.Module):
         hidden_states_to_store: Optional[jax.Array] = None
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
-                hidden_states_to_store = hidden_states
+                if aux_hidden_states is not None:
+                    hidden_states_to_store = jnp.concat(aux_hidden_states, dim=-1)
+                else:
+                    hidden_states_to_store = hidden_states
             elif logits_metadata.capture_hidden_mode.is_last():
                 # Get the last token hidden states. If sample_indices is None,
                 # pruned states only contain the last tokens already.
-                hidden_states_to_store = (
-                    pruned_states[sample_indices]
-                    if sample_indices is not None
-                    else pruned_states
-                )
+                if aux_hidden_states is not None:
+                    aux_pruned_states = jnp.concat(aux_pruned_states, dim=-1)
+                    hidden_states_to_store = (
+                        aux_pruned_states[sample_indices]
+                        if sample_indices is not None
+                        else aux_pruned_states
+                    )
+                else:
+                    hidden_states_to_store = (
+                        pruned_states[sample_indices]
+                        if sample_indices is not None
+                        else pruned_states
+                    )
             else:
                 assert False, "Should never reach"
 

@@ -58,6 +58,7 @@ class ModelRunner:
         tp_size: int,
         server_args: ServerArgs,
         mesh: jax.sharding.Mesh,
+        is_draft_worker: bool,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
         rngs: nnx.Rngs = None,
