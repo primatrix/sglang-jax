@@ -317,22 +317,6 @@ class EAGLEWorker(ModelWorker):
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
 
-def assign_draft_cache_locs(
-    req_pool_indices: jax.Array,
-    req_to_token: jax.Array,
-    seq_lens: jax.Array,
-    extend_lens: jax.Array,
-    num_new_pages_per_topk: jax.Array,
-    out_cache_loc: jax.Array,
-    req_to_token_shape: int,
-    topk: int,
-    speculative_num_steps: int,
-    page_size: int,
-    bs: int,
-) -> None:
-    pass
-
-
 def next_power_of_2(n: int):
     return 1 << (n - 1).bit_length() if n > 0 else 1
 
