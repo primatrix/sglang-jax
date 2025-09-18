@@ -281,12 +281,8 @@ class EAGLEWorker(ModelWorker):
         # [       topk 0         ] [       topk 1         ]
         # [iter=0, iter=1, iter=2] [iter=0, iter=1, iter=2]
 
-        # Reshape out_cache_loc to [num_seqs, topk, speculative_num_steps]
-        out_cache_loc_reshaped = out_cache_loc.reshape(
-            num_seqs, self.topk, self.speculative_num_steps
-        )
-
-        # Update req_to_token_pool with the cache locations
+        # Update req_to_token_pool with cache locations (no reshape needed)
+        # Layout: [seq0_topk0_steps, seq0_topk1_steps, seq1_topk0_steps, ...]
         for i in range(num_seqs):
             req_idx = batch.req_pool_indices[i].item()
             start_pos = batch.seq_lens[i].item()
@@ -295,8 +291,14 @@ class EAGLEWorker(ModelWorker):
             for k in range(self.topk):
                 # For each speculative step
                 for step in range(self.speculative_num_steps):
+                    # Calculate flat index: i * (topk * steps) + k * steps + step
+                    flat_idx = (
+                        i * (self.topk * self.speculative_num_steps)
+                        + k * self.speculative_num_steps
+                        + step
+                    )
                     token_pos = start_pos + step
-                    cache_loc = out_cache_loc_reshaped[i, k, step].item()
+                    cache_loc = out_cache_loc[flat_idx].item()
 
                     # Update req_to_token mapping
                     if token_pos < batch.req_to_token_pool.req_to_token.shape[1]:
