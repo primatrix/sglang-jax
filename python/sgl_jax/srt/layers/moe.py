@@ -289,6 +289,18 @@ class EPMoE(nnx.Module):
         n_gate = w0_kernel.shape[2]
         n_down = wo_kernel.shape[2]
 
+        jax.debug.print("x_shape: {x.shape}", x_shape=x.shape)
+        jax.debug.print(
+            "w0_kernel_shape: {w0_kernel.shape}", w0_kernel_shape=w0_kernel.shape
+        )
+        jax.debug.print(
+            "wo_kernel_shape: {wo_kernel.shape}", wo_kernel_shape=wo_kernel.shape
+        )
+        jax.debug.print(
+            "local_group_sizes: {local_group_sizes}",
+            local_group_sizes=local_group_sizes,
+        )
+
         default_tile_size = (512, 1024, 1024)
         tiling_gate = (
             min(default_tile_size[0], m),
