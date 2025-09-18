@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Any, List
 
+from python.sgl_jax.srt.managers.schedule_batch import ScheduleBatch
+
 
 class SpeculativeAlgorithm(IntEnum):
     NONE = auto()

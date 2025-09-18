@@ -254,6 +254,10 @@ class Req:
         self.cached_tokens = 0
         self.already_computed = 0
 
+        # The number of verification forward passes in the speculative decoding.
+        # This is used to compute the average acceptance length per request.
+        self.spec_verify_ct = 0
+
         # For metrics
         self.has_log_time_stats: bool = False
         self.queue_time_start = None
@@ -477,6 +481,9 @@ class ScheduleBatch:
 
     # Stream
     has_stream: bool = False
+
+    # device
+    device: str = "tpu"
 
     # device mesh
     mesh: mesh_lib.Mesh = None
@@ -1374,6 +1381,7 @@ class ModelWorkerBatch:
 
     spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None
     spec_algorithm: SpeculativeAlgorithm = None
+    # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
 
 
