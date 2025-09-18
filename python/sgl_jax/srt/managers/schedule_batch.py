@@ -9,7 +9,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 - ScheduleBatch is managed by `scheduler.py::Scheduler`.
   It contains high-level scheduling data. Most of the data is on the CPU.
-- ModelWorkerBatch is managed by `tp_worker.py::TpModelWorker`.
+- ModelWorkerBatch is managed by `tp_worker.py::ModelWorker`.
   It is a subset of `ScheduleBatch` that only contains data related to the model forward on GPU.
   It will be transformed from CPU scheduler to GPU model runner.
 - ForwardBatch is managed by `model_runner.py::ModelRunner`.
@@ -20,7 +20,7 @@ import dataclasses
 import logging
 import threading
 from http import HTTPStatus
-from typing import Any, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
 
 import numpy as np
 from jax import numpy as jnp
@@ -40,6 +40,11 @@ from sgl_jax.srt.precision_tracer import (
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 from sgl_jax.srt.server_args import ServerArgs
+from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
+if TYPE_CHECKING:
+    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -477,6 +482,9 @@ class ScheduleBatch:
     mesh: mesh_lib.Mesh = None
 
     cache_miss_count: int = 0
+
+    spec_algorithm: SpeculativeAlgorithm = None
+    spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -1244,6 +1252,8 @@ class ScheduleBatch:
             real_bs=real_bs,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             launch_done=self.launch_done,
+            spec_info=self.spec_info,
+            spec_algorithm=self.spec_algorithm,
         )
 
     def _generate_trace_info(self, real_bs: int, bid: int) -> List[str]:
@@ -1361,6 +1371,10 @@ class ModelWorkerBatch:
 
     # Pre-initialized ForwardBatch for overlap scheduling optimization
     forward_batch: Optional[Any] = None
+
+    spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None
+    spec_algorithm: SpeculativeAlgorithm = None
+    capture_hidden_mode: CaptureHiddenMode = None
 
 
 def get_last_loc(
