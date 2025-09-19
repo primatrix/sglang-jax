@@ -316,26 +316,20 @@ class EPMoE(nnx.Module):
 
         # Extract tiling configuration from gmm_tiling_config_array
         # gmm_tiling_config_array is [tm, tk, tn] from auto-tuning
-        tuned_tm = gmm_tiling_config_array[0]
-        tuned_tk = gmm_tiling_config_array[1]
-        tuned_tn = gmm_tiling_config_array[2]
-        jax.debug.print(
-            "tuned_tm: {tuned_tm}, tuned_tk: {tuned_tk}, tuned_tn: {tuned_tn}",
-            tuned_tm=tuned_tm,
-            tuned_tk=tuned_tk,
-            tuned_tn=tuned_tn,
-        )
+        # Convert to Python integers to avoid JAX tracer issues in custom_vjp
+        tuned_tm = int(gmm_tiling_config_array[0])
+        tuned_tk = int(gmm_tiling_config_array[1])
+        tuned_tn = int(gmm_tiling_config_array[2])
+
         tiling_gate = (
-            jnp.minimum(tuned_tm, m).astype(jnp.int32),
-            jnp.minimum(tuned_tk, k).astype(jnp.int32),
-            jnp.minimum(tuned_tn, n_gate).astype(jnp.int32),
+            min(tuned_tm, m),
+            min(tuned_tk, k),
+            min(tuned_tn, n_gate),
         )
         tiling_down = (
-            jnp.minimum(tuned_tm, m).astype(jnp.int32),
-            jnp.minimum(tuned_tk, n_gate).astype(
-                jnp.int32
-            ),  # k dimension is n_gate for down projection
-            jnp.minimum(tuned_tn, n_down).astype(jnp.int32),
+            min(tuned_tm, m),
+            min(tuned_tk, n_gate),  # k dimension is n_gate for down projection
+            min(tuned_tn, n_down),
         )
         # gate
         layer_w0 = gmm(
