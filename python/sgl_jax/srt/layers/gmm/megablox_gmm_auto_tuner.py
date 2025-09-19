@@ -16,23 +16,13 @@ logger = logging.getLogger(__name__)
 
 class MegabloxGMMAutoTuner:
     # Class-level tile size definitions to avoid duplication
-    TILE_SIZES_M = [8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+    TILE_SIZES_M = [128, 256, 512, 1024, 2048]
     TILE_SIZES_K = [128, 256, 512, 1024, 2048]
     TILE_SIZES_N = [
         128,
         256,
-        384,
         512,
-        768,
-        896,
         1024,
-        1152,
-        1280,
-        1408,
-        1536,
-        1664,
-        1792,
-        1920,
         2048,
     ]
 
