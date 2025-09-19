@@ -253,8 +253,12 @@ class ModelWorker:
         for batch_size in self.precompile_bs_paddings:
             for seq_length in self.precompile_token_paddings:
                 actual_tokens = batch_size * seq_length
-                actual_tokens = min(actual_tokens, self.max_padded_num_tokens)
-                actual_tokens = min(actual_tokens, 16384)  # hard limit
+                if actual_tokens > self.max_padded_num_tokens:
+                    continue
+                if actual_tokens > 16384:  # hard limit
+                    continue
+                # actual_tokens = min(actual_tokens, self.max_padded_num_tokens)
+                # actual_tokens = min(actual_tokens, 16384)
                 m = actual_tokens * self.num_experts_per_tok
 
                 if m < self.num_experts_per_tok:
