@@ -20,7 +20,7 @@ import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import jax
 
@@ -35,6 +35,9 @@ if TYPE_CHECKING:
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
 
 from jax.tree_util import register_pytree_node_class
+
+from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 class ForwardMode(IntEnum):

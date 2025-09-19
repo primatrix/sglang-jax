@@ -40,7 +40,7 @@ class NativeAttention(AttentionBackend):
         )
 
     def get_forward_metadata(self, batch: ModelWorkerBatch, mesh: Mesh):
-        """Init the metadata for a forward pass and return it."""
+        """Get the metadata for a forward pass."""
         return None
 
     def __call__(

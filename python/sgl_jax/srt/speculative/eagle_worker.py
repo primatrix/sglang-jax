@@ -226,7 +226,7 @@ class EAGLEWorker(ModelWorker):
         out_cache_loc = out_cache_loc.reshape(
             forward_batch.batch_size, self.topk, self.speculative_num_steps
         )
-        out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
+        out_cache_loc = jnp.transpose(out_cache_loc, (2, 0, 1)).reshape(
             self.speculative_num_steps, -1
         )
         # Return values
@@ -247,7 +247,7 @@ class EAGLEWorker(ModelWorker):
                 break
             forward_batch.input_ids = input_ids
             forward_batch.out_cache_loc = out_cache_loc[i]
-            forward_batch.positions.add(1)
+            forward_batch.positions = forward_batch.positions + 1
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
 
