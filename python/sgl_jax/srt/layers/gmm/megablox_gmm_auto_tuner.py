@@ -114,6 +114,11 @@ class MegabloxGMMAutoTuner:
 
         candidates = []
 
+        # Initialize effective dimensions to handle case where no candidates pass all checks
+        effective_tm = min(tile_sizes_m[0], m)
+        effective_tk = min(tile_sizes_k[0], k)
+        effective_tn = min(tile_sizes_n[0], n)
+
         for tm in tile_sizes_m:
             if tm > m:
                 continue
