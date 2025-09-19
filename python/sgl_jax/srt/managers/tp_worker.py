@@ -14,6 +14,8 @@ from jax.experimental.multihost_utils import broadcast_one_to_all
 from tqdm import tqdm
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.layers.gmm.megablox_gmm_auto_tuner import MegabloxGMMAutoTuner
+from sgl_jax.srt.layers.gmm.megablox_gmm_tuning_manager import get_default_cache_dir
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.managers.schedule_batch import (
     ModelWorkerBatch,
@@ -183,6 +185,124 @@ class ModelWorker:
             normalized_token_paddings.append(self.max_padded_num_tokens)
 
         self.precompile_token_paddings = normalized_token_paddings
+
+    def run_gmm_auto_tune(self):
+        start_time = time.perf_counter()
+        logger.info("[GMM AUTO-TUNE] Starting GMM tiling auto-tuning")
+
+        hf_config = self.model_config.hf_config
+
+        # check if this is a MoE model
+        self.num_experts = getattr(hf_config, "num_experts", None)
+        if self.num_experts is None:
+            self.disable_gmm_auto_tune = True
+            return
+        self.disable_gmm_auto_tune = False
+        logger.info(
+            f"[GMM AUTO-TUNE] MoE model detected with {self.num_experts} experts"
+        )
+
+        self.hidden_size = getattr(hf_config, "hidden_size", 4096)
+        self.intermediate_size = getattr(hf_config, "intermediate_size", None)
+        self.moe_intermediate_size = getattr(hf_config, "moe_intermediate_size", None)
+
+        logger.info(
+            f"[GMM AUTO-TUNE] Model config: hidden_size={self.hidden_size}, "
+            f"moe_intermediate_size={self.moe_intermediate_size}, num_experts={self.num_experts}"
+        )
+
+        self.num_experts_per_tok = getattr(hf_config, "num_experts_per_tok", 8)
+        # Generate all combinations: m = batch_size * seq_length * num_experts_per_tok
+        logger.info(f"[GMM AUTO-TUNE] Using precompile parameters for shape generation")
+        logger.info(
+            f"[GMM AUTO-TUNE] Batch size paddings: {self.precompile_bs_paddings}"
+        )
+        logger.info(
+            f"[GMM AUTO-TUNE] Sequence length paddings: {self.precompile_token_paddings}"
+        )
+        logger.info(f"[GMM AUTO-TUNE] Experts per token: {self.num_experts_per_tok}")
+        logger.info(
+            f"[GMM AUTO-TUNE] Max padded num tokens: {self.max_padded_num_tokens}"
+        )
+
+        shapes = []
+        logger.info(f"[GMM AUTO-TUNE] Adding decode-specific shapes (seq_length=1)")
+        for batch_size in self.precompile_bs_paddings:
+            seq_length = 1
+            actual_tokens = batch_size * seq_length
+
+            # Decode: m = batch_size * num_experts_per_tok
+            m = actual_tokens * self.num_experts_per_tok
+
+            if m < self.num_experts_per_tok:
+                continue
+
+            # Add shapes for decode gate/up projections (hidden -> intermediate)
+            shapes.append(
+                (m, self.hidden_size, self.moe_intermediate_size, self.num_experts)
+            )
+            # Add shapes for decode down projections (intermediate -> hidden)
+            shapes.append(
+                (m, self.moe_intermediate_size, self.hidden_size, self.num_experts)
+            )
+
+        logger.info(f"[GMM AUTO-TUNE] Adding prefill shapes (variable seq_length)")
+        for batch_size in self.precompile_bs_paddings:
+            for seq_length in self.precompile_token_paddings:
+                actual_tokens = batch_size * seq_length
+
+                m = actual_tokens * self.num_experts_per_tok
+
+                if m < self.num_experts_per_tok:
+                    continue
+
+                shapes.append(
+                    (
+                        m,
+                        self.hidden_size,
+                        self.moe_intermediate_size,
+                        self.num_experts,
+                    )
+                )
+
+                shapes.append(
+                    (
+                        m,
+                        self.moe_intermediate_size,
+                        self.hidden_size,
+                        self.num_experts,
+                    )
+                )
+        if not shapes:
+            logger.warning("[GMM AUTO-TUNE] No valid shapes to tune, auto tune skipped")
+            return
+
+        cache_dir = get_default_cache_dir()
+        tuner = MegabloxGMMAutoTuner(cache_dir=cache_dir)
+        logger.info(f"[GMM AUTO-TUNE] Using cache directory: {cache_dir}")
+
+        results = {}
+        total_shapes = len(shapes)
+        logger.info(f"[GMM AUTO-TUNE] Tuning {total_shapes} shape configurations")
+
+        with tqdm(shapes, desc="[GMM AUTO-TUNE] Progress", leave=False) as pbar:
+            for i, (m, k, n, num_groups) in enumerate(pbar):
+                pbar.set_postfix(shape=f"m={m},k={k},n={n},g={num_groups}")
+
+                optimal_tiling = tuner.tune_for_target_size(
+                    m, k, n, num_groups, use_cache=True
+                )
+                cache_key = tuner._get_cache_key(m, k, n, num_groups)
+                results[cache_key] = optimal_tiling
+
+        end_time = time.perf_counter()
+        logger.info(f"[GMM AUTO-TUNE] Completed in {end_time - start_time:.1f} seconds")
+        logger.info(
+            f"[GMM AUTO-TUNE] Successfully tuned {len(results)}/{total_shapes} configurations"
+        )
+
+        logger.info("[GMM AUTO-TUNE] Loading tuning results into memory")
+        self.gmm_tiling_configs = results
 
     def run_precompile(self):
         self.precompile_extend()

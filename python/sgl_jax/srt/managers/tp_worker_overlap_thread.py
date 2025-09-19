@@ -245,5 +245,8 @@ class ModelWorkerClient:
         )
         self.worker.run_precompile()
 
+    def run_gmm_auto_tune(self):
+        self.worker.run_gmm_auto_tune()
+
     def __delete__(self):
         self.input_queue.put((None, None, None, None))
