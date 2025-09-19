@@ -81,6 +81,9 @@ class MegabloxGMMTuningManager:
 
         return self.default_tuning_result
 
+    def get_all_tuning_results(self) -> Dict[str, np.ndarray[np.int32]]:
+        return self.tuning_cache
+
     def _get_cache_key(self, m: int, k: int, n: int, num_groups: int) -> str:
         return f"m{m}_k{k}_n{n}_g{num_groups}"
 

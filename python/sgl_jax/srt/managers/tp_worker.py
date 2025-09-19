@@ -15,7 +15,10 @@ from tqdm import tqdm
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.gmm.megablox_gmm_auto_tuner import MegabloxGMMAutoTuner
-from sgl_jax.srt.layers.gmm.megablox_gmm_tuning_manager import get_default_cache_dir
+from sgl_jax.srt.layers.gmm.megablox_gmm_tuning_manager import (
+    get_default_cache_dir,
+    get_global_megablox_gmm_tuning_manager,
+)
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.managers.schedule_batch import (
     ModelWorkerBatch,
@@ -302,7 +305,8 @@ class ModelWorker:
         )
 
         logger.info("[GMM AUTO-TUNE] Loading tuning results into memory")
-        self.gmm_tiling_configs = results
+        manager = get_global_megablox_gmm_tuning_manager(cache_dir=cache_dir)
+        self.gmm_tiling_configs = manager.get_all_tuning_results()
 
     def run_precompile(self):
         self.precompile_extend()
@@ -412,6 +416,13 @@ class ModelWorker:
         valid_cache_loc = np.arange(bs)
         invalid_cache_loc = np.array([0] * (invalid_cache_loc_size), dtype=jnp.int32)
 
+        gmm_tiling_config_array = np.array([512, 1024, 1024], dtype=np.int32)
+        if not self.disable_gmm_auto_tune:
+            tiling_key = f"m{bs * num_tokens* self.num_experts_per_tok}_k{self.hidden_size}_n{self.moe_intermediate_size}_g{self.num_experts}"
+            gmm_tiling_config_array = self.gmm_tiling_configs.get(
+                tiling_key, np.array([512, 1024, 1024], dtype=np.int32)
+            )
+
         return ModelWorkerBatch(
             bid=1,
             forward_mode=mode,
@@ -439,6 +450,7 @@ class ModelWorker:
             token_ids_logprobs=None,
             extend_logprob_start_lens=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
+            gmm_tiling_config_array=gmm_tiling_config_array,
         )
 
     def get_model_runner(self):

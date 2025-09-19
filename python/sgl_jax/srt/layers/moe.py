@@ -173,7 +173,7 @@ class EPMoE(nnx.Module):
         except Exception as e:
             return False, "cpu"
 
-    def __call__(self, inputs, router_logits=None):
+    def __call__(self, inputs, router_logits=None, gmm_tiling_config_array=None):
         if router_logits is None:
             raise ValueError("router_logits is required for EPMoE")
 
@@ -188,13 +188,22 @@ class EPMoE(nnx.Module):
         if self.expert_parallel_size == 1:
             output = self._single_device_forward(inputs, router_logits)
         else:
-            output = self._expert_parallel_forward_with_shard_map(inputs, router_logits)
+            output = self._expert_parallel_forward_with_shard_map(
+                inputs, router_logits, gmm_tiling_config_array
+            )
 
         return output
 
-    def _expert_parallel_forward_with_shard_map(self, inputs, router_logits):
+    def _expert_parallel_forward_with_shard_map(
+        self, inputs, router_logits, gmm_tiling_config_array
+    ):
         def _internal_moe_computation(
-            hidden_states, router_logits, w0_weights, w1_weights, wo_weights
+            hidden_states,
+            router_logits,
+            w0_weights,
+            w1_weights,
+            wo_weights,
+            gmm_tiling_config_array,
         ):
             data_index = jax.lax.axis_index("data")
             tensor_index = jax.lax.axis_index("tensor")
@@ -243,6 +252,7 @@ class EPMoE(nnx.Module):
                 w0_weights,
                 w1_weights,
                 wo_weights,
+                gmm_tiling_config_array,
             )
 
             # EP Combine
@@ -271,13 +281,28 @@ class EPMoE(nnx.Module):
                 P(("data", "tensor"), None, None),  # w0_weights
                 P(("data", "tensor"), None, None),  # w1_weights
                 P(("data", "tensor"), None, None),  # wo_weights
+                P(None),  # gmm_tiling_config_array
             ),
             out_specs=P(None),
             check_rep=False,
-        )(inputs, router_logits, self.wi_0.value, self.wi_1.value, self.wo.value)
+        )(
+            inputs,
+            router_logits,
+            self.wi_0.value,
+            self.wi_1.value,
+            self.wo.value,
+            gmm_tiling_config_array,
+        )
 
     def _gmm_compute_with_sharded_weights(
-        self, x, local_group_sizes, selected_experts, w0_kernel, w1_kernel, wo_kernel
+        self,
+        x,
+        local_group_sizes,
+        selected_experts,
+        w0_kernel,
+        w1_kernel,
+        wo_kernel,
+        gmm_tiling_config_array,
     ):
         if x.shape[0] == 0:
             empty_output = jnp.zeros(
@@ -289,16 +314,28 @@ class EPMoE(nnx.Module):
         n_gate = w0_kernel.shape[2]
         n_down = wo_kernel.shape[2]
 
-        default_tile_size = (512, 1024, 1024)
+        # Extract tiling configuration from gmm_tiling_config_array
+        # gmm_tiling_config_array is [tm, tk, tn] from auto-tuning
+        tuned_tm = gmm_tiling_config_array[0]
+        tuned_tk = gmm_tiling_config_array[1]
+        tuned_tn = gmm_tiling_config_array[2]
+        jax.debug.print(
+            "tuned_tm: {tuned_tm}, tuned_tk: {tuned_tk}, tuned_tn: {tuned_tn}",
+            tuned_tm=tuned_tm,
+            tuned_tk=tuned_tk,
+            tuned_tn=tuned_tn,
+        )
         tiling_gate = (
-            min(default_tile_size[0], m),
-            min(default_tile_size[1], k),
-            min(default_tile_size[2], n_gate),
+            jnp.minimum(tuned_tm, m).astype(jnp.int32),
+            jnp.minimum(tuned_tk, k).astype(jnp.int32),
+            jnp.minimum(tuned_tn, n_gate).astype(jnp.int32),
         )
         tiling_down = (
-            min(default_tile_size[0], m),
-            min(default_tile_size[1], n_gate),
-            min(default_tile_size[2], n_down),
+            jnp.minimum(tuned_tm, m).astype(jnp.int32),
+            jnp.minimum(tuned_tk, n_gate).astype(
+                jnp.int32
+            ),  # k dimension is n_gate for down projection
+            jnp.minimum(tuned_tn, n_down).astype(jnp.int32),
         )
         # gate
         layer_w0 = gmm(

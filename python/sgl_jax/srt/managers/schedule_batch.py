@@ -1362,6 +1362,8 @@ class ModelWorkerBatch:
     # Pre-initialized ForwardBatch for overlap scheduling optimization
     forward_batch: Optional[Any] = None
 
+    gmm_tiling_config_array: np.ndarray = None
+
 
 def get_last_loc(
     req_to_token: np.ndarray,

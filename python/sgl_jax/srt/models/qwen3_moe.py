@@ -255,7 +255,11 @@ class QWen3MoeDecoderLayer(nnx.Module):
 
         if self.is_moe_layer:
             router_logits = self.moe_gate(hidden_states)
-            mlp_output = self.mlp(hidden_states, router_logits=router_logits)
+            mlp_output = self.mlp(
+                hidden_states,
+                router_logits=router_logits,
+                gmm_tiling_config_array=forward_batch.gmm_tiling_config_array,
+            )
             hidden_states = mlp_output
         else:
             hidden_states = self.mlp(hidden_states)

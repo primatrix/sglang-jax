@@ -46,23 +46,23 @@ class MegabloxGMMAutoTuner:
     def _get_cache_file(self, cache_key: str) -> str:
         return os.path.join(self.cache_dir, f"{cache_key}.json")
 
-    def _load_cached_result(self, cache_key: str) -> Optional[Tuple[int, int, int]]:
+    def _load_cached_result(self, cache_key: str) -> Optional[np.ndarray]:
         cache_file = self._get_cache_file(cache_key)
         if os.path.exists(cache_file):
             try:
                 with open(cache_file, "r") as f:
                     data = json.load(f)
-                    return tuple(data["tuning_result"])
+                    return np.array(data["tuning_result"], dtype=np.int32)
             except Exception:
                 pass
         return None
 
     def _save_cached_result(
-        self, cache_key: str, tuning_result: Tuple[int, int, int], best_time: float
+        self, cache_key: str, tuning_result: np.ndarray, best_time: float
     ):
         cache_file = self._get_cache_file(cache_key)
         data = {
-            "tuning_result": list(tuning_result),
+            "tuning_result": tuning_result.tolist(),
             "best_time_ms": best_time * 1000,
             "timestamp": time.time(),
         }
@@ -197,7 +197,7 @@ class MegabloxGMMAutoTuner:
 
     def _find_best_tiling(
         self, lhs, rhs, group_sizes, candidates: List[Tuple[int, int, int]]
-    ) -> Tuple[Optional[Tuple[int, int, int]], float, dict]:
+    ) -> Tuple[Optional[np.ndarray], float, dict]:
         """Find the best tiling from candidates and return result with failure stats."""
         best_tiling = None
         best_time = float("inf")
@@ -208,7 +208,7 @@ class MegabloxGMMAutoTuner:
                 avg_time = self._benchmark_gmm(lhs, rhs, group_sizes, tiling)
                 if avg_time < best_time:
                     best_time = avg_time
-                    best_tiling = tiling
+                    best_tiling = np.array(tiling, dtype=np.int32)
             except Exception as e:
                 error_type = type(e).__name__
                 error_msg = str(e)
@@ -223,7 +223,7 @@ class MegabloxGMMAutoTuner:
 
         return best_tiling, best_time, failure_reasons
 
-    def _get_fallback_tiling(self, m: int, k: int, n: int) -> Tuple[int, int, int]:
+    def _get_fallback_tiling(self, m: int, k: int, n: int) -> np.ndarray:
         """Get a conservative fallback tiling that should always work."""
         # Find largest tiles that divide dimensions and meet TPU constraints
 
@@ -252,7 +252,7 @@ class MegabloxGMMAutoTuner:
                     fallback_tn = tn
                     break
 
-        return (fallback_tm, fallback_tk, fallback_tn)
+        return np.array([fallback_tm, fallback_tk, fallback_tn], dtype=np.int32)
 
     def tune_for_target_size(
         self,
@@ -261,7 +261,7 @@ class MegabloxGMMAutoTuner:
         n: int,
         num_groups: int,
         use_cache: bool = True,
-    ) -> Tuple[int, int, int]:
+    ) -> np.ndarray[np.int32]:
         """Find the optimal tiling configuration for given problem dimensions.
 
         Args:
@@ -272,7 +272,7 @@ class MegabloxGMMAutoTuner:
             use_cache: Whether to use cached results
 
         Returns:
-            Optimal tiling configuration (tm, tk, tn)
+            Optimal tiling configuration as np.ndarray([tm, tk, tn])
         """
         cache_key = self._get_cache_key(m, k, n, num_groups)
 
