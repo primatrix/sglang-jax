@@ -197,13 +197,17 @@ class EPMoE(nnx.Module):
     def _expert_parallel_forward_with_shard_map(
         self, inputs, router_logits, gmm_tiling_config_array
     ):
+        # Extract tiling configuration outside of shard_map to avoid tracer issues
+        tuned_tm = int(gmm_tiling_config_array[0])
+        tuned_tk = int(gmm_tiling_config_array[1])
+        tuned_tn = int(gmm_tiling_config_array[2])
+
         def _internal_moe_computation(
             hidden_states,
             router_logits,
             w0_weights,
             w1_weights,
             wo_weights,
-            gmm_tiling_config_array,
         ):
             data_index = jax.lax.axis_index("data")
             tensor_index = jax.lax.axis_index("tensor")
@@ -252,7 +256,9 @@ class EPMoE(nnx.Module):
                 w0_weights,
                 w1_weights,
                 wo_weights,
-                gmm_tiling_config_array,
+                tuned_tm,
+                tuned_tk,
+                tuned_tn,
             )
 
             # EP Combine
@@ -281,7 +287,6 @@ class EPMoE(nnx.Module):
                 P(("data", "tensor"), None, None),  # w0_weights
                 P(("data", "tensor"), None, None),  # w1_weights
                 P(("data", "tensor"), None, None),  # wo_weights
-                P(None),  # gmm_tiling_config_array
             ),
             out_specs=P(None),
             check_rep=False,
@@ -291,7 +296,6 @@ class EPMoE(nnx.Module):
             self.wi_0.value,
             self.wi_1.value,
             self.wo.value,
-            gmm_tiling_config_array,
         )
 
     def _gmm_compute_with_sharded_weights(
@@ -302,7 +306,9 @@ class EPMoE(nnx.Module):
         w0_kernel,
         w1_kernel,
         wo_kernel,
-        gmm_tiling_config_array,
+        tuned_tm,
+        tuned_tk,
+        tuned_tn,
     ):
         if x.shape[0] == 0:
             empty_output = jnp.zeros(
@@ -314,12 +320,7 @@ class EPMoE(nnx.Module):
         n_gate = w0_kernel.shape[2]
         n_down = wo_kernel.shape[2]
 
-        # Extract tiling configuration from gmm_tiling_config_array
-        # gmm_tiling_config_array is [tm, tk, tn] from auto-tuning
-        # Convert to Python integers to avoid JAX tracer issues in custom_vjp
-        tuned_tm = int(gmm_tiling_config_array[0])
-        tuned_tk = int(gmm_tiling_config_array[1])
-        tuned_tn = int(gmm_tiling_config_array[2])
+        # tuned_tm, tuned_tk, tuned_tn are already Python integers from auto-tuning
 
         tiling_gate = (
             min(tuned_tm, m),
