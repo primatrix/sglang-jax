@@ -198,9 +198,9 @@ class EPMoE(nnx.Module):
         self, inputs, router_logits, gmm_tiling_config_array
     ):
         # Extract tiling configuration outside of shard_map to avoid tracer issues
-        tuned_tm = int(gmm_tiling_config_array[0])
-        tuned_tk = int(gmm_tiling_config_array[1])
-        tuned_tn = int(gmm_tiling_config_array[2])
+        tuned_tm = gmm_tiling_config_array[0].astype(jnp.int32)
+        tuned_tk = gmm_tiling_config_array[1].astype(jnp.int32)
+        tuned_tn = gmm_tiling_config_array[2].astype(jnp.int32)
 
         def _internal_moe_computation(
             hidden_states,
