@@ -106,7 +106,7 @@ class MegabloxGMMAutoTuner:
         return np.mean(times)
 
     def _generate_tiling_candidates(
-        self, m: int, k: int, n: int
+        self, m: int, k: int, n: int, dtype: jnp.dtype = jnp.bfloat16
     ) -> List[Tuple[int, int, int]]:
         tile_sizes_m = self.TILE_SIZES_M
         tile_sizes_k = self.TILE_SIZES_K
@@ -166,7 +166,87 @@ class MegabloxGMMAutoTuner:
 
         candidates.sort(key=lambda x: (x[0] * x[1] * x[2], x[0], x[1], x[2]))
 
+        # Filter out candidates that exceed memory limits
+        candidates = self._filter_by_memory_limit(candidates, dtype=dtype)
+
         return candidates
+
+    def _estimate_tile_memory_usage(
+        self, tm: int, tk: int, tn: int, dtype: jnp.dtype = jnp.bfloat16
+    ) -> int:
+        """Estimate memory usage for a tiling configuration in bytes.
+
+        Args:
+            tm, tk, tn: Tile dimensions
+            dtype: Data type for input/output matrices
+
+        Returns:
+            Estimated memory usage in bytes
+        """
+        # Data type sizes in bytes
+        dtype_size = {
+            jnp.bfloat16: 2,
+            jnp.float16: 2,
+            jnp.float32: 4,
+        }.get(
+            dtype, 4
+        )  # Default to 4 bytes if unknown
+
+        # Memory components:
+        # 1. lhs tile: (tm, tk)
+        lhs_memory = tm * tk * dtype_size
+
+        # 2. rhs tile: (tk, tn)
+        rhs_memory = tk * tn * dtype_size
+
+        # 3. accumulator/output tile: (tm, tn) - always fp32 for accumulation
+        acc_memory = tm * tn * 4  # float32
+
+        # 4. Additional overhead (temp variables, alignment, etc.) ~20%
+        base_memory = lhs_memory + rhs_memory + acc_memory
+        overhead = int(base_memory * 0.2)
+
+        total_memory = base_memory + overhead
+
+        return total_memory
+
+    def _filter_by_memory_limit(
+        self,
+        candidates: List[Tuple[int, int, int]],
+        dtype: jnp.dtype = jnp.bfloat16,
+        max_memory_mb: int = 64,
+    ) -> List[Tuple[int, int, int]]:
+        """Filter out tiling candidates that exceed memory limits.
+
+        Args:
+            candidates: List of (tm, tk, tn) tuples
+            dtype: Data type for computation
+            max_memory_mb: Maximum memory limit in MB
+
+        Returns:
+            Filtered list of candidates
+        """
+        max_memory_bytes = max_memory_mb * 1024 * 1024  # Convert MB to bytes
+        filtered_candidates = []
+
+        for tm, tk, tn in candidates:
+            memory_usage = self._estimate_tile_memory_usage(tm, tk, tn, dtype)
+
+            if memory_usage <= max_memory_bytes:
+                filtered_candidates.append((tm, tk, tn))
+            else:
+                logger.debug(
+                    f"Skipping tiling ({tm}, {tk}, {tn}) - "
+                    f"memory usage {memory_usage / (1024*1024):.1f}MB > "
+                    f"{max_memory_mb}MB limit"
+                )
+
+        logger.debug(
+            f"Memory filtering: {len(filtered_candidates)}/{len(candidates)} "
+            f"candidates within {max_memory_mb}MB limit"
+        )
+
+        return filtered_candidates
 
     def _format_failure_summary(self, failure_reasons: dict) -> str:
         """Format failure reasons into a readable summary."""
@@ -277,7 +357,7 @@ class MegabloxGMMAutoTuner:
 
         # Create test data and generate candidates
         lhs, rhs, group_sizes = self._create_mock_data(m, k, n, num_groups)
-        candidates = self._generate_tiling_candidates(m, k, n)
+        candidates = self._generate_tiling_candidates(m, k, n, dtype=lhs.dtype)
 
         if not candidates:
             logger.warning(
