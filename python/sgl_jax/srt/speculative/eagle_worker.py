@@ -216,7 +216,9 @@ class EAGLEWorker(ModelWorker):
 
         # Run forward steps
         score_list, token_list, parents_list = self.draft_forward(batch)
-
+        logger.info(f"-------------score_list------------{score_list}")
+        logger.info(f"-------------token_list------------{token_list}")
+        logger.info(f"-------------parents_list------------{parents_list}")
         (
             tree_mask,
             position,
