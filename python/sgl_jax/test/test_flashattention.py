@@ -8,7 +8,7 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.layers.attention.flash_attn_kernel.flash_attention import (
     ref_ragged_paged_attention,
 )
-from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
+from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -228,7 +228,7 @@ def create_test_data(
         extend_seq_lens = None
 
     # init attention backend
-    attention_backend = FlashAttention(
+    attention_backend = FlashAttentionBackend(
         num_heads, num_kv_heads, head_dim, page_size=page_size
     )
     forward_mode = ForwardMode.EXTEND if mode == "prefill" else ForwardMode.DECODE

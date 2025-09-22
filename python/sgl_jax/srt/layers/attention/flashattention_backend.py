@@ -64,7 +64,7 @@ class FlashAttentionMetadata:
 
 @register_pytree_node_class
 @dataclass
-class FlashAttention(AttentionBackend):
+class FlashAttentionBackend(AttentionBackend):
     """Native Attention layer for variable-length sequences using ForwardBatch."""
 
     def __init__(
