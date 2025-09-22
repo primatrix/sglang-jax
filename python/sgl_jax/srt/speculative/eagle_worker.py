@@ -191,7 +191,7 @@ class EAGLEWorker(ModelWorker):
 
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
-
+        logger.info(f"-------------draft------------{spec_info}")
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         spec_info.num_tokens_per_batch = self.topk
         spec_info.num_tokens_for_logprob_per_batch = self.topk
