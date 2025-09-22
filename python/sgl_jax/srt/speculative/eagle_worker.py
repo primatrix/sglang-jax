@@ -152,10 +152,9 @@ class EAGLEWorker(ModelWorker):
             else:
                 unfinished_req_index.append(i)
         if has_finished:
-            unfinished_index_device = jax.numpy.array(
+            unfinished_index_device = jnp.array(
                 unfinished_req_index,
-                dtype=jax.numpy.int64,
-                device=batch.spec_info.topk_p.device,
+                dtype=jnp.int64,
             )
             batch.spec_info.filter_batch(
                 unfinished_index_device, has_been_filtered=False
@@ -184,27 +183,56 @@ class EAGLEWorker(ModelWorker):
         spec_info.num_tokens_for_logprob_per_batch = self.topk
         batch.return_hidden_states = False
 
-        # Get forward batch
-        model_worker_batch = batch.get_model_worker_batch()
-        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
-        forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.draft_model_runner
-        )
-        if not forward_batch.forward_mode.is_idle():
-            # Initialize attention backend
-            forward_metadata = (
-                self.draft_model_runner.attn_backend.get_forward_metadata(
-                    model_worker_batch, self.mesh
-                )
-            )
-            self.draft_model_runner.attn_backend.forward_metadata = forward_metadata
+        # if not model_worker_batch.forward_mode.is_idle():
+        #     forward_batch = ForwardBatch.init_new(
+        #         model_worker_batch, self.draft_model_runner
+        #     )
+        #     # Initialize attention backend
+        #     forward_metadata = (
+        #         self.draft_model_runner.attn_backend.get_forward_metadata(
+        #             model_worker_batch, self.mesh
+        #         )
+        #     )
+        #     self.draft_model_runner.attn_backend.forward_metadata = forward_metadata
 
         # Run forward steps
-        score_list, token_list, parents_list = self.draft_forward(forward_batch)
+        score_list, token_list, parents_list = self.draft_forward(batch)
 
+        (
+            tree_mask,
+            position,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            draft_tokens,
+        ) = build_tree_kernel_efficient(
+            spec_info.verified_id,
+            score_list,
+            token_list,
+            parents_list,
+            batch.seq_lens,
+            batch.seq_lens_sum,
+            self.topk,
+            self.speculative_num_steps,
+            self.speculative_num_draft_tokens,
+        )
         # build tree
 
-        return EagleVerifyInput()
+        return EagleVerifyInput(
+            draft_token=draft_tokens,
+            custom_mask=tree_mask,
+            positions=position,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
+            retrive_cum_len=None,
+            spec_steps=self.speculative_num_steps,
+            topk=self.topk,
+            draft_token_num=self.speculative_num_draft_tokens,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+            seq_lens_sum=batch.seq_lens_sum,
+            seq_lens_cpu=batch.seq_lens,
+        )
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleDraftInput):
         pass
@@ -212,10 +240,15 @@ class EAGLEWorker(ModelWorker):
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         pass
 
-    def draft_forward(self, forward_batch: ForwardBatch):
-        spec_info = forward_batch.spec_info
+    def draft_forward(self, schedule_batch: ScheduleBatch):
+
+        # Get forward batch
+        model_worker_batch = schedule_batch.get_model_worker_batch()
+        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
+
+        spec_info = model_worker_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
-        out_cache_loc = forward_batch.out_cache_loc
+        out_cache_loc = model_worker_batch.out_cache_loc
         topk_p, topk_index, hidden_states = (
             spec_info.topk_p,
             spec_info.topk_index,
@@ -224,7 +257,7 @@ class EAGLEWorker(ModelWorker):
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
         out_cache_loc = out_cache_loc.reshape(
-            forward_batch.batch_size, self.topk, self.speculative_num_steps
+            schedule_batch.batch_size(), self.topk, self.speculative_num_steps
         )
         out_cache_loc = jnp.transpose(out_cache_loc, (2, 0, 1)).reshape(
             self.speculative_num_steps, -1
@@ -245,19 +278,28 @@ class EAGLEWorker(ModelWorker):
 
             if i == self.speculative_num_steps - 1:
                 break
-            forward_batch.input_ids = input_ids
-            forward_batch.out_cache_loc = out_cache_loc[i]
-            forward_batch.positions = forward_batch.positions + 1
-            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+            model_worker_batch.input_ids = input_ids
+            model_worker_batch.out_cache_loc = out_cache_loc[i]
+            model_worker_batch.positions = model_worker_batch.positions + 1
+            self.draft_model_runner.attn_backend.forward_metadata = (
+                self.draft_model_runner.attn_backend.get_forward_metadata(
+                    model_worker_batch, self.draft_model_runner.mesh
+                )
+            )
             spec_info.hidden_states = hidden_states
-
+            forward_batch = ForwardBatch.init_new(
+                model_worker_batch, self.draft_model_runner
+            )
             # Run forward
             logits_output, _ = self.draft_model_runner.forward(
-                forward_batch, skip_attn_backend_init=True
+                forward_batch,
+                logits_metadata=LogitsMetadata.from_model_worker_batch(
+                    model_worker_batch, self.draft_model_runner.mesh
+                ),
             )
-            self._detect_nan_if_needed(logits_output)
-            probs = jnp.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            # self._detect_nan_if_needed(logits_output)
+            probs = jax.nn.softmax(logits_output.next_token_logits, axis=-1)
+            topk_p, topk_index = fast_topk(probs, self.topk, axis=-1)
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
@@ -317,18 +359,93 @@ class EAGLEWorker(ModelWorker):
             ]
 
         batch.out_cache_loc = out_cache_loc
-        batch.seq_lens_sum = jnp.sum(batch.seq_lens).item()
+        batch.seq_lens_sum = int(jnp.sum(batch.seq_lens))
         batch.return_hidden_states = False
         spec_info.positions = jnp.repeat(batch.seq_lens, self.topk)
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
 
+def fast_topk(values, topk, axis=-1):
+    if axis != -1:
+        # Move target axis to last position
+        values = jnp.moveaxis(values, axis, -1)
+
+    if topk == 1:
+        # Get max value and index for k=1 case
+        max_vals = jnp.max(values, axis=-1, keepdims=True)
+        max_indices = jnp.argmax(values, axis=-1, keepdims=True)
+        result_vals, result_indices = max_vals, max_indices
+    else:
+        # Use top_k for k>1 case (operates on last axis)
+        result_vals, result_indices = jax.lax.top_k(values, topk)
+
+    if axis != -1:
+        # Move axis back to original position
+        result_vals = jnp.moveaxis(result_vals, -1, axis)
+        result_indices = jnp.moveaxis(result_indices, -1, axis)
+
+    return result_vals, result_indices
+
+
 def select_top_k_tokens(
-    step: int,
+    i: int,
     topk_p: jax.Array,
     topk_index: jax.Array,
     hidden_states: jax.Array,
     scores: jax.Array,
     topk: int,
 ) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    if i == 0:
+        # The first step after extend
+        input_ids = topk_index.flatten()
+        hidden_states = jnp.repeat(hidden_states, topk, axis=0)
+        scores = topk_p  # shape: (b, topk)
+
+        tree_info = (
+            jnp.expand_dims(topk_p, axis=1),  # shape: (b, 1, topk)
+            topk_index,  # shape: (b, topk)
+            jnp.tile(
+                jnp.expand_dims(jnp.arange(-1, topk, dtype=jnp.float32), axis=0),
+                (topk_p.shape[0], 1),
+            ),  # shape: (b, topk + 1)
+        )
+    else:
+        # The later decode steps
+        expand_scores = jnp.mul(
+            jnp.expand_dims(scores, axis=2), topk_p.reshape(-1, topk, topk)
+        )  # (b, topk, 1) x (b, topk ,topk) -> (b, topk, topk)
+        topk_cs_p, topk_cs_index = fast_topk(
+            expand_scores.reshape(expand_scores.shape[0], -1), topk, axis=-1
+        )  # (b, topk)
+        scores = topk_cs_p  # shape: (b, topk)
+
+        topk_index = topk_index.reshape(-1, topk**2)
+        input_ids = jnp.take_along_axis(topk_index, topk_cs_index, axis=1).flatten()
+
+        if hidden_states.shape[0] > 0:
+            selected_input_index = topk_cs_index.flatten() // topk + jnp.repeat(
+                jnp.arange(0, hidden_states.shape[0], topk), topk
+            )
+            hidden_states = hidden_states[selected_input_index, :]
+
+        tree_info = (
+            expand_scores,  # shape: (b, topk, topk)
+            topk_index,  # shape: (b, topk * topk)
+            topk_cs_index + (topk**2 * (i - 1) + topk),  # shape: (b, topk)
+        )
+
+    return input_ids, hidden_states, scores, tree_info
+
+
+def build_tree_kernel_efficient(
+    verified_id: jax.Array,
+    score_list: List[jax.Array],
+    token_list: List[jax.Array],
+    parents_list: List[jax.Array],
+    seq_lens: jax.Array,
+    seq_lens_sum: int,
+    topk: int,
+    speculative_num_steps: int,
+    speculative_num_draft_tokens: int,
+) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     pass
