@@ -521,17 +521,3 @@ def select_top_k_tokens(
         )
 
     return input_ids, hidden_states, scores, tree_info
-
-
-def build_tree_kernel_efficient(
-    verified_id: jax.Array,
-    score_list: List[jax.Array],
-    token_list: List[jax.Array],
-    parents_list: List[jax.Array],
-    seq_lens: jax.Array,
-    seq_lens_sum: int,
-    topk: int,
-    speculative_num_steps: int,
-    speculative_num_draft_tokens: int,
-) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    pass
