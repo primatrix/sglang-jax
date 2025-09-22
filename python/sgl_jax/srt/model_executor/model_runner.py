@@ -339,16 +339,17 @@ class ModelRunner:
         self.attn_backend = self._get_attention_backend()
 
     def _get_attention_backend(self):
+        # First create the base attention backend
         if self.server_args.attention_backend == "native":
             from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 
-            return NativeAttention(self.num_attn_heads, self.num_kv_heads)
+            base_backend = NativeAttention(self.num_attn_heads, self.num_kv_heads)
         elif self.server_args.attention_backend == "fa":
             from sgl_jax.srt.layers.attention.flashattention_backend import (
                 FlashAttention,
             )
 
-            return FlashAttention(
+            base_backend = FlashAttention(
                 self.num_attn_heads,
                 self.num_kv_heads,
                 self.model_config.head_dim,
@@ -358,6 +359,41 @@ class ModelRunner:
             raise ValueError(
                 f"Unsupported attention backend: {self.server_args.attention_backend}"
             )
+
+        # Wrap with DP attention if dp_size > 1
+        if self.server_args.dp_size > 1:
+            from sgl_jax.srt.layers.dp_attention import create_dp_attention_backend
+
+            # Calculate DP and TP ranks
+            # Assuming simple layout: TP within DP groups
+            total_devices = self.server_args.tp_size
+            dp_size = self.server_args.dp_size
+            tp_size = total_devices // dp_size
+
+            # Get current device rank (this might need adjustment based on actual setup)
+            current_rank = (
+                jax.process_index() * jax.local_device_count()
+                + jax.devices()[0].id % jax.local_device_count()
+            )
+            dp_rank = current_rank // tp_size
+            tp_rank = current_rank % tp_size
+
+            logger.info(
+                f"Enabling DP Attention: dp_size={dp_size}, tp_size={tp_size}, "
+                f"dp_rank={dp_rank}, tp_rank={tp_rank}"
+            )
+
+            base_backend = create_dp_attention_backend(
+                base_backend=base_backend,
+                dp_size=dp_size,
+                tp_size=tp_size,
+                dp_rank=dp_rank,
+                tp_rank=tp_rank,
+                hidden_size=self.model_config.hidden_size,
+                mesh=self.mesh,
+            )
+
+        return base_backend
 
     def _forward(
         self,
