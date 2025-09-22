@@ -173,6 +173,7 @@ class EAGLEWorker(ModelWorker):
             batch.spec_info.filter_batch(
                 unfinished_index_device, has_been_filtered=False
             )
+        logger.info(f"-------------extend------------{batch.spec_info}")
 
     @property
     def draft_model_runner(self):
