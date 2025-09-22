@@ -256,8 +256,18 @@ class EAGLEWorker(ModelWorker):
 
     def draft_forward(self, schedule_batch: ScheduleBatch):
 
+        (
+            precompile_token_paddings,
+            precompile_bs_paddings,
+            precompile_cache_loc_paddings,
+        ) = self.target_worker.get_precompile_paddings()
         # Get forward batch
-        model_worker_batch = schedule_batch.get_model_worker_batch()
+        model_worker_batch = schedule_batch.get_model_worker_batch(
+            precompile_token_paddings,
+            precompile_bs_paddings,
+            precompile_cache_loc_paddings,
+            self.page_size,
+        )
         assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
 
         spec_info = model_worker_batch.spec_info
