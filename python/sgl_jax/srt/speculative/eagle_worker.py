@@ -495,7 +495,7 @@ def select_top_k_tokens(
         )
     else:
         # The later decode steps
-        expand_scores = jnp.mul(
+        expand_scores = jax.lax.mul(
             jnp.expand_dims(scores, axis=2), topk_p.reshape(-1, topk, topk)
         )  # (b, topk, 1) x (b, topk ,topk) -> (b, topk, topk)
         topk_cs_p, topk_cs_index = fast_topk(
