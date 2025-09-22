@@ -1250,7 +1250,17 @@ class ScheduleBatch:
             extend_logprob_start_lens=extend_logprob_start_lens,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             real_bs=real_bs,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
+            capture_hidden_mode=(
+                CaptureHiddenMode.FULL
+                if self.return_hidden_states
+                else (
+                    getattr(
+                        self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
+                    )
+                    if self.spec_info
+                    else CaptureHiddenMode.NULL
+                )
+            ),
             launch_done=self.launch_done,
             spec_info=self.spec_info,
             spec_algorithm=self.spec_algorithm,
