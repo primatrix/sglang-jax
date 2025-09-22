@@ -15,6 +15,220 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def get_last_loc_jax_array(
+    req_to_token: jax.Array,
+    req_pool_indices: jax.Array,
+    prefix_lens: jax.Array,
+) -> jax.Array:
+    """JAX version of get_last_loc that operates on JAX arrays.
+
+    Args:
+        req_to_token: Token mapping tensor of shape (num_reqs, max_seq_len)
+        req_pool_indices: Request pool indices of shape (batch_size,)
+        prefix_lens: Prefix lengths of shape (batch_size,)
+
+    Returns:
+        Last location tensor of shape (batch_size,)
+    """
+    return jnp.where(
+        prefix_lens > 0,
+        req_to_token[req_pool_indices, prefix_lens - 1],
+        jnp.full_like(prefix_lens, -1),
+    )
+
+
+def get_last_loc_large_page_size_top_k_1(
+    req_to_token: jax.Array,
+    req_pool_indices: jax.Array,
+    seq_lens: jax.Array,
+    speculative_num_steps: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """JAX implementation of get_last_loc_large_page_size_top_k_1.
+
+    This function is used in EAGLE speculative decoding to compute cache locations
+    for large page sizes when top_k=1.
+
+    Args:
+        req_to_token: Request to token mapping tensor
+        req_pool_indices: Request pool indices
+        seq_lens: Current sequence lengths
+        speculative_num_steps: Number of speculative decoding steps
+
+    Returns:
+        tuple of (prefix_lens, new_seq_lens, last_loc):
+        - prefix_lens: Same as input seq_lens
+        - new_seq_lens: Updated sequence lengths (prefix_lens + speculative_num_steps)
+        - last_loc: Last cache locations computed using get_last_loc
+    """
+    prefix_lens = seq_lens
+    new_seq_lens = prefix_lens + speculative_num_steps
+    last_loc = get_last_loc_jax_array(
+        req_to_token,
+        req_pool_indices,
+        prefix_lens,
+    )
+    return prefix_lens, new_seq_lens, last_loc
+
+
+def get_last_loc_large_page_size_large_top_k(
+    req_to_token: jax.Array,
+    req_pool_indices: jax.Array,
+    seq_lens: jax.Array,
+    speculative_num_steps: int,
+    topk: int,
+    page_size: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """JAX implementation of get_last_loc_large_page_size_large_top_k.
+
+    This function handles large page sizes with large top_k values in EAGLE speculative decoding.
+    It computes cache locations and manages page allocation for multiple top-k branches.
+
+    Args:
+        req_to_token: Request to token mapping tensor
+        req_pool_indices: Request pool indices
+        seq_lens: Current sequence lengths
+        speculative_num_steps: Number of speculative decoding steps
+        topk: Number of top-k branches
+        page_size: Size of each memory page
+
+    Returns:
+        tuple of (prefix_lens, new_seq_lens, last_loc, num_new_pages_per_topk, extend_lens):
+        - prefix_lens: Same as input seq_lens
+        - new_seq_lens: Updated sequence lengths considering page alignment
+        - last_loc: Last cache locations
+        - num_new_pages_per_topk: Number of new pages needed per top-k branch
+        - extend_lens: Number of tokens to extend for each sequence
+    """
+    prefix_lens = seq_lens
+    last_page_lens = prefix_lens % page_size
+    num_new_pages_per_topk = (
+        last_page_lens + speculative_num_steps + page_size - 1
+    ) // page_size
+
+    new_seq_lens = prefix_lens // page_size * page_size + num_new_pages_per_topk * (
+        page_size * topk
+    )
+    extend_lens = new_seq_lens - prefix_lens
+
+    last_loc = get_last_loc_jax_array(
+        req_to_token,
+        req_pool_indices,
+        prefix_lens,
+    )
+
+    return prefix_lens, new_seq_lens, last_loc, num_new_pages_per_topk, extend_lens
+
+
+def build_tree_kernel_efficient(
+    verified_id: jax.Array,
+    score_list: List[jax.Array],
+    token_list: List[jax.Array],
+    parents_list: List[jax.Array],
+    seq_lens: jax.Array,
+    seq_lens_sum: int,
+    topk: int,
+    spec_steps: int,
+    num_verify_tokens: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """JAX implementation of build_tree_kernel_efficient.
+
+    This is a simplified version of the EAGLE tree building algorithm for JAX.
+    The original implementation uses optimized CUDA kernels for tree construction.
+
+    Args:
+        verified_id: Verified token IDs from previous step
+        score_list: List of score tensors from draft model
+        token_list: List of token tensors from draft model
+        parents_list: List of parent index tensors
+        seq_lens: Sequence lengths
+        seq_lens_sum: Sum of sequence lengths
+        topk: Number of top-k candidates
+        spec_steps: Number of speculative steps
+        num_verify_tokens: Number of tokens to verify
+
+    Returns:
+        tuple of (tree_mask, positions, retrive_index, retrive_next_token,
+                 retrive_next_sibling, draft_tokens)
+    """
+    # Get batch size and device info
+    bs = len(seq_lens)
+
+    # Preprocess the tree data
+    if len(score_list) == 0:
+        # Handle empty case
+        draft_tokens = verified_id.flatten()
+        parent_list = jnp.array([], dtype=jnp.int64)
+        top_scores_index = jnp.array([], dtype=jnp.int64)
+    else:
+        # Concatenate and process score lists
+        score_tensor = jnp.concatenate([s.flatten() for s in score_list], axis=-1)
+        score_tensor = score_tensor.reshape(bs, -1)
+
+        # Concatenate token lists
+        ss_token_list = jnp.concatenate(token_list, axis=1)
+
+        # Get top scores and indices
+        if num_verify_tokens > 1:
+            # Use top-k to get the best candidates
+            top_scores_values, top_scores_index = jax.lax.top_k(
+                score_tensor, min(num_verify_tokens - 1, score_tensor.shape[-1])
+            )
+            # Sort the indices
+            top_scores_index = jnp.sort(top_scores_index, axis=-1)
+        else:
+            top_scores_index = jnp.array([], dtype=jnp.int64).reshape(bs, 0)
+
+        # Gather draft tokens
+        if top_scores_index.shape[-1] > 0:
+            draft_tokens_selected = jnp.take_along_axis(
+                ss_token_list, top_scores_index, axis=1
+            )
+            draft_tokens = jnp.concatenate(
+                [verified_id.reshape(bs, 1), draft_tokens_selected], axis=1
+            ).flatten()
+        else:
+            draft_tokens = verified_id.flatten()
+
+        # Build parent list (simplified)
+        if len(parents_list) > 1:
+            parent_list = jnp.concatenate(parents_list[:-1], axis=1)
+        else:
+            parent_list = jnp.array([], dtype=jnp.int64)
+
+    # Create tree mask (simplified - full attention for now)
+    total_tokens = seq_lens_sum + num_verify_tokens * bs
+    tree_mask = jnp.ones((total_tokens,), dtype=jnp.bool_)
+
+    # Create positions (simplified)
+    positions = jnp.repeat(seq_lens, num_verify_tokens) + jnp.tile(
+        jnp.arange(num_verify_tokens), bs
+    )
+
+    # Create retrieval indices (simplified)
+    retrive_index = jnp.full((bs, num_verify_tokens), -1, dtype=jnp.int64)
+    retrive_next_token = jnp.full((bs, num_verify_tokens), -1, dtype=jnp.int64)
+    retrive_next_sibling = jnp.full((bs, num_verify_tokens), -1, dtype=jnp.int64)
+
+    # Fill in some basic retrieval information
+    for i in range(bs):
+        for j in range(min(num_verify_tokens, len(draft_tokens) // bs)):
+            if i * num_verify_tokens + j < len(draft_tokens):
+                retrive_index = retrive_index.at[i, j].set(i * num_verify_tokens + j)
+                if j < num_verify_tokens - 1:
+                    retrive_next_token = retrive_next_token.at[i, j].set(
+                        i * num_verify_tokens + j + 1
+                    )
+
+    return (
+        tree_mask,
+        positions,
+        retrive_index,
+        retrive_next_token,
+        retrive_next_sibling,
+        draft_tokens,
+    )
+
+
 @dataclass
 class EagleDraftInput:
     # The inputs for decode

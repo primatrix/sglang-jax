@@ -13,7 +13,13 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
     ForwardBatch,
 )
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
-from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
+from sgl_jax.srt.speculative.eagle_util import (
+    EagleDraftInput,
+    EagleVerifyInput,
+    build_tree_kernel_efficient,
+    get_last_loc_large_page_size_large_top_k,
+    get_last_loc_large_page_size_top_k_1,
+)
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
@@ -33,6 +39,11 @@ class EAGLEWorker(ModelWorker):
             target_worker.get_memory_pool()
         )
         self.hot_token_id = None
+
+        # Initialize dummy tensors for EAGLE operations
+        self.num_new_pages_per_topk = None
+        self.extend_lens = None
+
         super().__init__(server_args, target_worker.mesh, True, self.req_to_token_pool)
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
@@ -62,6 +73,9 @@ class EAGLEWorker(ModelWorker):
             # draft extend for Update Draft State
             self.forward_draft_extend(
                 batch, model_worker_batch, logits_output.hidden_states, next_token_ids
+            )
+            logger.info(
+                f"-------------forward_draft_extend------------{logits_output.hidden_states.shape}"
             )
             return logits_output, next_token_ids, cache_miss_count, 0
         else:
@@ -321,10 +335,65 @@ class EAGLEWorker(ModelWorker):
                 num_seqs * self.speculative_num_steps * self.topk, backup_state=True
             )
         else:
-            # todo: page size > 1
-            self.extend_lens = 1
-            self.num_new_pages_per_topk = 1
-            pass
+            if self.topk == 1:
+                prefix_lens, seq_lens, last_loc = get_last_loc_large_page_size_top_k_1(
+                    batch.req_to_token_pool.req_to_token,
+                    batch.req_pool_indices,
+                    batch.seq_lens,
+                    self.speculative_num_steps,
+                )
+                extend_num_tokens = num_seqs * self.speculative_num_steps
+            else:
+                # In this case, the last partial page needs to be duplicated.
+                # KV cache layout in batch.req_to_token_pool.req_to_token:
+                #
+                # | -------- | -- xxxx .. | -- xxxx .. | -- xxxx .. |
+                #    prefix     top-k = 0    tok-k = 1    top-k = 2
+                #
+                #  "-" means prefix tokens
+                #  "x" means speculative draft tokens
+                #  "." means padded tokens
+
+                # TODO(lmzheng): The current implementation is still a fake support
+                # for page size > 1. In the `assign_draft_cache_locs` below,
+                # we directly move the indices instead of the real kv cache.
+                # This only works when the kernel backend runs with page size = 1.
+                # If the kernel backend runs with page size > 1, we need to
+                # duplicate the real KV cache. The overhead of duplicating KV
+                # cache seems okay because the draft KV cache only has one layer.
+                # see a related copy operation in MHATokenToKVPool::move_kv_cache.
+
+                (
+                    prefix_lens,
+                    seq_lens,
+                    last_loc,
+                    num_new_pages_per_topk,
+                    extend_lens,
+                ) = get_last_loc_large_page_size_large_top_k(
+                    batch.req_to_token_pool.req_to_token,
+                    batch.req_pool_indices,
+                    batch.seq_lens,
+                    self.speculative_num_steps,
+                    self.topk,
+                    self.page_size,
+                )
+
+                # TODO(lmzheng): remove this device sync
+                extend_num_tokens = int(jnp.sum(extend_lens))
+
+                # Store in instance variables for later use
+                self.num_new_pages_per_topk = num_new_pages_per_topk
+                self.extend_lens = extend_lens
+
+            out_cache_loc, token_to_kv_pool_state_backup = (
+                batch.alloc_paged_token_slots_extend(
+                    prefix_lens,
+                    seq_lens,
+                    last_loc,
+                    extend_num_tokens,
+                    backup_state=True,
+                )
+            )
 
         # [       topk 0         ] [       topk 1         ]
         # [iter=0, iter=1, iter=2] [iter=0, iter=1, iter=2]
@@ -350,7 +419,7 @@ class EAGLEWorker(ModelWorker):
 
                     # Update req_to_token mapping
                     if token_pos < batch.req_to_token_pool.req_to_token.shape[1]:
-                        batch.req_to_token_pool[req_idx, token_pos] = cache_loc
+                        batch.req_to_token_pool.write((req_idx, token_pos), cache_loc)
 
         if self.page_size > 1 and self.topk > 1:
             # Remove padded slots
