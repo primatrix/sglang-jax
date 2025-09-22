@@ -36,8 +36,10 @@ if TYPE_CHECKING:
 
 from jax.tree_util import register_pytree_node_class
 
-from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
+if TYPE_CHECKING:
+    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
 
 
 class ForwardMode(IntEnum):
@@ -166,7 +168,7 @@ class ForwardBatch:
     trace_request_ids: Optional[List[str]] = None
     trace_request_objects: Optional[List] = None
 
-    spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
+    spec_info: Optional[Union["EagleVerifyInput", "EagleDraftInput"]] = None
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
 

@@ -7,11 +7,10 @@ from typing import TYPE_CHECKING, Any, List
 import jax
 import jax.numpy as jnp
 
-from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
-from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
-
 if TYPE_CHECKING:
+    from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
     from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
+    from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +23,7 @@ class EagleDraftInput:
     topk_index: jax.Array = None
     # shape: (b, hidden_size)
     hidden_states: jax.Array = None
-    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
+    capture_hidden_mode: "CaptureHiddenMode" = 2  # CaptureHiddenMode.FULL
 
     # Inputs for extend
     # shape: (b,)
@@ -121,7 +120,7 @@ class EagleVerifyOutput:
     # Draft input batch
     draft_input: EagleDraftInput
     # Logit outputs from target worker
-    logits_output: LogitsProcessorOutput
+    logits_output: "LogitsProcessorOutput"
     # Accepted token ids including the bonus token
     verified_id: jax.Array
     # Accepted token length per sequence in a batch in CPU.
@@ -142,7 +141,7 @@ class EagleVerifyInput:
     spec_steps: int
     topk: int
     draft_token_num: int
-    capture_hidden_mode: CaptureHiddenMode
+    capture_hidden_mode: "CaptureHiddenMode"
     seq_lens_sum: int
     seq_lens_cpu: jax.Array
     # grammar: BaseGrammarObject = None
