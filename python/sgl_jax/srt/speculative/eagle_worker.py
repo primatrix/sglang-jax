@@ -180,9 +180,11 @@ class EAGLEWorker(ModelWorker):
         return self.get_model_runner()
 
     def capture_for_decode(
-        self, logits_output: LogitsProcessorOutput, spec_info: EagleDraftInput
+        self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
-        pass
+        probs = jax.nn.softmax(logits_output.next_token_logits, dim=-1)
+        draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
+        draft_input.hidden_states = logits_output.hidden_states
 
     def draft(self, batch: ScheduleBatch):
         if batch.forward_mode.is_idle():
