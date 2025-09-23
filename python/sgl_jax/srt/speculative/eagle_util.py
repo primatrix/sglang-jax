@@ -140,9 +140,7 @@ def build_tree_kernel_efficient_preprocess(
     ss_token_list = jnp.concatenate(token_list, axis=1)
 
     # Get top scores and indices
-    top_scores_values, top_scores_index = jax.lax.top_k(
-        score_tensor, num_verify_tokens - 1
-    )
+    _, top_scores_index = jax.lax.top_k(score_tensor, num_verify_tokens - 1)
     top_scores_index = jnp.sort(top_scores_index, axis=-1)
 
     # Gather draft tokens using the top indices
@@ -207,16 +205,17 @@ def build_tree_kernel_efficient(
     total_tokens = seq_lens_sum + num_verify_tokens * bs
     tree_mask = jnp.ones((total_tokens,), dtype=jnp.bool_)
 
-    # Reconstruct the tree structure based on parent_list and top_scores_index
+    # Reconstruct the tree structure using CUDA kernel parameters
     positions, retrive_index, retrive_next_token, retrive_next_sibling = (
         build_eagle_tree_structure(
-            parent_list,
-            top_scores_index,
-            seq_lens,
-            bs,
-            num_verify_tokens,
-            topk,
-            spec_steps,
+            parent_list=parent_list,
+            selected_index=top_scores_index,
+            verified_seq_len=seq_lens,
+            bs=bs,
+            draft_token_num=num_verify_tokens,
+            topk=topk,
+            depth=spec_steps,
+            tree_mask_mode=0,  # FULL_MASK
         )
     )
 
@@ -364,45 +363,63 @@ class EagleVerifyInput:
 
 def build_eagle_tree_structure(
     parent_list: jax.Array,
-    top_scores_index: jax.Array,
-    seq_lens: jax.Array,
+    selected_index: jax.Array,
+    verified_seq_len: jax.Array,
     bs: int,
-    num_verify_tokens: int,
+    draft_token_num: int,
     topk: int,
-    spec_steps: int,
+    depth: int,
+    tree_mask_mode: int = 0,  # FULL_MASK = 0
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Build EAGLE tree structure arrays based on CUDA kernel implementation.
+    """Build EAGLE tree structure arrays - JAX implementation of CUDA kernel build_tree_efficient.
 
-    This function implements the exact logic from the CUDA kernel build_tree_efficient.
+    This function exactly matches the CUDA kernel signature and logic:
+    __global__ void build_tree_efficient(
+        int64_t* parent_list,
+        int64_t* selected_index,
+        int64_t* verified_seq_len,
+        bool* tree_mask,              // handled externally
+        int64_t* positions,           // returned
+        int64_t* retrive_index,       // returned
+        int64_t* retrive_next_token,  // returned
+        int64_t* retrive_next_sibling,// returned
+        int topk,
+        int depth,
+        int draft_token_num,
+        int tree_mask_mode)
+
+    Args:
+        parent_list: Parent indices array [bs, topk * (depth-1) + 1]
+        selected_index: Selected token indices [bs, draft_token_num - 1]
+        verified_seq_len: Sequence lengths [bs]
+        bs: Batch size (equivalent to gridDim.x in CUDA)
+        draft_token_num: Number of draft tokens (equivalent to blockDim.x)
+        topk: Top-k value
+        depth: Tree depth
+        tree_mask_mode: Tree mask mode (0=FULL_MASK)
+
+    Returns:
+        tuple of (positions, retrive_index, retrive_next_token, retrive_next_sibling)
     """
 
     # Initialize arrays
-    positions = jnp.zeros((bs * num_verify_tokens,), dtype=jnp.int32)
-    retrive_index = jnp.full((bs, num_verify_tokens), -1, dtype=jnp.int32)
-    retrive_next_token = jnp.full((bs, num_verify_tokens), -1, dtype=jnp.int32)
-    retrive_next_sibling = jnp.full((bs, num_verify_tokens), -1, dtype=jnp.int32)
+    positions = jnp.zeros((bs * draft_token_num,), dtype=jnp.int32)
+    retrive_index = jnp.full((bs, draft_token_num), -1, dtype=jnp.int32)
+    retrive_next_token = jnp.full((bs, draft_token_num), -1, dtype=jnp.int32)
+    retrive_next_sibling = jnp.full((bs, draft_token_num), -1, dtype=jnp.int32)
 
-    # Process each batch
+    # Process each batch (equivalent to blockIdx.x in CUDA)
     for bid in range(bs):
-        seq_len = seq_lens[bid]
-        selected_index = top_scores_index[bid]  # [draft_token_num - 1]
-        batch_parent_list = (
-            parent_list[bid] if parent_list.shape[0] > 1 else parent_list[0]
-        )
+        seq_len = verified_seq_len[bid]
+        # Note: selected_index and parent_list have flattened indexing in CUDA kernel
+        # selected_index[bid * (draft_token_num - 1) + index]
+        # parent_list[bid * (topk * (depth - 1) + 1) + parent_tb_idx]
 
-        # Debug: print data structure info for first few iterations
-        if bid < 2:
-            print(f"DEBUG batch {bid}: seq_len={seq_len}")
-            print(
-                f"DEBUG batch {bid}: selected_index shape={selected_index.shape}, values={selected_index}"
-            )
-            print(
-                f"DEBUG batch {bid}: parent_list shape={batch_parent_list.shape}, values={batch_parent_list}"
-            )
+        # CUDA kernel equivalent: tid = threadIdx.x, bid = blockIdx.x
 
-        # Process each token (equivalent to each thread in CUDA kernel)
-        for tid in range(num_verify_tokens):
-            global_token_idx = bid * num_verify_tokens + tid
+        # Process each token (equivalent to threadIdx.x in CUDA kernel)
+        for tid in range(draft_token_num):
+            global_token_idx = bid * draft_token_num + tid
 
             if tid == 0:
                 # Verified token (tid == 0)
@@ -410,53 +427,67 @@ def build_eagle_tree_structure(
                 retrive_index = retrive_index.at[bid, tid].set(global_token_idx)
 
                 # Build retrive_next_token and retrive_next_sibling (backwards iteration)
+                retrive_index_offset = bid * draft_token_num
                 for i in range(
-                    num_verify_tokens - 1, 0, -1
+                    draft_token_num - 1, 0, -1
                 ):  # i from draft_token_num-1 to 1
-                    current_token_idx = bid * num_verify_tokens + i
+                    current_token_idx = retrive_index_offset + i
+                    # CUDA kernel: retrive_index[bid * draft_token_num + i] = current_token_idx
                     retrive_index = retrive_index.at[bid, i].set(current_token_idx)
 
-                    # Find parent position
-                    parent_tb_idx = selected_index[i - 1] // topk
+                    # CUDA kernel logic: parent_tb_idx = selected_index[bid * (draft_token_num - 1) + i - 1] / topk
+                    selected_idx = bid * (draft_token_num - 1) + i - 1
+                    parent_tb_idx = selected_index.flatten()[selected_idx] // topk
                     parent_position = 0
 
                     if parent_tb_idx > 0:
-                        # Get parent token index from parent_list
-                        if parent_tb_idx < len(batch_parent_list):
-                            parent_token_idx = batch_parent_list[parent_tb_idx]
+                        # CUDA kernel logic: parent_token_idx = parent_list[bid * (topk * (depth - 1) + 1) + parent_tb_idx]
+                        parent_list_idx = bid * (topk * (depth - 1) + 1) + parent_tb_idx
+                        if parent_list_idx < parent_list.size:
+                            parent_token_idx = parent_list.flatten()[parent_list_idx]
 
-                            # Find parent position in selected_index
-                            for parent_pos in range(len(selected_index)):
-                                if selected_index[parent_pos] == parent_token_idx:
+                            # Find parent position in selected_index using CUDA kernel logic
+                            for parent_pos in range(draft_token_num - 1):
+                                check_idx = bid * (draft_token_num - 1) + parent_pos
+                                if (
+                                    check_idx < selected_index.size
+                                    and selected_index.flatten()[check_idx]
+                                    == parent_token_idx
+                                ):
                                     parent_position = (
                                         parent_pos + 1
-                                    )  # +1 because we want 1-indexed
+                                    )  # +1 to convert to 1-indexed
                                     break
                             else:
-                                parent_position = num_verify_tokens  # Not found
+                                parent_position = draft_token_num  # Not found
                         else:
-                            parent_position = num_verify_tokens  # Invalid parent_tb_idx
+                            parent_position = draft_token_num  # Invalid parent_list_idx
                     else:
                         parent_position = 0  # Root node
 
-                    if parent_position >= num_verify_tokens:
+                    if parent_position >= draft_token_num:
                         # Invalid parent, skip
                         continue
 
-                    # Build next_token and sibling pointers
-                    if retrive_next_token[bid, parent_position] == -1:
+                    # CUDA kernel logic for building next_token and sibling pointers
+                    # if (retrive_next_token[bid * draft_token_num + parent_position] == -1)
+                    next_token_idx = bid * draft_token_num + parent_position
+                    if retrive_next_token.flatten()[next_token_idx] == -1:
                         retrive_next_token = retrive_next_token.at[
                             bid, parent_position
                         ].set(i)
                     else:
                         # There's already a next_token, so set sibling
-                        origin_next_token = retrive_next_token[bid, parent_position]
+                        origin_next_token = retrive_next_token.flatten()[next_token_idx]
                         retrive_next_token = retrive_next_token.at[
                             bid, parent_position
                         ].set(i)
                         retrive_next_sibling = retrive_next_sibling.at[bid, i].set(
                             origin_next_token
                         )
+
+                # CUDA kernel: retrive_index[bid * draft_token_num] = bid * draft_token_num
+                retrive_index = retrive_index.at[bid, 0].set(bid * draft_token_num)
 
             else:
                 # Draft token (tid > 0)
@@ -466,20 +497,27 @@ def build_eagle_tree_structure(
 
                 while True:
                     position += 1
-                    parent_tb_idx = selected_index[cur_position] // topk
+                    # CUDA kernel logic: parent_tb_idx = selected_index[bid * (draft_token_num - 1) + cur_position] / topk
+                    selected_idx = bid * (draft_token_num - 1) + cur_position
+                    parent_tb_idx = selected_index.flatten()[selected_idx] // topk
 
                     if parent_tb_idx == 0:
                         # Reached root
                         break
 
-                    # Find the parent token in selected_index
-                    if parent_tb_idx < len(batch_parent_list):
-                        token_idx = batch_parent_list[parent_tb_idx]
+                    # CUDA kernel logic: token_idx = parent_list[bid * (topk * (depth - 1) + 1) + parent_tb_idx]
+                    parent_list_idx = bid * (topk * (depth - 1) + 1) + parent_tb_idx
+                    if parent_list_idx < parent_list.size:
+                        token_idx = parent_list.flatten()[parent_list_idx]
 
-                        # Search for this token in selected_index
+                        # Search for this token in selected_index using CUDA kernel logic
                         found = False
-                        for cur_pos in range(len(selected_index)):
-                            if selected_index[cur_pos] == token_idx:
+                        for cur_pos in range(draft_token_num - 1):
+                            check_idx = bid * (draft_token_num - 1) + cur_pos
+                            if (
+                                check_idx < selected_index.size
+                                and selected_index.flatten()[check_idx] == token_idx
+                            ):
                                 cur_position = cur_pos
                                 found = True
                                 break
@@ -487,7 +525,7 @@ def build_eagle_tree_structure(
                         if not found:
                             break  # Invalid tree structure
                     else:
-                        break  # Invalid parent_tb_idx
+                        break  # Invalid parent_list_idx
 
                 positions = positions.at[global_token_idx].set(position + seq_len)
                 retrive_index = retrive_index.at[bid, tid].set(global_token_idx)
