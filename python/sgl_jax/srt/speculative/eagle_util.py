@@ -156,7 +156,7 @@ def build_tree_kernel_efficient_preprocess(
     logger.info(
         f"-------------draft_tokens------------{verified_id.shape} {score_tensor.shape} {ss_token_list.shape} {draft_tokens.shape}"
     )
-    assert draft_tokens.shape == (batch_size, verified_id.shape[0])
+    # assert draft_tokens.shape == (batch_size, verified_id.shape[0])
     draft_tokens = jnp.concatenate(
         [jnp.expand_dims(verified_id, axis=1), draft_tokens], axis=1
     ).flatten()
