@@ -355,9 +355,7 @@ def test_build_tree_kernel_efficient():
         and actual_retrive_next_token == expected_retrive_next_token
         and actual_retrive_next_sibling == expected_retrive_next_sibling
     ):
-        print(
-            "🎯 PERFECT MATCH: All arrays now match PyTorch CUDA kernel implementation!"
-        )
+
         print("✅ Position array matches")
         print("✅ Retrive_next_token matches")
         print("✅ Retrive_next_sibling matches")
@@ -367,11 +365,7 @@ def test_build_tree_kernel_efficient():
             "🚀 EAGLE tree construction is now fully compatible with PyTorch version!"
         )
     else:
-        print("🔧 TREE CONSTRUCTION: Implementing CUDA kernel logic...")
-        print("   - Now using the exact CUDA kernel build_tree_efficient algorithm")
-        print("   - Position calculation: trace parent chain to root for depth")
-        print("   - Retriive pointers: build next_token and sibling linked lists")
-        print("   - Should now match PyTorch output exactly")
+        raise ValueError("Test failed")
 
 
 def test_build_tree_preprocess():
