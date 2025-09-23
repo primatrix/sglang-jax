@@ -151,9 +151,7 @@ class EAGLEWorker(ModelWorker):
         )
         self.draft_model_runner.attn_backend.forward_metadata = forward_metadata
         forward_batch.forward_mode = ForwardMode.EXTEND
-        logger.info(
-            f" forward_batch.forward_mode { forward_batch.forward_mode} {forward_batch.forward_mode.is_decode()}"
-        )
+        logger.info(f" forward_batch { forward_batch}")
         logits_output, _ = self.draft_model_runner.forward(
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(
