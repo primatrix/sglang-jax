@@ -145,6 +145,10 @@ def build_tree_kernel_efficient_preprocess(
 
     # Gather draft tokens using the top indices
     draft_tokens = jnp.take_along_axis(ss_token_list, top_scores_index, axis=1)
+    logger.info(
+        f"-------------draft_tokens------------{verified_id.shape} {score_tensor.shape} {ss_token_list.shape} {draft_tokens.shape}"
+    )
+    assert draft_tokens.shape == (batch_size, verified_id.shape[0])
     draft_tokens = jnp.concatenate(
         [jnp.expand_dims(verified_id, axis=1), draft_tokens], axis=1
     ).flatten()
