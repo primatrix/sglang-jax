@@ -131,9 +131,12 @@ def build_tree_kernel_efficient_preprocess(
     This function matches the PyTorch preprocessing logic exactly.
     """
     logger.info(f"-------------verified_id------------{verified_id.shape}")
-    logger.info(f"-------------score_list------------{score_list.shape}")
-    logger.info(f"-------------token_list------------{token_list.shape}")
-    logger.info(f"-------------parents_list------------{parents_list.shape}")
+    for score in score_list:
+        logger.info(f"-------------score------------{score.shape}")
+    for token in token_list:
+        logger.info(f"-------------token------------{token.shape}")
+    for parent in parents_list:
+        logger.info(f"-------------parent------------{parent.shape}")
     logger.info(f"-------------num_verify_tokens------------{num_verify_tokens}")
     # Concatenate score_list along dim=1 and flatten from dim=1 onwards
     # b, n, topk; n = 1 + (num_steps-1) * self.topk
