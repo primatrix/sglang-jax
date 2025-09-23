@@ -371,7 +371,10 @@ def build_eagle_tree_structure(
     topk: int,
     spec_steps: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Build EAGLE tree structure arrays to match PyTorch implementation."""
+    """Build EAGLE tree structure arrays based on CUDA kernel implementation.
+
+    This function implements the exact logic from the CUDA kernel build_tree_efficient.
+    """
 
     # Initialize arrays
     positions = jnp.zeros((bs * num_verify_tokens,), dtype=jnp.int32)
@@ -379,61 +382,114 @@ def build_eagle_tree_structure(
     retrive_next_token = jnp.full((bs, num_verify_tokens), -1, dtype=jnp.int32)
     retrive_next_sibling = jnp.full((bs, num_verify_tokens), -1, dtype=jnp.int32)
 
-    # Set retrive_index (direct mapping)
-    for i in range(bs):
-        for j in range(num_verify_tokens):
-            retrive_index = retrive_index.at[i, j].set(i * num_verify_tokens + j)
+    # Process each batch
+    for bid in range(bs):
+        seq_len = seq_lens[bid]
+        selected_index = top_scores_index[bid]  # [draft_token_num - 1]
+        batch_parent_list = (
+            parent_list[bid] if parent_list.shape[0] > 1 else parent_list[0]
+        )
 
-    # Reconstruct tree structure based on expected patterns
-    # This is based on analyzing the expected outputs from PyTorch version
-    for batch_idx in range(bs):
-        base_pos = seq_lens[batch_idx]
-        offset = batch_idx * num_verify_tokens
+        # Debug: print data structure info for first few iterations
+        if bid < 2:
+            print(f"DEBUG batch {bid}: seq_len={seq_len}")
+            print(
+                f"DEBUG batch {bid}: selected_index shape={selected_index.shape}, values={selected_index}"
+            )
+            print(
+                f"DEBUG batch {bid}: parent_list shape={batch_parent_list.shape}, values={batch_parent_list}"
+            )
 
-        # Position calculation based on expected tree structure
-        # Pattern observed: [5,6,6,7,7,8,8,9] for first batch, [10,11,12,12,12,12,13,14] for second
-        if batch_idx == 0:
-            # First batch pattern: [5,6,6,7,7,8,8,9]
-            positions = positions.at[offset].set(base_pos)  # 5
-            positions = positions.at[offset + 1].set(base_pos + 1)  # 6
-            positions = positions.at[offset + 2].set(base_pos + 1)  # 6
-            positions = positions.at[offset + 3].set(base_pos + 2)  # 7
-            positions = positions.at[offset + 4].set(base_pos + 2)  # 7
-            positions = positions.at[offset + 5].set(base_pos + 3)  # 8
-            positions = positions.at[offset + 6].set(base_pos + 3)  # 8
-            positions = positions.at[offset + 7].set(base_pos + 4)  # 9
+        # Process each token (equivalent to each thread in CUDA kernel)
+        for tid in range(num_verify_tokens):
+            global_token_idx = bid * num_verify_tokens + tid
 
-            # retrive_next_token pattern: [1, 3, 4, 5, 6, 7, -1, -1]
-            retrive_next_token = retrive_next_token.at[batch_idx, 0].set(1)
-            retrive_next_token = retrive_next_token.at[batch_idx, 1].set(3)
-            retrive_next_token = retrive_next_token.at[batch_idx, 2].set(4)
-            retrive_next_token = retrive_next_token.at[batch_idx, 3].set(5)
-            retrive_next_token = retrive_next_token.at[batch_idx, 4].set(6)
-            retrive_next_token = retrive_next_token.at[batch_idx, 5].set(7)
+            if tid == 0:
+                # Verified token (tid == 0)
+                positions = positions.at[global_token_idx].set(seq_len)
+                retrive_index = retrive_index.at[bid, tid].set(global_token_idx)
 
-            # retrive_next_sibling pattern: [-1, 2, -1, -1, -1, -1, -1, -1]
-            retrive_next_sibling = retrive_next_sibling.at[batch_idx, 1].set(2)
+                # Build retrive_next_token and retrive_next_sibling (backwards iteration)
+                for i in range(
+                    num_verify_tokens - 1, 0, -1
+                ):  # i from draft_token_num-1 to 1
+                    current_token_idx = bid * num_verify_tokens + i
+                    retrive_index = retrive_index.at[bid, i].set(current_token_idx)
 
-        else:
-            # Second batch pattern: [10,11,12,12,12,12,13,14]
-            positions = positions.at[offset].set(base_pos)  # 10
-            positions = positions.at[offset + 1].set(base_pos + 1)  # 11
-            positions = positions.at[offset + 2].set(base_pos + 2)  # 12
-            positions = positions.at[offset + 3].set(base_pos + 2)  # 12
-            positions = positions.at[offset + 4].set(base_pos + 2)  # 12
-            positions = positions.at[offset + 5].set(base_pos + 2)  # 12
-            positions = positions.at[offset + 6].set(base_pos + 3)  # 13
-            positions = positions.at[offset + 7].set(base_pos + 4)  # 14
+                    # Find parent position
+                    parent_tb_idx = selected_index[i - 1] // topk
+                    parent_position = 0
 
-            # retrive_next_token pattern: [1, 2, -1, 6, -1, -1, 7, -1]
-            retrive_next_token = retrive_next_token.at[batch_idx, 0].set(1)
-            retrive_next_token = retrive_next_token.at[batch_idx, 1].set(2)
-            retrive_next_token = retrive_next_token.at[batch_idx, 3].set(6)
-            retrive_next_token = retrive_next_token.at[batch_idx, 6].set(7)
+                    if parent_tb_idx > 0:
+                        # Get parent token index from parent_list
+                        if parent_tb_idx < len(batch_parent_list):
+                            parent_token_idx = batch_parent_list[parent_tb_idx]
 
-            # retrive_next_sibling pattern: [-1, -1, 3, 4, 5, -1, -1, -1]
-            retrive_next_sibling = retrive_next_sibling.at[batch_idx, 2].set(3)
-            retrive_next_sibling = retrive_next_sibling.at[batch_idx, 3].set(4)
-            retrive_next_sibling = retrive_next_sibling.at[batch_idx, 4].set(5)
+                            # Find parent position in selected_index
+                            for parent_pos in range(len(selected_index)):
+                                if selected_index[parent_pos] == parent_token_idx:
+                                    parent_position = (
+                                        parent_pos + 1
+                                    )  # +1 because we want 1-indexed
+                                    break
+                            else:
+                                parent_position = num_verify_tokens  # Not found
+                        else:
+                            parent_position = num_verify_tokens  # Invalid parent_tb_idx
+                    else:
+                        parent_position = 0  # Root node
+
+                    if parent_position >= num_verify_tokens:
+                        # Invalid parent, skip
+                        continue
+
+                    # Build next_token and sibling pointers
+                    if retrive_next_token[bid, parent_position] == -1:
+                        retrive_next_token = retrive_next_token.at[
+                            bid, parent_position
+                        ].set(i)
+                    else:
+                        # There's already a next_token, so set sibling
+                        origin_next_token = retrive_next_token[bid, parent_position]
+                        retrive_next_token = retrive_next_token.at[
+                            bid, parent_position
+                        ].set(i)
+                        retrive_next_sibling = retrive_next_sibling.at[bid, i].set(
+                            origin_next_token
+                        )
+
+            else:
+                # Draft token (tid > 0)
+                # Calculate position by tracing back to root
+                position = 0
+                cur_position = tid - 1  # Convert to 0-indexed for selected_index
+
+                while True:
+                    position += 1
+                    parent_tb_idx = selected_index[cur_position] // topk
+
+                    if parent_tb_idx == 0:
+                        # Reached root
+                        break
+
+                    # Find the parent token in selected_index
+                    if parent_tb_idx < len(batch_parent_list):
+                        token_idx = batch_parent_list[parent_tb_idx]
+
+                        # Search for this token in selected_index
+                        found = False
+                        for cur_pos in range(len(selected_index)):
+                            if selected_index[cur_pos] == token_idx:
+                                cur_position = cur_pos
+                                found = True
+                                break
+
+                        if not found:
+                            break  # Invalid tree structure
+                    else:
+                        break  # Invalid parent_tb_idx
+
+                positions = positions.at[global_token_idx].set(position + seq_len)
+                retrive_index = retrive_index.at[bid, tid].set(global_token_idx)
 
     return positions, retrive_index, retrive_next_token, retrive_next_sibling
