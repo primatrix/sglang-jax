@@ -493,6 +493,15 @@ def select_top_k_tokens(
         input_ids = topk_index.flatten()
         hidden_states = jnp.repeat(hidden_states, topk, axis=0)
         scores = topk_p  # shape: (b, topk)
+        logger.info(
+            f"-------------i------------{i}==========================================="
+        )
+        logger.info(f"-------------topk_p------------{topk_p.shape}")
+        logger.info(f"-------------topk_index------------{topk_index.shape}")
+        logger.info(f"--------------input_ids-------------{input_ids.shape}")
+        logger.info(f"-------------scores------------{scores.shape}")
+        logger.info(f"-------------hidden_states------------{hidden_states.shape}")
+        logger.info("================================================================")
 
         tree_info = (
             jnp.expand_dims(topk_p, axis=1),  # shape: (b, 1, topk)
@@ -526,5 +535,14 @@ def select_top_k_tokens(
             topk_index,  # shape: (b, topk * topk)
             topk_cs_index + (topk**2 * (i - 1) + topk),  # shape: (b, topk)
         )
+        logger.info(
+            f"-------------i------------{i}==========================================="
+        )
+        logger.info(f"-------------topk_p------------{topk_p.shape}")
+        logger.info(f"-------------topk_index------------{topk_index.shape}")
+        logger.info(f"--------------input_ids-------------{input_ids.shape}")
+        logger.info(f"-------------scores------------{scores.shape}")
+        logger.info(f"-------------hidden_states------------{hidden_states.shape}")
+        logger.info("================================================================")
 
     return input_ids, hidden_states, scores, tree_info
