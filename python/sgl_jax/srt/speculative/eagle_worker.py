@@ -161,6 +161,7 @@ class EAGLEWorker(ModelWorker):
                 model_worker_batch, self.mesh
             ),
         )
+        logits_output.truncate_logits_processor_output(model_worker_batch)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
