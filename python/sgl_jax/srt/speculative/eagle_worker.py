@@ -238,7 +238,14 @@ class EAGLEWorker(ModelWorker):
             self.speculative_num_draft_tokens,
         )
         # build tree
-
+        logger.info(f"-------------tree_mask------------{tree_mask}")
+        logger.info(f"-------------position------------{position}")
+        logger.info(f"-------------retrive_index------------{retrive_index}")
+        logger.info(f"-------------retrive_next_token------------{retrive_next_token}")
+        logger.info(
+            f"-------------retrive_next_sibling------------{retrive_next_sibling}"
+        )
+        logger.info(f"-------------draft_tokens------------{draft_tokens}")
         return EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
