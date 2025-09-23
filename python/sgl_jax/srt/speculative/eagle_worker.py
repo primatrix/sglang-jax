@@ -187,6 +187,18 @@ class EAGLEWorker(ModelWorker):
             probs, self.topk, axis=-1
         )
         draft_input.hidden_states = logits_output.hidden_states
+        logger.info(
+            f"logits_output.next_token_logits {logits_output.next_token_logits.shape}"
+        )
+        logger.info(
+            f"-------------draft_input.topk_p------------{draft_input.topk_p.shape}"
+        )
+        logger.info(
+            f"-------------draft_input.topk_index------------{draft_input.topk_index.shape}"
+        )
+        logger.info(
+            f"-------------draft_input.hidden_states------------{draft_input.hidden_states.shape}"
+        )
 
     def draft(self, batch: ScheduleBatch):
         if batch.forward_mode.is_idle():
