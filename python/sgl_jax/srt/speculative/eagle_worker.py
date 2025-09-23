@@ -338,6 +338,9 @@ class EAGLEWorker(ModelWorker):
             # self._detect_nan_if_needed(logits_output)
             probs = jax.nn.softmax(logits_output.next_token_logits, axis=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, axis=-1)
+            logger.info(
+                f"***********{i}***{topk_p.shape} {topk_index.shape}*******************************"
+            )
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
