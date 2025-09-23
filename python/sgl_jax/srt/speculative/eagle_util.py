@@ -140,9 +140,8 @@ def build_tree_kernel_efficient_preprocess(
     logger.info(f"-------------num_verify_tokens------------{num_verify_tokens}")
     # Concatenate score_list along dim=1 and flatten from dim=1 onwards
     # b, n, topk; n = 1 + (num_steps-1) * self.topk
-    score_tensor = jnp.concatenate(score_list, axis=1).reshape(
-        score_tensor.shape[0], -1
-    )
+    score_tensor = jnp.concatenate(score_list, axis=1)
+    score_tensor = score_tensor.reshape(score_tensor.shape[0], -1)
     logger.info(f"-------------score_tensor------------{score_tensor.shape}")
 
     # Concatenate token lists: b, (self.topk + (num_steps-1) * self.topk)
