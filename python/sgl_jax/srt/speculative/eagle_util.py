@@ -119,6 +119,48 @@ def get_last_loc_large_page_size_large_top_k(
     return prefix_lens, new_seq_lens, last_loc, num_new_pages_per_topk, extend_lens
 
 
+def build_tree_kernel_efficient_preprocess(
+    verified_id: jax.Array,
+    score_list: List[jax.Array],
+    token_list: List[jax.Array],
+    parents_list: List[jax.Array],
+    num_verify_tokens: int,
+):
+    """JAX implementation of build_tree_kernel_efficient_preprocess.
+
+    This function matches the PyTorch preprocessing logic exactly.
+    """
+    # Concatenate score_list along dim=1 and flatten from dim=1 onwards
+    # b, n, topk; n = 1 + (num_steps-1) * self.topk
+    score_tensor = jnp.concatenate(score_list, axis=1)
+    batch_size = score_tensor.shape[0]
+    score_tensor = score_tensor.reshape(batch_size, -1)
+
+    # Concatenate token lists: b, (self.topk + (num_steps-1) * self.topk)
+    ss_token_list = jnp.concatenate(token_list, axis=1)
+
+    # Get top scores and indices
+    top_scores_values, top_scores_index = jax.lax.top_k(
+        score_tensor, num_verify_tokens - 1
+    )
+    top_scores_index = jnp.sort(top_scores_index, axis=-1)
+
+    # Gather draft tokens using the top indices
+    draft_tokens = jnp.take_along_axis(ss_token_list, top_scores_index, axis=1)
+    draft_tokens = jnp.concatenate(
+        [jnp.expand_dims(verified_id, axis=1), draft_tokens], axis=1
+    ).flatten()
+
+    # Build parent list
+    if len(parents_list) > 1:
+        parent_list = jnp.concatenate(parents_list[:-1], axis=1)
+    else:
+        batch_size = parents_list[0].shape[0]
+        parent_list = jnp.empty((batch_size, 0), dtype=jnp.int64)
+
+    return parent_list, top_scores_index, draft_tokens
+
+
 def build_tree_kernel_efficient(
     verified_id: jax.Array,
     score_list: List[jax.Array],
@@ -150,50 +192,15 @@ def build_tree_kernel_efficient(
         tuple of (tree_mask, positions, retrive_index, retrive_next_token,
                  retrive_next_sibling, draft_tokens)
     """
-    # Get batch size and device info
-    bs = len(seq_lens)
+    # Use the preprocessing function exactly like PyTorch version
+    parent_list, top_scores_index, draft_tokens = (
+        build_tree_kernel_efficient_preprocess(
+            verified_id, score_list, token_list, parents_list, num_verify_tokens
+        )
+    )
 
-    # Preprocess the tree data
-    if len(score_list) == 0:
-        # Handle empty case
-        draft_tokens = verified_id.flatten()
-        parent_list = jnp.array([], dtype=jnp.int64)
-        top_scores_index = jnp.array([], dtype=jnp.int64)
-    else:
-        # Concatenate and process score lists
-        score_tensor = jnp.concatenate([s.flatten() for s in score_list], axis=-1)
-        score_tensor = score_tensor.reshape(bs, -1)
-
-        # Concatenate token lists
-        ss_token_list = jnp.concatenate(token_list, axis=1)
-
-        # Get top scores and indices
-        if num_verify_tokens > 1:
-            # Use top-k to get the best candidates
-            top_scores_values, top_scores_index = jax.lax.top_k(
-                score_tensor, min(num_verify_tokens - 1, score_tensor.shape[-1])
-            )
-            # Sort the indices
-            top_scores_index = jnp.sort(top_scores_index, axis=-1)
-        else:
-            top_scores_index = jnp.array([], dtype=jnp.int64).reshape(bs, 0)
-
-        # Gather draft tokens
-        if top_scores_index.shape[-1] > 0:
-            draft_tokens_selected = jnp.take_along_axis(
-                ss_token_list, top_scores_index, axis=1
-            )
-            draft_tokens = jnp.concatenate(
-                [verified_id.reshape(bs, 1), draft_tokens_selected], axis=1
-            ).flatten()
-        else:
-            draft_tokens = verified_id.flatten()
-
-        # Build parent list (simplified)
-        if len(parents_list) > 1:
-            parent_list = jnp.concatenate(parents_list[:-1], axis=1)
-        else:
-            parent_list = jnp.array([], dtype=jnp.int64)
+    # Get batch size
+    bs = seq_lens.shape[0]
 
     # Create tree mask (simplified - full attention for now)
     total_tokens = seq_lens_sum + num_verify_tokens * bs
