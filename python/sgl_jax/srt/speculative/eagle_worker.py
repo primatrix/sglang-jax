@@ -140,6 +140,9 @@ class EAGLEWorker(ModelWorker):
             precompile_cache_loc_paddings,
             self.page_size,
         )
+        logger.info(
+            f"Original seq_lens: {model_worker_batch.seq_lens} shape: {model_worker_batch.seq_lens.shape}"
+        )
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
