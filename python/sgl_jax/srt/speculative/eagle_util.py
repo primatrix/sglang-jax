@@ -145,6 +145,13 @@ def build_tree_kernel_efficient_preprocess(
     )
     top_scores_index = jnp.sort(top_scores_index, axis=-1)
 
+    # Debug: 临时打印中间结果
+    print(f"DEBUG: score_tensor shape: {score_tensor.shape}")
+    print(f"DEBUG: ss_token_list shape: {ss_token_list.shape}")
+    print(f"DEBUG: top_scores_index shape: {top_scores_index.shape}")
+    print(f"DEBUG: top_scores_index: {top_scores_index}")
+    print(f"DEBUG: verified_id: {verified_id}")
+
     # Gather draft tokens using the top indices
     draft_tokens = jnp.take_along_axis(ss_token_list, top_scores_index, axis=1)
     draft_tokens = jnp.concatenate(
@@ -156,7 +163,7 @@ def build_tree_kernel_efficient_preprocess(
         parent_list = jnp.concatenate(parents_list[:-1], axis=1)
     else:
         batch_size = parents_list[0].shape[0]
-        parent_list = jnp.empty((batch_size, 0), dtype=jnp.int64)
+        parent_list = jnp.empty((batch_size, 0), dtype=jnp.int32)
 
     return parent_list, top_scores_index, draft_tokens
 
@@ -212,9 +219,9 @@ def build_tree_kernel_efficient(
     )
 
     # Create retrieval indices (simplified)
-    retrive_index = jnp.full((bs, num_verify_tokens), -1, dtype=jnp.int64)
-    retrive_next_token = jnp.full((bs, num_verify_tokens), -1, dtype=jnp.int64)
-    retrive_next_sibling = jnp.full((bs, num_verify_tokens), -1, dtype=jnp.int64)
+    retrive_index = jnp.full((bs, num_verify_tokens), -1, dtype=jnp.int32)
+    retrive_next_token = jnp.full((bs, num_verify_tokens), -1, dtype=jnp.int32)
+    retrive_next_sibling = jnp.full((bs, num_verify_tokens), -1, dtype=jnp.int32)
 
     # Fill in some basic retrieval information
     for i in range(bs):
