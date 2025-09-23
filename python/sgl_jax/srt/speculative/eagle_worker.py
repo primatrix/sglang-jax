@@ -11,6 +11,7 @@ from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
+    ForwardMode,
 )
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.speculative.eagle_util import (
@@ -149,7 +150,10 @@ class EAGLEWorker(ModelWorker):
             model_worker_batch, self.draft_model_runner.mesh
         )
         self.draft_model_runner.attn_backend.forward_metadata = forward_metadata
-        logger.info(f" forward_batch.forward_mode { forward_batch.forward_mode}")
+        forward_batch.forward_mode = ForwardMode.EXTEND
+        logger.info(
+            f" forward_batch.forward_mode { forward_batch.forward_mode} {forward_batch.forward_mode.is_decode()}"
+        )
         logits_output, _ = self.draft_model_runner.forward(
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(
