@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 
 import jax
@@ -72,12 +73,17 @@ class FlashAttention(AttentionBackend):
         num_attn_heads,
         num_kv_heads,
         head_dim,
-        vmem_limit_bytes: int = 64 * (1 << 20),  # 64MB
+        vmem_limit_bytes: int | None = None,  # None => auto-estimate in kernel
         page_size: int = 1,
         kv_partition_axis: str = "tensor",
         mesh: jax.sharding.Mesh = None,
     ):
-        self.vmem_limit_bytes = vmem_limit_bytes
+        # Allow override from env; otherwise leave None to auto-estimate inside kernel
+        if vmem_limit_bytes is None:
+            env_lim = os.environ.get("SGL_TPU_VMEM_LIMIT_BYTES")
+            self.vmem_limit_bytes = int(env_lim) if env_lim else None
+        else:
+            self.vmem_limit_bytes = vmem_limit_bytes
         self.num_heads = num_attn_heads
         if num_kv_heads is not None:
             self.num_kv_heads = num_kv_heads
@@ -96,6 +102,22 @@ class FlashAttention(AttentionBackend):
         indices = np.arange(0, len(batch.cache_loc), self.page_size)
         selected_cache_locs = batch.cache_loc[indices]
         page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
+
+        # Host-side debug logging for cache/page mapping
+        try:
+            import logging as _logging
+
+            _logger = _logging.getLogger(__name__)
+            _logger.debug(
+                "[FA meta dbg] forward_mode=%s, bs=%d, seq_lens_sum=%d, page_size=%d, page_indices_max=%d",
+                str(batch.forward_mode),
+                int(len(batch.seq_lens)),
+                int(np.sum(batch.seq_lens).item()),
+                int(self.page_size),
+                int(page_indices.max().item()) if page_indices.size > 0 else -1,
+            )
+        except Exception:
+            pass
 
         if batch.forward_mode == ForwardMode.EXTEND:
             cu_q_lens = np.concatenate(
@@ -207,6 +229,11 @@ class FlashAttention(AttentionBackend):
         num_pages = total_tokens // self.page_size
         kv_cache_fused_paged = kv_cache_fused.reshape(num_pages, self.page_size, -1, self.head_dim)
 
+        # Select page indices and remap to SWA pool if KV cache supports it
+        page_indices_arg = self.forward_metadata.page_indices
+        if hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
+            page_indices_arg = token_to_kv_pool.remap_cache_loc(page_indices_arg, layer.layer_id)
+
         in_specs = (
             P(None, self.kv_partition_axis),  # queries
             P(None, self.kv_partition_axis),  # keys (new tokens)
@@ -237,8 +264,8 @@ class FlashAttention(AttentionBackend):
                 kv_cache_fused,
                 *other_args,
                 sm_scale=scale,
-                sliding_window=None,
-                soft_cap=None,
+                sliding_window=layer.sliding_window_size,
+                soft_cap=layer.logit_cap,
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
 
@@ -258,7 +285,7 @@ class FlashAttention(AttentionBackend):
             v.reshape(v.shape[0], -1, self.head_dim),
             kv_cache_fused_paged,
             self.forward_metadata.seq_lens,
-            self.forward_metadata.page_indices,
+            page_indices_arg,
             self.forward_metadata.cu_q_lens,
             self.forward_metadata.cu_kv_lens,
             self.forward_metadata.distribution,
