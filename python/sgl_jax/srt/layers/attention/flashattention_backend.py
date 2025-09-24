@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax import lax
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
@@ -237,8 +238,9 @@ class FlashAttention(AttentionBackend):
                 kv_cache_fused,
                 *other_args,
                 sm_scale=scale,
-                sliding_window=None,
-                soft_cap=None,
+                page_size=self.page_size,
+                sliding_window=layer.sliding_window_size,
+                soft_cap=layer.logit_cap,
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
 
