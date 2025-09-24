@@ -395,7 +395,7 @@ def _launch_subprocesses(
     if server_args.dp_size == 1:
         scheduler_pipe_readers = []
         reader, writer = mp.Pipe(duplex=False)
-        proc = mp.Process(
+        proc = threading.Thread(
             target=run_scheduler_process,
             args=(
                 server_args,
@@ -433,7 +433,7 @@ def _launch_subprocesses(
         return None, None, None
 
     # Launch detokenizer process
-    detoken_proc = mp.Process(
+    detoken_proc = threading.Thread(
         target=run_detokenizer_process,
         args=(
             server_args,
