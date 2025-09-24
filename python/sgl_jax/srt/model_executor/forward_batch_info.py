@@ -20,7 +20,7 @@ import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import jax
 
@@ -37,6 +37,11 @@ if TYPE_CHECKING:
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
 
 from jax.tree_util import register_pytree_node_class
+
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
+if TYPE_CHECKING:
+    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
 
 
 class ForwardMode(IntEnum):
@@ -165,7 +170,7 @@ class ForwardBatch:
     trace_request_ids: Optional[List[str]] = None
     trace_request_objects: Optional[List] = None
 
-    spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
+    spec_info: Optional[Union["EagleVerifyInput", "EagleDraftInput"]] = None
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
 

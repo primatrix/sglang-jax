@@ -252,7 +252,7 @@ def configure_mtp(self, server_args: ServerArgs) -> MTPConfig:
 
 ### Phase 3: Optimization (4 weeks)
 
-- Implement CUDA graph support for MTP
+- Implement precompile support for MTP
 - Add memory optimization for multi-token sequences
 - Performance tuning and profiling
 - Benchmark against baseline implementations

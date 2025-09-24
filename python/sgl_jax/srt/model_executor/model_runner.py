@@ -346,10 +346,10 @@ class ModelRunner:
             return NativeAttention(self.num_attn_heads, self.num_kv_heads)
         elif self.server_args.attention_backend == "fa":
             from sgl_jax.srt.layers.attention.flashattention_backend import (
-                FlashAttention,
+                FlashAttentionBackend,
             )
 
-            return FlashAttention(
+            return FlashAttentionBackend(
                 self.num_attn_heads,
                 self.num_kv_heads,
                 self.model_config.head_dim,
