@@ -52,9 +52,6 @@ class EAGLEWorker(ModelWorker):
         if self.speculative_algorithm.is_eagle3():
             pass
         else:
-            logger.info(
-                f"{server_args.speculative_algorithm} set target model's embed and head for draft model"
-            )
             self.target_worker.model_runner.model.set_embed_and_head(embed, head)
 
     def forward_batch_speculative_generation(
@@ -75,14 +72,10 @@ class EAGLEWorker(ModelWorker):
             self.forward_draft_extend(
                 batch, model_worker_batch, logits_output.hidden_states, next_token_ids
             )
-            logger.info(
-                f"-------------forward_draft_extend------------{logits_output.hidden_states.shape}"
-            )
             return logits_output, next_token_ids, cache_miss_count, 0
         else:
             # draft
             spec_info = self.draft(batch)
-            logger.info(f"-------------draft------------{spec_info}")
             # verify
             logits_output, verify_output, model_worker_batch, cache_hit = self.verify(
                 batch, spec_info
@@ -140,9 +133,6 @@ class EAGLEWorker(ModelWorker):
             precompile_cache_loc_paddings,
             self.page_size,
         )
-        logger.info(
-            f"Original seq_lens: {model_worker_batch.seq_lens} shape: {model_worker_batch.seq_lens.shape}"
-        )
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
@@ -154,7 +144,6 @@ class EAGLEWorker(ModelWorker):
         )
         self.draft_model_runner.attn_backend.forward_metadata = forward_metadata
         forward_batch.forward_mode = ForwardMode.EXTEND
-        logger.info(f" forward_batch { forward_batch}")
         logits_output, _ = self.draft_model_runner.forward(
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(
@@ -179,7 +168,6 @@ class EAGLEWorker(ModelWorker):
             batch.spec_info.filter_batch(
                 unfinished_index_device, has_been_filtered=False
             )
-        logger.info(f"-------------extend------------{batch.spec_info}")
 
     @property
     def draft_model_runner(self):
@@ -193,18 +181,6 @@ class EAGLEWorker(ModelWorker):
             probs, self.topk, axis=-1
         )
         draft_input.hidden_states = logits_output.hidden_states
-        logger.info(
-            f"logits_output.next_token_logits {logits_output.next_token_logits.shape}"
-        )
-        logger.info(
-            f"-------------draft_input.topk_p------------{draft_input.topk_p.shape}"
-        )
-        logger.info(
-            f"-------------draft_input.topk_index------------{draft_input.topk_index.shape}"
-        )
-        logger.info(
-            f"-------------draft_input.hidden_states------------{draft_input.hidden_states.shape}"
-        )
 
     def draft(self, batch: ScheduleBatch):
         if batch.forward_mode.is_idle():
@@ -214,7 +190,6 @@ class EAGLEWorker(ModelWorker):
 
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
-        logger.info(f"-------------draft------------{spec_info}")
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         spec_info.num_tokens_per_batch = self.topk
         spec_info.num_tokens_for_logprob_per_batch = self.topk
@@ -234,9 +209,6 @@ class EAGLEWorker(ModelWorker):
 
         # Run forward steps
         score_list, token_list, parents_list = self.draft_forward(batch)
-        logger.info(f"-------------score_list------------{score_list}")
-        logger.info(f"-------------token_list------------{token_list}")
-        logger.info(f"-------------parents_list------------{parents_list}")
         (
             tree_mask,
             position,
@@ -256,14 +228,6 @@ class EAGLEWorker(ModelWorker):
             self.speculative_num_draft_tokens,
         )
         # build tree
-        logger.info(f"-------------tree_mask------------{tree_mask}")
-        logger.info(f"-------------position------------{position}")
-        logger.info(f"-------------retrive_index------------{retrive_index}")
-        logger.info(f"-------------retrive_next_token------------{retrive_next_token}")
-        logger.info(
-            f"-------------retrive_next_sibling------------{retrive_next_sibling}"
-        )
-        logger.info(f"-------------draft_tokens------------{draft_tokens}")
         return EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
@@ -325,9 +289,6 @@ class EAGLEWorker(ModelWorker):
         # Forward multiple steps
         scores = None
         for i in range(self.speculative_num_steps):
-            logger.info(
-                f"***********{i}***{topk_p.shape} {topk_index.shape}***{hidden_states.shape}****************************"
-            )
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
@@ -514,15 +475,6 @@ def select_top_k_tokens(
         input_ids = topk_index.flatten()
         hidden_states = jnp.repeat(hidden_states, topk, axis=0)
         scores = topk_p  # shape: (b, topk)
-        logger.info(
-            f"-------------i------------{i}==========================================="
-        )
-        logger.info(f"-------------topk_p------------{topk_p.shape}")
-        logger.info(f"-------------topk_index------------{topk_index.shape}")
-        logger.info(f"--------------input_ids-------------{input_ids.shape}")
-        logger.info(f"-------------scores------------{scores.shape}")
-        logger.info(f"-------------hidden_states------------{hidden_states.shape}")
-        logger.info("================================================================")
 
         tree_info = (
             jnp.expand_dims(topk_p, axis=1),  # shape: (b, 1, topk)
@@ -556,14 +508,5 @@ def select_top_k_tokens(
             topk_index,  # shape: (b, topk * topk)
             topk_cs_index + (topk**2 * (i - 1) + topk),  # shape: (b, topk)
         )
-        logger.info(
-            f"-------------i------------{i}==========================================="
-        )
-        logger.info(f"-------------topk_p------------{topk_p.shape}")
-        logger.info(f"-------------topk_index------------{topk_index.shape}")
-        logger.info(f"--------------input_ids-------------{input_ids.shape}")
-        logger.info(f"-------------scores------------{scores.shape}")
-        logger.info(f"-------------hidden_states------------{hidden_states.shape}")
-        logger.info("================================================================")
 
     return input_ids, hidden_states, scores, tree_info
