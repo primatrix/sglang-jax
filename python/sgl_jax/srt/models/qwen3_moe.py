@@ -1,10 +1,9 @@
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 from flax import nnx
 from jax import jax
 from jax import numpy as jnp
-from jax.sharding import get_abstract_mesh
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -232,7 +231,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         residual: Optional[jax.Array] = None,
-    ) -> Tuple[jax.Array, jax.Array]:
+    ):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -332,15 +331,14 @@ class Qwen3MoeForCausalLM(nnx.Module):
         self.mesh = mesh
         self.config = config
         self.dtype = config.dtype
-        logger.info(f"QWen3MoeForCausalLMModel config dtype: {self.dtype}")
-        self.transformer = QWen3MoeModel(
+        self.model = QWen3MoeModel(
             config.hf_config, dtype=self.dtype, rngs=rngs, mesh=mesh
         )
         self.lm_head = ParallelLMHead(
             config.hf_config.vocab_size, config.hidden_size, rngs=rngs
         )
         self.logits_processor = LogitsProcessor(
-            config.hf_config.vocab_size, self.lm_head, self.mesh
+            config.hf_config.vocab_size, mesh=self.mesh
         )
 
     def load_weights(self, rng_key: jax.Array):
@@ -358,12 +356,12 @@ class Qwen3MoeForCausalLM(nnx.Module):
     def _create_qwen3_moe_weight_mappings(self) -> dict:
         mappings = {
             "model.embed_tokens.weight": WeightMapping(
-                target_path="transformer.embed_tokens.embedding",
+                target_path="model.embed_tokens.embedding",
                 sharding=(None, None),
                 transpose=False,
             ),
             "model.norm.weight": WeightMapping(
-                target_path="transformer.norm.scale", sharding=(None,), transpose=False
+                target_path="model.norm.scale", sharding=(None,), transpose=False
             ),
         }
 
@@ -385,7 +383,7 @@ class Qwen3MoeForCausalLM(nnx.Module):
 
     def _create_moe_layer_mappings(self, layer_idx: int, is_mlp_layer: bool) -> dict:
         prefix = f"model.layers.{layer_idx}"
-        target_prefix = f"transformer.layers.{layer_idx}"
+        target_prefix = f"model.layers.{layer_idx}"
 
         mappings = {
             f"{prefix}.input_layernorm.weight": WeightMapping(
@@ -510,8 +508,8 @@ class Qwen3MoeForCausalLM(nnx.Module):
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused = self.transformer(forward_batch)
-        output = self.logits_processor(hidden_states, logits_metadata)
+        hidden_states, layers_kv_fused = self.model(forward_batch)
+        output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         return output, layers_kv_fused, True
 
 

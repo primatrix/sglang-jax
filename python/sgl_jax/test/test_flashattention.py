@@ -154,6 +154,8 @@ def create_test_data(
     # fake req_pool_indices, not used in attention
     req_pool_indices = jnp.arange(batch_size, dtype=jnp.int32)
 
+    print(f"{model_config=}")
+
     current_kv_cache = MHATokenToKVPool(
         size=max_total_token_size,
         page_size=page_size,
@@ -290,7 +292,7 @@ class TestAttention(CustomTestCase):
         self.rng_key = jax.random.PRNGKey(42)
         np.random.seed(42)
 
-    def run_test(self, mode, lens, mode_args):
+    def run_test(self, mode, lens, mode_args, sliding_window=None, logit_cap=None):
         # Create mock forward_batch
         num_heads, head_dim, num_kv_heads, page_size, dtype = mode_args
 
@@ -342,6 +344,8 @@ class TestAttention(CustomTestCase):
             scaling=head_dim**-0.5,
             num_kv_heads=num_kv_heads,
             layer_id=0,
+            sliding_window_size=sliding_window or 0,
+            logit_cap=logit_cap or 0,
         )
 
         padding_size = 4096
@@ -377,6 +381,8 @@ class TestAttention(CustomTestCase):
             # forward_batch.attn_backend.forward_metadata.cu_kv_lens,
             forward_batch.attn_backend.forward_metadata.num_seqs,
             sm_scale=head_dim**-0.5,
+            sliding_window=sliding_window,
+            soft_cap=logit_cap,
         )
         jax.block_until_ready(expected)
 
@@ -452,7 +458,7 @@ class TestAttention(CustomTestCase):
         # Parameters
         num_heads = 32
         num_kv_heads = 8
-        head_dim = 128
+        head_dim = 256
         lens = [
             (1, 128),
             (125, 125),
@@ -469,9 +475,9 @@ class TestAttention(CustomTestCase):
     def test_mha_decode_accuracy_page_size_1(self):
         """Test JAX attention accuracy against native fa"""
         # Parameters
-        num_heads = 32
-        num_kv_heads = 32
-        head_dim = 128
+        num_heads = 16
+        num_kv_heads = 8
+        head_dim = 256
         lens = [
             (1, 119),
             (1, 127),
@@ -602,6 +608,55 @@ class TestAttention(CustomTestCase):
 
         self.run_test(
             "decode", lens, (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16)
+        )
+
+    def test_sliding_window_and_soft_cap_prefill_accuracy(self):
+        """Test combined sliding window and soft cap attention accuracy in prefill mode"""
+        # Parameters
+        num_heads = 32
+        num_kv_heads = 32
+        head_dim = 256
+        sliding_window_size = 512
+        logit_cap = 20.0
+
+        lens = [
+            (1, 128),
+            (64, 64),
+            (128, 256),
+            (100, 300),
+            (1, 400),
+        ]
+
+        self.run_test(
+            "prefill",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16),
+            sliding_window=sliding_window_size,
+            logit_cap=logit_cap,
+        )
+
+    def test_sliding_window_and_soft_cap_decode_accuracy(self):
+        """Test combined sliding window and soft cap attention accuracy in decode mode"""
+        # Parameters
+        num_heads = 32
+        num_kv_heads = 32
+        head_dim = 128
+        sliding_window_size = 512
+        logit_cap = 20.0
+
+        lens = [
+            (1, 256),
+            (1, 400),
+            (1, 512),
+            (1, 1024),
+        ]
+
+        self.run_test(
+            "decode",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16),
+            sliding_window=sliding_window_size,
+            logit_cap=logit_cap,
         )
 
 

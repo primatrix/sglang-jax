@@ -42,6 +42,7 @@ class ModelConfig:
         dtype: str = "auto",
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
+        hybrid_kvcache_ratio: Optional[float] = None,
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
         quantization: Optional[str] = None,
         model_layer_nums: Optional[int] = None,
@@ -78,6 +79,18 @@ class ModelConfig:
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
         )
+        self.is_hybrid = is_hybrid_model(
+            self.hf_config.architectures,
+            hybrid_kvcache_ratio=hybrid_kvcache_ratio,
+            context_length=context_length,
+            attention_chunk_size=self.attention_chunk_size,
+        )
+        if self.is_hybrid is not None:
+            self.swa_attention_layer_ids, self.full_attention_layer_ids = (
+                get_hybrid_layer_ids(
+                    self.hf_config.architectures, self.hf_text_config.num_hidden_layers
+                )
+            )
 
         if (
             is_draft_model
@@ -141,6 +154,9 @@ class ModelConfig:
         self.hidden_size = self.hf_text_config.hidden_size
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.vocab_size = self.hf_text_config.vocab_size
+        self.final_logit_softcapping = getattr(
+            self.hf_text_config, "final_logit_softcapping", None
+        )
 
         # Override num_hidden_layers if model_layer_nums is specified
         if model_layer_nums is not None:
@@ -179,6 +195,7 @@ class ModelConfig:
             is_embedding=server_args.is_embedding,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
+            hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
             model_impl=server_args.model_impl,
             model_layer_nums=server_args.model_layer_nums,
             **kwargs,
@@ -451,7 +468,7 @@ def _get_and_verify_dtype(
 
     if config_dtype is None:
         config_dtype = jnp.float32
-
+        
     if isinstance(dtype, str):
         dtype = dtype.lower()
         if dtype == "auto":
@@ -509,6 +526,38 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         return False
     else:
         return not is_embedding
+
+
+def is_hybrid_model(
+    model_architectures: List[str],
+    hybrid_kvcache_ratio: Optional[float],
+    context_length: Optional[int],
+    attention_chunk_size: Optional[int],
+):
+    if hybrid_kvcache_ratio is None:
+        return None
+    elif (
+        hybrid_kvcache_ratio > 0
+        and model_architectures[0] == "Llama4ForConditionalGeneration"
+        and context_length > attention_chunk_size
+    ):
+        return hybrid_kvcache_ratio
+    else:
+        return None
+
+
+def get_hybrid_layer_ids(model_architectures: List[str], num_hidden_layers: int):
+    if "Llama4ForConditionalGeneration" in model_architectures:
+        swa_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if (i + 1) % 4 != 0
+        ]
+        full_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if (i + 1) % 4 == 0
+        ]
+    else:
+        swa_attention_layer_ids = None
+        full_attention_layer_ids = None
+    return swa_attention_layer_ids, full_attention_layer_ids
 
 
 multimodal_model_archs = [

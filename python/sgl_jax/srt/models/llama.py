@@ -268,7 +268,7 @@ class LlamaDecoderLayer(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         residual: Optional[jax.Array],
-    ) -> Tuple[jax.Array, jax.Array]:
+    ):
         layer_callback_flag = []
         if residual is None:
             residual = hidden_states
@@ -377,12 +377,12 @@ class LlamaForCausalLM(nnx.Module):
         self.config = config
         self.dtype = config.dtype
         logger.info(f"LlamaForCausalLM config dtype: {self.dtype}")
-        self.transformer = LlamaModel(config.hf_config, dtype=self.dtype, rngs=rngs)
+        self.model = LlamaModel(config.hf_config, dtype=self.dtype, rngs=rngs)
         self.lm_head = ParallelLMHead(
             config.hf_config.vocab_size, config.hidden_size, rngs=rngs
         )
         self.logits_processor = LogitsProcessor(
-            config.hf_config.vocab_size, self.lm_head, self.mesh
+            config.hf_config.vocab_size, mesh=self.mesh
         )
 
     def load_weights(self, rng_key: jax.Array):
@@ -403,12 +403,12 @@ class LlamaForCausalLM(nnx.Module):
     def _create_llama_weight_mappings(self) -> dict:
         mappings = {
             "model.embed_tokens.weight": WeightMapping(
-                target_path="transformer.embed_tokens.embedding",
+                target_path="model.embed_tokens.embedding",
                 sharding=(None, None),
                 transpose=False,
             ),
             "model.norm.weight": WeightMapping(
-                target_path="transformer.norm.scale", sharding=(None,), transpose=False
+                target_path="model.norm.scale", sharding=(None,), transpose=False
             ),
         }
 
@@ -426,7 +426,7 @@ class LlamaForCausalLM(nnx.Module):
 
     def _create_layer_mappings(self, layer_idx: int) -> dict:
         prefix = f"model.layers.{layer_idx}"
-        target_prefix = f"transformer.layers.{layer_idx}"
+        target_prefix = f"model.layers.{layer_idx}"
 
         mappings = {
             f"{prefix}.input_layernorm.weight": WeightMapping(
@@ -522,10 +522,8 @@ class LlamaForCausalLM(nnx.Module):
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused, layers_callback_flag = self.transformer(
-            forward_batch
-        )
-        output = self.logits_processor(hidden_states, logits_metadata)
+        hidden_states, layers_kv_fused, layers_callback_flag = self.model(forward_batch)
+        output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         return output, layers_kv_fused, layers_callback_flag
 
 
