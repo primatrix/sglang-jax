@@ -126,23 +126,11 @@ def build_tree_kernel_efficient_preprocess(
     parents_list: List[jax.Array],
     num_verify_tokens: int,
 ):
-    """JAX implementation of build_tree_kernel_efficient_preprocess.
 
-    This function matches the PyTorch preprocessing logic exactly.
-    """
-    logger.info(f"-------------verified_id------------{verified_id.shape}")
-    for score in score_list:
-        logger.info(f"-------------score------------{score.shape}")
-    for token in token_list:
-        logger.info(f"-------------token------------{token.shape}")
-    for parent in parents_list:
-        logger.info(f"-------------parent------------{parent.shape}")
-    logger.info(f"-------------num_verify_tokens------------{num_verify_tokens}")
     # Concatenate score_list along dim=1 and flatten from dim=1 onwards
     # b, n, topk; n = 1 + (num_steps-1) * self.topk
     score_tensor = jnp.concatenate(score_list, axis=1)
     score_tensor = score_tensor.reshape(score_tensor.shape[0], -1)
-    logger.info(f"-------------score_tensor------------{score_tensor.shape}")
 
     # Concatenate token lists: b, (self.topk + (num_steps-1) * self.topk)
     ss_token_list = jnp.concatenate(token_list, axis=1)
@@ -153,9 +141,6 @@ def build_tree_kernel_efficient_preprocess(
 
     # Gather draft tokens using the top indices
     draft_tokens = jnp.take_along_axis(ss_token_list, top_scores_index, axis=1)
-    logger.info(
-        f"-------------draft_tokens------------{verified_id.shape} {score_tensor.shape} {ss_token_list.shape} {draft_tokens.shape}"
-    )
     # assert draft_tokens.shape == (batch_size, verified_id.shape[0])
     draft_tokens = jnp.concatenate(
         [jnp.expand_dims(verified_id, axis=1), draft_tokens], axis=1
@@ -184,10 +169,6 @@ def build_tree_kernel_efficient(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """JAX implementation of build_tree_kernel_efficient.
 
-    This implementation reconstructs the EAGLE tree building algorithm to match
-    the PyTorch version's exact output patterns for positions, retrive_next_token,
-    and retrive_next_sibling arrays.
-
     Args:
         verified_id: Verified token IDs from previous step
         score_list: List of score tensors from draft model
@@ -203,7 +184,6 @@ def build_tree_kernel_efficient(
         tuple of (tree_mask, positions, retrive_index, retrive_next_token,
                  retrive_next_sibling, draft_tokens)
     """
-    # Use the preprocessing function exactly like PyTorch version
     parent_list, top_scores_index, draft_tokens = (
         build_tree_kernel_efficient_preprocess(
             verified_id, score_list, token_list, parents_list, num_verify_tokens
