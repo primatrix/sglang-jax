@@ -81,8 +81,6 @@ class EAGLEWorker(ModelWorker):
         else:
             # draft
             spec_info = self.draft(batch)
-            logger.info(f"-------------spec_info------------{spec_info}")
-            logger.info(f"-------------batch.seq_lens------------{batch}")
             # verify
             logits_output, verify_output, model_worker_batch = self.verify(
                 batch, spec_info
@@ -209,7 +207,7 @@ class EAGLEWorker(ModelWorker):
         #     # Initialize attention backend
         #     forward_metadata = (
         #         self.draft_model_runner.attn_backend.get_forward_metadata(
-        #             model_worker_batch, self.mesh
+        #             model_worker_batch
         #         )
         #     )
         #     self.draft_model_runner.attn_backend.forward_metadata = forward_metadata
@@ -461,7 +459,7 @@ class EAGLEWorker(ModelWorker):
         if not forward_batch.forward_mode.is_idle():
             forward_metadata = (
                 self.draft_model_runner.attn_backend.get_forward_metadata(
-                    model_worker_batch, self.mesh
+                    model_worker_batch
                 )
             )
             self.draft_model_runner.attn_backend.forward_metadata = forward_metadata

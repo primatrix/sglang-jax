@@ -922,6 +922,11 @@ class ScheduleBatch:
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
+        if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
+            # if spec decoding is used, the decode batch is prepared inside
+            # `forward_batch_speculative_generation` after running draft models.
+            return
+
         # Update fields
         self.input_ids = self.output_ids
 
@@ -1245,10 +1250,10 @@ class ScheduleBatch:
             extend_start_loc=extend_start_loc,
             cache_loc=cache_loc_cpu,
             extend_prefix_lens=(
-                extend_prefix_lens if self.forward_mode == ForwardMode.EXTEND else None
+                extend_prefix_lens if self.forward_mode.is_extend() else None
             ),
             extend_seq_lens=(
-                extend_seq_lens if self.forward_mode == ForwardMode.EXTEND else None
+                extend_seq_lens if self.forward_mode.is_extend() else None
             ),
             extend_logprob_start_lens=extend_logprob_start_lens,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
@@ -1275,7 +1280,7 @@ class ScheduleBatch:
             if precision_tracer.get_trace_active():
                 # for chunked prefill trace
                 if req.fill_ids:
-                    if self.forward_mode == ForwardMode.EXTEND:
+                    if self.forward_mode.is_extend():
                         input_ids_to_trace = req.fill_ids[len(req.prefix_indices) :]
                     else:
                         input_ids_to_trace = req.fill_ids
@@ -1288,7 +1293,7 @@ class ScheduleBatch:
                         req.rid, input_ids_to_trace, self.forward_mode
                     ),
                 )
-                if self.forward_mode == ForwardMode.EXTEND:
+                if self.forward_mode.is_extend():
                     precision_tracer.add_request_counter()
                     logger.info(
                         f"Starting trace for request {precision_tracer.get_request_counter()}: {req.rid}"

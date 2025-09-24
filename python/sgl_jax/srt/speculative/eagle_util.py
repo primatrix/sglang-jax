@@ -503,8 +503,7 @@ class EagleVerifyInput:
         if bs != len(sampling_info):
             sampling_info = copy.deepcopy(sampling_info)
             # NOTE: retrive_index are the indices of the requests that are kept.
-            sampling_info.filter_batch(
-                self.retrive_index.tolist(), self.retrive_index)
+            sampling_info.filter_batch(self.retrive_index.tolist(), self.retrive_index)
 
         # TODO: support custom sampler, apply the custom logit processors if registered in the sampling info.
         # if sampling_info.has_custom_logit_processor:
@@ -520,8 +519,7 @@ class EagleVerifyInput:
         is_all_greedy = sampling_info.is_all_greedy
 
         if is_all_greedy:
-            target_predict = jnp.argmax(
-                logits_output.next_token_logits, axis=-1)
+            target_predict = jnp.argmax(logits_output.next_token_logits, axis=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
 
             accept_index, accept_length, predict = verify_tree_greedy(
@@ -561,8 +559,7 @@ class EagleVerifyInput:
             # coins for rejection sampling
             coins = jax.random.uniform(candidates.shape, dtype=jnp.float32)
             # coins for final sampling
-            coins_for_final_sampling = jax.random.uniform(
-                (bs,), dtype=jnp.float32)
+            coins_for_final_sampling = jax.random.uniform((bs,), dtype=jnp.float32)
             accept_index, accept_length, predict = (
                 tree_speculative_sampling_target_only(
                     predicts=predict,
@@ -617,7 +614,7 @@ class EagleVerifyInput:
                 if req.finished():
                     has_finished = True
                     # set all tokens after finished token to -1 and break
-                    accept_index = accept_index.at[i, j + 1:].set(-1)
+                    accept_index = accept_index.at[i, j + 1 :].set(-1)
                     break
             if not req.finished():
                 unfinished_index.append(i)
@@ -649,8 +646,7 @@ class EagleVerifyInput:
                     page_size,
                     self.draft_token_num,
                 )
-                token_to_kv_pool_allocator.free(
-                    batch.out_cache_loc[evict_mask])
+                token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
             else:
                 # Shift the accepted tokens to the beginning.
                 # Only evict the last part
@@ -735,10 +731,8 @@ class EagleVerifyInput:
 
             accept_length_cpu = accept_length.tolist()
             if len(unfinished_accept_index) > 0:
-                unfinished_accept_index = jnp.concatenate(
-                    unfinished_accept_index)
-                unfinished_index_device = jnp.array(
-                    unfinished_index, dtype=jnp.int64)
+                unfinished_accept_index = jnp.concatenate(unfinished_accept_index)
+                unfinished_index_device = jnp.array(unfinished_index, dtype=jnp.int64)
                 draft_input_accept_length_cpu = [
                     accept_length_cpu[i] for i in unfinished_index
                 ]
@@ -746,8 +740,7 @@ class EagleVerifyInput:
                     batch.out_cache_loc = batch.out_cache_loc[unfinished_accept_index]
                 else:
                     batch.out_cache_loc = jnp.empty(
-                        len(unfinished_index) +
-                        sum(draft_input_accept_length_cpu),
+                        len(unfinished_index) + sum(draft_input_accept_length_cpu),
                         dtype=jnp.int64,
                     )
                     accept_length_filter = create_accept_length_filter(
@@ -808,8 +801,7 @@ def _generate_simulated_accept_index(
             size=(1,),
         )
         # clamp simulated values to be between 1 and self.spec_steps
-        simulated_values = jnp.clip(
-            simulated_values, min=1.0, max=spec_steps + 1)
+        simulated_values = jnp.clip(simulated_values, min=1.0, max=spec_steps + 1)
         simulate_acc_len = int(simulated_values.round().item())
     elif SIMULATE_ACC_METHOD == "match-expected":
         # multinomial sampling does not match the expected length
@@ -817,8 +809,7 @@ def _generate_simulated_accept_index(
         # but it's better to use "match-expected" for the cases that need to
         # match the expected length, One caveat is that this will only sample
         # either round down or round up of the expected length
-        simulate_acc_len_float = max(
-            1.0, min(spec_steps + 1, simulate_acc_len_float))
+        simulate_acc_len_float = max(1.0, min(spec_steps + 1, simulate_acc_len_float))
         lower = int(simulate_acc_len_float // 1)
         upper = lower + 1 if lower < spec_steps + 1 else lower
         if lower == upper:
@@ -1018,7 +1009,7 @@ def build_eagle_tree_structure(
                 positions = positions.at[global_token_idx].set(position + seq_len)
                 retrive_index = retrive_index.at[bid, tid].set(global_token_idx)
 
-    return positions, retrive_index, retrive_next_token, retrive_next_sibling
+    return tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling
 
 
 def get_src_tgt_cache_loc(
