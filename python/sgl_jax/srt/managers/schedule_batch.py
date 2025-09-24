@@ -40,11 +40,10 @@ from sgl_jax.srt.precision_tracer import (
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 from sgl_jax.srt.server_args import ServerArgs
-from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
-from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
+    from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -253,6 +252,10 @@ class Req:
         # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0
         self.already_computed = 0
+
+        # The number of verification forward passes in the speculative decoding.
+        # This is used to compute the average acceptance length per request.
+        self.spec_verify_ct = 0
 
         # For metrics
         self.has_log_time_stats: bool = False
@@ -1384,6 +1387,7 @@ class ModelWorkerBatch:
 
     spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None
     spec_algorithm: SpeculativeAlgorithm = None
+    # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
 
 

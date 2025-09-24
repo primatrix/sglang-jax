@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
+from sgl_jax.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.model_executor.forward_batch_info import (
@@ -17,18 +18,22 @@ from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.speculative.eagle_util import (
     EagleDraftInput,
     EagleVerifyInput,
+    EagleVerifyOutput,
     build_tree_kernel_efficient,
     get_last_loc_large_page_size_large_top_k,
     get_last_loc_large_page_size_top_k_1,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+from sgl_jax.srt.utils.common_utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
+RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
 
 
 class EAGLEWorker(ModelWorker):
     def __init__(self, server_args, target_worker: ModelWorker):
         self.target_worker = target_worker
+        self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
@@ -79,7 +84,7 @@ class EAGLEWorker(ModelWorker):
             logger.info(f"-------------spec_info------------{spec_info}")
             logger.info(f"-------------batch.seq_lens------------{batch}")
             # verify
-            logits_output, verify_output, model_worker_batch, cache_hit = self.verify(
+            logits_output, verify_output, model_worker_batch = self.verify(
                 batch, spec_info
             )
             self.forward_draft_extend_after_decode(batch)
@@ -246,11 +251,237 @@ class EAGLEWorker(ModelWorker):
             seq_lens_cpu=batch.seq_lens,
         )
 
-    def verify(self, batch: ScheduleBatch, spec_info: EagleDraftInput):
-        pass
+    def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
+        spec_info.prepare_for_verify(batch, self.page_size)
+        batch.return_hidden_states = False
+        batch.forward_mode = (
+            ForwardMode.TARGET_VERIFY
+            if not batch.forward_mode.is_idle()
+            else ForwardMode.IDLE
+        )
+        batch.spec_info = spec_info
+
+        (
+            precompile_token_paddings,
+            precompile_bs_paddings,
+            precompile_cache_loc_paddings,
+        ) = self.target_worker.get_precompile_paddings()
+
+        model_worker_batch = batch.get_model_worker_batch(
+            precompile_token_paddings,
+            precompile_bs_paddings,
+            precompile_cache_loc_paddings,
+            self.page_size,
+        )
+
+        assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
+
+        # forward
+        sampling_metadata = SamplingMetadata.from_model_worker_batch(
+            model_worker_batch,
+            len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
+            self.mesh,
+        )
+        logits_output, _, cache_miss_count = (
+            self.target_worker.forward_batch_generation(
+                model_worker_batch, sampling_metadata
+            )
+        )
+
+        # TODO: support grammar mask
+        # vocab_mask = None
+        # if batch.has_grammar:
+        #     pass
+
+        spec_info.hidden_states = logits_output.hidden_states
+        res: EagleVerifyOutput = spec_info.verify(
+            batch,
+            logits_output,
+            self.token_to_kv_pool_allocator,
+            self.page_size,
+            self.model_runner.rngs,
+        )
+
+        # Post process based on verified outputs.
+        # Pick indices that we care (accepted)
+        logits_output.next_token_logits = logits_output.next_token_logits[
+            res.accepted_indices
+        ]
+        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
+
+        # QQ: can be optimized
+        if self.target_worker.model_runner.is_hybrid_gdn:
+            # TODO: support Qwen3-Next
+            raise ValueError(f"hybrid gdn is not support yet")
+
+        if batch.return_logprob:
+            self.add_logprob_values(batch, res, logits_output)
+
+        # Prepare the batch for the next draft forwards.
+        batch.forward_mode = (
+            ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
+        )
+        batch.spec_info = res.draft_input
+
+        return logits_output, res, model_worker_batch
+
+    def add_logprob_values(
+        self,
+        batch: ScheduleBatch,
+        res: EagleVerifyOutput,
+        logits_output: LogitsProcessorOutput,
+    ):
+        # Extract args
+        logits_output = res.logits_output
+        top_logprobs_nums = batch.top_logprobs_nums
+        token_ids_logprobs = batch.token_ids_logprobs
+        accepted_indices = res.accepted_indices
+        assert len(accepted_indices) == len(logits_output.next_token_logits)
+
+        temperatures = batch.sampling_info.temperatures
+        num_draft_tokens = batch.spec_info.draft_token_num
+        # acceptance indices are the indices in a "flattened" batch.
+        # dividing it to num_draft_tokens will yield the actual batch index.
+        temperatures = temperatures[accepted_indices // num_draft_tokens]
+        if RETURN_ORIGINAL_LOGPROB:
+            logprobs = jax.nn.log_softmax(logits_output.next_token_logits, axis=-1)
+        else:
+            logprobs = jax.nn.log_softmax(
+                logits_output.next_token_logits / temperatures, axis=-1
+            )
+        batch_next_token_ids = res.verified_id
+        num_tokens_per_req = [accept + 1 for accept in res.accept_length_per_req_cpu]
+
+        # We should repeat top_logprobs_nums to match num_tokens_per_req.
+        top_logprobs_nums_repeat_interleaved = []
+        token_ids_logprobs_repeat_interleaved = []
+        for num, num_tokens in zip(top_logprobs_nums, num_tokens_per_req):
+            top_logprobs_nums_repeat_interleaved.extend([num] * num_tokens)
+        for token_ids, num_tokens in zip(token_ids_logprobs, num_tokens_per_req):
+            token_ids_logprobs_repeat_interleaved.extend([token_ids] * num_tokens)
+
+        # Extract logprobs
+        if any(x > 0 for x in top_logprobs_nums):
+            (
+                logits_output.next_token_top_logprobs_val,
+                logits_output.next_token_top_logprobs_idx,
+            ) = get_top_logprobs(
+                logprobs,
+                top_logprobs_nums_repeat_interleaved,
+            )
+
+        if any(x is not None for x in token_ids_logprobs):
+            (
+                logits_output.next_token_token_ids_logprobs_val,
+                logits_output.next_token_token_ids_logprobs_idx,
+            ) = get_token_ids_logprobs(
+                logprobs,
+                token_ids_logprobs_repeat_interleaved,
+            )
+
+        logits_output.next_token_logprobs = logprobs[
+            jnp.arange(len(batch_next_token_ids), device=batch.sampling_info.device),
+            batch_next_token_ids,
+        ]
+
+        # Add output logprobs to the request
+        pt = 0
+        next_token_logprobs = logits_output.next_token_logprobs.tolist()
+        verified_ids = batch_next_token_ids.tolist()
+        for req, num_tokens in zip(batch.reqs, num_tokens_per_req, strict=True):
+            for _ in range(num_tokens):
+                if req.return_logprob:
+                    req.output_token_logprobs_val.append(next_token_logprobs[pt])
+                    req.output_token_logprobs_idx.append(verified_ids[pt])
+                    if req.top_logprobs_num > 0:
+                        req.output_top_logprobs_val.append(
+                            res.logits_output.next_token_top_logprobs_val[pt]
+                        )
+                        req.output_top_logprobs_idx.append(
+                            res.logits_output.next_token_top_logprobs_idx[pt]
+                        )
+                pt += 1
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
-        pass
+        assert isinstance(batch.spec_info, EagleDraftInput)
+        # Backup fields that will be modified in-place
+        seq_lens_backup = batch.seq_lens.copy()
+        req_pool_indices_backup = batch.req_pool_indices
+        accept_length_backup = batch.spec_info.accept_length
+        return_logprob_backup = batch.return_logprob
+
+        input_is_idle = batch.forward_mode.is_idle()
+
+        if not input_is_idle and batch.spec_info.verified_id.size == 0:
+            batch = batch.copy()
+            batch.prepare_for_idle()
+            hidden_size = (
+                self.model_config.hidden_size * 3
+                if self.speculative_algorithm.is_eagle3()
+                else self.model_config.hidden_size
+            )
+            batch.spec_info = EagleDraftInput.create_idle_input(
+                hidden_size=hidden_size,
+                dtype=self.model_config.dtype,
+                topk=self.topk,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+            )
+
+        batch.spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
+        batch.spec_info.num_tokens_for_logprob_per_batch = 1
+        batch.spec_info.prepare_extend_after_decode(batch)
+        batch.forward_mode = (
+            ForwardMode.DRAFT_EXTEND
+            if not batch.forward_mode.is_idle()
+            else ForwardMode.IDLE
+        )
+
+        batch.return_hidden_states = False
+        (
+            precompile_token_paddings,
+            precompile_bs_paddings,
+            precompile_cache_loc_paddings,
+        ) = self.target_worker.get_precompile_paddings()
+        model_worker_batch = batch.get_model_worker_batch(
+            precompile_token_paddings,
+            precompile_bs_paddings,
+            precompile_cache_loc_paddings,
+            self.page_size,
+        )
+        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
+        forward_batch = ForwardBatch.init_new(
+            model_worker_batch, self.draft_model_runner
+        )
+        if forward_batch.seq_lens is not None:
+            forward_batch.seq_lens_sum = forward_batch.seq_lens.sum().item()
+        else:
+            forward_batch.seq_lens_sum = batch.seq_lens.sum().item()
+
+        # Run
+        if not forward_batch.forward_mode.is_idle():
+            forward_metadata = (
+                self.draft_model_runner.attn_backend.get_forward_metadata(
+                    model_worker_batch, self.mesh
+                )
+            )
+            self.draft_model_runner.attn_backend.forward_metadata = forward_metadata
+        logits_output, _ = self.draft_model_runner.forward(
+            forward_batch,
+            logits_metadata=LogitsMetadata.from_model_worker_batch(
+                model_worker_batch, self.mesh
+            ),
+        )
+        self.capture_for_decode(logits_output, forward_batch.spec_info)
+
+        # Restore backup.
+        # This is because `seq_lens` can be modified in `prepare_extend_after_decode`
+        batch.forward_mode = (
+            ForwardMode.DECODE if not input_is_idle else ForwardMode.IDLE
+        )
+        batch.seq_lens = seq_lens_backup
+        batch.req_pool_indices = req_pool_indices_backup
+        batch.spec_info.accept_length = accept_length_backup
+        batch.return_logprob = return_logprob_backup
 
     def draft_forward(self, schedule_batch: ScheduleBatch):
 

@@ -24,6 +24,8 @@ from typing import TYPE_CHECKING, List, Optional, Union
 
 import jax
 
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
 logger = logging.getLogger(__name__)
 
 from jax.sharding import NamedSharding, PartitionSpec
@@ -35,6 +37,7 @@ if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.mem_cache.memory_pool import KVCache
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
+    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
 
 from jax.tree_util import register_pytree_node_class
 
