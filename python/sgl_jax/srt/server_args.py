@@ -58,6 +58,7 @@ class ServerArgs:
     schedule_policy: str = "fcfs"
     schedule_conservativeness: float = 1.0
     page_size: int = 1
+    hybrid_kvcache_ratio: Optional[float] = None
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
 
@@ -114,11 +115,6 @@ class ServerArgs:
     disable_overlap_schedule: bool = False
     enable_precision_tracer: bool = False
 
-    # Jax distribution info
-    jax_proc_id: int = None
-    jax_num_procs: int = None
-
-    xla_backend: str = "tpu"
     # Kernel backend
     attention_backend: Optional[str] = "fa"
 
@@ -433,6 +429,18 @@ class ServerArgs:
             help="The number of tokens in a page.",
         )
         parser.add_argument(
+            "--hybrid-kvcache-ratio",
+            nargs="?",
+            const=0.5,
+            type=float,
+            default=ServerArgs.hybrid_kvcache_ratio,
+            help=(
+                "Mix ratio in [0,1] between uniform and hybrid kv buffers "
+                "(0.0 = pure uniform: swa_size / full_size = 1)"
+                "(1.0 = pure hybrid: swa_size / full_size = local_attention_size / context_length)"
+            ),
+        )
+        parser.add_argument(
             "--swa-full-tokens-ratio",
             type=float,
             default=ServerArgs.swa_full_tokens_ratio,
@@ -697,24 +705,6 @@ class ServerArgs:
             help="Enable precision tracer for debugging tensor values. May have performance impact.",
         )
 
-        parser.add_argument(
-            "--jax-proc-id",
-            type=int,
-            default=ServerArgs.jax_proc_id,
-            help="Jax Process ID",
-        )
-        parser.add_argument(
-            "--jax-num-procs",
-            type=int,
-            default=ServerArgs.jax_num_procs,
-            help="The number of Jax Processes",
-        )
-        parser.add_argument(
-            "--xla-backend",
-            type=str,
-            default=ServerArgs.xla_backend,
-            help="XLA backend",
-        )
         parser.add_argument(
             "--max-seq-len",
             type=int,

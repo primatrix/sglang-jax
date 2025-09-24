@@ -232,7 +232,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         residual: Optional[jax.Array] = None,
-    ) -> Tuple[jax.Array, jax.Array]:
+    ):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)

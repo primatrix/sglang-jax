@@ -268,7 +268,7 @@ class LlamaDecoderLayer(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         residual: Optional[jax.Array],
-    ) -> Tuple[jax.Array, jax.Array]:
+    ):
         layer_callback_flag = []
         if residual is None:
             residual = hidden_states

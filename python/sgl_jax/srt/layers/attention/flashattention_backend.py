@@ -247,7 +247,7 @@ class FlashAttention(AttentionBackend):
                 kv_cache_fused,
                 *other_args,
                 sm_scale=scale,
-                sliding_window=None,
+                sliding_window=layer.sliding_window_size,
                 soft_cap=None,
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )

@@ -35,6 +35,7 @@ class RadixAttention(nnx.Module):
         num_kv_heads: int,
         layer_id: int,
         v_head_dim: int = -1,
+        sliding_window_size: int = -1,
         attn_type: AttentionType = AttentionType.DECODER,
     ):
         super().__init__()
@@ -45,6 +46,7 @@ class RadixAttention(nnx.Module):
         self.v_head_dim = v_head_dim if v_head_dim != -1 else head_dim
         self.scaling = scaling
         self.layer_id = layer_id
+        self.sliding_window_size = sliding_window_size or -1
         self.attn_type = attn_type
 
     def __call__(

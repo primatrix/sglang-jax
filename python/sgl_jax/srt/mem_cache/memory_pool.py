@@ -388,16 +388,6 @@ class MHATokenToKVPool(KVCache):
             kv_partition_axis=self.kv_partition_axis,
         )
 
-    def get_kv_data(
-        self, layer_id: int, indices: jnp.ndarray
-    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        """Get KV data at specified positions"""
-        layer_idx = layer_id - self.start_layer
-        fused_kv_data = self.kv_buffer[layer_idx][indices]
-        k_data = fused_kv_data[:, ::2, :]  # Head interleaving: K at even indices
-        v_data = fused_kv_data[:, 1::2, :]  # Head interleaving: V at odd indices
-        return k_data, v_data
-
     def get_cpu_copy(self, indices):
         """Get CPU copy of fused KV cache for specified indices"""
         kv_cache_host = []
@@ -450,6 +440,96 @@ class MHATokenToKVPool(KVCache):
         # Merge k and v into fused format
         fused_kv = merge_kv(cache_k, cache_v)
         self.kv_buffer[layer_idx] = self.kv_buffer[layer_idx].at[loc].set(fused_kv)
+
+
+class SWAKVPool(KVCache):
+    """KV cache with separate pools for full and SWA attention layers."""
+
+    def __init__(
+        self,
+        size: int,
+        size_swa: int,
+        swa_attention_layer_ids: List[int],
+        full_attention_layer_ids: List[int],
+        token_to_kv_pool_class: KVCache = MHATokenToKVPool,
+        **kwargs,
+    ):
+        self.size = size
+        self.size_swa = size_swa
+        self.swa_layer_nums = len(swa_attention_layer_ids)
+        self.full_layer_nums = len(full_attention_layer_ids)
+        kwargs["page_size"] = 1
+
+        self.swa_kv_pool = token_to_kv_pool_class(
+            size=size_swa,
+            layer_num=self.swa_layer_nums,
+            **kwargs,
+        )
+        self.full_kv_pool = token_to_kv_pool_class(
+            size=size,
+            layer_num=self.full_layer_nums,
+            **kwargs,
+        )
+        self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
+        for full_attn_layer_id, global_layer_id in enumerate(full_attention_layer_ids):
+            self.layers_mapping[global_layer_id] = (full_attn_layer_id, False)
+        for swa_layer_id, global_layer_id in enumerate(swa_attention_layer_ids):
+            self.layers_mapping[global_layer_id] = (swa_layer_id, True)
+        self.full_to_swa_index_mapping: Optional[np.array] = None
+
+        k_size, v_size = self.get_kv_size_bytes()
+        self.mem_usage = (k_size + v_size) / GB
+
+    def get_kv_size_bytes(self):
+        k_size, v_size = self.full_kv_pool.get_kv_size_bytes()
+        k_size_swa, v_size_swa = self.swa_kv_pool.get_kv_size_bytes()
+        return k_size + k_size_swa, v_size + v_size_swa
+
+    def get_kv_buffer(self, layer_id: int):
+        layer_id_pool, is_swa = self.layers_mapping[layer_id]
+        if is_swa:
+            return self.swa_kv_pool.get_kv_buffer(layer_id_pool)
+        else:
+            return self.full_kv_pool.get_kv_buffer(layer_id_pool)
+
+    def get_fused_kv_buffer(self, layer_id):
+        layer_id_pool, is_swa = self.layers_mapping[layer_id]
+        if is_swa:
+            return self.swa_kv_pool.get_fused_kv_buffer(layer_id_pool)
+        else:
+            return self.full_kv_pool.get_fused_kv_buffer(layer_id_pool)
+
+    def translate_loc_from_full_to_swa(self, kv_indices: np.array):
+        assert self.full_to_swa_index_mapping is not None
+        return self.full_to_swa_index_mapping[kv_indices].to(np.int32)
+
+    def set_kv_buffer(
+        self,
+        layer_id: int,
+        loc: jnp.ndarray,
+        cache_k: jnp.ndarray,
+        cache_v: jnp.ndarray,
+        is_decode: bool = False,
+    ):
+        layer_id_pool, is_swa = self.layers_mapping[layer_id]
+        if is_swa:
+            if self.full_to_swa_index_mapping is not None:
+                loc = self.translate_loc_from_full_to_swa(loc)
+            self.swa_kv_pool.set_kv_buffer(
+                layer_id_pool,
+                loc,
+                cache_k,
+                cache_v,
+                is_decode,
+            )
+        else:
+            self.full_kv_pool.set_kv_buffer(
+                layer_id_pool,
+                loc,
+                cache_k,
+                cache_v,
+                is_decode,
+            )
 
 
 def _set_fused_kv_buffer(
