@@ -390,13 +390,11 @@ def build_eagle_tree_structure(
     for bid in range(bs):
         seq_len = verified_seq_len[bid]
 
-        # Calculate seq_tree_idx for this batch (similar to CUDA kernel)
+        # Calculate seq_tree_idx for this batch (exactly like CUDA kernel)
+        seq_tree_idx = draft_token_num * draft_token_num * bid
         if tree_mask_mode == 0:  # FULL_MASK
-            seq_tree_idx = 0
             for i in range(bid):
                 seq_tree_idx += verified_seq_len[i] * draft_token_num
-        else:
-            seq_tree_idx = draft_token_num * draft_token_num * bid
 
         for tid in range(draft_token_num):
             global_token_idx = bid * draft_token_num + tid
