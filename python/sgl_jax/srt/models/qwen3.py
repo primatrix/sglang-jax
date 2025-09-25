@@ -352,12 +352,10 @@ class QWen3Model(nnx.Module):
             universal_jitted_layer, layer_def, layer_state_def
         )
 
-        # Store all layer states
-        self.layer_states = []
-        for layer in self.layers:
-            _, layer_state = nnx.split(layer)
-            layer_state_leaves, _ = jax.tree_util.tree_flatten(layer_state)
-            self.layer_states.append(layer_state_leaves)
+        # Don't pre-store layer_states to avoid weight duplication - use dynamic split instead
+        logger.info(
+            f"Universal layer JIT initialized - will use dynamic split to avoid weight duplication"
+        )
 
     def __call__(
         self,
@@ -369,8 +367,12 @@ class QWen3Model(nnx.Module):
         layers_callback_flag = []
 
         if self.use_layer_jit and self.universal_layer_jit is not None:
-            # Use universal layer JIT
-            for layer_state_leaves in self.layer_states:
+            # Use universal layer JIT with dynamic split to avoid weight duplication
+            for layer in self.layers:
+                # Dynamic split - no weight duplication
+                _, layer_state = nnx.split(layer)
+                layer_state_leaves, _ = jax.tree_util.tree_flatten(layer_state)
+
                 hidden_states, residual, kv_fused, callback_flag = (
                     self.universal_layer_jit(
                         layer_state_leaves,
