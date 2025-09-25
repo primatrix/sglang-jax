@@ -202,6 +202,7 @@ def build_tree_kernel_efficient(
             draft_token_num=num_verify_tokens,
             topk=topk,
             depth=spec_steps,
+            seq_lens_sum=seq_lens_sum,
             tree_mask_mode=0,  # FULL_MASK
         )
     )
@@ -356,6 +357,7 @@ def build_eagle_tree_structure(
     draft_token_num: int,
     topk: int,
     depth: int,
+    seq_lens_sum: int,
     tree_mask_mode: int = 0,  # FULL_MASK = 0
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """
@@ -364,19 +366,22 @@ def build_eagle_tree_structure(
         selected_index: Selected token indices [bs, draft_token_num - 1]
         verified_seq_len: Sequence lengths [bs]
         bs: Batch size
-        draft_token_num: Number of draft tokens
+        draft_token_num: Number of draft tokens (num_verify_tokens)
         topk: Top-k value
         depth: Tree depth
+        seq_lens_sum: Sum of sequence lengths
         tree_mask_mode: Tree mask mode (0=FULL_MASK)
 
     Returns:
         tuple of (tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling)
     """
 
-    # Calculate tree mask size based on tree_mask_mode
+    # Calculate tree mask size based on tree_mask_mode (match PyTorch version)
     if tree_mask_mode == 0:  # FULL_MASK
-        total_seq_len = jnp.sum(verified_seq_len + draft_token_num)
-        tree_mask_size = total_seq_len * total_seq_len
+        # PyTorch formula: seq_lens_sum * draft_token_num + draft_token_num^2 * bs
+        tree_mask_size = (
+            seq_lens_sum * draft_token_num + draft_token_num * draft_token_num * bs
+        )
     else:
         tree_mask_size = bs * draft_token_num * draft_token_num
 
