@@ -541,6 +541,7 @@ class EAGLEWorker(ModelWorker):
             forward_batch = ForwardBatch.init_new(
                 model_worker_batch, self.draft_model_runner
             )
+            logger.info(f"-------------forward_batch------------{forward_batch}")
             # Run forward
             logits_output, _ = self.draft_model_runner.forward(
                 forward_batch,
