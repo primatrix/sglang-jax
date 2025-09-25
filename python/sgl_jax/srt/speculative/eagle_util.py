@@ -385,8 +385,7 @@ def build_eagle_tree_structure(
     else:
         tree_mask_size = bs * draft_token_num * draft_token_num
 
-    # Initialize arrays
-    tree_mask = jnp.zeros((tree_mask_size,), dtype=jnp.bool_)
+    tree_mask = jnp.ones((tree_mask_size,), dtype=jnp.bool_)
     positions = jnp.zeros((bs * draft_token_num,), dtype=jnp.int32)
     retrive_index = jnp.full((bs, draft_token_num), -1, dtype=jnp.int32)
     retrive_next_token = jnp.full((bs, draft_token_num), -1, dtype=jnp.int32)
