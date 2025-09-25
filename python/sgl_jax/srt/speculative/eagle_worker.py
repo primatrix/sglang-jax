@@ -76,6 +76,8 @@ class EAGLEWorker(ModelWorker):
         else:
             # draft
             spec_info = self.draft(batch)
+            logger.info(f"-------------spec_info------------{spec_info}")
+            logger.info(f"-------------batch.seq_lens------------{batch}")
             # verify
             logits_output, verify_output, model_worker_batch, cache_hit = self.verify(
                 batch, spec_info
@@ -140,7 +142,7 @@ class EAGLEWorker(ModelWorker):
 
         # Set forward_metadata for draft_model_runner's attention backend
         forward_metadata = self.draft_model_runner.attn_backend.get_forward_metadata(
-            model_worker_batch, self.draft_model_runner.mesh
+            model_worker_batch
         )
         self.draft_model_runner.attn_backend.forward_metadata = forward_metadata
         forward_batch.forward_mode = ForwardMode.EXTEND
@@ -303,7 +305,7 @@ class EAGLEWorker(ModelWorker):
             model_worker_batch.positions = model_worker_batch.positions + 1
             self.draft_model_runner.attn_backend.forward_metadata = (
                 self.draft_model_runner.attn_backend.get_forward_metadata(
-                    model_worker_batch, self.draft_model_runner.mesh
+                    model_worker_batch
                 )
             )
             spec_info.hidden_states = hidden_states
