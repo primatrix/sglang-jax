@@ -119,34 +119,15 @@ class ModelRunner:
         self.init_attention_backend()
 
     def initialize_jit(self):
-        """Initialize model JIT compilation"""
-        logger.info("Initializing model JIT compilation...")
+        """Initialize JIT compilation - pure layer-wise JIT approach"""
+        logger.info("Initializing pure layer-wise JIT compilation...")
 
-        # Split model and sampler for JIT
-        model_def, model_state = nnx.split(self.model)
-        model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
+        # Only JIT the sampler, not the entire model
+        # Model uses layer-wise JIT internally via transformer.initialize_layer_jit()
         sampler_def, sampler_state = nnx.split(self.sampler)
         sampler_state_leaves, sampler_state_def = jax.tree_util.tree_flatten(
             sampler_state
         )
-
-        @partial(
-            jax.jit,
-            donate_argnames=["forward_batch"],
-            static_argnames=["model_state_def"],
-        )
-        def jitted_run_model(
-            model_def,
-            model_state_def,
-            model_state_leaves,
-            forward_batch,
-            logits_metadata,
-        ):
-            model_state = jax.tree_util.tree_unflatten(
-                model_state_def, model_state_leaves
-            )
-            model = nnx.merge(model_def, model_state)
-            return model(forward_batch, logits_metadata)
 
         @partial(jax.jit, static_argnames=["sampler_state_def"])
         def jitted_sampler(sampler_def, sampler_state_def, sampler_state_leaves, *args):
@@ -156,14 +137,13 @@ class ModelRunner:
             sampler = nnx.merge(sampler_def, sampler_state)
             return sampler(*args)
 
-        self.jitted_run_model = partial(
-            jitted_run_model, model_def, model_state_def, model_state_leaves
-        )
         self.jitted_sampler = partial(
             jitted_sampler, sampler_def, sampler_state_def, sampler_state_leaves
         )
 
-        logger.info("Model JIT compilation initialized")
+        logger.info(
+            "Pure layer-wise JIT initialization completed - no global model JIT"
+        )
 
     def get_available_device_memory(self):
         min_available_device_memory = get_available_device_memory(
@@ -382,10 +362,8 @@ class ModelRunner:
         import jax._src.test_util as jtu
 
         with jtu.count_pjit_cpp_cache_miss() as count:
-            # Use model JIT (layer-wise JIT is handled inside the model)
-            output, layers_kv_fused, _ = self.jitted_run_model(
-                forward_batch, logits_metadata
-            )
+            # Direct model call - layer-wise JIT is handled inside the model
+            output, layers_kv_fused, _ = self.model(forward_batch, logits_metadata)
             cache_miss_count = count()
         self._set_kv_cache_after_forward(layers_kv_fused, forward_batch)
 
