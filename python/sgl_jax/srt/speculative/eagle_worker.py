@@ -482,6 +482,7 @@ class EAGLEWorker(ModelWorker):
         batch.return_logprob = return_logprob_backup
 
     def draft_forward(self, schedule_batch: ScheduleBatch):
+        logger.info(f"-------------schedule_batch------------{schedule_batch}")
 
         (
             precompile_token_paddings,
@@ -496,7 +497,7 @@ class EAGLEWorker(ModelWorker):
             self.page_size,
         )
         assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
-
+        logger.info(f"-------------model_worker_batch------------{model_worker_batch}")
         spec_info = model_worker_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
         out_cache_loc = model_worker_batch.out_cache_loc
@@ -541,7 +542,6 @@ class EAGLEWorker(ModelWorker):
             forward_batch = ForwardBatch.init_new(
                 model_worker_batch, self.draft_model_runner
             )
-            logger.info(f"-------------forward_batch------------{forward_batch}")
             # Run forward
             logits_output, _ = self.draft_model_runner.forward(
                 forward_batch,
