@@ -56,6 +56,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import (
     configure_logger,
     get_bool_env_var,
@@ -135,7 +136,9 @@ class Scheduler(
         self.max_seq_len = server_args.max_seq_len
         self.page_size = server_args.page_size
         self.enable_overlap = not server_args.disable_overlap_schedule
-
+        self.spec_algorithm = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        )
         # Init inter-process communication
         context = zmq.Context(2)
 
@@ -212,6 +215,15 @@ class Scheduler(
             server_args=server_args,
             mesh=self.mesh,
         )
+
+        # launch draft worker
+        if self.spec_algorithm.is_eagle():
+            from sgl_jax.srt.speculative.eagle_worker import EAGLEWorker
+
+            self.draft_worker = EAGLEWorker(
+                server_args=server_args,
+                target_worker=self.tp_worker,
+            )
 
         # Get token and memory info from the model worker
         (
@@ -923,19 +935,22 @@ class Scheduler(
             model_worker_batch.forward_batch = ForwardBatch.init_new(
                 model_worker_batch, self.tp_worker.get_model_runner()
             )
+        if self.spec_algorithm.is_none():
             logits_output, next_token_ids, cache_miss_count = (
                 self.tp_worker.forward_batch_generation(
                     model_worker_batch, sampling_metadata=sampling_metadata
                 )
             )
-            next_token_ids = next_token_ids[: model_worker_batch.real_bs]
         else:
-            logits_output, next_token_ids_device, cache_miss_count = (
-                self.tp_worker.forward_batch_generation(
-                    model_worker_batch, sampling_metadata=sampling_metadata
+            logits_output, next_token_ids, cache_miss_count, accept_length = (
+                self.draft_worker.forward_batch_speculative_generation(
+                    batch, model_worker_batch, sampling_metadata
                 )
             )
-            next_token_ids = np.array(jax.device_get(next_token_ids_device))[
+        if self.enable_overlap:
+            next_token_ids = next_token_ids[: model_worker_batch.real_bs]
+        else:
+            next_token_ids = np.array(jax.device_get(next_token_ids))[
                 : model_worker_batch.real_bs
             ]
 
