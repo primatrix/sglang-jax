@@ -282,7 +282,7 @@ class EAGLEWorker(ModelWorker):
         )
         logits_output, _, cache_miss_count = (
             self.target_worker.forward_batch_generation(
-                model_worker_batch, sampling_metadata
+                model_worker_batch, sampling_metadata=sampling_metadata
             )
         )
 

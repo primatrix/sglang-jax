@@ -507,6 +507,7 @@ class ScheduleBatch:
         tree_cache: BasePrefixCache,
         model_config: ModelConfig,
         enable_overlap: bool,
+        spec_algorithm: SpeculativeAlgorithm = None,
         enable_custom_logit_processor: bool = False,
         chunked_req: Optional[Req] = None,
         mesh: mesh_lib.Mesh = None,
@@ -524,6 +525,7 @@ class ScheduleBatch:
             has_stream=any(req.stream for req in reqs),
             chunked_req=chunked_req,
             mesh=mesh,
+            spec_algorithm=spec_algorithm,
             is_prefill_only=all(
                 req.sampling_params.max_new_tokens == 0 for req in reqs
             ),
@@ -1128,16 +1130,24 @@ class ScheduleBatch:
                 dtype=seq_lens_cpu.dtype,
             )
         else:
-            # For decode: each sequence contributes one token at the next position (seq_len)
-            # Create positions for actual tokens (one per sequence at seq_len)
-            batch_positions = seq_lens_cpu - 1
-            # Create positions array matching the length of input_ids (including padding)
-            positions_cpu = np.zeros(len(input_ids_cpu), dtype=batch_positions.dtype)
-            # Fill in the actual positions for the real tokens
-            # positions = positions.at[: len(batch_positions)].set(batch_positions)
-            positions_cpu[: len(batch_positions)] = batch_positions
-            # The padding tokens (if any) will have position 0, which is fine for padding
-            # For decode, extend_start_loc is typically not used but we'll set it anyway
+            if (
+                self.spec_info is not None
+                and getattr(self.spec_info, "positions", None) is not None
+            ):
+                positions_cpu = self.spec_info.positions
+            else:
+                # For decode: each sequence contributes one token at the next position (seq_len)
+                # Create positions for actual tokens (one per sequence at seq_len)
+                batch_positions = max(0, seq_lens_cpu - 1)
+                # Create positions array matching the length of input_ids (including padding)
+                positions_cpu = np.zeros(
+                    len(input_ids_cpu), dtype=batch_positions.dtype
+                )
+                # Fill in the actual positions for the real tokens
+                # positions = positions.at[: len(batch_positions)].set(batch_positions)
+                positions_cpu[: len(batch_positions)] = batch_positions
+                # The padding tokens (if any) will have position 0, which is fine for padding
+                # For decode, extend_start_loc is typically not used but we'll set it anyway
             extend_start_loc = np.arange(len(seq_lens_cpu), dtype=seq_lens_cpu.dtype)
 
         bs_padding_size = 0

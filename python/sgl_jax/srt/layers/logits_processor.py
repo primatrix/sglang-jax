@@ -233,10 +233,7 @@ class LogitsProcessor(nnx.Module):
         logits_metadata: LogitsMetadata,
         aux_hidden_states: Optional[jax.Array] = None,
     ) -> LogitsProcessorOutput:
-        if (
-            logits_metadata.forward_mode.is_decode_or_idle()
-            or logits_metadata.forward_mode.is_target_verify()
-        ):
+        if logits_metadata.forward_mode.is_decode_or_idle():
             pruned_states = hidden_states
             if aux_hidden_states is not None:
                 aux_pruned_states = [hidden for hidden in aux_hidden_states]
