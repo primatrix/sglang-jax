@@ -193,11 +193,7 @@ def build_tree_kernel_efficient(
     # Get batch size
     bs = seq_lens.shape[0]
 
-    # Create tree mask (simplified - full attention for now)
-    total_tokens = seq_lens_sum + num_verify_tokens * bs
-    tree_mask = jnp.ones((total_tokens,), dtype=jnp.bool_)
-
-    positions, retrive_index, retrive_next_token, retrive_next_sibling = (
+    tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling = (
         build_eagle_tree_structure(
             parent_list=parent_list,
             selected_index=top_scores_index,
@@ -361,7 +357,7 @@ def build_eagle_tree_structure(
     topk: int,
     depth: int,
     tree_mask_mode: int = 0,  # FULL_MASK = 0
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """
     Args:
         parent_list: Parent indices array [bs, topk * (depth-1) + 1]
@@ -374,10 +370,18 @@ def build_eagle_tree_structure(
         tree_mask_mode: Tree mask mode (0=FULL_MASK)
 
     Returns:
-        tuple of (positions, retrive_index, retrive_next_token, retrive_next_sibling)
+        tuple of (tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling)
     """
 
+    # Calculate tree mask size based on tree_mask_mode
+    if tree_mask_mode == 0:  # FULL_MASK
+        total_seq_len = jnp.sum(verified_seq_len + draft_token_num)
+        tree_mask_size = total_seq_len * total_seq_len
+    else:
+        tree_mask_size = bs * draft_token_num * draft_token_num
+
     # Initialize arrays
+    tree_mask = jnp.zeros((tree_mask_size,), dtype=jnp.bool_)
     positions = jnp.zeros((bs * draft_token_num,), dtype=jnp.int32)
     retrive_index = jnp.full((bs, draft_token_num), -1, dtype=jnp.int32)
     retrive_next_token = jnp.full((bs, draft_token_num), -1, dtype=jnp.int32)
@@ -386,11 +390,36 @@ def build_eagle_tree_structure(
     for bid in range(bs):
         seq_len = verified_seq_len[bid]
 
-        # selected_index[bid * (draft_token_num - 1) + index]
-        # parent_list[bid * (topk * (depth - 1) + 1) + parent_tb_idx]
+        # Calculate seq_tree_idx for this batch (similar to CUDA kernel)
+        if tree_mask_mode == 0:  # FULL_MASK
+            seq_tree_idx = 0
+            for i in range(bid):
+                seq_tree_idx += verified_seq_len[i] * draft_token_num
+        else:
+            seq_tree_idx = draft_token_num * draft_token_num * bid
 
         for tid in range(draft_token_num):
             global_token_idx = bid * draft_token_num + tid
+
+            # Calculate token_tree_idx for tree_mask
+            if tree_mask_mode == 0:  # FULL_MASK
+                token_tree_idx = (
+                    seq_tree_idx + (seq_len + draft_token_num) * tid + seq_len + 1
+                )
+            else:
+                token_tree_idx = (
+                    draft_token_num * draft_token_num * bid + draft_token_num * tid + 1
+                )
+
+            # Set tree_mask for this token
+            if token_tree_idx > 0 and token_tree_idx <= tree_mask_size:
+                tree_mask = tree_mask.at[token_tree_idx - 1].set(True)
+
+            # Clear next draft_token_num - 1 positions
+            for i in range(draft_token_num - 1):
+                mask_idx = token_tree_idx + i
+                if mask_idx < tree_mask_size:
+                    tree_mask = tree_mask.at[mask_idx].set(False)
 
             if tid == 0:
                 # Verified token (tid == 0)
@@ -461,6 +490,10 @@ def build_eagle_tree_structure(
 
                 while True:
                     position += 1
+                    mask_idx = token_tree_idx + cur_position
+                    if mask_idx < tree_mask_size:
+                        tree_mask = tree_mask.at[mask_idx].set(True)
+
                     selected_idx = bid * (draft_token_num - 1) + cur_position
                     parent_tb_idx = selected_index.flatten()[selected_idx] // topk
 
@@ -491,4 +524,4 @@ def build_eagle_tree_structure(
                 positions = positions.at[global_token_idx].set(position + seq_len)
                 retrive_index = retrive_index.at[bid, tid].set(global_token_idx)
 
-    return positions, retrive_index, retrive_next_token, retrive_next_sibling
+    return tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling
