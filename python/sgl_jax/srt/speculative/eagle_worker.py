@@ -76,6 +76,8 @@ class EAGLEWorker(ModelWorker):
         else:
             # draft
             spec_info = self.draft(batch)
+            logger.info(f"-------------spec_info------------{spec_info}")
+            logger.info(f"-------------batch.seq_lens------------{batch}")
             # verify
             logits_output, verify_output, model_worker_batch, cache_hit = self.verify(
                 batch, spec_info
