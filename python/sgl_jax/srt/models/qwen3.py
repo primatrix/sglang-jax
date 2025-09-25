@@ -312,6 +312,53 @@ class QWen3Model(nnx.Module):
             rngs=rngs,
         )
 
+        # Initialize layer-wise JIT at model level
+        self.use_layer_jit = True
+        self.universal_layer_jit = None
+        self.layer_states = None
+
+    def initialize_layer_jit(self):
+        """Initialize universal layer JIT at model level"""
+        from functools import partial
+
+        import jax
+        from flax import nnx
+
+        if not self.use_layer_jit:
+            return
+
+        # Use first layer to create universal JIT function
+        first_layer = self.layers[0]
+        layer_def, layer_state = nnx.split(first_layer)
+        layer_state_leaves, layer_state_def = jax.tree_util.tree_flatten(layer_state)
+
+        @partial(jax.jit, static_argnames=["layer_def", "layer_state_def"])
+        def universal_jitted_layer(
+            layer_def,
+            layer_state_def,
+            layer_state_leaves,
+            positions,
+            hidden_states,
+            forward_batch,
+            residual,
+        ):
+            layer_state = jax.tree_util.tree_unflatten(
+                layer_state_def, layer_state_leaves
+            )
+            layer = nnx.merge(layer_def, layer_state)
+            return layer(positions, hidden_states, forward_batch, residual)
+
+        self.universal_layer_jit = partial(
+            universal_jitted_layer, layer_def, layer_state_def
+        )
+
+        # Store all layer states
+        self.layer_states = []
+        for layer in self.layers:
+            _, layer_state = nnx.split(layer)
+            layer_state_leaves, _ = jax.tree_util.tree_flatten(layer_state)
+            self.layer_states.append(layer_state_leaves)
+
     def __call__(
         self,
         forward_batch: ForwardBatch,
@@ -320,12 +367,29 @@ class QWen3Model(nnx.Module):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         layers_kv_fused = []
         layers_callback_flag = []
-        for layer in self.layers:
-            hidden_states, residual, kv_fused, callback_flag = layer(
-                forward_batch.positions, hidden_states, forward_batch, residual
-            )
-            layers_kv_fused.append(kv_fused)
-            layers_callback_flag.extend(callback_flag)
+
+        if self.use_layer_jit and self.universal_layer_jit is not None:
+            # Use universal layer JIT
+            for layer_state_leaves in self.layer_states:
+                hidden_states, residual, kv_fused, callback_flag = (
+                    self.universal_layer_jit(
+                        layer_state_leaves,
+                        forward_batch.positions,
+                        hidden_states,
+                        forward_batch,
+                        residual,
+                    )
+                )
+                layers_kv_fused.append(kv_fused)
+                layers_callback_flag.extend(callback_flag)
+        else:
+            # Original layer-by-layer approach
+            for layer in self.layers:
+                hidden_states, residual, kv_fused, callback_flag = layer(
+                    forward_batch.positions, hidden_states, forward_batch, residual
+                )
+                layers_kv_fused.append(kv_fused)
+                layers_callback_flag.extend(callback_flag)
 
         if residual is not None:
             hidden_states += residual

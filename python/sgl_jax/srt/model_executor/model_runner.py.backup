@@ -119,10 +119,6 @@ class ModelRunner:
         self.init_attention_backend()
 
     def initialize_jit(self):
-        """Initialize model JIT compilation"""
-        logger.info("Initializing model JIT compilation...")
-
-        # Split model and sampler for JIT
         model_def, model_state = nnx.split(self.model)
         model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
         sampler_def, sampler_state = nnx.split(self.sampler)
@@ -150,10 +146,10 @@ class ModelRunner:
 
         @partial(jax.jit, static_argnames=["sampler_state_def"])
         def jitted_sampler(sampler_def, sampler_state_def, sampler_state_leaves, *args):
-            sampler_state = jax.tree_util.tree_unflatten(
+            model_state = jax.tree_util.tree_unflatten(
                 sampler_state_def, sampler_state_leaves
             )
-            sampler = nnx.merge(sampler_def, sampler_state)
+            sampler = nnx.merge(sampler_def, model_state)
             return sampler(*args)
 
         self.jitted_run_model = partial(
@@ -162,8 +158,6 @@ class ModelRunner:
         self.jitted_sampler = partial(
             jitted_sampler, sampler_def, sampler_state_def, sampler_state_leaves
         )
-
-        logger.info("Model JIT compilation initialized")
 
     def get_available_device_memory(self):
         min_available_device_memory = get_available_device_memory(
@@ -202,13 +196,6 @@ class ModelRunner:
             self.model, "end_layer", self.model_config.num_hidden_layers
         )
         self.num_effective_layers = self.end_layer - self.start_layer
-
-        # Initialize layer-wise JIT at model level
-        if hasattr(self.model, "transformer") and hasattr(
-            self.model.transformer, "initialize_layer_jit"
-        ):
-            logger.info("Initializing layer-wise JIT at model level...")
-            self.model.transformer.initialize_layer_jit()
 
     def profile_max_num_token(self, total_device_memory: int):
         """
@@ -382,7 +369,6 @@ class ModelRunner:
         import jax._src.test_util as jtu
 
         with jtu.count_pjit_cpp_cache_miss() as count:
-            # Use model JIT (layer-wise JIT is handled inside the model)
             output, layers_kv_fused, _ = self.jitted_run_model(
                 forward_batch, logits_metadata
             )
