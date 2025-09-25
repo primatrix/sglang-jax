@@ -85,6 +85,11 @@ class EAGLEWorker(ModelWorker):
             logits_output, verify_output, model_worker_batch = self.verify(
                 batch, spec_info
             )
+            logger.info(f"-------------logits_output------------{logits_output}")
+            logger.info(f"-------------verify_output------------{verify_output}")
+            logger.info(
+                f"-------------model_worker_batch------------{model_worker_batch}"
+            )
             self.forward_draft_extend_after_decode(batch)
             return (
                 logits_output,
