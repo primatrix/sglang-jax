@@ -376,9 +376,7 @@ def build_eagle_tree_structure(
         tuple of (tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling)
     """
 
-    # Calculate tree mask size based on tree_mask_mode (match PyTorch version)
     if tree_mask_mode == 0:  # FULL_MASK
-        # PyTorch formula: seq_lens_sum * draft_token_num + draft_token_num^2 * bs
         tree_mask_size = (
             seq_lens_sum * draft_token_num + draft_token_num * draft_token_num * bs
         )
