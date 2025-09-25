@@ -833,9 +833,10 @@ class Scheduler(
             self.tree_cache,
             self.model_config,
             self.enable_overlap,
-            False,
-            self.chunked_req,
-            self.mesh,
+            spec_algorithm=self.spec_algorithm,
+            enable_custom_logit_processor=False,
+            chunked_req=self.chunked_req,
+            mesh=self.mesh,
         )
 
         new_batch.prepare_for_extend()
@@ -1010,6 +1011,7 @@ class Scheduler(
             self.enable_overlap,
             self.server_args.enable_custom_logit_processor,
             self.mesh,
+            spec_algorithm=self.spec_algorithm,
         )
         idle_batch.prepare_for_idle()
         return idle_batch

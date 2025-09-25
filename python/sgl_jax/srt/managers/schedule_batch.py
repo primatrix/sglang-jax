@@ -507,6 +507,7 @@ class ScheduleBatch:
         tree_cache: BasePrefixCache,
         model_config: ModelConfig,
         enable_overlap: bool,
+        spec_algorithm: SpeculativeAlgorithm = None,
         enable_custom_logit_processor: bool = False,
         chunked_req: Optional[Req] = None,
         mesh: mesh_lib.Mesh = None,
@@ -524,6 +525,7 @@ class ScheduleBatch:
             has_stream=any(req.stream for req in reqs),
             chunked_req=chunked_req,
             mesh=mesh,
+            spec_algorithm=spec_algorithm,
             is_prefill_only=all(
                 req.sampling_params.max_new_tokens == 0 for req in reqs
             ),
