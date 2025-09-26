@@ -33,12 +33,10 @@ class QWen3Attention(nnx.Module):
         rope_scaling: Optional[Dict[str, Any]] = None,
         head_dim: Optional[int] = None,
         rms_norm_eps: float = None,
-        layer_id: int = 0,
         attention_bias: bool = False,
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
     ):
-        self.layer_id = layer_id
         assert num_heads % num_kv_heads == 0
         self.head_dim = head_dim or hidden_size // num_heads
         self.q_head_num = num_heads
@@ -109,7 +107,6 @@ class QWen3Attention(nnx.Module):
             head_dim=self.head_dim,
             scaling=self.scaling,
             num_kv_heads=num_kv_heads,
-            layer_id=layer_id,
         )
 
     def __call__(
@@ -117,6 +114,7 @@ class QWen3Attention(nnx.Module):
         positions: jax.Array,
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
+        layer_id: int,
     ) -> jax.Array:
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
@@ -130,7 +128,9 @@ class QWen3Attention(nnx.Module):
         k = self.k_norm(k)
 
         q, k = self.rotary_emb(positions, q, k)
-        attn_output, kv_fused = self.attn(q, k, v, forward_batch=forward_batch)
+        attn_output, kv_fused = self.attn(
+            q, k, v, layer_id=layer_id, forward_batch=forward_batch
+        )
 
         output, _ = self.o_proj(attn_output)
         return output, kv_fused
@@ -188,11 +188,9 @@ class QWen3DecoderLayer(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
     ):
-        self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
@@ -207,7 +205,6 @@ class QWen3DecoderLayer(nnx.Module):
             rope_scaling=rope_scaling,
             head_dim=head_dim,
             rms_norm_eps=config.rms_norm_eps,
-            layer_id=layer_id,
             attention_bias=config.attention_bias,
             dtype=dtype,
             rngs=rngs,
@@ -240,6 +237,7 @@ class QWen3DecoderLayer(nnx.Module):
         positions: jax.Array,
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
+        layer_id: int,
         residual: Optional[jax.Array] = None,
     ) -> Tuple[jax.Array, jax.Array]:
         layer_callback_flag = []
@@ -259,6 +257,7 @@ class QWen3DecoderLayer(nnx.Module):
         hidden_states, kv_fused = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
+            layer_id=layer_id,
             forward_batch=forward_batch,
         )
 
@@ -298,11 +297,10 @@ class QWen3Model(nnx.Module):
         self.layers = [
             QWen3DecoderLayer(
                 config=config,
-                layer_id=i,
                 dtype=dtype,
                 rngs=rngs,
             )
-            for i in range(config.num_hidden_layers)
+            for _ in range(config.num_hidden_layers)
         ]
 
         self.norm = nnx.RMSNorm(
@@ -369,6 +367,7 @@ class QWen3Model(nnx.Module):
             sample_layer_def,
             sample_layer_state_def,
             sample_layer_state_leaves,
+            layer_id,
             positions,
             hidden_states,
             forward_batch,
@@ -378,19 +377,22 @@ class QWen3Model(nnx.Module):
                 sample_layer_state_def, sample_layer_state_leaves
             )
             layer = nnx.merge(sample_layer_def, sample_layer_state)
-            return layer(positions, hidden_states, forward_batch, residual)
+            return layer(positions, hidden_states, forward_batch, residual, layer_id)
 
         self.universal_layer_jit = partial(universal_jitted_layer, sample_layer_def)
 
         self.jitted_layers = []
-        for layer in self.layers:
-            layer_def, layer_state = nnx.split(layer)
+        for i, layer in enumerate(self.layers):
+            _, layer_state = nnx.split(layer)
             layer_state_leaves, layer_state_def = jax.tree_util.tree_flatten(
                 layer_state
             )
-            self.jitted_layers.append(
-                partial(self.universal_layer_jit, layer_state_def, layer_state_leaves)
+            jitted_fn = partial(
+                self.universal_layer_jit,
+                layer_state_def,
+                layer_state_leaves,
             )
+            self.jitted_layers.append((jitted_fn, i))
 
     def __call__(
         self,
@@ -400,9 +402,13 @@ class QWen3Model(nnx.Module):
         hidden_states = self.jitted_embed_tokens(forward_batch.input_ids)
         layers_kv_fused = []
         layers_callback_flag = []
-        for layer_jitted in self.jitted_layers:
-            hidden_states, residual, kv_fused, callback_flag = layer_jitted(
-                forward_batch.positions, hidden_states, forward_batch, residual
+        for layer_jitted_fn, layer_id in self.jitted_layers:
+            hidden_states, residual, kv_fused, callback_flag = layer_jitted_fn(
+                layer_id,
+                forward_batch.positions,
+                hidden_states,
+                forward_batch,
+                residual,
             )
             layers_kv_fused.append(kv_fused)
             layers_callback_flag.extend(callback_flag)
