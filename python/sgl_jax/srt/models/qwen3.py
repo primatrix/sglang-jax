@@ -361,42 +361,16 @@ class QWen3Model(nnx.Module):
         del self.norm
 
     def initilize_decode_layer_jit(self):
-        sample_layer_def, sample_layer_state = nnx.split(self.layers[0])
-        sample_layer_state_leaves, sample_layer_state_def = jax.tree_util.tree_flatten(
-            sample_layer_state
-        )
-
-        @partial(
-            jax.jit,
-            static_argnames=["sample_layer_def", "sample_layer_state_def"],
-            donate_argnames=["forward_batch"],
-        )
-        def jitted_sample_layer(
-            sample_layer_def,
-            sample_layer_state_def,
-            sample_layer_state_leaves,
-            positions,
-            hidden_states,
-            forward_batch,
-            residual,
-        ):
-            sample_layer_state = jax.tree_util.tree_unflatten(
-                sample_layer_state_def, sample_layer_state_leaves
-            )
-            sample_layer = nnx.merge(sample_layer_def, sample_layer_state)
-            return sample_layer(positions, hidden_states, forward_batch, residual)
-
         self.jitted_layers = []
         for layer in self.layers:
-            _, layer_state = nnx.split(layer)
-            layer_state_leaves, _ = jax.tree_util.tree_flatten(layer_state)
-            layer_jitted = partial(
-                jitted_sample_layer,
-                sample_layer_def,
-                sample_layer_state_def,
-                layer_state_leaves,
-            )
-            self.jitted_layers.append(layer_jitted)
+            # 为每层创建已经merge好的完整jitted function
+            @partial(jax.jit, donate_argnames=["forward_batch"])
+            def jitted_layer(
+                positions, hidden_states, forward_batch, residual, _layer=layer
+            ):
+                return _layer(positions, hidden_states, forward_batch, residual)
+
+            self.jitted_layers.append(jitted_layer)
 
         del self.layers
 
