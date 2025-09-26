@@ -247,7 +247,7 @@ class QWen3DecoderLayer(nnx.Module):
             hidden_states = self.input_layernorm(hidden_states)
 
         layer_norm_callback_flag = precision_tracer.jit_pure_callback_record(
-            hidden_states, "input_layernorm_output", "INPUT_LAYERNORM", self.layer_id
+            hidden_states, "input_layernorm_output", "INPUT_LAYERNORM", layer_id
         )
         layer_callback_flag.append(layer_norm_callback_flag)
 
@@ -259,7 +259,7 @@ class QWen3DecoderLayer(nnx.Module):
         )
 
         attn_callback_flag = precision_tracer.jit_pure_callback_record(
-            hidden_states, "self_attn_output", "SELF_ATTN", self.layer_id
+            hidden_states, "self_attn_output", "SELF_ATTN", layer_id
         )
         layer_callback_flag.append(attn_callback_flag)
         hidden_states += residual
@@ -268,7 +268,7 @@ class QWen3DecoderLayer(nnx.Module):
         hidden_states = self.mlp(hidden_states)
 
         mlp_callback_flag = precision_tracer.jit_pure_callback_record(
-            hidden_states, "mlp_output", "MLP", self.layer_id
+            hidden_states, "mlp_output", "MLP", layer_id
         )
         layer_callback_flag.append(mlp_callback_flag)
 
