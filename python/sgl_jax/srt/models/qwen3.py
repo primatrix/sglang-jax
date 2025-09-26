@@ -407,7 +407,9 @@ class QWen3Model(nnx.Module):
                 residual,
             )
             jax.debug.print("layer_id: {layer_id}", layer_id=layer_id)
-            forward_batch.token_to_kv_pool.kv_buffer.at[layer_id].set(kv_fused)
+            # 使用相对于 start_layer 的索引
+            buffer_idx = layer_id - forward_batch.token_to_kv_pool.start_layer
+            forward_batch.token_to_kv_pool.kv_buffer.at[buffer_idx].set(kv_fused)
             # layers_kv_fused.append(kv_fused)
             layers_callback_flag.extend(callback_flag)
 
