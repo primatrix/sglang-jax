@@ -1103,26 +1103,48 @@ class ScheduleBatch:
                 axis=0,
             )
 
+        # If enable spec inference, use positions in spec info firstly
+        if (
+            self.spec_info is not None
+            and getattr(self.spec_info, "positions", None) is not None
+        ):
+            positions_cpu = self.spec_info.positions
+            # padding
+            padding_size = len(input_ids_cpu) - len(positions_cpu)
+            if padding_size:
+                positions_cpu = np.concatenate(
+                    [
+                        positions_cpu,
+                        jnp.zeros(padding_size, dtype=positions_cpu.dtype),
+                    ]
+                )
+        else:
+            positions_cpu = None
+
         # Calculate positions and extend_start_loc after padding
         if self.forward_mode.is_extend():
             # For prefill: create positions for each token in sequences
             # Calculate total tokens without padding first
-            total_tokens_before_padding = sum(
-                [extend_len for extend_len in self.extend_lens]
-            )
-            positions_cpu = np.concatenate(
-                [
-                    np.arange(prefix_len, seq_len, dtype=seq_lens_cpu.dtype)
-                    for seq_len, prefix_len in zip(seq_lens_cpu, self.prefix_lens)
-                ]
-            )
-
-            # If input_ids was padded, pad positions too
-            padding_size = len(input_ids_cpu) - total_tokens_before_padding
-            if padding_size:
-                positions_cpu = np.concatenate(
-                    [positions_cpu, np.zeros(padding_size, dtype=positions_cpu.dtype)]
+            if positions_cpu is None:
+                total_tokens_before_padding = sum(
+                    [extend_len for extend_len in self.extend_lens]
                 )
+                positions_cpu = np.concatenate(
+                    [
+                        np.arange(prefix_len, seq_len, dtype=seq_lens_cpu.dtype)
+                        for seq_len, prefix_len in zip(seq_lens_cpu, self.prefix_lens)
+                    ]
+                )
+
+                # If input_ids was padded, pad positions too
+                padding_size = len(input_ids_cpu) - total_tokens_before_padding
+                if padding_size:
+                    positions_cpu = np.concatenate(
+                        [
+                            positions_cpu,
+                            np.zeros(padding_size, dtype=positions_cpu.dtype),
+                        ]
+                    )
 
             # Start location of each sequence in the flattened array
             extend_start_loc = np.cumsum(
@@ -1130,12 +1152,7 @@ class ScheduleBatch:
                 dtype=seq_lens_cpu.dtype,
             )
         else:
-            if (
-                self.spec_info is not None
-                and getattr(self.spec_info, "positions", None) is not None
-            ):
-                positions_cpu = self.spec_info.positions
-            else:
+            if positions_cpu is None:
                 # For decode: each sequence contributes one token at the next position (seq_len)
                 # Create positions for actual tokens (one per sequence at seq_len)
                 batch_positions = max(0, seq_lens_cpu - 1)

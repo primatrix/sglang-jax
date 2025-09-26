@@ -319,13 +319,14 @@ class EagleDraftInput:
         batch.extend_lens = [x + 1 for x in batch.spec_info.accept_length_cpu]
         batch.extend_num_tokens = sum(batch.extend_lens)
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
+        batch.seq_lens_sum = batch.seq_lens.sum().item()
         batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
         batch.return_logprob = False
         batch.return_hidden_states = False
 
         self.capture_hidden_mode = CaptureHiddenMode.LAST
         self.accept_length = self.accept_length + 1
-        self.positions = jnp.empty_like(batch.input_ids, dtype=jnp.float32)
+        self.positions = jnp.empty_like(batch.input_ids, dtype=jnp.int32)
         self.verified_id = jnp.empty_like(self.accept_length, dtype=jnp.int32)
 
         self.positions, self.verified_id = create_extend_after_decode_spec_info(
