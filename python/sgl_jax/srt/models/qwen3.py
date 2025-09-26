@@ -406,6 +406,7 @@ class QWen3Model(nnx.Module):
                 forward_batch,
                 residual,
             )
+            jax.debug.print("layer_id: {layer_id}", layer_id=layer_id)
             forward_batch.token_to_kv_pool.kv_buffer.at[layer_id].set(kv_fused)
             # layers_kv_fused.append(kv_fused)
             layers_callback_flag.extend(callback_flag)
