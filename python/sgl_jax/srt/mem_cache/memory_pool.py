@@ -265,45 +265,69 @@ class MHATokenToKVPool(KVCache):
         return obj
 
     def _create_buffers(self):
-        """Create sharded fused KV cache buffers with proper distributed allocation"""
-        self.kv_sharding = NamedSharding(self.mesh, P(None, self.kv_partition_axis))
-
-        logger.info(f"Creating fused KV buffers for {self.layer_num} layers")
-        start_time = time.time()
-
         fused_buffer_shape = (
             self.size + self.page_size,
-            self.head_num * 2,  # [K0,V0,K1,V1,...]
+            self.head_num * 2,
             self.head_dim,
         )
-        total_memory_per_layer = (
-            fused_buffer_shape[0]
-            * fused_buffer_shape[1]
-            * fused_buffer_shape[2]
-            * jnp.dtype(self.dtype).itemsize
-        )
-        logger.info(
-            f"Total fused KV cache memory per layer: {total_memory_per_layer / GB:.2f} GB, dtype: {self.dtype}"
-        )
+        logger.info(f"Creating fused KV buffers for {self.layer_num} layers")
+        start_time = time.time()
+        full_shape = (self.layer_num,) + fused_buffer_shape
 
+        # 正确的 sharding：layer 维度不分片，head 维度按 TP 切分
+        full_sharding = NamedSharding(self.mesh, P(None, None, self.kv_partition_axis))
+
+        logger.info(f"Creating fused KV buffers with shape {full_shape}")
         with self.mesh:
-            buffer_list = []
-            for _ in range(self.layer_num):
-                kv_buf = jax.jit(
-                    lambda: jnp.zeros(
-                        shape=fused_buffer_shape,
-                        dtype=self.dtype,
-                    ),
-                    out_shardings=self.kv_sharding,
-                )()
-                buffer_list.append(kv_buf)
-
-            self.kv_buffer = jnp.stack(buffer_list)
-
+            self.kv_buffer = jax.jit(
+                lambda: jnp.zeros(full_shape, dtype=self.dtype),
+                out_shardings=full_sharding,
+            )()
         end_time = time.time()
         logger.info(
             f"Total time to create {self.layer_num} buffers: {end_time - start_time:.2f} seconds"
         )
+
+    # def _create_buffers(self):
+    #     """Create sharded fused KV cache buffers with proper distributed allocation"""
+    #     self.kv_sharding = NamedSharding(self.mesh, P(None, self.kv_partition_axis))
+
+    #     logger.info(f"Creating fused KV buffers for {self.layer_num} layers")
+    #     start_time = time.time()
+
+    #     fused_buffer_shape = (
+    #         self.size + self.page_size,
+    #         self.head_num * 2,  # [K0,V0,K1,V1,...]
+    #         self.head_dim,
+    #     )
+    #     total_memory_per_layer = (
+    #         fused_buffer_shape[0]
+    #         * fused_buffer_shape[1]
+    #         * fused_buffer_shape[2]
+    #         * jnp.dtype(self.dtype).itemsize
+    #     )
+    #     logger.info(
+    #         f"Total fused KV cache memory per layer: {total_memory_per_layer / GB:.2f} GB, dtype: {self.dtype}"
+    #     )
+
+    #     with self.mesh:
+    #         buffer_list = []
+    #         for _ in range(self.layer_num):
+    #             kv_buf = jax.jit(
+    #                 lambda: jnp.zeros(
+    #                     shape=fused_buffer_shape,
+    #                     dtype=self.dtype,
+    #                 ),
+    #                 out_shardings=self.kv_sharding,
+    #             )()
+    #             buffer_list.append(kv_buf)
+
+    #         self.kv_buffer = jnp.stack(buffer_list)
+
+    #     end_time = time.time()
+    #     logger.info(
+    #         f"Total time to create {self.layer_num} buffers: {end_time - start_time:.2f} seconds"
+    #     )
 
     def _calculate_memory_usage(self):
         fused_kv_size = (
