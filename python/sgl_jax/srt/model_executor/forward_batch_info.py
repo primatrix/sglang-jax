@@ -173,7 +173,7 @@ class ForwardBatch:
     trace_request_ids: Optional[List[str]] = None
     trace_request_objects: Optional[List] = None
 
-    spec_info: Optional[Union["EagleVerifyInput", "EagleDraftInput"]] = None
+    spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
 

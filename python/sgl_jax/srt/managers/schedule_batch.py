@@ -1112,7 +1112,6 @@ class ScheduleBatch:
             # padding
             if self.forward_mode == ForwardMode.DRAFT_EXTEND:
                 padding_size = len(input_ids_cpu) - len(positions_cpu)
-                print(f"{input_ids_cpu=}")
                 if padding_size:
                     positions_cpu = np.concatenate(
                         [

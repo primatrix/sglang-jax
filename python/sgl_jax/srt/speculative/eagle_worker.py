@@ -32,6 +32,7 @@ RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
 
 class EAGLEWorker(ModelWorker):
     def __init__(self, server_args, target_worker: ModelWorker):
+        self.server_args = server_args
         self.target_worker = target_worker
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
@@ -85,7 +86,10 @@ class EAGLEWorker(ModelWorker):
             logits_output, verify_output, model_worker_batch, _ = self.verify(
                 batch, spec_info
             )
-            self.forward_draft_extend_after_decode(batch)
+            print(f"{verify_output.accept_length_per_req_cpu=}")
+            # TODO: if enable_dp_attention, add condition here
+            if batch.spec_info.verified_id.shape[0] > 0:
+                self.forward_draft_extend_after_decode(batch)
             return (
                 logits_output,
                 verify_output.verified_id,
@@ -213,7 +217,6 @@ class EAGLEWorker(ModelWorker):
         #     self.draft_model_runner.attn_backend.forward_metadata = forward_metadata
 
         # Run forward steps
-        print(f"{batch=}")
         score_list, token_list, parents_list = self.draft_forward(batch)
         (
             tree_mask,
@@ -471,6 +474,7 @@ class EAGLEWorker(ModelWorker):
                 model_worker_batch, self.mesh
             ),
         )
+        logits_output.truncate_logits_processor_output(model_worker_batch)
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 
         # Restore backup.

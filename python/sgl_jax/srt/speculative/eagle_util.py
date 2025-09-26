@@ -533,12 +533,10 @@ class EagleVerifyInput:
             self.last_loc = last_loc
 
         assign_req_to_token_pool(
-            bs,
-            batch.req_to_token_pool,
             batch.req_pool_indices,
-            prefix_lens,
+            batch.req_to_token_pool,
+            batch.seq_lens,
             seq_lens_with_draft_token,
-            extend_lens,
             batch.out_cache_loc,
         )
 
@@ -778,12 +776,10 @@ class EagleVerifyInput:
             if page_size == 1 or self.topk == 1:
                 batch.out_cache_loc = batch.out_cache_loc[accept_index]
                 assign_req_to_token_pool(
-                    bs,
-                    batch.req_to_token_pool,
                     batch.req_pool_indices,
+                    batch.req_to_token_pool,
                     batch.seq_lens,
                     batch.seq_lens + accept_length + 1,
-                    jnp.array([self.draft_token_num] * bs),
                     batch.out_cache_loc,
                 )
             else:
@@ -808,13 +804,12 @@ class EagleVerifyInput:
             )
         else:
             if page_size == 1 or self.topk == 1:
+                batch.out_cache_loc = batch.out_cache_loc[accept_index]
                 assign_req_to_token_pool(
-                    bs,
-                    batch.req_to_token_pool,
                     batch.req_pool_indices,
+                    batch.req_to_token_pool,
                     batch.seq_lens,
                     batch.seq_lens + accept_length + 1,
-                    jnp.array([self.draft_token_num] * bs),
                     batch.out_cache_loc,
                 )
                 batch.seq_lens = batch.seq_lens + (accept_length + 1)
