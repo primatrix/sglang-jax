@@ -397,7 +397,6 @@ class QWen3Model(nnx.Module):
     ):
         residual = None
         hidden_states = self.jitted_embed_tokens(forward_batch.input_ids)
-        layers_kv_fused = []
         layers_callback_flag = []
         for layer_jitted_fn, layer_id in self.jitted_layers:
             hidden_states, residual, kv_fused, callback_flag = layer_jitted_fn(
@@ -407,11 +406,9 @@ class QWen3Model(nnx.Module):
                 forward_batch,
                 residual,
             )
-            layers_kv_fused.append(kv_fused)
+            forward_batch.token_to_kv_pool.kv_buffer.at[layer_id].set(kv_fused)
+            # layers_kv_fused.append(kv_fused)
             layers_callback_flag.extend(callback_flag)
-
-        # 将 layers_kv_fused 从列表转换为 JAX 数组，以便后续批量设置
-        layers_kv_fused = jnp.stack(layers_kv_fused, axis=0)
 
         if residual is not None:
             hidden_states += residual
@@ -421,7 +418,7 @@ class QWen3Model(nnx.Module):
             hidden_states, "transformer_output", "TRANSFORMER"
         )
         layers_callback_flag.append(callback_flag)
-        return hidden_states, layers_kv_fused, layers_callback_flag
+        return hidden_states, layers_callback_flag
 
 
 class Qwen3ForCausalLM(nnx.Module):
@@ -624,11 +621,9 @@ class Qwen3ForCausalLM(nnx.Module):
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused, layers_callback_flag = self.transformer(
-            forward_batch
-        )
+        hidden_states, layers_callback_flag = self.transformer(forward_batch)
         output = self.jitted_logits_processor(hidden_states, logits_metadata)
-        return output, layers_kv_fused, layers_callback_flag
+        return output, layers_callback_flag
 
 
 EntryClass = Qwen3ForCausalLM
