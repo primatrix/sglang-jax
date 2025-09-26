@@ -374,7 +374,7 @@ class QWen3Model(nnx.Module):
                 sample_layer_state_def, sample_layer_state_leaves
             )
             layer = nnx.merge(sample_layer_def, sample_layer_state)
-            return layer(positions, hidden_states, forward_batch, residual, layer_id)
+            return layer(positions, hidden_states, forward_batch, layer_id, residual)
 
         self.universal_layer_jit = partial(universal_jitted_layer, sample_layer_def)
 
