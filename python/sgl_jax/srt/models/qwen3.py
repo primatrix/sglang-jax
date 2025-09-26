@@ -363,9 +363,7 @@ class QWen3Model(nnx.Module):
         )
 
         @partial(
-            jax.jit,
-            static_argnames=["sample_layer_def", "sample_layer_state_def"],
-            donate_argnames=["forward_batch"],
+            jax.jit, static_argnames=["sample_layer_def", "sample_layer_state_def"]
         )
         def universal_jitted_layer(
             sample_layer_def,
