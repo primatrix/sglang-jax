@@ -275,16 +275,17 @@ class EAGLEWorker(ModelWorker):
         assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
 
         # forward
-        sampling_metadata = SamplingMetadata.from_model_worker_batch(
-            model_worker_batch,
-            len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
-            self.mesh,
-        )
+        # sampling_metadata = SamplingMetadata.from_model_worker_batch(
+        #     model_worker_batch,
+        #     len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
+        #     self.mesh,
+        # )
         logits_output, _, cache_miss_count = (
             self.target_worker.forward_batch_generation(
-                model_worker_batch, sampling_metadata=sampling_metadata
+                model_worker_batch, skip_sample=True
             )
         )
+        logits_output.truncate_logits_processor_output(model_worker_batch)
 
         # TODO: support grammar mask
         # vocab_mask = None

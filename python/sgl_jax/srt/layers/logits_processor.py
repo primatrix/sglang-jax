@@ -95,9 +95,15 @@ class LogitsProcessorOutput:
 
     def truncate_logits_processor_output(self, batch: "ModelWorkerBatch"):
         # note: here only need to truncate next_token_logits and hidden_states
-        self.next_token_logits = jax.lax.dynamic_slice_in_dim(
-            self.next_token_logits, 0, batch.real_bs, axis=0
-        )
+        if batch.forward_mode == ForwardMode.TARGET_VERIFY:
+            # For ForwardMode.TARGET_VERIFY mode, we should take draft_token_num token for tree verify later
+            self.next_token_logits = jax.lax.dynamic_slice_in_dim(
+                self.next_token_logits, 0, batch.spec_info.draft_token_num, axis=0
+            )
+        else:
+            self.next_token_logits = jax.lax.dynamic_slice_in_dim(
+                self.next_token_logits, 0, batch.real_bs, axis=0
+            )
         # assert not batch.capture_hidden_mode.need_capture()
 
 
@@ -233,7 +239,10 @@ class LogitsProcessor(nnx.Module):
         logits_metadata: LogitsMetadata,
         aux_hidden_states: Optional[jax.Array] = None,
     ) -> LogitsProcessorOutput:
-        if logits_metadata.forward_mode.is_decode_or_idle():
+        if (
+            logits_metadata.forward_mode.is_decode_or_idle()
+            or logits_metadata.forward_mode.is_target_verify()
+        ):
             pruned_states = hidden_states
             if aux_hidden_states is not None:
                 aux_pruned_states = [hidden for hidden in aux_hidden_states]

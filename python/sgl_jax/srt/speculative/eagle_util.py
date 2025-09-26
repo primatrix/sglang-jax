@@ -519,8 +519,9 @@ class EagleVerifyInput:
         is_all_greedy = sampling_info.is_all_greedy
 
         if is_all_greedy:
-            target_predict = jnp.argmax(logits_output.next_token_logits, axis=-1)
-            target_predict = target_predict.reshape(bs, self.draft_token_num)
+            target_predict = jnp.argmax(
+                logits_output.next_token_logits, axis=-1
+            ).flatten()
 
             accept_index, accept_length, predict = verify_tree_greedy(
                 predicts=predict,  # mutable
@@ -698,7 +699,7 @@ class EagleVerifyInput:
                 )
             else:
                 batch.out_cache_loc = tgt_cache_loc
-            batch.seq_lens.add_(accept_length + 1)
+            batch.seq_lens = batch.seq_lens + (accept_length + 1)
 
             draft_input = EagleDraftInput(
                 hidden_states=batch.spec_info.hidden_states[accept_index],

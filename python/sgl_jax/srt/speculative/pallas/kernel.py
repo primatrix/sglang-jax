@@ -94,8 +94,8 @@ def verify_tree_greedy(
         for j in range(1, num_speculative_tokens):
             cur_index = retrive_next_token[bid][cur_index]
             while cur_index != -1:
-                draft_index = retrive_index[bid][cur_index]
-                draft_token_id = candidates[bid][cur_index]
+                draft_index = retrive_index[bid, cur_index]
+                draft_token_id = candidates[bid, cur_index]
                 target_token_id = target_predict[last_accepted_retrive_idx]
                 if draft_token_id == target_token_id:
                     predicts = predicts.at[last_accepted_retrive_idx].set(
