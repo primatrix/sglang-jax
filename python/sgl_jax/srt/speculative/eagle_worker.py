@@ -82,15 +82,15 @@ class EAGLEWorker(ModelWorker):
             # draft
             spec_info = self.draft(batch)
             # verify
-            logits_output, verify_output, model_worker_batch = self.verify(
+            logits_output, verify_output, model_worker_batch, _ = self.verify(
                 batch, spec_info
             )
             self.forward_draft_extend_after_decode(batch)
             return (
                 logits_output,
-                next_token_ids,
-                cache_miss_count,
+                verify_output.verified_id,
                 sum(verify_output.accept_length_per_req_cpu),
+                0,
             )
 
     def forward_target_extend(
@@ -194,7 +194,6 @@ class EAGLEWorker(ModelWorker):
             self._draft_preprocess_decode(batch)
 
         spec_info = batch.spec_info
-        print(f"{spec_info.positions=} {batch=}")
         assert isinstance(spec_info, EagleDraftInput)
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         spec_info.num_tokens_per_batch = self.topk
@@ -214,6 +213,7 @@ class EAGLEWorker(ModelWorker):
         #     self.draft_model_runner.attn_backend.forward_metadata = forward_metadata
 
         # Run forward steps
+        print(f"{batch=}")
         score_list, token_list, parents_list = self.draft_forward(batch)
         (
             tree_mask,
@@ -323,7 +323,7 @@ class EAGLEWorker(ModelWorker):
         )
         batch.spec_info = res.draft_input
 
-        return logits_output, res, model_worker_batch
+        return logits_output, res, model_worker_batch, cache_miss_count
 
     def add_logprob_values(
         self,

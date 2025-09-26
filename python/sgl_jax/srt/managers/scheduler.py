@@ -943,7 +943,7 @@ class Scheduler(
                 )
             )
         else:
-            logits_output, next_token_ids, cache_miss_count, accept_length = (
+            logits_output, next_token_ids, accept_length, cache_miss_count = (
                 self.draft_worker.forward_batch_speculative_generation(
                     batch, model_worker_batch, sampling_metadata
                 )

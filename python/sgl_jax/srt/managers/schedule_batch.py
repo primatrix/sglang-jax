@@ -1110,15 +1110,16 @@ class ScheduleBatch:
         ):
             positions_cpu = self.spec_info.positions
             # padding
-            padding_size = len(input_ids_cpu) - len(positions_cpu)
-            print(f"{input_ids_cpu=}")
-            if padding_size:
-                positions_cpu = np.concatenate(
-                    [
-                        positions_cpu,
-                        jnp.zeros(padding_size, dtype=positions_cpu.dtype),
-                    ]
-                )
+            if self.forward_mode == ForwardMode.DRAFT_EXTEND:
+                padding_size = len(input_ids_cpu) - len(positions_cpu)
+                print(f"{input_ids_cpu=}")
+                if padding_size:
+                    positions_cpu = np.concatenate(
+                        [
+                            positions_cpu,
+                            jnp.zeros(padding_size, dtype=positions_cpu.dtype),
+                        ]
+                    )
         else:
             positions_cpu = None
 
