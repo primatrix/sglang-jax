@@ -367,7 +367,7 @@ class QWen3Model(nnx.Module):
             static_argnames=["sample_layer_def", "sample_layer_state_def"],
             donate_argnames=["forward_batch"],
         )
-        def jitted_sample_layer(
+        def universal_jitted_layer(
             sample_layer_def,
             sample_layer_state_def,
             sample_layer_state_leaves,
@@ -379,24 +379,20 @@ class QWen3Model(nnx.Module):
             sample_layer_state = jax.tree_util.tree_unflatten(
                 sample_layer_state_def, sample_layer_state_leaves
             )
-            sample_layer = nnx.merge(sample_layer_def, sample_layer_state)
-            return sample_layer(positions, hidden_states, forward_batch, residual)
+            layer = nnx.merge(sample_layer_def, sample_layer_state)
+            return layer(positions, hidden_states, forward_batch, residual)
+
+        self.universal_layer_jit = partial(universal_jitted_layer, sample_layer_def)
 
         self.jitted_layers = []
         for layer in self.layers:
-            _, layer_state = nnx.split(layer)
-            layer_state_leaves, _ = jax.tree_util.tree_flatten(layer_state)
-            # 深拷贝权重数据，确保独立于原始layer
-            layer_state_leaves_copy = jax.tree.map(
-                lambda x: jnp.array(x), layer_state_leaves
+            layer_def, layer_state = nnx.split(layer)
+            layer_state_leaves, layer_state_def = jax.tree_util.tree_flatten(
+                layer_state
             )
-            layer_jitted = partial(
-                jitted_sample_layer,
-                sample_layer_def,
-                sample_layer_state_def,
-                layer_state_leaves_copy,
+            self.jitted_layers.append(
+                partial(self.universal_layer_jit, layer_state_def, layer_state_leaves)
             )
-            self.jitted_layers.append(layer_jitted)
 
     def __call__(
         self,
