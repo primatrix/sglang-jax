@@ -1,4 +1,5 @@
 import logging
+from functools import partial
 from typing import Any, Dict, Optional, Tuple
 
 import jax
@@ -312,16 +313,101 @@ class QWen3Model(nnx.Module):
             rngs=rngs,
         )
 
+    def initilize_embed_tokens_jit(self):
+        embed_tokens_def, embed_tokens_state = nnx.split(self.embed_tokens)
+        embed_tokens_state_leaves, embed_tokens_state_def = jax.tree_util.tree_flatten(
+            embed_tokens_state
+        )
+
+        @partial(jax.jit, static_argnames=["embed_tokens_def"])
+        def jitted_embed_tokens(
+            embed_tokens_def, embed_tokens_state_def, embed_tokens_state_leaves, x
+        ):
+            embed_tokens_state = jax.tree_util.tree_unflatten(
+                embed_tokens_state_def, embed_tokens_state_leaves
+            )
+            embed_tokens = nnx.merge(embed_tokens_def, embed_tokens_state)
+            return embed_tokens(x)
+
+        self.jitted_embed_tokens = partial(
+            jitted_embed_tokens,
+            embed_tokens_def,
+            embed_tokens_state_def,
+            embed_tokens_state_leaves,
+        )
+
+        del self.embed_tokens
+
+    def initilize_rms_norm_jit(self):
+        rms_norm_def, rms_norm_state = nnx.split(self.norm)
+        rms_norm_state_leaves, rms_norm_state_def = jax.tree_util.tree_flatten(
+            rms_norm_state
+        )
+
+        @partial(jax.jit, static_argnames=["rms_norm_def"])
+        def jitted_rms_norm(rms_norm_def, rms_norm_state_def, rms_norm_state_leaves, x):
+            rms_norm_state = jax.tree_util.tree_unflatten(
+                rms_norm_state_def, rms_norm_state_leaves
+            )
+            rms_norm = nnx.merge(rms_norm_def, rms_norm_state)
+            return rms_norm(x)
+
+        self.jitted_rms_norm = partial(
+            jitted_rms_norm, rms_norm_def, rms_norm_state_def, rms_norm_state_leaves
+        )
+
+        del self.norm
+
+    def initilize_decode_layer_jit(self):
+        sample_layer_def, sample_layer_state = nnx.split(self.layers[0])
+        sample_layer_state_leaves, sample_layer_state_def = jax.tree_util.tree_flatten(
+            sample_layer_state
+        )
+
+        @partial(
+            jax.jit,
+            static_argnames=["sample_layer_def", "sample_layer_state_def"],
+            donate_argnames=["forward_batch"],
+        )
+        def jitted_sample_layer(
+            sample_layer_def,
+            sample_layer_state_def,
+            sample_layer_state_leaves,
+            positions,
+            hidden_states,
+            forward_batch,
+            residual,
+        ):
+            sample_layer_state = jax.tree_util.tree_unflatten(
+                sample_layer_state_def, sample_layer_state_leaves
+            )
+            sample_layer = nnx.merge(sample_layer_def, sample_layer_state)
+            return sample_layer(positions, hidden_states, forward_batch, residual)
+
+        self.jitted_layers = []
+        for layer in self.layers:
+            _, layer_state = nnx.split(layer)
+            layer_state_leaves, _ = jax.tree_util.tree_flatten(layer_state)
+            layer_jitted = partial(
+                jitted_sample_layer,
+                sample_layer_def,
+                sample_layer_state_def,
+                layer_state_leaves,
+            )
+            self.jitted_layers.append(layer_jitted)
+
+        del self.layers
+
     def __call__(
         self,
         forward_batch: ForwardBatch,
     ):
         residual = None
-        hidden_states = self.embed_tokens(forward_batch.input_ids)
+        hidden_states = self.jitted_embed_tokens(forward_batch.input_ids)
         layers_kv_fused = []
         layers_callback_flag = []
-        for layer in self.layers:
-            hidden_states, residual, kv_fused, callback_flag = layer(
+        for layer_jitted in self.jitted_layers:
+            hidden_states, residual, kv_fused, callback_flag = layer_jitted(
                 forward_batch.positions, hidden_states, forward_batch, residual
             )
             layers_kv_fused.append(kv_fused)
@@ -329,7 +415,7 @@ class QWen3Model(nnx.Module):
 
         if residual is not None:
             hidden_states += residual
-        hidden_states = self.norm(hidden_states)
+        hidden_states = self.jitted_rms_norm(hidden_states)
 
         callback_flag = precision_tracer.jit_pure_callback_record(
             hidden_states, "transformer_output", "TRANSFORMER"
@@ -353,6 +439,42 @@ class Qwen3ForCausalLM(nnx.Module):
         self.logits_processor = LogitsProcessor(
             config.hf_config.vocab_size, self.lm_head, self.mesh
         )
+
+    def initilize_jit(self):
+        self.initialize_logits_processor_jit()
+        self.transformer.initilize_embed_tokens_jit()
+        self.transformer.initilize_rms_norm_jit()
+        self.transformer.initilize_decode_layer_jit()
+        logger.info("JIT initialized successfully!")
+
+    def initialize_logits_processor_jit(self):
+        logits_processor_def, logits_processor_state = nnx.split(self.logits_processor)
+        logits_processor_state_leaves, logits_processor_state_def = (
+            jax.tree_util.tree_flatten(logits_processor_state)
+        )
+
+        @partial(jax.jit, static_argnames=["logits_processor_def"])
+        def jitted_logits_processor(
+            logits_processor_def,
+            logits_processor_state_def,
+            logits_processor_state_leaves,
+            hidden_states,
+            logits_metadata,
+        ):
+            logits_processor_state = jax.tree_util.tree_unflatten(
+                logits_processor_state_def, logits_processor_state_leaves
+            )
+            logits_processor = nnx.merge(logits_processor_def, logits_processor_state)
+            return logits_processor(hidden_states, logits_metadata)
+
+        self.jitted_logits_processor = partial(
+            jitted_logits_processor,
+            logits_processor_def,
+            logits_processor_state_def,
+            logits_processor_state_leaves,
+        )
+
+        del self.logits_processor
 
     def load_weights(self, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
@@ -504,7 +626,7 @@ class Qwen3ForCausalLM(nnx.Module):
         hidden_states, layers_kv_fused, layers_callback_flag = self.transformer(
             forward_batch
         )
-        output = self.logits_processor(hidden_states, logits_metadata)
+        output = self.jitted_logits_processor(hidden_states, logits_metadata)
         return output, layers_kv_fused, layers_callback_flag
 
 
