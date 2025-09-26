@@ -13,16 +13,15 @@ import numpy
 from flax import nnx
 from jax._src.lib import xla_client as xc
 
-if TYPE_CHECKING:
-    from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
-    from sgl_jax.srt.managers.schedule_batch import (
-        ScheduleBatch,
-        get_last_loc,
-        global_server_args_dict,
-    )
-    from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.layers.sampler import top_k_top_p_min_p_sampling_from_probs_jax
+from sgl_jax.srt.managers.schedule_batch import (
+    ScheduleBatch,
+    get_last_loc,
+    global_server_args_dict,
+)
 from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sgl_jax.srt.speculative.pallas.kernel import (
     align_evict_mask_to_page_size,
     assign_req_to_token_pool,
@@ -252,7 +251,7 @@ class EagleDraftInput:
     topk_index: jax.Array = None
     # shape: (b, hidden_size)
     hidden_states: jax.Array = None
-    capture_hidden_mode: "CaptureHiddenMode" = 2  # CaptureHiddenMode.FULL
+    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     # Inputs for extend
     # shape: (b,)
@@ -410,7 +409,7 @@ class EagleVerifyInput:
     spec_steps: int
     topk: int
     draft_token_num: int
-    capture_hidden_mode: "CaptureHiddenMode"
+    capture_hidden_mode: CaptureHiddenMode
     seq_lens_sum: int
     seq_lens_cpu: jax.Array
     # grammar: BaseGrammarObject = None
@@ -728,7 +727,7 @@ class EagleVerifyInput:
                     jnp.array([self.draft_token_num] * bs),
                     batch.out_cache_loc,
                 )
-                batch.seq_lens.add_(accept_length + 1)
+                batch.seq_lens = batch.seq_lens + (accept_length + 1)
 
             accept_length_cpu = accept_length.tolist()
             if len(unfinished_accept_index) > 0:
