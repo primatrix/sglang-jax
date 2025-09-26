@@ -190,12 +190,12 @@ class ForwardBatch:
             self.cache_loc,
             self.extend_prefix_lens,
             self.extend_seq_lens,
+            self.spec_info,
         )
 
         aux_data = {
             "forward_mode": self.forward_mode,
             "batch_size": self.batch_size,
-            "spec_info": self.spec_info,
             "spec_algorithm": self.spec_algorithm,
             "capture_hidden_mode": self.capture_hidden_mode,
         }
@@ -207,7 +207,6 @@ class ForwardBatch:
 
         obj.forward_mode = aux_data["forward_mode"]
         obj.batch_size = aux_data["batch_size"]
-        obj.spec_info = aux_data["spec_info"]
         obj.spec_algorithm = aux_data["spec_algorithm"]
         obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
         obj.trace_request_ids = None
@@ -224,6 +223,7 @@ class ForwardBatch:
         obj.cache_loc = children[8]
         obj.extend_prefix_lens = children[9]
         obj.extend_seq_lens = children[10]
+        obj.spec_info = children[11]
 
         return obj
 

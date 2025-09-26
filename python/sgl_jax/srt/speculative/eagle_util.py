@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy
 from flax import nnx
 from jax._src.lib import xla_client as xc
+from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.layers.sampler import top_k_top_p_min_p_sampling_from_probs_jax
@@ -243,6 +244,7 @@ def build_tree_kernel_efficient(
     )
 
 
+@register_pytree_node_class
 @dataclass
 class EagleDraftInput:
     # The inputs for decode
@@ -272,6 +274,49 @@ class EagleDraftInput:
     # shape: (b,)
     seq_lens_for_draft_extend: jax.Array = None
     req_pool_indices_for_draft_extend: jax.Array = None
+
+    def tree_flatten(self):
+        children = (
+            self.topk_p,
+            self.topk_index,
+            self.hidden_states,
+            self.verified_id,
+            self.accept_length,
+            self.kv_indptr,
+            self.kv_indices,
+            self.seq_lens_for_draft_extend,
+            self.req_pool_indices_for_draft_extend,
+        )
+
+        aux_data = {
+            "capture_hidden_mode": self.capture_hidden_mode,
+            "accept_length_cpu": self.accept_length_cpu,
+            "num_tokens_per_batch": self.num_tokens_per_batch,
+            "num_tokens_for_logprob_per_batch": self.num_tokens_for_logprob_per_batch,
+        }
+        return (children, aux_data)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        obj = cls.__new__(cls)
+        obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
+        obj.accept_length_cpu = aux_data["accept_length_cpu"]
+        obj.num_tokens_per_batch = aux_data["num_tokens_per_batch"]
+        obj.num_tokens_for_logprob_per_batch = aux_data[
+            "num_tokens_for_logprob_per_batch"
+        ]
+
+        obj.topk_p = children[0]
+        obj.topk_index = children[1]
+        obj.hidden_states = children[2]
+        obj.verified_id = children[3]
+        obj.accept_length = children[4]
+        obj.kv_indptr = children[5]
+        obj.kv_indices = children[6]
+        obj.seq_lens_for_draft_extend = children[7]
+        obj.req_pool_indices_for_draft_extend = children[8]
+
+        return obj
 
     def prepare_for_extend(self, batch: ScheduleBatch):
 
@@ -398,8 +443,10 @@ class EagleVerifyOutput:
     accepted_indices: jax.Array
 
 
+@register_pytree_node_class
 @dataclass
 class EagleVerifyInput:
+    # container type for pytree
     draft_token: jax.Array
     custom_mask: jax.Array
     positions: jax.Array
@@ -407,13 +454,55 @@ class EagleVerifyInput:
     retrive_next_token: jax.Array
     retrive_next_sibling: jax.Array
     retrive_cum_len: jax.Array
+    seq_lens_cpu: jax.Array
+    # common type for pytree
     spec_steps: int
     topk: int
     draft_token_num: int
-    capture_hidden_mode: CaptureHiddenMode
     seq_lens_sum: int
-    seq_lens_cpu: jax.Array
+    capture_hidden_mode: CaptureHiddenMode
     # grammar: BaseGrammarObject = None
+
+    def tree_flatten(self):
+        children = (
+            self.draft_token,
+            self.custom_mask,
+            self.positions,
+            self.retrive_index,
+            self.retrive_next_token,
+            self.retrive_next_sibling,
+            self.retrive_cum_len,
+            self.seq_lens_cpu,
+        )
+
+        aux_data = {
+            "spec_steps": self.spec_steps,
+            "topk": self.topk,
+            "draft_token_num": self.draft_token_num,
+            "seq_lens_sum": self.seq_lens_sum,
+            "capture_hidden_mode": self.capture_hidden_mode,
+        }
+        return (children, aux_data)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        obj = cls.__new__(cls)
+        obj.spec_steps = aux_data["spec_steps"]
+        obj.topk = aux_data["topk"]
+        obj.draft_token_num = aux_data["draft_token_num"]
+        obj.seq_lens_sum = aux_data["seq_lens_sum"]
+        obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
+
+        obj.draft_token = children[0]
+        obj.custom_mask = children[1]
+        obj.positions = children[2]
+        obj.retrive_index = children[3]
+        obj.retrive_next_token = children[4]
+        obj.retrive_next_sibling = children[5]
+        obj.retrive_cum_len = children[6]
+        obj.seq_lens_cpu = children[7]
+
+        return obj
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
         if batch.forward_mode.is_idle():
