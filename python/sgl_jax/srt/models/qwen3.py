@@ -410,6 +410,9 @@ class QWen3Model(nnx.Module):
             layers_kv_fused.append(kv_fused)
             layers_callback_flag.extend(callback_flag)
 
+        # 将 layers_kv_fused 从列表转换为 JAX 数组，以便后续批量设置
+        layers_kv_fused = jnp.stack(layers_kv_fused, axis=0)
+
         if residual is not None:
             hidden_states += residual
         hidden_states = self.jitted_rms_norm(hidden_states)
