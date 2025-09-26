@@ -319,7 +319,9 @@ class QWen3Model(nnx.Module):
             embed_tokens_state
         )
 
-        @partial(jax.jit, static_argnames=["embed_tokens_def"])
+        @partial(
+            jax.jit, static_argnames=["embed_tokens_def", "embed_tokens_state_def"]
+        )
         def jitted_embed_tokens(
             embed_tokens_def, embed_tokens_state_def, embed_tokens_state_leaves, x
         ):
@@ -344,7 +346,7 @@ class QWen3Model(nnx.Module):
             rms_norm_state
         )
 
-        @partial(jax.jit, static_argnames=["rms_norm_def"])
+        @partial(jax.jit, static_argnames=["rms_norm_def", "rms_norm_state_def"])
         def jitted_rms_norm(rms_norm_def, rms_norm_state_def, rms_norm_state_leaves, x):
             rms_norm_state = jax.tree_util.tree_unflatten(
                 rms_norm_state_def, rms_norm_state_leaves
@@ -453,7 +455,10 @@ class Qwen3ForCausalLM(nnx.Module):
             jax.tree_util.tree_flatten(logits_processor_state)
         )
 
-        @partial(jax.jit, static_argnames=["logits_processor_def"])
+        @partial(
+            jax.jit,
+            static_argnames=["logits_processor_def", "logits_processor_state_def"],
+        )
         def jitted_logits_processor(
             logits_processor_def,
             logits_processor_state_def,
