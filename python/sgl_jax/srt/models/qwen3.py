@@ -338,8 +338,6 @@ class QWen3Model(nnx.Module):
             embed_tokens_state_leaves,
         )
 
-        del self.embed_tokens
-
     def initilize_rms_norm_jit(self):
         rms_norm_def, rms_norm_state = nnx.split(self.norm)
         rms_norm_state_leaves, rms_norm_state_def = jax.tree_util.tree_flatten(
@@ -357,8 +355,6 @@ class QWen3Model(nnx.Module):
         self.jitted_rms_norm = partial(
             jitted_rms_norm, rms_norm_def, rms_norm_state_def, rms_norm_state_leaves
         )
-
-        del self.norm
 
     def initilize_decode_layer_jit(self):
         sample_layer_def, sample_layer_state = nnx.split(self.layers[0])
@@ -476,8 +472,6 @@ class Qwen3ForCausalLM(nnx.Module):
             logits_processor_state_def,
             logits_processor_state_leaves,
         )
-
-        del self.logits_processor
 
     def load_weights(self, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
