@@ -1111,6 +1111,7 @@ class ScheduleBatch:
             positions_cpu = self.spec_info.positions
             # padding
             padding_size = len(input_ids_cpu) - len(positions_cpu)
+            print(f"{input_ids_cpu=}")
             if padding_size:
                 positions_cpu = np.concatenate(
                     [
