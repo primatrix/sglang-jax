@@ -57,6 +57,7 @@ class RadixAttention(nnx.Module):
         assert k is not None
         assert v is not None
         self.layer_id = layer_id
+        jax.debug.print("radix attn layer_id: {layer_id}", layer_id=layer_id)
         attn_output, kv_fused = forward_batch.attn_backend(
             q,
             k,
