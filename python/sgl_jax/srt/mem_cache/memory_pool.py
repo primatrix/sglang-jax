@@ -228,7 +228,6 @@ class MHATokenToKVPool(KVCache):
 
     def tree_flatten(self):
         parent_children, parent_aux_data = super().tree_flatten()
-
         children = (self.kv_buffer,) + parent_children
         aux_data = {
             **parent_aux_data,
@@ -245,7 +244,6 @@ class MHATokenToKVPool(KVCache):
         parent_children = children[1:] if len(children) > 1 else ()
 
         obj = object.__new__(cls)
-
         parent_obj = super().tree_unflatten(aux_data, parent_children)
         for attr in [
             "size",
@@ -263,9 +261,7 @@ class MHATokenToKVPool(KVCache):
         obj.head_dim = aux_data["head_dim"]
         obj.kv_partition_axis = aux_data["kv_partition_axis"]
         obj.kv_sharding = aux_data["kv_sharding"]
-
         obj.kv_buffer = kv_buffer
-
         return obj
 
     def _create_buffers(self):
@@ -287,10 +283,11 @@ class MHATokenToKVPool(KVCache):
             * jnp.dtype(self.dtype).itemsize
         )
         logger.info(
-            f"Total fused KV cache memory per layer: {total_memory_per_layer / 1024**3:.2f} GB, dtype: {self.dtype}"
+            f"Total fused KV cache memory per layer: {total_memory_per_layer / GB:.2f} GB, dtype: {self.dtype}"
         )
+
         with self.mesh:
-            self.kv_buffer = []
+            buffer_list = []
             for _ in range(self.layer_num):
                 kv_buf = jax.jit(
                     lambda: jnp.zeros(
@@ -299,8 +296,9 @@ class MHATokenToKVPool(KVCache):
                     ),
                     out_shardings=self.kv_sharding,
                 )()
+                buffer_list.append(kv_buf)
 
-                self.kv_buffer.append(kv_buf)
+            self.kv_buffer = jnp.stack(buffer_list)
 
         end_time = time.time()
         logger.info(
@@ -308,130 +306,101 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _calculate_memory_usage(self):
-        """Calculate memory usage for fused KV cache"""
         fused_kv_size = (
             (self.size + self.page_size)
-            * self.head_num  # num_kv_heads
+            * self.head_num
             * self.head_dim
-            * 2  # num_heads * 2 (head interleaving)
+            * 2
             * jnp.dtype(self.dtype).itemsize
             * self.layer_num
         )
         self.mem_usage = fused_kv_size / GB
-
         logger.info(
             f"JAX Fused KV Cache allocated. #tokens: {self.size}, "
             f"Fused KV size: {fused_kv_size / GB:.2f} GB"
         )
 
     def get_kv_size_bytes(self):
-        """Calculate KV cache size in bytes for fused format"""
         fused_kv_size = (
             (self.size + self.page_size)
-            * self.head_num  # num_kv_heads
+            * self.head_num
             * self.head_dim
-            * 2  # num_heads * 2 (head interleaving)
+            * 2
             * jnp.dtype(self.dtype).itemsize
             * self.layer_num
         )
-        # For backward compatibility, return as separate k and v sizes
         k_size = fused_kv_size // 2
         v_size = fused_kv_size // 2
         return k_size, v_size
 
     def get_fused_kv_buffer(self, layer_id: int) -> jnp.ndarray:
-        return self.kv_buffer[layer_id - self.start_layer]
+        idx = layer_id - self.start_layer
+        return self.kv_buffer[idx]  # ✅ dynamic index into JAX array
 
     def get_kv_buffer(self, layer_id: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        layer_idx = layer_id - self.start_layer
-        fused_kv = self.kv_buffer[layer_idx]  # [cache_size, num_kv_heads * 2, head_dim]
-
-        # Extract K and V from head interleaving format [K1,V1,K2,V2,...]
-        k_buffer = fused_kv[:, ::2, :]  # Even indices: K heads (0, 2, 4, ...)
-        v_buffer = fused_kv[:, 1::2, :]  # Odd indices: V heads (1, 3, 5, ...)
-
+        idx = layer_id - self.start_layer
+        fused_kv = self.kv_buffer[idx]  # [N, H*2, D]
+        k_buffer = fused_kv[:, ::2, :]
+        v_buffer = fused_kv[:, 1::2, :]
         return k_buffer, v_buffer
 
     def set_kv_buffer(
         self,
         layer_id: int,
         loc: jax.Array,
-        k: jax.Array,  # [total_tokens, num_heads, head_dim]
-        v: jax.Array,  # [total_tokens, num_heads, head_dim]
+        k: jax.Array,
+        v: jax.Array,
         is_decode: bool = False,
     ) -> None:
-        """
-        Set KV cache data using fused KV cache format.
-
-        Args:
-            layer_id: Which layer to update
-            k: Key tensor [total_tokens, num_heads, head_dim]
-            v: Value tensor [total_tokens, num_heads, head_dim]
-            loc: Location indices [total_tokens], -1 for padding tokens
-            is_decode: Whether this is decode mode
-        """
-        layer_idx = layer_id - self.start_layer
-
+        idx = layer_id - self.start_layer
+        fused_kv = merge_kv(k, v)  # [T, H*2, D]
         page_size = 1 if is_decode else self.page_size
-
-        # Merge k and v into fused format
-        fused_kv = merge_kv(k, v)  # [total_tokens, num_heads * 2, head_dim]
-
-        # Update the fused KV cache
-        self.kv_buffer[layer_idx] = _set_fused_kv_buffer(
+        updated_layer = _set_fused_kv_buffer(
             fused_kv=fused_kv,
             loc=loc,
-            kv_cache=self.kv_buffer[layer_idx],
+            kv_cache=self.kv_buffer[idx],
             page_size=page_size,
             kv_partition_axis=self.kv_partition_axis,
         )
+        self.kv_buffer = self.kv_buffer.at[idx].set(updated_layer)
 
     def get_kv_data(
         self, layer_id: int, indices: jnp.ndarray
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        """Get KV data at specified positions"""
-        layer_idx = layer_id - self.start_layer
-        fused_kv_data = self.kv_buffer[layer_idx][indices]
-        k_data = fused_kv_data[:, ::2, :]  # Head interleaving: K at even indices
-        v_data = fused_kv_data[:, 1::2, :]  # Head interleaving: V at odd indices
+        idx = layer_id - self.start_layer
+        fused_kv_data = self.kv_buffer[idx][indices]
+        k_data = fused_kv_data[:, ::2, :]
+        v_data = fused_kv_data[:, 1::2, :]
         return k_data, v_data
 
     def get_cpu_copy(self, indices):
-        """Get CPU copy of fused KV cache for specified indices"""
+        # Extract all layers at once: [L, len(indices), H*2, D]
+        selected = self.kv_buffer[:, indices]  # shape: [L, ...]
         kv_cache_host = []
-        for layer_id in range(self.layer_num):
-            fused_kv_host = jax.device_get(self.kv_buffer[layer_id][indices])
-            # Extract k and v from fused format using head interleaving
-            k_host = fused_kv_host[:, ::2, :]  # Head interleaving: K at even indices
-            v_host = fused_kv_host[:, 1::2, :]  # Head interleaving: V at odd indices
+        for i in range(self.layer_num):
+            fused = jax.device_get(selected[i])
+            k_host = fused[:, ::2, :]
+            v_host = fused[:, 1::2, :]
             kv_cache_host.append([k_host, v_host])
         return kv_cache_host
 
     def load_cpu_copy(self, kv_cache_host, indices):
-        """Load host copy back to device"""
-        for layer_id in range(self.layer_num):
-            k_host, v_host = kv_cache_host[layer_id]
-            # Merge k and v into fused format
-            fused_kv_host = merge_kv(k_host, v_host)
-            fused_kv_device = jax.device_put(fused_kv_host, self.kv_sharding)
-            self.kv_buffer[layer_id] = (
-                self.kv_buffer[layer_id].at[indices].set(fused_kv_device)
-            )
+        # Reconstruct full stacked buffer for selected indices
+        reconstructed = []
+        for k_host, v_host in kv_cache_host:
+            fused = merge_kv(k_host, v_host)  # [len(indices), H*2, D]
+            reconstructed.append(fused)
+        stacked_host = jnp.stack(reconstructed)  # [L, len(indices), H*2, D]
+        stacked_device = jax.device_put(stacked_host, self.kv_sharding)
+        self.kv_buffer = self.kv_buffer.at[:, indices].set(stacked_device)
 
     def move_kv_cache(self, tgt_loc: jnp.ndarray, src_loc: jnp.ndarray):
-        """Move fused KV cache from source locations to target locations"""
-        for layer_id in range(self.layer_num):
-            # Get fused KV data from source locations
-            fused_kv_data = self.kv_buffer[layer_id][src_loc]
-            # Set data to target locations
-            self.kv_buffer[layer_id] = (
-                self.kv_buffer[layer_id].at[tgt_loc].set(fused_kv_data)
-            )
+        src_data = self.kv_buffer[:, src_loc]  # [L, len(src), ...]
+        self.kv_buffer = self.kv_buffer.at[:, tgt_loc].set(src_data)
 
     def clear_cache(self, indices: jnp.ndarray):
-        """Clear fused KV cache at specified indices"""
-        for layer_id in range(self.layer_num):
-            self.kv_buffer[layer_id] = self.kv_buffer[layer_id].at[indices].set(0)
+        zeros = jnp.zeros_like(self.kv_buffer[:, indices])
+        self.kv_buffer = self.kv_buffer.at[:, indices].set(zeros)
 
     def set_kv_buffer_legacy(
         self,
@@ -440,14 +409,9 @@ class MHATokenToKVPool(KVCache):
         cache_k: jnp.ndarray,
         cache_v: jnp.ndarray,
     ) -> None:
-        """
-        Legacy interface for backward compatibility.
-        This assumes contiguous cache locations and uses simple JAX operations.
-        """
-        layer_idx = layer_id - self.start_layer
-        # Merge k and v into fused format
+        idx = layer_id - self.start_layer
         fused_kv = merge_kv(cache_k, cache_v)
-        self.kv_buffer[layer_idx] = self.kv_buffer[layer_idx].at[loc].set(fused_kv)
+        self.kv_buffer = self.kv_buffer.at[idx, loc].set(fused_kv)
 
 
 def _set_fused_kv_buffer(
