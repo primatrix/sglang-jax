@@ -234,7 +234,6 @@ class MHATokenToKVPool(KVCache):
             "head_num": self.head_num,
             "head_dim": self.head_dim,
             "kv_partition_axis": self.kv_partition_axis,
-            "kv_sharding": self.kv_sharding,
         }
         return (children, aux_data)
 
@@ -260,7 +259,6 @@ class MHATokenToKVPool(KVCache):
         obj.head_num = aux_data["head_num"]
         obj.head_dim = aux_data["head_dim"]
         obj.kv_partition_axis = aux_data["kv_partition_axis"]
-        obj.kv_sharding = aux_data["kv_sharding"]
         obj.kv_buffer = kv_buffer
         return obj
 
