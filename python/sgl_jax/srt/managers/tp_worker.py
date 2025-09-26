@@ -212,6 +212,9 @@ class ModelWorker:
                     ForwardMode.EXTEND,
                     self.precompile_cache_loc_paddings[-1],
                 )
+                sampling_metadata = SamplingMetadata.from_model_worker_batch(
+                    model_worker_batch, 0, self.mesh
+                )
                 model_worker_batch.forward_batch = ForwardBatch.init_new(
                     model_worker_batch, self.model_runner
                 )
@@ -222,8 +225,39 @@ class ModelWorker:
                             future_token_ids_map,
                         )
                     )
-                self.forward_batch_generation(model_worker_batch, None, True)
 
+                # # forward
+                # forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+                # self.set_forward_metadata()
+                # logits_output, _ = self.model_runner.forward(
+                #     forward_batch,
+                #     logits_metadata=LogitsMetadata.from_model_worker_batch(
+                #         model_worker_batch, self.mesh
+                #     ),
+                # )
+
+                # """
+                #     sampling_seeds: jax.Array
+                #     is_all_greedy: bool = False
+                #     need_min_p_sampling: bool = False
+                # """
+
+                # sample_pairs = list(itertools.product([sampling_metadata.sampling_seeds, None], [True,False],[True,False])
+
+                # # sample
+                # next_token_ids_device = self.model_runner.sample(
+                #     logits_output,
+                #     sampling_metadata,
+                #     (
+                #         forward_batch.positions
+                #         if forward_batch.forward_mode.is_decode()
+                #         else forward_batch.seq_lens - 1
+                #     ),
+                # )
+
+                self.forward_batch_generation(
+                    model_worker_batch, None, False, sampling_metadata
+                )
         end_time = time.perf_counter()
         logger.info("[EXTEND] Precompile finished in %.0f secs", end_time - start_time)
 
@@ -265,6 +299,13 @@ class ModelWorker:
 
         end_time = time.perf_counter()
         logger.info("[DECODE] Precompile finished in %.0f secs", end_time - start_time)
+
+    def set_forward_metadata(self, model_worker_batch: ModelWorkerBatch):
+        self.model_runner.attn_backend.forward_metadata = (
+            self.worker.model_runner.attn_backend.get_forward_metadata(
+                model_worker_batch
+            )
+        )
 
     def get_max_padded_size(self):
         """Calculate the max padded batch size and token nums.
@@ -411,7 +452,13 @@ class ModelWorker:
 
             with jtu.count_pjit_cpp_cache_miss() as count:
                 next_token_ids_device = self.model_runner.sample(
-                    logits_output, sampling_metadata
+                    logits_output,
+                    sampling_metadata,
+                    (
+                        forward_batch.positions
+                        if forward_batch.forward_mode.is_decode()
+                        else forward_batch.seq_lens - 1
+                    ),
                 )
                 sample_cache_miss_count = count()
 
