@@ -246,7 +246,6 @@ def extend(reqs, model_runner):
         tree_cache=None,
         model_config=model_runner.model_config,
         enable_overlap=False,
-        # spec_algorithm=SpeculativeAlgorithm.NONE,
         enable_custom_logit_processor=False,
     )
     batch.prepare_for_extend()
@@ -279,7 +278,6 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
             tp_group=model_runner.tp_group,
             get_idle_batch=None,
             disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
             speculative_num_draft_tokens=None,
             require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
             disable_overlap_schedule=model_runner.server_args.disable_overlap_schedule,

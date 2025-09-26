@@ -40,11 +40,10 @@ from sgl_jax.srt.precision_tracer import (
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 from sgl_jax.srt.server_args import ServerArgs
-from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
-from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
+    from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -253,6 +252,10 @@ class Req:
         # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0
         self.already_computed = 0
+
+        # The number of verification forward passes in the speculative decoding.
+        # This is used to compute the average acceptance length per request.
+        self.spec_verify_ct = 0
 
         # For metrics
         self.has_log_time_stats: bool = False
@@ -504,6 +507,7 @@ class ScheduleBatch:
         tree_cache: BasePrefixCache,
         model_config: ModelConfig,
         enable_overlap: bool,
+        spec_algorithm: SpeculativeAlgorithm = None,
         enable_custom_logit_processor: bool = False,
         chunked_req: Optional[Req] = None,
         mesh: mesh_lib.Mesh = None,
@@ -521,6 +525,7 @@ class ScheduleBatch:
             has_stream=any(req.stream for req in reqs),
             chunked_req=chunked_req,
             mesh=mesh,
+            spec_algorithm=spec_algorithm,
             is_prefill_only=all(
                 req.sampling_params.max_new_tokens == 0 for req in reqs
             ),
@@ -919,6 +924,11 @@ class ScheduleBatch:
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
+        if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
+            # if spec decoding is used, the decode batch is prepared inside
+            # `forward_batch_speculative_generation` after running draft models.
+            return
+
         # Update fields
         self.input_ids = self.output_ids
 
@@ -1093,26 +1103,49 @@ class ScheduleBatch:
                 axis=0,
             )
 
+        # If enable spec inference, use positions in spec info firstly
+        if (
+            self.spec_info is not None
+            and getattr(self.spec_info, "positions", None) is not None
+        ):
+            positions_cpu = self.spec_info.positions
+            # padding
+            if self.forward_mode == ForwardMode.DRAFT_EXTEND:
+                padding_size = len(input_ids_cpu) - len(positions_cpu)
+                if padding_size:
+                    positions_cpu = np.concatenate(
+                        [
+                            positions_cpu,
+                            jnp.zeros(padding_size, dtype=positions_cpu.dtype),
+                        ]
+                    )
+        else:
+            positions_cpu = None
+
         # Calculate positions and extend_start_loc after padding
         if self.forward_mode.is_extend():
             # For prefill: create positions for each token in sequences
             # Calculate total tokens without padding first
-            total_tokens_before_padding = sum(
-                [extend_len for extend_len in self.extend_lens]
-            )
-            positions_cpu = np.concatenate(
-                [
-                    np.arange(prefix_len, seq_len, dtype=seq_lens_cpu.dtype)
-                    for seq_len, prefix_len in zip(seq_lens_cpu, self.prefix_lens)
-                ]
-            )
-
-            # If input_ids was padded, pad positions too
-            padding_size = len(input_ids_cpu) - total_tokens_before_padding
-            if padding_size:
-                positions_cpu = np.concatenate(
-                    [positions_cpu, np.zeros(padding_size, dtype=positions_cpu.dtype)]
+            if positions_cpu is None:
+                total_tokens_before_padding = sum(
+                    [extend_len for extend_len in self.extend_lens]
                 )
+                positions_cpu = np.concatenate(
+                    [
+                        np.arange(prefix_len, seq_len, dtype=seq_lens_cpu.dtype)
+                        for seq_len, prefix_len in zip(seq_lens_cpu, self.prefix_lens)
+                    ]
+                )
+
+                # If input_ids was padded, pad positions too
+                padding_size = len(input_ids_cpu) - total_tokens_before_padding
+                if padding_size:
+                    positions_cpu = np.concatenate(
+                        [
+                            positions_cpu,
+                            np.zeros(padding_size, dtype=positions_cpu.dtype),
+                        ]
+                    )
 
             # Start location of each sequence in the flattened array
             extend_start_loc = np.cumsum(
@@ -1120,16 +1153,19 @@ class ScheduleBatch:
                 dtype=seq_lens_cpu.dtype,
             )
         else:
-            # For decode: each sequence contributes one token at the next position (seq_len)
-            # Create positions for actual tokens (one per sequence at seq_len)
-            batch_positions = seq_lens_cpu - 1
-            # Create positions array matching the length of input_ids (including padding)
-            positions_cpu = np.zeros(len(input_ids_cpu), dtype=batch_positions.dtype)
-            # Fill in the actual positions for the real tokens
-            # positions = positions.at[: len(batch_positions)].set(batch_positions)
-            positions_cpu[: len(batch_positions)] = batch_positions
-            # The padding tokens (if any) will have position 0, which is fine for padding
-            # For decode, extend_start_loc is typically not used but we'll set it anyway
+            if positions_cpu is None:
+                # For decode: each sequence contributes one token at the next position (seq_len)
+                # Create positions for actual tokens (one per sequence at seq_len)
+                batch_positions = max(0, seq_lens_cpu - 1)
+                # Create positions array matching the length of input_ids (including padding)
+                positions_cpu = np.zeros(
+                    len(input_ids_cpu), dtype=batch_positions.dtype
+                )
+                # Fill in the actual positions for the real tokens
+                # positions = positions.at[: len(batch_positions)].set(batch_positions)
+                positions_cpu[: len(batch_positions)] = batch_positions
+                # The padding tokens (if any) will have position 0, which is fine for padding
+                # For decode, extend_start_loc is typically not used but we'll set it anyway
             extend_start_loc = np.arange(len(seq_lens_cpu), dtype=seq_lens_cpu.dtype)
 
         bs_padding_size = 0
@@ -1242,10 +1278,10 @@ class ScheduleBatch:
             extend_start_loc=extend_start_loc,
             cache_loc=cache_loc_cpu,
             extend_prefix_lens=(
-                extend_prefix_lens if self.forward_mode == ForwardMode.EXTEND else None
+                extend_prefix_lens if self.forward_mode.is_extend() else None
             ),
             extend_seq_lens=(
-                extend_seq_lens if self.forward_mode == ForwardMode.EXTEND else None
+                extend_seq_lens if self.forward_mode.is_extend() else None
             ),
             extend_logprob_start_lens=extend_logprob_start_lens,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
@@ -1272,7 +1308,7 @@ class ScheduleBatch:
             if precision_tracer.get_trace_active():
                 # for chunked prefill trace
                 if req.fill_ids:
-                    if self.forward_mode == ForwardMode.EXTEND:
+                    if self.forward_mode.is_extend():
                         input_ids_to_trace = req.fill_ids[len(req.prefix_indices) :]
                     else:
                         input_ids_to_trace = req.fill_ids
@@ -1285,7 +1321,7 @@ class ScheduleBatch:
                         req.rid, input_ids_to_trace, self.forward_mode
                     ),
                 )
-                if self.forward_mode == ForwardMode.EXTEND:
+                if self.forward_mode.is_extend():
                     precision_tracer.add_request_counter()
                     logger.info(
                         f"Starting trace for request {precision_tracer.get_request_counter()}: {req.rid}"
@@ -1384,6 +1420,7 @@ class ModelWorkerBatch:
 
     spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None
     spec_algorithm: SpeculativeAlgorithm = None
+    # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
 
 

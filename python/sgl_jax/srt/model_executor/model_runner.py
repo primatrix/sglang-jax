@@ -236,6 +236,13 @@ class ModelRunner:
 
         return max_tokens
 
+    @property
+    def is_hybrid_gdn(self):
+        return self.model_config.hf_config.architectures[0] in [
+            "Qwen3NextForCausalLM",
+            "Qwen3NextForCausalLMMTP",
+        ]
+
     def init_memory_pool(
         self,
         max_num_reqs: Optional[int] = None,
