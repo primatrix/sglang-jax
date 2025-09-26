@@ -386,11 +386,15 @@ class QWen3Model(nnx.Module):
         for layer in self.layers:
             _, layer_state = nnx.split(layer)
             layer_state_leaves, _ = jax.tree_util.tree_flatten(layer_state)
+            # 深拷贝权重数据，确保独立于原始layer
+            layer_state_leaves_copy = jax.tree.map(
+                lambda x: jnp.array(x), layer_state_leaves
+            )
             layer_jitted = partial(
                 jitted_sample_layer,
                 sample_layer_def,
                 sample_layer_state_def,
-                layer_state_leaves,
+                layer_state_leaves_copy,
             )
             self.jitted_layers.append(layer_jitted)
 
