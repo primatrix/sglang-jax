@@ -141,11 +141,9 @@ class Qwen3MLP(nnx.Module):
         self,
         hidden_size: int,
         intermediate_size: int,
-        layer_id: int = 0,
         rngs: nnx.Rngs = None,
         dtype: jnp.dtype = jnp.bfloat16,
     ) -> None:
-        self.layer_id = layer_id
 
         self.gate_proj = LinearBase(
             input_size=hidden_size,
@@ -213,7 +211,6 @@ class QWen3DecoderLayer(nnx.Module):
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
-            layer_id=layer_id,
             dtype=dtype,
             rngs=rngs,
         )
