@@ -347,7 +347,7 @@ class EagleDraftInput:
             verified_id=jnp.empty((0,), dtype=jnp.int32),
             hidden_states=jnp.empty((0, hidden_size), dtype=dtype),
             topk_p=jnp.empty((0, topk), dtype=jnp.float32),
-            topk_index=jnp.empty((0, topk), dtype=jnp.int64),
+            topk_index=jnp.empty((0, topk), dtype=jnp.int32),
             capture_hidden_mode=capture_hidden_mode,
             accept_length=jnp.empty((0,), dtype=jnp.int32),
             accept_length_cpu=[],
@@ -817,7 +817,7 @@ class EagleVerifyInput:
             accept_length_cpu = accept_length.tolist()
             if len(unfinished_accept_index) > 0:
                 unfinished_accept_index = jnp.concatenate(unfinished_accept_index)
-                unfinished_index_device = jnp.array(unfinished_index, dtype=jnp.int64)
+                unfinished_index_device = jnp.array(unfinished_index, dtype=jnp.int32)
                 draft_input_accept_length_cpu = [
                     accept_length_cpu[i] for i in unfinished_index
                 ]
@@ -826,7 +826,7 @@ class EagleVerifyInput:
                 else:
                     batch.out_cache_loc = jnp.empty(
                         len(unfinished_index) + sum(draft_input_accept_length_cpu),
-                        dtype=jnp.int64,
+                        dtype=jnp.int32,
                     )
                     accept_length_filter = create_accept_length_filter(
                         accept_length,
@@ -903,16 +903,16 @@ def _generate_simulated_accept_index(
             weight_upper = simulate_acc_len_float - lower
             weight_lower = 1.0 - weight_upper
             # here, data is on cpu
-            probs = numpy.array([weight_lower, weight_upper])
-            sampled_index = jax.random.multinomial(rng, probs, shape=(1,))
+            probs = jnp.array([weight_lower, weight_upper])
+            sampled_index = jax.random.categorical(rng, jnp.log(probs))
             simulate_acc_len = lower if sampled_index == 0 else upper
     else:
         raise ValueError(f"Invalid simulate_acc_method: {SIMULATE_ACC_METHOD}")
 
     accept_indx_first_col = accept_index[:, 0].reshape(-1, 1)
     sim_accept_index = jnp.full((bs, spec_steps + 1), -1, dtype=jnp.int32)
-    sim_accept_index[:, :simulate_acc_len] = accept_indx_first_col + jnp.arange(
-        simulate_acc_len
+    sim_accept_index = sim_accept_index.at[:, :simulate_acc_len].set(
+        accept_indx_first_col + jnp.arange(simulate_acc_len)
     )
     accept_length = accept_length.at[:].set(simulate_acc_len - 1)
     predict = predict.at[:].set(100)  # some legit token id
