@@ -64,7 +64,7 @@ class FlashAttentionMetadata:
 
 @register_pytree_node_class
 @dataclass
-class FlashAttention(AttentionBackend):
+class FlashAttentionBackend(AttentionBackend):
     """Native Attention layer for variable-length sequences using ForwardBatch."""
 
     def __init__(
@@ -97,7 +97,7 @@ class FlashAttention(AttentionBackend):
         selected_cache_locs = batch.cache_loc[indices]
         page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
 
-        if batch.forward_mode == ForwardMode.EXTEND:
+        if batch.forward_mode.is_extend():
             cu_q_lens = np.concatenate(
                 [
                     np.array([0], dtype=np.int32),
@@ -134,7 +134,7 @@ class FlashAttention(AttentionBackend):
         if batch.forward_mode == ForwardMode.DECODE:
             # All sequences are decode/mixed mode
             distribution = np.array([0, 0, num_seqs.item()], dtype=np.int32)
-        elif batch.forward_mode == ForwardMode.EXTEND:
+        elif batch.forward_mode.is_extend():
             # All sequences are prefill mode
             distribution = np.array(
                 [0, num_seqs.item(), num_seqs.item()], dtype=np.int32
