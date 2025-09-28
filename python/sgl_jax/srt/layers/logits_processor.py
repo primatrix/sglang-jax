@@ -297,11 +297,11 @@ class LogitsProcessor(nnx.Module):
             sample_indices = device_array(
                 np.array(
                     sample_indices,
-                    dtype=jnp.int64,
+                    dtype=np.int64,
                 ),
             )
             input_logprob_indices = device_array(
-                np.array(input_logprob_indices, dtype=jnp.int64),
+                np.array(input_logprob_indices, dtype=np.int64),
             )
 
         # Compute logits for both input and sampled tokens.
