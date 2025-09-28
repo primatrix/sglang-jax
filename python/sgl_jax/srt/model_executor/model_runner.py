@@ -349,18 +349,16 @@ class ModelRunner:
         import jax._src.test_util as jtu
 
         with jtu.count_pjit_cpp_cache_miss() as count:
-            output, _ = self.model(forward_batch, logits_metadata)
+            output, layers_kv_fused, _ = self.model(forward_batch, logits_metadata)
             cache_miss_count = count()
-        # self._set_kv_cache_after_forward(layers_kv_fused, forward_batch)
+        self._set_kv_cache_after_forward(layers_kv_fused, forward_batch)
 
         return output, cache_miss_count
 
     def _set_kv_cache_after_forward(self, layers_kv_fused, forward_batch: ForwardBatch):
         start_idx = forward_batch.token_to_kv_pool.start_layer
-        end_idx = start_idx + layers_kv_fused.shape[0]
-        forward_batch.token_to_kv_pool.kv_buffer.at[start_idx:end_idx].set(
-            updated_slices
-        )
+        end_idx = start_idx + len(layers_kv_fused)
+        forward_batch.token_to_kv_pool.kv_buffer[start_idx:end_idx] = layers_kv_fused
 
     def forward_idle(
         self,
