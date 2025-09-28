@@ -513,9 +513,9 @@ class EAGLEWorker(ModelWorker):
         )
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
-        out_cache_loc = out_cache_loc.reshape(
-            schedule_batch.batch_size(), self.topk, self.speculative_num_steps
-        )
+        out_cache_loc = out_cache_loc[
+            : (schedule_batch.batch_size() * self.topk * self.speculative_num_steps)
+        ].reshape(schedule_batch.batch_size(), self.topk, self.speculative_num_steps)
         out_cache_loc = jnp.transpose(out_cache_loc, (2, 0, 1)).reshape(
             self.speculative_num_steps, -1
         )
