@@ -24,6 +24,8 @@ from typing import TYPE_CHECKING, List, Optional, Union
 
 import jax
 
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
 logger = logging.getLogger(__name__)
 
 from jax.sharding import NamedSharding, PartitionSpec
@@ -35,6 +37,7 @@ if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.mem_cache.memory_pool import KVCache
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
+    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
 
 from jax.tree_util import register_pytree_node_class
 
@@ -170,7 +173,7 @@ class ForwardBatch:
     trace_request_ids: Optional[List[str]] = None
     trace_request_objects: Optional[List] = None
 
-    spec_info: Optional[Union["EagleVerifyInput", "EagleDraftInput"]] = None
+    spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
 
@@ -187,12 +190,12 @@ class ForwardBatch:
             self.cache_loc,
             self.extend_prefix_lens,
             self.extend_seq_lens,
+            self.spec_info,
         )
 
         aux_data = {
             "forward_mode": self.forward_mode,
             "batch_size": self.batch_size,
-            "spec_info": self.spec_info,
             "spec_algorithm": self.spec_algorithm,
             "capture_hidden_mode": self.capture_hidden_mode,
         }
@@ -204,7 +207,6 @@ class ForwardBatch:
 
         obj.forward_mode = aux_data["forward_mode"]
         obj.batch_size = aux_data["batch_size"]
-        obj.spec_info = aux_data["spec_info"]
         obj.spec_algorithm = aux_data["spec_algorithm"]
         obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
         obj.trace_request_ids = None
@@ -221,6 +223,7 @@ class ForwardBatch:
         obj.cache_loc = children[8]
         obj.extend_prefix_lens = children[9]
         obj.extend_seq_lens = children[10]
+        obj.spec_info = children[11]
 
         return obj
 

@@ -433,7 +433,7 @@ class Scheduler(
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states
-                self.check_memory()
+                # self.check_memory()
                 self.check_tree_cache()
                 self.new_token_ratio = self.init_new_token_ratio
 
@@ -833,9 +833,10 @@ class Scheduler(
             self.tree_cache,
             self.model_config,
             self.enable_overlap,
-            False,
-            self.chunked_req,
-            self.mesh,
+            spec_algorithm=self.spec_algorithm,
+            enable_custom_logit_processor=False,
+            chunked_req=self.chunked_req,
+            mesh=self.mesh,
         )
 
         new_batch.prepare_for_extend()
@@ -942,7 +943,7 @@ class Scheduler(
                 )
             )
         else:
-            logits_output, next_token_ids, cache_miss_count, accept_length = (
+            logits_output, next_token_ids, accept_length, cache_miss_count = (
                 self.draft_worker.forward_batch_speculative_generation(
                     batch, model_worker_batch, sampling_metadata
                 )
@@ -1010,6 +1011,7 @@ class Scheduler(
             self.enable_overlap,
             self.server_args.enable_custom_logit_processor,
             self.mesh,
+            spec_algorithm=self.spec_algorithm,
         )
         idle_batch.prepare_for_idle()
         return idle_batch
