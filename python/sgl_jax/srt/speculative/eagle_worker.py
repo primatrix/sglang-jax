@@ -537,7 +537,7 @@ class EAGLEWorker(ModelWorker):
                 break
             model_worker_batch.input_ids = input_ids
             model_worker_batch.out_cache_loc = out_cache_loc[i]
-            model_worker_batch.positions = model_worker_batch.positions + 1
+            model_worker_batch.positions = jnp.array(model_worker_batch.positions) + 1
             self.draft_model_runner.attn_backend.forward_metadata = (
                 self.draft_model_runner.attn_backend.get_forward_metadata(
                     model_worker_batch
