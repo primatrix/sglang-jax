@@ -398,10 +398,6 @@ class QWen3Model(nnx.Module):
         residual = None
         hidden_states = self.jitted_embed_tokens(forward_batch.input_ids)
 
-        # 调试：检查输入是否正确变化
-        jax.debug.print("input_ids: {input_ids}", input_ids=forward_batch.input_ids[:5])
-        jax.debug.print("positions: {positions}", positions=forward_batch.positions[:5])
-
         layers_callback_flag = []
         for layer_jitted_fn, layer_id in self.jitted_layers:
             hidden_states, residual, kv_fused, callback_flag = layer_jitted_fn(
@@ -413,20 +409,9 @@ class QWen3Model(nnx.Module):
             )
             buffer_idx = layer_id - forward_batch.token_to_kv_pool.start_layer
 
-            old_cache_sum = jnp.sum(
-                forward_batch.token_to_kv_pool.kv_buffer[buffer_idx]
-            )
-            jax.debug.print(
-                "layer {layer_id}: old_cache_sum={old_sum}, kv_fused_sum={new_sum}",
-                layer_id=layer_id,
-                old_sum=old_cache_sum,
-                new_sum=jnp.sum(kv_fused),
-            )
-
             forward_batch.token_to_kv_pool.kv_buffer = (
                 forward_batch.token_to_kv_pool.kv_buffer.at[buffer_idx].set(kv_fused)
             )
-            # layers_kv_fused.append(kv_fused)
             layers_callback_flag.extend(callback_flag)
 
         if residual is not None:

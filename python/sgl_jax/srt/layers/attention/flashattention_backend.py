@@ -201,7 +201,6 @@ class FlashAttention(AttentionBackend):
         Returns:
             Output tensor of shape [total_tokens, hidden_size]
         """
-        jax.debug.print("flash attn layer_id: {layer_id}", layer_id=layer.layer_id)
         kv_cache_fused = self._get_fused_kv_cache(forward_batch, layer.layer_id)
 
         if layer.scaling is None:
