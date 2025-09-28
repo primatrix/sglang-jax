@@ -525,6 +525,8 @@ class EAGLEWorker(ModelWorker):
         parents_list: List[jax.Array] = []
         # Forward multiple steps
         scores = None
+        # Save original positions to avoid buffer donation issues
+        original_positions = jnp.array(model_worker_batch.positions)
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
@@ -537,7 +539,7 @@ class EAGLEWorker(ModelWorker):
                 break
             model_worker_batch.input_ids = input_ids
             model_worker_batch.out_cache_loc = out_cache_loc[i]
-            model_worker_batch.positions = model_worker_batch.positions + 1
+            model_worker_batch.positions = original_positions + 1 + i
             self.draft_model_runner.attn_backend.forward_metadata = (
                 self.draft_model_runner.attn_backend.get_forward_metadata(
                     model_worker_batch
