@@ -167,18 +167,12 @@ def top_k_top_p_min_p_sampling_from_probs_jax(
     )
 
     multinomial_operands = (probs_sort, sampling_seeds, positions, rng)
-    # jax.debug.print(f"{sampling_seeds=}")
     sampled_index = lax.cond(
         sampling_seeds is not None,
         multinomial_with_seed,
         multinomial,
         multinomial_operands,
     )
-
-    # if sampling_seed is not None:
-    #     sampled_index = multinomial_with_seed(probs_sort, sampling_seed, positions)
-    # else:
-    #     sampled_index = random.categorical(rng, jnp.log(probs_sort)).reshape(-1, 1)
 
     return _sample_part_b(probs_idx, sampled_index)
 
@@ -206,7 +200,7 @@ def multinomial_with_seed(
         inputs: A float array of shape (n, m) representing n categorical
                 distributions with m categories each. The values are treated
                 as weights and do not need to sum to 1.
-        seed:   An integer arrayr of shape (n,) containing the random seed
+        seed:   An integer array of shape (n,) containing the random seed
                 for each corresponding row in `inputs`.
         positions: The positions of the tokens in the sequence.
 
@@ -222,8 +216,6 @@ def multinomial_with_seed(
     step_seed = seed * 19349663 ^ positions * 73856093
     seed_expanded = step_seed[:, None]
     col_indices = jnp.arange(m)[None, :]
-    # hashed = (seed_expanded * jnp.uint64(8589934591)) ^ (col_indices * jnp.uint64(479001599))
-    # hashed = (seed_expanded * 73856093) ^ (col_indices * 19349663)
     hashed = seed_expanded * 805306457 ^ col_indices * 479001599
     uniform_samples = (hashed % (2**24)).astype(jnp.float32) / (2**24)
     epsilon = 1e-9

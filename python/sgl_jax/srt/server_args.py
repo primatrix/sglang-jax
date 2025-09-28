@@ -188,9 +188,6 @@ class ServerArgs:
         os.environ["SGLANG_ENABLE_DETERMINISTIC_SAMPLING"] = (
             "1" if self.enable_deterministic_sampling else "0"
         )
-        from sgl_jax.srt.utils import get_bool_env_var
-
-        print(f"[post_init] {get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_SAMPLING")}")
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):

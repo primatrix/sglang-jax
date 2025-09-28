@@ -26,7 +26,7 @@ class TestMultinomialWithSeed(unittest.TestCase):
             dtype=jnp.bfloat16,
         )
 
-        flatter_distrition_processed = jax.nn.softmax(flatter_distribution, axis=-1)
+        flatter_distribution_processed = jax.nn.softmax(flatter_distribution, axis=-1)
 
         shaper_distribution = jnp.array(
             [
@@ -44,7 +44,7 @@ class TestMultinomialWithSeed(unittest.TestCase):
         positions = jnp.array([0, 1, 2, 3])
 
         test_cases = [
-            ("flatter_distribution", flatter_distrition_processed),
+            ("flatter_distribution", flatter_distribution_processed),
             ("shaper_distribution", shaper_distribution_processed),
         ]
 

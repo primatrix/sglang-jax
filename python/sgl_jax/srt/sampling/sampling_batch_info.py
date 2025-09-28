@@ -60,8 +60,6 @@ class SamplingMetadata:
             "return_logprob": self.return_logprob,
             "top_logprobs_nums": self.top_logprobs_nums,
             "token_ids_logprobs": self.token_ids_logprobs,
-            # "is_all_greedy": self.is_all_greedy,
-            # "need_min_p_sampling": self.need_min_p_sampling,
         }
         return (children, aux_data)
 
@@ -80,8 +78,6 @@ class SamplingMetadata:
         obj.return_logprob = aux_data["return_logprob"]
         obj.top_logprobs_nums = aux_data["top_logprobs_nums"]
         obj.token_ids_logprobs = aux_data["token_ids_logprobs"]
-        # obj.is_all_greedy = aux_data["is_all_greedy"]
-        # obj.need_min_p_sampling = aux_data["need_min_p_sampling"]
 
         return obj
 
