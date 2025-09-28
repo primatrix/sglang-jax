@@ -95,7 +95,7 @@ class SamplingMetadata:
             [
                 batch.sampling_info.temperatures,
                 np.array(
-                    [0.6] * pad_size, dtype=batch.sampling_info.temperatures.dtype
+                    [1.0] * pad_size, dtype=batch.sampling_info.temperatures.dtype
                 ),
             ]
         ).reshape(-1, 1)
@@ -108,15 +108,13 @@ class SamplingMetadata:
         padded_top_ks = np.concat(
             [
                 batch.sampling_info.top_ks,
-                np.array(
-                    [TOP_K_ALL] * pad_size, dtype=batch.sampling_info.top_ks.dtype
-                ),
+                np.array([1] * pad_size, dtype=batch.sampling_info.top_ks.dtype),
             ]
         )
         padded_min_ps = np.concat(
             [
                 batch.sampling_info.min_ps,
-                np.array([1.0] * pad_size, dtype=batch.sampling_info.min_ps.dtype),
+                np.array([0.0] * pad_size, dtype=batch.sampling_info.min_ps.dtype),
             ]
         )
         if batch.sampling_info.sampling_seeds is not None:
@@ -194,9 +192,9 @@ class SamplingBatchInfo:
     @classmethod
     def generate_for_precompile(cls, bs: int):
         temperatures = np.array([0.6 for _ in range(bs)], dtype=np.float32)
-        top_ps = np.array([1.0 for _ in range(bs)], dtype=np.float32)
-        top_ks = np.array([TOP_K_ALL for _ in range(bs)], dtype=np.int32)
-        min_ps = np.array([1.0 for _ in range(bs)], dtype=np.float32)
+        top_ps = np.array([0.9 for _ in range(bs)], dtype=np.float32)
+        top_ks = np.array([30 for _ in range(bs)], dtype=np.int32)
+        min_ps = np.array([0.6 for _ in range(bs)], dtype=np.float32)
         if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_SAMPLING"):
             sampling_seeds = np.array(
                 [DEFAULT_SAMPLING_SEED for _ in range(bs)], dtype=np.int32
