@@ -247,7 +247,7 @@ class QWenModel(nnx.Module):
             param_dtype=dtype,
         )
 
-        self.h = [
+        self.h = nnx.List([
             QWenBlock(
                 config,
                 layer_id=i,
@@ -255,7 +255,7 @@ class QWenModel(nnx.Module):
                 rngs=rngs,
             )
             for i in range(config.num_hidden_layers)
-        ]
+        ])
 
         self.ln_f = nnx.RMSNorm(
             config.hidden_size,

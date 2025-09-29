@@ -259,7 +259,7 @@ class Qwen2Model(nnx.Module):
             param_dtype=dtype,
         )
 
-        self.layers = [
+        self.layers = nnx.List([
             Qwen2DecoderLayer(
                 config=config,
                 layer_id=i,
@@ -267,7 +267,7 @@ class Qwen2Model(nnx.Module):
                 rngs=rngs,
             )
             for i in range(config.num_hidden_layers)
-        ]
+        ])
 
         self.norm = nnx.RMSNorm(
             config.hidden_size,
