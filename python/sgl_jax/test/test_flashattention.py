@@ -94,9 +94,7 @@ def create_custom_mask(lens):
         prefix_mask = jnp.full((prefix_len), True, dtype=jnp.bool)
         random_q_mask = jax.random.uniform(jax.random.PRNGKey(42), (q_lens[bid]))
         random_q_mask = random_q_mask < 0.5
-        custom_masks = custom_masks.append(
-            jnp.concatenate([prefix_mask, random_q_mask])
-        )
+        custom_masks.append(jnp.concatenate([prefix_mask, random_q_mask]))
 
     return jnp.concatenate(custom_masks)
 
@@ -253,7 +251,19 @@ def create_test_data(
         forward_mode = ForwardMode.TARGET_VERIFY
         custom_mask = create_custom_mask(lens)
         spec_info = EagleVerifyInput(
+            draft_token=None,
             custom_mask=custom_mask,
+            positions=None,
+            retrive_index=None,
+            retrive_next_token=None,
+            retrive_next_sibling=None,
+            retrive_cum_len=None,
+            seq_lens_cpu=None,
+            spec_steps=None,
+            topk=None,
+            draft_token_num=None,
+            seq_lens_sum=None,
+            capture_hidden_mode=None,
         )
     else:
         forward_mode = ForwardMode.EXTEND if mode == "prefill" else ForwardMode.DECODE
@@ -648,12 +658,14 @@ class TestAttention(CustomTestCase):
             (2, 22),
             (42, 42),
         ]
-        self.run_test(
-            "prefill",
-            lens,
-            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
-            False,
-        )
+        page_size = [1, 64]
+        causal_mask = False
+        for size in page_size:
+            self.run_test(
+                "prefill",
+                lens,
+                (num_heads, head_dim, num_kv_heads, size, jnp.bfloat16, causal_mask),
+            )
 
     def test_mha_decode_with_custom_mask(self):
         pass

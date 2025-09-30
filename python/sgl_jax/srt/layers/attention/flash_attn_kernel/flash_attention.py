@@ -249,6 +249,7 @@ def _ragged_paged_attention_kernel(
     page_indices_ref,  # [(padded_batch_size * model_context_len + page_size - 1) // page_size]
     cu_q_lens_ref,  # [padded_batch_size + 1]
     cu_kv_lens_ref,  # [padded_batch_size + 1]
+    cu_seq_mask_lens,
     distribution_ref,  # [3] (decode_end, prefill_end, mixed_end)
     sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
     bo_ids_ref,  # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
@@ -317,13 +318,6 @@ def _ragged_paged_attention_kernel(
     decode_end = distribution_ref[0]
     prefill_end = distribution_ref[1]
     mixed_end = distribution_ref[2]
-
-    kv_lens = cu_kv_lens_ref[1:] - cu_kv_lens_ref[:-1]
-    q_lens = cu_q_lens_ref[1:] - cu_q_lens_ref[:-1]
-    seq_mask_lens = kv_lens * q_lens
-    cu_seq_mask_lens = jnp.concatenate(
-        [jnp.array([0], dtype=jnp.int32), jnp.cumsum(seq_mask_lens)]
-    )
 
     q_start = cu_q_lens_ref[seq_idx]
     q_end = cu_q_lens_ref[seq_idx + 1]
@@ -1337,6 +1331,16 @@ def ragged_paged_attention(
             )
             * 2.4
         )
+
+    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+    seq_mask_lens = kv_lens * q_lens
+    cu_seq_mask_lens = jnp.concatenate(
+        [jnp.array([0], dtype=jnp.int32), jnp.cumsum(seq_mask_lens)]
+    )
+    if custom_mask is None:
+        # fix bug: XLA layout ({0}) does not match Mosaic layout ({0:T(128)}) for an operand of shape s32[0]
+        custom_mask = jnp.empty((1, 128))
+
     grid = (distribution[2],)
 
     in_specs = [
@@ -1397,6 +1401,7 @@ def ragged_paged_attention(
         page_indices,
         cu_q_lens,
         cu_kv_lens,
+        cu_seq_mask_lens,
         distribution,
         # (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
         jnp.zeros((3,), jnp.int32),
@@ -1443,8 +1448,8 @@ def ragged_paged_attention(
                 ),
             ],
             input_output_aliases={
-                8: 0,  # q input -> q output
-                10: 1,  # kv_cache_fused input -> updated kv_cache_fused output
+                9: 0,  # q input -> q output
+                11: 1,  # kv_cache_fused input -> updated kv_cache_fused output
             },
             name=scope_name,
         )

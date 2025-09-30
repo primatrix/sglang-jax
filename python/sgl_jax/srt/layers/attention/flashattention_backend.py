@@ -103,7 +103,7 @@ class FlashAttentionBackend(AttentionBackend):
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
             metadata.custom_mask = batch.spec_info.custom_mask
         else:
-            metadata.custom_mask = jnp.array([], dtype=jnp.bool)
+            metadata.custom_mask = None
 
         if batch.forward_mode.is_extend():
             cu_q_lens = np.concatenate(
