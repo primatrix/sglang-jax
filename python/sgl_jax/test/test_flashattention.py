@@ -247,6 +247,7 @@ def create_test_data(
     attention_backend = FlashAttentionBackend(
         num_heads, num_kv_heads, head_dim, page_size=page_size, mesh=mesh
     )
+    print(f"!!!!!!!! {causal=}")
     if not causal:
         forward_mode = ForwardMode.TARGET_VERIFY
         custom_mask = create_custom_mask(lens)
@@ -307,8 +308,10 @@ def create_test_data(
         cache_loc=cache_loc,
         extend_prefix_lens=extend_prefix_lens,
         extend_seq_lens=extend_seq_lens,
+        spec_info=spec_info,
     )
     fb.attn_backend.forward_metadata = attention_backend.get_forward_metadata(mwb)
+
     return fb, q, k, v
 
 

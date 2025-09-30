@@ -115,7 +115,7 @@ def ref_ragged_paged_attention(
         if custom_mask != None:
             raise ValueError(f"use causal mask, custom_mask is not None")
     else:
-        if custom_mask == None or custom_mask.size() < jnp.cumsum(kv_lens)[-1]:
+        if custom_mask == None or custom_mask.size < jnp.cumsum(kv_lens)[-1]:
             raise ValueError(
                 f"use custom_mask, custom_mask length must larger than total kv length"
             )
