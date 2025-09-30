@@ -247,7 +247,7 @@ def create_test_data(
     attention_backend = FlashAttentionBackend(
         num_heads, num_kv_heads, head_dim, page_size=page_size, mesh=mesh
     )
-    print(f"!!!!!!!! {causal=}")
+
     if not causal:
         forward_mode = ForwardMode.TARGET_VERIFY
         custom_mask = create_custom_mask(lens)

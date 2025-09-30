@@ -258,7 +258,7 @@ def _ragged_paged_attention_kernel(
     q_hbm_ref,  # [actual_num_kv_heads, padded_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     kv_hbm_ref,  # [padded_num_tokens, num_kv_heads_x2 // kv_packing, kv_packing, head_dim] - Fused KV with interleaved [K1,V1,K2,V2,...]
     kv_cache_fused_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_interleaved // kv_packing, kv_packing, head_dim]
-    custom_mask_ref,  # (flatten_total_kv_len,)
+    custom_mask_ref,  # (flatten_total_kv_len,), int8, dma not support bool type
     # Output
     o_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     updated_kv_cache_fused_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_interleaved // kv_packing, kv_packing, head_dim]
@@ -799,9 +799,10 @@ def _ragged_paged_attention_kernel(
                     k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(
                         jnp.int32, s.shape, 2
                     )
+                    # convert custom_mask from int8 to bool
                     mask = lax.select(
                         causal == 0,
-                        custom_mask,
+                        custom_mask.astype(jnp.bool),
                         q_span < k_span,
                     )
                     if sliding_window is not None:
@@ -1340,7 +1341,11 @@ def ragged_paged_attention(
     )
     if custom_mask is None:
         # fix bug: XLA layout ({0}) does not match Mosaic layout ({0:T(128)}) for an operand of shape s32[0]
-        custom_mask = jnp.empty((1, 128))
+        custom_mask = jnp.empty((1, 128), dtype=jnp.int8)
+    else:
+        assert (
+            custom_mask.dtype != jnp.bool
+        ), f"custom_mask bool dtype is not supported, use int32 instead. 0: False, 1: True"
 
     grid = (distribution[2],)
 
