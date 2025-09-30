@@ -333,6 +333,7 @@ def _ragged_paged_attention_kernel(
 
     def _fetch_mask(seq_idx, bq_idx, bkvmask_idx, bkvmask_sem_idx, *, wait=False):
         sem = sems.at[4, bkvmask_sem_idx]
+        assert sem.dtype == sems.dtype, f"######## {sem.dtype=} {sems.dtype=}"
         kvmask_fused_vmem_ref = bkvmask_ref.at[bkvmask_sem_idx]
 
         kv_len = kv_lens_ref[seq_idx]
