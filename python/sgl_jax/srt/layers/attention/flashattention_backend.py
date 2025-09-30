@@ -34,6 +34,7 @@ class FlashAttentionMetadata:
     page_indices: jax.Array = None
     seq_lens: jax.Array = None
     distribution: jax.Array = None
+    custom_mask: jax.Array = None
 
     def tree_flatten(self):
         children = (
@@ -43,6 +44,7 @@ class FlashAttentionMetadata:
             self.page_indices,
             self.seq_lens,
             self.distribution,
+            self.custom_mask,
         )
 
         aux_data = {}
@@ -58,6 +60,7 @@ class FlashAttentionMetadata:
         obj.page_indices = children[3]
         obj.seq_lens = children[4]
         obj.distribution = children[5]
+        obj.custom_mask = children[6]
 
         return obj
 
@@ -96,6 +99,11 @@ class FlashAttentionBackend(AttentionBackend):
         indices = np.arange(0, len(batch.cache_loc), self.page_size)
         selected_cache_locs = batch.cache_loc[indices]
         page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
+
+        if batch.forward_mode == ForwardMode.TARGET_VERIFY:
+            metadata.custom_mask = batch.spec_info.custom_mask
+        else:
+            metadata.custom_mask = None
 
         if batch.forward_mode.is_extend():
             cu_q_lens = np.concatenate(
@@ -215,6 +223,11 @@ class FlashAttentionBackend(AttentionBackend):
             num_pages, self.page_size, -1, self.head_dim
         )
 
+        causal = 1
+        custom_mask = self.forward_metadata.custom_mask
+        if forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:
+            causal = 0
+
         in_specs = (
             P(None, self.kv_partition_axis),  # queries
             P(None, self.kv_partition_axis),  # keys (new tokens)
@@ -227,6 +240,7 @@ class FlashAttentionBackend(AttentionBackend):
             P(),  # cu_q_lens
             P(),  # cu_kv_lens
             P(),  # distribution
+            P(),  # custom_mask
         )
         out_specs = (
             P(None, self.kv_partition_axis),  # attention output
@@ -246,6 +260,7 @@ class FlashAttentionBackend(AttentionBackend):
                 values,
                 kv_cache_fused,
                 *other_args,
+                causal=causal,
                 sm_scale=scale,
                 sliding_window=None,
                 soft_cap=None,
@@ -272,6 +287,7 @@ class FlashAttentionBackend(AttentionBackend):
             self.forward_metadata.cu_q_lens,
             self.forward_metadata.cu_kv_lens,
             self.forward_metadata.distribution,
+            self.forward_metadata.custom_mask,
         )
 
         return (

@@ -14,6 +14,8 @@ from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.model_executor.model_runner import ModelRunner
+from sgl_jax.srt.speculative.eagle_util import EagleVerifyInput
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.test.test_utils import CustomTestCase
 
@@ -84,6 +86,19 @@ def create_qkv_cache(
     return q, k, v
 
 
+def create_custom_mask(lens):
+    q_lens = [q_len for q_len, _ in lens]
+    custom_masks = []
+    for bid, seq_len in enumerate([kv_len for _, kv_len in lens]):
+        prefix_len = seq_len - q_lens[bid]
+        prefix_mask = jnp.full((prefix_len), True, dtype=jnp.bool)
+        random_q_mask = jax.random.uniform(jax.random.PRNGKey(42), (q_lens[bid]))
+        random_q_mask = random_q_mask < 0.5
+        custom_masks.append(jnp.concatenate([prefix_mask, random_q_mask]))
+
+    return jnp.concatenate(custom_masks)
+
+
 def write_prefix_tokens_for_kv(forward_batch, lens, k, v):
     page_size = forward_batch.attn_backend.page_size
     # Use aligned positions for k/v indexing since k/v arrays are created with alignment gaps
@@ -128,6 +143,7 @@ def create_test_data(
     head_dim,
     num_kv_heads,
     page_size,
+    causal=True,
     input_ids=None,
     model_config=None,
     max_total_token_size=710016,
@@ -229,9 +245,30 @@ def create_test_data(
 
     # init attention backend
     attention_backend = FlashAttentionBackend(
-        num_heads, num_kv_heads, head_dim, page_size=page_size
+        num_heads, num_kv_heads, head_dim, page_size=page_size, mesh=mesh
     )
-    forward_mode = ForwardMode.EXTEND if mode == "prefill" else ForwardMode.DECODE
+
+    if not causal:
+        forward_mode = ForwardMode.TARGET_VERIFY
+        custom_mask = create_custom_mask(lens)
+        spec_info = EagleVerifyInput(
+            draft_token=None,
+            custom_mask=custom_mask,
+            positions=None,
+            retrive_index=None,
+            retrive_next_token=None,
+            retrive_next_sibling=None,
+            retrive_cum_len=None,
+            seq_lens_cpu=None,
+            spec_steps=None,
+            topk=None,
+            draft_token_num=None,
+            seq_lens_sum=None,
+            capture_hidden_mode=None,
+        )
+    else:
+        forward_mode = ForwardMode.EXTEND if mode == "prefill" else ForwardMode.DECODE
+        spec_info = None
 
     mwb = ModelWorkerBatch(
         bid=1,
@@ -253,6 +290,7 @@ def create_test_data(
         extend_logprob_start_lens=None,
         extend_input_logprob_token_ids=None,
         real_bs=seq_lens.shape[0],
+        spec_info=spec_info,
     )
 
     fb = ForwardBatch(
@@ -270,8 +308,10 @@ def create_test_data(
         cache_loc=cache_loc,
         extend_prefix_lens=extend_prefix_lens,
         extend_seq_lens=extend_seq_lens,
+        spec_info=spec_info,
     )
     fb.attn_backend.forward_metadata = attention_backend.get_forward_metadata(mwb)
+
     return fb, q, k, v
 
 
@@ -288,7 +328,11 @@ class TestAttention(CustomTestCase):
 
     def run_test(self, mode, lens, mode_args):
         # Create mock forward_batch
-        num_heads, head_dim, num_kv_heads, page_size, dtype = mode_args
+        if len(mode_args) == 5:
+            num_heads, head_dim, num_kv_heads, page_size, dtype = mode_args
+            causal = True
+        else:
+            num_heads, head_dim, num_kv_heads, page_size, dtype, causal = mode_args
 
         if dtype == jnp.bfloat16:
             is_bf16 = True
@@ -302,6 +346,7 @@ class TestAttention(CustomTestCase):
             head_dim,
             num_kv_heads,
             page_size,
+            causal=causal,
             model_config={
                 "num_kv_heads": num_kv_heads,
                 "head_dim": head_dim,
@@ -372,6 +417,12 @@ class TestAttention(CustomTestCase):
             forward_batch.attn_backend.forward_metadata.cu_q_lens,
             # forward_batch.attn_backend.forward_metadata.cu_kv_lens,
             forward_batch.attn_backend.forward_metadata.num_seqs,
+            custom_mask=(
+                forward_batch.spec_info.custom_mask
+                if forward_batch.spec_info != None
+                else None
+            ),
+            causal=causal,
             sm_scale=head_dim**-0.5,
         )
         jax.block_until_ready(expected)
@@ -599,6 +650,34 @@ class TestAttention(CustomTestCase):
         self.run_test(
             "decode", lens, (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16)
         )
+
+    def test_mha_prefill_with_custom_mask(self):
+        """Test JAX attention accuracy against PyTorch reference"""
+        # Parameters
+        num_heads = 8
+        num_kv_heads = 8
+        head_dim = 128
+        lens = [
+            (2, 22),
+            (42, 42),
+        ]
+        page_size = [1, 64]
+        causal_mask = False
+        for size in page_size:
+            self.run_test(
+                "prefill",
+                lens,
+                (num_heads, head_dim, num_kv_heads, size, jnp.bfloat16, causal_mask),
+            )
+
+    def test_mha_decode_with_custom_mask(self):
+        pass
+
+    def test_gqa_prefill_with_custom_mask(self):
+        pass
+
+    def test_gqa_decode_with_custom_mask(self):
+        pass
 
 
 if __name__ == "__main__":
