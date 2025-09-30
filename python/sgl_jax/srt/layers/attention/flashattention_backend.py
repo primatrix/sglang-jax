@@ -101,11 +101,7 @@ class FlashAttentionBackend(AttentionBackend):
         page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
 
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
-            # convert custom_mask from bool to int8, because dma not support bool type
-            if batch.spec_info.custom_mask.dtype == jnp.bool:
-                metadata.custom_mask = batch.spec_info.custom_mask.astype(jnp.int8)
-            else:
-                metadata.custom_mask = batch.spec_info.custom_mask
+            metadata.custom_mask = batch.spec_info.custom_mask
         else:
             metadata.custom_mask = None
 
