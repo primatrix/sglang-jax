@@ -332,6 +332,7 @@ def _ragged_paged_attention_kernel(
             cp.start()
 
     def _fetch_mask(seq_idx, bq_idx, bkvmask_idx, bkvmask_sem_idx, *, wait=False):
+        assert False, f"@@@@@@@@@@@ {sem.dtype=} {sem.shape=}"
         sem = sems.at[4, bkvmask_sem_idx]
         kvmask_fused_vmem_ref = bkvmask_ref.at[bkvmask_sem_idx]
 
