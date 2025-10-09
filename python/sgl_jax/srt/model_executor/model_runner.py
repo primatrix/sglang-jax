@@ -136,38 +136,28 @@ class ModelRunner:
             sampler_state
         )
 
-        @partial(
-            jax.jit,
-            donate_argnames=["forward_batch"],
-            static_argnames=["model_state_def"],
-        )
-        def jitted_run_model(
-            model_def,
-            model_state_def,
-            model_state_leaves,
-            forward_batch,
-            logits_metadata,
-        ):
+        # Use closure to capture model state, avoiding double partial wrapping
+        @partial(jax.jit, donate_argnames=["forward_batch"])
+        def jitted_run_model(forward_batch, logits_metadata):
+            # Closure automatically captures outer scope variables
             model_state = jax.tree_util.tree_unflatten(
                 model_state_def, model_state_leaves
             )
             model = nnx.merge(model_def, model_state)
             return model(forward_batch, logits_metadata)
 
-        @partial(jax.jit, static_argnames=["sampler_state_def"])
-        def jitted_sampler(sampler_def, sampler_state_def, sampler_state_leaves, *args):
-            model_state = jax.tree_util.tree_unflatten(
+        @jax.jit
+        def jitted_sampler(*args):
+            # Closure automatically captures outer scope variables
+            sampler_state_reconstructed = jax.tree_util.tree_unflatten(
                 sampler_state_def, sampler_state_leaves
             )
-            sampler = nnx.merge(sampler_def, model_state)
+            sampler = nnx.merge(sampler_def, sampler_state_reconstructed)
             return sampler(*args)
 
-        self.jitted_run_model = partial(
-            jitted_run_model, model_def, model_state_def, model_state_leaves
-        )
-        self.jitted_sampler = partial(
-            jitted_sampler, sampler_def, sampler_state_def, sampler_state_leaves
-        )
+        # Direct assignment, no partial wrapping
+        self.jitted_run_model = jitted_run_model
+        self.jitted_sampler = jitted_sampler
 
     def get_available_device_memory(self):
         min_available_device_memory = get_available_device_memory(
