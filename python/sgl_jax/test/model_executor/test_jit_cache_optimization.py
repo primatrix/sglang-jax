@@ -12,6 +12,7 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from transformers import AutoTokenizer
 
@@ -82,7 +83,7 @@ class TestJITCacheOptimization(unittest.TestCase):
     def _create_model_runner(self):
         """Create a ModelRunner instance."""
         req_to_token_pool = ReqToTokenPool(
-            size=128, max_context_len=4096, mesh=self.mesh, dtype=jnp.int32
+            size=128, max_context_len=4096, dtype=np.int32
         )
 
         return ModelRunner(
