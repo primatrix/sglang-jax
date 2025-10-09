@@ -57,8 +57,8 @@ class TestJITCacheOptimization(unittest.TestCase):
 
         self.mesh = create_device_mesh(
             devices=jax_devices,
-            ici_parallelism=[1, self.tp_size, 1, 1],
-            dcn_parallelism=[1, 1, 1, 1],
+            ici_parallelism=[-1, self.tp_size, 1],
+            dcn_parallelism=[1, 1, 1],
         )
 
         # Model configuration
