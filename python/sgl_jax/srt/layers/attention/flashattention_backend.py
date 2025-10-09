@@ -4,6 +4,7 @@ from typing import Tuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
@@ -62,7 +63,7 @@ class FlashAttentionMetadata:
         return obj
 
 
-@register_pytree_node_class
+# @register_pytree_node_class
 @dataclass
 class FlashAttention(AttentionBackend):
     """Native Attention layer for variable-length sequences using ForwardBatch."""
@@ -77,6 +78,10 @@ class FlashAttention(AttentionBackend):
         kv_partition_axis: str = "tensor",
         mesh: jax.sharding.Mesh = None,
     ):
+        import flax
+
+        flax.config
+        # Static configuration (not included in PyTree)
         self.vmem_limit_bytes = vmem_limit_bytes
         self.num_heads = num_attn_heads
         if num_kv_heads is not None:
@@ -86,8 +91,10 @@ class FlashAttention(AttentionBackend):
         self.head_dim = head_dim
         self.page_size = page_size
         self.kv_partition_axis = kv_partition_axis
-        self.forward_metadata = FlashAttentionMetadata()
         self.mesh = mesh
+
+        # Dynamic state (included in PyTree via nnx.data)
+        self.forward_metadata = nnx.data(FlashAttentionMetadata())
 
     def get_forward_metadata(self, batch: ModelWorkerBatch):
         """Return the metadata for a forward pass."""
@@ -156,31 +163,6 @@ class FlashAttention(AttentionBackend):
             ),
         )
         return metadata
-
-    def tree_flatten(self):
-        children = (self.forward_metadata,)
-        aux_data = {
-            "num_heads": self.num_heads,
-            "num_kv_heads": self.num_kv_heads,
-            "vmem_limit_bytes": self.vmem_limit_bytes,
-            "head_dim": self.head_dim,
-            "page_size": self.page_size,
-        }
-        return (children, aux_data)
-
-    @classmethod
-    def tree_unflatten(cls, aux_data, children):
-        obj = cls(
-            aux_data["num_heads"],
-            aux_data["num_kv_heads"],
-            aux_data["head_dim"],
-            aux_data["vmem_limit_bytes"],
-            aux_data["page_size"],
-        )
-
-        obj.forward_metadata = children[0]
-
-        return obj
 
     def __call__(
         self,
