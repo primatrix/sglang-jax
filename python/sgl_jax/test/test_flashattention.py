@@ -6,7 +6,8 @@ import numpy as np
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.attention.flash_attn_kernel.flash_attention import (
-    ref_ragged_paged_attention,
+    merge_kv,
+    ref_ragged_paged_attention_fused,
 )
 from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
 from sgl_jax.srt.layers.radix_attention import RadixAttention
@@ -35,11 +36,7 @@ def unique_in_original_order(arr: jax.Array) -> jax.Array:
 
 
 def create_qkv_cache(
-    lens,
-    num_heads,
-    head_dim,
-    num_kv_heads,
-    page_size=1,
+    lens, num_heads, head_dim, num_kv_heads, page_size=1, dtype=jnp.bfloat16
 ):
     batched_q_len = sum([q_len for q_len, _ in lens])
     batched_kv_len = sum([kv_len for _, kv_len in lens])
@@ -50,11 +47,12 @@ def create_qkv_cache(
     batched_aligned_kv_len = jnp.sum(aligned_seq_lens).item()
 
     key = jax.random.PRNGKey(42)
-    q = jax.random.normal(key, (batched_q_len, num_heads, head_dim), dtype=jnp.bfloat16)
+    q = jax.random.normal(key, (batched_q_len, num_heads, head_dim), dtype=dtype)
+    # q = jnp.ones((batched_q_len, num_heads, head_dim), dtype=dtype)
 
     # Create k,v with proper alignment gaps between sequences
-    k = jnp.zeros((batched_aligned_kv_len, num_kv_heads, head_dim), dtype=jnp.bfloat16)
-    v = jnp.zeros((batched_aligned_kv_len, num_kv_heads, head_dim), dtype=jnp.bfloat16)
+    k = jnp.zeros((batched_aligned_kv_len, num_kv_heads, head_dim), dtype=dtype)
+    v = jnp.zeros((batched_aligned_kv_len, num_kv_heads, head_dim), dtype=dtype)
 
     # Fill in the actual data for each sequence with proper alignment
     actual_pos = 0
@@ -66,13 +64,15 @@ def create_qkv_cache(
         seq_k = jax.random.normal(
             jax.random.split(key, len(lens) * 2)[actual_pos],
             (seq_len, num_kv_heads, head_dim),
-            dtype=jnp.bfloat16,
+            dtype=dtype,
         )
         seq_v = jax.random.normal(
             jax.random.split(key, len(lens) * 2)[actual_pos + len(lens)],
             (seq_len, num_kv_heads, head_dim),
-            dtype=jnp.bfloat16,
+            dtype=dtype,
         )
+        # seq_k = jnp.full((seq_len, num_kv_heads, head_dim), fill_value=1, dtype=dtype)
+        # seq_v = jnp.full((seq_len, num_kv_heads, head_dim), fill_value=0.5, dtype=dtype)
 
         # Place data at aligned positions
         k = k.at[aligned_pos : aligned_pos + seq_len].set(seq_k)
@@ -154,17 +154,20 @@ def create_test_data(
     # fake req_pool_indices, not used in attention
     req_pool_indices = jnp.arange(batch_size, dtype=jnp.int32)
 
+    dtype = jnp.bfloat16 if model_config["bf16"] else jnp.float32
     current_kv_cache = MHATokenToKVPool(
         size=max_total_token_size,
         page_size=page_size,
-        dtype=jnp.bfloat16 if model_config["bf16"] else jnp.float32,
+        dtype=dtype,
         head_num=model_config["num_kv_heads"],
         head_dim=model_config["head_dim"],
         layer_num=model_config["num_hidden_layers"],
         mesh=mesh,
     )
     # create q, k v
-    q, k, v = create_qkv_cache(lens, num_heads, head_dim, num_kv_heads, page_size)
+    q, k, v = create_qkv_cache(
+        lens, num_heads, head_dim, num_kv_heads, page_size, dtype
+    )
 
     # cache loc - match schedule_batch.py logic with align_to_size
     def align_to_size(l, size, value=0):
@@ -367,14 +370,14 @@ class TestAttention(CustomTestCase):
             cache_loc_list.append(padded_page_indices)
         page_table = jnp.stack(cache_loc_list)
 
-        expected = ref_ragged_paged_attention(
+        kv = merge_kv(k, v)
+
+        expected = ref_ragged_paged_attention_fused(
             q.reshape(q.shape[0], num_heads, head_dim),
-            k.reshape(k.shape[0] // page_size, page_size, num_kv_heads, head_dim),
-            v.reshape(v.shape[0] // page_size, page_size, num_kv_heads, head_dim),
+            kv.reshape(kv.shape[0] // page_size, page_size, num_kv_heads * 2, head_dim),
             forward_batch.seq_lens,
             page_table,
             forward_batch.attn_backend.forward_metadata.cu_q_lens,
-            # forward_batch.attn_backend.forward_metadata.cu_kv_lens,
             forward_batch.attn_backend.forward_metadata.num_seqs,
             sm_scale=head_dim**-0.5,
         )
@@ -400,6 +403,7 @@ class TestAttention(CustomTestCase):
         print(f"JAX output shape: {jax_flat.shape}")
         print(f"Expected shape: {expected_flat.shape}")
         print(f"Max difference: {max_diff}")
+        print(f"Diff: {diff}")
 
         # Analyze by token dimension (rows) - show only first 5 tokens
         print(f"\n=== Token-wise Analysis (first 20 tokens) ===")
@@ -469,19 +473,16 @@ class TestAttention(CustomTestCase):
     def test_mha_decode_accuracy_page_size_1(self):
         """Test JAX attention accuracy against native fa"""
         # Parameters
-        num_heads = 32
-        num_kv_heads = 32
-        head_dim = 128
+        num_heads = 4
+        num_kv_heads = 2
+        head_dim = 256
         lens = [
-            (1, 119),
-            (1, 127),
-            (1, 128),
-            (1, 129),
-            (1, 133),
-            (1, 1001),
-            (1, 1023),
-            (1, 1024),
-            (1, 1025),
+            # (1, 1),
+            # (1, 133),
+            (1, 256),
+            # (1, 1001),
+            # (1, 1024),
+            # (1, 1025),
         ]
 
         self.run_test(

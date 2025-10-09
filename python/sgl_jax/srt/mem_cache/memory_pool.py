@@ -377,6 +377,8 @@ class MHATokenToKVPool(KVCache):
         # Merge k and v into fused format
         fused_kv = merge_kv(k, v)  # [total_tokens, num_heads * 2, head_dim]
 
+        # jax.debug.print("fused_kv dtype: {}, kv_cache dtype: {}", fused_kv.dtype, self.kv_buffer[layer_idx].dtype)
+
         # Update the fused KV cache
         self.kv_buffer[layer_idx] = _set_fused_kv_buffer(
             fused_kv=fused_kv,

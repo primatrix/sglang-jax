@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from typing import Tuple
 
 import jax
 import jax.numpy as jnp
@@ -101,14 +100,14 @@ class FlashAttention(AttentionBackend):
             cu_q_lens = np.concatenate(
                 [
                     np.array([0], dtype=np.int32),
-                    np.cumsum(batch.extend_seq_lens, dtype=np.int32),
+                    np.cumsum(batch.extend_seq_lens),
                 ]
             )
         elif batch.forward_mode == ForwardMode.DECODE:
-            cu_q_lens = np.concatenate(
+            cu_q_lens = jnp.concatenate(
                 [
-                    np.array([0], dtype=np.int32),
-                    np.cumsum(np.ones(len(batch.seq_lens), dtype=np.int32)),
+                    np.array([0], dtype=jnp.int32),
+                    np.cumsum(jnp.ones(len(batch.seq_lens), dtype=np.int32)),
                 ]
             )
         else:
@@ -190,7 +189,6 @@ class FlashAttention(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         attention_mask: jax.Array = None,
-        kv_partition_axis: str = "tensor",
     ):
         """
         Args:
@@ -208,20 +206,11 @@ class FlashAttention(AttentionBackend):
         else:
             scale = layer.scaling
 
-        # Prepare fused KV cache for paged format: [num_pages, page_size, num_kv_heads * 2, head_dim]
-        total_tokens = kv_cache_fused.shape[0]
-        num_pages = total_tokens // self.page_size
-        kv_cache_fused_paged = kv_cache_fused.reshape(
-            num_pages, self.page_size, -1, self.head_dim
-        )
-
         in_specs = (
             P(None, self.kv_partition_axis),  # queries
             P(None, self.kv_partition_axis),  # keys (new tokens)
             P(None, self.kv_partition_axis),  # values (new tokens)
-            P(
-                None, None, self.kv_partition_axis, None
-            ),  # kv_cache_fused (head interleaved)
+            P(None, self.kv_partition_axis, None),  # kv_cache_fused (head interleaved)
             P(),  # kv_lens
             P(),  # page_indices
             P(),  # cu_q_lens
@@ -247,6 +236,7 @@ class FlashAttention(AttentionBackend):
                 kv_cache_fused,
                 *other_args,
                 sm_scale=scale,
+                page_size=self.page_size,
                 sliding_window=None,
                 soft_cap=None,
                 vmem_limit_bytes=self.vmem_limit_bytes,
@@ -266,7 +256,7 @@ class FlashAttention(AttentionBackend):
             q.reshape(q.shape[0], -1, self.head_dim),
             k.reshape(k.shape[0], -1, self.head_dim),
             v.reshape(v.shape[0], -1, self.head_dim),
-            kv_cache_fused_paged,
+            kv_cache_fused,
             self.forward_metadata.seq_lens,
             self.forward_metadata.page_indices,
             self.forward_metadata.cu_q_lens,
