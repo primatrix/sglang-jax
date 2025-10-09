@@ -90,6 +90,9 @@ class EAGLEWorker(ModelWorker):
             # TODO: if enable_dp_attention, add condition here
             if batch.spec_info.verified_id.shape[0] > 0:
                 self.forward_draft_extend_after_decode(batch)
+            logger.info(
+                f"verify_output.verified_id=============== {verify_output.verified_id}"
+            )
             return (
                 logits_output,
                 verify_output.verified_id,
@@ -284,12 +287,20 @@ class EAGLEWorker(ModelWorker):
         #     len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
         #     self.mesh,
         # )
-        logits_output, _, cache_miss_count = (
+        logits_output, token_ids, cache_miss_count = (
             self.target_worker.forward_batch_generation(
                 model_worker_batch, skip_sample=True
             )
         )
+        logger.info(f"verify===================={token_ids}")
+        logger.info(
+            f"verify==logits_output=================={logits_output.next_token_logits.shape}"
+        )
+
         logits_output.truncate_logits_processor_output(model_worker_batch)
+        logger.info(
+            f"verify==logits_output=================={logits_output.next_token_logits.shape}"
+        )
 
         # TODO: support grammar mask
         # vocab_mask = None
@@ -531,6 +542,7 @@ class EAGLEWorker(ModelWorker):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
+            logger.info(f"================input_ids {input_ids}")
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
@@ -555,6 +567,17 @@ class EAGLEWorker(ModelWorker):
                 logits_metadata=LogitsMetadata.from_model_worker_batch(
                     model_worker_batch, self.draft_model_runner.mesh
                 ),
+            )
+            next_token_ids_device = self.model_runner.sample(
+                logits_output=logits_output,
+                sampling_metadata=SamplingMetadata.from_model_worker_batch(
+                    model_worker_batch,
+                    len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
+                    self.mesh,
+                ),
+            )
+            logger.info(
+                f"===================next_token_ids_device===={i} {i} {i}===={next_token_ids_device}"
             )
             # self._detect_nan_if_needed(logits_output)
             probs = jax.nn.softmax(logits_output.next_token_logits, axis=-1)

@@ -609,7 +609,9 @@ class EagleVerifyInput:
             target_predict = jnp.argmax(
                 logits_output.next_token_logits, axis=-1
             ).flatten()
-
+            logger.info(
+                f"\n\n111111111********************{candidates} \n\n{target_predict}******************\n\n"
+            )
             accept_index, accept_length, predict = verify_tree_greedy(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
@@ -619,6 +621,9 @@ class EagleVerifyInput:
                 retrive_next_token=self.retrive_next_token,
                 retrive_next_sibling=self.retrive_next_sibling,
                 target_predict=target_predict,
+            )
+            logger.info(
+                f"\n\n2222222222***************************{predict}*********************************\n\n"
             )
         else:
             # apply temperature and get target probs
@@ -687,9 +692,11 @@ class EagleVerifyInput:
         unfinished_index = []
         unfinished_accept_index = []
         accept_index_cpu = accept_index.tolist()
+        accept_index = jnp.full((bs, self.spec_steps + 1), -1, dtype=jnp.int32)
+        accept_length = jnp.empty((bs,), dtype=jnp.int32)
         predict_cpu = predict.tolist()
         has_finished = False
-
+        logger.info(f"====predict_cpu================{predict_cpu}")
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
         for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
