@@ -145,7 +145,11 @@ class ModelRunner:
         self.sampler_state_leaves = sampler_state_leaves
 
         # Use method-based approach to avoid closure constant capture
-        @partial(jax.jit, donate_argnames=["forward_batch"])
+        @partial(
+            jax.jit,
+            donate_argnames=["forward_batch"],
+            static_argnames=["model_state_def"],
+        )
         def jitted_run_model(
             model_def,
             model_state_def,
@@ -159,7 +163,7 @@ class ModelRunner:
             model = nnx.merge(model_def, model_state)
             return model(forward_batch, logits_metadata)
 
-        @jax.jit
+        @partial(jax.jit, static_argnames=["sampler_state_def"])
         def jitted_sampler(sampler_def, sampler_state_def, sampler_state_leaves, *args):
             sampler_state_reconstructed = jax.tree_util.tree_unflatten(
                 sampler_state_def, sampler_state_leaves
