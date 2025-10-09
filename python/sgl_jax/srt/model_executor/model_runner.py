@@ -136,10 +136,23 @@ class ModelRunner:
             sampler_state
         )
 
-        # Use closure to capture model state, avoiding double partial wrapping
+        # Store state as instance variables to avoid closure constant capture
+        self.model_def = model_def
+        self.model_state_def = model_state_def
+        self.model_state_leaves = model_state_leaves
+        self.sampler_def = sampler_def
+        self.sampler_state_def = sampler_state_def
+        self.sampler_state_leaves = sampler_state_leaves
+
+        # Use method-based approach to avoid closure constant capture
         @partial(jax.jit, donate_argnames=["forward_batch"])
-        def jitted_run_model(forward_batch, logits_metadata):
-            # Closure automatically captures outer scope variables
+        def jitted_run_model(
+            model_def,
+            model_state_def,
+            model_state_leaves,
+            forward_batch,
+            logits_metadata,
+        ):
             model_state = jax.tree_util.tree_unflatten(
                 model_state_def, model_state_leaves
             )
@@ -147,15 +160,14 @@ class ModelRunner:
             return model(forward_batch, logits_metadata)
 
         @jax.jit
-        def jitted_sampler(*args):
-            # Closure automatically captures outer scope variables
+        def jitted_sampler(sampler_def, sampler_state_def, sampler_state_leaves, *args):
             sampler_state_reconstructed = jax.tree_util.tree_unflatten(
                 sampler_state_def, sampler_state_leaves
             )
             sampler = nnx.merge(sampler_def, sampler_state_reconstructed)
             return sampler(*args)
 
-        # Direct assignment, no partial wrapping
+        # Store compiled functions as instance methods
         self.jitted_run_model = jitted_run_model
         self.jitted_sampler = jitted_sampler
 
@@ -377,7 +389,11 @@ class ModelRunner:
 
         with jtu.count_pjit_cpp_cache_miss() as count:
             output, layers_kv_fused, _ = self.jitted_run_model(
-                forward_batch, logits_metadata
+                self.model_def,
+                self.model_state_def,
+                self.model_state_leaves,
+                forward_batch,
+                logits_metadata,
             )
             cache_miss_count = count()
         self._set_kv_cache_after_forward(layers_kv_fused, forward_batch)
@@ -450,6 +466,9 @@ class ModelRunner:
             A list of next_token_ids
         """
         return self.jitted_sampler(
+            self.sampler_def,
+            self.sampler_state_def,
+            self.sampler_state_leaves,
             logits_output,
             sampling_metadata,
             positions,
