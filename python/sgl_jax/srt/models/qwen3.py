@@ -282,7 +282,7 @@ class QWen3DecoderLayer(nnx.Module):
 
 
 # JIT function that uses split/merge pattern for single layer compilation
-@jax.jit
+@jax.jit(donate_argnames=["token_to_kv_pool"])
 def jitted_qwen3_decoder_layer(
     graphdef: nnx.GraphDef,
     state: nnx.State,
