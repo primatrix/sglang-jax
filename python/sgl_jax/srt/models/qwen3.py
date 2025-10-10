@@ -1,4 +1,5 @@
 import logging
+from functools import partial
 from typing import Any, Dict, Optional, Tuple
 
 import jax
@@ -282,7 +283,10 @@ class QWen3DecoderLayer(nnx.Module):
 
 
 # JIT function that uses split/merge pattern for single layer compilation
-@jax.jit(donate_argnames=["token_to_kv_pool"])
+@partial(
+    jax.jit,
+    donate_argnames=["token_to_kv_pool"],  # donate KV cache to avoid copying
+)
 def jitted_qwen3_decoder_layer(
     graphdef: nnx.GraphDef,
     state: nnx.State,
