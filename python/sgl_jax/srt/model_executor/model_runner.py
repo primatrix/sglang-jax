@@ -129,31 +129,11 @@ class ModelRunner:
         self.init_attention_backend()
 
     def initialize_jit(self):
-        model_def, model_state = nnx.split(self.model)
-        model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
+        # Keep sampler JIT compilation since it's still beneficial for sampling
         sampler_def, sampler_state = nnx.split(self.sampler)
         sampler_state_leaves, sampler_state_def = jax.tree_util.tree_flatten(
             sampler_state
         )
-
-        @partial(
-            jax.jit,
-            donate_argnames=["token_to_kv_pool"],  # just donate KV cache
-            static_argnames=["model_state_def"],
-        )
-        def jitted_run_model(
-            model_def,
-            model_state_def,
-            model_state_leaves,
-            forward_batch,
-            token_to_kv_pool,
-            logits_metadata,
-        ):
-            model_state = jax.tree_util.tree_unflatten(
-                model_state_def, model_state_leaves
-            )
-            model = nnx.merge(model_def, model_state)
-            return model(forward_batch, token_to_kv_pool, logits_metadata)
 
         @partial(jax.jit, static_argnames=["sampler_state_def"])
         def jitted_sampler(sampler_def, sampler_state_def, sampler_state_leaves, *args):
@@ -164,18 +144,13 @@ class ModelRunner:
             return sampler(*args)
 
         def run_model_wrapper(forward_batch, logits_metadata):
+            """
+            Run model directly without split/merge - using single-layer JIT inside the model.
+            """
             token_to_kv_pool = self.token_to_kv_pool
+            return self.model(forward_batch, token_to_kv_pool, logits_metadata)
 
-            return jitted_run_model(
-                model_def,
-                model_state_def,
-                model_state_leaves,
-                forward_batch,
-                token_to_kv_pool,
-                logits_metadata,
-            )
-
-        self.jitted_run_model = run_model_wrapper
+        self.run_model = run_model_wrapper
         self.jitted_sampler = partial(
             jitted_sampler, sampler_def, sampler_state_def, sampler_state_leaves
         )
@@ -397,9 +372,7 @@ class ModelRunner:
         import jax._src.test_util as jtu
 
         with jtu.count_pjit_cpp_cache_miss() as count:
-            output, layers_kv_fused, _ = self.jitted_run_model(
-                forward_batch, logits_metadata
-            )
+            output, layers_kv_fused, _ = self.run_model(forward_batch, logits_metadata)
             cache_miss_count = count()
         self._set_kv_cache_after_forward(layers_kv_fused, forward_batch)
 

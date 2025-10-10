@@ -282,6 +282,23 @@ class QWen3DecoderLayer(nnx.Module):
         return hidden_states, residual, kv_fused, layer_callback_flag
 
 
+# JIT function that wraps a single QWen3DecoderLayer call
+@jax.jit
+def jitted_qwen3_decoder_layer(
+    layer,  # QWen3DecoderLayer instance
+    positions: jax.Array,
+    hidden_states: jax.Array,
+    forward_batch: ForwardBatch,
+    token_to_kv_pool: KVCache,
+    residual: Optional[jax.Array] = None,
+) -> Tuple[jax.Array, jax.Array, jax.Array, list]:
+    """
+    JIT-compiled single layer function that can be reused across all layers.
+    This follows the pattern from JAX documentation for efficient caching.
+    """
+    return layer(positions, hidden_states, forward_batch, token_to_kv_pool, residual)
+
+
 class QWen3Model(nnx.Module):
     def __init__(
         self,
@@ -325,13 +342,18 @@ class QWen3Model(nnx.Module):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         layers_kv_fused = []
         layers_callback_flag = []
+
+        # Use JIT-compiled single layer function for all layers
         for layer in self.layers:
-            hidden_states, residual, kv_fused, callback_flag = layer(
-                forward_batch.positions,
-                hidden_states,
-                forward_batch,
-                token_to_kv_pool,
-                residual,
+            hidden_states, residual, kv_fused, callback_flag = (
+                jitted_qwen3_decoder_layer(
+                    layer,
+                    forward_batch.positions,
+                    hidden_states,
+                    forward_batch,
+                    token_to_kv_pool,
+                    residual,
+                )
             )
             layers_kv_fused.append(kv_fused)
             layers_callback_flag.extend(callback_flag)
