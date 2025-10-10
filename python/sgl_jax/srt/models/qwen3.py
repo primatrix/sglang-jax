@@ -108,7 +108,6 @@ class QWen3Attention(nnx.Module):
             head_dim=self.head_dim,
             scaling=self.scaling,
             num_kv_heads=num_kv_heads,
-            layer_id=layer_id,
         )
 
     def __call__(
@@ -116,7 +115,7 @@ class QWen3Attention(nnx.Module):
         positions: jax.Array,
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
+        layer_kv_buffer: jax.Array,  # 预提取的该层 KV buffer
     ) -> jax.Array:
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
@@ -130,7 +129,7 @@ class QWen3Attention(nnx.Module):
         k = self.k_norm(k)
 
         q, k = self.rotary_emb(positions, q, k)
-        attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
+        attn_output, kv_fused = self.attn(q, k, v, forward_batch, layer_kv_buffer)
 
         output, _ = self.o_proj(attn_output)
         return output, kv_fused
@@ -237,11 +236,10 @@ class QWen3DecoderLayer(nnx.Module):
         positions: jax.Array,
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
+        layer_id: int,
+        layer_kv_buffer: jax.Array,  # 预提取的该层 KV buffer
         residual: Optional[jax.Array] = None,
     ) -> Tuple[jax.Array, jax.Array]:
-        # Use self.layer_id directly for all layer-specific operations
-        actual_layer_id = self.layer_id
 
         layer_callback_flag = []
         if residual is None:
@@ -253,7 +251,7 @@ class QWen3DecoderLayer(nnx.Module):
             hidden_states = self.input_layernorm(hidden_states)
 
         layer_norm_callback_flag = precision_tracer.jit_pure_callback_record(
-            hidden_states, "input_layernorm_output", "INPUT_LAYERNORM", actual_layer_id
+            hidden_states, "input_layernorm_output", "INPUT_LAYERNORM", layer_id
         )
         layer_callback_flag.append(layer_norm_callback_flag)
 
@@ -261,11 +259,11 @@ class QWen3DecoderLayer(nnx.Module):
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
-            token_to_kv_pool=token_to_kv_pool,
+            layer_kv_buffer=layer_kv_buffer,
         )
 
         attn_callback_flag = precision_tracer.jit_pure_callback_record(
-            hidden_states, "self_attn_output", "SELF_ATTN", actual_layer_id
+            hidden_states, "self_attn_output", "SELF_ATTN", layer_id
         )
         layer_callback_flag.append(attn_callback_flag)
         hidden_states += residual
@@ -274,7 +272,7 @@ class QWen3DecoderLayer(nnx.Module):
         hidden_states = self.mlp(hidden_states)
 
         mlp_callback_flag = precision_tracer.jit_pure_callback_record(
-            hidden_states, "mlp_output", "MLP", actual_layer_id
+            hidden_states, "mlp_output", "MLP", layer_id
         )
         layer_callback_flag.append(mlp_callback_flag)
 
@@ -284,27 +282,31 @@ class QWen3DecoderLayer(nnx.Module):
 def _qwen3_decoder_layer_fn(
     graphdef: nnx.GraphDef,
     state: nnx.State,
+    layer_id: int,
     positions: jax.Array,
     hidden_states: jax.Array,
     forward_batch: ForwardBatch,
-    token_to_kv_pool: KVCache,
+    layer_kv_buffer: jax.Array,
     residual: Optional[jax.Array] = None,
 ) -> Tuple[jax.Array, jax.Array, jax.Array, list]:
     """
     Single layer function that uses split/merge pattern.
     Uses split/merge pattern: takes split layer components and reconstructs the layer inside JIT.
-    This allows all layers to reuse the same compiled function since they have the same structure.
+    All layers share the same GraphDef structure, only layer_id differs dynamically.
+    layer_kv_buffer 在 JIT 外部预提取，避免 traced indexing。
     """
     # Reconstruct the layer from split components
     layer = nnx.merge(graphdef, state)
 
-    # Call the layer
-    return layer(positions, hidden_states, forward_batch, token_to_kv_pool, residual)
+    # Call the layer with dynamic layer_id and pre-extracted KV buffer
+    return layer(
+        positions, hidden_states, forward_batch, layer_id, layer_kv_buffer, residual
+    )
 
 
 # JIT-compiled version with buffer donation
 jitted_qwen3_decoder_layer = jax.jit(
-    _qwen3_decoder_layer_fn, donate_argnames=["token_to_kv_pool"]
+    _qwen3_decoder_layer_fn, donate_argnames=["layer_kv_buffer"]
 )
 
 
@@ -353,19 +355,24 @@ class QWen3Model(nnx.Module):
         layers_callback_flag = []
 
         # Use JIT-compiled single layer function with split/merge pattern
-        # All layers can reuse the same compiled function since they have the same structure
+        # All layers use the same GraphDef template (layer 0) but different States
+        template_graphdef, _ = nnx.split(self.layers[0])  # 使用第0层作为统一模板
+
         for layer_id, layer in enumerate(self.layers):
-            # Split the layer into graphdef and state
-            graphdef, state = nnx.split(layer)
+            # Split the layer to get its state, but use template GraphDef for consistency
+            _, state = nnx.split(layer)
+
+            layer_kv_buffer = token_to_kv_pool.get_fused_kv_buffer(layer_id)
 
             hidden_states, residual, kv_fused, callback_flag = (
                 jitted_qwen3_decoder_layer(
-                    graphdef,
+                    template_graphdef,
                     state,
+                    layer_id,
                     forward_batch.positions,
                     hidden_states,
                     forward_batch,
-                    token_to_kv_pool,
+                    layer_kv_buffer,
                     residual,
                 )
             )
