@@ -107,6 +107,7 @@ class QWen3Attention(nnx.Module):
             head_dim=self.head_dim,
             scaling=self.scaling,
             num_kv_heads=num_kv_heads,
+            layer_id=0,  # Default value, will be overridden at runtime
         )
 
     def __call__(
