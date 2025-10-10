@@ -55,29 +55,18 @@ class RadixAttention(nnx.Module):
         v: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-        layer_id: int = None,
         **kwargs,
     ):
         assert k is not None
         assert v is not None
 
-        # Temporarily override layer_id if provided
-        original_layer_id = self.layer_id
-        if layer_id is not None:
-            self.layer_id = layer_id
-
-        try:
-            attn_output, kv_fused = forward_batch.attn_backend(
-                q,
-                k,
-                v,
-                self,
-                forward_batch,
-                token_to_kv_pool,
-                **kwargs,
-            )
-        finally:
-            # Restore original layer_id
-            self.layer_id = original_layer_id
-
+        attn_output, kv_fused = forward_batch.attn_backend(
+            q,
+            k,
+            v,
+            self,
+            forward_batch,
+            token_to_kv_pool,
+            **kwargs,
+        )
         return attn_output, kv_fused

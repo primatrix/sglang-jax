@@ -33,6 +33,7 @@ class QWen3Attention(nnx.Module):
         rope_scaling: Optional[Dict[str, Any]] = None,
         head_dim: Optional[int] = None,
         rms_norm_eps: float = None,
+        layer_id: int = 0,
         attention_bias: bool = False,
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
@@ -107,7 +108,7 @@ class QWen3Attention(nnx.Module):
             head_dim=self.head_dim,
             scaling=self.scaling,
             num_kv_heads=num_kv_heads,
-            layer_id=0,  # Default value, will be overridden at runtime
+            layer_id=layer_id,
         )
 
     def __call__(
@@ -116,7 +117,6 @@ class QWen3Attention(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-        layer_id: int,
     ) -> jax.Array:
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
@@ -130,9 +130,7 @@ class QWen3Attention(nnx.Module):
         k = self.k_norm(k)
 
         q, k = self.rotary_emb(positions, q, k)
-        attn_output, kv_fused = self.attn(
-            q, k, v, forward_batch, token_to_kv_pool, layer_id
-        )
+        attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
 
         output, _ = self.o_proj(attn_output)
         return output, kv_fused
@@ -208,6 +206,7 @@ class QWen3DecoderLayer(nnx.Module):
             head_dim=head_dim,
             rms_norm_eps=config.rms_norm_eps,
             attention_bias=config.attention_bias,
+            layer_id=layer_id,  # Pass the actual layer_id
             dtype=dtype,
             rngs=rngs,
         )
@@ -240,10 +239,9 @@ class QWen3DecoderLayer(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         residual: Optional[jax.Array] = None,
-        layer_id: Optional[int] = None,
     ) -> Tuple[jax.Array, jax.Array]:
-        # Use provided layer_id or fall back to self.layer_id for compatibility
-        actual_layer_id = layer_id if layer_id is not None else self.layer_id
+        # Use self.layer_id directly for all layer-specific operations
+        actual_layer_id = self.layer_id
 
         layer_callback_flag = []
         if residual is None:
@@ -264,7 +262,6 @@ class QWen3DecoderLayer(nnx.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
-            layer_id=actual_layer_id,
         )
 
         attn_callback_flag = precision_tracer.jit_pure_callback_record(
@@ -289,7 +286,6 @@ class QWen3DecoderLayer(nnx.Module):
 def jitted_qwen3_decoder_layer(
     graphdef: nnx.GraphDef,
     state: nnx.State,
-    layer_id: int,
     positions: jax.Array,
     hidden_states: jax.Array,
     forward_batch: ForwardBatch,
@@ -300,14 +296,13 @@ def jitted_qwen3_decoder_layer(
     JIT-compiled single layer function that can be reused across all layers.
     Uses split/merge pattern: takes split layer components and reconstructs the layer inside JIT.
     This allows all layers to reuse the same compiled function since they have the same structure.
+    Note: layer_id must be handled outside JIT to avoid indexing issues.
     """
     # Reconstruct the layer from split components
     layer = nnx.merge(graphdef, state)
 
-    # Call the layer with the provided layer_id
-    return layer(
-        positions, hidden_states, forward_batch, token_to_kv_pool, residual, layer_id
-    )
+    # Call the layer without layer_id - this means we need to modify the call chain
+    return layer(positions, hidden_states, forward_batch, token_to_kv_pool, residual)
 
 
 class QWen3Model(nnx.Module):
@@ -364,7 +359,6 @@ class QWen3Model(nnx.Module):
                 jitted_qwen3_decoder_layer(
                     graphdef,
                     state,
-                    layer_id,
                     forward_batch.positions,
                     hidden_states,
                     forward_batch,
