@@ -34,7 +34,6 @@ class RadixAttention(nnx.Module):
         head_dim: int,
         scaling: float,
         num_kv_heads: int,
-        layer_id: int,
         v_head_dim: int = -1,
         attn_type: AttentionType = AttentionType.DECODER,
     ):
@@ -45,7 +44,6 @@ class RadixAttention(nnx.Module):
         self.qk_head_dim = head_dim
         self.v_head_dim = v_head_dim if v_head_dim != -1 else head_dim
         self.scaling = scaling
-        self.layer_id = layer_id
         self.attn_type = attn_type
 
     def __call__(
@@ -54,7 +52,7 @@ class RadixAttention(nnx.Module):
         k: jax.Array,
         v: jax.Array,
         forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
+        layer_kv_buffer: jax.Array,
         **kwargs,
     ):
         assert k is not None
@@ -66,7 +64,8 @@ class RadixAttention(nnx.Module):
             v,
             self,
             forward_batch,
-            token_to_kv_pool,
+            layer_kv_buffer,
             **kwargs,
         )
+
         return attn_output, kv_fused

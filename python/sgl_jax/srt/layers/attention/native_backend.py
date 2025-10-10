@@ -101,28 +101,40 @@ class NativeAttention(AttentionBackend):
         k: jax.Array,
         v: jax.Array,
         forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
+        token_to_kv_pool_or_buffer,  # 可能是 KVCache 对象或预提取的融合 buffer
         layer_id: int,
     ) -> Tuple[jax.Array, jax.Array]:
         """
         Get the kv cache from the forward batch.
         """
-        if is_tpu_runtime():
-            if forward_batch.forward_mode == ForwardMode.EXTEND:
-                token_to_kv_pool.set_kv_buffer(
-                    layer_id, forward_batch.out_cache_loc, k, v, is_decode=False
-                )
-            else:
-                token_to_kv_pool.set_kv_buffer(
-                    layer_id, forward_batch.out_cache_loc, k, v, is_decode=True
-                )
-        else:
-            token_to_kv_pool.set_kv_buffer_legacy(
-                layer_id, forward_batch.out_cache_loc, k, v
+        # 检查是否是预提取的融合 buffer (jax.Array)
+        if hasattr(token_to_kv_pool_or_buffer, "shape"):
+            # 直接从预提取的融合 buffer 中分离 K、V，避免 traced indexing
+            fused_kv = (
+                token_to_kv_pool_or_buffer  # [cache_size, num_kv_heads * 2, head_dim]
             )
+            k_buffer = fused_kv[:, ::2, :]  # Even indices: K heads (0, 2, 4, ...)
+            v_buffer = fused_kv[:, 1::2, :]  # Odd indices: V heads (1, 3, 5, ...)
+            return k_buffer, v_buffer
+        else:
+            # 传统方式：使用 KVCache 对象
+            token_to_kv_pool = token_to_kv_pool_or_buffer
+            if is_tpu_runtime():
+                if forward_batch.forward_mode == ForwardMode.EXTEND:
+                    token_to_kv_pool.set_kv_buffer(
+                        layer_id, forward_batch.out_cache_loc, k, v, is_decode=False
+                    )
+                else:
+                    token_to_kv_pool.set_kv_buffer(
+                        layer_id, forward_batch.out_cache_loc, k, v, is_decode=True
+                    )
+            else:
+                token_to_kv_pool.set_kv_buffer_legacy(
+                    layer_id, forward_batch.out_cache_loc, k, v
+                )
 
-        k, v = token_to_kv_pool.get_kv_buffer(layer_id)
-        return k, v
+            k, v = token_to_kv_pool.get_kv_buffer(layer_id)
+            return k, v
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
