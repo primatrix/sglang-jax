@@ -1,5 +1,4 @@
 import logging
-from functools import partial
 from typing import Any, Dict, Optional, Tuple
 
 import jax
@@ -282,12 +281,7 @@ class QWen3DecoderLayer(nnx.Module):
         return hidden_states, residual, kv_fused, layer_callback_flag
 
 
-# JIT function that uses split/merge pattern for single layer compilation
-@partial(
-    jax.jit,
-    donate_argnames=["token_to_kv_pool"],  # donate KV cache to avoid copying
-)
-def jitted_qwen3_decoder_layer(
+def _qwen3_decoder_layer_fn(
     graphdef: nnx.GraphDef,
     state: nnx.State,
     positions: jax.Array,
@@ -297,16 +291,21 @@ def jitted_qwen3_decoder_layer(
     residual: Optional[jax.Array] = None,
 ) -> Tuple[jax.Array, jax.Array, jax.Array, list]:
     """
-    JIT-compiled single layer function that can be reused across all layers.
+    Single layer function that uses split/merge pattern.
     Uses split/merge pattern: takes split layer components and reconstructs the layer inside JIT.
     This allows all layers to reuse the same compiled function since they have the same structure.
-    Note: layer_id must be handled outside JIT to avoid indexing issues.
     """
     # Reconstruct the layer from split components
     layer = nnx.merge(graphdef, state)
 
-    # Call the layer without layer_id - this means we need to modify the call chain
+    # Call the layer
     return layer(positions, hidden_states, forward_batch, token_to_kv_pool, residual)
+
+
+# JIT-compiled version with buffer donation
+jitted_qwen3_decoder_layer = jax.jit(
+    _qwen3_decoder_layer_fn, donate_argnames=["token_to_kv_pool"]
+)
 
 
 class QWen3Model(nnx.Module):
