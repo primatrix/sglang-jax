@@ -349,10 +349,13 @@ class QWen3Model(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
     ):
-        residual = None
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         layers_kv_fused = []
         layers_callback_flag = []
+
+        # Initialize residual as zeros to ensure consistent function signature
+        # This ensures jitted_qwen3_decoder_layer always receives the same number of arguments
+        residual = jnp.zeros_like(hidden_states)
 
         # Use JIT-compiled single layer function with split/merge pattern
         # All layers use the same GraphDef template (layer 0) but different States
