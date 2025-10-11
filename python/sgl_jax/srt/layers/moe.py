@@ -108,6 +108,7 @@ class EPMoE(nnx.Module):
         expert_parallel_size: int,
         mesh: Mesh,
         intermediate_dim: int = 2048,
+        renormalize: bool = True,
         weight_dtype: jnp.dtype = jnp.bfloat16,
         dtype: jnp.dtype = jnp.bfloat16,
         layer_id: int = 0,
@@ -122,6 +123,7 @@ class EPMoE(nnx.Module):
         self.dtype = dtype
         self.layer_id = layer_id
         self.expert_parallel_size = expert_parallel_size
+        self.renormalize = renormalize
         self.mesh = mesh
         if num_experts % self.expert_parallel_size != 0:
             raise ValueError(
@@ -209,10 +211,10 @@ class EPMoE(nnx.Module):
                 top_k_logits.astype(jnp.bfloat16), axis=-1
             ).astype(self.dtype)
 
-            # ep moe norm_topk_prob=true
-            top_k_weights = top_k_weights / jnp.sum(
-                top_k_weights, axis=-1, keepdims=True
-            )
+            if self.renormalize:
+                top_k_weights = top_k_weights / jnp.sum(
+                    top_k_weights, axis=-1, keepdims=True
+                )
 
             if hidden_states.ndim == 2:
                 total_tokens = hidden_states.shape[0]
