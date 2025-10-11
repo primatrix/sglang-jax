@@ -358,19 +358,19 @@ class QWen3Model(nnx.Module):
         residual = jnp.zeros_like(hidden_states)
 
         # Use JIT-compiled single layer function with split/merge pattern
-        # All layers use the same GraphDef template (layer 0) but different States
+        # Pre-split all layers once to avoid repeated split operations in the loop
         template_graphdef, _ = nnx.split(self.layers[0])  # 使用第0层作为统一模板
+        layer_states = [
+            nnx.split(layer)[1] for layer in self.layers
+        ]  # 预先 split 所有层
 
-        for layer_id, layer in enumerate(self.layers):
-            # Split the layer to get its state, but use template GraphDef for consistency
-            _, state = nnx.split(layer)
-
+        for layer_id in range(len(self.layers)):
             layer_kv_buffer = token_to_kv_pool.get_fused_kv_buffer(layer_id)
 
             hidden_states, residual, kv_fused, callback_flag = (
                 jitted_qwen3_decoder_layer(
                     template_graphdef,
-                    state,
+                    layer_states[layer_id],  # 使用预先 split 好的 state
                     layer_id,
                     forward_batch.positions,
                     hidden_states,
