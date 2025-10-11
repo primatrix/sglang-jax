@@ -289,7 +289,6 @@ def _qwen3_decoder_layer_fn(
     layer_kv_buffer: jax.Array,
     residual: Optional[jax.Array] = None,
 ) -> Tuple[jax.Array, jax.Array, jax.Array, list]:
-    # 从 leaves 和 treedef 重构 state
     state = jax.tree_util.tree_unflatten(state_treedef, state_leaves)
     layer = nnx.merge(graphdef, state)
 
