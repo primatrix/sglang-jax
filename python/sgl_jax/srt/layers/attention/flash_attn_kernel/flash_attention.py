@@ -258,12 +258,12 @@ def _ragged_paged_attention_kernel(
     q_hbm_ref,  # [actual_num_kv_heads, padded_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     kv_hbm_ref,  # [padded_num_tokens, num_kv_heads_x2 // kv_packing, kv_packing, head_dim] - Fused KV with interleaved [K1,V1,K2,V2,...]
     kv_cache_fused_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_interleaved // kv_packing, kv_packing, head_dim]
-    custom_mask_ref,  # (flatten_total_kv_len,), int8, dma not support bool type
+    custom_mask_ref,  # (flatten_total_kv_len, head_dim), int8, dma not support bool type
     # Output
     o_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     updated_kv_cache_fused_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_interleaved // kv_packing, kv_packing, head_dim]
     # Scratch
-    bkvmask_ref,  # [2, bq_sz, bkv_sz]
+    bkvmask_ref,  # [2, bq_sz, bkv_sz, head_dim]
     bkv_fused_x2_ref,  # [2, bkv_sz, num_kv_heads_interleaved // kv_packing, kv_packing, head_dim]
     bq_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     bo_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
@@ -333,7 +333,6 @@ def _ragged_paged_attention_kernel(
 
     def _fetch_mask(seq_idx, bq_idx, bkvmask_idx, bkvmask_sem_idx, *, wait=False):
         sem = sems.at[4, bkvmask_sem_idx]
-        assert sem.dtype == sems.dtype, f"######## {sem.dtype=} {sems.dtype=}"
         kvmask_fused_vmem_ref = bkvmask_ref.at[bkvmask_sem_idx]
 
         kv_len = kv_lens_ref[seq_idx]
@@ -802,7 +801,7 @@ def _ragged_paged_attention_kernel(
                     # convert custom_mask from int8 to bool
                     mask = lax.select(
                         causal == 0,
-                        custom_mask.astype(jnp.bool),
+                        custom_mask[:, :, :, 0].astype(jnp.bool),
                         q_span < k_span,
                     )
                     if sliding_window is not None:
@@ -1347,6 +1346,10 @@ def ragged_paged_attention(
             custom_mask.dtype != jnp.bool
         ), f"custom_mask bool dtype is not supported, use int32 instead. 0: False, 1: True"
 
+        custom_mask = jnp.repeat(
+            jnp.expand_dims(custom_mask, axis=1), repeats=head_dim, axis=1
+        )
+
     grid = (distribution[2],)
 
     in_specs = [
@@ -1367,7 +1370,7 @@ def ragged_paged_attention(
     )
 
     bkvmask_double_buf = pltpu.VMEM(
-        (2, bq_sz, bkv_sz),
+        (2, bq_sz, bkv_sz, head_dim),
         jnp.bool,
     )
 
