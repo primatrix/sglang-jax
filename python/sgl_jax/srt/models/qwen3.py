@@ -335,8 +335,9 @@ class QWen3Model(nnx.Module):
             scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
-        self.layer_states = [nnx.split(layer)[1] for layer in self.layers]
-        self.template_graphdef, _ = nnx.split(self.layers[0])
+        # 延迟初始化：在第一次调用时才 split，避免初始化时的不可变状态问题
+        self._layer_states = None
+        self._template_graphdef = None
 
     def __call__(
         self,
@@ -351,16 +352,18 @@ class QWen3Model(nnx.Module):
         # This ensures jitted_qwen3_decoder_layer always receives the same number of arguments
         residual = jnp.zeros_like(hidden_states)
 
-        # Use JIT-compiled single layer function with split/merge pattern
-        # Pre-split all layers once to avoid repeated split operations in the loop
+        # 延迟初始化：第一次调用时进行 split，后续调用复用
+        if self._layer_states is None:
+            self._layer_states = [nnx.split(layer)[1] for layer in self.layers]
+            self._template_graphdef, _ = nnx.split(self.layers[0])
 
         for layer_id in range(len(self.layers)):
             layer_kv_buffer = token_to_kv_pool.get_fused_kv_buffer(layer_id)
 
             hidden_states, residual, kv_fused, callback_flag = (
                 jitted_qwen3_decoder_layer(
-                    self.template_graphdef,
-                    self.layer_states[layer_id],
+                    self._template_graphdef,
+                    self._layer_states[layer_id],
                     layer_id,
                     forward_batch.positions,
                     hidden_states,
