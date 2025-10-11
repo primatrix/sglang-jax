@@ -115,7 +115,7 @@ class QWen3Attention(nnx.Module):
         positions: jax.Array,
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
-        layer_kv_buffer: jax.Array,  # 预提取的该层 KV buffer
+        layer_kv_buffer: jax.Array,
     ) -> jax.Array:
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
@@ -189,7 +189,6 @@ class QWen3DecoderLayer(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
     ):
-        self.layer_id = layer_id  # Keep for backward compatibility only
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
@@ -205,7 +204,7 @@ class QWen3DecoderLayer(nnx.Module):
             head_dim=head_dim,
             rms_norm_eps=config.rms_norm_eps,
             attention_bias=config.attention_bias,
-            layer_id=layer_id,  # Pass the actual layer_id
+            layer_id=layer_id,
             dtype=dtype,
             rngs=rngs,
         )
@@ -237,7 +236,7 @@ class QWen3DecoderLayer(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         layer_id: int,
-        layer_kv_buffer: jax.Array,  # 预提取的该层 KV buffer
+        layer_kv_buffer: jax.Array,
         residual: Optional[jax.Array] = None,
     ) -> Tuple[jax.Array, jax.Array]:
 
@@ -281,7 +280,8 @@ class QWen3DecoderLayer(nnx.Module):
 
 def _qwen3_decoder_layer_fn(
     graphdef: nnx.GraphDef,
-    state: nnx.State,
+    state_leaves: list,
+    state_treedef: jax.tree_util.PyTreeDef,
     layer_id: int,
     positions: jax.Array,
     hidden_states: jax.Array,
@@ -289,6 +289,8 @@ def _qwen3_decoder_layer_fn(
     layer_kv_buffer: jax.Array,
     residual: Optional[jax.Array] = None,
 ) -> Tuple[jax.Array, jax.Array, jax.Array, list]:
+    # 从 leaves 和 treedef 重构 state
+    state = jax.tree_util.tree_unflatten(state_treedef, state_leaves)
     layer = nnx.merge(graphdef, state)
 
     return layer(
@@ -296,9 +298,10 @@ def _qwen3_decoder_layer_fn(
     )
 
 
-# JIT-compiled version with buffer donation
 jitted_qwen3_decoder_layer = jax.jit(
-    _qwen3_decoder_layer_fn, donate_argnames=["layer_kv_buffer"]
+    _qwen3_decoder_layer_fn,
+    donate_argnames=["layer_kv_buffer"],
+    static_argnames=["state_treedef"],
 )
 
 
@@ -335,9 +338,9 @@ class QWen3Model(nnx.Module):
             scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
-        # 延迟初始化：在第一次调用时才 split，避免初始化时的不可变状态问题
         self._layer_states = None
         self._template_graphdef = None
+        self._template_treedef = None
 
     def __call__(
         self,
@@ -348,22 +351,27 @@ class QWen3Model(nnx.Module):
         layers_kv_fused = []
         layers_callback_flag = []
 
-        # Initialize residual as zeros to ensure consistent function signature
-        # This ensures jitted_qwen3_decoder_layer always receives the same number of arguments
         residual = jnp.zeros_like(hidden_states)
 
-        # 延迟初始化：第一次调用时进行 split，后续调用复用
         if self._layer_states is None:
-            self._layer_states = [nnx.split(layer)[1] for layer in self.layers]
-            self._template_graphdef, _ = nnx.split(self.layers[0])
+            self._template_graphdef, template_state = nnx.split(self.layers[0])
+            _, self._template_treedef = jax.tree_util.tree_flatten(template_state)
+
+            states = [nnx.split(layer)[1] for layer in self.layers]
+            self._layer_states = []
+            for state in states:
+                leaves, _ = jax.tree_util.tree_flatten(state)
+                self._layer_states.append(leaves)
 
         for layer_id in range(len(self.layers)):
             layer_kv_buffer = token_to_kv_pool.get_fused_kv_buffer(layer_id)
+            leaves = self._layer_states[layer_id]
 
             hidden_states, residual, kv_fused, callback_flag = (
                 jitted_qwen3_decoder_layer(
                     self._template_graphdef,
-                    self._layer_states[layer_id],
+                    leaves,
+                    self._template_treedef,
                     layer_id,
                     forward_batch.positions,
                     hidden_states,
