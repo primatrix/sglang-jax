@@ -289,16 +289,8 @@ def _qwen3_decoder_layer_fn(
     layer_kv_buffer: jax.Array,
     residual: Optional[jax.Array] = None,
 ) -> Tuple[jax.Array, jax.Array, jax.Array, list]:
-    """
-    Single layer function that uses split/merge pattern.
-    Uses split/merge pattern: takes split layer components and reconstructs the layer inside JIT.
-    All layers share the same GraphDef structure, only layer_id differs dynamically.
-    layer_kv_buffer 在 JIT 外部预提取，避免 traced indexing。
-    """
-    # Reconstruct the layer from split components
     layer = nnx.merge(graphdef, state)
 
-    # Call the layer with dynamic layer_id and pre-extracted KV buffer
     return layer(
         positions, hidden_states, forward_batch, layer_id, layer_kv_buffer, residual
     )
@@ -343,6 +335,8 @@ class QWen3Model(nnx.Module):
             scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
+        self.layer_states = [nnx.split(layer)[1] for layer in self.layers]
+        self.template_graphdef, _ = nnx.split(self.layers[0])
 
     def __call__(
         self,
@@ -359,18 +353,14 @@ class QWen3Model(nnx.Module):
 
         # Use JIT-compiled single layer function with split/merge pattern
         # Pre-split all layers once to avoid repeated split operations in the loop
-        template_graphdef, _ = nnx.split(self.layers[0])  # 使用第0层作为统一模板
-        layer_states = [
-            nnx.split(layer)[1] for layer in self.layers
-        ]  # 预先 split 所有层
 
         for layer_id in range(len(self.layers)):
             layer_kv_buffer = token_to_kv_pool.get_fused_kv_buffer(layer_id)
 
             hidden_states, residual, kv_fused, callback_flag = (
                 jitted_qwen3_decoder_layer(
-                    template_graphdef,
-                    layer_states[layer_id],  # 使用预先 split 好的 state
+                    self.template_graphdef,
+                    self.layer_states[layer_id],
                     layer_id,
                     forward_batch.positions,
                     hidden_states,
