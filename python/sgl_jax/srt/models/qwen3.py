@@ -305,24 +305,31 @@ jitted_qwen3_decoder_layer = jax.jit(
 )
 
 
-def _embedding_fn(graphdef, state, input_ids):
+def _embedding_fn(graphdef, state_leaves, state_treedef, input_ids):
+    state = jax.tree_util.tree_unflatten(state_treedef, state_leaves)
     embed_tokens = nnx.merge(graphdef, state)
     return embed_tokens(input_ids)
 
 
-def _final_norm_fn(graphdef, state, hidden_states):
+def _final_norm_fn(graphdef, state_leaves, state_treedef, hidden_states):
+    state = jax.tree_util.tree_unflatten(state_treedef, state_leaves)
     norm = nnx.merge(graphdef, state)
     return norm(hidden_states)
 
 
-def _logits_processor_fn(graphdef, state, hidden_states, logits_metadata):
+def _logits_processor_fn(
+    graphdef, state_leaves, state_treedef, hidden_states, logits_metadata
+):
+    state = jax.tree_util.tree_unflatten(state_treedef, state_leaves)
     logits_processor = nnx.merge(graphdef, state)
     return logits_processor(hidden_states, logits_metadata)
 
 
-jitted_embedding = jax.jit(_embedding_fn)
-jitted_final_norm = jax.jit(_final_norm_fn)
-jitted_logits_processor = jax.jit(_logits_processor_fn)
+jitted_embedding = jax.jit(_embedding_fn, static_argnames=["state_treedef"])
+jitted_final_norm = jax.jit(_final_norm_fn, static_argnames=["state_treedef"])
+jitted_logits_processor = jax.jit(
+    _logits_processor_fn, static_argnames=["state_treedef"]
+)
 
 
 class QWen3Model(nnx.Module):
@@ -362,9 +369,11 @@ class QWen3Model(nnx.Module):
         self._template_graphdef = None
         self._template_treedef = None
         self._embedding_graphdef = None
-        self._embedding_state = None
+        self._embedding_state_leaves = None
+        self._embedding_state_treedef = None
         self._norm_graphdef = None
-        self._norm_state = None
+        self._norm_state_leaves = None
+        self._norm_state_treedef = None
 
     def __call__(
         self,
@@ -385,14 +394,22 @@ class QWen3Model(nnx.Module):
                 leaves, _ = jax.tree_util.tree_flatten(state)
                 self._layer_states.append(leaves)
 
-            # Split embedding and norm
-            self._embedding_graphdef, self._embedding_state = nnx.split(
-                self.embed_tokens
+            # Split embedding and norm, then flatten
+            self._embedding_graphdef, embedding_state = nnx.split(self.embed_tokens)
+            self._embedding_state_leaves, self._embedding_state_treedef = (
+                jax.tree_util.tree_flatten(embedding_state)
             )
-            self._norm_graphdef, self._norm_state = nnx.split(self.norm)
+
+            self._norm_graphdef, norm_state = nnx.split(self.norm)
+            self._norm_state_leaves, self._norm_state_treedef = (
+                jax.tree_util.tree_flatten(norm_state)
+            )
 
         hidden_states = jitted_embedding(
-            self._embedding_graphdef, self._embedding_state, forward_batch.input_ids
+            self._embedding_graphdef,
+            self._embedding_state_leaves,
+            self._embedding_state_treedef,
+            forward_batch.input_ids,
         )
         residual = jnp.zeros_like(hidden_states)
 
@@ -419,7 +436,10 @@ class QWen3Model(nnx.Module):
         if residual is not None:
             hidden_states += residual
         hidden_states = jitted_final_norm(
-            self._norm_graphdef, self._norm_state, hidden_states
+            self._norm_graphdef,
+            self._norm_state_leaves,
+            self._norm_state_treedef,
+            hidden_states,
         )
 
         callback_flag = precision_tracer.jit_pure_callback_record(
@@ -445,7 +465,8 @@ class Qwen3ForCausalLM(nnx.Module):
             config.hf_config.vocab_size, self.lm_head, self.mesh
         )
         self._logits_processor_graphdef = None
-        self._logits_processor_state = None
+        self._logits_processor_state_leaves = None
+        self._logits_processor_state_treedef = None
 
     def load_weights(self, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
@@ -596,16 +617,21 @@ class Qwen3ForCausalLM(nnx.Module):
         logits_metadata: LogitsMetadata,
     ):
         if self._logits_processor_graphdef is None:
-            self._logits_processor_graphdef, self._logits_processor_state = nnx.split(
+            self._logits_processor_graphdef, logits_processor_state = nnx.split(
                 self.logits_processor
             )
+            (
+                self._logits_processor_state_leaves,
+                self._logits_processor_state_treedef,
+            ) = jax.tree_util.tree_flatten(logits_processor_state)
 
         hidden_states, layers_kv_fused, layers_callback_flag = self.transformer(
             forward_batch, token_to_kv_pool
         )
         output = jitted_logits_processor(
             self._logits_processor_graphdef,
-            self._logits_processor_state,
+            self._logits_processor_state_leaves,
+            self._logits_processor_state_treedef,
             hidden_states,
             logits_metadata,
         )
