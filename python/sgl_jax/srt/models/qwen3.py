@@ -305,23 +305,24 @@ jitted_qwen3_decoder_layer = jax.jit(
 )
 
 
-def _embedding_fn(embed_tokens, input_ids):
+def _embedding_fn(graphdef, state, input_ids):
+    embed_tokens = nnx.merge(graphdef, state)
     return embed_tokens(input_ids)
 
 
-def _final_norm_fn(norm, hidden_states):
+def _final_norm_fn(graphdef, state, hidden_states):
+    norm = nnx.merge(graphdef, state)
     return norm(hidden_states)
 
 
-def _logits_processor_fn(logits_processor, hidden_states, logits_metadata):
+def _logits_processor_fn(graphdef, state, hidden_states, logits_metadata):
+    logits_processor = nnx.merge(graphdef, state)
     return logits_processor(hidden_states, logits_metadata)
 
 
-jitted_embedding = jax.jit(_embedding_fn, static_argnames=["embed_tokens"])
-jitted_final_norm = jax.jit(_final_norm_fn, static_argnames=["norm"])
-jitted_logits_processor = jax.jit(
-    _logits_processor_fn, static_argnames=["logits_processor"]
-)
+jitted_embedding = jax.jit(_embedding_fn)
+jitted_final_norm = jax.jit(_final_norm_fn)
+jitted_logits_processor = jax.jit(_logits_processor_fn)
 
 
 class QWen3Model(nnx.Module):
@@ -360,19 +361,21 @@ class QWen3Model(nnx.Module):
         self._layer_states = None
         self._template_graphdef = None
         self._template_treedef = None
+        self._embedding_graphdef = None
+        self._embedding_state = None
+        self._norm_graphdef = None
+        self._norm_state = None
 
     def __call__(
         self,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
     ):
-        hidden_states = jitted_embedding(self.embed_tokens, forward_batch.input_ids)
         layers_kv_fused = []
         layers_callback_flag = []
 
-        residual = jnp.zeros_like(hidden_states)
-
         if self._layer_states is None:
+            # Split layers
             self._template_graphdef, template_state = nnx.split(self.layers[0])
             _, self._template_treedef = jax.tree_util.tree_flatten(template_state)
 
@@ -381,6 +384,17 @@ class QWen3Model(nnx.Module):
             for state in states:
                 leaves, _ = jax.tree_util.tree_flatten(state)
                 self._layer_states.append(leaves)
+
+            # Split embedding and norm
+            self._embedding_graphdef, self._embedding_state = nnx.split(
+                self.embed_tokens
+            )
+            self._norm_graphdef, self._norm_state = nnx.split(self.norm)
+
+        hidden_states = jitted_embedding(
+            self._embedding_graphdef, self._embedding_state, forward_batch.input_ids
+        )
+        residual = jnp.zeros_like(hidden_states)
 
         for layer_id in range(len(self.layers)):
             layer_kv_buffer = token_to_kv_pool.get_fused_kv_buffer(layer_id)
@@ -404,7 +418,9 @@ class QWen3Model(nnx.Module):
 
         if residual is not None:
             hidden_states += residual
-        hidden_states = jitted_final_norm(self.norm, hidden_states)
+        hidden_states = jitted_final_norm(
+            self._norm_graphdef, self._norm_state, hidden_states
+        )
 
         callback_flag = precision_tracer.jit_pure_callback_record(
             hidden_states, "transformer_output", "TRANSFORMER"
@@ -428,6 +444,8 @@ class Qwen3ForCausalLM(nnx.Module):
         self.logits_processor = LogitsProcessor(
             config.hf_config.vocab_size, self.lm_head, self.mesh
         )
+        self._logits_processor_graphdef = None
+        self._logits_processor_state = None
 
     def load_weights(self, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
@@ -577,11 +595,19 @@ class Qwen3ForCausalLM(nnx.Module):
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
+        if self._logits_processor_graphdef is None:
+            self._logits_processor_graphdef, self._logits_processor_state = nnx.split(
+                self.logits_processor
+            )
+
         hidden_states, layers_kv_fused, layers_callback_flag = self.transformer(
             forward_batch, token_to_kv_pool
         )
         output = jitted_logits_processor(
-            self.logits_processor, hidden_states, logits_metadata
+            self._logits_processor_graphdef,
+            self._logits_processor_state,
+            hidden_states,
+            logits_metadata,
         )
         return output, layers_kv_fused, layers_callback_flag
 
