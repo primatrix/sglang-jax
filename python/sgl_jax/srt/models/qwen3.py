@@ -305,6 +305,23 @@ jitted_qwen3_decoder_layer = jax.jit(
 )
 
 
+def _embedding_fn(embed_tokens, input_ids):
+    return embed_tokens(input_ids)
+
+
+def _final_norm_fn(norm, hidden_states):
+    return norm(hidden_states)
+
+
+def _logits_processor_fn(logits_processor, hidden_states, logits_metadata):
+    return logits_processor(hidden_states, logits_metadata)
+
+
+jitted_embedding = jax.jit(_embedding_fn)
+jitted_final_norm = jax.jit(_final_norm_fn)
+jitted_logits_processor = jax.jit(_logits_processor_fn)
+
+
 class QWen3Model(nnx.Module):
     def __init__(
         self,
@@ -347,7 +364,7 @@ class QWen3Model(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
     ):
-        hidden_states = self.embed_tokens(forward_batch.input_ids)
+        hidden_states = jitted_embedding(self.embed_tokens, forward_batch.input_ids)
         layers_kv_fused = []
         layers_callback_flag = []
 
@@ -385,7 +402,7 @@ class QWen3Model(nnx.Module):
 
         if residual is not None:
             hidden_states += residual
-        hidden_states = self.norm(hidden_states)
+        hidden_states = jitted_final_norm(self.norm, hidden_states)
 
         callback_flag = precision_tracer.jit_pure_callback_record(
             hidden_states, "transformer_output", "TRANSFORMER"
@@ -561,7 +578,9 @@ class Qwen3ForCausalLM(nnx.Module):
         hidden_states, layers_kv_fused, layers_callback_flag = self.transformer(
             forward_batch, token_to_kv_pool
         )
-        output = self.logits_processor(hidden_states, logits_metadata)
+        output = jitted_logits_processor(
+            self.logits_processor, hidden_states, logits_metadata
+        )
         return output, layers_kv_fused, layers_callback_flag
 
 
