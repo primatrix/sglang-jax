@@ -317,9 +317,11 @@ def _logits_processor_fn(logits_processor, hidden_states, logits_metadata):
     return logits_processor(hidden_states, logits_metadata)
 
 
-jitted_embedding = jax.jit(_embedding_fn)
-jitted_final_norm = jax.jit(_final_norm_fn)
-jitted_logits_processor = jax.jit(_logits_processor_fn)
+jitted_embedding = jax.jit(_embedding_fn, static_argnames=["embed_tokens"])
+jitted_final_norm = jax.jit(_final_norm_fn, static_argnames=["norm"])
+jitted_logits_processor = jax.jit(
+    _logits_processor_fn, static_argnames=["logits_processor"]
+)
 
 
 class QWen3Model(nnx.Module):
