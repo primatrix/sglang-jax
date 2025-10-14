@@ -171,4 +171,53 @@ def get_model_loader(
     if load_config.load_format == LoadFormat.JAX:
         return JAXModelLoader(load_config, rngs, mesh)
 
+    if load_config.load_format == LoadFormat.DUMMY:
+        return DummyModelLoader(load_config, rngs, mesh)
     return JAXModelLoader(load_config, rngs, mesh)
+
+
+class DummyModelLoader(BaseModelLoader):
+    """Model loader that will set model weights to random values."""
+
+    def __init__(
+            self, load_config: LoadConfig, rngs: jax.Array, mesh: jax.sharding.Mesh
+    ):
+        super().__init__(load_config)
+        if load_config.load_format != LoadFormat.DUMMY:
+            raise ValueError(
+                f"DummyModelLoader only supports JAX load format, "
+                f"got {load_config.load_format}"
+            )
+
+        self.rngs = rngs
+        self.mesh = mesh
+
+    def download_model(self, model_config: ModelConfig) -> None:
+        pass  # Nothing to download
+
+    def _get_model(self, model_class: Any, model_config: ModelConfig) -> nnx.Module:
+        @nnx.jit
+        def create_model(rng: nnx.Rngs):
+            model = model_class(model_config, rng, self.mesh)
+            state = nnx.state(model)
+            pspecs = nnx.get_partition_spec(state)
+            sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
+            nnx.update(model, sharded_state)
+            return model
+
+        with self.mesh:
+            model = create_model(self.rngs)
+
+        return model
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+    ) -> nnx.Module:
+        model, _ = get_model_architecture(model_config)
+        # For accurate performance evaluation, we assign
+        # random values to the weights.
+        return self._get_model(model, model_config)
+
+
