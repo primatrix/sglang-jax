@@ -29,7 +29,7 @@ from sgl_jax.srt.mem_cache.allocator import (
 )
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sgl_jax.srt.model_loader.loader import JAXModelLoader
+from sgl_jax.srt.model_loader.loader import JAXModelLoader, get_model_loader
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
@@ -92,15 +92,16 @@ class ModelRunner:
         global_server_args_dict.update(
             {k: getattr(server_args, k) for k in GLOBAL_SERVER_ARGS_KEYS}
         )
-
-        self.model_loader = JAXModelLoader(
-            load_config=LoadConfig(
-                load_format=LoadFormat.JAX, download_dir=server_args.download_dir
-            ),
+        load_config = LoadConfig(
+            load_format=LoadFormat.JAX, download_dir=server_args.download_dir
+        )
+        if server_args.load_format == LoadFormat.DUMMY:
+            load_config = LoadConfig(load_format=LoadFormat.DUMMY)
+        self.model_loader = get_model_loader(
+            load_config=load_config,
             rngs=rngs,
             mesh=self.mesh,
         )
-
         # Initialize precision tracer enable state
         precision_tracer.set_enable_precision_tracer(
             server_args.enable_precision_tracer
