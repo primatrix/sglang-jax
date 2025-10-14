@@ -249,10 +249,10 @@ class QWen3DecoderLayer(nnx.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
-        layer_norm_callback_flag = precision_tracer.jit_pure_callback_record(
-            hidden_states, "input_layernorm_output", "INPUT_LAYERNORM", layer_id
-        )
-        layer_callback_flag.append(layer_norm_callback_flag)
+        # layer_norm_callback_flag = precision_tracer.jit_pure_callback_record(
+        #     hidden_states, "input_layernorm_output", "INPUT_LAYERNORM", layer_id
+        # )
+        # layer_callback_flag.append(layer_norm_callback_flag)
 
         hidden_states, kv_fused = self.self_attn(
             positions=positions,
@@ -261,19 +261,19 @@ class QWen3DecoderLayer(nnx.Module):
             layer_kv_buffer=layer_kv_buffer,
         )
 
-        attn_callback_flag = precision_tracer.jit_pure_callback_record(
-            hidden_states, "self_attn_output", "SELF_ATTN", layer_id
-        )
-        layer_callback_flag.append(attn_callback_flag)
+        # attn_callback_flag = precision_tracer.jit_pure_callback_record(
+        #     hidden_states, "self_attn_output", "SELF_ATTN", layer_id
+        # )
+        # layer_callback_flag.append(attn_callback_flag)
         hidden_states += residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
 
-        mlp_callback_flag = precision_tracer.jit_pure_callback_record(
-            hidden_states, "mlp_output", "MLP", layer_id
-        )
-        layer_callback_flag.append(mlp_callback_flag)
+        # mlp_callback_flag = precision_tracer.jit_pure_callback_record(
+        #     hidden_states, "mlp_output", "MLP", layer_id
+        # )
+        # layer_callback_flag.append(mlp_callback_flag)
 
         return hidden_states, residual, kv_fused, layer_callback_flag
 
@@ -442,9 +442,9 @@ class QWen3Model(nnx.Module):
             hidden_states,
         )
 
-        callback_flag = precision_tracer.jit_pure_callback_record(
-            hidden_states, "transformer_output", "TRANSFORMER"
-        )
+        # callback_flag = precision_tracer.jit_pure_callback_record(
+        #     hidden_states, "transformer_output", "TRANSFORMER"
+        # )
         layers_callback_flag.append(callback_flag)
         return hidden_states, layers_kv_fused, layers_callback_flag
 
