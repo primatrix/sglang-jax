@@ -113,6 +113,7 @@ def _get_memory_usage():
         for i, device in enumerate(jax.devices()):
             try:
                 device_stats = device.memory_stats()
+                print(device_stats)
                 stats[f"device_{i}"] = device_stats.get("bytes_in_use", 0) / (1024**3)
             except:
                 stats[f"device_{i}"] = "N/A"
