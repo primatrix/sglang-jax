@@ -97,9 +97,12 @@ class MockLinear(nnx.Module):
         # Record memory after weight creation
         after_memory = print_memory("After weight creation")
 
-        # Show actual sharding info
-        print(f"    Weight sharding: {self.weight.value.sharding}")
-        print(f"    Weight devices: {list(self.weight.value.devices())}")
+        # Show actual sharding info (only outside JIT context)
+        try:
+            print(f"    Weight sharding: {self.weight.value.sharding}")
+            print(f"    Weight devices: {list(self.weight.value.devices())}")
+        except:
+            print("    Weight sharding info: (unavailable in JIT context)")
 
         # Calculate memory difference if possible
         try:
@@ -332,28 +335,30 @@ class MockModelRunner:
             start_time = time.time()
 
             # This mimics the model creation in model_loader.py
-            self.model = self.create_model(
-                self.model_config, self.dtype, self.rngs, self.mesh
-            )
-
+            self.model = self.create_model()
+            print_memory("Created Model")
             init_time = time.time() - start_time
             print(f"\nModel initialization completed in {init_time:.3f}s")
 
             # Initialize JIT (mimics ModelRunner.initialize_jit)
             self.initialize_jit()
 
-    @nnx.jit
-    def create_model(self, model_config, dtype, rngs, mesh):
-        """Create model with jit decorator like in the actual code"""
-        model = MockModel(model_config, dtype, rngs, mesh)
+    def create_model(self):
+        """Create model like in the actual code"""
 
-        # Apply sharding constraint like in the actual code
-        state = nnx.state(model)
-        pspecs = nnx.get_partition_spec(state)
-        sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
-        nnx.update(model, sharded_state)
+        @nnx.jit
+        def create_model_jitted(rngs: nnx.Rngs):
+            model = MockModel(self.model_config, self.dtype, rngs, self.mesh)
 
-        return model
+            # Apply sharding constraint like in the actual code
+            state = nnx.state(model)
+            pspecs = nnx.get_partition_spec(state)
+            sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
+            nnx.update(model, sharded_state)
+
+            return model
+
+        return create_model_jitted(self.rngs)
 
     def initialize_jit(self):
         """Initialize JIT functions like in actual ModelRunner"""
