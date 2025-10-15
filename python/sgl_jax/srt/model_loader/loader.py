@@ -15,6 +15,7 @@ from sgl_jax.srt.configs.load_config import LoadConfig, LoadFormat
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.model_loader.arch import get_model_architecture
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
+from sgl_jax.srt.utils.jax_utils import print_memory
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +108,7 @@ class JAXModelLoader(BaseModelLoader):
         with self.mesh:
             model = create_model(self.rng)
             time.sleep(1000)
+            print_memory("Created Model")
 
         rng_key = self.rng.default.key.value
         # FIXME: Better interface not to pass in model_config again
