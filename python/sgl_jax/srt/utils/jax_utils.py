@@ -105,3 +105,29 @@ def is_tpu_runtime() -> bool:
         return len(devs) > 0 and all(d.platform == "tpu" for d in devs)
     except Exception:
         return jax.default_backend() == "tpu"
+
+
+def _get_memory_usage():
+    try:
+        stats = {}
+        for i, device in enumerate(jax.devices()):
+            try:
+                device_stats = device.memory_stats()
+                stats[f"device_{i}"] = device_stats.get("bytes_in_use", 0) / (1024**3)
+            except:
+                stats[f"device_{i}"] = "N/A"
+        return stats
+    except:
+        return {f"device_{i}": "N/A" for i in range(len(jax.devices()))}
+
+
+def print_memory(stage_name):
+    memory = _get_memory_usage()
+    print(f"\n[{stage_name}] Memory usage:")
+    for device, usage in memory.items():
+        print(
+            f"  {device}: {usage}GB"
+            if isinstance(usage, float)
+            else f"  {device}: {usage}"
+        )
+    return memory

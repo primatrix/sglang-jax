@@ -15,6 +15,7 @@ from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.precision_tracer import precision_tracer
+from sgl_jax.srt.utils.jax_utils import print_memory
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -290,6 +291,7 @@ class QWen3Model(nnx.Module):
         rngs: nnx.Rngs = None,
     ):
 
+        print_memory("Init Qwen3 Model")
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
@@ -315,6 +317,7 @@ class QWen3Model(nnx.Module):
             scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
+        print_memory("End Init Qwen3 Model")
 
     def __call__(
         self,
