@@ -458,6 +458,26 @@ class PrecisionTracer:
             current_idx = 0
             result = {}
 
+            # Debug: Print batch information
+            logger.info(f"[TENSOR_DEBUG] Processing tensor with shape {tensor.shape}")
+            logger.info(f"[TENSOR_DEBUG] Batch has {len(request_in_batch)} requests")
+            total_expected_tokens = 0
+            for i, req_meta in enumerate(request_in_batch):
+                seq_len = req_meta.input_len if req_meta.forward_mode == 1 else 1
+                total_expected_tokens += seq_len
+                logger.info(
+                    f"[TENSOR_DEBUG] Request {i}: {req_meta.request_id[:8]}, forward_mode={req_meta.forward_mode}, input_len={req_meta.input_len}, expected_tokens={seq_len}"
+                )
+            logger.info(
+                f"[TENSOR_DEBUG] Total expected tokens: {total_expected_tokens}, tensor size: {total_batch_size}"
+            )
+
+            if total_expected_tokens > total_batch_size:
+                logger.error(
+                    f"[TENSOR_DEBUG] MISMATCH: Expected {total_expected_tokens} tokens but tensor only has {total_batch_size}"
+                )
+                # Still continue to see where exactly it fails
+
             for idx, req_meta in enumerate(request_in_batch):
                 req_id = req_meta.request_id
                 if req_meta.forward_mode == 1:
@@ -467,14 +487,17 @@ class PrecisionTracer:
 
                 if current_idx + seq_len > total_batch_size:
                     logger.error(
-                        f"[TENSOR_DEBUG] ERROR: Request {req_id} requires {seq_len} tokens, "
+                        f"[TENSOR_DEBUG] ERROR: Request {idx+1}/{len(request_in_batch)} ({req_id[:8]}) requires {seq_len} tokens, "
                         f"but only {total_batch_size - current_idx} left in tensor of shape {tensor.shape}. "
-                        f"Current position: {current_idx}"
+                        f"Current position: {current_idx}, forward_mode: {req_meta.forward_mode}, input_len: {req_meta.input_len}"
                     )
                     continue
 
                 slice_tensor = jnp.take(
                     tensor, jnp.arange(current_idx, current_idx + seq_len), axis=0
+                )
+                logger.debug(
+                    f"[TENSOR_DEBUG] Processing request {idx+1}/{len(request_in_batch)} ({req_id[:8]}): tokens [{current_idx}:{current_idx + seq_len}]"
                 )
                 current_idx += seq_len
 
