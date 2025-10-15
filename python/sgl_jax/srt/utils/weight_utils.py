@@ -14,6 +14,7 @@ from jax.sharding import PartitionSpec as P
 from safetensors import safe_open
 from tqdm import tqdm
 
+from demo_deferred_init_issue import print_memory
 from sgl_jax.srt.configs.model_config import ModelConfig
 
 logger = logging.getLogger(__name__)
@@ -110,7 +111,7 @@ class WeightLoader:
         logger.info(
             f"WeightLoader: Will load layers 0 to {self.model_config.num_hidden_layers - 1}"
         )
-
+        print_memory("Before Load Weights")
         for hf_key, hf_weight in self._iterate_weights():
             if hf_key in regular_mappings:
                 mapping = regular_mappings[hf_key]
@@ -128,7 +129,9 @@ class WeightLoader:
                     logger.debug(f"Skipping excluded layer weight: {hf_key}")
                 else:
                     logger.warning(f"No mapping found for weight: {hf_key}")
+            print_memory("Before NNX Update")
             nnx.update(self.model, params)
+            print_memory("After NNX Update")
 
         if moe_mappings:
             self._process_moe_expert_weights(params, moe_mappings, expert_weights)
