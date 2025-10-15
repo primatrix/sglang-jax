@@ -107,8 +107,8 @@ class JAXModelLoader(BaseModelLoader):
 
         with self.mesh:
             model = create_model(self.rng)
-            time.sleep(1000)
             print_memory("Created Model")
+            time.sleep(1000)
 
         rng_key = self.rng.default.key.value
         # FIXME: Better interface not to pass in model_config again
