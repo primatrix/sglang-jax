@@ -4,6 +4,8 @@ import jax
 from flax import nnx
 from jax import numpy as jnp
 
+from sgl_jax.srt.utils.jax_utils import print_memory
+
 
 def _canonicalize_tuple(x):
     if isinstance(x, Iterable):
@@ -41,11 +43,13 @@ class LinearBase(nnx.Module):
     ):
         """Initialize parameters and quantization method."""
         self.skip_bias_add = skip_bias_add
+        print_memory("Init Linear")
         self.weight = nnx.Param(
             nnx.with_partitioning(nnx.initializers.normal(), kernel_axes)(
                 rngs.params(), (input_size, output_size), params_dtype
             )
         )
+        print_memory("End Init Linear")
         if use_bias:
             self.bias = nnx.Param(
                 nnx.with_partitioning(
