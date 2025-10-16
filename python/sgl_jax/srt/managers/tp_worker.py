@@ -401,16 +401,6 @@ class ModelWorker:
                     model_worker_batch
                 )
             )
-            if model_worker_batch.forward_mode == ForwardMode.TARGET_VERIFY:
-                print(
-                    f"----------forward_metadata----------------{forward_metadata.cu_q_lens}-------------------"
-                )
-                print(
-                    f"----------forward_metadata----------------{forward_metadata.cu_kv_lens}-------------------"
-                )
-                print(
-                    f"----------forward_metadata----------------{forward_metadata.custom_mask}-------------------"
-                )
 
         self.model_runner.attn_backend.forward_metadata = forward_metadata
         logits_output, cache_miss_count = self.model_runner.forward(

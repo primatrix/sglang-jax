@@ -109,9 +109,6 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.custom_mask = batch.spec_info.custom_mask.astype(jnp.int32)
             else:
                 metadata.custom_mask = batch.spec_info.custom_mask
-            logger.info(
-                f"========{metadata.custom_mask.shape}==========target_verify {metadata.custom_mask}"
-            )
         else:
             metadata.custom_mask = None
 

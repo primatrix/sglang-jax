@@ -82,13 +82,10 @@ class EAGLEWorker(ModelWorker):
         else:
             # draft
             spec_info = self.draft(batch)
-            print(f"-----------------*******************{spec_info.draft_token}")
             # verify
             logits_output, verify_output, model_worker_batch, _ = self.verify(
                 batch, spec_info
             )
-            print(f"{verify_output.accept_length_per_req_cpu=}")
-            print(f"{verify_output.verified_id=}")
 
             # TODO: if enable_dp_attention, add condition here
             if batch.spec_info.verified_id.shape[0] > 0:
@@ -206,9 +203,7 @@ class EAGLEWorker(ModelWorker):
         spec_info.num_tokens_per_batch = self.topk
         spec_info.num_tokens_for_logprob_per_batch = self.topk
         batch.return_hidden_states = False
-        print(
-            f"...................{spec_info.hidden_states[:100]}........................"
-        )
+
         # if not model_worker_batch.forward_mode.is_idle():
         #     forward_batch = ForwardBatch.init_new(
         #         model_worker_batch, self.draft_model_runner
@@ -516,9 +511,6 @@ class EAGLEWorker(ModelWorker):
             spec_info.topk_index,
             spec_info.hidden_states,
         )
-        logger.info(
-            f"==============topk_index======={topk_index}======================="
-        )
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
         out_cache_loc = out_cache_loc[
@@ -538,9 +530,6 @@ class EAGLEWorker(ModelWorker):
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
-            )
-            logger.info(
-                f"=============tree_info[1]========{tree_info[1]}======================="
             )
 
             score_list.append(tree_info[0])
