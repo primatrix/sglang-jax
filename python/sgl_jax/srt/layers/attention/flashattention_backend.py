@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 from typing import Tuple
 
@@ -17,6 +18,8 @@ from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.utils import cdiv
 from sgl_jax.srt.utils.jax_utils import device_array
+
+logger = logging.getLogger(__name__)
 
 
 @register_pytree_node_class
@@ -106,16 +109,31 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.custom_mask = batch.spec_info.custom_mask.astype(jnp.int32)
             else:
                 metadata.custom_mask = batch.spec_info.custom_mask
+            logger.info(
+                f"========{metadata.custom_mask.shape}==========target_verify {metadata.custom_mask}"
+            )
         else:
             metadata.custom_mask = None
 
         if batch.forward_mode.is_extend():
-            cu_q_lens = np.concatenate(
-                [
-                    np.array([0], dtype=np.int32),
-                    np.cumsum(batch.extend_seq_lens),
-                ]
-            )
+            if batch.forward_mode.is_target_verify():
+                if batch.spec_info.topk == 1:
+                    cu_q_lens = np.arange(
+                        0,
+                        batch.seq_lens.shape[0] * batch.spec_info.draft_token_num + 1,
+                        batch.spec_info.draft_token_num,
+                    )
+                else:
+                    pass
+            else:
+                cu_q_lens = np.concatenate(
+                    [
+                        np.array([0], dtype=np.int32),
+                        np.cumsum(batch.extend_seq_lens),
+                    ]
+                )
+            # if batch.forward_mode == ForwardMode.TARGET_VERIFY:
+            # logger.info(f"***********{batch.forward_mode}******cu_q_lens****{batch.extend_seq_lens}*******{batch.extend_prefix_lens}******{cu_q_lens}")
         elif batch.forward_mode == ForwardMode.DECODE:
             cu_q_lens = jnp.concatenate(
                 [
@@ -231,7 +249,6 @@ class FlashAttentionBackend(AttentionBackend):
         custom_mask = self.forward_metadata.custom_mask
         if forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:
             causal = 0
-
         in_specs = (
             P(None, self.kv_partition_axis),  # queries
             P(None, self.kv_partition_axis),  # keys (new tokens)

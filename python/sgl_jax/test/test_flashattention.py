@@ -675,7 +675,22 @@ class TestAttention(CustomTestCase):
         pass
 
     def test_gqa_prefill_with_custom_mask(self):
-        pass
+        """Test JAX attention accuracy against PyTorch reference"""
+        # Parameters
+        num_heads = 128
+        num_kv_heads = 8
+        head_dim = 128
+        lens = [(32, 32), (42, 66), (128, 256)]
+        page_size = [
+            16,
+        ]
+        causal_mask = False
+        for size in page_size:
+            self.run_test(
+                "prefill",
+                lens,
+                (num_heads, head_dim, num_kv_heads, size, jnp.bfloat16, causal_mask),
+            )
 
     def test_gqa_decode_with_custom_mask(self):
         pass

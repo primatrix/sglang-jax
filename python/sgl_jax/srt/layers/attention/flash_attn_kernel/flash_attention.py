@@ -165,10 +165,11 @@ def ref_ragged_paged_attention(
         else:
             mask_start = cu_mask_lens[i]
             mask_end = cu_mask_lens[i + 1]
+            print(f"mask_start,  mask_end {mask_start} {mask_end}")
             mask = custom_mask[mask_start:mask_end]
             mask = (
-                jnp.repeat(jnp.expand_dims(mask, axis=0), num_kv_heads, axis=0).reshape(
-                    num_kv_heads, q_len, kv_len
+                jnp.repeat(jnp.expand_dims(mask, axis=0), num_q_heads, axis=0).reshape(
+                    num_q_heads, q_len, kv_len
                 )
                 < 1
             )
@@ -378,12 +379,12 @@ def _ragged_paged_attention_kernel(
                 sem,
                 wait,
             )
-            _async_copy(
-                zero_mask_ref.at[pl.ds(0, bkv_sz - load_kvmask_sz)],
-                kvmask_vmem_ref.at[i, pl.ds(load_kvmask_sz, bkv_sz - load_kvmask_sz)],
-                sem,
-                wait,
-            )
+            # _async_copy(
+            #     zero_mask_ref.at[pl.ds(0, bkv_sz - load_kvmask_sz)],
+            #     kvmask_vmem_ref.at[i, pl.ds(load_kvmask_sz, bkv_sz - load_kvmask_sz)],
+            #     sem,
+            #     wait,
+            # )
 
         lax.fori_loop(
             0,

@@ -153,7 +153,7 @@ def build_tree_kernel_efficient_preprocess(
     parents_list: List[jax.Array],
     num_verify_tokens: int,
 ):
-
+    logger.info(f"verified_id.......................{verified_id}")
     # Concatenate score_list along dim=1 and flatten from dim=1 onwards
     # b, n, topk; n = 1 + (num_steps-1) * self.topk
     score_tensor = jnp.concatenate(score_list, axis=1)
@@ -609,6 +609,9 @@ class EagleVerifyInput:
             target_predict = jnp.argmax(
                 logits_output.next_token_logits, axis=-1
             ).flatten()
+            print(
+                f"aaaaaaaaaaaaaaaaaa......{target_predict}........{candidates}......."
+            )
 
             accept_index, accept_length, predict = verify_tree_greedy(
                 predicts=predict,  # mutable
@@ -619,6 +622,9 @@ class EagleVerifyInput:
                 retrive_next_token=self.retrive_next_token,
                 retrive_next_sibling=self.retrive_next_sibling,
                 target_predict=target_predict,
+            )
+            print(
+                f"bbbbbbbbbbbbbbbbbbb......{accept_index}....{accept_length}.......{predict}..............."
             )
         else:
             # apply temperature and get target probs
@@ -719,6 +725,9 @@ class EagleVerifyInput:
         # TODO: fuse them
         accept_index = accept_index[accept_index != -1]
         verified_id = predict[accept_index]
+        logger.info(
+            f"////////////////accept_index {accept_index} {predict} {verified_id}"
+        )
         evict_mask = jnp.full_like(self.draft_token, True, dtype=jnp.bool)
         evict_mask = evict_mask.at[accept_index].set(False)
 
@@ -950,6 +959,9 @@ def build_eagle_tree_structure(
         tree_mask_size = (
             seq_lens_sum * draft_token_num + draft_token_num * draft_token_num * bs
         )
+        print(
+            f"*{seq_lens_sum}***{draft_token_num}***{bs}**{tree_mask_size}*************"
+        )
     else:
         tree_mask_size = bs * draft_token_num * draft_token_num
 
@@ -967,7 +979,7 @@ def build_eagle_tree_structure(
         if tree_mask_mode == 0:  # FULL_MASK
             for i in range(bid):
                 seq_tree_idx += verified_seq_len[i] * draft_token_num
-
+        print(f"+++++++++++++++++++++{seq_tree_idx}")
         for tid in range(draft_token_num):
             global_token_idx = bid * draft_token_num + tid
 
@@ -980,6 +992,7 @@ def build_eagle_tree_structure(
                 token_tree_idx = (
                     draft_token_num * draft_token_num * bid + draft_token_num * tid + 1
                 )
+            print(f"+++++++++++++++++++++{token_tree_idx}")
 
             # Set tree_mask for this token
             if token_tree_idx > 0 and token_tree_idx <= tree_mask_size:

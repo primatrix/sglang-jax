@@ -91,17 +91,40 @@ def verify_tree_greedy(
       accept_token_num: accept token number, shape: (bs,)
     """
     num_speculative_tokens = accept_index.shape[1]
+    print(f"\n--------candidates-------{candidates}-------------------------")
+    print(f"--------target-------{target_predict}-------------------------\n")
+
+    print(f"----------------retrive_index{retrive_index}")
+    print(f"----------------retrive_next_token{retrive_next_token}")
+    print(f"----------------retrive_next_sibling{retrive_next_sibling}")
+
     for bid, _ in enumerate(candidates):
         last_accepted_retrive_idx = retrive_index[bid, 0]
         accept_index = accept_index.at[bid, 0].set(last_accepted_retrive_idx)
         num_accepted_tokens = 0
         cur_index = 0
+        print(
+            f"-------bid----{bid}---last_accepted_retrive_idx-----{last_accepted_retrive_idx}-----accept_index---{accept_index}------------------------"
+        )
         for j in range(1, num_speculative_tokens):
             cur_index = retrive_next_token[bid][cur_index]
+            print(f"--------cur_index--------{cur_index}--------------------------")
             while cur_index != -1:
                 draft_index = retrive_index[bid, cur_index]
+                print(
+                    f"-------draft_index---------{draft_index}--------------------------"
+                )
+
                 draft_token_id = candidates[bid, cur_index]
+                print(
+                    f"-------draft_token_id---------{draft_token_id}--------------------------"
+                )
+
                 target_token_id = target_predict[last_accepted_retrive_idx]
+                print(
+                    f"-------target_token_id---------{target_token_id}--------last_accepted_retrive_idx-----{last_accepted_retrive_idx}-------------"
+                )
+
                 if draft_token_id == target_token_id:
                     predicts = predicts.at[last_accepted_retrive_idx].set(
                         target_token_id
@@ -120,7 +143,7 @@ def verify_tree_greedy(
         predicts = predicts.at[last_accepted_retrive_idx].set(
             target_predict[last_accepted_retrive_idx]
         )
-
+    print(f"*******************{accept_index}*************")
     return accept_index, accept_token_num, predicts
 
 

@@ -97,6 +97,9 @@ class LogitsProcessorOutput:
         # note: here only need to truncate next_token_logits and hidden_states
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
             # For ForwardMode.TARGET_VERIFY mode, we should take draft_token_num token for tree verify later
+            print(
+                f"---------------self.next_token_logits {self.next_token_logits.shape}"
+            )
             self.next_token_logits = jax.lax.dynamic_slice_in_dim(
                 self.next_token_logits, 0, batch.spec_info.draft_token_num, axis=0
             )
@@ -333,6 +336,9 @@ class LogitsProcessor(nnx.Module):
                         if sample_indices is not None
                         else pruned_states
                     )
+                    assert (
+                        True
+                    ), f"hidden_states_to_store {hidden_states_to_store[:100]}"
             else:
                 assert False, "Should never reach"
 
