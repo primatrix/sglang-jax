@@ -379,12 +379,12 @@ def _ragged_paged_attention_kernel(
                 sem,
                 wait,
             )
-            # _async_copy(
-            #     zero_mask_ref.at[pl.ds(0, bkv_sz - load_kvmask_sz)],
-            #     kvmask_vmem_ref.at[i, pl.ds(load_kvmask_sz, bkv_sz - load_kvmask_sz)],
-            #     sem,
-            #     wait,
-            # )
+            _async_copy(
+                zero_mask_ref.at[pl.ds(0, bkv_sz - load_kvmask_sz)],
+                kvmask_vmem_ref.at[i, pl.ds(load_kvmask_sz, bkv_sz - load_kvmask_sz)],
+                sem,
+                wait,
+            )
 
         lax.fori_loop(
             0,
