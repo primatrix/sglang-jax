@@ -121,6 +121,7 @@ def verify_tree_greedy(
         predicts = predicts.at[last_accepted_retrive_idx].set(
             target_predict[last_accepted_retrive_idx]
         )
+    print(f"=================accept_token_num======================{accept_token_num}")
     return accept_index, accept_token_num, predicts
 
 
