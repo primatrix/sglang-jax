@@ -593,6 +593,7 @@ class SchedulerOutputProcessorMixin:
 
         # Send to detokenizer
         if rids:
+            logger.info(f"====================={output_ids}==============")
             out = BatchTokenIDOut(
                 rids,
                 finished_reasons,

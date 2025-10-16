@@ -698,9 +698,7 @@ class EagleVerifyInput:
 
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
-        for i, (req, accept_index_row) in enumerate(
-            zip(batch.reqs, accept_iforward_metadata - -----ndex_cpu)
-        ):
+        for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
             for j, idx in enumerate(accept_index_row):
                 if idx == -1:
                     break
