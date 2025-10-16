@@ -88,6 +88,8 @@ class EAGLEWorker(ModelWorker):
                 batch, spec_info
             )
             print(f"{verify_output.accept_length_per_req_cpu=}")
+            print(f"{verify_output.verified_id=}")
+
             # TODO: if enable_dp_attention, add condition here
             if batch.spec_info.verified_id.shape[0] > 0:
                 self.forward_draft_extend_after_decode(batch)
