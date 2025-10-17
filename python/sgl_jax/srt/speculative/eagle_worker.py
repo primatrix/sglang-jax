@@ -86,7 +86,7 @@ class EAGLEWorker(ModelWorker):
             logits_output, verify_output, model_worker_batch, _ = self.verify(
                 batch, spec_info
             )
-            print(f"{verify_output.accept_length_per_req_cpu=}")
+
             # TODO: if enable_dp_attention, add condition here
             if batch.spec_info.verified_id.shape[0] > 0:
                 self.forward_draft_extend_after_decode(batch)
@@ -531,6 +531,7 @@ class EAGLEWorker(ModelWorker):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
+
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])

@@ -333,6 +333,9 @@ class LogitsProcessor(nnx.Module):
                         if sample_indices is not None
                         else pruned_states
                     )
+                    assert (
+                        True
+                    ), f"hidden_states_to_store {hidden_states_to_store[:100]}"
             else:
                 assert False, "Should never reach"
 

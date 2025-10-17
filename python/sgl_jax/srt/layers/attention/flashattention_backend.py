@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 from typing import Tuple
 
@@ -18,6 +19,8 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardM
 from sgl_jax.srt.utils import cdiv
 from sgl_jax.srt.utils.jax_utils import device_array
 
+logger = logging.getLogger(__name__)
+
 
 @register_pytree_node_class
 @dataclass
@@ -34,6 +37,7 @@ class FlashAttentionMetadata:
     page_indices: jax.Array = None
     seq_lens: jax.Array = None
     distribution: jax.Array = None
+    custom_mask: jax.Array = None
 
     def tree_flatten(self):
         children = (
@@ -43,6 +47,7 @@ class FlashAttentionMetadata:
             self.page_indices,
             self.seq_lens,
             self.distribution,
+            self.custom_mask,
         )
 
         aux_data = {}
@@ -58,6 +63,7 @@ class FlashAttentionMetadata:
         obj.page_indices = children[3]
         obj.seq_lens = children[4]
         obj.distribution = children[5]
+        obj.custom_mask = children[6]
 
         return obj
 
@@ -97,13 +103,31 @@ class FlashAttentionBackend(AttentionBackend):
         selected_cache_locs = batch.cache_loc[indices]
         page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
 
+        if batch.forward_mode == ForwardMode.TARGET_VERIFY:
+            # convert custom_mask from bool to int32, because dma not support bool type
+            if batch.spec_info.custom_mask.dtype == jnp.bool:
+                metadata.custom_mask = batch.spec_info.custom_mask.astype(jnp.int32)
+            else:
+                metadata.custom_mask = batch.spec_info.custom_mask
+        else:
+            metadata.custom_mask = None
+
         if batch.forward_mode.is_extend():
-            cu_q_lens = np.concatenate(
-                [
-                    np.array([0], dtype=np.int32),
-                    np.cumsum(batch.extend_seq_lens),
-                ]
-            )
+            if batch.forward_mode.is_target_verify():
+                cu_q_lens = np.arange(
+                    0,
+                    batch.seq_lens.shape[0] * batch.spec_info.draft_token_num + 1,
+                    batch.spec_info.draft_token_num,
+                )
+            else:
+                cu_q_lens = np.concatenate(
+                    [
+                        np.array([0], dtype=np.int32),
+                        np.cumsum(batch.extend_seq_lens),
+                    ]
+                )
+            # if batch.forward_mode == ForwardMode.TARGET_VERIFY:
+            # logger.info(f"***********{batch.forward_mode}******cu_q_lens****{batch.extend_seq_lens}*******{batch.extend_prefix_lens}******{cu_q_lens}")
         elif batch.forward_mode == ForwardMode.DECODE:
             cu_q_lens = jnp.concatenate(
                 [
@@ -215,6 +239,10 @@ class FlashAttentionBackend(AttentionBackend):
             num_pages, self.page_size, -1, self.head_dim
         )
 
+        causal = 1
+        custom_mask = self.forward_metadata.custom_mask
+        if forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:
+            causal = 0
         in_specs = (
             P(None, self.kv_partition_axis),  # queries
             P(None, self.kv_partition_axis),  # keys (new tokens)
@@ -227,6 +255,7 @@ class FlashAttentionBackend(AttentionBackend):
             P(),  # cu_q_lens
             P(),  # cu_kv_lens
             P(),  # distribution
+            P(),  # custom_mask
         )
         out_specs = (
             P(None, self.kv_partition_axis),  # attention output
@@ -246,6 +275,7 @@ class FlashAttentionBackend(AttentionBackend):
                 values,
                 kv_cache_fused,
                 *other_args,
+                causal=causal,
                 sm_scale=scale,
                 sliding_window=None,
                 soft_cap=None,
@@ -272,6 +302,7 @@ class FlashAttentionBackend(AttentionBackend):
             self.forward_metadata.cu_q_lens,
             self.forward_metadata.cu_kv_lens,
             self.forward_metadata.distribution,
+            self.forward_metadata.custom_mask,
         )
 
         return (

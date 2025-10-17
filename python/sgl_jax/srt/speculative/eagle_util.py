@@ -153,7 +153,6 @@ def build_tree_kernel_efficient_preprocess(
     parents_list: List[jax.Array],
     num_verify_tokens: int,
 ):
-
     # Concatenate score_list along dim=1 and flatten from dim=1 onwards
     # b, n, topk; n = 1 + (num_steps-1) * self.topk
     score_tensor = jnp.concatenate(score_list, axis=1)
@@ -967,7 +966,6 @@ def build_eagle_tree_structure(
         if tree_mask_mode == 0:  # FULL_MASK
             for i in range(bid):
                 seq_tree_idx += verified_seq_len[i] * draft_token_num
-
         for tid in range(draft_token_num):
             global_token_idx = bid * draft_token_num + tid
 
