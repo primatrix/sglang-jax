@@ -114,14 +114,11 @@ class FlashAttentionBackend(AttentionBackend):
 
         if batch.forward_mode.is_extend():
             if batch.forward_mode.is_target_verify():
-                if batch.spec_info.topk == 1:
-                    cu_q_lens = np.arange(
-                        0,
-                        batch.seq_lens.shape[0] * batch.spec_info.draft_token_num + 1,
-                        batch.spec_info.draft_token_num,
-                    )
-                else:
-                    pass
+                cu_q_lens = np.arange(
+                    0,
+                    batch.seq_lens.shape[0] * batch.spec_info.draft_token_num + 1,
+                    batch.spec_info.draft_token_num,
+                )
             else:
                 cu_q_lens = np.concatenate(
                     [
