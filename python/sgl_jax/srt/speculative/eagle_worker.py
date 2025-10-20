@@ -147,8 +147,8 @@ class EAGLEWorker(ModelWorker):
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=next_token_ids[: model_worker_batch.real_bs],
-            num_tokens_per_batch=1,
-            num_tokens_for_logprob_per_batch=1,
+            num_tokens_per_batch=jnp.asarray(1, dtype=jnp.int32),
+            num_tokens_for_logprob_per_batch=jnp.asarray(1, dtype=jnp.int32),
         )
         batch.return_hidden_states = False
         batch.spec_info.prepare_for_extend(batch)
@@ -224,8 +224,10 @@ class EAGLEWorker(ModelWorker):
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-        spec_info.num_tokens_per_batch = self.topk
-        spec_info.num_tokens_for_logprob_per_batch = self.topk
+        spec_info.num_tokens_per_batch = jnp.asarray(self.topk, dtype=jnp.int32)
+        spec_info.num_tokens_for_logprob_per_batch = jnp.asarray(
+            self.topk, dtype=jnp.int32
+        )
         batch.return_hidden_states = False
 
         # if not model_worker_batch.forward_mode.is_idle():
@@ -455,8 +457,12 @@ class EAGLEWorker(ModelWorker):
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
 
-        batch.spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
-        batch.spec_info.num_tokens_for_logprob_per_batch = 1
+        batch.spec_info.num_tokens_per_batch = jnp.asarray(
+            self.speculative_num_steps + 1, dtype=jnp.int32
+        )
+        batch.spec_info.num_tokens_for_logprob_per_batch = jnp.asarray(
+            1, dtype=jnp.int32
+        )
         batch.spec_info.prepare_extend_after_decode(batch)
         batch.forward_mode = (
             ForwardMode.DRAFT_EXTEND
