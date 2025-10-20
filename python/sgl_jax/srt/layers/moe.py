@@ -581,12 +581,9 @@ class FusedMoE(nnx.Module):
             )
 
         # Compute top-k experts and delegate to indices variant
-        top_k_logits, top_k_indices = jax.lax.top_k(
-            router_logits, self.num_experts_per_tok
-        )
-        top_k_weights = jax.nn.softmax(
-            top_k_logits.astype(jnp.bfloat16), axis=-1
-        ).astype(self.dtype)
+        top_k_logits, top_k_indices = jax.lax.top_k(router_logits, self.num_experts_per_tok)
+        top_k_weights = jax.nn.softmax(top_k_logits.astype(jnp.bfloat16), axis=-1)
+        top_k_weights = top_k_weights.astype(self.dtype)
         top_k_weights = top_k_weights / jnp.sum(top_k_weights, axis=-1, keepdims=True)
 
         if inputs.ndim == 2:
