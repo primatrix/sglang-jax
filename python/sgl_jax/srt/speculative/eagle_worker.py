@@ -208,10 +208,11 @@ class EAGLEWorker(ModelWorker):
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
-        probs = jax.nn.softmax(logits_output.next_token_logits, axis=-1)
-        draft_input.topk_p, draft_input.topk_index = fast_topk(
-            probs, self.topk, axis=-1
+        topk_p, topk_index = topk_probs_from_logits(
+            logits_output.next_token_logits, self.topk
         )
+        draft_input.topk_p = topk_p
+        draft_input.topk_index = topk_index
         draft_input.hidden_states = logits_output.hidden_states
 
     def draft(self, batch: ScheduleBatch):
@@ -580,8 +581,9 @@ class EAGLEWorker(ModelWorker):
                 ),
             )
             # self._detect_nan_if_needed(logits_output)
-            probs = jax.nn.softmax(logits_output.next_token_logits, axis=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, axis=-1)
+            topk_p, topk_index = topk_probs_from_logits(
+                logits_output.next_token_logits, self.topk
+            )
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
@@ -702,22 +704,27 @@ class EAGLEWorker(ModelWorker):
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
 
+def topk_probs_from_logits(
+    logits: jax.Array, topk: int, axis: int = -1
+) -> Tuple[jax.Array, jax.Array]:
+    """Return top-k probabilities without materializing the full softmax tensor."""
+    working_logits = jnp.moveaxis(logits, axis, -1) if axis != -1 else logits
+    topk_logits, topk_index = jax.lax.top_k(working_logits, topk)
+    logsumexp = jax.nn.logsumexp(working_logits, axis=-1, keepdims=True)
+    topk_probs = jnp.exp(topk_logits - logsumexp)
+
+    if axis != -1:
+        topk_probs = jnp.moveaxis(topk_probs, -1, axis)
+        topk_index = jnp.moveaxis(topk_index, -1, axis)
+
+    return topk_probs, topk_index
+
+
 def fast_topk(values, topk, axis=-1):
-    if axis != -1:
-        # Move target axis to last position
-        values = jnp.moveaxis(values, axis, -1)
-
-    if topk == 1:
-        # Get max value and index for k=1 case
-        max_vals = jnp.max(values, axis=-1, keepdims=True)
-        max_indices = jnp.argmax(values, axis=-1, keepdims=True)
-        result_vals, result_indices = max_vals, max_indices
-    else:
-        # Use top_k for k>1 case (operates on last axis)
-        result_vals, result_indices = jax.lax.top_k(values, topk)
+    working_values = jnp.moveaxis(values, axis, -1) if axis != -1 else values
+    result_vals, result_indices = jax.lax.top_k(working_values, topk)
 
     if axis != -1:
-        # Move axis back to original position
         result_vals = jnp.moveaxis(result_vals, -1, axis)
         result_indices = jnp.moveaxis(result_indices, -1, axis)
 
