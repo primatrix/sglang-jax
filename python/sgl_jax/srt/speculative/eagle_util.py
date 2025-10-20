@@ -192,6 +192,7 @@ def build_tree_kernel_efficient(
     topk: int,
     spec_steps: int,
     num_verify_tokens: int,
+    max_seq_len_per_req: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """JAX implementation of build_tree_kernel_efficient.
 
@@ -205,6 +206,7 @@ def build_tree_kernel_efficient(
         topk: Number of top-k candidates
         spec_steps: Number of speculative steps
         num_verify_tokens: Number of tokens to verify
+        max_seq_len_per_req: Maximum allowed sequence length per request (static bound)
 
     Returns:
         tuple of (tree_mask, positions, retrive_index, retrive_next_token,
@@ -218,6 +220,13 @@ def build_tree_kernel_efficient(
 
     # Get batch size
     bs = seq_lens.shape[0]
+    actual_tree_mask_size = (
+        seq_lens_sum * num_verify_tokens + num_verify_tokens * num_verify_tokens * bs
+    )
+    max_tree_mask_size = (
+        max_seq_len_per_req * num_verify_tokens * bs
+        + num_verify_tokens * num_verify_tokens * bs
+    )
 
     tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling = (
         build_eagle_tree_structure(
@@ -230,6 +239,9 @@ def build_tree_kernel_efficient(
             depth=spec_steps,
             seq_lens_sum=seq_lens_sum,
             tree_mask_mode=0,  # FULL_MASK
+            max_seq_len_per_req=max_seq_len_per_req,
+            max_tree_mask_size=max_tree_mask_size,
+            actual_tree_mask_size=actual_tree_mask_size,
         )
     )
 
@@ -928,6 +940,9 @@ def build_eagle_tree_structure(
     depth: int,
     seq_lens_sum: int,
     tree_mask_mode: int = 0,  # FULL_MASK = 0
+    max_seq_len_per_req: int | None = None,
+    max_tree_mask_size: int | None = None,
+    actual_tree_mask_size: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """
     Args:
@@ -940,19 +955,46 @@ def build_eagle_tree_structure(
         depth: Tree depth
         seq_lens_sum: Sum of sequence lengths
         tree_mask_mode: Tree mask mode (0=FULL_MASK)
+        max_seq_len_per_req: Static upper bound for sequence length per request
+        max_tree_mask_size: Optional explicit capacity for the tree mask buffer
+        actual_tree_mask_size: Optional override for the exact number of valid mask entries
 
     Returns:
         tuple of (tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling)
     """
 
     if tree_mask_mode == 0:  # FULL_MASK
-        tree_mask_size = (
+        inferred_actual_size = (
             seq_lens_sum * draft_token_num + draft_token_num * draft_token_num * bs
         )
+        tree_mask_size = (
+            inferred_actual_size
+            if actual_tree_mask_size is None
+            else actual_tree_mask_size
+        )
+        inferred_capacity = (
+            max_seq_len_per_req * draft_token_num * bs
+            + draft_token_num * draft_token_num * bs
+            if max_seq_len_per_req is not None
+            else inferred_actual_size
+        )
+        tree_mask_capacity = (
+            inferred_capacity if max_tree_mask_size is None else max_tree_mask_size
+        )
     else:
-        tree_mask_size = bs * draft_token_num * draft_token_num
+        inferred_actual_size = bs * draft_token_num * draft_token_num
+        tree_mask_size = (
+            inferred_actual_size
+            if actual_tree_mask_size is None
+            else actual_tree_mask_size
+        )
+        tree_mask_capacity = (
+            inferred_actual_size if max_tree_mask_size is None else max_tree_mask_size
+        )
 
-    tree_mask = jnp.ones((tree_mask_size,), dtype=jnp.bool_)
+    tree_mask = jnp.zeros((tree_mask_capacity,), dtype=jnp.bool_)
+    if tree_mask_size > 0:
+        tree_mask = tree_mask.at[:tree_mask_size].set(True)
     positions = jnp.zeros((bs * draft_token_num,), dtype=jnp.int32)
     retrive_index = jnp.full((bs, draft_token_num), -1, dtype=jnp.int32)
     retrive_next_token = jnp.full((bs, draft_token_num), -1, dtype=jnp.int32)

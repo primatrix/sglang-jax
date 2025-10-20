@@ -259,6 +259,7 @@ class EAGLEWorker(ModelWorker):
             self.topk,
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,
+            int(batch.req_to_token_pool.req_to_token.shape[1]),
         )
         # build tree
         return EagleVerifyInput(

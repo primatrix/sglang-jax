@@ -233,6 +233,7 @@ def test_build_tree_kernel_efficient():
         topk=topk,
         spec_steps=depth,
         num_verify_tokens=num_draft_token,
+        max_seq_len_per_req=int(seq_lens.max()),
     )
 
     print("=========== build tree kernel efficient ==========")
@@ -508,6 +509,7 @@ def test_build_tree_simple_case():
         topk=2,
         spec_steps=1,
         num_verify_tokens=2,
+        max_seq_len_per_req=int(seq_lens.max()),
     )
 
     (
