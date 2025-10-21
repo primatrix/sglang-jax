@@ -663,6 +663,7 @@ class EagleVerifyInput:
         is_all_greedy = sampling_info.is_all_greedy
 
         if is_all_greedy:
+            logger.info(f"==============={is_all_greedy}===========================")
             target_predict = jnp.argmax(
                 logits_output.next_token_logits, axis=-1
             ).flatten()
@@ -678,23 +679,27 @@ class EagleVerifyInput:
                 target_predict=target_predict,
             )
         else:
+            logger.info(
+                f"-------------------{is_all_greedy}-----------------------------"
+            )
+
             # apply temperature and get target probs
             expanded_temperature = jnp.repeat(
                 sampling_info.temperatures, self.draft_token_num
             )  # (bs * draft_token_num, 1)
-
+            expanded_temperature = jnp.expand_dims(expanded_temperature, axis=-1)
             target_probs = jax.nn.softmax(
                 logits_output.next_token_logits / expanded_temperature, axis=-1
             )  # (bs * draft_token_num, vocab_size)
             # TODO: optimize top_k and top_p by avoiding sort
-            _, rng = jax.random.split(rng.params())
+            rngs = jax.random.split(rng.params(), 3)
             target_probs = top_k_top_p_min_p_sampling_from_probs_jax(
                 target_probs,
                 jnp.repeat(sampling_info.top_ks, self.draft_token_num),
                 jnp.repeat(sampling_info.top_ps, self.draft_token_num),
                 jnp.repeat(sampling_info.min_ps, self.draft_token_num),
                 sampling_info.need_min_p_sampling,
-                rng,
+                rngs[0],
             )
 
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
@@ -702,9 +707,11 @@ class EagleVerifyInput:
             draft_probs = jnp.zeros(target_probs.shape, dtype=jnp.float32)
 
             # coins for rejection sampling
-            coins = jax.random.uniform(candidates.shape, dtype=jnp.float32)
+            coins = jax.random.uniform(rngs[1], candidates.shape, dtype=jnp.float32)
             # coins for final sampling
-            coins_for_final_sampling = jax.random.uniform((bs,), dtype=jnp.float32)
+            coins_for_final_sampling = jax.random.uniform(
+                rngs[2], (bs,), dtype=jnp.float32
+            )
             accept_index, accept_length, predict = (
                 tree_speculative_sampling_target_only(
                     predicts=predict,

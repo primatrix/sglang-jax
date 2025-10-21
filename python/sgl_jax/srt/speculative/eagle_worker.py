@@ -124,6 +124,9 @@ class EAGLEWorker(ModelWorker):
         self, model_worker_batch: ModelWorkerBatch, sample_meta_data: SamplingMetadata
     ) -> Tuple[LogitsProcessorOutput, jax.Array, int, int, np.ndarray]:
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        logger.info(f"===={model_worker_batch=}=========")
+        logger.info(f"===={sample_meta_data=}=========")
+
         logits_output, next_token_ids, cache_miss_count = (
             self.target_worker.forward_batch_generation(
                 model_worker_batch, sampling_metadata=sample_meta_data
