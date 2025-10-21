@@ -63,22 +63,44 @@ class EAGLEWorker(ModelWorker):
     def forward_batch_speculative_generation(
         self,
         batch: ScheduleBatch,
-        model_worker_batch: ModelWorkerBatch,
-        sample_meta_data: SamplingMetadata,
     ):
         # prefill : Target Extend -> Decode Extend for Update Draft State
         # Decode : Draft → Verify → Update Draft State → Draft → Verify → ...
 
         if batch.forward_mode.is_extend():
+            (
+                precompile_token_paddings,
+                precompile_bs_paddings,
+                precompile_cache_loc_paddings,
+            ) = self.target_worker.get_precompile_paddings()
+
+            model_worker_batch = batch.get_model_worker_batch(
+                precompile_token_paddings,
+                precompile_bs_paddings,
+                precompile_cache_loc_paddings,
+                self.page_size,
+            )
+
+            sampling_metadata = SamplingMetadata.from_model_worker_batch(
+                model_worker_batch,
+                len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
+                self.mesh,
+            )
             # target extend
             logits_output, next_token_ids, cache_miss_count, bid, seq_lens = (
-                self.forward_target_extend(model_worker_batch, sample_meta_data)
+                self.forward_target_extend(model_worker_batch, sampling_metadata)
             )
             # draft extend for Update Draft State
             self.forward_draft_extend(
                 batch, model_worker_batch, logits_output.hidden_states, next_token_ids
             )
-            return logits_output, next_token_ids, cache_miss_count, 0
+            return (
+                model_worker_batch,
+                logits_output,
+                next_token_ids,
+                cache_miss_count,
+                0,
+            )
         else:
             # draft
             spec_info = self.draft(batch)
@@ -91,6 +113,7 @@ class EAGLEWorker(ModelWorker):
             if batch.spec_info.verified_id.shape[0] > 0:
                 self.forward_draft_extend_after_decode(batch)
             return (
+                model_worker_batch,
                 logits_output,
                 verify_output.verified_id,
                 sum(verify_output.accept_length_per_req_cpu),
@@ -488,7 +511,6 @@ class EAGLEWorker(ModelWorker):
         batch.return_logprob = return_logprob_backup
 
     def draft_forward(self, schedule_batch: ScheduleBatch):
-
         (
             precompile_token_paddings,
             precompile_bs_paddings,

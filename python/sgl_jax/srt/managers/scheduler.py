@@ -866,6 +866,7 @@ class Scheduler(
         initial_bs = batch.batch_size()
 
         batch.filter_batch()
+
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
@@ -910,44 +911,48 @@ class Scheduler(
         # Run forward
         assert self.is_generation
 
-        (
-            precompile_token_paddings,
-            precompile_bs_paddings,
-            precompile_cache_loc_paddings,
-        ) = self.tp_worker.get_precompile_paddings()
-
-        model_worker_batch = batch.get_model_worker_batch(
-            precompile_token_paddings,
-            precompile_bs_paddings,
-            precompile_cache_loc_paddings,
-            self.page_size,
-        )
-
-        sampling_metadata = SamplingMetadata.from_model_worker_batch(
-            model_worker_batch,
-            len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
-            self.mesh,
-        )
-
-        if self.enable_overlap:
-            # Pre-initialize ForwardBatch for overlap scheduling optimization
-            from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-
-            model_worker_batch.forward_batch = ForwardBatch.init_new(
-                model_worker_batch, self.tp_worker.get_model_runner()
-            )
         if self.spec_algorithm.is_none():
+            (
+                precompile_token_paddings,
+                precompile_bs_paddings,
+                precompile_cache_loc_paddings,
+            ) = self.tp_worker.get_precompile_paddings()
+
+            model_worker_batch = batch.get_model_worker_batch(
+                precompile_token_paddings,
+                precompile_bs_paddings,
+                precompile_cache_loc_paddings,
+                self.page_size,
+            )
+
+            sampling_metadata = SamplingMetadata.from_model_worker_batch(
+                model_worker_batch,
+                len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
+                self.mesh,
+            )
+
+            if self.enable_overlap:
+                # Pre-initialize ForwardBatch for overlap scheduling optimization
+                from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+
+                model_worker_batch.forward_batch = ForwardBatch.init_new(
+                    model_worker_batch, self.tp_worker.get_model_runner()
+                )
+
             logits_output, next_token_ids, cache_miss_count = (
                 self.tp_worker.forward_batch_generation(
                     model_worker_batch, sampling_metadata=sampling_metadata
                 )
             )
         else:
-            logits_output, next_token_ids, accept_length, cache_miss_count = (
-                self.draft_worker.forward_batch_speculative_generation(
-                    batch, model_worker_batch, sampling_metadata
-                )
-            )
+            (
+                model_worker_batch,
+                logits_output,
+                next_token_ids,
+                accept_length,
+                cache_miss_count,
+            ) = self.draft_worker.forward_batch_speculative_generation(batch)
+
         if self.enable_overlap:
             next_token_ids = next_token_ids[: model_worker_batch.real_bs]
         else:

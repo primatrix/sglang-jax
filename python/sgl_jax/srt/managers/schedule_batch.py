@@ -22,6 +22,7 @@ import threading
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
 
+import jax
 import numpy as np
 from jax import numpy as jnp
 from jax._src import mesh as mesh_lib
@@ -985,6 +986,9 @@ class ScheduleBatch:
 
         self.reqs = [self.reqs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices]
+        # TODO: uniform data type in scheduler batch
+        if isinstance(self.seq_lens, jax.Array):
+            self.seq_lens = np.array(self.seq_lens)
         self.seq_lens = self.seq_lens[keep_indices]
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
@@ -1036,6 +1040,9 @@ class ScheduleBatch:
         self.return_logprob |= other.return_logprob
         self.has_stream |= other.has_stream
         self.return_hidden_states |= other.return_hidden_states
+
+        if self.spec_info:
+            self.spec_info.merge_batch(other.spec_info)
 
     def get_model_worker_batch(
         self,

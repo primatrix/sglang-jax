@@ -632,9 +632,9 @@ class EagleVerifyInput:
             _, rng = jax.random.split(rng.params())
             target_probs = top_k_top_p_min_p_sampling_from_probs_jax(
                 target_probs,
-                sampling_info.top_ks,
-                sampling_info.top_ps,
-                sampling_info.min_ps,
+                jnp.repeat(sampling_info.top_ks, self.draft_token_num),
+                jnp.repeat(sampling_info.top_ps, self.draft_token_num),
+                jnp.repeat(sampling_info.min_ps, self.draft_token_num),
                 sampling_info.need_min_p_sampling,
                 rng,
             )

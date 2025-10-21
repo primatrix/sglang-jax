@@ -187,7 +187,7 @@ def top_p_renorm_prob(probs, top_p_values):
     return jax.vmap(process_single_sample, in_axes=(0, 0))(probs, top_p_values)
 
 
-def _samplinf_from_prob(probs: jax.Array, threshold: jax.Array):
+def _sampling_from_prob(probs: jax.Array, threshold: jax.Array):
     valid_probs = jnp.where(probs > 0, probs, 0)
     cumsum_probs = jnp.cumsum(valid_probs)
     selected_idx = jnp.argmax(cumsum_probs > threshold)
@@ -294,7 +294,7 @@ def tree_speculative_sampling_target_only(
         relu_q_minus_p_vec = jnp.maximum(q_vec - p_vec, jnp.array(0, dtype=dtype))
         sum_relu_q_minus_p = jnp.sum(relu_q_minus_p_vec)
         u = coin * sum_relu_q_minus_p
-        sampled_id = _samplinf_from_prob(relu_q_minus_p_vec, u)
+        sampled_id = _sampling_from_prob(relu_q_minus_p_vec, u)
         predicts = predicts.at[last_accepted_retrive_idx].set(sampled_id)
 
     return accept_index, accept_token_num, predicts
@@ -320,52 +320,44 @@ def align_evict_mask_to_page_size(
 
 
 def get_target_cache_loc(
-    accept_length: jnp.ndarray,
-    to_free_num_slots: jnp.ndarray,
-    out_cache_loc: jnp.ndarray,
+    accept_length: jnp.array,
+    to_free_num_slots: jnp.array,
+    out_cache_loc: jnp.array,
     num_verify_tokens: int,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """
-    向量化的JAX实现，更高效
-    """
+) -> Tuple[jnp.array, jnp.array]:
     batch_size = accept_length.shape[0]
 
-    # 第一部分：向量化处理被接受的token
+    # process accepted token
     copy_lens_accepted = accept_length + 1
     max_accepted_len = jnp.max(copy_lens_accepted)
 
-    # 创建掩码矩阵
+    # create mask matrix
     token_indices = jnp.arange(max_accepted_len)[None, :]  # [1, max_len]
     # [batch_size, max_len]
     accepted_mask = token_indices < copy_lens_accepted[:, None]
 
-    # 使用掩码选择被接受的位置
+    # select accepted position with mask matrix
     accepted_positions = jnp.where(
         accepted_mask, out_cache_loc[:, :max_accepted_len], -1  # 填充值
     )
 
-    # 展平并移除填充
+    # remove padding
     tgt_cache_loc = accepted_positions.flatten()
     tgt_cache_loc = tgt_cache_loc[tgt_cache_loc != -1]
 
-    # 第二部分：向量化处理需要释放的token
+    # process released token
     max_to_free = jnp.max(to_free_num_slots)
-
-    # 为释放的token创建索引
     free_indices = jnp.arange(max_to_free)[None, :] + (
         num_verify_tokens - to_free_num_slots[:, None]
     )
     free_mask = jnp.arange(max_to_free)[None, :] < to_free_num_slots[:, None]
-
-    # 确保索引在有效范围内
     free_indices = jnp.clip(free_indices, 0, num_verify_tokens - 1)
 
-    # 使用advanced indexing选择要释放的位置
+    # use advanced indexing to select released position
     free_positions = jnp.where(
         free_mask, jnp.take_along_axis(out_cache_loc, free_indices, axis=1), -1
     )
 
-    # 展平并移除填充
     to_free_slots = free_positions.flatten()
     to_free_slots = to_free_slots[to_free_slots != -1]
 
@@ -373,13 +365,10 @@ def get_target_cache_loc(
 
 
 def filter_finished_cache_loc_kernel(
-    tgt_cache_loc: jnp.ndarray,
-    accept_length: jnp.ndarray,
-    accept_length_filter: jnp.ndarray,
-) -> jnp.ndarray:
-    """
-    向量化的JAX实现，处理大批次时更高效
-    """
+    tgt_cache_loc: jnp.array,
+    accept_length: jnp.array,
+    accept_length_filter: jnp.array,
+) -> jnp.array:
     batch_size = accept_length.shape[0]
     max_length = jnp.max(accept_length_filter)
 
