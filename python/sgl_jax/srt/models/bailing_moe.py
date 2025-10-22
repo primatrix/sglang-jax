@@ -6,8 +6,8 @@ from jax import jax
 from jax import numpy as jnp
 from transformers import PretrainedConfig
 
-from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
+from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK
@@ -54,14 +54,14 @@ class BailingMoEAttention(nnx.Module):
         self.use_qk_norm = use_qk_norm
 
         if use_qk_norm:
-            self.q_norm = nnx.RMSNorm(
+            self.q_norm = RMSNorm(
                 self.head_dim,
                 epsilon=rms_norm_eps,
                 param_dtype=dtype,
                 scale_init=nnx.with_partitioning(init_fn, (None,)),
                 rngs=rngs,
             )
-            self.k_norm = nnx.RMSNorm(
+            self.k_norm = RMSNorm(
                 self.head_dim,
                 epsilon=rms_norm_eps,
                 param_dtype=dtype,
@@ -306,14 +306,14 @@ class BailingMoEDecoderLayer(nnx.Module):
                 self.shared_experts = None
             self.is_moe_layer = True
 
-        self.input_layernorm = nnx.RMSNorm(
+        self.input_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
-        self.post_attention_layernorm = nnx.RMSNorm(
+        self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
@@ -415,7 +415,7 @@ class BailingMoEModel(nnx.Module):
             ]
         )
 
-        self.norm = nnx.RMSNorm(
+        self.norm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
