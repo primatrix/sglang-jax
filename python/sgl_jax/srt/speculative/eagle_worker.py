@@ -298,7 +298,6 @@ class EAGLEWorker(ModelWorker):
             precompile_bs_paddings,
             precompile_cache_loc_paddings,
         ) = self.target_worker.get_precompile_paddings()
-
         model_worker_batch = batch.get_model_worker_batch(
             precompile_token_paddings,
             precompile_bs_paddings,

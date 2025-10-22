@@ -186,7 +186,6 @@ class FlashAttentionBackend(AttentionBackend):
         num_seqs = np.sum(batch.seq_lens > 0, dtype=np.int32).reshape(
             1,
         )
-
         # Construct distribution for V2 kernel: [decode_end, prefill_end, mixed_end]
         if batch.forward_mode == ForwardMode.DECODE:
             # All sequences are decode/mixed mode

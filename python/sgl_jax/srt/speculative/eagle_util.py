@@ -641,6 +641,7 @@ class EagleVerifyInput:
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
         predict = jnp.empty(predict_shape, dtype=jnp.int32)
+
         accept_index = jnp.full((bs, self.spec_steps + 1), -1, dtype=jnp.int32)
         accept_length = jnp.empty((bs,), dtype=jnp.int32)
 
@@ -666,10 +667,7 @@ class EagleVerifyInput:
             target_predict = jnp.argmax(
                 logits_output.next_token_logits, axis=-1
             ).flatten()
-            logger.info("------------------------")
-            logger.info(f"{target_predict=}")
-            logger.info(f"{candidates=}")
-            logger.info("------------------------")
+            target_predict = target_predict.reshape(bs, self.draft_token_num)
             accept_index, accept_length, predict = verify_tree_greedy(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
