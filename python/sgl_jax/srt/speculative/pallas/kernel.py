@@ -103,7 +103,7 @@ def verify_tree_greedy(
                 draft_token_id = candidates[bid, cur_index]
                 target_token_id = target_predict[last_accepted_retrive_idx]
 
-                if draft_token_id == target_token_id:
+                if False:
                     predicts = predicts.at[last_accepted_retrive_idx].set(
                         target_token_id
                     )
@@ -121,7 +121,9 @@ def verify_tree_greedy(
         predicts = predicts.at[last_accepted_retrive_idx].set(
             target_predict[last_accepted_retrive_idx]
         )
-    print(f"=================accept_token_num======================{accept_token_num}")
+    print(
+        f"======================================={accept_token_num=}=========={last_accepted_retrive_idx=}"
+    )
     return accept_index, accept_token_num, predicts
 
 

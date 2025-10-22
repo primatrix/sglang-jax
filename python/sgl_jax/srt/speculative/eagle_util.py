@@ -663,11 +663,13 @@ class EagleVerifyInput:
         is_all_greedy = sampling_info.is_all_greedy
 
         if is_all_greedy:
-            logger.info(f"==============={is_all_greedy}===========================")
             target_predict = jnp.argmax(
                 logits_output.next_token_logits, axis=-1
             ).flatten()
-
+            logger.info("------------------------")
+            logger.info(f"{target_predict=}")
+            logger.info(f"{candidates=}")
+            logger.info("------------------------")
             accept_index, accept_length, predict = verify_tree_greedy(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
@@ -679,9 +681,6 @@ class EagleVerifyInput:
                 target_predict=target_predict,
             )
         else:
-            logger.info(
-                f"-------------------{is_all_greedy}-----------------------------"
-            )
 
             # apply temperature and get target probs
             expanded_temperature = jnp.repeat(

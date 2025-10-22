@@ -576,7 +576,7 @@ class EAGLEWorker(ModelWorker):
             model_worker_batch.positions = original_positions + 1 + i
             self.draft_model_runner.attn_backend.forward_metadata = (
                 self.draft_model_runner.attn_backend.get_forward_metadata(
-                    model_worker_batch
+                    model_worker_batch, i
                 )
             )
             spec_info.hidden_states = hidden_states
