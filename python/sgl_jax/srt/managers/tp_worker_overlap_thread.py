@@ -54,6 +54,7 @@ class ModelWorkerClient:
         )
         self.forward_thread.start()
         self.parent_process = psutil.Process().parent()
+        self.ct_lock = threading.Lock()
 
     def get_model_runner(self):
         return self.worker.get_model_runner()
@@ -178,28 +179,26 @@ class ModelWorkerClient:
             model_worker_batch
         )
 
-        # Push a new batch to the queue (JAX handles synchronization automatically)
-        self.input_queue.put(
-            (
-                model_worker_batch,
-                self.future_token_ids_ct,
-                sampling_metadata,
-                forward_metadata,
+        with self.ct_lock:
+            old_ct = self.future_token_ids_ct
+            bs = len(model_worker_batch.seq_lens)
+            future_next_token_ids = np.arange(
+                -(old_ct + 1),
+                -(old_ct + 1 + bs),
+                -1,
+                dtype=np.int32,
             )
-        )
+            self.future_token_ids_ct = (old_ct + bs) % self.future_token_ids_limit
 
-        # Allocate output future objects
-        # Only count non-padded sequences (seq_lens > 0)
-        bs = len(model_worker_batch.seq_lens)
-        future_next_token_ids = np.arange(
-            -(self.future_token_ids_ct + 1),
-            -(self.future_token_ids_ct + 1 + bs),
-            -1,
-            dtype=np.int32,
-        )
-        self.future_token_ids_ct = (
-            self.future_token_ids_ct + bs
-        ) % self.future_token_ids_limit
+            self.input_queue.put(
+                (
+                    model_worker_batch,
+                    old_ct,
+                    sampling_metadata,
+                    forward_metadata,
+                )
+            )
+
         return None, future_next_token_ids, 0
 
     def run_precompile(self):
