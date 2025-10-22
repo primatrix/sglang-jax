@@ -197,11 +197,10 @@ class EPMoE(nnx.Module):
             tensor_size = jax.lax.axis_size("tensor")
             expert_shard_id = data_index * tensor_size + tensor_index
 
-            # topk
-            top_k_logits, top_k_indices = jax.lax.top_k(router_logits, self.num_experts_per_tok)
-            top_k_weights = jax.nn.softmax(top_k_logits.astype(jnp.bfloat16), axis=-1).astype(
+            top_k_weights = jax.nn.softmax(router_logits.astype(jnp.float32), axis=-1).astype(
                 self.dtype
             )
+            top_k_weights, top_k_indices = jax.lax.top_k(top_k_weights, self.num_experts_per_tok)
 
             # ep moe norm_topk_prob=true
             top_k_weights = top_k_weights / jnp.sum(top_k_weights, axis=-1, keepdims=True)
