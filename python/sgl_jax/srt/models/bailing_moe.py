@@ -458,21 +458,18 @@ class BailingMoEModel(nnx.Module):
 class BailingMoEForCausalLM(nnx.Module):
     def __init__(
         self,
-        config: ModelConfig,
+        config: PretrainedConfig,
         rngs: nnx.Rngs = None,
+        dtype: jnp.dtype = jnp.bfloat16,
         mesh: jax.sharding.Mesh = None,
     ):
         self.mesh = mesh
         self.config = config
-        self.dtype = config.dtype
-        self.model = BailingMoEModel(
-            config.hf_config, dtype=self.dtype, rngs=rngs, mesh=mesh
-        )
-        self.lm_head = ParallelLMHead(
-            config.hf_config.vocab_size, config.hidden_size, rngs=rngs
-        )
+        self.dtype = dtype
+        self.model = BailingMoEModel(config, dtype=self.dtype, rngs=rngs, mesh=mesh)
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, rngs=rngs)
         self.logits_processor = LogitsProcessor(
-            config.hf_config.vocab_size, self.lm_head, self.mesh
+            config.vocab_size, self.lm_head, self.mesh
         )
 
     def load_weights(self, rng_key: jax.Array):
@@ -499,13 +496,13 @@ class BailingMoEForCausalLM(nnx.Module):
             ),
         }
 
-        if not getattr(self.config.hf_config, "tie_word_embeddings", True):
+        if not getattr(self.config, "tie_word_embeddings", True):
             mappings["lm_head.weight"] = WeightMapping(
                 target_path="lm_head.embedding", sharding=(None, None), transpose=False
             )
 
-        num_layers = self.config.hf_config.num_hidden_layers
-        first_k_dense_replace = self.config.hf_config.first_k_dense_replace
+        num_layers = self.config.num_hidden_layers
+        first_k_dense_replace = self.config.first_k_dense_replace
 
         for layer_idx in range(num_layers):
             layer_mappings = self._create_moe_layer_mappings(
@@ -548,7 +545,7 @@ class BailingMoEForCausalLM(nnx.Module):
             ),
         }
 
-        if getattr(self.config.hf_config, "use_qk_norm", True):
+        if getattr(self.config, "use_qk_norm", True):
             mappings[f"{prefix}.attention.query_layernorm.weight"] = WeightMapping(
                 target_path=f"{target_prefix}.self_attn.q_norm.scale",
                 sharding=(None,),
@@ -585,14 +582,14 @@ class BailingMoEForCausalLM(nnx.Module):
                 sharding=(None, None),
                 transpose=True,
             )
-            if getattr(self.config.hf_config, "moe_router_enable_expert_bias", False):
+            if getattr(self.config, "moe_router_enable_expert_bias", False):
                 mappings[f"{prefix}.mlp.gate.expert_bias"] = WeightMapping(
                     target_path=f"{target_prefix}.moe_gate.bias",
                     sharding=(None,),
                     transpose=False,
                 )
 
-            if getattr(self.config.hf_config, "num_shared_experts", 0) > 0:
+            if getattr(self.config, "num_shared_experts", 0) > 0:
                 shared_experts_mappings = {
                     f"{prefix}.mlp.shared_experts.gate_proj.weight": WeightMapping(
                         target_path=f"{target_prefix}.shared_experts.gate_proj.weight",
@@ -612,7 +609,7 @@ class BailingMoEForCausalLM(nnx.Module):
                 }
                 mappings.update(shared_experts_mappings)
 
-            num_experts = getattr(self.config.hf_config, "num_experts", 256)
+            num_experts = getattr(self.config, "num_experts", 256)
             for expert_type in ["gate_proj", "up_proj", "down_proj"]:
                 target_name = {
                     "gate_proj": "wi_0",
