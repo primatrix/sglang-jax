@@ -52,6 +52,8 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 GLOBAL_SERVER_ARGS_KEYS = [
     "device",
     "disable_radix_cache",
+    "speculative_accept_threshold_single",
+    "speculative_accept_threshold_acc",
 ]
 
 PADDING_BUCKETS = [1 << i for i in range(6, 21)]

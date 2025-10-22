@@ -124,6 +124,9 @@ class EAGLEWorker(ModelWorker):
         self, model_worker_batch: ModelWorkerBatch, sample_meta_data: SamplingMetadata
     ) -> Tuple[LogitsProcessorOutput, jax.Array, int, int, np.ndarray]:
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        logger.info(f"===={model_worker_batch=}=========")
+        logger.info(f"===={sample_meta_data=}=========")
+
         logits_output, next_token_ids, cache_miss_count = (
             self.target_worker.forward_batch_generation(
                 model_worker_batch, sampling_metadata=sample_meta_data
@@ -147,8 +150,8 @@ class EAGLEWorker(ModelWorker):
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=next_token_ids[: model_worker_batch.real_bs],
-            num_tokens_per_batch=1,
-            num_tokens_for_logprob_per_batch=1,
+            num_tokens_per_batch=jnp.asarray(1, dtype=jnp.int32),
+            num_tokens_for_logprob_per_batch=jnp.asarray(1, dtype=jnp.int32),
         )
         batch.return_hidden_states = False
         batch.spec_info.prepare_for_extend(batch)
@@ -208,10 +211,11 @@ class EAGLEWorker(ModelWorker):
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
-        probs = jax.nn.softmax(logits_output.next_token_logits, axis=-1)
-        draft_input.topk_p, draft_input.topk_index = fast_topk(
-            probs, self.topk, axis=-1
+        topk_p, topk_index = topk_probs_from_logits(
+            logits_output.next_token_logits, self.topk
         )
+        draft_input.topk_p = topk_p
+        draft_input.topk_index = topk_index
         draft_input.hidden_states = logits_output.hidden_states
 
     def draft(self, batch: ScheduleBatch):
@@ -223,8 +227,10 @@ class EAGLEWorker(ModelWorker):
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-        spec_info.num_tokens_per_batch = self.topk
-        spec_info.num_tokens_for_logprob_per_batch = self.topk
+        spec_info.num_tokens_per_batch = jnp.asarray(self.topk, dtype=jnp.int32)
+        spec_info.num_tokens_for_logprob_per_batch = jnp.asarray(
+            self.topk, dtype=jnp.int32
+        )
         batch.return_hidden_states = False
 
         # if not model_worker_batch.forward_mode.is_idle():
@@ -258,6 +264,7 @@ class EAGLEWorker(ModelWorker):
             self.topk,
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,
+            int(batch.req_to_token_pool.req_to_token.shape[1]),
         )
         # build tree
         return EagleVerifyInput(
@@ -291,7 +298,6 @@ class EAGLEWorker(ModelWorker):
             precompile_bs_paddings,
             precompile_cache_loc_paddings,
         ) = self.target_worker.get_precompile_paddings()
-
         model_worker_batch = batch.get_model_worker_batch(
             precompile_token_paddings,
             precompile_bs_paddings,
@@ -453,8 +459,12 @@ class EAGLEWorker(ModelWorker):
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
 
-        batch.spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
-        batch.spec_info.num_tokens_for_logprob_per_batch = 1
+        batch.spec_info.num_tokens_per_batch = jnp.asarray(
+            self.speculative_num_steps + 1, dtype=jnp.int32
+        )
+        batch.spec_info.num_tokens_for_logprob_per_batch = jnp.asarray(
+            1, dtype=jnp.int32
+        )
         batch.spec_info.prepare_extend_after_decode(batch)
         batch.forward_mode = (
             ForwardMode.DRAFT_EXTEND
@@ -565,7 +575,7 @@ class EAGLEWorker(ModelWorker):
             model_worker_batch.positions = original_positions + 1 + i
             self.draft_model_runner.attn_backend.forward_metadata = (
                 self.draft_model_runner.attn_backend.get_forward_metadata(
-                    model_worker_batch
+                    model_worker_batch, i
                 )
             )
             spec_info.hidden_states = hidden_states
@@ -580,8 +590,9 @@ class EAGLEWorker(ModelWorker):
                 ),
             )
             # self._detect_nan_if_needed(logits_output)
-            probs = jax.nn.softmax(logits_output.next_token_logits, axis=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, axis=-1)
+            topk_p, topk_index = topk_probs_from_logits(
+                logits_output.next_token_logits, self.topk
+            )
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
@@ -702,22 +713,27 @@ class EAGLEWorker(ModelWorker):
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
 
+def topk_probs_from_logits(
+    logits: jax.Array, topk: int, axis: int = -1
+) -> Tuple[jax.Array, jax.Array]:
+    """Return top-k probabilities without materializing the full softmax tensor."""
+    working_logits = jnp.moveaxis(logits, axis, -1) if axis != -1 else logits
+    topk_logits, topk_index = jax.lax.top_k(working_logits, topk)
+    logsumexp = jax.nn.logsumexp(working_logits, axis=-1, keepdims=True)
+    topk_probs = jnp.exp(topk_logits - logsumexp)
+
+    if axis != -1:
+        topk_probs = jnp.moveaxis(topk_probs, -1, axis)
+        topk_index = jnp.moveaxis(topk_index, -1, axis)
+
+    return topk_probs, topk_index
+
+
 def fast_topk(values, topk, axis=-1):
-    if axis != -1:
-        # Move target axis to last position
-        values = jnp.moveaxis(values, axis, -1)
-
-    if topk == 1:
-        # Get max value and index for k=1 case
-        max_vals = jnp.max(values, axis=-1, keepdims=True)
-        max_indices = jnp.argmax(values, axis=-1, keepdims=True)
-        result_vals, result_indices = max_vals, max_indices
-    else:
-        # Use top_k for k>1 case (operates on last axis)
-        result_vals, result_indices = jax.lax.top_k(values, topk)
+    working_values = jnp.moveaxis(values, axis, -1) if axis != -1 else values
+    result_vals, result_indices = jax.lax.top_k(working_values, topk)
 
     if axis != -1:
-        # Move axis back to original position
         result_vals = jnp.moveaxis(result_vals, -1, axis)
         result_indices = jnp.moveaxis(result_indices, -1, axis)
 

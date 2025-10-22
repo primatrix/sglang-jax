@@ -423,7 +423,6 @@ class ModelWorker:
                     logits_output, sampling_metadata
                 )
                 sample_cache_miss_count = count()
-
         return (
             logits_output,
             next_token_ids_device,
