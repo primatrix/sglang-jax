@@ -76,6 +76,7 @@ class ServerArgs:
 
     # Data parallel
     dp_size: int = 1
+    ep_size: int = None
 
     # Logging
     log_level: str = "info"
@@ -476,6 +477,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.tp_size,
             help="The tensor parallelism size.",
+        )
+        parser.add_argument(
+            "--ep-size",
+            type=int,
+            default=ServerArgs.ep_size,
+            help="The expert parallelism size",
         )
         parser.add_argument(
             "--stream-interval",
