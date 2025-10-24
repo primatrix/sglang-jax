@@ -69,22 +69,33 @@ class WeightLoader:
         self.mesh = mesh
         self.dtype = dtype
 
-        self.num_heads = model_config.num_attention_heads
-        self.num_kv_heads = (
-            model_config.get_total_num_kv_heads()
-        )  # Use original count for replication logic
-        self.hidden_size = model_config.hidden_size
-        self.head_dim_original = getattr(
-            model_config, "head_dim", self.hidden_size // self.num_heads
-        )
-
-        self.head_dim = (self.head_dim_original + 127) // 128 * 128
-        self.head_dim_pad = self.head_dim - self.head_dim_original
-
         if hasattr(self.mesh, "shape") and "tensor" in self.mesh.shape:
             self.sharding_size = self.mesh.shape["tensor"]
         else:
             self.sharding_size = 1
+        if model_config is not None:
+            self.num_heads = model_config.num_attention_heads
+            self.num_kv_heads = (
+                model_config.get_total_num_kv_heads()
+            )  # Use original count for replication logic
+            self.hidden_size = model_config.hidden_size
+            self.head_dim_original = getattr(
+                model_config, "head_dim", self.hidden_size // self.num_heads
+            )
+
+            self.head_dim = (self.head_dim_original + 127) // 128 * 128
+            self.head_dim_pad = self.head_dim - self.head_dim_original
+
+    def load_weights_from_target_model(self, path: str, weights: jax.Array, mapping: dict):
+        params = nnx.state(self.model)
+        sharded_weight = self._shard_weight(weights, mapping[path].sharding)
+        try:
+            model_param = self._get_param(params, path=path, judege=True)
+            model_param.value = sharded_weight.astype(model_param.value.dtype)
+        except Exception as e:
+            logger.error("Failed to load %s -> %s: %s", path, mapping, str(e))
+            raise e
+        nnx.update(self.model, params)
 
     def load_weights_from_safetensors(
         self, weight_mappings: dict[str, str | list[str] | WeightMapping]
@@ -232,6 +243,44 @@ class WeightLoader:
             logger.error("Failed to load %s -> %s: %s", hf_key, jax_path, str(e))
             raise
 
+    def assign_single_weight(
+        self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
+    ):
+        jax_path = mapping.target_path
+        processed_weight = weight
+
+        if mapping.reshape is not None:
+            processed_weight = jnp.reshape(processed_weight, mapping.reshape)
+
+        sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
+
+        try:
+            model_param = self._get_param(params, jax_path)
+            logger.debug(
+                "Loading %s -> %s, shape: %s, transpose: %s",
+                hf_key,
+                jax_path,
+                processed_weight.shape,
+                mapping.transpose,
+            )
+            model_param.value = sharded_weight.astype(model_param.value.dtype)
+        except Exception as e:
+            logger.error("Failed to load %s -> %s: %s", hf_key, jax_path, str(e))
+            raise
+
+    # def _process_eagle_hot_token_ids(self, hf_key: str, hf_weight: jax.Array) -> None:
+    #     """Derive and store Eagle3 hot token ids from the d2t weight."""
+    #     flattened = jnp.ravel(hf_weight)
+    #     hot_token_ids = flattened + jnp.arange(flattened.shape[0], dtype=flattened.dtype)
+    #     if not jnp.issubdtype(hot_token_ids.dtype, jnp.integer):
+    #         hot_token_ids = hot_token_ids.astype(jnp.int32)
+    #     self.model.hot_token_id = hot_token_ids
+    #     logger.debug(
+    #         "Assigned Eagle hot token ids for %s, shape: %s",
+    #         hf_key,
+    #         hot_token_ids.shape,
+    #     )
+
     def _handle_split_weight(
         self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
     ):
@@ -352,10 +401,11 @@ class WeightLoader:
             return jax.device_put(weight, self.mesh.devices.flatten()[0])
         return jax.device_put(weight, NamedSharding(self.mesh, P(*sharding)))
 
-    def _get_param(self, params: nnx.State, path: str) -> nnx.State:
+    def _get_param(self, params: nnx.State, path: str, judege: bool | None = False) -> nnx.State:
         keys = path.split(".")
         current_level = params
-
+        if judege:
+            print(current_level)
         for key in keys:
             if key.isdigit():
                 current_level = current_level[int(key)]

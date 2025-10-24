@@ -67,6 +67,7 @@ class ModelRunner:
         rngs: nnx.Rngs = None,
     ):
         # Parse args
+        self.is_draft_worker = is_draft_worker
         self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
@@ -125,8 +126,8 @@ class ModelRunner:
         self.sampler = Sampler(nnx.Rngs(server_args.random_seed))
         total_device_memory = self.get_available_device_memory()
         self.load_model()
-
-        self.initialize_jit()
+        if not self.is_draft_worker:
+            self.initialize_jit()
 
         # Init memory pool and attention backends
         self.init_memory_pool(
@@ -138,6 +139,7 @@ class ModelRunner:
         self.init_attention_backend()
 
     def initialize_jit(self):
+
         model_def, model_state = nnx.split(self.model)
         model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
         sampler_def, sampler_state = nnx.split(self.sampler)
@@ -168,6 +170,8 @@ class ModelRunner:
 
         def run_model_wrapper(forward_batch, logits_metadata):
             token_to_kv_pool = self.token_to_kv_pool
+            # print(model_def["transformer"]["embed_tokens"]["embedding"])
+            # print(model_state_def["transformer"]["embed_tokens"]["embedding"])
 
             return jitted_run_model(
                 model_def,
@@ -216,6 +220,16 @@ class ModelRunner:
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(self.model, "end_layer", self.model_config.num_hidden_layers)
         self.num_effective_layers = self.end_layer - self.start_layer
+        if self.server_args.speculative_algorithm == "EAGLE3" and not self.is_draft_worker:
+            try:
+                # get the aux layer from draft model config
+                eagle_config = getattr(self.model_config.hf_config, "eagle_config", None)
+                eagle_aux_hidden_state_layer_ids = eagle_config["eagle_aux_hidden_state_layer_ids"]
+            except Exception as e:
+                logger.warning("get the aux layer from draft model config %s", e)
+                # if there is no aux layer, set to None
+                eagle_aux_hidden_state_layer_ids = None
+            self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
 
     def profile_max_num_token(self, total_device_memory: int):
         """
