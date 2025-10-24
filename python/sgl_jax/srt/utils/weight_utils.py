@@ -100,7 +100,6 @@ class WeightLoader:
             else:
                 regular_mappings[key] = mapping
 
-        # Buffer for MoE expert weights: {moe_key: {hf_key: weight}}
         moe_buffer = {}
 
         logger.info(
@@ -119,7 +118,6 @@ class WeightLoader:
                     logger.debug("Skipping excluded MoE expert weight: %s", hf_key)
                     continue
 
-                # Assign this expert weight to its MoE group(s)
                 assigned = False
                 for moe_key, mapping in moe_mappings.items():
                     expected_hf_keys = mapping.target_path[1:]  # list of expected HF keys
@@ -129,7 +127,6 @@ class WeightLoader:
                         moe_buffer[moe_key][hf_key] = hf_weight
                         assigned = True
 
-                        # Check if all experts for this group are loaded
                         if len(moe_buffer[moe_key]) == len(expected_hf_keys):
                             self._process_single_moe_group(
                                 params, moe_key, mapping, moe_buffer[moe_key]
@@ -145,7 +142,6 @@ class WeightLoader:
                 else:
                     logger.warning("No mapping found for weight: %s", hf_key)
 
-        # Final sanity check
         if moe_buffer:
             for moe_key in moe_buffer:
                 expected = len(moe_mappings[moe_key].target_path[1:])
