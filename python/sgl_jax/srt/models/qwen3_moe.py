@@ -493,16 +493,21 @@ class Qwen3MoeForCausalLM(nnx.Module):
                     "up_proj": "wi_1",
                     "down_proj": "wo",
                 }[expert_type]
+
                 expert_keys = [
                     f"{prefix}.mlp.experts.{i}.{expert_type}.weight" for i in range(num_experts)
                 ]
 
+                if expert_type == "down_proj":
+                    sharding = (None, ("data", "tensor"), None)
+                else:
+                    sharding = (None, None, ("data", "tensor"))
+
                 mappings[f"__MOE_EXPERTS__{prefix}.mlp.{target_name}"] = WeightMapping(
                     target_path=[f"{target_prefix}.mlp.{target_name}"] + expert_keys,
-                    sharding=(("data", "tensor"), None, None),
+                    sharding=sharding,
                     transpose=True,
                 )
-
         return mappings
 
     def __call__(
