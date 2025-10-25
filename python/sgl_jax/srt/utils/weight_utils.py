@@ -120,6 +120,11 @@ class WeightLoader:
 
         for hf_key, hf_weight in self._iterate_weights():
             if hf_key in regular_mappings:
+                if hf_key == "d2t":
+                    base = jnp.arange(hf_weight.shape[0], dtype=hf_weight.dtype)
+                    hot_ids = (hf_weight + base).astype(jnp.int32)
+                    params["hot_token_ids"].value = hot_ids
+                    continue
                 mapping = regular_mappings[hf_key]
                 if isinstance(mapping, (str, list)):
                     mapping = WeightMapping(target_path=mapping)

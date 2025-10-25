@@ -207,13 +207,15 @@ class LlamaEagleModel(LlamaModel):
             token_to_kv_pool=token_to_kv_pool,
             residual=residual,
         )
-
+        if residual is not None:
+            hidden_states = hidden_states + residual
+            residual = hidden_states
         hidden_states_to_logits = self.norm(hidden_states)
 
         layers_kv_fused = [kv_fused] if kv_fused is not None else []
         layers_callback_flag: list = []
 
-        return hidden_states_to_logits, None, layers_kv_fused, layers_callback_flag
+        return hidden_states_to_logits, [residual], layers_kv_fused, layers_callback_flag
 
 
 class LlamaForCausalLMEagle3(LlamaForCausalLM):
@@ -357,38 +359,6 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
 
     def get_hot_token_id(self):
         return self.hot_token_ids
-
-    def load_single_weights(self):
-
-        print("")
-        print("")
-        print("")
-        print("")
-        print("")
-        print("")
-        print("")
-        print("")
-        print("")
-
-        params = nnx.state(self)
-
-        def recursive_print_params(obj, prefix="", f=None):
-            if isinstance(obj, dict):
-                for key, value in obj.items():
-                    new_prefix = f"{prefix}.{key}" if prefix else key
-                    recursive_print_params(value, new_prefix, f)
-            else:
-                # 打印完整路径和值的类型、形状等信息
-                if hasattr(obj, "shape"):
-                    f.write(f"{prefix}: shape={obj.shape}, dtype={obj.dtype}\n")
-                else:
-                    f.write(f"{prefix}: {type(obj).__name__} = {obj}\n")
-
-        with open("info.txt", "w") as f:
-            recursive_print_params(params, f=f)
-
-        # loader.load_weights_from_target_model(path="model.embed_tokens.embedding", weights=weight, mapping=weight_mappings)
-        logger.info("llama3 load_single_weights successfully!")
 
 
 EntryClass = [LlamaForCausalLMEagle3]

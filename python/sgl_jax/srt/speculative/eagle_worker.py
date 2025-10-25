@@ -501,7 +501,7 @@ class EAGLEWorker(ModelWorker):
         if model_worker_batch.spec_info.hidden_states is not None:
             current_len = model_worker_batch.spec_info.hidden_states.shape[0]
             padding_size = len(model_worker_batch.input_ids) - current_len
-            if padding_size > 0:
+            if padding_size >= 0:
                 model_worker_batch.spec_info.hidden_states = jnp.pad(
                     model_worker_batch.spec_info.hidden_states,
                     ((0, padding_size), (0, 0)),
@@ -597,10 +597,10 @@ class EAGLEWorker(ModelWorker):
                 )
 
             model_worker_batch.input_ids = input_ids
-            if model_worker_batch.spec_info.hidden_states is not None:
+            if hidden_states is not None:
                 current_len = hidden_states.shape[0]
                 padding_size = len(input_ids) - current_len
-                if padding_size > 0:
+                if padding_size >= 0:
                     model_worker_batch.spec_info.hidden_states = jnp.pad(
                         hidden_states,
                         ((0, padding_size), (0, 0)),
