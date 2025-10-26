@@ -165,6 +165,8 @@ class SchedulerOutputProcessorMixin:
             result.cache_miss_count,
         )
         self.num_generated_tokens += len(batch.reqs)
+        if not batch.spec_algorithm.is_none() and result.num_accepted_tokens is not None:
+            self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
 
         if self.enable_overlap:
             logits_output, next_token_ids, cache_miss_count = (

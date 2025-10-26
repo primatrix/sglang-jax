@@ -326,6 +326,7 @@ class QWen3Model(nnx.Module):
     ):
         residual = None
         hidden_states = self.embed_tokens(forward_batch.input_ids)
+        # print(f"qwen3  ========= {hidden_states.shape}")
         layers_kv_fused = []
         layers_callback_flag = []
         aux_hidden_states = []

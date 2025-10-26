@@ -129,7 +129,7 @@ class EAGLEWorker(ModelWorker):
             logits_output, next_token_ids, cache_miss_count, bid, seq_lens = (
                 self.forward_target_extend(model_worker_batch, sampling_metadata)
             )
-
+            # print(f"target================{next_token_ids=}")
             # draft extend for Update Draft State
             self.forward_draft_extend(
                 batch, model_worker_batch, logits_output.hidden_states, next_token_ids
@@ -615,6 +615,13 @@ class EAGLEWorker(ModelWorker):
             self.draft_model_runner.attn_backend.forward_metadata = (
                 self.draft_model_runner.attn_backend.get_forward_metadata(model_worker_batch, i)
             )
+            # logger.info(f"=============={self.draft_model_runner.attn_backend.forward_metadata.cu_kv_lens=}=========================")
+            # logger.info(f"=============={self.draft_model_runner.attn_backend.forward_metadata.cu_q_lens=}=========================")
+            # logger.info(f"=============={self.draft_model_runner.attn_backend.forward_metadata.seq_lens=}=========================")
+            # logger.info(f"=============={self.draft_model_runner.attn_backend.forward_metadata.num_seqs=}=========================")
+            # logger.info(f"=============={self.draft_model_runner.attn_backend.forward_metadata.page_indices[:30]=}=========================")
+            # logger.info(f"=============={self.draft_model_runner.attn_backend.forward_metadata.custom_mask=}=========================")
+
             # spec_info.hidden_states = hidden_states
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
             # Run forward

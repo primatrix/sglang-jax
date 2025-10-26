@@ -24,6 +24,8 @@ from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers.io_struct import (
     AbortReq,
+    FlushCacheReqInput,
+    FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     ProfileReq,
@@ -94,6 +96,7 @@ class GenerationBatchResult:
     extend_logprob_start_len_per_req: list[int]
     bid: int
     cache_miss_count: int
+    num_accepted_tokens: int | None = None
 
 
 class Scheduler(
@@ -293,6 +296,7 @@ class Scheduler(
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (AbortReq, self.abort_request),
+                (FlushCacheReqInput, self.flush_cache_wrapped),
                 (ProfileReq, self.profile),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
@@ -593,6 +597,8 @@ class Scheduler(
             "kvcache": round(self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2),
             "token_capacity": int(self.max_total_num_tokens),
         }
+        if not self.spec_algorithm.is_none() and self.cum_spec_accept_count > 0:
+            ret["avg_spec_accept_length"] = self.cum_spec_accept_length / self.cum_spec_accept_count
 
         return GetInternalStateReqOutput(internal_state=ret)
 
@@ -648,6 +654,65 @@ class Scheduler(
         return SetInternalStateReqOutput(
             request_id=recv_req.request_id, success=success, error_msg=error_msg
         )
+
+    def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
+        cache_type = getattr(recv_req, "cache_type", "all")
+        flushed_items = self.flush_cache(cache_type=cache_type)
+        return FlushCacheReqOutput(flushed_items=flushed_items)
+
+    def flush_cache(self, cache_type: str = "all") -> int:
+        if cache_type != "all":
+            logger.warning("Flush cache only supports cache_type 'all', got %s", cache_type)
+
+        self.running_batch.filter_batch()
+        has_pending = len(self.waiting_queue) > 0 or not self.running_batch.is_empty()
+        if has_pending:
+            logger.warning(
+                "Cache not flushed because there are pending requests. "
+                "#queue-req: %d, #running-req: %d",
+                len(self.waiting_queue),
+                len(self.running_batch.reqs),
+            )
+            return 0
+
+        self.cur_batch = None
+        self.last_batch = None
+        self.chunked_req = None
+        self.waiting_queue.clear()
+
+        self.tree_cache.reset()
+        if getattr(self, "grammar_backend", None):
+            self.grammar_backend.reset()
+        self.req_to_token_pool.clear()
+        self.token_to_kv_pool_allocator.clear()
+
+        if self.draft_worker:
+            self.draft_worker.clear_cache_pool()
+
+        self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+        self.running_batch.req_to_token_pool = self.req_to_token_pool
+        self.running_batch.token_to_kv_pool_allocator = self.token_to_kv_pool_allocator
+        self.running_batch.tree_cache = self.tree_cache
+        self.running_batch.model_config = self.model_config
+        self.running_batch.enable_overlap = self.enable_overlap
+        self.running_batch.spec_algorithm = self.spec_algorithm
+        self.running_batch.mesh = self.mesh
+
+        if self.cum_spec_accept_count > 0:
+            avg_spec_accept_length = self.cum_spec_accept_length / self.cum_spec_accept_count
+            logger.info(
+                "Average speculative accept length before flush: %.2f", avg_spec_accept_length
+            )
+
+        self.num_generated_tokens = 0
+        self.forward_ct_decode = 0
+        self.spec_num_total_accepted_tokens = 0
+        self.spec_num_total_forward_ct = 0
+        self.cum_spec_accept_length = 0
+        self.cum_spec_accept_count = 0
+
+        logger.info("Cache flushed successfully!")
+        return 1
 
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.perf_counter()
@@ -883,6 +948,7 @@ class Scheduler(
         # Run forward
         assert self.is_generation
 
+        num_accepted_tokens = None
         if self.spec_algorithm.is_none():
             (
                 precompile_token_paddings,
@@ -927,6 +993,7 @@ class Scheduler(
                 accept_length,
                 cache_miss_count,
             ) = self.draft_worker.forward_batch_speculative_generation(batch)
+            num_accepted_tokens = accept_length
         bid = model_worker_batch.bid
         batch.output_ids = next_token_ids
 
@@ -949,6 +1016,7 @@ class Scheduler(
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             bid=bid,
             cache_miss_count=cache_miss_count,
+            num_accepted_tokens=num_accepted_tokens,
         )
 
         return ret

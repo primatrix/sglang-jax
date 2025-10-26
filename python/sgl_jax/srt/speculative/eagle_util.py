@@ -364,10 +364,14 @@ class EagleDraftInput:
         pt = 0
         for i, extend_len in enumerate(batch.extend_lens):
             input_ids = batch.input_ids[pt : pt + extend_len]
+            # print(f"========draft extend original=={batch.input_ids=}===============")
+
             # TODO: batch.input_ids should on tpu
             batch.input_ids[pt : pt + extend_len] = jnp.concatenate(
                 (input_ids[1:], self.verified_id[i].reshape(1))
             )
+            # print(f"========draft extend=={batch.input_ids=}===============")
+
             pt += extend_len
 
     @classmethod
@@ -652,6 +656,9 @@ class EagleVerifyInput:
 
         if is_all_greedy:
             target_predict = jnp.argmax(logits_output.next_token_logits, axis=-1).flatten()
+            # print(f"{target_predict=}")
+            # print(f"{candidates=}")
+
             accept_index, accept_length, predict = verify_tree_greedy(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable

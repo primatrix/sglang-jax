@@ -22,6 +22,11 @@ class SchedulerMetricsMixin:
         self.cum_spec_accept_count = 0
         self.total_retracted_reqs = 0
 
+    def update_spec_metrics(self, bs: int, num_accepted_tokens: int):
+        self.spec_num_total_accepted_tokens += num_accepted_tokens
+        self.spec_num_total_forward_ct += bs
+        self.num_generated_tokens += num_accepted_tokens
+
     def log_prefill_stats(
         self,
         adder: PrefillAdder,
@@ -67,6 +72,25 @@ class SchedulerMetricsMixin:
             )
 
         msg = f"Decode batch. #running-req: {num_running_reqs}, {token_msg}"
+
+        if not self.spec_algorithm.is_none():
+            spec_accept_length = 0.0
+            spec_accept_rate = 0.0
+            if self.spec_num_total_forward_ct > 0:
+                spec_accept_length = (
+                    self.spec_num_total_accepted_tokens / self.spec_num_total_forward_ct
+                )
+                draft_steps = self.server_args.speculative_num_steps or 0
+                total_draft_tokens = self.spec_num_total_forward_ct * draft_steps
+                if draft_steps > 0 and total_draft_tokens > 0:
+                    spec_accept_rate = self.spec_num_total_accepted_tokens / total_draft_tokens
+                self.cum_spec_accept_length += self.spec_num_total_accepted_tokens
+                self.cum_spec_accept_count += self.spec_num_total_forward_ct
+                self.spec_num_total_accepted_tokens = 0
+                self.spec_num_total_forward_ct = 0
+            msg += (
+                f"accept len: {spec_accept_length:.2f}, " f"accept rate: {spec_accept_rate:.2f}, "
+            )
 
         msg += (
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "

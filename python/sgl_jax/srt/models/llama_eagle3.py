@@ -186,6 +186,7 @@ class LlamaEagleModel(LlamaModel):
             positions = jnp.arange(input_ids.shape[0], dtype=jnp.int32)
 
         embeds = self.embed_tokens(input_ids)
+        print(f"llama =========     {embeds.shape}")
 
         if self.is_mrope_enabled:
             # positions = forward_batch.mrope_positions
