@@ -248,7 +248,9 @@ class ModelRunner:
 
         cell_size = (
             self.model_config.get_num_kv_heads(self.tp_size)
-            * self.model_config.head_dim
+            * (self.model_config.head_dim + 127)
+            // 128
+            * 128
             * self.model_config.num_hidden_layers
             * 2
             * jnp.dtype(self.kv_cache_dtype).itemsize
@@ -364,7 +366,7 @@ class ModelRunner:
             page_size=self.page_size,
             dtype=self.kv_cache_dtype,
             head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
-            head_dim=self.model_config.head_dim,
+            head_dim=(self.model_config.head_dim + 127) // 128 * 128,
             layer_num=self.model_config.num_hidden_layers,
             mesh=self.mesh,
         )
@@ -410,7 +412,7 @@ class ModelRunner:
             return FlashAttentionBackend(
                 self.num_attn_heads,
                 self.num_kv_heads,
-                self.model_config.head_dim,
+                (self.model_config.head_dim + 127) // 128 * 128,
                 page_size=self.page_size,
                 mesh=self.mesh,
             )
@@ -566,7 +568,7 @@ class MockModelRunner(ModelRunner):
             page_size=self.page_size,
             dtype=self.kv_cache_dtype,
             head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
-            head_dim=self.model_config.head_dim,
+            head_dim=(self.model_config.head_dim + 127) // 128 * 128,
             layer_num=self.model_config.num_hidden_layers,
             mesh=mesh,
         )

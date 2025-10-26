@@ -54,11 +54,10 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         super().__init__(config, layer_id)
 
         # override qkv
-        head_dim = getattr(config, "head_dim", None)
         attention_bias = getattr(config, "attention_bias", False) or getattr(config, "bias", False)
         self.self_attn.q_proj = LinearBase(
             input_size=2 * self.hidden_size,
-            output_size=config.num_attention_heads * head_dim,
+            output_size=self.self_attn.q_head_num * self.self_attn.head_dim,
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
             rngs=rngs,
@@ -66,7 +65,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         )
         self.self_attn.k_proj = LinearBase(
             input_size=2 * config.hidden_size,
-            output_size=config.num_attention_heads * head_dim,
+            output_size=self.self_attn.kv_head_num * self.self_attn.head_dim,
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
             rngs=rngs,
@@ -74,9 +73,9 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         )
         self.self_attn.v_proj = LinearBase(
             input_size=2 * config.hidden_size,
-            output_size=config.num_attention_heads * head_dim,
+            output_size=config.num_key_value_heads * self.self_attn.head_dim,
             use_bias=attention_bias,
-            kernel_axes=(None, "tensor"),
+            kernel_axes=("tensor", None),
             rngs=rngs,
             params_dtype=dtype,
         )
@@ -111,6 +110,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         hidden_states = self.hidden_norm(hidden_states)
 
         hidden_states = jnp.concatenate([embeds, hidden_states], axis=-1, dtype=jnp.bfloat16)
+        print(f"-----{hidden_states.shape}------")
         # Self Attention
         hidden_states, kv_fused = self.self_attn(
             positions=positions,
@@ -125,7 +125,6 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
 
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
-
         return hidden_states, residual, kv_fused
 
 
@@ -327,6 +326,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             transpose=True,
             head_dim_padding=True,
             kv_head_padding=False,
+            is_eagle3=True,
         )
         mappings["midlayer.self_attn.k_proj.weight"] = WeightMapping(
             target_path="transformer.midlayer.self_attn.k_proj.weight",
@@ -334,6 +334,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             transpose=True,
             head_dim_padding=True,
             kv_head_padding=True,
+            is_eagle3=True,
         )
         mappings["midlayer.self_attn.v_proj.weight"] = WeightMapping(
             target_path="transformer.midlayer.self_attn.v_proj.weight",
@@ -341,6 +342,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             transpose=True,
             head_dim_padding=True,
             kv_head_padding=True,
+            is_eagle3=True,
         )
         mappings["midlayer.self_attn.o_proj.weight"] = WeightMapping(
             target_path="transformer.midlayer.self_attn.o_proj.weight",

@@ -185,10 +185,10 @@ class LlamaAttention(nnx.Module):
         v = v.reshape(-1, self.kv_head_num, self.head_dim)
 
         q, k = self.rotary_emb(positions, q, k)
+
         attn_output, kv_fused = self.attn(
             q, k, v, forward_batch=forward_batch, token_to_kv_pool=token_to_kv_pool
         )
-
         output, _ = self.o_proj(attn_output)
         return output, kv_fused
 
@@ -217,11 +217,13 @@ class LlamaDecoderLayer(nnx.Module):
         attention_bias = getattr(config, "attention_bias", False) or getattr(config, "bias", False)
 
         head_dim = getattr(config, "head_dim", None)
+        self.head_dim = (head_dim + 127) // 128 * 128
+
         self.self_attn = LlamaAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
-            head_dim=head_dim,
+            head_dim=self.head_dim,
             layer_id=layer_id,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
