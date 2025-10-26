@@ -14,6 +14,7 @@ from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers.schedule_batch import (
+    ModelWorkerBatch,
     ScheduleBatch,
     get_last_loc,
     global_server_args_dict,
@@ -353,7 +354,7 @@ class EagleDraftInput:
 
         return obj
 
-    def prepare_for_extend(self, batch: ScheduleBatch):
+    def prepare_for_extend(self, batch: ModelWorkerBatch):
 
         if batch.forward_mode.is_idle():
             return
@@ -362,7 +363,7 @@ class EagleDraftInput:
         assert len(self.verified_id) == len(batch.seq_lens)
 
         pt = 0
-        for i, extend_len in enumerate(batch.extend_lens):
+        for i, extend_len in enumerate(batch.extend_seq_lens):
             input_ids = batch.input_ids[pt : pt + extend_len]
             # TODO: batch.input_ids should on tpu
             batch.input_ids[pt : pt + extend_len] = jnp.concatenate(

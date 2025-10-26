@@ -301,7 +301,10 @@ class Scheduler(
 
         if not server_args.disable_jax_precompile:
             logger.info("[Scheduler] Begins to run worker precompile.")
-            self.tp_worker.run_precompile()
+            if self.spec_algorithm.is_none():
+                self.tp_worker.run_precompile()
+            else:
+                self.draft_worker.run_precompile()
             logger.info("[Scheduler] Completes worker precompile.")
 
     def sync_pub(self):
