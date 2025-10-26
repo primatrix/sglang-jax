@@ -374,8 +374,6 @@ class MHATokenToKVPool(KVCache):
         page_size = 1 if is_decode else self.page_size
 
         # Merge k and v into fused format
-        print(f"{k.shape}")
-        print(f"{v.shape}")
 
         fused_kv = merge_kv(k, v)  # [total_tokens, num_heads * 2, head_dim]
 

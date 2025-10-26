@@ -216,7 +216,6 @@ class WeightLoader:
         if mapping.reshape is not None:
             processed_weight = jnp.reshape(processed_weight, mapping.reshape)
         if mapping.head_dim_padding and self.head_dim_pad > 0:
-            print(f"----------{mapping.head_dim_padding=} {self.head_dim_pad}")
 
             processed_weight = self._apply_head_dim_padding(processed_weight, hf_key, mapping)
 
@@ -238,44 +237,6 @@ class WeightLoader:
         except Exception as e:
             logger.error("Failed to load %s -> %s: %s", hf_key, jax_path, str(e))
             raise
-
-    def assign_single_weight(
-        self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
-    ):
-        jax_path = mapping.target_path
-        processed_weight = weight
-
-        if mapping.reshape is not None:
-            processed_weight = jnp.reshape(processed_weight, mapping.reshape)
-
-        sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
-
-        try:
-            model_param = self._get_param(params, jax_path)
-            logger.debug(
-                "Loading %s -> %s, shape: %s, transpose: %s",
-                hf_key,
-                jax_path,
-                processed_weight.shape,
-                mapping.transpose,
-            )
-            model_param.value = sharded_weight.astype(model_param.value.dtype)
-        except Exception as e:
-            logger.error("Failed to load %s -> %s: %s", hf_key, jax_path, str(e))
-            raise
-
-    # def _process_eagle_hot_token_ids(self, hf_key: str, hf_weight: jax.Array) -> None:
-    #     """Derive and store Eagle3 hot token ids from the d2t weight."""
-    #     flattened = jnp.ravel(hf_weight)
-    #     hot_token_ids = flattened + jnp.arange(flattened.shape[0], dtype=flattened.dtype)
-    #     if not jnp.issubdtype(hot_token_ids.dtype, jnp.integer):
-    #         hot_token_ids = hot_token_ids.astype(jnp.int32)
-    #     self.model.hot_token_id = hot_token_ids
-    #     logger.debug(
-    #         "Assigned Eagle hot token ids for %s, shape: %s",
-    #         hf_key,
-    #         hot_token_ids.shape,
-    #     )
 
     def _handle_split_weight(
         self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
@@ -397,11 +358,9 @@ class WeightLoader:
             return jax.device_put(weight, self.mesh.devices.flatten()[0])
         return jax.device_put(weight, NamedSharding(self.mesh, P(*sharding)))
 
-    def _get_param(self, params: nnx.State, path: str, judege: bool | None = False) -> nnx.State:
+    def _get_param(self, params: nnx.State, path: str) -> nnx.State:
         keys = path.split(".")
         current_level = params
-        if judege:
-            print(current_level)
         for key in keys:
             if key.isdigit():
                 current_level = current_level[int(key)]
@@ -418,10 +377,8 @@ class WeightLoader:
     def _apply_head_dim_padding(
         self, weight: jax.Array, hf_key: str, mapping: WeightMapping
     ) -> jax.Array:
-        print(f"====={hf_key=}=========={weight.shape}==========")
 
         if hf_key.endswith(".bias"):
-            print("1")
             if any(proj in hf_key for proj in ["q_proj", "k_proj", "v_proj"]):
                 if "q_proj" in hf_key:
                     reshaped = jnp.reshape(weight, (self.num_heads, self.head_dim_original))
@@ -432,7 +389,6 @@ class WeightLoader:
                     padded = jnp.pad(reshaped, ((0, 0), (0, self.head_dim_pad)))
                     return jnp.reshape(padded, (self.num_kv_heads * self.head_dim,))
         else:
-            print("2")
 
             if mapping.reshape is not None:
                 if "o_proj" in hf_key:
@@ -443,10 +399,6 @@ class WeightLoader:
             else:
                 if mapping.transpose:
                     if "q_proj" in hf_key:
-                        print(f"====={hf_key=}=========={weight.shape}==========")
-                        print(
-                            f"====={self.hidden_size=}======{self.hidden_size if not mapping.is_eagle3 else 2 * self.hidden_size}===={self.num_kv_heads}==={self.head_dim_original}======="
-                        )
                         reshaped = jnp.reshape(
                             weight,
                             (
@@ -456,9 +408,6 @@ class WeightLoader:
                             ),
                         )
                         padded = jnp.pad(reshaped, ((0, 0), (0, 0), (0, self.head_dim_pad)))
-                        print(
-                            f"{(self.hidden_size if not mapping.is_eagle3 else 2 * self.hidden_size, self.num_heads * self.head_dim)=}"
-                        )
                         return jnp.reshape(
                             padded,
                             (
@@ -467,10 +416,6 @@ class WeightLoader:
                             ),
                         )
                     elif any(proj in hf_key for proj in ["k_proj", "v_proj"]):
-                        print(f"====={hf_key=}=========={weight.shape}==========")
-                        print(
-                            f"====={self.hidden_size=}=========={self.num_kv_heads}==={self.head_dim_original}======="
-                        )
 
                         reshaped = jnp.reshape(
                             weight,

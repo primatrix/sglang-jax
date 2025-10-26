@@ -584,8 +584,6 @@ class LlamaForCausalLM(nnx.Module):
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        print(forward_batch)
-        print(token_to_kv_pool)
         hidden_states, aux_hidden_states, layers_kv_fused, layers_callback_flag = self.transformer(
             forward_batch=forward_batch, token_to_kv_pool=token_to_kv_pool
         )
