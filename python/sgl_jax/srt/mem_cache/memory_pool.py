@@ -217,6 +217,8 @@ class KVCache(abc.ABC):
         """Load CPU copy back to device"""
         raise NotImplementedError()
 
+    # Base KVCache deliberately does not expose SWA-specific hooks
+
 
 @register_pytree_node_class
 class MHATokenToKVPool(KVCache):

@@ -27,7 +27,6 @@ class QWenMLP(nnx.Module):
         hidden_size: int,
         intermediate_size: int,
         layer_id: int = 0,
-        rngs: nnx.Rngs = None,
         dtype: jnp.dtype = jnp.float16,
     ):
         self.layer_id = layer_id
@@ -38,7 +37,6 @@ class QWenMLP(nnx.Module):
             use_bias=False,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
-            rngs=rngs,
         )
 
         self.w2 = LinearBase(
@@ -47,7 +45,6 @@ class QWenMLP(nnx.Module):
             use_bias=False,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
-            rngs=rngs,
         )
 
         self.c_proj = LinearBase(
@@ -56,7 +53,6 @@ class QWenMLP(nnx.Module):
             use_bias=False,
             kernel_axes=("tensor", None),
             params_dtype=dtype,
-            rngs=rngs,
         )
 
         self.act_func = jax.nn.silu
@@ -79,7 +75,6 @@ class QWenAttention(nnx.Module):
         rope_scaling: dict[str, Any] | None = None,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.float16,
-        rngs: nnx.Rngs = None,
     ):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -92,7 +87,6 @@ class QWenAttention(nnx.Module):
             output_size=hidden_size,
             use_bias=True,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             params_dtype=dtype,
         )
         self.k_proj = LinearBase(
@@ -100,7 +94,6 @@ class QWenAttention(nnx.Module):
             output_size=hidden_size,
             use_bias=True,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             params_dtype=dtype,
         )
         self.v_proj = LinearBase(
@@ -108,7 +101,6 @@ class QWenAttention(nnx.Module):
             output_size=hidden_size,
             use_bias=True,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             params_dtype=dtype,
         )
         self.c_proj = LinearBase(
@@ -116,7 +108,6 @@ class QWenAttention(nnx.Module):
             output_size=hidden_size,
             use_bias=False,
             kernel_axes=("tensor", None),
-            rngs=rngs,
             params_dtype=dtype,
         )
 
@@ -164,7 +155,6 @@ class QWenBlock(nnx.Module):
         config: PretrainedConfig,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.float16,
-        rngs: nnx.Rngs = None,
     ):
         self.layer_id = layer_id
 
@@ -173,7 +163,6 @@ class QWenBlock(nnx.Module):
             epsilon=config.layer_norm_epsilon,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None,)),
-            rngs=rngs,
         )
 
         rope_theta = getattr(config, "rope_theta", 10000)
@@ -186,7 +175,6 @@ class QWenBlock(nnx.Module):
             rope_scaling=rope_scaling,
             layer_id=layer_id,
             dtype=dtype,
-            rngs=rngs,
         )
 
         self.ln_2 = RMSNorm(
@@ -194,7 +182,6 @@ class QWenBlock(nnx.Module):
             epsilon=config.layer_norm_epsilon,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None,)),
-            rngs=rngs,
         )
 
         self.mlp = QWenMLP(
@@ -202,7 +189,6 @@ class QWenBlock(nnx.Module):
             config.intermediate_size // 2,
             layer_id=layer_id,
             dtype=dtype,
-            rngs=rngs,
         )
 
     def __call__(
@@ -237,14 +223,12 @@ class QWenModel(nnx.Module):
         self,
         config: PretrainedConfig,
         dtype: jnp.dtype = jnp.float16,
-        rngs: nnx.Rngs = None,
     ):
         vocab_size = ((config.vocab_size + 63) // 64) * 64
 
         self.embed_tokens = Embed(
             num_embeddings=vocab_size,
             features=config.hidden_size,
-            rngs=rngs,
             dtype=dtype,
             embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
             param_dtype=dtype,
@@ -256,7 +240,6 @@ class QWenModel(nnx.Module):
                     config,
                     layer_id=i,
                     dtype=dtype,
-                    rngs=rngs,
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -267,7 +250,6 @@ class QWenModel(nnx.Module):
             epsilon=config.layer_norm_epsilon,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None,)),
-            rngs=rngs,
         )
 
     def __call__(
@@ -297,27 +279,23 @@ class QWenLMHeadModel(nnx.Module):
         self,
         config: PretrainedConfig,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
         mesh: jax.sharding.Mesh = None,
     ):
         self.mesh = mesh
         self.config = config
         self.dtype = dtype
         logger.info("QWenLMHeadModel config dtype: %s", self.dtype)
-        self.transformer = QWenModel(config, dtype=self.dtype, rngs=rngs)
+        self.transformer = QWenModel(config, dtype=self.dtype)
         vocab_size = ((config.vocab_size + 63) // 64) * 64
         if not getattr(self.config, "tie_word_embeddings", False):
             self.lm_head = ParallelLMHead(
                 vocab_size,
                 config.hidden_size,
                 embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
-                rngs=rngs,
             )
         self.logits_processor = LogitsProcessor(vocab_size, mesh=self.mesh)
 
-    def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
-        self.rng = nnx.Rngs(rng_key)
-
+    def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
             model=self,
             model_config=model_config,

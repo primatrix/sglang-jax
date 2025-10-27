@@ -38,7 +38,6 @@ class LinearBase(nnx.Module):
         skip_bias_add: bool = False,
         params_dtype: jnp.dtype | None = jnp.bfloat16,
         kernel_axes: Sequence[str] | None = None,
-        rngs: nnx.Rngs = None,
     ):
         """Initialize parameters and quantization method."""
         self.skip_bias_add = skip_bias_add

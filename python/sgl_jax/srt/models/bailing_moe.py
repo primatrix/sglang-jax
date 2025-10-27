@@ -38,7 +38,6 @@ class BailingMoEAttention(nnx.Module):
         layer_id: int = 0,
         attention_bias: bool = False,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
     ):
         self.layer_id = layer_id
         assert num_heads % num_kv_heads == 0
@@ -59,14 +58,12 @@ class BailingMoEAttention(nnx.Module):
                 epsilon=rms_norm_eps,
                 param_dtype=dtype,
                 scale_init=nnx.with_partitioning(init_fn, (None,)),
-                rngs=rngs,
             )
             self.k_norm = RMSNorm(
                 self.head_dim,
                 epsilon=rms_norm_eps,
                 param_dtype=dtype,
                 scale_init=nnx.with_partitioning(init_fn, (None,)),
-                rngs=rngs,
             )
         else:
             self.q_norm = None
@@ -74,34 +71,30 @@ class BailingMoEAttention(nnx.Module):
 
         self.q_proj = LinearBase(
             input_size=hidden_size,
-            output_size=num_heads * self.head_dim,
+            output_size=self.q_size,
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             params_dtype=dtype,
         )
         self.k_proj = LinearBase(
             input_size=hidden_size,
-            output_size=num_kv_heads * self.head_dim,
+            output_size=self.kv_size,
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             params_dtype=dtype,
         )
         self.v_proj = LinearBase(
             input_size=hidden_size,
-            output_size=num_kv_heads * self.head_dim,
+            output_size=self.kv_size,
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             params_dtype=dtype,
         )
         self.c_proj = LinearBase(
-            input_size=num_heads * self.head_dim,
+            input_size=self.q_size,
             output_size=hidden_size,
             use_bias=attention_bias,
             kernel_axes=("tensor", None),
-            rngs=rngs,
             params_dtype=dtype,
         )
         self.rotary_emb = RotaryEmbedding(
@@ -154,7 +147,6 @@ class BailingMoEMLP(nnx.Module):
         hidden_size: int,
         intermediate_size: int,
         layer_id: int = 0,
-        rngs: nnx.Rngs = None,
         dtype: jnp.dtype = jnp.bfloat16,
     ) -> None:
         self.layer_id = layer_id
@@ -165,7 +157,6 @@ class BailingMoEMLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=False,
             params_dtype=dtype,
-            rngs=rngs,
         )
 
         self.up_proj = LinearBase(
@@ -174,7 +165,6 @@ class BailingMoEMLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=False,
             params_dtype=dtype,
-            rngs=rngs,
         )
 
         self.down_proj = LinearBase(
@@ -183,7 +173,6 @@ class BailingMoEMLP(nnx.Module):
             kernel_axes=("tensor", None),
             use_bias=False,
             params_dtype=dtype,
-            rngs=rngs,
         )
 
         self.act_fn = jax.nn.silu
@@ -202,7 +191,6 @@ class BailingMoEDecoderLayer(nnx.Module):
         config: PretrainedConfig,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
         mesh: jax.sharding.Mesh = None,
     ):
         self.layer_id = layer_id
@@ -233,7 +221,6 @@ class BailingMoEDecoderLayer(nnx.Module):
             layer_id=layer_id,
             attention_bias=getattr(config, "attention_bias", False),
             dtype=dtype,
-            rngs=rngs,
         )
 
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
@@ -244,7 +231,6 @@ class BailingMoEDecoderLayer(nnx.Module):
                 intermediate_size=config.intermediate_size,
                 layer_id=layer_id,
                 dtype=dtype,
-                rngs=rngs,
             )
             self.is_moe_layer = False
             self.moe_gate = None
@@ -294,7 +280,6 @@ class BailingMoEDecoderLayer(nnx.Module):
                     * num_shared_experts,
                     layer_id=layer_id,
                     dtype=dtype,
-                    rngs=rngs,
                 )
             else:
                 self.shared_experts = None
@@ -305,14 +290,12 @@ class BailingMoEDecoderLayer(nnx.Module):
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None,)),
-            rngs=rngs,
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None,)),
-            rngs=rngs,
         )
 
     def __call__(
@@ -364,7 +347,6 @@ class BailingMoEModel(nnx.Module):
         self,
         config: PretrainedConfig,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
         mesh: jax.sharding.Mesh = None,
     ):
         self.config = config
@@ -374,7 +356,6 @@ class BailingMoEModel(nnx.Module):
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
-            rngs=rngs,
             dtype=dtype,
             param_dtype=dtype,
             embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
@@ -386,7 +367,6 @@ class BailingMoEModel(nnx.Module):
                     config=config,
                     layer_id=i,
                     dtype=dtype,
-                    rngs=rngs,
                     mesh=mesh,
                 )
                 for i in range(config.num_hidden_layers)
@@ -398,7 +378,6 @@ class BailingMoEModel(nnx.Module):
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None,)),
-            rngs=rngs,
         )
 
     def __call__(
@@ -431,24 +410,21 @@ class BailingMoEForCausalLM(nnx.Module):
         self,
         config: PretrainedConfig,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
         mesh: jax.sharding.Mesh = None,
     ):
         self.mesh = mesh
         self.config = config
         self.dtype = dtype
-        self.transformer = BailingMoEModel(config, dtype=self.dtype, rngs=rngs, mesh=mesh)
+        self.model = BailingMoEModel(config, dtype=self.dtype, mesh=mesh)
         if not getattr(self.config, "tie_word_embeddings", False):
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
                 embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
-                rngs=rngs,
             )
         self.logits_processor = LogitsProcessor(config.vocab_size, self.mesh)
 
-    def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
-        self.rng = nnx.Rngs(rng_key)
+    def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
             model=self,
             model_config=model_config,
@@ -609,13 +585,11 @@ class BailingMoEForCausalLM(nnx.Module):
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused = self.transformer(forward_batch, token_to_kv_pool)
+        hidden_states, layers_kv_fused = self.model(forward_batch, token_to_kv_pool)
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
-            output = self.logits_processor(
-                hidden_states, self.transformer.embed_tokens, logits_metadata
-            )
+            output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
         return output, layers_kv_fused, True
 
 
