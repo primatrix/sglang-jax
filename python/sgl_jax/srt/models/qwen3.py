@@ -36,7 +36,6 @@ class QWen3Attention(nnx.Module):
         layer_id: int = 0,
         attention_bias: bool = False,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
     ):
         self.layer_id = layer_id
         assert num_heads % num_kv_heads == 0
@@ -53,14 +52,12 @@ class QWen3Attention(nnx.Module):
             epsilon=rms_norm_eps,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None,)),
-            rngs=rngs,
         )
         self.k_norm = RMSNorm(
             self.head_dim,
             epsilon=rms_norm_eps,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None,)),
-            rngs=rngs,
         )
 
         self.q_proj = LinearBase(
@@ -68,7 +65,6 @@ class QWen3Attention(nnx.Module):
             output_size=num_heads * self.head_dim,
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             params_dtype=dtype,
         )
         self.k_proj = LinearBase(
@@ -76,7 +72,6 @@ class QWen3Attention(nnx.Module):
             output_size=num_kv_heads * self.head_dim,
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             params_dtype=dtype,
         )
         self.v_proj = LinearBase(
@@ -84,7 +79,6 @@ class QWen3Attention(nnx.Module):
             output_size=num_kv_heads * self.head_dim,
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             params_dtype=dtype,
         )
         self.o_proj = LinearBase(
@@ -92,7 +86,6 @@ class QWen3Attention(nnx.Module):
             output_size=hidden_size,
             use_bias=attention_bias,
             kernel_axes=("tensor", None),
-            rngs=rngs,
             params_dtype=dtype,
         )
         self.rotary_emb = RotaryEmbedding(
@@ -143,7 +136,6 @@ class Qwen3MLP(nnx.Module):
         hidden_size: int,
         intermediate_size: int,
         layer_id: int = 0,
-        rngs: nnx.Rngs = None,
         dtype: jnp.dtype = jnp.bfloat16,
     ) -> None:
         self.layer_id = layer_id
@@ -154,7 +146,6 @@ class Qwen3MLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=False,
             params_dtype=dtype,
-            rngs=rngs,
         )
 
         self.up_proj = LinearBase(
@@ -163,7 +154,6 @@ class Qwen3MLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=False,
             params_dtype=dtype,
-            rngs=rngs,
         )
 
         self.down_proj = LinearBase(
@@ -172,7 +162,6 @@ class Qwen3MLP(nnx.Module):
             kernel_axes=("tensor", None),
             use_bias=False,
             params_dtype=dtype,
-            rngs=rngs,
         )
 
         self.act_fn = jax.nn.silu
@@ -191,7 +180,6 @@ class QWen3DecoderLayer(nnx.Module):
         config: PretrainedConfig,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
     ):
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
@@ -211,7 +199,6 @@ class QWen3DecoderLayer(nnx.Module):
             layer_id=layer_id,
             attention_bias=config.attention_bias,
             dtype=dtype,
-            rngs=rngs,
         )
 
         self.mlp = Qwen3MLP(
@@ -219,21 +206,18 @@ class QWen3DecoderLayer(nnx.Module):
             intermediate_size=config.intermediate_size,
             layer_id=layer_id,
             dtype=dtype,
-            rngs=rngs,
         )
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None,)),
-            rngs=rngs,
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None,)),
-            rngs=rngs,
         )
 
     def __call__(
@@ -287,12 +271,10 @@ class QWen3Model(nnx.Module):
         self,
         config: PretrainedConfig,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
     ):
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
-            rngs=rngs,
             dtype=dtype,
             embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
             param_dtype=dtype,
@@ -304,7 +286,6 @@ class QWen3Model(nnx.Module):
                     config=config,
                     layer_id=i,
                     dtype=dtype,
-                    rngs=rngs,
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -315,7 +296,6 @@ class QWen3Model(nnx.Module):
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None,)),
-            rngs=rngs,
         )
 
     def __call__(
@@ -354,26 +334,22 @@ class Qwen3ForCausalLM(nnx.Module):
         self,
         config: PretrainedConfig,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
         mesh: jax.sharding.Mesh = None,
     ):
         self.mesh = mesh
         self.config = config
         self.dtype = dtype
         logger.info("QWen3ForCausalLMModel config dtype: %s", self.dtype)
-        self.model = QWen3Model(config, dtype=self.dtype, rngs=rngs)
+        self.model = QWen3Model(config, dtype=self.dtype)
         if not getattr(self.config, "tie_word_embeddings", False):
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
                 embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
-                rngs=rngs,
             )
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
 
-    def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
-        self.rng = nnx.Rngs(rng_key)
-
+    def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
             model=self,
             model_config=model_config,

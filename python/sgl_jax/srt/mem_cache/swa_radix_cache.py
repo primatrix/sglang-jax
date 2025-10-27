@@ -511,6 +511,7 @@ class SWARadixCache(BasePrefixCache):
 
                 x = x_next
 
+        print(f"{swa_num_evicted=} {swa_num_tokens=} {full_num_tokens=}")
         if swa_num_evicted < swa_num_tokens:
             # get the least recently used node that is not locked, doesn't have to be a leaf
             x = self.swa_lru_list.get_lru_no_lock()
