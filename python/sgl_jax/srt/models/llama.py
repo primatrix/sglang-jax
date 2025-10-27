@@ -45,7 +45,6 @@ class LlamaMLP(nnx.Module):
         hidden_size: int,
         intermediate_size: int,
         layer_id: int = 0,
-        rngs: nnx.Rngs = None,
         dtype: jnp.dtype = jnp.bfloat16,
     ) -> None:
         self.layer_id = layer_id
@@ -56,7 +55,6 @@ class LlamaMLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=False,
             params_dtype=dtype,
-            rngs=rngs,
         )
 
         self.up_proj = LinearBase(
@@ -65,7 +63,6 @@ class LlamaMLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=False,
             params_dtype=dtype,
-            rngs=rngs,
         )
 
         self.down_proj = LinearBase(
@@ -74,7 +71,6 @@ class LlamaMLP(nnx.Module):
             kernel_axes=("tensor", None),
             use_bias=False,
             params_dtype=dtype,
-            rngs=rngs,
         )
 
         self.act_fn = jax.nn.silu
@@ -101,7 +97,6 @@ class LlamaAttention(nnx.Module):
         rope_is_neox_style: bool = True,
         max_position_embeddings: int = 8192,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
         attention_bias: bool = False,
     ) -> None:
         self.hidden_size = hidden_size
@@ -124,7 +119,6 @@ class LlamaAttention(nnx.Module):
             output_size=num_heads * self.head_dim,
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             params_dtype=dtype,
         )
         self.k_proj = LinearBase(
@@ -132,7 +126,6 @@ class LlamaAttention(nnx.Module):
             output_size=num_kv_heads * self.head_dim,
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             params_dtype=dtype,
         )
         self.v_proj = LinearBase(
@@ -140,7 +133,6 @@ class LlamaAttention(nnx.Module):
             output_size=num_kv_heads * self.head_dim,
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             params_dtype=dtype,
         )
         self.o_proj = LinearBase(
@@ -148,7 +140,6 @@ class LlamaAttention(nnx.Module):
             output_size=hidden_size,
             use_bias=attention_bias,
             kernel_axes=("tensor", None),
-            rngs=rngs,
             params_dtype=dtype,
         )
         self.rotary_emb = get_rope(
@@ -199,7 +190,6 @@ class LlamaDecoderLayer(nnx.Module):
         config: LlamaConfig,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
     ) -> None:
         # super().__init__()
         self.hidden_size = config.hidden_size
@@ -228,13 +218,11 @@ class LlamaDecoderLayer(nnx.Module):
             rope_is_neox_style=rope_is_neox_style,
             max_position_embeddings=max_position_embeddings,
             attention_bias=attention_bias,
-            rngs=rngs,
             dtype=dtype,
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
-            rngs=rngs,
             dtype=dtype,
         )
         self.input_layernorm = RMSNorm(
@@ -242,7 +230,6 @@ class LlamaDecoderLayer(nnx.Module):
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None,)),
-            rngs=rngs,
             dtype=dtype,
         )
         self.post_attention_layernorm = RMSNorm(
@@ -250,7 +237,6 @@ class LlamaDecoderLayer(nnx.Module):
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None,)),
-            rngs=rngs,
             dtype=dtype,
         )
 
@@ -305,7 +291,6 @@ class LlamaModel(nnx.Module):
         self,
         config: LlamaConfig,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -314,7 +299,6 @@ class LlamaModel(nnx.Module):
         self.embed_tokens = Embed(
             config.vocab_size,
             config.hidden_size,
-            rngs=rngs,
             dtype=dtype,
             param_dtype=dtype,
         )
@@ -325,7 +309,6 @@ class LlamaModel(nnx.Module):
                     config=config,
                     layer_id=i,
                     dtype=dtype,
-                    rngs=rngs,
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -336,7 +319,6 @@ class LlamaModel(nnx.Module):
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None,)),
-            rngs=rngs,
         )
 
     def __call__(
@@ -375,21 +357,18 @@ class LlamaForCausalLM(nnx.Module):
         self,
         config: PretrainedConfig,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
         mesh: jax.sharding.Mesh = None,
     ):
         self.mesh = mesh
         self.config = config
         self.dtype = dtype
         logger.info("LlamaForCausalLM config dtype: %s", self.dtype)
-        self.model = LlamaModel(config, dtype=self.dtype, rngs=rngs)
+        self.model = LlamaModel(config, dtype=self.dtype)
         if not getattr(self.config, "tie_word_embeddings", True):
-            self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, rngs=rngs)
+            self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config.vocab_size, self.mesh)
 
-    def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
-        self.rng = nnx.Rngs(rng_key)
-
+    def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
             model=self,
             model_config=model_config,
@@ -531,9 +510,7 @@ class LlamaForCausalLM(nnx.Module):
         if not getattr(self.config, "tie_word_embeddings", True):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
-            output = self.logits_processor(
-                hidden_states, self.model.embed_tokens, logits_metadata
-            )
+            output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
         return output, layers_kv_fused, layers_callback_flag
 
 

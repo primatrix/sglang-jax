@@ -217,6 +217,8 @@ class KVCache(abc.ABC):
         """Load CPU copy back to device"""
         raise NotImplementedError()
 
+    # Base KVCache deliberately does not expose SWA-specific hooks
+
 
 @register_pytree_node_class
 class MHATokenToKVPool(KVCache):
@@ -546,6 +548,18 @@ class SWAKVPool(KVCache):
         if is_swa:
             return self.swa_kv_pool.get_fused_kv_buffer(layer_id_pool)
         return self.full_kv_pool.get_fused_kv_buffer(layer_id_pool)
+
+    def remap_cache_loc(self, kv_indices, layer_id: int):
+        """Remap cache locations to SWA pool for SWA layers; otherwise no-op.
+
+        - Uses full_to_swa_index_mapping for translation
+        - Supports both numpy arrays and JAX Arrays
+        """
+        _, is_swa = self.layers_mapping[layer_id]
+        if not is_swa or self.full_to_swa_index_mapping is None:
+            return kv_indices
+        mapping_device = jnp.asarray(self.full_to_swa_index_mapping, dtype=jnp.int32)
+        return jnp.take(mapping_device, kv_indices)
 
     def set_kv_buffer(
         self,
@@ -913,27 +927,6 @@ def update_fused_kv_cache_vectorized(
     total_tokens = loc.shape[0]
     loc = loc.astype(jnp.int32)
 
-    # Debug: basic stats on inputs to catch unexpected indices/shapes under jit
-    try:
-        from jax import debug as _debug
-    except Exception:
-        _debug = None
-    if _debug is not None:
-        _debug.print(
-            "[KVUpdate dbg] tokens={} heads={} head_dim={} cache_tokens={} page_size={}",
-            fused_kv.shape[0],
-            fused_kv.shape[1],
-            fused_kv.shape[2],
-            kv_cache.shape[0],
-            page_size,
-        )
-        _debug.print(
-            "[KVUpdate dbg] loc_neg={} loc_max={} loc_min_pos={}",
-            jnp.sum(loc < 0),
-            jnp.max(jnp.where(loc == -1, 0, loc)),
-            jnp.min(jnp.where(loc >= 0, loc, jnp.iinfo(jnp.int32).max)),
-        )
-
     # Use original logic for page_size = 1: one slice per token
     kv_cache_locs = jnp.where(loc == -1, 0, loc).astype(jnp.int32)
     new_kv_locs = jnp.arange(total_tokens, dtype=jnp.int32)
@@ -955,14 +948,6 @@ def update_fused_kv_cache_vectorized(
         new_kv_start_loc=new_kv_locs,
         slice_lens=slice_lens,
     )
-
-    if _debug is not None:
-        _debug.print(
-            "[KVUpdate dbg] num_slices={} padded_slices={} nspb={}",
-            jnp.array(num_slices, dtype=jnp.int32),
-            jnp.array(slot_mapping.shape[1], dtype=jnp.int32),
-            jnp.array(num_slices_per_block, dtype=jnp.int32),
-        )
 
     num_kv_update_slices = jnp.array([num_slices], dtype=jnp.int32)
 
