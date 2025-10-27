@@ -12,6 +12,7 @@ from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.radix_attention import RadixAttention
+from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
@@ -232,18 +233,30 @@ class Qwen2DecoderLayer(nnx.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
+        layer_norm_callback_flag = precision_tracer.jit_pure_callback_record(
+            hidden_states, "input_layernorm_output", "INPUT_LAYERNORM", self.layer_id
+        )
+        layer_callback_flag.append(layer_norm_callback_flag)
         hidden_states, kv_fused = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
         )
+        attn_callback_flag = precision_tracer.jit_pure_callback_record(
+            hidden_states, "self_attn_output", "SELF_ATTN", self.layer_id
+        )
+        layer_callback_flag.append(attn_callback_flag)
 
         hidden_states += residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
 
+        mlp_callback_flag = precision_tracer.jit_pure_callback_record(
+            hidden_states, "mlp_output", "MLP", self.layer_id
+        )
+        layer_callback_flag.append(mlp_callback_flag)
         return hidden_states, residual, kv_fused, layer_callback_flag
 
 
@@ -306,7 +319,10 @@ class Qwen2Model(nnx.Module):
         if residual is not None:
             hidden_states += residual
         hidden_states = self.norm(hidden_states)
-
+        callback_flag = precision_tracer.jit_pure_callback_record(
+            hidden_states, "transformer_output", "TRANSFORMER"
+        )
+        layers_callback_flag.append(callback_flag)
         return hidden_states, layers_kv_fused, layers_callback_flag
 
 
