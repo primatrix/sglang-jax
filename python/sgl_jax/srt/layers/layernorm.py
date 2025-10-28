@@ -8,6 +8,7 @@ from flax.nnx import rnglib
 from flax.nnx.nn import dtypes, initializers
 from flax.typing import Array, Axes, Dtype, Initializer
 from jax import lax
+from sgl_jax.srt.precision_tracer import precision_tracer
 
 
 def _canonicalize_axes(rank: int, axes: Axes) -> tuple[int, ...]:
@@ -40,8 +41,10 @@ class RMSNorm(nnx.Module):
         axis_name: str | None = None,
         axis_index_groups: Any = None,
         use_fast_variance: bool = True,
+        layer_idx: int = -1,
         rngs: rnglib.Rngs,
     ):
+        self.layer_idx = layer_idx
         feature_shape = (num_features,)
 
         self.scale: nnx.Param[jax.Array] | None
@@ -73,7 +76,15 @@ class RMSNorm(nnx.Module):
             use_fast_variance=self.use_fast_variance,
             mask=mask,
         )
-
+        result = []
+        layer_norm_callback_flag = precision_tracer.jit_pure_callback_record(
+            mean, "input_layernorm_mean", "RMS_NORM", self.layer_idx
+        )
+        result.append(layer_norm_callback_flag)
+        layer_norm_callback_flag = precision_tracer.jit_pure_callback_record(
+            var, "input_layernorm_var", "RMS_NORM", self.layer_idx
+        )
+        result.append(layer_norm_callback_flag)
         return _normalize(
             x,
             mean,

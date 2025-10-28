@@ -136,6 +136,11 @@ class ModelRunner:
 
     def initialize_jit(self):
         model_def, model_state = nnx.split(self.model)
+        for key, params in model_state.flat_state():
+            try:
+                print(f"key {key}, params {params.shape}, mean {jnp.mean(params)}, std {jnp.std(params)}")
+            except Exception as e:
+                print(f'{key} has error {e}')
         model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
         sampler_def, sampler_state = nnx.split(self.sampler)
         sampler_state_leaves, sampler_state_def = jax.tree_util.tree_flatten(sampler_state)

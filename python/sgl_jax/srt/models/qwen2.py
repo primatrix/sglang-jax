@@ -207,6 +207,7 @@ class Qwen2DecoderLayer(nnx.Module):
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
+            layer_id = self.layer_id
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
@@ -214,6 +215,7 @@ class Qwen2DecoderLayer(nnx.Module):
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
+            layer_id = self.layer_id
         )
 
     def __call__(
