@@ -177,7 +177,7 @@ class GenerateReqInput:
         self._determine_batch_size()
         self._handle_parallel_sampling()
 
-        if self.is_single:
+        if self.is_single and self.parallel_sample_num == 1:
             self._normalize_single_inputs()
         else:
             self._normalize_batch_inputs()
