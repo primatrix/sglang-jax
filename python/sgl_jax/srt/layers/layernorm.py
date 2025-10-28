@@ -95,7 +95,7 @@ class RMSNorm(nnx.Module):
             self.feature_axes,
             self.dtype,
             self.epsilon,
-        ), result
+        )
 
 
 def _compute_stats(

@@ -229,11 +229,11 @@ class Qwen2DecoderLayer(nnx.Module):
         layer_callback_flag = []
         if residual is None:
             residual = hidden_states
-            hidden_states, _ = self.input_layernorm(hidden_states)
+            hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states += residual
             residual = hidden_states
-            hidden_states, _ = self.input_layernorm(hidden_states)
+            hidden_states = self.input_layernorm(hidden_states)
 
         layer_norm_callback_flag = precision_tracer.jit_pure_callback_record(
             hidden_states, "input_layernorm_output", "INPUT_LAYERNORM", self.layer_id
@@ -252,7 +252,7 @@ class Qwen2DecoderLayer(nnx.Module):
 
         hidden_states += residual
         residual = hidden_states
-        hidden_states, _ = self.post_attention_layernorm(hidden_states)
+        hidden_states= self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
 
         mlp_callback_flag = precision_tracer.jit_pure_callback_record(
