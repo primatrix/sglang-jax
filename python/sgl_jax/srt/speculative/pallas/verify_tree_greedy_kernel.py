@@ -249,9 +249,7 @@ def verify_tree_greedy(
     return accept_index, accept_token_num, predicts
 
 
-functools.partial(jax.jit, donate_argnames=("predicts", "accept_index", "accept_token_num"))
-
-
+@functools.partial(jax.jit, donate_argnames=("predicts", "accept_index", "accept_token_num"))
 def verify_tree_greedy_pallas_call(
     predicts: jax.Array,  # shape: (bs*num_draft_tokens,)
     accept_index: jax.Array,  # shape: (bs,num_spec_tokens)
