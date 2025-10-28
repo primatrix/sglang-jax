@@ -177,8 +177,19 @@ class GenerateReqInput:
         self._determine_batch_size()
         self._handle_parallel_sampling()
 
-        if self.is_single and self.parallel_sample_num == 1:
-            self._normalize_single_inputs()
+        if self.is_single:
+            if self.parallel_sample_num == 1:
+                self._normalize_single_inputs()
+            else:
+                if self.text is not None:
+                    if not isinstance(self.text, list):
+                        self.text = [self.text]
+                elif self.input_ids is not None:
+                    if not isinstance(self.input_ids[0], list):
+                        self.input_ids = [self.input_ids]
+                elif self.input_embeds is not None:
+                    if not isinstance(self.input_embeds, list):
+                        self.input_embeds = [self.input_embeds]
         else:
             self._normalize_batch_inputs()
 
