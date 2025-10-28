@@ -41,10 +41,10 @@ class RMSNorm(nnx.Module):
         axis_name: str | None = None,
         axis_index_groups: Any = None,
         use_fast_variance: bool = True,
-        layer_idx: int = -1,
+        layer_id: int = -1,
         rngs: rnglib.Rngs,
     ):
-        self.layer_idx = layer_idx
+        self.layer_idx = layer_id
         feature_shape = (num_features,)
 
         self.scale: nnx.Param[jax.Array] | None
