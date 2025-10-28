@@ -627,4 +627,4 @@ class BailingMoeV2ForCausalLM(BailingMoEForCausalLM):
     pass
 
 
-EntryClass = [BailingMoEForCausalLM, BailingMoeForCausalLM, BailingMoeV2ForCausalLM]
+# EntryClass = [BailingMoEForCausalLM, BailingMoeForCausalLM, BailingMoeV2ForCausalLM]

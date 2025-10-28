@@ -547,4 +547,4 @@ class Qwen3MoeForCausalLM(nnx.Module):
         return output, layers_kv_fused, True
 
 
-EntryClass = Qwen3MoeForCausalLM
+# EntryClass = Qwen3MoeForCausalLM

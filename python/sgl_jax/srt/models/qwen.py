@@ -426,4 +426,4 @@ class QWenLMHeadModel(nnx.Module):
         return output, layers_kv_fused, True
 
 
-EntryClass = QWenLMHeadModel
+# EntryClass = QWenLMHeadModel

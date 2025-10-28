@@ -531,4 +531,4 @@ class Qwen3ForCausalLM(nnx.Module):
         return output, layers_kv_fused, layers_callback_flag
 
 
-EntryClass = Qwen3ForCausalLM
+# EntryClass = Qwen3ForCausalLM
