@@ -76,15 +76,7 @@ class RMSNorm(nnx.Module):
             use_fast_variance=self.use_fast_variance,
             mask=mask,
         )
-        result = []
-        layer_norm_callback_flag = precision_tracer.jit_pure_callback_record(
-            mean, "input_layernorm_mean", "RMS_NORM", self.layer_idx
-        )
-        result.append(layer_norm_callback_flag)
-        layer_norm_callback_flag = precision_tracer.jit_pure_callback_record(
-            var, "input_layernorm_var", "RMS_NORM", self.layer_idx
-        )
-        result.append(layer_norm_callback_flag)
+        self.mean, self.var = mean, var
         return _normalize(
             x,
             mean,
