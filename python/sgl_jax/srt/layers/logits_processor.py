@@ -92,19 +92,12 @@ class LogitsProcessorOutput:
         # note: here only need to truncate next_token_logits and hidden_states
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
             # For ForwardMode.TARGET_VERIFY mode, we should take draft_token_num token for tree verify later
-            self.next_token_logits = jax.lax.dynamic_slice_in_dim(
-                self.next_token_logits,
-                0,
-                batch.real_bs * batch.spec_info.draft_token_num,
-                axis=0,
-            )
+            self.next_token_logits = self.next_token_logits[
+                0 : batch.real_bs * batch.spec_info.draft_token_num + 1
+            ]
         else:
-            self.next_token_logits = jax.lax.dynamic_slice_in_dim(
-                self.next_token_logits, 0, batch.real_bs, axis=0
-            )
-            self.hidden_states = jax.lax.dynamic_slice_in_dim(
-                self.hidden_states, 0, batch.real_bs, axis=0
-            )
+            self.next_token_logits = self.next_token_logits[0 : batch.real_bs + 1]
+            self.hidden_states = self.hidden_states[0 : batch.real_bs + 1]
         # assert not batch.capture_hidden_mode.need_capture()
 
 
