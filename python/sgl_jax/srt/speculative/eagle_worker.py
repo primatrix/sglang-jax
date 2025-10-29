@@ -102,24 +102,12 @@ class EAGLEWorker(ModelWorker):
 
     def forward_batch_speculative_generation(
         self,
-        batch: ScheduleBatch,
+        model_worker_batch: ModelWorkerBatch,
     ):
         # prefill : Target Extend -> Decode Extend for Update Draft State
         # Decode : Draft → Verify → Update Draft State → Draft → Verify → ...
 
-        if batch.forward_mode.is_extend():
-            (
-                precompile_token_paddings,
-                precompile_bs_paddings,
-                precompile_cache_loc_paddings,
-            ) = self.target_worker.get_precompile_paddings()
-
-            model_worker_batch = batch.get_model_worker_batch(
-                precompile_token_paddings,
-                precompile_bs_paddings,
-                precompile_cache_loc_paddings,
-                self.page_size,
-            )
+        if model_worker_batch.forward_mode.is_extend():
 
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
                 model_worker_batch,
@@ -133,7 +121,7 @@ class EAGLEWorker(ModelWorker):
 
             # draft extend for Update Draft State
             self.forward_draft_extend(
-                batch, model_worker_batch, logits_output.hidden_states, next_token_ids
+                model_worker_batch, logits_output.hidden_states, next_token_ids
             )
             return (
                 model_worker_batch,
@@ -143,7 +131,7 @@ class EAGLEWorker(ModelWorker):
                 0,
             )
         else:
-
+            batch = None
             # draft
             spec_info = self.draft(batch)
             # verify
@@ -181,7 +169,6 @@ class EAGLEWorker(ModelWorker):
 
     def forward_draft_extend(
         self,
-        batch: ScheduleBatch,
         model_worker_batch: ModelWorkerBatch,
         hidden_states: jax.Array,
         next_token_ids: jax.Array,
@@ -212,18 +199,18 @@ class EAGLEWorker(ModelWorker):
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         # assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
-        has_finished, unfinished_req_index = False, []
-        for i, req in enumerate(batch.reqs):
-            if req.finished():
-                has_finished = True
-            else:
-                unfinished_req_index.append(i)
-        if has_finished:
-            unfinished_index_device = jnp.array(
-                unfinished_req_index,
-                dtype=jnp.int64,
-            )
-            batch.spec_info.filter_batch(unfinished_index_device, has_been_filtered=False)
+        # has_finished, unfinished_req_index = False, []
+        # for i, req in enumerate(batch.reqs):
+        #     if req.finished():
+        #         has_finished = True
+        #     else:
+        #         unfinished_req_index.append(i)
+        # if has_finished:
+        #     unfinished_index_device = jnp.array(
+        #         unfinished_req_index,
+        #         dtype=jnp.int64,
+        #     )
+        #     batch.spec_info.filter_batch(unfinished_index_device, has_been_filtered=False)
 
     @property
     def draft_model_runner(self):

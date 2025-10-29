@@ -920,13 +920,26 @@ class Scheduler(
                     : model_worker_batch.real_bs
                 ]
         else:
+
+            (
+                precompile_token_paddings,
+                precompile_bs_paddings,
+                precompile_cache_loc_paddings,
+            ) = self.draft_worker.get_precompile_paddings()
+            model_worker_batch = batch.get_model_worker_batch(
+                precompile_token_paddings,
+                precompile_bs_paddings,
+                precompile_cache_loc_paddings,
+                self.page_size,
+            )
+
             (
                 model_worker_batch,
                 logits_output,
                 next_token_ids,
                 accept_length,
                 cache_miss_count,
-            ) = self.draft_worker.forward_batch_speculative_generation(batch)
+            ) = self.draft_worker.forward_batch_speculative_generation(model_worker_batch)
         bid = model_worker_batch.bid
         batch.output_ids = next_token_ids
 
