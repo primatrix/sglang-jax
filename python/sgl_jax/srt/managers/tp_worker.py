@@ -489,13 +489,15 @@ class ModelWorker:
                 # wait for sampling info to be done
                 if model_worker_batch.sampling_info.sampling_info_done:
                     model_worker_batch.sampling_info.sampling_info_done.wait()
-                next_token_ids_device = self.model_runner.sample(
+                next_token_ids_device,new_logits_output = self.model_runner.sample(
                     logits_output,
                     sampling_metadata,
                     positions_device,
                 )
                 sample_cache_miss_count = count()
-
+        print(f'logits_output. {logits_output}, {new_logits_output}')
+        if new_logits_output is not None:
+            logits_output = new_logits_output
         return (
             logits_output,
             next_token_ids_device,

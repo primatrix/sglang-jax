@@ -37,23 +37,23 @@ class Sampler(nnx.Module):
         temperatures_shape = sampling_metadata.temperatures.shape
 
         # Temperatures should be (batch_size, 1) for proper broadcasting
-        assert (
-            temperatures_shape[0] == logits_batch_size
-        ), f"Temperature batch size {temperatures_shape[0]} doesn't match logits batch size {logits_batch_size}"
+        #assert (
+        #    temperatures_shape[0] == logits_batch_size
+        #), f"Temperature batch size {temperatures_shape[0]} doesn't match logits batch size {logits_batch_size}"
 
         # Post process logits
-        processed_logits = jnp.divide(logits, sampling_metadata.temperatures).astype(logits.dtype)
+        processed_logits = jnp.divide(logits, sampling_metadata.temperatures[:logits_batch_size]).astype(logits.dtype)
 
         probs = jax.nn.softmax(processed_logits, axis=-1)
 
         args = (
             logits,
             probs,
-            sampling_metadata.top_ks,
-            sampling_metadata.top_ps,
-            sampling_metadata.min_ps,
+            sampling_metadata.top_ks[:logits_batch_size],
+            sampling_metadata.top_ps[:logits_batch_size],
+            sampling_metadata.min_ps[:logits_batch_size],
             positions,
-            sampling_metadata.temperatures,
+            sampling_metadata.temperatures[:logits_batch_size],
             sampling_metadata.sampling_seeds,
             sampling_metadata.need_min_p_sampling,
             rng,
@@ -68,7 +68,9 @@ class Sampler(nnx.Module):
         logits_output, sampling_metadata, batch_next_token_ids, logprobs = operands
 
         # Set next_token_logprobs
-        logits_output.next_token_logprobs = logprobs[
+        (next_token_logprobs, next_token_top_logprobs_val, next_token_top_logprobs_idx, next_token_token_ids_logprobs_val,
+         next_token_token_ids_logprobs_idx) = None, None, None, None, None
+        next_token_logprobs = logprobs[
             np.arange(len(batch_next_token_ids)),
             batch_next_token_ids,
         ]
@@ -78,8 +80,8 @@ class Sampler(nnx.Module):
             x > 0 for x in sampling_metadata.top_logprobs_nums
         ):
             (
-                logits_output.next_token_top_logprobs_val,
-                logits_output.next_token_top_logprobs_idx,
+                next_token_top_logprobs_val,
+                next_token_top_logprobs_idx,
             ) = get_top_logprobs(logprobs, sampling_metadata.top_logprobs_nums)
 
         # Set token_ids_logprobs if needed
@@ -87,11 +89,16 @@ class Sampler(nnx.Module):
             x is not None for x in sampling_metadata.token_ids_logprobs
         ):
             (
-                logits_output.next_token_token_ids_logprobs_val,
-                logits_output.next_token_token_ids_logprobs_idx,
+                next_token_token_ids_logprobs_val,
+                next_token_token_ids_logprobs_idx,
             ) = get_token_ids_logprobs(logprobs, sampling_metadata.token_ids_logprobs)
 
-        return None
+        return LogitsProcessorOutput(next_token_logits=logits_output.next_token_logits,
+               next_token_logprobs=next_token_logprobs,
+                next_token_top_logprobs_val=next_token_top_logprobs_val,
+                next_token_top_logprobs_idx=next_token_top_logprobs_idx,
+                next_token_token_ids_logprobs_val=next_token_token_ids_logprobs_val,
+                next_token_token_ids_logprobs_idx=next_token_token_ids_logprobs_idx)
 
     def _apply_linear_penalty(self, operands):
         """Apply linear penalty branch (overlap mode)"""
@@ -173,7 +180,9 @@ class Sampler(nnx.Module):
             sampling_metadata: Metadata for sampling
             positions: The positions of the tokens in the sequence.
         """
+
         # Apply penalties before sampling
+        print(f'sampling_metadata {sampling_metadata}')
         logits = self.apply_penalties(logits_output.next_token_logits, sampling_metadata)
 
         _, rng = jax.random.split(self.rngs.params())
@@ -192,14 +201,11 @@ class Sampler(nnx.Module):
             batch_next_token_ids,
             logprobs,
         )
-        lax.cond(
-            sampling_metadata.return_logprob,
-            self._process_logprob_results,
-            lambda operands: None,
-            logprob_operands,
-        )
+        new_logits_output = None
+        if sampling_metadata.return_logprob:
+            new_logits_output = self._process_logprob_results(logprob_operands)
 
-        return batch_next_token_ids
+        return batch_next_token_ids, new_logits_output
 
 
 def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: list[int]):

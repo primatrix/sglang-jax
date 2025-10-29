@@ -1188,6 +1188,9 @@ class ScheduleBatch:
                     [0] * bs_padding_size, dtype=extend_seq_lens.dtype
                 )
                 extend_seq_lens = np.concat([extend_seq_lens, invalid_extend_seq_lens], axis=0)
+
+                # invalid_extend_logprob_start_lens = np.array([0] * bs_padding_size, dtype=extend_logprob_start_lens.dtype)
+
             else:
                 invalid_extend_start_loc = np.array(
                     [len(seq_lens_cpu)] * bs_padding_size, dtype=extend_start_loc.dtype

@@ -381,8 +381,9 @@ class LogitsProcessor(nnx.Module):
     def get_top_logprobs(all_logprobs: jax.Array, logits_metadata: LogitsMetadata):
         max_k = max(logits_metadata.top_logprobs_nums)
         values, indices = jax.lax.top_k(all_logprobs, max_k)
-        values = values.tolist()
-        indices = indices.tolist()
+        # method was called on traced array
+        # values = values.tolist()
+        # indices = indices.tolist()
 
         input_top_logprobs_val, input_top_logprobs_idx = [], []
 
