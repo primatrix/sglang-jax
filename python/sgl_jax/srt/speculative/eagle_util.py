@@ -14,6 +14,7 @@ from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers.schedule_batch import (
+    ModelWorkerBatch,
     ScheduleBatch,
     get_last_loc,
     global_server_args_dict,
@@ -353,21 +354,20 @@ class EagleDraftInput:
 
         return obj
 
-    def prepare_for_extend(self, batch: ScheduleBatch):
+    def prepare_for_extend(self, model_worker_batch: ModelWorkerBatch):
 
-        if batch.forward_mode.is_idle():
+        if model_worker_batch.forward_mode.is_idle():
             return
 
         # Prefill only generate 1 token.
-        assert len(self.verified_id) == len(batch.seq_lens)
+        assert self.verified_id.shape[0] == model_worker_batch.seq_lens.shape[0]
 
         pt = 0
-        for i, extend_len in enumerate(batch.extend_lens):
-            input_ids = batch.input_ids[pt : pt + extend_len]
+        for i, extend_len in enumerate(model_worker_batch.extend_seq_lens):
+            input_ids = model_worker_batch.input_ids[pt : pt + extend_len]
             # TODO: batch.input_ids should on tpu
-            batch.input_ids[pt : pt + extend_len] = jnp.concatenate(
-                (input_ids[1:], self.verified_id[i].reshape(1))
-            )
+            model_worker_batch.input_ids[pt : pt + extend_len - 1] = input_ids[1:]
+            model_worker_batch.input_ids[pt + extend_len - 1] = self.verified_id[i]
             pt += extend_len
 
     @classmethod

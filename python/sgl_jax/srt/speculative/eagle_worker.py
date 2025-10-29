@@ -185,27 +185,15 @@ class EAGLEWorker(ModelWorker):
         hidden_states: jax.Array,
         next_token_ids: jax.Array,
     ):
-        batch.spec_info = EagleDraftInput(
+        model_worker_batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=next_token_ids[: model_worker_batch.real_bs],
-            num_tokens_per_batch=jnp.asarray(1, dtype=jnp.int32),
-            num_tokens_for_logprob_per_batch=jnp.asarray(1, dtype=jnp.int32),
+            num_tokens_per_batch=np.asarray(1, dtype=jnp.int32),
+            num_tokens_for_logprob_per_batch=np.asarray(1, dtype=jnp.int32),
         )
-        batch.return_hidden_states = False
-        batch.spec_info.prepare_for_extend(batch)
-        batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-        #  this place we shift the input_ids, so we need re-get the model_worker_batch
-        (
-            precompile_token_paddings,
-            precompile_bs_paddings,
-            precompile_cache_loc_paddings,
-        ) = self.target_worker.get_precompile_paddings()
-        model_worker_batch = batch.get_model_worker_batch(
-            precompile_token_paddings,
-            precompile_bs_paddings,
-            precompile_cache_loc_paddings,
-            self.page_size,
-        )
+        model_worker_batch.return_hidden_states = False
+        model_worker_batch.spec_info.prepare_for_extend(batch)
+        model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
         forward_batch.return_logprob = False
 
