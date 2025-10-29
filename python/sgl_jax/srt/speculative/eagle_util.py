@@ -360,10 +360,13 @@ class EagleDraftInput:
             return
 
         # Prefill only generate 1 token.
-        assert self.verified_id.shape[0] == model_worker_batch.seq_lens.shape[0]
+        assert (
+            self.verified_id.shape[0] == model_worker_batch.real_bs
+        ), f"{self.verified_id.shape=} {model_worker_batch.real_bs=}"
 
         pt = 0
-        for i, extend_len in enumerate(model_worker_batch.extend_seq_lens):
+        for i in range(model_worker_batch.real_bs):
+            extend_len = model_worker_batch.seq_lens[i]
             input_ids = model_worker_batch.input_ids[pt : pt + extend_len]
             # TODO: batch.input_ids should on tpu
             model_worker_batch.input_ids[pt : pt + extend_len - 1] = input_ids[1:]

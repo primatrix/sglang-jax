@@ -1,5 +1,5 @@
+import functools
 import logging
-from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -193,7 +193,7 @@ class EAGLEWorker(ModelWorker):
             num_tokens_for_logprob_per_batch=np.asarray(1, dtype=jnp.int32),
         )
         model_worker_batch.return_hidden_states = False
-        model_worker_batch.spec_info.prepare_for_extend(batch)
+        model_worker_batch.spec_info.prepare_for_extend(model_worker_batch=model_worker_batch)
         model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
         forward_batch.return_logprob = False
@@ -210,7 +210,7 @@ class EAGLEWorker(ModelWorker):
         )
         logits_output.truncate_logits_processor_output(model_worker_batch)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
-        assert forward_batch.spec_info is batch.spec_info
+        # assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
         has_finished, unfinished_req_index = False, []
         for i, req in enumerate(batch.reqs):
@@ -232,9 +232,7 @@ class EAGLEWorker(ModelWorker):
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
-        topk_p, topk_index = _capture_for_decode_jitted(
-            logits_output.next_token_logits, topk=self.topk
-        )
+        topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
         draft_input.topk_p = topk_p
         draft_input.topk_index = topk_index
         draft_input.hidden_states = logits_output.hidden_states
@@ -733,6 +731,7 @@ class EAGLEWorker(ModelWorker):
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
 
+@functools.partial(jax.jit, static_argnames=["topk"])
 def topk_probs_from_logits(
     logits: jax.Array, topk: int, axis: int = -1
 ) -> tuple[jax.Array, jax.Array]:
@@ -747,13 +746,6 @@ def topk_probs_from_logits(
         topk_index = jnp.moveaxis(topk_index, -1, axis)
 
     return topk_probs, topk_index
-
-
-@partial(jax.jit, static_argnames=("topk",))
-def _capture_for_decode_jitted(
-    next_token_logits: jax.Array, topk: int
-) -> tuple[jax.Array, jax.Array]:
-    return topk_probs_from_logits(next_token_logits, topk)
 
 
 def fast_topk(values, topk, axis=-1):

@@ -1252,7 +1252,6 @@ class ScheduleBatch:
 
         if precision_tracer.get_trace_active():
             self._generate_trace_info(real_bs, bid)
-
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
