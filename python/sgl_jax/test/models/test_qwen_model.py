@@ -21,7 +21,7 @@ class TestQwenModel(unittest.TestCase):
     """Test cases for the Qwen model."""
 
     def setUp(self):
-        self.mesh = create_device_mesh(ici_parallelism=[-1, 1, 1], dcn_parallelism=[1, 1, 1])
+        self.mesh = create_device_mesh(ici_parallelism=[-1, 1], dcn_parallelism=[1, 1])
         # Model path for local model and tokenizer
         self.test_model_path = os.environ.get(
             "MODEL_PATH", "Qwen/Qwen-7B"
@@ -369,7 +369,7 @@ class TestQwenModel(unittest.TestCase):
         jax_profiling_dir = os.environ.get("JAX_TRACE_PROFILING_DIR", "/tmp/jax_profiling")
         batch_size = int(os.environ.get("BATCH_SIZE", 10))
         with self.mesh, jax_trace_context(jax_profiling_dir):
-            sampler = Sampler(rngs=nnx.Rngs(0))
+            sampler = Sampler(rngs=nnx.Rngs(0), mesh=self.mesh)
             tokenizer = self._get_tokenizer()
 
             # Generate input texts based on batch_size
