@@ -120,7 +120,7 @@ class EAGLEWorker(ModelWorker):
             )
 
             # draft extend for Update Draft State
-            self.forward_draft_extend(
+            self.draft_extend_for_prefill(
                 model_worker_batch, logits_output.hidden_states, next_token_ids
             )
             return (
@@ -167,7 +167,7 @@ class EAGLEWorker(ModelWorker):
             model_worker_batch.seq_lens,
         )
 
-    def forward_draft_extend(
+    def draft_extend_for_prefill(
         self,
         model_worker_batch: ModelWorkerBatch,
         hidden_states: jax.Array,
