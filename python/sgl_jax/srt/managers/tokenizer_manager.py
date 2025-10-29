@@ -968,8 +968,10 @@ class TokenizerManager:
         if recv_obj.input_token_logprobs_val is None:
             return
         if len(recv_obj.input_token_logprobs_val) > 0:
-            state.input_token_logprobs_val.extend(recv_obj.input_token_logprobs_val[recv_obj_index])
-            state.input_token_logprobs_idx.extend(recv_obj.input_token_logprobs_idx[recv_obj_index])
+            ## input_tokens_logprobs_val is [None]
+            pass
+            #state.input_token_logprobs_val.extend(recv_obj.input_token_logprobs_val[recv_obj_index])
+            #state.input_token_logprobs_idx.extend(recv_obj.input_token_logprobs_idx[recv_obj_index])
         state.output_token_logprobs_val.extend(recv_obj.output_token_logprobs_val[recv_obj_index])
         state.output_token_logprobs_idx.extend(recv_obj.output_token_logprobs_idx[recv_obj_index])
         meta_info["input_token_logprobs"] = self.detokenize_logprob_tokens(
