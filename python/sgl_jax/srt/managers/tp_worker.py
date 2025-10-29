@@ -498,6 +498,8 @@ class ModelWorker:
         print(f'logits_output. {logits_output}, {new_logits_output}')
         if new_logits_output is not None:
             logits_output = new_logits_output
+            logits_output.next_token_top_logprobs_val = logits_output.next_token_top_logprobs_val.tolist()
+            logits_output.next_token_top_logprobs_idx = logits_output.next_token_top_logprobs_idx.tolist()
         return (
             logits_output,
             next_token_ids_device,

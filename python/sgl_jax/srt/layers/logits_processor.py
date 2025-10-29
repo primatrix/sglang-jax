@@ -51,11 +51,11 @@ class LogitsProcessorOutput:
             self.hidden_states,
             self.next_token_logprobs,
             self.input_token_logprobs,
+            self.next_token_top_logprobs_val,
+            self.next_token_top_logprobs_idx,
         )
 
         aux_data = {
-            "next_token_top_logprobs_val": self.next_token_top_logprobs_val,
-            "next_token_top_logprobs_idx": self.next_token_top_logprobs_idx,
             "next_token_token_ids_logprobs_val": self.next_token_token_ids_logprobs_val,
             "next_token_token_ids_logprobs_idx": self.next_token_token_ids_logprobs_idx,
             "input_top_logprobs_val": self.input_top_logprobs_val,
@@ -73,9 +73,9 @@ class LogitsProcessorOutput:
         obj.hidden_states = children[1]
         obj.next_token_logprobs = children[2]
         obj.input_token_logprobs = children[3]
+        obj.next_token_top_logprobs_val = children[4]
+        obj.next_token_top_logprobs_idx = children[5]
 
-        obj.next_token_top_logprobs_val = aux_data["next_token_top_logprobs_val"]
-        obj.next_token_top_logprobs_idx = aux_data["next_token_top_logprobs_idx"]
         obj.next_token_token_ids_logprobs_val = aux_data["next_token_token_ids_logprobs_val"]
         obj.next_token_token_ids_logprobs_idx = aux_data["next_token_token_ids_logprobs_idx"]
         obj.input_top_logprobs_val = aux_data["input_top_logprobs_val"]

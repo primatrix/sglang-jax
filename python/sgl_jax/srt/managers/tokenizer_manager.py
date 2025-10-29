@@ -987,8 +987,9 @@ class TokenizerManager:
 
         if top_logprobs_num > 0:
             if len(recv_obj.input_top_logprobs_val) > 0:
-                state.input_top_logprobs_val.extend(recv_obj.input_top_logprobs_val[recv_obj_index])
-                state.input_top_logprobs_idx.extend(recv_obj.input_top_logprobs_idx[recv_obj_index])
+                pass
+                #state.input_top_logprobs_val.extend(recv_obj.input_top_logprobs_val[recv_obj_index])
+                #state.input_top_logprobs_idx.extend(recv_obj.input_top_logprobs_idx[recv_obj_index])
             state.output_top_logprobs_val.extend(recv_obj.output_top_logprobs_val[recv_obj_index])
             state.output_top_logprobs_idx.extend(recv_obj.output_top_logprobs_idx[recv_obj_index])
             meta_info["input_top_logprobs"] = self.detokenize_top_logprobs_tokens(
