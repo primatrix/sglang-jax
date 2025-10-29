@@ -1,4 +1,5 @@
 import logging
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -231,7 +232,9 @@ class EAGLEWorker(ModelWorker):
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
-        topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
+        topk_p, topk_index = _capture_for_decode_jitted(
+            logits_output.next_token_logits, topk=self.topk
+        )
         draft_input.topk_p = topk_p
         draft_input.topk_index = topk_index
         draft_input.hidden_states = logits_output.hidden_states
@@ -744,6 +747,13 @@ def topk_probs_from_logits(
         topk_index = jnp.moveaxis(topk_index, -1, axis)
 
     return topk_probs, topk_index
+
+
+@partial(jax.jit, static_argnames=("topk",))
+def _capture_for_decode_jitted(
+    next_token_logits: jax.Array, topk: int
+) -> tuple[jax.Array, jax.Array]:
+    return topk_probs_from_logits(next_token_logits, topk)
 
 
 def fast_topk(values, topk, axis=-1):
