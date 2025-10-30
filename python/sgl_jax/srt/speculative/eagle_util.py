@@ -19,7 +19,12 @@ from sgl_jax.srt.managers.schedule_batch import (
     get_last_loc,
     global_server_args_dict,
 )
+from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sgl_jax.srt.mem_cache.common import (
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
+)
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sgl_jax.srt.speculative.pallas.kernel import (
     align_evict_mask_to_page_size,
@@ -551,40 +556,46 @@ class EagleVerifyInput:
 
         return obj
 
-    def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
-        if batch.forward_mode.is_idle():
+    def prepare_for_verify(
+        self, model_worker_batch: ModelWorkerBatch, page_size: int, target_worker: ModelWorker
+    ):
+        if model_worker_batch.forward_mode.is_idle():
             return
 
         # TODO: keep draft_token on TPU
-        batch.input_ids = self.draft_token
+        # bs = len(model_worker_batch.req_pool_indices)
+        model_worker_batch.input_ids = self.draft_token
 
         # bs = batch.batch_size()
-        prefix_lens = batch.seq_lens
-        seq_lens_with_draft_token = batch.seq_lens + self.draft_token_num
+        prefix_lens = model_worker_batch.seq_lens
+        seq_lens_with_draft_token = model_worker_batch.seq_lens + self.draft_token_num
         # extend_lens = jnp.array([self.draft_token_num] * bs)
 
         if page_size == 1:
-            batch.out_cache_loc = batch.alloc_token_slots(len(batch.input_ids))
+            model_worker_batch.out_cache_loc = alloc_token_slots(
+                model_worker_batch.tree_cache, len(model_worker_batch.input_ids)
+            )
         else:
             last_loc = get_last_loc(
-                batch.req_to_token_pool.req_to_token,
-                batch.req_pool_indices,
+                target_worker.req_to_token_pool.req_to_token,
+                model_worker_batch.req_pool_indices,
                 prefix_lens,
             )
-            batch.out_cache_loc = batch.alloc_paged_token_slots_extend(
+            model_worker_batch.out_cache_loc = alloc_paged_token_slots_extend(
+                model_worker_batch.tree_cache,
                 prefix_lens.tolist(),
                 seq_lens_with_draft_token.tolist(),
                 last_loc.tolist(),
-                len(batch.input_ids),
+                len(model_worker_batch.input_ids),
             )
             self.last_loc = last_loc
 
         assign_req_to_token_pool(
-            batch.req_pool_indices,
-            batch.req_to_token_pool,
-            batch.seq_lens,
+            model_worker_batch.req_pool_indices,
+            model_worker_batch.req_to_token_pool,
+            model_worker_batch.seq_lens,
             seq_lens_with_draft_token,
-            batch.out_cache_loc,
+            model_worker_batch.out_cache_loc,
         )
 
     def verify(

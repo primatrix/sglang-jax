@@ -279,25 +279,15 @@ class EAGLEWorker(ModelWorker):
             seq_lens_cpu=model_worker_batch.seq_lens,
         )
 
-    def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
-        spec_info.prepare_for_verify(batch, self.page_size)
-        batch.return_hidden_states = False
-        batch.forward_mode = (
-            ForwardMode.TARGET_VERIFY if not batch.forward_mode.is_idle() else ForwardMode.IDLE
+    def verify(self, model_worker_batch: ModelWorkerBatch, spec_info: EagleVerifyInput):
+        spec_info.prepare_for_verify(model_worker_batch, self.page_size, self.target_worker)
+        model_worker_batch.return_hidden_states = False
+        model_worker_batch.forward_mode = (
+            ForwardMode.TARGET_VERIFY
+            if not model_worker_batch.forward_mode.is_idle()
+            else ForwardMode.IDLE
         )
-        batch.spec_info = spec_info
-
-        (
-            precompile_token_paddings,
-            precompile_bs_paddings,
-            precompile_cache_loc_paddings,
-        ) = self.target_worker.get_precompile_paddings()
-        model_worker_batch = batch.get_model_worker_batch(
-            precompile_token_paddings,
-            precompile_bs_paddings,
-            precompile_cache_loc_paddings,
-            self.page_size,
-        )
+        model_worker_batch.spec_info = spec_info
 
         assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
 
@@ -319,7 +309,7 @@ class EAGLEWorker(ModelWorker):
 
         spec_info.hidden_states = logits_output.hidden_states
         res: EagleVerifyOutput = spec_info.verify(
-            batch,
+            model_worker_batch,
             logits_output,
             self.token_to_kv_pool_allocator,
             self.page_size,
@@ -336,14 +326,16 @@ class EAGLEWorker(ModelWorker):
             # TODO: support Qwen3-Next
             raise ValueError("hybrid gdn is not support yet")
 
-        if batch.return_logprob:
-            self.add_logprob_values(batch, res, logits_output)
+        if model_worker_batch.return_logprob:
+            self.add_logprob_values(model_worker_batch, res, logits_output)
 
         # Prepare the batch for the next draft forwards.
-        batch.forward_mode = (
-            ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
+        model_worker_batch.forward_mode = (
+            ForwardMode.DECODE
+            if not model_worker_batch.forward_mode.is_idle()
+            else ForwardMode.IDLE
         )
-        batch.spec_info = res.draft_input
+        model_worker_batch.spec_info = res.draft_input
 
         return logits_output, res, model_worker_batch, cache_miss_count
 
