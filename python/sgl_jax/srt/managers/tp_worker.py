@@ -507,6 +507,9 @@ class ModelWorker:
             if logits_output.input_token_ids_logprobs_val is not None:
                 logits_output.input_token_ids_logprobs_val = logits_output.input_token_ids_logprobs_val.tolist()
                 logits_output.input_token_ids_logprobs_idx = logits_output.input_token_ids_logprobs_idx.tolist()
+            if logits_output.input_top_logprobs_val is not None:
+                logits_output.input_top_logprobs_val = logits_output.input_top_logprobs_val.tolist()
+                logits_output.input_top_logprobs_idx = logits_output.input_top_logprobs_idx.tolist()
 
         return (
             logits_output,
