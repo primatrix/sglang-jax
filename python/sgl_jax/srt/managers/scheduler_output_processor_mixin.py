@@ -66,18 +66,6 @@ class SchedulerOutputProcessorMixin:
                     logits_output.input_token_logprobs = tuple(
                         jax.device_get(logits_output.input_token_logprobs).astype(float)
                     )
-                if logits_output.next_token_top_logprobs_val is not None:
-                    logits_output.next_token_top_logprobs_val = jax.device_get(logits_output.next_token_top_logprobs_val).astype(float)
-                    logits_output.next_token_top_logprobs_idx = jax.device_get(logits_output.next_token_top_logprobs_idx).astype(int)
-                if logits_output.next_token_token_ids_logprobs_val is not None:
-                    logits_output.next_token_token_ids_logprobs_val = jax.device_get(logits_output.next_token_token_ids_logprobs_val).astype(float)
-                    logits_output.next_token_token_ids_logprobs_idx = jax.device_get(logits_output.next_token_token_ids_logprobs_idx).astype(int)
-                if logits_output.input_token_ids_logprobs_val is not None:
-                    logits_output.input_token_ids_logprobs_val = jax.device_get(logits_output.input_token_ids_logprobs_val).astype(float)
-                    logits_output.input_token_ids_logprobs_idx = jax.device_get(logits_output.input_token_ids_logprobs_idx).astype(int)
-                if logits_output.input_top_logprobs_val is not None:
-                    logits_output.input_top_logprobs_val = jax.device_get(logits_output.input_top_logprobs_val).astype(float)
-                    logits_output.input_top_logprobs_idx = jax.device_get(logits_output.input_top_logprobs_idx).astype(int)
         # Check finish conditions
         logprob_pt = 0
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
