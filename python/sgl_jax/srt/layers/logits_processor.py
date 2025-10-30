@@ -23,13 +23,13 @@ class LogitsProcessorOutput:
     next_token_logits: jax.Array
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
-    hidden_states: jax.Array = None
+    hidden_states: jax.Array | None = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # The logprobs of the next tokens.                              shape: [#seq]
-    next_token_logprobs: jax.Array = None
+    next_token_logprobs: jax.Array | None = None
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
-    next_token_top_logprobs_val: jax.Array = None
+    next_token_top_logprobs_val: list | None = None
     next_token_top_logprobs_idx: jax.Array = None
     # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
     next_token_token_ids_logprobs_val: jax.Array = None
@@ -37,7 +37,7 @@ class LogitsProcessorOutput:
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logprobs of input tokens.        shape: [#token]
-    input_token_logprobs: jax.Array = None
+    input_token_logprobs: jax.Array | None = None
     # The logprobs and ids of the top-k tokens in input positions.  shape: [#seq, #token, k]
     input_top_logprobs_val: jax.Array = None
     input_top_logprobs_idx: jax.Array = None
@@ -50,18 +50,19 @@ class LogitsProcessorOutput:
             self.next_token_logits,
             self.hidden_states,
             self.next_token_logprobs,
-            self.input_token_logprobs,
-            self.next_token_top_logprobs_val,
-            self.next_token_top_logprobs_idx,
-            self.next_token_token_ids_logprobs_val,
-            self.next_token_token_ids_logprobs_idx,
-            self.input_top_logprobs_val,
-            self.input_top_logprobs_idx,
-            self.input_token_ids_logprobs_val,
-            self.input_token_ids_logprobs_idx,
+            self.input_token_logprobs
         )
 
-        aux_data = {}
+        aux_data = {
+            "next_token_top_logprobs_val" : self.next_token_top_logprobs_val,
+            "next_token_top_logprobs_idx": self.next_token_top_logprobs_idx,
+            "next_token_token_ids_logprobs_val": self.next_token_token_ids_logprobs_val,
+            "next_token_token_ids_logprobs_idx": self.next_token_token_ids_logprobs_idx,
+            "input_top_logprobs_val": self.input_top_logprobs_val,
+            "input_top_logprobs_idx": self.input_top_logprobs_idx,
+            "input_token_ids_logprobs_val": self.input_token_ids_logprobs_val,
+            "input_token_ids_logprobs_idx": self.input_token_ids_logprobs_idx,
+        }
         return (children, aux_data)
 
     @classmethod
@@ -72,14 +73,15 @@ class LogitsProcessorOutput:
         obj.hidden_states = children[1]
         obj.next_token_logprobs = children[2]
         obj.input_token_logprobs = children[3]
-        obj.next_token_top_logprobs_val = children[4]
-        obj.next_token_top_logprobs_idx = children[5]
-        obj.next_token_token_ids_logprobs_val = children[6]
-        obj.next_token_token_ids_logprobs_idx = children[7]
-        obj.input_top_logprobs_val = children[8]
-        obj.input_top_logprobs_idx = children[9]
-        obj.input_token_ids_logprobs_val = children[10]
-        obj.input_token_ids_logprobs_idx = children[11]
+
+        obj.next_token_top_logprobs_val = aux_data["next_token_top_logprobs_val"]
+        obj.next_token_top_logprobs_idx = aux_data["next_token_top_logprobs_idx"]
+        obj.next_token_token_ids_logprobs_val = aux_data["next_token_token_ids_logprobs_val"]
+        obj.next_token_token_ids_logprobs_idx = aux_data["next_token_token_ids_logprobs_idx"]
+        obj.input_top_logprobs_val = aux_data["input_top_logprobs_val"]
+        obj.input_top_logprobs_idx = aux_data["input_top_logprobs_idx"]
+        obj.input_token_ids_logprobs_val = aux_data["input_token_ids_logprobs_val"]
+        obj.input_token_ids_logprobs_idx = aux_data["input_token_ids_logprobs_idx"]
 
         return obj
 
