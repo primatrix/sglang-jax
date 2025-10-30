@@ -401,7 +401,7 @@ class LogitsProcessor(nnx.Module):
             input_top_logprobs_idx.append([indices[pt + j][:k] for j in range(pruned_len)])
             pt += pruned_len
 
-        return jnp.array(input_top_logprobs_val), jnp.array(input_top_logprobs_idx)
+        return input_top_logprobs_val, input_top_logprobs_idx
 
     @staticmethod
     def compute_temp_top_p_normalized_logprobs(

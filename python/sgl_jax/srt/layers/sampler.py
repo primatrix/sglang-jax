@@ -223,7 +223,7 @@ def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: list[int]):
     for i, k in enumerate(top_logprobs_nums):
         output_top_logprobs_val.append(values[i][:k])
         output_top_logprobs_idx.append(indices[i][:k])
-    return jnp.array(output_top_logprobs_val), jnp.array(output_top_logprobs_idx)
+    return output_top_logprobs_val, output_top_logprobs_idx
 
 
 def get_token_ids_logprobs(logprobs: jax.Array, token_ids_logprobs: list[list[int]]):
