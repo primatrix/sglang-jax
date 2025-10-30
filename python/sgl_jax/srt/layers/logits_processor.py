@@ -30,20 +30,20 @@ class LogitsProcessorOutput:
     next_token_logprobs: jax.Array | None = None
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
     next_token_top_logprobs_val: list | None = None
-    next_token_top_logprobs_idx: jax.Array = None
+    next_token_top_logprobs_idx: list = None
     # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
-    next_token_token_ids_logprobs_val: jax.Array = None
-    next_token_token_ids_logprobs_idx: jax.Array = None
+    next_token_token_ids_logprobs_val: list | None = None
+    next_token_token_ids_logprobs_idx: list | None = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logprobs of input tokens.        shape: [#token]
     input_token_logprobs: jax.Array | None = None
     # The logprobs and ids of the top-k tokens in input positions.  shape: [#seq, #token, k]
-    input_top_logprobs_val: jax.Array = None
-    input_top_logprobs_idx: jax.Array = None
+    input_top_logprobs_val: list | None = None
+    input_top_logprobs_idx: list | None = None
     # The logprobs and ids of the requested token ids in input positions. shape: [#seq, n] (n is the number of requested token ids)
-    input_token_ids_logprobs_val: jax.Array = None
-    input_token_ids_logprobs_idx: jax.Array = None
+    input_token_ids_logprobs_val: list | None = None
+    input_token_ids_logprobs_idx: list | None = None
 
     def tree_flatten(self):
         children = (
