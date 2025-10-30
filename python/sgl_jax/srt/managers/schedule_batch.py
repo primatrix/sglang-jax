@@ -1025,7 +1025,7 @@ class ScheduleBatch:
             extend_prefix_lens = np.array(self.prefix_lens, dtype=np.int32)
             bs_paddings = bs_paddings[-1:]
             cache_loc_paddings = cache_loc_paddings[-1:]
-            extend_logprob_start_lens = self.extend_logprob_start_lens
+            extend_logprob_start_lens = np.array(self.extend_logprob_start_lens, dtype=np.int32)
 
         global bid
         bid += 1
@@ -1189,7 +1189,8 @@ class ScheduleBatch:
                 )
                 extend_seq_lens = np.concat([extend_seq_lens, invalid_extend_seq_lens], axis=0)
 
-                # invalid_extend_logprob_start_lens = np.array([0] * bs_padding_size, dtype=extend_logprob_start_lens.dtype)
+                invalid_extend_logprob_start_lens = np.array([0] * bs_padding_size, dtype=extend_logprob_start_lens.dtype)
+                extend_logprob_start_lens = np.concat([extend_logprob_start_lens, invalid_extend_logprob_start_lens], axis=0)
 
             else:
                 invalid_extend_start_loc = np.array(
