@@ -54,6 +54,7 @@ from sgl_jax.srt.mem_cache.radix_cache import RadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
+from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import (
     configure_logger,
@@ -94,6 +95,9 @@ class GenerationBatchResult:
     extend_logprob_start_len_per_req: list[int]
     bid: int
     cache_miss_count: int
+
+    # relay path: forward stream -> next step forward
+    next_draft_input: EagleDraftInput | None = None
 
 
 class Scheduler(
@@ -698,6 +702,7 @@ class Scheduler(
 
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():
+
             if self.last_batch.chunked_req is not None:
                 chunked_req_to_exclude.add(self.last_batch.chunked_req)
 
@@ -728,7 +733,6 @@ class Scheduler(
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
                 ret = None
-
         return ret
 
     def get_new_batch_prefill(self) -> ScheduleBatch | None:
@@ -932,9 +936,9 @@ class Scheduler(
                 precompile_cache_loc_paddings,
                 self.page_size,
                 # eagle's model_worker_batch will be modified and repadding within eagle_worker
-                True,
+                skip_padding=True,
             )
-
+            print(f"====={model_worker_batch.forward_mode=}==========")
             (
                 model_worker_batch,
                 logits_output,
@@ -964,6 +968,9 @@ class Scheduler(
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             bid=bid,
             cache_miss_count=cache_miss_count,
+            next_draft_input=(
+                model_worker_batch.spec_info if not self.spec_algorithm.is_none() else None
+            ),
         )
 
         return ret

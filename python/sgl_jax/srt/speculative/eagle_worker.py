@@ -127,6 +127,8 @@ class EAGLEWorker(ModelWorker):
             self.draft_extend_for_prefill(
                 model_worker_batch, logits_output.hidden_states, next_token_ids
             )
+            print(f"after decode     {model_worker_batch.spec_info=}")
+
             return (
                 model_worker_batch,
                 logits_output,
@@ -134,10 +136,11 @@ class EAGLEWorker(ModelWorker):
                 cache_miss_count,
                 0,
             )
+
         else:
             spec_info = self.draft(model_worker_batch)
             # verify
-
+            print(f"=========after draft decode==={spec_info=}===============")
             logits_output, verify_output, model_worker_batch, _ = self.verify(
                 model_worker_batch, spec_info
             )
@@ -533,6 +536,8 @@ class EAGLEWorker(ModelWorker):
         # Save original positions to avoid buffer donation issues
         original_positions = jnp.array(model_worker_batch.positions)
         for i in range(self.speculative_num_steps):
+            print(f"-----1111---{hidden_states.shape=}------------")
+
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
@@ -546,6 +551,10 @@ class EAGLEWorker(ModelWorker):
 
             model_worker_batch.input_ids = input_ids
             model_worker_batch.spec_info.hidden_states = hidden_states
+            print("f---------------------")
+            print(f"-----2222---{input_ids.shape=}----------{hidden_states.shape=}------------")
+            print("f---------------------")
+
             model_worker_batch.out_cache_loc = out_cache_loc[i]
             model_worker_batch.positions = original_positions + 1 + i
             model_worker_batch.padding_model_worker_batch(

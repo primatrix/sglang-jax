@@ -33,6 +33,10 @@ from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
+from sgl_jax.srt.mem_cache.common import (
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
+)
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.precision_tracer import (
@@ -687,14 +691,15 @@ class ScheduleBatch:
 
         # Allocate memory
         if self.token_to_kv_pool_allocator.page_size == 1:
-            out_cache_loc = self.alloc_token_slots(extend_num_tokens)
+            out_cache_loc = alloc_token_slots(self.tree_cache, extend_num_tokens)
         else:
             last_loc_cpu = get_last_loc(
                 self.req_to_token_pool.req_to_token,
                 req_pool_indices_cpu,
                 prefix_lens_cpu,
             )
-            out_cache_loc = self.alloc_paged_token_slots_extend(
+            out_cache_loc = alloc_paged_token_slots_extend(
+                self.tree_cache,
                 prefix_lens,
                 seq_lens,
                 last_loc_cpu.tolist(),
@@ -885,7 +890,7 @@ class ScheduleBatch:
 
         # Allocate memory
         if self.token_to_kv_pool_allocator.page_size == 1:
-            self.out_cache_loc = self.alloc_token_slots(bs)
+            self.out_cache_loc = alloc_token_slots(self.tree_cache, bs)
         else:
             last_loc = self.req_to_token_pool.req_to_token[self.req_pool_indices, self.seq_lens - 2]
             self.out_cache_loc = self.alloc_paged_token_slots_decode(
@@ -1258,6 +1263,7 @@ class ModelWorkerBatch:
         bs_paddings: list,
         cache_loc_paddings: list,
     ):
+        print(f"{self.seq_lens=} {token_paddings=} {bs_paddings=} {cache_loc_paddings=}")
         if self.forward_mode.is_decode_or_idle():
             token_paddings = bs_paddings
         else:
@@ -1271,7 +1277,7 @@ class ModelWorkerBatch:
             if size >= len(self.input_ids):
                 padding_size = size - len(self.input_ids)
                 break
-        if padding_size > 0:
+        if padding_size >= 0:
             input_ids_cpu = np.concat(
                 [
                     self.input_ids,
@@ -1281,7 +1287,7 @@ class ModelWorkerBatch:
             )
         padded_input_ids_len = len(input_ids_cpu)
         out_cache_loc_num_to_padding = padded_input_ids_len - len(self.out_cache_loc)
-        if out_cache_loc_num_to_padding > 0:
+        if out_cache_loc_num_to_padding >= 0:
             out_cache_loc_cpu = np.concatenate(
                 [
                     self.out_cache_loc,
@@ -1314,6 +1320,9 @@ class ModelWorkerBatch:
         # Initialize padding area to ensure multiprocess consistency
         if len(self.cache_loc) < total_cache_loc_size:
             cache_loc_cpu[len(self.cache_loc) :] = 0
+        extend_start_loc = self.extend_start_loc
+        extend_prefix_lens = self.extend_prefix_lens
+        req_pool_indices_cpu = self.req_pool_indices
         if bs_padding_size > 0:
             invalid_req_pool_indices = np.array(
                 [-1] * bs_padding_size, dtype=self.req_pool_indices.dtype
@@ -1353,26 +1362,33 @@ class ModelWorkerBatch:
                     [self.extend_start_loc, invalid_extend_start_loc], axis=0
                 )
                 # padding
+        padding_size = 0
+        print(
+            f"=={self.forward_mode=}====={self.extend_seq_lens=}== {bs_padding_size=}={len(seq_lens_cpu)=}="
+        )
         if (
             self.forward_mode == ForwardMode.DRAFT_EXTEND
             or self.forward_mode == ForwardMode.TARGET_VERIFY
         ):
             padding_size = len(input_ids_cpu) - len(self.positions)
-            if padding_size:
-                positions_cpu = np.concatenate(
-                    [
-                        self.positions,
-                        jnp.zeros(padding_size, dtype=self.positions.dtype),
-                    ]
-                )
-        elif self.forward_mode == ForwardMode.EXTEND or ForwardMode.MIXED:
+        elif self.forward_mode == ForwardMode.EXTEND or self.forward_mode == ForwardMode.MIXED:
+            print(f"..............{self.forward_mode=}.............")
             total_tokens_before_padding = sum([extend_len for extend_len in extend_seq_lens])
             padding_size = len(input_ids_cpu) - total_tokens_before_padding
+        else:
+            pass
+        if padding_size >= 0:
+            positions_cpu = np.concatenate(
+                [
+                    self.positions,
+                    jnp.zeros(padding_size, dtype=self.positions.dtype),
+                ]
+            )
 
         self.seq_lens = seq_lens_cpu
         self.extend_start_loc = extend_start_loc
         self.extend_prefix_lens = extend_prefix_lens
-        self.extend_seq_lens = extend_seq_lens
+        self.extend_seq_lens = ((extend_seq_lens if self.forward_mode.is_extend() else None),)
         self.cache_loc = cache_loc_cpu
         self.input_ids = input_ids_cpu
         self.out_cache_loc = out_cache_loc_cpu

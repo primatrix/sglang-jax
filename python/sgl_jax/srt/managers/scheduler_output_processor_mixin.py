@@ -153,6 +153,8 @@ class SchedulerOutputProcessorMixin:
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req, cache_miss_count)
 
+        batch.spec_info = result.next_draft_input
+
     def process_batch_result_decode(
         self: Scheduler,
         batch: ScheduleBatch,

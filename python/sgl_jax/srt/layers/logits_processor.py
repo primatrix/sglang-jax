@@ -93,11 +93,18 @@ class LogitsProcessorOutput:
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
             # For ForwardMode.TARGET_VERIFY mode, we should take draft_token_num token for tree verify later
             self.next_token_logits = self.next_token_logits[
-                0 : batch.real_bs * batch.spec_info.draft_token_num + 1
+                0 : batch.real_bs * batch.spec_info.draft_token_num
             ]
         else:
-            self.next_token_logits = self.next_token_logits[0 : batch.real_bs + 1]
-            self.hidden_states = self.hidden_states[0 : batch.real_bs + 1]
+            print(
+                f"-------truncate_logits_processor_output-----------{self.hidden_states.shape=}-------------"
+            )
+            self.next_token_logits = self.next_token_logits[0 : batch.real_bs]
+            self.hidden_states = self.hidden_states[0 : batch.real_bs]
+            print(
+                f"-------truncate_logits_processor_output-----------{self.hidden_states.shape=}-------------"
+            )
+
         # assert not batch.capture_hidden_mode.need_capture()
 
 
