@@ -549,61 +549,6 @@ class ScheduleBatch:
             )
         return req_pool_indices
 
-    def alloc_token_slots(self, num_tokens: int, backup_state: bool = False):
-        self._evict_tree_cache_if_needed(num_tokens)
-
-        if backup_state:
-            state = self.token_to_kv_pool_allocator.backup_state()
-
-        out_cache_loc = self.token_to_kv_pool_allocator.alloc(num_tokens)
-        if out_cache_loc is None:
-            phase_str = "Prefill" if self.forward_mode.is_extend() else "Decode"
-            error_msg = (
-                f"{phase_str} out of memory. Try to lower your batch size.\n"
-                f"Try to allocate {num_tokens} tokens.\n"
-                f"{self._available_and_evictable_str()}"
-            )
-            logger.error(error_msg)
-            if self.tree_cache is not None:
-                self.tree_cache.pretty_print()
-            raise RuntimeError(error_msg)
-
-        if backup_state:
-            return out_cache_loc, state
-        else:
-            return out_cache_loc
-
-    def alloc_paged_token_slots_extend(
-        self,
-        prefix_lens: list[int],
-        seq_lens: list[int],
-        last_loc: list[int],
-        extend_num_tokens: int,
-        backup_state: bool = False,
-    ):
-        num_tokens = extend_num_tokens + len(seq_lens) * self.token_to_kv_pool_allocator.page_size
-        self._evict_tree_cache_if_needed(num_tokens)
-
-        if backup_state:
-            state = self.token_to_kv_pool_allocator.backup_state()
-
-        out_cache_loc = self.token_to_kv_pool_allocator.alloc_extend(
-            prefix_lens, seq_lens, last_loc, extend_num_tokens
-        )
-        if out_cache_loc is None:
-            error_msg = (
-                f"Prefill out of memory. Try to lower your batch size.\n"
-                f"Try to allocate {extend_num_tokens} tokens.\n"
-                f"{self._available_and_evictable_str()}"
-            )
-            logger.error(error_msg)
-            raise RuntimeError(error_msg)
-
-        if backup_state:
-            return out_cache_loc, state
-        else:
-            return out_cache_loc
-
     def alloc_paged_token_slots_decode(
         self,
         seq_lens: list[int],
@@ -1040,15 +985,13 @@ class ScheduleBatch:
         cache_loc_paddings: list,
         page_size: int,
         speculative_step_id: int = 0,
+        skip_padding: bool = False,
     ) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
-            token_paddings = bs_paddings
         else:
             extend_seq_lens = np.array(self.extend_lens, dtype=np.int32)
             extend_prefix_lens = np.array(self.prefix_lens, dtype=np.int32)
-            bs_paddings = bs_paddings[-1:]
-            cache_loc_paddings = cache_loc_paddings[-1:]
             extend_logprob_start_lens = self.extend_logprob_start_lens
 
         global bid
@@ -1065,54 +1008,11 @@ class ScheduleBatch:
         real_bs = len(seq_lens_cpu)
         req_pool_indices_cpu = self.req_pool_indices
         token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[self.req_pool_indices]
-        # padding seq
-        # extend & decode: input_ids, positions, out_cache_loc, cache_loc
-        padding_size = 0
-        token_paddings.sort()
-        for size in token_paddings:
-            if size >= len(input_ids_cpu):
-                padding_size = size - len(input_ids_cpu)
-                break
 
-        if padding_size > 0:
-            input_ids_cpu = np.concat(
-                [
-                    input_ids_cpu,
-                    np.array([0] * padding_size, dtype=input_ids_cpu.dtype),
-                ],
-                axis=0,
-            )
-
-        padded_input_ids_len = len(input_ids_cpu)
-        out_cache_loc_num_to_padding = padded_input_ids_len - len(out_cache_loc_cpu)
-        if out_cache_loc_num_to_padding > 0:
-            out_cache_loc_cpu = np.concatenate(
-                [
-                    out_cache_loc_cpu,
-                    np.array(
-                        [-1] * out_cache_loc_num_to_padding,
-                        dtype=out_cache_loc_cpu.dtype,
-                    ),
-                ],
-                axis=0,
-            )
-
+        # fixme @pc, move this to eagle_worker
         # If enable spec inference, use positions in spec info firstly
         if self.spec_info is not None and getattr(self.spec_info, "positions", None) is not None:
             positions_cpu = self.spec_info.positions
-            # padding
-            if (
-                self.forward_mode == ForwardMode.DRAFT_EXTEND
-                or self.forward_mode == ForwardMode.TARGET_VERIFY
-            ):
-                padding_size = len(input_ids_cpu) - len(positions_cpu)
-                if padding_size:
-                    positions_cpu = np.concatenate(
-                        [
-                            positions_cpu,
-                            jnp.zeros(padding_size, dtype=positions_cpu.dtype),
-                        ]
-                    )
         else:
             positions_cpu = None
 
@@ -1121,24 +1021,12 @@ class ScheduleBatch:
             # For prefill: create positions for each token in sequences
             # Calculate total tokens without padding first
             if positions_cpu is None:
-                total_tokens_before_padding = sum([extend_len for extend_len in self.extend_lens])
                 positions_cpu = np.concatenate(
                     [
                         np.arange(prefix_len, seq_len, dtype=seq_lens_cpu.dtype)
                         for seq_len, prefix_len in zip(seq_lens_cpu, self.prefix_lens)
                     ]
                 )
-
-                # If input_ids was padded, pad positions too
-                padding_size = len(input_ids_cpu) - total_tokens_before_padding
-                if padding_size:
-                    positions_cpu = np.concatenate(
-                        [
-                            positions_cpu,
-                            np.zeros(padding_size, dtype=positions_cpu.dtype),
-                        ]
-                    )
-
             # Start location of each sequence in the flattened array
             extend_start_loc = np.cumsum(
                 np.concatenate([np.array([0]), extend_seq_lens[:-1]]),
@@ -1158,14 +1046,6 @@ class ScheduleBatch:
                 # For decode, extend_start_loc is typically not used but we'll set it anyway
             extend_start_loc = np.arange(len(seq_lens_cpu), dtype=seq_lens_cpu.dtype)
 
-        bs_padding_size = 0
-        bs_paddings.sort()
-        select_bs_index = -1
-        for i, size in enumerate(bs_paddings):
-            if size >= len(seq_lens_cpu):
-                bs_padding_size = size - len(seq_lens_cpu)
-                select_bs_index = i
-                break
         cache_loc_flat = np.array([], dtype=np.int32)
 
         if len(seq_lens_cpu) > 0:
@@ -1203,56 +1083,9 @@ class ScheduleBatch:
                     # Padding is already zero from initialization
                     offset += aligned_len
 
-        offset = np.sum(seq_lens_cpu[seq_lens_cpu > 0]) if len(seq_lens_cpu) > 0 else 0
-
-        total_cache_loc_size = cache_loc_paddings[select_bs_index]
-        assert total_cache_loc_size >= len(cache_loc_flat)
-
-        cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
-        if len(cache_loc_flat) > 0:
-            cache_loc_cpu[: len(cache_loc_flat)] = cache_loc_flat
-        # Initialize padding area to ensure multiprocess consistency
-        if len(cache_loc_flat) < total_cache_loc_size:
-            cache_loc_cpu[len(cache_loc_flat) :] = 0
-
-        if bs_padding_size > 0:
-            invalid_req_pool_indices = np.array(
-                [-1] * bs_padding_size, dtype=req_pool_indices_cpu.dtype
-            )
-            req_pool_indices_cpu = np.concat(
-                [
-                    req_pool_indices_cpu,
-                    invalid_req_pool_indices,
-                ],
-                axis=0,
-            )
-            invalid_seq_lens = np.array([0] * bs_padding_size, dtype=seq_lens_cpu.dtype)
-            seq_lens_cpu = np.concat([seq_lens_cpu, invalid_seq_lens], axis=0)
-            if self.forward_mode.is_extend():
-                invalid_extend_start_loc = np.array(
-                    [extend_start_loc[-1] + extend_seq_lens[-1]] * bs_padding_size,
-                    dtype=extend_start_loc.dtype,
-                )
-                extend_start_loc = np.concat([extend_start_loc, invalid_extend_start_loc], axis=0)
-                invalid_extend_prefix_lens = np.array(
-                    [0] * bs_padding_size, dtype=extend_prefix_lens.dtype
-                )
-                extend_prefix_lens = np.concat(
-                    [extend_prefix_lens, invalid_extend_prefix_lens], axis=0
-                )
-                invalid_extend_seq_lens = np.array(
-                    [0] * bs_padding_size, dtype=extend_seq_lens.dtype
-                )
-                extend_seq_lens = np.concat([extend_seq_lens, invalid_extend_seq_lens], axis=0)
-            else:
-                invalid_extend_start_loc = np.array(
-                    [len(seq_lens_cpu)] * bs_padding_size, dtype=extend_start_loc.dtype
-                )
-                extend_start_loc = np.concat([extend_start_loc, invalid_extend_start_loc], axis=0)
-
         if precision_tracer.get_trace_active():
             self._generate_trace_info(real_bs, bid)
-        return ModelWorkerBatch(
+        res = ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
             input_ids=input_ids_cpu,
@@ -1266,7 +1099,7 @@ class ScheduleBatch:
             sampling_info=self.sampling_info,
             positions=positions_cpu,
             extend_start_loc=extend_start_loc,
-            cache_loc=cache_loc_cpu,
+            cache_loc=cache_loc_flat,
             extend_prefix_lens=(extend_prefix_lens if self.forward_mode.is_extend() else None),
             extend_seq_lens=(extend_seq_lens if self.forward_mode.is_extend() else None),
             extend_logprob_start_lens=extend_logprob_start_lens,
@@ -1284,7 +1117,16 @@ class ScheduleBatch:
             launch_done=self.launch_done,
             spec_info=self.spec_info,
             spec_algorithm=self.spec_algorithm,
+            tree_cache=self.tree_cache,
         )
+        if skip_padding:
+            return res
+        res.padding_model_worker_batch(
+            token_paddings=token_paddings,
+            bs_paddings=bs_paddings,
+            cache_loc_paddings=cache_loc_paddings,
+        )
+        return res
 
     def _generate_trace_info(self, real_bs: int, bid: int) -> list[str]:
         for req in self.reqs[:real_bs]:
@@ -1407,6 +1249,135 @@ class ModelWorkerBatch:
     spec_algorithm: SpeculativeAlgorithm = None
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
+
+    tree_cache: BasePrefixCache = None
+
+    def padding_model_worker_batch(
+        self,
+        token_paddings: list,
+        bs_paddings: list,
+        cache_loc_paddings: list,
+    ):
+        if self.forward_mode.is_decode_or_idle():
+            token_paddings = bs_paddings
+        else:
+            bs_paddings = bs_paddings[-1:]
+            cache_loc_paddings = cache_loc_paddings[-1:]
+        # padding seq
+        # extend & decode: input_ids, positions, out_cache_loc, cache_loc
+        padding_size = 0
+        token_paddings.sort()
+        for size in token_paddings:
+            if size >= len(self.input_ids):
+                padding_size = size - len(self.input_ids)
+                break
+        if padding_size > 0:
+            input_ids_cpu = np.concat(
+                [
+                    self.input_ids,
+                    np.array([0] * padding_size, dtype=self.input_ids.dtype),
+                ],
+                axis=0,
+            )
+        padded_input_ids_len = len(input_ids_cpu)
+        out_cache_loc_num_to_padding = padded_input_ids_len - len(self.out_cache_loc)
+        if out_cache_loc_num_to_padding > 0:
+            out_cache_loc_cpu = np.concatenate(
+                [
+                    self.out_cache_loc,
+                    np.array(
+                        [-1] * out_cache_loc_num_to_padding,
+                        dtype=self.out_cache_loc.dtype,
+                    ),
+                ],
+                axis=0,
+            )
+        # todo padding position
+        seq_lens_cpu = self.seq_lens
+        bs_padding_size = 0
+        bs_paddings.sort()
+        select_bs_index = -1
+        for i, size in enumerate(bs_paddings):
+            if size >= len(seq_lens_cpu):
+                bs_padding_size = size - len(seq_lens_cpu)
+                select_bs_index = i
+                break
+
+        # offset = np.sum(seq_lens_cpu[seq_lens_cpu > 0]) if len(seq_lens_cpu) > 0 else 0
+
+        total_cache_loc_size = cache_loc_paddings[select_bs_index]
+        assert total_cache_loc_size >= len(self.cache_loc)
+
+        cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
+        if len(self.cache_loc) > 0:
+            cache_loc_cpu[: len(self.cache_loc)] = self.cache_loc
+        # Initialize padding area to ensure multiprocess consistency
+        if len(self.cache_loc) < total_cache_loc_size:
+            cache_loc_cpu[len(self.cache_loc) :] = 0
+        if bs_padding_size > 0:
+            invalid_req_pool_indices = np.array(
+                [-1] * bs_padding_size, dtype=self.req_pool_indices.dtype
+            )
+            req_pool_indices_cpu = np.concat(
+                [
+                    self.req_pool_indices,
+                    invalid_req_pool_indices,
+                ],
+                axis=0,
+            )
+            invalid_seq_lens = np.array([0] * bs_padding_size, dtype=seq_lens_cpu.dtype)
+            seq_lens_cpu = np.concat([seq_lens_cpu, invalid_seq_lens], axis=0)
+            if self.forward_mode.is_extend():
+                invalid_extend_start_loc = np.array(
+                    [self.extend_start_loc[-1] + self.extend_seq_lens[-1]] * bs_padding_size,
+                    dtype=self.extend_start_loc.dtype,
+                )
+                extend_start_loc = np.concat(
+                    [self.extend_start_loc, invalid_extend_start_loc], axis=0
+                )
+                invalid_extend_prefix_lens = np.array(
+                    [0] * bs_padding_size, dtype=self.extend_prefix_lens.dtype
+                )
+                extend_prefix_lens = np.concat(
+                    [self.extend_prefix_lens, invalid_extend_prefix_lens], axis=0
+                )
+                invalid_extend_seq_lens = np.array(
+                    [0] * bs_padding_size, dtype=self.extend_seq_lens.dtype
+                )
+                extend_seq_lens = np.concat([self.extend_seq_lens, invalid_extend_seq_lens], axis=0)
+            else:
+                invalid_extend_start_loc = np.array(
+                    [len(seq_lens_cpu)] * bs_padding_size, dtype=self.extend_start_loc.dtype
+                )
+                extend_start_loc = np.concat(
+                    [self.extend_start_loc, invalid_extend_start_loc], axis=0
+                )
+                # padding
+        if (
+            self.forward_mode == ForwardMode.DRAFT_EXTEND
+            or self.forward_mode == ForwardMode.TARGET_VERIFY
+        ):
+            padding_size = len(input_ids_cpu) - len(self.positions)
+            if padding_size:
+                positions_cpu = np.concatenate(
+                    [
+                        self.positions,
+                        jnp.zeros(padding_size, dtype=self.positions.dtype),
+                    ]
+                )
+        elif self.forward_mode == ForwardMode.EXTEND or ForwardMode.MIXED:
+            total_tokens_before_padding = sum([extend_len for extend_len in extend_seq_lens])
+            padding_size = len(input_ids_cpu) - total_tokens_before_padding
+
+        self.seq_lens = seq_lens_cpu
+        self.extend_start_loc = extend_start_loc
+        self.extend_prefix_lens = extend_prefix_lens
+        self.extend_seq_lens = extend_seq_lens
+        self.cache_loc = cache_loc_cpu
+        self.input_ids = input_ids_cpu
+        self.out_cache_loc = out_cache_loc_cpu
+        self.req_pool_indices = req_pool_indices_cpu
+        self.positions = positions_cpu
 
 
 def get_last_loc(

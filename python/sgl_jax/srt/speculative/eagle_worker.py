@@ -11,6 +11,10 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorO
 from sgl_jax.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sgl_jax.srt.managers.tp_worker import ModelWorker
+from sgl_jax.srt.mem_cache.common import (
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
+)
 from sgl_jax.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -131,16 +135,16 @@ class EAGLEWorker(ModelWorker):
                 0,
             )
         else:
-            batch = None
-            # draft
-            spec_info = self.draft(batch)
+            spec_info = self.draft(model_worker_batch)
             # verify
 
-            logits_output, verify_output, model_worker_batch, _ = self.verify(batch, spec_info)
+            logits_output, verify_output, model_worker_batch, _ = self.verify(
+                model_worker_batch, spec_info
+            )
 
             # TODO: if enable_dp_attention, add condition here
-            if batch.spec_info.verified_id.shape[0] > 0:
-                self.forward_draft_extend_after_decode(batch)
+            if model_worker_batch.spec_info.verified_id.shape[0] > 0:
+                self.forward_draft_extend_after_decode(model_worker_batch)
             return (
                 model_worker_batch,
                 logits_output,
@@ -224,33 +228,21 @@ class EAGLEWorker(ModelWorker):
         draft_input.topk_index = topk_index
         draft_input.hidden_states = logits_output.hidden_states
 
-    def draft(self, batch: ScheduleBatch):
-        if batch.forward_mode.is_idle():
-            self._draft_preprocess_idle(batch)
+    def draft(self, model_worker_batch: ModelWorkerBatch):
+        if model_worker_batch.forward_mode.is_idle():
+            self._draft_preprocess_idle(model_worker_batch)
         else:
-            self._draft_preprocess_decode(batch)
+            self._draft_preprocess_decode(model_worker_batch)
 
-        spec_info = batch.spec_info
+        spec_info = model_worker_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         spec_info.num_tokens_per_batch = jnp.asarray(self.topk, dtype=jnp.int32)
         spec_info.num_tokens_for_logprob_per_batch = jnp.asarray(self.topk, dtype=jnp.int32)
-        batch.return_hidden_states = False
-
-        # if not model_worker_batch.forward_mode.is_idle():
-        #     forward_batch = ForwardBatch.init_new(
-        #         model_worker_batch, self.draft_model_runner
-        #     )
-        #     # Initialize attention backend
-        #     forward_metadata = (
-        #         self.draft_model_runner.attn_backend.get_forward_metadata(
-        #             model_worker_batch
-        #         )
-        #     )
-        #     self.draft_model_runner.attn_backend.forward_metadata = forward_metadata
+        model_worker_batch.return_hidden_states = False
 
         # Run forward steps
-        score_list, token_list, parents_list = self.draft_forward(batch)
+        score_list, token_list, parents_list = self.draft_forward(model_worker_batch)
         (
             tree_mask,
             position,
@@ -263,12 +255,12 @@ class EAGLEWorker(ModelWorker):
             score_list,
             token_list,
             parents_list,
-            batch.seq_lens,
-            batch.seq_lens_sum,
+            model_worker_batch.seq_lens,
+            model_worker_batch.seq_lens_sum,
             self.topk,
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,
-            int(batch.req_to_token_pool.req_to_token.shape[1]),
+            int(self.req_to_token_pool.req_to_token.shape[1]),
         )
         # build tree
         return EagleVerifyInput(
@@ -283,8 +275,8 @@ class EAGLEWorker(ModelWorker):
             topk=self.topk,
             draft_token_num=self.speculative_num_draft_tokens,
             capture_hidden_mode=CaptureHiddenMode.LAST,
-            seq_lens_sum=batch.seq_lens_sum,
-            seq_lens_cpu=batch.seq_lens,
+            seq_lens_sum=model_worker_batch.seq_lens_sum,
+            seq_lens_cpu=model_worker_batch.seq_lens,
         )
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
@@ -516,21 +508,8 @@ class EAGLEWorker(ModelWorker):
         batch.spec_info.accept_length = accept_length_backup
         batch.return_logprob = return_logprob_backup
 
-    def draft_forward(self, schedule_batch: ScheduleBatch):
-        (
-            precompile_token_paddings,
-            precompile_bs_paddings,
-            precompile_cache_loc_paddings,
-        ) = self.target_worker.get_precompile_paddings()
-        # Get forward batch
-        model_worker_batch = schedule_batch.get_model_worker_batch(
-            precompile_token_paddings,
-            precompile_bs_paddings,
-            precompile_cache_loc_paddings,
-            self.page_size,
-        )
+    def draft_forward(self, model_worker_batch: ModelWorkerBatch):
         assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
-
         spec_info = model_worker_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
         out_cache_loc = model_worker_batch.out_cache_loc
@@ -542,11 +521,17 @@ class EAGLEWorker(ModelWorker):
         if self.hot_token_ids is not None:
             topk_index = self.hot_token_ids[topk_index]
         out_cache_loc = out_cache_loc[
-            : (schedule_batch.batch_size() * self.topk * self.speculative_num_steps)
-        ].reshape(schedule_batch.batch_size(), self.topk, self.speculative_num_steps)
+            : (model_worker_batch.real_bs * self.topk * self.speculative_num_steps)
+        ].reshape(model_worker_batch.real_bs, self.topk, self.speculative_num_steps)
         out_cache_loc = jnp.transpose(out_cache_loc, (2, 0, 1)).reshape(
             self.speculative_num_steps, -1
         )
+        (
+            precompile_token_paddings,
+            precompile_bs_paddings,
+            precompile_cache_loc_paddings,
+        ) = self.target_worker.get_precompile_paddings()
+
         # Return values
         score_list: list[jax.Array] = []
         token_list: list[jax.Array] = []
@@ -566,28 +551,14 @@ class EAGLEWorker(ModelWorker):
 
             if i == self.speculative_num_steps - 1:
                 break
-            if i > 0:
-                model_worker_batch = schedule_batch.get_model_worker_batch(
-                    precompile_token_paddings,
-                    precompile_bs_paddings,
-                    precompile_cache_loc_paddings,
-                    self.page_size,
-                    speculative_step_id=i,
-                )
 
             model_worker_batch.input_ids = input_ids
-            if hidden_states is not None:
-                current_len = hidden_states.shape[0]
-                padding_size = len(input_ids) - current_len
-                if padding_size >= 0:
-                    model_worker_batch.spec_info.hidden_states = jnp.pad(
-                        hidden_states,
-                        ((0, padding_size), (0, 0)),
-                        mode="constant",
-                        constant_values=0,
-                    )
+            model_worker_batch.spec_info.hidden_states = hidden_states
             model_worker_batch.out_cache_loc = out_cache_loc[i]
             model_worker_batch.positions = original_positions + 1 + i
+            model_worker_batch.padding_model_worker_batch(
+                precompile_token_paddings, precompile_bs_paddings, precompile_cache_loc_paddings
+            )
             self.draft_model_runner.attn_backend.forward_metadata = (
                 self.draft_model_runner.attn_backend.get_forward_metadata(model_worker_batch, i)
             )
@@ -608,26 +579,28 @@ class EAGLEWorker(ModelWorker):
 
         return score_list, token_list, parents_list
 
-    def _draft_preprocess_idle(self, batch: ScheduleBatch):
+    def _draft_preprocess_idle(self, model_worker_batch: ModelWorkerBatch):
         pass
 
-    def _draft_preprocess_decode(self, batch: ScheduleBatch):
+    def _draft_preprocess_decode(self, model_worker_batch: ModelWorkerBatch):
         # Parse args
-        num_seqs = batch.batch_size()
-        spec_info = batch.spec_info
+        num_seqs = model_worker_batch.real_bs
+        spec_info = model_worker_batch.spec_info
 
         # todo: add penalty
 
         if self.page_size == 1:
-            out_cache_loc, token_to_kv_pool_state_backup = batch.alloc_token_slots(
-                num_seqs * self.speculative_num_steps * self.topk, backup_state=True
+            out_cache_loc, token_to_kv_pool_state_backup = alloc_token_slots(
+                model_worker_batch.tree_cache,
+                num_seqs * self.speculative_num_steps * self.topk,
+                backup_state=True,
             )
         else:
             if self.topk == 1:
                 prefix_lens, seq_lens, last_loc = get_last_loc_large_page_size_top_k_1(
-                    batch.req_to_token_pool.req_to_token,
-                    batch.req_pool_indices,
-                    batch.seq_lens,
+                    self.req_to_token_pool.req_to_token,
+                    model_worker_batch.req_pool_indices,
+                    model_worker_batch.seq_lens,
                     self.speculative_num_steps,
                 )
                 extend_num_tokens = num_seqs * self.speculative_num_steps
@@ -658,9 +631,9 @@ class EAGLEWorker(ModelWorker):
                     num_new_pages_per_topk,
                     extend_lens,
                 ) = get_last_loc_large_page_size_large_top_k(
-                    batch.req_to_token_pool.req_to_token,
-                    batch.req_pool_indices,
-                    batch.seq_lens,
+                    self.req_to_token_pool.req_to_token,
+                    model_worker_batch.req_pool_indices,
+                    model_worker_batch.seq_lens,
                     self.speculative_num_steps,
                     self.topk,
                     self.page_size,
@@ -673,7 +646,8 @@ class EAGLEWorker(ModelWorker):
                 self.num_new_pages_per_topk = num_new_pages_per_topk
                 self.extend_lens = extend_lens
 
-            out_cache_loc, token_to_kv_pool_state_backup = batch.alloc_paged_token_slots_extend(
+            out_cache_loc, token_to_kv_pool_state_backup = alloc_paged_token_slots_extend(
+                model_worker_batch.tree_cache,
                 prefix_lens,
                 seq_lens,
                 last_loc,
@@ -687,8 +661,8 @@ class EAGLEWorker(ModelWorker):
         # Update req_to_token_pool with cache locations (no reshape needed)
         # Layout: [seq0_topk0_steps, seq0_topk1_steps, seq1_topk0_steps, ...]
         for i in range(num_seqs):
-            req_idx = batch.req_pool_indices[i].item()
-            start_pos = batch.seq_lens[i].item()
+            req_idx = model_worker_batch.req_pool_indices[i].item()
+            start_pos = model_worker_batch.seq_lens[i].item()
 
             # For each topk branch
             for k in range(self.topk):
@@ -704,17 +678,17 @@ class EAGLEWorker(ModelWorker):
                     cache_loc = out_cache_loc[flat_idx].item()
 
                     # Update req_to_token mapping
-                    if token_pos < batch.req_to_token_pool.req_to_token.shape[1]:
-                        batch.req_to_token_pool.write((req_idx, token_pos), cache_loc)
+                    if token_pos < self.req_to_token_pool.req_to_token.shape[1]:
+                        self.req_to_token_pool.write((req_idx, token_pos), cache_loc)
 
         if self.page_size > 1 and self.topk > 1:
             # Remove padded slots
             out_cache_loc = out_cache_loc[: num_seqs * self.topk * self.speculative_num_steps]
 
-        batch.out_cache_loc = out_cache_loc
-        batch.seq_lens_sum = int(jnp.sum(batch.seq_lens))
-        batch.return_hidden_states = False
-        spec_info.positions = jnp.repeat(batch.seq_lens, self.topk)
+        model_worker_batch.out_cache_loc = out_cache_loc
+        model_worker_batch.seq_lens_sum = int(jnp.sum(model_worker_batch.seq_lens))
+        model_worker_batch.return_hidden_states = False
+        spec_info.positions = jnp.repeat(model_worker_batch.seq_lens, self.topk)
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
 

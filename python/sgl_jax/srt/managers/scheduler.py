@@ -931,6 +931,8 @@ class Scheduler(
                 precompile_bs_paddings,
                 precompile_cache_loc_paddings,
                 self.page_size,
+                # eagle's model_worker_batch will be modified and repadding within eagle_worker
+                True,
             )
 
             (
