@@ -385,9 +385,9 @@ class SchedulerOutputProcessorMixin:
         req.output_token_logprobs_val.append(output.next_token_logprobs[i])
         req.output_token_logprobs_idx.append(next_token_ids[i])
 
-        # self.add_input_logprob_return_values(
-        #     i, req, output, pt, num_input_logprobs, last_prefill_chunk=True
-        # )
+        self.add_input_logprob_return_values(
+            i, req, output, pt, num_input_logprobs, last_prefill_chunk=True
+        )
 
         if req.top_logprobs_num > 0:
             req.output_top_logprobs_val.append(output.next_token_top_logprobs_val[i])

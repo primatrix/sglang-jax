@@ -94,11 +94,17 @@ class Sampler(nnx.Module):
             ) = get_token_ids_logprobs(logprobs, sampling_metadata.token_ids_logprobs)
 
         return LogitsProcessorOutput(next_token_logits=logits_output.next_token_logits,
-               next_token_logprobs=next_token_logprobs,
+                next_token_logprobs=next_token_logprobs,
                 next_token_top_logprobs_val=next_token_top_logprobs_val,
                 next_token_top_logprobs_idx=next_token_top_logprobs_idx,
                 next_token_token_ids_logprobs_val=next_token_token_ids_logprobs_val,
-                next_token_token_ids_logprobs_idx=next_token_token_ids_logprobs_idx)
+                next_token_token_ids_logprobs_idx=next_token_token_ids_logprobs_idx,
+                input_token_logprobs = logits_output.input_token_logprobs,
+                input_top_logprobs_val = logits_output.input_top_logprobs_val,
+                input_top_logprobs_idx = logits_output.input_token_ids_logprobs_idx,
+                input_token_ids_logprobs_val=logits_output.input_token_ids_logprobs_val,
+                input_token_ids_logprobs_idx = logits_output.input_token_ids_logprobs_idx,
+                )
 
     def _apply_linear_penalty(self, operands):
         """Apply linear penalty branch (overlap mode)"""
