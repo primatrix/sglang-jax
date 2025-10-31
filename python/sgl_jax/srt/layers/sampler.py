@@ -188,7 +188,7 @@ class Sampler(nnx.Module):
         """
 
         # Apply penalties before sampling
-        print(f'sampling_metadata {sampling_metadata}')
+        # print(f'sampling_metadata {sampling_metadata}')
         logits = self.apply_penalties(logits_output.next_token_logits, sampling_metadata)
 
         _, rng = jax.random.split(self.rngs.params())
