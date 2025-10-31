@@ -161,7 +161,7 @@ class ModelRunner:
         def jitted_sampler(sampler_def, sampler_state_def, sampler_state_leaves, mesh, *args):
             model_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, model_state)
-            return sampler(*args, mesh=mesh)
+            return sampler(*args)
 
         def run_model_wrapper(forward_batch, logits_metadata):
             token_to_kv_pool = self.token_to_kv_pool
