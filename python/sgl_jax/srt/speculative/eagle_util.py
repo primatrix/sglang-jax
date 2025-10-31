@@ -425,7 +425,7 @@ class EagleDraftInput:
                 extend_num_tokens,
             )
 
-        assign_req_to_token_pool[(bs,)](
+        assign_req_to_token_pool(
             schedule_batch.req_pool_indices,
             schedule_batch.req_to_token_pool.req_to_token,
             self.allocate_lens,
