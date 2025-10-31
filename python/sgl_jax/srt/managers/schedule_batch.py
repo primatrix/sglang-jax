@@ -1018,7 +1018,7 @@ class ScheduleBatch:
         req_pool_indices_cpu = self.req_pool_indices
         token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[self.req_pool_indices]
 
-        # fixme @pc, move this to eagle_worker
+        # FIXME @pc, move this to eagle_worker
         # If enable spec inference, use positions in spec info firstly
         if self.spec_info is not None and getattr(self.spec_info, "positions", None) is not None:
             positions_cpu = self.spec_info.positions

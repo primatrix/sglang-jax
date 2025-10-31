@@ -206,6 +206,7 @@ class EAGLEWorker(ModelWorker):
         )
         logits_output.truncate_logits_processor_output(model_worker_batch)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
+        forward_batch.spec_info.allocate_lens = model_worker_batch.extend_seq_lens
         # assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
         # has_finished, unfinished_req_index = False, []
@@ -234,17 +235,9 @@ class EAGLEWorker(ModelWorker):
         draft_input.hidden_states = logits_output.hidden_states
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
-        if model_worker_batch.forward_mode.is_idle():
-            self._draft_preprocess_idle(model_worker_batch)
-        else:
-            self._draft_preprocess_decode(model_worker_batch)
-
         spec_info = model_worker_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
-        spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-        spec_info.num_tokens_per_batch = jnp.asarray(self.topk, dtype=jnp.int32)
-        spec_info.num_tokens_for_logprob_per_batch = jnp.asarray(self.topk, dtype=jnp.int32)
-        model_worker_batch.return_hidden_states = False
+        spec_info.prepare_for_draft_decode(model_worker_batch) 
         # Run forward steps
         score_list, token_list, parents_list = self.draft_forward(model_worker_batch)
         (
@@ -480,12 +473,12 @@ class EAGLEWorker(ModelWorker):
         )
         if self.hot_token_ids is not None:
             topk_index = self.hot_token_ids[topk_index]
-        out_cache_loc = out_cache_loc[
-            : (model_worker_batch.real_bs * self.topk * self.speculative_num_steps)
-        ].reshape(model_worker_batch.real_bs, self.topk, self.speculative_num_steps)
-        out_cache_loc = jnp.transpose(out_cache_loc, (2, 0, 1)).reshape(
-            self.speculative_num_steps, -1
-        )
+        # out_cache_loc = out_cache_loc[
+        #     : (model_worker_batch.real_bs * self.topk * self.speculative_num_steps)
+        # ].reshape(model_worker_batch.real_bs, self.topk, self.speculative_num_steps)
+        # out_cache_loc = jnp.transpose(out_cache_loc, (2, 0, 1)).reshape(
+        #     self.speculative_num_steps, -1
+        # )
         (
             precompile_token_paddings,
             precompile_bs_paddings,

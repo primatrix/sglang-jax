@@ -31,7 +31,6 @@ from sgl_jax.srt.mem_cache.common import (
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode,ForwardMode,ForwardBatch
 from sgl_jax.srt.speculative.pallas.kernel import (
     align_evict_mask_to_page_size,
-    assign_req_to_token_pool,
     create_extend_after_decode_spec_info,
     filter_finished_cache_loc_kernel,
     get_target_cache_loc,
@@ -391,55 +390,6 @@ class EagleDraftInput:
             model_worker_batch.input_ids[pt + extend_len - 1] = self.verified_id[i]
             pt += extend_len
 
-    def prepare_for_decode(self, schedule_batch: ScheduleBatch):
-        new_allocate_lens = schedule_batch.seq_lens + self.ALLOC_LEN_PER_DECODE
-        self.allocate_lens = new_allocate_lens
-        
-        # TODO(pc) implement overlap here
-        # schedule_batch.maybe_wait_verify_done()
-        bs = schedule_batch.batch_size()
-        
-        page_size = schedule_batch.token_to_kv_pool_allocator.page_size
-        
-        if page_size == 1:
-            new_allocate_lens = schedule_batch.seq_lens + self.ALLOC_LEN_PER_DECODE
-            num_needed_tokens = (new_allocate_lens - self.allocate_lens).sum().item()
-            out_cache_loc = alloc_token_slots(schedule_batch.tree_cache, num_needed_tokens)
-        else:
-            last_loc = get_last_loc(
-                schedule_batch.req_to_token_pool.req_to_token,
-                schedule_batch.req_pool_indices,
-                self.allocate_lens,
-            )
-            new_allocate_lens = schedule_batch.seq_lens + self.ALLOC_LEN_PER_DECODE
-            new_allocate_lens_cpu = new_allocate_lens.cpu()
-            allocate_lens_cpu = self.allocate_lens.cpu()
-            extend_num_tokens = sum(new_allocate_lens_cpu - allocate_lens_cpu).item()
-            out_cache_loc = alloc_paged_token_slots_extend(
-                schedule_batch.tree_cache,
-                self.allocate_lens,
-                allocate_lens_cpu,
-                new_allocate_lens,
-                new_allocate_lens_cpu,
-                last_loc,
-                extend_num_tokens,
-            )
-
-        assign_req_to_token_pool(
-            schedule_batch.req_pool_indices,
-            schedule_batch.req_to_token_pool.req_to_token,
-            self.allocate_lens,
-            new_allocate_lens,
-            out_cache_loc,
-            schedule_batch.req_to_token_pool.req_to_token.shape[1],
-            next_power_of_2(bs),
-        )
-        self.allocate_lens = new_allocate_lens
-
-        # FIXME(lsyin): make this sync optional
-        # schedule_batch.seq_lens_cpu = schedule_batch.seq_lens
-        schedule_batch.seq_lens_sum = np.sum(schedule_batch.seq_lens).item()
-        
     def prepare_for_extend_after_verify(self, model_worker_batch: ModelWorkerBatch, predict: jax.Array, num_draft_tokens:int, draft_model_runner: Any, batch_output:GenerationBatchResult):
         seq_lens_cpu_ = model_worker_batch.seq_lens_cpu
         extend_num_tokens = len(model_worker_batch.seq_lens) * num_draft_tokens
@@ -458,6 +408,59 @@ class EagleDraftInput:
         forward_batch = ForwardBatch.init_new(model_worker_batch, draft_model_runner)
         draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         return forward_batch
+    
+    def prepare_for_decode(self, schedule_batch: ScheduleBatch):
+        new_allocate_lens = schedule_batch.seq_lens + self.ALLOC_LEN_PER_DECODE
+        
+        # TODO(pc) implement overlap here
+        # schedule_batch.maybe_wait_verify_done()
+        bs = schedule_batch.batch_size()
+        
+        page_size = schedule_batch.token_to_kv_pool_allocator.page_size
+        
+        if page_size == 1:
+            num_needed_tokens = (new_allocate_lens - self.allocate_lens).sum().item()
+            out_cache_loc = alloc_token_slots(schedule_batch.tree_cache, num_needed_tokens)
+        else:
+            last_loc = get_last_loc(
+                schedule_batch.req_to_token_pool.req_to_token,
+                schedule_batch.req_pool_indices,
+                self.allocate_lens,
+            )
+            extend_num_tokens = sum(new_allocate_lens - self.allocate_lens).item()
+            out_cache_loc = alloc_paged_token_slots_extend(
+                schedule_batch.tree_cache,
+                self.allocate_lens,
+                self.allocate_lens,
+                last_loc,
+                extend_num_tokens,
+            )
+
+        assign_req_to_token_pool(
+            schedule_batch.req_pool_indices,
+            schedule_batch.req_to_token_pool.req_to_token,
+            self.allocate_lens,
+            new_allocate_lens,
+            out_cache_loc,
+        )
+        self.allocate_lens = new_allocate_lens
+
+        # FIXME(lsyin): make this sync optional
+        # schedule_batch.seq_lens_cpu = schedule_batch.seq_lens
+        schedule_batch.seq_lens_sum = np.sum(schedule_batch.seq_lens).item()
+    
+    def prepare_for_draft_decode(self, model_worker_batch: ModelWorkerBatch, topk: int, num_steps: int):
+        self.capture_hidden_mode = CaptureHiddenMode.LAST
+        self.num_tokens_per_batch = topk
+        self.num_tokens_for_logprob_per_batch = topk
+        model_worker_batch.return_hidden_states = False
+        bs = model_worker_batch.seq_lens.shape[0]
+        # we don't need process outcache_loc because we don't need this in attention backend
+        # out_cache_loc = np.empty((bs * topk * num_steps), dtype=np.int32)
+        # model_worker_batch.out_cache_loc = out_cache_loc
+        model_worker_batch.seq_lens_sum = int(jnp.sum(model_worker_batch.seq_lens))
+        model_worker_batch.return_hidden_states = False
+        model_worker_batch.spec_info.positions = jnp.repeat(model_worker_batch.seq_lens, topk)
     
     @classmethod
     def create_idle_input(
@@ -1265,3 +1268,23 @@ def create_accept_length_filter(
     accept_length_filter[unfinished_index_device] = accept_length[unfinished_index_device] + 1
     seq_lens.add_(accept_length + 1)
     return accept_length_filter
+
+def assign_req_to_token_pool(
+    req_pool_indices,
+    req_to_token_pool,
+    start_offsets,
+    end_offsets,
+    out_cache_loc,
+):
+    bs = start_offsets.shape[0]
+    out_cache_lens = end_offsets - start_offsets
+    out_cache_loc_start_positions = np.concatenate(
+        [np.array([0], dtype=np.int32), np.cumsum(out_cache_lens)]
+    )[0:-1]
+
+    for i in range(bs):
+        out_cache_loc_start = out_cache_loc_start_positions[i]
+        req_to_token_pool.write(
+            (req_pool_indices[i], slice(start_offsets[i], end_offsets[i])),
+            out_cache_loc[out_cache_loc_start : out_cache_loc_start + out_cache_lens[i]],
+        )
