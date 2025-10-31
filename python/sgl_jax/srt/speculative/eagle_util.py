@@ -655,33 +655,13 @@ class EagleVerifyInput:
         prefix_lens = model_worker_batch.seq_lens
         seq_lens_with_draft_token = model_worker_batch.seq_lens + self.draft_token_num
         # extend_lens = jnp.array([self.draft_token_num] * bs)
+        model_worker_batch.return_hidden_states = False
+        model_worker_batch.forward_mode = ForwardMode.TARGET_VERIFY
+        model_worker_batch.spec_info = self
+        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
-        if page_size == 1:
-            model_worker_batch.out_cache_loc = alloc_token_slots(
-                model_worker_batch.tree_cache, len(model_worker_batch.input_ids)
-            )
-        else:
-            last_loc = get_last_loc(
-                target_worker.model_runner.req_to_token_pool.req_to_token,
-                model_worker_batch.req_pool_indices,
-                prefix_lens,
-            )
-            model_worker_batch.out_cache_loc = alloc_paged_token_slots_extend(
-                model_worker_batch.tree_cache,
-                prefix_lens.tolist(),
-                seq_lens_with_draft_token.tolist(),
-                last_loc.tolist(),
-                len(model_worker_batch.input_ids),
-            )
-            self.last_loc = last_loc
+        # assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
 
-        assign_req_to_token_pool(
-            model_worker_batch.req_pool_indices,
-            target_worker.model_runner.req_to_token_pool,
-            model_worker_batch.seq_lens,
-            seq_lens_with_draft_token,
-            model_worker_batch.out_cache_loc,
-        )
 
     def sample(
         self,
@@ -735,16 +715,6 @@ class EagleVerifyInput:
             sampling_info = copy.deepcopy(sampling_info)
             # NOTE: retrive_index are the indices of the requests that are kept.
             sampling_info.filter_batch(self.retrive_index.tolist(), self.retrive_index)
-
-        # TODO: support custom sampler, apply the custom logit processors if registered in the sampling info.
-        # if sampling_info.has_custom_logit_processor:
-        #     pass
-        # TODO: Apply penalty
-        # if sampling_info.penalizer_orchestrator.is_required:
-        #     pass
-        # TODO: Apply grammar mask
-        # if vocab_mask is not None:
-        #     pass
 
         # Sample tokens. Force greedy sampling on AMD
         is_all_greedy = sampling_info.is_all_greedy
@@ -822,186 +792,6 @@ class EagleVerifyInput:
         accept_length = accept_length + 1
         verified_id = predict[accept_index]
         return predict, verified_id, accept_length, accept_index
-        unfinished_index = []
-        unfinished_accept_index = []
-        accept_index_cpu = accept_index.tolist()
-        predict_cpu = predict.tolist()
-        has_finished = False
-
-        # Iterate every accepted token and check if req has finished after append the token
-        # should be checked BEFORE free kv cache slots
-        for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
-            for j, idx in enumerate(accept_index_row):
-                if idx == -1:
-                    break
-                id = predict_cpu[idx]
-                req.output_ids.append(id)
-                req.check_finished()
-                if req.finished():
-                    has_finished = True
-                    # set all tokens after finished token to -1 and break
-                    accept_index = accept_index.at[i, j + 1 :].set(-1)
-                    break
-            if not req.finished():
-                unfinished_index.append(i)
-                if idx == -1:
-                    unfinished_accept_index.append(accept_index[i, :j])
-                else:
-                    unfinished_accept_index.append(accept_index[i])
-            req.spec_verify_ct += 1
-
-        if has_finished:
-            accept_length = (accept_index != -1).sum(axis=1) - 1
-
-        # Free the KV cache for unaccepted tokens
-        # TODO: fuse them
-        accept_index = accept_index[accept_index != -1]
-        verified_id = predict[accept_index]
-        evict_mask = jnp.full_like(self.draft_token, True, dtype=jnp.bool)
-        evict_mask = evict_mask.at[accept_index].set(False)
-
-        if page_size == 1:
-            # TODO: boolean array index leads to a device sync. Remove it.
-            token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
-        else:
-            if self.topk == 1:
-                # Only evict full empty page. Do not evict partial empty page
-                evict_mask = align_evict_mask_to_page_size(
-                    batch.seq_lens,
-                    evict_mask,
-                    page_size,
-                    self.draft_token_num,
-                )
-                token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
-            else:
-                # Shift the accepted tokens to the beginning.
-                # Only evict the last part
-                src_cache_loc, tgt_cache_loc, to_free_num_slots = get_src_tgt_cache_loc(
-                    batch.seq_lens,
-                    batch.out_cache_loc,
-                    accept_index,
-                    accept_length,
-                    self.draft_token_num,
-                    page_size,
-                )
-
-                # out_cache_loc: [0  1  2,  3  4  5,  6  7  8]
-                # accept_index:  [0  1 -1,  3  4 -1,  6 -1 -1]
-                # tgt_cache_loc: [0  1   ,  3  4   ,  6      ]
-                # to_free_slots: [      2,        5,     7  8]
-                # to_free_slots also needs to be page-aligned without the first partial page
-                #
-                # split each row of out_cache_loc into two parts.
-                # 1. the first part goes to tgt_cache_loc. length = accept_length[i] + 1
-                # 2. the second part goes to to_free_slots.
-                tgt_cache_loc, to_free_slots = get_target_cache_loc(
-                    accept_length,
-                    to_free_num_slots,
-                    batch.out_cache_loc,
-                    self.draft_token_num,
-                )
-
-                # Free the kv cache
-                token_to_kv_pool_allocator.free(to_free_slots)
-
-                # Copy the kv cache
-                batch.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
-                    tgt_cache_loc, src_cache_loc
-                )
-
-        # Construct EagleVerifyOutput
-        if not has_finished:
-            if page_size == 1 or self.topk == 1:
-                batch.out_cache_loc = batch.out_cache_loc[accept_index]
-                assign_req_to_token_pool(
-                    batch.req_pool_indices,
-                    batch.req_to_token_pool,
-                    batch.seq_lens,
-                    batch.seq_lens + accept_length + 1,
-                    batch.out_cache_loc,
-                )
-            else:
-                batch.out_cache_loc = tgt_cache_loc
-            batch.seq_lens = batch.seq_lens + (accept_length + 1)
-
-            accept_length_cpu_host = numpy.asarray(jax.device_get(accept_length), dtype=numpy.int32)
-            draft_input = EagleDraftInput(
-                hidden_states=batch.spec_info.hidden_states[accept_index],
-                verified_id=verified_id,
-                accept_length=accept_length,
-                accept_length_cpu=accept_length,
-                seq_lens_for_draft_extend=batch.seq_lens,
-                req_pool_indices_for_draft_extend=batch.req_pool_indices,
-            )
-
-            return EagleVerifyOutput(
-                draft_input=draft_input,
-                logits_output=logits_output,
-                verified_id=verified_id,
-                accept_length_per_req_cpu=accept_length_cpu_host.tolist(),
-                accepted_indices=accept_index,
-            )
-        else:
-            if page_size == 1 or self.topk == 1:
-                assign_req_to_token_pool(
-                    batch.req_pool_indices,
-                    batch.req_to_token_pool,
-                    batch.seq_lens,
-                    batch.seq_lens + accept_length + 1,
-                    batch.out_cache_loc[accept_index],
-                )
-                batch.seq_lens = batch.seq_lens + (accept_length + 1)
-
-            accept_length_cpu_host = numpy.asarray(jax.device_get(accept_length), dtype=numpy.int32)
-            accept_length_cpu = accept_length_cpu_host.tolist()
-            if len(unfinished_accept_index) > 0:
-                unfinished_accept_index = jnp.concatenate(unfinished_accept_index)
-                unfinished_index_device = jnp.array(unfinished_index, dtype=jnp.int32)
-                draft_input_accept_length_cpu = [accept_length_cpu[i] for i in unfinished_index]
-                if page_size == 1 or self.topk == 1:
-                    batch.out_cache_loc = batch.out_cache_loc[unfinished_accept_index]
-                else:
-                    batch.out_cache_loc = jnp.empty(
-                        len(unfinished_index) + sum(draft_input_accept_length_cpu),
-                        dtype=jnp.int32,
-                    )
-                    accept_length_filter = create_accept_length_filter(
-                        accept_length,
-                        unfinished_index_device,
-                        batch.seq_lens,
-                    )
-                    batch.out_cache_loc = filter_finished_cache_loc_kernel(
-                        tgt_cache_loc,
-                        accept_length,
-                        accept_length_filter,
-                    )
-
-                draft_input = EagleDraftInput(
-                    hidden_states=batch.spec_info.hidden_states[unfinished_accept_index],
-                    verified_id=predict[unfinished_accept_index],
-                    accept_length_cpu=jnp.asarray(draft_input_accept_length_cpu, dtype=jnp.int32),
-                    accept_length=accept_length[unfinished_index_device],
-                    seq_lens_for_draft_extend=batch.seq_lens[unfinished_index_device],
-                    req_pool_indices_for_draft_extend=batch.req_pool_indices[
-                        unfinished_index_device
-                    ],
-                )
-            else:
-                draft_input = EagleDraftInput.create_idle_input(
-                    hidden_size=batch.model_config.hidden_size,
-                    dtype=batch.model_config.dtype,
-                    topk=self.topk,
-                    capture_hidden_mode=CaptureHiddenMode.LAST,
-                )
-
-            return EagleVerifyOutput(
-                draft_input=draft_input,
-                logits_output=logits_output,
-                verified_id=verified_id,
-                accept_length_per_req_cpu=accept_length_cpu,
-                accepted_indices=accept_index,
-            )
-
 
 def _generate_simulated_accept_index(
     accept_index: jax.Array,

@@ -107,16 +107,20 @@ class EAGLEWorker(ModelWorker):
             self.draft_model_runner.model.set_embed_and_head(embed, head)
 
         self.model_runner.initialize_jit()
+        (
+            precompile_token_paddings,
+            precompile_bs_paddings,
+            precompile_cache_loc_paddings,
+        ) = self.target_worker.get_precompile_paddings()
+        self.precompile_bs_paddings = precompile_bs_paddings
+        self.precompile_cache_loc_paddings = precompile_cache_loc_paddings
+        self.precompile_token_paddings = precompile_token_paddings
 
     def forward_batch_speculative_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
     ):
-        # prefill : Target Extend -> Decode Extend for Update Draft State
-        # Decode : Draft → Verify → Update Draft State → Draft → Verify → ...
-
         if model_worker_batch.forward_mode.is_extend():
-
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
                 model_worker_batch,
                 len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
@@ -131,7 +135,6 @@ class EAGLEWorker(ModelWorker):
             self.draft_extend_for_prefill(
                 model_worker_batch, logits_output.hidden_states, next_token_ids
             )
-            print(f"after decode     {model_worker_batch.spec_info=}")
             # FIXME(pc) refactor this to batch output
             batch_output = GenerationBatchResult(
                 logits_output=logits_output,
@@ -140,19 +143,13 @@ class EAGLEWorker(ModelWorker):
                 bid=bid,
                 cache_miss_count=cache_miss_count
             )
-            print(f"==============={batch_output=}=========================")
             return batch_output
 
         else:
             spec_info = self.draft(model_worker_batch)
-            # verify
-            print(f"=========after draft decode==={spec_info=}===============")
             batch_output = self.verify(
                 model_worker_batch, spec_info
             )
-            print(f"=========after verify==={batch_output=}===============")
-
-            # TODO: if enable_dp_attention, add condition here
             if model_worker_batch.spec_info.verified_id.shape[0] > 0:
                 self.forward_draft_extend_after_decode(model_worker_batch, batch_output)
             return batch_output
@@ -278,40 +275,11 @@ class EAGLEWorker(ModelWorker):
 
     def verify(self, model_worker_batch: ModelWorkerBatch, spec_info: EagleVerifyInput):
         spec_info.prepare_for_verify(model_worker_batch, self.page_size, self.target_worker)
-        model_worker_batch.return_hidden_states = False
-        model_worker_batch.forward_mode = (
-            ForwardMode.TARGET_VERIFY
-            if not model_worker_batch.forward_mode.is_idle()
-            else ForwardMode.IDLE
-        )
-        model_worker_batch.spec_info = spec_info
-
-        assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
-
-        # forward
-        # sampling_metadata = SamplingMetadata.from_model_worker_batch(
-        #     model_worker_batch,
-        #     len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
-        #     self.mesh,
-        # )
         logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
             model_worker_batch, skip_sample=True
         )
         logits_output.truncate_logits_processor_output(model_worker_batch)
-
-        # TODO: support grammar mask
-        # vocab_mask = None
-        # if batch.has_grammar:
-        #     pass
-
         spec_info.hidden_states = logits_output.hidden_states
-        # res: EagleVerifyOutput = spec_info.sample(
-        #     model_worker_batch,
-        #     logits_output,
-        #     self.token_to_kv_pool_allocator,
-        #     self.page_size,
-        #     self.model_runner.rngs,
-        # )
         (
             predict,
             verified_id,
@@ -324,8 +292,6 @@ class EAGLEWorker(ModelWorker):
             self.page_size,
             self.model_runner.rngs,
         )
-        # Post process based on verified outputs.
-        # Pick indices that we care (accepted)
         logits_output.next_token_logits = logits_output.next_token_logits[accept_index]
         logits_output.hidden_states = logits_output.hidden_states[accept_index]
         new_seq_lens = model_worker_batch.seq_lens + accept_length
@@ -334,7 +300,7 @@ class EAGLEWorker(ModelWorker):
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,
             # FIXME(pc) make allocate_lens to true value
-            allocate_lens=None,
+            allocate_lens=model_worker_batch.spec_info.allocate_lens,
             hidden_states=logits_output.hidden_states
         )
         return GenerationBatchResult(
@@ -345,20 +311,6 @@ class EAGLEWorker(ModelWorker):
             # FIXME(pc) this field is for overlap
             # allocate_lens=cur_allocate_lens,
         )
-
-
-        # if model_worker_batch.return_logprob:
-        #     self.add_logprob_values(model_worker_batch, res, logits_output)
-
-        # # Prepare the batch for the next draft forwards.
-        # model_worker_batch.forward_mode = (
-        #     ForwardMode.DECODE
-        #     if not model_worker_batch.forward_mode.is_idle()
-        #     else ForwardMode.IDLE
-        # )
-        # model_worker_batch.spec_info = res.draft_input
-
-        # return logits_output, res, model_worker_batch, cache_miss_count
 
     def add_logprob_values(
         self,
@@ -452,14 +404,6 @@ class EAGLEWorker(ModelWorker):
         logits_output.next_token_logits = logits_output.next_token_logits[select_index]
         logits_output.hidden_states = logits_output.hidden_states[select_index]
         batch_output.next_draft_input = forward_batch.spec_info
-        # # Restore backup.
-        # # This is because `seq_lens` can be modified in `prepare_extend_after_decode`
-        # batch.forward_mode = ForwardMode.DECODE if not input_is_idle else ForwardMode.IDLE
-        # batch.seq_lens = seq_lens_backup
-        # batch.req_pool_indices = req_pool_indices_backup
-        # batch.spec_info.accept_length = accept_length_backup
-        # batch.return_logprob = return_logprob_backup
-
     
     def draft_forward(self, model_worker_batch: ModelWorkerBatch):
         assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
@@ -473,18 +417,6 @@ class EAGLEWorker(ModelWorker):
         )
         if self.hot_token_ids is not None:
             topk_index = self.hot_token_ids[topk_index]
-        # out_cache_loc = out_cache_loc[
-        #     : (model_worker_batch.real_bs * self.topk * self.speculative_num_steps)
-        # ].reshape(model_worker_batch.real_bs, self.topk, self.speculative_num_steps)
-        # out_cache_loc = jnp.transpose(out_cache_loc, (2, 0, 1)).reshape(
-        #     self.speculative_num_steps, -1
-        # )
-        (
-            precompile_token_paddings,
-            precompile_bs_paddings,
-            precompile_cache_loc_paddings,
-        ) = self.target_worker.get_precompile_paddings()
-
         # Return values
         score_list: list[jax.Array] = []
         token_list: list[jax.Array] = []
@@ -492,10 +424,8 @@ class EAGLEWorker(ModelWorker):
         # Forward multiple steps
         scores = None
         # Save original positions to avoid buffer donation issues
-        original_positions = jnp.array(model_worker_batch.positions)
+        original_positions = np.array(model_worker_batch.positions)
         for i in range(self.speculative_num_steps):
-            print(f"-----1111---{hidden_states.shape=}------------")
-
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
@@ -506,22 +436,16 @@ class EAGLEWorker(ModelWorker):
 
             if i == self.speculative_num_steps - 1:
                 break
-
+            # FIXME(pc) this should always be forward_batch ? beacuse it has same shape
             model_worker_batch.input_ids = input_ids
             model_worker_batch.spec_info.hidden_states = hidden_states
-            print("f---------------------")
-            print(f"-----2222---{input_ids.shape=}----------{hidden_states.shape=}------------")
-            print("f---------------------")
-
-            model_worker_batch.out_cache_loc = out_cache_loc[i]
             model_worker_batch.positions = original_positions + 1 + i
             model_worker_batch.padding_model_worker_batch(
-                precompile_token_paddings, precompile_bs_paddings, precompile_cache_loc_paddings
+                self.precompile_token_paddings, self.precompile_bs_paddings, self.precompile_cache_loc_paddings
             )
             self.draft_model_runner.attn_backend.forward_metadata = (
                 self.draft_model_runner.attn_backend.get_forward_metadata(model_worker_batch, i)
             )
-            # spec_info.hidden_states = hidden_states
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
             # Run forward
             logits_output, _ = self.draft_model_runner.forward(
@@ -530,7 +454,6 @@ class EAGLEWorker(ModelWorker):
                     model_worker_batch, self.draft_model_runner.mesh
                 ),
             )
-            # self._detect_nan_if_needed(logits_output)
             topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
             if self.hot_token_ids is not None:
                 topk_index = self.hot_token_ids[topk_index]
@@ -678,7 +601,7 @@ def fast_topk(values, topk, axis=-1):
 
     return result_vals, result_indices
 
-
+# FIXME(pc) this should be jitted or convert as np.ndarray
 def select_top_k_tokens(
     i: int,
     topk_p: jax.Array,
