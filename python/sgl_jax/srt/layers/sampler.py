@@ -1,11 +1,12 @@
+from functools import partial
+from typing import List, Optional
+
 import jax
 import numpy as np
 from flax import nnx
 from jax import lax
 from jax import numpy as jnp
 from jax import random
-from jax.sharding import Mesh, NamedSharding
-from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
@@ -27,9 +28,7 @@ class Sampler(nnx.Module):
 
     def _regular_sampling(self, operands):
         """Regular sampling branch"""
-        logits, sampling_metadata, positions, rng, mesh = operands
-
-        logits = lax.with_sharding_constraint(logits, NamedSharding(mesh, P(None, None)))
+        logits, sampling_metadata, positions, rng = operands
 
         # Validate broadcast compatibility for temperature division
         logits_batch_size = logits.shape[0]
@@ -41,7 +40,9 @@ class Sampler(nnx.Module):
         ), f"Temperature batch size {temperatures_shape[0]} doesn't match logits batch size {logits_batch_size}"
 
         # Post process logits
-        processed_logits = jnp.divide(logits, sampling_metadata.temperatures).astype(logits.dtype)
+        processed_logits = jnp.divide(logits, sampling_metadata.temperatures).astype(
+            logits.dtype
+        )
 
         probs = jax.nn.softmax(processed_logits, axis=-1)
 
@@ -90,19 +91,18 @@ class Sampler(nnx.Module):
         return None
 
     def _apply_linear_penalty(self, operands):
-        """
-        Args:
-            logits: The input logits tensor of shape [batch_size, vocab_size]
-            sampling_metadata: Metadata containing penalty information (never None)
-
-        Returns:
-            Modified logits with penalties applied
-        """
+        """Apply linear penalty branch (overlap mode)"""
         logits, sampling_metadata = operands
         penalty = sampling_metadata.linear_penalty
 
         # Validate penalty shape matches logits when penalty exists
-        penalty = penalty.astype(logits.dtype)
+        if penalty is not None:
+            assert (
+                penalty.shape == logits.shape
+            ), f"Linear penalty shape {penalty.shape} doesn't match logits shape {logits.shape}"
+            penalty = penalty.astype(logits.dtype)
+        else:
+            penalty = jnp.array(0.0, dtype=logits.dtype)
 
         return logits + penalty
 
@@ -131,12 +131,38 @@ class Sampler(nnx.Module):
 
         return logits + stop_penalty.astype(logits.dtype)
 
+    def apply_penalties(
+        self, logits: jax.Array, sampling_metadata: SamplingMetadata
+    ) -> jax.Array:
+        """
+        Apply penalties to logits with JIT-optimized tensor operations using lax.cond.
+
+        This method handles penalty application efficiently for both overlap and
+        non-overlap modes by using lax.cond to ensure compilation-time optimization
+        of different penalty application paths.
+
+        Args:
+            logits: The input logits tensor of shape [batch_size, vocab_size]
+            sampling_metadata: Metadata containing penalty information (never None)
+
+        Returns:
+            Modified logits with penalties applied
+        """
+
+        result_logits = lax.cond(
+            sampling_metadata.do_penalties,
+            self._apply_linear_penalty,
+            lambda operands: operands[0],  # Return logits
+            (logits, sampling_metadata),
+        )
+
+        return result_logits
+
     def __call__(
         self,
         logits_output: LogitsProcessorOutput,
         sampling_metadata: SamplingMetadata,
         positions: jax.Array,
-        mesh: Mesh,
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
 
@@ -145,21 +171,22 @@ class Sampler(nnx.Module):
             sampling_metadata: Metadata for sampling
             positions: The positions of the tokens in the sequence.
         """
-        # Apply penalties before sampling
-        logits = lax.cond(
-            sampling_metadata.do_penalties,
-            self._apply_linear_penalty,
-            lambda operands: operands[0],
-            (logits_output.next_token_logits, sampling_metadata),
+
+        logits = jnp.reshape(
+            logits_output.next_token_logits,
+            (-1, logits_output.next_token_logits.shape[-1]),
         )
 
+        # Apply penalties before sampling
+        logits = self.apply_penalties(logits, sampling_metadata)
+
         _, rng = jax.random.split(self.rngs.params())
+
         operands = (logits, sampling_metadata, positions, rng)
-        regular_fn = lambda op: self._regular_sampling((*op, mesh))
         batch_next_token_ids, logprobs = lax.cond(
             sampling_metadata.is_all_greedy,
             self._greedy_sampling,
-            regular_fn,
+            self._regular_sampling,
             operands,
         )
 
@@ -179,7 +206,7 @@ class Sampler(nnx.Module):
         return batch_next_token_ids
 
 
-def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: list[int]):
+def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: List[int]):
     max_k = max(top_logprobs_nums)
     values, indices = jax.lax.top_k(logprobs, max_k)
     values = values.tolist()
@@ -193,7 +220,7 @@ def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: list[int]):
     return output_top_logprobs_val, output_top_logprobs_idx
 
 
-def get_token_ids_logprobs(logprobs: jax.Array, token_ids_logprobs: list[list[int]]):
+def get_token_ids_logprobs(logprobs: jax.Array, token_ids_logprobs: List[List[int]]):
     output_token_ids_logprobs_val = []
     output_token_ids_logprobs_idx = []
     for i, token_ids in enumerate(token_ids_logprobs):
@@ -364,118 +391,3 @@ def top_p_normalize_probs_jax(
     num_tokens, _ = probs.shape
     row_idx = jnp.arange(num_tokens)[:, None]  # [B, 1], broadcast over H
     return jnp.zeros_like(probs).at[row_idx, probs_idx].set(probs_sort)
-<<<<<<< HEAD
-
-
-def _apply_min_p_filter(operands):
-    """Apply min_p filtering when need_min_p_sampling=True"""
-    inputs, min_ps = operands
-
-    if is_tpu_runtime():
-        max_per_bs = jnp.max(inputs, axis=1)
-        min_p_thresholds = max_per_bs * min_ps
-    else:
-        min_p_thresholds = inputs[:, 0] * min_ps
-    min_p_mask = inputs < min_p_thresholds.reshape(-1, 1)
-    return jnp.where(min_p_mask, 0.0, inputs)
-
-
-def top_k_top_p_min_p_sampling_from_probs_jax(args):
-    if is_tpu_runtime():
-        return top_k_top_p_min_p_sampling_from_probs_jax_tpu_runtime(args)
-    return top_k_top_p_min_p_sampling_from_probs_jax_not_tpu_runtime(args)
-
-
-def top_k_top_p_min_p_sampling_from_probs_jax_tpu_runtime(args):
-    (
-        logits,
-        _,
-        top_ks,
-        top_ps,
-        min_ps,
-        positions,
-        temperatures,
-        sampling_seeds,
-        need_min_p_sampling,
-        rng,
-    ) = args
-    logits = logits.astype(jnp.float32)
-    logits = topk_mask(logits, top_ks, replace_val=-1e12)
-    logits = topp_mask(logits, top_ps, replace_val=-1e12)
-
-    temperatures = temperatures.astype(logits.dtype)
-    logits = jnp.divide(logits, temperatures)
-
-    min_p_operands = (logits, min_ps)
-    logits = lax.cond(
-        need_min_p_sampling,
-        _apply_min_p_filter,
-        lambda operands: operands[0],
-        min_p_operands,
-    )
-
-    multinomial_operands = (logits, sampling_seeds, positions, rng)
-    sampled_index = lax.cond(
-        sampling_seeds is not None,
-        multinomial_with_seed,
-        multinomial,
-        multinomial_operands,
-    )
-
-    return sampled_index.flatten()
-
-
-def top_k_top_p_min_p_sampling_from_probs_jax_not_tpu_runtime(args):
-    (
-        _,
-        probs,
-        top_ks,
-        top_ps,
-        min_ps,
-        positions,
-        temperatures,
-        sampling_seeds,
-        need_min_p_sampling,
-        rng,
-    ) = args
-    # 1) Use jax.pure_callback to compute robust descending indices on CPU
-    out_spec = jnp.empty(probs.shape, dtype=jnp.int32)
-    probs_idx = jax.pure_callback(
-        _get_sorted_indices_np,
-        out_spec,
-        probs,
-        vmap_method="legacy_vectorized",
-    )
-    # 2) Gather with sanitized probabilities (map NaNs/Infs to 0)
-    sanitized_probs = jnp.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
-    assert probs_idx.shape == sanitized_probs.shape and probs_idx.dtype == jnp.int32
-    probs_sort = jnp.take_along_axis(sanitized_probs, probs_idx, axis=-1)
-    probs_sum = jnp.cumsum(probs_sort, axis=-1)
-
-    top_k_mask = jnp.arange(0, probs.shape[-1]).reshape(1, -1) >= top_ks.reshape(-1, 1)
-    probs_sort = jnp.where(top_k_mask, 0.0, probs_sort)
-
-    top_p_mask = (probs_sum - probs_sort) > top_ps.reshape(-1, 1)
-    probs_sort = jnp.where(top_p_mask, 0.0, probs_sort)
-
-    # Use lax.cond to avoid recompilation due to need_min_p_sampling changes
-    min_p_operands = (probs_sort, min_ps)
-    probs_sort = lax.cond(
-        need_min_p_sampling,
-        _apply_min_p_filter,
-        lambda operands: operands[0],  # No min_p filtering, just return probs_sort
-        min_p_operands,
-    )
-
-    multinomial_operands = (probs_sort, sampling_seeds, positions, rng)
-    sampled_index = lax.cond(
-        sampling_seeds is not None,
-        multinomial_with_seed,
-        multinomial,
-        multinomial_operands,
-    )
-
-    probs_idx = probs_idx.astype(jnp.int32)
-    return jnp.take_along_axis(probs_idx, axis=1, indices=sampled_index).flatten()
-=======
->>>>>>> parent of 7e6cad9 (use topk_mask and topp_mask to replace sort when sampling (#245))
