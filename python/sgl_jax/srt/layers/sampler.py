@@ -223,7 +223,7 @@ def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: list[int]):
     for i, k in enumerate(top_logprobs_nums):
         output_top_logprobs_val.append(values[i][:k])
         output_top_logprobs_idx.append(indices[i][:k])
-    return output_top_logprobs_val, output_top_logprobs_idx
+    return jnp.array(output_top_logprobs_val), jnp.array(output_top_logprobs_idx)
 
 
 def get_token_ids_logprobs(logprobs: jax.Array, token_ids_logprobs: list[list[int]]):
@@ -231,13 +231,13 @@ def get_token_ids_logprobs(logprobs: jax.Array, token_ids_logprobs: list[list[in
     output_token_ids_logprobs_idx = []
     for i, token_ids in enumerate(token_ids_logprobs):
         if token_ids is not None:
-            output_token_ids_logprobs_val.append(logprobs[i, token_ids].tolist())
+            output_token_ids_logprobs_val.append(logprobs[i, token_ids])
             output_token_ids_logprobs_idx.append(token_ids)
         else:
             output_token_ids_logprobs_val.append([])
             output_token_ids_logprobs_idx.append([])
 
-    return output_token_ids_logprobs_val, output_token_ids_logprobs_idx
+    return jnp.array(output_token_ids_logprobs_val), jnp.array(output_token_ids_logprobs_idx)
 
 
 def multinomial(

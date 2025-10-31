@@ -495,7 +495,7 @@ class ModelWorker:
                     positions_device,
                 )
                 sample_cache_miss_count = count()
-        print(f'logits_output. {logits_output}, {new_logits_output}')
+        # print(f'logits_output. {logits_output}, {new_logits_output}')
         if new_logits_output is not None:
             logits_output = new_logits_output
             if logits_output.next_token_top_logprobs_val is not None:

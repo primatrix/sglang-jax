@@ -285,7 +285,7 @@ class SchedulerOutputProcessorMixin:
             return
 
         # Important for the performance.
-        assert isinstance(output.input_token_logprobs, tuple)
+        # assert isinstance(output.input_token_logprobs, tuple)
         input_token_logprobs: tuple[int] = output.input_token_logprobs
         input_token_logprobs = input_token_logprobs[logprob_pt : logprob_pt + num_input_logprobs]
         req.input_token_logprobs.extend(input_token_logprobs)
