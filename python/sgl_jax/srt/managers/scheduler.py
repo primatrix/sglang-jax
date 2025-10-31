@@ -91,13 +91,12 @@ class ReceiveDataError(Exception):
 class GenerationBatchResult:
     logits_output: LogitsProcessorOutput | None
     next_token_ids: list[int] | None  # on device
-    extend_input_len_per_req: list[int]
-    extend_logprob_start_len_per_req: list[int]
     bid: int
     cache_miss_count: int
-
     # relay path: forward stream -> next step forward
     next_draft_input: EagleDraftInput | None = None
+    extend_input_len_per_req: list[int] | None = None
+    extend_logprob_start_len_per_req: list[int] | None = None
 
 
 class Scheduler(
@@ -939,16 +938,10 @@ class Scheduler(
                 skip_padding=True,
             )
             print(f"====={model_worker_batch.forward_mode=}==========")
-            (
-                model_worker_batch,
-                logits_output,
-                next_token_ids,
-                accept_length,
-                cache_miss_count,
-            ) = self.draft_worker.forward_batch_speculative_generation(model_worker_batch)
-        bid = model_worker_batch.bid
-        batch.output_ids = next_token_ids
-
+            batch_output = self.draft_worker.forward_batch_speculative_generation(model_worker_batch)
+        bid = batch_output.bid
+        batch.output_ids = batch_output.next_token_ids
+        print(f"{batch.output_ids=}")
         # These 2 values are needed for processing the output, but the values can be
         # modified by overlap schedule. So we have to copy them here so that
         # we can use the correct values in output processing.
@@ -962,15 +955,13 @@ class Scheduler(
             extend_logprob_start_len_per_req = None
 
         ret = GenerationBatchResult(
-            logits_output=logits_output,
-            next_token_ids=next_token_ids.tolist(),
+            logits_output=batch_output.logits_output,
+            next_token_ids=batch_output.next_token_ids.tolist(),
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             bid=bid,
-            cache_miss_count=cache_miss_count,
-            next_draft_input=(
-                model_worker_batch.spec_info if not self.spec_algorithm.is_none() else None
-            ),
+            cache_miss_count=batch_output.cache_miss_count,
+            next_draft_input=batch_output.next_draft_input,
         )
 
         return ret

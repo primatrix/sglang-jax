@@ -4,8 +4,8 @@ import copy
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any
-
+from typing import Any, ClassVar, TYPE_CHECKING
+import numpy as np
 import jax
 import jax.numpy as jnp
 import numpy
@@ -13,6 +13,9 @@ from flax import nnx
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
+from sgl_jax.srt.utils.common_utils import next_power_of_2
+if TYPE_CHECKING:
+    from sgl_jax.srt.managers.scheduler import GenerationBatchResult
 from sgl_jax.srt.managers.schedule_batch import (
     ModelWorkerBatch,
     ScheduleBatch,
@@ -25,7 +28,7 @@ from sgl_jax.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
 )
-from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode,ForwardMode,ForwardBatch
 from sgl_jax.srt.speculative.pallas.kernel import (
     align_evict_mask_to_page_size,
     assign_req_to_token_pool,
@@ -281,6 +284,9 @@ def build_tree_kernel_efficient(
 @register_pytree_node_class
 @dataclass
 class EagleDraftInput:
+    # Constant: alloc length per decode step
+    ALLOC_LEN_PER_DECODE: ClassVar[int] = None
+    
     # The inputs for decode
     # shape: (b, topk)
     topk_p: jax.Array = None
@@ -308,6 +314,13 @@ class EagleDraftInput:
     # shape: (b,)
     seq_lens_for_draft_extend: jax.Array = None
     req_pool_indices_for_draft_extend: jax.Array = None
+    # todo some fields is unuseful
+    
+    # Inputs for V2 overlap worker
+    # future_indices: Optional[FutureIndices] = None
+    allocate_lens: jax.Array | None = None
+    new_seq_lens: jax.Array | None = None
+    # verify_done: Optional[torch.cuda.Event] = None
 
     def tree_flatten(self):
         accept_length_cpu_arr = (
@@ -359,7 +372,7 @@ class EagleDraftInput:
 
         return obj
 
-    def prepare_for_extend(self, model_worker_batch: ModelWorkerBatch):
+    def prepare_for_extend_after_target_prefill(self, model_worker_batch: ModelWorkerBatch):
 
         if model_worker_batch.forward_mode.is_idle():
             return
@@ -378,6 +391,74 @@ class EagleDraftInput:
             model_worker_batch.input_ids[pt + extend_len - 1] = self.verified_id[i]
             pt += extend_len
 
+    def prepare_for_decode(self, schedule_batch: ScheduleBatch):
+        new_allocate_lens = schedule_batch.seq_lens + self.ALLOC_LEN_PER_DECODE
+        self.allocate_lens = new_allocate_lens
+        
+        # TODO(pc) implement overlap here
+        # schedule_batch.maybe_wait_verify_done()
+        bs = schedule_batch.batch_size()
+        
+        page_size = schedule_batch.token_to_kv_pool_allocator.page_size
+        
+        if page_size == 1:
+            new_allocate_lens = schedule_batch.seq_lens + self.ALLOC_LEN_PER_DECODE
+            num_needed_tokens = (new_allocate_lens - self.allocate_lens).sum().item()
+            out_cache_loc = alloc_token_slots(schedule_batch.tree_cache, num_needed_tokens)
+        else:
+            last_loc = get_last_loc(
+                schedule_batch.req_to_token_pool.req_to_token,
+                schedule_batch.req_pool_indices,
+                self.allocate_lens,
+            )
+            new_allocate_lens = schedule_batch.seq_lens + self.ALLOC_LEN_PER_DECODE
+            new_allocate_lens_cpu = new_allocate_lens.cpu()
+            allocate_lens_cpu = self.allocate_lens.cpu()
+            extend_num_tokens = sum(new_allocate_lens_cpu - allocate_lens_cpu).item()
+            out_cache_loc = alloc_paged_token_slots_extend(
+                schedule_batch.tree_cache,
+                self.allocate_lens,
+                allocate_lens_cpu,
+                new_allocate_lens,
+                new_allocate_lens_cpu,
+                last_loc,
+                extend_num_tokens,
+            )
+
+        assign_req_to_token_pool[(bs,)](
+            schedule_batch.req_pool_indices,
+            schedule_batch.req_to_token_pool.req_to_token,
+            self.allocate_lens,
+            new_allocate_lens,
+            out_cache_loc,
+            schedule_batch.req_to_token_pool.req_to_token.shape[1],
+            next_power_of_2(bs),
+        )
+        self.allocate_lens = new_allocate_lens
+
+        # FIXME(lsyin): make this sync optional
+        # schedule_batch.seq_lens_cpu = schedule_batch.seq_lens
+        schedule_batch.seq_lens_sum = np.sum(schedule_batch.seq_lens).item()
+        
+    def prepare_for_extend_after_verify(self, model_worker_batch: ModelWorkerBatch, predict: jax.Array, num_draft_tokens:int, draft_model_runner: Any, batch_output:GenerationBatchResult):
+        seq_lens_cpu_ = model_worker_batch.seq_lens_cpu
+        extend_num_tokens = len(model_worker_batch.seq_lens) * num_draft_tokens
+
+        model_worker_batch.spec_info = self
+        model_worker_batch.input_ids = predict
+        model_worker_batch.seq_lens = model_worker_batch.seq_lens + num_draft_tokens
+        model_worker_batch.seq_lens_cpu = model_worker_batch.seq_lens_cpu + num_draft_tokens
+        model_worker_batch.seq_lens_sum += extend_num_tokens
+        model_worker_batch.extend_seq_lens = [num_draft_tokens for _ in range(len(model_worker_batch.seq_lens))]
+        model_worker_batch.extend_prefix_lens = seq_lens_cpu_.tolist()
+        model_worker_batch.extend_num_tokens = extend_num_tokens
+        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
+        model_worker_batch.spec_info.hidden_states = batch_output.next_draft_input.hidden_states
+        forward_batch = ForwardBatch.init_new(model_worker_batch, draft_model_runner)
+        draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+        return forward_batch
+    
     @classmethod
     def create_idle_input(
         cls,
@@ -395,7 +476,8 @@ class EagleDraftInput:
             accept_length=jnp.empty((0,), dtype=jnp.int32),
             accept_length_cpu=jnp.empty((0,), dtype=jnp.int32),
         )
-
+        
+    @DeprecationWarning
     def prepare_extend_after_decode(
         self,
         batch: ScheduleBatch,
@@ -577,7 +659,7 @@ class EagleVerifyInput:
             )
         else:
             last_loc = get_last_loc(
-                target_worker.req_to_token_pool.req_to_token,
+                target_worker.model_runner.req_to_token_pool.req_to_token,
                 model_worker_batch.req_pool_indices,
                 prefix_lens,
             )
@@ -592,15 +674,15 @@ class EagleVerifyInput:
 
         assign_req_to_token_pool(
             model_worker_batch.req_pool_indices,
-            model_worker_batch.req_to_token_pool,
+            target_worker.model_runner.req_to_token_pool,
             model_worker_batch.seq_lens,
             seq_lens_with_draft_token,
             model_worker_batch.out_cache_loc,
         )
 
-    def verify(
+    def sample(
         self,
-        batch: ScheduleBatch,
+        model_worker_batch: ModelWorkerBatch,
         logits_output: LogitsProcessorOutput,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
@@ -617,11 +699,11 @@ class EagleVerifyInput:
         tokens. I.e., logits_output.next_token_logits only contains
         accepted token logits.
         """
-        if batch.forward_mode.is_idle():
+        if model_worker_batch.forward_mode.is_idle():
             return EagleVerifyOutput(
                 draft_input=EagleDraftInput.create_idle_input(
-                    hidden_size=batch.model_config.hidden_size,
-                    dtype=batch.model_config.dtype,
+                    hidden_size=model_worker_batch.model_config.hidden_size,
+                    dtype=model_worker_batch.model_config.dtype,
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 ),
@@ -637,7 +719,7 @@ class EagleVerifyInput:
 
         bs = self.retrive_index.shape[0]
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
-        sampling_info = batch.sampling_info
+        sampling_info = model_worker_batch.sampling_info
 
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
@@ -734,6 +816,9 @@ class EagleVerifyInput:
                 rng=rng,
             )
 
+        accept_length = accept_length + 1
+        verified_id = predict[accept_index]
+        return predict, verified_id, accept_length, accept_index
         unfinished_index = []
         unfinished_accept_index = []
         accept_index_cpu = accept_index.tolist()

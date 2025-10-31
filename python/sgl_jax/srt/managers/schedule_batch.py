@@ -856,10 +856,14 @@ class ScheduleBatch:
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
-        if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
+        if self.spec_algorithm.is_eagle():
             # if spec decoding is used, the decode batch is prepared inside
             # `forward_batch_speculative_generation` after running draft models.
-            return
+            draft_input: EagleDraftInput = self.spec_info
+            draft_input.prepare_for_decode(self)
+        
+        if not self.spec_algorithm.is_none():
+            return 
 
         if self.sampling_info.penalizer_orchestrator.is_required:
             if self.enable_overlap:
