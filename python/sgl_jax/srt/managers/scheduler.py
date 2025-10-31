@@ -98,6 +98,10 @@ class GenerationBatchResult:
     extend_input_len_per_req: list[int] | None = None
     extend_logprob_start_len_per_req: list[int] | None = None
 
+    allocate_lens: np.ndarray | None = None
+    num_accepted_tokens: int | None = None
+    accept_lens: np.ndarray | None = None
+
 
 class Scheduler(
     SchedulerOutputProcessorMixin,
@@ -938,7 +942,9 @@ class Scheduler(
                 skip_padding=True,
             )
             print(f"====={model_worker_batch.forward_mode=}==========")
-            batch_output = self.draft_worker.forward_batch_speculative_generation(model_worker_batch)
+            batch_output = self.draft_worker.forward_batch_speculative_generation(
+                model_worker_batch
+            )
         bid = batch_output.bid
         batch.output_ids = batch_output.next_token_ids
         print(f"{batch.output_ids=}")

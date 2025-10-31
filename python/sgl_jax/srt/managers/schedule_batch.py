@@ -102,6 +102,18 @@ class FINISH_MATCHED_STR(BaseFinishReason):
         }
 
 
+class FINISHED_MATCHED_REGEX(BaseFinishReason):
+    def __init__(self, matched: str):
+        super().__init__()
+        self.matched = matched
+
+    def to_json(self):
+        return {
+            "type": "stop",  # to match OpenAI API's return value
+            "matched": self.matched,
+        }
+
+
 class FINISH_LENGTH(BaseFinishReason):
     def __init__(self, length: int):
         super().__init__()
@@ -146,6 +158,7 @@ class Req:
         origin_input_ids_unpadded: tuple[int] | None = None,
         eos_token_ids: set[int] | None = None,
         vocab_size: int | None = None,
+        return_hidden_states: bool = False,
     ):
         # Input and output info
         self.rid = rid
@@ -163,6 +176,7 @@ class Req:
 
         # Sampling info
         self.sampling_params = sampling_params
+        self.return_hidden_states = return_hidden_states
 
         # Memory pool info
         self.req_pool_idx: int | None = None
@@ -170,6 +184,7 @@ class Req:
         # Check finish
         self.tokenizer = None
         self.finished_reason = None
+        self.finished_len = None
         # Whether this request has finished output
         self.finished_output = None
         # If we want to abort the request in the middle of the event loop, set this to true
@@ -342,7 +357,7 @@ class Req:
         all_ids = self.origin_input_ids_unpadded + self.output_ids
         return all_ids[self.surr_offset :], self.read_offset - self.surr_offset
 
-    def check_finished(self):
+    def check_finished(self, new_accepted_len: int = 1):
         if self.finished():
             return
 
@@ -356,39 +371,58 @@ class Req:
             self.finished_reason = FINISH_LENGTH(length=self.sampling_params.max_new_tokens)
             return
 
-        last_token_id = self.output_ids[-1]
-        if hasattr(last_token_id, "item"):
-            last_token_id = last_token_id.item()
-        last_token_id = int(last_token_id)
-        if not self.sampling_params.ignore_eos:
-            matched_eos = False
+        new_accepted_tokens = self.output_ids[-new_accepted_len:]
+        # if hasattr(last_token_id, "item"):
+        #     last_token_id = last_token_id.item()
+        # last_token_id = int(last_token_id)
+        if self._check_token_based_finish(new_accepted_tokens=new_accepted_tokens):
+            return
 
-            # Check stop token ids
+        if self._check_vocab_boundary_finish(new_accepted_tokens):
+            return
+
+        if self._check_str_based_finish():
+            return
+
+    def _check_vocab_boundary_finish(self, new_accepted_tokens: list[int]) -> bool:
+        for i, token_id in enumerate(new_accepted_tokens):
+            if self.vocab_size is not None and (token_id > self.vocab_size or token_id < 0):
+                if self.sampling_params.stop_token_ids:
+                    self.output_ids[-1] = next(iter(self.sampling_params.stop_token_ids))
+                elif self.eos_token_ids:
+                    self.output_ids[-1] = next(iter(self.eos_token_ids))
+                self.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
+                return True
+        return False
+
+    def _check_token_based_finish(self, new_accepted_tokens: list[int]) -> bool:
+        if self.sampling_params.ignore_eos:
+            return False
+        matched_eos = False
+        # Check stop token ids
+        for i, token_id in enumerate(new_accepted_tokens):
             if self.sampling_params.stop_token_ids:
-                matched_eos = last_token_id in self.sampling_params.stop_token_ids
+                matched_eos |= token_id in self.sampling_params.stop_token_ids
             if self.eos_token_ids:
                 if any(hasattr(token_id, "item") for token_id in self.eos_token_ids):
                     self.eos_token_ids = {
                         (int(token_id.item()) if hasattr(token_id, "item") else int(token_id))
                         for token_id in self.eos_token_ids
                     }
-                matched_eos |= last_token_id in self.eos_token_ids
+                matched_eos |= token_id in self.eos_token_ids
             if self.tokenizer is not None:
-                matched_eos |= last_token_id == self.tokenizer.eos_token_id
+                matched_eos |= token_id == self.tokenizer.eos_token_id
                 if self.tokenizer.additional_stop_token_ids:
-                    matched_eos |= last_token_id in self.tokenizer.additional_stop_token_ids
+                    matched_eos |= token_id in self.tokenizer.additional_stop_token_ids
             if matched_eos:
-                self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
-                return
+                self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
+                matched_pos = len(self.output_ids) - len(new_accepted_tokens) + i
+                self.finished_len = matched_pos + 1
+                return True
 
-        if self.vocab_size is not None and (last_token_id > self.vocab_size or last_token_id < 0):
-            if self.sampling_params.stop_token_ids:
-                self.output_ids[-1] = next(iter(self.sampling_params.stop_token_ids))
-            elif self.eos_token_ids:
-                self.output_ids[-1] = next(iter(self.eos_token_ids))
-            self.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
-            return
+        return False
 
+    def _check_str_based_finish(self):
         # Check stop strings
         if len(self.sampling_params.stop_strs) > 0:
             tail_str = self.tokenizer.decode(
@@ -398,7 +432,8 @@ class Req:
             for stop_str in self.sampling_params.stop_strs:
                 if stop_str in tail_str or stop_str in self.decoded_text:
                     self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
-                    return
+                    return True
+        return False
 
     def reset_for_retract(self):
         self.prefix_indices = []
@@ -861,9 +896,9 @@ class ScheduleBatch:
             # `forward_batch_speculative_generation` after running draft models.
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
-        
+
         if not self.spec_algorithm.is_none():
-            return 
+            return
 
         if self.sampling_info.penalizer_orchestrator.is_required:
             if self.enable_overlap:
