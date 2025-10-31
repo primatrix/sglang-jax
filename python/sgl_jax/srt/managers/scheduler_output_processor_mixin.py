@@ -170,6 +170,7 @@ class SchedulerOutputProcessorMixin:
         for i, req in enumerate(batch.reqs):
             predict_tokens.append(next_token_ids[i * stride : i * stride + accept_lens[i]])
             req.spec_verify_ct += 1
+            req.spec_accepted_tokens += accept_lens[i]
 
         return predict_tokens
 
@@ -481,6 +482,8 @@ class SchedulerOutputProcessorMixin:
         prompt_tokens = []
         completion_tokens = []
         cached_tokens = []
+        spec_verify_ct = []
+        spec_accepted_tokens = []
         output_hidden_states = None
 
         if return_logprob:
@@ -556,6 +559,10 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(req.output_ids))
                 cached_tokens.append(req.cached_tokens)
+
+                if not self.spec_algorithm.is_none():
+                    spec_verify_ct.append(req.spec_verify_ct)
+                    spec_accepted_tokens.append(req.spec_accepted_tokens)
 
                 if return_logprob:
                     if req.return_logprob and not req.input_logprob_sent:

@@ -278,10 +278,13 @@ class Req:
         # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0
         self.already_computed = 0
-
         # The number of verification forward passes in the speculative decoding.
         # This is used to compute the average acceptance length per request.
         self.spec_verify_ct = 0
+
+        # The number of accepted tokens in speculative decoding for this request.
+        # This is used to compute the acceptance rate and average acceptance length per request.
+        self.spec_accepted_tokens = 0
 
         # For metrics
         self.has_log_time_stats: bool = False
@@ -986,6 +989,14 @@ class ScheduleBatch:
         self.has_stream = any(req.stream for req in self.reqs)
 
         self.sampling_info.filter_batch(np.array(keep_indices))
+        if self.spec_info is not None:
+            if chunked_req_to_exclude is not None and len(chunked_req_to_exclude) > 0:
+                has_been_filtered = False
+            else:
+                has_been_filtered = True
+            self.spec_info.filter_batch(
+                new_indices=keep_indices, has_been_filtered=has_been_filtered
+            )
 
     def merge_batch(self, other: ScheduleBatch):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
