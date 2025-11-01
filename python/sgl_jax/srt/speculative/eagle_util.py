@@ -386,11 +386,10 @@ class EagleDraftInput:
 
         pt = 0
         for i in range(model_worker_batch.real_bs):
-            extend_len = model_worker_batch.seq_lens[i]
+            extend_len = model_worker_batch.extend_seq_lens[i]
             input_ids = model_worker_batch.input_ids[pt : pt + extend_len]
             # TODO: batch.input_ids should on tpu
-            model_worker_batch.input_ids[pt : pt + extend_len - 1] = input_ids[1:]
-            model_worker_batch.input_ids[pt + extend_len - 1] = self.verified_id[i]
+            model_worker_batch.input_ids[pt : pt + extend_len] = np.concatenate(input_ids[1:], self.verified_id[i].reshape(1))
             pt += extend_len
 
     def prepare_for_extend_after_verify(
