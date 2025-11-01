@@ -404,11 +404,13 @@ class EagleDraftInput:
         seq_lens_cpu_ = model_worker_batch.seq_lens
 
         model_worker_batch.spec_info = self
-        model_worker_batch.input_ids = batch_output.next_draft_input.verified_id
+        verified_id = batch_output.next_draft_input.verified_id
+        verified_id = verified_id[verified_id != 0].flatten()
+        model_worker_batch.input_ids = verified_id
         model_worker_batch.seq_lens = model_worker_batch.seq_lens + num_draft_tokens
-        model_worker_batch.extend_seq_lens = [
-            num_draft_tokens for _ in range(len(model_worker_batch.seq_lens))
-        ]
+        model_worker_batch.extend_seq_lens = jnp.array(
+            [num_draft_tokens for _ in range(len(model_worker_batch.seq_lens))]
+        )
         model_worker_batch.extend_prefix_lens = seq_lens_cpu_.tolist()
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
@@ -804,7 +806,8 @@ class EagleVerifyInput:
             )
 
         accept_length = accept_length + 1
-        # accept_index = np.concatenate(accept_index, axis=-1)
+        accept_index = np.concatenate(accept_index, axis=-1)
+        accept_index = accept_index[accept_index != -1]
         verified_id = predict[accept_index]
         print(f"==========={predict=}=============")
 

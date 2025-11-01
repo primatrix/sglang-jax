@@ -161,7 +161,7 @@ class SchedulerOutputProcessorMixin:
     ) -> list[list[int]]:
         """Resolve the padding next token ids for speculative decoding with overlap."""
 
-        next_token_ids = result.next_token_ids.tolist()
+        next_token_ids = result.next_token_ids
         accept_lens = result.accept_lens.tolist()
         result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
 

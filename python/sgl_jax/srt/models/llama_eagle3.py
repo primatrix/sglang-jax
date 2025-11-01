@@ -194,12 +194,12 @@ class LlamaEagleModel(LlamaModel):
         if forward_batch.spec_info is None or forward_batch.spec_info.hidden_states is None:
             raise ValueError("EAGLE3 draft model expects speculative hidden states.")
         hidden_states = forward_batch.spec_info.hidden_states
-        print(f"=========={hidden_states.shape=}=============")
-        print(f"=========={embeds.shape=}=============")
 
         if hidden_states.shape[-1] != embeds.shape[-1]:
             hidden_states = self.fc(hidden_states)[0]
 
+        print(f"=========={hidden_states.shape=}=============")
+        print(f"=========={embeds.shape=}=============")
         residual = None
         hidden_states, residual, kv_fused = self.midlayer(
             positions=positions,

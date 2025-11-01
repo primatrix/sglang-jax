@@ -309,8 +309,8 @@ class EAGLEWorker(ModelWorker):
             self.model_runner.rngs,
         )
         print(f"==============={accept_index=}==============")
-        logits_output.next_token_logits = logits_output.next_token_logits[accept_index != -1]
-        logits_output.hidden_states = logits_output.hidden_states[accept_index != -1]
+        logits_output.next_token_logits = logits_output.next_token_logits[accept_index]
+        logits_output.hidden_states = logits_output.hidden_states[accept_index]
         print(f"==================={logits_output.next_token_logits.shape=}=================")
         print(f"==================={logits_output.hidden_states.shape=}=================")
 
@@ -430,14 +430,15 @@ class EAGLEWorker(ModelWorker):
         draft_logits_output.truncate_logits_processor_output(model_worker_batch)
         self.capture_for_decode(draft_logits_output, forward_batch.spec_info)
         select_index = (
-            jnp.arange(len(model_worker_batch.seq_lens), device=self.device)
-            * self.speculative_num_draft_tokens
+            np.arange(len(model_worker_batch.seq_lens)) * self.speculative_num_draft_tokens
             + batch_output.accept_lens
             - 1
         )
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[select_index]
         draft_logits_output.hidden_states = draft_logits_output.hidden_states[select_index]
-        topk_p, topk_index = topk_probs_from_logits(draft_input.next_token_logits, self.topk)
+        topk_p, topk_index = topk_probs_from_logits(
+            draft_logits_output.next_token_logits, self.topk
+        )
 
         # prepare for next draft decode
         batch_output.next_draft_input.hidden_states = draft_logits_output.hidden_states

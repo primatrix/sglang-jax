@@ -968,6 +968,8 @@ class Scheduler(
             bid=bid,
             cache_miss_count=batch_output.cache_miss_count,
             next_draft_input=batch_output.next_draft_input,
+            accept_lens=batch_output.accept_lens,
+            allocate_lens=batch_output.allocate_lens,
         )
 
         return ret
