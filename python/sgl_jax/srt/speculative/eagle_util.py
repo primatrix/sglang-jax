@@ -401,24 +401,21 @@ class EagleDraftInput:
         draft_model_runner: Any,
         batch_output: GenerationBatchResult,
     ):
-        seq_lens_cpu_ = model_worker_batch.seq_lens_cpu
-        extend_num_tokens = len(model_worker_batch.seq_lens) * num_draft_tokens
+        seq_lens_cpu_ = model_worker_batch.seq_lens
 
         model_worker_batch.spec_info = self
-        model_worker_batch.input_ids = predict
+        model_worker_batch.input_ids = batch_output.next_draft_input.verified_id
         model_worker_batch.seq_lens = model_worker_batch.seq_lens + num_draft_tokens
-        model_worker_batch.seq_lens_cpu = model_worker_batch.seq_lens_cpu + num_draft_tokens
-        model_worker_batch.seq_lens_sum += extend_num_tokens
         model_worker_batch.extend_seq_lens = [
             num_draft_tokens for _ in range(len(model_worker_batch.seq_lens))
         ]
         model_worker_batch.extend_prefix_lens = seq_lens_cpu_.tolist()
-        model_worker_batch.extend_num_tokens = extend_num_tokens
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
         model_worker_batch.spec_info.hidden_states = batch_output.next_draft_input.hidden_states
         forward_batch = ForwardBatch.init_new(model_worker_batch, draft_model_runner)
-        draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+        forward_metadata = draft_model_runner.attn_backend.get_forward_metadata(model_worker_batch)
+        draft_model_runner.attn_backend.forward_metadata = forward_metadata
         return forward_batch
 
     def prepare_for_decode(self, schedule_batch: ScheduleBatch):
@@ -450,7 +447,7 @@ class EagleDraftInput:
 
         assign_req_to_token_pool(
             schedule_batch.req_pool_indices,
-            schedule_batch.req_to_token_pool.req_to_token,
+            schedule_batch.req_to_token_pool,
             self.allocate_lens,
             new_allocate_lens,
             out_cache_loc,
@@ -460,6 +457,7 @@ class EagleDraftInput:
         # FIXME(lsyin): make this sync optional
         # schedule_batch.seq_lens_cpu = schedule_batch.seq_lens
         schedule_batch.seq_lens_sum = np.sum(schedule_batch.seq_lens).item()
+        schedule_batch.out_cache_loc = out_cache_loc
 
     def prepare_for_draft_decode(
         self, model_worker_batch: ModelWorkerBatch, topk: int, num_steps: int
@@ -806,7 +804,13 @@ class EagleVerifyInput:
             )
 
         accept_length = accept_length + 1
+        # accept_index = np.concatenate(accept_index, axis=-1)
         verified_id = predict[accept_index]
+        print(f"==========={predict=}=============")
+
+        print(f"==========={accept_index=}=============")
+
+        print(f"==========={verified_id=}=============")
         return predict, verified_id, accept_length, accept_index
 
 

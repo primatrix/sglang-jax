@@ -95,6 +95,7 @@ class LogitsProcessorOutput:
             self.next_token_logits = self.next_token_logits[
                 0 : batch.real_bs * batch.spec_info.draft_token_num
             ]
+
         else:
             print(
                 f"-------truncate_logits_processor_output-----------{self.hidden_states.shape=}-------------"

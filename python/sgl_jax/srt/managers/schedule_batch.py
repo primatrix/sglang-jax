@@ -1337,6 +1337,9 @@ class ModelWorkerBatch:
             )
         padded_input_ids_len = len(input_ids_cpu)
         out_cache_loc_num_to_padding = padded_input_ids_len - len(self.out_cache_loc)
+        print(
+            f"========{out_cache_loc_num_to_padding=}========{padded_input_ids_len=}=========={len(self.out_cache_loc)=}======="
+        )
         if out_cache_loc_num_to_padding >= 0:
             out_cache_loc_cpu = np.concatenate(
                 [
@@ -1348,6 +1351,9 @@ class ModelWorkerBatch:
                 ],
                 axis=0,
             )
+        else:
+            # this maybe more than input_ids when eagle, but it will always be fix shape, so we should'd padding this
+            out_cache_loc_cpu = self.out_cache_loc
         # todo padding position
         seq_lens_cpu = self.seq_lens
         bs_padding_size = 0
