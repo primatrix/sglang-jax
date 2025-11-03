@@ -246,6 +246,13 @@ class SchedulerOutputProcessorMixin:
                     indices_to_free = self.req_to_token_pool.req_to_token[req.req_pool_idx][
                         start_p:end_p
                     ]
+                    print(f"============{batch.seq_lens=}========================")
+                    print(f"============{accept_lens_list=}========================")
+                    print(f"============{allocate_lens_list=}========================")
+                    print(f"============{start_p=}========================")
+                    print(f"============{end_p=}========================")
+
+                    print(f"============{indices_to_free=}============")
                     self.token_to_kv_pool_allocator.free(indices_to_free)
                 # End trace for finished request
                 if precision_tracer.get_trace_active():

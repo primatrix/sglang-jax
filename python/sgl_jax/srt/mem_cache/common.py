@@ -1,9 +1,11 @@
 import logging
 
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache
+
 logger = logging.getLogger(__name__)
 
-# todo @pc we should separate all mem cache from schedule batch to support more flexible operations
+# TODO @pc we should separate all mem cache from schedule batch to support more flexible operations
+
 
 def alloc_token_slots(
     tree_cache: BasePrefixCache,
@@ -30,6 +32,8 @@ def alloc_token_slots(
         return out_cache_loc, state
     else:
         return out_cache_loc
+
+
 def alloc_paged_token_slots_extend(
     tree_cache: BasePrefixCache,
     prefix_lens: list[int],
@@ -43,9 +47,7 @@ def alloc_paged_token_slots_extend(
     evict_from_tree_cache(tree_cache, num_tokens)
     if backup_state:
         state = allocator.backup_state()
-    out_cache_loc = allocator.alloc_extend(
-        prefix_lens, seq_lens, last_loc, extend_num_tokens
-    )
+    out_cache_loc = allocator.alloc_extend(prefix_lens, seq_lens, last_loc, extend_num_tokens)
     if out_cache_loc is None:
         error_msg = (
             f"Prefill out of memory. Try to lower your batch size.\n"
@@ -58,7 +60,8 @@ def alloc_paged_token_slots_extend(
         return out_cache_loc, state
     else:
         return out_cache_loc
-    
+
+
 def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
     if tree_cache is None:
         return
@@ -100,4 +103,3 @@ def available_and_evictable_str(tree_cache) -> str:
         available_size = token_to_kv_pool_allocator.available_size()
         evictable_size = tree_cache.evictable_size()
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
-    

@@ -388,6 +388,7 @@ class Scheduler(
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             )
         else:
+            print("**************init redix cache**********************")
             self.tree_cache = RadixCache(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -397,6 +398,7 @@ class Scheduler(
                 head_dim=self.model_config.head_dim,
                 layer_num=self.model_config.num_hidden_layers,
                 max_seq_len=server_args.max_seq_len,
+                is_eagle=self.spec_algorithm.is_eagle(),
             )
 
         self.decode_mem_cache_buf_multiplier = 1
@@ -414,7 +416,7 @@ class Scheduler(
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states
-                # self.check_memory()
+                self.check_memory()
                 self.check_tree_cache()
                 self.new_token_ratio = self.init_new_token_ratio
             self.last_batch = batch
@@ -980,6 +982,7 @@ class Scheduler(
         result: GenerationBatchResult,
         launch_done: threading.Event | None = None,
     ):
+        print(f"====process_batch_result==={batch.forward_mode=}=================")
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result, launch_done)
         elif batch.forward_mode.is_extend():

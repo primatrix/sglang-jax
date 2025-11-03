@@ -218,6 +218,8 @@ class Req:
         self.extend_logprob_start_len = 0
         self.last_node: Any = None
         self.last_host_node: Any = None
+        # The prefix length of the last prefix matching
+        self.last_matched_prefix_len: int = 0
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -329,6 +331,7 @@ class Req:
             ) = tree_cache.match_prefix(
                 key=self.adjust_max_prefix_ids(),
             )
+            self.last_matched_prefix_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     def adjust_max_prefix_ids(self):
