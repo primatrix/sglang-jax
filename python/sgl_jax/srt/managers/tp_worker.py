@@ -322,6 +322,7 @@ class ModelWorker:
 
         valid_cache_loc = np.arange(bs)
         invalid_cache_loc = np.array([0] * (invalid_cache_loc_size), dtype=jnp.int32)
+        valid_top_logprobs_nums = np.array([0] * bs, dtype=jnp.int32)
 
         return ModelWorkerBatch(
             bid=1,
@@ -332,7 +333,7 @@ class ModelWorker:
             req_pool_indices=np.arange(bs, dtype=np.int32),
             seq_lens=np.array([1] * bs, dtype=np.int32),
             out_cache_loc=np.concat([valid_out_cache_loc, invalid_out_cache_loc], axis=0),
-            return_logprob=False,
+            return_logprob=True,
             sampling_info=SamplingBatchInfo.generate_for_precompile(
                 bs,
                 self.model_config.vocab_size,
@@ -343,7 +344,7 @@ class ModelWorker:
             cache_loc=np.concat([valid_cache_loc, invalid_cache_loc], axis=0),
             extend_prefix_lens=(np.array([0] * bs) if mode == ForwardMode.EXTEND else None),
             extend_seq_lens=np.array([1] * bs) if mode == ForwardMode.EXTEND else None,
-            top_logprobs_nums=None,
+            top_logprobs_nums=valid_top_logprobs_nums,
             token_ids_logprobs=None,
             extend_logprob_start_lens=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,

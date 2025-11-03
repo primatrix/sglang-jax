@@ -1315,8 +1315,8 @@ class ModelWorkerBatch:
 
     # For logprob
     return_logprob: bool
-    top_logprobs_nums: list[int] | None
-    token_ids_logprobs: list[list[int]] | None
+    top_logprobs_nums: np.ndarray | None
+    token_ids_logprobs: np.ndarray | None
 
     # For extend
     # extend_num_tokens: Optional[int]

@@ -35,8 +35,8 @@ class SamplingMetadata:
 
     # logprob
     return_logprob: bool
-    top_logprobs_nums: list[int] | None
-    token_ids_logprobs: list[list[int]] | None
+    top_logprobs_nums: jax.Array # 一维
+    token_ids_logprobs: list[list[int]]
 
     # sample
     temperatures: jax.Array
@@ -62,12 +62,12 @@ class SamplingMetadata:
             self.need_min_p_sampling,
             self.linear_penalty,
             self.do_penalties,
+            self.return_logprob,
+            self.top_logprobs_nums,
         )
 
         aux_data = {
-            "return_logprob": self.return_logprob,
-            "top_logprobs_nums": self.top_logprobs_nums,
-            "token_ids_logprobs": self.token_ids_logprobs,
+            "token_ids_logprobs": self.token_ids_logprobs
         }
         return (children, aux_data)
 
@@ -84,9 +84,9 @@ class SamplingMetadata:
         obj.need_min_p_sampling = children[6]
         obj.linear_penalty = children[7]
         obj.do_penalties = children[8]
+        obj.return_logprob = children[9]
+        obj.top_logprobs_nums = children[10]
 
-        obj.return_logprob = aux_data["return_logprob"]
-        obj.top_logprobs_nums = aux_data["top_logprobs_nums"]
         obj.token_ids_logprobs = aux_data["token_ids_logprobs"]
 
         return obj
@@ -198,10 +198,20 @@ class SamplingMetadata:
             linear_penalty_device = _get_or_create_zero_penalty_device(
                 target_shape, linear_penalty_sharding
             )
+        if batch.return_logprob:
+            padded_top_logprobs_nums = np.concat(
+            [
+                batch.top_logprobs_nums,
+                np.array([0] * pad_size, dtype=batch.top_logprobs_nums.dtype),
+            ])
+            top_logprobs_nums_device = device_array(padded_top_logprobs_nums, sharding=sharding)
+
+        else:
+            top_logprobs_nums_device = None
 
         return cls(
             return_logprob=batch.return_logprob,
-            top_logprobs_nums=batch.top_logprobs_nums,
+            top_logprobs_nums=top_logprobs_nums_device,
             token_ids_logprobs=batch.token_ids_logprobs,
             temperatures=temperatures_device,
             top_ps=top_ps_device,
