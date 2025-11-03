@@ -388,8 +388,11 @@ class EagleDraftInput:
         for i in range(model_worker_batch.real_bs):
             extend_len = model_worker_batch.extend_seq_lens[i]
             input_ids = model_worker_batch.input_ids[pt : pt + extend_len]
+
             # TODO: batch.input_ids should on tpu
-            model_worker_batch.input_ids[pt : pt + extend_len] = np.concatenate(input_ids[1:], self.verified_id[i].reshape(1))
+            model_worker_batch.input_ids[pt : pt + extend_len] = np.concatenate(
+                (input_ids[1:], self.verified_id[i].reshape(1))
+            )
             pt += extend_len
 
     def prepare_for_extend_after_verify(
@@ -543,6 +546,7 @@ class EagleDraftInput:
 
     def filter_batch(self, new_indices: jax.Array, has_been_filtered: bool = True):
         # FIXME(pc) need support overlap here
+        self.allocate_lens = self.allocate_lens[new_indices]
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
             # therefore, we don't need to filter the batch again in scheduler
