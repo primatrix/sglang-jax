@@ -323,7 +323,7 @@ class ModelWorker:
         valid_cache_loc = np.arange(bs)
         invalid_cache_loc = np.array([0] * (invalid_cache_loc_size), dtype=jnp.int32)
         valid_top_logprobs_nums = np.array([0] * bs, dtype=jnp.int32)
-
+        valid_extend_logprob_start_lens = np.array([0] * bs, dtype = jnp.int32)
         return ModelWorkerBatch(
             bid=1,
             forward_mode=mode,
@@ -345,8 +345,8 @@ class ModelWorker:
             extend_prefix_lens=(np.array([0] * bs) if mode == ForwardMode.EXTEND else None),
             extend_seq_lens=np.array([1] * bs) if mode == ForwardMode.EXTEND else None,
             top_logprobs_nums=valid_top_logprobs_nums,
-            token_ids_logprobs=None,
-            extend_logprob_start_lens=None,
+            token_ids_logprobs=[[1]],
+            extend_logprob_start_lens=valid_extend_logprob_start_lens if mode == ForwardMode.EXTEND else None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
