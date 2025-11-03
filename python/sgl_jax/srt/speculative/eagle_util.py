@@ -546,6 +546,7 @@ class EagleDraftInput:
 
     def filter_batch(self, new_indices: jax.Array, has_been_filtered: bool = True):
         # FIXME(pc) need support overlap here
+        print(f"==============={self.allocate_lens.shape=}=========={new_indices=}====")
         self.allocate_lens = self.allocate_lens[new_indices]
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`

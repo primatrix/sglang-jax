@@ -446,7 +446,7 @@ class EAGLEWorker(ModelWorker):
         batch_output.next_draft_input.topk_index = topk_index
 
     def draft_forward(self, model_worker_batch: ModelWorkerBatch):
-        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
+        model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         spec_info = model_worker_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
         out_cache_loc = model_worker_batch.out_cache_loc

@@ -100,7 +100,18 @@ class SchedulerOutputProcessorMixin:
                             >= precision_tracer.get_max_requests()
                         ):
                             precision_tracer.stop_trace()
+                    _, _, available_size, evictable_size = self._get_token_info()
+                    print(
+                        f"3333=process_batch_result_prefill========{available_size=}=========={evictable_size=}=============="
+                    )
+
                     self.tree_cache.cache_finished_req(req)
+                    _, _, available_size, evictable_size = self._get_token_info()
+
+                    print(
+                        f"4444=process_batch_result_prefill========{available_size=}=========={evictable_size=}=============="
+                    )
+
                 elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                     # This updates radix so others can match
                     self.tree_cache.cache_unfinished_req(req)
@@ -236,6 +247,9 @@ class SchedulerOutputProcessorMixin:
 
             req.check_finished(new_accepted_len)
             if req.finished():
+                print(
+                    f"---{batch.spec_algorithm=}----------------{self.cur_batch.forward_mode=}-------------"
+                )
                 if batch.spec_algorithm.is_eagle() and self.cur_batch.forward_mode.is_extend():
                     start_p = batch.seq_lens[i] + accept_lens_list[i]
                     end_p = allocate_lens_list[i]

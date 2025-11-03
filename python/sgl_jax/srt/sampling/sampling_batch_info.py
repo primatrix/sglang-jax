@@ -97,32 +97,32 @@ class SamplingMetadata:
         mesh: Mesh = None,
     ) -> SamplingMetadata:
         sharding = NamedSharding(mesh, PartitionSpec()) if jax.process_count() == 1 else None
-        padded_temperatures = np.concat(
+        padded_temperatures = np.concatenate(
             [
                 batch.sampling_info.temperatures,
                 np.array([1.0] * pad_size, dtype=batch.sampling_info.temperatures.dtype),
             ]
         ).reshape(-1, 1)
-        padded_top_ps = np.concat(
+        padded_top_ps = np.concatenate(
             [
                 batch.sampling_info.top_ps,
                 np.array([1.0] * pad_size, dtype=batch.sampling_info.top_ps.dtype),
             ]
         )
-        padded_top_ks = np.concat(
+        padded_top_ks = np.concatenate(
             [
                 batch.sampling_info.top_ks,
                 np.array([1] * pad_size, dtype=batch.sampling_info.top_ks.dtype),
             ]
         )
-        padded_min_ps = np.concat(
+        padded_min_ps = np.concatenate(
             [
                 batch.sampling_info.min_ps,
                 np.array([0.0] * pad_size, dtype=batch.sampling_info.min_ps.dtype),
             ]
         )
         if batch.sampling_info.sampling_seeds is not None:
-            padded_sampling_seeds = np.concat(
+            padded_sampling_seeds = np.concatenate(
                 [
                     batch.sampling_info.sampling_seeds,
                     np.array(
@@ -157,7 +157,7 @@ class SamplingMetadata:
                     (pad_size, original_linear_penalty.shape[1]),
                     dtype=original_linear_penalty.dtype,
                 )
-                padded_linear_penalty = np.concat([original_linear_penalty, pad_rows], axis=0)
+                padded_linear_penalty = np.concatenate([original_linear_penalty, pad_rows], axis=0)
             else:
                 padded_linear_penalty = original_linear_penalty
 
@@ -180,7 +180,7 @@ class SamplingMetadata:
                     (pad_size, original_linear_penalty.shape[1]),
                     dtype=original_linear_penalty.dtype,
                 )
-                padded_linear_penalty = np.concat([original_linear_penalty, pad_rows], axis=0)
+                padded_linear_penalty = np.concatenate([original_linear_penalty, pad_rows], axis=0)
             else:
                 padded_linear_penalty = original_linear_penalty
 
@@ -218,32 +218,32 @@ class SamplingMetadata:
         """
         # Basic sampling parameters (same as original method)
         sharding = NamedSharding(mesh, PartitionSpec()) if jax.process_count() == 1 else None
-        padded_temperatures = np.concat(
+        padded_temperatures = np.concatenate(
             [
                 batch.sampling_info.temperatures,
                 np.array([1.0] * pad_size, dtype=batch.sampling_info.temperatures.dtype),
             ]
         ).reshape(-1, 1)
-        padded_top_ps = np.concat(
+        padded_top_ps = np.concatenate(
             [
                 batch.sampling_info.top_ps,
                 np.array([1.0] * pad_size, dtype=batch.sampling_info.top_ps.dtype),
             ]
         )
-        padded_top_ks = np.concat(
+        padded_top_ks = np.concatenate(
             [
                 batch.sampling_info.top_ks,
                 np.array([1] * pad_size, dtype=batch.sampling_info.top_ks.dtype),
             ]
         )
-        padded_min_ps = np.concat(
+        padded_min_ps = np.concatenate(
             [
                 batch.sampling_info.min_ps,
                 np.array([0.0] * pad_size, dtype=batch.sampling_info.min_ps.dtype),
             ]
         )
         if batch.sampling_info.sampling_seeds is not None:
-            padded_sampling_seeds = np.concat(
+            padded_sampling_seeds = np.concatenate(
                 [
                     batch.sampling_info.sampling_seeds,
                     np.array(
@@ -262,7 +262,7 @@ class SamplingMetadata:
         )
 
         if batch.sampling_info.sampling_seeds is not None:
-            padded_sampling_seeds = np.concat(
+            padded_sampling_seeds = np.concatenate(
                 [
                     batch.sampling_info.sampling_seeds,
                     np.array(
@@ -513,7 +513,7 @@ class SamplingBatchInfo:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
             if self_val is not None and other_val is not None:
-                setattr(self, item, np.concat([self_val, other_val]))
+                setattr(self, item, np.concatenate([self_val, other_val]))
 
         self.is_all_greedy &= other.is_all_greedy
         self.need_top_p_sampling |= other.need_top_p_sampling

@@ -205,9 +205,13 @@ class RadixCache(BasePrefixCache):
     def cache_finished_req(self, req: Req):
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.evictable_size()
+        print("------------1111111-------")
+
         print(
             f"11111111cache_finished_req=={available_size=}=={evictable_size=}===={len(req.origin_input_ids)=}======={len(req.output_ids)=}==========={len(req.prefix_indices)=}========="
         )
+        print("------------1111111-------")
+
         """Cache completed requests"""
         all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         if self.disable:
@@ -223,8 +227,10 @@ class RadixCache(BasePrefixCache):
         # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
         # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
         actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
-        kv_indices = self.req_to_token_pool.read(req.req_pool_idx, all_token_len)
+        kv_indices = self.req_to_token_pool.read(req.req_pool_idx, all_token_len * 2)
+        print("------------1111111-------")
 
+        print(f"-------------{kv_indices=}--------")
         if self.page_size != 1:
             page_aligned_len = actual_kv_len // self.page_size * self.page_size
             page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
@@ -242,11 +248,23 @@ class RadixCache(BasePrefixCache):
 
         # Radix Cache takes over one reference from memory pool
         new_prefix_len = self.insert(token_ids[:page_aligned_token_len], page_aligned_kv_indices)
+        print("------------1111111-------")
+
         print(
             f"req={req.rid}, old_prefix_len={old_prefix_len}, "
             f"new_prefix_len={new_prefix_len}, actual_kv_len={actual_kv_len}, "
             f"len(kv_indices)={len(kv_indices)}"
         )
+        print("------------222222-------")
+
+        print(
+            f"kv_indices[old_prefix_len:new_prefix_len]={kv_indices[old_prefix_len:new_prefix_len]},   "
+            f"kv_indices[page_aligned_len:]={kv_indices[page_aligned_len:]},  "
+            f"req.req_pool_idx={req.req_pool_idx},"
+        )
+        print("------------333333-------")
+        kv_indices = kv_indices[kv_indices != 0]
+
         self.token_to_kv_pool_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
         # free the unaligned tail
         self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
