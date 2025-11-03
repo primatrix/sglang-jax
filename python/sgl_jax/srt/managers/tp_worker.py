@@ -437,12 +437,27 @@ class ModelWorker:
                 # wait for sampling info to be done
                 if model_worker_batch.sampling_info.sampling_info_done:
                     model_worker_batch.sampling_info.sampling_info_done.wait()
-                next_token_ids_device = self.model_runner.sample(
+                next_token_ids_device,new_logits_output = self.model_runner.sample(
                     logits_output,
                     sampling_metadata,
                     positions_device,
                 )
                 sample_cache_miss_count = count()
+        # print(f'logits_output. {logits_output}, {new_logits_output}')
+        if new_logits_output is not None:
+            logits_output = new_logits_output
+            if logits_output.next_token_top_logprobs_val is not None:
+                logits_output.next_token_top_logprobs_val = logits_output.next_token_top_logprobs_val.tolist()
+                logits_output.next_token_top_logprobs_idx = logits_output.next_token_top_logprobs_idx.tolist()
+            if logits_output.next_token_token_ids_logprobs_val is not None:
+                logits_output.next_token_token_ids_logprobs_val = logits_output.next_token_token_ids_logprobs_val.tolist()
+                logits_output.next_token_token_ids_logprobs_idx = logits_output.next_token_token_ids_logprobs_idx.tolist()
+            if logits_output.input_token_ids_logprobs_val is not None:
+                logits_output.input_token_ids_logprobs_val = logits_output.input_token_ids_logprobs_val.tolist()
+                logits_output.input_token_ids_logprobs_idx = logits_output.input_token_ids_logprobs_idx.tolist()
+            if logits_output.input_top_logprobs_val is not None:
+                logits_output.input_top_logprobs_val = logits_output.input_top_logprobs_val.tolist()
+                logits_output.input_top_logprobs_idx = logits_output.input_top_logprobs_idx.tolist()
 
         return (
             logits_output,

@@ -37,23 +37,23 @@ class Sampler(nnx.Module):
         temperatures_shape = sampling_metadata.temperatures.shape
 
         # Temperatures should be (batch_size, 1) for proper broadcasting
-        assert (
-            temperatures_shape[0] == logits_batch_size
-        ), f"Temperature batch size {temperatures_shape[0]} doesn't match logits batch size {logits_batch_size}"
+        #assert (
+        #    temperatures_shape[0] == logits_batch_size
+        #), f"Temperature batch size {temperatures_shape[0]} doesn't match logits batch size {logits_batch_size}"
 
         # Post process logits
-        processed_logits = jnp.divide(logits, sampling_metadata.temperatures).astype(logits.dtype)
+        processed_logits = jnp.divide(logits, sampling_metadata.temperatures[:logits_batch_size]).astype(logits.dtype)
 
         probs = jax.nn.softmax(processed_logits, axis=-1)
 
         args = (
             logits,
             probs,
-            sampling_metadata.top_ks,
-            sampling_metadata.top_ps,
-            sampling_metadata.min_ps,
+            sampling_metadata.top_ks[:logits_batch_size],
+            sampling_metadata.top_ps[:logits_batch_size],
+            sampling_metadata.min_ps[:logits_batch_size],
             positions,
-            sampling_metadata.temperatures,
+            sampling_metadata.temperatures[:logits_batch_size],
             sampling_metadata.sampling_seeds,
             sampling_metadata.need_min_p_sampling,
             rng,
@@ -71,7 +71,9 @@ class Sampler(nnx.Module):
         logits_output, sampling_metadata, batch_next_token_ids, logprobs = operands
 
         # Set next_token_logprobs
-        logits_output.next_token_logprobs = logprobs[
+        (next_token_logprobs, next_token_top_logprobs_val, next_token_top_logprobs_idx, next_token_token_ids_logprobs_val,
+         next_token_token_ids_logprobs_idx) = None, None, None, None, None
+        next_token_logprobs = logprobs[
             np.arange(len(batch_next_token_ids)),
             batch_next_token_ids,
         ]
@@ -81,8 +83,8 @@ class Sampler(nnx.Module):
             x > 0 for x in sampling_metadata.top_logprobs_nums
         ):
             (
-                logits_output.next_token_top_logprobs_val,
-                logits_output.next_token_top_logprobs_idx,
+                next_token_top_logprobs_val,
+                next_token_top_logprobs_idx,
             ) = get_top_logprobs(logprobs, sampling_metadata.top_logprobs_nums)
 
         # Set token_ids_logprobs if needed
@@ -90,11 +92,22 @@ class Sampler(nnx.Module):
             x is not None for x in sampling_metadata.token_ids_logprobs
         ):
             (
-                logits_output.next_token_token_ids_logprobs_val,
-                logits_output.next_token_token_ids_logprobs_idx,
+                next_token_token_ids_logprobs_val,
+                next_token_token_ids_logprobs_idx,
             ) = get_token_ids_logprobs(logprobs, sampling_metadata.token_ids_logprobs)
 
-        return None
+        return LogitsProcessorOutput(next_token_logits=logits_output.next_token_logits,
+                next_token_logprobs=next_token_logprobs,
+                next_token_top_logprobs_val=next_token_top_logprobs_val,
+                next_token_top_logprobs_idx=next_token_top_logprobs_idx,
+                next_token_token_ids_logprobs_val=next_token_token_ids_logprobs_val,
+                next_token_token_ids_logprobs_idx=next_token_token_ids_logprobs_idx,
+                input_token_logprobs = logits_output.input_token_logprobs,
+                input_top_logprobs_val = logits_output.input_top_logprobs_val,
+                input_top_logprobs_idx = logits_output.input_top_logprobs_idx,
+                input_token_ids_logprobs_val=logits_output.input_token_ids_logprobs_val,
+                input_token_ids_logprobs_idx = logits_output.input_token_ids_logprobs_idx,
+                )
 
     def _apply_linear_penalty(self, operands):
         """
@@ -154,6 +167,7 @@ class Sampler(nnx.Module):
             positions: The positions of the tokens in the sequence.
             use_sort_for_toppk_minp: whether use sort when dealing with top_k, top_k and min_p.
         """
+
         # Apply penalties before sampling
         logits = lax.cond(
             sampling_metadata.do_penalties,
@@ -178,28 +192,23 @@ class Sampler(nnx.Module):
             batch_next_token_ids,
             logprobs,
         )
-        lax.cond(
-            sampling_metadata.return_logprob,
-            self._process_logprob_results,
-            lambda operands: None,
-            logprob_operands,
-        )
+        new_logits_output = None
+        if sampling_metadata.return_logprob:
+            new_logits_output = self._process_logprob_results(logprob_operands)
 
-        return batch_next_token_ids
+        return batch_next_token_ids, new_logits_output
 
 
 def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: list[int]):
     max_k = max(top_logprobs_nums)
     values, indices = jax.lax.top_k(logprobs, max_k)
-    values = values.tolist()
-    indices = indices.tolist()
 
     output_top_logprobs_val = []
     output_top_logprobs_idx = []
     for i, k in enumerate(top_logprobs_nums):
         output_top_logprobs_val.append(values[i][:k])
         output_top_logprobs_idx.append(indices[i][:k])
-    return output_top_logprobs_val, output_top_logprobs_idx
+    return jnp.array(output_top_logprobs_val), jnp.array(output_top_logprobs_idx)
 
 
 def get_token_ids_logprobs(logprobs: jax.Array, token_ids_logprobs: list[list[int]]):
@@ -207,13 +216,13 @@ def get_token_ids_logprobs(logprobs: jax.Array, token_ids_logprobs: list[list[in
     output_token_ids_logprobs_idx = []
     for i, token_ids in enumerate(token_ids_logprobs):
         if token_ids is not None:
-            output_token_ids_logprobs_val.append(logprobs[i, token_ids].tolist())
+            output_token_ids_logprobs_val.append(logprobs[i, token_ids])
             output_token_ids_logprobs_idx.append(token_ids)
         else:
             output_token_ids_logprobs_val.append([])
             output_token_ids_logprobs_idx.append([])
 
-    return output_token_ids_logprobs_val, output_token_ids_logprobs_idx
+    return jnp.array(output_token_ids_logprobs_val), jnp.array(output_token_ids_logprobs_idx)
 
 
 def multinomial(

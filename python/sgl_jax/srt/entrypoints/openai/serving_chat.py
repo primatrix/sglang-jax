@@ -691,6 +691,8 @@ Assistant: {% endif %}"""
         token_logprobs = []
 
         for token_idx, (token, logprob) in enumerate(zip(logprobs.tokens, logprobs.token_logprobs)):
+            if token is None:
+                token = ''
             token_bytes = list(token.encode("utf-8"))
             top_logprobs = []
             if logprobs.top_logprobs:

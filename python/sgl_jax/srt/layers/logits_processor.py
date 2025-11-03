@@ -30,7 +30,7 @@ class LogitsProcessorOutput:
     next_token_logprobs: jax.Array | None = None
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
     next_token_top_logprobs_val: list | None = None
-    next_token_top_logprobs_idx: list | None = None
+    next_token_top_logprobs_idx: list = None
     # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
     next_token_token_ids_logprobs_val: list | None = None
     next_token_token_ids_logprobs_idx: list | None = None
@@ -39,8 +39,8 @@ class LogitsProcessorOutput:
     # The logprobs of input tokens.        shape: [#token]
     input_token_logprobs: jax.Array | None = None
     # The logprobs and ids of the top-k tokens in input positions.  shape: [#seq, #token, k]
-    input_top_logprobs_val: list = None
-    input_top_logprobs_idx: list = None
+    input_top_logprobs_val: list | None = None
+    input_top_logprobs_idx: list | None = None
     # The logprobs and ids of the requested token ids in input positions. shape: [#seq, n] (n is the number of requested token ids)
     input_token_ids_logprobs_val: list | None = None
     input_token_ids_logprobs_idx: list | None = None
@@ -51,18 +51,20 @@ class LogitsProcessorOutput:
             self.hidden_states,
             self.next_token_logprobs,
             self.input_token_logprobs,
+
+            self.next_token_top_logprobs_val,
+            self.next_token_top_logprobs_idx,
+            self.next_token_token_ids_logprobs_val,
+            self.next_token_token_ids_logprobs_idx,
+
+            self.input_top_logprobs_val,
+            self.input_top_logprobs_idx,
+            self.input_token_ids_logprobs_val,
+            self.input_token_ids_logprobs_idx,
+
         )
 
-        aux_data = {
-            "next_token_top_logprobs_val": self.next_token_top_logprobs_val,
-            "next_token_top_logprobs_idx": self.next_token_top_logprobs_idx,
-            "next_token_token_ids_logprobs_val": self.next_token_token_ids_logprobs_val,
-            "next_token_token_ids_logprobs_idx": self.next_token_token_ids_logprobs_idx,
-            "input_top_logprobs_val": self.input_top_logprobs_val,
-            "input_top_logprobs_idx": self.input_top_logprobs_idx,
-            "input_token_ids_logprobs_val": self.input_token_ids_logprobs_val,
-            "input_token_ids_logprobs_idx": self.input_token_ids_logprobs_idx,
-        }
+        aux_data = {}
         return (children, aux_data)
 
     @classmethod
@@ -74,14 +76,14 @@ class LogitsProcessorOutput:
         obj.next_token_logprobs = children[2]
         obj.input_token_logprobs = children[3]
 
-        obj.next_token_top_logprobs_val = aux_data["next_token_top_logprobs_val"]
-        obj.next_token_top_logprobs_idx = aux_data["next_token_top_logprobs_idx"]
-        obj.next_token_token_ids_logprobs_val = aux_data["next_token_token_ids_logprobs_val"]
-        obj.next_token_token_ids_logprobs_idx = aux_data["next_token_token_ids_logprobs_idx"]
-        obj.input_top_logprobs_val = aux_data["input_top_logprobs_val"]
-        obj.input_top_logprobs_idx = aux_data["input_top_logprobs_idx"]
-        obj.input_token_ids_logprobs_val = aux_data["input_token_ids_logprobs_val"]
-        obj.input_token_ids_logprobs_idx = aux_data["input_token_ids_logprobs_idx"]
+        obj.next_token_top_logprobs_val = children[4]
+        obj.next_token_top_logprobs_idx = children[5]
+        obj.next_token_token_ids_logprobs_val = children[6]
+        obj.next_token_token_ids_logprobs_idx = children[7]
+        obj.input_top_logprobs_val = children[8]
+        obj.input_top_logprobs_idx = children[9]
+        obj.input_token_ids_logprobs_val = children[10]
+        obj.input_token_ids_logprobs_idx = children[11]
 
         return obj
 
@@ -196,7 +198,7 @@ class LogitsMetadata:
             extend_seq_lens=device_array(batch.extend_seq_lens, sharding=sharding),
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=(
-                batch.extend_logprob_start_lens if batch.return_logprob else None
+                batch.extend_logprob_start_lens.tolist() if batch.return_logprob else None
             ),
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
             top_logprobs_nums=batch.top_logprobs_nums,
@@ -370,19 +372,20 @@ class LogitsProcessor(nnx.Module):
                 continue
 
             input_token_ids_logprobs_val.append(
-                [all_logprobs[pt + j, token_ids].tolist() for j in range(pruned_len)]
+                [all_logprobs[pt + j, token_ids] for j in range(pruned_len)]
             )
             input_token_ids_logprobs_idx.append([token_ids for _ in range(pruned_len)])
             pt += pruned_len
 
-        return input_token_ids_logprobs_val, input_token_ids_logprobs_idx
+        return jnp.array(input_token_ids_logprobs_val), jnp.array(input_token_ids_logprobs_idx)
 
     @staticmethod
     def get_top_logprobs(all_logprobs: jax.Array, logits_metadata: LogitsMetadata):
         max_k = max(logits_metadata.top_logprobs_nums)
         values, indices = jax.lax.top_k(all_logprobs, max_k)
-        values = values.tolist()
-        indices = indices.tolist()
+        # method was called on traced array
+        # values = values.tolist()
+        # indices = indices.tolist()
 
         input_top_logprobs_val, input_top_logprobs_idx = [], []
 
@@ -400,7 +403,7 @@ class LogitsProcessor(nnx.Module):
             input_top_logprobs_idx.append([indices[pt + j][:k] for j in range(pruned_len)])
             pt += pruned_len
 
-        return input_top_logprobs_val, input_top_logprobs_idx
+        return jnp.array(input_top_logprobs_val), jnp.array(input_top_logprobs_idx)
 
     @staticmethod
     def compute_temp_top_p_normalized_logprobs(
