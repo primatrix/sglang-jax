@@ -198,7 +198,7 @@ class LogitsMetadata:
             extend_seq_lens=device_array(batch.extend_seq_lens, sharding=sharding),
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=(
-                batch.extend_logprob_start_lens.tolist() if batch.return_logprob else None
+                batch.extend_logprob_start_lens.tolist() if batch.return_logprob and batch.extend_logprob_start_lens is not None else None
             ),
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
             top_logprobs_nums=batch.top_logprobs_nums,
