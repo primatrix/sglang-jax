@@ -205,13 +205,9 @@ class RadixCache(BasePrefixCache):
     def cache_finished_req(self, req: Req):
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.evictable_size()
-        print("------------1111111-------")
-
         print(
             f"11111111cache_finished_req=={available_size=}=={evictable_size=}===={len(req.origin_input_ids)=}======={len(req.output_ids)=}==========={len(req.prefix_indices)=}========="
         )
-        print("------------1111111-------")
-
         """Cache completed requests"""
         all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         if self.disable:

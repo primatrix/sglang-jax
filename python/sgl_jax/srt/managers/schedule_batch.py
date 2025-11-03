@@ -1009,12 +1009,12 @@ class ScheduleBatch:
         # needs to be called with pre-merged Batch.reqs.
         self.sampling_info.merge_batch(other.sampling_info)
 
-        self.req_pool_indices = np.concatenate([self.req_pool_indices, other.req_pool_indices])
-        self.seq_lens = np.concatenate([self.seq_lens, other.seq_lens])
+        self.req_pool_indices = np.concat([self.req_pool_indices, other.req_pool_indices])
+        self.seq_lens = np.concat([self.seq_lens, other.seq_lens])
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
-            self.output_ids = np.concatenate(
+            self.output_ids = np.concat(
                 [
                     self.output_ids[: len(self.seq_lens)],
                     other.output_ids[: len(other.seq_lens)],
@@ -1333,7 +1333,7 @@ class ModelWorkerBatch:
                 padding_size = size - len(self.input_ids)
                 break
         if padding_size >= 0:
-            input_ids_cpu = np.concatenate(
+            input_ids_cpu = np.concat(
                 [
                     self.input_ids,
                     np.array([0] * padding_size, dtype=self.input_ids.dtype),
@@ -1388,7 +1388,7 @@ class ModelWorkerBatch:
             invalid_req_pool_indices = np.array(
                 [-1] * bs_padding_size, dtype=self.req_pool_indices.dtype
             )
-            req_pool_indices_cpu = np.concatenate(
+            req_pool_indices_cpu = np.concat(
                 [
                     self.req_pool_indices,
                     invalid_req_pool_indices,
@@ -1396,32 +1396,30 @@ class ModelWorkerBatch:
                 axis=0,
             )
             invalid_seq_lens = np.array([0] * bs_padding_size, dtype=seq_lens_cpu.dtype)
-            seq_lens_cpu = np.concatenate([seq_lens_cpu, invalid_seq_lens], axis=0)
+            seq_lens_cpu = np.concat([seq_lens_cpu, invalid_seq_lens], axis=0)
             if self.forward_mode.is_extend():
                 invalid_extend_start_loc = np.array(
                     [self.extend_start_loc[-1] + self.extend_seq_lens[-1]] * bs_padding_size,
                     dtype=self.extend_start_loc.dtype,
                 )
-                extend_start_loc = np.concatenate(
+                extend_start_loc = np.concat(
                     [self.extend_start_loc, invalid_extend_start_loc], axis=0
                 )
                 invalid_extend_prefix_lens = np.array(
                     [0] * bs_padding_size, dtype=self.extend_prefix_lens.dtype
                 )
-                extend_prefix_lens = np.concatenate(
+                extend_prefix_lens = np.concat(
                     [self.extend_prefix_lens, invalid_extend_prefix_lens], axis=0
                 )
                 invalid_extend_seq_lens = np.array(
                     [0] * bs_padding_size, dtype=self.extend_seq_lens.dtype
                 )
-                extend_seq_lens = np.concatenate(
-                    [self.extend_seq_lens, invalid_extend_seq_lens], axis=0
-                )
+                extend_seq_lens = np.concat([self.extend_seq_lens, invalid_extend_seq_lens], axis=0)
             else:
                 invalid_extend_start_loc = np.array(
                     [len(seq_lens_cpu)] * bs_padding_size, dtype=self.extend_start_loc.dtype
                 )
-                extend_start_loc = np.concatenate(
+                extend_start_loc = np.concat(
                     [self.extend_start_loc, invalid_extend_start_loc], axis=0
                 )
                 # padding
