@@ -454,7 +454,7 @@ class EAGLEWorker(ModelWorker):
         # Forward multiple steps
         scores = None
         # Save original positions to avoid buffer donation issues
-        original_positions = np.array(model_worker_batch.positions)
+        original_positions = np.repeat(model_worker_batch.seq_lens, self.topk)
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk

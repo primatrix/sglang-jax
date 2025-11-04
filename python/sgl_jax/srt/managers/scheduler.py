@@ -383,6 +383,8 @@ class Scheduler(
         self.req_to_token_pool, self.token_to_kv_pool_allocator = self.tp_worker.get_memory_pool()
 
         if server_args.chunked_prefill_size is not None and server_args.disable_radix_cache:
+            print("**************chunk cache**********************")
+            
             self.tree_cache = ChunkCache(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -406,14 +408,17 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
+            _, _, available_size, evictable_size = self._get_token_info()
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
-
+            _, _, available_size, evictable_size = self._get_token_info()
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+                _, _, available_size, evictable_size = self._get_token_info()
+                print(f"==33333===={available_size=}============={evictable_size=}================")
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
@@ -948,31 +953,33 @@ class Scheduler(
             batch_output = self.draft_worker.forward_batch_speculative_generation(
                 model_worker_batch
             )
-        bid = batch_output.bid
-        batch.output_ids = batch_output.next_token_ids
-        # These 2 values are needed for processing the output, but the values can be
-        # modified by overlap schedule. So we have to copy them here so that
-        # we can use the correct values in output processing.
-        if batch.return_logprob:
-            extend_input_len_per_req = [req.extend_input_len for req in batch.reqs]
-        else:
-            extend_input_len_per_req = None
-        if batch.return_logprob:
-            extend_logprob_start_len_per_req = [req.extend_logprob_start_len for req in batch.reqs]
-        else:
-            extend_logprob_start_len_per_req = None
+            bid = batch_output.bid
+            batch.output_ids = batch_output.next_token_ids
+            if batch_output.accept_lens is not None:
+                batch.seq_lens = batch.seq_lens + batch_output.accept_lens
+            # These 2 values are needed for processing the output, but the values can be
+            # modified by overlap schedule. So we have to copy them here so that
+            # we can use the correct values in output processing.
+            if batch.return_logprob:
+                extend_input_len_per_req = [req.extend_input_len for req in batch.reqs]
+            else:
+                extend_input_len_per_req = None
+            if batch.return_logprob:
+                extend_logprob_start_len_per_req = [req.extend_logprob_start_len for req in batch.reqs]
+            else:
+                extend_logprob_start_len_per_req = None
 
-        ret = GenerationBatchResult(
-            logits_output=batch_output.logits_output,
-            next_token_ids=batch_output.next_token_ids.tolist(),
-            extend_input_len_per_req=extend_input_len_per_req,
-            extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
-            bid=bid,
-            cache_miss_count=batch_output.cache_miss_count,
-            next_draft_input=batch_output.next_draft_input,
-            accept_lens=batch_output.accept_lens,
-            allocate_lens=batch_output.allocate_lens,
-        )
+            ret = GenerationBatchResult(
+                logits_output=batch_output.logits_output,
+                next_token_ids=batch_output.next_token_ids.tolist(),
+                extend_input_len_per_req=extend_input_len_per_req,
+                extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+                bid=bid,
+                cache_miss_count=batch_output.cache_miss_count,
+                next_draft_input=batch_output.next_draft_input,
+                accept_lens=batch_output.accept_lens,
+                allocate_lens=batch_output.allocate_lens,
+            )
 
         return ret
 

@@ -49,6 +49,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.is_not_in_free_group = True
         if self.free_group:
             all_free_indices = np.concatenate(self.free_group)
+            print(f"========={all_free_indices=}===========")
             self.free(all_free_indices)
 
     def merge_and_sort_free(self):
@@ -97,6 +98,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_slots = np.arange(1, self.size + 1, dtype=np.int32)
+        self.origin_size = len(self.free_slots)
         self.is_not_in_free_group = True
         self.free_group = []
 
