@@ -97,14 +97,8 @@ class LogitsProcessorOutput:
             ]
 
         else:
-            print(
-                f"-------truncate_logits_processor_output-----------{self.hidden_states.shape=}-------------"
-            )
             self.next_token_logits = self.next_token_logits[0 : batch.real_bs]
             self.hidden_states = self.hidden_states[0 : batch.real_bs]
-            print(
-                f"-------truncate_logits_processor_output-----------{self.hidden_states.shape=}-------------"
-            )
 
         # assert not batch.capture_hidden_mode.need_capture()
 

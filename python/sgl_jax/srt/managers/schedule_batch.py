@@ -1318,7 +1318,6 @@ class ModelWorkerBatch:
         bs_paddings: list,
         cache_loc_paddings: list,
     ):
-        print(f"{self.seq_lens=} {token_paddings=} {bs_paddings=} {cache_loc_paddings=}")
         if self.forward_mode.is_decode_or_idle():
             token_paddings = bs_paddings
         else:
@@ -1342,9 +1341,6 @@ class ModelWorkerBatch:
             )
         padded_input_ids_len = len(input_ids_cpu)
         out_cache_loc_num_to_padding = padded_input_ids_len - len(self.out_cache_loc)
-        print(
-            f"========{out_cache_loc_num_to_padding=}========{padded_input_ids_len=}=========={len(self.out_cache_loc)=}======="
-        )
         if out_cache_loc_num_to_padding >= 0:
             out_cache_loc_cpu = np.concatenate(
                 [
@@ -1424,16 +1420,12 @@ class ModelWorkerBatch:
                 )
                 # padding
         padding_size = 0
-        print(
-            f"=={self.forward_mode=}====={self.extend_seq_lens=}== {bs_padding_size=}={len(seq_lens_cpu)=}="
-        )
         if (
             self.forward_mode == ForwardMode.DRAFT_EXTEND
             or self.forward_mode == ForwardMode.TARGET_VERIFY
         ):
             padding_size = len(input_ids_cpu) - len(self.positions)
         elif self.forward_mode == ForwardMode.EXTEND or self.forward_mode == ForwardMode.MIXED:
-            print(f"..............{self.forward_mode=}.............")
             total_tokens_before_padding = sum([extend_len for extend_len in extend_seq_lens])
             padding_size = len(input_ids_cpu) - total_tokens_before_padding
         else:

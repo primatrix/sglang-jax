@@ -121,7 +121,6 @@ class EAGLEWorker(ModelWorker):
         model_worker_batch: ModelWorkerBatch,
     ):
         if model_worker_batch.forward_mode.is_extend():
-            print("------------extend----------------")
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
                 model_worker_batch,
                 len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
@@ -131,13 +130,11 @@ class EAGLEWorker(ModelWorker):
             logits_output, next_token_ids, cache_miss_count, bid, seq_lens = (
                 self.forward_target_extend(model_worker_batch, sampling_metadata)
             )
-            print("-------after target-----extend----------------")
 
             # draft extend for Update Draft State
             self.draft_extend_for_prefill(
                 model_worker_batch, logits_output.hidden_states, next_token_ids
             )
-            print("-------after draft-----extend----------------")
 
             # FIXME(pc) refactor this to batch output
             batch_output = GenerationBatchResult(
@@ -150,16 +147,12 @@ class EAGLEWorker(ModelWorker):
             return batch_output
 
         else:
-            print("------------decode----------------")
             cur_allocate_lens = model_worker_batch.spec_info.allocate_lens
             self.draft(model_worker_batch)
-            print("------------after draft decode----------------")
 
             batch_output = self.verify(model_worker_batch, cur_allocate_lens)
-            print("------------after target verify----------------")
 
             self.forward_draft_extend_after_decode(model_worker_batch, batch_output)
-            print("------------after draft decode after verify----------------")
 
             return batch_output
 
@@ -308,11 +301,8 @@ class EAGLEWorker(ModelWorker):
             self.page_size,
             self.model_runner.rngs,
         )
-        print(f"==============={accept_index=}==============")
         logits_output.next_token_logits = logits_output.next_token_logits[accept_index]
         logits_output.hidden_states = logits_output.hidden_states[accept_index]
-        print(f"==================={logits_output.next_token_logits.shape=}=================")
-        print(f"==================={logits_output.hidden_states.shape=}=================")
 
         new_seq_lens = model_worker_batch.seq_lens + accept_length
 

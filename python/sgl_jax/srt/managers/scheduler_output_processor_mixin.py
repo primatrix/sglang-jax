@@ -100,17 +100,7 @@ class SchedulerOutputProcessorMixin:
                             >= precision_tracer.get_max_requests()
                         ):
                             precision_tracer.stop_trace()
-                    _, _, available_size, evictable_size = self._get_token_info()
-                    print(
-                        f"3333=process_batch_result_prefill========{available_size=}=========={evictable_size=}=============="
-                    )
-
                     self.tree_cache.cache_finished_req(req)
-                    _, _, available_size, evictable_size = self._get_token_info()
-
-                    print(
-                        f"4444=process_batch_result_prefill========{available_size=}=========={evictable_size=}=============="
-                    )
 
                 elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                     # This updates radix so others can match
@@ -247,9 +237,6 @@ class SchedulerOutputProcessorMixin:
 
             req.check_finished(new_accepted_len)
             if req.finished():
-                print(
-                    f"---{batch.spec_algorithm=}----------------{self.cur_batch.forward_mode=}-------------"
-                )
                 if batch.spec_algorithm.is_eagle() and self.cur_batch.forward_mode.is_extend():
                     start_p = batch.seq_lens[i] + accept_lens_list[i]
                     end_p = allocate_lens_list[i]
@@ -260,13 +247,6 @@ class SchedulerOutputProcessorMixin:
                     indices_to_free = self.req_to_token_pool.req_to_token[req.req_pool_idx][
                         start_p:end_p
                     ]
-                    print(f"============{batch.seq_lens=}========================")
-                    print(f"============{accept_lens_list=}========================")
-                    print(f"============{allocate_lens_list=}========================")
-                    print(f"============{start_p=}========================")
-                    print(f"============{end_p=}========================")
-
-                    print(f"============{indices_to_free=}============")
                     self.token_to_kv_pool_allocator.free(indices_to_free)
                 # End trace for finished request
                 if precision_tracer.get_trace_active():

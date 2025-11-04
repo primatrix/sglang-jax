@@ -734,7 +734,6 @@ class Scheduler(
         else:
             # Run decode
             if not self.running_batch.is_empty():
-                print(f"=================={self.running_batch.seq_lens=}================")
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
@@ -830,19 +829,9 @@ class Scheduler(
         ):
             self.running_batch.filter_batch()
             if not self.running_batch.is_empty():
-                _, _, available_size, evictable_size = self._get_token_info()
-                print(
-                    f"=111===get_new_batch_prefill======{available_size=}===={evictable_size=}=============="
-                )
                 self.running_batch.prepare_for_decode()
-                print(
-                    f"==222==get_new_batch_prefill======{available_size=}===={evictable_size=}=============="
-                )
 
                 new_batch.mix_with_running(self.running_batch)
-                print(
-                    f"==333==get_new_batch_prefill======{available_size=}===={evictable_size=}=============="
-                )
 
                 new_batch.decoding_reqs = self.running_batch.reqs
 
@@ -956,18 +945,11 @@ class Scheduler(
                 # eagle's model_worker_batch will be modified and repadding within eagle_worker
                 skip_padding=True,
             )
-            print(f"====={model_worker_batch.forward_mode=}==========")
             batch_output = self.draft_worker.forward_batch_speculative_generation(
                 model_worker_batch
             )
-            if (
-                model_worker_batch.forward_mode == ForwardMode.DRAFT_EXTEND
-                or batch.forward_mode == ForwardMode.DECODE
-            ):
-                batch.forward_mode = ForwardMode.DRAFT_EXTEND
         bid = batch_output.bid
         batch.output_ids = batch_output.next_token_ids
-        print(f"{batch.output_ids=}")
         # These 2 values are needed for processing the output, but the values can be
         # modified by overlap schedule. So we have to copy them here so that
         # we can use the correct values in output processing.
@@ -1000,7 +982,6 @@ class Scheduler(
         result: GenerationBatchResult,
         launch_done: threading.Event | None = None,
     ):
-        print(f"====process_batch_result==={batch.forward_mode=}=================")
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result, launch_done)
         elif batch.forward_mode.is_extend():

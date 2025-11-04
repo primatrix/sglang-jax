@@ -198,8 +198,6 @@ class LlamaEagleModel(LlamaModel):
         if hidden_states.shape[-1] != embeds.shape[-1]:
             hidden_states = self.fc(hidden_states)[0]
 
-        print(f"=========={hidden_states.shape=}=============")
-        print(f"=========={embeds.shape=}=============")
         residual = None
         hidden_states, residual, kv_fused = self.midlayer(
             positions=positions,
