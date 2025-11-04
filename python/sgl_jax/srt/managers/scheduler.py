@@ -413,10 +413,6 @@ class Scheduler(
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             if batch:
-                if batch.spec_info is not None:
-                    print(f"=========={batch.spec_info.allocate_lens=}================")
-
-                
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:

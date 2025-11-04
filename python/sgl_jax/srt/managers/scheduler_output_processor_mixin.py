@@ -237,13 +237,7 @@ class SchedulerOutputProcessorMixin:
 
             req.check_finished(new_accepted_len)
             if req.finished():
-                print(f"==={req.rid=}========{batch.spec_algorithm.is_eagle()=}======================={self.cur_batch.forward_mode.is_extend()=}=============")
                 if batch.spec_algorithm.is_eagle():
-                    # 相当于最后一次decode之后, 多申请的那些free掉
-                    print(f"============{batch.seq_lens[i]=}==========================")
-                    print(f"============{accept_lens_list[i]=}==========================")
-                    print(f"============{allocate_lens_list[i]=}==========================")
-                    print(f"============{self.req_to_token_pool.req_to_token[req.req_pool_idx][:50]=}==========================")
                     all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
                     if self.page_size > 1:
                         all_token_len = cdiv(all_token_len, self.page_size) * self.page_size
@@ -251,7 +245,7 @@ class SchedulerOutputProcessorMixin:
                         req.req_pool_idx,
                         all_token_len : -1,
                     ]
-                    kv_indices=kv_indices[kv_indices != 0]
+                    kv_indices = kv_indices[kv_indices != 0]
                     # start_p = batch.seq_lens[i] + accept_lens_list[i] - (len(req.output_ids) - 1)
                     # end_p = allocate_lens_list[i]
                     # print(f"============{start_p=}======================={end_p=}======={ batch.seq_lens[i]=}====={accept_lens_list[i]}=")
@@ -262,8 +256,6 @@ class SchedulerOutputProcessorMixin:
                     #     start_p:end_p
                     # ]
                     self.token_to_kv_pool_allocator.free(kv_indices)
-                    _, _, available_size, evictable_size = self._get_token_info()
-                    print(f"=aaaa========={available_size=}============={evictable_size=}====={kv_indices=}===========")
                 # End trace for finished request
                 if precision_tracer.get_trace_active():
                     precision_tracer.set_request_status_to_completed(req.rid)
@@ -281,8 +273,6 @@ class SchedulerOutputProcessorMixin:
                     ):
                         precision_tracer.stop_trace()
                 self.tree_cache.cache_finished_req(req)
-                _, _, available_size, evictable_size = self._get_token_info()
-                print(f"====bbbb======{available_size=}============={evictable_size=}================")
 
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding
@@ -308,8 +298,6 @@ class SchedulerOutputProcessorMixin:
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
         batch.cache_miss_count = cache_miss_count
-        _, _, available_size, evictable_size = self._get_token_info()
-        print(f"====ccccc======{available_size=}============={evictable_size=}================")
         if (
             self.forward_ct_decode % self.server_args.decode_log_interval == 0
             or batch.cache_miss_count > 0

@@ -451,12 +451,6 @@ class EagleDraftInput:
                 last_loc,
                 extend_num_tokens,
             )
-        print(f"=================={schedule_batch.seq_lens=}===========================")
-        print(f"=================={out_cache_loc=}===========================")
-        print(f"=================={self.allocate_lens=}===========================")
-        print(f"=================={schedule_batch.spec_info.allocate_lens=}===========================")
-        
-        print(f"=================={new_allocate_lens=}===========================")
         assign_req_to_token_pool(
             schedule_batch.req_pool_indices,
             schedule_batch.req_to_token_pool,
@@ -1103,7 +1097,6 @@ def assign_req_to_token_pool(
         [np.array([0], dtype=np.int32), np.cumsum(out_cache_lens)]
     )[0:-1]
     for i in range(bs):
-        print(f"=================={req_to_token_pool.req_to_token[req_pool_indices[i]][:50]=}===========================")
         out_cache_loc_start = out_cache_loc_start_positions[i]
         req_to_token_pool.write(
             (req_pool_indices[i], slice(start_offsets[i], end_offsets[i])),

@@ -205,7 +205,6 @@ class RadixCache(BasePrefixCache):
     def cache_finished_req(self, req: Req):
         """Cache completed requests"""
         all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-        print(f"==ddddd==={len(req.origin_input_ids)=}={max(len(req.output_ids) - 1, 0)=}====={all_token_len=}==========")
         if self.disable:
             kv_indices = self.req_to_token_pool.read(
                 req.req_pool_idx,
