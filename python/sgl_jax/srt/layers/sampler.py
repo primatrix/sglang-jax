@@ -37,9 +37,9 @@ class Sampler(nnx.Module):
         temperatures_shape = sampling_metadata.temperatures.shape
 
         # Temperatures should be (batch_size, 1) for proper broadcasting
-        #assert (
-        #    temperatures_shape[0] == logits_batch_size
-        #), f"Temperature batch size {temperatures_shape[0]} doesn't match logits batch size {logits_batch_size}"
+        assert (
+            temperatures_shape[0] == logits_batch_size
+        ), f"Temperature batch size {temperatures_shape[0]} doesn't match logits batch size {logits_batch_size}"
 
         # Post process logits
         processed_logits = jnp.divide(logits, sampling_metadata.temperatures[:logits_batch_size]).astype(logits.dtype)
@@ -49,11 +49,11 @@ class Sampler(nnx.Module):
         args = (
             logits,
             probs,
-            sampling_metadata.top_ks[:logits_batch_size],
-            sampling_metadata.top_ps[:logits_batch_size],
-            sampling_metadata.min_ps[:logits_batch_size],
+            sampling_metadata.top_ks,
+            sampling_metadata.top_ps,
+            sampling_metadata.min_ps,
             positions,
-            sampling_metadata.temperatures[:logits_batch_size],
+            sampling_metadata.temperatures,
             sampling_metadata.sampling_seeds,
             sampling_metadata.need_min_p_sampling,
             rng,

@@ -242,18 +242,12 @@ class LogitsProcessor(nnx.Module):
             input_logprob_indices_pt = 0
             input_logprob_indices = []
             pt, pruned_states = 0, []
+
             for extend_logprob_start_len, extend_len in zip(
                 logits_metadata.extend_logprob_start_lens_cpu,
                 logits_metadata.extend_seq_lens_cpu,
             ):
-                if extend_len == 0:
-                    break
-
                 start_len = extend_logprob_start_len
-
-                # We always need at least 1 token to sample because that's required
-                # by a caller.
-                assert extend_len > start_len
                 pruned_states.append(hidden_states[pt + start_len : pt + extend_len])
                 pt += extend_len
                 sample_index_pt += extend_len - start_len
