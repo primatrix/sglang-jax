@@ -896,7 +896,7 @@ class ScheduleBatch:
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
-
+        print(f"==========prepare_for_decode========{bs=}===========================")
         if self.spec_algorithm.is_eagle():
             # if spec decoding is used, the decode batch is prepared inside
             # `forward_batch_speculative_generation` after running draft models.
@@ -978,6 +978,14 @@ class ScheduleBatch:
             self.seq_lens = np.array(self.seq_lens)
             self.output_ids = np.array(self.output_ids)
         self.seq_lens = self.seq_lens[keep_indices]
+        print(f"filter batch ==================={self.spec_info.allocate_lens=} ==================={self.seq_lens=}")
+        if self.spec_info is not None and self.spec_info.topk_p is not None:
+            keep_indices_jax = jnp.asarray(keep_indices, dtype=jnp.int32)
+            self.spec_info.topk_p = self.spec_info.topk_p[keep_indices_jax]
+            self.spec_info.topk_index = self.spec_info.topk_index[keep_indices_jax]
+            self.spec_info.hidden_states = self.spec_info.hidden_states[keep_indices_jax]
+            self.spec_info.verified_id = self.spec_info.verified_id[keep_indices_jax]
+            self.spec_info.allocate_lens = self.spec_info.allocate_lens[keep_indices_jax]
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
         if not isinstance(keep_indices, np.ndarray):

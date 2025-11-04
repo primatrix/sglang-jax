@@ -408,17 +408,17 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
-            _, _, available_size, evictable_size = self._get_token_info()
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
-            _, _, available_size, evictable_size = self._get_token_info()
             if batch:
+                if batch.spec_info is not None:
+                    print(f"=========={batch.spec_info.allocate_lens=}================")
+
+                
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
-                _, _, available_size, evictable_size = self._get_token_info()
-                print(f"==33333===={available_size=}============={evictable_size=}================")
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()

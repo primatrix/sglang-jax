@@ -135,12 +135,12 @@ class EAGLEWorker(ModelWorker):
             self.draft_extend_for_prefill(
                 model_worker_batch, logits_output.hidden_states, next_token_ids
             )
-
             # FIXME(pc) refactor this to batch output
             batch_output = GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
                 next_draft_input=model_worker_batch.spec_info,
+                allocate_lens=model_worker_batch.seq_lens,
                 bid=bid,
                 cache_miss_count=cache_miss_count,
             )

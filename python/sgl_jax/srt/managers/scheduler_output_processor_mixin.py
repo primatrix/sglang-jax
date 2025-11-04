@@ -240,6 +240,10 @@ class SchedulerOutputProcessorMixin:
                 print(f"==={req.rid=}========{batch.spec_algorithm.is_eagle()=}======================={self.cur_batch.forward_mode.is_extend()=}=============")
                 if batch.spec_algorithm.is_eagle():
                     # 相当于最后一次decode之后, 多申请的那些free掉
+                    print(f"============{batch.seq_lens[i]=}==========================")
+                    print(f"============{accept_lens_list[i]=}==========================")
+                    print(f"============{allocate_lens_list[i]=}==========================")
+                    print(f"============{self.req_to_token_pool.req_to_token[req.req_pool_idx][:50]=}==========================")
                     all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
                     if self.page_size > 1:
                         all_token_len = cdiv(all_token_len, self.page_size) * self.page_size

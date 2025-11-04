@@ -49,7 +49,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.is_not_in_free_group = True
         if self.free_group:
             all_free_indices = np.concatenate(self.free_group)
-            print(f"========={all_free_indices=}===========")
+            print(f"==={all_free_indices.shape=}======{all_free_indices=}===========")
             self.free(all_free_indices)
 
     def merge_and_sort_free(self):
