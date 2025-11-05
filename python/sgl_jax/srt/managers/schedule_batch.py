@@ -333,6 +333,7 @@ class Req:
             )
             self.last_matched_prefix_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
+        print(f"==============={self.prefix_indices=}===========================")
 
     def adjust_max_prefix_ids(self):
         self.fill_ids = self.origin_input_ids + self.output_ids
@@ -673,8 +674,11 @@ class ScheduleBatch:
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
             assert seq_len - pre_len == req.extend_input_len
-
             prefix_indices = req.prefix_indices
+            print(
+                f"=======prepare_for_extend========={req.rid=}====={pre_len=}===={prefix_indices=}====="
+            )
+
             if pre_len > 0:
                 # note: prefix_indices has to locate on device, or will meet Received incompatible devices for jitted computation
                 self.req_to_token_pool.write((req.req_pool_idx, slice(0, pre_len)), prefix_indices)
@@ -772,7 +776,6 @@ class ScheduleBatch:
                 out_cache_loc[pt : pt + extend_lens[i]],
             )
             pt += extend_lens[i]
-
         # Build sampling info
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,

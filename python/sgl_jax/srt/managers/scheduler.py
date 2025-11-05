@@ -383,14 +383,12 @@ class Scheduler(
         self.req_to_token_pool, self.token_to_kv_pool_allocator = self.tp_worker.get_memory_pool()
 
         if server_args.chunked_prefill_size is not None and server_args.disable_radix_cache:
-            print("**************chunk cache**********************")
-            
+
             self.tree_cache = ChunkCache(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             )
         else:
-            print("**************init redix cache**********************")
             self.tree_cache = RadixCache(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -407,14 +405,22 @@ class Scheduler(
 
     def event_loop_normal(self):
         """A normal scheduler loop."""
+        evictable_size = 0
         while True:
             recv_reqs = self.recv_requests()
+
             self.process_input_requests(recv_reqs)
             batch = self.get_next_batch_to_run()
+
             self.cur_batch = batch
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+                _, _, available_size, evictable_size = self._get_token_info()
+                protect_size = self.tree_cache.protected_size()
+                print(
+                    f"=====after process_batch_result===={available_size=}============={evictable_size=}=========={protect_size=}======"
+                )
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
@@ -735,6 +741,10 @@ class Scheduler(
         else:
             # Run decode
             if not self.running_batch.is_empty():
+                print(
+                    f"==== before self.update_running_batch ==================={self.running_batch.req_to_token_pool.req_to_token[self.running_batch.req_pool_indices[0]][0:50]=}======="
+                )
+
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
@@ -805,7 +815,8 @@ class Scheduler(
             self.chunked_req.is_chunked += 1
 
         self.log_prefill_stats(adder, can_run_list, running_bs)
-
+        _, _, available_size, evictable_size = self._get_token_info()
+        print(f"========={available_size=}============={evictable_size=}================")
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
             can_run_list,
@@ -819,9 +830,18 @@ class Scheduler(
             chunked_req=self.chunked_req,
             mesh=self.mesh,
         )
-
+        _, _, available_size, evictable_size = self._get_token_info()
+        protect_size = self.tree_cache.protected_size()
+        print(
+            f"=====before prepare for prefill===={available_size=}============={evictable_size=}======={protect_size=}========="
+        )
         new_batch.prepare_for_extend()
+        protect_size = self.tree_cache.protected_size()
 
+        _, _, available_size, evictable_size = self._get_token_info()
+        print(
+            f"=====after prepare for prefill===={available_size=}============={evictable_size=}========={protect_size=}======="
+        )
         # Mixed-style chunked prefill
         if (
             self.is_mixed_chunk
@@ -831,7 +851,9 @@ class Scheduler(
             self.running_batch.filter_batch()
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
-
+                print(
+                    f"==== after self.running_batch.prepare_for_decode() ==================={self.running_batch.req_to_token_pool.req_to_token[self.running_batch.req_pool_indices[0]][0:50]=}======="
+                )
                 new_batch.mix_with_running(self.running_batch)
 
                 new_batch.decoding_reqs = self.running_batch.reqs
@@ -880,9 +902,16 @@ class Scheduler(
 
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
+        print(
+            f"==== before batch.prepare_for_decode() ==================={batch.req_to_token_pool.req_to_token[batch.req_pool_indices[0]][0:50]=}======="
+        )
 
         # Update batch arrays
         batch.prepare_for_decode()
+        print(
+            f"==== after batch.prepare_for_decode() ==================={batch.req_to_token_pool.req_to_token[batch.req_pool_indices[0]][0:50]=}======="
+        )
+
         return batch
 
     def run_batch(self, batch: ScheduleBatch) -> GenerationBatchResult:
@@ -961,7 +990,9 @@ class Scheduler(
             else:
                 extend_input_len_per_req = None
             if batch.return_logprob:
-                extend_logprob_start_len_per_req = [req.extend_logprob_start_len for req in batch.reqs]
+                extend_logprob_start_len_per_req = [
+                    req.extend_logprob_start_len for req in batch.reqs
+                ]
             else:
                 extend_logprob_start_len_per_req = None
 

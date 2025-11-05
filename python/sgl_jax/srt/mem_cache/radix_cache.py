@@ -221,7 +221,7 @@ class RadixCache(BasePrefixCache):
         actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
         kv_indices = self.req_to_token_pool.read(req.req_pool_idx, all_token_len)
         kv_indices = kv_indices[kv_indices != 0]
-        
+
         if self.page_size != 1:
             page_aligned_len = actual_kv_len // self.page_size * self.page_size
             page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
@@ -229,7 +229,7 @@ class RadixCache(BasePrefixCache):
         else:
             page_aligned_len = actual_kv_len
             page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
-            
+
         page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
         old_prefix_len = len(req.prefix_indices)
         if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
@@ -243,6 +243,10 @@ class RadixCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
         # free the unaligned tail
         self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+
+        print(
+            f"==========={self.req_to_token_pool.req_to_token[req.req_pool_idx][:50]=}============"
+        )
         # Remove request slot and release cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
         self.dec_lock_ref(req.last_node)
@@ -258,6 +262,9 @@ class RadixCache(BasePrefixCache):
         # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
         actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
         kv_indices = self.req_to_token_pool.read(req.req_pool_idx, all_token_len)
+        print(
+            f"before RadixCache.cache_unfinished_req ============={self.req_to_token_pool.req_to_token[req.req_pool_idx][self.req_to_token_pool.req_to_token[req.req_pool_idx]!=0]}"
+        )
 
         if self.page_size != 1:
             page_aligned_len = actual_kv_len // self.page_size * self.page_size
@@ -278,6 +285,9 @@ class RadixCache(BasePrefixCache):
 
         # Radix Cache takes over one reference from memory pool
         new_prefix_len = self.insert(page_aligned_token_ids, page_aligned_kv_indices)
+        print(
+            f"kv_indices[old_prefix_len:new_prefix_len]================={kv_indices[old_prefix_len:new_prefix_len]=}"
+        )
         self.token_to_kv_pool_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
 
         # Prefix indices may have been updated, reuse them
@@ -305,6 +315,9 @@ class RadixCache(BasePrefixCache):
             else:
                 req.prefix_indices = new_indices
         req.last_node = new_last_node
+        print(
+            f"after RadixCache.cache_unfinished_req ============={self.req_to_token_pool.req_to_token[req.req_pool_idx][self.req_to_token_pool.req_to_token[req.req_pool_idx]!=0]}"
+        )
 
     # note: get_cached_kv is only used by test, skip to replace jnp with np
     def get_cached_kv(self, token_ids: list[int]) -> tuple[jnp.ndarray, int]:
