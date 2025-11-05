@@ -418,7 +418,7 @@ class EagleDraftInput:
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
         model_worker_batch.spec_info.hidden_states = batch_output.next_draft_input.hidden_states
         forward_batch = ForwardBatch.init_new(model_worker_batch, draft_model_runner)
-        forward_metadata = draft_model_runner.attn_backend.get_forward_metadata(model_worker_batch)
+        forward_metadata = draft_model_runner.attn_backend.get_forward_metadata(model_worker_batch, is_eagle=True)
         draft_model_runner.attn_backend.forward_metadata = forward_metadata
         return forward_batch
 
@@ -453,6 +453,10 @@ class EagleDraftInput:
                 last_loc,
                 extend_num_tokens,
             )
+        
+        print(f" before prepare_for_decode {out_cache_loc=}  {self.allocate_lens=} {new_allocate_lens=}")
+        for i in range(schedule_batch.req_pool_indices.shape[0]):
+            print(f" before prepare_for_decode {schedule_batch.req_to_token_pool.req_to_token[schedule_batch.req_pool_indices[i]][0:50]=}")
         assign_req_to_token_pool(
             schedule_batch.req_pool_indices,
             schedule_batch.req_to_token_pool,
@@ -460,6 +464,8 @@ class EagleDraftInput:
             new_allocate_lens,
             out_cache_loc,
         )
+        for i in range(schedule_batch.req_pool_indices.shape[0]):
+            print(f" after prepare_for_decode {schedule_batch.req_to_token_pool.req_to_token[schedule_batch.req_pool_indices[i]][0:50]=}")
 
         self.allocate_lens = new_allocate_lens
 
@@ -675,7 +681,8 @@ class EagleVerifyInput:
         # TODO: keep draft_token on TPU
         # bs = len(model_worker_batch.req_pool_indices)
         model_worker_batch.input_ids = self.draft_token
-
+        model_worker_batch.positions = self.positions
+        print(f"======={model_worker_batch.positions=}=============")
         # bs = batch.batch_size()
         prefix_lens = model_worker_batch.seq_lens
         seq_lens_with_draft_token = model_worker_batch.seq_lens + self.draft_token_num
@@ -745,6 +752,9 @@ class EagleVerifyInput:
 
         if is_all_greedy:
             target_predict = jnp.argmax(logits_output.next_token_logits, axis=-1).flatten()
+            print(f"-----------------{candidates=}-------------")
+            print(f"-----------------{target_predict=}-------------")
+            
             accept_index, accept_length, predict = verify_tree_greedy(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable

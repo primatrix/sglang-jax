@@ -96,12 +96,92 @@ class FlashAttentionBackend(AttentionBackend):
         self.forward_metadata = nnx.data(FlashAttentionMetadata())
         self.mesh = mesh
 
-    def get_forward_metadata(self, batch: ModelWorkerBatch, speculative_step_id: int = 0):
+    def get_forward_metadata(self, batch: ModelWorkerBatch,is_eagle:bool=False, speculative_step_id: int = 0, topk: int = 0):
+        if is_eagle:
+            return self.get_eagle_forward_metadata(batch, speculative_step_id=speculative_step_id, topk=topk)
+        
         """Return the metadata for a forward pass."""
         metadata = FlashAttentionMetadata()
 
         indices = np.arange(0, len(batch.cache_loc), self.page_size)
         selected_cache_locs = batch.cache_loc[indices]
+        page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
+
+        if batch.forward_mode == ForwardMode.EXTEND:
+            cu_q_lens = np.concatenate(
+                [
+                    np.array([0], dtype=np.int32),
+                    np.cumsum(batch.extend_seq_lens, dtype=np.int32),
+                ]
+            )
+        elif batch.forward_mode == ForwardMode.DECODE:
+            cu_q_lens = np.concatenate(
+                [
+                    np.array([0], dtype=np.int32),
+                    np.cumsum(np.ones(len(batch.seq_lens), dtype=np.int32)),
+                ]
+            )
+        else:
+            raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
+
+        seq_lens = np.copy(batch.seq_lens)
+
+        aligned_seq_lens = (
+            (batch.seq_lens + self.page_size - 1) // self.page_size
+        ) * self.page_size
+        cu_kv_lens = np.concatenate(
+            [
+                np.array([0], dtype=np.int32),
+                np.cumsum(aligned_seq_lens),
+            ]
+        )
+
+        num_seqs = np.sum(batch.seq_lens > 0, dtype=np.int32).reshape(
+            1,
+        )
+
+        # Construct distribution for V2 kernel: [decode_end, prefill_end, mixed_end]
+        if batch.forward_mode == ForwardMode.DECODE:
+            # All sequences are decode/mixed mode
+            distribution = np.array([0, 0, num_seqs.item()], dtype=np.int32)
+        elif batch.forward_mode == ForwardMode.EXTEND:
+            # All sequences are prefill mode
+            distribution = np.array([0, num_seqs.item(), num_seqs.item()], dtype=np.int32)
+        else:
+            raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
+
+        (
+            metadata.num_seqs,
+            metadata.cu_q_lens,
+            metadata.cu_kv_lens,
+            metadata.page_indices,
+            metadata.seq_lens,
+            metadata.distribution,
+        ) = device_array(
+            (num_seqs, cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
+            sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
+        )
+        return metadata
+    
+    def get_eagle_forward_metadata(self, batch: ModelWorkerBatch, speculative_step_id: int = 0, topk: int = 0):
+        """Return the metadata for a forward pass."""
+        metadata = FlashAttentionMetadata()
+
+        indices = np.arange(0, len(batch.cache_loc), self.page_size)
+        selected_cache_locs = batch.cache_loc[indices]
+        selected_cache_locs_for_draft_decode = np.zeros_like(selected_cache_locs)
+        if batch.forward_mode == ForwardMode.DECODE:
+            # for draft decode
+            offset1 = 0
+            offset2 = 0
+            for i in range(batch.seq_lens.shape[0]):
+                # 这里seq len 前面已经加一了, 对于draft 来说, 需要减1吗
+                print(f"=={speculative_step_id=}====={offset1=}===={batch.seq_lens[i]=}==={(speculative_step_id + 1)* topk=}====={offset1 + batch.seq_lens[i] + (speculative_step_id + 1)* topk}===================")
+                selected_cache_locs_for_draft_decode[offset1: offset1 + batch.seq_lens[i] + (speculative_step_id + 1)* topk] = selected_cache_locs[offset2 : offset2 + batch.seq_lens[i] + (speculative_step_id + 1)* topk]
+                offset1 += batch.seq_lens[i] + (speculative_step_id + 1)*topk
+                offset2 += batch.seq_lens[i] + EagleDraftInput.ALLOC_LEN_PER_DECODE
+            selected_cache_locs = selected_cache_locs_for_draft_decode
+            
         page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
 
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
@@ -182,7 +262,18 @@ class FlashAttentionBackend(AttentionBackend):
             distribution = np.array([0, num_seqs.item(), num_seqs.item()], dtype=np.int32)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
-
+        print(f"                                                                 ")
+        print(f"                                                                 ")
+        print(f"                                                                 ")
+        print(f"               {batch.forward_mode}                    ")
+        print(f"======={batch.cache_loc[batch.cache_loc != 0]=}================")
+        print(f"======{num_seqs=}===={cu_q_lens=}======{cu_kv_lens=}==================")
+        print(f"======{page_indices[0:50]=}===={batch.seq_lens=}======================")
+        if metadata.custom_mask is not None:
+            print(f"======{metadata.custom_mask[:50]=}=========================")
+        print(f"                                                                 ")
+        print(f"                                                                 ")
+        print(f"                                                                 ")
         (
             metadata.num_seqs,
             metadata.cu_q_lens,

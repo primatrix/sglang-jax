@@ -197,7 +197,7 @@ class EAGLEWorker(ModelWorker):
 
         # Set forward_metadata for draft_model_runner's attention backend
         forward_metadata = self.draft_model_runner.attn_backend.get_forward_metadata(
-            model_worker_batch
+            model_worker_batch, is_eagle=True
         )
         self.draft_model_runner.attn_backend.forward_metadata = forward_metadata
         forward_batch.forward_mode = ForwardMode.EXTEND
@@ -284,8 +284,11 @@ class EAGLEWorker(ModelWorker):
     def verify(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens: jax.Array):
         spec_info: EagleVerifyInput = model_worker_batch.spec_info
         spec_info.prepare_for_verify(model_worker_batch, self.page_size, self.target_worker)
+        forward_metadata = self.target_worker.model_runner.attn_backend.get_forward_metadata(
+            model_worker_batch, is_eagle=True
+        )
         logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
-            model_worker_batch, skip_sample=True
+            model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
         )
         logits_output.truncate_logits_processor_output(model_worker_batch)
         spec_info.hidden_states = logits_output.hidden_states
@@ -403,6 +406,8 @@ class EAGLEWorker(ModelWorker):
     def forward_draft_extend_after_decode(
         self, model_worker_batch: ModelWorkerBatch, batch_output: GenerationBatchResult
     ):
+        if batch_output.next_draft_input.verified_id.shape[0] <= 0:
+            return
         draft_input = EagleDraftInput(
             hidden_states=batch_output.logits_output.hidden_states,
         )
@@ -413,6 +418,8 @@ class EAGLEWorker(ModelWorker):
             self.draft_model_runner,
             batch_output,
         )
+        if forward_batch.input_ids.shape[0] <= 0:
+            return 
         draft_logits_output, _ = self.draft_model_runner.forward(
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
@@ -470,13 +477,14 @@ class EAGLEWorker(ModelWorker):
             model_worker_batch.input_ids = input_ids
             model_worker_batch.spec_info.hidden_states = hidden_states
             model_worker_batch.positions = original_positions + 1 + i
+            print(f"===========draft decode====={model_worker_batch.positions=}=======================")
             model_worker_batch.padding_model_worker_batch(
                 self.precompile_token_paddings,
                 self.precompile_bs_paddings,
                 self.precompile_cache_loc_paddings,
             )
             self.draft_model_runner.attn_backend.forward_metadata = (
-                self.draft_model_runner.attn_backend.get_forward_metadata(model_worker_batch, i)
+                self.draft_model_runner.attn_backend.get_forward_metadata(model_worker_batch,is_eagle=True,speculative_step_id=i, topk=topk_index.shape[1])
             )
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
             # Run forward

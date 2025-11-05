@@ -1119,9 +1119,8 @@ class ScheduleBatch:
                 if self.forward_mode == ForwardMode.TARGET_VERIFY:
                     seq_lens = seq_lens_cpu + self.spec_info.draft_token_num
                 elif self.forward_mode == ForwardMode.DECODE:
-                    seq_lens = seq_lens_cpu + self.spec_info.topk_p.shape[1] * (
-                        speculative_step_id + 1
-                    )
+                    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+                    seq_lens = seq_lens_cpu + EagleDraftInput.ALLOC_LEN_PER_DECODE
             # Filter out empty sequences
             valid_mask = seq_lens > 0
             if np.any(valid_mask):
