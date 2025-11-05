@@ -423,9 +423,6 @@ class EagleDraftInput:
         return forward_batch
 
     def prepare_for_decode(self, schedule_batch: ScheduleBatch):
-        print(
-            f"====before prepare for decode ==================={self.allocate_lens=}======="
-        )
         new_allocate_lens = schedule_batch.seq_lens + self.ALLOC_LEN_PER_DECODE
         if new_allocate_lens.shape[0] != self.allocate_lens.shape[0] or np.any(self.allocate_lens < schedule_batch.seq_lens):
             logger.warning(
@@ -456,16 +453,12 @@ class EagleDraftInput:
                 last_loc,
                 extend_num_tokens,
             )
-        print(f"===before assign_req_to_token_pool============{self.allocate_lens=}=================={new_allocate_lens=}=================")
         assign_req_to_token_pool(
             schedule_batch.req_pool_indices,
             schedule_batch.req_to_token_pool,
             self.allocate_lens,
             new_allocate_lens,
             out_cache_loc,
-        )
-        print(
-            f"====after prepare for decode ==================={schedule_batch.req_to_token_pool.req_to_token[schedule_batch.req_pool_indices[0]][0:50]=}======="
         )
 
         self.allocate_lens = new_allocate_lens

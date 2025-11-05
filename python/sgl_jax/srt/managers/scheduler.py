@@ -405,7 +405,6 @@ class Scheduler(
 
     def event_loop_normal(self):
         """A normal scheduler loop."""
-        evictable_size = 0
         while True:
             recv_reqs = self.recv_requests()
 
@@ -416,11 +415,6 @@ class Scheduler(
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
-                _, _, available_size, evictable_size = self._get_token_info()
-                protect_size = self.tree_cache.protected_size()
-                print(
-                    f"=====after process_batch_result===={available_size=}============={evictable_size=}=========={protect_size=}======"
-                )
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
@@ -814,7 +808,6 @@ class Scheduler(
 
         self.log_prefill_stats(adder, can_run_list, running_bs)
         _, _, available_size, evictable_size = self._get_token_info()
-        print(f"========={available_size=}============={evictable_size=}================")
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
             can_run_list,
@@ -830,16 +823,10 @@ class Scheduler(
         )
         _, _, available_size, evictable_size = self._get_token_info()
         protect_size = self.tree_cache.protected_size()
-        print(
-            f"=====before prepare for prefill===={available_size=}============={evictable_size=}======={protect_size=}========="
-        )
         new_batch.prepare_for_extend()
         protect_size = self.tree_cache.protected_size()
 
         _, _, available_size, evictable_size = self._get_token_info()
-        print(
-            f"=====after prepare for prefill===={available_size=}============={evictable_size=}========={protect_size=}======="
-        )
         # Mixed-style chunked prefill
         if (
             self.is_mixed_chunk
@@ -849,9 +836,6 @@ class Scheduler(
             self.running_batch.filter_batch()
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
-                print(
-                    f"==== after self.running_batch.prepare_for_decode() ==================={self.running_batch.req_to_token_pool.req_to_token[self.running_batch.req_pool_indices[0]][0:50]=}======="
-                )
                 new_batch.mix_with_running(self.running_batch)
 
                 new_batch.decoding_reqs = self.running_batch.reqs

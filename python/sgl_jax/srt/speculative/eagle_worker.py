@@ -144,7 +144,6 @@ class EAGLEWorker(ModelWorker):
                 bid=bid,
                 cache_miss_count=cache_miss_count,
             )
-            print(f"============={batch_output.allocate_lens=}================")
             return batch_output
 
         else:
