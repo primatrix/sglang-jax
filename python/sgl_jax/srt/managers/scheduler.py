@@ -741,9 +741,7 @@ class Scheduler(
         else:
             # Run decode
             if not self.running_batch.is_empty():
-                print(
-                    f"==== before self.update_running_batch ==================={self.running_batch.req_to_token_pool.req_to_token[self.running_batch.req_pool_indices[0]][0:50]=}======="
-                )
+
 
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
@@ -902,15 +900,9 @@ class Scheduler(
 
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
-        print(
-            f"==== before batch.prepare_for_decode() ==================={batch.req_to_token_pool.req_to_token[batch.req_pool_indices[0]][0:50]=}======="
-        )
 
         # Update batch arrays
         batch.prepare_for_decode()
-        print(
-            f"==== after batch.prepare_for_decode() ==================={batch.req_to_token_pool.req_to_token[batch.req_pool_indices[0]][0:50]=}======="
-        )
 
         return batch
 

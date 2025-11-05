@@ -144,6 +144,7 @@ class EAGLEWorker(ModelWorker):
                 bid=bid,
                 cache_miss_count=cache_miss_count,
             )
+            print(f"============={batch_output.allocate_lens=}================")
             return batch_output
 
         else:
@@ -207,7 +208,7 @@ class EAGLEWorker(ModelWorker):
         )
         logits_output.truncate_logits_processor_output(model_worker_batch)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
-        forward_batch.spec_info.allocate_lens = model_worker_batch.extend_seq_lens
+        forward_batch.spec_info.allocate_lens = model_worker_batch.seq_lens
         # assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
         # has_finished, unfinished_req_index = False, []
