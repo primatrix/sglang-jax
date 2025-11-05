@@ -237,6 +237,7 @@ class EAGLEWorker(ModelWorker):
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
         spec_info = model_worker_batch.spec_info
+        print(f"=====draft========{spec_info.verified_id=}================")
         assert isinstance(spec_info, EagleDraftInput)
         spec_info.prepare_for_draft_decode(
             model_worker_batch, self.topk, self.speculative_num_steps
@@ -308,7 +309,6 @@ class EAGLEWorker(ModelWorker):
         logits_output.hidden_states = logits_output.hidden_states[accept_index]
 
         new_seq_lens = model_worker_batch.seq_lens + accept_length
-
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,
@@ -441,6 +441,8 @@ class EAGLEWorker(ModelWorker):
         batch_output.next_draft_input.hidden_states = draft_logits_output.hidden_states
         batch_output.next_draft_input.topk_p = topk_p
         batch_output.next_draft_input.topk_index = topk_index
+        verified_id_idx = jnp.cumsum(batch_output.accept_lens) - 1
+        batch_output.next_draft_input.verified_id = batch_output.next_draft_input.verified_id[verified_id_idx]
 
     def draft_forward(self, model_worker_batch: ModelWorkerBatch):
         model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
