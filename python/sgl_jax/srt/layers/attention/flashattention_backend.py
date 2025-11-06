@@ -90,16 +90,24 @@ class FlashAttentionBackend(AttentionBackend):
             self.num_kv_heads = num_kv_heads
         else:
             self.num_kv_heads = num_attn_heads
-        self.head_dim = (head_dim + 127) // 128 * 128
+        self.head_dim = head_dim
         self.page_size = page_size
         self.kv_partition_axis = kv_partition_axis
         self.forward_metadata = nnx.data(FlashAttentionMetadata())
         self.mesh = mesh
 
-    def get_forward_metadata(self, batch: ModelWorkerBatch,is_eagle:bool=False, speculative_step_id: int = 0, topk: int = 0):
+    def get_forward_metadata(
+        self,
+        batch: ModelWorkerBatch,
+        is_eagle: bool = False,
+        speculative_step_id: int = 0,
+        topk: int = 0,
+    ):
         if is_eagle:
-            return self.get_eagle_forward_metadata(batch, speculative_step_id=speculative_step_id, topk=topk)
-        
+            return self.get_eagle_forward_metadata(
+                batch, speculative_step_id=speculative_step_id, topk=topk
+            )
+
         """Return the metadata for a forward pass."""
         metadata = FlashAttentionMetadata()
 
@@ -162,8 +170,10 @@ class FlashAttentionBackend(AttentionBackend):
             sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
         )
         return metadata
-    
-    def get_eagle_forward_metadata(self, batch: ModelWorkerBatch, speculative_step_id: int = 0, topk: int = 0):
+
+    def get_eagle_forward_metadata(
+        self, batch: ModelWorkerBatch, speculative_step_id: int = 0, topk: int = 0
+    ):
         """Return the metadata for a forward pass."""
         metadata = FlashAttentionMetadata()
 
@@ -175,13 +185,15 @@ class FlashAttentionBackend(AttentionBackend):
             offset1 = 0
             offset2 = 0
             for i in range(batch.seq_lens.shape[0]):
-                # 这里seq len 前面已经加一了, 对于draft 来说, 需要减1吗
-                print(f"=={speculative_step_id=}====={offset1=}===={batch.seq_lens[i]=}==={(speculative_step_id + 1)* topk=}====={offset1 + batch.seq_lens[i] + (speculative_step_id + 1)* topk}===================")
-                selected_cache_locs_for_draft_decode[offset1: offset1 + batch.seq_lens[i] + (speculative_step_id + 1)* topk] = selected_cache_locs[offset2 : offset2 + batch.seq_lens[i] + (speculative_step_id + 1)* topk]
-                offset1 += batch.seq_lens[i] + (speculative_step_id + 1)*topk
+                selected_cache_locs_for_draft_decode[
+                    offset1 : offset1 + batch.seq_lens[i] + (speculative_step_id + 1) * topk
+                ] = selected_cache_locs[
+                    offset2 : offset2 + batch.seq_lens[i] + (speculative_step_id + 1) * topk
+                ]
+                offset1 += batch.seq_lens[i] + (speculative_step_id + 1) * topk
                 offset2 += batch.seq_lens[i] + EagleDraftInput.ALLOC_LEN_PER_DECODE
             selected_cache_locs = selected_cache_locs_for_draft_decode
-            
+
         page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
 
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
@@ -262,7 +274,7 @@ class FlashAttentionBackend(AttentionBackend):
             distribution = np.array([0, num_seqs.item(), num_seqs.item()], dtype=np.int32)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
-        
+
         # print(f"                                                                 ")
         # print(f"                                                                 ")
         # print(f"                                                                 ")
@@ -339,8 +351,12 @@ class FlashAttentionBackend(AttentionBackend):
         # Prepare fused KV cache for paged format: [num_pages, page_size, num_kv_heads * 2, head_dim]
         total_tokens = kv_cache_fused.shape[0]
         num_pages = total_tokens // self.page_size
-        kv_cache_fused_paged = kv_cache_fused.reshape(num_pages, self.page_size, -1, self.head_dim)
+        kv_cache_fused_paged = kv_cache_fused.reshape(
+            num_pages, self.page_size, -1, (self.head_dim + 127) // 128 * 128
+        )
+
         causal = 1
+
         # custom_mask = self.forward_metadata.custom_mask
         if forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:
             causal = 0
@@ -403,6 +419,13 @@ class FlashAttentionBackend(AttentionBackend):
             self.forward_metadata.distribution,
             self.forward_metadata.custom_mask,
         )
+        pad_width = (self.head_dim + 127) // 128 * 128 - self.head_dim
+        if pad_width > 0:
+            updated_kv_cache_fused = jnp.pad(
+                updated_kv_cache_fused,
+                ((0, 0), (0, 0), (0, pad_width)),
+                mode="constant",
+            )
 
         return (
             attn_output.reshape(q.shape[0], -1),

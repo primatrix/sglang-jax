@@ -325,7 +325,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             target_path="transformer.midlayer.self_attn.q_proj.weight",
             sharding=(None, "tensor"),
             transpose=True,
-            head_dim_padding=True,
+            head_dim_padding=False,
             kv_head_padding=False,
             is_eagle3=True,
         )
@@ -333,7 +333,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             target_path="transformer.midlayer.self_attn.k_proj.weight",
             sharding=(None, "tensor"),
             transpose=True,
-            head_dim_padding=True,
+            head_dim_padding=False,
             kv_head_padding=True,
             is_eagle3=True,
         )
@@ -341,7 +341,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             target_path="transformer.midlayer.self_attn.v_proj.weight",
             sharding=(None, "tensor"),
             transpose=True,
-            head_dim_padding=True,
+            head_dim_padding=False,
             kv_head_padding=True,
             is_eagle3=True,
         )

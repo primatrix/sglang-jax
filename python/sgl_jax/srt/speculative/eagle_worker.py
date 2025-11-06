@@ -237,7 +237,6 @@ class EAGLEWorker(ModelWorker):
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
         spec_info = model_worker_batch.spec_info
-        print(f"=====draft========{spec_info.verified_id=}================")
         assert isinstance(spec_info, EagleDraftInput)
         spec_info.prepare_for_draft_decode(
             model_worker_batch, self.topk, self.speculative_num_steps
@@ -419,7 +418,7 @@ class EAGLEWorker(ModelWorker):
             batch_output,
         )
         if forward_batch.input_ids.shape[0] <= 0:
-            return 
+            return
         draft_logits_output, _ = self.draft_model_runner.forward(
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
@@ -442,7 +441,9 @@ class EAGLEWorker(ModelWorker):
         batch_output.next_draft_input.topk_p = topk_p
         batch_output.next_draft_input.topk_index = topk_index
         verified_id_idx = jnp.cumsum(batch_output.accept_lens) - 1
-        batch_output.next_draft_input.verified_id = batch_output.next_draft_input.verified_id[verified_id_idx]
+        batch_output.next_draft_input.verified_id = batch_output.next_draft_input.verified_id[
+            verified_id_idx
+        ]
 
     def draft_forward(self, model_worker_batch: ModelWorkerBatch):
         model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
@@ -479,14 +480,18 @@ class EAGLEWorker(ModelWorker):
             model_worker_batch.input_ids = input_ids
             model_worker_batch.spec_info.hidden_states = hidden_states
             model_worker_batch.positions = original_positions + 1 + i
-            print(f"===========draft decode====={model_worker_batch.positions=}=======================")
             model_worker_batch.padding_model_worker_batch(
                 self.precompile_token_paddings,
                 self.precompile_bs_paddings,
                 self.precompile_cache_loc_paddings,
             )
             self.draft_model_runner.attn_backend.forward_metadata = (
-                self.draft_model_runner.attn_backend.get_forward_metadata(model_worker_batch,is_eagle=True,speculative_step_id=i, topk=topk_index.shape[1])
+                self.draft_model_runner.attn_backend.get_forward_metadata(
+                    model_worker_batch,
+                    is_eagle=True,
+                    speculative_step_id=i,
+                    topk=topk_index.shape[1],
+                )
             )
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
             # Run forward
