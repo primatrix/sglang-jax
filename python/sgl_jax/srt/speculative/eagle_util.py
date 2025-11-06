@@ -765,6 +765,7 @@ class EagleVerifyInput:
                 retrive_next_sibling=self.retrive_next_sibling,
                 target_predict=target_predict,
             )
+            print(f"------------------{accept_length=}-------------------{accept_index=}----")
         else:
 
             # apply temperature and get target probs

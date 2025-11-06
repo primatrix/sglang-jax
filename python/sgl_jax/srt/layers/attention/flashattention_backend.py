@@ -262,18 +262,19 @@ class FlashAttentionBackend(AttentionBackend):
             distribution = np.array([0, num_seqs.item(), num_seqs.item()], dtype=np.int32)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
-        print(f"                                                                 ")
-        print(f"                                                                 ")
-        print(f"                                                                 ")
-        print(f"               {batch.forward_mode}                    ")
-        print(f"======={batch.cache_loc[batch.cache_loc != 0]=}================")
-        print(f"======{num_seqs=}===={cu_q_lens=}======{cu_kv_lens=}==================")
-        print(f"======{page_indices[0:50]=}===={batch.seq_lens=}======================")
-        if metadata.custom_mask is not None:
-            print(f"======{metadata.custom_mask[:50]=}=========================")
-        print(f"                                                                 ")
-        print(f"                                                                 ")
-        print(f"                                                                 ")
+        
+        # print(f"                                                                 ")
+        # print(f"                                                                 ")
+        # print(f"                                                                 ")
+        # print(f"               {batch.forward_mode}                    ")
+        # print(f"======={batch.cache_loc[batch.cache_loc != 0]=}================")
+        # print(f"======{num_seqs=}===={cu_q_lens=}======{cu_kv_lens=}==================")
+        # print(f"======{page_indices[0:50]=}===={batch.seq_lens=}====={seq_lens=}=================")
+        # if metadata.custom_mask is not None:
+        #     print(f"======{metadata.custom_mask[:50]=}=========================")
+        # print(f"                                                                 ")
+        # print(f"                                                                 ")
+        # print(f"                                                                 ")
         (
             metadata.num_seqs,
             metadata.cu_q_lens,
