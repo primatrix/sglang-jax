@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import logging
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -213,6 +214,78 @@ def build_tree_kernel_efficient_preprocess(
     return parent_list, top_scores_index, draft_tokens
 
 
+def _extract_parent_branch_indices(
+    parents_entry: np.ndarray, step_index: int, topk: int
+) -> np.ndarray:
+    if step_index == 0:
+        raise ValueError("Step index 0 has no parents")
+    offset = topk if step_index == 1 else topk**2 * (step_index - 1) + topk
+    raw = parents_entry.astype(np.int64) - offset
+    parent_indices = np.floor_divide(raw, topk)
+    parent_indices = np.clip(parent_indices, 0, topk - 1).astype(np.int32)
+    return parent_indices
+
+
+def build_tree_mask_for_draft_decode(
+    seq_lens: jax.Array | np.ndarray,
+    topk: int,
+    speculative_step_id: int,
+    parents_list: Sequence[jax.Array],
+) -> jax.Array:
+    """
+    Build flattened custom mask for draft decode that respects branch ancestry.
+
+    Args:
+        seq_lens: Sequence lengths (prompt+accepted) for each request.
+        topk: Number of speculative branches processed in parallel.
+        speculative_step_id: Current speculative step (0-indexed).
+        parents_list: List of parent index tensors produced by ``select_top_k_tokens``.
+
+    Returns:
+        Flattened boolean mask concatenating ``topk`` rows per request.
+    """
+
+    if topk <= 0:
+        raise ValueError("topk must be positive")
+
+    seq_lens_np = np.asarray(seq_lens, dtype=np.int32)
+    bs = seq_lens_np.shape[0]
+    if speculative_step_id + 1 > len(parents_list):
+        raise ValueError("parents_list must contain at least speculative_step_id + 1 entries")
+
+    # Precompute ancestry mapping: path[step, bid, branch]
+    ancestry = np.zeros((speculative_step_id + 1, bs, topk), dtype=np.int32)
+    ancestry[speculative_step_id] = np.broadcast_to(np.arange(topk, dtype=np.int32), (bs, topk))
+
+    for step in range(speculative_step_id, 0, -1):
+        parents_entry = np.asarray(parents_list[step])
+        parent_indices = _extract_parent_branch_indices(parents_entry, step, topk)
+        for bid in range(bs):
+            child_branch_ids = ancestry[step, bid]
+            ancestry[step - 1, bid] = parent_indices[bid, child_branch_ids]
+
+    masks: list[np.ndarray] = []
+    for bid in range(bs):
+        seq_len = int(seq_lens_np[bid])
+        kv_len = seq_len + (speculative_step_id + 1) * topk
+        mask = np.zeros((topk, kv_len), dtype=np.bool_)
+        mask[:, :seq_len] = True
+
+        for branch in range(topk):
+            for step in range(speculative_step_id + 1):
+                branch_idx = ancestry[step, bid, branch]
+                position = seq_len + step * topk + branch_idx
+                mask[branch, position] = True
+
+        masks.append(mask.reshape(-1))
+
+    if not masks:
+        return jnp.zeros((0,), dtype=jnp.bool_)
+
+    concatenated = np.concatenate(masks)
+    return jnp.asarray(concatenated, dtype=jnp.int32)
+
+
 def build_tree_kernel_efficient(
     verified_id: jax.Array,
     score_list: list[jax.Array],
@@ -414,9 +487,16 @@ class EagleDraftInput:
             [num_draft_tokens for _ in range(len(model_worker_batch.seq_lens))]
         )
         model_worker_batch.extend_prefix_lens = seq_lens_cpu_.tolist()
+        # 这里为什么是full呢, 不应该是last吗????, sglang中是为了overlap, 我们这里不overlap, 应该是last
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
         model_worker_batch.spec_info.hidden_states = batch_output.next_draft_input.hidden_states
+        print(
+            f"=======before======{model_worker_batch.positions=}=============={model_worker_batch.input_ids=}======="
+        )
+        # model_worker_batch.positions = model_worker_batch.spec_info.positions
+        print(f"=======after======{model_worker_batch.positions=}=====================")
+
         forward_batch = ForwardBatch.init_new(model_worker_batch, draft_model_runner)
         forward_metadata = draft_model_runner.attn_backend.get_forward_metadata(
             model_worker_batch, is_eagle=True
@@ -730,6 +810,9 @@ class EagleVerifyInput:
         bs = self.retrive_index.shape[0]
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
         sampling_info = model_worker_batch.sampling_info
+        print(f"================={model_worker_batch.spec_info.draft_token=}================")
+        print(f"================={candidates=}=================================")
+        print(f"================={model_worker_batch.spec_info.positions=}================")
 
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
@@ -748,8 +831,8 @@ class EagleVerifyInput:
 
         if is_all_greedy:
             target_predict = jnp.argmax(logits_output.next_token_logits, axis=-1).flatten()
-            print(f"-----------------{candidates=}-------------")
-            print(f"-----------------{target_predict=}-------------")
+            # print(f"-----------------{candidates=}-------------")
+            # print(f"-----------------{target_predict=}-------------")
 
             accept_index, accept_length, predict = verify_tree_greedy(
                 predicts=predict,  # mutable
@@ -761,7 +844,14 @@ class EagleVerifyInput:
                 retrive_next_sibling=self.retrive_next_sibling,
                 target_predict=target_predict,
             )
-            print(f"------------------{accept_length=}-------------------{accept_index=}----")
+            if accept_length[0] > 0:
+                print(
+                    f"\033[32m------------------{accept_length=}-------------------{accept_index=}----\033[0m"
+                )
+            else:
+                print(
+                    f"\033[31m------------------{accept_length=}-------------------{accept_index=}----\033[0m"
+                )
         else:
 
             # apply temperature and get target probs
@@ -932,7 +1022,7 @@ def build_eagle_tree_structure(
         tree_mask_capacity = (
             inferred_actual_size if max_tree_mask_size is None else max_tree_mask_size
         )
-
+    print(f"{tree_mask_capacity=}")
     tree_mask = jnp.zeros((tree_mask_capacity,), dtype=jnp.bool_)
     if tree_mask_size > 0:
         tree_mask = tree_mask.at[:tree_mask_size].set(True)

@@ -172,7 +172,7 @@ class FlashAttentionBackend(AttentionBackend):
         return metadata
 
     def get_eagle_forward_metadata(
-        self, batch: ModelWorkerBatch, speculative_step_id: int = 0, topk: int = 0
+        self, batch: ModelWorkerBatch, speculative_step_id: int = 0, topk: int = 1
     ):
         """Return the metadata for a forward pass."""
         metadata = FlashAttentionMetadata()
@@ -232,14 +232,16 @@ class FlashAttentionBackend(AttentionBackend):
                         np.cumsum(jnp.ones(len(batch.seq_lens), dtype=np.int32)),
                     ]
                 )
+                assert False, "should not reach here"
             else:
                 assert isinstance(batch.spec_info, EagleDraftInput)
                 cu_q_lens = np.arange(
                     0,
-                    len(batch.seq_lens) * batch.spec_info.topk_p.shape[1] + 1,
-                    step=batch.spec_info.topk_p.shape[1],
+                    len(batch.seq_lens) * topk + 1,
+                    step=topk,
                     dtype=np.int32,
                 )
+
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
@@ -249,7 +251,7 @@ class FlashAttentionBackend(AttentionBackend):
             seq_lens += extend_seq_lens
             aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
         elif batch.forward_mode.is_decode() and not batch.spec_algorithm.is_none():
-            seq_lens += speculative_step_id + 1
+            seq_lens += topk
             aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
         else:
             aligned_seq_lens = (

@@ -209,7 +209,7 @@ class LlamaEagleModel(LlamaModel):
         )
         if residual is not None:
             hidden_states = hidden_states + residual
-            residual = hidden_states
+            residual = hidden_states.copy()
         hidden_states_to_logits = self.norm(hidden_states)
 
         layers_kv_fused = [kv_fused] if kv_fused is not None else []

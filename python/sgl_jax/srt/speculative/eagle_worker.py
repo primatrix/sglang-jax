@@ -27,6 +27,7 @@ from sgl_jax.srt.speculative.eagle_util import (
     EagleVerifyInput,
     EagleVerifyOutput,
     build_tree_kernel_efficient,
+    build_tree_mask_for_draft_decode,
     get_last_loc_large_page_size_large_top_k,
     get_last_loc_large_page_size_top_k_1,
 )
@@ -192,6 +193,7 @@ class EAGLEWorker(ModelWorker):
             model_worker_batch=model_worker_batch
         )
         model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
         forward_batch.return_logprob = False
 
@@ -201,15 +203,34 @@ class EAGLEWorker(ModelWorker):
         )
         self.draft_model_runner.attn_backend.forward_metadata = forward_metadata
         forward_batch.forward_mode = ForwardMode.EXTEND
+        last_idx = np.cumsum(model_worker_batch.extend_seq_lens, axis=0) - 1
+
+        print(f"=========last_idx======={last_idx=}======================")
         logits_output, _ = self.draft_model_runner.forward(
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
+        print(f"====before trucate========{logits_output.hidden_states=}======================")
+        print(f"====before trucate========{logits_output.next_token_logits=}======================")
         logits_output.truncate_logits_processor_output(model_worker_batch)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         forward_batch.spec_info.allocate_lens = model_worker_batch.seq_lens
         # assert forward_batch.spec_info is batch.spec_info
+        print(
+            f"====before capture for decode========{logits_output.hidden_states=}======================"
+        )
+        print(
+            f"====before capture for decod========{logits_output.next_token_logits=}======================"
+        )
+
         self.capture_for_decode(logits_output, forward_batch.spec_info)
+        print(
+            f"====after capture for decode========{forward_batch.spec_info.hidden_states=}======================"
+        )
+        print(
+            f"====after capture for decod========{logits_output.next_token_logits=}======================"
+        )
+
         # has_finished, unfinished_req_index = False, []
         # for i, req in enumerate(batch.reqs):
         #     if req.finished():
@@ -243,6 +264,9 @@ class EAGLEWorker(ModelWorker):
         )
         # Run forward steps
         score_list, token_list, parents_list = self.draft_forward(model_worker_batch)
+        print(f"==========={token_list=}=========================")
+        print(f"==========={parents_list=}=========================")
+
         (
             tree_mask,
             position,
@@ -306,7 +330,7 @@ class EAGLEWorker(ModelWorker):
         )
         logits_output.next_token_logits = logits_output.next_token_logits[accept_index]
         logits_output.hidden_states = logits_output.hidden_states[accept_index]
-
+        model_worker_batch.positions = model_worker_batch.positions[accept_index]
         new_seq_lens = model_worker_batch.seq_lens + accept_length
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
@@ -423,6 +447,7 @@ class EAGLEWorker(ModelWorker):
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
+
         draft_logits_output.truncate_logits_processor_output(model_worker_batch)
         self.capture_for_decode(draft_logits_output, forward_batch.spec_info)
         select_index = (
@@ -469,7 +494,7 @@ class EAGLEWorker(ModelWorker):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
-
+            print(f"==================={hidden_states=}===========================")
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
@@ -480,11 +505,12 @@ class EAGLEWorker(ModelWorker):
             model_worker_batch.input_ids = input_ids
             model_worker_batch.spec_info.hidden_states = hidden_states
             model_worker_batch.positions = original_positions + 1 + i
-            model_worker_batch.padding_model_worker_batch(
-                self.precompile_token_paddings,
-                self.precompile_bs_paddings,
-                self.precompile_cache_loc_paddings,
-            )
+            # model_worker_batch.padding_model_worker_batch(
+            #     self.precompile_token_paddings,
+            #     self.precompile_bs_paddings,
+            #     self.precompile_cache_loc_paddings,
+            # )
+            print(f"==========={topk_index.shape[1]=}============")
             self.draft_model_runner.attn_backend.forward_metadata = (
                 self.draft_model_runner.attn_backend.get_forward_metadata(
                     model_worker_batch,
@@ -493,6 +519,37 @@ class EAGLEWorker(ModelWorker):
                     topk=topk_index.shape[1],
                 )
             )
+            if self.topk > 1:
+                logger.warning(
+                    "speculative_topk > 1 still remain test more corner case, it may make lower accpet rate"
+                )
+                self.draft_model_runner.attn_backend.forward_metadata.custom_mask = (
+                    build_tree_mask_for_draft_decode(
+                        model_worker_batch.seq_lens,
+                        topk=topk_index.shape[1],
+                        speculative_step_id=i,
+                        parents_list=parents_list,
+                    )
+                )
+            print(
+                f"================={self.draft_model_runner.attn_backend.forward_metadata.cu_kv_lens=}======================"
+            )
+            print(
+                f"================={self.draft_model_runner.attn_backend.forward_metadata.cu_q_lens=}======================"
+            )
+            print(
+                f"================={self.draft_model_runner.attn_backend.forward_metadata.custom_mask=}======================"
+            )
+            print(
+                f"================={self.draft_model_runner.attn_backend.forward_metadata.seq_lens=}======================"
+            )
+            print(
+                f"================={self.draft_model_runner.attn_backend.forward_metadata.num_seqs=}======================"
+            )
+            print(
+                f"================={self.draft_model_runner.attn_backend.forward_metadata.page_indices=}======================"
+            )
+
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
             # Run forward
             logits_output, _ = self.draft_model_runner.forward(
