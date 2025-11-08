@@ -180,8 +180,6 @@ class EAGLEWorker(ModelWorker):
         hidden_states: jax.Array,
         next_token_ids: jax.Array,
     ):
-        print(f"========after_target_prefill=========={hidden_states=}=======")
-        
         # FIXME(pc) move this all prepare to prepare_for_extend_after_target_prefill
         model_worker_batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
@@ -206,31 +204,16 @@ class EAGLEWorker(ModelWorker):
         forward_batch.forward_mode = ForwardMode.EXTEND
         last_idx = np.cumsum(model_worker_batch.extend_seq_lens, axis=0) - 1
 
-        print(f"=========last_idx======={last_idx=}======================")
         logits_output, _ = self.draft_model_runner.forward(
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
-        print(f"====before trucate========{logits_output.hidden_states=}======================")
-        print(f"====before trucate========{logits_output.next_token_logits=}======================")
         logits_output.truncate_logits_processor_output(model_worker_batch)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         forward_batch.spec_info.allocate_lens = model_worker_batch.seq_lens
         # assert forward_batch.spec_info is batch.spec_info
-        print(
-            f"====before capture for decode========{logits_output.hidden_states=}======================"
-        )
-        print(
-            f"====before capture for decod========{logits_output.next_token_logits=}======================"
-        )
 
         self.capture_for_decode(logits_output, forward_batch.spec_info)
-        print(
-            f"====after capture for decode========{forward_batch.spec_info.hidden_states=}======================"
-        )
-        print(
-            f"====after capture for decod========{logits_output.next_token_logits=}======================"
-        )
 
         # has_finished, unfinished_req_index = False, []
         # for i, req in enumerate(batch.reqs):
@@ -265,8 +248,6 @@ class EAGLEWorker(ModelWorker):
         )
         # Run forward steps
         score_list, token_list, parents_list = self.draft_forward(model_worker_batch)
-        print(f"==========={token_list=}=========================")
-        print(f"==========={parents_list=}=========================")
 
         (
             tree_mask,
@@ -495,7 +476,6 @@ class EAGLEWorker(ModelWorker):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
-            print(f"==================={hidden_states=}===========================")
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
@@ -511,7 +491,6 @@ class EAGLEWorker(ModelWorker):
             #     self.precompile_bs_paddings,
             #     self.precompile_cache_loc_paddings,
             # )
-            print(f"==========={topk_index.shape[1]=}============")
             self.draft_model_runner.attn_backend.forward_metadata = (
                 self.draft_model_runner.attn_backend.get_forward_metadata(
                     model_worker_batch,
@@ -532,24 +511,6 @@ class EAGLEWorker(ModelWorker):
                         parents_list=parents_list,
                     )
                 )
-            print(
-                f"================={self.draft_model_runner.attn_backend.forward_metadata.cu_kv_lens=}======================"
-            )
-            print(
-                f"================={self.draft_model_runner.attn_backend.forward_metadata.cu_q_lens=}======================"
-            )
-            print(
-                f"================={self.draft_model_runner.attn_backend.forward_metadata.custom_mask=}======================"
-            )
-            print(
-                f"================={self.draft_model_runner.attn_backend.forward_metadata.seq_lens=}======================"
-            )
-            print(
-                f"================={self.draft_model_runner.attn_backend.forward_metadata.num_seqs=}======================"
-            )
-            print(
-                f"================={self.draft_model_runner.attn_backend.forward_metadata.page_indices=}======================"
-            )
 
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
             # Run forward

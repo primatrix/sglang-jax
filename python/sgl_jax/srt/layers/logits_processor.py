@@ -238,8 +238,6 @@ class LogitsProcessor(nnx.Module):
         logits_metadata: LogitsMetadata,
         aux_hidden_states: jax.Array | None = None,
     ) -> LogitsProcessorOutput:
-        if aux_hidden_states is not None:
-            print(f"============={aux_hidden_states=}===================")
         if (
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
@@ -254,8 +252,6 @@ class LogitsProcessor(nnx.Module):
             pruned_states = hidden_states[last_index]
             if aux_hidden_states is not None:
                 aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
-                jax.debug.print(f"==========={aux_pruned_states=}==============")
-            jax.debug.print(f"==========={last_index=}==============")
 
             sample_indices = None
             input_logprob_indices = None
@@ -321,9 +317,7 @@ class LogitsProcessor(nnx.Module):
                 # pruned states only contain the last tokens already.
                 if aux_hidden_states is not None:
                     aux_pruned_states = jnp.concat(aux_pruned_states, axis=-1)
-                    print(
-                        f"=========logits_metadata.capture_hidden_mode.is_last():========{aux_pruned_states=}============={sample_indices=}============="
-                    )
+
                     hidden_states_to_store = (
                         aux_pruned_states[sample_indices]
                         if sample_indices is not None

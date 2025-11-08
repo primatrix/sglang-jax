@@ -810,9 +810,7 @@ class EagleVerifyInput:
         bs = self.retrive_index.shape[0]
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
         sampling_info = model_worker_batch.sampling_info
-        print(f"================={model_worker_batch.spec_info.draft_token=}================")
-        print(f"================={candidates=}=================================")
-        print(f"================={model_worker_batch.spec_info.positions=}================")
+
 
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
