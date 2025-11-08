@@ -131,7 +131,6 @@ class EAGLEWorker(ModelWorker):
             logits_output, next_token_ids, cache_miss_count, bid, seq_lens = (
                 self.forward_target_extend(model_worker_batch, sampling_metadata)
             )
-
             # draft extend for Update Draft State
             self.draft_extend_for_prefill(
                 model_worker_batch, logits_output.hidden_states, next_token_ids
@@ -181,6 +180,8 @@ class EAGLEWorker(ModelWorker):
         hidden_states: jax.Array,
         next_token_ids: jax.Array,
     ):
+        print(f"========after_target_prefill=========={hidden_states=}=======")
+        
         # FIXME(pc) move this all prepare to prepare_for_extend_after_target_prefill
         model_worker_batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
