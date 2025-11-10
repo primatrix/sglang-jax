@@ -46,19 +46,30 @@ class Sampler(nnx.Module):
 
         probs = jax.nn.softmax(processed_logits, axis=-1)
 
-        args = (
-            logits,
+        # args = (
+        #     logits,
+        #     probs,
+        #     sampling_metadata.top_ks,
+        #     sampling_metadata.top_ps,
+        #     sampling_metadata.min_ps,
+        #     positions,
+        #     sampling_metadata.temperatures,
+        #     sampling_metadata.sampling_seeds,
+        #     sampling_metadata.need_min_p_sampling,
+        #     rng,
+        # )
+        # batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_jax(args)
+
+        batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_jax_old(
             probs,
             sampling_metadata.top_ks,
             sampling_metadata.top_ps,
             sampling_metadata.min_ps,
             positions,
-            sampling_metadata.temperatures,
             sampling_metadata.sampling_seeds,
             sampling_metadata.need_min_p_sampling,
             rng,
         )
-        batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_jax(args)
 
         log_probs = jnp.log(probs).clip(min=jnp.finfo(probs.dtype).min)
         return batch_next_token_ids, log_probs
@@ -181,6 +192,124 @@ class Sampler(nnx.Module):
         )
 
         return batch_next_token_ids
+
+
+def _apply_min_p_filter_old(operands):
+    """Apply min_p filtering when need_min_p_sampling=True"""
+    probs_sort, min_ps = operands
+    min_p_thresholds = probs_sort[:, 0] * min_ps
+    min_p_mask = probs_sort < min_p_thresholds.reshape(-1, 1)
+    return jnp.where(min_p_mask, 0.0, probs_sort)
+
+
+def multinomial_old(
+    operands,
+) -> jax.Array:
+    inputs, _, _, rng = operands
+    return random.categorical(rng, jnp.log(inputs)).reshape(-1, 1)
+
+
+def multinomial_with_seed_old(
+    operands,
+) -> jax.Array:
+    """
+    Note:
+    1. This implementation is copied from https://github.com/sgl-project/sglang/blob/e2ac7888b8cb1fd6c33a7ec58d27a5f5b5b24e0c/python/sglang/srt/layers/sampler.py#L268.
+    2. Based on last response in issue, the fixed four big prime numbers can be set freely. 8589934591 is out of uin32, so I replace it with 805306457.
+    - issue: https://github.com/sgl-project/sglang/issues/10938
+
+    Samples n elements from an input array `inputs` of shape (n, m) using
+    a unique random seed for each row.
+
+    Args:
+        inputs: A float array of shape (n, m) representing n categorical
+                distributions with m categories each. The values are treated
+                as weights and do not need to sum to 1.
+        seed:   An integer array of shape (n,) containing the random seed
+                for each corresponding row in `inputs`.
+        positions: The positions of the tokens in the sequence.
+
+    Returns:
+        A array of shape (n,) where the i-th element is an index sampled
+        from the distribution in `inputs[i]` using `seed[i]`.
+    """
+    inputs, seed, positions, _ = operands
+    if seed is None:
+        # note: this codes is used to keep compatible with lax.cond
+        return multinomial_old(operands)
+    n, m = inputs.shape
+    step_seed = seed * 19349663 ^ positions * 73856093
+    seed_expanded = step_seed[:, None]
+    col_indices = jnp.arange(m)[None, :]
+    hashed = seed_expanded * 805306457 ^ col_indices * 479001599
+    uniform_samples = (hashed % (2**24)).astype(jnp.float32) / (2**24)
+    epsilon = 1e-9
+    gumbel_noise = -jnp.log(-jnp.log(uniform_samples + epsilon) + epsilon)
+    log_probs = jnp.log(inputs + epsilon)
+    perturbed_log_probs = log_probs + gumbel_noise
+    return jnp.argmax(perturbed_log_probs, axis=1, keepdims=True)
+
+
+def top_k_top_p_min_p_sampling_from_probs_jax_old(
+    probs: jax.Array,
+    top_ks: jax.Array,
+    top_ps: jax.Array,
+    min_ps: jax.Array,
+    positions: jax.Array,
+    sampling_seeds: jax.Array = None,
+    need_min_p_sampling: bool = False,
+    rng: nnx.Rngs = None,
+):
+    """A top-k, top-p and min-p sampling implementation with native jax operations."""
+    # Branch by backend: TPU can use native jnp.argsort/jnp.sort; others offload indices to CPU
+    if is_tpu_runtime():
+        probs_sort = jnp.sort(probs, axis=-1)[:, ::-1]  # Sort and reverse for descending order
+        probs_idx = jnp.argsort(probs, axis=-1)[:, ::-1]
+    else:
+        # 1) Use jax.pure_callback to compute robust descending indices on CPU
+        out_spec = jnp.empty(probs.shape, dtype=jnp.int32)
+        probs_idx = jax.pure_callback(
+            _get_sorted_indices_np,
+            out_spec,
+            probs,
+            vmap_method="legacy_vectorized",
+        )
+        # 2) Gather with sanitized probabilities (map NaNs/Infs to 0)
+        sanitized_probs = jnp.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+        assert probs_idx.shape == sanitized_probs.shape and probs_idx.dtype == jnp.int32
+        probs_sort = jnp.take_along_axis(sanitized_probs, probs_idx, axis=-1)
+
+    probs_sum = jnp.cumsum(probs_sort, axis=-1)
+
+    top_k_mask = jnp.arange(0, probs.shape[-1]).reshape(1, -1) >= top_ks.reshape(-1, 1)
+    probs_sort = jnp.where(top_k_mask, 0.0, probs_sort)
+
+    top_p_mask = (probs_sum - probs_sort) > top_ps.reshape(-1, 1)
+    probs_sort = jnp.where(top_p_mask, 0.0, probs_sort)
+
+    # Use lax.cond to avoid recompilation due to need_min_p_sampling changes
+    min_p_operands = (probs_sort, min_ps)
+    probs_sort = lax.cond(
+        need_min_p_sampling,
+        _apply_min_p_filter_old,
+        lambda operands: operands[0],  # No min_p filtering, just return probs_sort
+        min_p_operands,
+    )
+
+    # probs_sort, probs_idx = _sample_part_a(
+    #     probs, top_ks, top_ps, min_ps, need_min_p_sampling
+    # )
+
+    multinomial_operands = (probs_sort, sampling_seeds, positions, rng)
+    sampled_index = lax.cond(
+        sampling_seeds is not None,
+        multinomial_with_seed_old,
+        multinomial_old,
+        multinomial_operands,
+    )
+
+    probs_idx = probs_idx.astype(jnp.int32)
+    return jnp.take_along_axis(probs_idx, axis=1, indices=sampled_index).flatten()
 
 
 def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: list[int]):
