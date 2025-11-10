@@ -492,9 +492,6 @@ class EagleDraftInput:
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
         # TODO(pc) 这里的hidden_states要把 verified_id对应的hidden_state摘出来
         model_worker_batch.spec_info.hidden_states = batch_output.next_draft_input.hidden_states
-        print(
-            # f"=======before======{model_worker_batch.positions=}=============={model_worker_batch.input_ids=}======="
-        )
         # model_worker_batch.positions = model_worker_batch.spec_info.positions
         # print(f"=======after======{model_worker_batch.positions=}=====================")
 
@@ -835,8 +832,6 @@ class EagleVerifyInput:
 
         if is_all_greedy:
             target_predict = jnp.argmax(logits_output.next_token_logits, axis=-1).flatten()
-            print(f"-----------------{candidates=}-------------")
-            print(f"-----------------{target_predict=}-------------")
 
             accept_index, accept_length, predict = verify_tree_greedy(
                 predicts=predict,  # mutable

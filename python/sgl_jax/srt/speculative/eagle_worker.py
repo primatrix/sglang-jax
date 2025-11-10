@@ -193,6 +193,7 @@ class EAGLEWorker(ModelWorker):
         )
         model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        model_worker_batch.padding_model_worker_batch(self.precompile_token_paddings, self.precompile_bs_paddings, self.precompile_cache_loc_paddings)
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
         forward_batch.return_logprob = False
 
@@ -293,6 +294,7 @@ class EAGLEWorker(ModelWorker):
         forward_metadata = self.target_worker.model_runner.attn_backend.get_forward_metadata(
             model_worker_batch, is_eagle=True
         )
+        model_worker_batch.padding_model_worker_batch(self.precompile_bs_paddings, self.precompile_token_paddings, self.precompile_cache_loc_paddings)
         custom_mask = forward_metadata.custom_mask
         logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
             model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
@@ -430,7 +432,6 @@ class EAGLEWorker(ModelWorker):
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
-        print(f"===forward_draft_extend_after_decode==========={draft_logits_output.hidden_states.shape=}====={draft_logits_output.next_token_logits.shape=}==")
         draft_logits_output.truncate_logits_processor_output(model_worker_batch)
         self.capture_for_decode(draft_logits_output, forward_batch.spec_info)
         select_index = (
@@ -513,7 +514,7 @@ class EAGLEWorker(ModelWorker):
                         parents_list=parents_list,
                     )
                 )
-
+            model_worker_batch.padding_model_worker_batch(self.precompile_token_paddings, self.precompile_token_paddings, self.precompile_cache_loc_paddings)
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
             # Run forward
             logits_output, _ = self.draft_model_runner.forward(

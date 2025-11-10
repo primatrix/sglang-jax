@@ -165,7 +165,6 @@ class SchedulerOutputProcessorMixin:
         next_token_ids = result.next_token_ids
         accept_lens = result.accept_lens.tolist()
         result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
-        print(f"======_resolve_spec_decode_token_ids=========={result.next_token_ids=}=============")
         predict_tokens = []
         stride = self.draft_worker.speculative_num_draft_tokens
         for i, req in enumerate(batch.reqs):
@@ -188,7 +187,6 @@ class SchedulerOutputProcessorMixin:
         )
         if not self.spec_algorithm.is_none():
             next_token_ids = self._resolve_spec_decode_token_ids(result=result, batch=batch)
-            print(f"====next_token_ids============={next_token_ids=}=========")
             allocate_lens_list = result.allocate_lens.tolist()
             accept_lens_list = result.accept_lens.tolist()
         self.num_generated_tokens += len(batch.reqs)
