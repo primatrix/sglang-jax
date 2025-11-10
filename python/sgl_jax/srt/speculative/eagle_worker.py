@@ -293,6 +293,7 @@ class EAGLEWorker(ModelWorker):
         forward_metadata = self.target_worker.model_runner.attn_backend.get_forward_metadata(
             model_worker_batch, is_eagle=True
         )
+        custom_mask = forward_metadata.custom_mask
         logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
             model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
         )
@@ -429,7 +430,7 @@ class EAGLEWorker(ModelWorker):
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
-
+        print(f"===forward_draft_extend_after_decode==========={draft_logits_output.hidden_states.shape=}====={draft_logits_output.next_token_logits.shape=}==")
         draft_logits_output.truncate_logits_processor_output(model_worker_batch)
         self.capture_for_decode(draft_logits_output, forward_batch.spec_info)
         select_index = (
@@ -486,6 +487,10 @@ class EAGLEWorker(ModelWorker):
             model_worker_batch.input_ids = input_ids
             model_worker_batch.spec_info.hidden_states = hidden_states
             model_worker_batch.positions = original_positions + 1 + i
+            # print(f"=============={model_worker_batch.input_ids=}===================")
+            # print(f"=============={model_worker_batch.spec_info.hidden_states=}===================")
+            # print(f"=============={model_worker_batch.positions=}===================")
+
             # model_worker_batch.padding_model_worker_batch(
             #     self.precompile_token_paddings,
             #     self.precompile_bs_paddings,
@@ -500,9 +505,6 @@ class EAGLEWorker(ModelWorker):
                 )
             )
             if self.topk > 1:
-                logger.warning(
-                    "speculative_topk > 1 still remain test more corner case, it may make lower accpet rate"
-                )
                 self.draft_model_runner.attn_backend.forward_metadata.custom_mask = (
                     build_tree_mask_for_draft_decode(
                         model_worker_batch.seq_lens,

@@ -440,7 +440,7 @@ class EagleDraftInput:
         obj.kv_indices = children[6]
         obj.seq_lens_for_draft_extend = children[7]
         obj.req_pool_indices_for_draft_extend = children[8]
-
+        
         obj.accept_length_cpu = children[9]
         obj.num_tokens_per_batch = children[10]
         obj.num_tokens_for_logprob_per_batch = children[11]
@@ -488,14 +488,15 @@ class EagleDraftInput:
         )
         model_worker_batch.extend_prefix_lens = seq_lens_cpu_.tolist()
         # 这里为什么是full呢, 不应该是last吗????, sglang中是为了overlap, 我们这里不overlap, 应该是last
-        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
+        # TODO(pc) 这里的hidden_states要把 verified_id对应的hidden_state摘出来
         model_worker_batch.spec_info.hidden_states = batch_output.next_draft_input.hidden_states
         print(
-            f"=======before======{model_worker_batch.positions=}=============={model_worker_batch.input_ids=}======="
+            # f"=======before======{model_worker_batch.positions=}=============={model_worker_batch.input_ids=}======="
         )
         # model_worker_batch.positions = model_worker_batch.spec_info.positions
-        print(f"=======after======{model_worker_batch.positions=}=====================")
+        # print(f"=======after======{model_worker_batch.positions=}=====================")
 
         forward_batch = ForwardBatch.init_new(model_worker_batch, draft_model_runner)
         forward_metadata = draft_model_runner.attn_backend.get_forward_metadata(
@@ -632,9 +633,14 @@ class EagleDraftInput:
     ):
         pass
 
-    def filter_batch(self, new_indices: jax.Array, has_been_filtered: bool = True):
+    def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True):
         # FIXME(pc) need support overlap here
-        self.allocate_lens = self.allocate_lens[new_indices]
+        # if new_indices.shape[0] > self.allocate_lens.shape[0]:
+        #     logger.warning(f"{new_indices.shape[0]=} > {self.allocate_lens.shape[0]=}  {new_indices=} {self.allocate_lens=}")
+        # print(f"============={new_indices=}===============")
+        # print(f"============={self.allocate_lens=}==========================")
+        # new_indices = new_indices[new_indices < self.allocate_lens.shape[0]]
+        # self.allocate_lens = self.allocate_lens[new_indices]
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
             # therefore, we don't need to filter the batch again in scheduler
@@ -829,8 +835,8 @@ class EagleVerifyInput:
 
         if is_all_greedy:
             target_predict = jnp.argmax(logits_output.next_token_logits, axis=-1).flatten()
-            # print(f"-----------------{candidates=}-------------")
-            # print(f"-----------------{target_predict=}-------------")
+            print(f"-----------------{candidates=}-------------")
+            print(f"-----------------{target_predict=}-------------")
 
             accept_index, accept_length, predict = verify_tree_greedy(
                 predicts=predict,  # mutable
@@ -1020,7 +1026,6 @@ def build_eagle_tree_structure(
         tree_mask_capacity = (
             inferred_actual_size if max_tree_mask_size is None else max_tree_mask_size
         )
-    print(f"{tree_mask_capacity=}")
     tree_mask = jnp.zeros((tree_mask_capacity,), dtype=jnp.bool_)
     if tree_mask_size > 0:
         tree_mask = tree_mask.at[:tree_mask_size].set(True)
