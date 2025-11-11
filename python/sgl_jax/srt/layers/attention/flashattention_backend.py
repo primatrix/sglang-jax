@@ -213,6 +213,8 @@ class FlashAttentionBackend(AttentionBackend):
                     [batch.spec_info.draft_token_num] * real_batch_size, dtype=np.int32
                 )
                 extend_seq_lens = np.pad(q_lens, (0, padded_batch_size - real_batch_size))
+            # elif batch.forward_mode.is_draft_extend():
+            #     extend_seq_lens = np.pad(batch.extend_seq_lens, (0, (len(batch.seq_lens) - len(batch.extend_seq_lens))))
             else:
                 extend_seq_lens = batch.extend_seq_lens
 

@@ -393,7 +393,7 @@ class EagleDraftInput:
 
     # Inputs for V2 overlap worker
     # future_indices: Optional[FutureIndices] = None
-    allocate_lens: jax.Array | None = None
+    allocate_lens: np.ndarray | None = None
     new_seq_lens: jax.Array | None = None
     # verify_done: Optional[torch.cuda.Event] = None
 
@@ -475,6 +475,9 @@ class EagleDraftInput:
         num_draft_tokens: int,
         draft_model_runner: Any,
         batch_output: GenerationBatchResult,
+        precompile_token_paddings,
+        precompile_bs_paddings,
+        precompile_cache_loc_paddings
     ):
         seq_lens_cpu_ = model_worker_batch.seq_lens
 
@@ -482,25 +485,40 @@ class EagleDraftInput:
         verified_id = batch_output.next_draft_input.verified_id
         verified_id = verified_id[verified_id != 0].flatten()
         model_worker_batch.input_ids = verified_id
-        model_worker_batch.seq_lens = model_worker_batch.seq_lens + num_draft_tokens
-        model_worker_batch.extend_seq_lens = jnp.array(
-            [num_draft_tokens for _ in range(len(model_worker_batch.seq_lens))]
+        model_worker_batch.seq_lens = model_worker_batch.seq_lens[:model_worker_batch.real_bs] + batch_output.accept_lens
+        model_worker_batch.extend_seq_lens = np.asarray(
+            [batch_output.accept_lens[i] for i in range(batch_output.accept_lens.shape[0])]
         )
-        model_worker_batch.extend_prefix_lens = seq_lens_cpu_.tolist()
-        # 这里为什么是full呢, 不应该是last吗????, sglang中是为了overlap, 我们这里不overlap, 应该是last
+        # model_worker_batch.extend_prefix_lens = model_worker_batch.extend_prefix_lens
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
-        # TODO(pc) 这里的hidden_states要把 verified_id对应的hidden_state摘出来
         model_worker_batch.spec_info.hidden_states = batch_output.next_draft_input.hidden_states
+        # print(f"=======before padding==========={model_worker_batch.spec_info.hidden_states=}==========================")
         # model_worker_batch.positions = model_worker_batch.spec_info.positions
-        # print(f"=======after======{model_worker_batch.positions=}=====================")
-
-        forward_batch = ForwardBatch.init_new(model_worker_batch, draft_model_runner)
         forward_metadata = draft_model_runner.attn_backend.get_forward_metadata(
             model_worker_batch, is_eagle=True
         )
         draft_model_runner.attn_backend.forward_metadata = forward_metadata
-        return forward_batch
+        from sgl_jax.srt.layers.logits_processor import LogitsMetadata
+        logits_metadata = LogitsMetadata.from_model_worker_batch(model_worker_batch, draft_model_runner.mesh)
+        model_worker_batch.padding_model_worker_batch(
+            precompile_token_paddings, precompile_bs_paddings, precompile_cache_loc_paddings
+        )
+        hidden_states = model_worker_batch.spec_info.hidden_states
+        if hidden_states is not None and hidden_states.shape[0] < model_worker_batch.input_ids.shape[0]:
+            pad_len = model_worker_batch.input_ids.shape[0] - hidden_states.shape[0]
+            pad_shape = (pad_len,) + hidden_states.shape[1:]
+            pad_values = jnp.zeros(pad_shape, dtype=hidden_states.dtype)
+            model_worker_batch.spec_info.hidden_states = jnp.concatenate(
+                [model_worker_batch.spec_info.hidden_states, pad_values], axis=0
+            )
+        
+        # # print(f"=======after padding==========={model_worker_batch.spec_info.hidden_states=}==========================")
+        
+        forward_batch = ForwardBatch.init_new(model_worker_batch, draft_model_runner)
+
+        return forward_batch, logits_metadata
 
     def prepare_for_decode(self, schedule_batch: ScheduleBatch):
         new_allocate_lens = schedule_batch.seq_lens + self.ALLOC_LEN_PER_DECODE
@@ -771,6 +789,8 @@ class EagleVerifyInput:
         model_worker_batch.spec_info = self
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
+        # FIXME(pc) maybe not need here
+        model_worker_batch.extend_seq_lens = self.draft_token
         # assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
 
     def sample(
@@ -833,6 +853,7 @@ class EagleVerifyInput:
         if is_all_greedy:
             target_predict = jnp.argmax(logits_output.next_token_logits, axis=-1).flatten()
 
+            
             accept_index, accept_length, predict = verify_tree_greedy(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
@@ -843,13 +864,13 @@ class EagleVerifyInput:
                 retrive_next_sibling=self.retrive_next_sibling,
                 target_predict=target_predict,
             )
-            if accept_length[0] > 0:
+            if np.sum(accept_length) > 0:
                 print(
-                    f"\033[32m------------------{accept_length=}-------------------{accept_index=}----\033[0m"
+                    f"\033[32m accept rate is {np.sum(accept_length) / (accept_length.shape[0] * (self.draft_token_num - 1))}\033[0m"
                 )
             else:
                 print(
-                    f"\033[31m------------------{accept_length=}-------------------{accept_index=}----\033[0m"
+                    f"\033[31m accept rate is 0\033[0m"
                 )
         else:
 
