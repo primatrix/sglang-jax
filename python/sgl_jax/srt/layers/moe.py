@@ -197,9 +197,9 @@ class EPMoE(nnx.Module):
         world_size = jax.device_count()
         self.tp_size = world_size // self.ep_size
         self.experts_per_device = num_experts // self.ep_size
-        devices = jax.devices()
+        devices = jnp.array(jax.devices()).reshape(self.ep_size, self.tp_size)
         self.moe_mesh = jax.sharding.Mesh(
-            devices.reshape(self.ep_size, self.tp_size),
+            devices,
             axis_names=("expert", "tensor"),
             axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
         )
