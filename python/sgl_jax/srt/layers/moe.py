@@ -1,4 +1,5 @@
 import jax
+import numpy as np
 from flax import nnx
 from jax import numpy as jnp
 from jax.experimental.shard_map import shard_map
@@ -197,7 +198,7 @@ class EPMoE(nnx.Module):
         world_size = jax.device_count()
         self.tp_size = world_size // self.ep_size
         self.experts_per_device = num_experts // self.ep_size
-        devices = jnp.array(jax.devices()).reshape(self.ep_size, self.tp_size)
+        devices = np.array(jax.devices()).reshape(self.ep_size, self.tp_size)
         self.moe_mesh = jax.sharding.Mesh(
             devices,
             axis_names=("expert", "tensor"),
