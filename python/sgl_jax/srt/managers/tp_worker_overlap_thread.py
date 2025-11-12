@@ -38,7 +38,7 @@ class ModelWorkerClient:
         # Init future mappings
         self.future_token_ids_ct = 0
         self.future_token_ids_limit = self.max_running_requests * 3
-        self.future_token_ids_map = jnp.zeros((self.max_running_requests * 5,), dtype=jnp.int32)
+        self.future_token_ids_map = jnp.zeros((1024 * 5,), dtype=jnp.int32)
         self.mesh = mesh
         sharding = NamedSharding(mesh, PartitionSpec(None))
         self.future_token_ids_map = jax.device_put(self.future_token_ids_map, sharding)
