@@ -2,7 +2,6 @@ import jax
 from flax import nnx
 from jax import numpy as jnp
 from jax.experimental.shard_map import shard_map
-from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.gmm.megablox_gmm_backend import gmm
@@ -178,7 +177,6 @@ class EPMoE(nnx.Module):
         num_experts: int,
         num_experts_per_tok: int,
         ep_size: int,
-        mesh: Mesh,
         intermediate_dim: int = 2048,
         weight_dtype: jnp.dtype = jnp.bfloat16,
         dtype: jnp.dtype = jnp.bfloat16,
@@ -192,26 +190,21 @@ class EPMoE(nnx.Module):
         self.dtype = dtype
         self.layer_id = layer_id
         self.ep_size = ep_size
-        self.mesh = mesh
         if num_experts % self.ep_size != 0:
             raise ValueError(
                 f"num_experts({num_experts}) must be divisible by ep_size ({self.ep_size})"
             )
-        world_size = self.mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
+        world_size = jax.device_count()
         self.tp_size = world_size // self.ep_size
         self.experts_per_device = num_experts // self.ep_size
-
-        devices = self.mesh.devices.flatten()
+        devices = jax.devices()
         self.moe_mesh = jax.sharding.Mesh(
             devices.reshape(self.ep_size, self.tp_size),
             axis_names=("expert", "tensor"),
             axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
         )
 
-        abstract_mesh = self.mesh.abstract_mesh
-        self.updated_mesh = abstract_mesh.update(
-            axis_sizes=(self.ep_size, self.tp_size), axis_names=("expert", "tensor")
-        )
+        self.updated_mesh = self.moe_mesh.abstract_mesh
 
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
             self.wi_0 = nnx.Param(

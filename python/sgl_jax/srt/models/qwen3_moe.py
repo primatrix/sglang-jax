@@ -205,7 +205,6 @@ class QWen3MoeDecoderLayer(nnx.Module):
                 num_experts=num_experts,
                 num_experts_per_tok=num_experts_per_tok,
                 intermediate_dim=moe_intermediate_size,
-                mesh=mesh,
                 ep_size=config.ep_size,
                 weight_dtype=dtype,
                 dtype=dtype,
