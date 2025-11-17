@@ -3,7 +3,7 @@ import jax.numpy as jnp
 
 from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm import gmm as gmm_kernel
 
-gmm = jax.custom_vjp(gmm_kernel, nondiff_argnums=(3, 4, 7, 8))
+gmm = jax.custom_vjp(gmm_kernel, nondiff_argnums=(3, 4, 7, 8, 9))
 
 
 def _gmm_fwd(
@@ -13,6 +13,7 @@ def _gmm_fwd(
     preferred_element_type: jnp.dtype = jnp.float32,
     tiling: tuple[int, int, int] = (128, 128, 128),
     group_offset: jnp.ndarray | None = None,
+    lhs_offset: jnp.ndarray | None = None,
     existing_out: jnp.ndarray | None = None,
     transpose_rhs: bool = False,
     interpret: bool = False,
@@ -33,6 +34,7 @@ def _gmm_fwd(
         preferred_element_type,
         tiling,
         group_offset,
+        lhs_offset,
         existing_out,
         transpose_rhs=transpose_rhs,
         interpret=interpret,
@@ -45,6 +47,7 @@ def _gmm_bwd(
     preferred_element_type,
     tiling,
     group_offset,
+    lhs_offset,
     existing_out,
     transpose_rhs,
     interpret,

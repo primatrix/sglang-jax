@@ -290,6 +290,7 @@ def gmm(
     preferred_element_type: jnp.dtype = jnp.float32,
     tiling: tuple[int, int, int] | LutFn | None = (128, 128, 128),
     group_offset: jnp.ndarray | None = None,
+    lhs_offset: jnp.ndarray | None = None,
     existing_out: jnp.ndarray | None = None,
     transpose_rhs: bool = False,
     interpret: bool = False,
@@ -304,6 +305,8 @@ def gmm(
         tiling: 3-tuple of ints. The m, k and n-dimension tile sizes.
         group_offset: The group in group sizes to start computing from. This is
           particularly useful for when rhs num_groups is sharded.
+        lhs_offset: Row offset to apply when reading from lhs. Useful for reading
+          from a specific position in a larger sorted buffer.
         existing_out: Existing output to write to.
         transpose_rhs: True if the rhs needs to be transposed.
         interpret: Whether or not to run the kernel in interpret mode, helpful for
@@ -323,6 +326,12 @@ def gmm(
         if group_offset.shape:
             raise ValueError(f"group_offset must be a ()-shaped array. Got: {group_offset.shape}.")
         group_offset = group_offset[None]
+    if lhs_offset is None:
+        lhs_offset = jnp.array([0], dtype=jnp.int32)
+    else:
+        if lhs_offset.shape:
+            raise ValueError(f"lhs_offset must be a ()-shaped array. Got: {lhs_offset.shape}.")
+        lhs_offset = lhs_offset[None]
     num_current_groups = rhs.shape[0]
     num_total_groups = group_sizes.shape[0]
     lhs, group_sizes, input_dtype = _validate_args(lhs=lhs, rhs=rhs, group_sizes=group_sizes)
@@ -360,6 +369,7 @@ def gmm(
     def kernel(
         group_metadata,
         group_offset,
+        lhs_offset,
         lhs: jax.Array,
         rhs: jax.Array,
         existing_out,
@@ -367,7 +377,7 @@ def gmm(
         acc_scratch,
     ):
         group_offsets, group_ids, m_tile_ids = group_metadata
-        del group_offsets, group_ids, group_offset
+        del group_offsets, group_ids, group_offset, lhs_offset
 
         grid_id = pl.program_id(1)
         k_i = pl.program_id(2)
@@ -434,17 +444,17 @@ def gmm(
             partial(_accum, False),
         )
 
-    def lhs_transform_indices(n_i, grid_id, k_i, group_metadata, group_offset):
+    def lhs_transform_indices(n_i, grid_id, k_i, group_metadata, group_offset, lhs_offset):
         # lhs is (m, k). Load the [tm, tk] matrix for this m-tile.
         group_offsets, group_ids, m_tile_ids = group_metadata
         del n_i, group_offsets, group_ids, group_offset
-        return m_tile_ids[grid_id], k_i
+        return m_tile_ids[grid_id] + lhs_offset[0], k_i
 
-    def rhs_transform_indices(n_i, grid_id, k_i, group_metadata, group_offset):
+    def rhs_transform_indices(n_i, grid_id, k_i, group_metadata, group_offset, lhs_offset):
         # rhs is (num_groups, k, n). Load the [tk, tn] matrix based on the group id
         # for this m-tile.
         group_offsets, group_ids, m_tile_ids = group_metadata
-        del group_offsets, m_tile_ids
+        del group_offsets, m_tile_ids, lhs_offset
         if transpose_rhs:
             k_i, n_i = n_i, k_i
 
@@ -453,10 +463,10 @@ def gmm(
         # "unsharded" domain.
         return group_ids[grid_id] - group_offset[0], k_i, n_i
 
-    def out_transform_indices(n_i, grid_id, k_i, group_metadata, group_offset):
+    def out_transform_indices(n_i, grid_id, k_i, group_metadata, group_offset, lhs_offset):
         # out is (m, n). Load the [tm, tn] matrix for this m-tile.
         group_offsets, group_ids, m_tile_ids = group_metadata
-        del k_i, group_offsets, group_ids, group_offset
+        del k_i, group_offsets, group_ids, group_offset, lhs_offset
         return m_tile_ids[grid_id], n_i
 
     out_block_spec = pl.BlockSpec((tm, tn), out_transform_indices)
@@ -486,7 +496,7 @@ def gmm(
         kernel,
         out_shape=jax.ShapeDtypeStruct((m, n), preferred_element_type),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
+            num_scalar_prefetch=3,
             in_specs=[
                 lhs_block_spec,
                 rhs_block_spec,
@@ -507,6 +517,7 @@ def gmm(
     out = call_gmm(
         group_metadata,
         group_offset,
+        lhs_offset,
         lhs,
         rhs,
         existing_out,

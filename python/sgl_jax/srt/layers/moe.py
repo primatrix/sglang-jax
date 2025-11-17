@@ -306,17 +306,20 @@ class EPMoE(nnx.Module):
 
         # EP Dispatch
         if self.ep_size > 1:
-            x, local_group_sizes, selected_experts = self._expert_all_to_all_dispatch(
-                x, selected_experts, expert_shard_id
+            x, local_group_sizes, lhs_offset, num_local_tokens = self._expert_all_to_all_dispatch(
+                x, group_sizes, expert_shard_id
             )
         else:
             local_group_sizes = group_sizes
+            lhs_offset = 0
+            num_local_tokens = x.shape[0]
 
         # GMM
         intermediate_output = self._gmm_compute_with_sharded_weights(
             x,
             local_group_sizes,
-            selected_experts,
+            lhs_offset,
+            num_local_tokens,
             w0_weights,
             w1_weights,
             wo_weights,
@@ -340,15 +343,17 @@ class EPMoE(nnx.Module):
         return output
 
     def _gmm_compute_with_sharded_weights(
-        self, x, local_group_sizes, selected_experts, w0_kernel, w1_kernel, wo_kernel
+        self, x, local_group_sizes, lhs_offset, num_local_tokens, w0_kernel, w1_kernel, wo_kernel
     ):
-        if x.shape[0] == 0:
-            empty_output = jnp.zeros((0, wo_kernel.shape[-1]), dtype=x.dtype)  # (0, hidden_dim)
+        if num_local_tokens == 0:
+            empty_output = jnp.zeros((0, wo_kernel.shape[-1]), dtype=x.dtype)
             return empty_output
 
-        m, k = x.shape[0], x.shape[1]
+        m, k = num_local_tokens, x.shape[1]
         n_gate = w0_kernel.shape[2]
         n_down = wo_kernel.shape[2]
+
+        lhs_offset_array = jnp.array(lhs_offset, dtype=jnp.int32)
 
         default_tile_size = (512, 1024, 1024)
         tiling_gate = (
@@ -368,6 +373,7 @@ class EPMoE(nnx.Module):
             group_sizes=local_group_sizes,
             preferred_element_type=self.dtype,
             tiling=tiling_gate,
+            lhs_offset=lhs_offset_array,
         )
 
         # up
@@ -377,6 +383,7 @@ class EPMoE(nnx.Module):
             group_sizes=local_group_sizes,
             preferred_element_type=self.dtype,
             tiling=tiling_gate,
+            lhs_offset=lhs_offset_array,
         )
 
         # activation
@@ -403,34 +410,19 @@ class EPMoE(nnx.Module):
 
         return intermediate_output
 
-    def _expert_all_to_all_dispatch(self, data, sorted_experts, expert_shard_id):
+    def _expert_all_to_all_dispatch(self, data, global_group_sizes, expert_shard_id):
         local_expert_size = self.experts_per_device
 
-        # compute each token's expert shard
-        divided_assignments = jnp.floor_divide(sorted_experts, local_expert_size)
+        start_expert = expert_shard_id * local_expert_size
+        end_expert = start_expert + local_expert_size
 
-        # mask
-        belongs_to_this_shard = divided_assignments == expert_shard_id
+        global_group_offsets = jnp.concatenate([jnp.array([0]), jnp.cumsum(global_group_sizes)])
+        lhs_offset = global_group_offsets[start_expert]
 
-        local_experts = jnp.where(
-            belongs_to_this_shard,
-            jnp.mod(sorted_experts, local_expert_size),
-            local_expert_size,
-        )
+        local_group_sizes = global_group_sizes[start_expert:end_expert]
+        num_local_tokens = jnp.sum(local_group_sizes)
 
-        valid_indices = jnp.nonzero(belongs_to_this_shard, size=data.shape[0])[0]
-        num_valid_tokens = jnp.sum(belongs_to_this_shard)
-
-        local_data = data[valid_indices]
-        local_experts_extracted = local_experts[valid_indices]
-
-        valid_expert_mask = jnp.arange(data.shape[0]) < num_valid_tokens
-        valid_experts_for_bincount = jnp.where(
-            valid_expert_mask, local_experts_extracted, local_expert_size
-        )
-        local_group_sizes = jnp.bincount(valid_experts_for_bincount, length=local_expert_size)
-
-        return local_data, local_group_sizes, local_experts_extracted
+        return data, local_group_sizes, lhs_offset, num_local_tokens
 
     def _get_all_to_all_params(self, group_sizes, shard_id):
         input_offsets = jnp.zeros(self.ep_size, dtype=group_sizes.dtype)
