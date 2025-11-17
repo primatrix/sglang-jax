@@ -345,27 +345,12 @@ class EPMoE(nnx.Module):
     def _gmm_compute_with_sharded_weights(
         self, x, local_group_sizes, lhs_offset, num_local_tokens, w0_kernel, w1_kernel, wo_kernel
     ):
-        if num_local_tokens == 0:
-            empty_output = jnp.zeros((0, wo_kernel.shape[-1]), dtype=x.dtype)
-            return empty_output
-
-        m, k = num_local_tokens, x.shape[1]
-        n_gate = w0_kernel.shape[2]
-        n_down = wo_kernel.shape[2]
-
         lhs_offset_array = jnp.array(lhs_offset, dtype=jnp.int32)
 
         default_tile_size = (512, 1024, 1024)
-        tiling_gate = (
-            min(default_tile_size[0], m),
-            min(default_tile_size[1], k),
-            min(default_tile_size[2], n_gate),
-        )
-        tiling_down = (
-            min(default_tile_size[0], m),
-            min(default_tile_size[1], n_gate),
-            min(default_tile_size[2], n_down),
-        )
+        tiling_gate = default_tile_size
+        tiling_down = default_tile_size
+
         # gate
         layer_w0 = gmm(
             lhs=x,
