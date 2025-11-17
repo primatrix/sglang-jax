@@ -337,7 +337,10 @@ def gmm(
     lhs, group_sizes, input_dtype = _validate_args(lhs=lhs, rhs=rhs, group_sizes=group_sizes)
 
     # Gather shape information.
-    m, k, n = (lhs.shape[0], lhs.shape[1], rhs.shape[2])
+    # m is determined by group_sizes (actual data to process)
+    # This allows lhs to be a larger buffer with lhs_offset pointing to the data
+    m = jnp.sum(group_sizes)
+    k, n = (lhs.shape[1], rhs.shape[2])
     if transpose_rhs:
         n = rhs.shape[1]
 
