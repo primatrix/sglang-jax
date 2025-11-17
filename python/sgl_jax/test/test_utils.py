@@ -36,7 +36,7 @@ QWEN2_5_7B_INSTRUCT = "Qwen/Qwen2.5-7B-Instruct"
 QWEN3_CODER_30B_A3B_INSTRUCT = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
 GEMMA2_2B_IT = "google/gemma-2-2b-it"
 
-DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
+DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 900
 
 
 def is_in_ci():
@@ -453,17 +453,36 @@ def run_bench_serving(
     device="auto",
     background_task: Callable[[str, asyncio.Event], Awaitable[None]] | None = None,
     lora_name: str | None = None,
+    base_url: str | None = None,
+    external_process=None,
 ):
+    """Run benchmark against a server.
+
+    Args:
+        external_process: If provided, use this process and skip server launch/shutdown.
+                         This allows reusing a server across multiple benchmark runs.
+        base_url: If provided with external_process, use this URL instead of the default.
+    """
     if device == "auto":
         device = "tpu"
-    # Launch the server
-    base_url = DEFAULT_URL_FOR_TEST
-    process = popen_launch_server(
-        model,
-        base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=other_server_args,
-    )
+
+    # Determine if we should manage the server lifecycle
+    manage_server = external_process is None
+
+    if manage_server:
+        # Launch the server
+        base_url = DEFAULT_URL_FOR_TEST
+        process = popen_launch_server(
+            model,
+            base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_server_args,
+        )
+    else:
+        # Use the external process
+        process = external_process
+        if base_url is None:
+            base_url = DEFAULT_URL_FOR_TEST
 
     # Run benchmark
     args = get_benchmark_args(
@@ -512,7 +531,9 @@ def run_bench_serving(
     try:
         res = asyncio.run(_run())
     finally:
-        kill_process_tree(process.pid)
+        # Only kill the process if we launched it
+        if manage_server:
+            kill_process_tree(process.pid)
 
     assert res["completed"] == num_prompts
     return res
