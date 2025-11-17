@@ -414,12 +414,15 @@ class EPMoE(nnx.Module):
         local_expert_size = self.experts_per_device
 
         start_expert = expert_shard_id * local_expert_size
-        end_expert = start_expert + local_expert_size
 
         global_group_offsets = jnp.concatenate([jnp.array([0]), jnp.cumsum(global_group_sizes)])
-        lhs_offset = global_group_offsets[start_expert]
+        lhs_offset = jax.lax.dynamic_index_in_dim(
+            global_group_offsets, start_expert, keepdims=False
+        )
 
-        local_group_sizes = global_group_sizes[start_expert:end_expert]
+        local_group_sizes = jax.lax.dynamic_slice(
+            global_group_sizes, (start_expert,), (local_expert_size,)
+        )
         num_local_tokens = jnp.sum(local_group_sizes)
 
         return data, local_group_sizes, lhs_offset, num_local_tokens
