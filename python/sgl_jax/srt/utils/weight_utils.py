@@ -1493,7 +1493,7 @@ class WeightLoader:
         keys = path.split(".")
         current_level = params
 
-        for key in keys:
+        for i, key in enumerate(keys):
             if key.isdigit():
                 current_level = current_level[int(key)]
             else:
@@ -1502,6 +1502,22 @@ class WeightLoader:
                 elif hasattr(current_level, key):
                     current_level = getattr(current_level, key)
                 else:
+                    # Debug: print available keys at this level
+                    partial_path = ".".join(keys[: i + 1])
+                    if hasattr(current_level, "__contains__"):
+                        available = (
+                            list(current_level.keys()) if hasattr(current_level, "keys") else "N/A"
+                        )
+                    elif hasattr(current_level, "__dict__"):
+                        available = list(current_level.__dict__.keys())
+                    else:
+                        available = dir(current_level)
+                    logger.error(
+                        "Path %s not found. At %s, available keys: %s",
+                        path,
+                        partial_path,
+                        available[:10] if isinstance(available, list) else available,
+                    )
                     raise ValueError(f"{path} is not a valid param path")
 
         return current_level
