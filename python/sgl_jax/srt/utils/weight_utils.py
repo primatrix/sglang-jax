@@ -302,9 +302,11 @@ class WeightLoader:
         """
         if mesh is None:
             mesh = self.mesh
-        # Ensure sharding_spec is a tuple
+        # Ensure sharding_spec and target_shape are tuples
         if isinstance(sharding_spec, list):
             sharding_spec = tuple(sharding_spec)
+        if isinstance(target_shape, list):
+            target_shape = tuple(target_shape)
         target_sharding = jax.sharding.NamedSharding(mesh, P(*sharding_spec))
 
         if jax.process_count() == 1:
@@ -721,9 +723,11 @@ class WeightLoader:
                 sharding_spec = mapping.sharding
                 mesh_to_use = self.mesh
 
-            # Ensure sharding_spec is a tuple
+            # Ensure sharding_spec and target_shape are tuples
             if isinstance(sharding_spec, list):
                 sharding_spec = tuple(sharding_spec)
+            if isinstance(target_shape, list):
+                target_shape = tuple(target_shape)
             target_sharding = jax.sharding.NamedSharding(mesh_to_use, P(*sharding_spec))
 
             # Create the sharded array using callback
@@ -886,6 +890,9 @@ class WeightLoader:
         # Apply reshape
         if mapping.reshape is not None:
             shape = mapping.reshape
+            # Ensure shape is a tuple
+            if isinstance(shape, list):
+                shape = tuple(shape)
 
         return shape
 
