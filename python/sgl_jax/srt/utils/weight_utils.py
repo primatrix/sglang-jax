@@ -17,6 +17,183 @@ from sgl_jax.srt.configs.model_config import ModelConfig
 logger = logging.getLogger(__name__)
 
 
+class LazyWeightLoader:
+    """Helper class for loading weight slices on-demand from safetensors files."""
+
+    def __init__(self, st_files: list[str], hf_key: str, model_path: str):
+        self.st_files = st_files
+        self.hf_key = hf_key
+        self.model_path = model_path
+        self._weight_location = None  # (file_idx, tensor_name)
+        self._weight_shape = None
+        self._weight_dtype = None
+        self._find_weight()
+
+    def _find_weight(self):
+        """Locate which safetensors file contains this weight."""
+        for file_idx, st_file in enumerate(self.st_files):
+            with safe_open(st_file, framework="flax") as f:
+                if self.hf_key in f:
+                    self._weight_location = (file_idx, self.hf_key)
+                    tensor_slice = f.get_slice(self.hf_key)
+                    self._weight_shape = tensor_slice.get_shape()
+                    self._weight_dtype = tensor_slice.get_dtype()
+                    logger.debug(
+                        "Found %s in %s, shape=%s, dtype=%s",
+                        self.hf_key,
+                        os.path.basename(st_file),
+                        self._weight_shape,
+                        self._weight_dtype,
+                    )
+                    return
+        raise ValueError(f"Weight {self.hf_key} not found in any safetensors file")
+
+    def load_slice(self, slice_spec: tuple) -> np.ndarray:
+        """Load a specific slice of the weight.
+
+        Args:
+            slice_spec: Tuple of slices for each dimension
+
+        Returns:
+            The requested slice as a numpy array
+        """
+        if self._weight_location is None:
+            raise RuntimeError("Weight location not found")
+
+        file_idx, tensor_name = self._weight_location
+        st_file = self.st_files[file_idx]
+
+        with (
+            jax.default_device(jax.local_devices(backend="cpu")[0]),
+            safe_open(st_file, framework="flax") as f,
+        ):
+            # Load the full tensor first (safetensors doesn't support arbitrary slicing)
+            # This is still per-process, so better than all-processes loading
+            full_tensor = f.get_tensor(tensor_name)
+            # Apply the slice
+            sliced = full_tensor[slice_spec]
+            return np.array(sliced)
+
+    @property
+    def shape(self):
+        return self._weight_shape
+
+    @property
+    def dtype(self):
+        return self._weight_dtype
+
+
+class ShardingHelper:
+    """Helper class for computing source slices from target sharding indices."""
+
+    @staticmethod
+    def compute_source_slice(
+        target_indices: tuple,
+        target_shape: tuple,
+        source_shape: tuple,
+        transpose: bool = False,
+        split_dim: int | None = None,
+        split_offset: int = 0,
+    ) -> tuple:
+        """Compute which slice of source data is needed for target indices.
+
+        Args:
+            target_indices: Indices in the target array (from make_array_from_callback)
+            target_shape: Shape of target array
+            source_shape: Shape of source array (before transformations)
+            transpose: Whether source needs to be transposed
+            split_dim: Dimension along which source is split (for QKV)
+            split_offset: Offset in the split dimension (for K and V in QKV)
+
+        Returns:
+            Tuple of slices for the source array
+        """
+        # Target is transposed version of source
+        # target shape (M, N) = transpose(source shape (N, M))
+        # target_indices (i:j, k:l) -> source_indices (k:l, i:j)
+        source_indices = tuple(reversed(target_indices)) if transpose else target_indices
+
+        if split_dim is not None:
+            # Adjust the split dimension to account for offset
+            # E.g., for K in QKV, we need source[:, q_dim:q_dim+kv_dim]
+            source_indices = list(source_indices)
+            dim_slice = source_indices[split_dim]
+            if isinstance(dim_slice, slice):
+                start = (dim_slice.start or 0) + split_offset
+                stop = (dim_slice.stop or target_shape[split_dim]) + split_offset
+                source_indices[split_dim] = slice(start, stop, dim_slice.step)
+            else:
+                # Single index
+                source_indices[split_dim] = dim_slice + split_offset
+            source_indices = tuple(source_indices)
+
+        return source_indices
+
+    @staticmethod
+    def compute_kv_head_replica_mapping(
+        target_indices: tuple,
+        target_shape: tuple,
+        source_shape: tuple,
+        num_original_heads: int,
+        num_target_heads: int,
+        head_dim: int,
+        transpose: bool = False,
+    ) -> tuple:
+        """Compute source slice for KV head replication.
+
+        When tp_size > num_kv_heads, we replicate KV heads.
+        E.g., 4 original heads -> 16 target heads means each original head is replicated 4 times.
+
+        Args:
+            target_indices: Indices in target (replicated) array
+            target_shape: Shape of target array
+            source_shape: Shape of source array (before replication)
+            num_original_heads: Number of KV heads in checkpoint
+            num_target_heads: Number of KV heads after replication (usually tp_size)
+            head_dim: Dimension of each head
+            transpose: Whether the weight is transposed
+
+        Returns:
+            Tuple of slices for source array
+        """
+        num_replicas = num_target_heads // num_original_heads
+
+        # Determine which dimension contains the heads
+        # For k_proj/v_proj: shape is (hidden, num_heads * head_dim)
+        # After transpose: (num_heads * head_dim, hidden)
+        head_dim_axis = 1 if not transpose else 0
+
+        # Get the slice in the head dimension
+        target_slice = target_indices[head_dim_axis]
+
+        if isinstance(target_slice, slice):
+            # Convert target head indices to source head indices
+            target_start = target_slice.start or 0
+            target_stop = target_slice.stop or target_shape[head_dim_axis]
+
+            # Map target head range to source head range
+            source_head_start = target_start // head_dim // num_replicas
+            source_head_stop = (target_stop + head_dim - 1) // head_dim // num_replicas
+
+            source_start = source_head_start * head_dim
+            source_stop = (source_head_stop + 1) * head_dim
+
+            # Build source indices
+            source_indices = list(target_indices)
+            source_indices[head_dim_axis] = slice(source_start, source_stop, target_slice.step)
+            return tuple(source_indices)
+        else:
+            # Single index case
+            target_head_idx = target_slice // head_dim
+            source_head_idx = target_head_idx // num_replicas
+            offset_in_head = target_slice % head_dim
+            source_idx = source_head_idx * head_dim + offset_in_head
+
+            source_indices = list(target_indices)
+            source_indices[head_dim_axis] = source_idx
+            return tuple(source_indices)
+
+
 @dataclass
 class WeightMapping:
     target_path: str | list[str]
@@ -99,11 +276,618 @@ class WeightLoader:
         else:
             self.moe_abstract_mesh = None
 
+        # Cache for safetensors files (will be populated during loading)
+        self._st_files = None
+
+    def _shard_weight_lazy(
+        self,
+        lazy_loader: LazyWeightLoader,
+        target_shape: tuple,
+        sharding_spec: tuple,
+        mapping: WeightMapping,
+        mesh: jax.sharding.Mesh = None,
+    ) -> jax.Array:
+        """Create a sharded array using lazy loading from safetensors.
+
+        Args:
+            lazy_loader: LazyWeightLoader instance
+            target_shape: Shape of the target (transformed) array
+            sharding_spec: Sharding specification
+            mapping: WeightMapping with transformation info
+            mesh: Mesh to use (defaults to self.mesh)
+
+        Returns:
+            Sharded jax.Array
+        """
+        if mesh is None:
+            mesh = self.mesh
+        target_sharding = jax.sharding.NamedSharding(mesh, P(*sharding_spec))
+
+        if jax.process_count() == 1:
+            # Single process: load full weight and shard
+            full_weight = lazy_loader.load_slice(tuple(slice(None) for _ in lazy_loader.shape))
+            weight_jax = jnp.array(full_weight)
+            return jax.device_put(weight_jax, target_sharding)
+
+        # Multi-process: use lazy loading
+        def make_shard(indices):
+            # Compute which slice of source data we need
+            source_slice = self._compute_source_slice_for_mapping(
+                indices, target_shape, lazy_loader.shape, mapping
+            )
+
+            # Load only the needed slice
+            source_data = lazy_loader.load_slice(source_slice)
+
+            # Apply transformations
+            transformed = self._apply_transformations(
+                source_data, indices, target_shape, lazy_loader.shape, mapping
+            )
+
+            return transformed
+
+        return jax.make_array_from_callback(
+            shape=target_shape, sharding=target_sharding, data_callback=make_shard
+        )
+
+    def _compute_source_slice_for_mapping(
+        self,
+        target_indices: tuple,
+        target_shape: tuple,
+        source_shape: tuple,
+        mapping: WeightMapping,
+    ) -> tuple:
+        """Compute source slice needed for target indices based on mapping."""
+        # Handle KV head padding first (needs special logic)
+        if mapping.kv_head_padding and self.model_config.needs_kv_head_replication(
+            self.sharding_size
+        ):
+            return ShardingHelper.compute_kv_head_replica_mapping(
+                target_indices=target_indices,
+                target_shape=target_shape,
+                source_shape=source_shape,
+                num_original_heads=self.num_kv_heads,
+                num_target_heads=self.sharding_size,
+                head_dim=self.head_dim,
+                transpose=mapping.transpose,
+            )
+
+        # Handle regular transformations
+        return ShardingHelper.compute_source_slice(
+            target_indices=target_indices,
+            target_shape=target_shape,
+            source_shape=source_shape,
+            transpose=mapping.transpose,
+            split_dim=None,  # Will handle split separately
+            split_offset=0,
+        )
+
+    def _apply_transformations(
+        self,
+        source_data: np.ndarray,
+        target_indices: tuple,
+        target_shape: tuple,
+        source_shape: tuple,
+        mapping: WeightMapping,
+    ) -> jax.Array:
+        """Apply necessary transformations to source data."""
+        data = jnp.array(source_data)
+
+        # Apply transpose if needed
+        if mapping.transpose:
+            data = jnp.transpose(data, (1, 0))
+
+        # Apply KV head replication if needed
+        if mapping.kv_head_padding and self.model_config.needs_kv_head_replication(
+            self.sharding_size
+        ):
+            data = self._apply_kv_head_replication_to_slice(
+                data, target_indices, target_shape, mapping
+            )
+
+        # Apply reshape if needed
+        if mapping.reshape is not None:
+            # Need to be careful with reshape and sharding
+            data = jnp.reshape(data, self._compute_shard_reshape(target_indices, mapping.reshape))
+
+        return data
+
+    def _apply_kv_head_replication_to_slice(
+        self,
+        data: jax.Array,
+        target_indices: tuple,
+        target_shape: tuple,
+        mapping: WeightMapping,
+    ) -> jax.Array:
+        """Replicate KV heads in a slice of data."""
+        num_replicas = self.sharding_size // self.num_kv_heads
+        padding_strategy = self.model_config.get_kv_padding_strategy()
+
+        if padding_strategy != "replicate":
+            # Zero padding - just pad with zeros
+            # This is simpler but less correct
+            return data
+
+        # For replication, we need to replicate each source head
+        # The source data already contains only the heads we need (computed by compute_kv_head_replica_mapping)
+        # We need to replicate them to fill the target slice
+
+        # Determine head dimension axis
+        head_dim_axis = 1 if not mapping.transpose else 0
+
+        # Extract the number of heads in this slice
+        source_head_dim_size = data.shape[head_dim_axis]
+        num_source_heads = source_head_dim_size // self.head_dim
+
+        # Replicate each head
+        replicated_parts = []
+        for i in range(num_source_heads):
+            start_idx = i * self.head_dim
+            end_idx = (i + 1) * self.head_dim
+            if head_dim_axis == 1:
+                head_data = data[:, start_idx:end_idx]
+                for _ in range(num_replicas):
+                    replicated_parts.append(head_data)
+            else:
+                head_data = data[start_idx:end_idx, :]
+                for _ in range(num_replicas):
+                    replicated_parts.append(head_data)
+
+        return jnp.concatenate(replicated_parts, axis=head_dim_axis)
+
+    def _compute_shard_reshape(self, target_indices: tuple, full_reshape: tuple) -> tuple:
+        """Compute the reshape for a shard given target indices."""
+        # This is complex - for now, just return the portion of reshape that matches the shard
+        # In practice, reshape with sharding needs careful handling
+        return full_reshape
+
+    def _load_weights_lazy(
+        self,
+        params: nnx.State,
+        weight_mappings: dict[str, str | list[str] | WeightMapping],
+        safetensors_partition: int,
+    ):
+        """Load weights using lazy loading (Option 3 from JAX guide).
+
+        Each process only loads the weight slices it needs for its local devices.
+        """
+        # Get list of safetensors files
+        model_path = self.model_config.model_path
+        self._st_files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
+
+        if len(self._st_files) == 0:
+            raise RuntimeError(f"Cannot find any *.safetensors files in {model_path}")
+
+        logger.info("Found %s safetensors files", len(self._st_files))
+
+        # Separate regular and MOE mappings
+        regular_mappings = {}
+        moe_mappings = {}
+
+        for key, mapping in weight_mappings.items():
+            if key.startswith("__MOE_EXPERTS__"):
+                moe_mappings[key] = mapping
+            else:
+                regular_mappings[key] = mapping
+
+        # Process regular weights with lazy loading
+        for hf_key, mapping in tqdm(regular_mappings.items(), desc="[LAZY LOADING] Weights"):
+            if isinstance(mapping, (str, list)):
+                mapping = WeightMapping(target_path=mapping)
+
+            try:
+                # Create lazy loader
+                lazy_loader = LazyWeightLoader(
+                    st_files=self._st_files,
+                    hf_key=hf_key,
+                    model_path=model_path,
+                )
+
+                # Handle split vs single weight
+                if isinstance(mapping.target_path, list):
+                    self._handle_split_weight_lazy(params, hf_key, lazy_loader, mapping)
+                else:
+                    self._handle_single_weight_lazy(params, hf_key, lazy_loader, mapping)
+
+            except ValueError as e:
+                if not self._is_excluded_layer_weight(hf_key):
+                    logger.warning("Could not load %s: %s", hf_key, e)
+                continue
+
+        # Process MOE weights with lazy loading
+        if moe_mappings:
+            logger.info("Loading MoE expert weights with lazy loading...")
+            self._load_moe_weights_lazy(params, moe_mappings, safetensors_partition)
+
+        nnx.update(self.model, params)
+        logger.info("Lazy weight loading complete!")
+
+    def _handle_single_weight_lazy(
+        self,
+        params: nnx.State,
+        hf_key: str,
+        lazy_loader: LazyWeightLoader,
+        mapping: WeightMapping,
+    ):
+        """Handle loading a single weight with lazy loading."""
+        jax_path = mapping.target_path
+        model_param = self._get_param(params, jax_path)
+
+        # Compute target shape after transformations
+        source_shape = lazy_loader.shape
+        target_shape = self._compute_target_shape(source_shape, mapping, is_single=True)
+
+        # Apply output_multiplier_scale if needed (for lm_head)
+        # Note: This is tricky with lazy loading, might need special handling
+        if "lm_head" in hf_key and hasattr(self.model_config.hf_config, "output_multiplier_scale"):
+            logger.warning(
+                "output_multiplier_scale for %s not yet supported in lazy loading, weight will not be scaled",
+                hf_key,
+            )
+
+        # Create sharded array using lazy loading
+        sharded_weight = self._shard_weight_lazy(
+            lazy_loader=lazy_loader,
+            target_shape=target_shape,
+            sharding_spec=mapping.sharding,
+            mapping=mapping,
+        )
+
+        model_param.value = sharded_weight.astype(model_param.value.dtype)
+        logger.debug("Lazy loaded %s -> %s, target_shape: %s", hf_key, jax_path, target_shape)
+
+    def _handle_split_weight_lazy(
+        self,
+        params: nnx.State,
+        hf_key: str,
+        lazy_loader: LazyWeightLoader,
+        mapping: WeightMapping,
+    ):
+        """Handle loading split QKV weights with lazy loading."""
+        jax_paths = mapping.target_path
+        source_shape = lazy_loader.shape
+
+        # Compute split offsets for Q, K, V
+        if hf_key.endswith(".bias"):
+            q_dim = self.num_heads * self.head_dim_original
+            kv_dim = self.num_kv_heads * self.head_dim_original
+            split_offsets = [0, q_dim, q_dim + kv_dim]
+            target_shapes = [(q_dim,), (kv_dim,), (kv_dim,)]
+        else:
+            q_dim = self.num_heads * self.head_dim_original
+            kv_dim = self.num_kv_heads * self.head_dim_original
+
+            if mapping.transpose:
+                # Source shape: (hidden, q_dim + 2*kv_dim)
+                # After transpose: (q_dim + 2*kv_dim, hidden)
+                split_dim = 0  # Split along first dimension after transpose
+                other_dim = source_shape[0]  # hidden size
+                split_offsets = [0, q_dim, q_dim + kv_dim]
+                target_shapes = [
+                    (q_dim, other_dim),
+                    (kv_dim, other_dim),
+                    (kv_dim, other_dim),
+                ]
+            else:
+                # Source shape: (q_dim + 2*kv_dim, hidden)
+                split_dim = 0
+                other_dim = source_shape[1]
+                split_offsets = [0, q_dim, q_dim + kv_dim]
+                target_shapes = [
+                    (q_dim, other_dim),
+                    (kv_dim, other_dim),
+                    (kv_dim, other_dim),
+                ]
+
+        # Create lazy loaders for each split (Q, K, V)
+        for jax_path, split_offset, target_shape in zip(jax_paths, split_offsets, target_shapes):
+            # Create a modified mapping for this split
+            split_mapping = WeightMapping(
+                target_path=jax_path,
+                sharding=mapping.sharding,
+                transpose=mapping.transpose,
+                reshape=mapping.reshape,
+                head_dim_padding=mapping.head_dim_padding,
+                kv_head_padding=(
+                    mapping.kv_head_padding
+                    if ("k_proj" in jax_path or "v_proj" in jax_path)
+                    else False
+                ),
+                concat_axis=mapping.concat_axis,
+                is_eagle3=mapping.is_eagle3,
+            )
+
+            # Need to create a wrapper that handles the split offset
+            split_lazy_loader = self._create_split_lazy_loader(
+                lazy_loader, split_dim if not mapping.transpose else 1, split_offset, target_shape
+            )
+
+            # Load this split
+            model_param = self._get_param(params, jax_path)
+            sharded_weight = self._shard_weight_lazy(
+                lazy_loader=split_lazy_loader,
+                target_shape=target_shape,
+                sharding_spec=split_mapping.sharding,
+                mapping=split_mapping,
+            )
+
+            model_param.value = sharded_weight.astype(model_param.value.dtype)
+            logger.debug(
+                "Lazy loaded split %s -> %s, offset=%s, shape=%s",
+                hf_key,
+                jax_path,
+                split_offset,
+                target_shape,
+            )
+
+    def _create_split_lazy_loader(
+        self,
+        base_loader: LazyWeightLoader,
+        split_dim: int,
+        split_offset: int,
+        target_shape: tuple,
+    ) -> LazyWeightLoader:
+        """Create a lazy loader that handles offset for split weights."""
+
+        class SplitLazyLoader:
+            def __init__(self, base, dim, offset, shape):
+                self.base = base
+                self.split_dim = dim
+                self.split_offset = offset
+                self._shape = shape
+                self._dtype = base.dtype
+
+            def load_slice(self, slice_spec: tuple) -> np.ndarray:
+                # Adjust slice_spec to include the split offset
+                adjusted_spec = list(slice_spec)
+                dim_slice = adjusted_spec[self.split_dim]
+                if isinstance(dim_slice, slice):
+                    start = (dim_slice.start or 0) + self.split_offset
+                    stop = (dim_slice.stop or self._shape[self.split_dim]) + self.split_offset
+                    adjusted_spec[self.split_dim] = slice(start, stop, dim_slice.step)
+                else:
+                    adjusted_spec[self.split_dim] = dim_slice + self.split_offset
+
+                return self.base.load_slice(tuple(adjusted_spec))
+
+            @property
+            def shape(self):
+                return self._shape
+
+            @property
+            def dtype(self):
+                return self._dtype
+
+        return SplitLazyLoader(base_loader, split_dim, split_offset, target_shape)
+
+    def _load_moe_weights_lazy(
+        self,
+        params: nnx.State,
+        moe_mappings: dict[str, WeightMapping],
+        safetensors_partition: int,
+    ):
+        """Load MoE expert weights using lazy loading.
+
+        Each MoE group consists of multiple experts' weights that need to be stacked.
+        With lazy loading, each process only loads the experts it needs based on expert parallelism.
+        """
+        for moe_key, mapping in tqdm(moe_mappings.items(), desc="[LAZY LOADING] MoE Experts"):
+            target_path = mapping.target_path[0]
+            expected_hf_keys = mapping.target_path[1:]  # List of HF keys for all experts
+
+            # Create lazy loaders for all expert weights
+            expert_lazy_loaders = {}
+            for hf_key in expected_hf_keys:
+                try:
+                    expert_lazy_loaders[hf_key] = LazyWeightLoader(
+                        st_files=self._st_files,
+                        hf_key=hf_key,
+                        model_path=self.model_config.model_path,
+                    )
+                except ValueError as e:
+                    if not self._is_excluded_layer_weight(hf_key):
+                        logger.warning("Could not find MoE expert weight %s: %s", hf_key, e)
+                    continue
+
+            if not expert_lazy_loaders:
+                logger.warning("No expert weights found for MoE group %s", moe_key)
+                continue
+
+            # Get model parameter to determine target shape
+            model_param = self._get_param(params, target_path)
+            target_shape = model_param.value.shape  # (num_experts, ...)
+            num_experts = target_shape[0]
+            expert_weight_shape = target_shape[1:]
+
+            # Create lazy loaded sharded array for MoE experts
+            if "expert" in mapping.sharding:
+                # Expert parallelism case
+                ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
+                world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
+                tp_size = world_size // ep_size
+
+                devices = self.mesh.devices.flatten()
+                moe_mesh = jax.sharding.Mesh(
+                    devices.reshape(ep_size, tp_size), axis_names=("expert", "tensor")
+                )
+                sharding_spec = mapping.sharding
+                mesh_to_use = moe_mesh
+            else:
+                # No expert parallelism
+                sharding_spec = mapping.sharding
+                mesh_to_use = self.mesh
+
+            target_sharding = jax.sharding.NamedSharding(mesh_to_use, P(*sharding_spec))
+
+            # Create the sharded array using callback
+            def make_moe_shard(
+                indices,
+                loaders=expert_lazy_loaders,
+                hf_keys=expected_hf_keys,
+                num_experts_val=num_experts,
+                expert_weight_shape_val=expert_weight_shape,
+                mapping_val=mapping,
+                model_param_val=model_param,
+            ):
+                # indices is a tuple for the full (num_experts, ...) shape
+                # indices[0] is the slice for expert dimension
+                expert_slice = indices[0]
+
+                # Determine which experts we need for this shard
+                if isinstance(expert_slice, slice):
+                    start_expert = expert_slice.start or 0
+                    stop_expert = expert_slice.stop or num_experts_val
+                    expert_indices = range(start_expert, stop_expert)
+                else:
+                    # Single expert index
+                    expert_indices = [expert_slice]
+
+                # Load weights for each expert in this shard
+                expert_weights = []
+                for expert_idx in expert_indices:
+                    if expert_idx >= len(hf_keys):
+                        logger.warning(
+                            "Expert index %s out of range (total %s)", expert_idx, len(hf_keys)
+                        )
+                        continue
+
+                    hf_key = hf_keys[expert_idx]
+                    if hf_key not in loaders:
+                        logger.warning("No loader for expert %s", hf_key)
+                        continue
+
+                    loader = loaders[hf_key]
+
+                    # Compute slice for the non-expert dimensions
+                    # indices[1:] are slices for the weight dimensions
+                    weight_indices = indices[1:]
+
+                    # Load the slice we need
+                    source_slice = self._compute_moe_expert_source_slice(
+                        weight_indices, expert_weight_shape_val, loader.shape, mapping_val
+                    )
+                    source_data = loader.load_slice(source_slice)
+
+                    # Apply transformations
+                    transformed = self._apply_moe_expert_transformations(
+                        source_data,
+                        weight_indices,
+                        expert_weight_shape_val,
+                        loader.shape,
+                        mapping_val,
+                    )
+
+                    expert_weights.append(transformed)
+
+                # Stack expert weights along axis 0
+                if expert_weights:
+                    stacked = jnp.stack(expert_weights, axis=0)
+                    return stacked
+                else:
+                    # Fallback: return zeros if no weights found
+                    shard_shape = tuple(
+                        [len(expert_indices)]
+                        + [
+                            dim_slice.stop - dim_slice.start if isinstance(dim_slice, slice) else 1
+                            for dim_slice in indices[1:]
+                        ]
+                    )
+                    return jnp.zeros(shard_shape, dtype=model_param_val.value.dtype)
+
+            if jax.process_count() == 1:
+                # Single process: load all experts eagerly
+                all_expert_weights = []
+                for hf_key in expected_hf_keys:
+                    if hf_key not in expert_lazy_loaders:
+                        continue
+                    loader = expert_lazy_loaders[hf_key]
+                    full_weight = loader.load_slice(tuple(slice(None) for _ in loader.shape))
+                    weight_jax = jnp.array(full_weight)
+
+                    # Apply transformations
+                    if mapping.transpose:
+                        weight_jax = jnp.transpose(weight_jax, (1, 0))
+                    all_expert_weights.append(weight_jax)
+
+                stacked = jnp.stack(all_expert_weights, axis=0)
+                sharded_weight = jax.device_put(stacked, target_sharding)
+            else:
+                # Multi-process: use lazy loading
+                sharded_weight = jax.make_array_from_callback(
+                    shape=target_shape, sharding=target_sharding, data_callback=make_moe_shard
+                )
+
+            model_param.value = sharded_weight.astype(model_param.value.dtype)
+            logger.debug("Lazy loaded MoE group %s, shape: %s", moe_key, target_shape)
+
+    def _compute_moe_expert_source_slice(
+        self,
+        weight_indices: tuple,
+        target_shape: tuple,
+        source_shape: tuple,
+        mapping: WeightMapping,
+    ) -> tuple:
+        """Compute source slice for a single MoE expert weight."""
+        # Similar to regular weight slice computation
+        return ShardingHelper.compute_source_slice(
+            target_indices=weight_indices,
+            target_shape=target_shape,
+            source_shape=source_shape,
+            transpose=mapping.transpose,
+            split_dim=None,
+            split_offset=0,
+        )
+
+    def _apply_moe_expert_transformations(
+        self,
+        source_data: np.ndarray,
+        weight_indices: tuple,
+        target_shape: tuple,
+        source_shape: tuple,
+        mapping: WeightMapping,
+    ) -> jax.Array:
+        """Apply transformations to a single MoE expert weight."""
+        data = jnp.array(source_data)
+
+        # Apply transpose if needed
+        if mapping.transpose:
+            data = jnp.transpose(data, (1, 0))
+
+        return data
+
+    def _compute_target_shape(
+        self, source_shape: tuple, mapping: WeightMapping, is_single: bool = True
+    ) -> tuple:
+        """Compute the target shape after applying transformations."""
+        shape = source_shape
+
+        # Apply transpose
+        if mapping.transpose:
+            shape = tuple(reversed(shape))
+
+        # Apply KV head padding
+        if mapping.kv_head_padding and self.model_config.needs_kv_head_replication(
+            self.sharding_size
+        ):
+            # Expand KV head dimension
+            head_dim_axis = 1 if not mapping.transpose else 0
+
+            shape_list = list(shape)
+            shape_list[head_dim_axis] = self.sharding_size * self.head_dim
+            shape = tuple(shape_list)
+
+        # Apply reshape
+        if mapping.reshape is not None:
+            shape = mapping.reshape
+
+        return shape
+
     def load_weights_from_safetensors(
         self,
         weight_mappings: dict[str, str | list[str] | WeightMapping],
         safetensors_partition=1,
         dummy=False,
+        use_lazy_loading: bool | None = None,
     ):
         """Load weights from safetensors files or generate dummy weights.
 
@@ -111,6 +895,8 @@ class WeightLoader:
             weight_mappings: Mapping from HF keys to model paths with sharding info
             safetensors_partition: Number of safetensors partitions
             dummy: If True, generate random weights instead of loading from files
+            use_lazy_loading: If True, use lazy loading (load only needed slices per process).
+                            If None, auto-enable for multi-process (jax.process_count() > 1)
         """
         params = nnx.state(self.model)
 
@@ -120,6 +906,16 @@ class WeightLoader:
             self._load_dummy_weights(params, weight_mappings)
             return
 
+        # Auto-enable lazy loading for multi-process
+        if use_lazy_loading is None:
+            use_lazy_loading = jax.process_count() > 1
+
+        if use_lazy_loading:
+            logger.info("Using lazy weight loading (each process loads only its needed slices)")
+            self._load_weights_lazy(params, weight_mappings, safetensors_partition)
+            return
+
+        # Original eager loading path
         regular_mappings = {}
         moe_mappings = {}
 
