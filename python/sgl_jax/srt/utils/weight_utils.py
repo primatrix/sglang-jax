@@ -33,7 +33,8 @@ class LazyWeightLoader:
         """Locate which safetensors file contains this weight."""
         for file_idx, st_file in enumerate(self.st_files):
             with safe_open(st_file, framework="flax") as f:
-                if self.hf_key in f:
+                keys = list(f.keys())
+                if self.hf_key in keys:
                     self._weight_location = (file_idx, self.hf_key)
                     tensor_slice = f.get_slice(self.hf_key)
                     self._weight_shape = tensor_slice.get_shape()
