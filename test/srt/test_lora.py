@@ -27,7 +27,7 @@ class TestLora(CustomTestCase):
         self.assertEqual(len(lora_adapter.layers), 36, "layers is not right")
         for i in range(36):
             ## only base_model.model.model.layers.0.self_attn.qkv_proj.lora_A.weight and base_model.model.model.layers.0.self_attn.qkv_proj.lora_B.weight
-            self.assertEqual(len(lora_adapter.layers[i].weight), 2, "weights per layer is not right")
+            self.assertEqual(len(lora_adapter.layers[i].weights), 2, "weights per layer is not right")
 
 if __name__ == "__main__":
     unittest.main()
