@@ -478,6 +478,11 @@ class WeightLoader:
 
         # Process regular weights with lazy loading
         for hf_key, mapping in tqdm(regular_mappings.items(), desc="[LAZY LOADING] Weights"):
+            # Skip excluded layers early
+            if self._is_excluded_layer_weight(hf_key):
+                logger.debug("Skipping excluded layer weight: %s", hf_key)
+                continue
+
             if isinstance(mapping, (str, list)):
                 mapping = WeightMapping(target_path=mapping)
 
@@ -496,14 +501,29 @@ class WeightLoader:
                     self._handle_single_weight_lazy(params, hf_key, lazy_loader, mapping)
 
             except ValueError as e:
-                if not self._is_excluded_layer_weight(hf_key):
-                    logger.warning("Could not load %s: %s", hf_key, e)
+                logger.warning("Could not load %s: %s", hf_key, e)
                 continue
 
         # Process MOE weights with lazy loading
         if moe_mappings:
             logger.info("Loading MoE expert weights with lazy loading...")
-            self._load_moe_weights_lazy(params, moe_mappings, safetensors_partition)
+            # Filter out excluded layers from MoE mappings
+            filtered_moe_mappings = {}
+            for moe_key, mapping in moe_mappings.items():
+                # Check if any of the expert keys belong to excluded layers
+                expected_hf_keys = (
+                    mapping.target_path[1:] if isinstance(mapping.target_path, list) else []
+                )
+                if expected_hf_keys and not self._is_excluded_layer_weight(expected_hf_keys[0]):
+                    filtered_moe_mappings[moe_key] = mapping
+                elif not expected_hf_keys:
+                    # No expert keys, include by default
+                    filtered_moe_mappings[moe_key] = mapping
+                else:
+                    logger.debug("Skipping excluded MoE layer: %s", moe_key)
+
+            if filtered_moe_mappings:
+                self._load_moe_weights_lazy(params, filtered_moe_mappings, safetensors_partition)
 
         nnx.update(self.model, params)
         logger.info("Lazy weight loading complete!")
