@@ -145,7 +145,9 @@ class WeightLoader:
             weights_files.sort()
             weight_info = {}
 
-            logger.info("Scanning metadata for %s model files (Host 0 only)...", len(weights_files))
+            logger.info(
+                "Scanning metadata for %s model files (single host only)...", len(weights_files)
+            )
             # Use tqdm only on master to avoid log spam
             iterator = tqdm(weights_files, desc="Scanning Metadata", unit="file")
 
@@ -169,7 +171,7 @@ class WeightLoader:
             data_len = np.array(len(data_np), dtype=np.int32)
         else:
             # Other hosts just wait
-            logger.info("Waiting for metadata broadcast from Host 0...")
+            logger.info("Waiting for metadata broadcast from other host...")
             data_len = np.array(0, dtype=np.int32)
             data_np = None
 
