@@ -200,6 +200,79 @@ class WeightLoader:
 
         return lazy_arrays
 
+    def _create_stacked_moe_lazy_tensor(
+        self,
+        expected_hf_keys: list[str],
+        weight_info: dict,
+        file_manager: SequentialSafetensorManager,
+    ) -> jax.Array:
+        """
+        Optimized loader for MoE: Creates a SINGLE lazy array for the entire stack of experts.
+        This avoids creating thousands of small lazy arrays and greatly speeds up graph building.
+        Only supports standard MoE where each expert weight is not split across files (no concat_axis).
+        """
+        # 1. Get base info from the first expert
+        first_key = expected_hf_keys[0]
+        # assume len(infos) == 1 for standard MoE (checked by caller)
+        info = weight_info[first_key][0]
+
+        single_expert_shape = info["shape"]
+        st_dtype = info["dtype"]
+
+        dtype_map = {
+            "BF16": jnp.bfloat16,
+            "F16": jnp.float16,
+            "F32": jnp.float32,
+            "I64": jnp.int64,
+            "I32": jnp.int32,
+            "BOOL": jnp.bool_,
+        }
+        target_dtype = dtype_map.get(st_dtype, jnp.float32)
+
+        num_experts = len(expected_hf_keys)
+        stacked_shape = (num_experts, *single_expert_shape)
+        sharding = jax.sharding.NamedSharding(self.mesh, P())
+
+        def _load_stacked_slice(index):
+            # index is tuple of slices: (expert_slice, row_slice, col_slice...)
+            expert_slice = index[0]
+            inner_slice = index[1:]
+
+            # We need to determine which experts to load based on the slice
+            # slice.indices gives (start, stop, step) adjusted for length
+            start, stop, step = expert_slice.indices(num_experts)
+
+            # Calculate result shape for this chunk
+            # We rely on the fact that JAX calls this with a valid slice logic
+            expert_indices = range(start, stop, step)
+
+            # Determine the shape of the inner slice
+            # We can peek one file to see the output shape of get_slice,
+            # or calculate it manually. Let's do it one by one.
+
+            stacked_result = []
+
+            for i in expert_indices:
+                hf_key = expected_hf_keys[i]
+                # We assume infos length is 1 (checked in caller)
+                fname = weight_info[hf_key][0]["file"]
+                f = file_manager.get_handle(fname)
+
+                # Read just the requested part of this expert
+                data = f.get_slice(hf_key)[inner_slice]
+                stacked_result.append(data)
+
+            if not stacked_result:
+                return np.zeros(
+                    (0, *[s.stop - s.start for s in inner_slice]), dtype=np.float32
+                )  # fallback
+
+            return np.stack(stacked_result, axis=0)
+
+        return jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice).astype(
+            target_dtype
+        )
+
     def load_weights_from_safetensors(
         self,
         weight_mappings: dict[str, str | list[str] | WeightMapping],
@@ -274,12 +347,12 @@ class WeightLoader:
             for moe_key, mapping in tqdm(moe_mappings.items(), desc="Loading MoE Weights"):
                 expected_hf_keys = mapping.target_path[1:]
 
-                expert_weights_dict = {}  # {hf_key: list[jax.Array]}
                 group_complete = True
+                is_tp_split = False
 
+                # Validation pass
                 for hf_key in expected_hf_keys:
                     if hf_key not in weight_info:
-                        # Check excluded
                         if self._is_excluded_layer_weight(hf_key):
                             logger.debug("Skipping excluded MoE expert weight: %s", hf_key)
                         else:
@@ -289,28 +362,78 @@ class WeightLoader:
 
                     infos = weight_info[hf_key]
 
-                    # --- RESTORED LOGIC: Check safetensors_partition ---
-                    # For TP-sharded weights (Grok), we expect shards count == partition
-                    if mapping.concat_axis is not None and len(infos) < safetensors_partition:
-                        logger.warning(
-                            "Incomplete shards for %s: expected %s, found %s",
-                            hf_key,
-                            safetensors_partition,
-                            len(infos),
-                        )
-                        group_complete = False
-                        break
+                    # Check for TP split (Grok style)
+                    if mapping.concat_axis is not None:
+                        # If any expert is split across files, we must use the slow path
+                        if len(infos) > 1:
+                            is_tp_split = True
 
-                    lazy_arrays = self._create_lazy_tensors(hf_key, infos, file_manager)
-                    expert_weights_dict[hf_key] = lazy_arrays
+                        if len(infos) < safetensors_partition:
+                            logger.warning(
+                                "Incomplete shards for %s: expected %s, found %s",
+                                hf_key,
+                                safetensors_partition,
+                                len(infos),
+                            )
+                            group_complete = False
+                            break
 
                 if not group_complete:
                     continue
 
-                self._process_single_moe_group(params, moe_key, mapping, expert_weights_dict)
+                # OPTIMIZATION: Use Stacked Loader if no TP split (Standard MoE like Qwen/Mixtral)
+                if not is_tp_split and mapping.concat_axis is None:
+                    stacked_weight = self._create_stacked_moe_lazy_tensor(
+                        expected_hf_keys, weight_info, file_manager
+                    )
+                    # Apply transpose if needed (on the lazy array)
+                    if mapping.transpose:
+                        # Original stack: (E, N, K). We want transpose on last 2 dims -> (E, K, N)
+                        stacked_weight = jnp.transpose(stacked_weight, (0, 2, 1))
+
+                    self._process_single_moe_group_fast(params, moe_key, mapping, stacked_weight)
+
+                else:
+                    # Fallback to Slow Path (Grok TP Split)
+                    expert_weights_dict = {}
+                    for hf_key in expected_hf_keys:
+                        infos = weight_info[hf_key]
+                        lazy_arrays = self._create_lazy_tensors(hf_key, infos, file_manager)
+                        expert_weights_dict[hf_key] = lazy_arrays
+
+                    self._process_single_moe_group(params, moe_key, mapping, expert_weights_dict)
 
         nnx.update(self.model, params)
         logger.info("All weights loaded successfully.")
+
+    def _process_single_moe_group_fast(
+        self,
+        params: nnx.State,
+        moe_key: str,
+        mapping: WeightMapping,
+        stacked_weight: jax.Array,
+    ):
+        """Fast path assignment for pre-stacked MoE weights."""
+        target_path = mapping.target_path[0]
+
+        if "expert" in mapping.sharding:
+            ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
+            world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
+            tp_size = world_size // ep_size
+
+            devices = self.mesh.devices.flatten()
+            moe_mesh = jax.sharding.Mesh(
+                devices.reshape(ep_size, tp_size), axis_names=("expert", "tensor")
+            )
+
+            sharded_weight = self._shard_weight(stacked_weight, mapping.sharding, mesh=moe_mesh)
+        else:
+            sharded_weight = self._shard_weight(stacked_weight, mapping.sharding)
+
+        model_param = self._get_param(params, target_path)
+        model_param.value = sharded_weight.astype(model_param.value.dtype)
+
+        logger.debug("Assigned MoE group %s (Fast), shape: %s", moe_key, stacked_weight.shape)
 
     def _process_single_moe_group(
         self,
