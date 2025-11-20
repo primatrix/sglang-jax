@@ -1,12 +1,14 @@
 import glob
 import logging
 import os
+import pickle
 from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from jax.experimental import multihost_utils
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 from safetensors import safe_open
@@ -130,32 +132,74 @@ class WeightLoader:
     def _scan_weight_info(self) -> dict[str, list[dict]]:
         """
         Scan all safetensors files to build a mapping from HF key to file info.
-        Returns a dict where value is a LIST of info, supporting weights split across files.
+        Optimized for GCS/Network FS: Host 0 scans, then broadcasts to others.
         """
-        model_path = self.model_config.model_path
-        weights_files = glob.glob(os.path.join(model_path, "*.safetensors"))
+        # 1. Host 0 does the heavy lifting (Scanning)
+        if jax.process_index() == 0:
+            model_path = self.model_config.model_path
+            weights_files = glob.glob(os.path.join(model_path, "*.safetensors"))
 
-        if len(weights_files) == 0:
-            raise RuntimeError(f"Cannot find any *.safetensors files in {model_path}")
+            if len(weights_files) == 0:
+                raise RuntimeError(f"Cannot find any *.safetensors files in {model_path}")
 
-        # Sorting is CRITICAL for TP-sharded weights (e.g. Grok) to ensure correct concat order
-        weights_files.sort()
-        weight_info = {}
+            weights_files.sort()
+            weight_info = {}
 
-        logger.info("Scanning metadata for %s model files...", len(weights_files))
-        for st_file in weights_files:
-            # device="cpu" is fast for metadata reading
-            with safe_open(st_file, framework="flax", device="cpu") as f:
-                for key in f.keys():  # noqa: SIM118
-                    slice_info = f.get_slice(key)
-                    info = {
-                        "file": st_file,
-                        "shape": tuple(slice_info.get_shape()),
-                        "dtype": slice_info.get_dtype(),
-                    }
-                    if key not in weight_info:
-                        weight_info[key] = []
-                    weight_info[key].append(info)
+            logger.info("Scanning metadata for %s model files (Host 0 only)...", len(weights_files))
+            # Use tqdm only on master to avoid log spam
+            iterator = tqdm(weights_files, desc="Scanning Metadata", unit="file")
+
+            for st_file in iterator:
+                with safe_open(st_file, framework="flax", device="cpu") as f:
+                    for key in f.keys():  # noqa: SIM118
+                        slice_info = f.get_slice(key)
+                        info = {
+                            "file": st_file,
+                            "shape": tuple(slice_info.get_shape()),
+                            "dtype": slice_info.get_dtype(),
+                        }
+                        if key not in weight_info:
+                            weight_info[key] = []
+                        weight_info[key].append(info)
+
+            # Serialize the result
+            serialized_data = pickle.dumps(weight_info)
+            # Convert to uint8 array for JAX broadcasting
+            data_np = np.frombuffer(serialized_data, dtype=np.uint8)
+            data_len = np.array(len(data_np), dtype=np.int32)
+        else:
+            # Other hosts just wait
+            logger.info("Waiting for metadata broadcast from Host 0...")
+            data_len = np.array(0, dtype=np.int32)
+            data_np = None
+
+        # 2. Broadcast the length of the data first
+        # broadcast_one_to_all sends data from process 0 to all others
+        data_len = multihost_utils.broadcast_one_to_all(
+            data_len, is_source=(jax.process_index() == 0)
+        )
+
+        # 3. Prepare buffer on receivers
+        if jax.process_index() != 0:
+            # Ensure we allocate a numpy array of the correct size
+            data_np = np.empty(data_len.item(), dtype=np.uint8)
+
+        # 4. Broadcast the actual serialized data
+        # Note: JAX communicates via DeviceArrays, but small CPU arrays are fine too.
+        # Using device_put here ensures it enters the JAX communication layer correctly if needed,
+        # though multihost_utils usually handles numpy inputs gracefully.
+        synced_data = multihost_utils.broadcast_one_to_all(
+            data_np, is_source=(jax.process_index() == 0)
+        )
+
+        # 5. Deserialize
+        # Convert back to bytes (ensure we move to CPU first)
+        synced_bytes = np.array(synced_data).tobytes()
+        weight_info = pickle.loads(synced_bytes)
+
+        if jax.process_index() != 0:
+            logger.info("Metadata received. Total keys: %s", len(weight_info))
+
         return weight_info
 
     def _create_lazy_tensors(
