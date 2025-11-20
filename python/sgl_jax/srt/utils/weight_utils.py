@@ -606,12 +606,16 @@ class WeightLoader:
                 ]
 
         # Create lazy loaders for each split (Q, K, V)
-        for jax_path, split_offset, target_shape in zip(jax_paths, split_offsets, target_shapes):
+        for jax_path, split_offset, base_target_shape in zip(
+            jax_paths, split_offsets, target_shapes
+        ):
             # Create a modified mapping for this split
+            # Note: base_target_shape is already post-transpose, so we set transpose=False
+            # to avoid double-transpose in _compute_target_shape
             split_mapping = WeightMapping(
                 target_path=jax_path,
                 sharding=mapping.sharding,
-                transpose=mapping.transpose,
+                transpose=False,  # Already handled in base_target_shape
                 reshape=mapping.reshape,
                 head_dim_padding=mapping.head_dim_padding,
                 kv_head_padding=(
@@ -623,16 +627,26 @@ class WeightLoader:
                 is_eagle3=mapping.is_eagle3,
             )
 
-            # Need to create a wrapper that handles the split offset
+            # Compute the actual target shape considering kv_head_padding
+            # base_target_shape is already post-transpose
+            actual_target_shape = self._compute_target_shape(
+                base_target_shape, split_mapping, is_single=True
+            )
+
+            # Need to create a wrapper that handles the split offset and transpose
             split_lazy_loader = self._create_split_lazy_loader(
-                lazy_loader, split_dim if not mapping.transpose else 1, split_offset, target_shape
+                lazy_loader,
+                split_dim if not mapping.transpose else 1,
+                split_offset,
+                base_target_shape,
+                transpose=mapping.transpose,
             )
 
             # Load this split
             model_param = self._get_param(params, jax_path)
             sharded_weight = self._shard_weight_lazy(
                 lazy_loader=split_lazy_loader,
-                target_shape=target_shape,
+                target_shape=actual_target_shape,
                 sharding_spec=split_mapping.sharding,
                 mapping=split_mapping,
             )
@@ -643,7 +657,7 @@ class WeightLoader:
                 hf_key,
                 jax_path,
                 split_offset,
-                target_shape,
+                actual_target_shape,
             )
 
     def _create_split_lazy_loader(
@@ -652,29 +666,57 @@ class WeightLoader:
         split_dim: int,
         split_offset: int,
         target_shape: tuple,
+        transpose: bool = False,
     ) -> LazyWeightLoader:
-        """Create a lazy loader that handles offset for split weights."""
+        """Create a lazy loader that handles offset and transpose for split weights."""
 
         class SplitLazyLoader:
-            def __init__(self, base, dim, offset, shape):
+            def __init__(self, base, dim, offset, shape, do_transpose):
                 self.base = base
                 self.split_dim = dim
                 self.split_offset = offset
                 self._shape = shape
                 self._dtype = base.dtype
+                self.transpose = do_transpose
 
             def load_slice(self, slice_spec: tuple) -> np.ndarray:
-                # Adjust slice_spec to include the split offset
-                adjusted_spec = list(slice_spec)
+                # If transpose is needed, adjust indices first
+                if self.transpose:
+                    # Transpose the slice_spec to match base loader's coordinate system
+                    adjusted_spec = [slice_spec[1], slice_spec[0]]
+                else:
+                    adjusted_spec = list(slice_spec)
+
+                # Add split offset
                 dim_slice = adjusted_spec[self.split_dim]
                 if isinstance(dim_slice, slice):
+                    # Get the actual shape dimension for this slice
+                    source_dim_size = self.base.shape[self.split_dim]
+                    # Limit stop to not exceed available data
+                    if self.transpose:
+                        request_size = (
+                            self._shape[1 - self.split_dim]
+                            if self.split_dim < 2
+                            else self._shape[self.split_dim]
+                        )
+                    else:
+                        request_size = self._shape[self.split_dim]
                     start = (dim_slice.start or 0) + self.split_offset
-                    stop = (dim_slice.stop or self._shape[self.split_dim]) + self.split_offset
+                    stop = min(
+                        (dim_slice.stop or request_size) + self.split_offset, source_dim_size
+                    )
                     adjusted_spec[self.split_dim] = slice(start, stop, dim_slice.step)
                 else:
                     adjusted_spec[self.split_dim] = dim_slice + self.split_offset
 
-                return self.base.load_slice(tuple(adjusted_spec))
+                # Load data from base loader
+                data = self.base.load_slice(tuple(adjusted_spec))
+
+                # Transpose if needed
+                if self.transpose and len(data.shape) == 2:
+                    data = np.transpose(data)
+
+                return data
 
             @property
             def shape(self):
@@ -684,7 +726,7 @@ class WeightLoader:
             def dtype(self):
                 return self._dtype
 
-        return SplitLazyLoader(base_loader, split_dim, split_offset, target_shape)
+        return SplitLazyLoader(base_loader, split_dim, split_offset, target_shape, transpose)
 
     def _load_moe_weights_lazy(
         self,
