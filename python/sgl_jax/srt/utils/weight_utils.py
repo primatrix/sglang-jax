@@ -122,7 +122,7 @@ class WeightLoader:
                     slice_info = f.get_slice(key)
                     info = {
                         "file": st_file,
-                        "shape": slice_info.get_shape(),
+                        "shape": tuple(slice_info.get_shape()),
                         "dtype": slice_info.get_dtype(),
                     }
                     if key not in weight_info:
