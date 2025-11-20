@@ -118,7 +118,7 @@ class WeightLoader:
         for st_file in weights_files:
             # device="cpu" is fast for metadata reading
             with safe_open(st_file, framework="flax", device="cpu") as f:
-                for key in f:
+                for key in f.keys():  # noqa: SIM118
                     slice_info = f.get_slice(key)
                     info = {
                         "file": st_file,
