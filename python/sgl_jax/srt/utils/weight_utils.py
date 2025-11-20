@@ -677,17 +677,11 @@ class WeightLoader:
             mesh = self.mesh
         target_sharding = jax.sharding.NamedSharding(mesh, P(*sharding_spec))
 
-        if jax.process_count() > 1:
-
-            def make_shard(indices):
-                shard = weight[indices]
-                return shard
-
-            return jax.make_array_from_callback(
-                shape=weight.shape, sharding=target_sharding, data_callback=make_shard
-            )
-        else:
-            return jax.device_put(weight, target_sharding)
+        # FIX: Don't use make_array_from_callback manually here.
+        # Since 'weight' is already a Lazy JAX Array (backed by a callback),
+        # using device_put will trigger the slice/distribute logic automatically and lazily.
+        # JAX compiler handles the propagation of the slice back to the source callback.
+        return jax.device_put(weight, target_sharding)
 
     def _get_param(self, params: nnx.State, path: str) -> nnx.State:
         keys = path.split(".")
