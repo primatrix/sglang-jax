@@ -58,6 +58,34 @@ class WeightMapping:
             return (None,)
 
 
+class SequentialSafetensorManager:
+    """
+    Manages open file handles during a weight loading session to prevent
+    repeated opening/parsing of safetensors headers.
+    """
+
+    def __init__(self):
+        self.handles = {}
+
+    def get_handle(self, filename):
+        if filename not in self.handles:
+            # Keep the file open. framework="np" is crucial for JAX interop.
+            # device="cpu" ensures we don't accidentally alloc on GPU/TPU here.
+            self.handles[filename] = safe_open(filename, framework="np", device="cpu")
+        return self.handles[filename]
+
+    def close_all(self):
+        # safe_open objects don't strictly require close() as they rely on RAII/GC,
+        # but clearing references ensures we don't hold descriptors.
+        self.handles.clear()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close_all()
+
+
 class WeightLoader:
     def __init__(
         self,
@@ -130,7 +158,9 @@ class WeightLoader:
                     weight_info[key].append(info)
         return weight_info
 
-    def _create_lazy_tensors(self, hf_key: str, infos: list[dict]) -> list[jax.Array]:
+    def _create_lazy_tensors(
+        self, hf_key: str, infos: list[dict], file_manager: SequentialSafetensorManager
+    ) -> list[jax.Array]:
         """Create a list of JAX arrays that lazy load data from safetensors via callback."""
 
         lazy_arrays = []
@@ -153,11 +183,12 @@ class WeightLoader:
             sharding = jax.sharding.NamedSharding(self.mesh, P())
             filename = info["file"]
 
-            # Capture filename in closure
-            def _make_load_slice(fname=filename):
+            # Capture filename and file_manager in closure
+            def _make_load_slice(fname=filename, fm=file_manager):
                 def _load_slice(index):
-                    with safe_open(fname, framework="np", device="cpu") as f:
-                        return f.get_slice(hf_key)[index]
+                    # Get cached handle instead of opening new one
+                    f = fm.get_handle(fname)
+                    return f.get_slice(hf_key)[index]
 
                 return _load_slice
 
@@ -195,94 +226,88 @@ class WeightLoader:
             else:
                 regular_mappings[key] = mapping
 
-        # 2. Process Regular Weights (Lazy Pull)
+        # Use the Context Manager to cache file handles
         logger.info("Starting parallel weight loading via JAX Lazy Loader...")
 
-        for hf_key, mapping in tqdm(regular_mappings.items(), desc="Loading Regular Weights"):
-            if hf_key not in weight_info:
-                if hf_key == "d2t":
-                    # Special handling for d2t if not present
-                    logger.warning("Weight %s not found in safetensors index.", hf_key)
-                    continue
-
-                if self._is_excluded_layer_weight(hf_key):
-                    logger.debug("Skipping excluded layer weight: %s", hf_key)
-                    continue
-                else:
-                    logger.warning("No file found for weight: %s", hf_key)
-                    continue
-
-            infos = weight_info[hf_key]
-
-            # Create Lazy JAX Arrays
-            lazy_arrays = self._create_lazy_tensors(hf_key, infos)
-
-            # For regular weights, we generally expect 1 file.
-            # If there are multiple, it implies a split that regular mapping usually doesn't handle explicitly
-            # unless we want to concat?
-            # Standard behavior: Regular weights overwrite if duplicate keys exist,
-            # but standard HF models don't split regular weights with SAME key across files.
-            # We'll take the first one (or last one) to match standard overwrite behavior,
-            # OR if we want to be safe, we use the one that works.
-            # Let's assume index 0 is what we want, or if TP split is implicit?
-            # In existing logic, regular weights don't seem to use concat_axis logic in the same way as MoE.
-            lazy_weight = lazy_arrays[0]
-
-            if len(lazy_arrays) > 1:
-                logger.debug(
-                    "Found %s files for %s, using the first one.", len(lazy_arrays), hf_key
-                )
-
-            # Special Logic for d2t
-            if hf_key == "d2t":
-                base = jnp.arange(lazy_weight.shape[0], dtype=lazy_weight.dtype)
-                hot_ids = (lazy_weight + base).astype(jnp.int32)
-                params["hot_token_ids"].value = hot_ids
-                continue
-
-            if isinstance(mapping, (str, list)):
-                mapping = WeightMapping(target_path=mapping)
-
-            self._process_and_assign_weight(params, hf_key, lazy_weight, mapping)
-
-        # 3. Process MoE Weights (Lazy Pull)
-        for moe_key, mapping in tqdm(moe_mappings.items(), desc="Loading MoE Weights"):
-            expected_hf_keys = mapping.target_path[1:]
-
-            expert_weights_dict = {}  # {hf_key: list[jax.Array]}
-            group_complete = True
-
-            for hf_key in expected_hf_keys:
+        with SequentialSafetensorManager() as file_manager:
+            # 2. Process Regular Weights (Lazy Pull)
+            for hf_key, mapping in tqdm(regular_mappings.items(), desc="Loading Regular Weights"):
                 if hf_key not in weight_info:
-                    # Check excluded
+                    if hf_key == "d2t":
+                        # Special handling for d2t if not present
+                        logger.warning("Weight %s not found in safetensors index.", hf_key)
+                        continue
+
                     if self._is_excluded_layer_weight(hf_key):
-                        logger.debug("Skipping excluded MoE expert weight: %s", hf_key)
+                        logger.debug("Skipping excluded layer weight: %s", hf_key)
+                        continue
                     else:
-                        logger.warning("MoE expert weight %s not found.", hf_key)
-                    group_complete = False
-                    break
+                        logger.warning("No file found for weight: %s", hf_key)
+                        continue
 
                 infos = weight_info[hf_key]
 
-                # --- RESTORED LOGIC: Check safetensors_partition ---
-                # For TP-sharded weights (Grok), we expect shards count == partition
-                if mapping.concat_axis is not None and len(infos) < safetensors_partition:
-                    logger.warning(
-                        "Incomplete shards for %s: expected %s, found %s",
-                        hf_key,
-                        safetensors_partition,
-                        len(infos),
+                # Create Lazy JAX Arrays with file_manager
+                lazy_arrays = self._create_lazy_tensors(hf_key, infos, file_manager)
+
+                # For regular weights, we generally expect 1 file.
+                lazy_weight = lazy_arrays[0]
+
+                if len(lazy_arrays) > 1:
+                    logger.debug(
+                        "Found %s files for %s, using the first one.", len(lazy_arrays), hf_key
                     )
-                    group_complete = False
-                    break
 
-                lazy_arrays = self._create_lazy_tensors(hf_key, infos)
-                expert_weights_dict[hf_key] = lazy_arrays
+                # Special Logic for d2t
+                if hf_key == "d2t":
+                    base = jnp.arange(lazy_weight.shape[0], dtype=lazy_weight.dtype)
+                    hot_ids = (lazy_weight + base).astype(jnp.int32)
+                    params["hot_token_ids"].value = hot_ids
+                    continue
 
-            if not group_complete:
-                continue
+                if isinstance(mapping, (str, list)):
+                    mapping = WeightMapping(target_path=mapping)
 
-            self._process_single_moe_group(params, moe_key, mapping, expert_weights_dict)
+                self._process_and_assign_weight(params, hf_key, lazy_weight, mapping)
+
+            # 3. Process MoE Weights (Lazy Pull)
+            for moe_key, mapping in tqdm(moe_mappings.items(), desc="Loading MoE Weights"):
+                expected_hf_keys = mapping.target_path[1:]
+
+                expert_weights_dict = {}  # {hf_key: list[jax.Array]}
+                group_complete = True
+
+                for hf_key in expected_hf_keys:
+                    if hf_key not in weight_info:
+                        # Check excluded
+                        if self._is_excluded_layer_weight(hf_key):
+                            logger.debug("Skipping excluded MoE expert weight: %s", hf_key)
+                        else:
+                            logger.warning("MoE expert weight %s not found.", hf_key)
+                        group_complete = False
+                        break
+
+                    infos = weight_info[hf_key]
+
+                    # --- RESTORED LOGIC: Check safetensors_partition ---
+                    # For TP-sharded weights (Grok), we expect shards count == partition
+                    if mapping.concat_axis is not None and len(infos) < safetensors_partition:
+                        logger.warning(
+                            "Incomplete shards for %s: expected %s, found %s",
+                            hf_key,
+                            safetensors_partition,
+                            len(infos),
+                        )
+                        group_complete = False
+                        break
+
+                    lazy_arrays = self._create_lazy_tensors(hf_key, infos, file_manager)
+                    expert_weights_dict[hf_key] = lazy_arrays
+
+                if not group_complete:
+                    continue
+
+                self._process_single_moe_group(params, moe_key, mapping, expert_weights_dict)
 
         nnx.update(self.model, params)
         logger.info("All weights loaded successfully.")
