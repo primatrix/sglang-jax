@@ -66,6 +66,7 @@ class ServerArgs:
 
     # Runtime options
     device: str | None = None
+    device_indexes: list[int] | None = None
     tp_size: int = 1
     ep_size: int = 1
     stream_interval: int = 1
@@ -499,6 +500,14 @@ class ServerArgs:
             default=ServerArgs.device,
             help="The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified.",
         )
+
+        parser.add_argument(
+            "--device-indexes",
+            type=int,
+            nargs="+",
+            help="The device indexes to use build mesh. Defaults is all if not specified.",
+        )
+
         parser.add_argument(
             "--tensor-parallel-size",
             "--tp-size",

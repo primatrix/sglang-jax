@@ -60,6 +60,7 @@ def create_device_mesh(
     ici_parallelism: Sequence[int],
     dcn_parallelism: Sequence[int],
     devices=None,
+    device_indexes: list[int] = None,
     num_slices: int = 1,
     allow_split_physical_axes: bool = True,
     use_explicit_sharding: bool = True,
@@ -67,6 +68,12 @@ def create_device_mesh(
     """Create a device mesh"""
     if devices is None:
         devices = jax.devices()
+
+    if device_indexes is not None:
+        max_index = max(device_indexes)
+        if max_index >= len(devices):
+            raise RuntimeError("Device index out of range")
+        devices = [devices[i] for i in device_indexes]
 
     ici_parallelism = fill_unspecified_parallelism(ici_parallelism, len(devices))
     if num_slices > 1:
