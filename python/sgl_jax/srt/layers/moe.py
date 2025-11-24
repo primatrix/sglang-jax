@@ -6,6 +6,7 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
+from sgl_jax.srt.utils.profiling_utils import named_scope
 
 
 class GateLogit(nnx.Module):
@@ -35,6 +36,7 @@ class GateLogit(nnx.Module):
         else:
             self.bias = None
 
+    @named_scope
     def __call__(self, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         logits = hidden_states.astype(self.weight_dtype) @ self.kernel
 
@@ -66,6 +68,7 @@ class TopK(nnx.Module):
         self.topk_group = topk_group
         self.routed_scaling_factor = routed_scaling_factor
 
+    @named_scope
     def __call__(self, router_logits: jax.Array, correction_bias: jax.Array = None):
         if self.num_expert_group > 0 or self.topk_group > 0:
             if correction_bias is not None:
@@ -257,6 +260,7 @@ class EPMoE(nnx.Module):
         except Exception as _:
             return False, "cpu"
 
+    @named_scope
     def __call__(self, hidden_states, topk_weights, topk_ids) -> jax.Array:
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
             hidden_states_reshard = jax.sharding.reshard(hidden_states, P(None))
