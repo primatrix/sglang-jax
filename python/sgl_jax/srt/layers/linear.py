@@ -1,4 +1,4 @@
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 
 import jax
 from flax import nnx
@@ -7,16 +7,7 @@ from jax import numpy as jnp
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-
-def _canonicalize_tuple(x):
-    if isinstance(x, Iterable):
-        return tuple(x)
-    else:
-        return (x,)
-
-
-def _normalize_axes(axes: Iterable[int], ndim: int) -> tuple[int, ...]:
-    return tuple(ax if ax >= 0 else ndim + ax for ax in axes)
+from sgl_jax.srt.utils.profiling_utils import named_scope
 
 
 class LinearBase(nnx.Module):
@@ -40,6 +31,7 @@ class LinearBase(nnx.Module):
         skip_bias_add: bool = False,
         params_dtype: jnp.dtype | None = jnp.bfloat16,
         kernel_axes: Sequence[str] | None = None,
+        name: str = "linear_base",
         rngs: nnx.Rngs = None,
         mesh: jax.sharding.Mesh = None,
     ):
@@ -48,6 +40,7 @@ class LinearBase(nnx.Module):
         self.params_dtype = params_dtype
         self.kernel_axes = kernel_axes
         self.mesh = mesh
+        self.name = name
         self.weight = nnx.Param(
             jax.random.normal(
                 jax.random.PRNGKey(0),
@@ -70,6 +63,7 @@ class LinearBase(nnx.Module):
         else:
             self.bias = None
 
+    @named_scope
     def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         """Forward pass of the linear layer."""
         bias = self.bias if not self.skip_bias_add else None

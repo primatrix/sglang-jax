@@ -10,6 +10,7 @@ during inference.
 
 import functools
 import logging
+import math
 
 import jax
 import jax.numpy as jnp
@@ -1469,50 +1470,66 @@ def ragged_paged_attention(
         # (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset, bkv_sem_0_sz, bkv_sem_1_sz)
         jnp.full((6,), -1, jnp.int32),
     )
+    out_shape = [
+        jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
+        jax.ShapeDtypeStruct(
+            shape=kv_cache_fused_processed.shape,
+            dtype=kv_cache_fused_processed.dtype,
+        ),
+    ]
 
     scope_name = f"RPA-bq_{bq_sz}-bkvp_{bkv_p}-p_{page_size}"
-    kernel = jax.named_scope(scope_name)(
-        pl.pallas_call(
-            functools.partial(
-                _ragged_paged_attention_kernel,
-                sm_scale=sm_scale,
-                sliding_window=sliding_window,
-                soft_cap=soft_cap,
-                mask_value=mask_value,
-                q_scale=q_scale,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                xai_temperature_len=xai_temperature_len,
-                chunk_prefill_size=chunk_prefill_size,
-                bkv_p=bkv_p,
-                bq_sz=bq_sz,
-            ),
-            grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=len(scalar_prefetches),
-                in_specs=in_specs,
-                out_specs=out_specs,
-                grid=grid,
-                scratch_shapes=scratch_shapes,
-            ),
-            compiler_params=pltpu.CompilerParams(
-                # one, we need some extra work to support Megacore mode.
-                dimension_semantics=("arbitrary",),
-                vmem_limit_bytes=vmem_limit_bytes,
-                disable_bounds_checks=True,
-            ),
-            out_shape=[
-                jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
-                jax.ShapeDtypeStruct(
-                    shape=kv_cache_fused_processed.shape,
-                    dtype=kv_cache_fused_processed.dtype,
-                ),
-            ],
-            input_output_aliases={
-                9: 0,  # q input -> q output
-                11: 1,  # kv_cache_fused input -> updated kv_cache_fused output
-            },
-            name=scope_name,
-        )
+    kernel = pl.pallas_call(
+        functools.partial(
+            _ragged_paged_attention_kernel,
+            sm_scale=sm_scale,
+            sliding_window=sliding_window,
+            soft_cap=soft_cap,
+            mask_value=mask_value,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            xai_temperature_len=xai_temperature_len,
+            chunk_prefill_size=chunk_prefill_size,
+            bkv_p=bkv_p,
+            bq_sz=bq_sz,
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=len(scalar_prefetches),
+            in_specs=in_specs,
+            out_specs=out_specs,
+            grid=grid,
+            scratch_shapes=scratch_shapes,
+        ),
+        compiler_params=pltpu.CompilerParams(
+            # one, we need some extra work to support Megacore mode.
+            dimension_semantics=("arbitrary",),
+            vmem_limit_bytes=vmem_limit_bytes,
+            disable_bounds_checks=True,
+        ),
+        out_shape=out_shape,
+        input_output_aliases={
+            9: 0,  # q input -> q output
+            11: 1,  # kv_cache_fused input -> updated kv_cache_fused output
+        },
+        cost_estimate=get_cost_estimate(
+            queries,
+            kv_cache_fused,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            len(kv_lens),
+            sm_scale=sm_scale,
+            sliding_window=sliding_window,
+            soft_cap=soft_cap,
+            mask_value=mask_value,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            xai_temperature_len=xai_temperature_len,
+            kernel_inputs_specs=(queries, kv_cache_fused, scalar_prefetches, mask_value),
+            kernel_outputs_specs=out_shape,
+        ),
+        name=scope_name,
     )
 
     output, updated_kv_cache_fused = kernel(
@@ -1528,6 +1545,53 @@ def ragged_paged_attention(
         prepare_updated_kv_cache_fused(
             updated_kv_cache_fused, actual_num_kv_heads, actual_head_dim
         ),
+    )
+
+
+def _bytes(x: jax.Array | jax.ShapeDtypeStruct) -> int:
+    return math.prod(x.shape) * x.dtype.itemsize
+
+
+def get_cost_estimate(
+    queries: jax.Array,  # [padded_num_tokens, num_q_heads, head_dim]
+    kv_pages_fused: jax.Array,  # [total_num_pages, page_size, num_kv_heads * 2, head_dim]
+    kv_lens: jax.Array,  # i32[padded_batch_size]
+    page_indices: jax.Array,  # i32[(padded_batch_size * model_context_len + page_size - 1) // page_size]
+    cu_q_lens: jax.Array,  # i32[padded_batch_size + 1]
+    num_seqs: jax.Array,  # i32[1],
+    *,
+    sm_scale: float,
+    sliding_window: int | None,
+    soft_cap: float | None,
+    mask_value: float | None,
+    k_scale: float | None,
+    v_scale: float | None,
+    xai_temperature_len: float,
+    kernel_inputs_specs,
+    kernel_outputs_specs,
+) -> pl.CostEstimate | None:
+    body_cost = pl.estimate_cost(
+        ref_ragged_paged_attention_fused,
+        queries,
+        kv_pages_fused,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        num_seqs,
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+        mask_value=mask_value,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        xai_temperature_len=xai_temperature_len,
+    )
+    input_bytes = sum(_bytes(x) for x in jax.tree.leaves(kernel_inputs_specs))
+    output_bytes = sum(_bytes(x) for x in jax.tree.leaves(kernel_outputs_specs))
+    return pl.CostEstimate(
+        flops=body_cost.flops,
+        transcendentals=body_cost.transcendentals,
+        bytes_accessed=input_bytes + output_bytes,
     )
 
 
