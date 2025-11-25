@@ -63,8 +63,8 @@ class RMSNorm(nnx.Module):
         self.axis_index_groups = axis_index_groups
         self.use_fast_variance = use_fast_variance
 
-    def __call__(self, x, mask: Optional[jax.Array] = None):
-        mean, var = _compute_stats(
+    def __call__(self, x, mask: jax.Array | None = None):
+        mean, var, cast_x = _compute_stats(
             x,
             self.reduction_axes,
             self.dtype,
@@ -74,8 +74,9 @@ class RMSNorm(nnx.Module):
             use_fast_variance=self.use_fast_variance,
             mask=mask,
         )
-
-        return _normalize(
+        self.var = var
+        self.cast_x = cast_x
+        result, mul =  _normalize(
             x,
             mean,
             var,
@@ -86,6 +87,8 @@ class RMSNorm(nnx.Module):
             self.dtype,
             self.epsilon,
         )
+        self.mul = mul
+        return result
 
 
 def _compute_stats(
@@ -136,7 +139,7 @@ def _compute_stats(
     else:
         var = maybe_distributed_mean(_abs_sq(x), mask=mask)
         mu = jnp.zeros_like(var)
-    return mu, var
+    return mu, var, x
 
 
 def _normalize(
@@ -162,6 +165,7 @@ def _normalize(
         feature_shape[ax] = x.shape[ax]
     y = x - mean
     mul = lax.rsqrt(var + epsilon)
+    ret = mul
     args = [x]
     if scale is not None:
         scale = scale.reshape(feature_shape)
@@ -173,4 +177,4 @@ def _normalize(
         y += bias
         args.append(bias)
     dtype = dtypes.canonicalize_dtype(*args, dtype=dtype)
-    return jnp.asarray(y, dtype)
+    return jnp.asarray(y, dtype), ret

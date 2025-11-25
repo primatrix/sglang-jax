@@ -599,6 +599,7 @@ class PrecisionTracer:
                 "max": float(jnp.max(tensor).item()),
                 "mean": float(jnp.mean(tensor).item()),
                 "std": std_val,
+                "tensor": tensor.tolist(),
                 "has_nan": bool(jnp.any(jnp.isnan(tensor)).item()),
                 "has_inf": bool(jnp.any(jnp.isinf(tensor)).item()),
                 "layer_id": layer_id,
