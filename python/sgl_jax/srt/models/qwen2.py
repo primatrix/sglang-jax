@@ -16,6 +16,7 @@ from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
+from sgl_jax.srt.precision_tracer import precision_tracer
 
 logger = logging.getLogger(__name__)
 
@@ -242,7 +243,31 @@ class Qwen2DecoderLayer(nnx.Module):
 
         hidden_states += residual
         residual = hidden_states
+        pos1 = precision_tracer.jit_pure_callback_record(
+            hidden_states, "post_attention_layernorm_pos1", "MLP", self.layer_id
+        )
+        layer_callback_flag.append(pos1)
         hidden_states = self.post_attention_layernorm(hidden_states)
+        pos2 = precision_tracer.jit_pure_callback_record(
+            self.post_attention_layernorm.cast_x, "post_attention_layernorm_pos2", "MLP", self.layer_id
+        )
+        layer_callback_flag.append(pos2)
+
+        pos3 = precision_tracer.jit_pure_callback_record(
+            self.post_attention_layernorm.var, "post_attention_layernorm_pos3", "MLP", self.layer_id
+        )
+        layer_callback_flag.append(pos3)
+
+        pos4 = precision_tracer.jit_pure_callback_record(
+            self.post_attention_layernorm.mul, "post_attention_layernorm_pos4", "MLP", self.layer_id
+        )
+        layer_callback_flag.append(pos4)
+
+        pos5 = precision_tracer.jit_pure_callback_record(
+            hidden_states, "post_attention_layernorm_pos5", "MLP", self.layer_id
+        )
+        layer_callback_flag.append(pos5)
+
         hidden_states = self.mlp(hidden_states)
 
         return hidden_states, residual, kv_fused, layer_callback_flag
