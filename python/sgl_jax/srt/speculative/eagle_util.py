@@ -228,7 +228,7 @@ def build_tree_kernel_efficient_preprocess(
 @functools.partial(
     jax.jit,
     static_argnames=(
-        "padded_seq_lens_sum",
+        "max_seq_len_per_req",
         "num_verify_tokens",
         "topk",
         "max_seq_len_per_req",
@@ -244,7 +244,6 @@ def _build_tree_kernel_efficient_core(
     seq_lens: jax.Array,
     seq_lens_sum: jax.Array,
     *,
-    padded_seq_lens_sum: int,
     num_verify_tokens: int,
     topk: int,
     max_seq_len_per_req: int,
@@ -260,7 +259,7 @@ def _build_tree_kernel_efficient_core(
             draft_token_num=num_verify_tokens,
             topk=topk,
             seq_lens_sum=seq_lens_sum,
-            padded_seq_lens_sum=padded_seq_lens_sum,
+            max_context_len=max_seq_len_per_req,
             tree_mask_mode=tree_mask_mode,
         )
     )
@@ -354,7 +353,6 @@ def build_tree_kernel_efficient(
     parents_list: jax.Array,
     seq_lens: jax.Array,
     seq_lens_sum: jax.Array,
-    padded_seq_lens_sum: int,
     topk: int,
     num_verify_tokens: int,
     max_seq_len_per_req: int,
@@ -413,7 +411,6 @@ def build_tree_kernel_efficient(
             parent_list,
             seq_lens,
             seq_lens_sum,
-            padded_seq_lens_sum=padded_seq_lens_sum,
             num_verify_tokens=num_verify_tokens,
             topk=topk,
             max_seq_len_per_req=max_seq_len_per_req,

@@ -339,7 +339,6 @@ class EAGLEWorker(ModelWorker):
             parents_list,
             model_worker_batch.seq_lens[: model_worker_batch.real_bs],
             seq_lens_sum,
-            padded_seq_lens_sum,
             self.topk,
             self.speculative_num_draft_tokens,
             int(self.req_to_token_pool.req_to_token.shape[1]),

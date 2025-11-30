@@ -301,10 +301,10 @@ def _build_eagle_tree_structure_kernel(
 @partial(
     jax.jit,
     static_argnames=[
-        "padded_seq_lens_sum",
         "draft_token_num",
         "topk",
         "tree_mask_mode",
+        "max_context_len",
     ],
 )
 def build_eagle_tree_structure_pallas_call(
@@ -313,9 +313,9 @@ def build_eagle_tree_structure_pallas_call(
     verified_seq_len: jax.Array,
     seq_lens_sum: jax.Array,
     *,
-    padded_seq_lens_sum: int,
     draft_token_num: int,
     topk: int,
+    max_context_len: int,
     tree_mask_mode: int = 0,  # FULL_MASK = 0
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     bs = parent_list.shape[0]
@@ -323,7 +323,7 @@ def build_eagle_tree_structure_pallas_call(
     if tree_mask_mode == 0:  # FULL_MASK
         tree_mask_size = seq_lens_sum * draft_token_num + draft_token_num * draft_token_num * bs
         tree_mask_capacity = (
-            padded_seq_lens_sum * draft_token_num + draft_token_num * draft_token_num * bs
+            max_context_len * draft_token_num + draft_token_num * draft_token_num * bs
         )
     else:
         tree_mask_size = bs * draft_token_num * draft_token_num
@@ -415,7 +415,7 @@ def build_eagle_tree_structure_pallas_call(
 @partial(
     jax.jit,
     static_argnames=(
-        "padded_seq_lens_sum",
+        "max_context_len",
         "draft_token_num",
         "topk",
         "tree_mask_mode",
@@ -426,9 +426,9 @@ def build_eagle_tree_structure(
     selected_index: jax.Array,
     verified_seq_len: jax.Array,
     seq_lens_sum: jax.Array,
-    padded_seq_lens_sum: int,
     draft_token_num: int,
     topk: int,
+    max_context_len: int,
     tree_mask_mode: int = 0,  # FULL_MASK = 0
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """
@@ -462,7 +462,7 @@ def build_eagle_tree_structure(
     )
     _kernel = partial(
         build_eagle_tree_structure_pallas_call,
-        padded_seq_lens_sum=padded_seq_lens_sum,
+        max_context_len=max_context_len,
         draft_token_num=draft_token_num,
         topk=topk,
         tree_mask_mode=tree_mask_mode,
