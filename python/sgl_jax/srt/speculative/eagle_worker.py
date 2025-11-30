@@ -362,6 +362,7 @@ class EAGLEWorker(ModelWorker):
             seq_lens_sum=model_worker_batch.seq_lens_sum,
             seq_lens_cpu=np.array(jax.device_get(model_worker_batch.seq_lens)),
         )
+        print(f"{spec_info=}")
         model_worker_batch.spec_info = spec_info
         return spec_info
 
