@@ -54,15 +54,6 @@ class NativeAttention(AttentionBackend):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
     ):
-        """
-        Args:
-            q, k, v: Input tensors of shape [total_tokens, hidden_size]
-            forward_batch: ForwardBatch object containing seq_lens and batch_size
-            is_causal: Whether to apply causal masking
-        Returns:
-            Tuple of (output tensor of shape [total_tokens, hidden_size], k, v)
-        """
-        # TODO(pc) support tree based native attention backend
         k_buffer, v_buffer, kv_fused = self._get_and_update_kv_cache(
             k, v, forward_batch, token_to_kv_pool, self.kv_sharding, layer.layer_id
         )
@@ -84,7 +75,7 @@ class NativeAttention(AttentionBackend):
             k_buffer,
             v_buffer,
             forward_batch.seq_lens,
-            forward_batch.cache_loc,
+            forward_batch.cache_loc,  # NativeAttention uses cache_loc directly
             forward_batch.extend_prefix_lens,
             forward_batch.extend_seq_lens,
             layer.q_head_num,
@@ -96,7 +87,6 @@ class NativeAttention(AttentionBackend):
             xai_temperature_len=xai_temp_len,
         )
 
-        # Return full fused KV buffer for this layer so that caller can persist it outside JIT
         return attn_output, kv_fused
 
     def _get_and_update_kv_cache(

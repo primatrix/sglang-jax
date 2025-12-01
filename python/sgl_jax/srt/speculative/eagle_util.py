@@ -61,6 +61,10 @@ def _as_int32_array(value: Any, *, fallback: int = -1) -> jax.Array:
         return None
     if isinstance(value, jax.Array):
         return value
+    # Handle JAX Tracers (e.g. ShapedArray during scan/jit)
+    # We check for 'dtype' and absence of common python types to identify Tracers
+    if hasattr(value, "dtype") and not isinstance(value, (numpy.ndarray, int, float, bool)):
+        return value
     if isinstance(value, numpy.ndarray):
         return jnp.asarray(value, dtype=jnp.int32)
     if isinstance(value, (int, numpy.integer)):

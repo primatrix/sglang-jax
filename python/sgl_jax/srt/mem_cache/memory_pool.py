@@ -220,6 +220,15 @@ class KVCache(abc.ABC):
         """
         raise NotImplementedError()
 
+    @abc.abstractmethod
+    def get_all_buffers(self) -> list[jnp.ndarray]:
+        """Get all internal KV buffers.
+
+        Returns:
+            List of JAX arrays representing the KV cache buffers.
+        """
+        raise NotImplementedError()
+
     def get_kv_size_bytes(self):
         """Calculate KV cache size in bytes"""
         raise NotImplementedError()
@@ -423,6 +432,9 @@ class MHATokenToKVPool(KVCache):
     def replace_kv_buffer(self, fused_kv_buffer: list[jnp.ndarray]) -> None:
         self.kv_buffer[self.start_layer : self.start_layer + len(fused_kv_buffer)] = fused_kv_buffer
 
+    def get_all_buffers(self) -> list[jnp.ndarray]:
+        return self.kv_buffer
+
     def get_cpu_copy(self, indices):
         """Get CPU copy of fused KV cache for specified indices"""
         kv_cache_host = []
@@ -596,6 +608,19 @@ class SWAKVPool(KVCache):
 
         self.swa_kv_pool.replace_kv_buffer(swa_kv_buffer)
         self.full_kv_pool.replace_kv_buffer(full_kv_buffer)
+
+    def get_all_buffers(self) -> list[jnp.ndarray]:
+        full_buffers = self.full_kv_pool.get_all_buffers()
+        swa_buffers = self.swa_kv_pool.get_all_buffers()
+
+        all_buffers = [None] * (len(full_buffers) + len(swa_buffers))
+
+        for global_layer_id, (layer_id_pool, is_swa) in self.layers_mapping.items():
+            if is_swa:
+                all_buffers[global_layer_id] = swa_buffers[layer_id_pool]
+            else:
+                all_buffers[global_layer_id] = full_buffers[layer_id_pool]
+        return all_buffers
 
     def remap_cache_loc(self, loc: jax.Array, layer_id: int) -> jax.Array:
         """
@@ -923,6 +948,12 @@ class MLATokenToKVPool(KVCache):
         # Concatenate nope and rope components
         cache_k_combined = jnp.concatenate([cache_k_nope, cache_k_rope], axis=-1)
         self.kv_buffer[layer_idx] = self.kv_buffer[layer_idx].at[loc].set(cache_k_combined)
+
+    def replace_kv_buffer(self, kv_buffer: list[jnp.ndarray]) -> None:
+        self.kv_buffer[self.start_layer : self.start_layer + len(kv_buffer)] = kv_buffer
+
+    def get_all_buffers(self) -> list[jnp.ndarray]:
+        return self.kv_buffer
 
     def get_cpu_copy(self, indices):
         """Get CPU copy of KV cache for specified indices"""

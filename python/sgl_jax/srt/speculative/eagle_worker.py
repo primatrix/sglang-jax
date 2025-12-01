@@ -6,6 +6,7 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from tqdm import tqdm
@@ -280,6 +281,11 @@ class EAGLEWorker(ModelWorker):
         spec_info.prepare_for_draft_decode(
             model_worker_batch, self.topk, self.speculative_num_steps
         )
+        model_worker_batch.padding_model_worker_batch(
+            self.precompile_token_paddings,
+            self.precompile_bs_paddings,
+            self.precompile_cache_loc_paddings,
+        )
         # Run forward steps
         score_list, token_list, parents_list = self.draft_forward(model_worker_batch)
         (
@@ -528,17 +534,8 @@ class EAGLEWorker(ModelWorker):
                     parents_list=None,
                 )
             )
-        # Return values
-        # score_list   (bs, 1 + (step - 1) * topk  , eagle_topk)
-        # token_list   (bs, topk + (step - 1) * topk * topk)
-        # parents_list (bs, topk + 1 + (step - 1) * topk)
+
         bs = model_worker_batch.real_bs
-        step_min_1 = self.speculative_num_steps - 1
-        score_list: jax.Array = jnp.empty((bs, 1 + step_min_1 * self.topk, self.topk))
-        token_list: jax.Array = jnp.empty(
-            (bs, self.topk + step_min_1 * self.topk * self.topk), dtype=jnp.int32
-        )
-        parents_list: jax.Array = jnp.empty((bs, self.topk + 1 + step_min_1 * self.topk))
         if bs - hidden_states.shape[0] > 0:
             hidden_states = jnp.pad(
                 hidden_states,
@@ -549,105 +546,162 @@ class EAGLEWorker(ModelWorker):
                     (0, 0),
                 ),
             )
-        # Forward multiple steps
-        scores = None
+
+        # Force sharding to prevent cache miss (Python pad vs JIT output)
+        replicated_sharding = (
+            NamedSharding(self.model_runner.mesh, P()) if jax.process_count() == 1 else None
+        )
+        if replicated_sharding is not None:
+            hidden_states = jax.device_put(hidden_states, replicated_sharding)
+            topk_p = jax.device_put(topk_p, replicated_sharding)
+            topk_index = jax.device_put(topk_index, replicated_sharding)
+            if spec_info.verified_id is not None:
+                spec_info.verified_id = jax.device_put(spec_info.verified_id, replicated_sharding)
+
+        # Update spec_info with sharded arrays
+        spec_info.hidden_states = hidden_states
+        spec_info.topk_p = topk_p
+        spec_info.topk_index = topk_index
+
+        # --- Prepare Metadata for Scan ---
+        # Ensure batch parameters are set BEFORE calling get_eagle_multi_step_metadata
+        model_worker_batch.speculative_eagle_topk = self.topk
+        model_worker_batch.speculative_num_steps = self.speculative_num_steps
+        model_worker_batch.speculative_num_draft_tokens = self.speculative_num_draft_tokens
+
+        self.copy_model_worker_batch_to_cpu(model_worker_batch)
+        metadata_per_step = self.draft_model_runner.attn_backend.get_eagle_multi_step_metadata(
+            model_worker_batch,
+        )
+        # Forward in scan corresponds to steps 0 to N-2.
+        scan_metadata_list = metadata_per_step[:-1]
+        if len(scan_metadata_list) > 0:
+            stacked_metadata = jax.tree_util.tree_map(
+                lambda *xs: jnp.stack(xs), *scan_metadata_list
+            )
+            self.draft_model_runner.attn_backend.multi_step_metadata = nnx.data(stacked_metadata)
+
+        # --- Step 0 (Peel) ---
+        # Initial selection (Tree Expansion Step 0)
+        # Use a dummy scores array instead of None because jax.lax.cond traces both branches,
+        # and select_top_k_tokens_step_greater_0 expects an array.
+        scores = jnp.zeros((bs, self.topk), dtype=topk_p.dtype)
+        input_ids, hidden_states, scores, tree_info_0 = select_top_k_tokens_step_0(
+            topk_p, topk_index, hidden_states, scores, self.topk
+        )
+
+        score_list_0 = tree_info_0[0][:bs]  # (bs, 1, topk)
+        token_list_0 = tree_info_0[1][:bs]  # (bs, topk)
+        parents_list_0 = tree_info_0[2][:bs]  # (bs, topk + 1)
+
+        if self.speculative_num_steps == 1:
+            return score_list_0, token_list_0, parents_list_0
+
+        # --- Prepare for Scan (Steps 1 to N-1) ---
         positions_base = device_array(
             np.repeat(model_worker_batch.seq_lens[: model_worker_batch.real_bs], self.topk),
             sharding=(
                 NamedSharding(self.model_runner.mesh, P()) if jax.process_count() == 1 else None
             ),
         )
-        logits_metadata = None
-        model_worker_batch.speculative_eagle_topk = self.topk
-        model_worker_batch.speculative_num_steps = self.speculative_num_steps
-        model_worker_batch.speculative_num_draft_tokens = self.speculative_num_draft_tokens
-        # 这里需要150ms, 需要优化
-        self.copy_model_worker_batch_to_cpu(model_worker_batch)
-        metadata_per_step = self.draft_model_runner.attn_backend.get_eagle_multi_step_metadata(
-            model_worker_batch,
-        )
+
         model_worker_batch.input_ids = np.empty(bs * self.topk, np.int32)
         model_worker_batch.positions = np.empty(bs * self.topk, np.int32)
         model_worker_batch.spec_info.hidden_states = hidden_states
-        assert isinstance(metadata_per_step, list)
-        # we just use logits_metadata's forward mode and capture mode, it will not be modified within the loop
+
         logits_metadata = LogitsMetadata.from_model_worker_batch(
             model_worker_batch, self.draft_model_runner.mesh
         )
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
         forward_batch.out_cache_loc = jnp.empty((1,))
         forward_batch.cache_loc = jnp.empty((1,))
-        forward_batch.spec_info = EagleDraftInput()
-        forward_batch.spec_info.hidden_states = jnp.empty((bs * self.topk, hidden_states.shape[1]))
-        for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
-            )
-            if i == 0:
-                score_list = score_list.at[:bs, :1, :].set(tree_info[0][:bs])
-                token_list = token_list.at[:bs, : self.topk].set(tree_info[1][:bs])
-                parents_list = parents_list.at[:bs, : self.topk + 1].set(tree_info[2][:bs])
-            else:
-                score_start = 1 + (i - 1) * self.topk
-                token_start = self.topk + (i - 1) * self.topk * self.topk
-                parent_start = self.topk + 1 + (i - 1) * self.topk
-                score_list = score_list.at[:bs, score_start : score_start + self.topk, :].set(
-                    tree_info[0][:bs]
-                )
-                token_list = token_list.at[
-                    :bs, token_start : token_start + self.topk * self.topk
-                ].set(tree_info[1][:bs])
-                parents_list = parents_list.at[:bs, parent_start : parent_start + self.topk].set(
-                    tree_info[2][:bs]
-                )
-            if i == self.speculative_num_steps - 1:
-                break
-            forward_batch.input_ids = forward_batch.input_ids.at[:].set(input_ids[:])
-            # FIXME(pc) hiddenstate will become NAN when forward path is very long, we still have no reason for this
-            forward_batch.spec_info.hidden_states = forward_batch.spec_info.hidden_states.at[:].set(
-                hidden_states[:]
-            )
-            forward_batch.positions = forward_batch.positions.at[:].set(positions_base[:] + i)
-            self.draft_model_runner.attn_backend.forward_metadata = metadata_per_step[i]
 
-            # Run forward
+        # Set initial values for Step 0 Forward (which happens in first scan iter)
+        forward_batch.input_ids = input_ids
+        forward_batch.spec_info.hidden_states = hidden_states
+        forward_batch.positions = positions_base
+        # Initialize speculative_step_id to int32 array to match scan output structure
+        forward_batch.speculative_step_id = jnp.array(0, dtype=jnp.int32)
+
+        # Include KV cache in carry to handle state updates functionally
+        curr_kv_cache = self.draft_model_runner.token_to_kv_pool.get_all_buffers()
+        carry = (forward_batch, scores, curr_kv_cache)
+
+        def scan_fn(carry, step_idx):
+            batch, curr_scores, kv_cache = carry
+
+            # HACK: Temporarily update the global KV cache with the current tracer
+            # This ensures model.forward uses the state from the previous iteration
+            self.draft_model_runner.token_to_kv_pool.replace_kv_buffer(kv_cache)
+
+            # 1. Forward (Step `step_idx`)
+            batch.speculative_step_id = step_idx
             logits_output, _ = self.draft_model_runner.forward(
-                forward_batch,
+                batch,
                 logits_metadata=logits_metadata,
             )
-            topk_p, topk_index = topk_probs_from_logits(
-                logits_output.next_token_logits[: model_worker_batch.real_bs * self.topk], self.topk
+
+            # Retrieve updated KV cache (new tracers) produced by forward
+            new_kv_cache = self.draft_model_runner.token_to_kv_pool.get_all_buffers()
+
+            # 2. Process Logits
+            next_topk_p, next_topk_index = topk_probs_from_logits(
+                logits_output.next_token_logits[: bs * self.topk], self.topk
             )
             if self.hot_token_ids is not None:
-                topk_index = self.hot_token_ids[topk_index]
-            hidden_states = logits_output.hidden_states[
-                : model_worker_batch.real_bs * self.topk * self.topk, :
-            ]
-        # score_list_array = []
-        # token_list_array = []
-        # parents_list_array = []
-        # bs = model_worker_batch.real_bs
-        # for i in range(model_worker_batch.speculative_num_steps):
+                next_topk_index = self.hot_token_ids[next_topk_index]
+            next_hidden = logits_output.hidden_states[: bs * self.topk * self.topk, :]
 
-        #     if i == 0:
-        #         score_list_array.append(score_list[:bs, :1, :])
-        #         token_list_array.append(token_list[:bs, : self.topk])
-        #         parents_list_array.append(parents_list[:bs, : self.topk + 1])
-        #     else:
-        #         score_start = 1 + (i - 1) * self.topk
-        #         token_start = self.topk + (i - 1) * self.topk * self.topk
-        #         parent_start = self.topk + 1 + (i - 1) * self.topk
-        #         score_list_array.append(score_list[:bs, score_start : score_start + self.topk, :])
-        #         token_list_array.append(
-        #             token_list[:bs, token_start : token_start + self.topk * self.topk]
-        #         )
-        #         parents_list_array.append(
-        #             parents_list[:bs, parent_start : parent_start + self.topk]
-        #         )
+            # 3. Select (Step `step_idx + 1`)
+            next_i = step_idx + 1
+            next_ids, next_h, next_scores, tree_info = select_top_k_tokens_step_greater_0(
+                jnp.asarray(next_i),
+                next_topk_p,
+                next_topk_index,
+                next_hidden,
+                curr_scores,
+                self.topk,
+            )
 
-        # # assert jnp.allclose(jnp.concatenate(score_list_array, axis=1),score_list)
-        # # assert jnp.all(jnp.concatenate(token_list_array, axis=1), token_list)
-        # # assert jnp.all(jnp.concatenate(parents_list_array[:-1], axis=1), parents_list)
+            # 4. Update Batch for next Forward
+            new_positions = positions_base + next_i
+
+            # Create a new batch state for the next iteration
+            batch.input_ids = next_ids
+            batch.positions = new_positions
+            batch.spec_info.hidden_states = next_h
+
+            return (batch, next_scores, new_kv_cache), tree_info
+
+        # Run Scan over steps 0 to N-2
+        # This will produce results for Select(1) to Select(N-1)
+        steps = jnp.arange(self.speculative_num_steps - 1)
+        final_carry, stacked_tree_info = jax.lax.scan(scan_fn, carry, steps)
+
+        # Update the global KV cache with the final state from scan
+        _, _, final_kv_cache = final_carry
+        self.draft_model_runner.token_to_kv_pool.replace_kv_buffer(final_kv_cache)
+
+        # --- Combine Results ---        # stacked_tree_info[0] (scores): (num_steps-1, bs, topk, topk)
+        # stacked_tree_info[1] (tokens): (num_steps-1, bs, topk^2)
+        # stacked_tree_info[2] (parents): (num_steps-1, bs, topk)
+
+        scores_rest = stacked_tree_info[0]
+        tokens_rest = stacked_tree_info[1]
+        parents_rest = stacked_tree_info[2]
+
+        # Reshape and concatenate
+        # score_list: [step 0 (bs, 1, topk), steps 1..N-1 (bs, (N-1)*topk, topk)]
+        # We need to transpose stacked results from (steps, bs, ...) to (bs, steps, ...) and flatten
+
+        scores_rest = jnp.swapaxes(scores_rest, 0, 1).reshape(bs, -1, self.topk)
+        score_list = jnp.concatenate([score_list_0, scores_rest], axis=1)
+
+        tokens_rest = jnp.swapaxes(tokens_rest, 0, 1).reshape(bs, -1)
+        token_list = jnp.concatenate([token_list_0, tokens_rest], axis=1)
+
+        parents_rest = jnp.swapaxes(parents_rest, 0, 1).reshape(bs, -1)
+        parents_list = jnp.concatenate([parents_list_0, parents_rest], axis=1)
 
         return score_list, token_list, parents_list
 
@@ -769,19 +823,22 @@ def fast_topk(values, topk, axis=-1):
 
 # FIXME(pc) this should be jitted or convert as np.ndarray
 def select_top_k_tokens(
-    i: int,
+    i: int | jax.Array,
     topk_p: jax.Array,
     topk_index: jax.Array,
     hidden_states: jax.Array,
     scores: jax.Array,
     topk: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    if i == 0:
-        return select_top_k_tokens_step_0(topk_p, topk_index, hidden_states, scores, topk)
-    else:
-        return select_top_k_tokens_step_greater_0(
+    # Use jax.lax.cond to handle both static int (for step 0) and traced array (for scan)
+    return jax.lax.cond(
+        i == 0,
+        lambda _: select_top_k_tokens_step_0(topk_p, topk_index, hidden_states, scores, topk),
+        lambda _: select_top_k_tokens_step_greater_0(
             jnp.asarray(i), topk_p, topk_index, hidden_states, scores, topk
-        )
+        ),
+        None,
+    )
 
 
 @functools.partial(jax.jit, static_argnames=["topk"])

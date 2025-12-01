@@ -133,6 +133,7 @@ class ForwardBatch:
     """Store all inputs of a forward pass."""
 
     # The batch id
+    #  this field will not be used, we should remove it in the future
     bid: int
     # The forward mode
     forward_mode: ForwardMode
@@ -145,7 +146,7 @@ class ForwardBatch:
     # The sequence length for each request [batch_size]
     seq_lens: jax.Array
     # decode token position in kv cache
-    # this field will not be used
+    # this field will not be used, we should remove it in the future
     out_cache_loc: jax.Array
 
     # Position information [total_tokens]
@@ -155,7 +156,7 @@ class ForwardBatch:
 
     attn_backend: AttentionBackend = None
 
-    # this field will not be used
+    # this field will not be used, we should remove it in the future
     cache_loc: jax.Array = None
 
     # For extend
@@ -168,6 +169,8 @@ class ForwardBatch:
     spec_info: EagleVerifyInput | EagleDraftInput | None = None
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
+    # For multi-step speculative decoding in jax.lax.scan
+    speculative_step_id: int | jax.Array | None = None
 
     def tree_flatten(self):
         children = (
@@ -182,6 +185,7 @@ class ForwardBatch:
             self.extend_prefix_lens,
             self.extend_seq_lens,
             self.spec_info,
+            self.speculative_step_id,
         )
 
         aux_data = {
@@ -196,6 +200,7 @@ class ForwardBatch:
     def tree_unflatten(cls, aux_data, children):
         obj = cls.__new__(cls)
 
+        obj.bid = -1
         obj.forward_mode = aux_data["forward_mode"]
         obj.batch_size = aux_data["batch_size"]
         obj.spec_algorithm = aux_data["spec_algorithm"]
@@ -214,6 +219,7 @@ class ForwardBatch:
         obj.extend_prefix_lens = children[8]
         obj.extend_seq_lens = children[9]
         obj.spec_info = children[10]
+        obj.speculative_step_id = children[11]
         return obj
 
     def __repr__(self) -> str:
@@ -243,6 +249,11 @@ class ForwardBatch:
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
+        # Ensure speculative_step_id is not None (use -1 as default) to maintain consistent PyTree structure
+        spec_step_id = getattr(batch, "speculative_step_id", None)
+        if spec_step_id is None:
+            spec_step_id = -1
+
         (
             input_ids,
             seq_lens,
@@ -253,6 +264,7 @@ class ForwardBatch:
             cache_loc,
             extend_prefix_lens,
             extend_seq_lens,
+            speculative_step_id,
         ) = device_array(
             (
                 batch.input_ids,
@@ -264,6 +276,7 @@ class ForwardBatch:
                 batch.cache_loc,
                 batch.extend_prefix_lens,
                 batch.extend_seq_lens,
+                spec_step_id,
             ),
             sharding=(
                 NamedSharding(model_runner.mesh, PartitionSpec())
@@ -289,6 +302,7 @@ class ForwardBatch:
             spec_info=batch.spec_info,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=batch.capture_hidden_mode,
+            speculative_step_id=speculative_step_id,
         )
 
         return obj

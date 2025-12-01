@@ -94,6 +94,7 @@ class FlashAttention(AttentionBackend):
         self.page_size = page_size
         self.kv_partition_axis = kv_partition_axis
         self.forward_metadata = nnx.data(FlashAttentionMetadata())
+        self.multi_step_metadata = None
         self.mesh = mesh
 
     def get_forward_metadata(
@@ -256,9 +257,16 @@ class FlashAttention(AttentionBackend):
         seq_lens = np.copy(batch.seq_lens)
 
         # Vectorized preparation
-        real_bs = batch.real_bs
-        current_seq_lens = batch.seq_lens[:real_bs]
-        allocate_lens = batch.spec_info.allocate_lens[:real_bs]
+        # Use full padded batch size to ensure metadata shapes match forward_metadata
+        padded_bs = len(batch.seq_lens)
+        current_seq_lens = batch.seq_lens
+        allocate_lens = batch.spec_info.allocate_lens
+
+        # Pad allocate_lens if it only contains real_bs data
+        if len(allocate_lens) < padded_bs:
+            allocate_lens = np.pad(
+                allocate_lens, (0, padded_bs - len(allocate_lens)), mode="constant"
+            )
 
         draft_allocs = allocate_lens - current_seq_lens
 
@@ -305,13 +313,6 @@ class FlashAttention(AttentionBackend):
 
             page_indices_cur_step = (result_locs // self.page_size).astype(np.int32)
 
-            # Handle padding
-            TARGET_PADDING = 16384
-            if page_indices_cur_step.shape[0] < TARGET_PADDING:
-                padding_size = TARGET_PADDING - page_indices_cur_step.shape[0]
-                # Use np.pad to keep it on CPU/Numpy until device_array call
-                page_indices_cur_step = np.pad(page_indices_cur_step, (0, padding_size))
-
             page_indices.append(page_indices_cur_step)
 
         if batch.spec_algorithm.is_none():
@@ -348,7 +349,7 @@ class FlashAttention(AttentionBackend):
         return metadata
 
     def tree_flatten(self):
-        children = (self.forward_metadata,)
+        children = (self.forward_metadata, self.multi_step_metadata)
         aux_data = {
             "num_heads": self.num_heads,
             "num_kv_heads": self.num_kv_heads,
@@ -369,6 +370,7 @@ class FlashAttention(AttentionBackend):
         )
 
         obj.forward_metadata = children[0]
+        obj.multi_step_metadata = children[1]
 
         return obj
 
@@ -392,6 +394,31 @@ class FlashAttention(AttentionBackend):
         Returns:
             Output tensor of shape [total_tokens, hidden_size]
         """
+        if self.multi_step_metadata is not None and forward_batch.speculative_step_id is not None:
+
+            def select_multi_step(operand):
+                step_id = operand
+
+                def select_leaf(leaf):
+                    if leaf is None:
+                        return None
+                    return jax.lax.dynamic_index_in_dim(leaf, step_id, axis=0, keepdims=False)
+
+                return jax.tree_util.tree_map(select_leaf, self.multi_step_metadata)
+
+            def select_single_step(operand):
+                return self.forward_metadata
+
+            # Use cond to handle both scan (id >= 0) and regular (id = -1) cases
+            current_metadata = jax.lax.cond(
+                forward_batch.speculative_step_id >= 0,
+                select_multi_step,
+                select_single_step,
+                forward_batch.speculative_step_id,
+            )
+        else:
+            current_metadata = self.forward_metadata
+
         kv_cache_fused = self._get_fused_kv_cache(forward_batch, token_to_kv_pool, layer.layer_id)
 
         scale = 1.0 / jnp.sqrt(layer.head_dim) if layer.scaling is None else layer.scaling
@@ -405,11 +432,11 @@ class FlashAttention(AttentionBackend):
 
         causal = 1
 
-        # custom_mask = self.forward_metadata.custom_mask
-        if self.forward_metadata.custom_mask is not None:
+        # custom_mask = current_metadata.custom_mask
+        if current_metadata.custom_mask is not None:
             causal = 0
         # Select page indices and remap to SWA pool if KV cache supports it
-        page_indices_arg = self.forward_metadata.page_indices
+        page_indices_arg = current_metadata.page_indices
         if hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
             page_indices_arg = token_to_kv_pool.remap_cache_loc(page_indices_arg, layer.layer_id)
 
@@ -460,6 +487,7 @@ class FlashAttention(AttentionBackend):
             updated_kv_cache_fused,
         ) = jax.shard_map(  # Fused KV kernel handles cache updates internally
             _ragged_paged_attention_with_fused_kv,
+            mesh=self.mesh,
             in_specs=in_specs,
             out_specs=out_specs,
             check_vma=False,
@@ -468,12 +496,12 @@ class FlashAttention(AttentionBackend):
             k.reshape(k.shape[0], -1, self.head_dim),
             v.reshape(v.shape[0], -1, self.head_dim),
             kv_cache_fused_paged,
-            self.forward_metadata.seq_lens,
+            current_metadata.seq_lens,
             page_indices_arg,
-            self.forward_metadata.cu_q_lens,
-            self.forward_metadata.cu_kv_lens,
-            self.forward_metadata.distribution,
-            self.forward_metadata.custom_mask,
+            current_metadata.cu_q_lens,
+            current_metadata.cu_kv_lens,
+            current_metadata.distribution,
+            current_metadata.custom_mask,
         )
         pad_width = (self.head_dim + 127) // 128 * 128 - self.head_dim
         if pad_width > 0:

@@ -2,6 +2,7 @@
 
 import logging
 import os
+from contextlib import nullcontext
 from functools import partial
 
 import jax
@@ -158,7 +159,7 @@ class ModelRunner:
 
     def initialize_jit(self):
         model_def, model_state = nnx.split(self.model)
-        model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
+        _, model_state_def = jax.tree_util.tree_flatten(model_state)
         sampler_def, sampler_state = nnx.split(self.sampler)
         sampler_state_leaves, sampler_state_def = jax.tree_util.tree_flatten(sampler_state)
 
@@ -192,6 +193,10 @@ class ModelRunner:
             return sampler(*args, use_sort_for_toppk_minp=use_sort_for_toppk_minp)
 
         def run_model_wrapper(forward_batch, logits_metadata):
+            # Capture current model state to include updates (e.g. multi_step_metadata)
+            _, current_state = nnx.split(self.model)
+            model_state_leaves, _ = jax.tree_util.tree_flatten(current_state)
+
             token_to_kv_pool = self.token_to_kv_pool
 
             return jitted_run_model(
@@ -530,15 +535,20 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
     ) -> tuple[LogitsProcessorOutput, int]:
-        # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
-        # on jax >=0.7.1, we need to use set_mesh.
+        # Handle mesh context:
+        # 1. Try jax.sharding.use_mesh (deprecated but needed for old JAX)
+        # 2. Try jax.set_mesh (new API)
+        # 3. Catch ValueError: If inside JIT (e.g. scan), set_mesh is forbidden. Use nullcontext.
+        # 4. Catch AttributeError: If APIs missing, fallback.
+        ctx = nullcontext()
         try:
-            ctx = jax.sharding.use_mesh(self.mesh)
-        except AttributeError:
-            try:
+            if hasattr(jax.sharding, "use_mesh"):
+                ctx = jax.sharding.use_mesh(self.mesh)
+            else:
                 ctx = jax.set_mesh(self.mesh)
-            except AttributeError:
-                ctx = self.mesh
+        except (AttributeError, ValueError):
+            pass
+
         with ctx:
             if forward_batch.forward_mode.is_decode() or forward_batch.forward_mode.is_extend():
                 ret = self._forward(forward_batch, logits_metadata)
