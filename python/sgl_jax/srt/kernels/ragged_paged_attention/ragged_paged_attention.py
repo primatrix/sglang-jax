@@ -405,14 +405,14 @@ def _ragged_paged_attention_kernel(
                 wait,
             )
 
-        with jax.named_scope("ASYNC_COPY_LOOP"):
-            lax.fori_loop(
-                0,
-                load_q_sz,
-                loop_body,
-                None,
-                unroll=False,
-            )
+        pl.debug_print("ASYNC_COPY_START")
+        lax.fori_loop(
+            0,
+            load_q_sz,
+            loop_body,
+            None,
+            unroll=False,
+        )
 
     def _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, *, wait=False):
         sem = sems.at[0, bkv_sem_idx]
