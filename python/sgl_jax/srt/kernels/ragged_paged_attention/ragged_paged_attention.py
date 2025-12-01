@@ -359,11 +359,13 @@ def _ragged_paged_attention_kernel(
     q_end = cu_q_lens_ref[seq_idx + 1]
     q_len = q_end - q_start
     kv_len = kv_lens_ref[seq_idx]
+    pid = pl.program_id(0)
+    cond = pid >= 0
 
     def _async_copy(src, dst, sem, wait):
-        pl.debug_check(True, "=== PALLAS MAKE ASYNC COPY START ===")
+        pl.debug_check(cond, "=== PALLAS MAKE ASYNC COPY START ===")
         cp = pltpu.make_async_copy(src, dst, sem)
-        pl.debug_check(True, "=== PALLAS MAKE ASYNC COPY END ===")
+        pl.debug_check(cond, "=== PALLAS MAKE ASYNC COPY END ===")
 
         if wait:
             cp.wait()
