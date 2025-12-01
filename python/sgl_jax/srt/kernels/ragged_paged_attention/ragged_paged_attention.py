@@ -363,7 +363,7 @@ def _ragged_paged_attention_kernel(
     cond = pid >= 0
 
     def _async_copy(src, dst, sem, wait):
-        pl.debug_check(cond, "=== PALLAS MAKE ASYNC COPY START ===")
+        pl.debug_check(cond, "=== PALLAS MAKE ASYNC COPY TRIGGERED ===")
         cp = pltpu.make_async_copy(src, dst, sem)
 
         if wait:
