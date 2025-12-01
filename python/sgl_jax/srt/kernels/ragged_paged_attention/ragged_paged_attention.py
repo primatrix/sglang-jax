@@ -360,9 +360,7 @@ def _ragged_paged_attention_kernel(
     q_len = q_end - q_start
     kv_len = kv_lens_ref[seq_idx]
 
-    pid = pl.program_id(0)
-    cond = pid >= 0
-    pl.debug_check(cond, "=== MY_NVTX_MARKER_START ===")
+    pl.debug_check(True, "=== PALLAS_ANNOTATION_TEST ===")
 
     def _async_copy(src, dst, sem, wait):
         cp = pltpu.make_async_copy(src, dst, sem)
