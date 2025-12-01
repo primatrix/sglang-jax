@@ -360,10 +360,11 @@ def _ragged_paged_attention_kernel(
     q_len = q_end - q_start
     kv_len = kv_lens_ref[seq_idx]
 
-    pl.debug_check(True, "=== PALLAS_ANNOTATION_TEST ===")
-
     def _async_copy(src, dst, sem, wait):
+        pl.debug_check(True, "=== PALLAS MAKE ASYNC COPY START ===")
         cp = pltpu.make_async_copy(src, dst, sem)
+        pl.debug_check(True, "=== PALLAS MAKE ASYNC COPY END ===")
+
         if wait:
             cp.wait()
         else:
