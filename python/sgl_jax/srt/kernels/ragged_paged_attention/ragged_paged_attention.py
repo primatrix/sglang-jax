@@ -405,7 +405,9 @@ def _ragged_paged_attention_kernel(
                 wait,
             )
 
-        pl.debug_print("ASYNC_COPY_START")
+        pid = pl.program_id(0)
+        assert pid >= 0, "MY_MAKER_ASSERT"
+
         lax.fori_loop(
             0,
             load_q_sz,
