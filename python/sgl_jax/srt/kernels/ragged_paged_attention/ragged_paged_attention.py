@@ -365,12 +365,13 @@ def _ragged_paged_attention_kernel(
     def _async_copy(src, dst, sem, wait):
         pl.debug_check(cond, "=== PALLAS MAKE ASYNC COPY START ===")
         cp = pltpu.make_async_copy(src, dst, sem)
-        pl.debug_check(cond, "=== PALLAS MAKE ASYNC COPY END ===")
 
         if wait:
             cp.wait()
+            pl.debug_check(cond, "=== PALLAS MAKE ASYNC COPY WAIT ===")
         else:
             cp.start()
+            pl.debug_check(cond, "=== PALLAS MAKE ASYNC COPY START ===")
 
     def _fetch_mask(seq_idx, bq_idx, bkvmask_idx, bkvmask_sem_idx, *, wait=False):
         if custom_mask_ref is None:
