@@ -810,44 +810,88 @@ def _ragged_paged_attention_kernel(
                         return num_kv_heads_mask != 1
 
                 # Load batched data
-                k_batch, v_batch = batch_load_all_heads_kv()
-                q_batch, offs_qidx_batch = batch_prepare_queries()
+                # k_batch, v_batch = batch_load_all_heads_kv()
+                # q_batch, offs_qidx_batch = batch_prepare_queries()
 
-                def flash_attention(q_batch, k_batch, v_batch):
+                # [REMOVED] batch_load_all_heads_kv() and batch_prepare_queries()
+                # We will load data INSIDE the loop to avoid dynamic_slice on registers.
+                def flash_attention():  # No args, we access refs directly
                     # --- [OPTIMIZATION] Head Grouping Configuration ---
                     HEAD_GROUP_SIZE = 2
 
-                    q_batch_f32 = q_batch.astype(jnp.float32)
-                    k_batch_f32 = k_batch.astype(jnp.float32)
-                    v_batch_f32 = v_batch.astype(jnp.float32)
-
-                    if k_scale is not None:
-                        k_batch_f32 = k_batch_f32 * k_scale
-                    if v_scale is not None:
-                        v_batch_f32 = v_batch_f32 * v_scale
-
-                    # --- Loop over Head Groups instead of single Heads ---
+                    # --- Loop over Head Groups ---
                     def body(h_group_idx, _):
                         h_start = h_group_idx * HEAD_GROUP_SIZE
 
-                        # 1. Slice Inputs using lax.dynamic_slice (Fixes JIT Tracer Error)
-                        q_g = lax.dynamic_slice(
-                            q_batch_f32,
-                            (h_start, 0, 0),
-                            (HEAD_GROUP_SIZE, q_batch.shape[1], q_batch.shape[2]),
-                        )
-                        k_g = lax.dynamic_slice(
-                            k_batch_f32,
-                            (h_start, 0, 0),
-                            (HEAD_GROUP_SIZE, k_batch.shape[1], k_batch.shape[2]),
-                        )
-                        v_g = lax.dynamic_slice(
-                            v_batch_f32,
-                            (h_start, 0, 0),
-                            (HEAD_GROUP_SIZE, v_batch.shape[1], v_batch.shape[2]),
-                        )
+                        # =========================================================
+                        # FIX: Load Q/K/V inside the loop using pl.ds on Refs
+                        # =========================================================
 
-                        # 2. Grouped Matrix Multiplication
+                        # 1. Load Q Group: [2, BQ, D]
+                        # bq_x2_ref is [2, H, BQ, ...]. We slice H dimension.
+                        # Note: We need to handle bitcast/packing if strictly needed,
+                        # but usually load_bq helper handles single head.
+                        # Let's manually implement the load for the group to be safe.
+
+                        # We use a small unroll loop to load 2 heads and stack them
+                        # This is safer than trying to slice the packed dim dynamically
+                        q_heads = []
+                        offs_qidx_heads = []
+
+                        for i in range(HEAD_GROUP_SIZE):
+                            # Statically unrolled loop (i=0, 1)
+                            curr_h = h_start + i
+
+                            # load_bq returns [BQ, D]
+                            bq = load_bq(bq_sem_idx, curr_h, actual_bq_sz=actual_bq_sz)
+                            q_heads.append(bq)
+
+                            # Re-calculate offsets if needed
+                            if xai_temperature_len is not None:
+                                prefix_len = kv_len - q_len
+                                local_q_offset = (
+                                    bq_idx * bq_sz
+                                    + lax.iota(jnp.int32, bq.shape[0]) // num_q_heads_per_kv_head
+                                )
+                                base_qidx = prefix_len + local_q_offset
+                                offs_qidx_heads.append(base_qidx)
+
+                        q_g = jnp.stack(q_heads, axis=0).astype(jnp.float32)  # [2, BQ, D]
+
+                        if xai_temperature_len is not None:
+                            offs_qidx_g = jnp.stack(offs_qidx_heads, axis=0)  # [2, BQ]
+
+                        # 2. Load K/V Group: [2, BKV, D]
+                        k_heads = []
+                        v_heads = []
+                        for i in range(HEAD_GROUP_SIZE):
+                            curr_h = h_start + i
+                            # Use existing helper with correct stride
+                            # start = curr_h * 2 (because K,V interleaved)
+                            # step = total heads * 2
+                            bkv_lst = strided_load_bkv_fused(
+                                bkv_sem_idx,
+                                curr_h * 2,
+                                actual_num_kv_heads * 2,
+                                bkv_bitmask=bkv_bitmask,
+                            )
+                            k, v = bkv_lst[0]
+                            k_heads.append(k)
+                            v_heads.append(v)
+
+                        k_g = jnp.stack(k_heads, axis=0).astype(jnp.float32)  # [2, BKV, D]
+                        v_g = jnp.stack(v_heads, axis=0).astype(jnp.float32)  # [2, BKV, D]
+
+                        if k_scale is not None:
+                            k_g *= k_scale
+                        if v_scale is not None:
+                            v_g *= v_scale
+
+                        # =========================================================
+                        # Compute Logic (Same as before, but on loaded groups)
+                        # =========================================================
+
+                        # Grouped Matrix Multiplication
                         # einsum("gqd,gkd->gqk") where g=2.
                         s_g = (
                             jnp.einsum(
@@ -862,7 +906,7 @@ def _ragged_paged_attention_kernel(
                         if q_scale is not None:
                             s_g *= q_scale
 
-                        # 3. Masking Logic
+                        # Masking Logic
                         g_dim, bq_dim, bkv_dim = s_g.shape
 
                         _q_span = (
@@ -899,10 +943,6 @@ def _ragged_paged_attention_kernel(
 
                         # XAI Temperature
                         if xai_temperature_len is not None:
-                            offs_qidx_g = lax.dynamic_slice(
-                                offs_qidx_batch, (h_start, 0), (HEAD_GROUP_SIZE, q_batch.shape[1])
-                            )
-
                             xai_temperature_scale = 1.0 / jnp.log2(float(xai_temperature_len))
                             _qtemp = (
                                 jnp.log2(offs_qidx_g.astype(jnp.float32)) * xai_temperature_scale
@@ -914,11 +954,11 @@ def _ragged_paged_attention_kernel(
 
                         s_g += jnp.where(mask, mask_value, 0.0)
 
-                        # 4. Softmax Statistics Update
-                        # FIX: Use pl.ds for dynamic reference slicing
-                        m_ref_g = m_ref.at[pl.ds(h_start, HEAD_GROUP_SIZE), : q_batch.shape[1]]
-                        l_ref_g = l_ref.at[pl.ds(h_start, HEAD_GROUP_SIZE), : q_batch.shape[1]]
-                        acc_ref_g = acc_ref.at[pl.ds(h_start, HEAD_GROUP_SIZE), : q_batch.shape[1]]
+                        # Softmax Statistics Update
+                        # We use pl.ds on Refs here, which IS supported.
+                        m_ref_g = m_ref.at[pl.ds(h_start, HEAD_GROUP_SIZE), : q_g.shape[1]]
+                        l_ref_g = l_ref.at[pl.ds(h_start, HEAD_GROUP_SIZE), : q_g.shape[1]]
+                        acc_ref_g = acc_ref.at[pl.ds(h_start, HEAD_GROUP_SIZE), : q_g.shape[1]]
 
                         def load_with_init(ref, init_val):
                             return jnp.where(bkv_idx == 0, jnp.full_like(ref, init_val), ref[...])
@@ -926,11 +966,9 @@ def _ragged_paged_attention_kernel(
                         s_g_rowmax = jnp.max(s_g, axis=2, keepdims=True)
 
                         m_prev = load_with_init(m_ref_g, -jnp.inf)
-                        m_prev_val = m_prev[..., 0:1]  # [2, bq, 1] - Valid data only
+                        m_prev_val = m_prev[..., 0:1]
 
                         m_curr = jnp.maximum(m_prev_val, s_g_rowmax)
-
-                        # FIX: Use jnp.broadcast_to instead of broadcast_minor to avoid shape assertion
                         m_ref_g[...] = jnp.broadcast_to(m_curr, m_prev.shape)
 
                         p_g = jnp.exp(s_g - m_curr)
@@ -946,7 +984,7 @@ def _ragged_paged_attention_kernel(
                         exp_m_diff = jnp.exp(m_prev_val - m_curr)
 
                         l_prev = load_with_init(l_ref_g, 0.0)
-                        l_prev_val = l_prev[..., 0:1]  # [2, bq, 1]
+                        l_prev_val = l_prev[..., 0:1]
 
                         l_curr = exp_m_diff * l_prev_val + p_rowsum
                         l_ref_g[...] = jnp.broadcast_to(l_curr, l_prev.shape)
@@ -955,13 +993,13 @@ def _ragged_paged_attention_kernel(
                         o_curr = exp_m_diff * o_prev + pv_g
                         acc_ref_g[...] = o_curr
 
-                    # Run loop with stride 2 inside flash_attention
+                    # Run loop
                     lax.fori_loop(
                         0, actual_num_kv_heads // HEAD_GROUP_SIZE, body, None, unroll=True
                     )
 
-                # Call flash_attention inside compute_with_bkv
-                flash_attention(q_batch, k_batch, v_batch)
+                # Call the no-arg function
+                flash_attention()
 
             # Execution loop for BKV blocks (Outside compute_with_bkv definition, inside compute_with_bq)
             lax.fori_loop(0, num_bkv, compute_with_bkv, None, unroll=False)
