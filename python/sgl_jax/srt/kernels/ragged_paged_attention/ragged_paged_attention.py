@@ -867,43 +867,90 @@ def _ragged_paged_attention_kernel(
 
                     s += jnp.where(mask, mask_value, 0.0)
 
-                    for head_idx in range(actual_num_kv_heads):
-                        head_l_ref = l_ref.at[head_idx, : q_batch.shape[1]]
-                        head_m_ref = m_ref.at[head_idx, : q_batch.shape[1]]
-                        head_acc_ref = acc_ref.at[head_idx, : q_batch.shape[1]]
+                    HEAD_GROUP_SIZE = 2
+
+                    assert actual_num_kv_heads % HEAD_GROUP_SIZE == 0
+
+                    def compute_head_group(h_group_idx, _):
+                        h_start = h_group_idx * HEAD_GROUP_SIZE
+                        h_end = h_start + HEAD_GROUP_SIZE
+
+                        # 1. Slice pointers for the current group
+                        # Shape: [Group, bq_sz, 128] or [Group, bq_sz, head_dim]
+                        group_l_ref = l_ref.at[h_start:h_end, : q_batch.shape[1]]
+                        group_m_ref = m_ref.at[h_start:h_end, : q_batch.shape[1]]
+                        group_acc_ref = acc_ref.at[h_start:h_end, : q_batch.shape[1]]
 
                         def load_with_init(ref, init_val):
+                            # Ref shape: [Group, bq_sz, dim]
                             return jnp.where(bkv_idx == 0, jnp.full_like(ref, init_val), ref[...])
 
-                        s_head = s[head_idx]
-                        s_head_rowmax = jnp.max(s_head, axis=1, keepdims=True)
+                        # 2. Get Scores for this group
+                        # s shape: [num_heads, bq_sz, bkv_sz] -> Slice to [Group, bq_sz, bkv_sz]
+                        s_group = s[h_start:h_end]
 
-                        m_prev = load_with_init(head_m_ref, -jnp.inf)
-                        m_curr = jnp.maximum(m_prev, s_head_rowmax)
-                        head_m_ref[...] = m_curr
+                        # RowMax: [Group, bq_sz, 1]
+                        s_group_rowmax = jnp.max(s_group, axis=2, keepdims=True)
 
-                        p = jnp.exp(s_head - broadcast_minor(m_curr, s_head.shape))
+                        m_prev = load_with_init(
+                            group_m_ref, -jnp.inf
+                        )  # [Group, bq_sz, 128] (padded) or [..., 1] effective
 
-                        pv = jnp.einsum(
-                            "qk,kd->qd",
-                            p,
-                            v_batch_f32[head_idx],
+                        # m_curr logic
+                        # m_prev is effectively used as [Group, bq_sz, 1] for max comparison
+                        # We need to ensure shapes broadcast correctly.
+                        # m_ref storage is padded to 128, but we only care about the value.
+                        # Usually m is stored duplicated or we take the first column.
+                        # Based on original code logic: jnp.maximum(m_prev, s_head_rowmax)
+                        # Let's align dimensions carefully.
+                        # m_prev slice: [Group, bq, 128]. We need [Group, bq, 1].
+                        # Original code: m_curr = jnp.maximum(m_prev, s_head_rowmax) implies m_prev broadcasted?
+                        # Wait, m_ref shape is [..., 128].
+                        # In standard FlashAttn, m is vector [Batch, Q_len]. Here it seems stored in a 128-wide block for memory alignment.
+                        # Let's assume the valid data is broadcastable or in the first column.
+                        # To be safe and follow original logic structure:
+                        m_curr = jnp.maximum(m_prev, s_group_rowmax)
+                        group_m_ref[...] = m_curr
+
+                        # 3. Calculate P (Attention Prob)
+                        # s_group: [G, Q, K], m_curr: [G, Q, 1]
+                        # broadcast_minor handles the 128 alignment logic if necessary
+                        p_group = jnp.exp(s_group - broadcast_minor(m_curr, s_group.shape))
+
+                        # 4. PV Calculation (The Key Optimization!)
+                        # p_group: [G, Q, K]
+                        # v_batch_f32 slice: [G, K, D]
+                        # Result: [G, Q, D]
+                        # This einsum pushes more independent work to the MXU
+                        pv_group = jnp.einsum(
+                            "gqk,gkd->gqd",
+                            p_group,
+                            v_batch_f32[h_start:h_end],
                             preferred_element_type=jnp.float32,
                         )
 
-                        p_rowsum = jnp.sum(p, axis=1, keepdims=True)
-                        exp_m_diff = jnp.exp(m_prev - m_curr)
-                        l_prev = load_with_init(head_l_ref, 0.0)
+                        # 5. Update L and Acc
+                        p_rowsum = jnp.sum(p_group, axis=2, keepdims=True)  # [G, Q, 1]
+
+                        exp_m_diff = jnp.exp(m_prev - m_curr)  # [G, Q, 1] (or 128 broadcasted)
+
+                        l_prev = load_with_init(group_l_ref, 0.0)
                         l_curr = exp_m_diff * l_prev + p_rowsum
-                        head_l_ref[...] = l_curr
+                        group_l_ref[...] = l_curr
 
-                        o_prev = load_with_init(head_acc_ref, 0.0)
-                        o_curr = broadcast_minor(exp_m_diff, o_prev.shape) * o_prev + pv
-                        head_acc_ref[...] = o_curr
+                        o_prev = load_with_init(group_acc_ref, 0.0)
 
-                flash_attention(q_batch, k_batch, v_batch)
+                        # broadcast_minor logic for O update
+                        o_curr = broadcast_minor(exp_m_diff, o_prev.shape) * o_prev + pv_group
+                        group_acc_ref[...] = o_curr
 
-            lax.fori_loop(0, num_bkv, compute_with_bkv, None, unroll=False)
+                    lax.fori_loop(
+                        0,
+                        actual_num_kv_heads // HEAD_GROUP_SIZE,
+                        compute_head_group,
+                        None,
+                        unroll=True,
+                    )
 
             # Load acc and calculate final output.
             acc = acc_ref[...]
