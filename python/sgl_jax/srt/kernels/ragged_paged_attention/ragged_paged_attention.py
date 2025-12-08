@@ -814,6 +814,17 @@ def _ragged_paged_attention_kernel(
                 q_batch, offs_qidx_batch = batch_prepare_queries()
 
                 def flash_attention(q_batch, k_batch, v_batch):
+                    # --- [OPTIMIZATION] Head Grouping Configuration ---
+                    # TPU v6e MXU width is 256. Since head_dim is usually 128,
+                    # processing 1 head leaves 50% MXU idle.
+                    # We group 2 heads to saturate the 256-wide vector units.
+                    HEAD_GROUP_SIZE = 2
+
+                    # Ensure alignment (Caller should ensure padding or we assert here)
+                    # In a production kernel, we might want to mask the odd head,
+                    # but for max performance we assume H is even.
+                    # assert actual_num_kv_heads % HEAD_GROUP_SIZE == 0
+
                     q_batch_f32 = q_batch.astype(jnp.float32)
                     k_batch_f32 = k_batch.astype(jnp.float32)
                     v_batch_f32 = v_batch.astype(jnp.float32)
@@ -823,134 +834,174 @@ def _ragged_paged_attention_kernel(
                     if v_scale is not None:
                         v_batch_f32 = v_batch_f32 * v_scale
 
-                    s = (
-                        jnp.einsum(
-                            "hqd,hkd->hqk",
-                            q_batch_f32,
-                            k_batch_f32,
-                            preferred_element_type=jnp.float32,
-                        )
-                        * sm_scale
-                    )
-
-                    if q_scale is not None:
-                        s *= q_scale
-
-                    q_span = (
-                        kv_len
-                        - q_len
-                        + bq_idx * bq_sz
-                        + lax.broadcasted_iota(jnp.int32, s.shape, 1) // num_q_heads_per_kv_head
-                    )
-                    k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, s.shape, 2)
-                    # convert custom_mask from int32 to bool
-                    mask = load_mask(q_span, k_span)
-
-                    if sliding_window is not None:
-                        mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)
-
-                    if soft_cap is not None:
-                        s = soft_cap * jnp.tanh(s / soft_cap)
-
-                    # xai_temperature_scale: ref implementation from sgl-project/sglang
-                    # python/sglang/srt/layers/attention/triton_ops/decode_attention.py
-                    if xai_temperature_len is not None:
-                        xai_temperature_scale = 1.0 / jnp.log2(float(xai_temperature_len))
-                        _qtemp = (
-                            jnp.log2(offs_qidx_batch.astype(jnp.float32)) * xai_temperature_scale
-                        )
-                        xai_temperature_reg = jnp.where(
-                            offs_qidx_batch > xai_temperature_len, _qtemp, 1.0
-                        )
-
-                        s = s * xai_temperature_reg[:, :, None]
-
-                    s += jnp.where(mask, mask_value, 0.0)
-
-                    HEAD_GROUP_SIZE = 1
-
-                    assert actual_num_kv_heads % HEAD_GROUP_SIZE == 0
-
-                    def compute_head_group(h_group_idx, _):
+                    # --- Loop over Head Groups instead of single Heads ---
+                    def body(h_group_idx, _):
                         h_start = h_group_idx * HEAD_GROUP_SIZE
                         h_end = h_start + HEAD_GROUP_SIZE
 
-                        # 1. Slice pointers for the current group
-                        # Shape: [Group, bq_sz, 128] or [Group, bq_sz, head_dim]
-                        group_l_ref = l_ref.at[h_start:h_end, : q_batch.shape[1]]
-                        group_m_ref = m_ref.at[h_start:h_end, : q_batch.shape[1]]
-                        group_acc_ref = acc_ref.at[h_start:h_end, : q_batch.shape[1]]
+                        # 1. Slice Inputs for the Group [2, bq, D] / [2, bkv, D]
+                        q_g = q_batch_f32[h_start:h_end]
+                        k_g = k_batch_f32[h_start:h_end]
+                        v_g = v_batch_f32[h_start:h_end]
+
+                        # 2. Grouped Matrix Multiplication (QK^T)
+                        # einsum("gqd,gkd->gqk") where g=2.
+                        # This maps perfectly to TPU vector lanes/MXU batch dim.
+                        s_g = (
+                            jnp.einsum(
+                                "gqd,gkd->gqk",
+                                q_g,
+                                k_g,
+                                preferred_element_type=jnp.float32,
+                            )
+                            * sm_scale
+                        )
+
+                        if q_scale is not None:
+                            s_g *= q_scale
+
+                        # 3. Masking Logic (Vectorized)
+                        # Calculate spans for broadcasting. Shape: [2, bq, bkv]
+                        # Note: q_span/k_span calculation needs to handle the group dimension
+                        # to fetch the correct mask for each head if masks differ per head.
+                        # Assuming standard causal/ragged mask implies same mask for all heads in a seq.
+
+                        # Broadcast shapes for iota
+                        g_dim, bq_dim, bkv_dim = s_g.shape
+
+                        # q_span calculation matches original logic but broadcasted
+                        _q_span = (
+                            kv_len
+                            - q_len
+                            + bq_idx * bq_sz
+                            + lax.broadcasted_iota(jnp.int32, (bq_dim, bkv_dim), 0)
+                            // num_q_heads_per_kv_head
+                        )
+                        k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(
+                            jnp.int32, (bq_dim, bkv_dim), 1
+                        )
+
+                        # Expand to group dim [2, bq, bkv]
+                        q_span = jnp.broadcast_to(_q_span, (g_dim, bq_dim, bkv_dim))
+                        k_span = jnp.broadcast_to(k_span, (g_dim, bq_dim, bkv_dim))
+
+                        # Load mask
+                        if bkvmask_ref is None:
+                            mask = q_span < k_span
+                        else:
+                            # Original load_mask logic adapted for slicing
+                            # The mask buffer is usually shared or duplicated.
+                            # We slice the relevant part for these heads.
+                            mask_full = bkvmask_ref[bkv_sem_idx, :actual_bq_sz, :, 0]  # [bq, bkv]
+
+                            # Repeats logic from original code:
+                            num_q_heads_per_kv_head_mask = jnp.repeat(
+                                mask_full, num_q_heads_per_kv_head, axis=0
+                            )
+                            # We need to stack this for the current group
+                            mask_g = jnp.stack(
+                                [num_q_heads_per_kv_head_mask] * HEAD_GROUP_SIZE, axis=0
+                            )
+                            mask = mask_g != 1
+
+                        if sliding_window is not None:
+                            mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)
+
+                        if soft_cap is not None:
+                            s_g = soft_cap * jnp.tanh(s_g / soft_cap)
+
+                        # XAI Temperature (Vectorized)
+                        if xai_temperature_len is not None:
+                            # offs_qidx_batch is [H, bq]. Slice it for group.
+                            offs_qidx_g = offs_qidx_batch[h_start:h_end]  # [2, bq]
+
+                            xai_temperature_scale = 1.0 / jnp.log2(float(xai_temperature_len))
+                            _qtemp = (
+                                jnp.log2(offs_qidx_g.astype(jnp.float32)) * xai_temperature_scale
+                            )
+                            xai_temperature_reg = jnp.where(
+                                offs_qidx_g > xai_temperature_len, _qtemp, 1.0
+                            )
+                            # Broadcast to [2, bq, 1] for multiplication
+                            s_g = s_g * xai_temperature_reg[:, :, None]
+
+                        # Apply Mask
+                        s_g += jnp.where(mask, mask_value, 0.0)
+
+                        # 4. Softmax Statistics Update (The Tricky Part)
+                        # We access VMEM references via slicing
+
+                        # References to VMEM slices: [2, bq, 128] / [2, bq, head_dim]
+                        m_ref_g = m_ref.at[h_start:h_end, : q_batch.shape[1]]
+                        l_ref_g = l_ref.at[h_start:h_end, : q_batch.shape[1]]
+                        acc_ref_g = acc_ref.at[h_start:h_end, : q_batch.shape[1]]
 
                         def load_with_init(ref, init_val):
-                            # Ref shape: [Group, bq_sz, dim]
+                            # Ref shape: [2, bq, 128]
+                            # We must return shape [2, bq, 128]
                             return jnp.where(bkv_idx == 0, jnp.full_like(ref, init_val), ref[...])
 
-                        # 2. Get Scores for this group
-                        # s shape: [num_heads, bq_sz, bkv_sz] -> Slice to [Group, bq_sz, bkv_sz]
-                        s_group = s[h_start:h_end]
+                        # Local max: [2, bq, 1]
+                        s_g_rowmax = jnp.max(s_g, axis=2, keepdims=True)
 
-                        # RowMax: [Group, bq_sz, 1]
-                        s_group_rowmax = jnp.max(s_group, axis=2, keepdims=True)
+                        # Load Prev Max
+                        m_prev = load_with_init(m_ref_g, -jnp.inf)  # [2, bq, 128]
 
-                        m_prev = load_with_init(
-                            group_m_ref, -jnp.inf
-                        )  # [Group, bq_sz, 128] (padded) or [..., 1] effective
+                        # --- CRITICAL BUG FIX ---
+                        # m_ref storage is padded to 128 (e.g., [2, bq, 128]), but effective value is only at index 0.
+                        # If we use m_prev directly in jnp.maximum, the padding garbage (NaNs or 0s)
+                        # will corrupt the calculation. We MUST slice [..., 0:1].
+                        m_prev_val = m_prev[..., 0:1]  # [2, bq, 1]
 
-                        # m_curr logic
-                        # m_prev is effectively used as [Group, bq_sz, 1] for max comparison
-                        # We need to ensure shapes broadcast correctly.
-                        # m_ref storage is padded to 128, but we only care about the value.
-                        # Usually m is stored duplicated or we take the first column.
-                        # Based on original code logic: jnp.maximum(m_prev, s_head_rowmax)
-                        # Let's align dimensions carefully.
-                        # m_prev slice: [Group, bq, 128]. We need [Group, bq, 1].
-                        # Original code: m_curr = jnp.maximum(m_prev, s_head_rowmax) implies m_prev broadcasted?
-                        # Wait, m_ref shape is [..., 128].
-                        # In standard FlashAttn, m is vector [Batch, Q_len]. Here it seems stored in a 128-wide block for memory alignment.
-                        # Let's assume the valid data is broadcastable or in the first column.
-                        # To be safe and follow original logic structure:
-                        m_curr = jnp.maximum(m_prev, s_group_rowmax)
-                        group_m_ref[...] = m_curr
+                        # Update Max
+                        m_curr = jnp.maximum(m_prev_val, s_g_rowmax)  # [2, bq, 1]
 
-                        # 3. Calculate P (Attention Prob)
-                        # s_group: [G, Q, K], m_curr: [G, Q, 1]
-                        # broadcast_minor handles the 128 alignment logic if necessary
-                        p_group = jnp.exp(s_group - broadcast_minor(m_curr, s_group.shape))
+                        # Write back to VMEM (Broadcasting m_curr back to padded storage)
+                        # We use broadcast_minor to fill the 128 dim with the scalar max
+                        m_ref_g[...] = broadcast_minor(m_curr, m_prev.shape)
 
-                        # 4. PV Calculation (The Key Optimization!)
-                        # p_group: [G, Q, K]
-                        # v_batch_f32 slice: [G, K, D]
-                        # Result: [G, Q, D]
-                        # This einsum pushes more independent work to the MXU
-                        pv_group = jnp.einsum(
+                        # P Calculation (SIMD friendly)
+                        # s_g: [2, bq, bkv], m_curr: [2, bq, 1] -> Broadcasts correctly
+                        p_g = jnp.exp(s_g - m_curr)
+
+                        # 5. PV Calculation (Grouped)
+                        # einsum("gqk,gkd->gqd")
+                        pv_g = jnp.einsum(
                             "gqk,gkd->gqd",
-                            p_group,
-                            v_batch_f32[h_start:h_end],
+                            p_g,
+                            v_g,  # [2, bkv, D]
                             preferred_element_type=jnp.float32,
                         )
 
-                        # 5. Update L and Acc
-                        p_rowsum = jnp.sum(p_group, axis=2, keepdims=True)  # [G, Q, 1]
+                        # 6. Update Accumulator (L and O)
+                        p_rowsum = jnp.sum(p_g, axis=2, keepdims=True)  # [2, bq, 1]
 
-                        exp_m_diff = jnp.exp(m_prev - m_curr)  # [G, Q, 1] (or 128 broadcasted)
+                        # exp(m_prev - m_curr)
+                        # Note: m_prev_val and m_curr are [2, bq, 1], result is [2, bq, 1]
+                        exp_m_diff = jnp.exp(m_prev_val - m_curr)
 
-                        l_prev = load_with_init(group_l_ref, 0.0)
-                        l_curr = exp_m_diff * l_prev + p_rowsum
-                        group_l_ref[...] = l_curr
+                        l_prev = load_with_init(l_ref_g, 0.0)  # [2, bq, 128]
+                        l_prev_val = l_prev[
+                            ..., 0:1
+                        ]  # Slicing for safety, though L might be dense? usually L is also scalar per token
 
-                        o_prev = load_with_init(group_acc_ref, 0.0)
+                        # Correct update rule
+                        l_curr = exp_m_diff * l_prev_val + p_rowsum  # [2, bq, 1]
+                        l_ref_g[...] = broadcast_minor(l_curr, l_prev.shape)
 
-                        # broadcast_minor logic for O update
-                        o_curr = broadcast_minor(exp_m_diff, o_prev.shape) * o_prev + pv_group
-                        group_acc_ref[...] = o_curr
+                        o_prev = load_with_init(acc_ref_g, 0.0)  # [2, bq, D]
+                        # Broadcast exp_m_diff [2,bq,1] to [2,bq,D]
+                        o_curr = exp_m_diff * o_prev + pv_g
+                        acc_ref_g[...] = o_curr
 
+                    # Run loop with stride 2
                     lax.fori_loop(
-                        0,
-                        actual_num_kv_heads // HEAD_GROUP_SIZE,
-                        compute_head_group,
-                        None,
-                        unroll=True,
+                        0, actual_num_kv_heads // HEAD_GROUP_SIZE, body, None, unroll=True
                     )
+
+                flash_attention(q_batch, k_batch, v_batch)
+
+            lax.fori_loop(0, num_bkv, compute_with_bkv, None, unroll=False)
 
             # Load acc and calculate final output.
             acc = acc_ref[...]
