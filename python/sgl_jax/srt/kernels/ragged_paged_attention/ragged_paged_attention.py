@@ -815,15 +815,7 @@ def _ragged_paged_attention_kernel(
 
                 def flash_attention(q_batch, k_batch, v_batch):
                     # --- [OPTIMIZATION] Head Grouping Configuration ---
-                    # TPU v6e MXU width is 256. Since head_dim is usually 128,
-                    # processing 1 head leaves 50% MXU idle.
-                    # We group 2 heads to saturate the 256-wide vector units.
                     HEAD_GROUP_SIZE = 2
-
-                    # Ensure alignment (Caller should ensure padding or we assert here)
-                    # In a production kernel, we might want to mask the odd head,
-                    # but for max performance we assume H is even.
-                    # assert actual_num_kv_heads % HEAD_GROUP_SIZE == 0
 
                     q_batch_f32 = q_batch.astype(jnp.float32)
                     k_batch_f32 = k_batch.astype(jnp.float32)
@@ -837,18 +829,13 @@ def _ragged_paged_attention_kernel(
                     # --- Loop over Head Groups instead of single Heads ---
                     def body(h_group_idx, _):
                         h_start = h_group_idx * HEAD_GROUP_SIZE
-                        # h_end 不再需要，因为 lax.dynamic_slice 使用 size
 
-                        # =========================================================
-                        # FIX 1: 使用 lax.dynamic_slice 替代 Python 切片
-                        # =========================================================
-                        # q_g shape: [2, bq, D]
+                        # 1. Slice Inputs using lax.dynamic_slice (Fixes JIT Tracer Error)
                         q_g = lax.dynamic_slice(
                             q_batch_f32,
                             (h_start, 0, 0),
                             (HEAD_GROUP_SIZE, q_batch.shape[1], q_batch.shape[2]),
                         )
-                        # k_g/v_g shape: [2, bkv, D]
                         k_g = lax.dynamic_slice(
                             k_batch_f32,
                             (h_start, 0, 0),
@@ -861,6 +848,7 @@ def _ragged_paged_attention_kernel(
                         )
 
                         # 2. Grouped Matrix Multiplication
+                        # einsum("gqd,gkd->gqk") where g=2.
                         s_g = (
                             jnp.einsum(
                                 "gqd,gkd->gqk",
@@ -898,7 +886,6 @@ def _ragged_paged_attention_kernel(
                             num_q_heads_per_kv_head_mask = jnp.repeat(
                                 mask_full, num_q_heads_per_kv_head, axis=0
                             )
-                            # Stack for group
                             mask_g = jnp.stack(
                                 [num_q_heads_per_kv_head_mask] * HEAD_GROUP_SIZE, axis=0
                             )
@@ -910,9 +897,8 @@ def _ragged_paged_attention_kernel(
                         if soft_cap is not None:
                             s_g = soft_cap * jnp.tanh(s_g / soft_cap)
 
-                        # XAI Temperature (Fix: Also use dynamic_slice)
+                        # XAI Temperature
                         if xai_temperature_len is not None:
-                            # FIX: slice offs_qidx_batch
                             offs_qidx_g = lax.dynamic_slice(
                                 offs_qidx_batch, (h_start, 0), (HEAD_GROUP_SIZE, q_batch.shape[1])
                             )
@@ -929,11 +915,7 @@ def _ragged_paged_attention_kernel(
                         s_g += jnp.where(mask, mask_value, 0.0)
 
                         # 4. Softmax Statistics Update
-                        # =========================================================
-                        # FIX 2: 使用 pl.ds (Pallas Dynamic Slice) 对 Ref 进行切片
-                        # =========================================================
-                        # 之前的代码 m_ref.at[h_start:h_end] 也会导致同样的错误
-
+                        # FIX: Use pl.ds for dynamic reference slicing
                         m_ref_g = m_ref.at[pl.ds(h_start, HEAD_GROUP_SIZE), : q_batch.shape[1]]
                         l_ref_g = l_ref.at[pl.ds(h_start, HEAD_GROUP_SIZE), : q_batch.shape[1]]
                         acc_ref_g = acc_ref.at[pl.ds(h_start, HEAD_GROUP_SIZE), : q_batch.shape[1]]
@@ -944,9 +926,11 @@ def _ragged_paged_attention_kernel(
                         s_g_rowmax = jnp.max(s_g, axis=2, keepdims=True)
 
                         m_prev = load_with_init(m_ref_g, -jnp.inf)
-                        m_prev_val = m_prev[..., 0:1]
+                        m_prev_val = m_prev[..., 0:1]  # [2, bq, 1] - Valid data only
 
                         m_curr = jnp.maximum(m_prev_val, s_g_rowmax)
+
+                        # FIX: Use jnp.broadcast_to instead of broadcast_minor to avoid shape assertion
                         m_ref_g[...] = jnp.broadcast_to(m_curr, m_prev.shape)
 
                         p_g = jnp.exp(s_g - m_curr)
@@ -962,27 +946,29 @@ def _ragged_paged_attention_kernel(
                         exp_m_diff = jnp.exp(m_prev_val - m_curr)
 
                         l_prev = load_with_init(l_ref_g, 0.0)
-                        l_prev_val = l_prev[..., 0:1]
+                        l_prev_val = l_prev[..., 0:1]  # [2, bq, 1]
 
                         l_curr = exp_m_diff * l_prev_val + p_rowsum
-                        l_ref_g[...] = broadcast_minor(l_curr, l_prev.shape)
+                        l_ref_g[...] = jnp.broadcast_to(l_curr, l_prev.shape)
 
                         o_prev = load_with_init(acc_ref_g, 0.0)
                         o_curr = exp_m_diff * o_prev + pv_g
                         acc_ref_g[...] = o_curr
 
-                    # Run loop with stride 2
+                    # Run loop with stride 2 inside flash_attention
                     lax.fori_loop(
                         0, actual_num_kv_heads // HEAD_GROUP_SIZE, body, None, unroll=True
                     )
 
+                # Call flash_attention inside compute_with_bkv
                 flash_attention(q_batch, k_batch, v_batch)
 
+            # Execution loop for BKV blocks (Outside compute_with_bkv definition, inside compute_with_bq)
             lax.fori_loop(0, num_bkv, compute_with_bkv, None, unroll=False)
 
             # Load acc and calculate final output.
             acc = acc_ref[...]
-            l = broadcast_minor(l_ref[...], acc.shape)  # noqa
+            l = l_ref[..., 0:1]  # noqa
             out = (
                 lax.div(acc, l)
                 if q_dtype == jnp.float32
