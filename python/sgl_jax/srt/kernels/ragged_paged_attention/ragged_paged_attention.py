@@ -837,16 +837,30 @@ def _ragged_paged_attention_kernel(
                     # --- Loop over Head Groups instead of single Heads ---
                     def body(h_group_idx, _):
                         h_start = h_group_idx * HEAD_GROUP_SIZE
-                        h_end = h_start + HEAD_GROUP_SIZE
+                        # h_end 不再需要，因为 lax.dynamic_slice 使用 size
 
-                        # 1. Slice Inputs for the Group [2, bq, D] / [2, bkv, D]
-                        q_g = q_batch_f32[h_start:h_end]
-                        k_g = k_batch_f32[h_start:h_end]
-                        v_g = v_batch_f32[h_start:h_end]
+                        # =========================================================
+                        # FIX 1: 使用 lax.dynamic_slice 替代 Python 切片
+                        # =========================================================
+                        # q_g shape: [2, bq, D]
+                        q_g = lax.dynamic_slice(
+                            q_batch_f32,
+                            (h_start, 0, 0),
+                            (HEAD_GROUP_SIZE, q_batch.shape[1], q_batch.shape[2]),
+                        )
+                        # k_g/v_g shape: [2, bkv, D]
+                        k_g = lax.dynamic_slice(
+                            k_batch_f32,
+                            (h_start, 0, 0),
+                            (HEAD_GROUP_SIZE, k_batch.shape[1], k_batch.shape[2]),
+                        )
+                        v_g = lax.dynamic_slice(
+                            v_batch_f32,
+                            (h_start, 0, 0),
+                            (HEAD_GROUP_SIZE, v_batch.shape[1], v_batch.shape[2]),
+                        )
 
-                        # 2. Grouped Matrix Multiplication (QK^T)
-                        # einsum("gqd,gkd->gqk") where g=2.
-                        # This maps perfectly to TPU vector lanes/MXU batch dim.
+                        # 2. Grouped Matrix Multiplication
                         s_g = (
                             jnp.einsum(
                                 "gqd,gkd->gqk",
@@ -860,16 +874,9 @@ def _ragged_paged_attention_kernel(
                         if q_scale is not None:
                             s_g *= q_scale
 
-                        # 3. Masking Logic (Vectorized)
-                        # Calculate spans for broadcasting. Shape: [2, bq, bkv]
-                        # Note: q_span/k_span calculation needs to handle the group dimension
-                        # to fetch the correct mask for each head if masks differ per head.
-                        # Assuming standard causal/ragged mask implies same mask for all heads in a seq.
-
-                        # Broadcast shapes for iota
+                        # 3. Masking Logic
                         g_dim, bq_dim, bkv_dim = s_g.shape
 
-                        # q_span calculation matches original logic but broadcasted
                         _q_span = (
                             kv_len
                             - q_len
@@ -881,24 +888,17 @@ def _ragged_paged_attention_kernel(
                             jnp.int32, (bq_dim, bkv_dim), 1
                         )
 
-                        # Expand to group dim [2, bq, bkv]
                         q_span = jnp.broadcast_to(_q_span, (g_dim, bq_dim, bkv_dim))
                         k_span = jnp.broadcast_to(k_span, (g_dim, bq_dim, bkv_dim))
 
-                        # Load mask
                         if bkvmask_ref is None:
                             mask = q_span < k_span
                         else:
-                            # Original load_mask logic adapted for slicing
-                            # The mask buffer is usually shared or duplicated.
-                            # We slice the relevant part for these heads.
-                            mask_full = bkvmask_ref[bkv_sem_idx, :actual_bq_sz, :, 0]  # [bq, bkv]
-
-                            # Repeats logic from original code:
+                            mask_full = bkvmask_ref[bkv_sem_idx, :actual_bq_sz, :, 0]
                             num_q_heads_per_kv_head_mask = jnp.repeat(
                                 mask_full, num_q_heads_per_kv_head, axis=0
                             )
-                            # We need to stack this for the current group
+                            # Stack for group
                             mask_g = jnp.stack(
                                 [num_q_heads_per_kv_head_mask] * HEAD_GROUP_SIZE, axis=0
                             )
@@ -910,10 +910,12 @@ def _ragged_paged_attention_kernel(
                         if soft_cap is not None:
                             s_g = soft_cap * jnp.tanh(s_g / soft_cap)
 
-                        # XAI Temperature (Vectorized)
+                        # XAI Temperature (Fix: Also use dynamic_slice)
                         if xai_temperature_len is not None:
-                            # offs_qidx_batch is [H, bq]. Slice it for group.
-                            offs_qidx_g = offs_qidx_batch[h_start:h_end]  # [2, bq]
+                            # FIX: slice offs_qidx_batch
+                            offs_qidx_g = lax.dynamic_slice(
+                                offs_qidx_batch, (h_start, 0), (HEAD_GROUP_SIZE, q_batch.shape[1])
+                            )
 
                             xai_temperature_scale = 1.0 / jnp.log2(float(xai_temperature_len))
                             _qtemp = (
@@ -922,75 +924,50 @@ def _ragged_paged_attention_kernel(
                             xai_temperature_reg = jnp.where(
                                 offs_qidx_g > xai_temperature_len, _qtemp, 1.0
                             )
-                            # Broadcast to [2, bq, 1] for multiplication
                             s_g = s_g * xai_temperature_reg[:, :, None]
 
-                        # Apply Mask
                         s_g += jnp.where(mask, mask_value, 0.0)
 
-                        # 4. Softmax Statistics Update (The Tricky Part)
-                        # We access VMEM references via slicing
+                        # 4. Softmax Statistics Update
+                        # =========================================================
+                        # FIX 2: 使用 pl.ds (Pallas Dynamic Slice) 对 Ref 进行切片
+                        # =========================================================
+                        # 之前的代码 m_ref.at[h_start:h_end] 也会导致同样的错误
 
-                        # References to VMEM slices: [2, bq, 128] / [2, bq, head_dim]
-                        m_ref_g = m_ref.at[h_start:h_end, : q_batch.shape[1]]
-                        l_ref_g = l_ref.at[h_start:h_end, : q_batch.shape[1]]
-                        acc_ref_g = acc_ref.at[h_start:h_end, : q_batch.shape[1]]
+                        m_ref_g = m_ref.at[pl.ds(h_start, HEAD_GROUP_SIZE), : q_batch.shape[1]]
+                        l_ref_g = l_ref.at[pl.ds(h_start, HEAD_GROUP_SIZE), : q_batch.shape[1]]
+                        acc_ref_g = acc_ref.at[pl.ds(h_start, HEAD_GROUP_SIZE), : q_batch.shape[1]]
 
                         def load_with_init(ref, init_val):
-                            # Ref shape: [2, bq, 128]
-                            # We must return shape [2, bq, 128]
                             return jnp.where(bkv_idx == 0, jnp.full_like(ref, init_val), ref[...])
 
-                        # Local max: [2, bq, 1]
                         s_g_rowmax = jnp.max(s_g, axis=2, keepdims=True)
 
-                        # Load Prev Max
-                        m_prev = load_with_init(m_ref_g, -jnp.inf)  # [2, bq, 128]
+                        m_prev = load_with_init(m_ref_g, -jnp.inf)
+                        m_prev_val = m_prev[..., 0:1]
 
-                        # --- CRITICAL BUG FIX ---
-                        # m_ref storage is padded to 128 (e.g., [2, bq, 128]), but effective value is only at index 0.
-                        # If we use m_prev directly in jnp.maximum, the padding garbage (NaNs or 0s)
-                        # will corrupt the calculation. We MUST slice [..., 0:1].
-                        m_prev_val = m_prev[..., 0:1]  # [2, bq, 1]
-
-                        # Update Max
-                        m_curr = jnp.maximum(m_prev_val, s_g_rowmax)  # [2, bq, 1]
-
-                        # Write back to VMEM (Broadcasting m_curr back to padded storage)
-                        # We use broadcast_minor to fill the 128 dim with the scalar max
+                        m_curr = jnp.maximum(m_prev_val, s_g_rowmax)
                         m_ref_g[...] = broadcast_minor(m_curr, m_prev.shape)
 
-                        # P Calculation (SIMD friendly)
-                        # s_g: [2, bq, bkv], m_curr: [2, bq, 1] -> Broadcasts correctly
                         p_g = jnp.exp(s_g - m_curr)
 
-                        # 5. PV Calculation (Grouped)
-                        # einsum("gqk,gkd->gqd")
                         pv_g = jnp.einsum(
                             "gqk,gkd->gqd",
                             p_g,
-                            v_g,  # [2, bkv, D]
+                            v_g,
                             preferred_element_type=jnp.float32,
                         )
 
-                        # 6. Update Accumulator (L and O)
-                        p_rowsum = jnp.sum(p_g, axis=2, keepdims=True)  # [2, bq, 1]
-
-                        # exp(m_prev - m_curr)
-                        # Note: m_prev_val and m_curr are [2, bq, 1], result is [2, bq, 1]
+                        p_rowsum = jnp.sum(p_g, axis=2, keepdims=True)
                         exp_m_diff = jnp.exp(m_prev_val - m_curr)
 
-                        l_prev = load_with_init(l_ref_g, 0.0)  # [2, bq, 128]
-                        l_prev_val = l_prev[
-                            ..., 0:1
-                        ]  # Slicing for safety, though L might be dense? usually L is also scalar per token
+                        l_prev = load_with_init(l_ref_g, 0.0)
+                        l_prev_val = l_prev[..., 0:1]
 
-                        # Correct update rule
-                        l_curr = exp_m_diff * l_prev_val + p_rowsum  # [2, bq, 1]
+                        l_curr = exp_m_diff * l_prev_val + p_rowsum
                         l_ref_g[...] = broadcast_minor(l_curr, l_prev.shape)
 
-                        o_prev = load_with_init(acc_ref_g, 0.0)  # [2, bq, D]
-                        # Broadcast exp_m_diff [2,bq,1] to [2,bq,D]
+                        o_prev = load_with_init(acc_ref_g, 0.0)
                         o_curr = exp_m_diff * o_prev + pv_g
                         acc_ref_g[...] = o_curr
 
