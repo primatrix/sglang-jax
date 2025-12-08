@@ -867,7 +867,7 @@ def _ragged_paged_attention_kernel(
 
                     s += jnp.where(mask, mask_value, 0.0)
 
-                    HEAD_GROUP_SIZE = 2
+                    HEAD_GROUP_SIZE = 1
 
                     assert actual_num_kv_heads % HEAD_GROUP_SIZE == 0
 
