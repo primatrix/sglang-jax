@@ -947,7 +947,7 @@ def _ragged_paged_attention_kernel(
                         m_prev_val = m_prev[..., 0:1]
 
                         m_curr = jnp.maximum(m_prev_val, s_g_rowmax)
-                        m_ref_g[...] = broadcast_minor(m_curr, m_prev.shape)
+                        m_ref_g[...] = jnp.broadcast_to(m_curr, m_prev.shape)
 
                         p_g = jnp.exp(s_g - m_curr)
 
