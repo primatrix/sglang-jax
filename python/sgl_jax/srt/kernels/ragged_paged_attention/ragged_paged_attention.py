@@ -820,33 +820,20 @@ def _ragged_paged_attention_kernel(
                     HEAD_GROUP_SIZE = 2
 
                     # --- Loop over Head Groups ---
+                    # --- Loop over Head Groups instead of single Heads ---
                     def body(h_group_idx, _):
                         h_start = h_group_idx * HEAD_GROUP_SIZE
 
-                        # =========================================================
-                        # FIX: Load Q/K/V inside the loop using pl.ds on Refs
-                        # =========================================================
-
-                        # 1. Load Q Group: [2, BQ, D]
-                        # bq_x2_ref is [2, H, BQ, ...]. We slice H dimension.
-                        # Note: We need to handle bitcast/packing if strictly needed,
-                        # but usually load_bq helper handles single head.
-                        # Let's manually implement the load for the group to be safe.
-
-                        # We use a small unroll loop to load 2 heads and stack them
-                        # This is safer than trying to slice the packed dim dynamically
+                        # 1. Load Q Group [2, BQ, D]
+                        # Manual unroll to avoid dynamic slicing on registers or helpers with assertions
                         q_heads = []
                         offs_qidx_heads = []
 
                         for i in range(HEAD_GROUP_SIZE):
-                            # Statically unrolled loop (i=0, 1)
                             curr_h = h_start + i
-
-                            # load_bq returns [BQ, D]
                             bq = load_bq(bq_sem_idx, curr_h, actual_bq_sz=actual_bq_sz)
                             q_heads.append(bq)
 
-                            # Re-calculate offsets if needed
                             if xai_temperature_len is not None:
                                 prefix_len = kv_len - q_len
                                 local_q_offset = (
@@ -856,43 +843,79 @@ def _ragged_paged_attention_kernel(
                                 base_qidx = prefix_len + local_q_offset
                                 offs_qidx_heads.append(base_qidx)
 
-                        q_g = jnp.stack(q_heads, axis=0).astype(jnp.float32)  # [2, BQ, D]
+                        q_g = jnp.stack(q_heads, axis=0).astype(jnp.float32)
 
                         if xai_temperature_len is not None:
-                            offs_qidx_g = jnp.stack(offs_qidx_heads, axis=0)  # [2, BQ]
+                            offs_qidx_g = jnp.stack(offs_qidx_heads, axis=0)
 
-                        # 2. Load K/V Group: [2, BKV, D]
+                        # 2. Load K/V Group [2, BKV, D] - Manual Implementation
+                        bkv_ref = bkv_fused_x2_ref.at[bkv_sem_idx]
                         k_heads = []
                         v_heads = []
+
                         for i in range(HEAD_GROUP_SIZE):
                             curr_h = h_start + i
-                            # Use existing helper with correct stride
-                            # start = curr_h * 2 (because K,V interleaved)
-                            # step = total heads * 2
-                            bkv_lst = strided_load_bkv_fused(
-                                bkv_sem_idx,
-                                curr_h * 2,
-                                actual_num_kv_heads * 2,
-                                bkv_bitmask=bkv_bitmask,
-                            )
-                            k, v = bkv_lst[0]
-                            k_heads.append(k)
-                            v_heads.append(v)
 
-                        k_g = jnp.stack(k_heads, axis=0).astype(jnp.float32)  # [2, BKV, D]
-                        v_g = jnp.stack(v_heads, axis=0).astype(jnp.float32)  # [2, BKV, D]
+                            # Calculate indices for K and V (Interleaved: K1, V1, K2, V2...)
+                            idx_k = curr_h * 2
+                            idx_v = curr_h * 2 + 1
+
+                            # Resolve physical indices
+                            dim1_k = idx_k // kv_packing
+                            dim2_k = idx_k % kv_packing
+                            dim1_v = idx_v // kv_packing
+                            dim2_v = idx_v % kv_packing
+
+                            # Dynamic Slice Load from VMEM [bkv_sz, 1, 1, head_dim] -> [bkv_sz, head_dim]
+                            k_val = (
+                                bkv_ref.at[
+                                    pl.ds(0, bkv_sz),
+                                    pl.ds(dim1_k, 1),
+                                    pl.ds(dim2_k, 1),
+                                    pl.ds(0, head_dim),
+                                ]
+                                .get()
+                                .reshape(bkv_sz, head_dim)
+                            )
+
+                            v_val = (
+                                bkv_ref.at[
+                                    pl.ds(0, bkv_sz),
+                                    pl.ds(dim1_v, 1),
+                                    pl.ds(dim2_v, 1),
+                                    pl.ds(0, head_dim),
+                                ]
+                                .get()
+                                .reshape(bkv_sz, head_dim)
+                            )
+
+                            # [FIX] Correctly apply bitmask if packing > 1 (e.g. int4/int8)
+                            # We use the 'bkv_bitmask' already computed in the outer scope.
+                            if kv_packing > 1:
+                                # Bitcast to uint32 for masking
+                                k_val_u32 = pltpu.bitcast(k_val, jnp.uint32)
+                                v_val_u32 = pltpu.bitcast(v_val, jnp.uint32)
+
+                                # Apply mask
+                                k_val_u32 = k_val_u32 & bkv_bitmask
+                                v_val_u32 = v_val_u32 & bkv_bitmask
+
+                                # Bitcast back
+                                k_val = pltpu.bitcast(k_val_u32, kv_dtype)
+                                v_val = pltpu.bitcast(v_val_u32, kv_dtype)
+
+                            k_heads.append(k_val)
+                            v_heads.append(v_val)
+
+                        k_g = jnp.stack(k_heads, axis=0).astype(jnp.float32)
+                        v_g = jnp.stack(v_heads, axis=0).astype(jnp.float32)
 
                         if k_scale is not None:
                             k_g *= k_scale
                         if v_scale is not None:
                             v_g *= v_scale
 
-                        # =========================================================
-                        # Compute Logic (Same as before, but on loaded groups)
-                        # =========================================================
-
-                        # Grouped Matrix Multiplication
-                        # einsum("gqd,gkd->gqk") where g=2.
+                        # 3. Grouped Matrix Multiplication
                         s_g = (
                             jnp.einsum(
                                 "gqd,gkd->gqk",
@@ -906,7 +929,7 @@ def _ragged_paged_attention_kernel(
                         if q_scale is not None:
                             s_g *= q_scale
 
-                        # Masking Logic
+                        # 4. Masking Logic
                         g_dim, bq_dim, bkv_dim = s_g.shape
 
                         _q_span = (
@@ -954,8 +977,7 @@ def _ragged_paged_attention_kernel(
 
                         s_g += jnp.where(mask, mask_value, 0.0)
 
-                        # Softmax Statistics Update
-                        # We use pl.ds on Refs here, which IS supported.
+                        # 5. Softmax Statistics Update
                         m_ref_g = m_ref.at[pl.ds(h_start, HEAD_GROUP_SIZE), : q_g.shape[1]]
                         l_ref_g = l_ref.at[pl.ds(h_start, HEAD_GROUP_SIZE), : q_g.shape[1]]
                         acc_ref_g = acc_ref.at[pl.ds(h_start, HEAD_GROUP_SIZE), : q_g.shape[1]]
