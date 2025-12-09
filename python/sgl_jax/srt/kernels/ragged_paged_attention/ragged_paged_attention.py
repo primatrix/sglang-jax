@@ -851,25 +851,36 @@ def _ragged_paged_attention_kernel(
                         # 2. Load K/V Group [2, BKV, D] - Manual Implementation
                         bkv_ref = bkv_fused_x2_ref.at[bkv_sem_idx]
 
-                        if kv_packing == 1:
-                            # Optimized contiguous load for float/bfloat16
-                            # Load K1, V1, K2, V2... all together
-                            count = HEAD_GROUP_SIZE * 2
-                            start = h_start * 2
+                        if kv_packing <= 2:
+                            # Optimized contiguous load for float32 (packing=1) and bfloat16 (packing=2)
+                            # Target: Load HEAD_GROUP_SIZE heads (K+V pairs)
 
-                            # Load [bkv_sz, count, 1, head_dim]
+                            if kv_packing == 1:
+                                # Layout: [K1], [V1], [K2], [V2] ... along dim1
+                                # We need 2 * HEAD_GROUP_SIZE rows
+                                count = HEAD_GROUP_SIZE * 2
+                                start = h_start * 2
+                                packing_dim_size = 1
+                            else:  # kv_packing == 2
+                                # Layout: [K1, V1], [K2, V2] ... along dim1 (packed in dim2)
+                                # We need HEAD_GROUP_SIZE rows
+                                count = HEAD_GROUP_SIZE
+                                start = h_start
+                                packing_dim_size = 2
+
+                            # Load [bkv_sz, count, packing_dim_size, head_dim]
                             kv_chunk = (
                                 bkv_ref.at[
                                     pl.ds(0, bkv_sz),
                                     pl.ds(start, count),
-                                    pl.ds(0, 1),
+                                    pl.ds(0, packing_dim_size),
                                     pl.ds(0, head_dim),
                                 ]
                                 .get()
-                                .reshape(bkv_sz, count, head_dim)
+                                .reshape(bkv_sz, count * packing_dim_size, head_dim)
                             )
 
-                            # Separate K and V
+                            # Both cases result in flat: [K1, V1, K2, V2, ...]
                             # K: indices 0, 2, ...
                             # V: indices 1, 3, ...
                             k_g_T = kv_chunk[:, 0::2, :]  # [bkv_sz, G, D]
