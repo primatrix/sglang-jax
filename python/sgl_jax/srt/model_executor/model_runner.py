@@ -477,6 +477,7 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
     ):
+        print(f"logits_metadata {logits_metadata}")
         cache_miss_count = 0
         import jax._src.test_util as jtu
 
@@ -562,6 +563,7 @@ class ModelRunner:
         Returns:
             A list of next_token_ids
         """
+        print(f"sample_metadata {sampling_metadata}")
         # Penalty application has been moved to the Sampler for better JIT performance
         return self.jitted_sampler(
             logits_output,

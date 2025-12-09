@@ -120,11 +120,13 @@ class LogitsMetadata:
     extend_token_ids_logprob: bool = False
     extend_seq_lens: jax.Array | None = None
     extend_seq_lens_cpu: list[int] | None = None
+    extend_logprob_start_lens: jax.Array | None = None
     extend_logprob_start_lens_cpu: list[int] | None = None
+    extend_logprob_pruned_lens: jax.Array | None = None
     extend_logprob_pruned_lens_cpu: list[int] | None = None
-    top_logprobs_nums: list[int] | None = None
+    top_logprobs_nums: jax.Array | None = None
     extend_input_logprob_token_ids_device: jax.Array | None = None
-    token_ids_logprobs: list[list[int]] | None = None
+    token_ids_logprobs: jax.Array | None = None
 
     # logits and logprobs post processing
     temp_scaled_logprobs: bool = False
@@ -135,6 +137,8 @@ class LogitsMetadata:
     def tree_flatten(self):
         children = (
             self.extend_seq_lens,
+            self.top_logprobs_nums,
+            self.token_ids_logprobs,
             self.extend_input_logprob_token_ids_device,
             self.temperature,
             self.top_p,
@@ -143,14 +147,12 @@ class LogitsMetadata:
         aux_data = {
             "forward_mode": self.forward_mode,
             "capture_hidden_mode": self.capture_hidden_mode,
+            "extend_seq_lens_cpu": self.extend_seq_lens_cpu,
             "extend_return_logprob": self.extend_return_logprob,
             "extend_return_top_logprob": self.extend_return_top_logprob,
             "extend_token_ids_logprob": self.extend_token_ids_logprob,
-            "extend_seq_lens_cpu": self.extend_seq_lens_cpu,
             "extend_logprob_start_lens_cpu": self.extend_logprob_start_lens_cpu,
             "extend_logprob_pruned_lens_cpu": self.extend_logprob_pruned_lens_cpu,
-            "top_logprobs_nums": self.top_logprobs_nums,
-            "token_ids_logprobs": self.token_ids_logprobs,
             "temp_scaled_logprobs": self.temp_scaled_logprobs,
             "top_p_normalized_logprobs": self.top_p_normalized_logprobs,
         }
@@ -162,20 +164,22 @@ class LogitsMetadata:
         obj = cls.__new__(cls)
 
         obj.extend_seq_lens = children[0]
-        obj.extend_input_logprob_token_ids_device = children[1]
-        obj.temperature = children[2]
-        obj.top_p = children[3]
+        obj.top_logprobs_nums = children[1]
+        obj.token_ids_logprobs = children[2]
+
+        obj.extend_input_logprob_token_ids_device = children[3]
+        obj.temperature = children[4]
+        obj.top_p = children[5]
 
         obj.forward_mode = aux_data["forward_mode"]
         obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
+        obj.extend_seq_lens_cpu = aux_data["extend_seq_lens_cpu"]
         obj.extend_return_logprob = aux_data["extend_return_logprob"]
         obj.extend_return_top_logprob = aux_data["extend_return_top_logprob"]
         obj.extend_token_ids_logprob = aux_data["extend_token_ids_logprob"]
-        obj.extend_seq_lens_cpu = aux_data["extend_seq_lens_cpu"]
+
         obj.extend_logprob_start_lens_cpu = aux_data["extend_logprob_start_lens_cpu"]
         obj.extend_logprob_pruned_lens_cpu = aux_data["extend_logprob_pruned_lens_cpu"]
-        obj.top_logprobs_nums = aux_data["top_logprobs_nums"]
-        obj.token_ids_logprobs = aux_data["token_ids_logprobs"]
         obj.temp_scaled_logprobs = aux_data["temp_scaled_logprobs"]
         obj.top_p_normalized_logprobs = aux_data["top_p_normalized_logprobs"]
 
@@ -210,15 +214,12 @@ class LogitsMetadata:
             extend_return_top_logprob=extend_return_top_logprob,
             extend_token_ids_logprob=extend_token_ids_logprob,
             extend_seq_lens=device_array(batch.extend_seq_lens, sharding=sharding),
-            extend_seq_lens_cpu=extend_seq_lens_cpu,
-            extend_logprob_start_lens_cpu=(
-                batch.extend_logprob_start_lens.tolist()
-                if batch.return_logprob and batch.extend_logprob_start_lens is not None
-                else None
-            ),
-            extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
-            top_logprobs_nums=batch.top_logprobs_nums,
-            token_ids_logprobs=batch.token_ids_logprobs,
+            # extend_seq_lens_cpu=extend_seq_lens_cpu,
+            extend_logprob_start_lens=device_array(
+                batch.extend_logprob_start_lens.tolist() if batch.return_logprob and batch.extend_logprob_start_lens is not None else None , sharding = sharding),
+            extend_logprob_pruned_lens= device_array(extend_logprob_pruned_lens_cpu) if batch.return_logprob and extend_logprob_pruned_lens_cpu else None,
+            top_logprobs_nums=device_array(batch.top_logprobs_nums),
+            token_ids_logprobs=device_array(batch.token_ids_logprobs),
             extend_input_logprob_token_ids_device=device_array(
                 batch.extend_input_logprob_token_ids, sharding=sharding
             ),

@@ -1115,6 +1115,9 @@ class ScheduleBatch:
             cache_loc_paddings = cache_loc_paddings[-1:]
             extend_logprob_start_lens = self.extend_logprob_start_lens
 
+        top_logprobs_nums = self.top_logprobs_nums
+        token_ids_logprobs = self.token_ids_logprobs
+
         global bid
         bid += 1
 
@@ -1276,17 +1279,37 @@ class ScheduleBatch:
                     [0] * bs_padding_size, dtype=extend_seq_lens.dtype
                 )
                 extend_seq_lens = np.concat([extend_seq_lens, invalid_extend_seq_lens], axis=0)
-
-                invalid_extend_logprob_start_lens = np.array([0] * bs_padding_size, dtype=np.int32)
-                extend_logprob_start_lens = np.concat(
-                    [extend_logprob_start_lens, invalid_extend_logprob_start_lens], axis=0
-                )
-
+                if self.return_logprob:
+                    invalid_extend_logprob_start_lens = np.array([0] * bs_padding_size, dtype=np.int32)
+                    extend_logprob_start_lens = np.concat(
+                        [extend_logprob_start_lens, invalid_extend_logprob_start_lens], axis=0
+                    )
+                    invalid_top_logprobs_nums = np.array(
+                        [0] * bs_padding_size, dtype = np.int32
+                    )
+                    top_logprobs_nums = np.concat([self.top_logprobs_nums, invalid_top_logprobs_nums], axis = 0)
+                    invalid_token_ids_logprobs = np.array([None] * bs_padding_size)
+                    token_ids_logprobs = np.concat([self.token_ids_logprobs, invalid_token_ids_logprobs], axis = 0)
             else:
                 invalid_extend_start_loc = np.array(
                     [len(seq_lens_cpu)] * bs_padding_size, dtype=extend_start_loc.dtype
                 )
                 extend_start_loc = np.concat([extend_start_loc, invalid_extend_start_loc], axis=0)
+        token_ids_nums = None
+        if token_ids_logprobs is not None:
+            token_ids_nums = []
+            max_token_ids_num = 100
+            for i in range(len(token_ids_logprobs)):
+                if token_ids_logprobs[i] is None:
+                    token_ids_nums.append(0)
+                    token_ids_logprobs[i] = np.zeros(max_token_ids_num)
+                else:
+                    token_ids_nums.append(len(token_ids_logprobs[i]))
+                    if len(token_ids_logprobs[i]) < max_token_ids_num:
+                        token_ids_logprobs[i] = np.concat([token_ids_logprobs[i], np.zeros(max_token_ids_num - len(token_ids_nums))], axis = 0)
+                    else:
+                        token_ids_logprobs[i] = np.array(token_ids_logprobs[i][:max_token_ids_num])
+            token_ids_nums = np.array(token_ids_nums)
 
         sampling_info = self.sampling_info
         if self.sampling_info:
@@ -1345,8 +1368,9 @@ class ScheduleBatch:
             seq_lens=seq_lens_cpu,
             out_cache_loc=out_cache_loc_cpu,
             return_logprob=self.return_logprob,
-            top_logprobs_nums=self.top_logprobs_nums,
-            token_ids_logprobs=self.token_ids_logprobs,
+            top_logprobs_nums=top_logprobs_nums,
+            token_ids_logprobs=token_ids_logprobs,
+            token_ids_nums = token_ids_nums,
             sampling_info=sampling_info,
             positions=positions_cpu,
             extend_start_loc=extend_start_loc,
@@ -1639,14 +1663,15 @@ class ModelWorkerBatch:
 
     # For logprob
     return_logprob: bool
-    top_logprobs_nums: list[int] | None
-    token_ids_logprobs: list[list[int]] | None
+    top_logprobs_nums: np.ndarray | None
+    token_ids_logprobs: np.ndarray | None
+    token_ids_nums: np.ndarray | None
 
     # For extend
     # extend_num_tokens: Optional[int]
     extend_seq_lens: np.ndarray | None
     extend_prefix_lens: np.ndarray | None
-    extend_logprob_start_lens: list[int] | None
+    extend_logprob_start_lens: np.ndarray | None
     extend_input_logprob_token_ids: np.ndarray | None
 
     # For padding

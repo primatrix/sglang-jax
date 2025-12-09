@@ -366,6 +366,7 @@ class ModelWorker:
             extend_seq_lens=np.array([1] * bs) if mode == ForwardMode.EXTEND else None,
             top_logprobs_nums=None,
             token_ids_logprobs=None,
+            token_ids_nums = None,
             extend_logprob_start_lens=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             spec_algorithm=speculative_algotithm,
