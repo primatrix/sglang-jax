@@ -1299,17 +1299,19 @@ class ScheduleBatch:
         if token_ids_logprobs is not None:
             token_ids_nums = []
             max_token_ids_num = 100
+            token_ids_logprobs_tmp = []
             for i in range(len(token_ids_logprobs)):
                 if token_ids_logprobs[i] is None:
                     token_ids_nums.append(0)
-                    token_ids_logprobs[i] = np.zeros(max_token_ids_num)
+                    token_ids_logprobs_tmp.append(np.zeros(max_token_ids_num))
                 else:
                     token_ids_nums.append(len(token_ids_logprobs[i]))
                     if len(token_ids_logprobs[i]) < max_token_ids_num:
-                        token_ids_logprobs[i] = np.concat([token_ids_logprobs[i], np.zeros(max_token_ids_num - len(token_ids_nums))], axis = 0)
+                        token_ids_logprobs_tmp.append(np.concat([token_ids_logprobs[i], np.zeros(max_token_ids_num - len(token_ids_nums))], axis = 0))
                     else:
-                        token_ids_logprobs[i] = np.array(token_ids_logprobs[i][:max_token_ids_num])
+                        token_ids_logprobs_tmp.append(np.array(token_ids_logprobs[i][:max_token_ids_num]))
             token_ids_nums = np.array(token_ids_nums)
+            token_ids_logprobs = np.array(token_ids_logprobs_tmp)
 
         sampling_info = self.sampling_info
         if self.sampling_info:

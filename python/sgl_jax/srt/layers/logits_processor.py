@@ -191,7 +191,7 @@ class LogitsMetadata:
             extend_seq_lens_cpu = batch.extend_seq_lens.tolist()
 
             extend_return_top_logprob = any(x > 0 for x in batch.top_logprobs_nums)
-            extend_token_ids_logprob = any(x is not None for x in batch.token_ids_logprobs)
+            extend_token_ids_logprob = any(x_i > 0 for x in batch.token_ids_logprobs for x_i in x)
             extend_return_logprob = False
             extend_logprob_pruned_lens_cpu = []
             for extend_len, start_len in zip(
@@ -216,8 +216,8 @@ class LogitsMetadata:
             extend_seq_lens=device_array(batch.extend_seq_lens, sharding=sharding),
             # extend_seq_lens_cpu=extend_seq_lens_cpu,
             extend_logprob_start_lens=device_array(
-                batch.extend_logprob_start_lens.tolist() if batch.return_logprob and batch.extend_logprob_start_lens is not None else None , sharding = sharding),
-            extend_logprob_pruned_lens= device_array(extend_logprob_pruned_lens_cpu) if batch.return_logprob and extend_logprob_pruned_lens_cpu else None,
+                batch.extend_logprob_start_lens if batch.return_logprob and batch.extend_logprob_start_lens is not None else None , sharding = sharding),
+            extend_logprob_pruned_lens= device_array(np.array(extend_logprob_pruned_lens_cpu)) if batch.return_logprob and extend_logprob_pruned_lens_cpu else None,
             top_logprobs_nums=device_array(batch.top_logprobs_nums),
             token_ids_logprobs=device_array(batch.token_ids_logprobs),
             extend_input_logprob_token_ids_device=device_array(
