@@ -138,6 +138,8 @@ class LogitsMetadata:
         children = (
             self.extend_seq_lens,
             self.top_logprobs_nums,
+            self.extend_logprob_start_lens,
+            self.extend_logprob_pruned_lens,
             self.token_ids_logprobs,
             self.extend_input_logprob_token_ids_device,
             self.temperature,
@@ -165,11 +167,13 @@ class LogitsMetadata:
 
         obj.extend_seq_lens = children[0]
         obj.top_logprobs_nums = children[1]
-        obj.token_ids_logprobs = children[2]
+        obj.extend_logprob_start_lens = children[2]
+        obj.extend_logprob_pruned_lens = children[3]
+        obj.token_ids_logprobs = children[4]
 
-        obj.extend_input_logprob_token_ids_device = children[3]
-        obj.temperature = children[4]
-        obj.top_p = children[5]
+        obj.extend_input_logprob_token_ids_device = children[5]
+        obj.temperature = children[6]
+        obj.top_p = children[7]
 
         obj.forward_mode = aux_data["forward_mode"]
         obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
