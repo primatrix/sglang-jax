@@ -849,48 +849,75 @@ def _ragged_paged_attention_kernel(
                             offs_qidx_g = jnp.stack(offs_qidx_heads, axis=0)
 
                         # 2. Load K/V Group [2, BKV, D] - Manual Implementation
+
                         bkv_ref = bkv_fused_x2_ref.at[bkv_sem_idx]
 
                         if kv_packing <= 2:
+
                             # Optimized contiguous load for float32 (packing=1) and bfloat16 (packing=2)
-                            # Target: Load HEAD_GROUP_SIZE heads (K+V pairs)
+
+                            # Reshape to 3D to avoid "Only 2D gather is supported" error on 4D slice
+
+                            # [bkv_sz, dim1_heads, kv_packing, head_dim] -> [bkv_sz, dim1_heads, kv_packing * head_dim]
+
+                            dim1_heads = bkv_ref.shape[1]
+
+                            flat_head_dim = kv_packing * head_dim
+
+                            bkv_ref_flat = bkv_ref.reshape(bkv_sz, dim1_heads, flat_head_dim)
 
                             if kv_packing == 1:
-                                # Layout: [K1], [V1], [K2], [V2] ... along dim1
-                                # We need 2 * HEAD_GROUP_SIZE rows
-                                count = HEAD_GROUP_SIZE * 2
-                                start = h_start * 2
-                                packing_dim_size = 1
-                            else:  # kv_packing == 2
-                                # Layout: [K1, V1], [K2, V2] ... along dim1 (packed in dim2)
-                                # We need HEAD_GROUP_SIZE rows
-                                count = HEAD_GROUP_SIZE
-                                start = h_start
-                                packing_dim_size = 2
 
-                            # Load [bkv_sz, count, packing_dim_size, head_dim]
-                            kv_chunk = (
-                                bkv_ref.at[
-                                    pl.ds(0, bkv_sz),
-                                    pl.ds(start, count),
-                                    pl.ds(0, packing_dim_size),
-                                    pl.ds(0, head_dim),
-                                ]
-                                .get()
-                                .reshape(bkv_sz, count * packing_dim_size, head_dim)
-                            )
+                                # Layout: [K1], [V1], [K2], [V2] ... along dim1
+
+                                count = HEAD_GROUP_SIZE * 2
+
+                                start = h_start * 2
+
+                            else:  # kv_packing == 2
+
+                                # Layout: [K1, V1], [K2, V2] ... along dim1 (packed in dim2)
+
+                                count = HEAD_GROUP_SIZE
+
+                                start = h_start
+
+                            # Load flat chunk: [bkv_sz, count, flat_head_dim]
+
+                            kv_chunk_flat = bkv_ref_flat.at[
+                                pl.ds(0, bkv_sz),
+                                pl.ds(start, count),
+                                pl.ds(0, flat_head_dim),
+                            ].get()
+
+                            # Reshape back to [bkv_sz, count * packing, head_dim]
+
+                            # packing=1: count is 2*G, packing_dim is 1 -> 2*G
+
+                            # packing=2: count is G, packing_dim is 2 -> 2*G
+
+                            kv_chunk = kv_chunk_flat.reshape(bkv_sz, count * kv_packing, head_dim)
 
                             # Both cases result in flat: [K1, V1, K2, V2, ...]
+
                             # K: indices 0, 2, ...
+
                             # V: indices 1, 3, ...
+
                             k_g_T = kv_chunk[:, 0::2, :]  # [bkv_sz, G, D]
+
                             v_g_T = kv_chunk[:, 1::2, :]  # [bkv_sz, G, D]
 
                             # Transpose to [G, bkv_sz, D]
+
                             k_g = k_g_T.transpose(1, 0, 2).astype(jnp.float32)
+
                             v_g = v_g_T.transpose(1, 0, 2).astype(jnp.float32)
+
                         else:
+
                             k_heads = []
+
                             v_heads = []
 
                             for i in range(HEAD_GROUP_SIZE):
