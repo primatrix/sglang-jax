@@ -318,7 +318,7 @@ class LogitsProcessor(nnx.Module):
                 T, D = hidden_states.shape
 
                 # ---- pruned_states: 预分配，再用 .at[...] 填充 ----
-                pruned_init = jnp.zeros((total_len, D), dtype = hidden_states.dtype)
+                pruned_init = jnp.zeros((T, D), dtype = hidden_states.dtype)
 
                 def body_fun(i, carry):
                     pt, write_pos, pruned = carry
@@ -349,7 +349,7 @@ class LogitsProcessor(nnx.Module):
                 # ---- input_logprob_indices: 其实就是 [0..total_len-1] ----
                 input_logprob_indices = jnp.arange(total_len, dtype = jnp.int64)  # [total_len]
 
-                return pruned_states, sample_indices, input_logprob_indices
+                return pruned_states[:total_len], sample_indices, input_logprob_indices
             pruned_states, sample_indices, input_logprob_indices = (
                 process_hidden_states(hidden_states, logits_metadata.extend_logprob_start_lens, logits_metadata.extend_seq_lens))
         # Compute logits for both input and sampled tokens.
