@@ -268,40 +268,90 @@ class LogitsProcessor(nnx.Module):
             # 1. pruned_states: hidden states that we want logprobs from.
             # 2. sample_indices: Indices that have sampled tokens.
             # 3. input_logprob_indices: Indices that have input logprob tokens.
-            sample_index_pt = -1
-            sample_indices = []
-            input_logprob_indices_pt = 0
-            input_logprob_indices = []
-            pt, pruned_states = 0, []
+            # sample_index_pt = -1
+            # sample_indices = []
+            # input_logprob_indices_pt = 0
+            # input_logprob_indices = []
+            # pt, pruned_states = 0, []
+            #
+            # for extend_logprob_start_len, extend_len in zip(
+            #     logits_metadata.extend_logprob_start_lens,
+            #     logits_metadata.extend_seq_lens,
+            # ):
+            #     start_len = extend_logprob_start_len
+            #     pruned_states.append(hidden_states[pt + start_len : pt + extend_len])
+            #     pt += extend_len
+            #     sample_index_pt += extend_len - start_len
+            #     sample_indices.append(sample_index_pt)
+            #     input_logprob_indices.extend(
+            #         [
+            #             input_logprob_indices_pt + i
+            #             for i in range(extend_len - extend_logprob_start_len)
+            #         ]
+            #     )
+            #     input_logprob_indices_pt += extend_len - start_len
+            #
+            # pruned_states = jnp.concat(pruned_states)
+            # sample_indices = device_array(
+            #     np.array(
+            #         sample_indices,
+            #         dtype=np.int64,
+            #     ),
+            # )
+            # input_logprob_indices = device_array(
+            #     np.array(input_logprob_indices, dtype=np.int64),
+            # )
+            def process_hidden_states(hidden_states,
+                                      extend_logprob_start_lens,
+                                      extend_seq_lens):
+                """
+                hidden_states: [T, D]
+                extend_logprob_start_lens: [N]
+                extend_seq_lens: [N]
+                都是 jax.Array，函数可以 jit。
+                """
 
-            for extend_logprob_start_len, extend_len in zip(
-                logits_metadata.extend_logprob_start_lens_cpu,
-                logits_metadata.extend_seq_lens_cpu,
-            ):
-                start_len = extend_logprob_start_len
-                pruned_states.append(hidden_states[pt + start_len : pt + extend_len])
-                pt += extend_len
-                sample_index_pt += extend_len - start_len
-                sample_indices.append(sample_index_pt)
-                input_logprob_indices.extend(
-                    [
-                        input_logprob_indices_pt + i
-                        for i in range(extend_len - extend_logprob_start_len)
-                    ]
+                # 每个 segment 的有效长度
+                deltas = extend_seq_lens - extend_logprob_start_lens  # [N]
+                total_len = jnp.sum(deltas)  # 标量
+
+                T, D = hidden_states.shape
+
+                # ---- pruned_states: 预分配，再用 .at[...] 填充 ----
+                pruned_init = jnp.zeros((total_len, D), dtype = hidden_states.dtype)
+
+                def body_fun(i, carry):
+                    pt, write_pos, pruned = carry
+
+                    start_len = extend_logprob_start_lens[i]
+                    extend_len = extend_seq_lens[i]
+                    delta = extend_len - start_len
+
+                    seg_start = pt + start_len
+                    seg_end = pt + extend_len
+
+                    seg = hidden_states[seg_start:seg_end]  # [delta, D]
+                    pruned = pruned.at[write_pos:write_pos + delta].set(seg)
+
+                    pt = pt + extend_len
+                    write_pos = write_pos + delta
+
+                    return (pt, write_pos, pruned)
+
+                n = extend_seq_lens.shape[0]
+                (_, _, pruned_states) = jax.lax.fori_loop(
+                    0, n, body_fun, (0, 0, pruned_init)
                 )
-                input_logprob_indices_pt += extend_len - start_len
 
-            pruned_states = jnp.concat(pruned_states)
-            sample_indices = device_array(
-                np.array(
-                    sample_indices,
-                    dtype=np.int64,
-                ),
-            )
-            input_logprob_indices = device_array(
-                np.array(input_logprob_indices, dtype=np.int64),
-            )
+                # ---- sample_indices: cumsum(delta) - 1 ----
+                sample_indices = jnp.cumsum(deltas) - 1  # [N]
 
+                # ---- input_logprob_indices: 其实就是 [0..total_len-1] ----
+                input_logprob_indices = jnp.arange(total_len, dtype = jnp.int64)  # [total_len]
+
+                return pruned_states, sample_indices, input_logprob_indices
+            pruned_states, sample_indices, input_logprob_indices = (
+                process_hidden_states(hidden_states, logits_metadata.extend_logprob_start_lens, logits_metadata.extend_seq_lens))
         # Compute logits for both input and sampled tokens.
         logits = self._get_logits(pruned_states, lm_head)
         sampled_logits = logits[sample_indices] if sample_indices is not None else logits
