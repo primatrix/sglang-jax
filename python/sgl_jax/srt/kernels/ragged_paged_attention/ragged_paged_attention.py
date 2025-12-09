@@ -850,65 +850,94 @@ def _ragged_paged_attention_kernel(
 
                         # 2. Load K/V Group [2, BKV, D] - Manual Implementation
                         bkv_ref = bkv_fused_x2_ref.at[bkv_sem_idx]
-                        k_heads = []
-                        v_heads = []
 
-                        for i in range(HEAD_GROUP_SIZE):
-                            curr_h = h_start + i
+                        if kv_packing == 1:
+                            # Optimized contiguous load for float/bfloat16
+                            # Load K1, V1, K2, V2... all together
+                            count = HEAD_GROUP_SIZE * 2
+                            start = h_start * 2
 
-                            # Calculate indices for K and V (Interleaved: K1, V1, K2, V2...)
-                            idx_k = curr_h * 2
-                            idx_v = curr_h * 2 + 1
-
-                            # Resolve physical indices
-                            dim1_k = idx_k // kv_packing
-                            dim2_k = idx_k % kv_packing
-                            dim1_v = idx_v // kv_packing
-                            dim2_v = idx_v % kv_packing
-
-                            # Dynamic Slice Load from VMEM [bkv_sz, 1, 1, head_dim] -> [bkv_sz, head_dim]
-                            k_val = (
+                            # Load [bkv_sz, count, 1, head_dim]
+                            kv_chunk = (
                                 bkv_ref.at[
                                     pl.ds(0, bkv_sz),
-                                    pl.ds(dim1_k, 1),
-                                    pl.ds(dim2_k, 1),
+                                    pl.ds(start, count),
+                                    pl.ds(0, 1),
                                     pl.ds(0, head_dim),
                                 ]
                                 .get()
-                                .reshape(bkv_sz, head_dim)
+                                .reshape(bkv_sz, count, head_dim)
                             )
 
-                            v_val = (
-                                bkv_ref.at[
-                                    pl.ds(0, bkv_sz),
-                                    pl.ds(dim1_v, 1),
-                                    pl.ds(dim2_v, 1),
-                                    pl.ds(0, head_dim),
-                                ]
-                                .get()
-                                .reshape(bkv_sz, head_dim)
-                            )
+                            # Separate K and V
+                            # K: indices 0, 2, ...
+                            # V: indices 1, 3, ...
+                            k_g_T = kv_chunk[:, 0::2, :]  # [bkv_sz, G, D]
+                            v_g_T = kv_chunk[:, 1::2, :]  # [bkv_sz, G, D]
 
-                            # [FIX] Correctly apply bitmask if packing > 1 (e.g. int4/int8)
-                            # We use the 'bkv_bitmask' already computed in the outer scope.
-                            if kv_packing > 1:
-                                # Bitcast to uint32 for masking
-                                k_val_u32 = pltpu.bitcast(k_val, jnp.uint32)
-                                v_val_u32 = pltpu.bitcast(v_val, jnp.uint32)
+                            # Transpose to [G, bkv_sz, D]
+                            k_g = k_g_T.transpose(1, 0, 2).astype(jnp.float32)
+                            v_g = v_g_T.transpose(1, 0, 2).astype(jnp.float32)
+                        else:
+                            k_heads = []
+                            v_heads = []
 
-                                # Apply mask
-                                k_val_u32 = k_val_u32 & bkv_bitmask
-                                v_val_u32 = v_val_u32 & bkv_bitmask
+                            for i in range(HEAD_GROUP_SIZE):
+                                curr_h = h_start + i
 
-                                # Bitcast back
-                                k_val = pltpu.bitcast(k_val_u32, kv_dtype)
-                                v_val = pltpu.bitcast(v_val_u32, kv_dtype)
+                                # Calculate indices for K and V (Interleaved: K1, V1, K2, V2...)
+                                idx_k = curr_h * 2
+                                idx_v = curr_h * 2 + 1
 
-                            k_heads.append(k_val)
-                            v_heads.append(v_val)
+                                # Resolve physical indices
+                                dim1_k = idx_k // kv_packing
+                                dim2_k = idx_k % kv_packing
+                                dim1_v = idx_v // kv_packing
+                                dim2_v = idx_v % kv_packing
 
-                        k_g = jnp.stack(k_heads, axis=0).astype(jnp.float32)
-                        v_g = jnp.stack(v_heads, axis=0).astype(jnp.float32)
+                                # Dynamic Slice Load from VMEM [bkv_sz, 1, 1, head_dim] -> [bkv_sz, head_dim]
+                                k_val = (
+                                    bkv_ref.at[
+                                        pl.ds(0, bkv_sz),
+                                        pl.ds(dim1_k, 1),
+                                        pl.ds(dim2_k, 1),
+                                        pl.ds(0, head_dim),
+                                    ]
+                                    .get()
+                                    .reshape(bkv_sz, head_dim)
+                                )
+
+                                v_val = (
+                                    bkv_ref.at[
+                                        pl.ds(0, bkv_sz),
+                                        pl.ds(dim1_v, 1),
+                                        pl.ds(dim2_v, 1),
+                                        pl.ds(0, head_dim),
+                                    ]
+                                    .get()
+                                    .reshape(bkv_sz, head_dim)
+                                )
+
+                                # [FIX] Correctly apply bitmask if packing > 1 (e.g. int4/int8)
+                                # We use the 'bkv_bitmask' already computed in the outer scope.
+                                if kv_packing > 1:
+                                    # Bitcast to uint32 for masking
+                                    k_val_u32 = pltpu.bitcast(k_val, jnp.uint32)
+                                    v_val_u32 = pltpu.bitcast(v_val, jnp.uint32)
+
+                                    # Apply mask
+                                    k_val_u32 = k_val_u32 & bkv_bitmask
+                                    v_val_u32 = v_val_u32 & bkv_bitmask
+
+                                    # Bitcast back
+                                    k_val = pltpu.bitcast(k_val_u32, kv_dtype)
+                                    v_val = pltpu.bitcast(v_val_u32, kv_dtype)
+
+                                k_heads.append(k_val)
+                                v_heads.append(v_val)
+
+                            k_g = jnp.stack(k_heads, axis=0).astype(jnp.float32)
+                            v_g = jnp.stack(v_heads, axis=0).astype(jnp.float32)
 
                         if k_scale is not None:
                             k_g *= k_scale
