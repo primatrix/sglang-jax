@@ -336,8 +336,6 @@ class WeightLoader:
             tasks = []
             for i, expert_idx in enumerate(expert_indices[1:], start=1):
                 tasks.append((i, expert_idx))
-                print(f"Added task {i} for expert {expert_idx}")
-                print(f"Tasks: {tasks}")
 
             if tasks:
                 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
