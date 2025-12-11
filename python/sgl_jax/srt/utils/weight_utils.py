@@ -1,12 +1,14 @@
 import glob
 import logging
 import os
+import pickle
 from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from jax.experimental import multihost_utils
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 from safetensors import safe_open
@@ -58,6 +60,34 @@ class WeightMapping:
             return (None,)
 
 
+class SequentialSafetensorManager:
+    """
+    Manages open file handles during a weight loading session to prevent
+    repeated opening/parsing of safetensors headers.
+    """
+
+    def __init__(self):
+        self.handles = {}
+
+    def get_handle(self, filename):
+        if filename not in self.handles:
+            # Keep the file open. framework="np" is crucial for JAX interop.
+            # device="cpu" ensures we don't accidentally alloc on GPU/TPU here.
+            self.handles[filename] = safe_open(filename, framework="np", device="cpu")
+        return self.handles[filename]
+
+    def close_all(self):
+        # safe_open objects don't strictly require close() as they rely on RAII/GC,
+        # but clearing references ensures we don't hold descriptors.
+        self.handles.clear()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close_all()
+
+
 class WeightLoader:
     def __init__(
         self,
@@ -99,26 +129,212 @@ class WeightLoader:
         else:
             self.moe_abstract_mesh = None
 
+    def _scan_weight_info(self) -> dict[str, list[dict]]:
+        """
+        Scan all safetensors files to build a mapping from HF key to file info.
+        Optimized for GCS/Network FS: Host 0 scans, then broadcasts to others.
+        """
+        # 1. Host 0 does the heavy lifting (Scanning)
+        if jax.process_index() == 0:
+            model_path = self.model_config.model_path
+            weights_files = glob.glob(os.path.join(model_path, "*.safetensors"))
+
+            if len(weights_files) == 0:
+                raise RuntimeError(f"Cannot find any *.safetensors files in {model_path}")
+
+            weights_files.sort()
+            weight_info = {}
+
+            logger.info(
+                "Scanning metadata for %s model files (single host only)...", len(weights_files)
+            )
+            # Use tqdm only on master to avoid log spam
+            iterator = tqdm(weights_files, desc="Scanning Metadata", unit="file")
+
+            for st_file in iterator:
+                with safe_open(st_file, framework="flax", device="cpu") as f:
+                    for key in f.keys():  # noqa: SIM118
+                        slice_info = f.get_slice(key)
+                        info = {
+                            "file": st_file,
+                            "shape": tuple(slice_info.get_shape()),
+                            "dtype": slice_info.get_dtype(),
+                        }
+                        if key not in weight_info:
+                            weight_info[key] = []
+                        weight_info[key].append(info)
+
+            # Serialize the result
+            serialized_data = pickle.dumps(weight_info)
+            # Convert to uint8 array for JAX broadcasting
+            data_np = np.frombuffer(serialized_data, dtype=np.uint8)
+            data_len = np.array(len(data_np), dtype=np.int32)
+        else:
+            # Other hosts just wait
+            logger.info("Waiting for metadata broadcast from other host...")
+            data_len = np.array(0, dtype=np.int32)
+            data_np = None
+
+        # 2. Broadcast the length of the data first
+        # broadcast_one_to_all sends data from process 0 to all others
+        data_len = multihost_utils.broadcast_one_to_all(
+            data_len, is_source=(jax.process_index() == 0)
+        )
+
+        # 3. Prepare buffer on receivers
+        if jax.process_index() != 0:
+            # Ensure we allocate a numpy array of the correct size
+            data_np = np.empty(data_len.item(), dtype=np.uint8)
+
+        # 4. Broadcast the actual serialized data
+        # Note: JAX communicates via DeviceArrays, but small CPU arrays are fine too.
+        # Using device_put here ensures it enters the JAX communication layer correctly if needed,
+        # though multihost_utils usually handles numpy inputs gracefully.
+        synced_data = multihost_utils.broadcast_one_to_all(
+            data_np, is_source=(jax.process_index() == 0)
+        )
+
+        # 5. Deserialize
+        # Convert back to bytes (ensure we move to CPU first)
+        synced_bytes = np.array(synced_data).tobytes()
+        weight_info = pickle.loads(synced_bytes)
+
+        if jax.process_index() != 0:
+            logger.info("Metadata received. Total keys: %s", len(weight_info))
+
+        return weight_info
+
+    def _create_lazy_tensors(
+        self, hf_key: str, infos: list[dict], file_manager: SequentialSafetensorManager
+    ) -> list[jax.Array]:
+        """Create a list of JAX arrays that lazy load data from safetensors via callback."""
+
+        lazy_arrays = []
+
+        for info in infos:
+            shape = info["shape"]
+            st_dtype = info["dtype"]
+
+            dtype_map = {
+                "BF16": jnp.bfloat16,
+                "F16": jnp.float16,
+                "F32": jnp.float32,
+                "I64": jnp.int64,
+                "I32": jnp.int32,
+                "BOOL": jnp.bool_,
+            }
+            target_dtype = dtype_map.get(st_dtype, jnp.float32)
+
+            # Define sharding as replicated (logically, on disk)
+            sharding = jax.sharding.NamedSharding(self.mesh, P())
+            filename = info["file"]
+
+            # Capture filename and file_manager in closure
+            def _make_load_slice(fname=filename, fm=file_manager):
+                def _load_slice(index):
+                    # Get cached handle instead of opening new one
+                    f = fm.get_handle(fname)
+                    return f.get_slice(hf_key)[index]
+
+                return _load_slice
+
+            lazy_array = jax.make_array_from_callback(shape, sharding, _make_load_slice()).astype(
+                target_dtype
+            )
+
+            lazy_arrays.append(lazy_array)
+
+        return lazy_arrays
+
+    def _create_stacked_moe_lazy_tensor(
+        self,
+        expected_hf_keys: list[str],
+        weight_info: dict,
+        file_manager: SequentialSafetensorManager,
+    ) -> jax.Array:
+        """
+        Optimized loader for MoE: Creates a SINGLE lazy array for the entire stack of experts.
+        This avoids creating thousands of small lazy arrays and greatly speeds up graph building.
+        Only supports standard MoE where each expert weight is not split across files (no concat_axis).
+        """
+        # 1. Get base info from the first expert
+        first_key = expected_hf_keys[0]
+        # assume len(infos) == 1 for standard MoE (checked by caller)
+        info = weight_info[first_key][0]
+
+        single_expert_shape = info["shape"]
+        st_dtype = info["dtype"]
+
+        dtype_map = {
+            "BF16": jnp.bfloat16,
+            "F16": jnp.float16,
+            "F32": jnp.float32,
+            "I64": jnp.int64,
+            "I32": jnp.int32,
+            "BOOL": jnp.bool_,
+        }
+        target_dtype = dtype_map.get(st_dtype, jnp.float32)
+
+        num_experts = len(expected_hf_keys)
+        stacked_shape = (num_experts, *single_expert_shape)
+        sharding = jax.sharding.NamedSharding(self.mesh, P())
+
+        def _load_stacked_slice(index):
+            # index is tuple of slices: (expert_slice, row_slice, col_slice...)
+            expert_slice = index[0]
+            inner_slice = index[1:]
+
+            # We need to determine which experts to load based on the slice
+            # slice.indices gives (start, stop, step) adjusted for length
+            start, stop, step = expert_slice.indices(num_experts)
+
+            # Calculate result shape for this chunk
+            # We rely on the fact that JAX calls this with a valid slice logic
+            expert_indices = range(start, stop, step)
+
+            # Determine the shape of the inner slice
+            # We can peek one file to see the output shape of get_slice,
+            # or calculate it manually. Let's do it one by one.
+
+            stacked_result = []
+
+            for i in expert_indices:
+                hf_key = expected_hf_keys[i]
+                # We assume infos length is 1 (checked in caller)
+                fname = weight_info[hf_key][0]["file"]
+                f = file_manager.get_handle(fname)
+
+                # Read just the requested part of this expert
+                data = f.get_slice(hf_key)[inner_slice]
+                stacked_result.append(data)
+
+            if not stacked_result:
+                return np.zeros(
+                    (0, *[s.stop - s.start for s in inner_slice]), dtype=np.float32
+                )  # fallback
+
+            return np.stack(stacked_result, axis=0)
+
+        return jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice).astype(
+            target_dtype
+        )
+
     def load_weights_from_safetensors(
         self,
         weight_mappings: dict[str, str | list[str] | WeightMapping],
         safetensors_partition=1,
         dummy=False,
     ):
-        """Load weights from safetensors files or generate dummy weights.
-
-        Args:
-            weight_mappings: Mapping from HF keys to model paths with sharding info
-            safetensors_partition: Number of safetensors partitions
-            dummy: If True, generate random weights instead of loading from files
-        """
+        """Load weights using JAX lazy evaluation and parallel I/O."""
         params = nnx.state(self.model)
 
-        # Dummy mode: generate random weights using mapping's sharding info
-        # Can be explicitly passed or set via model_config._dummy_mode
         if dummy or self.dummy_mode:
             self._load_dummy_weights(params, weight_mappings)
             return
+
+        # 1. Build index of all weights on disk
+        # Note: values are lists to handle TP shards across files
+        weight_info = self._scan_weight_info()
 
         regular_mappings = {}
         moe_mappings = {}
@@ -129,94 +345,141 @@ class WeightLoader:
             else:
                 regular_mappings[key] = mapping
 
-        moe_buffer = {}
+        # Use the Context Manager to cache file handles
+        logger.info("Starting parallel weight loading via JAX Lazy Loader...")
 
-        logger.info(
-            "WeightLoader: Will load layers 0 to %s",
-            self.model_config.num_hidden_layers - 1,
-        )
+        with SequentialSafetensorManager() as file_manager:
+            # 2. Process Regular Weights (Lazy Pull)
+            for hf_key, mapping in tqdm(regular_mappings.items(), desc="Loading Regular Weights"):
+                if hf_key not in weight_info:
+                    if hf_key == "d2t":
+                        # Special handling for d2t if not present
+                        logger.warning("Weight %s not found in safetensors index.", hf_key)
+                        continue
 
-        for hf_key, hf_weight in self._iterate_weights():
-            if hf_key in regular_mappings:
+                    if self._is_excluded_layer_weight(hf_key):
+                        logger.debug("Skipping excluded layer weight: %s", hf_key)
+                        continue
+                    else:
+                        logger.warning("No file found for weight: %s", hf_key)
+                        continue
+
+                infos = weight_info[hf_key]
+
+                # Create Lazy JAX Arrays with file_manager
+                lazy_arrays = self._create_lazy_tensors(hf_key, infos, file_manager)
+
+                # For regular weights, we generally expect 1 file.
+                lazy_weight = lazy_arrays[0]
+
+                if len(lazy_arrays) > 1:
+                    logger.debug(
+                        "Found %s files for %s, using the first one.", len(lazy_arrays), hf_key
+                    )
+
+                # Special Logic for d2t
                 if hf_key == "d2t":
-                    base = jnp.arange(hf_weight.shape[0], dtype=hf_weight.dtype)
-                    hot_ids = (hf_weight + base).astype(jnp.int32)
+                    base = jnp.arange(lazy_weight.shape[0], dtype=lazy_weight.dtype)
+                    hot_ids = (lazy_weight + base).astype(jnp.int32)
                     params["hot_token_ids"].value = hot_ids
                     continue
-                mapping = regular_mappings[hf_key]
+
                 if isinstance(mapping, (str, list)):
                     mapping = WeightMapping(target_path=mapping)
-                self._process_and_assign_weight(params, hf_key, hf_weight, mapping)
-            elif (
-                "mlp.experts." in hf_key or "block_sparse_moe.experts" in hf_key
-            ) and hf_key.endswith(".weight"):
-                if self._is_excluded_layer_weight(hf_key):
-                    logger.debug("Skipping excluded MoE expert weight: %s", hf_key)
-                    continue
 
-                assigned = False
-                for moe_key, mapping in moe_mappings.items():
-                    expected_hf_keys = mapping.target_path[1:]  # list of expected HF keys
-                    if hf_key in expected_hf_keys:
-                        if moe_key not in moe_buffer:
-                            moe_buffer[moe_key] = {}
-                        if hf_key not in moe_buffer[moe_key]:
-                            moe_buffer[moe_key][hf_key] = []
-                        moe_buffer[moe_key][hf_key].append(hf_weight)
-                        assigned = True
+                self._process_and_assign_weight(params, hf_key, lazy_weight, mapping)
 
-                        if len(moe_buffer[moe_key]) == len(expected_hf_keys):
-                            shard_counts = [len(v) for v in moe_buffer[moe_key].values()]
-                            # Validate all weights have consistent shard counts
-                            if len(set(shard_counts)) != 1:
-                                continue
+            # 3. Process MoE Weights (Lazy Pull)
+            for moe_key, mapping in tqdm(moe_mappings.items(), desc="Loading MoE Weights"):
+                expected_hf_keys = mapping.target_path[1:]
 
-                            # Auto-detect TP sharding:
-                            # - Grok-2: concat_axis is set, needs multiple shards (e.g., 8)
-                            if mapping.concat_axis is not None:
-                                # TP-sharded weights: need to collect all TP shards
-                                # Expected number of shards = total model files / experts per file
-                                if shard_counts[0] < safetensors_partition:
-                                    # Still collecting shards, wait for more
-                                    continue
-                            else:
-                                # Non-TP-sharded weights: expect exactly 1 copy per expert
-                                if shard_counts[0] != 1:
-                                    continue
+                group_complete = True
+                is_tp_split = False
 
-                            self._process_single_moe_group(
-                                params, moe_key, mapping, moe_buffer[moe_key]
-                            )
-                            del moe_buffer[moe_key]  # free memory
+                # Validation pass
+                for hf_key in expected_hf_keys:
+                    if hf_key not in weight_info:
+                        if self._is_excluded_layer_weight(hf_key):
+                            logger.debug("Skipping excluded MoE expert weight: %s", hf_key)
+                        else:
+                            logger.warning("MoE expert weight %s not found.", hf_key)
+                        group_complete = False
                         break
 
-                if not assigned:
-                    logger.warning("MoE expert weight not assigned to any mapping: %s", hf_key)
-            else:
-                if self._is_excluded_layer_weight(hf_key):
-                    logger.debug("Skipping excluded layer weight: %s", hf_key)
-                else:
-                    logger.warning("No mapping found for weight: %s", hf_key)
+                    infos = weight_info[hf_key]
 
-        if moe_buffer:
-            for moe_key in moe_buffer:
-                mapping = moe_mappings[moe_key]
-                expected = len(mapping.target_path[1:])
-                got = len(moe_buffer[moe_key])
-                shard_counts = (
-                    [len(v) for v in moe_buffer[moe_key].values()] if moe_buffer[moe_key] else []
-                )
-                logger.error(
-                    "MoE group %s incomplete: %s/%s weights loaded, shard_counts=%s, concat_axis=%s",
-                    moe_key,
-                    got,
-                    expected,
-                    shard_counts,
-                    mapping.concat_axis,
-                )
-            raise RuntimeError("Incomplete MoE expert weights detected.")
+                    # Check for TP split (Grok style)
+                    if mapping.concat_axis is not None:
+                        # If any expert is split across files, we must use the slow path
+                        if len(infos) > 1:
+                            is_tp_split = True
+
+                        if len(infos) < safetensors_partition:
+                            logger.warning(
+                                "Incomplete shards for %s: expected %s, found %s",
+                                hf_key,
+                                safetensors_partition,
+                                len(infos),
+                            )
+                            group_complete = False
+                            break
+
+                if not group_complete:
+                    continue
+
+                # OPTIMIZATION: Use Stacked Loader if no TP split (Standard MoE like Qwen/Mixtral)
+                if not is_tp_split and mapping.concat_axis is None:
+                    stacked_weight = self._create_stacked_moe_lazy_tensor(
+                        expected_hf_keys, weight_info, file_manager
+                    )
+                    # Apply transpose if needed (on the lazy array)
+                    if mapping.transpose:
+                        # Original stack: (E, N, K). We want transpose on last 2 dims -> (E, K, N)
+                        stacked_weight = jnp.transpose(stacked_weight, (0, 2, 1))
+
+                    self._process_single_moe_group_fast(params, moe_key, mapping, stacked_weight)
+
+                else:
+                    # Fallback to Slow Path (Grok TP Split)
+                    expert_weights_dict = {}
+                    for hf_key in expected_hf_keys:
+                        infos = weight_info[hf_key]
+                        lazy_arrays = self._create_lazy_tensors(hf_key, infos, file_manager)
+                        expert_weights_dict[hf_key] = lazy_arrays
+
+                    self._process_single_moe_group(params, moe_key, mapping, expert_weights_dict)
 
         nnx.update(self.model, params)
+        logger.info("All weights loaded successfully.")
+
+    def _process_single_moe_group_fast(
+        self,
+        params: nnx.State,
+        moe_key: str,
+        mapping: WeightMapping,
+        stacked_weight: jax.Array,
+    ):
+        """Fast path assignment for pre-stacked MoE weights."""
+        target_path = mapping.target_path[0]
+
+        if "expert" in mapping.sharding:
+            ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
+            world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
+            tp_size = world_size // ep_size
+
+            devices = self.mesh.devices.flatten()
+            moe_mesh = jax.sharding.Mesh(
+                devices.reshape(ep_size, tp_size), axis_names=("expert", "tensor")
+            )
+
+            sharded_weight = self._shard_weight(stacked_weight, mapping.sharding, mesh=moe_mesh)
+        else:
+            sharded_weight = self._shard_weight(stacked_weight, mapping.sharding)
+
+        model_param = self._get_param(params, target_path)
+        model_param.value = sharded_weight.astype(model_param.value.dtype)
+
+        logger.debug("Assigned MoE group %s (Fast), shape: %s", moe_key, stacked_weight.shape)
 
     def _process_single_moe_group(
         self,
@@ -231,17 +494,21 @@ class WeightLoader:
         collected_weights = []
         for hf_key in expected_hf_keys:
             weights = expert_weights_dict[hf_key]
-            # If TP-sharded (e.g., Grok-2), concatenate shards along concat_axis
+
+            # Logic matches original: concatenate shards if concat_axis is set
             if mapping.concat_axis is not None and len(weights) > 1:
+                # Concatenate the lazy arrays.
+                # JAX will lazy-eval this concat only when shards are accessed.
                 weight = jnp.concatenate(weights, axis=mapping.concat_axis)
             else:
-                # Non-TP-sharded (e.g., Qwen3-MoE), expect single weight
+                # Non-TP-sharded, expect single weight
                 weight = weights[0]
 
             if mapping.transpose and not hf_key.endswith(".bias"):
                 weight = jnp.transpose(weight, (1, 0))
             collected_weights.append(weight)
 
+        # Stack is lazy on JAX arrays
         stacked_weight = jnp.stack(collected_weights, axis=0)  # (num_experts, ...)
 
         if "expert" in mapping.sharding:
@@ -270,7 +537,6 @@ class WeightLoader:
         seed: int = 1234,
     ):
         logger.info("Generating dummy weights with proper sharding from weight mappings")
-        # Separate regular and MOE weights
         regular_mappings = {}
         moe_mappings = {}
 
@@ -280,7 +546,6 @@ class WeightLoader:
             else:
                 regular_mappings[hf_key] = mapping
 
-        # Process regular weights
         for hf_key, mapping in regular_mappings.items():
 
             if isinstance(mapping, (str, list)):
@@ -301,12 +566,10 @@ class WeightLoader:
             shape = model_param.value.shape
             dtype = model_param.value.dtype
 
-            # Generate dummy weight with correct sharding
             sharding_spec = P(*mapping.sharding) if mapping.sharding else P()
             sharding = jax.sharding.NamedSharding(self.mesh, sharding_spec)
 
             def make_shard(indices, shape=shape, dtype=dtype):
-                # Compute shard shape from global shape and indices
                 shard_shape = []
                 for dim_size, idx in zip(shape, indices):
                     if isinstance(idx, slice):
@@ -317,7 +580,6 @@ class WeightLoader:
                         shard_shape.append(1)
                 shard_shape = tuple(shard_shape)
 
-                # Generate random data
                 rng = np.random.default_rng(seed)
                 if jnp.issubdtype(dtype, jnp.floating):
                     if dtype == jnp.bfloat16:
@@ -331,7 +593,6 @@ class WeightLoader:
                     arr_np = rng.uniform(-1e-3, 1e-3, size=shard_shape).astype(gen_dtype)
                     return jnp.asarray(arr_np, dtype=dtype)
                 else:
-                    # Non-floating types, just zeros
                     return jnp.zeros(shard_shape, dtype=dtype)
 
             dummy_weight = jax.make_array_from_callback(shape, sharding, make_shard)
@@ -343,7 +604,6 @@ class WeightLoader:
                 sharding_spec,
             )
 
-        # Process MOE weights
         for moe_key, mapping in moe_mappings.items():
             if isinstance(mapping, (str, list)):
                 mapping = WeightMapping(target_path=mapping)
@@ -356,19 +616,14 @@ class WeightLoader:
                 logger.debug("Skip dummy MOE weight for %s (parameter not found)", target_path)
                 continue
 
-            # Expected shape: (num_experts, ...)
             full_shape = model_param.value.shape
             num_experts = full_shape[0]
             expert_weight_shape = full_shape[1:]
             dtype = model_param.value.dtype
 
-            # Generate dummy weights for all experts
             collected_weights = []
             for expert_idx in range(num_experts):
-                # For each expert weight, generate with appropriate sharding
-                # Remove "expert" axis from sharding for individual expert weight generation
                 if mapping.sharding and "expert" in mapping.sharding:
-                    # Expert-parallel sharding: use tensor-only sharding for generation
                     expert_sharding_tuple = tuple(s for s in mapping.sharding if s != "expert")
                 else:
                     expert_sharding_tuple = mapping.sharding
@@ -402,12 +657,9 @@ class WeightLoader:
                 )
                 collected_weights.append(expert_weight)
 
-            # Stack all expert weights: (num_experts, ...)
             stacked_weight = jnp.stack(collected_weights, axis=0)
 
-            # Apply final sharding with expert axis if needed
             if mapping.sharding and "expert" in mapping.sharding:
-                # Use MOE mesh with expert parallelism
                 ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
                 if ep_size > 1:
                     world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
@@ -420,14 +672,12 @@ class WeightLoader:
                     final_sharding_spec = P(*mapping.sharding)
                     final_sharding = jax.sharding.NamedSharding(moe_mesh, final_sharding_spec)
                 else:
-                    # No expert parallelism, use regular mesh
                     final_sharding_spec = P(*mapping.sharding)
                     final_sharding = jax.sharding.NamedSharding(self.mesh, final_sharding_spec)
             else:
                 final_sharding_spec = P(*mapping.sharding) if mapping.sharding else P()
                 final_sharding = jax.sharding.NamedSharding(self.mesh, final_sharding_spec)
 
-            # Reshard to final sharding
             sharded_weight = jax.device_put(stacked_weight, final_sharding)
             model_param.value = sharded_weight.astype(dtype)
 
@@ -441,60 +691,6 @@ class WeightLoader:
 
         nnx.update(self.model, params)
         logger.info("Dummy weights generated successfully!")
-
-    def _iterate_weights(self):
-        model_path = self.model_config.model_path
-        weights_files = glob.glob(os.path.join(model_path, "*.safetensors"))
-
-        if len(weights_files) == 0:
-            raise RuntimeError(f"Cannot find any *.safetensors files in {model_path}")
-
-        weights_files.sort()
-
-        skipped_files = 0
-        with tqdm(weights_files, desc="[LOADING] MODEL WEIGHTS", unit="file") as pbar:
-            for st_file in pbar:
-                filename = os.path.basename(st_file)
-                pbar.set_postfix({"file": filename})
-
-                with (
-                    jax.default_device(jax.local_devices(backend="cpu")[0]),
-                    safe_open(st_file, framework="flax") as f,
-                ):
-                    needed_keys = []
-                    for name in f.keys():  # noqa: SIM118
-                        if not name.startswith("model.layers."):
-                            needed_keys.append(name)
-                            continue
-
-                        if not self._is_excluded_layer_weight(name):
-                            needed_keys.append(name)
-
-                    if not needed_keys:
-                        skipped_files += 1
-                        logger.debug(
-                            "Skipping %s: 0/%s weights needed",
-                            filename,
-                            len(f.keys()),
-                        )
-                        continue
-
-                    logger.debug(
-                        "Loading %s: %s/%s weights needed",
-                        filename,
-                        len(needed_keys),
-                        len(f.keys()),
-                    )
-                    for name in needed_keys:
-                        weight_tensor = f.get_tensor(name)
-                        yield name, weight_tensor
-
-        if skipped_files > 0:
-            logger.info(
-                "Memory optimization: Skipped %s/%s files with no needed weights",
-                skipped_files,
-                len(weights_files),
-            )
 
     def _process_and_assign_weight(
         self,
@@ -675,23 +871,11 @@ class WeightLoader:
             mesh = self.mesh
         target_sharding = jax.sharding.NamedSharding(mesh, P(*sharding_spec))
 
-        if (
-            getattr(weight, "_committed", False)
-            and getattr(weight, "sharding", None) == target_sharding
-        ):
-            return weight
-
-        if jax.process_count() > 1:
-
-            def make_shard(indices):
-                shard = weight[indices]
-                return shard
-
-            return jax.make_array_from_callback(
-                shape=weight.shape, sharding=target_sharding, data_callback=make_shard
-            )
-        else:
-            return jax.device_put(weight, target_sharding)
+        # FIX: Don't use make_array_from_callback manually here.
+        # Since 'weight' is already a Lazy JAX Array (backed by a callback),
+        # using device_put will trigger the slice/distribute logic automatically and lazily.
+        # JAX compiler handles the propagation of the slice back to the source callback.
+        return jax.device_put(weight, target_sharding)
 
     def _get_param(self, params: nnx.State, path: str) -> nnx.State:
         keys = path.split(".")
@@ -709,78 +893,6 @@ class WeightLoader:
                     raise ValueError(f"{path} is not a valid param path")
 
         return current_level
-
-    def _apply_head_dim_padding(
-        self, weight: jax.Array, hf_key: str, mapping: WeightMapping
-    ) -> jax.Array:
-        if hf_key.endswith(".bias"):
-            if any(proj in hf_key for proj in ["q_proj", "k_proj", "v_proj"]):
-                if "q_proj" in hf_key:
-                    reshaped = jnp.reshape(weight, (self.num_heads, self.head_dim_original))
-                    padded = jnp.pad(reshaped, ((0, 0), (0, self.head_dim_pad)))
-                    return jnp.reshape(padded, (self.num_heads * self.head_dim,))
-                else:  # k_proj or v_proj
-                    reshaped = jnp.reshape(weight, (self.num_kv_heads, self.head_dim_original))
-                    padded = jnp.pad(reshaped, ((0, 0), (0, self.head_dim_pad)))
-                    return jnp.reshape(padded, (self.num_kv_heads * self.head_dim,))
-        else:
-            if mapping.reshape is not None:
-                if "o_proj" in hf_key:
-                    padded = jnp.pad(weight, ((0, 0), (0, 0), (0, self.head_dim_pad)))
-                else:
-                    padded = jnp.pad(weight, ((0, 0), (0, self.head_dim_pad), (0, 0)))
-                return padded
-            else:
-                if mapping.transpose:
-                    if "q_proj" in hf_key:
-                        reshaped = jnp.reshape(
-                            weight,
-                            (
-                                self.hidden_size if not mapping.is_eagle3 else 2 * self.hidden_size,
-                                self.num_heads,
-                                self.head_dim_original,
-                            ),
-                        )
-                        padded = jnp.pad(reshaped, ((0, 0), (0, 0), (0, self.head_dim_pad)))
-                        return jnp.reshape(
-                            padded,
-                            (
-                                self.hidden_size if not mapping.is_eagle3 else 2 * self.hidden_size,
-                                self.num_heads * self.head_dim,
-                            ),
-                        )
-                    elif any(proj in hf_key for proj in ["k_proj", "v_proj"]):
-                        reshaped = jnp.reshape(
-                            weight,
-                            (
-                                self.hidden_size if not mapping.is_eagle3 else 2 * self.hidden_size,
-                                self.num_kv_heads,
-                                self.head_dim_original,
-                            ),
-                        )
-                        padded = jnp.pad(reshaped, ((0, 0), (0, 0), (0, self.head_dim_pad)))
-                        return jnp.reshape(
-                            padded,
-                            (
-                                self.hidden_size if not mapping.is_eagle3 else 2 * self.hidden_size,
-                                self.num_kv_heads * self.head_dim,
-                            ),
-                        )
-                    elif "o_proj" in hf_key:
-                        reshaped = jnp.reshape(
-                            weight,
-                            (self.num_heads * self.head_dim_original, self.hidden_size),
-                        )
-                        padded_reshaped = jnp.reshape(
-                            reshaped,
-                            (self.num_heads, self.head_dim_original, self.hidden_size),
-                        )
-                        padded = jnp.pad(padded_reshaped, ((0, 0), (0, self.head_dim_pad), (0, 0)))
-                        return jnp.reshape(
-                            padded, (self.num_heads * self.head_dim, self.hidden_size)
-                        )
-
-        return weight
 
     def _apply_kv_head_padding(self, weight: jax.Array, hf_key: str) -> jax.Array:
         """Apply KV head padding/replication when tp_size > total_kv_heads."""
