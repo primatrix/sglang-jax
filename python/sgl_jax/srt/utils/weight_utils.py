@@ -287,7 +287,7 @@ class WeightLoader:
         sharding = jax.sharding.NamedSharding(self.mesh, P())
 
         # GCS 并发数，推荐 32
-        MAX_WORKERS = 32
+        MAX_WORKERS = 128
 
         def _load_stacked_slice(index):
             expert_slice = index[0]
