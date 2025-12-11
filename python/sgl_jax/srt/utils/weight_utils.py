@@ -198,6 +198,11 @@ class WeightLoader:
         # 5. Deserialize
         # Convert back to bytes (ensure we move to CPU first)
         synced_bytes = np.array(synced_data).tobytes()
+
+        # Explicitly delete the device array and clear caches to avoid memory imbalance
+        del synced_data
+        jax.clear_caches()
+
         weight_info = pickle.loads(synced_bytes)
 
         if jax.process_index() != 0:
@@ -474,6 +479,7 @@ class WeightLoader:
                     self._process_single_moe_group(params, moe_key, mapping, expert_weights_dict)
 
         nnx.update(self.model, params)
+        jax.clear_caches()
         logger.info("All weights loaded successfully.")
 
     def _process_single_moe_group_fast(
