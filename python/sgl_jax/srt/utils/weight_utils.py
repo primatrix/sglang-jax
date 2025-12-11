@@ -2,6 +2,7 @@ import glob
 import logging
 import os
 import pickle
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import jax
@@ -253,15 +254,14 @@ class WeightLoader:
         file_manager: SequentialSafetensorManager,
     ) -> jax.Array:
         """
-        Optimized loader for MoE: Creates a SINGLE lazy array for the entire stack of experts.
-
-        [PERFORMANCE UPDATE]:
-        Uses pre-allocation (np.empty) instead of np.stack to eliminate
-        double memory usage and CPU copy overhead during weight loading.
+        Optimized loader for MoE (Stable Version):
+        1. Pre-allocation (No np.stack)
+        2. Threaded I/O (High concurrency for GCS)
+        3. Standard assignment (Compatible with all safetensors versions)
         """
         # 1. Get base info from the first expert
         first_key = expected_hf_keys[0]
-        # assume len(infos) == 1 for standard MoE (checked by caller)
+        # assume len(infos) == 1 for standard MoE
         info = weight_info[first_key][0]
 
         single_expert_shape = info["shape"]
@@ -281,60 +281,61 @@ class WeightLoader:
         stacked_shape = (num_experts, *single_expert_shape)
         sharding = jax.sharding.NamedSharding(self.mesh, P())
 
+        # GCS 并发数，推荐 32
+        MAX_WORKERS = 32
+
         def _load_stacked_slice(index):
-            # index is tuple of slices: (expert_slice, row_slice, col_slice...)
             expert_slice = index[0]
             inner_slice = index[1:]
 
-            # We need to determine which experts to load based on the slice
-            # slice.indices gives (start, stop, step) adjusted for length
             start, stop, step = expert_slice.indices(num_experts)
-
-            # Create the iterator for expert indices
-            expert_indices = range(start, stop, step)
-
-            # Calculate how many experts are in this slice (dimension 0 size)
+            expert_indices = list(range(start, stop, step))
             sliced_num_experts = len(expert_indices)
 
             if sliced_num_experts == 0:
-                # Handle edge case where slice is empty
-                # We return a zero-sized array with appropriate dimensionality
-                # Note: The inner dims don't strictly matter if dim 0 is 0,
-                # but we try to respect the number of dimensions.
                 return np.zeros((0, *[1] * len(inner_slice)), dtype=np.float32)
 
-            # --- Optimization: Pre-allocate memory ---
-            idx_iter = iter(expert_indices)
-
-            # 1. Read the first expert to determine the exact output shape and dtype
-            try:
-                first_idx = next(idx_iter)
-            except StopIteration:
-                return np.zeros((0,), dtype=np.float32)
-
+            # --- Step 1: Pre-allocation ---
+            # 主线程先读第一个，确定 shape 和 dtype
+            first_idx = expert_indices[0]
             first_hf_key = expected_hf_keys[first_idx]
-            fname = weight_info[first_hf_key][0]["file"]
-            f = file_manager.get_handle(fname)
 
-            # Read the actual data slice
-            first_data = f.get_slice(first_hf_key)[inner_slice]
+            fname_first = weight_info[first_hf_key][0]["file"]
+            f_first = file_manager.get_handle(fname_first)
 
-            # 2. Allocate the full output array immediately
-            # We use first_data.dtype to ensure we match what safetensors returns (e.g. bfloat16 via ml_dtypes)
+            # 标准读取
+            first_data = f_first.get_slice(first_hf_key)[inner_slice]
+
+            # 预分配大内存
             out_shape = (sliced_num_experts, *first_data.shape)
             out_array = np.empty(out_shape, dtype=first_data.dtype)
 
-            # 3. Fill the first slot
+            # 填入第一个
             out_array[0] = first_data
 
-            # 4. Fill the rest of the slots directly
-            for i, expert_idx in enumerate(idx_iter, start=1):
+            # --- Step 2: Concurrent Loading ---
+            # 定义线程工作函数
+            def load_one_expert(args):
+                i, expert_idx = args
                 hf_key = expected_hf_keys[expert_idx]
                 fname = weight_info[hf_key][0]["file"]
+
                 f = file_manager.get_handle(fname)
 
-                # Direct assignment avoids creating a list and calling np.stack later
+                # [修改点]：使用标准赋值，不使用 read_into
+                # 虽然会产生一个临时对象，但马上被写入 out_array 并销毁
+                # 依然是并发读取，依然没有 np.stack 的巨大开销
                 out_array[i] = f.get_slice(hf_key)[inner_slice]
+
+            # 准备剩余的任务 (跳过第一个)
+            tasks = []
+            for i, expert_idx in enumerate(expert_indices[1:], start=1):
+                tasks.append((i, expert_idx))
+
+            if tasks:
+                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                    # 并发执行，等待所有完成
+                    list(executor.map(load_one_expert, tasks))
 
             return out_array
 
