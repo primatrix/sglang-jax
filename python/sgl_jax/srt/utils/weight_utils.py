@@ -254,8 +254,10 @@ class WeightLoader:
     ) -> jax.Array:
         """
         Optimized loader for MoE: Creates a SINGLE lazy array for the entire stack of experts.
-        This avoids creating thousands of small lazy arrays and greatly speeds up graph building.
-        Only supports standard MoE where each expert weight is not split across files (no concat_axis).
+
+        [PERFORMANCE UPDATE]:
+        Uses pre-allocation (np.empty) instead of np.stack to eliminate
+        double memory usage and CPU copy overhead during weight loading.
         """
         # 1. Get base info from the first expert
         first_key = expected_hf_keys[0]
@@ -288,32 +290,53 @@ class WeightLoader:
             # slice.indices gives (start, stop, step) adjusted for length
             start, stop, step = expert_slice.indices(num_experts)
 
-            # Calculate result shape for this chunk
-            # We rely on the fact that JAX calls this with a valid slice logic
+            # Create the iterator for expert indices
             expert_indices = range(start, stop, step)
 
-            # Determine the shape of the inner slice
-            # We can peek one file to see the output shape of get_slice,
-            # or calculate it manually. Let's do it one by one.
+            # Calculate how many experts are in this slice (dimension 0 size)
+            sliced_num_experts = len(expert_indices)
 
-            stacked_result = []
+            if sliced_num_experts == 0:
+                # Handle edge case where slice is empty
+                # We return a zero-sized array with appropriate dimensionality
+                # Note: The inner dims don't strictly matter if dim 0 is 0,
+                # but we try to respect the number of dimensions.
+                return np.zeros((0, *[1] * len(inner_slice)), dtype=np.float32)
 
-            for i in expert_indices:
-                hf_key = expected_hf_keys[i]
-                # We assume infos length is 1 (checked in caller)
+            # --- Optimization: Pre-allocate memory ---
+            idx_iter = iter(expert_indices)
+
+            # 1. Read the first expert to determine the exact output shape and dtype
+            try:
+                first_idx = next(idx_iter)
+            except StopIteration:
+                return np.zeros((0,), dtype=np.float32)
+
+            first_hf_key = expected_hf_keys[first_idx]
+            fname = weight_info[first_hf_key][0]["file"]
+            f = file_manager.get_handle(fname)
+
+            # Read the actual data slice
+            first_data = f.get_slice(first_hf_key)[inner_slice]
+
+            # 2. Allocate the full output array immediately
+            # We use first_data.dtype to ensure we match what safetensors returns (e.g. bfloat16 via ml_dtypes)
+            out_shape = (sliced_num_experts, *first_data.shape)
+            out_array = np.empty(out_shape, dtype=first_data.dtype)
+
+            # 3. Fill the first slot
+            out_array[0] = first_data
+
+            # 4. Fill the rest of the slots directly
+            for i, expert_idx in enumerate(idx_iter, start=1):
+                hf_key = expected_hf_keys[expert_idx]
                 fname = weight_info[hf_key][0]["file"]
                 f = file_manager.get_handle(fname)
 
-                # Read just the requested part of this expert
-                data = f.get_slice(hf_key)[inner_slice]
-                stacked_result.append(data)
+                # Direct assignment avoids creating a list and calling np.stack later
+                out_array[i] = f.get_slice(hf_key)[inner_slice]
 
-            if not stacked_result:
-                return np.zeros(
-                    (0, *[s.stop - s.start for s in inner_slice]), dtype=np.float32
-                )  # fallback
-
-            return np.stack(stacked_result, axis=0)
+            return out_array
 
         return jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice).astype(
             target_dtype
