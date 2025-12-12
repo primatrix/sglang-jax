@@ -515,9 +515,9 @@ class EagleDraftInput:
         logits_metadata = LogitsMetadata.from_model_worker_batch(
             model_worker_batch, draft_model_runner.mesh
         )
-        model_worker_batch.padding_model_worker_batch(
-            precompile_token_paddings, precompile_bs_paddings, precompile_cache_loc_paddings
-        )
+        # model_worker_batch.padding_model_worker_batch(
+        #     precompile_token_paddings, precompile_bs_paddings, precompile_cache_loc_paddings
+        # )
         hidden_states = model_worker_batch.spec_info.hidden_states
         if (
             hidden_states is not None
@@ -584,7 +584,7 @@ class EagleDraftInput:
         # model_worker_batch.out_cache_loc = out_cache_loc
         model_worker_batch.seq_lens_sum = np.sum(model_worker_batch.seq_lens)
         model_worker_batch.return_hidden_states = False
-        model_worker_batch.spec_info.positions = np.repeat(model_worker_batch.seq_lens, topk)
+        # model_worker_batch.spec_info.positions = np.repeat(model_worker_batch.seq_lens, topk)
 
     @classmethod
     def create_idle_input(
