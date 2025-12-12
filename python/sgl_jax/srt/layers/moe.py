@@ -174,7 +174,7 @@ class TopK(nnx.Module):
 class EPMoE(nnx.Module):
     def __init__(
         self,
-        config,
+        hidden_size: int,
         num_experts: int,
         num_experts_per_tok: int,
         ep_size: int,
@@ -185,7 +185,6 @@ class EPMoE(nnx.Module):
         activation: str = "silu",
         layer_id: int = 0,
     ):
-        self.config = config
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.intermediate_dim = intermediate_dim
@@ -196,6 +195,7 @@ class EPMoE(nnx.Module):
         self.original_mesh = mesh
         self.mesh = mesh
         self.activation = activation
+        self.hidden_size = hidden_size
         if num_experts % self.ep_size != 0:
             raise ValueError(
                 f"num_experts({num_experts}) must be divisible by ep_size ({self.ep_size})"
@@ -220,7 +220,7 @@ class EPMoE(nnx.Module):
             self.wi_0 = nnx.Param(
                 jax.random.normal(
                     jax.random.PRNGKey(0),
-                    (num_experts, config.hidden_size, intermediate_dim),
+                    (num_experts, self.hidden_size, intermediate_dim),
                     dtype=weight_dtype,
                     out_sharding=P("expert", None, "tensor"),
                 )
@@ -229,7 +229,7 @@ class EPMoE(nnx.Module):
             self.wi_1 = nnx.Param(
                 jax.random.normal(
                     jax.random.PRNGKey(0),
-                    (num_experts, config.hidden_size, intermediate_dim),
+                    (num_experts, self.hidden_size, intermediate_dim),
                     dtype=weight_dtype,
                     out_sharding=P("expert", None, "tensor"),
                 )
@@ -238,7 +238,7 @@ class EPMoE(nnx.Module):
             self.wo = nnx.Param(
                 jax.random.normal(
                     jax.random.PRNGKey(0),
-                    (num_experts, intermediate_dim, config.hidden_size),
+                    (num_experts, intermediate_dim, self.hidden_size),
                     dtype=weight_dtype,
                     out_sharding=P("expert", "tensor", None),
                 )

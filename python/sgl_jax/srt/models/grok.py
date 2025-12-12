@@ -260,7 +260,7 @@ class Grok1MoE(nnx.Module):
             )
         else:
             self.experts = EPMoE(
-                config=config,
+                hidden_size=config.hidden_size,
                 num_experts=num_experts,
                 num_experts_per_tok=self.top_k,
                 intermediate_dim=intermediate_size,
