@@ -287,7 +287,7 @@ class BailingMoEDecoderLayer(nnx.Module):
                     routed_scaling_factor=config.routed_scaling_factor,
                 )
                 self.mlp = EPMoE(
-                    config=config,
+                    hidden_size=config.hidden_size,
                     num_experts=config.num_experts,
                     num_experts_per_tok=config.num_experts_per_tok,
                     intermediate_dim=config.moe_intermediate_size,
