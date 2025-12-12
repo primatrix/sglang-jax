@@ -275,7 +275,21 @@ class EAGLEWorker(ModelWorker):
         draft_input.topk_index = topk_index
         draft_input.hidden_states = logits_output.hidden_states
 
+    def get_padding_bs(self, real_bs: int) -> int:
+        self.precompile_bs_paddings = self.precompile_bs_paddings.sort()
+        select_bs_index = -1
+        bs_padding_size = 0
+        for i, size in enumerate(self.precompile_bs_paddings):
+            if size >= real_bs:
+                bs_padding_size = size - real_bs
+                select_bs_index = i
+                break
+        if select_bs_index < 0:
+            raise RuntimeError("did not get comperate padding bs, it should not happened")
+        return bs_padding_size, select_bs_index
+
     def draft(self, model_worker_batch: ModelWorkerBatch):
+        padding_bs_size, padding_bs_index = self.get_padding_bs(model_worker_batch.real_bs)
         spec_info = model_worker_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
         spec_info.prepare_for_draft_decode(
@@ -283,6 +297,7 @@ class EAGLEWorker(ModelWorker):
         )
         # Run forward steps
         score_list, token_list, parents_list = self.draft_forward(model_worker_batch)
+        # FIXME(pc) this place will cost 20+ms because of large model_worker_batch.seq_lens.shape[0], we should optim this
         (
             tree_mask,
             position,
@@ -327,11 +342,13 @@ class EAGLEWorker(ModelWorker):
         spec_info: EagleVerifyInput = model_worker_batch.spec_info
         spec_info.allocate_lens = cur_allocate_lens
         spec_info.prepare_for_verify(model_worker_batch, self.page_size, self.target_worker)
-        model_worker_batch.padding_model_worker_batch(
-            self.precompile_token_paddings,
-            self.precompile_bs_paddings,
-            self.precompile_cache_loc_paddings,
-        )
+        # this padding will cost 20+ms
+        # verify will forward bs*num_draft_tokens
+        # model_worker_batch.padding_model_worker_batch(
+        #     self.precompile_token_paddings,
+        #     self.precompile_bs_paddings,
+        #     self.precompile_cache_loc_paddings,
+        # )
         forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
