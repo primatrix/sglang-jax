@@ -1112,45 +1112,19 @@ def _fused_ep_moe_kernel(
     ### ------- Kernel end ------- ###
 
 
-@functools.partial(
-    jax.jit,
-    static_argnames=[
-        "mesh",
-        "top_k",
-        "renormalize_topk_logits",
-        "act_fn",
-        "subc_quant_wsz",
-        "bt",
-        "bf",
-        "bd1",
-        "bd2",
-        "btc",
-        "bfc",
-        "bd1c",
-        "bd2c",
-        "ep_axis_name",
-    ],
-)
-def fused_ep_moe(
-    mesh: jax.sharding.Mesh,
-    tokens: jax.Array,  # (num_tokens, hidden_size)
-    w1: jax.Array,  # (num_experts, 2, hidden_size, intermediate_size)
-    w2: jax.Array,  # (num_experts, intermediate_size, hidden_size)
-    gating_output: jax.Array,  # (num_tokens, num_experts)
-    top_k: int,
+def _validate_fused_ep_moe_args(
     *,
-    renormalize_topk_logits: bool = False,
-    act_fn: str = "silu",
-    subc_quant_wsz: int | None = None,
-    w1_scale: (
-        jax.Array | None
-    ) = None,  # F32(num_experts, 2, hidden_size // subc_quant_wsz, 1, intermediate_size)
-    w2_scale: (
-        jax.Array | None
-    ) = None,  # F32(num_experts, intermediate_size // subc_quant_wsz, 1, hidden_size)
-    b1: jax.Array | None = None,  # F32(num_experts, 2, 1, intermediate_size)
-    b2: jax.Array | None = None,  # F32(num_experts, 1, hidden_size)
-    # Kernel tuning parameters.
+    mesh: jax.sharding.Mesh,
+    tokens: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    gating_output: jax.Array,
+    top_k: int,
+    subc_quant_wsz: int | None,
+    w1_scale: jax.Array | None,
+    w2_scale: jax.Array | None,
+    b1: jax.Array | None,
+    b2: jax.Array | None,
     bt: int,
     bf: int,
     bd1: int,
@@ -1159,9 +1133,8 @@ def fused_ep_moe(
     bfc: int,
     bd1c: int,
     bd2c: int,
-    ep_axis_name: str = "tensor",
-):
-    # TODO(jevinjiang): move all these assertions to validation function.
+    ep_axis_name: str,
+) -> None:
     if len(mesh.shape) != 2:
         raise NotImplementedError("Only 2D mesh is supported.")
 
@@ -1204,9 +1177,6 @@ def fused_ep_moe(
         raise ValueError(f"Expected {num_experts=} to be aligned to {ep_size=}.")
 
     local_num_tokens = num_tokens // ep_size
-    # local_num_experts = num_experts // ep_size
-    padded_num_experts = align_to(num_experts, 128)
-    padded_top_k = align_to(top_k, 128)
     t_dtype = tokens.dtype
     t_packing = get_dtype_packing(t_dtype)
 
@@ -1295,8 +1265,116 @@ def fused_ep_moe(
         expected_b2_shape = (num_experts, 1, hidden_size)
         if b2.shape != expected_b2_shape:
             raise ValueError(f"Expected {b2.shape=} to be {expected_b2_shape}.")
-        if b2.dtype != jnp.float32:
-            b2 = b2.astype(jnp.float32)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=[
+        "mesh",
+        "top_k",
+        "renormalize_topk_logits",
+        "act_fn",
+        "subc_quant_wsz",
+        "bt",
+        "bf",
+        "bd1",
+        "bd2",
+        "btc",
+        "bfc",
+        "bd1c",
+        "bd2c",
+        "ep_axis_name",
+    ],
+)
+def fused_ep_moe(
+    mesh: jax.sharding.Mesh,
+    tokens: jax.Array,  # (num_tokens, hidden_size)
+    w1: jax.Array,  # (num_experts, 2, hidden_size, intermediate_size)
+    w2: jax.Array,  # (num_experts, intermediate_size, hidden_size)
+    gating_output: jax.Array,  # (num_tokens, num_experts)
+    top_k: int,
+    *,
+    renormalize_topk_logits: bool = False,
+    act_fn: str = "silu",
+    subc_quant_wsz: int | None = None,
+    w1_scale: (
+        jax.Array | None
+    ) = None,  # F32(num_experts, 2, hidden_size // subc_quant_wsz, 1, intermediate_size)
+    w2_scale: (
+        jax.Array | None
+    ) = None,  # F32(num_experts, intermediate_size // subc_quant_wsz, 1, hidden_size)
+    b1: jax.Array | None = None,  # F32(num_experts, 2, 1, intermediate_size)
+    b2: jax.Array | None = None,  # F32(num_experts, 1, hidden_size)
+    # Kernel tuning parameters.
+    bt: int,
+    bf: int,
+    bd1: int,
+    bd2: int,
+    btc: int,
+    bfc: int,
+    bd1c: int,
+    bd2c: int,
+    ep_axis_name: str = "tensor",
+):
+    _validate_fused_ep_moe_args(
+        mesh=mesh,
+        tokens=tokens,
+        w1=w1,
+        w2=w2,
+        gating_output=gating_output,
+        top_k=top_k,
+        subc_quant_wsz=subc_quant_wsz,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        b1=b1,
+        b2=b2,
+        bt=bt,
+        bf=bf,
+        bd1=bd1,
+        bd2=bd2,
+        btc=btc,
+        bfc=bfc,
+        bd1c=bd1c,
+        bd2c=bd2c,
+        ep_axis_name=ep_axis_name,
+    )
+
+    ep_size = mesh.shape[ep_axis_name]
+    num_devices = ep_size
+
+    num_tokens, hidden_size = tokens.shape
+    num_experts, intermediate_size, _ = w2.shape
+
+    local_num_tokens = num_tokens // ep_size
+    padded_num_experts = align_to(num_experts, 128)
+    padded_top_k = align_to(top_k, 128)
+    t_dtype = tokens.dtype
+    t_packing = get_dtype_packing(t_dtype)
+
+    # Override bt
+    if local_num_tokens <= t_packing * 8:
+        bt = local_num_tokens
+        btc = bt
+    bt = min(local_num_tokens, bt)
+    # The worst case is that all devices send bt to one device.
+    btc = min(bt, btc, bt * num_devices)
+
+    if subc_quant_wsz is not None:
+        # We force compute size of contracting dim to be subc_quant_wsz. So we can
+        # apply same scale after matmul and accumulation.
+        bd1c = subc_quant_wsz * t_packing
+        bfc = subc_quant_wsz
+
+    # Note: we should dump scale as the kernel expected shape in the
+    # checkpoint offline or reshape right after weight loading.
+    if w1_scale is not None and w1_scale.dtype != jnp.float32:
+        w1_scale = w1_scale.astype(jnp.float32)
+    if w2_scale is not None and w2_scale.dtype != jnp.float32:
+        w2_scale = w2_scale.astype(jnp.float32)
+    if b1 is not None and b1.dtype != jnp.float32:
+        b1 = b1.astype(jnp.float32)
+    if b2 is not None and b2.dtype != jnp.float32:
+        b2 = b2.astype(jnp.float32)
 
     # Prepare inputs for the kernel.
     if padded_num_experts != gating_output.shape[-1]:

@@ -241,7 +241,7 @@ class Qwen2MoeDecoderLayer(nnx.Module):
                 renormalize=getattr(config, "norm_topk_prob", True),
             )
             self.mlp = EPMoE(
-                config=config,
+                hidden_size=config.hidden_size,
                 num_experts=num_experts,
                 num_experts_per_tok=num_experts_per_tok,
                 intermediate_dim=moe_intermediate_size,

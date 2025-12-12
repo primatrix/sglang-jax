@@ -212,7 +212,6 @@ class FusedEPMoE(nnx.Module):
             b1=None,
             b2=None,
             ep_axis_name="tensor",
-            # tp_axis_name="data",
         )
 
         final_output = jax.sharding.reshard(output, P(None))
