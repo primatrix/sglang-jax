@@ -785,8 +785,6 @@ class EagleVerifyInput:
         self,
         model_worker_batch: ModelWorkerBatch,
         logits_output: LogitsProcessorOutput,
-        # token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-        # page_size: int,
         rng: nnx.Rngs,
         mesh: Mesh,
         # vocab_mask: jax.Array | None = None,  # For grammar

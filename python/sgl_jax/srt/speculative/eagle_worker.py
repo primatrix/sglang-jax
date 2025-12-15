@@ -119,10 +119,8 @@ class EAGLEWorker(ModelWorker):
         model_worker_batch: ModelWorkerBatch,
     ):
         if model_worker_batch.forward_mode.is_extend():
-            model_worker_batch.padding_model_worker_batch(
-                self.precompile_token_paddings,
-                self.precompile_bs_paddings,
-                self.precompile_cache_loc_paddings,
+            model_worker_batch.sampling_info.temperatures = (
+                model_worker_batch.sampling_info.temperatures[:, None]
             )
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
                 model_worker_batch,
@@ -213,7 +211,13 @@ class EAGLEWorker(ModelWorker):
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
-        logits_output.truncate_logits_processor_output(model_worker_batch)
+        print(f"{logits_output.next_token_logits.shape=}")
+        logits_output.next_token_logits = logits_output.next_token_logits[
+            : model_worker_batch.real_bs, :
+        ]
+        print(f"{logits_output.next_token_logits.shape=}")
+        if len(logits_output.hidden_states.shape) == 1:
+            logits_output.hidden_states = jnp.expand_dims(logits_output.hidden_states, axis=0)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         forward_batch.spec_info.allocate_lens = model_worker_batch.seq_lens[
             : model_worker_batch.real_bs
@@ -288,7 +292,7 @@ class EAGLEWorker(ModelWorker):
             raise RuntimeError("did not get comperate padding bs, it should not happened")
         return bs_padding_size, select_bs_index
 
-    def padding_model_worker_batch_for_eagle(self, model_worker_batch: ModelWorkerBatch):
+    def padding_for_decode(self, model_worker_batch: ModelWorkerBatch):
         _, padding_bs_index = self.get_padding_bs(model_worker_batch.real_bs)
         self.copy_model_worker_batch_to_cpu(model_worker_batch)
         spec_info = model_worker_batch.spec_info
@@ -362,8 +366,7 @@ class EAGLEWorker(ModelWorker):
         model_worker_batch.spec_info = spec_info
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
-        self.padding_model_worker_batch_for_eagle(model_worker_batch)
-        print(f"{model_worker_batch=}")
+        self.padding_for_decode(model_worker_batch)
         # Run forward steps
         score_list, token_list, parents_list = self.draft_forward(model_worker_batch)
         # FIXME(pc) this place will cost 20+ms because of large model_worker_batch.seq_lens.shape[0], we should optim this
@@ -388,12 +391,6 @@ class EAGLEWorker(ModelWorker):
             model_worker_batch.speculative_num_steps,
             self.mesh,
         )
-        print(f"{tree_mask.shape=}")
-        print(f"{position.shape=}")
-        print(f"{retrive_index.shape=}")
-        print(f"{retrive_next_token.shape=}")
-        print(f"{retrive_next_sibling.shape=}")
-        print(f"{draft_tokens.shape=}")
         # build tree
         model_worker_batch.spec_info = EagleVerifyInput(
             draft_token=draft_tokens,
@@ -441,8 +438,6 @@ class EAGLEWorker(ModelWorker):
         ) = spec_info.sample(
             model_worker_batch,
             logits_output,
-            # self.token_to_kv_pool_allocator,
-            # self.page_size,
             self.model_runner.rngs,
             self.mesh,
         )
@@ -641,6 +636,7 @@ class EAGLEWorker(ModelWorker):
             )
             if i == self.speculative_num_steps - 1:
                 break
+
             forward_batch = update_forward_batch_info(
                 forward_batch, i, input_ids, hidden_states, positions_base
             )
@@ -655,7 +651,6 @@ class EAGLEWorker(ModelWorker):
             if self.hot_token_ids is not None:
                 topk_index = self.hot_token_ids[topk_index]
             hidden_states = logits_output.hidden_states
-            print(f"{hidden_states.shape=}")
 
         return score_list, token_list, parents_list
 

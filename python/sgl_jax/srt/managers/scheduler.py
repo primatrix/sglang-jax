@@ -1195,12 +1195,11 @@ class Scheduler(
                 precompile_bs_paddings,
                 precompile_cache_loc_paddings,
             ) = self.draft_worker.get_precompile_paddings()
-            model_worker_batch = batch.get_model_worker_batch(
+            model_worker_batch = batch.get_spec_model_worker_batch(
                 precompile_token_paddings,
                 precompile_bs_paddings,
                 precompile_cache_loc_paddings,
                 self.page_size,
-                # eagle's model_worker_batch will be modified and repadding within eagle_worker
                 skip_padding=True,
             )
             batch_output = self.draft_worker.forward_batch_speculative_generation(
