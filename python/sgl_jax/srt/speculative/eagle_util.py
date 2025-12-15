@@ -482,16 +482,10 @@ class EagleDraftInput:
     def prepare_for_extend_after_verify(
         self,
         model_worker_batch: ModelWorkerBatch,
-        predict: np.ndarray,
-        num_draft_tokens: int,
         draft_model_runner: Any,
         batch_output: GenerationBatchResult,
         precompile_token_paddings,
-        precompile_bs_paddings,
-        precompile_cache_loc_paddings,
     ):
-        # seq_lens_cpu_ = model_worker_batch.seq_lens
-
         model_worker_batch.spec_info = self
         verified_id = batch_output.next_draft_input.verified_id
         verified_id = verified_id[verified_id != 0].flatten()
@@ -506,6 +500,41 @@ class EagleDraftInput:
         model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
         model_worker_batch.spec_info.hidden_states = batch_output.next_draft_input.hidden_states
+        precompile_token_paddings.sort()
+        token_padding_size = 0
+        for size in precompile_token_paddings:
+            if size >= model_worker_batch.input_ids.shape[0]:
+                token_padding_size = size
+                break
+
+        if token_padding_size >= model_worker_batch.spec_info.hidden_states.shape[0]:
+            model_worker_batch.spec_info.hidden_states = np.pad(
+                model_worker_batch.spec_info.hidden_states,
+                (
+                    (0, token_padding_size - model_worker_batch.spec_info.hidden_states.shape[0]),
+                    (0, 0),
+                ),
+            )
+        if token_padding_size >= model_worker_batch.input_ids.shape[0]:
+            model_worker_batch.input_ids = np.pad(
+                model_worker_batch.input_ids,
+                (0, token_padding_size - model_worker_batch.input_ids.shape[0]),
+            )
+        if token_padding_size >= model_worker_batch.positions.shape[0]:
+            model_worker_batch.positions = np.pad(
+                model_worker_batch.positions,
+                (0, token_padding_size - model_worker_batch.positions.shape[0]),
+            )
+        if token_padding_size >= model_worker_batch.seq_lens.shape[0]:
+            model_worker_batch.seq_lens = np.pad(
+                model_worker_batch.seq_lens,
+                (0, token_padding_size - model_worker_batch.seq_lens.shape[0]),
+            )
+        if token_padding_size >= model_worker_batch.extend_seq_lens.shape[0]:
+            model_worker_batch.extend_seq_lens = np.pad(
+                model_worker_batch.extend_seq_lens,
+                (0, token_padding_size - model_worker_batch.extend_seq_lens.shape[0]),
+            )
         forward_metadata = draft_model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
@@ -515,20 +544,8 @@ class EagleDraftInput:
         logits_metadata = LogitsMetadata.from_model_worker_batch(
             model_worker_batch, draft_model_runner.mesh
         )
-        # model_worker_batch.padding_model_worker_batch(
-        #     precompile_token_paddings, precompile_bs_paddings, precompile_cache_loc_paddings
-        # )
-        hidden_states = model_worker_batch.spec_info.hidden_states
-        if (
-            hidden_states is not None
-            and hidden_states.shape[0] < model_worker_batch.input_ids.shape[0]
-        ):
-            pad_len = model_worker_batch.input_ids.shape[0] - hidden_states.shape[0]
-            pad_shape = (pad_len,) + hidden_states.shape[1:]
-            pad_values = np.zeros(pad_shape, dtype=hidden_states.dtype)
-            model_worker_batch.spec_info.hidden_states = jnp.concatenate(
-                [model_worker_batch.spec_info.hidden_states, pad_values], axis=0
-            )
+        print(f"{model_worker_batch=}")
+        print(f"{forward_metadata=}")
 
         return model_worker_batch, logits_metadata
 
