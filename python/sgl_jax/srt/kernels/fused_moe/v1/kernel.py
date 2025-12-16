@@ -351,11 +351,11 @@ def _fused_ep_moe_kernel(
         ).wait()
 
     def get_top_k(gating_logits, top_k, renormalize_topk_logits):
-        # NOTE: Input must be Raw Logits, not Probabilities.
+        # NOTE: Input must be Raw Logits (BF16), not Probabilities.
         assert len(gating_logits.shape) == 2, gating_logits.shape
 
         # 🟢 [Track A: Routing] FP32
-        # 用于 Argmax 和 Bias 加法，保证索引计算正确且不报错
+        # 用于 Argmax 和 Bias 加法，保证索引计算正确
         gating_logits_f32 = gating_logits.astype(jnp.float32)
 
         if bias_hbm is not None:
@@ -367,8 +367,8 @@ def _fused_ep_moe_kernel(
         else:
             scores_for_choice = gating_logits_f32
 
-        # 🟢 [Track B: Value] BF16 (保持原样)
-        # 这里的 -inf 必须是 BF16，否则 jnp.where 会把 gating_logits 提升为 FP32
+        # 🟢 [Track B: Value] BF16
+        # 这里的 -inf 必须是 BF16，防止 jnp.where 意外提升精度
         neg_inf_bf16 = jnp.array(-jnp.inf, dtype=gating_logits.dtype)
 
         # === Grouped TopK Logic (基于 FP32 Scores 计算 Mask) ===
@@ -407,7 +407,9 @@ def _fused_ep_moe_kernel(
         final_selection_scores = jnp.where(valid_mask, scores_for_choice, -jnp.inf)
 
         padded_k_shape = (gating_logits.shape[0], padded_top_k)
-        top_k_logits_lst = []
+
+        # 🟢 [重要修正] 这里不再存储广播后的 (BT, K) 数组，而是存储 (BT, 1) 的标量权重
+        raw_weights_lst = []
         top_k_indices_lst = []
 
         t2e = jnp.zeros(gating_logits.shape, dtype=jnp.int32)
@@ -427,13 +429,12 @@ def _fused_ep_moe_kernel(
             # 2. 取值：严防死守 BF16
             mask = iota == broadcast_minor(top_k_indices, gating_logits.shape)
 
-            # 🟢 [修复核心] 使用 neg_inf_bf16
-            # 这样 jnp.where 返回 BF16，jnp.max 返回 BF16
+            # 使用 neg_inf_bf16 确保返回 BF16
             selected_weight = jnp.max(
                 jnp.where(mask, gating_logits, neg_inf_bf16), axis=1, keepdims=True
             )
-            top_k_logits = jnp.broadcast_to(selected_weight, padded_k_shape)  # dtype=BF16
-            top_k_logits_lst.append(top_k_logits)
+            # 🟢 [修正] 保持 (BT, 1)，不要广播到 padded_k_shape!
+            raw_weights_lst.append(selected_weight)
 
             t2e_routing = jnp.where(padded_k_iota == k_id, top_k_indices, t2e_routing)
             t2e += mask.astype(jnp.int32)
@@ -441,28 +442,29 @@ def _fused_ep_moe_kernel(
             if k_id != top_k - 1:
                 final_selection_scores = jnp.where(mask, -jnp.inf, final_selection_scores)
 
-        # 后处理
+        # === 后处理：Stack -> Softmax -> Unstack ===
+        # 将 list of (BT, 1) 堆叠成 (BT, K)
+        stacked_logits = jnp.concatenate(raw_weights_lst, axis=1)  # (BT, K)
+
         if renormalize_topk_logits:
-            # 归一化必须高精度，转 FP32
-            max_logits = top_k_logits_lst[0].astype(jnp.float32)
-            for k_id in range(1, top_k):
-                max_logits = jnp.maximum(max_logits, top_k_logits_lst[k_id].astype(jnp.float32))
-
-            top_k_exp_sum = jnp.zeros(padded_k_shape, jnp.float32)
-            for k_id in range(top_k):
-                val_f32 = top_k_logits_lst[k_id].astype(jnp.float32)
-                exp_val = jnp.exp(val_f32 - max_logits)
-                top_k_logits_lst[k_id] = exp_val
-                top_k_exp_sum += exp_val
-
-            top_k_exp_sum = top_k_exp_sum + 1e-6
-            for k_id in range(top_k):
-                top_k_logits_lst[k_id] /= top_k_exp_sum
+            # 🟢 使用标准 jax.nn.softmax，解决一切疑难杂症
+            # 注意：softmax 需要 FP32 输入以保证精度
+            stacked_probs = jax.nn.softmax(stacked_logits.astype(jnp.float32), axis=-1)
+            # 转回 BF16 还是保持 FP32？
+            # 为了 bt_acc 的稳定性，我们这里让它保持 FP32 精度进入列表
+            # 这样 bt_acc 里 (acc * prob) 会自动变成 (BF16 * FP32) -> FP32，精度更好
+            final_weights_tensor = stacked_probs
+        else:
+            # Raw Logits 模式：保持 BF16
+            final_weights_tensor = stacked_logits
 
         # Scaling
         if routed_scaling_factor is not None:
-            for k_id in range(top_k):
-                top_k_logits_lst[k_id] *= routed_scaling_factor
+            final_weights_tensor *= routed_scaling_factor
+
+        # 拆回 List 给 bt_acc 使用
+        # split 出来是 list of (BT, 1)
+        top_k_logits_lst = [final_weights_tensor[:, i : i + 1] for i in range(top_k)]
 
         expert_sizes = jnp.sum(t2e, axis=0, keepdims=True)
         expert_starts = jnp.zeros_like(expert_sizes)
@@ -1123,15 +1125,26 @@ def _fused_ep_moe_kernel(
             dst_ref=a2a_g_acc_vmem,
             sem=a2a_acc_sem,
         ).wait()
+
         output = None
         for k_id in range(top_k):
+            # Expert Output (BF16)
             acc = a2a_g_acc_vmem[k_id].reshape(bt, hidden_size)
+            # Weight (BF16 for Raw Logits, FP32 for Softmax)
             logits = broadcast_minor(top_k_logits_lst[k_id], acc.shape)
-            val = (acc * logits).astype(jnp.float32)
+
+            # 🟢 [核心逻辑]
+            # 1. (acc * logits):
+            #    - 如果是 Raw Logits: BF16 * BF16 -> BF16 (截断，匹配 Ref)
+            #    - 如果是 Softmax: BF16 * FP32 -> FP32 (高精度)
+            # 2. .astype(float32): 提升到 FP32 进行累加 (匹配 Ref 的 sum 行为)
+            term = (acc * logits).astype(jnp.float32)
+
             if output is None:
-                output = val
+                output = term
             else:
-                output += val
+                output += term
+
         assert output is not None
         return output.astype(output_hbm.dtype)
 
