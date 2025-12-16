@@ -211,11 +211,9 @@ class EAGLEWorker(ModelWorker):
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
-        print(f"{logits_output.next_token_logits.shape=}")
         logits_output.next_token_logits = logits_output.next_token_logits[
             : model_worker_batch.real_bs, :
         ]
-        print(f"{logits_output.next_token_logits.shape=}")
         if len(logits_output.hidden_states.shape) == 1:
             logits_output.hidden_states = jnp.expand_dims(logits_output.hidden_states, axis=0)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
@@ -451,7 +449,6 @@ class EAGLEWorker(ModelWorker):
             allocate_lens=cur_allocate_lens,
             hidden_states=logits_output.hidden_states,
         )
-        print(f"{next_draft_input.hidden_states.shape=}")
         model_worker_batch.spec_info = next_draft_input
         return GenerationBatchResult(
             logits_output=logits_output,
@@ -550,14 +547,12 @@ class EAGLEWorker(ModelWorker):
             hidden_states=batch_output.logits_output.hidden_states,
             allocate_lens=batch_output.allocate_lens,
         )
-        print(f"{draft_input.hidden_states.shape=}")
         model_worker_batch, logits_meatadata = draft_input.prepare_for_extend_after_verify(
             model_worker_batch,
             self.draft_model_runner,
             batch_output,
             self.precompile_token_paddings,
         )
-        print(f"{model_worker_batch.spec_info.hidden_states.shape=}")
 
         self.copy_model_worker_batch_to_cpu(model_worker_batch)
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
@@ -567,8 +562,6 @@ class EAGLEWorker(ModelWorker):
             forward_batch,
             logits_metadata=logits_meatadata,
         )
-        print(f"{draft_logits_output.next_token_logits.shape=}")
-        print(f"{draft_logits_output.hidden_states.shape=}")
 
         self.capture_for_decode(draft_logits_output, forward_batch.spec_info)
         select_index = (
@@ -645,7 +638,6 @@ class EAGLEWorker(ModelWorker):
             self.draft_model_runner.attn_backend.forward_metadata = metadata_per_step[i]
             # Run forward
             forward_batch.bid = model_worker_batch.bid
-            print(f"{forward_batch.spec_info.hidden_states.shape=}")
             logits_output, _ = self.draft_model_runner.forward(
                 forward_batch,
                 logits_metadata=logits_metadata,
@@ -654,7 +646,6 @@ class EAGLEWorker(ModelWorker):
             if self.hot_token_ids is not None:
                 topk_index = self.hot_token_ids[topk_index]
             hidden_states = logits_output.hidden_states
-            print(f"{hidden_states.shape=}")
 
         return score_list, token_list, parents_list
 

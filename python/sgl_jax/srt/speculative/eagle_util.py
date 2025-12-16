@@ -544,8 +544,6 @@ class EagleDraftInput:
         logits_metadata = LogitsMetadata.from_model_worker_batch(
             model_worker_batch, draft_model_runner.mesh
         )
-        print(f"{model_worker_batch=}")
-        print(f"{forward_metadata=}")
 
         return model_worker_batch, logits_metadata
 
