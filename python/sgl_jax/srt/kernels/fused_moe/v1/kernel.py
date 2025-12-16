@@ -1768,6 +1768,7 @@ def fused_ep_moe(
         b2,
         gating_output,
         a2a_g_hbm_scratch,
+        correction_bias,
     ):
         return fused_moe(
             pltpu.with_memory_space_constraint(tokens, pltpu.HBM),  # tokens_hbm
