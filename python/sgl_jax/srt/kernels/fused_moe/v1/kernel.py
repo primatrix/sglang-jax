@@ -346,7 +346,9 @@ def _fused_ep_moe_kernel(
 
             for _ in range(top_k_group):
                 # Find the index of the current best group
-                best_g_idx = jnp.argmax(curr_group_scores, axis=1, keepdims=True)
+                best_g_idx = jnp.argmax(
+                    curr_group_scores.astype(jnp.float32), axis=1, keepdims=True
+                )
                 # Generate the mask for this iteration (broadcast to match group_scores dimensions for comparison)
                 best_g_mask_iter = iota_groups == broadcast_minor(best_g_idx, group_scores.shape)
                 # Update the overall mask
@@ -379,7 +381,11 @@ def _fused_ep_moe_kernel(
         for k_id in range(top_k):
             # determines “who to select” (Argmax)
             top_k_indices = jnp.broadcast_to(
-                jnp.argmax(final_selection_scores[:, :num_experts], axis=1, keepdims=True),
+                jnp.argmax(
+                    final_selection_scores[:, :num_experts].astype(jnp.float32),
+                    axis=1,
+                    keepdims=True,
+                ),
                 padded_k_shape,
             )
             top_k_indices_lst.append(top_k_indices)
