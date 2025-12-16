@@ -1135,11 +1135,13 @@ def _fused_ep_moe_kernel(
         for k_id in range(top_k):
             # Expert Output (BF16)
             acc = a2a_g_acc_vmem[k_id].reshape(bt, hidden_size)
-            # Weight (BF16 if raw logits, FP32 if softmaxed)
+            # Weight (BF16 if raw logits)
             logits = broadcast_minor(top_k_logits_lst[k_id], acc.shape)
 
-            # 🟢 [修复] 强制转换为 FP32 进行乘法和累加，避免 BF16 下的大数值精度丢失
-            term = acc.astype(jnp.float32) * logits.astype(jnp.float32)
+            # 🟢 [修复核心]
+            # 1. 先做 (acc * logits)：这是 BF16 * BF16 -> BF16。复刻 Ref 的乘法截断。
+            # 2. 再 .astype(f32)：提升到 FP32 进行累加。复刻 Ref 的 Sum Reduction 精度。
+            term = (acc * logits).astype(jnp.float32)
 
             if output is None:
                 output = term
