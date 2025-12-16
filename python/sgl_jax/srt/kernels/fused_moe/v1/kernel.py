@@ -66,7 +66,7 @@ def ref_moe(
     top_k: int,
     *,
     renormalize_topk_logits: bool = False,
-    activation="silu",
+    act_fn="silu",
     subc_quant_wsz: int | None = None,
     w1_scale: (
         jax.Array | None
@@ -190,7 +190,7 @@ def ref_moe(
                 gmm1_w3_proj += b1[expert_id : expert_id + 1, 1]
 
             # Apply gated activation: activation(gate) * up
-            act = activation_fn(gmm1_w1_proj, gmm1_w3_proj, activation)
+            act = activation_fn(gmm1_w1_proj, gmm1_w3_proj, act_fn)
 
             # Second linear layer (down projection)
             gmm_2_out = act @ expert_weight_2  # [1, d_model]
