@@ -356,6 +356,7 @@ def _fused_ep_moe_kernel(
         # probabilities ($Prob + Bias$) is mathematically invalid.
         # Renormalization (Softmax) is deferred until after TopK selection.
         assert len(gating_logits.shape) == 2, gating_logits.shape
+        gating_logits = gating_logits.astype(jnp.float32)
         if bias_hbm is not None:
             bias_broadcast = jnp.broadcast_to(b_bias_vmem[None, :], gating_logits.shape)
             scores_for_choice = gating_logits + bias_broadcast
