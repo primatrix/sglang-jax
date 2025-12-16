@@ -1130,16 +1130,24 @@ def _fused_ep_moe_kernel(
             dst_ref=a2a_g_acc_vmem,
             sem=a2a_acc_sem,
         ).wait()
+
         output = None
         for k_id in range(top_k):
+            # Expert Output (BF16)
             acc = a2a_g_acc_vmem[k_id].reshape(bt, hidden_size)
+            # Weight (BF16 if raw logits, FP32 if softmaxed)
             logits = broadcast_minor(top_k_logits_lst[k_id], acc.shape)
-            acc *= logits
+
+            # 🟢 [修复] 强制转换为 FP32 进行乘法和累加，避免 BF16 下的大数值精度丢失
+            term = acc.astype(jnp.float32) * logits.astype(jnp.float32)
+
             if output is None:
-                output = acc
+                output = term
             else:
-                output += acc
+                output += term
+
         assert output is not None
+        # 最后再转回输出类型 (通常是 BF16)
         return output.astype(output_hbm.dtype)
 
     def start_send_bo(bt_id, priority=0):
