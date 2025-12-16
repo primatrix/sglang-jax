@@ -139,6 +139,10 @@ class MoEKernelTest(jtu.JaxTestCase):
         w_dtype=None,
         subc_quant_wsz=None,
         has_bias=False,
+        num_expert_group=0,
+        top_k_group=0,
+        routed_scaling_factor=None,
+        has_correction_bias=False,
         atol=2e-1,
         rtol=2e-1,
     ):
@@ -152,6 +156,14 @@ class MoEKernelTest(jtu.JaxTestCase):
             seed=seed,
             has_bias=has_bias,
         )
+
+        correction_bias = None
+        if has_correction_bias:
+            key = jax.random.key(seed + 999)
+            correction_bias = jax.random.normal(key, (num_experts,), dtype=jnp.float32).astype(
+                dtype
+            )
+
         w1_scale = None
         w2_scale = None
         if w_dtype is not None:
@@ -174,6 +186,10 @@ class MoEKernelTest(jtu.JaxTestCase):
             w2_scale=w2_scale,
             b1=b1,
             b2=b2,
+            correction_bias=correction_bias,
+            num_expert_group=num_expert_group,
+            top_k_group=top_k_group,
+            routed_scaling_factor=routed_scaling_factor,
             bt=bt,
             bf=bf,
             bd1=bd1,
@@ -184,6 +200,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             bd2c=bd2c,
             ep_axis_name="tensor",
         )
+
         expected = ref_moe(
             a,
             w1,
@@ -197,6 +214,10 @@ class MoEKernelTest(jtu.JaxTestCase):
             subc_quant_wsz=subc_quant_wsz,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
+            correction_bias=correction_bias,
+            num_expert_group=num_expert_group,
+            top_k_group=top_k_group,
+            routed_scaling_factor=routed_scaling_factor,
         )
         self.assertAllClose(actual, expected, atol=atol, rtol=rtol)
 
@@ -374,6 +395,101 @@ class MoEKernelTest(jtu.JaxTestCase):
             seed=1234,
             renormalize_topk_logits=False,
             has_bias=True,
+            bt=32,
+            bf=512,
+            bd1=512,
+            bd2=512,
+            btc=32,
+            bfc=256,
+            bd1c=256,
+            bd2c=256,
+        )
+
+    def test_grouped_topk(self):
+        dtype = jnp.bfloat16
+        top_k = 4
+        num_experts = 64
+        num_expert_group = 8
+        top_k_group = 2
+
+        hidden_size = 1024
+        intermediate_size = 1024
+        num_tokens = 8 * 32
+
+        self._test_moe(
+            dtype=dtype,
+            top_k=top_k,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_tokens=num_tokens,
+            seed=1234,
+            renormalize_topk_logits=True,
+            num_expert_group=num_expert_group,
+            top_k_group=top_k_group,
+            routed_scaling_factor=2.5,
+            bt=32,
+            bf=512,
+            bd1=512,
+            bd2=512,
+            btc=32,
+            bfc=256,
+            bd1c=256,
+            bd2c=256,
+        )
+
+    def test_biased_topk(self):
+        dtype = jnp.bfloat16
+        top_k = 8
+        num_experts = 128
+        hidden_size = 1024
+        intermediate_size = 1024
+        num_tokens = 8 * 32
+
+        self._test_moe(
+            dtype=dtype,
+            top_k=top_k,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_tokens=num_tokens,
+            seed=1234,
+            renormalize_topk_logits=True,
+            has_correction_bias=True,
+            bt=32,
+            bf=512,
+            bd1=512,
+            bd2=512,
+            btc=32,
+            bfc=256,
+            bd1c=256,
+            bd2c=256,
+        )
+
+    def test_biased_grouped_topk(self):
+        dtype = jnp.bfloat16
+        top_k = 4
+        num_experts = 64
+        num_expert_group = 8
+        top_k_group = 2
+
+        hidden_size = 1024
+        intermediate_size = 1024
+        num_tokens = 8 * 32
+
+        self._test_moe(
+            dtype=dtype,
+            top_k=top_k,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_tokens=num_tokens,
+            seed=1234,
+            renormalize_topk_logits=True,
+            has_correction_bias=True,
+            num_expert_group=num_expert_group,
+            top_k_group=top_k_group,
+            routed_scaling_factor=1.0,
             bt=32,
             bf=512,
             bd1=512,

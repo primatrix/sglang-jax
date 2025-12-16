@@ -76,19 +76,59 @@ def ref_moe(
     ) = None,  # F32(num_experts, intermediate_size // subc_quant_wsz, 1, hidden_size)
     b1: jax.Array | None = None,  # F32(num_experts, 2, 1, intermediate_size)
     b2: jax.Array | None = None,  # F32(num_experts, 1, hidden_size)
+    correction_bias: jax.Array | None = None,
+    num_expert_group: int = 0,
+    top_k_group: int = 0,
+    routed_scaling_factor: float | None = None,
 ):
     n_tokens = tokens.shape[0]  # num_tokens
+    num_experts = w1.shape[0]
 
-    # Compute gating scores for all experts
-    gating_logits = jax.nn.softmax(gating_output, axis=-1)  # [num_tokens, n_experts]
+    if correction_bias is not None:
+        # correction_bias: (num_experts,) -> broadcast to (n_tokens, num_experts)
+        scores_for_choice = gating_output + correction_bias[None, :]
+    else:
+        scores_for_choice = gating_output
+
+    # Grouped TopK Masking
+    if num_expert_group > 0 and top_k_group > 0:
+        experts_per_group = num_experts // num_expert_group
+        # Reshape: (n_tokens, n_groups, experts_per_group)
+        scores_grouped = scores_for_choice.reshape(n_tokens, num_expert_group, experts_per_group)
+
+        if correction_bias is not None:
+            # Biased Grouped: Sum of Top-2
+            vals, _ = jax.lax.top_k(scores_grouped, k=2)
+            group_scores = jnp.sum(vals, axis=-1)
+        else:
+            group_scores = jnp.max(scores_grouped, axis=-1)
+
+        _, top_group_indices = jax.lax.top_k(group_scores, k=top_k_group)
+
+        # (n_tokens, n_groups)
+        group_mask = jax.nn.one_hot(top_group_indices, num_expert_group).sum(axis=1) > 0.5
+        # Expand mask to experts: (n_tokens, n_groups, experts_per_group) -> (n_tokens, num_experts)
+        expert_mask = jnp.repeat(group_mask[:, :, None], experts_per_group, axis=2).reshape(
+            n_tokens, num_experts
+        )
+
+        # Apply Mask
+        scores_for_choice = jnp.where(expert_mask, scores_for_choice, -jnp.inf)
 
     # Select top-k experts per token
-    top_k_logits, top_k_indices = lax.top_k(
-        gating_logits, top_k
-    )  # [num_tokens, top_k], [num_tokens, top_k]
+    _, top_k_indices = lax.top_k(scores_for_choice, top_k)
+
+    # Gather weights from ORIGINAL gating_output
+    top_k_logits = jnp.take_along_axis(gating_output, top_k_indices, axis=1)
 
     if renormalize_topk_logits:
-        top_k_logits = top_k_logits / jnp.sum(top_k_logits, axis=-1, keepdims=True)
+        max_val = jnp.max(top_k_logits, axis=-1, keepdims=True)
+        top_k_probs = jnp.exp(top_k_logits - max_val)
+        top_k_logits = top_k_probs / jnp.sum(top_k_probs, axis=-1, keepdims=True)
+
+    # Apply Scaling Factor
+    if routed_scaling_factor is not None:
+        top_k_logits *= routed_scaling_factor
 
     t_outputs = []
     hidden_size, intermediate_size = w1.shape[-2:]
