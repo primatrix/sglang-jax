@@ -356,8 +356,12 @@ def _fused_ep_moe_kernel(
         # probabilities ($Prob + Bias$) is mathematically invalid.
         # Renormalization (Softmax) is deferred until after TopK selection.
         assert len(gating_logits.shape) == 2, gating_logits.shape
+
+        # Ensure FP32 for argmax and numerical stability
         gating_logits = gating_logits.astype(jnp.float32)
+
         if bias_hbm is not None:
+            # bias_vmem was loaded into b_bias_vmem (padded_num_experts,)
             bias_broadcast = jnp.broadcast_to(b_bias_vmem[None, :], gating_logits.shape)
             scores_for_choice = gating_logits + bias_broadcast
         else:
@@ -431,12 +435,11 @@ def _fused_ep_moe_kernel(
 
             # Extract values from gating_logits.
             # In Biased mode, this still extracts raw Logits (without Bias).
+            # We use float32 for max stability, as gating_logits was cast at start.
             selected_weight = jnp.max(
                 jnp.where(mask, gating_logits, -jnp.inf), axis=1, keepdims=True
             )
-            top_k_logits = jnp.broadcast_to(selected_weight, padded_k_shape).astype(
-                gating_logits.dtype
-            )
+            top_k_logits = jnp.broadcast_to(selected_weight, padded_k_shape)
             top_k_logits_lst.append(top_k_logits)
 
             # t2e_routing informs subsequent Gather/Scatter operations where to send data
@@ -451,6 +454,7 @@ def _fused_ep_moe_kernel(
             # Logits are scattered across a List rather than a contiguous Tensor, requiring costly stack/copy memory overhead when directly calling the jax.nn.softmax.
             # Here we manually implement the Max-Trick Softmax to leverage register-based in-place computation with zero additional memory.
             # Softmax implementation: exp(x_i - max(x)) / sum(exp(x_j - max(x)))
+
             # Finding the maximum among K values (Iterative Max Reduction)
             # Initialize max value as first element of list
             max_logits = top_k_logits_lst[0]
