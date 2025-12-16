@@ -68,15 +68,11 @@ def ref_moe(
     renormalize_topk_logits: bool = False,
     act_fn: str = "silu",
     subc_quant_wsz: int | None = None,
-    w1_scale: (
-        jax.Array | None
-    ) = None,  # F32(num_experts, 2, hidden_size // subc_quant_wsz, 1, intermediate_size)
-    w2_scale: (
-        jax.Array | None
-    ) = None,  # F32(num_experts, intermediate_size // subc_quant_wsz, 1, hidden_size)
-    b1: jax.Array | None = None,  # F32(num_experts, 2, 1, intermediate_size)
-    b2: jax.Array | None = None,  # F32(num_experts, 1, hidden_size)
-    correction_bias: jax.Array | None = None,  # (num_experts,)
+    w1_scale: jax.Array | None = None,
+    w2_scale: jax.Array | None = None,
+    b1: jax.Array | None = None,
+    b2: jax.Array | None = None,
+    correction_bias: jax.Array | None = None,
     num_expert_group: int = 0,
     top_k_group: int = 0,
     routed_scaling_factor: float | None = None,
@@ -88,7 +84,7 @@ def ref_moe(
     n_tokens = tokens.shape[0]
     num_experts = w2.shape[0]
 
-    # --- 1. Routing Logic (Matches get_top_k in kernel) ---
+    # --- 1. Routing Logic ---
 
     # Base scores for routing selection
     if correction_bias is not None:
@@ -101,7 +97,6 @@ def ref_moe(
     use_grouped = num_expert_group > 0 and top_k_group > 0
 
     # Mask to mark valid experts (-inf for invalid)
-    # Start with all True (valid)
     valid_mask = jnp.ones_like(selection_scores, dtype=jnp.bool_)
 
     if use_grouped:
@@ -113,135 +108,113 @@ def ref_moe(
 
         # Calculate Group Scores
         if correction_bias is not None:
-            # Biased Grouped: Sum of Top-2 in group (as per kernel logic)
+            # Biased Grouped: Sum of Top-2 in group
             vals, _ = jax.lax.top_k(scores_grouped, k=2)
-            group_scores = jnp.sum(vals, axis=-1)  # (num_tokens, num_groups)
+            group_scores = jnp.sum(vals, axis=-1)
         else:
             # Standard Grouped: Max in group
-            group_scores = jnp.max(scores_grouped, axis=-1)  # (num_tokens, num_groups)
+            group_scores = jnp.max(scores_grouped, axis=-1)
 
-        # Iteratively select top groups
-        # (We use a loop here to mimic the greedy selection masking if strictly needed,
-        # but standard top_k on group scores works if we don't need sequential dependency.
-        # The kernel uses a sequential mask update loop, so we replicate that logic simply via top_k
-        # assuming distinct scores, or using the kernel's exact logic if strictly matching implementation details).
-        # For reference, standard top_k is usually sufficient unless scores are identical.
-        _, top_groups_idx = jax.lax.top_k(group_scores, top_k_group)  # (num_tokens, top_k_group)
+        # Select Top Groups
+        _, top_groups_idx = jax.lax.top_k(group_scores, top_k_group)
 
         # Create a mask for allowed groups
-        # (num_tokens, num_groups)
         group_mask = jnp.sum(jax.nn.one_hot(top_groups_idx, num_expert_group), axis=1).astype(
             jnp.bool_
         )
 
-        # Expand mask back to experts: (num_tokens, num_groups, experts_per_group)
+        # Expand mask
         group_mask_expanded = jnp.broadcast_to(
             group_mask[:, :, None], (n_tokens, num_expert_group, experts_per_group)
         ).reshape(n_tokens, num_experts)
 
         valid_mask = valid_mask & group_mask_expanded
 
-    # Apply mask to selection scores
+    # Apply mask
     final_selection_scores = jnp.where(valid_mask, selection_scores, -jnp.inf)
 
     # Select Top-K Experts
-    # Note: Kernel casts to Float32 for Argmax safety
+    # Use float32 for argmax/top_k stability to match kernel
     _, top_k_indices = jax.lax.top_k(
         final_selection_scores.astype(jnp.float32), top_k
     )  # (num_tokens, top_k)
 
     # Extract Values
-    # Kernel logic: Uses `gating_output` (raw logits) for the values, even if `correction_bias` was used for selection.
+    # IMPORTANT: The kernel extracts values directly from the input 'gating_output' (raw logits).
+    # It does NOT perform a global softmax beforehand. We must match this.
     top_k_logits = jnp.take_along_axis(gating_output, top_k_indices, axis=-1)
 
-    # Renormalization (Softmax over the selected Top-K)
+    # Renormalization logic
     if renormalize_topk_logits:
+        # Standard MoE: Softmax over the selected Top-K values
         top_k_weights = jax.nn.softmax(top_k_logits.astype(jnp.float32), axis=-1).astype(
             tokens.dtype
         )
     else:
-        # If not renormalizing, we just take the logits (or probs if input was probs)
+        # Raw usage: Use the gathered values directly
         top_k_weights = top_k_logits
 
     # Apply Routed Scaling Factor
     if routed_scaling_factor is not None:
         top_k_weights = top_k_weights * routed_scaling_factor
 
-    # --- 2. Computation Logic (Iterate per token) ---
+    # --- 2. Computation Logic ---
 
     t_outputs = []
-    hidden_size, intermediate_size = w1.shape[-2:]
 
-    # Process each token individually (slow but correct reference)
+    # Process each token
     for i in range(n_tokens):
-        curr_token = jnp.expand_dims(tokens[i], axis=0)  # [1, hidden_size]
-        assigned_expert_ids = top_k_indices[i]  # [top_k]
+        curr_token = jnp.expand_dims(tokens[i], axis=0)
+        assigned_expert_ids = top_k_indices[i]
         tok_expert_act = []
 
         for k in range(top_k):
             expert_id = assigned_expert_ids[k]
 
-            # 1. First Linear Layer (Gate + Up)
+            # Linear 1 (Gate + Up)
             expert_w1 = w1[expert_id, 0].astype(jnp.float32)
             expert_w3 = w1[expert_id, 1].astype(jnp.float32)
 
-            # Apply Quantization Scales for W1/W3
             if w1_scale is not None:
-                # w1_scale shape: (num_experts, 2, hs//g, 1, is)
-                # broadcast to (hidden_size, intermediate_size)
-                s1 = w1_scale[expert_id, 0, :, 0]  # (hs//g, is)
-                s3 = w1_scale[expert_id, 1, :, 0]  # (hs//g, is)
+                s1 = w1_scale[expert_id, 0, :, 0]
+                s3 = w1_scale[expert_id, 1, :, 0]
                 if subc_quant_wsz is not None:
-                    s1 = jnp.repeat(s1, subc_quant_wsz, axis=0)[:hidden_size]
-                    s3 = jnp.repeat(s3, subc_quant_wsz, axis=0)[:hidden_size]
+                    s1 = jnp.repeat(s1, subc_quant_wsz, axis=0)[: w1.shape[-2]]
+                    s3 = jnp.repeat(s3, subc_quant_wsz, axis=0)[: w1.shape[-2]]
                 expert_w1 *= s1
                 expert_w3 *= s3
 
-            # Computation
-            gmm1_w1_proj = curr_token @ expert_w1  # [1, intermediate_size]
-            gmm1_w3_proj = curr_token @ expert_w3  # [1, intermediate_size]
+            gmm1_w1_proj = curr_token @ expert_w1
+            gmm1_w3_proj = curr_token @ expert_w3
 
-            # Apply Bias B1
             if b1 is not None:
                 gmm1_w1_proj += b1[expert_id, 0, 0]
                 gmm1_w3_proj += b1[expert_id, 1, 0]
 
-            # Activation
             act = activation_fn(gmm1_w1_proj, gmm1_w3_proj, act_fn)
 
-            # 2. Second Linear Layer (Down)
-            expert_weight_2 = w2[expert_id].astype(jnp.float32)  # [intermediate_size, hidden_size]
-
-            # Apply Quantization Scales for W2
+            # Linear 2 (Down)
+            expert_weight_2 = w2[expert_id].astype(jnp.float32)
             if w2_scale is not None:
-                # w2_scale shape: (num_experts, is//g, 1, hs)
                 s2 = w2_scale[expert_id, :, 0]
                 if subc_quant_wsz is not None:
-                    s2 = jnp.repeat(s2, subc_quant_wsz, axis=0)[:intermediate_size]
+                    s2 = jnp.repeat(s2, subc_quant_wsz, axis=0)[: w2.shape[-2]]
                 expert_weight_2 *= s2
 
-            gmm_2_out = act @ expert_weight_2  # [1, hidden_size]
-
-            # Apply Bias B2
+            gmm_2_out = act @ expert_weight_2
             if b2 is not None:
                 gmm_2_out += b2[expert_id, 0]
 
             tok_expert_act.append(gmm_2_out)
 
-        # Stack outputs from all experts for this token
-        experts_act = jnp.concatenate(tok_expert_act, axis=0)  # [top_k, hidden_size]
+        experts_act = jnp.concatenate(tok_expert_act, axis=0)
+        curr_weights = jnp.expand_dims(top_k_weights[i], axis=1)
 
-        # Weighted sum
-        curr_weights = top_k_weights[i]  # [top_k]
-        curr_weights = jnp.expand_dims(curr_weights, axis=1)  # [top_k, 1]
-
-        weighted_output = jnp.sum(
-            experts_act * curr_weights, axis=0, keepdims=True
-        )  # [1, hidden_size]
+        weighted_output = jnp.sum(experts_act * curr_weights, axis=0, keepdims=True)
 
         t_outputs.append(weighted_output.astype(tokens.dtype))
 
-    return jnp.concatenate(t_outputs, axis=0)  # [num_tokens, hidden_size]
+    return jnp.concatenate(t_outputs, axis=0)
 
 
 def _fused_ep_moe_kernel(
