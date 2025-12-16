@@ -66,155 +66,151 @@ def ref_moe(
     top_k: int,
     *,
     renormalize_topk_logits: bool = False,
-    act_fn: str = "silu",
+    activation="silu",
     subc_quant_wsz: int | None = None,
-    w1_scale: jax.Array | None = None,
-    w2_scale: jax.Array | None = None,
-    b1: jax.Array | None = None,
-    b2: jax.Array | None = None,
-    correction_bias: jax.Array | None = None,
+    w1_scale: (
+        jax.Array | None
+    ) = None,  # (num_experts, 2, cdiv(hidden_size, subc_quant_wsz), intermediate_size)
+    w2_scale: (
+        jax.Array | None
+    ) = None,  # (num_experts, cdiv(intermediate_size, subc_quant_wsz), hidden_size)
+    b1: jax.Array | None = None,  # (num_experts, 2, intermediate_size)
+    b2: jax.Array | None = None,  # (num_experts, hidden_size)
+    # --- 新增参数 ---
+    correction_bias: jax.Array | None = None,  # (num_experts,)
     num_expert_group: int = 0,
     top_k_group: int = 0,
     routed_scaling_factor: float | None = None,
 ):
-    """
-    Reference implementation of MoE matching the TPU kernel logic.
-    Supports Grouped Top-K, Correction Bias, and Post-TopK Softmax.
-    """
-    n_tokens = tokens.shape[0]
+    n_tokens = tokens.shape[0]  # num_tokens
     num_experts = w2.shape[0]
 
-    # --- 1. Routing Logic ---
+    # 1. 基础概率计算 (Softmax)
+    # 注意：根据 moe.py 逻辑，GateLogit 默认输出概率。
+    # 这里我们显式做 softmax 以确保输入转换为概率分布。
+    gating_probs = jax.nn.softmax(gating_output, axis=-1)  # [num_tokens, n_experts]
 
-    # Base scores for routing selection
+    # 2. 路由打分 (Bias Correction)
+    # 选人用 probs + bias，算权重只用 probs
     if correction_bias is not None:
-        # Broadcast bias to (num_tokens, num_experts)
-        selection_scores = gating_output + correction_bias[None, :]
+        selection_scores = gating_probs + correction_bias[None, :]
     else:
-        selection_scores = gating_output
+        selection_scores = gating_probs
 
-    # Validate inputs for grouping
-    use_grouped = num_expert_group > 0 and top_k_group > 0
-
-    # Mask to mark valid experts (-inf for invalid)
+    # 3. 分组逻辑 (Grouped Top-K)
     valid_mask = jnp.ones_like(selection_scores, dtype=jnp.bool_)
 
-    if use_grouped:
+    if num_expert_group > 0 and top_k_group > 0:
         assert num_experts % num_expert_group == 0
         experts_per_group = num_experts // num_expert_group
 
-        # Reshape to (num_tokens, num_groups, experts_per_group)
+        # Reshape: [n, groups, experts_per_group]
         scores_grouped = selection_scores.reshape(n_tokens, num_expert_group, experts_per_group)
 
-        # Calculate Group Scores
+        # 计算组分：Bias 模式下使用 Top-2 Sum (DeepSeek V3)，否则使用 Max
         if correction_bias is not None:
-            # Biased Grouped: Sum of Top-2 in group
             vals, _ = jax.lax.top_k(scores_grouped, k=2)
             group_scores = jnp.sum(vals, axis=-1)
         else:
-            # Standard Grouped: Max in group
             group_scores = jnp.max(scores_grouped, axis=-1)
 
-        # Select Top Groups
-        _, top_groups_idx = jax.lax.top_k(group_scores, top_k_group)
+        # 选出 Top Groups
+        _, top_groups_idx = jax.lax.top_k(group_scores, k=top_k_group)
 
-        # Create a mask for allowed groups
+        # 生成组 Mask
         group_mask = jnp.sum(jax.nn.one_hot(top_groups_idx, num_expert_group), axis=1).astype(
             jnp.bool_
         )
 
-        # Expand mask
+        # 广播回 Expert 维度
         group_mask_expanded = jnp.broadcast_to(
             group_mask[:, :, None], (n_tokens, num_expert_group, experts_per_group)
         ).reshape(n_tokens, num_experts)
 
         valid_mask = valid_mask & group_mask_expanded
 
-    # Apply mask
+    # 应用 Mask (-inf)
     final_selection_scores = jnp.where(valid_mask, selection_scores, -jnp.inf)
 
-    # Select Top-K Experts
-    # Use float32 for argmax/top_k stability to match kernel
-    _, top_k_indices = jax.lax.top_k(
-        final_selection_scores.astype(jnp.float32), top_k
-    )  # (num_tokens, top_k)
+    # 4. Top-K 选择
+    # 使用打分后的分数选 Index
+    _, top_k_indices = lax.top_k(final_selection_scores, top_k)  # [num_tokens, top_k]
 
-    # Extract Values
-    # IMPORTANT: The kernel extracts values directly from the input 'gating_output' (raw logits).
-    # It does NOT perform a global softmax beforehand. We must match this.
-    top_k_logits = jnp.take_along_axis(gating_output, top_k_indices, axis=-1)
+    # 5. 提取权重
+    # 注意：权重从原始概率 gating_probs 提取，不受 bias 影响
+    top_k_logits = jnp.take_along_axis(gating_probs, top_k_indices, axis=-1)
 
-    # Renormalization logic
+    # 6. 归一化 (Linear Renormalization)
     if renormalize_topk_logits:
-        # Standard MoE: Softmax over the selected Top-K values
-        top_k_weights = jax.nn.softmax(top_k_logits.astype(jnp.float32), axis=-1).astype(
-            tokens.dtype
-        )
-    else:
-        # Raw usage: Use the gathered values directly
-        top_k_weights = top_k_logits
+        top_k_logits = top_k_logits / jnp.sum(top_k_logits, axis=-1, keepdims=True)
 
-    # Apply Routed Scaling Factor
+    # 7. 缩放因子 (Routed Scaling Factor)
     if routed_scaling_factor is not None:
-        top_k_weights = top_k_weights * routed_scaling_factor
-
-    # --- 2. Computation Logic ---
+        top_k_logits = top_k_logits * routed_scaling_factor
 
     t_outputs = []
+    hidden_size, intermediate_size = w1.shape[-2:]
 
-    # Process each token
+    # Process each token individually
     for i in range(n_tokens):
-        curr_token = jnp.expand_dims(tokens[i], axis=0)
-        assigned_expert_ids = top_k_indices[i]
+        curr_token = jnp.expand_dims(tokens[i], axis=0)  # [1, d_model]
+        assigned_expert_ids = top_k_indices[i]  # [top_k] - indices of selected experts for token i
         tok_expert_act = []
 
-        for k in range(top_k):
-            expert_id = assigned_expert_ids[k]
-
-            # Linear 1 (Gate + Up)
+        # Process each selected expert for the current token
+        for expert_id in assigned_expert_ids:
+            # Get expert weights
             expert_w1 = w1[expert_id, 0].astype(jnp.float32)
             expert_w3 = w1[expert_id, 1].astype(jnp.float32)
-
             if w1_scale is not None:
-                s1 = w1_scale[expert_id, 0, :, 0]
-                s3 = w1_scale[expert_id, 1, :, 0]
-                if subc_quant_wsz is not None:
-                    s1 = jnp.repeat(s1, subc_quant_wsz, axis=0)[: w1.shape[-2]]
-                    s3 = jnp.repeat(s3, subc_quant_wsz, axis=0)[: w1.shape[-2]]
-                expert_w1 *= s1
-                expert_w3 *= s3
-
-            gmm1_w1_proj = curr_token @ expert_w1
-            gmm1_w3_proj = curr_token @ expert_w3
-
-            if b1 is not None:
-                gmm1_w1_proj += b1[expert_id, 0, 0]
-                gmm1_w3_proj += b1[expert_id, 1, 0]
-
-            act = activation_fn(gmm1_w1_proj, gmm1_w3_proj, act_fn)
-
-            # Linear 2 (Down)
-            expert_weight_2 = w2[expert_id].astype(jnp.float32)
+                expert_w1 *= jnp.repeat(w1_scale[expert_id, 0], subc_quant_wsz, axis=0)[
+                    :hidden_size
+                ]
+                expert_w3 *= jnp.repeat(w1_scale[expert_id, 1], subc_quant_wsz, axis=0)[
+                    :hidden_size
+                ]
+            expert_weight_1 = jnp.concat(
+                [expert_w1, expert_w3], axis=-1
+            )  # [d_model, 2 * intermediate_size]
+            expert_weight_2 = w2[expert_id].astype(jnp.float32)  # [intermediate_size, d_model]
             if w2_scale is not None:
-                s2 = w2_scale[expert_id, :, 0]
-                if subc_quant_wsz is not None:
-                    s2 = jnp.repeat(s2, subc_quant_wsz, axis=0)[: w2.shape[-2]]
-                expert_weight_2 *= s2
+                expert_weight_2 *= jnp.repeat(w2_scale[expert_id], subc_quant_wsz, axis=0)[
+                    :intermediate_size
+                ]
 
-            gmm_2_out = act @ expert_weight_2
+            # First linear layer with SwiGLU activation
+            gmm_1_out = curr_token @ expert_weight_1  # [1, 2 * intermediate_size]
+
+            # Split into gate and up projections for SwiGLU
+            gmm1_w1_proj, gmm1_w3_proj = jnp.split(
+                gmm_1_out, 2, axis=-1
+            )  # [1, intermediate_size], [1, intermediate_size]
+            if b1 is not None:
+                gmm1_w1_proj += b1[expert_id : expert_id + 1, 0]
+                gmm1_w3_proj += b1[expert_id : expert_id + 1, 1]
+
+            # Apply gated activation: activation(gate) * up
+            act = activation_fn(gmm1_w1_proj, gmm1_w3_proj, activation)
+
+            # Second linear layer (down projection)
+            gmm_2_out = act @ expert_weight_2  # [1, d_model]
             if b2 is not None:
-                gmm_2_out += b2[expert_id, 0]
-
+                gmm_2_out += b2[expert_id : expert_id + 1]
             tok_expert_act.append(gmm_2_out)
 
-        experts_act = jnp.concatenate(tok_expert_act, axis=0)
-        curr_weights = jnp.expand_dims(top_k_weights[i], axis=1)
+        # Combine outputs from all selected experts
+        experts_act = jnp.concatenate(tok_expert_act, axis=0)  # [top_k, d_model]
 
-        weighted_output = jnp.sum(experts_act * curr_weights, axis=0, keepdims=True)
+        # Weighted sum using top-k gating weights
+        top_k_weights = top_k_logits[i]  # [top_k]
+        top_k_weights = jnp.expand_dims(top_k_weights, axis=1)  # [top_k, 1]
+        weighted_output = jnp.sum(
+            experts_act * top_k_weights, axis=0, keepdims=True
+        )  # [1, d_model]
 
         t_outputs.append(weighted_output.astype(tokens.dtype))
 
-    return jnp.concatenate(t_outputs, axis=0)
+    return jnp.concatenate(t_outputs, axis=0)  # [num_tokens, d_model]
 
 
 def _fused_ep_moe_kernel(
@@ -372,76 +368,74 @@ def _fused_ep_moe_kernel(
             sem=b_gating_sem,
         ).wait()
 
-    def get_top_k(gating_logits, top_k, renormalize_topk_logits):
-        # NOTE: Input must be Raw Logits, not Probabilities.
-        # Correction Bias is additive ($Logits + Bias$). Adding bias to
-        # probabilities ($Prob + Bias$) is mathematically invalid.
-        # Renormalization (Softmax) is deferred until after TopK selection.
-        assert len(gating_logits.shape) == 2, gating_logits.shape
+    def get_top_k(gating_probs, top_k, renormalize_topk_logits):
+        # [CRITICAL CHANGE based on moe.py]
+        # Input `gating_probs` is assumed to be Probabilities (already Softmaxed),
+        # NOT Raw Logits.
+        # Logic matches moe.py:
+        # 1. Selection = Probs + Bias
+        # 2. Values = Probs
+        # 3. Renorm = Values / Sum(Values)  <-- No Exp() needed!
+
+        assert len(gating_probs.shape) == 2, gating_probs.shape
+
+        # 1. Bias Correction (Probs + Bias)
+        # Matches moe.py: scores_for_choice = router_logits + correction_bias
         if bias_hbm is not None:
-            bias_broadcast = jnp.broadcast_to(b_bias_vmem[None, :], gating_logits.shape)
-            scores_for_choice = gating_logits + bias_broadcast
+            bias_broadcast = jnp.broadcast_to(b_bias_vmem[None, :], gating_probs.shape)
+            scores_for_choice = gating_probs + bias_broadcast
         else:
-            scores_for_choice = gating_logits
+            scores_for_choice = gating_probs
 
         valid_mask = jnp.ones_like(scores_for_choice, dtype=jnp.bool_)
         use_grouped = num_expert_group > 0 and top_k_group > 0
 
-        # If grouping is enabled
-        # we need first select groups and set experts in unselected groups to -inf.
+        # 2. Grouped Top-K Logic
         if use_grouped:
             experts_per_group = padded_num_experts // num_expert_group
-            # Reshape: (bt, num_group, experts_per_group)
             scores_grouped = scores_for_choice.reshape(
-                gating_logits.shape[0], num_expert_group, experts_per_group
+                gating_probs.shape[0], num_expert_group, experts_per_group
             )
-            # biased grouped
+            scores_grouped_f32 = scores_grouped.astype(jnp.float32)
+
             if bias_hbm is not None:
-                vals, _ = jax.lax.top_k(scores_grouped, k=2)
+                # Biased grouped: Sum of Top-2
+                vals, _ = jax.lax.top_k(scores_grouped_f32, k=2)
                 group_scores = jnp.sum(vals, axis=-1)
             else:
-                group_scores = jnp.max(scores_grouped, axis=-1)
+                # Standard: Max
+                group_scores = jnp.max(scores_grouped_f32, axis=-1)
 
             group_mask = jnp.zeros_like(group_scores, dtype=jnp.bool_)
             curr_group_scores = group_scores
             iota_groups = lax.broadcasted_iota(jnp.int32, group_scores.shape, 1)
 
             for _ in range(top_k_group):
-                # Find the index of the current best group
-                best_g_idx = jnp.argmax(
-                    curr_group_scores.astype(jnp.float32), axis=1, keepdims=True
-                )
-                # Generate the mask for this iteration (broadcast to match group_scores dimensions for comparison)
+                best_g_idx = jnp.argmax(curr_group_scores, axis=1, keepdims=True)
                 best_g_mask_iter = iota_groups == broadcast_minor(best_g_idx, group_scores.shape)
-                # Update the overall mask
                 group_mask = group_mask | best_g_mask_iter
-                # Set the selected group's score to -inf so it won't be chosen again in the next round
                 curr_group_scores = jnp.where(best_g_mask_iter, -jnp.inf, curr_group_scores)
 
-            # Expand the Group Mask back to the Expert dimension
-            # (bt, num_group) -> (bt, num_group, 1) -> Broadcast -> (bt, num_experts)
             mask_expanded = jnp.broadcast_to(
                 jnp.expand_dims(group_mask, axis=-1),
-                (gating_logits.shape[0], num_expert_group, experts_per_group),
+                (gating_probs.shape[0], num_expert_group, experts_per_group),
             )
-            valid_mask = mask_expanded.reshape(gating_logits.shape)
+            valid_mask = mask_expanded.reshape(gating_probs.shape)
 
-        # Masked expert scores become -inf and will never be selected as TopK
-        # Only scores_for_choice is modified here, not gating_logits
         final_selection_scores = jnp.where(valid_mask, scores_for_choice, -jnp.inf)
 
-        padded_k_shape = (gating_logits.shape[0], padded_top_k)
+        padded_k_shape = (gating_probs.shape[0], padded_top_k)
         top_k_logits_lst = []
         top_k_indices_lst = []
 
-        t2e = jnp.zeros(gating_logits.shape, dtype=jnp.int32)
+        t2e = jnp.zeros(gating_probs.shape, dtype=jnp.int32)
         t2e_routing = jnp.zeros(padded_k_shape, dtype=jnp.int32)
 
-        iota = jax.lax.broadcasted_iota(jnp.int32, gating_logits.shape, 1)
+        iota = jax.lax.broadcasted_iota(jnp.int32, gating_probs.shape, 1)
         padded_k_iota = jax.lax.broadcasted_iota(jnp.int32, padded_k_shape, 1)
 
+        # 3. Iterative Top-K Selection
         for k_id in range(top_k):
-            # determines “who to select” (Argmax)
             top_k_indices = jnp.broadcast_to(
                 jnp.argmax(
                     final_selection_scores[:, :num_experts].astype(jnp.float32),
@@ -452,58 +446,44 @@ def _fused_ep_moe_kernel(
             )
             top_k_indices_lst.append(top_k_indices)
 
-            # determines “what the value is”
-            # mask: Only the selected expert position is True
-            mask = iota == broadcast_minor(top_k_indices, gating_logits.shape)
+            mask = iota == broadcast_minor(top_k_indices, gating_probs.shape)
 
-            # Extract values from gating_logits.
-            # In Biased mode, this still extracts raw Logits (without Bias).
+            # Extract Weight: From Probabilities (gating_probs)
             selected_weight = jnp.max(
-                jnp.where(mask, gating_logits, -jnp.inf), axis=1, keepdims=True
+                jnp.where(mask, gating_probs, -jnp.inf), axis=1, keepdims=True
             )
             top_k_logits = jnp.broadcast_to(selected_weight, padded_k_shape).astype(
-                gating_logits.dtype
+                gating_probs.dtype
             )
             top_k_logits_lst.append(top_k_logits)
 
-            # t2e_routing informs subsequent Gather/Scatter operations where to send data
             t2e_routing = jnp.where(padded_k_iota == k_id, top_k_indices, t2e_routing)
             t2e += mask.astype(jnp.int32)
 
-            # Only executed in non-final rounds to allow selection of the next-highest value in subsequent rounds
             if k_id != top_k - 1:
                 final_selection_scores = jnp.where(mask, -jnp.inf, final_selection_scores)
 
+        # 4. Renormalization (Linear Normalization)
+        # Matches moe.py: weights / sum(weights)
+        # REMOVED: Exp() calculation.
         if renormalize_topk_logits:
-            # Logits are scattered across a List rather than a contiguous Tensor, requiring costly stack/copy memory overhead when directly calling the jax.nn.softmax.
-            # Here we manually implement the Max-Trick Softmax to leverage register-based in-place computation with zero additional memory.
-            # Softmax implementation: exp(x_i - max(x)) / sum(exp(x_j - max(x)))
-            # Finding the maximum among K values (Iterative Max Reduction)
-            # Initialize max value as first element of list
-            max_logits = top_k_logits_lst[0]
-            # Iterate over remaining elements to update max value
-            for k_id in range(1, top_k):
-                max_logits = jnp.maximum(max_logits, top_k_logits_lst[k_id])
-
-            # Calculate Exp (minus Max) and accumulate Sum
-            top_k_exp_sum = jnp.zeros(padded_k_shape, jnp.float32)
+            top_k_sum = jnp.zeros(padded_k_shape, jnp.float32)
 
             for k_id in range(top_k):
-                # x = exp(logit - max)
-                # Directly modify list values in-place to exp values
-                exp_val = jnp.exp(top_k_logits_lst[k_id] - max_logits)
-                top_k_logits_lst[k_id] = exp_val
-                top_k_exp_sum += exp_val
+                # Accumulate Sum directly (Input is already prob-like)
+                top_k_sum += top_k_logits_lst[k_id].astype(jnp.float32)
 
-            # Normalization (Add epsilon to prevent division by zero, though max-trick makes 0 unlikely unless all values are -inf)
-            top_k_exp_sum = top_k_exp_sum + 1e-6
+            top_k_sum = top_k_sum + 1e-6
             for k_id in range(top_k):
-                top_k_logits_lst[k_id] /= top_k_exp_sum
+                # Normalize
+                normalized_val = top_k_logits_lst[k_id].astype(jnp.float32) / top_k_sum
+                top_k_logits_lst[k_id] = normalized_val.astype(gating_probs.dtype)
 
-        # Apply Scaling Factor
+        # 5. Scaling Factor
         if routed_scaling_factor is not None:
             for k_id in range(top_k):
-                top_k_logits_lst[k_id] *= routed_scaling_factor
+                val = top_k_logits_lst[k_id] * routed_scaling_factor
+                top_k_logits_lst[k_id] = val.astype(gating_probs.dtype)
 
         expert_sizes = jnp.sum(t2e, axis=0, keepdims=True)
         expert_starts = jnp.zeros_like(expert_sizes)
@@ -1207,8 +1187,9 @@ def _fused_ep_moe_kernel(
         wait_fetch_b_gating(bt_id)
 
         b_gating = b_gating_x2_vmem[bt_sem_id]
+        b_gating_score = jax.nn.softmax(b_gating, axis=-1)
         top_k_logits_lst, t2e_routing, expert_sizes, expert_starts = get_top_k(
-            b_gating, top_k, renormalize_topk_logits
+            b_gating_score, top_k, renormalize_topk_logits
         )
 
         all_reduce_metadata(bt_sem_id, t2e_routing, expert_starts, expert_sizes)
