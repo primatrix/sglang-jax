@@ -1,5 +1,5 @@
-from python.sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
+from python.sgl_jax.srt.managers.detokenizer_manager import DetokenizerManager
 
 
-class MultimodalTokenizer(TokenizerManager):
+class MultimodalDetokenizer(DetokenizerManager):
     pass
