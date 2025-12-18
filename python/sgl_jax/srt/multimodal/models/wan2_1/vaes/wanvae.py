@@ -521,6 +521,10 @@ class UpBlock(nnx.Module):
         return x, cache_list
 
 
+class ResidualUpBlock(nnx.Module):
+    pass
+
+
 class Decoder3d(nnx.Module):
     r"""
     A 3D decoder module.
@@ -548,6 +552,7 @@ class Decoder3d(nnx.Module):
         is_residual: bool = False,
         *,
         rngs: nnx.Rngs = None,
+        non_linearity: str = "silu",
     ):
         self.dim = dim
         self.z_dim = z_dim
@@ -564,31 +569,39 @@ class Decoder3d(nnx.Module):
 
         self.mid_block = MidBlock(dims[0], dropout, num_layers=1, rngs=rngs)
         self.up_blocks = nnx.List([])
-        if is_residual:
-            raise RuntimeError("not implemented")
-        else:
-            # in : [384, 384, 384, 192]
-            # out: [384, 384, 192, 96]
-            for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:], strict=True)):
-                # 4
-                # residual (+attention) blocks
-                if i > 0 and not is_residual:
-                    # wan vae 2.1
-                    in_dim = in_dim // 2
-
-                # determine if we need upsampling
-                up_flag = i != len(dim_mult) - 1
-                # determine upsampling mode, if not upsampling, set to None
-                upsample_mode = None
-                if up_flag and temperal_upsample[i]:
-                    upsample_mode = "upsample3d"
-                elif up_flag:
-                    upsample_mode = "upsample2d"
-                # 0 (384, 384)
-                # 1 (192, 384)
-                # 2 (192, 192)
-                # 3 (192, 96)
-                up_block = UpBlock(
+        # in : [384, 384, 384, 192]
+        # out: [384, 384, 192, 96]
+        for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:], strict=True)):
+            # 4
+            # residual (+attention) blocks
+            if i > 0 and not is_residual:
+                # wan vae 2.1
+                in_dim = in_dim // 2
+            # determine if we need upsampling
+            up_flag = i != len(dim_mult) - 1
+            # determine upsampling mode, if not upsampling, set to None
+            upsample_mode = None
+            if up_flag and temperal_upsample[i]:
+                upsample_mode = "upsample3d"
+            elif up_flag:
+                upsample_mode = "upsample2d"
+            # 0 (384, 384)
+            # 1 (192, 384)
+            # 2 (192, 192)
+            # 3 (192, 96)
+            up_block = (
+                ResidualUpBlock(
+                    in_dim=in_dim,
+                    out_dim=out_dim,
+                    num_res_blocks=num_res_blocks,
+                    dropout=dropout,
+                    temperal_upsample=temperal_upsample[i] if up_flag else False,
+                    up_flag=up_flag,
+                    non_linearity=non_linearity,
+                    rngs=rngs,
+                )
+                if is_residual
+                else UpBlock(
                     in_dim=in_dim,
                     out_dim=out_dim,
                     num_res_blocks=num_res_blocks,
@@ -596,7 +609,8 @@ class Decoder3d(nnx.Module):
                     upsample_mode=upsample_mode,
                     rngs=rngs,
                 )
-                self.up_blocks.append(up_block)
+            )
+            self.up_blocks.append(up_block)
         # output blocks
         self.norm_out = RMSNorm(out_dim, images=False, rngs=rngs)
         self.conv_out = CausalConv3d(out_dim, out_channels, (3, 3, 3), padding=(1, 1, 1), rngs=rngs)
