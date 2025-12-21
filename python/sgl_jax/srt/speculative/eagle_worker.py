@@ -378,6 +378,10 @@ class EAGLEWorker(ModelWorker):
             model_worker_batch.seq_lens = np.pad(
                 model_worker_batch.seq_lens, ((0, bs - model_worker_batch.seq_lens.shape[0]),)
             )
+            if spec_info.allocate_lens is not None:
+                spec_info.allocate_lens = np.pad(
+                    spec_info.allocate_lens, ((0, bs - spec_info.allocate_lens.shape[0]),)
+                )
         if bs - topk_index.shape[0] > 0:
             spec_info.topk_index = np.pad(
                 topk_index,
@@ -605,7 +609,7 @@ class EAGLEWorker(ModelWorker):
         self.capture_for_decode(draft_logits_output, forward_batch.spec_info)
         select_index = (
             np.arange(len(model_worker_batch.seq_lens[: batch_output.accept_lens.shape[0]]))
-            * self.speculative_num_draft_tokens
+            * (self.speculative_num_steps + 1)
             + batch_output.accept_lens
             - 1
         )
@@ -620,9 +624,8 @@ class EAGLEWorker(ModelWorker):
         batch_output.next_draft_input.topk_p = topk_p
         batch_output.next_draft_input.topk_index = topk_index
 
-        verified_id_idx = jnp.cumsum(batch_output.accept_lens) - 1
         batch_output.next_draft_input.verified_id = batch_output.next_draft_input.verified_id[
-            verified_id_idx
+            select_index
         ]
 
     def draft_forward(self, model_worker_batch: ModelWorkerBatch):
