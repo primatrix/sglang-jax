@@ -454,18 +454,9 @@ class EAGLEWorker(ModelWorker):
         spec_info: EagleVerifyInput = model_worker_batch.spec_info
         spec_info.allocate_lens = cur_allocate_lens
         spec_info.prepare_for_verify(model_worker_batch, self.page_size, self.target_worker)
-        # this padding will cost 20+ms
-        # verify will forward bs*num_draft_tokens
-        # model_worker_batch.padding_model_worker_batch(
-        #     self.precompile_token_paddings,
-        #     self.precompile_bs_paddings,
-        #     self.precompile_cache_loc_paddings,
-        # )
         forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
-        # custom_mask = forward_metadata.custom_mask
-        self.copy_model_worker_batch_to_cpu(model_worker_batch)
         logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
             model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
         )
@@ -597,7 +588,6 @@ class EAGLEWorker(ModelWorker):
             self.precompile_token_paddings,
         )
 
-        self.copy_model_worker_batch_to_cpu(model_worker_batch)
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
         if forward_batch.input_ids.shape[0] <= 0:
             return
