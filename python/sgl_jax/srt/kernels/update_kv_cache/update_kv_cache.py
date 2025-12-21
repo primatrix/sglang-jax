@@ -46,7 +46,7 @@ def get_num_slices_per_block(new_kv: jax.Array, kv_cache: jax.Array, page_size=1
     ), f"new_kv.dtype={new_kv.dtype} is not equal to kv_cache.dtype={kv_cache.dtype}"
     assert new_kv.dtype != jnp.float16, f"new_kv.dtype={new_kv.dtype} is not supported"
 
-    bits = dtypes.bit_width(kv_cache.dtype)
+    bits = dtypes.itemsize_bits(kv_cache.dtype)
     assert bits % 8 == 0, f"bits={bits} is not divisible by 8"
 
     bytes_per_element = bits // 8
