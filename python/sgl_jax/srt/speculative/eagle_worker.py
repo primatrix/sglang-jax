@@ -298,6 +298,45 @@ class EAGLEWorker(ModelWorker):
         spec_info.prepare_for_draft_decode(
             model_worker_batch, self.topk, self.speculative_num_steps
         )
+        # get unpadded seq_lens
+        seq_lens_cpu = model_worker_batch.seq_lens
+        page_size = self.page_size
+        token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[
+            model_worker_batch.req_pool_indices
+        ]
+        cache_loc_flat = np.array([], dtype=np.int32)
+        if len(seq_lens_cpu) > 0:
+            # Filter out empty sequences
+            valid_mask = seq_lens_cpu > 0
+            if np.any(valid_mask):
+                valid_indices = np.where(valid_mask)[0]
+                valid_seq_lens = seq_lens_cpu[valid_mask]
+                # Calculate aligned lengths for all valid sequences at once
+                aligned_lengths = ((valid_seq_lens + page_size - 1) // page_size) * page_size
+                total_aligned_length = np.sum(aligned_lengths)
+                # Pre-allocate the result array
+                cache_loc_flat = np.zeros(total_aligned_length, dtype=np.int32)
+                # Fill the array efficiently
+                offset = 0
+                for i, (seq_idx, seq_len, aligned_len) in enumerate(
+                    zip(valid_indices, valid_seq_lens, aligned_lengths)
+                ):
+                    # Copy the actual data
+                    cache_loc_flat[offset : offset + seq_len] = token_indices_with_all_reqs[
+                        seq_idx, :seq_len
+                    ]
+                    # Padding is already zero from initialization
+                    offset += aligned_len
+        total_cache_loc_size = self.precompile_cache_loc_paddings[padding_bs_index]
+        assert total_cache_loc_size >= len(cache_loc_flat)
+        cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
+        if len(cache_loc_flat) > 0:
+            cache_loc_cpu[: len(cache_loc_flat)] = cache_loc_flat
+        # Initialize padding area to ensure multiprocess consistency
+        if len(cache_loc_flat) < total_cache_loc_size:
+            cache_loc_cpu[len(cache_loc_flat) :] = 0
+        model_worker_batch.cache_loc = cache_loc_cpu
+
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
         spec_info = model_worker_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
