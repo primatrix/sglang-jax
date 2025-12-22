@@ -488,14 +488,20 @@ class EagleDraftInput:
     ):
         model_worker_batch.spec_info = self
         verified_id = batch_output.next_draft_input.verified_id
-        # verified_id = verified_id[verified_id != 0].flatten()
         model_worker_batch.input_ids = verified_id
-        model_worker_batch.seq_lens = model_worker_batch.seq_lens + batch_output.accept_lens
-        print(f"{model_worker_batch.seq_lens=}")
+        print(f"1111 {model_worker_batch.seq_lens=}")
+        print(f"{verified_id=}")
+        print(f"{batch_output.accept_lens=}")
+        print(f"{batch_output.next_draft_input.hidden_states.shape=}")
+        model_worker_batch.seq_lens[:model_worker_batch.real_bs] = model_worker_batch.seq_lens[:model_worker_batch.real_bs] + batch_output.accept_lens[:model_worker_batch.real_bs]
+        print(f"2222 {model_worker_batch.seq_lens=}")
+        
         bs = batch_output.accept_lens.shape[0]
         step_plus_1 = verified_id.shape[0] // bs
 
         model_worker_batch.extend_seq_lens = np.full((bs,), step_plus_1, dtype=np.int32)
+        model_worker_batch.extend_seq_lens[model_worker_batch.real_bs :] = 0
+        print(f"3333 {model_worker_batch.extend_seq_lens=}")
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND

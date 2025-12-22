@@ -119,6 +119,7 @@ class EAGLEWorker(ModelWorker):
         model_worker_batch: ModelWorkerBatch,
     ):
         if model_worker_batch.forward_mode.is_extend():
+            # FIXME(pc) add padding logic here
             model_worker_batch.sampling_info.temperatures = (
                 model_worker_batch.sampling_info.temperatures[:, None]
             )
@@ -598,10 +599,12 @@ class EAGLEWorker(ModelWorker):
         select_index = (
             np.arange(len(model_worker_batch.seq_lens[: model_worker_batch.real_bs]))
             * (self.speculative_num_steps + 1)
-            + batch_output.accept_lens
+            + batch_output.accept_lens[: model_worker_batch.real_bs]
             - 1
         )
-        print(f"{select_index=}")
+        print(f"select_index={select_index}")
+        print(f"draft_logits_output.next_token_logits.shape={draft_logits_output.next_token_logits.shape}")
+        print(f"draft_logits_output.hidden_states.shape={draft_logits_output.hidden_states.shape}")
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[select_index]
         draft_logits_output.hidden_states = draft_logits_output.hidden_states[select_index]
         topk_p, topk_index = topk_probs_from_logits(
@@ -617,13 +620,6 @@ class EAGLEWorker(ModelWorker):
         ]
         batch_output.allocate_lens = batch_output.allocate_lens[:model_worker_batch.real_bs]
         batch_output.accept_lens = batch_output.accept_lens[:model_worker_batch.real_bs]
-        print(f"{model_worker_batch.real_bs=}")
-        print(f"{batch_output.next_draft_input.hidden_states.shape=}")
-        print(f"{batch_output.next_draft_input.topk_p.shape=}")
-        print(f"{batch_output.next_draft_input.topk_index.shape=}")
-        print(f"{batch_output.next_draft_input.verified_id.shape=}")
-        print(f"{batch_output.allocate_lens.shape=}")
-        print(f"{batch_output.accept_lens.shape=}")
 
     def draft_forward(self, model_worker_batch: ModelWorkerBatch):
         topk_p, topk_index, hidden_states = (
