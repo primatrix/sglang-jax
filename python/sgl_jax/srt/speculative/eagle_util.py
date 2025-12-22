@@ -490,9 +490,8 @@ class EagleDraftInput:
         verified_id = batch_output.next_draft_input.verified_id
         # verified_id = verified_id[verified_id != 0].flatten()
         model_worker_batch.input_ids = verified_id
-        model_worker_batch.seq_lens = (
-            model_worker_batch.seq_lens[: model_worker_batch.real_bs] + batch_output.accept_lens
-        )
+        model_worker_batch.seq_lens = model_worker_batch.seq_lens + batch_output.accept_lens
+        print(f"{model_worker_batch.seq_lens=}")
         bs = batch_output.accept_lens.shape[0]
         step_plus_1 = verified_id.shape[0] // bs
 
