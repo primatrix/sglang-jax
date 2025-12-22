@@ -310,20 +310,20 @@ class EAGLEWorker(ModelWorker):
             valid_mask = seq_lens_cpu > 0
             if np.any(valid_mask):
                 valid_indices = np.where(valid_mask)[0]
-                valid_seq_lens = seq_lens_cpu[valid_mask]
+                valid_allocate_lens = spec_info.allocate_lens[valid_mask]
                 # Calculate aligned lengths for all valid sequences at once
-                aligned_lengths = ((valid_seq_lens + page_size - 1) // page_size) * page_size
+                aligned_lengths = ((valid_allocate_lens + page_size - 1) // page_size) * page_size
                 total_aligned_length = np.sum(aligned_lengths)
                 # Pre-allocate the result array
                 cache_loc_flat = np.zeros(total_aligned_length, dtype=np.int32)
                 # Fill the array efficiently
                 offset = 0
-                for i, (seq_idx, seq_len, aligned_len) in enumerate(
-                    zip(valid_indices, valid_seq_lens, aligned_lengths)
+                for i, (seq_idx, allocate_len, aligned_len) in enumerate(
+                    zip(valid_indices, valid_allocate_lens, aligned_lengths)
                 ):
                     # Copy the actual data
-                    cache_loc_flat[offset : offset + seq_len] = token_indices_with_all_reqs[
-                        seq_idx, :seq_len
+                    cache_loc_flat[offset : offset + allocate_len] = token_indices_with_all_reqs[
+                        seq_idx, :allocate_len
                     ]
                     # Padding is already zero from initialization
                     offset += aligned_len
@@ -336,7 +336,6 @@ class EAGLEWorker(ModelWorker):
         if len(cache_loc_flat) < total_cache_loc_size:
             cache_loc_cpu[len(cache_loc_flat) :] = 0
         model_worker_batch.cache_loc = cache_loc_cpu
-
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
         spec_info = model_worker_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
@@ -460,7 +459,6 @@ class EAGLEWorker(ModelWorker):
         logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
             model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
         )
-        logits_output.truncate_logits_processor_output(model_worker_batch)
         spec_info.hidden_states = logits_output.hidden_states
         (
             predict,

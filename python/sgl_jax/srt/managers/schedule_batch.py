@@ -1202,7 +1202,7 @@ class ScheduleBatch:
             # Filter out empty sequences
             valid_mask = seq_lens_cpu > 0
             if np.any(valid_mask):
-                valid_indices = np.where(valid_mask)[0]
+                valid_indices = np.where(valid_maask)[0]
                 valid_seq_lens = seq_lens_cpu[valid_mask]
 
                 # Calculate aligned lengths for all valid sequences at once
