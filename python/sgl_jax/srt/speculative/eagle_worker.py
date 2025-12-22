@@ -407,6 +407,11 @@ class EAGLEWorker(ModelWorker):
         model_worker_batch.spec_info = spec_info
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
+        print(f"{model_worker_batch.spec_info.hidden_states=}")
+        print(f"{model_worker_batch.spec_info.topk_index=}")
+        print(f"{model_worker_batch.spec_info.topk_p=}")
+        print(f"{model_worker_batch.spec_info.verified_id=}")
+
         self.padding_for_decode(model_worker_batch)
         score_list, token_list, parents_list = self.draft_forward(model_worker_batch)
         (
@@ -454,6 +459,11 @@ class EAGLEWorker(ModelWorker):
         forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
+        print(f"verify {model_worker_batch.input_ids=}")
+        print(f"verify {model_worker_batch.positions=}")
+        print(f"verify {forward_metadata.page_indices[:50]=}")
+        print(f"verify {forward_metadata.cu_q_lens[:50]=}")
+        print(f"verify {forward_metadata.cu_kv_lens[:50]=}")
         logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
             model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
         )
@@ -479,6 +489,9 @@ class EAGLEWorker(ModelWorker):
             allocate_lens=cur_allocate_lens,
             hidden_states=logits_output.hidden_states,
         )
+        print(f"{next_draft_input.hidden_states.shape=}")
+        for i in range(8):
+            print(f"{next_draft_input.hidden_states[i,:]=}")
         model_worker_batch.spec_info = next_draft_input
         return GenerationBatchResult(
             logits_output=logits_output,

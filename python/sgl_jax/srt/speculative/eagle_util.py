@@ -487,17 +487,13 @@ class EagleDraftInput:
         precompile_token_paddings,
     ):
         model_worker_batch.spec_info = self
-        verified_id = batch_output.next_draft_input.verified_id
-        model_worker_batch.input_ids = verified_id
-        # print(f"1111 {model_worker_batch.seq_lens=}")
-        # print(f"{verified_id=}")
-        # print(f"{batch_output.accept_lens=}")
-        # print(f"{batch_output.next_draft_input.hidden_states.shape=}")
+        # verified_id = batch_output.next_draft_input.verified_id
+        # model_worker_batch.input_ids = verified_id
+
         model_worker_batch.seq_lens[:model_worker_batch.real_bs] = model_worker_batch.seq_lens[:model_worker_batch.real_bs] + batch_output.accept_lens[:model_worker_batch.real_bs]
-        # print(f"2222 {model_worker_batch.seq_lens=}")
         
         bs = batch_output.accept_lens.shape[0]
-        step_plus_1 = verified_id.shape[0] // bs
+        step_plus_1 = model_worker_batch.input_ids.shape[0] // bs
 
         model_worker_batch.extend_seq_lens = np.full((bs,), step_plus_1, dtype=np.int32)
         model_worker_batch.extend_seq_lens[model_worker_batch.real_bs :] = 0
@@ -515,6 +511,13 @@ class EagleDraftInput:
         logits_metadata = LogitsMetadata.from_model_worker_batch(
             model_worker_batch, draft_model_runner.mesh
         )
+        print(f"{model_worker_batch.input_ids=}")
+        print(f"{model_worker_batch.positions=}")
+        print(f"{forward_metadata.page_indices[:50]=}")
+        print(f"{forward_metadata.cu_q_lens[:50]=}")
+        print(f"{forward_metadata.cu_kv_lens[:50]=}")
+        print(f"{forward_metadata.seq_lens[:50]=}")
+
         return model_worker_batch, logits_metadata
 
     def prepare_for_decode(self, schedule_batch: ScheduleBatch):
