@@ -65,6 +65,10 @@ def ref_moe(
     gating_output: jax.Array,  # (num_tokens, num_experts)
     top_k: int,
     *,
+    use_grouped_topk: bool = False,
+    num_groups: int = 1,
+    top_k_groups: int = 1,
+    bias: jax.Array | None = None,  # (num_experts,)
     renormalize_topk_logits: bool = False,
     act_fn: str = "silu",
     subc_quant_wsz: int | None = None,
@@ -78,14 +82,48 @@ def ref_moe(
     b2: jax.Array | None = None,  # F32(num_experts, 1, hidden_size)
 ):
     n_tokens = tokens.shape[0]  # num_tokens
+    num_experts = gating_output.shape[-1]
 
     # Compute gating scores for all experts
-    gating_logits = jax.nn.softmax(gating_output, axis=-1)  # [num_tokens, n_experts]
+    gating_logits_f32 = gating_output.astype(jnp.float32)
+    gating_probs = jax.nn.softmax(gating_logits_f32, axis=-1)
 
-    # Select top-k experts per token
-    top_k_logits, top_k_indices = lax.top_k(
-        gating_logits, top_k
-    )  # [num_tokens, top_k], [num_tokens, top_k]
+    routing_scores = (
+        gating_probs + jnp.expand_dims(bias.astype(jnp.float32), 0)
+        if bias is not None
+        else gating_probs
+    )
+
+    if use_grouped_topk:
+        assert num_experts % num_groups == 0
+        experts_per_group = num_experts // num_groups
+        reshaped_routing_scores = routing_scores.reshape(n_tokens, num_groups, experts_per_group)
+
+        if bias is not None:
+            top2_vals, _ = lax.top_k(reshaped_routing_scores, 2)
+            group_scores = jnp.sum(top2_vals, axis=-1)
+        else:
+            group_scores = jnp.max(reshaped_routing_scores, axis=-1)
+
+        group_mask_accum = jnp.zeros((n_tokens, num_groups), dtype=jnp.bool_)
+        temp_group_scores = group_scores
+        group_iota = jax.lax.broadcasted_iota(jnp.int32, (n_tokens, num_groups), 1)
+
+        for _ in range(top_k_groups):
+            curr_max_group_idx = jnp.argmax(temp_group_scores, axis=1, keepdims=True)
+            curr_mask = group_iota == curr_max_group_idx
+            group_mask_accum = jnp.logical_or(group_mask_accum, curr_mask)
+            temp_group_scores = jnp.where(curr_mask, -jnp.float32(jnp.inf), temp_group_scores)
+
+        expert_mask = jnp.repeat(
+            jnp.expand_dims(group_mask_accum, axis=2), experts_per_group, axis=2
+        ).reshape(n_tokens, num_experts)
+
+        # Apply mask to routing_scores
+        routing_scores = jnp.where(expert_mask, routing_scores, -jnp.float32(jnp.inf))
+
+    _, top_k_indices = lax.top_k(routing_scores, top_k)
+    top_k_logits = jnp.take_along_axis(gating_probs, top_k_indices, axis=-1)
 
     if renormalize_topk_logits:
         top_k_logits = top_k_logits / jnp.sum(top_k_logits, axis=-1, keepdims=True)
@@ -169,6 +207,7 @@ def _fused_ep_moe_kernel(
     b2_hbm,  # None | F32(local_num_experts, 1, hidden_size)
     gating_hbm,  # (local_num_tokens, padded_num_experts)
     a2a_g_hbm,  # (num_experts, bt, t_packing, hidden_size // t_packing)
+    bias_hbm,  # None | F32(padded_num_experts,)
     # Output
     output_hbm,  # (local_num_tokens, hidden_size)
     # Scratch
@@ -195,6 +234,7 @@ def _fused_ep_moe_kernel(
     b_b3_x2_vmem,  # None | <bw_sem_id> (2, 1, bf)
     b_b2_x2_vmem,  # None | <bw_sem_id> (2, t_packing, 1, bd2 // t_packing)
     b_acc_vmem,  # F32(bt * num_devices, 1, bf * 2)
+    b_bias_vmem,  # None | F32(padded_num_experts,)
     ### Semaphores:
     local_sems,  # (2, 5): 2 x [b_gating_sem, b_w1_sem, b_w2_sem, b_w3_sem, b_output_sem]
     send_sems,  # <e_sem_id> (2,)
@@ -203,6 +243,9 @@ def _fused_ep_moe_kernel(
     a2a_acc_sem,
     *,
     top_k: int,
+    use_grouped_topk: bool = False,
+    num_groups: int = 1,
+    top_k_groups: int = 1,
     renormalize_topk_logits: bool,
     ep_axis_name: str,
     act_fn: str,
@@ -297,9 +340,64 @@ def _fused_ep_moe_kernel(
             sem=b_gating_sem,
         ).wait()
 
-    def get_top_k(input, top_k, renormalize_topk_logits):
-        assert len(input.shape) == 2, input.shape
-        input = input.astype(jnp.float32)
+    def get_top_k(logits, top_k, renormalize_topk_logits):
+        num_tokens, num_experts = logits.shape
+        logits = logits.astype(jnp.float32)
+
+        if b_bias_vmem is not None:
+            bias_val = b_bias_vmem[...]
+            routing_scores = logits + jnp.expand_dims(bias_val, 0)
+        else:
+            routing_scores = logits
+
+        if use_grouped_topk:
+            assert num_experts % num_groups == 0, "Experts must be evenly divisible by groups"
+            experts_per_group = num_experts // num_groups
+
+            group_scores_list = []
+            for g in range(num_groups):
+                start = g * experts_per_group
+                end = start + experts_per_group
+                group_slice = routing_scores[:, start:end]
+
+                if b_bias_vmem is not None:
+                    val1 = jnp.max(group_slice, axis=1, keepdims=True)
+                    idx1 = jnp.argmax(group_slice, axis=1, keepdims=True)
+                    iota_slice = jax.lax.broadcasted_iota(jnp.int32, group_slice.shape, 1)
+                    mask1 = iota_slice == idx1
+                    group_slice_masked = jnp.where(mask1, -jnp.inf, group_slice)
+                    val2 = jnp.max(group_slice_masked, axis=1, keepdims=True)
+                    g_score = val1 + val2
+                else:
+                    g_score = jnp.max(group_slice, axis=1, keepdims=True)
+
+                group_scores_list.append(g_score)
+
+            group_scores = jnp.concatenate(group_scores_list, axis=1)
+
+            group_mask_accum = jnp.zeros((num_tokens, num_groups), dtype=jnp.bool_)
+            temp_group_scores = group_scores
+            group_iota = jax.lax.broadcasted_iota(jnp.int32, (num_tokens, num_groups), 1)
+
+            for _ in range(top_k_groups):
+                curr_max_group_idx = jnp.argmax(temp_group_scores, axis=1, keepdims=True)
+                curr_mask = group_iota == curr_max_group_idx
+                group_mask_accum = jnp.logical_or(group_mask_accum, curr_mask)
+                temp_group_scores = jnp.where(curr_mask, -jnp.inf, temp_group_scores)
+
+            masked_routing_slices = []
+            for g in range(num_groups):
+                g_mask = group_mask_accum[:, g : g + 1]
+                start = g * experts_per_group
+                end = start + experts_per_group
+                inp_slice = routing_scores[:, start:end]
+                masked_slice = jnp.where(g_mask, inp_slice, -jnp.inf)
+                masked_routing_slices.append(masked_slice)
+
+            input = jnp.concatenate(masked_routing_slices, axis=1)
+        else:
+            input = routing_scores
+
         padded_k_shape = (input.shape[0], padded_top_k)
         top_k_logits_lst = []
         top_k_indices_lst = []
@@ -310,23 +408,25 @@ def _fused_ep_moe_kernel(
         top_k_logits_sum = jnp.zeros(padded_k_shape, jnp.float32)
 
         for k_id in range(top_k):
-            # TODO(jevinjiang): return both top_k values and indices in Mosaic
-            top_k_logits = jnp.broadcast_to(
-                jnp.max(input[:, :num_experts], axis=1, keepdims=True),
-                padded_k_shape,
-            ).astype(input.dtype)
+            curr_indices = jnp.argmax(input[:, :num_experts], axis=1, keepdims=True)
+            top_k_indices = jnp.broadcast_to(curr_indices, padded_k_shape)
+            top_k_indices_lst.append(top_k_indices)
+
+            selection_mask = iota == broadcast_minor(top_k_indices, input.shape)
+            val = jnp.max(
+                jnp.where(selection_mask, logits[:, :num_experts], 0.0), axis=1, keepdims=True
+            )
+
+            top_k_logits = jnp.broadcast_to(val, padded_k_shape).astype(input.dtype)
             top_k_logits_lst.append(top_k_logits)
+
             if renormalize_topk_logits:
                 top_k_logits_sum += top_k_logits
-            # TODO(jevinjiang): support bf16 argmax in Mosaic
-            top_k_indices = jnp.broadcast_to(
-                jnp.argmax(input[:, :num_experts], axis=1, keepdims=True),
-                padded_k_shape,
-            )
-            top_k_indices_lst.append(top_k_indices)
+
             t2e_routing = jnp.where(padded_k_iota == k_id, top_k_indices, t2e_routing)
-            mask = iota == broadcast_minor(top_k_indices, input.shape)
+            mask = selection_mask
             t2e += mask.astype(jnp.int32)
+
             if k_id != top_k - 1:
                 input = jnp.where(mask, -jnp.inf, input)
 
@@ -1026,6 +1126,15 @@ def _fused_ep_moe_kernel(
         ).wait()
 
     ### ------- Kernel start ------- ###
+    if bias_hbm is not None:
+        bias_copy = pltpu.make_async_copy(
+            src_ref=bias_hbm,
+            dst_ref=b_bias_vmem,
+            sem=local_sems.at[0, 0],
+        )
+        bias_copy.start()
+        bias_copy.wait()
+
     start_fetch_b_gating(bt_id=0)
 
     def run_per_bt(bt_id, e_sem_id):
@@ -1035,7 +1144,10 @@ def _fused_ep_moe_kernel(
         wait_fetch_b_gating(bt_id)
 
         b_gating = b_gating_x2_vmem[bt_sem_id]
-        b_gating_score = jax.nn.softmax(b_gating, axis=-1)
+
+        b_gating_logits = b_gating.astype(jnp.float32)
+        b_gating_score = jax.nn.softmax(b_gating_logits, axis=-1)
+
         top_k_logits_lst, t2e_routing, expert_sizes, expert_starts = get_top_k(
             b_gating_score, top_k, renormalize_topk_logits
         )
@@ -1120,6 +1232,10 @@ def _validate_fused_ep_moe_args(
     w2: jax.Array,
     gating_output: jax.Array,
     top_k: int,
+    use_grouped_topk: bool,
+    num_groups: int,
+    top_k_groups: int,
+    bias: jax.Array | None,
     subc_quant_wsz: int | None,
     w1_scale: jax.Array | None,
     w2_scale: jax.Array | None,
@@ -1149,6 +1265,24 @@ def _validate_fused_ep_moe_args(
 
     num_tokens, hidden_size = tokens.shape
     num_experts, intermediate_size, _ = w2.shape
+
+    if bias is not None and bias.ndim != 1:
+        raise ValueError(f"bias must be 1D, got {bias.shape}")
+    if use_grouped_topk:
+        if num_groups <= 0:
+            raise ValueError(f"Expected num_groups > 0, got {num_groups}")
+        if top_k_groups <= 0:
+            raise ValueError(f"Expected top_k_groups > 0, got {top_k_groups}")
+        if top_k_groups > num_groups:
+            raise ValueError(
+                f"top_k_groups ({top_k_groups}) cannot be larger than num_groups ({num_groups})"
+            )
+
+        num_experts = w2.shape[0]
+        if num_experts % num_groups != 0:
+            raise ValueError(
+                f"num_experts ({num_experts}) must be divisible by num_groups ({num_groups})"
+            )
 
     if w1.shape != (num_experts, 2, hidden_size, intermediate_size):
         raise ValueError(
@@ -1272,6 +1406,9 @@ def _validate_fused_ep_moe_args(
     static_argnames=[
         "mesh",
         "top_k",
+        "use_grouped_topk",
+        "num_groups",
+        "top_k_groups",
         "renormalize_topk_logits",
         "act_fn",
         "subc_quant_wsz",
@@ -1294,6 +1431,9 @@ def fused_ep_moe(
     gating_output: jax.Array,  # (num_tokens, num_experts)
     top_k: int,
     *,
+    use_grouped_topk: bool = False,
+    num_groups: int = 1,
+    top_k_groups: int = 1,
     renormalize_topk_logits: bool = False,
     act_fn: str = "silu",
     subc_quant_wsz: int | None = None,
@@ -1305,6 +1445,7 @@ def fused_ep_moe(
     ) = None,  # F32(num_experts, intermediate_size // subc_quant_wsz, 1, hidden_size)
     b1: jax.Array | None = None,  # F32(num_experts, 2, 1, intermediate_size)
     b2: jax.Array | None = None,  # F32(num_experts, 1, hidden_size)
+    bias: jax.Array | None = None,  # (num_experts,)
     # Kernel tuning parameters.
     bt: int,
     bf: int,
@@ -1323,6 +1464,10 @@ def fused_ep_moe(
         w2=w2,
         gating_output=gating_output,
         top_k=top_k,
+        use_grouped_topk=use_grouped_topk,
+        num_groups=num_groups,
+        top_k_groups=top_k_groups,
+        bias=bias,
         subc_quant_wsz=subc_quant_wsz,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
@@ -1384,16 +1529,28 @@ def fused_ep_moe(
             constant_values=-jnp.inf,
         )
 
+    if bias is not None:
+        if bias.dtype != jnp.float32:
+            bias = bias.astype(jnp.float32)
+        if padded_num_experts != bias.shape[0]:
+            bias = jnp.pad(bias, (0, padded_num_experts - bias.shape[0]), constant_values=0.0)
+
     tokens = tokens.reshape(-1, t_packing, hidden_size // t_packing)
 
     hbm_block_spec = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     renorm_str = "-renorm_k" if renormalize_topk_logits else ""
     scope_name = f"fused-moe-k_{top_k}{renorm_str}-bt_{bt}_{btc}-bf_{bf}_{bfc}-bd1_{bd1}_{bd1c}-bd2_{bd2}_{bd2c}"
+    if use_grouped_topk:
+        scope_name += f"-grp_{num_groups}_{top_k_groups}"
+
     fused_moe = jax.named_scope(scope_name)(
         pl.pallas_call(
             functools.partial(
                 _fused_ep_moe_kernel,
                 top_k=top_k,
+                use_grouped_topk=use_grouped_topk,
+                num_groups=num_groups,
+                top_k_groups=top_k_groups,
                 renormalize_topk_logits=renormalize_topk_logits,
                 ep_axis_name=ep_axis_name,
                 act_fn=act_fn,
@@ -1420,6 +1577,7 @@ def fused_ep_moe(
                     None if b2 is None else hbm_block_spec,  # b2_hbm
                     hbm_block_spec,  # gating_output_hbm
                     hbm_block_spec,  # a2a_g_hbm
+                    None if bias is None else hbm_block_spec,  # bias_hbm
                 ],
                 out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                 scratch_shapes=(
@@ -1555,6 +1713,7 @@ def fused_ep_moe(
                         ),
                         # b_acc_vmem
                         pltpu.VMEM((bt * num_devices, 1, bf * 2), jnp.float32),
+                        (None if bias is None else pltpu.VMEM((padded_num_experts,), jnp.float32)),
                         # local_sems
                         pltpu.SemaphoreType.DMA((2, 5)),
                         # send_sems
@@ -1589,6 +1748,7 @@ def fused_ep_moe(
             None if b2 is None else P(ep_axis_name),  # b2_hbm
             P(ep_axis_name),  # gating_output_hbm
             P(),  # a2a_g_hbm
+            None if bias is None else P(),
         ),
         out_specs=P(ep_axis_name),
         check_vma=False,
@@ -1603,6 +1763,7 @@ def fused_ep_moe(
         b2,
         gating_output,
         a2a_g_hbm_scratch,
+        bias,
     ):
         return fused_moe(
             pltpu.with_memory_space_constraint(tokens, pltpu.HBM),  # tokens_hbm
@@ -1622,6 +1783,7 @@ def fused_ep_moe(
             (None if b2 is None else pltpu.with_memory_space_constraint(b2, pltpu.HBM)),  # b2_hbm
             pltpu.with_memory_space_constraint(gating_output, pltpu.HBM),  # gating_output_hbm
             pltpu.with_memory_space_constraint(a2a_g_hbm_scratch, pltpu.HBM),  # a2a_g_hbm
+            (None if bias is None else pltpu.with_memory_space_constraint(bias, pltpu.HBM)),
         )
 
     a2a_g_hbm_scratch = pl.empty((num_experts, bt, t_packing, hidden_size // t_packing), t_dtype)
@@ -1635,4 +1797,5 @@ def fused_ep_moe(
         b2,
         gating_output,
         a2a_g_hbm_scratch,
+        bias,
     )

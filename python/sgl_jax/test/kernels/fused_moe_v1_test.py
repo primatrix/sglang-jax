@@ -35,7 +35,13 @@ def gen_moe_inputs(
     key = jax.random.key(seed)
     k0, k1, k2, k3, k4, k5, k6 = jax.random.split(key, 7)
 
-    a = jax.random.normal(k0, (num_tokens, hidden_size), dtype=jnp.float32).astype(dtype) / 10
+    # Use 32.0 to prevent BF16 overflow
+    SCALE_FACTOR = 32.0
+
+    a = (
+        jax.random.normal(k0, (num_tokens, hidden_size), dtype=jnp.float32).astype(dtype)
+        / SCALE_FACTOR
+    )
 
     w1 = (
         jax.random.normal(
@@ -43,19 +49,21 @@ def gen_moe_inputs(
             (num_experts, 2, hidden_size, intermediate_size),
             dtype=jnp.float32,
         )
-        / 10
+        / SCALE_FACTOR
     ).astype(dtype)
     w2 = (
-        jax.random.normal(k2, (num_experts, intermediate_size, hidden_size), dtype=jnp.float32) / 10
+        jax.random.normal(k2, (num_experts, intermediate_size, hidden_size), dtype=jnp.float32)
+        / SCALE_FACTOR
     ).astype(dtype)
 
     if has_bias:
         b1 = (
-            jax.random.normal(k3, (num_experts, 2, 1, intermediate_size), dtype=jnp.float32) / 10
+            jax.random.normal(k3, (num_experts, 2, 1, intermediate_size), dtype=jnp.float32)
+            / SCALE_FACTOR
         ).astype(dtype)
-        b2 = (jax.random.normal(k4, (num_experts, 1, hidden_size), dtype=jnp.float32) / 10).astype(
-            dtype
-        )
+        b2 = (
+            jax.random.normal(k4, (num_experts, 1, hidden_size), dtype=jnp.float32) / SCALE_FACTOR
+        ).astype(dtype)
     else:
         b1 = b2 = None
 
@@ -65,7 +73,6 @@ def gen_moe_inputs(
         / 100
     )
 
-    # To generate unique top-k!
     top_k_indices = jax.random.randint(
         k6, (num_tokens, top_k), minval=0, maxval=num_experts - 1, dtype=jnp.int32
     )
@@ -75,12 +82,12 @@ def gen_moe_inputs(
             jax.nn.one_hot(top_k_indices, num_experts, dtype=jnp.float32),
             axis=1,
         )
-        * 30
+        * 10.0
     )
 
-    gating_output = (gating_output + one_hot).astype(dtype)
+    gating_output = gating_output + one_hot
 
-    return a, w1, w2, b1, b2, gating_output
+    return a, w1, w2, b1, b2, gating_output.astype(dtype)
 
 
 def sub_channel_quantize(x, quant_dtype, wsz=256):
@@ -139,8 +146,12 @@ class MoEKernelTest(jtu.JaxTestCase):
         w_dtype=None,
         subc_quant_wsz=None,
         has_bias=False,
+        bias=None,
         atol=2e-1,
         rtol=2e-1,
+        use_grouped_topk=False,
+        num_groups=1,
+        top_k_groups=1,
     ):
         a, w1, w2, b1, b2, gating_output = gen_moe_inputs(
             dtype,
@@ -174,6 +185,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             w2_scale=w2_scale,
             b1=b1,
             b2=b2,
+            bias=bias,  # Pass routing bias
             bt=bt,
             bf=bf,
             bd1=bd1,
@@ -183,7 +195,11 @@ class MoEKernelTest(jtu.JaxTestCase):
             bd1c=bd1c,
             bd2c=bd2c,
             ep_axis_name="tensor",
+            use_grouped_topk=use_grouped_topk,
+            num_groups=num_groups,
+            top_k_groups=top_k_groups,
         )
+
         expected = ref_moe(
             a,
             w1,
@@ -192,11 +208,15 @@ class MoEKernelTest(jtu.JaxTestCase):
             top_k,
             b1=b1,
             b2=b2,
+            bias=bias,  # Pass routing bias
             renormalize_topk_logits=renormalize_topk_logits,
             act_fn=act_fn,
             subc_quant_wsz=subc_quant_wsz,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
+            use_grouped_topk=use_grouped_topk,
+            num_groups=num_groups,
+            top_k_groups=top_k_groups,
         )
         self.assertAllClose(actual, expected, atol=atol, rtol=rtol)
 
@@ -227,6 +247,78 @@ class MoEKernelTest(jtu.JaxTestCase):
             bfc=256,
             bd1c=256,
             bd2c=256,
+        )
+
+    @parameterized.named_parameters(
+        ("single_group_select", 4, 1),  # 128 experts / 4 groups = 32 experts/group.
+        ("multi_group_select", 8, 2),  # 128 experts / 8 groups = 16 experts/group.
+    )
+    def test_grouped_topk(self, num_groups, top_k_groups):
+        dtype = jnp.bfloat16
+        top_k = 8
+        num_experts = 128
+        hidden_size = 1024
+        intermediate_size = 1024
+        num_tokens = 8 * 32
+
+        assert num_experts % num_groups == 0
+
+        self._test_moe(
+            dtype=dtype,
+            top_k=top_k,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_tokens=num_tokens,
+            seed=1234,
+            renormalize_topk_logits=True,
+            bt=32,
+            bf=1024,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=256,
+            bd1c=256,
+            bd2c=256,
+            use_grouped_topk=True,
+            num_groups=num_groups,
+            top_k_groups=top_k_groups,
+        )
+
+    def test_routing_bias_and_group_logic(self):
+        dtype = jnp.bfloat16
+        top_k = 8
+        num_experts = 128
+        hidden_size = 1024
+        intermediate_size = 1024
+        num_tokens = 8 * 32
+
+        bias = jnp.zeros((num_experts,), dtype=jnp.float32)
+        bias = bias.at[0].set(100.0)
+        num_groups = 4
+        bias = bias.at[32:64].add(50.0)
+
+        self._test_moe(
+            dtype=dtype,
+            top_k=top_k,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_tokens=num_tokens,
+            seed=1234,
+            renormalize_topk_logits=True,
+            bt=32,
+            bf=1024,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=256,
+            bd1c=256,
+            bd2c=256,
+            use_grouped_topk=True,
+            num_groups=num_groups,
+            top_k_groups=2,
+            bias=bias,
         )
 
     @parameterized.product(
@@ -357,7 +449,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             bd2c=256,
         )
 
-    def test_bias(self):
+    def test_ffn_bias(self):
         dtype = jnp.bfloat16
         top_k = 8
         num_experts = 128
