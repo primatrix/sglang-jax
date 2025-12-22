@@ -489,34 +489,32 @@ class EagleDraftInput:
         model_worker_batch.spec_info = self
         verified_id = batch_output.next_draft_input.verified_id
         model_worker_batch.input_ids = verified_id
-        print(f"1111 {model_worker_batch.seq_lens=}")
-        print(f"{verified_id=}")
-        print(f"{batch_output.accept_lens=}")
-        print(f"{batch_output.next_draft_input.hidden_states.shape=}")
+        # print(f"1111 {model_worker_batch.seq_lens=}")
+        # print(f"{verified_id=}")
+        # print(f"{batch_output.accept_lens=}")
+        # print(f"{batch_output.next_draft_input.hidden_states.shape=}")
         model_worker_batch.seq_lens[:model_worker_batch.real_bs] = model_worker_batch.seq_lens[:model_worker_batch.real_bs] + batch_output.accept_lens[:model_worker_batch.real_bs]
-        print(f"2222 {model_worker_batch.seq_lens=}")
+        # print(f"2222 {model_worker_batch.seq_lens=}")
         
         bs = batch_output.accept_lens.shape[0]
         step_plus_1 = verified_id.shape[0] // bs
 
         model_worker_batch.extend_seq_lens = np.full((bs,), step_plus_1, dtype=np.int32)
         model_worker_batch.extend_seq_lens[model_worker_batch.real_bs :] = 0
-        print(f"3333 {model_worker_batch.extend_seq_lens=}")
+        # print(f"3333 {model_worker_batch.extend_seq_lens=}")
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
         model_worker_batch.spec_info.hidden_states = batch_output.next_draft_input.hidden_states
-
+        model_worker_batch.spec_info.accept_length = batch_output.accept_lens
         forward_metadata = draft_model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
         draft_model_runner.attn_backend.forward_metadata = forward_metadata
         from sgl_jax.srt.layers.logits_processor import LogitsMetadata
-
         logits_metadata = LogitsMetadata.from_model_worker_batch(
             model_worker_batch, draft_model_runner.mesh
         )
-
         return model_worker_batch, logits_metadata
 
     def prepare_for_decode(self, schedule_batch: ScheduleBatch):

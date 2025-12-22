@@ -408,9 +408,7 @@ class EAGLEWorker(ModelWorker):
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
         self.padding_for_decode(model_worker_batch)
-        # Run forward steps
         score_list, token_list, parents_list = self.draft_forward(model_worker_batch)
-        # FIXME(pc) this place will cost 20+ms because of large model_worker_batch.seq_lens.shape[0], we should optim this
         (
             tree_mask,
             position,
@@ -432,7 +430,6 @@ class EAGLEWorker(ModelWorker):
             model_worker_batch.speculative_num_steps,
             self.mesh,
         )
-        # build tree
         model_worker_batch.spec_info = EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
@@ -602,11 +599,11 @@ class EAGLEWorker(ModelWorker):
             + batch_output.accept_lens[: model_worker_batch.real_bs]
             - 1
         )
-        print(f"select_index={select_index}")
-        print(f"draft_logits_output.next_token_logits.shape={draft_logits_output.next_token_logits.shape}")
-        print(f"draft_logits_output.hidden_states.shape={draft_logits_output.hidden_states.shape}")
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[select_index]
         draft_logits_output.hidden_states = draft_logits_output.hidden_states[select_index]
+        print(f"{draft_logits_output.next_token_logits[:5,:50]=}")
+        print(f"{draft_logits_output.hidden_states[:5,:50]=}")
+
         topk_p, topk_index = topk_probs_from_logits(
             draft_logits_output.next_token_logits, self.topk
         )
