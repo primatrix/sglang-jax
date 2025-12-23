@@ -490,8 +490,11 @@ class EagleDraftInput:
         # verified_id = batch_output.next_draft_input.verified_id
         # model_worker_batch.input_ids = verified_id
 
-        model_worker_batch.seq_lens[:model_worker_batch.real_bs] = model_worker_batch.seq_lens[:model_worker_batch.real_bs] + batch_output.accept_lens[:model_worker_batch.real_bs]
-        
+        model_worker_batch.seq_lens[: model_worker_batch.real_bs] = (
+            model_worker_batch.seq_lens[: model_worker_batch.real_bs]
+            + batch_output.accept_lens[: model_worker_batch.real_bs]
+        )
+
         bs = batch_output.accept_lens.shape[0]
         step_plus_1 = model_worker_batch.input_ids.shape[0] // bs
 
@@ -508,6 +511,7 @@ class EagleDraftInput:
         )
         draft_model_runner.attn_backend.forward_metadata = forward_metadata
         from sgl_jax.srt.layers.logits_processor import LogitsMetadata
+
         logits_metadata = LogitsMetadata.from_model_worker_batch(
             model_worker_batch, draft_model_runner.mesh
         )
@@ -566,13 +570,7 @@ class EagleDraftInput:
         self.num_tokens_per_batch = topk
         self.num_tokens_for_logprob_per_batch = topk
         model_worker_batch.return_hidden_states = False
-        # bs = model_worker_batch.seq_lens.shape[0]
-        # we don't need process outcache_loc because we don't need this in attention backend
-        # out_cache_loc = np.empty((bs * topk * num_steps), dtype=np.int32)
-        # model_worker_batch.out_cache_loc = out_cache_loc
         model_worker_batch.seq_lens_sum = np.sum(model_worker_batch.seq_lens)
-        model_worker_batch.return_hidden_states = False
-        # model_worker_batch.spec_info.positions = np.repeat(model_worker_batch.seq_lens, topk)
 
     @classmethod
     def create_idle_input(

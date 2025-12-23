@@ -294,9 +294,7 @@ class EAGLEWorker(ModelWorker):
     def padding_for_decode(self, model_worker_batch: ModelWorkerBatch):
         _, padding_bs_index = self.get_padding_bs(model_worker_batch.real_bs)
         self.copy_model_worker_batch_to_cpu(model_worker_batch)
-        spec_info = model_worker_batch.spec_info
-        assert isinstance(spec_info, EagleDraftInput)
-        spec_info.prepare_for_draft_decode(
+        model_worker_batch.spec_info.prepare_for_draft_decode(
             model_worker_batch, self.topk, self.speculative_num_steps
         )
         # get unpadded seq_lens
@@ -305,6 +303,8 @@ class EAGLEWorker(ModelWorker):
         token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[
             model_worker_batch.req_pool_indices
         ]
+        spec_info = model_worker_batch.spec_info
+        assert isinstance(spec_info, EagleDraftInput)
         cache_loc_flat = np.array([], dtype=np.int32)
         if len(seq_lens_cpu) > 0:
             # Filter out empty sequences
@@ -338,21 +338,18 @@ class EAGLEWorker(ModelWorker):
             cache_loc_cpu[len(cache_loc_flat) :] = 0
         model_worker_batch.cache_loc = cache_loc_cpu
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-        spec_info = model_worker_batch.spec_info
-        assert isinstance(spec_info, EagleDraftInput)
+
         # out_cache_loc = model_worker_batch.out_cache_loc
         topk_p, topk_index, hidden_states = (
             spec_info.topk_p,
             spec_info.topk_index,
             spec_info.hidden_states,
         )
-
+        if self.hot_token_ids is not None:
+            model_worker_batch.spec_info.topk_index = self.hot_token_ids[topk_index]
         # if we need custom mask, we should create for all at once and update it within loop
         # we should optimize build_tree_mask_for_draft_decode to a kernel
         if self.topk > 1:
-            topk_index = spec_info.topk_index
-            if self.hot_token_ids is not None:
-                topk_index = self.hot_token_ids[topk_index]
             self.draft_model_runner.attn_backend.forward_metadata.custom_mask = (
                 build_tree_mask_for_draft_decode(
                     model_worker_batch.seq_lens,
@@ -362,15 +359,16 @@ class EAGLEWorker(ModelWorker):
                 )
             )
         bs = self.precompile_bs_paddings[padding_bs_index]
-        if bs - spec_info.verified_id.shape[0] > 0:
-            spec_info.verified_id = np.pad(
-                spec_info.verified_id, ((0, bs - spec_info.verified_id.shape[0]),)
+        if bs - model_worker_batch.spec_info.verified_id.shape[0] > 0:
+            model_worker_batch.spec_info.verified_id = np.pad(
+                model_worker_batch.spec_info.verified_id,
+                ((0, bs - model_worker_batch.spec_info.verified_id.shape[0]),),
             )
-        if bs - topk_p.shape[0] > 0:
-            spec_info.topk_p = np.pad(
-                topk_p,
+        if bs - model_worker_batch.spec_info.topk_p.shape[0] > 0:
+            model_worker_batch.spec_info.topk_p = np.pad(
+                model_worker_batch.spec_info.topk_p,
                 (
-                    (0, bs - topk_p.shape[0]),
+                    (0, bs - model_worker_batch.spec_info.topk_p.shape[0]),
                     (0, 0),
                 ),
             )
@@ -378,23 +376,24 @@ class EAGLEWorker(ModelWorker):
             model_worker_batch.seq_lens = np.pad(
                 model_worker_batch.seq_lens, ((0, bs - model_worker_batch.seq_lens.shape[0]),)
             )
-            if spec_info.allocate_lens is not None:
-                spec_info.allocate_lens = np.pad(
-                    spec_info.allocate_lens, ((0, bs - spec_info.allocate_lens.shape[0]),)
+            if model_worker_batch.spec_info.allocate_lens is not None:
+                model_worker_batch.spec_info.allocate_lens = np.pad(
+                    model_worker_batch.spec_info.allocate_lens,
+                    ((0, bs - model_worker_batch.spec_info.allocate_lens.shape[0]),),
                 )
-        if bs - topk_index.shape[0] > 0:
-            spec_info.topk_index = np.pad(
-                topk_index,
+        if bs - model_worker_batch.spec_info.topk_index.shape[0] > 0:
+            model_worker_batch.spec_info.topk_index = np.pad(
+                model_worker_batch.spec_info.topk_index,
                 (
-                    (0, bs - topk_index.shape[0]),
+                    (0, bs - model_worker_batch.spec_info.topk_index.shape[0]),
                     (0, 0),
                 ),
             )
-        if bs - hidden_states.shape[0] > 0:
-            spec_info.hidden_states = np.pad(
-                hidden_states,
+        if bs - model_worker_batch.spec_info.hidden_states.shape[0] > 0:
+            model_worker_batch.spec_info.hidden_states = np.pad(
+                model_worker_batch.spec_info.hidden_states,
                 (
-                    (0, bs - hidden_states.shape[0]),
+                    (0, bs - model_worker_batch.spec_info.hidden_states.shape[0]),
                     (0, 0),
                 ),
             )
@@ -404,16 +403,19 @@ class EAGLEWorker(ModelWorker):
         model_worker_batch.speculative_num_draft_tokens = self.speculative_num_draft_tokens
         model_worker_batch.input_ids = np.empty(bs * self.topk, np.int32)
         model_worker_batch.positions = np.empty(bs * self.topk, np.int32)
-        model_worker_batch.spec_info = spec_info
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
-        print(f"{model_worker_batch.spec_info.hidden_states=}")
+        print(f"{model_worker_batch.spec_info.hidden_states[:, :50]=}")
         print(f"{model_worker_batch.spec_info.topk_index=}")
         print(f"{model_worker_batch.spec_info.topk_p=}")
         print(f"{model_worker_batch.spec_info.verified_id=}")
 
         self.padding_for_decode(model_worker_batch)
+        print(f"{model_worker_batch.spec_info.topk_index=}")
+        print(f"{model_worker_batch.seq_lens=}")
+
         score_list, token_list, parents_list = self.draft_forward(model_worker_batch)
+        print(f"draft {token_list=}")
         (
             tree_mask,
             position,
@@ -435,6 +437,8 @@ class EAGLEWorker(ModelWorker):
             model_worker_batch.speculative_num_steps,
             self.mesh,
         )
+
+        print(f"draft {draft_tokens=}")
         model_worker_batch.spec_info = EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
@@ -628,8 +632,8 @@ class EAGLEWorker(ModelWorker):
         batch_output.next_draft_input.verified_id = batch_output.next_draft_input.verified_id[
             select_index
         ]
-        batch_output.allocate_lens = batch_output.allocate_lens[:model_worker_batch.real_bs]
-        batch_output.accept_lens = batch_output.accept_lens[:model_worker_batch.real_bs]
+        batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
+        batch_output.accept_lens = batch_output.accept_lens[: model_worker_batch.real_bs]
 
     def draft_forward(self, model_worker_batch: ModelWorkerBatch):
         topk_p, topk_index, hidden_states = (
@@ -666,6 +670,11 @@ class EAGLEWorker(ModelWorker):
         forward_batch.spec_info = EagleDraftInput()
         forward_batch.spec_info.hidden_states = jnp.empty((bs * self.topk, hidden_states.shape[1]))
         for i in range(self.speculative_num_steps):
+            print(f"=== Draft Step {i} ===")
+            print(f"{topk_p[:5,:]=}")
+            print(f"{topk_index[:5,:]=}")
+            print(f"{scores=}")
+            # print(f"{hidden_states[:5,:50]=}")
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
@@ -681,16 +690,34 @@ class EAGLEWorker(ModelWorker):
                 forward_batch, i, input_ids, hidden_states, positions_base
             )
             self.draft_model_runner.attn_backend.forward_metadata = metadata_per_step[i]
+
+            print(f"draft step {i} {input_ids[:50]=}")
+            print(f"draft step {i} {forward_batch.positions[:50]=}")
+            print(f"draft step {i} {hidden_states[:5,:50]=}")
+            print(f"draft step {i} {metadata_per_step[i].page_indices[:50]=}")
+            print(f"draft step {i} {metadata_per_step[i].cu_q_lens[:50]=}")
+            print(f"draft step {i} {metadata_per_step[i].cu_kv_lens[:50]=}")
+            print(f"draft step {i} {metadata_per_step[i].seq_lens[:50]=}")
             # Run forward
             forward_batch.bid = model_worker_batch.bid
             logits_output, _ = self.draft_model_runner.forward(
                 forward_batch,
                 logits_metadata=logits_metadata,
             )
+
+            print(f"draft step {i} logits {logits_output.next_token_logits[:5,:50]=}")
+
             topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
+            print(f"1111 {topk_index[:5,:]=}")
+
             if self.hot_token_ids is not None:
                 topk_index = self.hot_token_ids[topk_index]
+            print(f"2222 {topk_index[:5,:]=}")
             hidden_states = logits_output.hidden_states
+            print(
+                f"logits processor output hidden states {logits_output.hidden_states_sampled[:5,:50]=}"
+            )
+            print("\n")
 
         return score_list, token_list, parents_list
 
@@ -822,7 +849,7 @@ def update_eagle_lists(
 ):
     bs = score_list.shape[0]
     scores_update, tokens_update, parents_update = tree_info
-
+    print(f"{tree_info=}")
     if i == 0:
         score_list = score_list.at[:bs, :1, :].set(scores_update[:bs])
         token_list = token_list.at[:bs, :topk].set(tokens_update[:bs])
