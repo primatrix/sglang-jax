@@ -4,6 +4,8 @@ from typing import Any
 import jax
 from flax import nnx
 from jax import numpy as jnp
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
@@ -46,6 +48,7 @@ class BailingMoEAttention(nnx.Module):
         attention_bias: bool = False,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
+        self.mesh = mesh
         self.layer_id = layer_id
         assert num_heads % num_kv_heads == 0
 
@@ -133,9 +136,42 @@ class BailingMoEAttention(nnx.Module):
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
 
-        q = q.reshape(-1, self.q_head_num, self.head_dim)
-        k = k.reshape(-1, self.kv_head_num, self.head_dim)
-        v = v.reshape(-1, self.kv_head_num, self.head_dim)
+        q = q.reshape(
+            -1,
+            self.q_head_num,
+            self.head_dim,
+            out_sharding=NamedSharding(
+                self.mesh,
+                P(
+                    "data",
+                    "tensor",
+                ),
+            ),
+        )
+        k = k.reshape(
+            -1,
+            self.kv_head_num,
+            self.head_dim,
+            out_sharding=NamedSharding(
+                self.mesh,
+                P(
+                    "data",
+                    "tensor",
+                ),
+            ),
+        )
+        v = v.reshape(
+            -1,
+            self.kv_head_num,
+            self.head_dim,
+            out_sharding=NamedSharding(
+                self.mesh,
+                P(
+                    "data",
+                    "tensor",
+                ),
+            ),
+        )
 
         if self.use_qk_norm:
             q = self.q_norm(q)
@@ -385,6 +421,7 @@ class BailingMoEDecoderLayer(nnx.Module):
 
             if shared_output is not None:
                 hidden_states = hidden_states + shared_output
+            topk_ids = None if self.use_fused else topk_ids
         else:
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
@@ -606,20 +643,30 @@ class BailingMoEForCausalLM(nnx.Module):
 
             if getattr(self.config, "num_shared_experts", 0) > 0:
                 if use_fused:
-                    mappings[f"{prefix}.mlp.shared_experts.gate_proj.weight"] = WeightMapping(
-                        target_path=f"{target_prefix}.mlp.w1_shared",
-                        sharding=(None, None),
-                        transpose=True,
+                    def _add_expert_weight(
+                        *,
+                        target_name: str,
+                        hf_name: str,
+                        sharding: tuple[str | None, ...],
+                    ) -> None:
+                        target_path = [f"{target_prefix}.mlp.{target_name}"]
+                        target_path.extend(
+                            [f"{prefix}.mlp.experts.{i}.{hf_name}.weight" for i in range(num_experts)]
+                        )
+                        mappings[f"__MOE_EXPERTS__{prefix}.mlp.{target_name}"] = WeightMapping(
+                            target_path=target_path,
+                            sharding=sharding,
+                            transpose=True,
+                        )
+
+                    _add_expert_weight(
+                        target_name="w1", hf_name="gate_proj", sharding=(("data", "tensor"), None, None)
                     )
-                    mappings[f"{prefix}.mlp.shared_experts.up_proj.weight"] = WeightMapping(
-                        target_path=f"{target_prefix}.mlp.w3_shared",
-                        sharding=(None, None),
-                        transpose=True,
+                    _add_expert_weight(
+                        target_name="w3", hf_name="up_proj", sharding=(("data", "tensor"), None, None)
                     )
-                    mappings[f"{prefix}.mlp.shared_experts.down_proj.weight"] = WeightMapping(
-                        target_path=f"{target_prefix}.mlp.w2_shared",
-                        sharding=(None, None),
-                        transpose=True,
+                    _add_expert_weight(
+                        target_name="w2", hf_name="down_proj", sharding=(("data", "tensor"), None, None)
                     )
                 else:
                     shared_experts_mappings = {
