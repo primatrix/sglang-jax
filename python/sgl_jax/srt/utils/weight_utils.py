@@ -31,6 +31,8 @@ class WeightMapping:
     kv_head_padding: bool = False
     concat_axis: int | None = None
     is_eagle3: bool = False
+    fuse_moe_weights: bool = False
+    fuse_gate_up: tuple[str, str] | None = None
 
     def __post_init__(self):
         if self.sharding is None:
@@ -256,37 +258,66 @@ class WeightLoader:
         infos: list[dict],
         file_manager: SequentialSafetensorManager,
         concat_axis: int,
+        fused_up_key: str | None = None,
+        fused_up_infos: list[dict] | None = None,
         target_sharding: jax.sharding.NamedSharding = None,
     ) -> jax.Array:
         """
-        Lazy loader for TP-Split weights (e.g., Grok Attention/MLP).
-        Instead of loading ALL shards on EVERY host, it calculates overlap
-        and only reads the specific file(s) containing the requested slice.
+        Lazy loader for TP-Split weights with optional SwiGLU Fusion.
         """
-        # 1. Build the "Map": Calculate start/end offsets for each file
-        # Sort by filename to ensure correct order (part-00001, part-00002...)
+        is_fused = fused_up_key is not None
+        if is_fused:
+            assert fused_up_infos is not None, "Fused infos missing"
+
+        # 1. Build the "Map": Sort and Pair
+        # We need to ensure files are processed in order (part-001, part-002...)
         sorted_infos = sorted(infos, key=lambda x: x["file"])
 
+        if is_fused:
+            sorted_up_infos = sorted(fused_up_infos, key=lambda x: x["file"])
+            assert len(sorted_infos) == len(sorted_up_infos), f"Split count mismatch for {hf_key}"
+            # Create (Gate, Up) pairs
+            sorted_pairs_list = list(zip(sorted_infos, sorted_up_infos))
+        else:
+            # Create (Gate, None) pairs
+            sorted_pairs_list = [(info, None) for info in sorted_infos]
+
+        if not sorted_pairs_list:
+            raise RuntimeError(f"No weight files found for {hf_key}")
+
+        # 2. Calculate Intervals and Global Shape
+        # Get base shape from the first shard
+        first_info = sorted_pairs_list[0][0]
+        base_shape = list(first_info["shape"])
+
         cumulative_start = 0
-        file_intervals = []  # List of (start, end, info)
+        file_intervals = []  # List of (start, end, info_gate, info_up)
 
-        # Assume all shards have same shape except on concat_axis
-        base_shape = list(sorted_infos[0]["shape"])
-
-        for info in sorted_infos:
-            shape = info["shape"]
-            length = shape[concat_axis]
+        for info_g, info_u in sorted_pairs_list:
+            # Assume splitting is only on concat_axis
+            length = info_g["shape"][concat_axis]
             start = cumulative_start
             end = start + length
-            file_intervals.append((start, end, info))
+
+            # Sanity check for Fused mode: Up shard must match Gate shard length
+            if is_fused:
+                length_u = info_u["shape"][concat_axis]
+                assert (
+                    length == length_u
+                ), f"Split shape mismatch between {hf_key} and {fused_up_key}"
+
+            file_intervals.append((start, end, info_g, info_u))
             cumulative_start = end
 
-        # 2. Determine Global Shape
-        global_shape = list(base_shape)
-        global_shape[concat_axis] = cumulative_start
-        global_shape = tuple(global_shape)
+        # Determine Global Spatial Shape
+        global_spatial_shape = list(base_shape)
+        global_spatial_shape[concat_axis] = cumulative_start
+        global_spatial_shape = tuple(global_spatial_shape)
 
-        st_dtype = sorted_infos[0]["dtype"]
+        # 3. Determine Final Output Shape
+        final_shape = (2, *global_spatial_shape) if is_fused else global_spatial_shape
+
+        st_dtype = first_info["dtype"]
         dtype_map = {
             "BF16": jnp.bfloat16,
             "F16": jnp.float16,
@@ -302,20 +333,34 @@ class WeightLoader:
         else:
             sharding = target_sharding
 
-        # 3. Define Smart Stitching Callback
+        # 4. Define Smart Stitching Callback
         def _smart_load_slice(index):
-            # index is the slice required by JAX.
-            # We need to intersect this slice with the physical file intervals.
-            slice_on_axis = index[concat_axis]
+            # If fused, index is (group_slice, dim0_slice, dim1_slice...)
+            # If standard, index is (dim0_slice, dim1_slice...)
+            if is_fused:
+                group_slice = index[0]
+                spatial_index = index[1:]
+
+                # Determine if we need Gate (0), Up (1), or both
+                # This logic simplifies "slice(None)" or specific indices
+                # But for simplicity, we'll decode what is requested.
+                # Usually JAX requests the full block or sharded block.
+                # We will construct the full (2, ...) block for the spatial slice
+                # and then slice the group dimension at the end.
+            else:
+                spatial_index = index
+
+            slice_on_axis = spatial_index[concat_axis]
 
             # Normalize slice
-            req_start, req_stop, req_step = slice_on_axis.indices(global_shape[concat_axis])
-            assert req_step == 1, "Strided access not supported in split loader yet"
+            req_start, req_stop, req_step = slice_on_axis.indices(global_spatial_shape[concat_axis])
+            assert req_step == 1, "Strided access not supported in split loader"
 
-            collected_chunks = []
+            collected_chunks_g = []
+            collected_chunks_u = []
 
-            for f_start, f_end, info in file_intervals:
-                # Calculate Intersection: [req_start, req_stop) AND [f_start, f_end)
+            for f_start, f_end, info_g, info_u in file_intervals:
+                # Intersection
                 intersect_start = max(req_start, f_start)
                 intersect_end = min(req_stop, f_end)
 
@@ -324,26 +369,45 @@ class WeightLoader:
                     local_end = intersect_end - f_start
 
                     # Construct read index for this file
-                    file_read_index = list(index)
+                    file_read_index = list(spatial_index)
                     file_read_index[concat_axis] = slice(local_start, local_end)
                     file_read_index = tuple(file_read_index)
 
-                    # Read directly
-                    f = file_manager.get_handle(info["file"])
-                    chunk = f.get_slice(hf_key)[file_read_index]
-                    collected_chunks.append(chunk)
+                    # Read Gate
+                    f_g = file_manager.get_handle(info_g["file"])
+                    chunk_g = f_g.get_slice(hf_key)[file_read_index]
+                    collected_chunks_g.append(chunk_g)
 
-            if not collected_chunks:
-                return np.zeros((0,) * len(global_shape), dtype=np.float32)
+                    # Read Up (if needed)
+                    if is_fused:
+                        f_u = file_manager.get_handle(info_u["file"])
+                        chunk_u = f_u.get_slice(fused_up_key)[file_read_index]
+                        collected_chunks_u.append(chunk_u)
 
-            if len(collected_chunks) == 1:
-                # Perfect match (1-to-1 mapping), no copy needed
-                return collected_chunks[0]
+            if not collected_chunks_g:
+                return np.zeros((0,) * len(final_shape), dtype=np.float32)
+
+            # Stitching (Concatenate along the split axis)
+            def stitch(chunks):
+                if len(chunks) == 1:
+                    return chunks[0]
+                return np.concatenate(chunks, axis=concat_axis)
+
+            final_g = stitch(collected_chunks_g)
+
+            if is_fused:
+                final_u = stitch(collected_chunks_u)
+                # Stack to (2, ...)
+                # shape: (2, H, I)
+                # We use stack axis 0
+                ret = np.stack([final_g, final_u], axis=0)
+
+                # Handle the case where JAX requested a specific slice of the '2' dim
+                return ret[group_slice, ...]
             else:
-                # Cross-file boundary (rare if TP matches), needs stitching
-                return np.concatenate(collected_chunks, axis=concat_axis)
+                return final_g
 
-        return jax.make_array_from_callback(global_shape, sharding, _smart_load_slice).astype(
+        return jax.make_array_from_callback(final_shape, sharding, _smart_load_slice).astype(
             target_dtype
         )
 
@@ -352,20 +416,26 @@ class WeightLoader:
         expected_hf_keys: list[str],
         weight_info: dict,
         file_manager: SequentialSafetensorManager,
+        fused_up_keys: list[str] | None = None,
         do_transpose: bool = False,
         target_sharding: jax.sharding.NamedSharding = None,
     ) -> jax.Array:
         """
-        Lazy oader for MoE weights:
-        1. Global Loading: Directly shards data to avoid redundant I/O.
-        2. CPU Transpose: Performs transpose on CPU to reduce TPU memory peak.
-        3. Pre-allocation: Uses np.empty instead of np.stack to save memory.
-        4. Threaded I/O: High concurrency for GCS throughput.
+        Lazy loader for MoE weights.
+        Supports both Standard MoE (3D) and Fused MoE (4D).
+
+        Args:
+            expected_hf_keys: List of keys for the primary weight (e.g., Gate or standard Expert weight).
+            fused_up_keys: Optional list of keys for the secondary weight (Up) if fusion is enabled.
         """
+        is_fused = fused_up_keys is not None
+        num_experts = len(expected_hf_keys)
+
+        if is_fused:
+            assert len(fused_up_keys) == num_experts, "Gate and Up keys count mismatch"
 
         # 1. Get base info from the first expert
         first_key = expected_hf_keys[0]
-        # assume len(infos) == 1 for standard MoE
         info = weight_info[first_key][0]
 
         single_expert_shape = info["shape"]
@@ -397,65 +467,113 @@ class WeightLoader:
         else:
             final_single_shape = single_expert_shape
 
-        stacked_shape = (num_experts, *final_single_shape)
+        # Calculate final stacked shape
+        if is_fused:
+            # Shape: (Num_Experts, 2, Hidden, Inter)
+            stacked_shape = (num_experts, 2, *final_single_shape)
+        else:
+            # Shape: (Num_Experts, Hidden, Inter)
+            stacked_shape = (num_experts, *final_single_shape)
 
         if target_sharding is None:
             sharding = jax.sharding.NamedSharding(self.mesh, P())
         else:
             sharding = target_sharding
 
-        MAX_WORKERS = 128
+        MAX_WORKERS = 64
 
         def _load_stacked_slice(index):
+            # Parse Index
             expert_slice = index[0]
-            inner_slice = index[1:]
+
+            if is_fused:
+                # index: (expert, group, h, i)
+                group_slice = index[1]
+                inner_slice = index[2:]
+            else:
+                # index: (expert, h, i)
+                group_slice = None
+                inner_slice = index[1:]
 
             start, stop, step = expert_slice.indices(num_experts)
             expert_indices = list(range(start, stop, step))
             sliced_num_experts = len(expert_indices)
 
+            # Determine buffer shape for inner dimensions
+            # We do a 'peek' read on the first requested expert to know the exact buffer size needed
+            # (Strictly speaking we could calculate it from inner_slice, but reading is safer for dtype/shape mismatch)
             if sliced_num_experts == 0:
-                return np.zeros((0, *[1] * len(inner_slice)), dtype=np.float32)
+                # Return empty with correct dimensionality
+                base_dims = (2,) if is_fused else ()
+                return np.zeros((0, *base_dims, *[1] * len(inner_slice)), dtype=np.float32)
 
-            first_idx = expert_indices[0]
-            first_hf_key = expected_hf_keys[first_idx]
+            # Define the worker function
+            def load_one_expert_data(expert_idx):
+                # Helper to process one file
+                def _read_file(key):
+                    fname = weight_info[key][0]["file"]
+                    f = file_manager.get_handle(fname)
+                    data = f.get_slice(key)[:]
+                    if do_transpose:
+                        data = np.transpose(data)
+                    # Apply inner slice (e.g. TP slice) immediately to save memory
+                    return data[inner_slice]
 
-            fname_first = weight_info[first_hf_key][0]["file"]
-            f_first = file_manager.get_handle(fname_first)
+                # Load Primary (Gate/Standard)
+                primary_data = _read_file(expected_hf_keys[expert_idx])
 
-            # Read raw data
-            first_data = f_first.get_slice(first_hf_key)[:]
+                if is_fused:
+                    # Load Secondary (Up)
+                    secondary_data = _read_file(fused_up_keys[expert_idx])
+                    return primary_data, secondary_data
+                else:
+                    return primary_data
 
-            # Process first data (transpose if needed) to determine final buffer properties
-            first_data_processed = np.transpose(first_data) if do_transpose else first_data
+            # Pre-allocate Output Buffer
+            # Peek first to get shape/dtype
+            first_res = load_one_expert_data(expert_indices[0])
 
-            # Slice according to inner_slice to determine the exact shape required
-            first_final_chunk = first_data_processed[inner_slice]
+            if is_fused:
+                # first_res is (gate_data, up_data)
+                # Output shape: (Sliced_Experts, 2, H_slice, I_slice)
+                element_shape = first_res[0].shape
+                out_shape = (sliced_num_experts, 2, *element_shape)
+                out_array = np.empty(out_shape, dtype=first_res[0].dtype)
 
-            out_shape = (sliced_num_experts, *first_final_chunk.shape)
-            out_array = np.empty(out_shape, dtype=first_final_chunk.dtype)
+                # Fill first
+                out_array[0, 0] = first_res[0]
+                out_array[0, 1] = first_res[1]
+            else:
+                # first_res is data
+                # Output shape: (Sliced_Experts, H_slice, I_slice)
+                element_shape = first_res.shape
+                out_shape = (sliced_num_experts, *element_shape)
+                out_array = np.empty(out_shape, dtype=first_res.dtype)
 
-            # Fill the first slot
-            out_array[0] = first_final_chunk
+                # Fill first
+                out_array[0] = first_res
 
-            def load_one_expert(args):
-                i, expert_idx = args
-                hf_key = expected_hf_keys[expert_idx]
-                fname = weight_info[hf_key][0]["file"]
-                f = file_manager.get_handle(fname)
-
-                data = f.get_slice(hf_key)[:]
-                if do_transpose:
-                    data = np.transpose(data)
-                out_array[i] = data[inner_slice]
-
+            # Parallel Load Remaining
             tasks = []
             for i, expert_idx in enumerate(expert_indices[1:], start=1):
                 tasks.append((i, expert_idx))
 
+            def worker(args):
+                i, exp_idx = args
+                res = load_one_expert_data(exp_idx)
+                if is_fused:
+                    out_array[i, 0] = res[0]
+                    out_array[i, 1] = res[1]
+                else:
+                    out_array[i] = res
+
             if tasks:
                 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                    list(executor.map(load_one_expert, tasks))
+                    list(executor.map(worker, tasks))
+
+            # Handle Group Slicing for Fused (if JAX asks for a subset of the '2' dimension)
+            if is_fused and group_slice is not None:
+                return out_array[:, group_slice, ...]
 
             return out_array
 
@@ -603,81 +721,87 @@ class WeightLoader:
             for moe_key, mapping in tqdm(moe_mappings.items(), desc="Loading MoE Weights"):
                 expected_hf_keys = mapping.target_path[1:]
 
+                fused_up_keys = None
+                if mapping.fuse_moe_weights:
+                    gate_token, up_token = mapping.fuse_gate_up
+                    gate_keys = sorted([k for k in expected_hf_keys if gate_token in k])
+                    up_keys = sorted([k for k in expected_hf_keys if up_token in k])
+
+                    if len(gate_keys) != len(up_keys) or len(gate_keys) == 0:
+                        logger.warning(
+                            "MoE Fusion mismatch: Gate %s, Up %s", len(gate_keys), len(up_keys)
+                        )
+                        continue
+
+                    expected_hf_keys = gate_keys
+                    fused_up_keys = up_keys
+
                 group_complete = True
                 is_tp_split = False
 
-                # Validation pass
-                for hf_key in expected_hf_keys:
+                keys_to_check = list(expected_hf_keys)  # Make a copy
+                if fused_up_keys:
+                    keys_to_check.extend(fused_up_keys)
+
+                for hf_key in keys_to_check:
                     if hf_key not in weight_info:
                         if self._is_excluded_layer_weight(hf_key):
-                            logger.debug("Skipping excluded MoE expert weight: %s", hf_key)
+                            logger.debug("Skipping excluded: %s", hf_key)
                         else:
-                            logger.warning("MoE expert weight %s not found.", hf_key)
+                            logger.warning("Missing MoE weight: %s", hf_key)
                         group_complete = False
                         break
 
                     infos = weight_info[hf_key]
-
-                    # Check for TP split (Grok style)
                     if mapping.concat_axis is not None:
                         if len(infos) > 1:
                             is_tp_split = True
-
                         if len(infos) < safetensors_partition:
-                            logger.warning(
-                                "Incomplete shards for %s: expected %s, found %s",
-                                hf_key,
-                                safetensors_partition,
-                                len(infos),
-                            )
                             group_complete = False
                             break
 
                 if not group_complete:
                     continue
 
-                # OPTIMIZATION: Use Stacked Loader if no TP split
                 if not is_tp_split and mapping.concat_axis is None:
-                    # 1. Pre-construct target sharding
                     if "expert" in mapping.sharding:
                         ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
                         world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get(
                             "tensor", 1
                         )
                         tp_size = world_size // ep_size
-
                         devices = self.mesh.devices.flatten()
-                        # Construct MoE specific mesh
                         moe_mesh = jax.sharding.Mesh(
                             devices.reshape(ep_size, tp_size), axis_names=("expert", "tensor")
                         )
                         final_sharding = jax.sharding.NamedSharding(moe_mesh, P(*mapping.sharding))
                     else:
-                        # Standard Sharding
                         final_sharding = jax.sharding.NamedSharding(self.mesh, P(*mapping.sharding))
 
-                    # 2. Call creator
                     stacked_weight = self._create_stacked_moe_lazy_tensor(
                         expected_hf_keys,
                         weight_info,
                         file_manager,
-                        do_transpose=mapping.transpose,  # CPU transpose
-                        target_sharding=final_sharding,  # Global loading
+                        fused_up_keys=fused_up_keys,
+                        do_transpose=mapping.transpose,
+                        target_sharding=final_sharding,
                     )
 
-                    # 3. Direct assignment
                     target_path = mapping.target_path[0]
                     model_param = self._get_param(params, target_path)
                     model_param.value = stacked_weight.astype(model_param.value.dtype)
 
                     logger.debug(
-                        "Assigned MoE group %s, shape: %s",
+                        "Assigned MoE group %s (Fused=%s), shape: %s",
                         moe_key,
+                        bool(fused_up_keys),
                         stacked_weight.shape,
                     )
                 else:
                     collected_experts = []
                     moe_mesh = self.mesh
+
+                    # 1. Setup Mesh (Expert Parallelism)
                     if "expert" in mapping.sharding:
                         ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
                         world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get(
@@ -689,23 +813,47 @@ class WeightLoader:
                             devices.reshape(ep_size, tp_size), axis_names=("expert", "tensor")
                         )
 
-                    for hf_key in expected_hf_keys:
+                    # 2. Iterate Experts (Sequential or Threaded)
+                    # Note: If fused, expected_hf_keys matches gate_keys from the loop setup
+                    for i, hf_key in enumerate(expected_hf_keys):
                         infos = weight_info[hf_key]
 
+                        # Prepare Fusion Args (Gate + Up)
+                        curr_up_key = None
+                        curr_up_infos = None
+                        if fused_up_keys:
+                            curr_up_key = fused_up_keys[i]
+                            curr_up_infos = weight_info[curr_up_key]
+
+                        # Call the split loader
                         expert_weight = self._create_split_lazy_tensor(
                             hf_key,
                             infos,
                             file_manager,
                             concat_axis=mapping.concat_axis,
+                            fused_up_key=curr_up_key,
+                            fused_up_infos=curr_up_infos,
                             target_sharding=None,
                         )
 
+                        # Handle Transpose logic
                         if mapping.transpose:
-                            expert_weight = jnp.transpose(expert_weight, (1, 0))
+                            if fused_up_keys:
+                                # Fused Shape: (2, H, I)
+                                # We want to transpose the spatial dims (H, I) -> (I, H)
+                                # Result Shape: (2, I, H)
+                                expert_weight = jnp.transpose(expert_weight, (0, 2, 1))
+                            else:
+                                # Standard Shape: (H, I) -> (I, H)
+                                expert_weight = jnp.transpose(expert_weight, (1, 0))
 
                         collected_experts.append(expert_weight)
 
+                    # 3. Stack and Assign
+                    # Standard: Stack (I, H) -> (E, I, H)
+                    # Fused: Stack (2, I, H) -> (E, 2, I, H)
                     stacked_weight = jnp.stack(collected_experts, axis=0)
+
                     final_sharding_spec = P(*mapping.sharding)
                     final_sharding = jax.sharding.NamedSharding(moe_mesh, final_sharding_spec)
 
@@ -716,8 +864,9 @@ class WeightLoader:
                     model_param.value = sharded_weight.astype(model_param.value.dtype)
 
                     logger.debug(
-                        "Assigned MoE group %s (Grok Split-Stitch), shape: %s",
+                        "Assigned MoE group %s (Split-Stitch, Fused=%s), shape: %s",
                         moe_key,
+                        bool(fused_up_keys),
                         stacked_weight.shape,
                     )
 
