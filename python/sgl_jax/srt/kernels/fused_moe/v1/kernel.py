@@ -2216,12 +2216,10 @@ def fused_ep_moe(
                         ),
                         # shared expert token
                         (
-                            (
-                                None
-                                if w1_shared is None
-                                else pltpu.VMEM((bt, hidden_size // t_packing), t_dtype)
-                            ),  # b_se_tokens_vmem
-                        ),
+                            None
+                            if w1_shared is None
+                            else pltpu.VMEM((bt, hidden_size // t_packing), t_dtype)
+                        ),  # b_se_tokens_vmem
                     ]
                 ),
             ),
