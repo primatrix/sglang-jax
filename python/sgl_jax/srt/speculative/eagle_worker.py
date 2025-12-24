@@ -204,6 +204,13 @@ class EAGLEWorker(ModelWorker):
         forward_metadata = self.draft_model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
+        print(f"draft extend {model_worker_batch.input_ids=}")
+        print(f"draft extend {model_worker_batch.positions=}")
+        print(f"draft extend {forward_metadata.cu_kv_lens=}")
+        print(f"draft extend {forward_metadata.cu_q_lens=}")
+        print(f"draft extend {forward_metadata.page_indices=}")
+        print(f"draft extend {forward_metadata.seq_lens=}")
+
         self.draft_model_runner.attn_backend.forward_metadata = forward_metadata
         forward_batch.forward_mode = ForwardMode.EXTEND
         # last_idx = np.cumsum(model_worker_batch.extend_seq_lens, axis=0) - 1
@@ -439,6 +446,8 @@ class EAGLEWorker(ModelWorker):
         )
 
         print(f"draft {draft_tokens=}")
+        print(f"draft {position=}")
+
         model_worker_batch.spec_info = EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
@@ -468,6 +477,9 @@ class EAGLEWorker(ModelWorker):
         print(f"verify {forward_metadata.page_indices[:50]=}")
         print(f"verify {forward_metadata.cu_q_lens[:50]=}")
         print(f"verify {forward_metadata.cu_kv_lens[:50]=}")
+        print(f"verify {forward_metadata.custom_mask[:50]=}")
+        print(f"verify {forward_metadata.seq_lens[:50]=}")
+
         logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
             model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
         )
@@ -884,7 +896,7 @@ def update_forward_batch_info(
         hidden_states[:]
     )
     forward_batch.positions = forward_batch.positions.at[:].set(
-        (positions_base[:] + i).astype(jnp.int32)
+        (positions_base[:] + i - 1).astype(jnp.int32)
     )
     return forward_batch
 

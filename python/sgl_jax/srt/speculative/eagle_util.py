@@ -753,7 +753,7 @@ class EagleVerifyInput:
         # TODO: keep draft_token on TPU
         # bs = len(model_worker_batch.req_pool_indices)
         model_worker_batch.input_ids = self.draft_token
-        model_worker_batch.positions = self.positions
+        model_worker_batch.positions = self.positions - 1
         # bs = batch.batch_size()
         # prefix_lens = model_worker_batch.seq_lens
         # seq_lens_with_draft_token = model_worker_batch.seq_lens + self.draft_token_num
