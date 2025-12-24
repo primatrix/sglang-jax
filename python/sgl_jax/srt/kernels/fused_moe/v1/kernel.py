@@ -976,7 +976,8 @@ def _fused_ep_moe_kernel(
 
             # W1
             # Prefetch Next W1
-            if next_bf_idx < num_se_bf_per_slice:
+            @pl.when(next_bf_idx < num_se_bf_per_slice)
+            def _():
                 for bd1_idx in range(num_bd1):
                     start_fetch_se_w1(grp_sem_id ^ 1, slice_idx, next_bf_idx, bd1_idx)
 
@@ -1050,7 +1051,8 @@ def _fused_ep_moe_kernel(
                 act = jax.nn.silu(act_gate) * act_up
 
             # W2
-            if next_bf_idx < num_se_bf_per_slice:
+            @pl.when(next_bf_idx < num_se_bf_per_slice)
+            def _():
                 for bd2_idx in range(num_bd2):
                     start_fetch_se_w2(grp_sem_id ^ 1, slice_idx, next_bf_idx, bd2_idx)
 
