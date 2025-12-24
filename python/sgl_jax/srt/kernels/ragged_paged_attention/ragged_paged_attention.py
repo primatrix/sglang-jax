@@ -442,38 +442,50 @@ def _ragged_paged_attention_kernel(
         # Make sure the current bkv buffer is safe to overwrite.
         wait_update_kv_cache(bkv_sem_idx)
 
-        def loop_body(i, offset):
-            sz = jnp.minimum(page_size, kv_left_frm_cache - i * page_size)
-            _async_copy(
-                kv_fused_cache_hbm_ref.at[
-                    pl.ds(page_indices_ref[page_indices_offset + i] * page_size, sz)
-                ],
-                kv_fused_vmem_ref.at[pl.ds(i * page_size, sz)],
-                sem,
-                wait,
-            )
-            return offset + sz
+        if not wait:
+            # Fetch effective kv from kv cache.
+            def loop_body(i, offset):
+                sz = jnp.minimum(page_size, kv_left_frm_cache - i * page_size)
+                _async_copy(
+                    kv_fused_cache_hbm_ref.at[
+                        pl.ds(page_indices_ref[page_indices_offset + i] * page_size, sz)
+                    ],
+                    kv_fused_vmem_ref.at[pl.ds(i * page_size, sz)],
+                    sem,
+                    wait,
+                )
+                return offset + sz
 
-        offset = lax.fori_loop(
-            0,
-            bkv_p_frm_cache,
-            loop_body,
-            0,  # offset
-            unroll=False,
-        )
-
-        # Fetch fused kv from new kv.
-        @pl.when(bkv_sz_frm_new > 0)
-        def _fetch_bkv_from_new_kv():
-            new_kv_len_start = q_end - kv_left_frm_new
-            _async_copy(
-                kv_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new)],
-                kv_fused_vmem_ref.at[pl.ds(offset, bkv_sz_frm_new)],
-                sem,
-                wait,
+            offset = lax.fori_loop(
+                0,
+                bkv_p_frm_cache,
+                loop_body,
+                0,  # offset
+                unroll=False,
             )
 
-        return kv_len_start + offset, bkv_sz_frm_new
+            # Fetch fused kv from new kv.
+            @pl.when(bkv_sz_frm_new > 0)
+            def _fetch_bkv_from_new_kv():
+                new_kv_len_start = q_end - kv_left_frm_new
+                _async_copy(
+                    kv_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new)],
+                    kv_fused_vmem_ref.at[pl.ds(offset, bkv_sz_frm_new)],
+                    sem,
+                    wait,
+                )
+
+            return kv_len_start + offset, bkv_sz_frm_new
+        else:
+            offset = jnp.minimum(kv_left_frm_cache, page_size * bkv_p)
+            dst = kv_fused_vmem_ref.at[pl.ds(0, offset + bkv_sz_frm_new)]
+            _async_copy(
+                src=dst,
+                dst=dst,
+                sem=sem,
+                wait=True,
+            )
+            return kv_len_start + offset, bkv_sz_frm_new
 
     def _update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz, *, wait=False):
         sem = sems.at[3, bkv_sem_idx]
@@ -493,29 +505,39 @@ def _ragged_paged_attention_kernel(
             *kv_fused_cache_hbm_shape[2:],
         )
 
-        def loop_body(i, states):
-            update_sz, ignore = states
-            sz = jnp.minimum(page_size - ignore, update_sz)
-            _async_copy(
-                kv_fused_vmem_ref.at[pl.ds((p_ignore + i) * page_size + ignore, sz)],
-                kv_fused_cache_hbm_ref.at[
-                    pl.ds(
-                        page_indices_ref[page_indices_offset + i] * page_size + ignore,
-                        sz,
-                    )
-                ],
-                sem,
-                wait,
-            )
-            return update_sz - sz, 0
+        if not wait:
 
-        lax.fori_loop(
-            0,
-            kv_p_end - kv_p_start,
-            loop_body,
-            (update_sz, ignore),  # total transfer size
-            unroll=False,
-        )
+            def loop_body(i, states):
+                update_sz, ignore = states
+                sz = jnp.minimum(page_size - ignore, update_sz)
+                _async_copy(
+                    kv_fused_vmem_ref.at[pl.ds((p_ignore + i) * page_size + ignore, sz)],
+                    kv_fused_cache_hbm_ref.at[
+                        pl.ds(
+                            page_indices_ref[page_indices_offset + i] * page_size + ignore,
+                            sz,
+                        )
+                    ],
+                    sem,
+                    wait,
+                )
+                return update_sz - sz, 0
+
+            lax.fori_loop(
+                0,
+                kv_p_end - kv_p_start,
+                loop_body,
+                (update_sz, ignore),  # total transfer size
+                unroll=False,
+            )
+        else:
+            dst = kv_fused_cache_hbm_ref.at[pl.ds(0, update_sz)]
+            _async_copy(
+                src=dst,
+                dst=dst,
+                sem=sem,
+                wait=True,
+            )
 
     def _fetch_bq(seq_idx, bq_idx, bq_sem_idx, *, wait=False):
         sem = sems.at[1, bq_sem_idx]
