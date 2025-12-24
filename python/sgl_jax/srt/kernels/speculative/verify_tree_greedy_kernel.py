@@ -111,7 +111,7 @@ def _verify_tree_greedy_kernel(
                     draft_index,
                     num_accepted_tokens,
                 ) = jax.lax.cond(
-                    draft_token_id == -1,
+                    draft_token_id == target_token_id,
                     on_true,
                     on_false,
                     (
