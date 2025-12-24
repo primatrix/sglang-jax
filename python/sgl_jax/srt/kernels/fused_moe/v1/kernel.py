@@ -2320,8 +2320,8 @@ def fused_ep_moe(
         gating_output,
         a2a_g_hbm_scratch,
         bias,
-        w1_shared=w1_shared,
-        w2_shared=w2_shared,
-        w1_shared_scale=w1_shared_scale,
-        w2_shared_scale=w2_shared_scale,
+        w1_shared,
+        w2_shared,
+        w1_shared_scale,
+        w2_shared_scale,
     )
