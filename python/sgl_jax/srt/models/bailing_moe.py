@@ -158,7 +158,6 @@ class BailingMoEMLP(nnx.Module):
         self.gate_proj = LinearBase(
             input_size=hidden_size,
             output_size=intermediate_size,
-            kernel_axes=(None, "tensor"),
             use_bias=False,
             params_dtype=dtype,
             mesh=mesh,
@@ -167,7 +166,6 @@ class BailingMoEMLP(nnx.Module):
         self.up_proj = LinearBase(
             input_size=hidden_size,
             output_size=intermediate_size,
-            kernel_axes=(None, "tensor"),
             use_bias=False,
             params_dtype=dtype,
             mesh=mesh,
@@ -176,7 +174,6 @@ class BailingMoEMLP(nnx.Module):
         self.down_proj = LinearBase(
             input_size=intermediate_size,
             output_size=hidden_size,
-            kernel_axes=("tensor", None),
             use_bias=False,
             params_dtype=dtype,
             mesh=mesh,
