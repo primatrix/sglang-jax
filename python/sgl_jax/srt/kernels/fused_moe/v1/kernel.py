@@ -2220,7 +2220,7 @@ def fused_ep_moe(
                         (
                             None
                             if w1_shared is None
-                            else pltpu.VMEM((bt, hidden_size // t_packing), t_dtype)
+                            else pltpu.VMEM((bt, hidden_size // t_packing), jnp.int32)
                         ),  # b_se_tokens_vmem
                     ]
                 ),
