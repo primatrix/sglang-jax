@@ -2244,16 +2244,11 @@ def fused_ep_moe(
         P(ep_axis_name),  # gating_output_hbm
         P(),  # a2a_g_hbm
         None if bias is None else P(),
+        None if w1_shared is None else P(),  # w1_shared
+        None if w2_shared is None else P(),  # w2_shared
+        None if w1_shared_scale is None else P(),  # w1_shared_scale
+        None if w2_shared_scale is None else P(),  # w2_shared_scale
     ]
-    if w1_shared is not None:
-        shard_map_in_specs.extend(
-            [
-                P(),  # w1_shared
-                P(),  # w2_shared
-                None if w1_shared_scale is None else P(),
-                None if w2_shared_scale is None else P(),
-            ]
-        )
 
     @jax.jit
     @jax.shard_map(
@@ -2279,39 +2274,37 @@ def fused_ep_moe(
         w2_shared_scale=None,
     ):
         args = [
-            pltpu.with_memory_space_constraint(tokens, pltpu.HBM),  # tokens_hbm
-            pltpu.with_memory_space_constraint(w1, pltpu.HBM),  # w1_hbm
-            pltpu.with_memory_space_constraint(w2, pltpu.HBM),  # w2_hbm
-            (
-                None
-                if w1_scale is None
-                else pltpu.with_memory_space_constraint(w1_scale, pltpu.HBM)
-            ),  # w1_scale_hbm
-            (
-                None
-                if w2_scale is None
-                else pltpu.with_memory_space_constraint(w2_scale, pltpu.HBM)
-            ),  # w2_scale_hbm
-            (None if b1 is None else pltpu.with_memory_space_constraint(b1, pltpu.HBM)),  # b1_hbm
-            (None if b2 is None else pltpu.with_memory_space_constraint(b2, pltpu.HBM)),  # b2_hbm
-            pltpu.with_memory_space_constraint(gating_output, pltpu.HBM),  # gating_output_hbm
-            pltpu.with_memory_space_constraint(a2a_g_hbm_scratch, pltpu.HBM),  # a2a_g_hbm
+            pltpu.with_memory_space_constraint(tokens, pltpu.HBM),
+            pltpu.with_memory_space_constraint(w1, pltpu.HBM),
+            pltpu.with_memory_space_constraint(w2, pltpu.HBM),
+            (None if w1_scale is None else pltpu.with_memory_space_constraint(w1_scale, pltpu.HBM)),
+            (None if w2_scale is None else pltpu.with_memory_space_constraint(w2_scale, pltpu.HBM)),
+            (None if b1 is None else pltpu.with_memory_space_constraint(b1, pltpu.HBM)),
+            (None if b2 is None else pltpu.with_memory_space_constraint(b2, pltpu.HBM)),
+            pltpu.with_memory_space_constraint(gating_output, pltpu.HBM),
+            pltpu.with_memory_space_constraint(a2a_g_hbm_scratch, pltpu.HBM),
             (None if bias is None else pltpu.with_memory_space_constraint(bias, pltpu.HBM)),
-        ]
-
-        if w1_shared is not None:
-            args.append(pltpu.with_memory_space_constraint(w1_shared, pltpu.HBM))
-            args.append(pltpu.with_memory_space_constraint(w2_shared, pltpu.HBM))
-            args.append(
+            (
+                None
+                if w1_shared is None
+                else pltpu.with_memory_space_constraint(w1_shared, pltpu.HBM)
+            ),
+            (
+                None
+                if w2_shared is None
+                else pltpu.with_memory_space_constraint(w2_shared, pltpu.HBM)
+            ),
+            (
                 None
                 if w1_shared_scale is None
                 else pltpu.with_memory_space_constraint(w1_shared_scale, pltpu.HBM)
-            )
-            args.append(
+            ),
+            (
                 None
                 if w2_shared_scale is None
                 else pltpu.with_memory_space_constraint(w2_shared_scale, pltpu.HBM)
-            )
+            ),
+        ]
 
         return fused_moe(*args)
 
