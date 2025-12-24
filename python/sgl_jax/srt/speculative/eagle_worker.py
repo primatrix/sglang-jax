@@ -204,12 +204,6 @@ class EAGLEWorker(ModelWorker):
         forward_metadata = self.draft_model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
-        print(f"draft extend {model_worker_batch.input_ids=}")
-        print(f"draft extend {model_worker_batch.positions=}")
-        print(f"draft extend {forward_metadata.cu_kv_lens=}")
-        print(f"draft extend {forward_metadata.cu_q_lens=}")
-        print(f"draft extend {forward_metadata.page_indices=}")
-        print(f"draft extend {forward_metadata.seq_lens=}")
 
         self.draft_model_runner.attn_backend.forward_metadata = forward_metadata
         forward_batch.forward_mode = ForwardMode.EXTEND
@@ -343,6 +337,7 @@ class EAGLEWorker(ModelWorker):
         # Initialize padding area to ensure multiprocess consistency
         if len(cache_loc_flat) < total_cache_loc_size:
             cache_loc_cpu[len(cache_loc_flat) :] = 0
+
         model_worker_batch.cache_loc = cache_loc_cpu
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
 
@@ -412,17 +407,10 @@ class EAGLEWorker(ModelWorker):
         model_worker_batch.positions = np.empty(bs * self.topk, np.int32)
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
-        print(f"{model_worker_batch.spec_info.hidden_states[:, :50]=}")
-        print(f"{model_worker_batch.spec_info.topk_index=}")
-        print(f"{model_worker_batch.spec_info.topk_p=}")
-        print(f"{model_worker_batch.spec_info.verified_id=}")
 
         self.padding_for_decode(model_worker_batch)
-        print(f"{model_worker_batch.spec_info.topk_index=}")
-        print(f"{model_worker_batch.seq_lens=}")
 
         score_list, token_list, parents_list = self.draft_forward(model_worker_batch)
-        print(f"draft {token_list=}")
         (
             tree_mask,
             position,
@@ -444,9 +432,6 @@ class EAGLEWorker(ModelWorker):
             model_worker_batch.speculative_num_steps,
             self.mesh,
         )
-
-        print(f"draft {draft_tokens=}")
-        print(f"draft {position=}")
 
         model_worker_batch.spec_info = EagleVerifyInput(
             draft_token=draft_tokens,
@@ -472,13 +457,6 @@ class EAGLEWorker(ModelWorker):
         forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
-        print(f"verify {model_worker_batch.input_ids=}")
-        print(f"verify {model_worker_batch.positions=}")
-        print(f"verify {forward_metadata.page_indices[:50]=}")
-        print(f"verify {forward_metadata.cu_q_lens[:50]=}")
-        print(f"verify {forward_metadata.cu_kv_lens[:50]=}")
-        print(f"verify {forward_metadata.custom_mask[:50]=}")
-        print(f"verify {forward_metadata.seq_lens[:50]=}")
 
         logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
             model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
@@ -505,9 +483,7 @@ class EAGLEWorker(ModelWorker):
             allocate_lens=cur_allocate_lens,
             hidden_states=logits_output.hidden_states,
         )
-        print(f"{next_draft_input.hidden_states.shape=}")
-        for i in range(8):
-            print(f"{next_draft_input.hidden_states[i,:]=}")
+
         model_worker_batch.spec_info = next_draft_input
         return GenerationBatchResult(
             logits_output=logits_output,
@@ -630,8 +606,6 @@ class EAGLEWorker(ModelWorker):
         )
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[select_index]
         draft_logits_output.hidden_states = draft_logits_output.hidden_states[select_index]
-        print(f"{draft_logits_output.next_token_logits[:5,:50]=}")
-        print(f"{draft_logits_output.hidden_states[:5,:50]=}")
 
         topk_p, topk_index = topk_probs_from_logits(
             draft_logits_output.next_token_logits, self.topk
@@ -682,11 +656,7 @@ class EAGLEWorker(ModelWorker):
         forward_batch.spec_info = EagleDraftInput()
         forward_batch.spec_info.hidden_states = jnp.empty((bs * self.topk, hidden_states.shape[1]))
         for i in range(self.speculative_num_steps):
-            print(f"=== Draft Step {i} ===")
-            print(f"{topk_p[:5,:]=}")
-            print(f"{topk_index[:5,:]=}")
-            print(f"{scores=}")
-            # print(f"{hidden_states[:5,:50]=}")
+
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
@@ -703,13 +673,6 @@ class EAGLEWorker(ModelWorker):
             )
             self.draft_model_runner.attn_backend.forward_metadata = metadata_per_step[i]
 
-            print(f"draft step {i} {input_ids[:50]=}")
-            print(f"draft step {i} {forward_batch.positions[:50]=}")
-            print(f"draft step {i} {hidden_states[:5,:50]=}")
-            print(f"draft step {i} {metadata_per_step[i].page_indices[:50]=}")
-            print(f"draft step {i} {metadata_per_step[i].cu_q_lens[:50]=}")
-            print(f"draft step {i} {metadata_per_step[i].cu_kv_lens[:50]=}")
-            print(f"draft step {i} {metadata_per_step[i].seq_lens[:50]=}")
             # Run forward
             forward_batch.bid = model_worker_batch.bid
             logits_output, _ = self.draft_model_runner.forward(
@@ -717,19 +680,11 @@ class EAGLEWorker(ModelWorker):
                 logits_metadata=logits_metadata,
             )
 
-            print(f"draft step {i} logits {logits_output.next_token_logits[:5,:50]=}")
-
             topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
-            print(f"1111 {topk_index[:5,:]=}")
 
             if self.hot_token_ids is not None:
                 topk_index = self.hot_token_ids[topk_index]
-            print(f"2222 {topk_index[:5,:]=}")
             hidden_states = logits_output.hidden_states
-            print(
-                f"logits processor output hidden states {logits_output.hidden_states_sampled[:5,:50]=}"
-            )
-            print("\n")
 
         return score_list, token_list, parents_list
 
@@ -861,7 +816,6 @@ def update_eagle_lists(
 ):
     bs = score_list.shape[0]
     scores_update, tokens_update, parents_update = tree_info
-    print(f"{tree_info=}")
     if i == 0:
         score_list = score_list.at[:bs, :1, :].set(scores_update[:bs])
         token_list = token_list.at[:bs, :topk].set(tokens_update[:bs])

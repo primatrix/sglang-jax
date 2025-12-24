@@ -500,7 +500,6 @@ class EagleDraftInput:
 
         model_worker_batch.extend_seq_lens = np.full((bs,), step_plus_1, dtype=np.int32)
         model_worker_batch.extend_seq_lens[model_worker_batch.real_bs :] = 0
-        # print(f"3333 {model_worker_batch.extend_seq_lens=}")
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
@@ -515,12 +514,6 @@ class EagleDraftInput:
         logits_metadata = LogitsMetadata.from_model_worker_batch(
             model_worker_batch, draft_model_runner.mesh
         )
-        print(f"{model_worker_batch.input_ids=}")
-        print(f"{model_worker_batch.positions=}")
-        print(f"{forward_metadata.page_indices[:50]=}")
-        print(f"{forward_metadata.cu_q_lens[:50]=}")
-        print(f"{forward_metadata.cu_kv_lens[:50]=}")
-        print(f"{forward_metadata.seq_lens[:50]=}")
 
         return model_worker_batch, logits_metadata
 

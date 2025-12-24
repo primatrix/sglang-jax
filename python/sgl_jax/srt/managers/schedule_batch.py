@@ -1202,7 +1202,7 @@ class ScheduleBatch:
             # Filter out empty sequences
             valid_mask = seq_lens_cpu > 0
             if np.any(valid_mask):
-                valid_indices = np.where(valid_maask)[0]
+                valid_indices = np.where(valid_mask)[0]
                 valid_seq_lens = seq_lens_cpu[valid_mask]
 
                 # Calculate aligned lengths for all valid sequences at once
@@ -1387,7 +1387,6 @@ class ScheduleBatch:
         real_bs = len(seq_lens_cpu)
         req_pool_indices_cpu = self.req_pool_indices
         token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[self.req_pool_indices]
-
         # FIXME @pc, move this to eagle_worker
         # If enable spec inference, use positions in spec info firstly
         if self.spec_info is not None and getattr(self.spec_info, "positions", None) is not None:
