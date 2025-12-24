@@ -1441,7 +1441,7 @@ def _fused_ep_moe_kernel(
         start_fetch_se_tokens(bt_id)
 
         if w1_shared is not None:
-            se_acc_vmem[...] = 0.0
+            se_acc_vmem[...] = jnp.zeros(se_acc_vmem.shape, dtype=jnp.float32)
             wait_fetch_se_tokens()
 
         b_gating = b_gating_x2_vmem[bt_sem_id]
