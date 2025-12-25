@@ -1079,14 +1079,8 @@ def _fused_ep_moe_kernel(
 
                     act_gate += acc_gate_part
                     act_up += acc_up_part
-
-            # Activation
-            if act_fn == "silu":
-                act = jax.nn.silu(act_gate) * act_up
-            elif act_fn == "gelu":
-                act = jax.nn.gelu(act_gate) * act_up
-            else:
-                act = jax.nn.silu(act_gate) * act_up
+            # activation
+            act = activation_fn(act_gate, act_up, act_fn)
 
             # W2
             @pl.when(next_bf_idx < num_se_bf_per_slice)
@@ -2025,16 +2019,11 @@ def fused_ep_moe(
         hbm_block_spec,  # gating_output_hbm
         hbm_block_spec,  # a2a_g_hbm
         None if bias is None else hbm_block_spec,  # bias_hbm
+        None if w1_shared is None else hbm_block_spec,
+        None if w2_shared is None else hbm_block_spec,
+        None if w1_shared_scale is None else hbm_block_spec,
+        None if w2_shared_scale is None else hbm_block_spec,
     ]
-    if w1_shared is not None:
-        grid_in_specs.extend(
-            [
-                hbm_block_spec,  # w1_shared
-                hbm_block_spec,  # w2_shared
-                None if w1_shared_scale is None else hbm_block_spec,
-                None if w2_shared_scale is None else hbm_block_spec,
-            ]
-        )
 
     fused_moe = jax.named_scope(scope_name)(
         pl.pallas_call(
