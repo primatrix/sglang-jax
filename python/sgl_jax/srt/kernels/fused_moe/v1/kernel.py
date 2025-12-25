@@ -853,8 +853,10 @@ def _fused_ep_moe_kernel(
             return
         is_valid = jnp.logical_and(bt_id >= 0, bt_id < num_bt)
         sz = pl.multiple_of(lax.select(is_valid, bt, 0), bt)
+        tokens_hbm_b32 = tokens_hbm.bitcast(jnp.int32).reshape(local_num_tokens, -1)
+
         pltpu.make_async_copy(
-            src_ref=tokens_hbm.at[pl.ds(bt_id * bt, sz)],
+            src_ref=tokens_hbm_b32.at[pl.ds(bt_id * bt, sz)],
             dst_ref=b_se_tokens_vmem.at[pl.ds(0, sz)],
             sem=local_sems.at[0, 5],
         ).start()
