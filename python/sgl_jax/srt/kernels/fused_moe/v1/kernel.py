@@ -278,8 +278,10 @@ def _fused_ep_moe_kernel(
     a2a_acc_sem,
     se_acc_vmem,  # (bt, hidden_size // t_packing) [Float32 Accumulator]
     b_se_w1_x2_vmem,  # (2, t_packing, bd1 // t_packing, bf)
+    b_se_w3_x2_vmem,  # (2, t_packing, bd1 // t_packing, bf)
     b_se_w2_x2_vmem,  # (2, t_packing, bf, bd2 // t_packing)
     b_se_w1_scale_x2_vmem,  # None | (2, t_packing, bd1 // t_packing // subc, 1, bf)
+    b_se_w3_scale_x2_vmem,  # None | (2, t_packing, bd1 // t_packing // subc, 1, bf)
     b_se_w2_scale_x2_vmem,  # None | (2, t_packing, bf // subc, 1, bd2 // t_packing)
     b_se_tokens_vmem,  # None | (bt, hidden_size // t_packing) [Input Buffer]
     *,
@@ -870,27 +872,50 @@ def _fused_ep_moe_kernel(
         global_feature_idx = slice_idx * num_se_bf_per_slice + bf_offset
         for p in range(t_packing):
             offset = p * h_per_t_packing + bd1_idx * bd1_per_t_packing
-            # Fetch W1 (Gate+Up)
+            # W1
             pltpu.make_async_copy(
                 src_ref=w1_shared.at[
-                    pl.ds(0, 2),
+                    pl.ds(0, 1),
                     pl.ds(offset, bd1_per_t_packing),
                     pl.ds(global_feature_idx * bf, bf),
                 ],
                 dst_ref=b_se_w1_x2_vmem.at[grp_sem_id, p],
                 sem=local_sems.at[grp_sem_id, 5],
             ).start()
-            # Fetch Scales
+            # W3
+            pltpu.make_async_copy(
+                src_ref=w1_shared.at[
+                    pl.ds(1, 1),
+                    pl.ds(offset, bd1_per_t_packing),
+                    pl.ds(global_feature_idx * bf, bf),
+                ],
+                dst_ref=b_se_w3_x2_vmem.at[grp_sem_id, p],
+                sem=local_sems.at[grp_sem_id, 5],
+            ).start()
+
             if w1_shared_scale is not None:
                 assert subc_quant_wsz is not None
+                # Scale Gate
                 pltpu.make_async_copy(
                     src_ref=w1_shared_scale.at[
-                        pl.ds(0, 2),
+                        pl.ds(0, 1),
                         pl.ds(offset // subc_quant_wsz, bd1_per_t_packing // subc_quant_wsz),
                         pl.ds(0, 1),
                         pl.ds(global_feature_idx * bf, bf),
                     ],
                     dst_ref=b_se_w1_scale_x2_vmem.at[grp_sem_id, p],
+                    sem=local_sems.at[grp_sem_id, 5],
+                ).start()
+
+                # Scale Up
+                pltpu.make_async_copy(
+                    src_ref=w1_shared_scale.at[
+                        pl.ds(1, 1),
+                        pl.ds(offset // subc_quant_wsz, bd1_per_t_packing // subc_quant_wsz),
+                        pl.ds(0, 1),
+                        pl.ds(global_feature_idx * bf, bf),
+                    ],
+                    dst_ref=b_se_w3_scale_x2_vmem.at[grp_sem_id, p],
                     sem=local_sems.at[grp_sem_id, 5],
                 ).start()
 
@@ -931,10 +956,21 @@ def _fused_ep_moe_kernel(
             dst_ref=b_se_w1_x2_vmem.at[grp_sem_id],
             sem=local_sems.at[grp_sem_id, 5],
         ).wait()
+        pltpu.make_async_copy(
+            src_ref=b_se_w3_x2_vmem.at[grp_sem_id],
+            dst_ref=b_se_w3_x2_vmem.at[grp_sem_id],
+            sem=local_sems.at[grp_sem_id, 5],
+        ).wait()
+
         if w1_shared_scale is not None:
             pltpu.make_async_copy(
                 src_ref=b_se_w1_scale_x2_vmem.at[grp_sem_id],
                 dst_ref=b_se_w1_scale_x2_vmem.at[grp_sem_id],
+                sem=local_sems.at[grp_sem_id, 5],
+            ).wait()
+            pltpu.make_async_copy(
+                src_ref=b_se_w3_scale_x2_vmem.at[grp_sem_id],
+                dst_ref=b_se_w3_scale_x2_vmem.at[grp_sem_id],
                 sem=local_sems.at[grp_sem_id, 5],
             ).wait()
 
@@ -1001,8 +1037,8 @@ def _fused_ep_moe_kernel(
                     w_slices = (p_id, pl.ds(0, bd1_per_t_packing), pl.ds(0, bf))
 
                     # Fetch Weights
-                    w1_gate_packed = b_se_w1_x2_vmem.at[grp_sem_id, :, :, :, 0][*w_slices]
-                    w1_up_packed = b_se_w1_x2_vmem.at[grp_sem_id, :, :, :, 1][*w_slices]
+                    w1_gate_packed = b_se_w1_x2_vmem.at[grp_sem_id][*w_slices]
+                    w1_up_packed = b_se_w3_x2_vmem.at[grp_sem_id][*w_slices]
 
                     w1_gate = pltpu.bitcast(w1_gate_packed.astype(repack_ty), t_dtype)
                     w1_up = pltpu.bitcast(w1_up_packed.astype(repack_ty), t_dtype)
@@ -1017,8 +1053,8 @@ def _fused_ep_moe_kernel(
                         )
 
                         # Fetch Scales
-                        s_gate = b_se_w1_scale_x2_vmem.at[grp_sem_id, :, :, :, :, 0][*scale_slices]
-                        s_up = b_se_w1_scale_x2_vmem.at[grp_sem_id, :, :, :, :, 1][*scale_slices]
+                        s_gate = b_se_w1_scale_x2_vmem.at[grp_sem_id][*scale_slices]
+                        s_up = b_se_w3_scale_x2_vmem.at[grp_sem_id][*scale_slices]
 
                         # Broadcast
                         s_gate = broadcast_quant_scale(s_gate, bd1_per_t_packing, subc_quant_wsz)
@@ -2180,6 +2216,12 @@ def fused_ep_moe(
                             if w1_shared is None
                             else pltpu.VMEM((2, t_packing, bd1 // t_packing, bf), w1.dtype)
                         ),
+                        # shared expert w3
+                        (
+                            None
+                            if w1_shared is None
+                            else pltpu.VMEM((2, t_packing, bd1 // t_packing, bf), w1.dtype)
+                        ),
                         # shared expert w2
                         (
                             None
@@ -2198,6 +2240,15 @@ def fused_ep_moe(
                                     1,
                                     bf,
                                 ),
+                                jnp.float32,
+                            )
+                        ),
+                        # shared expert scale W3
+                        (
+                            None
+                            if w1_shared_scale is None
+                            else pltpu.VMEM(
+                                (2, t_packing, bd1 // t_packing // subc_quant_wsz, 1, bf),
                                 jnp.float32,
                             )
                         ),
