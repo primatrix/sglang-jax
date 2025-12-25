@@ -2205,11 +2205,7 @@ def fused_ep_moe(
                         # a2a_acc_sem
                         pltpu.SemaphoreType.DMA,
                         # shared expert acc
-                        (
-                            None
-                            if w1_shared is None
-                            else pltpu.VMEM((bt, hidden_size // t_packing), jnp.float32)
-                        ),
+                        (None if w1_shared is None else pltpu.VMEM((bt, hidden_size), jnp.float32)),
                         # shared expert w1
                         (
                             None
