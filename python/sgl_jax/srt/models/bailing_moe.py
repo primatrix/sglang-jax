@@ -362,6 +362,8 @@ class BailingMoEDecoderLayer(nnx.Module):
             else:
                 shared_output = None
             router_logits = self.moe_gate(hidden_states)
+            if router_logits.dtype != hidden_states.dtype:
+                router_logits = router_logits.astype(hidden_states.dtype)
 
             if self.use_fused:
                 hidden_states = self.mlp(hidden_states, router_logits)
