@@ -877,7 +877,7 @@ def _fused_ep_moe_kernel(
             # W1
             pltpu.make_async_copy(
                 src_ref=w1_shared.at[
-                    pl.ds(0, 1),
+                    0,
                     pl.ds(offset, bd1_per_t_packing),
                     pl.ds(global_feature_idx * bf, bf),
                 ],
@@ -887,7 +887,7 @@ def _fused_ep_moe_kernel(
             # W3
             pltpu.make_async_copy(
                 src_ref=w1_shared.at[
-                    pl.ds(1, 1),
+                    1,
                     pl.ds(offset, bd1_per_t_packing),
                     pl.ds(global_feature_idx * bf, bf),
                 ],
@@ -900,7 +900,7 @@ def _fused_ep_moe_kernel(
                 # Scale Gate
                 pltpu.make_async_copy(
                     src_ref=w1_shared_scale.at[
-                        pl.ds(0, 1),
+                        0,
                         pl.ds(offset // subc_quant_wsz, bd1_per_t_packing // subc_quant_wsz),
                         pl.ds(0, 1),
                         pl.ds(global_feature_idx * bf, bf),
@@ -912,7 +912,7 @@ def _fused_ep_moe_kernel(
                 # Scale Up
                 pltpu.make_async_copy(
                     src_ref=w1_shared_scale.at[
-                        pl.ds(1, 1),
+                        1,
                         pl.ds(offset // subc_quant_wsz, bd1_per_t_packing // subc_quant_wsz),
                         pl.ds(0, 1),
                         pl.ds(global_feature_idx * bf, bf),
