@@ -586,56 +586,50 @@ class BailingMoEForCausalLM(nnx.Module):
             use_fused = moe_backend == "fused"
 
             if use_fused:
-                # Fused MoE Mapping
-                # w1: fused gate_proj(w1) + up_proj(w3) -> (num_experts, 2, hidden, intermediate)
-                # w2: down_proj(w2) -> (num_experts, intermediate, hidden)
-
-                # 1. Fused w1 (gate + up)
+                # 1. w1 (gate_proj)
                 target_path_w1 = [f"{target_prefix}.mlp.w1"]
-                # Add source keys for gate_proj and up_proj
-                for name in ["gate_proj", "up_proj"]:
-                    target_path_w1.extend(
-                        [f"{prefix}.mlp.experts.{i}.{name}.weight" for i in range(num_experts)]
-                    )
-
+                target_path_w1.extend(
+                    [f"{prefix}.mlp.experts.{i}.gate_proj.weight" for i in range(num_experts)]
+                )
                 mappings[f"__MOE_EXPERTS__{prefix}.mlp.w1"] = WeightMapping(
                     target_path=target_path_w1,
-                    sharding=("tensor", None, None, None),  # (E, 2, H, I)
+                    sharding=("tensor", None, None),  # (E, H, I)
                     transpose=True,
                     concat_axis=0,
-                    fuse_moe_weights=True,
-                    fuse_gate_up=("gate_proj", "up_proj"),
                 )
-
-                # 2. w2 (down)
+                target_path_w3 = [f"{target_prefix}.mlp.w3"]
+                target_path_w3.extend(
+                    [f"{prefix}.mlp.experts.{i}.up_proj.weight" for i in range(num_experts)]
+                )
+                mappings[f"__MOE_EXPERTS__{prefix}.mlp.w3"] = WeightMapping(
+                    target_path=target_path_w3,
+                    sharding=("tensor", None, None),  # (E, H, I)
+                    transpose=True,
+                    concat_axis=0,
+                )
                 target_path_w2 = [f"{target_prefix}.mlp.w2"]
                 target_path_w2.extend(
                     [f"{prefix}.mlp.experts.{i}.down_proj.weight" for i in range(num_experts)]
                 )
-
                 mappings[f"__MOE_EXPERTS__{prefix}.mlp.w2"] = WeightMapping(
                     target_path=target_path_w2,
                     sharding=("tensor", None, None),  # (E, I, H)
                     transpose=True,
-                    concat_axis=-1,
+                    concat_axis=0,
                 )
+
                 if getattr(self.config, "num_shared_experts", 0) > 0:
-                    target_path_w1_shared = [f"{target_prefix}.mlp.w1_shared"]
-                    target_path_w1_shared.append(f"{prefix}.mlp.shared_experts.gate_proj.weight")
-                    target_path_w1_shared.append(f"{prefix}.mlp.shared_experts.up_proj.weight")
-
-                    mappings[f"__MOE_EXPERTS__{prefix}.mlp.w1_shared"] = WeightMapping(
-                        target_path=target_path_w1_shared,
-                        sharding=(None, None, None, None),  # Output shape will be (1, 2, H, I)
+                    mappings[f"{prefix}.mlp.shared_experts.gate_proj.weight"] = WeightMapping(
+                        target_path=f"{target_prefix}.mlp.w1_shared",
+                        sharding=(None, None),
                         transpose=True,
-                        concat_axis=0,
-                        fuse_moe_weights=True,
-                        fuse_gate_up=("gate_proj", "up_proj"),
                     )
-
-                    physical_key_w2 = f"{prefix}.mlp.shared_experts.down_proj.weight"
-
-                    mappings[physical_key_w2] = WeightMapping(
+                    mappings[f"{prefix}.mlp.shared_experts.up_proj.weight"] = WeightMapping(
+                        target_path=f"{target_prefix}.mlp.w3_shared",
+                        sharding=(None, None),
+                        transpose=True,
+                    )
+                    mappings[f"{prefix}.mlp.shared_experts.down_proj.weight"] = WeightMapping(
                         target_path=f"{target_prefix}.mlp.w2_shared",
                         sharding=(None, None),
                         transpose=True,

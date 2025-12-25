@@ -172,10 +172,10 @@ def ref_moe(
             # 4. Apply Biases (Independent b1/b3)
             if b1 is not None:
                 # b1 shape: (num_experts, 1, intermediate_size)
-                gmm1_w1_proj += b1[expert_id, 0]
+                gmm1_w1_proj += b1[expert_id]
             if b3 is not None:
                 # b3 shape: (num_experts, 1, intermediate_size)
-                gmm1_w3_proj += b3[expert_id, 0]
+                gmm1_w3_proj += b3[expert_id]
 
             # 5. Activation (SwiGLU)
             act = activation_fn(gmm1_w1_proj, gmm1_w3_proj, act_fn)
@@ -191,7 +191,7 @@ def ref_moe(
             gmm_2_out = act @ expert_weight_2  # [1, hidden_size]
 
             if b2 is not None:
-                gmm_2_out += b2[expert_id, 0]
+                gmm_2_out += b2[expert_id]
 
             tok_expert_act.append(gmm_2_out)
 
