@@ -1542,7 +1542,7 @@ def _fused_ep_moe_kernel(
         output = bt_acc(bt_id, top_k_logits_lst)
 
         if w1_shared is not None:
-            output += se_acc_vmem.astype(output_hbm.dtype)
+            output += se_acc_vmem[...].astype(output_hbm.dtype)
 
         # Make sure it is safe to overwrite output buffer.
         wait_send_bo(bt_id=bt_id - 2)
