@@ -763,7 +763,7 @@ class WeightLoader:
                 if not group_complete:
                     continue
 
-                if not is_tp_split and mapping.concat_axis is None:
+                if not is_tp_split:
                     if "expert" in mapping.sharding:
                         ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
                         world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get(
