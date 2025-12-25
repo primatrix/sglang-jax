@@ -27,11 +27,11 @@ def _get_default_tile_sizes(hidden_size: int, intermediate_size: int) -> dict[st
         # Large models (e.g., Qwen 2.5B)
         return {
             "bt": 64,
-            "bf": 768,
+            "bf": 512,
             "bd1": 2048,
             "bd2": 2048,
             "btc": 64,
-            "bfc": 768,
+            "bfc": 512,
             "bd1c": 2048,
             "bd2c": 2048,
         }
@@ -39,11 +39,11 @@ def _get_default_tile_sizes(hidden_size: int, intermediate_size: int) -> dict[st
         # Medium models (e.g., Qwen 30B A3B)
         return {
             "bt": 16,
-            "bf": 384,
+            "bf": 512,
             "bd1": 512,
             "bd2": 512,
             "btc": 16,
-            "bfc": 384,
+            "bfc": 512,
             "bd1c": 256,
             "bd2c": 256,
         }
