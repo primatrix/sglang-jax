@@ -262,7 +262,11 @@ class BailingMoEDecoderLayer(nnx.Module):
 
             self.moe_backend = getattr(config, "moe_backend", "epmoe")
             self.use_fused = self.moe_backend == "fused"
-
+            moe_shared_expert_intermediate_size = getattr(
+                config,
+                "moe_shared_expert_intermediate_size",
+                config.moe_intermediate_size,
+            )
             if self.use_fused:
                 from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 
@@ -277,6 +281,11 @@ class BailingMoEDecoderLayer(nnx.Module):
                     dtype=dtype,
                     layer_id=layer_id,
                     renormalize_topk_logits=config.norm_topk_prob,
+                    use_grouped_topk=config.n_group > 0,
+                    num_groups=config.n_group,
+                    top_k_groups=config.topk_group,
+                    num_shared_experts=num_shared_experts,
+                    moe_shared_expert_intermediate_size=moe_shared_expert_intermediate_size,
                 )
             else:
                 self.topk = TopK(
@@ -298,15 +307,10 @@ class BailingMoEDecoderLayer(nnx.Module):
                     layer_id=layer_id,
                 )
 
-            if num_shared_experts > 0:
+            if num_shared_experts > 0 and not self.use_fused:
                 self.shared_experts = BailingMoEMLP(
                     hidden_size=config.hidden_size,
-                    intermediate_size=getattr(
-                        config,
-                        "moe_shared_expert_intermediate_size",
-                        config.moe_intermediate_size,
-                    )
-                    * num_shared_experts,
+                    intermediate_size=moe_shared_expert_intermediate_size * num_shared_experts,
                     layer_id=layer_id,
                     dtype=dtype,
                     mesh=mesh,
@@ -575,26 +579,6 @@ class BailingMoEForCausalLM(nnx.Module):
                     transpose=False,
                 )
 
-            if getattr(self.config, "num_shared_experts", 0) > 0:
-                shared_experts_mappings = {
-                    f"{prefix}.mlp.shared_experts.gate_proj.weight": WeightMapping(
-                        target_path=f"{target_prefix}.shared_experts.gate_proj.weight",
-                        sharding=(None, "tensor"),
-                        transpose=True,
-                    ),
-                    f"{prefix}.mlp.shared_experts.up_proj.weight": WeightMapping(
-                        target_path=f"{target_prefix}.shared_experts.up_proj.weight",
-                        sharding=(None, "tensor"),
-                        transpose=True,
-                    ),
-                    f"{prefix}.mlp.shared_experts.down_proj.weight": WeightMapping(
-                        target_path=f"{target_prefix}.shared_experts.down_proj.weight",
-                        sharding=("tensor", None),
-                        transpose=True,
-                    ),
-                }
-                mappings.update(shared_experts_mappings)
-
             num_experts = getattr(self.config, "num_experts", 256)
             moe_backend = getattr(self.config, "moe_backend", "epmoe")
             use_fused = moe_backend == "fused"
@@ -633,6 +617,24 @@ class BailingMoEForCausalLM(nnx.Module):
                     transpose=True,
                     concat_axis=-1,
                 )
+                if getattr(self.config, "num_shared_experts", 0) > 0:
+                    target_path_w1_shared = [f"{target_prefix}.mlp.w1_shared"]
+                    target_path_w1_shared.append(f"{prefix}.mlp.shared_experts.gate_proj.weight")
+                    target_path_w1_shared.append(f"{prefix}.mlp.shared_experts.up_proj.weight")
+
+                    mappings[f"__MOE_SHARED__{prefix}.mlp.w1_shared"] = WeightMapping(
+                        target_path=target_path_w1_shared,
+                        sharding=(None, None, None),
+                        transpose=True,
+                        concat_axis=0,
+                    )
+
+                    # w2_shared (Down)
+                    mappings[f"{prefix}.mlp.w2_shared"] = WeightMapping(
+                        target_path=f"{target_prefix}.mlp.w2_shared",
+                        sharding=(None, None),
+                        transpose=True,
+                    )
             else:
                 for expert_type in ["gate_proj", "up_proj", "down_proj"]:
                     target_name = {
@@ -654,6 +656,25 @@ class BailingMoEForCausalLM(nnx.Module):
                         sharding=sharding,
                         transpose=True,
                     )
+                if getattr(self.config, "num_shared_experts", 0) > 0:
+                    shared_experts_mappings = {
+                        f"{prefix}.mlp.shared_experts.gate_proj.weight": WeightMapping(
+                            target_path=f"{target_prefix}.shared_experts.gate_proj.weight",
+                            sharding=(None, "tensor"),
+                            transpose=True,
+                        ),
+                        f"{prefix}.mlp.shared_experts.up_proj.weight": WeightMapping(
+                            target_path=f"{target_prefix}.shared_experts.up_proj.weight",
+                            sharding=(None, "tensor"),
+                            transpose=True,
+                        ),
+                        f"{prefix}.mlp.shared_experts.down_proj.weight": WeightMapping(
+                            target_path=f"{target_prefix}.shared_experts.down_proj.weight",
+                            sharding=("tensor", None),
+                            transpose=True,
+                        ),
+                    }
+                    mappings.update(shared_experts_mappings)
 
         return mappings
 

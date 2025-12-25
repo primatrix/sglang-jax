@@ -102,6 +102,11 @@ class FusedEPMoE(nnx.Module):
         activation: str = "silu",
         layer_id: int = 0,
         renormalize_topk_logits: bool = False,
+        use_grouped_topk: bool = False,
+        num_groups: int = 1,
+        top_k_groups: int = 1,
+        num_shared_experts: int = 0,
+        moe_shared_expert_intermediate_size: int | None = None,
         # Tile size parameters - auto-selected if None
         bt: int | None = None,
         bf: int | None = None,
@@ -123,6 +128,13 @@ class FusedEPMoE(nnx.Module):
         self.activation = activation
         self.renormalize_topk_logits = renormalize_topk_logits
         self.mesh = mesh
+        self.use_grouped_topk = use_grouped_topk
+        self.num_groups = num_groups
+        self.top_k_groups = top_k_groups
+        self.num_shared_experts = num_shared_experts
+        self.moe_shared_expert_intermediate_size = (
+            moe_shared_expert_intermediate_size or intermediate_dim
+        )
 
         if num_experts % self.ep_size != 0:
             raise ValueError(
@@ -169,6 +181,31 @@ class FusedEPMoE(nnx.Module):
             )
         )
 
+        if self.num_shared_experts > 0:
+            se_inter_dim = self.moe_shared_expert_intermediate_size * self.num_shared_experts
+
+            self.w1_shared = nnx.Param(
+                jax.random.normal(
+                    jax.random.key(0),
+                    (2, config.hidden_size, se_inter_dim),
+                    dtype=weight_dtype,
+                    out_sharding=P(None, None, None),
+                )
+            )
+
+            # Shared Expert Down (SE_Inter, Hidden)
+            self.w2_shared = nnx.Param(
+                jax.random.normal(
+                    jax.random.key(0),
+                    (se_inter_dim, config.hidden_size),
+                    dtype=weight_dtype,
+                    out_sharding=P(None, None),
+                )
+            )
+        else:
+            self.w1_shared = None
+            self.w2_shared = None
+
     def __call__(self, hidden_states: jax.Array, router_logits: jax.Array) -> jax.Array:
         """
         Forward pass through the fused MoE layer.
@@ -187,6 +224,9 @@ class FusedEPMoE(nnx.Module):
         hidden_states = jax.sharding.reshard(hidden_states, P("tensor", None))
         router_logits = jax.sharding.reshard(router_logits, P("tensor", None))
 
+        w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
+        w2_shared_val = self.w2_shared.value if self.w2_shared is not None else None
+
         output = fused_ep_moe(
             mesh=self.mesh,
             tokens=hidden_states,
@@ -195,6 +235,11 @@ class FusedEPMoE(nnx.Module):
             gating_output=router_logits,
             top_k=self.num_experts_per_tok,
             renormalize_topk_logits=self.renormalize_topk_logits,
+            use_grouped_topk=self.use_grouped_topk,
+            num_groups=self.num_groups,
+            top_k_groups=self.top_k_groups,
+            w1_shared=w1_shared_val,
+            w2_shared=w2_shared_val,
             act_fn=self.activation,
             # Tile sizes
             bt=self.bt,
