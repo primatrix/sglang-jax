@@ -584,8 +584,8 @@ class MoEKernelTest(jtu.JaxTestCase):
             bd2=1024,
             btc=32,
             bfc=128,
-            bd1c=128,
-            bd2c=128,
+            bd1c=256,
+            bd2c=256,
             use_shared_expert=True,
             shared_intermediate_size=shared_intermediate_size,
         )
