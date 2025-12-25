@@ -622,15 +622,18 @@ class BailingMoEForCausalLM(nnx.Module):
                     target_path_w1_shared.append(f"{prefix}.mlp.shared_experts.gate_proj.weight")
                     target_path_w1_shared.append(f"{prefix}.mlp.shared_experts.up_proj.weight")
 
-                    mappings[f"__MOE_SHARED__{prefix}.mlp.w1_shared"] = WeightMapping(
+                    mappings[f"__MOE_EXPERTS__{prefix}.mlp.w1_shared"] = WeightMapping(
                         target_path=target_path_w1_shared,
-                        sharding=(None, None, None),
+                        sharding=(None, None, None, None),  # Output shape will be (1, 2, H, I)
                         transpose=True,
                         concat_axis=0,
+                        fuse_moe_weights=True,
+                        fuse_gate_up=("gate_proj", "up_proj"),
                     )
 
-                    # w2_shared (Down)
-                    mappings[f"{prefix}.mlp.w2_shared"] = WeightMapping(
+                    physical_key_w2 = f"{prefix}.mlp.shared_experts.down_proj.weight"
+
+                    mappings[physical_key_w2] = WeightMapping(
                         target_path=f"{target_prefix}.mlp.w2_shared",
                         sharding=(None, None),
                         transpose=True,

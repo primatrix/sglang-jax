@@ -789,6 +789,16 @@ class WeightLoader:
 
                     target_path = mapping.target_path[0]
                     model_param = self._get_param(params, target_path)
+
+                    if (
+                        stacked_weight.shape != model_param.value.shape
+                        and stacked_weight.ndim == model_param.value.ndim + 1
+                        and stacked_weight.shape[0] == 1
+                        and stacked_weight.shape[1:] == model_param.value.shape
+                    ):
+                        stacked_weight = jnp.squeeze(stacked_weight, axis=0)
+                        logger.debug("Auto-squeezed shared expert weight for %s", moe_key)
+
                     model_param.value = stacked_weight.astype(model_param.value.dtype)
 
                     logger.debug(
@@ -861,6 +871,16 @@ class WeightLoader:
 
                     target_path = mapping.target_path[0]
                     model_param = self._get_param(params, target_path)
+
+                    if (
+                        stacked_weight.shape != model_param.value.shape
+                        and stacked_weight.ndim == model_param.value.ndim + 1
+                        and stacked_weight.shape[0] == 1
+                        and stacked_weight.shape[1:] == model_param.value.shape
+                    ):
+                        stacked_weight = jnp.squeeze(stacked_weight, axis=0)
+                        logger.debug("Auto-squeezed shared expert weight for %s", moe_key)
+
                     model_param.value = sharded_weight.astype(model_param.value.dtype)
 
                     logger.debug(
