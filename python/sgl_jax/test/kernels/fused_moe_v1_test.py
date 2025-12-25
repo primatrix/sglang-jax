@@ -628,4 +628,4 @@ class MoEKernelTest(jtu.JaxTestCase):
 
 
 if __name__ == "__main__":
-    absltest.main(testLoader=jtu.JaxTestCase)
+    absltest.main(testLoader=jtu.JaxTestLoader())
