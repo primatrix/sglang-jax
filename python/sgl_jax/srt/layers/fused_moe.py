@@ -101,7 +101,6 @@ class FusedEPMoE(nnx.Module):
         activation: str = "silu",
         layer_id: int = 0,
         renormalize_topk_logits: bool = False,
-        use_sigmoid: bool = False,
         routed_scaling_factor: float | None = None,
         use_grouped_topk: bool = False,
         num_groups: int = 1,
@@ -128,7 +127,6 @@ class FusedEPMoE(nnx.Module):
         self.ep_size = ep_size
         self.activation = activation
         self.renormalize_topk_logits = renormalize_topk_logits
-        self.use_sigmoid = use_sigmoid
         self.routed_scaling_factor = routed_scaling_factor
         self.mesh = mesh
         self.use_grouped_topk = use_grouped_topk

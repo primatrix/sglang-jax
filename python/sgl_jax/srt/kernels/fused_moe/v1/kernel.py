@@ -71,7 +71,6 @@ def ref_moe(
     top_k_groups: int = 1,
     bias: jax.Array | None = None,  # (num_experts,)
     renormalize_topk_logits: bool = False,
-    use_sigmoid: bool = False,
     routed_scaling_factor: float | None = None,
     act_fn: str = "silu",
     subc_quant_wsz: int | None = None,
@@ -99,15 +98,11 @@ def ref_moe(
 
     # Compute gating scores for all experts
     gating_logits_f32 = gating_output.astype(jnp.float32)
-    if use_sigmoid:
-        gating_probs = jax.nn.sigmoid(gating_logits_f32)
-    else:
-        gating_probs = jax.nn.softmax(gating_logits_f32, axis=-1)
 
     routing_scores = (
-        gating_probs + jnp.expand_dims(bias.astype(jnp.float32), 0)
+        gating_logits_f32 + jnp.expand_dims(bias.astype(jnp.float32), 0)
         if bias is not None
-        else gating_probs
+        else gating_logits_f32
     )
 
     if use_grouped_topk:
@@ -139,7 +134,7 @@ def ref_moe(
         routing_scores = jnp.where(expert_mask, routing_scores, -jnp.float32(jnp.inf))
 
     _, top_k_indices = lax.top_k(routing_scores, top_k)
-    top_k_logits = jnp.take_along_axis(gating_probs, top_k_indices, axis=-1)
+    top_k_logits = jnp.take_along_axis(gating_logits_f32, top_k_indices, axis=-1)
 
     if renormalize_topk_logits:
         top_k_logits = top_k_logits / jnp.sum(top_k_logits, axis=-1, keepdims=True)
@@ -325,7 +320,6 @@ def _fused_ep_moe_kernel(
     num_groups: int = 1,
     top_k_groups: int = 1,
     renormalize_topk_logits: bool,
-    use_sigmoid: bool = False,
     routed_scaling_factor: float | None = None,
     ep_axis_name: str,
     act_fn: str,
@@ -1575,13 +1569,8 @@ def _fused_ep_moe_kernel(
 
         b_gating_logits = b_gating.astype(jnp.float32)
 
-        if use_sigmoid:
-            probs = jax.nn.sigmoid(b_gating_logits)
-        else:
-            probs = jax.nn.softmax(b_gating_logits, axis=-1)
-
         top_k_logits_lst, t2e_routing, expert_sizes, expert_starts = get_top_k(
-            probs, top_k, renormalize_topk_logits
+            b_gating_logits, top_k, renormalize_topk_logits
         )
 
         all_reduce_metadata(bt_sem_id, t2e_routing, expert_starts, expert_sizes)
@@ -1945,7 +1934,6 @@ def _validate_fused_ep_moe_args(
         "num_groups",
         "top_k_groups",
         "renormalize_topk_logits",
-        "use_sigmoid",
         "routed_scaling_factor",
         "act_fn",
         "subc_quant_wsz",
@@ -1974,7 +1962,6 @@ def fused_ep_moe(
     top_k_groups: int = 1,
     renormalize_topk_logits: bool = False,
     routed_scaling_factor: float | None = None,
-    use_sigmoid: bool = False,
     act_fn: str = "silu",
     subc_quant_wsz: int | None = None,
     w1_scale: jax.Array | None = None,
@@ -2166,7 +2153,6 @@ def fused_ep_moe(
                 num_groups=num_groups,
                 top_k_groups=top_k_groups,
                 renormalize_topk_logits=renormalize_topk_logits,
-                use_sigmoid=use_sigmoid,
                 routed_scaling_factor=routed_scaling_factor,
                 ep_axis_name=ep_axis_name,
                 act_fn=act_fn,
