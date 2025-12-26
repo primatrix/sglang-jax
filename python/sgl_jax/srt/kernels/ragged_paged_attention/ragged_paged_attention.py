@@ -1602,49 +1602,47 @@ def ragged_paged_attention(
     cost_estimate = pl.CostEstimate(flops=flops, bytes_accessed=bytes_accessed, transcendentals=0)
 
     scope_name = f"RPA-bq_{bq_sz}-bkvp_{bkv_p}-p_{page_size}"
-    kernel = jax.named_scope(scope_name)(
-        pl.pallas_call(
-            functools.partial(
-                _ragged_paged_attention_kernel,
-                sm_scale=sm_scale,
-                sliding_window=sliding_window,
-                soft_cap=soft_cap,
-                mask_value=mask_value,
-                q_scale=q_scale,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                xai_temperature_len=xai_temperature_len,
-                chunk_prefill_size=chunk_prefill_size,
-                bkv_p=bkv_p,
-                bq_sz=bq_sz,
+    kernel = pl.pallas_call(
+        functools.partial(
+            _ragged_paged_attention_kernel,
+            sm_scale=sm_scale,
+            sliding_window=sliding_window,
+            soft_cap=soft_cap,
+            mask_value=mask_value,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            xai_temperature_len=xai_temperature_len,
+            chunk_prefill_size=chunk_prefill_size,
+            bkv_p=bkv_p,
+            bq_sz=bq_sz,
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=len(scalar_prefetches),
+            in_specs=in_specs,
+            out_specs=out_specs,
+            grid=grid,
+            scratch_shapes=scratch_shapes,
+        ),
+        compiler_params=pltpu.CompilerParams(
+            # one, we need some extra work to support Megacore mode.
+            dimension_semantics=("arbitrary",),
+            vmem_limit_bytes=vmem_limit_bytes,
+            disable_bounds_checks=True,
+        ),
+        cost_estimate=cost_estimate,
+        out_shape=[
+            jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
+            jax.ShapeDtypeStruct(
+                shape=kv_cache_fused_processed.shape,
+                dtype=kv_cache_fused_processed.dtype,
             ),
-            grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=len(scalar_prefetches),
-                in_specs=in_specs,
-                out_specs=out_specs,
-                grid=grid,
-                scratch_shapes=scratch_shapes,
-            ),
-            compiler_params=pltpu.CompilerParams(
-                # one, we need some extra work to support Megacore mode.
-                dimension_semantics=("arbitrary",),
-                vmem_limit_bytes=vmem_limit_bytes,
-                disable_bounds_checks=True,
-            ),
-            cost_estimate=cost_estimate,
-            out_shape=[
-                jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
-                jax.ShapeDtypeStruct(
-                    shape=kv_cache_fused_processed.shape,
-                    dtype=kv_cache_fused_processed.dtype,
-                ),
-            ],
-            input_output_aliases={
-                9: 0,  # q input -> q output
-                11: 1,  # kv_cache_fused input -> updated kv_cache_fused output
-            },
-            name=scope_name,
-        )
+        ],
+        input_output_aliases={
+            9: 0,  # q input -> q output
+            11: 1,  # kv_cache_fused input -> updated kv_cache_fused output
+        },
+        name=scope_name,
     )
 
     output, updated_kv_cache_fused = kernel(
