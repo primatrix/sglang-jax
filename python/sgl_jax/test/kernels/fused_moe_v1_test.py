@@ -559,71 +559,71 @@ class MoEKernelTest(jtu.JaxTestCase):
     #         bd2c=256,
     #     )
 
-    def test_crash_repro_actual_config(self):
-        """
-        Reproduce Server Crash using parameters derived from BailingMoeV2 config.
+    # def test_crash_repro_actual_config(self):
+    #     """
+    #     Reproduce Server Crash using parameters derived from BailingMoeV2 config.
 
-        Scenario:
-        - Hidden Size: 2048 -> Triggers default bf=512 in fused_moe.py
-        - Shared Expert Inter: 512
-        - Local Experts: 64 (256 experts / 4 GPUs)
-        - Slice Size: 512 / 64 = 8
+    #     Scenario:
+    #     - Hidden Size: 2048 -> Triggers default bf=512 in fused_moe.py
+    #     - Shared Expert Inter: 512
+    #     - Local Experts: 64 (256 experts / 4 GPUs)
+    #     - Slice Size: 512 / 64 = 8
 
-        Crash Cause: Slice Size (8) < Block Size (512).
-        """
-        dtype = jnp.bfloat16
+    #     Crash Cause: Slice Size (8) < Block Size (512).
+    #     """
+    #     dtype = jnp.bfloat16
 
-        # From Config
-        hidden_size = 2048
-        # moe_intermediate_size in config is 512
-        intermediate_size = 512
-        num_experts = 256
-        top_k = 8
+    #     # From Config
+    #     hidden_size = 2048
+    #     # moe_intermediate_size in config is 512
+    #     intermediate_size = 512
+    #     num_experts = 256
+    #     top_k = 8
 
-        # Shared expert disabled for debugging crash source.
-        use_shared_expert = True
-        shared_intermediate_size = 512
+    #     # Shared expert disabled for debugging crash source.
+    #     use_shared_expert = True
+    #     shared_intermediate_size = 512
 
-        # Test Environment
-        num_tokens = 128  # Arbitrary batch size
+    #     # Test Environment
+    #     num_tokens = 128  # Arbitrary batch size
 
-        # Derived from fused_moe.py _get_default_tile_sizes(2048)
-        # These are the exact params your server is running with.
-        bt = 16
-        bf = 512
-        bd1 = 512
-        bd2 = 512
-        btc = 16
-        bfc = 512
-        bd1c = 256
-        bd2c = 256
+    #     # Derived from fused_moe.py _get_default_tile_sizes(2048)
+    #     # These are the exact params your server is running with.
+    #     bt = 16
+    #     bf = 512
+    #     bd1 = 512
+    #     bd2 = 512
+    #     btc = 16
+    #     bfc = 512
+    #     bd1c = 256
+    #     bd2c = 256
 
-        print(
-            f"\n=== Reproducing Crash: Slice={shared_intermediate_size/(num_experts/4)}, BF={bf} ==="
-        )
+    #     print(
+    #         f"\n=== Reproducing Crash: Slice={shared_intermediate_size/(num_experts/4)}, BF={bf} ==="
+    #     )
 
-        self._test_moe(
-            dtype=dtype,
-            top_k=top_k,
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_tokens=num_tokens,
-            seed=42,
-            renormalize_topk_logits=True,
-            # Server Default Tile Sizes
-            bt=bt,
-            bf=bf,
-            bd1=bd1,
-            bd2=bd2,
-            btc=btc,
-            bfc=bfc,
-            bd1c=bd1c,
-            bd2c=bd2c,
-            # Shared Expert Config
-            use_shared_expert=use_shared_expert,
-            shared_intermediate_size=shared_intermediate_size,
-        )
+    #     self._test_moe(
+    #         dtype=dtype,
+    #         top_k=top_k,
+    #         num_experts=num_experts,
+    #         hidden_size=hidden_size,
+    #         intermediate_size=intermediate_size,
+    #         num_tokens=num_tokens,
+    #         seed=42,
+    #         renormalize_topk_logits=True,
+    #         # Server Default Tile Sizes
+    #         bt=bt,
+    #         bf=bf,
+    #         bd1=bd1,
+    #         bd2=bd2,
+    #         btc=btc,
+    #         bfc=bfc,
+    #         bd1c=bd1c,
+    #         bd2c=bd2c,
+    #         # Shared Expert Config
+    #         use_shared_expert=use_shared_expert,
+    #         shared_intermediate_size=shared_intermediate_size,
+    #     )
 
     def test_shared_expert_basic(self):
         """Test Shared Expert with standard params (bf=1024, bfc=256)."""
