@@ -614,6 +614,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             num_tokens=num_tokens,
             seed=42,
             renormalize_topk_logits=True,
+            use_sigmoid=True,
             # Server Default Tile Sizes
             bt=bt,
             bf=bf,
