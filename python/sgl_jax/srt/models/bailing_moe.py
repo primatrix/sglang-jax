@@ -281,6 +281,7 @@ class BailingMoEDecoderLayer(nnx.Module):
                     dtype=dtype,
                     layer_id=layer_id,
                     renormalize_topk_logits=config.norm_topk_prob,
+                    use_sigmoid=getattr(config, "score_function", "sigmoid"),
                     use_grouped_topk=config.n_group > 0,
                     num_groups=config.n_group,
                     top_k_groups=config.topk_group,
