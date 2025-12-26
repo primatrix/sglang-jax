@@ -657,40 +657,40 @@ class MoEKernelTest(jtu.JaxTestCase):
             shared_intermediate_size=shared_intermediate_size,
         )
 
-    # def test_shared_expert_small_slice(self):
-    #     """
-    #     Test Shared Expert where slice size is small (128).
-    #     This proves reliability when using smaller bf matching the slice.
-    #     """
-    #     dtype = jnp.bfloat16
-    #     top_k = 2
-    #     num_experts = 16
-    #     shared_intermediate_size = 2048
+    def test_shared_expert_small_slice(self):
+        """
+        Test Shared Expert where slice size is small (128).
+        This proves reliability when using smaller bf matching the slice.
+        """
+        dtype = jnp.bfloat16
+        top_k = 2
+        num_experts = 16
+        shared_intermediate_size = 2048
 
-    #     hidden_size = 1024
-    #     intermediate_size = 1024
-    #     num_tokens = 64
+        hidden_size = 1024
+        intermediate_size = 1024
+        num_tokens = 64
 
-    #     self._test_moe(
-    #         dtype=dtype,
-    #         top_k=top_k,
-    #         num_experts=num_experts,
-    #         hidden_size=hidden_size,
-    #         intermediate_size=intermediate_size,
-    #         num_tokens=num_tokens,
-    #         seed=42,
-    #         renormalize_topk_logits=True,
-    #         bt=32,
-    #         bf=128,
-    #         bd1=1024,
-    #         bd2=1024,
-    #         btc=32,
-    #         bfc=128,
-    #         bd1c=256,
-    #         bd2c=256,
-    #         use_shared_expert=True,
-    #         shared_intermediate_size=shared_intermediate_size,
-    #     )
+        self._test_moe(
+            dtype=dtype,
+            top_k=top_k,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_tokens=num_tokens,
+            seed=42,
+            renormalize_topk_logits=True,
+            bt=32,
+            bf=128,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=128,
+            bd1c=256,
+            bd2c=256,
+            use_shared_expert=True,
+            shared_intermediate_size=shared_intermediate_size,
+        )
 
 
 if __name__ == "__main__":
