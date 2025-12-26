@@ -1045,27 +1045,41 @@ def _fused_ep_moe_kernel(
         se_acc_view = se_acc_vmem.reshape(bt, t_packing, -1)
 
         def run_se_block(block_offset, _):
-            grp_sem_id = block_offset % 2
             current_block_id = get_block_id_for_expert(local_e_id, block_offset)
             has_block = current_block_id < se_total_blocks
 
             @pl.when(has_block)
             def _():
-                # ============== 1. W1 & W3 计算 (Gate & Up) ==============
-                act_gate = jnp.zeros((bt, bf), dtype=jnp.float32)
-                act_up = jnp.zeros((bt, bf), dtype=jnp.float32)
+                # ============== 1. W1 & W3 Pipeline (Gate & Up) ==============
+                # 初始化 accumulator
+                init_act_gate = jnp.zeros((bt, bf), dtype=jnp.float32)
+                init_act_up = jnp.zeros((bt, bf), dtype=jnp.float32)
                 repack_ty = jnp.dtype(f"int{t_bitwidth}")
 
-                for bd1_idx in range(num_bd1):
-                    # A. Fetch
-                    start_fetch_se_w1(grp_sem_id, current_block_id, bd1_idx)
-                    start_fetch_se_w3(grp_sem_id, current_block_id, bd1_idx)
+                # [Prologue]: 预取第 0 个 slice 到 Buffer 0
+                if num_bd1 > 0:
+                    start_fetch_se_w1(0, current_block_id, 0)
+                    start_fetch_se_w3(0, current_block_id, 0)
 
-                    # B. Wait
-                    wait_fetch_se_w1(grp_sem_id)
-                    wait_fetch_se_w3(grp_sem_id)
+                # [Main Loop]: 这里的 carry 是 (act_gate, act_up)
+                def body_w1w3(bd1_idx, carry):
+                    act_gate_acc, act_up_acc = carry  # 解包 carry
 
-                    # C. Compute
+                    curr_sem_id = bd1_idx % 2
+                    next_sem_id = (bd1_idx + 1) % 2
+                    next_bd1_idx = bd1_idx + 1
+
+                    # A. [Prefetch Next]
+                    @pl.when(next_bd1_idx < num_bd1)
+                    def _():
+                        start_fetch_se_w1(next_sem_id, current_block_id, next_bd1_idx)
+                        start_fetch_se_w3(next_sem_id, current_block_id, next_bd1_idx)
+
+                    # B. [Wait Current]
+                    wait_fetch_se_w1(curr_sem_id)
+                    wait_fetch_se_w3(curr_sem_id)
+
+                    # C. [Compute Current]
                     t_b32 = b_se_tokens_vmem[
                         pl.ds(0, bt), pl.ds(bd1_idx * bd1_per_t_packing, bd1_per_t_packing)
                     ]
@@ -1076,8 +1090,8 @@ def _fused_ep_moe_kernel(
 
                         w_slices = (p_id, pl.ds(0, bd1_per_t_packing), pl.ds(0, bf))
 
-                        w1_gate_packed = b_se_w1_x2_vmem.at[grp_sem_id][*w_slices]
-                        w3_up_packed = b_se_w3_x2_vmem.at[grp_sem_id][*w_slices]
+                        w1_gate_packed = b_se_w1_x2_vmem.at[curr_sem_id][*w_slices]
+                        w3_up_packed = b_se_w3_x2_vmem.at[curr_sem_id][*w_slices]
 
                         w1_gate = pltpu.bitcast(w1_gate_packed.astype(repack_ty), t_dtype)
                         w3_up = pltpu.bitcast(w3_up_packed.astype(repack_ty), t_dtype)
@@ -1089,15 +1103,14 @@ def _fused_ep_moe_kernel(
                                 pl.ds(0, 1),
                                 pl.ds(0, bf),
                             )
-                            s_gate = b_se_w1_scale_x2_vmem.at[grp_sem_id][*scale_slices]
-                            s_up = b_se_w3_scale_x2_vmem.at[grp_sem_id][*scale_slices]
+                            s_gate = b_se_w1_scale_x2_vmem.at[curr_sem_id][*scale_slices]
+                            s_up = b_se_w3_scale_x2_vmem.at[curr_sem_id][*scale_slices]
                             s_gate = broadcast_quant_scale(
                                 s_gate, bd1_per_t_packing, subc_quant_wsz
                             )
                             s_up = broadcast_quant_scale(s_up, bd1_per_t_packing, subc_quant_wsz)
                             w1_gate_f = w1_gate.astype(jnp.float32) * s_gate
                             w3_up_f = w3_up.astype(jnp.float32) * s_up
-                            # 显式指定 accumulation 为 float32
                             acc_gate_part = jnp.dot(
                                 t.astype(jnp.float32), w1_gate_f, preferred_element_type=jnp.float32
                             )
@@ -1105,23 +1118,49 @@ def _fused_ep_moe_kernel(
                                 t.astype(jnp.float32), w3_up_f, preferred_element_type=jnp.float32
                             )
                         else:
-                            # 显式指定 accumulation 为 float32
                             acc_gate_part = jnp.dot(t, w1_gate, preferred_element_type=jnp.float32)
                             acc_up_part = jnp.dot(t, w3_up, preferred_element_type=jnp.float32)
 
-                        act_gate += acc_gate_part
-                        act_up += acc_up_part
+                        # 累加到 carry 变量中
+                        act_gate_acc += acc_gate_part
+                        act_up_acc += acc_up_part
 
+                    # 返回更新后的 carry
+                    return (act_gate_acc, act_up_acc)
+
+                # 执行循环，接收最终结果
+                act_gate, act_up = lax.fori_loop(
+                    0, num_bd1, body_w1w3, (init_act_gate, init_act_up)
+                )
+
+                # 激活函数
                 act = activation_fn(act_gate, act_up, act_fn)
 
-                # ============== 2. W2 计算 (Down) ==============
-                for bd2_idx in range(num_bd2):
-                    start_fetch_se_w2(grp_sem_id, current_block_id, bd2_idx)
-                    wait_fetch_se_w2(grp_sem_id)
+                # ============== 2. W2 Pipeline (Down) ==============
+                # W2 因为是写入 VMEM Ref (se_acc_view)，所以不需要 Loop Carry，保持原样即可
 
+                # [Prologue]
+                if num_bd2 > 0:
+                    start_fetch_se_w2(0, current_block_id, 0)
+
+                # [Main Loop]
+                def body_w2(bd2_idx, _):
+                    curr_sem_id = bd2_idx % 2
+                    next_sem_id = (bd2_idx + 1) % 2
+                    next_bd2_idx = bd2_idx + 1
+
+                    # A. [Prefetch]
+                    @pl.when(next_bd2_idx < num_bd2)
+                    def _():
+                        start_fetch_se_w2(next_sem_id, current_block_id, next_bd2_idx)
+
+                    # B. [Wait]
+                    wait_fetch_se_w2(curr_sem_id)
+
+                    # C. [Compute]
                     for p_id in range(t_packing):
                         w2_packed = b_se_w2_x2_vmem[
-                            grp_sem_id, p_id, pl.ds(0, bf), pl.ds(0, bd2_per_t_packing)
+                            curr_sem_id, p_id, pl.ds(0, bf), pl.ds(0, bd2_per_t_packing)
                         ]
                         w2_val = pltpu.bitcast(w2_packed.astype(repack_ty), t_dtype)
 
@@ -1131,20 +1170,21 @@ def _fused_ep_moe_kernel(
                                 pl.ds(0, 1),
                                 pl.ds(0, bd2_per_t_packing),
                             )
-                            s2 = b_se_w2_scale_x2_vmem.at[grp_sem_id, p_id][*scale_slices]
+                            s2 = b_se_w2_scale_x2_vmem.at[curr_sem_id, p_id][*scale_slices]
                             s2 = broadcast_quant_scale(s2, bf, subc_quant_wsz)
                             w2_f = w2_val.astype(jnp.float32) * s2
-                            # 显式指定 accumulation 为 float32
                             acc_chunk = jnp.dot(act, w2_f, preferred_element_type=jnp.float32)
                         else:
-                            # 显式指定 accumulation 为 float32
                             acc_chunk = jnp.dot(act, w2_val, preferred_element_type=jnp.float32)
 
+                        # 直接写入 VMEM Ref，不需要 Carry
                         se_acc_view[
                             pl.ds(0, bt),
                             p_id,
                             pl.ds(bd2_idx * bd2_per_t_packing, bd2_per_t_packing),
                         ] += acc_chunk
+
+                lax.fori_loop(0, num_bd2, body_w2, None)
 
         lax.fori_loop(0, max_se_blocks_per_expert, run_se_block, None)
 
