@@ -1011,51 +1011,53 @@ def _fused_ep_moe_kernel(
                 ).start()
 
     def wait_fetch_se_w1(grp_sem_id):
-        if w1_shared is None:
-            return
-        pltpu.make_async_copy(
-            src_ref=b_se_w1_x2_vmem.at[grp_sem_id],
-            dst_ref=b_se_w1_x2_vmem.at[grp_sem_id],
-            sem=local_sems.at[grp_sem_id, 5],
-        ).wait()
-
-        if w1_shared_scale is not None:
+        for _ in range(t_packing):
             pltpu.make_async_copy(
-                src_ref=b_se_w1_scale_x2_vmem.at[grp_sem_id],
-                dst_ref=b_se_w1_scale_x2_vmem.at[grp_sem_id],
+                src_ref=b_se_w1_x2_vmem.at[grp_sem_id],
+                dst_ref=b_se_w1_x2_vmem.at[grp_sem_id],
                 sem=local_sems.at[grp_sem_id, 5],
             ).wait()
 
-    def wait_fetch_se_w3(grp_sem_id):
-        if w3_shared is None:
-            return
-        pltpu.make_async_copy(
-            src_ref=b_se_w3_x2_vmem.at[grp_sem_id],
-            dst_ref=b_se_w3_x2_vmem.at[grp_sem_id],
-            sem=local_sems.at[grp_sem_id, 7],
-        ).wait()
+        # Scale 也是分片搬运的，也需要等待 (如果 w1_scale 存在)
+        if w1_shared_scale is not None:
+            for _ in range(t_packing):
+                pltpu.make_async_copy(
+                    src_ref=b_se_w1_scale_x2_vmem.at[grp_sem_id],
+                    dst_ref=b_se_w1_scale_x2_vmem.at[grp_sem_id],
+                    sem=local_sems.at[grp_sem_id, 5],
+                ).wait()
 
-        if w3_shared_scale is not None:
+    def wait_fetch_se_w3(grp_sem_id):
+        for _ in range(t_packing):
             pltpu.make_async_copy(
-                src_ref=b_se_w3_scale_x2_vmem.at[grp_sem_id],
-                dst_ref=b_se_w3_scale_x2_vmem.at[grp_sem_id],
+                src_ref=b_se_w3_x2_vmem.at[grp_sem_id],
+                dst_ref=b_se_w3_x2_vmem.at[grp_sem_id],
                 sem=local_sems.at[grp_sem_id, 7],
             ).wait()
 
+        if w3_shared_scale is not None:
+            for _ in range(t_packing):
+                pltpu.make_async_copy(
+                    src_ref=b_se_w3_scale_x2_vmem.at[grp_sem_id],
+                    dst_ref=b_se_w3_scale_x2_vmem.at[grp_sem_id],
+                    sem=local_sems.at[grp_sem_id, 7],
+                ).wait()
+
     def wait_fetch_se_w2(grp_sem_id):
-        if w2_shared is None:
-            return
-        pltpu.make_async_copy(
-            src_ref=b_se_w2_x2_vmem.at[grp_sem_id],
-            dst_ref=b_se_w2_x2_vmem.at[grp_sem_id],
-            sem=local_sems.at[grp_sem_id, 6],
-        ).wait()
-        if w2_shared_scale is not None:
+        for _ in range(t_packing):
             pltpu.make_async_copy(
-                src_ref=b_se_w2_scale_x2_vmem.at[grp_sem_id],
-                dst_ref=b_se_w2_scale_x2_vmem.at[grp_sem_id],
+                src_ref=b_se_w2_x2_vmem.at[grp_sem_id],
+                dst_ref=b_se_w2_x2_vmem.at[grp_sem_id],
                 sem=local_sems.at[grp_sem_id, 6],
             ).wait()
+
+        if w2_shared_scale is not None:
+            for _ in range(t_packing):
+                pltpu.make_async_copy(
+                    src_ref=b_se_w2_scale_x2_vmem.at[grp_sem_id],
+                    dst_ref=b_se_w2_scale_x2_vmem.at[grp_sem_id],
+                    sem=local_sems.at[grp_sem_id, 6],
+                ).wait()
 
     def compute_se_slice(local_e_id):
         if w1_shared is None:
@@ -1623,8 +1625,8 @@ def _fused_ep_moe_kernel(
         # Accumulate results for current batch.
         output = bt_acc(bt_id, top_k_logits_lst)
 
-        # if w1_shared is not None:
-        #     output += se_acc_vmem[...].astype(output_hbm.dtype)
+        if w1_shared is not None:
+            output += se_acc_vmem[...].astype(output_hbm.dtype)
 
         # Make sure it is safe to overwrite output buffer.
         wait_send_bo(bt_id=bt_id - 2)
