@@ -250,7 +250,7 @@ def get_vmem_estimate_bytes(
     head_dim = align_to(actual_head_dim, 128)
 
     total_bits = (
-        # bkv_x2_ref
+        # bkv_fused_x2_ref
         (2 * bkv_sz * num_kv_heads_x2 * head_dim) * (32 // kv_packing)
         +
         # bq_x2_ref + bo_x2_ref
@@ -362,6 +362,19 @@ def _ragged_paged_attention_kernel(
     q_len = q_end - q_start
     kv_len = kv_lens_ref[seq_idx]
 
+    if sliding_window is None:
+        bkv_idx_start = next_seq_bkv_idx_start = 0
+    else:
+        bkv_idx_start = jnp.maximum(kv_len - q_len - sliding_window, 0) // bkv_sz
+
+        # If seq_idx + 1 == num_seqs, kv_lens_ref[seq_idx + 1] will trigger a
+        # out-of-bound error. To avoid this, we set upperbound of next_seq_idx
+        # to be num_seqs - 1.
+        next_seq_idx = jnp.minimum(seq_idx + 1, num_seqs - 1)
+        next_kv_len = kv_lens_ref[next_seq_idx]
+        next_q_len = cu_q_lens_ref[next_seq_idx + 1] - q_end
+        next_seq_bkv_idx_start = jnp.maximum(next_kv_len - next_q_len - sliding_window, 0) // bkv_sz
+
     def flash_attention_step1_qk_softmax(
         q,  # [actual_bq_sz * num_q_heads_per_kv_head, head_dim]
         k,  # [bkv_sz, head_dim]
@@ -383,7 +396,7 @@ def _ragged_paged_attention_kernel(
         head_m_ref = m_ref.at[kv_head_idx, : q.shape[0]]
 
         def load_with_init(ref, init_val):
-            return jnp.where(bkv_idx == 0, jnp.full_like(ref, init_val), ref[...])
+            return jnp.where(bkv_idx == bkv_idx_start, jnp.full_like(ref, init_val), ref[...])
 
         # Follow FlashAttention-2 forward pass.
         if q_scale is not None:
@@ -723,7 +736,7 @@ def _ragged_paged_attention_kernel(
         vec = jnp.concat([ref[start + i :: step] for i in range(folds)], axis=1)
         return vec
 
-    def strided_load_bkv(bkv_sem_idx, start, step, *, bkv_mask):
+    def strided_load_bkv(bkv_sem_idx, start, step):
         assert start % kv_packing == 0
         assert step % kv_packing == 0
         start //= kv_packing
@@ -736,20 +749,11 @@ def _ragged_paged_attention_kernel(
         if kv_packing == 1:
             k = strided_load(kv_ref, start, step)
             v = strided_load(kv_ref, start + 1, step)
-            kv_zeros = jnp.zeros_like(k)
-            k = lax.select(bkv_mask, k, kv_zeros)
-            v = lax.select(bkv_mask, v, kv_zeros)
             k = pltpu.bitcast(k, kv_dtype)
             v = pltpu.bitcast(v, kv_dtype)
             return [(k, v)]
 
         kv = strided_load(kv_ref, start, step)
-        # bkv_mask holds information about where each row of bkv is valid.  Because
-        # kv is packed, a single 32-bits value might contain multiple k & v from
-        # different kv heads. Despite this we can guarantee that all values in a
-        # single 32-bits will map to the same bkv row. Therefore, it is safe to
-        # apply bkv_mask to kv directly.
-        kv = lax.select(bkv_mask, kv, jnp.zeros_like(kv))
         bitwidth = 32 // kv_packing
 
         # If we want to convert 32-bits into 32//N number of N-bits value, naive
@@ -833,6 +837,21 @@ def _ragged_paged_attention_kernel(
             next_bq_idx = lax.select(is_last_bq, 0, next_bq_idx)
             next_seq_idx = lax.select(is_last_bq, seq_idx + 1, seq_idx)
             next_bkv_sem_idx = lax.select(bkv_sem_idx == 0, 1, 0)
+
+            if sliding_window is None:
+                # When sliding window is disabled, starting bkv_idx of next request is
+                # always 0 regardless of seq_idx of next request.
+                next_bkv_idx_start = 0
+            else:
+                # Determine starting bkv_idx of next request based on whether next
+                # request is from the same sequence or next sequence.
+                next_bkv_idx_start = lax.select(
+                    is_last_bq,
+                    next_seq_bkv_idx_start,
+                    bkv_idx_start,
+                )
+            next_bkv_idx = lax.select(is_last_bkv, next_bkv_idx_start, next_bkv_idx)
+
             return next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx
 
         def compute_with_bq(bq_idx, _):
@@ -869,9 +888,6 @@ def _ragged_paged_attention_kernel(
             def compute_with_bkv(bkv_idx, _):
                 # Create bitmask for KV.
                 assert bkv_sz % kv_packing == 0
-                actual_bkv_sz = jnp.minimum(bkv_sz, kv_len - bkv_idx * bkv_sz)
-                bkv_shape = (bkv_sz, head_dim)
-                bkv_mask = lax.broadcasted_iota(jnp.int32, bkv_shape, 0) < actual_bkv_sz
 
                 # Get next bkv ids.
                 bkv_sem_idx = sem_ids_ref[1]
@@ -944,7 +960,6 @@ def _ragged_paged_attention_kernel(
                         bkv_sem_idx,
                         kv_head_start * 2,
                         num_kv_heads_x2,
-                        bkv_mask=bkv_mask,
                     )
                     assert len(bkv_lst) == heads_per_load
                     for i in range(heads_per_load):
@@ -1031,7 +1046,15 @@ def _ragged_paged_attention_kernel(
     @pl.when(seq_idx == 0)
     def prologue():
         start_fetch_bq(0, 0, 0)
-        start_fetch_bkv(0, 0, 0)
+        # Initialize bkv_fused_x2_ref to zeros to avoid NaN issues from accessing
+        # uninitialized memory. Bitcast into int32 to avoid tiling issues.
+        bkv_x2_int32_ref = bkv_fused_x2_ref.bitcast(jnp.int32).reshape((2, -1, 8, 128))
+        zeros = jnp.zeros(bkv_x2_int32_ref.shape[1:], jnp.int32)
+
+        # To pipeline VST and DMA, we divide the initialization into two steps.
+        bkv_x2_int32_ref[0] = zeros
+        start_fetch_bkv(0, bkv_idx_start, 0)
+        bkv_x2_int32_ref[1] = zeros
 
         if custom_mask_ref is not None:
             start_fetch_mask(0, 0, 0, 0)
