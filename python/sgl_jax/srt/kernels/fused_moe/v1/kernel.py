@@ -1163,11 +1163,8 @@ def _fused_ep_moe_kernel(
 
                         w_slices = (p_id, pl.ds(0, bd1_per_t_packing), pl.ds(0, bf))
 
-                        w1_gate_packed = b_se_w1_x2_vmem.at[curr_sem_id][*w_slices]
-                        w3_up_packed = b_se_w3_x2_vmem.at[curr_sem_id][*w_slices]
-
-                        w1_gate = pltpu.bitcast(w1_gate_packed.astype(repack_ty), t_dtype)
-                        w3_up = pltpu.bitcast(w3_up_packed.astype(repack_ty), t_dtype)
+                        w1_gate = b_se_w1_x2_vmem.at[curr_sem_id][*w_slices]
+                        w3_up = b_se_w3_x2_vmem.at[curr_sem_id][*w_slices]
 
                         if w1_shared_scale is not None:
                             scale_slices = (
@@ -1232,10 +1229,9 @@ def _fused_ep_moe_kernel(
 
                     # C. [Compute]
                     for p_id in range(t_packing):
-                        w2_packed = b_se_w2_x2_vmem[
+                        w2_val = b_se_w2_x2_vmem[
                             curr_sem_id, p_id, pl.ds(0, bf), pl.ds(0, bd2_per_t_packing)
                         ]
-                        w2_val = pltpu.bitcast(w2_packed.astype(repack_ty), t_dtype)
 
                         if w2_shared_scale is not None:
                             scale_slices = (
