@@ -928,87 +928,130 @@ def _fused_ep_moe_kernel(
     def start_fetch_se_w1(grp_sem_id, block_id, bd1_idx):
         if w1_shared is None:
             return
-        # 这里的 offset 计算针对当前的 bd1_idx
-        offset = bd1_idx * bd1_per_t_packing
 
-        # 你的原始逻辑，但去掉了 for bd1_idx 循环，只搬运单块
-        for p in range(t_packing):
+        # 计算物理偏移 (基于 bfloat16 的元素个数)
+        # 这里的 offset 是 bd1 维度的起始点
+        # h_per_t_packing * t_packing = hidden_size
+        # 但我们需要搬运的是 bd1 大小的数据。
+        # 原逻辑是 split 的，现在我们直接按 block_id 和 bd1_idx 寻址
+
+        # 1. 创建 int32 类型的 View (把 t_packing 维度折叠掉)
+        # HBM 原型: (hidden_size, intermediate_size) [BF16]
+        # VMEM 原型: (2, t_packing, hidden_size // t_packing, bf) [BF16]
+
+        # 我们需要搬运的切片大小: (bd1, bf)
+        # 对应的 int32 大小: (bd1 // 2, bf)  (假设 bd1 是 2 的倍数，肯定满足)
+
+        # 构造 Src Ref (HBM) - 视为 (Hidden//2, BF) 的 int32 矩阵
+        # offset 计算: bd1_idx * (bd1 // 2)
+        int32_bd1_dim = bd1_per_t_packing  # bd1 // 2
+
+        src_offset_h = bd1_idx * int32_bd1_dim
+
+        # 使用 int32 进行一次性搬运
+        pltpu.make_async_copy(
+            src_ref=w1_shared.bitcast(jnp.int32).at[
+                pl.ds(src_offset_h, int32_bd1_dim), pl.ds(block_id * bf, bf)
+            ],
+            dst_ref=b_se_w1_x2_vmem.at[grp_sem_id]
+            .bitcast(jnp.int32)
+            .at[
+                0,  # t_packing 维度被 bitcast 吃掉了，或者变成 (1, ...)
+                pl.ds(0, int32_bd1_dim),  # 直接填充到当前 bd1 的位置
+                pl.ds(0, bf),
+            ],
+            sem=local_sems.at[grp_sem_id, 5],
+        ).start()
+
+        # Scale 同理 (如果有)
+        if w1_shared_scale is not None:
+            # Scale 通常较小，维持原样或也合并
+            # 简单起见，Scale 保持原样循环 (因为它很小且不常变)，或者也用 int32 合并
+            # 为防死锁，建议 Scale 也合并:
+            # Scale shape: (Hidden/subc, 1, Inter)
+            scale_bd_dim = int32_bd1_dim // subc_quant_wsz
+            src_scale_offset = src_offset_h // subc_quant_wsz
+
             pltpu.make_async_copy(
-                src_ref=w1_shared.at[
-                    pl.ds(p * h_per_t_packing + offset, bd1_per_t_packing),  # 切片 offset
+                src_ref=w1_shared_scale.bitcast(jnp.int32).at[
+                    pl.ds(src_scale_offset, scale_bd_dim),
+                    pl.ds(0, 1),
                     pl.ds(block_id * bf, bf),
                 ],
-                dst_ref=b_se_w1_x2_vmem.at[grp_sem_id, p],  # 填入小 Buffer
+                dst_ref=b_se_w1_scale_x2_vmem.at[grp_sem_id]
+                .bitcast(jnp.int32)
+                .at[0, pl.ds(0, scale_bd_dim), pl.ds(0, 1), pl.ds(0, bf)],
                 sem=local_sems.at[grp_sem_id, 5],
             ).start()
 
-            if w1_shared_scale is not None:
-                # 同样的逻辑处理 Scale
-                scale_offset = offset // subc_quant_wsz
-                scale_len = bd1_per_t_packing // subc_quant_wsz
-                pltpu.make_async_copy(
-                    src_ref=w1_shared_scale.at[
-                        pl.ds(p * h_per_t_packing // subc_quant_wsz + scale_offset, scale_len),
-                        pl.ds(0, 1),
-                        pl.ds(block_id * bf, bf),
-                    ],
-                    dst_ref=b_se_w1_scale_x2_vmem.at[grp_sem_id, p],
-                    sem=local_sems.at[grp_sem_id, 5],
-                ).start()
-
+    # W3 同理
     def start_fetch_se_w3(grp_sem_id, block_id, bd1_idx):
         if w3_shared is None:
             return
-        offset = bd1_idx * bd1_per_t_packing
-        for p in range(t_packing):
-            # ... (代码逻辑同上，替换 buffer 为 w3) ...
+        int32_bd1_dim = bd1_per_t_packing
+        src_offset_h = bd1_idx * int32_bd1_dim
+
+        pltpu.make_async_copy(
+            src_ref=w3_shared.bitcast(jnp.int32).at[
+                pl.ds(src_offset_h, int32_bd1_dim), pl.ds(block_id * bf, bf)
+            ],
+            dst_ref=b_se_w3_x2_vmem.at[grp_sem_id]
+            .bitcast(jnp.int32)
+            .at[0, pl.ds(0, int32_bd1_dim), pl.ds(0, bf)],
+            sem=local_sems.at[grp_sem_id, 7],
+        ).start()
+
+        if w3_shared_scale is not None:
+            scale_bd_dim = int32_bd1_dim // subc_quant_wsz
+            src_scale_offset = src_offset_h // subc_quant_wsz
             pltpu.make_async_copy(
-                src_ref=w3_shared.at[
-                    pl.ds(p * h_per_t_packing + offset, bd1_per_t_packing),
+                src_ref=w3_shared_scale.bitcast(jnp.int32).at[
+                    pl.ds(src_scale_offset, scale_bd_dim),
+                    pl.ds(0, 1),
                     pl.ds(block_id * bf, bf),
                 ],
-                dst_ref=b_se_w3_x2_vmem.at[grp_sem_id, p],
+                dst_ref=b_se_w3_scale_x2_vmem.at[grp_sem_id]
+                .bitcast(jnp.int32)
+                .at[0, pl.ds(0, scale_bd_dim), pl.ds(0, 1), pl.ds(0, bf)],
                 sem=local_sems.at[grp_sem_id, 7],
             ).start()
-            if w3_shared_scale is not None:
-                scale_offset = offset // subc_quant_wsz
-                scale_len = bd1_per_t_packing // subc_quant_wsz
-                pltpu.make_async_copy(
-                    src_ref=w3_shared_scale.at[
-                        pl.ds(p * h_per_t_packing // subc_quant_wsz + scale_offset, scale_len),
-                        pl.ds(0, 1),
-                        pl.ds(block_id * bf, bf),
-                    ],
-                    dst_ref=b_se_w3_scale_x2_vmem.at[grp_sem_id, p],
-                    sem=local_sems.at[grp_sem_id, 7],
-                ).start()
 
+    # W2 同理 (注意 W2 的维度顺序可能不同)
     def start_fetch_se_w2(grp_sem_id, block_id, bd2_idx):
         if w2_shared is None:
             return
-        offset = bd2_idx * bd2_per_t_packing
-        for p in range(t_packing):
+        int32_bd2_dim = bd2_per_t_packing
+        # W2 是 (Inter, Hidden)
+        # 转 int32 后: (Inter, Hidden//2)
+        dst_offset_h = bd2_idx * int32_bd2_dim
+
+        pltpu.make_async_copy(
+            src_ref=w2_shared.bitcast(jnp.int32).at[
+                pl.ds(block_id * bf, bf), pl.ds(dst_offset_h, int32_bd2_dim)
+            ],
+            dst_ref=b_se_w2_x2_vmem.at[grp_sem_id]
+            .bitcast(jnp.int32)
+            .at[0, pl.ds(0, bf), pl.ds(0, int32_bd2_dim)],
+            sem=local_sems.at[grp_sem_id, 6],
+        ).start()
+
+        if w2_shared_scale is not None:
+            # W2 Scale: (Inter//subc, 1, Hidden)
+            scale_inter_idx = (block_id * bf) // subc_quant_wsz
+            scale_inter_len = bf // subc_quant_wsz
+            scale_dst_offset = dst_offset_h  # hidden dim 对应的 scale 也是同比例
+
             pltpu.make_async_copy(
-                src_ref=w2_shared.at[
-                    pl.ds(block_id * bf, bf), pl.ds(p * h_per_t_packing + offset, bd2_per_t_packing)
+                src_ref=w2_shared_scale.bitcast(jnp.int32).at[
+                    pl.ds(scale_inter_idx, scale_inter_len),
+                    pl.ds(0, 1),
+                    pl.ds(scale_dst_offset, int32_bd2_dim),
                 ],
-                dst_ref=b_se_w2_x2_vmem.at[grp_sem_id, p],
+                dst_ref=b_se_w2_scale_x2_vmem.at[grp_sem_id]
+                .bitcast(jnp.int32)
+                .at[0, pl.ds(0, scale_inter_len), pl.ds(0, 1), pl.ds(0, int32_bd2_dim)],
                 sem=local_sems.at[grp_sem_id, 6],
             ).start()
-            if w2_shared_scale is not None:
-                # 注意 W2 Scale 的维度通常是 (Inter//subc, 1, Hidden)
-                # 这里的切片逻辑需要根据你的 Scale layout 调整
-                scale_inter_idx = (block_id * bf) // subc_quant_wsz
-                scale_inter_len = bf // subc_quant_wsz
-                pltpu.make_async_copy(
-                    src_ref=w2_shared_scale.at[
-                        pl.ds(scale_inter_idx, scale_inter_len),
-                        pl.ds(0, 1),
-                        pl.ds(p * h_per_t_packing + offset, bd2_per_t_packing),
-                    ],
-                    dst_ref=b_se_w2_scale_x2_vmem.at[grp_sem_id, p],
-                    sem=local_sems.at[grp_sem_id, 6],
-                ).start()
 
     def wait_fetch_se_w1(grp_sem_id):
         if w1_shared is None:
