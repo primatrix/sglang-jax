@@ -1031,11 +1031,9 @@ def _fused_ep_moe_kernel(
         if w1_shared is None:
             return
 
-        # 如果 block 数量为 0 直接返回
         if max_se_blocks_per_expert == 0:
             return
 
-        # 辅助函数：广播 Scale
         def broadcast_quant_scale(scale, current_block_size, group_size):
             if group_size is None or group_size <= 0:
                 return scale.squeeze(-2)
@@ -1045,9 +1043,6 @@ def _fused_ep_moe_kernel(
             return s.squeeze(-2)
 
         se_acc_view = se_acc_vmem.reshape(bt, t_packing, -1)
-
-        # --- 核心修改开始 ---
-        # 移除原有的 prefetch_block 函数和对应的调用
 
         def run_se_block(block_offset, _):
             grp_sem_id = block_offset % 2
@@ -1061,19 +1056,16 @@ def _fused_ep_moe_kernel(
                 act_up = jnp.zeros((bt, bf), dtype=jnp.float32)
                 repack_ty = jnp.dtype(f"int{t_bitwidth}")
 
-                # 循环切片 hidden_dim (bd1)
                 for bd1_idx in range(num_bd1):
-                    # A. 发起当前分片的 DMA (Fetch)
+                    # A. Fetch
                     start_fetch_se_w1(grp_sem_id, current_block_id, bd1_idx)
                     start_fetch_se_w3(grp_sem_id, current_block_id, bd1_idx)
 
-                    # B. 等待数据到位 (Wait)
-                    # 此时 buffer 里只有当前 bd1_idx 的数据，安全！
+                    # B. Wait
                     wait_fetch_se_w1(grp_sem_id)
                     wait_fetch_se_w3(grp_sem_id)
 
-                    # C. 计算 (Compute)
-                    # Input Tokens 也要根据 bd1_idx 切片
+                    # C. Compute
                     t_b32 = b_se_tokens_vmem[
                         pl.ds(0, bt), pl.ds(bd1_idx * bd1_per_t_packing, bd1_per_t_packing)
                     ]
@@ -1082,7 +1074,6 @@ def _fused_ep_moe_kernel(
                         t = pltpu.bitcast(t_b32.astype(repack_ty), t_dtype)
                         t_b32 = t_b32 >> t_bitwidth
 
-                        # Buffer 现在是满的（相对于 bd1 大小），所以直接读全部
                         w_slices = (p_id, pl.ds(0, bd1_per_t_packing), pl.ds(0, bf))
 
                         w1_gate_packed = b_se_w1_x2_vmem.at[grp_sem_id][*w_slices]
@@ -1091,7 +1082,6 @@ def _fused_ep_moe_kernel(
                         w1_gate = pltpu.bitcast(w1_gate_packed.astype(repack_ty), t_dtype)
                         w3_up = pltpu.bitcast(w3_up_packed.astype(repack_ty), t_dtype)
 
-                        # Scale 处理逻辑 (简化示意)
                         if w1_shared_scale is not None:
                             scale_slices = (
                                 p_id,
@@ -1107,28 +1097,28 @@ def _fused_ep_moe_kernel(
                             s_up = broadcast_quant_scale(s_up, bd1_per_t_packing, subc_quant_wsz)
                             w1_gate_f = w1_gate.astype(jnp.float32) * s_gate
                             w3_up_f = w3_up.astype(jnp.float32) * s_up
-                            acc_gate_part = jnp.dot(t.astype(jnp.float32), w1_gate_f)
-                            acc_up_part = jnp.dot(t.astype(jnp.float32), w3_up_f)
+                            # 显式指定 accumulation 为 float32
+                            acc_gate_part = jnp.dot(
+                                t.astype(jnp.float32), w1_gate_f, preferred_element_type=jnp.float32
+                            )
+                            acc_up_part = jnp.dot(
+                                t.astype(jnp.float32), w3_up_f, preferred_element_type=jnp.float32
+                            )
                         else:
-                            acc_gate_part = jnp.dot(t, w1_gate)
-                            acc_up_part = jnp.dot(t, w3_up)
+                            # 显式指定 accumulation 为 float32
+                            acc_gate_part = jnp.dot(t, w1_gate, preferred_element_type=jnp.float32)
+                            acc_up_part = jnp.dot(t, w3_up, preferred_element_type=jnp.float32)
 
                         act_gate += acc_gate_part
                         act_up += acc_up_part
 
-                # 激活函数
                 act = activation_fn(act_gate, act_up, act_fn)
 
                 # ============== 2. W2 计算 (Down) ==============
-                # 循环切片 hidden_dim (bd2)
                 for bd2_idx in range(num_bd2):
-                    # A. 发起 Fetch
                     start_fetch_se_w2(grp_sem_id, current_block_id, bd2_idx)
-
-                    # B. 等待 Wait
                     wait_fetch_se_w2(grp_sem_id)
 
-                    # C. 计算 Compute
                     for p_id in range(t_packing):
                         w2_packed = b_se_w2_x2_vmem[
                             grp_sem_id, p_id, pl.ds(0, bf), pl.ds(0, bd2_per_t_packing)
@@ -1144,18 +1134,18 @@ def _fused_ep_moe_kernel(
                             s2 = b_se_w2_scale_x2_vmem.at[grp_sem_id, p_id][*scale_slices]
                             s2 = broadcast_quant_scale(s2, bf, subc_quant_wsz)
                             w2_f = w2_val.astype(jnp.float32) * s2
-                            acc_chunk = jnp.dot(act, w2_f)
+                            # 显式指定 accumulation 为 float32
+                            acc_chunk = jnp.dot(act, w2_f, preferred_element_type=jnp.float32)
                         else:
-                            acc_chunk = jnp.dot(act, w2_val)
+                            # 显式指定 accumulation 为 float32
+                            acc_chunk = jnp.dot(act, w2_val, preferred_element_type=jnp.float32)
 
-                        # 累加到最终结果 (根据 bd2_idx 偏移)
                         se_acc_view[
                             pl.ds(0, bt),
                             p_id,
                             pl.ds(bd2_idx * bd2_per_t_packing, bd2_per_t_packing),
                         ] += acc_chunk
 
-        # 执行主循环
         lax.fori_loop(0, max_se_blocks_per_expert, run_se_block, None)
 
     def dynamic_ffn1(
