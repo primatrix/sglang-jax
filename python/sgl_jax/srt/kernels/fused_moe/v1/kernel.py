@@ -71,6 +71,7 @@ def ref_moe(
     top_k_groups: int = 1,
     bias: jax.Array | None = None,  # (num_experts,)
     renormalize_topk_logits: bool = False,
+    use_sigmoid: bool = False,
     act_fn: str = "silu",
     subc_quant_wsz: int | None = None,
     w1_scale: (
@@ -97,7 +98,10 @@ def ref_moe(
 
     # Compute gating scores for all experts
     gating_logits_f32 = gating_output.astype(jnp.float32)
-    gating_probs = jax.nn.softmax(gating_logits_f32, axis=-1)
+    if use_sigmoid:
+        gating_probs = jax.nn.sigmoid(gating_logits_f32)
+    else:
+        gating_probs = jax.nn.softmax(gating_logits_f32, axis=-1)
 
     routing_scores = (
         gating_probs + jnp.expand_dims(bias.astype(jnp.float32), 0)
@@ -318,6 +322,7 @@ def _fused_ep_moe_kernel(
     num_groups: int = 1,
     top_k_groups: int = 1,
     renormalize_topk_logits: bool,
+    use_sigmoid: bool = False,
     ep_axis_name: str,
     act_fn: str,
     subc_quant_wsz: int | None = None,
@@ -1538,7 +1543,11 @@ def _fused_ep_moe_kernel(
         b_gating = b_gating_x2_vmem[bt_sem_id]
 
         b_gating_logits = b_gating.astype(jnp.float32)
-        b_gating_score = jax.nn.softmax(b_gating_logits, axis=-1)
+
+        if use_sigmoid:
+            b_gating_score = jax.nn.sigmoid(b_gating_logits)
+        else:
+            b_gating_score = jax.nn.softmax(b_gating_logits, axis=-1)
 
         top_k_logits_lst, t2e_routing, expert_sizes, expert_starts = get_top_k(
             b_gating_score, top_k, renormalize_topk_logits
@@ -1905,6 +1914,7 @@ def _validate_fused_ep_moe_args(
         "num_groups",
         "top_k_groups",
         "renormalize_topk_logits",
+        "use_sigmoid",
         "act_fn",
         "subc_quant_wsz",
         "bt",
@@ -1931,6 +1941,7 @@ def fused_ep_moe(
     num_groups: int = 1,
     top_k_groups: int = 1,
     renormalize_topk_logits: bool = False,
+    use_sigmoid: bool = False,
     act_fn: str = "silu",
     subc_quant_wsz: int | None = None,
     w1_scale: jax.Array | None = None,
@@ -2122,6 +2133,7 @@ def fused_ep_moe(
                 num_groups=num_groups,
                 top_k_groups=top_k_groups,
                 renormalize_topk_logits=renormalize_topk_logits,
+                use_sigmoid=use_sigmoid,
                 ep_axis_name=ep_axis_name,
                 act_fn=act_fn,
                 subc_quant_wsz=subc_quant_wsz,
