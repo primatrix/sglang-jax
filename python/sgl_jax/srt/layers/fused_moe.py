@@ -102,6 +102,7 @@ class FusedEPMoE(nnx.Module):
         layer_id: int = 0,
         renormalize_topk_logits: bool = False,
         use_sigmoid: bool = False,
+        routed_scaling_factor: float | None = None,
         use_grouped_topk: bool = False,
         num_groups: int = 1,
         top_k_groups: int = 1,
@@ -128,6 +129,7 @@ class FusedEPMoE(nnx.Module):
         self.activation = activation
         self.renormalize_topk_logits = renormalize_topk_logits
         self.use_sigmoid = use_sigmoid
+        self.routed_scaling_factor = routed_scaling_factor
         self.mesh = mesh
         self.use_grouped_topk = use_grouped_topk
         self.num_groups = num_groups
@@ -256,6 +258,7 @@ class FusedEPMoE(nnx.Module):
             top_k=self.num_experts_per_tok,
             renormalize_topk_logits=self.renormalize_topk_logits,
             use_sigmoid=self.use_sigmoid,
+            routed_scaling_factor=self.routed_scaling_factor,
             use_grouped_topk=self.use_grouped_topk,
             num_groups=self.num_groups,
             top_k_groups=self.top_k_groups,

@@ -72,6 +72,7 @@ def ref_moe(
     bias: jax.Array | None = None,  # (num_experts,)
     renormalize_topk_logits: bool = False,
     use_sigmoid: bool = False,
+    routed_scaling_factor: float | None = None,
     act_fn: str = "silu",
     subc_quant_wsz: int | None = None,
     w1_scale: (
@@ -204,6 +205,8 @@ def ref_moe(
 
         # Weighted sum using top-k gating weights
         top_k_weights = top_k_logits[i]  # [top_k]
+        if routed_scaling_factor is not None:
+            top_k_weights *= routed_scaling_factor
         top_k_weights = jnp.expand_dims(top_k_weights, axis=1)  # [top_k, 1]
         weighted_output = jnp.sum(
             experts_act * top_k_weights, axis=0, keepdims=True
@@ -323,6 +326,7 @@ def _fused_ep_moe_kernel(
     top_k_groups: int = 1,
     renormalize_topk_logits: bool,
     use_sigmoid: bool = False,
+    routed_scaling_factor: float | None = None,
     ep_axis_name: str,
     act_fn: str,
     subc_quant_wsz: int | None = None,
@@ -513,6 +517,10 @@ def _fused_ep_moe_kernel(
         if renormalize_topk_logits:
             for k_id in range(top_k):
                 top_k_logits_lst[k_id] /= top_k_logits_sum
+
+        if routed_scaling_factor is not None:
+            for k_id in range(top_k):
+                top_k_logits_lst[k_id] *= routed_scaling_factor
 
         expert_sizes = jnp.sum(t2e, axis=0, keepdims=True)
         expert_starts = jnp.zeros_like(expert_sizes)
@@ -1915,6 +1923,7 @@ def _validate_fused_ep_moe_args(
         "top_k_groups",
         "renormalize_topk_logits",
         "use_sigmoid",
+        "routed_scaling_factor",
         "act_fn",
         "subc_quant_wsz",
         "bt",
@@ -1941,6 +1950,7 @@ def fused_ep_moe(
     num_groups: int = 1,
     top_k_groups: int = 1,
     renormalize_topk_logits: bool = False,
+    routed_scaling_factor: float | None = None,
     use_sigmoid: bool = False,
     act_fn: str = "silu",
     subc_quant_wsz: int | None = None,
@@ -2134,6 +2144,7 @@ def fused_ep_moe(
                 top_k_groups=top_k_groups,
                 renormalize_topk_logits=renormalize_topk_logits,
                 use_sigmoid=use_sigmoid,
+                routed_scaling_factor=routed_scaling_factor,
                 ep_axis_name=ep_axis_name,
                 act_fn=act_fn,
                 subc_quant_wsz=subc_quant_wsz,
