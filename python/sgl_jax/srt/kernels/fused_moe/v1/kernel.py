@@ -898,94 +898,87 @@ def _fused_ep_moe_kernel(
     def start_fetch_se_w1(grp_sem_id, block_id, bd1_idx):
         if w1_shared is None:
             return
+        # 这里的 offset 计算针对当前的 bd1_idx
+        offset = bd1_idx * bd1_per_t_packing
 
-        @pl.when(block_id < se_total_blocks)
-        def _():
-            for p in range(t_packing):
-                offset = p * h_per_t_packing + bd1_idx * bd1_per_t_packing
-                # W1
+        # 你的原始逻辑，但去掉了 for bd1_idx 循环，只搬运单块
+        for p in range(t_packing):
+            pltpu.make_async_copy(
+                src_ref=w1_shared.at[
+                    pl.ds(p * h_per_t_packing + offset, bd1_per_t_packing),  # 切片 offset
+                    pl.ds(block_id * bf, bf),
+                ],
+                dst_ref=b_se_w1_x2_vmem.at[grp_sem_id, p],  # 填入小 Buffer
+                sem=local_sems.at[grp_sem_id, 5],
+            ).start()
+
+            if w1_shared_scale is not None:
+                # 同样的逻辑处理 Scale
+                scale_offset = offset // subc_quant_wsz
+                scale_len = bd1_per_t_packing // subc_quant_wsz
                 pltpu.make_async_copy(
-                    src_ref=w1_shared.at[
-                        pl.ds(offset, bd1_per_t_packing),
+                    src_ref=w1_shared_scale.at[
+                        pl.ds(p * h_per_t_packing // subc_quant_wsz + scale_offset, scale_len),
+                        pl.ds(0, 1),
                         pl.ds(block_id * bf, bf),
                     ],
-                    dst_ref=b_se_w1_x2_vmem.at[grp_sem_id, p],
+                    dst_ref=b_se_w1_scale_x2_vmem.at[grp_sem_id, p],
                     sem=local_sems.at[grp_sem_id, 5],
                 ).start()
-
-                # W1Scale
-                if w1_shared_scale is not None:
-                    assert subc_quant_wsz is not None
-                    pltpu.make_async_copy(
-                        src_ref=w1_shared_scale.at[
-                            pl.ds(offset // subc_quant_wsz, bd1_per_t_packing // subc_quant_wsz),
-                            pl.ds(0, 1),
-                            pl.ds(block_id * bf, bf),
-                        ],
-                        dst_ref=b_se_w1_scale_x2_vmem.at[grp_sem_id, p],
-                        sem=local_sems.at[grp_sem_id, 5],
-                    ).start()
 
     def start_fetch_se_w3(grp_sem_id, block_id, bd1_idx):
         if w3_shared is None:
             return
-
-        @pl.when(block_id < se_total_blocks)
-        def _():
-            for p in range(t_packing):
-                offset = p * h_per_t_packing + bd1_idx * bd1_per_t_packing
-                # W3
+        offset = bd1_idx * bd1_per_t_packing
+        for p in range(t_packing):
+            # ... (代码逻辑同上，替换 buffer 为 w3) ...
+            pltpu.make_async_copy(
+                src_ref=w3_shared.at[
+                    pl.ds(p * h_per_t_packing + offset, bd1_per_t_packing),
+                    pl.ds(block_id * bf, bf),
+                ],
+                dst_ref=b_se_w3_x2_vmem.at[grp_sem_id, p],
+                sem=local_sems.at[grp_sem_id, 7],
+            ).start()
+            if w3_shared_scale is not None:
+                scale_offset = offset // subc_quant_wsz
+                scale_len = bd1_per_t_packing // subc_quant_wsz
                 pltpu.make_async_copy(
-                    src_ref=w3_shared.at[
-                        pl.ds(offset, bd1_per_t_packing),
+                    src_ref=w3_shared_scale.at[
+                        pl.ds(p * h_per_t_packing // subc_quant_wsz + scale_offset, scale_len),
+                        pl.ds(0, 1),
                         pl.ds(block_id * bf, bf),
                     ],
-                    dst_ref=b_se_w3_x2_vmem.at[grp_sem_id, p],
+                    dst_ref=b_se_w3_scale_x2_vmem.at[grp_sem_id, p],
                     sem=local_sems.at[grp_sem_id, 7],
                 ).start()
-                # W3 Scale
-                if w3_shared_scale is not None:
-                    assert subc_quant_wsz is not None
-                    pltpu.make_async_copy(
-                        src_ref=w3_shared_scale.at[
-                            pl.ds(offset // subc_quant_wsz, bd1_per_t_packing // subc_quant_wsz),
-                            pl.ds(0, 1),
-                            pl.ds(block_id * bf, bf),
-                        ],
-                        dst_ref=b_se_w3_scale_x2_vmem.at[grp_sem_id, p],
-                        sem=local_sems.at[grp_sem_id, 7],
-                    ).start()
 
     def start_fetch_se_w2(grp_sem_id, block_id, bd2_idx):
         if w2_shared is None:
             return
-
-        @pl.when(block_id < se_total_blocks)
-        def _():
-            for p in range(t_packing):
-                offset = p * h_per_t_packing + bd2_idx * bd2_per_t_packing
-                # Fetch W2 (Down)
+        offset = bd2_idx * bd2_per_t_packing
+        for p in range(t_packing):
+            pltpu.make_async_copy(
+                src_ref=w2_shared.at[
+                    pl.ds(block_id * bf, bf), pl.ds(p * h_per_t_packing + offset, bd2_per_t_packing)
+                ],
+                dst_ref=b_se_w2_x2_vmem.at[grp_sem_id, p],
+                sem=local_sems.at[grp_sem_id, 6],
+            ).start()
+            if w2_shared_scale is not None:
+                # 注意 W2 Scale 的维度通常是 (Inter//subc, 1, Hidden)
+                # 这里的切片逻辑需要根据你的 Scale layout 调整
+                scale_inter_idx = (block_id * bf) // subc_quant_wsz
+                scale_inter_len = bf // subc_quant_wsz
                 pltpu.make_async_copy(
-                    src_ref=w2_shared.at[
-                        pl.ds(block_id * bf, bf), pl.ds(offset, bd2_per_t_packing)
+                    src_ref=w2_shared_scale.at[
+                        pl.ds(scale_inter_idx, scale_inter_len),
+                        pl.ds(0, 1),
+                        pl.ds(p * h_per_t_packing + offset, bd2_per_t_packing),
                     ],
-                    dst_ref=b_se_w2_x2_vmem.at[grp_sem_id, p],
+                    dst_ref=b_se_w2_scale_x2_vmem.at[grp_sem_id, p],
                     sem=local_sems.at[grp_sem_id, 6],
                 ).start()
-                # Fetch Scales
-                if w2_shared_scale is not None:
-                    assert subc_quant_wsz is not None
-                    scale_inter_idx = (block_id * bf) // subc_quant_wsz
-                    scale_inter_len = bf // subc_quant_wsz
-                    pltpu.make_async_copy(
-                        src_ref=w2_shared_scale.at[
-                            pl.ds(scale_inter_idx, scale_inter_len),
-                            pl.ds(0, 1),
-                            pl.ds(offset, bd2_per_t_packing),
-                        ],
-                        dst_ref=b_se_w2_scale_x2_vmem.at[grp_sem_id, p],
-                        sem=local_sems.at[grp_sem_id, 6],
-                    ).start()
 
     def wait_fetch_se_w1(grp_sem_id):
         if w1_shared is None:
@@ -1035,16 +1028,14 @@ def _fused_ep_moe_kernel(
             ).wait()
 
     def compute_se_slice(local_e_id):
-        """
-        Shared Expert block computation scheduled per expert via round robin.
-        """
         if w1_shared is None:
             return
 
-        num_blocks = max_se_blocks_per_expert
-        if num_blocks == 0:
+        # 如果 block 数量为 0 直接返回
+        if max_se_blocks_per_expert == 0:
             return
 
+        # 辅助函数：广播 Scale
         def broadcast_quant_scale(scale, current_block_size, group_size):
             if group_size is None or group_size <= 0:
                 return scale.squeeze(-2)
@@ -1055,138 +1046,117 @@ def _fused_ep_moe_kernel(
 
         se_acc_view = se_acc_vmem.reshape(bt, t_packing, -1)
 
-        def prefetch_block(grp_sem_id, block_id):
-            for bd1_idx in range(num_bd1):
-                start_fetch_se_w1(grp_sem_id, block_id, bd1_idx)
-                start_fetch_se_w3(grp_sem_id, block_id, bd1_idx)
-            for bd2_idx in range(num_bd2):
-                start_fetch_se_w2(grp_sem_id, block_id, bd2_idx)
-
-        first_block_id = get_block_id_for_expert(local_e_id, 0)
-        prefetch_block(0, first_block_id)
+        # --- 核心修改开始 ---
+        # 移除原有的 prefetch_block 函数和对应的调用
 
         def run_se_block(block_offset, _):
             grp_sem_id = block_offset % 2
-            next_block_offset = block_offset + 1
-
-            @pl.when(next_block_offset < num_blocks)
-            def _():
-                next_block_id = get_block_id_for_expert(local_e_id, next_block_offset)
-                prefetch_block(grp_sem_id ^ 1, next_block_id)
-
             current_block_id = get_block_id_for_expert(local_e_id, block_offset)
             has_block = current_block_id < se_total_blocks
 
             @pl.when(has_block)
             def _():
-                # Compute W1 W3
-                wait_fetch_se_w1(grp_sem_id)
-                wait_fetch_se_w3(grp_sem_id)
-
+                # ============== 1. W1 & W3 计算 (Gate & Up) ==============
                 act_gate = jnp.zeros((bt, bf), dtype=jnp.float32)
                 act_up = jnp.zeros((bt, bf), dtype=jnp.float32)
                 repack_ty = jnp.dtype(f"int{t_bitwidth}")
 
+                # 循环切片 hidden_dim (bd1)
                 for bd1_idx in range(num_bd1):
-                    # Input Tokens: (bt, bd1_chunk)
+                    # A. 发起当前分片的 DMA (Fetch)
+                    start_fetch_se_w1(grp_sem_id, current_block_id, bd1_idx)
+                    start_fetch_se_w3(grp_sem_id, current_block_id, bd1_idx)
+
+                    # B. 等待数据到位 (Wait)
+                    # 此时 buffer 里只有当前 bd1_idx 的数据，安全！
+                    wait_fetch_se_w1(grp_sem_id)
+                    wait_fetch_se_w3(grp_sem_id)
+
+                    # C. 计算 (Compute)
+                    # Input Tokens 也要根据 bd1_idx 切片
                     t_b32 = b_se_tokens_vmem[
                         pl.ds(0, bt), pl.ds(bd1_idx * bd1_per_t_packing, bd1_per_t_packing)
                     ]
 
                     for p_id in range(t_packing):
-                        # Unpack Input
                         t = pltpu.bitcast(t_b32.astype(repack_ty), t_dtype)
                         t_b32 = t_b32 >> t_bitwidth
 
+                        # Buffer 现在是满的（相对于 bd1 大小），所以直接读全部
                         w_slices = (p_id, pl.ds(0, bd1_per_t_packing), pl.ds(0, bf))
 
-                        # Fetch Weights
                         w1_gate_packed = b_se_w1_x2_vmem.at[grp_sem_id][*w_slices]
                         w3_up_packed = b_se_w3_x2_vmem.at[grp_sem_id][*w_slices]
 
                         w1_gate = pltpu.bitcast(w1_gate_packed.astype(repack_ty), t_dtype)
                         w3_up = pltpu.bitcast(w3_up_packed.astype(repack_ty), t_dtype)
 
+                        # Scale 处理逻辑 (简化示意)
                         if w1_shared_scale is not None:
-                            assert subc_quant_wsz is not None
                             scale_slices = (
                                 p_id,
                                 pl.ds(0, bd1_per_t_packing // subc_quant_wsz),
                                 pl.ds(0, 1),
                                 pl.ds(0, bf),
                             )
-
-                            # Fetch Scales
                             s_gate = b_se_w1_scale_x2_vmem.at[grp_sem_id][*scale_slices]
                             s_up = b_se_w3_scale_x2_vmem.at[grp_sem_id][*scale_slices]
-
-                            # Broadcast
                             s_gate = broadcast_quant_scale(
                                 s_gate, bd1_per_t_packing, subc_quant_wsz
                             )
                             s_up = broadcast_quant_scale(s_up, bd1_per_t_packing, subc_quant_wsz)
-
-                            # Dequantize & Dot
                             w1_gate_f = w1_gate.astype(jnp.float32) * s_gate
                             w3_up_f = w3_up.astype(jnp.float32) * s_up
-
-                            acc_gate_part = jnp.dot(
-                                t.astype(jnp.float32), w1_gate_f, preferred_element_type=jnp.float32
-                            )
-                            acc_up_part = jnp.dot(
-                                t.astype(jnp.float32), w3_up_f, preferred_element_type=jnp.float32
-                            )
-
+                            acc_gate_part = jnp.dot(t.astype(jnp.float32), w1_gate_f)
+                            acc_up_part = jnp.dot(t.astype(jnp.float32), w3_up_f)
                         else:
-                            acc_gate_part = jnp.dot(t, w1_gate, preferred_element_type=jnp.float32)
-                            acc_up_part = jnp.dot(t, w3_up, preferred_element_type=jnp.float32)
+                            acc_gate_part = jnp.dot(t, w1_gate)
+                            acc_up_part = jnp.dot(t, w3_up)
 
                         act_gate += acc_gate_part
                         act_up += acc_up_part
 
-                # Activation
+                # 激活函数
                 act = activation_fn(act_gate, act_up, act_fn)
 
-                # Compute W2
-                wait_fetch_se_w2(grp_sem_id)
-
+                # ============== 2. W2 计算 (Down) ==============
+                # 循环切片 hidden_dim (bd2)
                 for bd2_idx in range(num_bd2):
+                    # A. 发起 Fetch
+                    start_fetch_se_w2(grp_sem_id, current_block_id, bd2_idx)
+
+                    # B. 等待 Wait
+                    wait_fetch_se_w2(grp_sem_id)
+
+                    # C. 计算 Compute
                     for p_id in range(t_packing):
-                        # Fetch W2 Chunk
                         w2_packed = b_se_w2_x2_vmem[
                             grp_sem_id, p_id, pl.ds(0, bf), pl.ds(0, bd2_per_t_packing)
                         ]
-
-                        # Unpack
                         w2_val = pltpu.bitcast(w2_packed.astype(repack_ty), t_dtype)
 
                         if w2_shared_scale is not None:
-                            # Scale Fetch
                             scale_slices = (
                                 pl.ds(0, bf // subc_quant_wsz),
                                 pl.ds(0, 1),
                                 pl.ds(0, bd2_per_t_packing),
                             )
                             s2 = b_se_w2_scale_x2_vmem.at[grp_sem_id, p_id][*scale_slices]
-
-                            # Broadcast
                             s2 = broadcast_quant_scale(s2, bf, subc_quant_wsz)
-
-                            # Dequantize & Dot
                             w2_f = w2_val.astype(jnp.float32) * s2
-                            acc_chunk = jnp.dot(act, w2_f, preferred_element_type=jnp.float32)
-
+                            acc_chunk = jnp.dot(act, w2_f)
                         else:
-                            acc_chunk = jnp.dot(act, w2_val, preferred_element_type=jnp.float32)
+                            acc_chunk = jnp.dot(act, w2_val)
 
-                        # Accumulate
+                        # 累加到最终结果 (根据 bd2_idx 偏移)
                         se_acc_view[
                             pl.ds(0, bt),
                             p_id,
                             pl.ds(bd2_idx * bd2_per_t_packing, bd2_per_t_packing),
                         ] += acc_chunk
 
-        lax.fori_loop(0, num_blocks, run_se_block, None)
+        # 执行主循环
+        lax.fori_loop(0, max_se_blocks_per_expert, run_se_block, None)
 
     def dynamic_ffn1(
         t_b32_vmem,
