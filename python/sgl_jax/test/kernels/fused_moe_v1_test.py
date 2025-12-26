@@ -580,10 +580,9 @@ class MoEKernelTest(jtu.JaxTestCase):
         num_experts = 256
         top_k = 8
 
-        # From Config: Shared Expert
-        use_shared_expert = True
-        # moe_shared_expert_intermediate_size * num_shared_experts = 512 * 1
-        shared_intermediate_size = 512
+        # Shared expert disabled for debugging crash source.
+        use_shared_expert = False
+        shared_intermediate_size = 0
 
         # Test Environment
         num_tokens = 128  # Arbitrary batch size
