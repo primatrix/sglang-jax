@@ -255,7 +255,6 @@ class FusedEPMoE(nnx.Module):
             gating_output=router_logits,
             top_k=self.num_experts_per_tok,
             renormalize_topk_logits=self.renormalize_topk_logits,
-            use_sigmoid=self.use_sigmoid,
             routed_scaling_factor=self.routed_scaling_factor,
             use_grouped_topk=self.use_grouped_topk,
             num_groups=self.num_groups,
