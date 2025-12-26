@@ -379,8 +379,7 @@ def _fused_ep_moe_kernel(
     num_bd2 = cdiv(hidden_size, bd2)
 
     se_intermediate_size = w2_shared.shape[0] if w2_shared is not None else 0
-    se_slice_size = se_intermediate_size // local_num_experts
-    num_se_bf_per_slice = se_slice_size // bf
+    se_total_blocks = cdiv(se_intermediate_size, bf) if se_intermediate_size else 0
 
     def get_mesh_device_id(ep_rank):
         dp_rank = jax.lax.axis_index("data")
@@ -892,11 +891,18 @@ def _fused_ep_moe_kernel(
             src_ref=b_se_tokens_vmem, dst_ref=b_se_tokens_vmem, sem=local_sems.at[0, 5]
         ).wait()
 
-    def start_fetch_se_w1(grp_sem_id, slice_idx, bf_offset, bd1_idx):
-        if w1_shared is None:
-            return
+    def get_num_se_blocks_for_expert(local_e_id):
+        if se_total_blocks == 0 or local_e_id >= se_total_blocks:
+            return 0
+        remaining = se_total_blocks - local_e_id
+        return cdiv(remaining, local_num_experts)
 
-        global_feature_idx = slice_idx * num_se_bf_per_slice + bf_offset
+    def get_block_id_for_expert(local_e_id, block_offset):
+        return local_e_id + block_offset * local_num_experts
+
+    def start_fetch_se_w1(grp_sem_id, block_id, bd1_idx):
+        if w1_shared is None or block_id < 0 or block_id >= se_total_blocks:
+            return
 
         for p in range(t_packing):
             offset = p * h_per_t_packing + bd1_idx * bd1_per_t_packing
@@ -904,7 +910,7 @@ def _fused_ep_moe_kernel(
             pltpu.make_async_copy(
                 src_ref=w1_shared.at[
                     pl.ds(offset, bd1_per_t_packing),
-                    pl.ds(global_feature_idx * bf, bf),
+                    pl.ds(block_id * bf, bf),
                 ],
                 dst_ref=b_se_w1_x2_vmem.at[grp_sem_id, p],
                 sem=local_sems.at[grp_sem_id, 5],
@@ -917,23 +923,22 @@ def _fused_ep_moe_kernel(
                     src_ref=w1_shared_scale.at[
                         pl.ds(offset // subc_quant_wsz, bd1_per_t_packing // subc_quant_wsz),
                         pl.ds(0, 1),
-                        pl.ds(global_feature_idx * bf, bf),
+                        pl.ds(block_id * bf, bf),
                     ],
                     dst_ref=b_se_w1_scale_x2_vmem.at[grp_sem_id, p],
                     sem=local_sems.at[grp_sem_id, 5],
                 ).start()
 
-    def start_fetch_se_w3(grp_sem_id, slice_idx, bf_offset, bd1_idx):
-        if w3_shared is None:
+    def start_fetch_se_w3(grp_sem_id, block_id, bd1_idx):
+        if w3_shared is None or block_id < 0 or block_id >= se_total_blocks:
             return
-        global_feature_idx = slice_idx * num_se_bf_per_slice + bf_offset
         for p in range(t_packing):
             offset = p * h_per_t_packing + bd1_idx * bd1_per_t_packing
             # W3
             pltpu.make_async_copy(
                 src_ref=w3_shared.at[
                     pl.ds(offset, bd1_per_t_packing),
-                    pl.ds(global_feature_idx * bf, bf),
+                    pl.ds(block_id * bf, bf),
                 ],
                 dst_ref=b_se_w3_x2_vmem.at[grp_sem_id, p],
                 sem=local_sems.at[grp_sem_id, 7],
@@ -945,30 +950,27 @@ def _fused_ep_moe_kernel(
                     src_ref=w3_shared_scale.at[
                         pl.ds(offset // subc_quant_wsz, bd1_per_t_packing // subc_quant_wsz),
                         pl.ds(0, 1),
-                        pl.ds(global_feature_idx * bf, bf),
+                        pl.ds(block_id * bf, bf),
                     ],
                     dst_ref=b_se_w3_scale_x2_vmem.at[grp_sem_id, p],
                     sem=local_sems.at[grp_sem_id, 7],
                 ).start()
 
-    def start_fetch_se_w2(grp_sem_id, slice_idx, bf_offset, bd2_idx):
-        if w2_shared is None:
+    def start_fetch_se_w2(grp_sem_id, block_id, bd2_idx):
+        if w2_shared is None or block_id < 0 or block_id >= se_total_blocks:
             return
-        global_feature_idx = slice_idx * num_se_bf_per_slice + bf_offset
         for p in range(t_packing):
             offset = p * h_per_t_packing + bd2_idx * bd2_per_t_packing
             # Fetch W2 (Down)
             pltpu.make_async_copy(
-                src_ref=w2_shared.at[
-                    pl.ds(global_feature_idx * bf, bf), pl.ds(offset, bd2_per_t_packing)
-                ],
+                src_ref=w2_shared.at[pl.ds(block_id * bf, bf), pl.ds(offset, bd2_per_t_packing)],
                 dst_ref=b_se_w2_x2_vmem.at[grp_sem_id, p],
                 sem=local_sems.at[grp_sem_id, 6],
             ).start()
             # Fetch Scales
             if w2_shared_scale is not None:
                 assert subc_quant_wsz is not None
-                scale_inter_idx = (global_feature_idx * bf) // subc_quant_wsz
+                scale_inter_idx = (block_id * bf) // subc_quant_wsz
                 scale_inter_len = bf // subc_quant_wsz
                 pltpu.make_async_copy(
                     src_ref=w2_shared_scale.at[
@@ -1027,11 +1029,15 @@ def _fused_ep_moe_kernel(
                 sem=local_sems.at[grp_sem_id, 6],
             ).wait()
 
-    def compute_se_slice(slice_idx):
+    def compute_se_slice(local_e_id):
         """
-        Shared Expert Slice Computation Kernel.
+        Shared Expert block computation scheduled per expert via round robin.
         """
         if w1_shared is None:
+            return
+
+        num_blocks = get_num_se_blocks_for_expert(local_e_id)
+        if num_blocks == 0:
             return
 
         def broadcast_quant_scale(scale, current_block_size, group_size):
@@ -1044,18 +1050,24 @@ def _fused_ep_moe_kernel(
 
         se_acc_view = se_acc_vmem.reshape(bt, t_packing, -1)
 
-        def run_se_block(bf_idx, _):
-            grp_sem_id = bf_idx % 2
-            next_bf_idx = bf_idx + 1
+        def prefetch_block(grp_sem_id, block_id):
+            for bd1_idx in range(num_bd1):
+                start_fetch_se_w1(grp_sem_id, block_id, bd1_idx)
+                start_fetch_se_w3(grp_sem_id, block_id, bd1_idx)
+            for bd2_idx in range(num_bd2):
+                start_fetch_se_w2(grp_sem_id, block_id, bd2_idx)
 
-            # Prefetch Next Block Weights (W1, W3, W2)
-            @pl.when(next_bf_idx < num_se_bf_per_slice)
+        first_block_id = get_block_id_for_expert(local_e_id, 0)
+        prefetch_block(0, first_block_id)
+
+        def run_se_block(block_offset, _):
+            grp_sem_id = block_offset % 2
+            next_block_offset = block_offset + 1
+
+            @pl.when(next_block_offset < num_blocks)
             def _():
-                for bd1_idx in range(num_bd1):
-                    start_fetch_se_w1(grp_sem_id ^ 1, slice_idx, next_bf_idx, bd1_idx)
-                    start_fetch_se_w3(grp_sem_id ^ 1, slice_idx, next_bf_idx, bd1_idx)
-                for bd2_idx in range(num_bd2):
-                    start_fetch_se_w2(grp_sem_id ^ 1, slice_idx, next_bf_idx, bd2_idx)
+                next_block_id = get_block_id_for_expert(local_e_id, next_block_offset)
+                prefetch_block(grp_sem_id ^ 1, next_block_id)
 
             # Compute W1 W3
             wait_fetch_se_w1(grp_sem_id)
@@ -1160,13 +1172,7 @@ def _fused_ep_moe_kernel(
                         pl.ds(0, bt), p_id, pl.ds(bd2_idx * bd2_per_t_packing, bd2_per_t_packing)
                     ] += acc_chunk
 
-        for bd1_idx in range(num_bd1):
-            start_fetch_se_w1(0, slice_idx, 0, bd1_idx)
-            start_fetch_se_w3(0, slice_idx, 0, bd1_idx)
-        for bd2_idx in range(num_bd2):
-            start_fetch_se_w2(0, slice_idx, 0, bd2_idx)
-
-        lax.fori_loop(0, num_se_bf_per_slice, run_se_block, None)
+        lax.fori_loop(0, num_blocks, run_se_block, None)
 
     def dynamic_ffn1(
         t_b32_vmem,
@@ -1833,19 +1839,10 @@ def _validate_fused_ep_moe_args(
                 f"got {w2_shared.shape}"
             )
 
-        local_num_experts = num_experts // ep_size
-
-        if se_intermediate_size % local_num_experts != 0:
+        if se_intermediate_size % bf != 0:
             raise ValueError(
-                f"Shared Expert intermediate_size ({se_intermediate_size}) must be divisible by "
-                f"local_num_experts ({local_num_experts}) to support interleaved computation."
-            )
-
-        se_slice_size = se_intermediate_size // local_num_experts
-        if se_slice_size % bfc != 0:
-            raise ValueError(
-                f"Shared Expert slice size ({se_slice_size}) must be aligned to bfc ({bfc}) "
-                "for correct interleaved execution."
+                f"Shared Expert intermediate_size ({se_intermediate_size}) must be aligned to bf ({bf}) "
+                "to support block scheduling."
             )
 
         if subc_quant_wsz is not None:
@@ -1948,10 +1945,7 @@ def fused_ep_moe(
 ):
 
     if w1_shared is not None:
-        ep_size = mesh.shape[ep_axis_name]
-        num_experts = w2.shape[0]
-        local_num_experts = max(1, num_experts // ep_size)
-        alignment = local_num_experts * bf
+        alignment = bf
         current_inter = w1_shared.shape[-1]
         target_inter = align_to(current_inter, alignment)
         if target_inter > current_inter:
