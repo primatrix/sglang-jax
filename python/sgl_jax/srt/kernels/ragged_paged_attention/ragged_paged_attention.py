@@ -343,6 +343,7 @@ def _ragged_paged_attention_kernel(
         _,
     ) = kv_cache_fused_hbm_ref.shape
     num_q_heads_per_kv_head = num_q_heads_per_kv_head_per_packing * q_packing
+    num_kv_heads_x2 = num_kv_heads_per_kv_packing * kv_packing
     q_dtype = q_hbm_ref.dtype
     kv_dtype = kv_cache_fused_hbm_ref.dtype
     assert o_hbm_ref.dtype == q_dtype
@@ -360,6 +361,80 @@ def _ragged_paged_attention_kernel(
     q_end = cu_q_lens_ref[seq_idx + 1]
     q_len = q_end - q_start
     kv_len = kv_lens_ref[seq_idx]
+
+    def flash_attention(
+        q,  # [actual_bq_sz * num_q_heads_per_kv_head, head_dim]
+        k,  # [bkv_sz, head_dim]
+        v,  # [bkv_sz, head_dim]
+        *,
+        bq_idx,
+        bkv_idx,
+        kv_head_idx,
+        q_span,
+        k_span,
+        mask,
+        xai_temperature_reg=None,
+    ):
+        assert len(q.shape) == 2
+        assert q.shape[0] % num_q_heads_per_kv_head == 0
+        assert q.shape[1] == head_dim
+        assert k.shape == v.shape == (bkv_sz, head_dim)
+        assert k.dtype == v.dtype
+        head_l_ref = l_ref.at[kv_head_idx, : q.shape[0]]
+        head_m_ref = m_ref.at[kv_head_idx, : q.shape[0]]
+        head_acc_ref = acc_ref.at[kv_head_idx, : q.shape[0]]
+
+        def load_with_init(ref, init_val):
+            return jnp.where(bkv_idx == 0, jnp.full_like(ref, init_val), ref[...])
+
+        # Follow FlashAttention-2 forward pass.
+        if q_scale is not None:
+            q = q / q_scale
+            if jnp.issubdtype(k.dtype, jnp.floating):
+                dtype_info = jnp.finfo(k.dtype)
+                minval = float(dtype_info.min)
+                maxval = float(dtype_info.max)
+                q = jnp.clip(q, min=minval, max=maxval)
+            q = q.astype(k.dtype)
+
+        s = jnp.einsum("nd,md->nm", q, k, preferred_element_type=jnp.float32)
+        s *= sm_scale
+        if k_scale is not None:
+            s *= k_scale
+        if q_scale is not None:
+            s *= q_scale
+
+        # xai_temperature_scale: ref implementation from sgl-project/sglang
+        # python/sglang/srt/layers/attention/triton_ops/decode_attention.py
+        if xai_temperature_reg is not None:
+            assert len(xai_temperature_reg.shape) == 1
+            s = s * xai_temperature_reg[:, None]
+
+        # TODO(jevinjiang, xiowei): reduce pages_per_seq based on sliding_window.
+        if sliding_window is not None:
+            mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)
+
+        if soft_cap is not None:
+            s = soft_cap * jnp.tanh(s / soft_cap)
+        s += jnp.where(mask, mask_value, 0.0)
+        s_rowmax = jnp.max(s, axis=1, keepdims=True)
+        m_prev = load_with_init(head_m_ref, -jnp.inf)
+        m_curr = jnp.maximum(m_prev, s_rowmax)
+        head_m_ref[...] = m_curr
+        p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
+
+        pv = jnp.einsum("nm,md->nd", p, v, preferred_element_type=jnp.float32)
+        if v_scale is not None:
+            pv *= v_scale
+
+        p_rowsum = jnp.sum(p, axis=1, keepdims=True)
+        exp_m_diff = jnp.exp(m_prev - m_curr)
+        l_prev = load_with_init(head_l_ref, 0.0)
+        l_curr = exp_m_diff * l_prev + p_rowsum
+        head_l_ref[...] = l_curr
+        o_prev = load_with_init(head_acc_ref, 0.0)
+        o_curr = broadcast_minor(exp_m_diff, o_prev.shape) * o_prev + pv
+        head_acc_ref[...] = o_curr
 
     def _async_copy(src, dst, sem, wait):
         cp = pltpu.make_async_copy(src, dst, sem)
@@ -634,7 +709,7 @@ def _ragged_paged_attention_kernel(
         vec = jnp.concat([ref[start + i :: step] for i in range(folds)], axis=1)
         return vec
 
-    def strided_load_bkv_fused(bkv_sem_idx, start, step, *, bkv_mask):
+    def strided_load_bkv(bkv_sem_idx, start, step, *, bkv_mask):
         assert start % kv_packing == 0
         assert step % kv_packing == 0
         start //= kv_packing
@@ -751,6 +826,25 @@ def _ragged_paged_attention_kernel(
             next_seq_idx, next_bq_idx, next_bq_sem_idx = get_next_bq_ids(
                 seq_idx, bq_idx, bq_sem_idx
             )
+            # support xai temperature
+            xai_temperature_reg = None
+            if xai_temperature_len is not None:
+                # Correctly calculate sequence-relative position
+                prefix_len = kv_len - q_len
+                # `bq_idx * bq_sz` is the offset within the new queries for this sequence
+                local_q_offset = (
+                    bq_idx * bq_sz
+                    + lax.iota(jnp.int32, actual_bq_sz * num_q_heads_per_kv_head)
+                    // num_q_heads_per_kv_head
+                )
+                # `absolute_q_position` is the absolute sequence position
+                absolute_q_position = prefix_len + local_q_offset
+
+                xai_temperature_scale = 1.0 / jnp.log2(float(xai_temperature_len))
+                _qtemp = jnp.log2(absolute_q_position.astype(jnp.float32)) * xai_temperature_scale
+                xai_temperature_reg = jnp.where(
+                    absolute_q_position > xai_temperature_len, _qtemp, 1.0
+                )
 
             # Prefetch next bq
             @pl.when(next_seq_idx < num_seqs)
@@ -798,161 +892,61 @@ def _ragged_paged_attention_kernel(
                 def update_cur_bkv_to_cache():
                     start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
 
-                # Flash attention with cur bkv and bq
-                # NOTE: kv_packing is divided by 2 because k and v are packed together.
-
-                def batch_load_all_heads_kv():
-                    k_heads = []
-                    v_heads = []
-
-                    for head_idx in range(actual_num_kv_heads):
-                        bkv_lst = strided_load_bkv_fused(
-                            bkv_sem_idx,
-                            head_idx * 2,
-                            actual_num_kv_heads * 2,
-                            bkv_mask=bkv_mask,
-                        )
-
-                        k_head, v_head = bkv_lst[0]
-                        k_heads.append(k_head)
-                        v_heads.append(v_head)
-
-                    return jnp.stack(k_heads, axis=0), jnp.stack(v_heads, axis=0)
-
-                def batch_prepare_queries():
-                    q_heads = []
-                    for head_idx in range(actual_num_kv_heads):
-                        bq = load_bq(bq_sem_idx, head_idx, actual_bq_sz=actual_bq_sz)
-                        q_heads.append(bq)
-                    q_batch = jnp.stack(q_heads, axis=0)
-
-                    if xai_temperature_len is not None:
-                        # Correctly calculate sequence-relative position
-                        prefix_len = kv_len - q_len
-                        # `bq_idx * bq_sz` is the offset within the new queries for this sequence
-                        local_q_offset = (
-                            bq_idx * bq_sz
-                            + lax.iota(jnp.int32, q_batch.shape[1]) // num_q_heads_per_kv_head
-                        )
-                        # `base_qidx` is the absolute sequence position
-                        base_qidx = prefix_len + local_q_offset
-                        # Tile for all KV heads, as the position is the same for each head group.
-                        offs_qidx_batch = jnp.tile(base_qidx, (q_batch.shape[0], 1))
-                        return q_batch, offs_qidx_batch
-
-                    return q_batch, None
-
                 def load_mask(q_span, k_span):
                     if bkvmask_ref is None:
                         return q_span < k_span
                     else:
+                        # use custom mask
                         mask = bkvmask_ref[bkv_sem_idx, :actual_bq_sz, :, 0]
                         num_q_heads_per_kv_head_mask = jnp.repeat(
                             mask, num_q_heads_per_kv_head, axis=0
                         )
-                        num_kv_heads_mask = jnp.concat(
-                            [
-                                num_q_heads_per_kv_head_mask.reshape(
-                                    1, *num_q_heads_per_kv_head_mask.shape
-                                )
-                            ]
-                            * actual_num_kv_heads
-                        )
-                        return num_kv_heads_mask != 1
+                        return num_q_heads_per_kv_head_mask != 1
 
-                # Load batched data
-                k_batch, v_batch = batch_load_all_heads_kv()
-                q_batch, offs_qidx_batch = batch_prepare_queries()
-
-                def flash_attention(q_batch, k_batch, v_batch):
-                    q_batch_f32 = q_batch.astype(jnp.float32)
-                    k_batch_f32 = k_batch.astype(jnp.float32)
-                    v_batch_f32 = v_batch.astype(jnp.float32)
-
-                    if k_scale is not None:
-                        k_batch_f32 = k_batch_f32 * k_scale
-                    if v_scale is not None:
-                        v_batch_f32 = v_batch_f32 * v_scale
-
-                    s = (
-                        jnp.einsum(
-                            "hqd,hkd->hqk",
-                            q_batch_f32,
-                            k_batch_f32,
-                            preferred_element_type=jnp.float32,
-                        )
-                        * sm_scale
+                # Flash attention with cur bkv and bq
+                # NOTE: kv_packing is divided by 2 because k and v are packed together.
+                heads_per_load = max(1, kv_packing // 2)
+                q_span = (
+                    kv_len
+                    - q_len
+                    + bq_idx * bq_sz
+                    + lax.broadcasted_iota(
+                        jnp.int32, (actual_bq_sz * num_q_heads_per_kv_head, bkv_sz), 0
                     )
+                    // num_q_heads_per_kv_head
+                )
+                k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(
+                    jnp.int32, (actual_bq_sz * num_q_heads_per_kv_head, bkv_sz), 1
+                )
+                attn_mask = load_mask(q_span, k_span)
 
-                    if q_scale is not None:
-                        s *= q_scale
-
-                    q_span = (
-                        kv_len
-                        - q_len
-                        + bq_idx * bq_sz
-                        + lax.broadcasted_iota(jnp.int32, s.shape, 1) // num_q_heads_per_kv_head
+                for kv_head_start in range(0, actual_num_kv_heads, heads_per_load):
+                    bkv_lst = strided_load_bkv(
+                        bkv_sem_idx,
+                        kv_head_start * 2,
+                        num_kv_heads_x2,
+                        bkv_mask=bkv_mask,
                     )
-                    k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, s.shape, 2)
-                    # convert custom_mask from int32 to bool
-                    mask = load_mask(q_span, k_span)
+                    assert len(bkv_lst) == heads_per_load
+                    for i in range(heads_per_load):
+                        kv_head_idx = kv_head_start + i
+                        if kv_head_idx >= actual_num_kv_heads:
+                            break
+                        bq = load_bq(bq_sem_idx, kv_head_idx, actual_bq_sz=actual_bq_sz)
 
-                    if sliding_window is not None:
-                        mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)
-
-                    if soft_cap is not None:
-                        s = soft_cap * jnp.tanh(s / soft_cap)
-
-                    # xai_temperature_scale: ref implementation from sgl-project/sglang
-                    # python/sglang/srt/layers/attention/triton_ops/decode_attention.py
-                    if xai_temperature_len is not None:
-                        xai_temperature_scale = 1.0 / jnp.log2(float(xai_temperature_len))
-                        _qtemp = (
-                            jnp.log2(offs_qidx_batch.astype(jnp.float32)) * xai_temperature_scale
+                        bk, bv = bkv_lst[i]
+                        flash_attention(
+                            bq,
+                            bk,
+                            bv,
+                            bq_idx=bq_idx,
+                            bkv_idx=bkv_idx,
+                            kv_head_idx=kv_head_idx,
+                            q_span=q_span,
+                            k_span=k_span,
+                            mask=attn_mask,
+                            xai_temperature_reg=xai_temperature_reg,
                         )
-                        xai_temperature_reg = jnp.where(
-                            offs_qidx_batch > xai_temperature_len, _qtemp, 1.0
-                        )
-
-                        s = s * xai_temperature_reg[:, :, None]
-
-                    s += jnp.where(mask, mask_value, 0.0)
-
-                    for head_idx in range(actual_num_kv_heads):
-                        head_l_ref = l_ref.at[head_idx, : q_batch.shape[1]]
-                        head_m_ref = m_ref.at[head_idx, : q_batch.shape[1]]
-                        head_acc_ref = acc_ref.at[head_idx, : q_batch.shape[1]]
-
-                        def load_with_init(ref, init_val):
-                            return jnp.where(bkv_idx == 0, jnp.full_like(ref, init_val), ref[...])
-
-                        s_head = s[head_idx]
-                        s_head_rowmax = jnp.max(s_head, axis=1, keepdims=True)
-
-                        m_prev = load_with_init(head_m_ref, -jnp.inf)
-                        m_curr = jnp.maximum(m_prev, s_head_rowmax)
-                        head_m_ref[...] = m_curr
-
-                        p = jnp.exp(s_head - broadcast_minor(m_curr, s_head.shape))
-
-                        pv = jnp.einsum(
-                            "qk,kd->qd",
-                            p,
-                            v_batch_f32[head_idx],
-                            preferred_element_type=jnp.float32,
-                        )
-
-                        p_rowsum = jnp.sum(p, axis=1, keepdims=True)
-                        exp_m_diff = jnp.exp(m_prev - m_curr)
-                        l_prev = load_with_init(head_l_ref, 0.0)
-                        l_curr = exp_m_diff * l_prev + p_rowsum
-                        head_l_ref[...] = l_curr
-
-                        o_prev = load_with_init(head_acc_ref, 0.0)
-                        o_curr = broadcast_minor(exp_m_diff, o_prev.shape) * o_prev + pv
-                        head_acc_ref[...] = o_curr
-
-                flash_attention(q_batch, k_batch, v_batch)
 
             lax.fori_loop(0, num_bkv, compute_with_bkv, None, unroll=False)
 
