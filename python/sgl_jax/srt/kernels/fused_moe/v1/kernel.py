@@ -1576,12 +1576,12 @@ def _fused_ep_moe_kernel(
         b_gating_logits = b_gating.astype(jnp.float32)
 
         if use_sigmoid:
-            b_gating_score = jax.nn.sigmoid(b_gating_logits)
+            probs = jax.nn.sigmoid(b_gating_logits)
         else:
-            b_gating_score = jax.nn.softmax(b_gating_logits, axis=-1)
+            probs = jax.nn.softmax(b_gating_logits, axis=-1)
 
         top_k_logits_lst, t2e_routing, expert_sizes, expert_starts = get_top_k(
-            b_gating_score, top_k, renormalize_topk_logits
+            probs, top_k, renormalize_topk_logits
         )
 
         all_reduce_metadata(bt_sem_id, t2e_routing, expert_starts, expert_sizes)
