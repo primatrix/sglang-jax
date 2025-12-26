@@ -424,20 +424,27 @@ def _fused_ep_moe_kernel(
             sem=b_gating_sem,
         ).wait()
 
-    def get_top_k(logits, top_k, renormalize_topk_logits):
-        num_tokens, num_experts = logits.shape
-        logits = logits.astype(jnp.float32)
+    def get_top_k(probs, top_k, renormalize_topk_logits):
+        """
+        probs: 这里的输入必须是经过 Sigmoid/Softmax 之后的原始概率值 (0~1)
+        """
+        num_tokens, num_experts = probs.shape
+        probs = probs.astype(jnp.float32)
 
+        # 1. 计算用于选路的分数 (Routing Scores)
+        # DeepSeek/Bailing 逻辑: Bias 只加在选路分数上，不加在最终权重上
         if b_bias_vmem is not None:
             bias_val = b_bias_vmem[...]
-            routing_scores = logits + jnp.expand_dims(bias_val, 0)
+            routing_scores = probs + jnp.expand_dims(bias_val, 0)
         else:
-            routing_scores = logits
+            routing_scores = probs
 
+        # 2. 准备 TopK 迭代的输入分数
         if use_grouped_topk:
             assert num_experts % num_groups == 0, "Experts must be evenly divisible by groups"
             experts_per_group = num_experts // num_groups
 
+            # --- Group Score 计算 (Biased Sum-Top2 vs Unbiased Max) ---
             group_scores_list = []
             for g in range(num_groups):
                 start = g * experts_per_group
@@ -445,20 +452,25 @@ def _fused_ep_moe_kernel(
                 group_slice = routing_scores[:, start:end]
 
                 if b_bias_vmem is not None:
+                    # Biased 模式: Sum of Top 2
                     val1 = jnp.max(group_slice, axis=1, keepdims=True)
-                    idx1 = jnp.argmax(group_slice, axis=1, keepdims=True)
+                    # Mask 掉最大值，找第二大
                     iota_slice = jax.lax.broadcasted_iota(jnp.int32, group_slice.shape, 1)
+                    idx1 = jnp.argmax(group_slice, axis=1, keepdims=True)
                     mask1 = iota_slice == idx1
-                    group_slice_masked = jnp.where(mask1, -jnp.inf, group_slice)
+                    # 使用 -inf 进行 mask，适应可能存在的负数 score
+                    group_slice_masked = jnp.where(mask1, -jnp.float32(jnp.inf), group_slice)
                     val2 = jnp.max(group_slice_masked, axis=1, keepdims=True)
                     g_score = val1 + val2
                 else:
+                    # Unbiased 模式: Max
                     g_score = jnp.max(group_slice, axis=1, keepdims=True)
 
                 group_scores_list.append(g_score)
 
             group_scores = jnp.concatenate(group_scores_list, axis=1)
 
+            # --- Group Selection ---
             group_mask_accum = jnp.zeros((num_tokens, num_groups), dtype=jnp.bool_)
             temp_group_scores = group_scores
             group_iota = jax.lax.broadcasted_iota(jnp.int32, (num_tokens, num_groups), 1)
@@ -467,41 +479,48 @@ def _fused_ep_moe_kernel(
                 curr_max_group_idx = jnp.argmax(temp_group_scores, axis=1, keepdims=True)
                 curr_mask = group_iota == curr_max_group_idx
                 group_mask_accum = jnp.logical_or(group_mask_accum, curr_mask)
-                temp_group_scores = jnp.where(curr_mask, -jnp.inf, temp_group_scores)
+                temp_group_scores = jnp.where(curr_mask, -jnp.float32(jnp.inf), temp_group_scores)
 
+            # --- Apply Mask to Routing Scores ---
             masked_routing_slices = []
             for g in range(num_groups):
                 g_mask = group_mask_accum[:, g : g + 1]
                 start = g * experts_per_group
                 end = start + experts_per_group
                 inp_slice = routing_scores[:, start:end]
-                masked_slice = jnp.where(g_mask, inp_slice, -jnp.inf)
+                # 未选中的 Group 分数设为 -inf
+                masked_slice = jnp.where(g_mask, inp_slice, -jnp.float32(jnp.inf))
                 masked_routing_slices.append(masked_slice)
 
-            input = jnp.concatenate(masked_routing_slices, axis=1)
+            curr_scores = jnp.concatenate(masked_routing_slices, axis=1)
         else:
-            input = routing_scores
+            curr_scores = routing_scores
 
-        padded_k_shape = (input.shape[0], padded_top_k)
+        # 3. TopK 提取循环
+        padded_k_shape = (curr_scores.shape[0], padded_top_k)
         top_k_logits_lst = []
         top_k_indices_lst = []
-        t2e = jnp.zeros(input.shape, dtype=jnp.int32)
+        t2e = jnp.zeros(curr_scores.shape, dtype=jnp.int32)
         t2e_routing = jnp.zeros(padded_k_shape, dtype=jnp.int32)
-        iota = jax.lax.broadcasted_iota(jnp.int32, input.shape, 1)
+        iota = jax.lax.broadcasted_iota(jnp.int32, curr_scores.shape, 1)
         padded_k_iota = jax.lax.broadcasted_iota(jnp.int32, padded_k_shape, 1)
         top_k_logits_sum = jnp.zeros(padded_k_shape, jnp.float32)
 
         for k_id in range(top_k):
-            curr_indices = jnp.argmax(input[:, :num_experts], axis=1, keepdims=True)
+            # A. 用 curr_scores (加了 Bias) 找索引
+            curr_indices = jnp.argmax(curr_scores[:, :num_experts], axis=1, keepdims=True)
             top_k_indices = jnp.broadcast_to(curr_indices, padded_k_shape)
             top_k_indices_lst.append(top_k_indices)
 
-            selection_mask = iota == broadcast_minor(top_k_indices, input.shape)
+            selection_mask = iota == broadcast_minor(top_k_indices, curr_scores.shape)
+
+            # B. 用 probs (原始值) 取权重 -- 关键修改！
+            # 只有被选中的位置(selection_mask)才取 probs 的值，其余为 0.0
             val = jnp.max(
-                jnp.where(selection_mask, logits[:, :num_experts], 0.0), axis=1, keepdims=True
+                jnp.where(selection_mask, probs[:, :num_experts], 0.0), axis=1, keepdims=True
             )
 
-            top_k_logits = jnp.broadcast_to(val, padded_k_shape).astype(input.dtype)
+            top_k_logits = jnp.broadcast_to(val, padded_k_shape).astype(probs.dtype)
             top_k_logits_lst.append(top_k_logits)
 
             if renormalize_topk_logits:
@@ -512,12 +531,16 @@ def _fused_ep_moe_kernel(
             t2e += mask.astype(jnp.int32)
 
             if k_id != top_k - 1:
-                input = jnp.where(mask, -jnp.inf, input)
+                # Mask 掉已选中的，准备下一轮
+                curr_scores = jnp.where(mask, -jnp.float32(jnp.inf), curr_scores)
 
+        # 4. 归一化 (Renormalize)
         if renormalize_topk_logits:
             for k_id in range(top_k):
-                top_k_logits_lst[k_id] /= top_k_logits_sum
+                # 加 epsilon 防止除零
+                top_k_logits_lst[k_id] /= top_k_logits_sum + 1e-6
 
+        # 5. 缩放 (Scaling)
         if routed_scaling_factor is not None:
             for k_id in range(top_k):
                 top_k_logits_lst[k_id] *= routed_scaling_factor
