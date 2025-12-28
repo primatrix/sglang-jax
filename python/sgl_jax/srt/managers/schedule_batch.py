@@ -1353,19 +1353,8 @@ class ScheduleBatch:
 
     def get_spec_model_worker_batch(
         self,
-        token_paddings: list,
-        bs_paddings: list,
-        cache_loc_paddings: list,
         page_size: int,
-        skip_padding: bool = False,
     ) -> ModelWorkerBatch:
-        if not skip_padding:
-            return self.get_model_worker_batch(
-                token_paddings=token_paddings,
-                bs_paddings=bs_paddings,
-                cache_loc_paddings=cache_loc_paddings,
-                page_size=page_size,
-            )
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:

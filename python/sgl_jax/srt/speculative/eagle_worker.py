@@ -836,7 +836,7 @@ def update_eagle_lists(
 
 
 # FIXME(pc) this should be jitted or convert as np.ndarray
-@functools.partial(jax.jit, static_argnames=["i"])
+# @functools.partial(jax.jit, static_argnames=["i"])
 def update_forward_batch_info(
     forward_batch: ForwardBatch,
     i: int,

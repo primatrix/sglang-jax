@@ -1189,19 +1189,7 @@ class Scheduler(
                     : model_worker_batch.real_bs
                 ]
         else:
-
-            (
-                precompile_token_paddings,
-                precompile_bs_paddings,
-                precompile_cache_loc_paddings,
-            ) = self.draft_worker.get_precompile_paddings()
-            model_worker_batch = batch.get_spec_model_worker_batch(
-                precompile_token_paddings,
-                precompile_bs_paddings,
-                precompile_cache_loc_paddings,
-                self.page_size,
-                skip_padding=True,
-            )
+            model_worker_batch = batch.get_spec_model_worker_batch(self.page_size)
             batch_output = self.draft_worker.forward_batch_speculative_generation(
                 model_worker_batch
             )
