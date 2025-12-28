@@ -484,7 +484,7 @@ class EagleDraftInput:
         model_worker_batch: ModelWorkerBatch,
         draft_model_runner: Any,
         batch_output: GenerationBatchResult,
-        precompile_token_paddings,
+        speculative_num_draft_tokens: int,
     ):
         model_worker_batch.spec_info = self
         # verified_id = batch_output.next_draft_input.verified_id
@@ -492,22 +492,28 @@ class EagleDraftInput:
 
         model_worker_batch.seq_lens[: model_worker_batch.real_bs] = (
             model_worker_batch.seq_lens[: model_worker_batch.real_bs]
-            + batch_output.accept_lens[: model_worker_batch.real_bs]
+            + speculative_num_draft_tokens - 1
         )
-
+        print(f"{model_worker_batch.seq_lens[:50]=}")
         bs = batch_output.accept_lens.shape[0]
         step_plus_1 = model_worker_batch.input_ids.shape[0] // bs
-
+        model_worker_batch.positions = model_worker_batch.positions - 1
         model_worker_batch.extend_seq_lens = np.full((bs,), step_plus_1, dtype=np.int32)
         model_worker_batch.extend_seq_lens[model_worker_batch.real_bs :] = 0
-        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-        model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
         model_worker_batch.spec_info.hidden_states = batch_output.next_draft_input.hidden_states
         model_worker_batch.spec_info.accept_length = batch_output.accept_lens
+        model_worker_batch.input_ids = batch_output.next_draft_input.verified_id
         forward_metadata = draft_model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
+        print(f"{forward_metadata.page_indices[:50]=}")
+        print(f"{forward_metadata.cu_q_lens[:50]=}")
+        print(f"{forward_metadata.cu_kv_lens[:50]=}")
+        print(f"{forward_metadata.seq_lens[:50]=}")
+
         draft_model_runner.attn_backend.forward_metadata = forward_metadata
         from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 
@@ -518,7 +524,7 @@ class EagleDraftInput:
         return model_worker_batch, logits_metadata
 
     def prepare_for_decode(self, schedule_batch: ScheduleBatch):
-        new_allocate_lens = schedule_batch.seq_lens + self.ALLOC_LEN_PER_DECODE
+        new_allocate_lens = schedule_batch.seq_lens + self.ALLOC_LEN_PER_DECODE - 1
         bs = schedule_batch.batch_size()
         assert (
             self.allocate_lens.shape[0] == bs
@@ -746,7 +752,7 @@ class EagleVerifyInput:
         # TODO: keep draft_token on TPU
         # bs = len(model_worker_batch.req_pool_indices)
         model_worker_batch.input_ids = self.draft_token
-        model_worker_batch.positions = self.positions - 1
+        model_worker_batch.positions = self.positions
         # bs = batch.batch_size()
         # prefix_lens = model_worker_batch.seq_lens
         # seq_lens_with_draft_token = model_worker_batch.seq_lens + self.draft_token_num
@@ -755,8 +761,6 @@ class EagleVerifyInput:
         model_worker_batch.forward_mode = ForwardMode.TARGET_VERIFY
         model_worker_batch.spec_info = self
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-
-        # FIXME(pc) maybe not need here
         model_worker_batch.extend_seq_lens = self.draft_token
         # assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
 

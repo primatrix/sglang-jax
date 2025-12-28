@@ -299,6 +299,7 @@ class EAGLEWorker(ModelWorker):
             model_worker_batch, self.topk, self.speculative_num_steps
         )
         # get unpadded seq_lens
+        model_worker_batch.seq_lens = model_worker_batch.seq_lens
         seq_lens_cpu = model_worker_batch.seq_lens
         page_size = self.page_size
         token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[
@@ -409,7 +410,6 @@ class EAGLEWorker(ModelWorker):
     def draft(self, model_worker_batch: ModelWorkerBatch):
 
         self.padding_for_decode(model_worker_batch)
-
         score_list, token_list, parents_list = self.draft_forward(model_worker_batch)
         (
             tree_mask,
@@ -457,6 +457,17 @@ class EAGLEWorker(ModelWorker):
         forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
+        # print("verify forward metadata page_indices:", forward_metadata.page_indices[:50])
+        # print("verify forward metadata cu_q_lens :", forward_metadata.cu_q_lens[:50])
+        # print("verify forward metadata cu_kv_lens", forward_metadata.cu_kv_lens[:50])
+        # print("verify forward metadata seq_lens", forward_metadata.seq_lens[:50])
+        # print("verify forward metadata num_seqs", forward_metadata.num_seqs[:50])
+        # print("verify forward metadata custom_mask", forward_metadata.custom_mask[:50])
+
+        print(f"{model_worker_batch.positions=}")
+        print(f"{model_worker_batch.input_ids=}")
+
+
 
         logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
             model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
@@ -586,16 +597,22 @@ class EAGLEWorker(ModelWorker):
             model_worker_batch,
             self.draft_model_runner,
             batch_output,
-            self.precompile_token_paddings,
+            self.speculative_num_draft_tokens,
         )
 
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
         if forward_batch.input_ids.shape[0] <= 0:
             return
+        print(f"draft extend after verify input_ids:", forward_batch.input_ids)
+        print(f"draft extend after verify positions:", forward_batch.positions)
+        print(f"draft extend after verify hiddenstates:", forward_batch.spec_info.hidden_states[:5, :50])
+
+        # print(f"draft extend after verify spec info hidden_states:", forward_batch.spec_info.hidden_states[:2, :50])
         draft_logits_output, _ = self.draft_model_runner.forward(
             forward_batch,
             logits_metadata=logits_meatadata,
         )
+        print(f"draft extend after verify hidden_states:", draft_logits_output.hidden_states[:5, :50])
 
         self.capture_for_decode(draft_logits_output, forward_batch.spec_info)
         select_index = (
@@ -606,7 +623,7 @@ class EAGLEWorker(ModelWorker):
         )
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[select_index]
         draft_logits_output.hidden_states = draft_logits_output.hidden_states[select_index]
-
+        # print(f"draft extend after verify next_token_logits:", draft_logits_output.next_token_logits[:5, :50])
         topk_p, topk_index = topk_probs_from_logits(
             draft_logits_output.next_token_logits, self.topk
         )
@@ -660,6 +677,7 @@ class EAGLEWorker(ModelWorker):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
+            print(f"draft step {i} input_ids:", input_ids)
             # update_eagle_lists and update_forward_batch_info this two function will make accept rate very low if be jitted
             # FIXME we should find it out why lead this ?
             score_list, token_list, parents_list = update_eagle_lists(
@@ -675,6 +693,16 @@ class EAGLEWorker(ModelWorker):
 
             # Run forward
             forward_batch.bid = model_worker_batch.bid
+            print(f"draft step {i} forward_batch input_ids:", forward_batch.input_ids)
+            print(f"draft step {i} forward_batch positions:", forward_batch.positions)
+            print(f"draft step {i} forward_batch spec info:", forward_batch.spec_info.hidden_states[:5, :50])
+            print(f"draft step {i} metadata:", self.draft_model_runner.attn_backend.forward_metadata.page_indices[:50])
+            print(f"draft step {i} metadata:", self.draft_model_runner.attn_backend.forward_metadata.cu_q_lens[:50])
+            print(f"draft step {i} metadata:", self.draft_model_runner.attn_backend.forward_metadata.cu_kv_lens[:50])
+            print(f"draft step {i} metadata:", self.draft_model_runner.attn_backend.forward_metadata.seq_lens[:50])
+
+
+
             logits_output, _ = self.draft_model_runner.forward(
                 forward_batch,
                 logits_metadata=logits_metadata,
@@ -850,7 +878,7 @@ def update_forward_batch_info(
         hidden_states[:]
     )
     forward_batch.positions = forward_batch.positions.at[:].set(
-        (positions_base[:] + i - 1).astype(jnp.int32)
+        (positions_base[:] + i).astype(jnp.int32)
     )
     return forward_batch
 
@@ -871,7 +899,7 @@ def select_top_k_tokens(
         )
 
 
-@functools.partial(jax.jit, static_argnames=["topk"])
+# @functools.partial(jax.jit, static_argnames=["topk"])
 def select_top_k_tokens_step_0(
     topk_p: jax.Array,
     topk_index: jax.Array,
@@ -894,7 +922,7 @@ def select_top_k_tokens_step_0(
     return input_ids, hidden_states, scores, tree_info
 
 
-@functools.partial(jax.jit, static_argnames=["topk"])
+# @functools.partial(jax.jit, static_argnames=["topk"])
 def select_top_k_tokens_step_greater_0(
     i: jax.Array,
     topk_p: jax.Array,
