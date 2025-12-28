@@ -592,18 +592,10 @@ class EAGLEWorker(ModelWorker):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
         if forward_batch.input_ids.shape[0] <= 0:
             return
-        # print(f"draft extend after verify input_ids:", forward_batch.input_ids)
-        # print(f"draft extend after verify positions:", forward_batch.positions)
-        # print(f"draft extend after verify hiddenstates:", forward_batch.spec_info.hidden_states[:5, :50])
-
-        # print(f"draft extend after verify spec info hidden_states:", forward_batch.spec_info.hidden_states[:2, :50])
         draft_logits_output, _ = self.draft_model_runner.forward(
             forward_batch,
             logits_metadata=logits_meatadata,
         )
-        # print(f"draft extend after verify hidden_states:", draft_logits_output.hidden_states[:5, :50])
-
-        # self.capture_for_decode(draft_logits_output, forward_batch.spec_info)
         select_index = (
             np.arange(len(model_worker_batch.seq_lens[: model_worker_batch.real_bs]))
             * (self.speculative_num_steps + 1)
@@ -612,7 +604,6 @@ class EAGLEWorker(ModelWorker):
         )
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[select_index]
         draft_logits_output.hidden_states = draft_logits_output.hidden_states[select_index]
-        # print(f"draft extend after verify next_token_logits:", draft_logits_output.next_token_logits[:5, :50])
         topk_p, topk_index = topk_probs_from_logits(
             draft_logits_output.next_token_logits, self.topk
         )
@@ -666,7 +657,6 @@ class EAGLEWorker(ModelWorker):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
-            # print(f"draft step {i} input_ids:", input_ids)
             # update_eagle_lists and update_forward_batch_info this two function will make accept rate very low if be jitted
             # FIXME we should find it out why lead this ?
             score_list, token_list, parents_list = update_eagle_lists(
@@ -682,16 +672,6 @@ class EAGLEWorker(ModelWorker):
 
             # Run forward
             forward_batch.bid = model_worker_batch.bid
-            # print(f"draft step {i} forward_batch input_ids:", forward_batch.input_ids)
-            # print(f"draft step {i} forward_batch positions:", forward_batch.positions)
-            # print(f"draft step {i} forward_batch spec info:", forward_batch.spec_info.hidden_states[:5, :50])
-            # print(f"draft step {i} metadata:", self.draft_model_runner.attn_backend.forward_metadata.page_indices[:50])
-            # print(f"draft step {i} metadata:", self.draft_model_runner.attn_backend.forward_metadata.cu_q_lens[:50])
-            # print(f"draft step {i} metadata:", self.draft_model_runner.attn_backend.forward_metadata.cu_kv_lens[:50])
-            # print(f"draft step {i} metadata:", self.draft_model_runner.attn_backend.forward_metadata.seq_lens[:50])
-
-
-
             logits_output, _ = self.draft_model_runner.forward(
                 forward_batch,
                 logits_metadata=logits_metadata,
