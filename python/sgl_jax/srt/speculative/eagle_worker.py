@@ -614,7 +614,7 @@ class EAGLEWorker(ModelWorker):
         )
         # print(f"draft extend after verify hidden_states:", draft_logits_output.hidden_states[:5, :50])
 
-        self.capture_for_decode(draft_logits_output, forward_batch.spec_info)
+        # self.capture_for_decode(draft_logits_output, forward_batch.spec_info)
         select_index = (
             np.arange(len(model_worker_batch.seq_lens[: model_worker_batch.real_bs]))
             * (self.speculative_num_steps + 1)
@@ -899,7 +899,7 @@ def select_top_k_tokens(
         )
 
 
-# @functools.partial(jax.jit, static_argnames=["topk"])
+@functools.partial(jax.jit, static_argnames=["topk"])
 def select_top_k_tokens_step_0(
     topk_p: jax.Array,
     topk_index: jax.Array,
@@ -922,7 +922,7 @@ def select_top_k_tokens_step_0(
     return input_ids, hidden_states, scores, tree_info
 
 
-# @functools.partial(jax.jit, static_argnames=["topk"])
+@functools.partial(jax.jit, static_argnames=["topk"])
 def select_top_k_tokens_step_greater_0(
     i: jax.Array,
     topk_p: jax.Array,
