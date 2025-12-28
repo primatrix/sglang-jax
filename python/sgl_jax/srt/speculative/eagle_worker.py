@@ -861,14 +861,10 @@ def update_forward_batch_info(
     hidden_states: jax.Array,
     positions_base: jax.Array,
 ) -> ForwardBatch:
-    forward_batch.input_ids = forward_batch.input_ids.at[:].set(input_ids[:].astype(jnp.int32))
+    forward_batch.input_ids = input_ids
     # FIXME(pc) hiddenstate will become NAN when forward path is very long, we still have no reason for this
-    forward_batch.spec_info.hidden_states = forward_batch.spec_info.hidden_states.at[:].set(
-        hidden_states[:]
-    )
-    forward_batch.positions = forward_batch.positions.at[:].set(
-        (positions_base[:] + i).astype(jnp.int32)
-    )
+    forward_batch.spec_info.hidden_states = hidden_states
+    forward_batch.positions = positions_base + i
     return forward_batch
 
 
