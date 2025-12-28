@@ -494,7 +494,7 @@ class EagleDraftInput:
             model_worker_batch.seq_lens[: model_worker_batch.real_bs]
             + speculative_num_draft_tokens - 1
         )
-        print(f"{model_worker_batch.seq_lens[:50]=}")
+        # print(f"{model_worker_batch.seq_lens[:50]=}")
         bs = batch_output.accept_lens.shape[0]
         step_plus_1 = model_worker_batch.input_ids.shape[0] // bs
         model_worker_batch.positions = model_worker_batch.positions - 1
@@ -509,10 +509,10 @@ class EagleDraftInput:
         forward_metadata = draft_model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
-        print(f"{forward_metadata.page_indices[:50]=}")
-        print(f"{forward_metadata.cu_q_lens[:50]=}")
-        print(f"{forward_metadata.cu_kv_lens[:50]=}")
-        print(f"{forward_metadata.seq_lens[:50]=}")
+        # print(f"{forward_metadata.page_indices[:50]=}")
+        # print(f"{forward_metadata.cu_q_lens[:50]=}")
+        # print(f"{forward_metadata.cu_kv_lens[:50]=}")
+        # print(f"{forward_metadata.seq_lens[:50]=}")
 
         draft_model_runner.attn_backend.forward_metadata = forward_metadata
         from sgl_jax.srt.layers.logits_processor import LogitsMetadata
