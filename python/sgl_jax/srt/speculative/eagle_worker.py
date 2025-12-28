@@ -423,8 +423,8 @@ class EAGLEWorker(ModelWorker):
             score_list,
             token_list,
             parents_list,
-            model_worker_batch.seq_lens,
-            np.sum(model_worker_batch.seq_lens),
+            model_worker_batch.seq_lens - 1,
+            np.sum(model_worker_batch.seq_lens - 1),
             self.topk,
             self.speculative_num_draft_tokens,
             int(self.req_to_token_pool.req_to_token.shape[1]),
@@ -457,17 +457,6 @@ class EAGLEWorker(ModelWorker):
         forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
-        # print("verify forward metadata page_indices:", forward_metadata.page_indices[:50])
-        # print("verify forward metadata cu_q_lens :", forward_metadata.cu_q_lens[:50])
-        # print("verify forward metadata cu_kv_lens", forward_metadata.cu_kv_lens[:50])
-        # print("verify forward metadata seq_lens", forward_metadata.seq_lens[:50])
-        # print("verify forward metadata num_seqs", forward_metadata.num_seqs[:50])
-        # print("verify forward metadata custom_mask", forward_metadata.custom_mask[:50])
-
-        # print(f"{model_worker_batch.positions=}")
-        # print(f"{model_worker_batch.input_ids=}")
-
-
 
         logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
             model_worker_batch, skip_sample=True, forward_metadata=forward_metadata

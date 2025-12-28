@@ -749,8 +749,9 @@ class EagleVerifyInput:
         if model_worker_batch.forward_mode.is_idle():
             return
 
-        # TODO: keep draft_token on TPU
-        # bs = len(model_worker_batch.req_pool_indices)
+        model_worker_batch.seq_lens[: model_worker_batch.real_bs] = (
+            model_worker_batch.seq_lens[: model_worker_batch.real_bs] - 1
+        )
         model_worker_batch.input_ids = self.draft_token
         model_worker_batch.positions = self.positions
         # bs = batch.batch_size()
