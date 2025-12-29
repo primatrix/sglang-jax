@@ -454,7 +454,7 @@ def _fused_ep_moe_kernel(
     b_b1_x2_vmem,  # None | <bw_sem_id> (2, 1, bf)
     b_b3_x2_vmem,  # None | <bw_sem_id> (2, 1, bf)
     b_b2_x2_vmem,  # None | <bw_sem_id> (2, t_packing, 1, bd2 // t_packing)
-    b_acc_vmem,  # F32(2, bt * num_devices, 1, bf)
+    b_acc_vmem,  # F32(bt * num_devices, 1, bf * 2)
     b_bias_vmem,  # None | F32(padded_num_experts,)
     ### Semaphores:
     local_sems,  # (2, 9): 2 x [b_gating_sem, b_w1_sem, b_w2_sem, b_w3_sem, b_output_sem,  b_se_w1_sem, b_se_w2_sem, b_se_w3_sem]
@@ -1328,13 +1328,14 @@ def _fused_ep_moe_kernel(
         lax.fori_loop(0, max_se_blocks_per_expert, run_se_block, None)
 
     def start_fetch_and_wait_topk_bias():
-        copy = pltpu.make_async_copy(
-            src_ref=bias_hbm,
-            dst_ref=b_bias_vmem,
-            sem=local_sems.at[0, 0],
-        )
-        copy.start()
-        copy.wait()
+        if bias_hbm is not None:
+            copy = pltpu.make_async_copy(
+                src_ref=bias_hbm,
+                dst_ref=b_bias_vmem,
+                sem=local_sems.at[0, 0],
+            )
+            copy.start()
+            copy.wait()
 
     def dynamic_ffn1(
         t_b32_vmem,
@@ -1547,9 +1548,9 @@ def _fused_ep_moe_kernel(
             .reshape(2, bt * num_devices, hidden_size // t_packing)
             .at[e_sem_id]
         )
-        b_acc_vmem_2d = b_acc_vmem.reshape(2, bt * num_devices, bf)
-        b_acc1_vmem = b_acc_vmem_2d.at[0]
-        b_acc3_vmem = b_acc_vmem_2d.at[1]
+        b_acc_vmem_2d = b_acc_vmem.reshape(bt * num_devices, bf * 2)
+        b_acc1_vmem = b_acc_vmem_2d.at[:, :bf]
+        b_acc3_vmem = b_acc_vmem_2d.at[:, bf:]
 
         e_id = my_id * local_num_experts + local_e_id
         dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
@@ -2271,7 +2272,7 @@ def fused_ep_moe(
         b1_scratch,  # b_b1_x2_vmem
         b3_scratch,  # b_b3_x2_vmem
         b2_scratch,  # b_b2_x2_vmem
-        pltpu.VMEM((2, bt_x_devices, 1, block_config.bf), jnp.float32),  # b_acc_vmem
+        pltpu.VMEM((bt_x_devices, 1, block_config.bf * 2), jnp.float32),  # b_acc_vmem
         bias_scratch,  # b_bias_vmem
         # Semaphores.
         local_sem,  # local_sems
