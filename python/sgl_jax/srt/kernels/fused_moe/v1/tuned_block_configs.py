@@ -59,14 +59,14 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, int, int, int, int, int, i
 }
 
 DEFAULT_FUSED_MOE_BLOCK_CONFIG = FusedMoEBlockConfig(
-    bt=16,
+    bt=32,
     bf=512,
-    bd1=512,
-    bd2=512,
-    btc=16,
+    bd1=1024,
+    bd2=1024,
+    btc=32,
     bfc=512,
-    bd1c=256,
-    bd2c=256,
+    bd1c=1024,
+    bd2c=1024,
 )
 
 
