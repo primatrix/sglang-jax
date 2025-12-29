@@ -556,18 +556,13 @@ def _fused_ep_moe_kernel(
         pltpu.semaphore_wait(barrier_sem, 1)
 
     def start_fetch_b_gating(bt_id, priority=0):
+        is_valid = jnp.logical_and(bt_id >= 0, bt_id < num_bt)
+        sz = pl.multiple_of(lax.select(is_valid, bt, 0), bt)
         bt_sem_id = (bt_id + 2) % 2
         b_gating_sem = local_sems.at[bt_sem_id, 0]
-        bt_start = bt_id * bt
-        # Hint Mosaic about HBM tiling alignment for `tpu.memref_slice`:
-        # - f32 is typically tiled as (8, 128)
-        # - bf16/f16 is typically tiled as (16, 128)
-        # Using a dtype-derived factor is more robust than hardcoding 8.
-        gating_tile0 = 256 // dtypes.itemsize_bits(gating_hbm.dtype)
-        bt_start = pl.multiple_of(bt_start, gating_tile0) if bt % gating_tile0 == 0 else bt_start
         pltpu.make_async_copy(
-            src_ref=gating_hbm.at[pl.ds(bt_start, bt)],
-            dst_ref=b_gating_x2_vmem.at[bt_sem_id, pl.ds(0, bt)],
+            src_ref=gating_hbm.at[pl.ds(bt_id * bt, sz)],
+            dst_ref=b_gating_x2_vmem.at[bt_sem_id, pl.ds(0, sz)],
             sem=b_gating_sem,
         ).start(priority=priority)
 
@@ -847,19 +842,17 @@ def _fused_ep_moe_kernel(
         remote_sz = sz - local_sz
         is_valid = jnp.logical_and(local_e_id >= 0, local_e_id < local_num_experts)
         remote_sz = lax.select(is_valid, remote_sz, 0)
-        ref = a2a_g_hbm.reshape(num_experts * bt, t_packing, hidden_size // t_packing)
         pltpu.make_async_copy(
-            src_ref=ref.at[pl.ds(0, remote_sz)],
-            dst_ref=ref.at[pl.ds(0, remote_sz)],
+            src_ref=a2a_g_hbm.at[0, pl.ds(0, remote_sz)],
+            dst_ref=a2a_g_hbm.at[0, pl.ds(0, remote_sz)],
             sem=send_sems.at[e_sem_id],
         ).wait()
 
     def wait_a2a_gather_recv_all():
         sz = top_k * bt
-        ref = a2a_g_hbm.reshape(num_experts * bt, t_packing, hidden_size // t_packing)
         pltpu.make_async_copy(
-            src_ref=ref.at[pl.ds(0, sz)],
-            dst_ref=ref.at[pl.ds(0, sz)],
+            src_ref=a2a_g_hbm.at[0, pl.ds(0, sz)],
+            dst_ref=a2a_g_hbm.at[0, pl.ds(0, sz)],
             sem=a2a_gather_sem,
         ).wait()
 
