@@ -2218,7 +2218,7 @@ def fused_ep_moe(
     bias_scratch = None if bias is None else pltpu.VMEM((padded_num_experts,), jnp.float32)
     local_sem = pltpu.SemaphoreType.DMA((2, 9 if w1_shared is not None else 5))
     shared_expert_acc = (
-        None if w1_shared is None else pltpu.VMEM((2, block_config.bf, hidden_size), jnp.float32)
+        None if w1_shared is None else pltpu.VMEM((2, block_config.bt, hidden_size), jnp.float32)
     )
     b_se_w1_x2_vmem = (
         None
