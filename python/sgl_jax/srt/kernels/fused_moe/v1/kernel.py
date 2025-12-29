@@ -1687,6 +1687,8 @@ def _fused_ep_moe_kernel(
     sync_barrier()
     start_fetch_and_wait_topk_bias()
     start_fetch_b_gating(bt_id=0)
+    if w1_shared is not None:
+        start_fetch_se_tokens(bt_id=0)
 
     def run_per_bt(bt_id, e_sem_id):
         bt_sem_id = bt_id % 2
@@ -1695,6 +1697,8 @@ def _fused_ep_moe_kernel(
         @pl.when(next_bt_id < num_bt)
         def _():
             start_fetch_b_gating(next_bt_id)
+            if w1_shared is not None:
+                start_fetch_se_tokens(next_bt_id)
 
         wait_fetch_b_gating(bt_id)
 
