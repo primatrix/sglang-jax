@@ -2357,11 +2357,10 @@ def fused_ep_moe(
                 scratch_shapes=scratch_shapes,
             ),
             compiler_params=pltpu.CompilerParams(
+                collective_id=0,
                 # TPU VMEM is 64MiB per core; requesting more is invalid and can
                 # crash compilation/runtime on some platforms.
-                vmem_limit_bytes=64
-                * 1024
-                * 1024,
+                vmem_limit_bytes=64 * 1024 * 1024,
             ),
             name=scope_name,
         )
