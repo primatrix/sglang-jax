@@ -64,7 +64,7 @@ DEFAULT_FUSED_MOE_BLOCK_CONFIG = FusedMoEBlockConfig(
     bd1=1024,
     bd2=1024,
     btc=32,
-    bfc=1024,
+    bfc=512,
     bd1c=1024,
     bd2c=1024,
 )
