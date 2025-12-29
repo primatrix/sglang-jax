@@ -480,6 +480,7 @@ def _fused_ep_moe_kernel(
     recv_sems,  # <e_sem_id> (2,)
     a2a_gather_sem,
     a2a_acc_sem,
+    barrier_sem,
     se_acc_vmem,  # (bt, hidden_size // t_packing) [Float32 Accumulator]
     b_se_w1_x2_vmem,  # (2, t_packing, bd1 // t_packing, bf)
     b_se_w2_x2_vmem,  # (2, t_packing, bf, bd2 // t_packing)
@@ -488,7 +489,6 @@ def _fused_ep_moe_kernel(
     b_se_w2_scale_x2_vmem,  # None | (2, t_packing, bf // subc, 1, bd2 // t_packing)
     b_se_w3_scale_x2_vmem,  # None | (2, t_packing, bd1 // t_packing // subc, 1, bf)
     b_se_tokens_vmem,  # None | (bt, hidden_size // t_packing) [Input Buffer]
-    barrier_sem,
     *,
     top_k: int,
     use_grouped_topk: bool = False,
