@@ -2,11 +2,12 @@ import jax
 from flax import nnx
 from jax import numpy as jnp
 from jax import shard_map
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_ep_moe
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
+from sgl_jax.srt.utils.profiling_utils import named_scope
 
 
 class GateLogit(nnx.Module):
@@ -36,6 +37,7 @@ class GateLogit(nnx.Module):
         else:
             self.bias = None
 
+    @named_scope
     def __call__(self, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         logits = hidden_states.astype(self.weight_dtype) @ self.kernel
 
@@ -67,6 +69,7 @@ class TopK(nnx.Module):
         self.topk_group = topk_group
         self.routed_scaling_factor = routed_scaling_factor
 
+    @named_scope
     def __call__(self, router_logits: jax.Array, correction_bias: jax.Array = None):
         if self.num_expert_group > 0 or self.topk_group > 0:
             if correction_bias is not None:
@@ -258,6 +261,7 @@ class EPMoE(nnx.Module):
         except Exception as _:
             return False, "cpu"
 
+    @named_scope
     def __call__(self, hidden_states, topk_weights, topk_ids) -> jax.Array:
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
             hidden_states_reshard = jax.sharding.reshard(hidden_states, P(None))
@@ -318,9 +322,6 @@ class EPMoE(nnx.Module):
             group_offset,
         )
 
-        if self.ep_size > 1:
-            intermediate_output = self._combine(intermediate_output)
-
         output = self._unpermute(
             intermediate_output,
             sorted_selected_experts,
@@ -328,6 +329,10 @@ class EPMoE(nnx.Module):
             batch_size,
             seq_len,
         )
+        # Combine across expert shards after unpermute to reduce EP communication
+        # volume from O(T*K*H) to O(T*H).
+        if self.ep_size > 1:
+            output = self._combine(output)
         return output
 
     def _gmm_compute(self, x, group_sizes, w0_kernel, w1_kernel, wo_kernel, group_offset):
@@ -616,4 +621,5 @@ class FusedEPMoE(nnx.Module):
             ep_axis_name="tensor",
         )
 
+        output = jax.sharding.reshard(output, NamedSharding(self.mesh, P(None, None)))
         return output
