@@ -533,6 +533,12 @@ class FusedEPMoE(nnx.Module):
         activation: str = "silu",
         layer_id: int = 0,
         renormalize_topk_logits: bool = False,
+        routed_scaling_factor: float | None = None,
+        use_grouped_topk: bool = False,
+        num_groups: int = 1,
+        top_k_groups: int = 1,
+        num_shared_experts: int = 0,
+        moe_shared_expert_intermediate_size: int | None = None,
     ):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
@@ -545,6 +551,15 @@ class FusedEPMoE(nnx.Module):
         self.activation = activation
         self.renormalize_topk_logits = renormalize_topk_logits
         self.mesh = mesh
+        self.routed_scaling_factor = routed_scaling_factor
+        self.mesh = mesh
+        self.use_grouped_topk = use_grouped_topk
+        self.num_groups = num_groups
+        self.top_k_groups = top_k_groups
+        self.num_shared_experts = num_shared_experts
+        self.moe_shared_expert_intermediate_size = (
+            moe_shared_expert_intermediate_size or intermediate_dim
+        )
 
         if num_experts % self.ep_size != 0:
             raise ValueError(
@@ -578,11 +593,45 @@ class FusedEPMoE(nnx.Module):
             )
         )
 
+        if self.num_shared_experts > 0:
+            se_inter_dim = self.moe_shared_expert_intermediate_size * self.num_shared_experts
+            self.w1_shared = nnx.Param(
+                jax.random.normal(
+                    jax.random.key(0),
+                    (hidden_size, se_inter_dim),
+                    dtype=weight_dtype,
+                    out_sharding=P(None, None),
+                )
+            )
+
+            self.w2_shared = nnx.Param(
+                jax.random.normal(
+                    jax.random.key(0),
+                    (se_inter_dim, hidden_size),
+                    dtype=weight_dtype,
+                    out_sharding=P(None, None),
+                )
+            )
+
+            self.w3_shared = nnx.Param(
+                jax.random.normal(
+                    jax.random.key(0),
+                    (hidden_size, se_inter_dim),
+                    dtype=weight_dtype,
+                    out_sharding=P(None, None),
+                )
+            )
+        else:
+            self.w1_shared = None
+            self.w3_shared = None
+            self.w2_shared = None
+
     def __call__(
         self,
         hidden_states: jax.Array,
         router_logits: jax.Array,
         *,
+        router_bias: jax.Array | None = None,
         block_config: FusedMoEBlockConfig | None = None,
     ) -> jax.Array:
         """
@@ -606,8 +655,16 @@ class FusedEPMoE(nnx.Module):
             w2=self.w2.value,
             w3=self.w3.value,
             gating_output=router_logits,
+            bias=router_bias,
             top_k=self.num_experts_per_tok,
             renormalize_topk_logits=self.renormalize_topk_logits,
+            routed_scaling_factor=self.routed_scaling_factor,
+            use_grouped_topk=self.use_grouped_topk,
+            num_groups=self.num_groups,
+            top_k_groups=self.top_k_groups,
+            w1_shared=self.w1_shared.value,
+            w2_shared=self.w2_shared.value,
+            w3_shared=self.w3_shared.value,
             act_fn=self.activation,
             block_config=block_config,
             # Optional parameters (not used in basic case)
