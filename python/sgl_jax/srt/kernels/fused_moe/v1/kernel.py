@@ -2175,14 +2175,14 @@ def fused_ep_moe(
     if w1_scale is not None:
         assert subc_quant_wsz is not None
         w1_scale_scratch = pltpu.VMEM(
-            (2, t_packing, block_config.bd1 // subc_quant_wsz, 1, block_config.bf),
+            (2, t_packing, block_config.bd1 // t_packing // subc_quant_wsz, 1, block_config.bf),
             jnp.float32,
         )
     w3_scale_scratch = None
     if w3_scale is not None:
         assert subc_quant_wsz is not None
         w3_scale_scratch = pltpu.VMEM(
-            (2, t_packing, block_config.bd1 // subc_quant_wsz, 1, block_config.bf),
+            (2, t_packing, block_config.bd1 // t_packing // subc_quant_wsz, 1, block_config.bf),
             jnp.float32,
         )
 
@@ -2190,14 +2190,16 @@ def fused_ep_moe(
     if w2_scale is not None:
         assert subc_quant_wsz is not None
         w2_scale_scratch = pltpu.VMEM(
-            (2, t_packing, block_config.bf // subc_quant_wsz, 1, block_config.bd2),
+            (2, t_packing, block_config.bf // subc_quant_wsz, 1, block_config.bd2 // t_packing),
             jnp.float32,
         )
 
     b1_scratch = None if b1 is None else pltpu.VMEM((2, 1, block_config.bf), jnp.float32)
     b3_scratch = None if b3 is None else pltpu.VMEM((2, 1, block_config.bf), jnp.float32)
     b2_scratch = (
-        None if b2 is None else pltpu.VMEM((2, t_packing, 1, block_config.bd2), jnp.float32)
+        None
+        if b2 is None
+        else pltpu.VMEM((2, t_packing, 1, block_config.bd2 // t_packing), jnp.float32)
     )
     bias_scratch = None if bias is None else pltpu.VMEM((padded_num_experts,), jnp.float32)
     local_sem = pltpu.SemaphoreType.DMA((2, 9 if w1_shared is not None else 5))
@@ -2237,7 +2239,7 @@ def fused_ep_moe(
         None
         if w2_shared_scale is None
         else pltpu.VMEM(
-            (2, t_packing, block_config.bf // t_packing // subc_quant_wsz, 1, block_config.bd2),
+            (2, t_packing, block_config.bf // subc_quant_wsz, 1, block_config.bd2 // t_packing),
             jnp.float32,
         )
     )
@@ -2276,9 +2278,15 @@ def fused_ep_moe(
         # Expert compute scratch.
         pltpu.VMEM((2, block_config.bt, padded_num_experts), gating_dtype),  # b_gating_x2_vmem
         pltpu.VMEM((2, block_config.bt, hidden_size), t_dtype),  # b_output_x2_vmem
-        pltpu.VMEM((2, t_packing, block_config.bd1, block_config.bf), w1.dtype),  # b_w1_x2_vmem
-        pltpu.VMEM((2, t_packing, block_config.bd1, block_config.bf), w3.dtype),  # b_w3_x2_vmem
-        pltpu.VMEM((2, t_packing, block_config.bf, block_config.bd2), w2.dtype),  # b_w2_x2_vmem
+        pltpu.VMEM(
+            (2, t_packing, block_config.bd1 // t_packing, block_config.bf), w1.dtype
+        ),  # b_w1_x2_vmem
+        pltpu.VMEM(
+            (2, t_packing, block_config.bd1 // t_packing, block_config.bf), w3.dtype
+        ),  # b_w3_x2_vmem
+        pltpu.VMEM(
+            (2, t_packing, block_config.bf, block_config.bd2 // t_packing), w2.dtype
+        ),  # b_w2_x2_vmem
         w1_scale_scratch,  # b_w1_scale_x2_vmem
         w3_scale_scratch,  # b_w3_scale_x2_vmem
         w2_scale_scratch,  # b_w2_scale_x2_vmem
