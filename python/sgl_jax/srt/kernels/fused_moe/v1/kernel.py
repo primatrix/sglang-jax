@@ -1861,6 +1861,9 @@ def _validate_fused_ep_moe_args(
     t_dtype = tokens.dtype
     t_packing = get_dtype_packing(t_dtype)
 
+    bt = block_config.bt
+    btc = block_config.btc
+
     # Override bt
     if local_num_tokens <= t_packing * 8:
         bt = local_num_tokens
@@ -2113,6 +2116,9 @@ def fused_ep_moe(
     gating_dtype = gating_output.dtype
     ep_size = mesh.shape[ep_axis_name]
     t_packing = get_dtype_packing(t_dtype)
+
+    bt = block_config.bt
+    btc = block_config.btc
 
     # Override bt
     if local_num_tokens <= t_packing * 8:
