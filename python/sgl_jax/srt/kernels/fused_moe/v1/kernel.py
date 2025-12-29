@@ -2215,6 +2215,7 @@ def fused_ep_moe(
     b1_scratch = None if b1 is None else pltpu.VMEM((2, 1, block_config.bf), jnp.float32)
     b3_scratch = None if b3 is None else pltpu.VMEM((2, 1, block_config.bf), jnp.float32)
     b2_scratch = None if b2 is None else pltpu.VMEM((2, t_packing, 1, bd2_per_pack), jnp.float32)
+    bias_scratch = None if bias is None else pltpu.VMEM((padded_num_experts,), jnp.float32)
     local_sem = (pltpu.SemaphoreType.DMA((2, 9 if w1_shared is not None else 5)),)
     shared_expert_acc = (
         None if w1_shared is None else pltpu.VMEM((2, block_config.bf, hidden_size), jnp.float32)
@@ -2295,6 +2296,7 @@ def fused_ep_moe(
         b3_scratch,  # b_b3_x2_vmem
         b2_scratch,  # b_b2_x2_vmem
         pltpu.VMEM((2, bt_x_devices, 1, block_config.bf), jnp.float32),  # b_acc_vmem
+        bias_scratch,  # b_bias_vmem
         # Semaphores.
         local_sem,  # local_sems
         pltpu.SemaphoreType.DMA((2,)),  # send_sems
