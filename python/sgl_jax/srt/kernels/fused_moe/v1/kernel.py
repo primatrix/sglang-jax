@@ -548,13 +548,12 @@ def _fused_ep_moe_kernel(
         return (dp_rank, ep_rank)
 
     def sync_barrier():
-        for i in range(num_devices):
-            pltpu.semaphore_signal(
-                barrier_sem,
-                device_id=get_mesh_device_id(i),
-                device_id_type=pltpu.DeviceIdType.MESH,
-            )
-        pltpu.semaphore_wait(barrier_sem, num_devices)
+        pltpu.semaphore_signal(
+            barrier_sem,
+            device_id=get_mesh_device_id(right_id),
+            device_id_type=pltpu.DeviceIdType.MESH,
+        )
+        pltpu.semaphore_wait(barrier_sem, 1)
 
     def start_fetch_b_gating(bt_id, priority=0):
         bt_sem_id = (bt_id + 2) % 2
