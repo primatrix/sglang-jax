@@ -630,8 +630,8 @@ class FusedEPMoE(nnx.Module):
         self,
         hidden_states: jax.Array,
         router_logits: jax.Array,
-        *,
         router_bias: jax.Array | None = None,
+        *,
         block_config: FusedMoEBlockConfig | None = None,
     ) -> jax.Array:
         """
