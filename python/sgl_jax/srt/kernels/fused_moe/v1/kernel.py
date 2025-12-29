@@ -1345,19 +1345,14 @@ def _fused_ep_moe_kernel(
 
         lax.fori_loop(0, max_se_blocks_per_expert, run_se_block, None)
 
-    def start_fetch_topk_bias():
-        pltpu.make_async_copy(
+    def start_fetch_and_wait_topk_bias():
+        copy = pltpu.make_async_copy(
             src_ref=bias_hbm,
             dst_ref=b_bias_vmem,
             sem=local_sems.at[0, 0],
-        ).start()
-
-    def wait_fetch_topk_bias():
-        pltpu.make_async_copy(
-            src_ref=b_bias_vmem,
-            dst_ref=b_bias_vmem,
-            sem=local_sems.at[0, 0],
-        ).wait()
+        )
+        copy.start()
+        copy.wait()
 
     def dynamic_ffn1(
         t_b32_vmem,
@@ -1690,7 +1685,7 @@ def _fused_ep_moe_kernel(
 
     ### ------- Kernel start ------- ###
     sync_barrier()
-    start_fetch_topk_bias()
+    start_fetch_and_wait_topk_bias()
     start_fetch_b_gating(bt_id=0)
 
     def run_per_bt(bt_id, e_sem_id):
@@ -1702,7 +1697,6 @@ def _fused_ep_moe_kernel(
             start_fetch_b_gating(next_bt_id)
 
         wait_fetch_b_gating(bt_id)
-        wait_fetch_topk_bias()
 
         if w1_shared is not None:
             se_acc_vmem[bt_sem_id] = jnp.zeros(se_acc_vmem[bt_sem_id].shape, dtype=jnp.float32)
