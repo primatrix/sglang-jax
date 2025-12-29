@@ -234,6 +234,10 @@ class Qwen2MoeDecoderLayer(nnx.Module):
                 dtype=dtype,
                 layer_id=layer_id,
                 renormalize_topk_logits=getattr(config, "norm_topk_prob", True),
+                routed_scaling_factor=config.routed_scaling_factor,
+                use_grouped_topk=config.n_group > 0,
+                num_groups=config.n_group,
+                top_k_groups=config.topk_group,
             )
         else:
             self.topk = TopK(
@@ -325,7 +329,7 @@ class Qwen2MoeDecoderLayer(nnx.Module):
 
         router_logits = self.moe_gate(hidden_states)
         if self.use_fused:
-            mlp_output = self.mlp(hidden_states, router_logits)
+            mlp_output = self.mlp(hidden_states, router_logits, None)
         else:
             topk_weights, topk_ids = self.topk(router_logits)
             mlp_output = self.mlp(hidden_states, topk_weights, topk_ids)

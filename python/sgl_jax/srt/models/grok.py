@@ -257,6 +257,10 @@ class Grok1MoE(nnx.Module):
                 dtype=dtype,
                 layer_id=layer_id,
                 renormalize_topk_logits=False,  # Match sglang behavior
+                routed_scaling_factor=config.routed_scaling_factor,
+                use_grouped_topk=config.n_group > 0,
+                num_groups=config.n_group,
+                top_k_groups=config.topk_group,
             )
         else:
             self.experts = EPMoE(
@@ -285,7 +289,7 @@ class Grok1MoE(nnx.Module):
             # Fused kernel: pass router_logits directly
             # Top-K selection is handled internally by the kernel
             assert isinstance(self.experts, FusedEPMoE)
-            return self.experts(hidden_states, router_logits)
+            return self.experts(hidden_states, router_logits, None)
         else:
             # EPMoE: compute top-k routing weights using sglang-style approach:
             # 1. Compute global softmax over ALL experts (not just top-k)
