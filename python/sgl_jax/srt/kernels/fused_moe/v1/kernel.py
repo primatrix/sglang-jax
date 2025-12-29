@@ -548,6 +548,7 @@ def _fused_ep_moe_kernel(
         return (dp_rank, ep_rank)
 
     def sync_barrier():
+        barrier_sem = pltpu.get_barrier_semaphore()
         pltpu.semaphore_signal(
             barrier_sem,
             device_id=get_mesh_device_id(right_id),
@@ -1690,6 +1691,7 @@ def _fused_ep_moe_kernel(
         start_a2a_scatter(bt_id=bt_id, e_sem_id=e_sem_id, local_e_id=0)
 
         def run_per_expert(local_e_id, e_sem_id):
+            sync_barrier()
             # Prefetch weights for CURRENT active expert.
             # TODO(jevinjiang): It is hard to prefetch weights in previous iteration
             # because the expert_ffn keeps overwriting the buffers. Triple buffering
@@ -1720,14 +1722,12 @@ def _fused_ep_moe_kernel(
 
             # A must-wait before next sync_barrier.
             wait_a2a_scatter_send(bt_id, e_sem_id, local_e_id)
-            sync_barrier()
             return next_e_sem_id
 
         e_sem_id = lax.fori_loop(0, local_num_experts, run_per_expert, e_sem_id, unroll=False)
 
         # Wait to receive a2a gather for ALL experts.
         wait_a2a_gather_recv_all()
-        sync_barrier()
 
         # Accumulate results for current batch.
         output = bt_acc(bt_id, top_k_logits_lst)
@@ -1856,15 +1856,17 @@ def _validate_fused_ep_moe_args(
     # `gating_output` is DMA'd from HBM in (bt, num_experts) tiles. Mosaic requires
     # the tile start index to be divisible by the HBM tiling factor, which depends
     # on dtype (e.g. f32 -> 8, bf16 -> 16).
+    num_devices = ep_size
     local_num_tokens = num_tokens // ep_size
-    num_bt = cdiv(local_num_tokens, block_config.bt)
-    gating_tile0 = 256 // dtypes.itemsize_bits(gating_output.dtype)
-    if num_bt > 1 and block_config.bt % gating_tile0 != 0:
-        raise ValueError(
-            f"Expected {block_config.bt=} to be aligned to {gating_tile0=} when {num_bt=} > 1 "
-            f"(for gating dtype {gating_output.dtype})."
-        )
+    t_dtype = tokens.dtype
+    t_packing = get_dtype_packing(t_dtype)
 
+    # Override bt
+    if local_num_tokens <= t_packing * 8:
+        bt = local_num_tokens
+        btc = bt
+    bt = min(local_num_tokens, bt)
+    btc = min(bt, btc, bt * num_devices)
     # Note: we should dump scale as the kernel expected shape in the
     # checkpoint offline or reshape right after weight loading.
     if w1_scale is not None:
@@ -2109,11 +2111,16 @@ def fused_ep_moe(
     padded_top_k = align_to(top_k, 128)
     t_dtype = tokens.dtype
     gating_dtype = gating_output.dtype
+    ep_size = mesh.shape[ep_axis_name]
     t_packing = get_dtype_packing(t_dtype)
-    hidden_per_pack = hidden_size // t_packing
-    bt_x_devices = block_config.bt * num_devices
-    bd1_per_pack = block_config.bd1 // t_packing
-    bd2_per_pack = block_config.bd2 // t_packing
+
+    # Override bt
+    if local_num_tokens <= t_packing * 8:
+        bt = local_num_tokens
+        btc = bt
+    bt = min(local_num_tokens, bt)
+    # The worst case is that all devices send bt to one device.
+    btc = min(bt, btc, bt * num_devices)
 
     # Note: we should dump scale as the kernel expected shape in the
     # checkpoint offline or reshape right after weight loading.
@@ -2162,14 +2169,14 @@ def fused_ep_moe(
     if w1_scale is not None:
         assert subc_quant_wsz is not None
         w1_scale_scratch = pltpu.VMEM(
-            (2, t_packing, bd1_per_pack // subc_quant_wsz, 1, block_config.bf),
+            (2, t_packing, block_config.bd1 // subc_quant_wsz, 1, block_config.bf),
             jnp.float32,
         )
     w3_scale_scratch = None
     if w3_scale is not None:
         assert subc_quant_wsz is not None
         w3_scale_scratch = pltpu.VMEM(
-            (2, t_packing, bd1_per_pack // subc_quant_wsz, 1, block_config.bf),
+            (2, t_packing, block_config.bd1 // subc_quant_wsz, 1, block_config.bf),
             jnp.float32,
         )
 
@@ -2177,13 +2184,15 @@ def fused_ep_moe(
     if w2_scale is not None:
         assert subc_quant_wsz is not None
         w2_scale_scratch = pltpu.VMEM(
-            (2, t_packing, block_config.bf // subc_quant_wsz, 1, bd2_per_pack),
+            (2, t_packing, block_config.bf // subc_quant_wsz, 1, block_config.bd2),
             jnp.float32,
         )
 
     b1_scratch = None if b1 is None else pltpu.VMEM((2, 1, block_config.bf), jnp.float32)
     b3_scratch = None if b3 is None else pltpu.VMEM((2, 1, block_config.bf), jnp.float32)
-    b2_scratch = None if b2 is None else pltpu.VMEM((2, t_packing, 1, bd2_per_pack), jnp.float32)
+    b2_scratch = (
+        None if b2 is None else pltpu.VMEM((2, t_packing, 1, block_config.bd2), jnp.float32)
+    )
     bias_scratch = None if bias is None else pltpu.VMEM((padded_num_experts,), jnp.float32)
     local_sem = pltpu.SemaphoreType.DMA((2, 9 if w1_shared is not None else 5))
     shared_expert_acc = (
@@ -2249,22 +2258,28 @@ def fused_ep_moe(
         pltpu.SMEM((2, 1, padded_num_experts), jnp.int32),  # expert_sizes_x2_smem
         pltpu.SMEM((2,), jnp.int32),  # a2a_s_sends_x2_smem
         # Token scatter/gather scratch.
-        pltpu.VMEM((2, bt_x_devices, t_packing, hidden_per_pack), t_dtype),  # a2a_s_x2_vmem
-        pltpu.VMEM((2, bt_x_devices, t_packing, hidden_per_pack), t_dtype),  # a2a_s_acc_x2_vmem
-        pltpu.VMEM((top_k, block_config.bt, t_packing, hidden_per_pack), t_dtype),  # a2a_g_acc_vmem
+        pltpu.VMEM(
+            (2, bt * num_devices, t_packing, hidden_size // t_packing), t_dtype
+        ),  # a2a_s_x2_vmem
+        pltpu.VMEM(
+            (2, bt * num_devices, t_packing, hidden_size // t_packing), t_dtype
+        ),  # a2a_s_acc_x2_vmem
+        pltpu.VMEM(
+            (top_k, block_config.bt, t_packing, hidden_size // t_packing), t_dtype
+        ),  # a2a_g_acc_vmem
         # Expert compute scratch.
         pltpu.VMEM((2, block_config.bt, padded_num_experts), gating_dtype),  # b_gating_x2_vmem
         pltpu.VMEM((2, block_config.bt, hidden_size), t_dtype),  # b_output_x2_vmem
-        pltpu.VMEM((2, t_packing, bd1_per_pack, block_config.bf), w1.dtype),  # b_w1_x2_vmem
-        pltpu.VMEM((2, t_packing, bd1_per_pack, block_config.bf), w3.dtype),  # b_w3_x2_vmem
-        pltpu.VMEM((2, t_packing, block_config.bf, bd2_per_pack), w2.dtype),  # b_w2_x2_vmem
+        pltpu.VMEM((2, t_packing, block_config.bd1, block_config.bf), w1.dtype),  # b_w1_x2_vmem
+        pltpu.VMEM((2, t_packing, block_config.bd1, block_config.bf), w3.dtype),  # b_w3_x2_vmem
+        pltpu.VMEM((2, t_packing, block_config.bf, block_config.bd2), w2.dtype),  # b_w2_x2_vmem
         w1_scale_scratch,  # b_w1_scale_x2_vmem
         w3_scale_scratch,  # b_w3_scale_x2_vmem
         w2_scale_scratch,  # b_w2_scale_x2_vmem
         b1_scratch,  # b_b1_x2_vmem
         b3_scratch,  # b_b3_x2_vmem
         b2_scratch,  # b_b2_x2_vmem
-        pltpu.VMEM((bt_x_devices, 1, block_config.bf * 2), jnp.float32),  # b_acc_vmem
+        pltpu.VMEM((bt * num_devices, 1, block_config.bf * 2), jnp.float32),  # b_acc_vmem
         bias_scratch,  # b_bias_vmem
         # Semaphores.
         local_sem,  # local_sems
