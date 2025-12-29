@@ -358,10 +358,10 @@ class BailingMoEDecoderLayer(nnx.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         if self.is_moe_layer:
-            # if self.shared_experts is not None:
-            #     shared_output = self.shared_experts(hidden_states)
-            # else:
-            #     shared_output = None
+            if self.shared_experts is not None:
+                shared_output = self.shared_experts(hidden_states)
+            else:
+                shared_output = None
             router_logits = self.moe_gate(hidden_states)
             if router_logits.dtype != hidden_states.dtype:
                 router_logits = router_logits.astype(hidden_states.dtype)
@@ -373,9 +373,8 @@ class BailingMoEDecoderLayer(nnx.Module):
                 topk_weights, topk_ids = self.topk(router_logits, correction_bias)
                 hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
 
-            # if shared_output is not None:
-            #     # hidden_states = hidden_states + shared_output
-            #     hidden_states = hidden_states
+            if shared_output is not None:
+                hidden_states = hidden_states + shared_output
         else:
             hidden_states = self.mlp(hidden_states)
 
