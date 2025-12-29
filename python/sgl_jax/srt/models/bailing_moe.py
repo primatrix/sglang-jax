@@ -262,7 +262,11 @@ class BailingMoEDecoderLayer(nnx.Module):
 
             self.moe_backend = getattr(config, "moe_backend", "epmoe")
             self.use_fused = self.moe_backend == "fused"
-
+            moe_shared_expert_intermediate_size = getattr(
+                config,
+                "moe_shared_expert_intermediate_size",
+                config.moe_intermediate_size,
+            )
             if self.use_fused:
                 from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 
@@ -277,6 +281,12 @@ class BailingMoEDecoderLayer(nnx.Module):
                     dtype=dtype,
                     layer_id=layer_id,
                     renormalize_topk_logits=config.norm_topk_prob,
+                    routed_scaling_factor=config.routed_scaling_factor,
+                    use_grouped_topk=config.n_group > 0,
+                    num_groups=config.n_group,
+                    top_k_groups=config.topk_group,
+                    num_shared_experts=num_shared_experts,
+                    moe_shared_expert_intermediate_size=moe_shared_expert_intermediate_size,
                 )
             else:
                 self.topk = TopK(
@@ -298,15 +308,10 @@ class BailingMoEDecoderLayer(nnx.Module):
                     layer_id=layer_id,
                 )
 
-            if num_shared_experts > 0:
+            if num_shared_experts > 0 and not self.use_fused:
                 self.shared_experts = BailingMoEMLP(
                     hidden_size=config.hidden_size,
-                    intermediate_size=getattr(
-                        config,
-                        "moe_shared_expert_intermediate_size",
-                        config.moe_intermediate_size,
-                    )
-                    * num_shared_experts,
+                    intermediate_size=moe_shared_expert_intermediate_size * num_shared_experts,
                     layer_id=layer_id,
                     dtype=dtype,
                     mesh=mesh,
@@ -358,13 +363,13 @@ class BailingMoEDecoderLayer(nnx.Module):
             else:
                 shared_output = None
             router_logits = self.moe_gate(hidden_states)
+            if router_logits.dtype != hidden_states.dtype:
+                router_logits = router_logits.astype(hidden_states.dtype)
 
+            correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
             if self.use_fused:
-                hidden_states = self.mlp(hidden_states, router_logits)
+                hidden_states = self.mlp(hidden_states, router_logits, correction_bias)
             else:
-                correction_bias = (
-                    self.moe_gate.bias.value if self.moe_gate.bias is not None else None
-                )
                 topk_weights, topk_ids = self.topk(router_logits, correction_bias)
                 hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
 
@@ -575,64 +580,59 @@ class BailingMoEForCausalLM(nnx.Module):
                     transpose=False,
                 )
 
-            if getattr(self.config, "num_shared_experts", 0) > 0:
-                shared_experts_mappings = {
-                    f"{prefix}.mlp.shared_experts.gate_proj.weight": WeightMapping(
-                        target_path=f"{target_prefix}.shared_experts.gate_proj.weight",
-                        sharding=(None, "tensor"),
-                        transpose=True,
-                    ),
-                    f"{prefix}.mlp.shared_experts.up_proj.weight": WeightMapping(
-                        target_path=f"{target_prefix}.shared_experts.up_proj.weight",
-                        sharding=(None, "tensor"),
-                        transpose=True,
-                    ),
-                    f"{prefix}.mlp.shared_experts.down_proj.weight": WeightMapping(
-                        target_path=f"{target_prefix}.shared_experts.down_proj.weight",
-                        sharding=("tensor", None),
-                        transpose=True,
-                    ),
-                }
-                mappings.update(shared_experts_mappings)
-
             num_experts = getattr(self.config, "num_experts", 256)
             moe_backend = getattr(self.config, "moe_backend", "epmoe")
             use_fused = moe_backend == "fused"
 
             if use_fused:
-                # Fused MoE Mapping
-                # w1: fused gate_proj(w1) + up_proj(w3) -> (num_experts, 2, hidden, intermediate)
-                # w2: down_proj(w2) -> (num_experts, intermediate, hidden)
-
-                # 1. Fused w1 (gate + up)
+                # 1. w1 (gate_proj)
                 target_path_w1 = [f"{target_prefix}.mlp.w1"]
-                # Add source keys for gate_proj and up_proj
-                for name in ["gate_proj", "up_proj"]:
-                    target_path_w1.extend(
-                        [f"{prefix}.mlp.experts.{i}.{name}.weight" for i in range(num_experts)]
-                    )
-
+                target_path_w1.extend(
+                    [f"{prefix}.mlp.experts.{i}.gate_proj.weight" for i in range(num_experts)]
+                )
                 mappings[f"__MOE_EXPERTS__{prefix}.mlp.w1"] = WeightMapping(
                     target_path=target_path_w1,
-                    sharding=("tensor", None, None, None),  # (E, 2, H, I)
+                    sharding=("tensor", None, None),  # (E, H, I)
                     transpose=True,
                     concat_axis=0,
-                    fuse_moe_weights=True,
-                    fuse_gate_up=("gate_proj", "up_proj"),
                 )
-
-                # 2. w2 (down)
+                target_path_w3 = [f"{target_prefix}.mlp.w3"]
+                target_path_w3.extend(
+                    [f"{prefix}.mlp.experts.{i}.up_proj.weight" for i in range(num_experts)]
+                )
+                mappings[f"__MOE_EXPERTS__{prefix}.mlp.w3"] = WeightMapping(
+                    target_path=target_path_w3,
+                    sharding=("tensor", None, None),  # (E, H, I)
+                    transpose=True,
+                    concat_axis=0,
+                )
                 target_path_w2 = [f"{target_prefix}.mlp.w2"]
                 target_path_w2.extend(
                     [f"{prefix}.mlp.experts.{i}.down_proj.weight" for i in range(num_experts)]
                 )
-
                 mappings[f"__MOE_EXPERTS__{prefix}.mlp.w2"] = WeightMapping(
                     target_path=target_path_w2,
                     sharding=("tensor", None, None),  # (E, I, H)
                     transpose=True,
-                    concat_axis=-1,
+                    concat_axis=0,
                 )
+
+                if getattr(self.config, "num_shared_experts", 0) > 0:
+                    mappings[f"{prefix}.mlp.shared_experts.gate_proj.weight"] = WeightMapping(
+                        target_path=f"{target_prefix}.mlp.w1_shared",
+                        sharding=(None, None),
+                        transpose=True,
+                    )
+                    mappings[f"{prefix}.mlp.shared_experts.up_proj.weight"] = WeightMapping(
+                        target_path=f"{target_prefix}.mlp.w3_shared",
+                        sharding=(None, None),
+                        transpose=True,
+                    )
+                    mappings[f"{prefix}.mlp.shared_experts.down_proj.weight"] = WeightMapping(
+                        target_path=f"{target_prefix}.mlp.w2_shared",
+                        sharding=(None, None),
+                        transpose=True,
+                    )
             else:
                 for expert_type in ["gate_proj", "up_proj", "down_proj"]:
                     target_name = {
@@ -654,6 +654,25 @@ class BailingMoEForCausalLM(nnx.Module):
                         sharding=sharding,
                         transpose=True,
                     )
+                if getattr(self.config, "num_shared_experts", 0) > 0:
+                    shared_experts_mappings = {
+                        f"{prefix}.mlp.shared_experts.gate_proj.weight": WeightMapping(
+                            target_path=f"{target_prefix}.shared_experts.gate_proj.weight",
+                            sharding=(None, "tensor"),
+                            transpose=True,
+                        ),
+                        f"{prefix}.mlp.shared_experts.up_proj.weight": WeightMapping(
+                            target_path=f"{target_prefix}.shared_experts.up_proj.weight",
+                            sharding=(None, "tensor"),
+                            transpose=True,
+                        ),
+                        f"{prefix}.mlp.shared_experts.down_proj.weight": WeightMapping(
+                            target_path=f"{target_prefix}.shared_experts.down_proj.weight",
+                            sharding=("tensor", None),
+                            transpose=True,
+                        ),
+                    }
+                    mappings.update(shared_experts_mappings)
 
         return mappings
 
