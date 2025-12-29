@@ -475,7 +475,7 @@ def _fused_ep_moe_kernel(
     b_acc_vmem,  # F32(2, bt * num_devices, 1, bf)
     b_bias_vmem,  # None | F32(padded_num_experts,)
     ### Semaphores:
-    local_sems,  # (2, 8): 2 x [b_gating_sem, b_w1_sem, b_w2_sem, b_w3_sem, b_output_sem,  b_se_w1_sem, b_se_w2_sem, b_se_w3_sem]
+    local_sems,  # (2, 9): 2 x [b_gating_sem, b_w1_sem, b_w2_sem, b_w3_sem, b_output_sem,  b_se_w1_sem, b_se_w2_sem, b_se_w3_sem]
     send_sems,  # <e_sem_id> (2,)
     recv_sems,  # <e_sem_id> (2,)
     a2a_gather_sem,
@@ -2216,7 +2216,7 @@ def fused_ep_moe(
     b3_scratch = None if b3 is None else pltpu.VMEM((2, 1, block_config.bf), jnp.float32)
     b2_scratch = None if b2 is None else pltpu.VMEM((2, t_packing, 1, bd2_per_pack), jnp.float32)
     bias_scratch = None if bias is None else pltpu.VMEM((padded_num_experts,), jnp.float32)
-    local_sem = (pltpu.SemaphoreType.DMA((2, 9 if w1_shared is not None else 5)),)
+    local_sem = pltpu.SemaphoreType.DMA((2, 9 if w1_shared is not None else 5))
     shared_expert_acc = (
         None if w1_shared is None else pltpu.VMEM((2, block_config.bf, hidden_size), jnp.float32)
     )
