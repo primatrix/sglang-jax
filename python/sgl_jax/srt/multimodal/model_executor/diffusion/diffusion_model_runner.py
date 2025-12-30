@@ -3,7 +3,7 @@ import time
 
 import jax.numpy as jnp
 
-from python.sgl_jax.srt.model_loader.loader import get_model_loader
+from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 
 logger = logging.getLogger(__name__)
