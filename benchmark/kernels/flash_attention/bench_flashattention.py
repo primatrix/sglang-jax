@@ -16,6 +16,9 @@ from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
     get_kernel_scope_name,
     ragged_paged_attention,
 )
+from sgl_jax.srt.kernels.ragged_paged_attention.tuned_block_sizes import (
+    get_tuned_block_sizes,
+)
 from sgl_jax.srt.kernels.utils.perf import multiple_iteration_timeit_from_trace
 from sgl_jax.test.test_utils import CustomTestCase, is_in_ci
 
@@ -131,11 +134,22 @@ def benchmark_backend(
     jax.block_until_ready(output)
 
     # Benchmark
+    best_bkv_p, best_bq_sz = get_tuned_block_sizes(
+        q.dtype,
+        k.dtype,
+        q_head_num,
+        kv_head_num,
+        head_dim,
+        page_size,
+        max_num_batched_tokens,
+        page_indices.shape[0] // kv_lens.shape[0],
+        True,
+    )
     times = multiple_iteration_timeit_from_trace(
         compute_func=lambda: attn(),
         data_generator=lambda: (),
-        task=get_kernel_scope_name(16, 2, page_size),
-        tries=3,
+        task=get_kernel_scope_name(best_bq_sz, best_bkv_p, page_size),
+        tries=1,
     )
     avg_time = float(np.mean(times)) if times else float("nan")
 
@@ -241,38 +255,38 @@ class TestPerformance(CustomTestCase):
         # Key: (mode, page_size, max_num_batched_tokens, q_head_num, kv_head_num, head_dim, max_kv_cache_tokens)
         # Value: expected cost-time (baseline) in ms
         test_cases = {
-            ("prefill", 128, 1024, 4, 1, 128, 600000): 0.740023,
-            ("prefill", 128, 1024, 4, 2, 128, 600000): 1.187553,
-            ("prefill", 128, 1024, 8, 1, 128, 600000): 0.723803,
-            ("prefill", 128, 1024, 8, 4, 128, 600000): 2.0092227,
-            ("prefill", 128, 4096, 4, 1, 128, 600000): 0.80139633,
-            ("prefill", 128, 4096, 4, 2, 128, 600000): 1.257796,
-            ("prefill", 128, 4096, 8, 1, 128, 600000): 0.863873,
-            ("prefill", 128, 4096, 8, 4, 128, 600000): 2.216679,
-            ("prefill", 256, 1024, 4, 1, 128, 600000): 0.709483,
-            ("prefill", 256, 1024, 4, 2, 128, 600000): 1.140886,
-            ("prefill", 256, 1024, 8, 1, 128, 600000): 0.75215633,
-            ("prefill", 256, 1024, 8, 4, 128, 600000): 1.9960757,
-            ("prefill", 256, 4096, 4, 1, 128, 600000): 0.800553,
-            ("prefill", 256, 4096, 4, 2, 128, 600000): 1.249716,
-            ("prefill", 256, 4096, 8, 1, 128, 600000): 0.867703,
-            ("prefill", 256, 4096, 8, 4, 128, 600000): 2.2203957,
-            ("decode", 128, 128, 4, 1, 128, 600000): 0.925433,
-            ("decode", 128, 128, 4, 2, 128, 600000): 1.431036,
-            ("decode", 128, 128, 8, 1, 128, 600000): 0.92405633,
-            ("decode", 128, 128, 8, 4, 128, 600000): 2.493542,
-            ("decode", 128, 256, 4, 1, 128, 600000): 1.1431197,
-            ("decode", 128, 256, 4, 2, 128, 600000): 1.735556,
-            ("decode", 128, 256, 8, 1, 128, 600000): 1.137416,
-            ("decode", 128, 256, 8, 4, 128, 600000): 3.010292,
-            ("decode", 256, 128, 4, 1, 128, 600000): 0.87172933,
-            ("decode", 256, 128, 4, 2, 128, 600000): 1.3990127,
-            ("decode", 256, 128, 8, 1, 128, 600000): 0.856623,
-            ("decode", 256, 128, 8, 4, 128, 600000): 2.3763857,
-            ("decode", 256, 256, 4, 1, 128, 600000): 1.0207963,
-            ("decode", 256, 256, 4, 2, 128, 600000): 1.6457827,
-            ("decode", 256, 256, 8, 1, 128, 600000): 1.032563,
-            ("decode", 256, 256, 8, 4, 128, 600000): 2.7910553,
+            ("prefill", 128, 1024, 4, 1, 128, 600000): 0.0158863,
+            ("prefill", 128, 1024, 4, 2, 128, 600000): 0.0150987,
+            ("prefill", 128, 1024, 8, 1, 128, 600000): 0.0217812,
+            ("prefill", 128, 1024, 8, 4, 128, 600000): 0.0241038,
+            ("prefill", 128, 4096, 4, 1, 128, 600000): 0.091245,
+            ("prefill", 128, 4096, 4, 2, 128, 600000): 0.091995,
+            ("prefill", 128, 4096, 8, 1, 128, 600000): 0.147034,
+            ("prefill", 128, 4096, 8, 4, 128, 600000): 0.161692,
+            ("prefill", 256, 1024, 4, 1, 128, 600000): 0.01573,
+            ("prefill", 256, 1024, 4, 2, 128, 600000): 0.015095,
+            ("prefill", 256, 1024, 8, 1, 128, 600000): 0.021755,
+            ("prefill", 256, 1024, 8, 4, 128, 600000): 0.0237662,
+            ("prefill", 256, 4096, 4, 1, 128, 600000): 0.091365,
+            ("prefill", 256, 4096, 4, 2, 128, 600000): 0.0914912,
+            ("prefill", 256, 4096, 8, 1, 128, 600000): 0.146874,
+            ("prefill", 256, 4096, 8, 4, 128, 600000): 0.161585,
+            ("decode", 128, 128, 4, 1, 128, 600000): 0.235763,
+            ("decode", 128, 128, 4, 2, 128, 600000): 0.303399,
+            ("decode", 128, 128, 8, 1, 128, 600000): 0.239314,
+            ("decode", 128, 128, 8, 4, 128, 600000): 0.529945,
+            ("decode", 128, 256, 4, 1, 128, 600000): 0.461838,
+            ("decode", 128, 256, 4, 2, 128, 600000): 0.590747,
+            ("decode", 128, 256, 8, 1, 128, 600000): 0.456383,
+            ("decode", 128, 256, 8, 4, 128, 600000): 1.06428,
+            ("decode", 256, 128, 4, 1, 128, 600000): 0.167162,
+            ("decode", 256, 128, 4, 2, 128, 600000): 0.26077,
+            ("decode", 256, 128, 8, 1, 128, 600000): 0.168829,
+            ("decode", 256, 128, 8, 4, 128, 600000): 0.405069,
+            ("decode", 256, 256, 4, 1, 128, 600000): 0.331566,
+            ("decode", 256, 256, 4, 2, 128, 600000): 0.504135,
+            ("decode", 256, 256, 8, 1, 128, 600000): 0.331131,
+            ("decode", 256, 256, 8, 4, 128, 600000): 0.809101,
         }
         max_context_len = 40960
         for case, baseline in test_cases.items():

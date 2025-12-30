@@ -1212,7 +1212,7 @@ def get_tuned_block_sizes(
     page_size,
     max_num_tokens,
     pages_per_seq,
-    causal,
+    causal=True,
 ) -> tuple[int, int]:
     if not causal:
         # FIXME(pc) hack this to avoid oom when precompile, currently, we still have no better choice for non-causal's mask
