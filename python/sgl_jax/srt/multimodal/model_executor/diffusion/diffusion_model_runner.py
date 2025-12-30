@@ -83,7 +83,9 @@ class DiffusionModelRunner(BaseModelRunner):
             if do_classifier_free_guidance:
                 latents = jnp.concatenate([latents] * 2)
             # Perform denoising step
-            noise_pred = self.model.forward(latents, text_embeds, t_batch, deterministic=True)
+            noise_pred: jax.Array = self.model.forward(
+                latents, text_embeds, t_batch, deterministic=True
+            )
             if do_classifier_free_guidance:
                 bsz = latents.shape[0] // 2
                 noise_uncond = noise_pred[bsz:]
