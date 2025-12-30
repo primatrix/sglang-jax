@@ -107,9 +107,10 @@ def sub_channel_quantize(x, quant_dtype, wsz=256):
     for i in range(0, x.shape[-2], wsz):
         y = x[..., i : i + wsz, :]
         abs_max = jnp.abs(y).max(axis=-2, keepdims=True)
-        # FIX: Protect against division by zero for empty blocks (NaN fix)
+        # FIX: Robust division protection.
+        # Use epsilon check (1e-30) instead of ==0 to catch denormals that might cause instability.
         scale = (abs_max / dtype_max).astype(jnp.float32)
-        scale = jnp.where(scale == 0, 1.0, scale)
+        scale = jnp.where(scale < 1e-30, 1.0, scale)
         w = (y / scale).astype(quant_dtype)
         w_lst.append(w)
         scale_lst.append(scale)
