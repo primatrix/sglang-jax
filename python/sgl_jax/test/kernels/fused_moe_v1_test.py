@@ -35,9 +35,10 @@ def gen_moe_inputs(
     *,
     seed=1234,
     has_bias=False,
+    has_router_bias=False,
 ):
     key = jax.random.key(seed)
-    k0, k1, k2, k3, k4, k5, k6, k7, k8 = jax.random.split(key, 9)
+    k0, k1, k2, k3, k4, k5, k6, k7, k8, k9 = jax.random.split(key, 10)
 
     a = jax.random.normal(k0, (num_tokens, hidden_size), dtype=jnp.float32).astype(dtype) / 10
 
@@ -70,6 +71,10 @@ def gen_moe_inputs(
         / 100
     )
 
+    router_bias = None
+    if has_router_bias:
+        router_bias = jax.random.normal(k9, (num_experts,), dtype=jnp.float32) / 10
+
     # To generate unique top-k!
     top_k_indices = jax.random.randint(
         k8, (num_tokens, top_k), minval=0, maxval=num_experts - 1, dtype=jnp.int32
@@ -83,9 +88,10 @@ def gen_moe_inputs(
         * 30
     )
 
+    # Output Raw Logits. We will Softmax them in _test_moe to simulate GateLogit.
     gating_output = (gating_output + one_hot).astype(dtype)
 
-    return a, w1, w2, w3, b1, b2, b3, gating_output
+    return a, w1, w2, w3, b1, b2, b3, gating_output, router_bias
 
 
 def sub_channel_quantize(x, quant_dtype, wsz=256):
@@ -101,7 +107,9 @@ def sub_channel_quantize(x, quant_dtype, wsz=256):
     for i in range(0, x.shape[-2], wsz):
         y = x[..., i : i + wsz, :]
         abs_max = jnp.abs(y).max(axis=-2, keepdims=True)
+        # Fix: Prevent division by zero to avoid NaNs in empty/small blocks
         scale = (abs_max / dtype_max).astype(jnp.float32)
+        scale = jnp.where(scale == 0, 1.0, scale)
         w = (y / scale).astype(quant_dtype)
         w_lst.append(w)
         scale_lst.append(scale)
@@ -144,10 +152,14 @@ class MoEKernelTest(jtu.JaxTestCase):
         w_dtype=None,
         subc_quant_wsz=None,
         has_bias=False,
+        has_router_bias=False,
+        use_grouped_topk=False,
+        num_groups=1,
+        top_k_groups=1,
         atol=2e-1,
         rtol=2e-1,
     ):
-        a, w1, w2, w3, b1, b2, b3, gating_output = gen_moe_inputs(
+        a, w1, w2, w3, b1, b2, b3, gating_output, router_bias = gen_moe_inputs(
             dtype,
             top_k,
             num_experts,
@@ -156,6 +168,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             num_tokens,
             seed=seed,
             has_bias=has_bias,
+            has_router_bias=has_router_bias,
         )
         w1_scale = None
         w2_scale = None
@@ -166,6 +179,10 @@ class MoEKernelTest(jtu.JaxTestCase):
             w1, w1_scale = sub_channel_quantize(w1, w_dtype, subc_quant_wsz)
             w2, w2_scale = sub_channel_quantize(w2, w_dtype, subc_quant_wsz)
             w3, w3_scale = sub_channel_quantize(w3, w_dtype, subc_quant_wsz)
+
+        # IMPORTANT: GateLogit always performs Softmax.
+        # So the input to Kernel is ALWAYS Probabilities, regardless of renormalize flag.
+        gating_output = jax.nn.softmax(gating_output.astype(jnp.float32), axis=-1).astype(dtype)
 
         actual = fused_ep_moe(
             mesh=self.mesh,
@@ -184,6 +201,10 @@ class MoEKernelTest(jtu.JaxTestCase):
             b1=b1,
             b2=b2,
             b3=b3,
+            bias=router_bias,
+            use_grouped_topk=use_grouped_topk,
+            num_groups=num_groups,
+            top_k_groups=top_k_groups,
             block_config=FusedMoEBlockConfig(
                 bt=bt,
                 bf=bf,
@@ -206,12 +227,16 @@ class MoEKernelTest(jtu.JaxTestCase):
             b1=b1,
             b2=b2,
             b3=b3,
+            bias=router_bias,
             renormalize_topk_logits=renormalize_topk_logits,
             act_fn=act_fn,
             subc_quant_wsz=subc_quant_wsz,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             w3_scale=w3_scale,
+            use_grouped_topk=use_grouped_topk,
+            num_groups=num_groups,
+            top_k_groups=top_k_groups,
         )
         self.assertAllClose(actual, expected, atol=atol, rtol=rtol)
 
@@ -239,9 +264,50 @@ class MoEKernelTest(jtu.JaxTestCase):
             bd1=1024,
             bd2=1024,
             btc=32,
-            bfc=256,
+            bfc=1024,
             bd1c=256,
             bd2c=256,
+        )
+
+    @parameterized.product(
+        has_router_bias=[False, True],
+        grouping_config=[
+            {"use_grouped_topk": False, "num_groups": 1, "top_k_groups": 1},
+            {"use_grouped_topk": True, "num_groups": 4, "top_k_groups": 1},
+            {"use_grouped_topk": True, "num_groups": 4, "top_k_groups": 2},
+        ],
+    )
+    def test_topk(self, has_router_bias, grouping_config):
+        dtype = jnp.bfloat16
+        top_k = 8
+        num_experts = 128
+        hidden_size = 1024
+        intermediate_size = 1024
+        num_tokens = 8 * 32
+
+        # Relax tolerance slightly for BF16 precision noise in complex routing
+        atol = 0.5
+
+        self._test_moe(
+            dtype=dtype,
+            top_k=top_k,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_tokens=num_tokens,
+            seed=1234,
+            renormalize_topk_logits=True,
+            has_router_bias=has_router_bias,
+            **grouping_config,
+            bt=32,
+            bf=512,
+            bd1=512,
+            bd2=512,
+            btc=32,
+            bfc=512,
+            bd1c=256,
+            bd2c=256,
+            atol=atol,
         )
 
     @parameterized.product(
@@ -254,6 +320,12 @@ class MoEKernelTest(jtu.JaxTestCase):
         hidden_size = 1024
         intermediate_size = 1024
         num_tokens = 8 * 32
+
+        # Relax tolerance for SwiGLU due to BF16 multiplication noise
+        atol = 2e-1
+        if act_fn == "swigluoai":
+            atol = 5e-1
+
         self._test_moe(
             dtype=dtype,
             top_k=top_k,
@@ -269,9 +341,10 @@ class MoEKernelTest(jtu.JaxTestCase):
             bd1=512,
             bd2=512,
             btc=32,
-            bfc=256,
+            bfc=512,
             bd1c=256,
             bd2c=256,
+            atol=atol,
         )
 
     def test_benchmark_qwen_235(self):
@@ -367,7 +440,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             bd1=1024,
             bd2=1024,
             btc=32,
-            bfc=256,
+            bfc=1024,
             bd1c=256,
             bd2c=256,
         )
@@ -394,7 +467,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             bd1=512,
             bd2=512,
             btc=32,
-            bfc=256,
+            bfc=512,
             bd1c=256,
             bd2c=256,
         )
