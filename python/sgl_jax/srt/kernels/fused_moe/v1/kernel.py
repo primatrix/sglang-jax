@@ -1398,9 +1398,10 @@ def _fused_ep_moe_kernel(
             copy.wait()
 
             # 2. Init Accumulators
-            # 使用全 0 初始化，直接切片赋值
-            acc_tile_gate[...] = 0.0
-            acc_tile_up[...] = 0.0
+            # [Fix] 显式广播 0.0 到 (btc, bf) 形状，避免标量赋值报错
+            zeros = jnp.zeros((btc, bf), dtype=jnp.float32)
+            acc_tile_gate[:] = zeros
+            acc_tile_up[:] = zeros
 
             # 3. Compute
             for bd1c_id in range(cdiv(bd1, bd1c)):
@@ -1432,7 +1433,6 @@ def _fused_ep_moe_kernel(
 
                         acc_slices = (pl.ds(0, btc), pl.ds(bfc_id * bfc, bfc))
 
-                        # [Fix] 使用 += 和 = 代替 .at[].add/set
                         if should_init and p_id == bd1c_id == 0:
                             if b1_vmem is not None:
                                 b1_scale_slices = (pl.ds(0, 1), pl.ds(bfc_id * bfc, bfc))
@@ -1474,7 +1474,7 @@ def _fused_ep_moe_kernel(
                 )
                 copy1.start()
                 copy1.wait()
-                vmem_gate_ref[:] = vmem_gate_ref[:] + temp_ref[:]  # 这里用 [:] 显式全切片操作更安全
+                vmem_gate_ref[:] = vmem_gate_ref[:] + temp_ref[:]
                 copy2 = pltpu.make_async_copy(
                     src_ref=vmem_gate_ref, dst_ref=hbm_gate_ref, sem=local_sems.at[0, 1]
                 )
