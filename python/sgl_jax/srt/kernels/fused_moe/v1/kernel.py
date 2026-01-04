@@ -1392,20 +1392,23 @@ def _fused_ep_moe_kernel(
         num_loops = cdiv(dyn_sz, btc)
 
         def body(btc_id, _):
+            # [Fix] 确保循环内的偏移量也被视为对齐的。
+            # btc 通常是 16/32，满足 8 对齐。
             curr_offset = btc_id * btc
+            # 这里的 pl.multiple_of 是可选的，如果 btc 是常数且 %8==0 编译器通常能推导，
+            # 但加上更稳妥，特别是当 base_offset 已经是对齐的时候。
 
-            # [Fix] Construct dma_len structurally as (x * 8) to satisfy Mosaic compiler.
-            # 1. Calculate remaining length
+            # 计算 DMA 长度 (保持之前的逻辑)
             rem_len = dyn_sz - curr_offset
-            # 2. Calculate remaining "8-byte blocks" (Ceil Div 8)
             rem_blocks = (rem_len + 7) // 8
-            # 3. Clamp to max blocks in a tile (btc is usually 16 or 32, so btc // 8 is int)
             max_blocks = btc // 8
             use_blocks = lax.min(rem_blocks, max_blocks)
-            # 4. Multiply back by 8. This guarantees dma_len is a multiple of 8.
             dma_len = use_blocks * 8
 
             # 1. Load Input Tile
+            # base_offset 已经是 multiple_of(8)
+            # dma_len 是 multiple_of(8)
+            # 只要 curr_offset 也是，那就没问题。
             copy = pltpu.make_async_copy(
                 src_ref=a2a_s_hbm_ref.at[
                     pl.ds(base_offset + curr_offset, dma_len),
@@ -1418,12 +1421,12 @@ def _fused_ep_moe_kernel(
             copy.start()
             copy.wait()
 
-            # 2. Init Accumulators (Static full slice)
+            # 2. Init Accumulators
             zeros = jnp.zeros((btc, bf), dtype=jnp.float32)
             acc_tile_gate[...] = zeros
             acc_tile_up[...] = zeros
 
-            # 3. Compute (Static full slice)
+            # 3. Compute
             for bd1c_id in range(cdiv(bd1, bd1c)):
                 for p_id in range(t_packing):
                     t = t_tile_vmem[
@@ -1495,7 +1498,6 @@ def _fused_ep_moe_kernel(
                 copy1.start()
                 copy1.wait()
 
-                # Math on static full slice
                 acc_tile_gate[...] += acc_temp_vmem[...]
 
                 copy2 = pltpu.make_async_copy(
@@ -1541,7 +1543,6 @@ def _fused_ep_moe_kernel(
         def body(btc_id, _):
             curr_offset = btc_id * btc
 
-            # [Fix] Construct dma_len as (x * 8)
             rem_len = dyn_sz - curr_offset
             rem_blocks = (rem_len + 7) // 8
             max_blocks = btc // 8
@@ -1627,7 +1628,7 @@ def _fused_ep_moe_kernel(
                 copy1.start()
                 copy1.wait()
 
-                # Add (Static Math)
+                # Add
                 old_val_f = res_temp_vmem[...].astype(jnp.float32)
                 new_val_f = res_tile_vmem[...].astype(jnp.float32)
                 sum_val = (old_val_f + new_val_f).astype(t_dtype)
@@ -1649,7 +1650,12 @@ def _fused_ep_moe_kernel(
 
         # 获取当前 Expert 在 HBM 中的全局 Offset 和数据量
         e_id = my_id * local_num_experts + local_e_id
-        base_offset = expert_starts_x2_smem[bt_sem_id, 0, e_id]
+
+        # [Fix] 这里的 dyn_sz 和 base_offset 在 all_reduce_metadata 中已经被强制对齐到 8 了
+        # 但编译器不知道，所以我们需要用 pl.multiple_of 显式告知编译器
+        raw_base_offset = expert_starts_x2_smem[bt_sem_id, 0, e_id]
+        base_offset = pl.multiple_of(raw_base_offset, 8)
+
         dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
 
         # 获取 HBM Buffers 的引用 (Slice for current e_sem_id)
@@ -1704,7 +1710,7 @@ def _fused_ep_moe_kernel(
                     acc_tile_up=acc_tile_up,
                     dyn_sz=dyn_sz,
                     should_init=(bd1_id == 0),
-                    base_offset=base_offset,
+                    base_offset=base_offset,  # 传入已标记对齐的 offset
                 )
                 bw_sem_id = (bw_sem_id + 1) % 2
 
@@ -1736,7 +1742,7 @@ def _fused_ep_moe_kernel(
                     res_temp_vmem=res_temp_vmem,
                     dyn_sz=dyn_sz,
                     should_init=(bf_id == 0),
-                    base_offset=base_offset,
+                    base_offset=base_offset,  # 传入已标记对齐的 offset
                 )
                 bw_sem_id = (bw_sem_id + 1) % 2
 
