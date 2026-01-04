@@ -4,14 +4,14 @@ import time
 import jax
 import jax.numpy as jnp
 
-from python.sgl_jax.srt.configs.load_config import LoadConfig
-from python.sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
-from python.sgl_jax.srt.multimodal.configs.multimodal_model_configs import (
-    MultiModalModelConfigs,
-)
+from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_loader.loader import JAXModelLoader
+from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.configs.dits.configs import WanModelConfig
+from sgl_jax.srt.multimodal.configs.multimodal_model_configs import (
+    MultiModalModelConfigs,
+)
 from sgl_jax.srt.multimodal.manager.io_struct import VideoGenerationsRequest
 from sgl_jax.srt.multimodal.models.diffusion_solvers.unipc_multistep_scheduler import (
     UniPCMultistepScheduler,

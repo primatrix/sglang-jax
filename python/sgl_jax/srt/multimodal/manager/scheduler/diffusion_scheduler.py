@@ -1,7 +1,7 @@
 import jax.sharding
 
-from python.sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.managers.communication import CommunicationBackend
+from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.model_executor.diffusion.diffusion_model_worker import (
     DiffusionModelWorker,
 )

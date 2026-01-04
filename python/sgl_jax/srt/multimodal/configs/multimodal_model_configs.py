@@ -1,6 +1,6 @@
-from python.sgl_jax.srt.configs.model_config import ModelConfig
-from python.sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
-from python.sgl_jax.srt.multimodal.manager.utils import load_stage_configs_from_yaml
+from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
+from sgl_jax.srt.multimodal.manager.utils import load_stage_configs_from_yaml
 
 
 class MultiModalModelConfigs(ModelConfig):
