@@ -716,7 +716,6 @@ def _fused_ep_moe_kernel(
             sizes_vmem,
         ):
             offsets_vmem[...] = jnp.zeros_like(offsets_vmem)
-            # TODO(jevinjiang): check how slow is VMEM -> SMEM.
             offsets_copy = pltpu.async_copy(
                 src_ref=offsets_vmem,
                 dst_ref=expert_offsets_x2_smem.at[bt_sem_id],
@@ -728,13 +727,19 @@ def _fused_ep_moe_kernel(
                 dst_ref=t2e_routing_x2_smem.at[bt_sem_id],
                 sem=send_sem,
             )
-            reduced_sizes = sizes
-            reduced_starts = starts
+
+            # [Fix] 核心修改：对本地 size 进行 8 对齐，确保 starts 也是对齐的
+            # 保留原始 sizes 给 d2e_count (Gather 只需要传回有效数据)
+            aligned_local_sizes = (sizes + 7) // 8 * 8
+
+            reduced_sizes = aligned_local_sizes
+            reduced_starts = starts  # starts is initialized to 0
+
             row_id = my_id
             d2e_count_vmem[row_id] = sizes
+
             for i in range(num_devices - 1):
                 sync_barrier()
-                # TODO(jevinjiang): we can use double buffering to improve AR if needed.
                 pltpu.async_remote_copy(
                     src_ref=d2e_count_vmem.at[row_id],
                     dst_ref=d2e_count_vmem.at[row_id],
@@ -745,10 +750,17 @@ def _fused_ep_moe_kernel(
                 ).wait()
                 row_id = (row_id + num_devices - 1) % num_devices
                 new_sizes = d2e_count_vmem[row_id]
-                reduced_sizes += new_sizes
-                reduced_starts += lax.select(my_id > i, new_sizes, jnp.zeros_like(new_sizes))
+
+                # [Fix] 对远程 size 也进行 8 对齐累加
+                aligned_new_sizes = (new_sizes + 7) // 8 * 8
+
+                reduced_sizes += aligned_new_sizes
+                reduced_starts += lax.select(
+                    my_id > i, aligned_new_sizes, jnp.zeros_like(aligned_new_sizes)
+                )
+
             starts_vmem[...] = reduced_starts
-            sizes_vmem[...] = reduced_sizes
+            sizes_vmem[...] = reduced_sizes  # FFN 将基于对齐后的总长度运行
 
             starts_copy = pltpu.async_copy(
                 src_ref=starts_vmem,
@@ -761,8 +773,6 @@ def _fused_ep_moe_kernel(
                 sem=send_sem,
             )
 
-            # TODO(jevinjiang): if d2e_count is too big, we can store in HBM and fetch
-            # to SMEM partially.
             d2e_count_copy = pltpu.async_copy(
                 src_ref=d2e_count_vmem,
                 dst_ref=d2e_count_x2_smem.at[bt_sem_id],
@@ -1382,27 +1392,33 @@ def _fused_ep_moe_kernel(
 
         def body(btc_id, _):
             curr_offset = btc_id * btc
-            valid_len = lax.min(btc, dyn_sz - curr_offset)
+
+            # [Fix] 强制对齐 DMA 长度到 8，避免编译器报错
+            # 因为我们在 metadata 中已经做了 Padding，所以这里多读是安全的
+            real_len = lax.min(btc, dyn_sz - curr_offset)
+            dma_len = (real_len + 7) // 8 * 8
+            # 限制不超过 buffer 大小 (btc通常是16/32，是对齐的，但防御性编程)
+            dma_len = lax.min(dma_len, btc)
 
             # 1. Load Input Tile
             copy = pltpu.make_async_copy(
                 src_ref=a2a_s_hbm_ref.at[
-                    pl.ds(base_offset + curr_offset, valid_len),
+                    pl.ds(base_offset + curr_offset, dma_len),
                     pl.ds(0, t_packing),
                     pl.ds(0, bd1 // t_packing),
                 ],
-                dst_ref=t_tile_vmem.at[pl.ds(0, valid_len)],
+                dst_ref=t_tile_vmem.at[pl.ds(0, dma_len)],
                 sem=local_sems.at[0, 1],
             )
             copy.start()
             copy.wait()
 
-            # 2. Init Accumulators (使用全切片 [...])
+            # 2. Init Accumulators
             zeros = jnp.zeros((btc, bf), dtype=jnp.float32)
             acc_tile_gate[...] = zeros
             acc_tile_up[...] = zeros
 
-            # 3. Compute
+            # 3. Compute (全量计算，忽略 padding 部分的无效计算)
             for bd1c_id in range(cdiv(bd1, bd1c)):
                 for p_id in range(t_packing):
                     t = t_tile_vmem[
@@ -1449,12 +1465,11 @@ def _fused_ep_moe_kernel(
                             acc_tile_up[*acc_slices] += acc3
 
             # 4. RMW & Store
-            # DMA 引用使用动态切片，保证 HBM 读写不越界
-            hbm_gate_ref = acc_hbm_gate.at[pl.ds(base_offset + curr_offset, valid_len)]
-            hbm_up_ref = acc_hbm_up.at[pl.ds(base_offset + curr_offset, valid_len)]
-            vmem_gate_ref = acc_tile_gate.at[pl.ds(0, valid_len)]
-            vmem_up_ref = acc_tile_up.at[pl.ds(0, valid_len)]
-            temp_ref = acc_temp_vmem.at[pl.ds(0, valid_len)]
+            hbm_gate_ref = acc_hbm_gate.at[pl.ds(base_offset + curr_offset, dma_len)]
+            hbm_up_ref = acc_hbm_up.at[pl.ds(base_offset + curr_offset, dma_len)]
+            vmem_gate_ref = acc_tile_gate.at[pl.ds(0, dma_len)]
+            vmem_up_ref = acc_tile_up.at[pl.ds(0, dma_len)]
+            temp_ref = acc_temp_vmem.at[pl.ds(0, dma_len)]
 
             if should_init:
                 copy1 = pltpu.make_async_copy(
@@ -1469,30 +1484,26 @@ def _fused_ep_moe_kernel(
                 copy2.wait()
             else:
                 # Gate RMW
-                # 1. Load: HBM -> Temp (动态长度)
                 copy1 = pltpu.make_async_copy(
                     src_ref=hbm_gate_ref, dst_ref=temp_ref, sem=local_sems.at[0, 1]
                 )
                 copy1.start()
                 copy1.wait()
-
-                # 2. Add: Tile + Temp (使用全静态长度，避免动态 shape 错误)
-                # acc_tile_gate 和 acc_temp_vmem 都是 (btc, bf) 的静态 shape
+                # [Fix] 算术运算使用静态全切片 [...]，避免动态 Shape 错误
                 acc_tile_gate[...] += acc_temp_vmem[...]
 
-                # 3. Store: Tile -> HBM (动态长度)
                 copy2 = pltpu.make_async_copy(
                     src_ref=vmem_gate_ref, dst_ref=hbm_gate_ref, sem=local_sems.at[0, 1]
                 )
                 copy2.start()
 
-                # Up RMW (同理)
+                # Up RMW
                 copy3 = pltpu.make_async_copy(
                     src_ref=hbm_up_ref, dst_ref=temp_ref, sem=local_sems.at[0, 1]
                 )
                 copy3.start()
-                copy2.wait()  # Wait for previous Gate Store
-                copy3.wait()  # Wait for current Up Load
+                copy2.wait()
+                copy3.wait()
 
                 acc_tile_up[...] += acc_temp_vmem[...]
 
@@ -1523,17 +1534,21 @@ def _fused_ep_moe_kernel(
 
         def body(btc_id, _):
             curr_offset = btc_id * btc
-            valid_len = lax.min(btc, dyn_sz - curr_offset)
+
+            # [Fix] 对齐 DMA 长度到 8
+            real_len = lax.min(btc, dyn_sz - curr_offset)
+            dma_len = (real_len + 7) // 8 * 8
+            dma_len = lax.min(dma_len, btc)
 
             # 1. Load Accumulators
             pltpu.make_async_copy(
-                src_ref=acc_hbm_gate.at[pl.ds(base_offset + curr_offset, valid_len)],
-                dst_ref=acc_tile_gate.at[pl.ds(0, valid_len)],
+                src_ref=acc_hbm_gate.at[pl.ds(base_offset + curr_offset, dma_len)],
+                dst_ref=acc_tile_gate.at[pl.ds(0, dma_len)],
                 sem=local_sems.at[0, 1],
             ).start()
             copy1 = pltpu.make_async_copy(
-                src_ref=acc_hbm_up.at[pl.ds(base_offset + curr_offset, valid_len)],
-                dst_ref=acc_tile_up.at[pl.ds(0, valid_len)],
+                src_ref=acc_hbm_up.at[pl.ds(base_offset + curr_offset, dma_len)],
+                dst_ref=acc_tile_up.at[pl.ds(0, dma_len)],
                 sem=local_sems.at[0, 1],
             )
             copy1.start()
@@ -1583,12 +1598,12 @@ def _fused_ep_moe_kernel(
 
             # 3. RMW & Store
             hbm_dst_ref = a2a_s_acc_hbm_ref.at[
-                pl.ds(base_offset + curr_offset, valid_len),
+                pl.ds(base_offset + curr_offset, dma_len),
                 pl.ds(0, t_packing),
                 pl.ds(0, bd2_per_t_packing),
             ]
-            vmem_src_ref = res_tile_vmem.at[pl.ds(0, valid_len)]
-            temp_ref = res_temp_vmem.at[pl.ds(0, valid_len)]
+            vmem_src_ref = res_tile_vmem.at[pl.ds(0, dma_len)]
+            temp_ref = res_temp_vmem.at[pl.ds(0, dma_len)]
 
             if should_init:
                 copy1 = pltpu.make_async_copy(
@@ -1597,7 +1612,7 @@ def _fused_ep_moe_kernel(
                 copy1.start()
                 copy1.wait()
             else:
-                # Load Old (Dynamic DMA)
+                # Load Old
                 copy1 = pltpu.make_async_copy(
                     src_ref=hbm_dst_ref, dst_ref=temp_ref, sem=local_sems.at[0, 1]
                 )
@@ -1605,14 +1620,13 @@ def _fused_ep_moe_kernel(
                 copy1.wait()
 
                 # Add (Static Math)
-                # 使用整个静态 buffer 进行计算
                 old_val_f = res_temp_vmem[...].astype(jnp.float32)
                 new_val_f = res_tile_vmem[...].astype(jnp.float32)
                 sum_val = (old_val_f + new_val_f).astype(t_dtype)
 
                 res_tile_vmem[...] = sum_val
 
-                # Store New (Dynamic DMA)
+                # Store New
                 copy2 = pltpu.make_async_copy(
                     src_ref=vmem_src_ref, dst_ref=hbm_dst_ref, sem=local_sems.at[0, 1]
                 )
