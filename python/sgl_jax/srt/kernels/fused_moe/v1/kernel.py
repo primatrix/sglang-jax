@@ -1397,7 +1397,7 @@ def _fused_ep_moe_kernel(
             copy.start()
             copy.wait()
 
-            # 2. Init Accumulators
+            # 2. Init Accumulators (使用全切片 [...])
             zeros = jnp.zeros((btc, bf), dtype=jnp.float32)
             acc_tile_gate[...] = zeros
             acc_tile_up[...] = zeros
@@ -1449,6 +1449,7 @@ def _fused_ep_moe_kernel(
                             acc_tile_up[*acc_slices] += acc3
 
             # 4. RMW & Store
+            # DMA 引用使用动态切片，保证 HBM 读写不越界
             hbm_gate_ref = acc_hbm_gate.at[pl.ds(base_offset + curr_offset, valid_len)]
             hbm_up_ref = acc_hbm_up.at[pl.ds(base_offset + curr_offset, valid_len)]
             vmem_gate_ref = acc_tile_gate.at[pl.ds(0, valid_len)]
@@ -1468,27 +1469,33 @@ def _fused_ep_moe_kernel(
                 copy2.wait()
             else:
                 # Gate RMW
+                # 1. Load: HBM -> Temp (动态长度)
                 copy1 = pltpu.make_async_copy(
                     src_ref=hbm_gate_ref, dst_ref=temp_ref, sem=local_sems.at[0, 1]
                 )
                 copy1.start()
                 copy1.wait()
-                # [Fix] 使用 [...] 代替 [:]
-                vmem_gate_ref[...] = vmem_gate_ref[...] + temp_ref[...]
+
+                # 2. Add: Tile + Temp (使用全静态长度，避免动态 shape 错误)
+                # acc_tile_gate 和 acc_temp_vmem 都是 (btc, bf) 的静态 shape
+                acc_tile_gate[...] += acc_temp_vmem[...]
+
+                # 3. Store: Tile -> HBM (动态长度)
                 copy2 = pltpu.make_async_copy(
                     src_ref=vmem_gate_ref, dst_ref=hbm_gate_ref, sem=local_sems.at[0, 1]
                 )
                 copy2.start()
 
-                # Up RMW
+                # Up RMW (同理)
                 copy3 = pltpu.make_async_copy(
                     src_ref=hbm_up_ref, dst_ref=temp_ref, sem=local_sems.at[0, 1]
                 )
                 copy3.start()
-                copy2.wait()
-                copy3.wait()
-                # [Fix] 使用 [...] 代替 [:]
-                vmem_up_ref[...] = vmem_up_ref[...] + temp_ref[...]
+                copy2.wait()  # Wait for previous Gate Store
+                copy3.wait()  # Wait for current Up Load
+
+                acc_tile_up[...] += acc_temp_vmem[...]
+
                 copy4 = pltpu.make_async_copy(
                     src_ref=vmem_up_ref, dst_ref=hbm_up_ref, sem=local_sems.at[0, 1]
                 )
@@ -1590,24 +1597,22 @@ def _fused_ep_moe_kernel(
                 copy1.start()
                 copy1.wait()
             else:
-                # Load Old
+                # Load Old (Dynamic DMA)
                 copy1 = pltpu.make_async_copy(
                     src_ref=hbm_dst_ref, dst_ref=temp_ref, sem=local_sems.at[0, 1]
                 )
                 copy1.start()
                 copy1.wait()
 
-                # Add
-                old_val = temp_ref.get()
-                new_val = vmem_src_ref.get()
-                old_val_f = old_val.astype(jnp.float32)
-                new_val_f = new_val.astype(jnp.float32)
+                # Add (Static Math)
+                # 使用整个静态 buffer 进行计算
+                old_val_f = res_temp_vmem[...].astype(jnp.float32)
+                new_val_f = res_tile_vmem[...].astype(jnp.float32)
                 sum_val = (old_val_f + new_val_f).astype(t_dtype)
 
-                # [Fix] 使用 [...] 代替 [:]
-                vmem_src_ref[...] = sum_val
+                res_tile_vmem[...] = sum_val
 
-                # Store New
+                # Store New (Dynamic DMA)
                 copy2 = pltpu.make_async_copy(
                     src_ref=vmem_src_ref, dst_ref=hbm_dst_ref, sem=local_sems.at[0, 1]
                 )
