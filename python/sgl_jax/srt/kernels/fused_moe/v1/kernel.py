@@ -1385,7 +1385,7 @@ def _fused_ep_moe_kernel(
             valid_len = lax.min(btc, dyn_sz - curr_offset)
 
             # [修复] 3D 索引加载，完美匹配 HBM 结构
-            pltpu.make_async_copy(
+            copy = pltpu.make_async_copy(
                 src_ref=a2a_s_hbm_ref.at[
                     pl.ds(base_offset + curr_offset, valid_len),
                     pl.ds(0, t_packing),  # 显式切分 Packing 维
@@ -1393,8 +1393,9 @@ def _fused_ep_moe_kernel(
                 ],
                 dst_ref=t_tile_vmem.at[pl.ds(0, valid_len)],
                 sem=local_sems.at[0, 1],
-            ).start()
-            pltpu.semaphore_wait(local_sems.at[0, 1], 1)
+            )
+            copy.start()
+            copy.wait()
 
             # Init Accumulators
             acc_tile_gate[...] = jnp.zeros_like(acc_tile_gate)
@@ -1457,35 +1458,42 @@ def _fused_ep_moe_kernel(
             temp_ref = acc_temp_vmem.at[pl.ds(0, valid_len)]
 
             if should_init:
-                pltpu.make_async_copy(
+                copy1 = pltpu.make_async_copy(
                     src_ref=vmem_gate_ref, dst_ref=hbm_gate_ref, sem=local_sems.at[0, 1]
-                ).start()
-                pltpu.make_async_copy(
+                )
+                copy1.start()
+                copy2 = pltpu.make_async_copy(
                     src_ref=vmem_up_ref, dst_ref=hbm_up_ref, sem=local_sems.at[0, 1]
-                ).start()
-                pltpu.semaphore_wait(local_sems.at[0, 1], 2)
+                )
+                copy2.start()
+                copy1.wait()
+                copy2.wait()
             else:
                 # Gate RMW
-                pltpu.make_async_copy(
+                copy1 = pltpu.make_async_copy(
                     src_ref=hbm_gate_ref, dst_ref=temp_ref, sem=local_sems.at[0, 1]
-                ).start()
-                pltpu.semaphore_wait(local_sems.at[0, 1], 1)
+                )
+                copy1.start()
+                copy1.wait()
                 vmem_gate_ref.set(vmem_gate_ref.get() + temp_ref.get())
-                pltpu.make_async_copy(
+                copy2 = pltpu.make_async_copy(
                     src_ref=vmem_gate_ref, dst_ref=hbm_gate_ref, sem=local_sems.at[0, 1]
-                ).start()
+                )
+                copy2.start()
 
                 # Up RMW
-                pltpu.make_async_copy(
+                copy3 = pltpu.make_async_copy(
                     src_ref=hbm_up_ref, dst_ref=temp_ref, sem=local_sems.at[0, 1]
-                ).start()
-                pltpu.semaphore_wait(local_sems.at[0, 1], 2)  # Wait for Gate Store + Up Load
+                )
+                copy3.start()
+                copy2.wait()
+                copy3.wait()
                 vmem_up_ref.set(vmem_up_ref.get() + temp_ref.get())
-                pltpu.make_async_copy(
+                copy4 = pltpu.make_async_copy(
                     src_ref=vmem_up_ref, dst_ref=hbm_up_ref, sem=local_sems.at[0, 1]
-                ).start()
-
-                pltpu.semaphore_wait(local_sems.at[0, 1], 1)
+                )
+                copy4.start()
+                copy4.wait()
 
         lax.fori_loop(0, num_loops, body, None)
 
@@ -1516,12 +1524,13 @@ def _fused_ep_moe_kernel(
                 dst_ref=acc_tile_gate.at[pl.ds(0, valid_len)],
                 sem=local_sems.at[0, 1],
             ).start()
-            pltpu.make_async_copy(
+            copy1 = pltpu.make_async_copy(
                 src_ref=acc_hbm_up.at[pl.ds(base_offset + curr_offset, valid_len)],
                 dst_ref=acc_tile_up.at[pl.ds(0, valid_len)],
                 sem=local_sems.at[0, 1],
-            ).start()
-            pltpu.semaphore_wait(local_sems.at[0, 1], 2)
+            )
+            copy1.start()
+            copy1.wait()
 
             # 2. Compute (不变)
             for bd2c_id in range(cdiv(bd2, bd2c)):
@@ -1578,18 +1587,20 @@ def _fused_ep_moe_kernel(
 
             if should_init:
                 # Overwrite
-                pltpu.make_async_copy(
+                copy1 = pltpu.make_async_copy(
                     src_ref=vmem_src_ref, dst_ref=hbm_dst_ref, sem=local_sems.at[0, 1]
-                ).start()
-                pltpu.semaphore_wait(local_sems.at[0, 1], 1)
+                )
+                copy1.start()
+                copy1.wait()
             else:
                 # RMW: Load -> Add -> Store
 
                 # A. Load HBM (Old Value) -> Temp VMEM
-                pltpu.make_async_copy(
+                copy1 = pltpu.make_async_copy(
                     src_ref=hbm_dst_ref, dst_ref=temp_ref, sem=local_sems.at[0, 1]
-                ).start()
-                pltpu.semaphore_wait(local_sems.at[0, 1], 1)
+                )
+                copy1.start()
+                copy1.wait()
 
                 # B. Add: New (res_tile) + Old (temp) -> New (res_tile)
                 # 直接在 t_dtype 上加 (如果 t_dtype 是 float/bfloat)，或者需要 bitcast float 做加法
@@ -1606,10 +1617,11 @@ def _fused_ep_moe_kernel(
                 vmem_src_ref.set(sum_val)
 
                 # C. Store New -> HBM
-                pltpu.make_async_copy(
+                copy2 = pltpu.make_async_copy(
                     src_ref=vmem_src_ref, dst_ref=hbm_dst_ref, sem=local_sems.at[0, 1]
-                ).start()
-                pltpu.semaphore_wait(local_sems.at[0, 1], 1)
+                )
+                copy2.start()
+                copy2.wait()
 
         lax.fori_loop(0, num_loops, body, None)
 
