@@ -292,7 +292,7 @@ class WanI2VCrossAttention(WanSelfAttention):
         self.norm_added_k = RMSNorm(dim, epsilon=epsilon)
         self.norm_added_q = RMSNorm(dim, epsilon=epsilon)
 
-    def call(self, x, context, context_lens):
+    def __call__(self, x, context, context_lens):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -374,7 +374,7 @@ class WanTransformer3DModel:
         )
         pass
 
-    def call(
+    def __call__(
         self,
         hidden_states: jax.Array,
         encoder_hidden_states: jax.Array | list[jax.Array],
