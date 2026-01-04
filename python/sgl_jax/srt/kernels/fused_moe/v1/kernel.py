@@ -1390,6 +1390,7 @@ def _fused_ep_moe_kernel(
         base_offset,
     ):
         num_loops = cdiv(dyn_sz, btc)
+        FFN1_SEM_IDX = 9 if w1_shared is not None else 5
 
         def body(btc_id, _):
             # [Fix] 确保循环内的偏移量也被视为对齐的。
@@ -1416,7 +1417,7 @@ def _fused_ep_moe_kernel(
                     pl.ds(0, bd1 // t_packing),
                 ],
                 dst_ref=t_tile_vmem.at[pl.ds(0, dma_len)],
-                sem=local_sems.at[0, 1],
+                sem=local_sems.at[0, FFN1_SEM_IDX],
             )
             copy.start()
             copy.wait()
@@ -1481,11 +1482,11 @@ def _fused_ep_moe_kernel(
 
             if should_init:
                 copy1 = pltpu.make_async_copy(
-                    src_ref=vmem_gate_ref, dst_ref=hbm_gate_ref, sem=local_sems.at[0, 1]
+                    src_ref=vmem_gate_ref, dst_ref=hbm_gate_ref, sem=local_sems.at[0, FFN1_SEM_IDX]
                 )
                 copy1.start()
                 copy2 = pltpu.make_async_copy(
-                    src_ref=vmem_up_ref, dst_ref=hbm_up_ref, sem=local_sems.at[0, 1]
+                    src_ref=vmem_up_ref, dst_ref=hbm_up_ref, sem=local_sems.at[0, FFN1_SEM_IDX]
                 )
                 copy2.start()
                 copy1.wait()
@@ -1493,7 +1494,7 @@ def _fused_ep_moe_kernel(
             else:
                 # Gate RMW
                 copy1 = pltpu.make_async_copy(
-                    src_ref=hbm_gate_ref, dst_ref=temp_ref, sem=local_sems.at[0, 1]
+                    src_ref=hbm_gate_ref, dst_ref=temp_ref, sem=local_sems.at[0, FFN1_SEM_IDX]
                 )
                 copy1.start()
                 copy1.wait()
@@ -1501,13 +1502,13 @@ def _fused_ep_moe_kernel(
                 acc_tile_gate[...] += acc_temp_vmem[...]
 
                 copy2 = pltpu.make_async_copy(
-                    src_ref=vmem_gate_ref, dst_ref=hbm_gate_ref, sem=local_sems.at[0, 1]
+                    src_ref=vmem_gate_ref, dst_ref=hbm_gate_ref, sem=local_sems.at[0, FFN1_SEM_IDX]
                 )
                 copy2.start()
 
                 # Up RMW
                 copy3 = pltpu.make_async_copy(
-                    src_ref=hbm_up_ref, dst_ref=temp_ref, sem=local_sems.at[0, 1]
+                    src_ref=hbm_up_ref, dst_ref=temp_ref, sem=local_sems.at[0, FFN1_SEM_IDX]
                 )
                 copy3.start()
                 copy2.wait()
@@ -1516,7 +1517,7 @@ def _fused_ep_moe_kernel(
                 acc_tile_up[...] += acc_temp_vmem[...]
 
                 copy4 = pltpu.make_async_copy(
-                    src_ref=vmem_up_ref, dst_ref=hbm_up_ref, sem=local_sems.at[0, 1]
+                    src_ref=vmem_up_ref, dst_ref=hbm_up_ref, sem=local_sems.at[0, FFN1_SEM_IDX]
                 )
                 copy4.start()
                 copy4.wait()
@@ -1539,6 +1540,7 @@ def _fused_ep_moe_kernel(
         base_offset,
     ):
         num_loops = cdiv(dyn_sz, btc)
+        FFN2_SEM_IDX = 10 if w1_shared is not None else 6
 
         def body(btc_id, _):
             curr_offset = btc_id * btc
@@ -1553,12 +1555,12 @@ def _fused_ep_moe_kernel(
             pltpu.make_async_copy(
                 src_ref=acc_hbm_gate.at[pl.ds(base_offset + curr_offset, dma_len)],
                 dst_ref=acc_tile_gate.at[pl.ds(0, dma_len)],
-                sem=local_sems.at[0, 1],
+                sem=local_sems.at[0, FFN2_SEM_IDX],
             ).start()
             copy1 = pltpu.make_async_copy(
                 src_ref=acc_hbm_up.at[pl.ds(base_offset + curr_offset, dma_len)],
                 dst_ref=acc_tile_up.at[pl.ds(0, dma_len)],
-                sem=local_sems.at[0, 1],
+                sem=local_sems.at[0, FFN2_SEM_IDX],
             )
             copy1.start()
             copy1.wait()
@@ -1616,14 +1618,14 @@ def _fused_ep_moe_kernel(
 
             if should_init:
                 copy1 = pltpu.make_async_copy(
-                    src_ref=vmem_src_ref, dst_ref=hbm_dst_ref, sem=local_sems.at[0, 1]
+                    src_ref=vmem_src_ref, dst_ref=hbm_dst_ref, sem=local_sems.at[0, FFN2_SEM_IDX]
                 )
                 copy1.start()
                 copy1.wait()
             else:
                 # Load Old
                 copy1 = pltpu.make_async_copy(
-                    src_ref=hbm_dst_ref, dst_ref=temp_ref, sem=local_sems.at[0, 1]
+                    src_ref=hbm_dst_ref, dst_ref=temp_ref, sem=local_sems.at[0, FFN2_SEM_IDX]
                 )
                 copy1.start()
                 copy1.wait()
@@ -1637,7 +1639,7 @@ def _fused_ep_moe_kernel(
 
                 # Store New
                 copy2 = pltpu.make_async_copy(
-                    src_ref=vmem_src_ref, dst_ref=hbm_dst_ref, sem=local_sems.at[0, 1]
+                    src_ref=vmem_src_ref, dst_ref=hbm_dst_ref, sem=local_sems.at[0, FFN2_SEM_IDX]
                 )
                 copy2.start()
                 copy2.wait()
@@ -2367,7 +2369,7 @@ def fused_ep_moe(
         b2_scratch,  # b_b2_x2_vmem
         (None if bias is None else pltpu.VMEM((padded_num_experts,), jnp.float32)),  # bias
         # Semaphores.
-        pltpu.SemaphoreType.DMA((2, 9 if w1_shared is not None else 5)),  # local_sems
+        pltpu.SemaphoreType.DMA((2, 11 if w1_shared is not None else 7)),  # local_sems
         pltpu.SemaphoreType.DMA((2,)),  # send_sems
         pltpu.SemaphoreType.DMA((2,)),  # recv_sems
         pltpu.SemaphoreType.DMA,  # a2a_gather_sem
