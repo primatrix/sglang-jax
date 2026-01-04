@@ -1373,7 +1373,7 @@ def _fused_ep_moe_kernel(
         acc_hbm_up,
         acc_tile_gate,
         acc_tile_up,
-        acc_temp_vmem,  # [新增]
+        acc_temp_vmem,
         dyn_sz,
         should_init,
         base_offset,
@@ -1384,12 +1384,12 @@ def _fused_ep_moe_kernel(
             curr_offset = btc_id * btc
             valid_len = lax.min(btc, dyn_sz - curr_offset)
 
-            # [修复] 3D 索引加载，完美匹配 HBM 结构
+            # 1. Load Input Tile
             copy = pltpu.make_async_copy(
                 src_ref=a2a_s_hbm_ref.at[
                     pl.ds(base_offset + curr_offset, valid_len),
-                    pl.ds(0, t_packing),  # 显式切分 Packing 维
-                    pl.ds(0, bd1 // t_packing),  # 显式切分 Feature 维
+                    pl.ds(0, t_packing),
+                    pl.ds(0, bd1 // t_packing),
                 ],
                 dst_ref=t_tile_vmem.at[pl.ds(0, valid_len)],
                 sem=local_sems.at[0, 1],
@@ -1397,17 +1397,17 @@ def _fused_ep_moe_kernel(
             copy.start()
             copy.wait()
 
-            # Init Accumulators
-            acc_tile_gate[...] = jnp.zeros_like(acc_tile_gate)
-            acc_tile_up[...] = jnp.zeros_like(acc_tile_up)
+            # 2. Init Accumulators
+            # 使用全 0 初始化，直接切片赋值
+            acc_tile_gate[...] = 0.0
+            acc_tile_up[...] = 0.0
 
+            # 3. Compute
             for bd1c_id in range(cdiv(bd1, bd1c)):
-                # [修复] 直接通过 p_id 索引，无需 bitcast/shift
                 for p_id in range(t_packing):
                     t = t_tile_vmem[
                         pl.ds(0, btc), p_id, pl.ds(bd1c_id * bd1c_per_t_packing, bd1c_per_t_packing)
                     ]
-                    # t 现在是正确类型的 unpacked 数据
 
                     for bfc_id in range(cdiv(bf, bfc)):
                         w_slices = (
@@ -1416,7 +1416,6 @@ def _fused_ep_moe_kernel(
                             pl.ds(bfc_id * bfc, bfc),
                         )
 
-                        # Compute Gate
                         w1 = w1_vmem[*w_slices]
                         acc1 = jnp.dot(t, w1, preferred_element_type=jnp.float32)
                         if w1_scale_vmem is not None:
@@ -1424,7 +1423,6 @@ def _fused_ep_moe_kernel(
                             w1_scale = jnp.broadcast_to(w1_scale_vmem[*w1_scale_slices], acc1.shape)
                             acc1 *= w1_scale
 
-                        # Compute Up
                         w3 = w3_vmem[*w_slices]
                         acc3 = jnp.dot(t, w3, preferred_element_type=jnp.float32)
                         if w3_scale_vmem is not None:
@@ -1434,6 +1432,7 @@ def _fused_ep_moe_kernel(
 
                         acc_slices = (pl.ds(0, btc), pl.ds(bfc_id * bfc, bfc))
 
+                        # [Fix] 使用 += 和 = 代替 .at[].add/set
                         if should_init and p_id == bd1c_id == 0:
                             if b1_vmem is not None:
                                 b1_scale_slices = (pl.ds(0, 1), pl.ds(bfc_id * bfc, bfc))
@@ -1443,18 +1442,18 @@ def _fused_ep_moe_kernel(
                                 b3_scale_slices = (pl.ds(0, 1), pl.ds(bfc_id * bfc, bfc))
                                 b3_val = jnp.broadcast_to(b3_vmem[*b3_scale_slices], acc3.shape)
                                 acc3 += b3_val
-                            acc_tile_gate.at[*acc_slices].set(acc1)
-                            acc_tile_up.at[*acc_slices].set(acc3)
-                        else:
-                            acc_tile_gate.at[*acc_slices].add(acc1)
-                            acc_tile_up.at[*acc_slices].add(acc3)
 
-            # --- RMW with Temp Buffer ---
+                            acc_tile_gate[*acc_slices] = acc1
+                            acc_tile_up[*acc_slices] = acc3
+                        else:
+                            acc_tile_gate[*acc_slices] += acc1
+                            acc_tile_up[*acc_slices] += acc3
+
+            # 4. RMW & Store
             hbm_gate_ref = acc_hbm_gate.at[pl.ds(base_offset + curr_offset, valid_len)]
             hbm_up_ref = acc_hbm_up.at[pl.ds(base_offset + curr_offset, valid_len)]
             vmem_gate_ref = acc_tile_gate.at[pl.ds(0, valid_len)]
             vmem_up_ref = acc_tile_up.at[pl.ds(0, valid_len)]
-            # [修复] 使用专用的 acc_temp_vmem
             temp_ref = acc_temp_vmem.at[pl.ds(0, valid_len)]
 
             if should_init:
@@ -1475,7 +1474,7 @@ def _fused_ep_moe_kernel(
                 )
                 copy1.start()
                 copy1.wait()
-                vmem_gate_ref.set(vmem_gate_ref.get() + temp_ref.get())
+                vmem_gate_ref[:] = vmem_gate_ref[:] + temp_ref[:]  # 这里用 [:] 显式全切片操作更安全
                 copy2 = pltpu.make_async_copy(
                     src_ref=vmem_gate_ref, dst_ref=hbm_gate_ref, sem=local_sems.at[0, 1]
                 )
@@ -1486,9 +1485,9 @@ def _fused_ep_moe_kernel(
                     src_ref=hbm_up_ref, dst_ref=temp_ref, sem=local_sems.at[0, 1]
                 )
                 copy3.start()
-                copy2.wait()
-                copy3.wait()
-                vmem_up_ref.set(vmem_up_ref.get() + temp_ref.get())
+                copy2.wait()  # Wait for previous Gate Store
+                copy3.wait()  # Wait for current Up Load
+                vmem_up_ref[:] = vmem_up_ref[:] + temp_ref[:]
                 copy4 = pltpu.make_async_copy(
                     src_ref=vmem_up_ref, dst_ref=hbm_up_ref, sem=local_sems.at[0, 1]
                 )
@@ -1507,7 +1506,7 @@ def _fused_ep_moe_kernel(
         b2_vmem,
         a2a_s_acc_hbm_ref,
         res_tile_vmem,
-        res_temp_vmem,  # <--- [修改] 传入正确的 Temp Buffer
+        res_temp_vmem,
         dyn_sz,
         should_init,
         base_offset,
@@ -1518,7 +1517,7 @@ def _fused_ep_moe_kernel(
             curr_offset = btc_id * btc
             valid_len = lax.min(btc, dyn_sz - curr_offset)
 
-            # 1. Load Accumulators (不变)
+            # 1. Load Accumulators
             pltpu.make_async_copy(
                 src_ref=acc_hbm_gate.at[pl.ds(base_offset + curr_offset, valid_len)],
                 dst_ref=acc_tile_gate.at[pl.ds(0, valid_len)],
@@ -1532,7 +1531,7 @@ def _fused_ep_moe_kernel(
             copy1.start()
             copy1.wait()
 
-            # 2. Compute (不变)
+            # 2. Compute
             for bd2c_id in range(cdiv(bd2, bd2c)):
                 for p_id in range(t_packing):
                     res = jnp.zeros((btc, bd2c_per_t_packing), dtype=jnp.float32)
@@ -1570,53 +1569,44 @@ def _fused_ep_moe_kernel(
                             acc *= w2_scale
                         res += acc
 
-                    res_tile_vmem.at[
+                    # [Fix] 使用 = 代替 .at[].set
+                    res_tile_vmem[
                         pl.ds(0, btc), p_id, pl.ds(bd2c_id * bd2c_per_t_packing, bd2c_per_t_packing)
-                    ].set(res.astype(t_dtype))
+                    ] = res.astype(t_dtype)
 
-            # --- 3. HBM Store / RMW (修正逻辑) ---
+            # 3. RMW & Store
             hbm_dst_ref = a2a_s_acc_hbm_ref.at[
                 pl.ds(base_offset + curr_offset, valid_len),
                 pl.ds(0, t_packing),
                 pl.ds(0, bd2_per_t_packing),
             ]
             vmem_src_ref = res_tile_vmem.at[pl.ds(0, valid_len)]
-
-            # [修正] 使用 res_temp_vmem，它的 shape/dtype 与 vmem_src_ref 完全一致
             temp_ref = res_temp_vmem.at[pl.ds(0, valid_len)]
 
             if should_init:
-                # Overwrite
                 copy1 = pltpu.make_async_copy(
                     src_ref=vmem_src_ref, dst_ref=hbm_dst_ref, sem=local_sems.at[0, 1]
                 )
                 copy1.start()
                 copy1.wait()
             else:
-                # RMW: Load -> Add -> Store
-
-                # A. Load HBM (Old Value) -> Temp VMEM
+                # Load Old
                 copy1 = pltpu.make_async_copy(
                     src_ref=hbm_dst_ref, dst_ref=temp_ref, sem=local_sems.at[0, 1]
                 )
                 copy1.start()
                 copy1.wait()
 
-                # B. Add: New (res_tile) + Old (temp) -> New (res_tile)
-                # 直接在 t_dtype 上加 (如果 t_dtype 是 float/bfloat)，或者需要 bitcast float 做加法
-                # 假设 t_dtype 支持直接加法 (Jax Pallas 行为)，或者为了安全转 float 加
+                # Add (Safe bitcast add)
                 old_val = temp_ref.get()
                 new_val = vmem_src_ref.get()
-
-                # 安全做法：转 float32 加，再转回 t_dtype
-                # 注意：这里维度是 3D (btc, packing, dim)，需要正确 bitcast
                 old_val_f = old_val.astype(jnp.float32)
                 new_val_f = new_val.astype(jnp.float32)
                 sum_val = (old_val_f + new_val_f).astype(t_dtype)
 
-                vmem_src_ref.set(sum_val)
+                vmem_src_ref[:] = sum_val  # [Fix] 原地更新
 
-                # C. Store New -> HBM
+                # Store New
                 copy2 = pltpu.make_async_copy(
                     src_ref=vmem_src_ref, dst_ref=hbm_dst_ref, sem=local_sems.at[0, 1]
                 )
