@@ -1485,11 +1485,11 @@ def _fused_ep_moe_kernel(
                     src_ref=vmem_gate_ref, dst_ref=hbm_gate_ref, sem=local_sems.at[0, FFN1_SEM_IDX]
                 )
                 copy1.start()
+                copy1.wait()
                 copy2 = pltpu.make_async_copy(
                     src_ref=vmem_up_ref, dst_ref=hbm_up_ref, sem=local_sems.at[0, FFN1_SEM_IDX]
                 )
                 copy2.start()
-                copy1.wait()
                 copy2.wait()
             else:
                 # Gate RMW
@@ -1505,13 +1505,12 @@ def _fused_ep_moe_kernel(
                     src_ref=vmem_gate_ref, dst_ref=hbm_gate_ref, sem=local_sems.at[0, FFN1_SEM_IDX]
                 )
                 copy2.start()
-
+                copy2.wait()
                 # Up RMW
                 copy3 = pltpu.make_async_copy(
                     src_ref=hbm_up_ref, dst_ref=temp_ref, sem=local_sems.at[0, FFN1_SEM_IDX]
                 )
                 copy3.start()
-                copy2.wait()
                 copy3.wait()
 
                 acc_tile_up[...] += acc_temp_vmem[...]
@@ -1552,18 +1551,20 @@ def _fused_ep_moe_kernel(
             dma_len = use_blocks * 8
 
             # 1. Load Accumulators
-            pltpu.make_async_copy(
+            copy1 = pltpu.make_async_copy(
                 src_ref=acc_hbm_gate.at[pl.ds(base_offset + curr_offset, dma_len)],
                 dst_ref=acc_tile_gate.at[pl.ds(0, dma_len)],
-                sem=local_sems.at[0, FFN2_SEM_IDX],
-            ).start()
-            copy1 = pltpu.make_async_copy(
-                src_ref=acc_hbm_up.at[pl.ds(base_offset + curr_offset, dma_len)],
-                dst_ref=acc_tile_up.at[pl.ds(0, dma_len)],
                 sem=local_sems.at[0, FFN2_SEM_IDX],
             )
             copy1.start()
             copy1.wait()
+            copy2 = pltpu.make_async_copy(
+                src_ref=acc_hbm_up.at[pl.ds(base_offset + curr_offset, dma_len)],
+                dst_ref=acc_tile_up.at[pl.ds(0, dma_len)],
+                sem=local_sems.at[0, FFN2_SEM_IDX],
+            )
+            copy2.start()
+            copy2.wait()
 
             # 2. Compute
             for bd2c_id in range(cdiv(bd2, bd2c)):
@@ -1617,18 +1618,18 @@ def _fused_ep_moe_kernel(
             temp_ref = res_temp_vmem.at[pl.ds(0, dma_len)]
 
             if should_init:
-                copy1 = pltpu.make_async_copy(
+                copy3 = pltpu.make_async_copy(
                     src_ref=vmem_src_ref, dst_ref=hbm_dst_ref, sem=local_sems.at[0, FFN2_SEM_IDX]
                 )
-                copy1.start()
-                copy1.wait()
+                copy3.start()
+                copy3.wait()
             else:
                 # Load Old
-                copy1 = pltpu.make_async_copy(
+                copy3 = pltpu.make_async_copy(
                     src_ref=hbm_dst_ref, dst_ref=temp_ref, sem=local_sems.at[0, FFN2_SEM_IDX]
                 )
-                copy1.start()
-                copy1.wait()
+                copy3.start()
+                copy3.wait()
 
                 # Add
                 old_val_f = res_temp_vmem[...].astype(jnp.float32)
@@ -1638,11 +1639,11 @@ def _fused_ep_moe_kernel(
                 res_tile_vmem[...] = sum_val
 
                 # Store New
-                copy2 = pltpu.make_async_copy(
+                copy4 = pltpu.make_async_copy(
                     src_ref=vmem_src_ref, dst_ref=hbm_dst_ref, sem=local_sems.at[0, FFN2_SEM_IDX]
                 )
-                copy2.start()
-                copy2.wait()
+                copy4.start()
+                copy4.wait()
 
         lax.fori_loop(0, num_loops, body, None)
 
