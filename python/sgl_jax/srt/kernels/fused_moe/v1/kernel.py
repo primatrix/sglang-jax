@@ -728,8 +728,9 @@ def _fused_ep_moe_kernel(
                 sem=send_sem,
             )
 
-            # [Fix] 核心修改：对本地 size 进行 8 对齐，确保 starts 也是对齐的
-            # 保留原始 sizes 给 d2e_count (Gather 只需要传回有效数据)
+            # [Fix] Align local sizes to 8. This ensures 'starts' (cumulative sum)
+            # and subsequent 'sizes' are always multiples of 8.
+            # This creates physical padding between experts in HBM.
             aligned_local_sizes = (sizes + 7) // 8 * 8
 
             reduced_sizes = aligned_local_sizes
@@ -751,7 +752,7 @@ def _fused_ep_moe_kernel(
                 row_id = (row_id + num_devices - 1) % num_devices
                 new_sizes = d2e_count_vmem[row_id]
 
-                # [Fix] 对远程 size 也进行 8 对齐累加
+                # [Fix] Align remote sizes to 8 for accumulation
                 aligned_new_sizes = (new_sizes + 7) // 8 * 8
 
                 reduced_sizes += aligned_new_sizes
@@ -760,7 +761,7 @@ def _fused_ep_moe_kernel(
                 )
 
             starts_vmem[...] = reduced_starts
-            sizes_vmem[...] = reduced_sizes  # FFN 将基于对齐后的总长度运行
+            sizes_vmem[...] = reduced_sizes  # FFN kernel sees aligned sizes
 
             starts_copy = pltpu.async_copy(
                 src_ref=starts_vmem,
@@ -1393,12 +1394,16 @@ def _fused_ep_moe_kernel(
         def body(btc_id, _):
             curr_offset = btc_id * btc
 
-            # [Fix] 强制对齐 DMA 长度到 8，避免编译器报错
-            # 因为我们在 metadata 中已经做了 Padding，所以这里多读是安全的
-            real_len = lax.min(btc, dyn_sz - curr_offset)
-            dma_len = (real_len + 7) // 8 * 8
-            # 限制不超过 buffer 大小 (btc通常是16/32，是对齐的，但防御性编程)
-            dma_len = lax.min(dma_len, btc)
+            # [Fix] Construct dma_len structurally as (x * 8) to satisfy Mosaic compiler.
+            # 1. Calculate remaining length
+            rem_len = dyn_sz - curr_offset
+            # 2. Calculate remaining "8-byte blocks" (Ceil Div 8)
+            rem_blocks = (rem_len + 7) // 8
+            # 3. Clamp to max blocks in a tile (btc is usually 16 or 32, so btc // 8 is int)
+            max_blocks = btc // 8
+            use_blocks = lax.min(rem_blocks, max_blocks)
+            # 4. Multiply back by 8. This guarantees dma_len is a multiple of 8.
+            dma_len = use_blocks * 8
 
             # 1. Load Input Tile
             copy = pltpu.make_async_copy(
@@ -1413,12 +1418,12 @@ def _fused_ep_moe_kernel(
             copy.start()
             copy.wait()
 
-            # 2. Init Accumulators
+            # 2. Init Accumulators (Static full slice)
             zeros = jnp.zeros((btc, bf), dtype=jnp.float32)
             acc_tile_gate[...] = zeros
             acc_tile_up[...] = zeros
 
-            # 3. Compute (全量计算，忽略 padding 部分的无效计算)
+            # 3. Compute (Static full slice)
             for bd1c_id in range(cdiv(bd1, bd1c)):
                 for p_id in range(t_packing):
                     t = t_tile_vmem[
@@ -1489,7 +1494,8 @@ def _fused_ep_moe_kernel(
                 )
                 copy1.start()
                 copy1.wait()
-                # [Fix] 算术运算使用静态全切片 [...]，避免动态 Shape 错误
+
+                # Math on static full slice
                 acc_tile_gate[...] += acc_temp_vmem[...]
 
                 copy2 = pltpu.make_async_copy(
@@ -1535,10 +1541,12 @@ def _fused_ep_moe_kernel(
         def body(btc_id, _):
             curr_offset = btc_id * btc
 
-            # [Fix] 对齐 DMA 长度到 8
-            real_len = lax.min(btc, dyn_sz - curr_offset)
-            dma_len = (real_len + 7) // 8 * 8
-            dma_len = lax.min(dma_len, btc)
+            # [Fix] Construct dma_len as (x * 8)
+            rem_len = dyn_sz - curr_offset
+            rem_blocks = (rem_len + 7) // 8
+            max_blocks = btc // 8
+            use_blocks = lax.min(rem_blocks, max_blocks)
+            dma_len = use_blocks * 8
 
             # 1. Load Accumulators
             pltpu.make_async_copy(
