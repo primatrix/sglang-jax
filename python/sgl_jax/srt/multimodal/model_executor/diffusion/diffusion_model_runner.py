@@ -4,6 +4,11 @@ import time
 import jax
 import jax.numpy as jnp
 
+from python.sgl_jax.srt.configs.load_config import LoadConfig
+from python.sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
+from python.sgl_jax.srt.multimodal.configs.multimodal_model_configs import (
+    MultiModalModelConfigs,
+)
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.multimodal.configs.dits.configs import WanModelConfig
@@ -17,9 +22,14 @@ logger = logging.getLogger(__name__)
 
 # DiffusionModelRunner is responsible for running denoising steps within diffusion model inference
 class DiffusionModelRunner(BaseModelRunner):
-    def __init__(self, model_config):
-        super().__init__(model_config)
-        self.model_loader = get_model_loader(model_config, None)
+    def __init__(self, server_args: MultimodalServerArgs, mesh):
+        self.model_config = MultiModalModelConfigs.from_server_args(server_args)
+        load_config = LoadConfig(
+            load_format=server_args.load_format,
+            # hack here
+            download_dir=server_args.download_dir,
+        )
+        self.model_loader = get_model_loader(load_config, mesh)
         self.transformer_model = None
         self.transformer_2_model = None
         self.solver = None
