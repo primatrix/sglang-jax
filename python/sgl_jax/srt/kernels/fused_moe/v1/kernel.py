@@ -1756,16 +1756,13 @@ def _fused_ep_moe_kernel(
                 e_id = t2e_routing_x2_smem[bt_sem_id, bt_t_id, k_id]
                 offset = expert_offsets_x2_smem[bt_sem_id, 1, e_id]
                 expert_offsets_x2_smem[bt_sem_id, 1, e_id] = offset + 1
-                pltpu.make_async_copy(
+                copy = pltpu.make_async_copy(
                     src_ref=a2a_g_hbm.at[e_id, pl.ds(offset, 1)],
                     dst_ref=a2a_g_acc_vmem.at[k_id, pl.ds(bt_t_id, 1)],
                     sem=a2a_acc_sem,
-                ).start()
-        pltpu.make_async_copy(
-            src_ref=a2a_g_acc_vmem,
-            dst_ref=a2a_g_acc_vmem,
-            sem=a2a_acc_sem,
-        ).wait()
+                )
+                copy.start()
+                copy.wait()
         output = None
         for k_id in range(top_k):
             acc = a2a_g_acc_vmem[k_id].reshape(bt, hidden_size)
