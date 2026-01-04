@@ -441,6 +441,9 @@ def _fused_ep_moe_kernel(
     gating_hbm,  # (local_num_tokens, padded_num_experts)
     a2a_g_hbm,  # (num_experts, bt, t_packing, hidden_size // t_packing)
     bias_hbm,  # None | F32(padded_num_experts,)
+    a2a_s_hbm,  # 现在的 Scatter 目的地是 HBM
+    a2a_s_acc_hbm,  # 现在的 Gather 出发地是 HBM
+    acc_hbm,
     w1_shared,  # None | (hidden_size, se_intermediate_size)
     w2_shared,  # None | (se_intermediate_size, hidden_size)
     w3_shared,  # None | (hidden_size, se_intermediate_size)
@@ -456,8 +459,11 @@ def _fused_ep_moe_kernel(
     expert_starts_x2_smem,  # <bt_sem_id> (2, 1, padded_num_experts)
     expert_sizes_x2_smem,  # <bt_sem_id> (2, 1, padded_num_experts)
     a2a_s_sends_x2_smem,  # <e_sem_id> (2,)
-    a2a_s_x2_vmem,  # <e_sem_id> (2, bt * num_devices, t_packing, hidden_size // t_packing)
-    a2a_s_acc_x2_vmem,  # <e_sem_id> (2, bt * num_devices, t_packing, hidden_size // t_packing)
+    t_tile_vmem,
+    res_tile_vmem,
+    acc_temp_vmem,
+    res_temp_vmem,
+    acc_tile_vmem,
     ### Accumulation for gathered tokens:
     a2a_g_acc_vmem,  # (top_k, bt, t_packing, hidden_size // t_packing)
     ### Expert weight double buffering:
@@ -472,7 +478,6 @@ def _fused_ep_moe_kernel(
     b_b1_x2_vmem,  # None | <bw_sem_id> (2, 1, bf)
     b_b3_x2_vmem,  # None | <bw_sem_id> (2, 1, bf)
     b_b2_x2_vmem,  # None | <bw_sem_id> (2, t_packing, 1, bd2 // t_packing)
-    b_acc_vmem,  # F32(2, bt * num_devices, 1, bf)
     b_bias_vmem,  # None | F32(padded_num_experts,)
     ### Semaphores:
     local_sems,  # (2, 5): 2 x [b_gating_sem, b_w1_sem, b_w2_sem, b_w3_sem, b_output_sem]
@@ -522,7 +527,6 @@ def _fused_ep_moe_kernel(
 
     t_dtype = tokens_hbm.dtype
     t_packing = get_dtype_packing(t_dtype)
-    t_bitwidth = 32 // t_packing
     assert a2a_g_hbm.dtype == t_dtype
     assert w1_hbm.dtype == w2_hbm.dtype
     assert w3_hbm.dtype == w2_hbm.dtype
@@ -802,12 +806,12 @@ def _fused_ep_moe_kernel(
                 # TODO(jevinjiang): compare the perf when using branches.
                 pltpu.make_async_copy(
                     src_ref=tokens_hbm.at[pl.ds(t_id, local_sz)],
-                    dst_ref=a2a_s_x2_vmem.at[e_sem_id, pl.ds(start, local_sz)],
+                    dst_ref=a2a_s_hbm.at[e_sem_id, pl.ds(start, local_sz)],
                     sem=recv_sems.at[e_sem_id],
                 ).start()
                 pltpu.make_async_remote_copy(
                     src_ref=tokens_hbm.at[pl.ds(t_id, remote_sz)],
-                    dst_ref=a2a_s_x2_vmem.at[e_sem_id, pl.ds(start, remote_sz)],
+                    dst_ref=a2a_s_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
                     send_sem=send_sems.at[e_sem_id],
                     recv_sem=recv_sems.at[e_sem_id],
                     device_id=get_mesh_device_id(recv_id),
@@ -820,8 +824,8 @@ def _fused_ep_moe_kernel(
         e_id = my_id * local_num_experts + local_e_id
         sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
         pltpu.make_async_copy(
-            src_ref=a2a_s_x2_vmem.at[e_sem_id, pl.ds(0, sz)],
-            dst_ref=a2a_s_x2_vmem.at[e_sem_id, pl.ds(0, sz)],
+            src_ref=a2a_s_hbm.at[e_sem_id, pl.ds(0, sz)],
+            dst_ref=a2a_s_hbm.at[e_sem_id, pl.ds(0, sz)],
             sem=recv_sems.at[e_sem_id],
         ).wait()
 
@@ -829,8 +833,8 @@ def _fused_ep_moe_kernel(
         del bt_id, local_e_id
         sz = a2a_s_sends_x2_smem[e_sem_id]
         pltpu.make_async_copy(
-            src_ref=a2a_s_x2_vmem.at[e_sem_id, pl.ds(0, sz)],
-            dst_ref=a2a_s_x2_vmem.at[e_sem_id, pl.ds(0, sz)],
+            src_ref=a2a_s_hbm.at[e_sem_id, pl.ds(0, sz)],
+            dst_ref=a2a_s_hbm.at[e_sem_id, pl.ds(0, sz)],
             sem=send_sems.at[e_sem_id],
         ).wait()
 
@@ -844,12 +848,12 @@ def _fused_ep_moe_kernel(
             local_sz = lax.select(is_local, sz, 0)
             remote_sz = lax.select(is_local, 0, sz)
             pltpu.make_async_copy(
-                src_ref=a2a_s_acc_x2_vmem.at[e_sem_id, pl.ds(start, local_sz)],
+                src_ref=a2a_s_acc_hbm.at[e_sem_id, pl.ds(start, local_sz)],
                 dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, local_sz)],
                 sem=a2a_gather_sem,
             ).start()
             pltpu.make_async_remote_copy(
-                src_ref=a2a_s_acc_x2_vmem.at[e_sem_id, pl.ds(start, remote_sz)],
+                src_ref=a2a_s_acc_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
                 dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, remote_sz)],
                 send_sem=send_sems.at[e_sem_id],
                 recv_sem=a2a_gather_sem,
@@ -1357,148 +1361,170 @@ def _fused_ep_moe_kernel(
         lax.fori_loop(0, max_se_blocks_per_expert, run_se_block, None)
 
     def dynamic_ffn1(
-        t_b32_vmem,
+        a2a_s_hbm_ref,
+        t_tile_vmem,
         w1_vmem,
         w1_scale_vmem,
         b1_vmem,
         w3_vmem,
         w3_scale_vmem,
         b3_vmem,
-        acc1_vmem,
-        acc3_vmem,
+        acc_hbm_gate,
+        acc_hbm_up,
+        acc_tile_gate,
+        acc_tile_up,
+        acc_temp_vmem,  # [新增]
         dyn_sz,
         should_init,
+        base_offset,
     ):
-        assert t_b32_vmem.shape == (bt * num_devices, bd1 // t_packing)
-        assert w1_vmem.shape == w3_vmem.shape == (t_packing, bd1_per_t_packing, bf)
-        assert acc1_vmem.shape == acc3_vmem.shape == (bt * num_devices, bf)
-        assert bd1 % (t_packing * 128) == 0, (bd1, t_packing)
-        assert bd1c % (t_packing * 128) == 0, (bd1c, t_packing)
-        assert bd1_per_t_packing % bd1c_per_t_packing == 0
-        if w1_scale_vmem is not None:
-            assert w1_scale_vmem.shape == (
-                t_packing,
-                bd1_per_t_packing // subc_quant_wsz,
-                1,
-                bf,
-            )
-            assert bd1c_per_t_packing == subc_quant_wsz
-        if w3_scale_vmem is not None:
-            assert w3_scale_vmem.shape == (
-                t_packing,
-                bd1_per_t_packing // subc_quant_wsz,
-                1,
-                bf,
-            )
-            assert bd1c_per_t_packing == subc_quant_wsz
-
         num_loops = cdiv(dyn_sz, btc)
-        repack_ty = jnp.dtype(f"int{t_bitwidth}")
 
         def body(btc_id, _):
+            curr_offset = btc_id * btc
+            valid_len = lax.min(btc, dyn_sz - curr_offset)
+
+            # [修复] 3D 索引加载，完美匹配 HBM 结构
+            pltpu.make_async_copy(
+                src_ref=a2a_s_hbm_ref.at[
+                    pl.ds(base_offset + curr_offset, valid_len),
+                    pl.ds(0, t_packing),  # 显式切分 Packing 维
+                    pl.ds(0, bd1 // t_packing),  # 显式切分 Feature 维
+                ],
+                dst_ref=t_tile_vmem.at[pl.ds(0, valid_len)],
+                sem=local_sems.at[0, 1],
+            ).start()
+            pltpu.semaphore_wait(local_sems.at[0, 1], 1)
+
+            # Init Accumulators
+            acc_tile_gate[...] = jnp.zeros_like(acc_tile_gate)
+            acc_tile_up[...] = jnp.zeros_like(acc_tile_up)
+
             for bd1c_id in range(cdiv(bd1, bd1c)):
-                t_b32 = t_b32_vmem[
-                    pl.ds(btc_id * btc, btc),
-                    pl.ds(bd1c_id * bd1c_per_t_packing, bd1c_per_t_packing),
-                ]
+                # [修复] 直接通过 p_id 索引，无需 bitcast/shift
                 for p_id in range(t_packing):
-                    t = pltpu.bitcast(t_b32.astype(repack_ty), t_dtype)
-                    t_b32 = t_b32 >> t_bitwidth
+                    t = t_tile_vmem[
+                        pl.ds(0, btc), p_id, pl.ds(bd1c_id * bd1c_per_t_packing, bd1c_per_t_packing)
+                    ]
+                    # t 现在是正确类型的 unpacked 数据
+
                     for bfc_id in range(cdiv(bf, bfc)):
                         w_slices = (
                             p_id,
                             pl.ds(bd1c_id * bd1c_per_t_packing, bd1c_per_t_packing),
                             pl.ds(bfc_id * bfc, bfc),
                         )
+
+                        # Compute Gate
                         w1 = w1_vmem[*w_slices]
                         acc1 = jnp.dot(t, w1, preferred_element_type=jnp.float32)
-
                         if w1_scale_vmem is not None:
-                            w1_scale_slices = (
-                                p_id,
-                                bd1c_id,
-                                pl.ds(0, 1),
-                                pl.ds(bfc_id * bfc, bfc),
-                            )
-                            # TODO(jevinjiang): can use mosaic to load with stride 0.
+                            w1_scale_slices = (p_id, bd1c_id, pl.ds(0, 1), pl.ds(bfc_id * bfc, bfc))
                             w1_scale = jnp.broadcast_to(w1_scale_vmem[*w1_scale_slices], acc1.shape)
                             acc1 *= w1_scale
 
+                        # Compute Up
                         w3 = w3_vmem[*w_slices]
-
                         acc3 = jnp.dot(t, w3, preferred_element_type=jnp.float32)
-
                         if w3_scale_vmem is not None:
-                            w3_scale_slices = (
-                                p_id,
-                                bd1c_id,
-                                pl.ds(0, 1),
-                                pl.ds(bfc_id * bfc, bfc),
-                            )
+                            w3_scale_slices = (p_id, bd1c_id, pl.ds(0, 1), pl.ds(bfc_id * bfc, bfc))
                             w3_scale = jnp.broadcast_to(w3_scale_vmem[*w3_scale_slices], acc3.shape)
                             acc3 *= w3_scale
 
-                        acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
+                        acc_slices = (pl.ds(0, btc), pl.ds(bfc_id * bfc, bfc))
+
                         if should_init and p_id == bd1c_id == 0:
                             if b1_vmem is not None:
-                                b1_scale_slices = (
-                                    pl.ds(0, 1),
-                                    pl.ds(bfc_id * bfc, bfc),
-                                )
-                                b1 = jnp.broadcast_to(b1_vmem[*b1_scale_slices], acc1.shape)
-                                acc1 += b1
+                                b1_scale_slices = (pl.ds(0, 1), pl.ds(bfc_id * bfc, bfc))
+                                b1_val = jnp.broadcast_to(b1_vmem[*b1_scale_slices], acc1.shape)
+                                acc1 += b1_val
                             if b3_vmem is not None:
-                                b3_scale_slices = (
-                                    pl.ds(0, 1),
-                                    pl.ds(bfc_id * bfc, bfc),
-                                )
-                                b3 = jnp.broadcast_to(b3_vmem[*b3_scale_slices], acc1.shape)
-                                acc3 += b3
-
-                            acc1_vmem_slice = acc1_vmem.at[*acc_slices]
-                            acc3_vmem_slice = acc3_vmem.at[*acc_slices]
-                            store_with_retiling(acc1_vmem_slice, acc1)
-                            store_with_retiling(acc3_vmem_slice, acc3)
+                                b3_scale_slices = (pl.ds(0, 1), pl.ds(bfc_id * bfc, bfc))
+                                b3_val = jnp.broadcast_to(b3_vmem[*b3_scale_slices], acc3.shape)
+                                acc3 += b3_val
+                            acc_tile_gate.at[*acc_slices].set(acc1)
+                            acc_tile_up.at[*acc_slices].set(acc3)
                         else:
-                            acc1_vmem_slice = acc1_vmem.at[*acc_slices]
-                            acc3_vmem_slice = acc3_vmem.at[*acc_slices]
-                            store_with_retiling(acc1_vmem_slice, acc1, is_acc=True)
-                            store_with_retiling(acc3_vmem_slice, acc3, is_acc=True)
+                            acc_tile_gate.at[*acc_slices].add(acc1)
+                            acc_tile_up.at[*acc_slices].add(acc3)
+
+            # --- RMW with Temp Buffer ---
+            hbm_gate_ref = acc_hbm_gate.at[pl.ds(base_offset + curr_offset, valid_len)]
+            hbm_up_ref = acc_hbm_up.at[pl.ds(base_offset + curr_offset, valid_len)]
+            vmem_gate_ref = acc_tile_gate.at[pl.ds(0, valid_len)]
+            vmem_up_ref = acc_tile_up.at[pl.ds(0, valid_len)]
+            # [修复] 使用专用的 acc_temp_vmem
+            temp_ref = acc_temp_vmem.at[pl.ds(0, valid_len)]
+
+            if should_init:
+                pltpu.make_async_copy(
+                    src_ref=vmem_gate_ref, dst_ref=hbm_gate_ref, sem=local_sems.at[0, 1]
+                ).start()
+                pltpu.make_async_copy(
+                    src_ref=vmem_up_ref, dst_ref=hbm_up_ref, sem=local_sems.at[0, 1]
+                ).start()
+                pltpu.semaphore_wait(local_sems.at[0, 1], 2)
+            else:
+                # Gate RMW
+                pltpu.make_async_copy(
+                    src_ref=hbm_gate_ref, dst_ref=temp_ref, sem=local_sems.at[0, 1]
+                ).start()
+                pltpu.semaphore_wait(local_sems.at[0, 1], 1)
+                vmem_gate_ref.set(vmem_gate_ref.get() + temp_ref.get())
+                pltpu.make_async_copy(
+                    src_ref=vmem_gate_ref, dst_ref=hbm_gate_ref, sem=local_sems.at[0, 1]
+                ).start()
+
+                # Up RMW
+                pltpu.make_async_copy(
+                    src_ref=hbm_up_ref, dst_ref=temp_ref, sem=local_sems.at[0, 1]
+                ).start()
+                pltpu.semaphore_wait(local_sems.at[0, 1], 2)  # Wait for Gate Store + Up Load
+                vmem_up_ref.set(vmem_up_ref.get() + temp_ref.get())
+                pltpu.make_async_copy(
+                    src_ref=vmem_up_ref, dst_ref=hbm_up_ref, sem=local_sems.at[0, 1]
+                ).start()
+
+                pltpu.semaphore_wait(local_sems.at[0, 1], 1)
 
         lax.fori_loop(0, num_loops, body, None)
 
     def dynamic_ffn2(
-        acc1_vmem,
-        acc3_vmem,
+        acc_hbm_gate,
+        acc_hbm_up,
+        acc_tile_gate,
+        acc_tile_up,
         w2_vmem,
         w2_scale_vmem,
         b2_vmem,
-        res_b32_vmem,
+        a2a_s_acc_hbm_ref,
+        res_tile_vmem,
+        res_temp_vmem,  # <--- [修改] 传入正确的 Temp Buffer
         dyn_sz,
         should_init,
+        base_offset,
     ):
-        assert res_b32_vmem.shape == (bt * num_devices, bd2_per_t_packing)
-        assert w2_vmem.shape == (t_packing, bf, bd2_per_t_packing)
-        assert acc1_vmem.shape == acc3_vmem.shape == (bt * num_devices, bf)
-        assert bd2 % (t_packing * 128) == 0, (bd2, t_packing)
-        assert bd2c % (t_packing * 128) == 0, (bd2c, t_packing)
-        assert t_dtype in (jnp.float32, jnp.bfloat16)
-
-        if w2_scale_vmem is not None:
-            assert w2_scale_vmem.shape == (
-                t_packing,
-                bf // subc_quant_wsz,
-                1,
-                bd2_per_t_packing,
-            )
-            assert bfc == subc_quant_wsz
-
         num_loops = cdiv(dyn_sz, btc)
-        assert bd2c % (t_packing * 128) == 0, (bd2c, t_packing)
 
         def body(btc_id, _):
+            curr_offset = btc_id * btc
+            valid_len = lax.min(btc, dyn_sz - curr_offset)
+
+            # 1. Load Accumulators (不变)
+            pltpu.make_async_copy(
+                src_ref=acc_hbm_gate.at[pl.ds(base_offset + curr_offset, valid_len)],
+                dst_ref=acc_tile_gate.at[pl.ds(0, valid_len)],
+                sem=local_sems.at[0, 1],
+            ).start()
+            pltpu.make_async_copy(
+                src_ref=acc_hbm_up.at[pl.ds(base_offset + curr_offset, valid_len)],
+                dst_ref=acc_tile_up.at[pl.ds(0, valid_len)],
+                sem=local_sems.at[0, 1],
+            ).start()
+            pltpu.semaphore_wait(local_sems.at[0, 1], 2)
+
+            # 2. Compute (不变)
             for bd2c_id in range(cdiv(bd2, bd2c)):
-                res_lst = []
                 for p_id in range(t_packing):
                     res = jnp.zeros((btc, bd2c_per_t_packing), dtype=jnp.float32)
 
@@ -1508,20 +1534,22 @@ def _fused_ep_moe_kernel(
                             pl.ds(0, 1),
                             pl.ds(bd2c_id * bd2c_per_t_packing, bd2c_per_t_packing),
                         )
-                        b2 = jnp.broadcast_to(b2_vmem[*b2_scale_slices], res.shape)
-                        res += b2
+                        b2_val = jnp.broadcast_to(b2_vmem[*b2_scale_slices], res.shape)
+                        res += b2_val
 
                     for bfc_id in range(cdiv(bf, bfc)):
-                        acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
-                        acc1 = acc1_vmem[*acc_slices]
-                        acc3 = acc3_vmem[*acc_slices]
-                        act = activation_fn(acc1, acc3, act_fn)
+                        acc_slices = (pl.ds(0, btc), pl.ds(bfc_id * bfc, bfc))
+                        act = activation_fn(
+                            acc_tile_gate[*acc_slices], acc_tile_up[*acc_slices], act_fn
+                        )
+
                         w2 = w2_vmem[
                             p_id,
                             pl.ds(bfc_id * bfc, bfc),
                             pl.ds(bd2c_id * bd2c_per_t_packing, bd2c_per_t_packing),
                         ]
                         acc = jnp.dot(act, w2, preferred_element_type=jnp.float32)
+
                         if w2_scale_vmem is not None:
                             w2_scale_slices = (
                                 p_id,
@@ -1532,58 +1560,90 @@ def _fused_ep_moe_kernel(
                             w2_scale = jnp.broadcast_to(w2_scale_vmem[*w2_scale_slices], acc.shape)
                             acc *= w2_scale
                         res += acc
-                    res = pltpu.bitcast(res, jnp.uint32)
-                    if t_packing == 2:
-                        res = res >> 16 << (16 * p_id)
-                    else:
-                        assert t_packing == 1
-                    res_lst.append(res)
-                res = res_lst[0]
-                # TODO(jevinjiang): use interleaved packing when it is exposed to Pallas
-                for i in range(1, t_packing):
-                    res |= res_lst[i]
-                sliced_res_vmem = res_b32_vmem.at[
-                    pl.ds(btc_id * btc, btc),
-                    pl.ds(bd2c_id * bd2c_per_t_packing, bd2c_per_t_packing),
-                ]
-                if should_init:
-                    sliced_res_vmem[...] = res
-                else:
-                    sliced_res_vmem[...] = pltpu.bitcast(
-                        sliced_res_vmem.bitcast(t_dtype)[...] + pltpu.bitcast(res, t_dtype),
-                        sliced_res_vmem.dtype,
-                    )
+
+                    res_tile_vmem.at[
+                        pl.ds(0, btc), p_id, pl.ds(bd2c_id * bd2c_per_t_packing, bd2c_per_t_packing)
+                    ].set(res.astype(t_dtype))
+
+            # --- 3. HBM Store / RMW (修正逻辑) ---
+            hbm_dst_ref = a2a_s_acc_hbm_ref.at[
+                pl.ds(base_offset + curr_offset, valid_len),
+                pl.ds(0, t_packing),
+                pl.ds(0, bd2_per_t_packing),
+            ]
+            vmem_src_ref = res_tile_vmem.at[pl.ds(0, valid_len)]
+
+            # [修正] 使用 res_temp_vmem，它的 shape/dtype 与 vmem_src_ref 完全一致
+            temp_ref = res_temp_vmem.at[pl.ds(0, valid_len)]
+
+            if should_init:
+                # Overwrite
+                pltpu.make_async_copy(
+                    src_ref=vmem_src_ref, dst_ref=hbm_dst_ref, sem=local_sems.at[0, 1]
+                ).start()
+                pltpu.semaphore_wait(local_sems.at[0, 1], 1)
+            else:
+                # RMW: Load -> Add -> Store
+
+                # A. Load HBM (Old Value) -> Temp VMEM
+                pltpu.make_async_copy(
+                    src_ref=hbm_dst_ref, dst_ref=temp_ref, sem=local_sems.at[0, 1]
+                ).start()
+                pltpu.semaphore_wait(local_sems.at[0, 1], 1)
+
+                # B. Add: New (res_tile) + Old (temp) -> New (res_tile)
+                # 直接在 t_dtype 上加 (如果 t_dtype 是 float/bfloat)，或者需要 bitcast float 做加法
+                # 假设 t_dtype 支持直接加法 (Jax Pallas 行为)，或者为了安全转 float 加
+                old_val = temp_ref.get()
+                new_val = vmem_src_ref.get()
+
+                # 安全做法：转 float32 加，再转回 t_dtype
+                # 注意：这里维度是 3D (btc, packing, dim)，需要正确 bitcast
+                old_val_f = old_val.astype(jnp.float32)
+                new_val_f = new_val.astype(jnp.float32)
+                sum_val = (old_val_f + new_val_f).astype(t_dtype)
+
+                vmem_src_ref.set(sum_val)
+
+                # C. Store New -> HBM
+                pltpu.make_async_copy(
+                    src_ref=vmem_src_ref, dst_ref=hbm_dst_ref, sem=local_sems.at[0, 1]
+                ).start()
+                pltpu.semaphore_wait(local_sems.at[0, 1], 1)
 
         lax.fori_loop(0, num_loops, body, None)
 
     def expert_ffn(bt_id, e_sem_id, local_e_id):
         bt_sem_id = bt_id % 2
         bw_sem_id = 0
-        # start_fetch_bw1(local_e_id, bw_sem_id, 0, 0)
-        # start_fetch_bw3(local_e_id, bw_sem_id, 0, 0)
-        a2a_s_b32_vmem = (
-            a2a_s_x2_vmem.bitcast(jnp.uint32)
-            .reshape(2, bt * num_devices, hidden_size // t_packing)
-            .at[e_sem_id]
-        )
-        a2a_s_acc_b32_vmem = (
-            a2a_s_acc_x2_vmem.bitcast(jnp.uint32)
-            .reshape(2, bt * num_devices, hidden_size // t_packing)
-            .at[e_sem_id]
-        )
-        b_acc_vmem_2d = b_acc_vmem.reshape(2, bt * num_devices, bf)
-        b_acc1_vmem = b_acc_vmem_2d.at[0]
-        b_acc3_vmem = b_acc_vmem_2d.at[1]
 
+        # 获取当前 Expert 在 HBM 中的全局 Offset 和数据量
         e_id = my_id * local_num_experts + local_e_id
+        base_offset = expert_starts_x2_smem[bt_sem_id, 0, e_id]
         dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
+
+        # 获取 HBM Buffers 的引用 (Slice for current e_sem_id)
+        a2a_s_hbm_ref = a2a_s_hbm.at[e_sem_id]
+        a2a_s_acc_hbm_ref = a2a_s_acc_hbm.at[e_sem_id]
+
+        # Accumulators (split Gate/Up)
+        acc_hbm_gate = acc_hbm.at[0]
+        acc_hbm_up = acc_hbm.at[1]
+
+        # VMEM Tile Buffers (split Gate/Up for Acc)
+        acc_tile_gate = acc_tile_vmem.at[0]
+        acc_tile_up = acc_tile_vmem.at[1]
 
         bd1_per_t_packing = bd1 // t_packing
         bd2_per_t_packing = bd2 // t_packing
 
+        # Feature Block Loop
         for bf_id in range(num_bf):
+
+            # --- Layer 1 ---
             for bd1_id in range(num_bd1):
                 start_fetch_next_bw(local_e_id, bw_sem_id, bf_id, bd1_id, 0)
+
                 w1_scale_vmem = (
                     None if b_w1_scale_x2_vmem is None else b_w1_scale_x2_vmem.at[bw_sem_id]
                 )
@@ -1592,29 +1652,37 @@ def _fused_ep_moe_kernel(
                 )
                 b1_vmem = None if b_b1_x2_vmem is None else b_b1_x2_vmem.at[bf_id % 2]
                 b3_vmem = None if b_b3_x2_vmem is None else b_b3_x2_vmem.at[bf_id % 2]
+
                 wait_fetch_bw1(local_e_id, bw_sem_id, bf_id, bd1_id)
                 wait_fetch_bw3(local_e_id, bw_sem_id, bf_id, bd1_id)
 
                 dynamic_ffn1(
-                    t_b32_vmem=a2a_s_b32_vmem.at[
+                    a2a_s_hbm_ref=a2a_s_hbm_ref.at[
                         ..., pl.ds(bd1_id * bd1_per_t_packing, bd1_per_t_packing)
                     ],
+                    t_tile_vmem=t_tile_vmem,
                     w1_vmem=b_w1_x2_vmem.at[bw_sem_id],
                     w1_scale_vmem=w1_scale_vmem,
                     b1_vmem=b1_vmem,
                     w3_vmem=b_w3_x2_vmem.at[bw_sem_id],
                     w3_scale_vmem=w3_scale_vmem,
                     b3_vmem=b3_vmem,
-                    acc1_vmem=b_acc1_vmem,
-                    acc3_vmem=b_acc3_vmem,
+                    acc_hbm_gate=acc_hbm_gate,
+                    acc_hbm_up=acc_hbm_up,
+                    acc_tile_gate=acc_tile_gate,
+                    acc_temp_vmem=acc_temp_vmem,
+                    acc_tile_up=acc_tile_up,
                     dyn_sz=dyn_sz,
                     should_init=(bd1_id == 0),
+                    base_offset=base_offset,
                 )
                 bw_sem_id = (bw_sem_id + 1) % 2
 
+            # --- Layer 2 ---
             for bd2_id in range(num_bd2):
                 start_fetch_next_bw(local_e_id, bw_sem_id, bf_id, num_bd1, bd2_id)
                 wait_fetch_bw2(local_e_id, bw_sem_id, bf_id, bd2_id)
+
                 if bf_id == bd2_id == 0:
                     wait_a2a_gather_send(bt_id, e_sem_id, local_e_id - 2)
 
@@ -1622,17 +1690,24 @@ def _fused_ep_moe_kernel(
                     None if b_w2_scale_x2_vmem is None else b_w2_scale_x2_vmem.at[bw_sem_id]
                 )
                 b2_vmem = None if b_b2_x2_vmem is None else b_b2_x2_vmem.at[bd2_id % 2]
+
                 dynamic_ffn2(
-                    acc1_vmem=b_acc1_vmem,
-                    acc3_vmem=b_acc3_vmem,
+                    acc_hbm_gate=acc_hbm_gate,
+                    acc_hbm_up=acc_hbm_up,
+                    acc_tile_gate=acc_tile_gate,
+                    acc_tile_up=acc_tile_up,
                     w2_vmem=b_w2_x2_vmem.at[bw_sem_id],
                     w2_scale_vmem=w2_scale_vmem,
                     b2_vmem=b2_vmem,
-                    res_b32_vmem=a2a_s_acc_b32_vmem.at[
+                    a2a_s_acc_hbm_ref=a2a_s_acc_hbm_ref.at[
                         ..., pl.ds(bd2_id * bd2_per_t_packing, bd2_per_t_packing)
                     ],
+                    res_tile_vmem=res_tile_vmem,
+                    res_temp_vmem=res_temp_vmem,
+                    t_tile_vmem=t_tile_vmem,
                     dyn_sz=dyn_sz,
                     should_init=(bf_id == 0),
+                    base_offset=base_offset,
                 )
                 bw_sem_id = (bw_sem_id + 1) % 2
 
@@ -2236,8 +2311,12 @@ def fused_ep_moe(
         pltpu.SMEM((2, 1, padded_num_experts), jnp.int32),  # expert_sizes_x2_smem
         pltpu.SMEM((2,), jnp.int32),  # a2a_s_sends_x2_smem
         # Token scatter/gather scratch.
-        pltpu.VMEM((2, bt_x_devices, t_packing, hidden_per_pack), t_dtype),  # a2a_s_x2_vmem
-        pltpu.VMEM((2, bt_x_devices, t_packing, hidden_per_pack), t_dtype),  # a2a_s_acc_x2_vmem
+        pltpu.VMEM((block_config.btc, t_packing, block_config.bd1 // t_packing), t_dtype),
+        # [修改] Result Tile: 3D Shape
+        pltpu.VMEM((block_config.btc, t_packing, block_config.bd2 // t_packing), t_dtype),
+        pltpu.VMEM((block_config.btc, block_config.bf), jnp.float32),
+        pltpu.VMEM((block_config.btc, t_packing, block_config.bd2 // t_packing), t_dtype),
+        pltpu.VMEM((2, block_config.btc, block_config.bf), jnp.float32),
         pltpu.VMEM((top_k, block_config.bt, t_packing, hidden_per_pack), t_dtype),  # a2a_g_acc_vmem
         # Expert compute scratch.
         pltpu.VMEM((2, block_config.bt, padded_num_experts), gating_dtype),  # b_gating_x2_vmem
@@ -2251,7 +2330,6 @@ def fused_ep_moe(
         b1_scratch,  # b_b1_x2_vmem
         b3_scratch,  # b_b3_x2_vmem
         b2_scratch,  # b_b2_x2_vmem
-        pltpu.VMEM((2, bt_x_devices, 1, block_config.bf), jnp.float32),  # b_acc_vmem
         (None if bias is None else pltpu.VMEM((padded_num_experts,), jnp.float32)),  # bias
         # Semaphores.
         pltpu.SemaphoreType.DMA((2, 9 if w1_shared is not None else 5)),  # local_sems
@@ -2371,6 +2449,9 @@ def fused_ep_moe(
                     hbm_block_spec,  # gating_output_hbm
                     hbm_block_spec,  # a2a_g_hbm
                     None if bias is None else hbm_block_spec,
+                    hbm_block_spec,  # a2a_s_hbm (全量 Buffer)
+                    hbm_block_spec,  # a2a_s_acc_hbm (全量 Buffer)
+                    hbm_block_spec,  # acc
                     None if w1_shared is None else hbm_block_spec,  # w1_shared (Gate)
                     None if w2_shared is None else hbm_block_spec,  # w2_shared (Down)
                     None if w3_shared is None else hbm_block_spec,  # w3_shared (Up)
@@ -2409,6 +2490,9 @@ def fused_ep_moe(
             P(ep_axis_name),  # gating_output_hbm
             P(),  # a2a_g_hbm
             None if bias is None else P(),
+            P(),  # a2a_s_hbm (全量 Buffer)
+            P(),  # a2a_s_acc_hbm (全量 Buffer)
+            P(),  # acc_hbm
             None if w1_shared is None else P(),  # w1_shared
             None if w2_shared is None else P(),  # w2_shared
             None if w3_shared is None else P(),  # w3_shared
@@ -2433,6 +2517,9 @@ def fused_ep_moe(
         gating_output,
         a2a_g_hbm_scratch,
         bias,
+        a2a_s_hbm,
+        a2a_s_acc_hbm,
+        acc_hbm,
         w1_shared=None,
         w2_shared=None,
         w3_shared=None,
@@ -2466,6 +2553,9 @@ def fused_ep_moe(
             pltpu.with_memory_space_constraint(gating_output, pltpu.HBM),  # gating_output_hbm
             pltpu.with_memory_space_constraint(a2a_g_hbm_scratch, pltpu.HBM),  # a2a_g_hbm
             (None if bias is None else pltpu.with_memory_space_constraint(bias, pltpu.HBM)),
+            pltpu.with_memory_space_constraint(a2a_s_hbm, pltpu.HBM),
+            pltpu.with_memory_space_constraint(a2a_s_acc_hbm, pltpu.HBM),
+            pltpu.with_memory_space_constraint(acc_hbm, pltpu.HBM),
             (
                 None
                 if w1_shared is None
@@ -2502,6 +2592,9 @@ def fused_ep_moe(
     a2a_g_hbm_scratch = pl.empty(
         (num_experts, block_config.bt, t_packing, hidden_size // t_packing), t_dtype
     )
+    a2a_s_hbm = pl.empty((2, bt_x_devices, t_packing, hidden_per_pack), t_dtype)
+    a2a_s_acc_hbm = pl.empty((2, bt_x_devices, t_packing, hidden_per_pack), t_dtype)
+    acc_hbm = pl.empty((2, bt_x_devices, block_config.bf), jnp.float32)
     return kernel(
         tokens,
         w1,
@@ -2516,6 +2609,9 @@ def fused_ep_moe(
         gating_output,
         a2a_g_hbm_scratch,
         bias,
+        a2a_s_hbm,
+        a2a_s_acc_hbm,
+        acc_hbm,
         w1_shared,
         w2_shared,
         w3_shared,
