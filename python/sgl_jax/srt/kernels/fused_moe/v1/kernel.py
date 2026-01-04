@@ -1398,10 +1398,9 @@ def _fused_ep_moe_kernel(
             copy.wait()
 
             # 2. Init Accumulators
-            # [Fix] 显式广播 0.0 到 (btc, bf) 形状，避免标量赋值报错
             zeros = jnp.zeros((btc, bf), dtype=jnp.float32)
-            acc_tile_gate[:] = zeros
-            acc_tile_up[:] = zeros
+            acc_tile_gate[...] = zeros
+            acc_tile_up[...] = zeros
 
             # 3. Compute
             for bd1c_id in range(cdiv(bd1, bd1c)):
@@ -1474,7 +1473,8 @@ def _fused_ep_moe_kernel(
                 )
                 copy1.start()
                 copy1.wait()
-                vmem_gate_ref[:] = vmem_gate_ref[:] + temp_ref[:]
+                # [Fix] 使用 [...] 代替 [:]
+                vmem_gate_ref[...] = vmem_gate_ref[...] + temp_ref[...]
                 copy2 = pltpu.make_async_copy(
                     src_ref=vmem_gate_ref, dst_ref=hbm_gate_ref, sem=local_sems.at[0, 1]
                 )
@@ -1485,9 +1485,10 @@ def _fused_ep_moe_kernel(
                     src_ref=hbm_up_ref, dst_ref=temp_ref, sem=local_sems.at[0, 1]
                 )
                 copy3.start()
-                copy2.wait()  # Wait for previous Gate Store
-                copy3.wait()  # Wait for current Up Load
-                vmem_up_ref[:] = vmem_up_ref[:] + temp_ref[:]
+                copy2.wait()
+                copy3.wait()
+                # [Fix] 使用 [...] 代替 [:]
+                vmem_up_ref[...] = vmem_up_ref[...] + temp_ref[...]
                 copy4 = pltpu.make_async_copy(
                     src_ref=vmem_up_ref, dst_ref=hbm_up_ref, sem=local_sems.at[0, 1]
                 )
@@ -1569,7 +1570,6 @@ def _fused_ep_moe_kernel(
                             acc *= w2_scale
                         res += acc
 
-                    # [Fix] 使用 = 代替 .at[].set
                     res_tile_vmem[
                         pl.ds(0, btc), p_id, pl.ds(bd2c_id * bd2c_per_t_packing, bd2c_per_t_packing)
                     ] = res.astype(t_dtype)
@@ -1597,14 +1597,15 @@ def _fused_ep_moe_kernel(
                 copy1.start()
                 copy1.wait()
 
-                # Add (Safe bitcast add)
+                # Add
                 old_val = temp_ref.get()
                 new_val = vmem_src_ref.get()
                 old_val_f = old_val.astype(jnp.float32)
                 new_val_f = new_val.astype(jnp.float32)
                 sum_val = (old_val_f + new_val_f).astype(t_dtype)
 
-                vmem_src_ref[:] = sum_val  # [Fix] 原地更新
+                # [Fix] 使用 [...] 代替 [:]
+                vmem_src_ref[...] = sum_val
 
                 # Store New
                 copy2 = pltpu.make_async_copy(
