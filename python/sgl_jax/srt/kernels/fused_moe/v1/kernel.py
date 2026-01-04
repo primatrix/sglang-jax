@@ -1712,7 +1712,6 @@ def _fused_ep_moe_kernel(
                     ],
                     res_tile_vmem=res_tile_vmem,
                     res_temp_vmem=res_temp_vmem,
-                    t_tile_vmem=t_tile_vmem,
                     dyn_sz=dyn_sz,
                     should_init=(bf_id == 0),
                     base_offset=base_offset,
