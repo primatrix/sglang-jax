@@ -380,7 +380,7 @@ class WanTransformer3DModel:
         encoder_hidden_states: jax.Array | list[jax.Array],
         timesteps: jax.Array,
         encoder_hidden_states_image: jax.Array | list[jax.Array] | None,
-        guidance_scale=1.0 | None,
+        guidance_scale=1.0,
         **kwargs,
     ):
         # origin_dtype = hidden_states.dtype
