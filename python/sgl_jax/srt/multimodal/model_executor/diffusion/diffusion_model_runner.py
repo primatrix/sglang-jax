@@ -10,11 +10,14 @@ from python.sgl_jax.srt.multimodal.configs.multimodal_model_configs import (
     MultiModalModelConfigs,
 )
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
-from sgl_jax.srt.model_loader.loader import get_model_loader
+from sgl_jax.srt.model_loader.loader import JAXModelLoader
 from sgl_jax.srt.multimodal.configs.dits.configs import WanModelConfig
 from sgl_jax.srt.multimodal.manager.io_struct import VideoGenerationsRequest
 from sgl_jax.srt.multimodal.models.diffusion_solvers.unipc_multistep_scheduler import (
     UniPCMultistepScheduler,
+)
+from sgl_jax.srt.multimodal.models.wan2_1.diffusion.wan2_1_dit import (
+    WanTransformer3DModel,
 )
 
 logger = logging.getLogger(__name__)
@@ -29,7 +32,9 @@ class DiffusionModelRunner(BaseModelRunner):
             # hack here
             download_dir=server_args.download_dir,
         )
-        self.model_loader = get_model_loader(load_config, mesh)
+        # self.model_loader = get_model_loader(load_config, mesh)
+        # hack here to use JAXModelLoader directly
+        self.model_loader = JAXModelLoader(load_config, mesh)
         self.transformer_model = None
         self.transformer_2_model = None
         self.solver = None
@@ -42,7 +47,8 @@ class DiffusionModelRunner(BaseModelRunner):
         # e.g., setting up noise schedulers, diffusion steps, etc.
 
     def initialize(self):
-        self.model = self.model_loader.load_model(model_config=self.model_config)
+        # self.model = self.model_loader.load_model(model_config=self.model_config)
+        self.model = WanTransformer3DModel(self.model_config)
         self.solver = UniPCMultistepScheduler(
             num_train_timesteps=1000,
             beta_start=0.0001,
@@ -94,7 +100,11 @@ class DiffusionModelRunner(BaseModelRunner):
                 latents = jnp.concatenate([latents] * 2)
             # Perform denoising step
             noise_pred: jax.Array = self.model.forward(
-                latents, text_embeds, t_batch, deterministic=True
+                hidden_states=latents,
+                encoder_hidden_states=text_embeds,
+                time_steps=t_batch,
+                encoder_hidden_states_image=None,
+                guidance_scale=None,
             )
             if do_classifier_free_guidance:
                 bsz = latents.shape[0] // 2
