@@ -466,18 +466,20 @@ def _fused_ep_moe_kernel(
         return (dp_rank, ep_rank)
 
     def sync_barrier():
-        for i in range(num_devices):
-            pltpu.semaphore_signal(
-                barrier_sem,
-                device_id=get_mesh_device_id(i),
-                device_id_type=pltpu.DeviceIdType.MESH,
-            )
-        pltpu.semaphore_wait(barrier_sem, num_devices)
+        # Ring-style barrier (matches f5b4f079): signal right neighbor and wait once.
+        pltpu.semaphore_signal(
+            barrier_sem,
+            device_id=get_mesh_device_id(right_id),
+            device_id_type=pltpu.DeviceIdType.MESH,
+        )
+        pltpu.semaphore_wait(barrier_sem, 1)
 
     def start_fetch_b_gating(bt_id, priority=0):
+        is_valid = jnp.logical_and(bt_id >= 0, bt_id < num_bt)
+        sz = pl.multiple_of(lax.select(is_valid, bt, 0), bt)
         bt_sem_id = (bt_id + 2) % 2
         b_gating_sem = local_sems.at[bt_sem_id, 0]
-        bt_start = bt_id * bt
+        bt_start = lax.select(is_valid, bt_id * bt, 0)
         # Hint Mosaic about HBM tiling alignment for `tpu.memref_slice`:
         # - f32 is typically tiled as (8, 128)
         # - bf16/f16 is typically tiled as (16, 128)
@@ -485,8 +487,8 @@ def _fused_ep_moe_kernel(
         gating_tile0 = 256 // dtypes.itemsize_bits(gating_hbm.dtype)
         bt_start = pl.multiple_of(bt_start, gating_tile0) if bt % gating_tile0 == 0 else bt_start
         pltpu.make_async_copy(
-            src_ref=gating_hbm.at[pl.ds(bt_start, bt)],
-            dst_ref=b_gating_x2_vmem.at[bt_sem_id, pl.ds(0, bt)],
+            src_ref=gating_hbm.at[pl.ds(bt_start, sz)],
+            dst_ref=b_gating_x2_vmem.at[bt_sem_id, pl.ds(0, sz)],
             sem=b_gating_sem,
         ).start(priority=priority)
 
@@ -707,24 +709,23 @@ def _fused_ep_moe_kernel(
         remote_sz = sz - local_sz
         is_valid = jnp.logical_and(local_e_id >= 0, local_e_id < local_num_experts)
         remote_sz = lax.select(is_valid, remote_sz, 0)
-        # Avoid using an HBM `reshape()` view as a dst ref: Mosaic may fail to prove tiling
-        # alignment for `tpu.memref_slice` on reshaped HBM buffers.
+        # Drain outstanding remote sends for this expert.
+        # Use a VMEM self-copy as the wait handle to avoid HBM reshape/slice pitfalls.
         pltpu.make_async_copy(
-            src_ref=a2a_g_hbm.at[0, pl.ds(0, remote_sz)],
-            dst_ref=a2a_g_hbm.at[0, pl.ds(0, remote_sz)],
+            src_ref=a2a_s_acc_x2_vmem.at[e_sem_id, pl.ds(0, remote_sz)],
+            dst_ref=a2a_s_acc_x2_vmem.at[e_sem_id, pl.ds(0, remote_sz)],
             sem=send_sems.at[e_sem_id],
         ).wait()
 
     def wait_a2a_gather_recv_all():
         # Wait for all outstanding a2a gather receives.
         #
-        # Note: `sz` can be larger than `bt` because each token contributes `top_k` expert
-        # activations. This wait is sem-driven; we use a canonical HBM slice ref and rely on
-        # the semaphore to track completion of all DMA operations enqueued on `a2a_gather_sem`.
-        sz = top_k * bt
+        # Note: the total receive volume is `top_k * bt` tokens, which can exceed the
+        # per-expert `bt` capacity along `a2a_g_hbm`'s token dimension. Use a VMEM buffer
+        # with matching logical volume as the wait handle.
         pltpu.make_async_copy(
-            src_ref=a2a_g_hbm.at[0, pl.ds(0, sz)],
-            dst_ref=a2a_g_hbm.at[0, pl.ds(0, sz)],
+            src_ref=a2a_g_acc_vmem,
+            dst_ref=a2a_g_acc_vmem,
             sem=a2a_gather_sem,
         ).wait()
 
