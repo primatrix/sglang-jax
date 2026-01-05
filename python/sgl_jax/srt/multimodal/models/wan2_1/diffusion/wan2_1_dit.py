@@ -122,7 +122,7 @@ class WanTransformerBlock(nnx.Module):
 
         self.scale_shift_table = nnx.Param(jax.random.randn(1, 6, dim) / dim**0.5)
 
-    def call(
+    def __call__(
         self,
         hidden_states: jax.Array,
         encoder_hidden_states: jax.Array,
@@ -245,7 +245,7 @@ class WanSelfAttention(nnx.Module):
             causal=False,
         )
 
-    def call(self, x: jax.Array, context: jax.Array, context_lens: int):
+    def __call__(self, x: jax.Array, context: jax.Array, context_lens: int):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -258,7 +258,7 @@ class WanSelfAttention(nnx.Module):
 
 class WanT2VCrossAttention(WanSelfAttention):
 
-    def call(self, x, context, context_lens, crossattn_cache=None):
+    def __call__(self, x, context, context_lens, crossattn_cache=None):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
