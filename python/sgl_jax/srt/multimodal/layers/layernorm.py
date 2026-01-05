@@ -83,7 +83,7 @@ class ScaleResidualLayerNormScaleShift(nnx.Module):
                     use_scale=elementwise_affine,
                     use_bias=elementwise_affine,
                     dtype=dtype,
-                    rngs=nnx.Rngs(0),
+                    rngs=jax.random.PRNGKey(0),
                 )
             else:
                 self.norm = nnx.LayerNorm(
@@ -92,7 +92,7 @@ class ScaleResidualLayerNormScaleShift(nnx.Module):
                     use_scale=elementwise_affine,
                     use_bias=elementwise_affine,
                     dtype=dtype,
-                    rngs=nnx.Rngs(0),
+                    rngs=jax.random.PRNGKey(0),
                 )
         else:
             raise NotImplementedError(f"Norm type {norm_type} not implemented")
