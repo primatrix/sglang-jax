@@ -25,7 +25,6 @@ class ReplicatedLinear(LinearBase):
         self,
         input_size: int,
         output_size: int,
-        mesh: jax.sharding.Mesh,
         use_bias: bool = True,
         skip_bias_add: bool = False,
         params_dtype: jnp.dtype | None = jnp.bfloat16,
@@ -34,7 +33,6 @@ class ReplicatedLinear(LinearBase):
         super().__init__(
             input_size=input_size,
             output_size=output_size,
-            mesh=mesh,
             use_bias=use_bias,
             skip_bias_add=skip_bias_add,
             params_dtype=params_dtype,

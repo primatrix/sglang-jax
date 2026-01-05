@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+from sgl_jax.srt.layers.embeddings import apply_rotary_emb
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.multimodal.layers.attention.layer import USPAttention
 from sgl_jax.srt.multimodal.layers.layernorm import (
@@ -169,7 +170,7 @@ class WanTransformerBlock(nnx.Module):
         v = v.squeeze(1).reshape(v.shape[0], v.shape[2], self.num_attention_heads, -1)
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        q, k = _apply_rotary_emb(q, cos, sin, is_neox_style=False), _apply_rotary_emb(
+        q, k = apply_rotary_emb(q, cos, sin, is_neox_style=False), apply_rotary_emb(
             k, cos, sin, is_neox_style=False
         )
         attn_output = self.attn1(q, k, v)
@@ -199,12 +200,6 @@ class WanTransformerBlock(nnx.Module):
         hidden_states = self.mlp_residual(hidden_states, ffn_output, c_gate_msa)
         hidden_states = hidden_states.astype(origin_dtype)
         return hidden_states
-
-
-def _apply_rotary_emb(
-    x: jax.Array, freqs_cos: jax.Array, freqs_sin: jax.Array, is_neox_style: bool = False
-) -> jax.Array:
-    pass
 
 
 class WanSelfAttention(nnx.Module):
@@ -385,7 +380,7 @@ class WanTimeTextImageEmbedding(nnx.Module):
 
 
 class WanTransformer3DModel(nnx.Module):
-    def __init__(self, config):
+    def __init__(self, config, *, rngs: nnx.Rngs = None):
         self.patch_size = config.patch_size
         self.hidden_size = config.hidden_dim
         self.num_attention_heads = config.num_heads
@@ -399,6 +394,7 @@ class WanTransformer3DModel(nnx.Module):
             embed_dim=inner_dim,
             patch_size=config.patch_size,
             flatten=False,
+            rngs=rngs,
         )
 
         self.condition_embedder = WanTimeTextImageEmbedding(
@@ -491,10 +487,10 @@ class WanTransformer3DModel(nnx.Module):
         )
         if ts_seq_len is not None:
             # batch_size, seq_len, 6, inner_dim
-            timestep_proj = timestep_proj.unflatten(2, (6, -1))
+            timestep_proj = timestep_proj.reshape(timestep_proj.shape[:2] + (6, -1))
         else:
             # batch_size, 6, inner_dim
-            timestep_proj = timestep_proj.unflatten(1, (6, -1))
+            timestep_proj = timestep_proj.reshape(timestep_proj.shape[:1] + (6, -1))
 
 
 EntryClass = WanTransformer3DModel
