@@ -5,8 +5,8 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from python.sgl_jax.srt.multimodal.layers.linear import ReplicatedLinear
-from python.sgl_jax.srt.multimodal.layers.mlp import MLP, get_act_fn
+from sgl_jax.srt.multimodal.layers.linear import ReplicatedLinear
+from sgl_jax.srt.multimodal.layers.mlp import MLP, get_act_fn
 
 
 class PatchEmbed(nnx.Module):
