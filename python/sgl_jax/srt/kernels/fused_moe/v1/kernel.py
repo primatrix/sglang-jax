@@ -123,24 +123,6 @@ def broadcast_minor(src, shape):
     ]
 
 
-# TODO(jevinjiang): Apply the same trick for load.
-def store_with_retiling(ref, val, *, is_acc: bool = False):
-    """Retiling (8, 128) to (1, 128) in store."""
-    assert ref.shape == val.shape
-    assert ref.dtype == val.dtype
-    assert get_dtype_packing(ref.dtype) == 1
-    assert len(ref.shape) == 2
-    assert ref.shape[1] % 128 == 0
-    a, b = ref.shape
-    folds = b // 128
-    reshaped_ref = ref.reshape(a * folds, 128)
-    for i in range(folds):
-        if is_acc:
-            reshaped_ref[pl.ds(i, a, folds)] += val[:, i * 128 : (i + 1) * 128]
-        else:
-            reshaped_ref[pl.ds(i, a, folds)] = val[:, i * 128 : (i + 1) * 128]
-
-
 def swigluoai(
     gate: jax.Array, up: jax.Array, *, alpha: float = 1.702, limit: float = 7.0
 ) -> jax.Array:
@@ -709,9 +691,10 @@ def _fused_ep_moe_kernel(
 
     def wait_a2a_gather_recv_all():
         sz = top_k * bt
+        ref = a2a_g_hbm.reshape(num_experts * bt, t_packing, hidden_size // t_packing)
         pltpu.make_async_copy(
-            src_ref=a2a_g_hbm.at[0, pl.ds(0, sz)],
-            dst_ref=a2a_g_hbm.at[0, pl.ds(0, sz)],
+            src_ref=ref.at[pl.ds(0, sz)],
+            dst_ref=ref.at[pl.ds(0, sz)],
             sem=a2a_gather_sem,
         ).wait()
 
