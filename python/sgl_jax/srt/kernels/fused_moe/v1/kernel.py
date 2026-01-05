@@ -716,9 +716,15 @@ def _fused_ep_moe_kernel(
         ).wait()
 
     def wait_a2a_gather_recv_all():
+        # Wait for all outstanding a2a gather receives.
+        #
+        # Note: `sz` can be larger than `bt` because each token contributes `top_k` expert
+        # activations. This wait is sem-driven; we use a canonical HBM slice ref and rely on
+        # the semaphore to track completion of all DMA operations enqueued on `a2a_gather_sem`.
+        sz = top_k * bt
         pltpu.make_async_copy(
-            src_ref=a2a_g_hbm.at[0, pl.ds(0, bt)],
-            dst_ref=a2a_g_hbm.at[0, pl.ds(0, bt)],
+            src_ref=a2a_g_hbm.at[0, pl.ds(0, sz)],
+            dst_ref=a2a_g_hbm.at[0, pl.ds(0, sz)],
             sem=a2a_gather_sem,
         ).wait()
 
