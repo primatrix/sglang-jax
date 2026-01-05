@@ -33,9 +33,8 @@ class MLP(nnx.Module):
         prefix: str = "",
     ):
         self.fc_in = ReplicatedLinear(
-            input_dim,
-            mlp_hidden_dim,
-            mesh=mesh,
+            input_size=input_dim,
+            output_size=mlp_hidden_dim,
             use_bias=bias,
             params_dtype=dtype,
         )
