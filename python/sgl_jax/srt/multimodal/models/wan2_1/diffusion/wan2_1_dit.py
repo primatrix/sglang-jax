@@ -24,9 +24,9 @@ class WanImageEmbedding(nnx.Module):
     def __init__(self, in_features: int, out_features: int):
         super().__init__()
 
-        self.norm1 = FP32LayerNorm(in_features)
+        self.norm1 = FP32LayerNorm(num_features=in_features, rngs=jax.random.PRNGKey(0))
         self.ff = MLP(in_features, in_features, out_features, act_type="gelu")
-        self.norm2 = FP32LayerNorm(out_features)
+        self.norm2 = FP32LayerNorm(num_features=out_features, rngs=jax.random.PRNGKey(0))
 
     def __call__(self, x: jax.Array) -> jax.Array:
         """
@@ -54,7 +54,7 @@ class WanTransformerBlock(nnx.Module):
     ):
         super().__init__()
 
-        self.norm1 = FP32LayerNorm(num_features=dim, epsilon=epsilon)
+        self.norm1 = FP32LayerNorm(num_features=dim, epsilon=epsilon, rngs=jax.random.PRNGKey(0))
 
         self.to_q = ReplicatedLinear(input_size=dim, output_size=dim, use_bias=True)
         self.to_k = ReplicatedLinear(input_size=dim, output_size=dim, use_bias=True)
@@ -359,7 +359,7 @@ class WanTimeTextImageEmbedding(nnx.Module):
 
         self.image_embedder = None
         if image_embed_dim is not None:
-            self.image_embedder = WanImageEmbedding(image_embed_dim, dim)
+            self.image_embedder = WanImageEmbedding(in_features=image_embed_dim, out_features=dim)
 
     def forward(
         self,
