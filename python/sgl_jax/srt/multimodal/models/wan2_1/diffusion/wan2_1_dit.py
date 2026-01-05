@@ -140,7 +140,7 @@ class WanTransformerBlock(nnx.Module):
         if len(hidden_states.shape) == 4:
             hidden_states = hidden_states.squeeze(1)
         bs, seq_len, _ = hidden_states.shape
-        origin_dtype = hidden_states.dtypeq
+        origin_dtype = hidden_states.dtype
         if temb.ndim == 4:
             # temb: [batch, seq_len, 6, inner_dim]
             e = self.scale_shift_table[None, None, :, :] + temb.astype(jnp.float32)
@@ -154,7 +154,7 @@ class WanTransformerBlock(nnx.Module):
 
         else:
             # temb: [batch, 6, inner_dim]
-            e = self.scale_shift_table[None, :, :] + temb.astype(jnp.float32)
+            e = self.scale_shift_table + temb.astype(jnp.float32)
 
             (shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa) = jnp.split(
                 e, 6, axis=1
@@ -376,7 +376,7 @@ class WanTimeTextImageEmbedding(nnx.Module):
                 WanImageEmbedding(in_features=image_embed_dim, out_features=dim)
             )
 
-    def forward(
+    def __call__(
         self,
         timestep: jax.Array,
         encoder_hidden_states: jax.Array,
@@ -444,6 +444,28 @@ class WanTransformer3DModel(nnx.Module):
             dtype=jnp.float32,
         )
 
+        # 4. Output norm & projection
+        from sgl_jax.srt.multimodal.layers.layernorm import LayerNormScaleShift
+
+        self.norm_out = LayerNormScaleShift(
+            inner_dim,
+            norm_type="layer",
+            epsilon=config.epsilon,
+            elementwise_affine=False,
+            dtype=jnp.float32,
+            compute_dtype=jnp.float32,
+        )
+        out_channels = getattr(config, "out_channels", config.in_channels)
+        self.proj_out = nnx.Linear(
+            in_features=inner_dim,
+            out_features=out_channels * int(jnp.prod(jnp.array(config.patch_size))),
+            use_bias=True,
+            rngs=rngs,
+        )
+        self.scale_shift_table = nnx.Param(
+            jax.random.normal(jax.random.key(0), (1, 2, inner_dim)) / (inner_dim**0.5)
+        )
+
     def __call__(
         self,
         hidden_states: jax.Array,
@@ -481,11 +503,16 @@ class WanTransformer3DModel(nnx.Module):
         #     else None
         # )
 
+        # Convert from channel-first (B, C, F, H, W) to channel-last (B, F, H, W, C) for nnx.Conv
+        hidden_states = jnp.transpose(hidden_states, (0, 2, 3, 4, 1))
         hidden_states = self.patch_embedding(hidden_states)
-        hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        # Flatten spatial dimensions: (B, F', H', W', C) -> (B, F'*H'*W', C)
+        batch_size = hidden_states.shape[0]
+        embed_dim = hidden_states.shape[-1]
+        hidden_states = hidden_states.reshape(batch_size, -1, embed_dim)
 
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
-        if timesteps.dim() == 2:
+        if timesteps.ndim == 2:
             # ti2v
             ts_seq_len = timesteps.shape[1]
             timesteps = timesteps.flatten()  # batch_size * seq_len
@@ -506,6 +533,60 @@ class WanTransformer3DModel(nnx.Module):
         else:
             # batch_size, 6, inner_dim
             timestep_proj = timestep_proj.reshape(timestep_proj.shape[:1] + (6, -1))
+
+        # Concatenate image and text embeddings if image embeddings exist
+        if encoder_hidden_states_image is not None:
+            encoder_hidden_states = jnp.concatenate(
+                [encoder_hidden_states_image, encoder_hidden_states], axis=1
+            )
+
+        # 4. Transformer blocks
+        freqs_cis = (freqs_cos, freqs_sin)
+        for block in self.blocks:
+            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, freqs_cis)
+
+        # 5. Output norm, projection & unpatchify
+        if temb.ndim == 3:
+            # batch_size, seq_len, inner_dim (wan 2.2 ti2v)
+            combined = self.scale_shift_table[None, :, :, :] + temb[:, :, None, :]
+            # Split into shift and scale
+            shift, scale = jnp.split(combined, 2, axis=2)
+            shift = jnp.squeeze(shift, axis=2)
+            scale = jnp.squeeze(scale, axis=2)
+        else:
+            # batch_size, inner_dim
+            combined = self.scale_shift_table + temb[:, None, :]
+            shift, scale = jnp.split(combined, 2, axis=1)
+
+        hidden_states = self.norm_out(hidden_states, shift, scale)
+        hidden_states = self.proj_out(hidden_states)
+
+        # Unpatchify: reshape from patches back to image space
+        # hidden_states shape: [batch_size, num_patches, out_channels * patch_volume]
+        p_t, p_h, p_w = self.patch_size
+        hidden_states = hidden_states.reshape(
+            batch_size,
+            post_patch_num_frames,
+            post_patch_height,
+            post_patch_width,
+            p_t,
+            p_h,
+            p_w,
+            -1,  # out_channels
+        )
+        # Permute to rearrange patches: [B, out_channels, F, p_t, H, p_h, W, p_w]
+        hidden_states = jnp.transpose(hidden_states, (0, 7, 1, 4, 2, 5, 3, 6))
+
+        # Flatten patch dimensions to get final output: [B, C, F*p_t, H*p_h, W*p_w]
+        output = hidden_states.reshape(
+            batch_size,
+            -1,  # out_channels
+            post_patch_num_frames * p_t,
+            post_patch_height * p_h,
+            post_patch_width * p_w,
+        )
+
+        return output
 
 
 EntryClass = WanTransformer3DModel

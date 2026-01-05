@@ -165,6 +165,6 @@ class ModulateProjection(nnx.Module):
         """
         Apply the modulated projection to the input tensor.
         """
-        x = self.linear(x)
-        x, _ = self.act(x)
+        x = self.act(x)
+        x, _ = self.linear(x)
         return x

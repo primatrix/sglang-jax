@@ -52,9 +52,9 @@ class ReplicatedLinear(LinearBase):
             )
 
     def __call__(self, inputs: jax.Array) -> tuple[jax.Array, jax.Array | None]:
-        output = jnp.dot(inputs, self.weight.value)
+        output = jnp.dot(inputs, self.weight[...])
         if self.skip_bias_add:
-            return output, self.bias.value if hasattr(self, "bias") else None
+            return output, self.bias[...] if hasattr(self, "bias") else None
         if hasattr(self, "bias"):
-            output = output + self.bias.value
-        return output, self.bias.value if hasattr(self, "bias") else None
+            output = output + self.bias[...]
+        return output, self.bias[...] if hasattr(self, "bias") else None
