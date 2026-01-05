@@ -43,7 +43,7 @@ class MLP(nnx.Module):
         if output_dim is None:
             output_dim = input_dim
         self.fc_out = ReplicatedLinear(
-            mlp_hidden_dim, output_dim, mesh=mesh, use_bias=bias, params_dtype=dtype
+            input_size=mlp_hidden_dim, output_size=output_dim, use_bias=bias, params_dtype=dtype
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
