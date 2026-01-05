@@ -466,7 +466,6 @@ def _fused_ep_moe_kernel(
         return (dp_rank, ep_rank)
 
     def sync_barrier():
-        # Ring-style barrier (matches f5b4f079): signal right neighbor and wait once.
         pltpu.semaphore_signal(
             barrier_sem,
             device_id=get_mesh_device_id(right_id),
@@ -479,15 +478,8 @@ def _fused_ep_moe_kernel(
         sz = pl.multiple_of(lax.select(is_valid, bt, 0), bt)
         bt_sem_id = (bt_id + 2) % 2
         b_gating_sem = local_sems.at[bt_sem_id, 0]
-        bt_start = lax.select(is_valid, bt_id * bt, 0)
-        # Hint Mosaic about HBM tiling alignment for `tpu.memref_slice`:
-        # - f32 is typically tiled as (8, 128)
-        # - bf16/f16 is typically tiled as (16, 128)
-        # Using a dtype-derived factor is more robust than hardcoding 8.
-        gating_tile0 = 256 // dtypes.itemsize_bits(gating_hbm.dtype)
-        bt_start = pl.multiple_of(bt_start, gating_tile0) if bt % gating_tile0 == 0 else bt_start
         pltpu.make_async_copy(
-            src_ref=gating_hbm.at[pl.ds(bt_start, sz)],
+            src_ref=gating_hbm.at[pl.ds(bt_id * bt, sz)],
             dst_ref=b_gating_x2_vmem.at[bt_sem_id, pl.ds(0, sz)],
             sem=b_gating_sem,
         ).start(priority=priority)
@@ -709,23 +701,19 @@ def _fused_ep_moe_kernel(
         remote_sz = sz - local_sz
         is_valid = jnp.logical_and(local_e_id >= 0, local_e_id < local_num_experts)
         remote_sz = lax.select(is_valid, remote_sz, 0)
-        # Drain outstanding remote sends for this expert.
-        # Use a VMEM self-copy as the wait handle to avoid HBM reshape/slice pitfalls.
+        ref = a2a_g_hbm.reshape(num_experts * bt, t_packing, hidden_size // t_packing)
         pltpu.make_async_copy(
-            src_ref=a2a_s_acc_x2_vmem.at[e_sem_id, pl.ds(0, remote_sz)],
-            dst_ref=a2a_s_acc_x2_vmem.at[e_sem_id, pl.ds(0, remote_sz)],
+            src_ref=ref.at[pl.ds(0, remote_sz)],
+            dst_ref=ref.at[pl.ds(0, remote_sz)],
             sem=send_sems.at[e_sem_id],
         ).wait()
 
     def wait_a2a_gather_recv_all():
-        # Wait for all outstanding a2a gather receives.
-        #
-        # Note: the total receive volume is `top_k * bt` tokens, which can exceed the
-        # per-expert `bt` capacity along `a2a_g_hbm`'s token dimension. Use a VMEM buffer
-        # with matching logical volume as the wait handle.
+        sz = top_k * bt
+        ref = a2a_g_hbm.reshape(num_experts * bt, t_packing, hidden_size // t_packing)
         pltpu.make_async_copy(
-            src_ref=a2a_g_acc_vmem,
-            dst_ref=a2a_g_acc_vmem,
+            src_ref=ref.at[pl.ds(0, sz)],
+            dst_ref=ref.at[pl.ds(0, sz)],
             sem=a2a_gather_sem,
         ).wait()
 
