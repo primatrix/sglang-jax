@@ -701,19 +701,17 @@ def _fused_ep_moe_kernel(
         remote_sz = sz - local_sz
         is_valid = jnp.logical_and(local_e_id >= 0, local_e_id < local_num_experts)
         remote_sz = lax.select(is_valid, remote_sz, 0)
-        ref = a2a_g_hbm.reshape(num_experts * bt, t_packing, hidden_size // t_packing)
         pltpu.make_async_copy(
-            src_ref=ref.at[pl.ds(0, remote_sz)],
-            dst_ref=ref.at[pl.ds(0, remote_sz)],
+            src_ref=a2a_g_hbm.at[0, pl.ds(0, remote_sz)],
+            dst_ref=a2a_g_hbm.at[0, pl.ds(0, remote_sz)],
             sem=send_sems.at[e_sem_id],
         ).wait()
 
     def wait_a2a_gather_recv_all():
         sz = top_k * bt
-        ref = a2a_g_hbm.reshape(num_experts * bt, t_packing, hidden_size // t_packing)
         pltpu.make_async_copy(
-            src_ref=ref.at[pl.ds(0, sz)],
-            dst_ref=ref.at[pl.ds(0, sz)],
+            src_ref=a2a_g_hbm.at[0, pl.ds(0, sz)],
+            dst_ref=a2a_g_hbm.at[0, pl.ds(0, sz)],
             sem=a2a_gather_sem,
         ).wait()
 
@@ -994,15 +992,11 @@ def _fused_ep_moe_kernel(
                                 b3 = jnp.broadcast_to(b3_vmem[*b3_scale_slices], acc1.shape)
                                 acc3 += b3
 
-                            acc1_vmem_slice = acc1_vmem.at[*acc_slices]
-                            acc3_vmem_slice = acc3_vmem.at[*acc_slices]
-                            store_with_retiling(acc1_vmem_slice, acc1)
-                            store_with_retiling(acc3_vmem_slice, acc3)
+                            acc1_vmem[*acc_slices] = acc1
+                            acc3_vmem[*acc_slices] = acc3
                         else:
-                            acc1_vmem_slice = acc1_vmem.at[*acc_slices]
-                            acc3_vmem_slice = acc3_vmem.at[*acc_slices]
-                            store_with_retiling(acc1_vmem_slice, acc1, is_acc=True)
-                            store_with_retiling(acc3_vmem_slice, acc3, is_acc=True)
+                            acc1_vmem[*acc_slices] += acc1
+                            acc3_vmem[*acc_slices] += acc3
 
         lax.fori_loop(0, num_loops, body, None)
 
