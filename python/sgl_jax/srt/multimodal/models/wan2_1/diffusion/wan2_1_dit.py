@@ -12,7 +12,12 @@ from sgl_jax.srt.multimodal.layers.layernorm import (
 from sgl_jax.srt.multimodal.layers.linear import ReplicatedLinear
 from sgl_jax.srt.multimodal.layers.mlp import MLP
 from sgl_jax.srt.multimodal.layers.rotary_embedding import NDRotaryEmbedding
-from sgl_jax.srt.multimodal.layers.visual_embedding import PatchEmbed
+from sgl_jax.srt.multimodal.layers.visual_embedding import (
+    ModulateProjection,
+    PatchEmbed,
+    TimestepEmbedder,
+    WanImageEmbedding,
+)
 
 
 class WanTransformerBlock(nnx.Module):
@@ -322,7 +327,42 @@ class WanI2VCrossAttention(WanSelfAttention):
 
 
 class WanTimeTextImageEmbedding(nnx.Module):
-    pass
+
+    def __init__(
+        self,
+        dim: int,
+        time_freq_dim: int,
+        text_embed_dim: int,
+        image_embed_dim: int | None = None,
+    ):
+        super().__init__()
+
+        self.time_embedder = TimestepEmbedder(
+            dim, frequency_embedding_size=time_freq_dim, act_layer="silu"
+        )
+        self.time_modulation = ModulateProjection(dim, factor=6, act_layer="silu")
+        self.text_embedder = MLP(text_embed_dim, dim, dim, bias=True, act_type="gelu_pytorch_tanh")
+
+        self.image_embedder = None
+        if image_embed_dim is not None:
+            self.image_embedder = WanImageEmbedding(image_embed_dim, dim)
+
+    def forward(
+        self,
+        timestep: jax.Array,
+        encoder_hidden_states: jax.Array,
+        encoder_hidden_states_image: jax.Array | None = None,
+        timestep_seq_len: int | None = None,
+    ):
+        temb = self.time_embedder(timestep, timestep_seq_len)
+        timestep_proj = self.time_modulation(temb)
+
+        encoder_hidden_states = self.text_embedder(encoder_hidden_states)
+        if encoder_hidden_states_image is not None:
+            assert self.image_embedder is not None
+            encoder_hidden_states_image = self.image_embedder(encoder_hidden_states_image)
+
+        return temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image
 
 
 class WanTransformer3DModel:

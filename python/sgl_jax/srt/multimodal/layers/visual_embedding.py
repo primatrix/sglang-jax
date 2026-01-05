@@ -62,3 +62,15 @@ class PatchEmbed(nnx.Module):
             x = x.reshape(b, -1, c)
         x = self.norm(x)
         return x
+
+
+class TimestepEmbedder(nnx.Module):
+    pass
+
+
+class ModulateProjection(nnx.Module):
+    pass
+
+
+class WanImageEmbedding(nnx.Module):
+    pass
