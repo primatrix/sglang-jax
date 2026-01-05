@@ -24,9 +24,14 @@ class WanImageEmbedding(nnx.Module):
     def __init__(self, in_features: int, out_features: int):
         super().__init__()
 
-        self.norm1 = FP32LayerNorm(num_features=in_features, rngs=jax.random.PRNGKey(0))
-        self.ff = MLP(in_features, in_features, out_features, act_type="gelu")
-        self.norm2 = FP32LayerNorm(num_features=out_features, rngs=jax.random.PRNGKey(0))
+        self.norm1 = FP32LayerNorm(num_features=in_features, rngs=nnx.Rngs(0))
+        self.ff = MLP(
+            input_dim=in_features,
+            mlp_hidden_dim=in_features,
+            output_dim=out_features,
+            act_type="gelu",
+        )
+        self.norm2 = FP32LayerNorm(num_features=out_features, rngs=nnx.Rngs(0))
 
     def __call__(self, x: jax.Array) -> jax.Array:
         """
@@ -54,7 +59,7 @@ class WanTransformerBlock(nnx.Module):
     ):
         super().__init__()
 
-        self.norm1 = FP32LayerNorm(num_features=dim, epsilon=epsilon, rngs=jax.random.PRNGKey(0))
+        self.norm1 = FP32LayerNorm(num_features=dim, epsilon=epsilon, rngs=nnx.Rngs(0))
 
         self.to_q = ReplicatedLinear(input_size=dim, output_size=dim, use_bias=True)
         self.to_k = ReplicatedLinear(input_size=dim, output_size=dim, use_bias=True)
@@ -118,10 +123,12 @@ class WanTransformerBlock(nnx.Module):
         )
 
         # 3. Feed-forward
-        self.ffn = MLP(dim, ffn_dim, act_type="gelu_pytorch_tanh")
+        self.ffn = MLP(input_dim=dim, mlp_hidden_dim=ffn_dim, act_type="gelu_pytorch_tanh")
         self.mlp_residual = ScaleResidual()
 
-        self.scale_shift_table = nnx.Param(jax.random.randn(1, 6, dim) / dim**0.5)
+        self.scale_shift_table = nnx.Param(
+            jax.random.normal(jax.random.key(0), (1, 6, dim)) / (dim**0.5)
+        )
 
     def __call__(
         self,
@@ -355,11 +362,19 @@ class WanTimeTextImageEmbedding(nnx.Module):
             dim, frequency_embedding_size=time_freq_dim, act_layer="silu"
         )
         self.time_modulation = ModulateProjection(dim, factor=6, act_layer="silu")
-        self.text_embedder = MLP(text_embed_dim, dim, dim, bias=True, act_type="gelu_pytorch_tanh")
+        self.text_embedder = MLP(
+            input_dim=text_embed_dim,
+            mlp_hidden_dim=dim,
+            output_dim=dim,
+            bias=True,
+            act_type="gelu_pytorch_tanh",
+        )
 
         self.image_embedder = None
         if image_embed_dim is not None:
-            self.image_embedder = WanImageEmbedding(in_features=image_embed_dim, out_features=dim)
+            self.image_embedder = nnx.data(
+                WanImageEmbedding(in_features=image_embed_dim, out_features=dim)
+            )
 
     def forward(
         self,
@@ -384,6 +399,7 @@ class WanTransformer3DModel(nnx.Module):
         self.patch_size = config.patch_size
         self.hidden_size = config.hidden_dim
         self.num_attention_heads = config.num_heads
+        self.in_channels = config.in_channels
         self.sp_size = 1
         d = self.hidden_size // self.num_attention_heads
         self.rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
@@ -407,7 +423,7 @@ class WanTransformer3DModel(nnx.Module):
         # 3. Transformer blocks
         # attn_backend = get_global_server_args().attention_backend
         transformer_block = WanTransformerBlock
-        self.blocks = nnx.list(
+        self.blocks = nnx.List(
             [
                 transformer_block(
                     inner_dim,
@@ -427,7 +443,6 @@ class WanTransformer3DModel(nnx.Module):
             rope_theta=10000,
             dtype=jnp.float32,
         )
-        pass
 
     def __call__(
         self,

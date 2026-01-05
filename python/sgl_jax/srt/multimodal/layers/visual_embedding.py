@@ -87,9 +87,9 @@ class TimestepEmbedder(nnx.Module):
         self.max_period = max_period
 
         self.mlp = MLP(
-            frequency_embedding_size,
-            hidden_size,
-            hidden_size,
+            input_dim=frequency_embedding_size,
+            mlp_hidden_dim=hidden_size,
+            output_dim=hidden_size,
             act_type=act_layer,
             dtype=dtype,
         )

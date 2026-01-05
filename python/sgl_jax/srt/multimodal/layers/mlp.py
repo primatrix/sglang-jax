@@ -25,7 +25,6 @@ class MLP(nnx.Module):
         self,
         input_dim: int,
         mlp_hidden_dim: int,
-        mesh: jax.sharding.Mesh,
         output_dim: int | None = None,
         bias: bool = True,
         act_type: str = "gelu_pytorch_tanh",
