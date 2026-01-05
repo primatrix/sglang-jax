@@ -707,19 +707,18 @@ def _fused_ep_moe_kernel(
         remote_sz = sz - local_sz
         is_valid = jnp.logical_and(local_e_id >= 0, local_e_id < local_num_experts)
         remote_sz = lax.select(is_valid, remote_sz, 0)
-        ref = a2a_g_hbm.reshape(num_experts * bt, t_packing, hidden_size // t_packing)
+        # Avoid using an HBM `reshape()` view as a dst ref: Mosaic may fail to prove tiling
+        # alignment for `tpu.memref_slice` on reshaped HBM buffers.
         pltpu.make_async_copy(
-            src_ref=ref.at[pl.ds(0, remote_sz)],
-            dst_ref=ref.at[pl.ds(0, remote_sz)],
+            src_ref=a2a_g_hbm.at[0, pl.ds(0, remote_sz)],
+            dst_ref=a2a_g_hbm.at[0, pl.ds(0, remote_sz)],
             sem=send_sems.at[e_sem_id],
         ).wait()
 
     def wait_a2a_gather_recv_all():
-        sz = top_k * bt
-        ref = a2a_g_hbm.reshape(num_experts * bt, t_packing, hidden_size // t_packing)
         pltpu.make_async_copy(
-            src_ref=ref.at[pl.ds(0, sz)],
-            dst_ref=ref.at[pl.ds(0, sz)],
+            src_ref=a2a_g_hbm.at[0, pl.ds(0, bt)],
+            dst_ref=a2a_g_hbm.at[0, pl.ds(0, bt)],
             sem=a2a_gather_sem,
         ).wait()
 
