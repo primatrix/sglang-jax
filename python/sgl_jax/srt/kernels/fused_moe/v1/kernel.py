@@ -444,6 +444,7 @@ def _fused_ep_moe_kernel(
     my_id = lax.axis_index(ep_axis_name)
     num_devices = lax.axis_size(ep_axis_name)
     local_num_tokens = tokens_hbm.shape[0]
+    print(f"{tokens_hbm.shape=}")
     local_num_experts, intermediate_size, hidden_size = w2_hbm.shape
     output_bt = b_output_x2_vmem.shape[1]
     assert local_num_tokens % output_bt == 0, (local_num_tokens, output_bt)
@@ -684,6 +685,7 @@ def _fused_ep_moe_kernel(
             src_t_id = bt_start + t_id
             for k_id in range(top_k):
                 e_id = t2e_routing_smem[bt_sem_id, t_id, k_id]
+                # e_id = src_t_id % num_experts
                 is_active_expert = e_id % local_num_experts == local_e_id
                 recv_id = e_id // local_num_experts
                 offset = expert_offsets_smem[bt_sem_id, 0, e_id]
@@ -1571,13 +1573,12 @@ def _fused_ep_moe_kernel(
         wait_a2a_scatter_recv(bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=local_e_id)
 
         # Perform FFN for CURRENT active expert.
-        if a2a_only:
+        if not a2a_only:
             wait_a2a_gather_send(bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=local_e_id - 2)
-        else:
             expert_ffn(bt_sem_id, e_sem_id, local_e_id)
 
-        # Start a2a gather to send back tokens for CURRENT active expert.
-        start_a2a_gather(bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=local_e_id)
+            # Start a2a gather to send back tokens for CURRENT active expert.
+            start_a2a_gather(bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=local_e_id)
 
         # A must-wait before next sync_barrier.
         wait_a2a_scatter_send(e_sem_id)
@@ -1639,37 +1640,40 @@ def _fused_ep_moe_kernel(
         )
 
         # Wait to receive a2a gather for ALL experts before consuming `a2a_g_hbm`.
-        wait_a2a_gather_recv_all(bt_size=output_bt)
+        if not a2a_only:
+            wait_a2a_gather_recv_all(bt_size=output_bt)
         sync_barrier()
 
         out_buf_id = bt_id & jnp.int32(1)
         # Make sure it is safe to overwrite output buffer (bt_id-2 uses the same buffer).
         # Note: epic overlaps this wait with bt_acc compute by delaying the store into b_output_x2_vmem.
         # Our acc path writes directly into b_output_x2_vmem during reduction, so we must wait before acc.
-        wait_store_output(bt_id=bt_id - jnp.int32(2))
+        if not a2a_only:
+            wait_store_output(bt_id=bt_id - jnp.int32(2))
 
-        # Accumulate results for current bt into b_output_x2_vmem, then start async send to output_hbm.
-        acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
-        start_send_bo(bt_id=bt_id)
+            # Accumulate results for current bt into b_output_x2_vmem, then start async send to output_hbm.
+            acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
+            start_send_bo(bt_id=bt_id)
 
-        # Drain the last outstanding gather sends (the loop body waits `local_e_id - 2`).
-        wait_a2a_gather_send(
-            bt_sem_id=bt_sem_id,
-            e_sem_id=e_sem_id,
-            local_e_id=local_num_experts - 2,
-        )
-        wait_a2a_gather_send(
-            bt_sem_id=bt_sem_id,
-            e_sem_id=lax.select(e_sem_id == 0, 1, 0),
-            local_e_id=local_num_experts - 1,
-        )
+            # Drain the last outstanding gather sends (the loop body waits `local_e_id - 2`).
+            wait_a2a_gather_send(
+                bt_sem_id=bt_sem_id,
+                e_sem_id=e_sem_id,
+                local_e_id=local_num_experts - 2,
+            )
+            wait_a2a_gather_send(
+                bt_sem_id=bt_sem_id,
+                e_sem_id=lax.select(e_sem_id == 0, 1, 0),
+                local_e_id=local_num_experts - 1,
+            )
         sync_barrier()
         return e_sem_id
 
     lax.fori_loop(0, num_bt, run_bt, jnp.int32(0), unroll=False)
     # Drain outstanding output stores (matches epic wait_send_bo for last two bts).
-    wait_store_output(bt_id=jnp.int32(num_bt - 2))
-    wait_store_output(bt_id=jnp.int32(num_bt - 1))
+    if not a2a_only:
+        wait_store_output(bt_id=jnp.int32(num_bt - 2))
+        wait_store_output(bt_id=jnp.int32(num_bt - 1))
 
     ### ------- Kernel end ------- ###
 
