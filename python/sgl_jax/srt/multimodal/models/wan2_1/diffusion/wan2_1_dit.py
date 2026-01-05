@@ -16,8 +16,27 @@ from sgl_jax.srt.multimodal.layers.visual_embedding import (
     ModulateProjection,
     PatchEmbed,
     TimestepEmbedder,
-    WanImageEmbedding,
 )
+
+
+class WanImageEmbedding(nnx.Module):
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+
+        self.norm1 = FP32LayerNorm(in_features)
+        self.ff = MLP(in_features, in_features, out_features, act_type="gelu")
+        self.norm2 = FP32LayerNorm(out_features)
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        """
+        Args:
+            x: Input tensor of shape (B, L, C) -> Channel Last
+        """
+        origin_dtype = x.dtype
+        x = self.norm1(x)
+        x = self.ff(x)
+        x = self.norm2(x).astype(origin_dtype)
+        return x
 
 
 class WanTransformerBlock(nnx.Module):
@@ -365,7 +384,7 @@ class WanTimeTextImageEmbedding(nnx.Module):
         return temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image
 
 
-class WanTransformer3DModel:
+class WanTransformer3DModel(nnx.Module):
     def __init__(self, config):
         self.patch_size = config.patch_size
         self.hidden_size = config.hidden_dim
