@@ -883,6 +883,19 @@ class AutoencoderKLWan(nnx.Module):
             raise NotImplementedError
 
         return out
+    
+    def load_weights(self, model_config: ModelConfig):
+        loader = WeightLoader(
+            model=self,
+            model_config=model_config,
+            mesh=self.mesh,
+            dtype=self.dtype,
+        )
+
+        weight_mappings = to_mappings()
+
+        loader.load_weights_from_safetensors(weight_mappings)
+        logger.info("wanvae weights loaded successfully!")
 
 
 EntryClass = AutoencoderKLWan
