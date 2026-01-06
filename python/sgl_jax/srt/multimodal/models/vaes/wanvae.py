@@ -14,17 +14,21 @@
 # limitations under the License.
 
 from typing import Any
-
+import logging
 import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax import Array
 from jax.lax import Precision
 
+from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.multimodal.configs.models.vaes.wanvae import WanVAEConfig
 from sgl_jax.srt.multimodal.models.vaes.commons import DiagonalGaussianDistribution
+from sgl_jax.srt.multimodal.models.vaes.weight_mapping import to_mappings
+from sgl_jax.srt.utils.weight_utils import WeightLoader
 
 CACHE_T = 2
+logger = logging.getLogger(__name__)
 
 
 class CausalConv3d(nnx.Module):
