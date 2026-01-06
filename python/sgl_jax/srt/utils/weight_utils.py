@@ -2,6 +2,8 @@ import glob
 import logging
 import os
 import pickle
+import re
+import copy
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -483,10 +485,44 @@ class WeightLoader:
         moe_mappings = {}
 
         for key, mapping in weight_mappings.items():
-            if key.startswith("__MOE_EXPERTS__"):
-                moe_mappings[key] = mapping
+            if "*" not in key:
+                if key.startswith("__MOE_EXPERTS__"):
+                    moe_mappings[key] = mapping
+                else:
+                    regular_mappings[key] = mapping
             else:
-                regular_mappings[key] = mapping
+                key_as_regex = key.replace("*", "(*)")
+                for weight_info_key, _ in weight_info.items():
+                    match = re.search(key_as_regex, weight_info_key)
+                    if match:
+                        matched_parts = match.groups()
+
+                        if isinstance(mapping, str):
+                            format_template = mapping.replace('*', '{}')
+                            replaced_mapping = format_template.format(*matched_parts)
+                        elif isinstance(mapping, list):
+                            format_template = mapping[0].replace('*', '{}')
+                            replaced_str = format_template.format(*matched_parts)
+                            replaced_mapping = [replaced_str, *mapping[1:]]
+                        elif isinstance(mapping, tuple):
+                            format_template = mapping[0].replace('*', '{}')
+                            replaced_str = format_template.format(*matched_parts)
+                            replaced_mapping = (replaced_str, *mapping[1:])
+                        elif isinstance(mapping, WeightMapping):
+                            format_template = mapping.target_path.replace('*', '{}')
+                            replaced_path = format_template.format(*matched_parts)
+                            replaced_mapping = copy.copy(mapping)
+                            replaced_mapping.target_path = replaced_path
+                        else:
+                            replaced_mapping = mapping
+
+
+                        if key.startswith("__MOE_EXPERTS__"):
+                            moe_mappings[weight_info_key] = replaced_mapping
+                        else:
+                            regular_mappings[weight_info_key] = replaced_mapping
+
+
 
         logger.info("Starting parallel weight loading via JAX Lazy Loader...")
 
