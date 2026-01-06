@@ -1582,7 +1582,7 @@ def _fused_ep_moe_kernel(
 
         # A must-wait before next sync_barrier.
         wait_a2a_scatter_send(e_sem_id)
-        sync_barrier()
+        # sync_barrier()
         return next_e_sem_id
 
     if num_bt >= 1:
@@ -1642,7 +1642,7 @@ def _fused_ep_moe_kernel(
         # Wait to receive a2a gather for ALL experts before consuming `a2a_g_hbm`.
         if not a2a_only:
             wait_a2a_gather_recv_all(bt_size=output_bt)
-        sync_barrier()
+        # sync_barrier()
 
         out_buf_id = bt_id & jnp.int32(1)
         # Make sure it is safe to overwrite output buffer (bt_id-2 uses the same buffer).
@@ -1666,7 +1666,7 @@ def _fused_ep_moe_kernel(
                 e_sem_id=lax.select(e_sem_id == 0, 1, 0),
                 local_e_id=local_num_experts - 1,
             )
-        sync_barrier()
+        # sync_barrier()
         return e_sem_id
 
     lax.fori_loop(0, num_bt, run_bt, jnp.int32(0), unroll=False)
