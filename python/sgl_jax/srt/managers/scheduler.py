@@ -635,7 +635,7 @@ class Scheduler(
             extra_key=recv_req.extra_key,
             eos_token_ids=self.model_config.hf_eos_token_id,
             vocab_size=self.model_config.vocab_size,
-            return_hidden_states = self.recv_req.return_hidden_states,
+            return_hidden_states = recv_req.return_hidden_states,
         )
         req.tokenizer = self.tokenizer
 
