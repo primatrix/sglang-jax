@@ -15,7 +15,6 @@
 """Inference-only UMT5 model compatible with HuggingFace weights."""
 
 import copy
-import logging
 import math
 from typing import Any, Optional, Dict
 
@@ -33,8 +32,6 @@ from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
-
-logger = logging.getLogger(__name__)
 
 
 def fp16_clamp(x: jax.Array):
@@ -580,9 +577,6 @@ class UMT5Stack(nnx.Module):
         # Copy to all other layers
         for i in range(1, len(self.block)):
             self.block[i].layer0_SelfAttention.relative_attention_bias.embedding[...] = layer0_bias
-        
-        logger.debug(f"Shared relative_attention_bias from layer 0 to {len(self.block)-1} other layers")
-
     def __call__(
         self, 
         hidden_states: jax.Array,
@@ -652,8 +646,6 @@ class UMT5EncoderModel(nnx.Module):
         loader.load_weights_from_safetensors(weight_mappings)
         
         # No need to share relative_attention_bias - each layer loads its own weights
-        
-        logger.info("UMT5Encoder weights loaded successfully!")
     
     def _create_weight_mappings(self) -> dict:
         """Create mappings from HuggingFace weight names to JAX model parameters."""
@@ -731,8 +723,6 @@ class UMT5DecoderModel(nnx.Module):
         loader.load_weights_from_safetensors(weight_mappings)
         
         # No need to share relative_attention_bias - each layer loads its own weights
-        
-        logger.info("UMT5Decoder weights loaded successfully!")
     
     def _create_weight_mappings(self) -> dict:
         """Create weight mappings for decoder model."""
@@ -834,8 +824,6 @@ class UMT5Model(nnx.Module):
         loader.load_weights_from_safetensors(weight_mappings)
         
         # No need to share relative_attention_bias - each layer loads its own weights
-        
-        logger.info("UMT5Model (Encoder-Decoder) weights loaded successfully!")
     
     def _create_weight_mappings(self) -> dict:
         """Create mappings from HuggingFace weight names to JAX model parameters."""
@@ -956,9 +944,6 @@ class UMT5ForConditionalGeneration(nnx.Module):
         loader.load_weights_from_safetensors(weight_mappings)
         
         # No need to share relative_attention_bias - each layer loads its own weights
-        
-        logger.info("UMT5 weights loaded successfully!")
-
     def _create_weight_mappings(self) -> dict:
         """Create mappings from HuggingFace weight names to JAX model parameters."""
         mappings = {
