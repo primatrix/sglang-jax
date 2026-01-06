@@ -326,7 +326,11 @@ def run_all(
     *,
     warmup_iters: int = 1,
     a2a_only: bool = False,
+    balanced_routing: bool = False,
     no_comm: bool = False,
+    gather_only: bool = False,
+    scatter_only: bool = False,
+    ffn_only: bool = False,
     tune_block_config: bool = False,
     bt_candidates: list[int] | None = None,
     bts_candidates: list[int] | None = None,
@@ -373,6 +377,14 @@ def run_all(
     print(f"Running fused_moe benchmarks with scenario='{scenario}', dtype={dtype}")
     if a2a_only:
         print("  mode: a2a_only=True")
+    if gather_only:
+        print("  mode: gather_only=True")
+    if scatter_only:
+        print("  mode: scatter_only=True")
+    if ffn_only:
+        print("  mode: ffn_only=True")
+    if balanced_routing:
+        print("  mode: balanced_routing=True")
     if no_comm:
         print("  mode: no_comm=True")
     for case in cases:
@@ -418,6 +430,10 @@ def run_all(
                 layer_id=0,
                 renormalize_topk_logits=case.renormalize_topk_logits,
                 a2a_only=a2a_only,
+                gather_only=gather_only,
+                scatter_only=scatter_only,
+                ffn_only=ffn_only,
+                balanced_routing=balanced_routing,
                 no_comm=no_comm,
             )
 
@@ -534,12 +550,32 @@ def parse_args() -> argparse.Namespace:
         help="Skip expert FFN compute (measure mostly routing + A2A + accumulation).",
     )
     parser.add_argument(
+        "--balanced-routing",
+        action="store_true",
+        help="Balanced experts routing.",
+    )
+    parser.add_argument(
         "--no-comm",
         action="store_true",
         help=(
             "Disable cross-device communication (no all-reduce / no A2A remote copies). "
             "This is a perf microbenchmark mode and does not preserve EP-MoE semantics."
         ),
+    )
+    parser.add_argument(
+        "--gather-only",
+        action="store_true",
+        help="Only gather tokens from experts.",
+    )
+    parser.add_argument(
+        "--scatter-only",
+        action="store_true",
+        help="Only scatter tokens to experts.",
+    )
+    parser.add_argument(
+        "--ffn-only",
+        action="store_true",
+        help="FFN Only.",
     )
     parser.add_argument(
         "--tune-block-config",
@@ -614,6 +650,10 @@ if __name__ == "__main__":
         args.iters,
         warmup_iters=args.warmup_iters,
         a2a_only=args.a2a_only,
+        gather_only=args.gather_only,
+        scatter_only=args.scatter_only,
+        ffn_only=args.ffn_only,
+        balanced_routing=args.balanced_routing,
         no_comm=args.no_comm,
         tune_block_config=args.tune_block_config,
         bt_candidates=args.bt_candidates,

@@ -428,6 +428,10 @@ def _fused_ep_moe_kernel(
     ep_axis_name: str,
     act_fn: str,
     a2a_only: bool = False,
+    gather_only: bool = False,
+    scatter_only: bool = False,
+    ffn_only: bool = False,
+    balanced_routing: bool = False,
     no_comm: bool = False,
     subc_quant_wsz: int | None = None,
     # Kernel tuning params.
@@ -540,53 +544,94 @@ def _fused_ep_moe_kernel(
             sem=b_gating_sem,
         ).wait()
 
-    def get_top_k(input, top_k, renormalize_topk_logits, *, out_top_k_logits_vmem):
-        assert len(input.shape) == 2, input.shape
-        input = input.astype(jnp.float32)
-        padded_k_shape = (input.shape[0], padded_top_k)
-        top_k_logits_lst = []
-        top_k_indices_lst = []
-        t2e = jnp.zeros(input.shape, dtype=jnp.int32)
-        t2e_routing = jnp.zeros(padded_k_shape, dtype=jnp.int32)
-        iota = jax.lax.broadcasted_iota(jnp.int32, input.shape, 1)
-        padded_k_iota = jax.lax.broadcasted_iota(jnp.int32, padded_k_shape, 1)
-        top_k_logits_sum = jnp.zeros(padded_k_shape, jnp.float32)
+    def get_top_k(
+        input, top_k, renormalize_topk_logits, *, out_top_k_logits_vmem, balanced_routing=False
+    ):
+        if balanced_routing:
+            num_tokens = input.shape[0]
 
-        for k_id in range(top_k):
-            # TODO(jevinjiang): return both top_k values and indices in Mosaic
-            top_k_logits = jnp.broadcast_to(
-                jnp.max(input[:, :num_experts], axis=1, keepdims=True),
-                padded_k_shape,
-            ).astype(input.dtype)
-            top_k_logits_lst.append(top_k_logits)
-            if renormalize_topk_logits:
-                top_k_logits_sum += top_k_logits
-            # TODO(jevinjiang): support bf16 argmax in Mosaic
-            top_k_indices = jnp.broadcast_to(
-                jnp.argmax(input[:, :num_experts], axis=1, keepdims=True),
-                padded_k_shape,
+            # 1. 路由逻辑：确定性循环分发
+            # token_iota: (num_tokens, 1) -> (num_tokens, padded_top_k)
+            token_iota = jax.lax.broadcasted_iota(jnp.int32, (num_tokens, padded_top_k), 0)
+            # k_iota: (1, padded_top_k)
+            k_iota = jax.lax.broadcasted_iota(jnp.int32, (num_tokens, padded_top_k), 1)
+
+            # 仅在 k <= top_k 时计算路由，否则设为 0
+            # 公式：(token_idx * top_k + (k_idx - 1)) % num_experts
+            t2e_routing = jnp.where(
+                k_iota <= top_k, (token_iota * top_k + (k_iota - 1)) % num_experts, jnp.int32(0)
             )
-            top_k_indices_lst.append(top_k_indices)
-            t2e_routing = jnp.where(padded_k_iota == k_id, top_k_indices, t2e_routing)
-            mask = iota == broadcast_minor(top_k_indices, input.shape)
-            t2e += mask.astype(jnp.int32)
-            if k_id != top_k - 1:
-                input = jnp.where(mask, -jnp.inf, input)
 
-        if renormalize_topk_logits:
+            # 2. Expert Sizes：均衡分布
+            avg_size = (num_tokens * top_k) // num_experts
+            expert_sizes = jnp.full((1, padded_num_experts), avg_size, dtype=jnp.int32)
+
+            # 处理余数（确保总数守恒，防止信号量死锁）
+            remainder = (num_tokens * top_k) % num_experts
+            expert_idx_iota = jax.lax.broadcasted_iota(jnp.int32, (1, padded_num_experts), 0)
+            expert_sizes = jnp.where(expert_idx_iota < remainder, expert_sizes + 1, expert_sizes)
+
+            # 3. Logits 填充：修复 ValueError
+            weight_val = 1.0 / top_k
+            # 显式广播以匹配 (output_bt, top_k) 的 VMEM 形状
+            weights = jnp.broadcast_to(
+                jnp.array(weight_val, jnp.float32), out_top_k_logits_vmem.shape
+            )
+            out_top_k_logits_vmem[...] = weights
+
+            # 4. Expert Starts：静态计算
+            # 每个 expert 在 a2a_s 缓冲区中的起始位置
+            # 在均衡模拟中，通常配合 metadata all_reduce 使用
+            expert_starts = jnp.zeros_like(expert_sizes)
+
+            return t2e_routing, expert_sizes, expert_starts
+        else:
+            assert len(input.shape) == 2, input.shape
+            input = input.astype(jnp.float32)
+            padded_k_shape = (input.shape[0], padded_top_k)
+            top_k_logits_lst = []
+            top_k_indices_lst = []
+            t2e = jnp.zeros(input.shape, dtype=jnp.int32)
+            t2e_routing = jnp.zeros(padded_k_shape, dtype=jnp.int32)
+            iota = jax.lax.broadcasted_iota(jnp.int32, input.shape, 1)
+            padded_k_iota = jax.lax.broadcasted_iota(jnp.int32, padded_k_shape, 1)
+            top_k_logits_sum = jnp.zeros(padded_k_shape, jnp.float32)
+
             for k_id in range(top_k):
-                top_k_logits_lst[k_id] /= top_k_logits_sum
+                # TODO(jevinjiang): return both top_k values and indices in Mosaic
+                top_k_logits = jnp.broadcast_to(
+                    jnp.max(input[:, :num_experts], axis=1, keepdims=True),
+                    padded_k_shape,
+                ).astype(input.dtype)
+                top_k_logits_lst.append(top_k_logits)
+                if renormalize_topk_logits:
+                    top_k_logits_sum += top_k_logits
+                # TODO(jevinjiang): support bf16 argmax in Mosaic
+                top_k_indices = jnp.broadcast_to(
+                    jnp.argmax(input[:, :num_experts], axis=1, keepdims=True),
+                    padded_k_shape,
+                )
+                top_k_indices_lst.append(top_k_indices)
+                t2e_routing = jnp.where(padded_k_iota == k_id, top_k_indices, t2e_routing)
+                mask = iota == broadcast_minor(top_k_indices, input.shape)
+                t2e += mask.astype(jnp.int32)
+                if k_id != top_k - 1:
+                    input = jnp.where(mask, -jnp.inf, input)
 
-        # Materialize per-token top-k logits into a compact VMEM buffer to avoid
-        # dynamic_slice on `top_k_logits_lst[k_id][t_id, 0]` inside acc_and_store_output.
-        for k_id in range(top_k):
-            out_top_k_logits_vmem.at[pl.ds(0, input.shape[0]), pl.ds(k_id, 1)][...] = (
-                top_k_logits_lst[k_id][:, :1].astype(jnp.float32)
-            )
+            if renormalize_topk_logits:
+                for k_id in range(top_k):
+                    top_k_logits_lst[k_id] /= top_k_logits_sum
 
-        expert_sizes = jnp.sum(t2e, axis=0, keepdims=True)
-        expert_starts = jnp.zeros_like(expert_sizes)
-        return t2e_routing, expert_sizes, expert_starts
+            # Materialize per-token top-k logits into a compact VMEM buffer to avoid
+            # dynamic_slice on `top_k_logits_lst[k_id][t_id, 0]` inside acc_and_store_output.
+            for k_id in range(top_k):
+                out_top_k_logits_vmem.at[pl.ds(0, input.shape[0]), pl.ds(k_id, 1)][...] = (
+                    top_k_logits_lst[k_id][:, :1].astype(jnp.float32)
+                )
+
+            expert_sizes = jnp.sum(t2e, axis=0, keepdims=True)
+            expert_starts = jnp.zeros_like(expert_sizes)
+            return t2e_routing, expert_sizes, expert_starts
 
     def all_reduce_metadata(*, bt_sem_id, t2e_routing, starts, sizes):
         send_sem = send_sems.at[0]
@@ -1343,7 +1388,8 @@ def _fused_ep_moe_kernel(
             for bd2_id in range(num_bd2):
                 start_fetch_next_bw(local_e_id, bw_sem_id, bf_id, num_bd1, bd2_id)
                 wait_fetch_bw2(local_e_id, bw_sem_id, bf_id, bd2_id)
-                if bf_id == bd2_id == 0:
+                # if bf_id == bd2_id == 0:
+                if bf_id == bd2_id == 0 and not ffn_only:
                     wait_a2a_gather_send(
                         bt_sem_id=bt_sem_id,
                         e_sem_id=e_sem_id,
@@ -1562,27 +1608,31 @@ def _fused_ep_moe_kernel(
             bt_sem_id=bt_sem_id,
             bt_start=bt_start,
         ):
-            start_a2a_scatter(
-                bt_sem_id=bt_sem_id,
-                e_sem_id=next_e_sem_id,
-                local_e_id=next_local_e_id,
-                bt_start=bt_start,
-            )
+            if a2a_only or scatter_only or (not ffn_only):
+                start_a2a_scatter(
+                    bt_sem_id=bt_sem_id,
+                    e_sem_id=next_e_sem_id,
+                    local_e_id=next_local_e_id,
+                    bt_start=bt_start,
+                )
 
         # Wait a2a scatter for CURRENT active expert.
-        wait_a2a_scatter_recv(bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=local_e_id)
+        if a2a_only or scatter_only or (not ffn_only):
+            wait_a2a_scatter_recv(bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=local_e_id)
 
         # Perform FFN for CURRENT active expert.
-        if not a2a_only:
+        if a2a_only or gather_only or (not ffn_only):
             wait_a2a_gather_send(bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=local_e_id - 2)
+        if ffn_only or (not a2a_only and not gather_only and not scatter_only):
             expert_ffn(bt_sem_id, e_sem_id, local_e_id)
-
+        if a2a_only or gather_only or (not ffn_only):
             # Start a2a gather to send back tokens for CURRENT active expert.
             start_a2a_gather(bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=local_e_id)
 
         # A must-wait before next sync_barrier.
-        wait_a2a_scatter_send(e_sem_id)
-        # sync_barrier()
+        if a2a_only or scatter_only or (not ffn_only):
+            wait_a2a_scatter_send(e_sem_id)
+        sync_barrier()
         return next_e_sem_id
 
     if num_bt >= 1:
@@ -1613,6 +1663,7 @@ def _fused_ep_moe_kernel(
             top_k,
             renormalize_topk_logits,
             out_top_k_logits_vmem=top_k_logits_vmem,
+            balanced_routing=balanced_routing,
         )
 
         all_reduce_metadata(
@@ -1624,7 +1675,10 @@ def _fused_ep_moe_kernel(
         sync_barrier()
 
         # Start a2a scatter for first active expert.
-        start_a2a_scatter(bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=0, bt_start=bt_start)
+        if a2a_only or scatter_only or (not ffn_only):
+            start_a2a_scatter(
+                bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=0, bt_start=bt_start
+            )
 
         e_sem_id = lax.fori_loop(
             0,
@@ -1640,21 +1694,22 @@ def _fused_ep_moe_kernel(
         )
 
         # Wait to receive a2a gather for ALL experts before consuming `a2a_g_hbm`.
-        if not a2a_only:
+        if a2a_only or gather_only or (not ffn_only):
             wait_a2a_gather_recv_all(bt_size=output_bt)
-        # sync_barrier()
+        sync_barrier()
 
         out_buf_id = bt_id & jnp.int32(1)
         # Make sure it is safe to overwrite output buffer (bt_id-2 uses the same buffer).
         # Note: epic overlaps this wait with bt_acc compute by delaying the store into b_output_x2_vmem.
         # Our acc path writes directly into b_output_x2_vmem during reduction, so we must wait before acc.
-        if not a2a_only:
+        if not a2a_only and not gather_only and not scatter_only and not ffn_only:
             wait_store_output(bt_id=bt_id - jnp.int32(2))
 
             # Accumulate results for current bt into b_output_x2_vmem, then start async send to output_hbm.
             acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
             start_send_bo(bt_id=bt_id)
 
+        if a2a_only or gather_only or (not ffn_only):
             # Drain the last outstanding gather sends (the loop body waits `local_e_id - 2`).
             wait_a2a_gather_send(
                 bt_sem_id=bt_sem_id,
@@ -1666,12 +1721,12 @@ def _fused_ep_moe_kernel(
                 e_sem_id=lax.select(e_sem_id == 0, 1, 0),
                 local_e_id=local_num_experts - 1,
             )
-        # sync_barrier()
+        sync_barrier()
         return e_sem_id
 
     lax.fori_loop(0, num_bt, run_bt, jnp.int32(0), unroll=False)
     # Drain outstanding output stores (matches epic wait_send_bo for last two bts).
-    if not a2a_only:
+    if not a2a_only and not gather_only and not scatter_only and not ffn_only:
         wait_store_output(bt_id=jnp.int32(num_bt - 2))
         wait_store_output(bt_id=jnp.int32(num_bt - 1))
 
@@ -1815,6 +1870,10 @@ def _validate_fused_ep_moe_args(
         "renormalize_topk_logits",
         "act_fn",
         "a2a_only",
+        "gather_only",
+        "scatter_only",
+        "ffn_only",
+        "balanced_routing",
         "no_comm",
         "subc_quant_wsz",
         "block_config",
@@ -1848,8 +1907,13 @@ def fused_ep_moe(
     block_config: FusedMoEBlockConfig | None = None,
     ep_axis_name: str = "tensor",
     a2a_only: bool = False,
+    gather_only: bool = False,
+    scatter_only: bool = False,
+    ffn_only: bool = False,
+    balanced_routing: bool = False,
     no_comm: bool = False,
 ):
+    print(f"{a2a_only=} {gather_only=} {scatter_only=} {ffn_only=}")
     ep_size = mesh.shape[ep_axis_name]
     if block_config is None:
         from .tuned_block_configs import get_tuned_fused_moe_block_config
@@ -2017,6 +2081,10 @@ def fused_ep_moe(
                 ep_axis_name=ep_axis_name,
                 act_fn=act_fn,
                 a2a_only=a2a_only,
+                gather_only=gather_only,
+                scatter_only=scatter_only,
+                ffn_only=ffn_only,
+                balanced_routing=balanced_routing,
                 no_comm=no_comm,
                 subc_quant_wsz=subc_quant_wsz,
                 bt=block_config.bt,
