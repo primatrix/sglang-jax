@@ -132,13 +132,14 @@ class SchedulerOutputProcessorMixin:
                         req.return_hidden_states
                         and logits_output.hidden_states is not None
                 ):
-                    req.hidden_states.append(
+                    req.hidden_states.append(jax.device_get(
                         logits_output.hidden_states[
                             hidden_state_offset: (
                                 hidden_state_offset := hidden_state_offset
                                                        + len(req.origin_input_ids)
                             )
                         ]
+                    ).astype(float)
                     )
                 # Update grammar state after token sampling
                 if req.grammar is not None:
