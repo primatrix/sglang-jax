@@ -278,6 +278,8 @@ class BailingMoEDecoderLayer(nnx.Module):
                     dtype=dtype,
                     layer_id=layer_id,
                     renormalize_topk_logits=config.norm_topk_prob,
+                    balanced_topk=True,
+                    debug_routing=True,
                 )
             else:
                 self.topk = TopK(

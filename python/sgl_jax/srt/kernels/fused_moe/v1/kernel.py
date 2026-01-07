@@ -1862,6 +1862,7 @@ def _validate_fused_ep_moe_args(
         "act_fn",
         "subc_quant_wsz",
         "block_config",
+        "balanced_topk",
         "ep_axis_name",
     ],
 )
