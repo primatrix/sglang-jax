@@ -537,27 +537,34 @@ def _fused_ep_moe_kernel(
             sem=b_gating_sem,
         ).wait()
 
-    def _stateless_uniform01_u32(x: jax.Array) -> jax.Array:
-        x = (x + jnp.uint32(0x9E3779B9)) & jnp.uint32(0xFFFFFFFF)
-        x ^= x >> jnp.uint32(16)
-        x = (x * jnp.uint32(0x85EBCA6B)) & jnp.uint32(0xFFFFFFFF)
-        x ^= x >> jnp.uint32(13)
-        x = (x * jnp.uint32(0xC2B2AE35)) & jnp.uint32(0xFFFFFFFF)
-        x ^= x >> jnp.uint32(16)
-        return x.astype(jnp.float32) * (1.0 / 2**32)
+    def get_top_k(input, top_k, renormalize_topk_logits, *, out_top_k_logits_vmem):
+        if balanced_topk:
+            # Deterministic cyclic routing for benchmarking / tuning. This mirrors
+            # 6be3aa2b9... "balanced gate" top-k: it avoids data-dependent routing
+            # variance so tuning can focus on compute/comm tiling.
+            num_tokens = input.shape[0]
+            token_iota = jax.lax.broadcasted_iota(jnp.int32, (num_tokens, padded_top_k), 0)
+            k_iota = jax.lax.broadcasted_iota(jnp.int32, (num_tokens, padded_top_k), 1)
+            t2e_routing = jnp.where(
+                k_iota < top_k,
+                (token_iota * top_k + k_iota) % num_experts,
+                jnp.int32(0),
+            )
 
-    def get_top_k(
-        input,
-        top_k,
-        renormalize_topk_logits,
-        *,
-        out_top_k_logits_vmem,
-        balanced_topk: bool,
-        token_start: jax.Array,
-    ):
+            avg_size = (num_tokens * top_k) // num_experts
+            expert_sizes = jnp.full((1, padded_num_experts), avg_size, dtype=jnp.int32)
+            remainder = (num_tokens * top_k) % num_experts
+            expert_idx_iota = jax.lax.broadcasted_iota(jnp.int32, (1, padded_num_experts), 1)
+            expert_sizes = jnp.where(expert_idx_iota < remainder, expert_sizes + 1, expert_sizes)
+
+            out_top_k_logits_vmem[...] = jnp.full(
+                out_top_k_logits_vmem.shape, 1.0 / top_k, dtype=jnp.float32
+            )
+            expert_starts = jnp.zeros_like(expert_sizes)
+            return t2e_routing, expert_sizes, expert_starts
+
         assert len(input.shape) == 2, input.shape
-        val_input = input.astype(jnp.float32)
-        idx_input = val_input
+        input = input.astype(jnp.float32)
         padded_k_shape = (input.shape[0], padded_top_k)
         top_k_logits_lst = []
         t2e = jnp.zeros(input.shape, dtype=jnp.int32)
@@ -566,47 +573,25 @@ def _fused_ep_moe_kernel(
         padded_k_iota = jax.lax.broadcasted_iota(jnp.int32, padded_k_shape, 1)
         top_k_logits_sum = jnp.zeros(padded_k_shape, jnp.float32)
 
-        # Balanced-topk: when all logits are equal for a token (common during init / degenerate
-        # inputs), argmax tie-break deterministically routes to the first few experts. Detect
-        # this "flat row" case and select experts in a cyclic pattern to spread load.
-        token_ids = token_start + jnp.arange(input.shape[0], dtype=jnp.int32)
-        if balanced_topk:
-            row_max = jnp.max(val_input[:, :num_experts], axis=1)
-            row_min = jnp.min(val_input[:, :num_experts], axis=1)
-            is_flat = row_max == row_min
-
-            token_u = token_ids.astype(jnp.uint32)[:, None]
-            expert_u = jnp.arange(num_experts, dtype=jnp.uint32)[None, :]
-            noise_base = token_u * jnp.uint32(0xD1B54A35) + expert_u * jnp.uint32(0x94D049BB)
-            idx_input = idx_input.at[:, :num_experts].add(
-                _stateless_uniform01_u32(noise_base) * 1e-7
-            )
-        else:
-            is_flat = None
-
         for k_id in range(top_k):
             # TODO(jevinjiang): return both top_k values and indices in Mosaic
             top_k_logits = jnp.broadcast_to(
-                jnp.max(val_input[:, :num_experts], axis=1, keepdims=True),
+                jnp.max(input[:, :num_experts], axis=1, keepdims=True),
                 padded_k_shape,
             ).astype(input.dtype)
             top_k_logits_lst.append(top_k_logits)
             if renormalize_topk_logits:
                 top_k_logits_sum += top_k_logits
             # TODO(jevinjiang): support bf16 argmax in Mosaic
-            argmax_idx = jnp.argmax(idx_input[:, :num_experts], axis=1)
-            if balanced_topk:
-                balanced_idx = (token_ids * top_k + jnp.int32(k_id)) % jnp.int32(num_experts)
-                top1 = jnp.where(is_flat, balanced_idx, argmax_idx)
-            else:
-                top1 = argmax_idx
-            top_k_indices = jnp.broadcast_to(top1[:, None], padded_k_shape)
+            top_k_indices = jnp.broadcast_to(
+                jnp.argmax(input[:, :num_experts], axis=1, keepdims=True),
+                padded_k_shape,
+            )
             t2e_routing = jnp.where(padded_k_iota == k_id, top_k_indices, t2e_routing)
             mask = iota == broadcast_minor(top_k_indices, input.shape)
             t2e += mask.astype(jnp.int32)
             if k_id != top_k - 1:
-                val_input = jnp.where(mask, -jnp.inf, val_input)
-                idx_input = jnp.where(mask, -jnp.inf, idx_input)
+                input = jnp.where(mask, -jnp.inf, input)
 
         if renormalize_topk_logits:
             for k_id in range(top_k):
@@ -1663,8 +1648,6 @@ def _fused_ep_moe_kernel(
             top_k,
             renormalize_topk_logits,
             out_top_k_logits_vmem=top_k_logits_vmem,
-            balanced_topk=balanced_topk,
-            token_start=bt_start,
         )
 
         all_reduce_metadata(
@@ -1862,7 +1845,6 @@ def _validate_fused_ep_moe_args(
         "act_fn",
         "subc_quant_wsz",
         "block_config",
-        "balanced_topk",
         "ep_axis_name",
     ],
 )
@@ -2254,50 +2236,24 @@ def fused_ep_moe_routing_stats(
             is_local_expert = jnp.logical_and(expert_iota >= local_start, expert_iota < local_end)
             x = jnp.where(is_local_expert, x, -jnp.inf)
 
-        token_ids = jnp.arange(x.shape[0], dtype=jnp.int32)
         if balanced_topk:
-            row_max = jnp.max(x, axis=1)
-            row_min = jnp.min(x, axis=1)
-            is_flat = row_max == row_min
-
-            token_u = token_ids.astype(jnp.uint32)[:, None]
-            expert_u = jnp.arange(num_experts, dtype=jnp.uint32)[None, :]
-            noise_base = token_u * jnp.uint32(0xD1B54A35) + expert_u * jnp.uint32(0x94D049BB)
-
-            def _stateless_uniform01_u32(y: jax.Array) -> jax.Array:
-                y = (y + jnp.uint32(0x9E3779B9)) & jnp.uint32(0xFFFFFFFF)
-                y ^= y >> jnp.uint32(16)
-                y = (y * jnp.uint32(0x85EBCA6B)) & jnp.uint32(0xFFFFFFFF)
-                y ^= y >> jnp.uint32(13)
-                y = (y * jnp.uint32(0xC2B2AE35)) & jnp.uint32(0xFFFFFFFF)
-                y ^= y >> jnp.uint32(16)
-                return y.astype(jnp.float32) * (1.0 / 2**32)
-
-            x_idx = x + _stateless_uniform01_u32(noise_base) * 1e-7
-        else:
-            is_flat = None
-            x_idx = x
-
-        iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
-        topk_ids: list[jax.Array] = []
-        for k_id in range(top_k):
-            argmax_idx = jnp.argmax(x_idx, axis=1)
-            if balanced_topk:
-                if local_mask:
-                    balanced_local = (token_ids * top_k + jnp.int32(k_id)) % jnp.int32(
-                        local_num_experts
-                    )
-                    balanced_idx = balanced_local + jnp.int32(local_start)
-                else:
-                    balanced_idx = (token_ids * top_k + jnp.int32(k_id)) % jnp.int32(num_experts)
-                top1 = jnp.where(is_flat, balanced_idx, argmax_idx)
+            # Match epic/fused-moe balanced_topk semantics: ignore logits and route
+            # deterministically in a cyclic pattern.
+            num_tokens = x.shape[0]
+            token_iota = jax.lax.broadcasted_iota(jnp.int32, (num_tokens, top_k), 0)
+            k_iota = jax.lax.broadcasted_iota(jnp.int32, (num_tokens, top_k), 1)
+            if local_mask:
+                topk_ids = (token_iota * top_k + k_iota) % local_num_experts + local_start
             else:
-                top1 = argmax_idx
-            topk_ids.append(top1)
-            mask = iota == top1[:, None]
-            x = jnp.where(mask, -jnp.inf, x)
-            x_idx = jnp.where(mask, -jnp.inf, x_idx)
-        topk_ids = jnp.stack(topk_ids, axis=1)
+                topk_ids = (token_iota * top_k + k_iota) % num_experts
+        else:
+            iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
+            topk_ids_lst: list[jax.Array] = []
+            for _ in range(top_k):
+                top1 = jnp.argmax(x, axis=1)
+                topk_ids_lst.append(top1)
+                x = jnp.where(iota == top1[:, None], -jnp.inf, x)
+            topk_ids = jnp.stack(topk_ids_lst, axis=1)
 
         counts = jnp.bincount(topk_ids.reshape(-1), length=num_experts)
         counts = jax.lax.psum(counts, axis_name=ep_axis_name)
