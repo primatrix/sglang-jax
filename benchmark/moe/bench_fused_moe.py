@@ -349,6 +349,7 @@ def run_all(
     tune_block_config: bool = False,
     balanced_topk: bool = False,
     debug_routing: bool = False,
+    router_balance_factor: float = 1.0,
     bt_candidates: list[int] | None = None,
     bts_candidates: list[int] | None = None,
     bf_candidates: list[int] | None = None,
@@ -396,6 +397,10 @@ def run_all(
         print("  mode: balanced_topk=True (deterministic cyclic routing)")
     else:
         print("  mode: balanced_topk=False (routing from router_logits)")
+    print(
+        "  router_logits: generated (router_balance_factor="
+        f"{router_balance_factor}, 1.0=balanced, smaller=more_imbalanced)"
+    )
     for case in cases:
         t_packing = _dtype_packing(dtype)
         mesh = build_mesh(ep_size=case.ep_size, tp_size=case.tp_size)
@@ -417,7 +422,13 @@ def run_all(
             f"  mesh: ep_size={case.ep_size}, tp_size={case.tp_size}, "
             f"devices_used={case.ep_size * case.tp_size}/{len(jax.devices())}"
         )
-        data = prepare_fused_moe_inputs(case, dtype=dtype, mesh=mesh, include_weights=False)
+        data = prepare_fused_moe_inputs(
+            case,
+            dtype=dtype,
+            mesh=mesh,
+            include_weights=False,
+            router_balance_factor=router_balance_factor,
+        )
 
         if debug_routing:
 
@@ -669,6 +680,18 @@ def parse_args() -> argparse.Namespace:
         help="Print routing histogram summary derived from router_logits (unbalanced path) for each case.",
     )
     parser.add_argument(
+        "--router-balance-factor",
+        type=float,
+        default=1.0,
+        help="Single knob controlling routing skew: 1.0=balanced, smaller=more imbalanced.",
+    )
+    parser.add_argument(
+        "--router-imbalance-factor",
+        dest="router_balance_factor",
+        type=float,
+        help="Alias for --router-balance-factor (kept for backward compatibility).",
+    )
+    parser.add_argument(
         "--bt-candidates",
         type=int,
         nargs="+",
@@ -740,6 +763,7 @@ if __name__ == "__main__":
         tune_block_config=args.tune_block_config,
         balanced_topk=args.balanced_topk,
         debug_routing=args.debug_routing,
+        router_balance_factor=args.router_balance_factor,
         bt_candidates=args.bt_candidates,
         bts_candidates=args.bts_candidates,
         bf_candidates=args.bf_candidates,

@@ -65,18 +65,39 @@ def generate_router_logits(
     scenario: str,
     num_experts_per_tok: int = 2,
     imbalance_factor: float = 3.0,
+    *,
+    seed: int = 0,
 ) -> jax.Array:
     """Synthetic router logits with configurable balance; keep generation cheap."""
+    token_iota = jnp.arange(num_tokens, dtype=jnp.uint32)[:, None]
+    expert_iota = jnp.arange(num_experts, dtype=jnp.uint32)[None, :]
+
+    def _stateless_uniform01_u32(x: jax.Array) -> jax.Array:
+        # SplitMix32-style mixing: fast, deterministic, decent bit diffusion.
+        x = (x + jnp.uint32(0x9E3779B9)) & jnp.uint32(0xFFFFFFFF)
+        x ^= x >> jnp.uint32(16)
+        x = (x * jnp.uint32(0x85EBCA6B)) & jnp.uint32(0xFFFFFFFF)
+        x ^= x >> jnp.uint32(13)
+        x = (x * jnp.uint32(0xC2B2AE35)) & jnp.uint32(0xFFFFFFFF)
+        x ^= x >> jnp.uint32(16)
+        # Map uint32 -> [0, 1).
+        return x.astype(jnp.float32) * (1.0 / 2**32)
+
+    # Deterministic per-(token, expert) noise in [0, 1).
+    base = (
+        token_iota * jnp.uint32(0xD1B54A35)
+        + expert_iota * jnp.uint32(0x94D049BB)
+        + jnp.uint32(seed)
+    )
+    noise01 = _stateless_uniform01_u32(base)
+
     if scenario == "random":
-        base = jnp.reshape(
-            jnp.arange(num_tokens * num_experts, dtype=jnp.float32),
-            (num_tokens, num_experts),
-        )
-        return base * 0.001
+        # Unbiased pseudo-random logits per token/expert.
+        return noise01
 
     if scenario == "balanced":
         logits = -10.0 * jnp.ones((num_tokens, num_experts), dtype=jnp.float32)
-        token_ids = jnp.arange(num_tokens, dtype=jnp.int32)[:, None]
+        token_ids = token_iota.astype(jnp.int32)
         cols = (
             token_ids * num_experts_per_tok + jnp.arange(num_experts_per_tok, dtype=jnp.int32)
         ) % num_experts
@@ -84,13 +105,71 @@ def generate_router_logits(
         return logits
 
     if scenario == "imbalanced":
-        temperature = num_experts / (imbalance_factor * 2)
-        expert_base_logits = jnp.arange(num_experts, dtype=jnp.float32)
-        expert_base_logits = 10.0 * jnp.exp(-expert_base_logits / temperature)
-        logits = jnp.tile(expert_base_logits, (num_tokens, 1))
-        return logits
+        # Biased logits: per-expert bias + per-token noise.
+        #
+        # - Larger `imbalance_factor` => stronger skew toward low-index experts.
+        # - For imbalance_factor ~= 0, bias goes to ~0 and routing is close to random.
+        inv_temp = jnp.float32(max(float(imbalance_factor), 1e-6))
+        expert_bias = -(expert_iota.astype(jnp.float32) / jnp.float32(num_experts)) * inv_temp
+        noise = (noise01 * 2.0 - 1.0).astype(jnp.float32)
+        return expert_bias + noise
 
     raise ValueError(f"Unknown scenario '{scenario}'. Use random|balanced|imbalanced.")
+
+
+def generate_fused_router_logits(
+    num_tokens: int,
+    num_experts: int,
+    *,
+    top_k: int,
+    router_balance_factor: float,
+    seed: int = 0,
+) -> jax.Array:
+    """Router logits for fused_moe benchmarks with a single imbalance knob.
+
+    `router_balance_factor` semantics:
+    - 1.0 => balanced cyclic routing (near-uniform expert counts).
+    - smaller => increasingly skewed routing toward low-index experts.
+    """
+    # Clamp to (0, 1] so the mapping is monotonic and avoids div-by-zero.
+    f = float(router_balance_factor)
+    f = max(min(f, 1.0), 1e-6)
+    strength = (1.0 / f) - 1.0  # 0 at f=1, grows as f->0
+
+    # Start from a balanced top-k assignment: for each token, set its top-k experts
+    # to +1.0 and others to 0.0. This guarantees balanced routing at strength=0.
+    logits = jnp.zeros((num_tokens, num_experts), dtype=jnp.float32)
+    token_ids = jnp.arange(num_tokens, dtype=jnp.int32)[:, None]
+    cols = (token_ids * top_k + jnp.arange(top_k, dtype=jnp.int32)) % num_experts
+    logits = logits.at[jnp.arange(num_tokens)[:, None], cols].set(1.0)
+
+    # Add a global per-expert bias that favors low-index experts. As `strength`
+    # grows, this bias overwhelms the balanced pattern and concentrates load.
+    expert_rank = jnp.arange(num_experts, dtype=jnp.float32)
+    bias = -(expert_rank / jnp.float32(max(num_experts - 1, 1))) * jnp.float32(strength)
+    logits = logits + bias[None, :]
+
+    # Add small deterministic noise to break ties, keeping generation cheap and stable.
+    token_iota = jnp.arange(num_tokens, dtype=jnp.uint32)[:, None]
+    expert_iota = jnp.arange(num_experts, dtype=jnp.uint32)[None, :]
+    base = (
+        token_iota * jnp.uint32(0xD1B54A35)
+        + expert_iota * jnp.uint32(0x94D049BB)
+        + jnp.uint32(seed)
+    )
+
+    def _stateless_uniform01_u32(x: jax.Array) -> jax.Array:
+        x = (x + jnp.uint32(0x9E3779B9)) & jnp.uint32(0xFFFFFFFF)
+        x ^= x >> jnp.uint32(16)
+        x = (x * jnp.uint32(0x85EBCA6B)) & jnp.uint32(0xFFFFFFFF)
+        x ^= x >> jnp.uint32(13)
+        x = (x * jnp.uint32(0xC2B2AE35)) & jnp.uint32(0xFFFFFFFF)
+        x ^= x >> jnp.uint32(16)
+        return x.astype(jnp.float32) * (1.0 / 2**32)
+
+    noise01 = _stateless_uniform01_u32(base)
+    logits = logits + (noise01 * 2.0 - 1.0) * 1e-3
+    return logits
 
 
 def build_group_sizes(
@@ -122,6 +201,7 @@ def prepare_gmm_inputs(
         scenario,
         num_experts_per_tok=case.top_k,
         imbalance_factor=case.routed_scaling_factor or 3.0,
+        seed=case.seed,
     ).astype(dtype)
     group_sizes, topk_ids = build_group_sizes(router_logits, case.top_k, case.num_experts)
     lhs = build_grouped_lhs(group_sizes, case.hidden_size, dtype, seed=case.seed + 1)
@@ -142,7 +222,17 @@ def prepare_fused_moe_inputs(
     *,
     ep_axis_name: str = "tensor",
     include_weights: bool = True,
+    router_balance_factor: float = 1.0,
+    router_imbalance_factor: float | None = None,
 ) -> Dict[str, jax.Array]:
+    # Backward-compat alias: older CLI used --router-imbalance-factor with inverse semantics.
+    if router_imbalance_factor is not None:
+        router_balance_factor = float(router_imbalance_factor)
+
+    f = float(router_balance_factor)
+    if not np.isfinite(f) or f <= 0:
+        raise ValueError(f"Expected router_balance_factor to be finite and > 0, got {f}.")
+
     if mesh is None:
         tokens = jnp.empty((case.num_tokens, case.hidden_size), dtype=dtype)
         out: dict[str, jax.Array] = {"tokens": tokens}
@@ -157,9 +247,13 @@ def prepare_fused_moe_inputs(
                 (case.num_experts, case.intermediate_size, case.hidden_size),
                 dtype=dtype,
             )
-        # For fused_moe benchmarks, routing can be made deterministic inside the
-        # kernel via `balanced_topk`, so router logits are unnecessary here.
-        router_logits = jnp.zeros((case.num_tokens, case.num_experts), dtype=dtype)
+        router_logits = generate_fused_router_logits(
+            case.num_tokens,
+            case.num_experts,
+            top_k=case.top_k,
+            router_balance_factor=f,
+            seed=case.seed,
+        ).astype(dtype)
         out["router_logits"] = router_logits
         return out
 
@@ -209,10 +303,14 @@ def prepare_fused_moe_inputs(
             ),
             out_shardings=w2_sharding,
         )()
-    # For fused_moe benchmarks, routing can be made deterministic inside the
-    # kernel via `balanced_topk`, so router logits are unnecessary here.
     router_logits = jax.jit(
-        lambda: jnp.zeros((case.num_tokens, case.num_experts), dtype=dtype),
+        lambda: generate_fused_router_logits(
+            case.num_tokens,
+            case.num_experts,
+            top_k=case.top_k,
+            router_balance_factor=f,
+            seed=case.seed,
+        ).astype(dtype),
         out_shardings=logits_sharding,
     )()
     out["router_logits"] = router_logits
