@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax.experimental.compilation_cache import compilation_cache as _compilation_cache
+from jax.sharding import PartitionSpec as P
 
 from benchmark.moe.utils import (
     BAILING_BASE,
@@ -346,6 +347,8 @@ def run_all(
     *,
     warmup_iters: int = 1,
     tune_block_config: bool = False,
+    balanced_topk: bool = False,
+    debug_routing: bool = False,
     bt_candidates: list[int] | None = None,
     bts_candidates: list[int] | None = None,
     bf_candidates: list[int] | None = None,
@@ -388,9 +391,11 @@ def run_all(
     if tune_block_config:
         from sgl_jax.srt.utils.jax_utils import get_device_name
 
-    balanced_topk = False
     print(f"Running fused_moe benchmarks with dtype={dtype}")
-    print("  mode: balanced_topk=True (deterministic cyclic routing)")
+    if balanced_topk:
+        print("  mode: balanced_topk=True (deterministic cyclic routing)")
+    else:
+        print("  mode: balanced_topk=False (routing from router_logits)")
     for case in cases:
         t_packing = _dtype_packing(dtype)
         mesh = build_mesh(ep_size=case.ep_size, tp_size=case.tp_size)
@@ -413,6 +418,91 @@ def run_all(
             f"devices_used={case.ep_size * case.tp_size}/{len(jax.devices())}"
         )
         data = prepare_fused_moe_inputs(case, dtype=dtype, mesh=mesh, include_weights=False)
+
+        if debug_routing:
+
+            def _unbalanced_topk_ids(
+                probs: jax.Array, *, top_k: int, num_experts: int
+            ) -> jax.Array:
+                probs = probs[:, :num_experts]
+                iota = jax.lax.broadcasted_iota(jnp.int32, probs.shape, 1)
+                t2e_routing: list[jax.Array] = []
+                x = probs
+                for _ in range(top_k):
+                    top1 = jnp.argmax(x, axis=1)
+                    t2e_routing.append(top1)
+                    x = jnp.where(iota == top1[:, None], -jnp.inf, x)
+                return jnp.stack(t2e_routing, axis=1)
+
+            @jax.jit
+            @jax.shard_map(
+                mesh=mesh,
+                in_specs=(P("tensor", None),),
+                out_specs=(P(), P(), P(), P()),
+                check_vma=False,
+            )
+            def routing_stats(router_logits):
+                my_id = jax.lax.axis_index("tensor")
+                local_num_experts = case.num_experts // case.ep_size
+                local_start = my_id * local_num_experts
+                local_end = local_start + local_num_experts
+
+                probs = jax.nn.softmax(router_logits.astype(jnp.float32), axis=-1)
+                topk_ids = _unbalanced_topk_ids(
+                    probs, top_k=case.top_k, num_experts=case.num_experts
+                )
+                counts = jnp.bincount(topk_ids.reshape(-1), length=case.num_experts)
+                counts = jax.lax.psum(counts, axis_name="tensor")
+
+                expert_iota = jax.lax.broadcasted_iota(jnp.int32, (1, probs.shape[-1]), 1)[
+                    0, : case.num_experts
+                ]
+                is_local_expert = jnp.logical_and(
+                    expert_iota >= local_start, expert_iota < local_end
+                )
+                probs_local = jnp.where(is_local_expert, probs[:, : case.num_experts], -jnp.inf)
+                topk_ids_local = _unbalanced_topk_ids(
+                    probs_local, top_k=case.top_k, num_experts=case.num_experts
+                )
+                counts_local = jnp.bincount(topk_ids_local.reshape(-1), length=case.num_experts)
+                counts_local = jax.lax.psum(counts_local, axis_name="tensor")
+
+                logits_min = jax.lax.pmin(jnp.min(router_logits), axis_name="tensor")
+                logits_max = jax.lax.pmax(jnp.max(router_logits), axis_name="tensor")
+                return logits_min, logits_max, counts, counts_local
+
+            logits_min, logits_max, counts, counts_local = routing_stats(data["router_logits"])
+            logits_min, logits_max, counts, counts_local = jax.device_get(
+                (logits_min, logits_max, counts, counts_local)
+            )
+            counts = np.asarray(counts)
+            counts_local = np.asarray(counts_local)
+
+            def _summarize(counts: np.ndarray) -> str:
+                active = int(np.count_nonzero(counts))
+                max_e = int(np.argmax(counts)) if counts.size else -1
+                max_c = int(np.max(counts)) if counts.size else 0
+                top = np.argsort(counts)[-8:][::-1]
+                top_summary = ", ".join(
+                    [f"{int(i)}:{int(counts[i])}" for i in top if counts[i] > 0]
+                )
+                return f"active_experts={active}/{case.num_experts} max={max_c}@{max_e} top={top_summary or 'n/a'}"
+
+            print(
+                "  routing(unbalanced): "
+                f"router_logits=[{float(logits_min):.3g},{float(logits_max):.3g}] "
+                + _summarize(counts)
+            )
+            print("  routing(unbalanced, local-mask): " + _summarize(counts_local))
+            if float(logits_min) == float(logits_max):
+                print(
+                    "  note: router_logits are constant; unbalanced top-k tie-breaks via argmax -> "
+                    "routes to the first few experts (0..top_k-1), which can heavily skew load."
+                )
+            if balanced_topk:
+                expected = case.num_tokens * case.top_k / case.num_experts
+                print(f"  routing(balanced_topk): expected ~{expected:.2f} tokens/expert (global)")
+
         block_cfgs: list[FusedMoEBlockConfig | None]
         if tune_block_config:
             block_cfgs = select_block_configs(
@@ -569,6 +659,16 @@ def parse_args() -> argparse.Namespace:
         help="Benchmark multiple block_config variants and print the best tuned table entry.",
     )
     parser.add_argument(
+        "--balanced-topk",
+        action="store_true",
+        help="Enable deterministic cyclic routing inside the fused_moe kernel (ignores router_logits).",
+    )
+    parser.add_argument(
+        "--debug-routing",
+        action="store_true",
+        help="Print routing histogram summary derived from router_logits (unbalanced path) for each case.",
+    )
+    parser.add_argument(
         "--bt-candidates",
         type=int,
         nargs="+",
@@ -638,6 +738,8 @@ if __name__ == "__main__":
         args.iters,
         warmup_iters=args.warmup_iters,
         tune_block_config=args.tune_block_config,
+        balanced_topk=args.balanced_topk,
+        debug_routing=args.debug_routing,
         bt_candidates=args.bt_candidates,
         bts_candidates=args.bts_candidates,
         bf_candidates=args.bf_candidates,
