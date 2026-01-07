@@ -371,6 +371,7 @@ def _fused_ep_moe_kernel(
     a2a_g_hbm,  # (num_experts, bt, t_packing, hidden_size // t_packing)
     # Output
     output_hbm,  # (local_num_tokens, hidden_size)
+    expert_counts_hbm,  # 新增: (num_bt, padded_num_experts)
     # Scratch
     t2e_routing_x2_smem,  # (2, bt, padded_top_k)
     d2e_count_x2_smem,  # (2, num_devices, 1, padded_num_experts)
@@ -405,6 +406,7 @@ def _fused_ep_moe_kernel(
     a2a_gather_sem,
     a2a_acc_sems,  # DMA(1,)
     barrier_sem,
+    expert_size_sem,
     *,
     top_k: int,
     renormalize_topk_logits: bool,
@@ -1610,6 +1612,20 @@ def _fused_ep_moe_kernel(
         sync_barrier()
         return next_e_sem_id
 
+    def copy_expert_size(bt_sem_id, bt_id):
+        pltpu.make_async_copy(
+            src_ref=expert_sizes_x2_smem.at[bt_sem_id, pl.ds(0, 1)],
+            dst_ref=expert_counts_hbm.at[pl.ds(bt_id, 1)],
+            sem=expert_size_sem,
+        ).start()
+
+    def wait_copy_expert_size():
+        pltpu.make_async_copy(
+            src_ref=expert_counts_hbm.at[0, pl.ds(0, 1)],
+            dst_ref=expert_counts_hbm.at[pl.ds(0, 1)],
+            sem=expert_size_sem,
+        ).wait()
+
     if num_bt >= 1:
         start_fetch_b_gating(bt_id=jnp.int32(0))
 
@@ -1639,6 +1655,10 @@ def _fused_ep_moe_kernel(
             starts=expert_starts,
             sizes=expert_sizes,
         )
+        # --- 新增: 将当前 bt 块内每个 expert 接收的全局 token 数量存回 HBM ---
+        # expert_sizes_x2_smem 此时存储的是经过 All-Reduce 后的全局 count
+        # 我们将其保存到 expert_counts_hbm 的第 bt_id 行
+        copy_expert_size(bt_sem_id, bt_id)
         sync_barrier()
 
         # Start a2a scatter for first active expert.
@@ -1685,6 +1705,7 @@ def _fused_ep_moe_kernel(
     # Drain outstanding output stores (matches epic wait_send_bo for last two bts).
     wait_store_output(bt_id=jnp.int32(num_bt - 2))
     wait_store_output(bt_id=jnp.int32(num_bt - 1))
+    wait_copy_expert_size()
 
     ### ------- Kernel end ------- ###
 
@@ -2018,7 +2039,12 @@ def fused_ep_moe(
         pltpu.SemaphoreType.DMA,  # a2a_gather_sem
         pltpu.SemaphoreType.DMA((1,)),  # a2a_acc_sems
         pltpu.SemaphoreType.BARRIER,  # barrier_sem
+        pltpu.SemaphoreType.DMA,
     )
+
+    num_bt = cdiv(local_num_tokens, block_config.bt)
+    expert_counts_shape = (num_bt, padded_num_experts)
+
     fused_moe = jax.named_scope(scope_name)(
         pl.pallas_call(
             functools.partial(
@@ -2039,7 +2065,10 @@ def fused_ep_moe(
                 bd1c=block_config.bd1c,
                 bd2c=block_config.bd2c,
             ),
-            out_shape=jax.ShapeDtypeStruct((local_num_tokens, hidden_size), t_dtype),
+            out_shape=(
+                jax.ShapeDtypeStruct((local_num_tokens, hidden_size), t_dtype),
+                jax.ShapeDtypeStruct(expert_counts_shape, jnp.int32),
+            ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=0,
                 in_specs=[
@@ -2058,7 +2087,10 @@ def fused_ep_moe(
                     hbm_block_spec,  # a2a_s_acc_x2_hbm
                     hbm_block_spec,  # a2a_g_hbm
                 ],
-                out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                out_specs=(
+                    pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                    pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),  # expert_counts_hbm
+                ),
                 scratch_shapes=scratch_shapes,
             ),
             compiler_params=pltpu.CompilerParams(
@@ -2090,7 +2122,7 @@ def fused_ep_moe(
             P(),  # a2a_s_acc_x2_hbm
             P(),  # a2a_g_hbm
         ),
-        out_specs=P(ep_axis_name),
+        out_specs=(P(ep_axis_name), P(ep_axis_name)),
         check_vma=False,
     )
     def kernel(
@@ -2109,7 +2141,7 @@ def fused_ep_moe(
         a2a_s_acc_x2_hbm_scratch,
         a2a_g_hbm_scratch,
     ):
-        local_output = fused_moe(
+        local_output, local_expert_counts = fused_moe(
             pltpu.with_memory_space_constraint(tokens, pltpu.HBM),  # tokens_hbm
             pltpu.with_memory_space_constraint(w1, pltpu.HBM),  # w1_hbm
             pltpu.with_memory_space_constraint(w2, pltpu.HBM),  # w2_hbm
@@ -2139,7 +2171,7 @@ def fused_ep_moe(
             ),  # a2a_s_acc_x2_hbm
             pltpu.with_memory_space_constraint(a2a_g_hbm_scratch, pltpu.HBM),  # a2a_g_hbm
         )
-        return local_output
+        return local_output, local_expert_counts
 
     a2a_s_x2_hbm_scratch = pl.empty(
         (2, a2a_max_tokens, t_packing, hidden_size // t_packing), t_dtype

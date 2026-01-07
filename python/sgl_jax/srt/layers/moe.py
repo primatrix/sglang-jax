@@ -602,7 +602,7 @@ class FusedEPMoE(nnx.Module):
         """
         assert hidden_states.ndim == 2
 
-        output = fused_ep_moe(
+        output, expert_counts = fused_ep_moe(
             mesh=self.mesh,
             tokens=hidden_states,
             w1=self.w1.value,
@@ -626,4 +626,24 @@ class FusedEPMoE(nnx.Module):
         )
 
         output = jax.sharding.reshard(output, NamedSharding(self.mesh, P(None, None)))
-        return output
+        # 2. 对 output 进行 reshard
+        output = jax.sharding.reshard(output, NamedSharding(self.mesh, P(None, None)))
+
+        # 3. 处理 expert_counts
+        # 目前 expert_counts 的形状是 (num_bt, padded_num_experts)
+        # 如果你想评估负载，通常需要对所有 block 求和得到每个 Expert 的总负载
+        # 注意：由于 kernel 内部已经做了全网 All-Reduce，
+        # 所以每个 Device 上的 expert_counts 数据在逻辑上是全局同步后的
+        total_expert_counts = jnp.sum(expert_counts, axis=0)  # (padded_num_experts,)
+
+        # 如果 padded_num_experts 多于实际的 num_experts，截断它
+        total_expert_counts = total_expert_counts[: self.num_experts]
+
+        # 将 count 也 reshard 到一个确定的 sharding 上（通常是全复制 P() 方便后续分析）
+        total_expert_counts = jax.sharding.reshard(
+            total_expert_counts, NamedSharding(self.mesh, P())
+        )
+        jax.debug.print(
+            "total_expert_counts: {total_expert_counts}", total_expert_counts=total_expert_counts
+        )
+        return output, total_expert_counts
