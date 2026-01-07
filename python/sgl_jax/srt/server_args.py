@@ -122,6 +122,8 @@ class ServerArgs:
     enable_tokenizer_batch_encode: bool = False
     disable_overlap_schedule: bool = False
     enable_precision_tracer: bool = False
+    balanced_topk: bool = False
+    debug_routing: bool = False
 
     # Kernel backend
     attention_backend: str | None = "fa"
@@ -781,6 +783,16 @@ class ServerArgs:
             "--enable-precision-tracer",
             action="store_true",
             help="Enable precision tracer for debugging tensor values. May have performance impact.",
+        )
+        parser.add_argument(
+            "--balanced-topk",
+            action="store_true",
+            help="Use deterministic cyclic top-k routing for fused MoE (ignores router logits).",
+        )
+        parser.add_argument(
+            "--debug-routing",
+            action="store_true",
+            help="Print fused MoE routing balance stats (mean/max) via jax.debug.print.",
         )
 
         parser.add_argument(

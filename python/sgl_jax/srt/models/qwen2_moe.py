@@ -234,6 +234,8 @@ class Qwen2MoeDecoderLayer(nnx.Module):
                 dtype=dtype,
                 layer_id=layer_id,
                 renormalize_topk_logits=getattr(config, "norm_topk_prob", True),
+                balanced_topk=getattr(config, "balanced_topk", False),
+                debug_routing=getattr(config, "debug_routing", False),
             )
         else:
             self.topk = TopK(

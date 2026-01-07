@@ -254,6 +254,9 @@ class ModelRunner:
         self.model_config.log_kv_heads_info(self.tp_size)
         self.model_config.hf_config.ep_size = self.ep_size
         self.model_config.hf_config.moe_backend = self.model_config.moe_backend.value
+        # Propagate server-side fused MoE knobs into the HF config so model code can read them.
+        self.model_config.hf_config.balanced_topk = self.server_args.balanced_topk
+        self.model_config.hf_config.debug_routing = self.server_args.debug_routing
 
         self.model = self.model_loader.load_model(
             model_config=self.model_config,

@@ -257,6 +257,8 @@ class Grok1MoE(nnx.Module):
                 dtype=dtype,
                 layer_id=layer_id,
                 renormalize_topk_logits=False,  # Match sglang behavior
+                balanced_topk=getattr(config, "balanced_topk", False),
+                debug_routing=getattr(config, "debug_routing", False),
             )
         else:
             self.experts = EPMoE(
