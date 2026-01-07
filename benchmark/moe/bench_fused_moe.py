@@ -8,7 +8,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import math
 
 import jax
 import jax.numpy as jnp
@@ -25,14 +24,18 @@ from benchmark.moe.utils import (
 )
 from benchmark.utils import multiple_iteration_timeit_from_trace
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
+    DEFAULT_TPU_VMEM_BUDGET_BYTES as _DEFAULT_KERNEL_TPU_VMEM_BUDGET_BYTES,
+)
+from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
     FusedMoEBlockConfig,
+    estimate_fused_moe_vmem_bytes,
     validate_fused_moe_block_config,
 )
 from sgl_jax.srt.layers.moe import FusedEPMoE
 
 # Leave headroom for compiler padding/alignment and any unmodeled VMEM usage.
-DEFAULT_TPU_VMEM_BUDGET_MB = 60
-DEFAULT_TPU_VMEM_BUDGET_BYTES = DEFAULT_TPU_VMEM_BUDGET_MB * 1024 * 1024
+DEFAULT_TPU_VMEM_BUDGET_BYTES = _DEFAULT_KERNEL_TPU_VMEM_BUDGET_BYTES
+DEFAULT_TPU_VMEM_BUDGET_MB = DEFAULT_TPU_VMEM_BUDGET_BYTES // (1024 * 1024)
 
 
 def _dtype_packing(dtype: jnp.dtype) -> int:
@@ -44,98 +47,25 @@ def _dtype_packing(dtype: jnp.dtype) -> int:
 
 
 def _estimate_vmem_bytes(case: MoEBenchmarkCase, dtype: jnp.dtype, cfg: FusedMoEBlockConfig) -> int:
-    """Rough VMEM estimate to avoid compile-time OOM (TPU VMEM is 64MB/core).
-
-    Note: this intentionally overestimates a bit because the fused_moe kernel
-    materializes several routing/top-k temporaries (see `get_top_k` in the
-    pallas kernel body), which are not part of the explicit scratch buffers.
-    """
+    a2a_storage = getattr(cfg, "a2a_storage", "auto")
+    use_vmem_a2a = a2a_storage == "vmem"
     bt = cfg.bt
     bts = bt if cfg.bts is None else int(cfg.bts)
-    bf = cfg.bf
-    bd1 = cfg.bd1
-    bd2 = cfg.bd2
-    top_k = case.top_k
-    num_devices = case.ep_size
-    hidden = case.hidden_size
-
-    token_bytes = jnp.dtype(dtype).itemsize
-    weight_bytes = token_bytes
-
-    t_packing = _dtype_packing(dtype)
-    local_num_tokens = case.num_tokens // case.ep_size
-    padded_num_experts = ((case.num_experts + 127) // 128) * 128
-    padded_top_k = ((case.top_k + 127) // 128) * 128
-    output_bt = math.gcd(bt, local_num_tokens)
-    # With run_bt tiling, the a2a scratch only needs to cover one `output_bt` tile
-    # (across all EP devices), padded up to a multiple of `bts` for safe token staging.
-    a2a_max_tokens = ((output_bt * num_devices + bts - 1) // bts) * bts
-
-    # Output-side staging (no overlap):
-    # - a2a_g_acc_vmem: (1, top_k, acc_bt, hidden_size)
-    # - b_output: (1, output_bt, hidden_size)
-    acc_bt = math.gcd(output_bt, 8)  # Must match fused_moe kernel scratch shape.
-    a2a_g_acc = 1 * top_k * acc_bt * hidden * token_bytes
-    # b_output_x2_vmem is double-buffered to overlap store(output_hbm) with next bt's compute.
-    b_output = 2 * output_bt * hidden * token_bytes
-    # b_gating_vmem is double-buffered for run_bt overlap.
-    b_gating = 2 * output_bt * padded_num_experts * token_bytes
-    # t2e_routing_smem scratch is placed in SMEM (not VMEM).
-    t2e_routing = 0
-    # top_k_logits_vmem scratch: (output_bt, top_k) float32
-    top_k_logits = output_bt * top_k * 4
-
-    # See kernel scratch shapes: b_w1_x2_vmem/b_w3_x2_vmem/b_w2_x2_vmem.
-    w1 = 2 * bd1 * bf * weight_bytes
-    w3 = 2 * bd1 * bf * weight_bytes
-    w2 = 2 * bf * bd2 * weight_bytes
-
-    # b_acc_vmem is F32(2, a2a_max_tokens, 1, bf)
-    b_acc = 2 * a2a_max_tokens * bf * 4
-    # U32 token staging for FFN1: (2, bts, bd1 // t_packing)
-    t_stage_b32 = 2 * bts * (bd1 // t_packing) * 4
-    # Kernel uses triple-buffering for a2a_s_acc staging: (3, bts, bd2 // t_packing)
-    a2a_s_acc_stage_b32 = 3 * bts * (bd2 // t_packing) * 4
-
-    # Routing / top-k temporaries in kernel (best-effort conservative estimate):
-    # - softmax + get_top_k use float32 work buffers and broadcasted iotas
-    # - top_k logits are materialized as `top_k` arrays of shape (output_bt, padded_top_k)
-    # This is separate from `t2e_routing_smem` above.
-    routing_work_f32 = output_bt * padded_num_experts * 4  # softmax result (approx)
-    get_top_k_input_f32 = output_bt * padded_num_experts * 4
-    get_top_k_t2e = output_bt * padded_num_experts * 4
-    get_top_k_iota = output_bt * padded_num_experts * 4
-    get_top_k_mask = output_bt * padded_num_experts * 4
-    get_top_k_padded_iota = output_bt * padded_top_k * 4
-    get_top_k_t2e_routing = output_bt * padded_top_k * 4
-    get_top_k_logits_sum = output_bt * padded_top_k * 4
-    get_top_k_logits_lst = top_k * output_bt * padded_top_k * 4
-    routing_temporaries = (
-        routing_work_f32
-        + get_top_k_input_f32
-        + get_top_k_t2e
-        + get_top_k_iota
-        + get_top_k_mask
-        + get_top_k_padded_iota
-        + get_top_k_t2e_routing
-        + get_top_k_logits_sum
-        + get_top_k_logits_lst
-    )
-
-    # Skip optional scale/bias buffers (unused in this benchmark).
-    return (
-        a2a_g_acc
-        + b_output
-        + b_gating
-        + t2e_routing
-        + top_k_logits
-        + w1
-        + w3
-        + w2
-        + b_acc
-        + t_stage_b32
-        + a2a_s_acc_stage_b32
-        + routing_temporaries
+    return estimate_fused_moe_vmem_bytes(
+        num_tokens=case.num_tokens,
+        num_experts=case.num_experts,
+        top_k=case.top_k,
+        hidden_size=case.hidden_size,
+        intermediate_size=case.intermediate_size,
+        dtype=dtype,
+        ep_size=case.ep_size,
+        bt=bt,
+        bts=bts,
+        bf=cfg.bf,
+        bd1=cfg.bd1,
+        bd2=cfg.bd2,
+        use_vmem_a2a=use_vmem_a2a,
+        include_routing_temporaries=True,
     )
 
 
@@ -147,6 +77,7 @@ def select_block_configs(
     bts_candidates: list[int] | None = None,
     bf_candidates: list[int],
     bd_candidates: list[int],
+    a2a_storage_candidates: list[str] | None = None,
     tpu_vmem_budget_bytes: int,
     max_configs: int,
 ) -> list[FusedMoEBlockConfig]:
@@ -213,6 +144,9 @@ def select_block_configs(
         bfc = cfg.bfc
         bd1c = cfg.bd1c
         bd2c = cfg.bd2c
+        a2a_storage = getattr(cfg, "a2a_storage", "auto")
+        if a2a_storage not in ("auto", "hbm", "vmem"):
+            return False, f"unsupported a2a_storage={a2a_storage!r}"
 
         if bt <= 0 or bf <= 0 or bd1 <= 0 or bd2 <= 0:
             return False, "non-positive tile size"
@@ -280,11 +214,15 @@ def select_block_configs(
             effective.bfc,
             effective.bd1c,
             effective.bd2c,
+            getattr(effective, "a2a_storage", "auto"),
         )
         if key in seen:
             return
         seen.add(key)
         configs.append(effective)
+
+    if a2a_storage_candidates is None:
+        a2a_storage_candidates = ["auto"]
 
     for bt in bt_candidates:
         if bts_candidates_i is None:
@@ -294,21 +232,23 @@ def select_block_configs(
         for bts in bts_list:
             for bf in bf_candidates:
                 for bd in bd_candidates:
-                    raw = FusedMoEBlockConfig(
-                        bt=bt,
-                        bf=bf,
-                        bd1=bd,
-                        bd2=bd,
-                        btc=bt,
-                        bfc=bf,
-                        bd1c=bd,
-                        bd2c=bd,
-                        bts=bts,
-                    )
-                    effective = raw.effective_for(
-                        num_tokens=case.num_tokens, ep_size=case.ep_size, dtype=dtype
-                    )
-                    add(raw=raw, effective=effective)
+                    for a2a_storage in a2a_storage_candidates:
+                        raw = FusedMoEBlockConfig(
+                            bt=bt,
+                            bf=bf,
+                            bd1=bd,
+                            bd2=bd,
+                            btc=bt,
+                            bfc=bf,
+                            bd1c=bd,
+                            bd2c=bd,
+                            bts=bts,
+                            a2a_storage=a2a_storage,
+                        )
+                        effective = raw.effective_for(
+                            num_tokens=case.num_tokens, ep_size=case.ep_size, dtype=dtype
+                        )
+                        add(raw=raw, effective=effective)
 
     if max_configs <= 0:
         raise ValueError(f"Expected {max_configs=} to be > 0.")
@@ -316,9 +256,10 @@ def select_block_configs(
         return configs
 
     # Keep benchmark runtime bounded while retaining coverage across (btc, bf, bd).
-    def score(c: FusedMoEBlockConfig) -> tuple[int, int, int, int, int, int, int, int, int]:
+    def score(c: FusedMoEBlockConfig) -> tuple[int, int, int, int, int, int, int, int, int, int]:
         # Lexicographic "weighted" ranking; larger tiles tend to run faster.
-        return (c.bt, c.bts or c.bt, c.bf, c.bd1, c.bd2, c.btc, c.bfc, c.bd1c, c.bd2c)
+        a2a_rank = {"auto": 0, "hbm": 1, "vmem": 2}.get(getattr(c, "a2a_storage", "auto"), 0)
+        return (c.bt, c.bts or c.bt, c.bf, c.bd1, c.bd2, c.btc, c.bfc, c.bd1c, c.bd2c, a2a_rank)
 
     selected: list[FusedMoEBlockConfig] = []
     selected_keys: set[tuple[int, ...]] = set()
@@ -350,6 +291,7 @@ def run_all(
     bts_candidates: list[int] | None = None,
     bf_candidates: list[int] | None = None,
     bd_candidates: list[int] | None = None,
+    a2a_storage_candidates: list[str] | None = None,
     num_tokens: list[int] | None = None,
     tpu_vmem_budget_bytes: int = DEFAULT_TPU_VMEM_BUDGET_BYTES,
     max_configs: int = 9,
@@ -384,7 +326,7 @@ def run_all(
         print("No runnable fused_moe cases after filtering tp_size!=1.")
         return
 
-    tuned_results: dict[str, dict[tuple, tuple[int, int, int, int, int, int, int, int]]] = {}
+    tuned_results: dict[str, dict[tuple, tuple]] = {}
     if tune_block_config:
         from sgl_jax.srt.utils.jax_utils import get_device_name
 
@@ -422,6 +364,7 @@ def run_all(
                 bts_candidates=bts_candidates,
                 bf_candidates=bf_candidates or [128, 256, 512, 1024, 2048],
                 bd_candidates=bd_candidates or [256, 512, 1024, 2048, 4096, 8192],
+                a2a_storage_candidates=a2a_storage_candidates,
                 tpu_vmem_budget_bytes=tpu_vmem_budget_bytes,
                 max_configs=max_configs,
             )
@@ -532,6 +475,9 @@ def run_all(
                         best_cfg.bd1c,
                         best_cfg.bd2c,
                     )
+                    a2a_storage = getattr(best_cfg, "a2a_storage", "auto")
+                    if a2a_storage != "auto":
+                        cfg_tuple = (*cfg_tuple, a2a_storage)
                     print(f"  best: {best_cfg.as_kwargs()} ({best_ms:.3f} ms)")
                     print(f"  tuned_table[{device_name}][{table_key}] = {cfg_tuple}")
                     per_device = tuned_results.setdefault(device_name, {})
@@ -602,6 +548,18 @@ def parse_args() -> argparse.Namespace:
         help="Candidate list for bd1/bd2 (hidden tile), e.g. --bd-candidates 512 1024 2048 4096",
     )
     parser.add_argument(
+        "--a2a-storage-candidates",
+        type=str,
+        nargs="+",
+        choices=["auto", "hbm", "vmem"],
+        default=None,
+        help=(
+            "Candidate list for where to store a2a_s/a2a_s_acc scratch buffers. "
+            "Use 'vmem' for decode fast-path experiments. "
+            "Example: --a2a-storage-candidates hbm vmem"
+        ),
+    )
+    parser.add_argument(
         "--num-tokens",
         type=int,
         nargs="+",
@@ -642,6 +600,7 @@ if __name__ == "__main__":
         bts_candidates=args.bts_candidates,
         bf_candidates=args.bf_candidates,
         bd_candidates=args.bd_candidates,
+        a2a_storage_candidates=args.a2a_storage_candidates,
         num_tokens=args.num_tokens,
         tpu_vmem_budget_bytes=tpu_vmem_budget_bytes,
         max_configs=args.max_configs,

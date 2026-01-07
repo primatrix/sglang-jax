@@ -33,8 +33,9 @@ from .kernel import FusedMoEBlockConfig
 #   - subc_quant_wsz (0 means None)
 #
 # Value:
-#   - (bt, bf, bd1, bd2, btc, bfc, bd1c, bd2c)
-TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, int, int, int, int, int, int, int]]] = {
+#   - (bt, bf, bd1, bd2, btc, bfc, bd1c, bd2c[, a2a_storage])
+#     where a2a_storage is one of: "auto", "hbm", "vmem" (or legacy int code 0/1/2).
+TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple]] = {
     # Populate per-device kind, e.g. "TPU v6e", "TPU v7".
     "TPU v6e": {
         ("bfloat16", 128, 8, 8, 8192, 2048, 4): (32, 2048, 2048, 2048, 32, 2048, 2048, 2048),
@@ -71,6 +72,7 @@ DEFAULT_FUSED_MOE_BLOCK_CONFIG = FusedMoEBlockConfig(
     bfc=1024,
     bd1c=1024,
     bd2c=1024,
+    a2a_storage="auto",
 )
 
 
@@ -141,7 +143,19 @@ def get_tuned_fused_moe_block_config(
     if cfg_tuple is None:
         return DEFAULT_FUSED_MOE_BLOCK_CONFIG
 
-    bt, bf, bd1, bd2, btc, bfc, bd1c, bd2c = cfg_tuple
+    a2a_storage = "auto"
+    if len(cfg_tuple) == 8:
+        bt, bf, bd1, bd2, btc, bfc, bd1c, bd2c = cfg_tuple
+    elif len(cfg_tuple) == 9:
+        bt, bf, bd1, bd2, btc, bfc, bd1c, bd2c, a2a_storage_raw = cfg_tuple
+        if isinstance(a2a_storage_raw, int):
+            a2a_storage = {0: "auto", 1: "hbm", 2: "vmem"}.get(int(a2a_storage_raw), "auto")
+        else:
+            a2a_storage = str(a2a_storage_raw)
+    else:
+        raise ValueError(
+            f"Expected tuned cfg tuple length 8 or 9, got {len(cfg_tuple)}: {cfg_tuple}"
+        )
     cfg = FusedMoEBlockConfig(
         bt=bt,
         bf=bf,
@@ -151,5 +165,6 @@ def get_tuned_fused_moe_block_config(
         bfc=bfc,
         bd1c=bd1c,
         bd2c=bd2c,
+        a2a_storage=a2a_storage,
     )
     return cfg
