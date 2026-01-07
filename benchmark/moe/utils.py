@@ -178,9 +178,10 @@ def generate_fused_router_logits(
     if delta > 0:
         has0 = jnp.any(topk_ids == 0, axis=1)
         candidates = jnp.logical_not(has0)
-        rank = jnp.cumsum(candidates.astype(jnp.int32))
-        select = jnp.logical_and(candidates, rank <= jnp.int32(delta))
-        topk_ids = topk_ids.at[select, 0].set(jnp.int32(0))
+        # Avoid boolean indexing under jit by converting the mask to integer indices
+        # with a fixed, static `size`.
+        token_idx = jnp.nonzero(candidates, size=int(delta), fill_value=0)[0].astype(jnp.int32)
+        topk_ids = topk_ids.at[token_idx, 0].set(jnp.int32(0))
 
     # Materialize logits so that get_top_k picks exactly `topk_ids` in rank order.
     # Use distinct per-k values to avoid argmax tie-break artifacts.
