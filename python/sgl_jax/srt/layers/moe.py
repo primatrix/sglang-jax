@@ -5,7 +5,11 @@ from jax import shard_map
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_ep_moe
+from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
+    FusedMoEBlockConfig,
+    fused_ep_moe,
+    fused_ep_moe_routing_stats,
+)
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
@@ -533,6 +537,9 @@ class FusedEPMoE(nnx.Module):
         activation: str = "silu",
         layer_id: int = 0,
         renormalize_topk_logits: bool = False,
+        balanced_topk: bool = False,
+        debug_routing: bool = False,
+        debug_routing_local_mask: bool = False,
     ):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
@@ -544,7 +551,10 @@ class FusedEPMoE(nnx.Module):
         self.ep_size = ep_size
         self.activation = activation
         self.renormalize_topk_logits = renormalize_topk_logits
+        self.balanced_topk = balanced_topk
         self.mesh = mesh
+        self.debug_routing = debug_routing
+        self.debug_routing_local_mask = debug_routing_local_mask
 
         if num_experts % self.ep_size != 0:
             raise ValueError(
@@ -599,6 +609,43 @@ class FusedEPMoE(nnx.Module):
         """
         assert hidden_states.ndim == 2
 
+        if self.debug_routing:
+            factor, mean, max_count, active = fused_ep_moe_routing_stats(
+                mesh=self.mesh,
+                router_logits=router_logits,
+                top_k=self.num_experts_per_tok,
+                num_experts=self.num_experts,
+                ep_axis_name="tensor",
+                local_mask=self.debug_routing_local_mask,
+                balanced_topk=self.balanced_topk,
+            )
+
+            @jax.jit
+            @jax.shard_map(
+                mesh=self.mesh,
+                in_specs=(P(), P(), P(), P()),
+                out_specs=P(),
+                check_vma=False,
+            )
+            def _print_once(factor, mean, max_count, active):
+                should_print = jax.lax.axis_index("tensor") == 0
+
+                def _do_print(_):
+                    jax.debug.print(
+                        "fused_ep_moe routing: layer={layer} factor={f:.4f} mean={m:.1f} max={x:.0f} active={a:.0f}",
+                        layer=self.layer_id,
+                        f=factor,
+                        m=mean,
+                        x=max_count,
+                        a=active,
+                        ordered=True,
+                    )
+                    return jnp.int32(0)
+
+                return jax.lax.cond(should_print, _do_print, lambda _: jnp.int32(0), jnp.int32(0))
+
+            _print_once(factor, mean, max_count, active)
+
         output = fused_ep_moe(
             mesh=self.mesh,
             tokens=hidden_states,
@@ -608,6 +655,7 @@ class FusedEPMoE(nnx.Module):
             gating_output=router_logits,
             top_k=self.num_experts_per_tok,
             renormalize_topk_logits=self.renormalize_topk_logits,
+            balanced_topk=self.balanced_topk,
             act_fn=self.activation,
             block_config=block_config,
             # Optional parameters (not used in basic case)
