@@ -207,6 +207,20 @@ def validate_fused_moe_block_config(
         raise ValueError(f"Expected {bt=} to be aligned to {t_packing=}.")
     if local_num_tokens % bt != 0:
         raise ValueError(f"Expected {local_num_tokens=} to be divisible by {bt=}.")
+    # TPU HBM `gating_hbm` is typically tiled along the major dimension. Mosaic
+    # requires `tpu.memref_slice` sizes to be aligned to that tiling; otherwise
+    # compilation fails with errors like:
+    #   "Slice shape along dimension 0 must be aligned to tiling (4), but is 2."
+    # For small `local_num_tokens`, Mosaic may pick a smaller tile, so we align
+    # against `gcd(preferred_tile, local_num_tokens)`.
+    gating_bits = jnp.dtype(dtype).itemsize * 8
+    preferred_gating_tile0 = 256 // gating_bits if gating_bits > 0 else 1
+    preferred_gating_tile0 = max(1, int(preferred_gating_tile0))
+    gating_tile0 = math.gcd(int(local_num_tokens), preferred_gating_tile0)
+    if gating_tile0 <= 0:
+        raise ValueError(f"Expected computed {gating_tile0=} to be > 0.")
+    if bt % gating_tile0 != 0:
+        raise ValueError(f"Expected {bt=} to be aligned to {gating_tile0=} (gating HBM tiling).")
     if bts % t_packing != 0:
         raise ValueError(f"Expected {bts=} to be aligned to {t_packing=}.")
     if bts > bt:
@@ -502,7 +516,10 @@ def _fused_ep_moe_kernel(
         # Hint Mosaic about HBM tiling alignment for `tpu.memref_slice`:
         # - f32 is typically tiled as (8, 128)
         # - bf16/f16 is typically tiled as (16, 128)
-        gating_tile0 = 256 // (jnp.dtype(gating_hbm.dtype).itemsize * 8)
+        gating_bits = jnp.dtype(gating_hbm.dtype).itemsize * 8
+        preferred_gating_tile0 = 256 // gating_bits if gating_bits > 0 else 1
+        preferred_gating_tile0 = max(1, int(preferred_gating_tile0))
+        gating_tile0 = math.gcd(int(local_num_tokens), preferred_gating_tile0)
         if bt_size % gating_tile0 == 0:
             bt_start = pl.multiple_of(bt_start, gating_tile0)
         pltpu.make_async_copy(
