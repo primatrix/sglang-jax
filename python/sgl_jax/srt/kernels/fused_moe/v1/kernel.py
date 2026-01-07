@@ -160,6 +160,12 @@ def get_dtype_packing(dtype):
 DEFAULT_TPU_VMEM_LIMIT_BYTES = 64 * 1024 * 1024
 # Leave headroom for compiler padding/temporaries.
 DEFAULT_TPU_VMEM_BUDGET_BYTES = 60 * 1024 * 1024
+# Extra headroom when we explicitly pin large operands into VMEM (alternate memory).
+# XLA's alternate memory allocator can fail even when a naive sum-of-buffers fits.
+#
+# Keep this small: the main guardrail is the total estimate; this is just to
+# reduce "colored operand" allocation failures for `a2a_storage="auto"`.
+DEFAULT_TPU_VMEM_PINNED_HEADROOM_BYTES = 2 * 1024 * 1024
 
 
 def estimate_fused_moe_vmem_bytes(
@@ -2241,7 +2247,10 @@ def fused_ep_moe(
         # - Only consider VMEM-a2a when the whole per-core token batch fits in a single
         #   bt tile (bt == local_num_tokens), i.e. num_bt == 1.
         # - Only enable if the *total* VMEM estimate (including a2a in VMEM) fits.
-        vmem_budget_bytes = DEFAULT_TPU_VMEM_BUDGET_BYTES
+        vmem_budget_bytes = max(
+            0,
+            DEFAULT_TPU_VMEM_BUDGET_BYTES - DEFAULT_TPU_VMEM_PINNED_HEADROOM_BYTES,
+        )
         use_vmem_a2a = (bt == local_num_tokens) and (
             estimate_fused_moe_vmem_bytes(
                 num_tokens=num_tokens,

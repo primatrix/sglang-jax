@@ -437,6 +437,11 @@ def run_all(
                         tries=iters,
                         warmup=warmup_iters,
                     )
+                except jax.errors.JaxRuntimeError as e:
+                    # Compilation/runtime failures (e.g. alternate memory assignment
+                    # failures when forcing VMEM placement). Treat as an invalid config.
+                    print(f"SKIP fused_moe blocks [{i+1}/{len(block_cfgs)}], reason: {e}")
+                    continue
                 except ValueError as e:
                     # Guard against shape constraints enforced by the fused kernel
                     # (e.g. local_num_tokens alignment to dtype packing).
