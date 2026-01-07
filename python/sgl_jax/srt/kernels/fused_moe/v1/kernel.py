@@ -543,8 +543,8 @@ def _fused_ep_moe_kernel(
     b2_hbm,  # None | F32(local_num_experts, 1, hidden_size)
     b3_hbm,  # None | F32(local_num_experts, 1, intermediate_size)
     gating_hbm,  # (local_num_tokens, padded_num_experts)
-    a2a_s_x2,  # (2, a2a_max_tokens, t_packing, hidden_size // t_packing) in HBM or VMEM
-    a2a_s_acc_x2,  # (2, a2a_max_tokens, t_packing, hidden_size // t_packing) in HBM or VMEM
+    a2a_s_x2_hbm,  # (2, a2a_max_tokens, t_packing, hidden_size // t_packing) in HBM
+    a2a_s_acc_x2_hbm,  # (2, a2a_max_tokens, t_packing, hidden_size // t_packing) in HBM
     a2a_g_hbm,  # (num_experts, bt, t_packing, hidden_size // t_packing)
     # Output
     output_hbm,  # (local_num_tokens, hidden_size)
@@ -573,6 +573,11 @@ def _fused_ep_moe_kernel(
     b_acc_vmem,  # F32(2, align_to(bt * num_devices, bts), 1, bf)
     t_stage_x2_vmem,  # <token_buf_id> (2, bts, t_packing, bd1 // t_packing)
     a2a_s_acc_stage_x3_vmem,  # <acc_buf_id> (3, bts, t_packing, bd2 // t_packing)
+    # Optional VMEM-resident A2A buffers. These must be allocated via
+    # `scratch_shapes` (not operands), otherwise XLA may fail to reserve
+    # alternate memory for "colored operands" at compile time.
+    a2a_s_x2_vmem,  # None | VMEM(2, a2a_max_tokens, t_packing, hidden_size // t_packing)
+    a2a_s_acc_x2_vmem,  # None | VMEM(2, a2a_max_tokens, t_packing, hidden_size // t_packing)
     ### Semaphores:
     token_stage_x2_sems,  # DMA(2,): <token_buf_id>
     acc_stage_x3_sems,  # DMA(3,): <acc_buf_id>
@@ -608,6 +613,11 @@ def _fused_ep_moe_kernel(
     assert b_output_x2_vmem.shape[1] == bt, (b_output_x2_vmem.shape[1], bt)
     assert local_num_tokens % bt == 0, (local_num_tokens, bt)
     num_bt = local_num_tokens // bt
+    a2a_s_x2 = a2a_s_x2_hbm
+    a2a_s_acc_x2 = a2a_s_acc_x2_hbm
+    if use_vmem_a2a:
+        a2a_s_x2 = a2a_s_x2_vmem
+        a2a_s_acc_x2 = a2a_s_acc_x2_vmem
     a2a_max_tokens = a2a_s_x2.shape[1]
     right_id = (my_id + 1) % num_devices
     num_experts = a2a_g_hbm.shape[0]
@@ -2307,9 +2317,6 @@ def fused_ep_moe(
     tokens = tokens.reshape(-1, t_packing, hidden_size // t_packing)
 
     hbm_block_spec = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
-    a2a_block_spec = pl.BlockSpec(
-        memory_space=pltpu.MemorySpace.VMEM if use_vmem_a2a else pltpu.MemorySpace.HBM
-    )
     renorm_str = "-renorm_k" if renormalize_topk_logits else ""
     a2a_tag = "vmem" if use_vmem_a2a else "hbm"
     scope_name = (
@@ -2345,6 +2352,19 @@ def fused_ep_moe(
     b1_scratch = None if b1 is None else pltpu.VMEM((2, 1, block_config.bf), jnp.float32)
     b3_scratch = None if b3 is None else pltpu.VMEM((2, 1, block_config.bf), jnp.float32)
     b2_scratch = None if b2 is None else pltpu.VMEM((2, t_packing, 1, bd2_per_pack), jnp.float32)
+
+    a2a_s_x2_vmem_scratch = None
+    a2a_s_acc_x2_vmem_scratch = None
+    if use_vmem_a2a:
+        a2a_s_x2_vmem_scratch = pltpu.VMEM(
+            (2, a2a_max_tokens, t_packing, hidden_per_pack),
+            t_dtype,
+        )
+        a2a_s_acc_x2_vmem_scratch = pltpu.VMEM(
+            (2, a2a_max_tokens, t_packing, hidden_per_pack),
+            t_dtype,
+        )
+
     scratch_shapes = (
         # Routing / metadata.
         pltpu.SMEM((2, bt, padded_top_k), jnp.int32),  # t2e_routing_x2_smem
@@ -2376,6 +2396,8 @@ def fused_ep_moe(
             (3, block_config.bts, t_packing, bd2_per_pack),
             t_dtype,
         ),  # a2a_s_acc_stage_x3_vmem
+        a2a_s_x2_vmem_scratch,  # a2a_s_x2_vmem
+        a2a_s_acc_x2_vmem_scratch,  # a2a_s_acc_x2_vmem
         # Semaphores.
         pltpu.SemaphoreType.DMA((2,)),  # token_stage_x2_sems
         pltpu.SemaphoreType.DMA((3,)),  # acc_stage_x3_sems
@@ -2386,6 +2408,7 @@ def fused_ep_moe(
         pltpu.SemaphoreType.DMA((1,)),  # a2a_acc_sems
         pltpu.SemaphoreType.BARRIER,  # barrier_sem
     )
+
     fused_moe = jax.named_scope(scope_name)(
         pl.pallas_call(
             functools.partial(
@@ -2422,8 +2445,8 @@ def fused_ep_moe(
                     None if b2 is None else hbm_block_spec,  # b2_hbm
                     None if b3 is None else hbm_block_spec,  # b3_hbm
                     hbm_block_spec,  # gating_output_hbm
-                    a2a_block_spec,  # a2a_s_x2 (HBM or VMEM)
-                    a2a_block_spec,  # a2a_s_acc_x2 (HBM or VMEM)
+                    hbm_block_spec,  # a2a_s_x2 (HBM)
+                    hbm_block_spec,  # a2a_s_acc_x2 (HBM)
                     hbm_block_spec,  # a2a_g_hbm
                 ],
                 out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
@@ -2477,8 +2500,7 @@ def fused_ep_moe(
         a2a_s_acc_x2_scratch,
         a2a_g_hbm_scratch,
     ):
-        a2a_space = pltpu.VMEM if use_vmem_a2a else pltpu.HBM
-        local_output = fused_moe(
+        return fused_moe(
             pltpu.with_memory_space_constraint(tokens, pltpu.HBM),  # tokens_hbm
             pltpu.with_memory_space_constraint(w1, pltpu.HBM),  # w1_hbm
             pltpu.with_memory_space_constraint(w2, pltpu.HBM),  # w2_hbm
@@ -2502,15 +2524,18 @@ def fused_ep_moe(
             (None if b2 is None else pltpu.with_memory_space_constraint(b2, pltpu.HBM)),  # b2_hbm
             (None if b3 is None else pltpu.with_memory_space_constraint(b3, pltpu.HBM)),  # b3_hbm
             pltpu.with_memory_space_constraint(gating_output, pltpu.HBM),  # gating_output_hbm
-            pltpu.with_memory_space_constraint(a2a_s_x2_scratch, a2a_space),  # a2a_s_x2
-            pltpu.with_memory_space_constraint(a2a_s_acc_x2_scratch, a2a_space),  # a2a_s_acc_x2
+            pltpu.with_memory_space_constraint(a2a_s_x2_scratch, pltpu.HBM),  # a2a_s_x2
+            pltpu.with_memory_space_constraint(a2a_s_acc_x2_scratch, pltpu.HBM),  # a2a_s_acc_x2
             pltpu.with_memory_space_constraint(a2a_g_hbm_scratch, pltpu.HBM),  # a2a_g_hbm
         )
-        return local_output
 
-    a2a_s_x2_scratch = pl.empty((2, a2a_max_tokens, t_packing, hidden_size // t_packing), t_dtype)
+    a2a_s_x2_scratch = pl.empty(
+        (2, a2a_max_tokens, t_packing, hidden_size // t_packing),
+        t_dtype,
+    )
     a2a_s_acc_x2_scratch = pl.empty(
-        (2, a2a_max_tokens, t_packing, hidden_size // t_packing), t_dtype
+        (2, a2a_max_tokens, t_packing, hidden_size // t_packing),
+        t_dtype,
     )
     a2a_g_hbm_scratch = pl.empty((num_experts, bt, t_packing, hidden_size // t_packing), t_dtype)
     return kernel(
