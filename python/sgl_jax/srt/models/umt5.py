@@ -95,7 +95,7 @@ class UMT5DenseGatedActDense(nnx.Module):
         self.dropout = nnx.Dropout(config.dropout_rate)
         self.act = ACT_FN.get(config.dense_act_fn, jax.nn.gelu)
 
-    def __call__(self, hidden_states: jax.Array, deterministic: bool = False) -> jax.Array:
+    def __call__(self, hidden_states: jax.Array, deterministic: bool = True) -> jax.Array:
         hidden_gelu = self.act(self.wi_0(hidden_states)[0])
         hidden_linear = self.wi_1(hidden_states)[0]
         hidden_states = hidden_gelu * hidden_linear
@@ -131,7 +131,7 @@ class UMT5DenseActDense(nnx.Module):
         self.dropout = nnx.Dropout(config.dropout_rate)
         self.act = ACT_FN.get(config.dense_act_fn, jax.nn.relu)
 
-    def __call__(self, hidden_states: jax.Array, deterministic: bool = False) -> jax.Array:
+    def __call__(self, hidden_states: jax.Array, deterministic: bool = True) -> jax.Array:
         hidden_states, _ = self.wi(hidden_states)
         hidden_states = self.act(hidden_states)
         hidden_states = self.dropout(hidden_states, deterministic=deterministic)
@@ -273,7 +273,7 @@ class UMT5Attention(nnx.Module):
         self,
         hidden_states: jax.Array,
         mask: jax.Array | None = None,
-        deterministic: bool = False,
+        deterministic: bool = True,
         encoder_hidden_states: jax.Array | None = None,
         encoder_mask: jax.Array | None = None,
         forward_batch: ForwardBatch | None = None,
@@ -401,14 +401,14 @@ class UMT5Block(nnx.Module):
         self.is_decoder = is_decoder
         
         # Self Attention sublayer
-        self.layer0_LayerNorm = RMSNorm(
+        self.input_layernorm = RMSNorm(
             config.d_model, 
             epsilon=config.layer_norm_epsilon, 
             dtype=dtype,
             param_dtype=dtype,
             use_scale=True,
         )
-        self.layer0_SelfAttention = UMT5Attention(
+        self.self_attn = UMT5Attention(
             config, 
             mesh, 
             dtype=dtype,
@@ -416,18 +416,18 @@ class UMT5Block(nnx.Module):
             is_cross_attention=False,
             is_decoder=is_decoder,
         )
-        self.layer0_dropout = nnx.Dropout(config.dropout_rate)
+        self.self_attn_dropout = nnx.Dropout(config.dropout_rate)
         
         # Cross Attention sublayer (Decoder only)
         if self.is_decoder:
-            self.layer1_LayerNorm = RMSNorm(
+            self.cross_attention_layernorm = RMSNorm(
                 config.d_model, 
                 epsilon=config.layer_norm_epsilon, 
                 dtype=dtype,
                 param_dtype=dtype,
                 use_scale=True,
             )
-            self.layer1_EncDecAttention = UMT5Attention(
+            self.cross_attn = UMT5Attention(
                 config,
                 mesh,
                 dtype=dtype,
@@ -435,10 +435,10 @@ class UMT5Block(nnx.Module):
                 is_cross_attention=True,
                 is_decoder=is_decoder,
             )
-            self.layer1_dropout = nnx.Dropout(config.dropout_rate)
+            self.cross_attn_dropout = nnx.Dropout(config.dropout_rate)
         
         # Feed Forward sublayer
-        self.layer_FF_LayerNorm = RMSNorm(
+        self.post_attention_layernorm = RMSNorm(
             config.d_model, 
             epsilon=config.layer_norm_epsilon, 
             dtype=dtype,
@@ -447,53 +447,58 @@ class UMT5Block(nnx.Module):
         )
         
         if config.is_gated_act:
-            self.layer_FF_DenseReluDense = UMT5DenseGatedActDense(config, mesh, dtype=dtype)
+            self.mlp = UMT5DenseGatedActDense(config, mesh, dtype=dtype)
         else:
-            self.layer_FF_DenseReluDense = UMT5DenseActDense(config, mesh, dtype=dtype)
+            self.mlp = UMT5DenseActDense(config, mesh, dtype=dtype)
             
-        self.layer_FF_dropout = nnx.Dropout(config.dropout_rate)
+        self.mlp_dropout = nnx.Dropout(config.dropout_rate)
         
     def __call__(
         self, 
         hidden_states: jax.Array,
         mask: jax.Array | None = None,
-        deterministic: bool = False,
-        encoder_hidden_states: jax.Array | None = None,
-        encoder_mask: jax.Array | None = None,
+        deterministic: bool = True,
         forward_batch: ForwardBatch | None = None,
         token_to_kv_pool: KVCache | None = None,
     ) -> jax.Array:
         
         # Self Attention block
-        normed_hidden_states = self.layer0_LayerNorm(hidden_states)
-        attn_output = self.layer0_SelfAttention(
+        normed_hidden_states = self.input_layernorm(hidden_states)
+        attn_output = self.self_attn(
             normed_hidden_states, 
             mask=mask, 
             deterministic=deterministic,
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
         )
-        attn_output = self.layer0_dropout(attn_output, deterministic=deterministic)
+        attn_output = self.self_attn_dropout(attn_output, deterministic=deterministic)
         hidden_states = hidden_states + attn_output
         hidden_states = fp16_clamp(hidden_states)
         
         # Cross Attention block (Decoder Only)
-        if self.is_decoder and encoder_hidden_states is not None:
-            normed_hidden_states = self.layer1_LayerNorm(hidden_states)
-            attn_output = self.layer1_EncDecAttention(
-                normed_hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_mask=encoder_mask,
-                deterministic=deterministic
-            )
-            attn_output = self.layer1_dropout(attn_output, deterministic=deterministic)
-            hidden_states = hidden_states + attn_output
-            hidden_states = fp16_clamp(hidden_states)
+        if self.is_decoder:
+            encoder_hidden_states = None
+            encoder_mask = None
+            if forward_batch is not None:
+                encoder_hidden_states = getattr(forward_batch, "encoder_hidden_states", None)
+                encoder_mask = getattr(forward_batch, "encoder_mask", None)
+
+            if encoder_hidden_states is not None:
+                normed_hidden_states = self.cross_attention_layernorm(hidden_states)
+                attn_output = self.cross_attn(
+                    normed_hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_mask=encoder_mask,
+                    deterministic=deterministic
+                )
+                attn_output = self.cross_attn_dropout(attn_output, deterministic=deterministic)
+                hidden_states = hidden_states + attn_output
+                hidden_states = fp16_clamp(hidden_states)
 
         # Feed Forward block
-        normed_hidden_states = self.layer_FF_LayerNorm(hidden_states)
-        mlp_output = self.layer_FF_DenseReluDense(normed_hidden_states, deterministic=deterministic)
-        mlp_output = self.layer_FF_dropout(mlp_output, deterministic=deterministic)
+        normed_hidden_states = self.post_attention_layernorm(hidden_states)
+        mlp_output = self.mlp(normed_hidden_states, deterministic=deterministic)
+        mlp_output = self.mlp_dropout(mlp_output, deterministic=deterministic)
         hidden_states = hidden_states + mlp_output
         hidden_states = fp16_clamp(hidden_states)
         
@@ -534,9 +539,7 @@ class UMT5Stack(nnx.Module):
         self, 
         hidden_states: jax.Array,
         mask: jax.Array | None = None,
-        deterministic: bool = False,
-        encoder_hidden_states: jax.Array | None = None,
-        encoder_mask: jax.Array | None = None,
+        deterministic: bool = True,
         forward_batch: ForwardBatch | None = None,
         token_to_kv_pool: KVCache | None = None,
     ) -> jax.Array:
@@ -549,8 +552,6 @@ class UMT5Stack(nnx.Module):
                 hidden_states, 
                 mask=mask, 
                 deterministic=deterministic,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_mask=encoder_mask,
                 forward_batch=forward_batch,
                 token_to_kv_pool=token_to_kv_pool,
             )
@@ -617,18 +618,21 @@ class UMT5EncoderModel(nnx.Module):
 
     def __call__(
         self,
-        input_ids: jax.Array,
-        forward_batch: ForwardBatch | None = None, 
+        forward_batch: ForwardBatch,
         token_to_kv_pool: Any | None = None,
-        attention_mask: jax.Array | None = None,
-        **kwargs
     ):
-        x = forward_batch.input_ids if forward_batch is not None else input_ids
-        mask = attention_mask if attention_mask is not None else kwargs.get("mask", None)
-        deterministic = kwargs.get("deterministic", False)
+        x = forward_batch.input_ids
+        mask = getattr(forward_batch, "attention_mask", None)
+        deterministic = getattr(forward_batch, "deterministic", True)
             
         hidden_states = self.shared(x)
-        hidden_states = self.encoder(hidden_states, mask=mask, deterministic=deterministic)
+        hidden_states = self.encoder(
+            hidden_states, 
+            mask=mask, 
+            deterministic=deterministic,
+            forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool
+        )
         return hidden_states
 
 
@@ -691,36 +695,22 @@ class UMT5DecoderModel(nnx.Module):
 
     def __call__(
         self,
-        input_ids: jax.Array | None = None,
-        decoder_input_ids: jax.Array | None = None,
-        forward_batch: ForwardBatch | None = None,
+        forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache | None = None,
-        encoder_hidden_states: jax.Array | None = None,
-        encoder_mask: jax.Array | None = None,
-        decoder_attention_mask: jax.Array | None = None,
-        **kwargs
     ):
-        # Support multiple input conventions
-        if decoder_input_ids is not None:
-            x = decoder_input_ids
-        elif input_ids is not None:
-            x = input_ids
-        elif forward_batch is not None:
-            x = forward_batch.input_ids
-        else:
-            raise ValueError("Must provide either input_ids, decoder_input_ids, or forward_batch")
-            
-        mask = decoder_attention_mask if decoder_attention_mask is not None else kwargs.get("attention_mask")
+        x = forward_batch.input_ids
+        deterministic = getattr(forward_batch, "deterministic", True)
             
         hidden_states = self.shared(x)
+        
+        mask = getattr(forward_batch, "attention_mask", None)
+        
         hidden_states = self.decoder(
             hidden_states,
             mask=mask,
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_mask=encoder_mask,
-            deterministic=kwargs.get("deterministic", False)
+            deterministic=deterministic
         )
         return hidden_states
 
@@ -796,31 +786,32 @@ class UMT5Model(nnx.Module):
 
     def __call__(
         self,
-        input_ids: jax.Array,
-        decoder_input_ids: jax.Array,
-        attention_mask: jax.Array | None = None,
-        decoder_attention_mask: jax.Array | None = None,
-        forward_batch: ForwardBatch | None = None,
+        forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache | None = None,
-        **kwargs
     ):
-        deterministic = kwargs.get("deterministic", False)
+        input_ids = forward_batch.input_ids
+        attention_mask = getattr(forward_batch, "attention_mask", None)
+        deterministic = getattr(forward_batch, "deterministic", True)
         
         # Encoder pass
         encoder_hidden_states = self.shared(input_ids)
         encoder_hidden_states = self.encoder(
             encoder_hidden_states, 
             mask=attention_mask,
-            deterministic=deterministic
+            deterministic=deterministic,
+            forward_batch=forward_batch
         )
         
         # Decoder pass
+        decoder_input_ids = getattr(forward_batch, "decoder_input_ids", input_ids)
+        
         decoder_hidden_states = self.shared(decoder_input_ids)
+        
+        decoder_attention_mask = getattr(forward_batch, "decoder_attention_mask", attention_mask)
+
         decoder_hidden_states = self.decoder(
             decoder_hidden_states,
             mask=decoder_attention_mask,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_mask=attention_mask,
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
             deterministic=deterministic
@@ -832,7 +823,7 @@ class UMT5Model(nnx.Module):
 class UMT5ForConditionalGeneration(nnx.Module):
     """
     UMT5 for conditional generation with LM head.
-    Supports testing mode (direct parameters) and SGLang inference mode.
+    Supports SGLang inference mode.
     """
     def __init__(
         self,
@@ -919,87 +910,40 @@ class UMT5ForConditionalGeneration(nnx.Module):
 
     def __call__(
         self,
-        forward_batch: ForwardBatch | None = None,
+        forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache | None = None,
         logits_metadata: LogitsMetadata | None = None,
-        input_ids: jax.Array | None = None,
-        decoder_input_ids: jax.Array | None = None,
-        attention_mask: jax.Array | None = None,
-        decoder_attention_mask: jax.Array | None = None,
-        encoder_outputs: jax.Array | None = None,
-        **kwargs
     ):
         """
-        Forward pass with two modes:
-        1. Testing: Direct parameters (input_ids, decoder_input_ids, etc.)
-        2. SGLang: forward_batch, token_to_kv_pool, logits_metadata
+        Forward pass for SGLang inference mode.
         """
-        deterministic = kwargs.get("deterministic", False)
-            
-        # Case 1: Testing mode
-        if (input_ids is not None or encoder_outputs is not None) and decoder_input_ids is not None:
-            # Encoder pass (skip if encoder_outputs provided)
-            encoder_hidden_states = encoder_outputs
-            if encoder_hidden_states is None:
-                if input_ids is None:
-                    raise ValueError("Must provide input_ids if encoder_outputs is not provided")
-                encoder_embeds = self.shared(input_ids)
-                encoder_hidden_states = self.encoder(
-                    encoder_embeds,
-                    mask=attention_mask,
-                    deterministic=deterministic
-                )
-            
-            # Decoder pass
-            decoder_embeds = self.shared(decoder_input_ids)
-            decoder_hidden_states = self.decoder(
-                decoder_embeds,
-                mask=decoder_attention_mask,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_mask=attention_mask,
-                deterministic=deterministic,
-                forward_batch=None,
-                token_to_kv_pool=None
-            )
-            
-            # Compute logits
+        batch_input_ids = forward_batch.input_ids
+        deterministic = getattr(forward_batch, "deterministic", True)
+        
+        # Decoder forward pass
+        decoder_embeds = self.shared(batch_input_ids)
+        
+        mask = getattr(forward_batch, "attention_mask", None)
+        
+        decoder_hidden_states = self.decoder(
+            decoder_embeds, 
+            mask=mask,
+            forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
+            deterministic=deterministic
+        )
+        
+        # Compute logits
+        if logits_metadata is not None:
+            logits = self.logits_processor(decoder_hidden_states, self.lm_head, logits_metadata)
+        else:
             lm_head_weights = self.lm_head.embedding[...]
             logits = jnp.matmul(decoder_hidden_states, lm_head_weights.T)
-            return logits
-            
-        # Case 2: SGLang inference mode
-        elif forward_batch is not None:
-            batch_input_ids = forward_batch.input_ids
-            
-            # Get cached encoder outputs if available
-            encoder_hidden_states = getattr(forward_batch, "encoder_hidden_states", None)
-            encoder_mask = getattr(forward_batch, "encoder_mask", None)
-            
-            # Decoder forward pass
-            decoder_embeds = self.shared(batch_input_ids)
-            decoder_hidden_states = self.decoder(
-                decoder_embeds, 
-                mask=None,  # Mask handled by RadixAttention
-                forward_batch=forward_batch,
-                token_to_kv_pool=token_to_kv_pool,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_mask=encoder_mask,
-                deterministic=deterministic
-            )
-            
-            # Compute logits
-            logits = self.logits_processor(decoder_hidden_states, self.lm_head, logits_metadata)
-            
-            # Return format for SGLang runtime
-            layers_kv_fused = []
-            layers_callback_flag = []
-            return logits, layers_kv_fused, layers_callback_flag
         
-        else:
-            raise ValueError(
-                "Either provide (input_ids, decoder_input_ids) for testing mode "
-                "or forward_batch for SGLang inference mode"
-            )
+        # Return format for SGLang runtime
+        layers_kv_fused = []
+        layers_callback_flag = []
+        return logits, layers_kv_fused, layers_callback_flag
 
 
 def _create_block_mapping_helper(config: UMT5Config, layer_idx: int, is_decoder: bool, prefix: str) -> dict:
@@ -1023,27 +967,27 @@ def _create_block_mapping_helper(config: UMT5Config, layer_idx: int, is_decoder:
     # Layer 0: Self Attention
     mappings.update({
         f"{source_prefix}.layer.0.layer_norm.weight": WeightMapping(
-            target_path=f"{target_prefix}.layer0_LayerNorm.scale",
+            target_path=f"{target_prefix}.input_layernorm.scale",
             sharding=(None,),
             transpose=False,
         ),
         f"{source_prefix}.layer.0.SelfAttention.q.weight": WeightMapping(
-            target_path=f"{target_prefix}.layer0_SelfAttention.q.weight",
+            target_path=f"{target_prefix}.self_attn.q.weight",
             sharding=(None, "tensor"),
             transpose=True,
         ),
         f"{source_prefix}.layer.0.SelfAttention.k.weight": WeightMapping(
-            target_path=f"{target_prefix}.layer0_SelfAttention.k.weight",
+            target_path=f"{target_prefix}.self_attn.k.weight",
             sharding=(None, "tensor"),
             transpose=True,
         ),
         f"{source_prefix}.layer.0.SelfAttention.v.weight": WeightMapping(
-            target_path=f"{target_prefix}.layer0_SelfAttention.v.weight",
+            target_path=f"{target_prefix}.self_attn.v.weight",
             sharding=(None, "tensor"),
             transpose=True,
         ),
         f"{source_prefix}.layer.0.SelfAttention.o.weight": WeightMapping(
-            target_path=f"{target_prefix}.layer0_SelfAttention.o.weight",
+            target_path=f"{target_prefix}.self_attn.o.weight",
             sharding=("tensor", None),
             transpose=True,
         ),
@@ -1051,7 +995,7 @@ def _create_block_mapping_helper(config: UMT5Config, layer_idx: int, is_decoder:
     
     # Relative attention bias (loaded for all layers from HF checkpoint)
     mappings[f"{source_prefix}.layer.0.SelfAttention.relative_attention_bias.weight"] = WeightMapping(
-        target_path=f"{target_prefix}.layer0_SelfAttention.relative_attention_bias.embedding",
+        target_path=f"{target_prefix}.self_attn.relative_attention_bias.embedding",
         sharding=(None, "tensor"),
         transpose=False,
     )
@@ -1060,27 +1004,27 @@ def _create_block_mapping_helper(config: UMT5Config, layer_idx: int, is_decoder:
         # Layer 1: Cross Attention (Decoder only)
         mappings.update({
             f"{source_prefix}.layer.1.layer_norm.weight": WeightMapping(
-                target_path=f"{target_prefix}.layer1_LayerNorm.scale",
+                target_path=f"{target_prefix}.cross_attention_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
             f"{source_prefix}.layer.1.EncDecAttention.q.weight": WeightMapping(
-                target_path=f"{target_prefix}.layer1_EncDecAttention.q.weight",
+                target_path=f"{target_prefix}.cross_attn.q.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             ),
             f"{source_prefix}.layer.1.EncDecAttention.k.weight": WeightMapping(
-                target_path=f"{target_prefix}.layer1_EncDecAttention.k.weight",
+                target_path=f"{target_prefix}.cross_attn.k.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             ),
             f"{source_prefix}.layer.1.EncDecAttention.v.weight": WeightMapping(
-                target_path=f"{target_prefix}.layer1_EncDecAttention.v.weight",
+                target_path=f"{target_prefix}.cross_attn.v.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             ),
             f"{source_prefix}.layer.1.EncDecAttention.o.weight": WeightMapping(
-                target_path=f"{target_prefix}.layer1_EncDecAttention.o.weight",
+                target_path=f"{target_prefix}.cross_attn.o.weight",
                 sharding=("tensor", None),
                 transpose=True,
             ),
@@ -1092,14 +1036,14 @@ def _create_block_mapping_helper(config: UMT5Config, layer_idx: int, is_decoder:
     # FFN Layer
     mappings.update({
         f"{source_prefix}.layer.{ffn_layer_idx}.layer_norm.weight": WeightMapping(
-            target_path=f"{target_prefix}.layer_FF_LayerNorm.scale",
+            target_path=f"{target_prefix}.post_attention_layernorm.scale",
             sharding=(None,),
             transpose=False,
         ),
     })
 
     # FFN weights (gated vs non-gated)
-    dense_cls_name = "layer_FF_DenseReluDense"
+    dense_cls_name = "mlp"
     if config.is_gated_act:
         mappings.update({
             f"{source_prefix}.layer.{ffn_layer_idx}.DenseReluDense.wi_0.weight": WeightMapping(
@@ -1136,4 +1080,3 @@ def _create_block_mapping_helper(config: UMT5Config, layer_idx: int, is_decoder:
 
 
 EntryClass = [UMT5EncoderModel, UMT5DecoderModel, UMT5Model, UMT5ForConditionalGeneration]
-
