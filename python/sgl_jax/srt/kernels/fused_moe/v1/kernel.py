@@ -537,17 +537,20 @@ def _fused_ep_moe_kernel(
             sem=b_gating_sem,
         ).wait()
 
-    def get_top_k(input, top_k, renormalize_topk_logits, *, out_top_k_logits_vmem):
+    def get_top_k(input, top_k, renormalize_topk_logits, *, out_top_k_logits_vmem, bt_start):
         if balanced_topk:
-            # Deterministic cyclic routing for benchmarking / tuning. This mirrors
-            # 6be3aa2b9... "balanced gate" top-k: it avoids data-dependent routing
-            # variance so tuning can focus on compute/comm tiling.
+            # Deterministic cyclic routing for benchmarking / tuning. Unlike the original
+            # epic/fused-moe implementation (which is local-token-index based), this uses a
+            # global token id so the routing is balanced across the EP axis without extra
+            # communication.
             num_tokens = input.shape[0]
             token_iota = jax.lax.broadcasted_iota(jnp.int32, (num_tokens, padded_top_k), 0)
             k_iota = jax.lax.broadcasted_iota(jnp.int32, (num_tokens, padded_top_k), 1)
+            global_token_offset = my_id * local_num_tokens + bt_start
+            global_token_iota = token_iota + global_token_offset
             t2e_routing = jnp.where(
                 k_iota < top_k,
-                (token_iota * top_k + k_iota) % num_experts,
+                (global_token_iota * top_k + k_iota) % num_experts,
                 jnp.int32(0),
             )
 
@@ -555,7 +558,29 @@ def _fused_ep_moe_kernel(
             expert_sizes = jnp.full((1, padded_num_experts), avg_size, dtype=jnp.int32)
             remainder = (num_tokens * top_k) % num_experts
             expert_idx_iota = jax.lax.broadcasted_iota(jnp.int32, (1, padded_num_experts), 1)
-            expert_sizes = jnp.where(expert_idx_iota < remainder, expert_sizes + 1, expert_sizes)
+            # The flattened routing sequence for consecutive tokens is:
+            #   expert = (global_token_offset * top_k + n) % num_experts, n in [0, num_tokens*top_k)
+            # so the extra +1 counts (the remainder) start from `start_expert` and wrap.
+            start_expert = (global_token_offset * top_k) % num_experts
+            end_expert = start_expert + remainder
+            is_real_expert = expert_idx_iota < num_experts
+            if remainder == 0:
+                remainder_mask = jnp.zeros_like(expert_idx_iota, dtype=jnp.bool_)
+            else:
+                wrap = end_expert > num_experts
+                remainder_mask = jnp.where(
+                    wrap,
+                    jnp.logical_or(
+                        expert_idx_iota >= start_expert,
+                        expert_idx_iota < (end_expert - num_experts),
+                    ),
+                    jnp.logical_and(
+                        expert_idx_iota >= start_expert,
+                        expert_idx_iota < end_expert,
+                    ),
+                )
+                remainder_mask = jnp.logical_and(remainder_mask, is_real_expert)
+            expert_sizes = jnp.where(remainder_mask, expert_sizes + 1, expert_sizes)
 
             out_top_k_logits_vmem[...] = jnp.full(
                 out_top_k_logits_vmem.shape, 1.0 / top_k, dtype=jnp.float32
@@ -1648,6 +1673,7 @@ def _fused_ep_moe_kernel(
             top_k,
             renormalize_topk_logits,
             out_top_k_logits_vmem=top_k_logits_vmem,
+            bt_start=bt_start,
         )
 
         all_reduce_metadata(
@@ -2233,15 +2259,17 @@ def fused_ep_moe_routing_stats(
             x = jnp.where(is_local_expert, x, -jnp.inf)
 
         if balanced_topk:
-            # Match epic/fused-moe balanced_topk semantics: ignore logits and route
-            # deterministically in a cyclic pattern.
+            # Ignore logits and route deterministically in a cyclic pattern using a
+            # global token id so the routing is balanced across the EP axis.
             num_tokens = x.shape[0]
             token_iota = jax.lax.broadcasted_iota(jnp.int32, (num_tokens, top_k), 0)
             k_iota = jax.lax.broadcasted_iota(jnp.int32, (num_tokens, top_k), 1)
+            global_token_offset = jax.lax.axis_index(ep_axis_name) * num_tokens
+            global_token_iota = token_iota + global_token_offset
             if local_mask:
-                topk_ids = (token_iota * top_k + k_iota) % local_num_experts + local_start
+                topk_ids = (global_token_iota * top_k + k_iota) % local_num_experts + local_start
             else:
-                topk_ids = (token_iota * top_k + k_iota) % num_experts
+                topk_ids = (global_token_iota * top_k + k_iota) % num_experts
         else:
             iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
             topk_ids_lst: list[jax.Array] = []
