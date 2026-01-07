@@ -35,10 +35,7 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 
 def fp16_clamp(x: jax.Array):
-    """
-    Prevents overflow in float16 by clamping values to the max representable range.
-    Standard practice for T5/UMT5 models in lower precision.
-    """
+    """Clamps values to prevent float16 overflow."""
     if x.dtype == jnp.float16 and jnp.isinf(x).any():
         clamp = jnp.finfo(x.dtype).max - 1000
         x = jax.lax.clamp(x=x, min=-clamp, max=clamp)
@@ -47,13 +44,8 @@ def fp16_clamp(x: jax.Array):
 
 def gelu_new(x):
     """
-    Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
-    Also see the paper: https://arxiv.org/abs/1606.08415
-    
-    Note: PyTorch's `func.gelu(tanh_approx=True)` matches this implementation:
-    0.5 * x * (1.0 + tanh(sqrt(2.0 / pi) * (x + 0.044715 * x^3)))
-    
-    This is critical for exact numerical alignment with HuggingFace T5/UMT5 models.
+    GELU activation with tanh approximation (matches HF T5/UMT5).
+    Equivalent to PyTorch's F.gelu(x, approximate='tanh').
     """
     return 0.5 * x * (1.0 + jnp.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * jnp.power(x, 3))))
 
@@ -67,7 +59,7 @@ ACT_FN = {
 
 class UMT5DenseGatedActDense(nnx.Module):
     """
-    Gated-GELU Feed Forward Network used in newer T5 variants (e.g. UMT5, Flan-T5).
+    Gated-GELU FFN (used in UMT5, Flan-T5).
     Structure: (GeLU(x @ wi_0.T) * (x @ wi_1.T)) @ wo.T
     """
     def __init__(
@@ -79,26 +71,26 @@ class UMT5DenseGatedActDense(nnx.Module):
         self.wi_0 = LinearBase(
             input_size=config.d_model,
             output_size=config.d_ff,
+            mesh=mesh,
             use_bias=False,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
-            mesh=mesh,
         )
         self.wi_1 = LinearBase(
             input_size=config.d_model,
             output_size=config.d_ff,
+            mesh=mesh,
             use_bias=False,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
-            mesh=mesh,
         )
         self.wo = LinearBase(
             input_size=config.d_ff,
             output_size=config.d_model,
+            mesh=mesh,
             use_bias=False,
             kernel_axes=("tensor", None),
             params_dtype=dtype,
-            mesh=mesh,
         )
         self.dropout = nnx.Dropout(config.dropout_rate)
         self.act = ACT_FN.get(config.dense_act_fn, jax.nn.gelu)
@@ -113,10 +105,7 @@ class UMT5DenseGatedActDense(nnx.Module):
 
 
 class UMT5DenseActDense(nnx.Module):
-    """
-    Standard Feed Forward Network (Linear -> Act -> Linear).
-    Used in original T5 models.
-    """
+    """Standard FFN (used in original T5): Linear -> Act -> Linear."""
     def __init__(
         self,
         config: UMT5Config,
@@ -126,18 +115,18 @@ class UMT5DenseActDense(nnx.Module):
         self.wi = LinearBase(
             input_size=config.d_model,
             output_size=config.d_ff,
+            mesh=mesh,
             use_bias=False,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
-            mesh=mesh,
         )
         self.wo = LinearBase(
             input_size=config.d_ff,
             output_size=config.d_model,
+            mesh=mesh,
             use_bias=False,
             kernel_axes=("tensor", None),
             params_dtype=dtype,
-            mesh=mesh,
         )
         self.dropout = nnx.Dropout(config.dropout_rate)
         self.act = ACT_FN.get(config.dense_act_fn, jax.nn.relu)
@@ -152,11 +141,8 @@ class UMT5DenseActDense(nnx.Module):
 
 class UMT5Attention(nnx.Module):
     """
-    Multi-head attention module for UMT5 with support for:
-    1. Self-Attention (Encoder/Decoder)
-    2. Cross-Attention (Decoder)
-    3. Relative Position Bias (T5-style)
-    4. KV Cache optimization via RadixAttention (Decoder Self-Attention only)
+    Multi-head attention for UMT5.
+    Supports self-attention, cross-attention, relative position bias, and KV cache.
     """
     def __init__(
         self,
@@ -182,39 +168,37 @@ class UMT5Attention(nnx.Module):
         self.q = LinearBase(
             input_size=self.d_model,
             output_size=self.inner_dim,
+            mesh=mesh,
             use_bias=False,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
-            mesh=mesh,
         )
         self.k = LinearBase(
             input_size=self.d_model,
             output_size=self.inner_dim,
+            mesh=mesh,
             use_bias=False,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
-            mesh=mesh,
         )
         self.v = LinearBase(
             input_size=self.d_model,
             output_size=self.inner_dim,
+            mesh=mesh,
             use_bias=False,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
-            mesh=mesh,
         )
         self.o = LinearBase(
             input_size=self.inner_dim,
             output_size=self.d_model,
+            mesh=mesh,
             use_bias=False,
             kernel_axes=("tensor", None),
             params_dtype=dtype,
-            mesh=mesh,
         )
 
-        # Relative Attention Bias
-        # In T5/UMT5, partial position information is learned via these bias buckets.
-        # This is strictly applied in Self-Attention layers.
+        # Relative position bias (T5-style, self-attention only)
         if not self.is_cross_attention:
             self.relative_attention_bias = Embed(
                 self.relative_attention_num_buckets,
@@ -227,7 +211,7 @@ class UMT5Attention(nnx.Module):
         
         self.dropout = nnx.Dropout(config.dropout_rate)
 
-        # RadixAttention for Decoder Self-Attention with KV Cache optimization via PagedAttention
+        # RadixAttention with KV cache (decoder self-attention only)
         if self.is_decoder and not self.is_cross_attention:
             self.radix_attn = RadixAttention(
                 num_heads=self.n_heads,
@@ -241,13 +225,11 @@ class UMT5Attention(nnx.Module):
         self, relative_position, bidirectional=True, num_buckets=32, max_distance=128
     ):
         """
-        Adapted from HuggingFace T5 implementation.
-        Computes bucket indices for relative positions.
+        Compute bucket indices for relative positions (adapted from HF T5).
         
-        Key properties:
-        1. Logarithmic bucketing for larger distances to capture long-range dependencies efficiently.
-        2. Bidirectional (Encoder) uses separate buckets for past/future.
-        3. Unidirectional (Decoder) only considers past.
+        Bidirectional (encoder): separate buckets for past/future.
+        Unidirectional (decoder): only considers past positions.
+        Uses logarithmic bucketing for longer distances.
         """
         ret = 0
         n = -relative_position
@@ -271,9 +253,7 @@ class UMT5Attention(nnx.Module):
         return jnp.where(is_small, n, val_if_large) + ret
 
     def compute_bias(self, query_length, key_length, bidirectional=True):
-        """
-        Computes the relative attention bias matrix [1, n_heads, query_len, key_len].
-        """
+        """Compute relative attention bias matrix [1, n_heads, query_len, key_len]."""
         context_position = jnp.arange(query_length, dtype=jnp.int32)[:, None]
         memory_position = jnp.arange(key_length, dtype=jnp.int32)[None, :]
         relative_position = memory_position - context_position
@@ -305,32 +285,30 @@ class UMT5Attention(nnx.Module):
         # Project queries
         q, _ = self.q(hidden_states)
 
-        # Determine Key/Value sources based on attention type
+        # Get K/V from encoder (cross-attn) or input (self-attn)
         if self.is_cross_attention:
-            # Cross-Attention: keys/values come from the Encoder Output
+            # Cross-attention: K/V from encoder output
             if encoder_hidden_states is None:
                 raise ValueError("encoder_hidden_states must be provided for cross attention")
             k, _ = self.k(encoder_hidden_states)
             v, _ = self.v(encoder_hidden_states)
             key_length = encoder_hidden_states.shape[1]
         else:
-            # Self-Attention: keys/values come from the Input itself
+            # Self-attention: K/V from input
             k, _ = self.k(hidden_states)
             v, _ = self.v(hidden_states)
             key_length = seq_length
 
         kv_fused = None
         
-        # CASE 1: Decoder Self-Attention with KV Cache Optimization (RadixAttention)
-        # This path is used during highly-optimized autoregressive decoding via SGLang runtime.
+        # CASE 1: Decoder self-attention with KV cache (RadixAttention)
+        # Used during autoregressive decoding in SGLang runtime.
         if self.is_decoder and not self.is_cross_attention and forward_batch is not None and token_to_kv_pool is not None:
             q_flat = q.reshape(-1, self.n_heads, self.key_value_proj_dim)
             k_flat = k.reshape(-1, self.n_heads, self.key_value_proj_dim)
             v_flat = v.reshape(-1, self.n_heads, self.key_value_proj_dim)
             
-            # Note: Relative Position Bias support in RadixAttention is handled implicitly 
-            # or requires specific kernel support for T5-style bias.
-            # Currently assuming basic masking and standard attention in fast path.
+            # Note: Relative position bias not currently supported in RadixAttention fast path
             attn_output, kv_fused = self.radix_attn(
                 q_flat, k_flat, v_flat, 
                 forward_batch, 
@@ -341,9 +319,7 @@ class UMT5Attention(nnx.Module):
             output, _ = self.o(attn_output)
             return output
 
-        # CASE 2: Manual Attention Implementation (Standard / Training / Eager Mode)
-        # Used for Encoder, Cross-Attention, or fallback when RadixAttention is not applicable.
-
+        # CASE 2: Standard attention (encoder, cross-attention, or fallback)
         # Reshape for multi-head attention
         q = q.reshape(batch_size, seq_length, self.n_heads, self.key_value_proj_dim)
         k = k.reshape(batch_size, -1, self.n_heads, self.key_value_proj_dim)
@@ -353,28 +329,28 @@ class UMT5Attention(nnx.Module):
         k = jnp.transpose(k, (0, 2, 1, 3))  # [batch, n_heads, seq_k, head_dim]
         v = jnp.transpose(v, (0, 2, 1, 3))  # [batch, n_heads, seq_k, head_dim]
 
-        # Compute attention scores (T5 uses unscaled dot-product attention)
+        # Compute attention scores (unscaled for T5)
         q_f32 = q.astype(jnp.float32)
         k_f32 = k.astype(jnp.float32)
         scores = jnp.matmul(q_f32, jnp.swapaxes(k_f32, -1, -2))
         
-        # Add Relative Position Bias (Self-Attention Only)
+        # Add relative position bias (self-attention only)
         if not self.is_cross_attention:
             bidirectional = not self.is_decoder
             position_bias = self.compute_bias(seq_length, k.shape[2], bidirectional=bidirectional)
             scores += position_bias.astype(jnp.float32)
 
-        # Construct and apply attention masks
+        # Apply attention masks
         active_mask = mask if not self.is_cross_attention else encoder_mask
         
         if self.is_decoder and not self.is_cross_attention:
-             # Decoder Self-Attention requires a Causal Mask (lower triangular)
+             # Causal mask for decoder self-attention
              causal_mask = jnp.tril(jnp.ones((seq_length, seq_length), dtype=jnp.bool_))
              causal_mask = causal_mask[None, None, :, :]  # [1, 1, seq, seq]
              
              if active_mask is not None:
                  if active_mask.ndim == 2:
-                     # Combine Causal Mask with Padding Mask
+                     # Combine causal mask with padding mask
                      active_mask = active_mask[:, None, None, :]
                      combined_mask = jnp.logical_and(causal_mask, active_mask)
                      active_mask = combined_mask
@@ -411,12 +387,8 @@ class UMT5Attention(nnx.Module):
 
 class UMT5Block(nnx.Module):
     """
-    Transformer block for UMT5 model.
-    
-    Structure:
-    1. Self-Attention + LayerNorm + Residual
-    2. Cross-Attention + LayerNorm + Residual (Decoder only)
-    3. Feed-Forward + LayerNorm + Residual
+    Transformer block for UMT5.
+    Includes self-attention, cross-attention (decoder only), and feed-forward sublayers.
     """
     def __init__(
         self,
@@ -529,9 +501,7 @@ class UMT5Block(nnx.Module):
 
 
 class UMT5Stack(nnx.Module):
-    """
-    Stack of UMT5 transformer blocks (Encoder or Decoder).
-    """
+    """Stack of UMT5 transformer blocks (encoder or decoder)."""
     def __init__(
         self,
         config: UMT5Config,
@@ -559,24 +529,7 @@ class UMT5Stack(nnx.Module):
             use_scale=True,
         )
         self.dropout = nnx.Dropout(config.dropout_rate)
-    
-    def share_relative_attention_bias(self):
-        """
-        Share relative_attention_bias from layer 0 to all other layers.
-        
-        In PyTorch/HuggingFace T5/UMT5, only block.0 has relative_attention_bias weights.
-        In our JAX implementation, each layer has its own Embed layer for better parallelization.
-        This method copies layer 0's bias to all other layers after loading weights.
-        """
-        if len(self.block) == 0:
-            return
-        
-        # Get the bias from layer 0
-        layer0_bias = self.block[0].layer0_SelfAttention.relative_attention_bias.embedding[...]
-        
-        # Copy to all other layers
-        for i in range(1, len(self.block)):
-            self.block[i].layer0_SelfAttention.relative_attention_bias.embedding[...] = layer0_bias
+
     def __call__(
         self, 
         hidden_states: jax.Array,
@@ -610,9 +563,7 @@ class UMT5Stack(nnx.Module):
 
 
 class UMT5EncoderModel(nnx.Module):
-    """
-    UMT5 Encoder-only model.
-    """
+    """UMT5 encoder-only model."""
     def __init__(
         self,
         config: UMT5Config,
@@ -644,9 +595,7 @@ class UMT5EncoderModel(nnx.Module):
         )
         weight_mappings = self._create_weight_mappings()
         loader.load_weights_from_safetensors(weight_mappings)
-        
-        # No need to share relative_attention_bias - each layer loads its own weights
-    
+
     def _create_weight_mappings(self) -> dict:
         """Create mappings from HuggingFace weight names to JAX model parameters."""
         mappings = {
@@ -684,9 +633,7 @@ class UMT5EncoderModel(nnx.Module):
 
 
 class UMT5DecoderModel(nnx.Module):
-    """
-    UMT5 Decoder-only model.
-    """
+    """UMT5 decoder-only model."""
     def __init__(
         self,
         config: UMT5Config,
@@ -721,8 +668,6 @@ class UMT5DecoderModel(nnx.Module):
         )
         weight_mappings = self._create_weight_mappings()
         loader.load_weights_from_safetensors(weight_mappings)
-        
-        # No need to share relative_attention_bias - each layer loads its own weights
     
     def _create_weight_mappings(self) -> dict:
         """Create weight mappings for decoder model."""
@@ -741,7 +686,7 @@ class UMT5DecoderModel(nnx.Module):
         
         for layer_idx in range(self.config.num_decoder_layers):
             mappings.update(_create_block_mapping_helper(self.config, layer_idx, is_decoder=True, prefix="decoder.block"))
-
+        
         return mappings
 
     def __call__(
@@ -781,9 +726,7 @@ class UMT5DecoderModel(nnx.Module):
 
 
 class UMT5Model(nnx.Module):
-    """
-    Full UMT5 Encoder-Decoder model (without LM head).
-    """
+    """UMT5 encoder-decoder model (without LM head)."""
     def __init__(
         self,
         config: UMT5Config,
@@ -822,8 +765,6 @@ class UMT5Model(nnx.Module):
         )
         weight_mappings = self._create_weight_mappings()
         loader.load_weights_from_safetensors(weight_mappings)
-        
-        # No need to share relative_attention_bias - each layer loads its own weights
     
     def _create_weight_mappings(self) -> dict:
         """Create mappings from HuggingFace weight names to JAX model parameters."""
@@ -850,9 +791,9 @@ class UMT5Model(nnx.Module):
         
         for layer_idx in range(self.config.num_decoder_layers):
             mappings.update(_create_block_mapping_helper(self.config, layer_idx, is_decoder=True, prefix="decoder.block"))
-        
+
         return mappings
-    
+
     def __call__(
         self,
         input_ids: jax.Array,
@@ -890,8 +831,8 @@ class UMT5Model(nnx.Module):
 
 class UMT5ForConditionalGeneration(nnx.Module):
     """
-    UMT5 model for conditional generation with LM head.
-    Supports both testing mode (direct parameter passing) and SGLang inference mode.
+    UMT5 for conditional generation with LM head.
+    Supports testing mode (direct parameters) and SGLang inference mode.
     """
     def __init__(
         self,
@@ -942,8 +883,7 @@ class UMT5ForConditionalGeneration(nnx.Module):
         )
         weight_mappings = self._create_weight_mappings()
         loader.load_weights_from_safetensors(weight_mappings)
-        
-        # No need to share relative_attention_bias - each layer loads its own weights
+
     def _create_weight_mappings(self) -> dict:
         """Create mappings from HuggingFace weight names to JAX model parameters."""
         mappings = {
@@ -990,15 +930,15 @@ class UMT5ForConditionalGeneration(nnx.Module):
         **kwargs
     ):
         """
-        Forward pass supporting two modes:
-        1. Testing mode: Direct parameter passing (input_ids, decoder_input_ids, etc.)
-        2. SGLang mode: Using forward_batch, token_to_kv_pool, logits_metadata
+        Forward pass with two modes:
+        1. Testing: Direct parameters (input_ids, decoder_input_ids, etc.)
+        2. SGLang: forward_batch, token_to_kv_pool, logits_metadata
         """
         deterministic = kwargs.get("deterministic", False)
             
-        # Case 1: Testing mode (Direct parameters)
+        # Case 1: Testing mode
         if (input_ids is not None or encoder_outputs is not None) and decoder_input_ids is not None:
-            # Encoder pass (compute only if encoder_outputs not provided)
+            # Encoder pass (skip if encoder_outputs provided)
             encoder_hidden_states = encoder_outputs
             if encoder_hidden_states is None:
                 if input_ids is None:
@@ -1022,7 +962,7 @@ class UMT5ForConditionalGeneration(nnx.Module):
                 token_to_kv_pool=None
             )
             
-            # LM Head - compute logits using weights
+            # Compute logits
             lm_head_weights = self.lm_head.embedding[...]
             logits = jnp.matmul(decoder_hidden_states, lm_head_weights.T)
             return logits
@@ -1031,14 +971,12 @@ class UMT5ForConditionalGeneration(nnx.Module):
         elif forward_batch is not None:
             batch_input_ids = forward_batch.input_ids
             
-            # Check if encoder_hidden_states are cached in forward_batch
+            # Get cached encoder outputs if available
             encoder_hidden_states = getattr(forward_batch, "encoder_hidden_states", None)
             encoder_mask = getattr(forward_batch, "encoder_mask", None)
             
-            # Decoder embeddings
+            # Decoder forward pass
             decoder_embeds = self.shared(batch_input_ids)
-            
-            # Decoder Stack
             decoder_hidden_states = self.decoder(
                 decoder_embeds, 
                 mask=None,  # Mask handled by RadixAttention
@@ -1049,12 +987,12 @@ class UMT5ForConditionalGeneration(nnx.Module):
                 deterministic=deterministic
             )
             
-            # LM Head
+            # Compute logits
             logits = self.logits_processor(decoder_hidden_states, self.lm_head, logits_metadata)
             
-            # Return format compatible with SGLang runtime
-            layers_kv_fused = []  # Placeholder for KV cache updates
-            layers_callback_flag = []  # Placeholder for callback flags
+            # Return format for SGLang runtime
+            layers_kv_fused = []
+            layers_callback_flag = []
             return logits, layers_kv_fused, layers_callback_flag
         
         else:
@@ -1066,17 +1004,16 @@ class UMT5ForConditionalGeneration(nnx.Module):
 
 def _create_block_mapping_helper(config: UMT5Config, layer_idx: int, is_decoder: bool, prefix: str) -> dict:
     """
-    Helper function to create weight mappings for a single transformer block.
-    Reduces code duplication across different model classes.
+    Create weight mappings for a single transformer block.
     
     Args:
-        config: UMT5 configuration
-        layer_idx: Index of the layer/block
-        is_decoder: Whether this is a decoder block (vs encoder)
-        prefix: Prefix for weight keys (e.g., "encoder.block" or "decoder.block")
+        config: UMT5 config
+        layer_idx: Layer index
+        is_decoder: True for decoder blocks
+        prefix: Weight name prefix (e.g., "encoder.block")
     
     Returns:
-        Dictionary of weight mappings for this block
+        Weight mapping dict
     """
     target_prefix = prefix + f".{layer_idx}"
     source_prefix = prefix + f".{layer_idx}"
@@ -1112,8 +1049,7 @@ def _create_block_mapping_helper(config: UMT5Config, layer_idx: int, is_decoder:
         ),
     })
     
-    # Relative Attention Bias: Load for every layer
-    # In HuggingFace UMT5, every layer has its own relative_attention_bias weights
+    # Relative attention bias (loaded for all layers from HF checkpoint)
     mappings[f"{source_prefix}.layer.0.SelfAttention.relative_attention_bias.weight"] = WeightMapping(
         target_path=f"{target_prefix}.layer0_SelfAttention.relative_attention_bias.embedding",
         sharding=(None, "tensor"),
