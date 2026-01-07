@@ -388,7 +388,7 @@ def run_all(
     if tune_block_config:
         from sgl_jax.srt.utils.jax_utils import get_device_name
 
-    balanced_topk = True
+    balanced_topk = False
     print(f"Running fused_moe benchmarks with dtype={dtype}")
     print("  mode: balanced_topk=True (deterministic cyclic routing)")
     for case in cases:
