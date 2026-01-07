@@ -632,13 +632,12 @@ class FusedEPMoE(nnx.Module):
 
                 def _do_print(_):
                     jax.debug.print(
-                        "fused_ep_moe routing: layer={layer} factor={f:.4f} mean={m:.1f} max={x:.0f} active={a:.0f}",
+                        "fused_ep_moe routing: layer={layer} factor={f} mean={m} max={x} active={a}",
                         layer=self.layer_id,
                         f=factor,
                         m=mean,
                         x=max_count,
                         a=active,
-                        ordered=True,
                     )
                     return jnp.int32(0)
 

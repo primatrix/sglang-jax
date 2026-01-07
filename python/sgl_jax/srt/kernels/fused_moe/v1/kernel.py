@@ -2205,10 +2205,6 @@ def fused_ep_moe_routing_stats(
     - Global stats require a small collective (`lax.psum`) across `ep_axis_name`.
     - `local_mask=True` restricts routing to each device's local expert shard (useful for
       diagnosing compute-only/no-comm modes).
-
-    Example:
-        `factor, mean, max_count, active = fused_ep_moe_routing_stats(mesh=mesh, router_logits=logits, top_k=8)`
-        `jax.debug.print("routing: factor={f:.3f} mean={m} max={x} active={a}", f=factor, m=mean, x=max_count, a=active)`
     """
     if num_experts is None:
         num_experts = int(router_logits.shape[-1])
