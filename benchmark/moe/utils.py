@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 from typing import Dict, Iterable, Tuple
 
 import jax
@@ -128,34 +129,71 @@ def generate_fused_router_logits(
     """Router logits for fused_moe benchmarks with a single imbalance knob.
 
     `router_balance_factor` semantics:
-    - 1.0 => balanced cyclic routing (near-uniform expert counts).
-    - smaller => increasingly skewed routing toward low-index experts.
+    - Defined as `mean_count / max_count`, where counts are computed over the `num_tokens * top_k`
+      routing choices (global).
+    - 1.0 => perfectly balanced (max_count ~= mean_count, subject to integer constraints).
+    - smaller => more imbalanced (larger max_count).
     """
-    # Clamp to (0, 1] so the mapping is monotonic and avoids div-by-zero.
+    if num_experts <= 0:
+        raise ValueError(f"Expected {num_experts=} to be > 0.")
+    if top_k <= 0 or top_k > num_experts:
+        raise ValueError(f"Expected 0 < {top_k=} <= {num_experts=}.")
+    if num_tokens <= 0:
+        raise ValueError(f"Expected {num_tokens=} to be > 0.")
+
     f = float(router_balance_factor)
-    f = max(min(f, 1.0), 1e-6)
-    strength = (1.0 / f) - 1.0  # 0 at f=1, grows as f->0
+    if not np.isfinite(f) or f <= 0 or f > 1.0:
+        raise ValueError(f"Expected 0 < router_balance_factor <= 1.0, got {f}.")
 
-    # Start from a balanced top-k assignment: for each token, set its top-k experts
-    # to +1.0 and others to 0.0. This guarantees balanced routing at strength=0.
-    logits = jnp.zeros((num_tokens, num_experts), dtype=jnp.float32)
+    # Each expert can be selected at most once per token, so max_count <= num_tokens.
+    # This implies a minimum achievable mean/max ratio of (mean / num_tokens) = top_k / num_experts.
+    min_factor = float(top_k) / float(num_experts)
+    if f < min_factor:
+        raise ValueError(
+            f"router_balance_factor too small for {top_k=}, {num_experts=}: "
+            f"min feasible is {min_factor:.6f}, got {f}."
+        )
+
+    total = int(num_tokens) * int(top_k)
+    mean = float(total) / float(num_experts)
+    target_max = mean / f
+    max_count = int(round(target_max))
+    max_count = max(max_count, int(math.ceil(mean)))
+    max_count = min(max_count, int(num_tokens))
+
+    # Start from a deterministic balanced cyclic top-k assignment:
+    # topk_ids[token, k] = (token * top_k + k) % num_experts
     token_ids = jnp.arange(num_tokens, dtype=jnp.int32)[:, None]
-    cols = (token_ids * top_k + jnp.arange(top_k, dtype=jnp.int32)) % num_experts
-    logits = logits.at[jnp.arange(num_tokens)[:, None], cols].set(1.0)
+    k_ids = jnp.arange(top_k, dtype=jnp.int32)[None, :]
+    topk_ids = (token_ids * top_k + k_ids) % num_experts
 
-    # Add a global per-expert bias that favors low-index experts. As `strength`
-    # grows, this bias overwhelms the balanced pattern and concentrates load.
-    expert_rank = jnp.arange(num_experts, dtype=jnp.float32)
-    bias = -(expert_rank / jnp.float32(max(num_experts - 1, 1))) * jnp.float32(strength)
-    logits = logits + bias[None, :]
+    # Baseline count of expert 0 in the cyclic assignment.
+    base = total // num_experts
+    rem = total % num_experts
+    baseline_count0 = int(base + (1 if rem > 0 else 0))
 
-    # Add small deterministic noise to break ties, keeping generation cheap and stable.
-    token_iota = jnp.arange(num_tokens, dtype=jnp.uint32)[:, None]
-    expert_iota = jnp.arange(num_experts, dtype=jnp.uint32)[None, :]
-    base = (
-        token_iota * jnp.uint32(0xD1B54A35)
-        + expert_iota * jnp.uint32(0x94D049BB)
-        + jnp.uint32(seed)
+    # Increase expert 0 count (up to num_tokens) by rewriting slot-0 for tokens
+    # that don't already include expert 0.
+    delta = max_count - baseline_count0
+    if delta > 0:
+        has0 = jnp.any(topk_ids == 0, axis=1)
+        candidates = jnp.logical_not(has0)
+        rank = jnp.cumsum(candidates.astype(jnp.int32))
+        select = jnp.logical_and(candidates, rank <= jnp.int32(delta))
+        topk_ids = topk_ids.at[select, 0].set(jnp.int32(0))
+
+    # Materialize logits so that get_top_k picks exactly `topk_ids` in rank order.
+    # Use distinct per-k values to avoid argmax tie-break artifacts.
+    logits = jnp.zeros((num_tokens, num_experts), dtype=jnp.float32)
+    rows = jnp.arange(num_tokens, dtype=jnp.int32)[:, None]
+    vals = (top_k - jnp.arange(top_k, dtype=jnp.float32))[None, :]
+    logits = logits.at[rows, topk_ids].set(vals)
+
+    # Add tiny deterministic noise to break ties among non-topk experts, keeping generation stable.
+    token_u = token_ids.astype(jnp.uint32)
+    expert_u = jnp.arange(num_experts, dtype=jnp.uint32)[None, :]
+    noise_base = (
+        token_u * jnp.uint32(0xD1B54A35) + expert_u * jnp.uint32(0x94D049BB) + jnp.uint32(seed)
     )
 
     def _stateless_uniform01_u32(x: jax.Array) -> jax.Array:
@@ -167,7 +205,7 @@ def generate_fused_router_logits(
         x ^= x >> jnp.uint32(16)
         return x.astype(jnp.float32) * (1.0 / 2**32)
 
-    noise01 = _stateless_uniform01_u32(base)
+    noise01 = _stateless_uniform01_u32(noise_base)
     logits = logits + (noise01 * 2.0 - 1.0) * 1e-3
     return logits
 
@@ -223,12 +261,7 @@ def prepare_fused_moe_inputs(
     ep_axis_name: str = "tensor",
     include_weights: bool = True,
     router_balance_factor: float = 1.0,
-    router_imbalance_factor: float | None = None,
 ) -> Dict[str, jax.Array]:
-    # Backward-compat alias: older CLI used --router-imbalance-factor with inverse semantics.
-    if router_imbalance_factor is not None:
-        router_balance_factor = float(router_imbalance_factor)
-
     f = float(router_balance_factor)
     if not np.isfinite(f) or f <= 0:
         raise ValueError(f"Expected router_balance_factor to be finite and > 0, got {f}.")

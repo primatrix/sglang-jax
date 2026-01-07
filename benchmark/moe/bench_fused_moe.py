@@ -347,7 +347,6 @@ def run_all(
     *,
     warmup_iters: int = 1,
     tune_block_config: bool = False,
-    balanced_topk: bool = False,
     debug_routing: bool = False,
     router_balance_factor: float = 1.0,
     bt_candidates: list[int] | None = None,
@@ -393,13 +392,9 @@ def run_all(
         from sgl_jax.srt.utils.jax_utils import get_device_name
 
     print(f"Running fused_moe benchmarks with dtype={dtype}")
-    if balanced_topk:
-        print("  mode: balanced_topk=True (deterministic cyclic routing)")
-    else:
-        print("  mode: balanced_topk=False (routing from router_logits)")
     print(
         "  router_logits: generated (router_balance_factor="
-        f"{router_balance_factor}, 1.0=balanced, smaller=more_imbalanced)"
+        f"{router_balance_factor}, defined as mean_count/max_count)"
     )
     for case in cases:
         t_packing = _dtype_packing(dtype)
@@ -489,15 +484,22 @@ def run_all(
             counts = np.asarray(counts)
             counts_local = np.asarray(counts_local)
 
+            mean_count = (case.num_tokens * case.top_k) / case.num_experts
+
             def _summarize(counts: np.ndarray) -> str:
                 active = int(np.count_nonzero(counts))
                 max_e = int(np.argmax(counts)) if counts.size else -1
                 max_c = int(np.max(counts)) if counts.size else 0
+                balance = float(mean_count / max_c) if max_c > 0 else float("nan")
                 top = np.argsort(counts)[-8:][::-1]
                 top_summary = ", ".join(
                     [f"{int(i)}:{int(counts[i])}" for i in top if counts[i] > 0]
                 )
-                return f"active_experts={active}/{case.num_experts} max={max_c}@{max_e} top={top_summary or 'n/a'}"
+                return (
+                    f"active_experts={active}/{case.num_experts} "
+                    f"mean={mean_count:.3g} mean/max={balance:.3g} "
+                    f"max={max_c}@{max_e} top={top_summary or 'n/a'}"
+                )
 
             print(
                 "  routing(unbalanced): "
@@ -510,10 +512,6 @@ def run_all(
                     "  note: router_logits are constant; unbalanced top-k tie-breaks via argmax -> "
                     "routes to the first few experts (0..top_k-1), which can heavily skew load."
                 )
-            if balanced_topk:
-                expected = case.num_tokens * case.top_k / case.num_experts
-                print(f"  routing(balanced_topk): expected ~{expected:.2f} tokens/expert (global)")
-
         block_cfgs: list[FusedMoEBlockConfig | None]
         if tune_block_config:
             block_cfgs = select_block_configs(
@@ -542,7 +540,6 @@ def run_all(
                 activation=case.activation,
                 layer_id=0,
                 renormalize_topk_logits=case.renormalize_topk_logits,
-                balanced_topk=balanced_topk,
             )
 
             moe_def, moe_state = nnx.split(fused_layer)
@@ -670,11 +667,6 @@ def parse_args() -> argparse.Namespace:
         help="Benchmark multiple block_config variants and print the best tuned table entry.",
     )
     parser.add_argument(
-        "--balanced-topk",
-        action="store_true",
-        help="Enable deterministic cyclic routing inside the fused_moe kernel (ignores router_logits).",
-    )
-    parser.add_argument(
         "--debug-routing",
         action="store_true",
         help="Print routing histogram summary derived from router_logits (unbalanced path) for each case.",
@@ -684,12 +676,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Single knob controlling routing skew: 1.0=balanced, smaller=more imbalanced.",
-    )
-    parser.add_argument(
-        "--router-imbalance-factor",
-        dest="router_balance_factor",
-        type=float,
-        help="Alias for --router-balance-factor (kept for backward compatibility).",
     )
     parser.add_argument(
         "--bt-candidates",
@@ -761,7 +747,6 @@ if __name__ == "__main__":
         args.iters,
         warmup_iters=args.warmup_iters,
         tune_block_config=args.tune_block_config,
-        balanced_topk=args.balanced_topk,
         debug_routing=args.debug_routing,
         router_balance_factor=args.router_balance_factor,
         bt_candidates=args.bt_candidates,
