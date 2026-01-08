@@ -16,11 +16,15 @@ class VaeScheduler:
         server_args: MultimodalServerArgs,
         communication_backend: CommunicationBackend = None,
         mesh: jax.sharding.Mesh = None,
+        model_class=None,
         **kwargs,
     ):
         self._comm_backend = communication_backend
         self.mesh = mesh
-        self.vae_worker = VaeModelWorker(server_args, mesh=mesh)
+        self.vae_worker = VaeModelWorker(
+            model_class=model_class, mesh=mesh, server_args=server_args
+        )
+        self.server_args = server_args
 
     def event_loop_normal(self):
         while True:

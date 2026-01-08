@@ -7,6 +7,7 @@ stage_args:
      max_batch_size: 1
    scheduler: vae
    scheduler_params: {}
+   model_class: AutoencoderKLWan
      # a: b
    # args:
    #   engine_type: xxx, ar or diffusion
@@ -37,4 +38,5 @@ stage_args:
      max_batch_size: 1
    scheduler: diffusion
    scheduler_params: {}
+   model_class: WanTransformer3DModel
    final_output: true

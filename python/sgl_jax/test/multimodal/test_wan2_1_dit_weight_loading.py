@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-from sgl_jax.srt.multimodal.configs.dits.configs import WanModelConfig
+from sgl_jax.srt.multimodal.configs.dits.wan_model_config import WanModelConfig
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

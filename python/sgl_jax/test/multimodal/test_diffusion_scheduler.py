@@ -11,7 +11,7 @@ from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 
 
 # Small config for unit testing to avoid OOM
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass
 class SmallWanModelConfig:
     """Small config for unit testing."""
 

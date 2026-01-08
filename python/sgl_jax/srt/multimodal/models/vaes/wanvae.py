@@ -760,12 +760,11 @@ class AutoencoderKLWan(nnx.Module):
         self,
         config: WanVAEConfig,
         *,
-        rngs=nnx.Rngs,
-        mesh: jax.sharding.Mesh,
+        mesh: jax.sharding.Mesh = None,
         dtype: jnp.dtype = jnp.bfloat16,
     ) -> None:
-        self.mesh = mesh
-        self.dtype = dtype
+
+        rngs = nnx.Rngs(0)
         self.z_dim = config.z_dim
         self.temperal_downsample = list(config.temperal_downsample)
         self.temperal_upsample = list(config.temperal_downsample)[::-1]
@@ -779,6 +778,8 @@ class AutoencoderKLWan(nnx.Module):
         self.latents_std = list(config.latents_std)
         self.shift_factor = config.shift_factor
         self.config = config
+        self.mesh = mesh
+        self.dtype = dtype
         if config.load_encoder:
             self.encoder = Encoder3d(
                 in_channels=config.in_channels,
@@ -898,7 +899,6 @@ class AutoencoderKLWan(nnx.Module):
         return out
 
     def load_weights(self, model_config: ModelConfig):
-        model_config.model_path = model_config.model_path + "/vae"
         loader = WeightLoader(
             model=self,
             model_config=model_config,

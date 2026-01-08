@@ -14,10 +14,13 @@ class DiffusionScheduler:
         server_args: MultimodalServerArgs,
         mesh: jax.sharding.Mesh,
         communication_backend: CommunicationBackend = None,
+        model_class=None,
     ):
         self.communication_backend = communication_backend
         self.mesh = mesh
-        self.diffusion_worker = DiffusionModelWorker(server_args, mesh=mesh)
+        self.diffusion_worker = DiffusionModelWorker(
+            server_args, mesh=mesh, model_class=model_class
+        )
 
     def event_loop_normal(self):
 
