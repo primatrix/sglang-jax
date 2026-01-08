@@ -434,7 +434,7 @@ class Scheduler(
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
-                sub_dir= "tokenizer" if server_args.multimodal else "",
+                sub_dir="tokenizer" if server_args.multimodal else "",
             )
 
     def init_memory_pool_and_cache(self):
