@@ -2798,6 +2798,8 @@ def fused_ep_moe(
             P(
                 (dp_axis_name, tp_axis_name),
             ),  # gating_output_hbm
+            P(),  # a2a_s_x2_hbm
+            P(),  # a2a_s_acc_x2_hbm
             P(),  # a2a_g_hbm
             None if bias is None else P(),
             None if w1_shared is None else P(),  # w1_shared
