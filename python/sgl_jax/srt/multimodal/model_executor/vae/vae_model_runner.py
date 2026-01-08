@@ -5,7 +5,10 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
+from sgl_jax.srt.configs.load_config import LoadConfig
+from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
+from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.multimodal.configs.models.vaes.wanvae import WanVAEConfig
 from sgl_jax.srt.multimodal.models.vaes.wanvae import AutoencoderKLWan
 from sgl_jax.srt.server_args import ServerArgs
@@ -13,13 +16,16 @@ from sgl_jax.srt.server_args import ServerArgs
 
 class VaeModelRunner(BaseModelRunner):
     def __init__(self, server_args: ServerArgs = None, mesh: jax.sharding.Mesh = None):
-        # self.model_loader = get_model_loader(
-        #     load_config = LoadConfig(
-        #         load_format = server_args.load_format,
-        #         perdownload_dir = server_args.download_dir,
-        #     ),
-        #     mesh = self.mesh,
-        # )
+        self.mesh = mesh
+        self.model_loader = get_model_loader(
+            load_config=LoadConfig(
+                load_format=server_args.load_format,
+                download_dir=server_args.download_dir,
+                sub_dir="vae",
+            ),
+            mesh=self.mesh,
+        )
+        self.model_config = ModelConfig.from_server_args(server_args)
         self.initialize()
 
     def initialize(self):
@@ -30,7 +36,9 @@ class VaeModelRunner(BaseModelRunner):
         # self.model = self.model_loader.load_model(
         #     model_config = self.model_config,
         # )
-        self.model = AutoencoderKLWan(WanVAEConfig(), rngs=nnx.Rngs(0))
+        # todo
+        self.model = AutoencoderKLWan(WanVAEConfig(), rngs=nnx.Rngs(0), mesh=self.mesh)
+        self.model.load_weights(self.model_config)
 
     def initialize_jit(self):
         model_def, model_state = nnx.split(self.model)

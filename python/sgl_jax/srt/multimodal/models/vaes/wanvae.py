@@ -756,8 +756,16 @@ class AutoencoderKLWan(nnx.Module):
 
     _supports_gradient_checkpointing = False
 
-    def __init__(self, config: WanVAEConfig, *, rngs=nnx.Rngs) -> None:
-
+    def __init__(
+        self,
+        config: WanVAEConfig,
+        *,
+        rngs=nnx.Rngs,
+        mesh: jax.sharding.Mesh,
+        dtype: jnp.dtype = jnp.bfloat16,
+    ) -> None:
+        self.mesh = mesh
+        self.dtype = dtype
         self.z_dim = config.z_dim
         self.temperal_downsample = list(config.temperal_downsample)
         self.temperal_upsample = list(config.temperal_downsample)[::-1]
@@ -890,6 +898,7 @@ class AutoencoderKLWan(nnx.Module):
         return out
 
     def load_weights(self, model_config: ModelConfig):
+        model_config.model_path = model_config.model_path + "/vae"
         loader = WeightLoader(
             model=self,
             model_config=model_config,

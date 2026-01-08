@@ -5,6 +5,7 @@ import jax.sharding
 import numpy as np
 
 from sgl_jax.srt.managers.communication import CommunicationBackend
+from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.model_executor.vae.vae_model_worker import VaeModelWorker
 
@@ -12,14 +13,14 @@ from sgl_jax.srt.multimodal.model_executor.vae.vae_model_worker import VaeModelW
 class VaeScheduler:
     def __init__(
         self,
-        server_args=None,
+        server_args: MultimodalServerArgs,
         communication_backend: CommunicationBackend = None,
         mesh: jax.sharding.Mesh = None,
         **kwargs,
     ):
         self._comm_backend = communication_backend
         self.mesh = mesh
-        self.vae_worker = VaeModelWorker(None, mesh=mesh)
+        self.vae_worker = VaeModelWorker(server_args, mesh=mesh)
 
     def event_loop_normal(self):
         while True:

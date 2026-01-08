@@ -29,6 +29,7 @@ class DiffusionModelRunner(BaseModelRunner):
         load_config = LoadConfig(
             load_format=server_args.load_format,
             download_dir=server_args.download_dir,
+            sub_dir="transformer",
         )
         self.model_loader = JAXModelLoader(load_config, mesh)
 
