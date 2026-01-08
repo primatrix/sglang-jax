@@ -1,9 +1,9 @@
+import copy
 import glob
 import logging
 import os
 import pickle
 import re
-import copy
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -28,6 +28,9 @@ class WeightMapping:
     target_path: str | list[str]
     sharding: tuple | None = None
     transpose: bool = False
+    transpose_axes: tuple[int, ...] | None = (
+        None  # For multi-dimensional transpose (e.g., conv weights)
+    )
     reshape: tuple | None = None
     head_dim_padding: bool = False
     kv_head_padding: bool = False
@@ -498,31 +501,28 @@ class WeightLoader:
                         matched_parts = match.groups()
 
                         if isinstance(mapping, str):
-                            format_template = mapping.replace('*', '{}')
+                            format_template = mapping.replace("*", "{}")
                             replaced_mapping = format_template.format(*matched_parts)
                         elif isinstance(mapping, list):
-                            format_template = mapping[0].replace('*', '{}')
+                            format_template = mapping[0].replace("*", "{}")
                             replaced_str = format_template.format(*matched_parts)
                             replaced_mapping = [replaced_str, *mapping[1:]]
                         elif isinstance(mapping, tuple):
-                            format_template = mapping[0].replace('*', '{}')
+                            format_template = mapping[0].replace("*", "{}")
                             replaced_str = format_template.format(*matched_parts)
                             replaced_mapping = (replaced_str, *mapping[1:])
                         elif isinstance(mapping, WeightMapping):
-                            format_template = mapping.target_path.replace('*', '{}')
+                            format_template = mapping.target_path.replace("*", "{}")
                             replaced_path = format_template.format(*matched_parts)
                             replaced_mapping = copy.copy(mapping)
                             replaced_mapping.target_path = replaced_path
                         else:
                             replaced_mapping = mapping
 
-
                         if key.startswith("__MOE_EXPERTS__"):
                             moe_mappings[weight_info_key] = replaced_mapping
                         else:
                             regular_mappings[weight_info_key] = replaced_mapping
-
-
 
         logger.info("Starting parallel weight loading via JAX Lazy Loader...")
 
@@ -585,7 +585,10 @@ class WeightLoader:
                             )
                             lazy_weight = lazy_arrays[0]
 
-                        if mapping.transpose:
+                        # Handle multi-dimensional transpose (transpose_axes) or 2D transpose
+                        if mapping.transpose_axes is not None:
+                            lazy_weight = jnp.transpose(lazy_weight, mapping.transpose_axes)
+                        elif mapping.transpose:
                             lazy_weight = jnp.transpose(lazy_weight, (1, 0))
 
                         if "lm_head" in hf_key and hasattr(
@@ -931,7 +934,10 @@ class WeightLoader:
     ):
         processed_weight = hf_weight
 
-        if mapping.transpose and not hf_key.endswith(".bias"):
+        # Handle multi-dimensional transpose (transpose_axes) or 2D transpose
+        if mapping.transpose_axes is not None and not hf_key.endswith(".bias"):
+            processed_weight = jnp.transpose(processed_weight, mapping.transpose_axes)
+        elif mapping.transpose and not hf_key.endswith(".bias"):
             processed_weight = jnp.transpose(processed_weight, (1, 0))
 
         if isinstance(mapping.target_path, list):

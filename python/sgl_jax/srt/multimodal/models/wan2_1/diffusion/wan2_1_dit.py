@@ -641,5 +641,66 @@ class WanTransformer3DModel(nnx.Module):
         print("[9] done, output:", output.shape)
         return output
 
+    def load_weights(self, model_path: str) -> None:
+        """
+        Load weights from HuggingFace safetensors files.
+
+        Args:
+            model_path: Path to the transformer directory containing safetensors files
+        """
+        import logging
+
+        from sgl_jax.srt.multimodal.models.wan2_1.diffusion.wan2_1_dit_weights_mapping import (
+            to_i2v_mappings,
+            to_mappings,
+        )
+        from sgl_jax.srt.utils.weight_utils import WeightLoader
+
+        logger = logging.getLogger(__name__)
+
+        # Determine if this is I2V model based on image_embedder
+        is_i2v = hasattr(self.condition_embedder, "image_embedder") and (
+            self.condition_embedder.image_embedder is not None
+        )
+
+        # Get weight mappings
+        if is_i2v:
+            weight_mappings = to_i2v_mappings()
+            logger.info("Using I2V weight mappings")
+        else:
+            weight_mappings = to_mappings()
+            logger.info("Using T2V weight mappings")
+
+        # Create a minimal config object for WeightLoader
+        class MinimalConfig:
+            def __init__(self, path, hidden_size, num_heads, num_kv_heads):
+                self.model_path = path
+                self.hidden_size = hidden_size
+                self.num_attention_heads = num_heads
+                self.num_key_value_heads = num_kv_heads
+                self.hf_config = type("HFConfig", (), {})()
+
+            def get_total_num_kv_heads(self):
+                return self.num_key_value_heads
+
+            def needs_kv_head_replication(self, tp_size):
+                return False
+
+        model_config = MinimalConfig(
+            path=model_path,
+            hidden_size=self.hidden_size,
+            num_heads=self.num_attention_heads,
+            num_kv_heads=self.num_attention_heads,
+        )
+
+        # Create weight loader and load weights
+        loader = WeightLoader(
+            model=self,
+            model_config=model_config,
+            mesh=self.mesh,
+        )
+        loader.load_weights_from_safetensors(weight_mappings)
+        logger.info("Weights loaded successfully for WanTransformer3DModel")
+
 
 EntryClass = WanTransformer3DModel

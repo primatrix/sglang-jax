@@ -13,8 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
 import logging
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -24,7 +25,7 @@ from jax.lax import Precision
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.multimodal.configs.models.vaes.wanvae import WanVAEConfig
 from sgl_jax.srt.multimodal.models.vaes.commons import DiagonalGaussianDistribution
-from sgl_jax.srt.multimodal.models.vaes.weight_mapping import to_mappings
+from sgl_jax.srt.multimodal.models.vaes.vae_weights_mappings import to_mappings
 from sgl_jax.srt.utils.weight_utils import WeightLoader
 
 CACHE_T = 2
@@ -887,7 +888,7 @@ class AutoencoderKLWan(nnx.Module):
             raise NotImplementedError
 
         return out
-    
+
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
             model=self,
