@@ -353,6 +353,7 @@ def run_all(
     num_tokens: list[int] | None = None,
     tpu_vmem_budget_bytes: int = DEFAULT_TPU_VMEM_BUDGET_BYTES,
     max_configs: int = 9,
+    balanced_routing: bool = False,
 ) -> None:
     raw_cases: list[MoEBenchmarkCase] | None = None
     if num_tokens is not None:
@@ -388,7 +389,7 @@ def run_all(
     if tune_block_config:
         from sgl_jax.srt.utils.jax_utils import get_device_name
 
-    balanced_topk = True
+    balanced_topk = balanced_routing
     print(f"Running fused_moe benchmarks with dtype={dtype}")
     print("  mode: balanced_topk=True (deterministic cyclic routing)")
     for case in cases:
@@ -425,6 +426,7 @@ def run_all(
                 tpu_vmem_budget_bytes=tpu_vmem_budget_bytes,
                 max_configs=max_configs,
             )
+            print(f"{block_cfgs=}")
         else:
             block_cfgs = [None]
 
@@ -569,6 +571,11 @@ def parse_args() -> argparse.Namespace:
         help="Benchmark multiple block_config variants and print the best tuned table entry.",
     )
     parser.add_argument(
+        "--balanced-routing",
+        action="store_true",
+        help="Benchmark multiple block_config variants and print the best tuned table entry.",
+    )
+    parser.add_argument(
         "--bt-candidates",
         type=int,
         nargs="+",
@@ -645,4 +652,5 @@ if __name__ == "__main__":
         num_tokens=args.num_tokens,
         tpu_vmem_budget_bytes=tpu_vmem_budget_bytes,
         max_configs=args.max_configs,
+        balanced_routing=args.balanced_routing,
     )

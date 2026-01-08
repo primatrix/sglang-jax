@@ -1621,7 +1621,7 @@ def _fused_ep_moe_kernel(
 
     def wait_copy_expert_size():
         pltpu.make_async_copy(
-            src_ref=expert_counts_hbm.at[0, pl.ds(0, 1)],
+            src_ref=expert_counts_hbm.at[pl.ds(0, 1)],
             dst_ref=expert_counts_hbm.at[pl.ds(0, 1)],
             sem=expert_size_sem,
         ).wait()
@@ -2122,7 +2122,7 @@ def fused_ep_moe(
             P(),  # a2a_s_acc_x2_hbm
             P(),  # a2a_g_hbm
         ),
-        out_specs=(P(ep_axis_name), P(ep_axis_name)),
+        out_specs=(P(ep_axis_name), P(None)),
         check_vma=False,
     )
     def kernel(

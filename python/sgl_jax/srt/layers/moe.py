@@ -640,10 +640,9 @@ class FusedEPMoE(nnx.Module):
         total_expert_counts = total_expert_counts[: self.num_experts]
 
         # 将 count 也 reshard 到一个确定的 sharding 上（通常是全复制 P() 方便后续分析）
-        total_expert_counts = jax.sharding.reshard(
-            total_expert_counts, NamedSharding(self.mesh, P())
-        )
         jax.debug.print(
-            "total_expert_counts: {total_expert_counts}", total_expert_counts=total_expert_counts
+            "total_expert_counts: {total_expert_counts}, hidden_states.shape: {shape}",
+            total_expert_counts=total_expert_counts,
+            shape=hidden_states.shape,
         )
         return output, total_expert_counts
