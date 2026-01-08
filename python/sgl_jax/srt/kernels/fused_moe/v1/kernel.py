@@ -350,6 +350,13 @@ def ref_moe(
     return jnp.concatenate(t_outputs, axis=0)  # [actual_num_tokens, hidden_size]
 
 
+def get_ep_size(mesh: jax.sharding.Mesh, dp_axis_name, tp_axis_name):
+    assert len(mesh.shape) == 2, "Only 2D mesh supported: ('data', 'tensor')."
+    dp_size = mesh.shape[dp_axis_name]
+    tp_size = mesh.shape[tp_axis_name]
+    return dp_size * tp_size
+
+
 def _fused_ep_moe_kernel(
     # Input
     tokens_hbm,  # (local_num_tokens, t_packing, hidden_size // t_packing)
@@ -409,7 +416,8 @@ def _fused_ep_moe_kernel(
     top_k: int,
     renormalize_topk_logits: bool,
     balanced_topk: bool,
-    ep_axis_name: str,
+    dp_axis_name: str,
+    tp_axis_name: str,
     act_fn: str,
     subc_quant_wsz: int | None = None,
     # Kernel tuning params.
@@ -423,8 +431,12 @@ def _fused_ep_moe_kernel(
     bd1c: int,  # Compute size of block hidden_size.
     bd2c: int,  # Compute size of block hidden_size.
 ):
-    my_id = lax.axis_index(ep_axis_name)
-    num_devices = lax.axis_size(ep_axis_name)
+    dp_rank = lax.axis_index(dp_axis_name)
+    tp_rank = lax.axis_index(tp_axis_name)
+    tp_size = lax.axis_size(tp_axis_name)
+    dp_size = lax.axis_size(dp_axis_name)
+    my_id = dp_rank * tp_size + tp_rank
+    num_devices = tp_size * dp_size
     local_num_tokens = tokens_hbm.shape[0]
     local_num_experts, intermediate_size, hidden_size = w2_hbm.shape
     assert b_output_x2_vmem.shape[1] == bt, (b_output_x2_vmem.shape[1], bt)
@@ -478,8 +490,9 @@ def _fused_ep_moe_kernel(
     num_bd2 = cdiv(hidden_size, bd2)
 
     def get_mesh_device_id(ep_rank):
-        dp_rank = jax.lax.axis_index("data")
-        return (dp_rank, ep_rank)
+        dp_rank = ep_rank // tp_size
+        tp_rank = ep_rank % tp_size
+        return (dp_rank, tp_rank)
 
     def sync_barrier():
         # Full mesh barrier (matches epic/integrate-fused-moe). The previous
@@ -1706,18 +1719,13 @@ def _validate_fused_ep_moe_args(
     b2: jax.Array | None,
     b3: jax.Array | None,
     block_config: FusedMoEBlockConfig,
-    ep_axis_name: str,
+    dp_axis_name: str,
+    tp_axis_name: str,
 ) -> None:
     if len(mesh.shape) != 2:
         raise NotImplementedError("Only 2D mesh is supported.")
 
-    for axis_name in mesh.axis_names:
-        if axis_name == ep_axis_name:
-            continue
-        if mesh.shape[axis_name] != 1:
-            raise NotImplementedError(f"Expected all non-ep axis to have size 1 in {mesh.shape=}")
-
-    ep_size = mesh.shape[ep_axis_name]
+    ep_size = get_ep_size(mesh, dp_axis_name, tp_axis_name)
     num_tokens, hidden_size = tokens.shape
     num_experts, intermediate_size, _ = w2.shape
 
@@ -1827,7 +1835,8 @@ def _validate_fused_ep_moe_args(
         "act_fn",
         "subc_quant_wsz",
         "block_config",
-        "ep_axis_name",
+        "dp_axis_name",
+        "tp_axis_name",
         "balanced_topk",
     ],
 )
@@ -1857,9 +1866,11 @@ def fused_ep_moe(
     b2: jax.Array | None = None,  # F32(num_experts, 1, hidden_size)
     b3: jax.Array | None = None,  # F32(num_experts, 1, intermediate_size)
     block_config: FusedMoEBlockConfig | None = None,
-    ep_axis_name: str = "tensor",
+    dp_axis_name: str = "data",
+    tp_axis_name: str = "tensor",
 ):
-    ep_size = mesh.shape[ep_axis_name]
+
+    ep_size = get_ep_size(mesh, dp_axis_name, tp_axis_name)
     if block_config is None:
         from .tuned_block_configs import get_tuned_fused_moe_block_config
 
@@ -1896,7 +1907,8 @@ def fused_ep_moe(
         b2=b2,
         b3=b3,
         block_config=block_config,
-        ep_axis_name=ep_axis_name,
+        dp_axis_name=dp_axis_name,
+        tp_axis_name=tp_axis_name,
     )
 
     num_devices = ep_size
@@ -2026,7 +2038,8 @@ def fused_ep_moe(
                 top_k=top_k,
                 renormalize_topk_logits=renormalize_topk_logits,
                 balanced_topk=balanced_topk,
-                ep_axis_name=ep_axis_name,
+                dp_axis_name=dp_axis_name,
+                tp_axis_name=tp_axis_name,
                 act_fn=act_fn,
                 subc_quant_wsz=subc_quant_wsz,
                 bt=bt,
@@ -2075,22 +2088,70 @@ def fused_ep_moe(
     @jax.shard_map(
         mesh=mesh,
         in_specs=(
-            P(ep_axis_name),  # tokens_hbm
-            P(ep_axis_name),  # w1_hbm
-            P(ep_axis_name),  # w2_hbm
-            P(ep_axis_name),  # w3_hbm
-            None if w1_scale is None else P(ep_axis_name),  # w1_scale_hbm
-            None if w2_scale is None else P(ep_axis_name),  # w2_scale_hbm
-            None if w3_scale is None else P(ep_axis_name),  # w3_scale_hbm
-            None if b1 is None else P(ep_axis_name),  # b1_hbm
-            None if b2 is None else P(ep_axis_name),  # b2_hbm
-            None if b3 is None else P(ep_axis_name),  # b3_hbm
-            P(ep_axis_name),  # gating_output_hbm
+            P(
+                (dp_axis_name, tp_axis_name),
+            ),  # tokens_hbm
+            P(
+                (dp_axis_name, tp_axis_name),
+            ),  # w1_hbm
+            P(
+                (dp_axis_name, tp_axis_name),
+            ),  # w2_hbm
+            P(
+                (dp_axis_name, tp_axis_name),
+            ),  # w3_hbm
+            (
+                None
+                if w1_scale is None
+                else P(
+                    (dp_axis_name, tp_axis_name),
+                )
+            ),  # w1_scale_hbm
+            (
+                None
+                if w2_scale is None
+                else P(
+                    (dp_axis_name, tp_axis_name),
+                )
+            ),  # w2_scale_hbm
+            (
+                None
+                if w3_scale is None
+                else P(
+                    (dp_axis_name, tp_axis_name),
+                )
+            ),  # w3_scale_hbm
+            (
+                None
+                if b1 is None
+                else P(
+                    (dp_axis_name, tp_axis_name),
+                )
+            ),  # b1_hbm
+            (
+                None
+                if b2 is None
+                else P(
+                    (dp_axis_name, tp_axis_name),
+                )
+            ),  # b2_hbm
+            (
+                None
+                if b3 is None
+                else P(
+                    (dp_axis_name, tp_axis_name),
+                )
+            ),  # b3_hbm
+            P(
+                (dp_axis_name, tp_axis_name),
+            ),  # gating_output_hbm
             P(),  # a2a_s_x2_hbm
             P(),  # a2a_s_acc_x2_hbm
             P(),  # a2a_g_hbm
         ),
-        out_specs=P(ep_axis_name),
+        out_specs=P(
+            (dp_axis_name, tp_axis_name),
+        ),
         check_vma=False,
     )
     def kernel(
