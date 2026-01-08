@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 
-from python.sgl_jax.srt.multimodal.configs.vaes.vae_base_config import VAEConfig
+from sgl_jax.srt.multimodal.configs.vaes.vae_base_config import VAEConfig
 
 
 @dataclass

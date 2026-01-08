@@ -680,5 +680,9 @@ class WanTransformer3DModel(nnx.Module):
         loader.load_weights_from_safetensors(weight_mappings)
         logger.info("Weights loaded successfully for WanTransformer3DModel")
 
+    @staticmethod
+    def get_config_class() -> WanModelConfig:
+        return WanModelConfig
+
 
 EntryClass = WanTransformer3DModel
