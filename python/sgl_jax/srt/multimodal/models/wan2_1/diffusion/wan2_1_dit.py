@@ -1,11 +1,15 @@
+import math
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
 
-# from sgl_jax.srt.multimodal.configs.dits.wan2_1 import WanVideoArchConfig, WanVideoConfig
 from sgl_jax.srt.layers.embeddings import apply_rotary_emb
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
+
+# from sgl_jax.srt.multimodal.configs.dits.wan2_1 import WanVideoArchConfig, WanVideoConfig
+from sgl_jax.srt.multimodal.configs.dits.configs import WanModelConfig
 from sgl_jax.srt.multimodal.layers.attention.layer import USPAttention
 from sgl_jax.srt.multimodal.layers.layernorm import (
     FP32LayerNorm,
@@ -429,7 +433,14 @@ class WanTimeTextImageEmbedding(nnx.Module):
 
 
 class WanTransformer3DModel(nnx.Module):
-    def __init__(self, config, *, rngs: nnx.Rngs = None, mesh: jax.sharding.Mesh | None = None):
+    def __init__(
+        self,
+        config: WanModelConfig,
+        *,
+        rngs: nnx.Rngs = None,
+        dtype=jnp.bfloat16,
+        mesh: jax.sharding.Mesh | None = None,
+    ):
         self.patch_size = config.patch_size
         self.hidden_size = config.hidden_dim
         self.num_attention_heads = config.num_heads
@@ -494,7 +505,7 @@ class WanTransformer3DModel(nnx.Module):
         out_channels = getattr(config, "out_channels", config.in_channels)
         self.proj_out = nnx.Linear(
             in_features=inner_dim,
-            out_features=out_channels * int(jnp.prod(jnp.array(config.patch_size))),
+            out_features=out_channels * math.prod(config.patch_size),
             use_bias=True,
             rngs=rngs,
         )

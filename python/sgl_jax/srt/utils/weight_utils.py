@@ -494,7 +494,7 @@ class WeightLoader:
                 else:
                     regular_mappings[key] = mapping
             else:
-                key_as_regex = key.replace("*", "(*)")
+                key_as_regex = re.escape(key).replace(r"\*", r"(.*?)")
                 for weight_info_key, _ in weight_info.items():
                     match = re.search(key_as_regex, weight_info_key)
                     if match:
