@@ -894,10 +894,7 @@ def _fused_ep_moe_kernel(
         ).wait()
 
     def wait_a2a_gather_recv_all(*, bt_size):
-        # Align to f5b4: wait using a flat slice into `a2a_g_hbm` sized to the
-        # total gathered token vectors for this bt tile (`top_k * bt_size`).
-        sz = jnp.int32(bt_size * top_k)
-        ref = a2a_g_hbm.at[0, pl.ds(0, sz)]
+        ref = a2a_g_hbm.at[0, pl.ds(0, bt_size)]
         pltpu.make_async_copy(
             src_ref=ref,
             dst_ref=ref,
@@ -2035,7 +2032,7 @@ def fused_ep_moe(
     t_packing = get_dtype_packing(t_dtype)
     hidden_per_pack = hidden_size // t_packing
     # With run_bt tiling in the pallas kernel, a2a scratch only needs to cover one bt tile.
-    a2a_max_tokens = align_to(bt * num_devices * top_k, block_config.bts)
+    a2a_max_tokens = align_to(bt * num_devices, block_config.bts)
     bd1_per_pack = block_config.bd1 // t_packing
     bd2_per_pack = block_config.bd2 // t_packing
 
