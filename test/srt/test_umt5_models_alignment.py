@@ -452,9 +452,10 @@ def test_encoder_alignment(model_name, mesh, tokenizer, precision="float32"):
             # Pass forward_batch instead of input_ids
             # UMT5EncoderModel is a wrapper, so we pass forward_batch directly
             # It will extract input_ids internally
-            jax_encoder_output = jax_encoder(
+            jax_encoder_output_obj, _, _ = jax_encoder(
                 forward_batch=forward_batch,
             )
+            jax_encoder_output = jax_encoder_output_obj.hidden_states
 
     # Compare
     mae, max_diff, rel_err = compare_outputs(

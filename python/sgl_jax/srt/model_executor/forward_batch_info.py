@@ -23,6 +23,7 @@ from functools import total_ordering
 from typing import TYPE_CHECKING
 
 import jax
+import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec
 from jax.tree_util import register_pytree_node_class
 
@@ -166,6 +167,10 @@ class ForwardBatch:
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
 
+    # Encoder-Decoder specific fields
+    attention_mask: jax.Array | None = None
+    deterministic: bool = True
+
     def tree_flatten(self):
         children = (
             self.input_ids,
@@ -179,6 +184,7 @@ class ForwardBatch:
             self.extend_prefix_lens,
             self.extend_seq_lens,
             self.spec_info,
+            self.attention_mask,
         )
 
         aux_data = {
@@ -186,6 +192,7 @@ class ForwardBatch:
             "batch_size": self.batch_size,
             "spec_algorithm": self.spec_algorithm,
             "capture_hidden_mode": self.capture_hidden_mode,
+            "deterministic": self.deterministic,
         }
         return (children, aux_data)
 
@@ -197,6 +204,7 @@ class ForwardBatch:
         obj.batch_size = aux_data["batch_size"]
         obj.spec_algorithm = aux_data["spec_algorithm"]
         obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
+        obj.deterministic = aux_data.get("deterministic", True)
         obj.trace_request_ids = None
         obj.trace_request_objects = None
 
@@ -211,6 +219,13 @@ class ForwardBatch:
         obj.extend_prefix_lens = children[8]
         obj.extend_seq_lens = children[9]
         obj.spec_info = children[10]
+
+        # Handle optional children for backward compatibility
+        if len(children) > 11:
+            obj.attention_mask = children[11]
+        else:
+            obj.attention_mask = None
+
         return obj
 
     def __repr__(self) -> str:
@@ -287,5 +302,16 @@ class ForwardBatch:
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=batch.capture_hidden_mode,
         )
+
+        # Auto-generate attention mask for Encoder models (e.g. UMT5)
+        # Assumes padded input batch for encoder models
+        if getattr(model_runner.model_config, "is_embedding", False):
+            hf_config = model_runner.model_config.hf_config
+            pad_token_id = getattr(hf_config, "pad_token_id", 0)
+            if pad_token_id is None:
+                pad_token_id = 0
+            
+            # Generate mask: 1 for valid tokens, 0 for padding
+            obj.attention_mask = (obj.input_ids != pad_token_id).astype(jnp.int32)
 
         return obj

@@ -27,7 +27,7 @@ from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.layernorm import RMSNorm
-from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor, LogitsProcessorOutput
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -620,6 +620,7 @@ class UMT5EncoderModel(nnx.Module):
         self,
         forward_batch: ForwardBatch,
         token_to_kv_pool: Any | None = None,
+        logits_metadata: LogitsMetadata | None = None,
     ):
         x = forward_batch.input_ids
         mask = getattr(forward_batch, "attention_mask", None)
@@ -633,7 +634,13 @@ class UMT5EncoderModel(nnx.Module):
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool
         )
-        return hidden_states
+        
+        # Return standard ModelRunner interface format
+        # Encoder models don't produce logits, so we return dummy logits
+        return LogitsProcessorOutput(
+            next_token_logits=jnp.empty((0, 0), dtype=self.dtype),
+            hidden_states=hidden_states,
+        ), [], []
 
 
 class UMT5DecoderModel(nnx.Module):
