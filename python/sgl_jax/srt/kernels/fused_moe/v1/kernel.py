@@ -132,6 +132,93 @@ def get_dtype_packing(dtype):
     return 32 // bits
 
 
+def estimate_fused_moe_vmem_bytes(
+    *,
+    num_tokens: int,
+    ep_size: int,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    block_config: FusedMoEBlockConfig,
+    t_dtype: jnp.dtype,
+    gating_dtype: jnp.dtype,
+    w_dtype: jnp.dtype,
+) -> int:
+    """Conservative estimate for Pallas VMEM scratch usage in bytes.
+
+    Intended for offline tuning/selection: estimates explicit VMEM scratch
+    buffers. Kernel temporaries (softmax/top-k work buffers, compiler-introduced
+    padding, etc.) are hard to model accurately; prefer leaving headroom via a
+    single budget knob (e.g. `DEFAULT_TPU_VMEM_BUDGET_MB`).
+    """
+    if ep_size <= 0:
+        raise ValueError(f"Expected {ep_size=} to be > 0.")
+    if num_tokens % ep_size != 0:
+        raise ValueError(f"Expected {num_tokens=} to be aligned to {ep_size=}.")
+
+    t_packing = get_dtype_packing(t_dtype)
+    local_num_tokens = num_tokens // ep_size
+
+    bt = int(block_config.bt)
+    bts = bt if block_config.bts is None else int(block_config.bts)
+    bf = int(block_config.bf)
+    bd1 = int(block_config.bd1)
+    bd2 = int(block_config.bd2)
+
+    if t_packing <= 0:
+        raise ValueError(f"Expected computed {t_packing=} to be > 0.")
+    if hidden_size % t_packing != 0:
+        raise ValueError(f"Expected {hidden_size=} to be divisible by {t_packing=}.")
+    if bd1 % t_packing != 0 or bd2 % t_packing != 0:
+        raise ValueError(f"Expected {bd1=} and {bd2=} to be divisible by {t_packing=}.")
+    if bts <= 0:
+        raise ValueError(f"Expected {bts=} to be > 0.")
+
+    padded_num_experts = align_to(num_experts, 128)
+    bd1_per_pack = bd1 // t_packing
+    bd2_per_pack = bd2 // t_packing
+    hidden_per_pack = hidden_size // t_packing
+    output_bt = math.gcd(bt, local_num_tokens)
+    a2a_max_tokens = align_to(output_bt * ep_size, bts)
+
+    t_bytes = int(jnp.dtype(t_dtype).itemsize)
+    gating_bytes = int(jnp.dtype(gating_dtype).itemsize)
+    w_bytes = int(jnp.dtype(w_dtype).itemsize)
+
+    vmem_bytes = 0
+    # a2a_g_acc_vmem: (1, top_k, gcd(bt, 16), t_packing, hidden_per_pack)
+    vmem_bytes += (
+        1
+        * int(top_k)
+        * int(math.gcd(output_bt, 16))
+        * int(t_packing)
+        * int(hidden_per_pack)
+        * t_bytes
+    )
+    # top_k_logits_vmem: (bt, top_k) f32
+    vmem_bytes += int(output_bt) * int(top_k) * 4
+    # b_gating_x2_vmem: (2, bt, padded_num_experts)
+    vmem_bytes += 2 * int(output_bt) * int(padded_num_experts) * gating_bytes
+    # b_output_x2_vmem: (2, bt, hidden_size)
+    vmem_bytes += 2 * int(output_bt) * int(hidden_size) * t_bytes
+    # Weight staging:
+    # b_w1_x2_vmem: (2, t_packing, bd1_per_pack, bf)
+    vmem_bytes += 2 * int(t_packing) * int(bd1_per_pack) * int(bf) * w_bytes
+    # b_w3_x2_vmem: (2, t_packing, bd1_per_pack, bf)
+    vmem_bytes += 2 * int(t_packing) * int(bd1_per_pack) * int(bf) * w_bytes
+    # b_w2_x2_vmem: (2, t_packing, bf, bd2_per_pack)
+    vmem_bytes += 2 * int(t_packing) * int(bf) * int(bd2_per_pack) * w_bytes
+    # b_acc_vmem: (2, a2a_max_tokens, 1, bf) f32
+    vmem_bytes += 2 * int(a2a_max_tokens) * int(bf) * 4
+    # t_stage_x2_vmem: (2, bts, t_packing, bd1_per_pack)
+    vmem_bytes += 2 * int(bts) * int(t_packing) * int(bd1_per_pack) * t_bytes
+    # a2a_s_acc_stage_x3_vmem: (3, bts, t_packing, bd2_per_pack)
+    vmem_bytes += 3 * int(bts) * int(t_packing) * int(bd2_per_pack) * t_bytes
+
+    _ = local_num_tokens
+    return int(vmem_bytes)
+
+
 def broadcast_minor(src, shape):
     if src.shape == shape:
         return src
@@ -1912,6 +1999,7 @@ def fused_ep_moe(
         dtype=tokens.dtype,
         subc_quant_wsz=subc_quant_wsz,
     )
+
     _validate_fused_ep_moe_args(
         mesh=mesh,
         tokens=tokens,

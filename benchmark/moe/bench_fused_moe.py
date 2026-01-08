@@ -8,7 +8,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import math
 
 import jax
 import jax.numpy as jnp
@@ -27,117 +26,15 @@ from benchmark.moe.utils import (
 from benchmark.utils import multiple_iteration_timeit_from_trace
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
     FusedMoEBlockConfig,
+    estimate_fused_moe_vmem_bytes,
+    get_dtype_packing,
     validate_fused_moe_block_config,
 )
 from sgl_jax.srt.layers.moe import FusedEPMoE
 
-# Leave headroom for compiler padding/alignment and any unmodeled VMEM usage.
+# Leave headroom for kernel temporaries and compiler padding/alignment.
 DEFAULT_TPU_VMEM_BUDGET_MB = 60
 DEFAULT_TPU_VMEM_BUDGET_BYTES = DEFAULT_TPU_VMEM_BUDGET_MB * 1024 * 1024
-
-
-def _dtype_packing(dtype: jnp.dtype) -> int:
-    """Match get_dtype_packing() in fused_moe kernel (32-bit repack width)."""
-    bits = jnp.dtype(dtype).itemsize * 8
-    if 32 % bits != 0:
-        raise ValueError(f"Unsupported dtype packing for {dtype=} ({bits=} bits).")
-    return 32 // bits
-
-
-def _estimate_vmem_bytes(case: MoEBenchmarkCase, dtype: jnp.dtype, cfg: FusedMoEBlockConfig) -> int:
-    """Rough VMEM estimate to avoid compile-time OOM (TPU VMEM is 64MB/core).
-
-    Note: this intentionally overestimates a bit because the fused_moe kernel
-    materializes several routing/top-k temporaries (see `get_top_k` in the
-    pallas kernel body), which are not part of the explicit scratch buffers.
-    """
-    bt = cfg.bt
-    bts = bt if cfg.bts is None else int(cfg.bts)
-    bf = cfg.bf
-    bd1 = cfg.bd1
-    bd2 = cfg.bd2
-    top_k = case.top_k
-    num_devices = case.ep_size
-    hidden = case.hidden_size
-
-    token_bytes = jnp.dtype(dtype).itemsize
-    weight_bytes = token_bytes
-
-    t_packing = _dtype_packing(dtype)
-    local_num_tokens = case.num_tokens // case.ep_size
-    padded_num_experts = ((case.num_experts + 127) // 128) * 128
-    padded_top_k = ((case.top_k + 127) // 128) * 128
-    output_bt = math.gcd(bt, local_num_tokens)
-    # With run_bt tiling, the a2a scratch only needs to cover one `output_bt` tile
-    # (across all EP devices), padded up to a multiple of `bts` for safe token staging.
-    a2a_max_tokens = ((output_bt * num_devices + bts - 1) // bts) * bts
-
-    # Output-side staging (no overlap):
-    # - a2a_g_acc_vmem: (1, top_k, acc_bt, hidden_size)
-    # - b_output: (1, output_bt, hidden_size)
-    acc_bt = math.gcd(output_bt, 8)  # Must match fused_moe kernel scratch shape.
-    a2a_g_acc = 1 * top_k * acc_bt * hidden * token_bytes
-    # b_output_x2_vmem is double-buffered to overlap store(output_hbm) with next bt's compute.
-    b_output = 2 * output_bt * hidden * token_bytes
-    # b_gating_vmem is double-buffered for run_bt overlap.
-    b_gating = 2 * output_bt * padded_num_experts * token_bytes
-    # t2e_routing_smem scratch is placed in SMEM (not VMEM).
-    t2e_routing = 0
-    # top_k_logits_vmem scratch: (output_bt, top_k) float32
-    top_k_logits = output_bt * top_k * 4
-
-    # See kernel scratch shapes: b_w1_x2_vmem/b_w3_x2_vmem/b_w2_x2_vmem.
-    w1 = 2 * bd1 * bf * weight_bytes
-    w3 = 2 * bd1 * bf * weight_bytes
-    w2 = 2 * bf * bd2 * weight_bytes
-
-    # b_acc_vmem is F32(2, a2a_max_tokens, 1, bf)
-    b_acc = 2 * a2a_max_tokens * bf * 4
-    # U32 token staging for FFN1: (2, bts, bd1 // t_packing)
-    t_stage_b32 = 2 * bts * (bd1 // t_packing) * 4
-    # Kernel uses triple-buffering for a2a_s_acc staging: (3, bts, bd2 // t_packing)
-    a2a_s_acc_stage_b32 = 3 * bts * (bd2 // t_packing) * 4
-
-    # Routing / top-k temporaries in kernel (best-effort conservative estimate):
-    # - softmax + get_top_k use float32 work buffers and broadcasted iotas
-    # - top_k logits are materialized as `top_k` arrays of shape (output_bt, padded_top_k)
-    # This is separate from `t2e_routing_smem` above.
-    routing_work_f32 = output_bt * padded_num_experts * 4  # softmax result (approx)
-    get_top_k_input_f32 = output_bt * padded_num_experts * 4
-    get_top_k_t2e = output_bt * padded_num_experts * 4
-    get_top_k_iota = output_bt * padded_num_experts * 4
-    get_top_k_mask = output_bt * padded_num_experts * 4
-    get_top_k_padded_iota = output_bt * padded_top_k * 4
-    get_top_k_t2e_routing = output_bt * padded_top_k * 4
-    get_top_k_logits_sum = output_bt * padded_top_k * 4
-    get_top_k_logits_lst = top_k * output_bt * padded_top_k * 4
-    routing_temporaries = (
-        routing_work_f32
-        + get_top_k_input_f32
-        + get_top_k_t2e
-        + get_top_k_iota
-        + get_top_k_mask
-        + get_top_k_padded_iota
-        + get_top_k_t2e_routing
-        + get_top_k_logits_sum
-        + get_top_k_logits_lst
-    )
-
-    # Skip optional scale/bias buffers (unused in this benchmark).
-    return (
-        a2a_g_acc
-        + b_output
-        + b_gating
-        + t2e_routing
-        + top_k_logits
-        + w1
-        + w3
-        + w2
-        + b_acc
-        + t_stage_b32
-        + a2a_s_acc_stage_b32
-        + routing_temporaries
-    )
 
 
 def select_block_configs(
@@ -157,7 +54,7 @@ def select_block_configs(
     only by basic divisibility/alignment constraints and VMEM budget, without
     applying additional heuristics (e.g. "keep only the largest two").
     """
-    t_packing = _dtype_packing(dtype)
+    t_packing = get_dtype_packing(dtype)
     tile_align = t_packing * 128
     local_num_tokens = case.num_tokens // case.ep_size
 
@@ -255,7 +152,17 @@ def select_block_configs(
             return False, f"bd1({bd1}) % bd1c({bd1c}) != 0 or bd2({bd2}) % bd2c({bd2c}) != 0"
 
         # TPU VMEM is 64MB per core; exceeding it is a compile-time OOM.
-        est = _estimate_vmem_bytes(case, dtype, cfg)
+        est = estimate_fused_moe_vmem_bytes(
+            num_tokens=case.num_tokens,
+            ep_size=case.ep_size,
+            num_experts=case.num_experts,
+            top_k=case.top_k,
+            hidden_size=case.hidden_size,
+            block_config=cfg,
+            t_dtype=dtype,
+            gating_dtype=dtype,
+            w_dtype=dtype,
+        )
         if est > tpu_vmem_budget_bytes:
             return (
                 False,
@@ -397,7 +304,7 @@ def run_all(
         f"{router_balance_factor}, defined as mean_count/max_count)"
     )
     for case in cases:
-        t_packing = _dtype_packing(dtype)
+        t_packing = get_dtype_packing(dtype)
         mesh = build_mesh(ep_size=case.ep_size, tp_size=case.tp_size)
         mesh_ep = mesh.shape["tensor"]
         if mesh_ep != case.ep_size:
