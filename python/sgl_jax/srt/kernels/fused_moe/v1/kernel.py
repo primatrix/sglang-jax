@@ -776,15 +776,13 @@ def _fused_ep_moe_kernel(
         ).wait()
 
     def wait_a2a_gather_recv_all(*, bt_size):
-        # Align to f5b4: wait using a flat slice into `a2a_g_hbm` sized to the
-        # total gathered token vectors for this bt tile (`top_k * bt_size`).
-        sz = jnp.int32(bt_size * top_k)
-        ref = a2a_g_hbm.at[0, pl.ds(0, sz)]
-        pltpu.make_async_copy(
-            src_ref=ref,
-            dst_ref=ref,
-            sem=a2a_gather_sem,
-        ).wait()
+        for k in range(top_k):
+            ref = a2a_g_hbm.at[k, pl.ds(0, bt_size)]
+            pltpu.make_async_copy(
+                src_ref=ref,
+                dst_ref=ref,
+                sem=a2a_gather_sem,
+            ).wait()
 
     def start_fetch_bw1(local_e_id, bw1_sem_id, bf_id, bd1_id):
         for p in range(t_packing):
