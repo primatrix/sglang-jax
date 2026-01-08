@@ -365,7 +365,7 @@ class BailingMoEDecoderLayer(nnx.Module):
             router_logits = self.moe_gate(hidden_states)
 
             if self.use_fused:
-                hidden_states = self.mlp(hidden_states, router_logits)
+                hidden_states, _ = self.mlp(hidden_states, router_logits)
             else:
                 correction_bias = (
                     self.moe_gate.bias.value if self.moe_gate.bias is not None else None

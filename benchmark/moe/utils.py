@@ -48,6 +48,20 @@ BAILING_BASE = dict(
     ep_size=None,
 )
 
+# Bailing MoE defaults (matches the observed precompile shapes).
+BAILING_MINI_BASE = dict(
+    num_experts=256,
+    top_k=8,
+    hidden_size=2048,
+    intermediate_size=512,
+    activation="silu",
+    renormalize_topk_logits=True,
+    num_expert_group=8,
+    topk_group=4,
+    # Let benchmarks pick ep_size based on available devices by default.
+    ep_size=None,
+)
+
 _NUM_TOKENS = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
 
 GROUP_GEMM_CASES: Iterable[MoEBenchmarkCase] = tuple(
