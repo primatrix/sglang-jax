@@ -933,7 +933,7 @@ def _fused_ep_moe_kernel(
         is_valid = jnp.logical_and(local_e_id >= 0, local_e_id < local_num_experts)
         remote_sz = lax.select(is_valid, remote_sz, 0)
 
-        ref = a2a_g_hbm.at[0, pl.ds(0, 1 if remote_sz > 0 else 0)]
+        ref = a2a_g_hbm.at[0, pl.ds(0, lax.select(remote_sz > 0, 1, 0))]
         pltpu.make_async_copy(
             src_ref=ref,
             dst_ref=ref,
