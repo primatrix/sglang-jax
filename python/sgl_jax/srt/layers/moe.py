@@ -540,6 +540,7 @@ class FusedEPMoE(nnx.Module):
         balanced_topk: bool = False,
         debug_routing: bool = False,
         debug_routing_local_mask: bool = False,
+        disable_a2a: bool = False,
     ):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
@@ -555,6 +556,7 @@ class FusedEPMoE(nnx.Module):
         self.mesh = mesh
         self.debug_routing = debug_routing
         self.debug_routing_local_mask = debug_routing_local_mask
+        self.disable_a2a = False
 
         if num_experts % self.ep_size != 0:
             raise ValueError(
@@ -657,6 +659,7 @@ class FusedEPMoE(nnx.Module):
             balanced_topk=self.balanced_topk,
             act_fn=self.activation,
             block_config=block_config,
+            disable_a2a=self.disable_a2a,
             # Optional parameters (not used in basic case)
             subc_quant_wsz=None,
             w1_scale=None,
