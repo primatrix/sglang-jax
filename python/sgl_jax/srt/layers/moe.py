@@ -8,6 +8,7 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
     FusedMoEBlockConfig,
     fused_ep_moe,
+    fused_ep_moe_routing_anomaly_stats,
     fused_ep_moe_routing_stats,
 )
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
@@ -621,6 +622,17 @@ class FusedEPMoE(nnx.Module):
                 local_mask=self.debug_routing_local_mask,
                 balanced_topk=self.balanced_topk,
             )
+            dup_rate, dup_count, nonfinite_rate, all_neg_inf_rate = (
+                fused_ep_moe_routing_anomaly_stats(
+                    mesh=self.mesh,
+                    router_logits=router_logits,
+                    top_k=self.num_experts_per_tok,
+                    num_experts=self.num_experts,
+                    ep_axis_name="tensor",
+                    local_mask=self.debug_routing_local_mask,
+                    balanced_topk=self.balanced_topk,
+                )
+            )
 
             @jax.jit
             @jax.shard_map(
@@ -646,6 +658,31 @@ class FusedEPMoE(nnx.Module):
                 return jax.lax.cond(should_print, _do_print, lambda _: jnp.int32(0), jnp.int32(0))
 
             _print_once(factor, mean, max_count, active)
+
+            @jax.jit
+            @jax.shard_map(
+                mesh=self.mesh,
+                in_specs=(P(), P(), P(), P()),
+                out_specs=P(),
+                check_vma=False,
+            )
+            def _print_anomaly_once(dup_rate, dup_count, nonfinite_rate, all_neg_inf_rate):
+                should_print = jax.lax.axis_index("tensor") == 0
+
+                def _do_print(_):
+                    jax.debug.print(
+                        "fused_ep_moe routing_anomaly: layer={layer} dup_rate={dr} dup_count={dc} nonfinite_rate={nr} all_neg_inf_rate={ar}",
+                        layer=self.layer_id,
+                        dr=dup_rate,
+                        dc=dup_count,
+                        nr=nonfinite_rate,
+                        ar=all_neg_inf_rate,
+                    )
+                    return jnp.int32(0)
+
+                return jax.lax.cond(should_print, _do_print, lambda _: jnp.int32(0), jnp.int32(0))
+
+            _print_anomaly_once(dup_rate, dup_count, nonfinite_rate, all_neg_inf_rate)
 
         output = fused_ep_moe(
             mesh=self.mesh,

@@ -532,7 +532,7 @@ def _fused_ep_moe_kernel(
     assert b_output_x2_vmem.shape[1] == bt, (b_output_x2_vmem.shape[1], bt)
     assert local_num_tokens % bt == 0, (local_num_tokens, bt)
     num_bt = local_num_tokens // bt
-    a2a_max_tokens = a2a_s_x2_hbm.shape[1]
+    a2a_max_tokens = a2a_s_acc_x2_hbm.shape[1]
     right_id = (my_id + 1) % num_devices
     num_experts = a2a_g_hbm.shape[0]
     padded_num_experts = d2e_count_x2_smem.shape[-1]
@@ -2451,5 +2451,99 @@ def fused_ep_moe_routing_stats(
         active = jnp.sum(counts > 0).astype(jnp.float32)
         balance_factor = mean / jnp.maximum(max_count, jnp.float32(1.0))
         return balance_factor, mean, max_count, active
+
+    return _stats(router_logits)
+
+
+def fused_ep_moe_routing_anomaly_stats(
+    *,
+    mesh: jax.sharding.Mesh,
+    router_logits: jax.Array,
+    top_k: int,
+    num_experts: int | None = None,
+    ep_axis_name: str = "tensor",
+    local_mask: bool = False,
+    balanced_topk: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Detect routing anomalies outside the pallas kernel.
+
+    Returns `(dup_rate, dup_count, nonfinite_rate, all_neg_inf_rate)`, where:
+    - `dup_rate`: fraction of tokens whose top-k contains duplicate expert ids
+    - `dup_count`: number of such tokens (global across EP)
+    - `nonfinite_rate`: fraction of tokens with any NaN/Inf in logits row
+    - `all_neg_inf_rate`: fraction of tokens with all logits == -inf
+
+    Notes:
+    - The duplicate check mirrors the pallas kernel's iterative argmax masking
+      (not `lax.top_k`) to catch NaN-induced repeats.
+    - Global stats require a small collective (`lax.psum`) across `ep_axis_name`.
+    """
+    if num_experts is None:
+        num_experts = int(router_logits.shape[-1])
+    if top_k <= 0 or top_k > num_experts:
+        raise ValueError(f"Expected 0 < {top_k=} <= {num_experts=}.")
+
+    @jax.jit
+    @jax.shard_map(
+        mesh=mesh,
+        in_specs=(P(ep_axis_name, None),),
+        out_specs=(P(), P(), P(), P()),
+        check_vma=False,
+    )
+    def _stats(router_logits_shard: jax.Array):
+        x = router_logits_shard[:, :num_experts].astype(jnp.float32)
+        any_nonfinite = jnp.any(~jnp.isfinite(x), axis=1)
+        all_neg_inf = jnp.all(jnp.isneginf(x), axis=1)
+
+        if local_mask:
+            my_id = jax.lax.axis_index(ep_axis_name)
+            ep_size = jax.lax.axis_size(ep_axis_name)
+            if num_experts % ep_size != 0:
+                raise ValueError(f"Expected {num_experts=} to be divisible by {ep_size=}.")
+            local_num_experts = num_experts // ep_size
+            local_start = my_id * local_num_experts
+            local_end = local_start + local_num_experts
+            expert_iota = jax.lax.broadcasted_iota(jnp.int32, (1, num_experts), 1)[0]
+            is_local_expert = jnp.logical_and(expert_iota >= local_start, expert_iota < local_end)
+            x = jnp.where(is_local_expert, x, -jnp.inf)
+
+        if balanced_topk:
+            num_tokens = x.shape[0]
+            token_iota = jax.lax.broadcasted_iota(jnp.int32, (num_tokens, top_k), 0)
+            k_iota = jax.lax.broadcasted_iota(jnp.int32, (num_tokens, top_k), 1)
+            global_token_offset = jax.lax.axis_index(ep_axis_name) * num_tokens
+            global_token_iota = token_iota + global_token_offset
+            if local_mask:
+                topk_ids = (global_token_iota * top_k + k_iota) % local_num_experts + local_start
+            else:
+                topk_ids = (global_token_iota * top_k + k_iota) % num_experts
+        else:
+            # Mirror the pallas kernel's iterative argmax + masking.
+            iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
+            ids_lst: list[jax.Array] = []
+            x_i = x
+            for _ in range(top_k):
+                idx = jnp.argmax(x_i, axis=1).astype(jnp.int32)
+                ids_lst.append(idx)
+                x_i = jnp.where(iota == idx[:, None], -jnp.inf, x_i)
+            topk_ids = jnp.stack(ids_lst, axis=1)
+
+        sorted_ids = jnp.sort(topk_ids, axis=1)
+        has_dup = jnp.any(sorted_ids[:, 1:] == sorted_ids[:, :-1], axis=1)
+
+        local_tokens = jnp.int32(x.shape[0])
+        total_tokens = jax.lax.psum(local_tokens, axis_name=ep_axis_name).astype(jnp.float32)
+        dup_count = jax.lax.psum(jnp.sum(has_dup).astype(jnp.float32), axis_name=ep_axis_name)
+        nonfinite_count = jax.lax.psum(
+            jnp.sum(any_nonfinite).astype(jnp.float32), axis_name=ep_axis_name
+        )
+        all_neg_inf_count = jax.lax.psum(
+            jnp.sum(all_neg_inf).astype(jnp.float32), axis_name=ep_axis_name
+        )
+        denom = jnp.maximum(total_tokens, jnp.float32(1.0))
+        dup_rate = dup_count / denom
+        nonfinite_rate = nonfinite_count / denom
+        all_neg_inf_rate = all_neg_inf_count / denom
+        return dup_rate, dup_count, nonfinite_rate, all_neg_inf_rate
 
     return _stats(router_logits)
