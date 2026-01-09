@@ -2349,7 +2349,7 @@ def fused_ep_moe(
         return local_output
 
     a2a_s_x2_hbm_scratch = pl.empty(
-        (2, a2a_max_tokens * top_k, t_packing, hidden_size // t_packing), t_dtype
+        (2, a2a_max_tokens, t_packing, hidden_size // t_packing), t_dtype
     )
     a2a_s_acc_x2_hbm_scratch = pl.empty(
         (2, a2a_max_tokens, t_packing, hidden_size // t_packing), t_dtype
