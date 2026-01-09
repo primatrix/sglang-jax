@@ -625,16 +625,20 @@ def _fused_ep_moe_kernel(
     def sync_barrier():
         if not enable_comm:
             return
+
         # Full mesh barrier (matches epic/integrate-fused-moe). The previous
         # "signal right + wait 1" is only a neighbor fence (not a global barrier)
         # and can lead to rare deadlocks when subsequent comm assumes all peers
         # reached the same phase.
-        for i in range(num_devices):
+        def _signal_device(i, _):
             pltpu.semaphore_signal(
                 barrier_sem,
                 device_id=get_mesh_device_id(i),
                 device_id_type=pltpu.DeviceIdType.MESH,
             )
+            return None
+
+        lax.fori_loop(0, num_devices, _signal_device, None, unroll=False)
         pltpu.semaphore_wait(barrier_sem, num_devices)
 
     def start_fetch_b_gating(*, bt_id, priority=0):
@@ -807,7 +811,9 @@ def _fused_ep_moe_kernel(
             reduced_starts = starts
             row_id = my_id
             d2e_count_vmem[row_id] = sizes
-            for i in range(num_devices - 1):
+
+            def _all_reduce_step(i, state):
+                row_id, reduced_sizes, reduced_starts = state
                 sync_barrier()
                 # TODO(jevinjiang): we can use double buffering to improve AR if needed.
                 pltpu.async_remote_copy(
@@ -820,8 +826,19 @@ def _fused_ep_moe_kernel(
                 ).wait()
                 row_id = (row_id + num_devices - 1) % num_devices
                 new_sizes = d2e_count_vmem[row_id]
-                reduced_sizes += new_sizes
-                reduced_starts += lax.select(my_id > i, new_sizes, jnp.zeros_like(new_sizes))
+                reduced_sizes = reduced_sizes + new_sizes
+                reduced_starts = reduced_starts + lax.select(
+                    my_id > i, new_sizes, jnp.zeros_like(new_sizes)
+                )
+                return (row_id, reduced_sizes, reduced_starts)
+
+            _, reduced_sizes, reduced_starts = lax.fori_loop(
+                0,
+                num_devices - 1,
+                _all_reduce_step,
+                (row_id, reduced_sizes, reduced_starts),
+                unroll=False,
+            )
             starts_vmem[...] = reduced_starts
             sizes_vmem[...] = reduced_sizes
 
@@ -897,11 +914,16 @@ def _fused_ep_moe_kernel(
 
             # Only the local device contributes tokens in comp-only mode.
             d2e_count_vmem[...] = jnp.zeros_like(d2e_count_vmem)
-            for dev_id in range(num_devices):
+
+            def _set_d2e_count(dev_id, d2e_count_vmem):
                 is_my = my_id == dev_id
-                d2e_count_vmem = d2e_count_vmem.at[dev_id].set(
+                return d2e_count_vmem.at[dev_id].set(
                     lax.select(is_my, sizes, jnp.zeros_like(sizes))
                 )
+
+            d2e_count_vmem = lax.fori_loop(
+                0, num_devices, _set_d2e_count, d2e_count_vmem, unroll=False
+            )
             d2e_count_copy = pltpu.async_copy(
                 src_ref=d2e_count_vmem,
                 dst_ref=d2e_count_x2_smem.at[bt_sem_id],
@@ -930,7 +952,8 @@ def _fused_ep_moe_kernel(
             t_id, send_sz, e_sem_id=e_sem_id, local_e_id=local_e_id, bt_start=bt_start
         ):
             src_t_id = bt_start + t_id
-            for k_id in range(top_k):
+
+            def _scatter_k(k_id, send_sz):
                 e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
                 is_active_expert = e_id % local_num_experts == local_e_id
                 recv_id = e_id // local_num_experts
@@ -939,7 +962,7 @@ def _fused_ep_moe_kernel(
                 is_local = recv_id == my_id
                 local_sz = lax.select(is_local, sz, jnp.int32(0))
                 remote_sz = lax.select(is_local, jnp.int32(0), sz)
-                send_sz += remote_sz
+                send_sz = send_sz + remote_sz
                 expert_offsets_x2_smem[bt_sem_id, 0, e_id] = offset + local_sz + remote_sz
                 start = expert_starts_x2_smem[bt_sem_id, 0, e_id] + offset
                 pltpu.make_async_copy(
@@ -956,8 +979,9 @@ def _fused_ep_moe_kernel(
                         device_id=get_mesh_device_id(recv_id),
                         device_id_type=pltpu.DeviceIdType.MESH,
                     ).start()
+                return send_sz
 
-            return send_sz
+            return lax.fori_loop(0, top_k, _scatter_k, send_sz, unroll=False)
 
         send_sz = lax.fori_loop(
             0,
@@ -1959,7 +1983,8 @@ def _fused_ep_moe_kernel(
         def load_acc_bt_sync(*, tile_start):
             def _load_one(t_i, _):
                 t_id = tile_start + t_i
-                for k_id in range(top_k):
+
+                def _load_k(k_id, _):
                     e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
                     offset = expert_offsets_x2_smem[bt_sem_id, 1, e_id]
                     expert_offsets_x2_smem[bt_sem_id, 1, e_id] = offset + 1
@@ -1968,6 +1993,9 @@ def _fused_ep_moe_kernel(
                         dst_ref=a2a_g_acc_vmem.at[0, k_id, pl.ds(t_i, 1)],
                         sem=a2a_acc_sems.at[0],
                     ).start()
+                    return None
+
+                lax.fori_loop(0, top_k, _load_k, None, unroll=False)
                 return None
 
             lax.fori_loop(0, acc_bt, _load_one, None, unroll=False)
@@ -1984,10 +2012,13 @@ def _fused_ep_moe_kernel(
                 pl.ds(tile_start, acc_bt),
                 pl.ds(0, top_k),
             ][...]
-            for k_id in range(top_k):
+
+            def _acc_k(k_id, output_tile):
                 acc_tile = a2a_g_acc_vmem[0, k_id, :acc_bt].astype(jnp.float32)
                 logits = logits_tile[:, k_id].reshape(acc_bt, 1, 1)
-                output_tile += acc_tile * logits
+                return output_tile + acc_tile * logits
+
+            output_tile = lax.fori_loop(0, top_k, _acc_k, output_tile, unroll=False)
 
             out_offset = pl.multiple_of(out_offset, 16)
             b_output_x2_vmem.at[out_buf_id, pl.ds(out_offset, acc_bt), pl.ds(0, hidden_size)][
