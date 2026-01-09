@@ -372,6 +372,7 @@ def run_all(
     config_mode: str = "base",
     use_shared_expert: bool = False,
     use_grouped_topk: bool = False,
+    perf_mode: str | None = None,
 ) -> None:
     raw_cases: list[MoEBenchmarkCase] | None = None
     if num_tokens is not None:
@@ -490,11 +491,13 @@ def run_all(
             moe_def, moe_state = nnx.split(fused_layer)
             moe_state_leaves, moe_state_def = jax.tree_util.tree_flatten(moe_state)
 
-            @jax.jit(static_argnames=("moe_state_def", "block_config"))
-            def run(tokens, router_logits, *, moe_state_def, moe_state_leaves, block_config):
+            @jax.jit(static_argnames=("moe_state_def", "block_config", "perf_mode"))
+            def run(
+                tokens, router_logits, *, moe_state_def, moe_state_leaves, block_config, perf_mode
+            ):
                 moe_state = jax.tree_util.tree_unflatten(moe_state_def, moe_state_leaves)
                 moe = nnx.merge(moe_def, moe_state)
-                return moe(tokens, router_logits, block_config=block_config)
+                return moe(tokens, router_logits, block_config=block_config, perf_mode=perf_mode)
 
             best: tuple[float, FusedMoEBlockConfig | None] | None = None
             for i, block_cfg in enumerate(block_cfgs):
@@ -515,6 +518,7 @@ def run_all(
                         moe_state_def=moe_state_def,
                         moe_state_leaves=moe_state_leaves,
                         block_config=block_cfg,
+                        perf_mode=perf_mode,
                     )
 
                 try:
@@ -685,6 +689,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable shared expert logic (allocates extra VMEM buffers).",
     )
+    parser.add_argument(
+        "--perf-mode",
+        type=str,
+        default=None,
+        choices=["normal", "latency"],
+        help="Performance mode for the fused_moe kernel (default: auto from env or 'normal').",
+    )
     return parser.parse_args()
 
 
@@ -707,4 +718,5 @@ if __name__ == "__main__":
         config_mode=args.config_mode,
         use_shared_expert=args.use_shared_expert,
         use_grouped_topk=args.use_grouped_topk,
+        perf_mode=args.perf_mode,
     )

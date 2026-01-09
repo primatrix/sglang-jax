@@ -636,6 +636,7 @@ class FusedEPMoE(nnx.Module):
         router_bias: jax.Array | None = None,
         *,
         block_config: FusedMoEBlockConfig | None = None,
+        perf_mode: str | None = None,
     ) -> jax.Array:
         """
         Forward pass through the fused MoE layer.
@@ -675,6 +676,7 @@ class FusedEPMoE(nnx.Module):
             balanced_topk=self.balanced_topk,
             act_fn=self.activation,
             block_config=block_config,
+            perf_mode=perf_mode,
             # Optional parameters (not used in basic case)
             subc_quant_wsz=None,
             w1_scale=None,
