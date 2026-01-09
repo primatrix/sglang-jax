@@ -903,25 +903,39 @@ def _fused_ep_moe_kernel(
 
             start += sz
 
-    def wait_a2a_gather_send(*, bt_sem_id, e_sem_id, local_e_id):
-        is_valid = jnp.logical_and(local_e_id >= 0, local_e_id < local_num_experts)
-        safe_local_e_id = lax.select(is_valid, local_e_id, 0)
-        my_e_id = my_id * local_num_experts + safe_local_e_id
+    # def wait_a2a_gather_send(*, bt_sem_id, e_sem_id, local_e_id):
+    #     is_valid = jnp.logical_and(local_e_id >= 0, local_e_id < local_num_experts)
+    #     safe_local_e_id = lax.select(is_valid, local_e_id, 0)
+    #     my_e_id = my_id * local_num_experts + safe_local_e_id
 
-        # Important: wait via `a2a_g_hbm` itself (matches f5b4) so reads from
-        # `a2a_g_hbm` can't be reordered before the gather completes. We issue one
-        # wait per remote destination so each slice stays <= `bt`.
-        for recv_id in range(num_devices):
-            sz = d2e_count_x2_smem[bt_sem_id, recv_id, 0, my_e_id]
-            is_local = recv_id == my_id
-            wait_sz = lax.select(is_local, jnp.int32(0), sz)
-            wait_sz = lax.select(is_valid, wait_sz, jnp.int32(0))
-            ref = a2a_g_hbm.at[my_e_id, pl.ds(0, wait_sz)]
-            pltpu.make_async_copy(
-                src_ref=ref,
-                dst_ref=ref,
-                sem=send_x2_sems.at[e_sem_id],
-            ).wait()
+    #     # Important: wait via `a2a_g_hbm` itself (matches f5b4) so reads from
+    #     # `a2a_g_hbm` can't be reordered before the gather completes. We issue one
+    #     # wait per remote destination so each slice stays <= `bt`.
+    #     for recv_id in range(num_devices):
+    #         sz = d2e_count_x2_smem[bt_sem_id, recv_id, 0, my_e_id]
+    #         is_local = recv_id == my_id
+    #         wait_sz = lax.select(is_local, jnp.int32(0), sz)
+    #         wait_sz = lax.select(is_valid, wait_sz, jnp.int32(0))
+    #         ref = a2a_g_hbm.at[my_e_id, pl.ds(0, wait_sz)]
+    #         pltpu.make_async_copy(
+    #             src_ref=ref,
+    #             dst_ref=ref,
+    #             sem=send_x2_sems.at[e_sem_id],
+    #         ).wait()
+
+    def wait_a2a_gather_send(bt_id, e_sem_id, local_e_id):
+        my_e_id = my_id * local_num_experts + local_e_id
+        bt_sem_id = bt_id % 2
+        sz = expert_sizes_x2_smem[bt_sem_id, 0, my_e_id]
+        local_sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, my_e_id]
+        remote_sz = sz - local_sz
+        is_valid = jnp.logical_and(local_e_id >= 0, local_e_id < local_num_experts)
+        remote_sz = lax.select(is_valid, remote_sz, 0)
+        pltpu.make_async_copy(
+            src_ref=a2a_s_acc_x2_hbm.at[0, pl.ds(0, remote_sz)],
+            dst_ref=a2a_s_acc_x2_hbm.at[0, pl.ds(0, remote_sz)],
+            sem=send_x2_sems.at[e_sem_id],
+        ).wait()
 
     def wait_a2a_gather_recv_all(*, bt_size):
         # `a2a_gather_sem` counts DMA bytes; total gather volume per `bt` tile is
