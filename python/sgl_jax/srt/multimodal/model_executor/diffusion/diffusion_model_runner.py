@@ -79,7 +79,7 @@ class DiffusionModelRunner(BaseModelRunner):
 
         num_inference_steps = self.model_config.num_inference_steps
         # time_steps = batch.timesteps
-        text_embeds = device_array(batch.prompt_embeds, NamedSharding(self.mesh, PartitionSpec()))
+        text_embeds = device_array(batch.prompt_embeds, sharding=NamedSharding(self.mesh, PartitionSpec()))
         print(f"{text_embeds=}")
         guidance_scale = batch.guidance_scale
         do_classifier_free_guidance = guidance_scale > 1.0
@@ -94,7 +94,7 @@ class DiffusionModelRunner(BaseModelRunner):
             ),
             dtype=jnp.float32,
         )  # Placeholder for latents
-        latents = device_array(batch.latents, NamedSharding(self.mesh, PartitionSpec()))
+        latents = device_array(batch.latents, sharding=NamedSharding(self.mesh, PartitionSpec()))
         solver_state: UniPCMultistepSchedulerState = self.solver.set_timesteps(
             self.solver_state,
             num_inference_steps=num_inference_steps,
