@@ -525,6 +525,7 @@ def _fused_ep_moe_kernel(
     bfc: int,  # Compute size of block intermediate_size.
     bd1c: int,  # Compute size of block hidden_size.
     bd2c: int,  # Compute size of block hidden_size.
+    a2a_only: bool,
 ):
     my_id = lax.axis_index(ep_axis_name)
     num_devices = lax.axis_size(ep_axis_name)
@@ -1718,7 +1719,14 @@ def _fused_ep_moe_kernel(
         wait_a2a_scatter_recv(bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=local_e_id)
 
         # Perform FFN for CURRENT active expert.
-        expert_ffn(bt_sem_id, e_sem_id, local_e_id)
+        if not a2a_only:
+            expert_ffn(bt_sem_id, e_sem_id, local_e_id)
+        else:
+            wait_a2a_gather_send(
+                bt_sem_id=bt_sem_id,
+                e_sem_id=e_sem_id,
+                local_e_id=local_e_id - 2,
+            )
 
         # Start a2a gather to send back tokens for CURRENT active expert.
         start_a2a_gather(bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=local_e_id)
@@ -1795,14 +1803,15 @@ def _fused_ep_moe_kernel(
         )
 
         # Wait to receive a2a gather for ALL experts before consuming `a2a_g_hbm`.
-        wait_a2a_gather_recv_all(bt_size=bt)
+        # wait_a2a_gather_recv_all(bt_size=bt)
         sync_barrier()
 
         out_buf_id = bt_id & jnp.int32(1)
-        wait_store_output(bt_id=bt_id - 2)
-        # Accumulate results for current bt into b_output_x2_vmem, then start async send to output_hbm.
-        acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
-        start_send_bo(bt_id=bt_id)
+        if not a2a_only:
+            wait_store_output(bt_id=bt_id - 2)
+            # Accumulate results for current bt into b_output_x2_vmem, then start async send to output_hbm.
+            acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
+            start_send_bo(bt_id=bt_id)
 
         # Drain the last outstanding gather sends (the loop body waits `local_e_id - 2`).
         wait_a2a_gather_send(
@@ -1819,10 +1828,11 @@ def _fused_ep_moe_kernel(
         return e_sem_id
 
     lax.fori_loop(0, num_bt, run_bt, jnp.int32(0), unroll=False)
-    # Drain outstanding output stores (matches epic wait_send_bo for last two bts).
-    wait_store_output(bt_id=jnp.int32(num_bt - 2))
-    wait_store_output(bt_id=jnp.int32(num_bt - 1))
-    wait_copy_expert_size()
+    if not a2a_only:
+        # Drain outstanding output stores (matches epic wait_send_bo for last two bts).
+        wait_store_output(bt_id=jnp.int32(num_bt - 2))
+        wait_store_output(bt_id=jnp.int32(num_bt - 1))
+    # wait_copy_expert_size()
 
     ### ------- Kernel end ------- ###
 
@@ -1967,6 +1977,7 @@ def _validate_fused_ep_moe_args(
         "subc_quant_wsz",
         "block_config",
         "ep_axis_name",
+        "a2a_only",
     ],
 )
 def fused_ep_moe(
@@ -1996,6 +2007,7 @@ def fused_ep_moe(
     b3: jax.Array | None = None,  # F32(num_experts, 1, intermediate_size)
     block_config: FusedMoEBlockConfig | None = None,
     ep_axis_name: str = "tensor",
+    a2a_only: bool = False,
 ):
     ep_size = mesh.shape[ep_axis_name]
     if block_config is None:
@@ -2182,6 +2194,7 @@ def fused_ep_moe(
                 bfc=block_config.bfc,
                 bd1c=block_config.bd1c,
                 bd2c=block_config.bd2c,
+                a2a_only=a2a_only,
             ),
             out_shape=(
                 jax.ShapeDtypeStruct((local_num_tokens, hidden_size), t_dtype),

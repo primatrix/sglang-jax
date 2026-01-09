@@ -540,6 +540,7 @@ class FusedEPMoE(nnx.Module):
         balanced_topk: bool = False,
         debug_routing: bool = False,
         debug_routing_local_mask: bool = False,
+        a2a_only: bool = False,
     ):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
@@ -555,6 +556,7 @@ class FusedEPMoE(nnx.Module):
         self.mesh = mesh
         self.debug_routing = debug_routing
         self.debug_routing_local_mask = debug_routing_local_mask
+        self.a2a_only = a2a_only
 
         if num_experts % self.ep_size != 0:
             raise ValueError(
@@ -594,6 +596,7 @@ class FusedEPMoE(nnx.Module):
         router_logits: jax.Array,
         *,
         block_config: FusedMoEBlockConfig | None = None,
+        a2a_only: bool = False,
     ) -> jax.Array:
         """
         Forward pass through the fused MoE layer.
@@ -666,6 +669,7 @@ class FusedEPMoE(nnx.Module):
             b2=None,
             b3=None,
             ep_axis_name="tensor",
+            a2a_only=self.a2a_only,
         )
 
         output = jax.sharding.reshard(output, NamedSharding(self.mesh, P(None, None)))

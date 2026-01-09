@@ -271,6 +271,7 @@ def run_all(
     hotspot_count: int = None,
     zero_expert_count: int = None,
     non_hotspot_alpha: float = None,
+    a2a_only: bool = False,
 ) -> None:
     raw_cases: list[MoEBenchmarkCase] | None = None
     if num_tokens is not None:
@@ -478,6 +479,7 @@ def run_all(
                 activation=case.activation,
                 layer_id=0,
                 renormalize_topk_logits=case.renormalize_topk_logits,
+                a2a_only=a2a_only,
             )
 
             moe_def, moe_state = nnx.split(fused_layer)
@@ -691,6 +693,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hotspot-count", type=int, default=1, help="热点专家的数量")
     parser.add_argument("--zero-expert-count", type=int, default=0)
     parser.add_argument("--non-hotspot-alpha", type=float, default=100.0)
+    parser.add_argument(
+        "--a2a-only",
+        action="store_true",
+        help="Benchmark multiple block_config variants and print the best tuned table entry.",
+    )
     return parser.parse_args()
 
 
@@ -720,4 +727,5 @@ if __name__ == "__main__":
         hotspot_count=args.hotspot_count,
         zero_expert_count=args.zero_expert_count,
         non_hotspot_alpha=args.non_hotspot_alpha,
+        a2a_only=args.a2a_only,
     )
