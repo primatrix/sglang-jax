@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import math
+import os
 from dataclasses import dataclass
 
 import jax
@@ -163,6 +164,29 @@ def activation_fn(acc1, acc3, act_fn):
         return swigluoai(acc1, acc3)
     else:
         raise RuntimeError(f"Unsupported activation function: {act_fn}")
+
+
+def _canonicalize_fused_ep_moe_perf_mode(mode: str | None) -> str:
+    if mode is None:
+        return "normal"
+    m = str(mode).strip().lower()
+    if m in ("", "0", "false", "off", "default", "normal", "full"):
+        return "normal"
+    if m in ("a2a", "a2a_only", "a2a-only"):
+        return "a2a_only"
+    if m in ("comp", "compute", "comp_only", "comp-only"):
+        return "comp_only"
+    raise ValueError(
+        "Unsupported fused_ep_moe perf_mode. "
+        "Expected one of: normal, a2a_only, comp_only; "
+        f"got {mode!r}."
+    )
+
+
+def _get_fused_ep_moe_perf_mode(perf_mode: str | None) -> str:
+    if perf_mode is not None:
+        return _canonicalize_fused_ep_moe_perf_mode(perf_mode)
+    return _canonicalize_fused_ep_moe_perf_mode(os.environ.get("SGL_FUSED_EP_MOE_MODE"))
 
 
 def validate_fused_moe_block_config(
@@ -517,6 +541,7 @@ def _fused_ep_moe_kernel(
     tp_axis_name: str,
     act_fn: str,
     subc_quant_wsz: int | None = None,
+    perf_mode: str = "normal",
     # Kernel tuning params.
     bt: int,  # Outer token tile size (output tiling).
     bf: int,  # Block size of intermediate_size.
@@ -566,6 +591,12 @@ def _fused_ep_moe_kernel(
     assert bts % btc == 0
     assert bts <= bt
 
+    perf_mode = _canonicalize_fused_ep_moe_perf_mode(perf_mode)
+    enable_comm = perf_mode != "comp_only"
+    enable_compute = perf_mode != "a2a_only"
+    local_topk_only = perf_mode == "comp_only"
+    enable_shared_expert = perf_mode == "normal"
+
     h_per_t_packing = hidden_size // t_packing
     assert tokens_hbm.shape[-1] == h_per_t_packing
     bd1_per_t_packing = bd1 // t_packing
@@ -592,6 +623,8 @@ def _fused_ep_moe_kernel(
         return (dp_rank, tp_rank)
 
     def sync_barrier():
+        if not enable_comm:
+            return
         # Full mesh barrier (matches epic/integrate-fused-moe). The previous
         # "signal right + wait 1" is only a neighbor fence (not a global barrier)
         # and can lead to rare deadlocks when subsequent comm assumes all peers
@@ -640,6 +673,13 @@ def _fused_ep_moe_kernel(
             routing_scores = input_logits + jnp.expand_dims(bias_val[: input_logits.shape[1]], 0)
         else:
             routing_scores = input_logits
+
+        if local_topk_only:
+            local_start = my_id * jnp.int32(local_num_experts)
+            local_end = local_start + jnp.int32(local_num_experts)
+            expert_iota = jax.lax.broadcasted_iota(jnp.int32, routing_scores.shape, 1)
+            is_local = jnp.logical_and(expert_iota >= local_start, expert_iota < local_end)
+            routing_scores = jnp.where(is_local, routing_scores, -jnp.float32(jnp.inf))
 
         if use_grouped_topk:
             curr_num_experts = input_logits.shape[1]
@@ -737,6 +777,8 @@ def _fused_ep_moe_kernel(
         return t2e_routing, expert_sizes, expert_starts
 
     def all_reduce_metadata(*, bt_sem_id, t2e_routing, starts, sizes):
+        if not enable_comm:
+            raise RuntimeError("all_reduce_metadata called with enable_comm=False")
         send_sem = send_x2_sems.at[0]
         recv_sem = recv_x2_sems.at[0]
 
@@ -817,6 +859,70 @@ def _fused_ep_moe_kernel(
             pltpu.VMEM(expert_sizes_x2_smem.shape[1:], expert_sizes_x2_smem.dtype),
         )
 
+    def write_local_metadata(*, bt_sem_id, t2e_routing, starts, sizes):
+        send_sem = send_x2_sems.at[0]
+
+        def _write(
+            t2e_routing_vmem,
+            d2e_count_vmem,
+            offsets_vmem,
+            starts_vmem,
+            sizes_vmem,
+        ):
+            offsets_vmem[...] = jnp.zeros_like(offsets_vmem)
+            offsets_copy = pltpu.async_copy(
+                src_ref=offsets_vmem,
+                dst_ref=expert_offsets_x2_smem.at[bt_sem_id],
+                sem=send_sem,
+            )
+            t2e_routing_vmem[...] = t2e_routing
+            t2e_routing_copy = pltpu.async_copy(
+                src_ref=t2e_routing_vmem,
+                dst_ref=t2e_routing_x2_smem.at[bt_sem_id],
+                sem=send_sem,
+            )
+
+            starts_vmem[...] = starts
+            sizes_vmem[...] = sizes
+            starts_copy = pltpu.async_copy(
+                src_ref=starts_vmem,
+                dst_ref=expert_starts_x2_smem.at[bt_sem_id],
+                sem=send_sem,
+            )
+            sizes_copy = pltpu.async_copy(
+                src_ref=sizes_vmem,
+                dst_ref=expert_sizes_x2_smem.at[bt_sem_id],
+                sem=send_sem,
+            )
+
+            # Only the local device contributes tokens in comp-only mode.
+            d2e_count_vmem[...] = jnp.zeros_like(d2e_count_vmem)
+            for dev_id in range(num_devices):
+                is_my = my_id == dev_id
+                d2e_count_vmem = d2e_count_vmem.at[dev_id].set(
+                    lax.select(is_my, sizes, jnp.zeros_like(sizes))
+                )
+            d2e_count_copy = pltpu.async_copy(
+                src_ref=d2e_count_vmem,
+                dst_ref=d2e_count_x2_smem.at[bt_sem_id],
+                sem=send_sem,
+            )
+
+            t2e_routing_copy.wait()
+            d2e_count_copy.wait()
+            offsets_copy.wait()
+            starts_copy.wait()
+            sizes_copy.wait()
+
+        pl.run_scoped(
+            _write,
+            pltpu.VMEM(t2e_routing_x2_smem.shape[1:], t2e_routing_x2_smem.dtype),
+            pltpu.VMEM(d2e_count_x2_smem.shape[1:], d2e_count_x2_smem.dtype),
+            pltpu.VMEM(expert_offsets_x2_smem.shape[1:], expert_offsets_x2_smem.dtype),
+            pltpu.VMEM(expert_starts_x2_smem.shape[1:], expert_starts_x2_smem.dtype),
+            pltpu.VMEM(expert_sizes_x2_smem.shape[1:], expert_sizes_x2_smem.dtype),
+        )
+
     def start_a2a_scatter(*, bt_sem_id, e_sem_id, local_e_id, bt_start):
         # Counting the number of remote sends from the current device.
         # Use `lax.fori_loop` to avoid unrolling `bt` (huge MLIR / slow compile).
@@ -841,14 +947,15 @@ def _fused_ep_moe_kernel(
                     dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
                     sem=recv_x2_sems.at[e_sem_id],
                 ).start()
-                pltpu.make_async_remote_copy(
-                    src_ref=tokens_hbm.at[pl.ds(src_t_id, remote_sz)],
-                    dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
-                    send_sem=send_x2_sems.at[e_sem_id],
-                    recv_sem=recv_x2_sems.at[e_sem_id],
-                    device_id=get_mesh_device_id(recv_id),
-                    device_id_type=pltpu.DeviceIdType.MESH,
-                ).start()
+                if enable_comm:
+                    pltpu.make_async_remote_copy(
+                        src_ref=tokens_hbm.at[pl.ds(src_t_id, remote_sz)],
+                        dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
+                        send_sem=send_x2_sems.at[e_sem_id],
+                        recv_sem=recv_x2_sems.at[e_sem_id],
+                        device_id=get_mesh_device_id(recv_id),
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).start()
 
             return send_sz
 
@@ -871,6 +978,8 @@ def _fused_ep_moe_kernel(
         ).wait()
 
     def wait_a2a_scatter_send(e_sem_id):
+        if not enable_comm:
+            return
         sz = a2a_s_sends_x2_smem[e_sem_id]
         pltpu.make_async_copy(
             src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
@@ -892,18 +1001,21 @@ def _fused_ep_moe_kernel(
                 dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, local_sz)],
                 sem=a2a_gather_sem,
             ).start()
-            pltpu.make_async_remote_copy(
-                src_ref=src_ref.at[e_sem_id, pl.ds(start, remote_sz)],
-                dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, remote_sz)],
-                send_sem=send_x2_sems.at[e_sem_id],
-                recv_sem=a2a_gather_sem,
-                device_id=get_mesh_device_id(recv_id),
-                device_id_type=pltpu.DeviceIdType.MESH,
-            ).start()
+            if enable_comm:
+                pltpu.make_async_remote_copy(
+                    src_ref=src_ref.at[e_sem_id, pl.ds(start, remote_sz)],
+                    dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, remote_sz)],
+                    send_sem=send_x2_sems.at[e_sem_id],
+                    recv_sem=a2a_gather_sem,
+                    device_id=get_mesh_device_id(recv_id),
+                    device_id_type=pltpu.DeviceIdType.MESH,
+                ).start()
 
             start += sz
 
     def wait_a2a_gather_send(*, bt_sem_id, e_sem_id, local_e_id):
+        if not enable_comm:
+            return
         my_e_id = my_id * local_num_experts + local_e_id
         sz = expert_sizes_x2_smem[bt_sem_id, 0, my_e_id]
         local_sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, my_e_id]
@@ -1132,7 +1244,7 @@ def _fused_ep_moe_kernel(
             raise RuntimeError("Unreachable")
 
     def start_fetch_se_tokens(bt_id):
-        if w1_shared_hbm is None:
+        if not enable_shared_expert or w1_shared_hbm is None:
             return
         bt_sem_id = bt_id & 1
         pltpu.make_async_copy(
@@ -1142,7 +1254,7 @@ def _fused_ep_moe_kernel(
         ).start()
 
     def wait_fetch_se_tokens(bt_id):
-        if w1_shared_hbm is None:
+        if not enable_shared_expert or w1_shared_hbm is None:
             return
         bt_sem_id = bt_id & 1
         pltpu.make_async_copy(
@@ -1916,13 +2028,14 @@ def _fused_ep_moe_kernel(
     start_fetch_and_wait_bias()
 
     def run_per_expert(local_e_id, e_sem_id, *, bt_sem_id, bt_start):
-        # Prefetch weights for CURRENT active expert.
-        # TODO(jevinjiang): It is hard to prefetch weights in previous iteration
-        # because the expert_ffn keeps overwriting the buffers. Triple buffering
-        # could resolve this but it takes more VMEM scratch. Need further
-        # experiment on this.
-        start_fetch_bw1(local_e_id, bw1_sem_id=0, bf_id=0, bd1_id=0)
-        start_fetch_bw3(local_e_id, bw3_sem_id=0, bf_id=0, bd3_id=0)
+        if enable_compute:
+            # Prefetch weights for CURRENT active expert.
+            # TODO(jevinjiang): It is hard to prefetch weights in previous iteration
+            # because the expert_ffn keeps overwriting the buffers. Triple buffering
+            # could resolve this but it takes more VMEM scratch. Need further
+            # experiment on this.
+            start_fetch_bw1(local_e_id, bw1_sem_id=0, bf_id=0, bd1_id=0)
+            start_fetch_bw3(local_e_id, bw3_sem_id=0, bf_id=0, bd3_id=0)
 
         # Next ids.
         next_e_sem_id = lax.select(e_sem_id == 0, 1, 0)
@@ -1946,8 +2059,26 @@ def _fused_ep_moe_kernel(
         # Wait a2a scatter for CURRENT active expert.
         wait_a2a_scatter_recv(bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=local_e_id)
 
-        # Perform FFN for CURRENT active expert.
-        expert_ffn(bt_sem_id, e_sem_id, local_e_id)
+        if enable_compute:
+            expert_ffn(bt_sem_id, e_sem_id, local_e_id)
+        else:
+            # Keep sem reuse consistent with the compute path: e_sem_id toggles,
+            # so the gather send for (local_e_id - 2) shares the same e_sem_id.
+            @pl.when(local_e_id >= 2)
+            def _():
+                wait_a2a_gather_send(
+                    bt_sem_id=bt_sem_id,
+                    e_sem_id=e_sem_id,
+                    local_e_id=local_e_id - 2,
+                )
+
+            e_id = my_id * local_num_experts + local_e_id
+            dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id].astype(jnp.int32)
+            pltpu.make_async_copy(
+                src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, dyn_sz)],
+                dst_ref=a2a_s_acc_x2_hbm.at[e_sem_id, pl.ds(0, dyn_sz)],
+                sem=a2a_acc_sems.at[0],
+            ).wait()
 
         # Start a2a gather to send back tokens for CURRENT active expert.
         start_a2a_gather(bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=local_e_id)
@@ -1958,7 +2089,7 @@ def _fused_ep_moe_kernel(
         return next_e_sem_id
 
     def run_shared_expert(bt_sem_id):
-        if w1_shared_hbm is None:
+        if not enable_shared_expert or w1_shared_hbm is None:
             return
 
         se_inter_size = w2_shared_hbm.shape[0]
@@ -2098,12 +2229,20 @@ def _fused_ep_moe_kernel(
             out_top_k_logits_vmem=top_k_logits_vmem,
         )
 
-        all_reduce_metadata(
-            bt_sem_id=bt_sem_id,
-            t2e_routing=t2e_routing,
-            starts=expert_starts,
-            sizes=expert_sizes,
-        )
+        if enable_comm:
+            all_reduce_metadata(
+                bt_sem_id=bt_sem_id,
+                t2e_routing=t2e_routing,
+                starts=expert_starts,
+                sizes=expert_sizes,
+            )
+        else:
+            write_local_metadata(
+                bt_sem_id=bt_sem_id,
+                t2e_routing=t2e_routing,
+                starts=expert_starts,
+                sizes=expert_sizes,
+            )
         sync_barrier()
 
         # Start a2a scatter for first active expert.
@@ -2376,6 +2515,7 @@ def _validate_fused_ep_moe_args(
     static_argnames=[
         "mesh",
         "top_k",
+        "perf_mode",
         "use_grouped_topk",
         "num_groups",
         "top_k_groups",
@@ -2389,7 +2529,7 @@ def _validate_fused_ep_moe_args(
         "balanced_topk",
     ],
 )
-def fused_ep_moe(
+def _fused_ep_moe_impl(
     mesh: jax.sharding.Mesh,
     tokens: jax.Array,  # (num_tokens, hidden_size)
     w1: jax.Array,  # (num_experts, hidden_size, intermediate_size)
@@ -2428,8 +2568,10 @@ def fused_ep_moe(
     block_config: FusedMoEBlockConfig | None = None,
     dp_axis_name: str = "data",
     tp_axis_name: str = "tensor",
+    perf_mode: str = "normal",
 ):
 
+    perf_mode = _canonicalize_fused_ep_moe_perf_mode(perf_mode)
     ep_size = get_ep_size(mesh, dp_axis_name, tp_axis_name)
     if block_config is None:
         from .tuned_block_configs import get_tuned_fused_moe_block_config
