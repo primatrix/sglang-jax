@@ -37,6 +37,7 @@ class WanModelConfig:
     max_text_len: int = 512
     num_frames: int = 11
     latent_size: tuple[int, int] = (60, 90)
+    latent_input_dim = 16
     num_inference_steps: int = 30
     guidance_scale: float = 5.0
 

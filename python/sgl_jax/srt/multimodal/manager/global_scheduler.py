@@ -138,7 +138,7 @@ class GlobalScheduler:
                             self.send_to_detokenizer.send_pyobj(stage_result)
                         else:
                             self.in_queues[i + 1].put_nowait(
-                                stage_result.to_stage_req(self.stage_configs[i].scheduler)
+                                stage_result.to_stage_req(self.stage_configs[i + 1].scheduler)
                             )
 
 

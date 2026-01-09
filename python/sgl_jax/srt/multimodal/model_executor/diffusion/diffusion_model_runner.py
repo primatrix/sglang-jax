@@ -4,6 +4,8 @@ import time
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax import NamedSharding
+from jax.sharding import PartitionSpec
 
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
@@ -18,6 +20,7 @@ from sgl_jax.srt.multimodal.models.diffusion_solvers.unipc_multistep_scheduler i
 from sgl_jax.srt.multimodal.models.wan2_1.diffusion.wan2_1_dit import (
     WanTransformer3DModel,
 )
+from sgl_jax.srt.utils.jax_utils import device_array
 
 logger = logging.getLogger(__name__)
 
@@ -74,9 +77,9 @@ class DiffusionModelRunner(BaseModelRunner):
         # Implement the diffusion model inference logic here
         # This might include steps like adding noise, denoising, etc.
 
-        num_inference_steps = batch.num_inference_steps
+        num_inference_steps = self.model_config.num_inference_steps
         # time_steps = batch.timesteps
-        text_embeds = batch.prompt_embeds
+        text_embeds = device_array(batch.prompt_embeds, NamedSharding(self.mesh, PartitionSpec()))
         print(f"{text_embeds=}")
         guidance_scale = batch.guidance_scale
         do_classifier_free_guidance = guidance_scale > 1.0
@@ -85,13 +88,13 @@ class DiffusionModelRunner(BaseModelRunner):
             (
                 1,
                 self.model_config.num_frames,
-                self.model_config.latent_size[0],
-                self.model_config.latent_size[1],
+                batch.width,
+                batch.height,
                 self.model_config.latent_input_dim,
             ),
             dtype=jnp.float32,
         )  # Placeholder for latents
-        latents = batch.latents
+        latents = device_array(batch.latents, NamedSharding(self.mesh, PartitionSpec()))
         solver_state: UniPCMultistepSchedulerState = self.solver.set_timesteps(
             self.solver_state,
             num_inference_steps=num_inference_steps,
