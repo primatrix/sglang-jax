@@ -589,6 +589,19 @@ class UMT5EncoderModel(nnx.Module):
 
     def load_weights(self, model_config: ModelConfig):
         """Load weights from HuggingFace checkpoint."""
+        import os
+        import glob
+        
+        original_path = model_config.model_path
+        is_local_path = os.path.isabs(original_path)
+        
+        if is_local_path and os.path.exists(original_path):
+            has_safetensors = len(glob.glob(os.path.join(original_path, "*.safetensors"))) > 0
+            has_text_encoder = os.path.exists(os.path.join(original_path, "text_encoder"))
+            
+            if not has_safetensors and has_text_encoder:
+                model_config.model_path = os.path.join(original_path, "text_encoder")
+        
         loader = WeightLoader(
             model=self,
             model_config=model_config,
