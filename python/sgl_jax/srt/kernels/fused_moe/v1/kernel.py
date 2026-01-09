@@ -952,8 +952,7 @@ def _fused_ep_moe_kernel(
             t_id, send_sz, e_sem_id=e_sem_id, local_e_id=local_e_id, bt_start=bt_start
         ):
             src_t_id = bt_start + t_id
-
-            def _scatter_k(k_id, send_sz):
+            for k_id in range(top_k):
                 e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
                 is_active_expert = e_id % local_num_experts == local_e_id
                 recv_id = e_id // local_num_experts
@@ -962,7 +961,7 @@ def _fused_ep_moe_kernel(
                 is_local = recv_id == my_id
                 local_sz = lax.select(is_local, sz, jnp.int32(0))
                 remote_sz = lax.select(is_local, jnp.int32(0), sz)
-                send_sz = send_sz + remote_sz
+                send_sz += remote_sz
                 expert_offsets_x2_smem[bt_sem_id, 0, e_id] = offset + local_sz + remote_sz
                 start = expert_starts_x2_smem[bt_sem_id, 0, e_id] + offset
                 pltpu.make_async_copy(
@@ -979,9 +978,8 @@ def _fused_ep_moe_kernel(
                         device_id=get_mesh_device_id(recv_id),
                         device_id_type=pltpu.DeviceIdType.MESH,
                     ).start()
-                return send_sz
 
-            return lax.fori_loop(0, top_k, _scatter_k, send_sz, unroll=False)
+            return send_sz
 
         send_sz = lax.fori_loop(
             0,
@@ -1983,8 +1981,7 @@ def _fused_ep_moe_kernel(
         def load_acc_bt_sync(*, tile_start):
             def _load_one(t_i, _):
                 t_id = tile_start + t_i
-
-                def _load_k(k_id, _):
+                for k_id in range(top_k):
                     e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
                     offset = expert_offsets_x2_smem[bt_sem_id, 1, e_id]
                     expert_offsets_x2_smem[bt_sem_id, 1, e_id] = offset + 1
@@ -1993,9 +1990,6 @@ def _fused_ep_moe_kernel(
                         dst_ref=a2a_g_acc_vmem.at[0, k_id, pl.ds(t_i, 1)],
                         sem=a2a_acc_sems.at[0],
                     ).start()
-                    return None
-
-                lax.fori_loop(0, top_k, _load_k, None, unroll=False)
                 return None
 
             lax.fori_loop(0, acc_bt, _load_one, None, unroll=False)
@@ -2012,13 +2006,10 @@ def _fused_ep_moe_kernel(
                 pl.ds(tile_start, acc_bt),
                 pl.ds(0, top_k),
             ][...]
-
-            def _acc_k(k_id, output_tile):
+            for k_id in range(top_k):
                 acc_tile = a2a_g_acc_vmem[0, k_id, :acc_bt].astype(jnp.float32)
                 logits = logits_tile[:, k_id].reshape(acc_bt, 1, 1)
-                return output_tile + acc_tile * logits
-
-            output_tile = lax.fori_loop(0, top_k, _acc_k, output_tile, unroll=False)
+                output_tile += acc_tile * logits
 
             out_offset = pl.multiple_of(out_offset, 16)
             b_output_x2_vmem.at[out_buf_id, pl.ds(out_offset, acc_bt), pl.ds(0, hidden_size)][
