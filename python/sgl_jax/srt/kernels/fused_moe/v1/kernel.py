@@ -596,6 +596,13 @@ def _fused_ep_moe_kernel(
     enable_compute = perf_mode != "a2a_only"
     local_topk_only = perf_mode == "comp_only"
     enable_shared_expert = perf_mode == "normal"
+    jax.debug.print(
+        "enable_comm: {enable_comm}, enable_compute: {enable_compute}, local_topk_only: {local_topk_only}, enable_shared_expert: {enable_shared_expert}",
+        enable_comm=enable_comm,
+        enable_compute=enable_compute,
+        local_topk_only=local_topk_only,
+        enable_shared_expert=enable_shared_expert,
+    )
 
     h_per_t_packing = hidden_size // t_packing
     assert tokens_hbm.shape[-1] == h_per_t_packing
