@@ -73,27 +73,25 @@ def _estimate_vmem_bytes(
     weight_bytes = token_bytes
 
     t_packing = _dtype_packing(dtype)
-    local_num_tokens = case.num_tokens // case.ep_size
     padded_num_experts = ((case.num_experts + 127) // 128) * 128
     padded_top_k = ((case.top_k + 127) // 128) * 128
-    output_bt = math.gcd(bt, local_num_tokens)
-    # With run_bt tiling, the a2a scratch only needs to cover one `output_bt` tile
-    # (across all EP devices), padded up to a multiple of `bts` for safe token staging.
-    a2a_max_tokens = ((output_bt * num_devices + bts - 1) // bts) * bts
+    # Kernel scratch shapes use bt directly.
+    # a2a_max_tokens = align_to(bt * num_devices, bts)
+    a2a_max_tokens = ((bt * num_devices + bts - 1) // bts) * bts
 
     # Output-side staging (no overlap):
-    # - a2a_g_acc_vmem: (1, top_k, acc_bt, hidden_size)
-    # - b_output: (1, output_bt, hidden_size)
-    acc_bt = math.gcd(output_bt, 8)  # Must match fused_moe kernel scratch shape.
+    # - a2a_g_acc_vmem: (1, top_k, gcd(bt, 16), t_packing, hidden_per_pack)
+    # - b_output_x2_vmem: (2, bt, hidden_size)
+    acc_bt = math.gcd(bt, 16)  # Must match fused_moe kernel scratch shape.
     a2a_g_acc = 1 * top_k * acc_bt * hidden * token_bytes
     # b_output_x2_vmem is double-buffered to overlap store(output_hbm) with next bt's compute.
-    b_output = 2 * output_bt * hidden * token_bytes
-    # b_gating_vmem is double-buffered for run_bt overlap.
-    b_gating = 2 * output_bt * padded_num_experts * token_bytes
+    b_output = 2 * bt * hidden * token_bytes
+    # b_gating_x2_vmem is double-buffered for run_bt overlap: (2, bt, padded_num_experts)
+    b_gating = 2 * bt * padded_num_experts * token_bytes
     # t2e_routing_smem scratch is placed in SMEM (not VMEM).
     t2e_routing = 0
-    # top_k_logits_vmem scratch: (output_bt, top_k) float32
-    top_k_logits = output_bt * top_k * 4
+    # top_k_logits_vmem scratch: (bt, top_k) float32
+    top_k_logits = bt * top_k * 4
 
     # See kernel scratch shapes: b_w1_x2_vmem/b_w3_x2_vmem/b_w2_x2_vmem.
     w1 = 2 * bd1 * bf * weight_bytes
@@ -109,17 +107,17 @@ def _estimate_vmem_bytes(
 
     # Routing / top-k temporaries in kernel (best-effort conservative estimate):
     # - softmax + get_top_k use float32 work buffers and broadcasted iotas
-    # - top_k logits are materialized as `top_k` arrays of shape (output_bt, padded_top_k)
+    # - top_k logits are materialized as `top_k` arrays of shape (bt, padded_top_k)
     # This is separate from `t2e_routing_smem` above.
-    routing_work_f32 = output_bt * padded_num_experts * 4  # softmax result (approx)
-    get_top_k_input_f32 = output_bt * padded_num_experts * 4
-    get_top_k_t2e = output_bt * padded_num_experts * 4
-    get_top_k_iota = output_bt * padded_num_experts * 4
-    get_top_k_mask = output_bt * padded_num_experts * 4
-    get_top_k_padded_iota = output_bt * padded_top_k * 4
-    get_top_k_t2e_routing = output_bt * padded_top_k * 4
-    get_top_k_logits_sum = output_bt * padded_top_k * 4
-    get_top_k_logits_lst = top_k * output_bt * padded_top_k * 4
+    routing_work_f32 = bt * padded_num_experts * 4  # softmax result (approx)
+    get_top_k_input_f32 = bt * padded_num_experts * 4
+    get_top_k_t2e = bt * padded_num_experts * 4
+    get_top_k_iota = bt * padded_num_experts * 4
+    get_top_k_mask = bt * padded_num_experts * 4
+    get_top_k_padded_iota = bt * padded_top_k * 4
+    get_top_k_t2e_routing = bt * padded_top_k * 4
+    get_top_k_logits_sum = bt * padded_top_k * 4
+    get_top_k_logits_lst = top_k * bt * padded_top_k * 4
     routing_temporaries = (
         routing_work_f32
         + get_top_k_input_f32

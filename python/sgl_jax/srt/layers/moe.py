@@ -638,7 +638,6 @@ class FusedEPMoE(nnx.Module):
         router_bias: jax.Array | None = None,
         *,
         block_config: FusedMoEBlockConfig | None = None,
-        a2a_only: bool = False,
     ) -> jax.Array:
         """
         Forward pass through the fused MoE layer.
@@ -707,11 +706,4 @@ class FusedEPMoE(nnx.Module):
 
         # 如果 padded_num_experts 多于实际的 num_experts，截断它
         total_expert_counts = total_expert_counts[: self.num_experts]
-
-        # 将 count 也 reshard 到一个确定的 sharding 上（通常是全复制 P() 方便后续分析）
-        jax.debug.print(
-            "total_expert_counts: {total_expert_counts}, hidden_states.shape: {shape}",
-            total_expert_counts=total_expert_counts,
-            shape=hidden_states.shape,
-        )
         return output, total_expert_counts
