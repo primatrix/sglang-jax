@@ -7,6 +7,7 @@ import psutil
 
 from sgl_jax.srt.managers.communication import QueueBackend
 from sgl_jax.srt.managers.scheduler import Scheduler as AutoRegressiveScheduler
+from sgl_jax.srt.models.umt5 import UMT5EncoderModel
 from sgl_jax.srt.multimodal.manager.device_manager import DeviceManager
 from sgl_jax.srt.multimodal.manager.scheduler.diffusion_scheduler import (
     DiffusionScheduler,
@@ -19,7 +20,6 @@ from sgl_jax.srt.multimodal.models.wan2_1.diffusion.wan2_1_dit import (
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.utils import get_exception_traceback
-from sgl_jax.srt.models.umt5 import UMT5EncoderModel
 
 logger = logging.getLogger(__name__)
 

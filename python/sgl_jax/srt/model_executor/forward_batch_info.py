@@ -307,15 +307,15 @@ class ForwardBatch:
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)
         is_embedding = getattr(model_runner.model_config, "is_embedding", False)
         architectures = getattr(model_runner.model_config.hf_config, "architectures", [])
-        
+
         needs_mask = need_attention_mask(architectures, is_embedding)
-        
+
         if needs_mask:
             hf_config = model_runner.model_config.hf_config
             pad_token_id = getattr(hf_config, "pad_token_id", 0)
             if pad_token_id is None:
                 pad_token_id = 0
-            
+
             # Generate mask: 1 for valid tokens, 0 for padding
             obj.attention_mask = (obj.input_ids != pad_token_id).astype(jnp.int32)
 

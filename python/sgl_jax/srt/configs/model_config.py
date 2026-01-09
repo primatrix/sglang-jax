@@ -559,17 +559,17 @@ ENCODER_ONLY_MODELS = [
 def need_attention_mask(model_architectures: list[str], is_embedding: bool = False) -> bool:
     """
     Determine if a model needs attention_mask for handling padding tokens.
-    
+
     Args:
         model_architectures: List of model architecture names from HF config
         is_embedding: Whether --is-embedding flag is set
-    
+
     Returns:
         True if the model needs attention_mask (Encoder-only or Embedding models)
     """
     if is_embedding:
         return True
-    
+
     return any(arch in ENCODER_ONLY_MODELS for arch in model_architectures)
 
 

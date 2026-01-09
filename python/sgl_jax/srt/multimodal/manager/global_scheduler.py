@@ -9,12 +9,12 @@ import psutil
 import setproctitle
 import zmq
 
+from sgl_jax.srt.managers.io_struct import AbortReq
 from sgl_jax.srt.multimodal.manager.device_manager import DeviceManager
 from sgl_jax.srt.multimodal.manager.io_struct import TokenizedGenerateMMReqInput
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.manager.stage import Stage
 from sgl_jax.srt.multimodal.manager.utils import load_stage_configs_from_yaml
-from sgl_jax.srt.managers.io_struct import AbortReq
 from sgl_jax.srt.multimodal.models.static_configs import get_stage_config_path
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils import configure_logger, kill_itself_when_parent_died
@@ -74,7 +74,7 @@ class GlobalScheduler:
 
     def handle_abort_request(self, abort_req: AbortReq):
         """Handle abort request from client."""
-        logger.info(f"Received abort request for rid={abort_req.rid}")
+        logger.info("Received abort request for rid=%s", abort_req.rid)
         # For now, just log and return None
         # TODO: Forward abort to stages if needed
         return None
@@ -87,8 +87,8 @@ class GlobalScheduler:
             input_ids=input.input_ids,
             negative_input_ids=input.negative_input_ids,
             num_outputs_per_prompt=input.n,
-            height_latents=int(size_str.split("*")[0]),
-            width_latents=int(size_str.split("*")[1]),
+            height=int(size_str.split("*")[0]),
+            width=int(size_str.split("*")[1]),
             num_frames=input.num_frames,
             data_type=input.data_type,
             save_output=input.save_output,
@@ -131,7 +131,9 @@ class GlobalScheduler:
                 for req in reqs:
                     dispatched_req = self._request_dispatcher(req)
                     if dispatched_req is not None:
-                        self.in_queues[0].put_nowait(dispatched_req.to_stage_req(self.stage_configs[0].scheduler))
+                        self.in_queues[0].put_nowait(
+                            dispatched_req.to_stage_req(self.stage_configs[0].scheduler)
+                        )
             else:
                 for i, stage in enumerate(self.stage_list):
                     stage_result = Req.from_stage(stage.try_collect(), self.req_store)
@@ -149,7 +151,7 @@ class GlobalScheduler:
                             self.send_to_detokenizer.send_pyobj(stage_result)
                         else:
                             self.in_queues[i + 1].put_nowait(
-                                stage_result.to_stage_req(self.stage_configs[i].scheduler)
+                                stage_result.to_stage_req(self.stage_configs[i + 1].scheduler)
                             )
 
 

@@ -175,7 +175,7 @@ class Req:
             if stage_result.rids[0] not in req_store:
                 raise RuntimeError(f"{stage_result.rids[0]} is not in req_store")
             req = req_store[stage_result.rids[0]]
-            req.prompt_embeds = stage_result.output_hidden_states
+            req.prompt_embeds = stage_result.output_hidden_states[0][0]
             return req
         else:
             return stage_result
