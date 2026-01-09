@@ -204,6 +204,7 @@ def to_mappings(num_layers: int = 30) -> dict[str, WeightMapping]:
     )
 
     # Self-Attention Residual Norm (norm2 in HF -> self_attn_residual_norm in JAX)
+    # Note: blocks.*.norm1 in HF has elementwise_affine=False, so no weights to load
     mappings["blocks.*.norm2.weight"] = WeightMapping(
         target_path="blocks.*.self_attn_residual_norm.norm.scale",
         sharding=(None,),

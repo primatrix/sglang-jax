@@ -1,10 +1,13 @@
 import logging
 import time
+from functools import partial
 
 import jax
 import jax.numpy as jnp
+from flax import nnx
 from jax import NamedSharding
 from jax.sharding import PartitionSpec
+
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_loader.loader import JAXModelLoader, get_model_loader
@@ -14,7 +17,6 @@ from sgl_jax.srt.multimodal.models.diffusion_solvers.unipc_multistep_scheduler i
     UniPCMultistepScheduler,
     UniPCMultistepSchedulerState,
 )
-
 from sgl_jax.srt.utils.jax_utils import device_array
 
 logger = logging.getLogger(__name__)
@@ -72,6 +74,55 @@ class DiffusionModelRunner(BaseModelRunner):
         )
         self.solver_state = self.solver.create_state()
         # Any additional initialization specific to diffusion models
+        self.initialize_jit()
+
+    def initialize_jit(self):
+        model_def, model_state = nnx.split(self.model)
+        model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
+
+        @partial(
+            jax.jit,
+            static_argnames=["model_state_def"],
+        )
+        def forward_model(
+            model_def,
+            model_state_def,
+            model_state_leaves,
+            hidden_states,
+            encoder_hidden_states,
+            timesteps,
+            encoder_hidden_states_image,
+            guidance_scale,
+        ):
+            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            model = nnx.merge(model_def, model_state)
+            return model(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                timesteps=timesteps,
+                encoder_hidden_states_image=encoder_hidden_states_image,
+                guidance_scale=guidance_scale,
+            )
+
+        def forward_wrapper(
+            hidden_states,
+            encoder_hidden_states,
+            timesteps,
+            encoder_hidden_states_image,
+            guidance_scale,
+        ):
+            return forward_model(
+                model_def,
+                model_state_def,
+                model_state_leaves,
+                hidden_states,
+                encoder_hidden_states,
+                timesteps,
+                encoder_hidden_states_image,
+                guidance_scale,
+            )
+
+        self.jitted_forward = forward_wrapper
 
     def forward(self, batch: Req, mesh: jax.sharding.Mesh):
         # Implement the diffusion model inference logic here
@@ -79,7 +130,9 @@ class DiffusionModelRunner(BaseModelRunner):
 
         num_inference_steps = self.model_config.num_inference_steps
         # time_steps = batch.timesteps
-        text_embeds = device_array(batch.prompt_embeds, sharding=NamedSharding(self.mesh, PartitionSpec()))
+        text_embeds = device_array(
+            batch.prompt_embeds, sharding=NamedSharding(self.mesh, PartitionSpec())
+        )
         print(f"{text_embeds=}")
         guidance_scale = batch.guidance_scale
         do_classifier_free_guidance = guidance_scale > 1.0
@@ -110,7 +163,7 @@ class DiffusionModelRunner(BaseModelRunner):
             # Transpose to channel-first (B, T, H, W, C) -> (B, C, T, H, W) for model
             latents_cf = latents.transpose(0, 4, 1, 2, 3)
             # Perform denoising step
-            noise_pred: jax.Array = self.model(
+            noise_pred: jax.Array = self.jitted_forward(
                 hidden_states=latents_cf,
                 encoder_hidden_states=text_embeds,
                 timesteps=t_batch,

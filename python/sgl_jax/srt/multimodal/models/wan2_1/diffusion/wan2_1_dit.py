@@ -68,7 +68,9 @@ class WanTransformerBlock(nnx.Module):
     ):
         super().__init__()
 
-        self.norm1 = FP32LayerNorm(num_features=dim, epsilon=epsilon, rngs=nnx.Rngs(0))
+        self.norm1 = FP32LayerNorm(
+            num_features=dim, epsilon=epsilon, use_scale=False, use_bias=False, rngs=nnx.Rngs(0)
+        )
 
         self.to_q = LinearBase(
             input_size=dim, output_size=dim, use_bias=True, mesh=mesh, kernel_axes=(None, None)
@@ -608,12 +610,12 @@ class WanTransformer3DModel(nnx.Module):
 
         # 4. Transformer blocks
         print("[5] blocks")
-        # freqs_cis = (freqs_cos, freqs_sin)
+        freqs_cis = (freqs_cos, freqs_sin)
         for i, block in enumerate(self.blocks):
             print(f"  [5.{i}] block {i}")
-            # hidden_states = block(
-            #     hidden_states, encoder_hidden_states, timestep_proj, freqs_cis, req
-            # )
+            hidden_states = block(
+                hidden_states, encoder_hidden_states, timestep_proj, freqs_cis, req
+            )
 
         # 5. Output norm, projection & unpatchify
         print("[6] norm_out")
