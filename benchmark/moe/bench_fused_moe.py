@@ -693,8 +693,8 @@ def parse_args() -> argparse.Namespace:
         "--perf-mode",
         type=str,
         default=None,
-        choices=["normal", "latency"],
-        help="Performance mode for the fused_moe kernel (default: auto from env or 'normal').",
+        choices=["normal", "a2a_only", "comp_only"],
+        help="Performance mode for the fused_moe kernel: normal (default), a2a_only, comp_only.",
     )
     return parser.parse_args()
 
