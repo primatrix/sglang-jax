@@ -2405,7 +2405,7 @@ def fused_ep_moe_routing_stats(
     @jax.shard_map(
         mesh=mesh,
         in_specs=(P(ep_axis_name, None),),
-        out_specs=(P(), P(), P(), P(), P()),
+        out_specs=(P(), P(), P(), P()),
         check_vma=False,
     )
     def _stats(router_logits_shard: jax.Array):
