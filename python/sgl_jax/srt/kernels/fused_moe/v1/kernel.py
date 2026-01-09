@@ -949,7 +949,7 @@ def _fused_ep_moe_kernel(
         # `bt_size * top_k`, independent of routing distribution. Drain it by
         # waiting `top_k` times on a `bt_size` slice.
         for k in range(top_k):
-            ref = a2a_g_hbm.at[k, pl.ds(0, bt_size)]
+            ref = a2a_g_hbm.at[0, pl.ds(0, bt_size)]
             pltpu.make_async_copy(
                 src_ref=ref,
                 dst_ref=ref,
@@ -1833,10 +1833,10 @@ def _fused_ep_moe_kernel(
         wait_a2a_gather_recv_all(bt_size=bt)
         sync_barrier()
 
-        out_buf_id = bt_id & jnp.int32(1)
+        # out_buf_id = bt_id & jnp.int32(1)
         wait_store_output(bt_id=bt_id - 2)
         # Accumulate results for current bt into b_output_x2_vmem, then start async send to output_hbm.
-        acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
+        # acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
         start_send_bo(bt_id=bt_id)
 
         # Drain the last outstanding gather sends (the loop body waits `local_e_id - 2`).
