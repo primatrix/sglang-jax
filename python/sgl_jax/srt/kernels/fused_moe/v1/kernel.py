@@ -231,6 +231,24 @@ def broadcast_minor(src, shape):
     ]
 
 
+def safe_softmax(x: jax.Array, *, axis: int = -1) -> jax.Array:
+    """NaN-safe softmax.
+
+    Mosaic/TPU kernels can crash if routing logits contain NaNs/Infs (e.g. NaNs in
+    `softmax` -> repeated argmax -> oversized dispatch counts). This implementation
+    treats non-finite inputs as -inf and returns all-zeros when the normalization
+    term is 0.
+    """
+    x = x.astype(jnp.float32)
+    x = jnp.where(jnp.isfinite(x), x, -jnp.inf)
+    x_max = jnp.max(x, axis=axis, keepdims=True)
+    exp = jnp.exp(x - x_max)
+    exp = jnp.where(jnp.isfinite(exp), exp, 0.0)
+    denom = jnp.sum(exp, axis=axis, keepdims=True)
+    denom_safe = jnp.where(denom > 0.0, denom, 1.0)
+    return exp / denom_safe
+
+
 def swigluoai(
     gate: jax.Array, up: jax.Array, *, alpha: float = 1.702, limit: float = 7.0
 ) -> jax.Array:
@@ -700,6 +718,7 @@ def _fused_ep_moe_kernel(
 
         assert len(input.shape) == 2, input.shape
         input = input.astype(jnp.float32)
+        input = jnp.where(jnp.isfinite(input), input, -jnp.inf)
         if disable_a2a:
             local_start = my_id * local_num_experts
             local_end = local_start + local_num_experts
@@ -1802,7 +1821,7 @@ def _fused_ep_moe_kernel(
         wait_fetch_b_gating(bt_id=bt_id)
 
         b_gating = b_gating_x2_vmem.at[bt_sem_id][...]
-        b_gating_score = jax.nn.softmax(b_gating.astype(jnp.float32), axis=-1)
+        b_gating_score = safe_softmax(b_gating, axis=-1)
         t2e_routing, expert_sizes, expert_starts = get_top_k(
             b_gating_score,
             top_k,
@@ -1811,6 +1830,15 @@ def _fused_ep_moe_kernel(
             bt_start=bt_start,
         )
 
+        # Defensive diagnostics: if the same token is routed to the same expert multiple
+        # times (typically from non-finite router outputs), a single expert can exceed
+        # `bt` tokens per device and overflow the a2a scratch sized by `bt * num_devices`.
+        max_local_expert_size = jnp.max(expert_sizes[0, :num_experts])
+
+        @pl.when(max_local_expert_size > bt)
+        def _():
+            pl.debug_print("fused_moe: local expert_size max {}", max_local_expert_size)
+
         all_reduce_metadata(
             bt_sem_id=bt_sem_id,
             t2e_routing=t2e_routing,
@@ -1818,6 +1846,12 @@ def _fused_ep_moe_kernel(
             sizes=expert_sizes,
         )
         sync_barrier()
+
+        max_global_expert_size = jnp.max(expert_sizes_x2_smem[bt_sem_id, 0, :num_experts])
+
+        @pl.when(max_global_expert_size > (bt * num_devices))
+        def _():
+            pl.debug_print("fused_moe: global expert_size max {}", max_global_expert_size)
 
         # Start a2a scatter for first active expert.
         start_a2a_scatter(bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=0, bt_start=bt_start)
