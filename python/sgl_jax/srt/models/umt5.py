@@ -20,6 +20,7 @@ from typing import Any, Optional, Dict
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P, NamedSharding
 from flax import nnx
 from transformers import UMT5Config
 
@@ -284,7 +285,7 @@ class UMT5Attention(nnx.Module):
         
         # Project queries
         q, _ = self.q(hidden_states)
-
+        
         # Get K/V from encoder (cross-attn) or input (self-attn)
         if self.is_cross_attention:
             # Cross-attention: K/V from encoder output
@@ -624,9 +625,23 @@ class UMT5EncoderModel(nnx.Module):
     ):
         x = forward_batch.input_ids
         mask = getattr(forward_batch, "attention_mask", None)
+        
+        # Reshape 1D input_ids to (batch_size, seq_len) for Encoder
+        if x.ndim == 1:
+            if hasattr(forward_batch, 'req_pool_indices'):
+                bs = forward_batch.req_pool_indices.shape[0]
+                total_tokens = x.shape[0]
+                if total_tokens % bs == 0:
+                    seq_len = total_tokens // bs
+                    x = x.reshape(bs, seq_len)
+                    # Reshape mask to match input_ids if it exists
+                    if mask is not None and mask.ndim == 1:
+                        mask = mask.reshape(bs, seq_len)
+        
         deterministic = getattr(forward_batch, "deterministic", True)
             
         hidden_states = self.shared(x)
+        
         hidden_states = self.encoder(
             hidden_states, 
             mask=mask, 
@@ -635,10 +650,16 @@ class UMT5EncoderModel(nnx.Module):
             token_to_kv_pool=token_to_kv_pool
         )
         
-        # Return standard ModelRunner interface format
-        # Encoder models don't produce logits, so we return dummy logits
+        # Create dummy logits to satisfy sampler interface
+        bs = forward_batch.req_pool_indices.shape[0] if hasattr(forward_batch, 'req_pool_indices') else x.shape[0]
+        dummy_logits = jnp.zeros((bs, self.config.vocab_size), dtype=self.dtype)
+        
+        # Apply tensor-parallel sharding
+        sharding = NamedSharding(self.mesh, P(None, "tensor"))
+        dummy_logits = jax.device_put(dummy_logits, sharding)
+        
         return LogitsProcessorOutput(
-            next_token_logits=jnp.empty((0, 0), dtype=self.dtype),
+            next_token_logits=dummy_logits,
             hidden_states=hidden_states,
         ), [], []
 

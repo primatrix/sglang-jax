@@ -528,6 +528,50 @@ multimodal_model_archs = [
 ]
 
 
+# Models that require attention_mask for padding token handling
+# These are typically Encoder-only or Embedding models
+ENCODER_ONLY_MODELS = [
+    # UMT5 Encoder variants
+    "UMT5EncoderModel",
+    "T5EncoderModel",
+    # BERT family
+    "BertModel",
+    "BertForSequenceClassification",
+    "XLMRobertaModel",
+    "XLMRobertaForSequenceClassification",
+    # CLIP components
+    "CLIPTextModel",
+    "CLIPVisionModel",
+    # Other Encoders
+    "Contriever",
+    # Embedding models
+    "LlamaEmbeddingModel",
+    "MistralModel",
+    "LlamaForSequenceClassification",
+    "LlamaForSequenceClassificationWithNormal_Weights",
+    "InternLM2ForRewardModel",
+    "Qwen2ForRewardModel",
+    "Qwen2ForSequenceClassification",
+]
+
+
+def need_attention_mask(model_architectures: list[str], is_embedding: bool = False) -> bool:
+    """
+    Determine if a model needs attention_mask for handling padding tokens.
+    
+    Args:
+        model_architectures: List of model architecture names from HF config
+        is_embedding: Whether --is-embedding flag is set
+    
+    Returns:
+        True if the model needs attention_mask (Encoder-only or Embedding models)
+    """
+    if is_embedding:
+        return True
+    
+    return any(arch in ENCODER_ONLY_MODELS for arch in model_architectures)
+
+
 class MockModelConfig(ModelConfig):
     def __init__(
         self,

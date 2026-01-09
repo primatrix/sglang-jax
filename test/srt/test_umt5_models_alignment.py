@@ -77,8 +77,26 @@ def get_jax_dtype(precision: str):
     return dtype_map[precision]
 
 
-def create_dummy_forward_batch(input_ids, mesh, forward_mode=ForwardMode.EXTEND):
-    """Create a minimal ForwardBatch for testing."""
+def create_dummy_forward_batch(
+    input_ids, 
+    mesh, 
+    forward_mode=ForwardMode.EXTEND,
+    pad_token_id=0,
+    auto_generate_mask=False
+):
+    """
+    Create a minimal ForwardBatch for testing.
+    
+    Args:
+        input_ids: Input token IDs, shape (batch_size, seq_len)
+        mesh: JAX device mesh
+        forward_mode: Forward mode (EXTEND or DECODE)
+        pad_token_id: Padding token ID for mask generation
+        auto_generate_mask: If True, automatically generate attention_mask
+    
+    Returns:
+        ForwardBatch with optional attention_mask
+    """
     batch_size, seq_len = input_ids.shape
     
     # Dummy data
@@ -95,7 +113,7 @@ def create_dummy_forward_batch(input_ids, mesh, forward_mode=ForwardMode.EXTEND)
         out_cache_loc = jnp.array(out_cache_loc)
         positions = jnp.array(positions)
 
-    return ForwardBatch(
+    forward_batch = ForwardBatch(
         bid=0,
         forward_mode=forward_mode,
         batch_size=batch_size,
@@ -105,6 +123,13 @@ def create_dummy_forward_batch(input_ids, mesh, forward_mode=ForwardMode.EXTEND)
         out_cache_loc=out_cache_loc,
         positions=positions,
     )
+    
+    # Auto-generate attention mask if requested
+    if auto_generate_mask:
+        attention_mask = (input_ids != pad_token_id).astype(jnp.int32)
+        forward_batch.attention_mask = attention_mask
+    
+    return forward_batch
 
 
 class CompilationProgressTracker:
@@ -471,6 +496,321 @@ def test_encoder_alignment(model_name, mesh, tokenizer, precision="float32"):
     return passed, mae
 
 
+def test_encoder_alignment_batch(model_name, mesh, tokenizer, precision="float32"):
+    """Test UMT5EncoderModel alignment with batched inputs (different lengths, with padding)"""
+    logger.info("\n" + "=" * 80)
+    logger.info("Testing UMT5EncoderModel Batch Alignment (Multiple Sequences with Padding)")
+    logger.info("=" * 80)
+
+    # Load HF Encoder
+    hf_config = UMT5Config.from_pretrained(model_name)
+    hf_full_model = HFUMt5Model.from_pretrained(
+        model_name, attn_implementation="eager", dtype=get_torch_dtype(precision)
+    )
+    hf_full_model.eval()
+
+    # Create JAX Encoder
+    with jax.set_mesh(mesh):
+        jax_encoder = JAXUMt5EncoderModel(
+            config=hf_config,
+            mesh=mesh,
+            dtype=get_jax_dtype(precision),
+        )
+
+    # Load weights
+    load_weights_from_hf(jax_encoder, hf_full_model, model_name, mesh=mesh, precision=precision)
+
+    # Create test inputs with different lengths
+    texts = [
+        "Short",  # ~2 tokens
+        "Medium length text here",  # ~5 tokens
+        "A much longer text sequence for comprehensive batch testing"  # ~11 tokens
+    ]
+    
+    logger.info(f"📊 Testing with {len(texts)} sequences of varying lengths:")
+    for i, text in enumerate(texts):
+        logger.info(f"  Sequence {i+1}: '{text}'")
+    
+    # HF tokenizer processing (automatic padding to max length in batch)
+    inputs = tokenizer(texts, return_tensors="pt", padding=True)
+    pt_input_ids = inputs.input_ids
+    pt_attention_mask = inputs.attention_mask
+    
+    logger.info(f"📊 Batch shape: {pt_input_ids.shape}, Padding token: {tokenizer.pad_token_id or 0}")
+    logger.info(f"📊 Attention mask:\n{pt_attention_mask.numpy()}")
+
+    # Convert to JAX
+    jax_input_ids = jnp.array(pt_input_ids.numpy())
+    pad_token_id = tokenizer.pad_token_id or 0
+    
+    # Method 1: Manual mask setting (for verification)
+    forward_batch_manual = create_dummy_forward_batch(jax_input_ids, mesh, ForwardMode.EXTEND)
+    forward_batch_manual.attention_mask = jnp.array(pt_attention_mask.numpy())
+    
+    # Method 2: Auto-generate mask (simulating production environment)
+    forward_batch_auto = create_dummy_forward_batch(
+        jax_input_ids, mesh, ForwardMode.EXTEND,
+        pad_token_id=pad_token_id,
+        auto_generate_mask=True
+    )
+    
+    # Verify mask consistency
+    mask_match = jnp.allclose(forward_batch_auto.attention_mask, pt_attention_mask.numpy())
+    logger.info(f"🔍 Auto-generated mask matches HF mask: {'✅ YES' if mask_match else '❌ NO'}")
+    if not mask_match:
+        logger.error("❌ Mask generation mismatch detected!")
+        logger.error(f"HF mask:\n{pt_attention_mask.numpy()}")
+        logger.error(f"Auto mask:\n{forward_batch_auto.attention_mask}")
+        return False, float('inf')
+
+    # Run inference with HF
+    with torch.no_grad():
+        pt_encoder_output = hf_full_model.encoder(
+            input_ids=pt_input_ids, attention_mask=pt_attention_mask
+        ).last_hidden_state
+
+    # Run inference with JAX
+    with CompilationProgressTracker("Compiling JAX encoder for batch"):
+        with jax.set_mesh(mesh):
+            jax_encoder_output_obj, _, _ = jax_encoder(
+                forward_batch=forward_batch_auto,  # Use auto-generated mask
+            )
+            jax_encoder_output = jax_encoder_output_obj.hidden_states
+
+    # Per-sequence comparison (only compare valid tokens, excluding padding)
+    logger.info("\n=== Per-Sequence Alignment Results ===")
+    all_passed = True
+    sequence_maes = []
+    
+    for i in range(len(texts)):
+        # Get valid length for this sequence
+        valid_len = int(pt_attention_mask[i].sum().item())
+        
+        # Extract valid portion (exclude padding)
+        pt_seq = pt_encoder_output[i, :valid_len, :]
+        jax_seq = jax_encoder_output[i, :valid_len, :]
+        
+        # Compare
+        mae, max_diff, rel_err = compare_outputs(
+            pt_seq, jax_seq, f"Sequence {i+1} (valid_len={valid_len})", threshold=1e-4
+        )
+        sequence_maes.append(mae)
+        
+        seq_passed = mae < 1e-4
+        if not seq_passed:
+            all_passed = False
+            logger.error(f"❌ Sequence {i+1} alignment FAILED")
+        else:
+            logger.info(f"✅ Sequence {i+1} alignment PASSED")
+    
+    # Overall statistics
+    avg_mae = np.mean(sequence_maes)
+    max_mae = np.max(sequence_maes)
+    
+    logger.info(f"\n📊 Batch Alignment Summary:")
+    logger.info(f"  Average MAE across sequences: {avg_mae:.10e}")
+    logger.info(f"  Max MAE across sequences: {max_mae:.10e}")
+    logger.info(f"  All sequences passed: {'✅ YES' if all_passed else '❌ NO'}")
+    
+    if all_passed:
+        logger.info("✅ Encoder batch alignment PASSED")
+    else:
+        logger.error(f"❌ Encoder batch alignment FAILED")
+
+    return all_passed, avg_mae
+
+
+def test_attention_mask_generation(model_name, mesh, tokenizer, precision="float32"):
+    """Test that auto-generated attention_mask matches HF tokenizer output"""
+    logger.info("\n" + "=" * 80)
+    logger.info("Testing Attention Mask Generation Logic")
+    logger.info("=" * 80)
+
+    pad_token_id = tokenizer.pad_token_id or 0
+    logger.info(f"📊 Padding token ID: {pad_token_id}")
+    
+    # Test Case 1: Standard padding (different lengths)
+    logger.info("\n--- Test Case 1: Standard Padding (Right-side padding) ---")
+    texts_case1 = ["Hello", "Hello world", "Hello world, how are you?"]
+    inputs1 = tokenizer(texts_case1, return_tensors="pt", padding=True)
+    
+    hf_mask_1 = inputs1.attention_mask.numpy()
+    input_ids_1 = jnp.array(inputs1.input_ids.numpy())
+    auto_mask_1 = (input_ids_1 != pad_token_id).astype(jnp.int32)
+    
+    case1_passed = np.allclose(auto_mask_1, hf_mask_1)
+    logger.info(f"  Input shape: {input_ids_1.shape}")
+    logger.info(f"  HF mask:\n{hf_mask_1}")
+    logger.info(f"  Auto mask:\n{auto_mask_1}")
+    logger.info(f"  Match: {'✅ YES' if case1_passed else '❌ NO'}")
+    
+    # Test Case 2: No padding (all sequences same length)
+    logger.info("\n--- Test Case 2: No Padding (Same length sequences) ---")
+    texts_case2 = ["Hello world", "Goodbye now"]
+    inputs2 = tokenizer(texts_case2, return_tensors="pt", padding=True)
+    
+    hf_mask_2 = inputs2.attention_mask.numpy()
+    input_ids_2 = jnp.array(inputs2.input_ids.numpy())
+    auto_mask_2 = (input_ids_2 != pad_token_id).astype(jnp.int32)
+    
+    case2_passed = np.allclose(auto_mask_2, hf_mask_2)
+    expected_all_ones = np.all(hf_mask_2 == 1)
+    logger.info(f"  Input shape: {input_ids_2.shape}")
+    logger.info(f"  All masks are 1 (no padding): {'✅ YES' if expected_all_ones else '❌ NO'}")
+    logger.info(f"  Match: {'✅ YES' if case2_passed else '❌ NO'}")
+    
+    # Test Case 3: Single sequence (no batch)
+    logger.info("\n--- Test Case 3: Single Sequence ---")
+    texts_case3 = ["Single test sequence"]
+    inputs3 = tokenizer(texts_case3, return_tensors="pt", padding=True)
+    
+    hf_mask_3 = inputs3.attention_mask.numpy()
+    input_ids_3 = jnp.array(inputs3.input_ids.numpy())
+    auto_mask_3 = (input_ids_3 != pad_token_id).astype(jnp.int32)
+    
+    case3_passed = np.allclose(auto_mask_3, hf_mask_3)
+    logger.info(f"  Input shape: {input_ids_3.shape}")
+    logger.info(f"  Match: {'✅ YES' if case3_passed else '❌ NO'}")
+    
+    # Test Case 4: Very short vs very long
+    logger.info("\n--- Test Case 4: Extreme Length Difference ---")
+    texts_case4 = [
+        "Hi",  # Very short
+        "This is a much longer sentence with many more tokens to test padding behavior"  # Very long
+    ]
+    inputs4 = tokenizer(texts_case4, return_tensors="pt", padding=True)
+    
+    hf_mask_4 = inputs4.attention_mask.numpy()
+    input_ids_4 = jnp.array(inputs4.input_ids.numpy())
+    auto_mask_4 = (input_ids_4 != pad_token_id).astype(jnp.int32)
+    
+    case4_passed = np.allclose(auto_mask_4, hf_mask_4)
+    padding_ratio = (hf_mask_4 == 0).sum() / hf_mask_4.size
+    logger.info(f"  Input shape: {input_ids_4.shape}")
+    logger.info(f"  Padding ratio: {padding_ratio:.2%}")
+    logger.info(f"  Match: {'✅ YES' if case4_passed else '❌ NO'}")
+    
+    # Overall result
+    all_cases_passed = case1_passed and case2_passed and case3_passed and case4_passed
+    
+    logger.info("\n" + "=" * 80)
+    logger.info("📊 Mask Generation Test Summary:")
+    logger.info(f"  Case 1 (Standard padding): {'✅ PASSED' if case1_passed else '❌ FAILED'}")
+    logger.info(f"  Case 2 (No padding): {'✅ PASSED' if case2_passed else '❌ FAILED'}")
+    logger.info(f"  Case 3 (Single sequence): {'✅ PASSED' if case3_passed else '❌ FAILED'}")
+    logger.info(f"  Case 4 (Extreme difference): {'✅ PASSED' if case4_passed else '❌ FAILED'}")
+    logger.info("=" * 80)
+    
+    if all_cases_passed:
+        logger.info("✅ All mask generation tests PASSED")
+    else:
+        logger.error("❌ Some mask generation tests FAILED")
+    
+    return all_cases_passed, 0.0
+
+
+def test_encoder_batch_performance(model_name, mesh, tokenizer, precision="float32"):
+    """Test encoder performance with different batch sizes"""
+    logger.info("\n" + "=" * 80)
+    logger.info("Testing UMT5Encoder Performance with Various Batch Sizes")
+    logger.info("=" * 80)
+
+    # Load models
+    hf_config = UMT5Config.from_pretrained(model_name)
+    hf_full_model = HFUMt5Model.from_pretrained(
+        model_name, attn_implementation="eager", dtype=get_torch_dtype(precision)
+    )
+    hf_full_model.eval()
+
+    with jax.set_mesh(mesh):
+        jax_encoder = JAXUMt5EncoderModel(
+            config=hf_config,
+            mesh=mesh,
+            dtype=get_jax_dtype(precision),
+        )
+
+    load_weights_from_hf(jax_encoder, hf_full_model, model_name, mesh=mesh, precision=precision)
+
+    # Test with different batch sizes
+    batch_sizes = [1, 4, 8, 16, 32]
+    results = []
+    
+    for batch_size in batch_sizes:
+        logger.info(f"\n--- Testing Batch Size: {batch_size} ---")
+        
+        # Generate batch of test sequences
+        texts = [f"Test sequence number {i} for performance testing" for i in range(batch_size)]
+        inputs = tokenizer(texts, return_tensors="pt", padding=True)
+        
+        pt_input_ids = inputs.input_ids
+        pt_attention_mask = inputs.attention_mask
+        jax_input_ids = jnp.array(pt_input_ids.numpy())
+        pad_token_id = tokenizer.pad_token_id or 0
+        
+        # Create ForwardBatch with auto-generated mask
+        forward_batch = create_dummy_forward_batch(
+            jax_input_ids, mesh, ForwardMode.EXTEND,
+            pad_token_id=pad_token_id,
+            auto_generate_mask=True
+        )
+        
+        # Warmup (compile on first run)
+        if batch_size == batch_sizes[0]:
+            logger.info("  🔥 Warming up (compiling)...")
+            with jax.set_mesh(mesh):
+                _ = jax_encoder(forward_batch=forward_batch)
+        
+        # Benchmark JAX
+        num_runs = 5
+        jax_times = []
+        
+        for run in range(num_runs):
+            with jax.set_mesh(mesh):
+                start = time.time()
+                jax_output_obj, _, _ = jax_encoder(forward_batch=forward_batch)
+                jax_output = jax_output_obj.hidden_states
+                # Ensure computation is complete
+                jax.block_until_ready(jax_output)
+                elapsed = time.time() - start
+                jax_times.append(elapsed)
+        
+        avg_jax_time = np.mean(jax_times)
+        std_jax_time = np.std(jax_times)
+        throughput = batch_size / avg_jax_time
+        
+        logger.info(f"  JAX avg time: {avg_jax_time*1000:.2f}ms (±{std_jax_time*1000:.2f}ms)")
+        logger.info(f"  Throughput: {throughput:.2f} sequences/sec")
+        logger.info(f"  Batch shape: {jax_input_ids.shape}")
+        logger.info(f"  Output shape: {jax_output.shape}")
+        
+        results.append({
+            'batch_size': batch_size,
+            'avg_time_ms': avg_jax_time * 1000,
+            'std_time_ms': std_jax_time * 1000,
+            'throughput': throughput,
+            'seq_len': jax_input_ids.shape[1]
+        })
+    
+    # Summary
+    logger.info("\n" + "=" * 80)
+    logger.info("📊 Performance Summary:")
+    logger.info("-" * 80)
+    logger.info(f"{'Batch Size':>12} | {'Avg Time (ms)':>15} | {'Throughput (seq/s)':>20} | {'Seq Len':>8}")
+    logger.info("-" * 80)
+    
+    for r in results:
+        logger.info(
+            f"{r['batch_size']:>12} | {r['avg_time_ms']:>12.2f} ± {r['std_time_ms']:>4.2f} | "
+            f"{r['throughput']:>20.2f} | {r['seq_len']:>8}"
+        )
+    
+    logger.info("=" * 80)
+    logger.info("✅ Performance benchmark completed")
+    
+    # Return success (performance test always passes if no errors)
+    return True, 0.0
+
+
 def test_full_model_alignment(model_name, mesh, tokenizer, precision="float32"):
     """Test UMT5Model (Full Encoder-Decoder) alignment"""
     logger.info("\n" + "=" * 80)
@@ -801,6 +1141,187 @@ def test_end_to_end_generation(model_name: str, mesh: jax.sharding.Mesh, tokeniz
     return True, 0.0
 
 
+def test_end_to_end_generation_batch(model_name: str, mesh: jax.sharding.Mesh, tokenizer, precision="float32"):
+    """
+    End-to-end batch generation alignment.
+    Compares batch generation from PyTorch generate() vs JAX autoregressive loop with multiple sequences.
+    """
+    logger.info("\n" + "=" * 80)
+    logger.info("Testing End-to-End Batch Generation Alignment")
+    logger.info("=" * 80)
+
+    # Load Models
+    hf_config = UMT5Config.from_pretrained(model_name)
+    hf_model = HFUMt5ForConditionalGeneration.from_pretrained(
+        model_name, dtype=get_torch_dtype(precision)
+    )
+    hf_model.eval()
+
+    with jax.set_mesh(mesh):
+        jax_model = JAXUMt5ForConditionalGeneration(hf_config, mesh, dtype=get_jax_dtype(precision))
+    load_weights_from_hf(jax_model, hf_model, model_name, mesh=mesh, precision=precision)
+
+    # Batch prompts with different lengths
+    prompts = [
+        "Translate English to French: Hello",                           # Short
+        "Translate English to German: Good morning",                    # Medium
+        "Translate English to Spanish: How are you today?"              # Longer
+    ]
+    
+    logger.info(f"📊 Testing batch generation with {len(prompts)} sequences of varying lengths:")
+    for i, prompt in enumerate(prompts):
+        logger.info(f"  Sequence {i+1}: '{prompt}'")
+
+    # PyTorch Batch Generation (Greedy)
+    logger.info("\n🔧 Running PyTorch batch generation...")
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True)
+    pt_input_ids = inputs.input_ids
+    pt_attention_mask = inputs.attention_mask
+    
+    logger.info(f"  Batch shape: {pt_input_ids.shape}, Padding token: {tokenizer.pad_token_id or 0}")
+    
+    with torch.no_grad():
+        pt_outputs = hf_model.generate(
+            pt_input_ids,
+            attention_mask=pt_attention_mask,
+            max_new_tokens=20,
+            do_sample=False,  # Deterministic greedy search
+            use_cache=True,
+        )
+    
+    logger.info("  ✓ PyTorch batch generation complete")
+    for i in range(len(prompts)):
+        pt_text = tokenizer.decode(pt_outputs[i], skip_special_tokens=True)
+        logger.info(f"  PT Seq {i+1}: {pt_outputs[i].tolist()[:10]}... (text: {pt_text[:50]}...)")
+
+    # JAX Batch Generation (Manual Greedy Loop)
+    logger.info("\n🔧 Running JAX batch generation...")
+    jax_input_ids = jnp.array(pt_input_ids.numpy())
+    jax_attention_mask = jnp.array(pt_attention_mask.numpy())
+    
+    batch_size = jax_input_ids.shape[0]
+    
+    # Prepare Encoder Batch
+    encoder_batch = create_dummy_forward_batch(jax_input_ids, mesh, ForwardMode.EXTEND)
+    encoder_batch.attention_mask = jax_attention_mask
+    
+    # Precompute Encoder Outputs (once for all sequences)
+    with CompilationProgressTracker("Compiling JAX model for batch generation"):
+        with jax.set_mesh(mesh):
+            encoder_embeds = jax_model.shared(jax_input_ids)
+            encoder_outputs = jax_model.encoder(
+                hidden_states=encoder_embeds,
+                forward_batch=encoder_batch,
+            )
+    
+    # Start decoding for all sequences
+    start_token = (
+        hf_config.decoder_start_token_id
+        if hf_config.decoder_start_token_id is not None
+        else 0
+    )
+    
+    # Initialize decoder inputs for batch
+    decoder_input_ids = jnp.full((batch_size, 1), start_token, dtype=jnp.int32)
+    generated_ids_batch = [[int(start_token)] for _ in range(batch_size)]
+    finished = [False] * batch_size  # Track which sequences have finished
+    
+    logger.info(f"  Starting batch decode (batch_size={batch_size})...")
+    
+    for step in range(20):
+        if step % 5 == 0:
+            logger.info(f"    Step {step+1}/20... (finished: {sum(finished)}/{batch_size})")
+        
+        with jax.set_mesh(mesh):
+            # Prepare Decoder Batch (Extend mode for simplicity)
+            decoder_batch = create_dummy_forward_batch(decoder_input_ids, mesh, ForwardMode.EXTEND)
+            decoder_batch.encoder_hidden_states = encoder_outputs
+            decoder_batch.encoder_mask = jax_attention_mask
+            
+            outputs, _, _ = jax_model(
+                forward_batch=decoder_batch,
+                token_to_kv_pool=None,
+            )
+            
+            # Get next token for each sequence in batch
+            next_token_logits = outputs[:, -1, :]  # (batch_size, vocab_size)
+            next_token_ids = jnp.argmax(next_token_logits, axis=-1)  # (batch_size,)
+        
+        # Update each sequence
+        new_tokens = []
+        all_finished = True
+        
+        for i in range(batch_size):
+            if not finished[i]:
+                next_token_id = int(next_token_ids[i])
+                
+                # Check for EOS
+                if next_token_id == hf_config.eos_token_id:
+                    generated_ids_batch[i].append(next_token_id)
+                    finished[i] = True
+                    new_tokens.append(tokenizer.pad_token_id or 0)  # Use padding for finished sequences
+                else:
+                    generated_ids_batch[i].append(next_token_id)
+                    new_tokens.append(next_token_id)
+                    all_finished = False
+            else:
+                # Sequence already finished, use padding
+                new_tokens.append(tokenizer.pad_token_id or 0)
+        
+        # Stop if all sequences finished
+        if all_finished:
+            logger.info(f"  ✓ All sequences finished at step {step+1}")
+            break
+        
+        # Concatenate new tokens to decoder input
+        decoder_input_ids = jnp.concatenate(
+            [decoder_input_ids, jnp.array(new_tokens, dtype=jnp.int32).reshape(batch_size, 1)],
+            axis=1
+        )
+    
+    logger.info("  ✓ JAX batch generation complete")
+    for i in range(batch_size):
+        jax_text = tokenizer.decode(generated_ids_batch[i], skip_special_tokens=True)
+        logger.info(f"  JAX Seq {i+1}: {generated_ids_batch[i][:10]}... (text: {jax_text[:50]}...)")
+    
+    # Per-sequence comparison
+    logger.info("\n" + "=" * 80)
+    logger.info("📊 Per-Sequence Alignment Results:")
+    logger.info("=" * 80)
+    
+    all_matched = True
+    for i in range(batch_size):
+        pt_ids = pt_outputs[i].tolist()
+        jax_ids = generated_ids_batch[i]
+        
+        logger.info(f"\nSequence {i+1}: '{prompts[i]}'")
+        logger.info(f"  PT length:  {len(pt_ids)}")
+        logger.info(f"  JAX length: {len(jax_ids)}")
+        
+        if pt_ids == jax_ids:
+            logger.info(f"  ✅ Token Sequence: MATCH")
+        else:
+            all_matched = False
+            logger.error(f"  ❌ Token Sequence: MISMATCH")
+            logger.error(f"    PT:  {pt_ids}")
+            logger.error(f"    JAX: {jax_ids}")
+            
+            # Show first difference
+            min_len = min(len(pt_ids), len(jax_ids))
+            for j in range(min_len):
+                if pt_ids[j] != jax_ids[j]:
+                    logger.error(f"    First diff at position {j}: PT={pt_ids[j]}, JAX={jax_ids[j]}")
+                    break
+    
+    logger.info("\n" + "=" * 80)
+    if all_matched:
+        logger.info("✅ All sequences in batch generation PASSED")
+    else:
+        logger.error("❌ Some sequences in batch generation FAILED")
+    
+    return all_matched, 0.0 if all_matched else 1.0
+
+
 def test_end_to_end_translation(model_name: str, mesh: jax.sharding.Mesh, tokenizer, precision="float32"):
     """
     End-to-end translation test with actual text generation.
@@ -853,15 +1374,19 @@ def verify_alignment(model_name="google/umt5-base", test_type="all", tp_size=Non
 
     test_functions = {
         "encoder": test_encoder_alignment,
+        "encoder_batch": test_encoder_alignment_batch,
+        "mask_generation": test_attention_mask_generation,
+        "encoder_performance": test_encoder_batch_performance,
         "encoder_decoder": test_full_model_alignment,
         "logits": test_generation_model_alignment,
         "generation": test_end_to_end_translation,
         "tokens": test_end_to_end_generation,
+        "tokens_batch": test_end_to_end_generation_batch,
     }
 
     if test_type == "all":
-        # Run core alignment tests
-        for test_name in ["encoder", "encoder_decoder", "logits", "tokens"]:
+        # Run core alignment tests (including new batch tests)
+        for test_name in ["encoder", "encoder_batch", "mask_generation", "encoder_decoder", "logits", "tokens"]:
             try:
                 passed, mae = test_functions[test_name](model_name, mesh, tokenizer, precision)
                 results.append((test_name.replace("_", " ").title(), passed, mae))
@@ -922,12 +1447,28 @@ if __name__ == "__main__":
         choices=[
             "all",
             "encoder",
+            "encoder_batch",
+            "mask_generation",
+            "encoder_performance",
             "encoder_decoder",
             "logits",
             "generation",
             "tokens",
+            "tokens_batch",
         ],
-        help="Which test to run (encoder: encoder only, encoder_decoder: full model, logits: precision test, generation: text generation, tokens: exact token alignment)",
+        help=(
+            "Which test to run:\n"
+            "  encoder: Single-sequence encoder test\n"
+            "  encoder_batch: Batch encoder test with padding\n"
+            "  mask_generation: Attention mask generation validation\n"
+            "  encoder_performance: Performance benchmark with various batch sizes\n"
+            "  encoder_decoder: Full encoder-decoder model\n"
+            "  logits: Logits precision test\n"
+            "  generation: Text generation\n"
+            "  tokens: Exact token alignment (single sequences)\n"
+            "  tokens_batch: Exact token alignment (batch generation)\n"
+            "  all: Run core alignment tests (encoder, encoder_batch, mask_generation, encoder_decoder, logits, tokens)"
+        ),
     )
     parser.add_argument(
         "--log_file", type=str, default=None, help="Path to save the log file"

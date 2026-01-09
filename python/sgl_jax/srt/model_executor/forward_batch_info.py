@@ -27,6 +27,7 @@ import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec
 from jax.tree_util import register_pytree_node_class
 
+from sgl_jax.srt.configs.model_config import need_attention_mask
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.jax_utils import device_array
 
@@ -303,9 +304,13 @@ class ForwardBatch:
             capture_hidden_mode=batch.capture_hidden_mode,
         )
 
-        # Auto-generate attention mask for Encoder models (e.g. UMT5)
-        # Assumes padded input batch for encoder models
-        if getattr(model_runner.model_config, "is_embedding", False):
+        # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)
+        is_embedding = getattr(model_runner.model_config, "is_embedding", False)
+        architectures = getattr(model_runner.model_config.hf_config, "architectures", [])
+        
+        needs_mask = need_attention_mask(architectures, is_embedding)
+        
+        if needs_mask:
             hf_config = model_runner.model_config.hf_config
             pad_token_id = getattr(hf_config, "pad_token_id", 0)
             if pad_token_id is None:
