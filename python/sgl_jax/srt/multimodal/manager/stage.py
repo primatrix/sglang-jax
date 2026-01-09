@@ -19,6 +19,7 @@ from sgl_jax.srt.multimodal.models.wan2_1.diffusion.wan2_1_dit import (
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.utils import get_exception_traceback
+from sgl_jax.srt.models.umt5 import UMT5EncoderModel
 
 logger = logging.getLogger(__name__)
 
@@ -105,11 +106,9 @@ def get_scheduler_class(name: str):
 def get_model_class(name: str):
     if name == "AutoencoderKLWan":
         return AutoencoderKLWan
-    elif name == "auto_regressive":
-        # TODO add eventloop for auto regressive scheduler
-        return AutoRegressiveScheduler
+    elif name == "UMT5EncoderModel":
+        return UMT5EncoderModel
     elif name == "WanTransformer3DModel":
-        # TODO add eventloop for VAE scheduler
         return WanTransformer3DModel
     else:
         raise ValueError(f"Unknown model name: {name}")

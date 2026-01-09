@@ -3,6 +3,7 @@ import dataclasses
 import logging
 import signal
 import time
+import uuid
 from http import HTTPStatus
 from typing import Any
 
@@ -29,21 +30,20 @@ logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class MMReqState:
-    """Store the state a request."""
+    """Store the state of a request."""
 
+    rid: str
     out_list: list[dict[Any, Any]]
     finished: bool
     event: asyncio.Event
     obj: GenerateMMReqInput
-
     created_time: float
 
 
 class MultimodalTokenizer(TokenizerManager):
     def __init__(self, server_args, port_args):
         super().__init__(server_args, port_args)
-        #  this will cast warning when use_fast=True  like
-        #  "Using `use_fast=True` but `torchvision` is not available. Falling back to the slow image processor."
+        # Use slow image processor to avoid torchvision dependency warning
         try:
             self.mm_processor = AutoImageProcessor.from_pretrained(
                 server_args.model_path, use_fast=False
@@ -51,7 +51,6 @@ class MultimodalTokenizer(TokenizerManager):
         except Exception:
             logger.warning("Failed to load processor from %s", server_args.model_path)
         self.rid_to_state: dict[str, MMReqState] = {}
-        # todo: rewrite this
         self._result_dispatcher = TypeBasedDispatcher(
             [
                 (
@@ -62,7 +61,6 @@ class MultimodalTokenizer(TokenizerManager):
         )
 
     def _handle_batch_output(self, reqs: list):
-        print("_handle_batch_output...")
         if len(reqs) > 0 and self.server_args.log_requests:
             logger.info("handle_batch_output %s, self.rid_to_state %s", reqs, self.rid_to_state)
         for req in reqs:
@@ -70,6 +68,12 @@ class MultimodalTokenizer(TokenizerManager):
                 self.rid_to_state[req.rid].finished = True
                 self.rid_to_state[req.rid].event.set()
                 self.rid_to_state[req.rid].out_list = [{"success": True, "meta_info": {}}]
+            else:
+                logger.warning(
+                    "Received result for unknown request rid=%s. Known rids: %s",
+                    req.rid,
+                    list(self.rid_to_state.keys()),
+                )
 
     async def generate_request(
         self,
@@ -96,10 +100,10 @@ class MultimodalTokenizer(TokenizerManager):
 
     async def _tokenize_one_request(self, obj: GenerateMMReqInput):
         """Tokenize one request."""
+        # Support both 'prompt' (multimodal) and 'text' (text-only) fields
+        input_text = getattr(obj, "prompt", None) or getattr(obj, "text", None)
 
-        # Tokenize
-        input_text = obj.prompt
-        input_ids = obj.input_ids
+        input_ids = getattr(obj, "input_ids", None)
         if input_ids is None and input_text is not None:
             if self.tokenizer is None:
                 raise ValueError(
@@ -107,20 +111,26 @@ class MultimodalTokenizer(TokenizerManager):
                 )
             encoded = self.tokenizer(input_text)
             input_ids = encoded["input_ids"]
-        if obj.input_reference is not None:
-            # todo: need handle image process
+
+        if getattr(obj, "input_reference", None) is not None:
+            # TODO: Handle image preprocessing for multimodal inputs
             pass
+
         return self._create_tokenized_object(obj, input_text, input_ids)
 
     def _create_tokenized_object(self, obj: GenerateMMReqInput, input_text, input_ids):
+        rid = getattr(obj, "rid", None)
+        if rid is None:
+            rid = uuid.uuid4().hex
+
         tokenized_obj = TokenizedGenerateMMReqInput(
-            rid=obj.rid,
-            prompt=obj.prompt,
+            rid=rid,
+            prompt=input_text,
             input_ids=input_ids,
-            size=obj.size,
-            num_frames=obj.num_frames,
-            data_type=obj.data_type,
-            save_output=obj.save_output,
+            size=getattr(obj, "size", None),
+            num_frames=getattr(obj, "num_frames", None),
+            data_type=getattr(obj, "data_type", None),
+            save_output=getattr(obj, "save_output", True),
         )
         return tokenized_obj
 
@@ -131,10 +141,15 @@ class MultimodalTokenizer(TokenizerManager):
         created_time: float | None = None,
     ):
         self.send_to_scheduler.send_pyobj(tokenized_obj)
-        state = MMReqState([], False, asyncio.Event(), obj, created_time=created_time)
-        # Handle rid being a list (single element) or string
-        rid_key = obj.rid[0] if isinstance(obj.rid, list) else obj.rid
-        self.rid_to_state[rid_key] = state
+        state = MMReqState(
+            rid=tokenized_obj.rid,
+            out_list=[],
+            finished=False,
+            event=asyncio.Event(),
+            obj=obj,
+            created_time=created_time,
+        )
+        self.rid_to_state[tokenized_obj.rid] = state
         return state
 
     async def _wait_one_response(
@@ -149,17 +164,10 @@ class MultimodalTokenizer(TokenizerManager):
                 await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)
             except TimeoutError:
                 if request is not None and await request.is_disconnected():
-                    # Abort the request for disconnected requests (non-streaming, waiting queue)
-                    self.abort_request(obj.rid)
-                    # Use exception to kill the whole call stack and asyncio task
-                    try:
-                        raise ValueError(
-                            f"Request is disconnected from the client side (type 1). Abort request rid={obj.rid}"
-                        )
-                    except ValueError as e:
-                        raise ValueError(
-                            f"Request is disconnected from the client side (type 1). Abort request rid={obj.rid}"
-                        ) from e
+                    self.abort_request(state.rid)
+                    raise ValueError(
+                        f"Request is disconnected from the client side. Abort request rid={state.rid}"
+                    )
                 continue
 
             out = state.out_list[-1]
@@ -171,7 +179,6 @@ class MultimodalTokenizer(TokenizerManager):
                     msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}, out={dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
                     logger.info(msg)
 
-                # Check if this was an abort/error created by scheduler
                 if isinstance(out["meta_info"].get("finish_reason"), dict):
                     finish_reason = out["meta_info"]["finish_reason"]
                     if (
@@ -189,11 +196,9 @@ class MultimodalTokenizer(TokenizerManager):
                 yield out
             else:
                 if request is not None and await request.is_disconnected():
-                    # Abort the request for disconnected requests (non-streaming, running)
-                    self.abort_request(obj.rid)
-                    # Use exception to kill the whole call stack and asyncio task
+                    self.abort_request(state.rid)
                     raise ValueError(
-                        f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
+                        f"Request is disconnected from the client side. Abort request rid={state.rid}"
                     )
 
 
