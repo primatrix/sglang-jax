@@ -6,10 +6,9 @@ import numpy as np
 from flax import nnx
 
 from sgl_jax.srt.configs.load_config import LoadConfig
-from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_loader.loader import get_model_loader
-from sgl_jax.srt.multimodal.configs.models.vaes.wanvae import WanVAEConfig
+from sgl_jax.srt.multimodal.configs.vaes.wanvae import WanVAEConfig
 from sgl_jax.srt.server_args import ServerArgs
 
 
