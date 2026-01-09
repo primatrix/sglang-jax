@@ -4,6 +4,8 @@ import logging
 import os
 from pathlib import Path
 
+from sgl_jax.srt.multimodal.manager.utils import extract_model_name
+
 logger = logging.getLogger(__name__)
 
 # Get the directory where this file is located
@@ -65,7 +67,7 @@ class StageConfigRegistry:
             ValueError: If no matching config is found for the model.
         """
         # Extract model name from path (handle both local paths and HF repo IDs)
-        model_name = cls._extract_model_name(model_path)
+        model_name = extract_model_name(model_path)
 
         # Try exact match first
         yaml_filename = cls._REGISTRY.get(model_name)
@@ -92,22 +94,6 @@ class StageConfigRegistry:
             f"Available models: {available_models}. "
             f"You can register new models using StageConfigRegistry.register()."
         )
-
-    @classmethod
-    def _extract_model_name(cls, model_path: str) -> str:
-        """Extract the model name from a model path.
-
-        Handles both:
-        - Local paths: /models/Wan-AI/Wan2.1-T2V-1.3B-Diffusers -> Wan2.1-T2V-1.3B-Diffusers
-        - HF repo IDs: Wan-AI/Wan2.1-T2V-1.3B-Diffusers -> Wan2.1-T2V-1.3B-Diffusers
-        """
-        # Remove trailing slashes
-        model_path = model_path.rstrip("/")
-
-        # Get the basename (last component of path)
-        basename = os.path.basename(model_path)
-
-        return basename
 
     @classmethod
     def list_registered_models(cls) -> list[str]:
