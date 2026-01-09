@@ -1,16 +1,21 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
 
-from sgl_jax.srt.multimodal.configs.models.vaes.base import VAEArchConfig, VAEConfig
+from python.sgl_jax.srt.multimodal.configs.vaes.vae_base_config import VAEConfig
 
 
 @dataclass
-class WanVAEArchConfig(VAEArchConfig):
+class WanVAEConfig(VAEConfig):
+    use_feature_cache: bool = True
+    use_tiling: bool = False
+    use_temporal_tiling: bool = False
+    use_parallel_tiling: bool = False
+    model_class: None = None
     base_dim: int = 96  # The base number of channels in the first layer.
     decoder_base_dim: int | None = None
     z_dim: int = 16  # The dimensionality of the latent space.
@@ -77,17 +82,6 @@ class WanVAEArchConfig(VAEArchConfig):
         self.temporal_compression_ratio = self.scale_factor_temporal
         self.spatial_compression_ratio = self.scale_factor_spatial
 
-
-@dataclass
-class WanVAEConfig(VAEConfig):
-    arch_config: WanVAEArchConfig = field(default_factory=WanVAEArchConfig)
-    use_feature_cache: bool = True
-
-    use_tiling: bool = False
-    use_temporal_tiling: bool = False
-    use_parallel_tiling: bool = False
-
-    def __post_init__(self):
         self.blend_num_frames = (
             self.tile_sample_min_num_frames - self.tile_sample_stride_num_frames
         ) * 2

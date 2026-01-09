@@ -82,7 +82,10 @@ class JAXModelLoader(BaseModelLoader):
         return jit_model
 
     def _initialize_model(self, model_config: ModelConfig) -> Any:
-        model_class, _ = get_model_architecture(model_config)
+        if not isinstance(model_config, ModelConfig):
+            model_class = model_config.model_class
+        else:
+            model_class, _ = get_model_architecture(model_config)
 
         if not hasattr(model_class, "load_weights"):
             raise ValueError(
@@ -93,11 +96,13 @@ class JAXModelLoader(BaseModelLoader):
         return model_class
 
     def _get_model(self, model_class: Any, model_config: ModelConfig) -> nnx.Module:
+        if not isinstance(model_config, ModelConfig):
+            config = model_config
+        else:
+            config = model_config.hf_config
         with jax.set_mesh(self.mesh):
             model = nnx.eval_shape(
-                lambda: model_class(
-                    model_config.hf_config, dtype=model_config.dtype, mesh=self.mesh
-                )
+                lambda: model_class(config, dtype=model_config.dtype, mesh=self.mesh)
             )
 
         model.load_weights(model_config)

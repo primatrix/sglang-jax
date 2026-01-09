@@ -8,9 +8,11 @@ from sgl_jax.srt.multimodal.model_executor.diffusion.diffusion_model_runner impo
 
 
 class DiffusionModelWorker:
-    def __init__(self, server_args: MultimodalServerArgs, mesh: jax.sharding.Mesh = None):
+    def __init__(
+        self, server_args: MultimodalServerArgs, mesh: jax.sharding.Mesh = None, model_class=None
+    ):
         self.mesh = mesh
-        self.model_runner = DiffusionModelRunner(server_args, self.mesh)
+        self.model_runner = DiffusionModelRunner(server_args, self.mesh, model_class=model_class)
         self.initialize()
 
     def initialize(self):

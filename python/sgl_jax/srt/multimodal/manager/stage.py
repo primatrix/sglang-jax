@@ -12,6 +12,10 @@ from sgl_jax.srt.multimodal.manager.scheduler.diffusion_scheduler import (
     DiffusionScheduler,
 )
 from sgl_jax.srt.multimodal.manager.scheduler.vae_scheduler import VaeScheduler
+from sgl_jax.srt.multimodal.models.vaes.wanvae import AutoencoderKLWan
+from sgl_jax.srt.multimodal.models.wan2_1.diffusion.wan2_1_dit import (
+    WanTransformer3DModel,
+)
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.utils import get_exception_traceback
@@ -54,10 +58,12 @@ class Stage:
             # todo according to config to decide which scheduler to use
             scheduler_class = get_scheduler_class(self.stage_config.scheduler)
             comm_backend = QueueBackend(in_queue=self._in_queue, out_queue=self._out_queue)
+            model_class = get_model_class(self.stage_config.model_class)
             self._stage_scheduler = scheduler_class(
                 communication_backend=comm_backend,
                 mesh=self.mesh,
                 server_args=self.server_args,
+                model_class=model_class,
                 **self.stage_config.scheduler_params,
             )
             self._out_queue.put_nowait({"status": "ready"})
@@ -94,3 +100,16 @@ def get_scheduler_class(name: str):
         return VaeScheduler
     else:
         raise ValueError(f"Unknown scheduler name: {name}")
+
+
+def get_model_class(name: str):
+    if name == "AutoencoderKLWan":
+        return AutoencoderKLWan
+    elif name == "auto_regressive":
+        # TODO add eventloop for auto regressive scheduler
+        return AutoRegressiveScheduler
+    elif name == "WanTransformer3DModel":
+        # TODO add eventloop for VAE scheduler
+        return WanTransformer3DModel
+    else:
+        raise ValueError(f"Unknown model name: {name}")

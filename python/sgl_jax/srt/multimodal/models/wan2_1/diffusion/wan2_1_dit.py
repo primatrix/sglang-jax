@@ -1,3 +1,4 @@
+import logging
 import math
 
 import jax
@@ -9,7 +10,7 @@ from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 
 # from sgl_jax.srt.multimodal.configs.dits.wan2_1 import WanVideoArchConfig, WanVideoConfig
-from sgl_jax.srt.multimodal.configs.dits.configs import WanModelConfig
+from sgl_jax.srt.multimodal.configs.dits.wan_model_config import WanModelConfig
 from sgl_jax.srt.multimodal.layers.attention.layer import USPAttention
 from sgl_jax.srt.multimodal.layers.layernorm import (
     FP32LayerNorm,
@@ -23,6 +24,13 @@ from sgl_jax.srt.multimodal.layers.visual_embedding import (
     PatchEmbed,
     TimestepEmbedder,
 )
+from sgl_jax.srt.multimodal.models.wan2_1.diffusion.wan2_1_dit_weights_mapping import (
+    to_i2v_mappings,
+    to_mappings,
+)
+from sgl_jax.srt.utils.weight_utils import WeightLoader
+
+logger = logging.getLogger(__name__)
 
 
 class WanImageEmbedding(nnx.Module):
@@ -437,13 +445,14 @@ class WanTransformer3DModel(nnx.Module):
         self,
         config: WanModelConfig,
         *,
-        rngs: nnx.Rngs = None,
         dtype=jnp.bfloat16,
         mesh: jax.sharding.Mesh | None = None,
     ):
         self.patch_size = config.patch_size
-        self.hidden_size = config.hidden_dim
-        self.num_attention_heads = config.num_heads
+        self.hidden_size = config.num_attention_heads * config.attention_head_dim
+        self.dtype = dtype
+        rngs = nnx.Rngs(0)
+        self.num_attention_heads = config.num_attention_heads
         self.in_channels = config.in_channels
         self.sp_size = 1
         d = self.hidden_size // self.num_attention_heads
@@ -512,6 +521,7 @@ class WanTransformer3DModel(nnx.Module):
         self.scale_shift_table = nnx.Param(
             jax.random.normal(jax.random.key(0), (1, 2, inner_dim)) / (inner_dim**0.5)
         )
+        self.model_config = config
 
     def __call__(
         self,
@@ -659,55 +669,12 @@ class WanTransformer3DModel(nnx.Module):
         Args:
             model_path: Path to the transformer directory containing safetensors files
         """
-        import logging
-
-        from sgl_jax.srt.multimodal.models.wan2_1.diffusion.wan2_1_dit_weights_mapping import (
-            to_i2v_mappings,
-            to_mappings,
+        weight_mappings = (
+            to_i2v_mappings() if self.model_config.added_kv_proj_dim is not None else to_mappings()
         )
-        from sgl_jax.srt.utils.weight_utils import WeightLoader
-
-        logger = logging.getLogger(__name__)
-
-        # Determine if this is I2V model based on image_embedder
-        is_i2v = hasattr(self.condition_embedder, "image_embedder") and (
-            self.condition_embedder.image_embedder is not None
-        )
-
-        # Get weight mappings
-        if is_i2v:
-            weight_mappings = to_i2v_mappings()
-            logger.info("Using I2V weight mappings")
-        else:
-            weight_mappings = to_mappings()
-            logger.info("Using T2V weight mappings")
-
-        # Create a minimal config object for WeightLoader
-        class MinimalConfig:
-            def __init__(self, path, hidden_size, num_heads, num_kv_heads):
-                self.model_path = path
-                self.hidden_size = hidden_size
-                self.num_attention_heads = num_heads
-                self.num_key_value_heads = num_kv_heads
-                self.hf_config = type("HFConfig", (), {})()
-
-            def get_total_num_kv_heads(self):
-                return self.num_key_value_heads
-
-            def needs_kv_head_replication(self, tp_size):
-                return False
-
-        model_config = MinimalConfig(
-            path=model_path,
-            hidden_size=self.hidden_size,
-            num_heads=self.num_attention_heads,
-            num_kv_heads=self.num_attention_heads,
-        )
-
-        # Create weight loader and load weights
         loader = WeightLoader(
             model=self,
-            model_config=model_config,
+            model_config=self.model_config,
             mesh=self.mesh,
         )
         loader.load_weights_from_safetensors(weight_mappings)

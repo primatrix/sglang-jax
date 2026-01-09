@@ -108,17 +108,17 @@ class WeightLoader:
         self.mesh = mesh
         self.dtype = dtype
         self.dummy_mode = getattr(model_config, "_dummy_mode", False)
+        if hasattr(model_config, "num_attention_heads"):
+            self.num_heads = model_config.num_attention_heads
+            # Use original count for replication logic
+            self.num_kv_heads = model_config.get_total_num_kv_heads()
+            self.hidden_size = model_config.hidden_size
+            self.head_dim_original = getattr(
+                model_config, "head_dim", self.hidden_size // self.num_heads
+            )
 
-        self.num_heads = model_config.num_attention_heads
-        # Use original count for replication logic
-        self.num_kv_heads = model_config.get_total_num_kv_heads()
-        self.hidden_size = model_config.hidden_size
-        self.head_dim_original = getattr(
-            model_config, "head_dim", self.hidden_size // self.num_heads
-        )
-
-        self.head_dim_pad = (self.head_dim_original + 127) // 128 * 128 - self.head_dim_original
-        self.head_dim = self.head_dim_original
+            self.head_dim_pad = (self.head_dim_original + 127) // 128 * 128 - self.head_dim_original
+            self.head_dim = self.head_dim_original
         if hasattr(self.mesh, "shape") and "tensor" in self.mesh.shape:
             self.sharding_size = self.mesh.shape["tensor"]
         else:
