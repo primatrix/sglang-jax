@@ -12,6 +12,13 @@ import psutil
 import setproctitle
 from transformers import AutoImageProcessor
 
+from sgl_jax.srt.multimodal.models.static_configs.yaml_registry import get_stage_config_path
+from sgl_jax.srt.multimodal.models.registry import PreprocessorConfigRegistry
+from sgl_jax.srt.multimodal.manager.utils import (
+    extract_model_name,
+    load_tokenizer_configs_from_yaml,
+)
+from sgl_jax.srt.multimodal.models.vision_utils import load_image
 from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
 from sgl_jax.srt.multimodal.manager.io_struct import (
     GenerateMMReqInput,
@@ -51,6 +58,18 @@ class MultimodalTokenizer(TokenizerManager):
         except Exception:
             logger.warning("Failed to load processor from %s", server_args.model_path)
         self.rid_to_state: dict[str, MMReqState] = {}
+
+        # Load tokenizer configs
+        tokenizer_config_path = get_stage_config_path(server_args.model_path)
+        model_name = extract_model_name(server_args.model_path)
+        logger.info(
+            "Loading tokenizer config from: %s, model = %s", tokenizer_config_path, model_name
+        )
+        self._parse_tokenizer_configs(
+            load_tokenizer_configs_from_yaml(tokenizer_config_path), model_name
+        )
+
+        # todo: rewrite this
         self._result_dispatcher = TypeBasedDispatcher(
             [
                 (
@@ -59,6 +78,38 @@ class MultimodalTokenizer(TokenizerManager):
                 ),
             ]
         )
+
+    def _parse_tokenizer_configs(self, tokenizer_configs, model_name: str):
+        # Parse tokenizer configurations
+        if tokenizer_configs is None:
+            return
+
+        # preprocessor configs
+        if "preprocessor" not in tokenizer_configs:
+            return
+
+        preprocessor_cfg = tokenizer_configs.preprocessor
+
+        # image
+        image_preprocess_func = PreprocessorConfigRegistry.get_image_preprocess_func(model_name)
+        if "image" in preprocessor_cfg and image_preprocess_func is not None:
+            self.image_preprocessor_func = lambda image: image_preprocess_func(
+                image, preprocessor_cfg.image.get("params")
+            )
+
+        # audio
+        audio_preprocess_func = PreprocessorConfigRegistry.get_audio_preprocess_func(model_name)
+        if "audio" in preprocessor_cfg and audio_preprocess_func is not None:
+            self.audio_preprocessor_func = lambda audio: audio_preprocess_func(
+                audio, preprocessor_cfg.audio.get("params")
+            )
+
+        # video
+        video_preprocess_func = PreprocessorConfigRegistry.get_video_preprocess_func(model_name)
+        if "video" in preprocessor_cfg and video_preprocess_func is not None:
+            self.video_preprocessor_func = lambda video: video_preprocess_func(
+                video, preprocessor_cfg.video.get("params")
+            )
 
     def _handle_batch_output(self, reqs: list):
         if len(reqs) > 0 and self.server_args.log_requests:
@@ -102,8 +153,10 @@ class MultimodalTokenizer(TokenizerManager):
         """Tokenize one request."""
         # Support both 'prompt' (multimodal) and 'text' (text-only) fields
         input_text = getattr(obj, "prompt", None) or getattr(obj, "text", None)
-
         input_ids = getattr(obj, "input_ids", None)
+        image = None
+        
+        # Tokenize
         if input_ids is None and input_text is not None:
             if self.tokenizer is None:
                 raise ValueError(
@@ -113,12 +166,13 @@ class MultimodalTokenizer(TokenizerManager):
             input_ids = encoded["input_ids"]
 
         if getattr(obj, "input_reference", None) is not None:
-            # TODO: Handle image preprocessing for multimodal inputs
-            pass
+            if self.image_preprocessor_func is not None:
+                image = load_image(obj.input_reference)
+                image = self.image_preprocessor_func(image)
 
-        return self._create_tokenized_object(obj, input_text, input_ids)
+        return self._create_tokenized_object(obj, input_text, input_ids, image=image)
 
-    def _create_tokenized_object(self, obj: GenerateMMReqInput, input_text, input_ids):
+    def _create_tokenized_object(self, obj: GenerateMMReqInput, input_text, input_ids, image):
         rid = getattr(obj, "rid", None)
         if rid is None:
             rid = uuid.uuid4().hex
@@ -127,6 +181,7 @@ class MultimodalTokenizer(TokenizerManager):
             rid=rid,
             prompt=input_text,
             input_ids=input_ids,
+            preprocessed_image=image,
             size=getattr(obj, "size", None),
             num_frames=getattr(obj, "num_frames", None),
             data_type=getattr(obj, "data_type", None),
