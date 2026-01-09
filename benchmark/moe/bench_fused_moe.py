@@ -19,6 +19,7 @@ from jax.sharding import PartitionSpec as P
 from benchmark.moe.utils import (
     BAILING_BASE,
     MoEBenchmarkCase,
+    MoEImbalanceSimulator,
     build_mesh,
     prepare_fused_moe_inputs,
     select_cases,
@@ -263,6 +264,13 @@ def run_all(
     num_tokens: list[int] | None = None,
     tpu_vmem_budget_bytes: int = DEFAULT_TPU_VMEM_BUDGET_BYTES,
     max_configs: int = 9,
+    imbalance_mode: str = None,  # 手动显式传入
+    alpha: float = None,
+    zipf_s: float = None,
+    hotspot_ratio: float = None,
+    hotspot_count: int = None,
+    zero_expert_count: int = None,
+    non_hotspot_alpha: float = None,
 ) -> None:
     raw_cases: list[MoEBenchmarkCase] | None = None
     if num_tokens is not None:
@@ -330,6 +338,29 @@ def run_all(
             mesh=mesh,
             include_weights=False,
             router_balance_factor=router_balance_factor,
+        )
+
+        # --- 注入不均衡模拟器逻辑 ---
+        target_counts = MoEImbalanceSimulator.generate_counts(
+            case.num_tokens,
+            case.top_k,
+            case.num_experts,
+            mode=imbalance_mode,
+            alpha=alpha,
+            zipf_s=zipf_s,
+            hotspot_ratio=hotspot_ratio,
+            hotspot_count=hotspot_count,
+            zero_expert_count=zero_expert_count,
+            non_hotspot_alpha=non_hotspot_alpha,
+        )
+        # 构造定制化的 Logits
+        custom_logits = MoEImbalanceSimulator.create_logits_from_counts(
+            case.num_tokens, case.num_experts, case.top_k, target_counts
+        )
+
+        # 重新分片并覆盖原有的 router_logits
+        data["router_logits"] = jax.device_put(
+            custom_logits, jax.sharding.NamedSharding(mesh, P("tensor", None))
         )
 
         if debug_routing:
@@ -642,6 +673,24 @@ def parse_args() -> argparse.Namespace:
         default=9,
         help="Maximum number of block configs to benchmark per case when --tune-block-config is set.",
     )
+
+    parser.add_argument(
+        "--imbalance-mode",
+        type=str,
+        choices=["balanced", "dirichlet", "zipf", "hotspot", "sparse_hotspot"],
+        default="balanced",
+        help="All-to-All 不均衡负载模式",
+    )
+    parser.add_argument(
+        "--alpha", type=float, default=1.0, help="Dirichlet 分布因子 (越小越不均衡，如 0.1)"
+    )
+    parser.add_argument("--zipf-s", type=float, default=1.1, help="Zipf 分布因子 (越大越不均衡)")
+    parser.add_argument(
+        "--hotspot-ratio", type=float, default=0.5, help="热点专家占据的 Token 总量比例 (0.0-1.0)"
+    )
+    parser.add_argument("--hotspot-count", type=int, default=1, help="热点专家的数量")
+    parser.add_argument("--zero-expert-count", type=int, default=0)
+    parser.add_argument("--non-hotspot-alpha", type=float, default=100.0)
     return parser.parse_args()
 
 
@@ -650,6 +699,7 @@ if __name__ == "__main__":
     if args.compilation_cache_dir:
         _compilation_cache.set_cache_dir(args.compilation_cache_dir)
     tpu_vmem_budget_bytes = int(args.tpu_vmem_budget_mb) * 1024 * 1024
+    full_args_dict = vars(args)
     run_all(
         args.iters,
         warmup_iters=args.warmup_iters,
@@ -663,4 +713,11 @@ if __name__ == "__main__":
         num_tokens=args.num_tokens,
         tpu_vmem_budget_bytes=tpu_vmem_budget_bytes,
         max_configs=args.max_configs,
+        imbalance_mode=args.imbalance_mode,  # 手动显式传入
+        alpha=args.alpha,
+        zipf_s=args.zipf_s,
+        hotspot_ratio=args.hotspot_ratio,
+        hotspot_count=args.hotspot_count,
+        zero_expert_count=args.zero_expert_count,
+        non_hotspot_alpha=args.non_hotspot_alpha,
     )
