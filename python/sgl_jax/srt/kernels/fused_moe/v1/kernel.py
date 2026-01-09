@@ -2556,3 +2556,136 @@ def fused_ep_moe_routing_anomaly_stats(
         return dup_rate, dup_count, logits_nonfinite_rate, softmax_nonfinite_rate, all_neg_inf_rate
 
     return _stats(router_logits)
+
+
+def fused_ep_moe_routing_tile_overflow_stats(
+    *,
+    mesh: jax.sharding.Mesh,
+    tokens: jax.Array,
+    w2: jax.Array,
+    router_logits: jax.Array,
+    top_k: int,
+    block_config: FusedMoEBlockConfig | None = None,
+    num_experts: int | None = None,
+    ep_axis_name: str = "tensor",
+    local_mask: bool = False,
+    balanced_topk: bool = False,
+    subc_quant_wsz: int | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Detect per-`bt`-tile routing overflow vs the kernel's a2a scratch sizing.
+
+    The fused pallas kernel processes tokens in `bt` tiles and sizes a2a scratch as:
+      `a2a_max_tokens = align_to(bt * ep_size, bts)`
+
+    This function mirrors that tiling and returns:
+      `(max_tile_bucket, overflow_tile_count, bt, a2a_max_tokens)`.
+    """
+    ep_size = mesh.shape[ep_axis_name]
+    if num_experts is None:
+        num_experts = int(router_logits.shape[-1])
+    if top_k <= 0 or top_k > num_experts:
+        raise ValueError(f"Expected 0 < {top_k=} <= {num_experts=}.")
+    if tokens.ndim != 2:
+        raise ValueError(f"Expected tokens.ndim==2, got {tokens.ndim=}.")
+    if router_logits.ndim != 2:
+        raise ValueError(f"Expected router_logits.ndim==2, got {router_logits.ndim=}.")
+
+    if block_config is None:
+        from .tuned_block_configs import get_tuned_fused_moe_block_config
+
+        num_tokens, hidden_size = tokens.shape
+        num_experts_w2, intermediate_size, _ = w2.shape
+        if num_experts is None:
+            num_experts = int(num_experts_w2)
+        block_config = get_tuned_fused_moe_block_config(
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=tokens.dtype,
+            ep_size=ep_size,
+        )
+
+    block_config = block_config.effective_for(
+        num_tokens=int(tokens.shape[0]),
+        ep_size=int(ep_size),
+        dtype=tokens.dtype,
+        subc_quant_wsz=subc_quant_wsz,
+    )
+    bt = int(block_config.bt)
+    a2a_max_tokens = int(align_to(bt * int(ep_size), int(block_config.bts)))
+
+    @jax.jit
+    @jax.shard_map(
+        mesh=mesh,
+        in_specs=(P(ep_axis_name, None),),
+        out_specs=(P(), P(), P(), P()),
+        check_vma=False,
+    )
+    def _stats(router_logits_shard: jax.Array):
+        x = router_logits_shard[:, :num_experts].astype(jnp.float32)
+        if local_mask:
+            my_id = jax.lax.axis_index(ep_axis_name)
+            ep_size = jax.lax.axis_size(ep_axis_name)
+            if num_experts % ep_size != 0:
+                raise ValueError(f"Expected {num_experts=} to be divisible by {ep_size=}.")
+            local_num_experts = num_experts // ep_size
+            local_start = my_id * local_num_experts
+            local_end = local_start + local_num_experts
+            expert_iota = jax.lax.broadcasted_iota(jnp.int32, (1, num_experts), 1)[0]
+            is_local_expert = jnp.logical_and(expert_iota >= local_start, expert_iota < local_end)
+            x = jnp.where(is_local_expert, x, -jnp.inf)
+
+        local_num_tokens = x.shape[0]
+        if local_num_tokens % bt != 0:
+            raise ValueError(f"Expected {local_num_tokens=} divisible by {bt=}.")
+        num_bt = local_num_tokens // bt
+        x_bt = x.reshape(num_bt, bt, num_experts)
+
+        def _tile_topk_ids(tile_x: jax.Array, *, bt_id: jax.Array) -> jax.Array:
+            if balanced_topk:
+                bt_start = bt_id * jnp.int32(bt)
+                token_iota = jax.lax.broadcasted_iota(jnp.int32, (bt, top_k), 0)
+                k_iota = jax.lax.broadcasted_iota(jnp.int32, (bt, top_k), 1)
+                global_token_offset = jax.lax.axis_index(ep_axis_name) * local_num_tokens + bt_start
+                global_token_iota = token_iota + global_token_offset
+                if local_mask:
+                    topk_ids = (
+                        global_token_iota * top_k + k_iota
+                    ) % local_num_experts + local_start
+                else:
+                    topk_ids = (global_token_iota * top_k + k_iota) % num_experts
+                return topk_ids
+
+            scores = jax.nn.softmax(tile_x, axis=-1)
+            iota = jax.lax.broadcasted_iota(jnp.int32, scores.shape, 1)
+            ids_lst: list[jax.Array] = []
+            scores_i = scores
+            for _ in range(top_k):
+                idx = jnp.argmax(scores_i, axis=1).astype(jnp.int32)
+                ids_lst.append(idx)
+                scores_i = jnp.where(iota == idx[:, None], -jnp.inf, scores_i)
+            return jnp.stack(ids_lst, axis=1)
+
+        def _body(bt_id, carry):
+            cur_max, cur_over = carry
+            topk_ids = _tile_topk_ids(x_bt[bt_id], bt_id=bt_id)
+            counts = jnp.bincount(topk_ids.reshape(-1), length=num_experts)
+            counts = jax.lax.psum(counts, axis_name=ep_axis_name)
+            tile_max = counts.max().astype(jnp.int32)
+            cur_max = jnp.maximum(cur_max, tile_max)
+            cur_over = cur_over + (tile_max > jnp.int32(a2a_max_tokens)).astype(jnp.int32)
+            return cur_max, cur_over
+
+        max_tile_bucket, overflow_tile_count = lax.fori_loop(
+            0, num_bt, _body, (jnp.int32(0), jnp.int32(0)), unroll=False
+        )
+        return (
+            max_tile_bucket,
+            overflow_tile_count,
+            jnp.int32(bt),
+            jnp.int32(a2a_max_tokens),
+        )
+
+    return _stats(router_logits)

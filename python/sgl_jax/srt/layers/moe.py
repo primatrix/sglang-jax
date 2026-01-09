@@ -10,6 +10,7 @@ from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
     fused_ep_moe,
     fused_ep_moe_routing_anomaly_stats,
     fused_ep_moe_routing_stats,
+    fused_ep_moe_routing_tile_overflow_stats,
 )
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
 from sgl_jax.srt.utils.profiling_utils import named_scope
@@ -635,6 +636,40 @@ class FusedEPMoE(nnx.Module):
                     balanced_topk=self.balanced_topk,
                 )
             )
+            max_tile_bucket, overflow_tile_count, bt, a2a_max_tokens = (
+                fused_ep_moe_routing_tile_overflow_stats(
+                    mesh=self.mesh,
+                    tokens=hidden_states,
+                    w2=self.w2.value,
+                    router_logits=router_logits,
+                    top_k=self.num_experts_per_tok,
+                    block_config=block_config,
+                    num_experts=self.num_experts,
+                    ep_axis_name="tensor",
+                    local_mask=self.debug_routing_local_mask,
+                    balanced_topk=self.balanced_topk,
+                    subc_quant_wsz=None,
+                )
+            )
+            hidden_nonfinite_rate = None
+
+            @jax.jit
+            @jax.shard_map(
+                mesh=self.mesh,
+                in_specs=(P("tensor", None),),
+                out_specs=P(),
+                check_vma=False,
+            )
+            def _hidden_nonfinite_rate(hidden_states_shard: jax.Array):
+                any_nonfinite = jnp.any(~jnp.isfinite(hidden_states_shard), axis=1)
+                local_tokens = jnp.int32(hidden_states_shard.shape[0])
+                total_tokens = jax.lax.psum(local_tokens, axis_name="tensor").astype(jnp.float32)
+                nonfinite_count = jax.lax.psum(
+                    jnp.sum(any_nonfinite).astype(jnp.float32), axis_name="tensor"
+                )
+                return nonfinite_count / jnp.maximum(total_tokens, jnp.float32(1.0))
+
+            hidden_nonfinite_rate = _hidden_nonfinite_rate(hidden_states)
 
             @jax.jit
             @jax.shard_map(
@@ -691,16 +726,72 @@ class FusedEPMoE(nnx.Module):
                 dup_rate, dup_count, logits_nonfinite_rate, softmax_nonfinite_rate, all_neg_inf_rate
             )
 
+            @jax.jit
+            @jax.shard_map(
+                mesh=self.mesh,
+                in_specs=(P(), P(), P(), P()),
+                out_specs=P(),
+                check_vma=False,
+            )
+            def _print_tile_once(max_tile_bucket, overflow_tile_count, bt, a2a_max_tokens):
+                should_print = jax.lax.axis_index("tensor") == 0
+
+                def _do_print(_):
+                    jax.debug.print(
+                        "fused_ep_moe routing_tile: layer={layer} bt={bt} a2a_max_tokens={a2a} max_tile_bucket={mx} overflow_tile_count={ov}",
+                        layer=self.layer_id,
+                        bt=bt,
+                        a2a=a2a_max_tokens,
+                        mx=max_tile_bucket,
+                        ov=overflow_tile_count,
+                    )
+                    return jnp.int32(0)
+
+                return jax.lax.cond(should_print, _do_print, lambda _: jnp.int32(0), jnp.int32(0))
+
+            _print_tile_once(max_tile_bucket, overflow_tile_count, bt, a2a_max_tokens)
+
+            @jax.jit
+            @jax.shard_map(
+                mesh=self.mesh,
+                in_specs=(P(),),
+                out_specs=P(),
+                check_vma=False,
+            )
+            def _print_hidden_once(hidden_nonfinite_rate):
+                should_print = jax.lax.axis_index("tensor") == 0
+
+                def _do_print(_):
+                    jax.debug.print(
+                        "fused_ep_moe hidden_anomaly: layer={layer} hidden_nonfinite_rate={nr}",
+                        layer=self.layer_id,
+                        nr=hidden_nonfinite_rate,
+                    )
+                    return jnp.int32(0)
+
+                return jax.lax.cond(should_print, _do_print, lambda _: jnp.int32(0), jnp.int32(0))
+
+            _print_hidden_once(hidden_nonfinite_rate)
+
             if self.debug_routing_raise:
 
                 def _raise_cb(
                     layer, dup_rate, dup_count, logits_nonfinite_rate, softmax_nonfinite_rate
                 ):
+                    import sys
+
                     layer = int(layer)
                     dup_rate = float(dup_rate)
                     dup_count = float(dup_count)
                     logits_nonfinite_rate = float(logits_nonfinite_rate)
                     softmax_nonfinite_rate = float(softmax_nonfinite_rate)
+                    sys.stderr.write(
+                        "fused_ep_moe routing_anomaly (raise): "
+                        f"layer={layer} dup_rate={dup_rate} dup_count={dup_count} "
+                        f"logits_nonfinite_rate={logits_nonfinite_rate} "
+                        f"softmax_nonfinite_rate={softmax_nonfinite_rate}\n"
+                    )
+                    sys.stderr.flush()
                     raise RuntimeError(
                         "fused_ep_moe routing_anomaly: "
                         f"layer={layer} dup_rate={dup_rate} dup_count={dup_count} "
@@ -755,6 +846,104 @@ class FusedEPMoE(nnx.Module):
                     softmax_nonfinite_rate,
                     all_neg_inf_rate,
                 )
+
+                def _raise_overflow_cb(
+                    layer, bt, a2a_max_tokens, max_tile_bucket, overflow_tile_count
+                ):
+                    import sys
+
+                    layer = int(layer)
+                    bt = int(bt)
+                    a2a_max_tokens = int(a2a_max_tokens)
+                    max_tile_bucket = int(max_tile_bucket)
+                    overflow_tile_count = int(overflow_tile_count)
+                    sys.stderr.write(
+                        "fused_ep_moe routing_tile_overflow (raise): "
+                        f"layer={layer} bt={bt} a2a_max_tokens={a2a_max_tokens} "
+                        f"max_tile_bucket={max_tile_bucket} overflow_tile_count={overflow_tile_count}\n"
+                    )
+                    sys.stderr.flush()
+                    raise RuntimeError(
+                        "fused_ep_moe routing_tile_overflow: "
+                        f"layer={layer} bt={bt} a2a_max_tokens={a2a_max_tokens} "
+                        f"max_tile_bucket={max_tile_bucket} overflow_tile_count={overflow_tile_count}"
+                    )
+
+                @jax.jit
+                @jax.shard_map(
+                    mesh=self.mesh,
+                    in_specs=(P(), P(), P(), P()),
+                    out_specs=P(),
+                    check_vma=False,
+                )
+                def _raise_overflow_once(max_tile_bucket, overflow_tile_count, bt, a2a_max_tokens):
+                    should_act = jax.lax.axis_index("tensor") == 0
+                    has_overflow = overflow_tile_count > 0
+
+                    def _do_raise(_):
+                        jax.debug.callback(
+                            _raise_overflow_cb,
+                            jnp.int32(self.layer_id),
+                            bt,
+                            a2a_max_tokens,
+                            max_tile_bucket,
+                            overflow_tile_count,
+                            ordered=True,
+                        )
+                        return jnp.int32(0)
+
+                    return jax.lax.cond(
+                        jnp.logical_and(should_act, has_overflow),
+                        _do_raise,
+                        lambda _: jnp.int32(0),
+                        jnp.int32(0),
+                    )
+
+                _raise_overflow_once(max_tile_bucket, overflow_tile_count, bt, a2a_max_tokens)
+
+                def _raise_hidden_cb(layer, hidden_nonfinite_rate):
+                    import sys
+
+                    layer = int(layer)
+                    hidden_nonfinite_rate = float(hidden_nonfinite_rate)
+                    sys.stderr.write(
+                        "fused_ep_moe hidden_anomaly (raise): "
+                        f"layer={layer} hidden_nonfinite_rate={hidden_nonfinite_rate}\n"
+                    )
+                    sys.stderr.flush()
+                    raise RuntimeError(
+                        "fused_ep_moe hidden_anomaly: "
+                        f"layer={layer} hidden_nonfinite_rate={hidden_nonfinite_rate}"
+                    )
+
+                @jax.jit
+                @jax.shard_map(
+                    mesh=self.mesh,
+                    in_specs=(P(),),
+                    out_specs=P(),
+                    check_vma=False,
+                )
+                def _raise_hidden_once(hidden_nonfinite_rate):
+                    should_act = jax.lax.axis_index("tensor") == 0
+                    has_hidden_anomaly = hidden_nonfinite_rate > 0
+
+                    def _do_raise(_):
+                        jax.debug.callback(
+                            _raise_hidden_cb,
+                            jnp.int32(self.layer_id),
+                            hidden_nonfinite_rate,
+                            ordered=True,
+                        )
+                        return jnp.int32(0)
+
+                    return jax.lax.cond(
+                        jnp.logical_and(should_act, has_hidden_anomaly),
+                        _do_raise,
+                        lambda _: jnp.int32(0),
+                        jnp.int32(0),
+                    )
+
+                _raise_hidden_once(hidden_nonfinite_rate)
 
         output = fused_ep_moe(
             mesh=self.mesh,
