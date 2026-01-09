@@ -597,11 +597,11 @@ def _fused_ep_moe_kernel(
     local_topk_only = perf_mode == "comp_only"
     enable_shared_expert = perf_mode == "normal"
     jax.debug.print(
-        "enable_comm: {enable_comm}, enable_compute: {enable_compute}, local_topk_only: {local_topk_only}, enable_shared_expert: {enable_shared_expert}",
-        enable_comm=enable_comm,
-        enable_compute=enable_compute,
-        local_topk_only=local_topk_only,
-        enable_shared_expert=enable_shared_expert,
+        "enable_comm: {}, enable_compute: {}, local_topk_only: {}, enable_shared_expert: {}",
+        enable_comm,
+        enable_compute,
+        local_topk_only,
+        enable_shared_expert,
     )
 
     h_per_t_packing = hidden_size // t_packing
@@ -1468,9 +1468,10 @@ def _fused_ep_moe_kernel(
 
         dyn_sz_i32 = dyn_sz.astype(jnp.int32)
         num_loops = lax.select(dyn_sz_i32 > 0, (dyn_sz_i32 + (btc - 1)) // btc, 0)
+        num_bd1c = cdiv(bd1, bd1c)
 
         def body(btc_id, _):
-            for bd1c_id in range(cdiv(bd1, bd1c)):
+            def bd1c_body(bd1c_id, _):
                 for p_id in range(t_packing):
                     t = t_vmem[
                         pl.ds(btc_id * btc, btc),
@@ -1484,7 +1485,7 @@ def _fused_ep_moe_kernel(
                             pl.ds(bfc_id * bfc, bfc),
                         )
                         w1 = w1_vmem[*w_slices]
-                        acc1 = jnp.dot(t, w1, preferred_element_type=jnp.float32)
+                        acc1_val = jnp.dot(t, w1, preferred_element_type=jnp.float32)
 
                         if w1_scale_vmem is not None:
                             w1_scale_slices = (
@@ -1494,12 +1495,14 @@ def _fused_ep_moe_kernel(
                                 pl.ds(bfc_id * bfc, bfc),
                             )
                             # TODO(jevinjiang): can use mosaic to load with stride 0.
-                            w1_scale = jnp.broadcast_to(w1_scale_vmem[*w1_scale_slices], acc1.shape)
-                            acc1 *= w1_scale
+                            w1_scale = jnp.broadcast_to(
+                                w1_scale_vmem[*w1_scale_slices], acc1_val.shape
+                            )
+                            acc1_val *= w1_scale
 
                         w3 = w3_vmem[*w_slices]
 
-                        acc3 = jnp.dot(t, w3, preferred_element_type=jnp.float32)
+                        acc3_val = jnp.dot(t, w3, preferred_element_type=jnp.float32)
 
                         if w3_scale_vmem is not None:
                             w3_scale_slices = (
@@ -1508,31 +1511,36 @@ def _fused_ep_moe_kernel(
                                 pl.ds(0, 1),
                                 pl.ds(bfc_id * bfc, bfc),
                             )
-                            w3_scale = jnp.broadcast_to(w3_scale_vmem[*w3_scale_slices], acc3.shape)
-                            acc3 *= w3_scale
+                            w3_scale = jnp.broadcast_to(
+                                w3_scale_vmem[*w3_scale_slices], acc3_val.shape
+                            )
+                            acc3_val *= w3_scale
 
                         acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
-                        if should_init and p_id == bd1c_id == 0:
-                            if b1_vmem is not None:
-                                b1_scale_slices = (
-                                    pl.ds(0, 1),
-                                    pl.ds(bfc_id * bfc, bfc),
-                                )
-                                b1 = jnp.broadcast_to(b1_vmem[*b1_scale_slices], acc1.shape)
-                                acc1 += b1
-                            if b3_vmem is not None:
-                                b3_scale_slices = (
-                                    pl.ds(0, 1),
-                                    pl.ds(bfc_id * bfc, bfc),
-                                )
-                                b3 = jnp.broadcast_to(b3_vmem[*b3_scale_slices], acc1.shape)
-                                acc3 += b3
+                        is_first = jnp.logical_and(p_id == 0, bd1c_id == 0)
+                        should_set = jnp.logical_and(should_init, is_first)
 
-                            acc1_vmem[*acc_slices] = acc1
-                            acc3_vmem[*acc_slices] = acc3
-                        else:
-                            acc1_vmem[*acc_slices] += acc1
-                            acc3_vmem[*acc_slices] += acc3
+                        # Add bias if needed (only on first iteration)
+                        if b1_vmem is not None:
+                            b1_scale_slices = (pl.ds(0, 1), pl.ds(bfc_id * bfc, bfc))
+                            b1 = jnp.broadcast_to(b1_vmem[*b1_scale_slices], acc1_val.shape)
+                            acc1_val = lax.select(should_set, acc1_val + b1, acc1_val)
+                        if b3_vmem is not None:
+                            b3_scale_slices = (pl.ds(0, 1), pl.ds(bfc_id * bfc, bfc))
+                            b3 = jnp.broadcast_to(b3_vmem[*b3_scale_slices], acc3_val.shape)
+                            acc3_val = lax.select(should_set, acc3_val + b3, acc3_val)
+
+                        # Conditional assignment or accumulation
+                        acc1_vmem[*acc_slices] = lax.select(
+                            should_set, acc1_val, acc1_vmem[*acc_slices] + acc1_val
+                        )
+                        acc3_vmem[*acc_slices] = lax.select(
+                            should_set, acc3_val, acc3_vmem[*acc_slices] + acc3_val
+                        )
+
+                return None
+
+            lax.fori_loop(0, num_bd1c, bd1c_body, None, unroll=False)
 
         lax.fori_loop(0, num_loops, body, None)
 
@@ -1566,9 +1574,10 @@ def _fused_ep_moe_kernel(
         dyn_sz_i32 = dyn_sz.astype(jnp.int32)
         num_loops = lax.select(dyn_sz_i32 > 0, (dyn_sz_i32 + (btc - 1)) // btc, 0)
         assert bd2c % (t_packing * 128) == 0, (bd2c, t_packing)
+        num_bd2c = cdiv(bd2, bd2c)
 
-        def body(btc_id, __):
-            for bd2c_id in range(cdiv(bd2, bd2c)):
+        def body(btc_id, _):
+            def bd2c_body(bd2c_id, _):
                 for p_id in range(t_packing):
                     res = jnp.zeros((btc, bd2c_per_t_packing), dtype=jnp.float32)
 
@@ -1611,6 +1620,10 @@ def _fused_ep_moe_kernel(
                         res_slice[...] = res.astype(t_dtype)
                     else:
                         res_slice[...] = (res_slice[...].astype(jnp.float32) + res).astype(t_dtype)
+
+                return None
+
+            lax.fori_loop(0, num_bd2c, bd2c_body, None, unroll=False)
 
         lax.fori_loop(0, num_loops, body, None)
 
