@@ -2529,7 +2529,7 @@ def _validate_fused_ep_moe_args(
         "balanced_topk",
     ],
 )
-def _fused_ep_moe_impl(
+def fused_ep_moe(
     mesh: jax.sharding.Mesh,
     tokens: jax.Array,  # (num_tokens, hidden_size)
     w1: jax.Array,  # (num_experts, hidden_size, intermediate_size)
