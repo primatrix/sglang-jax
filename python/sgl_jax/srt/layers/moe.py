@@ -541,6 +541,7 @@ class FusedEPMoE(nnx.Module):
         balanced_topk: bool = False,
         debug_routing: bool = False,
         debug_routing_local_mask: bool = False,
+        debug_routing_raise: bool = False,
         disable_a2a: bool = False,
     ):
         self.hidden_size = hidden_size
@@ -557,6 +558,7 @@ class FusedEPMoE(nnx.Module):
         self.mesh = mesh
         self.debug_routing = debug_routing
         self.debug_routing_local_mask = debug_routing_local_mask
+        self.debug_routing_raise = debug_routing_raise
         self.disable_a2a = False
 
         if num_experts % self.ep_size != 0:
@@ -622,7 +624,7 @@ class FusedEPMoE(nnx.Module):
                 local_mask=self.debug_routing_local_mask,
                 balanced_topk=self.balanced_topk,
             )
-            dup_rate, dup_count, nonfinite_rate, all_neg_inf_rate = (
+            dup_rate, dup_count, logits_nonfinite_rate, softmax_nonfinite_rate, all_neg_inf_rate = (
                 fused_ep_moe_routing_anomaly_stats(
                     mesh=self.mesh,
                     router_logits=router_logits,
@@ -662,27 +664,97 @@ class FusedEPMoE(nnx.Module):
             @jax.jit
             @jax.shard_map(
                 mesh=self.mesh,
-                in_specs=(P(), P(), P(), P()),
+                in_specs=(P(), P(), P(), P(), P()),
                 out_specs=P(),
                 check_vma=False,
             )
-            def _print_anomaly_once(dup_rate, dup_count, nonfinite_rate, all_neg_inf_rate):
+            def _print_anomaly_once(
+                dup_rate, dup_count, logits_nonfinite_rate, softmax_nonfinite_rate, all_neg_inf_rate
+            ):
                 should_print = jax.lax.axis_index("tensor") == 0
 
                 def _do_print(_):
                     jax.debug.print(
-                        "fused_ep_moe routing_anomaly: layer={layer} dup_rate={dr} dup_count={dc} nonfinite_rate={nr} all_neg_inf_rate={ar}",
+                        "fused_ep_moe routing_anomaly: layer={layer} dup_rate={dr} dup_count={dc} logits_nonfinite_rate={lnr} softmax_nonfinite_rate={snr} all_neg_inf_rate={ar}",
                         layer=self.layer_id,
                         dr=dup_rate,
                         dc=dup_count,
-                        nr=nonfinite_rate,
+                        lnr=logits_nonfinite_rate,
+                        snr=softmax_nonfinite_rate,
                         ar=all_neg_inf_rate,
                     )
                     return jnp.int32(0)
 
                 return jax.lax.cond(should_print, _do_print, lambda _: jnp.int32(0), jnp.int32(0))
 
-            _print_anomaly_once(dup_rate, dup_count, nonfinite_rate, all_neg_inf_rate)
+            _print_anomaly_once(
+                dup_rate, dup_count, logits_nonfinite_rate, softmax_nonfinite_rate, all_neg_inf_rate
+            )
+
+            if self.debug_routing_raise:
+
+                def _raise_cb(
+                    layer, dup_rate, dup_count, logits_nonfinite_rate, softmax_nonfinite_rate
+                ):
+                    layer = int(layer)
+                    dup_rate = float(dup_rate)
+                    dup_count = float(dup_count)
+                    logits_nonfinite_rate = float(logits_nonfinite_rate)
+                    softmax_nonfinite_rate = float(softmax_nonfinite_rate)
+                    raise RuntimeError(
+                        "fused_ep_moe routing_anomaly: "
+                        f"layer={layer} dup_rate={dup_rate} dup_count={dup_count} "
+                        f"logits_nonfinite_rate={logits_nonfinite_rate} "
+                        f"softmax_nonfinite_rate={softmax_nonfinite_rate}"
+                    )
+
+                @jax.jit
+                @jax.shard_map(
+                    mesh=self.mesh,
+                    in_specs=(P(), P(), P(), P(), P()),
+                    out_specs=P(),
+                    check_vma=False,
+                )
+                def _raise_anomaly_once(
+                    dup_rate,
+                    dup_count,
+                    logits_nonfinite_rate,
+                    softmax_nonfinite_rate,
+                    all_neg_inf_rate,
+                ):
+                    del all_neg_inf_rate
+                    should_act = jax.lax.axis_index("tensor") == 0
+                    has_anomaly = jnp.logical_or(
+                        dup_count > 0,
+                        jnp.logical_or(logits_nonfinite_rate > 0, softmax_nonfinite_rate > 0),
+                    )
+
+                    def _do_raise(_):
+                        jax.debug.callback(
+                            _raise_cb,
+                            jnp.int32(self.layer_id),
+                            dup_rate,
+                            dup_count,
+                            logits_nonfinite_rate,
+                            softmax_nonfinite_rate,
+                            ordered=True,
+                        )
+                        return jnp.int32(0)
+
+                    return jax.lax.cond(
+                        jnp.logical_and(should_act, has_anomaly),
+                        _do_raise,
+                        lambda _: jnp.int32(0),
+                        jnp.int32(0),
+                    )
+
+                _raise_anomaly_once(
+                    dup_rate,
+                    dup_count,
+                    logits_nonfinite_rate,
+                    softmax_nonfinite_rate,
+                    all_neg_inf_rate,
+                )
 
         output = fused_ep_moe(
             mesh=self.mesh,

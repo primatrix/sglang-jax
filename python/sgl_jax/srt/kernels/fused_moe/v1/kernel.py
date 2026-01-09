@@ -2435,12 +2435,14 @@ def fused_ep_moe_routing_stats(
             else:
                 topk_ids = (global_token_iota * top_k + k_iota) % num_experts
         else:
-            iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
+            # Mirror the pallas kernel: softmax, then iterative argmax masking.
+            scores = jax.nn.softmax(x, axis=-1)
+            iota = jax.lax.broadcasted_iota(jnp.int32, scores.shape, 1)
             topk_ids_lst: list[jax.Array] = []
             for _ in range(top_k):
-                top1 = jnp.argmax(x, axis=1)
+                top1 = jnp.argmax(scores, axis=1)
                 topk_ids_lst.append(top1)
-                x = jnp.where(iota == top1[:, None], -jnp.inf, x)
+                scores = jnp.where(iota == top1[:, None], -jnp.inf, scores)
             topk_ids = jnp.stack(topk_ids_lst, axis=1)
 
         counts = jnp.bincount(topk_ids.reshape(-1), length=num_experts)
@@ -2464,18 +2466,19 @@ def fused_ep_moe_routing_anomaly_stats(
     ep_axis_name: str = "tensor",
     local_mask: bool = False,
     balanced_topk: bool = False,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Detect routing anomalies outside the pallas kernel.
 
-    Returns `(dup_rate, dup_count, nonfinite_rate, all_neg_inf_rate)`, where:
+    Returns `(dup_rate, dup_count, logits_nonfinite_rate, softmax_nonfinite_rate, all_neg_inf_rate)`, where:
     - `dup_rate`: fraction of tokens whose top-k contains duplicate expert ids
     - `dup_count`: number of such tokens (global across EP)
-    - `nonfinite_rate`: fraction of tokens with any NaN/Inf in logits row
+    - `logits_nonfinite_rate`: fraction of tokens with any NaN/Inf in logits row
+    - `softmax_nonfinite_rate`: fraction of tokens whose softmax scores contain any NaN/Inf
     - `all_neg_inf_rate`: fraction of tokens with all logits == -inf
 
     Notes:
     - The duplicate check mirrors the pallas kernel's iterative argmax masking
-      (not `lax.top_k`) to catch NaN-induced repeats.
+      on softmax scores (not `lax.top_k`) to catch NaN-induced repeats.
     - Global stats require a small collective (`lax.psum`) across `ep_axis_name`.
     """
     if num_experts is None:
@@ -2492,9 +2495,6 @@ def fused_ep_moe_routing_anomaly_stats(
     )
     def _stats(router_logits_shard: jax.Array):
         x = router_logits_shard[:, :num_experts].astype(jnp.float32)
-        any_nonfinite = jnp.any(~jnp.isfinite(x), axis=1)
-        all_neg_inf = jnp.all(jnp.isneginf(x), axis=1)
-
         if local_mask:
             my_id = jax.lax.axis_index(ep_axis_name)
             ep_size = jax.lax.axis_size(ep_axis_name)
@@ -2507,6 +2507,11 @@ def fused_ep_moe_routing_anomaly_stats(
             is_local_expert = jnp.logical_and(expert_iota >= local_start, expert_iota < local_end)
             x = jnp.where(is_local_expert, x, -jnp.inf)
 
+        any_nonfinite_logits = jnp.any(~jnp.isfinite(x), axis=1)
+        all_neg_inf = jnp.all(jnp.isneginf(x), axis=1)
+        scores = jax.nn.softmax(x, axis=-1)
+        any_nonfinite_softmax = jnp.any(~jnp.isfinite(scores), axis=1)
+
         if balanced_topk:
             num_tokens = x.shape[0]
             token_iota = jax.lax.broadcasted_iota(jnp.int32, (num_tokens, top_k), 0)
@@ -2518,14 +2523,14 @@ def fused_ep_moe_routing_anomaly_stats(
             else:
                 topk_ids = (global_token_iota * top_k + k_iota) % num_experts
         else:
-            # Mirror the pallas kernel's iterative argmax + masking.
-            iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
+            # Mirror the pallas kernel's iterative argmax + masking on softmax scores.
+            iota = jax.lax.broadcasted_iota(jnp.int32, scores.shape, 1)
             ids_lst: list[jax.Array] = []
-            x_i = x
+            scores_i = scores
             for _ in range(top_k):
-                idx = jnp.argmax(x_i, axis=1).astype(jnp.int32)
+                idx = jnp.argmax(scores_i, axis=1).astype(jnp.int32)
                 ids_lst.append(idx)
-                x_i = jnp.where(iota == idx[:, None], -jnp.inf, x_i)
+                scores_i = jnp.where(iota == idx[:, None], -jnp.inf, scores_i)
             topk_ids = jnp.stack(ids_lst, axis=1)
 
         sorted_ids = jnp.sort(topk_ids, axis=1)
@@ -2534,16 +2539,20 @@ def fused_ep_moe_routing_anomaly_stats(
         local_tokens = jnp.int32(x.shape[0])
         total_tokens = jax.lax.psum(local_tokens, axis_name=ep_axis_name).astype(jnp.float32)
         dup_count = jax.lax.psum(jnp.sum(has_dup).astype(jnp.float32), axis_name=ep_axis_name)
-        nonfinite_count = jax.lax.psum(
-            jnp.sum(any_nonfinite).astype(jnp.float32), axis_name=ep_axis_name
+        logits_nonfinite_count = jax.lax.psum(
+            jnp.sum(any_nonfinite_logits).astype(jnp.float32), axis_name=ep_axis_name
+        )
+        softmax_nonfinite_count = jax.lax.psum(
+            jnp.sum(any_nonfinite_softmax).astype(jnp.float32), axis_name=ep_axis_name
         )
         all_neg_inf_count = jax.lax.psum(
             jnp.sum(all_neg_inf).astype(jnp.float32), axis_name=ep_axis_name
         )
         denom = jnp.maximum(total_tokens, jnp.float32(1.0))
         dup_rate = dup_count / denom
-        nonfinite_rate = nonfinite_count / denom
+        logits_nonfinite_rate = logits_nonfinite_count / denom
+        softmax_nonfinite_rate = softmax_nonfinite_count / denom
         all_neg_inf_rate = all_neg_inf_count / denom
-        return dup_rate, dup_count, nonfinite_rate, all_neg_inf_rate
+        return dup_rate, dup_count, logits_nonfinite_rate, softmax_nonfinite_rate, all_neg_inf_rate
 
     return _stats(router_logits)
