@@ -933,7 +933,11 @@ def _fused_ep_moe_kernel(
         is_valid = jnp.logical_and(local_e_id >= 0, local_e_id < local_num_experts)
         remote_sz = lax.select(is_valid, remote_sz, 0)
 
-        ref = a2a_g_hbm.at[0, pl.ds(0, lax.select(remote_sz > 0, 1, 0))]
+        # `send_x2_sems` is a DMA semaphore that is incremented by the remote-copy
+        # bytecount; the wait must match the total sent size. Use an `a2a_*` buffer
+        # (sized by `a2a_max_tokens`) to keep the slice in-bounds even when
+        # `remote_sz > bt`.
+        ref = a2a_s_acc_x2_hbm.at[e_sem_id, pl.ds(0, remote_sz)]
         pltpu.make_async_copy(
             src_ref=ref,
             dst_ref=ref,
@@ -941,6 +945,9 @@ def _fused_ep_moe_kernel(
         ).wait()
 
     def wait_a2a_gather_recv_all(*, bt_size):
+        # `a2a_gather_sem` counts DMA bytes; total gather volume per `bt` tile is
+        # `bt_size * top_k`, independent of routing distribution. Drain it by
+        # waiting `top_k` times on a `bt_size` slice.
         for k in range(top_k):
             ref = a2a_g_hbm.at[k, pl.ds(0, bt_size)]
             pltpu.make_async_copy(
