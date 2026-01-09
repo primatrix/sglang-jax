@@ -596,13 +596,6 @@ def _fused_ep_moe_kernel(
     enable_compute = perf_mode != "a2a_only"
     local_topk_only = perf_mode == "comp_only"
     enable_shared_expert = perf_mode == "normal"
-    jax.debug.print(
-        "enable_comm: {}, enable_compute: {}, local_topk_only: {}, enable_shared_expert: {}",
-        enable_comm,
-        enable_compute,
-        local_topk_only,
-        enable_shared_expert,
-    )
 
     h_per_t_packing = hidden_size // t_packing
     assert tokens_hbm.shape[-1] == h_per_t_packing
@@ -2592,6 +2585,14 @@ def fused_ep_moe(
 ):
 
     perf_mode = _canonicalize_fused_ep_moe_perf_mode(perf_mode)
+    enable_comm = perf_mode != "comp_only"
+    enable_compute = perf_mode != "a2a_only"
+    local_topk_only = perf_mode == "comp_only"
+    enable_shared_expert = perf_mode == "normal"
+    print(
+        f"fused_ep_moe: enable_comm={enable_comm}, enable_compute={enable_compute}, "
+        f"local_topk_only={local_topk_only}, enable_shared_expert={enable_shared_expert}"
+    )
     ep_size = get_ep_size(mesh, dp_axis_name, tp_axis_name)
     if block_config is None:
         from .tuned_block_configs import get_tuned_fused_moe_block_config
