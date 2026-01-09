@@ -8,7 +8,6 @@ from flax import nnx
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_loader.loader import get_model_loader
-from sgl_jax.srt.multimodal.configs.vaes.wanvae import WanVAEConfig
 from sgl_jax.srt.server_args import ServerArgs
 
 
@@ -33,8 +32,7 @@ class VaeModelRunner(BaseModelRunner):
         self.initialize_jit()
 
     def load_model(self):
-        # FIXME resoulve model config by model class
-        self.model_config = WanVAEConfig()
+        self.model_config = self.model_class.get_config_class()()
         self.model_config.model_path = self.server_args.model_path
         self.model_config.model_class = self.model_class
         self.model = self.model_loader.load_model(
