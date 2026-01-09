@@ -923,9 +923,8 @@ def _fused_ep_moe_kernel(
     #             sem=send_x2_sems.at[e_sem_id],
     #         ).wait()
 
-    def wait_a2a_gather_send(bt_id, e_sem_id, local_e_id):
+    def wait_a2a_gather_send(*, bt_sem_id, e_sem_id, local_e_id):
         my_e_id = my_id * local_num_experts + local_e_id
-        bt_sem_id = bt_id % 2
         sz = expert_sizes_x2_smem[bt_sem_id, 0, my_e_id]
         local_sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, my_e_id]
         remote_sz = sz - local_sz
