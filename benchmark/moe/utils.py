@@ -418,7 +418,6 @@ class MoEImbalanceSimulator:
             raise ValueError(f"Unknown mode: {mode}")
 
         # 将概率转换为具体的 token 数量
-        print(f"{probs=}")
         counts = np.floor(probs * total_picks).astype(int)
         # 补齐因舍入导致的差值
         diff = total_picks - counts.sum()

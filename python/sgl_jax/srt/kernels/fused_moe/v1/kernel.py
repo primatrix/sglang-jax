@@ -2129,10 +2129,6 @@ def _fused_ep_moe_kernel(
             starts=expert_starts,
             sizes=expert_sizes,
         )
-        # --- 新增: 将当前 bt 块内每个 expert 接收的全局 token 数量存回 HBM ---
-        # expert_sizes_x2_smem 此时存储的是经过 All-Reduce 后的全局 count
-        # 我们将其保存到 expert_counts_hbm 的第 bt_id 行
-        copy_expert_size(bt_sem_id, bt_id)
         sync_barrier()
 
         # Start a2a scatter for first active expert.
@@ -2181,7 +2177,6 @@ def _fused_ep_moe_kernel(
     # Drain outstanding output stores (matches epic wait_send_bo for last two bts).
     wait_store_output(bt_id=jnp.int32(num_bt - 2))
     wait_store_output(bt_id=jnp.int32(num_bt - 1))
-    wait_copy_expert_size()
 
     ### ------- Kernel end ------- ###
 
