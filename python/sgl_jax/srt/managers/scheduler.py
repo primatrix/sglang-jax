@@ -129,6 +129,7 @@ class Scheduler(
         port_args: PortArgs = None,
         communication_backend: CommunicationBackend = None,
         mesh: jax.sharding.Mesh = None,
+        model_class: None = None,
     ):
         # set jit cache
         jit_cache_dir = os.getenv("JAX_COMPILATION_CACHE_DIR", None)
