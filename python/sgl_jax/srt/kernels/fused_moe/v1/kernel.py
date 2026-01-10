@@ -2261,7 +2261,7 @@ def _fused_ep_moe_kernel(
             curr_e_sem_id, curr_se_block = carry
 
             run_shared_expert_step_single(curr_se_block, bt_sem_id)
-            curr_se_block += 1  # SE 指针前进
+            curr_se_block += 1
 
             wait_a2a_scatter_recv(
                 bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id
