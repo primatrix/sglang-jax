@@ -2073,9 +2073,12 @@ def _fused_ep_moe_kernel(
                         out_buf_id, pl.ds(0, bt), pl.ds(hidden_offset, bd2_per_t_packing)
                     ]
 
-                    if block_id == 0:
+                    @pl.when(block_id == 0)
+                    def _(out_slice=out_slice, acc_chunk=acc_chunk):
                         out_slice[...] = acc_chunk.astype(t_dtype)
-                    else:
+
+                    @pl.when(block_id > 0)
+                    def _(out_slice=out_slice, acc_chunk=acc_chunk):
                         out_slice[...] = (out_slice[...].astype(jnp.float32) + acc_chunk).astype(
                             t_dtype
                         )
