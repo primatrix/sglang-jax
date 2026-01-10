@@ -2323,12 +2323,16 @@ def _fused_ep_moe_kernel(
 
         if w1_shared_hbm is not None:
 
-            def acc_se_to_final(h_idx, _):
-                se_val = b_se_out_vmem[pl.ds(0, bt), pl.ds(h_idx, 1)]
-                out_ref = b_output_x2_vmem.at[out_buf_id, pl.ds(0, bt), pl.ds(h_idx, 1)]
-                out_ref[...] = (out_ref[...].astype(jnp.float32) + se_val).astype(output_hbm.dtype)
+            def acc_se_to_final_vectorized(h_vec_idx, _):
+                h_start = h_vec_idx * 128
+                se_slice = b_se_out_vmem[pl.ds(0, bt), pl.ds(h_start, 128)]
 
-            lax.fori_loop(0, hidden_size, acc_se_to_final, None, unroll=False)
+                out_ref = b_output_x2_vmem.at[out_buf_id, pl.ds(0, bt), pl.ds(h_start, 128)]
+                out_ref[...] = (out_ref[...].astype(jnp.float32) + se_slice).astype(
+                    output_hbm.dtype
+                )
+
+            lax.fori_loop(0, hidden_size // 128, acc_se_to_final_vectorized, None, unroll=False)
 
         start_send_bo(bt_id=bt_id)
 
