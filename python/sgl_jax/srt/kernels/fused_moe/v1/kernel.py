@@ -1985,96 +1985,100 @@ def _fused_ep_moe_kernel(
         return s.squeeze(-2)
 
     def run_shared_expert_step_single(block_id, bt_sem_id):
-        if w1_shared_hbm is None or block_id >= se_total_blocks:
+        if w1_shared_hbm is None:
             return
 
-        if num_bd1 > 0:
-            start_fetch_se_w1(0, block_id, 0)
-            start_fetch_se_w3(0, block_id, 0)
+        @pl.when(block_id < se_total_blocks)
+        def _():
+            if num_bd1 > 0:
+                start_fetch_se_w1(0, block_id, 0)
+                start_fetch_se_w3(0, block_id, 0)
 
-        init_val = jnp.zeros((bt, bse), dtype=jnp.float32)
+            init_val = jnp.zeros((bt, bse), dtype=jnp.float32)
 
-        def body_w1w3(bd1_idx, carry):
-            act_gate_acc, act_up_acc = carry
-            curr_sem = bd1_idx % 2
-            next_sem = (bd1_idx + 1) % 2
-            next_bd1_idx = bd1_idx + 1
+            def body_w1w3(bd1_idx, carry):
+                act_gate_acc, act_up_acc = carry
+                curr_sem = bd1_idx % 2
+                next_sem = (bd1_idx + 1) % 2
+                next_bd1_idx = bd1_idx + 1
 
-            @pl.when(next_bd1_idx < num_bd1)
-            def _():
-                start_fetch_se_w1(next_sem, block_id, next_bd1_idx)
-                start_fetch_se_w3(next_sem, block_id, next_bd1_idx)
+                @pl.when(next_bd1_idx < num_bd1)
+                def _():
+                    start_fetch_se_w1(next_sem, block_id, next_bd1_idx)
+                    start_fetch_se_w3(next_sem, block_id, next_bd1_idx)
 
-            wait_fetch_se_w1(curr_sem)
-            wait_fetch_se_w3(curr_sem)
+                wait_fetch_se_w1(curr_sem)
+                wait_fetch_se_w3(curr_sem)
 
-            for p_id in range(t_packing):
-                t = b_se_tokens_vmem[
-                    bt_sem_id,
-                    pl.ds(0, bt),
-                    p_id,
-                    pl.ds(bd1_idx * bd1_per_t_packing, bd1_per_t_packing),
-                ]
-                t_f32 = t.astype(jnp.float32)
+                for p_id in range(t_packing):
+                    t = b_se_tokens_vmem[
+                        bt_sem_id,
+                        pl.ds(0, bt),
+                        p_id,
+                        pl.ds(bd1_idx * bd1_per_t_packing, bd1_per_t_packing),
+                    ]
+                    t_f32 = t.astype(jnp.float32)
 
-                # W1
-                w1_gate = b_se_w1_x2_vmem[curr_sem, p_id]
-                if w1_shared_scale_hbm is not None:
-                    s_gate = b_se_w1_scale_x2_vmem[curr_sem, p_id]
-                    s_gate = broadcast_quant_scale(s_gate, bd1_per_t_packing, subc_quant_wsz)
-                    acc_gate_part = jnp.dot(t_f32, w1_gate.astype(jnp.float32) * s_gate)
-                else:
-                    acc_gate_part = jnp.dot(t_f32, w1_gate.astype(jnp.float32))
+                    # W1
+                    w1_gate = b_se_w1_x2_vmem[curr_sem, p_id]
+                    if w1_shared_scale_hbm is not None:
+                        s_gate = b_se_w1_scale_x2_vmem[curr_sem, p_id]
+                        s_gate = broadcast_quant_scale(s_gate, bd1_per_t_packing, subc_quant_wsz)
+                        acc_gate_part = jnp.dot(t_f32, w1_gate.astype(jnp.float32) * s_gate)
+                    else:
+                        acc_gate_part = jnp.dot(t_f32, w1_gate.astype(jnp.float32))
 
-                # W3
-                w3_up = b_se_w3_x2_vmem[curr_sem, p_id]
-                if w3_shared_scale_hbm is not None:
-                    s_up = b_se_w3_scale_x2_vmem[curr_sem, p_id]
-                    s_up = broadcast_quant_scale(s_up, bd1_per_t_packing, subc_quant_wsz)
-                    acc_up_part = jnp.dot(t_f32, w3_up.astype(jnp.float32) * s_up)
-                else:
-                    acc_up_part = jnp.dot(t_f32, w3_up.astype(jnp.float32))
+                    # W3
+                    w3_up = b_se_w3_x2_vmem[curr_sem, p_id]
+                    if w3_shared_scale_hbm is not None:
+                        s_up = b_se_w3_scale_x2_vmem[curr_sem, p_id]
+                        s_up = broadcast_quant_scale(s_up, bd1_per_t_packing, subc_quant_wsz)
+                        acc_up_part = jnp.dot(t_f32, w3_up.astype(jnp.float32) * s_up)
+                    else:
+                        acc_up_part = jnp.dot(t_f32, w3_up.astype(jnp.float32))
 
-                act_gate_acc += acc_gate_part
-                act_up_acc += acc_up_part
+                    act_gate_acc += acc_gate_part
+                    act_up_acc += acc_up_part
 
-            return (act_gate_acc, act_up_acc)
+                return (act_gate_acc, act_up_acc)
 
-        act_gate, act_up = lax.fori_loop(0, num_bd1, body_w1w3, (init_val, init_val))
-        act = activation_fn(act_gate, act_up, act_fn)
+            act_gate, act_up = lax.fori_loop(0, num_bd1, body_w1w3, (init_val, init_val))
+            act = activation_fn(act_gate, act_up, act_fn)
 
-        if num_bd2 > 0:
-            start_fetch_se_w2(0, block_id, 0)
+            if num_bd2 > 0:
+                start_fetch_se_w2(0, block_id, 0)
 
-        def body_w2(bd2_idx, _):
-            curr_sem = bd2_idx % 2
-            next_sem = (bd2_idx + 1) % 2
-            next_bd2_idx = bd2_idx + 1
+            def body_w2(bd2_idx, _):
+                curr_sem = bd2_idx % 2
+                next_sem = (bd2_idx + 1) % 2
+                next_bd2_idx = bd2_idx + 1
 
-            @pl.when(next_bd2_idx < num_bd2)
-            def _():
-                start_fetch_se_w2(next_sem, block_id, next_bd2_idx)
+                @pl.when(next_bd2_idx < num_bd2)
+                def _():
+                    start_fetch_se_w2(next_sem, block_id, next_bd2_idx)
 
-            wait_fetch_se_w2(curr_sem)
+                wait_fetch_se_w2(curr_sem)
 
-            for p_id in range(t_packing):
-                w2_val = b_se_w2_x2_vmem[curr_sem, p_id]
+                for p_id in range(t_packing):
+                    w2_val = b_se_w2_x2_vmem[curr_sem, p_id]
 
-                if w2_shared_scale_hbm is not None:
-                    s2 = b_se_w2_scale_x2_vmem[curr_sem, p_id]
-                    s2 = broadcast_quant_scale(s2, bse, subc_quant_wsz)
-                    acc_chunk = jnp.dot(act, w2_val.astype(jnp.float32) * s2)
-                else:
-                    acc_chunk = jnp.dot(act, w2_val.astype(jnp.float32))
+                    if w2_shared_scale_hbm is not None:
+                        s2 = b_se_w2_scale_x2_vmem[curr_sem, p_id]
+                        s2 = broadcast_quant_scale(s2, bse, subc_quant_wsz)
+                        acc_chunk = jnp.dot(act, w2_val.astype(jnp.float32) * s2)
+                    else:
+                        acc_chunk = jnp.dot(act, w2_val.astype(jnp.float32))
 
-                hidden_offset = p_id * h_per_t_packing + bd2_idx * bd2_per_t_packing
+                    hidden_offset = p_id * h_per_t_packing + bd2_idx * bd2_per_t_packing
 
-                out_slice = b_se_out_vmem.at[pl.ds(0, bt), pl.ds(hidden_offset, bd2_per_t_packing)]
-                out_slice[...] = (out_slice[...].astype(jnp.float32) + acc_chunk).astype(
-                    jnp.float32
-                )
+                    out_slice = b_se_out_vmem.at[
+                        pl.ds(0, bt), pl.ds(hidden_offset, bd2_per_t_packing)
+                    ]
+                    out_slice[...] = (out_slice[...].astype(jnp.float32) + acc_chunk).astype(
+                        jnp.float32
+                    )
 
-        lax.fori_loop(0, num_bd2, body_w2, None)
+            lax.fori_loop(0, num_bd2, body_w2, None)
 
     # def run_shared_expert(bt_sem_id):
     #     if w1_shared_hbm is None:
