@@ -501,8 +501,8 @@ def _fused_ep_moe_kernel(
     t_stage_x2_vmem,  # <token_buf_id> (2, bts, t_packing, bd1 // t_packing)
     a2a_s_acc_stage_x3_vmem,  # <acc_buf_id> (3, bts, t_packing, bd2 // t_packing)
     b_bias_vmem,  # None | F32(padded_num_experts,)
-    b_se_tokens_vmem,  # None | (bt, hidden_size // t_packing) [Input Buffer]
     b_se_out_vmem,  # None | (bt, hidden_size) [Output Buffer]
+    b_se_tokens_vmem,  # None | (bt, hidden_size // t_packing) [Input Buffer]
     b_se_w1_x2_vmem,  # <sew_sem_id> (2, t_packing, bd1 // t_packing, bf)
     b_se_w3_x2_vmem,  # <sew_sem_id> (2, t_packing, bd1 // t_packing, bf)
     b_se_w2_x2_vmem,  # <sew_sem_id> (2, t_packing, bf, bd2 // t_packing)
