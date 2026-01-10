@@ -157,8 +157,7 @@ def _estimate_vmem_bytes(
 
         # 2. SE Tokens Buffer (b_se_tokens_vmem) -> (2, bt, hidden)
         se_tokens = 2 * bt * hidden * token_bytes
-        se_out = bt * hidden * 4
-        total_bytes += se_w1 + se_w3 + se_w2 + se_tokens + se_out
+        total_bytes += se_w1 + se_w3 + se_w2 + se_tokens
 
     return total_bytes
 
