@@ -542,7 +542,7 @@ def _fused_ep_moe_kernel(
     assert b_output_x2_vmem.shape[1] == bt, (b_output_x2_vmem.shape[1], bt)
     assert local_num_tokens % bt == 0, (local_num_tokens, bt)
     num_bt = local_num_tokens // bt
-    a2a_max_tokens = a2a_s_acc_x2_hbm.shape[1]
+    # a2a_max_tokens = a2a_s_acc_x2_hbm.shape[1]
     right_id = (my_id + 1) % num_devices
     num_experts = a2a_g_hbm.shape[0]
     padded_num_experts = d2e_count_x2_smem.shape[-1]
@@ -1500,9 +1500,9 @@ def _fused_ep_moe_kernel(
 
     def expert_ffn(bt_sem_id, e_sem_id, local_e_id):
         bw_sem_id = jnp.int32(0)
-        b_acc_vmem_2d = b_acc_vmem.reshape(2, a2a_max_tokens, bf)
-        b_acc1_vmem = b_acc_vmem_2d.at[0]
-        b_acc3_vmem = b_acc_vmem_2d.at[1]
+        # b_acc_vmem_2d = b_acc_vmem.reshape(2, a2a_max_tokens, bf)
+        # b_acc1_vmem = b_acc_vmem_2d.at[0]
+        # b_acc3_vmem = b_acc_vmem_2d.at[1]
 
         e_id = my_id * local_num_experts + local_e_id
         dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
@@ -1644,7 +1644,7 @@ def _fused_ep_moe_kernel(
                         b3_vmem=b3_vmem,
                         should_init_ffn1=should_init_ffn1,
                     ):
-                        tile_start = token_tile_id * token_tile
+                        # tile_start = token_tile_id * token_tile
 
                         next_tile_id = token_tile_id + 1
                         next_buf_id = token_buf_id ^ jnp.int32(1)
@@ -1658,20 +1658,20 @@ def _fused_ep_moe_kernel(
 
                         wait_stage_a2a_s_tile(token_buf_id)
 
-                        tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
-                        dynamic_ffn1(
-                            t_vmem=t_stage_x2_vmem.at[token_buf_id],
-                            w1_vmem=w1_vmem,
-                            w1_scale_vmem=w1_scale_vmem,
-                            b1_vmem=b1_vmem,
-                            w3_vmem=w3_vmem,
-                            w3_scale_vmem=w3_scale_vmem,
-                            b3_vmem=b3_vmem,
-                            acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
-                            acc3_vmem=b_acc3_vmem.at[pl.ds(tile_start, token_tile)],
-                            dyn_sz=tile_sz,
-                            should_init=should_init_ffn1,
-                        )
+                        # tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
+                        # dynamic_ffn1(
+                        #     t_vmem=t_stage_x2_vmem.at[token_buf_id],
+                        #     w1_vmem=w1_vmem,
+                        #     w1_scale_vmem=w1_scale_vmem,
+                        #     b1_vmem=b1_vmem,
+                        #     w3_vmem=w3_vmem,
+                        #     w3_scale_vmem=w3_scale_vmem,
+                        #     b3_vmem=b3_vmem,
+                        #     acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
+                        #     acc3_vmem=b_acc3_vmem.at[pl.ds(tile_start, token_tile)],
+                        #     dyn_sz=tile_sz,
+                        #     should_init=should_init_ffn1,
+                        # )
                         return next_buf_id
 
                     lax.fori_loop(
@@ -1765,7 +1765,7 @@ def _fused_ep_moe_kernel(
                     ):
                         buf_compute, buf_store, buf_load = state
                         tile_start = token_tile_id * token_tile
-                        tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
+                        # tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
 
                         if not should_init_ffn2:
                             do_prefetch = token_tile_id + 1 < num_token_tiles
@@ -1792,16 +1792,16 @@ def _fused_ep_moe_kernel(
                             def _(buf_compute=buf_compute):
                                 wait_stage_a2a_s_acc_tile(buf_compute)
 
-                        dynamic_ffn2(
-                            acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
-                            acc3_vmem=b_acc3_vmem.at[pl.ds(tile_start, token_tile)],
-                            w2_vmem=w2_vmem,
-                            w2_scale_vmem=w2_scale_vmem,
-                            b2_vmem=b2_vmem,
-                            res_vmem=a2a_s_acc_stage_x3_vmem.at[buf_compute],
-                            dyn_sz=tile_sz,
-                            should_init=should_init_ffn2,
-                        )
+                        # dynamic_ffn2(
+                        #     acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
+                        #     acc3_vmem=b_acc3_vmem.at[pl.ds(tile_start, token_tile)],
+                        #     w2_vmem=w2_vmem,
+                        #     w2_scale_vmem=w2_scale_vmem,
+                        #     b2_vmem=b2_vmem,
+                        #     res_vmem=a2a_s_acc_stage_x3_vmem.at[buf_compute],
+                        #     dyn_sz=tile_sz,
+                        #     should_init=should_init_ffn2,
+                        # )
                         start_store_stage_a2a_s_acc_tile_to_hbm(tile_start, bd2_start, buf_compute)
                         return (buf_load, buf_compute, buf_store)
 
