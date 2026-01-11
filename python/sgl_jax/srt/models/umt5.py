@@ -303,12 +303,10 @@ class UMT5Attention(nnx.Module):
                 raise ValueError("encoder_hidden_states must be provided for cross attention")
             k, _ = self.k(encoder_hidden_states)
             v, _ = self.v(encoder_hidden_states)
-            key_length = encoder_hidden_states.shape[1]
         else:
             # Self-attention: K/V from input
             k, _ = self.k(hidden_states)
             v, _ = self.v(hidden_states)
-            key_length = seq_length
 
         kv_fused = None
 
@@ -666,16 +664,15 @@ class UMT5EncoderModel(nnx.Module):
         mask = getattr(forward_batch, "attention_mask", None)
 
         # Reshape 1D input_ids to (batch_size, seq_len) for Encoder
-        if x.ndim == 1:
-            if hasattr(forward_batch, "req_pool_indices"):
-                bs = forward_batch.req_pool_indices.shape[0]
-                total_tokens = x.shape[0]
-                if total_tokens % bs == 0:
-                    seq_len = total_tokens // bs
-                    x = x.reshape(bs, seq_len)
-                    # Reshape mask to match input_ids if it exists
-                    if mask is not None and mask.ndim == 1:
-                        mask = mask.reshape(bs, seq_len)
+        if x.ndim == 1 and hasattr(forward_batch, "req_pool_indices"):
+            bs = forward_batch.req_pool_indices.shape[0]
+            total_tokens = x.shape[0]
+            if total_tokens % bs == 0:
+                seq_len = total_tokens // bs
+                x = x.reshape(bs, seq_len)
+                # Reshape mask to match input_ids if it exists
+                if mask is not None and mask.ndim == 1:
+                    mask = mask.reshape(bs, seq_len)
 
         deterministic = getattr(forward_batch, "deterministic", True)
 
