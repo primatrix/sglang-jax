@@ -1508,7 +1508,7 @@ def _fused_ep_moe_kernel(
         dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
         dyn_sz_i32 = dyn_sz.astype(jnp.int32)
 
-        bd1_per_t_packing = bd1 // t_packing
+        # bd1_per_t_packing = bd1 // t_packing
         bd2_per_t_packing = bd2 // t_packing
         # Stage tokens in bt-sized tiles from HBM -> VMEM (to reduce staging frequency),
         # while keeping `btc` as the inner compute block size.
@@ -1516,28 +1516,30 @@ def _fused_ep_moe_kernel(
         num_token_tiles = (dyn_sz_i32 + (token_tile - 1)) // token_tile
 
         def start_stage_a2a_s_tile_from_hbm(tile_start, bd1_id, buf_id):
-            pltpu.make_async_copy(
-                src_ref=a2a_s_x2_hbm.at[
-                    e_sem_id,
-                    pl.ds(tile_start, token_tile),
-                    pl.ds(0, t_packing),
-                    pl.ds(bd1_id * bd1_per_t_packing, bd1_per_t_packing),
-                ],
-                dst_ref=t_stage_x2_vmem.at[
-                    buf_id,
-                    pl.ds(0, token_tile),
-                    pl.ds(0, t_packing),
-                    pl.ds(0, bd1_per_t_packing),
-                ],
-                sem=token_stage_x2_sems.at[buf_id],
-            ).start()
+            # pltpu.make_async_copy(
+            #     src_ref=a2a_s_x2_hbm.at[
+            #         e_sem_id,
+            #         pl.ds(tile_start, token_tile),
+            #         pl.ds(0, t_packing),
+            #         pl.ds(bd1_id * bd1_per_t_packing, bd1_per_t_packing),
+            #     ],
+            #     dst_ref=t_stage_x2_vmem.at[
+            #         buf_id,
+            #         pl.ds(0, token_tile),
+            #         pl.ds(0, t_packing),
+            #         pl.ds(0, bd1_per_t_packing),
+            #     ],
+            #     sem=token_stage_x2_sems.at[buf_id],
+            # ).start()
+            pass
 
         def wait_stage_a2a_s_tile(buf_id):
-            pltpu.make_async_copy(
-                src_ref=t_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
-                dst_ref=t_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
-                sem=token_stage_x2_sems.at[buf_id],
-            ).wait()
+            # pltpu.make_async_copy(
+            #     src_ref=t_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
+            #     dst_ref=t_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
+            #     sem=token_stage_x2_sems.at[buf_id],
+            # ).wait()
+            pass
 
         def start_load_stage_a2a_s_acc_tile_from_hbm(tile_start, bd2_start, buf_id):
             pltpu.make_async_copy(
