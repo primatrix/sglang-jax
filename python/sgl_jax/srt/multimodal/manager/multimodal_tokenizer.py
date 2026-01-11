@@ -167,7 +167,7 @@ class MultimodalTokenizer(TokenizerManager):
                     self.abort_request(state.rid)
                     raise ValueError(
                         f"Request is disconnected from the client side. Abort request rid={state.rid}"
-                    )
+                    ) from None
                 continue
 
             out = state.out_list[-1]
