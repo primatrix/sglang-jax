@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 
 import jax
 import jax.numpy as jnp
@@ -512,6 +513,16 @@ def run_all(
                     case.intermediate_size if use_shared_expert else None
                 ),
                 a2a_only=a2a_only,
+                disable_a2a=os.getenv("FUSED_MOE_BENCHMARK_DISABLE_A2A", False),
+                disable_dynamic_ffn1=os.getenv("FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN1", False),
+                disable_dynamic_ffn2=os.getenv("FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN2", False),
+                disable_weight_load=os.getenv("FUSED_MOE_BENCHMARK_DISABLE_WEIGHT_LOAD", False),
+                disable_a2a_s_tile_read=os.getenv(
+                    "FUSED_MOE_BENCHMARK_DISABLE_A2A_S_TILE_READ", False
+                ),
+                disable_a2a_s_acc_tile_write=os.getenv(
+                    "FUSED_MOE_BENCHMARK_DISABLE_A2A_S_ACC_TILE_WRITE", False
+                ),
             )
 
             moe_def, moe_state = nnx.split(fused_layer)

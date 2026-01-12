@@ -530,6 +530,12 @@ def _fused_ep_moe_kernel(
     bd1c: int,  # Compute size of block hidden_size.
     bd2c: int,  # Compute size of block hidden_size.
     a2a_only: bool,
+    disable_a2a: bool,
+    disable_dynamic_ffn1: bool,
+    disable_dynamic_ffn2: bool,
+    disable_weight_load: bool,
+    disable_a2a_s_tile_read: bool,
+    disable_a2a_s_acc_tile_write: bool,
 ):
     dp_rank = lax.axis_index(dp_axis_name)
     tp_rank = lax.axis_index(tp_axis_name)
@@ -542,7 +548,7 @@ def _fused_ep_moe_kernel(
     assert b_output_x2_vmem.shape[1] == bt, (b_output_x2_vmem.shape[1], bt)
     assert local_num_tokens % bt == 0, (local_num_tokens, bt)
     num_bt = local_num_tokens // bt
-    # a2a_max_tokens = a2a_s_acc_x2_hbm.shape[1]
+    a2a_max_tokens = a2a_s_acc_x2_hbm.shape[1]
     right_id = (my_id + 1) % num_devices
     num_experts = a2a_g_hbm.shape[0]
     padded_num_experts = d2e_count_x2_smem.shape[-1]
@@ -821,124 +827,131 @@ def _fused_ep_moe_kernel(
         )
 
     def start_a2a_scatter(*, bt_sem_id, e_sem_id, local_e_id, bt_start):
+        if disable_a2a:
+            return
+
         # Counting the number of remote sends from the current device.
         # Use `lax.fori_loop` to avoid unrolling `bt` (huge MLIR / slow compile).
-        # def _scatter_one(
-        #     t_id, send_sz, e_sem_id=e_sem_id, local_e_id=local_e_id, bt_start=bt_start
-        # ):
-        #     src_t_id = bt_start + t_id
-        #     for k_id in range(top_k):
-        #         e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
-        #         is_active_expert = e_id % local_num_experts == local_e_id
-        #         recv_id = e_id // local_num_experts
-        #         offset = expert_offsets_x2_smem[bt_sem_id, 0, e_id]
-        #         sz = lax.select(is_active_expert, jnp.int32(1), jnp.int32(0))
-        #         is_local = recv_id == my_id
-        #         local_sz = lax.select(is_local, sz, jnp.int32(0))
-        #         remote_sz = lax.select(is_local, jnp.int32(0), sz)
-        #         send_sz += remote_sz
-        #         expert_offsets_x2_smem[bt_sem_id, 0, e_id] = offset + local_sz + remote_sz
-        #         start = expert_starts_x2_smem[bt_sem_id, 0, e_id] + offset
-        #         pltpu.make_async_copy(
-        #             src_ref=tokens_hbm.at[pl.ds(src_t_id, local_sz)],
-        #             dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
-        #             sem=recv_x2_sems.at[e_sem_id],
-        #         ).start()
-        #         pltpu.make_async_remote_copy(
-        #             src_ref=tokens_hbm.at[pl.ds(src_t_id, remote_sz)],
-        #             dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
-        #             send_sem=send_x2_sems.at[e_sem_id],
-        #             recv_sem=recv_x2_sems.at[e_sem_id],
-        #             device_id=get_mesh_device_id(recv_id),
-        #             device_id_type=pltpu.DeviceIdType.MESH,
-        #         ).start()
+        def _scatter_one(
+            t_id, send_sz, e_sem_id=e_sem_id, local_e_id=local_e_id, bt_start=bt_start
+        ):
+            src_t_id = bt_start + t_id
+            for k_id in range(top_k):
+                e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
+                is_active_expert = e_id % local_num_experts == local_e_id
+                recv_id = e_id // local_num_experts
+                offset = expert_offsets_x2_smem[bt_sem_id, 0, e_id]
+                sz = lax.select(is_active_expert, jnp.int32(1), jnp.int32(0))
+                is_local = recv_id == my_id
+                local_sz = lax.select(is_local, sz, jnp.int32(0))
+                remote_sz = lax.select(is_local, jnp.int32(0), sz)
+                send_sz += remote_sz
+                expert_offsets_x2_smem[bt_sem_id, 0, e_id] = offset + local_sz + remote_sz
+                start = expert_starts_x2_smem[bt_sem_id, 0, e_id] + offset
+                pltpu.make_async_copy(
+                    src_ref=tokens_hbm.at[pl.ds(src_t_id, local_sz)],
+                    dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
+                    sem=recv_x2_sems.at[e_sem_id],
+                ).start()
+                pltpu.make_async_remote_copy(
+                    src_ref=tokens_hbm.at[pl.ds(src_t_id, remote_sz)],
+                    dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
+                    send_sem=send_x2_sems.at[e_sem_id],
+                    recv_sem=recv_x2_sems.at[e_sem_id],
+                    device_id=get_mesh_device_id(recv_id),
+                    device_id_type=pltpu.DeviceIdType.MESH,
+                ).start()
 
-        #     return send_sz
+            return send_sz
 
-        # send_sz = lax.fori_loop(
-        #     0,
-        #     bt,
-        #     _scatter_one,
-        #     jnp.int32(0),
-        #     unroll=False,
-        # )
-        # a2a_s_sends_x2_smem[e_sem_id] = send_sz
-        pass
+        send_sz = lax.fori_loop(
+            0,
+            bt,
+            _scatter_one,
+            jnp.int32(0),
+            unroll=False,
+        )
+        a2a_s_sends_x2_smem[e_sem_id] = send_sz
 
     def wait_a2a_scatter_recv(*, bt_sem_id, e_sem_id, local_e_id):
-        # e_id = my_id * local_num_experts + local_e_id
-        # sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
-        # pltpu.make_async_copy(
-        #     src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
-        #     dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
-        #     sem=recv_x2_sems.at[e_sem_id],
-        # ).wait()
-        pass
+        if disable_a2a:
+            return
+        e_id = my_id * local_num_experts + local_e_id
+        sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
+        pltpu.make_async_copy(
+            src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
+            dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
+            sem=recv_x2_sems.at[e_sem_id],
+        ).wait()
 
     def wait_a2a_scatter_send(e_sem_id):
-        # sz = a2a_s_sends_x2_smem[e_sem_id]
-        # pltpu.make_async_copy(
-        #     src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
-        #     dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
-        #     sem=send_x2_sems.at[e_sem_id],
-        # ).wait()
-        pass
+        if disable_a2a:
+            return
+        sz = a2a_s_sends_x2_smem[e_sem_id]
+        pltpu.make_async_copy(
+            src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
+            dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
+            sem=send_x2_sems.at[e_sem_id],
+        ).wait()
 
     def start_a2a_gather(*, bt_sem_id, e_sem_id, local_e_id):
-        # my_e_id = my_id * local_num_experts + local_e_id
-        # start = 0
-        # src_ref = a2a_s_acc_x2_hbm
-        # for recv_id in range(num_devices):
-        #     sz = d2e_count_x2_smem[bt_sem_id, recv_id, 0, my_e_id]
-        #     is_local = recv_id == my_id
-        #     local_sz = lax.select(is_local, sz, 0)
-        #     remote_sz = lax.select(is_local, 0, sz)
-        #     pltpu.make_async_copy(
-        #         src_ref=src_ref.at[e_sem_id, pl.ds(start, local_sz)],
-        #         dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, local_sz)],
-        #         sem=a2a_gather_sem,
-        #     ).start()
-        #     pltpu.make_async_remote_copy(
-        #         src_ref=src_ref.at[e_sem_id, pl.ds(start, remote_sz)],
-        #         dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, remote_sz)],
-        #         send_sem=send_x2_sems.at[e_sem_id],
-        #         recv_sem=a2a_gather_sem,
-        #         device_id=get_mesh_device_id(recv_id),
-        #         device_id_type=pltpu.DeviceIdType.MESH,
-        #     ).start()
+        if disable_a2a:
+            return
+        my_e_id = my_id * local_num_experts + local_e_id
+        start = 0
+        src_ref = a2a_s_acc_x2_hbm
+        for recv_id in range(num_devices):
+            sz = d2e_count_x2_smem[bt_sem_id, recv_id, 0, my_e_id]
+            is_local = recv_id == my_id
+            local_sz = lax.select(is_local, sz, 0)
+            remote_sz = lax.select(is_local, 0, sz)
+            pltpu.make_async_copy(
+                src_ref=src_ref.at[e_sem_id, pl.ds(start, local_sz)],
+                dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, local_sz)],
+                sem=a2a_gather_sem,
+            ).start()
+            pltpu.make_async_remote_copy(
+                src_ref=src_ref.at[e_sem_id, pl.ds(start, remote_sz)],
+                dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, remote_sz)],
+                send_sem=send_x2_sems.at[e_sem_id],
+                recv_sem=a2a_gather_sem,
+                device_id=get_mesh_device_id(recv_id),
+                device_id_type=pltpu.DeviceIdType.MESH,
+            ).start()
 
-        #     start += sz
-        pass
+            start += sz
 
     def wait_a2a_gather_send(*, bt_sem_id, e_sem_id, local_e_id):
-        # my_e_id = my_id * local_num_experts + local_e_id
-        # sz = expert_sizes_x2_smem[bt_sem_id, 0, my_e_id]
-        # local_sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, my_e_id]
-        # remote_sz = sz - local_sz
-        # is_valid = jnp.logical_and(local_e_id >= 0, local_e_id < local_num_experts)
-        # remote_sz = lax.select(is_valid, remote_sz, 0)
+        if disable_a2a:
+            return
+        my_e_id = my_id * local_num_experts + local_e_id
+        sz = expert_sizes_x2_smem[bt_sem_id, 0, my_e_id]
+        local_sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, my_e_id]
+        remote_sz = sz - local_sz
+        is_valid = jnp.logical_and(local_e_id >= 0, local_e_id < local_num_experts)
+        remote_sz = lax.select(is_valid, remote_sz, 0)
 
-        # # Important: wait via `a2a_g_hbm` itself (matches f5b4) so reads from
-        # # `a2a_g_hbm` can't be reordered before the gather completes.
-        # ref = a2a_g_hbm.at[0, pl.ds(0, remote_sz)]
-        # pltpu.make_async_copy(
-        #     src_ref=ref,
-        #     dst_ref=ref,
-        #     sem=send_x2_sems.at[e_sem_id],
-        # ).wait()
-        pass
+        # Important: wait via `a2a_g_hbm` itself (matches f5b4) so reads from
+        # `a2a_g_hbm` can't be reordered before the gather completes.
+        ref = a2a_g_hbm.at[0, pl.ds(0, remote_sz)]
+        pltpu.make_async_copy(
+            src_ref=ref,
+            dst_ref=ref,
+            sem=send_x2_sems.at[e_sem_id],
+        ).wait()
 
     def wait_a2a_gather_recv_all(*, bt_size):
-        # # Align to f5b4: wait using a flat slice into `a2a_g_hbm` sized to the
-        # # total gathered token vectors for this bt tile (`top_k * bt_size`).
-        # sz = jnp.int32(bt_size * top_k)
-        # ref = a2a_g_hbm.at[0, pl.ds(0, sz)]
-        # pltpu.make_async_copy(
-        #     src_ref=ref,
-        #     dst_ref=ref,
-        #     sem=a2a_gather_sem,
-        # ).wait()
-        pass
+        if disable_a2a:
+            return
+        # Align to f5b4: wait using a flat slice into `a2a_g_hbm` sized to the
+        # total gathered token vectors for this bt tile (`top_k * bt_size`).
+        sz = jnp.int32(bt_size * top_k)
+        ref = a2a_g_hbm.at[0, pl.ds(0, sz)]
+        pltpu.make_async_copy(
+            src_ref=ref,
+            dst_ref=ref,
+            sem=a2a_gather_sem,
+        ).wait()
 
     def start_fetch_and_wait_bias():
         if bias_hbm is not None:
@@ -951,185 +964,187 @@ def _fused_ep_moe_kernel(
             bias_copy.wait()
 
     def start_fetch_bw1(local_e_id, bw1_sem_id, bf_id, bd1_id):
-        # for p in range(t_packing):
-        #     offset = p * h_per_t_packing + bd1_id * bd1_per_t_packing
-        #     pltpu.make_async_copy(
-        #         src_ref=w1_hbm.at[
-        #             local_e_id,
-        #             pl.ds(offset, bd1_per_t_packing),
-        #             pl.ds(bf_id * bf, bf),
-        #         ],
-        #         dst_ref=b_w1_x2_vmem.at[bw1_sem_id, p],
-        #         sem=local_sems.at[bw1_sem_id, 1],
-        #     ).start()
-        #     if w1_scale_hbm is not None:
-        #         assert subc_quant_wsz is not None
-        #         pltpu.make_async_copy(
-        #             src_ref=w1_scale_hbm.at[
-        #                 local_e_id,
-        #                 pl.ds(
-        #                     offset // subc_quant_wsz,
-        #                     bd1_per_t_packing // subc_quant_wsz,
-        #                 ),
-        #                 pl.ds(0, 1),
-        #                 pl.ds(bf_id * bf, bf),
-        #             ],
-        #             dst_ref=b_w1_scale_x2_vmem.at[bw1_sem_id, p],
-        #             sem=local_sems.at[bw1_sem_id, 1],
-        #         ).start()
-        # if b1_hbm is not None:
+        if disable_weight_load:
+            return
+        for p in range(t_packing):
+            offset = p * h_per_t_packing + bd1_id * bd1_per_t_packing
+            pltpu.make_async_copy(
+                src_ref=w1_hbm.at[
+                    local_e_id,
+                    pl.ds(offset, bd1_per_t_packing),
+                    pl.ds(bf_id * bf, bf),
+                ],
+                dst_ref=b_w1_x2_vmem.at[bw1_sem_id, p],
+                sem=local_sems.at[bw1_sem_id, 1],
+            ).start()
+            if w1_scale_hbm is not None:
+                assert subc_quant_wsz is not None
+                pltpu.make_async_copy(
+                    src_ref=w1_scale_hbm.at[
+                        local_e_id,
+                        pl.ds(
+                            offset // subc_quant_wsz,
+                            bd1_per_t_packing // subc_quant_wsz,
+                        ),
+                        pl.ds(0, 1),
+                        pl.ds(bf_id * bf, bf),
+                    ],
+                    dst_ref=b_w1_scale_x2_vmem.at[bw1_sem_id, p],
+                    sem=local_sems.at[bw1_sem_id, 1],
+                ).start()
+        if b1_hbm is not None:
 
-        #     @pl.when(bd1_id == 0)
-        #     def _():
-        #         pltpu.make_async_copy(
-        #             src_ref=b1_hbm.at[local_e_id, pl.ds(0, 1), pl.ds(bf_id * bf, bf)],
-        #             dst_ref=b_b1_x2_vmem.at[bf_id % 2],
-        #             sem=local_sems.at[bw1_sem_id, 1],
-        #         ).start()
-
-        pass
+            @pl.when(bd1_id == 0)
+            def _():
+                pltpu.make_async_copy(
+                    src_ref=b1_hbm.at[local_e_id, pl.ds(0, 1), pl.ds(bf_id * bf, bf)],
+                    dst_ref=b_b1_x2_vmem.at[bf_id % 2],
+                    sem=local_sems.at[bw1_sem_id, 1],
+                ).start()
 
     def start_fetch_bw2(local_e_id, bw2_sem_id, bf_id, bd2_id):
-        # for p in range(t_packing):
-        #     offset = p * h_per_t_packing + bd2_id * bd2_per_t_packing
-        #     pltpu.make_async_copy(
-        #         src_ref=w2_hbm.at[
-        #             local_e_id,
-        #             pl.ds(bf_id * bf, bf),
-        #             pl.ds(offset, bd2_per_t_packing),
-        #         ],
-        #         dst_ref=b_w2_x2_vmem.at[bw2_sem_id, p],
-        #         sem=local_sems.at[bw2_sem_id, 2],
-        #     ).start()
-        #     if w2_scale_hbm is not None:
-        #         assert subc_quant_wsz is not None
-        #         pltpu.make_async_copy(
-        #             src_ref=w2_scale_hbm.at[
-        #                 local_e_id,
-        #                 pl.ds(bf_id * bf // subc_quant_wsz, bf // subc_quant_wsz),
-        #                 pl.ds(0, 1),
-        #                 pl.ds(offset, bd2_per_t_packing),
-        #             ],
-        #             dst_ref=b_w2_scale_x2_vmem.at[bw2_sem_id, p],
-        #             sem=local_sems.at[bw2_sem_id, 2],
-        #         ).start()
-        #     if b2_hbm is not None and bf_id == 0:
-        #         pltpu.make_async_copy(
-        #             src_ref=b2_hbm.at[local_e_id, pl.ds(0, 1), pl.ds(offset, bd2_per_t_packing)],
-        #             dst_ref=b_b2_x2_vmem.at[bd2_id % 2, p],
-        #             sem=local_sems.at[bw2_sem_id, 2],
-        #         ).start()
-        pass
+        if disable_weight_load:
+            return
+        for p in range(t_packing):
+            offset = p * h_per_t_packing + bd2_id * bd2_per_t_packing
+            pltpu.make_async_copy(
+                src_ref=w2_hbm.at[
+                    local_e_id,
+                    pl.ds(bf_id * bf, bf),
+                    pl.ds(offset, bd2_per_t_packing),
+                ],
+                dst_ref=b_w2_x2_vmem.at[bw2_sem_id, p],
+                sem=local_sems.at[bw2_sem_id, 2],
+            ).start()
+            if w2_scale_hbm is not None:
+                assert subc_quant_wsz is not None
+                pltpu.make_async_copy(
+                    src_ref=w2_scale_hbm.at[
+                        local_e_id,
+                        pl.ds(bf_id * bf // subc_quant_wsz, bf // subc_quant_wsz),
+                        pl.ds(0, 1),
+                        pl.ds(offset, bd2_per_t_packing),
+                    ],
+                    dst_ref=b_w2_scale_x2_vmem.at[bw2_sem_id, p],
+                    sem=local_sems.at[bw2_sem_id, 2],
+                ).start()
+            if b2_hbm is not None and bf_id == 0:
+                pltpu.make_async_copy(
+                    src_ref=b2_hbm.at[local_e_id, pl.ds(0, 1), pl.ds(offset, bd2_per_t_packing)],
+                    dst_ref=b_b2_x2_vmem.at[bd2_id % 2, p],
+                    sem=local_sems.at[bw2_sem_id, 2],
+                ).start()
 
     def start_fetch_bw3(local_e_id, bw3_sem_id, bf_id, bd3_id):
-        # for p in range(t_packing):
-        #     offset = p * h_per_t_packing + bd3_id * bd1_per_t_packing
-        #     pltpu.make_async_copy(
-        #         src_ref=w3_hbm.at[
-        #             local_e_id,
-        #             pl.ds(offset, bd1_per_t_packing),
-        #             pl.ds(bf_id * bf, bf),
-        #         ],
-        #         dst_ref=b_w3_x2_vmem.at[bw3_sem_id, p],
-        #         sem=local_sems.at[bw3_sem_id, 3],
-        #     ).start()
-        #     if w3_scale_hbm is not None:
-        #         assert subc_quant_wsz is not None
-        #         pltpu.make_async_copy(
-        #             src_ref=w3_scale_hbm.at[
-        #                 local_e_id,
-        #                 pl.ds(
-        #                     offset // subc_quant_wsz,
-        #                     bd1_per_t_packing // subc_quant_wsz,
-        #                 ),
-        #                 pl.ds(0, 1),
-        #                 pl.ds(bf_id * bf, bf),
-        #             ],
-        #             dst_ref=b_w3_scale_x2_vmem.at[bw3_sem_id, p],
-        #             sem=local_sems.at[bw3_sem_id, 3],
-        #         ).start()
-        # if b3_hbm is not None:
+        if disable_weight_load:
+            return
+        for p in range(t_packing):
+            offset = p * h_per_t_packing + bd3_id * bd1_per_t_packing
+            pltpu.make_async_copy(
+                src_ref=w3_hbm.at[
+                    local_e_id,
+                    pl.ds(offset, bd1_per_t_packing),
+                    pl.ds(bf_id * bf, bf),
+                ],
+                dst_ref=b_w3_x2_vmem.at[bw3_sem_id, p],
+                sem=local_sems.at[bw3_sem_id, 3],
+            ).start()
+            if w3_scale_hbm is not None:
+                assert subc_quant_wsz is not None
+                pltpu.make_async_copy(
+                    src_ref=w3_scale_hbm.at[
+                        local_e_id,
+                        pl.ds(
+                            offset // subc_quant_wsz,
+                            bd1_per_t_packing // subc_quant_wsz,
+                        ),
+                        pl.ds(0, 1),
+                        pl.ds(bf_id * bf, bf),
+                    ],
+                    dst_ref=b_w3_scale_x2_vmem.at[bw3_sem_id, p],
+                    sem=local_sems.at[bw3_sem_id, 3],
+                ).start()
+        if b3_hbm is not None:
 
-        #     @pl.when(bd3_id == 0)
-        #     def _():
-        #         pltpu.make_async_copy(
-        #             src_ref=b3_hbm.at[local_e_id, pl.ds(0, 1), pl.ds(bf_id * bf, bf)],
-        #             dst_ref=b_b3_x2_vmem.at[bf_id % 2],
-        #             sem=local_sems.at[bw3_sem_id, 3],
-        #         ).start()
-
-        pass
+            @pl.when(bd3_id == 0)
+            def _():
+                pltpu.make_async_copy(
+                    src_ref=b3_hbm.at[local_e_id, pl.ds(0, 1), pl.ds(bf_id * bf, bf)],
+                    dst_ref=b_b3_x2_vmem.at[bf_id % 2],
+                    sem=local_sems.at[bw3_sem_id, 3],
+                ).start()
 
     def wait_fetch_bw1(local_e_id, bw1_sem_id, bf_id, bd1_id):
         del local_e_id
-        # pltpu.make_async_copy(
-        #     src_ref=b_w1_x2_vmem.at[bw1_sem_id],
-        #     dst_ref=b_w1_x2_vmem.at[bw1_sem_id],
-        #     sem=local_sems.at[bw1_sem_id, 1],
-        # ).wait()
-        # if w1_scale_hbm is not None:
-        #     pltpu.make_async_copy(
-        #         src_ref=b_w1_scale_x2_vmem.at[bw1_sem_id],
-        #         dst_ref=b_w1_scale_x2_vmem.at[bw1_sem_id],
-        #         sem=local_sems.at[bw1_sem_id, 1],
-        #     ).wait()
-        # if b1_hbm is not None:
+        if disable_weight_load:
+            return
+        pltpu.make_async_copy(
+            src_ref=b_w1_x2_vmem.at[bw1_sem_id],
+            dst_ref=b_w1_x2_vmem.at[bw1_sem_id],
+            sem=local_sems.at[bw1_sem_id, 1],
+        ).wait()
+        if w1_scale_hbm is not None:
+            pltpu.make_async_copy(
+                src_ref=b_w1_scale_x2_vmem.at[bw1_sem_id],
+                dst_ref=b_w1_scale_x2_vmem.at[bw1_sem_id],
+                sem=local_sems.at[bw1_sem_id, 1],
+            ).wait()
+        if b1_hbm is not None:
 
-        #     @pl.when(bd1_id == 0)
-        #     def _():
-        #         pltpu.make_async_copy(
-        #             src_ref=b_b1_x2_vmem.at[bf_id % 2],
-        #             dst_ref=b_b1_x2_vmem.at[bf_id % 2],
-        #             sem=local_sems.at[bw1_sem_id, 1],
-        #         ).wait()
-
-        pass
+            @pl.when(bd1_id == 0)
+            def _():
+                pltpu.make_async_copy(
+                    src_ref=b_b1_x2_vmem.at[bf_id % 2],
+                    dst_ref=b_b1_x2_vmem.at[bf_id % 2],
+                    sem=local_sems.at[bw1_sem_id, 1],
+                ).wait()
 
     def wait_fetch_bw2(local_e_id, bw2_sem_id, bf_id, bd2_id):
         del local_e_id
-        # pltpu.make_async_copy(
-        #     src_ref=b_w2_x2_vmem.at[bw2_sem_id],
-        #     dst_ref=b_w2_x2_vmem.at[bw2_sem_id],
-        #     sem=local_sems.at[bw2_sem_id, 2],
-        # ).wait()
-        # if w2_scale_hbm is not None:
-        #     pltpu.make_async_copy(
-        #         src_ref=b_w2_scale_x2_vmem.at[bw2_sem_id],
-        #         dst_ref=b_w2_scale_x2_vmem.at[bw2_sem_id],
-        #         sem=local_sems.at[bw2_sem_id, 2],
-        #     ).wait()
-        # if b2_hbm is not None and bf_id == 0:
-        #     pltpu.make_async_copy(
-        #         src_ref=b_b2_x2_vmem.at[bd2_id % 2],
-        #         dst_ref=b_b2_x2_vmem.at[bd2_id % 2],
-        #         sem=local_sems.at[bw2_sem_id, 2],
-        #     ).wait()
-        pass
+        if disable_weight_load:
+            return
+        pltpu.make_async_copy(
+            src_ref=b_w2_x2_vmem.at[bw2_sem_id],
+            dst_ref=b_w2_x2_vmem.at[bw2_sem_id],
+            sem=local_sems.at[bw2_sem_id, 2],
+        ).wait()
+        if w2_scale_hbm is not None:
+            pltpu.make_async_copy(
+                src_ref=b_w2_scale_x2_vmem.at[bw2_sem_id],
+                dst_ref=b_w2_scale_x2_vmem.at[bw2_sem_id],
+                sem=local_sems.at[bw2_sem_id, 2],
+            ).wait()
+        if b2_hbm is not None and bf_id == 0:
+            pltpu.make_async_copy(
+                src_ref=b_b2_x2_vmem.at[bd2_id % 2],
+                dst_ref=b_b2_x2_vmem.at[bd2_id % 2],
+                sem=local_sems.at[bw2_sem_id, 2],
+            ).wait()
 
     def wait_fetch_bw3(local_e_id, bw3_sem_id, bf_id, bd3_id):
         del local_e_id
-        # pltpu.make_async_copy(
-        #     src_ref=b_w3_x2_vmem.at[bw3_sem_id],
-        #     dst_ref=b_w3_x2_vmem.at[bw3_sem_id],
-        #     sem=local_sems.at[bw3_sem_id, 3],
-        # ).wait()
-        # if w3_scale_hbm is not None:
-        #     pltpu.make_async_copy(
-        #         src_ref=b_w3_scale_x2_vmem.at[bw3_sem_id],
-        #         dst_ref=b_w3_scale_x2_vmem.at[bw3_sem_id],
-        #         sem=local_sems.at[bw3_sem_id, 3],
-        #     ).wait()
-        # if b3_hbm is not None:
+        if disable_weight_load:
+            return
+        pltpu.make_async_copy(
+            src_ref=b_w3_x2_vmem.at[bw3_sem_id],
+            dst_ref=b_w3_x2_vmem.at[bw3_sem_id],
+            sem=local_sems.at[bw3_sem_id, 3],
+        ).wait()
+        if w3_scale_hbm is not None:
+            pltpu.make_async_copy(
+                src_ref=b_w3_scale_x2_vmem.at[bw3_sem_id],
+                dst_ref=b_w3_scale_x2_vmem.at[bw3_sem_id],
+                sem=local_sems.at[bw3_sem_id, 3],
+            ).wait()
+        if b3_hbm is not None:
 
-        #     @pl.when(bd3_id == 0)
-        #     def _():
-        #         pltpu.make_async_copy(
-        #             src_ref=b_b3_x2_vmem.at[bf_id % 2],
-        #             dst_ref=b_b3_x2_vmem.at[bf_id % 2],
-        #             sem=local_sems.at[bw3_sem_id, 3],
-        #         ).wait()
-
-        pass
+            @pl.when(bd3_id == 0)
+            def _():
+                pltpu.make_async_copy(
+                    src_ref=b_b3_x2_vmem.at[bf_id % 2],
+                    dst_ref=b_b3_x2_vmem.at[bf_id % 2],
+                    sem=local_sems.at[bw3_sem_id, 3],
+                ).wait()
 
     def start_fetch_se_tokens(bt_id):
         if w1_shared_hbm is None:
@@ -1497,9 +1512,9 @@ def _fused_ep_moe_kernel(
 
     def expert_ffn(bt_sem_id, e_sem_id, local_e_id):
         bw_sem_id = jnp.int32(0)
-        # b_acc_vmem_2d = b_acc_vmem.reshape(2, a2a_max_tokens, bf)
-        # b_acc1_vmem = b_acc_vmem_2d.at[0]
-        # b_acc3_vmem = b_acc_vmem_2d.at[1]
+        b_acc_vmem_2d = b_acc_vmem.reshape(2, a2a_max_tokens, bf)
+        b_acc1_vmem = b_acc_vmem_2d.at[0]
+        b_acc3_vmem = b_acc_vmem_2d.at[1]
 
         e_id = my_id * local_num_experts + local_e_id
         dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
@@ -1513,80 +1528,85 @@ def _fused_ep_moe_kernel(
         num_token_tiles = (dyn_sz_i32 + (token_tile - 1)) // token_tile
 
         def start_stage_a2a_s_tile_from_hbm(tile_start, bd1_id, buf_id):
-            # pltpu.make_async_copy(
-            #     src_ref=a2a_s_x2_hbm.at[
-            #         e_sem_id,
-            #         pl.ds(tile_start, token_tile),
-            #         pl.ds(0, t_packing),
-            #         pl.ds(bd1_id * bd1_per_t_packing, bd1_per_t_packing),
-            #     ],
-            #     dst_ref=t_stage_x2_vmem.at[
-            #         buf_id,
-            #         pl.ds(0, token_tile),
-            #         pl.ds(0, t_packing),
-            #         pl.ds(0, bd1_per_t_packing),
-            #     ],
-            #     sem=token_stage_x2_sems.at[buf_id],
-            # ).start()
-            pass
+            if disable_a2a_s_tile_read:
+                return
+            pltpu.make_async_copy(
+                src_ref=a2a_s_x2_hbm.at[
+                    e_sem_id,
+                    pl.ds(tile_start, token_tile),
+                    pl.ds(0, t_packing),
+                    pl.ds(bd1_id * bd1_per_t_packing, bd1_per_t_packing),
+                ],
+                dst_ref=t_stage_x2_vmem.at[
+                    buf_id,
+                    pl.ds(0, token_tile),
+                    pl.ds(0, t_packing),
+                    pl.ds(0, bd1_per_t_packing),
+                ],
+                sem=token_stage_x2_sems.at[buf_id],
+            ).start()
 
         def wait_stage_a2a_s_tile(buf_id):
-            # pltpu.make_async_copy(
-            #     src_ref=t_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
-            #     dst_ref=t_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
-            #     sem=token_stage_x2_sems.at[buf_id],
-            # ).wait()
-            pass
+            if disable_a2a_s_tile_read:
+                return
+            pltpu.make_async_copy(
+                src_ref=t_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
+                dst_ref=t_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
+                sem=token_stage_x2_sems.at[buf_id],
+            ).wait()
 
         def start_load_stage_a2a_s_acc_tile_from_hbm(tile_start, bd2_start, buf_id):
-            # pltpu.make_async_copy(
-            #     src_ref=a2a_s_acc_x2_hbm.at[
-            #         e_sem_id,
-            #         pl.ds(tile_start, token_tile),
-            #         pl.ds(0, t_packing),
-            #         pl.ds(bd2_start, bd2_per_t_packing),
-            #     ],
-            #     dst_ref=a2a_s_acc_stage_x3_vmem.at[
-            #         buf_id,
-            #         pl.ds(0, token_tile),
-            #         pl.ds(0, t_packing),
-            #         pl.ds(0, bd2_per_t_packing),
-            #     ],
-            #     sem=acc_stage_x3_sems.at[buf_id],
-            # ).start()
-            pass
+            if disable_a2a_s_acc_tile_write:
+                return
+            pltpu.make_async_copy(
+                src_ref=a2a_s_acc_x2_hbm.at[
+                    e_sem_id,
+                    pl.ds(tile_start, token_tile),
+                    pl.ds(0, t_packing),
+                    pl.ds(bd2_start, bd2_per_t_packing),
+                ],
+                dst_ref=a2a_s_acc_stage_x3_vmem.at[
+                    buf_id,
+                    pl.ds(0, token_tile),
+                    pl.ds(0, t_packing),
+                    pl.ds(0, bd2_per_t_packing),
+                ],
+                sem=acc_stage_x3_sems.at[buf_id],
+            ).start()
 
         def wait_stage_a2a_s_acc_tile(buf_id):
-            # pltpu.make_async_copy(
-            #     src_ref=a2a_s_acc_stage_x3_vmem.at[
-            #         buf_id,
-            #         pl.ds(0, token_tile),
-            #     ],
-            #     dst_ref=a2a_s_acc_stage_x3_vmem.at[
-            #         buf_id,
-            #         pl.ds(0, token_tile),
-            #     ],
-            #     sem=acc_stage_x3_sems.at[buf_id],
-            # ).wait()
-            pass
+            if disable_a2a_s_acc_tile_write:
+                return
+            pltpu.make_async_copy(
+                src_ref=a2a_s_acc_stage_x3_vmem.at[
+                    buf_id,
+                    pl.ds(0, token_tile),
+                ],
+                dst_ref=a2a_s_acc_stage_x3_vmem.at[
+                    buf_id,
+                    pl.ds(0, token_tile),
+                ],
+                sem=acc_stage_x3_sems.at[buf_id],
+            ).wait()
 
         def start_store_stage_a2a_s_acc_tile_to_hbm(tile_start, bd2_start, buf_id):
-            # pltpu.make_async_copy(
-            #     src_ref=a2a_s_acc_stage_x3_vmem.at[
-            #         buf_id,
-            #         pl.ds(0, token_tile),
-            #         pl.ds(0, t_packing),
-            #         pl.ds(0, bd2_per_t_packing),
-            #     ],
-            #     dst_ref=a2a_s_acc_x2_hbm.at[
-            #         e_sem_id,
-            #         pl.ds(tile_start, token_tile),
-            #         pl.ds(0, t_packing),
-            #         pl.ds(bd2_start, bd2_per_t_packing),
-            #     ],
-            #     sem=acc_stage_x3_sems.at[buf_id],
-            # ).start()
-            pass
+            if disable_a2a_s_acc_tile_write:
+                return
+            pltpu.make_async_copy(
+                src_ref=a2a_s_acc_stage_x3_vmem.at[
+                    buf_id,
+                    pl.ds(0, token_tile),
+                    pl.ds(0, t_packing),
+                    pl.ds(0, bd2_per_t_packing),
+                ],
+                dst_ref=a2a_s_acc_x2_hbm.at[
+                    e_sem_id,
+                    pl.ds(tile_start, token_tile),
+                    pl.ds(0, t_packing),
+                    pl.ds(bd2_start, bd2_per_t_packing),
+                ],
+                sem=acc_stage_x3_sems.at[buf_id],
+            ).start()
 
         def with_static_bw(bw_sem_id, body):
             return lax.cond(
@@ -1646,7 +1666,7 @@ def _fused_ep_moe_kernel(
                         b3_vmem=b3_vmem,
                         should_init_ffn1=should_init_ffn1,
                     ):
-                        # tile_start = token_tile_id * token_tile
+                        tile_start = token_tile_id * token_tile
 
                         next_tile_id = token_tile_id + 1
                         next_buf_id = token_buf_id ^ jnp.int32(1)
@@ -1660,20 +1680,23 @@ def _fused_ep_moe_kernel(
 
                         wait_stage_a2a_s_tile(token_buf_id)
 
-                        # tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
-                        # dynamic_ffn1(
-                        #     t_vmem=t_stage_x2_vmem.at[token_buf_id],
-                        #     w1_vmem=w1_vmem,
-                        #     w1_scale_vmem=w1_scale_vmem,
-                        #     b1_vmem=b1_vmem,
-                        #     w3_vmem=w3_vmem,
-                        #     w3_scale_vmem=w3_scale_vmem,
-                        #     b3_vmem=b3_vmem,
-                        #     acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
-                        #     acc3_vmem=b_acc3_vmem.at[pl.ds(tile_start, token_tile)],
-                        #     dyn_sz=tile_sz,
-                        #     should_init=should_init_ffn1,
-                        # )
+                        if disable_dynamic_ffn1:
+                            return next_buf_id
+
+                        tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
+                        dynamic_ffn1(
+                            t_vmem=t_stage_x2_vmem.at[token_buf_id],
+                            w1_vmem=w1_vmem,
+                            w1_scale_vmem=w1_scale_vmem,
+                            b1_vmem=b1_vmem,
+                            w3_vmem=w3_vmem,
+                            w3_scale_vmem=w3_scale_vmem,
+                            b3_vmem=b3_vmem,
+                            acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
+                            acc3_vmem=b_acc3_vmem.at[pl.ds(tile_start, token_tile)],
+                            dyn_sz=tile_sz,
+                            should_init=should_init_ffn1,
+                        )
                         return next_buf_id
 
                     lax.fori_loop(
@@ -1767,7 +1790,7 @@ def _fused_ep_moe_kernel(
                     ):
                         buf_compute, buf_store, buf_load = state
                         tile_start = token_tile_id * token_tile
-                        # tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
+                        tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
 
                         if not should_init_ffn2:
                             do_prefetch = token_tile_id + 1 < num_token_tiles
@@ -1794,16 +1817,19 @@ def _fused_ep_moe_kernel(
                             def _(buf_compute=buf_compute):
                                 wait_stage_a2a_s_acc_tile(buf_compute)
 
-                        # dynamic_ffn2(
-                        #     acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
-                        #     acc3_vmem=b_acc3_vmem.at[pl.ds(tile_start, token_tile)],
-                        #     w2_vmem=w2_vmem,
-                        #     w2_scale_vmem=w2_scale_vmem,
-                        #     b2_vmem=b2_vmem,
-                        #     res_vmem=a2a_s_acc_stage_x3_vmem.at[buf_compute],
-                        #     dyn_sz=tile_sz,
-                        #     should_init=should_init_ffn2,
-                        # )
+                        if disable_dynamic_ffn2:
+                            return
+
+                        dynamic_ffn2(
+                            acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
+                            acc3_vmem=b_acc3_vmem.at[pl.ds(tile_start, token_tile)],
+                            w2_vmem=w2_vmem,
+                            w2_scale_vmem=w2_scale_vmem,
+                            b2_vmem=b2_vmem,
+                            res_vmem=a2a_s_acc_stage_x3_vmem.at[buf_compute],
+                            dyn_sz=tile_sz,
+                            should_init=should_init_ffn2,
+                        )
                         start_store_stage_a2a_s_acc_tile_to_hbm(tile_start, bd2_start, buf_compute)
                         return (buf_load, buf_compute, buf_store)
 
@@ -2415,6 +2441,12 @@ def _validate_fused_ep_moe_args(
         "tp_axis_name",
         "balanced_topk",
         "a2a_only",
+        "disable_a2a",
+        "disable_dynamic_ffn1",
+        "disable_dynamic_ffn2",
+        "disable_weight_load",
+        "disable_a2a_s_tile_read",
+        "disable_a2a_s_acc_tile_write",
     ],
 )
 def fused_ep_moe(
@@ -2457,6 +2489,12 @@ def fused_ep_moe(
     dp_axis_name: str = "data",
     tp_axis_name: str = "tensor",
     a2a_only: bool = False,
+    disable_a2a: bool = False,
+    disable_dynamic_ffn1: bool = False,
+    disable_dynamic_ffn2: bool = False,
+    disable_weight_load: bool = False,
+    disable_a2a_s_tile_read: bool = False,
+    disable_a2a_s_acc_tile_write: bool = False,
 ):
 
     ep_size = get_ep_size(mesh, dp_axis_name, tp_axis_name)
@@ -2730,6 +2768,12 @@ def fused_ep_moe(
                 bd1c=block_config.bd1c,
                 bd2c=block_config.bd2c,
                 a2a_only=a2a_only,
+                disable_a2a=disable_a2a,
+                disable_dynamic_ffn1=disable_dynamic_ffn1,
+                disable_dynamic_ffn2=disable_dynamic_ffn2,
+                disable_weight_load=disable_weight_load,
+                disable_a2a_s_tile_read=disable_a2a_s_tile_read,
+                disable_a2a_s_acc_tile_write=disable_a2a_s_acc_tile_write,
             ),
             out_shape=(
                 jax.ShapeDtypeStruct((local_num_tokens, hidden_size), t_dtype),
