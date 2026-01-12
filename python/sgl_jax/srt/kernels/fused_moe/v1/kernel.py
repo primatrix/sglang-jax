@@ -856,16 +856,13 @@ def _fused_ep_moe_kernel(
             send_chunk_idx = (my_id - step + num_devices) % num_devices
             recv_chunk_idx = (my_id - step - 1 + num_devices) % num_devices
 
-            send_offset = send_chunk_idx * chunk_size
-            recv_offset = recv_chunk_idx * chunk_size
-
             sync_barrier()
 
+            b_output_view = b_output_x2_vmem.at[out_buf_id].reshape(num_devices, chunk_size)
+            scratch_view = se_ar_scratch_vmem.reshape(num_devices, chunk_size)
             copy_desc = pltpu.make_async_remote_copy(
-                src_ref=b_output_x2_vmem.at[out_buf_id]
-                .reshape(total_elems)
-                .at[pl.ds(send_offset, chunk_size)],
-                dst_ref=se_ar_scratch_vmem.reshape(total_elems).at[pl.ds(recv_offset, chunk_size)],
+                src_ref=b_output_view.at[send_chunk_idx, pl.ds(0, chunk_size)],
+                dst_ref=scratch_view.at[recv_chunk_idx, pl.ds(0, chunk_size)],
                 send_sem=sem,  # [修复] 添加 send_sem，信号量 +1
                 recv_sem=sem,  # [修复] 远端接收完成后，也会给对应设备的 sem +1
                 device_id=get_mesh_device_id(right_peer),
@@ -874,12 +871,8 @@ def _fused_ep_moe_kernel(
             copy_desc.start()
             copy_desc.wait()
 
-            acc_target = (
-                b_output_x2_vmem.at[out_buf_id]
-                .reshape(total_elems)
-                .at[pl.ds(recv_offset, chunk_size)]
-            )
-            incoming = se_ar_scratch_vmem.reshape(total_elems).at[pl.ds(recv_offset, chunk_size)]
+            acc_target = b_output_view.at[recv_chunk_idx, pl.ds(0, chunk_size)]
+            incoming = scratch_view.at[recv_chunk_idx, pl.ds(0, chunk_size)]
 
             acc_val = acc_target[...]
             inc_val = incoming[...]
@@ -893,18 +886,12 @@ def _fused_ep_moe_kernel(
             send_chunk_idx = (my_id - step + 1 + num_devices) % num_devices
             recv_chunk_idx = (my_id - step + num_devices) % num_devices
 
-            send_offset = send_chunk_idx * chunk_size
-            recv_offset = recv_chunk_idx * chunk_size
-
             sync_barrier()
 
+            b_output_view = b_output_x2_vmem.at[out_buf_id].reshape(num_devices, chunk_size)
             copy_desc = pltpu.make_async_remote_copy(
-                src_ref=b_output_x2_vmem.at[out_buf_id]
-                .reshape(total_elems)
-                .at[pl.ds(send_offset, chunk_size)],
-                dst_ref=b_output_x2_vmem.at[out_buf_id]
-                .reshape(total_elems)
-                .at[pl.ds(recv_offset, chunk_size)],
+                src_ref=b_output_view.at[send_chunk_idx, pl.ds(0, chunk_size)],
+                dst_ref=b_output_view.at[recv_chunk_idx, pl.ds(0, chunk_size)],
                 send_sem=sem,  # [修复] 添加 send_sem
                 recv_sem=sem,  # [修复]
                 device_id=get_mesh_device_id(right_peer),
