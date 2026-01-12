@@ -54,6 +54,7 @@ def _estimate_vmem_bytes(
     dtype: jnp.dtype,
     cfg: FusedMoEBlockConfig,
     use_shared_expert: bool = False,
+    verbose: bool = False,
 ) -> int:
     """Rough VMEM estimate to avoid compile-time OOM (TPU VMEM is 64MB/core).
 
@@ -158,6 +159,39 @@ def _estimate_vmem_bytes(
         # 2. SE Tokens Buffer (b_se_tokens_vmem) -> (2, bt, hidden)
         se_tokens = 2 * bt * hidden * token_bytes
         total_bytes += se_w1 + se_w3 + se_w2 + se_tokens
+
+    if verbose:
+
+        def _mb(b: int) -> str:
+            return f"{b / (1024 * 1024):.2f}"
+
+        print("    VMEM Breakdown:")
+        print(
+            f"      b_w1_x2_vmem:           {_mb(w1)} MB  (2, {t_packing}, {bd1 // t_packing}, {bf})"
+        )
+        print(
+            f"      b_w3_x2_vmem:           {_mb(w3)} MB  (2, {t_packing}, {bd1 // t_packing}, {bf})"
+        )
+        print(
+            f"      b_w2_x2_vmem:           {_mb(w2)} MB  (2, {t_packing}, {bf}, {bd2 // t_packing})"
+        )
+        print(f"      b_acc_vmem:             {_mb(b_acc)} MB  (2, {a2a_max_tokens}, 1, {bf}) f32")
+        print(f"      b_output_x2_vmem:       {_mb(b_output)} MB  (2, {bt}, {hidden})")
+        print(
+            f"      a2a_g_acc_vmem:         {_mb(a2a_g_acc)} MB  (1, {top_k}, {acc_bt}, {t_packing}, {hidden // t_packing})"
+        )
+        print(
+            f"      t_stage_x2_vmem:        {_mb(t_stage_b32)} MB  (2, {bts}, {t_packing}, {bd1 // t_packing})"
+        )
+        print(
+            f"      a2a_s_acc_stage_x3:     {_mb(a2a_s_acc_stage_b32)} MB  (3, {bts}, {t_packing}, {bd2 // t_packing})"
+        )
+        print(f"      b_gating_x2_vmem:       {_mb(b_gating)} MB  (2, {bt}, {padded_num_experts})")
+        print(f"      routing_temporaries:    {_mb(routing_temporaries)} MB")
+        if use_shared_expert:
+            print(f"      se_w1/w3/w2 + tokens:   {_mb(se_w1 + se_w3 + se_w2 + se_tokens)} MB")
+        print("      ----------------------------")
+        print(f"      Total:                  {_mb(total_bytes)} MB")
 
     return total_bytes
 
@@ -543,6 +577,18 @@ def run_all(
                 else:
                     print(
                         f"  fused_moe blocks [{i+1}/{len(block_cfgs)}] -> {block_cfg.as_kwargs()}"
+                    )
+                    vmem_bytes = _estimate_vmem_bytes(
+                        case,
+                        dtype,
+                        block_cfg,
+                        use_shared_expert=use_shared_expert,
+                        verbose=True,
+                    )
+                    vmem_mb = vmem_bytes / (1024 * 1024)
+                    vmem_remaining_mb = 64.0 - vmem_mb
+                    print(
+                        f"    => VMEM: {vmem_mb:.2f} MB / 64 MB (remaining: {vmem_remaining_mb:.2f} MB)"
                     )
 
                 task = "fused-moe-k_.*"
