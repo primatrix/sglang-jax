@@ -861,7 +861,7 @@ def _fused_ep_moe_kernel(
 
             sync_barrier()
 
-            pltpu.make_async_remote_copy(
+            copy_desc = pltpu.make_async_remote_copy(
                 src_ref=b_output_x2_vmem.at[out_buf_id]
                 .reshape(total_elems)
                 .at[pl.ds(send_offset, chunk_size)],
@@ -870,10 +870,9 @@ def _fused_ep_moe_kernel(
                 recv_sem=sem,  # [修复] 远端接收完成后，也会给对应设备的 sem +1
                 device_id=get_mesh_device_id(right_peer),
                 device_id_type=pltpu.DeviceIdType.MESH,
-            ).start()
-
-            # [修复] 等待 2 个信号：1个是本地发送读完(确保可以覆写)，1个是远端发送写完(确保可以累加)
-            pltpu.semaphore_wait(sem, 2)
+            )
+            copy_desc.start()
+            copy_desc.wait()
 
             acc_target = (
                 b_output_x2_vmem.at[out_buf_id]
@@ -897,7 +896,7 @@ def _fused_ep_moe_kernel(
 
             sync_barrier()
 
-            pltpu.make_async_remote_copy(
+            copy_desc = pltpu.make_async_remote_copy(
                 src_ref=b_output_x2_vmem.at[out_buf_id]
                 .reshape(total_elems)
                 .at[pl.ds(send_offset, chunk_size)],
@@ -908,10 +907,9 @@ def _fused_ep_moe_kernel(
                 recv_sem=sem,  # [修复]
                 device_id=get_mesh_device_id(right_peer),
                 device_id_type=pltpu.DeviceIdType.MESH,
-            ).start()
-
-            # [修复] 同样等待 2 个信号
-            pltpu.semaphore_wait(sem, 2)
+            )
+            copy_desc.start()
+            copy_desc.wait()
 
         lax.fori_loop(0, num_devices - 1, all_gather_step, None, unroll=True)
         sync_barrier()
