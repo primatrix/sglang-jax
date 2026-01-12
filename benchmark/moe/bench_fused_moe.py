@@ -523,6 +523,7 @@ def run_all(
                 disable_a2a_s_acc_tile_write=os.getenv(
                     "FUSED_MOE_BENCHMARK_DISABLE_A2A_S_ACC_TILE_WRITE", False
                 ),
+                disable_shared_expert=os.getenv("FUSED_MOE_BENCHMARK_DISABLE_SHARED_EXPERT", False),
             )
 
             moe_def, moe_state = nnx.split(fused_layer)

@@ -536,6 +536,7 @@ def _fused_ep_moe_kernel(
     disable_weight_load: bool,
     disable_a2a_s_tile_read: bool,
     disable_a2a_s_acc_tile_write: bool,
+    disable_shared_expert: bool,
 ):
     dp_rank = lax.axis_index(dp_axis_name)
     tp_rank = lax.axis_index(tp_axis_name)
@@ -1997,6 +1998,9 @@ def _fused_ep_moe_kernel(
         return next_e_sem_id
 
     def run_shared_expert(bt_sem_id):
+        if disable_shared_expert:
+            return
+
         if w1_shared_hbm is None:
             return
 
@@ -2447,6 +2451,7 @@ def _validate_fused_ep_moe_args(
         "disable_weight_load",
         "disable_a2a_s_tile_read",
         "disable_a2a_s_acc_tile_write",
+        "disable_shared_expert",
     ],
 )
 def fused_ep_moe(
@@ -2495,6 +2500,7 @@ def fused_ep_moe(
     disable_weight_load: bool = False,
     disable_a2a_s_tile_read: bool = False,
     disable_a2a_s_acc_tile_write: bool = False,
+    disable_shared_expert: bool = False,
 ):
 
     ep_size = get_ep_size(mesh, dp_axis_name, tp_axis_name)
@@ -2774,6 +2780,7 @@ def fused_ep_moe(
                 disable_weight_load=disable_weight_load,
                 disable_a2a_s_tile_read=disable_a2a_s_tile_read,
                 disable_a2a_s_acc_tile_write=disable_a2a_s_acc_tile_write,
+                disable_shared_expert=disable_shared_expert,
             ),
             out_shape=(
                 jax.ShapeDtypeStruct((local_num_tokens, hidden_size), t_dtype),
