@@ -341,9 +341,9 @@ class UMT5Attention(nnx.Module):
         k = k.reshape(-1, self.n_heads, self.key_value_proj_dim)
         v = v.reshape(-1, self.n_heads, self.key_value_proj_dim)
 
-        q = jnp.transpose(q, (0, 2, 1, 3))  # [batch, n_heads, seq_q, head_dim]
-        k = jnp.transpose(k, (0, 2, 1, 3))  # [batch, n_heads, seq_k, head_dim]
-        v = jnp.transpose(v, (0, 2, 1, 3))  # [batch, n_heads, seq_k, head_dim]
+        q = jnp.transpose(q, (1, 0, 2))  # [batch, n_heads, seq_q, head_dim]
+        k = jnp.transpose(k, (1, 0, 2))  # [batch, n_heads, seq_k, head_dim]
+        v = jnp.transpose(v, (1, 0, 2))  # [batch, n_heads, seq_k, head_dim]
 
         # Compute attention scores (unscaled for T5)
         q_f32 = q.astype(jnp.float32)
