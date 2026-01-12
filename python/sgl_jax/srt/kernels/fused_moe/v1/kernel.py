@@ -844,48 +844,29 @@ def _fused_ep_moe_kernel(
         if w1_shared_hbm is None:
             return
 
-        # === 修改 1: 移除 Reshape，计算行维度的切分 ===
-        # 假设 bt 是 num_devices 的倍数（在 TPU kernel 中通常成立，例如 bt=16, dev=8）
-        rows_per_rank = bt // num_devices
-        rows_per_rank = pl.multiple_of(rows_per_rank, 16)
+        cols_per_rank = hidden_size // num_devices
 
         right_peer = (my_id + 1) % num_devices
         sem = se_ar_sem.at[0]
 
-        # === 修改 2: 保持 2D 视图 ===
-        # 不要使用 .reshape(total_elems)
-        # 直接引用 2D 上的特定 buffer
         b_output_2d = b_output_x2_vmem.at[out_buf_id]
-
-        # 假设 scratch 也是 (bt, hidden_size) 的形状
-        # 如果 scratch 本身是 1D 的且没有 offset，reshape 也许能过，但在 copy 时必须和 src 维度一致
-        # 这里假设 scratch 定义时维度与 b_output 一致，或者我们可以显式地按 2D 访问
         scratch_2d = se_ar_scratch_vmem
 
         # --- Phase 1: Reduce-Scatter ---
         def reduce_scatter_step(step, _):
-            # 计算 chunk 对应的 rank 索引
             send_chunk_idx = (my_id - step + num_devices) % num_devices
             recv_chunk_idx = (my_id - step - 1 + num_devices) % num_devices
 
-            # === 修改 3: 将 offset 转换为 row_idx ===
-            send_row_start = send_chunk_idx * rows_per_rank
-            recv_row_start = recv_chunk_idx * rows_per_rank
-            send_row_start = pl.multiple_of(send_row_start, 16)
-            recv_row_start = pl.multiple_of(recv_row_start, 16)
-
-            # 这里的 multiple_of 提示可能不再严格需要，因为 hidden_size 通常是对齐的
-            # 但保留着也没坏处，或者改为对 row_start 做检查
-            # pl.multiple_of(send_row_start, 1)
+            send_col_start = send_chunk_idx * cols_per_rank
+            recv_col_start = recv_chunk_idx * cols_per_rank
+            send_col_start = pl.multiple_of(send_col_start, 128)
+            recv_col_start = pl.multiple_of(recv_col_start, 128)
 
             sync_barrier()
 
-            # === 修改 4: 使用 2D 切片进行 Remote Copy ===
-            # 语法: .at[pl.ds(start_row, size), slice(None)]
-            # 这表示取这些行，列全选
             copy_desc = pltpu.make_async_remote_copy(
-                src_ref=b_output_2d.at[pl.ds(send_row_start, rows_per_rank), slice(None)],
-                dst_ref=scratch_2d.at[pl.ds(recv_row_start, rows_per_rank), slice(None)],
+                src_ref=b_output_2d.at[pl.ds(0, bt), pl.ds(send_col_start, cols_per_rank)],
+                dst_ref=scratch_2d.at[pl.ds(0, bt), pl.ds(send_col_start, cols_per_rank)],
                 send_sem=sem,
                 recv_sem=sem,
                 device_id=get_mesh_device_id(right_peer),
@@ -894,9 +875,8 @@ def _fused_ep_moe_kernel(
             copy_desc.start()
             copy_desc.wait()
 
-            # === 修改 5: 本地 Reduce 也在 2D 上进行 ===
-            acc_target = b_output_2d.at[pl.ds(recv_row_start, rows_per_rank), slice(None)]
-            incoming = scratch_2d.at[pl.ds(recv_row_start, rows_per_rank), slice(None)]
+            acc_target = b_output_2d.at[pl.ds(0, bt), pl.ds(recv_col_start, cols_per_rank)]
+            incoming = scratch_2d.at[pl.ds(0, bt), pl.ds(recv_col_start, cols_per_rank)]
 
             acc_val = acc_target[...]
             inc_val = incoming[...]
@@ -910,16 +890,16 @@ def _fused_ep_moe_kernel(
             send_chunk_idx = (my_id - step + 1 + num_devices) % num_devices
             recv_chunk_idx = (my_id - step + num_devices) % num_devices
 
-            send_row_start = send_chunk_idx * rows_per_rank
-            recv_row_start = recv_chunk_idx * rows_per_rank
-            send_row_start = pl.multiple_of(send_row_start, 16)
-            recv_row_start = pl.multiple_of(recv_row_start, 16)
+            send_col_start = send_chunk_idx * cols_per_rank
+            recv_col_start = recv_chunk_idx * cols_per_rank
+            send_col_start = pl.multiple_of(send_col_start, 128)
+            recv_col_start = pl.multiple_of(recv_col_start, 128)
 
             sync_barrier()
 
             copy_desc = pltpu.make_async_remote_copy(
-                src_ref=b_output_2d.at[pl.ds(send_row_start, rows_per_rank), slice(None)],
-                dst_ref=b_output_2d.at[pl.ds(recv_row_start, rows_per_rank), slice(None)],
+                src_ref=b_output_2d.at[pl.ds(0, bt), pl.ds(send_col_start, cols_per_rank)],
+                dst_ref=b_output_2d.at[pl.ds(0, bt), pl.ds(send_col_start, cols_per_rank)],
                 send_sem=sem,
                 recv_sem=sem,
                 device_id=get_mesh_device_id(right_peer),
@@ -2417,6 +2397,15 @@ def _validate_fused_ep_moe_args(
         assert (
             block_config.bt * hidden_size
         ) % ep_size == 0, f"Output size ({block_config.bt}*{hidden_size}) must be divisible by ep_size ({ep_size}) for Ring All-Reduce."
+        if hidden_size % ep_size != 0:
+            raise ValueError(
+                f"Shared expert all-reduce requires hidden_size ({hidden_size}) to be divisible by ep_size ({ep_size})."
+            )
+        per_rank_cols = hidden_size // ep_size
+        if per_rank_cols % 128 != 0:
+            raise ValueError(
+                f"Shared expert all-reduce requires (hidden_size/ep_size) to be a multiple of 128, got {per_rank_cols}."
+            )
         if w3_shared is None or w2_shared is None:
             raise ValueError("w1_shared, w3_shared, and w2_shared must be provided together.")
 
