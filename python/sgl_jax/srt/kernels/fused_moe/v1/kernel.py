@@ -862,10 +862,10 @@ def _fused_ep_moe_kernel(
             sync_barrier()
 
             pltpu.make_async_remote_copy(
-                src_ref=b_output_x2_vmem.at[out_buf_id].reshape(total_elems)[
-                    pl.ds(send_offset, chunk_size)
-                ],
-                dst_ref=se_ar_scratch_vmem.reshape(total_elems)[pl.ds(recv_offset, chunk_size)],
+                src_ref=b_output_x2_vmem.at[out_buf_id]
+                .reshape(total_elems)
+                .at[pl.ds(send_offset, chunk_size)],
+                dst_ref=se_ar_scratch_vmem.reshape(total_elems).at[pl.ds(recv_offset, chunk_size)],
                 send_sem=sem,  # [修复] 添加 send_sem，信号量 +1
                 recv_sem=sem,  # [修复] 远端接收完成后，也会给对应设备的 sem +1
                 device_id=get_mesh_device_id(right_peer),
@@ -875,10 +875,12 @@ def _fused_ep_moe_kernel(
             # [修复] 等待 2 个信号：1个是本地发送读完(确保可以覆写)，1个是远端发送写完(确保可以累加)
             pltpu.semaphore_wait(sem, 2)
 
-            acc_target = b_output_x2_vmem.at[out_buf_id].reshape(total_elems)[
-                pl.ds(recv_offset, chunk_size)
-            ]
-            incoming = se_ar_scratch_vmem.reshape(total_elems)[pl.ds(recv_offset, chunk_size)]
+            acc_target = (
+                b_output_x2_vmem.at[out_buf_id]
+                .reshape(total_elems)
+                .at[pl.ds(recv_offset, chunk_size)]
+            )
+            incoming = se_ar_scratch_vmem.reshape(total_elems).at[pl.ds(recv_offset, chunk_size)]
 
             new_val = acc_target.astype(jnp.float32) + incoming.astype(jnp.float32)
             acc_target[...] = new_val.astype(t_dtype)
@@ -896,12 +898,12 @@ def _fused_ep_moe_kernel(
             sync_barrier()
 
             pltpu.make_async_remote_copy(
-                src_ref=b_output_x2_vmem.at[out_buf_id].reshape(total_elems)[
-                    pl.ds(send_offset, chunk_size)
-                ],
-                dst_ref=b_output_x2_vmem.at[out_buf_id].reshape(total_elems)[
-                    pl.ds(recv_offset, chunk_size)
-                ],
+                src_ref=b_output_x2_vmem.at[out_buf_id]
+                .reshape(total_elems)
+                .at[pl.ds(send_offset, chunk_size)],
+                dst_ref=b_output_x2_vmem.at[out_buf_id]
+                .reshape(total_elems)
+                .at[pl.ds(recv_offset, chunk_size)],
                 send_sem=sem,  # [修复] 添加 send_sem
                 recv_sem=sem,  # [修复]
                 device_id=get_mesh_device_id(right_peer),
