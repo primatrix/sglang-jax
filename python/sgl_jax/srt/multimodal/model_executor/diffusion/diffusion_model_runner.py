@@ -189,5 +189,5 @@ class DiffusionModelRunner(BaseModelRunner):
             logging.info(
                 "Finished diffusion step %d in %.2f seconds", step, time.time() - start_time
             )
-        batch.latents = latents
+        batch.latents = jax.device_get(latents)
         return batch

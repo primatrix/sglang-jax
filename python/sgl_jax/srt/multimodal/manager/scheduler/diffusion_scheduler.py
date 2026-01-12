@@ -36,8 +36,8 @@ class DiffusionScheduler:
         # schedule_batch -> worker_batch -> forward_batch
         batch = self.prepare_diffusion_batch(req)
         self.diffusion_worker.forward(batch, self.mesh)
-        mock_req = Req(rid=batch.rid)
-        self.communication_backend.send_pyobj(mock_req)
+        # mock_req = Req(rid=batch.rid)
+        self.communication_backend.send_pyobj(batch)
 
     def prepare_diffusion_batch(self, req: Req) -> Req:
 

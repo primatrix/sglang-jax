@@ -3,11 +3,14 @@ import queue
 import jax.numpy as jnp
 import jax.sharding
 import numpy as np
+from jax import NamedSharding
+from jax.sharding import PartitionSpec
 
 from sgl_jax.srt.managers.communication import CommunicationBackend
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.model_executor.vae.vae_model_worker import VaeModelWorker
+from sgl_jax.srt.utils.jax_utils import device_array
 
 
 class VaeScheduler:
@@ -31,11 +34,10 @@ class VaeScheduler:
             reqs = self._comm_backend.recv_requests()
             if len(reqs) > 0:
                 for req in reqs:
-                    if req.latents is None:
-                        req.latents = jnp.array(
-                            np.arange(1 * 5 * 3 * 4 * 16), dtype=jnp.float32
-                        ).reshape(1, 5, 3, 4, 16)
                     assert req.latents is not None
+                    req.latents = device_array(
+                        req.latents, sharding=NamedSharding(self.mesh, PartitionSpec())
+                    )
                 self.run_vae_batch(reqs)
 
     def run_vae_batch(self, batch: list[Req]):
