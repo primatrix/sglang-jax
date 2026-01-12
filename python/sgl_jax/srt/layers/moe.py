@@ -605,7 +605,7 @@ class FusedEPMoE(nnx.Module):
                     jax.random.key(0),
                     (hidden_size, se_inter_dim),
                     dtype=weight_dtype,
-                    out_sharding=P(None, None),
+                    out_sharding=P(None, "tensor"),
                 )
             )
 
@@ -614,7 +614,7 @@ class FusedEPMoE(nnx.Module):
                     jax.random.key(0),
                     (se_inter_dim, hidden_size),
                     dtype=weight_dtype,
-                    out_sharding=P(None, None),
+                    out_sharding=P("tensor", None),
                 )
             )
 
@@ -623,7 +623,7 @@ class FusedEPMoE(nnx.Module):
                     jax.random.key(0),
                     (hidden_size, se_inter_dim),
                     dtype=weight_dtype,
-                    out_sharding=P(None, None),
+                    out_sharding=P(None, "tensor"),
                 )
             )
         else:

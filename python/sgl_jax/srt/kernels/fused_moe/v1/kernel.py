@@ -508,6 +508,7 @@ def _fused_ep_moe_kernel(
     b_se_w1_scale_x2_vmem,  # None | <sew_sem_id> (2, t_packing, bd1 // t_packing // subc_quant_wsz, 1, bf)
     b_se_w3_scale_x2_vmem,  # None | <sew_sem_id> (2, t_packing, bd1 // t_packing // subc_quant_wsz, 1, bf)
     b_se_w2_scale_x2_vmem,  # None | <sew_sem_id> (2, t_packing, bf // subc_quant_wsz, 1, bd2 // t_packing)
+    se_ar_scratch_vmem,
     ### Semaphores:
     token_stage_x2_sems,  # DMA(2,): <token_buf_id>
     acc_stage_x3_sems,  # DMA(3,): <acc_buf_id>
@@ -516,6 +517,7 @@ def _fused_ep_moe_kernel(
     recv_x2_sems,  # <e_sem_id> (2,)
     a2a_gather_sem,
     a2a_acc_sems,  # DMA(1,)
+    se_ar_sem,
     barrier_sem,
     expert_size_sem,
     *,
@@ -837,6 +839,72 @@ def _fused_ep_moe_kernel(
             pltpu.VMEM(expert_starts_x2_smem.shape[1:], expert_starts_x2_smem.dtype),
             pltpu.VMEM(expert_sizes_x2_smem.shape[1:], expert_sizes_x2_smem.dtype),
         )
+
+    def all_reduce_shared_expert(bt_sem_id, out_buf_id):
+        if w1_shared_hbm is None:
+            return
+
+        total_elems = bt * hidden_size
+        chunk_size = total_elems // num_devices
+        right_peer = (my_id + 1) % num_devices
+
+        recv_sem = se_ar_sem.at[0]
+
+        def reduce_scatter_step(step, _):
+            send_chunk_idx = (my_id - step + num_devices) % num_devices
+            recv_chunk_idx = (my_id - step - 1 + num_devices) % num_devices
+
+            send_offset = send_chunk_idx * chunk_size
+            recv_offset = recv_chunk_idx * chunk_size
+
+            sync_barrier()
+
+            pltpu.make_async_remote_copy(
+                src_ref=b_output_x2_vmem.at[out_buf_id].reshape(total_elems)[
+                    pl.ds(send_offset, chunk_size)
+                ],
+                dst_ref=se_ar_scratch_vmem.reshape(total_elems)[pl.ds(recv_offset, chunk_size)],
+                recv_sem=recv_sem,
+                device_id=get_mesh_device_id(right_peer),
+                device_id_type=pltpu.DeviceIdType.MESH,
+            ).start()
+
+            pltpu.semaphore_wait(recv_sem, 1)
+            acc_target = b_output_x2_vmem.at[out_buf_id].reshape(total_elems)[
+                pl.ds(recv_offset, chunk_size)
+            ]
+            incoming = se_ar_scratch_vmem.reshape(total_elems)[pl.ds(recv_offset, chunk_size)]
+
+            new_val = acc_target.astype(jnp.float32) + incoming.astype(jnp.float32)
+            acc_target[...] = new_val.astype(t_dtype)
+
+        lax.fori_loop(0, num_devices - 1, reduce_scatter_step, None, unroll=True)
+
+        def all_gather_step(step, _):
+            send_chunk_idx = (my_id - step + num_devices) % num_devices
+            recv_chunk_idx = (my_id - step - 1 + num_devices) % num_devices
+
+            send_offset = send_chunk_idx * chunk_size
+            recv_offset = recv_chunk_idx * chunk_size
+
+            sync_barrier()
+            pltpu.make_async_remote_copy(
+                src_ref=b_output_x2_vmem.at[out_buf_id].reshape(total_elems)[
+                    pl.ds(send_offset, chunk_size)
+                ],
+                dst_ref=b_output_x2_vmem.at[out_buf_id].reshape(total_elems)[
+                    pl.ds(recv_offset, chunk_size)
+                ],
+                recv_sem=recv_sem,
+                device_id=get_mesh_device_id(right_peer),
+                device_id_type=pltpu.DeviceIdType.MESH,
+            ).start()
+
+            pltpu.semaphore_wait(recv_sem, 1)
+
+        lax.fori_loop(0, num_devices - 1, all_gather_step, None, unroll=True)
+
+        sync_barrier()
 
     def start_a2a_scatter(*, bt_sem_id, e_sem_id, local_e_id, bt_start):
         # Counting the number of remote sends from the current device.
@@ -2142,7 +2210,7 @@ def _fused_ep_moe_kernel(
 
         wait_a2a_gather_recv_all(bt_size=bt)
         sync_barrier()
-
+        all_reduce_shared_expert(bt_sem_id, out_buf_id)
         acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
 
         start_send_bo(bt_id=bt_id)
@@ -2321,6 +2389,9 @@ def _validate_fused_ep_moe_args(
             )
 
     if w1_shared is not None:
+        assert (
+            block_config.bt * hidden_size
+        ) % ep_size == 0, f"Output size ({block_config.bt}*{hidden_size}) must be divisible by ep_size ({ep_size}) for Ring All-Reduce."
         if w3_shared is None or w2_shared is None:
             raise ValueError("w1_shared, w3_shared, and w2_shared must be provided together.")
 
@@ -2463,6 +2534,37 @@ def fused_ep_moe(
         dtype=tokens.dtype,
         subc_quant_wsz=subc_quant_wsz,
     )
+
+    if w1_shared is not None:
+        bse = block_config.bse
+
+        min_alignment = ep_size * bse
+        curr_inter = w1_shared.shape[1]
+
+        padded_inter = align_to(curr_inter, min_alignment)
+
+        if padded_inter > curr_inter:
+            pad_len = padded_inter - curr_inter
+            w1_shared = jnp.pad(w1_shared, ((0, 0), (0, pad_len)))
+            w3_shared = jnp.pad(w3_shared, ((0, 0), (0, pad_len)))
+            w2_shared = jnp.pad(w2_shared, ((0, pad_len), (0, 0)))
+
+            if subc_quant_wsz is not None:
+                if w1_shared_scale is not None:
+                    w1_shared_scale = jnp.pad(w1_shared_scale, ((0, 0), (0, 0), (0, pad_len)))
+
+                if w3_shared_scale is not None:
+                    w3_shared_scale = jnp.pad(w3_shared_scale, ((0, 0), (0, 0), (0, pad_len)))
+
+                if w2_shared_scale is not None:
+                    if pad_len % subc_quant_wsz != 0:
+                        raise ValueError(
+                            f"Padding length {pad_len} must be divisible by {subc_quant_wsz}"
+                        )
+
+                    pad_len_sub = pad_len // subc_quant_wsz
+                    w2_shared_scale = jnp.pad(w2_shared_scale, ((0, pad_len_sub), (0, 0), (0, 0)))
+
     _validate_fused_ep_moe_args(
         mesh=mesh,
         tokens=tokens,
@@ -2691,6 +2793,9 @@ def fused_ep_moe(
                 jnp.float32,
             )
         ),  # b_se_w2_scale_x2_vmem
+        (
+            None if w1_shared is None else pltpu.VMEM((bt, hidden_size), t_dtype)
+        ),  # se_ar_scratch_vmem
         # Semaphores.
         pltpu.SemaphoreType.DMA((2,)),  # token_stage_x2_sems
         pltpu.SemaphoreType.DMA((3,)),  # acc_stage_x3_sems
@@ -2699,6 +2804,7 @@ def fused_ep_moe(
         pltpu.SemaphoreType.DMA((2,)),  # recv_x2_sems
         pltpu.SemaphoreType.DMA,  # a2a_gather_sem
         pltpu.SemaphoreType.DMA((1,)),  # a2a_acc_sems
+        (None if w1_shared is None else pltpu.SemaphoreType.DMA((1,))),
         pltpu.SemaphoreType.BARRIER,  # barrier_sem
         pltpu.SemaphoreType.DMA,
     )
@@ -2843,12 +2949,12 @@ def fused_ep_moe(
             P(),  # a2a_s_acc_x2_hbm
             P(),  # a2a_g_hbm
             None if bias is None else P(),
-            None if w1_shared is None else P(),  # w1_shared
-            None if w3_shared is None else P(),  # w3_shared
-            None if w2_shared is None else P(),  # w2_shared
-            None if w1_shared_scale is None else P(),  # w1_shared_scale
-            None if w3_shared_scale is None else P(),  # w3_shared_scale
-            None if w2_shared_scale is None else P(),  # w2_shared_scale
+            None if w1_shared is None else P(None, tp_axis_name),  # w1_shared
+            None if w3_shared is None else P(None, tp_axis_name),  # w3_shared
+            None if w2_shared is None else P(tp_axis_name, None),  # w2_shared
+            None if w1_shared_scale is None else P(None, tp_axis_name),  # w1_shared_scale
+            None if w3_shared_scale is None else P(None, tp_axis_name),  # w3_shared_scale
+            None if w2_shared_scale is None else P(tp_axis_name, None),  # w2_shared_scale
         ),
         out_specs=(
             P(
