@@ -189,7 +189,16 @@ def _estimate_vmem_bytes(
         print(f"      b_gating_x2_vmem:       {_mb(b_gating)} MB  (2, {bt}, {padded_num_experts})")
         print(f"      routing_temporaries:    {_mb(routing_temporaries)} MB")
         if use_shared_expert:
-            print(f"      se_w1/w3/w2 + tokens:   {_mb(se_w1 + se_w3 + se_w2 + se_tokens)} MB")
+            print(
+                f"      b_se_w1_x2_vmem:        {_mb(se_w1)} MB  (2, {t_packing}, {bd1 // t_packing}, {bf})"
+            )
+            print(
+                f"      b_se_w3_x2_vmem:        {_mb(se_w3)} MB  (2, {t_packing}, {bd1 // t_packing}, {bf})"
+            )
+            print(
+                f"      b_se_w2_x2_vmem:        {_mb(se_w2)} MB  (2, {t_packing}, {bf}, {bd2 // t_packing})"
+            )
+            print(f"      b_se_tokens_vmem:       {_mb(se_tokens)} MB  (2, {bt}, {hidden})")
         print("      ----------------------------")
         print(f"      Total:                  {_mb(total_bytes)} MB")
 
