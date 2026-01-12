@@ -848,8 +848,10 @@ def _fused_ep_moe_kernel(
         chunk_size = total_elems // num_devices
         right_peer = (my_id + 1) % num_devices
 
-        recv_sem = se_ar_sem.at[0]
+        # 复用同一个信号量
+        sem = se_ar_sem.at[0]
 
+        # --- Phase 1: Reduce-Scatter ---
         def reduce_scatter_step(step, _):
             send_chunk_idx = (my_id - step + num_devices) % num_devices
             recv_chunk_idx = (my_id - step - 1 + num_devices) % num_devices
@@ -864,12 +866,15 @@ def _fused_ep_moe_kernel(
                     pl.ds(send_offset, chunk_size)
                 ],
                 dst_ref=se_ar_scratch_vmem.reshape(total_elems)[pl.ds(recv_offset, chunk_size)],
-                recv_sem=recv_sem,
+                send_sem=sem,  # [修复] 添加 send_sem，信号量 +1
+                recv_sem=sem,  # [修复] 远端接收完成后，也会给对应设备的 sem +1
                 device_id=get_mesh_device_id(right_peer),
                 device_id_type=pltpu.DeviceIdType.MESH,
             ).start()
 
-            pltpu.semaphore_wait(recv_sem, 1)
+            # [修复] 等待 2 个信号：1个是本地发送读完(确保可以覆写)，1个是远端发送写完(确保可以累加)
+            pltpu.semaphore_wait(sem, 2)
+
             acc_target = b_output_x2_vmem.at[out_buf_id].reshape(total_elems)[
                 pl.ds(recv_offset, chunk_size)
             ]
@@ -880,14 +885,16 @@ def _fused_ep_moe_kernel(
 
         lax.fori_loop(0, num_devices - 1, reduce_scatter_step, None, unroll=True)
 
+        # --- Phase 2: All-Gather ---
         def all_gather_step(step, _):
-            send_chunk_idx = (my_id - step + num_devices) % num_devices
-            recv_chunk_idx = (my_id - step - 1 + num_devices) % num_devices
+            send_chunk_idx = (my_id - step + 1 + num_devices) % num_devices
+            recv_chunk_idx = (my_id - step + num_devices) % num_devices
 
             send_offset = send_chunk_idx * chunk_size
             recv_offset = recv_chunk_idx * chunk_size
 
             sync_barrier()
+
             pltpu.make_async_remote_copy(
                 src_ref=b_output_x2_vmem.at[out_buf_id].reshape(total_elems)[
                     pl.ds(send_offset, chunk_size)
@@ -895,15 +902,16 @@ def _fused_ep_moe_kernel(
                 dst_ref=b_output_x2_vmem.at[out_buf_id].reshape(total_elems)[
                     pl.ds(recv_offset, chunk_size)
                 ],
-                recv_sem=recv_sem,
+                send_sem=sem,  # [修复] 添加 send_sem
+                recv_sem=sem,  # [修复]
                 device_id=get_mesh_device_id(right_peer),
                 device_id_type=pltpu.DeviceIdType.MESH,
             ).start()
 
-            pltpu.semaphore_wait(recv_sem, 1)
+            # [修复] 同样等待 2 个信号
+            pltpu.semaphore_wait(sem, 2)
 
         lax.fori_loop(0, num_devices - 1, all_gather_step, None, unroll=True)
-
         sync_barrier()
 
     def start_a2a_scatter(*, bt_sem_id, e_sem_id, local_e_id, bt_start):
