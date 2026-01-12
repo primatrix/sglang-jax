@@ -39,7 +39,7 @@ class VaeScheduler:
                     self.preprocess(req)
                     import json
                     with open("data.json", "r") as f:
-                        data = np.array(json.loads(f.read())["before"]["latents"])
+                        data = np.array(json.loads(f.read())["after"]["latents"])
                     req.latents = req.latents = device_array(
                         data, sharding=NamedSharding(self.mesh, PartitionSpec())
                     )
