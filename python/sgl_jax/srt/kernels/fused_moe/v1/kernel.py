@@ -1701,7 +1701,7 @@ def _fused_ep_moe_kernel(
             def run_one_bd1_no_init(bd1_id, bw_sem_id):
                 return run_gate_up_bd1(bd1_id=bd1_id, bw_sem_id=bw_sem_id, should_init_ffn1=False)
 
-            return lax.fori_loop(1, num_bd1, run_one_bd1_no_init, bw_sem_id, unroll=False)
+            return lax.fori_loop(1, num_bd1, run_one_bd1_no_init, bw_sem_id, unroll=True)
 
         def run_down_slices(*, bf_id: int, bw_sem_id):
             should_init_ffn2 = bf_id == 0
@@ -1811,7 +1811,7 @@ def _fused_ep_moe_kernel(
                         return (buf_load, buf_compute, buf_store)
 
                     state = (init_buf_compute, init_buf_store, init_buf_load)
-                    state = lax.fori_loop(0, num_token_tiles, run_ffn2_tile, state, unroll=False)
+                    state = lax.fori_loop(0, num_token_tiles, run_ffn2_tile, state, unroll=True)
 
                     @pl.when(num_token_tiles >= 1)
                     def _():
@@ -1829,7 +1829,7 @@ def _fused_ep_moe_kernel(
 
                 return with_static_bw(bw_sem_id, body)
 
-            return lax.fori_loop(0, num_bd2, run_down_bd2, bw_sem_id, unroll=False)
+            return lax.fori_loop(0, num_bd2, run_down_bd2, bw_sem_id, unroll=True)
 
         for bf_id in range(num_bf):
             bw_sem_id = run_gate_up_slices(bf_id=bf_id, bw_sem_id=bw_sem_id)
