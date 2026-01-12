@@ -2812,7 +2812,7 @@ def fused_ep_moe(
         pltpu.SemaphoreType.DMA((2,)),  # recv_x2_sems
         pltpu.SemaphoreType.DMA,  # a2a_gather_sem
         pltpu.SemaphoreType.DMA((1,)),  # a2a_acc_sems
-        (None if w1_shared is None else pltpu.SemaphoreType.DMA((1,))),
+        pltpu.SemaphoreType.DMA((1,)),
         pltpu.SemaphoreType.BARRIER,  # barrier_sem
         pltpu.SemaphoreType.DMA,
     )
