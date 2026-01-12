@@ -1818,7 +1818,7 @@ def _fused_ep_moe_kernel(
                                 wait_stage_a2a_s_acc_tile(buf_compute)
 
                         if disable_dynamic_ffn2:
-                            return
+                            return (buf_load, buf_compute, buf_store)
 
                         dynamic_ffn2(
                             acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
