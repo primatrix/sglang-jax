@@ -847,6 +847,7 @@ def _fused_ep_moe_kernel(
         # === 修改 1: 移除 Reshape，计算行维度的切分 ===
         # 假设 bt 是 num_devices 的倍数（在 TPU kernel 中通常成立，例如 bt=16, dev=8）
         rows_per_rank = bt // num_devices
+        rows_per_rank = pl.multiple_of(rows_per_rank, 16)
 
         right_peer = (my_id + 1) % num_devices
         sem = se_ar_sem.at[0]
@@ -870,6 +871,8 @@ def _fused_ep_moe_kernel(
             # === 修改 3: 将 offset 转换为 row_idx ===
             send_row_start = send_chunk_idx * rows_per_rank
             recv_row_start = recv_chunk_idx * rows_per_rank
+            send_row_start = pl.multiple_of(send_row_start, 16)
+            recv_row_start = pl.multiple_of(recv_row_start, 16)
 
             # 这里的 multiple_of 提示可能不再严格需要，因为 hidden_size 通常是对齐的
             # 但保留着也没坏处，或者改为对 row_start 做检查
@@ -909,6 +912,8 @@ def _fused_ep_moe_kernel(
 
             send_row_start = send_chunk_idx * rows_per_rank
             recv_row_start = recv_chunk_idx * rows_per_rank
+            send_row_start = pl.multiple_of(send_row_start, 16)
+            recv_row_start = pl.multiple_of(recv_row_start, 16)
 
             sync_barrier()
 
