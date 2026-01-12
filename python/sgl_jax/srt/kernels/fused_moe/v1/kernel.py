@@ -1501,7 +1501,7 @@ def _fused_ep_moe_kernel(
                     else:
                         res_slice[...] = (res_slice[...].astype(jnp.float32) + res).astype(t_dtype)
 
-        lax.fori_loop(0, num_loops, body, None)
+        lax.fori_loop(0, num_loops, body, None, unroll=True)
 
     def expert_ffn(bt_sem_id, e_sem_id, local_e_id):
         bw_sem_id = jnp.int32(0)
