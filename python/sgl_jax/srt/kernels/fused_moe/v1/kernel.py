@@ -823,116 +823,122 @@ def _fused_ep_moe_kernel(
     def start_a2a_scatter(*, bt_sem_id, e_sem_id, local_e_id, bt_start):
         # Counting the number of remote sends from the current device.
         # Use `lax.fori_loop` to avoid unrolling `bt` (huge MLIR / slow compile).
-        def _scatter_one(
-            t_id, send_sz, e_sem_id=e_sem_id, local_e_id=local_e_id, bt_start=bt_start
-        ):
-            src_t_id = bt_start + t_id
-            for k_id in range(top_k):
-                e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
-                is_active_expert = e_id % local_num_experts == local_e_id
-                recv_id = e_id // local_num_experts
-                offset = expert_offsets_x2_smem[bt_sem_id, 0, e_id]
-                sz = lax.select(is_active_expert, jnp.int32(1), jnp.int32(0))
-                is_local = recv_id == my_id
-                local_sz = lax.select(is_local, sz, jnp.int32(0))
-                remote_sz = lax.select(is_local, jnp.int32(0), sz)
-                send_sz += remote_sz
-                expert_offsets_x2_smem[bt_sem_id, 0, e_id] = offset + local_sz + remote_sz
-                start = expert_starts_x2_smem[bt_sem_id, 0, e_id] + offset
-                pltpu.make_async_copy(
-                    src_ref=tokens_hbm.at[pl.ds(src_t_id, local_sz)],
-                    dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
-                    sem=recv_x2_sems.at[e_sem_id],
-                ).start()
-                pltpu.make_async_remote_copy(
-                    src_ref=tokens_hbm.at[pl.ds(src_t_id, remote_sz)],
-                    dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
-                    send_sem=send_x2_sems.at[e_sem_id],
-                    recv_sem=recv_x2_sems.at[e_sem_id],
-                    device_id=get_mesh_device_id(recv_id),
-                    device_id_type=pltpu.DeviceIdType.MESH,
-                ).start()
+        # def _scatter_one(
+        #     t_id, send_sz, e_sem_id=e_sem_id, local_e_id=local_e_id, bt_start=bt_start
+        # ):
+        #     src_t_id = bt_start + t_id
+        #     for k_id in range(top_k):
+        #         e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
+        #         is_active_expert = e_id % local_num_experts == local_e_id
+        #         recv_id = e_id // local_num_experts
+        #         offset = expert_offsets_x2_smem[bt_sem_id, 0, e_id]
+        #         sz = lax.select(is_active_expert, jnp.int32(1), jnp.int32(0))
+        #         is_local = recv_id == my_id
+        #         local_sz = lax.select(is_local, sz, jnp.int32(0))
+        #         remote_sz = lax.select(is_local, jnp.int32(0), sz)
+        #         send_sz += remote_sz
+        #         expert_offsets_x2_smem[bt_sem_id, 0, e_id] = offset + local_sz + remote_sz
+        #         start = expert_starts_x2_smem[bt_sem_id, 0, e_id] + offset
+        #         pltpu.make_async_copy(
+        #             src_ref=tokens_hbm.at[pl.ds(src_t_id, local_sz)],
+        #             dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
+        #             sem=recv_x2_sems.at[e_sem_id],
+        #         ).start()
+        #         pltpu.make_async_remote_copy(
+        #             src_ref=tokens_hbm.at[pl.ds(src_t_id, remote_sz)],
+        #             dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
+        #             send_sem=send_x2_sems.at[e_sem_id],
+        #             recv_sem=recv_x2_sems.at[e_sem_id],
+        #             device_id=get_mesh_device_id(recv_id),
+        #             device_id_type=pltpu.DeviceIdType.MESH,
+        #         ).start()
 
-            return send_sz
+        #     return send_sz
 
-        send_sz = lax.fori_loop(
-            0,
-            bt,
-            _scatter_one,
-            jnp.int32(0),
-            unroll=False,
-        )
-        a2a_s_sends_x2_smem[e_sem_id] = send_sz
+        # send_sz = lax.fori_loop(
+        #     0,
+        #     bt,
+        #     _scatter_one,
+        #     jnp.int32(0),
+        #     unroll=False,
+        # )
+        # a2a_s_sends_x2_smem[e_sem_id] = send_sz
+        pass
 
     def wait_a2a_scatter_recv(*, bt_sem_id, e_sem_id, local_e_id):
-        e_id = my_id * local_num_experts + local_e_id
-        sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
-        pltpu.make_async_copy(
-            src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
-            dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
-            sem=recv_x2_sems.at[e_sem_id],
-        ).wait()
+        # e_id = my_id * local_num_experts + local_e_id
+        # sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
+        # pltpu.make_async_copy(
+        #     src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
+        #     dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
+        #     sem=recv_x2_sems.at[e_sem_id],
+        # ).wait()
+        pass
 
     def wait_a2a_scatter_send(e_sem_id):
-        sz = a2a_s_sends_x2_smem[e_sem_id]
-        pltpu.make_async_copy(
-            src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
-            dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
-            sem=send_x2_sems.at[e_sem_id],
-        ).wait()
+        # sz = a2a_s_sends_x2_smem[e_sem_id]
+        # pltpu.make_async_copy(
+        #     src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
+        #     dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
+        #     sem=send_x2_sems.at[e_sem_id],
+        # ).wait()
+        pass
 
     def start_a2a_gather(*, bt_sem_id, e_sem_id, local_e_id):
-        my_e_id = my_id * local_num_experts + local_e_id
-        start = 0
-        src_ref = a2a_s_acc_x2_hbm
-        for recv_id in range(num_devices):
-            sz = d2e_count_x2_smem[bt_sem_id, recv_id, 0, my_e_id]
-            is_local = recv_id == my_id
-            local_sz = lax.select(is_local, sz, 0)
-            remote_sz = lax.select(is_local, 0, sz)
-            pltpu.make_async_copy(
-                src_ref=src_ref.at[e_sem_id, pl.ds(start, local_sz)],
-                dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, local_sz)],
-                sem=a2a_gather_sem,
-            ).start()
-            pltpu.make_async_remote_copy(
-                src_ref=src_ref.at[e_sem_id, pl.ds(start, remote_sz)],
-                dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, remote_sz)],
-                send_sem=send_x2_sems.at[e_sem_id],
-                recv_sem=a2a_gather_sem,
-                device_id=get_mesh_device_id(recv_id),
-                device_id_type=pltpu.DeviceIdType.MESH,
-            ).start()
+        # my_e_id = my_id * local_num_experts + local_e_id
+        # start = 0
+        # src_ref = a2a_s_acc_x2_hbm
+        # for recv_id in range(num_devices):
+        #     sz = d2e_count_x2_smem[bt_sem_id, recv_id, 0, my_e_id]
+        #     is_local = recv_id == my_id
+        #     local_sz = lax.select(is_local, sz, 0)
+        #     remote_sz = lax.select(is_local, 0, sz)
+        #     pltpu.make_async_copy(
+        #         src_ref=src_ref.at[e_sem_id, pl.ds(start, local_sz)],
+        #         dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, local_sz)],
+        #         sem=a2a_gather_sem,
+        #     ).start()
+        #     pltpu.make_async_remote_copy(
+        #         src_ref=src_ref.at[e_sem_id, pl.ds(start, remote_sz)],
+        #         dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, remote_sz)],
+        #         send_sem=send_x2_sems.at[e_sem_id],
+        #         recv_sem=a2a_gather_sem,
+        #         device_id=get_mesh_device_id(recv_id),
+        #         device_id_type=pltpu.DeviceIdType.MESH,
+        #     ).start()
 
-            start += sz
+        #     start += sz
+        pass
 
     def wait_a2a_gather_send(*, bt_sem_id, e_sem_id, local_e_id):
-        my_e_id = my_id * local_num_experts + local_e_id
-        sz = expert_sizes_x2_smem[bt_sem_id, 0, my_e_id]
-        local_sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, my_e_id]
-        remote_sz = sz - local_sz
-        is_valid = jnp.logical_and(local_e_id >= 0, local_e_id < local_num_experts)
-        remote_sz = lax.select(is_valid, remote_sz, 0)
+        # my_e_id = my_id * local_num_experts + local_e_id
+        # sz = expert_sizes_x2_smem[bt_sem_id, 0, my_e_id]
+        # local_sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, my_e_id]
+        # remote_sz = sz - local_sz
+        # is_valid = jnp.logical_and(local_e_id >= 0, local_e_id < local_num_experts)
+        # remote_sz = lax.select(is_valid, remote_sz, 0)
 
-        # Important: wait via `a2a_g_hbm` itself (matches f5b4) so reads from
-        # `a2a_g_hbm` can't be reordered before the gather completes.
-        ref = a2a_g_hbm.at[0, pl.ds(0, remote_sz)]
-        pltpu.make_async_copy(
-            src_ref=ref,
-            dst_ref=ref,
-            sem=send_x2_sems.at[e_sem_id],
-        ).wait()
+        # # Important: wait via `a2a_g_hbm` itself (matches f5b4) so reads from
+        # # `a2a_g_hbm` can't be reordered before the gather completes.
+        # ref = a2a_g_hbm.at[0, pl.ds(0, remote_sz)]
+        # pltpu.make_async_copy(
+        #     src_ref=ref,
+        #     dst_ref=ref,
+        #     sem=send_x2_sems.at[e_sem_id],
+        # ).wait()
+        pass
 
     def wait_a2a_gather_recv_all(*, bt_size):
-        # Align to f5b4: wait using a flat slice into `a2a_g_hbm` sized to the
-        # total gathered token vectors for this bt tile (`top_k * bt_size`).
-        sz = jnp.int32(bt_size * top_k)
-        ref = a2a_g_hbm.at[0, pl.ds(0, sz)]
-        pltpu.make_async_copy(
-            src_ref=ref,
-            dst_ref=ref,
-            sem=a2a_gather_sem,
-        ).wait()
+        # # Align to f5b4: wait using a flat slice into `a2a_g_hbm` sized to the
+        # # total gathered token vectors for this bt tile (`top_k * bt_size`).
+        # sz = jnp.int32(bt_size * top_k)
+        # ref = a2a_g_hbm.at[0, pl.ds(0, sz)]
+        # pltpu.make_async_copy(
+        #     src_ref=ref,
+        #     dst_ref=ref,
+        #     sem=a2a_gather_sem,
+        # ).wait()
+        pass
 
     def start_fetch_and_wait_bias():
         if bias_hbm is not None:
@@ -1507,30 +1513,30 @@ def _fused_ep_moe_kernel(
         num_token_tiles = (dyn_sz_i32 + (token_tile - 1)) // token_tile
 
         def start_stage_a2a_s_tile_from_hbm(tile_start, bd1_id, buf_id):
-            pltpu.make_async_copy(
-                src_ref=a2a_s_x2_hbm.at[
-                    e_sem_id,
-                    pl.ds(tile_start, token_tile),
-                    pl.ds(0, t_packing),
-                    pl.ds(bd1_id * bd1_per_t_packing, bd1_per_t_packing),
-                ],
-                dst_ref=t_stage_x2_vmem.at[
-                    buf_id,
-                    pl.ds(0, token_tile),
-                    pl.ds(0, t_packing),
-                    pl.ds(0, bd1_per_t_packing),
-                ],
-                sem=token_stage_x2_sems.at[buf_id],
-            ).start()
-            # pass
+            # pltpu.make_async_copy(
+            #     src_ref=a2a_s_x2_hbm.at[
+            #         e_sem_id,
+            #         pl.ds(tile_start, token_tile),
+            #         pl.ds(0, t_packing),
+            #         pl.ds(bd1_id * bd1_per_t_packing, bd1_per_t_packing),
+            #     ],
+            #     dst_ref=t_stage_x2_vmem.at[
+            #         buf_id,
+            #         pl.ds(0, token_tile),
+            #         pl.ds(0, t_packing),
+            #         pl.ds(0, bd1_per_t_packing),
+            #     ],
+            #     sem=token_stage_x2_sems.at[buf_id],
+            # ).start()
+            pass
 
         def wait_stage_a2a_s_tile(buf_id):
-            pltpu.make_async_copy(
-                src_ref=t_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
-                dst_ref=t_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
-                sem=token_stage_x2_sems.at[buf_id],
-            ).wait()
-            # pass
+            # pltpu.make_async_copy(
+            #     src_ref=t_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
+            #     dst_ref=t_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
+            #     sem=token_stage_x2_sems.at[buf_id],
+            # ).wait()
+            pass
 
         def start_load_stage_a2a_s_acc_tile_from_hbm(tile_start, bd2_start, buf_id):
             # pltpu.make_async_copy(
