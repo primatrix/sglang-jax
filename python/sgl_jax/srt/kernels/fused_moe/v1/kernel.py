@@ -848,10 +848,10 @@ def _fused_ep_moe_kernel(
         chunk_size = total_elems // num_devices
         right_peer = (my_id + 1) % num_devices
 
-        # Reuse semaphore
+        # 复用同一个信号量（必须是 Ref，不要用 se_ar_sem[0]）
         sem = se_ar_sem.at[0]
 
-        # Use flattened views to avoid dimension 0 tiling constraints
+        # 建议：用 1D flat，避免 2D VMEM 上的 vector.load 对齐证明问题
         b_output_flat = b_output_x2_vmem.at[out_buf_id].reshape(total_elems)
         scratch_flat = se_ar_scratch_vmem.reshape(total_elems)
 
@@ -860,12 +860,16 @@ def _fused_ep_moe_kernel(
             send_chunk_idx = (my_id - step + num_devices) % num_devices
             recv_chunk_idx = (my_id - step - 1 + num_devices) % num_devices
 
-            # Calculate flat offsets
             send_offset = send_chunk_idx * chunk_size
             recv_offset = recv_chunk_idx * chunk_size
 
+            # 这两行是“提示/断言”，帮助 Mosaic 做静态对齐推导（可保留，能更稳）
+            pl.multiple_of(send_offset, 16)
+            pl.multiple_of(recv_offset, 16)
+
             sync_barrier()
 
+            # remote copy：必须传 Ref（用 .at[...] + pl.ds）
             copy_desc = pltpu.make_async_remote_copy(
                 src_ref=b_output_flat.at[pl.ds(send_offset, chunk_size)],
                 dst_ref=scratch_flat.at[pl.ds(recv_offset, chunk_size)],
@@ -877,6 +881,7 @@ def _fused_ep_moe_kernel(
             copy_desc.start()
             copy_desc.wait()
 
+            # 本地 reduce：同样用 1D slice，避免 2D VMEM 行向量 load 的对齐证明
             acc_target = b_output_flat.at[pl.ds(recv_offset, chunk_size)]
             incoming = scratch_flat.at[pl.ds(recv_offset, chunk_size)]
 
@@ -894,6 +899,9 @@ def _fused_ep_moe_kernel(
 
             send_offset = send_chunk_idx * chunk_size
             recv_offset = recv_chunk_idx * chunk_size
+
+            pl.multiple_of(send_offset, 16)
+            pl.multiple_of(recv_offset, 16)
 
             sync_barrier()
 
