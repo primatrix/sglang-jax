@@ -881,7 +881,9 @@ def _fused_ep_moe_kernel(
             )
             incoming = se_ar_scratch_vmem.reshape(total_elems).at[pl.ds(recv_offset, chunk_size)]
 
-            new_val = acc_target.astype(jnp.float32) + incoming.astype(jnp.float32)
+            acc_val = acc_target[...]
+            inc_val = incoming[...]
+            new_val = acc_val.astype(jnp.float32) + inc_val.astype(jnp.float32)
             acc_target[...] = new_val.astype(t_dtype)
 
         lax.fori_loop(0, num_devices - 1, reduce_scatter_step, None, unroll=True)
