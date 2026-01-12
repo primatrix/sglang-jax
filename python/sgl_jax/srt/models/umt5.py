@@ -291,7 +291,7 @@ class UMT5Attention(nnx.Module):
         token_to_kv_pool: KVCache | None = None,
     ) -> jax.Array:
 
-        batch_size, seq_length = hidden_states.shape[:2]
+        seq_length, dim = hidden_states.shape[:2]
 
         # Project queries
         q, _ = self.q(hidden_states)
@@ -331,15 +331,15 @@ class UMT5Attention(nnx.Module):
                 token_to_kv_pool,
             )
 
-            attn_output = attn_output.reshape(batch_size, seq_length, self.inner_dim)
+            attn_output = attn_output.reshape(seq_length, self.inner_dim)
             output, _ = self.o(attn_output)
             return output
 
         # CASE 2: Standard attention (encoder, cross-attention, or fallback)
         # Reshape for multi-head attention
-        q = q.reshape(batch_size, seq_length, self.n_heads, self.key_value_proj_dim)
-        k = k.reshape(batch_size, -1, self.n_heads, self.key_value_proj_dim)
-        v = v.reshape(batch_size, -1, self.n_heads, self.key_value_proj_dim)
+        q = q.reshape(seq_length, self.n_heads, self.key_value_proj_dim)
+        k = k.reshape(-1, self.n_heads, self.key_value_proj_dim)
+        v = v.reshape(-1, self.n_heads, self.key_value_proj_dim)
 
         q = jnp.transpose(q, (0, 2, 1, 3))  # [batch, n_heads, seq_q, head_dim]
         k = jnp.transpose(k, (0, 2, 1, 3))  # [batch, n_heads, seq_k, head_dim]
@@ -394,8 +394,8 @@ class UMT5Attention(nnx.Module):
         v_f32 = v.astype(jnp.float32)
         attn_output = jnp.matmul(attn_weights, v_f32)
 
-        attn_output = jnp.transpose(attn_output, (0, 2, 1, 3))
-        attn_output = attn_output.reshape(batch_size, seq_length, self.inner_dim)
+        attn_output = jnp.transpose(attn_output, (1, 0, 2))
+        attn_output = attn_output.reshape(seq_length, self.inner_dim)
 
         output, _ = self.o(attn_output)
         return output
