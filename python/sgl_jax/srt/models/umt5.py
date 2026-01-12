@@ -277,7 +277,7 @@ class UMT5Attention(nnx.Module):
         )
 
         values = self.relative_attention_bias(rp_bucket)
-        values = jnp.transpose(values, (2, 0, 1))[None, :, :, :]
+        values = jnp.transpose(values, (2, 0, 1))
         return values
 
     def __call__(
@@ -341,9 +341,9 @@ class UMT5Attention(nnx.Module):
         k = k.reshape(-1, self.n_heads, self.key_value_proj_dim)
         v = v.reshape(-1, self.n_heads, self.key_value_proj_dim)
 
-        q = jnp.transpose(q, (1, 0, 2))  # [batch, n_heads, seq_q, head_dim]
-        k = jnp.transpose(k, (1, 0, 2))  # [batch, n_heads, seq_k, head_dim]
-        v = jnp.transpose(v, (1, 0, 2))  # [batch, n_heads, seq_k, head_dim]
+        q = jnp.transpose(q, (1, 0, 2))  # [n_heads, seq_q, head_dim]
+        k = jnp.transpose(k, (1, 0, 2))  # [n_heads, seq_k, head_dim]
+        v = jnp.transpose(v, (1, 0, 2))  # [n_heads, seq_k, head_dim]
 
         # Compute attention scores (unscaled for T5)
         q_f32 = q.astype(jnp.float32)
@@ -353,7 +353,7 @@ class UMT5Attention(nnx.Module):
         # Add relative position bias (self-attention only)
         if not self.is_cross_attention:
             bidirectional = not self.is_decoder
-            position_bias = self.compute_bias(seq_length, k.shape[2], bidirectional=bidirectional)
+            position_bias = self.compute_bias(seq_length, k.shape[1], bidirectional=bidirectional)
             scores += position_bias.astype(jnp.float32)
 
         # Apply attention masks
