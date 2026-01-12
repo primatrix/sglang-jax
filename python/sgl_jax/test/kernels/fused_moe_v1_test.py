@@ -380,44 +380,13 @@ class MoEKernelTest(jtu.JaxTestCase):
     #         bd2c=256,
     #     )
 
-    def test_benchmark_qwen_235(self):
-        num_experts = 128
-        top_k = 8
-        hidden_size = 4096
-        intermediate_size = 1536
-        dtype = jnp.bfloat16
-        num_tokens = 8 * 64
-        seed = 54321
-        renormalize_topk_logits = True
-        self._test_moe(
-            dtype=dtype,
-            top_k=top_k,
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_tokens=num_tokens,
-            seed=seed,
-            renormalize_topk_logits=renormalize_topk_logits,
-            bt=64,
-            bf=768,
-            bd1=2048,
-            bd2=2048,
-            btc=64,
-            bfc=768,
-            bd1c=2048,
-            bd2c=2048,
-            act_fn="silu",
-            atol=5e-2,
-            rtol=5e-2,
-        )
-
-    # def test_benchmark_qwen_30b_a3b(self):
+    # def test_benchmark_qwen_235(self):
     #     num_experts = 128
     #     top_k = 8
-    #     hidden_size = 2048
-    #     intermediate_size = 768
+    #     hidden_size = 4096
+    #     intermediate_size = 1536
     #     dtype = jnp.bfloat16
-    #     num_tokens = 512
+    #     num_tokens = 8 * 64
     #     seed = 54321
     #     renormalize_topk_logits = True
     #     self._test_moe(
@@ -429,18 +398,49 @@ class MoEKernelTest(jtu.JaxTestCase):
     #         num_tokens=num_tokens,
     #         seed=seed,
     #         renormalize_topk_logits=renormalize_topk_logits,
-    #         bt=16,
-    #         bf=384,
-    #         bd1=512,
-    #         bd2=512,
-    #         btc=16,
-    #         bfc=384,
-    #         bd1c=256,
-    #         bd2c=256,
+    #         bt=64,
+    #         bf=768,
+    #         bd1=2048,
+    #         bd2=2048,
+    #         btc=64,
+    #         bfc=768,
+    #         bd1c=2048,
+    #         bd2c=2048,
     #         act_fn="silu",
     #         atol=5e-2,
     #         rtol=5e-2,
     #     )
+
+    def test_benchmark_qwen_30b_a3b(self):
+        num_experts = 128
+        top_k = 8
+        hidden_size = 2048
+        intermediate_size = 768
+        dtype = jnp.bfloat16
+        num_tokens = 512
+        seed = 54321
+        renormalize_topk_logits = True
+        self._test_moe(
+            dtype=dtype,
+            top_k=top_k,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_tokens=num_tokens,
+            seed=seed,
+            renormalize_topk_logits=renormalize_topk_logits,
+            bt=16,
+            bf=384,
+            bd1=512,
+            bd2=512,
+            btc=16,
+            bfc=384,
+            bd1c=256,
+            bd2c=256,
+            act_fn="silu",
+            atol=5e-2,
+            rtol=5e-2,
+        )
 
     # @parameterized.product(
     #     w_dtype=[jnp.int8, jnp.float8_e5m2, jnp.float4_e2m1fn],
