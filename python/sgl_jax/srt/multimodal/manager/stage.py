@@ -13,7 +13,7 @@ from sgl_jax.srt.multimodal.manager.scheduler.diffusion_scheduler import (
     DiffusionScheduler,
 )
 from sgl_jax.srt.multimodal.manager.scheduler.vae_scheduler import VaeScheduler
-from sgl_jax.srt.multimodal.models.vaes.wanvae import AutoencoderKLWan
+from sgl_jax.srt.multimodal.models.wan2_1.vaes.wanvae import AutoencoderKLWan
 from sgl_jax.srt.multimodal.models.wan2_1.diffusion.wan2_1_dit import (
     WanTransformer3DModel,
 )
