@@ -1542,51 +1542,54 @@ def _fused_ep_moe_kernel(
             pass
 
         def start_load_stage_a2a_s_acc_tile_from_hbm(tile_start, bd2_start, buf_id):
-            pltpu.make_async_copy(
-                src_ref=a2a_s_acc_x2_hbm.at[
-                    e_sem_id,
-                    pl.ds(tile_start, token_tile),
-                    pl.ds(0, t_packing),
-                    pl.ds(bd2_start, bd2_per_t_packing),
-                ],
-                dst_ref=a2a_s_acc_stage_x3_vmem.at[
-                    buf_id,
-                    pl.ds(0, token_tile),
-                    pl.ds(0, t_packing),
-                    pl.ds(0, bd2_per_t_packing),
-                ],
-                sem=acc_stage_x3_sems.at[buf_id],
-            ).start()
+            # pltpu.make_async_copy(
+            #     src_ref=a2a_s_acc_x2_hbm.at[
+            #         e_sem_id,
+            #         pl.ds(tile_start, token_tile),
+            #         pl.ds(0, t_packing),
+            #         pl.ds(bd2_start, bd2_per_t_packing),
+            #     ],
+            #     dst_ref=a2a_s_acc_stage_x3_vmem.at[
+            #         buf_id,
+            #         pl.ds(0, token_tile),
+            #         pl.ds(0, t_packing),
+            #         pl.ds(0, bd2_per_t_packing),
+            #     ],
+            #     sem=acc_stage_x3_sems.at[buf_id],
+            # ).start()
+            pass
 
         def wait_stage_a2a_s_acc_tile(buf_id):
-            pltpu.make_async_copy(
-                src_ref=a2a_s_acc_stage_x3_vmem.at[
-                    buf_id,
-                    pl.ds(0, token_tile),
-                ],
-                dst_ref=a2a_s_acc_stage_x3_vmem.at[
-                    buf_id,
-                    pl.ds(0, token_tile),
-                ],
-                sem=acc_stage_x3_sems.at[buf_id],
-            ).wait()
+            # pltpu.make_async_copy(
+            #     src_ref=a2a_s_acc_stage_x3_vmem.at[
+            #         buf_id,
+            #         pl.ds(0, token_tile),
+            #     ],
+            #     dst_ref=a2a_s_acc_stage_x3_vmem.at[
+            #         buf_id,
+            #         pl.ds(0, token_tile),
+            #     ],
+            #     sem=acc_stage_x3_sems.at[buf_id],
+            # ).wait()
+            pass
 
         def start_store_stage_a2a_s_acc_tile_to_hbm(tile_start, bd2_start, buf_id):
-            pltpu.make_async_copy(
-                src_ref=a2a_s_acc_stage_x3_vmem.at[
-                    buf_id,
-                    pl.ds(0, token_tile),
-                    pl.ds(0, t_packing),
-                    pl.ds(0, bd2_per_t_packing),
-                ],
-                dst_ref=a2a_s_acc_x2_hbm.at[
-                    e_sem_id,
-                    pl.ds(tile_start, token_tile),
-                    pl.ds(0, t_packing),
-                    pl.ds(bd2_start, bd2_per_t_packing),
-                ],
-                sem=acc_stage_x3_sems.at[buf_id],
-            ).start()
+            # pltpu.make_async_copy(
+            #     src_ref=a2a_s_acc_stage_x3_vmem.at[
+            #         buf_id,
+            #         pl.ds(0, token_tile),
+            #         pl.ds(0, t_packing),
+            #         pl.ds(0, bd2_per_t_packing),
+            #     ],
+            #     dst_ref=a2a_s_acc_x2_hbm.at[
+            #         e_sem_id,
+            #         pl.ds(tile_start, token_tile),
+            #         pl.ds(0, t_packing),
+            #         pl.ds(bd2_start, bd2_per_t_packing),
+            #     ],
+            #     sem=acc_stage_x3_sems.at[buf_id],
+            # ).start()
+            pass
 
         def with_static_bw(bw_sem_id, body):
             return lax.cond(
