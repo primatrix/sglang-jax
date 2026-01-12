@@ -1640,7 +1640,7 @@ def _fused_ep_moe_kernel(
                         b3_vmem=b3_vmem,
                         should_init_ffn1=should_init_ffn1,
                     ):
-                        tile_start = token_tile_id * token_tile
+                        # tile_start = token_tile_id * token_tile
 
                         next_tile_id = token_tile_id + 1
                         next_buf_id = token_buf_id ^ jnp.int32(1)
@@ -1654,20 +1654,20 @@ def _fused_ep_moe_kernel(
 
                         wait_stage_a2a_s_tile(token_buf_id)
 
-                        tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
-                        dynamic_ffn1(
-                            t_vmem=t_stage_x2_vmem.at[token_buf_id],
-                            w1_vmem=w1_vmem,
-                            w1_scale_vmem=w1_scale_vmem,
-                            b1_vmem=b1_vmem,
-                            w3_vmem=w3_vmem,
-                            w3_scale_vmem=w3_scale_vmem,
-                            b3_vmem=b3_vmem,
-                            acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
-                            acc3_vmem=b_acc3_vmem.at[pl.ds(tile_start, token_tile)],
-                            dyn_sz=tile_sz,
-                            should_init=should_init_ffn1,
-                        )
+                        # tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
+                        # dynamic_ffn1(
+                        #     t_vmem=t_stage_x2_vmem.at[token_buf_id],
+                        #     w1_vmem=w1_vmem,
+                        #     w1_scale_vmem=w1_scale_vmem,
+                        #     b1_vmem=b1_vmem,
+                        #     w3_vmem=w3_vmem,
+                        #     w3_scale_vmem=w3_scale_vmem,
+                        #     b3_vmem=b3_vmem,
+                        #     acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
+                        #     acc3_vmem=b_acc3_vmem.at[pl.ds(tile_start, token_tile)],
+                        #     dyn_sz=tile_sz,
+                        #     should_init=should_init_ffn1,
+                        # )
                         return next_buf_id
 
                     lax.fori_loop(
@@ -1761,7 +1761,7 @@ def _fused_ep_moe_kernel(
                     ):
                         buf_compute, buf_store, buf_load = state
                         tile_start = token_tile_id * token_tile
-                        # tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
+                        tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
 
                         if not should_init_ffn2:
                             do_prefetch = token_tile_id + 1 < num_token_tiles
@@ -1788,16 +1788,16 @@ def _fused_ep_moe_kernel(
                             def _(buf_compute=buf_compute):
                                 wait_stage_a2a_s_acc_tile(buf_compute)
 
-                        # dynamic_ffn2(
-                        #     acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
-                        #     acc3_vmem=b_acc3_vmem.at[pl.ds(tile_start, token_tile)],
-                        #     w2_vmem=w2_vmem,
-                        #     w2_scale_vmem=w2_scale_vmem,
-                        #     b2_vmem=b2_vmem,
-                        #     res_vmem=a2a_s_acc_stage_x3_vmem.at[buf_compute],
-                        #     dyn_sz=tile_sz,
-                        #     should_init=should_init_ffn2,
-                        # )
+                        dynamic_ffn2(
+                            acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
+                            acc3_vmem=b_acc3_vmem.at[pl.ds(tile_start, token_tile)],
+                            w2_vmem=w2_vmem,
+                            w2_scale_vmem=w2_scale_vmem,
+                            b2_vmem=b2_vmem,
+                            res_vmem=a2a_s_acc_stage_x3_vmem.at[buf_compute],
+                            dyn_sz=tile_sz,
+                            should_init=should_init_ffn2,
+                        )
                         start_store_stage_a2a_s_acc_tile_to_hbm(tile_start, bd2_start, buf_compute)
                         return (buf_load, buf_compute, buf_store)
 
