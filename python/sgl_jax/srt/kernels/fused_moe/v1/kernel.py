@@ -1423,7 +1423,7 @@ def _fused_ep_moe_kernel(
                             acc1_vmem[*acc_slices] += acc1
                             acc3_vmem[*acc_slices] += acc3
 
-        lax.fori_loop(0, num_loops, body, None)
+        lax.fori_loop(0, num_loops, body, None, unroll=True)
 
     def dynamic_ffn2(
         acc1_vmem,
