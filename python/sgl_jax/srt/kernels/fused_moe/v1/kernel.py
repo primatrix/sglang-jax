@@ -1684,7 +1684,7 @@ def _fused_ep_moe_kernel(
                         num_token_tiles,
                         run_ffn1_tile,
                         jnp.int32(0),
-                        unroll=False,
+                        unroll=True,
                     )
                     return jnp.int32(next_bw_sem_id)
 
