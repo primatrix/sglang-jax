@@ -24,7 +24,9 @@ from jax.lax import Precision
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.multimodal.configs.vaes.wan_vae_config import WanVAEConfig
-from sgl_jax.srt.multimodal.models.wan2_1.vaes.commons import DiagonalGaussianDistribution
+from sgl_jax.srt.multimodal.models.wan2_1.vaes.commons import (
+    DiagonalGaussianDistribution,
+)
 from sgl_jax.srt.multimodal.models.wan2_1.vaes.vae_weights_mappings import to_mappings
 from sgl_jax.srt.utils.weight_utils import WeightLoader
 
