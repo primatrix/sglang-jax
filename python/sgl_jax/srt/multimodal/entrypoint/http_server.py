@@ -58,6 +58,7 @@ async def _convert_to_internal_request(obj: ImageGenerationsRequest | VideoGener
         raise Exception(f"not supported type {type(obj)}")
     return GenerateMMReqInput(
         prompt=obj.prompt,
+        neg_prompt=obj.neg_prompt,
         size=obj.size,
         num_frames=num_frames,
         data_type=data_type,

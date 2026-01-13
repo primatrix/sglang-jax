@@ -1,6 +1,6 @@
 import logging
 import math
-
+import numpy as np
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -224,6 +224,7 @@ class WanTransformerBlock(nnx.Module):
         norm_hidden_states, hidden_states = norm_hidden_states.astype(
             origin_dtype
         ), hidden_states.astype(origin_dtype)
+        jax.debug.callback(_log_tensor, "Block Self-Attn output", hidden_states)
 
         # 2. Cross-attention
         attn_output = self.attn2(norm_hidden_states, encoder_hidden_states, context_lens=None)
@@ -233,11 +234,13 @@ class WanTransformerBlock(nnx.Module):
         norm_hidden_states, hidden_states = norm_hidden_states.astype(
             origin_dtype
         ), hidden_states.astype(origin_dtype)
+        jax.debug.callback(_log_tensor, "Block Cross-Attn output", hidden_states)
 
         # 3. Feed-forward
         ffn_output = self.ffn(norm_hidden_states)
         hidden_states = self.mlp_residual(hidden_states, ffn_output, c_gate_msa)
         hidden_states = hidden_states.astype(origin_dtype)
+        jax.debug.callback(_log_tensor, "Block MLP output", hidden_states)
         return hidden_states
 
 
@@ -442,6 +445,16 @@ class WanTimeTextImageEmbedding(nnx.Module):
         return temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image
 
 
+def _log_tensor(name, x):
+    """Helper to log tensor info to a file during JIT execution."""
+    with open("debug_dit_outputs.txt", "a") as f:
+        f.write(f"--- {name} ---\n")
+        f.write(f"shape: {x.shape}\n")
+        f.write(f"mean: {float(np.mean(x)):.6f}\n")
+        f.write(f"std: {float(np.std(x)):.6f}\n")
+        f.write(f"data: {np.array(x).flatten()[:10]}\n\n")
+
+
 class WanTransformer3DModel(nnx.Module):
     def __init__(
         self,
@@ -536,6 +549,7 @@ class WanTransformer3DModel(nnx.Module):
         **kwargs,
     ):
         print("[1] input:", hidden_states.shape)
+        jax.debug.callback(_log_tensor, "[1] input", hidden_states)
         # origin_dtype = hidden_states.dtype
         if isinstance(encoder_hidden_states, list):
             # assert len(encoder_hidden_states) > 1, "encoder_hidden_states list is empty"
@@ -568,6 +582,7 @@ class WanTransformer3DModel(nnx.Module):
             start_frame=0,
         )
         assert freqs_cos.dtype == jnp.float32
+        jax.debug.callback(_log_tensor, "[2] freqs_cos", freqs_cos)
 
         print("[3] patch_embedding")
         # Convert from channel-first (B, C, F, H, W) to channel-last (B, F, H, W, C) for nnx.Conv
@@ -577,6 +592,7 @@ class WanTransformer3DModel(nnx.Module):
         batch_size = hidden_states.shape[0]
         embed_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.reshape(batch_size, -1, embed_dim)
+        jax.debug.callback(_log_tensor, "[3] patch_embedding hidden_states", hidden_states)
 
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timesteps.ndim == 2:
@@ -607,6 +623,8 @@ class WanTransformer3DModel(nnx.Module):
             encoder_hidden_states = jnp.concatenate(
                 [encoder_hidden_states_image, encoder_hidden_states], axis=1
             )
+        jax.debug.callback(_log_tensor, "[4] encoder_hidden_states", encoder_hidden_states)
+        jax.debug.callback(_log_tensor, "[4] timestep_proj", timestep_proj)
 
         # 4. Transformer blocks
         print("[5] blocks")
@@ -616,6 +634,7 @@ class WanTransformer3DModel(nnx.Module):
             hidden_states = block(
                 hidden_states, encoder_hidden_states, timestep_proj, freqs_cis, req
             )
+            jax.debug.callback(_log_tensor, f"[5.{i}] block {i} hidden_states", hidden_states)
 
         # 5. Output norm, projection & unpatchify
         print("[6] norm_out")
@@ -632,8 +651,11 @@ class WanTransformer3DModel(nnx.Module):
             shift, scale = jnp.split(combined, 2, axis=1)
 
         hidden_states = self.norm_out(hidden_states, shift, scale)
+        jax.debug.callback(_log_tensor, "[6] norm_out hidden_states", hidden_states)
+
         print("[7] proj_out")
         hidden_states = self.proj_out(hidden_states)
+        jax.debug.callback(_log_tensor, "[7] proj_out hidden_states", hidden_states)
 
         # Unpatchify: reshape from patches back to image space
         # hidden_states shape: [batch_size, num_patches, out_channels * patch_volume]
@@ -662,6 +684,7 @@ class WanTransformer3DModel(nnx.Module):
         )
 
         print("[9] done, output:", output.shape)
+        jax.debug.callback(_log_tensor, "[9] done output", output)
         return output
 
     def load_weights(self, model_path: str) -> None:

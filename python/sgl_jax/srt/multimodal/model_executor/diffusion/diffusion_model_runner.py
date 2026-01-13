@@ -4,6 +4,7 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from jax import NamedSharding
 from jax.sharding import PartitionSpec
@@ -16,6 +17,9 @@ from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.models.diffusion_solvers.unipc_multistep_scheduler import (
     UniPCMultistepScheduler,
     UniPCMultistepSchedulerState,
+)
+from sgl_jax.srt.multimodal.models.diffusion_solvers.flow_unipc_multistep_scheduler import (
+    FlowUniPCMultistepScheduler,
 )
 from sgl_jax.srt.utils.jax_utils import device_array
 
@@ -57,22 +61,8 @@ class DiffusionModelRunner(BaseModelRunner):
             mesh=self.mesh, load_config=LoadConfig(sub_dir="transformer")
         )
         self.model = self.model_loader.load_model(model_config=self.model_config)
-        self.solver: UniPCMultistepScheduler = UniPCMultistepScheduler(
-            num_train_timesteps=1000,
-            beta_start=0.0001,
-            beta_end=0.02,
-            beta_schedule="linear",
-            solver_order=2,  # Order 2 for guided sampling
-            prediction_type="flow_prediction",
-            use_flow_sigmas=True,  # Enable flow-based sigma schedule
-            flow_shift=3.0,  # 5.0 for 720P, 3.0 for 480P
-            timestep_spacing="linspace",
-            predict_x0=True,
-            solver_type="bh2",
-            lower_order_final=True,
-            dtype=jnp.float32,
-        )
-        self.solver_state = self.solver.create_state()
+        self.solver: FlowUniPCMultistepScheduler = FlowUniPCMultistepScheduler(shift=3.0)
+        # self.solver_state = self.solver.create_state()
         # Any additional initialization specific to diffusion models
         self.initialize_jit()
 
@@ -129,37 +119,50 @@ class DiffusionModelRunner(BaseModelRunner):
         # This might include steps like adding noise, denoising, etc.
 
         num_inference_steps = self.model_config.num_inference_steps
-        # time_steps = batch.timesteps
-        text_embeds = device_array(
-            batch.prompt_embeds, sharding=NamedSharding(self.mesh, PartitionSpec())
-        )
-        print(f"{text_embeds=}")
         guidance_scale = batch.guidance_scale
         do_classifier_free_guidance = guidance_scale > 1.0
-        batch.latents = jax.random.normal(
-            jax.random.PRNGKey(46),
-            (
-                1,
-                self.model_config.num_frames,
-                batch.width,
-                batch.height,
-                self.model_config.latent_input_dim,
-            ),
-            dtype=jnp.float32,
-        )  # Placeholder for latents
+
+        # Handle prompt embeddings
+        prompt_embeds = batch.prompt_embeds
+        if do_classifier_free_guidance:
+            if batch.negative_prompt_embeds is not None:
+                neg_embeds = batch.negative_prompt_embeds
+                prompt_embeds = jnp.concatenate([prompt_embeds, neg_embeds], axis=0)
+            else:
+                 # If no negative provided but CFG on, maybe use zeros or duplicate?
+                 # Or assume prompt_embeds already has it.
+                 # For now, let's assume if negative is provided, we concat.
+                 pass
+
+        text_embeds = device_array(
+            prompt_embeds, sharding=NamedSharding(self.mesh, PartitionSpec())
+        )
+        # text_embeds shape: (B, L, D), no transpose needed
+        # Pad seq_len dimension if needed
+        if text_embeds.shape[1] < 512:
+            pad_width = 512 - text_embeds.shape[1]
+            text_embeds = jnp.pad(
+                text_embeds, ((0, 0), (0, pad_width), (0, 0)), mode="constant", constant_values=0
+            )
+        self.prepare_latents(batch)
+        with open("debug_output_sglang.txt","a") as f:
+            f.write("before latents:\n")
+            f.write(f"{batch.latents}\n")
         latents = device_array(batch.latents, sharding=NamedSharding(self.mesh, PartitionSpec()))
-        solver_state: UniPCMultistepSchedulerState = self.solver.set_timesteps(
-            self.solver_state,
+        self.solver.set_timesteps(
             num_inference_steps=num_inference_steps,
             shape=latents.transpose(0, 4, 1, 2, 3).shape,
         )
+        self.solver.set_begin_index(0)
+
         for step in range(num_inference_steps):
             start_time = time.time()
             logging.info("Starting diffusion step %d", step)
-            t_scalar = jnp.array(solver_state.timesteps, dtype=jnp.int32)[step]
-            t_batch = jnp.broadcast_to(t_scalar, latents.shape[0])
+            t_scalar = jnp.array(self.solver.timesteps, dtype=jnp.int32)[step]
             if do_classifier_free_guidance:
-                latents = jnp.concatenate([latents] * 2)
+                latents = jnp.concatenate([latents] * 2, axis=0)
+            # Create timestep batch AFTER latents concat to match batch size
+            t_batch = jnp.broadcast_to(t_scalar, (latents.shape[0],))
             # Transpose to channel-first (B, T, H, W, C) -> (B, C, T, H, W) for model
             latents_cf = latents.transpose(0, 4, 1, 2, 3)
             # Perform denoising step
@@ -178,16 +181,38 @@ class DiffusionModelRunner(BaseModelRunner):
                 latents = latents[:bsz]
             # noise_pred is already channel-first (B, C, T, H, W) from model
             # latents is channel-last (B, T, H, W, C), need to transpose for solver
-            latents, solver_state = self.solver.step(
-                solver_state,
-                noise_pred,  # already (B, C, T, H, W)
-                t_scalar,
-                latents.transpose(0, 4, 1, 2, 3),  # (B, T, H, W, C) -> (B, C, T, H, W)
-            )
+            latents = self.solver.step(
+                model_output=noise_pred,  # already (B, C, T, H, W)
+                timestep=t_scalar,
+                sample=latents.transpose(0, 4, 1, 2, 3),  # (B, T, H, W, C) -> (B, C, T, H, W)
+                return_dict=False
+            )[0]
 
             latents = latents.transpose(0, 2, 3, 4, 1)  # back to channel-last
             logging.info(
                 "Finished diffusion step %d in %.2f seconds", step, time.time() - start_time
             )
         batch.latents = jax.device_get(latents)
+        with open("debug_output_sglang.txt","a") as f:
+            f.write("final latents:\n")
+            f.write(f"{batch.latents}\n")
         return batch
+
+    def prepare_latents(self, batch: Req):
+        if batch.latents is not None:
+            return
+        assert batch.width % self.model_config.scale_factor_spatial == 0
+        assert batch.height % self.model_config.scale_factor_spatial == 0
+        assert (self.model_config.num_frames - 1) % self.model_config.scale_factor_temporal == 0
+        latents = jax.random.normal(
+            jax.random.PRNGKey(46),
+            (
+                1,
+                (batch.num_frames - 1) // self.model_config.scale_factor_temporal + 1,
+                batch.width // self.model_config.scale_factor_spatial,
+                batch.height // self.model_config.scale_factor_spatial,
+                self.model_config.latent_input_dim,
+            ),
+            dtype=jnp.float32,
+        )  # Placeholder for latents
+        batch.latents = latents
