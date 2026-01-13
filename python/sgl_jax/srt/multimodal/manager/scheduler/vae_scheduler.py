@@ -37,9 +37,15 @@ class VaeScheduler:
                 for req in reqs:
                     assert req.latents is not None
                     self.preprocess(req)
-                    req.latents = device_array(
-                        req.latents, sharding=NamedSharding(self.mesh, PartitionSpec())
+                    import json
+                    with open("data.json", "r") as f:
+                        data = np.array(json.loads(f.read())["before"]["latents"])
+                    req.latents = req.latents = device_array(
+                        data, sharding=NamedSharding(self.mesh, PartitionSpec())
                     )
+                    #req.latents = device_array(
+                    #    req.latents, sharding=NamedSharding(self.mesh, PartitionSpec())
+                    #)
                 self.run_vae_batch(reqs)
 
     def preprocess(self, req):
@@ -52,6 +58,9 @@ class VaeScheduler:
         for req in batch:
             output, _ = self.vae_worker.forward(req)
             req.output = jax.device_get(output)
+            with open("result.json", "w") as f:
+                import json
+                f.write(json.dumps({"data": req.output.tolist()}))
             req.latents = None
             self._comm_backend.send_pyobj(req)
 
