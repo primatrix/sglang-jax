@@ -4,7 +4,6 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import nnx
 from jax import NamedSharding
 from jax.sharding import PartitionSpec
@@ -14,10 +13,6 @@ from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_loader.loader import JAXModelLoader, get_model_loader
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
-from sgl_jax.srt.multimodal.models.diffusion_solvers.unipc_multistep_scheduler import (
-    UniPCMultistepScheduler,
-    UniPCMultistepSchedulerState,
-)
 from sgl_jax.srt.multimodal.models.diffusion_solvers.flow_unipc_multistep_scheduler import (
     FlowUniPCMultistepScheduler,
 )
@@ -129,7 +124,7 @@ class DiffusionModelRunner(BaseModelRunner):
                 neg_embeds = batch.negative_prompt_embeds
                 prompt_embeds = jnp.concatenate([prompt_embeds, neg_embeds], axis=0)
             else:
-                 pass
+                pass
         text_embeds = device_array(
             prompt_embeds, sharding=NamedSharding(self.mesh, PartitionSpec())
         )
@@ -178,7 +173,7 @@ class DiffusionModelRunner(BaseModelRunner):
                 model_output=noise_pred,  # already (B, C, T, H, W)
                 timestep=t_scalar,
                 sample=latents.transpose(0, 4, 1, 2, 3),  # (B, T, H, W, C) -> (B, C, T, H, W)
-                return_dict=False
+                return_dict=False,
             )[0]
 
             latents = latents.transpose(0, 2, 3, 4, 1)  # back to channel-last

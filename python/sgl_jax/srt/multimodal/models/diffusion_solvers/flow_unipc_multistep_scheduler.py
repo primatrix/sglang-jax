@@ -12,7 +12,6 @@
 import math
 from dataclasses import dataclass
 from functools import partial
-from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -21,6 +20,7 @@ import jax.numpy as jnp
 @dataclass
 class FlowSchedulerOutput:
     """Output class for scheduler step."""
+
     prev_sample: jax.Array
 
 
@@ -81,9 +81,7 @@ class FlowUniPCMultistepScheduler:
             if solver_type in ["midpoint", "heun", "logrho"]:
                 self.solver_type = "bh2"
             else:
-                raise NotImplementedError(
-                    f"{solver_type} is not implemented for {self.__class__}"
-                )
+                raise NotImplementedError(f"{solver_type} is not implemented for {self.__class__}")
 
         if prediction_type != "flow_prediction":
             raise ValueError(
@@ -342,7 +340,7 @@ class FlowUniPCMultistepScheduler:
         # Compute prediction residual
         pred_res = jnp.where(
             order > 1,
-            jnp.einsum("k,k...->...", rhos_p[:order-1], D1s[:order-1]),
+            jnp.einsum("k,k...->...", rhos_p[: order - 1], D1s[: order - 1]),
             jnp.zeros_like(x),
         )
 
@@ -495,7 +493,7 @@ class FlowUniPCMultistepScheduler:
         # Compute correction residual
         corr_res = jnp.where(
             order > 1,
-            jnp.einsum("k,k...->...", rhos_c[:order-1], D1s[:order-1]),
+            jnp.einsum("k,k...->...", rhos_c[: order - 1], D1s[: order - 1]),
             jnp.zeros_like(D1_t),
         )
 

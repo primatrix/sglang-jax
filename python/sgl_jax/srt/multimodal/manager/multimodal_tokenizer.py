@@ -123,9 +123,13 @@ class MultimodalTokenizer(TokenizerManager):
             # TODO: Handle image preprocessing for multimodal inputs
             pass
 
-        return self._create_tokenized_object(obj, input_text, input_ids, neg_input_text, neg_input_ids)
+        return self._create_tokenized_object(
+            obj, input_text, input_ids, neg_input_text, neg_input_ids
+        )
 
-    def _create_tokenized_object(self, obj: GenerateMMReqInput, input_text, input_ids, neg_input_text, neg_input_ids):
+    def _create_tokenized_object(
+        self, obj: GenerateMMReqInput, input_text, input_ids, neg_input_text, neg_input_ids
+    ):
         rid = getattr(obj, "rid", None)
         if rid is None:
             rid = uuid.uuid4().hex
@@ -133,7 +137,7 @@ class MultimodalTokenizer(TokenizerManager):
         tokenized_obj = TokenizedGenerateMMReqInput(
             rid=rid,
             prompt=input_text,
-            negative_prompt = neg_input_text,
+            negative_prompt=neg_input_text,
             input_ids=input_ids,
             negative_input_ids=neg_input_ids,
             size=getattr(obj, "size", None),
