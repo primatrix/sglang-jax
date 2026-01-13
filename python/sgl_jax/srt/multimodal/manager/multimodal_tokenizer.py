@@ -102,8 +102,9 @@ class MultimodalTokenizer(TokenizerManager):
         """Tokenize one request."""
         # Support both 'prompt' (multimodal) and 'text' (text-only) fields
         input_text = getattr(obj, "prompt", None) or getattr(obj, "text", None)
-
+        neg_input_text = getattr(obj, "neg_prompt", None) or getattr(obj, "text", None)
         input_ids = getattr(obj, "input_ids", None)
+        neg_input_ids = getattr(obj, "neg_input_ids", None)
         if input_ids is None and input_text is not None:
             if self.tokenizer is None:
                 raise ValueError(
@@ -111,14 +112,24 @@ class MultimodalTokenizer(TokenizerManager):
                 )
             encoded = self.tokenizer(input_text)
             input_ids = encoded["input_ids"]
-
+        if neg_input_ids is None and neg_input_text is not None:
+            if self.tokenizer is None:
+                raise ValueError(
+                    "Tokenizer is not initialized but neg_input_text requires tokenization"
+                )
+            encoded = self.tokenizer(neg_input_text)
+            neg_input_ids = encoded["input_ids"]
         if getattr(obj, "input_reference", None) is not None:
             # TODO: Handle image preprocessing for multimodal inputs
             pass
 
-        return self._create_tokenized_object(obj, input_text, input_ids)
+        return self._create_tokenized_object(
+            obj, input_text, input_ids, neg_input_text, neg_input_ids
+        )
 
-    def _create_tokenized_object(self, obj: GenerateMMReqInput, input_text, input_ids):
+    def _create_tokenized_object(
+        self, obj: GenerateMMReqInput, input_text, input_ids, neg_input_text, neg_input_ids
+    ):
         rid = getattr(obj, "rid", None)
         if rid is None:
             rid = uuid.uuid4().hex
@@ -126,7 +137,9 @@ class MultimodalTokenizer(TokenizerManager):
         tokenized_obj = TokenizedGenerateMMReqInput(
             rid=rid,
             prompt=input_text,
+            negative_prompt=neg_input_text,
             input_ids=input_ids,
+            negative_input_ids=neg_input_ids,
             size=getattr(obj, "size", None),
             num_frames=getattr(obj, "num_frames", None),
             data_type=getattr(obj, "data_type", None),

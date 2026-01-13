@@ -74,7 +74,10 @@ class Stage:
                 self.stage_config.scheduler,
             )
             if getattr(self._stage_scheduler, "enable_overlap", False):
-                self._stage_scheduler.event_loop_overlap()
+                raise AssertionError(
+                    "currently we not support overlap for autoregressive scheduler"
+                )
+                # self._stage_scheduler.event_loop_overlap()
             else:
                 self._stage_scheduler.event_loop_normal()
         except Exception:

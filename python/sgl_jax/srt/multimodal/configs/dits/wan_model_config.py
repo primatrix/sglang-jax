@@ -31,11 +31,15 @@ class WanModelConfig(MultiModalModelConfigs):
     dtype: jnp.dtype = jnp.bfloat16
     precision: Precision = Precision.HIGHEST
     max_text_len: int = 512
-    num_frames: int = 11
-    latent_size: tuple[int, int] = (60, 90)
-    num_inference_steps: int = 30
+    num_frames: int = 5
+    # num_frames - 1 must be divisible by scale_factor_temporal
+    latent_size: tuple[int, int] = (64, 64)
+    # latent_size must be divisible by scale_factor_spatial
+    num_inference_steps: int = 50
     guidance_scale: float = 5.0
     latent_input_dim: int = 16
+    scale_factor_temporal: int = 4
+    scale_factor_spatial: int = 8
     model_class: None = None  # To be set to the model class
 
     def get_total_num_kv_heads(self) -> int:

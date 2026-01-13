@@ -103,7 +103,7 @@ class Req:
     # Scheduler parameters
     num_inference_steps: int = 5
     ## guidance_scale 越大，图像或者视频更贴近prompt
-    guidance_scale: float = 1.0
+    guidance_scale: float = 3.0
     guidance_scale_2: float | None = None
     guidance_rescale: float = 0.0
     eta: float = 0.0
