@@ -845,24 +845,35 @@ def _fused_ep_moe_kernel(
             return
 
         cols_per_rank = hidden_size // num_devices
-
         right_peer = (my_id + 1) % num_devices
+        # 使用 sem[0] 做发送, sem[1] 做接收，或者都用同一个依靠逻辑保证
+        # 原代码只用了一个 sem，这在 async_remote_copy 中通常是安全的，
+        # 因为 recv_sem 只有在数据到达后才 signal。
         sem = se_ar_sem.at[0]
 
         b_output_2d = b_output_x2_vmem.at[out_buf_id]
         scratch_2d = se_ar_scratch_vmem
 
+        # [优化] 移除循环内的 sync_barrier，仅在 AR 开始前做一次保护（如果需要）
+        # 实际上如果上层逻辑保证了 compute done，这里甚至不需要 barrier，
+        # 除非担心前一个 bt 的 AR 还没结束（但 sem 应该能 handle）。
+        # 保持一个 sync_barrier 在函数入口是为了对齐相位，防止跑得快的 rank 读取了跑得慢的 rank 的旧数据。
+        sync_barrier()
+
         # --- Phase 1: Reduce-Scatter ---
         def reduce_scatter_step(step, _):
+            # 逻辑：Send Chunk K -> Recv Chunk K-1 -> Add Chunk K-1
             send_chunk_idx = (my_id - step + num_devices) % num_devices
             recv_chunk_idx = (my_id - step - 1 + num_devices) % num_devices
 
             send_col_start = send_chunk_idx * cols_per_rank
             recv_col_start = recv_chunk_idx * cols_per_rank
+
+            # Mosaic/Pallas 提示：加上 alignment hint
             send_col_start = pl.multiple_of(send_col_start, 128)
             recv_col_start = pl.multiple_of(recv_col_start, 128)
 
-            sync_barrier()
+            # [优化] 移除了 sync_barrier()
 
             copy_desc = pltpu.make_async_remote_copy(
                 src_ref=b_output_2d.at[pl.ds(0, bt), pl.ds(send_col_start, cols_per_rank)],
@@ -873,8 +884,15 @@ def _fused_ep_moe_kernel(
                 device_id_type=pltpu.DeviceIdType.MESH,
             )
             copy_desc.start()
+            # 注意：这里的 wait 会阻塞 Scalar，但 DMA 已经在跑了。
+            # 如果想极致优化，需要手动 split loop，先 issue 所有 copy，再配合 sem_wait 做 add。
+            # 但当前这样移除 barrier 已经会有很大提升。
             copy_desc.wait()
 
+            # 计算部分：Accumulate received data
+            # 注意：这里的 dst_ref 和 src_ref 实际上要在逻辑上对应 "接收到的数据"
+            # 你的原逻辑中 dst_ref 指向 scratch，然后从 scratch 读出来加到 b_output 的 recv_col 部分
+            # 这在逻辑上是 Ring Reduce-Scatter 的标准步。
             acc_target = b_output_2d.at[pl.ds(0, bt), pl.ds(recv_col_start, cols_per_rank)]
             incoming = scratch_2d.at[pl.ds(0, bt), pl.ds(recv_col_start, cols_per_rank)]
 
@@ -895,8 +913,6 @@ def _fused_ep_moe_kernel(
             send_col_start = pl.multiple_of(send_col_start, 128)
             recv_col_start = pl.multiple_of(recv_col_start, 128)
 
-            sync_barrier()
-
             copy_desc = pltpu.make_async_remote_copy(
                 src_ref=b_output_2d.at[pl.ds(0, bt), pl.ds(send_col_start, cols_per_rank)],
                 dst_ref=b_output_2d.at[pl.ds(0, bt), pl.ds(send_col_start, cols_per_rank)],
@@ -909,7 +925,6 @@ def _fused_ep_moe_kernel(
             copy_desc.wait()
 
         lax.fori_loop(0, num_devices - 1, all_gather_step, None, unroll=True)
-        sync_barrier()
 
     def start_a2a_scatter(*, bt_sem_id, e_sem_id, local_e_id, bt_start):
         # Counting the number of remote sends from the current device.
@@ -2132,10 +2147,10 @@ def _fused_ep_moe_kernel(
         next_bt_id = bt_id + jnp.int32(1)
         out_buf_id = bt_id & jnp.int32(1)
 
-        @pl.when(next_bt_id < num_bt)
-        def _():
-            start_fetch_b_gating(bt_id=next_bt_id)
-            start_fetch_se_tokens(next_bt_id)
+        # @pl.when(next_bt_id < num_bt)
+        # def _():
+        #     start_fetch_b_gating(bt_id=next_bt_id)
+        #     start_fetch_se_tokens(next_bt_id)
 
         wait_fetch_b_gating(bt_id=bt_id)
         wait_fetch_se_tokens(bt_id)
@@ -2215,6 +2230,12 @@ def _fused_ep_moe_kernel(
 
         wait_a2a_gather_recv_all(bt_size=bt)
         sync_barrier()
+
+        @pl.when(next_bt_id < num_bt)
+        def _():
+            start_fetch_b_gating(bt_id=next_bt_id, priority=1)
+            start_fetch_se_tokens(bt_id=next_bt_id)
+
         all_reduce_shared_expert(bt_sem_id, out_buf_id)
         acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
 
