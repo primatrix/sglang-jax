@@ -188,7 +188,7 @@ class DiffusionModelRunner(BaseModelRunner):
             return
         assert batch.width % self.model_config.scale_factor_spatial == 0
         assert batch.height % self.model_config.scale_factor_spatial == 0
-        assert (self.model_config.num_frames - 1) % self.model_config.scale_factor_temporal == 0
+        assert (batch.num_frames - 1) % self.model_config.scale_factor_temporal == 0
         latents = jax.random.normal(
             jax.random.PRNGKey(46),
             (

@@ -35,7 +35,7 @@ class WanModelConfig(MultiModalModelConfigs):
     # num_frames - 1 must be divisible by scale_factor_temporal
     latent_size: tuple[int, int] = (64, 64)
     # latent_size must be divisible by scale_factor_spatial
-    num_inference_steps: int = 5
+    num_inference_steps: int = 50
     guidance_scale: float = 5.0
     latent_input_dim: int = 16
     scale_factor_temporal: int = 4
