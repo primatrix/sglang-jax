@@ -2140,7 +2140,7 @@ def _fused_ep_moe_kernel(
 
         @pl.when(next_bt_id < num_bt)
         def _():
-            start_fetch_b_gating(bt_id=next_bt_id)
+            start_fetch_b_gating(bt_id=next_bt_id, priority=1)
             start_fetch_se_tokens(next_bt_id)
 
         acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
