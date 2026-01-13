@@ -50,7 +50,7 @@ class VaeScheduler:
 
     def run_vae_batch(self, batch: list[Req]):
         for req in batch:
-            output = self.vae_worker.forward(req)
+            output, _ = self.vae_worker.forward(req)
             req.output = jax.device_get(output)
             req.latents = None
             self._comm_backend.send_pyobj(req)
