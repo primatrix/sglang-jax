@@ -2059,11 +2059,6 @@ def _fused_ep_moe_kernel(
         next_bt_id = bt_id + jnp.int32(1)
         out_buf_id = bt_id & jnp.int32(1)
 
-        @pl.when(next_bt_id < num_bt)
-        def _():
-            start_fetch_b_gating(bt_id=next_bt_id)
-            start_fetch_se_tokens(next_bt_id)
-
         wait_fetch_b_gating(bt_id=bt_id)
         wait_fetch_se_tokens(bt_id)
 
@@ -2142,6 +2137,11 @@ def _fused_ep_moe_kernel(
 
         wait_a2a_gather_recv_all(bt_size=bt)
         sync_barrier()
+
+        @pl.when(next_bt_id < num_bt)
+        def _():
+            start_fetch_b_gating(bt_id=next_bt_id)
+            start_fetch_se_tokens(next_bt_id)
 
         acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
 
