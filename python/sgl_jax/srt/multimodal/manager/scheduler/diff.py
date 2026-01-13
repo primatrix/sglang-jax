@@ -1,7 +1,7 @@
 import json
 import numpy as np
 
-with open("base.json","r") as f:
+with open("data.json","r") as f:
     base = np.array(json.loads(f.read())["after"]["output"])
 
 with open("result.json","w") as f:
