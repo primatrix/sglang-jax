@@ -129,11 +129,7 @@ class DiffusionModelRunner(BaseModelRunner):
                 neg_embeds = batch.negative_prompt_embeds
                 prompt_embeds = jnp.concatenate([prompt_embeds, neg_embeds], axis=0)
             else:
-                 # If no negative provided but CFG on, maybe use zeros or duplicate?
-                 # Or assume prompt_embeds already has it.
-                 # For now, let's assume if negative is provided, we concat.
                  pass
-
         text_embeds = device_array(
             prompt_embeds, sharding=NamedSharding(self.mesh, PartitionSpec())
         )
@@ -145,9 +141,6 @@ class DiffusionModelRunner(BaseModelRunner):
                 text_embeds, ((0, 0), (0, pad_width), (0, 0)), mode="constant", constant_values=0
             )
         self.prepare_latents(batch)
-        with open("debug_output_sglang.txt","a") as f:
-            f.write("before latents:\n")
-            f.write(f"{batch.latents}\n")
         latents = device_array(batch.latents, sharding=NamedSharding(self.mesh, PartitionSpec()))
         self.solver.set_timesteps(
             num_inference_steps=num_inference_steps,
@@ -193,9 +186,6 @@ class DiffusionModelRunner(BaseModelRunner):
                 "Finished diffusion step %d in %.2f seconds", step, time.time() - start_time
             )
         batch.latents = jax.device_get(latents)
-        with open("debug_output_sglang.txt","a") as f:
-            f.write("final latents:\n")
-            f.write(f"{batch.latents}\n")
         return batch
 
     def prepare_latents(self, batch: Req):
