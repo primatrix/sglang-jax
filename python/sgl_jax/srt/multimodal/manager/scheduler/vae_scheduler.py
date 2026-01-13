@@ -36,12 +36,14 @@ class VaeScheduler:
             if len(reqs) > 0:
                 for req in reqs:
                     assert req.latents is not None
-                    self.preprocess(req)
                     import json
                     with open("data.json", "r") as f:
                         data = np.array(json.loads(f.read())["before"]["latents"])
+                        data = np.transpose(data, (0, 2, 3, 4, 1))
+                    req.latents = data
+                    self.preprocess(req)
                     req.latents = req.latents = device_array(
-                        np.transpose(data, (0,2,3,4,1)), sharding=NamedSharding(self.mesh, PartitionSpec())
+                        req.latents, sharding=NamedSharding(self.mesh, PartitionSpec())
                     )
                     #req.latents = device_array(
                     #    req.latents, sharding=NamedSharding(self.mesh, PartitionSpec())
