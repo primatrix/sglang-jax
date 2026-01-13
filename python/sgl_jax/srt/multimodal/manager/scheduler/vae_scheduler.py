@@ -28,6 +28,7 @@ class VaeScheduler:
             model_class=model_class, mesh=mesh, server_args=server_args
         )
         self.server_args = server_args
+        self.model_config = model_class.get_config_class()()
 
     def event_loop_normal(self):
         while True:
@@ -35,10 +36,17 @@ class VaeScheduler:
             if len(reqs) > 0:
                 for req in reqs:
                     assert req.latents is not None
+                    self.preprocess(req)
                     req.latents = device_array(
                         req.latents, sharding=NamedSharding(self.mesh, PartitionSpec())
                     )
                 self.run_vae_batch(reqs)
+
+    def preprocess(self, req):
+        if hasattr(self.model_config, "scaling_factor"):
+            req.latents = req.latents / self.model_config.scaling_factor
+        if hasattr(self.model_config, "shift_factor"):
+            req.latents += self.model_config.shift_factor
 
     def run_vae_batch(self, batch: list[Req]):
         for req in batch:

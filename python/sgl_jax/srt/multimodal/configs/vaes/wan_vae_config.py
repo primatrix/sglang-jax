@@ -3,8 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass
 
-import jax
-import jax.numpy as jnp
+import numpy as np
 
 from sgl_jax.srt.multimodal.configs.vaes.vae_base_config import VAEConfig
 
@@ -75,10 +74,8 @@ class WanVAEConfig(VAEConfig):
 
     def __post_init__(self):
         ## todo is z_dim is the channel dimension?
-        self.scaling_factor: jax.Array = 1.0 / jnp.array(self.latents_std).reshape(
-            1, 1, 1, 1, self.z_dim
-        )
-        self.shift_factor: jax.Array = jnp.array(self.latents_mean).reshape(1, 1, 1, 1, self.z_dim)
+        self.scaling_factor = 1.0 / np.array(self.latents_std).reshape(1, 1, 1, 1, self.z_dim)
+        self.shift_factor = np.array(self.latents_mean).reshape(1, 1, 1, 1, self.z_dim)
         self.temporal_compression_ratio = self.scale_factor_temporal
         self.spatial_compression_ratio = self.scale_factor_spatial
 

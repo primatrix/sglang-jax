@@ -13,10 +13,10 @@ from sgl_jax.srt.multimodal.manager.scheduler.diffusion_scheduler import (
     DiffusionScheduler,
 )
 from sgl_jax.srt.multimodal.manager.scheduler.vae_scheduler import VaeScheduler
-from sgl_jax.srt.multimodal.models.wan2_1.vaes.wanvae import AutoencoderKLWan
 from sgl_jax.srt.multimodal.models.wan2_1.diffusion.wan2_1_dit import (
     WanTransformer3DModel,
 )
+from sgl_jax.srt.multimodal.models.wan2_1.vaes.wanvae import AutoencoderKLWan
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.utils import get_exception_traceback
