@@ -840,91 +840,165 @@ def _fused_ep_moe_kernel(
             pltpu.VMEM(expert_sizes_x2_smem.shape[1:], expert_sizes_x2_smem.dtype),
         )
 
-    def all_reduce_shared_expert(bt_sem_id, out_buf_id):
+    se_cols_per_rank = hidden_size // num_devices
+    se_right_peer = (my_id + 1) % num_devices
+    se_ar_steps = 2 * (num_devices - 1)  # Reduce-Scatter + All-Gather
+
+    def step_shared_expert_ar(step_idx, buf_id):
         if w1_shared_hbm is None:
             return
 
-        cols_per_rank = hidden_size // num_devices
-        right_peer = (my_id + 1) % num_devices
-        # 使用 sem[0] 做发送, sem[1] 做接收，或者都用同一个依靠逻辑保证
-        # 原代码只用了一个 sem，这在 async_remote_copy 中通常是安全的，
-        # 因为 recv_sem 只有在数据到达后才 signal。
+        b_output_2d = b_output_x2_vmem.at[buf_id]
+        scratch_2d = se_ar_scratch_vmem
+        # 复用 sem[0] 即可，因为 step 是串行的
         sem = se_ar_sem.at[0]
 
-        b_output_2d = b_output_x2_vmem.at[out_buf_id]
-        scratch_2d = se_ar_scratch_vmem
+        # 1. Reduce-Scatter 阶段 (前 num_devices-1 步)
+        def run_reduce_scatter(s):
+            send_chunk_idx = (my_id - s + num_devices) % num_devices
+            recv_chunk_idx = (my_id - s - 1 + num_devices) % num_devices
 
-        # [优化] 移除循环内的 sync_barrier，仅在 AR 开始前做一次保护（如果需要）
-        # 实际上如果上层逻辑保证了 compute done，这里甚至不需要 barrier，
-        # 除非担心前一个 bt 的 AR 还没结束（但 sem 应该能 handle）。
-        # 保持一个 sync_barrier 在函数入口是为了对齐相位，防止跑得快的 rank 读取了跑得慢的 rank 的旧数据。
-        sync_barrier()
+            send_col_start = pl.multiple_of(send_chunk_idx * se_cols_per_rank, 128)
+            recv_col_start = pl.multiple_of(recv_chunk_idx * se_cols_per_rank, 128)
 
-        # --- Phase 1: Reduce-Scatter ---
-        def reduce_scatter_step(step, _):
-            # 逻辑：Send Chunk K -> Recv Chunk K-1 -> Add Chunk K-1
-            send_chunk_idx = (my_id - step + num_devices) % num_devices
-            recv_chunk_idx = (my_id - step - 1 + num_devices) % num_devices
-
-            send_col_start = send_chunk_idx * cols_per_rank
-            recv_col_start = recv_chunk_idx * cols_per_rank
-
-            # Mosaic/Pallas 提示：加上 alignment hint
-            send_col_start = pl.multiple_of(send_col_start, 128)
-            recv_col_start = pl.multiple_of(recv_col_start, 128)
-
-            # [优化] 移除了 sync_barrier()
-
+            # Async Copy (ICI)
             copy_desc = pltpu.make_async_remote_copy(
-                src_ref=b_output_2d.at[pl.ds(0, bt), pl.ds(send_col_start, cols_per_rank)],
-                dst_ref=scratch_2d.at[pl.ds(0, bt), pl.ds(send_col_start, cols_per_rank)],
+                src_ref=b_output_2d.at[pl.ds(0, bt), pl.ds(send_col_start, se_cols_per_rank)],
+                dst_ref=scratch_2d.at[pl.ds(0, bt), pl.ds(send_col_start, se_cols_per_rank)],
                 send_sem=sem,
                 recv_sem=sem,
-                device_id=get_mesh_device_id(right_peer),
+                device_id=get_mesh_device_id(se_right_peer),
                 device_id_type=pltpu.DeviceIdType.MESH,
             )
             copy_desc.start()
-            # 注意：这里的 wait 会阻塞 Scalar，但 DMA 已经在跑了。
-            # 如果想极致优化，需要手动 split loop，先 issue 所有 copy，再配合 sem_wait 做 add。
-            # 但当前这样移除 barrier 已经会有很大提升。
+            # 这里的 wait 只阻塞指令发射，不阻塞 MXU
             copy_desc.wait()
 
-            # 计算部分：Accumulate received data
-            # 注意：这里的 dst_ref 和 src_ref 实际上要在逻辑上对应 "接收到的数据"
-            # 你的原逻辑中 dst_ref 指向 scratch，然后从 scratch 读出来加到 b_output 的 recv_col 部分
-            # 这在逻辑上是 Ring Reduce-Scatter 的标准步。
-            acc_target = b_output_2d.at[pl.ds(0, bt), pl.ds(recv_col_start, cols_per_rank)]
-            incoming = scratch_2d.at[pl.ds(0, bt), pl.ds(recv_col_start, cols_per_rank)]
+            # Accumulate (Vector ALU)
+            acc_target = b_output_2d.at[pl.ds(0, bt), pl.ds(recv_col_start, se_cols_per_rank)]
+            incoming = scratch_2d.at[pl.ds(0, bt), pl.ds(recv_col_start, se_cols_per_rank)]
 
             acc_val = acc_target[...]
             inc_val = incoming[...]
             new_val = acc_val.astype(jnp.float32) + inc_val.astype(jnp.float32)
             acc_target[...] = new_val.astype(t_dtype)
 
-        lax.fori_loop(0, num_devices - 1, reduce_scatter_step, None, unroll=True)
-
-        # --- Phase 2: All-Gather ---
-        def all_gather_step(step, _):
-            send_chunk_idx = (my_id - step + 1 + num_devices) % num_devices
-            recv_chunk_idx = (my_id - step + num_devices) % num_devices
-
-            send_col_start = send_chunk_idx * cols_per_rank
-            recv_col_start = recv_chunk_idx * cols_per_rank
-            send_col_start = pl.multiple_of(send_col_start, 128)
-            recv_col_start = pl.multiple_of(recv_col_start, 128)
+        # 2. All-Gather 阶段 (后 num_devices-1 步)
+        def run_all_gather(s):
+            ag_step = s - (num_devices - 1)
+            send_chunk_idx = (my_id - ag_step + 1 + num_devices) % num_devices
+            send_col_start = pl.multiple_of(send_chunk_idx * se_cols_per_rank, 128)
 
             copy_desc = pltpu.make_async_remote_copy(
-                src_ref=b_output_2d.at[pl.ds(0, bt), pl.ds(send_col_start, cols_per_rank)],
-                dst_ref=b_output_2d.at[pl.ds(0, bt), pl.ds(send_col_start, cols_per_rank)],
+                src_ref=b_output_2d.at[pl.ds(0, bt), pl.ds(send_col_start, se_cols_per_rank)],
+                dst_ref=b_output_2d.at[pl.ds(0, bt), pl.ds(send_col_start, se_cols_per_rank)],
                 send_sem=sem,
                 recv_sem=sem,
-                device_id=get_mesh_device_id(right_peer),
+                device_id=get_mesh_device_id(se_right_peer),
                 device_id_type=pltpu.DeviceIdType.MESH,
             )
             copy_desc.start()
             copy_desc.wait()
 
-        lax.fori_loop(0, num_devices - 1, all_gather_step, None, unroll=True)
+        # 根据 step_idx 决定跑哪个阶段
+        is_rs = step_idx < (num_devices - 1)
+        lax.cond(is_rs, lambda s: run_reduce_scatter(s), lambda s: run_all_gather(s), step_idx)
+
+    def finish_remaining_ar_steps(start_step, buf_id):
+        if w1_shared_hbm is None:
+            return
+
+        def loop_body(i, _):
+            step_shared_expert_ar(i, buf_id)
+            return None
+
+        lax.fori_loop(start_step, se_ar_steps, loop_body, None, unroll=True)
+
+    # def all_reduce_shared_expert(bt_sem_id, out_buf_id):
+    #     if w1_shared_hbm is None:
+    #         return
+
+    #     cols_per_rank = hidden_size // num_devices
+    #     right_peer = (my_id + 1) % num_devices
+    #     # 使用 sem[0] 做发送, sem[1] 做接收，或者都用同一个依靠逻辑保证
+    #     # 原代码只用了一个 sem，这在 async_remote_copy 中通常是安全的，
+    #     # 因为 recv_sem 只有在数据到达后才 signal。
+    #     sem = se_ar_sem.at[0]
+
+    #     b_output_2d = b_output_x2_vmem.at[out_buf_id]
+    #     scratch_2d = se_ar_scratch_vmem
+
+    #     # [优化] 移除循环内的 sync_barrier，仅在 AR 开始前做一次保护（如果需要）
+    #     # 实际上如果上层逻辑保证了 compute done，这里甚至不需要 barrier，
+    #     # 除非担心前一个 bt 的 AR 还没结束（但 sem 应该能 handle）。
+    #     # 保持一个 sync_barrier 在函数入口是为了对齐相位，防止跑得快的 rank 读取了跑得慢的 rank 的旧数据。
+    #     sync_barrier()
+
+    #     # --- Phase 1: Reduce-Scatter ---
+    #     def reduce_scatter_step(step, _):
+    #         # 逻辑：Send Chunk K -> Recv Chunk K-1 -> Add Chunk K-1
+    #         send_chunk_idx = (my_id - step + num_devices) % num_devices
+    #         recv_chunk_idx = (my_id - step - 1 + num_devices) % num_devices
+
+    #         send_col_start = send_chunk_idx * cols_per_rank
+    #         recv_col_start = recv_chunk_idx * cols_per_rank
+
+    #         # Mosaic/Pallas 提示：加上 alignment hint
+    #         send_col_start = pl.multiple_of(send_col_start, 128)
+    #         recv_col_start = pl.multiple_of(recv_col_start, 128)
+
+    #         # [优化] 移除了 sync_barrier()
+
+    #         copy_desc = pltpu.make_async_remote_copy(
+    #             src_ref=b_output_2d.at[pl.ds(0, bt), pl.ds(send_col_start, cols_per_rank)],
+    #             dst_ref=scratch_2d.at[pl.ds(0, bt), pl.ds(send_col_start, cols_per_rank)],
+    #             send_sem=sem,
+    #             recv_sem=sem,
+    #             device_id=get_mesh_device_id(right_peer),
+    #             device_id_type=pltpu.DeviceIdType.MESH,
+    #         )
+    #         copy_desc.start()
+    #         # 注意：这里的 wait 会阻塞 Scalar，但 DMA 已经在跑了。
+    #         # 如果想极致优化，需要手动 split loop，先 issue 所有 copy，再配合 sem_wait 做 add。
+    #         # 但当前这样移除 barrier 已经会有很大提升。
+    #         copy_desc.wait()
+
+    #         # 计算部分：Accumulate received data
+    #         # 注意：这里的 dst_ref 和 src_ref 实际上要在逻辑上对应 "接收到的数据"
+    #         # 你的原逻辑中 dst_ref 指向 scratch，然后从 scratch 读出来加到 b_output 的 recv_col 部分
+    #         # 这在逻辑上是 Ring Reduce-Scatter 的标准步。
+    #         acc_target = b_output_2d.at[pl.ds(0, bt), pl.ds(recv_col_start, cols_per_rank)]
+    #         incoming = scratch_2d.at[pl.ds(0, bt), pl.ds(recv_col_start, cols_per_rank)]
+
+    #         acc_val = acc_target[...]
+    #         inc_val = incoming[...]
+    #         new_val = acc_val.astype(jnp.float32) + inc_val.astype(jnp.float32)
+    #         acc_target[...] = new_val.astype(t_dtype)
+
+    #     lax.fori_loop(0, num_devices - 1, reduce_scatter_step, None, unroll=True)
+
+    #     # --- Phase 2: All-Gather ---
+    #     def all_gather_step(step, _):
+    #         send_chunk_idx = (my_id - step + 1 + num_devices) % num_devices
+    #         recv_chunk_idx = (my_id - step + num_devices) % num_devices
+
+    #         send_col_start = send_chunk_idx * cols_per_rank
+    #         recv_col_start = recv_chunk_idx * cols_per_rank
+    #         send_col_start = pl.multiple_of(send_col_start, 128)
+    #         recv_col_start = pl.multiple_of(recv_col_start, 128)
+
+    #         copy_desc = pltpu.make_async_remote_copy(
+    #             src_ref=b_output_2d.at[pl.ds(0, bt), pl.ds(send_col_start, cols_per_rank)],
+    #             dst_ref=b_output_2d.at[pl.ds(0, bt), pl.ds(send_col_start, cols_per_rank)],
+    #             send_sem=sem,
+    #             recv_sem=sem,
+    #             device_id=get_mesh_device_id(right_peer),
+    #             device_id_type=pltpu.DeviceIdType.MESH,
+    #         )
+    #         copy_desc.start()
+    #         copy_desc.wait()
+
+    #     lax.fori_loop(0, num_devices - 1, all_gather_step, None, unroll=True)
 
     def start_a2a_scatter(*, bt_sem_id, e_sem_id, local_e_id, bt_start):
         # Counting the number of remote sends from the current device.
@@ -2141,20 +2215,27 @@ def _fused_ep_moe_kernel(
         start_fetch_b_gating(bt_id=jnp.int32(0))
         start_fetch_se_tokens(bt_id=jnp.int32(0))
 
+    ar_steps_per_expert = 1
+
     def run_bt(bt_id, e_sem_id):
         bt_start = bt_id * bt
         bt_sem_id = bt_id & jnp.int32(1)
         next_bt_id = bt_id + jnp.int32(1)
+
+        # 当前 Block 的输出 buffer (用于 SE 计算和 AR)
         out_buf_id = bt_id & jnp.int32(1)
 
-        # @pl.when(next_bt_id < num_bt)
-        # def _():
-        #     start_fetch_b_gating(bt_id=next_bt_id)
-        #     start_fetch_se_tokens(next_bt_id)
+        # 1. 预取下一个 Block (标准 Double Buffer)
+        @pl.when(next_bt_id < num_bt)
+        def _():
+            start_fetch_b_gating(bt_id=next_bt_id)
+            start_fetch_se_tokens(next_bt_id)
 
+        # 2. 等待当前 Block 数据
         wait_fetch_b_gating(bt_id=bt_id)
         wait_fetch_se_tokens(bt_id)
 
+        # 3. Gating & TopK & Metadata
         b_gating = b_gating_x2_vmem.at[bt_sem_id][...]
         t2e_routing, expert_sizes, expert_starts = get_top_k(
             b_gating,
@@ -2168,20 +2249,26 @@ def _fused_ep_moe_kernel(
             starts=expert_starts,
             sizes=expert_sizes,
         )
-        # copy_expert_size(bt_sem_id, bt_id)
-        sync_barrier()
 
+        # 4. 同步 & 等待落盘 Buffer 释放
+        sync_barrier()
         wait_store_output(bt_id=bt_id - 2)
 
         start_a2a_scatter(bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=0, bt_start=bt_start)
 
-        init_carry = (e_sem_id, jnp.int32(0))
+        # Carry 状态: (e_sem_id, se_block_idx, ar_step_idx, barrier_passed)
+        init_carry = (e_sem_id, jnp.int32(0), jnp.int32(0), False)
 
         def run_per_expert_pipelined(local_e_id, carry):
-            curr_e_sem_id, curr_se_block = carry
+            curr_e_sem_id, curr_se_block, ar_step_idx, barrier_passed = carry
 
-            run_shared_expert_slice(curr_se_block, bt_sem_id, out_buf_id)
-            curr_se_block += 1
+            do_compute_pre = curr_se_block < se_total_blocks
+
+            @pl.when(do_compute_pre)
+            def _():
+                run_shared_expert_slice(curr_se_block, bt_sem_id, out_buf_id)
+
+            curr_se_block += lax.select(do_compute_pre, 1, 0)
 
             wait_a2a_scatter_recv(
                 bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id
@@ -2191,10 +2278,29 @@ def _fused_ep_moe_kernel(
                 start_fetch_bw1(local_e_id, bw1_sem_id=0, bf_id=0, bd1_id=0)
                 start_fetch_bw3(local_e_id, bw3_sem_id=0, bf_id=0, bd3_id=0)
                 expert_ffn(bt_sem_id, curr_e_sem_id, local_e_id)
+
+                # --- [Phase 2: SE All-Reduce Overlap] ---
+                # 只有当 Barrier 已经通过（意味着所有 Device 的 SE 计算都完成了），
+                # 我们才开始执行 AR。这通常发生在 Loop 的后半段。
+                def ar_loop(i, current_step):
+                    can_run = barrier_passed & (current_step < se_ar_steps)
+
+                    @pl.when(can_run)
+                    def _():
+                        step_shared_expert_ar(current_step, out_buf_id)
+
+                    return current_step + lax.select(can_run, 1, 0)
+
+                # 在 MXU 忙着跑 FFN 时，尝试插入 AR 步骤
+                new_ar_step = lax.fori_loop(
+                    0, ar_steps_per_expert, ar_loop, ar_step_idx, unroll=True
+                )
+
             else:
                 wait_a2a_gather_send(
                     bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id - 2
                 )
+                new_ar_step = ar_step_idx
 
             start_a2a_gather(bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id)
 
@@ -2210,37 +2316,62 @@ def _fused_ep_moe_kernel(
                     bt_start=bt_start,
                 )
 
-            run_shared_expert_slice(curr_se_block, bt_sem_id, out_buf_id)
-            curr_se_block += 1
+            # 如果前面还没算完 SE，后面继续算
+            do_compute_post = curr_se_block < se_total_blocks
+
+            @pl.when(do_compute_post)
+            def _():
+                run_shared_expert_slice(curr_se_block, bt_sem_id, out_buf_id)
+
+            curr_se_block += lax.select(do_compute_post, 1, 0)
+
+            # --- [CRITICAL BARRIER LOGIC] ---
+            # 检查分水岭：SE 计算是否刚刚全部完成？
+            # 如果是，所有 Device 需要在此同步，确保数据就绪，然后开启 AR 阶段。
+            just_finished = (curr_se_block == se_total_blocks) & (jnp.logical_not(barrier_passed))
+
+            @pl.when(just_finished)
+            def _():
+                sync_barrier()
+
+            new_barrier_passed = barrier_passed | just_finished
 
             wait_a2a_scatter_send(curr_e_sem_id)
-            sync_barrier()
-            return (next_e_sem_id, curr_se_block)
+            sync_barrier()  # 保持原有的 Loop Barrier
 
+            return (next_e_sem_id, curr_se_block, new_ar_step, new_barrier_passed)
+
+        # 运行 Pipeline 循环
         final_carry = lax.fori_loop(
             0, local_num_experts, run_per_expert_pipelined, init_carry, unroll=False
         )
-        final_e_sem_id, final_se_block = final_carry
+        final_e_sem_id, final_se_block, final_ar_step, final_barrier_passed = final_carry
 
-        def cleanup_body(block_idx, _):
+        # --- 收尾工作 (Cleanup) ---
+
+        # 1. 如果 SE 计算还没完（比如 routed experts 很少），强制算完
+        def cleanup_compute(block_idx, _):
             run_shared_expert_slice(block_idx, bt_sem_id, out_buf_id)
             return None
 
-        lax.fori_loop(final_se_block, se_total_blocks, cleanup_body, None)
+        lax.fori_loop(final_se_block, se_total_blocks, cleanup_compute, None)
+
+        # 2. 补上 Barrier (如果之前没触发)
+        @pl.when(jnp.logical_not(final_barrier_passed))
+        def _():
+            sync_barrier()
 
         wait_a2a_gather_recv_all(bt_size=bt)
-        sync_barrier()
 
-        @pl.when(next_bt_id < num_bt)
-        def _():
-            start_fetch_b_gating(bt_id=next_bt_id, priority=1)
-            start_fetch_se_tokens(bt_id=next_bt_id)
+        # 3. 如果 AR 还没完，强制跑完
+        finish_remaining_ar_steps(final_ar_step, out_buf_id)
 
-        all_reduce_shared_expert(bt_sem_id, out_buf_id)
+        # 4. 累加 Routed 结果 + 落盘
+        # 此时 b_output 里已经是完整的 SE 结果了，直接把 Routed 加上去即可
         acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
-
         start_send_bo(bt_id=bt_id)
 
+        # 5. 收尾同步
         wait_a2a_gather_send(
             bt_sem_id=bt_sem_id,
             e_sem_id=final_e_sem_id,
@@ -2254,8 +2385,10 @@ def _fused_ep_moe_kernel(
         sync_barrier()
         return final_e_sem_id
 
+    # 主循环
     lax.fori_loop(0, num_bt, run_bt, jnp.int32(0), unroll=False)
-    # Drain outstanding output stores (matches epic wait_send_bo for last two bts).
+
+    # 最后的落盘等待
     wait_store_output(bt_id=jnp.int32(num_bt - 2))
     wait_store_output(bt_id=jnp.int32(num_bt - 1))
     # wait_copy_expert_size()
