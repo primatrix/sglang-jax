@@ -461,12 +461,12 @@ class FlashAttention(AttentionBackend):
             return self._forward_gpu(q, k, v, layer, forward_batch, token_to_kv_pool)
 
     def _forward_tpu(
-        self,
-        q: jax.Array,
-        k: jax.Array,
-        v: jax.Array,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
+            self,
+            q: jax.Array,
+            k: jax.Array,
+            v: jax.Array,
+            layer: RadixAttention,
+            forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         causal: int = 1,
     ):
