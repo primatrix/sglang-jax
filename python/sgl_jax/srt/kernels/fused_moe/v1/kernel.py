@@ -2215,7 +2215,11 @@ def _fused_ep_moe_kernel(
         start_fetch_b_gating(bt_id=jnp.int32(0))
         start_fetch_se_tokens(bt_id=jnp.int32(0))
 
-    ar_steps_per_expert = 1
+    se_compute_slots = jnp.maximum(se_total_blocks, 1)
+    available_slots = jnp.maximum(local_num_experts - se_compute_slots, 1)
+
+    ar_steps_needed = se_ar_steps
+    ar_steps_per_expert = cdiv(ar_steps_needed, available_slots)
 
     def run_bt(bt_id, e_sem_id):
         bt_start = bt_id * bt
@@ -2325,9 +2329,6 @@ def _fused_ep_moe_kernel(
 
             curr_se_block += lax.select(do_compute_post, 1, 0)
 
-            # --- [CRITICAL BARRIER LOGIC] ---
-            # 检查分水岭：SE 计算是否刚刚全部完成？
-            # 如果是，所有 Device 需要在此同步，确保数据就绪，然后开启 AR 阶段。
             just_finished = (curr_se_block == se_total_blocks) & (jnp.logical_not(barrier_passed))
 
             @pl.when(just_finished)
