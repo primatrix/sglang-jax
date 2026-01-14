@@ -124,65 +124,35 @@ class DiffusionModelRunner(BaseModelRunner):
         if prompt_embeds.ndim == 2:
             prompt_embeds = jnp.expand_dims(prompt_embeds, axis=0)
 
+        # Pad to 512 tokens (do this first for both positive and negative)
+        def pad_to_512(embeds):
+            if embeds.shape[1] < 512:
+                pad_width = 512 - embeds.shape[1]
+                return jnp.pad(
+                    embeds, ((0, 0), (0, pad_width), (0, 0)), mode="constant", constant_values=0
+                )
+            return embeds
+
+        # text_embeds shape: (B, 512, D)
+        prompt_embeds = pad_to_512(prompt_embeds)
         if do_classifier_free_guidance:
             if batch.negative_prompt_embeds is not None:
                 neg_embeds = batch.negative_prompt_embeds
                 # Add batch dimension to negative embeds if needed
                 if neg_embeds.ndim == 2:
                     neg_embeds = jnp.expand_dims(neg_embeds, axis=0)
+
+                # Pad negative embeds to 512 as well
+                neg_embeds = pad_to_512(neg_embeds)
+
+                # Now both are (1, 512, D), concatenate to (2, 512, D)
                 prompt_embeds = jnp.concatenate([prompt_embeds, neg_embeds], axis=0)
             else:
                 pass
+
         text_embeds = device_array(
             prompt_embeds, sharding=NamedSharding(self.mesh, PartitionSpec())
         )
-        # text_embeds shape: (B, L, D), no transpose needed
-        # Record actual sequence length before padding
-        actual_seq_len = text_embeds.shape[1]
-
-        # Pad seq_len dimension if needed
-        if text_embeds.shape[1] < 512:
-            pad_width = 512 - text_embeds.shape[1]
-            text_embeds = jnp.pad(
-                text_embeds, ((0, 0), (0, pad_width), (0, 0)), mode="constant", constant_values=0
-            )
-        # Dump encoder data for debugging
-        logging.info(
-            "Actual sequence length: %d, text embedding shape: %s",
-            actual_seq_len,
-            text_embeds.shape,
-        )
-        try:
-            from sgl_jax.srt.utils.dump_utils import get_encoder_dumper
-
-            dumper = get_encoder_dumper()
-            request_id = batch.rid if batch.rid else "unknown"
-
-            if dumper.should_dump(request_id):
-                import numpy as np
-
-                # Prepare before data (encoder input)
-                before_data = {
-                    "request_id": request_id,
-                    "prompt": batch.prompt,
-                    "input_ids": batch.input_ids,
-                    "actual_seq_len": int(actual_seq_len),  # Record unpadded length
-                }
-
-                # Prepare after data (encoder output)
-                # Convert JAX array to numpy for serialization
-                hidden_states_np = np.array(text_embeds)
-                after_data = {"hidden_states": hidden_states_np}
-
-                dumper.dump_encoder_data(before_data, after_data, request_id)
-                logging.info(
-                    "[DiffusionDump] Encoder data dumped for request_id=%s, prompt=%s, actual_seq_len=%d",
-                    request_id,
-                    batch.prompt,
-                    actual_seq_len,
-                )
-        except Exception as e:
-            logging.warning("[DiffusionDump] Failed to dump encoder data: %s", str(e))
 
         self.prepare_latents(batch)
         latents = device_array(batch.latents, sharding=NamedSharding(self.mesh, PartitionSpec()))
