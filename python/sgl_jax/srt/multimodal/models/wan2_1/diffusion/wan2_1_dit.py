@@ -535,7 +535,6 @@ class WanTransformer3DModel(nnx.Module):
         req=None,
         **kwargs,
     ):
-        print("[1] input:", hidden_states.shape)
         # origin_dtype = hidden_states.dtype
         if isinstance(encoder_hidden_states, list):
             # assert len(encoder_hidden_states) > 1, "encoder_hidden_states list is empty"
@@ -557,7 +556,6 @@ class WanTransformer3DModel(nnx.Module):
         post_patch_height = height // p_h
         post_patch_width = width // p_w
 
-        print("[2] rotary_emb")
         freqs_cos, freqs_sin = self.rotary_emb.forward_from_grid(
             (
                 post_patch_num_frames,
@@ -569,7 +567,6 @@ class WanTransformer3DModel(nnx.Module):
         )
         assert freqs_cos.dtype == jnp.float32
 
-        print("[3] patch_embedding")
         # Convert from channel-first (B, C, F, H, W) to channel-last (B, F, H, W, C) for nnx.Conv
         hidden_states = jnp.transpose(hidden_states, (0, 2, 3, 4, 1))
         hidden_states = self.patch_embedding(hidden_states)
@@ -586,7 +583,6 @@ class WanTransformer3DModel(nnx.Module):
         else:
             ts_seq_len = None
 
-        print("[4] condition_embedder")
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
             self.condition_embedder(
                 timesteps,
@@ -609,16 +605,13 @@ class WanTransformer3DModel(nnx.Module):
             )
 
         # 4. Transformer blocks
-        print("[5] blocks")
         freqs_cis = (freqs_cos, freqs_sin)
         for i, block in enumerate(self.blocks):
-            print(f"  [5.{i}] block {i}")
             hidden_states = block(
                 hidden_states, encoder_hidden_states, timestep_proj, freqs_cis, req
             )
 
         # 5. Output norm, projection & unpatchify
-        print("[6] norm_out")
         if temb.ndim == 3:
             # batch_size, seq_len, inner_dim (wan 2.2 ti2v)
             combined = self.scale_shift_table[None, :, :, :] + temb[:, :, None, :]
@@ -632,12 +625,10 @@ class WanTransformer3DModel(nnx.Module):
             shift, scale = jnp.split(combined, 2, axis=1)
 
         hidden_states = self.norm_out(hidden_states, shift, scale)
-        print("[7] proj_out")
         hidden_states = self.proj_out(hidden_states)
 
         # Unpatchify: reshape from patches back to image space
         # hidden_states shape: [batch_size, num_patches, out_channels * patch_volume]
-        print("[8] unpatchify")
         p_t, p_h, p_w = self.patch_size
         hidden_states = hidden_states.reshape(
             batch_size,
@@ -661,7 +652,6 @@ class WanTransformer3DModel(nnx.Module):
             post_patch_width * p_w,
         )
 
-        print("[9] done, output:", output.shape)
         return output
 
     def load_weights(self, model_path: str) -> None:
