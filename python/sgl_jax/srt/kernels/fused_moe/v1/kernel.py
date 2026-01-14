@@ -2228,6 +2228,14 @@ def _fused_ep_moe_kernel(
             def _():
                 expert_ffn(bt_sem_id, curr_e_sem_id, local_e_id)
 
+            @pl.when(jnp.logical_not(is_active_expert))
+            def _():
+                wait_a2a_gather_send(
+                    bt_sem_id=bt_sem_id,
+                    e_sem_id=curr_e_sem_id,
+                    local_e_id=local_e_id - 2,
+                )
+
             start_a2a_gather(bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id)
 
             run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
