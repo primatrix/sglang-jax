@@ -52,6 +52,7 @@ def _dtype_packing(dtype: jnp.dtype) -> int:
 def _estimate_vmem_bytes(
     case: MoEBenchmarkCase,
     dtype: jnp.dtype,
+    router_dtype: jnp.dtype,
     cfg: FusedMoEBlockConfig,
     use_shared_expert: bool = False,
     verbose: bool = False,
@@ -73,6 +74,7 @@ def _estimate_vmem_bytes(
 
     token_bytes = jnp.dtype(dtype).itemsize
     weight_bytes = token_bytes
+    router_bytes = jnp.dtype(router_dtype).itemsize
 
     t_packing = _dtype_packing(dtype)
     padded_num_experts = ((case.num_experts + 127) // 128) * 128
@@ -89,7 +91,7 @@ def _estimate_vmem_bytes(
     # b_output_x2_vmem is double-buffered to overlap store(output_hbm) with next bt's compute.
     b_output = 2 * bt * hidden * token_bytes
     # b_gating_x2_vmem is double-buffered for run_bt overlap: (2, bt, padded_num_experts)
-    b_gating = 2 * bt * padded_num_experts * token_bytes
+    b_gating = 2 * bt * padded_num_experts * router_bytes
     # t2e_routing_smem scratch is placed in SMEM (not VMEM).
     t2e_routing = 0
     # top_k_logits_vmem scratch: (bt, top_k) float32
@@ -152,7 +154,9 @@ def _estimate_vmem_bytes(
         se_w1 = 2 * bd1 * cfg.bse * weight_bytes  # (2, t_packing, bd/pack, bse)
         se_w3 = 2 * bd1 * cfg.bse * weight_bytes
         se_w2 = 2 * cfg.bse * bd2 * weight_bytes
-        se_tokens = 2 * bt * hidden * token_bytes  # (2, bt, hidden)
+        # Matches fused_moe kernel scratch shape (bt ping-pong x bd1-slice ping-pong):
+        # (2, 2, bt, t_packing, bd1_per_pack) => 4 * bt * bd1 elements.
+        se_tokens = 4 * bt * bd1 * token_bytes
         total_bytes += se_w1 + se_w3 + se_w2 + se_tokens
 
     if verbose:
@@ -176,7 +180,7 @@ def _estimate_vmem_bytes(
             f"      a2a_g_acc_vmem:         {_mb(a2a_g_acc)} MB  (1, {top_k}, {acc_bt}, {t_packing}, {hidden // t_packing})"
         )
         print(
-            f"      t_stage_x2_vmem:        {_mb(t_stage_b32)} MB  (2, {bts}, {t_packing}, {bd1 // t_packing})"
+            f"      b_stage_x2_vmem:        {_mb(t_stage_b32)} MB  (2, {bts}, {t_packing}, {bd1 // t_packing})"
         )
         print(
             f"      a2a_s_acc_stage_x3:     {_mb(a2a_s_acc_stage_b32)} MB  (3, {bts}, {t_packing}, {bd2 // t_packing})"
@@ -193,7 +197,9 @@ def _estimate_vmem_bytes(
             print(
                 f"      b_se_w2_x2_vmem:        {_mb(se_w2)} MB  (2, {t_packing}, {bf}, {bd2 // t_packing})"
             )
-            print(f"      b_se_tokens_vmem:       {_mb(se_tokens)} MB  (2, {bt}, {hidden})")
+            print(
+                f"      b_se_tokens_vmem:       {_mb(se_tokens)} MB  (2, 2, {bt}, {t_packing}, {bd1 // t_packing})"
+            )
         print("      ----------------------------")
         print(f"      Total:                  {_mb(total_bytes)} MB")
 
@@ -203,6 +209,7 @@ def _estimate_vmem_bytes(
 def select_block_configs(
     case: MoEBenchmarkCase,
     dtype: jnp.dtype,
+    router_dtype: jnp.dtype,
     *,
     bt_candidates: list[int],
     bts_candidates: list[int] | None = None,
@@ -217,6 +224,8 @@ def select_block_configs(
     t_packing = _dtype_packing(dtype)
     tile_align = t_packing * 128
     local_num_tokens = case.num_tokens // case.ep_size
+    router_bits = jnp.dtype(router_dtype).itemsize * 8
+    router_tile0 = math.gcd(256 // router_bits, local_num_tokens)
 
     def _pick_candidates(
         *,
@@ -273,6 +282,11 @@ def select_block_configs(
             return False, f"bt({bt}) > local_num_tokens({local_num_tokens})"
         if bt % t_packing != 0:
             return False, f"bt({bt}) % t_packing({t_packing}) != 0"
+        if bt % router_tile0 != 0:
+            return (
+                False,
+                f"bt({bt}) not aligned to router_tile0({router_tile0}) for router_dtype={jnp.dtype(router_dtype).name}",
+            )
         if bts % t_packing != 0:
             return False, f"bts({bts}) % t_packing({t_packing}) != 0"
         if not (0 < bts <= bt):
@@ -308,7 +322,9 @@ def select_block_configs(
             return False, f"bd1({bd1}) % bd1c({bd1c}) != 0 or bd2({bd2}) % bd2c({bd2c}) != 0"
 
         # Pass use_shared_expert to estimate correct VMEM
-        est = _estimate_vmem_bytes(case, dtype, cfg, use_shared_expert=use_shared_expert)
+        est = _estimate_vmem_bytes(
+            case, dtype, router_dtype, cfg, use_shared_expert=use_shared_expert
+        )
         if est > tpu_vmem_budget_bytes:
             return (
                 False,
@@ -567,6 +583,7 @@ def run_all(
             block_cfgs = select_block_configs(
                 case,
                 dtype,
+                router_dtype=data["router_logits"].dtype,
                 bt_candidates=bt_candidates or [2, 4, 8, 16, 32, 64, 128, 256, 512],
                 bts_candidates=bts_candidates,
                 bf_candidates=bf_candidates or [128, 256, 512, 1024, 2048],
@@ -633,6 +650,7 @@ def run_all(
                     vmem_bytes = _estimate_vmem_bytes(
                         case,
                         dtype,
+                        data["router_logits"].dtype,
                         block_cfg,
                         use_shared_expert=use_shared_expert,
                         verbose=True,
