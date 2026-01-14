@@ -8,7 +8,9 @@ from pydantic import BaseModel
 
 class ImageGenerationsRequest(BaseModel):
     prompt: str
-    neg_prompt: str = "blurry, low quality"
+    neg_prompt: str = (
+        "blurry, low quality, inconsistent lighting, floating, disconnected from scene"
+    )
     model: str | None = None
     n: int | None = 1
     response_format: str | None = "url"  # url | b64_json
@@ -26,7 +28,9 @@ class ImageResponse(BaseModel):
 
 class VideoGenerationsRequest(BaseModel):
     prompt: str
-    neg_prompt: str = "blurry, low quality"
+    neg_prompt: str = (
+        "blurry, low quality, inconsistent lighting, floating, disconnected from scene"
+    )
     input_reference: str | None = None
     model: str | None = None
     seconds: int | None = 4
@@ -61,7 +65,9 @@ class GenerateMMReqInput:
     rid: str | None = None
     data_type: DataType | None = None
     prompt: str | None = None
-    neg_prompt: str | None = "blurry, low quality"
+    neg_prompt: str | None = (
+        "blurry, low quality, inconsistent lighting, floating, disconnected from scene"
+    )
     input_ids: list[int] | None = None
     n: int | None = 1
     input_reference: str | None = None

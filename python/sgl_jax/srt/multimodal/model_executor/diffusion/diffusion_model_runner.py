@@ -7,6 +7,7 @@ import jax.numpy as jnp
 from flax import nnx
 from jax import NamedSharding
 from jax.sharding import PartitionSpec
+from tqdm import tqdm
 
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
@@ -15,6 +16,9 @@ from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.models.diffusion_solvers.flow_unipc_multistep_scheduler import (
     FlowUniPCMultistepScheduler,
+)
+from sgl_jax.srt.multimodal.models.static_configs.model_config_registry import (
+    get_model_config,
 )
 from sgl_jax.srt.utils.jax_utils import device_array
 
@@ -43,7 +47,7 @@ class DiffusionModelRunner(BaseModelRunner):
         self._cached_num_steps = None
         self.model_class = model_class
         # TODO: load model_config from server_args based on model architecture
-        self.model_config = self.model_class.get_config_class()()
+        self.model_config = get_model_config(self.server_args.model_path)
         self.model_config.model_path = self.server_args.model_path
         self.model_config.model_class = self.model_class
         # Additional initialization for diffusion model if needed
@@ -163,10 +167,9 @@ class DiffusionModelRunner(BaseModelRunner):
             shape=latents.transpose(0, 4, 1, 2, 3).shape,
         )
         self.solver.set_begin_index(0)
+        start_time = time.time()
 
-        for step in range(num_inference_steps):
-            start_time = time.time()
-            logging.info("Starting diffusion step %d", step)
+        for step in tqdm(range(num_inference_steps), desc="Diffusion steps"):
             t_scalar = jnp.array(self.solver.timesteps, dtype=jnp.int32)[step]
             if do_classifier_free_guidance:
                 latents = jnp.concatenate([latents] * 2, axis=0)
@@ -198,9 +201,8 @@ class DiffusionModelRunner(BaseModelRunner):
             )[0]
 
             latents = latents.transpose(0, 2, 3, 4, 1)  # back to channel-last
-            logging.info(
-                "Finished diffusion step %d in %.2f seconds", step, time.time() - start_time
-            )
+
+        logging.info("Finished diffusion step %d in %.2f seconds", step, time.time() - start_time)
         batch.latents = jax.device_get(latents)
         return batch
 
@@ -209,12 +211,17 @@ class DiffusionModelRunner(BaseModelRunner):
             return
         assert batch.width % self.model_config.scale_factor_spatial == 0
         assert batch.height % self.model_config.scale_factor_spatial == 0
-        assert (batch.num_frames - 1) % self.model_config.scale_factor_temporal == 0
+        if batch.num_frames is not None:
+            assert (batch.num_frames - 1) % self.model_config.scale_factor_temporal == 0
         latents = jax.random.normal(
             jax.random.PRNGKey(46),
             (
                 1,
-                (batch.num_frames - 1) // self.model_config.scale_factor_temporal + 1,
+                (
+                    (batch.num_frames - 1) // self.model_config.scale_factor_temporal + 1
+                    if batch.num_frames is not None
+                    else 1
+                ),
                 batch.width // self.model_config.scale_factor_spatial,
                 batch.height // self.model_config.scale_factor_spatial,
                 self.model_config.latent_input_dim,
