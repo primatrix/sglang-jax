@@ -118,23 +118,42 @@ class DiffusionModelRunner(BaseModelRunner):
         do_classifier_free_guidance = guidance_scale > 1.0
 
         # Handle prompt embeddings
+
         prompt_embeds = batch.prompt_embeds
+        # Add batch dimension if needed: (L, D) -> (1, L, D)
+        if prompt_embeds.ndim == 2:
+            prompt_embeds = jnp.expand_dims(prompt_embeds, axis=0)
+
+        # Pad to 512 tokens (do this first for both positive and negative)
+        def pad_to_512(embeds):
+            if embeds.shape[1] < 512:
+                pad_width = 512 - embeds.shape[1]
+                return jnp.pad(
+                    embeds, ((0, 0), (0, pad_width), (0, 0)), mode="constant", constant_values=0
+                )
+            return embeds
+
+        # text_embeds shape: (B, 512, D)
+        prompt_embeds = pad_to_512(prompt_embeds)
         if do_classifier_free_guidance:
             if batch.negative_prompt_embeds is not None:
                 neg_embeds = batch.negative_prompt_embeds
+                # Add batch dimension to negative embeds if needed
+                if neg_embeds.ndim == 2:
+                    neg_embeds = jnp.expand_dims(neg_embeds, axis=0)
+
+                # Pad negative embeds to 512 as well
+                neg_embeds = pad_to_512(neg_embeds)
+
+                # Now both are (1, 512, D), concatenate to (2, 512, D)
                 prompt_embeds = jnp.concatenate([prompt_embeds, neg_embeds], axis=0)
             else:
                 pass
+
         text_embeds = device_array(
             prompt_embeds, sharding=NamedSharding(self.mesh, PartitionSpec())
         )
-        # text_embeds shape: (B, L, D), no transpose needed
-        # Pad seq_len dimension if needed
-        if text_embeds.shape[1] < 512:
-            pad_width = 512 - text_embeds.shape[1]
-            text_embeds = jnp.pad(
-                text_embeds, ((0, 0), (0, pad_width), (0, 0)), mode="constant", constant_values=0
-            )
+
         self.prepare_latents(batch)
         latents = device_array(batch.latents, sharding=NamedSharding(self.mesh, PartitionSpec()))
         self.solver.set_timesteps(
