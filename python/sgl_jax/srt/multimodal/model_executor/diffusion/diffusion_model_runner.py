@@ -2,13 +2,12 @@ import logging
 import time
 from functools import partial
 
-from tqdm import tqdm
-
 import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax import NamedSharding
 from jax.sharding import PartitionSpec
+from tqdm import tqdm
 
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
@@ -202,10 +201,8 @@ class DiffusionModelRunner(BaseModelRunner):
             )[0]
 
             latents = latents.transpose(0, 2, 3, 4, 1)  # back to channel-last
-            
-        logging.info(
-            "Finished diffusion step %d in %.2f seconds", step, time.time() - start_time
-        )
+
+        logging.info("Finished diffusion step %d in %.2f seconds", step, time.time() - start_time)
         batch.latents = jax.device_get(latents)
         return batch
 
@@ -220,7 +217,11 @@ class DiffusionModelRunner(BaseModelRunner):
             jax.random.PRNGKey(46),
             (
                 1,
-                (batch.num_frames - 1) // self.model_config.scale_factor_temporal + 1 if batch.num_frames is not None else 1,
+                (
+                    (batch.num_frames - 1) // self.model_config.scale_factor_temporal + 1
+                    if batch.num_frames is not None
+                    else 1
+                ),
                 batch.width // self.model_config.scale_factor_spatial,
                 batch.height // self.model_config.scale_factor_spatial,
                 self.model_config.latent_input_dim,

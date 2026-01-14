@@ -73,7 +73,9 @@ class TestCausalConv3d(unittest.TestCase):
         x2 = jax.random.normal(jax.random.PRNGKey(43), (1, 3, 4, 4, in_channels))
 
         # Concat different future frames
-        x_a = jnp.concatenate([x1[:, :2], x2[:, 2:3]], axis=1)  # frames 0,1 from x1, frame 2 from x2
+        x_a = jnp.concatenate(
+            [x1[:, :2], x2[:, 2:3]], axis=1
+        )  # frames 0,1 from x1, frame 2 from x2
         x_b = jnp.concatenate([x1[:, :2], x1[:, 2:3]], axis=1)  # all frames from x1
 
         out_a, _ = conv(x_a)
@@ -254,7 +256,9 @@ class TestVAEEncodeDecode(unittest.TestCase):
         # But the .sample() or .mode() would return (B, T, H, W, z_dim)
         print(f"Input shape: {x.shape}")
         print(f"Encoded shape: {out.parameters.shape}")
-        print(f"Expected latent shape: ({1}, {expected_t}, {expected_h}, {expected_w}, {config.z_dim})")
+        print(
+            f"Expected latent shape: ({1}, {expected_t}, {expected_h}, {expected_w}, {config.z_dim})"
+        )
 
         self.assertEqual(out.parameters.shape[0], 1)  # Batch
         self.assertEqual(out.parameters.shape[2], expected_h)  # H
@@ -474,18 +478,16 @@ class TestVAEScheduler(unittest.TestCase):
         latents = jax.random.normal(jax.random.PRNGKey(42), (1, 2, 8, 8, config.z_dim))
 
         # Apply scaling and shift (as done in VaeScheduler.preprocess)
-        if hasattr(config, "scaling_factor"):
-            scaled = latents / config.scaling_factor
-        else:
-            scaled = latents
+        scaled = latents / config.scaling_factor if hasattr(config, "scaling_factor") else latents
 
-        if hasattr(config, "shift_factor"):
-            shifted = scaled + config.shift_factor
-        else:
-            shifted = scaled
+        shifted = scaled + config.shift_factor if hasattr(config, "shift_factor") else scaled
 
-        print(f"Original latents stats: mean={float(jnp.mean(latents)):.4f}, std={float(jnp.std(latents)):.4f}")
-        print(f"After preprocessing: mean={float(jnp.mean(shifted)):.4f}, std={float(jnp.std(shifted)):.4f}")
+        print(
+            f"Original latents stats: mean={float(jnp.mean(latents)):.4f}, std={float(jnp.std(latents)):.4f}"
+        )
+        print(
+            f"After preprocessing: mean={float(jnp.mean(shifted)):.4f}, std={float(jnp.std(shifted)):.4f}"
+        )
 
         # Verify shapes are preserved
         self.assertEqual(shifted.shape, latents.shape)
