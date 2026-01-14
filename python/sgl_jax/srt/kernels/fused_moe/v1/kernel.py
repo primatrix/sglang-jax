@@ -1699,8 +1699,8 @@ def _fused_ep_moe_kernel(
                     next_bw_sem_id = 1 - bw_sem_id
                     next_bd1_id = bd1_id + jnp.int32(1)
 
-                    @pl.when(num_token_tiles > 0)
-                    def _(bd1_id=bd1_id):
+                    @pl.when((num_token_tiles > 0) & (bd1_id == 0))
+                    def _prefetch_tokens_for_bd0_bts0():
                         start_stage_a2a_s_tile_from_hbm(jnp.int32(0), bd1_id, jnp.int32(0))
 
                     @pl.when(next_bd1_id < num_bd1)
@@ -1751,12 +1751,16 @@ def _fused_ep_moe_kernel(
                         next_start = next_tile_id * token_tile
 
                         @pl.when(next_tile_id < num_token_tiles)
-                        def _prefetch(
+                        def _prefetch_tokens_for_next_bts(
                             next_start=next_start, next_buf_id=next_buf_id, bd1_id=bd1_id
                         ):
                             start_stage_a2a_s_tile_from_hbm(next_start, bd1_id, next_buf_id)
 
                         wait_stage_a2a_s_tile(token_buf_id)
+
+                        @pl.when((next_tile_id == num_token_tiles) & (bd1_id + 1 < num_bd1))
+                        def _prefetch_bts0_tokens_for_next_bd():
+                            start_stage_a2a_s_tile_from_hbm(jnp.int32(0), bd1_id + 1, jnp.int32(0))
 
                         if disable_dynamic_ffn1:
                             return next_buf_id
