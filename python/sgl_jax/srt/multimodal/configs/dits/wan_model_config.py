@@ -18,6 +18,7 @@ class WanModelConfig(MultiModalModelConfigs):
     ffn_dim: int = 8960
     freq_dim: int = 256
     text_dim: int = 4096
+    flow_shift: float | None = 3.0
     image_dim: int | None = None  # None for T2V, set for I2V
     patch_size: tuple[int, int, int] = (1, 2, 2)
     cross_attn_norm: bool = True

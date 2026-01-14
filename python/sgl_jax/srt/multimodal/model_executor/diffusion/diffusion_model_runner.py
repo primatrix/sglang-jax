@@ -56,7 +56,7 @@ class DiffusionModelRunner(BaseModelRunner):
             mesh=self.mesh, load_config=LoadConfig(sub_dir="transformer")
         )
         self.model = self.model_loader.load_model(model_config=self.model_config)
-        self.solver: FlowUniPCMultistepScheduler = FlowUniPCMultistepScheduler(shift=3.0)
+        self.solver: FlowUniPCMultistepScheduler = FlowUniPCMultistepScheduler(shift=self.model_config.flow_shift)
         # self.solver_state = self.solver.create_state()
         # Any additional initialization specific to diffusion models
         self.initialize_jit()
