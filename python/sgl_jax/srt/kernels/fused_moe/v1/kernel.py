@@ -502,6 +502,8 @@ def _fused_ep_moe_kernel(
     a2a_s_acc_stage_x3_vmem,  # <acc_buf_id> (3, bts, t_packing, bd2 // t_packing)
     b_bias_vmem,  # None | F32(padded_num_experts,)
     b_se_tokens_vmem,  # None | (2, 2, bt, t_packing, bd1 // t_packing) [Input Buffer: bt ping-pong x bd1-slice ping-pong]
+    b_se_gate_acc_vmem,
+    b_se_up_acc_vmem,
     b_se_w1_x2_vmem,  # <sew_sem_id> (2, t_packing, bd1 // t_packing, bf)
     b_se_w3_x2_vmem,  # <sew_sem_id> (2, t_packing, bd1 // t_packing, bf)
     b_se_w2_x2_vmem,  # <sew_sem_id> (2, t_packing, bf, bd2 // t_packing)
@@ -2023,19 +2025,20 @@ def _fused_ep_moe_kernel(
         @pl.when(block_id < se_total_blocks)
         def _():
             bt_start = bt_id * bt
-            # 计算总共需要多少个 bts 块
             num_chunks = cdiv(bt, bts)
+
+            # --- [新增] 初始化 VMEM Accumulator 为 0 ---
+            # 直接对整个 VMEM 区域写 0
+            b_se_gate_acc_vmem.at[...].set(0.0)
+            b_se_up_acc_vmem.at[...].set(0.0)
+            # ----------------------------------------
 
             if num_bd1 > 0:
                 start_fetch_se_w1(0, block_id, 0)
                 start_fetch_se_w3(0, block_id, 0)
 
-            # 初始化 Accumulator (Register/VMEM scratch)
-            # 注意：这里的 init_val 是一个普通的 JAX Array，存在寄存器里
-            init_val = jnp.zeros((bt, bse), dtype=jnp.float32)
-
-            def body_w1w3(bd1_idx, carry):
-                act_gate_acc, act_up_acc = carry
+            # 注意：body_w1w3 不需要 carry 了，因为累加状态在 VMEM 中
+            def body_w1w3(bd1_idx, _):
                 curr_w_sem = bd1_idx % 2
                 next_w_sem = (bd1_idx + 1) % 2
                 next_bd1_idx = bd1_idx + 1
@@ -2057,8 +2060,7 @@ def _fused_ep_moe_kernel(
                     bts_idx=jnp.int32(0),
                 )
 
-                def run_token_chunk(chunk_idx, chunk_carry):
-                    c_gate_acc, c_up_acc = chunk_carry
+                def run_token_chunk(chunk_idx, _):
                     curr_buf_id = chunk_idx % 2
                     next_buf_id = (chunk_idx + 1) % 2
                     next_chunk_idx = chunk_idx + 1
@@ -2082,7 +2084,6 @@ def _fused_ep_moe_kernel(
                     chunk_up_acc_part = jnp.zeros((bts, bse), dtype=jnp.float32)
 
                     for p_id in range(t_packing):
-                        # Pallas Ref 读取使用 pl.ds (这是正确的)
                         t = b_se_tokens_vmem[
                             bt_sem_id,
                             curr_buf_id,
@@ -2114,40 +2115,31 @@ def _fused_ep_moe_kernel(
                         else:
                             chunk_up_acc_part += jnp.dot(t_f32, w3_up.astype(jnp.float32))
 
-                    # 4. Update Accumulator (Fixing the error here)
-                    # c_gate_acc 是普通的 JAX Array，使用 lax.dynamic_slice / dynamic_update_slice
-                    slice_start_idx = chunk_idx * bts
+                    # 4. Accumulate in VMEM (Fixing the dynamic_slice error)
+                    # 使用 pl.ds 直接操作 VMEM Ref
+                    slice_idx = pl.ds(chunk_idx * bts, bts)
 
-                    # [Fix]: 读取旧值
-                    # slice shape: (bts, bse), start_indices: (slice_start_idx, 0)
-                    current_gate_slice = lax.dynamic_slice(
-                        c_gate_acc, (slice_start_idx, 0), (bts, bse)
-                    )
+                    # Read old value
+                    curr_gate = b_se_gate_acc_vmem.at[slice_idx, pl.ds(0, bse)].get()
+                    curr_up = b_se_up_acc_vmem.at[slice_idx, pl.ds(0, bse)].get()
 
-                    # 累加
-                    new_gate_slice = current_gate_slice + chunk_gate_acc_part
+                    # Add
+                    curr_gate += chunk_gate_acc_part
+                    curr_up += chunk_up_acc_part
 
-                    # [Fix]: 写回新值
-                    c_gate_acc = lax.dynamic_update_slice(
-                        c_gate_acc, new_gate_slice, (slice_start_idx, 0)
-                    )
+                    # Write back
+                    b_se_gate_acc_vmem.at[slice_idx, pl.ds(0, bse)].set(curr_gate)
+                    b_se_up_acc_vmem.at[slice_idx, pl.ds(0, bse)].set(curr_up)
 
-                    # 对 Up 投影做同样的操作
-                    current_up_slice = lax.dynamic_slice(c_up_acc, (slice_start_idx, 0), (bts, bse))
-                    new_up_slice = current_up_slice + chunk_up_acc_part
-                    c_up_acc = lax.dynamic_update_slice(
-                        c_up_acc, new_up_slice, (slice_start_idx, 0)
-                    )
+                lax.fori_loop(0, num_chunks, run_token_chunk, None)
 
-                    return c_gate_acc, c_up_acc
+            # 执行外层 bd1 循环，不再传递 carry
+            lax.fori_loop(0, num_bd1, body_w1w3, None)
 
-                act_gate_acc, act_up_acc = lax.fori_loop(
-                    0, num_chunks, run_token_chunk, (act_gate_acc, act_up_acc)
-                )
-
-                return (act_gate_acc, act_up_acc)
-
-            act_gate, act_up = lax.fori_loop(0, num_bd1, body_w1w3, (init_val, init_val))
+            # --- Activation ---
+            # 从 VMEM 读取完整的累加结果
+            act_gate = b_se_gate_acc_vmem[...]
+            act_up = b_se_up_acc_vmem[...]
             act = activation_fn(act_gate, act_up, act_fn)
 
             # --- W2 Down Projection ---
@@ -2165,7 +2157,6 @@ def _fused_ep_moe_kernel(
 
                 wait_fetch_se_w2(curr_w_sem)
 
-                # W2 不需要分块 Token，因为 act 已经在寄存器里了，直接算
                 for p_id in range(t_packing):
                     w2_val = b_se_w2_x2_vmem[curr_w_sem, p_id]
 
@@ -2178,7 +2169,6 @@ def _fused_ep_moe_kernel(
 
                     hidden_offset = p_id * h_per_t_packing + bd2_idx * bd2_per_t_packing
 
-                    # Output Buffer 是 Pallas Ref，可以使用 .at[...].set(...)
                     out_slice = b_output_x2_vmem.at[
                         out_buf_id, pl.ds(0, bt), pl.ds(hidden_offset, bd2_per_t_packing)
                     ]
@@ -2793,6 +2783,16 @@ def fused_ep_moe(
             if w1_shared is None
             else pltpu.VMEM((2, 2, block_config.bts, t_packing, bd1_per_pack), t_dtype)
         ),  # b_se_tokens_vmem
+        (
+            None
+            if w1_shared is None
+            else pltpu.VMEM((block_config.bt, block_config.bse), jnp.float32)
+        ),  # b_se_gate_acc_vmem
+        (
+            None
+            if w3_shared is None
+            else pltpu.VMEM((block_config.bt, block_config.bse), jnp.float32)
+        ),  # b_se_up_acc_vmem
         (
             None
             if w1_shared is None
