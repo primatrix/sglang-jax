@@ -1162,18 +1162,23 @@ def _fused_ep_moe_kernel(
                     sem=local_sems.at[bw3_sem_id, 3],
                 ).wait()
 
-    def start_fetch_se_tokens_slice(*, bt_start, bt_sem_id, bd1_idx, buf_id):
+    # 增加 bts_idx 参数
+    def start_fetch_se_tokens_slice(*, bt_start, bt_sem_id, bd1_idx, buf_id, bts_idx):
         if w1_shared_hbm is None or disable_shared_expert:
             return
         bd1_start = bd1_idx * bd1_per_t_packing
+
+        # 计算当前 chunk 在 HBM 中的实际 token 偏移
+        token_offset = bt_start + bts_idx * bts
+
+        # 注意：这里源从 HBM 的 token_offset 开始取 bts 长度
         src_ref = tokens_hbm.at[
-            pl.ds(bt_start, bt),
+            pl.ds(token_offset, bts),
             pl.ds(0, t_packing),
             pl.ds(bd1_start, bd1_per_t_packing),
         ]
 
-        # Use static semaphore indices; dynamic selection on the 2nd axis of
-        # `local_sems` can cause Mosaic scheduling issues / deadlocks.
+        # 目标 VMEM 只有 bts 大小，所以始终写入 0:bts
         @pl.when(buf_id == 0)
         def _():
             pltpu.make_async_copy(
@@ -1181,7 +1186,7 @@ def _fused_ep_moe_kernel(
                 dst_ref=b_se_tokens_vmem.at[
                     bt_sem_id,
                     0,
-                    pl.ds(0, bt),
+                    pl.ds(0, bts),  # 修改为 bts
                     pl.ds(0, t_packing),
                     pl.ds(0, bd1_per_t_packing),
                 ],
@@ -1195,7 +1200,7 @@ def _fused_ep_moe_kernel(
                 dst_ref=b_se_tokens_vmem.at[
                     bt_sem_id,
                     1,
-                    pl.ds(0, bt),
+                    pl.ds(0, bts),  # 修改为 bts
                     pl.ds(0, t_packing),
                     pl.ds(0, bd1_per_t_packing),
                 ],
@@ -1208,39 +1213,25 @@ def _fused_ep_moe_kernel(
 
         @pl.when(buf_id == 0)
         def _():
-            ref = b_se_tokens_vmem.at[bt_sem_id, 0]
+            # 获取 buffer 0 的引用
+            # 注意：这里的形状必须匹配 b_se_tokens_vmem 的定义
+            # 原来是 pl.ds(0, bt)，现在改为 pl.ds(0, bts)
+            ref = b_se_tokens_vmem.at[bt_sem_id, 0, pl.ds(0, bts)]
             pltpu.make_async_copy(
                 src_ref=ref,
                 dst_ref=ref,
-                sem=local_sems.at[bt_sem_id, 8],
+                sem=local_sems.at[bt_sem_id, 8],  # 复用索引 8
             ).wait()
 
         @pl.when(buf_id != 0)
         def _():
-            ref = b_se_tokens_vmem.at[bt_sem_id, 1]
+            # 获取 buffer 1 的引用
+            ref = b_se_tokens_vmem.at[bt_sem_id, 1, pl.ds(0, bts)]
             pltpu.make_async_copy(
                 src_ref=ref,
                 dst_ref=ref,
-                sem=local_sems.at[bt_sem_id, 9],
+                sem=local_sems.at[bt_sem_id, 9],  # 复用索引 9
             ).wait()
-
-    def start_fetch_se_tokens(bt_id):
-        if w1_shared_hbm is None or disable_shared_expert:
-            return
-        bt_sem_id = bt_id & 1
-        bt_start = bt_id * bt
-        start_fetch_se_tokens_slice(
-            bt_start=bt_start,
-            bt_sem_id=bt_sem_id,
-            bd1_idx=jnp.int32(0),
-            buf_id=jnp.int32(0),
-        )
-
-    def wait_fetch_se_tokens(bt_id):
-        if w1_shared_hbm is None or disable_shared_expert:
-            return
-        bt_sem_id = bt_id & 1
-        wait_fetch_se_tokens_slice(bt_sem_id=bt_sem_id, buf_id=jnp.int32(0))
 
     def start_fetch_se_w1(grp_sem_id, block_id, bd1_idx):
         if w1_shared_hbm is None:
@@ -2032,20 +2023,12 @@ def _fused_ep_moe_kernel(
         @pl.when(block_id < se_total_blocks)
         def _():
             bt_start = bt_id * bt
+            num_chunks = bt // bts
 
-            # `b_se_tokens_vmem` is a (2, 2, ...) ping-pong buffer that gets overwritten
-            # as we stream over `bd1_idx`. For correctness, restart the stream from
-            # `bd1_idx=0` for each shared-expert block beyond the first.
-            @pl.when(block_id != 0)
-            def _():
-                start_fetch_se_tokens_slice(
-                    bt_start=bt_start,
-                    bt_sem_id=bt_sem_id,
-                    bd1_idx=jnp.int32(0),
-                    buf_id=jnp.int32(0),
-                )
+            # 注意：不再在外部预取 tokens，因为 buffer 只有 bts 大小，装不下整个 bt
 
             if num_bd1 > 0:
+                # 预取第一个 bd1 块的权重
                 start_fetch_se_w1(0, block_id, 0)
                 start_fetch_se_w3(0, block_id, 0)
 
@@ -2053,82 +2036,141 @@ def _fused_ep_moe_kernel(
 
             def body_w1w3(bd1_idx, carry):
                 act_gate_acc, act_up_acc = carry
-                curr_sem = bd1_idx % 2
-                next_sem = (bd1_idx + 1) % 2
+                curr_w_sem = bd1_idx % 2
+                next_w_sem = (bd1_idx + 1) % 2
                 next_bd1_idx = bd1_idx + 1
-                token_buf_id = bd1_idx & jnp.int32(1)
-                next_token_buf_id = token_buf_id ^ jnp.int32(1)
 
+                # --- 权重流水线 (保持不变) ---
                 @pl.when(next_bd1_idx < num_bd1)
                 def _():
-                    start_fetch_se_w1(next_sem, block_id, next_bd1_idx)
-                    start_fetch_se_w3(next_sem, block_id, next_bd1_idx)
-                    start_fetch_se_tokens_slice(
-                        bt_start=bt_start,
-                        bt_sem_id=bt_sem_id,
-                        bd1_idx=next_bd1_idx,
-                        buf_id=next_token_buf_id,
-                    )
+                    start_fetch_se_w1(next_w_sem, block_id, next_bd1_idx)
+                    start_fetch_se_w3(next_w_sem, block_id, next_bd1_idx)
 
-                wait_fetch_se_w1(curr_sem)
-                wait_fetch_se_w3(curr_sem)
-                wait_fetch_se_tokens_slice(bt_sem_id=bt_sem_id, buf_id=token_buf_id)
+                wait_fetch_se_w1(curr_w_sem)
+                wait_fetch_se_w3(curr_w_sem)
 
-                for p_id in range(t_packing):
-                    t = b_se_tokens_vmem[
-                        bt_sem_id,
-                        token_buf_id,
-                        pl.ds(0, bt),
-                        p_id,
-                        pl.ds(0, bd1_per_t_packing),
-                    ]
-                    t_f32 = t.astype(jnp.float32)
+                # --- Token 内部循环 (新增) ---
+                # 在计算当前 bd1 块时，分块流式处理 tokens
 
-                    # W1
-                    w1_gate = b_se_w1_x2_vmem[curr_sem, p_id]
-                    if w1_shared_scale_hbm is not None:
-                        s_gate = b_se_w1_scale_x2_vmem[curr_sem, p_id]
-                        s_gate = broadcast_quant_scale(s_gate, bd1_per_t_packing, subc_quant_wsz)
-                        acc_gate_part = jnp.dot(t_f32, w1_gate.astype(jnp.float32) * s_gate)
-                    else:
-                        acc_gate_part = jnp.dot(t_f32, w1_gate.astype(jnp.float32))
+                # 预取第一个 chunk 的 tokens
+                start_fetch_se_tokens_slice(
+                    bt_start=bt_start,
+                    bt_sem_id=bt_sem_id,
+                    bd1_idx=bd1_idx,
+                    buf_id=jnp.int32(0),
+                    bts_idx=jnp.int32(0),
+                )
 
-                    # W3
-                    w3_up = b_se_w3_x2_vmem[curr_sem, p_id]
-                    if w3_shared_scale_hbm is not None:
-                        s_up = b_se_w3_scale_x2_vmem[curr_sem, p_id]
-                        s_up = broadcast_quant_scale(s_up, bd1_per_t_packing, subc_quant_wsz)
-                        acc_up_part = jnp.dot(t_f32, w3_up.astype(jnp.float32) * s_up)
-                    else:
-                        acc_up_part = jnp.dot(t_f32, w3_up.astype(jnp.float32))
+                def run_token_chunk(chunk_idx, chunk_carry):
+                    c_gate_acc, c_up_acc = chunk_carry
+                    curr_buf_id = chunk_idx % 2
+                    next_buf_id = (chunk_idx + 1) % 2
+                    next_chunk_idx = chunk_idx + 1
 
-                    act_gate_acc += acc_gate_part
-                    act_up_acc += acc_up_part
+                    # 1. 预取下一个 token chunk
+                    @pl.when(next_chunk_idx < num_chunks)
+                    def _():
+                        start_fetch_se_tokens_slice(
+                            bt_start=bt_start,
+                            bt_sem_id=bt_sem_id,
+                            bd1_idx=bd1_idx,
+                            buf_id=next_buf_id,
+                            bts_idx=next_chunk_idx,
+                        )
+
+                    # 2. 等待当前 token chunk
+                    wait_fetch_se_tokens_slice(bt_sem_id=bt_sem_id, buf_id=curr_buf_id)
+
+                    # 3. 计算 (逻辑同原版，但只针对当前的 bts 切片)
+                    chunk_gate_acc_part = jnp.zeros((bts, bse), dtype=jnp.float32)
+                    chunk_up_acc_part = jnp.zeros((bts, bse), dtype=jnp.float32)
+
+                    for p_id in range(t_packing):
+                        # 从 VMEM 读取 bts 大小的 tokens
+                        t = b_se_tokens_vmem[
+                            bt_sem_id,
+                            curr_buf_id,
+                            pl.ds(0, bts),  # 使用 bts
+                            p_id,
+                            pl.ds(0, bd1_per_t_packing),
+                        ]
+                        t_f32 = t.astype(jnp.float32)
+
+                        # W1
+                        w1_gate = b_se_w1_x2_vmem[curr_w_sem, p_id]
+                        if w1_shared_scale_hbm is not None:
+                            s_gate = b_se_w1_scale_x2_vmem[curr_w_sem, p_id]
+                            s_gate = broadcast_quant_scale(
+                                s_gate, bd1_per_t_packing, subc_quant_wsz
+                            )
+                            chunk_gate_acc_part += jnp.dot(
+                                t_f32, w1_gate.astype(jnp.float32) * s_gate
+                            )
+                        else:
+                            chunk_gate_acc_part += jnp.dot(t_f32, w1_gate.astype(jnp.float32))
+
+                        # W3
+                        w3_up = b_se_w3_x2_vmem[curr_w_sem, p_id]
+                        if w3_shared_scale_hbm is not None:
+                            s_up = b_se_w3_scale_x2_vmem[curr_w_sem, p_id]
+                            s_up = broadcast_quant_scale(s_up, bd1_per_t_packing, subc_quant_wsz)
+                            chunk_up_acc_part += jnp.dot(t_f32, w3_up.astype(jnp.float32) * s_up)
+                        else:
+                            chunk_up_acc_part += jnp.dot(t_f32, w3_up.astype(jnp.float32))
+
+                    # 4. 累加到整体的 Accumulator 中
+                    # c_gate_acc 形状是 (bt, bse)，我们只更新对应的 slice
+                    slice_start = chunk_idx * bts
+
+                    current_gate_slice = c_gate_acc.at[pl.ds(slice_start, bts)].get()
+                    new_gate_slice = current_gate_slice + chunk_gate_acc_part
+                    c_gate_acc = c_gate_acc.at[pl.ds(slice_start, bts)].set(new_gate_slice)
+
+                    current_up_slice = c_up_acc.at[pl.ds(slice_start, bts)].get()
+                    new_up_slice = current_up_slice + chunk_up_acc_part
+                    c_up_acc = c_up_acc.at[pl.ds(slice_start, bts)].set(new_up_slice)
+
+                    return c_gate_acc, c_up_acc
+
+                # 执行内部循环
+                act_gate_acc, act_up_acc = lax.fori_loop(
+                    0, num_chunks, run_token_chunk, (act_gate_acc, act_up_acc)
+                )
 
                 return (act_gate_acc, act_up_acc)
 
             act_gate, act_up = lax.fori_loop(0, num_bd1, body_w1w3, (init_val, init_val))
             act = activation_fn(act_gate, act_up, act_fn)
 
+            # --- 下投影 (W2) 部分 ---
             if num_bd2 > 0:
                 start_fetch_se_w2(0, block_id, 0)
 
             def body_w2(bd2_idx, _):
-                curr_sem = bd2_idx % 2
-                next_sem = (bd2_idx + 1) % 2
+                curr_w_sem = bd2_idx % 2
+                next_w_sem = (bd2_idx + 1) % 2
                 next_bd2_idx = bd2_idx + 1
 
                 @pl.when(next_bd2_idx < num_bd2)
                 def _():
-                    start_fetch_se_w2(next_sem, block_id, next_bd2_idx)
+                    start_fetch_se_w2(next_w_sem, block_id, next_bd2_idx)
 
-                wait_fetch_se_w2(curr_sem)
+                wait_fetch_se_w2(curr_w_sem)
 
+                # 对于 W2，我们不需要重新加载 Tokens，因为 'act' (Activation) 已经在寄存器/VMEM 中准备好了
+                # 并且形状是 (bt, bse)。
+                # 只需要遍历 chunk 进行计算以保持各种 slice 操作的一致性，或者直接对整个 bt 计算。
+                # 由于 W2 的计算是 (bt, bse) x (bse, hidden)，通常不需要对 bt 分块，
+                # 除非为了保持 act 的寄存器压力较低。
+                # 但由于 act 已经是 full size，我们可以直接计算，或者为了代码对称性也分块。
+                # 原代码是直接计算整个 bt 的。此处保持原样最简单，因为 buffer 压力主要在输入 tokens。
+
+                # 原逻辑 (保持不变，或根据需要分块):
                 for p_id in range(t_packing):
-                    w2_val = b_se_w2_x2_vmem[curr_sem, p_id]
+                    w2_val = b_se_w2_x2_vmem[curr_w_sem, p_id]
 
                     if w2_shared_scale_hbm is not None:
-                        s2 = b_se_w2_scale_x2_vmem[curr_sem, p_id]
+                        s2 = b_se_w2_scale_x2_vmem[curr_w_sem, p_id]
                         s2 = broadcast_quant_scale(s2, bse, subc_quant_wsz)
                         acc_chunk = jnp.dot(act, w2_val.astype(jnp.float32) * s2)
                     else:
@@ -2136,6 +2178,7 @@ def _fused_ep_moe_kernel(
 
                     hidden_offset = p_id * h_per_t_packing + bd2_idx * bd2_per_t_packing
 
+                    # 写入 Output Buffer (它是 bt 大小的，没变)
                     out_slice = b_output_x2_vmem.at[
                         out_buf_id, pl.ds(0, bt), pl.ds(hidden_offset, bd2_per_t_packing)
                     ]
@@ -2154,7 +2197,6 @@ def _fused_ep_moe_kernel(
 
     if num_bt >= 1:
         start_fetch_b_gating(bt_id=jnp.int32(0))
-        start_fetch_se_tokens(bt_id=jnp.int32(0))
 
     def run_bt(bt_id, e_sem_id):
         bt_start = bt_id * bt
@@ -2165,7 +2207,6 @@ def _fused_ep_moe_kernel(
         @pl.when(next_bt_id < num_bt)
         def _():
             start_fetch_b_gating(bt_id=next_bt_id)
-            start_fetch_se_tokens(next_bt_id)
 
         wait_fetch_b_gating(bt_id=bt_id)
 
@@ -2748,7 +2789,9 @@ def fused_ep_moe(
         ),  # a2a_s_acc_stage_x3_vmem
         (None if bias is None else pltpu.VMEM((padded_num_experts,), jnp.float32)),  # b_bias_vmem
         (
-            None if w1_shared is None else pltpu.VMEM((2, 2, bt, t_packing, bd1_per_pack), t_dtype)
+            None
+            if w1_shared is None
+            else pltpu.VMEM((2, 2, block_config.bts, t_packing, bd1_per_pack), t_dtype)
         ),  # b_se_tokens_vmem
         (
             None
