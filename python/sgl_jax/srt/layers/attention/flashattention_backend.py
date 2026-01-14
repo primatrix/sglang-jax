@@ -195,6 +195,10 @@ class FlashAttention(AttentionBackend):
 
         # Stack them to create a (dp_size, 3) array
         # This allows JAX to shard it along axis 0, so each device gets its own (3,) distribution
+        print(f"{metadata.cu_q_lens=}")
+        print(f"{metadata.cu_kv_lens=}")
+        print(f"{metadata.page_indices=}")
+        print(f"{metadata.seq_lens=}")
         distribution = np.concatenate(distribution_list)
 
         (
