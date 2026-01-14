@@ -2029,8 +2029,11 @@ def _fused_ep_moe_kernel(
 
             # --- [新增] 初始化 VMEM Accumulator 为 0 ---
             # 直接对整个 VMEM 区域写 0
-            b_se_gate_acc_vmem.at[...].set(0.0)
-            b_se_up_acc_vmem.at[...].set(0.0)
+            init_zeros = jnp.zeros((bt, bse), dtype=jnp.float32)
+
+            # 使用 [...] 对整个 Buffer 进行赋值
+            b_se_gate_acc_vmem.at[...].set(init_zeros)
+            b_se_up_acc_vmem.at[...].set(init_zeros)
             # ----------------------------------------
 
             if num_bd1 > 0:
