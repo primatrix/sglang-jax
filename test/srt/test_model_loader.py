@@ -20,6 +20,7 @@ from sgl_jax.srt.configs.load_config import LoadConfig, LoadFormat
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.model_loader.loader import JAXModelLoader, get_model_loader
 from sgl_jax.srt.models.qwen import QWenLMHeadModel
+from huggingface_hub.utils import HFValidationError
 
 
 class TestModelLoader(unittest.TestCase):

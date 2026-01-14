@@ -44,10 +44,8 @@ class TestWan2_1Model(CustomTestCase):
             timeout=1200,
         )
         response.raise_for_status()
-        # 解析返回的 JSON 数据
         result = response.json()
-        print("请求成功！")
-        print(json.dumps(result, indent=4, ensure_ascii=False))
+        print(json.dumps(result, indent = 4, ensure_ascii = False))
         process.kill()
 
     def test_wan2_1_14b(self):
@@ -77,10 +75,9 @@ class TestWan2_1Model(CustomTestCase):
             timeout=1200,
         )
         response.raise_for_status()
-        # 解析返回的 JSON 数据
         result = response.json()
-        print("请求成功！")
-        print(json.dumps(result, indent=4, ensure_ascii=False))
+        print("success")
+        print(json.dumps(result, indent = 4, ensure_ascii = False))
         process.kill()
 
 
