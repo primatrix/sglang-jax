@@ -2254,54 +2254,74 @@ def _fused_ep_moe_kernel(
 
         start_a2a_scatter(bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=0, bt_start=bt_start)
 
-        # ========== 优化策略：提前完成 SE 计算，然后与 Routed Expert 真正 overlap ==========
+        # ========== 优化策略 V2：SE 分块交错 + 减少 barrier ==========
         #
-        # 1. 先快速完成所有 SE 计算（在 expert 循环前）
-        # 2. SE 完成后通过 barrier 同步所有设备
-        # 3. 所有设备同步启动 AR（形成 Ring pipeline）
-        # 4. AR 在后台执行时，前台并行执行 routed expert FFN
-        # 5. 移除 expert 循环中的 per-expert barrier
+        # V1 问题：SE 前置导致 Prefill 变慢 +17%
+        # - 所有设备必须等待 SE 完成才能开始 scatter
+        # - 大 batch 时串行等待延迟高
         #
-        # 这样做的好处：
-        # - SE 计算连续，cache 友好
-        # - AR 能形成完整的 Ring，ICI 效率高
-        # - AR 与 FFN 真正 overlap，充分利用 MXU + ICI 带宽
-        # - Barrier 次数从 O(num_experts) 降到 O(1)
+        # V2 改进：
+        # 1. SE 分成较大的 chunks，在 expert 循环前半段交错计算
+        # 2. 每个 expert 可能计算 1-2 个 SE blocks
+        # 3. 移除 per-expert barrier (关键优化!)
+        # 4. AR 与 FFN overlap (关键优化!)
+        # 5. 只在 SE 完成后做一次 barrier
+        #
+        # 目标：
+        # - Prefill: SE 和 scatter 交错，减少延迟
+        # - Decode: AR 与 FFN overlap，提升吞吐
 
-        # 步骤 1: 快速完成所有 SE 计算
-        if w1_shared_hbm is not None:
+        # 计算 SE 分配策略
+        # 目标：在前 1/2 的 experts 中完成所有 SE 计算
+        # 避免在所有 expert 中都计算 SE（太碎片）
+        se_experts_target = jnp.maximum(local_num_experts // 2, 1)
+        se_blocks_per_expert = cdiv(se_total_blocks, se_experts_target)
+        # 限制每个 expert 最多算 2 个 SE blocks，避免单个 expert 太慢
+        se_blocks_per_expert = jnp.minimum(se_blocks_per_expert, 2)
 
-            def compute_all_se_blocks(block_idx, _):
-                run_shared_expert_slice(block_idx, bt_sem_id, out_buf_id)
-                return None
-
-            lax.fori_loop(0, se_total_blocks, compute_all_se_blocks, None)
-
-            # 步骤 2: 同步所有设备，确保 SE 都算完
-            sync_barrier()
-
-        # 步骤 3: 准备 AR 状态
-        # ar_step: 当前 AR 执行到第几步
-        ar_step = jnp.int32(0)
-
-        # 步骤 4: 定义 expert 循环，AR 在循环中与 FFN overlap
-        init_carry = (e_sem_id, ar_step)
+        # Carry 状态: (e_sem_id, se_block_idx, ar_step, barrier_passed)
+        init_carry = (e_sem_id, jnp.int32(0), jnp.int32(0), False)
 
         def run_per_expert_with_ar_overlap(local_e_id, carry):
-            curr_e_sem_id, curr_ar_step = carry
+            curr_e_sem_id, curr_se_block, curr_ar_step, barrier_passed = carry
 
-            # 在等待数据的同时，执行一些 AR 步骤（真正的 overlap！）
-            # 每个 expert 执行 1-2 步 AR，总共 se_ar_steps 步会在循环中完成
+            # 步骤 1: 在循环前半段计算 SE blocks（交错策略）
             if w1_shared_hbm is not None:
-                should_step = curr_ar_step < se_ar_steps
+                # 使用 lax.fori_loop 避免闭包问题，并确保 JAX 可以正确追踪
+                def compute_se_blocks_body(i, se_block):
+                    should_compute = se_block < se_total_blocks
 
-                @pl.when(should_step)
+                    @pl.when(should_compute)
+                    def _():
+                        run_shared_expert_slice(se_block, bt_sem_id, out_buf_id)
+
+                    return se_block + should_compute.astype(jnp.int32)
+
+                curr_se_block = lax.fori_loop(
+                    0, se_blocks_per_expert, compute_se_blocks_body, curr_se_block
+                )
+
+            # 步骤 2: 如果 SE 刚完成，做一次 barrier 同步
+            just_finished_se = (curr_se_block >= se_total_blocks) & jnp.logical_not(barrier_passed)
+
+            @pl.when(just_finished_se)
+            def _():
+                sync_barrier()
+
+            barrier_passed = barrier_passed | just_finished_se
+
+            # 步骤 3: 在 SE 完成后，执行 AR 与 FFN overlap
+            # 只有在 barrier_passed 后才能安全地执行 AR
+            if w1_shared_hbm is not None:
+                should_ar = barrier_passed & (curr_ar_step < se_ar_steps)
+
+                @pl.when(should_ar)
                 def _():
                     step_shared_expert_ar(curr_ar_step, out_buf_id)
 
-                # 更新步数：如果执行了 step，则 +1，否则 +0
-                curr_ar_step = curr_ar_step + should_step.astype(jnp.int32)
+                curr_ar_step = curr_ar_step + should_ar.astype(jnp.int32)
 
+            # 步骤 4: Routed expert 处理
             wait_a2a_scatter_recv(
                 bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id
             )
@@ -2315,13 +2335,13 @@ def _fused_ep_moe_kernel(
 
                 # FFN 后再执行一步 AR（如果还有）
                 if w1_shared_hbm is not None:
-                    should_step = curr_ar_step < se_ar_steps
+                    should_ar = barrier_passed & (curr_ar_step < se_ar_steps)
 
-                    @pl.when(should_step)
+                    @pl.when(should_ar)
                     def _():
                         step_shared_expert_ar(curr_ar_step, out_buf_id)
 
-                    curr_ar_step = curr_ar_step + should_step.astype(jnp.int32)
+                    curr_ar_step = curr_ar_step + should_ar.astype(jnp.int32)
             else:
                 wait_a2a_gather_send(
                     bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id - 2
@@ -2343,33 +2363,42 @@ def _fused_ep_moe_kernel(
 
             wait_a2a_scatter_send(curr_e_sem_id)
             # 关键优化：移除每个 expert 后的 barrier！
-            # AR 和 FFN 是异步的，不需要每次都同步
+            # SE 和 AR 都在特定条件下同步，不需要每次都全局同步
 
-            return (next_e_sem_id, curr_ar_step)
+            return (next_e_sem_id, curr_se_block, curr_ar_step, barrier_passed)
 
         # 运行 Pipeline 循环
         final_carry = lax.fori_loop(
             0, local_num_experts, run_per_expert_with_ar_overlap, init_carry, unroll=False
         )
-        final_e_sem_id, final_ar_step = final_carry
+        final_e_sem_id, final_se_block, final_ar_step, final_barrier_passed = final_carry
 
         # --- 收尾工作 (Cleanup) ---
 
-        # 1. SE 已经在循环前算完了，不需要再补算
+        # 1. 如果 SE 计算还没完（比如 experts 很少），强制算完
+        def cleanup_se_compute(block_idx, _):
+            run_shared_expert_slice(block_idx, bt_sem_id, out_buf_id)
+            return None
 
-        # 2. 确保所有 routed expert 通信完成
+        lax.fori_loop(final_se_block, se_total_blocks, cleanup_se_compute, None)
+
+        # 2. 补上 Barrier (如果之前没触发，比如没有 SE)
+        @pl.when(jnp.logical_not(final_barrier_passed))
+        def _():
+            sync_barrier()
+
+        # 3. 确保所有 routed expert 通信完成
         wait_a2a_gather_recv_all(bt_size=bt)
 
-        # 3. 补完剩余的 AR 步骤（如果有的话）
-        # 在 expert 循环中可能没有执行完所有 AR 步骤
+        # 4. 补完剩余的 AR 步骤（如果有的话）
         finish_remaining_ar_steps(final_ar_step, out_buf_id)
 
-        # 4. 累加 Routed 结果 + 落盘
+        # 5. 累加 Routed 结果 + 落盘
         # 此时 b_output 里已经是完整的 SE 结果（经过 AR），直接把 Routed 加上去即可
         acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
         start_send_bo(bt_id=bt_id)
 
-        # 5. 收尾同步
+        # 6. 收尾同步
         wait_a2a_gather_send(
             bt_sem_id=bt_sem_id,
             e_sem_id=final_e_sem_id,
