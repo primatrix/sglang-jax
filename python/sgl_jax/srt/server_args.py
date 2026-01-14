@@ -10,7 +10,11 @@ import tempfile
 import jax
 
 from sgl_jax.srt.function_call.function_call_parser import FunctionCallParser
-from sgl_jax.srt.hf_transformers_utils import check_gguf_file, get_config
+from sgl_jax.srt.hf_transformers_utils import (
+    check_gguf_file,
+    download_from_hf,
+    get_config,
+)
 from sgl_jax.srt.reasoning_parser import ReasoningParser
 from sgl_jax.srt.utils.common_utils import (
     is_remote_url,
@@ -223,6 +227,7 @@ class ServerArgs:
         if self.nnodes > 1 and self.device_indexes is not None:
             logger.warning("In a multi-machine scenario, device_indexes will be set to None.")
             self.device_indexes = None
+        self.model_path = download_from_hf(self.model_path)
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):

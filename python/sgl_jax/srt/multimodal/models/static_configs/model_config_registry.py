@@ -61,12 +61,24 @@ class ModelConfigRegistry:
     _KEYWORD_PATTERNS: list[tuple[str, callable]] = [
         # 14B patterns (check first as they're more specific)
         ("T2V-14B", lambda: WanModelConfig(flow_shift=5.0, **ModelConfigRegistry._WAN_14B_ARCH)),
-        ("I2V-14B-720P", lambda: WanModelConfig(
-            flow_shift=5.0, image_dim=1280, added_kv_proj_dim=5120, **ModelConfigRegistry._WAN_14B_ARCH
-        )),
-        ("I2V-14B-480P", lambda: WanModelConfig(
-            flow_shift=3.0, image_dim=1280, added_kv_proj_dim=5120, **ModelConfigRegistry._WAN_14B_ARCH
-        )),
+        (
+            "I2V-14B-720P",
+            lambda: WanModelConfig(
+                flow_shift=5.0,
+                image_dim=1280,
+                added_kv_proj_dim=5120,
+                **ModelConfigRegistry._WAN_14B_ARCH,
+            ),
+        ),
+        (
+            "I2V-14B-480P",
+            lambda: WanModelConfig(
+                flow_shift=3.0,
+                image_dim=1280,
+                added_kv_proj_dim=5120,
+                **ModelConfigRegistry._WAN_14B_ARCH,
+            ),
+        ),
         # 1.3B patterns (uses default WanModelConfig params)
         ("T2V-1.3B", lambda: WanModelConfig(flow_shift=3.0)),
         # Generic Wan2.1 fallback (default to 1.3B/480P)
