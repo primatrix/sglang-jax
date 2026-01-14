@@ -2027,20 +2027,13 @@ def _fused_ep_moe_kernel(
             bt_start = bt_id * bt
             num_chunks = cdiv(bt, bts)
 
-            # --- [新增] 初始化 VMEM Accumulator 为 0 ---
-            # 直接对整个 VMEM 区域写 0
-            init_zeros = jnp.zeros((bt, bse), dtype=jnp.float32)
-
-            # 使用 [...] 对整个 Buffer 进行赋值
-            b_se_gate_acc_vmem.at[...].set(init_zeros)
-            b_se_up_acc_vmem.at[...].set(init_zeros)
-            # ----------------------------------------
+            # [修改 1] 删除这里的初始化 VMEM Accumulator 为 0 的代码
+            # 因为我们在下面通过 bd1_idx == 0 判断来直接 overwrite，省去了初始化的开销
 
             if num_bd1 > 0:
                 start_fetch_se_w1(0, block_id, 0)
                 start_fetch_se_w3(0, block_id, 0)
 
-            # 注意：body_w1w3 不需要 carry 了，因为累加状态在 VMEM 中
             def body_w1w3(bd1_idx, _):
                 curr_w_sem = bd1_idx % 2
                 next_w_sem = (bd1_idx + 1) % 2
@@ -2054,7 +2047,6 @@ def _fused_ep_moe_kernel(
                 wait_fetch_se_w1(curr_w_sem)
                 wait_fetch_se_w3(curr_w_sem)
 
-                # --- Token Pipeline Start ---
                 start_fetch_se_tokens_slice(
                     bt_start=bt_start,
                     bt_sem_id=bt_sem_id,
@@ -2068,7 +2060,6 @@ def _fused_ep_moe_kernel(
                     next_buf_id = (chunk_idx + 1) % 2
                     next_chunk_idx = chunk_idx + 1
 
-                    # 1. Pipeline: Prefetch next tokens
                     @pl.when(next_chunk_idx < num_chunks)
                     def _():
                         start_fetch_se_tokens_slice(
@@ -2079,10 +2070,9 @@ def _fused_ep_moe_kernel(
                             bts_idx=next_chunk_idx,
                         )
 
-                    # 2. Wait current tokens
                     wait_fetch_se_tokens_slice(bt_sem_id=bt_sem_id, buf_id=curr_buf_id)
 
-                    # 3. Compute GEMM on small chunk
+                    # Compute GEMM on small chunk
                     chunk_gate_acc_part = jnp.zeros((bts, bse), dtype=jnp.float32)
                     chunk_up_acc_part = jnp.zeros((bts, bse), dtype=jnp.float32)
 
@@ -2118,34 +2108,36 @@ def _fused_ep_moe_kernel(
                         else:
                             chunk_up_acc_part += jnp.dot(t_f32, w3_up.astype(jnp.float32))
 
-                    # 4. Accumulate in VMEM (Fixing the dynamic_slice error)
-                    # 使用 pl.ds 直接操作 VMEM Ref
+                    # [修改 2] 核心优化：根据 bd1_idx 决定覆盖 (Overwrite) 还是累加 (Accumulate)
                     slice_idx = pl.ds(chunk_idx * bts, bts)
 
-                    # Read old value
-                    curr_gate = b_se_gate_acc_vmem.at[slice_idx, pl.ds(0, bse)].get()
-                    curr_up = b_se_up_acc_vmem.at[slice_idx, pl.ds(0, bse)].get()
+                    # 第一次：直接写入 VMEM，不读取旧值，节省 50% 带宽并避免读取垃圾数据
+                    @pl.when(bd1_idx == 0)
+                    def _overwrite():
+                        b_se_gate_acc_vmem.at[slice_idx, pl.ds(0, bse)].set(chunk_gate_acc_part)
+                        b_se_up_acc_vmem.at[slice_idx, pl.ds(0, bse)].set(chunk_up_acc_part)
 
-                    # Add
-                    curr_gate += chunk_gate_acc_part
-                    curr_up += chunk_up_acc_part
-
-                    # Write back
-                    b_se_gate_acc_vmem.at[slice_idx, pl.ds(0, bse)].set(curr_gate)
-                    b_se_up_acc_vmem.at[slice_idx, pl.ds(0, bse)].set(curr_up)
+                    # 后续：读取旧值 + 累加
+                    @pl.when(bd1_idx > 0)
+                    def _accumulate():
+                        curr_gate = b_se_gate_acc_vmem.at[slice_idx, pl.ds(0, bse)].get()
+                        curr_up = b_se_up_acc_vmem.at[slice_idx, pl.ds(0, bse)].get()
+                        b_se_gate_acc_vmem.at[slice_idx, pl.ds(0, bse)].set(
+                            curr_gate + chunk_gate_acc_part
+                        )
+                        b_se_up_acc_vmem.at[slice_idx, pl.ds(0, bse)].set(
+                            curr_up + chunk_up_acc_part
+                        )
 
                 lax.fori_loop(0, num_chunks, run_token_chunk, None)
 
-            # 执行外层 bd1 循环，不再传递 carry
             lax.fori_loop(0, num_bd1, body_w1w3, None)
 
-            # --- Activation ---
-            # 从 VMEM 读取完整的累加结果
+            # ... (后续 Activation 和 W2 逻辑保持不变) ...
             act_gate = b_se_gate_acc_vmem[...]
             act_up = b_se_up_acc_vmem[...]
             act = activation_fn(act_gate, act_up, act_fn)
 
-            # --- W2 Down Projection ---
             if num_bd2 > 0:
                 start_fetch_se_w2(0, block_id, 0)
 
