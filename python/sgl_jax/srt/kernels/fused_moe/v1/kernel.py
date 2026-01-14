@@ -2193,8 +2193,14 @@ def _fused_ep_moe_kernel(
         def run_per_expert_pipelined(local_e_id, carry):
             curr_e_sem_id, curr_se_block = carry
 
-            start_fetch_bw1(local_e_id, bw1_sem_id=0, bf_id=0, bd1_id=0)
-            start_fetch_bw3(local_e_id, bw3_sem_id=0, bf_id=0, bd3_id=0)
+            e_id = my_id * local_num_experts + local_e_id
+            dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
+            is_active_expert = dyn_sz > 0
+
+            @pl.when(is_active_expert)
+            def _():
+                start_fetch_bw1(local_e_id, bw1_sem_id=0, bf_id=0, bd1_id=0)
+                start_fetch_bw3(local_e_id, bw3_sem_id=0, bf_id=0, bd3_id=0)
 
             @pl.when(curr_se_block == 0)
             def _():
@@ -2217,7 +2223,10 @@ def _fused_ep_moe_kernel(
             wait_a2a_scatter_recv(
                 bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id
             )
-            expert_ffn(bt_sem_id, curr_e_sem_id, local_e_id)
+
+            @pl.when(is_active_expert)
+            def _():
+                expert_ffn(bt_sem_id, curr_e_sem_id, local_e_id)
 
             start_a2a_gather(bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id)
 
