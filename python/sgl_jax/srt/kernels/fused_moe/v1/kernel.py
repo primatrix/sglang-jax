@@ -2292,9 +2292,15 @@ def _fused_ep_moe_kernel(
 
             # 在等待数据的同时，执行一些 AR 步骤（真正的 overlap！）
             # 每个 expert 执行 1-2 步 AR，总共 se_ar_steps 步会在循环中完成
-            if w1_shared_hbm is not None and curr_ar_step < se_ar_steps:
-                step_shared_expert_ar(curr_ar_step, out_buf_id)
-                curr_ar_step += 1
+            if w1_shared_hbm is not None:
+                should_step = curr_ar_step < se_ar_steps
+
+                @pl.when(should_step)
+                def _():
+                    step_shared_expert_ar(curr_ar_step, out_buf_id)
+
+                # 更新步数：如果执行了 step，则 +1，否则 +0
+                curr_ar_step = curr_ar_step + should_step.astype(jnp.int32)
 
             wait_a2a_scatter_recv(
                 bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id
@@ -2308,9 +2314,14 @@ def _fused_ep_moe_kernel(
                 expert_ffn(bt_sem_id, curr_e_sem_id, local_e_id)
 
                 # FFN 后再执行一步 AR（如果还有）
-                if w1_shared_hbm is not None and curr_ar_step < se_ar_steps:
-                    step_shared_expert_ar(curr_ar_step, out_buf_id)
-                    curr_ar_step += 1
+                if w1_shared_hbm is not None:
+                    should_step = curr_ar_step < se_ar_steps
+
+                    @pl.when(should_step)
+                    def _():
+                        step_shared_expert_ar(curr_ar_step, out_buf_id)
+
+                    curr_ar_step = curr_ar_step + should_step.astype(jnp.int32)
             else:
                 wait_a2a_gather_send(
                     bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id - 2
