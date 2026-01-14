@@ -8,6 +8,8 @@ from sgl_jax.srt.managers.io_struct import BatchTokenIDOut, TokenizedGenerateReq
 from sgl_jax.srt.multimodal.manager.io_struct import DataType
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 
+NegativePromptSuffix = "_negative"
+
 
 @dataclass
 class Req:
@@ -158,24 +160,43 @@ class Req:
     # results
     output: jax.Array | None = None
 
-    def to_stage_req(self, scheduler: str):
+    def to_stage_reqs(self, scheduler: str):
         if scheduler == "auto_regressive":
-            return TokenizedGenerateReqInput(
-                rid=self.rid,
-                input_ids=self.input_ids,
-                sampling_params=SamplingParams(max_new_tokens=1),
-                return_hidden_states=True,
-            )
+            return [
+                TokenizedGenerateReqInput(
+                    rid=self.rid,
+                    input_ids=self.input_ids,
+                    sampling_params=SamplingParams(max_new_tokens=1),
+                    return_hidden_states=True,
+                ),
+                TokenizedGenerateReqInput(
+                    rid=self.rid + NegativePromptSuffix,
+                    input_ids=self.negative_input_ids,
+                    sampling_params=SamplingParams(max_new_tokens=1),
+                    return_hidden_states=True,
+                ),
+            ]
         else:
-            return self
+            return [self]
 
     @staticmethod
     def from_stage(stage_result: Any, req_store: dict):
         if type(stage_result) is BatchTokenIDOut:
-            if stage_result.rids[0] not in req_store:
-                raise RuntimeError(f"{stage_result.rids[0]} is not in req_store")
-            req = req_store[stage_result.rids[0]]
-            req.prompt_embeds = stage_result.output_hidden_states[0][0]
+            req = None
+            for i, rid in enumerate(stage_result.rids):
+                if rid.endswith(NegativePromptSuffix):
+                    rid = rid[: -len(NegativePromptSuffix)]
+                    if rid not in req_store:
+                        raise RuntimeError(f"{rid} is not in req_store")
+                    req = req_store[rid]
+                    req.negative_prompt_embeds = stage_result.output_hidden_states[i][0]
+                else:
+                    if rid not in req_store:
+                        raise RuntimeError(f"{rid} is not in req_store")
+                    req = req_store[rid]
+                    req.prompt_embeds = stage_result.output_hidden_states[i][0]
+            if req.prompt_embeds is None or req.negative_prompt_embeds is None:
+                return None
             return req
         else:
             return stage_result
