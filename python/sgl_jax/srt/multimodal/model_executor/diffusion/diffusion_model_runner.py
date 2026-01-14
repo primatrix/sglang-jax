@@ -135,6 +135,36 @@ class DiffusionModelRunner(BaseModelRunner):
             text_embeds = jnp.pad(
                 text_embeds, ((0, 0), (0, pad_width), (0, 0)), mode="constant", constant_values=0
             )
+            # Dump encoder data for debugging
+            try:
+                from sgl_jax.srt.utils.dump_utils import get_encoder_dumper
+
+                dumper = get_encoder_dumper()
+                request_id = batch.rid if batch.rid else "unknown"
+
+                if dumper.should_dump(request_id):
+                    import numpy as np
+
+                    # Prepare before data (encoder input)
+                    before_data = {
+                        "request_id": request_id,
+                        "prompt": batch.prompt,
+                        "input_ids": batch.input_ids,
+                    }
+
+                    # Prepare after data (encoder output)
+                    # Convert JAX array to numpy for serialization
+                    hidden_states_np = np.array(text_embeds)
+                    after_data = {"hidden_states": hidden_states_np}
+
+                    dumper.dump_encoder_data(before_data, after_data, request_id)
+                    logging.info(
+                        "[DiffusionDump] Encoder data dumped for request_id=%s, prompt=%s",
+                        request_id,
+                        batch.prompt,
+                    )
+            except Exception as e:
+                logging.warning("[DiffusionDump] Failed to dump encoder data: %s", str(e))
         self.prepare_latents(batch)
         latents = device_array(batch.latents, sharding=NamedSharding(self.mesh, PartitionSpec()))
         self.solver.set_timesteps(

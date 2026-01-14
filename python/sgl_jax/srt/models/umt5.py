@@ -1,22 +1,16 @@
 # Copyright 2026 SII Team
 # Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 # ==============================================================================
 
-"""Inference-only UMT5 model compatible with HuggingFace weights."""
+"""UMT5 model using RadixAttention for efficient attention computation.
+
+This implementation uses RadixAttention for decoder self-attention and native
+attention for encoder and cross-attention, providing optimal balance between
+performance and compatibility with T5's position bias mechanism.
+"""
 
 import copy
 import math
-from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -29,524 +23,381 @@ from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
-from sgl_jax.srt.layers.logits_processor import (
-    LogitsMetadata,
-    LogitsProcessor,
-    LogitsProcessorOutput,
-)
-from sgl_jax.srt.layers.radix_attention import RadixAttention
+from sgl_jax.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sgl_jax.srt.layers.radix_attention import AttentionType, RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
+# =============================================================================
+# Utilities
+# =============================================================================
 
-def fp16_clamp(x: jax.Array):
-    """Clamps values to prevent float16 overflow."""
+
+def fp16_clamp(x):
+    """Clamp to prevent float16 overflow."""
     if x.dtype == jnp.float16 and jnp.isinf(x).any():
         clamp = jnp.finfo(x.dtype).max - 1000
-        x = jax.lax.clamp(x=x, min=-clamp, max=clamp)
+        return jax.lax.clamp(x=x, min=-clamp, max=clamp)
     return x
 
 
 def gelu_new(x):
+    """GELU with tanh approximation (HF T5/UMT5 style)."""
+    return 0.5 * x * (1.0 + jnp.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * x**3)))
+
+
+def update_decoder_seq_lens(forward_batch: ForwardBatch, dec_ids):
+    """Update forward_batch.seq_lens for decoder using decoder_seq_lens if available."""
+    if hasattr(forward_batch, "decoder_seq_lens"):
+        forward_batch.seq_lens = forward_batch.decoder_seq_lens
+        forward_batch.extend_seq_lens = forward_batch.decoder_seq_lens
+    else:
+        dec_len = len(dec_ids)
+        forward_batch.seq_lens = jnp.array([dec_len], dtype=jnp.int32)
+        forward_batch.extend_seq_lens = jnp.array([dec_len], dtype=jnp.int32)
+    forward_batch.positions = jnp.arange(len(dec_ids), dtype=jnp.int32)
+
+
+ACT_FN = {"gelu": jax.nn.gelu, "gelu_new": gelu_new, "relu": jax.nn.relu}
+
+
+def _apply_block_diagonal_mask(scores, q_lens, k_lens, is_causal=False):
+    """Block-diagonal mask: each sequence attends only to itself.
+
+    For cross-attention: q_lens (decoder) and k_lens (encoder) can differ.
+    For self-attention: pass same seq_lens for both.
+    For decoder self-attention: set is_causal=True to add causal mask.
     """
-    GELU activation with tanh approximation (matches HF T5/UMT5).
-    Equivalent to PyTorch's F.gelu(x, approximate='tanh').
-    """
-    return 0.5 * x * (1.0 + jnp.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * jnp.power(x, 3))))
+    _, q_len, k_len = scores.shape
+    q_total, k_total = jnp.sum(q_lens), jnp.sum(k_lens)
+
+    # Validity masks
+    q_valid = jnp.arange(q_len) < q_total
+    k_valid = jnp.arange(k_len) < k_total
+
+    # Batch IDs via cumsum
+    q_starts = jnp.cumsum(q_lens, dtype=jnp.int32) - q_lens
+    k_starts = jnp.cumsum(k_lens, dtype=jnp.int32) - k_lens
+    q_indicators = jnp.zeros(q_len, dtype=jnp.int32).at[q_starts].set(1)
+    k_indicators = jnp.zeros(k_len, dtype=jnp.int32).at[k_starts].set(1)
+    q_ids = jnp.cumsum(q_indicators, dtype=jnp.int32) - 1
+    k_ids = jnp.cumsum(k_indicators, dtype=jnp.int32) - 1
+
+    # Block-diagonal: same batch ID
+    mask = (q_ids[:, None] == k_ids[None, :]) & q_valid[:, None] & k_valid[None, :]
+
+    # Add causal mask for decoder self-attention
+    if is_causal:
+        q_pos_in_seq = jnp.arange(q_len) - q_starts[q_ids]
+        k_pos_in_seq = jnp.arange(k_len) - k_starts[k_ids]
+        causal_mask = k_pos_in_seq[None, :] <= q_pos_in_seq[:, None]
+        mask = mask & causal_mask
+
+    return jnp.where(mask[None], scores, jnp.finfo(scores.dtype).min)
 
 
-ACT_FN = {
-    "gelu": jax.nn.gelu,
-    "gelu_new": gelu_new,
-    "relu": jax.nn.relu,
-}
+def relative_position_bucket(rel_pos, bidirectional=True, num_buckets=32, max_distance=128):
+    """T5-style relative position bucketing."""
+    ret = 0
+    n = -rel_pos
+    if bidirectional:
+        num_buckets //= 2
+        ret += (n < 0).astype(jnp.int32) * num_buckets
+        n = jnp.abs(n)
+    else:
+        n = jnp.maximum(n, 0)
+
+    max_exact = num_buckets // 2
+    is_small = n < max_exact
+    val_large = max_exact + (
+        jnp.log(n.astype(jnp.float32) / max_exact)
+        / math.log(max_distance / max_exact)
+        * (num_buckets - max_exact)
+    ).astype(jnp.int32)
+    val_large = jnp.minimum(val_large, num_buckets - 1)
+
+    return jnp.where(is_small, n, val_large) + ret
 
 
-class UMT5DenseGatedActDense(nnx.Module):
-    """
-    Gated-GELU FFN (used in UMT5, Flan-T5).
-    Structure: (GeLU(x @ wi_0.T) * (x @ wi_1.T)) @ wo.T
-    """
+# =============================================================================
+# FFN Modules
+# =============================================================================
 
-    def __init__(
-        self,
-        config: UMT5Config,
-        mesh: jax.sharding.Mesh,
-        dtype: jnp.dtype = jnp.bfloat16,
-    ):
-        self.wi_0 = LinearBase(
-            input_size=config.d_model,
-            output_size=config.d_ff,
-            mesh=mesh,
-            use_bias=False,
-            kernel_axes=(None, "tensor"),
-            params_dtype=dtype,
+
+class UMT5FFN(nnx.Module):
+    """UMT5 Feed-Forward Network (gated or standard)."""
+
+    def __init__(self, config: UMT5Config, mesh, dtype=jnp.bfloat16):
+        mk_linear = lambda in_sz, out_sz, axes: LinearBase(
+            in_sz, out_sz, mesh, use_bias=False, kernel_axes=axes, params_dtype=dtype
         )
-        self.wi_1 = LinearBase(
-            input_size=config.d_model,
-            output_size=config.d_ff,
-            mesh=mesh,
-            use_bias=False,
-            kernel_axes=(None, "tensor"),
-            params_dtype=dtype,
-        )
-        self.wo = LinearBase(
-            input_size=config.d_ff,
-            output_size=config.d_model,
-            mesh=mesh,
-            use_bias=False,
-            kernel_axes=("tensor", None),
-            params_dtype=dtype,
-        )
+
+        if config.is_gated_act:
+            # Gated: (GeLU(x @ wi_0) * (x @ wi_1)) @ wo
+            self.wi_0 = mk_linear(config.d_model, config.d_ff, (None, "tensor"))
+            self.wi_1 = mk_linear(config.d_model, config.d_ff, (None, "tensor"))
+        else:
+            # Standard: GeLU(x @ wi) @ wo
+            self.wi = mk_linear(config.d_model, config.d_ff, (None, "tensor"))
+
+        self.wo = mk_linear(config.d_ff, config.d_model, ("tensor", None))
         self.dropout = nnx.Dropout(config.dropout_rate)
         self.act = ACT_FN.get(config.dense_act_fn, jax.nn.gelu)
+        self.is_gated = config.is_gated_act
 
-    def __call__(self, hidden_states: jax.Array, deterministic: bool = True) -> jax.Array:
-        hidden_gelu = self.act(self.wi_0(hidden_states)[0])
-        hidden_linear = self.wi_1(hidden_states)[0]
-        hidden_states = hidden_gelu * hidden_linear
-        hidden_states = self.dropout(hidden_states, deterministic=deterministic)
-        hidden_states, _ = self.wo(hidden_states)
-        return hidden_states
+    def __call__(self, x, deterministic=True):
+        dtype = x.dtype
+        if self.is_gated:
+            h0, _ = self.wi_0(x)
+            h1, _ = self.wi_1(x)
+            h = self.dropout((self.act(h0) * h1).astype(dtype), deterministic=deterministic)
+        else:
+            h, _ = self.wi(x)
+            h = self.dropout(self.act(h).astype(dtype), deterministic=deterministic)
+
+        out, _ = self.wo(h)
+        return out
 
 
-class UMT5DenseActDense(nnx.Module):
-    """Standard FFN (used in original T5): Linear -> Act -> Linear."""
-
-    def __init__(
-        self,
-        config: UMT5Config,
-        mesh: jax.sharding.Mesh,
-        dtype: jnp.dtype = jnp.bfloat16,
-    ):
-        self.wi = LinearBase(
-            input_size=config.d_model,
-            output_size=config.d_ff,
-            mesh=mesh,
-            use_bias=False,
-            kernel_axes=(None, "tensor"),
-            params_dtype=dtype,
-        )
-        self.wo = LinearBase(
-            input_size=config.d_ff,
-            output_size=config.d_model,
-            mesh=mesh,
-            use_bias=False,
-            kernel_axes=("tensor", None),
-            params_dtype=dtype,
-        )
-        self.dropout = nnx.Dropout(config.dropout_rate)
-        self.act = ACT_FN.get(config.dense_act_fn, jax.nn.relu)
-
-    def __call__(self, hidden_states: jax.Array, deterministic: bool = True) -> jax.Array:
-        hidden_states, _ = self.wi(hidden_states)
-        hidden_states = self.act(hidden_states)
-        hidden_states = self.dropout(hidden_states, deterministic=deterministic)
-        hidden_states, _ = self.wo(hidden_states)
-        return hidden_states
+# =============================================================================
+# Attention Module
+# =============================================================================
 
 
 class UMT5Attention(nnx.Module):
-    """
-    Multi-head attention for UMT5.
-    Supports self-attention, cross-attention, relative position bias, and KV cache.
-    """
+    """UMT5 attention: RadixAttention for decoder self-attn, custom for others."""
 
     def __init__(
         self,
         config: UMT5Config,
-        mesh: jax.sharding.Mesh,
-        dtype: jnp.dtype = jnp.bfloat16,
-        layer_idx: int = 0,
-        is_cross_attention: bool = False,
-        is_decoder: bool = False,
+        mesh,
+        dtype=jnp.bfloat16,
+        layer_idx=0,
+        is_cross_attention=False,
+        is_decoder=False,
     ):
         self.is_decoder = is_decoder
         self.is_cross_attention = is_cross_attention
-        self.relative_attention_num_buckets = config.relative_attention_num_buckets
-        self.relative_attention_max_distance = getattr(
-            config, "relative_attention_max_distance", 128
-        )
+        self.layer_idx = layer_idx
+        self.mesh = mesh
 
         self.d_model = config.d_model
-        self.key_value_proj_dim = config.d_kv
+        self.d_kv = config.d_kv
         self.n_heads = config.num_heads
-        self.inner_dim = self.n_heads * self.key_value_proj_dim
-        self.layer_idx = layer_idx
+        self.inner_dim = self.n_heads * self.d_kv
 
-        # QKV projections
-        self.q = LinearBase(
-            input_size=self.d_model,
-            output_size=self.inner_dim,
-            mesh=mesh,
-            use_bias=False,
-            kernel_axes=(None, "tensor"),
-            params_dtype=dtype,
+        # QKV + O projections
+        mk_linear = lambda in_sz, out_sz, axes: LinearBase(
+            in_sz, out_sz, mesh, use_bias=False, kernel_axes=axes, params_dtype=dtype
         )
-        self.k = LinearBase(
-            input_size=self.d_model,
-            output_size=self.inner_dim,
-            mesh=mesh,
-            use_bias=False,
-            kernel_axes=(None, "tensor"),
-            params_dtype=dtype,
-        )
-        self.v = LinearBase(
-            input_size=self.d_model,
-            output_size=self.inner_dim,
-            mesh=mesh,
-            use_bias=False,
-            kernel_axes=(None, "tensor"),
-            params_dtype=dtype,
-        )
-        self.o = LinearBase(
-            input_size=self.inner_dim,
-            output_size=self.d_model,
-            mesh=mesh,
-            use_bias=False,
-            kernel_axes=("tensor", None),
-            params_dtype=dtype,
-        )
+        self.q = mk_linear(self.d_model, self.inner_dim, (None, "tensor"))
+        self.k = mk_linear(self.d_model, self.inner_dim, (None, "tensor"))
+        self.v = mk_linear(self.d_model, self.inner_dim, (None, "tensor"))
+        self.o = mk_linear(self.inner_dim, self.d_model, ("tensor", None))
 
-        # Relative position bias (T5-style, self-attention only)
-        if not self.is_cross_attention:
-            self.relative_attention_bias = Embed(
-                self.relative_attention_num_buckets,
+        # T5 relative position bias (self-attention only)
+        if not is_cross_attention:
+            num_buckets = config.relative_attention_num_buckets
+            self.rel_bias = Embed(
+                num_buckets,
                 self.n_heads,
                 dtype=dtype,
                 param_dtype=dtype,
                 mesh=mesh,
                 kernel_axes=(None, "tensor"),
             )
+            self.num_buckets = num_buckets
+            self.max_distance = getattr(config, "relative_attention_max_distance", 128)
 
         self.dropout = nnx.Dropout(config.dropout_rate)
 
-        # RadixAttention with KV cache (decoder self-attention only)
-        if self.is_decoder and not self.is_cross_attention:
+        # RadixAttention for decoder self-attention (needs KV cache)
+        if is_decoder and not is_cross_attention:
             self.radix_attn = RadixAttention(
                 num_heads=self.n_heads,
-                head_dim=self.key_value_proj_dim,
-                scaling=1.0,  # T5 uses unscaled attention
+                head_dim=self.d_kv,
+                scaling=1.0,  # T5 uses scale=1.0
                 num_kv_heads=self.n_heads,
                 layer_id=layer_idx,
+                attn_type=AttentionType.DECODER,
             )
-
-    def _relative_position_bucket(
-        self, relative_position, bidirectional=True, num_buckets=32, max_distance=128
-    ):
-        """
-        Compute bucket indices for relative positions (adapted from HF T5).
-
-        Bidirectional (encoder): separate buckets for past/future.
-        Unidirectional (decoder): only considers past positions.
-        Uses logarithmic bucketing for longer distances.
-        """
-        ret = 0
-        n = -relative_position
-        if bidirectional:
-            num_buckets //= 2
-            ret += (n < 0).astype(jnp.int32) * num_buckets
-            n = jnp.abs(n)
-        else:
-            n = jnp.maximum(n, 0)
-
-        max_exact = num_buckets // 2
-        is_small = n < max_exact
-
-        val_if_large = max_exact + (
-            jnp.log(n.astype(jnp.float32) / max_exact)
-            / math.log(max_distance / max_exact)
-            * (num_buckets - max_exact)
-        ).astype(jnp.int32)
-
-        val_if_large = jnp.minimum(val_if_large, num_buckets - 1)
-        return jnp.where(is_small, n, val_if_large) + ret
-
-    def compute_bias(self, query_length, key_length, bidirectional=True):
-        """Compute relative attention bias matrix [1, n_heads, query_len, key_len]."""
-        context_position = jnp.arange(query_length, dtype=jnp.int32)[:, None]
-        memory_position = jnp.arange(key_length, dtype=jnp.int32)[None, :]
-        relative_position = memory_position - context_position
-
-        rp_bucket = self._relative_position_bucket(
-            relative_position,
-            bidirectional=bidirectional,
-            num_buckets=self.relative_attention_num_buckets,
-            max_distance=self.relative_attention_max_distance,
-        )
-
-        values = self.relative_attention_bias(rp_bucket)
-        values = jnp.transpose(values, (2, 0, 1))[None, :, :, :]
-        return values
 
     def __call__(
         self,
-        hidden_states: jax.Array,
-        mask: jax.Array | None = None,
-        deterministic: bool = True,
-        encoder_hidden_states: jax.Array | None = None,
-        encoder_mask: jax.Array | None = None,
-        forward_batch: ForwardBatch | None = None,
-        token_to_kv_pool: KVCache | None = None,
-    ) -> jax.Array:
+        x,
+        forward_batch: ForwardBatch,
+        encoder_hidden_states=None,
+        token_to_kv_pool: KVCache = None,
+        deterministic=True,
+    ):
+        dtype = x.dtype
 
-        batch_size, seq_length = hidden_states.shape[:2]
-
-        # Project queries
-        q, _ = self.q(hidden_states)
-
-        # Get K/V from encoder (cross-attn) or input (self-attn)
+        # Q/K/V projections
+        q, _ = self.q(x)
         if self.is_cross_attention:
-            # Cross-attention: K/V from encoder output
             if encoder_hidden_states is None:
-                raise ValueError("encoder_hidden_states must be provided for cross attention")
+                raise ValueError("encoder_hidden_states required for cross-attention")
             k, _ = self.k(encoder_hidden_states)
             v, _ = self.v(encoder_hidden_states)
         else:
-            # Self-attention: K/V from input
-            k, _ = self.k(hidden_states)
-            v, _ = self.v(hidden_states)
+            k, _ = self.k(x)
+            v, _ = self.v(x)
 
-        kv_fused = None
+        # Decoder self-attention with KV cache: use RadixAttention
+        if self.is_decoder and not self.is_cross_attention and token_to_kv_pool is not None:
+            q_3d = q.reshape(-1, self.n_heads, self.d_kv)
+            k_3d = k.reshape(-1, self.n_heads, self.d_kv)
+            v_3d = v.reshape(-1, self.n_heads, self.d_kv)
+            out, _ = self.radix_attn(q_3d, k_3d, v_3d, forward_batch, token_to_kv_pool)
+            out = out.reshape(q.shape[0], self.inner_dim)
+        else:
+            # Encoder self-attention and cross-attention: use native attention
+            out = self._native_attention(q, k, v, forward_batch)
 
-        # CASE 1: Decoder self-attention with KV cache (RadixAttention)
-        # Used during autoregressive decoding in SGLang runtime.
-        if (
-            self.is_decoder
-            and not self.is_cross_attention
-            and forward_batch is not None
-            and token_to_kv_pool is not None
-        ):
-            q_flat = q.reshape(-1, self.n_heads, self.key_value_proj_dim)
-            k_flat = k.reshape(-1, self.n_heads, self.key_value_proj_dim)
-            v_flat = v.reshape(-1, self.n_heads, self.key_value_proj_dim)
+        out = self.dropout(out.astype(dtype), deterministic=deterministic)
+        out, _ = self.o(out)
+        return out
 
-            # Note: Relative position bias not currently supported in RadixAttention fast path
-            attn_output, kv_fused = self.radix_attn(
-                q_flat,
-                k_flat,
-                v_flat,
-                forward_batch,
-                token_to_kv_pool,
-            )
+    def _native_attention(self, q, k, v, forward_batch: ForwardBatch):
+        """Native attention for encoder/cross-attention with T5 position bias."""
+        num_tokens, hidden = q.shape[0], q.shape[-1]
+        head_dim = hidden // self.n_heads
 
-            attn_output = attn_output.reshape(batch_size, seq_length, self.inner_dim)
-            output, _ = self.o(attn_output)
-            return output
+        # Reshape to [heads, tokens, head_dim]
+        def to_heads(x):
+            n_tok = x.shape[0]
+            return jnp.transpose(x.reshape(n_tok, self.n_heads, head_dim), (1, 0, 2))
 
-        # CASE 2: Standard attention (encoder, cross-attention, or fallback)
-        # Reshape for multi-head attention
-        q = q.reshape(batch_size, seq_length, self.n_heads, self.key_value_proj_dim)
-        k = k.reshape(batch_size, -1, self.n_heads, self.key_value_proj_dim)
-        v = v.reshape(batch_size, -1, self.n_heads, self.key_value_proj_dim)
+        q_h, k_h, v_h = to_heads(q), to_heads(k), to_heads(v)
 
-        q = jnp.transpose(q, (0, 2, 1, 3))  # [batch, n_heads, seq_q, head_dim]
-        k = jnp.transpose(k, (0, 2, 1, 3))  # [batch, n_heads, seq_k, head_dim]
-        v = jnp.transpose(v, (0, 2, 1, 3))  # [batch, n_heads, seq_k, head_dim]
+        # Compute scores in float32
+        scores = jnp.einsum("hqd,hkd->hqk", q_h.astype(jnp.float32), k_h.astype(jnp.float32))
 
-        # Compute attention scores (unscaled for T5)
-        q_f32 = q.astype(jnp.float32)
-        k_f32 = k.astype(jnp.float32)
-        scores = jnp.matmul(q_f32, jnp.swapaxes(k_f32, -1, -2))
+        # Get sequence lengths
+        q_lens = getattr(forward_batch, "extend_seq_lens", forward_batch.seq_lens)
+        # Fallback if seq_lens is None: assume single sequence
+        if q_lens is None:
+            q_lens = jnp.array([q.shape[0]], dtype=jnp.int32)
 
-        # Add relative position bias (self-attention only)
-        if not self.is_cross_attention:
-            bidirectional = not self.is_decoder
-            position_bias = self.compute_bias(seq_length, k.shape[2], bidirectional=bidirectional)
-            scores += position_bias.astype(jnp.float32)
+        # Add position bias for self-attention (T5-specific)
+        if not self.is_cross_attention and hasattr(self, "rel_bias"):
+            pos_bias = self._compute_position_bias(q_lens, q.shape[0], k.shape[0])
+            scores = scores + pos_bias.astype(jnp.float32)
 
-        # Apply attention masks
-        active_mask = mask if not self.is_cross_attention else encoder_mask
+        # Apply masking
+        kv_lens = (
+            getattr(forward_batch, "encoder_seq_lens", q_lens)
+            if self.is_cross_attention
+            else q_lens
+        )
+        is_causal = self.is_decoder and not self.is_cross_attention
 
-        if self.is_decoder and not self.is_cross_attention:
-            # Causal mask for decoder self-attention
-            causal_mask = jnp.tril(jnp.ones((seq_length, seq_length), dtype=jnp.bool_))
-            causal_mask = causal_mask[None, None, :, :]  # [1, 1, seq, seq]
+        # Apply block_diagonal_mask
+        scores = _apply_block_diagonal_mask(scores, q_lens, kv_lens, is_causal=is_causal)
 
-            if active_mask is not None:
-                if active_mask.ndim == 2:
-                    # Combine causal mask with padding mask
-                    active_mask = active_mask[:, None, None, :]
-                    combined_mask = jnp.logical_and(causal_mask, active_mask)
-                    active_mask = combined_mask
-                elif active_mask.ndim == 3:
-                    active_mask = active_mask[:, None, :, :]
-                    active_mask = jnp.logical_and(causal_mask, active_mask)
-            else:
-                active_mask = causal_mask
+        # Softmax and weighted sum
+        weights = jax.nn.softmax(scores, axis=-1)
+        out = jnp.einsum("hqk,hkd->hqd", weights, v_h.astype(jnp.float32))
 
-        # Apply the final mask to scores
-        if active_mask is not None:
-            if active_mask.ndim == 2:
-                active_mask = active_mask[:, None, None, :]
-            elif active_mask.ndim == 3 and self.is_cross_attention:
-                active_mask = active_mask[:, None, :, :]
+        return jnp.transpose(out, (1, 0, 2)).reshape(num_tokens, hidden)
 
-            mask_value = jnp.finfo(scores.dtype).min
-            scores = jnp.where(active_mask == 0, mask_value, scores)
+    def _compute_position_bias(self, seq_lens, q_len, k_len):
+        """Compute T5 position bias [heads, q_len, k_len]."""
+        starts = jnp.cumsum(seq_lens) - seq_lens
+        indicators = jnp.zeros(q_len, dtype=jnp.int32).at[starts].set(1)
+        batch_ids = jnp.cumsum(indicators) - 1
 
-        # Compute attention weights and output
-        orig_dtype = scores.dtype
-        attn_weights = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(orig_dtype)
-        attn_weights = self.dropout(attn_weights, deterministic=deterministic)
+        q_pos = jnp.arange(q_len) - starts[batch_ids]
+        k_pos = jnp.arange(k_len) - starts[batch_ids]
+        rel_pos = k_pos[None, :] - q_pos[:, None]
 
-        v_f32 = v.astype(jnp.float32)
-        attn_output = jnp.matmul(attn_weights, v_f32)
+        buckets = relative_position_bucket(
+            rel_pos,
+            bidirectional=(not self.is_decoder),
+            num_buckets=self.num_buckets,
+            max_distance=self.max_distance,
+        )
+        return jnp.transpose(self.rel_bias(buckets), (2, 0, 1))
 
-        attn_output = jnp.transpose(attn_output, (0, 2, 1, 3))
-        attn_output = attn_output.reshape(batch_size, seq_length, self.inner_dim)
 
-        output, _ = self.o(attn_output)
-        return output
+# =============================================================================
+# Transformer Block & Stack
+# =============================================================================
 
 
 class UMT5Block(nnx.Module):
-    """
-    Transformer block for UMT5.
-    Includes self-attention, cross-attention (decoder only), and feed-forward sublayers.
-    """
+    """UMT5 transformer block."""
 
-    def __init__(
-        self,
-        config: UMT5Config,
-        mesh: jax.sharding.Mesh,
-        dtype: jnp.dtype = jnp.bfloat16,
-        layer_idx: int = 0,
-        is_decoder: bool = False,
-    ):
+    def __init__(self, config: UMT5Config, mesh, dtype=jnp.bfloat16, layer_idx=0, is_decoder=False):
         self.is_decoder = is_decoder
 
-        # Self Attention sublayer
-        self.input_layernorm = RMSNorm(
+        # Self attention
+        self.ln1 = RMSNorm(
             config.d_model,
             epsilon=config.layer_norm_epsilon,
             dtype=dtype,
             param_dtype=dtype,
             use_scale=True,
         )
-        self.self_attn = UMT5Attention(
-            config,
-            mesh,
-            dtype=dtype,
-            layer_idx=layer_idx,
-            is_cross_attention=False,
-            is_decoder=is_decoder,
-        )
-        self.self_attn_dropout = nnx.Dropout(config.dropout_rate)
+        self.self_attn = UMT5Attention(config, mesh, dtype, layer_idx, False, is_decoder)
+        self.drop1 = nnx.Dropout(config.dropout_rate)
 
-        # Cross Attention sublayer (Decoder only)
-        if self.is_decoder:
-            self.cross_attention_layernorm = RMSNorm(
+        # Cross attention (decoder only)
+        if is_decoder:
+            self.ln_cross = RMSNorm(
                 config.d_model,
                 epsilon=config.layer_norm_epsilon,
                 dtype=dtype,
                 param_dtype=dtype,
                 use_scale=True,
             )
-            self.cross_attn = UMT5Attention(
-                config,
-                mesh,
-                dtype=dtype,
-                layer_idx=layer_idx,
-                is_cross_attention=True,
-                is_decoder=is_decoder,
-            )
-            self.cross_attn_dropout = nnx.Dropout(config.dropout_rate)
+            self.cross_attn = UMT5Attention(config, mesh, dtype, layer_idx, True, is_decoder)
+            self.drop_cross = nnx.Dropout(config.dropout_rate)
 
-        # Feed Forward sublayer
-        self.post_attention_layernorm = RMSNorm(
+        # FFN
+        self.ln2 = RMSNorm(
             config.d_model,
             epsilon=config.layer_norm_epsilon,
             dtype=dtype,
             param_dtype=dtype,
             use_scale=True,
         )
+        self.mlp = UMT5FFN(config, mesh, dtype)
+        self.drop2 = nnx.Dropout(config.dropout_rate)
 
-        if config.is_gated_act:
-            self.mlp = UMT5DenseGatedActDense(config, mesh, dtype=dtype)
-        else:
-            self.mlp = UMT5DenseActDense(config, mesh, dtype=dtype)
-
-        self.mlp_dropout = nnx.Dropout(config.dropout_rate)
-
-    def __call__(
-        self,
-        hidden_states: jax.Array,
-        mask: jax.Array | None = None,
-        deterministic: bool = True,
-        forward_batch: ForwardBatch | None = None,
-        token_to_kv_pool: KVCache | None = None,
-    ) -> jax.Array:
-
-        # Self Attention block
-        normed_hidden_states = self.input_layernorm(hidden_states)
-        attn_output = self.self_attn(
-            normed_hidden_states,
-            mask=mask,
-            deterministic=deterministic,
-            forward_batch=forward_batch,
+    def __call__(self, x, forward_batch: ForwardBatch, token_to_kv_pool=None, deterministic=True):
+        # Self attention
+        h = self.self_attn(
+            self.ln1(x),
+            forward_batch,
             token_to_kv_pool=token_to_kv_pool,
+            deterministic=deterministic,
         )
-        attn_output = self.self_attn_dropout(attn_output, deterministic=deterministic)
-        hidden_states = hidden_states + attn_output
-        hidden_states = fp16_clamp(hidden_states)
+        x = fp16_clamp(x + self.drop1(h, deterministic=deterministic))
 
-        # Cross Attention block (Decoder Only)
-        if self.is_decoder:
-            encoder_hidden_states = None
-            encoder_mask = None
-            if forward_batch is not None:
-                encoder_hidden_states = getattr(forward_batch, "encoder_hidden_states", None)
-                encoder_mask = getattr(forward_batch, "encoder_mask", None)
+        # Cross attention
+        if (
+            self.is_decoder
+            and (enc_h := getattr(forward_batch, "encoder_hidden_states", None)) is not None
+        ):
+            h = self.cross_attn(self.ln_cross(x), forward_batch, enc_h, deterministic=deterministic)
+            x = fp16_clamp(x + self.drop_cross(h, deterministic=deterministic))
 
-            if encoder_hidden_states is not None:
-                normed_hidden_states = self.cross_attention_layernorm(hidden_states)
-                attn_output = self.cross_attn(
-                    normed_hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                    encoder_mask=encoder_mask,
-                    deterministic=deterministic,
-                )
-                attn_output = self.cross_attn_dropout(attn_output, deterministic=deterministic)
-                hidden_states = hidden_states + attn_output
-                hidden_states = fp16_clamp(hidden_states)
-
-        # Feed Forward block
-        normed_hidden_states = self.post_attention_layernorm(hidden_states)
-        mlp_output = self.mlp(normed_hidden_states, deterministic=deterministic)
-        mlp_output = self.mlp_dropout(mlp_output, deterministic=deterministic)
-        hidden_states = hidden_states + mlp_output
-        hidden_states = fp16_clamp(hidden_states)
-
-        return hidden_states
+        # FFN
+        h = self.mlp(self.ln2(x), deterministic=deterministic)
+        return fp16_clamp(x + self.drop2(h, deterministic=deterministic))
 
 
 class UMT5Stack(nnx.Module):
-    """Stack of UMT5 transformer blocks (encoder or decoder)."""
+    """Stack of UMT5 transformer blocks."""
 
-    def __init__(
-        self,
-        config: UMT5Config,
-        mesh: jax.sharding.Mesh,
-        dtype: jnp.dtype = jnp.bfloat16,
-    ):
+    def __init__(self, config: UMT5Config, mesh, dtype=jnp.bfloat16):
         self.is_decoder = config.is_decoder
-
-        self.block = nnx.List(
-            [
-                UMT5Block(
-                    config,
-                    mesh,
-                    dtype=dtype,
-                    layer_idx=i,
-                    is_decoder=self.is_decoder,
-                )
-                for i in range(config.num_layers)
-            ]
+        self.blocks = nnx.List(
+            [UMT5Block(config, mesh, dtype, i, config.is_decoder) for i in range(config.num_layers)]
         )
-
-        self.final_layer_norm = RMSNorm(
+        self.final_ln = RMSNorm(
             config.d_model,
             epsilon=config.layer_norm_epsilon,
             dtype=dtype,
@@ -555,47 +406,23 @@ class UMT5Stack(nnx.Module):
         )
         self.dropout = nnx.Dropout(config.dropout_rate)
 
-    def __call__(
-        self,
-        hidden_states: jax.Array,
-        mask: jax.Array | None = None,
-        deterministic: bool = True,
-        forward_batch: ForwardBatch | None = None,
-        token_to_kv_pool: KVCache | None = None,
-    ) -> jax.Array:
-        # Initial dropout on embeddings
-        hidden_states = self.dropout(hidden_states, deterministic=deterministic)
+    def __call__(self, x, forward_batch: ForwardBatch, token_to_kv_pool=None, deterministic=True):
+        x = self.dropout(x, deterministic=deterministic)
+        for block in self.blocks:
+            x = block(x, forward_batch, token_to_kv_pool, deterministic)
+        return self.dropout(fp16_clamp(self.final_ln(x)), deterministic=deterministic)
 
-        # Pass through all transformer blocks
-        for block in self.block:
-            hidden_states = block(
-                hidden_states,
-                mask=mask,
-                deterministic=deterministic,
-                forward_batch=forward_batch,
-                token_to_kv_pool=token_to_kv_pool,
-            )
 
-        # Final layer norm and dropout
-        hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = fp16_clamp(hidden_states)
-        hidden_states = self.dropout(hidden_states, deterministic=deterministic)
-        return hidden_states
+# =============================================================================
+# Model Classes
+# =============================================================================
 
 
 class UMT5EncoderModel(nnx.Module):
     """UMT5 encoder-only model."""
 
-    def __init__(
-        self,
-        config: UMT5Config,
-        mesh: jax.sharding.Mesh,
-        dtype: jnp.dtype = jnp.bfloat16,
-    ):
-        self.config = config
-        self.mesh = mesh
-        self.dtype = dtype
-
+    def __init__(self, config: UMT5Config, mesh, dtype=jnp.bfloat16):
+        self.config, self.mesh, self.dtype = config, mesh, dtype
         self.shared = Embed(
             config.vocab_size,
             config.d_model,
@@ -604,123 +431,52 @@ class UMT5EncoderModel(nnx.Module):
             mesh=mesh,
             kernel_axes=("tensor", None),
         )
-
-        self.encoder = UMT5Stack(config, mesh, dtype=dtype)
+        self.encoder = UMT5Stack(config, mesh, dtype)
 
     def load_weights(self, model_config: ModelConfig):
-        """Load weights from HuggingFace checkpoint."""
         import glob
         import os
 
-        original_path = model_config.model_path
-        is_local_path = os.path.isabs(original_path)
+        path = model_config.model_path
+        if (
+            os.path.isabs(path)
+            and os.path.exists(path)
+            and not glob.glob(os.path.join(path, "*.safetensors"))
+            and os.path.exists(os.path.join(path, "text_encoder"))
+        ):
+            model_config.model_path = os.path.join(path, "text_encoder")
 
-        if is_local_path and os.path.exists(original_path):
-            has_safetensors = len(glob.glob(os.path.join(original_path, "*.safetensors"))) > 0
-            has_text_encoder = os.path.exists(os.path.join(original_path, "text_encoder"))
+        loader = WeightLoader(self, model_config, self.mesh, self.dtype)
+        loader.load_weights_from_safetensors(self._weight_mappings())
 
-            if not has_safetensors and has_text_encoder:
-                model_config.model_path = os.path.join(original_path, "text_encoder")
-
-        loader = WeightLoader(
-            model=self,
-            model_config=model_config,
-            mesh=self.mesh,
-            dtype=self.dtype,
-        )
-        weight_mappings = self._create_weight_mappings()
-        loader.load_weights_from_safetensors(weight_mappings)
-
-    def _create_weight_mappings(self) -> dict:
-        """Create mappings from HuggingFace weight names to JAX model parameters."""
-        mappings = {
-            "shared.weight": WeightMapping(
-                target_path="shared.embedding",
-                sharding=("tensor", None),
-                transpose=False,
-            ),
+    def _weight_mappings(self):
+        m = {
+            "shared.weight": WeightMapping("shared.embedding", ("tensor", None), False),
             "encoder.final_layer_norm.weight": WeightMapping(
-                target_path="encoder.final_layer_norm.scale",
-                sharding=(None,),
-                transpose=False,
+                "encoder.final_ln.scale", (None,), False
             ),
         }
+        for i in range(self.config.num_layers):
+            m.update(_block_mappings(self.config, i, False, "encoder.block", "encoder.blocks"))
+        return m
 
-        for layer_idx in range(self.config.num_layers):
-            mappings.update(
-                _create_block_mapping_helper(
-                    self.config, layer_idx, is_decoder=False, prefix="encoder.block"
-                )
-            )
-        return mappings
-
-    def __call__(
-        self,
-        forward_batch: ForwardBatch,
-        token_to_kv_pool: Any | None = None,
-        logits_metadata: LogitsMetadata | None = None,
-    ):
-        x = forward_batch.input_ids
-        mask = getattr(forward_batch, "attention_mask", None)
-
-        # Reshape 1D input_ids to (batch_size, seq_len) for Encoder
-        if x.ndim == 1 and hasattr(forward_batch, "req_pool_indices"):
-            bs = forward_batch.req_pool_indices.shape[0]
-            total_tokens = x.shape[0]
-            if total_tokens % bs == 0:
-                seq_len = total_tokens // bs
-                x = x.reshape(bs, seq_len)
-                # Reshape mask to match input_ids if it exists
-                if mask is not None and mask.ndim == 1:
-                    mask = mask.reshape(bs, seq_len)
-
+    def __call__(self, forward_batch: ForwardBatch, token_to_kv_pool=None, logits_metadata=None):
+        x = self.shared(forward_batch.input_ids)
         deterministic = getattr(forward_batch, "deterministic", True)
+        hidden = self.encoder(x, forward_batch, token_to_kv_pool, deterministic)
 
-        hidden_states = self.shared(x)
-
-        hidden_states = self.encoder(
-            hidden_states,
-            mask=mask,
-            deterministic=deterministic,
-            forward_batch=forward_batch,
-            token_to_kv_pool=token_to_kv_pool,
-        )
-
-        # Create dummy logits to satisfy sampler interface
-        bs = (
-            forward_batch.req_pool_indices.shape[0]
-            if hasattr(forward_batch, "req_pool_indices")
-            else x.shape[0]
-        )
-        dummy_logits = jnp.zeros((bs, self.config.vocab_size), dtype=self.dtype)
-
-        # Apply tensor-parallel sharding
-        sharding = NamedSharding(self.mesh, P(None, "tensor"))
-        dummy_logits = jax.device_put(dummy_logits, sharding)
-
-        return (
-            LogitsProcessorOutput(
-                next_token_logits=dummy_logits,
-                hidden_states=hidden_states,
-            ),
-            [],
-            [],
-        )
+        # Dummy logits for interface compatibility
+        bs = forward_batch.seq_lens.shape[0]
+        dummy = jnp.zeros((bs, self.config.vocab_size), dtype=self.dtype)
+        dummy = jax.device_put(dummy, NamedSharding(self.mesh, P(None, "tensor")))
+        return LogitsProcessorOutput(next_token_logits=dummy, hidden_states=hidden), [], []
 
 
 class UMT5DecoderModel(nnx.Module):
     """UMT5 decoder-only model."""
 
-    def __init__(
-        self,
-        config: UMT5Config,
-        mesh: jax.sharding.Mesh,
-        dtype: jnp.dtype = jnp.bfloat16,
-    ):
-        self.config = config
-        self.mesh = mesh
-        self.dtype = dtype
-
+    def __init__(self, config: UMT5Config, mesh, dtype=jnp.bfloat16):
+        self.config, self.mesh, self.dtype = config, mesh, dtype
         self.shared = Embed(
             config.vocab_size,
             config.d_model,
@@ -729,82 +485,37 @@ class UMT5DecoderModel(nnx.Module):
             mesh=mesh,
             kernel_axes=("tensor", None),
         )
-
-        decoder_config = copy.deepcopy(config)
-        decoder_config.is_decoder = True
-        decoder_config.num_layers = config.num_decoder_layers
-        self.decoder = UMT5Stack(decoder_config, mesh, dtype=dtype)
+        dec_cfg = copy.deepcopy(config)
+        dec_cfg.is_decoder = True
+        dec_cfg.num_layers = config.num_decoder_layers
+        self.decoder = UMT5Stack(dec_cfg, mesh, dtype)
 
     def load_weights(self, model_config: ModelConfig):
-        """Load weights from HuggingFace checkpoint."""
-        loader = WeightLoader(
-            model=self,
-            model_config=model_config,
-            mesh=self.mesh,
-            dtype=self.dtype,
-        )
-        weight_mappings = self._create_weight_mappings()
-        loader.load_weights_from_safetensors(weight_mappings)
+        loader = WeightLoader(self, model_config, self.mesh, self.dtype)
+        loader.load_weights_from_safetensors(self._weight_mappings())
 
-    def _create_weight_mappings(self) -> dict:
-        """Create weight mappings for decoder model."""
-        mappings = {
-            "shared.weight": WeightMapping(
-                target_path="shared.embedding",
-                sharding=("tensor", None),
-                transpose=False,
-            ),
+    def _weight_mappings(self):
+        m = {
+            "shared.weight": WeightMapping("shared.embedding", ("tensor", None), False),
             "decoder.final_layer_norm.weight": WeightMapping(
-                target_path="decoder.final_layer_norm.scale",
-                sharding=(None,),
-                transpose=False,
+                "decoder.final_ln.scale", (None,), False
             ),
         }
+        for i in range(self.config.num_decoder_layers):
+            m.update(_block_mappings(self.config, i, True, "decoder.block", "decoder.blocks"))
+        return m
 
-        for layer_idx in range(self.config.num_decoder_layers):
-            mappings.update(
-                _create_block_mapping_helper(
-                    self.config, layer_idx, is_decoder=True, prefix="decoder.block"
-                )
-            )
-
-        return mappings
-
-    def __call__(
-        self,
-        forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache | None = None,
-    ):
-        x = forward_batch.input_ids
+    def __call__(self, forward_batch: ForwardBatch, token_to_kv_pool=None):
+        x = self.shared(forward_batch.input_ids)
         deterministic = getattr(forward_batch, "deterministic", True)
-
-        hidden_states = self.shared(x)
-
-        mask = getattr(forward_batch, "attention_mask", None)
-
-        hidden_states = self.decoder(
-            hidden_states,
-            mask=mask,
-            forward_batch=forward_batch,
-            token_to_kv_pool=token_to_kv_pool,
-            deterministic=deterministic,
-        )
-        return hidden_states
+        return self.decoder(x, forward_batch, token_to_kv_pool, deterministic)
 
 
 class UMT5Model(nnx.Module):
-    """UMT5 encoder-decoder model (without LM head)."""
+    """UMT5 encoder-decoder model."""
 
-    def __init__(
-        self,
-        config: UMT5Config,
-        mesh: jax.sharding.Mesh,
-        dtype: jnp.dtype = jnp.bfloat16,
-    ):
-        self.config = config
-        self.mesh = mesh
-        self.dtype = dtype
-
+    def __init__(self, config: UMT5Config, mesh, dtype=jnp.bfloat16):
+        self.config, self.mesh, self.dtype = config, mesh, dtype
         self.shared = Embed(
             config.vocab_size,
             config.d_model,
@@ -814,114 +525,63 @@ class UMT5Model(nnx.Module):
             kernel_axes=("tensor", None),
         )
 
-        encoder_config = copy.deepcopy(config)
-        encoder_config.is_decoder = False
-        self.encoder = UMT5Stack(encoder_config, mesh, dtype=dtype)
+        enc_cfg = copy.deepcopy(config)
+        enc_cfg.is_decoder = False
+        self.encoder = UMT5Stack(enc_cfg, mesh, dtype)
 
-        decoder_config = copy.deepcopy(config)
-        decoder_config.is_decoder = True
-        decoder_config.num_layers = config.num_decoder_layers
-        self.decoder = UMT5Stack(decoder_config, mesh, dtype=dtype)
+        dec_cfg = copy.deepcopy(config)
+        dec_cfg.is_decoder = True
+        dec_cfg.num_layers = config.num_decoder_layers
+        self.decoder = UMT5Stack(dec_cfg, mesh, dtype)
 
     def load_weights(self, model_config: ModelConfig):
-        """Load weights from HuggingFace checkpoint."""
-        loader = WeightLoader(
-            model=self,
-            model_config=model_config,
-            mesh=self.mesh,
-            dtype=self.dtype,
-        )
-        weight_mappings = self._create_weight_mappings()
-        loader.load_weights_from_safetensors(weight_mappings)
+        loader = WeightLoader(self, model_config, self.mesh, self.dtype)
+        loader.load_weights_from_safetensors(self._weight_mappings())
 
-    def _create_weight_mappings(self) -> dict:
-        """Create mappings from HuggingFace weight names to JAX model parameters."""
-        mappings = {
-            "shared.weight": WeightMapping(
-                target_path="shared.embedding",
-                sharding=("tensor", None),
-                transpose=False,
-            ),
+    def _weight_mappings(self):
+        m = {
+            "shared.weight": WeightMapping("shared.embedding", ("tensor", None), False),
             "encoder.final_layer_norm.weight": WeightMapping(
-                target_path="encoder.final_layer_norm.scale",
-                sharding=(None,),
-                transpose=False,
+                "encoder.final_ln.scale", (None,), False
             ),
             "decoder.final_layer_norm.weight": WeightMapping(
-                target_path="decoder.final_layer_norm.scale",
-                sharding=(None,),
-                transpose=False,
+                "decoder.final_ln.scale", (None,), False
             ),
         }
+        for i in range(self.config.num_layers):
+            m.update(_block_mappings(self.config, i, False, "encoder.block", "encoder.blocks"))
+        for i in range(self.config.num_decoder_layers):
+            m.update(_block_mappings(self.config, i, True, "decoder.block", "decoder.blocks"))
+        return m
 
-        for layer_idx in range(self.config.num_layers):
-            mappings.update(
-                _create_block_mapping_helper(
-                    self.config, layer_idx, is_decoder=False, prefix="encoder.block"
-                )
-            )
-
-        for layer_idx in range(self.config.num_decoder_layers):
-            mappings.update(
-                _create_block_mapping_helper(
-                    self.config, layer_idx, is_decoder=True, prefix="decoder.block"
-                )
-            )
-
-        return mappings
-
-    def __call__(
-        self,
-        forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache | None = None,
-    ):
-        input_ids = forward_batch.input_ids
-        attention_mask = getattr(forward_batch, "attention_mask", None)
+    def __call__(self, forward_batch: ForwardBatch, token_to_kv_pool=None):
         deterministic = getattr(forward_batch, "deterministic", True)
 
-        # Encoder pass
-        encoder_hidden_states = self.shared(input_ids)
-        encoder_hidden_states = self.encoder(
-            encoder_hidden_states,
-            mask=attention_mask,
-            deterministic=deterministic,
-            forward_batch=forward_batch,
+        # Encoder pass - save state immediately
+        enc_h = self.encoder(
+            self.shared(forward_batch.input_ids), forward_batch, None, deterministic
         )
-
-        # Decoder pass
-        decoder_input_ids = getattr(forward_batch, "decoder_input_ids", input_ids)
-
-        decoder_hidden_states = self.shared(decoder_input_ids)
-
-        decoder_attention_mask = getattr(forward_batch, "decoder_attention_mask", attention_mask)
-
-        decoder_hidden_states = self.decoder(
-            decoder_hidden_states,
-            mask=decoder_attention_mask,
-            forward_batch=forward_batch,
-            token_to_kv_pool=token_to_kv_pool,
-            deterministic=deterministic,
+        forward_batch.encoder_seq_lens = getattr(
+            forward_batch, "extend_seq_lens", forward_batch.seq_lens
         )
+        forward_batch.encoder_hidden_states = enc_h
 
-        return decoder_hidden_states
+        # Decoder pass - update seq_lens if needed
+        dec_ids = getattr(forward_batch, "decoder_input_ids", forward_batch.input_ids)
+        if (
+            hasattr(forward_batch, "decoder_input_ids")
+            and forward_batch.decoder_input_ids is not forward_batch.input_ids
+        ):
+            update_decoder_seq_lens(forward_batch, dec_ids)
+
+        return self.decoder(self.shared(dec_ids), forward_batch, token_to_kv_pool, deterministic)
 
 
 class UMT5ForConditionalGeneration(nnx.Module):
-    """
-    UMT5 for conditional generation with LM head.
-    Supports SGLang inference mode.
-    """
+    """UMT5 for conditional generation with LM head."""
 
-    def __init__(
-        self,
-        config: UMT5Config,
-        mesh: jax.sharding.Mesh,
-        dtype: jnp.dtype = jnp.bfloat16,
-    ):
-        self.config = config
-        self.mesh = mesh
-        self.dtype = dtype
-
+    def __init__(self, config: UMT5Config, mesh, dtype=jnp.bfloat16):
+        self.config, self.mesh, self.dtype = config, mesh, dtype
         self.shared = Embed(
             config.vocab_size,
             config.d_model,
@@ -931,14 +591,14 @@ class UMT5ForConditionalGeneration(nnx.Module):
             kernel_axes=("tensor", None),
         )
 
-        encoder_config = copy.deepcopy(config)
-        encoder_config.is_decoder = False
-        self.encoder = UMT5Stack(encoder_config, mesh, dtype=dtype)
+        enc_cfg = copy.deepcopy(config)
+        enc_cfg.is_decoder = False
+        self.encoder = UMT5Stack(enc_cfg, mesh, dtype)
 
-        decoder_config = copy.deepcopy(config)
-        decoder_config.is_decoder = True
-        decoder_config.num_layers = config.num_decoder_layers
-        self.decoder = UMT5Stack(decoder_config, mesh, dtype=dtype)
+        dec_cfg = copy.deepcopy(config)
+        dec_cfg.is_decoder = True
+        dec_cfg.num_layers = config.num_decoder_layers
+        self.decoder = UMT5Stack(dec_cfg, mesh, dtype)
 
         self.lm_head = ParallelLMHead(
             config.vocab_size,
@@ -948,244 +608,142 @@ class UMT5ForConditionalGeneration(nnx.Module):
             kernel_axes=("tensor", None),
             mesh=mesh,
         )
-
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=mesh)
 
     def load_weights(self, model_config: ModelConfig):
-        """Load weights from HuggingFace checkpoint."""
-        loader = WeightLoader(
-            model=self,
-            model_config=model_config,
-            mesh=self.mesh,
-            dtype=self.dtype,
-        )
-        weight_mappings = self._create_weight_mappings()
-        loader.load_weights_from_safetensors(weight_mappings)
+        loader = WeightLoader(self, model_config, self.mesh, self.dtype)
+        loader.load_weights_from_safetensors(self._weight_mappings())
 
-    def _create_weight_mappings(self) -> dict:
-        """Create mappings from HuggingFace weight names to JAX model parameters."""
-        mappings = {
-            "shared.weight": WeightMapping(
-                target_path="shared.embedding",
-                sharding=("tensor", None),
-                transpose=False,
-            ),
+    def _weight_mappings(self):
+        m = {
+            "shared.weight": WeightMapping("shared.embedding", ("tensor", None), False),
             "encoder.final_layer_norm.weight": WeightMapping(
-                target_path="encoder.final_layer_norm.scale",
-                sharding=(None,),
-                transpose=False,
+                "encoder.final_ln.scale", (None,), False
             ),
             "decoder.final_layer_norm.weight": WeightMapping(
-                target_path="decoder.final_layer_norm.scale",
-                sharding=(None,),
-                transpose=False,
+                "decoder.final_ln.scale", (None,), False
             ),
-            "lm_head.weight": WeightMapping(
-                target_path="lm_head.embedding",
-                sharding=("tensor", None),
-                transpose=False,
-            ),
+            "lm_head.weight": WeightMapping("lm_head.embedding", ("tensor", None), False),
         }
+        for i in range(self.config.num_layers):
+            m.update(_block_mappings(self.config, i, False, "encoder.block", "encoder.blocks"))
+        for i in range(self.config.num_decoder_layers):
+            m.update(_block_mappings(self.config, i, True, "decoder.block", "decoder.blocks"))
+        return m
 
-        for layer_idx in range(self.config.num_layers):
-            mappings.update(
-                _create_block_mapping_helper(
-                    self.config, layer_idx, is_decoder=False, prefix="encoder.block"
-                )
-            )
-
-        for layer_idx in range(self.config.num_decoder_layers):
-            mappings.update(
-                _create_block_mapping_helper(
-                    self.config, layer_idx, is_decoder=True, prefix="decoder.block"
-                )
-            )
-
-        return mappings
-
-    def __call__(
-        self,
-        forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache | None = None,
-        logits_metadata: LogitsMetadata | None = None,
-    ):
-        """
-        Forward pass for SGLang inference mode.
-        """
-        batch_input_ids = forward_batch.input_ids
+    def __call__(self, forward_batch: ForwardBatch, token_to_kv_pool=None, logits_metadata=None):
         deterministic = getattr(forward_batch, "deterministic", True)
 
-        # Decoder forward pass
-        decoder_embeds = self.shared(batch_input_ids)
+        # Encoder pass (cache if needed)
+        if (
+            not hasattr(forward_batch, "encoder_hidden_states")
+            or forward_batch.encoder_hidden_states is None
+        ):
+            enc_h = self.shared(forward_batch.input_ids)
+            enc_h = self.encoder(enc_h, forward_batch, None, deterministic)
+            forward_batch.encoder_seq_lens = getattr(
+                forward_batch, "extend_seq_lens", forward_batch.seq_lens
+            )
+            forward_batch.encoder_hidden_states = enc_h
 
-        mask = getattr(forward_batch, "attention_mask", None)
+        # Decoder pass
+        dec_ids = getattr(forward_batch, "decoder_input_ids", forward_batch.input_ids)
 
-        decoder_hidden_states = self.decoder(
-            decoder_embeds,
-            mask=mask,
-            forward_batch=forward_batch,
-            token_to_kv_pool=token_to_kv_pool,
-            deterministic=deterministic,
-        )
+        if (
+            hasattr(forward_batch, "decoder_input_ids")
+            and forward_batch.decoder_input_ids is not forward_batch.input_ids
+        ):
+            update_decoder_seq_lens(forward_batch, dec_ids)
 
-        # Compute logits
+        dec_h = self.decoder(self.shared(dec_ids), forward_batch, token_to_kv_pool, deterministic)
+
         if logits_metadata is not None:
-            logits = self.logits_processor(decoder_hidden_states, self.lm_head, logits_metadata)
+            logits = self.logits_processor(dec_h, self.lm_head, logits_metadata)
         else:
-            lm_head_weights = self.lm_head.embedding[...]
-            logits = jnp.matmul(decoder_hidden_states, lm_head_weights.T)
-
-        # Return format for SGLang runtime
-        layers_kv_fused = []
-        layers_callback_flag = []
-        return logits, layers_kv_fused, layers_callback_flag
+            logits = jnp.matmul(dec_h, self.lm_head.embedding[...].T)
+        return logits, [], []
 
 
-def _create_block_mapping_helper(
-    config: UMT5Config, layer_idx: int, is_decoder: bool, prefix: str
-) -> dict:
-    """
-    Create weight mappings for a single transformer block.
+# =============================================================================
+# Weight Mapping Helper
+# =============================================================================
 
-    Args:
-        config: UMT5 config
-        layer_idx: Layer index
-        is_decoder: True for decoder blocks
-        prefix: Weight name prefix (e.g., "encoder.block")
 
-    Returns:
-        Weight mapping dict
-    """
-    target_prefix = prefix + f".{layer_idx}"
-    source_prefix = prefix + f".{layer_idx}"
-
-    mappings = {}
-
-    # Layer 0: Self Attention
-    mappings.update(
-        {
-            f"{source_prefix}.layer.0.layer_norm.weight": WeightMapping(
-                target_path=f"{target_prefix}.input_layernorm.scale",
-                sharding=(None,),
-                transpose=False,
-            ),
-            f"{source_prefix}.layer.0.SelfAttention.q.weight": WeightMapping(
-                target_path=f"{target_prefix}.self_attn.q.weight",
-                sharding=(None, "tensor"),
-                transpose=True,
-            ),
-            f"{source_prefix}.layer.0.SelfAttention.k.weight": WeightMapping(
-                target_path=f"{target_prefix}.self_attn.k.weight",
-                sharding=(None, "tensor"),
-                transpose=True,
-            ),
-            f"{source_prefix}.layer.0.SelfAttention.v.weight": WeightMapping(
-                target_path=f"{target_prefix}.self_attn.v.weight",
-                sharding=(None, "tensor"),
-                transpose=True,
-            ),
-            f"{source_prefix}.layer.0.SelfAttention.o.weight": WeightMapping(
-                target_path=f"{target_prefix}.self_attn.o.weight",
-                sharding=("tensor", None),
-                transpose=True,
-            ),
-        }
-    )
-
-    # Relative attention bias (loaded for all layers from HF checkpoint)
-    mappings[f"{source_prefix}.layer.0.SelfAttention.relative_attention_bias.weight"] = (
-        WeightMapping(
-            target_path=f"{target_prefix}.self_attn.relative_attention_bias.embedding",
-            sharding=(None, "tensor"),
-            transpose=False,
-        )
-    )
+def _block_mappings(config, idx, is_decoder, src_prefix, tgt_prefix):
+    """Generate weight mappings for a transformer block."""
+    s, t = f"{src_prefix}.{idx}", f"{tgt_prefix}.{idx}"
+    m = {
+        f"{s}.layer.0.layer_norm.weight": WeightMapping(f"{t}.ln1.scale", (None,), False),
+        f"{s}.layer.0.SelfAttention.q.weight": WeightMapping(
+            f"{t}.self_attn.q.weight", (None, "tensor"), True
+        ),
+        f"{s}.layer.0.SelfAttention.k.weight": WeightMapping(
+            f"{t}.self_attn.k.weight", (None, "tensor"), True
+        ),
+        f"{s}.layer.0.SelfAttention.v.weight": WeightMapping(
+            f"{t}.self_attn.v.weight", (None, "tensor"), True
+        ),
+        f"{s}.layer.0.SelfAttention.o.weight": WeightMapping(
+            f"{t}.self_attn.o.weight", ("tensor", None), True
+        ),
+        f"{s}.layer.0.SelfAttention.relative_attention_bias.weight": WeightMapping(
+            f"{t}.self_attn.rel_bias.embedding", (None, "tensor"), False
+        ),
+    }
 
     if is_decoder:
-        # Layer 1: Cross Attention (Decoder only)
-        mappings.update(
+        m.update(
             {
-                f"{source_prefix}.layer.1.layer_norm.weight": WeightMapping(
-                    target_path=f"{target_prefix}.cross_attention_layernorm.scale",
-                    sharding=(None,),
-                    transpose=False,
+                f"{s}.layer.1.layer_norm.weight": WeightMapping(
+                    f"{t}.ln_cross.scale", (None,), False
                 ),
-                f"{source_prefix}.layer.1.EncDecAttention.q.weight": WeightMapping(
-                    target_path=f"{target_prefix}.cross_attn.q.weight",
-                    sharding=(None, "tensor"),
-                    transpose=True,
+                f"{s}.layer.1.EncDecAttention.q.weight": WeightMapping(
+                    f"{t}.cross_attn.q.weight", (None, "tensor"), True
                 ),
-                f"{source_prefix}.layer.1.EncDecAttention.k.weight": WeightMapping(
-                    target_path=f"{target_prefix}.cross_attn.k.weight",
-                    sharding=(None, "tensor"),
-                    transpose=True,
+                f"{s}.layer.1.EncDecAttention.k.weight": WeightMapping(
+                    f"{t}.cross_attn.k.weight", (None, "tensor"), True
                 ),
-                f"{source_prefix}.layer.1.EncDecAttention.v.weight": WeightMapping(
-                    target_path=f"{target_prefix}.cross_attn.v.weight",
-                    sharding=(None, "tensor"),
-                    transpose=True,
+                f"{s}.layer.1.EncDecAttention.v.weight": WeightMapping(
+                    f"{t}.cross_attn.v.weight", (None, "tensor"), True
                 ),
-                f"{source_prefix}.layer.1.EncDecAttention.o.weight": WeightMapping(
-                    target_path=f"{target_prefix}.cross_attn.o.weight",
-                    sharding=("tensor", None),
-                    transpose=True,
+                f"{s}.layer.1.EncDecAttention.o.weight": WeightMapping(
+                    f"{t}.cross_attn.o.weight", ("tensor", None), True
                 ),
             }
         )
-        ffn_layer_idx = 2
+        ffn_idx = 2
     else:
-        ffn_layer_idx = 1
+        ffn_idx = 1
 
-    # FFN Layer
-    mappings.update(
-        {
-            f"{source_prefix}.layer.{ffn_layer_idx}.layer_norm.weight": WeightMapping(
-                target_path=f"{target_prefix}.post_attention_layernorm.scale",
-                sharding=(None,),
-                transpose=False,
-            ),
-        }
-    )
+    m[f"{s}.layer.{ffn_idx}.layer_norm.weight"] = WeightMapping(f"{t}.ln2.scale", (None,), False)
 
-    # FFN weights (gated vs non-gated)
-    dense_cls_name = "mlp"
     if config.is_gated_act:
-        mappings.update(
+        m.update(
             {
-                f"{source_prefix}.layer.{ffn_layer_idx}.DenseReluDense.wi_0.weight": WeightMapping(
-                    target_path=f"{target_prefix}.{dense_cls_name}.wi_0.weight",
-                    sharding=(None, "tensor"),
-                    transpose=True,
+                f"{s}.layer.{ffn_idx}.DenseReluDense.wi_0.weight": WeightMapping(
+                    f"{t}.mlp.wi_0.weight", (None, "tensor"), True
                 ),
-                f"{source_prefix}.layer.{ffn_layer_idx}.DenseReluDense.wi_1.weight": WeightMapping(
-                    target_path=f"{target_prefix}.{dense_cls_name}.wi_1.weight",
-                    sharding=(None, "tensor"),
-                    transpose=True,
+                f"{s}.layer.{ffn_idx}.DenseReluDense.wi_1.weight": WeightMapping(
+                    f"{t}.mlp.wi_1.weight", (None, "tensor"), True
                 ),
-                f"{source_prefix}.layer.{ffn_layer_idx}.DenseReluDense.wo.weight": WeightMapping(
-                    target_path=f"{target_prefix}.{dense_cls_name}.wo.weight",
-                    sharding=("tensor", None),
-                    transpose=True,
+                f"{s}.layer.{ffn_idx}.DenseReluDense.wo.weight": WeightMapping(
+                    f"{t}.mlp.wo.weight", ("tensor", None), True
                 ),
             }
         )
     else:
-        mappings.update(
+        m.update(
             {
-                f"{source_prefix}.layer.{ffn_layer_idx}.DenseReluDense.wi.weight": WeightMapping(
-                    target_path=f"{target_prefix}.{dense_cls_name}.wi.weight",
-                    sharding=(None, "tensor"),
-                    transpose=True,
+                f"{s}.layer.{ffn_idx}.DenseReluDense.wi.weight": WeightMapping(
+                    f"{t}.mlp.wi.weight", (None, "tensor"), True
                 ),
-                f"{source_prefix}.layer.{ffn_layer_idx}.DenseReluDense.wo.weight": WeightMapping(
-                    target_path=f"{target_prefix}.{dense_cls_name}.wo.weight",
-                    sharding=("tensor", None),
-                    transpose=True,
+                f"{s}.layer.{ffn_idx}.DenseReluDense.wo.weight": WeightMapping(
+                    f"{t}.mlp.wo.weight", ("tensor", None), True
                 ),
             }
         )
 
-    return mappings
+    return m
 
 
 EntryClass = [UMT5EncoderModel, UMT5DecoderModel, UMT5Model, UMT5ForConditionalGeneration]
