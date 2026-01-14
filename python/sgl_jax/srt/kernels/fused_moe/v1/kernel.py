@@ -2023,15 +2023,15 @@ def _fused_ep_moe_kernel(
         @pl.when(block_id < se_total_blocks)
         def _():
             bt_start = bt_id * bt
-            num_chunks = bt // bts
-
-            # 注意：不再在外部预取 tokens，因为 buffer 只有 bts 大小，装不下整个 bt
+            # 计算总共需要多少个 bts 块
+            num_chunks = cdiv(bt, bts)
 
             if num_bd1 > 0:
-                # 预取第一个 bd1 块的权重
                 start_fetch_se_w1(0, block_id, 0)
                 start_fetch_se_w3(0, block_id, 0)
 
+            # 初始化 Accumulator (Register/VMEM scratch)
+            # 注意：这里的 init_val 是一个普通的 JAX Array，存在寄存器里
             init_val = jnp.zeros((bt, bse), dtype=jnp.float32)
 
             def body_w1w3(bd1_idx, carry):
@@ -2040,7 +2040,6 @@ def _fused_ep_moe_kernel(
                 next_w_sem = (bd1_idx + 1) % 2
                 next_bd1_idx = bd1_idx + 1
 
-                # --- 权重流水线 (保持不变) ---
                 @pl.when(next_bd1_idx < num_bd1)
                 def _():
                     start_fetch_se_w1(next_w_sem, block_id, next_bd1_idx)
@@ -2049,10 +2048,7 @@ def _fused_ep_moe_kernel(
                 wait_fetch_se_w1(curr_w_sem)
                 wait_fetch_se_w3(curr_w_sem)
 
-                # --- Token 内部循环 (新增) ---
-                # 在计算当前 bd1 块时，分块流式处理 tokens
-
-                # 预取第一个 chunk 的 tokens
+                # --- Token Pipeline Start ---
                 start_fetch_se_tokens_slice(
                     bt_start=bt_start,
                     bt_sem_id=bt_sem_id,
@@ -2067,7 +2063,7 @@ def _fused_ep_moe_kernel(
                     next_buf_id = (chunk_idx + 1) % 2
                     next_chunk_idx = chunk_idx + 1
 
-                    # 1. 预取下一个 token chunk
+                    # 1. Pipeline: Prefetch next tokens
                     @pl.when(next_chunk_idx < num_chunks)
                     def _():
                         start_fetch_se_tokens_slice(
@@ -2078,19 +2074,19 @@ def _fused_ep_moe_kernel(
                             bts_idx=next_chunk_idx,
                         )
 
-                    # 2. 等待当前 token chunk
+                    # 2. Wait current tokens
                     wait_fetch_se_tokens_slice(bt_sem_id=bt_sem_id, buf_id=curr_buf_id)
 
-                    # 3. 计算 (逻辑同原版，但只针对当前的 bts 切片)
+                    # 3. Compute GEMM on small chunk
                     chunk_gate_acc_part = jnp.zeros((bts, bse), dtype=jnp.float32)
                     chunk_up_acc_part = jnp.zeros((bts, bse), dtype=jnp.float32)
 
                     for p_id in range(t_packing):
-                        # 从 VMEM 读取 bts 大小的 tokens
+                        # Pallas Ref 读取使用 pl.ds (这是正确的)
                         t = b_se_tokens_vmem[
                             bt_sem_id,
                             curr_buf_id,
-                            pl.ds(0, bts),  # 使用 bts
+                            pl.ds(0, bts),
                             p_id,
                             pl.ds(0, bd1_per_t_packing),
                         ]
@@ -2118,21 +2114,33 @@ def _fused_ep_moe_kernel(
                         else:
                             chunk_up_acc_part += jnp.dot(t_f32, w3_up.astype(jnp.float32))
 
-                    # 4. 累加到整体的 Accumulator 中
-                    # c_gate_acc 形状是 (bt, bse)，我们只更新对应的 slice
-                    slice_start = chunk_idx * bts
+                    # 4. Update Accumulator (Fixing the error here)
+                    # c_gate_acc 是普通的 JAX Array，使用 lax.dynamic_slice / dynamic_update_slice
+                    slice_start_idx = chunk_idx * bts
 
-                    current_gate_slice = c_gate_acc.at[pl.ds(slice_start, bts)].get()
+                    # [Fix]: 读取旧值
+                    # slice shape: (bts, bse), start_indices: (slice_start_idx, 0)
+                    current_gate_slice = lax.dynamic_slice(
+                        c_gate_acc, (slice_start_idx, 0), (bts, bse)
+                    )
+
+                    # 累加
                     new_gate_slice = current_gate_slice + chunk_gate_acc_part
-                    c_gate_acc = c_gate_acc.at[pl.ds(slice_start, bts)].set(new_gate_slice)
 
-                    current_up_slice = c_up_acc.at[pl.ds(slice_start, bts)].get()
+                    # [Fix]: 写回新值
+                    c_gate_acc = lax.dynamic_update_slice(
+                        c_gate_acc, new_gate_slice, (slice_start_idx, 0)
+                    )
+
+                    # 对 Up 投影做同样的操作
+                    current_up_slice = lax.dynamic_slice(c_up_acc, (slice_start_idx, 0), (bts, bse))
                     new_up_slice = current_up_slice + chunk_up_acc_part
-                    c_up_acc = c_up_acc.at[pl.ds(slice_start, bts)].set(new_up_slice)
+                    c_up_acc = lax.dynamic_update_slice(
+                        c_up_acc, new_up_slice, (slice_start_idx, 0)
+                    )
 
                     return c_gate_acc, c_up_acc
 
-                # 执行内部循环
                 act_gate_acc, act_up_acc = lax.fori_loop(
                     0, num_chunks, run_token_chunk, (act_gate_acc, act_up_acc)
                 )
@@ -2142,7 +2150,7 @@ def _fused_ep_moe_kernel(
             act_gate, act_up = lax.fori_loop(0, num_bd1, body_w1w3, (init_val, init_val))
             act = activation_fn(act_gate, act_up, act_fn)
 
-            # --- 下投影 (W2) 部分 ---
+            # --- W2 Down Projection ---
             if num_bd2 > 0:
                 start_fetch_se_w2(0, block_id, 0)
 
@@ -2157,15 +2165,7 @@ def _fused_ep_moe_kernel(
 
                 wait_fetch_se_w2(curr_w_sem)
 
-                # 对于 W2，我们不需要重新加载 Tokens，因为 'act' (Activation) 已经在寄存器/VMEM 中准备好了
-                # 并且形状是 (bt, bse)。
-                # 只需要遍历 chunk 进行计算以保持各种 slice 操作的一致性，或者直接对整个 bt 计算。
-                # 由于 W2 的计算是 (bt, bse) x (bse, hidden)，通常不需要对 bt 分块，
-                # 除非为了保持 act 的寄存器压力较低。
-                # 但由于 act 已经是 full size，我们可以直接计算，或者为了代码对称性也分块。
-                # 原代码是直接计算整个 bt 的。此处保持原样最简单，因为 buffer 压力主要在输入 tokens。
-
-                # 原逻辑 (保持不变，或根据需要分块):
+                # W2 不需要分块 Token，因为 act 已经在寄存器里了，直接算
                 for p_id in range(t_packing):
                     w2_val = b_se_w2_x2_vmem[curr_w_sem, p_id]
 
@@ -2178,7 +2178,7 @@ def _fused_ep_moe_kernel(
 
                     hidden_offset = p_id * h_per_t_packing + bd2_idx * bd2_per_t_packing
 
-                    # 写入 Output Buffer (它是 bt 大小的，没变)
+                    # Output Buffer 是 Pallas Ref，可以使用 .at[...].set(...)
                     out_slice = b_output_x2_vmem.at[
                         out_buf_id, pl.ds(0, bt), pl.ds(hidden_offset, bd2_per_t_packing)
                     ]
