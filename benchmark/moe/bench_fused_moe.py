@@ -111,9 +111,7 @@ def _estimate_vmem_bytes(
     a2a_s_acc_stage_b32 = 3 * bts * (bd2 // 2) * 4  # Approximation
 
     # Routing / top-k temporaries in kernel (best-effort conservative estimate):
-    # - softmax + get_top_k use float32 work buffers and broadcasted iotas
-    # - top_k logits are materialized as `top_k` arrays of shape (bt, padded_top_k)
-    # This is separate from `t2e_routing_smem` above.
+    # ... (routing temporaries calculation unchanged) ...
     routing_work_f32 = bt * padded_num_experts * 4  # softmax result (approx)
     get_top_k_input_f32 = bt * padded_num_experts * 4
     get_top_k_t2e = bt * padded_num_experts * 4
@@ -154,10 +152,14 @@ def _estimate_vmem_bytes(
         se_w1 = 2 * bd1 * cfg.bse * weight_bytes  # (2, t_packing, bd/pack, bse)
         se_w3 = 2 * bd1 * cfg.bse * weight_bytes
         se_w2 = 2 * cfg.bse * bd2 * weight_bytes
-        # Matches fused_moe kernel scratch shape (bt ping-pong x bd1-slice ping-pong):
-        # (2, 2, bt, t_packing, bd1_per_pack) => 4 * bt * bd1 elements.
-        se_tokens = 4 * bt * bd1 * token_bytes
-        total_bytes += se_w1 + se_w3 + se_w2 + se_tokens
+
+        # b_se_tokens_vmem: (2, 2, bts, t_packing, bd1_per_pack) => 4 * bts * bd1 elements.
+        se_tokens = 4 * bts * bd1 * token_bytes
+
+        # Shape: (bt, bse), F32
+        se_accumulators = 2 * bt * cfg.bse * 4
+
+        total_bytes += se_w1 + se_w3 + se_w2 + se_tokens + se_accumulators
 
     if verbose:
 
@@ -198,8 +200,12 @@ def _estimate_vmem_bytes(
                 f"      b_se_w2_x2_vmem:        {_mb(se_w2)} MB  (2, {t_packing}, {bf}, {bd2 // t_packing})"
             )
             print(
-                f"      b_se_tokens_vmem:       {_mb(se_tokens)} MB  (2, 2, {bt}, {t_packing}, {bd1 // t_packing})"
+                f"      b_se_tokens_vmem:       {_mb(se_tokens)} MB  (2, 2, {bts}, {t_packing}, {bd1 // t_packing})"
             )
+            print(
+                f"      b_se_acc_vmem (x2):     {_mb(se_accumulators)} MB  (2, {bt}, {cfg.bse}) f32"
+            )
+
         print("      ----------------------------")
         print(f"      Total:                  {_mb(total_bytes)} MB")
 
