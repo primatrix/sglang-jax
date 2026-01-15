@@ -230,6 +230,11 @@ class ServerArgs:
             )
             self.chunked_prefill_size = -1
 
+        # Disable radix cache for multimodal mode (e.g., UMT5 Encoder without KV cache)
+        if self.multimodal and not self.disable_radix_cache:
+            logger.info("Multimodal mode enabled, disabling radix cache")
+            self.disable_radix_cache = True
+
         if self.grammar_backend is None:
             self.grammar_backend = "llguidance"
 
