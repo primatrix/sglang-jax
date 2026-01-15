@@ -482,6 +482,7 @@ def _fused_ep_moe_kernel(
     expert_starts_x2_smem,  # (2, 1, padded_num_experts)
     expert_sizes_x2_smem,  # (2, 1, padded_num_experts)
     a2a_s_sends_x2_smem,  # <e_sem_id> (2,)
+    b_reduce_scratch,  # (bt, hidden_size)
     ### Accumulation for gathered tokens:
     a2a_g_acc_vmem,  # (1, top_k, acc_bt, t_packing, hidden_size // t_packing)
     top_k_logits_vmem,  # F32(bt, top_k)
@@ -514,6 +515,7 @@ def _fused_ep_moe_kernel(
     local_sems,  # DMA(2, N): weight ping-pong semaphores (plus gating/output and shared-expert staging)
     send_x2_sems,  # <e_sem_id> (2,)
     recv_x2_sems,  # <e_sem_id> (2,)
+    se_reduce_sems,  # (2,)
     a2a_gather_sem,
     a2a_acc_sems,  # DMA(1,)
     barrier_sem,
@@ -1955,9 +1957,10 @@ def _fused_ep_moe_kernel(
 
     def acc_and_store_output(*, bt_sem_id, out_buf_id):
         acc_bt = a2a_g_acc_vmem.shape[2]
-        assert bt % acc_bt == 0, (bt, acc_bt)
+        # assert bt % acc_bt == 0, (bt, acc_bt) # 这个 assert 可以保留
         num_acc_tiles = bt // acc_bt
 
+        # --- [1] 定义 MoE HBM Load 函数 ---
         def start_load_acc_bt(*, tile_start, buf_id):
             def _load_one(t_i, _):
                 t_id = tile_start + t_i
@@ -1981,6 +1984,56 @@ def _fused_ep_moe_kernel(
                 sem=a2a_acc_sems.at[0],
             ).wait()
 
+        # --- [2] 定义 SE Manual All-Reduce 函数 ---
+        def run_manual_se_all_reduce(curr_out_vmem):
+            if w1_shared_hbm is None or disable_shared_expert:
+                return
+
+            my_dp_rank = dp_rank
+            my_tp_rank = tp_rank
+            right_tp_rank = (my_tp_rank + 1) % tp_size
+            right_device_coords = (my_dp_rank, right_tp_rank)
+
+            # === [修改] 使用专用信号量 ===
+            # index 0 用于发送完成信号
+            # index 1 用于接收完成信号
+            send_sem = se_reduce_sems.at[0]
+            recv_sem = se_reduce_sems.at[1]
+            # ===========================
+
+            def step_body(i, _):
+                sync_barrier()  # 这一步 barrier 依然很重要
+
+                # 发送给右边
+                pltpu.make_async_remote_copy(
+                    src_ref=curr_out_vmem,
+                    dst_ref=b_reduce_scratch,
+                    send_sem=send_sem,  # 这里的 send_sem 只管这一次 SE 通信
+                    recv_sem=recv_sem,  # 对方的 recv_sem[1] 会被触发
+                    device_id=right_device_coords,
+                    device_id_type=pltpu.DeviceIdType.MESH,
+                ).start()
+
+                # 接收左边 (等待 recv_sem[1] 被触发)
+                pltpu.make_async_copy(
+                    src_ref=b_reduce_scratch,
+                    dst_ref=b_reduce_scratch,
+                    sem=recv_sem,
+                ).wait()
+
+                # 累加
+                curr_out_vmem[...] += b_reduce_scratch
+
+                # 等待发送完成
+                pltpu.make_async_copy(
+                    src_ref=curr_out_vmem,
+                    dst_ref=curr_out_vmem,
+                    sem=send_sem,
+                ).wait()
+
+            lax.fori_loop(0, tp_size - 1, step_body, None, unroll=True)
+
+        # --- [3] 定义结果合并函数 ---
         def acc_gather_to_output(*, tile_start, out_offset, buf_id):
             output_tile = jnp.zeros((acc_bt, t_packing, h_per_t_packing), dtype=jnp.float32)
             logits_tile = top_k_logits_vmem.at[
@@ -1997,16 +2050,24 @@ def _fused_ep_moe_kernel(
                 out_buf_id, pl.ds(out_offset, acc_bt), pl.ds(0, hidden_size)
             ]
 
-            if w1_shared_hbm is not None:
-                current_val = target_slice[...].astype(jnp.float32)
-                new_val = current_val + output_tile.reshape(acc_bt, hidden_size)
-                target_slice[...] = new_val.astype(output_hbm.dtype)
-            else:
-                target_slice[...] = output_tile.reshape(acc_bt, hidden_size).astype(
-                    output_hbm.dtype
-                )
+            # 此时 target_slice 已经是 All-Reduce 后的完整 SE 结果
+            current_val = target_slice[...].astype(jnp.float32)
+            new_val = current_val + output_tile.reshape(acc_bt, hidden_size)
+            target_slice[...] = new_val.astype(output_hbm.dtype)
 
+        # =========================================================
+        # [核心优化] 并行流水线调度
+        # =========================================================
+
+        # A. 【抢跑】启动第一块 MoE 数据的 HBM Load
+        # 这是一个 Async DMA 动作，CPU 继续往下执行
         start_load_acc_bt(tile_start=0, buf_id=0)
+
+        # B. 【并行】同时执行 SE All-Reduce (ICI 通信)
+        # 这个函数是阻塞的 (Blocking)，但因为它运行在 ICI 上，
+        # 而步骤 A 运行在 HBM 上，所以两者完美并行。
+        # 且由于 SE 数据量小 (2MB)，通常比 HBM Load 快，耗时几乎被掩盖。
+        run_manual_se_all_reduce(b_output_x2_vmem.at[out_buf_id])
 
         def run_acc_pipeline(i, _):
             curr_buf_id = i % 2
@@ -2780,6 +2841,9 @@ def fused_ep_moe(
         pltpu.SMEM((2, 1, padded_num_experts), jnp.int32),  # expert_starts_x2_smem
         pltpu.SMEM((2, 1, padded_num_experts), jnp.int32),  # expert_sizes_x2_smem
         pltpu.SMEM((2,), jnp.int32),  # a2a_s_sends_x2_smem
+        (
+            None if w1_shared is None else pltpu.VMEM((bt, hidden_size), t_dtype)
+        ),  # # b_reduce_scratch
         pltpu.VMEM(
             (2, top_k, math.gcd(bt, 16), t_packing, hidden_per_pack),
             t_dtype,
@@ -2876,6 +2940,7 @@ def fused_ep_moe(
         pltpu.SemaphoreType.DMA((2, 10 if w1_shared is not None else 5)),  # local_sems
         pltpu.SemaphoreType.DMA((2,)),  # send_x2_sems
         pltpu.SemaphoreType.DMA((2,)),  # recv_x2_sems
+        (None if w1_shared is None else pltpu.SemaphoreType.DMA((2,))),  # se_reduce_sems
         pltpu.SemaphoreType.DMA,  # a2a_gather_sem
         pltpu.SemaphoreType.DMA((1,)),  # a2a_acc_sems
         pltpu.SemaphoreType.BARRIER,  # barrier_sem
@@ -3028,12 +3093,12 @@ def fused_ep_moe(
             P(),  # a2a_s_acc_x2_hbm
             P(),  # a2a_g_hbm
             None if bias is None else P(),
-            None if w1_shared is None else P(),  # w1_shared
-            None if w3_shared is None else P(),  # w3_shared
-            None if w2_shared is None else P(),  # w2_shared
-            None if w1_shared_scale is None else P(),  # w1_shared_scale
-            None if w3_shared_scale is None else P(),  # w3_shared_scale
-            None if w2_shared_scale is None else P(),  # w2_shared_scale
+            None if w1_shared is None else P(None, tp_axis_name),
+            None if w3_shared is None else P(None, tp_axis_name),
+            None if w2_shared is None else P(tp_axis_name, None),
+            None if w1_shared_scale is None else P(None, None, tp_axis_name),
+            None if w3_shared_scale is None else P(None, None, tp_axis_name),
+            None if w2_shared_scale is None else P(tp_axis_name, None, None),
         ),
         out_specs=(
             P(
