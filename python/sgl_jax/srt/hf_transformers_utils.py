@@ -28,15 +28,13 @@ for name, cls in _CONFIG_REGISTRY.items():
         AutoConfig.register(name, cls)
 
 
-def download_from_hf(model_path: str, multimodal: bool = False):
+def download_from_hf(model_path: str, allow_patterns: list[str] | None = None):
     if os.path.exists(model_path):
         return model_path
 
-    return (
-        snapshot_download(model_path, allow_patterns=["*.json", "*.bin", "*.model"])
-        if not multimodal
-        else snapshot_download(model_path)
-    )
+    if allow_patterns is None:
+        allow_patterns = ["*.json", "*.bin", "*.model"]
+    return snapshot_download(model_path, allow_patterns=allow_patterns)
 
 
 def get_hf_text_config(config: PretrainedConfig):
