@@ -312,20 +312,26 @@ def select_block_configs(
             return False, f"bse({bse}) % 128 != 0"
 
         if use_shared_expert:
-            se_inter = case.intermediate_size
-            if (
-                hasattr(case, "moe_shared_expert_intermediate_size")
-                and case.moe_shared_expert_intermediate_size
-            ):
-                se_inter = case.moe_shared_expert_intermediate_size
+            # 1. 获取全局 Shared Expert 中间层维度
+            # 优先检查 case 是否有 moe_shared_expert_intermediate_size 属性，没有则用默认的 intermediate_size
+            se_inter = (
+                getattr(case, "moe_shared_expert_intermediate_size", None) or case.intermediate_size
+            )
 
-            local_se_inter = se_inter // case.tp_size
+            # 2. 获取 TP Size
+            # 直接从闭包里的 case 对象拿。如果 case.tp_size 为 0 或 1，默认为 1
+            tp_size = max(case.tp_size, 1)
+
+            # 3. 计算切分后的 Local Size
+            # Shared Expert 的权重是沿着中间维度 (Intermediate) 被 TP 切分的
+            local_se_inter = se_inter // tp_size
+
+            # 4. 核心校验：bse 不能比 Local Size 还大，且必须整除
+            if local_se_inter < bse:
+                return False, f"local_se_inter({local_se_inter}) < bse({bse}) [TP={tp_size}]"
 
             if local_se_inter % bse != 0:
-                return (
-                    False,
-                    f"local_se_inter({local_se_inter}) % bse({bse}) != 0 (Global={se_inter}, TP={case.tp_size})",
-                )
+                return False, f"local_se_inter({local_se_inter}) % bse({bse}) != 0 [TP={tp_size}]"
 
         if case.hidden_size % bd1 != 0 or case.hidden_size % bd2 != 0:
             return (
