@@ -325,7 +325,7 @@ def select_block_configs(
             # 3. 计算切分后的 Local Size
             # Shared Expert 的权重是沿着中间维度 (Intermediate) 被 TP 切分的
             local_se_inter = se_inter // tp_size
-
+            print("tp_size", tp_size)
             # 4. 核心校验：bse 不能比 Local Size 还大，且必须整除
             if local_se_inter < bse:
                 return False, f"local_se_inter({local_se_inter}) < bse({bse}) [TP={tp_size}]"
