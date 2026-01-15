@@ -32,7 +32,7 @@ def download_from_hf(model_path: str):
     if os.path.exists(model_path):
         return model_path
 
-    return snapshot_download(model_path)
+    return snapshot_download(model_path, allow_patterns=["*.json", "*.bin", "*.model"])
 
 
 def get_hf_text_config(config: PretrainedConfig):
