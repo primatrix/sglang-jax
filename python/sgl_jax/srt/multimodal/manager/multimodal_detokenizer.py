@@ -38,11 +38,8 @@ class MultimodalDetokenizer(DetokenizerManager):
         if sample.ndim == 3:
             # for images, dim t is missing
             sample = sample.unsqueeze(1)
-        # videos = rearrange(sample, "t h w c -> t c h w")
         frames = []
         for x in sample:
-            # x = torchvision.utils.make_grid(x, nrow = 6)
-            # x = x.transpose(0, 1).transpose(1, 2).squeeze(-1)
             frames.append((np.clip(x / 2 + 0.5, 0, 1) * 255).astype(np.uint8))
 
         # Save outputs if requested

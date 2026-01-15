@@ -126,7 +126,6 @@ class GlobalScheduler:
             reqs = self.recv_request()
             if len(reqs) > 0 and self.server_args.log_requests:
                 logger.info("recv_reqs from tokenizer %s", reqs)
-            time.sleep(3)
             if reqs:
                 for req in reqs:
                     dispatched_req = self._request_dispatcher(req)
