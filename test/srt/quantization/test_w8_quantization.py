@@ -99,7 +99,7 @@ class TestW8Int8(BaseW8Test):
     quantization_config_path = "int8_all_modules_w_only.yaml"
     gsm8k_accuracy_threshold = 0.95
     throughput_threshold = 100
-    other_args = ["--tp-size=4", "--download-dir=/dev/shm", "--max-running-requests=256"]
+    other_args = ["--tp-size=4", "--download-dir=/dev/shm", "--max-running-requests=256", "--page-size=64"]
 
 
 if __name__ == "__main__":
