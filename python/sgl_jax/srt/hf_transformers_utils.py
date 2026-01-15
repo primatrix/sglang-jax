@@ -28,11 +28,14 @@ for name, cls in _CONFIG_REGISTRY.items():
         AutoConfig.register(name, cls)
 
 
-def download_from_hf(model_path: str, allow_patterns: list[str] | None = None):
+_UNSET = object()
+
+
+def download_from_hf(model_path: str, allow_patterns: list[str] | None = _UNSET):
     if os.path.exists(model_path):
         return model_path
 
-    if allow_patterns is None:
+    if allow_patterns is _UNSET:
         allow_patterns = ["*.json", "*.bin", "*.model"]
     return snapshot_download(model_path, allow_patterns=allow_patterns)
 
