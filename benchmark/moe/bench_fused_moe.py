@@ -311,6 +311,22 @@ def select_block_configs(
         if bse % 128 != 0:
             return False, f"bse({bse}) % 128 != 0"
 
+        if use_shared_expert:
+            se_inter = case.intermediate_size
+            if (
+                hasattr(case, "moe_shared_expert_intermediate_size")
+                and case.moe_shared_expert_intermediate_size
+            ):
+                se_inter = case.moe_shared_expert_intermediate_size
+
+            local_se_inter = se_inter // case.tp_size
+
+            if local_se_inter % bse != 0:
+                return (
+                    False,
+                    f"local_se_inter({local_se_inter}) % bse({bse}) != 0 (Global={se_inter}, TP={case.tp_size})",
+                )
+
         if case.hidden_size % bd1 != 0 or case.hidden_size % bd2 != 0:
             return (
                 False,
