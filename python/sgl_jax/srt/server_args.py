@@ -250,7 +250,7 @@ class ServerArgs:
             logger.warning("In a multi-machine scenario, device_indexes will be set to None.")
             self.device_indexes = None
         if self.multimodal:
-            self.model_path = download_from_hf(self.model_path)
+            self.model_path = download_from_hf(self.model_path, multimodal=True)
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
