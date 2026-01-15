@@ -52,50 +52,20 @@ def cleanup_sglang_processes():
     This is critical to ensure TPU devices and other resources are properly
     released before starting the next test.
     """
-    patterns = [
-        r"sglang::",
-        r"sglang-jax::",
-        r"sglang\.launch_server",
-        r"sglang\.bench",
-        r"sglang\.data_parallel",
-        r"sglang\.srt",
-        r"sgl_jax\.launch_server",
-        r"sgl_jax\.srt",
-        r"sgl_jax\.bench",
-        r"sgl_jax\.data_parallel",
-    ]
-    combined_pattern = "|".join(patterns)
-
-    # Get current process and parent process PIDs to exclude them
-    current_pid = os.getpid()
-    parent_pid = os.getppid()
-    exclude_pids = {current_pid, parent_pid}
-
     try:
-        # Find and kill any leftover sglang processes
-        result = subprocess.run(
-            ["pgrep", "-f", combined_pattern],
-            capture_output=True,
-            text=True,
-        )
-        if result.stdout.strip():
-            pids = result.stdout.strip().split("\n")
-            killed_count = 0
-            for pid in pids:
-                try:
-                    pid_int = int(pid)
-                    # Skip current process and parent process
-                    if pid_int in exclude_pids:
-                        continue
-                    os.kill(pid_int, signal.SIGKILL)
-                    killed_count += 1
-                except (ProcessLookupError, ValueError):
-                    pass
-            if killed_count > 0:
-                print(f"\nCleaning up {killed_count} leftover sglang processes...", flush=True)
-                # Wait for processes to fully terminate
-                time.sleep(3)
-                print("Sglang processes cleaned up.\n", flush=True)
+        # Get the path to killall_sglang.sh relative to this file
+        script_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        killall_script = os.path.join(script_dir, "scripts", "killall_sglang.sh")
+
+        if os.path.exists(killall_script):
+            print("\nCleaning up leftover sglang processes...", flush=True)
+            subprocess.run(
+                ["bash", killall_script],
+                capture_output=True,
+            )
+            # Wait for processes to fully terminate and release resources
+            time.sleep(3)
+            print("Sglang processes cleaned up.\n", flush=True)
     except Exception as e:
         print(f"Warning: Failed to cleanup sglang processes: {e}\n", flush=True)
 
