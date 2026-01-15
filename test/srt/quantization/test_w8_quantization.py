@@ -48,6 +48,13 @@ class BaseW8Test(CustomTestCase):
         if cls is BaseW8Test:
             return
         kill_process_tree(cls.process.pid)
+        # Wait for process to fully terminate and release resources
+        try:
+            cls.process.wait(timeout=30)
+        except Exception:
+            pass
+        # Give OS time to release shared memory and other resources
+        time.sleep(5)
 
     def test_gsm8k(self):
         if self.gsm8k_accuracy_threshold is None:
@@ -99,7 +106,12 @@ class TestW8Int8(BaseW8Test):
     quantization_config_path = "int8_all_modules_w_only.yaml"
     gsm8k_accuracy_threshold = 0.95
     throughput_threshold = 100
-    other_args = ["--tp-size=4", "--download-dir=/dev/shm", "--max-running-requests=256", "--page-size=64"]
+    other_args = [
+        "--tp-size=4",
+        "--download-dir=/dev/shm",
+        "--max-running-requests=256",
+        "--page-size=64",
+    ]
 
 
 if __name__ == "__main__":
