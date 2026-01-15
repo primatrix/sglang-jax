@@ -284,8 +284,11 @@ def select_block_configs(
             return False, f"bt({bt}) > local_num_tokens({local_num_tokens})"
         if bt % t_packing != 0:
             return False, f"bt({bt}) % t_packing({t_packing}) != 0"
-        if bt % 16 != 0:
-            return False, f"bt({bt}) % 16 != 0 (TPU tiling alignment)"
+        if local_num_tokens >= 16 and bt % 16 != 0:
+            return (
+                False,
+                f"bt({bt}) % 16 != 0 (TPU tiling alignment for local_tokens={local_num_tokens})",
+            )
 
         if bt % router_tile0 != 0:
             return (
