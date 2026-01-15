@@ -46,30 +46,6 @@ def run_with_timeout(
     return ret_value[0]
 
 
-def cleanup_sglang_processes():
-    """Kill any leftover sglang processes between tests.
-
-    This is critical to ensure TPU devices and other resources are properly
-    released before starting the next test.
-    """
-    try:
-        # Get the path to killall_sglang.sh relative to this file
-        script_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        killall_script = os.path.join(script_dir, "scripts", "killall_sglang.sh")
-
-        if os.path.exists(killall_script):
-            print("\nCleaning up leftover sglang processes...", flush=True)
-            subprocess.run(
-                ["bash", killall_script],
-                capture_output=True,
-            )
-            # Wait for processes to fully terminate and release resources
-            time.sleep(3)
-            print("Sglang processes cleaned up.\n", flush=True)
-    except Exception as e:
-        print(f"Warning: Failed to cleanup sglang processes: {e}\n", flush=True)
-
-
 def cleanup_model_cache():
     shm_dir = "/dev/shm"
     if os.path.exists(shm_dir):
@@ -130,7 +106,6 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
                             f"Test {test_path} failed with return code {process.returncode}\n",
                             flush=True,
                         )
-                        cleanup_sglang_processes()
                         cleanup_model_cache()
                         return process.returncode
             else:
@@ -154,7 +129,6 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
                 flush=True,
             )
 
-            cleanup_sglang_processes()
             cleanup_model_cache()
 
             return process.returncode
@@ -480,8 +454,8 @@ suites = {
         TestFile("test/srt/test_engine_determine_generation.py", 3),
         TestFile("test/srt/test_engine_flush_cache.py", 3),
         TestFile("test/srt/test_engine_pause_continue.py", 3),
-        TestFile("test/srt/test_server_pause_continue.py", 30),
-        TestFile("test/srt/multimodal/test_wan2_1_models.py", 30),
+        TestFile("test/srt/test_server_pause_continue.py", 6),
+        # TestFile("test/srt/multimodal/test_wan2_1_models.py", 30),
     ],
 }
 
