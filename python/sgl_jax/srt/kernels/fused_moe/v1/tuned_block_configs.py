@@ -76,7 +76,7 @@ DEFAULT_FUSED_MOE_BLOCK_CONFIG = FusedMoEBlockConfig(
     bfc=512,
     bd1c=1024,
     bd2c=1024,
-    bse=512,
+    bse=256,  # 改为 256 以适配更大的 ep_size（例如 ep_size=8 时 local_se_inter=2048/8=256）
 )
 
 
