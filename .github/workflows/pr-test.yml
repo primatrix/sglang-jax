@@ -22,7 +22,7 @@ on:
 
 concurrency:
   group: pr-test-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   # =============================================== check changes ====================================================
