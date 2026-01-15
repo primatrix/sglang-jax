@@ -2022,7 +2022,7 @@ def _fused_ep_moe_kernel(
                 ).wait()
 
                 # 累加
-                curr_out_vmem[...] += b_reduce_scratch
+                curr_out_vmem[...] += b_reduce_scratch[...]
 
                 # 等待发送完成
                 pltpu.make_async_copy(
