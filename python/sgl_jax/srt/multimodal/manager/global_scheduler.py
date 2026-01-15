@@ -120,7 +120,6 @@ class GlobalScheduler:
         return recv_reqs
 
     def event_loop(self):
-        import time
 
         while True:
             reqs = self.recv_request()
