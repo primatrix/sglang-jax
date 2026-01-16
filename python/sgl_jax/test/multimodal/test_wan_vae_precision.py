@@ -87,11 +87,13 @@ class TestWanVaePrecision(unittest.TestCase):
         return y.transpose((0, 4, 1, 2, 3))
     
     def test_encode_precision(self):
+        print("Testing encode precision...")
         torch_output = self._get_diffusers_encode_output()
         jax_output = self._get_jax_encode_output()
         np.testing.assert_allclose(torch_output, jax_output, rtol=1e-5, atol=1e-5)
 
     def test_decode_precision(self):
+        print("Testing decode precision...")
         torch_output = self._get_diffusers_decode_output()
         jax_output = self._get_jax_decode_output()
         np.testing.assert_allclose(torch_output, jax_output, rtol=1e-5, atol=1e-5)
