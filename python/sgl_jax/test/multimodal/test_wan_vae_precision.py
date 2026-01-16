@@ -16,22 +16,24 @@ from sgl_jax.srt.multimodal.configs.vaes.wan_vae_config import WanVAEConfig
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.configs.load_config import LoadConfig
+import os
 
 class TestWanVaePrecision(unittest.TestCase):
     """Test VaeScheduler full load and forward flow."""
 
     @classmethod
     def setUpClass(cls):
+        os.environ["JAX_PLATFORMS"] = "cpu"
         cls.mesh = jax.sharding.Mesh(jax.devices(), axis_names=("data",))
         cls.server_args = MultimodalServerArgs(
             model_path="/models/Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
         )
-        cls.vae = diffusersWan.from_pretrained(
-            cls.server_args.model_path,
-            subfolder="vae",
-            torch_dtype=torch.float32,
-        )
-        cls.vae.eval()
+        # cls.vae = diffusersWan.from_pretrained(
+        #     cls.server_args.model_path,
+        #     subfolder="vae",
+        #     torch_dtype=torch.float32,
+        # )
+        # cls.vae.eval()
         cls.model_class = AutoencoderKLWan
         model_loader = get_model_loader(
             load_config=LoadConfig(
@@ -47,20 +49,23 @@ class TestWanVaePrecision(unittest.TestCase):
         cls.jax_vae = model_loader.load_model(
             model_config=model_config,
         )
-
+    @classmethod
+    def tearDownClass(cls):
+        os.environ.pop("JAX_PLATFORMS", None)
 
     def _get_diffusers_encode_output(self):
-        input = (
-            torch.tensor(np.arange(1 * 5 * 192 * 192 * 3), dtype=torch.float32)
-            .reshape(1, 5, 192, 192, 3)
-            .permute((0, 4, 1, 2, 3))
-        )
-        latents = self.vae.encode(input)
-        print(latents.latent_dist.parameters.shape)
+        # input = (
+            # torch.tensor(np.arange(1 * 5 * 192 * 192 * 3), dtype=torch.float32)
+            # .reshape(1, 5, 192, 192, 3)
+            # .permute((0, 4, 1, 2, 3))
+        # )
+        # latents = self.vae.encode(input)
+        # print(latents.latent_dist.parameters.shape)
         with open("wan_vae_diffusers_encode_output.npy", "wb") as f:
-            np.save(f, latents.latent_dist.parameters.detach().numpy())
+            # np.save(f, latents.latent_dist.parameters.detach().numpy())
+            return np.load(f)
 
-        return latents.latent_dist.parameters.detach().numpy()
+        # return latents.latent_dist.parameters.detach().numpy()
     
     def _get_jax_encode_output(self,):
         input = jnp.array(np.arange(1 * 5 * 192 * 192 * 3), dtype=jnp.float32).reshape(1, 5, 192, 192, 3)
@@ -69,16 +74,18 @@ class TestWanVaePrecision(unittest.TestCase):
         return latents.parameters.transpose((0, 4, 1, 2, 3))
     
     def _get_diffusers_decode_output(self):
-        latents = (
-            torch.tensor(np.arange(1 * 5 * 3 * 4 * 16), dtype=torch.float32)
-            .reshape(1, 5, 3, 4, 16)
-            .permute((0, 4, 1, 2, 3))
-        )
-        y = self.vae.decode(latents)
-        print(y.sample.shape)
+        # latents = (
+        #     torch.tensor(np.arange(1 * 5 * 3 * 4 * 16), dtype=torch.float32)
+        #     .reshape(1, 5, 3, 4, 16)
+        #     .permute((0, 4, 1, 2, 3))
+        # )
+        # y = self.vae.decode(latents)
+        # print(y.sample.shape)
         with open("wan_vae_diffusers_decode_output.npy", "wb") as f:
-            np.save(f, y.sample.detach().numpy())
-        return y.sample.detach().numpy()
+            # np.save(f, y.sample.detach().numpy())
+            y = np.load(f)
+            return y
+        # return y.sample.detach().numpy()
     
     def _get_jax_decode_output(self):
         latents = jnp.array(np.arange(1 * 5 * 3 * 4 * 16), dtype=jnp.float32).reshape(1, 5, 3, 4, 16)
