@@ -17,8 +17,9 @@ class TestVaeScheduler(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        cls.mesh = jax.sharding.Mesh(jax.devices(), axis_names=("data",))
         cls.server_args = MultimodalServerArgs(
-            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            model_path="/models/Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
             download_dir="/dev/shm",
         )
         cls.backend = QueueBackend(in_queue=queue.Queue(), out_queue=queue.Queue())
