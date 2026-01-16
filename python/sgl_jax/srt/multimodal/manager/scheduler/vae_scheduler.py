@@ -55,13 +55,3 @@ class VaeScheduler:
             req.latents = None
             self._comm_backend.send_pyobj(req)
 
-
-if __name__ == "__main__":
-    in_queue = queue.Queue()
-    out_queue = queue.Queue()
-    scheduler = VaeScheduler(server_args=None, in_queue=in_queue, out_queue=out_queue, mesh=None)
-    x = jnp.array(np.arange(1 * 5 * 3 * 4 * 16), dtype=jnp.float32).reshape(1, 5, 3, 4, 16)
-    req = Req(rid="111", latents=x)
-    scheduler.run_vae_batch([req])
-    y = out_queue.get()
-    print(y)
