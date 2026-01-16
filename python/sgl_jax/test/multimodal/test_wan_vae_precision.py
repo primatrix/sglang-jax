@@ -68,7 +68,7 @@ class TestWanVaePrecision(unittest.TestCase):
         print(latents.parameters.shape)
         return latents.parameters.transpose((0, 4, 1, 2, 3))
     
-    def _get_transformer_decode_output(self):
+    def _get_diffusers_decode_output(self):
         latents = (
             torch.tensor(np.arange(1 * 5 * 3 * 4 * 16), dtype=torch.float32)
             .reshape(1, 5, 3, 4, 16)
@@ -87,12 +87,12 @@ class TestWanVaePrecision(unittest.TestCase):
         return y.transpose((0, 4, 1, 2, 3))
     
     def test_encode_precision(self):
-        torch_output = self._get_transformer_encode_output()
+        torch_output = self._get_diffusers_encode_output()
         jax_output = self._get_jax_encode_output()
         np.testing.assert_allclose(torch_output, jax_output, rtol=1e-5, atol=1e-5)
 
     def test_decode_precision(self):
-        torch_output = self._get_transformer_decode_output()
+        torch_output = self._get_diffusers_decode_output()
         jax_output = self._get_jax_decode_output()
         np.testing.assert_allclose(torch_output, jax_output, rtol=1e-5, atol=1e-5)
 
