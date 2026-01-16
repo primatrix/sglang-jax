@@ -19,7 +19,7 @@ class TestWanVaePrecision(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.mesh = jax.sharding.Mesh(jax.devices()[0], ("data",))
+        cls.mesh = jax.sharding.Mesh(jax.devices(), axis_names=("data",))
         cls.server_args = MultimodalServerArgs(
             model_path="/models/Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
         )
@@ -30,7 +30,7 @@ class TestWanVaePrecision(unittest.TestCase):
         )
         cls.vae.eval()
 
-        cls.jax_vae = JaxWan(WanVAEConfig(), cls.mesh)
+        cls.jax_vae = JaxWan(WanVAEConfig(), mesh=cls.mesh)
         cls.jax_vae.load_weights(WanVAEConfig())
 
     def _get_transformer_encode_output(self):
@@ -42,6 +42,8 @@ class TestWanVaePrecision(unittest.TestCase):
         latents = self.vae.encode(input)
         print(latents.latent_dist.parameters.shape)
         return latents.latent_dist.parameters.detach().numpy()
+        with open("test_encode_output.npy", "wb") as f:
+            np.save(f, latents.latent_dist.parameters.detach().numpy())
     
     def _get_jax_encode_output(self,):
         input = jnp.array(np.arange(1 * 5 * 192 * 192 * 3), dtype=jnp.float32).reshape(1, 5, 192, 192, 3)
