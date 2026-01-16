@@ -52,7 +52,13 @@ class SchedulerOutputProcessorMixin:
             result.extend_logprob_start_len_per_req,
             result.cache_miss_count,
         )
-        if self.enable_overlap:
+        if self.enable_overlap and self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
+            result = self.draft_worker.resolve_last_batch_result(launch_done)
+            logits_output = result.logits_output
+            next_token_ids = result.next_token_ids
+            cache_miss_count = result.cache_miss_count
+            batch.spec_info = result.next_draft_input
+        elif self.enable_overlap:
             logits_output, next_token_ids, cache_miss_count = (
                 self.tp_worker.resolve_last_batch_result(launch_done)
             )
@@ -214,6 +220,13 @@ class SchedulerOutputProcessorMixin:
             result.next_token_ids,
             result.cache_miss_count,
         )
+        if self.enable_overlap and self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
+            result = self.draft_worker.resolve_last_batch_result(launch_done)
+            logits_output = result.logits_output
+            next_token_ids = result.next_token_ids
+            cache_miss_count = result.cache_miss_count
+            batch.spec_info = result.next_draft_input
+
         if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
             next_token_ids = self._resolve_spec_decode_token_ids(result=result, batch=batch)
 
@@ -230,7 +243,9 @@ class SchedulerOutputProcessorMixin:
             self.draft_token += len(batch.reqs) * self.draft_worker.speculative_num_draft_tokens
         # FIXME(pc) add spec decode metrics
 
-        if self.enable_overlap:
+        if self.enable_overlap and self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
+            next_token_logprobs = logits_output.next_token_logprobs
+        elif self.enable_overlap:
             logits_output, next_token_ids, cache_miss_count = (
                 self.tp_worker.resolve_last_batch_result(launch_done)
             )

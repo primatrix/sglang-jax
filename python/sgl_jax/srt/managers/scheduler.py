@@ -58,7 +58,7 @@ from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
 )
 from sgl_jax.srt.managers.scheduler_profiler_mixing import SchedulerProfilerMixin
 from sgl_jax.srt.managers.tp_worker import ModelWorker
-from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
+from sgl_jax.srt.managers.tp_worker_overlap_thread import EagleWorkerClient, ModelWorkerClient
 from sgl_jax.srt.managers.utils import validate_input_length
 from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.radix_cache import RadixCache
@@ -66,7 +66,7 @@ from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
-from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, FutureEagleDraftInput
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import (
     configure_logger,
@@ -108,7 +108,7 @@ class GenerationBatchResult:
     bid: int
     cache_miss_count: int
     # relay path: forward stream -> next step forward
-    next_draft_input: EagleDraftInput | None = None
+    next_draft_input: EagleDraftInput | FutureEagleDraftInput | None = None
 
     allocate_lens: np.ndarray | None = None
     num_accepted_tokens: int | None = None
@@ -237,21 +237,42 @@ class Scheduler(
             device_indexes=server_args.device_indexes,
         )
 
-        TpWorkerClass = ModelWorkerClient if self.enable_overlap else ModelWorker
-
-        self.tp_worker = TpWorkerClass(
-            server_args=server_args,
-            mesh=self.mesh,
-        )
+        if (
+            self.enable_overlap
+            and self.spec_algorithm is not None
+            and self.spec_algorithm.is_eagle()
+        ):
+            self.tp_worker = ModelWorker(server_args=server_args, mesh=self.mesh)
+        else:
+            TpWorkerClass = ModelWorkerClient if self.enable_overlap else ModelWorker
+            self.tp_worker = TpWorkerClass(
+                server_args=server_args,
+                mesh=self.mesh,
+            )
 
         # launch draft worker
         if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
             from sgl_jax.srt.speculative.eagle_worker import EAGLEWorker
 
-            self.draft_worker = EAGLEWorker(
-                server_args=server_args,
-                target_worker=self.tp_worker,
-            )
+            if self.enable_overlap:
+                self.draft_worker = EagleWorkerClient(
+                    server_args=server_args,
+                    mesh=self.mesh,
+                    target_worker=self.tp_worker,
+                )
+            else:
+                self.draft_worker = EAGLEWorker(
+                    server_args=server_args,
+                    target_worker=self.tp_worker,
+                )
+
+        self.overlap_worker = self.tp_worker if self.enable_overlap else None
+        if (
+            self.enable_overlap
+            and self.spec_algorithm is not None
+            and self.spec_algorithm.is_eagle()
+        ):
+            self.overlap_worker = self.draft_worker
 
         # Get token and memory info from the model worker
         (
@@ -518,7 +539,7 @@ class Scheduler(
                     tmp_batch = ScheduleBatch(
                         reqs=None,
                         forward_mode=ForwardMode.DUMMY_FIRST,
-                        next_batch_sampling_info=self.tp_worker.cur_sampling_info,
+                        next_batch_sampling_info=self.overlap_worker.cur_sampling_info,
                     )
                     with jax.profiler.TraceAnnotation("process_batch_result"):
                         self.process_batch_result(tmp_batch, None, batch.launch_done)
@@ -527,7 +548,7 @@ class Scheduler(
                 # Process the results of the last batch
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 tmp_batch.next_batch_sampling_info = (
-                    self.tp_worker.cur_sampling_info if batch else None
+                    self.overlap_worker.cur_sampling_info if batch else None
                 )
                 # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
                 self.process_batch_result(
@@ -1288,13 +1309,18 @@ class Scheduler(
             batch_output = self.draft_worker.forward_batch_speculative_generation(
                 model_worker_batch
             )
-            if batch_output.accept_lens is not None:
+            if batch_output.accept_lens is not None and not self.enable_overlap:
                 # Decode
                 batch.seq_lens = batch.seq_lens + batch_output.accept_lens
             else:
                 # Prefill
                 batch.seq_lens = batch.seq_lens + 1
             batch.spec_info = batch_output.next_draft_input
+            if (
+                isinstance(batch.spec_info, FutureEagleDraftInput)
+                and batch.spec_info.allocate_lens is None
+            ):
+                batch.spec_info.allocate_lens = np.asarray(batch.seq_lens)
             next_token_ids = batch_output.next_token_ids
             logits_output = batch_output.logits_output
             cache_miss_count = batch_output.cache_miss_count
@@ -1322,7 +1348,11 @@ class Scheduler(
             cache_miss_count=cache_miss_count,
         )
         if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
-            assert isinstance(batch_output.next_draft_input, EagleDraftInput)
+            if not (
+                self.enable_overlap
+                and isinstance(batch_output.next_draft_input, FutureEagleDraftInput)
+            ):
+                assert isinstance(batch_output.next_draft_input, EagleDraftInput)
             ret.next_draft_input = batch_output.next_draft_input
             ret.accept_lens = batch_output.accept_lens
             ret.allocate_lens = batch_output.allocate_lens
@@ -1340,7 +1370,10 @@ class Scheduler(
             self.process_batch_result_prefill(batch, result, launch_done)
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
-                self.tp_worker.resolve_last_batch_result(launch_done)
+                if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
+                    self.draft_worker.resolve_last_batch_result(launch_done)
+                else:
+                    self.tp_worker.resolve_last_batch_result(launch_done)
                 self.set_next_batch_sampling_info_done(batch)
         elif batch.forward_mode.is_dummy_first():
             self.set_next_batch_sampling_info_done(batch)

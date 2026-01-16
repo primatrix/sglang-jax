@@ -659,6 +659,15 @@ class EagleDraftInput:
 
 
 @dataclass
+class FutureEagleDraftInput(EagleDraftInput):
+    """Placeholder to resolve EagleDraftInput from future maps."""
+
+    future_ct: int = 0
+    bs: int = 0
+    keep_indices: np.ndarray | None = None
+
+
+@dataclass
 class EagleVerifyOutput:
     # Draft input batch
     draft_input: EagleDraftInput

@@ -53,7 +53,11 @@ from sgl_jax.srt.sampling.sampling_params import DEFAULT_SAMPLING_SEED, Sampling
 from sgl_jax.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
-    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
+from sgl_jax.srt.speculative.eagle_util import (
+    EagleDraftInput,
+    EagleVerifyInput,
+    FutureEagleDraftInput,
+)
     from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -1033,6 +1037,13 @@ class ScheduleBatch:
 
         self.reqs = [self.reqs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices]
+        if isinstance(self.spec_info, FutureEagleDraftInput):
+            if not isinstance(keep_indices, np.ndarray):
+                keep_indices = np.array(keep_indices)
+            if self.spec_info.keep_indices is not None:
+                keep_indices = np.asarray(self.spec_info.keep_indices)[keep_indices]
+            self.spec_info.keep_indices = keep_indices
+            self.spec_info.bs = len(keep_indices)
         # TODO: uniform data type in scheduler batch
         if isinstance(self.seq_lens, jax.Array):
             self.seq_lens = np.array(self.seq_lens)
@@ -1045,6 +1056,10 @@ class ScheduleBatch:
             self.spec_info.hidden_states = self.spec_info.hidden_states[keep_indices_jax]
             self.spec_info.verified_id = self.spec_info.verified_id[keep_indices_jax]
             self.spec_info.allocate_lens = self.spec_info.allocate_lens[keep_indices_jax]
+        elif self.spec_info is not None and getattr(self.spec_info, "allocate_lens", None) is not None:
+            if not isinstance(keep_indices, np.ndarray):
+                keep_indices = np.array(keep_indices)
+            self.spec_info.allocate_lens = np.asarray(self.spec_info.allocate_lens)[keep_indices]
 
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
