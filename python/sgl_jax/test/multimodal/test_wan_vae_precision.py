@@ -9,11 +9,13 @@ from sgl_jax.srt.managers.communication import QueueBackend
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.manager.scheduler.vae_scheduler import VaeScheduler
-from sgl_jax.srt.multimodal.models.wan2_1.vaes.wanvae import AutoencoderKLWan as JaxWan
+from sgl_jax.srt.multimodal.models.wan2_1.vaes.wanvae import AutoencoderKLWan
 import torch
-from diffusers import AutoencoderKLWan
+from diffusers import AutoencoderKLWan as diffusersWan
 from sgl_jax.srt.multimodal.configs.vaes.wan_vae_config import WanVAEConfig
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.model_loader.loader import get_model_loader
+from sgl_jax.srt.configs.load_config import LoadConfig
 
 class TestWanVaePrecision(unittest.TestCase):
     """Test VaeScheduler full load and forward flow."""
@@ -24,15 +26,28 @@ class TestWanVaePrecision(unittest.TestCase):
         cls.server_args = MultimodalServerArgs(
             model_path="/models/Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
         )
-        cls.vae = AutoencoderKLWan.from_pretrained(
+        cls.vae = diffusersWan.from_pretrained(
             cls.server_args.model_path,
             subfolder="vae",
             torch_dtype=torch.float32,
         )
         cls.vae.eval()
+        cls.model_class = AutoencoderKLWan
+        model_loader = get_model_loader(
+            load_config=LoadConfig(
+                model_class=cls.model_class,
+                sub_dir="vae",
+            ),
+            mesh=cls.mesh,
+        ) 
+        
+        model_config = cls.model_class.get_config_class()()
+        model_config.model_path = cls.server_args.model_path
+        model_config.model_class = cls.model_class
+        cls.jax_vae = model_loader.load_model(
+            model_config=model_config,
+        )
 
-        cls.jax_vae = JaxWan(WanVAEConfig(), mesh=cls.mesh)
-        cls.jax_vae.load_weights(model_config=ModelConfig(model_path=cls.server_args.model_path + "/vae"))
 
     def _get_diffusers_encode_output(self):
         input = (
