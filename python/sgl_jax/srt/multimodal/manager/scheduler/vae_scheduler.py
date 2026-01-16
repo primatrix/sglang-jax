@@ -1,8 +1,4 @@
-import queue
-
-import jax.numpy as jnp
 import jax.sharding
-import numpy as np
 from jax import NamedSharding
 from jax.sharding import PartitionSpec
 
@@ -54,4 +50,3 @@ class VaeScheduler:
             req.output = jax.device_get(output)
             req.latents = None
             self._comm_backend.send_pyobj(req)
-

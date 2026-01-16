@@ -1,20 +1,16 @@
-import dataclasses
+import queue
 import unittest
-from unittest.mock import patch
 
 import jax
 import jax.numpy as jnp
-from jax.lax import Precision
-import queue
 import numpy as np
 
+from sgl_jax.srt.managers.communication import QueueBackend
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
-from sgl_jax.srt.multimodal.manager.scheduler.vae_scheduler import (
-            VaeScheduler,
-)
-from sgl_jax.srt.managers.communication import QueueBackend
+from sgl_jax.srt.multimodal.manager.scheduler.vae_scheduler import VaeScheduler
 from sgl_jax.srt.multimodal.models.wan2_1.vaes.wanvae import AutoencoderKLWan
+
 
 class TestVaeScheduler(unittest.TestCase):
     """Test VaeScheduler full load and forward flow."""
@@ -40,8 +36,9 @@ class TestVaeScheduler(unittest.TestCase):
         x = jnp.array(np.arange(1 * 5 * 3 * 4 * 16), dtype=jnp.float32).reshape(1, 5, 3, 4, 16)
         req = Req(rid="test", latents=x)
         self.scheduler.run_vae_batch([req])
-        result=self.backend._out_queue.get()
-        print(result.output)
+        result = self.backend._out_queue.get()
+        self.assertEqual(result.output.shape, (1, 17, 24, 32, 3))
+
 
 if __name__ == "__main__":
     unittest.main()
