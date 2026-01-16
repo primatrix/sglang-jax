@@ -62,8 +62,8 @@ class TestWanVaePrecision(unittest.TestCase):
         # )
         # latents = self.vae.encode(input)
         # print(latents.latent_dist.parameters.shape)
-
-        with open(Path(__file__).resolve().parent + "/data/wan_vae_diffusers_encode_output.npy", "wb") as f:
+        current_dir = Path(__file__).resolve().parent
+        with open(current_dir + "/data/wan_vae_diffusers_encode_output.npy", "rb") as f:
             # np.save(f, latents.latent_dist.parameters.detach().numpy())
             return np.load(f.read())
 
@@ -83,7 +83,8 @@ class TestWanVaePrecision(unittest.TestCase):
         # )
         # y = self.vae.decode(latents)
         # print(y.sample.shape)
-        with open(Path(__file__).resolve().parent + "/data/wan_vae_diffusers_decode_output.npy", "wb") as f:
+        current_dir = Path(__file__).resolve().parent
+        with open(current_dir + "/data/wan_vae_diffusers_decode_output.npy", "rb") as f:
             # np.save(f, y.sample.detach().numpy())
             y = np.load(f.read())
             return y
