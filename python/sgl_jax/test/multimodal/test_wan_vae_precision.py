@@ -1,30 +1,26 @@
-import queue
+import os
 import unittest
+from pathlib import Path
 
+os.environ["JAX_PLATFORMS"] = "cpu"
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sgl_jax.srt.managers.communication import QueueBackend
+from sgl_jax.srt.configs.load_config import LoadConfig
+from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
-from sgl_jax.srt.multimodal.manager.schedule_batch import Req
-from sgl_jax.srt.multimodal.manager.scheduler.vae_scheduler import VaeScheduler
-from sgl_jax.srt.multimodal.models.wan2_1.vaes.wanvae import AutoencoderKLWan
+
 # import torch
 # from diffusers import AutoencoderKLWan as diffusersWan
-from sgl_jax.srt.multimodal.configs.vaes.wan_vae_config import WanVAEConfig
-from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.model_loader.loader import get_model_loader
-from sgl_jax.srt.configs.load_config import LoadConfig
-import os
-from pathlib import Path
+from sgl_jax.srt.multimodal.models.wan2_1.vaes.wanvae import AutoencoderKLWan
+
 
 class TestWanVaePrecision(unittest.TestCase):
-    """Test VaeScheduler full load and forward flow."""
+    """Test wan vae encode and decode precision"""
 
     @classmethod
     def setUpClass(cls):
-        os.environ["JAX_PLATFORMS"] = "cpu"
         cls.mesh = jax.sharding.Mesh(jax.devices(), axis_names=("data",))
         cls.server_args = MultimodalServerArgs(
             model_path="/models/Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
@@ -42,36 +38,41 @@ class TestWanVaePrecision(unittest.TestCase):
                 sub_dir="vae",
             ),
             mesh=cls.mesh,
-        ) 
-        
+        )
+
         model_config = cls.model_class.get_config_class()()
         model_config.model_path = cls.server_args.model_path
         model_config.model_class = cls.model_class
         cls.jax_vae = model_loader.load_model(
             model_config=model_config,
         )
+
     @classmethod
     def tearDownClass(cls):
         os.environ.pop("JAX_PLATFORMS", None)
 
     def _get_diffusers_encode_output(self):
         # input = (
-            # torch.tensor(np.arange(1 * 5 * 192 * 192 * 3), dtype=torch.float32)
-            # .reshape(1, 5, 192, 192, 3)
-            # .permute((0, 4, 1, 2, 3))
+        # torch.tensor(np.arange(1 * 5 * 192 * 192 * 3), dtype=torch.float32)
+        # .reshape(1, 5, 192, 192, 3)
+        # .permute((0, 4, 1, 2, 3))
         # )
         # latents = self.vae.encode(input)
         # print(latents.latent_dist.parameters.shape)
         current_dir = str(Path(__file__).resolve().parent)
         return np.load(current_dir + "/data/wan_vae_diffusers_encode_output.npy")
         # return latents.latent_dist.parameters.detach().numpy()
-    
-    def _get_jax_encode_output(self,):
-        input = jnp.array(np.arange(1 * 5 * 192 * 192 * 3), dtype=jnp.float32).reshape(1, 5, 192, 192, 3)
+
+    def _get_jax_encode_output(
+        self,
+    ):
+        input = jnp.array(np.arange(1 * 5 * 192 * 192 * 3), dtype=jnp.float32).reshape(
+            1, 5, 192, 192, 3
+        )
         latents = self.jax_vae.encode(input)
         print(latents.parameters.shape)
         return latents.parameters.transpose((0, 4, 1, 2, 3))
-    
+
     def _get_diffusers_decode_output(self):
         # latents = (
         #     torch.tensor(np.arange(1 * 5 * 3 * 4 * 16), dtype=torch.float32)
@@ -83,13 +84,15 @@ class TestWanVaePrecision(unittest.TestCase):
         current_dir = str(Path(__file__).resolve().parent)
         return np.load(current_dir + "/data/wan_vae_diffusers_decode_output.npy")
         # return y.sample.detach().numpy()
-    
+
     def _get_jax_decode_output(self):
-        latents = jnp.array(np.arange(1 * 5 * 3 * 4 * 16), dtype=jnp.float32).reshape(1, 5, 3, 4, 16)
+        latents = jnp.array(np.arange(1 * 5 * 3 * 4 * 16), dtype=jnp.float32).reshape(
+            1, 5, 3, 4, 16
+        )
         y = self.jax_vae.decode(latents)
         print(y.shape)
         return y.transpose((0, 4, 1, 2, 3))
-    
+
     def test_encode_precision(self):
         print("Testing encode precision...")
         torch_output = self._get_diffusers_encode_output()
@@ -101,6 +104,7 @@ class TestWanVaePrecision(unittest.TestCase):
         torch_output = self._get_diffusers_decode_output()
         jax_output = self._get_jax_decode_output()
         np.testing.assert_allclose(torch_output, jax_output, rtol=1e-5, atol=1e-5)
+
 
 if __name__ == "__main__":
     unittest.main()
