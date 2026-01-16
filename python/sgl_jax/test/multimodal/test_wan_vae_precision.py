@@ -10,13 +10,14 @@ from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.manager.scheduler.vae_scheduler import VaeScheduler
 from sgl_jax.srt.multimodal.models.wan2_1.vaes.wanvae import AutoencoderKLWan
-import torch
-from diffusers import AutoencoderKLWan as diffusersWan
+# import torch
+# from diffusers import AutoencoderKLWan as diffusersWan
 from sgl_jax.srt.multimodal.configs.vaes.wan_vae_config import WanVAEConfig
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.configs.load_config import LoadConfig
 import os
+from pathlib import Path
 
 class TestWanVaePrecision(unittest.TestCase):
     """Test VaeScheduler full load and forward flow."""
@@ -61,9 +62,10 @@ class TestWanVaePrecision(unittest.TestCase):
         # )
         # latents = self.vae.encode(input)
         # print(latents.latent_dist.parameters.shape)
-        with open("wan_vae_diffusers_encode_output.npy", "wb") as f:
+
+        with open(Path(__file__).resolve().parent + "/data/wan_vae_diffusers_encode_output.npy", "wb") as f:
             # np.save(f, latents.latent_dist.parameters.detach().numpy())
-            return np.load(f)
+            return np.load(f.read())
 
         # return latents.latent_dist.parameters.detach().numpy()
     
@@ -81,9 +83,9 @@ class TestWanVaePrecision(unittest.TestCase):
         # )
         # y = self.vae.decode(latents)
         # print(y.sample.shape)
-        with open("wan_vae_diffusers_decode_output.npy", "wb") as f:
+        with open(Path(__file__).resolve().parent + "/data/wan_vae_diffusers_decode_output.npy", "wb") as f:
             # np.save(f, y.sample.detach().numpy())
-            y = np.load(f)
+            y = np.load(f.read())
             return y
         # return y.sample.detach().numpy()
     
