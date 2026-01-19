@@ -41,7 +41,24 @@ class MMReqState:
 
 
 class MultimodalTokenizer(TokenizerManager):
+    """Tokenization manager for multimodal requests.
+
+    `MultimodalTokenizer` accepts high-level multimodal generation requests
+    (`GenerateMMReqInput`), tokenizes text inputs (and prepares image
+    references when supported), forwards tokenized requests to the
+    scheduler pipeline, and waits for/streams back results. It tracks the
+    state of outstanding requests via `MMReqState` and uses a
+    `TypeBasedDispatcher` to handle results arriving from the pipeline.
+    """
+
     def __init__(self, server_args, port_args):
+        """Initialize tokenizer, processor and result dispatcher.
+
+        Loads an image processor (best-effort), initializes an in-memory
+        map `rid_to_state` to track request state objects, and prepares a
+        result dispatcher that routes batches of outputs back to
+        `_handle_batch_output`.
+        """
         super().__init__(server_args, port_args)
         # Use slow image processor to avoid torchvision dependency warning
         try:
@@ -61,6 +78,12 @@ class MultimodalTokenizer(TokenizerManager):
         )
 
     def _handle_batch_output(self, reqs: list):
+        """Handle a batch of outputs returned from the pipeline.
+
+        Marks the corresponding `MMReqState` as finished, sets its event to
+        wake any waiters, and stores a simple success meta record. If a
+        result arrives for an unknown `rid` it logs a warning.
+        """
         if len(reqs) > 0 and self.server_args.log_requests:
             logger.info("handle_batch_output %s, self.rid_to_state %s", reqs, self.rid_to_state)
         for req in reqs:
@@ -80,6 +103,14 @@ class MultimodalTokenizer(TokenizerManager):
         obj: GenerateMMReqInput,
         request: fastapi.Request | None = None,
     ):
+        """High level API: accept a generation request and stream responses.
+
+        This coroutine tokenizes the input (text and optional image refs),
+        sends the tokenized request to the scheduler pipeline, and then
+        asynchronously yields results as they arrive (supporting streaming
+        if `obj.stream` is True). It respects client disconnects and a
+        configured wait timeout.
+        """
         created_time = time.time()
         async with self._cond:
             await self._cond.wait_for(lambda: not self._updating)
@@ -99,7 +130,11 @@ class MultimodalTokenizer(TokenizerManager):
             yield response
 
     async def _tokenize_one_request(self, obj: GenerateMMReqInput):
-        """Tokenize one request."""
+        """
+        Converts text fields to token ids using the configured tokenizer.
+        Image preprocessing / references are noted as TODO; when provided
+        `input_ids` are passed through unchanged.
+        """
         # Support both 'prompt' (multimodal) and 'text' (text-only) fields
         input_text = getattr(obj, "prompt", None) or getattr(obj, "text", None)
         neg_input_text = getattr(obj, "neg_prompt", None) or getattr(obj, "text", None)
@@ -130,6 +165,11 @@ class MultimodalTokenizer(TokenizerManager):
     def _create_tokenized_object(
         self, obj: GenerateMMReqInput, input_text, input_ids, neg_input_text, neg_input_ids
     ):
+        """Build `TokenizedGenerateMMReqInput` from the original request.
+
+        Ensures a request id (`rid`) exists, and copies over relevant
+        properties such as size, num_frames, data type and save_output flag.
+        """
         rid = getattr(obj, "rid", None)
         if rid is None:
             rid = uuid.uuid4().hex
@@ -153,6 +193,11 @@ class MultimodalTokenizer(TokenizerManager):
         tokenized_obj: TokenizedGenerateMMReqInput,
         created_time: float | None = None,
     ):
+        """Send a tokenized request into the scheduling pipeline and track it.
+
+        Constructs an `MMReqState` to wait for results and stores it in
+        `rid_to_state` keyed by the request id.
+        """
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = MMReqState(
             rid=tokenized_obj.rid,
@@ -171,7 +216,12 @@ class MultimodalTokenizer(TokenizerManager):
         state: MMReqState,
         request: fastapi.Request | None = None,
     ):
-        """Wait for the response of one request."""
+        """Wait for results for a single request, yielding responses.
+
+        This method waits on `state.event` with a timeout (`self.wait_timeout`),
+        handles client disconnects (aborting the request), and yields
+        intermediate/final outputs according to `obj.stream`.
+        """
         while True:
             try:
                 await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)

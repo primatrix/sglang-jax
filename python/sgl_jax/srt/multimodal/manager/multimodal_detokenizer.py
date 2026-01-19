@@ -17,11 +17,28 @@ logger = logging.getLogger(__name__)
 
 
 class MultimodalDetokenizer(DetokenizerManager):
+    """Collects final multimodal outputs and persists or returns them.
+
+    The `MultimodalDetokenizer` receives completed `Req` objects (typically
+    produced by pipeline stages) and is responsible for converting raw
+    output arrays into image/video files when requested. It wires a
+    `TypeBasedDispatcher` to handle different result types; currently it
+    supports saving `Req` outputs via `save_result`.
+    """
+
     def __init__(
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
+        """Initialize the detokenizer manager and request dispatcher.
+
+        Args:
+            server_args: Global server configuration used for logging and
+                behavior control.
+            port_args: Port arguments (kept for API compatibility / future
+                use).
+        """
         super().__init__(server_args, port_args)
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -30,6 +47,20 @@ class MultimodalDetokenizer(DetokenizerManager):
         )
 
     def save_result(self, req: Req):
+        """Process and optionally save the `Req` output.
+
+        Behavior:
+        - Validates presence of `req.output` and logs a warning if empty.
+        - Normalizes pixel range from model output (assumed in [-1, 1]) to
+          uint8 images.
+        - If `req.save_output` is true, writes a video (`.mp4`) for
+          `DataType.VIDEO` or an image (`.jpg`) otherwise and sets
+          `req.output_file_name`.
+
+        Returns the original `Req` wrapped in a list to match dispatcher
+        expectations.
+        """
+
         logger.info("save_result...")
         if req.output is None or len(req.output) == 0:
             logger.warning("No output to save for request id: %s", req.rid)
@@ -67,6 +98,13 @@ def run_multimodal_detokenizer_process(
     server_args: ServerArgs,
     port_args: PortArgs,
 ):
+    """Process entrypoint for the multimodal detokenizer.
+
+    Performs process-level setup, constructs a `MultimodalDetokenizer`, and
+    runs its event loop. On unhandled exceptions the parent process is
+    signaled to terminate.
+    """
+
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang-jax::multimodal_detokenizer")
     configure_logger(server_args)

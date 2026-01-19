@@ -25,7 +25,38 @@ logger = logging.getLogger(__name__)
 
 
 class GlobalScheduler:
+    """Orchestrates multimodal request scheduling and stage dispatch.
+
+    GlobalScheduler is responsible for receiving tokenized requests from the
+    tokenizer via a ZMQ PULL socket, converting them into `Req` objects, and
+    dispatching them into a pipeline of `Stage` instances. It also collects
+    outputs from stages and forwards final results to the detokenizer via a
+    ZMQ PUSH socket.
+
+    Key responsibilities:
+    - Initialize ZMQ sockets for inter-process communication.
+    - Load stage configurations and build a list of `Stage` instances.
+    - Manage `DeviceManager` and a request store for tracking in-flight
+        requests.
+    - Start each stage in its own thread and coordinate stage input/output
+        queues (using `queue.Queue`).
+    - Run the main event loop that pulls requests, dispatches them, and
+        collects stage results.
+
+    Notes:
+    - `start_stage` spawns threads which execute `Stage.run_stage`.
+    - `run_global_scheduler_process` wraps this class for running in a
+        separate process and sets up process-level bookkeeping (title,
+        parent-death handling, logging).
+    """
+
     def __init__(self, server_args: ServerArgs, port_args: PortArgs) -> None:
+        """Initialize the GlobalScheduler.
+
+        Creates ZMQ sockets for receiving tokenized requests and sending
+        detokenized outputs, loads stage configurations, initializes the
+        `DeviceManager`, and prepares in/out queues and stage threads.
+        """
         context = zmq.Context(2)
         self.server_args = server_args
         self.recv_from_tokenizer = get_zmq_socket(
@@ -43,6 +74,14 @@ class GlobalScheduler:
         self.req_store = dict()
 
     def _init_stage(self):
+        """Build Stage instances and wire stage queues.
+
+        Builds stages in parallel using a ThreadPoolExecutor, sorts them by
+        index, creates per-stage input/output queues, attaches the queues to
+        each `Stage`, starts stage threads, and prepares the request
+        dispatcher mapping.
+        """
+
         def _build_stage(idx_cfg: tuple[int, Any]) -> tuple[int, Stage]:
             idx, cfg = idx_cfg
             return idx, Stage(cfg, device_manager=self.device_manager, server_args=self.server_args)
@@ -73,13 +112,24 @@ class GlobalScheduler:
         )
 
     def handle_abort_request(self, abort_req: AbortReq):
-        """Handle abort request from client."""
+        """Handle a client abort request.
+
+        Currently this logs the abort request. In future the abort should be
+        propagated to stages to cancel in-flight work associated with the
+        request id (`rid`).
+        """
         logger.info("Received abort request for rid=%s", abort_req.rid)
         # For now, just log and return None
         # TODO: Forward abort to stages if needed
         return None
 
     def convert_request(self, input: TokenizedGenerateMMReqInput):
+        """Convert a tokenized input into internal `Req`.
+
+        Parses input size, constructs a `Req` object, ensures the request id
+        is unique in `req_store`, and stores the request for tracking.
+        """
+
         size_str = input.size if input.size else "1024*1024"
 
         req = Req(
@@ -99,6 +149,13 @@ class GlobalScheduler:
         return req
 
     def start_stage(self):
+        """Start each stage in its own thread and wait for readiness.
+
+        Spawns a thread per `Stage` running `Stage.run_stage` and then blocks
+        on each stage's output queue for a readiness message. Raises if a
+        stage fails to initialize.
+        """
+
         import threading
 
         for stage in self.stage_list:
@@ -110,6 +167,12 @@ class GlobalScheduler:
                 raise Exception(f"stage {i} init failed")
 
     def recv_request(self):
+        """Non-blockingly drain incoming requests from the tokenizer socket.
+
+        Returns a list of Python objects received via ZMQ. The method uses
+        `zmq.NOBLOCK` to avoid blocking when there are no messages.
+        """
+
         recv_reqs = []
         while True:
             try:
@@ -120,6 +183,17 @@ class GlobalScheduler:
         return recv_reqs
 
     def event_loop(self):
+        """Main event loop: receive, dispatch, and collect stage results.
+
+        Loop behavior:
+        - Drain incoming tokenized requests and dispatch them via the
+          `TypeBasedDispatcher` to create per-stage `Req` objects.
+        - If no new requests are available, poll each stage for outputs via
+          `stage.try_collect()` and either forward final outputs to the
+          detokenizer socket or enqueue the next-stage requests.
+        The loop runs forever; external supervision should manage process
+        lifecycle and termination.
+        """
 
         while True:
             reqs = self.recv_request()
@@ -161,6 +235,15 @@ def run_global_scheduler_process(
     port_args: PortArgs,
     pipe_writer,
 ):
+    """Run the GlobalScheduler inside a separate process context.
+
+    This helper performs process-level setup (parent-death handling,
+    process title, logger configuration), constructs the `GlobalScheduler`,
+    signals readiness to the parent via `pipe_writer`, and then starts the
+    scheduler's event loop. Exceptions are logged and the parent is signaled
+    to terminate on fatal errors.
+    """
+
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang-jax::global_scheduler")
     configure_logger(server_args)

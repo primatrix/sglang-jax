@@ -25,9 +25,33 @@ logger = logging.getLogger(__name__)
 
 
 class Stage:
+    """Represents a single pipeline stage running a scheduler.
+
+    A `Stage` owns a device `mesh` (created from `stage_config` and
+    allocated devices via `DeviceManager`), an inbound queue and an outbound
+    queue used to communicate with the global scheduler, and a scheduler
+    instance that performs the stage-specific work (e.g. diffusion, VAE,
+    autoregressive).
+
+    Lifecycle:
+    - Constructed in the parent process; device indices are allocated.
+    - `set_in_queue` / `set_out_queue` attach communication queues.
+    - `run_stage` is executed in a dedicated thread: it initializes the
+      stage scheduler, signals readiness on the out queue, and runs the
+      scheduler's event loop.
+    """
+
     def __init__(
         self, stage_config: Any, *, device_manager: DeviceManager, server_args: ServerArgs
     ):
+        """Initialize stage resources and create the device mesh.
+
+        Args:
+            stage_config: Configuration for this stage (includes `runtime` and
+                scheduler information).
+            device_manager: `DeviceManager` used to reserve device indices.
+            server_args: Global server arguments passed to schedulers.
+        """
         self._in_queue = None
         self._out_queue = None
         # this parallelism setting is accord to stage config
@@ -42,12 +66,26 @@ class Stage:
         # mesh
 
     def set_in_queue(self, in_queue: Queue):
+        """Attach the inbound queue used to receive requests for this stage."""
+
         self._in_queue = in_queue
 
     def set_out_queue(self, out_queue: Queue):
+        """Attach the outbound queue used to publish status/results."""
+
         self._out_queue = out_queue
 
     def run_stage(self):
+        """Thread entrypoint: initialize scheduler and run its event loop.
+
+        The method creates the scheduler instance specified in
+        `stage_config`, wraps the stage's in/out queues with a `QueueBackend`,
+        signals readiness by putting `{"status": "ready"}` on the out
+        queue, and then runs the scheduler's event loop. On unexpected
+        exceptions it logs the traceback and signals the parent process to
+        terminate.
+        """
+
         parent_process = psutil.Process().parent()
         try:
             logger.info(
@@ -86,6 +124,11 @@ class Stage:
             parent_process.send_signal(signal.SIGQUIT)
 
     def try_collect(self):
+        """Attempt to read one item from the stage's out queue without blocking.
+
+        Returns the queued object if present, otherwise `None`.
+        """
+
         assert self._out_queue is not None
         try:
             return self._out_queue.get_nowait()
