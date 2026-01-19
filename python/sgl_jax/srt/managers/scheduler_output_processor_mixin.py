@@ -571,7 +571,6 @@ class SchedulerOutputProcessorMixin:
         output_hidden_states = None
         output_routed_experts = None
 
-
         if return_logprob:
             input_token_logprobs_val = []
             input_token_logprobs_idx = []
@@ -709,7 +708,6 @@ class SchedulerOutputProcessorMixin:
                         output_top_logprobs_idx.append([])
                         output_token_ids_logprobs_val.append([])
                         output_token_ids_logprobs_idx.append([])
-
 
                 # if req.return_routed_experts:
                 if output_routed_experts is None:
