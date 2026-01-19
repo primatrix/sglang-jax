@@ -43,9 +43,9 @@ def fill_token_bitmask(
 
 @jax.jit
 def apply_token_bitmask(
-    logits: jax.Array,
-    vocab_mask: jax.Array,
-) -> jax.Array:
+    logits: jnp.ndarray,
+    vocab_mask: jnp.ndarray,
+) -> jnp.ndarray:
     """Apply token bitmask to logits.
 
     Sets logits to -inf where the bitmask bit is 0.
@@ -84,7 +84,7 @@ def apply_token_bitmask(
     return masked_logits
 
 
-def unpack_bitmask(vocab_mask: jax.Array) -> jax.Array:
+def unpack_bitmask(vocab_mask: jnp.ndarray) -> jnp.ndarray:
     """Unpack int32 bitmask to boolean array (no dynamic slicing).
 
     Args:

@@ -1,7 +1,7 @@
 import abc
 from typing import TYPE_CHECKING, Any, NamedTuple
 
-import jax
+import jax.numpy as jnp
 
 if TYPE_CHECKING:
     from sgl_jax.srt.mem_cache.radix_cache import TreeNode
@@ -22,7 +22,7 @@ class MatchResult(NamedTuple):
                             0 if HiCache is not enabled.
     """
 
-    device_indices: jax.Array
+    device_indices: jnp.ndarray
     last_device_node: TreeNode | None
     last_host_node: TreeNode | None
     host_hit_length: int = 0
@@ -87,7 +87,7 @@ class BasePrefixCache(abc.ABC):
         self,
         last_host_node: Any,
         host_hit_length: int,
-    ) -> tuple[jax.Array, Any]:
+    ) -> tuple[jnp.ndarray, Any]:
         """
         Preparing KV cache loading from host to device.
         """

@@ -7,22 +7,22 @@ gmm = jax.custom_vjp(gmm_kernel, nondiff_argnums=(3, 4, 7, 8))
 
 
 def _gmm_fwd(
-    lhs: jax.Array,
-    rhs: jax.Array,
-    group_sizes: jax.Array,
+    lhs: jnp.ndarray,
+    rhs: jnp.ndarray,
+    group_sizes: jnp.ndarray,
     preferred_element_type: jnp.dtype = jnp.float32,
     tiling: tuple[int, int, int] = (128, 128, 128),
-    group_offset: jax.Array | None = None,
-    existing_out: jax.Array | None = None,
+    group_offset: jnp.ndarray | None = None,
+    existing_out: jnp.ndarray | None = None,
     transpose_rhs: bool = False,
     interpret: bool = False,
 ) -> tuple[
-    jax.Array,
+    jnp.ndarray,
     tuple[
-        jax.Array,
-        jax.Array,
-        jax.Array,
-        jax.Array | None,
+        jnp.ndarray,
+        jnp.ndarray,
+        jnp.ndarray,
+        jnp.ndarray | None,
         int,
     ],
 ]:
