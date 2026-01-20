@@ -265,6 +265,7 @@ class BailingMoEDecoderLayer(nnx.Module):
 
             self.moe_backend = getattr(config, "moe_backend", MoEBackend.EPMOE)
             self.use_fused = self.moe_backend == MoEBackend.FUSED
+
             moe_shared_expert_intermediate_size = getattr(
                 config,
                 "moe_shared_expert_intermediate_size",
@@ -371,6 +372,7 @@ class BailingMoEDecoderLayer(nnx.Module):
             correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
             if self.use_fused:
                 hidden_states = self.mlp(hidden_states, router_logits)
+                topk_ids = None
             else:
                 topk_weights, topk_ids = self.topk(router_logits, correction_bias)
                 hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)

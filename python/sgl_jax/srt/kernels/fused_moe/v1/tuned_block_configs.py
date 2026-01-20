@@ -36,6 +36,30 @@ from .kernel import FusedMoEBlockConfig
 # fmt: off
 TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
     # Populate per-device kind, e.g. "TPU v6e", "TPU v7".
+    "TPU v6e": {
+        # NOTE: For small-token decode shapes on TPU v6e, bf=512/bd=2048 can
+        # trigger TPU runtime anomalies in end-to-end precompile. Use a more
+        # conservative tiling here.
+        ('bfloat16', 16, 256, 8, 2048, 512, 4, True, True): (4, 256, 1024, 1024, 4, 4, 256, 1024, 1024, 256),
+        ('bfloat16', 32, 256, 8, 2048, 512, 4, True, True): (8, 512, 2048, 2048, 8, 8, 512, 2048, 2048, 256),
+        ('bfloat16', 64, 256, 8, 2048, 512, 4, True, True): (16, 512, 2048, 2048, 16, 16, 512, 2048, 2048, 512),
+        ('bfloat16', 128, 256, 8, 2048, 512, 4, True, True): (32, 512, 2048, 2048, 32, 32, 512, 2048, 2048, 256),
+        ('bfloat16', 256, 256, 8, 2048, 512, 4, True, True): (64, 512, 2048, 2048, 64, 64, 512, 2048, 2048, 256),
+        ('bfloat16', 512, 256, 8, 2048, 512, 4, True, True): (128, 512, 2048, 2048, 128, 128, 512, 2048, 2048, 256),
+        ('bfloat16', 1024, 256, 8, 2048, 512, 4, True, True): (256, 512, 2048, 2048, 256, 256, 512, 2048, 2048, 512),
+        ('bfloat16', 2048, 256, 8, 2048, 512, 4, True, True): (512, 512, 2048, 2048, 512, 512, 512, 2048, 2048, 256),
+        ('bfloat16', 4096, 256, 8, 2048, 512, 4, True, True): (512, 512, 2048, 2048, 512, 512, 512, 2048, 2048, 256),
+
+        ('bfloat16', 16, 128, 8, 2048, 768, 4, False, False): (4, 256, 2048, 2048, 4, 4, 256, 2048, 2048, 256),
+        ('bfloat16', 32, 128, 8, 2048, 768, 4, False, False): (8, 256, 2048, 2048, 8, 8, 256, 2048, 2048, 256),
+        ('bfloat16', 64, 128, 8, 2048, 768, 4, False, False): (16, 256, 2048, 2048, 16, 16, 256, 2048, 2048, 256),
+        ('bfloat16', 128, 128, 8, 2048, 768, 4, False, False): (32, 256, 2048, 2048, 32, 32, 256, 2048, 2048, 256),
+        ('bfloat16', 256, 128, 8, 2048, 768, 4, False, False): (64, 256, 2048, 2048, 64, 64, 256, 2048, 2048, 256),
+        ('bfloat16', 512, 128, 8, 2048, 768, 4, False, False): (128, 256, 2048, 2048, 128, 128, 256, 2048, 2048, 256),
+        ('bfloat16', 1024, 128, 8, 2048, 768, 4, False, False): (256, 256, 2048, 2048, 256, 256, 256, 2048, 2048, 256),
+        ('bfloat16', 2048, 128, 8, 2048, 768, 4, False, False): (512, 256, 2048, 2048, 512, 512, 256, 2048, 2048, 256),
+        ('bfloat16', 4096, 128, 8, 2048, 768, 4, False, False): (512, 256, 2048, 2048, 512, 512, 256, 2048, 2048, 256),
+    },
     "TPU v7": {
         ('bfloat16', 64, 256, 8, 8192, 2048, 32, False, False): (2, 2048, 2048, 2048, 2, 2, 2048, 2048, 2048, 2048),
         ('bfloat16', 128, 256, 8, 8192, 2048, 32, False, False): (4, 2048, 2048, 2048, 4, 4, 2048, 2048, 2048, 2048),
@@ -68,14 +92,15 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
 
 DEFAULT_FUSED_MOE_BLOCK_CONFIG = FusedMoEBlockConfig(
     bt=32,
-    bf=512,
+    bf=256,
     bd1=1024,
     bd2=1024,
+    bts=32,
     btc=32,
-    bfc=512,
+    bfc=256,
     bd1c=1024,
     bd2c=1024,
-    bse=512,
+    bse=256,
 )
 
 
@@ -144,6 +169,8 @@ def get_tuned_fused_moe_block_config(
     )
     device_name = keys[0]
     table_key = keys[1:]
+
+    print(f"table_key: {table_key}")
 
     cfg_tuple = None
     if device_name in TUNED_BLOCK_CONFIGS:

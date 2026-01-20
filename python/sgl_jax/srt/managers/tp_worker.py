@@ -287,7 +287,14 @@ class ModelWorker:
                         future_token_ids_map,
                     )
 
-                self.forward_batch_generation(model_worker_batch, None, False, sampling_metadata)
+                # Ensure the previous precompile step completes before moving on.
+                # This avoids queuing many async TPU executions back-to-back, which can
+                # surface as hard-to-diagnose runtime failures on some platforms.
+                _, next_token_ids, _ = self.forward_batch_generation(
+                    model_worker_batch, None, False, sampling_metadata
+                )
+                if next_token_ids is not None:
+                    jax.block_until_ready(next_token_ids)
         end_time = time.perf_counter()
         logger.info("[EXTEND] Precompile finished in %.0f secs", end_time - start_time)
 
@@ -330,7 +337,15 @@ class ModelWorker:
                     model_worker_batch, None, False, sampling_metadata
                 )
                 if future_token_ids_map is not None:
-                    set_future_token_ids(future_token_ids_map, 0, next_token_ids)
+                    # `set_future_token_ids` returns a new array. Bind it so the
+                    # update is part of the dataflow, then block on the *updated*
+                    # map (which also implies `next_token_ids` is ready).
+                    future_token_ids_map = set_future_token_ids(
+                        future_token_ids_map, 0, next_token_ids
+                    )
+                    jax.block_until_ready(future_token_ids_map)
+                elif next_token_ids is not None:
+                    jax.block_until_ready(next_token_ids)
 
         end_time = time.perf_counter()
         logger.info("[DECODE] Precompile finished in %.0f secs", end_time - start_time)
@@ -376,8 +391,11 @@ class ModelWorker:
         speculative_algotithm=None,
         enable_static_lora: bool = None,
     ) -> ModelWorkerBatch:
-        valid_input_ids = np.array([1] * bs, dtype=jnp.int32)
-        invalid_input_ids = np.array([0] * (num_tokens - bs), dtype=jnp.int32)
+        # Use deterministic, non-constant token ids for precompile so the model
+        # doesn't see identical tokens across the whole batch (which can produce
+        # pathological routing/collective patterns).
+        valid_input_ids = np.arange(1, bs + 1, dtype=np.int32)
+        invalid_input_ids = np.zeros((num_tokens - bs,), dtype=np.int32)
         valid_out_cache_loc = np.arange(bs, dtype=jnp.int32)
         invalid_out_cache_loc = np.array([-1] * (num_tokens - bs), dtype=jnp.int32)
         valid_positions = np.array([0] * bs, dtype=jnp.int32)
