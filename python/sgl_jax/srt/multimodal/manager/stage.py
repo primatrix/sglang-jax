@@ -5,17 +5,17 @@ from typing import Any
 
 import jax
 import psutil
-
-from python.sgl_jax.srt.multimodal.models.qwen2_5VL.vit import Qwen2_5VLVisionModel
 from sgl_jax.srt.managers.communication import QueueBackend
 from sgl_jax.srt.managers.scheduler import Scheduler as AutoRegressiveScheduler
 from sgl_jax.srt.models.umt5 import UMT5EncoderModel
+from sgl_jax.srt.models.qwen2 import Qwen2ForCausalLM
 from sgl_jax.srt.multimodal.manager.device_manager import DeviceManager
 from sgl_jax.srt.multimodal.manager.scheduler.diffusion_scheduler import (
     DiffusionScheduler,
 )
 from sgl_jax.srt.multimodal.manager.scheduler.vae_scheduler import VaeScheduler
 from sgl_jax.srt.multimodal.manager.scheduler.vit_scheduler import VitScheduler
+from sgl_jax.srt.multimodal.models.vit import Qwen2_5VLVisionModel
 from sgl_jax.srt.multimodal.models.wan.diffusion.wan_dit import (
     WanDualTransformer3DModel,
     WanTransformer3DModel,
@@ -181,5 +181,7 @@ def get_model_class(name: str):
         return WanDualTransformer3DModel
     elif name == "Qwen2_5VLVisionModel":
         return Qwen2_5VLVisionModel
+    elif name == "Qwen2ForCausalLM":
+        return Qwen2ForCausalLM
     else:
         raise ValueError(f"Unknown model name: {name}")
