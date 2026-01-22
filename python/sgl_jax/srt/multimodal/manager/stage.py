@@ -5,10 +5,11 @@ from typing import Any
 
 import jax
 import psutil
+
 from sgl_jax.srt.managers.communication import QueueBackend
 from sgl_jax.srt.managers.scheduler import Scheduler as AutoRegressiveScheduler
-from sgl_jax.srt.models.umt5 import UMT5EncoderModel
 from sgl_jax.srt.models.qwen2 import Qwen2ForCausalLM
+from sgl_jax.srt.models.umt5 import UMT5EncoderModel
 from sgl_jax.srt.multimodal.manager.device_manager import DeviceManager
 from sgl_jax.srt.multimodal.manager.scheduler.diffusion_scheduler import (
     DiffusionScheduler,
