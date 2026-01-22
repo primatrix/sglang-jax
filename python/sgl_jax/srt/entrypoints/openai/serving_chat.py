@@ -76,16 +76,7 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         if is_multimodal:
-            adapted_request = GenerateVLMReqInput(
-                prompt=processed_messages.prompt or "",
-                image_data=processed_messages.image_data,
-                video_data=processed_messages.video_data,
-                stream=request.stream,
-                n=request.n,
-                sampling_params=sampling_params,
-                stop=processed_messages.stop,
-                rid=request.rid if isinstance(request.rid, str) else None,
-            )
+            prompt_kwargs = {"text": processed_messages.prompt}
         else:
             # Handle single vs multiple requests
             if isinstance(processed_messages.prompt_ids, str):
@@ -93,16 +84,19 @@ class OpenAIServingChat(OpenAIServingBase):
             else:
                 prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
 
-            adapted_request = GenerateReqInput(
-                **prompt_kwargs,
-                sampling_params=sampling_params,
-                return_logprob=request.logprobs,
-                logprob_start_len=-1,
-                top_logprobs_num=request.top_logprobs or 0,
-                stream=request.stream,
-                extra_key=request.extra_key,
-                rid=request.rid,
-            )
+        adapted_request = GenerateReqInput(
+            **prompt_kwargs,
+            image_data=processed_messages.image_data,
+            video_data=processed_messages.video_data,
+            audio_data=processed_messages.audio_data,
+            sampling_params=sampling_params,
+            return_logprob=request.logprobs,
+            logprob_start_len=-1,
+            top_logprobs_num=request.top_logprobs or 0,
+            stream=request.stream,
+            extra_key=request.extra_key,
+            rid=request.rid,
+        )
 
         return adapted_request, request
 

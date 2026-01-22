@@ -215,8 +215,6 @@ class MultimodalDataItem:
         """
         Set padding value after hashing the data first
         """
-        from sgl_jax.srt.managers.mm_utils import hash_feature
-
         if self.hash is None:
             if self.feature is not None:
                 hashed_feature = self.feature
