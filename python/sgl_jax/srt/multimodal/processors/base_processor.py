@@ -18,7 +18,6 @@ from sgl_jax.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sgl_jax.srt.utils import load_audio, load_image, load_video, logger
 
 
-
 @dataclasses.dataclass
 class BaseMultiModalProcessorOutput:
     # input_text, with each frame of video/image represented with a image_token

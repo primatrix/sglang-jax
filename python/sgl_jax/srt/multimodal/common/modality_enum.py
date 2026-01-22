@@ -1,12 +1,13 @@
-from enum import Enum, auto
 import dataclasses
-import jax
-from typing import Any
-import numpy as np
-import jax.numpy as jnp
 import hashlib
 import pickle
-from typing import TYPE_CHECKING, Any, Literal
+from enum import Enum, auto
+from typing import Any, Literal
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
 
 def flatten_nested_list(nested_list):
     if isinstance(nested_list, list):
@@ -145,6 +146,7 @@ def pad_input_tokens(
                 padded_ids[i] = pad_value
 
     return padded_ids
+
 
 class Modality(Enum):
     IMAGE = auto()
