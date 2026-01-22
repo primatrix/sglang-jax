@@ -131,6 +131,14 @@ class ServerArgs:
     attention_backend: str | None = "fa"
     moe_backend: str = "epmoe"
 
+    # EPLB (Expert-Parallel Load Balancing) for MoE
+    enable_eplb: bool = False
+    eplb_window_size: int = 32
+    eplb_update_interval: int = 32
+    eplb_redundant_experts: int = 0
+    eplb_max_redundant_experts: int = 128
+    eplb_seed: int = 0
+
     grammar_backend: str | None = None
 
     max_seq_len: int = 4096
@@ -844,6 +852,41 @@ class ServerArgs:
             choices=["epmoe", "fused", "auto"],
             default=ServerArgs.moe_backend,
             help="The backend to use for MoE models.",
+        )
+        parser.add_argument(
+            "--enable-eplb",
+            action="store_true",
+            help="Enable EPLB (Expert-Parallel Load Balancing) stats collection and planning.",
+        )
+        parser.add_argument(
+            "--eplb-window-size",
+            type=int,
+            default=ServerArgs.eplb_window_size,
+            help="Sliding window size (in steps) for EPLB routing statistics.",
+        )
+        parser.add_argument(
+            "--eplb-update-interval",
+            type=int,
+            default=ServerArgs.eplb_update_interval,
+            help="Recompute EPLB placement every N recorded steps.",
+        )
+        parser.add_argument(
+            "--eplb-redundant-experts",
+            type=int,
+            default=ServerArgs.eplb_redundant_experts,
+            help="Number of redundant expert slots (R) to allocate (max 128).",
+        )
+        parser.add_argument(
+            "--eplb-max-redundant-experts",
+            type=int,
+            default=ServerArgs.eplb_max_redundant_experts,
+            help="Maximum redundant experts allowed (default 128).",
+        )
+        parser.add_argument(
+            "--eplb-seed",
+            type=int,
+            default=ServerArgs.eplb_seed,
+            help="Random seed used by EPLB placement algorithm for tie-breaking.",
         )
 
         parser.add_argument(

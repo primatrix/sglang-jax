@@ -182,6 +182,11 @@ class QWen3MoeDecoderLayer(nnx.Module):
             num_experts = getattr(config, "num_experts", 128)
             num_experts_per_tok = getattr(config, "num_experts_per_tok", 8)
             moe_intermediate_size = getattr(config, "moe_intermediate_size", 768)
+            self.num_experts_per_tok = num_experts_per_tok
+            self.capture_topk_ids = bool(
+                getattr(config, "enable_return_routed_experts", False)
+                or getattr(config, "enable_eplb", False)
+            )
 
             self.moe_backend = getattr(config, "moe_backend", "epmoe")
             self.use_fused = self.moe_backend == "fused"
@@ -267,7 +272,12 @@ class QWen3MoeDecoderLayer(nnx.Module):
 
             if self.use_fused:
                 hidden_states = self.mlp(hidden_states, router_logits)
-                topk_ids = None
+                if self.capture_topk_ids:
+                    _, topk_ids = jax.lax.top_k(
+                        router_logits.astype(jnp.float32), self.num_experts_per_tok
+                    )
+                else:
+                    topk_ids = None
             else:
                 topk_weights, topk_ids = self.topk(router_logits)
                 hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)

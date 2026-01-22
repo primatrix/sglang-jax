@@ -202,11 +202,70 @@ class ModelWorker:
 
         self.parent_process = psutil.Process().parent()
         self.sync_queue = Queue()
+
+        self._eplb_controller = self._maybe_create_eplb_controller()
         self.sync_expert_ids_d2h_thread = threading.Thread(
             target=self._sync_expert_ids_d2h_thread_func,
             daemon=True,
         )
         self.sync_expert_ids_d2h_thread.start()
+
+    def _maybe_create_eplb_controller(self):
+        if not getattr(self.server_args, "enable_eplb", False):
+            return None
+
+        hf_text_config = self.model_config.hf_text_config
+        num_layers = int(hf_text_config.num_hidden_layers)
+
+        num_logical_experts = None
+        for cfg in (hf_text_config, self.model_config.hf_config):
+            for attr in ("num_experts", "n_experts"):
+                v = getattr(cfg, attr, None)
+                if v is not None:
+                    num_logical_experts = int(v)
+                    break
+            if num_logical_experts is not None:
+                break
+
+        num_experts_per_tok = None
+        for cfg in (hf_text_config, self.model_config.hf_config):
+            v = getattr(cfg, "num_experts_per_tok", None)
+            if v is not None:
+                num_experts_per_tok = int(v)
+                break
+        if num_logical_experts is None or num_experts_per_tok is None:
+            logger.warning(
+                "EPLB enabled but model config does not expose MoE fields; disabling EPLB. "
+                "Found num_logical_experts=%s num_experts_per_tok=%s",
+                num_logical_experts,
+                num_experts_per_tok,
+            )
+            return None
+
+        ep_size = int(self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1))
+        from sgl_jax.srt.eplb import EplbController
+
+        logger.info(
+            "EPLB enabled: num_layers=%d num_logical_experts=%d top_k=%d ep_size=%d window=%d interval=%d R=%d",
+            num_layers,
+            int(num_logical_experts),
+            int(num_experts_per_tok),
+            ep_size,
+            int(self.server_args.eplb_window_size),
+            int(self.server_args.eplb_update_interval),
+            int(self.server_args.eplb_redundant_experts),
+        )
+        return EplbController(
+            num_layers=num_layers,
+            num_logical_experts=int(num_logical_experts),
+            num_experts_per_tok=int(num_experts_per_tok),
+            ep_size=ep_size,
+            window_size=int(self.server_args.eplb_window_size),
+            update_interval=int(self.server_args.eplb_update_interval),
+            num_redundant_experts=int(self.server_args.eplb_redundant_experts),
+            max_num_redundant_experts=int(self.server_args.eplb_max_redundant_experts),
+            seed=int(self.server_args.eplb_seed),
+        )
 
     def _sync_expert_ids_d2h_thread_func(self):
         try:
@@ -220,6 +279,46 @@ class ModelWorker:
         while True:
             layers_topk_ids, model_worker_batch = self.sync_queue.get()
             get_global_experts_capturer().on_forward_end(layers_topk_ids, model_worker_batch)
+            self._maybe_record_eplb(layers_topk_ids, model_worker_batch)
+
+    def _maybe_record_eplb(
+        self, layers_topk_ids: list[jax.Array | None], model_worker_batch: ModelWorkerBatch
+    ):
+        controller = self._eplb_controller
+        if controller is None:
+            return
+
+        unpadded_input_len = model_worker_batch.get_original_input_len()
+        topk_ids_cpu = jax.device_get(layers_topk_ids)
+
+        topk_ids_by_layer = []
+        top_k = controller.recorder.num_experts_per_tok
+        for ids_cpu in topk_ids_cpu:
+            if ids_cpu is None:
+                topk_ids_by_layer.append(None)
+                continue
+            topk_ids_by_layer.append(np.asarray(ids_cpu)[:unpadded_input_len, :top_k])
+
+        controller.record_step(topk_ids_by_layer=topk_ids_by_layer)
+        update = controller.maybe_rebalance()
+        if update is None:
+            return
+
+        logical_count = update.record_dump.logical_count
+        nonzero = logical_count.sum(axis=1) > 0
+        if np.any(nonzero):
+            per_layer = logical_count[nonzero]
+            max_over_mean = float(np.max(per_layer) / max(1.0, float(np.mean(per_layer))))
+        else:
+            max_over_mean = 0.0
+        logger.info(
+            "EPLB update computed at step=%d (filled=%d/%d), max/mean=%.3f, E_physical=%d",
+            controller.steps,
+            controller.recorder.filled,
+            controller.recorder.window_size,
+            max_over_mean,
+            update.metadata.num_physical_experts,
+        )
 
     def normalize_token_paddings(self):
         normalized_token_paddings = []

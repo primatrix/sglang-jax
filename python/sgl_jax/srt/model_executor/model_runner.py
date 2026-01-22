@@ -265,6 +265,17 @@ class ModelRunner(BaseModelRunner):
         self.model_config.log_kv_heads_info(self.tp_size)
         self.model_config.hf_config.ep_size = self.ep_size
         self.model_config.hf_config.moe_backend = self.model_config.moe_backend.value
+        self.model_config.hf_config.enable_return_routed_experts = (
+            self.server_args.enable_return_routed_experts
+        )
+        self.model_config.hf_config.enable_eplb = self.server_args.enable_eplb
+        self.model_config.hf_config.eplb_window_size = self.server_args.eplb_window_size
+        self.model_config.hf_config.eplb_update_interval = self.server_args.eplb_update_interval
+        self.model_config.hf_config.eplb_redundant_experts = self.server_args.eplb_redundant_experts
+        self.model_config.hf_config.eplb_max_redundant_experts = (
+            self.server_args.eplb_max_redundant_experts
+        )
+        self.model_config.hf_config.eplb_seed = self.server_args.eplb_seed
 
         self.model = self.model_loader.load_model(
             model_config=self.model_config,

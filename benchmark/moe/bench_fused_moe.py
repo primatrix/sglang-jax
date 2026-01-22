@@ -471,6 +471,9 @@ def run_all(
     hotspot_count: int = None,
     zero_expert_count: int = None,
     non_hotspot_alpha: float = None,
+    eplb_redundant_experts: int = 0,
+    eplb_seed: int = 0,
+    eplb_dry_run: bool = False,
 ) -> None:
     raw_cases: list[MoEBenchmarkCase] | None = None
     if num_tokens is not None:
@@ -516,6 +519,8 @@ def run_all(
     print(f"Running fused_moe benchmarks with dtype={dtype}")
     print(f"  config_mode: {config_mode}")
     print(f"  features: shared_expert={use_shared_expert}, grouped_topk={use_grouped_topk}")
+    if eplb_dry_run:
+        print(f"  eplb_dry_run: redundant_experts={eplb_redundant_experts}, seed={eplb_seed}")
 
     for case in cases:
         t_packing = _dtype_packing(dtype)
@@ -562,6 +567,43 @@ def run_all(
         custom_logits = MoEImbalanceSimulator.create_logits_from_counts(
             case.num_tokens, case.num_experts, case.top_k, target_counts
         )
+
+        if eplb_dry_run:
+            from sgl_jax.srt.eplb import rebalance_experts_greedy
+
+            ep_group_size = mesh.shape["data"] * mesh.shape["tensor"]
+            meta = rebalance_experts_greedy(
+                tokens_per_logical_expert=np.asarray(target_counts, dtype=np.float32)[None, :],
+                ep_size=int(ep_group_size),
+                num_redundant_experts=int(eplb_redundant_experts),
+                max_num_redundant_experts=128,
+                seed=int(eplb_seed),
+            )
+
+            p2l = meta.physical_to_logical_map[0]
+            replica_counts = np.bincount(p2l, minlength=case.num_experts).astype(np.int32)
+            ideal_per_replica = np.asarray(target_counts, dtype=np.float64) / np.maximum(
+                replica_counts, 1
+            )
+            slot_weights = ideal_per_replica[p2l.astype(np.int64)]
+
+            local_e = meta.num_physical_experts // int(ep_group_size)
+            rank_loads = np.array(
+                [
+                    float(slot_weights[r * local_e : (r + 1) * local_e].sum())
+                    for r in range(int(ep_group_size))
+                ],
+                dtype=np.float64,
+            )
+            mean = float(rank_loads.mean())
+            mx = float(rank_loads.max()) if rank_loads.size else 0.0
+            ratio = (mx / mean) if mean > 0 else float("inf")
+            print(
+                "  [eplb_dry_run] "
+                f"E_logical={case.num_experts} E_physical={meta.num_physical_experts} "
+                f"replicas_added={meta.num_physical_experts - case.num_experts} "
+                f"rank_load_max/mean={ratio:.3f}"
+            )
 
         data["router_logits"] = jax.device_put(
             custom_logits, jax.sharding.NamedSharding(mesh, P("tensor", None))
@@ -867,6 +909,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hotspot-count", type=int, default=1, help="热点专家的数量")
     parser.add_argument("--zero-expert-count", type=int, default=0)
     parser.add_argument("--non-hotspot-alpha", type=float, default=100.0)
+    parser.add_argument(
+        "--eplb-dry-run",
+        action="store_true",
+        help="Compute and print EPLB greedy placement stats (no kernel changes).",
+    )
+    parser.add_argument(
+        "--eplb-redundant-experts",
+        type=int,
+        default=0,
+        help="Requested redundant physical experts for EPLB (max 128; may be reduced for divisibility).",
+    )
+    parser.add_argument(
+        "--eplb-seed",
+        type=int,
+        default=0,
+        help="Deterministic seed for EPLB greedy dispatch selection.",
+    )
     return parser.parse_args()
 
 
@@ -905,6 +964,9 @@ if __name__ == "__main__":
             hotspot_count=args.hotspot_count,
             zero_expert_count=args.zero_expert_count,
             non_hotspot_alpha=args.non_hotspot_alpha,
+            eplb_dry_run=args.eplb_dry_run,
+            eplb_redundant_experts=args.eplb_redundant_experts,
+            eplb_seed=args.eplb_seed,
         )
     except BaseException as e:
         print(f"FATAL: {type(e).__name__}: {e}", flush=True)

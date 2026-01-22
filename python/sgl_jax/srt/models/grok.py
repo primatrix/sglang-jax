@@ -243,6 +243,10 @@ class Grok1MoE(nnx.Module):
         # Select MoE backend based on config
         self.moe_backend = getattr(config, "moe_backend", "epmoe")
         self.use_fused = self.moe_backend == "fused"
+        self.capture_topk_ids = bool(
+            getattr(config, "enable_return_routed_experts", False)
+            or getattr(config, "enable_eplb", False)
+        )
 
         if self.use_fused:
             self.experts = FusedEPMoE(
@@ -286,7 +290,11 @@ class Grok1MoE(nnx.Module):
             # Fused kernel: pass router_logits directly
             # Top-K selection is handled internally by the kernel
             assert isinstance(self.experts, FusedEPMoE)
-            return self.experts(hidden_states, router_logits), None
+            if self.capture_topk_ids:
+                _, top_k_indices = jax.lax.top_k(router_logits.astype(jnp.float32), self.top_k)
+            else:
+                top_k_indices = None
+            return self.experts(hidden_states, router_logits), top_k_indices
         else:
             # EPMoE: compute top-k routing weights using sglang-style approach:
             # 1. Compute global softmax over ALL experts (not just top-k)

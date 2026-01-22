@@ -3084,3 +3084,92 @@ def fused_ep_moe(
         w3_shared_scale,
         w2_shared_scale,
     )
+
+
+def fused_ep_moe_from_topk(
+    mesh: jax.sharding.Mesh,
+    tokens: jax.Array,  # (num_tokens, hidden_size)
+    w1: jax.Array,  # (num_experts, hidden_size, intermediate_size)
+    w2: jax.Array,  # (num_experts, intermediate_size, hidden_size)
+    w3: jax.Array,  # (num_experts, hidden_size, intermediate_size)
+    topk_ids_physical: jax.Array,  # (num_tokens, top_k)
+    topk_weights: jax.Array,  # (num_tokens, top_k)
+    *,
+    bias: jax.Array | None = None,
+    act_fn: str = "silu",
+    subc_quant_wsz: int | None = None,
+    w1_scale: jax.Array | None = None,
+    w2_scale: jax.Array | None = None,
+    w3_scale: jax.Array | None = None,
+    w1_shared: jax.Array | None = None,
+    w2_shared: jax.Array | None = None,
+    w3_shared: jax.Array | None = None,
+    w1_shared_scale: jax.Array | None = None,
+    w2_shared_scale: jax.Array | None = None,
+    w3_shared_scale: jax.Array | None = None,
+    b1: jax.Array | None = None,
+    b2: jax.Array | None = None,
+    b3: jax.Array | None = None,
+    block_config: FusedMoEBlockConfig | None = None,
+    dp_axis_name: str = "data",
+    tp_axis_name: str = "tensor",
+    renormalize_topk_logits: bool = False,
+    routed_scaling_factor: float | None = None,
+) -> jax.Array:
+    """Compatibility entrypoint: run fused MoE from precomputed physical top-k.
+
+    This is a temporary bridge implementation that materializes a dense gating matrix and
+    calls `fused_ep_moe`. It is correct but not intended for production scale because it
+    allocates `(num_tokens, num_experts)` gating HBM.
+    """
+    from sgl_jax.srt.eplb.topk import dense_logits_from_topk
+
+    if tokens.ndim != 2:
+        raise ValueError(f"Expected {tokens.ndim=} to be 2 for tokens (num_tokens, hidden).")
+    if topk_ids_physical.ndim != 2 or topk_weights.ndim != 2:
+        raise ValueError("Expected topk_ids_physical and topk_weights to be 2D.")
+    if topk_ids_physical.shape != topk_weights.shape:
+        raise ValueError(f"Expected {topk_ids_physical.shape=} to match {topk_weights.shape=}.")
+
+    top_k = int(topk_ids_physical.shape[1])
+    num_experts = int(w1.shape[0])
+
+    gating_output = dense_logits_from_topk(
+        topk_ids=topk_ids_physical,
+        topk_weights=topk_weights,
+        num_experts=num_experts,
+        fill_value=float("-inf"),
+    ).astype(tokens.dtype)
+
+    return fused_ep_moe(
+        mesh=mesh,
+        tokens=tokens,
+        w1=w1,
+        w2=w2,
+        w3=w3,
+        gating_output=gating_output,
+        top_k=top_k,
+        use_grouped_topk=False,
+        num_groups=1,
+        top_k_groups=1,
+        bias=bias,
+        renormalize_topk_logits=renormalize_topk_logits,
+        routed_scaling_factor=routed_scaling_factor,
+        act_fn=act_fn,
+        subc_quant_wsz=subc_quant_wsz,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w3_scale=w3_scale,
+        w1_shared=w1_shared,
+        w2_shared=w2_shared,
+        w3_shared=w3_shared,
+        w1_shared_scale=w1_shared_scale,
+        w2_shared_scale=w2_shared_scale,
+        w3_shared_scale=w3_shared_scale,
+        b1=b1,
+        b2=b2,
+        b3=b3,
+        block_config=block_config,
+        dp_axis_name=dp_axis_name,
+        tp_axis_name=tp_axis_name,
+    )
