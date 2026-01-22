@@ -686,7 +686,7 @@ class Scheduler(
             mm_items = recv_req.mm_inputs.get("mm_items", [])
 
             # Filter for image and video items
-            from sgl_jax.srt.managers.schedule_batch import MultimodalDataItem
+            from sgl_jax.srt.multimodal.common.modality_enum import MultimodalDataItem
 
             image_items = []
             video_items = []

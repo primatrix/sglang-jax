@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image
 from transformers import BaseImageProcessorFast
 
-from sgl_jax.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 from sgl_jax.srt.utils import load_audio, load_image, load_video, logger
 
 
@@ -227,13 +227,14 @@ class BaseMultimodalProcessor(ABC):
             hasattr(processor, "image_processor")
             and isinstance(processor.image_processor, BaseImageProcessorFast)
             and not self.server_args.disable_fast_image_processor
-        ):
-            if processor.__class__.__name__ not in {
+            and processor.__class__.__name__
+            not in {
                 "Qwen2_5_VLProcessor",
                 "Qwen3VLProcessor",
-            }:
-                # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
-                device = jax.devices()[0]
+            }
+        ):
+            # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
+            device = jax.devices()[0]
 
         # Process with the original processor (may produce PyTorch tensors)
         result = processor.__call__(

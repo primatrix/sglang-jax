@@ -5,15 +5,26 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal
 
+import numpy as np
+
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason
-from sgl_jax.srt.multimodal.mm_utils import has_valid_data
-from sgl_jax.srt.utils import ImageData
+from sgl_jax.srt.multimodal.common.modality_enum import flatten_nested_list
+from sgl_jax.srt.multimodal.common.multimodal_util import ImageData
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
     from PIL import Image
 else:
     Image = Any
+
+
+def has_valid_data(data) -> bool:
+    """Check if data contains any valid content."""
+    if data is None:
+        return False
+    if isinstance(data, list):
+        return any(has_valid_data(item) for item in flatten_nested_list(data))
+    return True
 
 
 @dataclass

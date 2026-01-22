@@ -360,7 +360,7 @@ class MultimodalInputs:
     def contains_mm_input(self) -> bool:
         return any(True for item in self.mm_items if item.is_valid())
 
-    def merge(self, other: MultimodalInputs):
+    def merge(self, other):
         """
         Merge multimodal inputs when merging requests
         """
