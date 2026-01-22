@@ -5,7 +5,6 @@ This is a stub implementation for the migration from sglang.
 
 import logging
 
-
 logger = logging.getLogger(__name__)
 from sgl_jax.srt.multimodal.common.multimodal_util import ImageData
 
@@ -40,6 +39,11 @@ def process_content_for_template_format(
         # OpenAI format: preserve structured content list, normalize types
         processed_content_parts = []
         for chunk in msg_dict["content"]:
+            if not isinstance(chunk, dict):
+                if hasattr(chunk, "model_dump"):
+                    chunk = chunk.model_dump()
+                elif hasattr(chunk, "dict"):
+                    chunk = chunk.dict()
             if isinstance(chunk, dict):
                 chunk_type = chunk.get("type")
 

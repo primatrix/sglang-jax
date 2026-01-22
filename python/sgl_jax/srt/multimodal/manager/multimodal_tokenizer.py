@@ -88,19 +88,20 @@ class MultimodalTokenizer(TokenizerManager):
             "tokenizer",
         }:
             processor_candidates.append(os.path.dirname(server_args.model_path.rstrip("/")))
+        trust_remote_code = server_args.trust_remote_code or server_args.multimodal
         for candidate in processor_candidates:
             try:
                 self.mm_processor = AutoProcessor.from_pretrained(
                     candidate,
-                    trust_remote_code=server_args.trust_remote_code,
+                    trust_remote_code=trust_remote_code,
                 )
                 self.mm_config = AutoConfig.from_pretrained(
                     candidate,
-                    trust_remote_code=server_args.trust_remote_code,
+                    trust_remote_code=trust_remote_code,
                 )
                 break
-            except Exception:
-                logger.warning("Failed to load processor/config from %s", candidate)
+            except Exception as exc:
+                logger.warning("Failed to load processor/config from %s: %s", candidate, exc)
         self.rid_to_state: dict[str, MMReqState] = {}
         self._result_dispatcher = TypeBasedDispatcher(
             [
