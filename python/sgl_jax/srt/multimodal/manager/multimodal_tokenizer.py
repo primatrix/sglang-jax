@@ -77,17 +77,30 @@ class MultimodalTokenizer(TokenizerManager):
         super().__init__(server_args, port_args)
         self.mm_processor = None
         self.mm_config = None
-        try:
-            self.mm_processor = AutoProcessor.from_pretrained(
-                server_args.model_path,
-                trust_remote_code=server_args.trust_remote_code,
-            )
-            self.mm_config = AutoConfig.from_pretrained(
-                server_args.model_path,
-                trust_remote_code=server_args.trust_remote_code,
-            )
-        except Exception:
-            logger.warning("Failed to load processor/config from %s", server_args.model_path)
+        processor_candidates = [server_args.model_path]
+        model_basename = os.path.basename(server_args.model_path.rstrip("/"))
+        if model_basename in {
+            "text_encoder",
+            "vision_encoder",
+            "language_model",
+            "transformer",
+            "vae",
+            "tokenizer",
+        }:
+            processor_candidates.append(os.path.dirname(server_args.model_path.rstrip("/")))
+        for candidate in processor_candidates:
+            try:
+                self.mm_processor = AutoProcessor.from_pretrained(
+                    candidate,
+                    trust_remote_code=server_args.trust_remote_code,
+                )
+                self.mm_config = AutoConfig.from_pretrained(
+                    candidate,
+                    trust_remote_code=server_args.trust_remote_code,
+                )
+                break
+            except Exception:
+                logger.warning("Failed to load processor/config from %s", candidate)
         self.rid_to_state: dict[str, MMReqState] = {}
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -209,7 +222,13 @@ class MultimodalTokenizer(TokenizerManager):
             elif obj.data_type == DataType.VIDEO:
                 video_data = [obj.input_reference]
 
-        if (image_data or video_data) and self.mm_processor is not None:
+        if (image_data or video_data) and self.mm_processor is None:
+            raise ValueError(
+                "Multimodal inputs provided but processor/config is not available. "
+                "Check model_path and trust_remote_code settings."
+            )
+
+        if image_data or video_data:
             images = [self._load_image_from_source(item) for item in image_data]
             videos = [self._load_video_from_source(item) for item in video_data]
             processor_out = self.mm_processor(
