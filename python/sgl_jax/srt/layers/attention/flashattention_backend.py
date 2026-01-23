@@ -21,6 +21,7 @@ from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.utils import cdiv
 from sgl_jax.srt.utils.jax_utils import device_array
 from sgl_jax.srt.utils.profiling_utils import named_scope
+from sgl_jax.srt.utils.quantization.quantization_utils import quantize_kv
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,9 @@ class FlashAttention(AttentionBackend):
         page_size: int = 1,
         kv_partition_axis: str = "tensor",
         attention_data_partition_axis: str = "data",
+        kv_cache_quantized_dtype: jnp.dtype = None,
+        cache_k_scale: float = None,
+        cache_v_scale: float = None,
         mesh: jax.sharding.Mesh = None,
     ):
         self.vmem_limit_bytes = vmem_limit_bytes
@@ -95,6 +99,9 @@ class FlashAttention(AttentionBackend):
         self.attention_data_partition_axis = attention_data_partition_axis
         self.forward_metadata = nnx.data(FlashAttentionMetadata())
         self.mesh = mesh
+        self.kv_cache_quantized_dtype = kv_cache_quantized_dtype
+        self.cache_k_scale = cache_k_scale
+        self.cache_v_scale = cache_v_scale
 
     def get_forward_metadata(
         self,
@@ -510,6 +517,12 @@ class FlashAttention(AttentionBackend):
         if hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
             page_indices_arg = token_to_kv_pool.remap_cache_loc(page_indices_arg, layer.layer_id)
 
+        # kv cache quant
+        if self.kv_cache_quantized_dtype:
+            k, v = quantize_kv(
+                self.kv_cache_quantized_dtype, k, v, self.cache_k_scale, self.cache_v_scale
+            )
+
         in_specs = (
             P(self.attention_data_partition_axis, self.kv_partition_axis),  # queries
             P(self.attention_data_partition_axis, self.kv_partition_axis),  # keys (new tokens)
@@ -546,6 +559,8 @@ class FlashAttention(AttentionBackend):
                 sm_scale=scale,
                 sliding_window=layer.sliding_window_size,
                 soft_cap=layer.logit_cap,
+                k_scale=self.cache_k_scale,
+                v_scale=self.cache_v_scale,
                 xai_temperature_len=(
                     layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
                 ),

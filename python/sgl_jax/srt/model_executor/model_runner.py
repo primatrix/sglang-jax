@@ -116,6 +116,16 @@ class ModelRunner(BaseModelRunner):
         # Initialize precision tracer enable state
         precision_tracer.set_enable_precision_tracer(server_args.enable_precision_tracer)
 
+        # kv cache quant
+        if server_args.kv_cache_dtype in [jnp.float8_e4m3, jnp.float8_e5m2]:
+            self.kv_cache_quantized_dtype = server_args.kv_cache_dtype
+            self.cache_k_scale = 1.0
+            self.cache_v_scale = 1.0
+        else:
+            self.kv_cache_quantized_dtype = None
+            self.cache_k_scale = None
+            self.cache_v_scale = None
+
         # If it is a draft model, tp_group can be different
         self.initialize()
 
@@ -355,6 +365,10 @@ class ModelRunner(BaseModelRunner):
             self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "bf16":
             self.kv_cache_dtype = jnp.bfloat16
+        elif self.server_args.kv_cache_dtype == "fp8_e5m2":
+            self.kv_cache_dtype = jnp.float8_e5m2
+        elif self.server_args.kv_cache_dtype == "fp8_e4m3":
+            self.kv_cache_dtype = jnp.float8_e4m3
         else:
             raise ValueError(f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}.")
         logger.info("ModelRunner kv_cache_dtype: %s", self.kv_cache_dtype)
@@ -521,6 +535,9 @@ class ModelRunner(BaseModelRunner):
                 self.model_config.head_dim,
                 page_size=self.page_size,
                 mesh=self.mesh,
+                kv_cache_quantized_dtype=self.kv_cache_quantized_dtype,
+                cache_k_scale=self.cache_k_scale,
+                cache_v_scale=self.cache_v_scale,
             )
         else:
             raise ValueError(f"Unsupported attention backend: {self.server_args.attention_backend}")

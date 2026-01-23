@@ -257,3 +257,28 @@ def generate_mock_model_worker_batch(
         dp_size=1,
         per_dp_bs_size=bs,
     )
+
+
+def static_per_tensor_quantize_tensor(
+    dtype: jnp.dtype,
+    tensor: jax.Array,
+    scale: float,
+) -> jax.Array:
+    dtype_info = jnp.iinfo(dtype) if jnp.issubdtype(dtype, jnp.integer) else jnp.finfo(dtype)
+    dtype_max = float(dtype_info.max)
+    dtype_min = float(dtype_info.min)
+
+    return jnp.clip(tensor / scale, dtype_min, dtype_max).astype(dtype)
+
+
+def quantize_kv(
+    dtype: jnp.dtype,
+    key: jax.Array,
+    value: jax.Array,
+    k_scale: float,
+    v_scale: float,
+) -> tuple[jax.Array, jax.Array]:
+    """Static quantize key and value tensors."""
+    key = static_per_tensor_quantize_tensor(dtype, key, k_scale)
+    value = static_per_tensor_quantize_tensor(dtype, value, v_scale)
+    return key, value
