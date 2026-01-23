@@ -72,7 +72,7 @@ BAILING_MINI_BASE = dict(
     ep_size=None,
 )
 
-_NUM_TOKENS = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
+_NUM_TOKENS = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
 
 BASE_CASES: Iterable[MoEBenchmarkCase] = tuple(
     MoEBenchmarkCase(
