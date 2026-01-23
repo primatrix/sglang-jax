@@ -9,7 +9,7 @@ from sgl_jax.srt.layers.embeddings import apply_rotary_emb
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.multimodal.configs.dits.wan_model_config import WanModelConfig
-from sgl_jax.srt.multimodal.layers.attention.layer import USPAttention
+from sgl_jax.srt.multimodal.layers.attention.layer import RingAttention
 from sgl_jax.srt.multimodal.layers.layernorm import (
     FP32LayerNorm,
     ScaleResidual,
@@ -101,7 +101,7 @@ class WanTransformerBlock(nnx.Module):
 
         # 1. Self-attention
 
-        self.attn1 = USPAttention(
+        self.attn1 = RingAttention(
             num_heads=num_heads,
             head_size=dim // num_heads,
             causal=False,
@@ -342,7 +342,7 @@ class WanSelfAttention(nnx.Module):
         self.norm_k = RMSNorm(dim, epsilon=self.epsilon)
 
         # Scaled dot product attention
-        self.attn = USPAttention(
+        self.attn = RingAttention(
             num_heads=num_heads,
             head_size=self.head_dim,
             dropout_rate=0,
