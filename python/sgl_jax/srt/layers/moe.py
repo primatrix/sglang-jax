@@ -903,15 +903,27 @@ class FusedEPMoE(nnx.Module):
                 logits = logits + router_bias.astype(jnp.float32)
 
             topk_weights, topk_ids_logical = jax.lax.top_k(logits, self.num_experts_per_tok)
-            dp_rank = jax.lax.axis_index("data")
-            tp_rank = jax.lax.axis_index("tensor")
             tp_size = int(self.mesh.shape["tensor"])
-            ep_rank = dp_rank * tp_size + tp_rank
 
-            dispatch_col = jax.lax.dynamic_index_in_dim(
-                self.eplb_dispatch_map.value, ep_rank.astype(jnp.int32), axis=1, keepdims=False
-            )
-            topk_ids_physical = dispatch_col[topk_ids_logical.astype(jnp.int32)]
+            def _map_logical_to_physical(
+                ids_logical: jax.Array, dispatch_map: jax.Array
+            ) -> jax.Array:
+                dp_rank = jax.lax.axis_index("data")
+                tp_rank = jax.lax.axis_index("tensor")
+                ep_rank = dp_rank * tp_size + tp_rank
+                dispatch_col = jax.lax.dynamic_index_in_dim(
+                    dispatch_map, ep_rank.astype(jnp.int32), axis=1, keepdims=False
+                )
+                return dispatch_col[ids_logical.astype(jnp.int32)]
+
+            topk_ids_physical = shard_map(
+                _map_logical_to_physical,
+                mesh=self.mesh,
+                in_specs=(P(("data", "tensor"), None), P(None, None)),
+                out_specs=P(("data", "tensor"), None),
+                check_vma=False,
+            )(topk_ids_logical, self.eplb_dispatch_map.value)
+            topk_weights = jax.device_put(topk_weights, topk_ids_physical.sharding)
 
             output = fused_ep_moe_from_topk(
                 mesh=self.mesh,
