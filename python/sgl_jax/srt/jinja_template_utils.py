@@ -1,12 +1,14 @@
+import logging
+
+from sgl_jax.srt.multimodal.common.multimodal_util import ImageData
+
 """
 Jinja template utilities for processing chat templates.
 This is a stub implementation for the migration from sglang.
 """
 
-import logging
 
 logger = logging.getLogger(__name__)
-from sgl_jax.srt.multimodal.common.multimodal_util import ImageData
 
 
 def process_content_for_template_format(
@@ -34,6 +36,15 @@ def process_content_for_template_format(
     if not isinstance(msg_dict.get("content"), list):
         # Already a string or None, no processing needed
         return {k: v for k, v in msg_dict.items() if v is not None}
+
+    if content_format is None:
+        # Heuristic fallback when template format detection isn't available.
+        # Structured OpenAI-style content parts always include "type".
+        content_format = (
+            "openai"
+            if any(isinstance(chunk, dict) and "type" in chunk for chunk in msg_dict["content"])
+            else "string"
+        )
 
     if content_format == "openai":
         # OpenAI format: preserve structured content list, normalize types

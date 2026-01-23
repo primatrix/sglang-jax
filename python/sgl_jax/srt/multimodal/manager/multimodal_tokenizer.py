@@ -196,7 +196,6 @@ class MultimodalTokenizer(TokenizerManager):
                 "Receive: obj=%s",
                 dataclass_to_string_truncated(obj, max_length, skip_names=skip_names),
             )
-
         tokenized_obj = await self._tokenize_one_request(obj)
         state = self._send_one_request(obj, tokenized_obj, created_time)
         async for response in self._wait_one_response(obj, state, request):
@@ -214,7 +213,6 @@ class MultimodalTokenizer(TokenizerManager):
         input_ids = getattr(obj, "input_ids", None)
         neg_input_ids = getattr(obj, "neg_input_ids", None)
         mm_inputs = None
-
         image_data = self._normalize_mm_list(getattr(obj, "image_data", None))
         video_data = self._normalize_mm_list(getattr(obj, "video_data", None))
         if not image_data and not video_data and getattr(obj, "input_reference", None) is not None:
@@ -222,13 +220,11 @@ class MultimodalTokenizer(TokenizerManager):
                 image_data = [obj.input_reference]
             elif obj.data_type == DataType.VIDEO:
                 video_data = [obj.input_reference]
-
         if (image_data or video_data) and self.mm_processor is None:
             raise ValueError(
                 "Multimodal inputs provided but processor/config is not available. "
                 "Check model_path and trust_remote_code settings."
             )
-
         if image_data or video_data:
             images = [self._load_image_from_source(item) for item in image_data]
             videos = [self._load_video_from_source(item) for item in video_data]
@@ -236,7 +232,7 @@ class MultimodalTokenizer(TokenizerManager):
                 images=images or None,
                 videos=videos or None,
                 text=input_text or "",
-                return_tensors="np",
+                return_tensors="pt",
             )
             if "input_ids" in processor_out:
                 input_ids = processor_out["input_ids"][0].tolist()
@@ -317,7 +313,6 @@ class MultimodalTokenizer(TokenizerManager):
                 "video_grid_thw": video_grid_thw,
                 "second_per_grid_ts": second_per_grid_ts,
             }
-
         if input_ids is None and input_text is not None:
             if self.tokenizer is None:
                 raise ValueError(

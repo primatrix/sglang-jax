@@ -1,29 +1,18 @@
-import signal
-import subprocess
-import sys
-import tempfile
-import threading
-import time
-import traceback
-from collections import OrderedDict
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
-from functools import lru_cache
-from io import BytesIO
-from pathlib import Path
-from typing import Any, Literal
-from urllib.parse import urlparse
+import logging
 import os
-import jax
+import tempfile
+from dataclasses import dataclass
+from io import BytesIO
+from typing import Literal
+from urllib.parse import urlparse
+
 import numpy as np
-import psutil
 import pybase64
 import requests
-import zmq
-from fastapi.responses import ORJSONResponse
 from PIL import Image
-import logging
+
 logger = logging.getLogger(__name__)
+
 
 def decode_video_base64(video_base64):
     from PIL import Image
@@ -280,7 +269,3 @@ def encode_video(video_path, frame_count_limit=None):
     frames = vr.get_batch(frame_indices).asnumpy()
     frames = [Image.fromarray(v.astype("uint8")) for v in frames]
     return frames
-
-
-
-

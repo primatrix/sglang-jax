@@ -42,7 +42,7 @@ def get_mm_processor(
     for model_cls, processor_cls in PROCESSOR_MAPPING.items():
         if model_cls.__name__ in hf_config.architectures:
             return processor_cls(hf_config, server_args, processor, transport_mode)
-    # FIXME this should be fixed cause we modify the architecture name in multimodal 
+    # FIXME this should be fixed cause we modify the architecture name in multimodal
     raise ValueError(
         f"No processor registered for architecture: {hf_config.architectures}.\n"
         f"Registered architectures: {[model_cls.__name__ for model_cls in PROCESSOR_MAPPING]}"
