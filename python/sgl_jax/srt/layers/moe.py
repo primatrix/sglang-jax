@@ -890,17 +890,19 @@ class FusedEPMoE(nnx.Module):
         w2_shared_val = self.w2_shared.value if self.w2_shared is not None else None
 
         if self.enable_eplb:
-            if self.use_grouped_topk or router_bias is not None:
-                raise NotImplementedError(
-                    "EPLB fused path currently requires use_grouped_topk=False and router_bias=None."
-                )
             if router_logits.shape[-1] != self.num_logical_experts:
                 raise ValueError(
                     f"EPLB expects router_logits last dim to be {self.num_logical_experts}, got {router_logits.shape[-1]}."
                 )
-            topk_weights, topk_ids_logical = jax.lax.top_k(
-                router_logits.astype(jnp.float32), self.num_experts_per_tok
-            )
+
+            # EPLB path always computes top-k in logical-expert space, then maps logical->physical
+            # using the current dispatch map. For compatibility with models that enable grouped-topk
+            # or router expert-bias, we fall back to plain top-k over all logical experts here.
+            logits = router_logits.astype(jnp.float32)
+            if router_bias is not None:
+                logits = logits + router_bias.astype(jnp.float32)
+
+            topk_weights, topk_ids_logical = jax.lax.top_k(logits, self.num_experts_per_tok)
             dp_rank = jax.lax.axis_index("data")
             tp_rank = jax.lax.axis_index("tensor")
             tp_size = int(self.mesh.shape["tensor"])
