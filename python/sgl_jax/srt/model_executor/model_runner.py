@@ -254,6 +254,55 @@ class ModelRunner(BaseModelRunner):
 
         self.jitted_compute_logprobs = partial(jitted_compute_logprobs, self.mesh)
 
+    def _materialize_eplb_dispatch_maps(self) -> None:
+        """Materialize EPLB dispatch maps after `nnx.eval_shape` + weight loading.
+
+        The model is instantiated under `nnx.eval_shape`, so non-checkpoint state (like
+        EPLB dispatch maps) can remain as `jax.ShapeDtypeStruct` leaves unless explicitly
+        replaced with concrete arrays. This must run before the first JIT'ed forward.
+        """
+        if not getattr(self.server_args, "enable_eplb", False):
+            return
+        if getattr(self.server_args, "moe_backend", None) != "fused":
+            return
+
+        init_dispatch_all = getattr(self.model_config.hf_config, "eplb_initial_dispatch_map", None)
+
+        from jax.sharding import NamedSharding
+        from jax.sharding import PartitionSpec as P
+
+        def walk(obj) -> None:
+            from sgl_jax.srt.layers.moe import FusedEPMoE
+
+            if isinstance(obj, FusedEPMoE) and getattr(obj, "enable_eplb", False):
+                dispatch = None
+                if init_dispatch_all is not None:
+                    dispatch = init_dispatch_all[int(obj.layer_id)]
+                else:
+                    dispatch = np.tile(
+                        np.arange(int(obj.num_logical_experts), dtype=np.int32)[:, None],
+                        (1, int(obj.ep_size)),
+                    )
+                obj.eplb_dispatch_map.value = jax.device_put(
+                    np.asarray(dispatch, dtype=np.int32),
+                    NamedSharding(self.mesh, P()),
+                )
+                return
+
+            if isinstance(obj, (list, tuple)):
+                for x in obj:
+                    walk(x)
+                return
+            if isinstance(obj, dict):
+                for x in obj.values():
+                    walk(x)
+                return
+            if hasattr(obj, "__dict__"):
+                for x in obj.__dict__.values():
+                    walk(x)
+
+        walk(self.model)
+
     def apply_eplb_rebalance(self, *, new_metadata) -> None:
         """Apply a new EPLB placement online (fused MoE only).
 
@@ -597,6 +646,11 @@ class ModelRunner(BaseModelRunner):
         self.model = self.model_loader.load_model(
             model_config=self.model_config,
         )
+        if (
+            getattr(self.model_config.hf_config, "enable_eplb", False)
+            and getattr(self.model_config.hf_config, "moe_backend", None) == "fused"
+        ):
+            self._materialize_eplb_dispatch_maps()
         if (
             getattr(self.model_config.hf_config, "enable_eplb", False)
             and getattr(self.model_config.hf_config, "moe_backend", None) == "fused"
