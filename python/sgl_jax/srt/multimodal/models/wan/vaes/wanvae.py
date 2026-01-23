@@ -1146,21 +1146,20 @@ class AutoencoderKLWan(nnx.Module):
     def decode(self, z: jax.Array) -> jax.Array:
         if self.use_feature_cache:
             self.clear_cache()
-            iter_ = z.shape[1]
             x, _ = self.post_quant_conv(z)
             cache_list = self._feat_map
-            for i in range(iter_):
-                cache_idx = [0]
-                if i == 0:
-                    out, cache_list = self.decoder(
-                        x[:, i : i + 1, :, :, :], cache_list=cache_list, cache_idx=cache_idx
-                    )
-                else:
-                    out_, cache_list = self.decoder(
-                        x[:, i : i + 1, :, :, :], cache_list=cache_list, cache_idx=cache_idx
-                    )
-                    out = jnp.concatenate([out, out_], 1)
+            x_seq = jnp.swapaxes(x, 0, 1)  # [T, B, H, W, C]
 
+            def step(carry, x_t):
+                cache_list = carry
+                cache_idx = [0]
+                out_t, cache_list = self.decoder(
+                    x_t[:, None, :, :, :], cache_list=cache_list, cache_idx=cache_idx
+                )
+                return cache_list, out_t[:, 0]
+
+            cache_list, outs = jax.lax.scan(step, cache_list, x_seq)
+            out = jnp.swapaxes(outs, 0, 1)  # [B, T, H, W, C]
             out = jnp.clip(out, min=-1.0, max=1.0)
             self.clear_cache()
         else:
