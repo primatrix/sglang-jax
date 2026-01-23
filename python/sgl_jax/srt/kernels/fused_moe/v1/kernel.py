@@ -3122,8 +3122,6 @@ def fused_ep_moe_from_topk(
     calls `fused_ep_moe`. It is correct but not intended for production scale because it
     allocates `(num_tokens, num_experts)` gating HBM.
     """
-    from sgl_jax.srt.eplb.topk import dense_logits_from_topk
-
     if tokens.ndim != 2:
         raise ValueError(f"Expected {tokens.ndim=} to be 2 for tokens (num_tokens, hidden).")
     if topk_ids_physical.ndim != 2 or topk_weights.ndim != 2:
@@ -3134,12 +3132,26 @@ def fused_ep_moe_from_topk(
     top_k = int(topk_ids_physical.shape[1])
     num_experts = int(w1.shape[0])
 
-    gating_output = dense_logits_from_topk(
-        topk_ids=topk_ids_physical,
-        topk_weights=topk_weights,
-        num_experts=num_experts,
-        fill_value=float("-inf"),
-    ).astype(tokens.dtype)
+    # Materialize dense gating with explicit mesh sharding so scatter works under SPMD.
+    # This is a correctness-first bridge (allocates (num_tokens, num_experts)).
+    from jax.sharding import NamedSharding
+    from jax.sharding import PartitionSpec as P
+
+    num_tokens = int(tokens.shape[0])
+    gating_output = jnp.full(
+        (num_tokens, num_experts),
+        jnp.float32(float("-inf")),
+        dtype=jnp.float32,
+    )
+    gating_output = jax.sharding.reshard(
+        gating_output,
+        NamedSharding(mesh, P((dp_axis_name, tp_axis_name), None)),
+    )
+    rows = jnp.arange(num_tokens, dtype=jnp.int32)[:, None]
+    gating_output = gating_output.at[rows, topk_ids_physical.astype(jnp.int32)].set(
+        topk_weights.astype(jnp.float32)
+    )
+    gating_output = gating_output.astype(tokens.dtype)
 
     return fused_ep_moe(
         mesh=mesh,
