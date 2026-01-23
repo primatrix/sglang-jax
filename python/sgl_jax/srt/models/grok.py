@@ -227,11 +227,14 @@ class Grok1MoE(nnx.Module):
         self.layer_id = layer_id
         self.mesh = mesh
 
+        num_logical_experts = int(num_experts)
+        num_physical_experts = int(getattr(config, "num_physical_experts", num_logical_experts))
+
         # Gate always runs at full precision for stability
         # (see https://arxiv.org/pdf/2101.03961)
         self.gate = LinearBase(
             input_size=hidden_size,
-            output_size=num_experts,
+            output_size=num_logical_experts,
             use_bias=False,
             params_dtype=jnp.float32,
             kernel_axes=(None, None),
@@ -249,9 +252,14 @@ class Grok1MoE(nnx.Module):
         )
 
         if self.use_fused:
+            initial_dispatch = None
+            if getattr(config, "enable_eplb", False):
+                init_dispatch_all = getattr(config, "eplb_initial_dispatch_map", None)
+                if init_dispatch_all is not None:
+                    initial_dispatch = init_dispatch_all[layer_id]
             self.experts = FusedEPMoE(
                 hidden_size=hidden_size,
-                num_experts=num_experts,
+                num_experts=num_physical_experts,
                 num_experts_per_tok=self.top_k,
                 intermediate_dim=intermediate_size,
                 mesh=mesh,
@@ -261,11 +269,14 @@ class Grok1MoE(nnx.Module):
                 dtype=dtype,
                 layer_id=layer_id,
                 renormalize_topk_logits=False,  # Match sglang behavior
+                enable_eplb=getattr(config, "enable_eplb", False),
+                num_logical_experts=num_logical_experts,
+                initial_dispatch_map_layer=initial_dispatch,
             )
         else:
             self.experts = EPMoE(
                 hidden_size=config.hidden_size,
-                num_experts=num_experts,
+                num_experts=num_logical_experts,
                 num_experts_per_tok=self.top_k,
                 intermediate_dim=intermediate_size,
                 mesh=mesh,
@@ -951,17 +962,40 @@ class Grok1ForCausalLM(nnx.Module):
 
         # Concat axes for TP-split weights
         grok_concat_axis_map = {"w1": 0, "w3": 0, "w2": -1}
-
-        moe_mappings = create_moe_weights_mapping(
-            prefix=prefix,
-            target_prefix=target_prefix,
-            num_experts=self.config.num_local_experts,
-            expert_type_names=("w1", "w3", "w2"),
-            moe_path="block_sparse_moe.experts",
-            source_expert_pattern="{i}",
-            moe_backend=moe_backend,
-            expert_concat_axis_map=grok_concat_axis_map,
+        num_logical_experts = int(self.config.num_local_experts)
+        num_physical_experts = int(
+            getattr(self.config, "num_physical_experts", num_logical_experts)
         )
+
+        enable_eplb = bool(getattr(self.config, "enable_eplb", False))
+        if moe_backend == "fused" and enable_eplb and num_physical_experts != num_logical_experts:
+            p2l_all = getattr(self.config, "eplb_initial_physical_to_logical_map", None)
+            if p2l_all is None:
+                raise ValueError(
+                    "EPLB redundant experts requested, but config.eplb_initial_physical_to_logical_map is missing."
+                )
+            moe_mappings = create_moe_weights_mapping(
+                prefix=prefix,
+                target_prefix=target_prefix,
+                num_experts=num_physical_experts,
+                physical_to_logical_map=p2l_all[layer_idx],
+                expert_type_names=("w1", "w3", "w2"),
+                moe_path="block_sparse_moe.experts",
+                source_expert_pattern="{i}",
+                moe_backend=moe_backend,
+                expert_concat_axis_map=grok_concat_axis_map,
+            )
+        else:
+            moe_mappings = create_moe_weights_mapping(
+                prefix=prefix,
+                target_prefix=target_prefix,
+                num_experts=num_logical_experts,
+                expert_type_names=("w1", "w3", "w2"),
+                moe_path="block_sparse_moe.experts",
+                source_expert_pattern="{i}",
+                moe_backend=moe_backend,
+                expert_concat_axis_map=grok_concat_axis_map,
+            )
         mappings.update(moe_mappings)
 
         return mappings

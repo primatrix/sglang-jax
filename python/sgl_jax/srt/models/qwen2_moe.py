@@ -207,7 +207,8 @@ class Qwen2MoeDecoderLayer(nnx.Module):
         )
 
         # Use MoE for all layers
-        num_experts = getattr(config, "num_experts", 8)
+        num_logical_experts = getattr(config, "num_experts", 8)
+        num_physical_experts = getattr(config, "num_physical_experts", num_logical_experts)
         num_experts_per_tok = getattr(config, "num_experts_per_tok", 2)
         moe_intermediate_size = getattr(config, "moe_intermediate_size", config.intermediate_size)
         self.num_experts_per_tok = num_experts_per_tok
@@ -218,7 +219,7 @@ class Qwen2MoeDecoderLayer(nnx.Module):
 
         self.moe_gate = GateLogit(
             input_size=config.hidden_size,
-            num_experts=num_experts,
+            num_experts=num_logical_experts,
             weight_dtype=dtype,
         )
 
@@ -228,9 +229,15 @@ class Qwen2MoeDecoderLayer(nnx.Module):
         if self.use_fused:
             from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 
+            initial_dispatch = None
+            if getattr(config, "enable_eplb", False):
+                init_dispatch_all = getattr(config, "eplb_initial_dispatch_map", None)
+                if init_dispatch_all is not None:
+                    initial_dispatch = init_dispatch_all[layer_id]
+
             self.mlp = FusedEPMoE(
                 hidden_size=config.hidden_size,
-                num_experts=num_experts,
+                num_experts=num_physical_experts,
                 num_experts_per_tok=num_experts_per_tok,
                 intermediate_dim=moe_intermediate_size,
                 mesh=mesh,
@@ -239,6 +246,9 @@ class Qwen2MoeDecoderLayer(nnx.Module):
                 dtype=dtype,
                 layer_id=layer_id,
                 renormalize_topk_logits=getattr(config, "norm_topk_prob", True),
+                enable_eplb=getattr(config, "enable_eplb", False),
+                num_logical_experts=num_logical_experts,
+                initial_dispatch_map_layer=initial_dispatch,
             )
         else:
             self.topk = TopK(
@@ -247,7 +257,7 @@ class Qwen2MoeDecoderLayer(nnx.Module):
             )
             self.mlp = EPMoE(
                 hidden_size=config.hidden_size,
-                num_experts=num_experts,
+                num_experts=num_logical_experts,
                 num_experts_per_tok=num_experts_per_tok,
                 intermediate_dim=moe_intermediate_size,
                 mesh=mesh,
@@ -591,16 +601,34 @@ class Qwen2MoeForCausalLM(nnx.Module):
             mappings.update(shared_expert_mappings)
 
         num_experts = getattr(self.config, "num_experts", 8)
+        num_physical_experts = getattr(self.config, "num_physical_experts", num_experts)
         moe_backend = getattr(self.config, "moe_backend", "epmoe")
 
-        moe_mappings = create_moe_weights_mapping(
-            prefix=prefix,
-            target_prefix=target_prefix,
-            num_experts=num_experts,
-            moe_backend=moe_backend,
-            moe_path="mlp",
-            source_expert_pattern="experts.{i}",
-        )
+        enable_eplb = bool(getattr(self.config, "enable_eplb", False))
+        if moe_backend == "fused" and enable_eplb and int(num_physical_experts) != int(num_experts):
+            p2l_all = getattr(self.config, "eplb_initial_physical_to_logical_map", None)
+            if p2l_all is None:
+                raise ValueError(
+                    "EPLB redundant experts requested, but config.eplb_initial_physical_to_logical_map is missing."
+                )
+            moe_mappings = create_moe_weights_mapping(
+                prefix=prefix,
+                target_prefix=target_prefix,
+                num_experts=int(num_physical_experts),
+                physical_to_logical_map=p2l_all[layer_idx],
+                moe_backend=moe_backend,
+                moe_path="mlp",
+                source_expert_pattern="experts.{i}",
+            )
+        else:
+            moe_mappings = create_moe_weights_mapping(
+                prefix=prefix,
+                target_prefix=target_prefix,
+                num_experts=int(num_experts),
+                moe_backend=moe_backend,
+                moe_path="mlp",
+                source_expert_pattern="experts.{i}",
+            )
         mappings.update(moe_mappings)
 
         return mappings

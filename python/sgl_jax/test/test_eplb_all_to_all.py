@@ -43,9 +43,17 @@ class TestEplbAllToAllPlan(unittest.TestCase):
             offs = plan.input_offsets[r]
             self.assertTrue(np.array_equal(offs[1:], np.cumsum(sizes[:-1])))
 
-            rsizes = plan.recv_sizes[r]
-            roffs = plan.output_offsets[r]
-            self.assertTrue(np.array_equal(roffs[1:], np.cumsum(rsizes[:-1])))
+        # output_offsets are sender-side. For each receiver, they should match
+        # receiver-side prefix sums over senders when transposed.
+        for dst_rank in range(ep_size):
+            expected_receiver_offsets = np.zeros((ep_size,), dtype=np.int32)
+            if ep_size > 1:
+                expected_receiver_offsets[1:] = np.cumsum(plan.recv_sizes[dst_rank][:-1])
+            for src_rank in range(ep_size):
+                self.assertEqual(
+                    int(plan.output_offsets[src_rank][dst_rank]),
+                    int(expected_receiver_offsets[src_rank]),
+                )
 
         # Per-rank flattened index vectors must match total sizes.
         for r in range(ep_size):

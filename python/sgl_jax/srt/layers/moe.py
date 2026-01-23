@@ -1,11 +1,16 @@
 import jax
+import numpy as np
 from flax import nnx
 from jax import numpy as jnp
 from jax import shard_map
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_ep_moe
+from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
+    FusedMoEBlockConfig,
+    fused_ep_moe,
+    fused_ep_moe_from_topk,
+)
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import (
@@ -712,10 +717,12 @@ class FusedEPMoE(nnx.Module):
     def __init__(
         self,
         hidden_size: int,
-        num_experts: int,
+        num_experts: int,  # physical experts (E_physical)
         num_experts_per_tok: int,
         ep_size: int,
         mesh: Mesh,
+        *,
+        num_logical_experts: int | None = None,
         intermediate_dim: int = 2048,
         weight_dtype: jnp.dtype = jnp.bfloat16,
         dtype: jnp.dtype = jnp.bfloat16,
@@ -728,15 +735,23 @@ class FusedEPMoE(nnx.Module):
         routed_scaling_factor: float | None = None,
         num_shared_experts: int = 0,
         moe_shared_expert_intermediate_size: int | None = None,
+        enable_eplb: bool = False,
+        initial_dispatch_map_layer: jax.Array | None = None,  # (E_logical, ep_size) int32
     ):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
+        self.num_logical_experts = int(num_logical_experts or num_experts)
         self.intermediate_dim = intermediate_dim
         self.weight_dtype = weight_dtype
         self.dtype = dtype
         self.layer_id = layer_id
-        self.ep_size = ep_size
+        ep_size_mesh = int(mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1))
+        if ep_size != ep_size_mesh:
+            raise ValueError(
+                f"Expected ep_size to equal dp*tp for fused MoE, got {ep_size=} vs {ep_size_mesh=}."
+            )
+        self.ep_size = ep_size_mesh
         self.activation = activation
         self.use_grouped_topk = use_grouped_topk
         self.num_groups = num_groups
@@ -748,10 +763,19 @@ class FusedEPMoE(nnx.Module):
             moe_shared_expert_intermediate_size or intermediate_dim
         )
         self.mesh = mesh
+        self.enable_eplb = enable_eplb
 
         if num_experts % self.ep_size != 0:
             raise ValueError(
                 f"num_experts({num_experts}) must be divisible by ep_size ({self.ep_size})"
+            )
+        if self.num_logical_experts <= 0:
+            raise ValueError(
+                f"Expected num_logical_experts to be > 0, got {self.num_logical_experts}."
+            )
+        if self.num_logical_experts > num_experts:
+            raise ValueError(
+                f"Expected num_logical_experts <= num_experts, got {self.num_logical_experts=} {num_experts=}."
             )
 
         # Initialize weights.
@@ -779,6 +803,27 @@ class FusedEPMoE(nnx.Module):
                 dtype=weight_dtype,
                 out_sharding=P("tensor", None, None),
             )
+        )
+
+        # Per-layer logical->physical expert mapping for EPLB routing.
+        # For redundancy, this dispatch chooses which physical replica each EP rank should use.
+        # Online updates rewrite this (and the corresponding weights) in-place.
+        if initial_dispatch_map_layer is not None:
+            initial_dispatch_map_layer = jnp.asarray(initial_dispatch_map_layer).astype(jnp.int32)
+            if initial_dispatch_map_layer.shape != (self.num_logical_experts, self.ep_size):
+                raise ValueError(
+                    "Expected initial_dispatch_map_layer to have shape "
+                    f"({self.num_logical_experts}, {self.ep_size}), got {initial_dispatch_map_layer.shape}."
+                )
+            init_dispatch = initial_dispatch_map_layer
+        else:
+            init_dispatch = jnp.tile(
+                jnp.arange(self.num_logical_experts, dtype=jnp.int32)[:, None],
+                (1, self.ep_size),
+            )
+        self.eplb_dispatch_map = nnx.Param(
+            init_dispatch,
+            out_sharding=P(),
         )
 
         if self.num_shared_experts > 0:
@@ -844,36 +889,88 @@ class FusedEPMoE(nnx.Module):
         w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
         w2_shared_val = self.w2_shared.value if self.w2_shared is not None else None
 
-        output = fused_ep_moe(
-            mesh=self.mesh,
-            tokens=hidden_states,
-            w1=self.w1.value,
-            w2=self.w2.value,
-            w3=self.w3.value,
-            gating_output=router_logits,
-            bias=router_bias,
-            top_k=self.num_experts_per_tok,
-            use_grouped_topk=self.use_grouped_topk,
-            num_groups=self.num_groups,
-            top_k_groups=self.top_k_groups,
-            renormalize_topk_logits=self.renormalize_topk_logits,
-            routed_scaling_factor=self.routed_scaling_factor,
-            act_fn=self.activation,
-            block_config=block_config,
-            # Optional parameters (not used in basic case)
-            subc_quant_wsz=None,
-            w1_scale=None,
-            w2_scale=None,
-            w3_scale=None,
-            w1_shared=w1_shared_val,
-            w2_shared=w2_shared_val,
-            w3_shared=w3_shared_val,
-            b1=None,
-            b2=None,
-            b3=None,
-            dp_axis_name="data",
-            tp_axis_name="tensor",
-        )
+        if self.enable_eplb:
+            if self.use_grouped_topk or router_bias is not None:
+                raise NotImplementedError(
+                    "EPLB fused path currently requires use_grouped_topk=False and router_bias=None."
+                )
+            if router_logits.shape[-1] != self.num_logical_experts:
+                raise ValueError(
+                    f"EPLB expects router_logits last dim to be {self.num_logical_experts}, got {router_logits.shape[-1]}."
+                )
+            topk_weights, topk_ids_logical = jax.lax.top_k(
+                router_logits.astype(jnp.float32), self.num_experts_per_tok
+            )
+            dp_rank = jax.lax.axis_index("data")
+            tp_rank = jax.lax.axis_index("tensor")
+            tp_size = int(self.mesh.shape["tensor"])
+            ep_rank = dp_rank * tp_size + tp_rank
+
+            dispatch_col = jax.lax.dynamic_index_in_dim(
+                self.eplb_dispatch_map.value, ep_rank.astype(jnp.int32), axis=1, keepdims=False
+            )
+            topk_ids_physical = dispatch_col[topk_ids_logical.astype(jnp.int32)]
+
+            output = fused_ep_moe_from_topk(
+                mesh=self.mesh,
+                tokens=hidden_states,
+                w1=self.w1.value,
+                w2=self.w2.value,
+                w3=self.w3.value,
+                topk_ids_physical=topk_ids_physical,
+                topk_weights=topk_weights,
+                bias=None,
+                act_fn=self.activation,
+                subc_quant_wsz=None,
+                w1_scale=None,
+                w2_scale=None,
+                w3_scale=None,
+                w1_shared=w1_shared_val,
+                w2_shared=w2_shared_val,
+                w3_shared=w3_shared_val,
+                w1_shared_scale=None,
+                w2_shared_scale=None,
+                w3_shared_scale=None,
+                b1=None,
+                b2=None,
+                b3=None,
+                block_config=block_config,
+                dp_axis_name="data",
+                tp_axis_name="tensor",
+                renormalize_topk_logits=self.renormalize_topk_logits,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
+        else:
+            output = fused_ep_moe(
+                mesh=self.mesh,
+                tokens=hidden_states,
+                w1=self.w1.value,
+                w2=self.w2.value,
+                w3=self.w3.value,
+                gating_output=router_logits,
+                bias=router_bias,
+                top_k=self.num_experts_per_tok,
+                use_grouped_topk=self.use_grouped_topk,
+                num_groups=self.num_groups,
+                top_k_groups=self.top_k_groups,
+                renormalize_topk_logits=self.renormalize_topk_logits,
+                routed_scaling_factor=self.routed_scaling_factor,
+                act_fn=self.activation,
+                block_config=block_config,
+                # Optional parameters (not used in basic case)
+                subc_quant_wsz=None,
+                w1_scale=None,
+                w2_scale=None,
+                w3_scale=None,
+                w1_shared=w1_shared_val,
+                w2_shared=w2_shared_val,
+                w3_shared=w3_shared_val,
+                b1=None,
+                b2=None,
+                b3=None,
+                dp_axis_name="data",
+                tp_axis_name="tensor",
+            )
 
         output = jax.sharding.reshard(output, NamedSharding(self.mesh, P(None, None)))
         return output
@@ -884,6 +981,7 @@ def create_moe_weights_mapping(
     prefix: str,
     target_prefix: str,
     num_experts: int,
+    physical_to_logical_map: list[int] | np.ndarray | None = None,
     expert_type_names: tuple[str, str, str] = (
         "gate_proj",
         "up_proj",
@@ -920,11 +1018,26 @@ def create_moe_weights_mapping(
         # Target path for JAX model parameters (matching EPMoE internal variables)
         target_path_base = f"{target_prefix}.{moe_path}.{target_name}"
 
-        # Source weight paths for all experts to be loaded and concatenated
-        expert_keys = [
-            f"{prefix}.{moe_path}.{source_expert_pattern.format(i=i)}.{source_name}.weight"
-            for i in range(num_experts)
-        ]
+        # Source weight paths for all experts to be loaded and concatenated.
+        # For EPLB redundancy with fused MoE, `num_experts` may be E_physical, and
+        # `physical_to_logical_map` maps each physical slot to the logical expert id to copy from.
+        if physical_to_logical_map is not None:
+            p2l = np.asarray(physical_to_logical_map, dtype=np.int32)
+            if p2l.shape != (num_experts,):
+                raise ValueError(
+                    f"Expected physical_to_logical_map to have shape ({num_experts},), got {p2l.shape}."
+                )
+            if np.any(p2l < 0):
+                raise ValueError("physical_to_logical_map contains negative logical ids")
+            expert_keys = [
+                f"{prefix}.{moe_path}.{source_expert_pattern.format(i=int(p2l[i]))}.{source_name}.weight"
+                for i in range(num_experts)
+            ]
+        else:
+            expert_keys = [
+                f"{prefix}.{moe_path}.{source_expert_pattern.format(i=i)}.{source_name}.weight"
+                for i in range(num_experts)
+            ]
 
         if moe_backend == "epmoe":
             # Sharding logic based on EPMoE PartitionSpec:

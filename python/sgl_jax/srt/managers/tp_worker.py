@@ -204,6 +204,8 @@ class ModelWorker:
         self.sync_queue = Queue()
 
         self._eplb_controller = self._maybe_create_eplb_controller()
+        self._eplb_pending_metadata = None
+        self._eplb_lock = threading.Lock()
         self.sync_expert_ids_d2h_thread = threading.Thread(
             target=self._sync_expert_ids_d2h_thread_func,
             daemon=True,
@@ -244,6 +246,23 @@ class ModelWorker:
 
         ep_size = int(self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1))
         from sgl_jax.srt.eplb import EplbController
+        from sgl_jax.srt.eplb.metadata import choose_num_physical_experts
+
+        _e_physical, actual_r = choose_num_physical_experts(
+            num_logical_experts=int(num_logical_experts),
+            ep_size=ep_size,
+            requested_num_redundant_experts=int(self.server_args.eplb_redundant_experts),
+            max_num_redundant_experts=int(self.server_args.eplb_max_redundant_experts),
+        )
+        if actual_r != int(self.server_args.eplb_redundant_experts):
+            logger.warning(
+                "Adjusting eplb_redundant_experts for divisibility: requested=%d actual=%d "
+                "(E_logical=%d ep_size=%d)",
+                int(self.server_args.eplb_redundant_experts),
+                int(actual_r),
+                int(num_logical_experts),
+                int(ep_size),
+            )
 
         logger.info(
             "EPLB enabled: num_layers=%d num_logical_experts=%d top_k=%d ep_size=%d window=%d interval=%d R=%d",
@@ -253,7 +272,7 @@ class ModelWorker:
             ep_size,
             int(self.server_args.eplb_window_size),
             int(self.server_args.eplb_update_interval),
-            int(self.server_args.eplb_redundant_experts),
+            int(actual_r),
         )
         return EplbController(
             num_layers=num_layers,
@@ -262,7 +281,7 @@ class ModelWorker:
             ep_size=ep_size,
             window_size=int(self.server_args.eplb_window_size),
             update_interval=int(self.server_args.eplb_update_interval),
-            num_redundant_experts=int(self.server_args.eplb_redundant_experts),
+            num_redundant_experts=int(actual_r),
             max_num_redundant_experts=int(self.server_args.eplb_max_redundant_experts),
             seed=int(self.server_args.eplb_seed),
         )
@@ -319,6 +338,8 @@ class ModelWorker:
             max_over_mean,
             update.metadata.num_physical_experts,
         )
+        with self._eplb_lock:
+            self._eplb_pending_metadata = update.metadata
 
     def normalize_token_paddings(self):
         normalized_token_paddings = []
@@ -624,6 +645,13 @@ class ModelWorker:
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
+
+        pending = None
+        with self._eplb_lock:
+            pending = self._eplb_pending_metadata
+            self._eplb_pending_metadata = None
+        if pending is not None:
+            self.model_runner.apply_eplb_rebalance(new_metadata=pending)
 
         self.dump_topk_ids(layers_topk_ids, model_worker_batch)
 

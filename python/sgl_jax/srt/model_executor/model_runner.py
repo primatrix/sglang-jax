@@ -114,6 +114,9 @@ class ModelRunner(BaseModelRunner):
         # Initialize precision tracer enable state
         precision_tracer.set_enable_precision_tracer(server_args.enable_precision_tracer)
 
+        # Online EPLB state (host-side).
+        self._eplb_metadata = None
+
         # If it is a draft model, tp_group can be different
         self.initialize()
 
@@ -173,8 +176,11 @@ class ModelRunner(BaseModelRunner):
 
     def initialize_jit(self):
         model_def, model_state = nnx.split(self.model)
+        # Save for online state rewrites (e.g., EPLB weight rebalance).
+        self._model_def = model_def
         # note export for external modification
         self.model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
+        self._model_state_def = model_state_def
         sampler_def, sampler_state = nnx.split(self.sampler)
         sampler_state_leaves, sampler_state_def = jax.tree_util.tree_flatten(sampler_state)
 
@@ -236,6 +242,240 @@ class ModelRunner(BaseModelRunner):
 
         self.jitted_compute_logprobs = partial(jitted_compute_logprobs, self.mesh)
 
+    def apply_eplb_rebalance(self, *, new_metadata) -> None:
+        """Apply a new EPLB placement online (fused MoE only).
+
+        This updates:
+          - fused MoE expert weights (w1/w2/w3) via `jax.lax.ragged_all_to_all`
+          - fused MoE dispatch maps used by the external-topk path
+
+        It rewrites `self.model_state_leaves` so subsequent forward passes use the
+        new expert placement. Intended for manual TPU testing.
+        """
+        if not getattr(self.server_args, "enable_eplb", False):
+            return
+
+        from sgl_jax.srt.eplb.metadata import ExpertLocationMetadata
+        from sgl_jax.srt.eplb.weight_rebalance import (
+            build_rebalance_all_to_all_device_plan,
+            compute_rebalance_sources,
+            rebalance_weights_all_to_all,
+        )
+        from sgl_jax.srt.layers.moe import FusedEPMoE
+
+        if not isinstance(new_metadata, ExpertLocationMetadata):
+            raise TypeError(
+                f"Expected new_metadata to be ExpertLocationMetadata, got {type(new_metadata)}."
+            )
+
+        ep_size = int(self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1))
+        if new_metadata.ep_size != ep_size:
+            raise ValueError(
+                f"EPLB metadata ep_size mismatch: {new_metadata.ep_size} vs {ep_size}."
+            )
+
+        if self._eplb_metadata is None:
+            # Assume initial fused MoE weights are laid out by logical id.
+            if new_metadata.num_physical_experts != new_metadata.num_logical_experts:
+                raise ValueError(
+                    "Online rebalance for redundant experts requires initial EPLB metadata at startup "
+                    "(expected ModelRunner._eplb_metadata to be set)."
+                )
+            p2l = np.tile(
+                np.arange(new_metadata.num_physical_experts, dtype=np.int32)[None, :],
+                (new_metadata.num_layers, 1),
+            )
+            dispatch = np.tile(
+                np.arange(new_metadata.num_physical_experts, dtype=np.int32)[None, :, None],
+                (new_metadata.num_layers, 1, ep_size),
+            )
+            self._eplb_metadata = ExpertLocationMetadata(
+                ep_size=ep_size,
+                physical_to_logical_map=p2l,
+                logical_to_rank_dispatch_physical_map=dispatch,
+            )
+
+        old_metadata = self._eplb_metadata
+        if old_metadata.physical_to_logical_map.shape != new_metadata.physical_to_logical_map.shape:
+            raise ValueError(
+                "EPLB metadata shape change is not supported online (would require recompilation): "
+                f"{old_metadata.physical_to_logical_map.shape} vs {new_metadata.physical_to_logical_map.shape}."
+            )
+
+        src_for_dst = compute_rebalance_sources(
+            old_physical_to_logical_map=old_metadata.physical_to_logical_map,
+            new_physical_to_logical_map=new_metadata.physical_to_logical_map,
+            ep_size=ep_size,
+        )
+
+        model_state = jax.tree_util.tree_unflatten(self._model_state_def, self.model_state_leaves)
+        model = nnx.merge(self._model_def, model_state)
+
+        devices = self.mesh.devices.flatten()
+        expert_mesh = jax.sharding.Mesh(devices.reshape((ep_size,)), axis_names=("expert",))
+
+        def _device_put_plan(plan_arr: np.ndarray) -> jax.Array:
+            return jax.device_put(
+                jnp.asarray(plan_arr),
+                NamedSharding(expert_mesh, P("expert", None)),
+            )
+
+        def rebalance_param(
+            param_value: jax.Array,
+            *,
+            send_src_local_indices_by_rank: jax.Array,
+            send_sizes_by_rank: jax.Array,
+            input_offsets_by_rank: jax.Array,
+            output_offsets_by_rank: jax.Array,
+            recv_sizes_by_rank: jax.Array,
+            recv_dst_local_indices_by_rank: jax.Array,
+        ) -> jax.Array:
+            original_sharding = getattr(param_value, "sharding", None)
+            target_expert_sharding = NamedSharding(
+                expert_mesh, P("expert", *([None] * (param_value.ndim - 1)))
+            )
+            value_expert = jax.device_put(param_value, target_expert_sharding)
+
+            in_specs = (
+                P("expert", *([None] * (param_value.ndim - 1))),
+                P("expert", None),
+                P("expert", None),
+                P("expert", None),
+                P("expert", None),
+                P("expert", None),
+                P("expert", None),
+            )
+            out_specs = P("expert", *([None] * (param_value.ndim - 1)))
+
+            def _do_rebalance(
+                weights_local,
+                send_src_local_indices,
+                send_sizes,
+                input_offsets,
+                output_offsets,
+                recv_sizes,
+                recv_dst_local_indices,
+            ):
+                return rebalance_weights_all_to_all(
+                    weights_local=weights_local,
+                    send_src_local_indices=send_src_local_indices,
+                    input_offsets=input_offsets,
+                    send_sizes=send_sizes,
+                    output_offsets=output_offsets,
+                    recv_sizes=recv_sizes,
+                    recv_dst_local_indices=recv_dst_local_indices,
+                    axis_name="expert",
+                )
+
+            do_rebalance = jax.shard_map(
+                _do_rebalance,
+                mesh=expert_mesh,
+                in_specs=in_specs,
+                out_specs=out_specs,
+                check_vma=False,
+            )
+            out_expert = do_rebalance(
+                value_expert,
+                send_src_local_indices_by_rank,
+                send_sizes_by_rank,
+                input_offsets_by_rank,
+                output_offsets_by_rank,
+                recv_sizes_by_rank,
+                recv_dst_local_indices_by_rank,
+            )
+            if original_sharding is None:
+                return out_expert
+            return jax.device_put(out_expert, original_sharding)
+
+        visited = set()
+
+        def walk(obj):
+            oid = id(obj)
+            if oid in visited:
+                return
+            visited.add(oid)
+
+            if isinstance(obj, FusedEPMoE):
+                layer_id = int(getattr(obj, "layer_id", -1))
+                if not (0 <= layer_id < new_metadata.num_layers):
+                    return
+                if not getattr(obj, "enable_eplb", False):
+                    return
+                if getattr(obj, "use_grouped_topk", False):
+                    # The grouped-topk fused path currently consumes dense gating output and
+                    # assumes expert ids index directly into the weights tensor.
+                    return
+                if int(obj.num_experts) != int(new_metadata.num_physical_experts):
+                    raise ValueError(
+                        "FusedEPMoE num_experts mismatch vs EPLB metadata; redundancy/shape changes "
+                        "require model re-init. "
+                        f"{obj.num_experts=} vs {new_metadata.num_physical_experts=}."
+                    )
+
+                layer_src = src_for_dst[layer_id].astype(np.int32)
+                device_plan = build_rebalance_all_to_all_device_plan(
+                    src_for_dst_physical=layer_src,
+                    ep_size=ep_size,
+                )
+                send_src_by_rank = _device_put_plan(device_plan.send_src_local_indices)
+                send_sizes_by_rank = _device_put_plan(device_plan.send_sizes)
+                input_offsets_by_rank = _device_put_plan(device_plan.input_offsets)
+                output_offsets_by_rank = _device_put_plan(device_plan.output_offsets)
+                recv_sizes_by_rank = _device_put_plan(device_plan.recv_sizes)
+                recv_dst_by_rank = _device_put_plan(device_plan.recv_dst_local_indices)
+
+                obj.w1.value = rebalance_param(
+                    obj.w1.value,
+                    send_src_local_indices_by_rank=send_src_by_rank,
+                    send_sizes_by_rank=send_sizes_by_rank,
+                    input_offsets_by_rank=input_offsets_by_rank,
+                    output_offsets_by_rank=output_offsets_by_rank,
+                    recv_sizes_by_rank=recv_sizes_by_rank,
+                    recv_dst_local_indices_by_rank=recv_dst_by_rank,
+                )
+                obj.w2.value = rebalance_param(
+                    obj.w2.value,
+                    send_src_local_indices_by_rank=send_src_by_rank,
+                    send_sizes_by_rank=send_sizes_by_rank,
+                    input_offsets_by_rank=input_offsets_by_rank,
+                    output_offsets_by_rank=output_offsets_by_rank,
+                    recv_sizes_by_rank=recv_sizes_by_rank,
+                    recv_dst_local_indices_by_rank=recv_dst_by_rank,
+                )
+                obj.w3.value = rebalance_param(
+                    obj.w3.value,
+                    send_src_local_indices_by_rank=send_src_by_rank,
+                    send_sizes_by_rank=send_sizes_by_rank,
+                    input_offsets_by_rank=input_offsets_by_rank,
+                    output_offsets_by_rank=output_offsets_by_rank,
+                    recv_sizes_by_rank=recv_sizes_by_rank,
+                    recv_dst_local_indices_by_rank=recv_dst_by_rank,
+                )
+
+                dispatch = new_metadata.logical_to_rank_dispatch_physical_map[layer_id].astype(
+                    np.int32
+                )
+                obj.eplb_dispatch_map.value = jnp.asarray(dispatch)
+                return
+
+            if isinstance(obj, (list, tuple)):
+                for x in obj:
+                    walk(x)
+                return
+            if isinstance(obj, dict):
+                for x in obj.values():
+                    walk(x)
+                return
+            if hasattr(obj, "__dict__"):
+                for x in obj.__dict__.values():
+                    walk(x)
+
+        walk(model)
+
+        _, new_state = nnx.split(model)
+        self.model_state_leaves, _ = jax.tree_util.tree_flatten(new_state)
+        self._eplb_metadata = new_metadata
+
     def get_available_device_memory(self):
         distributed = jax.process_count() != 1
         min_available_device_memory = get_available_device_memory(
@@ -277,9 +517,82 @@ class ModelRunner(BaseModelRunner):
         )
         self.model_config.hf_config.eplb_seed = self.server_args.eplb_seed
 
+        if self.server_args.enable_eplb and self.model_config.moe_backend.value == "fused":
+            # Redundant experts (E_physical = E_logical + R) must be chosen before model init
+            # to keep expert-weight shapes stable across online rebalances.
+            num_logical_experts = None
+            for attr in ("num_experts", "n_experts", "num_local_experts"):
+                v = getattr(self.model_config.hf_config, attr, None)
+                if v is not None:
+                    num_logical_experts = int(v)
+                    break
+
+            num_layers = int(
+                getattr(
+                    self.model_config.hf_config,
+                    "num_hidden_layers",
+                    getattr(self.model_config, "num_hidden_layers", 0),
+                )
+            )
+            if num_layers <= 0:
+                num_layers = int(self.model_config.num_hidden_layers)
+
+            if num_logical_experts is None:
+                logger.warning(
+                    "EPLB enabled for fused MoE, but model config does not expose num_experts; "
+                    "disabling redundant experts."
+                )
+            else:
+                from sgl_jax.srt.eplb.algorithm import rebalance_experts_greedy
+                from sgl_jax.srt.eplb.metadata import choose_num_physical_experts
+
+                num_physical_experts, actual_r = choose_num_physical_experts(
+                    num_logical_experts=num_logical_experts,
+                    ep_size=int(self.ep_size),
+                    requested_num_redundant_experts=int(self.server_args.eplb_redundant_experts),
+                    max_num_redundant_experts=int(self.server_args.eplb_max_redundant_experts),
+                )
+                if actual_r != int(self.server_args.eplb_redundant_experts):
+                    logger.warning(
+                        "Adjusting eplb_redundant_experts for divisibility: requested=%d actual=%d "
+                        "(E_logical=%d ep_size=%d)",
+                        int(self.server_args.eplb_redundant_experts),
+                        int(actual_r),
+                        int(num_logical_experts),
+                        int(self.ep_size),
+                    )
+
+                self.model_config.hf_config.num_physical_experts = int(num_physical_experts)
+                self.model_config.hf_config.eplb_redundant_experts = int(actual_r)
+
+                init_meta = rebalance_experts_greedy(
+                    tokens_per_logical_expert=np.ones(
+                        (num_layers, int(num_logical_experts)), dtype=np.float32
+                    ),
+                    ep_size=int(self.ep_size),
+                    num_redundant_experts=int(actual_r),
+                    max_num_redundant_experts=int(self.server_args.eplb_max_redundant_experts),
+                    seed=int(self.server_args.eplb_seed),
+                )
+                self.model_config.hf_config.eplb_initial_metadata = init_meta
+                self.model_config.hf_config.eplb_initial_physical_to_logical_map = (
+                    init_meta.physical_to_logical_map
+                )
+                self.model_config.hf_config.eplb_initial_dispatch_map = (
+                    init_meta.logical_to_rank_dispatch_physical_map
+                )
+
         self.model = self.model_loader.load_model(
             model_config=self.model_config,
         )
+        if (
+            getattr(self.model_config.hf_config, "enable_eplb", False)
+            and getattr(self.model_config.hf_config, "moe_backend", None) == "fused"
+        ):
+            # Track the current placement for online weight rebalance.
+            self._eplb_metadata = getattr(
+                self.model_config.hf_config, "eplb_initial_metadata", None
+            )
         if self.is_draft_worker:
             # if draft model and target model share same safetensor files, we should hack here to avoid create redundant layer kv cache
             self.model_config.num_hidden_layers = getattr(

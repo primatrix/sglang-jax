@@ -261,9 +261,12 @@ class BailingMoEDecoderLayer(nnx.Module):
                 router_dtype = jnp.float32
             else:
                 router_dtype = jnp.bfloat16
+
+            num_logical_experts = int(config.num_experts)
+            num_physical_experts = int(getattr(config, "num_physical_experts", num_logical_experts))
             self.moe_gate = GateLogit(
                 input_size=config.hidden_size,
-                num_experts=config.num_experts,
+                num_experts=num_logical_experts,
                 enable_expert_bias=getattr(config, "moe_router_enable_expert_bias", False),
                 weight_dtype=router_dtype,
                 score_func=getattr(config, "score_function", "sigmoid"),
@@ -283,9 +286,14 @@ class BailingMoEDecoderLayer(nnx.Module):
             )
 
             if self.use_fused:
+                initial_dispatch = None
+                if getattr(config, "enable_eplb", False):
+                    init_dispatch_all = getattr(config, "eplb_initial_dispatch_map", None)
+                    if init_dispatch_all is not None:
+                        initial_dispatch = init_dispatch_all[layer_id]
                 self.mlp = FusedEPMoE(
                     hidden_size=config.hidden_size,
-                    num_experts=config.num_experts,
+                    num_experts=num_physical_experts,
                     num_experts_per_tok=config.num_experts_per_tok,
                     intermediate_dim=config.moe_intermediate_size,
                     mesh=mesh,
@@ -300,6 +308,9 @@ class BailingMoEDecoderLayer(nnx.Module):
                     top_k_groups=config.topk_group,
                     num_shared_experts=num_shared_experts,
                     moe_shared_expert_intermediate_size=moe_shared_expert_intermediate_size,
+                    enable_eplb=getattr(config, "enable_eplb", False),
+                    num_logical_experts=num_logical_experts,
+                    initial_dispatch_map_layer=initial_dispatch,
                 )
             else:
                 self.topk = TopK(
@@ -311,7 +322,7 @@ class BailingMoEDecoderLayer(nnx.Module):
                 )
                 self.mlp = EPMoE(
                     hidden_size=config.hidden_size,
-                    num_experts=config.num_experts,
+                    num_experts=num_logical_experts,
                     num_experts_per_tok=config.num_experts_per_tok,
                     intermediate_dim=config.moe_intermediate_size,
                     mesh=mesh,
@@ -602,16 +613,33 @@ class BailingMoEForCausalLM(nnx.Module):
                 )
 
             num_experts = getattr(self.config, "num_experts", 256)
+            num_physical_experts = getattr(self.config, "num_physical_experts", num_experts)
             moe_backend = getattr(self.config, "moe_backend", "epmoe")
             use_fused = moe_backend == "fused"
 
-            moe_mappings = create_moe_weights_mapping(
-                prefix=prefix,
-                target_prefix=target_prefix,
-                num_experts=num_experts,
-                expert_type_names=("gate_proj", "up_proj", "down_proj"),
-                moe_backend=moe_backend,
-            )
+            enable_eplb = bool(getattr(self.config, "enable_eplb", False))
+            if use_fused and enable_eplb and int(num_physical_experts) != int(num_experts):
+                p2l_all = getattr(self.config, "eplb_initial_physical_to_logical_map", None)
+                if p2l_all is None:
+                    raise ValueError(
+                        "EPLB redundant experts requested, but config.eplb_initial_physical_to_logical_map is missing."
+                    )
+                moe_mappings = create_moe_weights_mapping(
+                    prefix=prefix,
+                    target_prefix=target_prefix,
+                    num_experts=int(num_physical_experts),
+                    physical_to_logical_map=p2l_all[layer_idx],
+                    expert_type_names=("gate_proj", "up_proj", "down_proj"),
+                    moe_backend=moe_backend,
+                )
+            else:
+                moe_mappings = create_moe_weights_mapping(
+                    prefix=prefix,
+                    target_prefix=target_prefix,
+                    num_experts=int(num_experts),
+                    expert_type_names=("gate_proj", "up_proj", "down_proj"),
+                    moe_backend=moe_backend,
+                )
             mappings.update(moe_mappings)
 
             if getattr(self.config, "num_shared_experts", 0) > 0:

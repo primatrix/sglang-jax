@@ -4,8 +4,10 @@ from .recorder import EplbStatsRecorder, counts_from_topk_ids
 from .runtime import EplbController, EplbUpdate
 from .topk import dense_logits_from_topk, map_logical_to_physical_topk_ids
 from .weight_rebalance import (
+    RebalanceAllToAllDevicePlan,
     RebalanceAllToAllPlan,
     apply_rebalance_mapping_global,
+    build_rebalance_all_to_all_device_plan,
     build_rebalance_all_to_all_plan,
     compute_rebalance_sources,
     pack_expert_rows,
@@ -23,7 +25,9 @@ __all__ = [
     "rebalance_experts_greedy",
     "compute_rebalance_sources",
     "RebalanceAllToAllPlan",
+    "RebalanceAllToAllDevicePlan",
     "build_rebalance_all_to_all_plan",
+    "build_rebalance_all_to_all_device_plan",
     "dense_logits_from_topk",
     "map_logical_to_physical_topk_ids",
     "apply_rebalance_mapping_global",
