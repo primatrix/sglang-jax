@@ -81,7 +81,19 @@ class ModelRunner(BaseModelRunner):
         self.rngs = rngs
 
         self.tp_size = tp_size
-        self.ep_size = server_args.ep_size
+        # For fused MoE, EP group is effectively dp*tp (full 2D mesh). Some TPU
+        # deployments create a mesh whose "data" axis is derived from device count,
+        # so server_args.ep_size can be inconsistent with the actual mesh.
+        ep_size_mesh = int(mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1))
+        if server_args.moe_backend == "fused" and int(server_args.ep_size) != ep_size_mesh:
+            logger.warning(
+                "Overriding server_args.ep_size for fused MoE to match dp*tp mesh: requested=%d actual=%d",
+                int(server_args.ep_size),
+                int(ep_size_mesh),
+            )
+            self.ep_size = ep_size_mesh
+        else:
+            self.ep_size = server_args.ep_size
         self.server_args = server_args
         self.is_generation = model_config.is_generation
         self.page_size = server_args.page_size
