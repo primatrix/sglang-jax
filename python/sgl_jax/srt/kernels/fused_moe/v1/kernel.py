@@ -3148,9 +3148,16 @@ def fused_ep_moe_from_topk(
         NamedSharding(mesh, P((dp_axis_name, tp_axis_name), None)),
     )
     rows = jnp.arange(num_tokens, dtype=jnp.int32)[:, None]
-    gating_output = gating_output.at[rows, topk_ids_physical.astype(jnp.int32)].set(
-        topk_weights.astype(jnp.float32)
-    )
+    out_sharding = NamedSharding(mesh, P((dp_axis_name, tp_axis_name), None))
+    try:
+        gating_output = gating_output.at[rows, topk_ids_physical.astype(jnp.int32)].set(
+            topk_weights.astype(jnp.float32),
+            out_sharding=out_sharding,
+        )
+    except TypeError:
+        gating_output = gating_output.at[rows, topk_ids_physical.astype(jnp.int32)].set(
+            topk_weights.astype(jnp.float32)
+        )
     gating_output = gating_output.astype(tokens.dtype)
 
     return fused_ep_moe(
