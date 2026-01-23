@@ -9,6 +9,7 @@ from sgl_jax.srt.multimodal.layers.attention.layer import ring_attention, simple
 class TestRingAttention(unittest.TestCase):
     def _run_case(self, causal: bool):
         key = jax.random.key(0)
+        
         b, s, h, d = 2, 64, 4, 16
         q = jax.random.normal(key, (b, s, h, d), dtype=jnp.float32)
         k = jax.random.normal(jax.random.key(1), (b, s, h, d), dtype=jnp.float32)
