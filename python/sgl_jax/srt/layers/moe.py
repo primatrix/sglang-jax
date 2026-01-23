@@ -923,7 +923,9 @@ class FusedEPMoE(nnx.Module):
                 out_specs=P(("data", "tensor"), None),
                 check_vma=False,
             )(topk_ids_logical, self.eplb_dispatch_map.value)
-            topk_weights = jax.device_put(topk_weights, topk_ids_physical.sharding)
+            topk_weights = jax.sharding.reshard(
+                topk_weights, NamedSharding(self.mesh, P(("data", "tensor"), None))
+            )
 
             output = fused_ep_moe_from_topk(
                 mesh=self.mesh,
