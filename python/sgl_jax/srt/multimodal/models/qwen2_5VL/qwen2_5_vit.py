@@ -10,10 +10,7 @@ from flax import nnx
 from functools import partial
 
 from transformers import modeling_flax_utils
-from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
-    Qwen2_5_VLConfig,
-    Qwen2_5_VLVisionConfig,
-)
+from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import QwenVLModelConfig
 
 init_fn = nnx.initializers.uniform()
 DEFAULT_BLOCK_K_MAJOR = 128
@@ -54,7 +51,7 @@ class Qwen2_5_VisionRotaryEmbedding(nnx.Module):
 
 
 class Qwen2_5_VisionMLP(nnx.Module):
-    def __init__(self, config: Qwen2_5_VLVisionConfig, dtype: jnp.dtype, rngs: nnx.Rngs = None):
+    def __init__(self, config: QwenVLModelConfig, dtype: jnp.dtype, rngs: nnx.Rngs = None):
         in_features = config.hidden_size
         hidden_features = config.intermediate_size
         act_fn = modeling_flax_utils.ACT2FN[config.hidden_act]
@@ -88,11 +85,10 @@ class Qwen2_5_VisionMLP(nnx.Module):
 
 class Qwen2_5_VisionAttention(nnx.Module):
     def __init__(
-            self, config: Qwen2_5_VLConfig, dtype: jnp.dtype, rngs: nnx.Rngs = None, mesh: Mesh = None
+            self, config: QwenVLModelConfig, dtype: jnp.dtype, rngs: nnx.Rngs = None, mesh: Mesh = None
     ):
-        vision_config = config.vision_config
-        self.hidden_size = vision_config.hidden_size
-        self.num_heads = vision_config.num_heads
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_heads
         self.head_dim = self.hidden_size // self.num_heads
         self.scale = 1.0 / math.sqrt(self.head_dim)
 
@@ -118,10 +114,9 @@ class Qwen2_5_VisionAttention(nnx.Module):
 
 class Qwen2_5_VisionBlock(nnx.Module):
     def __init__(
-            self, config: Qwen2_5_VLConfig, dtype: jnp.dtype, rngs: nnx.Rngs = None, mesh: Mesh = None
+            self, config: QwenVLModelConfig, dtype: jnp.dtype, rngs: nnx.Rngs = None, mesh: Mesh = None
     ):
-        vision_config = config.vision_config
-        dim = vision_config.hidden_size
+        dim = config.hidden_size
         norm_layer = partial(
             nnx.RMSNorm,
             epsilon=config.rms_norm_eps,
@@ -134,7 +129,7 @@ class Qwen2_5_VisionBlock(nnx.Module):
         self.norm1 = norm_layer(dim, dtype=dtype, rngs=_rngs)
         self.norm2 = norm_layer(dim, dtype=dtype, rngs=_rngs)
         self.attn = Qwen2_5_VisionAttention(config=config, dtype=dtype, rngs=rngs, mesh=mesh)
-        self.mlp = Qwen2_5_VisionMLP(config=vision_config, dtype=dtype, rngs=rngs)
+        self.mlp = Qwen2_5_VisionMLP(config=config, dtype=dtype, rngs=rngs)
 
 
 class Qwen2_5_VisionPatchMerger(nnx.Module):
