@@ -6,6 +6,7 @@ Migrated from main functions in VAE source files and extended with mock tests.
 import os
 import sys
 import unittest
+from functools import partial
 
 # Add python directory to sys.path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
@@ -313,6 +314,77 @@ class TestVAEEncodeDecode(unittest.TestCase):
         self.assertGreaterEqual(min_val, -1.0 - 1e-5, "Output should be >= -1")
         self.assertLessEqual(max_val, 1.0 + 1e-5, "Output should be <= 1")
         print("Value range test PASSED!")
+
+    def test_decode_480x832_max_frames_single_gpu(self):
+        """Stress-test decode frame capacity at 480x832 on a single GPU."""
+
+        devices = jax.devices()
+
+        config = self.config_class()
+        config.load_encoder = False
+        vae = self.vae_class(config)
+
+        height = int(os.environ.get("SGLANG_WANVAE_TEST_HEIGHT", "480"))
+        width = int(os.environ.get("SGLANG_WANVAE_TEST_WIDTH", "832"))
+        min_frames = int(os.environ.get("SGLANG_WANVAE_MIN_FRAMES", "73"))
+        max_frames = int(os.environ.get("SGLANG_WANVAE_MAX_FRAMES", "200"))
+        step = int(os.environ.get("SGLANG_WANVAE_FRAME_STEP", str(config.scale_factor_temporal)))
+
+        if height % config.scale_factor_spatial != 0 or width % config.scale_factor_spatial != 0:
+            self.skipTest("Height/width must be divisible by VAE scale factor")
+
+        def align_frames(n):
+            return n - (n - 1) % config.scale_factor_temporal
+
+        min_frames = align_frames(min_frames)
+        max_frames = align_frames(max_frames)
+        if max_frames < min_frames:
+            self.skipTest("Invalid frame range for stress test")
+
+        model_def, model_state = nnx.split(vae)
+        model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
+
+        @partial(jax.jit, static_argnames=["model_state_def"])
+        def decode(model_def, model_state_def, model_state_leaves, x):
+            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            model = nnx.merge(model_def, model_state)
+            return model.decode(x)
+
+        def decode_wrapper(x):
+            return decode(model_def, model_state_def, model_state_leaves, x)
+
+        latent_h = height // config.scale_factor_spatial
+        latent_w = width // config.scale_factor_spatial
+
+        best = None
+        for frames in range(min_frames, max_frames + 1, step):
+            latent_frames = (frames - 1) // config.scale_factor_temporal + 1
+            print(f"Testing decode with {frames} frames ({latent_frames} latent frames)...")
+            z = jax.random.normal(
+                jax.random.PRNGKey(0),
+                (1, latent_frames, latent_h, latent_w, config.z_dim),
+                dtype=jnp.float32,
+            )
+            try:
+                out = decode_wrapper(z)
+                out.block_until_ready()
+                self.assertEqual(out.shape[1], frames)
+                best = frames
+            except Exception as exc:  # pragma: no cover - depends on device OOM
+                message = str(exc).lower()
+                if (
+                    "resource exhausted" in message
+                    or "out of memory" in message
+                    or "oom" in message
+                ):
+                    break
+                raise
+
+        if best is None:
+            self.fail(f"Decode failed at {min_frames} frames")
+
+        print(f"Max frames decoded at {height}x{width}: {best}")
+        self.assertGreaterEqual(best, min_frames)
 
 
 @requires_jax

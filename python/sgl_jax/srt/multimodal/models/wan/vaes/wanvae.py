@@ -1146,20 +1146,39 @@ class AutoencoderKLWan(nnx.Module):
     def decode(self, z: jax.Array) -> jax.Array:
         if self.use_feature_cache:
             self.clear_cache()
-            iter_ = z.shape[1]
             x, _ = self.post_quant_conv(z)
             cache_list = self._feat_map
-            for i in range(iter_):
+            t = x.shape[1]
+
+            # Warm up the first two frames to stabilize cache shapes and output length.
+            cache_idx = [0]
+            out0, cache_list = self.decoder(
+                x[:, :1, :, :, :], cache_list=cache_list, cache_idx=cache_idx
+            )
+            if t == 1:
+                out = out0
+            else:
                 cache_idx = [0]
-                if i == 0:
-                    out, cache_list = self.decoder(
-                        x[:, i : i + 1, :, :, :], cache_list=cache_list, cache_idx=cache_idx
-                    )
+                out1, cache_list = self.decoder(
+                    x[:, 1:2, :, :, :], cache_list=cache_list, cache_idx=cache_idx
+                )
+                if t == 2:
+                    out = jnp.concatenate([out0, out1], axis=1)
                 else:
-                    out_, cache_list = self.decoder(
-                        x[:, i : i + 1, :, :, :], cache_list=cache_list, cache_idx=cache_idx
-                    )
-                    out = jnp.concatenate([out, out_], 1)
+                    xs = jnp.swapaxes(x[:, 2:, :, :, :], 0, 1)
+
+                    def step(cache_list, x_t):
+                        cache_idx = [0]
+                        out_t, cache_list = self.decoder(
+                            x_t[:, None, :, :, :], cache_list=cache_list, cache_idx=cache_idx
+                        )
+                        return cache_list, out_t
+
+                    cache_list, out_tail = jax.lax.scan(step, cache_list, xs)
+                    out_tail = out_tail.transpose(1, 0, 2, 3, 4, 5)
+                    b, t_tail, t_step, h, w, c = out_tail.shape
+                    out_tail = out_tail.reshape(b, t_tail * t_step, h, w, c)
+                    out = jnp.concatenate([out0, out1, out_tail], axis=1)
 
             out = jnp.clip(out, min=-1.0, max=1.0)
             self.clear_cache()
