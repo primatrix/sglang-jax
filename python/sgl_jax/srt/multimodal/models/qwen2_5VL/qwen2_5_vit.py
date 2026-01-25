@@ -11,12 +11,99 @@ from functools import partial
 
 from transformers import modeling_flax_utils
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import QwenVLModelConfig
+from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
+
+if not is_tpu_runtime():
+    from flash_attn_jax import flash_mha, flash_mha_varlen
 
 init_fn = nnx.initializers.uniform()
 DEFAULT_BLOCK_K_MAJOR = 128
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+def apply_rotary_pos_emb_vision(x: jax.Array, rotary_pos_emb: jax.Array) -> jax.Array:
+    _, _, _, H = x.shape
+    half_dim = H // 2
+
+    x_real = x[..., :half_dim]
+    x_imag = x[..., half_dim:]
+
+    cos_emb = jnp.cos(rotary_pos_emb)
+    sin_emb = jnp.sin(rotary_pos_emb)
+
+    cos_emb = cos_emb[None, :, None, :]
+    sin_emb = sin_emb[None, :, None, :]
+
+    x_rotated_real = x_real * cos_emb - x_imag * sin_emb
+    x_rotated_imag = x_real * sin_emb + x_imag * cos_emb
+
+    return jnp.concatenate([x_rotated_real, x_rotated_imag], axis=-1)
+
+def vision_attention(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    scale: float,
+    window_size: int = -1,
+) -> jax.Array:
+    """
+    Compute vision attention using flash attention on GPU or native attention on TPU.
+
+    This is a simple attention function for vision models (no KV cache, no causal masking).
+
+    Args:
+        q, k, v: Input tensors of shape [B, T, N, H] (batch, seq_len, num_heads, head_dim)
+        scale: Attention scale factor (1/sqrt(head_dim))
+        window_size: Window size for local attention. -1 means full attention.
+
+    Returns:
+        Output tensor of shape [B, T, N, H]
+    """
+    if not is_tpu_runtime():
+
+        # GPU: use flash_mha
+        original_dtype = q.dtype
+        if q.dtype not in [jnp.bfloat16, jnp.float16]:
+            q = q.astype(jnp.bfloat16)
+            k = k.astype(jnp.bfloat16)
+            v = v.astype(jnp.bfloat16)
+
+        if window_size > 0:
+            output = flash_mha(
+                q,
+                k,
+                v,
+                softmax_scale=scale,
+                is_causal=False,
+                window_size=(window_size, window_size),
+            )
+        else:
+            output = flash_mha(q, k, v, softmax_scale=scale, is_causal=False)
+
+        if output.dtype != original_dtype:
+            output = output.astype(original_dtype)
+        return output
+    else:
+        # TPU: native attention
+        B, T, N, H = q.shape
+        q = jnp.transpose(q, (0, 2, 1, 3))  # [B, N, T, H]
+        k = jnp.transpose(k, (0, 2, 1, 3))
+        v = jnp.transpose(v, (0, 2, 1, 3))
+
+        attn_weights = jnp.einsum("bnth,bnsh->bnts", q, k) * scale
+
+        if window_size > 0:
+            # Create window mask for local attention
+            positions = jnp.arange(T)
+            distance = jnp.abs(positions[:, None] - positions[None, :])
+            window_mask = distance > window_size
+            attn_weights = jnp.where(
+                window_mask[None, None, :, :], jnp.finfo(attn_weights.dtype).min, attn_weights
+            )
+
+        attn_weights = jax.nn.softmax(attn_weights, axis=-1)
+        output = jnp.einsum("bnts,bnsh->bnth", attn_weights, v)
+        return jnp.transpose(output, (0, 2, 1, 3))  # [B, T, N, H]
 
 class Qwen2_5_VisionPatchEmbed(nnx.Module):
     def __init__(
@@ -43,11 +130,32 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
             rngs=rngs or nnx.Rngs(0),  # Use dummy rngs if None (for eval_shape)
         )
 
+    def __call__(self, x: jax.Array) -> jax.Array:
+        # x is (L, C * T * H * W)
+        L, dim = x.shape
+        C = dim // (self.temporal_patch_size * self.patch_size * self.patch_size)
+        # Reshape to (L, T, H, W, C) for Conv3D with channels_last
+        x = x.reshape(L, C, self.temporal_patch_size, self.patch_size, self.patch_size)
+        # L,T,H,W,C
+        x = jnp.transpose(x, (0, 2, 3, 4, 1))
+        x = self.proj(x)
+        # After conv, shape is (L, T_out, H_out, W_out, C_out)
+        # With stride=kernel_size, T_out=H_out=W_out=1.
+        # So shape is (L, 1, 1, 1, hidden_size)
+        x = x.reshape(L, self.hidden_size)
+        return x
+
 
 class Qwen2_5_VisionRotaryEmbedding(nnx.Module):
     def __init__(self, dim: int, theta: float = 10000.0):
         self.dim = dim
         self.theta = theta
+
+    def __call__(self, seq_len: int) -> jax.Array:
+        inv_freq = 1.0 / (self.theta ** (jnp.arange(0, self.dim, 2, dtype=jnp.float32) / self.dim))
+        seq = jnp.arange(seq_len, dtype=jnp.float32)
+        freqs = jnp.outer(seq, inv_freq)
+        return freqs.astype(jnp.bfloat16)
 
 
 class Qwen2_5_VisionMLP(nnx.Module):
@@ -82,6 +190,12 @@ class Qwen2_5_VisionMLP(nnx.Module):
         )
         self.act_fn = act_fn
 
+    def __call__(self, x: jax.Array) -> jax.Array:
+        gate = self.act_fn(self.gate_proj(x))
+        up = self.up_proj(x)
+        fuse = gate * up
+        return self.down_proj(fuse)
+
 
 class Qwen2_5_VisionAttention(nnx.Module):
     def __init__(
@@ -111,6 +225,43 @@ class Qwen2_5_VisionAttention(nnx.Module):
             rngs=_rngs,
         )
 
+    def __call__(
+            self,
+            x: jax.Array,
+            rotary_pos_emb: jax.Array,
+            cu_window_seqlens: jax.Array | None = None,
+            use_fullattn: bool = True,
+    ) -> jax.Array:
+        T, B, D = x.shape
+        assert B == 1, "Vision attention currently only supports batch size 1"
+
+        # Project to Q, K, V
+        qkv = self.qkv_proj(x)
+        q, k, v = jnp.split(qkv, 3, axis=-1)
+
+        # Reshape: [T, B, D] -> [B, T, N, H]
+        q = q.reshape(T, B, self.num_heads, self.head_dim).transpose(1, 0, 2, 3)
+        k = k.reshape(T, B, self.num_heads, self.head_dim).transpose(1, 0, 2, 3)
+        v = v.reshape(T, B, self.num_heads, self.head_dim).transpose(1, 0, 2, 3)
+
+        # Apply rotary embeddings
+        q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
+        k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
+
+        # Compute window size from cu_window_seqlens if using windowed attention
+        window_size = -1
+        if not use_fullattn and cu_window_seqlens is not None:
+            window_sizes = jnp.diff(cu_window_seqlens)
+            window_size = int(window_sizes[0]) if len(window_sizes) > 0 else -1
+
+        # Compute attention using the backend function
+        output = vision_attention(q, k, v, self.scale, window_size)
+
+        # Reshape back: [B, T, N, H] -> [T, B, D]
+        output = output.transpose(1, 0, 2, 3).reshape(T, B, D)
+
+        return self.proj(output)
+
 
 class Qwen2_5_VisionBlock(nnx.Module):
     def __init__(
@@ -130,6 +281,17 @@ class Qwen2_5_VisionBlock(nnx.Module):
         self.norm2 = norm_layer(dim, dtype=dtype, rngs=_rngs)
         self.attn = Qwen2_5_VisionAttention(config=config, dtype=dtype, rngs=rngs, mesh=mesh)
         self.mlp = Qwen2_5_VisionMLP(config=config, dtype=dtype, rngs=rngs)
+
+    def __call__(
+            self,
+            x: jax.Array,
+            rotary_pos_emb: jax.Array,
+            cu_window_seqlens: jax.Array | None = None,
+            use_fullattn: bool = True,
+    ) -> jax.Array:
+        x = x + self.attn(self.norm1(x), rotary_pos_emb, cu_window_seqlens, use_fullattn)
+        x = x + self.mlp(self.norm2(x))
+        return x
 
 
 class Qwen2_5_VisionPatchMerger(nnx.Module):
@@ -167,15 +329,262 @@ class Qwen2_5_VisionPatchMerger(nnx.Module):
         )
 
 
+    def __call__(self, x: jax.Array) -> jax.Array:
+        x = self.ln_q(x)
+        x = x.reshape(-1, self.hidden_size)
+        x = self.mlp_fc1(x)
+        x = self.mlp_act(x)
+        x = self.mlp_fc2(x)
+        return x
+
+
 class Qwen2_5_VL_VisionModel(nnx.Module):
     """Placeholder model class for the ViT stage.
     - Call encode_vision() to get vision embeddings
     - Call get_input_embeddings() to merge vision + text embeddings
     """
     
-    def __init__(self, dtype=None, mesh=None):
-        super().__init__()
+    def __init__(
+        self,
+        config: QwenVLModelConfig,
+        dtype: jnp.dtype,
+        rngs: nnx.Rngs = None,
+        mesh: Mesh = None,
+        norm_eps: float = 1e-6,
+    ):
+        self.config = config
+        self.dtype = dtype
+
+        self.patch_embed = Qwen2_5_VisionPatchEmbed(
+            patch_size=config.patch_size,
+            temporal_patch_size=config.temporal_patch_size,
+            in_channels=config.in_channels,
+            hidden_size=config.hidden_size,
+            dtype=dtype,
+            rngs=rngs,
+        )
+
+        head_dim = config.hidden_size // config.num_heads
+        self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
+
+        self.blocks = nnx.List(
+            [
+                Qwen2_5_VisionBlock(
+                    config=config,
+                    dtype=dtype,
+                    rngs=rngs,
+                    mesh=mesh,
+                )
+                for _ in range(config.depth)
+            ]
+        )
+
+        self.merger = Qwen2_5_VisionPatchMerger(
+            d_model=config.out_hidden_size,
+            context_dim=config.hidden_size,
+            norm_layer=partial(nnx.RMSNorm, epsilon=norm_eps),
+            spatial_merge_size=config.spatial_merge_size,
+            dtype=dtype,
+            rngs=rngs,
+        )
+
+        self.window_size = config.window_size
+        self.patch_size = config.patch_size
+        self.spatial_merge_size = config.spatial_merge_size
+        self.fullatt_block_indexes = config.fullatt_block_indexes
+        self.spatial_merge_unit = self.spatial_merge_size**2
 
     def load_weights(self, model_config):
       pass
+
+    def rotary_pos_emb_thw(self, t, h, w):
+        hpos_ids, wpos_ids = jnp.indices((h, w))
+        hpos_ids = (
+            hpos_ids.reshape(
+                h // self.spatial_merge_size,
+                self.spatial_merge_size,
+                w // self.spatial_merge_size,
+                self.spatial_merge_size,
+            )
+            .transpose(0, 2, 1, 3)
+            .flatten()
+        )
+        wpos_ids = (
+            wpos_ids.reshape(
+                h // self.spatial_merge_size,
+                self.spatial_merge_size,
+                w // self.spatial_merge_size,
+                self.spatial_merge_size,
+            )
+            .transpose(0, 2, 1, 3)
+            .flatten()
+        )
+        pos_ids = jnp.stack([hpos_ids, wpos_ids], axis=-1)
+        pos_ids = jnp.tile(pos_ids, (t, 1))
+
+        max_size = max(h, w)
+        rotary_pos_emb_full = self.rotary_pos_emb(max_size)
+
+        rotary_pos_emb = rotary_pos_emb_full[pos_ids].reshape(pos_ids.shape[0], -1)
+        rotary_pos_emb = rotary_pos_emb.reshape(
+            rotary_pos_emb.shape[0] // self.spatial_merge_unit, self.spatial_merge_unit, -1
+        )
+
+        return rotary_pos_emb
+
+    def get_window_index_thw(self, grid_t, grid_h, grid_w):
+        vit_merger_window_size = self.window_size // self.spatial_merge_size // self.patch_size
+
+        llm_grid_h = grid_h // self.spatial_merge_size
+        llm_grid_w = grid_w // self.spatial_merge_size
+
+        index = jnp.arange(grid_t * llm_grid_h * llm_grid_w).reshape(grid_t, llm_grid_h, llm_grid_w)
+
+        pad_h = vit_merger_window_size - llm_grid_h % vit_merger_window_size
+        pad_w = vit_merger_window_size - llm_grid_w % vit_merger_window_size
+        num_windows_h = (llm_grid_h + pad_h) // vit_merger_window_size
+        num_windows_w = (llm_grid_w + pad_w) // vit_merger_window_size
+
+        index_padded = jnp.pad(index, ((0, 0), (0, pad_h), (0, pad_w)), constant_values=-100)
+        index_padded = index_padded.reshape(
+            grid_t, num_windows_h, vit_merger_window_size, num_windows_w, vit_merger_window_size
+        )
+        index_padded = jnp.transpose(index_padded, (0, 1, 3, 2, 4)).reshape(
+            grid_t, num_windows_h * num_windows_w, vit_merger_window_size, vit_merger_window_size
+        )
+        seqlens = (index_padded != -100).sum([2, 3]).reshape(-1)
+        index_padded = index_padded.reshape(-1)
+        # The number of valid indices is static because grid_t, grid_h, grid_w
+        # are static.
+        num_valid_indices = grid_t * llm_grid_h * llm_grid_w
+        valid_indices = jnp.nonzero(index_padded != -100, size=num_valid_indices)[0]
+        index_new = index_padded[valid_indices]
+        cu_seqlens_tmp = jnp.cumsum(seqlens) * self.spatial_merge_unit
+        cu_seqlens_tmp = cu_seqlens_tmp.astype(jnp.int32)
+
+        # NOTE (wenlong): Pytorch code uses this to reduce replication,
+        # but I don't think there is a need here, plus it would cause problem in JIT
+        # Please refer here if there is a problem down-stream
+        # cu_seqlens_tmp = jnp.unique(cu_seqlens_tmp)
+
+        return index_new, cu_seqlens_tmp
+
+    def get_rope_by_thw(self, t, h, w):
+        window_index_thw, cu_seq_lens_window_thw = self.get_window_index_thw(t, h, w)
+
+        rotary_pos_emb_thw = self.rotary_pos_emb_thw(t, h, w)
+
+        rotary_pos_emb_thw = rotary_pos_emb_thw[window_index_thw, :, :]
+        rotary_pos_emb_thw = rotary_pos_emb_thw.reshape(-1, rotary_pos_emb_thw.shape[-1])
+        cu_seq_lens_thw = jnp.full(t, h * w, dtype=jnp.int32)
+
+        return rotary_pos_emb_thw, window_index_thw, cu_seq_lens_window_thw, cu_seq_lens_thw
+
+    def compute_aux_arrays(self, grid_thw: tuple[tuple[int, int, int]]):
+        num_grids = len(grid_thw)
+
+        rotary_pos_emb = []
+        window_index: list = []
+        cu_window_seqlens: list = [jnp.array([0], dtype=jnp.int32)]
+        cu_seqlens: list = []
+
+        window_index_id = 0
+        cu_window_seqlens_last = 0
+        for i in range(num_grids):
+            t, h, w = grid_thw[i]
+
+            llm_h = h // self.spatial_merge_size
+            llm_w = w // self.spatial_merge_size
+
+            (
+                rotary_pos_emb_thw,
+                window_index_thw,
+                cu_seqlens_window_thw,
+                cu_seqlens_thw,
+            ) = self.get_rope_by_thw(t, h, w)
+
+            window_index.append(window_index_thw + window_index_id)
+            window_index_id += t * llm_h * llm_w
+
+            cu_seqlens_window_thw = cu_seqlens_window_thw + cu_window_seqlens_last
+            cu_window_seqlens_last = cu_seqlens_window_thw[-1]
+            cu_window_seqlens.append(cu_seqlens_window_thw)
+
+            rotary_pos_emb.append(rotary_pos_emb_thw)
+
+            cu_seqlens.append(cu_seqlens_thw)
+
+        rotary_pos_emb = jnp.concatenate(rotary_pos_emb, axis=0)
+        window_index = jnp.concatenate(window_index, axis=0)
+        cu_window_seqlens = jnp.concatenate(cu_window_seqlens, axis=0)
+
+        cu_seqlens = jnp.concatenate(cu_seqlens, axis=0)
+        cu_seqlens = jnp.cumsum(cu_seqlens, axis=0, dtype=jnp.int32)
+        cu_seqlens = jnp.pad(cu_seqlens, ((1, 0),), mode="constant", constant_values=0)
+        return window_index, rotary_pos_emb, cu_seqlens, cu_window_seqlens
+
+    def compute_hidden_states(
+        self,
+        x: jax.Array,
+        window_index: jax.Array,
+        rotary_pos_emb: jax.Array,
+        cu_seqlens: jax.Array,
+        cu_window_seqlens: jax.Array,
+    ) -> jax.Array:
+        hidden_states = self.patch_embed(x)
+
+        # num of patches
+        seq_len = x.shape[0]
+
+        hidden_states = hidden_states.reshape(
+            seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1
+        )
+        hidden_states = hidden_states[window_index, :, :]
+        hidden_states = hidden_states.reshape(seq_len, -1)
+
+        hidden_states = jnp.expand_dims(hidden_states, axis=1)
+
+        for layer_num, blk in enumerate(self.blocks):
+            if layer_num in self.fullatt_block_indexes:
+                hidden_states = blk(
+                    hidden_states,
+                    rotary_pos_emb=rotary_pos_emb,
+                    cu_window_seqlens=cu_seqlens,
+                    use_fullattn=True,
+                )
+            else:
+                hidden_states = blk(
+                    hidden_states,
+                    rotary_pos_emb=rotary_pos_emb,
+                    cu_window_seqlens=cu_window_seqlens,
+                    use_fullattn=False,
+                )
+
+        # adapter
+        hidden_states = self.merger(hidden_states)
+        # Use numpy argsort to avoid XLA kernel cache bug on GPU
+        # (RET_CHECK failure in xla/service/gpu/kernel_reuse_cache.cc)
+        # This is safe since vision encoding runs outside JIT
+        reverse_indices = np.argsort(np.asarray(window_index))
+        hidden_states = hidden_states[reverse_indices, :]
+        return hidden_states
+
+    def __call__(self, x: jax.Array, grid_thw: tuple[tuple[int, int, int]]) -> jax.Array:
+        # x: pixel_values: jax.Array
+        # """Shape:
+        # `(num_patches, num_channels * patch_size * patch_size)`
+        # """
+
+        # grid_thw: image_grid_thw: jax.Array
+        # """Shape: `(num_images, 3)`
+        # This should be in `(grid_t, grid_h, grid_w)` format.
+        # """
+        # Run in eager mode (no JIT) to avoid kernel cache issues
+        # Vision encoding happens once during prefill, performance isn't critical
+        window_index, rotary_pos_emb, cu_seqlens, cu_window_seqlens = self.compute_aux_arrays(
+            grid_thw
+        )
+        return self.compute_hidden_states(
+            x, window_index, rotary_pos_emb, cu_seqlens, cu_window_seqlens
+        )
 
