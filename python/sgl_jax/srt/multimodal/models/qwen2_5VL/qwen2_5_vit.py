@@ -659,7 +659,8 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
                     "visual.patch_embed.proj.weight": WeightMapping(
                         target_path="visual.patch_embed.proj.kernel",
                         sharding=(None, None, None, None, None),
-                        transpose=(2, 3, 4, 1, 0),  # Permute axes for Conv3D
+                        transpose_axes=(2, 3, 4, 1, 0)
+                        # transpose=(2, 3, 4, 1, 0),  # Permute axes for Conv3D
                     ),
                     # Merger layers
                     "visual.merger.ln_q.weight": WeightMapping(
