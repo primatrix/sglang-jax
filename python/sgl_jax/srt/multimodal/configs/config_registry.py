@@ -4,7 +4,7 @@ import logging
 import os
 
 from sgl_jax.srt.multimodal.configs.dits.wan_model_config import WanModelConfig
-from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import QwenVLModelConfig
+from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import QwenVLModelVitConfig
 from sgl_jax.srt.multimodal.configs.vaes.wan_vae_config import WanVAEConfig
 
 logger = logging.getLogger(__name__)
@@ -264,12 +264,12 @@ class VAEConfigRegistry:
 class QwenVLConfigRegistry:
     # Model name -> config factory mapping
     _REGISTRY: dict[str, callable] = {
-        "Qwen/Qwen2.5-VL-3B-Instruct": lambda: QwenVLModelConfig(),
+        "Qwen/Qwen2.5-VL-3B-Instruct": lambda: QwenVLModelVitConfig(),
     }
 
     # Keyword patterns for fallback matching (order matters - more specific first)
     _KEYWORD_PATTERNS: list[tuple[str, callable]] = [
-        ("Qwen2.5-VL", lambda: QwenVLModelConfig()),
+        ("Qwen2.5-VL", lambda: QwenVLModelVitConfig()),
     ]
 
     @classmethod
@@ -278,7 +278,7 @@ class QwenVLConfigRegistry:
         logger.info("Registered QwenVL config '%s'", model_name)
 
     @classmethod
-    def get_config(cls, model_path: str) -> QwenVLModelConfig:
+    def get_config(cls, model_path: str) -> QwenVLModelVitConfig:
         model_name = cls._extract_model_name(model_path)
 
         # Try exact match first
@@ -345,7 +345,7 @@ def get_vae_config(model_path: str) -> WanVAEConfig:
     """
     return VAEConfigRegistry.get_config(model_path)
 
-def get_qwen_vl_config(model_path: str) -> QwenVLModelConfig:
+def get_qwen_vl_config(model_path: str) -> QwenVLModelVitConfig:
     """Convenience function to get Qwen vl config.
 
     Args:

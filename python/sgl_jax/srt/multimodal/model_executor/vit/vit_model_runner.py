@@ -59,7 +59,7 @@ class VitModelRunner(BaseModelRunner):
         ):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
-            return model(x)
+            return model.encode_vision(x)
 
         def encode_vision_wrapper(x: jax.Array):
             return encode_vision(model_def, model_state_def, model_state_leaves, x)

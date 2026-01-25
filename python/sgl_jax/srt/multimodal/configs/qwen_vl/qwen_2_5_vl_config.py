@@ -7,7 +7,7 @@ from sgl_jax.srt.multimodal.configs.multimodal_base_config import MultiModalMode
 
 
 @dataclasses.dataclass
-class QwenVLModelConfig(MultiModalModelConfigs):
+class QwenVLModelVitConfig(MultiModalModelConfigs):
     model_type = "qwen2_5_vl"
     base_config_key = "vision_config"
 
