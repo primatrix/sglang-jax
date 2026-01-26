@@ -652,15 +652,15 @@ def _fused_ep_moe_kernel(
         ).wait()
 
     def _compute_expert_sizes(topk_ids: jax.Array) -> jax.Array:
-        sizes = jnp.zeros((1, padded_num_experts), dtype=jnp.int32)
-
-        def _count_one(t_id, sizes_acc):
-            for k_id in range(top_k):
-                e_id = topk_ids[t_id, k_id].astype(jnp.int32)
-                sizes_acc = sizes_acc.at[0, e_id].add(jnp.int32(1))
-            return sizes_acc
-
-        return lax.fori_loop(0, bt, _count_one, sizes, unroll=False)
+        # IMPORTANT: avoid `.at[...]` scatter updates inside Pallas (scatter is not
+        # implemented in the TPU lowering for this kernel).
+        #
+        # Shapes:
+        #   topk_ids: [bt, top_k]
+        #   sizes:    [1, padded_num_experts]
+        one_hot = jax.nn.one_hot(topk_ids.astype(jnp.int32), padded_num_experts, dtype=jnp.int32)
+        counts = jnp.sum(one_hot, axis=(0, 1), dtype=jnp.int32)
+        return counts[jnp.newaxis, :]
 
     def all_reduce_metadata(*, bt_sem_id, t2e_routing, starts, sizes):
         send_sem = send_x2_sems.at[0]
@@ -2089,9 +2089,13 @@ def _fused_ep_moe_kernel(
             jnp.float32
         )
 
-        padded_k_shape = (bt, padded_top_k)
-        t2e_routing = jnp.zeros(padded_k_shape, dtype=jnp.int32)
-        t2e_routing = t2e_routing.at[:, :top_k].set(topk_ids_bt.astype(jnp.int32))
+        # IMPORTANT: avoid `.at[...]` scatter updates inside Pallas.
+        t2e_routing = jnp.pad(
+            topk_ids_bt.astype(jnp.int32),
+            ((0, 0), (0, padded_top_k - top_k)),
+            mode="constant",
+            constant_values=0,
+        )
         expert_sizes = _compute_expert_sizes(topk_ids_bt)
         expert_starts = jnp.zeros_like(expert_sizes)
         all_reduce_metadata(
