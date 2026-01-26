@@ -2671,6 +2671,11 @@ def fused_ep_moe(
             f"Expected topk_ids/topk_weights to have shape (num_tokens, top_k) or "
             f"(num_tokens, padded_top_k); got {topk_ids.shape=} with {top_k=} {padded_top_k=}."
         )
+    # Force materialization of the padded buffers. Without this, XLA can keep
+    # `pad` results as non-materialized views, which can lead to invalid DMA
+    # bounds when Mosaic generates HBM->VMEM transfers for the top-k tiles.
+    topk_ids = lax.copy(topk_ids)
+    topk_weights = lax.copy(topk_weights)
 
     tokens = tokens.reshape(-1, t_packing, hidden_size // t_packing)
 
