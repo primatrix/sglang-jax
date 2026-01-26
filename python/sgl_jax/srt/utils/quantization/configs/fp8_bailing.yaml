@@ -14,7 +14,7 @@ quantization:
         weight_qtype: 'float8_e4m3fn'
         act_qtype: 'float8_e4m3fn'
 
-  # MoE experts: FP8 weights only, NO activation quantization
+  # MoE experts: FP8 weights and activation
   moe:
     weight_dtype: 'float8_e4m3fn'
     activation_dtype: 'float8_e4m3fn'
