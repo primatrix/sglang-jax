@@ -461,8 +461,10 @@ def _fused_ep_moe_kernel(
     b1_hbm,  # None | F32(local_num_experts, 1, intermediate_size)
     b2_hbm,  # None | F32(local_num_experts, 1, hidden_size)
     b3_hbm,  # None | F32(local_num_experts, 1, intermediate_size)
-    topk_ids_hbm,  # (local_num_tokens, top_k) int32
-    topk_weights_hbm,  # (local_num_tokens, top_k) float32
+    # Note: for TPU HBM tiling/DMA alignment we pass top-k buffers with the
+    # last dimension padded to `align_to(top_k, 128)`.
+    topk_ids_hbm,  # (local_num_tokens, padded_top_k) int32
+    topk_weights_hbm,  # (local_num_tokens, padded_top_k) float32
     a2a_s_x2_hbm,  # (2, align_to(bt * num_devices, bts), t_packing, hidden_size // t_packing)
     a2a_s_acc_x2_hbm,  # (2, align_to(bt * num_devices, bts), t_packing, hidden_size // t_packing)
     a2a_g_hbm,  # (num_experts, bt, t_packing, hidden_size // t_packing)
@@ -485,8 +487,8 @@ def _fused_ep_moe_kernel(
     a2a_g_acc_vmem,  # (1, top_k, acc_bt, t_packing, hidden_size // t_packing)
     top_k_logits_vmem,  # F32(bt, top_k)
     ### Expert weight double buffering:
-    b_topk_ids_x2_vmem,  # (2, bt, top_k)
-    b_topk_weights_x2_vmem,  # (2, bt, top_k)
+    b_topk_ids_x2_vmem,  # (2, bt, padded_top_k)
+    b_topk_weights_x2_vmem,  # (2, bt, padded_top_k)
     b_output_x2_vmem,  # (2, bt, hidden_size)
     b_w1_x2_vmem,  # <bw_sem_id> (2, t_packing, bd1 // t_packing, bf)
     b_w3_x2_vmem,  # <bw_sem_id> (2, t_packing, bd1 // t_packing, bf)
@@ -628,13 +630,13 @@ def _fused_ep_moe_kernel(
         bt_size = bt
 
         pltpu.make_async_copy(
-            src_ref=topk_ids_hbm.at[pl.ds(bt_start, bt_size), pl.ds(0, top_k)],
-            dst_ref=b_topk_ids_x2_vmem.at[bt_sem_id, pl.ds(0, bt_size), pl.ds(0, top_k)],
+            src_ref=topk_ids_hbm.at[pl.ds(bt_start, bt_size), pl.ds(0, padded_top_k)],
+            dst_ref=b_topk_ids_x2_vmem.at[bt_sem_id, pl.ds(0, bt_size), pl.ds(0, padded_top_k)],
             sem=local_sems.at[bt_sem_id, 0],
         ).start(priority=priority)
         pltpu.make_async_copy(
-            src_ref=topk_weights_hbm.at[pl.ds(bt_start, bt_size), pl.ds(0, top_k)],
-            dst_ref=b_topk_weights_x2_vmem.at[bt_sem_id, pl.ds(0, bt_size), pl.ds(0, top_k)],
+            src_ref=topk_weights_hbm.at[pl.ds(bt_start, bt_size), pl.ds(0, padded_top_k)],
+            dst_ref=b_topk_weights_x2_vmem.at[bt_sem_id, pl.ds(0, bt_size), pl.ds(0, padded_top_k)],
             sem=local_sems.at[bt_sem_id, topk_weights_sem_idx],
         ).start(priority=priority)
 
@@ -2083,8 +2085,8 @@ def _fused_ep_moe_kernel(
 
         wait_fetch_b_topk(bt_id=bt_id)
 
-        topk_ids_bt = b_topk_ids_x2_vmem.at[bt_sem_id][...]
-        topk_weights_bt = b_topk_weights_x2_vmem.at[bt_sem_id][...]
+        topk_ids_bt = b_topk_ids_x2_vmem.at[bt_sem_id][...][:, :top_k]
+        topk_weights_bt = b_topk_weights_x2_vmem.at[bt_sem_id][...][:, :top_k]
         top_k_logits_vmem.at[pl.ds(0, bt), pl.ds(0, top_k)][...] = topk_weights_bt.astype(
             jnp.float32
         )
@@ -2256,10 +2258,16 @@ def _validate_fused_ep_moe_args(
             raise ValueError(f"Expected {gating_output.shape=} to be {(num_tokens, num_experts)}.")
     else:
         assert topk_ids is not None and topk_weights is not None
-        if topk_ids.shape != (num_tokens, top_k):
-            raise ValueError(f"Expected {topk_ids.shape=} to be {(num_tokens, top_k)}.")
-        if topk_weights.shape != (num_tokens, top_k):
-            raise ValueError(f"Expected {topk_weights.shape=} to be {(num_tokens, top_k)}.")
+        padded_top_k = align_to(top_k, 128)
+        expected_shapes = {(num_tokens, top_k), (num_tokens, padded_top_k)}
+        if topk_ids.shape not in expected_shapes:
+            raise ValueError(
+                f"Expected {topk_ids.shape=} to be one of {sorted(expected_shapes)}, got {top_k=}."
+            )
+        if topk_weights.shape not in expected_shapes:
+            raise ValueError(
+                f"Expected {topk_weights.shape=} to be one of {sorted(expected_shapes)}, got {top_k=}."
+            )
 
     validate_fused_moe_block_config(
         num_tokens=num_tokens,
@@ -2603,6 +2611,28 @@ def fused_ep_moe(
             routed_scaling_factor=routed_scaling_factor,
         )
 
+    # IMPORTANT: `topk_ids/topk_weights` must be padded to 128 for TPU HBM tiling
+    # and DMA slice alignment. The kernel only consumes the first `top_k` columns.
+    if topk_ids.shape[1] == top_k:
+        if padded_top_k != top_k:
+            topk_ids = jnp.pad(
+                topk_ids,
+                ((0, 0), (0, padded_top_k - top_k)),
+                mode="constant",
+                constant_values=0,
+            )
+            topk_weights = jnp.pad(
+                topk_weights,
+                ((0, 0), (0, padded_top_k - top_k)),
+                mode="constant",
+                constant_values=0.0,
+            )
+    elif topk_ids.shape[1] != padded_top_k:
+        raise ValueError(
+            f"Expected topk_ids/topk_weights to have shape (num_tokens, top_k) or "
+            f"(num_tokens, padded_top_k); got {topk_ids.shape=} with {top_k=} {padded_top_k=}."
+        )
+
     tokens = tokens.reshape(-1, t_packing, hidden_size // t_packing)
 
     hbm_block_spec = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
@@ -2658,8 +2688,8 @@ def fused_ep_moe(
         ),  # a2a_g_acc_vmem
         pltpu.VMEM((bt, top_k), jnp.float32),  # top_k_logits_vmem
         # Expert compute scratch.
-        pltpu.VMEM((2, bt, top_k), jnp.int32),  # b_topk_ids_x2_vmem
-        pltpu.VMEM((2, bt, top_k), jnp.float32),  # b_topk_weights_x2_vmem
+        pltpu.VMEM((2, bt, padded_top_k), jnp.int32),  # b_topk_ids_x2_vmem
+        pltpu.VMEM((2, bt, padded_top_k), jnp.float32),  # b_topk_weights_x2_vmem
         pltpu.VMEM((2, bt, hidden_size), t_dtype),  # b_output_x2_vmem
         pltpu.VMEM((2, t_packing, bd1_per_pack, block_config.bf), w1.dtype),  # b_w1_x2_vmem
         pltpu.VMEM((2, t_packing, bd1_per_pack, block_config.bf), w3.dtype),  # b_w3_x2_vmem
