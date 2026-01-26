@@ -676,6 +676,8 @@ def _fused_ep_moe_kernel(
             offsets_vmem,
             starts_vmem,
             sizes_vmem,
+            d2e_count_vmem,
+            my_sizes_vmem,
         ):
             offsets_vmem[...] = jnp.zeros_like(offsets_vmem)
             # TODO(jevinjiang): check how slow is VMEM -> SMEM.
@@ -691,12 +693,16 @@ def _fused_ep_moe_kernel(
                 sem=send_sem,
             )
 
-            # IMPORTANT: remote puts must target HBM (not VMEM). We use an HBM
-            # scratch buffer to allgather per-device sizes and then DMA to SMEM.
+            # IMPORTANT: HBM references are not directly writable/readable inside
+            # Mosaic; stage through VMEM and use DMA copies.
+            my_sizes_vmem[...] = sizes
             my_sizes_hbm = d2e_count_x2_hbm.at[
                 bt_sem_id, my_id, pl.ds(0, 1), pl.ds(0, padded_num_experts)
             ]
-            my_sizes_hbm[...] = sizes
+            my_sizes_put = pltpu.async_copy(
+                src_ref=my_sizes_vmem, dst_ref=my_sizes_hbm, sem=send_sem
+            )
+            my_sizes_put.wait()
 
             # Ensure all peers have entered this scope before issuing remote puts.
             sync_barrier()
@@ -728,7 +734,12 @@ def _fused_ep_moe_kernel(
             # Ensure all peers completed their sends before using gathered sizes.
             sync_barrier()
 
-            gathered = d2e_count_x2_hbm.at[bt_sem_id][...][:, 0, :]
+            d2e_count_load = pltpu.async_copy(
+                src_ref=d2e_count_x2_hbm.at[bt_sem_id], dst_ref=d2e_count_vmem, sem=send_sem
+            )
+            d2e_count_load.wait()
+
+            gathered = d2e_count_vmem[:, 0, :]
             reduced_sizes = jnp.sum(gathered, axis=0, dtype=jnp.int32)[jnp.newaxis, :]
             before_mask = (jnp.arange(num_devices, dtype=jnp.int32) < my_id).astype(jnp.int32)
             reduced_starts = jnp.sum(
@@ -749,7 +760,7 @@ def _fused_ep_moe_kernel(
                 sem=send_sem,
             )
             d2e_count_copy = pltpu.async_copy(
-                src_ref=d2e_count_x2_hbm.at[bt_sem_id],
+                src_ref=d2e_count_vmem,
                 dst_ref=d2e_count_x2_smem.at[bt_sem_id],
                 sem=send_sem,
             )
@@ -766,6 +777,8 @@ def _fused_ep_moe_kernel(
             pltpu.VMEM(expert_offsets_x2_smem.shape[1:], expert_offsets_x2_smem.dtype),
             pltpu.VMEM(expert_starts_x2_smem.shape[1:], expert_starts_x2_smem.dtype),
             pltpu.VMEM(expert_sizes_x2_smem.shape[1:], expert_sizes_x2_smem.dtype),
+            pltpu.VMEM(d2e_count_x2_smem.shape[1:], d2e_count_x2_smem.dtype),
+            pltpu.VMEM((1, padded_num_experts), jnp.int32),
         )
 
     def start_a2a_scatter(*, bt_sem_id, e_sem_id, local_e_id, bt_start):
