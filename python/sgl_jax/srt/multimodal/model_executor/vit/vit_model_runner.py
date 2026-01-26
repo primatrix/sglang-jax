@@ -1,6 +1,6 @@
-from functools import partial
-
 import jax
+import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 
 from sgl_jax.srt.configs.load_config import LoadConfig
@@ -45,30 +45,57 @@ class VitModelRunner(BaseModelRunner):
         model_def, model_state = nnx.split(self.model)
         model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
 
-        @partial(
-            jax.jit,
-            static_argnames=["model_state_def"],
-        )
-        def encode_vision(
+        def _encode_vision_impl(
             model_def,
             model_state_def,
             model_state_leaves,
             pixel_values,
-            image_grid_thw,
-            video_grid_thw,
+            window_index,
+            rotary_pos_emb,
+            cu_seqlens,
+            cu_window_seqlens,
         ):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
-            return model(pixel_values, image_grid_thw, video_grid_thw)
+            return model.visual.compute_hidden_states(
+                pixel_values, window_index, rotary_pos_emb, cu_seqlens, cu_window_seqlens
+            )
+
+        encode_vision = jax.jit(_encode_vision_impl, static_argnames=["model_state_def"])
+
+        def _to_static_grid(grid_thw):
+            if grid_thw is None:
+                return None
+            if isinstance(grid_thw, tuple):
+                return tuple(tuple(int(x) for x in row) for row in grid_thw)
+            grid = np.asarray(grid_thw)
+            if grid.size == 0:
+                return None
+            return tuple(tuple(int(x) for x in row) for row in grid.tolist())
 
         def encode_vision_wrapper(pixel_values: jax.Array, image_grid_thw, video_grid_thw):
+            image_grid_thw = _to_static_grid(image_grid_thw)
+            video_grid_thw = _to_static_grid(video_grid_thw)
+            combined_grid_thw = []
+            if image_grid_thw:
+                combined_grid_thw.extend(image_grid_thw)
+            if video_grid_thw:
+                combined_grid_thw.extend(video_grid_thw)
+            if not combined_grid_thw:
+                return jnp.zeros((0, self.model.config.hidden_size), dtype=pixel_values.dtype)
+            combined_grid_thw = tuple(combined_grid_thw)
+            window_index, rotary_pos_emb, cu_seqlens, cu_window_seqlens = (
+                self.model.visual.compute_aux_arrays(combined_grid_thw)
+            )
             return encode_vision(
                 model_def,
                 model_state_def,
                 model_state_leaves,
                 pixel_values,
-                image_grid_thw,
-                video_grid_thw,
+                window_index,
+                rotary_pos_emb,
+                cu_seqlens,
+                cu_window_seqlens,
             )
 
         self.jitted_encode_vision = encode_vision_wrapper

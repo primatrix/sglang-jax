@@ -231,6 +231,9 @@ class Qwen2_5_VisionAttention(nnx.Module):
         self.num_heads = config.num_heads
         self.head_dim = self.hidden_size // self.num_heads
         self.scale = 1.0 / math.sqrt(self.head_dim)
+        self._window_token_size = (
+            (config.window_size // config.spatial_merge_size // config.patch_size) ** 2
+        ) * (config.spatial_merge_size**2)
 
         # Use dummy rngs if None (for eval_shape)
         _rngs = rngs or nnx.Rngs(0)
@@ -274,11 +277,10 @@ class Qwen2_5_VisionAttention(nnx.Module):
         q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
         k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
 
-        # Compute window size from cu_window_seqlens if using windowed attention
+        # Use static window size derived from config for JIT compatibility.
         window_size = -1
         if not use_fullattn and cu_window_seqlens is not None:
-            window_sizes = jnp.diff(cu_window_seqlens)
-            window_size = int(window_sizes[0]) if len(window_sizes) > 0 else -1
+            window_size = self._window_token_size
 
         # Compute attention using the backend function
         output = vision_attention(q, k, v, self.scale, window_size)
@@ -584,10 +586,8 @@ class Qwen2_5_VL_VisionTransformer(nnx.Module):
 
         # adapter
         hidden_states = self.merger(hidden_states)
-        # Use numpy argsort to avoid XLA kernel cache bug on GPU
-        # (RET_CHECK failure in xla/service/gpu/kernel_reuse_cache.cc)
-        # This is safe since vision encoding runs outside JIT
-        reverse_indices = np.argsort(np.asarray(window_index))
+        # JIT-safe argsort (numpy would break under JIT).
+        reverse_indices = jnp.argsort(window_index)
         hidden_states = hidden_states[reverse_indices, :]
         return hidden_states
 
@@ -653,7 +653,7 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
         else:
             loader.load_weights_from_safetensors(weight_mappings)
 
-        logger.info("Qwen2.5 VL weights loaded successfully!")
+        logger.info("Qwen2.5 VL - ViT Stage weights loaded successfully!")
 
     def _create_qwen2_5_vl_vision_weight_mappings(self) -> dict:
         mappings = {}
@@ -701,11 +701,10 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
             )
 
         # Vision layers mappings
-        if hasattr(self.config, "vision_config"):
-            num_vision_layers = getattr(self.config.vision_config, "depth", 0)
-            for layer_idx in range(num_vision_layers):
-                vision_layer_mappings = self._create_vision_layer_mappings(layer_idx)
-                mappings.update(vision_layer_mappings)
+        num_vision_layers = getattr(self.config, "depth", 0)
+        for layer_idx in range(num_vision_layers):
+            vision_layer_mappings = self._create_vision_layer_mappings(layer_idx)
+            mappings.update(vision_layer_mappings)
 
         return mappings
 
