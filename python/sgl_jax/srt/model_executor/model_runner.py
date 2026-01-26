@@ -271,11 +271,19 @@ class ModelRunner(BaseModelRunner):
         from jax.sharding import NamedSharding
         from jax.sharding import PartitionSpec as P
 
-        def walk(obj) -> None:
-            from sgl_jax.srt.layers.moe import FusedEPMoE
+        from sgl_jax.srt.layers.moe import FusedEPMoE
+
+        visited: set[int] = set()
+        stack: list[object] = [self.model]
+
+        while stack:
+            obj = stack.pop()
+            oid = id(obj)
+            if oid in visited:
+                continue
+            visited.add(oid)
 
             if isinstance(obj, FusedEPMoE) and getattr(obj, "enable_eplb", False):
-                dispatch = None
                 if init_dispatch_all is not None:
                     dispatch = init_dispatch_all[int(obj.layer_id)]
                 else:
@@ -287,21 +295,20 @@ class ModelRunner(BaseModelRunner):
                     np.asarray(dispatch, dtype=np.int32),
                     NamedSharding(self.mesh, P()),
                 )
-                return
+                continue
 
-            if isinstance(obj, (list, tuple)):
-                for x in obj:
-                    walk(x)
-                return
+            # Treat arrays and scalars as leaves.
+            if isinstance(obj, (jax.Array, np.ndarray, str, bytes, int, float, bool, type(None))):
+                continue
+
+            if isinstance(obj, (list, tuple, set, frozenset)):
+                stack.extend(list(obj))
+                continue
             if isinstance(obj, dict):
-                for x in obj.values():
-                    walk(x)
-                return
+                stack.extend(list(obj.values()))
+                continue
             if hasattr(obj, "__dict__"):
-                for x in obj.__dict__.values():
-                    walk(x)
-
-        walk(self.model)
+                stack.extend(list(obj.__dict__.values()))
 
     def apply_eplb_rebalance(self, *, new_metadata) -> None:
         """Apply a new EPLB placement online (fused MoE only).
