@@ -184,7 +184,7 @@ def prepare_inputs_for_quantization(
 ) -> tuple[ForwardBatch, MHATokenToKVPool, LogitsMetadata]:
     bs = 1
     max_seq_len = 4096
-    num_tokens = model_config.vocab_size
+    num_tokens = 512
     num_kv_heads = model_config.get_total_num_kv_heads_with_replication(
         model_runner.mesh.shape["tensor"]
     )

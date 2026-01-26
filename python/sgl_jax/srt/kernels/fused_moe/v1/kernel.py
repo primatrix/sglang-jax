@@ -1728,7 +1728,9 @@ def _fused_ep_moe_kernel(
 
                         @pl.when((next_tile_id == num_token_tiles) & (bd1_id + 1 < num_bd1))
                         def _prefetch_bts0_tokens_for_next_bd():
-                            start_stage_a2a_s_tile_from_hbm(jnp.int32(0), bd1_id + 1, jnp.int32(0))
+                            start_stage_a2a_s_tile_from_hbm(
+                                jnp.int32(0), jnp.minimum(bd1_id + 1, num_bd1 - 1), jnp.int32(0)
+                            )
 
                         tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
                         dynamic_ffn1(
