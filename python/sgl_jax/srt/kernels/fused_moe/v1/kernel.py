@@ -468,6 +468,7 @@ def _fused_ep_moe_kernel(
     a2a_s_x2_hbm,  # (2, align_to(bt * num_devices, bts), t_packing, hidden_size // t_packing)
     a2a_s_acc_x2_hbm,  # (2, align_to(bt * num_devices, bts), t_packing, hidden_size // t_packing)
     a2a_g_hbm,  # (num_experts, bt, t_packing, hidden_size // t_packing)
+    d2e_count_x2_hbm,  # (2, num_devices, 1, padded_num_experts) int32
     w1_shared_hbm,  # None | (hidden_size, se_intermediate_size)
     w3_shared_hbm,  # None | (hidden_size, se_intermediate_size)
     w2_shared_hbm,  # None | (se_intermediate_size, hidden_size)
@@ -672,7 +673,6 @@ def _fused_ep_moe_kernel(
         # `starts` and global `sizes`.
         def _all_reduce_metadata(
             t2e_routing_vmem,
-            d2e_count_vmem,
             offsets_vmem,
             starts_vmem,
             sizes_vmem,
@@ -691,17 +691,22 @@ def _fused_ep_moe_kernel(
                 sem=send_sem,
             )
 
-            d2e_count_vmem[...] = jnp.zeros_like(d2e_count_vmem)
-            d2e_count_vmem[my_id] = sizes
+            # IMPORTANT: remote puts must target HBM (not VMEM). We use an HBM
+            # scratch buffer to allgather per-device sizes and then DMA to SMEM.
+            my_sizes_hbm = d2e_count_x2_hbm.at[
+                bt_sem_id, my_id, pl.ds(0, 1), pl.ds(0, padded_num_experts)
+            ]
+            my_sizes_hbm[...] = sizes
 
-            # Ensure all peers have entered this scope (VMEM allocated) before
-            # issuing remote puts.
+            # Ensure all peers have entered this scope before issuing remote puts.
             sync_barrier()
             for step in range(1, num_devices):
                 peer_id = (my_id + step) % num_devices
                 pltpu.make_async_remote_copy(
-                    src_ref=d2e_count_vmem.at[my_id, pl.ds(0, 1), pl.ds(0, padded_num_experts)],
-                    dst_ref=d2e_count_vmem.at[my_id, pl.ds(0, 1), pl.ds(0, padded_num_experts)],
+                    src_ref=my_sizes_hbm,
+                    dst_ref=d2e_count_x2_hbm.at[
+                        bt_sem_id, my_id, pl.ds(0, 1), pl.ds(0, padded_num_experts)
+                    ],
                     send_sem=send_sem,
                     recv_sem=recv_sem,
                     device_id=get_mesh_device_id(peer_id),
@@ -711,21 +716,24 @@ def _fused_ep_moe_kernel(
                 # Drain one incoming update for this step to guarantee forward
                 # progress (remote copies signal `recv_sem` on the receiver).
                 src_peer = (my_id + num_devices - step) % num_devices
-                recv_ref = d2e_count_vmem.at[src_peer, pl.ds(0, 1), pl.ds(0, padded_num_experts)]
+                recv_ref = d2e_count_x2_hbm.at[
+                    bt_sem_id, src_peer, pl.ds(0, 1), pl.ds(0, padded_num_experts)
+                ]
                 pltpu.make_async_copy(src_ref=recv_ref, dst_ref=recv_ref, sem=recv_sem).wait()
 
-                send_ref = d2e_count_vmem.at[my_id, pl.ds(0, 1), pl.ds(0, padded_num_experts)]
-                pltpu.make_async_copy(src_ref=send_ref, dst_ref=send_ref, sem=send_sem).wait()
+                pltpu.make_async_copy(
+                    src_ref=my_sizes_hbm, dst_ref=my_sizes_hbm, sem=send_sem
+                ).wait()
 
             # Ensure all peers completed their sends before using gathered sizes.
             sync_barrier()
 
-            reduced_sizes = jnp.zeros_like(sizes)
-            reduced_starts = jnp.zeros_like(starts)
-            for dev_id in range(num_devices):
-                dev_sizes = d2e_count_vmem[dev_id]
-                reduced_sizes += dev_sizes
-                reduced_starts += lax.select(dev_id < my_id, dev_sizes, jnp.zeros_like(dev_sizes))
+            gathered = d2e_count_x2_hbm.at[bt_sem_id][...][:, 0, :]
+            reduced_sizes = jnp.sum(gathered, axis=0, dtype=jnp.int32)[jnp.newaxis, :]
+            before_mask = (jnp.arange(num_devices, dtype=jnp.int32) < my_id).astype(jnp.int32)
+            reduced_starts = jnp.sum(
+                gathered * before_mask[:, jnp.newaxis], axis=0, dtype=jnp.int32
+            )[jnp.newaxis, :]
 
             starts_vmem[...] = reduced_starts
             sizes_vmem[...] = reduced_sizes
@@ -741,7 +749,7 @@ def _fused_ep_moe_kernel(
                 sem=send_sem,
             )
             d2e_count_copy = pltpu.async_copy(
-                src_ref=d2e_count_vmem,
+                src_ref=d2e_count_x2_hbm.at[bt_sem_id],
                 dst_ref=d2e_count_x2_smem.at[bt_sem_id],
                 sem=send_sem,
             )
@@ -755,7 +763,6 @@ def _fused_ep_moe_kernel(
         pl.run_scoped(
             _all_reduce_metadata,
             pltpu.VMEM(t2e_routing_x2_smem.shape[1:], t2e_routing_x2_smem.dtype),
-            pltpu.VMEM(d2e_count_x2_smem.shape[1:], d2e_count_x2_smem.dtype),
             pltpu.VMEM(expert_offsets_x2_smem.shape[1:], expert_offsets_x2_smem.dtype),
             pltpu.VMEM(expert_starts_x2_smem.shape[1:], expert_starts_x2_smem.dtype),
             pltpu.VMEM(expert_sizes_x2_smem.shape[1:], expert_sizes_x2_smem.dtype),
@@ -2846,6 +2853,7 @@ def fused_ep_moe(
                     hbm_block_spec,  # a2a_s_x2_hbm
                     hbm_block_spec,  # a2a_s_acc_x2_hbm
                     hbm_block_spec,  # a2a_g_hbm
+                    hbm_block_spec,  # d2e_count_x2_hbm
                     None if w1_shared is None else hbm_block_spec,  # w1_shared_hbm
                     None if w3_shared is None else hbm_block_spec,  # w3_shared_hbm
                     None if w2_shared is None else hbm_block_spec,  # w2_shared_hbm
@@ -2933,6 +2941,7 @@ def fused_ep_moe(
             P(),  # a2a_s_x2_hbm
             P(),  # a2a_s_acc_x2_hbm
             P(),  # a2a_g_hbm
+            P(),  # d2e_count_x2_hbm
             None if w1_shared is None else P(),  # w1_shared
             None if w3_shared is None else P(),  # w3_shared
             None if w2_shared is None else P(),  # w2_shared
@@ -2959,6 +2968,7 @@ def fused_ep_moe(
         a2a_s_x2_hbm_scratch,
         a2a_s_acc_x2_hbm_scratch,
         a2a_g_hbm_scratch,
+        d2e_count_x2_hbm_scratch,
         w1_shared=None,
         w3_shared=None,
         w2_shared=None,
@@ -2996,6 +3006,9 @@ def fused_ep_moe(
                 a2a_s_acc_x2_hbm_scratch, pltpu.HBM
             ),  # a2a_s_acc_x2_hbm
             pltpu.with_memory_space_constraint(a2a_g_hbm_scratch, pltpu.HBM),  # a2a_g_hbm
+            pltpu.with_memory_space_constraint(
+                d2e_count_x2_hbm_scratch, pltpu.HBM
+            ),  # d2e_count_x2_hbm
             (
                 None
                 if w1_shared is None
@@ -3036,6 +3049,7 @@ def fused_ep_moe(
         (2, a2a_max_tokens, t_packing, hidden_size // t_packing), t_dtype
     )
     a2a_g_hbm_scratch = pl.empty((num_experts, bt, t_packing, hidden_size // t_packing), t_dtype)
+    d2e_count_x2_hbm_scratch = pl.empty((2, num_devices, 1, padded_num_experts), jnp.int32)
 
     output = kernel(
         tokens,
@@ -3053,6 +3067,7 @@ def fused_ep_moe(
         a2a_s_x2_hbm_scratch,
         a2a_s_acc_x2_hbm_scratch,
         a2a_g_hbm_scratch,
+        d2e_count_x2_hbm_scratch,
         w1_shared,
         w3_shared,
         w2_shared,
