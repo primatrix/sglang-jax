@@ -2492,6 +2492,25 @@ def fused_ep_moe(
 ):
 
     ep_size = get_ep_size(mesh, dp_axis_name, tp_axis_name)
+    orig_num_tokens = tokens.shape[0]
+    t_packing = get_dtype_packing(tokens.dtype)
+    local_num_tokens = orig_num_tokens // ep_size
+    if local_num_tokens * ep_size != orig_num_tokens:
+        raise ValueError(f"Expected {orig_num_tokens=} to be aligned to {ep_size=}.")
+    if local_num_tokens % t_packing != 0:
+        padded_num_tokens = align_to(orig_num_tokens, ep_size * t_packing)
+        pad = padded_num_tokens - orig_num_tokens
+        tokens = jnp.pad(tokens, ((0, pad), (0, 0)), mode="constant", constant_values=0)
+        if gating_output is not None:
+            gating_output = jnp.pad(
+                gating_output, ((0, pad), (0, 0)), mode="constant", constant_values=0
+            )
+        if topk_ids is not None:
+            topk_ids = jnp.pad(topk_ids, ((0, pad), (0, 0)), mode="constant", constant_values=0)
+        if topk_weights is not None:
+            topk_weights = jnp.pad(
+                topk_weights, ((0, pad), (0, 0)), mode="constant", constant_values=0.0
+            )
     if block_config is None:
         from .tuned_block_configs import get_tuned_fused_moe_block_config
 
@@ -3018,7 +3037,7 @@ def fused_ep_moe(
     )
     a2a_g_hbm_scratch = pl.empty((num_experts, bt, t_packing, hidden_size // t_packing), t_dtype)
 
-    return kernel(
+    output = kernel(
         tokens,
         w1,
         w2,
@@ -3041,3 +3060,4 @@ def fused_ep_moe(
         w3_shared_scale,
         w2_shared_scale,
     )
+    return output[:orig_num_tokens]
