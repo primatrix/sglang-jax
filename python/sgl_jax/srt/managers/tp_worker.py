@@ -210,7 +210,7 @@ class ModelWorker:
             target=self._sync_expert_ids_d2h_thread_func,
             daemon=True,
         )
-        # self.sync_expert_ids_d2h_thread.start()
+        self.sync_expert_ids_d2h_thread.start()
 
     def _maybe_create_eplb_controller(self):
         if not getattr(self.server_args, "enable_eplb", False):
