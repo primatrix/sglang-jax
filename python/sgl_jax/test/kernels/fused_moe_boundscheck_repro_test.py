@@ -171,6 +171,14 @@ class FusedMoeBoundsCheckReproTest(jtu.JaxTestCase):
         ),
     )
     def test_boundscheck_repro(self, **kwargs):
+        shared_override = os.getenv("SGLANG_FUSED_MOE_BOUNDSCHECK_SHARED_EXPERT", None)
+        if shared_override is not None:
+            kwargs["has_shared_expert"] = shared_override not in ("0", "false", "False")
+
+        prepad_override = os.getenv("SGLANG_FUSED_MOE_BOUNDSCHECK_PREPAD_TOPK", None)
+        if prepad_override is not None:
+            kwargs["prepad_topk"] = prepad_override not in ("0", "false", "False")
+
         sweep = os.getenv("SGLANG_FUSED_MOE_BOUNDSCHECK_SWEEP", "0") == "1"
         cases = [kwargs]
         if sweep:
@@ -186,6 +194,15 @@ class FusedMoeBoundsCheckReproTest(jtu.JaxTestCase):
                         cases.append(c)
 
         for case in cases:
+            desc = (
+                "boundscheck_case "
+                f"num_tokens={case['num_tokens']} "
+                f"shared={int(case['has_shared_expert'])} "
+                f"prepad_topk={int(case['prepad_topk'])}"
+            )
+            # If the TPU driver crashes, this is the last printed case and serves as the
+            # "which variant triggered it" marker.
+            print(desc, flush=True)
             with self.subTest(
                 **{k: case[k] for k in ("num_tokens", "has_shared_expert", "prepad_topk")}
             ):
