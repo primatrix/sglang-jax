@@ -2674,8 +2674,8 @@ def fused_ep_moe(
     # Force materialization of the padded buffers. Without this, XLA can keep
     # `pad` results as non-materialized views, which can lead to invalid DMA
     # bounds when Mosaic generates HBM->VMEM transfers for the top-k tiles.
-    topk_ids = lax.copy(topk_ids)
-    topk_weights = lax.copy(topk_weights)
+    topk_ids = jnp.copy(topk_ids)
+    topk_weights = jnp.copy(topk_weights)
 
     tokens = tokens.reshape(-1, t_packing, hidden_size // t_packing)
 
