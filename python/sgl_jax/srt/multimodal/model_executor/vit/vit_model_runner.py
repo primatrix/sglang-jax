@@ -101,10 +101,12 @@ class VitModelRunner(BaseModelRunner):
         self.jitted_encode_vision = encode_vision_wrapper
 
     def forward(self, batch: Req, mesh: jax.sharding.Mesh):
-        batch.input_embeds = self.jitted_encode_vision(
+        batch.multimodal_embeddings = self.jitted_encode_vision(
             pixel_values=batch.pixel_values,
             image_grid_thw=batch.image_grid_thw,
             video_grid_thw=batch.video_grid_thw,
         )
-        print(f"VitModelRunner forward input_embeds shape: {batch.input_embeds.shape}")
+        print(
+            f"VitModelRunner forward multimodal_embeddings shape: {batch.multimodal_embeddings.shape}"
+        )
         return batch
