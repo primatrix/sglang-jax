@@ -202,27 +202,48 @@ class Qwen2_5_VL_Generation(nnx.Module):
         if head_weight is not None:
             self.lm_head.embedding.value = head_weight
 
-    def get_input_embeddings(self, input_ids: jax.Array, vision_embeds: jax.Array) -> jax.Array:
+    def _merge_vision_text_embeddings(
+        self,
+        input_ids: jax.Array,
+        text_embeds: jax.Array,
+        vision_embeds: list[jax.Array],
+    ) -> jax.Array:
+        """Merge vision embeddings into text embeddings at image/video token positions."""
+        vision_embeds_flat = jnp.concatenate(vision_embeds, axis=0)
+
+        placeholder_token_ids = []
+        if self.image_token_id is not None:
+            placeholder_token_ids.append(self.image_token_id)
+        if self.video_token_id is not None:
+            placeholder_token_ids.append(self.video_token_id)
+        if not placeholder_token_ids:
+            return text_embeds
+
+        placeholder_token_ids = jnp.array(placeholder_token_ids)
+        is_multimodal = jnp.isin(input_ids, placeholder_token_ids)
+
+        dummy_row = jnp.zeros_like(vision_embeds_flat[0:1])
+        vision_embeds_padded = jnp.concatenate([dummy_row, vision_embeds_flat], axis=0)
+
+        gather_indices = jnp.cumsum(is_multimodal)
+        update_values = vision_embeds_padded[gather_indices]
+
+        condition = jnp.expand_dims(is_multimodal, axis=-1)
+        return jnp.where(condition, update_values, text_embeds)
+
+    def get_input_embeddings(
+        self, input_ids: jax.Array, vision_embeds: jax.Array | list[jax.Array]
+    ) -> jax.Array:
         text_embeds = self.model.embed_tokens(input_ids)
         if vision_embeds is None:
             return text_embeds
 
-        mask = None
-        if self.image_token_id is not None:
-            mask = input_ids == self.image_token_id
-        if self.video_token_id is not None:
-            video_mask = input_ids == self.video_token_id
-            mask = video_mask if mask is None else (mask | video_mask)
-
-        if mask is None:
+        if isinstance(vision_embeds, jax.Array):
+            vision_embeds = [vision_embeds]
+        if len(vision_embeds) == 0:
             return text_embeds
 
-        num_mm = vision_embeds.shape[0]
-        if num_mm == 0:
-            return text_embeds
-
-        mm_positions = jnp.nonzero(mask, size=num_mm, fill_value=0)[0]
-        return text_embeds.at[mm_positions].set(vision_embeds)
+        return self._merge_vision_text_embeddings(input_ids, text_embeds, vision_embeds)
 
     def __call__(
         self,
@@ -231,11 +252,10 @@ class Qwen2_5_VL_Generation(nnx.Module):
         logits_metadata: LogitsMetadata,
     ):
         vision_embeds = getattr(forward_batch, "cached_vision_embeds", None)
-        input_embeds = (
-            self.get_input_embeddings(forward_batch.input_ids, vision_embeds)
-            if vision_embeds is not None
-            else None
-        )
+        if vision_embeds is not None and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+            input_embeds = self.get_input_embeddings(forward_batch.input_ids, vision_embeds)
+        else:
+            input_embeds = None
         hidden_states, layers_kv_fused, layers_callback_flag = self.model(
             forward_batch, token_to_kv_pool, input_embeds=input_embeds
         )

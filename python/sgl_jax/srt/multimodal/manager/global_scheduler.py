@@ -11,7 +11,7 @@ import psutil
 import setproctitle
 import zmq
 
-from sgl_jax.srt.managers.io_struct import AbortReq
+from sgl_jax.srt.managers.io_struct import AbortReq, BatchTokenIDOut
 from sgl_jax.srt.multimodal.common.modality_enum import (
     MultimodalDataItem,
     pad_input_tokens,
@@ -377,6 +377,18 @@ class GlobalScheduler:
                             self.stage_configs[i].final_output,
                         )
                     if stage_result is None:
+                        continue
+                    if isinstance(stage_result, BatchTokenIDOut):
+                        if self.stage_configs[i].final_output:
+                            self.send_to_detokenizer.send_pyobj(stage_result)
+                            for rid in stage_result.rids:
+                                if rid in self.req_store:
+                                    del self.req_store[rid]
+                        else:
+                            logger.warning(
+                                "Received BatchTokenIDOut from non-final stage-%d; skipping.",
+                                i,
+                            )
                         continue
 
                     # Check if request was aborted (rid no longer in req_store)
