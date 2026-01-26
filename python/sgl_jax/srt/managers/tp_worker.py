@@ -295,22 +295,29 @@ class ModelWorker:
             self.parent_process.send_signal(signal.SIGQUIT)
 
     def _sync_experts_ids_d2h(self):
+        dump_topk_ids_file_info = os.getenv("DUMP_TOPK_IDS_FILEINFO", None)
+        dump_enabled = (
+            self.server_args.enable_return_routed_experts and dump_topk_ids_file_info is not None
+        )
+        controller = self._eplb_controller
+        need_cpu_copy = (
+            controller is not None or dump_enabled or self.server_args.enable_return_routed_experts
+        )
         while True:
             layers_topk_ids, model_worker_batch = self.sync_queue.get()
-            controller = self._eplb_controller
-            if controller is None:
-                get_global_experts_capturer().on_forward_end(layers_topk_ids, model_worker_batch)
+            if not need_cpu_copy:
                 continue
 
-            # When EPLB is enabled, we need a host copy anyway; reuse it for routed-experts capture to
-            # avoid a second D2H transfer when both features are enabled.
             layers_topk_ids_cpu = jax.device_get(layers_topk_ids)
             get_global_experts_capturer().on_forward_end(layers_topk_ids_cpu, model_worker_batch)
-            self._maybe_record_eplb(layers_topk_ids_cpu, model_worker_batch)
+            if dump_enabled:
+                self.dump_topk_ids(layers_topk_ids_cpu, model_worker_batch)
+            if controller is not None:
+                self._maybe_record_eplb(layers_topk_ids_cpu, model_worker_batch)
 
     def _maybe_record_eplb(
         self,
-        layers_topk_ids: list[jax.Array | np.ndarray | None],
+        layers_topk_ids: list[np.ndarray | None],
         model_worker_batch: ModelWorkerBatch,
     ):
         controller = self._eplb_controller
@@ -318,14 +325,10 @@ class ModelWorker:
             return
 
         unpadded_input_len = model_worker_batch.get_original_input_len()
-        if any(isinstance(x, jax.Array) for x in layers_topk_ids if x is not None):
-            topk_ids_cpu = jax.device_get(layers_topk_ids)
-        else:
-            topk_ids_cpu = layers_topk_ids
 
         topk_ids_by_layer = []
         top_k = controller.recorder.num_experts_per_tok
-        for ids_cpu in topk_ids_cpu:
+        for ids_cpu in layers_topk_ids:
             if ids_cpu is None:
                 topk_ids_by_layer.append(None)
                 continue
@@ -666,8 +669,6 @@ class ModelWorker:
         if pending is not None:
             self.model_runner.apply_eplb_rebalance(new_metadata=pending)
 
-        self.dump_topk_ids(layers_topk_ids, model_worker_batch)
-
         if launch_done is not None:
             launch_done.set()
 
@@ -741,7 +742,11 @@ class ModelWorker:
             cache_miss_count,
         )
 
-    def dump_topk_ids(self, layers_topk_ids: list[jax.Array], model_worker_batch: ModelWorkerBatch):
+    def dump_topk_ids(
+        self,
+        layers_topk_ids: list[np.ndarray | None],
+        model_worker_batch: ModelWorkerBatch,
+    ):
         enable = self.server_args.enable_return_routed_experts
         dump_topk_ids_file_info = os.getenv("DUMP_TOPK_IDS_FILEINFO", None)
         if not enable or dump_topk_ids_file_info is None:
@@ -760,7 +765,6 @@ class ModelWorker:
         import datetime
 
         unpadded_input_len = model_worker_batch.get_original_input_len()
-        layers_topk_ids_cpu = jax.device_get(layers_topk_ids)
 
         file_name = (
             f"{datetime.datetime.now().strftime('%Y-%m-%d_%H_%M_%S')}_{unpadded_input_len}"
@@ -768,10 +772,13 @@ class ModelWorker:
         )
 
         valid_topk_ids = []
-        for ids_cpu in layers_topk_ids_cpu:
-            valid_ids = ids_cpu[
-                :unpadded_input_len, : self.model_config.hf_text_config.num_experts_per_tok
-            ]
+        num_experts_per_tok = self.model_config.hf_text_config.num_experts_per_tok
+        dummy = np.full((unpadded_input_len, num_experts_per_tok), fill_value=-1, dtype=np.int32)
+        for ids_cpu in layers_topk_ids:
+            if ids_cpu is None:
+                valid_ids = dummy
+            else:
+                valid_ids = ids_cpu[:unpadded_input_len, :num_experts_per_tok]
             valid_topk_ids.append(valid_ids)
 
         # Stack to create (num_layers, seq_len, num_experts_per_tok)

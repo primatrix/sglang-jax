@@ -8,7 +8,6 @@ import logging
 import time
 from abc import ABC, abstractmethod
 
-import jax
 import numpy as np
 import pybase64
 
@@ -44,9 +43,9 @@ class RoutedExpertsCapturer(ABC):
             return _RoutedExpertsCapturerNoop()
 
     @abstractmethod
-    def _sync_fwd_experts_buffer_DtoH(
+    def _write_fwd_experts_to_host_buffer(
         self,
-        topk_ids: list[jax.Array | np.ndarray | None],
+        topk_ids: list[np.ndarray | None],
         model_worker_batch: ModelWorkerBatch,
     ):
         raise NotImplementedError
@@ -63,7 +62,7 @@ class RoutedExpertsCapturer(ABC):
 
     @abstractmethod
     def on_forward_end(
-        self, topk_ids: list[jax.Array | np.ndarray | None], model_worker_batch: ModelWorkerBatch
+        self, topk_ids: list[np.ndarray | None], model_worker_batch: ModelWorkerBatch
     ):
         raise NotImplementedError
 
@@ -108,15 +107,14 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         assert hasattr(self, "host_buffer")
         return get_array_size_bytes(self.host_buffer)
 
-    def _sync_fwd_experts_buffer_DtoH(
+    def _write_fwd_experts_to_host_buffer(
         self,
-        topk_ids: list[jax.Array | np.ndarray | None],  # padded topk_ids
+        topk_ids: list[np.ndarray | None],  # already on host
         model_worker_batch: ModelWorkerBatch,
     ):
         unpadded_input_len = model_worker_batch.get_original_input_len()
         valid_out_cache_loc_cpu = model_worker_batch.out_cache_loc[:unpadded_input_len]
-        topk_ids_cpu = jax.device_get(topk_ids)
-        for layer_idx, ids_cpu in enumerate(topk_ids_cpu):
+        for layer_idx, ids_cpu in enumerate(topk_ids):
             if ids_cpu is None:
                 valid_ids = self.dummy_experts_ids[:unpadded_input_len]
             else:
@@ -140,9 +138,9 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
                 time.sleep(0.001)
 
     def on_forward_end(
-        self, topk_ids: list[jax.Array | np.ndarray | None], model_worker_batch: ModelWorkerBatch
+        self, topk_ids: list[np.ndarray | None], model_worker_batch: ModelWorkerBatch
     ):
-        self._sync_fwd_experts_buffer_DtoH(
+        self._write_fwd_experts_to_host_buffer(
             topk_ids=topk_ids,
             model_worker_batch=model_worker_batch,
         )
@@ -152,9 +150,9 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
     def __init__(self):
         pass
 
-    def _sync_fwd_experts_buffer_DtoH(
+    def _write_fwd_experts_to_host_buffer(
         self,
-        topk_ids: list[jax.Array | np.ndarray | None],
+        topk_ids: list[np.ndarray | None],
         model_worker_batch: ModelWorkerBatch,
     ):
         pass
@@ -169,7 +167,7 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
         pass
 
     def on_forward_end(
-        self, topk_ids: list[jax.Array | np.ndarray | None], model_worker_batch: ModelWorkerBatch
+        self, topk_ids: list[np.ndarray | None], model_worker_batch: ModelWorkerBatch
     ):
         pass
 
