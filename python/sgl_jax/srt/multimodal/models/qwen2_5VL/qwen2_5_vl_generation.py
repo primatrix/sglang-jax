@@ -6,8 +6,8 @@ from flax import nnx
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.hf_transformers_utils import get_hf_text_config
-from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.embeddings import ParallelLMHead
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.qwen2 import Qwen2Model
@@ -252,7 +252,10 @@ class Qwen2_5_VL_Generation(nnx.Module):
         logits_metadata: LogitsMetadata,
     ):
         vision_embeds = getattr(forward_batch, "cached_vision_embeds", None)
-        if vision_embeds is not None and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+        if (
+            vision_embeds is not None
+            and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+        ):
             input_embeds = self.get_input_embeddings(forward_batch.input_ids, vision_embeds)
         else:
             input_embeds = None

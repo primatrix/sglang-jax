@@ -1,5 +1,6 @@
 """Registry for mapping model names to model configs."""
 
+import contextlib
 import json
 import logging
 import os
@@ -90,28 +91,23 @@ def _apply_qwen_vl_vision_overrides(
             continue
         value = vision_cfg[src_key]
         if dst_attr in _QWEN_VL_VISION_INT_FIELDS:
-            try:
+            with contextlib.suppress(Exception):
                 value = int(value)
-            except Exception:
-                pass
         elif dst_attr in _QWEN_VL_VISION_FLOAT_FIELDS:
-            try:
+            with contextlib.suppress(Exception):
                 value = float(value)
-            except Exception:
-                pass
-        elif dst_attr in _QWEN_VL_VISION_LIST_FIELDS:
-            if not isinstance(value, list):
-                value = list(value)
+        elif dst_attr in _QWEN_VL_VISION_LIST_FIELDS and not isinstance(value, list):
+            value = list(value)
         setattr(config, dst_attr, value)
         updated_fields.add(dst_attr)
 
-    if "out_hidden_size" not in updated_fields:
-        top_hidden_size = config_dict.get("hidden_size")
-        if top_hidden_size is not None:
-            try:
-                config.out_hidden_size = int(top_hidden_size)
-            except Exception:
-                config.out_hidden_size = top_hidden_size
+    if (
+        "out_hidden_size" not in updated_fields
+        and (top_hidden_size := config_dict.get("hidden_size")) is not None
+    ):
+        with contextlib.suppress(Exception):
+            top_hidden_size = int(top_hidden_size)
+        config.out_hidden_size = top_hidden_size
 
     if updated_fields:
         logger.info("Loaded QwenVL vision config overrides from %s", model_path)
