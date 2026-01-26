@@ -6,11 +6,7 @@ from jax import shard_map
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
-    FusedMoEBlockConfig,
-    fused_ep_moe,
-    fused_ep_moe_from_topk,
-)
+from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_ep_moe
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import (
@@ -81,27 +77,19 @@ class TopK(nnx.Module):
 
     @named_scope
     def __call__(self, router_logits: jax.Array, correction_bias: jax.Array = None):
-        router_logits = router_logits.astype(jnp.float32)
+        from sgl_jax.srt.eplb.topk import compute_topk
 
-        if self.num_expert_group > 0 or self.topk_group > 0:
-            if correction_bias is not None:
-                topk_weights, topk_ids = self._biased_grouped_topk(router_logits, correction_bias)
-            else:
-                topk_weights, topk_ids = self._grouped_topk(router_logits)
-        else:
-            if correction_bias is not None:
-                topk_weights, topk_ids = self._biased_topk(router_logits, correction_bias)
-            else:
-                topk_weights, topk_ids = self._topk(router_logits)
-
-        if self.renormalize:
-            topk_weights = topk_weights / (jnp.sum(topk_weights, axis=-1, keepdims=True))
-            if self.routed_scaling_factor is not None:
-                topk_weights *= self.routed_scaling_factor
-
-        topk_weights = topk_weights.astype(jnp.float32)
-
-        return topk_weights, topk_ids
+        use_grouped = self.num_expert_group > 0 or self.topk_group > 0
+        return compute_topk(
+            router_logits=router_logits,
+            top_k=int(self.topk),
+            correction_bias=correction_bias,
+            use_grouped_topk=use_grouped,
+            num_groups=int(self.num_expert_group) if use_grouped else 1,
+            top_k_groups=int(self.topk_group) if use_grouped else 1,
+            renormalize_topk_logits=bool(self.renormalize),
+            routed_scaling_factor=self.routed_scaling_factor,
+        )
 
     def _topk(self, router_logits):
         return jax.lax.top_k(router_logits, self.topk)
@@ -898,11 +886,18 @@ class FusedEPMoE(nnx.Module):
             # EPLB path always computes top-k in logical-expert space, then maps logical->physical
             # using the current dispatch map. For compatibility with models that enable grouped-topk
             # or router expert-bias, we fall back to plain top-k over all logical experts here.
-            logits = router_logits.astype(jnp.float32)
-            if router_bias is not None:
-                logits = logits + router_bias.astype(jnp.float32)
+            from sgl_jax.srt.eplb.topk import compute_topk
 
-            topk_weights, topk_ids_logical = jax.lax.top_k(logits, self.num_experts_per_tok)
+            topk_weights, topk_ids_logical = compute_topk(
+                router_logits=router_logits,
+                top_k=self.num_experts_per_tok,
+                correction_bias=router_bias,
+                use_grouped_topk=False,
+                num_groups=1,
+                top_k_groups=1,
+                renormalize_topk_logits=self.renormalize_topk_logits,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
             tp_size = int(self.mesh.shape["tensor"])
 
             def _map_logical_to_physical(
@@ -923,19 +918,21 @@ class FusedEPMoE(nnx.Module):
                 out_specs=P(("data", "tensor"), None),
                 check_vma=False,
             )(topk_ids_logical, self.eplb_dispatch_map.value)
-            topk_weights = jax.sharding.reshard(
-                topk_weights, NamedSharding(self.mesh, P(("data", "tensor"), None))
-            )
 
-            output = fused_ep_moe_from_topk(
+            output = fused_ep_moe(
                 mesh=self.mesh,
                 tokens=hidden_states,
                 w1=self.w1.value,
                 w2=self.w2.value,
                 w3=self.w3.value,
-                topk_ids_physical=topk_ids_physical,
-                topk_weights=topk_weights,
+                gating_output=None,
                 bias=None,
+                top_k=self.num_experts_per_tok,
+                topk_ids=topk_ids_physical,
+                topk_weights=topk_weights,
+                use_grouped_topk=False,
+                num_groups=1,
+                top_k_groups=1,
                 act_fn=self.activation,
                 subc_quant_wsz=None,
                 w1_scale=None,
@@ -953,8 +950,8 @@ class FusedEPMoE(nnx.Module):
                 block_config=block_config,
                 dp_axis_name="data",
                 tp_axis_name="tensor",
-                renormalize_topk_logits=self.renormalize_topk_logits,
-                routed_scaling_factor=self.routed_scaling_factor,
+                renormalize_topk_logits=False,
+                routed_scaling_factor=None,
             )
         else:
             output = fused_ep_moe(

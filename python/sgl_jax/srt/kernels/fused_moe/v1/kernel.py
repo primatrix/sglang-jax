@@ -461,11 +461,11 @@ def _fused_ep_moe_kernel(
     b1_hbm,  # None | F32(local_num_experts, 1, intermediate_size)
     b2_hbm,  # None | F32(local_num_experts, 1, hidden_size)
     b3_hbm,  # None | F32(local_num_experts, 1, intermediate_size)
-    gating_hbm,  # (local_num_tokens, padded_num_experts)
+    topk_ids_hbm,  # (local_num_tokens, top_k) int32
+    topk_weights_hbm,  # (local_num_tokens, top_k) float32
     a2a_s_x2_hbm,  # (2, align_to(bt * num_devices, bts), t_packing, hidden_size // t_packing)
     a2a_s_acc_x2_hbm,  # (2, align_to(bt * num_devices, bts), t_packing, hidden_size // t_packing)
     a2a_g_hbm,  # (num_experts, bt, t_packing, hidden_size // t_packing)
-    bias_hbm,  # None | F32(padded_num_experts,)
     w1_shared_hbm,  # None | (hidden_size, se_intermediate_size)
     w3_shared_hbm,  # None | (hidden_size, se_intermediate_size)
     w2_shared_hbm,  # None | (se_intermediate_size, hidden_size)
@@ -485,7 +485,8 @@ def _fused_ep_moe_kernel(
     a2a_g_acc_vmem,  # (1, top_k, acc_bt, t_packing, hidden_size // t_packing)
     top_k_logits_vmem,  # F32(bt, top_k)
     ### Expert weight double buffering:
-    b_gating_x2_vmem,  # (2, bt, padded_num_experts)
+    b_topk_ids_x2_vmem,  # (2, bt, top_k)
+    b_topk_weights_x2_vmem,  # (2, bt, top_k)
     b_output_x2_vmem,  # (2, bt, hidden_size)
     b_w1_x2_vmem,  # <bw_sem_id> (2, t_packing, bd1 // t_packing, bf)
     b_w3_x2_vmem,  # <bw_sem_id> (2, t_packing, bd1 // t_packing, bf)
@@ -499,7 +500,6 @@ def _fused_ep_moe_kernel(
     b_acc_vmem,  # F32(2, align_to(bt * num_devices, bts), 1, bf)
     b_stage_x2_vmem,  # <token_buf_id> (2, bts, t_packing, bd1 // t_packing)
     a2a_s_acc_stage_x3_vmem,  # <acc_buf_id> (3, bts, t_packing, bd2 // t_packing)
-    b_bias_vmem,  # None | F32(padded_num_experts,)
     b_se_tokens_vmem,  # None | (2, 2, bt, t_packing, bd1 // t_packing) [Input Buffer: bt ping-pong x bd1-slice ping-pong]
     b_se_w1_x2_vmem,  # <sew_sem_id> (2, t_packing, bd1 // t_packing, bf)
     b_se_w3_x2_vmem,  # <sew_sem_id> (2, t_packing, bd1 // t_packing, bf)
@@ -620,135 +620,47 @@ def _fused_ep_moe_kernel(
             )
         pltpu.semaphore_wait(barrier_sem, num_devices)
 
-    def start_fetch_b_gating(*, bt_id, priority=0):
+    topk_weights_sem_idx = 10 if w1_shared_hbm is not None else 5
+
+    def start_fetch_b_topk(*, bt_id, priority=0):
         bt_sem_id = bt_id & jnp.int32(1)
-        b_gating_sem = local_sems.at[bt_sem_id, 0]
         bt_start = bt_id * bt
-        local_num_tokens = gating_hbm.shape[0]
-        gating_bits = jnp.dtype(gating_hbm.dtype).itemsize * 8
-        gating_tile0 = math.gcd(256 // gating_bits, local_num_tokens)
         bt_size = bt
-        bt_start = pl.multiple_of(bt_start, gating_tile0)
+
         pltpu.make_async_copy(
-            src_ref=gating_hbm.at[pl.ds(bt_start, bt_size)],
-            dst_ref=b_gating_x2_vmem.at[bt_sem_id, pl.ds(0, bt_size)],
-            sem=b_gating_sem,
+            src_ref=topk_ids_hbm.at[pl.ds(bt_start, bt_size), pl.ds(0, top_k)],
+            dst_ref=b_topk_ids_x2_vmem.at[bt_sem_id, pl.ds(0, bt_size), pl.ds(0, top_k)],
+            sem=local_sems.at[bt_sem_id, 0],
+        ).start(priority=priority)
+        pltpu.make_async_copy(
+            src_ref=topk_weights_hbm.at[pl.ds(bt_start, bt_size), pl.ds(0, top_k)],
+            dst_ref=b_topk_weights_x2_vmem.at[bt_sem_id, pl.ds(0, bt_size), pl.ds(0, top_k)],
+            sem=local_sems.at[bt_sem_id, topk_weights_sem_idx],
         ).start(priority=priority)
 
-    def wait_fetch_b_gating(*, bt_id):
+    def wait_fetch_b_topk(*, bt_id):
         bt_sem_id = bt_id & jnp.int32(1)
-        b_gating_sem = local_sems.at[bt_sem_id, 0]
         pltpu.make_async_copy(
-            src_ref=b_gating_x2_vmem.at[bt_sem_id],
-            dst_ref=b_gating_x2_vmem.at[bt_sem_id],
-            sem=b_gating_sem,
+            src_ref=b_topk_ids_x2_vmem.at[bt_sem_id],
+            dst_ref=b_topk_ids_x2_vmem.at[bt_sem_id],
+            sem=local_sems.at[bt_sem_id, 0],
+        ).wait()
+        pltpu.make_async_copy(
+            src_ref=b_topk_weights_x2_vmem.at[bt_sem_id],
+            dst_ref=b_topk_weights_x2_vmem.at[bt_sem_id],
+            sem=local_sems.at[bt_sem_id, topk_weights_sem_idx],
         ).wait()
 
-    def get_top_k(input_logits, top_k, renormalize_topk_logits, *, out_top_k_logits_vmem):
-        input_logits = input_logits.astype(jnp.float32)
-        num_tokens = input_logits.shape[0]
+    def _compute_expert_sizes(topk_ids: jax.Array) -> jax.Array:
+        sizes = jnp.zeros((1, padded_num_experts), dtype=jnp.int32)
 
-        if b_bias_vmem is not None:
-            # b_bias_vmem (padded_num_experts,)
-            bias_val = b_bias_vmem[...]
-            routing_scores = input_logits + jnp.expand_dims(bias_val[: input_logits.shape[1]], 0)
-        else:
-            routing_scores = input_logits
-
-        if use_grouped_topk:
-            curr_num_experts = input_logits.shape[1]
-            experts_per_group = curr_num_experts // num_groups
-
-            group_scores_list = []
-            for g in range(num_groups):
-                start = g * experts_per_group
-                end = start + experts_per_group
-                group_slice = routing_scores[:, start:end]
-
-                if b_bias_vmem is not None:
-                    # Specific bias logic for grouped topk: sum of top 2
-                    val1 = jnp.max(group_slice, axis=1, keepdims=True)
-                    idx1 = jnp.argmax(group_slice, axis=1, keepdims=True)
-                    iota_slice = jax.lax.broadcasted_iota(jnp.int32, group_slice.shape, 1)
-                    mask1 = iota_slice == idx1
-                    group_slice_masked = jnp.where(mask1, -jnp.float32(jnp.inf), group_slice)
-                    val2 = jnp.max(group_slice_masked, axis=1, keepdims=True)
-                    g_score = val1 + val2
-                else:
-                    g_score = jnp.max(group_slice, axis=1, keepdims=True)
-                group_scores_list.append(g_score)
-
-            group_scores = jnp.concatenate(group_scores_list, axis=1)
-            group_mask_accum = jnp.zeros((num_tokens, num_groups), dtype=jnp.bool_)
-            temp_group_scores = group_scores
-            group_iota = jax.lax.broadcasted_iota(jnp.int32, (num_tokens, num_groups), 1)
-
-            for _ in range(top_k_groups):
-                curr_max_group_idx = jnp.argmax(temp_group_scores, axis=1, keepdims=True)
-                curr_mask = group_iota == curr_max_group_idx
-                group_mask_accum = jnp.logical_or(group_mask_accum, curr_mask)
-                temp_group_scores = jnp.where(curr_mask, -jnp.float32(jnp.inf), temp_group_scores)
-
-            masked_routing_slices = []
-            for g in range(num_groups):
-                g_mask = group_mask_accum[:, g : g + 1]
-                start = g * experts_per_group
-                end = start + experts_per_group
-                inp_slice = routing_scores[:, start:end]
-                masked_slice = jnp.where(g_mask, inp_slice, -jnp.float32(jnp.inf))
-                masked_routing_slices.append(masked_slice)
-            curr_scores = jnp.concatenate(masked_routing_slices, axis=1)
-        else:
-            curr_scores = routing_scores
-
-        padded_k_shape = (curr_scores.shape[0], padded_top_k)
-        top_k_logits_lst = []
-        t2e = jnp.zeros(curr_scores.shape, dtype=jnp.int32)
-        t2e_routing = jnp.zeros(padded_k_shape, dtype=jnp.int32)
-        iota = jax.lax.broadcasted_iota(jnp.int32, curr_scores.shape, 1)
-        padded_k_iota = jax.lax.broadcasted_iota(jnp.int32, padded_k_shape, 1)
-        top_k_logits_sum = jnp.zeros(padded_k_shape, jnp.float32)
-
-        for k_id in range(top_k):
-            # Select expert from current scores (masked/biased)
-            curr_indices = jnp.argmax(curr_scores[:, :num_experts], axis=1, keepdims=True)
-            top_k_indices = jnp.broadcast_to(curr_indices, padded_k_shape)
-
-            selection_mask = iota == broadcast_minor(top_k_indices, curr_scores.shape)
-
-            # Extract value from original input logits
-            val = jnp.sum(
-                jnp.where(selection_mask, input_logits[:, :num_experts], 0.0), axis=1, keepdims=True
-            )
-
-            top_k_logits = jnp.broadcast_to(val, padded_k_shape).astype(input_logits.dtype)
-            top_k_logits_lst.append(top_k_logits)
-
-            if renormalize_topk_logits:
-                top_k_logits_sum += top_k_logits
-
-            t2e_routing = jnp.where(padded_k_iota == k_id, top_k_indices, t2e_routing)
-            mask = selection_mask
-            t2e += mask.astype(jnp.int32)
-            if k_id != top_k - 1:
-                curr_scores = jnp.where(mask, -jnp.float32(jnp.inf), curr_scores)
-
-        if renormalize_topk_logits:
+        def _count_one(t_id, sizes_acc):
             for k_id in range(top_k):
-                top_k_logits_lst[k_id] /= top_k_logits_sum + 1e-6
+                e_id = topk_ids[t_id, k_id].astype(jnp.int32)
+                sizes_acc = sizes_acc.at[0, e_id].add(jnp.int32(1))
+            return sizes_acc
 
-        if routed_scaling_factor is not None:
-            for k_id in range(top_k):
-                top_k_logits_lst[k_id] *= routed_scaling_factor
-
-        for k_id in range(top_k):
-            out_top_k_logits_vmem.at[pl.ds(0, input_logits.shape[0]), pl.ds(k_id, 1)][...] = (
-                top_k_logits_lst[k_id][:, :1].astype(jnp.float32)
-            )
-
-        expert_sizes = jnp.sum(t2e, axis=0, keepdims=True)
-        expert_starts = jnp.zeros_like(expert_sizes)
-        return t2e_routing, expert_sizes, expert_starts
+        return lax.fori_loop(0, bt, _count_one, sizes, unroll=False)
 
     def all_reduce_metadata(*, bt_sem_id, t2e_routing, starts, sizes):
         send_sem = send_x2_sems.at[0]
@@ -960,16 +872,6 @@ def _fused_ep_moe_kernel(
             dst_ref=ref,
             sem=a2a_gather_sem,
         ).wait()
-
-    def start_fetch_and_wait_bias():
-        if bias_hbm is not None:
-            bias_copy = pltpu.make_async_copy(
-                src_ref=bias_hbm,
-                dst_ref=b_bias_vmem,
-                sem=local_sems.at[0, 0],
-            )
-            bias_copy.start()
-            bias_copy.wait()
 
     def start_fetch_bw1(local_e_id, bw1_sem_id, bf_id, bd1_id):
         for p in range(t_packing):
@@ -2013,7 +1915,6 @@ def _fused_ep_moe_kernel(
 
     ### ------- Kernel start ------- ###
     sync_barrier()
-    start_fetch_and_wait_bias()
 
     def broadcast_quant_scale(scale, current_block_size, group_size):
         if group_size is None or group_size <= 0:
@@ -2166,7 +2067,7 @@ def _fused_ep_moe_kernel(
             lax.fori_loop(0, num_bd2, body_w2, None)
 
     if num_bt >= 1:
-        start_fetch_b_gating(bt_id=jnp.int32(0))
+        start_fetch_b_topk(bt_id=jnp.int32(0))
         start_fetch_se_tokens(bt_id=jnp.int32(0))
 
     def run_bt(bt_id, e_sem_id):
@@ -2177,18 +2078,22 @@ def _fused_ep_moe_kernel(
 
         @pl.when(next_bt_id < num_bt)
         def _():
-            start_fetch_b_gating(bt_id=next_bt_id)
+            start_fetch_b_topk(bt_id=next_bt_id)
             start_fetch_se_tokens(next_bt_id)
 
-        wait_fetch_b_gating(bt_id=bt_id)
+        wait_fetch_b_topk(bt_id=bt_id)
 
-        b_gating = b_gating_x2_vmem.at[bt_sem_id][...]
-        t2e_routing, expert_sizes, expert_starts = get_top_k(
-            b_gating,
-            top_k,
-            renormalize_topk_logits,
-            out_top_k_logits_vmem=top_k_logits_vmem,
+        topk_ids_bt = b_topk_ids_x2_vmem.at[bt_sem_id][...]
+        topk_weights_bt = b_topk_weights_x2_vmem.at[bt_sem_id][...]
+        top_k_logits_vmem.at[pl.ds(0, bt), pl.ds(0, top_k)][...] = topk_weights_bt.astype(
+            jnp.float32
         )
+
+        padded_k_shape = (bt, padded_top_k)
+        t2e_routing = jnp.zeros(padded_k_shape, dtype=jnp.int32)
+        t2e_routing = t2e_routing.at[:, :top_k].set(topk_ids_bt.astype(jnp.int32))
+        expert_sizes = _compute_expert_sizes(topk_ids_bt)
+        expert_starts = jnp.zeros_like(expert_sizes)
         all_reduce_metadata(
             bt_sem_id=bt_sem_id,
             t2e_routing=t2e_routing,
@@ -2292,7 +2197,9 @@ def _validate_fused_ep_moe_args(
     w1: jax.Array,
     w2: jax.Array,
     w3: jax.Array,
-    gating_output: jax.Array,
+    gating_output: jax.Array | None,
+    topk_ids: jax.Array | None,
+    topk_weights: jax.Array | None,
     top_k: int,
     use_grouped_topk: bool,
     num_groups: int,
@@ -2337,8 +2244,18 @@ def _validate_fused_ep_moe_args(
             f"Expected {w3.shape=} to be {(num_experts, hidden_size, intermediate_size)}."
         )
 
-    if gating_output.shape != (num_tokens, num_experts):
-        raise ValueError(f"Expected {gating_output.shape=} to be {(num_tokens, num_experts)}.")
+    if (gating_output is None) == (topk_ids is None or topk_weights is None):
+        raise ValueError("Provide exactly one of (gating_output) or (topk_ids, topk_weights).")
+
+    if gating_output is not None:
+        if gating_output.shape != (num_tokens, num_experts):
+            raise ValueError(f"Expected {gating_output.shape=} to be {(num_tokens, num_experts)}.")
+    else:
+        assert topk_ids is not None and topk_weights is not None
+        if topk_ids.shape != (num_tokens, top_k):
+            raise ValueError(f"Expected {topk_ids.shape=} to be {(num_tokens, top_k)}.")
+        if topk_weights.shape != (num_tokens, top_k):
+            raise ValueError(f"Expected {topk_weights.shape=} to be {(num_tokens, top_k)}.")
 
     validate_fused_moe_block_config(
         num_tokens=num_tokens,
@@ -2352,17 +2269,11 @@ def _validate_fused_ep_moe_args(
         block_config=block_config,
     )
 
-    # Mosaic DMA tiling constraint for `start_fetch_b_gating`: the slice shape along the
-    # token dimension must be aligned to the underlying HBM tiling of router logits.
-    local_num_tokens = num_tokens // ep_size
-    gating_bits = jnp.dtype(gating_output.dtype).itemsize * 8
-    router_tile0 = math.gcd(256 // gating_bits, local_num_tokens)
-    if block_config.bt % router_tile0 != 0:
-        raise ValueError(
-            "Unsupported block_config.bt for router_logits tiling: "
-            f"bt={block_config.bt} must be divisible by router_tile0={router_tile0} "
-            f"(router_logits dtype={jnp.dtype(gating_output.dtype).name}, local_num_tokens={local_num_tokens})."
-        )
+    if topk_ids is not None:
+        if topk_ids.dtype != jnp.int32:
+            raise ValueError(f"Expected topk_ids dtype int32, got {topk_ids.dtype}.")
+        if topk_weights.dtype != jnp.float32:
+            raise ValueError(f"Expected topk_weights dtype float32, got {topk_weights.dtype}.")
 
     # Note: block_config.bt is the outer expert-side token tile (routing/comm + output tiling);
     # block_config.bts is the inner token staging tile used inside expert_ffn.
@@ -2532,9 +2443,11 @@ def fused_ep_moe(
     w1: jax.Array,  # (num_experts, hidden_size, intermediate_size)
     w2: jax.Array,  # (num_experts, intermediate_size, hidden_size)
     w3: jax.Array,  # (num_experts, hidden_size, intermediate_size)
-    gating_output: jax.Array,  # (num_tokens, num_experts)
+    gating_output: jax.Array | None,  # (num_tokens, num_experts)
     top_k: int,
     *,
+    topk_ids: jax.Array | None = None,  # (num_tokens, top_k) int32
+    topk_weights: jax.Array | None = None,  # (num_tokens, top_k) float32
     use_grouped_topk: bool = False,
     num_groups: int = 1,
     top_k_groups: int = 1,
@@ -2596,6 +2509,8 @@ def fused_ep_moe(
         w2=w2,
         w3=w3,
         gating_output=gating_output,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
         top_k=top_k,
         use_grouped_topk=use_grouped_topk,
         num_groups=num_groups,
@@ -2631,7 +2546,6 @@ def fused_ep_moe(
     padded_num_experts = align_to(num_experts, 128)
     padded_top_k = align_to(top_k, 128)
     t_dtype = tokens.dtype
-    gating_dtype = gating_output.dtype
     t_packing = get_dtype_packing(t_dtype)
     hidden_per_pack = hidden_size // t_packing
     # With run_bt tiling in the pallas kernel, a2a scratch only needs to cover one bt tile.
@@ -2664,19 +2578,26 @@ def fused_ep_moe(
     if w3_shared_scale is not None and w3_shared_scale.dtype != jnp.float32:
         w3_shared_scale = w3_shared_scale.astype(jnp.float32)
 
-    # Prepare inputs for the kernel.
-    if padded_num_experts != gating_output.shape[-1]:
-        gating_output = jnp.pad(
-            gating_output,
-            ((0, 0), (0, padded_num_experts - gating_output.shape[-1])),
-            constant_values=-jnp.inf,
-        )
+    if topk_ids is not None or topk_weights is not None:
+        if topk_ids is None or topk_weights is None:
+            raise ValueError("topk_ids and topk_weights must be provided together.")
+        topk_ids = topk_ids.astype(jnp.int32)
+        topk_weights = topk_weights.astype(jnp.float32)
+    else:
+        if gating_output is None:
+            raise ValueError("Either gating_output or (topk_ids, topk_weights) must be provided.")
+        from sgl_jax.srt.eplb.topk import compute_topk
 
-    if bias is not None:
-        if bias.dtype != jnp.float32:
-            bias = bias.astype(jnp.float32)
-        if padded_num_experts != bias.shape[0]:
-            bias = jnp.pad(bias, (0, padded_num_experts - bias.shape[0]), constant_values=0.0)
+        topk_weights, topk_ids = compute_topk(
+            router_logits=gating_output,
+            top_k=top_k,
+            correction_bias=bias,
+            use_grouped_topk=use_grouped_topk,
+            num_groups=num_groups,
+            top_k_groups=top_k_groups,
+            renormalize_topk_logits=renormalize_topk_logits,
+            routed_scaling_factor=routed_scaling_factor,
+        )
 
     tokens = tokens.reshape(-1, t_packing, hidden_size // t_packing)
 
@@ -2733,7 +2654,8 @@ def fused_ep_moe(
         ),  # a2a_g_acc_vmem
         pltpu.VMEM((bt, top_k), jnp.float32),  # top_k_logits_vmem
         # Expert compute scratch.
-        pltpu.VMEM((2, bt, padded_num_experts), gating_dtype),  # b_gating_x2_vmem
+        pltpu.VMEM((2, bt, top_k), jnp.int32),  # b_topk_ids_x2_vmem
+        pltpu.VMEM((2, bt, top_k), jnp.float32),  # b_topk_weights_x2_vmem
         pltpu.VMEM((2, bt, hidden_size), t_dtype),  # b_output_x2_vmem
         pltpu.VMEM((2, t_packing, bd1_per_pack, block_config.bf), w1.dtype),  # b_w1_x2_vmem
         pltpu.VMEM((2, t_packing, bd1_per_pack, block_config.bf), w3.dtype),  # b_w3_x2_vmem
@@ -2750,7 +2672,6 @@ def fused_ep_moe(
             (3, block_config.bts, t_packing, bd2_per_pack),
             t_dtype,
         ),  # a2a_s_acc_stage_x3_vmem
-        (None if bias is None else pltpu.VMEM((padded_num_experts,), jnp.float32)),  # b_bias_vmem
         (
             None if w1_shared is None else pltpu.VMEM((2, 2, bt, t_packing, bd1_per_pack), t_dtype)
         ),  # b_se_tokens_vmem
@@ -2820,7 +2741,7 @@ def fused_ep_moe(
         # Semaphores.
         pltpu.SemaphoreType.DMA((2,)),  # token_stage_x2_sems
         pltpu.SemaphoreType.DMA((3,)),  # acc_stage_x3_sems
-        pltpu.SemaphoreType.DMA((2, 10 if w1_shared is not None else 5)),  # local_sems
+        pltpu.SemaphoreType.DMA((2, 11 if w1_shared is not None else 6)),  # local_sems
         pltpu.SemaphoreType.DMA((2,)),  # send_x2_sems
         pltpu.SemaphoreType.DMA((2,)),  # recv_x2_sems
         pltpu.SemaphoreType.DMA,  # a2a_gather_sem
@@ -2867,11 +2788,11 @@ def fused_ep_moe(
                     None if b1 is None else hbm_block_spec,  # b1_hbm
                     None if b2 is None else hbm_block_spec,  # b2_hbm
                     None if b3 is None else hbm_block_spec,  # b3_hbm
-                    hbm_block_spec,  # gating_output_hbm
+                    hbm_block_spec,  # topk_ids_hbm
+                    hbm_block_spec,  # topk_weights_hbm
                     hbm_block_spec,  # a2a_s_x2_hbm
                     hbm_block_spec,  # a2a_s_acc_x2_hbm
                     hbm_block_spec,  # a2a_g_hbm
-                    None if bias is None else hbm_block_spec,  # bias_hbm
                     None if w1_shared is None else hbm_block_spec,  # w1_shared_hbm
                     None if w3_shared is None else hbm_block_spec,  # w3_shared_hbm
                     None if w2_shared is None else hbm_block_spec,  # w2_shared_hbm
@@ -2952,11 +2873,13 @@ def fused_ep_moe(
             ),  # b3_hbm
             P(
                 (dp_axis_name, tp_axis_name),
-            ),  # gating_output_hbm
+            ),  # topk_ids_hbm
+            P(
+                (dp_axis_name, tp_axis_name),
+            ),  # topk_weights_hbm
             P(),  # a2a_s_x2_hbm
             P(),  # a2a_s_acc_x2_hbm
             P(),  # a2a_g_hbm
-            None if bias is None else P(),
             None if w1_shared is None else P(),  # w1_shared
             None if w3_shared is None else P(),  # w3_shared
             None if w2_shared is None else P(),  # w2_shared
@@ -2978,11 +2901,11 @@ def fused_ep_moe(
         b1,
         b2,
         b3,
-        gating_output,
+        topk_ids,
+        topk_weights,
         a2a_s_x2_hbm_scratch,
         a2a_s_acc_x2_hbm_scratch,
         a2a_g_hbm_scratch,
-        bias,
         w1_shared=None,
         w3_shared=None,
         w2_shared=None,
@@ -3013,13 +2936,13 @@ def fused_ep_moe(
             (None if b1 is None else pltpu.with_memory_space_constraint(b1, pltpu.HBM)),  # b1_hbm
             (None if b2 is None else pltpu.with_memory_space_constraint(b2, pltpu.HBM)),  # b2_hbm
             (None if b3 is None else pltpu.with_memory_space_constraint(b3, pltpu.HBM)),  # b3_hbm
-            pltpu.with_memory_space_constraint(gating_output, pltpu.HBM),  # gating_output_hbm
+            pltpu.with_memory_space_constraint(topk_ids, pltpu.HBM),  # topk_ids_hbm
+            pltpu.with_memory_space_constraint(topk_weights, pltpu.HBM),  # topk_weights_hbm
             pltpu.with_memory_space_constraint(a2a_s_x2_hbm_scratch, pltpu.HBM),  # a2a_s_x2_hbm
             pltpu.with_memory_space_constraint(
                 a2a_s_acc_x2_hbm_scratch, pltpu.HBM
             ),  # a2a_s_acc_x2_hbm
             pltpu.with_memory_space_constraint(a2a_g_hbm_scratch, pltpu.HBM),  # a2a_g_hbm
-            (None if bias is None else pltpu.with_memory_space_constraint(bias, pltpu.HBM)),
             (
                 None
                 if w1_shared is None
@@ -3072,123 +2995,15 @@ def fused_ep_moe(
         b1,
         b2,
         b3,
-        gating_output,
+        topk_ids,
+        topk_weights,
         a2a_s_x2_hbm_scratch,
         a2a_s_acc_x2_hbm_scratch,
         a2a_g_hbm_scratch,
-        bias,
         w1_shared,
         w3_shared,
         w2_shared,
         w1_shared_scale,
         w3_shared_scale,
         w2_shared_scale,
-    )
-
-
-def fused_ep_moe_from_topk(
-    mesh: jax.sharding.Mesh,
-    tokens: jax.Array,  # (num_tokens, hidden_size)
-    w1: jax.Array,  # (num_experts, hidden_size, intermediate_size)
-    w2: jax.Array,  # (num_experts, intermediate_size, hidden_size)
-    w3: jax.Array,  # (num_experts, hidden_size, intermediate_size)
-    topk_ids_physical: jax.Array,  # (num_tokens, top_k)
-    topk_weights: jax.Array,  # (num_tokens, top_k)
-    *,
-    bias: jax.Array | None = None,
-    act_fn: str = "silu",
-    subc_quant_wsz: int | None = None,
-    w1_scale: jax.Array | None = None,
-    w2_scale: jax.Array | None = None,
-    w3_scale: jax.Array | None = None,
-    w1_shared: jax.Array | None = None,
-    w2_shared: jax.Array | None = None,
-    w3_shared: jax.Array | None = None,
-    w1_shared_scale: jax.Array | None = None,
-    w2_shared_scale: jax.Array | None = None,
-    w3_shared_scale: jax.Array | None = None,
-    b1: jax.Array | None = None,
-    b2: jax.Array | None = None,
-    b3: jax.Array | None = None,
-    block_config: FusedMoEBlockConfig | None = None,
-    dp_axis_name: str = "data",
-    tp_axis_name: str = "tensor",
-    renormalize_topk_logits: bool = False,
-    routed_scaling_factor: float | None = None,
-) -> jax.Array:
-    """Compatibility entrypoint: run fused MoE from precomputed physical top-k.
-
-    This is a temporary bridge implementation that materializes a dense gating matrix and
-    calls `fused_ep_moe`. It is correct but not intended for production scale because it
-    allocates `(num_tokens, num_experts)` gating HBM.
-    """
-    if tokens.ndim != 2:
-        raise ValueError(f"Expected {tokens.ndim=} to be 2 for tokens (num_tokens, hidden).")
-    if topk_ids_physical.ndim != 2 or topk_weights.ndim != 2:
-        raise ValueError("Expected topk_ids_physical and topk_weights to be 2D.")
-    if topk_ids_physical.shape != topk_weights.shape:
-        raise ValueError(f"Expected {topk_ids_physical.shape=} to match {topk_weights.shape=}.")
-
-    top_k = int(topk_ids_physical.shape[1])
-    num_experts = int(w1.shape[0])
-
-    # Materialize dense gating with explicit mesh sharding so scatter works under SPMD.
-    # This is a correctness-first bridge (allocates (num_tokens, num_experts)).
-    from jax.sharding import NamedSharding
-    from jax.sharding import PartitionSpec as P
-
-    num_tokens = int(tokens.shape[0])
-    gating_output = jnp.full(
-        (num_tokens, num_experts),
-        jnp.float32(float("-inf")),
-        dtype=jnp.float32,
-    )
-    gating_output = jax.sharding.reshard(
-        gating_output,
-        NamedSharding(mesh, P((dp_axis_name, tp_axis_name), None)),
-    )
-    rows = jnp.arange(num_tokens, dtype=jnp.int32)[:, None]
-    out_sharding = NamedSharding(mesh, P((dp_axis_name, tp_axis_name), None))
-    try:
-        gating_output = gating_output.at[rows, topk_ids_physical.astype(jnp.int32)].set(
-            topk_weights.astype(jnp.float32),
-            out_sharding=out_sharding,
-        )
-    except TypeError:
-        gating_output = gating_output.at[rows, topk_ids_physical.astype(jnp.int32)].set(
-            topk_weights.astype(jnp.float32)
-        )
-    gating_output = gating_output.astype(tokens.dtype)
-
-    return fused_ep_moe(
-        mesh=mesh,
-        tokens=tokens,
-        w1=w1,
-        w2=w2,
-        w3=w3,
-        gating_output=gating_output,
-        top_k=top_k,
-        use_grouped_topk=False,
-        num_groups=1,
-        top_k_groups=1,
-        bias=bias,
-        renormalize_topk_logits=renormalize_topk_logits,
-        routed_scaling_factor=routed_scaling_factor,
-        act_fn=act_fn,
-        subc_quant_wsz=subc_quant_wsz,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        w3_scale=w3_scale,
-        w1_shared=w1_shared,
-        w2_shared=w2_shared,
-        w3_shared=w3_shared,
-        w1_shared_scale=w1_shared_scale,
-        w2_shared_scale=w2_shared_scale,
-        w3_shared_scale=w3_shared_scale,
-        b1=b1,
-        b2=b2,
-        b3=b3,
-        block_config=block_config,
-        dp_axis_name=dp_axis_name,
-        tp_axis_name=tp_axis_name,
     )
