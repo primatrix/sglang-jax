@@ -1,21 +1,22 @@
 import logging
 import math
 from collections.abc import Callable
-
-import jax
-from jax.sharding import Mesh
-import jax.numpy as jnp
-import numpy as np
-from flax import nnx
 from functools import partial
 from typing import Literal, TypedDict
 
+import jax
+import jax.numpy as jnp
+import numpy as np
+from flax import nnx
+from jax.sharding import Mesh
 from transformers import modeling_flax_utils
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import QwenVLModelVitConfig
+from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
+    QwenVLModelVitConfig,
+)
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
-from sgl_jax.srt.utils.weight_utils import WeightMapping, WeightLoader
+from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 if not is_tpu_runtime():
     from flash_attn_jax import flash_mha
@@ -60,11 +61,11 @@ def apply_rotary_pos_emb_vision(x: jax.Array, rotary_pos_emb: jax.Array) -> jax.
 
 
 def vision_attention(
-        q: jax.Array,
-        k: jax.Array,
-        v: jax.Array,
-        scale: float,
-        window_size: int = -1,
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    scale: float,
+    window_size: int = -1,
 ) -> jax.Array:
     """
     Compute vision attention using flash attention on GPU or native attention on TPU.
@@ -128,13 +129,13 @@ def vision_attention(
 
 class Qwen2_5_VisionPatchEmbed(nnx.Module):
     def __init__(
-            self,
-            rngs: nnx.Rngs = None,
-            patch_size: int = 14,
-            temporal_patch_size: int = 2,
-            in_channels: int = 3,
-            hidden_size: int = 1152,
-            dtype: jnp.dtype = jnp.bfloat16,
+        self,
+        rngs: nnx.Rngs = None,
+        patch_size: int = 14,
+        temporal_patch_size: int = 2,
+        in_channels: int = 3,
+        hidden_size: int = 1152,
+        dtype: jnp.dtype = jnp.bfloat16,
     ) -> None:
         self.patch_size = patch_size
         self.temporal_patch_size = temporal_patch_size
@@ -220,7 +221,11 @@ class Qwen2_5_VisionMLP(nnx.Module):
 
 class Qwen2_5_VisionAttention(nnx.Module):
     def __init__(
-            self, config: QwenVLModelVitConfig, dtype: jnp.dtype, rngs: nnx.Rngs = None, mesh: Mesh = None
+        self,
+        config: QwenVLModelVitConfig,
+        dtype: jnp.dtype,
+        rngs: nnx.Rngs = None,
+        mesh: Mesh = None,
     ):
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_heads
@@ -247,11 +252,11 @@ class Qwen2_5_VisionAttention(nnx.Module):
         )
 
     def __call__(
-            self,
-            x: jax.Array,
-            rotary_pos_emb: jax.Array,
-            cu_window_seqlens: jax.Array | None = None,
-            use_fullattn: bool = True,
+        self,
+        x: jax.Array,
+        rotary_pos_emb: jax.Array,
+        cu_window_seqlens: jax.Array | None = None,
+        use_fullattn: bool = True,
     ) -> jax.Array:
         T, B, D = x.shape
         assert B == 1, "Vision attention currently only supports batch size 1"
@@ -286,7 +291,11 @@ class Qwen2_5_VisionAttention(nnx.Module):
 
 class Qwen2_5_VisionBlock(nnx.Module):
     def __init__(
-            self, config: QwenVLModelVitConfig, dtype: jnp.dtype, rngs: nnx.Rngs = None, mesh: Mesh = None
+        self,
+        config: QwenVLModelVitConfig,
+        dtype: jnp.dtype,
+        rngs: nnx.Rngs = None,
+        mesh: Mesh = None,
     ):
         dim = config.hidden_size
         norm_layer = partial(
@@ -304,11 +313,11 @@ class Qwen2_5_VisionBlock(nnx.Module):
         self.mlp = Qwen2_5_VisionMLP(config=config, dtype=dtype, rngs=rngs)
 
     def __call__(
-            self,
-            x: jax.Array,
-            rotary_pos_emb: jax.Array,
-            cu_window_seqlens: jax.Array | None = None,
-            use_fullattn: bool = True,
+        self,
+        x: jax.Array,
+        rotary_pos_emb: jax.Array,
+        cu_window_seqlens: jax.Array | None = None,
+        use_fullattn: bool = True,
     ) -> jax.Array:
         x = x + self.attn(self.norm1(x), rotary_pos_emb, cu_window_seqlens, use_fullattn)
         x = x + self.mlp(self.norm2(x))
@@ -317,15 +326,15 @@ class Qwen2_5_VisionBlock(nnx.Module):
 
 class Qwen2_5_VisionPatchMerger(nnx.Module):
     def __init__(
-            self,
-            d_model: int,
-            context_dim: int,
-            norm_layer: Callable,
-            spatial_merge_size: int,
-            dtype: jnp.dtype,
-            rngs: nnx.Rngs = None,
+        self,
+        d_model: int,
+        context_dim: int,
+        norm_layer: Callable,
+        spatial_merge_size: int,
+        dtype: jnp.dtype,
+        rngs: nnx.Rngs = None,
     ):
-        self.hidden_size = context_dim * (spatial_merge_size ** 2)
+        self.hidden_size = context_dim * (spatial_merge_size**2)
 
         # Use dummy rngs if None (for eval_shape)
         _rngs = rngs or nnx.Rngs(0)
@@ -361,12 +370,12 @@ class Qwen2_5_VisionPatchMerger(nnx.Module):
 class Qwen2_5_VL_VisionTransformer(nnx.Module):
 
     def __init__(
-            self,
-            config: QwenVLModelVitConfig,
-            dtype: jnp.dtype,
-            rngs: nnx.Rngs = None,
-            mesh: Mesh = None,
-            norm_eps: float = 1e-6,
+        self,
+        config: QwenVLModelVitConfig,
+        dtype: jnp.dtype,
+        rngs: nnx.Rngs = None,
+        mesh: Mesh = None,
+        norm_eps: float = 1e-6,
     ):
         self.config = config
         self.dtype = dtype
@@ -408,7 +417,7 @@ class Qwen2_5_VL_VisionTransformer(nnx.Module):
         self.patch_size = config.patch_size
         self.spatial_merge_size = config.spatial_merge_size
         self.fullatt_block_indexes = config.fullatt_block_indexes
-        self.spatial_merge_unit = self.spatial_merge_size ** 2
+        self.spatial_merge_unit = self.spatial_merge_size**2
 
     def rotary_pos_emb_thw(self, t, h, w):
         hpos_ids, wpos_ids = jnp.indices((h, w))
@@ -537,12 +546,12 @@ class Qwen2_5_VL_VisionTransformer(nnx.Module):
         return window_index, rotary_pos_emb, cu_seqlens, cu_window_seqlens
 
     def compute_hidden_states(
-            self,
-            x: jax.Array,
-            window_index: jax.Array,
-            rotary_pos_emb: jax.Array,
-            cu_seqlens: jax.Array,
-            cu_window_seqlens: jax.Array,
+        self,
+        x: jax.Array,
+        window_index: jax.Array,
+        rotary_pos_emb: jax.Array,
+        cu_seqlens: jax.Array,
+        cu_window_seqlens: jax.Array,
     ) -> jax.Array:
         hidden_states = self.patch_embed(x)
 
@@ -604,15 +613,15 @@ class Qwen2_5_VL_VisionTransformer(nnx.Module):
 
 class Qwen2_5_VL_VisionModel(nnx.Module):
     """Placeholder model class for the ViT stage.
-      - Call encode_vision() to get vision embeddings
+    - Call encode_vision() to get vision embeddings
     """
 
     def __init__(
-            self,
-            config: QwenVLModelVitConfig,
-            dtype: jnp.dtype = jnp.bfloat16,
-            rngs: nnx.Rngs = None,
-            mesh: Mesh = None,
+        self,
+        config: QwenVLModelVitConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        rngs: nnx.Rngs = None,
+        mesh: Mesh = None,
     ) -> None:
         self.config = config
         self.dtype = dtype
@@ -659,7 +668,7 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
                     "visual.patch_embed.proj.weight": WeightMapping(
                         target_path="visual.patch_embed.proj.kernel",
                         sharding=(None, None, None, None, None),
-                        transpose_axes=(2, 3, 4, 1, 0)
+                        transpose_axes=(2, 3, 4, 1, 0),
                         # transpose=(2, 3, 4, 1, 0),  # Permute axes for Conv3D
                     ),
                     # Merger layers
@@ -790,7 +799,7 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
         raise ValueError(f"Incorrect type of {name}. " f"Got type: {type(mm_input)}")
 
     def _parse_and_validate_image_input(
-            self, image_grid_thw: tuple[tuple[int, int, int], ...], **kwargs: object
+        self, image_grid_thw: tuple[tuple[int, int, int], ...], **kwargs: object
     ) -> Qwen2_5_VLImageInputs | None:
         pixel_values = kwargs.pop("pixel_values", None)
         image_embeds = kwargs.pop("image_embeds", None)
@@ -807,14 +816,14 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
         return None
 
     def _parse_and_validate_multimodal_inputs(
-            self, image_grid_thw: tuple[tuple[int, int, int], ...], **kwargs: object
+        self, image_grid_thw: tuple[tuple[int, int, int], ...], **kwargs: object
     ) -> dict:
         mm_input_by_modality = {}
 
         for input_key in kwargs:
             if (
-                    input_key in ("pixel_values", "image_embeds")
-                    and "image" not in mm_input_by_modality
+                input_key in ("pixel_values", "image_embeds")
+                and "image" not in mm_input_by_modality
             ):
                 mm_input_by_modality["image"] = self._parse_and_validate_image_input(
                     image_grid_thw, **kwargs
@@ -855,7 +864,7 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
         return tuple(jnp.split(image_embeds, split_indices))
 
     def get_multimodal_embeddings(
-            self, image_grid_thw: tuple[tuple[int, int, int], ...], **kwargs: object
+        self, image_grid_thw: tuple[tuple[int, int, int], ...], **kwargs: object
     ) -> list[jax.Array]:
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(image_grid_thw, **kwargs)
         if not mm_input_by_modality:
@@ -871,11 +880,11 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
 
         return list(multimodal_embeddings)
 
-    def encode_vision(
-            self,
-            pixel_values: jax.Array,
-            image_grid_thw: tuple[tuple[int, int, int], ...] = None,
-            video_grid_thw: tuple[tuple[int, int, int], ...] = None,
+    def __call__(
+        self,
+        pixel_values: jax.Array,
+        image_grid_thw: tuple[tuple[int, int, int], ...] = None,
+        video_grid_thw: tuple[tuple[int, int, int], ...] = None,
     ) -> jax.Array:
         """
         Encode vision inputs (images and/or videos) to embeddings.

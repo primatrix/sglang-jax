@@ -6,25 +6,23 @@ from flax import nnx
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_loader.loader import get_model_loader
-from sgl_jax.srt.multimodal.configs.config_registry import get_qwen_vl_config
-
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
+from sgl_jax.srt.multimodal.configs.config_registry import get_qwen_vl_config
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
+
 
 class VitModelRunner(BaseModelRunner):
     """Runner shell for ViT stage execution."""
 
     def __init__(
-            self,
-            server_args: MultimodalServerArgs = None,
-            mesh: jax.sharding.Mesh = None,
-            model_class=None
+        self,
+        server_args: MultimodalServerArgs = None,
+        mesh: jax.sharding.Mesh = None,
+        model_class=None,
     ):
         self.mesh = mesh
         self.model_loader = get_model_loader(
-            load_config=LoadConfig(
-                model_class=model_class
-            ),
+            load_config=LoadConfig(model_class=model_class),
             mesh=self.mesh,
         )
         self.model_class = model_class
@@ -52,19 +50,34 @@ class VitModelRunner(BaseModelRunner):
             static_argnames=["model_state_def"],
         )
         def encode_vision(
-                model_def,
-                model_state_def,
-                model_state_leaves,
-                x,
+            model_def,
+            model_state_def,
+            model_state_leaves,
+            pixel_values,
+            image_grid_thw,
+            video_grid_thw,
         ):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
-            return model.encode_vision(x)
+            return model(pixel_values, image_grid_thw, video_grid_thw)
 
-        def encode_vision_wrapper(x: jax.Array):
-            return encode_vision(model_def, model_state_def, model_state_leaves, x)
+        def encode_vision_wrapper(pixel_values: jax.Array, image_grid_thw, video_grid_thw):
+            return encode_vision(
+                model_def,
+                model_state_def,
+                model_state_leaves,
+                pixel_values,
+                image_grid_thw,
+                video_grid_thw,
+            )
 
         self.jitted_encode_vision = encode_vision_wrapper
 
     def forward(self, batch: Req, mesh: jax.sharding.Mesh):
+        batch.input_embeds = self.jitted_encode_vision(
+            pixel_values=batch.pixel_values,
+            image_grid_thw=batch.image_grid_thw,
+            video_grid_thw=batch.video_grid_thw,
+        )
+        print(f"VitModelRunner forward input_embeds shape: {batch.input_embeds.shape}")
         return batch
