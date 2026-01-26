@@ -297,18 +297,31 @@ class ModelWorker:
     def _sync_experts_ids_d2h(self):
         while True:
             layers_topk_ids, model_worker_batch = self.sync_queue.get()
-            get_global_experts_capturer().on_forward_end(layers_topk_ids, model_worker_batch)
-            self._maybe_record_eplb(layers_topk_ids, model_worker_batch)
+            controller = self._eplb_controller
+            if controller is None:
+                get_global_experts_capturer().on_forward_end(layers_topk_ids, model_worker_batch)
+                continue
+
+            # When EPLB is enabled, we need a host copy anyway; reuse it for routed-experts capture to
+            # avoid a second D2H transfer when both features are enabled.
+            layers_topk_ids_cpu = jax.device_get(layers_topk_ids)
+            get_global_experts_capturer().on_forward_end(layers_topk_ids_cpu, model_worker_batch)
+            self._maybe_record_eplb(layers_topk_ids_cpu, model_worker_batch)
 
     def _maybe_record_eplb(
-        self, layers_topk_ids: list[jax.Array | None], model_worker_batch: ModelWorkerBatch
+        self,
+        layers_topk_ids: list[jax.Array | np.ndarray | None],
+        model_worker_batch: ModelWorkerBatch,
     ):
         controller = self._eplb_controller
         if controller is None:
             return
 
         unpadded_input_len = model_worker_batch.get_original_input_len()
-        topk_ids_cpu = jax.device_get(layers_topk_ids)
+        if any(isinstance(x, jax.Array) for x in layers_topk_ids if x is not None):
+            topk_ids_cpu = jax.device_get(layers_topk_ids)
+        else:
+            topk_ids_cpu = layers_topk_ids
 
         topk_ids_by_layer = []
         top_k = controller.recorder.num_experts_per_tok

@@ -46,7 +46,7 @@ class RoutedExpertsCapturer(ABC):
     @abstractmethod
     def _sync_fwd_experts_buffer_DtoH(
         self,
-        topk_ids: list[jax.Array],
+        topk_ids: list[jax.Array | np.ndarray | None],
         model_worker_batch: ModelWorkerBatch,
     ):
         raise NotImplementedError
@@ -62,7 +62,9 @@ class RoutedExpertsCapturer(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def on_forward_end(self, topk_ids: list[jax.Array], model_worker_batch: ModelWorkerBatch):
+    def on_forward_end(
+        self, topk_ids: list[jax.Array | np.ndarray | None], model_worker_batch: ModelWorkerBatch
+    ):
         raise NotImplementedError
 
 
@@ -108,7 +110,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
 
     def _sync_fwd_experts_buffer_DtoH(
         self,
-        topk_ids: list[jax.Array],  # padded topk_ids
+        topk_ids: list[jax.Array | np.ndarray | None],  # padded topk_ids
         model_worker_batch: ModelWorkerBatch,
     ):
         unpadded_input_len = model_worker_batch.get_original_input_len()
@@ -137,7 +139,9 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             else:
                 time.sleep(0.001)
 
-    def on_forward_end(self, topk_ids: list[jax.Array], model_worker_batch: ModelWorkerBatch):
+    def on_forward_end(
+        self, topk_ids: list[jax.Array | np.ndarray | None], model_worker_batch: ModelWorkerBatch
+    ):
         self._sync_fwd_experts_buffer_DtoH(
             topk_ids=topk_ids,
             model_worker_batch=model_worker_batch,
@@ -150,7 +154,7 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
 
     def _sync_fwd_experts_buffer_DtoH(
         self,
-        topk_ids: list[jax.Array],
+        topk_ids: list[jax.Array | np.ndarray | None],
         model_worker_batch: ModelWorkerBatch,
     ):
         pass
@@ -164,7 +168,9 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
     ):
         pass
 
-    def on_forward_end(self, topk_ids: list[jax.Array], model_worker_batch: ModelWorkerBatch):
+    def on_forward_end(
+        self, topk_ids: list[jax.Array | np.ndarray | None], model_worker_batch: ModelWorkerBatch
+    ):
         pass
 
 
