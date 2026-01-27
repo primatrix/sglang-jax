@@ -101,16 +101,10 @@ class VitModelRunner(BaseModelRunner):
         self.jitted_encode_vision = encode_vision_wrapper
 
     def forward(self, batch: Req, mesh: jax.sharding.Mesh):
-        batch.multimodal_embeddings = self.jitted_encode_vision(
+        vision_embeds = self.jitted_encode_vision(
             pixel_values=batch.pixel_values,
             image_grid_thw=batch.image_grid_thw,
             video_grid_thw=batch.video_grid_thw,
         )
-        # Cache for downstream LLM stage (auto_regressive) to avoid re-encoding.
-        batch.cached_vision_embeds = batch.multimodal_embeddings
-        if hasattr(batch, "vlm_inputs") and isinstance(batch.vlm_inputs, dict):
-            batch.vlm_inputs["cached_vision_embeds"] = batch.multimodal_embeddings
-        print(
-            f"VitModelRunner forward multimodal_embeddings shape: {batch.multimodal_embeddings.shape}"
-        )
+        batch.vlm_inputs.multimodal_embeddings = vision_embeds
         return batch

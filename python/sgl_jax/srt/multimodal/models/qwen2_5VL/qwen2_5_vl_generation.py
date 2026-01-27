@@ -251,12 +251,12 @@ class Qwen2_5_VL_Generation(nnx.Module):
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        vision_embeds = getattr(forward_batch, "cached_vision_embeds", None)
+        multimodal_embedding = getattr(forward_batch, "multimodal_embedding", None)
         if (
-            vision_embeds is not None
+            multimodal_embedding is not None
             and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         ):
-            input_embeds = self.get_input_embeddings(forward_batch.input_ids, vision_embeds)
+            input_embeds = self.get_input_embeddings(forward_batch.input_ids, multimodal_embedding)
         else:
             input_embeds = None
         hidden_states, layers_kv_fused, layers_callback_flag = self.model(
