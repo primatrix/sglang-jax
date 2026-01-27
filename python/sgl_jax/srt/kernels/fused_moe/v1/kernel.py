@@ -140,18 +140,6 @@ def get_dtype_packing(dtype):
     return 32 // bits
 
 
-def broadcast_minor(src, shape):
-    if src.shape == shape:
-        return src
-    assert src.shape[:-1] == shape[:-1]
-    assert src.shape[-1] % 128 == 0
-    target_minor = align_to(shape[-1], src.shape[-1])
-    # no-op concatenation.
-    return jnp.concatenate([src for _ in range(target_minor // src.shape[-1])], axis=-1)[
-        ..., : shape[-1]
-    ]
-
-
 def swigluoai(
     gate: jax.Array, up: jax.Array, *, alpha: float = 1.702, limit: float = 7.0
 ) -> jax.Array:
@@ -521,11 +509,6 @@ def _fused_ep_moe_kernel(
     barrier_sem,
     *,
     top_k: int,
-    use_grouped_topk: bool = False,
-    num_groups: int = 1,
-    top_k_groups: int = 1,
-    renormalize_topk_logits: bool,
-    routed_scaling_factor: float | None = None,
     dp_axis_name: str,
     tp_axis_name: str,
     act_fn: str,
@@ -2632,10 +2615,7 @@ def fused_ep_moe(
     t_packing = get_dtype_packing(t_dtype)
     hidden_per_pack = hidden_size // t_packing
     # With run_bt tiling in the pallas kernel, a2a scratch only needs to cover one bt tile.
-    # TODO: FIXME(prayer): kernel Anomalies error temporary solution
-    # After a detailed investigation of a2a, this topk multiplication needs to be removed
     a2a_max_tokens = align_to(bt * num_devices, block_config.bts)
-    a2a_max_tokens_with_top_k = align_to(bt * num_devices * top_k, block_config.bts)
     bd1_per_pack = block_config.bd1 // t_packing
     bd2_per_pack = block_config.bd2 // t_packing
 
@@ -2864,11 +2844,6 @@ def fused_ep_moe(
             functools.partial(
                 _fused_ep_moe_kernel,
                 top_k=top_k,
-                use_grouped_topk=use_grouped_topk,
-                num_groups=num_groups,
-                top_k_groups=top_k_groups,
-                renormalize_topk_logits=renormalize_topk_logits,
-                routed_scaling_factor=routed_scaling_factor,
                 dp_axis_name=dp_axis_name,
                 tp_axis_name=tp_axis_name,
                 act_fn=act_fn,
@@ -3093,7 +3068,7 @@ def fused_ep_moe(
         return local_output
 
     a2a_s_x2_hbm_scratch = pl.empty(
-        (2, a2a_max_tokens_with_top_k, t_packing, hidden_size // t_packing), t_dtype
+        (2, a2a_max_tokens, t_packing, hidden_size // t_packing), t_dtype
     )
     a2a_s_acc_x2_hbm_scratch = pl.empty(
         (2, a2a_max_tokens, t_packing, hidden_size // t_packing), t_dtype
