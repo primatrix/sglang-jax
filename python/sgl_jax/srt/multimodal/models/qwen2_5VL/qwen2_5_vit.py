@@ -12,6 +12,8 @@ from jax.sharding import Mesh
 from transformers import modeling_flax_utils
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.hf_transformers_utils import get_hf_text_config
+from sgl_jax.srt.layers.embeddings import Embed
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
     QwenVLModelVitConfig,
 )
@@ -637,6 +639,16 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
 
     def load_weights(self, model_config: ModelConfig) -> None:
         """Load model weights with JAX distributed loading support"""
+        text_config = get_hf_text_config(model_config.hf_config) or model_config.hf_config
+        if not hasattr(self, "text_embed"):
+            self.text_embed = Embed(
+                num_embeddings=text_config.vocab_size,
+                features=text_config.hidden_size,
+                dtype=self.dtype,
+                param_dtype=self.dtype,
+                kernel_axes=(None, None),
+                mesh=self.mesh,
+            )
 
         # Decide loading strategy based on mesh configuration
         loader = WeightLoader(
@@ -657,6 +669,12 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
 
     def _create_qwen2_5_vl_vision_weight_mappings(self) -> dict:
         mappings = {}
+
+        mappings["model.embed_tokens.weight"] = WeightMapping(
+            target_path="text_embed.embedding",
+            sharding=(None, None),
+            transpose=False,
+        )
 
         # Vision mappings (check if visual model exists)
         if hasattr(self, "visual"):

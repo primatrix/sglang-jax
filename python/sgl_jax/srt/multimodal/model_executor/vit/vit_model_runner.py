@@ -100,11 +100,57 @@ class VitModelRunner(BaseModelRunner):
 
         self.jitted_encode_vision = encode_vision_wrapper
 
+    def _merge_multimodal_embeddings(
+        self,
+        input_ids: jax.Array,
+        vision_embeds: jax.Array | list[jax.Array],
+        mm_inputs: dict,
+    ) -> jax.Array | None:
+        if vision_embeds is None:
+            return None
+
+        if isinstance(vision_embeds, list):
+            if len(vision_embeds) == 0:
+                return None
+            vision_embeds = jnp.concatenate(vision_embeds, axis=0)
+        if vision_embeds.size == 0:
+            return None
+
+        image_token_id = mm_inputs.get("im_token_id") or mm_inputs.get("image_token_id")
+        video_token_id = mm_inputs.get("video_token_id")
+        placeholder_token_ids = [tok for tok in (image_token_id, video_token_id) if tok is not None]
+        if not placeholder_token_ids:
+            return None
+
+        text_embeds = self.model.text_embed(input_ids)
+        placeholder_token_ids = jnp.array(placeholder_token_ids)
+        is_multimodal = jnp.isin(input_ids, placeholder_token_ids)
+
+        dummy_row = jnp.zeros_like(vision_embeds[0:1])
+        vision_embeds_padded = jnp.concatenate([dummy_row, vision_embeds], axis=0)
+
+        gather_indices = jnp.cumsum(is_multimodal)
+        update_values = vision_embeds_padded[gather_indices]
+
+        condition = jnp.expand_dims(is_multimodal, axis=-1)
+        return jnp.where(condition, update_values, text_embeds)
+
     def forward(self, batch: Req, mesh: jax.sharding.Mesh):
         vision_embeds = self.jitted_encode_vision(
             pixel_values=batch.pixel_values,
             image_grid_thw=batch.image_grid_thw,
             video_grid_thw=batch.video_grid_thw,
         )
-        batch.vlm_inputs.multimodal_embeddings = vision_embeds
+        mm_inputs = batch.vlm_inputs if isinstance(batch.vlm_inputs, dict) else None
+        if mm_inputs is not None:
+            input_ids = batch.input_ids or batch.origin_input_ids
+            if input_ids is not None:
+                input_ids = jnp.asarray(input_ids)
+                merged_embeds = self._merge_multimodal_embeddings(
+                    input_ids=input_ids,
+                    vision_embeds=vision_embeds,
+                    mm_inputs=mm_inputs,
+                )
+                if merged_embeds is not None:
+                    mm_inputs["multimodal_embedding"] = merged_embeds
         return batch

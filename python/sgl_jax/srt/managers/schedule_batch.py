@@ -1397,9 +1397,14 @@ class ScheduleBatch:
             multimodal_embedding_list = []
             for req in self.reqs:
                 # Check for cached vision embeddings first (for chunked prefill)
-                if hasattr(req, "multimodal_embedding") and req.mm_inputs is not None:
+                if (
+                    hasattr(req, "multimodal_embedding")
+                    and req.mm_inputs is not None
+                    and req.multimodal_embedding is not None
+                ):
                     multimodal_embedding_list.append(req.multimodal_embedding)
-            multimodal_embedding = np.concatenate(multimodal_embedding_list, axis=0)
+            if multimodal_embedding_list:
+                multimodal_embedding = np.concatenate(multimodal_embedding_list, axis=0)
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
