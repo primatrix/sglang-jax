@@ -1,4 +1,12 @@
+from typing import Sequence, Optional, Tuple
+
+import jax
 import jax.numpy as jnp
+from flax import nnx
+from jax import Array
+
+from sgl_jax.srt.layers.embeddings import Embed
+
 
 class MelSpectrumExtractor:
     def __init__(
@@ -127,3 +135,59 @@ class MelSpectrumExtractor:
         if squeeze_dim:
             mel_stack = jnp.squeeze(mel_stack, axis=0)
         return mel_stack
+
+class ResidualVectorQuantizer(nnx.Module):
+    def __init__(
+            self,
+            dimension: int,
+            n_q: int,
+            bins: Sequence[int],
+            dtype: jnp.dtype | None = jnp.float32,
+            mesh: jax.sharding.Mesh | None = None,
+    ):
+        self.dimension = dimension
+        self.n_q = n_q
+
+        codebooks_list = []
+        for i in range(n_q):
+            size = bins[min(i, len(bins) - 1)]
+            codebooks_list.append(
+                Embed(
+                    num_embeddings=size,
+                    features=dimension,
+                    type=dtype,
+                    kernel_axes=("tensor", None),
+                    param_dtype=dtype,
+                    mesh=mesh,
+                )
+            )
+        self.codebooks = nnx.List(codebooks_list)
+
+    def encode(
+            self, hidden_states: Array, mask: Optional[Array] = None, n_q: Optional[int] = None
+    ) -> Tuple[Array, Array]:
+        num_levels = n_q or self.n_q
+        residual = hidden_states
+        quantized = jnp.zeros_like(hidden_states)
+        codes = []
+        mask = None if mask is None else mask[..., None]
+        for i in range(num_levels):
+            codebook = self.codebooks[i].value
+            dist = jnp.sum((residual[:, None, :] - codebook[None, :, :]) ** 2, axis=-1)
+            idx = jnp.argmin(dist, axis=-1)
+            chosen = codebook[idx]
+            if mask is not None:
+                chosen = chosen * mask
+            quantized = quantized + chosen
+            residual = residual - chosen
+            codes.append(idx)
+        return jnp.stack(codes, axis=0), quantized
+
+    def decode(self, codes: Array) -> Array:
+        num_levels = codes.shape[0]
+        flat = codes.reshape(num_levels, -1)
+        decoded = jnp.zeros((flat.shape[1], self.dimension), dtype=jnp.float32)
+        for i in range(num_levels):
+            codebook = self.codebooks[i].value
+            decoded = decoded + codebook[flat[i]]
+        return decoded.reshape(*codes.shape[1:], self.dimension)
