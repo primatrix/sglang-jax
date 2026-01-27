@@ -176,11 +176,6 @@ class Qwen2_5_VL_Generation(nnx.Module):
                         head_dim_padding=True,
                         kv_head_padding=True,
                     ),
-                    f"{prefix}.self_attn.o_proj.bias": WeightMapping(
-                        target_path=f"{target_prefix}.self_attn.o_proj.bias",
-                        sharding=(None,),
-                        transpose=False,
-                    ),
                 }
             )
 
