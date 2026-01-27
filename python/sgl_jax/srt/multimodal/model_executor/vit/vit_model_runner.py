@@ -82,7 +82,10 @@ class VitModelRunner(BaseModelRunner):
             if video_grid_thw:
                 combined_grid_thw.extend(video_grid_thw)
             if not combined_grid_thw:
-                return jnp.zeros((0, self.model.config.hidden_size), dtype=pixel_values.dtype)
+                return jnp.zeros(
+                    (0, self.model.config.hidden_size),
+                    dtype=pixel_values.dtype if pixel_values is not None else jnp.float32,
+                )
             combined_grid_thw = tuple(combined_grid_thw)
             window_index, rotary_pos_emb, cu_seqlens, cu_window_seqlens = (
                 self.model.visual.compute_aux_arrays(combined_grid_thw)

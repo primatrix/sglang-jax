@@ -11,8 +11,6 @@ from flax import nnx
 from jax.sharding import Mesh
 from transformers import modeling_flax_utils
 
-from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.hf_transformers_utils import get_hf_text_config
 from sgl_jax.srt.layers.embeddings import Embed
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
     QwenVLModelVitConfig,
@@ -637,13 +635,12 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
         )
         logger.info("Qwen2_5_VL_VisionModel initialized with dtype %s", dtype)
 
-    def load_weights(self, model_config: ModelConfig) -> None:
+    def load_weights(self, model_config: QwenVLModelVitConfig) -> None:
         """Load model weights with JAX distributed loading support"""
-        text_config = get_hf_text_config(model_config.hf_config) or model_config.hf_config
         if not hasattr(self, "text_embed"):
             self.text_embed = Embed(
-                num_embeddings=text_config.vocab_size,
-                features=text_config.hidden_size,
+                num_embeddings=model_config.vocab_size,
+                features=model_config.text_hidden_size,
                 dtype=self.dtype,
                 param_dtype=self.dtype,
                 kernel_axes=(None, None),

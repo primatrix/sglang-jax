@@ -1395,16 +1395,26 @@ class ScheduleBatch:
         multimodal_embedding = None
         if self.forward_mode == ForwardMode.EXTEND:
             multimodal_embedding_list = []
-            for req in self.reqs:
+            for req, prefix_len, extend_len in zip(self.reqs, self.prefix_lens, self.extend_lens):
                 # Check for cached vision embeddings first (for chunked prefill)
                 if (
                     hasattr(req, "multimodal_embedding")
                     and req.mm_inputs is not None
                     and req.multimodal_embedding is not None
                 ):
-                    multimodal_embedding_list.append(req.multimodal_embedding)
+                    mm_full = np.asarray(req.multimodal_embedding)
+                    start = int(prefix_len or 0)
+                    end = start + int(extend_len or 0)
+                    multimodal_embedding_list.append(mm_full[start:end])
             if multimodal_embedding_list:
                 multimodal_embedding = np.concatenate(multimodal_embedding_list, axis=0)
+                if len(multimodal_embedding) < len(input_ids_cpu):
+                    pad_rows = len(input_ids_cpu) - len(multimodal_embedding)
+                    pad = np.zeros(
+                        (pad_rows, multimodal_embedding.shape[1]),
+                        dtype=multimodal_embedding.dtype,
+                    )
+                    multimodal_embedding = np.concatenate([multimodal_embedding, pad], axis=0)
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
