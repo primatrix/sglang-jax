@@ -535,6 +535,7 @@ def run_all(
     weight_dtype: jnp.dtype = jnp.bfloat16,  # Quantize the weight dtype, the activation's dtype always is bfloat16
     *,
     warmup_iters: int = 1,
+    act_quant_dtype: jnp.dtype | None = None,
     tune_block_config: bool = False,
     bt_candidates: list[int] | None = None,
     bts_candidates: list[int] | None = None,
@@ -610,7 +611,10 @@ def run_all(
     )
 
     for case in cases:
-        t_packing = _dtype_packing(jnp.bfloat16)
+        # `act_quant_dtype` quantizes FFN compute only; tokens for EP communication
+        # remain in `dtype` (typically bf16).
+        dtype_for_block = dtype
+        t_packing = _dtype_packing(dtype_for_block)
         mesh = build_mesh(ep_size=case.ep_size, tp_size=case.tp_size)
         mesh_ep = mesh.shape["tensor"]
         if mesh_ep != case.ep_size:
@@ -665,7 +669,7 @@ def run_all(
         if tune_block_config:
             block_cfgs = select_block_configs(
                 case,
-                dtype,
+                dtype_for_block,
                 weight_dtype=weight_dtype,
                 router_dtype=data["router_logits"].dtype,
                 bt_candidates=bt_candidates or [2, 4, 8, 16, 32, 64, 128, 256, 512],
@@ -681,10 +685,10 @@ def run_all(
         else:
             block_cfgs = [None]
 
-        if weight_dtype == jnp.float8_e4m3fn:
+        if weight_dtype == jnp.float8_e4m3fn or act_quant_dtype is not None:
             quantization_config = QuantizationConfig(
-                moe_weight_dtype=weight_dtype,
-                moe_activation_dtype=None,  # activation is bfloat16
+                moe_weight_dtype=weight_dtype if weight_dtype == jnp.float8_e4m3fn else None,
+                moe_activation_dtype=act_quant_dtype,
             )
         else:
             quantization_config = None
@@ -882,6 +886,17 @@ def parse_args() -> argparse.Namespace:
         choices=["bfloat16", "float8_e4m3fn"],
     )
     parser.add_argument(
+        "--act-quant-dtype",
+        type=str,
+        default=None,
+        choices=["float8_e4m3fn", "float8_e5m2"],
+        help=(
+            "Activation quantization dtype for fused MoE FFN compute. When set, fused_ep_moe "
+            "keeps tokens in bf16/f16/f32 for communication and quantizes activations to FP8 "
+            "inside the FFN compute."
+        ),
+    )
+    parser.add_argument(
         "--tune-block-config",
         action="store_true",
         help="Benchmark multiple block_config variants and print the best tuned table entry.",
@@ -1018,7 +1033,12 @@ if __name__ == "__main__":
         raise ValueError(
             f"Unsupported dtype: {args.weight_dtype}. Supported: {list(DTYPE_MAP.keys())}"
         )
+    if args.act_quant_dtype not in DTYPE_MAP:
+        raise ValueError(
+            f"Unsupported act_quant_dtype: {args.act_quant_dtype}. Supported: {list(DTYPE_MAP.keys())}"
+        )
     weight_dtype = DTYPE_MAP[args.weight_dtype]
+    act_quant_dtype = DTYPE_MAP[args.act_quant_dtype]
     if args.compilation_cache_dir:
         _compilation_cache.set_cache_dir(args.compilation_cache_dir)
     tpu_vmem_budget_bytes = int(args.tpu_vmem_budget_mb) * 1024 * 1024
@@ -1028,6 +1048,7 @@ if __name__ == "__main__":
             args.iters,
             weight_dtype=weight_dtype,
             warmup_iters=args.warmup_iters,
+            act_quant_dtype=act_quant_dtype,
             tune_block_config=args.tune_block_config,
             bt_candidates=args.bt_candidates,
             bts_candidates=args.bts_candidates,
