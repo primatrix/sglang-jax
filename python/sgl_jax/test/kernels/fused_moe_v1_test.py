@@ -158,6 +158,7 @@ class MoEKernelTest(jtu.JaxTestCase):
         bse: int | None = None,
         act_fn="silu",
         w_dtype=None,
+        act_quant_dtype=None,
         subc_quant_wsz=None,
         has_bias=False,
         has_shared_expert=False,
@@ -231,6 +232,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             top_k_groups=top_k_groups,
             renormalize_topk_logits=renormalize_topk_logits,
             act_fn=act_fn,
+            act_quant_dtype=act_quant_dtype,
             subc_quant_wsz=subc_quant_wsz,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
@@ -506,6 +508,92 @@ class MoEKernelTest(jtu.JaxTestCase):
             bd2c=256,
             bse=512,
         )
+
+    def test_fp8_activation_quant(self):
+        if not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("Expect TPUv7+")
+        dtype = jnp.bfloat16
+        top_k = 8
+        num_experts = 128
+        hidden_size = 1024
+        intermediate_size = 1024
+        num_tokens = 8 * 32
+        a, w1, w2, w3, b1, b2, b3, gating_output, w1_shared, w2_shared, w3_shared = gen_moe_inputs(
+            dtype,
+            top_k,
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            num_tokens,
+            seed=1234,
+        )
+        assert b1 is None and b2 is None and b3 is None
+        assert w1_shared is None and w2_shared is None and w3_shared is None
+
+        subc_quant_wsz = 256
+        w1, w1_scale = sub_channel_quantize(w1, jnp.float8_e4m3fn, subc_quant_wsz)
+        w2, w2_scale = sub_channel_quantize(w2, jnp.float8_e4m3fn, subc_quant_wsz)
+        w3, w3_scale = sub_channel_quantize(w3, jnp.float8_e4m3fn, subc_quant_wsz)
+
+        # Quantize tokens ahead of comm: fp8 tokens + per-token scale.
+        a_f32 = a.astype(jnp.float32)
+        abs_max = jnp.max(jnp.abs(a_f32), axis=-1, keepdims=True)
+        dtype_max = jnp.array(jnp.finfo(jnp.float8_e4m3fn).max, dtype=jnp.float32)
+        a_scale = jnp.where(abs_max == 0, jnp.ones_like(abs_max), abs_max / dtype_max).astype(
+            jnp.bfloat16
+        )
+        a_fp8 = jnp.clip(a_f32 / a_scale, -dtype_max, dtype_max).astype(jnp.float8_e4m3fn)
+        a_deq = (a_fp8.astype(jnp.float32) * a_scale.astype(jnp.float32)).astype(dtype)
+
+        block_config = FusedMoEBlockConfig(
+            bt=32,
+            bf=1024,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=256,
+            bd1c=256,
+            bd2c=256,
+            bse=512,
+        )
+
+        actual = fused_ep_moe(
+            mesh=self.mesh,
+            tokens=a_fp8,
+            tokens_scale=a_scale,
+            out_dtype=dtype,
+            w1=w1,
+            w2=w2,
+            w3=w3,
+            gating_output=gating_output,
+            top_k=top_k,
+            renormalize_topk_logits=False,
+            act_fn="silu",
+            act_quant_dtype=jnp.float8_e4m3fn,
+            subc_quant_wsz=subc_quant_wsz,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            w3_scale=w3_scale,
+            block_config=block_config,
+            tp_axis_name="tensor",
+        )
+
+        expected = ref_moe(
+            a_deq,
+            w1,
+            w2,
+            w3,
+            gating_output,
+            top_k,
+            renormalize_topk_logits=False,
+            act_fn="silu",
+            subc_quant_wsz=subc_quant_wsz,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            w3_scale=w3_scale,
+        )
+
+        np.testing.assert_allclose(actual, expected, atol=5e-1, rtol=5e-1)
 
     @parameterized.product(
         w_dtype=[jnp.int8],

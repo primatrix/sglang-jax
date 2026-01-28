@@ -1002,9 +1002,21 @@ class FusedEPMoE(nnx.Module):
         w2_shared_scale = self.w2_shared_scale.value if self.w2_shared_scale is not None else None
         subc_quant_wsz = 256 if self.subc_quant_wsz is not None else None
 
+        tokens = hidden_states
+        tokens_scale = None
+        out_dtype = None
+        if self.activation_quantized_dtype is not None:
+            tokens, tokens_scale = quantize_tensor_simple(
+                hidden_states,
+                self.activation_quantized_dtype,
+                dim=-1,
+                out_dtype=jnp.bfloat16,
+            )
+            out_dtype = hidden_states.dtype
+
         output = fused_ep_moe(
             mesh=self.mesh,
-            tokens=hidden_states,
+            tokens=tokens,
             w1=self.w1.value,
             w2=self.w2.value,
             w3=self.w3.value,
@@ -1017,6 +1029,9 @@ class FusedEPMoE(nnx.Module):
             renormalize_topk_logits=self.renormalize_topk_logits,
             routed_scaling_factor=self.routed_scaling_factor,
             act_fn=self.activation,
+            act_quant_dtype=self.activation_quantized_dtype,
+            out_dtype=out_dtype,
+            tokens_scale=tokens_scale,
             block_config=block_config,
             # Optional parameters (not used in basic case)
             subc_quant_wsz=subc_quant_wsz,
