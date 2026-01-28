@@ -155,6 +155,14 @@ class Req:
     # results
     output: jax.Array | None = None
 
+    # Audio inputs
+    audio_input: jax.Array | None = None
+    codes: jax.Array | None = None
+    use_quantizer: bool = True
+    n_q: int | None = None
+    sample_rate: int = 24000
+    audio_mode: str | None = None
+
     def to_stage_reqs(self, scheduler: str):
         if scheduler == "auto_regressive":
             return [
