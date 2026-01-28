@@ -535,15 +535,7 @@ class MoEKernelTest(jtu.JaxTestCase):
         w2, w2_scale = sub_channel_quantize(w2, jnp.float8_e4m3fn, subc_quant_wsz)
         w3, w3_scale = sub_channel_quantize(w3, jnp.float8_e4m3fn, subc_quant_wsz)
 
-        # Quantize tokens ahead of comm: fp8 tokens + per-token scale.
-        a_f32 = a.astype(jnp.float32)
-        abs_max = jnp.max(jnp.abs(a_f32), axis=-1, keepdims=True)
-        dtype_max = jnp.array(jnp.finfo(jnp.float8_e4m3fn).max, dtype=jnp.float32)
-        a_scale = jnp.where(abs_max == 0, jnp.ones_like(abs_max), abs_max / dtype_max).astype(
-            jnp.bfloat16
-        )
-        a_fp8 = jnp.clip(a_f32 / a_scale, -dtype_max, dtype_max).astype(jnp.float8_e4m3fn)
-        a_deq = (a_fp8.astype(jnp.float32) * a_scale.astype(jnp.float32)).astype(dtype)
+        # Activation quantization happens inside fused_ep_moe compute (post-comm).
 
         block_config = FusedMoEBlockConfig(
             bt=32,
@@ -559,9 +551,7 @@ class MoEKernelTest(jtu.JaxTestCase):
 
         actual = fused_ep_moe(
             mesh=self.mesh,
-            tokens=a_fp8,
-            tokens_scale=a_scale,
-            out_dtype=dtype,
+            tokens=a,
             w1=w1,
             w2=w2,
             w3=w3,
@@ -579,7 +569,7 @@ class MoEKernelTest(jtu.JaxTestCase):
         )
 
         expected = ref_moe(
-            a_deq,
+            a,
             w1,
             w2,
             w3,
