@@ -10,6 +10,7 @@ from transformers import PretrainedConfig
 
 from sgl_jax.srt.layers.embeddings import Embed
 from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 @dataclass
 class EncoderOutput:
@@ -48,6 +49,84 @@ def apply_rotary(x: Array, cos: Array, sin: Array) -> Array:
     cos = cos[:, None, :, :]
     sin = sin[:, None, :, :]
     return (x * cos) + (rotate_half(x) * sin)
+
+
+def to_mappings(config: PretrainedConfig) -> dict[str, WeightMapping]:
+    mappings = {
+        "encoder.conv1.weight": WeightMapping(target_path="encoder.conv1.kernel", transpose_axes=(2, 1, 0)),
+        "encoder.conv1.bias": WeightMapping(target_path="encoder.conv1.bias"),
+        "encoder.conv2.weight": WeightMapping(target_path="encoder.conv2.kernel", transpose_axes=(2, 1, 0)),
+        "encoder.conv2.bias": WeightMapping(target_path="encoder.conv2.bias"),
+        "encoder.layer_norm.weight": WeightMapping(target_path="encoder.layer_norm.scale"),
+        "encoder.layer_norm.bias": WeightMapping(target_path="encoder.layer_norm.bias"),
+        "encoder.layers.*.self_attn.q_proj.weight": WeightMapping(target_path="encoder.layers.*.self_attn.q_proj.weight", transpose=True),
+        "encoder.layers.*.self_attn.q_proj.bias": WeightMapping(target_path="encoder.layers.*.self_attn.q_proj.bias"),
+        "encoder.layers.*.self_attn.k_proj.weight": WeightMapping(target_path="encoder.layers.*.self_attn.k_proj.weight", transpose=True),
+        "encoder.layers.*.self_attn.v_proj.weight": WeightMapping(target_path="encoder.layers.*.self_attn.v_proj.weight", transpose=True),
+        "encoder.layers.*.self_attn.v_proj.bias": WeightMapping(target_path="encoder.layers.*.self_attn.v_proj.bias"),
+        "encoder.layers.*.self_attn.out_proj.weight": WeightMapping(target_path="encoder.layers.*.self_attn.out_proj.weight", transpose=True),
+        "encoder.layers.*.self_attn.out_proj.bias": WeightMapping(target_path="encoder.layers.*.self_attn.out_proj.bias"),
+        "encoder.layers.*.self_attn_layer_norm.weight": WeightMapping(target_path="encoder.layers.*.self_attn_layer_norm.scale"),
+        "encoder.layers.*.self_attn_layer_norm.bias": WeightMapping(target_path="encoder.layers.*.self_attn_layer_norm.bias"),
+        "encoder.layers.*.final_layer_norm.weight": WeightMapping(target_path="encoder.layers.*.final_layer_norm.scale"),
+        "encoder.layers.*.final_layer_norm.bias": WeightMapping(target_path="encoder.layers.*.final_layer_norm.bias"),
+        "encoder.layers.*.fc1.weight": WeightMapping(target_path="encoder.layers.*.fc1.weight", transpose=True),
+        "encoder.layers.*.fc1.bias": WeightMapping(target_path="encoder.layers.*.fc1.bias"),
+        "encoder.layers.*.fc2.weight": WeightMapping(target_path="encoder.layers.*.fc2.weight", transpose=True),
+        "encoder.layers.*.fc2.bias": WeightMapping(target_path="encoder.layers.*.fc2.bias"),
+        "encoder.down_sample_layer.0.weight": WeightMapping(target_path="encoder.down_sample_layer.kernel", transpose_axes=(2, 1, 0)),
+        "encoder.down_sample_norm.weight": WeightMapping(target_path="encoder.down_norm.scale"),
+        "encoder.down_sample_norm.bias": WeightMapping(target_path="encoder.down_norm.bias"),
+        "encoder.quantizer.vq.layers.*._codebook.embed": WeightMapping(target_path="encoder.quantizer.codebooks.*.embedding.embedding"),
+        "decoder.dconv1.conv.weight": WeightMapping(target_path="decoder.dconv1.conv.kernel"),
+        "decoder.dconv1.conv.bias": WeightMapping(target_path="decoder.dconv1.conv.bias"),
+        "decoder.dconv1.norm.weight": WeightMapping(target_path="decoder.dconv1.norm.scale"),
+        "decoder.dconv1.norm.bias": WeightMapping(target_path="decoder.dconv1.norm.bias"),
+        "decoder.layer_norm.weight": WeightMapping(target_path="decoder.layer_norm.scale"),
+        "decoder.layer_norm.bias": WeightMapping(target_path="decoder.layer_norm.bias"),
+        "decoder.dconv2.conv.weight": WeightMapping(target_path="decoder.dconv2.conv.kernel"),
+        "decoder.dconv2.conv.bias": WeightMapping(target_path="decoder.dconv2.conv.bias"),
+        "decoder.dconv2.norm.weight": WeightMapping(target_path="decoder.dconv2.norm.scale"),
+        "decoder.dconv2.norm.bias": WeightMapping(target_path="decoder.dconv2.norm.bias"),
+        "decoder.layers.*.self_attn.q_proj.weight": WeightMapping(target_path="decoder.layers.*.self_attn.q_proj.weight", transpose=True),
+        "decoder.layers.*.self_attn.q_proj.bias": WeightMapping(target_path="decoder.layers.*.self_attn.q_proj.bias"),
+        "decoder.layers.*.self_attn.k_proj.weight": WeightMapping(target_path="decoder.layers.*.self_attn.k_proj.weight", transpose=True),
+        "decoder.layers.*.self_attn.v_proj.weight": WeightMapping(target_path="decoder.layers.*.self_attn.v_proj.weight", transpose=True),
+        "decoder.layers.*.self_attn.v_proj.bias": WeightMapping(target_path="decoder.layers.*.self_attn.v_proj.bias"),
+        "decoder.layers.*.self_attn.out_proj.weight": WeightMapping(target_path="decoder.layers.*.self_attn.out_proj.weight", transpose=True),
+        "decoder.layers.*.self_attn.out_proj.bias": WeightMapping(target_path="decoder.layers.*.self_attn.out_proj.bias"),
+        "decoder.layers.*.self_attn_layer_norm.weight": WeightMapping(target_path="decoder.layers.*.self_attn_layer_norm.scale"),
+        "decoder.layers.*.self_attn_layer_norm.bias": WeightMapping(target_path="decoder.layers.*.self_attn_layer_norm.bias"),
+        "decoder.layers.*.final_layer_norm.weight": WeightMapping(target_path="decoder.layers.*.final_layer_norm.scale"),
+        "decoder.layers.*.final_layer_norm.bias": WeightMapping(target_path="decoder.layers.*.final_layer_norm.bias"),
+        "decoder.layers.*.fc1.weight": WeightMapping(target_path="decoder.layers.*.fc1.weight", transpose=True),
+        "decoder.layers.*.fc1.bias": WeightMapping(target_path="decoder.layers.*.fc1.bias"),
+        "decoder.layers.*.fc2.weight": WeightMapping(target_path="decoder.layers.*.fc2.weight", transpose=True),
+        "decoder.layers.*.fc2.bias": WeightMapping(target_path="decoder.layers.*.fc2.bias"),
+        "decoder.vocoder.embeddings.weight": WeightMapping(target_path="decoder.vocoder.embeddings.weight", transpose=True),
+        "decoder.vocoder.layer_norm.weight": WeightMapping(target_path="decoder.vocoder.layer_norm.scale"),
+        "decoder.vocoder.layer_norm.bias": WeightMapping(target_path="decoder.vocoder.layer_norm.bias"),
+        "decoder.vocoder.head.out.weight": WeightMapping(target_path="decoder.vocoder.head.linear.weight", transpose=True),
+        "decoder.vocoder.head.out.bias": WeightMapping(target_path="decoder.vocoder.head.linear.bias"),
+        "decoder.vocoder.head.istft.window": WeightMapping(target_path="decoder.vocoder.head.istft.window"),
+        "decoder.vocoder.layers.*.self_attn.q_proj.weight": WeightMapping(target_path="decoder.vocoder.layers.*.self_attn.q_proj.weight", transpose=True),
+        "decoder.vocoder.layers.*.self_attn.q_proj.bias": WeightMapping(target_path="decoder.vocoder.layers.*.self_attn.q_proj.bias"),
+        "decoder.vocoder.layers.*.self_attn.k_proj.weight": WeightMapping(target_path="decoder.vocoder.layers.*.self_attn.k_proj.weight", transpose=True),
+        "decoder.vocoder.layers.*.self_attn.v_proj.weight": WeightMapping(target_path="decoder.vocoder.layers.*.self_attn.v_proj.weight", transpose=True),
+        "decoder.vocoder.layers.*.self_attn.v_proj.bias": WeightMapping(target_path="decoder.vocoder.layers.*.self_attn.v_proj.bias"),
+        "decoder.vocoder.layers.*.self_attn.out_proj.weight": WeightMapping(target_path="decoder.vocoder.layers.*.self_attn.out_proj.weight", transpose=True),
+        "decoder.vocoder.layers.*.self_attn.out_proj.bias": WeightMapping(target_path="decoder.vocoder.layers.*.self_attn.out_proj.bias"),
+        "decoder.vocoder.layers.*.self_attn_layer_norm.weight": WeightMapping(target_path="decoder.vocoder.layers.*.self_attn_layer_norm.scale"),
+        "decoder.vocoder.layers.*.self_attn_layer_norm.bias": WeightMapping(target_path="decoder.vocoder.layers.*.self_attn_layer_norm.bias"),
+        "decoder.vocoder.layers.*.final_layer_norm.weight": WeightMapping(target_path="decoder.vocoder.layers.*.final_layer_norm.scale"),
+        "decoder.vocoder.layers.*.final_layer_norm.bias": WeightMapping(target_path="decoder.vocoder.layers.*.final_layer_norm.bias"),
+        "decoder.vocoder.layers.*.fc1.weight": WeightMapping(target_path="decoder.vocoder.layers.*.fc1.weight", transpose=True),
+        "decoder.vocoder.layers.*.fc1.bias": WeightMapping(target_path="decoder.vocoder.layers.*.fc1.bias"),
+        "decoder.vocoder.layers.*.fc2.weight": WeightMapping(target_path="decoder.vocoder.layers.*.fc2.weight", transpose=True),
+        "decoder.vocoder.layers.*.fc2.bias": WeightMapping(target_path="decoder.vocoder.layers.*.fc2.bias"),
+    }
+    return mappings
+
 
 class MelSpectrumExtractor:
     """Extract mel spectrogram from audio waveforms."""
@@ -898,6 +977,8 @@ class FlaxMiMoAudioTokenizer(nnx.Module):
         rngs: Optional[nnx.Rngs] = None,
     ):
         self.config = config
+        self.mesh = mesh
+        self.dtype = dtype
         self.encoder = AudioEncoder(config, mesh=mesh, dtype=dtype, rngs=rngs)
         self.decoder = AudioDecoder(config, mesh=mesh, dtype=dtype, rngs=rngs)
         self.downsample_rate = int(config.hop_length * 2 * config.avg_pooler)
@@ -925,5 +1006,28 @@ class FlaxMiMoAudioTokenizer(nnx.Module):
         hidden = hidden[None, ...]
         lengths = jnp.array([hidden.shape[1]])
         return self.decoder(hidden, lengths)
+
+    def load_weights(self, model_config):
+        loader = WeightLoader(self, model_config, self.mesh, self.dtype)
+        loader.load_weights_from_safetensors(to_mappings(self.config))
+        self._init_rope_inv_freq()
+
+    def _init_rope_inv_freq(self):
+        config = self.config
+        encoder_dim = config.d_model // config.encoder_attention_heads
+        encoder_half = encoder_dim // 2
+        self.encoder.position_embedding.inv_freq.value = 1.0 / (
+            config.rope_theta ** (jnp.arange(0, encoder_half, dtype=jnp.float32) / encoder_half)
+        )
+        decoder_dim = config.d_model // config.decoder_attention_heads
+        decoder_half = decoder_dim // 2
+        self.decoder.position_embedding.inv_freq.value = 1.0 / (
+            config.rope_theta ** (jnp.arange(0, decoder_half, dtype=jnp.float32) / decoder_half)
+        )
+        vocoder_dim = config.vocoder_dim // config.vocoder_attention_heads
+        vocoder_half = vocoder_dim // 2
+        self.decoder.vocoder.position_embedding.inv_freq.value = 1.0 / (
+            config.rope_theta ** (jnp.arange(0, vocoder_half, dtype=jnp.float32) / vocoder_half)
+        )
 
 EntryClass = FlaxMiMoAudioTokenizer
