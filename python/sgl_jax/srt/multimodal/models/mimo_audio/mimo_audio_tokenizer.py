@@ -54,76 +54,79 @@ def apply_rotary(x: Array, cos: Array, sin: Array) -> Array:
 def to_mappings(config: PretrainedConfig) -> dict[str, WeightMapping]:
     mappings = {
         "encoder.conv1.weight": WeightMapping(target_path="encoder.conv1.kernel", transpose_axes=(2, 1, 0)),
-        "encoder.conv1.bias": WeightMapping(target_path="encoder.conv1.bias"),
+        "encoder.conv1.bias": WeightMapping(target_path="encoder.conv1.bias", sharding=()),
         "encoder.conv2.weight": WeightMapping(target_path="encoder.conv2.kernel", transpose_axes=(2, 1, 0)),
-        "encoder.conv2.bias": WeightMapping(target_path="encoder.conv2.bias"),
-        "encoder.layer_norm.weight": WeightMapping(target_path="encoder.layer_norm.scale"),
-        "encoder.layer_norm.bias": WeightMapping(target_path="encoder.layer_norm.bias"),
+        "encoder.conv2.bias": WeightMapping(target_path="encoder.conv2.bias", sharding=()),
+        "encoder.layer_norm.weight": WeightMapping(target_path="encoder.layer_norm.scale", sharding=()),
+        "encoder.layer_norm.bias": WeightMapping(target_path="encoder.layer_norm.bias", sharding=()),
         "encoder.layers.*.self_attn.q_proj.weight": WeightMapping(target_path="encoder.layers.*.self_attn.q_proj.weight", transpose=True),
-        "encoder.layers.*.self_attn.q_proj.bias": WeightMapping(target_path="encoder.layers.*.self_attn.q_proj.bias"),
+        "encoder.layers.*.self_attn.q_proj.bias": WeightMapping(target_path="encoder.layers.*.self_attn.q_proj.bias", sharding=()),
         "encoder.layers.*.self_attn.k_proj.weight": WeightMapping(target_path="encoder.layers.*.self_attn.k_proj.weight", transpose=True),
+        "encoder.layers.*.self_attn.k_proj.bias": WeightMapping(target_path="encoder.layers.*.self_attn.k_proj.bias", sharding=()),
         "encoder.layers.*.self_attn.v_proj.weight": WeightMapping(target_path="encoder.layers.*.self_attn.v_proj.weight", transpose=True),
-        "encoder.layers.*.self_attn.v_proj.bias": WeightMapping(target_path="encoder.layers.*.self_attn.v_proj.bias"),
+        "encoder.layers.*.self_attn.v_proj.bias": WeightMapping(target_path="encoder.layers.*.self_attn.v_proj.bias", sharding=()),
         "encoder.layers.*.self_attn.out_proj.weight": WeightMapping(target_path="encoder.layers.*.self_attn.out_proj.weight", transpose=True),
-        "encoder.layers.*.self_attn.out_proj.bias": WeightMapping(target_path="encoder.layers.*.self_attn.out_proj.bias"),
-        "encoder.layers.*.self_attn_layer_norm.weight": WeightMapping(target_path="encoder.layers.*.self_attn_layer_norm.scale"),
-        "encoder.layers.*.self_attn_layer_norm.bias": WeightMapping(target_path="encoder.layers.*.self_attn_layer_norm.bias"),
-        "encoder.layers.*.final_layer_norm.weight": WeightMapping(target_path="encoder.layers.*.final_layer_norm.scale"),
-        "encoder.layers.*.final_layer_norm.bias": WeightMapping(target_path="encoder.layers.*.final_layer_norm.bias"),
+        "encoder.layers.*.self_attn.out_proj.bias": WeightMapping(target_path="encoder.layers.*.self_attn.out_proj.bias", sharding=()),
+        "encoder.layers.*.self_attn_layer_norm.weight": WeightMapping(target_path="encoder.layers.*.self_attn_layer_norm.scale", sharding=()),
+        "encoder.layers.*.self_attn_layer_norm.bias": WeightMapping(target_path="encoder.layers.*.self_attn_layer_norm.bias", sharding=()),
+        "encoder.layers.*.final_layer_norm.weight": WeightMapping(target_path="encoder.layers.*.final_layer_norm.scale", sharding=()),
+        "encoder.layers.*.final_layer_norm.bias": WeightMapping(target_path="encoder.layers.*.final_layer_norm.bias", sharding=()),
         "encoder.layers.*.fc1.weight": WeightMapping(target_path="encoder.layers.*.fc1.weight", transpose=True),
-        "encoder.layers.*.fc1.bias": WeightMapping(target_path="encoder.layers.*.fc1.bias"),
+        "encoder.layers.*.fc1.bias": WeightMapping(target_path="encoder.layers.*.fc1.bias", sharding=()),
         "encoder.layers.*.fc2.weight": WeightMapping(target_path="encoder.layers.*.fc2.weight", transpose=True),
-        "encoder.layers.*.fc2.bias": WeightMapping(target_path="encoder.layers.*.fc2.bias"),
+        "encoder.layers.*.fc2.bias": WeightMapping(target_path="encoder.layers.*.fc2.bias", sharding=()),
         "encoder.down_sample_layer.0.weight": WeightMapping(target_path="encoder.down_sample_layer.kernel", transpose_axes=(2, 1, 0)),
-        "encoder.down_sample_norm.weight": WeightMapping(target_path="encoder.down_norm.scale"),
-        "encoder.down_sample_norm.bias": WeightMapping(target_path="encoder.down_norm.bias"),
-        "encoder.quantizer.vq.layers.*._codebook.embed": WeightMapping(target_path="encoder.quantizer.codebooks.*.embedding.embedding"),
+        "encoder.down_sample_norm.weight": WeightMapping(target_path="encoder.down_norm.scale", sharding=()),
+        "encoder.down_sample_norm.bias": WeightMapping(target_path="encoder.down_norm.bias", sharding=()),
+        # NOTE: codebook weights are loaded manually in load_weights() to avoid WeightLoader._get_param issues with nnx.List + Embed
         "decoder.dconv1.conv.weight": WeightMapping(target_path="decoder.dconv1.conv.kernel"),
-        "decoder.dconv1.conv.bias": WeightMapping(target_path="decoder.dconv1.conv.bias"),
-        "decoder.dconv1.norm.weight": WeightMapping(target_path="decoder.dconv1.norm.scale"),
-        "decoder.dconv1.norm.bias": WeightMapping(target_path="decoder.dconv1.norm.bias"),
-        "decoder.layer_norm.weight": WeightMapping(target_path="decoder.layer_norm.scale"),
-        "decoder.layer_norm.bias": WeightMapping(target_path="decoder.layer_norm.bias"),
+        "decoder.dconv1.conv.bias": WeightMapping(target_path="decoder.dconv1.conv.bias", sharding=()),
+        "decoder.dconv1.norm.weight": WeightMapping(target_path="decoder.dconv1.norm.scale", sharding=()),
+        "decoder.dconv1.norm.bias": WeightMapping(target_path="decoder.dconv1.norm.bias", sharding=()),
+        "decoder.layer_norm.weight": WeightMapping(target_path="decoder.layer_norm.scale", sharding=()),
+        "decoder.layer_norm.bias": WeightMapping(target_path="decoder.layer_norm.bias", sharding=()),
         "decoder.dconv2.conv.weight": WeightMapping(target_path="decoder.dconv2.conv.kernel"),
-        "decoder.dconv2.conv.bias": WeightMapping(target_path="decoder.dconv2.conv.bias"),
-        "decoder.dconv2.norm.weight": WeightMapping(target_path="decoder.dconv2.norm.scale"),
-        "decoder.dconv2.norm.bias": WeightMapping(target_path="decoder.dconv2.norm.bias"),
+        "decoder.dconv2.conv.bias": WeightMapping(target_path="decoder.dconv2.conv.bias", sharding=()),
+        "decoder.dconv2.norm.weight": WeightMapping(target_path="decoder.dconv2.norm.scale", sharding=()),
+        "decoder.dconv2.norm.bias": WeightMapping(target_path="decoder.dconv2.norm.bias", sharding=()),
         "decoder.layers.*.self_attn.q_proj.weight": WeightMapping(target_path="decoder.layers.*.self_attn.q_proj.weight", transpose=True),
-        "decoder.layers.*.self_attn.q_proj.bias": WeightMapping(target_path="decoder.layers.*.self_attn.q_proj.bias"),
+        "decoder.layers.*.self_attn.q_proj.bias": WeightMapping(target_path="decoder.layers.*.self_attn.q_proj.bias", sharding=()),
         "decoder.layers.*.self_attn.k_proj.weight": WeightMapping(target_path="decoder.layers.*.self_attn.k_proj.weight", transpose=True),
+        "decoder.layers.*.self_attn.k_proj.bias": WeightMapping(target_path="decoder.layers.*.self_attn.k_proj.bias", sharding=()),
         "decoder.layers.*.self_attn.v_proj.weight": WeightMapping(target_path="decoder.layers.*.self_attn.v_proj.weight", transpose=True),
-        "decoder.layers.*.self_attn.v_proj.bias": WeightMapping(target_path="decoder.layers.*.self_attn.v_proj.bias"),
+        "decoder.layers.*.self_attn.v_proj.bias": WeightMapping(target_path="decoder.layers.*.self_attn.v_proj.bias", sharding=()),
         "decoder.layers.*.self_attn.out_proj.weight": WeightMapping(target_path="decoder.layers.*.self_attn.out_proj.weight", transpose=True),
-        "decoder.layers.*.self_attn.out_proj.bias": WeightMapping(target_path="decoder.layers.*.self_attn.out_proj.bias"),
-        "decoder.layers.*.self_attn_layer_norm.weight": WeightMapping(target_path="decoder.layers.*.self_attn_layer_norm.scale"),
-        "decoder.layers.*.self_attn_layer_norm.bias": WeightMapping(target_path="decoder.layers.*.self_attn_layer_norm.bias"),
-        "decoder.layers.*.final_layer_norm.weight": WeightMapping(target_path="decoder.layers.*.final_layer_norm.scale"),
-        "decoder.layers.*.final_layer_norm.bias": WeightMapping(target_path="decoder.layers.*.final_layer_norm.bias"),
+        "decoder.layers.*.self_attn.out_proj.bias": WeightMapping(target_path="decoder.layers.*.self_attn.out_proj.bias", sharding=()),
+        "decoder.layers.*.self_attn_layer_norm.weight": WeightMapping(target_path="decoder.layers.*.self_attn_layer_norm.scale", sharding=()),
+        "decoder.layers.*.self_attn_layer_norm.bias": WeightMapping(target_path="decoder.layers.*.self_attn_layer_norm.bias", sharding=()),
+        "decoder.layers.*.final_layer_norm.weight": WeightMapping(target_path="decoder.layers.*.final_layer_norm.scale", sharding=()),
+        "decoder.layers.*.final_layer_norm.bias": WeightMapping(target_path="decoder.layers.*.final_layer_norm.bias", sharding=()),
         "decoder.layers.*.fc1.weight": WeightMapping(target_path="decoder.layers.*.fc1.weight", transpose=True),
-        "decoder.layers.*.fc1.bias": WeightMapping(target_path="decoder.layers.*.fc1.bias"),
+        "decoder.layers.*.fc1.bias": WeightMapping(target_path="decoder.layers.*.fc1.bias", sharding=()),
         "decoder.layers.*.fc2.weight": WeightMapping(target_path="decoder.layers.*.fc2.weight", transpose=True),
-        "decoder.layers.*.fc2.bias": WeightMapping(target_path="decoder.layers.*.fc2.bias"),
+        "decoder.layers.*.fc2.bias": WeightMapping(target_path="decoder.layers.*.fc2.bias", sharding=()),
         "decoder.vocoder.embeddings.weight": WeightMapping(target_path="decoder.vocoder.embeddings.weight", transpose=True),
-        "decoder.vocoder.layer_norm.weight": WeightMapping(target_path="decoder.vocoder.layer_norm.scale"),
-        "decoder.vocoder.layer_norm.bias": WeightMapping(target_path="decoder.vocoder.layer_norm.bias"),
+        "decoder.vocoder.layer_norm.weight": WeightMapping(target_path="decoder.vocoder.layer_norm.scale", sharding=()),
+        "decoder.vocoder.layer_norm.bias": WeightMapping(target_path="decoder.vocoder.layer_norm.bias", sharding=()),
         "decoder.vocoder.head.out.weight": WeightMapping(target_path="decoder.vocoder.head.linear.weight", transpose=True),
-        "decoder.vocoder.head.out.bias": WeightMapping(target_path="decoder.vocoder.head.linear.bias"),
-        "decoder.vocoder.head.istft.window": WeightMapping(target_path="decoder.vocoder.head.istft.window"),
+        "decoder.vocoder.head.out.bias": WeightMapping(target_path="decoder.vocoder.head.linear.bias", sharding=()),
+        "decoder.vocoder.head.istft.window": WeightMapping(target_path="decoder.vocoder.head.istft.window", sharding=()),
         "decoder.vocoder.layers.*.self_attn.q_proj.weight": WeightMapping(target_path="decoder.vocoder.layers.*.self_attn.q_proj.weight", transpose=True),
-        "decoder.vocoder.layers.*.self_attn.q_proj.bias": WeightMapping(target_path="decoder.vocoder.layers.*.self_attn.q_proj.bias"),
+        "decoder.vocoder.layers.*.self_attn.q_proj.bias": WeightMapping(target_path="decoder.vocoder.layers.*.self_attn.q_proj.bias", sharding=()),
         "decoder.vocoder.layers.*.self_attn.k_proj.weight": WeightMapping(target_path="decoder.vocoder.layers.*.self_attn.k_proj.weight", transpose=True),
+        "decoder.vocoder.layers.*.self_attn.k_proj.bias": WeightMapping(target_path="decoder.vocoder.layers.*.self_attn.k_proj.bias", sharding=()),
         "decoder.vocoder.layers.*.self_attn.v_proj.weight": WeightMapping(target_path="decoder.vocoder.layers.*.self_attn.v_proj.weight", transpose=True),
-        "decoder.vocoder.layers.*.self_attn.v_proj.bias": WeightMapping(target_path="decoder.vocoder.layers.*.self_attn.v_proj.bias"),
+        "decoder.vocoder.layers.*.self_attn.v_proj.bias": WeightMapping(target_path="decoder.vocoder.layers.*.self_attn.v_proj.bias", sharding=()),
         "decoder.vocoder.layers.*.self_attn.out_proj.weight": WeightMapping(target_path="decoder.vocoder.layers.*.self_attn.out_proj.weight", transpose=True),
-        "decoder.vocoder.layers.*.self_attn.out_proj.bias": WeightMapping(target_path="decoder.vocoder.layers.*.self_attn.out_proj.bias"),
-        "decoder.vocoder.layers.*.self_attn_layer_norm.weight": WeightMapping(target_path="decoder.vocoder.layers.*.self_attn_layer_norm.scale"),
-        "decoder.vocoder.layers.*.self_attn_layer_norm.bias": WeightMapping(target_path="decoder.vocoder.layers.*.self_attn_layer_norm.bias"),
-        "decoder.vocoder.layers.*.final_layer_norm.weight": WeightMapping(target_path="decoder.vocoder.layers.*.final_layer_norm.scale"),
-        "decoder.vocoder.layers.*.final_layer_norm.bias": WeightMapping(target_path="decoder.vocoder.layers.*.final_layer_norm.bias"),
+        "decoder.vocoder.layers.*.self_attn.out_proj.bias": WeightMapping(target_path="decoder.vocoder.layers.*.self_attn.out_proj.bias", sharding=()),
+        "decoder.vocoder.layers.*.self_attn_layer_norm.weight": WeightMapping(target_path="decoder.vocoder.layers.*.self_attn_layer_norm.scale", sharding=()),
+        "decoder.vocoder.layers.*.self_attn_layer_norm.bias": WeightMapping(target_path="decoder.vocoder.layers.*.self_attn_layer_norm.bias", sharding=()),
+        "decoder.vocoder.layers.*.final_layer_norm.weight": WeightMapping(target_path="decoder.vocoder.layers.*.final_layer_norm.scale", sharding=()),
+        "decoder.vocoder.layers.*.final_layer_norm.bias": WeightMapping(target_path="decoder.vocoder.layers.*.final_layer_norm.bias", sharding=()),
         "decoder.vocoder.layers.*.fc1.weight": WeightMapping(target_path="decoder.vocoder.layers.*.fc1.weight", transpose=True),
-        "decoder.vocoder.layers.*.fc1.bias": WeightMapping(target_path="decoder.vocoder.layers.*.fc1.bias"),
+        "decoder.vocoder.layers.*.fc1.bias": WeightMapping(target_path="decoder.vocoder.layers.*.fc1.bias", sharding=()),
         "decoder.vocoder.layers.*.fc2.weight": WeightMapping(target_path="decoder.vocoder.layers.*.fc2.weight", transpose=True),
-        "decoder.vocoder.layers.*.fc2.bias": WeightMapping(target_path="decoder.vocoder.layers.*.fc2.bias"),
+        "decoder.vocoder.layers.*.fc2.bias": WeightMapping(target_path="decoder.vocoder.layers.*.fc2.bias", sharding=()),
     }
     return mappings
 
@@ -979,6 +982,8 @@ class FlaxMiMoAudioTokenizer(nnx.Module):
         self.config = config
         self.mesh = mesh
         self.dtype = dtype
+        if rngs is None:
+            rngs = nnx.Rngs(0)
         self.encoder = AudioEncoder(config, mesh=mesh, dtype=dtype, rngs=rngs)
         self.decoder = AudioDecoder(config, mesh=mesh, dtype=dtype, rngs=rngs)
         self.downsample_rate = int(config.hop_length * 2 * config.avg_pooler)
@@ -1010,7 +1015,31 @@ class FlaxMiMoAudioTokenizer(nnx.Module):
     def load_weights(self, model_config):
         loader = WeightLoader(self, model_config, self.mesh, self.dtype)
         loader.load_weights_from_safetensors(to_mappings(self.config))
+        self._load_codebook_weights(model_config)
         self._init_rope_inv_freq()
+
+    def _load_codebook_weights(self, model_config):
+        """Manually load codebook weights since WeightLoader._get_param has issues with nnx.List + Embed."""
+        import os
+        from safetensors import safe_open
+
+        # Find safetensors file
+        model_path = model_config.model_path
+        if os.path.isdir(model_path):
+            safetensors_files = [f for f in os.listdir(model_path) if f.endswith(".safetensors")]
+            if not safetensors_files:
+                raise ValueError(f"No safetensors files found in {model_path}")
+            safetensors_path = os.path.join(model_path, safetensors_files[0])
+        else:
+            safetensors_path = model_path
+
+        # Load codebook weights
+        with safe_open(safetensors_path, framework="numpy") as f:
+            for i in range(self.config.num_quantizers):
+                hf_key = f"encoder.quantizer.vq.layers.{i}._codebook.embed"
+                if hf_key in f.keys():
+                    weight = jnp.array(f.get_tensor(hf_key), dtype=self.dtype)
+                    self.encoder.quantizer.codebooks[i].embedding.value = weight
 
     def _init_rope_inv_freq(self):
         config = self.config
