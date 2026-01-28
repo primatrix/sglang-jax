@@ -1,0 +1,11 @@
+model_arch: MiMo-Audio-Tokenizer
+stage_args:
+  - stage_id: 0
+    runtime:
+      num_tpus: 1
+      max_batch_size: 1
+      device_kind: cpu
+    scheduler: audio
+    scheduler_params: {}
+    model_class: FlaxMiMoAudioTokenizer
+    final_output: true
