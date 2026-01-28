@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import dataclasses
 import logging
 import signal
@@ -8,6 +9,7 @@ from http import HTTPStatus
 from typing import Any
 
 import fastapi
+import numpy as np
 import psutil
 import setproctitle
 from transformers import AutoImageProcessor
@@ -15,6 +17,10 @@ from transformers import AutoImageProcessor
 from sgl_jax.srt.managers.io_struct import AbortReq
 from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
 from sgl_jax.srt.multimodal.manager.io_struct import (
+    AudioDecodeRequest,
+    AudioDecodeResponse,
+    AudioEncodeRequest,
+    AudioEncodeResponse,
     GenerateMMReqInput,
     TokenizedGenerateMMReqInput,
 )
@@ -95,7 +101,15 @@ class MultimodalTokenizer(TokenizerManager):
             if req.rid in self.rid_to_state:
                 self.rid_to_state[req.rid].finished = True
                 self.rid_to_state[req.rid].event.set()
-                self.rid_to_state[req.rid].out_list = [{"success": True, "meta_info": {}}]
+
+                out_data = {"success": True, "meta_info": {}}
+                if hasattr(req, "audio_mode") and req.audio_mode is not None:
+                    if req.audio_mode == "encode" and req.output is not None:
+                        out_data["codes"] = req.output.tolist() if hasattr(req.output, "tolist") else req.output
+                    elif req.audio_mode == "decode" and req.output is not None:
+                        out_data["audio_data"] = req.output
+
+                self.rid_to_state[req.rid].out_list = [out_data]
             else:
                 logger.warning(
                     "Received result for unknown request rid=%s. Known rids: %s",
@@ -303,6 +317,136 @@ class MultimodalTokenizer(TokenizerManager):
                     raise ValueError(
                         f"Request is disconnected from the client side. Abort request rid={state.rid}"
                     )
+
+    async def encode_audio(
+        self,
+        obj: AudioEncodeRequest,
+        request: fastapi.Request | None = None,
+    ):
+        """Encode audio data to codes using the audio tokenizer.
+
+        Args:
+            obj: AudioEncodeRequest containing base64 encoded audio data.
+            request: FastAPI request object for disconnect handling.
+
+        Returns:
+            AudioEncodeResponse containing the encoded codes.
+        """
+        created_time = time.time()
+        async with self._cond:
+            await self._cond.wait_for(lambda: not self._updating)
+
+        self.auto_create_handle_loop()
+
+        rid = uuid.uuid4().hex
+
+        if obj.audio_data:
+            audio_bytes = base64.b64decode(obj.audio_data)
+            audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
+        else:
+            audio_array = np.zeros((1, 1), dtype=np.float32)
+
+        from sgl_jax.srt.multimodal.manager.schedule_batch import Req
+
+        audio_req = Req(
+            rid=rid,
+            audio_input=audio_array,
+            audio_mode="encode",
+            use_quantizer=obj.use_quantizer,
+            n_q=obj.n_q,
+            sample_rate=obj.sample_rate,
+        )
+
+        state = MMReqState(
+            rid=rid,
+            out_list=[],
+            finished=False,
+            event=asyncio.Event(),
+            obj=obj,
+            created_time=created_time,
+        )
+        self.rid_to_state[rid] = state
+
+        self.send_to_scheduler.send_pyobj(audio_req)
+
+        try:
+            await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)
+        except TimeoutError:
+            raise ValueError(f"Audio encode request timed out for rid={rid}") from None
+
+        del self.rid_to_state[rid]
+
+        out = state.out_list[-1] if state.out_list else {"success": True, "meta_info": {}}
+
+        return AudioEncodeResponse(
+            id=rid,
+            codes=out.get("codes"),
+            hidden_states_shape=out.get("hidden_states_shape"),
+        )
+
+    async def decode_audio(
+        self,
+        obj: AudioDecodeRequest,
+        request: fastapi.Request | None = None,
+    ):
+        """Decode codes to audio data using the audio tokenizer.
+
+        Args:
+            obj: AudioDecodeRequest containing the codes to decode.
+            request: FastAPI request object for disconnect handling.
+
+        Returns:
+            AudioDecodeResponse containing base64 encoded audio data.
+        """
+        created_time = time.time()
+        async with self._cond:
+            await self._cond.wait_for(lambda: not self._updating)
+
+        self.auto_create_handle_loop()
+
+        rid = uuid.uuid4().hex
+
+        codes_array = np.array(obj.codes, dtype=np.int32)
+
+        from sgl_jax.srt.multimodal.manager.schedule_batch import Req
+
+        audio_req = Req(
+            rid=rid,
+            codes=codes_array,
+            audio_mode="decode",
+        )
+
+        state = MMReqState(
+            rid=rid,
+            out_list=[],
+            finished=False,
+            event=asyncio.Event(),
+            obj=obj,
+            created_time=created_time,
+        )
+        self.rid_to_state[rid] = state
+
+        self.send_to_scheduler.send_pyobj(audio_req)
+
+        try:
+            await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)
+        except TimeoutError:
+            raise ValueError(f"Audio decode request timed out for rid={rid}") from None
+
+        del self.rid_to_state[rid]
+
+        out = state.out_list[-1] if state.out_list else {"success": True, "meta_info": {}}
+
+        audio_data_b64 = None
+        if out.get("audio_data") is not None:
+            audio_bytes = out["audio_data"].astype(np.float32).tobytes()
+            audio_data_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+        return AudioDecodeResponse(
+            id=rid,
+            audio_data=audio_data_b64,
+            sample_rate=24000,
+        )
 
 
 def run_multimodal_tokenizer_process(

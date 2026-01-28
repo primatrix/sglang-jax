@@ -51,15 +51,41 @@ class VideoResponse(BaseModel):
     path: str | None = None
 
 
+class AudioEncodeRequest(BaseModel):
+    audio_data: str  # base64 encoded audio
+    sample_rate: int = 24000
+    use_quantizer: bool = True
+    n_q: int | None = None
+
+
+class AudioDecodeRequest(BaseModel):
+    codes: list[list[int]]  # [n_q, seq_len]
+
+
+class AudioEncodeResponse(BaseModel):
+    id: str
+    codes: list[list[int]] | None = None
+    hidden_states_shape: list[int] | None = None
+
+
+class AudioDecodeResponse(BaseModel):
+    id: str
+    audio_data: str | None = None  # base64 encoded audio
+    sample_rate: int = 24000
+
+
 class DataType(Enum):
     IMAGE = auto()
     VIDEO = auto()
+    AUDIO = auto()
 
     def get_default_extension(self) -> str:
         if self == DataType.IMAGE:
             return "jpg"
-        else:
+        elif self == DataType.VIDEO:
             return "mp4"
+        else:
+            return "wav"
 
 
 @dataclasses.dataclass
