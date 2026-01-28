@@ -32,18 +32,30 @@ class StageConfigRegistry:
         "Wan2.2-T2V-A14B-Diffusers": "wan2_2_stage_config.yaml",
         "Wan-AI/Wan2.2-I2V-A14B-Diffusers": "wan2_2_stage_config.yaml",
         "Wan2.2-I2V-A14B-Diffusers": "wan2_2_stage_config.yaml",
-        # MiMo Audio Tokenizer
+        # MiMo Audio (unified multimodal model with encoder, backbone, decoder)
         "xiaomi/MiMo-Audio-Tokenizer": "mimo_audio_stage_config.yaml",
         "XiaomiMiMo/MiMo-Audio-Tokenizer": "mimo_audio_stage_config.yaml",
         "MiMo-Audio-Tokenizer": "mimo_audio_stage_config.yaml",
+        "xiaomi/MiMo-7B-RL": "mimo_audio_stage_config.yaml",
+        "MiMo-7B-RL": "mimo_audio_stage_config.yaml",
+        "xiaomi/MiMo-Audio": "mimo_audio_stage_config.yaml",
+        "MiMo-Audio": "mimo_audio_stage_config.yaml",
+        # MiMo Audio with actual HuggingFace repo names
+        "XiaomiMiMo/MiMo-Audio-7B-Instruct": "mimo_audio_stage_config.yaml",
+        "MiMo-Audio-7B-Instruct": "mimo_audio_stage_config.yaml",
     }
 
     # Keyword patterns for fallback matching (order matters - more specific first)
     _KEYWORD_PATTERNS: list[tuple[str, str]] = [
         ("Wan2.2", "wan2_2_stage_config.yaml"),
         ("Wan2.1", "wan2_1_stage_config.yaml"),
+        # MiMo Audio patterns (all use unified stage config)
+        ("MiMo-Audio-7B-Instruct", "mimo_audio_stage_config.yaml"),
+        ("MiMo-Audio-Tokenizer", "mimo_audio_stage_config.yaml"),
         ("MiMo-Audio", "mimo_audio_stage_config.yaml"),
         ("mimo-audio", "mimo_audio_stage_config.yaml"),
+        ("MiMo-7B", "mimo_audio_stage_config.yaml"),
+        ("mimo-7b", "mimo_audio_stage_config.yaml"),
     ]
 
     @classmethod
