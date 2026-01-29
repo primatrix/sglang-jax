@@ -146,6 +146,10 @@ class QuantizationConfig:
         if hf_quant_cfg is None:
             return None
 
+        # 如果已经是 QuantizationConfig 对象，直接返回（避免重复创建）
+        if isinstance(hf_quant_cfg, cls):
+            return hf_quant_cfg
+
         # 辅助函数：兼容 dict 和 object 访问
         def get_val(key, default=None):
             if isinstance(hf_quant_cfg, dict):
