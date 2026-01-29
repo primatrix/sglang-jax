@@ -141,11 +141,11 @@ class QuantizationConfig:
         return cls.from_yaml(config_path)
 
     @classmethod
-    def from_hf_config(cls, hf_quant_cfg: dict) -> "QuantizationConfig | None":
+    def from_hf_config(cls, hf_quant_cfg) -> "QuantizationConfig | None":
         """Create quantization config from HuggingFace model quantization_config.
 
         Args:
-            hf_quant_cfg: The quantization_config dict from HF model config
+            hf_quant_cfg: The quantization_config dict or object from HF model config
 
         Returns:
             QuantizationConfig if a supported quantization method is detected, None otherwise
@@ -153,7 +153,12 @@ class QuantizationConfig:
         if hf_quant_cfg is None:
             return None
 
-        quant_method = hf_quant_cfg.get("quant_method")
+        # Handle both dict and object types
+        if isinstance(hf_quant_cfg, dict):
+            quant_method = hf_quant_cfg.get("quant_method")
+        else:
+            # If it's an object (e.g., transformers QuantizationConfig), get attribute
+            quant_method = getattr(hf_quant_cfg, "quant_method", None)
 
         # Handle FP8 quantization (common in FP8 models)
         if quant_method in ["fp8", "fbgemm_fp8"]:

@@ -97,12 +97,14 @@ class ModelConfig:
         self.quantization_config = QuantizationConfig.from_path(quantization_config_path)
 
         # If no explicit quantization config provided, try to auto-detect from HF config
+        # IMPORTANT: Parse HF config BEFORE we overwrite hf_config.quantization_config
         if self.quantization_config is None:
             hf_quant_cfg = self._parse_quant_hf_config()
             if hf_quant_cfg is not None:
                 self.quantization_config = QuantizationConfig.from_hf_config(hf_quant_cfg)
 
         # Attach quantization config to hf_config so models can access it
+        # (This overwrites the original HF quantization_config, which is OK)
         self.hf_config.quantization_config = self.quantization_config
 
         self.hf_generation_config = get_generation_config(
