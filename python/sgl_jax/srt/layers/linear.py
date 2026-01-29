@@ -43,6 +43,10 @@ class LinearBase(nnx.Module):
         self.kernel_axes = kernel_axes
         self.mesh = mesh
         self.name = scope_name
+
+        self.in_features = input_size
+        self.out_features = output_size
+
         self.weight = nnx.Param(
             jax.random.normal(
                 jax.random.PRNGKey(0),
@@ -87,10 +91,6 @@ class LinearBase(nnx.Module):
 class QuantizedLinear(nnx.Module):
     """Quantized linear layer using native quantized matmul.
 
-    This layer stores pre-quantized weights and scales, and uses the native
-    quantized matmul kernel for the forward pass. Weights are quantized once
-    at initialization/conversion time, and activations are quantized at runtime.
-
     Args:
         weight_q: Quantized weight tensor [output_size, input_size]
         weight_scale: Weight quantization scale [output_size] for per-channel
@@ -116,7 +116,8 @@ class QuantizedLinear(nnx.Module):
         scope_name: str = "quantized_linear",
     ):
         """Initialize the quantized linear layer with pre-quantized weights."""
-        self.weight_q = nnx.Param(weight_q)
+        self.weight = nnx.Param(weight_q)
+
         self.weight_scale = nnx.Param(weight_scale)
         self.bias = nnx.Param(bias) if bias is not None else None
         self.activation_dtype = activation_dtype
@@ -126,13 +127,10 @@ class QuantizedLinear(nnx.Module):
         self.params_dtype = params_dtype
         self.name = scope_name
 
-        # Determine if we need tensor parallel reduction
-        # kernel_axes[0] is input axis, kernel_axes[1] is output axis
-        # For row-parallel (e.g., o_proj): kernel_axes = ("tensor", None)
-        #   -> input is sharded, need psum over "tensor"
-        # For column-parallel (e.g., q_proj): kernel_axes = (None, "tensor")
-        #   -> input is replicated, no psum needed
-        self.reduce_axis = kernel_axes[0]  # Axis to reduce over (or None)
+        self.reduce_axis = kernel_axes[0]
+
+        self.in_features = weight_q.shape[1]
+        self.out_features = weight_q.shape[0]
 
     @classmethod
     def from_linear(
@@ -141,34 +139,18 @@ class QuantizedLinear(nnx.Module):
         weight_dtype: jnp.dtype,
         activation_dtype: jnp.dtype | None = None,
     ) -> "QuantizedLinear":
-        """Convert a LinearBase layer to a QuantizedLinear layer.
-
-        Uses per-channel weight quantization and dynamic per-token activation quantization.
-
-        Args:
-            linear: The LinearBase layer to convert
-            weight_dtype: Target dtype for weight quantization (e.g., jnp.int8, jnp.float8_e4m3fn)
-            activation_dtype: Target dtype for activation quantization (None = no activation quantization)
-
-        Returns:
-            A new QuantizedLinear layer with quantized weights
-        """
+        """Convert a LinearBase layer to a QuantizedLinear layer."""
         # LinearBase weight shape: [input_size, output_size]
         # xla_quantized_matmul expects w_q: [output_size, input_size]
-        # So we need to transpose the weight before quantizing
         weight = linear.weight.value
-        weight_t = weight.T  # [output_size, input_size]
+        weight_t = weight.T
 
-        # Per-channel quantization along output dimension
-        # After transpose, output_size is axis 0, input_size is axis 1
-        # We want per-output-channel, so reduce along axis 1 (input features)
         weight_q, weight_scale = quantize_tensor(
             dtype=weight_dtype,
             tensor=weight_t,
             axis=1,
         )
 
-        # Get bias if it exists
         bias = linear.bias.value if linear.bias is not None else None
 
         return cls(
@@ -185,36 +167,14 @@ class QuantizedLinear(nnx.Module):
 
     @named_scope
     def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
-        """Forward pass using quantized matmul.
-
-        Args:
-            x: Input tensor [..., input_size]
-
-        Returns:
-            Tuple of (output, bias) where output is [..., output_size]
-            and bias is returned if skip_bias_add is True
-        """
-        # Determine if we should quantize activations
+        """Forward pass using quantized matmul."""
         quantize_activation = self.activation_dtype is not None
-
-        # Handle batched inputs by reshaping to 2D
         orig_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
 
-        # Use shard_map for local computation with single all-reduce
-        # kernel_axes[0] = input sharding axis (e.g., "tensor" for o_proj, None for q_proj)
-        # kernel_axes[1] = output sharding axis (e.g., None for o_proj, "tensor" for q_proj)
-        #
-        # Weight w_q has shape [output_size, input_size]
-        # After transpose from LinearBase, its sharding is P(kernel_axes[1], kernel_axes[0])
-        # e.g., for o_proj with kernel_axes=("tensor", None): w_q has P(None, "tensor")
         input_axis = self.kernel_axes[0]
         output_axis = self.kernel_axes[1]
 
-        # Input x sharding: for row-parallel, x is P(None, input_axis)
-        # Weight w_q sharding: P(output_axis, input_axis)
-        # Weight scale sharding: P(output_axis) - per output channel
-        # Output sharding: P(None, output_axis)
         in_specs = (
             P(None, input_axis),  # x
             P(output_axis, input_axis),  # w_q
@@ -226,19 +186,17 @@ class QuantizedLinear(nnx.Module):
             partial(
                 xla_quantized_matmul_local,
                 quantize_activation=quantize_activation,
-                reduce_axis=input_axis,  # psum over input axis (e.g., "tensor" for o_proj)
+                reduce_axis=input_axis,
             ),
             mesh=self.mesh,
             in_specs=in_specs,
             out_specs=out_specs,
             check_vma=False,
-        )(x_2d, self.weight_q.value, self.weight_scale.value)
+        )(x_2d, self.weight.value, self.weight_scale.value)
 
-        # Reshape back to original batch dimensions
         if x.ndim > 2:
             output = output.reshape(*orig_shape[:-1], output.shape[-1])
 
-        # Handle bias
         bias = self.bias if not self.skip_bias_add else None
         if bias is not None:
             output = output + bias.value
