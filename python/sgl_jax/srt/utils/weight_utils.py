@@ -11,6 +11,15 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+try:
+    if not hasattr(np, "float8_e4m3fn"):
+        np.float8_e4m3fn = np.uint8
+    if not hasattr(np, "float8_e5m2"):
+        np.float8_e5m2 = np.uint8
+except Exception:
+    pass
+
 from flax import nnx
 from jax.experimental import multihost_utils
 from jax.sharding import Mesh
