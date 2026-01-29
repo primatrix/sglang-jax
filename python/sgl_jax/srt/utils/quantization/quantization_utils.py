@@ -163,18 +163,39 @@ class Quantizer:
                                 rule["weight_dtype"],
                             )
 
-                            # Directly instantiate QuantizedLinear without converting weights
-                            # We assume QuantizedLinear.__init__ is compatible with LinearBase's params
-                            # plus the extra quantization args.
+                            # For structure replacement, we need to create placeholder weights
+                            # Extract dimensions from weight shape: (input_size, output_size)
+                            input_size, output_size = attr_value.weight.value.shape
+
+                            # Create ShapeDtypeStruct placeholders for quantized weights
+                            # QuantizedLinear expects weight_q: [output_size, input_size] (transposed)
+                            weight_q_struct = jax.ShapeDtypeStruct(
+                                (output_size, input_size),
+                                rule["weight_dtype"],
+                            )
+                            # Per-channel scale: [output_size]
+                            weight_scale_struct = jax.ShapeDtypeStruct(
+                                (output_size,),
+                                jnp.float32,
+                            )
+                            # Bias: [output_size] if exists
+                            bias_struct = None
+                            if attr_value.bias is not None:
+                                bias_struct = jax.ShapeDtypeStruct(
+                                    (output_size,),
+                                    attr_value.params_dtype,
+                                )
+
                             new_layer = QuantizedLinear(
-                                in_features=attr_value.in_features,
-                                out_features=attr_value.out_features,
-                                use_bias=attr_value.use_bias,
-                                dtype=attr_value.dtype,
-                                param_dtype=getattr(attr_value, "param_dtype", jnp.float32),
-                                weight_dtype=rule["weight_dtype"],
+                                weight_q=weight_q_struct,
+                                weight_scale=weight_scale_struct,
+                                bias=bias_struct,
                                 activation_dtype=rule["activation_dtype"],
-                                # Pass kernel_init/bias_init if needed, though they will be overwritten by load
+                                mesh=attr_value.mesh,
+                                kernel_axes=attr_value.kernel_axes,
+                                skip_bias_add=attr_value.skip_bias_add,
+                                params_dtype=attr_value.params_dtype,
+                                scope_name=getattr(attr_value, "name", "quantized_linear"),
                             )
 
                             setattr(obj, attr_name, new_layer)
