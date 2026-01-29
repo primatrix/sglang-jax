@@ -1396,9 +1396,8 @@ class ScheduleBatch:
         if self.forward_mode == ForwardMode.EXTEND:
             input_embedding_list = []
             for req, prefix_len, extend_len in zip(self.reqs, self.prefix_lens, self.extend_lens):
-                # Check for cached vision embeddings first (for chunked prefill)
-                if hasattr(req, "multimodal_embedding") and req.input_embedding is not None:
-                    mm_full = np.asarray(req.input_embedding)
+                if hasattr(req, "multimodal_embedding") and req.multimodal_embedding is not None:
+                    mm_full = np.asarray(req.multimodal_embedding)
                     start = int(prefix_len or 0)
                     end = start + int(extend_len or 0)
                     input_embedding_list.append(mm_full[start:end])
