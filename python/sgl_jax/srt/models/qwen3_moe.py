@@ -449,17 +449,16 @@ class Qwen3MoeForCausalLM(nnx.Module):
 
             if moe_backend == "epmoe":
                 # Scale sharding for EPMoE:
-                # From quantization_utils.py:
-                # - wi_0_scale: shape (E, 1, 1, I) with sharding ("expert", None, None, "tensor")
-                # - wi_1_scale: shape (E, 1, 1, I) with sharding ("expert", None, None, "tensor")
-                # - wo_scale: shape (E, 1, 1, O) with sharding ("expert", None, None, None)
-                if target_name == "wo":
-                    sharding = ("expert", None, None, None)
-                else:
-                    sharding = ("expert", None, None, "tensor")
+                # Note: Scales are loaded as 2D (num_experts, feature_dim) from safetensors
+                # They will be reshaped to 4D (num_experts, 1, 1, feature_dim) after loading
+                # So we use 2D sharding here:
+                # - wi_0_scale: shape (E, I) with sharding ("expert", "tensor")
+                # - wi_1_scale: shape (E, I) with sharding ("expert", "tensor")
+                # - wo_scale: shape (E, O) with sharding ("expert", None)
+                sharding = ("expert", None) if target_name == "wo" else ("expert", "tensor")
             elif moe_backend == "fused":
                 # TODO: Add FusedEPMoE scale sharding logic
-                sharding = (None, None, None, None)
+                sharding = (None, None)
 
             # Use __MOE_EXPERTS__ prefix to indicate aggregated MoE scale loading
             mappings[f"__MOE_EXPERTS__{target_path_base}"] = WeightMapping(

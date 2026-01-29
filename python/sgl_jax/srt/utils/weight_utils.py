@@ -877,6 +877,35 @@ class WeightLoader:
                     # 3. Direct assignment
                     target_path = mapping.target_path[0]
                     model_param = self._get_param(params, target_path)
+
+                    # Check if this is a scale parameter that needs reshaping from 2D to 4D
+                    if "_scale" in target_path and stacked_weight.ndim == 2:
+                        # Reshape (num_experts, feature_dim) -> (num_experts, 1, 1, feature_dim)
+                        # This is required for GMM kernels in EPMoE
+                        reshaped_data = stacked_weight.reshape(
+                            stacked_weight.shape[0], 1, 1, stacked_weight.shape[1]
+                        )
+
+                        # Update sharding to 4D: ("expert", None, None, "tensor") or ("expert", None, None, None)
+                        # Determine correct sharding based on original 2D sharding
+                        if len(mapping.sharding) >= 2 and mapping.sharding[1] == "tensor":
+                            target_sharding_4d = ("expert", None, None, "tensor")
+                        else:
+                            target_sharding_4d = ("expert", None, None, None)
+
+                        # Apply the new sharding
+                        target_sharding = jax.sharding.NamedSharding(
+                            final_sharding.mesh, P(*target_sharding_4d)
+                        )
+                        stacked_weight = jax.device_put(reshaped_data, target_sharding)
+
+                        logger.debug(
+                            "Reshaped MoE scale %s from 2D to 4D: %s with sharding %s",
+                            moe_key,
+                            stacked_weight.shape,
+                            target_sharding_4d,
+                        )
+
                     model_param.value = stacked_weight.astype(model_param.value.dtype)
 
                     logger.debug(
