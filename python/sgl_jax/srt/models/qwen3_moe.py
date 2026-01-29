@@ -551,6 +551,8 @@ class Qwen3MoeForCausalLM(nnx.Module):
                 ),
             }
             mappings.update(attn_scale_mappings)
+        else:
+            logger.info("No quantization scale mappings for attention layers")
 
         if getattr(self.config, "attention_bias", False):
             bias_mappings = {
