@@ -220,12 +220,19 @@ class JAXModelLoader(DefaultModelLoader):
                 )
             )
         if model_config.quantization_config is not None:
-            logger.info("Loader: Applying quantization")
+            logger.info(
+                "Loader: Applying quantization (config type: %s)",
+                type(model_config.quantization_config).__name__,
+            )
             quantizer = Quantizer(model_config)
             model = quantizer.apply_linear_quantization_structure(model)
             model = quantizer.apply_moe_quantization_structure(model)
         else:
-            logger.info("Loader: No quantization config found, skipping quantization")
+            logger.info(
+                "Loader: No quantization config found (model_config.quantization_config = %s, hf_config.quantization_config = %s)",
+                model_config.quantization_config,
+                getattr(model_config.hf_config, "quantization_config", None),
+            )
         model.load_weights(model_config)
         return model
 

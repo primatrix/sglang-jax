@@ -100,13 +100,29 @@ class ModelConfig:
         # IMPORTANT: Parse HF config BEFORE we overwrite hf_config.quantization_config
         if self.quantization_config is None:
             hf_quant_cfg = self._parse_quant_hf_config()
+            logger.info(
+                "ModelConfig: Parsed HF quant config: %s (type: %s)",
+                hf_quant_cfg,
+                type(hf_quant_cfg).__name__ if hf_quant_cfg is not None else "None",
+            )
             if hf_quant_cfg is not None:
                 self.quantization_config = QuantizationConfig.from_hf_config(hf_quant_cfg)
+                logger.info(
+                    "ModelConfig: Created QuantizationConfig from HF config: %s",
+                    self.quantization_config,
+                )
 
         # Attach quantization config to hf_config so models can access it
         # (This overwrites the original HF quantization_config, which is OK)
         if self.quantization_config is not None:
             self.hf_config.quantization_config = self.quantization_config
+            logger.info(
+                "ModelConfig: Attached quantization_config to hf_config (has_linear=%s, has_moe=%s)",
+                self.quantization_config.has_linear_quantization(),
+                self.quantization_config.has_moe_quantization(),
+            )
+        else:
+            logger.info("ModelConfig: No quantization config to attach")
 
         self.hf_generation_config = get_generation_config(
             config_path,
