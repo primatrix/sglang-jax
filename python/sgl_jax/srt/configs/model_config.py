@@ -64,8 +64,6 @@ class ModelConfig:
         self.model_impl = model_impl
         self.quantization = quantization
         self.quantization_config_path = quantization_config_path
-        # Create unified quantization config from path
-        self.quantization_config = QuantizationConfig.from_path(quantization_config_path)
         # if ep_size > 1, use ep moe, else use fused moe
         # TODO: support ep moe with ETP
         self.ep_size = 1
@@ -94,6 +92,15 @@ class ModelConfig:
             model_override_args=self.model_override_args,
             **kwargs,
         )
+
+        # Create unified quantization config from path or auto-detect from HF config
+        self.quantization_config = QuantizationConfig.from_path(quantization_config_path)
+
+        # If no explicit quantization config provided, try to auto-detect from HF config
+        if self.quantization_config is None:
+            hf_quant_cfg = self._parse_quant_hf_config()
+            if hf_quant_cfg is not None:
+                self.quantization_config = QuantizationConfig.from_hf_config(hf_quant_cfg)
 
         # Attach quantization config to hf_config so models can access it
         self.hf_config.quantization_config = self.quantization_config

@@ -140,6 +140,43 @@ class QuantizationConfig:
             return None
         return cls.from_yaml(config_path)
 
+    @classmethod
+    def from_hf_config(cls, hf_quant_cfg: dict) -> "QuantizationConfig | None":
+        """Create quantization config from HuggingFace model quantization_config.
+
+        Args:
+            hf_quant_cfg: The quantization_config dict from HF model config
+
+        Returns:
+            QuantizationConfig if a supported quantization method is detected, None otherwise
+        """
+        if hf_quant_cfg is None:
+            return None
+
+        quant_method = hf_quant_cfg.get("quant_method")
+
+        # Handle FP8 quantization (common in FP8 models)
+        if quant_method in ["fp8", "fbgemm_fp8"]:
+            # For FP8 models, quantize all linear layers and MoE layers
+            linear_rules = [
+                {
+                    "module_path": ".*",  # Match all layers
+                    "weight_dtype": "float8_e4m3fn",
+                    "activation_dtype": None,  # Weight-only quantization
+                }
+            ]
+
+            return cls(
+                linear_rules=linear_rules,
+                moe_weight_dtype=jnp.float8_e4m3fn,
+                moe_activation_dtype=None,
+            )
+
+        # Handle other quantization methods here in the future
+        # (e.g., int8, modelopt, etc.)
+
+        return None
+
     def get_moe_weight_dtype(self) -> jnp.dtype | None:
         """Get the dtype for MoE weight quantization."""
         return self.moe_weight_dtype

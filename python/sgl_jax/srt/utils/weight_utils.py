@@ -242,17 +242,17 @@ class WeightLoader:
                 # Fallback: Load full tensor on every host (Replicated)
                 sharding = jax.sharding.NamedSharding(self.mesh, P())
 
-            def _make_load_slice(fname=filename, fm=file_manager):
+            def _make_load_slice(fname=filename, fm=file_manager, dtype=target_dtype):
                 def _load_slice(index):
                     # index is the slice required by the current host based on 'sharding'
                     f = fm.get_handle(fname)
-                    return f.get_slice(hf_key)[index]
+                    data = f.get_slice(hf_key)[index]
+                    # Convert to JAX array with proper dtype handling for FP8
+                    return jnp.asarray(data, dtype=dtype)
 
                 return _load_slice
 
-            lazy_array = jax.make_array_from_callback(shape, sharding, _make_load_slice()).astype(
-                target_dtype
-            )
+            lazy_array = jax.make_array_from_callback(shape, sharding, _make_load_slice())
 
             lazy_arrays.append(lazy_array)
 
@@ -344,18 +344,19 @@ class WeightLoader:
                     collected_chunks.append(chunk)
 
             if not collected_chunks:
-                return np.zeros((0,) * len(global_shape), dtype=np.float32)
+                return jnp.zeros((0,) * len(global_shape), dtype=target_dtype)
 
             if len(collected_chunks) == 1:
                 # Perfect match (1-to-1 mapping), no copy needed
-                return collected_chunks[0]
+                result = collected_chunks[0]
             else:
                 # Cross-file boundary (rare if TP matches), needs stitching
-                return np.concatenate(collected_chunks, axis=concat_axis)
+                result = np.concatenate(collected_chunks, axis=concat_axis)
 
-        return jax.make_array_from_callback(global_shape, sharding, _smart_load_slice).astype(
-            target_dtype
-        )
+            # Convert to JAX array with proper dtype handling for FP8
+            return jnp.asarray(result, dtype=target_dtype)
+
+        return jax.make_array_from_callback(global_shape, sharding, _smart_load_slice)
 
     def _create_stacked_split_moe_lazy_tensor(
         self,
@@ -536,12 +537,11 @@ class WeightLoader:
                 expert_data = _load_single_expert_slice(expert_idx, original_inner_slice)
                 expert_slices.append(expert_data)
 
-            # Stack all experts together
-            return np.stack(expert_slices, axis=0)
+            # Stack all experts together and convert to JAX array with proper dtype
+            result = np.stack(expert_slices, axis=0)
+            return jnp.asarray(result, dtype=target_dtype)
 
-        return jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice).astype(
-            target_dtype
-        )
+        return jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice)
 
     def _create_stacked_moe_lazy_tensor(
         self,
@@ -655,11 +655,10 @@ class WeightLoader:
                 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                     list(executor.map(load_one_expert, tasks))
 
-            return out_array
+            # Convert to JAX array with proper dtype handling for FP8
+            return jnp.asarray(out_array, dtype=target_dtype)
 
-        return jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice).astype(
-            target_dtype
-        )
+        return jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice)
 
     def load_weights_from_safetensors(
         self,
