@@ -81,7 +81,7 @@ class SequentialSafetensorManager:
         if filename not in self.handles:
             # Keep the file open. framework="np" is crucial for JAX interop.
             # device="cpu" ensures we don't accidentally alloc on GPU/TPU here.
-            self.handles[filename] = safe_open(filename, framework="np", device="cpu")
+            self.handles[filename] = safe_open(filename, framework="flax", device="cpu")
         return self.handles[filename]
 
     def close_all(self):
@@ -211,12 +211,7 @@ class WeightLoader:
         file_manager: SequentialSafetensorManager,
         target_sharding: jax.sharding.NamedSharding = None,
     ) -> list[jax.Array]:
-        """
-        Create a list of JAX arrays that lazy load data from safetensors via callback.
-        Supports 'Global Loading' via target_sharding to avoid redundant I/O.
-        """
         lazy_arrays = []
-
         for info in infos:
             shape = info["shape"]
             st_dtype = info["dtype"]
@@ -232,43 +227,24 @@ class WeightLoader:
                 "BOOL": jnp.bool_,
             }
             target_dtype = dtype_map.get(st_dtype, jnp.float32)
-
             filename = info["file"]
+            sharding = (
+                target_sharding
+                if target_sharding is not None
+                else jax.sharding.NamedSharding(self.mesh, P())
+            )
 
-            if target_sharding is not None:
-                # Load only what this host needs (Global Loading)
-                sharding = target_sharding
-            else:
-                # Fallback: Load full tensor on every host (Replicated)
-                sharding = jax.sharding.NamedSharding(self.mesh, P())
-
-            def _make_load_slice(
-                fname=filename, fm=file_manager, dtype=target_dtype, st_dtype_str=st_dtype
-            ):
+            def _make_load_slice(fname=filename, fm=file_manager, dtype=target_dtype):
                 def _load_slice(index):
-                    # index is the slice required by the current host based on 'sharding'
                     f = fm.get_handle(fname)
-
-                    # For FP8 types, safetensors with old NumPy versions will fail
-                    # So we need to read as raw bytes and convert in JAX
-                    if st_dtype_str in ("F8_E4M3", "F8_E5M2"):
-                        # Read entire tensor first (safetensors limitation with FP8)
-                        # Then slice and convert in JAX which has proper FP8 support
-                        full_data = f.get_tensor(hf_key)
-                        # Convert to JAX array first, then slice
-                        jax_data = jnp.asarray(full_data, dtype=dtype)
-                        return jax_data[index]
-                    else:
-                        # For non-FP8 types, can directly slice from safetensors
-                        data = f.get_slice(hf_key)[index]
-                        return jnp.asarray(data, dtype=dtype)
+                    # 【修复】统一使用 get_slice 绕过 numpy.float8 检查
+                    data = f.get_slice(hf_key)[index]
+                    return jnp.asarray(data, dtype=dtype)
 
                 return _load_slice
 
             lazy_array = jax.make_array_from_callback(shape, sharding, _make_load_slice())
-
             lazy_arrays.append(lazy_array)
-
         return lazy_arrays
 
     def _create_split_lazy_tensor(
@@ -351,15 +327,8 @@ class WeightLoader:
                     file_read_index[concat_axis] = slice(local_start, local_end)
                     file_read_index = tuple(file_read_index)
 
-                    # Read chunk - handle FP8 types specially
                     f = file_manager.get_handle(info["file"])
-                    if st_dtype in ("F8_E4M3", "F8_E5M2"):
-                        # For FP8, read full tensor then slice in JAX
-                        full_chunk = f.get_tensor(hf_key)
-                        jax_chunk = jnp.asarray(full_chunk, dtype=target_dtype)
-                        chunk = jax_chunk[file_read_index]
-                    else:
-                        chunk = f.get_slice(hf_key)[file_read_index]
+                    chunk = f.get_slice(hf_key)[file_read_index]
                     collected_chunks.append(chunk)
 
             if not collected_chunks:
@@ -370,7 +339,7 @@ class WeightLoader:
                 result = collected_chunks[0]
             else:
                 # Cross-file boundary (rare if TP matches), needs stitching
-                result = np.concatenate(collected_chunks, axis=concat_axis)
+                result = jnp.concatenate(collected_chunks, axis=concat_axis)
 
             # Convert to JAX array with proper dtype handling for FP8
             return jnp.asarray(result, dtype=target_dtype)
@@ -505,15 +474,8 @@ class WeightLoader:
                     file_read_index[effective_concat_axis] = slice(local_start, local_end)
                     file_read_index = tuple(file_read_index)
 
-                    # Read chunk - handle FP8 types specially
                     f = file_manager.get_handle(info["file"])
-                    if st_dtype in ("F8_E4M3", "F8_E5M2"):
-                        # For FP8, read full tensor then slice in JAX
-                        full_chunk = f.get_tensor(hf_key)
-                        jax_chunk = jnp.asarray(full_chunk, dtype=target_dtype)
-                        chunk = jax_chunk[file_read_index]
-                    else:
-                        chunk = f.get_slice(hf_key)[file_read_index]
+                    chunk = f.get_slice(hf_key)[file_read_index]
                     collected_chunks.append(chunk)
 
             if not collected_chunks:
@@ -523,11 +485,11 @@ class WeightLoader:
                 result = collected_chunks[0]
             else:
                 # Cross-file boundary, needs stitching
-                result = np.concatenate(collected_chunks, axis=effective_concat_axis)
+                result = jnp.concatenate(collected_chunks, axis=effective_concat_axis)
 
             # Apply transpose if needed
             if do_transpose:
-                result = np.transpose(result)
+                result = jnp.transpose(result)
 
             return result
 
@@ -563,8 +525,7 @@ class WeightLoader:
                 expert_slices.append(expert_data)
 
             # Stack all experts together and convert to JAX array with proper dtype
-            result = np.stack(expert_slices, axis=0)
-            return jnp.asarray(result, dtype=target_dtype)
+            return jnp.stack(expert_slices, axis=0).astype(target_dtype)
 
         return jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice)
 
@@ -640,57 +601,24 @@ class WeightLoader:
             if sliced_num_experts == 0:
                 return np.zeros((0, *[1] * len(inner_slice)), dtype=np.float32)
 
-            first_idx = expert_indices[0]
-            first_hf_key = expected_hf_keys[first_idx]
-
-            fname_first = weight_info[first_hf_key][0]["file"]
-            f_first = file_manager.get_handle(fname_first)
-
-            # Read raw data - handle FP8 types
-            if st_dtype in ("F8_E4M3", "F8_E5M2"):
-                first_data = f_first.get_tensor(first_hf_key)
-                first_data = jnp.asarray(first_data, dtype=target_dtype)
-            else:
-                first_data = f_first.get_slice(first_hf_key)[:]
-
-            # Process first data (transpose if needed) to determine final buffer properties
-            first_data_processed = np.transpose(first_data) if do_transpose else first_data
-
-            # Slice according to inner_slice to determine the exact shape required
-            first_final_chunk = first_data_processed[inner_slice]
-
-            out_shape = (sliced_num_experts, *first_final_chunk.shape)
-            out_array = np.empty(out_shape, dtype=first_final_chunk.dtype)
-
-            # Fill the first slot
-            out_array[0] = first_final_chunk
-
-            def load_one_expert(args):
-                i, expert_idx = args
+            def load_one_expert(expert_idx):
                 hf_key = expected_hf_keys[expert_idx]
                 fname = weight_info[hf_key][0]["file"]
                 f = file_manager.get_handle(fname)
 
-                # Read data - handle FP8 types
-                if st_dtype in ("F8_E4M3", "F8_E5M2"):
-                    data = f.get_tensor(hf_key)
-                    data = jnp.asarray(data, dtype=target_dtype)
-                else:
-                    data = f.get_slice(hf_key)[:]
+                data = f.get_slice(hf_key)[:]
+
                 if do_transpose:
-                    data = np.transpose(data)
-                out_array[i] = data[inner_slice]
+                    data = jnp.transpose(data)
 
-            tasks = []
-            for i, expert_idx in enumerate(expert_indices[1:], start=1):
-                tasks.append((i, expert_idx))
+                return data[inner_slice]
 
-            if tasks:
-                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                    list(executor.map(load_one_expert, tasks))
+            results = []
 
-            # Convert to JAX array with proper dtype handling for FP8
-            return jnp.asarray(out_array, dtype=target_dtype)
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                results = list(executor.map(load_one_expert, expert_indices))
+
+            return jnp.stack(results, axis=0).astype(target_dtype)
 
         return jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice)
 
