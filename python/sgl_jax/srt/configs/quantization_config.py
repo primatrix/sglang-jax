@@ -142,43 +142,65 @@ class QuantizationConfig:
 
     @classmethod
     def from_hf_config(cls, hf_quant_cfg) -> "QuantizationConfig | None":
-        """Create quantization config from HuggingFace model quantization_config.
-
-        Args:
-            hf_quant_cfg: The quantization_config dict or object from HF model config
-
-        Returns:
-            QuantizationConfig if a supported quantization method is detected, None otherwise
-        """
+        """Create quantization config from HuggingFace model quantization_config."""
         if hf_quant_cfg is None:
             return None
 
-        # Handle both dict and object types
-        if isinstance(hf_quant_cfg, dict):
-            quant_method = hf_quant_cfg.get("quant_method")
-        else:
-            # If it's an object (e.g., transformers QuantizationConfig), get attribute
-            quant_method = getattr(hf_quant_cfg, "quant_method", None)
+        # 辅助函数：兼容 dict 和 object 访问
+        def get_val(key, default=None):
+            if isinstance(hf_quant_cfg, dict):
+                return hf_quant_cfg.get(key, default)
+            return getattr(hf_quant_cfg, key, default)
 
-        # Handle FP8 quantization (common in FP8 models)
+        quant_method = get_val("quant_method")
+
+        # 统一转小写比较
+        if quant_method is not None:
+            quant_method = str(quant_method).lower()
+
+        # === 核心修复：增加对 fp8 的支持 ===
         if quant_method in ["fp8", "fbgemm_fp8"]:
-            # For FP8 models, quantize all linear layers and MoE layers
+            import re
+
+            # 1. 决定激活是否量化 (W8A8 还是 W8A16)
+            # config.json 里有 "activation_scheme": "dynamic" -> 使用 float8_e4m3fn
+            activation_scheme = get_val("activation_scheme", "dynamic")
+            if activation_scheme in ["static", "dynamic"]:
+                # W8A8 模式：激活也是 FP8，利用 Tensor Core 加速
+                act_dtype_str = "float8_e4m3fn"
+                moe_act_dtype = jnp.float8_e4m3fn
+            else:
+                # Weight-Only 模式
+                act_dtype_str = None
+                moe_act_dtype = None
+
+            # 2. 处理黑名单 (modules_to_not_convert)
+            # 这一点非常重要！你的 config.json 里排除了 lm_head 和 gate
+            modules_to_not_convert = get_val("modules_to_not_convert", [])
+
+            if modules_to_not_convert:
+                # 构建正则表达式：匹配所有“不包含”黑名单关键词的层
+                # Regex 逻辑：^(?!.*(lm_head|gate|layernorm)).*$
+                safe_modules = [re.escape(m) for m in modules_to_not_convert]
+                excluded_pattern = "|".join(safe_modules)
+                regex = f"^(?!.*({excluded_pattern})).*$"
+            else:
+                regex = ".*"
+
+            # 3. 生成线性层量化规则
             linear_rules = [
                 {
-                    "module_path": ".*",  # Match all layers
+                    "module_path": regex,  # 应用上面的正则
                     "weight_dtype": "float8_e4m3fn",
-                    "activation_dtype": None,  # Weight-only quantization
+                    "activation_dtype": act_dtype_str,
                 }
             ]
 
             return cls(
                 linear_rules=linear_rules,
                 moe_weight_dtype=jnp.float8_e4m3fn,
-                moe_activation_dtype=None,
+                moe_activation_dtype=moe_act_dtype,
             )
-
-        # Handle other quantization methods here in the future
-        # (e.g., int8, modelopt, etc.)
 
         return None
 
