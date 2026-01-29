@@ -242,13 +242,26 @@ class WeightLoader:
                 # Fallback: Load full tensor on every host (Replicated)
                 sharding = jax.sharding.NamedSharding(self.mesh, P())
 
-            def _make_load_slice(fname=filename, fm=file_manager, dtype=target_dtype):
+            def _make_load_slice(
+                fname=filename, fm=file_manager, dtype=target_dtype, st_dtype_str=st_dtype
+            ):
                 def _load_slice(index):
                     # index is the slice required by the current host based on 'sharding'
                     f = fm.get_handle(fname)
-                    data = f.get_slice(hf_key)[index]
-                    # Convert to JAX array with proper dtype handling for FP8
-                    return jnp.asarray(data, dtype=dtype)
+
+                    # For FP8 types, safetensors with old NumPy versions will fail
+                    # So we need to read as raw bytes and convert in JAX
+                    if st_dtype_str in ("F8_E4M3", "F8_E5M2"):
+                        # Read entire tensor first (safetensors limitation with FP8)
+                        # Then slice and convert in JAX which has proper FP8 support
+                        full_data = f.get_tensor(hf_key)
+                        # Convert to JAX array first, then slice
+                        jax_data = jnp.asarray(full_data, dtype=dtype)
+                        return jax_data[index]
+                    else:
+                        # For non-FP8 types, can directly slice from safetensors
+                        data = f.get_slice(hf_key)[index]
+                        return jnp.asarray(data, dtype=dtype)
 
                 return _load_slice
 
@@ -338,9 +351,15 @@ class WeightLoader:
                     file_read_index[concat_axis] = slice(local_start, local_end)
                     file_read_index = tuple(file_read_index)
 
-                    # Read directly
+                    # Read chunk - handle FP8 types specially
                     f = file_manager.get_handle(info["file"])
-                    chunk = f.get_slice(hf_key)[file_read_index]
+                    if st_dtype in ("F8_E4M3", "F8_E5M2"):
+                        # For FP8, read full tensor then slice in JAX
+                        full_chunk = f.get_tensor(hf_key)
+                        jax_chunk = jnp.asarray(full_chunk, dtype=target_dtype)
+                        chunk = jax_chunk[file_read_index]
+                    else:
+                        chunk = f.get_slice(hf_key)[file_read_index]
                     collected_chunks.append(chunk)
 
             if not collected_chunks:
@@ -486,9 +505,15 @@ class WeightLoader:
                     file_read_index[effective_concat_axis] = slice(local_start, local_end)
                     file_read_index = tuple(file_read_index)
 
-                    # Read directly
+                    # Read chunk - handle FP8 types specially
                     f = file_manager.get_handle(info["file"])
-                    chunk = f.get_slice(hf_key)[file_read_index]
+                    if st_dtype in ("F8_E4M3", "F8_E5M2"):
+                        # For FP8, read full tensor then slice in JAX
+                        full_chunk = f.get_tensor(hf_key)
+                        jax_chunk = jnp.asarray(full_chunk, dtype=target_dtype)
+                        chunk = jax_chunk[file_read_index]
+                    else:
+                        chunk = f.get_slice(hf_key)[file_read_index]
                     collected_chunks.append(chunk)
 
             if not collected_chunks:
@@ -621,8 +646,12 @@ class WeightLoader:
             fname_first = weight_info[first_hf_key][0]["file"]
             f_first = file_manager.get_handle(fname_first)
 
-            # Read raw data
-            first_data = f_first.get_slice(first_hf_key)[:]
+            # Read raw data - handle FP8 types
+            if st_dtype in ("F8_E4M3", "F8_E5M2"):
+                first_data = f_first.get_tensor(first_hf_key)
+                first_data = jnp.asarray(first_data, dtype=target_dtype)
+            else:
+                first_data = f_first.get_slice(first_hf_key)[:]
 
             # Process first data (transpose if needed) to determine final buffer properties
             first_data_processed = np.transpose(first_data) if do_transpose else first_data
@@ -642,7 +671,12 @@ class WeightLoader:
                 fname = weight_info[hf_key][0]["file"]
                 f = file_manager.get_handle(fname)
 
-                data = f.get_slice(hf_key)[:]
+                # Read data - handle FP8 types
+                if st_dtype in ("F8_E4M3", "F8_E5M2"):
+                    data = f.get_tensor(hf_key)
+                    data = jnp.asarray(data, dtype=target_dtype)
+                else:
+                    data = f.get_slice(hf_key)[:]
                 if do_transpose:
                     data = np.transpose(data)
                 out_array[i] = data[inner_slice]
