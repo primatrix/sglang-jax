@@ -407,6 +407,70 @@ class Qwen3MoeForCausalLM(nnx.Module):
 
         return mappings
 
+    def _create_moe_scale_mappings(
+        self,
+        prefix: str,
+        target_prefix: str,
+        num_experts: int,
+        moe_backend: str = "epmoe",
+    ) -> dict:
+        """Generate scale mappings for quantized MOE expert weights.
+
+        Maps HF format: model.layers.{i}.mlp.experts.{j}.{gate/up/down}_proj.weight_scale_inv
+        To JAX format: model.layers.{i}.mlp.{wi_0/wi_1/wo}_scale
+        """
+        if moe_backend == "epmoe":
+            # EPMoE uses wi_0, wi_1, wo naming
+            scale_type_map = {
+                "gate_proj": "wi_0",
+                "up_proj": "wi_1",
+                "down_proj": "wo",
+            }
+        elif moe_backend == "fused":
+            # FusedEPMoE uses w1, w3, w2 naming
+            scale_type_map = {
+                "gate_proj": "w1",
+                "up_proj": "w3",
+                "down_proj": "w2",
+            }
+        else:
+            raise ValueError(f"Unsupported MoE backend: {moe_backend}")
+
+        mappings = {}
+        for source_name, target_name in scale_type_map.items():
+            # Target path for scale parameter
+            target_path_base = f"{target_prefix}.mlp.{target_name}_scale"
+
+            # Source scale paths for all experts to be stacked
+            expert_scale_keys = [
+                f"{prefix}.mlp.experts.{i}.{source_name}.weight_scale_inv"
+                for i in range(num_experts)
+            ]
+
+            if moe_backend == "epmoe":
+                # Scale sharding for EPMoE:
+                # From quantization_utils.py:
+                # - wi_0_scale: shape (E, 1, 1, I) with sharding ("expert", None, None, "tensor")
+                # - wi_1_scale: shape (E, 1, 1, I) with sharding ("expert", None, None, "tensor")
+                # - wo_scale: shape (E, 1, 1, O) with sharding ("expert", None, None, None)
+                if target_name == "wo":
+                    sharding = ("expert", None, None, None)
+                else:
+                    sharding = ("expert", None, None, "tensor")
+            elif moe_backend == "fused":
+                # TODO: Add FusedEPMoE scale sharding logic
+                sharding = (None, None, None, None)
+
+            # Use __MOE_EXPERTS__ prefix to indicate aggregated MoE scale loading
+            mappings[f"__MOE_EXPERTS__{target_path_base}"] = WeightMapping(
+                target_path=[target_path_base] + expert_scale_keys,
+                sharding=sharding,
+                transpose=False,
+                concat_axis=None,  # Stack along new dimension (expert dimension)
+            )
+
+        return mappings
+
     def _create_moe_layer_mappings(self, layer_idx: int, is_mlp_layer: bool) -> dict:
         prefix = f"model.layers.{layer_idx}"
         target_prefix = f"model.layers.{layer_idx}"
@@ -456,6 +520,38 @@ class Qwen3MoeForCausalLM(nnx.Module):
             ),
         }
 
+        # Add quantization scale mappings for attention layers if quantization is enabled
+        if (
+            hasattr(self.config, "quantization_config")
+            and self.config.quantization_config is not None
+        ):
+            logger.info("Adding quantization scale mappings for attention layers")
+            attn_scale_mappings = {
+                f"{prefix}.self_attn.q_proj.weight_scale_inv": WeightMapping(
+                    target_path=f"{target_prefix}.self_attn.q_proj.weight_scale",
+                    sharding=(None, "tensor"),
+                    transpose=True,
+                ),
+                f"{prefix}.self_attn.k_proj.weight_scale_inv": WeightMapping(
+                    target_path=f"{target_prefix}.self_attn.k_proj.weight_scale",
+                    sharding=(None, "tensor"),
+                    transpose=True,
+                    kv_head_padding=True,
+                ),
+                f"{prefix}.self_attn.v_proj.weight_scale_inv": WeightMapping(
+                    target_path=f"{target_prefix}.self_attn.v_proj.weight_scale",
+                    sharding=(None, "tensor"),
+                    transpose=True,
+                    kv_head_padding=True,
+                ),
+                f"{prefix}.self_attn.o_proj.weight_scale_inv": WeightMapping(
+                    target_path=f"{target_prefix}.self_attn.c_proj.weight_scale",
+                    sharding=("tensor", None),
+                    transpose=True,
+                ),
+            }
+            mappings.update(attn_scale_mappings)
+
         if getattr(self.config, "attention_bias", False):
             bias_mappings = {
                 f"{prefix}.self_attn.q_proj.bias": WeightMapping(
@@ -502,6 +598,30 @@ class Qwen3MoeForCausalLM(nnx.Module):
                 ),
             }
             mappings.update(mlp_mappings)
+
+            # Add quantization scale mappings for MLP layers if quantization is enabled
+            if (
+                hasattr(self.config, "quantization_config")
+                and self.config.quantization_config is not None
+            ):
+                mlp_scale_mappings = {
+                    f"{prefix}.mlp.gate_proj.weight_scale_inv": WeightMapping(
+                        target_path=f"{target_prefix}.mlp.gate_proj.weight_scale",
+                        sharding=(None, "tensor"),
+                        transpose=True,
+                    ),
+                    f"{prefix}.mlp.up_proj.weight_scale_inv": WeightMapping(
+                        target_path=f"{target_prefix}.mlp.up_proj.weight_scale",
+                        sharding=(None, "tensor"),
+                        transpose=True,
+                    ),
+                    f"{prefix}.mlp.down_proj.weight_scale_inv": WeightMapping(
+                        target_path=f"{target_prefix}.mlp.down_proj.weight_scale",
+                        sharding=("tensor", None),
+                        transpose=True,
+                    ),
+                }
+                mappings.update(mlp_scale_mappings)
         else:
             mappings[f"{prefix}.mlp.gate.weight"] = WeightMapping(
                 target_path=f"{target_prefix}.moe_gate.kernel",
@@ -521,6 +641,19 @@ class Qwen3MoeForCausalLM(nnx.Module):
                 source_expert_pattern="experts.{i}",
             )
             mappings.update(moe_mappings)
+
+            # Add quantization scale mappings for MOE layers if quantization is enabled
+            if (
+                hasattr(self.config, "quantization_config")
+                and self.config.quantization_config is not None
+            ):
+                moe_scale_mappings = self._create_moe_scale_mappings(
+                    prefix=prefix,
+                    target_prefix=target_prefix,
+                    num_experts=num_experts,
+                    moe_backend=moe_backend,
+                )
+                mappings.update(moe_scale_mappings)
 
         return mappings
 
