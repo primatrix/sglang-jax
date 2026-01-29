@@ -105,7 +105,8 @@ class ModelConfig:
 
         # Attach quantization config to hf_config so models can access it
         # (This overwrites the original HF quantization_config, which is OK)
-        self.hf_config.quantization_config = self.quantization_config
+        if self.quantization_config is not None:
+            self.hf_config.quantization_config = self.quantization_config
 
         self.hf_generation_config = get_generation_config(
             config_path,
