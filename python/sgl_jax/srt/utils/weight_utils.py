@@ -1157,6 +1157,16 @@ class WeightLoader:
         jax_path = mapping.target_path
         processed_weight = weight
 
+        # Flatten 2D scale tensors to 1D for QuantizedLinear
+        # Static quantization stores scales as 2D (per-group), but we need 1D (per-channel)
+        if "_scale" in jax_path and processed_weight.ndim == 2:
+            logger.debug(
+                "Flattening 2D scale %s from shape %s to 1D",
+                hf_key,
+                processed_weight.shape,
+            )
+            processed_weight = processed_weight.reshape(-1)
+
         # Apply output_multiplier_scale to lm_head weights (matching PyTorch implementation)
         if "lm_head" in hf_key and hasattr(self.model_config.hf_config, "output_multiplier_scale"):
             logger.info(
