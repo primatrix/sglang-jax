@@ -528,22 +528,22 @@ class Qwen3MoeForCausalLM(nnx.Module):
             attn_scale_mappings = {
                 f"{prefix}.self_attn.q_proj.weight_scale_inv": WeightMapping(
                     target_path=f"{target_prefix}.self_attn.q_proj.weight_scale",
-                    sharding=("tensor",),
+                    sharding=(None, "tensor"),
                     transpose=False,
                 ),
                 f"{prefix}.self_attn.k_proj.weight_scale_inv": WeightMapping(
                     target_path=f"{target_prefix}.self_attn.k_proj.weight_scale",
-                    sharding=("tensor",),
+                    sharding=(None, "tensor"),
                     transpose=False,
                 ),
                 f"{prefix}.self_attn.v_proj.weight_scale_inv": WeightMapping(
                     target_path=f"{target_prefix}.self_attn.v_proj.weight_scale",
-                    sharding=("tensor",),
+                    sharding=(None, "tensor"),
                     transpose=False,
                 ),
                 f"{prefix}.self_attn.o_proj.weight_scale_inv": WeightMapping(
                     target_path=f"{target_prefix}.self_attn.c_proj.weight_scale",
-                    sharding=(None,),
+                    sharding=("tensor", None),
                     transpose=False,
                 ),
             }
@@ -606,17 +606,17 @@ class Qwen3MoeForCausalLM(nnx.Module):
                 mlp_scale_mappings = {
                     f"{prefix}.mlp.gate_proj.weight_scale_inv": WeightMapping(
                         target_path=f"{target_prefix}.mlp.gate_proj.weight_scale",
-                        sharding=("tensor",),
+                        sharding=(None, "tensor"),
                         transpose=False,
                     ),
                     f"{prefix}.mlp.up_proj.weight_scale_inv": WeightMapping(
                         target_path=f"{target_prefix}.mlp.up_proj.weight_scale",
-                        sharding=("tensor",),
+                        sharding=(None, "tensor"),
                         transpose=False,
                     ),
                     f"{prefix}.mlp.down_proj.weight_scale_inv": WeightMapping(
                         target_path=f"{target_prefix}.mlp.down_proj.weight_scale",
-                        sharding=(None,),
+                        sharding=("tensor", None),
                         transpose=False,
                     ),
                 }

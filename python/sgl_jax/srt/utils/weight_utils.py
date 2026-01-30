@@ -1178,6 +1178,7 @@ class WeightLoader:
         # Flatten 2D scale tensors to 1D for QuantizedLinear
         # Static quantization stores scales as 2D (per-group), but we need 1D (per-channel)
         # This must be done AFTER kv_head_padding since that expects 2D tensors
+        scale_sharding = mapping.sharding
         if "_scale" in jax_path and processed_weight.ndim == 2:
             logger.debug(
                 "Flattening 2D scale %s from shape %s to 1D",
@@ -1185,8 +1186,13 @@ class WeightLoader:
                 processed_weight.shape,
             )
             processed_weight = processed_weight.reshape(-1)
+            # Update sharding from 2D to 1D: keep only the axis that was sharded
+            # (None, "tensor") -> ("tensor",)  or  ("tensor", None) -> ("tensor",)  or  (None, None) -> (None,)
+            if len(scale_sharding) == 2:
+                non_none_axes = tuple(s for s in scale_sharding if s is not None)
+                scale_sharding = non_none_axes if non_none_axes else (None,)
 
-        sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
+        sharded_weight = self._shard_weight(processed_weight, scale_sharding)
 
         try:
             model_param = self._get_param(params, jax_path)
