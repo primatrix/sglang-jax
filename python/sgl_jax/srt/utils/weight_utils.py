@@ -780,7 +780,21 @@ class WeightLoader:
                                 hf_key,
                                 lazy_weight.shape,
                             )
-                            lazy_weight = lazy_weight.reshape(-1)
+                            # Need to specify out_sharding when reshaping a sharded array
+                            # Extract the sharded axis from 2D sharding
+                            if len(mapping.sharding) == 2:
+                                non_none_axes = tuple(s for s in mapping.sharding if s is not None)
+                                out_sharding = P(*non_none_axes) if non_none_axes else P()
+                            else:
+                                out_sharding = P()
+
+                            from jax import lax
+
+                            lazy_weight = lax.reshape(
+                                lazy_weight,
+                                (lazy_weight.size,),
+                                out_sharding=jax.sharding.NamedSharding(self.mesh, out_sharding),
+                            )
 
                         model_param = self._get_param(params, target_path)
                         model_param.value = lazy_weight.astype(model_param.value.dtype)
