@@ -535,13 +535,11 @@ class Qwen3MoeForCausalLM(nnx.Module):
                     target_path=f"{target_prefix}.self_attn.k_proj.weight_scale",
                     sharding=("tensor",),
                     transpose=False,
-                    kv_head_padding=True,
                 ),
                 f"{prefix}.self_attn.v_proj.weight_scale_inv": WeightMapping(
                     target_path=f"{target_prefix}.self_attn.v_proj.weight_scale",
                     sharding=("tensor",),
                     transpose=False,
-                    kv_head_padding=True,
                 ),
                 f"{prefix}.self_attn.o_proj.weight_scale_inv": WeightMapping(
                     target_path=f"{target_prefix}.self_attn.c_proj.weight_scale",
