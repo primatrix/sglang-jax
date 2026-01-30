@@ -56,6 +56,8 @@ class MiMoAudioBackboneConfig(PretrainedConfig):
     # Model path for weight loading
     model_path: Optional[str] = None
     model_class: Optional[type] = None
+    revision: Optional[str] = None
+    dtype: str = "bfloat16"
 
     def __post_init__(self):
         # Ensure tuples are properly converted from lists (JSON doesn't support tuples)
@@ -65,6 +67,15 @@ class MiMoAudioBackboneConfig(PretrainedConfig):
             self.speech_empty_ids = tuple(self.speech_empty_ids)
         if isinstance(self.delay_pattern, list):
             self.delay_pattern = tuple(self.delay_pattern)
+
+    def get_total_num_kv_heads(self) -> int:
+        """Return total number of KV heads (required by WeightLoader)."""
+        return self.num_key_value_heads
+
+    @property
+    def hf_config(self):
+        """WeightLoader expects model_config.hf_config."""
+        return self
 
     def create_main_transformer_config(self) -> "MiMoAudioBackboneConfig":
         """Create config for main transformer (Qwen2 layers)."""
@@ -104,15 +115,18 @@ class MiMoAudioBackboneConfig(PretrainedConfig):
 
 @dataclass
 class MiMoAudioArguments:
-    """Arguments for MiMo Audio model inference."""
+    """Arguments for MiMo Audio model inference.
 
-    model_name_or_path: str
-    sosp_idx: int  # start of speech token index
-    eosp_idx: int  # end of speech token index
-    sostm_idx: int  # start of streaming token index
-    eostm_idx: int  # end of streaming token index
-    eot_idx: int  # end of turn token index
-    empty_idx: int  # empty token index
+    Token indices should be loaded from the model's config at runtime.
+    """
+
+    model_name_or_path: Optional[str] = None
+    sosp_idx: int = 0  # start of speech token index
+    eosp_idx: int = 0  # end of speech token index
+    sostm_idx: int = 0  # start of streaming token index
+    eostm_idx: int = 0  # end of streaming token index
+    eot_idx: int = 0  # end of turn token index
+    empty_idx: int = 0  # empty token index
 
 
 @dataclass
