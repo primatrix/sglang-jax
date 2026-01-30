@@ -771,6 +771,17 @@ class WeightLoader:
                             )
 
                         target_path = mapping.target_path
+
+                        # Flatten 2D scale tensors to 1D for QuantizedLinear
+                        # Static quantization stores scales as 2D (per-group), but we need 1D (per-channel)
+                        if "_scale" in target_path and lazy_weight.ndim == 2:
+                            logger.debug(
+                                "Flattening 2D scale %s from shape %s to 1D",
+                                hf_key,
+                                lazy_weight.shape,
+                            )
+                            lazy_weight = lazy_weight.reshape(-1)
+
                         model_param = self._get_param(params, target_path)
                         model_param.value = lazy_weight.astype(model_param.value.dtype)
 
