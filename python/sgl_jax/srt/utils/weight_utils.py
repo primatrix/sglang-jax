@@ -1130,9 +1130,20 @@ class WeightLoader:
         processed_weight = hf_weight
 
         # Handle multi-dimensional transpose (transpose_axes) or 2D transpose
-        if mapping.transpose_axes is not None and not hf_key.endswith(".bias"):
+        # Skip transpose for quantized weights (they are already in the correct format in safetensors)
+        is_quantized_weight = hf_key.endswith(".weight") and processed_weight.dtype in [
+            jnp.float8_e4m3fn,
+            jnp.float8_e5m2,
+            jnp.int8,
+        ]
+
+        if (
+            mapping.transpose_axes is not None
+            and not hf_key.endswith(".bias")
+            and not is_quantized_weight
+        ):
             processed_weight = jnp.transpose(processed_weight, mapping.transpose_axes)
-        elif mapping.transpose and not hf_key.endswith(".bias"):
+        elif mapping.transpose and not hf_key.endswith(".bias") and not is_quantized_weight:
             processed_weight = jnp.transpose(processed_weight, (1, 0))
 
         if isinstance(mapping.target_path, list):
