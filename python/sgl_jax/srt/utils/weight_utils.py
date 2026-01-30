@@ -750,9 +750,16 @@ class WeightLoader:
                             lazy_weight = lazy_arrays[0]
 
                         # Handle multi-dimensional transpose (transpose_axes) or 2D transpose
-                        if mapping.transpose_axes is not None:
+                        # Skip transpose for quantized weights (they are already in the correct format)
+                        is_quantized_weight = hf_key.endswith(".weight") and lazy_weight.dtype in [
+                            jnp.float8_e4m3fn,
+                            jnp.float8_e5m2,
+                            jnp.int8,
+                        ]
+
+                        if mapping.transpose_axes is not None and not is_quantized_weight:
                             lazy_weight = jnp.transpose(lazy_weight, mapping.transpose_axes)
-                        elif mapping.transpose:
+                        elif mapping.transpose and not is_quantized_weight:
                             lazy_weight = jnp.transpose(lazy_weight, (1, 0))
 
                         if "lm_head" in hf_key and hasattr(
