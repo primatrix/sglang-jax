@@ -441,12 +441,12 @@ class MiMoAudioForCausalLM(nnx.Module):
     def __init__(
         self,
         config: MiMoAudioBackboneConfig,
-        args: MiMoAudioArguments,
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
+        args: MiMoAudioArguments | None = None,
     ):
         self.config = config
-        self.args = args
+        self.args = args or MiMoAudioArguments()
         self.mesh = mesh
         self.dtype = dtype
 
@@ -518,12 +518,13 @@ class MiMoAudioForCausalLM(nnx.Module):
         )
 
         # LM heads for audio channels (8 channels)
+        # Note: speech_vocab_sizes (e.g. 1025, 129) are not divisible by TP, so no sharding
         self.patch_decoder_lm_heads = nnx.List([
             LinearBase(
                 input_size=config.local_dim,
                 output_size=config.speech_vocab_sizes[i],
                 use_bias=False,
-                kernel_axes=(None, "tensor"),
+                kernel_axes=(None, None),
                 params_dtype=dtype,
                 mesh=mesh,
             )
@@ -531,12 +532,13 @@ class MiMoAudioForCausalLM(nnx.Module):
         ])
 
         # Speech embeddings (8 channels)
+        # Note: speech_vocab_sizes not divisible by TP, so no sharding on vocab axis
         self.speech_embeddings = nnx.List([
             Embed(
                 num_embeddings=config.speech_vocab_sizes[i],
                 features=config.input_local_dim,
                 dtype=dtype,
-                kernel_axes=(None, "tensor"),
+                kernel_axes=(None, None),
                 param_dtype=dtype,
                 mesh=mesh,
             )
