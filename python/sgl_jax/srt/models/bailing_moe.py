@@ -651,7 +651,6 @@ class BailingMoEForCausalLM(nnx.Module):
             moe_backend = getattr(self.config, "moe_backend", "epmoe")
             use_fused = moe_backend == "fused"
 
-            # hardcode block size to 256 for now
             BLOCK_SIZE = 256
             hidden_size = self.config.hidden_size
             inter_size = getattr(self.config, "moe_intermediate_size", 2048)
@@ -670,12 +669,10 @@ class BailingMoEForCausalLM(nnx.Module):
                     target_param = mapping.target_path[0]
                     src_paths = mapping.target_path[1:]
 
-                    new_transpose = mapping.transpose
-
                     new_moe_mappings[key] = WeightMapping(
                         target_path=[target_param] + src_paths,
                         sharding=mapping.sharding,
-                        transpose=new_transpose,
+                        transpose=mapping.transpose,
                         concat_axis=mapping.concat_axis,
                     )
 
@@ -685,26 +682,34 @@ class BailingMoEForCausalLM(nnx.Module):
 
                     is_w2 = target_param.endswith("w2") or target_param.endswith("wo")
                     out_dim = hidden_size if is_w2 else inter_size
-                    in_dim = inter_size if is_w2 else hidden_size
-                    num_blocks = in_dim // BLOCK_SIZE
-                    scale_reshape = (num_experts, 1, 1, out_dim)
-                    scale_repeat = (1, num_blocks)
-                    # Mapping sharding for w1 is (E, T, None).
-                    # Mapping sharding for w2 is (E, None, T).
 
-                    scale_sharding = None
-                    if mapping.sharding:
-                        # Construct (E, Blocks, 1, Out)
-                        # Dim 0 (E) = mapping[0]
-                        # Dim 1 (Blocks) = mapping[1] (Matches 'In' dim of weight)
-                        # Dim 2 (1) = None
-                        # Dim 3 (Out) = mapping[2] (Matches 'Out' dim of weight)
-                        scale_sharding = (
-                            mapping.sharding[0],
-                            mapping.sharding[1],
-                            None,
-                            mapping.sharding[2],
-                        )
+                    if use_fused:
+                        in_dim = inter_size if is_w2 else hidden_size
+                        num_blocks = in_dim // BLOCK_SIZE
+                        scale_reshape = (num_experts, 1, 1, out_dim)
+                        scale_repeat = (1, num_blocks)
+
+                        scale_sharding = None
+                        if mapping.sharding:
+                            scale_sharding = (
+                                mapping.sharding[0],
+                                mapping.sharding[1],
+                                None,
+                                mapping.sharding[2],
+                            )
+                    else:
+                        scale_reshape = (num_experts, 1, 1, out_dim)
+                        scale_repeat = None  #
+
+                        # EPMoE scale sharding:
+                        # w1 (E, Inter, Hidden) -> sharding (E, T, None) -> Scale (E, 1, 1, Inter) should match (E, ..., T)
+                        # Actually for EPMoE param layout: (E, 1, 1, C)
+                        # mapping.sharding for w1 is (E, T, None). T is on dim 1.
+                        # We map T to dim 3 (Inter).
+                        # Correct sharding for EPMoE Scale: (s[0], None, None, s[1])
+                        scale_sharding = None
+                        if mapping.sharding:
+                            scale_sharding = (mapping.sharding[0], None, None, mapping.sharding[1])
 
                     new_moe_mappings[scale_key] = WeightMapping(
                         target_path=[target_scale_param] + scale_src_paths,
@@ -719,7 +724,6 @@ class BailingMoEForCausalLM(nnx.Module):
             else:
                 mappings.update(moe_mappings)
 
-            # === 4. Shared Experts ===
             num_shared = getattr(self.config, "num_shared_experts", 0)
             if num_shared > 0:
                 if use_fused:
@@ -734,13 +738,11 @@ class BailingMoEForCausalLM(nnx.Module):
                         target_path = f"{target_prefix}.mlp.{target_name}"
 
                         if is_static_quant:
-                            # 4.1 Weight: Transpose=True
                             mappings[full_hf_key] = WeightMapping(
                                 target_path=target_path,
                                 sharding=(None, None),
                                 transpose=True,
                             )
-                            # 4.2 Scale
                             scale_key = f"{prefix}.mlp.shared_experts.{hf_name}.weight_scale"
 
                             is_w2 = "down_proj" in hf_name
@@ -765,39 +767,46 @@ class BailingMoEForCausalLM(nnx.Module):
                                 transpose=True,
                             )
                 else:
-                    # EPMoE
-                    def add_shared_mapping(hf_name, target_name, sharding_std):
+
+                    def add_shared_expert_mapping(hf_name, target_name, sharding_std):
                         full_hf_key = f"{prefix}.mlp.shared_experts.{hf_name}.weight"
+
+                        target_base = f"{target_prefix}.shared_experts.{target_name}"
+
                         if is_static_quant:
                             sharding_quant = (
                                 (sharding_std[1], sharding_std[0])
                                 if len(sharding_std) == 2
                                 else sharding_std
                             )
+
                             mappings[full_hf_key] = WeightMapping(
-                                target_path=f"{target_prefix}.shared_experts.{target_name}.weight_q",
+                                target_path=f"{target_base}.weight_q",
                                 sharding=sharding_quant,
                                 transpose=False,
                             )
+
                             scale_key = f"{prefix}.mlp.shared_experts.{hf_name}.weight_scale"
+
                             scale_sharding = (sharding_quant[0],)
                             if target_name == "down_proj":
                                 scale_sharding = (None,)
+
                             mappings[scale_key] = WeightMapping(
-                                target_path=f"{target_prefix}.shared_experts.{target_name}.weight_scale",
+                                target_path=f"{target_base}.weight_scale",
                                 sharding=scale_sharding,
                                 transpose=False,
                             )
                         else:
                             mappings[full_hf_key] = WeightMapping(
-                                target_path=f"{target_prefix}.shared_experts.{target_name}.weight",
+                                target_path=f"{target_base}.weight",
                                 sharding=sharding_std,
                                 transpose=True,
                             )
 
-                    add_shared_mapping("gate_proj", "gate_proj", (None, "tensor"))
-                    add_shared_mapping("up_proj", "up_proj", (None, "tensor"))
-                    add_shared_mapping("down_proj", "down_proj", ("tensor", None))
+                    add_shared_expert_mapping("gate_proj", "gate_proj", (None, "tensor"))
+                    add_shared_expert_mapping("up_proj", "up_proj", (None, "tensor"))
+                    add_shared_expert_mapping("down_proj", "down_proj", ("tensor", None))
 
         return mappings
 
