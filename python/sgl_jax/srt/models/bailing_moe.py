@@ -697,28 +697,36 @@ class BailingMoEForCausalLM(nnx.Module):
                                 None,
                                 mapping.sharding[2],
                             )
+
+                        new_moe_mappings[scale_key] = WeightMapping(
+                            target_path=[target_scale_param] + scale_src_paths,
+                            sharding=scale_sharding,
+                            transpose=False,
+                            reshape=scale_reshape,
+                            repeat=scale_repeat,
+                            concat_axis=mapping.concat_axis,
+                        )
+
                     else:
                         scale_reshape = (num_experts, 1, 1, out_dim)
-                        scale_repeat = None  #
-
-                        # EPMoE scale sharding:
-                        # w1 (E, Inter, Hidden) -> sharding (E, T, None) -> Scale (E, 1, 1, Inter) should match (E, ..., T)
-                        # Actually for EPMoE param layout: (E, 1, 1, C)
-                        # mapping.sharding for w1 is (E, T, None). T is on dim 1.
-                        # We map T to dim 3 (Inter).
-                        # Correct sharding for EPMoE Scale: (s[0], None, None, s[1])
+                        scale_repeat = None
                         scale_sharding = None
                         if mapping.sharding:
-                            scale_sharding = (mapping.sharding[0], None, None, mapping.sharding[1])
+                            target_dim_sharding = None
+                            if is_w2 and len(mapping.sharding) > 2:
+                                target_dim_sharding = mapping.sharding[2]
+                            elif not is_w2 and len(mapping.sharding) > 1:
+                                target_dim_sharding = mapping.sharding[1]
+                            scale_sharding = (mapping.sharding[0], target_dim_sharding, None)
 
-                    new_moe_mappings[scale_key] = WeightMapping(
-                        target_path=[target_scale_param] + scale_src_paths,
-                        sharding=scale_sharding,
-                        transpose=False,
-                        reshape=scale_reshape,
-                        repeat=scale_repeat,
-                        concat_axis=mapping.concat_axis,
-                    )
+                        new_moe_mappings[scale_key] = WeightMapping(
+                            target_path=[target_scale_param] + scale_src_paths,
+                            sharding=scale_sharding,
+                            transpose=False,
+                            reshape=scale_reshape,
+                            repeat=scale_repeat,
+                            concat_axis=mapping.concat_axis,
+                        )
 
                 mappings.update(new_moe_mappings)
             else:
