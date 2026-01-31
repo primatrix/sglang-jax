@@ -775,10 +775,14 @@ class WeightLoader:
                         # Flatten 2D scale tensors to 1D for QuantizedLinear
                         # Static quantization stores scales as 2D (per-group), but we need 1D (per-channel)
                         if "_scale" in target_path and lazy_weight.ndim == 2:
-                            logger.debug(
-                                "Flattening 2D scale %s from shape %s to 1D",
+                            original_shape = lazy_weight.shape
+                            # Calculate flattened size: product of all dimensions
+                            flat_size = original_shape[0] * original_shape[1]
+                            logger.info(
+                                "Flattening 2D scale %s from shape %s to 1D (%d)",
                                 hf_key,
-                                lazy_weight.shape,
+                                original_shape,
+                                flat_size,
                             )
                             # Need to specify out_sharding when reshaping a sharded array
                             # Extract the sharded axis from 2D sharding
@@ -792,8 +796,14 @@ class WeightLoader:
 
                             lazy_weight = lax.reshape(
                                 lazy_weight,
-                                (lazy_weight.size,),
+                                (flat_size,),
                                 out_sharding=jax.sharding.NamedSharding(self.mesh, out_sharding),
+                            )
+                            logger.info(
+                                "After flattening %s: shape=%s, target=%s",
+                                hf_key,
+                                lazy_weight.shape,
+                                target_path,
                             )
 
                         model_param = self._get_param(params, target_path)
@@ -1212,12 +1222,21 @@ class WeightLoader:
         # This must be done AFTER kv_head_padding since that expects 2D tensors
         scale_sharding = mapping.sharding
         if "_scale" in jax_path and processed_weight.ndim == 2:
-            logger.debug(
-                "Flattening 2D scale %s from shape %s to 1D",
+            original_shape = processed_weight.shape
+            flat_size = original_shape[0] * original_shape[1]
+            logger.info(
+                "Slow path: Flattening 2D scale %s from shape %s to 1D (%d)",
                 hf_key,
-                processed_weight.shape,
+                original_shape,
+                flat_size,
             )
             processed_weight = processed_weight.reshape(-1)
+            logger.info(
+                "Slow path: After flattening %s: shape=%s, target=%s",
+                hf_key,
+                processed_weight.shape,
+                jax_path,
+            )
             # Update sharding from 2D to 1D: keep only the axis that was sharded
             # (None, "tensor") -> ("tensor",)  or  ("tensor", None) -> ("tensor",)  or  (None, None) -> (None,)
             if len(scale_sharding) == 2:
