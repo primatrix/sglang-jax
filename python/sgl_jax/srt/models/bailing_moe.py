@@ -369,12 +369,13 @@ class BailingMoEDecoderLayer(nnx.Module):
         )
         hidden_states += residual
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
 
         replicated_spec = jax.sharding.PartitionSpec(*([None] * hidden_states.ndim))
         target_sharding = jax.sharding.NamedSharding(self.mesh, replicated_spec)
         hidden_states_replicated = jax.sharding.reshard(hidden_states, target_sharding)
         jax.debug.callback(_save_moe_output_impl, hidden_states_replicated, self.layer_id)
+
+        hidden_states = self.post_attention_layernorm(hidden_states)
 
         if self.is_moe_layer:
             if self.shared_experts is not None:
