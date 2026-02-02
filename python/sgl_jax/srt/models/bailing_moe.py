@@ -4,7 +4,6 @@ from typing import Any
 import jax
 from flax import nnx
 from jax import numpy as jnp
-from jax.experimental import io_callback
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
@@ -211,6 +210,7 @@ class BailingMoEDecoderLayer(nnx.Module):
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
+        self.mesh = mesh
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 1000000)
@@ -392,13 +392,18 @@ class BailingMoEDecoderLayer(nnx.Module):
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
 
-        # _save_moe_output_impl("/tmp/tpu_logs", hidden_states, self.layer_id)
-        io_callback(
-            _save_moe_output_impl,  # 回调函数
-            None,  # 返回值形状 (无)
-            hidden_states,  # 参数1: 需要保存的 Tensor
-            self.layer_id,  # 参数2: 当前层 ID
-        )
+        # # _save_moe_output_impl("/tmp/tpu_logs", hidden_states, self.layer_id)
+        # io_callback(
+        #     _save_moe_output_impl,  # 回调函数
+        #     None,  # 返回值形状 (无)
+        #     hidden_states,  # 参数1: 需要保存的 Tensor
+        #     self.layer_id,  # 参数2: 当前层 ID
+        # )
+
+        replicated_spec = jax.sharding.PartitionSpec(*([None] * hidden_states.ndim))
+        target_sharding = jax.sharding.NamedSharding(self.mesh, replicated_spec)
+        hidden_states_replicated = jax.sharding.reshard(hidden_states, target_sharding)
+        jax.debug.callback(_save_moe_output_impl, hidden_states_replicated, self.layer_id)
         return hidden_states, residual, kv_fused, topk_ids
 
 
