@@ -2050,10 +2050,10 @@ def _fused_ep_moe_kernel(
                     w3_up_compute = w3_up.astype(t_dtype)  # FP8 -> BF16
 
                     act_gate_acc += jnp.dot(
-                        t_val_compute, w1_gate_compute, preferred_element_type=t_dtype
+                        t_val_compute, w1_gate_compute, preferred_element_type=jnp.float32
                     )
                     act_up_acc += jnp.dot(
-                        t_val_compute, w3_up_compute, preferred_element_type=t_dtype
+                        t_val_compute, w3_up_compute, preferred_element_type=jnp.float32
                     )
 
                 return (act_gate_acc, act_up_acc)
@@ -2100,14 +2100,14 @@ def _fused_ep_moe_kernel(
                 for p_id in range(t_packing):
                     w2_val = b_se_w2_x2_vmem[curr_sem, p_id]
                     w2_val_compute = w2_val.astype(t_dtype)
-                    acc_chunk = jnp.dot(act, w2_val_compute, preferred_element_type=t_dtype)
+                    acc_chunk = jnp.dot(act, w2_val_compute, preferred_element_type=jnp.float32)
 
                     hidden_offset = p_id * h_per_t_packing + bd2_idx * bd2_per_t_packing
 
                     if b_se_w2_scale_all is not None:
                         s_down = b_se_w2_scale_all[0, 0, pl.ds(hidden_offset, bd2_per_t_packing)]
                         s_down = jnp.broadcast_to(s_down, acc_chunk.shape)
-                        acc_chunk *= s_down
+                        acc_chunk = acc_chunk * s_down.astype(t_dtype)
 
                     out_slice = b_output_x2_vmem.at[
                         out_buf_id, pl.ds(0, bt), pl.ds(hidden_offset, bd2_per_t_packing)
