@@ -2063,12 +2063,12 @@ def _fused_ep_moe_kernel(
             if b_se_w1_scale_all is not None:
                 s_gate = b_se_w1_scale_all[0, 0, pl.ds(block_id * bse, bse)]
                 s_gate = jnp.broadcast_to(s_gate, gate_res.shape)
-                gate_res = gate_res * s_gate
+                gate_res = gate_res * s_gate.astype(t_dtype)
 
             if b_se_w3_scale_all is not None:
                 s_up = b_se_w3_scale_all[0, 0, pl.ds(block_id * bse, bse)]
                 s_up = jnp.broadcast_to(s_up, up_res.shape)
-                up_res = up_res * s_up
+                up_res = up_res * s_up.astype(t_dtype)
 
             act = activation_fn(gate_res, up_res, act_fn)
 
@@ -2107,7 +2107,8 @@ def _fused_ep_moe_kernel(
                     if b_se_w2_scale_all is not None:
                         s_down = b_se_w2_scale_all[0, 0, pl.ds(hidden_offset, bd2_per_t_packing)]
                         s_down = jnp.broadcast_to(s_down, acc_chunk.shape)
-                        acc_chunk = acc_chunk * s_down.astype(t_dtype)
+                        acc_chunk_bf16 = acc_chunk.astype(t_dtype)
+                        acc_chunk = acc_chunk_bf16 * s_down.astype(t_dtype)
 
                     out_slice = b_output_x2_vmem.at[
                         out_buf_id, pl.ds(0, bt), pl.ds(hidden_offset, bd2_per_t_packing)
