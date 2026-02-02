@@ -1278,9 +1278,12 @@ def main() -> int:
             (tokens.astype(jnp.float32) @ gate_w).astype(jnp.float32),
             args.score_function,
         ).astype(router_dtype)
-        router_bias = (
-            jnp.asarray(router_bias_np, dtype=jnp.bfloat16) if router_bias_np is not None else None
-        )
+        if router_bias_np is not None:
+            router_bias = jax.device_put(
+                jnp.asarray(router_bias_np, dtype=jnp.bfloat16), NamedSharding(mesh, P())
+            )
+        else:
+            router_bias = None
         print(
             f"[router] from_checkpoint gate_weight=yes expert_bias={'yes' if router_bias_np is not None else 'no'}"
         )
@@ -1339,7 +1342,8 @@ def main() -> int:
         topk_group=(args.top_k_groups if args.use_grouped_topk else 0),
         routed_scaling_factor=args.routed_scaling_factor,
     )
-    topk_weights, topk_ids = topk(router_logits, router_bias)
+    with jax.set_mesh(mesh):
+        topk_weights, topk_ids = topk(router_logits, router_bias)
 
     moe_weight_dtype = _str_to_dtype(args.moe_weight_dtype)
     if use_static:
