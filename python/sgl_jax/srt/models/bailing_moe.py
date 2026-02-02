@@ -393,18 +393,20 @@ class BailingMoEDecoderLayer(nnx.Module):
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
 
-        global_replicated_sharding = jax.sharding.NamedSharding(
-            self.mesh, jax.sharding.PartitionSpec(None, None)
-        )
+        with jax.sharding.mesh(self.mesh):
+            global_replicated_sharding = jax.sharding.NamedSharding(
+                self.mesh, jax.sharding.PartitionSpec(None, None)
+            )
 
-        # 使用 reshard 强制进行跨 Mesh/跨 Sharding 的通信转换
-        hidden_states_safe = jax.lax.with_sharding_constraint(
-            hidden_states, global_replicated_sharding
-        )
+            # 将数据强制 Reshard/Constraint 到全局 Replicated 状态
+            # 这一步会触发必要的 AllGather 通信，将切片数据聚合
+            hidden_states_safe = jax.lax.with_sharding_constraint(
+                hidden_states, global_replicated_sharding
+            )
 
-        # 此外，如果报错依然存在，建议将 io_callback 放在 jax.jit 外部
-        # 或者确保传给 io_callback 的是主 Mesh 下的 replicated 数据
-        io_callback(_save_moe_output_impl, None, hidden_states_safe, self.layer_id)
+            # 现在可以安全地调用 io_callback，因为数据和环境都在主 Mesh 上
+            io_callback(_save_moe_output_impl, None, hidden_states_safe, self.layer_id)
+
         return hidden_states, residual, kv_fused, topk_ids
 
 
