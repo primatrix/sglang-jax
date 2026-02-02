@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+import datetime
 import gc
+import os
 from collections import defaultdict
 from typing import Any
 
@@ -210,3 +212,19 @@ def get_memory_usage():
         return stats
     except Exception:
         return {f"device_{i}": "N/A" for i in range(len(jax.devices()))}
+
+
+def _save_moe_output_impl(save_dir, data, layer_id):
+    os.makedirs(save_dir, exist_ok=True)
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    filename = f"{save_dir}/layer_{layer_id}_output_{timestamp}.npy"
+
+    try:
+        with open(filename, "wb") as f:
+            import numpy as np
+
+            np.save(f, data)
+        print(f"[Debug] Saved MoE output for Layer {layer_id} to {filename} | Shape: {data.shape}")
+    except Exception as e:
+        print(f"[Error] Failed to save MoE output: {e}")
