@@ -451,6 +451,18 @@ class BailingMoEModel(nnx.Module):
             )
             layers_kv_fused.append(kv_fused)
             layers_topk_ids.append(topk_ids)
+            replicated_spec = jax.sharding.PartitionSpec(*([None] * hidden_states.ndim))
+
+            # 2. 构建目标 Sharding，直接把 layer.mesh 塞进去
+            # JAX 会通过这个对象知道目标 Mesh 是谁，不需要环境上下文
+            target_sharding = jax.sharding.NamedSharding(layer.mesh, replicated_spec)
+
+            # 3. 强制 Reshard
+            # JAX 看到这个指令，会自行处理当前的 Distributed Array 到目标 Mesh/Sharding 的通信
+            hidden_states_replicated = jax.sharding.reshard(hidden_states, target_sharding)
+
+            # 4. 回调
+            io_callback(_save_moe_output_impl, None, hidden_states_replicated, layer.layer_id)
 
         if residual is not None:
             hidden_states += residual
@@ -830,7 +842,6 @@ class BailingMoEForCausalLM(nnx.Module):
         hidden_states, layers_kv_fused, layers_topk_ids = self.model(
             forward_batch, token_to_kv_pool
         )
-        io_callback(_save_moe_output_impl, None, hidden_states, 0)
 
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
