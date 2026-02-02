@@ -393,7 +393,7 @@ class BailingMoEDecoderLayer(nnx.Module):
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
 
-        with jax.sharding.mesh(self.mesh):
+        with self.mesh:
             global_replicated_sharding = jax.sharding.NamedSharding(
                 self.mesh, jax.sharding.PartitionSpec(None, None)
             )
