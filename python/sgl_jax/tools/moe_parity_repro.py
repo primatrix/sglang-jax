@@ -916,6 +916,11 @@ def main() -> int:
             "shared math; defaults to False to match end-to-end QuantizedLinear behavior."
         ),
     )
+    parser.add_argument(
+        "--debug-use-ref-shared",
+        action="store_true",
+        help="[Debug] Disable internal shared experts in fused kernel, and manually add the Ref-MLP output instead.",
+    )
     args = parser.parse_args()
     user_set_tokens_apply_rmsnorm = args.tokens_apply_post_attn_rmsnorm is not None
     user_set_tokens_rmsnorm_from_ckpt = args.tokens_rmsnorm_from_ckpt is not None
@@ -1558,6 +1563,22 @@ def main() -> int:
         else:
             w1_scale = w2_scale = w3_scale = None
 
+    call_w1_shared = w1_shared_fused
+    call_w2_shared = w2_shared_fused
+    call_w3_shared = w3_shared_fused
+    call_w1_shared_scale = w1_shared_scale
+    call_w2_shared_scale = w2_shared_scale
+    call_w3_shared_scale = w3_shared_scale
+
+    if args.debug_use_ref_shared:
+        print("[debug] 🛡️ Shielding Fused Shared Experts (passing None to kernel)...")
+        call_w1_shared = None
+        call_w2_shared = None
+        call_w3_shared = None
+        call_w1_shared_scale = None
+        call_w2_shared_scale = None
+        call_w3_shared_scale = None
+
     fused_out = fused_ep_moe(
         mesh=mesh,
         tokens=tokens,
@@ -1577,12 +1598,12 @@ def main() -> int:
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         w3_scale=w3_scale,
-        w1_shared=w1_shared_fused,
-        w2_shared=w2_shared_fused,
-        w3_shared=w3_shared_fused,
-        w1_shared_scale=w1_shared_scale,
-        w2_shared_scale=w2_shared_scale,
-        w3_shared_scale=w3_shared_scale,
+        w1_shared=call_w1_shared,
+        w2_shared=call_w2_shared,
+        w3_shared=call_w3_shared,
+        w1_shared_scale=call_w1_shared_scale,
+        w2_shared_scale=call_w2_shared_scale,
+        w3_shared_scale=call_w3_shared_scale,
         tp_axis_name="tensor",
     )
     fused_out_no_shared = None
@@ -1658,6 +1679,10 @@ def main() -> int:
                     act_fn=args.act_fn,
                 )
         ep_out = ep_out + shared_out
+
+    if args.debug_use_ref_shared and shared_out is not None:
+        print("[debug] ➕ Adding Ref-MLP Shared Output to Fused-MoE output manually.")
+        fused_out = fused_out + shared_out
 
     fused_np = np.asarray(jax.device_get(fused_out))
     fused_no_shared_np = (
