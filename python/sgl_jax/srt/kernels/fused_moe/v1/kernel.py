@@ -2045,18 +2045,16 @@ def _fused_ep_moe_kernel(
                     w1_gate = b_se_w1_x2_vmem[curr_sem, p_id]
                     w3_up = b_se_w3_x2_vmem[curr_sem, p_id]
 
-                    # === CRITICAL FIX: Explicit FP32 Cast ===
-                    # Explicitly cast operands to FP32. This forces the dot product
-                    # to run in FP32 precision, preventing implicit downcasting
-                    # or low-precision accumulation on TPU for mixed inputs (BF16/FP8).
-                    t_val_f32 = t_val.astype(jnp.float32)
-                    w1_gate_f32 = w1_gate.astype(jnp.float32)
-                    w3_up_f32 = w3_up.astype(jnp.float32)
+                    t_val_compute = t_val  # Keep as BF16
+                    w1_gate_compute = w1_gate.astype(t_dtype)  # FP8 -> BF16
+                    w3_up_compute = w3_up.astype(t_dtype)  # FP8 -> BF16
 
                     act_gate_acc += jnp.dot(
-                        t_val_f32, w1_gate_f32, preferred_element_type=jnp.float32
+                        t_val_compute, w1_gate_compute, preferred_element_type=t_dtype
                     )
-                    act_up_acc += jnp.dot(t_val_f32, w3_up_f32, preferred_element_type=jnp.float32)
+                    act_up_acc += jnp.dot(
+                        t_val_compute, w3_up_compute, preferred_element_type=t_dtype
+                    )
 
                 return (act_gate_acc, act_up_acc)
 
@@ -2101,13 +2099,8 @@ def _fused_ep_moe_kernel(
 
                 for p_id in range(t_packing):
                     w2_val = b_se_w2_x2_vmem[curr_sem, p_id]
-
-                    # === CRITICAL FIX: Explicit FP32 Cast ===
-                    # Act is already FP32, but W2 is FP8/BF16. Explicitly casting W2
-                    # ensures the multiplication happens in FP32 domain.
-                    w2_val_f32 = w2_val.astype(jnp.float32)
-
-                    acc_chunk = jnp.dot(act, w2_val_f32, preferred_element_type=jnp.float32)
+                    w2_val_compute = w2_val.astype(t_dtype)
+                    acc_chunk = jnp.dot(act, w2_val_compute, preferred_element_type=t_dtype)
 
                     hidden_offset = p_id * h_per_t_packing + bd2_idx * bd2_per_t_packing
 
