@@ -1230,7 +1230,7 @@ def main() -> int:
                 f"Model: {hidden_size}. (Check if you dumped the correct layer output)"
             )
 
-        input_np = loaded_data[: args.num_tokens]
+        input_np = np.array(loaded_data[: args.num_tokens])
 
         if input_np.shape[0] < args.num_tokens:
             print(
@@ -1239,9 +1239,8 @@ def main() -> int:
             print(f"[warning] Using actual available tokens: {input_np.shape[0]}")
             args.num_tokens = input_np.shape[0]
 
-        tokens_f32 = jax.device_put(
-            jnp.asarray(input_np, dtype=jnp.float32), jax.local_devices()[0]
-        )
+        replicated_sharding = NamedSharding(mesh, P())
+        tokens_f32 = jax.device_put(jnp.asarray(input_np, dtype=jnp.float32), replicated_sharding)
     else:
         tokens_f32 = jax.random.normal(key, (args.num_tokens, hidden_size), dtype=jnp.float32)
     if args.tokens_apply_post_attn_rmsnorm:
