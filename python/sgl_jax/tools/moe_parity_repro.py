@@ -1682,7 +1682,9 @@ def main() -> int:
 
     if args.debug_use_ref_shared and shared_out is not None:
         print("[debug] ➕ Adding Ref-MLP Shared Output to Fused-MoE output manually.")
-        fused_out = fused_out + shared_out
+        fused_out = (fused_out.astype(jnp.float32) + shared_out.astype(jnp.float32)).astype(
+            jnp.bfloat16
+        )
 
     fused_np = np.asarray(jax.device_get(fused_out))
     fused_no_shared_np = (
