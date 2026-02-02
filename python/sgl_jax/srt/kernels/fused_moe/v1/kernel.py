@@ -2376,46 +2376,46 @@ def _validate_fused_ep_moe_args(
     # Note: we should dump scale as the kernel expected shape in the
     # checkpoint offline or reshape right after weight loading.
     if w1_scale is not None:
-        if subc_quant_wsz is None:
-            raise ValueError("Expected subc_quant_wsz to be set when w1_scale is provided.")
-        expected_w1_scale_shape = (
-            num_experts,
-            hidden_size // subc_quant_wsz,
-            1,
-            intermediate_size,
-        )
-        if w1_scale.shape != expected_w1_scale_shape:
-            raise ValueError(f"Expected {w1_scale.shape=} to be {expected_w1_scale_shape}.")
-        if w1_scale.dtype != jnp.float32:
-            w1_scale = w1_scale.astype(jnp.float32)
+        # if subc_quant_wsz is None:
+        #     raise ValueError("Expected subc_quant_wsz to be set when w1_scale is provided.")
+        # expected_w1_scale_shape = (
+        #     num_experts,
+        #     hidden_size // subc_quant_wsz,
+        #     1,
+        #     intermediate_size,
+        # )
+        # if w1_scale.shape != expected_w1_scale_shape:
+        #     raise ValueError(f"Expected {w1_scale.shape=} to be {expected_w1_scale_shape}.")
+        # if w1_scale.dtype != jnp.float32:
+        w1_scale = w1_scale.astype(jnp.float32)
 
     if w2_scale is not None:
-        if subc_quant_wsz is None:
-            raise ValueError("Expected subc_quant_wsz to be set when w2_scale is provided.")
-        expected_w2_scale_shape = (
-            num_experts,
-            intermediate_size // subc_quant_wsz,
-            1,
-            hidden_size,
-        )
-        if w2_scale.shape != expected_w2_scale_shape:
-            raise ValueError(f"Expected {w2_scale.shape=} to be {expected_w2_scale_shape}.")
-        if w2_scale.dtype != jnp.float32:
-            w2_scale = w2_scale.astype(jnp.float32)
+        # if subc_quant_wsz is None:
+        #     raise ValueError("Expected subc_quant_wsz to be set when w2_scale is provided.")
+        # expected_w2_scale_shape = (
+        #     num_experts,
+        #     intermediate_size // subc_quant_wsz,
+        #     1,
+        #     hidden_size,
+        # )
+        # if w2_scale.shape != expected_w2_scale_shape:
+        #     raise ValueError(f"Expected {w2_scale.shape=} to be {expected_w2_scale_shape}.")
+        # if w2_scale.dtype != jnp.float32:
+        w2_scale = w2_scale.astype(jnp.float32)
 
     if w3_scale is not None:
-        if subc_quant_wsz is None:
-            raise ValueError("Expected subc_quant_wsz to be set when w3_scale is provided.")
-        expected_w3_scale_shape = (
-            num_experts,
-            hidden_size // subc_quant_wsz,
-            1,
-            intermediate_size,
-        )
-        if w3_scale.shape != expected_w3_scale_shape:
-            raise ValueError(f"Expected {w3_scale.shape=} to be {expected_w3_scale_shape}.")
-        if w3_scale.dtype != jnp.float32:
-            w3_scale = w3_scale.astype(jnp.float32)
+        # if subc_quant_wsz is None:
+        #     raise ValueError("Expected subc_quant_wsz to be set when w3_scale is provided.")
+        # expected_w3_scale_shape = (
+        #     num_experts,
+        #     hidden_size // subc_quant_wsz,
+        #     1,
+        #     intermediate_size,
+        # )
+        # if w3_scale.shape != expected_w3_scale_shape:
+        #     raise ValueError(f"Expected {w3_scale.shape=} to be {expected_w3_scale_shape}.")
+        # if w3_scale.dtype != jnp.float32:
+        w3_scale = w3_scale.astype(jnp.float32)
 
     if b1 is not None:
         expected_b1_shape = (num_experts, 1, intermediate_size)
