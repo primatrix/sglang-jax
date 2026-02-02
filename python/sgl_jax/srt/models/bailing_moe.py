@@ -5,7 +5,6 @@ import jax
 from flax import nnx
 from jax import numpy as jnp
 from jax.experimental import io_callback
-from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
@@ -394,9 +393,17 @@ class BailingMoEDecoderLayer(nnx.Module):
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
 
-        replicated_sharding = jax.sharding.NamedSharding(self.mesh, P(None, None))
-        hidden_states_safe = jax.lax.with_sharding_constraint(hidden_states, replicated_sharding)
-        # hidden_states_safe = jax.sharding.reshard(hidden_states, P())
+        global_replicated_sharding = jax.sharding.NamedSharding(
+            self.mesh, jax.sharding.PartitionSpec(None, None)
+        )
+
+        # 使用 reshard 强制进行跨 Mesh/跨 Sharding 的通信转换
+        hidden_states_safe = jax.lax.with_sharding_constraint(
+            hidden_states, global_replicated_sharding
+        )
+
+        # 此外，如果报错依然存在，建议将 io_callback 放在 jax.jit 外部
+        # 或者确保传给 io_callback 的是主 Mesh 下的 replicated 数据
         io_callback(_save_moe_output_impl, None, hidden_states_safe, self.layer_id)
         return hidden_states, residual, kv_fused, topk_ids
 
