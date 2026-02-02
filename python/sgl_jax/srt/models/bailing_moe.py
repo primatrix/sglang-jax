@@ -4,7 +4,6 @@ from typing import Any
 import jax
 from flax import nnx
 from jax import numpy as jnp
-from jax.experimental import io_callback
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
@@ -22,7 +21,6 @@ from sgl_jax.srt.layers.moe import (
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.utils.jax_utils import _save_moe_output_impl
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -392,12 +390,12 @@ class BailingMoEDecoderLayer(nnx.Module):
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
 
-        io_callback(
-            _save_moe_output_impl,  # 回调函数
-            None,  # 返回值形状 (无)
-            hidden_states,  # 参数1: 需要保存的 Tensor
-            self.layer_id,  # 参数2: 当前层 ID
-        )
+        # io_callback(
+        #     _save_moe_output_impl,  # 回调函数
+        #     None,  # 返回值形状 (无)
+        #     hidden_states,  # 参数1: 需要保存的 Tensor
+        #     self.layer_id,  # 参数2: 当前层 ID
+        # )
         return hidden_states, residual, kv_fused, topk_ids
 
 
