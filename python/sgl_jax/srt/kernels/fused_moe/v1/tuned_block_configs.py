@@ -102,13 +102,13 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         ('bfloat16', 'bfloat16', 4096, 256, 8, 8192, 2048, 128, True, True): (32, 512, 4096, 4096, 32, 32, 512, 4096, 4096, 128),
         ('bfloat16', 'bfloat16', 8192, 256, 8, 8192, 2048, 128, True, True): (64, 512, 2048, 2048, 64, 64, 512, 2048, 2048, 128),
 
-        ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 8192, 2048, 32, True, True): (2, 2048, 4096, 4096, 2, 2, 2048, 4096, 4096, 256),
-        ('bfloat16', 'float8_e4m3fn', 128, 256, 8, 8192, 2048, 32, True, True): (4, 2048, 4096, 4096, 4, 4, 2048, 4096, 4096, 256),
-        ('bfloat16', 'float8_e4m3fn', 512, 256, 8, 8192, 2048, 32, True, True): (16, 2048, 2048, 2048, 16, 16, 2048, 2048, 2048, 1024),
-        ('bfloat16', 'float8_e4m3fn', 1024, 256, 8, 8192, 2048, 32, True, True): (32, 2048, 2048, 2048, 32, 32, 2048, 2048, 2048, 1024),
-        ('bfloat16', 'float8_e4m3fn', 2048, 256, 8, 8192, 2048, 32, True, True): (64, 1024, 4096, 4096, 64, 64, 1024, 4096, 4096, 256),
-        ('bfloat16', 'float8_e4m3fn', 4096, 256, 8, 8192, 2048, 32, True, True): (128, 1024, 2048, 2048, 128, 128, 1024, 2048, 2048, 256),
-        ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 8192, 2048, 32, True, True): (128, 1024, 2048, 2048, 128, 128, 1024, 2048, 2048, 256),
+        ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 8192, 2048, 32, True, True): (2, 2048, 4096, 4096, 2, 2, 2048, 4096, 4096, 2048),
+        ('bfloat16', 'float8_e4m3fn', 128, 256, 8, 8192, 2048, 32, True, True): (4, 2048, 4096, 4096, 4, 4, 2048, 4096, 4096, 2048),
+        ('bfloat16', 'float8_e4m3fn', 512, 256, 8, 8192, 2048, 32, True, True): (16, 2048, 2048, 2048, 16, 16, 2048, 2048, 2048, 2048),
+        ('bfloat16', 'float8_e4m3fn', 1024, 256, 8, 8192, 2048, 32, True, True): (32, 2048, 2048, 2048, 32, 32, 2048, 2048, 2048, 2048),
+        ('bfloat16', 'float8_e4m3fn', 2048, 256, 8, 8192, 2048, 32, True, True): (64, 1024, 4096, 4096, 64, 64, 1024, 4096, 4096, 2048),
+        ('bfloat16', 'float8_e4m3fn', 4096, 256, 8, 8192, 2048, 32, True, True): (128, 1024, 2048, 2048, 128, 128, 1024, 2048, 2048, 2048),
+        ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 8192, 2048, 32, True, True): (128, 1024, 2048, 2048, 128, 128, 1024, 2048, 2048, 2048),
     },
     # Fallback for any device kind.
     "*": {},
@@ -124,7 +124,7 @@ DEFAULT_FUSED_MOE_BLOCK_CONFIG = FusedMoEBlockConfig(
     bfc=512,
     bd1c=1024,
     bd2c=1024,
-    bse=512,
+    bse=2048,
 )
 
 
@@ -184,47 +184,47 @@ def get_tuned_fused_moe_block_config(
       KeyError: if not found and allow_fallback=False.
     """
 
-    keys = get_simplified_key(
-        dtype=dtype,
-        weight_dtype=weight_dtype,
-        num_tokens=num_tokens,
-        num_experts=num_experts,
-        top_k=top_k,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        ep_size=ep_size,
-        use_shared_expert=use_shared_expert,
-        use_grouped_topk=use_grouped_topk,
-    )
-    device_name = keys[0]
-    table_key = keys[1:]
+    # keys = get_simplified_key(
+    #     dtype=dtype,
+    #     weight_dtype=weight_dtype,
+    #     num_tokens=num_tokens,
+    #     num_experts=num_experts,
+    #     top_k=top_k,
+    #     hidden_size=hidden_size,
+    #     intermediate_size=intermediate_size,
+    #     ep_size=ep_size,
+    #     use_shared_expert=use_shared_expert,
+    #     use_grouped_topk=use_grouped_topk,
+    # )
+    # device_name = keys[0]
+    # table_key = keys[1:]
 
-    cfg_tuple = None
-    if device_name in TUNED_BLOCK_CONFIGS:
-        cfg_tuple = TUNED_BLOCK_CONFIGS[device_name].get(table_key)
-    if cfg_tuple is None:
-        cfg_tuple = TUNED_BLOCK_CONFIGS.get("*", {}).get(table_key)
+    # cfg_tuple = None
+    # if device_name in TUNED_BLOCK_CONFIGS:
+    #     cfg_tuple = TUNED_BLOCK_CONFIGS[device_name].get(table_key)
+    # if cfg_tuple is None:
+    #     cfg_tuple = TUNED_BLOCK_CONFIGS.get("*", {}).get(table_key)
 
-    if cfg_tuple is None:
-        return DEFAULT_FUSED_MOE_BLOCK_CONFIG
+    # if cfg_tuple is None:
+    return DEFAULT_FUSED_MOE_BLOCK_CONFIG
 
-    if len(cfg_tuple) != 10:
-        raise ValueError(f"Unexpected tuned config tuple length: {len(cfg_tuple)}")
+    # if len(cfg_tuple) != 10:
+    #     raise ValueError(f"Unexpected tuned config tuple length: {len(cfg_tuple)}")
 
-    logger.info("Using tuned block config: %s", cfg_tuple)
+    # logger.info("Using tuned block config: %s", cfg_tuple)
 
-    bt, bf, bd1, bd2, bts, btc, bfc, bd1c, bd2c, bse = cfg_tuple
+    # bt, bf, bd1, bd2, bts, btc, bfc, bd1c, bd2c, bse = cfg_tuple
 
-    cfg = FusedMoEBlockConfig(
-        bt=bt,
-        bf=bf,
-        bd1=bd1,
-        bd2=bd2,
-        btc=btc,
-        bfc=bfc,
-        bd1c=bd1c,
-        bd2c=bd2c,
-        bse=bse,
-        bts=bts,
-    )
-    return cfg
+    # cfg = FusedMoEBlockConfig(
+    #     bt=bt,
+    #     bf=bf,
+    #     bd1=bd1,
+    #     bd2=bd2,
+    #     btc=btc,
+    #     bfc=bfc,
+    #     bd1c=bd1c,
+    #     bd2c=bd2c,
+    #     bse=bse,
+    #     bts=bts,
+    # )
+    # return cfg

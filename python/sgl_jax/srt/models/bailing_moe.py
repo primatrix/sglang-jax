@@ -21,7 +21,6 @@ from sgl_jax.srt.layers.moe import (
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.utils.jax_utils import _save_moe_output_impl
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -370,10 +369,10 @@ class BailingMoEDecoderLayer(nnx.Module):
         hidden_states += residual
         residual = hidden_states
 
-        replicated_spec = jax.sharding.PartitionSpec(*([None] * hidden_states.ndim))
-        target_sharding = jax.sharding.NamedSharding(self.mesh, replicated_spec)
-        hidden_states_replicated = jax.sharding.reshard(hidden_states, target_sharding)
-        jax.debug.callback(_save_moe_output_impl, hidden_states_replicated, self.layer_id)
+        # replicated_spec = jax.sharding.PartitionSpec(*([None] * hidden_states.ndim))
+        # target_sharding = jax.sharding.NamedSharding(self.mesh, replicated_spec)
+        # hidden_states_replicated = jax.sharding.reshard(hidden_states, target_sharding)
+        # jax.debug.callback(_save_moe_output_impl, hidden_states_replicated, self.layer_id)
 
         hidden_states = self.post_attention_layernorm(hidden_states)
 
