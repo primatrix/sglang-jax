@@ -5,6 +5,7 @@ import jax
 from flax import nnx
 from jax import numpy as jnp
 from jax.experimental import io_callback
+from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
@@ -392,12 +393,12 @@ class BailingMoEDecoderLayer(nnx.Module):
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
 
-        io_callback(
-            _save_moe_output_impl,  # 回调函数
-            None,  # 返回值形状 (无)
-            hidden_states,  # 参数1: 需要保存的 Tensor
-            self.layer_id,  # 参数2: 当前层 ID
-        )
+        sharding_constraint = jax.sharding.NamedSharding(
+            self.mesh, P(None, "tensor")
+        )  # 或者 P("data", "tensor")
+        hidden_states_safe = jax.lax.with_sharding_constraint(hidden_states, sharding_constraint)
+
+        io_callback(_save_moe_output_impl, None, hidden_states_safe, self.layer_id)
         return hidden_states, residual, kv_fused, topk_ids
 
 
