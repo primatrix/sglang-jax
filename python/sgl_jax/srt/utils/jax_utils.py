@@ -214,7 +214,8 @@ def get_memory_usage():
         return {f"device_{i}": "N/A" for i in range(len(jax.devices()))}
 
 
-def _save_moe_output_impl(save_dir, data, layer_id):
+def _save_moe_output_impl(data, layer_id):
+    save_dir = "/tmp/tpu_logs"
     os.makedirs(save_dir, exist_ok=True)
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")

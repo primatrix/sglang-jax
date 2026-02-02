@@ -396,7 +396,6 @@ class BailingMoEDecoderLayer(nnx.Module):
         io_callback(
             _save_moe_output_impl,  # 回调函数
             None,  # 返回值形状 (无)
-            "/tmp/tpu_logs",
             hidden_states,  # 参数1: 需要保存的 Tensor
             self.layer_id,  # 参数2: 当前层 ID
         )
