@@ -4,7 +4,6 @@ from typing import Any
 import jax
 from flax import nnx
 from jax import numpy as jnp
-from jax.experimental import io_callback
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
@@ -22,7 +21,6 @@ from sgl_jax.srt.layers.moe import (
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.utils.jax_utils import _save_moe_output_impl
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -392,17 +390,6 @@ class BailingMoEDecoderLayer(nnx.Module):
         else:
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
-
-        global_replicated_sharding = jax.sharding.NamedSharding(
-            self.mesh, jax.sharding.PartitionSpec(None, None)
-        )
-
-        # 将数据强制 Reshard/Constraint 到全局 Replicated 状态
-        # 这一步会触发必要的 AllGather 通信，将切片数据聚合
-        hidden_states_safe = jax.sharding.reshard(hidden_states, global_replicated_sharding)
-
-        # 现在可以安全地调用 io_callback，因为数据和环境都在主 Mesh 上
-        io_callback(_save_moe_output_impl, None, hidden_states_safe, self.layer_id)
 
         return hidden_states, residual, kv_fused, topk_ids
 

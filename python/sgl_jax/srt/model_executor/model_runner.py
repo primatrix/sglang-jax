@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax._src import mesh as mesh_lib
+from jax.experimental import io_callback
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
@@ -44,7 +45,10 @@ from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
-from sgl_jax.srt.utils.jax_utils import get_available_device_memory
+from sgl_jax.srt.utils.jax_utils import (
+    _save_moe_output_impl,
+    get_available_device_memory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -538,6 +542,7 @@ class ModelRunner(BaseModelRunner):
             )
             cache_miss_count = count()
         self._set_kv_cache_after_forward(layers_kv_fused)
+        io_callback(_save_moe_output_impl, None, output, 0)
 
         # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch
         return output, cache_miss_count, layers_topk_ids
