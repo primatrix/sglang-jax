@@ -646,9 +646,20 @@ def _fused_ep_moe_kernel(
             sem=b_gating_sem,
         ).wait()
 
-    def get_top_k(input_logits, top_k, renormalize_topk_logits, *, out_top_k_logits_vmem):
+    def get_top_k(
+        input_logits,
+        top_k,
+        renormalize_topk_logits,
+        *,
+        out_top_k_logits_vmem,
+    ):
         input_logits = input_logits.astype(jnp.float32)
         num_tokens = input_logits.shape[0]
+        # Derive validity from gating logits: invalid tokens are pre-masked to
+        # all -inf (outside pallas), which keeps routing/comm fully well-defined
+        # without needing a separate per-token mask DMA.
+        max_logits = jnp.max(input_logits[:, :num_experts], axis=1, keepdims=True)
+        valid_col = jnp.isfinite(max_logits).astype(jnp.int32)
 
         if b_bias_vmem is not None:
             # b_bias_vmem (padded_num_experts,)
@@ -715,6 +726,9 @@ def _fused_ep_moe_kernel(
             # Select expert from current scores (masked/biased)
             curr_indices = jnp.argmax(curr_scores[:, :num_experts], axis=1, keepdims=True)
             top_k_indices = jnp.broadcast_to(curr_indices, padded_k_shape)
+            # Encode padding by setting expert id to -1. This avoids needing a
+            # separate per-token mask in later scalar code paths (scatter/output).
+            top_k_indices = top_k_indices * valid_col + (-jnp.int32(1)) * (jnp.int32(1) - valid_col)
 
             selection_mask = iota == broadcast_minor(top_k_indices, curr_scores.shape)
 
@@ -858,16 +872,18 @@ def _fused_ep_moe_kernel(
             src_t_id = bt_start + t_id
             for k_id in range(top_k):
                 e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
-                is_active_expert = e_id % local_num_experts == local_e_id
-                recv_id = e_id // local_num_experts
-                offset = expert_offsets_x2_smem[bt_sem_id, 0, e_id]
+                is_valid = e_id >= 0
+                e_id_safe = lax.select(is_valid, e_id, jnp.int32(0))
+                is_active_expert = is_valid & (e_id_safe % local_num_experts == local_e_id)
+                recv_id = e_id_safe // local_num_experts
+                offset = expert_offsets_x2_smem[bt_sem_id, 0, e_id_safe]
                 sz = lax.select(is_active_expert, jnp.int32(1), jnp.int32(0))
                 is_local = recv_id == my_id
                 local_sz = lax.select(is_local, sz, jnp.int32(0))
                 remote_sz = lax.select(is_local, jnp.int32(0), sz)
                 send_sz += remote_sz
-                expert_offsets_x2_smem[bt_sem_id, 0, e_id] = offset + local_sz + remote_sz
-                start = expert_starts_x2_smem[bt_sem_id, 0, e_id] + offset
+                expert_offsets_x2_smem[bt_sem_id, 0, e_id_safe] = offset + local_sz + remote_sz
+                start = expert_starts_x2_smem[bt_sem_id, 0, e_id_safe] + offset
                 pltpu.make_async_copy(
                     src_ref=tokens_hbm.at[pl.ds(src_t_id, local_sz)],
                     dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
@@ -1885,15 +1901,28 @@ def _fused_ep_moe_kernel(
         def start_load_acc_bt(*, tile_start, buf_id):
             def _load_one(t_i, _):
                 t_id = tile_start + t_i
-                for k_id in range(top_k):
-                    e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
-                    offset = expert_offsets_x2_smem[bt_sem_id, 1, e_id]
-                    expert_offsets_x2_smem[bt_sem_id, 1, e_id] = offset + 1
-                    pltpu.make_async_copy(
-                        src_ref=a2a_g_hbm.at[e_id, pl.ds(offset, 1)],
-                        dst_ref=a2a_g_acc_vmem.at[buf_id, k_id, pl.ds(t_i, 1)],
-                        sem=a2a_acc_sems.at[0],
-                    ).start()
+                # Use the routing sentinel (-1) to identify padding tokens.
+                token_e0 = t2e_routing_x2_smem[bt_sem_id, t_id, 0]
+                is_valid_token = token_e0 >= 0
+
+                @pl.when(is_valid_token)
+                def _():
+                    for k_id in range(top_k):
+                        e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
+                        offset = expert_offsets_x2_smem[bt_sem_id, 1, e_id]
+                        expert_offsets_x2_smem[bt_sem_id, 1, e_id] = offset + 1
+                        pltpu.make_async_copy(
+                            src_ref=a2a_g_hbm.at[e_id, pl.ds(offset, 1)],
+                            dst_ref=a2a_g_acc_vmem.at[buf_id, k_id, pl.ds(t_i, 1)],
+                            sem=a2a_acc_sems.at[0],
+                        ).start()
+
+                @pl.when(jnp.logical_not(is_valid_token))
+                def _():
+                    zeros = jnp.zeros((1, t_packing, h_per_t_packing), dtype=a2a_g_acc_vmem.dtype)
+                    for k_id in range(top_k):
+                        a2a_g_acc_vmem.at[buf_id, k_id, pl.ds(t_i, 1)][...] = zeros
+
                 return None
 
             lax.fori_loop(0, acc_bt, _load_one, None, unroll=False)
@@ -2263,6 +2292,7 @@ def _validate_fused_ep_moe_args(
     w2: jax.Array,
     w3: jax.Array,
     gating_output: jax.Array,
+    token_valid_mask: jax.Array | None,
     top_k: int,
     use_grouped_topk: bool,
     num_groups: int,
@@ -2309,6 +2339,9 @@ def _validate_fused_ep_moe_args(
 
     if gating_output.shape != (num_tokens, num_experts):
         raise ValueError(f"Expected {gating_output.shape=} to be {(num_tokens, num_experts)}.")
+
+    if token_valid_mask is not None and token_valid_mask.shape != (num_tokens,):
+        raise ValueError(f"Expected {token_valid_mask.shape=} to be {(num_tokens,)}.")
 
     validate_fused_moe_block_config(
         num_tokens=num_tokens,
@@ -2514,6 +2547,7 @@ def fused_ep_moe(
     gating_output: jax.Array,  # (num_tokens, num_experts)
     top_k: int,
     *,
+    token_valid_mask: jax.Array | None = None,  # (num_tokens,)
     use_grouped_topk: bool = False,
     num_groups: int = 1,
     top_k_groups: int = 1,
@@ -2576,6 +2610,7 @@ def fused_ep_moe(
         w2=w2,
         w3=w3,
         gating_output=gating_output,
+        token_valid_mask=token_valid_mask,
         top_k=top_k,
         use_grouped_topk=use_grouped_topk,
         num_groups=num_groups,
@@ -2658,6 +2693,13 @@ def fused_ep_moe(
             bias = bias.astype(jnp.float32)
         if padded_num_experts != bias.shape[0]:
             bias = jnp.pad(bias, (0, padded_num_experts - bias.shape[0]), constant_values=0.0)
+
+    if token_valid_mask is not None:
+        token_valid_mask = token_valid_mask.astype(jnp.int32)
+        # Pre-mask invalid tokens in the router logits. This avoids having to DMA
+        # a 1D validity vector into VMEM (HBM->VMEM vector copies require 128-aligned
+        # lengths), and lets the kernel derive validity from `-inf` logits.
+        gating_output = jnp.where(token_valid_mask[:, None] != 0, gating_output, -jnp.inf)
 
     tokens = tokens.reshape(-1, t_packing, hidden_size // t_packing)
 
@@ -2770,7 +2812,7 @@ def fused_ep_moe(
         # Semaphores.
         pltpu.SemaphoreType.DMA((2,)),  # token_stage_x2_sems
         pltpu.SemaphoreType.DMA((3,)),  # acc_stage_x3_sems
-        pltpu.SemaphoreType.DMA((2, 13 if w1_shared is not None else 5)),  # local_sems
+        pltpu.SemaphoreType.DMA((2, 14)),  # local_sems
         pltpu.SemaphoreType.DMA((2,)),  # send_x2_sems
         pltpu.SemaphoreType.DMA((2,)),  # recv_x2_sems
         pltpu.SemaphoreType.DMA,  # a2a_gather_sem
