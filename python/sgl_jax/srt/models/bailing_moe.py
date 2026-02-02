@@ -212,6 +212,7 @@ class BailingMoEDecoderLayer(nnx.Module):
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
+        self.mesh = mesh
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 1000000)
