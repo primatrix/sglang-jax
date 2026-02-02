@@ -921,6 +921,9 @@ def main() -> int:
         action="store_true",
         help="[Debug] Disable internal shared experts in fused kernel, and manually add the Ref-MLP output instead.",
     )
+    parser.add_argument(
+        "--load-input", type=str, default=None, help="Path to input.npy to replace random tokens"
+    )
     args = parser.parse_args()
     user_set_tokens_apply_rmsnorm = args.tokens_apply_post_attn_rmsnorm is not None
     user_set_tokens_rmsnorm_from_ckpt = args.tokens_rmsnorm_from_ckpt is not None
@@ -1208,7 +1211,39 @@ def main() -> int:
     intermediate_size = int(wi_0_np.shape[-2])
 
     key = jax.random.key(args.seed)
-    tokens_f32 = jax.random.normal(key, (args.num_tokens, hidden_size), dtype=jnp.float32)
+    if args.load_input:
+        print(f"[input] Loading custom tokens from {args.load_input}...")
+        loaded_data = jnp.load(args.load_input)
+
+        if isinstance(loaded_data, np.lib.npyio.NpzFile):
+            keys = loaded_data.files
+            target_key = next((k for k in ["input", "tokens", "data"] if k in keys), keys[0])
+            print(f"[input] Detected .npz file, using key: '{target_key}'")
+            loaded_data = loaded_data[target_key]
+
+        if loaded_data.ndim > 2:
+            loaded_data = loaded_data.reshape(-1, loaded_data.shape[-1])
+
+        if loaded_data.shape[-1] != hidden_size:
+            raise ValueError(
+                f"Input hidden_size mismatch! File: {loaded_data.shape[-1]}, "
+                f"Model: {hidden_size}. (Check if you dumped the correct layer output)"
+            )
+
+        input_np = loaded_data[: args.num_tokens]
+
+        if input_np.shape[0] < args.num_tokens:
+            print(
+                f"[warning] Input file only has {input_np.shape[0]} tokens, but --num-tokens={args.num_tokens}."
+            )
+            print(f"[warning] Using actual available tokens: {input_np.shape[0]}")
+            args.num_tokens = input_np.shape[0]
+
+        tokens_f32 = jax.device_put(
+            jnp.asarray(input_np, dtype=jnp.float32), jax.local_devices()[0]
+        )
+    else:
+        tokens_f32 = jax.random.normal(key, (args.num_tokens, hidden_size), dtype=jnp.float32)
     if args.tokens_apply_post_attn_rmsnorm:
         norm_weight = None
         if args.tokens_rmsnorm_from_ckpt and weight_map is not None:
