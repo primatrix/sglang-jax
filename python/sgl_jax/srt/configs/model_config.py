@@ -291,12 +291,12 @@ class ModelConfig:
                                     found_act_config = True
                                     break
 
-                    if found_act_config:
-                        activation_dtype_str = "float8_e4m3fn"
-                        moe_activation_dtype_jax = jnp.float8_e4m3fn
-                        logger.info(
-                            "Enabling dynamic activation quantization (float8_e4m3fn) based on config."
-                        )
+                    # if found_act_config:
+                    #     activation_dtype_str = "float8_e4m3fn"
+                    #     moe_activation_dtype_jax = jnp.float8_e4m3fn
+                    #     logger.info(
+                    #         "Enabling dynamic activation quantization (float8_e4m3fn) based on config."
+                    #     )
 
                     quant_config = QuantizationConfig(
                         is_static_checkpoint=True,
