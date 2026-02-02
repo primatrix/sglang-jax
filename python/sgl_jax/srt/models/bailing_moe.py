@@ -394,11 +394,7 @@ class BailingMoEDecoderLayer(nnx.Module):
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
 
-        sharding_constraint = jax.sharding.NamedSharding(
-            self.mesh, P(None, "tensor")
-        )  # 或者 P("data", "tensor")
-        hidden_states_safe = jax.lax.with_sharding_constraint(hidden_states, sharding_constraint)
-
+        hidden_states_safe = jax.sharding.reshard(hidden_states, P())
         io_callback(_save_moe_output_impl, None, hidden_states_safe, self.layer_id)
         return hidden_states, residual, kv_fused, topk_ids
 
