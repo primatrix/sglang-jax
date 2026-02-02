@@ -1711,6 +1711,17 @@ def main() -> int:
             + f" shape={shared_np.shape}"
         )
 
+        hybrid_fused = fused_no_shared_np.astype(np.float32) + shared_np
+        hybrid_ep = ep_expert_np.astype(np.float32) + shared_np
+
+        hybrid_stats = _describe_diff(hybrid_fused, hybrid_ep)
+
+        print(
+            "[diff.hybrid_check] "
+            + " ".join(f"{k}={v:.6g}" for k, v in hybrid_stats.items())
+            + " (Ref: EP+QL vs Target: Fused+QL)"
+        )
+
     if args.dump_shared_intermediates:
         if not has_shared or fused_no_shared_np is None or shared_out is None:
             print("[dump.shared] skipped (shared_experts not enabled in this run)")
