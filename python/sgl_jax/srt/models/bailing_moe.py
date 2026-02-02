@@ -4,6 +4,7 @@ from typing import Any
 import jax
 from flax import nnx
 from jax import numpy as jnp
+from jax.experimental import io_callback
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
@@ -21,6 +22,7 @@ from sgl_jax.srt.layers.moe import (
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.utils.jax_utils import _save_moe_output_impl
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -828,6 +830,8 @@ class BailingMoEForCausalLM(nnx.Module):
         hidden_states, layers_kv_fused, layers_topk_ids = self.model(
             forward_batch, token_to_kv_pool
         )
+        io_callback(_save_moe_output_impl, None, hidden_states, 0)
+
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
