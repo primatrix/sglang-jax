@@ -61,6 +61,10 @@ cpu = [
 all = [
     "jax[tpu]==0.8.1",
 ]
+multimodal = [
+    "torch",
+    "torchvision",
+]
 
 [tool.setuptools.packages.find]
 exclude = [
