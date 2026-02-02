@@ -4,7 +4,6 @@ from typing import Any
 import jax
 from flax import nnx
 from jax import numpy as jnp
-from jax.experimental import io_callback
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
@@ -462,7 +461,9 @@ class BailingMoEModel(nnx.Module):
             hidden_states_replicated = jax.sharding.reshard(hidden_states, target_sharding)
 
             # 4. 回调
-            io_callback(_save_moe_output_impl, None, hidden_states_replicated, layer.layer_id)
+            jax.debug.callback(
+                _save_moe_output_impl, None, hidden_states_replicated, layer.layer_id
+            )
 
         if residual is not None:
             hidden_states += residual
