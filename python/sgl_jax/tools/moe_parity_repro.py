@@ -916,6 +916,14 @@ def main() -> int:
             "shared math; defaults to False to match end-to-end QuantizedLinear behavior."
         ),
     )
+    parser.add_argument(
+        "--debug-use-ref-shared",
+        action="store_true",
+        help="[Debug] Disable internal shared experts in fused kernel, and manually add the Ref-MLP output instead.",
+    )
+    parser.add_argument(
+        "--load-input", type=str, default=None, help="Path to input.npy to replace random tokens"
+    )
     args = parser.parse_args()
     user_set_tokens_apply_rmsnorm = args.tokens_apply_post_attn_rmsnorm is not None
     user_set_tokens_rmsnorm_from_ckpt = args.tokens_rmsnorm_from_ckpt is not None
@@ -1203,7 +1211,38 @@ def main() -> int:
     intermediate_size = int(wi_0_np.shape[-2])
 
     key = jax.random.key(args.seed)
-    tokens_f32 = jax.random.normal(key, (args.num_tokens, hidden_size), dtype=jnp.float32)
+    if args.load_input:
+        print(f"[input] Loading custom tokens from {args.load_input}...")
+        loaded_data = jnp.load(args.load_input)
+
+        if isinstance(loaded_data, np.lib.npyio.NpzFile):
+            keys = loaded_data.files
+            target_key = next((k for k in ["input", "tokens", "data"] if k in keys), keys[0])
+            print(f"[input] Detected .npz file, using key: '{target_key}'")
+            loaded_data = loaded_data[target_key]
+
+        if loaded_data.ndim > 2:
+            loaded_data = loaded_data.reshape(-1, loaded_data.shape[-1])
+
+        if loaded_data.shape[-1] != hidden_size:
+            raise ValueError(
+                f"Input hidden_size mismatch! File: {loaded_data.shape[-1]}, "
+                f"Model: {hidden_size}. (Check if you dumped the correct layer output)"
+            )
+
+        input_np = np.array(loaded_data[: args.num_tokens])
+
+        if input_np.shape[0] < args.num_tokens:
+            print(
+                f"[warning] Input file only has {input_np.shape[0]} tokens, but --num-tokens={args.num_tokens}."
+            )
+            print(f"[warning] Using actual available tokens: {input_np.shape[0]}")
+            args.num_tokens = input_np.shape[0]
+
+        replicated_sharding = NamedSharding(mesh, P())
+        tokens_f32 = jax.device_put(jnp.asarray(input_np, dtype=jnp.float32), replicated_sharding)
+    else:
+        tokens_f32 = jax.random.normal(key, (args.num_tokens, hidden_size), dtype=jnp.float32)
     if args.tokens_apply_post_attn_rmsnorm:
         norm_weight = None
         if args.tokens_rmsnorm_from_ckpt and weight_map is not None:
@@ -1239,9 +1278,12 @@ def main() -> int:
             (tokens.astype(jnp.float32) @ gate_w).astype(jnp.float32),
             args.score_function,
         ).astype(router_dtype)
-        router_bias = (
-            jnp.asarray(router_bias_np, dtype=jnp.bfloat16) if router_bias_np is not None else None
-        )
+        if router_bias_np is not None:
+            router_bias = jax.device_put(
+                jnp.asarray(router_bias_np, dtype=jnp.bfloat16), NamedSharding(mesh, P())
+            )
+        else:
+            router_bias = None
         print(
             f"[router] from_checkpoint gate_weight=yes expert_bias={'yes' if router_bias_np is not None else 'no'}"
         )
@@ -1300,7 +1342,8 @@ def main() -> int:
         topk_group=(args.top_k_groups if args.use_grouped_topk else 0),
         routed_scaling_factor=args.routed_scaling_factor,
     )
-    topk_weights, topk_ids = topk(router_logits, router_bias)
+    with jax.set_mesh(mesh):
+        topk_weights, topk_ids = topk(router_logits, router_bias)
 
     moe_weight_dtype = _str_to_dtype(args.moe_weight_dtype)
     if use_static:
@@ -1558,6 +1601,22 @@ def main() -> int:
         else:
             w1_scale = w2_scale = w3_scale = None
 
+    call_w1_shared = w1_shared_fused
+    call_w2_shared = w2_shared_fused
+    call_w3_shared = w3_shared_fused
+    call_w1_shared_scale = w1_shared_scale
+    call_w2_shared_scale = w2_shared_scale
+    call_w3_shared_scale = w3_shared_scale
+
+    if args.debug_use_ref_shared:
+        print("[debug] 🛡️ Shielding Fused Shared Experts (passing None to kernel)...")
+        call_w1_shared = None
+        call_w2_shared = None
+        call_w3_shared = None
+        call_w1_shared_scale = None
+        call_w2_shared_scale = None
+        call_w3_shared_scale = None
+
     fused_out = fused_ep_moe(
         mesh=mesh,
         tokens=tokens,
@@ -1577,12 +1636,12 @@ def main() -> int:
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         w3_scale=w3_scale,
-        w1_shared=w1_shared_fused,
-        w2_shared=w2_shared_fused,
-        w3_shared=w3_shared_fused,
-        w1_shared_scale=w1_shared_scale,
-        w2_shared_scale=w2_shared_scale,
-        w3_shared_scale=w3_shared_scale,
+        w1_shared=call_w1_shared,
+        w2_shared=call_w2_shared,
+        w3_shared=call_w3_shared,
+        w1_shared_scale=call_w1_shared_scale,
+        w2_shared_scale=call_w2_shared_scale,
+        w3_shared_scale=call_w3_shared_scale,
         tp_axis_name="tensor",
     )
     fused_out_no_shared = None
@@ -1658,6 +1717,12 @@ def main() -> int:
                     act_fn=args.act_fn,
                 )
         ep_out = ep_out + shared_out
+
+    if args.debug_use_ref_shared and shared_out is not None:
+        print("[debug] ➕ Adding Ref-MLP Shared Output to Fused-MoE output manually.")
+        fused_out = (fused_out.astype(jnp.float32) + shared_out.astype(jnp.float32)).astype(
+            jnp.bfloat16
+        )
 
     fused_np = np.asarray(jax.device_get(fused_out))
     fused_no_shared_np = (
