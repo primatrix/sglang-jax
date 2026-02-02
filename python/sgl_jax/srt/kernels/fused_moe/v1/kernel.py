@@ -260,10 +260,10 @@ def validate_fused_moe_block_config(
             raise ValueError(f"Expected {intermediate_size=} to be aligned to {subc_quant_wsz=}.")
         if bd1c != subc_quant_wsz * t_packing:
             raise ValueError(
-                f"Expected {bd1c=} to be {subc_quant_wsz * t_packing=} when quantized."
+                f"Expected {bd1c=} to be {subc_quant_wsz * t_packing=} when block quantized."
             )
         if bfc != subc_quant_wsz:
-            raise ValueError(f"Expected {bfc=} to be {subc_quant_wsz=} when quantized.")
+            raise ValueError(f"Expected {bfc=} to be {subc_quant_wsz=} when block quantized.")
 
 
 def ref_moe(
@@ -1007,20 +1007,35 @@ def _fused_ep_moe_kernel(
                 sem=local_sems.at[bw1_sem_id, 1],
             ).start()
             if w1_scale_hbm is not None:
-                assert subc_quant_wsz is not None
-                pltpu.make_async_copy(
-                    src_ref=w1_scale_hbm.at[
-                        local_e_id,
-                        pl.ds(
-                            offset // subc_quant_wsz,
-                            bd1_per_t_packing // subc_quant_wsz,
-                        ),
-                        pl.ds(0, 1),
-                        pl.ds(bf_id * bf, bf),
-                    ],
-                    dst_ref=b_w1_scale_x2_vmem.at[bw1_sem_id, p],
-                    sem=local_sems.at[bw1_sem_id, 1],
-                ).start()
+                if subc_quant_wsz is not None:
+                    # Original Block-wise Logic
+                    pltpu.make_async_copy(
+                        src_ref=w1_scale_hbm.at[
+                            local_e_id,
+                            pl.ds(offset // subc_quant_wsz, bd1_per_t_packing // subc_quant_wsz),
+                            pl.ds(0, 1),
+                            pl.ds(bf_id * bf, bf),
+                        ],
+                        dst_ref=b_w1_scale_x2_vmem.at[bw1_sem_id, p],
+                        sem=local_sems.at[bw1_sem_id, 1],
+                    ).start()
+                else:
+                    # New Per-Channel Logic (Load scale corresponding to Output Dim `bf`)
+                    # We only need to load it once per bf block, regardless of bd1_id or p
+                    # But to keep semaphores simple, we can load it redundantly or just on p=0
+                    @pl.when(p == 0)
+                    def _():
+                        pltpu.make_async_copy(
+                            src_ref=w1_scale_hbm.at[
+                                local_e_id,
+                                pl.ds(0, 1),  # Dim 1 is squeezed/1
+                                pl.ds(0, 1),
+                                pl.ds(bf_id * bf, bf),  # Load Output Channel slice
+                            ],
+                            dst_ref=b_w1_scale_x2_vmem.at[bw1_sem_id, 0],  # Store in index 0
+                            sem=local_sems.at[bw1_sem_id, 1],
+                        ).start()
+
         if b1_hbm is not None:
 
             @pl.when(bd1_id == 0)
@@ -1044,23 +1059,31 @@ def _fused_ep_moe_kernel(
                 sem=local_sems.at[bw2_sem_id, 2],
             ).start()
             if w2_scale_hbm is not None:
-                assert subc_quant_wsz is not None
-                pltpu.make_async_copy(
-                    src_ref=w2_scale_hbm.at[
-                        local_e_id,
-                        pl.ds(bf_id * bf // subc_quant_wsz, bf // subc_quant_wsz),
-                        pl.ds(0, 1),
-                        pl.ds(offset, bd2_per_t_packing),
-                    ],
-                    dst_ref=b_w2_scale_x2_vmem.at[bw2_sem_id, p],
-                    sem=local_sems.at[bw2_sem_id, 2],
-                ).start()
-            if b2_hbm is not None and bf_id == 0:
-                pltpu.make_async_copy(
-                    src_ref=b2_hbm.at[local_e_id, pl.ds(0, 1), pl.ds(offset, bd2_per_t_packing)],
-                    dst_ref=b_b2_x2_vmem.at[bd2_id % 2, p],
-                    sem=local_sems.at[bw2_sem_id, 2],
-                ).start()
+                if subc_quant_wsz is not None:
+                    # Original Block-wise Logic
+                    pltpu.make_async_copy(
+                        src_ref=w2_scale_hbm.at[
+                            local_e_id,
+                            pl.ds(bf_id * bf // subc_quant_wsz, bf // subc_quant_wsz),
+                            pl.ds(0, 1),
+                            pl.ds(offset, bd2_per_t_packing),
+                        ],
+                        dst_ref=b_w2_scale_x2_vmem.at[bw2_sem_id, p],
+                        sem=local_sems.at[bw2_sem_id, 2],
+                    ).start()
+                else:
+                    # New Per-Channel Logic (Load scale corresponding to Output Dim `bd2`)
+                    # W2 is (I, H). Scale is (1, H). offset tracks H dimension.
+                    pltpu.make_async_copy(
+                        src_ref=w2_scale_hbm.at[
+                            local_e_id,
+                            pl.ds(0, 1),
+                            pl.ds(0, 1),
+                            pl.ds(offset, bd2_per_t_packing),  # Output Channel Slice
+                        ],
+                        dst_ref=b_w2_scale_x2_vmem.at[bw2_sem_id, p],
+                        sem=local_sems.at[bw2_sem_id, 2],
+                    ).start()
 
     def start_fetch_bw3(local_e_id, bw3_sem_id, bf_id, bd3_id):
         for p in range(t_packing):
@@ -1075,20 +1098,32 @@ def _fused_ep_moe_kernel(
                 sem=local_sems.at[bw3_sem_id, 3],
             ).start()
             if w3_scale_hbm is not None:
-                assert subc_quant_wsz is not None
-                pltpu.make_async_copy(
-                    src_ref=w3_scale_hbm.at[
-                        local_e_id,
-                        pl.ds(
-                            offset // subc_quant_wsz,
-                            bd1_per_t_packing // subc_quant_wsz,
-                        ),
-                        pl.ds(0, 1),
-                        pl.ds(bf_id * bf, bf),
-                    ],
-                    dst_ref=b_w3_scale_x2_vmem.at[bw3_sem_id, p],
-                    sem=local_sems.at[bw3_sem_id, 3],
-                ).start()
+                if subc_quant_wsz is not None:
+                    pltpu.make_async_copy(
+                        src_ref=w3_scale_hbm.at[
+                            local_e_id,
+                            pl.ds(offset // subc_quant_wsz, bd1_per_t_packing // subc_quant_wsz),
+                            pl.ds(0, 1),
+                            pl.ds(bf_id * bf, bf),
+                        ],
+                        dst_ref=b_w3_scale_x2_vmem.at[bw3_sem_id, p],
+                        sem=local_sems.at[bw3_sem_id, 3],
+                    ).start()
+                else:
+
+                    @pl.when(p == 0)
+                    def _():
+                        pltpu.make_async_copy(
+                            src_ref=w3_scale_hbm.at[
+                                local_e_id,
+                                pl.ds(0, 1),
+                                pl.ds(0, 1),
+                                pl.ds(bf_id * bf, bf),
+                            ],
+                            dst_ref=b_w3_scale_x2_vmem.at[bw3_sem_id, 0],
+                            sem=local_sems.at[bw3_sem_id, 3],
+                        ).start()
+
         if b3_hbm is not None:
 
             @pl.when(bd3_id == 0)
@@ -1349,21 +1384,15 @@ def _fused_ep_moe_kernel(
         assert bd1c % (t_packing * 128) == 0, (bd1c, t_packing)
         assert bd1_per_t_packing % bd1c_per_t_packing == 0
         if w1_scale_vmem is not None:
-            assert w1_scale_vmem.shape == (
-                t_packing,
-                bd1_per_t_packing // subc_quant_wsz,
-                1,
-                bf,
-            )
-            assert bd1c_per_t_packing == subc_quant_wsz
-        if w3_scale_vmem is not None:
-            assert w3_scale_vmem.shape == (
-                t_packing,
-                bd1_per_t_packing // subc_quant_wsz,
-                1,
-                bf,
-            )
-            assert bd1c_per_t_packing == subc_quant_wsz
+            if subc_quant_wsz is not None:
+                assert w1_scale_vmem.shape == (
+                    t_packing,
+                    bd1_per_t_packing // subc_quant_wsz,
+                    1,
+                    bf,
+                )
+            else:
+                assert w1_scale_vmem.shape == (1, 1, 1, bf)
 
         dyn_sz_i32 = dyn_sz.astype(jnp.int32)
         num_loops = lax.select(dyn_sz_i32 > 0, (dyn_sz_i32 + (btc - 1)) // btc, 0)
@@ -1386,26 +1415,43 @@ def _fused_ep_moe_kernel(
                         acc1 = jnp.dot(t, w1, preferred_element_type=jnp.float32)
 
                         if w1_scale_vmem is not None:
-                            w1_scale_slices = (
-                                p_id,
-                                bd1c_id,
-                                pl.ds(0, 1),
-                                pl.ds(bfc_id * bfc, bfc),
-                            )
-                            w1_scale = jnp.broadcast_to(w1_scale_vmem[*w1_scale_slices], acc1.shape)
+                            if subc_quant_wsz is not None:
+                                w1_scale_slices = (
+                                    p_id,
+                                    bd1c_id,
+                                    pl.ds(0, 1),
+                                    pl.ds(bfc_id * bfc, bfc),
+                                )
+                                w1_scale = jnp.broadcast_to(
+                                    w1_scale_vmem[*w1_scale_slices], acc1.shape
+                                )
+                            else:
+                                # Per-Channel: Load slice of Output Channel (bf)
+                                w1_scale_slices = (0, 0, 0, pl.ds(bfc_id * bfc, bfc))
+                                w1_scale = jnp.broadcast_to(
+                                    w1_scale_vmem[*w1_scale_slices], acc1.shape
+                                )
                             acc1 *= w1_scale
 
                         w3 = w3_vmem[*w_slices]
                         acc3 = jnp.dot(t, w3, preferred_element_type=jnp.float32)
 
                         if w3_scale_vmem is not None:
-                            w3_scale_slices = (
-                                p_id,
-                                bd1c_id,
-                                pl.ds(0, 1),
-                                pl.ds(bfc_id * bfc, bfc),
-                            )
-                            w3_scale = jnp.broadcast_to(w3_scale_vmem[*w3_scale_slices], acc3.shape)
+                            if subc_quant_wsz is not None:
+                                w3_scale_slices = (
+                                    p_id,
+                                    bd1c_id,
+                                    pl.ds(0, 1),
+                                    pl.ds(bfc_id * bfc, bfc),
+                                )
+                                w3_scale = jnp.broadcast_to(
+                                    w3_scale_vmem[*w3_scale_slices], acc3.shape
+                                )
+                            else:
+                                w3_scale_slices = (0, 0, 0, pl.ds(bfc_id * bfc, bfc))
+                                w3_scale = jnp.broadcast_to(
+                                    w3_scale_vmem[*w3_scale_slices], acc3.shape
+                                )
                             acc3 *= w3_scale
 
                         acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
@@ -1464,13 +1510,15 @@ def _fused_ep_moe_kernel(
         assert t_dtype in (jnp.float32, jnp.bfloat16)
 
         if w2_scale_vmem is not None:
-            assert w2_scale_vmem.shape == (
-                t_packing,
-                bf // subc_quant_wsz,
-                1,
-                bd2_per_t_packing,
-            )
-            assert bfc == subc_quant_wsz
+            if subc_quant_wsz is not None:
+                assert w2_scale_vmem.shape == (
+                    t_packing,
+                    bf // subc_quant_wsz,
+                    1,
+                    bd2_per_t_packing,
+                )
+            else:
+                assert w2_scale_vmem.shape == (t_packing, 1, 1, bd2_per_t_packing)
 
         dyn_sz_i32 = dyn_sz.astype(jnp.int32)
         num_loops = lax.select(dyn_sz_i32 > 0, (dyn_sz_i32 + (btc - 1)) // btc, 0)
@@ -1502,12 +1550,21 @@ def _fused_ep_moe_kernel(
                         ]
                         acc = jnp.dot(act, w2, preferred_element_type=jnp.float32)
                         if w2_scale_vmem is not None:
-                            w2_scale_slices = (
-                                p_id,
-                                bfc_id,
-                                pl.ds(0, 1),
-                                pl.ds(bd2c_id * bd2c_per_t_packing, bd2c_per_t_packing),
-                            )
+                            if subc_quant_wsz is not None:
+                                w2_scale_slices = (
+                                    p_id,
+                                    bfc_id,
+                                    pl.ds(0, 1),
+                                    pl.ds(bd2c_id * bd2c_per_t_packing, bd2c_per_t_packing),
+                                )
+                            else:
+                                w2_scale_slices = (
+                                    p_id,
+                                    0,
+                                    0,
+                                    pl.ds(bd2c_id * bd2c_per_t_packing, bd2c_per_t_packing),
+                                )
+
                             w2_scale = jnp.broadcast_to(w2_scale_vmem[*w2_scale_slices], acc.shape)
                             acc *= w2_scale
                         res += acc
@@ -2646,26 +2703,29 @@ def fused_ep_moe(
 
     w1_scale_scratch = None
     if w1_scale is not None:
-        assert subc_quant_wsz is not None
-        w1_scale_scratch = pltpu.VMEM(
-            (2, t_packing, bd1_per_pack // subc_quant_wsz, 1, block_config.bf),
-            jnp.float32,
-        )
+        if subc_quant_wsz is not None:
+            w1_scale_shape = (2, t_packing, bd1_per_pack // subc_quant_wsz, 1, block_config.bf)
+        else:
+            # Per-Channel: (2, 1, 1, bf). Note: We use index 0 of t_packing dim.
+            w1_scale_shape = (2, 1, 1, block_config.bf)
+        w1_scale_scratch = pltpu.VMEM(w1_scale_shape, jnp.float32)
+
     w3_scale_scratch = None
     if w3_scale is not None:
-        assert subc_quant_wsz is not None
-        w3_scale_scratch = pltpu.VMEM(
-            (2, t_packing, bd1_per_pack // subc_quant_wsz, 1, block_config.bf),
-            jnp.float32,
-        )
+        if subc_quant_wsz is not None:
+            w3_scale_shape = (2, t_packing, bd1_per_pack // subc_quant_wsz, 1, block_config.bf)
+        else:
+            w3_scale_shape = (2, 1, 1, block_config.bf)
+        w3_scale_scratch = pltpu.VMEM(w3_scale_shape, jnp.float32)
 
     w2_scale_scratch = None
     if w2_scale is not None:
-        assert subc_quant_wsz is not None
-        w2_scale_scratch = pltpu.VMEM(
-            (2, t_packing, block_config.bf // subc_quant_wsz, 1, bd2_per_pack),
-            jnp.float32,
-        )
+        if subc_quant_wsz is not None:
+            w2_scale_shape = (2, t_packing, block_config.bf // subc_quant_wsz, 1, bd2_per_pack)
+        else:
+            w2_scale_shape = (2, t_packing, 1, 1, bd2_per_pack)  # Wait, logic above used 4D.
+            w2_scale_shape = (2, t_packing, 1, 1, bd2_per_pack)
+        w2_scale_scratch = pltpu.VMEM(w2_scale_shape, jnp.float32)
 
     b1_scratch = None if b1 is None else pltpu.VMEM((2, 1, block_config.bf), jnp.float32)
     b3_scratch = None if b3 is None else pltpu.VMEM((2, 1, block_config.bf), jnp.float32)

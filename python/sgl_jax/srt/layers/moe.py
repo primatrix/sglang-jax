@@ -1038,7 +1038,7 @@ class FusedEPMoE(nnx.Module):
         # w1_shared_scale = None
         # w3_shared_scale = None
         # w2_shared_scale = None
-        subc_quant_wsz = self.subc_quant_wsz if self.subc_quant_wsz is not None else None
+        # subc_quant_wsz = self.subc_quant_wsz if self.subc_quant_wsz is not None else None
 
         output = fused_ep_moe(
             mesh=self.mesh,
@@ -1057,7 +1057,7 @@ class FusedEPMoE(nnx.Module):
             act_fn=self.activation,
             block_config=block_config,
             # Optional parameters (not used in basic case)
-            subc_quant_wsz=subc_quant_wsz,
+            subc_quant_wsz=None,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             w3_scale=w3_scale,

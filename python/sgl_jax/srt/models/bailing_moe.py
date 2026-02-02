@@ -651,7 +651,7 @@ class BailingMoEForCausalLM(nnx.Module):
             moe_backend = getattr(self.config, "moe_backend", "epmoe")
             use_fused = moe_backend == "fused"
 
-            BLOCK_SIZE = 256
+            # BLOCK_SIZE = 256
             hidden_size = self.config.hidden_size
             inter_size = getattr(self.config, "moe_intermediate_size", 2048)
 
@@ -684,18 +684,22 @@ class BailingMoEForCausalLM(nnx.Module):
                     out_dim = hidden_size if is_w2 else inter_size
 
                     if use_fused:
-                        in_dim = inter_size if is_w2 else hidden_size
-                        num_blocks = in_dim // BLOCK_SIZE
+                        # in_dim = inter_size if is_w2 else hidden_size
+                        # num_blocks = in_dim // BLOCK_SIZE
                         scale_reshape = (num_experts, 1, 1, out_dim)
-                        scale_repeat = (1, num_blocks)
+                        scale_repeat = None
 
                         scale_sharding = None
                         if mapping.sharding:
+                            target_out_sharding = (
+                                mapping.sharding[2] if len(mapping.sharding) > 2 else None
+                            )
+
                             scale_sharding = (
-                                mapping.sharding[0],
-                                mapping.sharding[1],
-                                None,
-                                mapping.sharding[2],
+                                mapping.sharding[0],  # Expert Axis
+                                None,  # Dim 1 (Input Block) -> 1
+                                None,  # Dim 2 (Input Block Inner) -> 1
+                                target_out_sharding,  # Out Axis
                             )
 
                         new_moe_mappings[scale_key] = WeightMapping(
