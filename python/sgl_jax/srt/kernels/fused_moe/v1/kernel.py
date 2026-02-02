@@ -1032,7 +1032,7 @@ def _fused_ep_moe_kernel(
                                 pl.ds(0, 1),
                                 pl.ds(bf_id * bf, bf),  # Load Output Channel slice
                             ],
-                            dst_ref=b_w1_scale_x2_vmem.at[bw1_sem_id, 0],  # Store in index 0
+                            dst_ref=b_w1_scale_x2_vmem.at[bw1_sem_id],
                             sem=local_sems.at[bw1_sem_id, 1],
                         ).start()
 
@@ -1120,7 +1120,7 @@ def _fused_ep_moe_kernel(
                                 pl.ds(0, 1),
                                 pl.ds(bf_id * bf, bf),
                             ],
-                            dst_ref=b_w3_scale_x2_vmem.at[bw3_sem_id, 0],
+                            dst_ref=b_w3_scale_x2_vmem.at[bw3_sem_id],
                             sem=local_sems.at[bw3_sem_id, 3],
                         ).start()
 
@@ -1392,7 +1392,7 @@ def _fused_ep_moe_kernel(
                     bf,
                 )
             else:
-                assert w1_scale_vmem.shape == (1, 1, 1, bf)
+                assert w1_scale_vmem.shape == (1, 1, bf)
 
         dyn_sz_i32 = dyn_sz.astype(jnp.int32)
         num_loops = lax.select(dyn_sz_i32 > 0, (dyn_sz_i32 + (btc - 1)) // btc, 0)
@@ -1427,7 +1427,7 @@ def _fused_ep_moe_kernel(
                                 )
                             else:
                                 # Per-Channel: Load slice of Output Channel (bf)
-                                w1_scale_slices = (0, 0, 0, pl.ds(bfc_id * bfc, bfc))
+                                w1_scale_slices = (0, 0, pl.ds(bfc_id * bfc, bfc))
                                 w1_scale = jnp.broadcast_to(
                                     w1_scale_vmem[*w1_scale_slices], acc1.shape
                                 )
@@ -1448,7 +1448,7 @@ def _fused_ep_moe_kernel(
                                     w3_scale_vmem[*w3_scale_slices], acc3.shape
                                 )
                             else:
-                                w3_scale_slices = (0, 0, 0, pl.ds(bfc_id * bfc, bfc))
+                                w3_scale_slices = (0, 0, pl.ds(bfc_id * bfc, bfc))
                                 w3_scale = jnp.broadcast_to(
                                     w3_scale_vmem[*w3_scale_slices], acc3.shape
                                 )
