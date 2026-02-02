@@ -2012,7 +2012,6 @@ def _fused_ep_moe_kernel(
                     start_fetch_se_w1(0, block_id, 0)
                     start_fetch_se_w3(0, block_id, 0)
 
-            # 1. FFN1 Accumulation (bt, bse)
             gate_acc = jnp.zeros((bt, bse), dtype=jnp.float32)
             up_acc = jnp.zeros((bt, bse), dtype=jnp.float32)
 
@@ -2041,13 +2040,14 @@ def _fused_ep_moe_kernel(
                 wait_fetch_se_tokens_slice(bt_sem_id=bt_sem_id, buf_id=token_buf_id)
 
                 for p_id in range(t_packing):
-                    t_f32 = b_se_tokens_vmem[
+                    t_val = b_se_tokens_vmem[
                         bt_sem_id, token_buf_id, pl.ds(0, bt), p_id, pl.ds(0, bd1_per_t_packing)
                     ]
                     w1_gate = b_se_w1_x2_vmem[curr_sem, p_id]
                     w3_up = b_se_w3_x2_vmem[curr_sem, p_id]
-                    act_gate_acc += jnp.dot(t_f32, w1_gate, preferred_element_type=jnp.float32)
-                    act_up_acc += jnp.dot(t_f32, w3_up, preferred_element_type=jnp.float32)
+
+                    act_gate_acc += jnp.dot(t_val, w1_gate, preferred_element_type=jnp.float32)
+                    act_up_acc += jnp.dot(t_val, w3_up, preferred_element_type=jnp.float32)
 
                 return (act_gate_acc, act_up_acc)
 
@@ -2074,12 +2074,10 @@ def _fused_ep_moe_kernel(
                 next_sem = (bd2_idx + 1) % 2
                 next_bd2_idx = bd2_idx + 1
 
-                # Prefetch the next slice of W2
                 @pl.when(next_bd2_idx < num_bd2)
                 def _():
                     start_fetch_se_w2(next_sem, block_id, next_bd2_idx)
 
-                # --- CROSS-BLOCK PREFETCH: Fetch W1/W3 for NEXT block_id ---
                 @pl.when(bd2_idx == 0)
                 def _():
                     next_block_id = block_id + 1
