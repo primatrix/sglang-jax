@@ -2035,13 +2035,20 @@ def _fused_ep_moe_kernel(
                 wait_fetch_se_tokens_slice(bt_sem_id=bt_sem_id, buf_id=token_buf_id)
 
                 for p_id in range(t_packing):
-                    t_f32 = b_se_tokens_vmem[
+                    t_val = b_se_tokens_vmem[
                         bt_sem_id, token_buf_id, pl.ds(0, bt), p_id, pl.ds(0, bd1_per_t_packing)
                     ]
+                    t_val_compute = t_val.astype(t_dtype)
+
                     w1_gate = b_se_w1_x2_vmem[curr_sem, p_id]
                     w3_up = b_se_w3_x2_vmem[curr_sem, p_id]
-                    act_gate_acc += jnp.dot(t_f32, w1_gate, preferred_element_type=jnp.float32)
-                    act_up_acc += jnp.dot(t_f32, w3_up, preferred_element_type=jnp.float32)
+
+                    act_gate_acc += jnp.dot(
+                        t_val_compute, w1_gate.astype(t_dtype), preferred_element_type=jnp.float32
+                    )
+                    act_up_acc += jnp.dot(
+                        t_val_compute, w3_up.astype(t_dtype), preferred_element_type=jnp.float32
+                    )
 
                 return (act_gate_acc, act_up_acc)
 
@@ -2050,12 +2057,12 @@ def _fused_ep_moe_kernel(
             if b_se_w1_scale_all is not None:
                 s_gate = b_se_w1_scale_all[0, 0, pl.ds(block_id * bse, bse)]
                 s_gate = jnp.broadcast_to(s_gate, gate_res.shape)
-                gate_res = gate_res * s_gate
+                gate_res = gate_res * s_gate.astype(t_dtype)
 
             if b_se_w3_scale_all is not None:
                 s_up = b_se_w3_scale_all[0, 0, pl.ds(block_id * bse, bse)]
                 s_up = jnp.broadcast_to(s_up, up_res.shape)
-                up_res = up_res * s_up
+                up_res = up_res * s_up.astype(t_dtype)
 
             act = activation_fn(gate_res, up_res, act_fn)
 
@@ -2089,14 +2096,24 @@ def _fused_ep_moe_kernel(
                 for p_id in range(t_packing):
                     w2_val = b_se_w2_x2_vmem[curr_sem, p_id]
 
-                    acc_chunk = jnp.dot(act, w2_val, preferred_element_type=jnp.float32)
+                    # [Fix 4/4] Down Matmul & Scale: 这里的修改最关键
+                    # 1. Dot 输入转 BF16, 累加用 FP32
+                    acc_chunk = jnp.dot(
+                        act, w2_val.astype(t_dtype), preferred_element_type=jnp.float32
+                    )
 
                     hidden_offset = p_id * h_per_t_packing + bd2_idx * bd2_per_t_packing
 
                     if b_se_w2_scale_all is not None:
                         s_down = b_se_w2_scale_all[0, 0, pl.ds(hidden_offset, bd2_per_t_packing)]
                         s_down = jnp.broadcast_to(s_down, acc_chunk.shape)
-                        acc_chunk *= s_down
+
+                        # === 终极 BF16 模拟 ===
+                        # QuantizedLinear 是 BF16 Accumulator * BF16 Scale
+                        # Pallas 强制 FP32 Accumulator。
+                        # 为了对齐，我们在乘 Scale 之前，先手动把 FP32 Acc 截断为 BF16
+                        acc_chunk_bf16 = acc_chunk.astype(t_dtype)
+                        acc_chunk = acc_chunk_bf16 * s_down.astype(t_dtype)
 
                     out_slice = b_output_x2_vmem.at[
                         out_buf_id, pl.ds(0, bt), pl.ds(hidden_offset, bd2_per_t_packing)
