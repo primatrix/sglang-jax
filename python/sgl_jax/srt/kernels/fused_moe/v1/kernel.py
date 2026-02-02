@@ -2109,7 +2109,7 @@ def _fused_ep_moe_kernel(
                         s_down = jnp.broadcast_to(s_down, acc_chunk.shape)
                         acc_chunk_bf16 = acc_chunk.astype(t_dtype)
                         acc_chunk = acc_chunk_bf16 * s_down.astype(t_dtype)
-
+                        acc_chunk = acc_chunk.astype(jnp.float32)
                     out_slice = b_output_x2_vmem.at[
                         out_buf_id, pl.ds(0, bt), pl.ds(hidden_offset, bd2_per_t_packing)
                     ]
