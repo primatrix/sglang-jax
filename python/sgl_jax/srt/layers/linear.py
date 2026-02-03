@@ -113,6 +113,7 @@ class QuantizedLinear(nnx.Module):
         kernel_axes: Sequence[str | None] | None = None,
         skip_bias_add: bool = False,
         params_dtype: jnp.dtype | None = jnp.bfloat16,
+        compute_dtype: jnp.dtype | None = None,
         scope_name: str = "quantized_linear",
     ):
         """Initialize the quantized linear layer with pre-quantized weights."""
@@ -124,6 +125,7 @@ class QuantizedLinear(nnx.Module):
         self.kernel_axes = kernel_axes
         self.skip_bias_add = skip_bias_add
         self.params_dtype = params_dtype
+        self.compute_dtype = compute_dtype
         self.name = scope_name
 
         # Determine if we need tensor parallel reduction
@@ -238,6 +240,7 @@ class QuantizedLinear(nnx.Module):
                 xla_quantized_matmul_local,
                 quantize_activation=quantize_activation,
                 reduce_axis=input_axis,  # psum over input axis (e.g., "tensor" for o_proj)
+                compute_dtype=self.compute_dtype,
             ),
             mesh=self.mesh,
             in_specs=in_specs,
