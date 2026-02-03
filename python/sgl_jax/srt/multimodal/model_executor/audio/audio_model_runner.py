@@ -143,7 +143,18 @@ class AudioModelRunner(BaseModelRunner):
         input_lens = jnp.array([mels.shape[1]])
         return mels, input_lens
 
-    def forward(self, x: jax.Array, mode: str, **kwargs):
+    def forward(self, x: jax.Array, input_lens: jax.Array | None, mode: str, **kwargs):
+        """Forward pass for audio encoding/decoding.
+
+        Args:
+            x: For encode mode, this is mel spectrogram [B, T, n_mels] (preprocessed in tokenizer).
+               For decode mode, this is codes [n_q, seq_len].
+            input_lens: For encode mode, the length of mel spectrogram. None for decode mode.
+            mode: "encode" or "decode".
+
+        Returns:
+            (output, cache_miss_count)
+        """
         cache_miss_count = 0
         import jax._src.test_util as jtu
 
@@ -151,8 +162,8 @@ class AudioModelRunner(BaseModelRunner):
             if mode == "encode":
                 use_quantizer = kwargs.get("use_quantizer", True)
                 n_q = kwargs.get("n_q", None)
-                mels, input_lens = self._preprocess_audio(x)
-                output = self.jitted_encode(mels, input_lens, use_quantizer=use_quantizer, n_q=n_q)
+                # x is already mel spectrogram (preprocessed in tokenizer)
+                output = self.jitted_encode(x, input_lens, use_quantizer=use_quantizer, n_q=n_q)
             elif mode == "decode":
                 output = self.jitted_decode(x)
             cache_miss_count = count()

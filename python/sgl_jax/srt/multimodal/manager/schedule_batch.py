@@ -157,6 +157,8 @@ class Req:
 
     # Audio inputs
     audio_input: jax.Array | None = None
+    mel_input: jax.Array | None = None  # Preprocessed mel spectrogram [B, T, n_mels]
+    mel_input_lens: jax.Array | None = None  # Lengths for mel spectrogram
     codes: jax.Array | None = None
     audio_codes: jax.Array | None = None
     use_quantizer: bool = True

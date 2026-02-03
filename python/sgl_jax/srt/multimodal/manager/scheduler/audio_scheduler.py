@@ -86,8 +86,12 @@ class AudioScheduler:
 
     def preprocess(self, req: Req):
         sharding = NamedSharding(self.mesh, PartitionSpec())
-        if req.audio_mode in ("encode", "generation") and req.audio_input is not None:
-            req.audio_input = device_array(req.audio_input, sharding=sharding)
+        if req.audio_mode in ("encode", "generation"):
+            # Use mel_input (preprocessed in tokenizer) instead of audio_input
+            if req.mel_input is not None:
+                req.mel_input = device_array(req.mel_input, sharding=sharding)
+            if req.mel_input_lens is not None:
+                req.mel_input_lens = device_array(req.mel_input_lens, sharding=sharding)
         elif req.audio_mode == "decode" and req.codes is not None:
             req.codes = device_array(req.codes, sharding=sharding)
 
@@ -108,6 +112,8 @@ class AudioScheduler:
                 output, _ = self.audio_worker.forward(req, mode="decode")
                 req.output = jax.device_get(output)
 
-            req.audio_input = None
+            # Clear inputs to free memory
+            req.mel_input = None
+            req.mel_input_lens = None
             req.codes = None
             self._comm_backend.send_pyobj(req)

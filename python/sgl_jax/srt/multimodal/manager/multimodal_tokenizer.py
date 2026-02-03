@@ -78,7 +78,12 @@ class MultimodalTokenizer(TokenizerManager):
                 server_args.model_path, use_fast=False
             )
         except Exception:
-            logger.warning("Failed to load processor from %s", server_args.model_path)
+            logger.warning("Failed to load image processor from %s", server_args.model_path)
+
+        # Initialize audio processor (MelSpectrumExtractor) for audio models
+        self.audio_processor = None
+        self._init_audio_processor(server_args.model_path)
+
         self.rid_to_state: dict[str, MMReqState] = {}
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -92,6 +97,67 @@ class MultimodalTokenizer(TokenizerManager):
                 ),
             ]
         )
+
+    def _init_audio_processor(self, model_path: str):
+        """Initialize audio processor if the model is an audio model."""
+        import json
+        import os
+        try:
+            import huggingface_hub
+            if os.path.isdir(model_path):
+                config_path = os.path.join(model_path, "config.json")
+            else:
+                config_path = huggingface_hub.hf_hub_download(
+                    model_path,
+                    "config.json",
+                    local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+                )
+            with open(config_path, "r") as f:
+                config = json.load(f)
+
+            # Check if this is an audio model by looking for audio-specific config keys
+            if "n_mels" in config and "sampling_rate" in config:
+                from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_tokenizer import MelSpectrumExtractor
+                self.audio_processor = MelSpectrumExtractor(
+                    sample_rate=config.get("sampling_rate", 24000),
+                    n_fft=config.get("nfft", 960),
+                    hop_length=config.get("hop_length", 240),
+                    win_length=config.get("window_size", config.get("nfft", 960)),
+                    n_mels=config.get("n_mels", 128),
+                    f_min=config.get("fmin", 0),
+                    f_max=config.get("fmax") or (config.get("sampling_rate", 24000) // 2),
+                )
+                logger.info("Initialized audio processor for model %s", model_path)
+        except Exception as e:
+            logger.warning("Failed to initialize audio processor from %s: %s", model_path, e)
+
+    def _preprocess_audio_to_mel(self, audio_array: np.ndarray) -> tuple:
+        """Convert raw audio waveform to mel spectrogram.
+
+        Args:
+            audio_array: Raw audio waveform as numpy array.
+
+        Returns:
+            Tuple of (mel_spectrogram, input_lengths).
+        """
+        import jax.numpy as jnp
+
+        if self.audio_processor is None:
+            raise ValueError("Audio processor not initialized. Cannot preprocess audio.")
+
+        # Convert to JAX array for mel extraction
+        audio = jnp.array(audio_array)
+        if audio.ndim == 1:
+            audio = audio[None, :]
+
+        mels = self.audio_processor(audio)
+        if mels.ndim == 2:
+            mels = mels[None, :]
+        # Transpose to [batch, time, n_mels]
+        mels = jnp.transpose(mels, (0, 2, 1))
+        input_lens = jnp.array([mels.shape[1]])
+
+        return mels, input_lens
 
     def _handle_batch_output(self, reqs: list):
         """Handle a batch of outputs returned from the pipeline.
@@ -351,11 +417,15 @@ class MultimodalTokenizer(TokenizerManager):
         else:
             audio_array = np.zeros((24000,), dtype=np.float32)
 
+        # Preprocess audio to mel spectrogram in tokenizer
+        mel_input, mel_input_lens = self._preprocess_audio_to_mel(audio_array)
+
         from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 
         audio_req = Req(
             rid=rid,
-            audio_input=audio_array,
+            mel_input=mel_input,
+            mel_input_lens=mel_input_lens,
             audio_mode="encode",
             use_quantizer=obj.use_quantizer,
             n_q=obj.n_q,
@@ -474,6 +544,9 @@ class MultimodalTokenizer(TokenizerManager):
         else:
             audio_array = np.zeros((24000,), dtype=np.float32)
 
+        # Preprocess audio to mel spectrogram in tokenizer
+        mel_input, mel_input_lens = self._preprocess_audio_to_mel(audio_array)
+
         input_ids = None
         if obj.prompt and self.tokenizer is not None:
             encoded = self.tokenizer(obj.prompt)
@@ -483,7 +556,8 @@ class MultimodalTokenizer(TokenizerManager):
 
         audio_req = Req(
             rid=rid,
-            audio_input=audio_array,
+            mel_input=mel_input,
+            mel_input_lens=mel_input_lens,
             audio_mode="generation",
             sample_rate=obj.sample_rate,
             data_type=DataType.AUDIO,

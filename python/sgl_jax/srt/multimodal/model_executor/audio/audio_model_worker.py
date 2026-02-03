@@ -10,6 +10,12 @@ class AudioModelWorker:
 
     def forward(self, batch: Req, mode: str = "encode", **kwargs):
         if mode == "encode":
-            return self.model_runner.forward(batch.audio_input, mode, **kwargs)
+            # Use mel_input (preprocessed in tokenizer) instead of audio_input
+            return self.model_runner.forward(
+                batch.mel_input,
+                batch.mel_input_lens,
+                mode,
+                **kwargs
+            )
         elif mode == "decode":
-            return self.model_runner.forward(batch.codes, mode)
+            return self.model_runner.forward(batch.codes, None, mode)
