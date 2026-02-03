@@ -19,7 +19,7 @@ stage_args:
   # Stage 1: LLM Backbone - process text + audio tokens, generate response
   - stage_id: 1
     runtime:
-      num_tpus: 4
+      num_tpus: 2
       max_batch_size: 1
       device_kind: tpu
     scheduler: audio_backbone
