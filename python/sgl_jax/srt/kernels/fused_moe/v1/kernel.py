@@ -488,7 +488,6 @@ def _fused_ep_moe_kernel(
     ### Expert weight double buffering:
     b_gating_x2_vmem,  # (2, bt, padded_num_experts)
     b_output_x2_vmem,  # (2, bt, hidden_size)
-    b_se_acc_x2_vmem,  # None | F32(2, bt, hidden_size)
     b_w1_x2_vmem,  # <bw_sem_id> (2, t_packing, bd1 // t_packing, bf)
     b_w3_x2_vmem,  # <bw_sem_id> (2, t_packing, bd1 // t_packing, bf)
     b_w2_x2_vmem,  # <bw_sem_id> (2, t_packing, bf, bd2 // t_packing)
@@ -1922,12 +1921,7 @@ def _fused_ep_moe_kernel(
             ]
 
             if w1_shared_hbm is not None:
-                if b_se_acc_x2_vmem is not None:
-                    current_val = b_se_acc_x2_vmem[
-                        out_buf_id, pl.ds(out_offset, acc_bt), pl.ds(0, hidden_size)
-                    ]
-                else:
-                    current_val = target_slice[...].astype(jnp.float32)
+                current_val = target_slice[...].astype(jnp.float32)
                 new_val = current_val + output_tile.reshape(acc_bt, hidden_size)
                 target_slice[...] = new_val.astype(output_hbm.dtype)
             else:
@@ -2041,20 +2035,13 @@ def _fused_ep_moe_kernel(
                 wait_fetch_se_tokens_slice(bt_sem_id=bt_sem_id, buf_id=token_buf_id)
 
                 for p_id in range(t_packing):
-                    t_val = b_se_tokens_vmem[
+                    t_f32 = b_se_tokens_vmem[
                         bt_sem_id, token_buf_id, pl.ds(0, bt), p_id, pl.ds(0, bd1_per_t_packing)
                     ]
-                    t_val_compute = t_val.astype(t_dtype)
-
                     w1_gate = b_se_w1_x2_vmem[curr_sem, p_id]
                     w3_up = b_se_w3_x2_vmem[curr_sem, p_id]
-
-                    act_gate_acc += jnp.dot(
-                        t_val_compute, w1_gate.astype(t_dtype), preferred_element_type=jnp.float32
-                    )
-                    act_up_acc += jnp.dot(
-                        t_val_compute, w3_up.astype(t_dtype), preferred_element_type=jnp.float32
-                    )
+                    act_gate_acc += jnp.dot(t_f32, w1_gate, preferred_element_type=jnp.float32)
+                    act_up_acc += jnp.dot(t_f32, w3_up, preferred_element_type=jnp.float32)
 
                 return (act_gate_acc, act_up_acc)
 
@@ -2063,12 +2050,12 @@ def _fused_ep_moe_kernel(
             if b_se_w1_scale_all is not None:
                 s_gate = b_se_w1_scale_all[0, 0, pl.ds(block_id * bse, bse)]
                 s_gate = jnp.broadcast_to(s_gate, gate_res.shape)
-                gate_res = gate_res * s_gate.astype(t_dtype)
+                gate_res = gate_res * s_gate
 
             if b_se_w3_scale_all is not None:
                 s_up = b_se_w3_scale_all[0, 0, pl.ds(block_id * bse, bse)]
                 s_up = jnp.broadcast_to(s_up, up_res.shape)
-                up_res = up_res * s_up.astype(t_dtype)
+                up_res = up_res * s_up
 
             act = activation_fn(gate_res, up_res, act_fn)
 
@@ -2102,54 +2089,28 @@ def _fused_ep_moe_kernel(
                 for p_id in range(t_packing):
                     w2_val = b_se_w2_x2_vmem[curr_sem, p_id]
 
-                    # [Fix 4/4] Down Matmul & Scale: 这里的修改最关键
-                    # 1. Dot 输入转 BF16, 累加用 FP32
-                    acc_chunk = jnp.dot(
-                        act, w2_val.astype(t_dtype), preferred_element_type=jnp.float32
-                    )
+                    acc_chunk = jnp.dot(act, w2_val, preferred_element_type=jnp.float32)
 
                     hidden_offset = p_id * h_per_t_packing + bd2_idx * bd2_per_t_packing
 
                     if b_se_w2_scale_all is not None:
                         s_down = b_se_w2_scale_all[0, 0, pl.ds(hidden_offset, bd2_per_t_packing)]
                         s_down = jnp.broadcast_to(s_down, acc_chunk.shape)
-
-                        # === 终极 BF16 模拟 ===
-                        # QuantizedLinear 是 BF16 Accumulator * BF16 Scale
-                        # Pallas 强制 FP32 Accumulator。
-                        # 为了对齐，我们在乘 Scale 之前，先手动把 FP32 Acc 截断为 BF16
-                        acc_chunk_bf16 = acc_chunk.astype(t_dtype)
-                        acc_chunk = acc_chunk_bf16 * s_down.astype(t_dtype)
-                        acc_chunk = acc_chunk.astype(jnp.float32)
+                        acc_chunk *= s_down
 
                     out_slice = b_output_x2_vmem.at[
                         out_buf_id, pl.ds(0, bt), pl.ds(hidden_offset, bd2_per_t_packing)
                     ]
 
-                    if b_se_acc_x2_vmem is not None:
-                        out_f32_slice = b_se_acc_x2_vmem.at[
-                            out_buf_id, pl.ds(0, bt), pl.ds(hidden_offset, bd2_per_t_packing)
-                        ]
+                    @pl.when(block_id == 0)
+                    def _(out_slice=out_slice, acc_chunk=acc_chunk):
+                        out_slice[...] = acc_chunk.astype(t_dtype)
 
-                        @pl.when(block_id == 0)
-                        def _(out_f32_slice=out_f32_slice, acc_chunk=acc_chunk):
-                            out_f32_slice[...] = acc_chunk
-
-                        @pl.when(block_id > 0)
-                        def _(out_f32_slice=out_f32_slice, acc_chunk=acc_chunk):
-                            out_f32_slice[...] = out_f32_slice[...] + acc_chunk
-
-                    else:
-
-                        @pl.when(block_id == 0)
-                        def _(out_slice=out_slice, acc_chunk=acc_chunk):
-                            out_slice[...] = acc_chunk.astype(t_dtype)
-
-                        @pl.when(block_id > 0)
-                        def _(out_slice=out_slice, acc_chunk=acc_chunk):
-                            out_slice[...] = (
-                                out_slice[...].astype(jnp.float32) + acc_chunk
-                            ).astype(t_dtype)
+                    @pl.when(block_id > 0)
+                    def _(out_slice=out_slice, acc_chunk=acc_chunk):
+                        out_slice[...] = (out_slice[...].astype(jnp.float32) + acc_chunk).astype(
+                            t_dtype
+                        )
 
             lax.fori_loop(0, num_bd2, body_w2, None)
 
@@ -2440,15 +2401,6 @@ def _validate_fused_ep_moe_args(
         if w3_shared is None or w2_shared is None:
             raise ValueError("w1_shared, w3_shared, and w2_shared must be provided together.")
 
-        shared_scales = (w1_shared_scale, w2_shared_scale, w3_shared_scale)
-        if any(s is not None for s in shared_scales) and not all(
-            s is not None for s in shared_scales
-        ):
-            raise ValueError(
-                "Expected w1_shared_scale, w2_shared_scale, and w3_shared_scale to be provided together "
-                "(either all None or all set)."
-            )
-
         se_intermediate_size = w2_shared.shape[0]
 
         if se_intermediate_size % block_config.bse != 0:
@@ -2718,7 +2670,6 @@ def fused_ep_moe(
     b1_scratch = None if b1 is None else pltpu.VMEM((2, 1, block_config.bf), jnp.float32)
     b3_scratch = None if b3 is None else pltpu.VMEM((2, 1, block_config.bf), jnp.float32)
     b2_scratch = None if b2 is None else pltpu.VMEM((2, t_packing, 1, bd2_per_pack), jnp.float32)
-    se_acc_scratch = None if w1_shared is None else pltpu.VMEM((2, bt, hidden_size), jnp.float32)
     scratch_shapes = (
         # Routing / metadata.
         pltpu.SMEM((2, bt, padded_top_k), jnp.int32),  # t2e_routing_x2_smem
@@ -2735,7 +2686,6 @@ def fused_ep_moe(
         # Expert compute scratch.
         pltpu.VMEM((2, bt, padded_num_experts), gating_dtype),  # b_gating_x2_vmem
         pltpu.VMEM((2, bt, hidden_size), t_dtype),  # b_output_x2_vmem
-        se_acc_scratch,  # b_se_acc_x2_vmem
         pltpu.VMEM((2, t_packing, bd1_per_pack, block_config.bf), w1.dtype),  # b_w1_x2_vmem
         pltpu.VMEM((2, t_packing, bd1_per_pack, block_config.bf), w3.dtype),  # b_w3_x2_vmem
         pltpu.VMEM((2, t_packing, block_config.bf, bd2_per_pack), w2.dtype),  # b_w2_x2_vmem
