@@ -67,12 +67,20 @@ class AudioBackboneModelRunner(BaseModelRunner):
         # Update config with values from HF config
         for key, value in hf_config.items():
             if hasattr(self.model_config, key):
-                if isinstance(value, list) and key in (
-                    "speech_vocab_sizes",
-                    "speech_empty_ids",
-                    "delay_pattern",
-                ):
-                    value = tuple(value)
+                if key in ("speech_vocab_sizes", "speech_empty_ids"):
+                    if isinstance(value, str):
+                        import ast
+                        value = tuple(ast.literal_eval(value))
+                    elif isinstance(value, list):
+                        value = tuple(value)
+                elif key == "delay_pattern":
+                    if isinstance(value, str) and "-" in value:
+                        value = tuple(int(x) for x in value.split("-"))
+                    elif isinstance(value, str):
+                        import ast
+                        value = tuple(ast.literal_eval(value))
+                    elif isinstance(value, list):
+                        value = tuple(value)
                 setattr(self.model_config, key, value)
 
         self.model_config.model_path = self.server_args.model_path

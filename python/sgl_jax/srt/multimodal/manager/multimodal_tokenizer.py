@@ -2,6 +2,7 @@ import asyncio
 import base64
 import dataclasses
 import logging
+import os
 import signal
 import time
 import uuid
@@ -21,6 +22,9 @@ from sgl_jax.srt.multimodal.manager.io_struct import (
     AudioDecodeResponse,
     AudioEncodeRequest,
     AudioEncodeResponse,
+    AudioGenerationRequest,
+    AudioGenerationResponse,
+    DataType,
     GenerateMMReqInput,
     TokenizedGenerateMMReqInput,
 )
@@ -67,6 +71,7 @@ class MultimodalTokenizer(TokenizerManager):
         `_handle_batch_output`.
         """
         super().__init__(server_args, port_args)
+        self.wait_timeout = int(os.environ.get("SGLANG_WAIT_TIMEOUT", "600"))
         # Use slow image processor to avoid torchvision dependency warning
         try:
             self.mm_processor = AutoImageProcessor.from_pretrained(
@@ -344,7 +349,7 @@ class MultimodalTokenizer(TokenizerManager):
             audio_bytes = base64.b64decode(obj.audio_data)
             audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
         else:
-            audio_array = np.zeros((1, 1), dtype=np.float32)
+            audio_array = np.zeros((24000,), dtype=np.float32)
 
         from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 
@@ -355,6 +360,7 @@ class MultimodalTokenizer(TokenizerManager):
             use_quantizer=obj.use_quantizer,
             n_q=obj.n_q,
             sample_rate=obj.sample_rate,
+            data_type=DataType.AUDIO,
         )
 
         state = MMReqState(
@@ -414,6 +420,7 @@ class MultimodalTokenizer(TokenizerManager):
             rid=rid,
             codes=codes_array,
             audio_mode="decode",
+            data_type=DataType.AUDIO,
         )
 
         state = MMReqState(
@@ -446,6 +453,76 @@ class MultimodalTokenizer(TokenizerManager):
             id=rid,
             audio_data=audio_data_b64,
             sample_rate=24000,
+        )
+
+    async def generate_audio(
+        self,
+        obj: AudioGenerationRequest,
+        request: fastapi.Request | None = None,
+    ):
+        created_time = time.time()
+        async with self._cond:
+            await self._cond.wait_for(lambda: not self._updating)
+
+        self.auto_create_handle_loop()
+
+        rid = uuid.uuid4().hex
+
+        if obj.audio_data:
+            audio_bytes = base64.b64decode(obj.audio_data)
+            audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
+        else:
+            audio_array = np.zeros((24000,), dtype=np.float32)
+
+        input_ids = None
+        if obj.prompt and self.tokenizer is not None:
+            encoded = self.tokenizer(obj.prompt)
+            input_ids = encoded["input_ids"]
+
+        from sgl_jax.srt.multimodal.manager.schedule_batch import Req
+
+        audio_req = Req(
+            rid=rid,
+            audio_input=audio_array,
+            audio_mode="generation",
+            sample_rate=obj.sample_rate,
+            data_type=DataType.AUDIO,
+            save_output=obj.save_output,
+            prompt=obj.prompt,
+            input_ids=input_ids,
+            n_q=8,
+        )
+
+        state = MMReqState(
+            rid=rid,
+            out_list=[],
+            finished=False,
+            event=asyncio.Event(),
+            obj=obj,
+            created_time=created_time,
+        )
+        self.rid_to_state[rid] = state
+
+        self.send_to_scheduler.send_pyobj(audio_req)
+
+        try:
+            await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)
+        except TimeoutError:
+            raise ValueError(f"Audio generation request timed out for rid={rid}") from None
+
+        del self.rid_to_state[rid]
+
+        out = state.out_list[-1] if state.out_list else {"success": True, "meta_info": {}}
+
+        audio_data_b64 = None
+        if out.get("audio_data") is not None:
+            audio_bytes = out["audio_data"].astype(np.float32).tobytes()
+            audio_data_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+        return AudioGenerationResponse(
+            id=rid,
+            audio_data=audio_data_b64,
+            sample_rate=obj.sample_rate,
         )
 
 

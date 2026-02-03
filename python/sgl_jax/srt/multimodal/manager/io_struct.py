@@ -74,6 +74,19 @@ class AudioDecodeResponse(BaseModel):
     sample_rate: int = 24000
 
 
+class AudioGenerationRequest(BaseModel):
+    audio_data: str
+    prompt: str | None = None
+    sample_rate: int = 24000
+    save_output: bool = False
+
+
+class AudioGenerationResponse(BaseModel):
+    id: str
+    audio_data: str | None = None
+    sample_rate: int = 24000
+
+
 class DataType(Enum):
     IMAGE = auto()
     VIDEO = auto()

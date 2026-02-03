@@ -357,37 +357,38 @@ class ISTFT(nnx.Module):
 
     def __call__(self, spec: Array) -> Array:
         """Convert spectrogram to audio waveform."""
+        import numpy as np
+
         frames = jnp.fft.irfft(spec, n=self.n_fft, axis=1, norm="backward")
         frames = frames * self.window.value[None, :, None]
         frames = jnp.swapaxes(frames, 1, 2)
 
-        batch, num_frames, _ = frames.shape
+        # Convert to numpy to avoid JAX sharding issues in the overlap-add loop
+        frames_np = np.asarray(jax.device_get(frames))
+        window_sq_np = np.asarray(jax.device_get(jnp.square(self.window.value)))
+
+        batch, num_frames, _ = frames_np.shape
         output_size = (num_frames - 1) * self.hop_length + self.win_length
-        audio = jnp.zeros((batch, output_size), dtype=frames.dtype)
-        env = jnp.zeros_like(audio)
-        window_sq = jnp.square(self.window.value)
 
-        def body(i, carry):
-            audio_acc, env_acc = carry
+        audio_np = np.zeros((batch, output_size), dtype=frames_np.dtype)
+        env_np = np.zeros((batch, output_size), dtype=frames_np.dtype)
+
+        # Overlap-add in numpy (no sharding issues)
+        for i in range(num_frames):
             start = i * self.hop_length
-            frame = frames[:, i, :]
-            current_audio = jax.lax.dynamic_slice(audio_acc, (0, start), (batch, self.win_length))
-            current_env = jax.lax.dynamic_slice(env_acc, (0, start), (batch, self.win_length))
-            updated_audio = current_audio + frame
-            updated_env = current_env + window_sq
-            audio_acc = jax.lax.dynamic_update_slice(audio_acc, updated_audio, (0, start))
-            env_acc = jax.lax.dynamic_update_slice(env_acc, updated_env, (0, start))
-            return audio_acc, env_acc
-
-        audio, env = jax.lax.fori_loop(0, num_frames, body, (audio, env))
+            end = start + self.win_length
+            audio_np[:, start:end] += frames_np[:, i, :]
+            env_np[:, start:end] += window_sq_np
 
         if self.pad > 0:
-            audio = audio[:, self.pad : -self.pad]
-            env = env[:, self.pad : -self.pad]
+            audio_np = audio_np[:, self.pad:-self.pad]
+            env_np = env_np[:, self.pad:-self.pad]
 
-        env = jnp.maximum(env, 1e-11)
-        audio = audio / env
-        return audio
+        env_np = np.maximum(env_np, 1e-11)
+        audio_np = audio_np / env_np
+
+        # Convert back to JAX array
+        return jnp.array(audio_np)
 
 class ISTFTHead(nnx.Module):
     """ISTFT head that projects hidden states to magnitude and phase."""

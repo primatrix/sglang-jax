@@ -158,12 +158,29 @@ class Req:
     # Audio inputs
     audio_input: jax.Array | None = None
     codes: jax.Array | None = None
+    audio_codes: jax.Array | None = None
     use_quantizer: bool = True
     n_q: int | None = None
     sample_rate: int = 24000
     audio_mode: str | None = None
 
+    # Audio backbone outputs
+    backbone_cache: Any = None
+    generated_text_tokens: jax.Array | None = None
+    generated_audio_tokens: jax.Array | None = None
+    text_logits: jax.Array | None = None
+
     def to_stage_reqs(self, scheduler: str):
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(
+            "to_stage_reqs: scheduler=%s, rid=%s, output=%s, audio_codes=%s, input_ids=%s",
+            scheduler,
+            self.rid,
+            self.output is not None,
+            self.audio_codes is not None,
+            self.input_ids is not None,
+        )
         if scheduler == "auto_regressive":
             return [
                 TokenizedGenerateReqInput(
@@ -179,6 +196,27 @@ class Req:
                     return_hidden_states=True,
                 ),
             ]
+        elif scheduler == "audio_backbone":
+            if self.output is not None and self.audio_codes is None:
+                self.audio_codes = self.output
+                self.output = None
+            logger.info(
+                "to_stage_reqs audio_backbone: audio_codes=%s",
+                self.audio_codes.shape if self.audio_codes is not None else None,
+            )
+            return [self]
+        elif scheduler == "audio_decoder":
+            if self.generated_audio_tokens is not None and self.codes is None:
+                # generated_audio_tokens shape: [B, group_size, audio_channels]
+                # decoder expects codes shape: [n_q, seq_len] = [audio_channels, group_size]
+                tokens = self.generated_audio_tokens
+                if tokens.ndim == 3:
+                    # Take first batch item and transpose
+                    tokens = tokens[0].T  # [audio_channels, group_size]
+                self.codes = tokens
+                self.generated_audio_tokens = None
+            self.audio_mode = "decode"
+            return [self]
         else:
             return [self]
 

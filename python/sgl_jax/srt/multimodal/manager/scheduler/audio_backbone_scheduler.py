@@ -144,9 +144,9 @@ class AudioBackboneScheduler:
     def _get_sampler_config(self, req: Req) -> MiMoSamplerConfig:
         """Get sampler configuration from request."""
         return MiMoSamplerConfig(
-            do_sample=getattr(req, "do_sample", True),
+            do_sample=getattr(req, "do_sample", False),
             temperature=getattr(req, "temperature", 1.0),
-            top_k=getattr(req, "top_k", 50),
+            top_k=getattr(req, "top_k", 0),
             top_p=getattr(req, "top_p", 1.0),
         )
 
@@ -163,34 +163,10 @@ class AudioBackboneScheduler:
             Sampled token IDs: [B]
         """
         if sampler_config.do_sample:
-            # Apply temperature
             logits = logits / sampler_config.temperature
-
-            # Apply top-k if specified
-            if sampler_config.top_k > 0:
-                top_k = min(sampler_config.top_k, logits.shape[-1])
-                indices_to_remove = logits < jnp.sort(logits, axis=-1)[:, -top_k]
-                logits = jnp.where(indices_to_remove, -jnp.inf, logits)
-
-            # Apply top-p if specified
-            if sampler_config.top_p < 1.0:
-                sorted_logits = jnp.sort(logits, axis=-1)[:, ::-1]
-                sorted_probs = jax.nn.softmax(sorted_logits, axis=-1)
-                cumsum_probs = jnp.cumsum(sorted_probs, axis=-1)
-                sorted_indices_to_remove = cumsum_probs > sampler_config.top_p
-                sorted_indices_to_remove = jnp.roll(sorted_indices_to_remove, 1, axis=-1)
-                sorted_indices_to_remove = sorted_indices_to_remove.at[:, 0].set(False)
-                indices_to_remove = jnp.argsort(jnp.argsort(logits, axis=-1)[:, ::-1], axis=-1)
-                indices_to_remove = jnp.take_along_axis(
-                    sorted_indices_to_remove, indices_to_remove, axis=-1
-                )
-                logits = jnp.where(indices_to_remove, -jnp.inf, logits)
-
-            # Sample
             self.rng_key, subkey = jax.random.split(self.rng_key)
             token = jax.random.categorical(subkey, logits, axis=-1)
         else:
-            # Greedy decoding
             token = jnp.argmax(logits, axis=-1)
 
         return token

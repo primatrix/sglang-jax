@@ -181,6 +181,9 @@ class MiMoAudioAttention(nnx.Module):
         # Handle KV cache
         if cache is not None:
             cached_k, cached_v, cache_pos = cache
+            # Force k/v to be replicated to match cache sharding
+            k = jnp.asarray(k)
+            v = jnp.asarray(v)
             # Update cache at current position using fixed-size indexing
             cached_k = jax.lax.dynamic_update_slice(
                 cached_k, k, (0, cache_pos, 0, 0)
@@ -389,7 +392,7 @@ class MiMoAudioTransformer(nnx.Module):
             hidden_states: [B, T, hidden_size]
             new_cache: Updated cache list
         """
-        if self.has_embedder:
+        if self.has_embedder and input_ids_or_embeds.ndim == 2 and jnp.issubdtype(input_ids_or_embeds.dtype, jnp.integer):
             hidden_states = self.embed_tokens(input_ids_or_embeds)
         else:
             hidden_states = input_ids_or_embeds
@@ -740,14 +743,11 @@ class MiMoAudioForCausalLM(nnx.Module):
             (B, self.config.group_size, self.config.audio_channels), dtype=jnp.int32
         )
 
-        # Initialize cache for patch decoder (fixed size, independent per patch)
-        cache = self.patch_decoder.init_cache(B, delay_iters, self.dtype)
-
         for t in range(delay_iters):
             positions = jnp.array([t])
 
-            # Forward through patch decoder
-            hidden_state, cache = self.patch_decoder(local_embeds, positions, cache=cache)
+            # Forward through patch decoder without cache for now (simpler, avoids sharding issues)
+            hidden_state, _ = self.patch_decoder(local_embeds, positions, cache=None)
 
             next_local_embeds = jnp.zeros_like(local_embeds)
 

@@ -59,35 +59,22 @@ class MultimodalDetokenizer(DetokenizerManager):
         return abort_req
 
     def save_result(self, req: Req):
-        """Process and optionally save the `Req` output.
-
-        Behavior:
-        - Validates presence of `req.output` and logs a warning if empty.
-        - Normalizes pixel range from model output (assumed in [-1, 1]) to
-          uint8 images.
-        - If `req.save_output` is true, writes a video (`.mp4`) for
-          `DataType.VIDEO` or an image (`.jpg`) otherwise and sets
-          `req.output_file_name`.
-
-        Returns the original `Req` wrapped in a list to match dispatcher
-        expectations.
-        """
-
         logger.info("save_result...")
-        if req.output is None or len(req.output) == 0:
+        if req.output is None or (hasattr(req.output, '__len__') and len(req.output) == 0):
             logger.warning("No output to save for request id: %s", req.rid)
             return [req]
+
+        if req.data_type == DataType.AUDIO:
+            return [req]
+
         sample = req.output[0]
         if sample.ndim == 3:
-            # for images, dim t is missing
             sample = sample.unsqueeze(1)
         frames = []
         for x in sample:
             frames.append((np.clip(x / 2 + 0.5, 0, 1) * 255).astype(np.uint8))
 
-        # Save outputs if requested
         if req.save_output:
-            # if req.output_file_name:
             if req.data_type == DataType.VIDEO:
                 req.output_file_name = req.rid + ".mp4"
                 imageio.mimsave(

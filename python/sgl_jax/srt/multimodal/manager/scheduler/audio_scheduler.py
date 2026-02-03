@@ -85,35 +85,29 @@ class AudioScheduler:
                     self.run_audio_batch(valid_reqs)
 
     def preprocess(self, req: Req):
-        """Apply preprocessing to a single `Req`.
-
-        Moves audio_input or codes to device with proper sharding.
-        """
         sharding = NamedSharding(self.mesh, PartitionSpec())
-        if req.audio_mode == "encode" and req.audio_input is not None:
+        if req.audio_mode in ("encode", "generation") and req.audio_input is not None:
             req.audio_input = device_array(req.audio_input, sharding=sharding)
         elif req.audio_mode == "decode" and req.codes is not None:
             req.codes = device_array(req.codes, sharding=sharding)
 
     def run_audio_batch(self, batch: list[Req]):
-        """Run the audio forward pass for a batch of requests.
-
-        For each `Req` in `batch`, invokes the `AudioModelWorker.forward`, moves
-        the result back to host memory with `jax.device_get`, clears the input
-        to free memory, and sends the completed request through the communication
-        backend.
-        """
-
         for req in batch:
             mode = req.audio_mode or "encode"
-            if mode == "encode":
+            logger.info("AudioScheduler.run_audio_batch: mode=%s, rid=%s", mode, req.rid)
+            if mode in ("encode", "generation"):
                 output, _ = self.audio_worker.forward(
                     req, mode="encode", use_quantizer=req.use_quantizer, n_q=req.n_q
                 )
+                req.output = jax.device_get(output.codes)
+                logger.info(
+                    "AudioScheduler encode output: codes shape=%s",
+                    req.output.shape if req.output is not None else None,
+                )
             else:
                 output, _ = self.audio_worker.forward(req, mode="decode")
+                req.output = jax.device_get(output)
 
-            req.output = jax.device_get(output)
             req.audio_input = None
             req.codes = None
             self._comm_backend.send_pyobj(req)

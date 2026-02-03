@@ -21,6 +21,8 @@ from sgl_jax.srt.multimodal.manager.io_struct import (
     AudioDecodeResponse,
     AudioEncodeRequest,
     AudioEncodeResponse,
+    AudioGenerationRequest,
+    AudioGenerationResponse,
     DataType,
     GenerateMMReqInput,
     ImageGenerationsRequest,
@@ -114,6 +116,18 @@ async def audio_decode(obj: AudioDecodeRequest, request: Request):
         return ret
     except ValueError as e:
         logger.error("[http_server] audio_decode error: %s", e)
+        return _create_error_response(e)
+
+
+@app.api_route("/api/v1/audio/generation", methods=["POST"])
+async def audio_generation(obj: AudioGenerationRequest, request: Request):
+    try:
+        from sgl_jax.srt.entrypoints.http_server import _global_state
+
+        ret = await _global_state.tokenizer_manager.generate_audio(obj, request)
+        return ret
+    except ValueError as e:
+        logger.error("[http_server] audio_generation error: %s", e)
         return _create_error_response(e)
 
 
@@ -303,11 +317,11 @@ def _execute_multimodal_server_warmup(
             "save_output": False,
         }
     elif _is_audio_model(server_args.model_path):
-        request_endpoint = "/api/v1/audio/encode"
+        request_endpoint = "/api/v1/audio/generation"
         json_data = {
             "audio_data": "",
             "sample_rate": 24000,
-            "use_quantizer": False,
+            "save_output": False,
         }
     else:
         # Default to image generation for other multimodal models
