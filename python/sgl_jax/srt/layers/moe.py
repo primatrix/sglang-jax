@@ -1070,6 +1070,7 @@ class FusedEPMoE(nnx.Module):
             b1=None,
             b2=None,
             b3=None,
+            activation_quantized_dtype=self.activation_quantized_dtype,
             dp_axis_name="data",
             tp_axis_name="tensor",
         )
