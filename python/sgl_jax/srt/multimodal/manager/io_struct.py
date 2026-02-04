@@ -70,7 +70,8 @@ class AudioEncodeResponse(BaseModel):
 
 class AudioDecodeResponse(BaseModel):
     id: str
-    audio_data: str | None = None  # base64 encoded audio
+    audio_data: str | None = None       # base64 编码的音频
+    url: str | None = None              # 文件路径 (当 save_output=True)
     sample_rate: int = 24000
 
 
@@ -83,7 +84,23 @@ class AudioGenerationRequest(BaseModel):
 
 class AudioGenerationResponse(BaseModel):
     id: str
-    audio_data: str | None = None
+    audio_data: str | None = None       # base64 编码的音频
+    url: str | None = None              # 文件路径 (当 save_output=True)
+    sample_rate: int = 24000
+
+
+class TTSRequest(BaseModel):
+    """Text-to-Speech request."""
+    text: str                           # 要合成的文本
+    prompt: str | None = None           # 声音风格提示词
+    save_output: bool = False           # 是否保存到文件
+
+
+class TTSResponse(BaseModel):
+    """Text-to-Speech response."""
+    id: str
+    audio_data: str | None = None       # base64 编码的音频
+    url: str | None = None              # 文件路径 (当 save_output=True)
     sample_rate: int = 24000
 
 

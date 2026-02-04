@@ -27,6 +27,8 @@ from sgl_jax.srt.multimodal.manager.io_struct import (
     DataType,
     GenerateMMReqInput,
     TokenizedGenerateMMReqInput,
+    TTSRequest,
+    TTSResponse,
 )
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils import (
@@ -132,7 +134,7 @@ class MultimodalTokenizer(TokenizerManager):
             if "XiaomiMiMo/MiMo-Audio-Tokenizer" not in model_paths_to_try:
                 model_paths_to_try.append("XiaomiMiMo/MiMo-Audio-Tokenizer")
 
-        logger.info("Attempting to init audio processor from paths: %s", model_paths_to_try)
+        logger.warning("Attempting to init audio processor from paths: %s", model_paths_to_try)
 
         for try_path in model_paths_to_try:
             try:
@@ -160,7 +162,7 @@ class MultimodalTokenizer(TokenizerManager):
                         padding_value=0.0,
                         return_attention_mask=False,
                     )
-                    logger.info("Initialized WhisperFeatureExtractor from %s", try_path)
+                    logger.warning("Initialized WhisperFeatureExtractor from %s", try_path)
                     return
             except Exception as e:
                 logger.warning("Failed to init audio processor from %s: %s", try_path, e)
@@ -640,6 +642,89 @@ class MultimodalTokenizer(TokenizerManager):
             id=rid,
             audio_data=audio_data_b64,
             sample_rate=obj.sample_rate,
+        )
+
+    async def tts(
+        self,
+        obj: TTSRequest,
+        request: fastapi.Request | None = None,
+    ):
+        """Text-to-Speech: convert text to audio.
+
+        Args:
+            obj: TTSRequest containing text and optional voice prompt.
+            request: FastAPI request object for disconnect handling.
+
+        Returns:
+            TTSResponse containing the generated audio.
+        """
+        created_time = time.time()
+        async with self._cond:
+            await self._cond.wait_for(lambda: not self._updating)
+
+        self.auto_create_handle_loop()
+
+        rid = uuid.uuid4().hex
+
+        # Tokenize the text input
+        text_input_ids = None
+        if obj.text and self.tokenizer is not None:
+            encoded = self.tokenizer(obj.text)
+            text_input_ids = encoded["input_ids"]
+
+        # Tokenize the voice prompt if provided
+        prompt_input_ids = None
+        if obj.prompt and self.tokenizer is not None:
+            encoded = self.tokenizer(obj.prompt)
+            prompt_input_ids = encoded["input_ids"]
+
+        from sgl_jax.srt.multimodal.manager.schedule_batch import Req
+
+        tts_req = Req(
+            rid=rid,
+            audio_mode="tts",
+            text=obj.text,
+            text_input_ids=text_input_ids,
+            prompt=obj.prompt,
+            prompt_input_ids=prompt_input_ids,
+            data_type=DataType.AUDIO,
+            save_output=obj.save_output,
+        )
+
+        state = MMReqState(
+            rid=rid,
+            out_list=[],
+            finished=False,
+            event=asyncio.Event(),
+            obj=obj,
+            created_time=created_time,
+        )
+        self.rid_to_state[rid] = state
+
+        self.send_to_scheduler.send_pyobj(tts_req)
+
+        try:
+            await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)
+        except TimeoutError:
+            raise ValueError(f"TTS request timed out for rid={rid}") from None
+
+        del self.rid_to_state[rid]
+
+        out = state.out_list[-1] if state.out_list else {"success": True, "meta_info": {}}
+
+        audio_data_b64 = None
+        url = None
+        if out.get("audio_data") is not None:
+            audio_bytes = out["audio_data"].astype(np.float32).tobytes()
+            audio_data_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+        if out.get("url") is not None:
+            url = out["url"]
+
+        return TTSResponse(
+            id=rid,
+            audio_data=audio_data_b64,
+            url=url,
+            sample_rate=24000,
         )
 
 

@@ -26,6 +26,8 @@ from sgl_jax.srt.multimodal.manager.io_struct import (
     DataType,
     GenerateMMReqInput,
     ImageGenerationsRequest,
+    TTSRequest,
+    TTSResponse,
     VideoGenerationsRequest,
 )
 from sgl_jax.srt.multimodal.manager.multimodal_detokenizer import (
@@ -128,6 +130,19 @@ async def audio_generation(obj: AudioGenerationRequest, request: Request):
         return ret
     except ValueError as e:
         logger.error("[http_server] audio_generation error: %s", e)
+        return _create_error_response(e)
+
+
+@app.api_route("/api/v1/audio/tts", methods=["POST"])
+async def text_to_speech(obj: TTSRequest, request: Request):
+    """Text-to-Speech endpoint."""
+    try:
+        from sgl_jax.srt.entrypoints.http_server import _global_state
+
+        ret = await _global_state.tokenizer_manager.tts(obj, request)
+        return ret
+    except ValueError as e:
+        logger.error("[http_server] tts error: %s", e)
         return _create_error_response(e)
 
 

@@ -164,7 +164,12 @@ class Req:
     use_quantizer: bool = True
     n_q: int | None = None
     sample_rate: int = 24000
-    audio_mode: str | None = None
+    audio_mode: str | None = None  # "encode", "decode", "generation", "tts"
+
+    # TTS inputs
+    text: str | None = None                     # TTS text to synthesize
+    text_input_ids: list[int] | None = None     # Tokenized TTS text
+    prompt_input_ids: list[int] | None = None   # Tokenized voice style prompt
 
     # Audio backbone outputs
     backbone_cache: Any = None
