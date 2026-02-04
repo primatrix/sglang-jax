@@ -99,11 +99,10 @@ class MultimodalTokenizer(TokenizerManager):
         )
 
     def _init_audio_processor(self, model_path: str):
-        """Initialize audio processor (MelSpectrumExtractor) for audio models.
+        """Initialize audio processor for audio models using transformers FeatureExtractor.
 
-        This loads the stage config to find the audio encoder's model path,
-        then initializes MelSpectrumExtractor from that config.
-        Note: JAX_PLATFORMS=cpu must be set before this is called.
+        This loads the audio config and initializes a WhisperFeatureExtractor-like processor
+        that uses numpy (not JAX) for mel spectrogram computation.
         """
         import json
         import os
@@ -150,17 +149,18 @@ class MultimodalTokenizer(TokenizerManager):
                     config = json.load(f)
 
                 if "n_mels" in config and "sampling_rate" in config:
-                    from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_tokenizer import MelSpectrumExtractor
-                    self.audio_processor = MelSpectrumExtractor(
-                        sample_rate=config.get("sampling_rate", 24000),
-                        n_fft=config.get("nfft", 960),
+                    # Use transformers WhisperFeatureExtractor (numpy-based, no JAX dependency)
+                    from transformers import WhisperFeatureExtractor
+
+                    self.audio_processor = WhisperFeatureExtractor(
+                        feature_size=config.get("n_mels", 128),
+                        sampling_rate=config.get("sampling_rate", 24000),
                         hop_length=config.get("hop_length", 240),
-                        win_length=config.get("window_size", config.get("nfft", 960)),
-                        n_mels=config.get("n_mels", 128),
-                        f_min=config.get("fmin", 0),
-                        f_max=config.get("fmax") or (config.get("sampling_rate", 24000) // 2),
+                        n_fft=config.get("nfft", 960),
+                        padding_value=0.0,
+                        return_attention_mask=False,
                     )
-                    logger.info("Initialized audio processor from %s", try_path)
+                    logger.info("Initialized WhisperFeatureExtractor from %s", try_path)
                     return
             except Exception as e:
                 logger.warning("Failed to init audio processor from %s: %s", try_path, e)
@@ -170,29 +170,36 @@ class MultimodalTokenizer(TokenizerManager):
         logger.warning("Could not initialize audio processor")
 
     def _preprocess_audio_to_mel(self, audio_array: np.ndarray) -> tuple:
-        """Convert raw audio waveform to mel spectrogram.
+        """Convert raw audio waveform to mel spectrogram using WhisperFeatureExtractor.
 
         Args:
-            audio_array: Raw audio waveform as numpy array.
+            audio_array: Raw audio waveform as numpy array, shape (samples,).
 
         Returns:
-            Tuple of (mel_spectrogram, input_lengths).
+            Tuple of (mel_spectrogram, input_lengths) as JAX arrays.
+            mel_spectrogram shape: [batch, time, n_mels]
         """
         import jax.numpy as jnp
 
         if self.audio_processor is None:
             raise ValueError("Audio processor not initialized. Cannot preprocess audio.")
 
-        # Convert to JAX array for mel extraction
-        audio = jnp.array(audio_array)
-        if audio.ndim == 1:
-            audio = audio[None, :]
+        # WhisperFeatureExtractor expects 1D array or list of 1D arrays
+        if audio_array.ndim == 2:
+            audio_array = audio_array.squeeze(0)
 
-        mels = self.audio_processor(audio)
-        if mels.ndim == 2:
-            mels = mels[None, :]
-        # Transpose to [batch, time, n_mels]
-        mels = jnp.transpose(mels, (0, 2, 1))
+        # Extract mel features using WhisperFeatureExtractor
+        # Returns dict with 'input_features' key, shape [batch, n_mels, time]
+        features = self.audio_processor(
+            audio_array,
+            sampling_rate=self.audio_processor.sampling_rate,
+            return_tensors="np",
+        )
+        mels = features["input_features"]  # shape: [batch, n_mels, time]
+
+        # Convert to JAX and transpose to [batch, time, n_mels]
+        mels = jnp.array(mels)
+        mels = jnp.transpose(mels, (0, 2, 1))  # [batch, time, n_mels]
         input_lens = jnp.array([mels.shape[1]])
 
         return mels, input_lens
@@ -642,10 +649,6 @@ def run_multimodal_tokenizer_process(
     server_args: ServerArgs,
     port_args: PortArgs,
 ):
-    # Force JAX to use CPU in tokenizer process (TPU is used by model workers)
-    import os
-    os.environ["JAX_PLATFORMS"] = "cpu"
-
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang-jax::multimodal_tokenizer")
     configure_logger(server_args)
