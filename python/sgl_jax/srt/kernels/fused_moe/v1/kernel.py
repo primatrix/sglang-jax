@@ -529,6 +529,7 @@ def _fused_ep_moe_kernel(
     tp_axis_name: str,
     act_fn: str,
     subc_quant_wsz: int | None = None,
+    activation_quantized_dtype: jnp.dtype | None = None,
     # Kernel tuning params.
     bt: int,  # Outer token tile size (output tiling).
     bf: int,  # Block size of intermediate_size.
@@ -603,6 +604,23 @@ def _fused_ep_moe_kernel(
     if w1_shared_hbm is not None:
         se_inter_size = w2_shared_hbm.shape[0]
         se_total_blocks = cdiv(se_inter_size, bse)
+
+    # Activation quantization helper
+    act_quant_enabled = activation_quantized_dtype is not None
+    if act_quant_enabled:
+        act_quant_max_val = float(jnp.finfo(activation_quantized_dtype).max)
+
+    def quantize_activation(x):
+        """Quantize activation to FP8, returns (x_fp8, scale)."""
+        if not act_quant_enabled:
+            return x, None
+        # Per-row (per-token) quantization
+        x_abs_max = jnp.max(jnp.abs(x), axis=-1, keepdims=True)
+        scale = x_abs_max / act_quant_max_val
+        # Avoid division by zero
+        scale = jnp.maximum(scale, 1e-12)
+        x_q = (x / scale).astype(activation_quantized_dtype)
+        return x_q, scale
 
     def get_mesh_device_id(ep_rank):
         dp_rank = ep_rank // tp_size
@@ -1496,12 +1514,21 @@ def _fused_ep_moe_kernel(
                         acc1 = acc1_vmem[*acc_slices]
                         acc3 = acc3_vmem[*acc_slices]
                         act = activation_fn(acc1, acc3, act_fn)
+
+                        # Quantize activation if enabled
+                        act_q, act_scale = quantize_activation(act)
+
                         w2 = w2_vmem[
                             p_id,
                             pl.ds(bfc_id * bfc, bfc),
                             pl.ds(bd2c_id * bd2c_per_t_packing, bd2c_per_t_packing),
                         ]
-                        acc = jnp.dot(act, w2, preferred_element_type=jnp.float32)
+                        acc = jnp.dot(act_q, w2, preferred_element_type=jnp.float32)
+
+                        # Apply activation scale (dequantize)
+                        if act_scale is not None:
+                            acc *= act_scale
+
                         if w2_scale_vmem is not None:
                             w2_scale_slices = (
                                 p_id,
@@ -2060,6 +2087,9 @@ def _fused_ep_moe_kernel(
 
             act = activation_fn(gate_res, up_res, act_fn)
 
+            # Quantize activation for SE if enabled
+            act_q, se_act_scale = quantize_activation(act)
+
             # 2. FFN2 (Down projection)
             if num_bd2 > 0:
                 start_fetch_se_w2(0, block_id, 0)
@@ -2090,7 +2120,11 @@ def _fused_ep_moe_kernel(
                 for p_id in range(t_packing):
                     w2_val = b_se_w2_x2_vmem[curr_sem, p_id]
 
-                    acc_chunk = jnp.dot(act, w2_val, preferred_element_type=jnp.float32)
+                    acc_chunk = jnp.dot(act_q, w2_val, preferred_element_type=jnp.float32)
+
+                    # Apply activation scale (dequantize)
+                    if se_act_scale is not None:
+                        acc_chunk *= se_act_scale
 
                     hidden_offset = p_id * h_per_t_packing + bd2_idx * bd2_per_t_packing
 
@@ -2510,6 +2544,7 @@ def fused_ep_moe(
     b1: jax.Array | None = None,  # F32(num_experts, 1, intermediate_size)
     b2: jax.Array | None = None,  # F32(num_experts, 1, hidden_size)
     b3: jax.Array | None = None,  # F32(num_experts, 1, intermediate_size)
+    activation_quantized_dtype: jnp.dtype | None = None,  # e.g. jnp.float8_e4m3fn
     block_config: FusedMoEBlockConfig | None = None,
     dp_axis_name: str = "data",
     tp_axis_name: str = "tensor",
@@ -2763,6 +2798,7 @@ def fused_ep_moe(
                 tp_axis_name=tp_axis_name,
                 act_fn=act_fn,
                 subc_quant_wsz=subc_quant_wsz,
+                activation_quantized_dtype=activation_quantized_dtype,
                 bt=bt,
                 bf=block_config.bf,
                 bd1=block_config.bd1,
