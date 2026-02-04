@@ -176,11 +176,10 @@ class MultimodalTokenizer(TokenizerManager):
             audio_array: Raw audio waveform as numpy array, shape (samples,).
 
         Returns:
-            Tuple of (mel_spectrogram, input_lengths) as JAX arrays.
+            Tuple of (mel_spectrogram, input_lengths) as numpy arrays.
             mel_spectrogram shape: [batch, time, n_mels]
+            Note: Returns numpy arrays to avoid JAX initialization in tokenizer process.
         """
-        import jax.numpy as jnp
-
         if self.audio_processor is None:
             raise ValueError("Audio processor not initialized. Cannot preprocess audio.")
 
@@ -197,10 +196,9 @@ class MultimodalTokenizer(TokenizerManager):
         )
         mels = features["input_features"]  # shape: [batch, n_mels, time]
 
-        # Convert to JAX and transpose to [batch, time, n_mels]
-        mels = jnp.array(mels)
-        mels = jnp.transpose(mels, (0, 2, 1))  # [batch, time, n_mels]
-        input_lens = jnp.array([mels.shape[1]])
+        # Transpose to [batch, time, n_mels] - stay in numpy, no JAX
+        mels = np.transpose(mels, (0, 2, 1))  # [batch, time, n_mels]
+        input_lens = np.array([mels.shape[1]])
 
         return mels, input_lens
 
