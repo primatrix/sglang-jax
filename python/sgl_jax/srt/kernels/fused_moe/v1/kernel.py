@@ -2505,6 +2505,7 @@ def _validate_fused_ep_moe_args(
         "act_fn",
         "subc_quant_wsz",
         "block_config",
+        "activation_quantized_dtype",
         "dp_axis_name",
         "tp_axis_name",
     ],
