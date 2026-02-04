@@ -190,17 +190,26 @@ class MultimodalTokenizer(TokenizerManager):
             audio_array = audio_array.squeeze(0)
 
         # Extract mel features using WhisperFeatureExtractor
+        # IMPORTANT: Set padding=False to prevent automatic padding to 30 seconds
         # Returns dict with 'input_features' key, shape [batch, n_mels, time]
         features = self.audio_processor(
             audio_array,
             sampling_rate=self.audio_processor.sampling_rate,
             return_tensors="np",
+            padding=False,  # Do not pad to fixed length
         )
         mels = features["input_features"]  # shape: [batch, n_mels, time]
 
         # Transpose to [batch, time, n_mels] - stay in numpy, no JAX
         mels = np.transpose(mels, (0, 2, 1))  # [batch, time, n_mels]
         input_lens = np.array([mels.shape[1]])
+
+        logger.warning(
+            "Audio preprocessing: input_samples=%d, mel_shape=%s, input_lens=%s",
+            len(audio_array) if audio_array.ndim == 1 else audio_array.shape[-1],
+            mels.shape,
+            input_lens,
+        )
 
         return mels, input_lens
 
