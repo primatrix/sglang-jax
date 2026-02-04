@@ -150,10 +150,6 @@ class MultimodalTokenizer(TokenizerManager):
                     config = json.load(f)
 
                 if "n_mels" in config and "sampling_rate" in config:
-                    # Set JAX to CPU before importing MelSpectrumExtractor
-                    # (it uses JAX for mel filterbank computation)
-                    os.environ.setdefault("JAX_PLATFORMS", "cpu")
-
                     from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_tokenizer import MelSpectrumExtractor
                     self.audio_processor = MelSpectrumExtractor(
                         sample_rate=config.get("sampling_rate", 24000),
@@ -646,6 +642,10 @@ def run_multimodal_tokenizer_process(
     server_args: ServerArgs,
     port_args: PortArgs,
 ):
+    # Force JAX to use CPU in tokenizer process (TPU is used by model workers)
+    import os
+    os.environ["JAX_PLATFORMS"] = "cpu"
+
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang-jax::multimodal_tokenizer")
     configure_logger(server_args)
