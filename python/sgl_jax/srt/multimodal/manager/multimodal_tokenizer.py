@@ -80,7 +80,7 @@ class MultimodalTokenizer(TokenizerManager):
         except Exception:
             logger.warning("Failed to load image processor from %s", server_args.model_path)
 
-        # Initialize audio processor (MelSpectrumExtractor) for audio models
+        # Initialize audio processor (WhisperFeatureExtractor) for audio models
         self.audio_processor = None
         self._init_audio_processor(server_args.model_path)
 

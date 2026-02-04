@@ -11,7 +11,6 @@ from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.multimodal.configs.config_registry import get_audio_config
-from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_tokenizer import MelSpectrumExtractor
 from sgl_jax.srt.server_args import ServerArgs
 
 
@@ -29,7 +28,6 @@ class AudioModelRunner(BaseModelRunner):
         )
         self.model_class = model_class
         self.server_args = server_args
-        self.mel_extractor = None
         self.initialize()
 
     def initialize(self):
@@ -61,15 +59,6 @@ class AudioModelRunner(BaseModelRunner):
         self.model_config.model_class = self.model_class
         self.model = self.model_loader.load_model(
             model_config=self.model_config,
-        )
-        self.mel_extractor = MelSpectrumExtractor(
-            sample_rate=self.model_config.sampling_rate,
-            n_fft=self.model_config.nfft,
-            hop_length=self.model_config.hop_length,
-            win_length=getattr(self.model_config, 'win_length', self.model_config.nfft),
-            n_mels=self.model_config.n_mels,
-            f_min=self.model_config.fmin,
-            f_max=self.model_config.fmax or (self.model_config.sampling_rate // 2),
         )
 
     def initialize_jit(self):
@@ -131,17 +120,6 @@ class AudioModelRunner(BaseModelRunner):
 
         self.jitted_encode = encode_wrapper
         self.jitted_decode = decode_wrapper
-
-    def _preprocess_audio(self, audio: jax.Array):
-        """Convert raw audio waveform to mel spectrogram."""
-        if audio.ndim == 1:
-            audio = audio[None, :]
-        mels = self.mel_extractor(audio)
-        if mels.ndim == 2:
-            mels = mels[None, :]
-        mels = jnp.transpose(mels, (0, 2, 1))
-        input_lens = jnp.array([mels.shape[1]])
-        return mels, input_lens
 
     def forward(self, x: jax.Array, input_lens: jax.Array | None, mode: str, **kwargs):
         """Forward pass for audio encoding/decoding.
