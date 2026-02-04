@@ -1,5 +1,5 @@
 resources:
-  accelerators: tpu-v6e-1 #
+  accelerators: tpu-v6e-4 #
   accelerator_args:
     tpu_vm: True
     runtime_version: v2-alpha-tpuv6e # optional
