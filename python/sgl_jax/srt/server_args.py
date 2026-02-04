@@ -176,6 +176,9 @@ class ServerArgs:
     multimodal: bool = False
 
     enable_return_routed_experts: bool = False
+    enable_expert_balance_debug: bool = False
+    expert_balance_segment_tokens: int = 100
+    expert_balance_output_file: str | None = None
 
     def __post_init__(self):
         # Set missing default values
@@ -254,6 +257,17 @@ class ServerArgs:
             self.device_indexes = None
         if self.multimodal:
             self.model_path = download_from_hf(self.model_path, allow_patterns=None)
+
+        if self.enable_expert_balance_debug and self.expert_balance_segment_tokens <= 0:
+            raise ValueError("expert_balance_segment_tokens must be positive")
+
+        if self.enable_expert_balance_debug and not self.expert_balance_output_file:
+            import datetime
+
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.expert_balance_output_file = os.path.join(
+                "debug_outputs", f"expert_balance_{timestamp}_{os.getpid()}.csv"
+            )
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -802,6 +816,23 @@ class ServerArgs:
             "--enable-precision-tracer",
             action="store_true",
             help="Enable precision tracer for debugging tensor values. May have performance impact.",
+        )
+        parser.add_argument(
+            "--enable-expert-balance-debug",
+            action="store_true",
+            help="Enable expert balance debug stats output (segment-based).",
+        )
+        parser.add_argument(
+            "--expert-balance-segment-tokens",
+            type=int,
+            default=ServerArgs.expert_balance_segment_tokens,
+            help="Token count per segment for expert balance stats.",
+        )
+        parser.add_argument(
+            "--expert-balance-output-file",
+            type=str,
+            default=ServerArgs.expert_balance_output_file,
+            help="CSV output file path for expert balance stats.",
         )
 
         parser.add_argument(
