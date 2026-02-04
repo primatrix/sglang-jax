@@ -2,6 +2,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import jax
+import jax.numpy as jnp
+import numpy as np
 import PIL.Image
 
 from sgl_jax.srt.managers.io_struct import BatchTokenIDOut, TokenizedGenerateReqInput
@@ -9,6 +11,18 @@ from sgl_jax.srt.multimodal.manager.io_struct import DataType
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 
 NegativePromptSuffix = "_negative"
+
+# MiMo Audio aggregation constants
+MIMO_AUDIO_GROUP_SIZE = 4
+MIMO_AUDIO_CHANNELS = 8
+MIMO_SPEECH_EMPTY_IDS = (1024, 1024, 128, 128, 128, 128, 128, 128)
+MIMO_EMPTY_IDX = 151667       # <|empty|> - text placeholder in audio patches
+MIMO_SOSP_IDX = 151665        # <|sosp|> - start of speech
+MIMO_EOSP_IDX = 151666        # <|eosp|> - end of speech
+MIMO_SOSTM_IDX = 151670       # <|sostm|> - start of streaming
+MIMO_EOSTM_IDX = 151671       # <|eostm|> - end of streaming
+MIMO_EOT_IDX = 151672         # <|eot|> - end of turn
+MIMO_TEXT_PADDING = -100      # padding for text patches (timesteps 1-3)
 
 
 @dataclass
@@ -208,9 +222,18 @@ class Req:
                 self.audio_codes = self.output
                 self.output = None
             logger.info(
-                "to_stage_reqs audio_backbone: audio_codes=%s",
+                "to_stage_reqs audio_backbone: audio_codes=%s, text_input_ids=%s",
                 self.audio_codes.shape if self.audio_codes is not None else None,
+                len(self.text_input_ids) if self.text_input_ids else None,
             )
+            # Aggregate text and audio into backbone input format [1, 9, seq_len]
+            backbone_input = self._build_backbone_input()
+            if backbone_input is not None:
+                self.input_ids = backbone_input
+                logger.info(
+                    "to_stage_reqs audio_backbone: built input_ids=%s",
+                    self.input_ids.shape if self.input_ids is not None else None,
+                )
             return [self]
         elif scheduler == "audio_decoder":
             if self.generated_audio_tokens is not None and self.codes is None:
@@ -264,3 +287,175 @@ class Req:
             return req
         else:
             return stage_result
+
+    # =========================================================================
+    # MiMo Audio Aggregation Methods
+    # =========================================================================
+
+    def _build_backbone_input(self) -> jax.Array:
+        """Build backbone input by aggregating text and audio into [1, 9, seq_len] format.
+
+        The backbone expects input_ids with shape [B, 1+audio_channels, seq_len] where:
+        - Channel 0: text tokens (with -100 padding for non-first timesteps in each group)
+        - Channels 1-8: audio codes (or speech_empty_ids for text patches)
+
+        Returns:
+            input_ids: [1, 9, seq_len] tensor ready for backbone forward pass
+        """
+        import logging
+
+        logger = logging.getLogger(__name__)
+        segments = []
+
+        if self.audio_mode == "tts":
+            # TTS: text patches + <|sosp|> marker (backbone will generate audio)
+            if self.text_input_ids:
+                segments.append(self._build_text_segment(self.text_input_ids))
+            # Add start-of-speech marker to signal audio generation
+            segments.append(self._build_sosp_segment())
+
+        elif self.audio_mode == "generation":
+            # Audio generation/continuation: audio patches + optional text
+            if self.audio_codes is not None:
+                segments.append(self._build_audio_segment(self.audio_codes))
+            if self.text_input_ids:
+                segments.append(self._build_text_segment(self.text_input_ids))
+
+        elif self.audio_mode == "audio_understanding":
+            # Audio understanding: audio patches + question text
+            if self.audio_codes is not None:
+                segments.append(self._build_audio_segment(self.audio_codes))
+            if self.text_input_ids:
+                segments.append(self._build_text_segment(self.text_input_ids))
+
+        else:
+            # Default: just use whatever is available
+            if self.audio_codes is not None:
+                segments.append(self._build_audio_segment(self.audio_codes))
+            if self.text_input_ids:
+                segments.append(self._build_text_segment(self.text_input_ids))
+
+        if not segments:
+            logger.warning("No segments to build for backbone input, rid=%s", self.rid)
+            return None
+
+        # Concatenate all segments along sequence dimension
+        input_ids = jnp.concatenate(segments, axis=1)  # [9, total_seq_len]
+        logger.info(
+            "Built backbone input: audio_mode=%s, shape=%s, rid=%s",
+            self.audio_mode,
+            input_ids.shape,
+            self.rid,
+        )
+        return input_ids[None, :, :]  # [1, 9, total_seq_len]
+
+    def _build_text_segment(self, text_ids: list) -> jax.Array:
+        """Build a text-only segment where text tokens are active.
+
+        For each text token, creates a group of (group_size) timesteps:
+        - Timestep 0: actual text token
+        - Timesteps 1 to group_size-1: -100 (padding)
+
+        Audio channels are filled with speech_empty_ids.
+
+        Args:
+            text_ids: List of text token IDs
+
+        Returns:
+            Tensor of shape [9, len(text_ids) * group_size]
+        """
+        if not text_ids:
+            return jnp.zeros((1 + MIMO_AUDIO_CHANNELS, 0), dtype=jnp.int32)
+
+        # Expand each text token with padding: [t1] -> [t1, -100, -100, -100]
+        text_expanded = []
+        for t in text_ids:
+            text_expanded.append(t)
+            text_expanded.extend([MIMO_TEXT_PADDING] * (MIMO_AUDIO_GROUP_SIZE - 1))
+
+        seq_len = len(text_expanded)
+        text_row = jnp.array(text_expanded, dtype=jnp.int32)
+
+        # Build audio channel rows with speech_empty_ids
+        rows = [text_row]
+        for ch in range(MIMO_AUDIO_CHANNELS):
+            row = jnp.full((seq_len,), MIMO_SPEECH_EMPTY_IDS[ch], dtype=jnp.int32)
+            rows.append(row)
+
+        return jnp.stack(rows, axis=0)  # [9, seq_len]
+
+    def _build_audio_segment(self, audio_codes: jax.Array) -> jax.Array:
+        """Build an audio-only segment where audio codes are active.
+
+        Text channel is filled with <|empty|> token (151667).
+        Audio codes are placed directly in channels 1-8.
+
+        Args:
+            audio_codes: Audio codes tensor of shape [8, T_audio]
+
+        Returns:
+            Tensor of shape [9, T_audio]
+        """
+        if audio_codes is None:
+            return jnp.zeros((1 + MIMO_AUDIO_CHANNELS, 0), dtype=jnp.int32)
+
+        # Ensure audio_codes is a jax array
+        if isinstance(audio_codes, np.ndarray):
+            audio_codes = jnp.array(audio_codes)
+
+        T_audio = audio_codes.shape[1]
+
+        # Text channel: all timesteps filled with <|empty|> token
+        text_row = jnp.full((T_audio,), MIMO_EMPTY_IDX, dtype=jnp.int32)
+
+        # Concatenate text row with audio codes
+        return jnp.concatenate(
+            [text_row[None, :], audio_codes.astype(jnp.int32)], axis=0
+        )  # [9, T_audio]
+
+    def _build_sosp_segment(self) -> jax.Array:
+        """Build a <|sosp|> (start of speech) segment.
+
+        This marks the beginning of audio generation.
+        Creates one group with:
+        - Text channel: [<|sosp|>, -100, -100, -100]
+        - Audio channels: speech_empty_ids
+
+        Returns:
+            Tensor of shape [9, group_size]
+        """
+        # Text row: sosp token followed by padding
+        text_row = jnp.array(
+            [MIMO_SOSP_IDX] + [MIMO_TEXT_PADDING] * (MIMO_AUDIO_GROUP_SIZE - 1),
+            dtype=jnp.int32,
+        )
+
+        rows = [text_row]
+        for ch in range(MIMO_AUDIO_CHANNELS):
+            row = jnp.full((MIMO_AUDIO_GROUP_SIZE,), MIMO_SPEECH_EMPTY_IDS[ch], dtype=jnp.int32)
+            rows.append(row)
+
+        return jnp.stack(rows, axis=0)  # [9, group_size]
+
+    def _build_eosp_segment(self) -> jax.Array:
+        """Build a <|eosp|> (end of speech) segment.
+
+        This marks the end of audio.
+        Creates one group with:
+        - Text channel: [<|eosp|>, -100, -100, -100]
+        - Audio channels: speech_empty_ids
+
+        Returns:
+            Tensor of shape [9, group_size]
+        """
+        text_row = jnp.array(
+            [MIMO_EOSP_IDX] + [MIMO_TEXT_PADDING] * (MIMO_AUDIO_GROUP_SIZE - 1),
+            dtype=jnp.int32,
+        )
+
+        rows = [text_row]
+        for ch in range(MIMO_AUDIO_CHANNELS):
+            row = jnp.full((MIMO_AUDIO_GROUP_SIZE,), MIMO_SPEECH_EMPTY_IDS[ch], dtype=jnp.int32)
+            rows.append(row)
+
+        return jnp.stack(rows, axis=0)  # [9, group_size]
