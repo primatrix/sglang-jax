@@ -620,7 +620,6 @@ def _fused_ep_moe_kernel(
         # Avoid division by zero
         scale = jnp.maximum(scale, 1e-12)
         x_q = (x / scale).astype(activation_quantized_dtype)
-        assert 0 == 1, "break here"
         return x_q, scale
 
     def get_mesh_device_id(ep_rank):
