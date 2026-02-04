@@ -9,7 +9,7 @@ stage_args:
     runtime:
       num_tpus: 1
       max_batch_size: 1
-      device_kind: cpu
+      device_kind: tpu
     scheduler: audio_encoder
     scheduler_params: {}
     model_class: FlaxMiMoAudioTokenizer

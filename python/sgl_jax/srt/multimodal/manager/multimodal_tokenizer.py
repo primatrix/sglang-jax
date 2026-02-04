@@ -99,37 +99,79 @@ class MultimodalTokenizer(TokenizerManager):
         )
 
     def _init_audio_processor(self, model_path: str):
-        """Initialize audio processor if the model is an audio model."""
+        """Initialize audio processor (MelSpectrumExtractor) for audio models.
+
+        This loads the stage config to find the audio encoder's model path,
+        then initializes MelSpectrumExtractor from that config.
+        Note: JAX_PLATFORMS=cpu must be set before this is called.
+        """
         import json
         import os
-        try:
-            import huggingface_hub
-            if os.path.isdir(model_path):
-                config_path = os.path.join(model_path, "config.json")
-            else:
-                config_path = huggingface_hub.hf_hub_download(
-                    model_path,
-                    "config.json",
-                    local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-                )
-            with open(config_path, "r") as f:
-                config = json.load(f)
 
-            # Check if this is an audio model by looking for audio-specific config keys
-            if "n_mels" in config and "sampling_rate" in config:
-                from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_tokenizer import MelSpectrumExtractor
-                self.audio_processor = MelSpectrumExtractor(
-                    sample_rate=config.get("sampling_rate", 24000),
-                    n_fft=config.get("nfft", 960),
-                    hop_length=config.get("hop_length", 240),
-                    win_length=config.get("window_size", config.get("nfft", 960)),
-                    n_mels=config.get("n_mels", 128),
-                    f_min=config.get("fmin", 0),
-                    f_max=config.get("fmax") or (config.get("sampling_rate", 24000) // 2),
-                )
-                logger.info("Initialized audio processor for model %s", model_path)
+        model_paths_to_try = [model_path]
+
+        # Load stage config to find audio encoder model path
+        try:
+            from sgl_jax.srt.multimodal.models.static_configs import get_stage_config_path
+            from sgl_jax.srt.multimodal.manager.utils import load_stage_configs_from_yaml
+
+            stage_config_path = get_stage_config_path(model_path)
+            stage_configs = load_stage_configs_from_yaml(stage_config_path)
+
+            for stage_cfg in stage_configs:
+                scheduler = getattr(stage_cfg, 'scheduler', None)
+                if scheduler == "audio_encoder":
+                    audio_model_path = getattr(stage_cfg, 'model_path', None)
+                    if audio_model_path and audio_model_path not in model_paths_to_try:
+                        model_paths_to_try.insert(0, audio_model_path)
+                    break
         except Exception as e:
-            logger.warning("Failed to initialize audio processor from %s: %s", model_path, e)
+            logger.warning("Could not load stage config: %s", e)
+
+        # Fallback for MiMo Audio models
+        if "mimo" in model_path.lower() and "audio" in model_path.lower():
+            if "XiaomiMiMo/MiMo-Audio-Tokenizer" not in model_paths_to_try:
+                model_paths_to_try.append("XiaomiMiMo/MiMo-Audio-Tokenizer")
+
+        logger.info("Attempting to init audio processor from paths: %s", model_paths_to_try)
+
+        for try_path in model_paths_to_try:
+            try:
+                import huggingface_hub
+                if os.path.isdir(try_path):
+                    config_path = os.path.join(try_path, "config.json")
+                else:
+                    try:
+                        config_path = huggingface_hub.hf_hub_download(try_path, "config.json", local_files_only=True)
+                    except Exception:
+                        config_path = huggingface_hub.hf_hub_download(try_path, "config.json", local_files_only=False)
+
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+
+                if "n_mels" in config and "sampling_rate" in config:
+                    # Set JAX to CPU before importing MelSpectrumExtractor
+                    # (it uses JAX for mel filterbank computation)
+                    os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
+                    from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_tokenizer import MelSpectrumExtractor
+                    self.audio_processor = MelSpectrumExtractor(
+                        sample_rate=config.get("sampling_rate", 24000),
+                        n_fft=config.get("nfft", 960),
+                        hop_length=config.get("hop_length", 240),
+                        win_length=config.get("window_size", config.get("nfft", 960)),
+                        n_mels=config.get("n_mels", 128),
+                        f_min=config.get("fmin", 0),
+                        f_max=config.get("fmax") or (config.get("sampling_rate", 24000) // 2),
+                    )
+                    logger.info("Initialized audio processor from %s", try_path)
+                    return
+            except Exception as e:
+                logger.warning("Failed to init audio processor from %s: %s", try_path, e)
+                import traceback
+                logger.warning("Traceback: %s", traceback.format_exc())
+
+        logger.warning("Could not initialize audio processor")
 
     def _preprocess_audio_to_mel(self, audio_array: np.ndarray) -> tuple:
         """Convert raw audio waveform to mel spectrogram.
