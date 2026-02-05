@@ -1843,7 +1843,6 @@ class ScheduleBatch:
         input_ids_cpu, positions_cpu, out_cache_loc_cpu, real_input_ids_len = (
             self._merge_input_and_positions(per_dp_token_padding, total_token_size)
         )
-        logger.info("out_cache_loc_cpu: %s", out_cache_loc_cpu)
 
         # Step 3: Merge batch-level metadata from all DP ranks
         (
