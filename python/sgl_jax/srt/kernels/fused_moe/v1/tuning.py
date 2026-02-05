@@ -9,7 +9,7 @@ from __future__ import annotations
 # Minimum bucket size for `valid_num_tokens` when selecting a tuned block config.
 # The bucketing scheme maps (potentially many) `valid_num_tokens` values to a
 # smaller set of keys to avoid excessive compile variants.
-SGLANG_FUSED_MOE_TUNING_MIN_BUCKET: int = 64
+SGLANG_FUSED_MOE_TUNING_MIN_BUCKET: int = 16
 
 
 def _round_up_to_multiple(x: int, multiple: int) -> int:

@@ -624,6 +624,7 @@ def run_all(
     non_hotspot_alpha: float = None,
     token_mask_mode: str = "none",
     token_valid_ratios: list[float] | None = None,
+    valid_num_tokens_buckets: list[int] | None = None,
     token_mask_seed: int = 0,
 ) -> None:
     if use_grouped_topk is None:
@@ -639,8 +640,16 @@ def run_all(
     for r in ratios:
         if not (0.0 <= float(r) <= 1.0):
             raise ValueError(f"Expected token_valid_ratios to be within [0.0, 1.0], got {r=}.")
-    if token_mask_mode == "none":
-        ratios = [1.0]
+
+    bucket_targets = None if valid_num_tokens_buckets is None else list(valid_num_tokens_buckets)
+    if bucket_targets is not None:
+        if not bucket_targets:
+            bucket_targets = None
+        else:
+            bucket_targets = [int(b) for b in bucket_targets]
+            for b in bucket_targets:
+                if b <= 0:
+                    raise ValueError(f"Expected valid_num_tokens_buckets to be > 0, got {b=}.")
 
     token_list = DEFAULT_NUM_TOKENS if num_tokens is None else num_tokens
     raw_cases = make_moe_cases(
@@ -674,6 +683,7 @@ def run_all(
         return
 
     tuned_results: dict[str, dict[tuple, tuple[int, int, int, int, int, int, int, int, int]]] = {}
+    tuned_results_ms: dict[str, dict[tuple, float]] = {}
     if tune_block_config:
         from sgl_jax.srt.utils.jax_utils import get_device_name
 
@@ -708,8 +718,14 @@ def run_all(
             f"devices_used={case.ep_size * case.tp_size}/{len(jax.devices())}"
         )
         if token_mask_mode != "none":
-            ratios_str = ", ".join(f"{r:g}" for r in ratios)
-            print(f"  token_mask: mode={token_mask_mode}, valid_ratios=[{ratios_str}]")
+            if bucket_targets is not None:
+                buckets_str = ", ".join(str(b) for b in bucket_targets)
+                print(
+                    f"  token_mask: mode={token_mask_mode}, valid_num_tokens_buckets=[{buckets_str}]"
+                )
+            else:
+                ratios_str = ", ".join(f"{r:g}" for r in ratios)
+                print(f"  token_mask: mode={token_mask_mode}, valid_ratios=[{ratios_str}]")
         data = prepare_fused_moe_inputs(
             case,
             weight_dtype=weight_dtype,
@@ -855,19 +871,59 @@ def run_all(
                     block_config=block_config,
                 )
 
-            for token_valid_ratio in ratios:
-                token_valid_mask: jax.Array | None = None
-                if token_mask_mode != "none":
+            ep_world_size = int(case.ep_size) * int(case.tp_size)
+            if token_mask_mode == "none":
+                case_bucket_targets = [int(case.num_tokens)]
+            elif bucket_targets is not None:
+                case_bucket_targets = []
+                for b in bucket_targets:
+                    if b > case.num_tokens:
+                        continue
+                    num_valid = int(min(b, case.num_tokens))
+                    hint = bucket_valid_num_tokens_for_fused_moe(
+                        valid_num_tokens=int(num_valid),
+                        padded_num_tokens=int(case.num_tokens),
+                        ep_size=ep_world_size,
+                    )
+                    if hint == int(b):
+                        case_bucket_targets.append(int(b))
+                if not case_bucket_targets:
+                    print("  skip: no valid_num_tokens_buckets apply to this padded num_tokens")
+                    continue
+            else:
+                case_bucket_targets = []
+                for token_valid_ratio in ratios:
                     num_valid = int(round(case.num_tokens * float(token_valid_ratio)))
                     num_valid = max(0, min(case.num_tokens, num_valid))
+                    hint = bucket_valid_num_tokens_for_fused_moe(
+                        valid_num_tokens=int(num_valid),
+                        padded_num_tokens=int(case.num_tokens),
+                        ep_size=ep_world_size,
+                    )
+                    case_bucket_targets.append(int(hint))
+                case_bucket_targets = sorted(set(case_bucket_targets))
+
+            for bucket in case_bucket_targets:
+                token_valid_mask: jax.Array | None = None
+                if token_mask_mode != "none":
+                    num_valid = int(min(bucket, case.num_tokens))
+                    num_valid = max(0, num_valid)
                 else:
                     num_valid = case.num_tokens
 
                 valid_num_tokens_hint = bucket_valid_num_tokens_for_fused_moe(
                     valid_num_tokens=int(num_valid),
                     padded_num_tokens=int(case.num_tokens),
-                    ep_size=int(case.ep_size) * int(case.tp_size),
+                    ep_size=ep_world_size,
                 )
+                if token_mask_mode != "none" and valid_num_tokens_hint != int(bucket):
+                    # Should not happen for well-formed bucket targets; guard to avoid
+                    # accidental tuning under the wrong key.
+                    print(
+                        f"  skip: requested {bucket=} but got {valid_num_tokens_hint=} for "
+                        f"{num_valid=} (padded={case.num_tokens}, ep_size={ep_world_size})"
+                    )
+                    continue
 
                 if token_mask_mode != "none":
                     mask_np = np.zeros((case.num_tokens,), dtype=np.int32)
@@ -891,8 +947,8 @@ def run_all(
                     )
 
                 print(
-                    f"  fused_moe tuning: token_valid_ratio={float(token_valid_ratio):g}, "
-                    f"valid_num_tokens(bucketed)={valid_num_tokens_hint}"
+                    f"  fused_moe tuning: valid_num_tokens(bucketed)={valid_num_tokens_hint}, "
+                    f"num_valid={num_valid}, padded={case.num_tokens}"
                 )
 
                 best: tuple[float, FusedMoEBlockConfig | None] | None = None
@@ -1024,12 +1080,16 @@ def run_all(
                         print(f"  best: {best_cfg.as_kwargs()} ({best_ms:.3f} ms)")
                         print(f"  tuned_table[{device_name}][{table_key}] = {cfg_tuple}")
                         per_device = tuned_results.setdefault(device_name, {})
-                        if table_key in per_device and per_device[table_key] != cfg_tuple:
-                            print(
-                                f"  overwrite tuned entry: {device_name}[{table_key}] "
-                                f"{per_device[table_key]} -> {cfg_tuple}"
-                            )
-                        per_device[table_key] = cfg_tuple
+                        per_device_ms = tuned_results_ms.setdefault(device_name, {})
+                        prev_ms = per_device_ms.get(table_key)
+                        if prev_ms is None or best_ms < prev_ms:
+                            if table_key in per_device and per_device[table_key] != cfg_tuple:
+                                print(
+                                    f"  overwrite tuned entry: {device_name}[{table_key}] "
+                                    f"{per_device[table_key]} ({prev_ms:.3f} ms) -> {cfg_tuple} ({best_ms:.3f} ms)"
+                                )
+                            per_device[table_key] = cfg_tuple
+                            per_device_ms[table_key] = float(best_ms)
 
     if tune_block_config and tuned_results:
         print("\n# --- Copy/paste into tuned_block_configs.py ---")
@@ -1188,7 +1248,19 @@ def parse_args() -> argparse.Namespace:
         default=[1.0],
         help=(
             "Fraction of tokens marked valid (0.0-1.0). "
+            "These ratios are converted into bucketed valid_num_tokens keys; the benchmark tunes per bucket. "
             "If < 1.0 and --token-mask-mode is not set, defaults to --token-mask-mode=random."
+        ),
+    )
+    parser.add_argument(
+        "--valid-num-tokens-bucket",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Explicit bucketed valid_num_tokens keys to tune (preferred over ratios). "
+            "For each bucket B, the benchmark generates a token_valid_mask with num_valid=B (clamped by padded tokens) "
+            "and tunes the entry keyed by num_tokens=B in tuned_block_configs."
         ),
     )
     parser.add_argument(
@@ -1260,6 +1332,7 @@ if __name__ == "__main__":
             non_hotspot_alpha=args.non_hotspot_alpha,
             token_mask_mode=args.token_mask_mode,
             token_valid_ratios=args.token_valid_ratio,
+            valid_num_tokens_buckets=args.valid_num_tokens_bucket,
             token_mask_seed=args.token_mask_seed,
         )
     except BaseException as e:
