@@ -449,6 +449,31 @@ def get_ep_size(mesh: jax.sharding.Mesh, dp_axis_name, tp_axis_name):
     return dp_size * tp_size
 
 
+def _normalize_valid_num_tokens_for_tuning(
+    *,
+    valid_num_tokens: int,
+    padded_num_tokens: int,
+    ep_size: int,
+) -> int:
+    """Normalize a valid-token-count hint for tuned block-config lookup.
+
+    The kernel shape is still determined by `padded_num_tokens`; this value is
+    only used to pick a tuned config from the lookup table.
+    """
+    if valid_num_tokens <= 0:
+        return int(padded_num_tokens)
+    if ep_size <= 0:
+        raise ValueError(f"Expected {ep_size=} to be > 0.")
+    if padded_num_tokens <= 0:
+        raise ValueError(f"Expected {padded_num_tokens=} to be > 0.")
+
+    valid_num_tokens = int(min(valid_num_tokens, padded_num_tokens))
+    valid_num_tokens = int(max(valid_num_tokens, ep_size))
+    valid_num_tokens = int(((valid_num_tokens + ep_size - 1) // ep_size) * ep_size)
+    valid_num_tokens = int(min(valid_num_tokens, padded_num_tokens))
+    return int(valid_num_tokens)
+
+
 def _fused_ep_moe_kernel(
     # Input
     tokens_hbm,  # (local_num_tokens, t_packing, hidden_size // t_packing)
@@ -2621,6 +2646,7 @@ def _validate_fused_ep_moe_args(
         "act_fn",
         "subc_quant_wsz",
         "block_config",
+        "valid_num_tokens",
         "dp_axis_name",
         "tp_axis_name",
     ],
@@ -2635,6 +2661,7 @@ def fused_ep_moe(
     top_k: int,
     *,
     token_valid_mask: jax.Array | None = None,  # (num_tokens,)
+    valid_num_tokens: int | None = None,
     use_grouped_topk: bool = False,
     num_groups: int = 1,
     top_k_groups: int = 1,
@@ -2673,8 +2700,17 @@ def fused_ep_moe(
 
         num_tokens, hidden_size = tokens.shape
         num_experts, intermediate_size, _ = w2.shape
+        lookup_num_tokens = (
+            num_tokens
+            if valid_num_tokens is None
+            else _normalize_valid_num_tokens_for_tuning(
+                valid_num_tokens=int(valid_num_tokens),
+                padded_num_tokens=num_tokens,
+                ep_size=ep_size,
+            )
+        )
         block_config = get_tuned_fused_moe_block_config(
-            num_tokens=num_tokens,
+            num_tokens=lookup_num_tokens,
             num_experts=num_experts,
             top_k=top_k,
             hidden_size=hidden_size,

@@ -1004,6 +1004,7 @@ class FusedEPMoE(nnx.Module):
         router_bias: jax.Array | None = None,
         token_valid_mask: jax.Array | None = None,
         *,
+        valid_num_tokens: int | None = None,
         block_config: FusedMoEBlockConfig | None = None,
     ) -> jax.Array:
         """
@@ -1058,6 +1059,7 @@ class FusedEPMoE(nnx.Module):
             act_fn=self.activation,
             block_config=block_config,
             token_valid_mask=token_valid_mask,
+            valid_num_tokens=valid_num_tokens,
             # Optional parameters (not used in basic case)
             subc_quant_wsz=subc_quant_wsz,
             w1_scale=w1_scale,

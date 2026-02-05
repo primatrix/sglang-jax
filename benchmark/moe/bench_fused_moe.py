@@ -37,6 +37,9 @@ from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
     FusedMoEBlockConfig,
     validate_fused_moe_block_config,
 )
+from sgl_jax.srt.kernels.fused_moe.v1.tuning import (
+    bucket_valid_num_tokens_for_fused_moe,
+)
 from sgl_jax.srt.layers.moe import FusedEPMoE
 
 # Leave headroom for compiler padding/alignment and any unmodeled VMEM usage.
@@ -620,7 +623,7 @@ def run_all(
     zero_expert_count: int = None,
     non_hotspot_alpha: float = None,
     token_mask_mode: str = "none",
-    token_valid_ratio: float = 1.0,
+    token_valid_ratios: list[float] | None = None,
     token_mask_seed: int = 0,
 ) -> None:
     if use_grouped_topk is None:
@@ -629,8 +632,15 @@ def run_all(
     token_mask_mode = (token_mask_mode or "none").lower()
     if token_mask_mode not in ("none", "prefix", "random"):
         raise ValueError(f"Unsupported {token_mask_mode=}. Expected none|prefix|random.")
-    if not (0.0 <= token_valid_ratio <= 1.0):
-        raise ValueError(f"Expected {token_valid_ratio=} to be within [0.0, 1.0].")
+
+    ratios = [1.0] if token_valid_ratios is None else list(token_valid_ratios)
+    if not ratios:
+        ratios = [1.0]
+    for r in ratios:
+        if not (0.0 <= float(r) <= 1.0):
+            raise ValueError(f"Expected token_valid_ratios to be within [0.0, 1.0], got {r=}.")
+    if token_mask_mode == "none":
+        ratios = [1.0]
 
     token_list = DEFAULT_NUM_TOKENS if num_tokens is None else num_tokens
     raw_cases = make_moe_cases(
@@ -698,7 +708,8 @@ def run_all(
             f"devices_used={case.ep_size * case.tp_size}/{len(jax.devices())}"
         )
         if token_mask_mode != "none":
-            print(f"  token_mask: mode={token_mask_mode}, valid_ratio={token_valid_ratio}")
+            ratios_str = ", ".join(f"{r:g}" for r in ratios)
+            print(f"  token_mask: mode={token_mask_mode}, valid_ratios=[{ratios_str}]")
         data = prepare_fused_moe_inputs(
             case,
             weight_dtype=weight_dtype,
@@ -727,29 +738,7 @@ def run_all(
         data["router_logits"] = jax.device_put(
             custom_logits, jax.sharding.NamedSharding(mesh, P("tensor", None))
         )
-        token_valid_mask: jax.Array | None = None
-        if token_mask_mode != "none":
-            num_valid = int(round(case.num_tokens * token_valid_ratio))
-            num_valid = max(0, min(case.num_tokens, num_valid))
-            mask_np = np.zeros((case.num_tokens,), dtype=np.int32)
-            if token_mask_mode == "prefix":
-                num_invalid = case.num_tokens - num_valid
-                if num_valid:
-                    mask_np[num_invalid:] = 1
-            else:
-                rng = np.random.default_rng(token_mask_seed + case.seed)
-                if num_valid:
-                    valid_idx = rng.choice(case.num_tokens, size=num_valid, replace=False)
-                    mask_np[valid_idx] = 1
-            token_valid_mask = jax.device_put(
-                jnp.asarray(mask_np),
-                jax.sharding.NamedSharding(
-                    mesh,
-                    P(
-                        "tensor",
-                    ),
-                ),
-            )
+        # Token validity mask and valid_num_tokens hint are derived per ratio below.
         # Determine subc_quant_wsz for FP8 quantization
         subc_quant_wsz = 256 if weight_dtype == jnp.float8_e4m3fn else None
 
@@ -820,19 +809,30 @@ def run_all(
 
             @partial(
                 jax.jit,
-                static_argnames=("moe_state_def", "block_config"),
+                static_argnames=("moe_state_def", "block_config", "valid_num_tokens"),
                 compiler_options=_tpu_log_recorder_compiler_options(),
             )
             def run_no_mask(
-                tokens, router_logits, *, moe_state_def, moe_state_leaves, block_config
+                tokens,
+                router_logits,
+                *,
+                valid_num_tokens: int,
+                moe_state_def,
+                moe_state_leaves,
+                block_config,
             ):
                 moe_state = jax.tree_util.tree_unflatten(moe_state_def, moe_state_leaves)
                 moe = nnx.merge(moe_def, moe_state)
-                return moe(tokens, router_logits, block_config=block_config)
+                return moe(
+                    tokens,
+                    router_logits,
+                    valid_num_tokens=valid_num_tokens,
+                    block_config=block_config,
+                )
 
             @partial(
                 jax.jit,
-                static_argnames=("moe_state_def", "block_config"),
+                static_argnames=("moe_state_def", "block_config", "valid_num_tokens"),
                 compiler_options=_tpu_log_recorder_compiler_options(),
             )
             def run_with_mask(
@@ -840,6 +840,7 @@ def run_all(
                 router_logits,
                 token_valid_mask,
                 *,
+                valid_num_tokens: int,
                 moe_state_def,
                 moe_state_leaves,
                 block_config,
@@ -850,148 +851,185 @@ def run_all(
                     tokens,
                     router_logits,
                     token_valid_mask=token_valid_mask,
+                    valid_num_tokens=valid_num_tokens,
                     block_config=block_config,
                 )
 
-            best: tuple[float, FusedMoEBlockConfig | None] | None = None
-            for i, block_cfg in enumerate(block_cfgs):
-                tag = "default" if block_cfg is None else str(i)
-                if block_cfg is None:
-                    print("  fused_moe blocks] -> (block_config=None)")
+            for token_valid_ratio in ratios:
+                token_valid_mask: jax.Array | None = None
+                if token_mask_mode != "none":
+                    num_valid = int(round(case.num_tokens * float(token_valid_ratio)))
+                    num_valid = max(0, min(case.num_tokens, num_valid))
                 else:
-                    print(
-                        f"  fused_moe blocks [{i+1}/{len(block_cfgs)}] -> {block_cfg.as_kwargs()}"
-                    )
-                    vmem_bytes = _estimate_vmem_bytes(
-                        case,
-                        jnp.bfloat16,
-                        weight_dtype,
-                        data["router_logits"].dtype,
-                        block_cfg,
-                        intermediate_size=case.intermediate_size,
-                        hidden_size=case.hidden_size,
-                        use_shared_expert=use_shared_expert,
-                        subc_quant_wsz=subc_quant_wsz,
-                        verbose=True,
-                    )
-                    vmem_mb = vmem_bytes / (1024 * 1024)
-                    vmem_remaining_mb = 64.0 - vmem_mb
-                    print(
-                        f"    => VMEM: {vmem_mb:.2f} MB / 64 MB (remaining: {vmem_remaining_mb:.2f} MB)"
+                    num_valid = case.num_tokens
+
+                valid_num_tokens_hint = bucket_valid_num_tokens_for_fused_moe(
+                    valid_num_tokens=int(num_valid),
+                    padded_num_tokens=int(case.num_tokens),
+                    ep_size=int(case.ep_size) * int(case.tp_size),
+                )
+
+                if token_mask_mode != "none":
+                    mask_np = np.zeros((case.num_tokens,), dtype=np.int32)
+                    if token_mask_mode == "prefix":
+                        num_invalid = case.num_tokens - num_valid
+                        if num_valid:
+                            mask_np[num_invalid:] = 1
+                    else:
+                        rng = np.random.default_rng(token_mask_seed + case.seed)
+                        if num_valid:
+                            valid_idx = rng.choice(case.num_tokens, size=num_valid, replace=False)
+                            mask_np[valid_idx] = 1
+                    token_valid_mask = jax.device_put(
+                        jnp.asarray(mask_np),
+                        jax.sharding.NamedSharding(
+                            mesh,
+                            P(
+                                "tensor",
+                            ),
+                        ),
                     )
 
-                task = "fused-moe-k_.*"
+                print(
+                    f"  fused_moe tuning: token_valid_ratio={float(token_valid_ratio):g}, "
+                    f"valid_num_tokens(bucketed)={valid_num_tokens_hint}"
+                )
 
-                def _compute(block_cfg=block_cfg):
-                    if token_valid_mask is None:
-                        return run_no_mask(
+                best: tuple[float, FusedMoEBlockConfig | None] | None = None
+                for i, block_cfg in enumerate(block_cfgs):
+                    tag = "default" if block_cfg is None else str(i)
+                    if block_cfg is None:
+                        print("  fused_moe blocks] -> (block_config=None)")
+                    else:
+                        print(
+                            f"  fused_moe blocks [{i+1}/{len(block_cfgs)}] -> {block_cfg.as_kwargs()}"
+                        )
+                        vmem_bytes = _estimate_vmem_bytes(
+                            case,
+                            jnp.bfloat16,
+                            weight_dtype,
+                            data["router_logits"].dtype,
+                            block_cfg,
+                            intermediate_size=case.intermediate_size,
+                            hidden_size=case.hidden_size,
+                            use_shared_expert=use_shared_expert,
+                            subc_quant_wsz=subc_quant_wsz,
+                            verbose=True,
+                        )
+                        vmem_mb = vmem_bytes / (1024 * 1024)
+                        vmem_remaining_mb = 64.0 - vmem_mb
+                        print(
+                            f"    => VMEM: {vmem_mb:.2f} MB / 64 MB (remaining: {vmem_remaining_mb:.2f} MB)"
+                        )
+
+                    task = "fused-moe-k_.*"
+
+                    def _compute(block_cfg=block_cfg):
+                        if token_valid_mask is None:
+                            return run_no_mask(
+                                data["tokens"],
+                                data["router_logits"],
+                                valid_num_tokens=valid_num_tokens_hint,
+                                moe_state_def=moe_state_def,
+                                moe_state_leaves=moe_state_leaves,
+                                block_config=block_cfg,
+                            )
+                        return run_with_mask(
                             data["tokens"],
                             data["router_logits"],
+                            token_valid_mask,
+                            valid_num_tokens=valid_num_tokens_hint,
                             moe_state_def=moe_state_def,
                             moe_state_leaves=moe_state_leaves,
                             block_config=block_cfg,
                         )
-                    return run_with_mask(
-                        data["tokens"],
-                        data["router_logits"],
-                        token_valid_mask,
-                        moe_state_def=moe_state_def,
-                        moe_state_leaves=moe_state_leaves,
-                        block_config=block_cfg,
-                    )
 
-                try:
-                    if block_cfg is not None:
-                        validate_fused_moe_block_config(
-                            num_tokens=case.num_tokens,
-                            num_experts=case.num_experts,
-                            top_k=case.top_k,
-                            hidden_size=case.hidden_size,
-                            intermediate_size=case.intermediate_size,
-                            dtype=dtype,
-                            ep_size=mesh_ep,
-                            subc_quant_wsz=None,
-                            block_config=block_cfg,
+                    try:
+                        if block_cfg is not None:
+                            validate_fused_moe_block_config(
+                                num_tokens=case.num_tokens,
+                                num_experts=case.num_experts,
+                                top_k=case.top_k,
+                                hidden_size=case.hidden_size,
+                                intermediate_size=case.intermediate_size,
+                                dtype=dtype,
+                                ep_size=mesh_ep,
+                                subc_quant_wsz=None,
+                                block_config=block_cfg,
+                            )
+                        times = multiple_iteration_timeit_from_trace(
+                            compute_func=_compute,
+                            data_generator=lambda: (),
+                            task=task,
+                            tries=iters,
+                            warmup=warmup_iters,
                         )
-                    times = multiple_iteration_timeit_from_trace(
-                        compute_func=_compute,
-                        data_generator=lambda: (),
-                        task=task,
-                        tries=iters,
-                        warmup=warmup_iters,
-                    )
-                except ValueError as e:
-                    print(f"SKIP fused_moe blocks [{i+1}/{len(block_cfgs)}], reason: {e}")
-                    continue
-                except SystemExit as e:
-                    # In some TPU environments stderr isn't captured/aggregated, and some internal
-                    # errors can surface as SystemExit(1). Print the traceback to stdout so it's
-                    # visible in logs.
-                    print(
-                        f"ERROR fused_moe blocks [{i+1}/{len(block_cfgs)}]: "
-                        f"{type(e).__name__}: {e}",
-                        flush=True,
-                    )
-                    print(traceback.format_exc(), flush=True)
-                    raise
-                except Exception as e:
-                    # Some failures (e.g., TPU compilation/runtime issues or missing profiler trace
-                    # output) can surface as non-ValueError exceptions. Print the full traceback to
-                    # stdout so benchmark runs don't appear to exit silently.
-                    print(
-                        f"ERROR fused_moe blocks [{i+1}/{len(block_cfgs)}]: "
-                        f"{type(e).__name__}: {e}",
-                        flush=True,
-                    )
-                    print(traceback.format_exc(), flush=True)
-                    continue
-                if len(times) > 1:
-                    times = times[1:]
-                mean_ms = float(np.mean(times)) if times else float("nan")
-                print(f"     fused_moe[{tag}]: {mean_ms:.3f} ms (trace) | samples={times}")
-                if tune_block_config and np.isfinite(mean_ms):
-                    if best is None or mean_ms < best[0]:
-                        best = (mean_ms, block_cfg)
-
-            if tune_block_config and best is not None:
-                best_ms, best_cfg = best
-                if best_cfg is None:
-                    print(f"  best: default ({best_ms:.3f} ms)")
-                else:
-                    device_name = get_device_name()
-                    table_key = (
-                        jnp.dtype(dtype).name,
-                        jnp.dtype(weight_dtype).name,
-                        case.num_tokens,
-                        case.num_experts,
-                        case.top_k,
-                        case.hidden_size,
-                        case.intermediate_size,
-                        case.ep_size,
-                        use_shared_expert,
-                        use_grouped_topk,
-                    )
-                    cfg_tuple = (
-                        best_cfg.bt,
-                        best_cfg.bf,
-                        best_cfg.bd1,
-                        best_cfg.bd2,
-                        best_cfg.bts if best_cfg.bts is not None else best_cfg.bt,
-                        best_cfg.btc,
-                        best_cfg.bfc,
-                        best_cfg.bd1c,
-                        best_cfg.bd2c,
-                        best_cfg.bse,
-                    )
-                    print(f"  best: {best_cfg.as_kwargs()} ({best_ms:.3f} ms)")
-                    print(f"  tuned_table[{device_name}][{table_key}] = {cfg_tuple}")
-                    per_device = tuned_results.setdefault(device_name, {})
-                    if table_key in per_device and per_device[table_key] != cfg_tuple:
+                    except ValueError as e:
+                        print(f"SKIP fused_moe blocks [{i+1}/{len(block_cfgs)}], reason: {e}")
+                        continue
+                    except SystemExit as e:
                         print(
-                            f"  overwrite tuned entry: {device_name}[{table_key}] "
-                            f"{per_device[table_key]} -> {cfg_tuple}"
+                            f"ERROR fused_moe blocks [{i+1}/{len(block_cfgs)}]: "
+                            f"{type(e).__name__}: {e}",
+                            flush=True,
                         )
-                    per_device[table_key] = cfg_tuple
+                        print(traceback.format_exc(), flush=True)
+                        raise
+                    except Exception as e:
+                        print(
+                            f"ERROR fused_moe blocks [{i+1}/{len(block_cfgs)}]: "
+                            f"{type(e).__name__}: {e}",
+                            flush=True,
+                        )
+                        print(traceback.format_exc(), flush=True)
+                        continue
+                    if len(times) > 1:
+                        times = times[1:]
+                    mean_ms = float(np.mean(times)) if times else float("nan")
+                    print(f"     fused_moe[{tag}]: {mean_ms:.3f} ms (trace) | samples={times}")
+                    if tune_block_config and np.isfinite(mean_ms):
+                        if best is None or mean_ms < best[0]:
+                            best = (mean_ms, block_cfg)
+
+                if tune_block_config and best is not None:
+                    best_ms, best_cfg = best
+                    if best_cfg is None:
+                        print(f"  best: default ({best_ms:.3f} ms)")
+                    else:
+                        device_name = get_device_name()
+                        table_key = (
+                            jnp.dtype(dtype).name,
+                            jnp.dtype(weight_dtype).name,
+                            int(valid_num_tokens_hint),
+                            case.num_experts,
+                            case.top_k,
+                            case.hidden_size,
+                            case.intermediate_size,
+                            case.ep_size,
+                            use_shared_expert,
+                            use_grouped_topk,
+                        )
+                        cfg_tuple = (
+                            best_cfg.bt,
+                            best_cfg.bf,
+                            best_cfg.bd1,
+                            best_cfg.bd2,
+                            best_cfg.bts if best_cfg.bts is not None else best_cfg.bt,
+                            best_cfg.btc,
+                            best_cfg.bfc,
+                            best_cfg.bd1c,
+                            best_cfg.bd2c,
+                            best_cfg.bse,
+                        )
+                        print(f"  best: {best_cfg.as_kwargs()} ({best_ms:.3f} ms)")
+                        print(f"  tuned_table[{device_name}][{table_key}] = {cfg_tuple}")
+                        per_device = tuned_results.setdefault(device_name, {})
+                        if table_key in per_device and per_device[table_key] != cfg_tuple:
+                            print(
+                                f"  overwrite tuned entry: {device_name}[{table_key}] "
+                                f"{per_device[table_key]} -> {cfg_tuple}"
+                            )
+                        per_device[table_key] = cfg_tuple
 
     if tune_block_config and tuned_results:
         print("\n# --- Copy/paste into tuned_block_configs.py ---")
@@ -1146,7 +1184,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--token-valid-ratio",
         type=float,
-        default=1.0,
+        nargs="+",
+        default=[1.0],
         help=(
             "Fraction of tokens marked valid (0.0-1.0). "
             "If < 1.0 and --token-mask-mode is not set, defaults to --token-mask-mode=random."
@@ -1169,7 +1208,7 @@ if __name__ == "__main__":
     except Exception:
         pass
     args = parse_args()
-    if args.token_mask_mode == "none" and args.token_valid_ratio < 1.0:
+    if args.token_mask_mode == "none" and any(float(r) < 1.0 for r in args.token_valid_ratio):
         args.token_mask_mode = "random"
     DTYPE_MAP = {
         "int8": jnp.int8,
@@ -1220,7 +1259,7 @@ if __name__ == "__main__":
             zero_expert_count=args.zero_expert_count,
             non_hotspot_alpha=args.non_hotspot_alpha,
             token_mask_mode=args.token_mask_mode,
-            token_valid_ratio=args.token_valid_ratio,
+            token_valid_ratios=args.token_valid_ratio,
             token_mask_seed=args.token_mask_seed,
         )
     except BaseException as e:

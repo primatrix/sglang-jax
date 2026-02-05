@@ -420,6 +420,7 @@ class BailingMoEDecoderLayer(nnx.Module):
                     router_logits,
                     router_bias=correction_bias,
                     token_valid_mask=token_valid_mask,
+                    valid_num_tokens=forward_batch.valid_num_tokens,
                 )
                 topk_ids = None
             else:

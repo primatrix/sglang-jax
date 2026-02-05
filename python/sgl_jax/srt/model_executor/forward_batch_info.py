@@ -28,6 +28,9 @@ from jax.sharding import NamedSharding, PartitionSpec
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.configs.model_config import need_attention_mask
+from sgl_jax.srt.kernels.fused_moe.v1.tuning import (
+    bucket_valid_num_tokens_for_fused_moe,
+)
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.jax_utils import device_array
 
@@ -178,6 +181,11 @@ class ForwardBatch:
     # Multimodal cached vision embeddings (prefill only)
     input_embedding: jax.Array | None = None
 
+    # Optional tuning hint for fused MoE: bucketed valid token count (global).
+    # This is intentionally a static Python int so it can steer kernel selection
+    # without any device sync.
+    valid_num_tokens: int | None = None
+
     def tree_flatten(self):
         children = (
             self.input_ids,
@@ -203,6 +211,7 @@ class ForwardBatch:
             "spec_algorithm": self.spec_algorithm,
             "capture_hidden_mode": self.capture_hidden_mode,
             "deterministic": self.deterministic,
+            "valid_num_tokens": self.valid_num_tokens,
         }
         return (children, aux_data)
 
@@ -215,6 +224,7 @@ class ForwardBatch:
         obj.spec_algorithm = aux_data["spec_algorithm"]
         obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
         obj.deterministic = aux_data.get("deterministic", True)
+        obj.valid_num_tokens = aux_data.get("valid_num_tokens", None)
         obj.trace_request_ids = None
         obj.trace_request_objects = None
 
@@ -377,5 +387,28 @@ class ForwardBatch:
 
             # Generate mask: 1 for valid tokens, 0 for padding
             obj.attention_mask = (obj.input_ids != pad_token_id).astype(jnp.int32)
+
+        # Optional tuning hint for fused MoE: drive block-config selection using
+        # the *valid* (unpadded) token count instead of the padded token count.
+        #
+        # Note: This must be a Python int (static) to steer kernel selection
+        # without forcing any device synchronization.
+        padded_num_tokens = int(batch.input_ids.shape[0])
+        if batch.forward_mode.is_decode():
+            valid_num_tokens = int(batch.real_bs)
+        elif batch.forward_mode.is_extend():
+            valid_num_tokens = int(batch.real_input_ids_len)
+        else:
+            valid_num_tokens = padded_num_tokens
+
+        dp_size = int(model_runner.mesh.shape.get("data", 1))
+        tp_size = int(model_runner.mesh.shape.get("tensor", 1))
+        ep_size = dp_size * tp_size
+
+        obj.valid_num_tokens = bucket_valid_num_tokens_for_fused_moe(
+            valid_num_tokens=valid_num_tokens,
+            padded_num_tokens=padded_num_tokens,
+            ep_size=ep_size,
+        )
 
         return obj
