@@ -1,10 +1,5 @@
 import logging
-import os
 import signal
-
-# Force JAX to use CPU before any JAX imports to avoid TPU conflicts
-# This must be set before importing modules that use JAX
-os.environ["JAX_PLATFORMS"] = "cpu"
 
 import imageio
 import numpy as np
@@ -107,9 +102,6 @@ def run_multimodal_detokenizer_process(
     Performs process-level setup, constructs a `MultimodalDetokenizer`, and
     runs its event loop. On unhandled exceptions the parent process is
     signaled to terminate.
-
-    Note: JAX_PLATFORMS=cpu is set at module level to ensure JAX uses CPU
-    before any JAX imports occur.
     """
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang-jax::multimodal_detokenizer")
