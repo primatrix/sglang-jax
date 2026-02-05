@@ -65,7 +65,7 @@ class MiMoRotaryEmbedding(nnx.Module):
         base: float,
         dim: int,
         max_seq_len: int,
-        rope_type: str = "default",git
+        rope_type: str = "default",
         dtype: jnp.dtype = jnp.float32,
     ):
         self.base = base
