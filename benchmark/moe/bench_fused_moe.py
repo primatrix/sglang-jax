@@ -353,15 +353,13 @@ def select_block_configs(
         return v in (2, 4, 8) or v % 8 == 0
 
     bt_candidates = [
-        v
-        for v in _pick_candidates(candidates=bt_candidates, multiple_of=t_packing)
-        if _bt_allowed(v)
+        v for v in _pick_candidates(candidates=bt_candidates, multiple_of=1) if _bt_allowed(v)
     ]
     bts_candidates_i: list[int] | None
     if bts_candidates is None:
         bts_candidates_i = None
     else:
-        bts_candidates_i = _pick_candidates(candidates=list(bts_candidates), multiple_of=t_packing)
+        bts_candidates_i = _pick_candidates(candidates=list(bts_candidates), multiple_of=1)
     bf_candidates = _pick_candidates(candidates=bf_candidates, multiple_of=128)
     bd_candidates = _pick_candidates(candidates=bd_candidates, multiple_of=tile_align)
 
@@ -384,8 +382,6 @@ def select_block_configs(
             return False, "non-positive tile size"
         if bt > local_num_tokens:
             return False, f"bt({bt}) > local_num_tokens({local_num_tokens})"
-        if bt % t_packing != 0:
-            return False, f"bt({bt}) % t_packing({t_packing}) != 0"
         if not _bt_allowed(bt):
             return False, f"bt({bt}) must be 2, 4, 8, or a multiple of 8"
         if bt % router_tile0 != 0:
@@ -393,14 +389,10 @@ def select_block_configs(
                 False,
                 f"bt({bt}) not aligned to router_tile0({router_tile0}) for router_dtype={jnp.dtype(router_dtype).name}",
             )
-        if bts % t_packing != 0:
-            return False, f"bts({bts}) % t_packing({t_packing}) != 0"
         if not (0 < bts <= bt):
             return False, f"bts({bts}) not in (0, bt({bt})]"
         if not (0 < btc <= bts):
             return False, f"btc({btc}) not in (0, bts({bts})]"
-        if btc % t_packing != 0:
-            return False, f"btc({btc}) % t_packing({t_packing}) != 0"
         if bts % btc != 0:
             return False, f"bts({bts}) % btc({btc}) != 0"
 
@@ -643,15 +635,16 @@ def run_all(
 
         # For fused_moe benchmark we require tp_size==1, i.e. we use all local devices as EP.
         world_size = len(jax.devices())
-        t_packing = _dtype_packing(dtype)
-        align_multiple = world_size * t_packing
+        # Pick a padded token count that is legal for EP sharding and avoids
+        # degenerate bt=1 cases after `effective_for` (kernel requires bt>=2).
+        align_multiple = world_size * 2
 
         def _ceil_to_multiple(x: int, multiple: int) -> int:
             return ((x + multiple - 1) // multiple) * multiple
 
         valid_by_padded = {}
         for v in valid_list:
-            padded = _ceil_to_multiple(max(v, world_size), align_multiple)
+            padded = _ceil_to_multiple(max(v, 2 * world_size), align_multiple)
             valid_by_padded.setdefault(int(padded), []).append(int(v))
 
         for padded, values in valid_by_padded.items():
@@ -711,18 +704,10 @@ def run_all(
     )
 
     for case in cases:
-        t_packing = _dtype_packing(jnp.bfloat16)
         mesh = build_mesh(ep_size=case.ep_size, tp_size=case.tp_size)
         mesh_ep = mesh.shape["tensor"]
         if mesh_ep != case.ep_size:
             print(f"warning [case={case.name}] mesh_ep={mesh_ep} != case.ep_size={case.ep_size}")
-        local_num_tokens = case.num_tokens // mesh_ep
-        if local_num_tokens % t_packing != 0:
-            print(
-                f"skip [case={case.name}] because local_num_tokens={local_num_tokens} "
-                f"is not aligned to t_packing={t_packing} (dtype={jnp.dtype(dtype).name}, ep_size={mesh_ep})"
-            )
-            continue
         print(
             f"\n[case={case.name}] tokens={case.num_tokens}, experts={case.num_experts}, "
             f"top_k={case.top_k}, hidden={case.hidden_size}, intermediate={case.intermediate_size}, ep_size={case.ep_size}"

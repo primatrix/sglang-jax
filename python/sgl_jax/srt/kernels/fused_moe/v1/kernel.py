@@ -210,16 +210,10 @@ def validate_fused_moe_block_config(
     bd2c = block_config.bd2c
     bse = block_config.bse
 
-    if local_num_tokens % t_packing != 0:
-        raise ValueError(f"Expected {local_num_tokens=} to be aligned to {t_packing=}.")
-    if bt % t_packing != 0:
-        raise ValueError(f"Expected {bt=} to be aligned to {t_packing=}.")
     if not (bt in (2, 4, 8) or bt % 8 == 0):
         raise ValueError("Expected bt to be 2, 4, 8, or a multiple of 8.")
     if local_num_tokens % bt != 0:
         raise ValueError(f"Expected {local_num_tokens=} to be divisible by {bt=}.")
-    if bts % t_packing != 0:
-        raise ValueError(f"Expected {bts=} to be aligned to {t_packing=}.")
     if bts > bt:
         raise ValueError(f"Expected {bts=} to be <= {bt=}.")
     if not (0 < btc <= bts):
@@ -600,7 +594,6 @@ def _fused_ep_moe_kernel(
     assert bd1c % t_packing == 0
     assert bd2c % t_packing == 0
 
-    assert bts % t_packing == 0
     assert bts % btc == 0
     assert bts <= bt
 
