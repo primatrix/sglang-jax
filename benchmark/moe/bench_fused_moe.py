@@ -37,9 +37,7 @@ from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
     FusedMoEBlockConfig,
     validate_fused_moe_block_config,
 )
-from sgl_jax.srt.kernels.fused_moe.v1.tuning import (
-    bucket_valid_num_tokens_for_fused_moe,
-)
+from sgl_jax.srt.kernels.fused_moe.v1.tuning import clamp_valid_num_tokens_for_fused_moe
 from sgl_jax.srt.layers.moe import FusedEPMoE
 
 # Leave headroom for compiler padding/alignment and any unmodeled VMEM usage.
@@ -623,8 +621,7 @@ def run_all(
     zero_expert_count: int = None,
     non_hotspot_alpha: float = None,
     token_mask_mode: str = "none",
-    token_valid_ratios: list[float] | None = None,
-    valid_num_tokens_buckets: list[int] | None = None,
+    valid_num_tokens: list[int] | None = None,
     token_mask_seed: int = 0,
 ) -> None:
     if use_grouped_topk is None:
@@ -634,24 +631,41 @@ def run_all(
     if token_mask_mode not in ("none", "prefix", "random"):
         raise ValueError(f"Unsupported {token_mask_mode=}. Expected none|prefix|random.")
 
-    ratios = [1.0] if token_valid_ratios is None else list(token_valid_ratios)
-    if not ratios:
-        ratios = [1.0]
-    for r in ratios:
-        if not (0.0 <= float(r) <= 1.0):
-            raise ValueError(f"Expected token_valid_ratios to be within [0.0, 1.0], got {r=}.")
+    if valid_num_tokens is not None and num_tokens is not None:
+        raise ValueError("Pass either valid_num_tokens or num_tokens, not both.")
 
-    bucket_targets = None if valid_num_tokens_buckets is None else list(valid_num_tokens_buckets)
-    if bucket_targets is not None:
-        if not bucket_targets:
-            bucket_targets = None
-        else:
-            bucket_targets = [int(b) for b in bucket_targets]
-            for b in bucket_targets:
-                if b <= 0:
-                    raise ValueError(f"Expected valid_num_tokens_buckets to be > 0, got {b=}.")
+    valid_by_padded: dict[int, list[int]] | None = None
+    if valid_num_tokens is not None:
+        valid_list = [int(v) for v in valid_num_tokens]
+        for v in valid_list:
+            if v <= 0:
+                raise ValueError(f"Expected valid_num_tokens to be > 0, got {v=}.")
 
-    token_list = DEFAULT_NUM_TOKENS if num_tokens is None else num_tokens
+        # For fused_moe benchmark we require tp_size==1, i.e. we use all local devices as EP.
+        world_size = len(jax.devices())
+        t_packing = _dtype_packing(dtype)
+        align_multiple = world_size * t_packing
+
+        def _ceil_to_multiple(x: int, multiple: int) -> int:
+            return ((x + multiple - 1) // multiple) * multiple
+
+        valid_by_padded = {}
+        for v in valid_list:
+            padded = _ceil_to_multiple(max(v, world_size), align_multiple)
+            valid_by_padded.setdefault(int(padded), []).append(int(v))
+
+        for padded, values in valid_by_padded.items():
+            valid_by_padded[padded] = sorted(set(values))
+
+        if token_mask_mode == "none":
+            needs_mask = any(v != padded for padded, vs in valid_by_padded.items() for v in vs)
+            if needs_mask:
+                token_mask_mode = "random"
+
+        token_list = sorted(valid_by_padded.keys())
+        print(f"  derived padded num_tokens from valid_num_tokens: {token_list}")
+    else:
+        token_list = DEFAULT_NUM_TOKENS if num_tokens is None else num_tokens
     raw_cases = make_moe_cases(
         num_tokens=token_list,
         num_experts=num_experts,
@@ -718,14 +732,15 @@ def run_all(
             f"devices_used={case.ep_size * case.tp_size}/{len(jax.devices())}"
         )
         if token_mask_mode != "none":
-            if bucket_targets is not None:
-                buckets_str = ", ".join(str(b) for b in bucket_targets)
+            if valid_by_padded is not None:
+                values = valid_by_padded.get(int(case.num_tokens), [])
+                values_str = ", ".join(str(v) for v in values[:12])
+                suffix = "" if len(values) <= 12 else f" (+{len(values) - 12} more)"
                 print(
-                    f"  token_mask: mode={token_mask_mode}, valid_num_tokens_buckets=[{buckets_str}]"
+                    f"  token_mask: mode={token_mask_mode}, valid_num_tokens=[{values_str}]{suffix}"
                 )
             else:
-                ratios_str = ", ".join(f"{r:g}" for r in ratios)
-                print(f"  token_mask: mode={token_mask_mode}, valid_ratios=[{ratios_str}]")
+                print(f"  token_mask: mode={token_mask_mode}")
         data = prepare_fused_moe_inputs(
             case,
             weight_dtype=weight_dtype,
@@ -871,61 +886,30 @@ def run_all(
                     block_config=block_config,
                 )
 
-            ep_world_size = int(case.ep_size) * int(case.tp_size)
-            if token_mask_mode == "none":
-                case_bucket_targets = [int(case.num_tokens)]
-            elif bucket_targets is not None:
-                case_bucket_targets = []
-                for b in bucket_targets:
-                    if b > case.num_tokens:
-                        continue
-                    num_valid = int(min(b, case.num_tokens))
-                    hint = bucket_valid_num_tokens_for_fused_moe(
-                        valid_num_tokens=int(num_valid),
-                        padded_num_tokens=int(case.num_tokens),
-                        ep_size=ep_world_size,
-                    )
-                    if hint == int(b):
-                        case_bucket_targets.append(int(b))
-                if not case_bucket_targets:
-                    print("  skip: no valid_num_tokens_buckets apply to this padded num_tokens")
+            if valid_by_padded is not None:
+                valid_values = valid_by_padded.get(int(case.num_tokens), [])
+                if not valid_values:
                     continue
             else:
-                case_bucket_targets = []
-                for token_valid_ratio in ratios:
-                    num_valid = int(round(case.num_tokens * float(token_valid_ratio)))
-                    num_valid = max(0, min(case.num_tokens, num_valid))
-                    hint = bucket_valid_num_tokens_for_fused_moe(
-                        valid_num_tokens=int(num_valid),
-                        padded_num_tokens=int(case.num_tokens),
-                        ep_size=ep_world_size,
-                    )
-                    case_bucket_targets.append(int(hint))
-                case_bucket_targets = sorted(set(case_bucket_targets))
+                valid_values = [int(case.num_tokens)]
 
-            for bucket in case_bucket_targets:
+            for valid_value in valid_values:
                 token_valid_mask: jax.Array | None = None
-                if token_mask_mode != "none":
-                    num_valid = int(min(bucket, case.num_tokens))
-                    num_valid = max(0, num_valid)
-                else:
-                    num_valid = case.num_tokens
+                num_valid = int(min(valid_value, case.num_tokens))
+                num_valid = max(0, num_valid)
 
-                valid_num_tokens_hint = bucket_valid_num_tokens_for_fused_moe(
+                valid_num_tokens_key = clamp_valid_num_tokens_for_fused_moe(
                     valid_num_tokens=int(num_valid),
                     padded_num_tokens=int(case.num_tokens),
-                    ep_size=ep_world_size,
                 )
-                if token_mask_mode != "none" and valid_num_tokens_hint != int(bucket):
-                    # Should not happen for well-formed bucket targets; guard to avoid
-                    # accidental tuning under the wrong key.
-                    print(
-                        f"  skip: requested {bucket=} but got {valid_num_tokens_hint=} for "
-                        f"{num_valid=} (padded={case.num_tokens}, ep_size={ep_world_size})"
-                    )
-                    continue
 
-                if token_mask_mode != "none":
+                if token_mask_mode == "none" and valid_num_tokens_key != int(case.num_tokens):
+                    raise ValueError(
+                        "token_mask_mode=none requires valid_num_tokens==padded num_tokens; "
+                        f"got valid_num_tokens={valid_num_tokens_key}, padded={case.num_tokens}"
+                    )
+
+                if token_mask_mode != "none" and valid_num_tokens_key != int(case.num_tokens):
                     mask_np = np.zeros((case.num_tokens,), dtype=np.int32)
                     if token_mask_mode == "prefix":
                         num_invalid = case.num_tokens - num_valid
@@ -947,7 +931,7 @@ def run_all(
                     )
 
                 print(
-                    f"  fused_moe tuning: valid_num_tokens(bucketed)={valid_num_tokens_hint}, "
+                    f"  fused_moe tuning: valid_num_tokens={valid_num_tokens_key}, "
                     f"num_valid={num_valid}, padded={case.num_tokens}"
                 )
 
@@ -985,7 +969,7 @@ def run_all(
                             return run_no_mask(
                                 data["tokens"],
                                 data["router_logits"],
-                                valid_num_tokens=valid_num_tokens_hint,
+                                valid_num_tokens=valid_num_tokens_key,
                                 moe_state_def=moe_state_def,
                                 moe_state_leaves=moe_state_leaves,
                                 block_config=block_cfg,
@@ -994,7 +978,7 @@ def run_all(
                             data["tokens"],
                             data["router_logits"],
                             token_valid_mask,
-                            valid_num_tokens=valid_num_tokens_hint,
+                            valid_num_tokens=valid_num_tokens_key,
                             moe_state_def=moe_state_def,
                             moe_state_leaves=moe_state_leaves,
                             block_config=block_cfg,
@@ -1056,7 +1040,7 @@ def run_all(
                         table_key = (
                             jnp.dtype(dtype).name,
                             jnp.dtype(weight_dtype).name,
-                            int(valid_num_tokens_hint),
+                            int(valid_num_tokens_key),
                             case.num_experts,
                             case.top_k,
                             case.hidden_size,
@@ -1242,25 +1226,14 @@ def parse_args() -> argparse.Namespace:
         help="Optional token_valid_mask pattern for exercising invalid-token logic.",
     )
     parser.add_argument(
-        "--token-valid-ratio",
-        type=float,
-        nargs="+",
-        default=[1.0],
-        help=(
-            "Fraction of tokens marked valid (0.0-1.0). "
-            "These ratios are converted into bucketed valid_num_tokens keys; the benchmark tunes per bucket. "
-            "If < 1.0 and --token-mask-mode is not set, defaults to --token-mask-mode=random."
-        ),
-    )
-    parser.add_argument(
-        "--valid-num-tokens-bucket",
+        "--valid-num-tokens",
         type=int,
         nargs="+",
         default=None,
         help=(
-            "Explicit bucketed valid_num_tokens keys to tune (preferred over ratios). "
-            "For each bucket B, the benchmark generates a token_valid_mask with num_valid=B (clamped by padded tokens) "
-            "and tunes the entry keyed by num_tokens=B in tuned_block_configs."
+            "Valid (unpadded) token counts to tune. For each value V, the benchmark derives the closest padded "
+            "num_tokens that satisfies EP/packing tiling constraints and tunes a config entry keyed by num_tokens=V "
+            "(with token_valid_mask applied when V < padded)."
         ),
     )
     parser.add_argument(
@@ -1280,8 +1253,6 @@ if __name__ == "__main__":
     except Exception:
         pass
     args = parse_args()
-    if args.token_mask_mode == "none" and any(float(r) < 1.0 for r in args.token_valid_ratio):
-        args.token_mask_mode = "random"
     DTYPE_MAP = {
         "int8": jnp.int8,
         "float8_e4m3fn": jnp.float8_e4m3fn,
@@ -1331,8 +1302,7 @@ if __name__ == "__main__":
             zero_expert_count=args.zero_expert_count,
             non_hotspot_alpha=args.non_hotspot_alpha,
             token_mask_mode=args.token_mask_mode,
-            token_valid_ratios=args.token_valid_ratio,
-            valid_num_tokens_buckets=args.valid_num_tokens_bucket,
+            valid_num_tokens=args.valid_num_tokens,
             token_mask_seed=args.token_mask_seed,
         )
     except BaseException as e:

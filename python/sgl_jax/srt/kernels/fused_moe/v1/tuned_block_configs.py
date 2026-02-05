@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Key (without device_name):
 #   - tokens dtype name
 #   - weight dtype name
-#   - num_tokens (bucketed valid token count used for tuning lookup; kernel shapes still use padded tokens)
+#   - num_tokens (valid token count used for tuning lookup; kernel shapes still use padded tokens)
 #   - num_experts
 #   - top_k
 #   - hidden_size
@@ -164,14 +164,12 @@ def get_simplified_key(
 ) -> tuple:
     """Get a simplified key to reduce the number of tuned combinations.
 
-    Note: `num_tokens` here refers to the tuning lookup token count (typically a
-    bucketed `valid_num_tokens`), not necessarily the padded token dimension
-    used to compile the kernel.
+    Note: `num_tokens` here refers to the tuning lookup token count (typically
+    `valid_num_tokens`), not necessarily the padded token dimension used to
+    compile the kernel.
     """
     if ep_size <= 0:
         raise ValueError(f"Expected {ep_size=} to be > 0.")
-    if num_tokens % ep_size != 0:
-        raise ValueError(f"Expected {num_tokens=} to be aligned to {ep_size=}.")
 
     device = get_device_name()
     dtype_name = jnp.dtype(dtype).name

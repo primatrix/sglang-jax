@@ -28,9 +28,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.configs.model_config import need_attention_mask
-from sgl_jax.srt.kernels.fused_moe.v1.tuning import (
-    bucket_valid_num_tokens_for_fused_moe,
-)
+from sgl_jax.srt.kernels.fused_moe.v1.tuning import clamp_valid_num_tokens_for_fused_moe
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.jax_utils import device_array
 
@@ -401,14 +399,9 @@ class ForwardBatch:
         else:
             valid_num_tokens = padded_num_tokens
 
-        dp_size = int(model_runner.mesh.shape.get("data", 1))
-        tp_size = int(model_runner.mesh.shape.get("tensor", 1))
-        ep_size = dp_size * tp_size
-
-        obj.valid_num_tokens = bucket_valid_num_tokens_for_fused_moe(
+        obj.valid_num_tokens = clamp_valid_num_tokens_for_fused_moe(
             valid_num_tokens=valid_num_tokens,
             padded_num_tokens=padded_num_tokens,
-            ep_size=ep_size,
         )
 
         return obj

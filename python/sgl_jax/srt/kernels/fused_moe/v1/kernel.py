@@ -449,13 +449,13 @@ def get_ep_size(mesh: jax.sharding.Mesh, dp_axis_name, tp_axis_name):
     return dp_size * tp_size
 
 
-def _normalize_valid_num_tokens_for_tuning(
+def _clamp_valid_num_tokens_for_tuning(
     *,
     valid_num_tokens: int,
     padded_num_tokens: int,
     ep_size: int,
 ) -> int:
-    """Normalize a valid-token-count hint for tuned block-config lookup.
+    """Clamp a valid-token-count hint for tuned block-config lookup.
 
     The kernel shape is still determined by `padded_num_tokens`; this value is
     only used to pick a tuned config from the lookup table.
@@ -467,10 +467,9 @@ def _normalize_valid_num_tokens_for_tuning(
     if padded_num_tokens <= 0:
         raise ValueError(f"Expected {padded_num_tokens=} to be > 0.")
 
+    valid_num_tokens = int(valid_num_tokens)
     valid_num_tokens = int(min(valid_num_tokens, padded_num_tokens))
-    valid_num_tokens = int(max(valid_num_tokens, ep_size))
-    valid_num_tokens = int(((valid_num_tokens + ep_size - 1) // ep_size) * ep_size)
-    valid_num_tokens = int(min(valid_num_tokens, padded_num_tokens))
+    valid_num_tokens = int(max(valid_num_tokens, 1))
     return int(valid_num_tokens)
 
 
@@ -2703,7 +2702,7 @@ def fused_ep_moe(
         lookup_num_tokens = (
             num_tokens
             if valid_num_tokens is None
-            else _normalize_valid_num_tokens_for_tuning(
+            else _clamp_valid_num_tokens_for_tuning(
                 valid_num_tokens=int(valid_num_tokens),
                 padded_num_tokens=num_tokens,
                 ep_size=ep_size,
