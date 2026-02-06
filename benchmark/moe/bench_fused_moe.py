@@ -81,6 +81,7 @@ def _estimate_vmem_bytes(
     dtype: jnp.dtype,
     weight_dtype: jnp.dtype,
     router_dtype: jnp.dtype,
+    act_quant_dtype: jnp.dtype | None,
     cfg: FusedMoEBlockConfig,
     intermediate_size: int,
     hidden_size: int,
@@ -156,6 +157,15 @@ def _estimate_vmem_bytes(
     # U32 token staging for FFN1: (2, bts, bd1 // t_packing)
     # Note: Using 4 bytes for packing factor adjustment roughly
     t_stage_b32 = 2 * bts * (bd1 // 2) * 4  # Approximation
+    # Extra staging scratch buffers for activation quantization in fused_moe:
+    # - b_stage_q_x2_vmem:     (2, bts, t_packing, bd1_per_pack) int8
+    # - b_stage_scale_x2_vmem: (2, bts, scale_bytes) int8 (scale_bytes == align_to(2, 128) in kernel)
+    act_stage_q = 0
+    act_stage_scale = 0
+    if act_quant_dtype is not None:
+        act_stage_q = 2 * bts * bd1  # int8 transport bytes
+        act_scale_bytes = 128
+        act_stage_scale = 2 * bts * act_scale_bytes  # int8 scale/meta bytes
     # Kernel uses triple-buffering for a2a_s_acc staging: (3, bts, bd2 // t_packing)
     a2a_s_acc_stage_b32 = 3 * bts * (bd2 // 2) * 4  # Approximation
 
@@ -198,6 +208,8 @@ def _estimate_vmem_bytes(
         + w2_scale
         + b_acc
         + t_stage_b32
+        + act_stage_q
+        + act_stage_scale
         + a2a_s_acc_stage_b32
         + routing_temporaries
     )
@@ -315,6 +327,7 @@ def select_block_configs(
     dtype: jnp.dtype,
     weight_dtype: jnp.dtype,
     router_dtype: jnp.dtype,
+    act_quant_dtype: jnp.dtype | None,
     *,
     bt_candidates: list[int],
     bts_candidates: list[int] | None = None,
@@ -425,6 +438,7 @@ def select_block_configs(
             dtype,
             weight_dtype,
             router_dtype,
+            act_quant_dtype,
             cfg,
             intermediate_size=case.intermediate_size,
             hidden_size=case.hidden_size,
@@ -585,6 +599,7 @@ def run_all(
     dtype: jnp.dtype = jnp.bfloat16,
     weight_dtype: jnp.dtype = jnp.bfloat16,  # Quantize the weight dtype, the activation's dtype always is bfloat16
     *,
+    act_quant_dtypes: list[jnp.dtype | None] | None = None,
     warmup_iters: int = 1,
     tune_block_config: bool = False,
     bt_candidates: list[int] | None = None,
@@ -618,6 +633,43 @@ def run_all(
 ) -> None:
     if use_grouped_topk is None:
         use_grouped_topk = bool(num_expert_group or topk_group)
+
+    if not act_quant_dtypes:
+        act_quant_dtypes = [None]
+    act_quant_dtypes_i: list[jnp.dtype | None] = []
+    for v in act_quant_dtypes:
+        if v is None:
+            act_quant_dtypes_i.append(None)
+            continue
+        v = jnp.dtype(v)
+        supported_fp8 = tuple(
+            dt
+            for dt in (
+                getattr(jnp, "float8_e4m3fn", None),
+                getattr(jnp, "float8_e5m2", None),
+                getattr(jnp, "float8_e4m3fnuz", None),
+                getattr(jnp, "float8_e5m2fnuz", None),
+            )
+            if dt is not None
+        )
+        if v not in supported_fp8:
+            raise ValueError(f"Unsupported {v=}; currently only fp8 activation quant is supported.")
+        act_quant_dtypes_i.append(v)
+    # De-duplicate while preserving order.
+    act_quant_dtypes_unique: list[jnp.dtype | None] = []
+    for v in act_quant_dtypes_i:
+        if v in act_quant_dtypes_unique:
+            continue
+        act_quant_dtypes_unique.append(v)
+    act_quant_dtypes_i = act_quant_dtypes_unique
+    act_quant_names = ["none" if v is None else jnp.dtype(v).name for v in act_quant_dtypes_i]
+    if len(act_quant_dtypes_i) != 1:
+        raise ValueError(
+            "Tuning multiple activation-quant dtypes in one run is not supported yet; "
+            f"got act_quant={act_quant_names}."
+        )
+    act_quant_dtype = act_quant_dtypes_i[0]
+    act_quant_name = act_quant_names[0]
 
     token_mask_mode = (token_mask_mode or "none").lower()
     if token_mask_mode not in ("none", "prefix", "random"):
@@ -695,7 +747,10 @@ def run_all(
         from sgl_jax.srt.utils.jax_utils import get_device_name
 
     print(f"Running fused_moe benchmarks with weight_dtype={weight_dtype}")
-    print(f"  features: shared_expert={use_shared_expert}, grouped_topk={use_grouped_topk}")
+    print(
+        f"  features: act_quant={act_quant_names}, shared_expert={use_shared_expert}, "
+        f"grouped_topk={use_grouped_topk}"
+    )
     print(
         "  shape: "
         f"num_experts={num_experts}, top_k={top_k}, hidden_size={hidden_size}, intermediate_size={intermediate_size}, "
@@ -773,6 +828,7 @@ def run_all(
                 dtype,
                 weight_dtype=weight_dtype,
                 router_dtype=data["router_logits"].dtype,
+                act_quant_dtype=act_quant_dtype,
                 bt_candidates=bt_candidates or [2, 4, 8, 16, 32, 64, 128, 256, 512],
                 bts_candidates=bts_candidates,
                 bf_candidates=bf_candidates or [128, 256, 512, 1024, 2048],
@@ -787,13 +843,13 @@ def run_all(
         else:
             block_cfgs = [None]
 
-        if weight_dtype == jnp.float8_e4m3fn:
+        moe_weight_dtype = weight_dtype if weight_dtype == jnp.float8_e4m3fn else None
+        quantization_config = None
+        if moe_weight_dtype is not None or act_quant_dtype is not None:
             quantization_config = QuantizationConfig(
-                moe_weight_dtype=weight_dtype,
-                moe_activation_dtype=None,  # activation is bfloat16
+                moe_weight_dtype=moe_weight_dtype,
+                moe_activation_dtype=act_quant_dtype,
             )
-        else:
-            quantization_config = None
 
         with jax.set_mesh(mesh):
             fused_layer = FusedEPMoE(
@@ -817,7 +873,7 @@ def run_all(
                 ),
                 quantization_config=quantization_config,
             )
-            if quantization_config is not None:
+            if quantization_config is not None and moe_weight_dtype is not None:
                 fused_layer.quantize_weights()
 
             moe_def, moe_state = nnx.split(fused_layer)
@@ -916,7 +972,7 @@ def run_all(
                     )
 
                 print(
-                    f"  fused_moe tuning: valid_num_tokens={valid_num_tokens_key}, "
+                    f"  fused_moe tuning: act_quant={act_quant_name}, valid_num_tokens={valid_num_tokens_key}, "
                     f"num_valid={num_valid}, padded={case.num_tokens}"
                 )
 
@@ -931,9 +987,10 @@ def run_all(
                         )
                         vmem_bytes = _estimate_vmem_bytes(
                             case,
-                            jnp.bfloat16,
+                            dtype,
                             weight_dtype,
                             data["router_logits"].dtype,
+                            act_quant_dtype,
                             block_cfg,
                             intermediate_size=case.intermediate_size,
                             hidden_size=case.hidden_size,
@@ -979,7 +1036,7 @@ def run_all(
                                 intermediate_size=case.intermediate_size,
                                 dtype=dtype,
                                 ep_size=mesh_ep,
-                                subc_quant_wsz=None,
+                                subc_quant_wsz=subc_quant_wsz,
                                 block_config=block_cfg,
                             )
                         times = multiple_iteration_timeit_from_trace(
@@ -1025,6 +1082,7 @@ def run_all(
                         table_key = (
                             jnp.dtype(dtype).name,
                             jnp.dtype(weight_dtype).name,
+                            act_quant_name,
                             int(valid_num_tokens_key),
                             case.num_experts,
                             case.top_k,
@@ -1067,7 +1125,7 @@ def run_all(
             print(f'TUNED_BLOCK_CONFIGS.setdefault("{device_name}", {{}}).update({{')
             for k in sorted(
                 entries.keys(),
-                key=lambda t: (t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[0]),
+                key=lambda t: (t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[0]),
             ):
                 print(f"    {k}: {entries[k]},")
             print("})\n")
@@ -1088,6 +1146,13 @@ def parse_args() -> argparse.Namespace:
         default="bfloat16",
         help="Data type to benchmark.",
         choices=["bfloat16", "float8_e4m3fn"],
+    )
+    parser.add_argument(
+        "--act-quant-type",
+        type=str,
+        default="none",
+        choices=["none", "float8_e4m3fn", "float8_e5m2"],
+        help="Activation quant dtype for fused_moe scatter payload (none disables; fp8 enables).",
     )
     parser.add_argument(
         "--tune-block-config",
@@ -1239,7 +1304,6 @@ if __name__ == "__main__":
         pass
     args = parse_args()
     DTYPE_MAP = {
-        "int8": jnp.int8,
         "float8_e4m3fn": jnp.float8_e4m3fn,
         "float8_e5m2": jnp.float8_e5m2,
         "bfloat16": jnp.bfloat16,
@@ -1251,6 +1315,7 @@ if __name__ == "__main__":
             f"Unsupported dtype: {args.weight_dtype}. Supported: {list(DTYPE_MAP.keys())}"
         )
     weight_dtype = DTYPE_MAP[args.weight_dtype]
+    act_quant_dtype = None if args.act_quant_type == "none" else DTYPE_MAP[args.act_quant_type]
     if args.compilation_cache_dir:
         _compilation_cache.set_cache_dir(args.compilation_cache_dir)
     tpu_vmem_budget_bytes = int(args.tpu_vmem_budget_mb) * 1024 * 1024
@@ -1259,6 +1324,7 @@ if __name__ == "__main__":
         run_all(
             args.iters,
             weight_dtype=weight_dtype,
+            act_quant_dtypes=[act_quant_dtype],
             warmup_iters=args.warmup_iters,
             tune_block_config=args.tune_block_config,
             bt_candidates=args.bt_candidates,

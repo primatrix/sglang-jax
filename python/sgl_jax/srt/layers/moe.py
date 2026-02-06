@@ -1051,6 +1051,7 @@ class FusedEPMoE(nnx.Module):
             gating_output=router_logits,
             bias=router_bias,
             top_k=self.num_experts_per_tok,
+            act_quant_dtype=self.activation_quantized_dtype,
             use_grouped_topk=self.use_grouped_topk,
             num_groups=self.num_groups,
             top_k_groups=self.top_k_groups,

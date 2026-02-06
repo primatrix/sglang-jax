@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 # Key (without device_name):
 #   - tokens dtype name
 #   - weight dtype name
+#   - act quant dtype name ("none" | jnp dtype name)
 #   - num_tokens (valid token count used for tuning lookup; kernel shapes still use padded tokens)
 #   - num_experts
 #   - top_k
@@ -153,6 +154,7 @@ def get_simplified_key(
     *,
     dtype: jnp.dtype,
     weight_dtype: jnp.dtype,
+    act_quant_dtype: jnp.dtype | None,
     num_tokens: int,
     num_experts: int,
     top_k: int,
@@ -167,6 +169,47 @@ def get_simplified_key(
     Note: `num_tokens` here refers to the tuning lookup token count (typically
     `valid_num_tokens`), not necessarily the padded token dimension used to
     compile the kernel.
+    """
+    if ep_size <= 0:
+        raise ValueError(f"Expected {ep_size=} to be > 0.")
+
+    device = get_device_name()
+    dtype_name = jnp.dtype(dtype).name
+    weight_dtype_name = jnp.dtype(weight_dtype).name
+    act_quant_dtype_name = "none" if act_quant_dtype is None else jnp.dtype(act_quant_dtype).name
+    return (
+        device,
+        dtype_name,
+        weight_dtype_name,
+        act_quant_dtype_name,
+        num_tokens,
+        num_experts,
+        top_k,
+        hidden_size,
+        intermediate_size,
+        ep_size,
+        bool(use_shared_expert),
+        bool(use_grouped_topk),
+    )
+
+
+def get_simplified_key_legacy(
+    *,
+    dtype: jnp.dtype,
+    weight_dtype: jnp.dtype,
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    intermediate_size: int,
+    ep_size: int,
+    use_shared_expert: bool,
+    use_grouped_topk: bool,
+) -> tuple:
+    """Legacy (pre-activation-quant) tuning key format.
+
+    Kept for backward compatibility with existing tuned tables that don't include
+    the activation-quant dtype dimension.
     """
     if ep_size <= 0:
         raise ValueError(f"Expected {ep_size=} to be > 0.")
@@ -198,6 +241,7 @@ def get_tuned_fused_moe_block_config(
     intermediate_size: int,
     dtype: jnp.dtype,
     weight_dtype: jnp.dtype,
+    act_quant_dtype: jnp.dtype | None,
     ep_size: int,
     use_shared_expert: bool,
     use_grouped_topk: bool,
@@ -211,6 +255,7 @@ def get_tuned_fused_moe_block_config(
     keys = get_simplified_key(
         dtype=dtype,
         weight_dtype=weight_dtype,
+        act_quant_dtype=act_quant_dtype,
         num_tokens=num_tokens,
         num_experts=num_experts,
         top_k=top_k,
@@ -228,6 +273,27 @@ def get_tuned_fused_moe_block_config(
         cfg_tuple = TUNED_BLOCK_CONFIGS[device_name].get(table_key)
     if cfg_tuple is None:
         cfg_tuple = TUNED_BLOCK_CONFIGS.get("*", {}).get(table_key)
+
+    # Backward compatible lookup for legacy tables (no act-quant dtype key).
+    if cfg_tuple is None and act_quant_dtype is None:
+        legacy_keys = get_simplified_key_legacy(
+            dtype=dtype,
+            weight_dtype=weight_dtype,
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            ep_size=ep_size,
+            use_shared_expert=use_shared_expert,
+            use_grouped_topk=use_grouped_topk,
+        )
+        legacy_device_name = legacy_keys[0]
+        legacy_table_key = legacy_keys[1:]
+        if legacy_device_name in TUNED_BLOCK_CONFIGS:
+            cfg_tuple = TUNED_BLOCK_CONFIGS[legacy_device_name].get(legacy_table_key)
+        if cfg_tuple is None:
+            cfg_tuple = TUNED_BLOCK_CONFIGS.get("*", {}).get(legacy_table_key)
 
     if cfg_tuple is None:
         return DEFAULT_FUSED_MOE_BLOCK_CONFIG

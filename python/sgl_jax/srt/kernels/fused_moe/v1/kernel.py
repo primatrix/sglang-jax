@@ -173,6 +173,23 @@ def activation_fn(acc1, acc3, act_fn):
         raise RuntimeError(f"Unsupported activation function: {act_fn}")
 
 
+def _pack_bf16_to_u8x2(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Pack bf16 scalar(s) into two uint8 bytes (little-endian)."""
+    x_bf16 = x.astype(jnp.bfloat16)
+    x_u16 = lax.bitcast_convert_type(x_bf16, jnp.uint16)
+    lo = (x_u16 & jnp.uint16(0xFF)).astype(jnp.uint8)
+    hi = (lax.shift_right_logical(x_u16, jnp.uint16(8)) & jnp.uint16(0xFF)).astype(jnp.uint8)
+    return lo, hi
+
+
+def _unpack_u8x2_to_bf16(lo: jax.Array, hi: jax.Array) -> jax.Array:
+    """Unpack two uint8 bytes (little-endian) into bf16 scalar(s)."""
+    lo_u16 = lo.astype(jnp.uint16) & jnp.uint16(0xFF)
+    hi_u16 = hi.astype(jnp.uint16) & jnp.uint16(0xFF)
+    x_u16 = lo_u16 | (hi_u16 << jnp.uint16(8))
+    return lax.bitcast_convert_type(x_u16, jnp.bfloat16)
+
+
 def validate_fused_moe_block_config(
     *,
     num_tokens: int,
@@ -483,7 +500,8 @@ def _fused_ep_moe_kernel(
     b2_hbm,  # None | F32(local_num_experts, 1, hidden_size)
     b3_hbm,  # None | F32(local_num_experts, 1, intermediate_size)
     gating_hbm,  # (local_num_tokens, padded_num_experts)
-    a2a_s_x2_hbm,  # (2, align_to(bt * num_devices, bts), t_packing, hidden_size // t_packing)
+    a2a_s_x2_hbm,  # (2, align_to(bt * num_devices, bts), t_packing, hidden_size // t_packing) [payload bytes]
+    a2a_s_scale_x2_hbm,  # None | (2, align_to(bt * num_devices, bts), scale_bytes) [scale bytes]
     a2a_s_acc_x2_hbm,  # (2, align_to(bt * num_devices, bts), t_packing, hidden_size // t_packing)
     a2a_g_hbm,  # (num_experts, bt, t_packing, hidden_size // t_packing)
     bias_hbm,  # None | F32(padded_num_experts,)
@@ -519,6 +537,8 @@ def _fused_ep_moe_kernel(
     b_b2_x2_vmem,  # None | <bw_sem_id> (2, t_packing, 1, bd2 // t_packing)
     b_acc_vmem,  # F32(2, align_to(bt * num_devices, bts), 1, bf)
     b_stage_x2_vmem,  # <token_buf_id> (2, bts, t_packing, bd1 // t_packing)
+    b_stage_q_x2_vmem,  # None | I8(2, bts, t_packing, bd1 // t_packing)
+    b_stage_scale_x2_vmem,  # None | I8(2, bts, scale_bytes)
     a2a_s_acc_stage_x3_vmem,  # <acc_buf_id> (3, bts, t_packing, bd2 // t_packing)
     b_bias_vmem,  # None | F32(padded_num_experts,)
     b_se_tokens_vmem,  # None | (2, 2, bt, t_packing, bd1 // t_packing) [Input Buffer: bt ping-pong x bd1-slice ping-pong]
@@ -539,6 +559,7 @@ def _fused_ep_moe_kernel(
     a2a_acc_sems,  # DMA(1,)
     barrier_sem,
     *,
+    act_quant_dtype: jnp.dtype | None = None,
     top_k: int,
     use_grouped_topk: bool = False,
     num_groups: int = 1,
@@ -561,6 +582,25 @@ def _fused_ep_moe_kernel(
     bd2c: int,  # Compute size of block hidden_size.
     bse: int,  # Block size for SE intermediate_size.
 ):
+    act_quant_enabled = act_quant_dtype is not None
+    if act_quant_enabled:
+        act_quant_dtype = jnp.dtype(act_quant_dtype)
+        supported_fp8 = tuple(
+            dt
+            for dt in (
+                getattr(jnp, "float8_e4m3fn", None),
+                getattr(jnp, "float8_e5m2", None),
+                getattr(jnp, "float8_e4m3fnuz", None),
+                getattr(jnp, "float8_e5m2fnuz", None),
+            )
+            if dt is not None
+        )
+        if act_quant_dtype not in supported_fp8:
+            raise ValueError(
+                "Unsupported act_quant_dtype. Expected one of: float8_e4m3fn, float8_e5m2 "
+                f"(and their *uz variants); got {act_quant_dtype=}."
+            )
+
     dp_rank = lax.axis_index(dp_axis_name)
     tp_rank = lax.axis_index(tp_axis_name)
     tp_size = lax.axis_size(tp_axis_name)
@@ -599,6 +639,67 @@ def _fused_ep_moe_kernel(
 
     h_per_t_packing = hidden_size // t_packing
     assert tokens_hbm.shape[-1] == h_per_t_packing
+
+    scale_bytes = 0
+    if act_quant_enabled:
+        if a2a_s_scale_x2_hbm is None:
+            raise ValueError(
+                "Expected a2a_s_scale_x2_hbm to be provided when act_quant_dtype is set."
+            )
+        if jnp.dtype(a2a_s_x2_hbm.dtype) != jnp.int8:
+            raise ValueError(
+                "Expected a2a_s_x2_hbm transport dtype to be int8 when act_quant_dtype is set "
+                f"(got {a2a_s_x2_hbm.dtype=}, {act_quant_dtype=})."
+            )
+        if int(a2a_s_x2_hbm.shape[-1]) != int(h_per_t_packing):
+            raise ValueError(
+                "Expected a2a_s_x2_hbm to store only payload bytes when act_quant_dtype is set "
+                f"(got {a2a_s_x2_hbm.shape[-1]=}, expected {h_per_t_packing=})."
+            )
+        if jnp.dtype(a2a_s_scale_x2_hbm.dtype) != jnp.int8:
+            raise ValueError(
+                "Expected a2a_s_scale_x2_hbm dtype to be int8 when act_quant_dtype is set "
+                f"(got {a2a_s_scale_x2_hbm.dtype=})."
+            )
+        scale_bytes = int(a2a_s_scale_x2_hbm.shape[-1])
+        if scale_bytes != align_to(2, 128):
+            raise ValueError(
+                f"Expected scale_bytes to be exactly align_to(2,128)={align_to(2, 128)} (got {scale_bytes=})."
+            )
+        if scale_bytes < 2 or scale_bytes % 128 != 0:
+            raise ValueError(
+                f"Expected scale_bytes to be a multiple of 128 and >=2 (got {scale_bytes=})."
+            )
+
+    def _make_scale_bytes(scale_f32: jax.Array) -> jax.Array:
+        """Encode per-token scale as bf16 bits into a byte buffer (padded to 128B)."""
+        lo, hi = _pack_bf16_to_u8x2(scale_f32)
+        lo_i8 = lo.astype(jnp.int8)
+        hi_i8 = hi.astype(jnp.int8)
+        scale_bytes_buf = jnp.zeros((scale_f32.shape[0], scale_bytes), dtype=jnp.int8)
+        scale_bytes_buf = scale_bytes_buf.at[:, 0].set(lo_i8)
+        scale_bytes_buf = scale_bytes_buf.at[:, 1].set(hi_i8)
+        return scale_bytes_buf
+
+    def _quantize_token_slice_to_payload_bytes(
+        token_slice: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Per-token scaled quantization into fp8 payload bytes + scale bytes.
+
+        Matches `quantize_tensor_simple()` behavior for fp8 dtypes.
+        """
+        # token_slice: (sz, t_packing, h_per_t_packing)
+        x_f32 = token_slice.astype(jnp.float32)
+        maxabs = jnp.max(jnp.abs(x_f32), axis=(1, 2))
+        fp8_max = jnp.float32(jnp.finfo(act_quant_dtype).max)
+        fp8_min = jnp.float32(jnp.finfo(act_quant_dtype).min)
+        scale = lax.select(maxabs > 0.0, maxabs / fp8_max, jnp.float32(1.0))  # (sz,)
+        y = x_f32 * (jnp.float32(1.0) / scale)[:, None, None]
+        q_fp8 = jnp.clip(y, fp8_min, fp8_max).astype(act_quant_dtype)
+        payload_bytes = lax.bitcast_convert_type(q_fp8, jnp.int8)
+        scale_bytes_buf = _make_scale_bytes(scale)
+        return payload_bytes, scale_bytes_buf
+
     bd1_per_t_packing = bd1 // t_packing
     bd2_per_t_packing = bd2 // t_packing
     bd1c_per_t_packing = bd1c // t_packing
@@ -885,6 +986,87 @@ def _fused_ep_moe_kernel(
         )
 
     def start_a2a_scatter(*, bt_sem_id, e_sem_id, local_e_id, bt_start):
+        def _store_quant_payload(*, src_t_id, start, sz, e_sem_id):
+            token_slice = tokens_hbm.at[pl.ds(src_t_id, sz)][...]
+            payload_bytes, scale_bytes_buf = _quantize_token_slice_to_payload_bytes(token_slice)
+
+            a2a_s_x2_hbm.at[
+                e_sem_id,
+                pl.ds(start, sz),
+                pl.ds(0, t_packing),
+                pl.ds(0, h_per_t_packing),
+            ][...] = payload_bytes
+            a2a_s_scale_x2_hbm.at[
+                e_sem_id,
+                pl.ds(start, sz),
+                pl.ds(0, scale_bytes),
+            ][...] = scale_bytes_buf
+            return a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, sz)]
+
+        def scatter_local_copy(*, src_t_id, start, sz, e_sem_id):
+            if act_quant_enabled:
+                ref = _store_quant_payload(
+                    src_t_id=src_t_id,
+                    start=start,
+                    sz=sz,
+                    e_sem_id=e_sem_id,
+                )
+                # Signal recv semaphore for local tokens (no DMA used for the store).
+                pltpu.make_async_copy(
+                    src_ref=ref,
+                    dst_ref=ref,
+                    sem=recv_x2_sems.at[e_sem_id],
+                ).start()
+                scale_ref = a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(start, sz)]
+                pltpu.make_async_copy(
+                    src_ref=scale_ref,
+                    dst_ref=scale_ref,
+                    sem=recv_x2_sems.at[e_sem_id],
+                ).start()
+                return
+
+            pltpu.make_async_copy(
+                src_ref=tokens_hbm.at[pl.ds(src_t_id, sz)],
+                dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, sz)],
+                sem=recv_x2_sems.at[e_sem_id],
+            ).start()
+
+        def scatter_remote_copy(*, src_t_id, start, sz, e_sem_id, recv_id):
+            if act_quant_enabled:
+                ref = _store_quant_payload(
+                    src_t_id=src_t_id,
+                    start=start,
+                    sz=sz,
+                    e_sem_id=e_sem_id,
+                )
+                pltpu.make_async_remote_copy(
+                    src_ref=ref,
+                    dst_ref=ref,
+                    send_sem=send_x2_sems.at[e_sem_id],
+                    recv_sem=recv_x2_sems.at[e_sem_id],
+                    device_id=get_mesh_device_id(recv_id),
+                    device_id_type=pltpu.DeviceIdType.MESH,
+                ).start()
+                scale_ref = a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(start, sz)]
+                pltpu.make_async_remote_copy(
+                    src_ref=scale_ref,
+                    dst_ref=scale_ref,
+                    send_sem=send_x2_sems.at[e_sem_id],
+                    recv_sem=recv_x2_sems.at[e_sem_id],
+                    device_id=get_mesh_device_id(recv_id),
+                    device_id_type=pltpu.DeviceIdType.MESH,
+                ).start()
+                return
+
+            pltpu.make_async_remote_copy(
+                src_ref=tokens_hbm.at[pl.ds(src_t_id, sz)],
+                dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, sz)],
+                send_sem=send_x2_sems.at[e_sem_id],
+                recv_sem=recv_x2_sems.at[e_sem_id],
+                device_id=get_mesh_device_id(recv_id),
+                device_id_type=pltpu.DeviceIdType.MESH,
+            ).start()
+
         # Counting the number of remote sends from the current device.
         # Use `lax.fori_loop` to avoid unrolling `bt` (huge MLIR / slow compile).
         def _scatter_one(
@@ -910,11 +1092,12 @@ def _fused_ep_moe_kernel(
                 def _local_copy(
                     src_t_id=src_t_id, start=start, local_sz=local_sz, e_sem_id=e_sem_id
                 ):
-                    pltpu.make_async_copy(
-                        src_ref=tokens_hbm.at[pl.ds(src_t_id, local_sz)],
-                        dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
-                        sem=recv_x2_sems.at[e_sem_id],
-                    ).start()
+                    scatter_local_copy(
+                        src_t_id=src_t_id,
+                        start=start,
+                        sz=local_sz,
+                        e_sem_id=e_sem_id,
+                    )
 
                 @pl.when(remote_sz != 0)
                 def _remote_copy(
@@ -924,14 +1107,13 @@ def _fused_ep_moe_kernel(
                     e_sem_id=e_sem_id,
                     recv_id=recv_id,
                 ):
-                    pltpu.make_async_remote_copy(
-                        src_ref=tokens_hbm.at[pl.ds(src_t_id, remote_sz)],
-                        dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
-                        send_sem=send_x2_sems.at[e_sem_id],
-                        recv_sem=recv_x2_sems.at[e_sem_id],
-                        device_id=get_mesh_device_id(recv_id),
-                        device_id_type=pltpu.DeviceIdType.MESH,
-                    ).start()
+                    scatter_remote_copy(
+                        src_t_id=src_t_id,
+                        start=start,
+                        sz=remote_sz,
+                        e_sem_id=e_sem_id,
+                        recv_id=recv_id,
+                    )
 
             return send_sz
 
@@ -957,6 +1139,13 @@ def _fused_ep_moe_kernel(
                 dst_ref=ref,
                 sem=recv_x2_sems.at[e_sem_id],
             ).wait()
+            if act_quant_enabled:
+                # Second recv for the scale buffer.
+                pltpu.make_async_copy(
+                    src_ref=ref,
+                    dst_ref=ref,
+                    sem=recv_x2_sems.at[e_sem_id],
+                ).wait()
 
     def wait_a2a_scatter_send(*, bt_sem_id, e_sem_id, local_e_id):
         scatter_send_sz = a2a_s_sends_x2_smem[e_sem_id]
@@ -971,6 +1160,13 @@ def _fused_ep_moe_kernel(
                 dst_ref=ref,
                 sem=send_x2_sems.at[e_sem_id],
             ).wait()
+            if act_quant_enabled:
+                # Second send for the scale buffer.
+                pltpu.make_async_copy(
+                    src_ref=ref,
+                    dst_ref=ref,
+                    sem=send_x2_sems.at[e_sem_id],
+                ).wait()
 
     def start_a2a_gather(*, bt_sem_id, e_sem_id, local_e_id):
         my_e_id = my_id * local_num_experts + local_e_id
@@ -1636,6 +1832,37 @@ def _fused_ep_moe_kernel(
         num_token_tiles = (dyn_sz_i32 + (token_tile - 1)) // token_tile
 
         def start_stage_a2a_s_tile_from_hbm(tile_start, bd1_id, buf_id):
+            if act_quant_enabled:
+                pltpu.make_async_copy(
+                    src_ref=a2a_s_x2_hbm.at[
+                        e_sem_id,
+                        pl.ds(tile_start, token_tile),
+                        pl.ds(0, t_packing),
+                        pl.ds(bd1_id * bd1_per_t_packing, bd1_per_t_packing),
+                    ],
+                    dst_ref=b_stage_q_x2_vmem.at[
+                        buf_id,
+                        pl.ds(0, token_tile),
+                        pl.ds(0, t_packing),
+                        pl.ds(0, bd1_per_t_packing),
+                    ],
+                    sem=token_stage_x2_sems.at[buf_id],
+                ).start()
+                pltpu.make_async_copy(
+                    src_ref=a2a_s_scale_x2_hbm.at[
+                        e_sem_id,
+                        pl.ds(tile_start, token_tile),
+                        pl.ds(0, scale_bytes),
+                    ],
+                    dst_ref=b_stage_scale_x2_vmem.at[
+                        buf_id,
+                        pl.ds(0, token_tile),
+                        pl.ds(0, scale_bytes),
+                    ],
+                    sem=token_stage_x2_sems.at[buf_id],
+                ).start()
+                return
+
             pltpu.make_async_copy(
                 src_ref=a2a_s_x2_hbm.at[
                     e_sem_id,
@@ -1653,11 +1880,42 @@ def _fused_ep_moe_kernel(
             ).start()
 
         def wait_stage_a2a_s_tile(buf_id):
+            if not act_quant_enabled:
+                pltpu.make_async_copy(
+                    src_ref=b_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
+                    dst_ref=b_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
+                    sem=token_stage_x2_sems.at[buf_id],
+                ).wait()
+                return
+
+            # Drain DMA(s) for this stage: `q` + trailing scale/meta.
+            ref = b_stage_q_x2_vmem.at[buf_id, pl.ds(0, token_tile)]
             pltpu.make_async_copy(
-                src_ref=b_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
-                dst_ref=b_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
+                src_ref=ref,
+                dst_ref=ref,
                 sem=token_stage_x2_sems.at[buf_id],
             ).wait()
+            pltpu.make_async_copy(
+                src_ref=ref,
+                dst_ref=ref,
+                sem=token_stage_x2_sems.at[buf_id],
+            ).wait()
+
+            # Dequantize staged q into the existing bf16/f16 token stage buffer.
+            payload_bytes = b_stage_q_x2_vmem.at[buf_id, pl.ds(0, token_tile)][...]
+            q_f32 = lax.bitcast_convert_type(payload_bytes, act_quant_dtype).astype(jnp.float32)
+
+            scale_bytes_buf = b_stage_scale_x2_vmem.at[buf_id, pl.ds(0, token_tile)][...]
+            lo_u8 = (scale_bytes_buf[:, 0].astype(jnp.uint16) & jnp.uint16(0xFF)).astype(jnp.uint8)
+            hi_u8 = (scale_bytes_buf[:, 1].astype(jnp.uint16) & jnp.uint16(0xFF)).astype(jnp.uint8)
+            scale_f32 = _unpack_u8x2_to_bf16(lo_u8, hi_u8).astype(jnp.float32)  # (token_tile,)
+            deq = q_f32 * scale_f32[:, None, None]
+            b_stage_x2_vmem.at[
+                buf_id,
+                pl.ds(0, token_tile),
+                pl.ds(0, t_packing),
+                pl.ds(0, bd1_per_t_packing),
+            ][...] = deq.astype(b_stage_x2_vmem.dtype)
 
         def start_load_stage_a2a_s_acc_tile_from_hbm(tile_start, bd2_start, buf_id):
             pltpu.make_async_copy(
@@ -2637,6 +2895,7 @@ def _validate_fused_ep_moe_args(
         "routed_scaling_factor",
         "act_fn",
         "subc_quant_wsz",
+        "act_quant_dtype",
         "block_config",
         "valid_num_tokens",
         "dp_axis_name",
@@ -2662,6 +2921,10 @@ def fused_ep_moe(
     routed_scaling_factor: float | None = None,
     act_fn: str = "silu",
     subc_quant_wsz: int | None = None,
+    # Preferred API: when set, enables activation quantization (currently applied
+    # on the EP a2a/scatter payload) and selects the payload dtype. When None,
+    # activation quantization is disabled.
+    act_quant_dtype: jnp.dtype | None = None,
     w1_scale: (
         jax.Array | None
     ) = None,  # F32(num_experts, hidden_size // subc_quant_wsz, 1, intermediate_size)
@@ -2686,6 +2949,9 @@ def fused_ep_moe(
 ):
 
     ep_size = get_ep_size(mesh, dp_axis_name, tp_axis_name)
+    if act_quant_dtype is not None:
+        act_quant_dtype = jnp.dtype(act_quant_dtype)
+    act_quant_enabled = act_quant_dtype is not None
 
     if block_config is None:
         from .tuned_block_configs import get_tuned_fused_moe_block_config
@@ -2709,6 +2975,7 @@ def fused_ep_moe(
             intermediate_size=intermediate_size,
             dtype=tokens.dtype,
             weight_dtype=w1.dtype,
+            act_quant_dtype=act_quant_dtype,
             ep_size=ep_size,
             use_shared_expert=(w1_shared is not None),
             use_grouped_topk=use_grouped_topk,
@@ -2885,6 +3152,16 @@ def fused_ep_moe(
         b2_scratch,  # b_b2_x2_vmem
         pltpu.VMEM((2, a2a_max_tokens, 1, block_config.bf), jnp.float32),  # b_acc_vmem
         pltpu.VMEM((2, block_config.bts, t_packing, bd1_per_pack), t_dtype),  # b_stage_x2_vmem
+        (
+            None
+            if not act_quant_enabled
+            else pltpu.VMEM((2, block_config.bts, t_packing, bd1_per_pack), jnp.int8)
+        ),  # b_stage_q_x2_vmem
+        (
+            None
+            if not act_quant_enabled
+            else pltpu.VMEM((2, block_config.bts, align_to(2, 128)), jnp.int8)
+        ),  # b_stage_scale_x2_vmem
         pltpu.VMEM(
             (3, block_config.bts, t_packing, bd2_per_pack),
             t_dtype,
@@ -2941,6 +3218,7 @@ def fused_ep_moe(
         pl.pallas_call(
             functools.partial(
                 _fused_ep_moe_kernel,
+                act_quant_dtype=act_quant_dtype,
                 top_k=top_k,
                 use_grouped_topk=use_grouped_topk,
                 num_groups=num_groups,
@@ -2978,6 +3256,7 @@ def fused_ep_moe(
                     None if b3 is None else hbm_block_spec,  # b3_hbm
                     hbm_block_spec,  # gating_output_hbm
                     hbm_block_spec,  # a2a_s_x2_hbm
+                    None if not act_quant_enabled else hbm_block_spec,  # a2a_s_scale_x2_hbm
                     hbm_block_spec,  # a2a_s_acc_x2_hbm
                     hbm_block_spec,  # a2a_g_hbm
                     None if bias is None else hbm_block_spec,  # bias_hbm
@@ -3063,6 +3342,7 @@ def fused_ep_moe(
                 (dp_axis_name, tp_axis_name),
             ),  # gating_output_hbm
             P(),  # a2a_s_x2_hbm
+            None if not act_quant_enabled else P(),  # a2a_s_scale_x2_hbm
             P(),  # a2a_s_acc_x2_hbm
             P(),  # a2a_g_hbm
             None if bias is None else P(),
@@ -3089,6 +3369,7 @@ def fused_ep_moe(
         b3,
         gating_output,
         a2a_s_x2_hbm_scratch,
+        a2a_s_scale_x2_hbm_scratch,
         a2a_s_acc_x2_hbm_scratch,
         a2a_g_hbm_scratch,
         bias,
@@ -3124,6 +3405,11 @@ def fused_ep_moe(
             (None if b3 is None else pltpu.with_memory_space_constraint(b3, pltpu.HBM)),  # b3_hbm
             pltpu.with_memory_space_constraint(gating_output, pltpu.HBM),  # gating_output_hbm
             pltpu.with_memory_space_constraint(a2a_s_x2_hbm_scratch, pltpu.HBM),  # a2a_s_x2_hbm
+            (
+                None
+                if a2a_s_scale_x2_hbm_scratch is None
+                else pltpu.with_memory_space_constraint(a2a_s_scale_x2_hbm_scratch, pltpu.HBM)
+            ),  # a2a_s_scale_x2_hbm
             pltpu.with_memory_space_constraint(
                 a2a_s_acc_x2_hbm_scratch, pltpu.HBM
             ),  # a2a_s_acc_x2_hbm
@@ -3162,9 +3448,25 @@ def fused_ep_moe(
         )
         return local_output
 
-    a2a_s_x2_hbm_scratch = pl.empty(
-        (2, a2a_max_tokens_with_top_k, t_packing, hidden_size // t_packing), t_dtype
-    )
+    if act_quant_enabled:
+        a2a_s_x2_hbm_scratch = pl.empty(
+            (
+                2,
+                a2a_max_tokens_with_top_k,
+                t_packing,
+                hidden_size // t_packing,
+            ),
+            jnp.int8,
+        )
+        a2a_s_scale_x2_hbm_scratch = pl.empty(
+            (2, a2a_max_tokens_with_top_k, align_to(2, 128)),
+            jnp.int8,
+        )
+    else:
+        a2a_s_x2_hbm_scratch = pl.empty(
+            (2, a2a_max_tokens_with_top_k, t_packing, hidden_size // t_packing), t_dtype
+        )
+        a2a_s_scale_x2_hbm_scratch = None
     a2a_s_acc_x2_hbm_scratch = pl.empty(
         (2, a2a_max_tokens, t_packing, hidden_size // t_packing), t_dtype
     )
@@ -3183,6 +3485,7 @@ def fused_ep_moe(
         b3,
         gating_output,
         a2a_s_x2_hbm_scratch,
+        a2a_s_scale_x2_hbm_scratch,
         a2a_s_acc_x2_hbm_scratch,
         a2a_g_hbm_scratch,
         bias,
