@@ -1028,11 +1028,9 @@ class FusedEPMoE(nnx.Module):
     def __call__(
         self,
         hidden_states: jax.Array,
-        router_logits: jax.Array,
-        router_bias: jax.Array | None = None,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
         token_valid_mask: jax.Array | None = None,
-        l2p_map: jax.Array | None = None,
-        l2p_num_valid: jax.Array | None = None,
         *,
         block_config: FusedMoEBlockConfig | None = None,
     ) -> jax.Array:
@@ -1042,16 +1040,18 @@ class FusedEPMoE(nnx.Module):
         Args:
             hidden_states: Input tokens, shape (num_tokens, hidden_size) or
                           (batch_size, seq_len, hidden_size)
-            router_logits: Router output logits, shape (num_tokens, num_experts)
-                          Note: Should be raw logits, not after softmax or top-k
+            topk_weights: Pre-computed top-k weights
+            topk_ids: Pre-computed top-k expert IDs
 
         Returns:
             MoE layer output, same shape as hidden_states
         """
         assert hidden_states.ndim == 2
 
-        if router_bias is not None:
-            router_bias = jax.sharding.reshard(router_bias, P())
+        # Fused MoE expects topk_weights/ids to be replicated or sharded correctly
+        # for its internal shard_map.
+        topk_weights = jax.sharding.reshard(topk_weights, P(None))
+        topk_ids = jax.sharding.reshard(topk_ids, P(None))
 
         w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
         w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
@@ -1065,8 +1065,6 @@ class FusedEPMoE(nnx.Module):
         w2_shared_scale = self.w2_shared_scale.value if self.w2_shared_scale is not None else None
 
         subc_quant_wsz = self.subc_quant_wsz if self.subc_quant_wsz is not None else None
-        l2p_map_value = l2p_map[self.layer_id] if l2p_map is not None else None
-        l2p_num_valid_value = l2p_num_valid[self.layer_id] if l2p_num_valid is not None else None
 
         output = fused_ep_moe(
             mesh=self.mesh,
@@ -1074,8 +1072,8 @@ class FusedEPMoE(nnx.Module):
             w1=self.w1.value,
             w2=self.w2.value,
             w3=self.w3.value,
-            gating_output=router_logits,
-            bias=router_bias,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
             top_k=self.num_experts_per_tok,
             use_grouped_topk=self.use_grouped_topk,
             num_groups=self.num_groups,
@@ -1099,8 +1097,6 @@ class FusedEPMoE(nnx.Module):
             b1=None,
             b2=None,
             b3=None,
-            l2p_map=l2p_map_value,
-            l2p_num_valid=l2p_num_valid_value,
             dp_axis_name="data",
             tp_axis_name="tensor",
         )
