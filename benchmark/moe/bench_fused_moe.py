@@ -364,6 +364,17 @@ def select_block_configs(
     bf_candidates = _pick_candidates(candidates=bf_candidates, multiple_of=128)
     bd_candidates = _pick_candidates(candidates=bd_candidates, multiple_of=tile_align)
 
+    if subc_quant_wsz is not None:
+        # For sub-channel quantization, the kernel overrides:
+        #   bfc = subc_quant_wsz
+        #   bd1c = subc_quant_wsz * t_packing
+        # so we can pre-filter candidates to avoid generating obviously-invalid configs.
+        bf_candidates = [
+            v for v in bf_candidates if v >= subc_quant_wsz and v % subc_quant_wsz == 0
+        ]
+        bd1c_req = subc_quant_wsz * t_packing
+        bd_candidates = [v for v in bd_candidates if v >= bd1c_req and v % bd1c_req == 0]
+
     raw_bse_candidates = bse_candidates if bse_candidates is not None else bf_candidates
     bse_candidates_i = _pick_candidates(candidates=raw_bse_candidates, multiple_of=128)
 
@@ -423,6 +434,30 @@ def select_block_configs(
             return False, f"bd1c({bd1c})/bd2c({bd2c}) not aligned to tile_align({tile_align})"
         if bd1 % bd1c != 0 or bd2 % bd2c != 0:
             return False, f"bd1({bd1}) % bd1c({bd1c}) != 0 or bd2({bd2}) % bd2c({bd2c}) != 0"
+
+        if subc_quant_wsz is not None:
+            if subc_quant_wsz <= 0:
+                return False, f"subc_quant_wsz({subc_quant_wsz}) must be > 0"
+            if subc_quant_wsz % 256 != 0:
+                return False, f"subc_quant_wsz({subc_quant_wsz}) % 256 != 0"
+            if case.hidden_size % subc_quant_wsz != 0:
+                return (
+                    False,
+                    f"hidden_size({case.hidden_size}) % subc_quant_wsz({subc_quant_wsz}) != 0",
+                )
+            if case.intermediate_size % subc_quant_wsz != 0:
+                return (
+                    False,
+                    f"intermediate_size({case.intermediate_size}) % subc_quant_wsz({subc_quant_wsz}) != 0",
+                )
+            # effective_for() enforces these overrides; keep as a sanity check here.
+            if bfc != subc_quant_wsz:
+                return False, f"bfc({bfc}) != subc_quant_wsz({subc_quant_wsz})"
+            if bd1c != subc_quant_wsz * t_packing:
+                return (
+                    False,
+                    f"bd1c({bd1c}) != subc_quant_wsz({subc_quant_wsz}) * t_packing({t_packing})",
+                )
 
         # Pass use_shared_expert to estimate correct VMEM
         est = _estimate_vmem_bytes(
@@ -550,7 +585,10 @@ def select_block_configs(
                                 bse=bse,
                             )
                             effective = raw.effective_for(
-                                num_tokens=case.num_tokens, ep_size=case.ep_size, dtype=dtype
+                                num_tokens=case.num_tokens,
+                                ep_size=case.ep_size,
+                                dtype=dtype,
+                                subc_quant_wsz=subc_quant_wsz,
                             )
                             add(raw=raw, effective=effective)
 
@@ -949,7 +987,7 @@ def run_all(
                             intermediate_size=case.intermediate_size,
                             dtype=dtype,
                             ep_size=mesh_ep,
-                            subc_quant_wsz=None,
+                            subc_quant_wsz=subc_quant_wsz,
                             block_config=block_cfg,
                         )
                     times = multiple_iteration_timeit_from_trace(
