@@ -2343,25 +2343,28 @@ def _fused_ep_moe_kernel(
         # )
 
         # Populate top_k_logits_vmem
-        top_k_logits_vmem[...] = b_topk_weights_x2_vmem[bt_sem_id]
+        top_k_logits_vmem[...] = jnp.where(
+            bt_sem_id == jnp.int32(0),
+            b_topk_weights_x2_vmem[0],
+            b_topk_weights_x2_vmem[1],
+        )
 
         # Prepare t2e_routing
-        t2e_routing_vmem = b_topk_ids_x2_vmem[bt_sem_id]
-        t2e_routing = t2e_routing_vmem
+        t2e_routing = jnp.where(
+            bt_sem_id == jnp.int32(0),
+            b_topk_ids_x2_vmem[0],
+            b_topk_ids_x2_vmem[1],
+        )
 
         # Compute expert_sizes
         expert_sizes = jnp.zeros((1, padded_num_experts), dtype=jnp.int32)
-
-        def count_one(i, sizes):
+        for i in range(bt):
             for k in range(top_k):
-                eid = t2e_routing_vmem[i, k]
+                eid = t2e_routing[i, k]
                 is_valid = eid >= 0
                 idx = lax.select(is_valid, eid, jnp.int32(0))
                 inc = lax.select(is_valid, jnp.int32(1), jnp.int32(0))
-                sizes = sizes.at[0, idx].add(inc)
-            return sizes
-
-        expert_sizes = lax.fori_loop(0, bt, count_one, expert_sizes)
+                expert_sizes = expert_sizes.at[0, idx].add(inc)
 
         expert_starts = jnp.zeros_like(expert_sizes)
 
