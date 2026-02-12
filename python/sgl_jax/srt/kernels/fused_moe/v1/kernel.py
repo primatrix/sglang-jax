@@ -785,7 +785,11 @@ def _fused_ep_moe_kernel(
                 dst_ref=expert_offsets_x2_smem.at[bt_sem_id],
                 sem=send_sem,
             )
-            t2e_routing_vmem[...] = t2e_routing
+            t2e_routing_vmem[...] = jnp.full_like(t2e_routing_vmem, jnp.int32(-1))
+            t2e_routing_vmem.at[
+                pl.ds(0, t2e_routing.shape[0]),
+                pl.ds(0, t2e_routing.shape[1]),
+            ][...] = t2e_routing
             t2e_routing_copy = pltpu.async_copy(
                 src_ref=t2e_routing_vmem,
                 dst_ref=t2e_routing_x2_smem.at[bt_sem_id],
