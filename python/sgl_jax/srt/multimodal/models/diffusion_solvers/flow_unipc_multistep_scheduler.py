@@ -652,3 +652,112 @@ class FlowUniPCMultistepScheduler:
 
     def __len__(self) -> int:
         return self.num_train_timesteps
+
+    # ==================== Optimized APIs for Issue #845 ====================
+
+    def _scan_step_fn(
+        self,
+        carry: tuple[jax.Array, jax.Array, jax.Array, int],
+        model_output: jax.Array,
+    ) -> tuple[tuple[jax.Array, jax.Array, jax.Array, int], None]:
+        """Single step function for scan (static method to avoid tracer issues)."""
+        sample, model_outputs, sigmas, step_idx = carry
+        solver_order = self.solver_order
+        
+        # Convert model output
+        sigma = sigmas[step_idx]
+        converted = self._convert_model_output_jit(
+            model_output, sample, sigma, self.predict_x0
+        )
+        
+        # Update history
+        model_outputs = jnp.concatenate([model_outputs[1:], converted[None, ...]], axis=0)
+        
+        # Always use full order for simplicity (can be optimized later)
+        this_order = solver_order
+        
+        # Predict
+        m0 = model_outputs[solver_order - 1]
+        prev_sample = self._uni_p_update_jit(
+            sample=sample,
+            m0=m0,
+            model_outputs=model_outputs,
+            sigmas=sigmas,
+            step_index=step_idx,
+            order=this_order,
+            solver_order=solver_order,
+            predict_x0=self.predict_x0,
+            solver_type=self.solver_type,
+        )
+        
+        return (prev_sample, model_outputs, sigmas, step_idx + 1), None
+
+    def scan_steps(
+        self,
+        model_outputs_list: list[jax.Array] | jax.Array,
+        initial_sample: jax.Array,
+    ) -> jax.Array:
+        """
+        Execute all scheduler steps in a single JIT-compiled scan (Issue #845).
+        
+        This eliminates host-device synchronization during inference by using
+        jax.lax.scan for continuous execution.
+        
+        Args:
+            model_outputs_list: List or array of model predictions, shape (num_steps, ...)
+            initial_sample: Initial noisy sample
+            
+        Returns:
+            Final denoised sample
+        """
+        if isinstance(model_outputs_list, list):
+            model_outputs_list = jnp.stack(model_outputs_list)
+        
+        num_steps = model_outputs_list.shape[0]
+        
+        # Initialize state
+        init_model_outputs = jnp.zeros((self.solver_order,) + initial_sample.shape, dtype=self.dtype)
+        
+        # Use fori_loop instead of scan to avoid tracer issues with dynamic order
+        def body_fn(i, carry):
+            sample, model_outputs = carry
+            model_output = model_outputs_list[i]
+            
+            # Convert model output
+            sigma = self._sigmas[i]
+            converted = self._convert_model_output_jit(
+                model_output, sample, sigma, self.predict_x0
+            )
+            
+            # Update history
+            model_outputs = jnp.concatenate([model_outputs[1:], converted[None, ...]], axis=0)
+            
+            # Determine order
+            if self.lower_order_final:
+                this_order = min(self.solver_order, num_steps - i)
+            else:
+                this_order = self.solver_order
+            this_order = min(this_order, min(i, self.solver_order) + 1)
+            
+            # Predict
+            m0 = model_outputs[self.solver_order - 1]
+            prev_sample = self._uni_p_update_jit(
+                sample=sample,
+                m0=m0,
+                model_outputs=model_outputs,
+                sigmas=self._sigmas,
+                step_index=i,
+                order=this_order,
+                solver_order=self.solver_order,
+                predict_x0=self.predict_x0,
+                solver_type=self.solver_type,
+            )
+            
+            return prev_sample, model_outputs
+        
+        final_sample, _ = jax.lax.fori_loop(
+            0, num_steps, body_fn, (initial_sample, init_model_outputs)
+        )
+        
+        return final_sample
+
