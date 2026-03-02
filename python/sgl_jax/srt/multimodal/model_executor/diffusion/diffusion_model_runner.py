@@ -4,6 +4,7 @@ from collections.abc import Callable
 from functools import partial
 
 import jax
+import jax._src.test_util as jtu
 import jax.numpy as jnp
 from flax import nnx
 from jax import NamedSharding
@@ -192,7 +193,7 @@ class DiffusionModelRunner(BaseModelRunner):
         )
         self.solver.set_begin_index(0)
         start_time = time.time()
-        import jax._src.test_util as jtu
+        cache_miss_count = 0
 
         for step in tqdm(range(num_inference_steps), desc="Diffusion steps"):
             # Check for abort between steps
@@ -222,7 +223,7 @@ class DiffusionModelRunner(BaseModelRunner):
                     encoder_hidden_states_image=None,
                     guidance_scale=None,
                 )
-                logger.info("diffusion cache miss count: %d", count())
+                cache_miss_count += count()
             if do_classifier_free_guidance:
                 bsz = latents.shape[0] // 2
                 noise_uncond = noise_pred[bsz:]
@@ -242,7 +243,12 @@ class DiffusionModelRunner(BaseModelRunner):
             if step_callback is not None:
                 step_callback()
 
-        logger.info("Finished diffusion step %d in %.2f seconds", step, time.time() - start_time)
+        logger.info(
+            "Finished diffusion step %d in %.2f seconds, cache misses: %d",
+            step,
+            time.time() - start_time,
+            cache_miss_count,
+        )
         batch.latents = jax.device_get(latents)
         return False  # Not aborted
 

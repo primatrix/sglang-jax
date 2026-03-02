@@ -655,42 +655,72 @@ class FlowUniPCMultistepScheduler:
 
     # ==================== Optimized APIs for Issue #845 ====================
 
-    def _scan_step_fn(
-        self,
-        carry: tuple[jax.Array, jax.Array, jax.Array, int],
-        model_output: jax.Array,
-    ) -> tuple[tuple[jax.Array, jax.Array, jax.Array, int], None]:
-        """Single step function for scan (static method to avoid tracer issues)."""
-        sample, model_outputs, sigmas, step_idx = carry
-        solver_order = self.solver_order
-        
-        # Convert model output
-        sigma = sigmas[step_idx]
-        converted = self._convert_model_output_jit(
-            model_output, sample, sigma, self.predict_x0
+    @staticmethod
+    @partial(jax.jit, static_argnames=["solver_order", "predict_x0", "solver_type"])
+    def _run_steady_loop(
+        model_outputs_stacked: jax.Array,
+        sigmas: jax.Array,
+        sample: jax.Array,
+        model_outputs_buf: jax.Array,
+        last_sample: jax.Array,
+        steady_start: int,
+        steady_end: int,
+        solver_order: int,
+        predict_x0: bool,
+        solver_type: str,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """JIT-compiled steady-state loop with fixed order (no switch)."""
+
+        def body(i, carry):
+            sample, model_outputs_buf, last_sample = carry
+            model_output = model_outputs_stacked[i]
+            converted = FlowUniPCMultistepScheduler._convert_model_output_jit(
+                model_output, sample, sigmas[i], predict_x0
+            )
+
+            # Corrector (always enabled, fixed order=solver_order)
+            m0_old = model_outputs_buf[solver_order - 1]
+            sample = FlowUniPCMultistepScheduler._uni_c_update_jit(
+                this_model_output=converted,
+                last_sample=last_sample,
+                this_sample=sample,
+                m0=m0_old,
+                model_outputs=model_outputs_buf,
+                sigmas=sigmas,
+                step_index=i,
+                order=solver_order,
+                solver_order=solver_order,
+                predict_x0=predict_x0,
+                solver_type=solver_type,
+            )
+
+            model_outputs_buf = jnp.concatenate(
+                [model_outputs_buf[1:], converted[None, ...]], axis=0
+            )
+            new_last_sample = sample
+
+            # Predictor (fixed order=solver_order)
+            m0 = model_outputs_buf[solver_order - 1]
+            prev_sample = FlowUniPCMultistepScheduler._uni_p_update_jit(
+                sample=sample,
+                m0=m0,
+                model_outputs=model_outputs_buf,
+                sigmas=sigmas,
+                step_index=i,
+                order=solver_order,
+                solver_order=solver_order,
+                predict_x0=predict_x0,
+                solver_type=solver_type,
+            )
+
+            return prev_sample, model_outputs_buf, new_last_sample
+
+        return jax.lax.fori_loop(
+            steady_start,
+            steady_end,
+            body,
+            (sample, model_outputs_buf, last_sample),
         )
-        
-        # Update history
-        model_outputs = jnp.concatenate([model_outputs[1:], converted[None, ...]], axis=0)
-        
-        # Always use full order for simplicity (can be optimized later)
-        this_order = solver_order
-        
-        # Predict
-        m0 = model_outputs[solver_order - 1]
-        prev_sample = self._uni_p_update_jit(
-            sample=sample,
-            m0=m0,
-            model_outputs=model_outputs,
-            sigmas=sigmas,
-            step_index=step_idx,
-            order=this_order,
-            solver_order=solver_order,
-            predict_x0=self.predict_x0,
-            solver_type=self.solver_type,
-        )
-        
-        return (prev_sample, model_outputs, sigmas, step_idx + 1), None
 
     def scan_steps(
         self,
@@ -698,66 +728,153 @@ class FlowUniPCMultistepScheduler:
         initial_sample: jax.Array,
     ) -> jax.Array:
         """
-        Execute all scheduler steps in a single JIT-compiled scan (Issue #845).
-        
-        This eliminates host-device synchronization during inference by using
-        jax.lax.scan for continuous execution.
-        
+        Execute all scheduler steps with fori_loop for the steady-state portion.
+
+        Warmup steps (where order ramps up) and the final step (lower_order_final)
+        are unrolled in Python. The steady-state steps (fixed order=solver_order
+        with corrector) run in a JIT-compiled fori_loop.
+
         Args:
-            model_outputs_list: List or array of model predictions, shape (num_steps, ...)
-            initial_sample: Initial noisy sample
-            
+            model_outputs_list: All model predictions, shape (num_steps, ...).
+            initial_sample: Initial noisy sample (latent).
+
         Returns:
-            Final denoised sample
+            Final denoised sample after all steps.
         """
+        initial_sample = initial_sample.astype(jnp.float32)
         if isinstance(model_outputs_list, list):
             model_outputs_list = jnp.stack(model_outputs_list)
-        
+
         num_steps = model_outputs_list.shape[0]
-        
-        # Initialize state
-        init_model_outputs = jnp.zeros((self.solver_order,) + initial_sample.shape, dtype=self.dtype)
-        
-        # Use fori_loop instead of scan to avoid tracer issues with dynamic order
-        def body_fn(i, carry):
-            sample, model_outputs = carry
-            model_output = model_outputs_list[i]
-            
-            # Convert model output
-            sigma = self._sigmas[i]
-            converted = self._convert_model_output_jit(
-                model_output, sample, sigma, self.predict_x0
+        solver_order = self.solver_order
+        predict_x0 = self.predict_x0
+        solver_type = self.solver_type
+        sigmas = self._sigmas
+
+        # Pre-compute predictor order for each step (Python-level).
+        predictor_orders = []
+        for i in range(num_steps):
+            order = min(solver_order, num_steps - i) if self.lower_order_final else solver_order
+            order = min(order, min(i, solver_order) + 1)
+            predictor_orders.append(order)
+
+        # Corrector at step i uses the predictor order from step i-1.
+        corrector_orders = [0] + predictor_orders[:-1]
+
+        # Find the contiguous steady-state range where both orders == solver_order.
+        # Typical pattern for solver_order=2, 30 steps:
+        #   warmup=[0,1], steady=[2..28], final=[29]
+        steady_start = num_steps
+        steady_end = num_steps
+        for i in range(num_steps):
+            is_steady = (
+                predictor_orders[i] == solver_order
+                and corrector_orders[i] == solver_order
+                and i > 0
+                and (i - 1) not in self.disable_corrector
             )
-            
-            # Update history
-            model_outputs = jnp.concatenate([model_outputs[1:], converted[None, ...]], axis=0)
-            
-            # Determine order
-            if self.lower_order_final:
-                this_order = min(self.solver_order, num_steps - i)
-            else:
-                this_order = self.solver_order
-            this_order = min(this_order, min(i, self.solver_order) + 1)
-            
-            # Predict
-            m0 = model_outputs[self.solver_order - 1]
-            prev_sample = self._uni_p_update_jit(
+            if is_steady and steady_start == num_steps:
+                steady_start = i
+            elif not is_steady and steady_start < num_steps:
+                steady_end = i
+                break
+
+        # Initialize state
+        model_outputs_buf = jnp.zeros((solver_order,) + initial_sample.shape, dtype=self.dtype)
+        last_sample = jnp.zeros_like(initial_sample)
+        sample = initial_sample
+
+        # --- Phase 1: Warmup (unrolled, steps 0..steady_start-1) ---
+        for i in range(min(steady_start, num_steps)):
+            model_output = model_outputs_list[i]
+            converted = self._convert_model_output_jit(model_output, sample, sigmas[i], predict_x0)
+
+            if i > 0 and corrector_orders[i] > 0 and (i - 1) not in self.disable_corrector:
+                m0_old = model_outputs_buf[solver_order - 1]
+                sample = self._uni_c_update_jit(
+                    this_model_output=converted,
+                    last_sample=last_sample,
+                    this_sample=sample,
+                    m0=m0_old,
+                    model_outputs=model_outputs_buf,
+                    sigmas=sigmas,
+                    step_index=i,
+                    order=corrector_orders[i],
+                    solver_order=solver_order,
+                    predict_x0=predict_x0,
+                    solver_type=solver_type,
+                )
+
+            model_outputs_buf = jnp.concatenate(
+                [model_outputs_buf[1:], converted[None, ...]], axis=0
+            )
+            last_sample = sample
+
+            m0 = model_outputs_buf[solver_order - 1]
+            sample = self._uni_p_update_jit(
                 sample=sample,
                 m0=m0,
-                model_outputs=model_outputs,
-                sigmas=self._sigmas,
+                model_outputs=model_outputs_buf,
+                sigmas=sigmas,
                 step_index=i,
-                order=this_order,
-                solver_order=self.solver_order,
-                predict_x0=self.predict_x0,
-                solver_type=self.solver_type,
+                order=predictor_orders[i],
+                solver_order=solver_order,
+                predict_x0=predict_x0,
+                solver_type=solver_type,
             )
-            
-            return prev_sample, model_outputs
-        
-        final_sample, _ = jax.lax.fori_loop(
-            0, num_steps, body_fn, (initial_sample, init_model_outputs)
-        )
-        
-        return final_sample
 
+        # --- Phase 2: Steady state (JIT-compiled fori_loop, fixed order) ---
+        if steady_end > steady_start:
+            sample, model_outputs_buf, last_sample = self._run_steady_loop(
+                model_outputs_stacked=model_outputs_list,
+                sigmas=sigmas,
+                sample=sample,
+                model_outputs_buf=model_outputs_buf,
+                last_sample=last_sample,
+                steady_start=steady_start,
+                steady_end=steady_end,
+                solver_order=solver_order,
+                predict_x0=predict_x0,
+                solver_type=solver_type,
+            )
+
+        # --- Phase 3: Final steps (unrolled, steps steady_end..num_steps-1) ---
+        for i in range(steady_end, num_steps):
+            model_output = model_outputs_list[i]
+            converted = self._convert_model_output_jit(model_output, sample, sigmas[i], predict_x0)
+
+            if corrector_orders[i] > 0 and (i - 1) not in self.disable_corrector:
+                m0_old = model_outputs_buf[solver_order - 1]
+                sample = self._uni_c_update_jit(
+                    this_model_output=converted,
+                    last_sample=last_sample,
+                    this_sample=sample,
+                    m0=m0_old,
+                    model_outputs=model_outputs_buf,
+                    sigmas=sigmas,
+                    step_index=i,
+                    order=corrector_orders[i],
+                    solver_order=solver_order,
+                    predict_x0=predict_x0,
+                    solver_type=solver_type,
+                )
+
+            model_outputs_buf = jnp.concatenate(
+                [model_outputs_buf[1:], converted[None, ...]], axis=0
+            )
+            last_sample = sample
+
+            m0 = model_outputs_buf[solver_order - 1]
+            sample = self._uni_p_update_jit(
+                sample=sample,
+                m0=m0,
+                model_outputs=model_outputs_buf,
+                sigmas=sigmas,
+                step_index=i,
+                order=predictor_orders[i],
+                solver_order=solver_order,
+                predict_x0=predict_x0,
+                solver_type=solver_type,
+            )
+
+        return sample
