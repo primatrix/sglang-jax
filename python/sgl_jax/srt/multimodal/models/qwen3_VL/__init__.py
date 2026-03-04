@@ -5,11 +5,10 @@ distributed inference on TPUs.
 
 Components:
 - Qwen3_VL_VisionModel: Vision encoder with DeepStack feature extraction
-- Qwen3_VL_Generation: Text decoder with M-RoPE for conditional generation
+- Qwen3_VL_Generation: Text decoder extending QWen3Model with M-RoPE
 """
 
 from sgl_jax.srt.multimodal.models.qwen3_VL.qwen3_vl_generation import (
-    MRotaryEmbedding,
     Qwen3_VL_Generation,
     Qwen3_VL_Model,
 )
@@ -24,6 +23,7 @@ from sgl_jax.srt.multimodal.models.qwen3_VL.qwen3_vl_vit import (
     Qwen3_VLVisionPatchMerger,
     Qwen3_VLVisionRotaryEmbedding,
 )
+from sgl_jax.srt.multimodal.models.qwen_vl_utils import MRotaryEmbedding
 
 __all__ = [
     # Vision components

@@ -48,6 +48,8 @@ class StageConfigRegistry:
         "Qwen3-VL-8B-Instruct": "qwen3_vl_stage_config_tp4.yaml",
         "Qwen/Qwen3-VL-32B-Instruct": "qwen3_vl_stage_config_tp4.yaml",
         "Qwen3-VL-32B-Instruct": "qwen3_vl_stage_config_tp4.yaml",
+        "Qwen/Qwen3-VL-30B-A3B-Thinking": "qwen3_vl_stage_config_tp4.yaml",
+        "Qwen3-VL-30B-A3B-Thinking": "qwen3_vl_stage_config_tp4.yaml",
     }
 
     # Keyword patterns for fallback matching (order matters - more specific first)

@@ -8,8 +8,6 @@ Key differences from Qwen2.5-VL:
 """
 
 import logging
-import math
-from functools import partial
 from typing import Literal, TypedDict
 
 import jax
@@ -17,12 +15,10 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax.sharding import Mesh
-from transformers import modeling_flax_utils
 
 from sgl_jax.srt.layers.embeddings import Embed
-from sgl_jax.srt.multimodal.configs.qwen_vl.qwen3_vl_config import (
-    Qwen3VLConfig,
-    Qwen3VLVisionConfig,
+from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
+    QwenVLModelVitConfig,
 )
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
@@ -142,7 +138,7 @@ class Qwen3_VLVisionPatchEmbed(nnx.Module):
 
     def __init__(
         self,
-        config: Qwen3VLVisionConfig,
+        config: QwenVLModelVitConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
     ) -> None:
@@ -194,7 +190,7 @@ class Qwen3_VLVisionMLP(nnx.Module):
 
     def __init__(
         self,
-        config: Qwen3VLVisionConfig,
+        config: QwenVLModelVitConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
     ):
@@ -226,7 +222,7 @@ class Qwen3_VLVisionAttention(nnx.Module):
 
     def __init__(
         self,
-        config: Qwen3VLVisionConfig,
+        config: QwenVLModelVitConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
     ):
@@ -279,7 +275,7 @@ class Qwen3_VLVisionBlock(nnx.Module):
 
     def __init__(
         self,
-        config: Qwen3VLVisionConfig,
+        config: QwenVLModelVitConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
     ):
@@ -327,7 +323,7 @@ class Qwen3_VLVisionPatchMerger(nnx.Module):
 
     def __init__(
         self,
-        config: Qwen3VLVisionConfig,
+        config: QwenVLModelVitConfig,
         use_postshuffle_norm: bool = False,
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
@@ -384,7 +380,7 @@ class Qwen3_VL_VisionTransformer(nnx.Module):
 
     def __init__(
         self,
-        config: Qwen3VLVisionConfig,
+        config: QwenVLModelVitConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
         mesh: Mesh = None,
@@ -479,10 +475,7 @@ class Qwen3_VL_VisionTransformer(nnx.Module):
 
             # Repeat for temporal dimension and apply spatial merge permutation
             pos_embeds = pos_embeds.reshape(h, w, -1)
-            if t > 1:
-                pos_embeds = jnp.tile(pos_embeds[None], (t, 1, 1, 1))
-            else:
-                pos_embeds = pos_embeds[None]
+            pos_embeds = jnp.tile(pos_embeds[None], (t, 1, 1, 1)) if t > 1 else pos_embeds[None]
 
             # Permute for spatial merge
             merge_size = self.spatial_merge_size
@@ -529,7 +522,6 @@ class Qwen3_VL_VisionTransformer(nnx.Module):
 
             # Create frequency table
             max_hw = max(grid_h, grid_w)
-            head_dim = self.config.hidden_size // self.config.num_heads
             freq_table = self.rotary_pos_emb(max_hw)  # (max_hw, rotary_dim//2)
 
             # Lookup embeddings
@@ -593,7 +585,7 @@ class Qwen3_VL_VisionModel(nnx.Module):
 
     def __init__(
         self,
-        config: Qwen3VLVisionConfig,
+        config: QwenVLModelVitConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
         mesh: Mesh = None,

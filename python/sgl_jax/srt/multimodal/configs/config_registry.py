@@ -33,6 +33,10 @@ _QWEN_VL_VISION_KEY_MAP = {
     "initializer_range": "initializer_range",
     "fullatt_block_indexes": "fullatt_block_indexes",
     "full_attn_block_indexes": "fullatt_block_indexes",
+    # Qwen3-VL specific
+    "num_position_embeddings": "num_position_embeddings",
+    "deepstack_visual_indexes": "deepstack_visual_indexes",
+    "rope_theta": "rope_theta",
 }
 _QWEN_VL_VISION_INT_FIELDS = {
     "depth",
@@ -46,13 +50,16 @@ _QWEN_VL_VISION_INT_FIELDS = {
     "tokens_per_second",
     "window_size",
     "out_hidden_size",
+    "num_position_embeddings",
 }
 _QWEN_VL_VISION_FLOAT_FIELDS = {
     "initializer_range",
     "rms_norm_eps",
+    "rope_theta",
 }
 _QWEN_VL_VISION_LIST_FIELDS = {
     "fullatt_block_indexes",
+    "deepstack_visual_indexes",
 }
 
 
@@ -369,11 +376,52 @@ class VAEConfigRegistry:
 class QwenVLConfigRegistry:
     # Model name -> config factory mapping
     _REGISTRY: dict[str, callable] = {
+        # Qwen2.5-VL (default config)
         "Qwen/Qwen2.5-VL-3B-Instruct": lambda: QwenVLModelVitConfig(),
+        # Qwen3-VL-30B-A3B (MoE variant with Qwen3-VL architecture)
+        "Qwen/Qwen3-VL-30B-A3B-Thinking": lambda: QwenVLModelVitConfig(
+            model_type="qwen3_vl",
+            depth=27,
+            hidden_size=1152,
+            hidden_act="gelu_pytorch_tanh",
+            intermediate_size=4304,
+            num_heads=16,
+            patch_size=16,
+            out_hidden_size=2048,
+            deepstack_visual_indexes=(8, 16, 24),
+            rms_norm_eps=1e-6,
+        ),
+        "Qwen3-VL-30B-A3B-Thinking": lambda: QwenVLModelVitConfig(
+            model_type="qwen3_vl",
+            depth=27,
+            hidden_size=1152,
+            hidden_act="gelu_pytorch_tanh",
+            intermediate_size=4304,
+            num_heads=16,
+            patch_size=16,
+            out_hidden_size=2048,
+            deepstack_visual_indexes=(8, 16, 24),
+            rms_norm_eps=1e-6,
+        ),
     }
 
     # Keyword patterns for fallback matching (order matters - more specific first)
     _KEYWORD_PATTERNS: list[tuple[str, callable]] = [
+        (
+            "Qwen3-VL",
+            lambda: QwenVLModelVitConfig(
+                model_type="qwen3_vl",
+                depth=27,
+                hidden_size=1152,
+                hidden_act="gelu_pytorch_tanh",
+                intermediate_size=4304,
+                num_heads=16,
+                patch_size=16,
+                out_hidden_size=2048,
+                deepstack_visual_indexes=(8, 16, 24),
+                rms_norm_eps=1e-6,
+            ),
+        ),
         ("Qwen2.5-VL", lambda: QwenVLModelVitConfig()),
     ]
 

@@ -2,7 +2,6 @@ import logging
 import math
 from collections.abc import Callable
 from functools import partial
-from typing import Literal, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -11,41 +10,22 @@ from flax import nnx
 from jax.sharding import Mesh
 from transformers import modeling_flax_utils
 
-from sgl_jax.srt.layers.embeddings import Embed
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
     QwenVLModelVitConfig,
 )
+from sgl_jax.srt.multimodal.models.qwen_vl_utils import (
+    BaseQwenVLVisionModel,
+    QwenVLImageInputs,
+    QwenVLImagePixelInputs,
+    QwenVLVisionRotaryEmbedding,
+    _get_flash_mha,
+)
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
-
-_FLASH_MHA = None
-
-
-def _get_flash_mha():
-    global _FLASH_MHA
-    if _FLASH_MHA is None:
-        from flash_attn_jax import flash_mha as _FLASH_MHA
-    return _FLASH_MHA
-
+from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 init_fn = nnx.initializers.uniform()
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-
-
-class Qwen2_5_VLImagePixelInputs(TypedDict):
-    type: Literal["pixel_values"]
-    pixel_values: jax.Array
-    image_grid_thw: tuple[tuple[int, int, int], ...]
-
-
-class Qwen2_5_VLImageEmbeddingInputs(TypedDict):
-    type: Literal["image_embeds"]
-    image_embeds: jax.Array
-    image_grid_thw: jax.Array
-
-
-Qwen2_5_VLImageInputs = Qwen2_5_VLImagePixelInputs | Qwen2_5_VLImageEmbeddingInputs
 
 
 def apply_rotary_pos_emb_vision(x: jax.Array, rotary_pos_emb: jax.Array) -> jax.Array:
@@ -173,18 +153,6 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
         # So shape is (L, 1, 1, 1, hidden_size)
         x = x.reshape(L, self.hidden_size)
         return x
-
-
-class Qwen2_5_VisionRotaryEmbedding(nnx.Module):
-    def __init__(self, dim: int, theta: float = 10000.0):
-        self.dim = dim
-        self.theta = theta
-
-    def __call__(self, seq_len: int) -> jax.Array:
-        inv_freq = 1.0 / (self.theta ** (jnp.arange(0, self.dim, 2, dtype=jnp.float32) / self.dim))
-        seq = jnp.arange(seq_len, dtype=jnp.float32)
-        freqs = jnp.outer(seq, inv_freq)
-        return freqs.astype(jnp.bfloat16)
 
 
 class Qwen2_5_VisionMLP(nnx.Module):
@@ -399,7 +367,15 @@ class Qwen2_5_VL_VisionTransformer(nnx.Module):
         )
 
         head_dim = config.hidden_size // config.num_heads
-        self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
+        self.rotary_pos_emb = QwenVLVisionRotaryEmbedding(head_dim // 2)
+
+        # Qwen2.5-VL specific: wrap __call__ to cast to bfloat16
+        _orig_call = self.rotary_pos_emb.__call__
+
+        def _call_with_cast(seq_len):
+            return _orig_call(seq_len).astype(jnp.bfloat16)
+
+        self.rotary_pos_emb.__call__ = _call_with_cast
 
         self.blocks = nnx.List(
             [
@@ -618,10 +594,8 @@ class Qwen2_5_VL_VisionTransformer(nnx.Module):
         )
 
 
-class Qwen2_5_VL_VisionModel(nnx.Module):
-    """Placeholder model class for the ViT stage.
-    - Call encode_vision() to get vision embeddings
-    """
+class Qwen2_5_VL_VisionModel(BaseQwenVLVisionModel):
+    """Qwen2.5-VL Vision Model."""
 
     def __init__(
         self,
@@ -630,6 +604,7 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
         rngs: nnx.Rngs = None,
         mesh: Mesh = None,
     ) -> None:
+        super().__init__()
         self.config = config
         self.dtype = dtype
         self.mesh = mesh
@@ -642,36 +617,7 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
         )
         logger.info("Qwen2_5_VL_VisionModel initialized with dtype %s", dtype)
 
-    def load_weights(self, model_config: QwenVLModelVitConfig) -> None:
-        """Load model weights with JAX distributed loading support"""
-        if not hasattr(self, "text_embed"):
-            self.text_embed = Embed(
-                num_embeddings=model_config.vocab_size,
-                features=model_config.text_hidden_size,
-                dtype=self.dtype,
-                param_dtype=self.dtype,
-                kernel_axes=(None, None),
-                mesh=self.mesh,
-            )
-
-        # Decide loading strategy based on mesh configuration
-        loader = WeightLoader(
-            model=self,
-            model_config=model_config,
-            mesh=self.mesh,
-            dtype=self.dtype,
-        )
-        weight_mappings = self._create_qwen2_5_vl_vision_weight_mappings()
-
-        if self.mesh is not None:
-            with self.mesh:
-                loader.load_weights_from_safetensors(weight_mappings)
-        else:
-            loader.load_weights_from_safetensors(weight_mappings)
-
-        logger.info("Qwen2.5 VL - ViT Stage weights loaded successfully!")
-
-    def _create_qwen2_5_vl_vision_weight_mappings(self) -> dict:
+    def _create_vision_weight_mappings(self) -> dict:
         mappings = {}
 
         mappings["model.embed_tokens.weight"] = WeightMapping(
@@ -729,6 +675,10 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
             mappings.update(vision_layer_mappings)
 
         return mappings
+
+    def load_weights(self, model_config: QwenVLModelVitConfig) -> None:
+        super().load_weights(model_config)
+        logger.info("Qwen2.5 VL - ViT Stage weights loaded successfully!")
 
     def _create_vision_layer_mappings(self, layer_idx: int) -> dict:
         # Qwen2.5-VL uses visual.blocks.{i}.* for vision layers
@@ -821,7 +771,7 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
 
     def _parse_and_validate_image_input(
         self, image_grid_thw: tuple[tuple[int, int, int], ...], **kwargs: object
-    ) -> Qwen2_5_VLImageInputs | None:
+    ) -> QwenVLImageInputs | None:
         pixel_values = kwargs.pop("pixel_values", None)
         image_embeds = kwargs.pop("image_embeds", None)
 
@@ -830,7 +780,7 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
 
         if pixel_values is not None:
             pixel_values = self._validate_and_reshape_mm_tensor(pixel_values, "image pixel values")
-            return Qwen2_5_VLImagePixelInputs(
+            return QwenVLImagePixelInputs(
                 type="pixel_values", pixel_values=pixel_values, image_grid_thw=image_grid_thw
             )
 
@@ -854,7 +804,7 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
     def get_single_image_embedding(self, image_pixel_values, image_grid_thw):
         return self.visual(image_pixel_values, (image_grid_thw,))
 
-    def _process_image_input(self, image_input: Qwen2_5_VLImageInputs) -> tuple[jax.Array, ...]:
+    def _process_image_input(self, image_input: QwenVLImageInputs) -> tuple[jax.Array, ...]:
 
         grid_thw = image_input["image_grid_thw"]
 
