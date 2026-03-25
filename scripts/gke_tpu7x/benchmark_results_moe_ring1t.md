@@ -51,6 +51,8 @@ python3 -u /tmp/launcher.py scripts/gke_tpu7x/bench_tpu_inference_moe.py \
 
 ## Benchmark Results (Ring-1T, ep=8)
 
+### With Default Block Config
+
 | num_tokens | sglang-jax (ms) | tpu-inference (ms) | speedup |
 |:----------:|:---------------:|:------------------:|:-------:|
 | 64         | 0.814           | 1.734              | 2.1x    |
@@ -59,13 +61,32 @@ python3 -u /tmp/launcher.py scripts/gke_tpu7x/bench_tpu_inference_moe.py \
 | 512        | 2.099           | compilation failed | -       |
 | 1024       | 3.839           | compilation failed | -       |
 
-**sglang-jax is ~2-3x faster on the Ring-1T MoE config.**
+### With Tuned Block Config (from Ring-1T ep=32, scaled by local_num_tokens)
+
+Tuned configs are adapted from Ring-1T (256 experts, ep=32) to our scaled config (64 experts, ep=8)
+by mapping `local_num_tokens = num_tokens / ep_size`:
+- ep=8/64t (local=8) uses ep=32/256t (local=8) config
+- ep=8/128t (local=16) uses ep=32/512t (local=16) config
+- ep=8/256t (local=32) uses ep=32/1024t (local=32) config
+- ep=8/512t (local=64) uses ep=32/2048t (local=64) config
+- ep=8/1024t (local=128) uses ep=32/4096t (local=128) config
+
+| num_tokens | Default (ms) | Tuned (ms) | vs Default | tpu-inference (ms) | vs tpu-inference |
+|:----------:|:------------:|:----------:|:----------:|:------------------:|:----------------:|
+| 64         | 0.814        | 0.300      | **2.7x**   | 1.734              | **5.8x**         |
+| 128        | 0.863        | 0.329      | **2.6x**   | 1.604              | **4.9x**         |
+| 256        | 0.943        | 0.522      | **1.8x**   | 2.763              | **5.3x**         |
+| 512        | 2.099        | 0.667      | **3.1x**   | compilation failed | -                |
+| 1024       | 3.839        | 1.144      | **3.4x**   | compilation failed | -                |
+
+**With tuned configs, sglang-jax is 1.8-3.4x faster than default, and 4.9-5.8x faster than tpu-inference.**
 
 ### Notes
 
 - tpu-inference fails to compile at 512/1024 tokens due to VMEM overflow. The kernel's scratch buffer management cannot handle large batch sizes combined with large hidden/intermediate dimensions (8192/2048).
 - sglang-jax handles all token counts without issues.
 - Both kernels were run with balanced routing (no imbalance simulation).
+- Tuned block configs are stored in `python/sgl_jax/srt/kernels/fused_moe/v1/tuned_block_configs.py`.
 
 ---
 
@@ -281,13 +302,15 @@ The trace viewer uses keyboard shortcuts (scroll wheel does NOT zoom):
 
 ## Conclusions
 
-1. **sglang-jax fused_moe is 2-3x faster** than tpu-inference's ring-based implementation on the Ring-1T MoE config (64 experts, top_k=8, hidden=8192, intermediate=2048, ep=8).
+1. **Tuned block configs provide 1.8-3.4x speedup** over default configs on the Ring-1T MoE config, bringing sglang-jax to 0.3-1.1ms range.
 
-2. **tpu-inference has scalability limitations** — it fails to compile with 512+ tokens on Ring-1T dimensions due to VMEM overflow in scratch buffer allocation.
+2. **With tuned configs, sglang-jax fused_moe is 4.9-5.8x faster** than tpu-inference's ring-based implementation (64 experts, top_k=8, hidden=8192, intermediate=2048, ep=8).
 
-3. **sglang-jax scales smoothly** from 64 to 1024 tokens, with latency growing sub-linearly (0.8ms → 3.8ms for 16x more tokens).
+3. **tpu-inference has scalability limitations** — it fails to compile with 512+ tokens on Ring-1T dimensions due to VMEM overflow in scratch buffer allocation.
 
-4. **Profile traces confirm** that LLO utilization is visible for Pallas custom calls when the correct LIBTPU flags and libtpu-nightly are used.
+4. **sglang-jax scales smoothly** from 64 to 1024 tokens, with tuned latency growing sub-linearly (0.3ms → 1.1ms for 16x more tokens).
+
+5. **Profile traces confirm** that LLO utilization is visible for Pallas custom calls when the correct LIBTPU flags and libtpu-nightly are used.
 
 ---
 
