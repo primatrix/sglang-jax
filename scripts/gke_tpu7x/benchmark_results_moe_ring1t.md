@@ -26,7 +26,7 @@ Scaled config for ep=8 (experts / 4):
 
 ```bash
 python3 -u /tmp/launcher.py -m benchmark.moe.bench_fused_moe \
-    --num-experts 64 --topk 8 --hidden-size 8192 --intermediate-size 2048 \
+    --num-experts 64 --top-k 8 --hidden-size 8192 --intermediate-size 2048 \
     --num-tokens 64 128 256 512 1024 --iters 5 --warmup-iters 2 \
     --imbalance-mode balanced
 ```
@@ -71,44 +71,211 @@ python3 -u /tmp/launcher.py scripts/gke_tpu7x/bench_tpu_inference_moe.py \
 
 ## Profiling (xprof with LLO utilization)
 
-Profile traces were captured for sglang-jax using xprof custom call profiling to inspect LLO-level utilization of the Pallas kernels.
+Profile traces were captured for sglang-jax using xprof custom call profiling to inspect LLO-level
+utilization of the Pallas kernels. This section documents the complete end-to-end flow.
 
-### Setup
+### Background: What is LLO Utilization?
 
-Required LIBTPU flags (set before importing JAX):
-```bash
-LIBTPU_INIT_ARGS="--xla_enable_custom_call_region_trace=true --xla_xprof_register_llo_debug_info=true"
+XLA Custom Calls (i.e. Pallas kernels) are opaque to the standard XLA profiler. By enabling two
+LIBTPU flags, xprof can show per-hardware-unit utilization **inside** each custom call:
+
+| Row in Trace Viewer | What it shows |
+|---|---|
+| MXU | Matrix Unit utilization (matmuls) |
+| Scalar ALU | Scalar arithmetic |
+| Vector ALU | Vector arithmetic |
+| Vector Load / Store | HBM ↔ VMEM data movement |
+| Vector Fills / Spills | VMEM spill traffic |
+| XLU | Cross-Lane Unit (permutes, reductions) |
+
+Reference: [xprof custom_call_profiling.md](https://github.com/openxla/xprof/blob/master/docs/custom_call_profiling.md)
+
+---
+
+### Step 1: Prepare a Profile Launcher
+
+**The key requirement**: `LIBTPU_INIT_ARGS` must be set **before** JAX/libtpu is imported.
+A regular `launcher.py` imports JAX immediately, so we need a separate `profile_launcher.py`.
+
+Create `/tmp/profile_launcher.py` on the pod (or see `scripts/gke_tpu7x/profile_moe.py` for reference):
+
+```python
+#!/usr/bin/env python3
+import os, sys, runpy
+
+# ---- MUST be set BEFORE importing JAX ----
+_xla_flags = (
+    "--xla_enable_custom_call_region_trace=true "
+    "--xla_xprof_register_llo_debug_info=true"
+)
+existing = os.environ.get("LIBTPU_INIT_ARGS", "")
+os.environ["LIBTPU_INIT_ARGS"] = (existing + " " + _xla_flags).strip()
+
+# Standard launcher setup
+REPO_ROOT = "/tmp/sglang-jax"
+sys.path.insert(0, os.path.join(REPO_ROOT, "python"))
+sys.path.insert(0, REPO_ROOT)
+os.chdir(REPO_ROOT)
+
+import jax
+jax.distributed.initialize()
+
+script_path = os.path.join(REPO_ROOT, sys.argv[1])
+sys.argv = [sys.argv[1]] + sys.argv[2:]
+runpy.run_path(script_path, run_name="__main__")
 ```
 
-Required package: `libtpu-nightly==0.0.38.dev*` (standard libtpu may not support LLO debug info registration).
-
-### Profile command
-
+Copy to both containers:
 ```bash
-python3 -u /tmp/launcher.py -m benchmark.moe.bench_fused_moe \
-    --num-experts 64 --topk 8 --hidden-size 8192 --intermediate-size 2048 \
-    --num-tokens 128 --iters 3 --warmup-iters 1 \
-    --imbalance-mode balanced --profile --profile-dir profile_ring1t_moe
+for C in <WORKLOAD>-1 <WORKLOAD>-2; do
+  kubectl cp /tmp/profile_launcher.py <POD>:/tmp/profile_launcher.py -c $C
+done
 ```
 
-### Trace files
+### Step 2: Run Profiling on TPU Pod
 
-Traces saved to `profile_ring1t_moe/case_128t_64e_ep8/`:
-- `*.xplane.pb` (80 MB) — full XPlane data, viewable with TensorBoard
-- `*.trace.json.gz` (10 MB) — trace events, viewable with Perfetto UI (https://ui.perfetto.dev)
+Both containers must run the same command simultaneously (JAX multi-process requirement):
 
-### Viewing traces
-
-**Option 1: TensorBoard**
 ```bash
-pip install tensorboard-plugin-profile
-tensorboard --logdir=profile_ring1t_moe/
+POD=<pod-name>
+WL=<workload-name>
+
+PROFILE_CMD="python3 -u /tmp/profile_launcher.py benchmark/moe/bench_fused_moe.py \
+  --num-experts 64 --top-k 8 --hidden-size 8192 --intermediate-size 2048 \
+  --num-tokens 128 --iters 3 --warmup-iters 1 \
+  --imbalance-mode balanced --profile --profile-dir /tmp/profile_output"
+
+# Worker in background
+kubectl exec $POD -c ${WL}-2 -- bash -c "$PROFILE_CMD" 2>&1 &
+BGPID=$!
+
+# Main in foreground
+kubectl exec $POD -c ${WL}-1 -- bash -c "$PROFILE_CMD" 2>&1
+
+kill $BGPID 2>/dev/null; wait $BGPID 2>/dev/null
 ```
 
-**Option 2: Perfetto UI**
-1. Open https://ui.perfetto.dev
-2. Upload `*.trace.json.gz`
-3. Look for the "LLO utilization" line under each TPU core to inspect custom call performance
+Successful output looks like:
+```
+LIBTPU_INIT_ARGS=--xla_enable_custom_call_region_trace=true --xla_xprof_register_llo_debug_info=true
+[Process 0] JAX 0.8.1, 8 devices, local 4
+  Profiling to: /tmp/profile_output/case_128t_64e_ep8
+  Profile saved to: /tmp/profile_output/case_128t_64e_ep8
+```
+
+### Step 3: Pull Trace Files to Local
+
+The trace files are large (~90 MB total). Use GCS as intermediate for reliable transfer:
+
+```bash
+# On pod: upload to GCS
+kubectl exec $POD -c ${WL}-1 -- bash -c '
+TRACE_DIR=$(find /tmp/profile_output -name "*.xplane.pb" -exec dirname {} \;)
+gsutil cp ${TRACE_DIR}/*.xplane.pb gs://<bucket>/profile_tmp/
+gsutil cp ${TRACE_DIR}/*.trace.json.gz gs://<bucket>/profile_tmp/
+'
+
+# On local: download from GCS
+mkdir -p profile_output/
+gsutil cp gs://<bucket>/profile_tmp/xplane.pb profile_output/
+gsutil cp gs://<bucket>/profile_tmp/trace.json.gz profile_output/
+```
+
+Alternative (direct kubectl cp, may truncate large files):
+```bash
+kubectl cp $POD:/tmp/profile_output ./profile_output -c ${WL}-1
+```
+
+Generated files:
+- `*.xplane.pb` (~83 MB) — full XPlane protobuf, contains LLO utilization data
+- `*.trace.json.gz` (~10 MB) — pre-converted trace events
+
+### Step 4: View Results with TensorBoard
+
+**Important**: TensorBoard must run on **Linux** (not macOS). The xprof native module
+(`_pywrap_profiler_plugin`) does not have macOS ARM64 builds. Run TensorBoard on the
+TPU pod itself and port-forward to local.
+
+#### 4a. Install TensorBoard on Pod
+
+Version requirements (must be compatible):
+```bash
+kubectl exec $POD -c ${WL}-1 -- pip install \
+  'tensorflow>=2.21' \
+  'tensorboard>=2.20' \
+  'tensorboard-plugin-profile>=2.22' \
+  'xprof>=2.22' \
+  'protobuf>=5,<7' \
+  'setuptools<81'
+```
+
+#### 4b. Start TensorBoard on Pod
+
+```bash
+kubectl exec $POD -c ${WL}-1 -- bash -c "
+nohup python3 -c '
+from tensorboard import main as tb
+import sys
+sys.argv = [\"tensorboard\", \"--logdir=/tmp/profile_output/\", \"--port=6006\", \"--bind_all\", \"--load_fast=false\"]
+tb.run_main()
+tb.main()
+' > /tmp/tb.log 2>&1 &"
+```
+
+Verify no profile plugin errors:
+```bash
+kubectl exec $POD -c ${WL}-1 -- grep -i error /tmp/tb.log
+# Should only show CUDA-related warnings (expected on TPU), no profile plugin errors
+```
+
+#### 4c. Port-Forward to Local
+
+```bash
+kubectl port-forward $POD 6006:6006
+```
+
+#### 4d. Open in Browser
+
+1. Open **http://localhost:6006/**
+2. Top-right dropdown: select **Profile**
+3. Left panel "Tools": select **trace_viewer**
+4. Left panel "Runs": select the run (e.g. `case_128t_64e_ep8/2026_03_25_03_31_38`)
+5. Left panel "Hosts": select the TPU host
+
+#### 4e. Navigate the Trace Viewer
+
+The trace viewer uses keyboard shortcuts (scroll wheel does NOT zoom):
+
+| Key | Action |
+|-----|--------|
+| **W** | Zoom in |
+| **S** | Zoom out |
+| **A** | Pan left |
+| **D** | Pan right |
+| **1** | Select mode (click to inspect events) |
+| **2** | Pan mode (drag to move) |
+| **3** | Zoom mode (drag to zoom into region) |
+| **4** | Timing mode (measure duration between points) |
+
+**What to look for:**
+- **XLA Modules / XLA Ops** rows: shows the fused_moe kernel execution span
+- **MXU** row: matrix unit utilization (higher = better for matmul-bound kernels)
+- **Vector Load/Store** rows: HBM bandwidth utilization
+- **Framework Name Scope** row: shows the JAX call hierarchy (jit → fused_ep_moe → pallas_call)
+- **Source code** row: links back to the kernel source file and line number
+
+### Troubleshooting
+
+| Problem | Cause | Fix |
+|---|---|---|
+| "No dashboards are active" | TensorBoard can't find profile data | Ensure `--logdir` points to parent of the run dir that contains `plugins/profile/` |
+| Profile tab says "plugin has moved" | `tensorboard-plugin-profile` not installed | `pip install tensorboard-plugin-profile>=2.22` |
+| `_pywrap_profiler_plugin` import error | Running on macOS (no native module) | Run TensorBoard on the Linux pod, port-forward to local |
+| `proto.id() > INT_MAX` | tensorboard-plugin-profile too old for JAX 0.8.1 | Upgrade to `tensorboard-plugin-profile>=2.22` + `tensorflow>=2.21` |
+| `'MessageFactory' has no attribute 'GetPrototype'` | protobuf version mismatch | `pip install 'protobuf>=5,<7'` |
+| `ModuleNotFoundError: pkg_resources` | setuptools too new (>=82) | `pip install 'setuptools<81'` |
+| No LLO utilization rows (MXU etc.) | LIBTPU flags not set before JAX import | Use `profile_launcher.py` that sets flags before `import jax` |
+| Profiling hangs after warmup | libtpu version issue | Ensure `libtpu-nightly>=0.0.38.dev` is installed |
 
 ---
 
@@ -128,8 +295,8 @@ tensorboard --logdir=profile_ring1t_moe/
 
 ### sglang-jax benchmark
 ```bash
-python3 -u /tmp/launcher.py -m benchmark.moe.bench_fused_moe \
-    --num-experts <E> --topk <K> --hidden-size <D> --intermediate-size <F> \
+python3 -u /tmp/profile_launcher.py benchmark/moe/bench_fused_moe.py \
+    --num-experts <E> --top-k <K> --hidden-size <D> --intermediate-size <F> \
     --num-tokens <T1> <T2> ... --iters 5 --warmup-iters 2 \
     --imbalance-mode balanced
 ```
@@ -143,15 +310,19 @@ python3 -u /tmp/launcher.py scripts/gke_tpu7x/bench_tpu_inference_moe.py \
 
 ### sglang-jax profiling
 ```bash
-LIBTPU_INIT_ARGS="--xla_enable_custom_call_region_trace=true --xla_xprof_register_llo_debug_info=true" \
-python3 -u /tmp/launcher.py -m benchmark.moe.bench_fused_moe \
-    --num-experts <E> --topk <K> --hidden-size <D> --intermediate-size <F> \
+# Use profile_launcher.py (NOT launcher.py) — it sets LIBTPU flags before JAX import
+python3 -u /tmp/profile_launcher.py benchmark/moe/bench_fused_moe.py \
+    --num-experts <E> --top-k <K> --hidden-size <D> --intermediate-size <F> \
     --num-tokens <T> --iters 3 --warmup-iters 1 \
     --imbalance-mode balanced --profile --profile-dir <output_dir>
 ```
 
 ### Pull traces to local
 ```bash
-# From the GKE pod
-kubectl cp <pod>:/tmp/<profile_dir> ./<local_dir>
+# Reliable method: via GCS
+kubectl exec <POD> -c <WORKLOAD>-1 -- gsutil cp /tmp/<profile_dir>/**/*.xplane.pb gs://<bucket>/profile_tmp/
+gsutil cp gs://<bucket>/profile_tmp/*.xplane.pb ./<local_dir>/
+
+# Quick method (may truncate files > ~50MB):
+kubectl cp <POD>:/tmp/<profile_dir> ./<local_dir> -c <WORKLOAD>-1
 ```
