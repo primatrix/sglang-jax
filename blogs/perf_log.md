@@ -25,6 +25,7 @@ python -m benchmark.moe.bench_fused_moe_kernel --iters 5
 | R4 | Asymmetric block config: bd1=2560 (num_bd1: 4→2) | 0.299 | -2.6% | 20/20 PASS | ad780690 |
 | R5 | Unroll 3 static fori_loops (prefix sum + gather acc) | 0.298 | -0.3% | 20/20 PASS | bfe353e3 |
 | R6 | Pre-compute allgather metadata in JAX layer | 0.289 | -3.0% | 20/20 PASS | 62c43de0 |
+| R7 | Bulk DMA wait in acc_and_store_output | 0.287 | -0.7% | 20/20 PASS | TBD |
 
 ## 详细记录
 
@@ -101,3 +102,14 @@ python -m benchmark.moe.bench_fused_moe_kernel --iters 5
 - **samples**: [0.2888, 0.2897, 0.2890, 0.2877]
 - **变化**: -0.009ms (-3.0%)
 - **总变化**: -1.119ms (-79.5%) vs baseline
+
+### Round 7: Bulk DMA wait in acc_and_store_output
+- **改动**: 将 `wait_load_acc_bt` 中 `num_valid * top_k` 次标量 fori_loop 等待替换为单次 bulk DMA wait:
+  - 原代码: `fori_loop(0, num_valid * top_k, _wait_one, ...)` → 最多 128 次/tile × 4 tiles = 512 次标量等待
+  - 新代码: `pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()` → 1 次 bulk wait/tile
+  - `wait_ref` 大小 = `(top_k, num_valid, t_packing, h_per_t_packing)` 匹配所有 DMA 传输的总字节数
+- **精度测试**: 20/20 PASS (347s), 1 skipped
+- **性能测试**: mean=0.287ms, min=0.286ms, max=0.288ms
+- **samples**: [0.2869, 0.2878, 0.2862, 0.2862]
+- **变化**: -0.002ms (-0.7%)
+- **总变化**: -1.121ms (-79.6%) vs baseline

@@ -1920,25 +1920,16 @@ def _fused_ep_moe_kernel(
             @pl.when(num_valid != 0)
             def _():
                 # `start_load_acc_bt` launches one HBM->VMEM DMA per (valid token, top-k),
-                # all sharing `a2a_acc_sems[0]`. To avoid consuming fewer semaphore
-                # signals than DMAs launched (which can stall later stages), drain
-                # exactly `num_valid * top_k` waits here.
-                def _wait_one(_, __):
-                    ref = a2a_g_acc_vmem.at[buf_id, 0, pl.ds(0, 1)]
-                    pltpu.make_async_copy(
-                        src_ref=ref,
-                        dst_ref=ref,
-                        sem=a2a_acc_sems.at[0],
-                    ).wait()
-                    return None
-
-                lax.fori_loop(
-                    0,
-                    num_valid * jnp.int32(top_k),
-                    _wait_one,
-                    None,
-                    unroll=False,
-                )
+                # all sharing `a2a_acc_sems[0]`. Drain all signals in one bulk wait
+                # instead of looping `num_valid * top_k` times.
+                wait_ref = a2a_g_acc_vmem.at[
+                    buf_id, pl.ds(0, top_k), pl.ds(0, num_valid)
+                ]
+                pltpu.make_async_copy(
+                    src_ref=wait_ref,
+                    dst_ref=wait_ref,
+                    sem=a2a_acc_sems.at[0],
+                ).wait()
 
         def acc_gather_to_output(*, tile_start, out_offset, buf_id):
             output_tile = jnp.zeros((acc_bt, t_packing, h_per_t_packing), dtype=jnp.float32)
