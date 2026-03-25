@@ -2235,11 +2235,13 @@ def _fused_ep_moe_kernel(
         # This is a prefix sum of local expert counts: O(num_experts) scalar ops,
         # replacing O(bt * top_k) = O(2048) scalar ops per scatter call.
         tile_base = bt_start * top_k
-        running_sum = jnp.int32(0)
-        for _e in range(num_experts):
+
+        def _compute_sorted_starts(_e, running_sum, bt_sem_id=bt_sem_id, tile_base=tile_base):
             sorted_scatter_starts_x2_smem[bt_sem_id, 0, _e] = tile_base + running_sum
             count_e = d2e_count_x2_smem[bt_sem_id, my_id, 0, _e]
-            running_sum = running_sum + count_e
+            return running_sum + count_e
+
+        lax.fori_loop(0, num_experts, _compute_sorted_starts, jnp.int32(0), unroll=False)
 
         wait_store_output(bt_id=bt_id - 2)
 

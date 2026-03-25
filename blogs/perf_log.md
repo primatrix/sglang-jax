@@ -19,7 +19,7 @@ python -m benchmark.moe.bench_fused_moe_kernel --iters 5
 | Round | 改动内容 | Kernel Time (ms) | 变化 | 精度 | Commit |
 |-------|---------|-----------------|------|------|--------|
 | R0 (baseline) | 未修改 | 1.408 | - | 20/20 PASS | - |
-| R1 | Pre-sort tokens + bulk scatter DMA | 1.319 | -6.3% | 20/20 PASS | TBD |
+| R1 | Pre-sort tokens + bulk scatter DMA | 1.319 | -6.3% | 20/20 PASS | 416634e6 |
 
 ## 详细记录
 
