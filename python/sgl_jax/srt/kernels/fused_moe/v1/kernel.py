@@ -471,6 +471,7 @@ def _fused_ep_moe_kernel(
     b3_hbm,  # None | F32(local_num_experts, 1, intermediate_size)
     topk_weights_hbm,  # (local_num_tokens, top_k)
     topk_ids_hbm,  # (local_num_tokens, top_k)
+    sorted_tokens_hbm,  # (local_num_tokens * top_k, t_packing, hidden_size // t_packing)
     a2a_s_x2_hbm,  # (2, align_to(bt * num_devices, bts), t_packing, hidden_size // t_packing)
     a2a_s_acc_x2_hbm,  # (2, align_to(bt * num_devices, bts), t_packing, hidden_size // t_packing)
     a2a_g_hbm,  # (num_experts, bt, t_packing, hidden_size // t_packing)
@@ -489,6 +490,7 @@ def _fused_ep_moe_kernel(
     expert_starts_x2_smem,  # (2, 1, padded_num_experts)
     expert_sizes_x2_smem,  # (2, 1, padded_num_experts)
     a2a_s_sends_x2_smem,  # <e_sem_id> (2,)
+    sorted_scatter_starts_x2_smem,  # (2, 1, padded_num_experts) int32: per-expert src starts in sorted_tokens
     ### Accumulation for gathered tokens:
     a2a_g_acc_vmem,  # (1, top_k, acc_bt, t_packing, hidden_size // t_packing)
     ### Expert weight double buffering:
@@ -789,63 +791,54 @@ def _fused_ep_moe_kernel(
         )
 
     def start_a2a_scatter(*, bt_sem_id, e_sem_id, local_e_id, bt_start):
-        # Counting the number of remote sends from the current device.
-        # Use `lax.fori_loop` to avoid unrolling `bt` (huge MLIR / slow compile).
-        def _scatter_one(
-            t_id, send_sz, e_sem_id=e_sem_id, local_e_id=local_e_id, bt_start=bt_start
-        ):
-            src_t_id = bt_start + t_id
-            for k_id in range(top_k):
-                e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
-                is_valid = e_id >= 0
-                e_id_safe = lax.select(is_valid, e_id, jnp.int32(0))
-                is_active_expert = is_valid & (e_id_safe % local_num_experts == local_e_id)
-                recv_id = e_id_safe // local_num_experts
-                offset = expert_offsets_x2_smem[bt_sem_id, 0, e_id_safe]
-                sz = lax.select(is_active_expert, jnp.int32(1), jnp.int32(0))
-                is_local = recv_id == my_id
-                local_sz = lax.select(is_local, sz, jnp.int32(0))
-                remote_sz = lax.select(is_local, jnp.int32(0), sz)
-                send_sz += remote_sz
-                expert_offsets_x2_smem[bt_sem_id, 0, e_id_safe] = offset + local_sz + remote_sz
-                start = expert_starts_x2_smem[bt_sem_id, 0, e_id_safe] + offset
+        # Bulk scatter: iterate over num_devices (static, O(8)) instead of
+        # lax.fori_loop over bt tokens (O(bt*top_k)=O(2048) scalar ops).
+        # Uses pre-sorted tokens where each expert's tokens are contiguous.
+        send_sz = jnp.int32(0)
+        for dev_id in range(num_devices):
+            e_id = jnp.int32(dev_id * local_num_experts) + local_e_id
+            count = d2e_count_x2_smem[bt_sem_id, my_id, 0, e_id]
+            src_start = sorted_scatter_starts_x2_smem[bt_sem_id, 0, e_id]
 
-                @pl.when(local_sz != 0)
-                def _local_copy(
-                    src_t_id=src_t_id, start=start, local_sz=local_sz, e_sem_id=e_sem_id
-                ):
-                    pltpu.make_async_copy(
-                        src_ref=tokens_hbm.at[pl.ds(src_t_id, local_sz)],
-                        dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
-                        sem=recv_x2_sems.at[e_sem_id],
-                    ).start()
+            dst_offset = expert_offsets_x2_smem[bt_sem_id, 0, e_id]
+            dst_start = expert_starts_x2_smem[bt_sem_id, 0, e_id] + dst_offset
+            expert_offsets_x2_smem[bt_sem_id, 0, e_id] = dst_offset + count
 
-                @pl.when(remote_sz != 0)
-                def _remote_copy(
-                    src_t_id=src_t_id,
-                    start=start,
-                    remote_sz=remote_sz,
-                    e_sem_id=e_sem_id,
-                    recv_id=recv_id,
-                ):
-                    pltpu.make_async_remote_copy(
-                        src_ref=tokens_hbm.at[pl.ds(src_t_id, remote_sz)],
-                        dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
-                        send_sem=send_x2_sems.at[e_sem_id],
-                        recv_sem=recv_x2_sems.at[e_sem_id],
-                        device_id=get_mesh_device_id(recv_id),
-                        device_id_type=pltpu.DeviceIdType.MESH,
-                    ).start()
+            is_local = (jnp.int32(dev_id) == my_id)
+            local_count = lax.select(is_local, count, jnp.int32(0))
+            remote_count = lax.select(is_local, jnp.int32(0), count)
+            send_sz = send_sz + remote_count
 
-            return send_sz
+            @pl.when(local_count != 0)
+            def _local_copy(
+                src_start=src_start,
+                dst_start=dst_start,
+                local_count=local_count,
+                e_sem_id=e_sem_id,
+            ):
+                pltpu.make_async_copy(
+                    src_ref=sorted_tokens_hbm.at[pl.ds(src_start, local_count)],
+                    dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(dst_start, local_count)],
+                    sem=recv_x2_sems.at[e_sem_id],
+                ).start()
 
-        send_sz = lax.fori_loop(
-            0,
-            bt,
-            _scatter_one,
-            jnp.int32(0),
-            unroll=False,
-        )
+            @pl.when(remote_count != 0)
+            def _remote_copy(
+                src_start=src_start,
+                dst_start=dst_start,
+                remote_count=remote_count,
+                e_sem_id=e_sem_id,
+                dev_id=dev_id,
+            ):
+                pltpu.make_async_remote_copy(
+                    src_ref=sorted_tokens_hbm.at[pl.ds(src_start, remote_count)],
+                    dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(dst_start, remote_count)],
+                    send_sem=send_x2_sems.at[e_sem_id],
+                    recv_sem=recv_x2_sems.at[e_sem_id],
+                    device_id=get_mesh_device_id(jnp.int32(dev_id)),
+                    device_id_type=pltpu.DeviceIdType.MESH,
+                ).start()
+
         a2a_s_sends_x2_smem[e_sem_id] = send_sz
 
     def wait_a2a_scatter_recv(*, bt_sem_id, e_sem_id, local_e_id):
@@ -2238,6 +2231,16 @@ def _fused_ep_moe_kernel(
         )
         sync_barrier()
 
+        # Pre-compute per-expert source positions in sorted_tokens for bulk scatter.
+        # This is a prefix sum of local expert counts: O(num_experts) scalar ops,
+        # replacing O(bt * top_k) = O(2048) scalar ops per scatter call.
+        tile_base = bt_start * top_k
+        running_sum = jnp.int32(0)
+        for _e in range(num_experts):
+            sorted_scatter_starts_x2_smem[bt_sem_id, 0, _e] = tile_base + running_sum
+            count_e = d2e_count_x2_smem[bt_sem_id, my_id, 0, _e]
+            running_sum = running_sum + count_e
+
         wait_store_output(bt_id=bt_id - 2)
 
         start_a2a_scatter(bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=0, bt_start=bt_start)
@@ -2764,6 +2767,7 @@ def fused_ep_moe(
         pltpu.SMEM((2, 1, padded_num_experts), jnp.int32),  # expert_starts_x2_smem
         pltpu.SMEM((2, 1, padded_num_experts), jnp.int32),  # expert_sizes_x2_smem
         pltpu.SMEM((2,), jnp.int32),  # a2a_s_sends_x2_smem
+        pltpu.SMEM((2, 1, padded_num_experts), jnp.int32),  # sorted_scatter_starts_x2_smem
         pltpu.VMEM(
             (2, top_k, math.gcd(bt, 16), t_packing, hidden_per_pack),
             t_dtype,
@@ -2870,6 +2874,7 @@ def fused_ep_moe(
                     None if b3 is None else hbm_block_spec,  # b3_hbm
                     hbm_block_spec,  # topk_weights_hbm
                     hbm_block_spec,  # topk_ids_hbm
+                    hbm_block_spec,  # sorted_tokens_hbm
                     hbm_block_spec,  # a2a_s_x2_hbm
                     hbm_block_spec,  # a2a_s_acc_x2_hbm
                     hbm_block_spec,  # a2a_g_hbm
@@ -2993,6 +2998,27 @@ def fused_ep_moe(
         w3_shared_scale=None,
         w2_shared_scale=None,
     ):
+        # Pre-sort tokens by (tile_id, expert_id) for bulk scatter DMA.
+        # This creates a sorted token array where each expert's tokens are
+        # contiguous, enabling O(num_devices) bulk DMA per expert instead of
+        # O(bt * top_k) per-token scalar scatter.
+        active_ids = topk_ids[:, :top_k]  # (local_num_tokens, top_k) int32
+        flat_ids = active_ids.reshape(-1)  # (local_num_tokens * top_k,)
+
+        token_flat_idx = jnp.arange(local_num_tokens * top_k, dtype=jnp.int32)
+        orig_token_idx = token_flat_idx // top_k
+        tile_ids_arr = orig_token_idx // bt
+
+        # Map invalid expert_ids (-1) to num_experts so they sort to end of each tile
+        safe_ids = jnp.where(flat_ids >= 0, flat_ids, jnp.int32(num_experts))
+        sort_keys = tile_ids_arr * (num_experts + 1) + safe_ids
+
+        sorted_order = jnp.argsort(sort_keys, stable=True)
+        sorted_token_idx = sorted_order // top_k
+
+        # Gather tokens in sorted order
+        sorted_tokens = tokens[sorted_token_idx]
+
         local_output = fused_moe(
             pltpu.with_memory_space_constraint(tokens, pltpu.HBM),  # tokens_hbm
             pltpu.with_memory_space_constraint(w1, pltpu.HBM),  # w1_hbm
@@ -3018,6 +3044,7 @@ def fused_ep_moe(
             (None if b3 is None else pltpu.with_memory_space_constraint(b3, pltpu.HBM)),  # b3_hbm
             pltpu.with_memory_space_constraint(topk_weights, pltpu.HBM),  # topk_weights_hbm
             pltpu.with_memory_space_constraint(topk_ids, pltpu.HBM),  # topk_ids_hbm
+            pltpu.with_memory_space_constraint(sorted_tokens, pltpu.HBM),  # sorted_tokens_hbm
             pltpu.with_memory_space_constraint(a2a_s_x2_hbm_scratch, pltpu.HBM),  # a2a_s_x2_hbm
             pltpu.with_memory_space_constraint(
                 a2a_s_acc_x2_hbm_scratch, pltpu.HBM
