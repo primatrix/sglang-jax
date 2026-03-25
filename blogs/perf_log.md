@@ -26,6 +26,7 @@ python -m benchmark.moe.bench_fused_moe_kernel --iters 5
 | R5 | Unroll 3 static fori_loops (prefix sum + gather acc) | 0.298 | -0.3% | 20/20 PASS | bfe353e3 |
 | R6 | Pre-compute allgather metadata in JAX layer | 0.289 | -3.0% | 20/20 PASS | 62c43de0 |
 | R7 | Bulk DMA wait in acc_and_store_output | 0.287 | -0.7% | 20/20 PASS | TBD |
+| R8 | Skip last sync_barrier in run_bt | 0.286 | -0.3% | 20/20 PASS | TBD |
 
 ## 详细记录
 
@@ -113,3 +114,14 @@ python -m benchmark.moe.bench_fused_moe_kernel --iters 5
 - **samples**: [0.2869, 0.2878, 0.2862, 0.2862]
 - **变化**: -0.002ms (-0.7%)
 - **总变化**: -1.121ms (-79.6%) vs baseline
+
+### Round 8: Skip last sync_barrier in run_bt
+- **改动**: 将 `run_bt` 末尾的 `sync_barrier()` 改为 `@pl.when(bt_id + 1 < num_bt)` 条件执行：
+  - 最后一轮 bt 不需要 barrier（无后续 bt 需要同步）
+  - 所有跨设备通信已通过 wait_a2a_gather_recv_all + wait_a2a_gather_send 确保完成
+  - 对 num_bt=1 场景，直接省去一次 barrier (~2μs)
+- **精度测试**: 20/20 PASS (337s), 1 skipped
+- **性能测试**: mean=0.286ms, min=0.285ms, max=0.286ms
+- **samples**: [0.2857, 0.2855, 0.2862, 0.2851]
+- **变化**: -0.001ms (-0.3%)
+- **总变化**: -1.122ms (-79.7%) vs baseline

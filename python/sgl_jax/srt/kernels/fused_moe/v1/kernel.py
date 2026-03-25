@@ -2288,7 +2288,11 @@ def _fused_ep_moe_kernel(
             local_e_id=last1_local_e_id,
         )
 
-        sync_barrier()
+        # Only barrier between bt iterations; the last iteration needs no barrier
+        # because there's no subsequent bt that depends on cross-device state.
+        @pl.when(bt_id + 1 < num_bt)
+        def _():
+            sync_barrier()
         return final_e_sem_id
 
     lax.fori_loop(0, num_bt, run_bt, jnp.int32(0), unroll=False)
