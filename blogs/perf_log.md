@@ -20,7 +20,8 @@ python -m benchmark.moe.bench_fused_moe_kernel --iters 5
 |-------|---------|-----------------|------|------|--------|
 | R0 (baseline) | 未修改 | 1.408 | - | 20/20 PASS | - |
 | R1 | Pre-sort tokens + bulk scatter DMA | 1.319 | -6.3% | 20/20 PASS | 416634e6 |
-| R2 | Block config tuning: bt=64, bf=2048, bd1/bd2=1280 | 0.312 | -76.3% | 20/20 PASS | e455ab9e |
+| R2 | Block config tuning: bt=64, bf=2048, bd1/bd2=1280 | 0.312 | -76.3% | 20/20 PASS | 4c2b31de |
+| R3 | Remove 4 redundant sync_barriers | 0.307 | -1.6% | 20/20 PASS | TBD |
 
 ## 详细记录
 
@@ -50,3 +51,15 @@ python -m benchmark.moe.bench_fused_moe_kernel --iters 5
   - bt=64, bf=2048, bd1=1024: 0.321ms
   - bt=64, bf=2048, bd1=2560: VMEM OOM (74.28M > 64M)
   - bt=64, bf=2048, bd1=5120: VMEM OOM (135.71M > 64M)
+
+### Round 3: Remove 4 redundant sync_barriers
+- **改动**: 移除 4 个冗余的 sync_barrier:
+  1. all_reduce_metadata 内的 pre-allgather barrier（与 round 0 barrier 合并）
+  2. all_reduce_metadata 内的 post-allgather barrier（各设备 recv_wait 已保证本地数据一致）
+  3. all_reduce_metadata 后的 barrier（allreduce 内部已有足够同步）
+  4. wait_a2a_gather_recv_all 后的 barrier（gather recv 已完成，后续操作均为本地）
+- **精度测试**: 20/20 PASS (333s), 1 skipped
+- **性能测试**: mean=0.307ms, min=0.307ms, max=0.308ms
+- **samples**: [0.3065, 0.3076, 0.3070, 0.3067]
+- **变化**: -0.005ms (-1.6%)
+- **总变化**: -1.101ms (-78.2%) vs baseline

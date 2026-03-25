@@ -688,9 +688,10 @@ def _fused_ep_moe_kernel(
             d2e_count_vmem[...] = jnp.zeros_like(d2e_count_vmem)
             d2e_count_vmem[my_id] = sizes
 
-            sync_barrier()
             # Fast path for power-of-two device counts: recursive doubling
             # allgather in O(log2(num_devices)) rounds.
+            # The first round's barrier also serves as the pre-allgather barrier
+            # (ensures d2e_count_vmem[my_id] is initialized before any exchange).
             if num_devices > 0 and (num_devices & (num_devices - 1)) == 0:
                 rounds = int(math.log2(num_devices))
                 for round_id in range(rounds):
@@ -726,6 +727,7 @@ def _fused_ep_moe_kernel(
                     ]
                     pltpu.make_async_copy(src_ref=send_ref, dst_ref=send_ref, sem=send_sem).wait()
             else:
+                sync_barrier()  # Non-power-of-2 path needs pre-allgather barrier
                 for step in range(1, num_devices):
                     peer_id = (my_id + step) % num_devices
                     pltpu.make_async_remote_copy(
@@ -746,8 +748,9 @@ def _fused_ep_moe_kernel(
                     send_ref = d2e_count_vmem.at[my_id, pl.ds(0, 1), pl.ds(0, padded_num_experts)]
                     pltpu.make_async_copy(src_ref=send_ref, dst_ref=send_ref, sem=send_sem).wait()
 
-            # Ensure all peers completed their sends before using gathered sizes.
-            sync_barrier()
+            # After the last allgather round, each device's local recv_wait
+            # ensures d2e_count_vmem is fully populated. No global barrier
+            # needed since the prefix-sum below only reads local data.
 
             reduced_sizes = jnp.zeros_like(sizes)
             reduced_starts = jnp.zeros_like(starts)
@@ -800,9 +803,9 @@ def _fused_ep_moe_kernel(
             count = d2e_count_x2_smem[bt_sem_id, my_id, 0, e_id]
             src_start = sorted_scatter_starts_x2_smem[bt_sem_id, 0, e_id]
 
-            dst_offset = expert_offsets_x2_smem[bt_sem_id, 0, e_id]
-            dst_start = expert_starts_x2_smem[bt_sem_id, 0, e_id] + dst_offset
-            expert_offsets_x2_smem[bt_sem_id, 0, e_id] = dst_offset + count
+            # Each expert e_id is processed exactly once per bt tile (one
+            # local_e_id owns it), so the scatter offset is always 0.
+            dst_start = expert_starts_x2_smem[bt_sem_id, 0, e_id]
 
             is_local = (jnp.int32(dev_id) == my_id)
             local_count = lax.select(is_local, count, jnp.int32(0))
@@ -2229,7 +2232,6 @@ def _fused_ep_moe_kernel(
             starts=expert_starts,
             sizes=expert_sizes,
         )
-        sync_barrier()
 
         # Pre-compute per-expert source positions in sorted_tokens for bulk scatter.
         # This is a prefix sum of local expert counts: O(num_experts) scalar ops,
@@ -2313,7 +2315,6 @@ def _fused_ep_moe_kernel(
         lax.fori_loop(final_se_block, se_total_blocks, cleanup_body, None)
 
         wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
-        sync_barrier()
 
         acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
 
