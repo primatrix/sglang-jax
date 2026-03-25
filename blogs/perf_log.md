@@ -21,7 +21,8 @@ python -m benchmark.moe.bench_fused_moe_kernel --iters 5
 | R0 (baseline) | 未修改 | 1.408 | - | 20/20 PASS | - |
 | R1 | Pre-sort tokens + bulk scatter DMA | 1.319 | -6.3% | 20/20 PASS | 416634e6 |
 | R2 | Block config tuning: bt=64, bf=2048, bd1/bd2=1280 | 0.312 | -76.3% | 20/20 PASS | 4c2b31de |
-| R3 | Remove 4 redundant sync_barriers | 0.307 | -1.6% | 20/20 PASS | TBD |
+| R3 | Remove 4 redundant sync_barriers | 0.307 | -1.6% | 20/20 PASS | 9624b5d3 |
+| R4 | Asymmetric block config: bd1=2560 (num_bd1: 4→2) | 0.299 | -2.6% | 20/20 PASS | TBD |
 
 ## 详细记录
 
@@ -63,3 +64,11 @@ python -m benchmark.moe.bench_fused_moe_kernel --iters 5
 - **samples**: [0.3065, 0.3076, 0.3070, 0.3067]
 - **变化**: -0.005ms (-1.6%)
 - **总变化**: -1.101ms (-78.2%) vs baseline
+
+### Round 4: Asymmetric block config (bd1=2560, bd2=1280)
+- **改动**: 使用非对称 block config，bd1=2560 (gate/up projection 从 4 tiles 降为 2 tiles)，bd2=1280 (down projection 保持 4 tiles)。bd1=2560 接近 VMEM 上限，需要 bd2 < bd1 才能编译成功。
+- **精度测试**: 20/20 PASS (333s), 1 skipped
+- **性能测试**: mean=0.299ms, min=0.297ms, max=0.300ms
+- **samples**: [0.2987, 0.2974, 0.2990, 0.2996]
+- **变化**: -0.008ms (-2.6%)
+- **总变化**: -1.109ms (-78.8%) vs baseline
