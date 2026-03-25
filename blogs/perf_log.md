@@ -20,6 +20,7 @@ python -m benchmark.moe.bench_fused_moe_kernel --iters 5
 |-------|---------|-----------------|------|------|--------|
 | R0 (baseline) | 未修改 | 1.408 | - | 20/20 PASS | - |
 | R1 | Pre-sort tokens + bulk scatter DMA | 1.319 | -6.3% | 20/20 PASS | 416634e6 |
+| R2 | Block config tuning: bt=32→64 (num_bt=2→1) | 0.664 | -49.7% | 20/20 PASS | TBD |
 
 ## 详细记录
 
@@ -34,3 +35,10 @@ python -m benchmark.moe.bench_fused_moe_kernel --iters 5
 - **性能测试**: mean=1.319ms, min=1.317ms, max=1.321ms
 - **samples**: [1.3206, 1.3175, 1.3186, 1.3204]
 - **变化**: -0.089ms (-6.3%)
+
+### Round 2: Block config tuning (bt=32→64, num_bt=2→1)
+- **改动**: 为目标 shape (512, 64, 8, 5120, 2048, ep=8) 添加 tuned block config，bt=64 使 num_bt 从 2 降为 1，消除一次完整外层循环 (all-reduce + scatter + FFN pipeline + gather + barriers)
+- **精度测试**: 20/20 PASS (335s), 1 skipped
+- **性能测试**: mean=0.664ms, min=0.663ms, max=0.664ms
+- **samples**: [0.6642, 0.6633, 0.6641, 0.6634]
+- **变化**: -0.655ms (-49.7%)
