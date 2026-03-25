@@ -22,7 +22,8 @@ python -m benchmark.moe.bench_fused_moe_kernel --iters 5
 | R1 | Pre-sort tokens + bulk scatter DMA | 1.319 | -6.3% | 20/20 PASS | 416634e6 |
 | R2 | Block config tuning: bt=64, bf=2048, bd1/bd2=1280 | 0.312 | -76.3% | 20/20 PASS | 4c2b31de |
 | R3 | Remove 4 redundant sync_barriers | 0.307 | -1.6% | 20/20 PASS | 9624b5d3 |
-| R4 | Asymmetric block config: bd1=2560 (num_bd1: 4→2) | 0.299 | -2.6% | 20/20 PASS | TBD |
+| R4 | Asymmetric block config: bd1=2560 (num_bd1: 4→2) | 0.299 | -2.6% | 20/20 PASS | ad780690 |
+| R5 | Unroll 3 static fori_loops (prefix sum + gather acc) | 0.298 | -0.3% | 20/20 PASS | bfe353e3 |
 
 ## 详细记录
 
@@ -72,3 +73,18 @@ python -m benchmark.moe.bench_fused_moe_kernel --iters 5
 - **samples**: [0.2987, 0.2974, 0.2990, 0.2996]
 - **变化**: -0.008ms (-2.6%)
 - **总变化**: -1.109ms (-78.8%) vs baseline
+
+### Round 5: Unroll 3 static fori_loops
+- **改动**: 将 3 个静态边界 fori_loop 改为 unroll=True，消除标量循环控制流开销:
+  1. `_compute_sorted_starts`: 64 次 prefix sum 循环（每次写 SMEM + 读 SMEM + 加法）
+  2. `start_load_acc_bt._load_one`: 16 次 gather DMA 启动循环（每次读 SMEM + 启动 8 个 DMA）
+  3. `wait_load_acc_bt._count_valid`: 16 次有效 token 计数循环
+- **精度测试**: 20/20 PASS (347s), 1 skipped
+- **性能测试**: mean=0.298ms, min=0.297ms, max=0.299ms
+- **samples**: [0.2976, 0.2983, 0.2978, 0.2970, 0.2981, 0.2980, 0.2981, 0.2975, 0.2990]
+- **变化**: -0.001ms (-0.3%)
+- **总变化**: -1.110ms (-78.8%) vs baseline
+- **未生效的尝试**:
+  - DMA priority=1 on weight fetches: 0.318ms (regression +6.3%，scatter/gather 被降优先级延迟)
+  - Earlier weight prefetch (bd2 second-to-last): 0.300ms (无变化)
+  - wait_a2a_gather_recv_all unroll=True: 无额外改善

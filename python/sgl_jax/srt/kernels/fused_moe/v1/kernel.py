@@ -1944,7 +1944,7 @@ def _fused_ep_moe_kernel(
 
                 return None
 
-            lax.fori_loop(0, acc_bt, _load_one, None, unroll=False)
+            lax.fori_loop(0, acc_bt, _load_one, None, unroll=True)
 
         def wait_load_acc_bt(*, buf_id, tile_start):
             # If this acc tile contains zero valid tokens, `start_load_acc_bt` does not
@@ -1960,7 +1960,7 @@ def _fused_ep_moe_kernel(
                 acc_bt,
                 _count_valid,
                 jnp.int32(0),
-                unroll=False,
+                unroll=True,
             )
 
             @pl.when(num_valid != 0)
@@ -2243,7 +2243,7 @@ def _fused_ep_moe_kernel(
             count_e = d2e_count_x2_smem[bt_sem_id, my_id, 0, _e]
             return running_sum + count_e
 
-        lax.fori_loop(0, num_experts, _compute_sorted_starts, jnp.int32(0), unroll=False)
+        lax.fori_loop(0, num_experts, _compute_sorted_starts, jnp.int32(0), unroll=True)
 
         wait_store_output(bt_id=bt_id - 2)
 
