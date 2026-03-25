@@ -24,6 +24,7 @@ python -m benchmark.moe.bench_fused_moe_kernel --iters 5
 | R3 | Remove 4 redundant sync_barriers | 0.307 | -1.6% | 20/20 PASS | 9624b5d3 |
 | R4 | Asymmetric block config: bd1=2560 (num_bd1: 4→2) | 0.299 | -2.6% | 20/20 PASS | ad780690 |
 | R5 | Unroll 3 static fori_loops (prefix sum + gather acc) | 0.298 | -0.3% | 20/20 PASS | bfe353e3 |
+| R6 | Pre-compute allgather metadata in JAX layer | 0.289 | -3.0% | 20/20 PASS | 62c43de0 |
 
 ## 详细记录
 
@@ -88,3 +89,15 @@ python -m benchmark.moe.bench_fused_moe_kernel --iters 5
   - DMA priority=1 on weight fetches: 0.318ms (regression +6.3%，scatter/gather 被降优先级延迟)
   - Earlier weight prefetch (bd2 second-to-last): 0.300ms (无变化)
   - wait_a2a_gather_recv_all unroll=True: 无额外改善
+
+### Round 6: Pre-compute allgather metadata in JAX layer
+- **改动**: 将 O(log2(num_devices))=O(3) 轮 recursive doubling allgather 从 Pallas kernel 移至 JAX 图层：
+  - 在 shard_map 内用 `jax.nn.one_hot` + `jax.lax.all_gather` 预计算 per-bt-tile 的 d2e_count, expert_starts, expert_sizes
+  - 打包为 `ep_metadata_hbm` (num_bt, num_devices+2, 1, padded_num_experts) 传入 kernel
+  - kernel 内 `all_reduce_metadata` 从 3 轮 remote copy + 3 sync_barrier 简化为 3 次 HBM→VMEM DMA + VMEM→SMEM copy
+  - 修复 semaphore race: HBM→VMEM DMA 使用独立 local_sem 避免与 VMEM→SMEM 的 send_sem 计数器冲突
+- **精度测试**: 20/20 PASS (341s), 1 skipped
+- **性能测试**: mean=0.289ms, min=0.288ms, max=0.290ms
+- **samples**: [0.2888, 0.2897, 0.2890, 0.2877]
+- **变化**: -0.009ms (-3.0%)
+- **总变化**: -1.119ms (-79.5%) vs baseline
