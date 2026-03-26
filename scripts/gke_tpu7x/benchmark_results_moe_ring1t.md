@@ -65,25 +65,25 @@ python3 -u /tmp/launcher.py scripts/gke_tpu7x/bench_tpu_inference_moe.py \
 
 **sglang-jax tuning:** Adapted from Ring-1T (256 experts, ep=32) by mapping `local_num_tokens = num_tokens / ep_size`.
 
-**tpu-inference tuning:** Grid search over (bt, bf, bd1, bd2, btc, bfc, bd1c, bd2c) with VMEM budget filtering (58 MB for TPU v7 64 MB VMEM). Tuned via `scripts/gke_tpu7x/tune_tpu_inference_moe.py`.
+**tpu-inference tuning:** Comprehensive grid search over (bt, bf, bd1, bd2, btc) with VMEM budget filtering (58 MB for TPU v7 64 MB VMEM), stratified sampling across bt values, 40 configs per token count. Tuned via `scripts/gke_tpu7x/tune_tpu_inference_moe.py`.
 
 | num_tokens | sglang-jax tuned (ms) | tpu-inference tuned (ms) | sglang-jax speedup |
 |:----------:|:---------------------:|:------------------------:|:------------------:|
-| 64         | 0.300                 | 1.539                    | **5.1x**           |
-| 128        | 0.329                 | 1.563                    | **4.8x**           |
-| 256        | 0.522                 | 1.893                    | **3.6x**           |
-| 512        | 0.667                 | 2.443                    | **3.7x**           |
-| 1024       | 1.144                 | 4.422                    | **3.9x**           |
+| 64         | 0.300                 | 1.458                    | **4.9x**           |
+| 128        | 0.329                 | 1.527                    | **4.6x**           |
+| 256        | 0.522                 | 1.855                    | **3.6x**           |
+| 512        | 0.667                 | 2.322                    | **3.5x**           |
+| 1024       | 1.144                 | 4.375                    | **3.8x**           |
 
-**With both kernels tuned, sglang-jax is 3.6-5.1x faster than tpu-inference.**
+**With both kernels tuned, sglang-jax is 3.5-4.9x faster than tpu-inference.**
 
 #### tpu-inference tuned block configs
 
 | num_tokens | bt | bf | bd1 | bd2 | btc | bfc | bd1c | bd2c | VMEM (MB) |
 |:----------:|:--:|:--:|:---:|:---:|:---:|:---:|:----:|:----:|:---------:|
-| 64         | 8  | 2048 | 2048 | 2048 | 8 | 2048 | 2048 | 2048 | 54.3 |
-| 128        | 16 | 2048 | 512 | 4096 | 2 | 2048 | 512 | 4096 | 52.5 |
-| 256        | 32 | 2048 | 512 | 2048 | 32 | 2048 | 256 | 256 | 57.0 |
+| 64         | 8  | 2048 | 2048 | 2048 | 4 | 2048 | 2048 | 2048 | 54.3 |
+| 128        | 4  | 2048 | 2048 | 2048 | 4 | 2048 | 2048 | 2048 | 51.1 |
+| 256        | 32 | 2048 | 512 | 2048 | 32 | 2048 | 512 | 2048 | 49.0 |
 | 512        | 64 | 1024 | 512 | 1024 | 64 | 1024 | 512 | 1024 | 54.0 |
 | 1024       | 64 | 1024 | 512 | 1024 | 64 | 1024 | 512 | 1024 | 54.0 |
 
@@ -91,6 +91,7 @@ Key observations:
 - tpu-inference is VMEM-constrained: bt maxes out at 64 for 512+ tokens, and bf drops to 1024
 - 512/1024 tokens now compile (previously failed with default configs) by using smaller block sizes
 - The 1024t config reuses 512t's config because bt=128 would exceed VMEM budget
+- bt < 8 causes MosaicError (tile alignment) for 256+ tokens — an additional constraint beyond VMEM
 
 ### Notes
 
@@ -313,7 +314,7 @@ The trace viewer uses keyboard shortcuts (scroll wheel does NOT zoom):
 
 ## Conclusions
 
-1. **With both kernels tuned, sglang-jax is 3.6-5.1x faster** than tpu-inference on the Ring-1T MoE config (64 experts, top_k=8, hidden=8192, intermediate=2048, ep=8).
+1. **With both kernels tuned, sglang-jax is 3.5-4.9x faster** than tpu-inference on the Ring-1T MoE config (64 experts, top_k=8, hidden=8192, intermediate=2048, ep=8).
 
 2. **Tuning is critical for both kernels.** sglang-jax default→tuned: 1.8-3.4x faster. tpu-inference default→tuned: fixes compilation failures at 512/1024t and improves 64-256t by ~1.5x.
 

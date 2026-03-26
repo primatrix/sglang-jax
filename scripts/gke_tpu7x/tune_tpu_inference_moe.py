@@ -82,14 +82,16 @@ def generate_valid_configs(
     t_packing: int = 2,
     vmem_budget: int = 58 * 1024 * 1024,  # 58 MB conservative (actual TPU v7 VMEM = 64 MB)
 ) -> list[dict]:
-    """Generate VMEM-safe block configs for the given shape."""
+    """Generate VMEM-safe block configs for the given shape.
+
+    Strategy: enumerate all valid (bt, bf, bd1, bd2) combos that fit in VMEM,
+    then for each combo generate compute tile variants (btc, bfc, bd1c, bd2c).
+    """
     # bt candidates: must divide local_num_tokens, be multiple of t_packing
-    bt_candidates = []
-    for bt in [2, 4, 8, 16, 32, 64, 128, 256]:
-        if bt > local_num_tokens:
-            break
-        if local_num_tokens % bt == 0 and bt % t_packing == 0:
-            bt_candidates.append(bt)
+    bt_candidates = [bt for bt in [2, 4, 8, 16, 32, 64, 128, 256]
+                     if bt <= local_num_tokens
+                     and local_num_tokens % bt == 0
+                     and bt % t_packing == 0]
 
     # bf candidates: must divide intermediate_size, be multiple of 128
     bf_candidates = [v for v in [128, 256, 512, 1024, 2048]
@@ -109,40 +111,35 @@ def generate_valid_configs(
         if vmem > vmem_budget:
             continue
 
-        # btc: must divide bt
-        btc_candidates = [v for v in [2, 4, 8, 16, 32, 64, 128] if v <= bt and bt % v == 0]
+        # Generate a few representative compute tile combos:
+        # btc: divisors of bt
+        btc_all = [v for v in [2, 4, 8, 16, 32, 64, 128] if v <= bt and bt % v == 0]
+        # Pick max, half, and min btc
+        btc_set = {max(btc_all), min(btc_all)}
+        mid = btc_all[len(btc_all) // 2]
+        btc_set.add(mid)
 
-        # Compute tile candidates for bd1c/bd2c (must be multiple of 256, divide bd)
-        bd1c_candidates = [v for v in [256, 512, 1024, 2048, 4096, 8192]
-                           if v <= bd1 and bd1 % v == 0 and v % (t_packing * 128) == 0]
-        bd2c_candidates = [v for v in [256, 512, 1024, 2048, 4096, 8192]
-                           if v <= bd2 and bd2 % v == 0 and v % (t_packing * 128) == 0]
-
-        # bfc: must be multiple of 128, divide bf
-        bfc_candidates = [v for v in [128, 256, 512, 1024, 2048]
-                          if v <= bf and bf % v == 0 and v % 128 == 0]
-
-        # Only try a few representative combos to keep search manageable:
-        # 1. Full compute tiles (bXc = bX) with max btc
-        # 2. Full compute tiles with btc = bt//2
-        # 3. Smaller compute tiles with full btc
-        for btc in [max(btc_candidates), min(btc_candidates)]:
-            for bd1c in [bd1, min(bd1c_candidates)]:
-                for bd2c in [bd2, min(bd2c_candidates)]:
-                    for bfc in [bf]:
-                        configs.append({
-                            "bt": bt, "bf": bf, "bd1": bd1, "bd2": bd2,
-                            "btc": btc, "bfc": bfc,
-                            "bd1c": bd1c, "bd2c": bd2c,
-                            "vmem_mb": vmem / (1024 * 1024),
-                        })
+        # bd1c/bd2c: just use bd1/bd2 (full tile) — the kernel already loops internally
+        # bfc: just use bf
+        for btc in sorted(btc_set, reverse=True):
+            configs.append({
+                "bt": bt, "bf": bf, "bd1": bd1, "bd2": bd2,
+                "btc": btc, "bfc": bf, "bd1c": bd1, "bd2c": bd2,
+                "vmem_mb": vmem / (1024 * 1024),
+            })
 
     return configs
 
 
-def pareto_filter(configs: list[dict], max_configs: int = 15) -> list[dict]:
-    """Keep a diverse set of configs."""
-    # Deduplicate by all 8 block params
+def pareto_filter(configs: list[dict], max_configs: int = 40) -> list[dict]:
+    """Select a diverse set of configs that covers the search space well.
+
+    Strategy:
+    1. Deduplicate by all 8 block params
+    2. Group by (bt, bf, bd1, bd2) — only keep the best btc per group (= max btc)
+    3. Ensure diversity across bt, bf, and bd values
+    """
+    # Deduplicate
     seen = set()
     unique = []
     for c in configs:
@@ -151,14 +148,47 @@ def pareto_filter(configs: list[dict], max_configs: int = 15) -> list[dict]:
         if key not in seen:
             seen.add(key)
             unique.append(c)
-    configs = unique
 
-    if len(configs) <= max_configs:
-        return configs
+    # Group by (bt, bf, bd1, bd2), keep top 2 btc variants per group
+    groups: dict[tuple, list[dict]] = {}
+    for c in unique:
+        gkey = (c["bt"], c["bf"], c["bd1"], c["bd2"])
+        groups.setdefault(gkey, []).append(c)
 
-    # Sort by bt desc (larger bt = better token throughput), then bf desc
-    configs.sort(key=lambda x: (-x["bt"], -x["bf"], -x["bd1"] * x["bd2"]))
-    return configs[:max_configs]
+    representatives = []
+    for gkey, group in groups.items():
+        group.sort(key=lambda x: -x["btc"])  # prefer larger btc
+        representatives.extend(group[:2])  # keep top 2 btc per (bt,bf,bd1,bd2)
+
+    if len(representatives) <= max_configs:
+        return representatives
+
+    # Stratified sampling: ensure we cover different bt and bf values
+    # Sort by bt desc, then bf desc, then bd1*bd2 desc
+    representatives.sort(key=lambda x: (-x["bt"], -x["bf"], -x["bd1"] * x["bd2"]))
+
+    # Ensure at least 2 configs per unique bt value
+    by_bt: dict[int, list[dict]] = {}
+    for c in representatives:
+        by_bt.setdefault(c["bt"], []).append(c)
+
+    selected = []
+    # First pass: take top configs per bt
+    per_bt = max(2, max_configs // len(by_bt))
+    for bt_val in sorted(by_bt.keys(), reverse=True):
+        selected.extend(by_bt[bt_val][:per_bt])
+
+    # Deduplicate and trim
+    seen2 = set()
+    final = []
+    for c in selected:
+        key = (c["bt"], c["bf"], c["bd1"], c["bd2"],
+               c["btc"], c["bfc"], c["bd1c"], c["bd2c"])
+        if key not in seen2:
+            seen2.add(key)
+            final.append(c)
+
+    return final[:max_configs]
 
 
 def build_mesh(ep_size: int) -> Mesh:
