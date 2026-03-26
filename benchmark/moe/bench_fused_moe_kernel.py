@@ -45,11 +45,14 @@ def run_benchmark(
     profile: bool = False,
     profile_dir: str = "profile_fused_moe_kernel",
     imbalance_mode: str = "balanced",
+    weight_dtype_str: str = "bfloat16",
 ):
     ep_size = len(jax.devices())
+    weight_dtype = {"bfloat16": jnp.bfloat16, "float8_e4m3fn": jnp.float8_e4m3fn}[weight_dtype_str]
     print(f"Fused MoE Kernel Benchmark")
     print(f"  tokens={num_tokens}, experts={num_experts}, top_k={top_k}")
     print(f"  hidden={hidden_size}, intermediate={intermediate_size}, ep_size={ep_size}")
+    print(f"  weight_dtype={weight_dtype_str}")
     print(f"  iters={iters}, warmup={warmup_iters}, profile={profile}")
 
     case = MoEBenchmarkCase(
@@ -69,7 +72,7 @@ def run_benchmark(
     print(f"  mesh: {mesh.shape}")
 
     data = prepare_fused_moe_inputs(
-        case, weight_dtype=jnp.bfloat16, mesh=mesh,
+        case, weight_dtype=weight_dtype, mesh=mesh,
         include_weights=False, include_shared_expert=False,
     )
 
@@ -93,7 +96,7 @@ def run_benchmark(
             ep_size=ep_size,
             mesh=mesh,
             intermediate_dim=intermediate_size,
-            weight_dtype=jnp.bfloat16,
+            weight_dtype=weight_dtype,
             dtype=jnp.bfloat16,
             activation="silu",
             layer_id=0,
@@ -189,6 +192,8 @@ def parse_args():
     parser.add_argument("--intermediate-size", type=int, default=2048)
     parser.add_argument("--imbalance-mode", type=str, default="balanced",
                         choices=["balanced", "dirichlet", "zipf", "hotspot", "sparse_hotspot"])
+    parser.add_argument("--weight-dtype", type=str, default="bfloat16",
+                        choices=["bfloat16", "float8_e4m3fn"])
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-dir", type=str, default="profile_fused_moe_kernel")
     return parser.parse_args()
@@ -207,4 +212,5 @@ if __name__ == "__main__":
         profile=args.profile,
         profile_dir=args.profile_dir,
         imbalance_mode=args.imbalance_mode,
+        weight_dtype_str=args.weight_dtype,
     )
