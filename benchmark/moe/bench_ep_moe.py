@@ -26,6 +26,7 @@ from benchmark.moe.utils import (
     select_cases,
 )
 from benchmark.utils import multiple_iteration_timeit_from_trace
+from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 from sgl_jax.srt.layers.moe import EPMoE, TopK
 
 
@@ -60,7 +61,9 @@ def run_all(
     scenario: str,
     iters: int,
     dtype: jnp.dtype = jnp.bfloat16,
+    weight_dtype: jnp.dtype = jnp.bfloat16,
     *,
+    warmup_iters: int = 1,
     num_tokens: list[int] | None = None,
     num_experts: int = 256,
     top_k: int = 8,
@@ -86,7 +89,17 @@ def run_all(
     )
     cases = list(select_cases(raw_cases))
 
-    print(f"Running ep_moe benchmarks with scenario='{scenario}', dtype={dtype}")
+    if weight_dtype == jnp.float8_e4m3fn:
+        quantization_config = QuantizationConfig(
+            moe_weight_dtype=weight_dtype,
+            moe_activation_dtype=None,
+        )
+    else:
+        quantization_config = None
+
+    print(
+        f"Running ep_moe benchmarks with scenario='{scenario}', dtype={dtype}, weight_dtype={weight_dtype}"
+    )
     for case in cases:
         assert case.ep_size is not None
         assert case.tp_size is not None
@@ -124,7 +137,10 @@ def run_all(
                 dtype=dtype,
                 activation=case.activation,
                 layer_id=0,
+                quantization_config=quantization_config,
             )
+            if quantization_config is not None:
+                ep_moe_layer.quantize_weights()
 
             # Avoid capturing massive expert weights as XLA constants: split NNx modules
             # into (def, state) and pass the state leaves as explicit jitted inputs.
@@ -163,6 +179,7 @@ def run_all(
                 data_generator=lambda: (),
                 task=f"ep_moe_{case.name}",
                 tries=iters,
+                warmup=warmup_iters,
             )
             if len(times) > 1:
                 times = times[1:]
@@ -179,6 +196,19 @@ def parse_args() -> argparse.Namespace:
         help="Router logits distribution pattern.",
     )
     parser.add_argument("--iters", type=int, default=3, help="Number of benchmark iterations.")
+    parser.add_argument(
+        "--warmup-iters",
+        type=int,
+        default=1,
+        help="Number of warmup iterations before profiling (per case).",
+    )
+    parser.add_argument(
+        "--weight-dtype",
+        type=str,
+        default="bfloat16",
+        help="Weight data type to benchmark.",
+        choices=["bfloat16", "float8_e4m3fn"],
+    )
     parser.add_argument(
         "--num-tokens",
         type=int,
@@ -210,11 +240,18 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
+    DTYPE_MAP = {
+        "bfloat16": jnp.bfloat16,
+        "float8_e4m3fn": jnp.float8_e4m3fn,
+    }
+    weight_dtype = DTYPE_MAP[args.weight_dtype]
     if args.compilation_cache_dir:
         _compilation_cache.set_cache_dir(args.compilation_cache_dir)
     run_all(
         args.scenario,
         args.iters,
+        weight_dtype=weight_dtype,
+        warmup_iters=args.warmup_iters,
         num_tokens=args.num_tokens,
         num_experts=args.num_experts,
         top_k=args.top_k,
