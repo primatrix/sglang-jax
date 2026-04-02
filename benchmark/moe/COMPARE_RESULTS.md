@@ -111,7 +111,7 @@ FusedMoEBlockConfig(
 
 配置: `hotspot_count=128, hotspot_ratio=0.667` (128 个热专家获得 2/3 总流量)
 
-### EPMoE vs Default FusedEPMoE under Hotspot
+### 4a. EPMoE vs Default FusedEPMoE under Hotspot
 
 | tokens | EPMoE (ms) | Fused-Default (ms) | Speedup |
 |--------|-----------|-------------------|---------|
@@ -125,22 +125,44 @@ FusedMoEBlockConfig(
 | 4096 | 4.409 | 11.099 | 0.40x |
 | 8192 | 8.378 | 21.124 | 0.40x |
 
-**Geo-mean: 0.57x (EPMoE wins — FusedEPMoE 在 imbalanced 下更差)**
+**Geo-mean: 0.57x (EPMoE wins — default FusedEPMoE 在 imbalanced 下更差)**
+
+### 4b. EPMoE vs Tuned FusedEPMoE under Hotspot
+
+测试 Round 2 最优 tuned configs 在同一 hotspot 条件下的性能。
+
+| tokens | EPMoE (ms) | tuned_small | tuned_medium | tuned_large | base_btc32 | best Fused | Speedup |
+|--------|-----------|------------|-------------|------------|-----------|-----------|---------|
+| 128 | 1.082 | 1.302 | 1.292 | **1.280** | 1.282 | 1.280 | 0.84x |
+| 256 | 1.195 | 1.453 | 1.305 | **1.282** | 1.457 | 1.282 | 0.93x |
+| 512 | 1.439 | 1.792 | 1.402 | 1.411 | **1.379** | 1.379 | **1.04x** |
+| 1024 | 1.918 | 2.024 | 1.942 | 1.932 | **1.925** | 1.925 | 1.00x |
+| 2048 | 2.752 | 3.073 | 3.097 | 2.991 | **2.897** | 2.897 | 0.95x |
+| 4096 | 4.605 | 5.650 | 5.514 | 5.454 | **5.284** | 5.284 | 0.87x |
+| 8192 | 8.425 | 10.181 | 9.797 | 9.733 | **9.008** | 9.008 | 0.94x |
+
+**Geo-mean: 0.94x (EPMoE wins — tuned FusedEPMoE 在 hotspot 下仍然不如 EPMoE)**
+
+**关键发现:**
+- btc=32 (`base_btc32`) 在 hotspot 下反而优于 btc=16 的 tuned configs（与 balanced 结论相反）
+- Balanced 下 1.23x 的 Fused 优势在 hotspot 下逆转为 0.94x 的 EPMoE 优势
+- 仅 512 tokens 时 Fused 微弱胜出 (1.04x)
 
 ### Balanced vs Hotspot 影响对比
 
-| tokens | EPMoE 变化 | FusedEPMoE(default) 变化 |
-|--------|----------|----------------------|
-| 32 | -6% | +9% |
-| 128 | +5% | -1% |
-| 512 | +2% | -1% |
-| 1024 | +3% | +18% |
-| 2048 | +10% | +25% |
-| 4096 | +2% | **+32%** |
-| 8192 | +3% | **+42%** |
+| tokens | EPMoE 变化 | FusedEPMoE(default) 变化 | FusedEPMoE(tuned) 变化 |
+|--------|----------|----------------------|---------------------|
+| 128 | +5% → +25% | -1% | +72% |
+| 256 | — | — | +65% |
+| 512 | +2% | -1% | +73% |
+| 1024 | +3% | +18% | +58% |
+| 2048 | +10% | +25% | +42% |
+| 4096 | +2% | **+32%** | +44% |
+| 8192 | +3% | **+42%** | +29% |
 
-- **EPMoE**: 通信为 replicate+psum（与 routing 分布无关），对 imbalance 不敏感 (±2-10%)
-- **FusedEPMoE**: all-to-all DMA 不均衡 + pipeline stall，大 token 下退化 20-42%
+- **EPMoE**: 通信为 replicate+psum（与 routing 分布无关），对 imbalance 不敏感 (±5-25%)
+- **FusedEPMoE (tuned)**: 小 token 退化 65-73%，大 token 退化 29-44%
+- **btc=16 在 hotspot 下更敏感**: pipeline 迭代次数增加放大了 DMA 等待时间
 
 ## 结论
 
@@ -148,9 +170,9 @@ FusedMoEBlockConfig(
 
 默认 FusedEPMoE config 在 v6e + MiMo-V2-Flash shape 下完全未优化，导致 FusedEPMoE 比 EPMoE 慢 37-60%。经过三轮 tuning 后反而快 2-55%。
 
-### 2. btc=16 是关键优化
+### 2. btc=16 是关键优化（仅限 Balanced）
 
-Deep tuning 发现将 token compute tile 从 btc=32 降到 btc=16，在 ≥512 tokens 下带来 5-32% 的提升。这是因为更小的 btc 减少了 expert FFN 内的 VMEM 压力，让 MXU pipeline 更高效。
+Deep tuning 发现将 token compute tile 从 btc=32 降到 btc=16，在 ≥512 tokens 下带来 5-32% 的提升。但在 hotspot imbalance 下，btc=16 反而不如 btc=32 — 更多 pipeline 迭代放大了 DMA 等待。
 
 ### 3. Tuned FusedEPMoE 优于 EPMoE（Balanced）
 
@@ -161,9 +183,16 @@ Deep tuning 发现将 token compute tile 从 btc=32 降到 btc=16，在 ≥512 t
 | 512-1024 tokens | 1.42-1.55x | 显著优势（甜蜜区间） |
 | 2048-8192 tokens | 1.16-1.26x | 稳定优势 |
 
-### 4. FusedEPMoE 的 Imbalance 敏感性
+### 4. FusedEPMoE 的 Imbalance 敏感性（关键风险）
 
-FusedEPMoE 在负载不均衡时性能退化显著（大 token 时 +32-42%），而 EPMoE 几乎不受影响。生产环境中如果 routing 不够均衡，FusedEPMoE 的实际收益会缩小。
+| 场景 | Geo-mean Speedup | 胜者 |
+|------|----------------|------|
+| Balanced | **1.23x** | Fused |
+| Hotspot 2:1 (default config) | 0.57x | EPMoE |
+| **Hotspot 2:1 (tuned config)** | **0.94x** | **EPMoE** |
+
+Tuning 改善了 hotspot 下的表现 (0.57x→0.94x)，但仍然无法反超 EPMoE。
+**生产环境中如果 routing 不均衡，应优先选择 EPMoE。**
 
 ### 5. v6e VMEM 限制
 
@@ -172,6 +201,6 @@ bt=64/128 + bd1=4096 的组合在 ≥1024 tokens 下触发 VMEM OOM (70.4M > 64M
 ### 6. 下一步
 
 1. 将 v6e + MiMo-V2-Flash 的 tuned config 添加到 `tuned_block_configs.py`
-2. 测试 tuned FusedEPMoE 在 imbalanced 下的性能（当前仅测了 default config）
+2. ~~测试 tuned FusedEPMoE 在 imbalanced 下的性能~~ ✅ 已完成 (Section 4b)
 3. 验证 weight_block_size=[128,128] 量化对结果的影响
 4. 探索 EPLB (expert load balancing) 对 FusedEPMoE imbalance 问题的缓解效果

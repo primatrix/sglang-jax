@@ -416,7 +416,77 @@ tokens | EPMoE bal→hot | 变化  | Fused bal→hot      | 变化
 
 ---
 
-## 10. 全局总结
+## 10. Tuned FusedEPMoE — Hotspot Imbalance 测试
+
+**日期**: 2026-04-02
+**目的**: 验证 tuned FusedEPMoE block configs 在 hotspot 下的实际表现（Section 9 仅测了 default config）
+
+### 配置
+
+```
+与 Section 9 相同的 hotspot 参数:
+  hotspot_count=128, hotspot_ratio=0.6667, non_hotspot_alpha=10000.0
+
+测试的 FusedEPMoE block configs:
+  tuned_small:  bt=32 bf=2048 bd1=4096 bd2=4096 btc=16 bse=2048 bd2c=2048  (R2 小token最优)
+  tuned_medium: bt=32 bf=2048 bd1=4096 bd2=4096 btc=16 bse=128  bd2c=4096  (R2 中token最优)
+  tuned_large:  bt=32 bf=2048 bd1=4096 bd2=4096 btc=16 bse=512  bd2c=4096  (R2 大token最优)
+  base_btc32:   bt=32 bf=2048 bd1=4096 bd2=4096 btc=32 bse=512  bd2c=4096  (btc=32 参考)
+
+iters=5, warmup=2
+```
+
+### 结果
+
+```
+tokens | local | EPMoE (ms) | tuned_small | tuned_medium | tuned_large | base_btc32 | best Fused vs EPMoE
+-------|-------|------------|-------------|--------------|-------------|------------|--------------------
+   128 |     8 |      1.082 |       1.302 |        1.292 |       1.280 |      1.282 | 0.84x (EPMoE)
+   256 |    16 |      1.195 |       1.453 |        1.305 |       1.282 |      1.457 | 0.93x (EPMoE)
+   512 |    32 |      1.439 |       1.792 |        1.402 |       1.411 |      1.379 | 1.04x (Fused)
+  1024 |    64 |      1.918 |       2.024 |        1.942 |       1.932 |      1.925 | 1.00x (持平)
+  2048 |   128 |      2.752 |       3.073 |        3.097 |       2.991 |      2.897 | 0.95x (EPMoE)
+  4096 |   256 |      4.605 |       5.650 |        5.514 |       5.454 |      5.284 | 0.87x (EPMoE)
+  8192 |   512 |      8.425 |      10.181 |        9.797 |       9.733 |      9.008 | 0.94x (EPMoE)
+
+Geo-mean speedup (best tuned Fused / EPMoE): 0.94x — EPMoE wins
+```
+
+### 分析
+
+1. **Tuned FusedEPMoE 在 hotspot 下也无法赢过 EPMoE** — geo-mean 仅 0.94x
+   - Balanced: 1.23x (Fused 赢) → Hotspot: 0.94x (EPMoE 赢)
+   - Imbalance 将 FusedEPMoE 的优势从 +23% 完全逆转为 -6%
+
+2. **btc=32 在 hotspot 下反而优于 btc=16** — 与 balanced 结论相反:
+   - base_btc32 在 5/7 token counts 下是最优 fused config
+   - btc=16 的 tuned configs 在 hotspot 下全面败给 btc=32
+   - 原因推测: btc=16 增加了 pipeline 迭代次数，hotspot 下每次迭代的 DMA 等待时间
+     被放大，导致总等待时间增加超过了 btc=16 的 VMEM 优化收益
+
+3. **EPMoE 在 hotspot 下性能稳定**:
+   - Balanced EPMoE: 0.863-8.096 ms
+   - Hotspot EPMoE: 1.082-8.425 ms (+5-25%, 多数 <10%)
+   - 大 token scaling 接近线性
+
+4. **FusedEPMoE 在 hotspot 下性能退化幅度** (最优 tuned config vs balanced tuned):
+   ```
+   tokens | balanced best | hotspot best | 退化
+   -------|-------------|-------------|------
+      128 |       0.744 |       1.280 |  +72%
+      256 |       0.777 |       1.282 |  +65%
+      512 |       0.799 |       1.379 |  +73%
+     1024 |       1.215 |       1.925 |  +58%
+     2048 |       2.047 |       2.897 |  +42%
+     4096 |       3.677 |       5.284 |  +44%
+     8192 |       6.968 |       9.008 |  +29%
+   ```
+   - 小 token 退化更严重 (65-73%) — 因为通信占比更高
+   - 大 token 退化较小 (29-44%) — 计算占比增大缓冲了通信影响
+
+---
+
+## 11. 全局总结
 
 ### 数据汇总 (Balanced, 最终优化)
 
@@ -434,13 +504,34 @@ tokens | EPMoE (ms) | Fused-Default | R1 Tuned | R2 Tuned | Best Config         
   8192 |      8.096 |        18.019 |    7.558 |    6.968 | R2 btc16                 |    1.16x
 ```
 
+### 数据汇总 (Hotspot 2:1, tuned configs)
+
+```
+tokens | EPMoE (ms) | Best Tuned Fused | Config     | Speedup
+-------|------------|-----------------|------------|--------
+   128 |      1.082 |            1.280 | tuned_large|   0.84x
+   256 |      1.195 |            1.282 | tuned_large|   0.93x
+   512 |      1.439 |            1.379 | base_btc32 |   1.04x
+  1024 |      1.918 |            1.925 | base_btc32 |   1.00x
+  2048 |      2.752 |            2.897 | base_btc32 |   0.95x
+  4096 |      4.605 |            5.284 | base_btc32 |   0.87x
+  8192 |      8.425 |            9.008 | base_btc32 |   0.94x
+
+Geo-mean: 0.94x (EPMoE wins)
+```
+
 ### 关键发现
 
 1. **Block config tuning 带来 2-3 轮共 ~60-70% 的提升** (相对 default config)
-2. **btc=16 是最关键的单一优化**: 比 btc=32 快 5-32%，尤其在 ≥1024 tokens
+2. **btc=16 是 balanced 下最关键的单一优化**: 比 btc=32 快 5-32%，尤其在 ≥1024 tokens
 3. **Tuned FusedEPMoE 在 balanced 下全面优于 EPMoE**: geo-mean 1.23x
-4. **FusedEPMoE 对 imbalance 敏感**: 大 token + hotspot 时退化 25-42%
-5. **v6e VMEM 约束限制 tile 组合**: bt=64/128 + bd1=4096 导致 OOM
-6. **推荐两个 config**:
-   - 小 token (≤256): `bt=32 bf=2048 bd1=4096 bd2=4096 btc=16 bd2c=2048 bse=2048`
-   - 大 token (≥512): `bt=32 bf=2048 bd1=4096 bd2=4096 btc=16 bd2c=4096 bse=512`
+4. **FusedEPMoE 对 imbalance 极度敏感**:
+   - Default config: hotspot 下退化 25-42%（大 token）
+   - **Tuned config: hotspot 下退化 29-73%**，balanced 下的 1.23x 优势逆转为 0.94x 劣势
+   - btc=16 在 balanced 下优但在 hotspot 下不如 btc=32 — 说明 pipeline 迭代次数增加放大了 DMA 等待
+5. **EPMoE 对 imbalance 不敏感**: hotspot 下仅 ±5-25% 波动
+6. **v6e VMEM 约束限制 tile 组合**: bt=64/128 + bd1=4096 导致 OOM
+7. **推荐**:
+   - Balanced 环境: 使用 tuned FusedEPMoE (1.23x over EPMoE)
+   - 不均衡环境: 使用 EPMoE (更稳定，0.94x→1.0x，不依赖均衡 routing)
+   - 或者: FusedEPMoE + EPLB (expert load balancing) 作为中间方案（待测试）
