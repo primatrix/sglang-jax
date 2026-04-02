@@ -5,7 +5,6 @@ import json
 import os
 import pathlib
 import random
-import re
 import string
 import time
 from typing import Any
@@ -40,55 +39,67 @@ _maybe_enable_compilation_cache_from_env()
 
 
 def _extract_marker_durations_ms(trace: dict[str, Any], task: str | None = None) -> list[float]:
-    marker_events: list[dict[str, Any]] = []
-    for e in trace.get("traceEvents", []):
-        args = e.get("args", {})
-        tf_op = args.get("tf_op", "")
-        if MARKER in tf_op:
-            marker_events.append(e)
+    """Extract per-iteration device durations (ms) from profiler trace.
 
-    marker_call_done_events = [e for e in marker_events if e.get("name", "").endswith("call-done")]
-    if marker_call_done_events:
-        marker_events = marker_call_done_events
+    Finds top-level JIT XLA Module events that carry ``device_duration_ps``
+    (the actual TPU kernel time). Groups by device (pid), then **averages**
+    across devices per iteration to smooth measurement noise. Each device's
+    duration already includes collective communication wait time.
 
-    def _durations_by_pid(events: list[dict[str, Any]]) -> dict[int, list[float]]:
-        by_pid: dict[int, list[dict[str, Any]]] = {}
-        for e in events:
-            pid = e.get("pid")
-            if isinstance(pid, int):
-                by_pid.setdefault(pid, []).append(e)
+    Never falls back to host-side ``dur`` which includes Python / host-device
+    synchronisation overhead.
+    """
+    all_events = trace.get("traceEvents", [])
 
-        durations: dict[int, list[float]] = {}
-        for pid, pid_events in by_pid.items():
-            pid_events.sort(key=lambda ev: float(ev.get("ts", 0.0)))
-            pid_durations: list[float] = []
-            for e in pid_events:
-                args = e.get("args", {})
-                if args.get("device_duration_ps"):
-                    pid_durations.append(float(args["device_duration_ps"]) / 1e9)
-                elif "dur" in e:
-                    pid_durations.append(float(e["dur"]) / 1e3)
-            if pid_durations:
-                durations[pid] = pid_durations
-        return durations
+    # ── 1. Collect top-level JIT module events with device_duration_ps ──
+    jit_events: list[dict[str, Any]] = []
+    for e in all_events:
+        dev_dur = e.get("args", {}).get("device_duration_ps")
+        if dev_dur and str(e.get("name", "")).startswith("jit_"):
+            jit_events.append(e)
 
-    if not marker_events:
-        if not task:
-            return []
-        event_matcher = re.compile(task)
-        events = []
-        for e in trace.get("traceEvents", []):
-            if "name" in e and event_matcher.match(e["name"]):
-                events.append(e)
-        durations_by_pid = _durations_by_pid(events)
-        if not durations_by_pid:
-            return []
-        return max(sorted(durations_by_pid.items()), key=lambda kv: len(kv[1]))[1]
-
-    durations_by_pid = _durations_by_pid(marker_events)
-    if not durations_by_pid:
+    if not jit_events:
         return []
-    return max(sorted(durations_by_pid.items()), key=lambda kv: len(kv[1]))[1]
+
+    # ── 2. Group by function name and pick the benchmark target ──
+    # The benchmark target is the JIT function with the most total device
+    # time (tiny helpers like jit__multi_slice are excluded automatically).
+    by_func: dict[str, list[dict[str, Any]]] = {}
+    for e in jit_events:
+        by_func.setdefault(e["name"], []).append(e)
+
+    target_func = max(
+        by_func,
+        key=lambda n: sum(int(e["args"]["device_duration_ps"]) for e in by_func[n]),
+    )
+    target_events = by_func[target_func]
+
+    # ── 3. Group by pid (TPU device), sort by timestamp ──
+    by_pid: dict[int, list[tuple[float, float]]] = {}
+    for e in target_events:
+        pid = e.get("pid")
+        if not isinstance(pid, int):
+            continue
+        ts = float(e.get("ts", 0.0))
+        dur_ms = int(e["args"]["device_duration_ps"]) / 1e9  # ps → ms
+        by_pid.setdefault(pid, []).append((ts, dur_ms))
+
+    if not by_pid:
+        return []
+
+    for pid in by_pid:
+        by_pid[pid].sort(key=lambda x: x[0])
+
+    # ── 4. Per iteration: average across devices ──
+    # Each device's device_duration_ps already includes collective wait time
+    # (all-to-all is synchronous). Averaging smooths measurement noise.
+    n_iters = max(len(v) for v in by_pid.values())
+    result: list[float] = []
+    for i in range(n_iters):
+        durs = [pid_events[i][1] for pid_events in by_pid.values() if i < len(pid_events)]
+        result.append(sum(durs) / len(durs))
+
+    return result
 
 
 def _load_trace(trace_root: str) -> dict[str, Any]:
