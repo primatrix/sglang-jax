@@ -438,7 +438,7 @@ class EPMoE(nnx.Module):
             batch_size, seq_len = hidden_states.shape[0], hidden_states.shape[1]
             total_tokens = batch_size * seq_len
 
-        inputs_2d, token_indices, sorted_selected_experts, weights, group_sizes = self._permute(
+        inputs_2d, token_indices, sorted_weights, group_sizes = self._permute(
             hidden_states, topk_ids, topk_weights
         )
 
@@ -461,10 +461,9 @@ class EPMoE(nnx.Module):
 
         output = self._unpermute(
             intermediate_output,
-            sorted_selected_experts,
-            weights,
-            batch_size,
-            seq_len,
+            sorted_weights,
+            token_indices,
+            total_tokens,
         )
 
         # All-reduce after unpermute: communication volume is (T, hidden_size)
@@ -588,54 +587,35 @@ class EPMoE(nnx.Module):
         # avoiding a full [M*top_k, D] materialization in _permute.
         token_indices = sorted_selected_experts // self.num_experts_per_tok
 
+        # Pre-compute weights in sorted order for scatter-based unpermute.
+        # sorted_selected_experts[i] = original flat index j, so
+        # sorted_weights[i] = topk_weights.ravel()[j]
+        sorted_weights = top_k_weights.ravel()[sorted_selected_experts]
+
         group_sizes = jnp.bincount(flatten_selected_experts, length=self.num_experts)
 
         return (
             inputs_2d,
             token_indices,
-            sorted_selected_experts,
-            top_k_weights,
+            sorted_weights,
             group_sizes,
         )
 
-    def _unpermute(self, intermediate, sorted_selected_experts, weights, batch_size, seq_len):
-        expected_tokens = sorted_selected_experts.shape[0]
-        actual_tokens = intermediate.shape[0]
+    def _unpermute(self, intermediate, sorted_weights, token_indices, total_tokens):
+        """Scatter-based unpermute: weight and accumulate in one pass.
 
-        if actual_tokens != expected_tokens:
-            if actual_tokens > expected_tokens:
-                intermediate = intermediate[:expected_tokens]
-            else:
-                padding_size = expected_tokens - actual_tokens
-                padding = jnp.zeros((padding_size, intermediate.shape[1]), dtype=intermediate.dtype)
-                intermediate = jnp.concatenate([intermediate, padding], axis=0)
+        Instead of argsort → take → reshape → einsum, directly scatter
+        weighted results to output positions using token_indices. This
+        eliminates one argsort and one full gather.
+        """
+        # Weight each expert's output by its topk weight
+        weighted = intermediate.astype(jnp.float32) * sorted_weights[:, None].astype(jnp.float32)
 
-        argsort_indices = jnp.argsort(sorted_selected_experts, stable=True)
-        unsort_intermediate = jnp.take(intermediate, indices=argsort_indices, axis=0)
+        # Scatter-add to original token positions (handles top_k accumulation)
+        output = jnp.zeros((total_tokens, intermediate.shape[-1]), dtype=jnp.float32)
+        output = output.at[token_indices].add(weighted)
 
-        total_tokens = weights.shape[0] * weights.shape[1] // self.num_experts_per_tok
-
-        reshaped_weights = jnp.reshape(weights, (total_tokens, self.num_experts_per_tok))
-        reshaped_intermediate = jnp.reshape(
-            unsort_intermediate,
-            (total_tokens, self.num_experts_per_tok, -1),
-        )
-
-        intermediate_fp32 = reshaped_intermediate.astype(jnp.float32)
-        weights_fp32 = reshaped_weights.astype(jnp.float32)
-
-        output = jnp.einsum(
-            "BKE,BK -> BE",
-            intermediate_fp32,
-            weights_fp32,
-        )
-
-        if len(weights.shape) == 2:
-            final_output = output.astype(self.dtype)
-        else:
-            final_output = output.reshape(batch_size, seq_len, -1).astype(self.dtype)
-
-        return final_output
+        return output.astype(self.dtype)
 
 
 # create_moe_weights_mapping is utility function to generate weight mapping for MOE layers
