@@ -68,11 +68,11 @@ spec:
                 fieldRef:
                   fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
             - name: BENCH_BRANCH
-              value: "feat/moe-benchmark"
+              value: "exp/gmm-tiling-v2"
             - name: BENCH_REPO
               value: "https://github.com/primatrix/sglang-jax.git"
             - name: PROFILE_DIR
-              value: "/gcs/prayer/moe_profiling/20260407_indexed_gmm_gateup_v2"
+              value: "/gcs/prayer/moe_profiling/20260408_tiling_segsum"
           command:
             - bash
             - -c

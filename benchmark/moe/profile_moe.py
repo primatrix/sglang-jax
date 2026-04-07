@@ -1,7 +1,14 @@
 """
-Capture xprof traces for EPMoE vs FusedEPMoE on MiMoV2Flash MoE dimensions.
+Capture xprof traces for EPMoE optimization experiments on MiMoV2Flash MoE dimensions.
 
-Saves traces to /tmp/moe_profiles/ for extraction via kubectl cp or GCS upload.
+Experiments:
+  1. baseline: indexed_gmm + gate-up fusion (73cbcece)
+  2. tiling_256: custom tile_m=256 for GMM v2
+  3. tiling_512: custom tile_m=512 for GMM v2
+  4. segment_sum: segment_sum-based unpermute (replaces argsort+take+einsum)
+  5. tiling_256_segment: tile_m=256 + segment_sum combined
+
+Saves traces to PROFILE_DIR for xprof analysis.
 """
 
 from __future__ import annotations
@@ -12,14 +19,9 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from benchmark.moe.utils import (
-    MoEBenchmarkCase,
-    MoEImbalanceSimulator,
-    build_mesh,
-    generate_router_logits,
-    prepare_fused_moe_inputs,
-)
-from sgl_jax.srt.layers.moe import EPMoE, FusedEPMoE, TopK
+from benchmark.moe.utils import build_mesh, generate_router_logits
+from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import TileSizes
+from sgl_jax.srt.layers.moe import EPMoE, TopK
 
 NUM_EXPERTS = 256
 TOP_K = 8
@@ -27,20 +29,73 @@ HIDDEN_SIZE = 4096
 INTERMEDIATE_SIZE = 2048
 PROFILE_DIR = os.environ.get("PROFILE_DIR", "/gcs/moe_profiles")
 
-# Which configs to profile: (backend, ep_size, tp_size, num_tokens)
-# num_tokens: 16384 = prefill (16k input), 1024 = decode (1k output)
+# (tag, ep_size, tp_size, num_tokens, v2_tile_info, use_segment_sum)
 PROFILE_CASES = [
-    ("epmoe", 1, 16, 1024),
-    ("epmoe", 8, 2, 1024),
-    ("epmoe", 16, 1, 1024),
-    ("fused", 16, 1, 1024),
-    ("epmoe", 1, 16, 16384),
-    ("epmoe", 16, 1, 16384),
-    ("fused", 16, 1, 16384),
+    # Best config from last round: ep1_tp16 at 16k tokens
+    # Baseline (auto-tiling, argsort+take+einsum unpermute)
+    ("baseline_ep1_tp16_nt16384", 1, 16, 16384, None, False),
+    # Tiling experiments: tile_m=256 (double default 128)
+    (
+        "tiling256_ep1_tp16_nt16384",
+        1,
+        16,
+        16384,
+        TileSizes(tile_m=256, tile_k=256, tile_n=256),
+        False,
+    ),
+    # Tiling: tile_m=512
+    (
+        "tiling512_ep1_tp16_nt16384",
+        1,
+        16,
+        16384,
+        TileSizes(tile_m=512, tile_k=256, tile_n=256),
+        False,
+    ),
+    # Segment-sum unpermute (eliminates argsort+take+reshape+einsum)
+    ("segsum_ep1_tp16_nt16384", 1, 16, 16384, None, True),
+    # Combined: tiling_256 + segment_sum
+    (
+        "tiling256_segsum_ep1_tp16_nt16384",
+        1,
+        16,
+        16384,
+        TileSizes(tile_m=256, tile_k=256, tile_n=256),
+        True,
+    ),
+    # Also test decode scenario (1k tokens)
+    ("baseline_ep1_tp16_nt1024", 1, 16, 1024, None, False),
+    (
+        "tiling256_ep1_tp16_nt1024",
+        1,
+        16,
+        1024,
+        TileSizes(tile_m=256, tile_k=256, tile_n=256),
+        False,
+    ),
+    ("segsum_ep1_tp16_nt1024", 1, 16, 1024, None, True),
+    # EP16 configs for comparison
+    ("baseline_ep16_tp1_nt16384", 16, 1, 16384, None, False),
+    (
+        "tiling256_ep16_tp1_nt16384",
+        16,
+        1,
+        16384,
+        TileSizes(tile_m=256, tile_k=256, tile_n=256),
+        False,
+    ),
+    ("segsum_ep16_tp1_nt16384", 16, 1, 16384, None, True),
 ]
 
 
-def profile_epmoe(ep_size: int, tp_size: int, num_tokens: int, trace_dir: str) -> None:
+def profile_case(
+    ep_size: int,
+    tp_size: int,
+    num_tokens: int,
+    trace_dir: str,
+    v2_tile_info=None,
+    use_segment_sum: bool = False,
+) -> None:
     mesh = build_mesh(ep_size=ep_size, tp_size=tp_size)
     tokens = jnp.empty((num_tokens, HIDDEN_SIZE), dtype=jnp.bfloat16)
     router_logits = generate_router_logits(
@@ -63,6 +118,8 @@ def profile_epmoe(ep_size: int, tp_size: int, num_tokens: int, trace_dir: str) -
             dtype=jnp.bfloat16,
             activation="silu",
             layer_id=0,
+            v2_tile_info=v2_tile_info,
+            use_segment_sum_unpermute=use_segment_sum,
         )
 
         topk_def, topk_state = nnx.split(topk_layer)
@@ -97,105 +154,29 @@ def profile_epmoe(ep_size: int, tp_size: int, num_tokens: int, trace_dir: str) -
         print(f"    trace saved to {trace_dir}")
 
 
-def profile_fused(ep_size: int, num_tokens: int, trace_dir: str) -> None:
-    case = MoEBenchmarkCase(
-        name="fused_profile",
-        num_tokens=num_tokens,
-        num_experts=NUM_EXPERTS,
-        top_k=TOP_K,
-        hidden_size=HIDDEN_SIZE,
-        intermediate_size=INTERMEDIATE_SIZE,
-    )
-    mesh = build_mesh(ep_size=ep_size, tp_size=1)
-
-    data = prepare_fused_moe_inputs(
-        case,
-        weight_dtype=jnp.bfloat16,
-        mesh=mesh,
-        include_weights=False,
-    )
-    target_counts = MoEImbalanceSimulator.generate_counts(
-        num_tokens,
-        TOP_K,
-        NUM_EXPERTS,
-        mode="balanced",
-    )
-    custom_logits = MoEImbalanceSimulator.create_logits_from_counts(
-        num_tokens,
-        NUM_EXPERTS,
-        TOP_K,
-        target_counts,
-    )
-    from jax.sharding import NamedSharding
-    from jax.sharding import PartitionSpec as P
-
-    data["router_logits"] = jax.device_put(
-        custom_logits,
-        NamedSharding(mesh, P("tensor", None)),
-    )
-
-    with jax.set_mesh(mesh):
-        fused_layer = FusedEPMoE(
-            hidden_size=HIDDEN_SIZE,
-            num_experts=NUM_EXPERTS,
-            num_experts_per_tok=TOP_K,
-            ep_size=ep_size,
-            mesh=mesh,
-            intermediate_dim=INTERMEDIATE_SIZE,
-            weight_dtype=jnp.bfloat16,
-            dtype=jnp.bfloat16,
-            activation="silu",
-            layer_id=0,
-            renormalize_topk_logits=True,
-        )
-        topk_layer = TopK(topk=TOP_K, renormalize=True)
-
-        moe_def, moe_state = nnx.split(fused_layer)
-        moe_leaves, moe_treedef = jax.tree_util.tree_flatten(moe_state)
-        topk_def, topk_state = nnx.split(topk_layer)
-        topk_leaves, topk_treedef = jax.tree_util.tree_flatten(topk_state)
-
-        @jax.jit(static_argnames=("moe_treedef", "topk_treedef"))
-        def fn(tokens, logits, *, moe_treedef, moe_leaves, topk_treedef, topk_leaves):
-            moe = nnx.merge(moe_def, jax.tree_util.tree_unflatten(moe_treedef, moe_leaves))
-            topk = nnx.merge(topk_def, jax.tree_util.tree_unflatten(topk_treedef, topk_leaves))
-            w, ids = topk(logits)
-            return moe(tokens, w, ids)
-
-        kwargs = dict(
-            moe_treedef=moe_treedef,
-            moe_leaves=moe_leaves,
-            topk_treedef=topk_treedef,
-            topk_leaves=topk_leaves,
-        )
-
-        # Warmup
-        out = fn(data["tokens"], data["router_logits"], **kwargs)
-        jax.block_until_ready(out)
-        print("    warmup done")
-
-        # Profile
-        with jax.profiler.trace(trace_dir):
-            for i in range(5):
-                out = fn(data["tokens"], data["router_logits"], **kwargs)
-                jax.block_until_ready(out)
-        print(f"    trace saved to {trace_dir}")
-
-
 def main():
     num_devices = len(jax.devices())
     print(f"MoE xprof profiling: {num_devices} x {jax.devices()[0].device_kind}")
     os.makedirs(PROFILE_DIR, exist_ok=True)
 
-    for backend, ep, tp, nt in PROFILE_CASES:
-        tag = f"{backend}_ep{ep}_tp{tp}_nt{nt}"
-        trace_dir = os.path.join(PROFILE_DIR, tag)
-        print(f"\n[{tag}]")
+    for tag, ep, tp, nt, tile_info, seg_sum in PROFILE_CASES:
+        if ep * tp != num_devices:
+            print(f"\n[{tag}] SKIP: requires {ep*tp} devices, have {num_devices}")
+            continue
 
-        if backend == "epmoe":
-            profile_epmoe(ep, tp, nt, trace_dir)
-        else:
-            profile_fused(ep, nt, trace_dir)
+        trace_dir = os.path.join(PROFILE_DIR, tag)
+        opts = []
+        if tile_info is not None:
+            opts.append(f"tile=({tile_info.tile_m},{tile_info.tile_k},{tile_info.tile_n})")
+        if seg_sum:
+            opts.append("segment_sum")
+        opts_str = f" [{', '.join(opts)}]" if opts else ""
+        print(f"\n[{tag}]{opts_str}")
+
+        try:
+            profile_case(ep, tp, nt, trace_dir, v2_tile_info=tile_info, use_segment_sum=seg_sum)
+        except Exception as e:
+            print(f"    FAILED: {e}")
 
     # List output
     print("\n=== Profiles saved ===")

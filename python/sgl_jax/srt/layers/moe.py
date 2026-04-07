@@ -33,9 +33,13 @@ class EPMoE(nnx.Module):
         layer_id: int = 0,
         quantization_config=None,
         physical_to_logical_map: "jax.Array | None" = None,
+        v2_tile_info=None,
+        use_segment_sum_unpermute: bool = False,
     ):
         self.num_experts_per_tok = num_experts_per_tok
         self.physical_to_logical_map = physical_to_logical_map
+        self.v2_tile_info = v2_tile_info
+        self.use_segment_sum_unpermute = use_segment_sum_unpermute
 
         metadata = get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
@@ -438,8 +442,8 @@ class EPMoE(nnx.Module):
             batch_size, seq_len = hidden_states.shape[0], hidden_states.shape[1]
             total_tokens = batch_size * seq_len
 
-        inputs_2d, token_indices, sorted_selected_experts, weights, group_sizes = self._permute(
-            hidden_states, topk_ids, topk_weights
+        inputs_2d, token_indices, sorted_selected_experts, weights, sorted_weights, group_sizes = (
+            self._permute(hidden_states, topk_ids, topk_weights)
         )
 
         group_sizes = group_sizes.astype(jnp.int32)
@@ -459,13 +463,22 @@ class EPMoE(nnx.Module):
             wo_kernel_bias,
         )
 
-        output = self._unpermute(
-            intermediate_output,
-            sorted_selected_experts,
-            weights,
-            batch_size,
-            seq_len,
-        )
+        use_segment_sum = getattr(self, "use_segment_sum_unpermute", False)
+        if use_segment_sum:
+            output = self._unpermute_segment_sum(
+                intermediate_output,
+                sorted_weights,
+                token_indices,
+                total_tokens,
+            )
+        else:
+            output = self._unpermute(
+                intermediate_output,
+                sorted_selected_experts,
+                weights,
+                batch_size,
+                seq_len,
+            )
 
         # All-reduce after unpermute: communication volume is (T, hidden_size)
         # instead of (T * top_k, hidden_size), reducing by a factor of top_k.
@@ -500,12 +513,16 @@ class EPMoE(nnx.Module):
         group_sizes = group_sizes.astype(jnp.int32)
         act_q_dtype = self.activation_quantized_dtype
 
+        # Use custom v2 tiling if configured
+        v2_tile_info = getattr(self, "v2_tile_info", None)
+
         gmm_kwargs = dict(
             group_sizes=group_sizes,
             preferred_element_type=self.dtype,
             group_offset=group_offset,
             maybe_quantize_lhs=act_q_dtype is not None,
             acc_dtype=jnp.float32,
+            v2_tile_info=v2_tile_info,
         )
 
         # === GEMM1: fused gate-up projection (weights pre-concatenated at load time) ===
@@ -588,6 +605,9 @@ class EPMoE(nnx.Module):
         # avoiding a full [M*top_k, D] materialization in _permute.
         token_indices = sorted_selected_experts // self.num_experts_per_tok
 
+        # Pre-sort routing weights for segment_sum unpermute path
+        sorted_weights = top_k_weights.ravel()[sorted_selected_experts]
+
         group_sizes = jnp.bincount(flatten_selected_experts, length=self.num_experts)
 
         return (
@@ -595,6 +615,7 @@ class EPMoE(nnx.Module):
             token_indices,
             sorted_selected_experts,
             top_k_weights,
+            sorted_weights,
             group_sizes,
         )
 
@@ -636,6 +657,16 @@ class EPMoE(nnx.Module):
             final_output = output.reshape(batch_size, seq_len, -1).astype(self.dtype)
 
         return final_output
+
+    def _unpermute_segment_sum(self, intermediate, sorted_weights, token_indices, total_tokens):
+        """Segment-sum unpermute: weight and reduce in one pass.
+
+        Replaces argsort+take+reshape+einsum with a single segment_sum.
+        Requires sorted_weights and token_indices from _permute.
+        """
+        weighted = intermediate.astype(jnp.float32) * sorted_weights[:, None].astype(jnp.float32)
+        output = jax.ops.segment_sum(weighted, token_indices, num_segments=total_tokens)
+        return output.astype(self.dtype)
 
 
 # create_moe_weights_mapping is utility function to generate weight mapping for MOE layers
