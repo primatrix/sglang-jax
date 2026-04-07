@@ -2,11 +2,11 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: moe-bench-svc
+  name: tiling-sweep-svc
 spec:
   clusterIP: None
   selector:
-    job-name: moe-bench
+    job-name: tiling-sweep
   ports:
     - name: tpu-data
       port: 8471
@@ -19,7 +19,7 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: moe-bench
+  name: tiling-sweep
 spec:
   completionMode: Indexed
   completions: 4
@@ -31,7 +31,7 @@ spec:
         gke-gcsfuse/volumes: "true"
     spec:
       serviceAccountName: gcs-account
-      subdomain: moe-bench-svc
+      subdomain: tiling-sweep-svc
       restartPolicy: Never
       nodeSelector:
         cloud.google.com/gke-nodepool: tpu-v6e-16-xc
@@ -62,17 +62,17 @@ spec:
               name: gcs-storage
           env:
             - name: TPU_WORKER_HOSTNAMES
-              value: "moe-bench-0.moe-bench-svc,moe-bench-1.moe-bench-svc,moe-bench-2.moe-bench-svc,moe-bench-3.moe-bench-svc"
+              value: "tiling-sweep-0.tiling-sweep-svc,tiling-sweep-1.tiling-sweep-svc,tiling-sweep-2.tiling-sweep-svc,tiling-sweep-3.tiling-sweep-svc"
             - name: TPU_WORKER_ID
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
             - name: BENCH_BRANCH
-              value: "feat/moe-benchmark"
+              value: "feat/tiling-sweep"
             - name: BENCH_REPO
               value: "https://github.com/primatrix/sglang-jax.git"
             - name: PROFILE_DIR
-              value: "/gcs/prayer/moe_profiling/20260407_indexed_gmm_gateup_v2"
+              value: "/gcs/prayer/moe_profiling/20260407_tiling_sweep"
           command:
             - bash
             - -c
@@ -97,5 +97,5 @@ spec:
 
               echo "=== Worker $TPU_WORKER_ID: devices=$(python3 -c 'import jax; print(jax.device_count())') ==="
 
-              # Run xprof profiling — traces saved to GCS
-              python -m benchmark.moe.profile_moe
+              # Run tiling sweep — results saved to GCS
+              python -m benchmark.moe.tiling_sweep
