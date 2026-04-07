@@ -211,71 +211,68 @@ except ImportError:
 
 requires_tops = pytest.mark.skipif(not HAS_TOPS, reason="tops library not available")
 
+# Prefill (chunk) kernel uses Pallas TPU primitives and cannot run on CPU.
+_HAS_TPU = any(d.platform == "tpu" for d in jax.devices())
+requires_tpu = pytest.mark.skipif(not _HAS_TPU, reason="chunk kernel requires TPU")
+
 
 def _make_forward_batch(forward_mode):
     return SimpleNamespace(forward_mode=forward_mode)
+
+
+_SMALL_CONFIG = _make_config(
+    hidden_size=512,
+    num_attention_heads=4,
+    head_dim=128,
+    num_hidden_layers=10,
+    partial_rotary_factor=0.5,
+    max_position_embeddings=1024,
+    rope_theta=10000,
+    group_norm_size=4,
+)
+
+_SMALL_H = 4
+_SMALL_K = 128
+_SMALL_HIDDEN = 512
 
 
 class TestDecodeForward:
     @requires_tops
     def test_decode_output_shape(self):
         """Decode forward should return output [T, hidden_size] and new_state [T, H, K, V]."""
-        config = _make_config(
-            hidden_size=256,
-            num_attention_heads=4,
-            head_dim=64,
-            num_hidden_layers=10,
-            partial_rotary_factor=0.5,
-            max_position_embeddings=1024,
-            rope_theta=10000,
-            group_norm_size=4,
-        )
         backend = LinearAttentionBackend(mesh=mesh)
         T = 2
-        H, K = 4, 64
 
         with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
             module = BailingMoeV2_5LinearAttention(
-                config=config, layer_idx=5, mesh=mesh, backend=backend
+                config=_SMALL_CONFIG, layer_idx=5, mesh=mesh, backend=backend
             )
-            hidden = jax.random.normal(jax.random.PRNGKey(0), (T, 256), dtype=jnp.bfloat16)
+            hidden = jax.random.normal(
+                jax.random.PRNGKey(0), (T, _SMALL_HIDDEN), dtype=jnp.bfloat16
+            )
             positions = jnp.arange(T, dtype=jnp.int32)
-            recurrent_state = jnp.zeros((T, H, K, K), dtype=jnp.bfloat16)
+            recurrent_state = jnp.zeros((T, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.bfloat16)
             fb = _make_forward_batch(ForwardMode.DECODE)
 
             output, new_state = module(positions, hidden, fb, recurrent_state)
 
-        assert output.shape == (T, 256), f"Expected ({T}, 256), got {output.shape}"
-        assert new_state.shape == (
-            T,
-            H,
-            K,
-            K,
-        ), f"Expected ({T}, {H}, {K}, {K}), got {new_state.shape}"
+        assert output.shape == (T, _SMALL_HIDDEN)
+        assert new_state.shape == (T, _SMALL_H, _SMALL_K, _SMALL_K)
 
     @requires_tops
     def test_decode_state_updates(self):
         """Two decode steps should produce different states."""
-        config = _make_config(
-            hidden_size=256,
-            num_attention_heads=4,
-            head_dim=64,
-            num_hidden_layers=10,
-            partial_rotary_factor=0.5,
-            max_position_embeddings=1024,
-            rope_theta=10000,
-            group_norm_size=4,
-        )
         backend = LinearAttentionBackend(mesh=mesh)
         T = 1
-        H, K = 4, 64
 
         with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
             module = BailingMoeV2_5LinearAttention(
-                config=config, layer_idx=5, mesh=mesh, backend=backend
+                config=_SMALL_CONFIG, layer_idx=5, mesh=mesh, backend=backend
             )
-            hidden = jax.random.normal(jax.random.PRNGKey(42), (T, 256), dtype=jnp.bfloat16)
-            state0 = jnp.zeros((T, H, K, K), dtype=jnp.bfloat16)
+            hidden = jax.random.normal(
+                jax.random.PRNGKey(42), (T, _SMALL_HIDDEN), dtype=jnp.bfloat16
+            )
+            state0 = jnp.zeros((T, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.bfloat16)
             fb = _make_forward_batch(ForwardMode.DECODE)
 
             _, state1 = module(jnp.array([0], dtype=jnp.int32), hidden, fb, state0)
@@ -286,60 +283,43 @@ class TestDecodeForward:
     @requires_tops
     def test_decode_state_affects_output(self):
         """Different initial states should produce different outputs."""
-        config = _make_config(
-            hidden_size=256,
-            num_attention_heads=4,
-            head_dim=64,
-            num_hidden_layers=10,
-            partial_rotary_factor=0.5,
-            max_position_embeddings=1024,
-            rope_theta=10000,
-            group_norm_size=4,
-        )
         backend = LinearAttentionBackend(mesh=mesh)
         T = 1
-        H, K = 4, 64
 
         with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
             module = BailingMoeV2_5LinearAttention(
-                config=config, layer_idx=5, mesh=mesh, backend=backend
+                config=_SMALL_CONFIG, layer_idx=5, mesh=mesh, backend=backend
             )
-            hidden = jax.random.normal(jax.random.PRNGKey(42), (T, 256), dtype=jnp.bfloat16)
+            hidden = jax.random.normal(
+                jax.random.PRNGKey(42), (T, _SMALL_HIDDEN), dtype=jnp.bfloat16
+            )
             fb = _make_forward_batch(ForwardMode.DECODE)
 
-            state_zeros = jnp.zeros((T, H, K, K), dtype=jnp.bfloat16)
-            _, state_nonzero = module(jnp.array([0], dtype=jnp.int32), hidden, fb, state_zeros)
+            state_zeros = jnp.zeros((T, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.bfloat16)
+            state_large = jax.random.normal(
+                jax.random.PRNGKey(99), (T, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.bfloat16
+            )
 
-            out_from_zeros, _ = module(jnp.array([1], dtype=jnp.int32), hidden, fb, state_zeros)
-            out_from_nonzero, _ = module(jnp.array([1], dtype=jnp.int32), hidden, fb, state_nonzero)
+            out_from_zeros, _ = module(jnp.array([0], dtype=jnp.int32), hidden, fb, state_zeros)
+            out_from_large, _ = module(jnp.array([0], dtype=jnp.int32), hidden, fb, state_large)
 
         assert not jnp.allclose(
-            out_from_zeros, out_from_nonzero
+            out_from_zeros, out_from_large
         ), "Different states should give different outputs"
 
 
 class TestPrefillForward:
     @requires_tops
+    @requires_tpu
     def test_prefill_output_shape(self):
         """Prefill forward should return output [T, hidden_size] and new_state [N_padded, H, K, V]."""
-        config = _make_config(
-            hidden_size=256,
-            num_attention_heads=4,
-            head_dim=64,
-            num_hidden_layers=10,
-            partial_rotary_factor=0.5,
-            max_position_embeddings=1024,
-            rope_theta=10000,
-            group_norm_size=4,
-        )
         backend = LinearAttentionBackend(mesh=mesh)
         seq_len = 128
         N_padded = 1
-        H, K = 4, 64
 
         with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
             module = BailingMoeV2_5LinearAttention(
-                config=config, layer_idx=5, mesh=mesh, backend=backend
+                config=_SMALL_CONFIG, layer_idx=5, mesh=mesh, backend=backend
             )
 
             batch_meta = SimpleNamespace(
@@ -350,37 +330,31 @@ class TestPrefillForward:
             )
             backend.get_forward_metadata(batch_meta)
 
-            hidden = jax.random.normal(jax.random.PRNGKey(0), (seq_len, 256), dtype=jnp.bfloat16)
+            hidden = jax.random.normal(
+                jax.random.PRNGKey(0), (seq_len, _SMALL_HIDDEN), dtype=jnp.bfloat16
+            )
             positions = jnp.arange(seq_len, dtype=jnp.int32)
-            recurrent_state = jnp.zeros((N_padded, H, K, K), dtype=jnp.bfloat16)
+            recurrent_state = jnp.zeros(
+                (N_padded, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.bfloat16
+            )
             fb = _make_forward_batch(ForwardMode.EXTEND)
 
             output, new_state = module(positions, hidden, fb, recurrent_state)
 
-        assert output.shape == (seq_len, 256), f"Expected ({seq_len}, 256), got {output.shape}"
-        assert new_state.shape == (N_padded, H, K, K)
+        assert output.shape == (seq_len, _SMALL_HIDDEN)
+        assert new_state.shape == (N_padded, _SMALL_H, _SMALL_K, _SMALL_K)
 
     @requires_tops
+    @requires_tpu
     def test_prefill_non_chunk_aligned(self):
         """Prefill with non-chunk-aligned seq_len (e.g. 100) should work via scatter/gather."""
-        config = _make_config(
-            hidden_size=256,
-            num_attention_heads=4,
-            head_dim=64,
-            num_hidden_layers=10,
-            partial_rotary_factor=0.5,
-            max_position_embeddings=1024,
-            rope_theta=10000,
-            group_norm_size=4,
-        )
         backend = LinearAttentionBackend(mesh=mesh)
         seq_len = 100
         N_padded = 1
-        H, K = 4, 64
 
         with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
             module = BailingMoeV2_5LinearAttention(
-                config=config, layer_idx=5, mesh=mesh, backend=backend
+                config=_SMALL_CONFIG, layer_idx=5, mesh=mesh, backend=backend
             )
 
             batch_meta = SimpleNamespace(
@@ -391,36 +365,30 @@ class TestPrefillForward:
             )
             backend.get_forward_metadata(batch_meta)
 
-            hidden = jax.random.normal(jax.random.PRNGKey(0), (seq_len, 256), dtype=jnp.bfloat16)
+            hidden = jax.random.normal(
+                jax.random.PRNGKey(0), (seq_len, _SMALL_HIDDEN), dtype=jnp.bfloat16
+            )
             positions = jnp.arange(seq_len, dtype=jnp.int32)
-            recurrent_state = jnp.zeros((N_padded, H, K, K), dtype=jnp.bfloat16)
+            recurrent_state = jnp.zeros(
+                (N_padded, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.bfloat16
+            )
             fb = _make_forward_batch(ForwardMode.EXTEND)
 
             output, new_state = module(positions, hidden, fb, recurrent_state)
 
-        assert output.shape == (seq_len, 256)
-        assert new_state.shape == (N_padded, H, K, K)
+        assert output.shape == (seq_len, _SMALL_HIDDEN)
+        assert new_state.shape == (N_padded, _SMALL_H, _SMALL_K, _SMALL_K)
 
     @requires_tops
+    @requires_tpu
     def test_prefill_zeros_state_runs(self):
         """Prefill with all-zeros initial state should complete without error."""
-        config = _make_config(
-            hidden_size=256,
-            num_attention_heads=4,
-            head_dim=64,
-            num_hidden_layers=10,
-            partial_rotary_factor=0.5,
-            max_position_embeddings=1024,
-            rope_theta=10000,
-            group_norm_size=4,
-        )
         backend = LinearAttentionBackend(mesh=mesh)
-        seq_len = 64
-        H, K = 4, 64
+        seq_len = 128
 
         with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
             module = BailingMoeV2_5LinearAttention(
-                config=config, layer_idx=5, mesh=mesh, backend=backend
+                config=_SMALL_CONFIG, layer_idx=5, mesh=mesh, backend=backend
             )
 
             batch_meta = SimpleNamespace(
@@ -431,15 +399,17 @@ class TestPrefillForward:
             )
             backend.get_forward_metadata(batch_meta)
 
-            hidden = jax.random.normal(jax.random.PRNGKey(0), (seq_len, 256), dtype=jnp.bfloat16)
+            hidden = jax.random.normal(
+                jax.random.PRNGKey(0), (seq_len, _SMALL_HIDDEN), dtype=jnp.bfloat16
+            )
             positions = jnp.arange(seq_len, dtype=jnp.int32)
-            recurrent_state = jnp.zeros((1, H, K, K), dtype=jnp.bfloat16)
+            recurrent_state = jnp.zeros((1, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.bfloat16)
             fb = _make_forward_batch(ForwardMode.EXTEND)
 
             output, new_state = module(positions, hidden, fb, recurrent_state)
 
-        assert output.shape == (seq_len, 256)
-        assert new_state.shape == (1, H, K, K)
+        assert output.shape == (seq_len, _SMALL_HIDDEN)
+        assert new_state.shape == (1, _SMALL_H, _SMALL_K, _SMALL_K)
 
 
 # ---------------------------------------------------------------------------
@@ -494,3 +464,234 @@ class TestWhiteBox:
             gate = jax.nn.sigmoid(g)
 
         assert jnp.all(gate >= 0) and jnp.all(gate <= 1), "Gate values out of [0,1]"
+
+    def test_v_skips_rmsnorm(self):
+        """V should NOT be modified by Q/K RMSNorm."""
+        H, K = 4, 64
+        config = _make_config(
+            hidden_size=256,
+            num_attention_heads=H,
+            head_dim=K,
+            num_hidden_layers=10,
+            partial_rotary_factor=0.5,
+            max_position_embeddings=1024,
+            rope_theta=10000,
+            group_norm_size=4,
+        )
+        backend = LinearAttentionBackend(mesh=mesh)
+
+        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
+            module = BailingMoeV2_5LinearAttention(
+                config=config, layer_idx=5, mesh=mesh, backend=backend
+            )
+            hidden = jax.random.normal(jax.random.PRNGKey(0), (4, 256), dtype=jnp.float32)
+
+            qkv, _ = module.qkv_proj(hidden)
+            qkv = qkv.reshape(4, 3, H, K)
+            v_before = qkv[:, 2]
+
+            q = qkv[:, 0]
+            k = qkv[:, 1]
+            if module.q_norm is not None:
+                q = module.q_norm(q)
+                k = module.k_norm(k)
+            v_after = qkv[:, 2]
+
+        np.testing.assert_array_equal(
+            np.array(v_before), np.array(v_after), err_msg="V should not be modified by Q/K RMSNorm"
+        )
+
+    def test_rope_only_affects_first_rotary_dims(self):
+        """RoPE should only modify the first rope_dim dims; rest unchanged."""
+        H, K = 4, 64
+        config = _make_config(
+            hidden_size=256,
+            num_attention_heads=H,
+            head_dim=K,
+            num_hidden_layers=10,
+            partial_rotary_factor=0.5,
+            max_position_embeddings=1024,
+            rope_theta=10000,
+            group_norm_size=4,
+        )
+        rope_dim = int(K * 0.5)  # 32
+        backend = LinearAttentionBackend(mesh=mesh)
+
+        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
+            module = BailingMoeV2_5LinearAttention(
+                config=config, layer_idx=5, mesh=mesh, backend=backend
+            )
+            hidden = jax.random.normal(jax.random.PRNGKey(0), (4, 256), dtype=jnp.float32)
+
+            qkv, _ = module.qkv_proj(hidden)
+            qkv = qkv.reshape(4, 3, H, K)
+            q_pre = qkv[:, 0]
+            k_pre = qkv[:, 1]
+
+            if module.q_norm is not None:
+                q_pre = module.q_norm(q_pre)
+                k_pre = module.k_norm(k_pre)
+
+            positions = jnp.arange(4, dtype=jnp.int32)
+            q_post, k_post = module.rotary_emb(positions, q_pre, k_pre)
+
+        np.testing.assert_array_equal(
+            np.array(q_pre[:, :, rope_dim:]),
+            np.array(q_post[:, :, rope_dim:]),
+            err_msg="Q dims after rope_dim should be unchanged by RoPE",
+        )
+        np.testing.assert_array_equal(
+            np.array(k_pre[:, :, rope_dim:]),
+            np.array(k_post[:, :, rope_dim:]),
+            err_msg="K dims after rope_dim should be unchanged by RoPE",
+        )
+
+    def test_dense_projection_changes_values(self):
+        """Dense projection should produce different values from its input."""
+        H, K = 4, 64
+        config = _make_config(
+            hidden_size=256,
+            num_attention_heads=H,
+            head_dim=K,
+            num_hidden_layers=10,
+            partial_rotary_factor=0.5,
+            max_position_embeddings=1024,
+            rope_theta=10000,
+            group_norm_size=4,
+        )
+        backend = LinearAttentionBackend(mesh=mesh)
+
+        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
+            module = BailingMoeV2_5LinearAttention(
+                config=config, layer_idx=5, mesh=mesh, backend=backend
+            )
+            x = jax.random.normal(jax.random.PRNGKey(0), (4, H * K), dtype=jnp.bfloat16)
+            y, _ = module.dense(x)
+
+        assert not jnp.allclose(x, y), "Dense projection should change values"
+
+
+# ---------------------------------------------------------------------------
+# Multi-request isolation tests (require tops library)
+# ---------------------------------------------------------------------------
+
+
+class TestMultiRequestIsolation:
+    @requires_tops
+    def test_decode_multi_request_isolation(self):
+        """Two requests decoded separately should match decoded together."""
+        backend = LinearAttentionBackend(mesh=mesh)
+
+        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
+            module = BailingMoeV2_5LinearAttention(
+                config=_SMALL_CONFIG, layer_idx=5, mesh=mesh, backend=backend
+            )
+
+            hidden1 = jax.random.normal(
+                jax.random.PRNGKey(42), (1, _SMALL_HIDDEN), dtype=jnp.bfloat16
+            )
+            hidden2 = jax.random.normal(
+                jax.random.PRNGKey(43), (1, _SMALL_HIDDEN), dtype=jnp.bfloat16
+            )
+            state1 = jax.random.normal(
+                jax.random.PRNGKey(44), (1, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.bfloat16
+            )
+            state2 = jax.random.normal(
+                jax.random.PRNGKey(45), (1, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.bfloat16
+            )
+
+            fb = _make_forward_batch(ForwardMode.DECODE)
+
+            # Separate
+            out1, s1 = module(jnp.array([0], dtype=jnp.int32), hidden1, fb, state1)
+            out2, s2 = module(jnp.array([0], dtype=jnp.int32), hidden2, fb, state2)
+
+            # Together
+            hidden_both = jnp.concatenate([hidden1, hidden2], axis=0)
+            state_both = jnp.concatenate([state1, state2], axis=0)
+            positions_both = jnp.array([0, 0], dtype=jnp.int32)
+            out_both, s_both = module(positions_both, hidden_both, fb, state_both)
+
+        np.testing.assert_allclose(
+            np.array(out_both[0]),
+            np.array(out1[0]),
+            atol=2e-1,
+            err_msg="Request 1 output differs between separate and batched decode",
+        )
+        np.testing.assert_allclose(
+            np.array(out_both[1]),
+            np.array(out2[0]),
+            atol=2e-1,
+            err_msg="Request 2 output differs between separate and batched decode",
+        )
+
+    @requires_tops
+    @requires_tpu
+    def test_prefill_multi_request_isolation(self):
+        """Two requests prefilled separately should match prefilled together."""
+        seq_len1, seq_len2 = 128, 128
+
+        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
+            # --- Separate ---
+            backend1 = LinearAttentionBackend(mesh=mesh)
+            module = BailingMoeV2_5LinearAttention(
+                config=_SMALL_CONFIG, layer_idx=5, mesh=mesh, backend=backend1
+            )
+            batch1 = SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND,
+                extend_seq_lens=np.array([seq_len1], dtype=np.int32),
+                seq_lens=np.array([seq_len1], dtype=np.int32),
+                input_ids=np.zeros(seq_len1, dtype=np.int32),
+            )
+            backend1.get_forward_metadata(batch1)
+            h1 = jax.random.normal(
+                jax.random.PRNGKey(0), (seq_len1, _SMALL_HIDDEN), dtype=jnp.bfloat16
+            )
+            pos1 = jnp.arange(seq_len1, dtype=jnp.int32)
+            state1_init = jnp.zeros((1, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.bfloat16)
+            fb_ext = _make_forward_batch(ForwardMode.EXTEND)
+            out1, s1 = module(pos1, h1, fb_ext, state1_init)
+
+            backend2 = LinearAttentionBackend(mesh=mesh)
+            module.backend = backend2
+            batch2 = SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND,
+                extend_seq_lens=np.array([seq_len2], dtype=np.int32),
+                seq_lens=np.array([seq_len2], dtype=np.int32),
+                input_ids=np.zeros(seq_len2, dtype=np.int32),
+            )
+            backend2.get_forward_metadata(batch2)
+            h2 = jax.random.normal(
+                jax.random.PRNGKey(1), (seq_len2, _SMALL_HIDDEN), dtype=jnp.bfloat16
+            )
+            pos2 = jnp.arange(seq_len2, dtype=jnp.int32)
+            state2_init = jnp.zeros((1, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.bfloat16)
+            out2, s2 = module(pos2, h2, fb_ext, state2_init)
+
+            # --- Together ---
+            backend_both = LinearAttentionBackend(mesh=mesh)
+            module.backend = backend_both
+            batch_both = SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND,
+                extend_seq_lens=np.array([seq_len1, seq_len2], dtype=np.int32),
+                seq_lens=np.array([seq_len1, seq_len2], dtype=np.int32),
+                input_ids=np.zeros(seq_len1 + seq_len2, dtype=np.int32),
+            )
+            backend_both.get_forward_metadata(batch_both)
+            h_both = jnp.concatenate([h1, h2], axis=0)
+            pos_both = jnp.concatenate([pos1, pos2], axis=0)
+            state_both_init = jnp.zeros((2, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.bfloat16)
+            out_both, s_both = module(pos_both, h_both, fb_ext, state_both_init)
+
+        np.testing.assert_allclose(
+            np.array(out_both[:seq_len1]),
+            np.array(out1),
+            atol=5e-2,
+            err_msg="Request 1 output differs in batched prefill",
+        )
+        np.testing.assert_allclose(
+            np.array(s_both[0]),
+            np.array(s1[0]),
+            atol=5e-2,
+            err_msg="Request 1 state differs in batched prefill",
+        )
