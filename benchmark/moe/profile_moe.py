@@ -147,7 +147,10 @@ def main():
         trace_dir = os.path.join(PROFILE_DIR, tag)
         opts = []
         if tile_info is not None:
-            opts.append(f"tile=({tile_info.tile_m},{tile_info.tile_k},{tile_info.tile_n})")
+            if callable(tile_info):
+                opts.append("tile=custom_fn")
+            else:
+                opts.append(f"tile=({tile_info.tile_m},{tile_info.tile_k},{tile_info.tile_n})")
         if seg_sum:
             opts.append("segment_sum")
         opts_str = f" [{', '.join(opts)}]" if opts else ""
