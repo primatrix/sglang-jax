@@ -446,24 +446,19 @@ class EPMoE(nnx.Module):
 
         group_offset = self._dispatch(group_sizes, expert_shard_id)
 
-        intermediate_output = self._gmm_compute(
+        output = self._gmm_compute(
             inputs_2d,
             token_indices,
             group_sizes,
             wi_01_weights,
             wo_weights,
             group_offset,
+            sorted_weights,
+            total_tokens,
             wi_01_kernel_scale,
             wo_kernel_scale,
             wi_01_kernel_bias,
             wo_kernel_bias,
-        )
-
-        output = self._unpermute(
-            intermediate_output,
-            sorted_weights,
-            token_indices,
-            total_tokens,
         )
 
         # All-reduce after unpermute: communication volume is (T, hidden_size)
@@ -483,20 +478,21 @@ class EPMoE(nnx.Module):
         wi_01_kernel,
         wo_kernel,
         group_offset,
+        sorted_weights,
+        total_tokens,
         wi_01_kernel_scale=None,
         wo_kernel_scale=None,
         wi_01_kernel_bias=None,
         wo_kernel_bias=None,
     ):
         if token_indices.shape[0] == 0:
-            return jnp.zeros((0, wo_kernel.shape[-1]), dtype=inputs_2d.dtype)
+            return jnp.zeros((total_tokens, wo_kernel.shape[-1]), dtype=self.dtype)
 
         # indexed_gmm: gather sorted_inputs here instead of in _permute,
         # so XLA can fuse the gather with the matmul and avoid materializing
         # the full [M*top_k, D] sorted_inputs tensor at peak memory.
         x = inputs_2d[token_indices].astype(self.dtype)
 
-        group_sizes = group_sizes.astype(jnp.int32)
         act_q_dtype = self.activation_quantized_dtype
 
         gmm_kwargs = dict(
@@ -531,7 +527,7 @@ class EPMoE(nnx.Module):
         intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
         # === GEMM2: intermediate @ wo ===
-        return gmm(
+        expert_output = gmm(
             lhs=intermediate_layer,
             rhs=wo_kernel,
             rhs_scale=wo_kernel_scale,
@@ -540,6 +536,15 @@ class EPMoE(nnx.Module):
             activation_quantized_dtype=act_q_dtype,
             **gmm_kwargs,
         )
+
+        # === Fused scatter-based unpermute ===
+        # Weight each expert's output and scatter to original token positions
+        # in one pass, so XLA can potentially fuse GEMM2 output → weight → scatter
+        # without a full HBM round-trip for the intermediate tensor.
+        weighted = expert_output.astype(jnp.float32) * sorted_weights[:, None].astype(jnp.float32)
+        output = jnp.zeros((total_tokens, expert_output.shape[-1]), dtype=jnp.float32)
+        output = output.at[token_indices].add(weighted)
+        return output.astype(self.dtype)
 
     def _dispatch(self, group_sizes, expert_shard_id):
         if self.ep_size <= 1:
