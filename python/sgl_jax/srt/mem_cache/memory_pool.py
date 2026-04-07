@@ -491,6 +491,7 @@ class SWAKVPool(KVCache):
         self,
         size: int,
         size_swa: int,
+        page_size: int,
         swa_attention_layer_ids: list[int],
         full_attention_layer_ids: list[int],
         token_to_kv_pool_class: KVCache = MHATokenToKVPool,
@@ -499,11 +500,12 @@ class SWAKVPool(KVCache):
     ):
         self.size = size
         self.size_swa = size_swa
+        self.page_size = page_size
         self.swa_layer_nums = len(swa_attention_layer_ids)
         self.full_layer_nums = len(full_attention_layer_ids)
         self.mesh = kwargs["mesh"]
         self.kv_partition_axis = "tensor"
-        kwargs["page_size"] = 1
+        kwargs["page_size"] = page_size
 
         # SWA layers may have different KV head count than full-attention layers
         swa_kwargs = kwargs

@@ -521,8 +521,10 @@ class ModelRunner(BaseModelRunner):
             self.token_to_kv_pool = SWAKVPool(
                 size=self.full_max_total_num_tokens,
                 size_swa=self.swa_max_total_num_tokens,
+                page_size=self.page_size,
                 swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
                 full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+                token_to_kv_pool_class=MHATokenToKVPool,
                 dtype=self.kv_cache_dtype,
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(
                     self.attention_tp_size
@@ -554,6 +556,7 @@ class ModelRunner(BaseModelRunner):
                         self.full_max_total_num_tokens,
                         self.swa_max_total_num_tokens,
                         kvcache=self.token_to_kv_pool,
+                        page_size=self.page_size,
                         dp_size=dp_size,
                     )
                 else:
@@ -573,6 +576,17 @@ class ModelRunner(BaseModelRunner):
                     debug_mode=False,
                     dp_size=dp_size,
                 )
+
+        if (
+            self.is_hybrid
+            and hasattr(self, "attn_backend")
+            and hasattr(self.token_to_kv_pool_allocator, "full_to_swa_index_mapping")
+        ):
+            object.__setattr__(
+                self.attn_backend,
+                "swa_index_mapping",
+                self.token_to_kv_pool_allocator.full_to_swa_index_mapping,
+            )
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
