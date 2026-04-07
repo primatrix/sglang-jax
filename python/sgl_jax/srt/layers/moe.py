@@ -487,7 +487,7 @@ class EPMoE(nnx.Module):
             batch_size, seq_len = hidden_states.shape[0], hidden_states.shape[1]
             total_tokens = batch_size * seq_len
 
-        inputs_2d, token_indices, sorted_selected_experts, weights, group_sizes = self._permute(
+        x, sorted_selected_experts, weights, group_sizes = self._permute(
             hidden_states, topk_ids, topk_weights
         )
 
@@ -496,8 +496,7 @@ class EPMoE(nnx.Module):
         group_offset = self._dispatch(group_sizes, expert_shard_id)
 
         intermediate_output = self._gmm_compute(
-            inputs_2d,
-            token_indices,
+            x,
             group_sizes,
             w0_weights,
             w1_weights,
@@ -530,8 +529,7 @@ class EPMoE(nnx.Module):
 
     def _gmm_compute(
         self,
-        inputs_2d,
-        token_indices,
+        x,
         group_sizes,
         w0_kernel,
         w1_kernel,
@@ -544,13 +542,8 @@ class EPMoE(nnx.Module):
         w1_kernel_bias=None,
         wo_kernel_bias=None,
     ):
-        if token_indices.shape[0] == 0:
-            return jnp.zeros((0, wo_kernel.shape[-1]), dtype=inputs_2d.dtype)
-
-        # indexed_gmm: gather sorted_inputs here instead of in _permute,
-        # so XLA can fuse the gather with the matmul and avoid materializing
-        # the full [M*top_k, D] sorted_inputs tensor at peak memory.
-        x = inputs_2d[token_indices].astype(self.dtype)
+        if x.shape[0] == 0:
+            return jnp.zeros((0, wo_kernel.shape[-1]), dtype=x.dtype)
 
         group_sizes = group_sizes.astype(jnp.int32)
         act_q_dtype = self.activation_quantized_dtype
@@ -644,16 +637,14 @@ class EPMoE(nnx.Module):
 
         flatten_selected_experts = jnp.ravel(top_k_indices)
         sorted_selected_experts = jnp.argsort(flatten_selected_experts, stable=True)
-        # token_indices: maps each sorted position to the original token index.
-        # Pass to _gmm_compute so the gather happens there (indexed_gmm pattern),
-        # avoiding a full [M*top_k, D] materialization in _permute.
-        token_indices = sorted_selected_experts // self.num_experts_per_tok
+        sorted_indices = sorted_selected_experts // self.num_experts_per_tok
+
+        sorted_inputs = jnp.take(inputs_2d, indices=sorted_indices, axis=0).astype(self.dtype)
 
         group_sizes = jnp.bincount(flatten_selected_experts, length=self.num_experts)
 
         return (
-            inputs_2d,
-            token_indices,
+            sorted_inputs,
             sorted_selected_experts,
             top_k_weights,
             group_sizes,
