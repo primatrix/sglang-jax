@@ -20,7 +20,10 @@ import jax.numpy as jnp
 from flax import nnx
 
 from benchmark.moe.utils import build_mesh, generate_router_logits
-from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import TileSizes
+from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import (
+    TileSizes,
+    calculate_tiling,
+)
 from sgl_jax.srt.layers.moe import EPMoE, TopK
 
 NUM_EXPERTS = 256
@@ -29,61 +32,38 @@ HIDDEN_SIZE = 4096
 INTERMEDIATE_SIZE = 2048
 PROFILE_DIR = os.environ.get("PROFILE_DIR", "/gcs/moe_profiles")
 
+
+def make_tile_m_fn(target_tile_m: int):
+    """Create a TileFn that uses auto-tiler for tile_k/tile_n but overrides tile_m."""
+
+    def fn(lhs_dtype, rhs_dtype, dims, vmem_limit_bytes):
+        tiles = calculate_tiling(lhs_dtype, rhs_dtype, dims, vmem_limit_bytes)
+        actual_tile_m = min(target_tile_m, dims.size_m)
+        return TileSizes(tile_m=actual_tile_m, tile_k=tiles.tile_k, tile_n=tiles.tile_n)
+
+    return fn
+
+
 # (tag, ep_size, tp_size, num_tokens, v2_tile_info, use_segment_sum)
 PROFILE_CASES = [
     # Best config from last round: ep1_tp16 at 16k tokens
-    # Baseline (auto-tiling, argsort+take+einsum unpermute)
+    # Baseline (auto-tiling tile_m=128, argsort+take+einsum unpermute)
     ("baseline_ep1_tp16_nt16384", 1, 16, 16384, None, False),
-    # Tiling experiments: tile_m=256 (double default 128)
-    (
-        "tiling256_ep1_tp16_nt16384",
-        1,
-        16,
-        16384,
-        TileSizes(tile_m=256, tile_k=256, tile_n=256),
-        False,
-    ),
+    # Tiling experiments: tile_m=256 (auto tile_k/tile_n preserved)
+    ("tiling256_ep1_tp16_nt16384", 1, 16, 16384, make_tile_m_fn(256), False),
     # Tiling: tile_m=512
-    (
-        "tiling512_ep1_tp16_nt16384",
-        1,
-        16,
-        16384,
-        TileSizes(tile_m=512, tile_k=256, tile_n=256),
-        False,
-    ),
+    ("tiling512_ep1_tp16_nt16384", 1, 16, 16384, make_tile_m_fn(512), False),
     # Segment-sum unpermute (eliminates argsort+take+reshape+einsum)
     ("segsum_ep1_tp16_nt16384", 1, 16, 16384, None, True),
     # Combined: tiling_256 + segment_sum
-    (
-        "tiling256_segsum_ep1_tp16_nt16384",
-        1,
-        16,
-        16384,
-        TileSizes(tile_m=256, tile_k=256, tile_n=256),
-        True,
-    ),
+    ("tiling256_segsum_ep1_tp16_nt16384", 1, 16, 16384, make_tile_m_fn(256), True),
     # Also test decode scenario (1k tokens)
     ("baseline_ep1_tp16_nt1024", 1, 16, 1024, None, False),
-    (
-        "tiling256_ep1_tp16_nt1024",
-        1,
-        16,
-        1024,
-        TileSizes(tile_m=256, tile_k=256, tile_n=256),
-        False,
-    ),
+    ("tiling256_ep1_tp16_nt1024", 1, 16, 1024, make_tile_m_fn(256), False),
     ("segsum_ep1_tp16_nt1024", 1, 16, 1024, None, True),
     # EP16 configs for comparison
     ("baseline_ep16_tp1_nt16384", 16, 1, 16384, None, False),
-    (
-        "tiling256_ep16_tp1_nt16384",
-        16,
-        1,
-        16384,
-        TileSizes(tile_m=256, tile_k=256, tile_n=256),
-        False,
-    ),
+    ("tiling256_ep16_tp1_nt16384", 16, 1, 16384, make_tile_m_fn(256), False),
     ("segsum_ep16_tp1_nt16384", 16, 1, 16384, None, True),
 ]
 
