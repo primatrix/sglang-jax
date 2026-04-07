@@ -14,6 +14,7 @@ from sgl_jax.srt.kernels.update_kv_cache.update_kv_cache import (
     get_slot_mapping,
     kv_cache_update,
 )
+from sgl_jax.srt.kernels.ragged_paged_attention.util import get_dtype_packing
 
 
 def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
@@ -510,12 +511,46 @@ class SplitMHATokenToKVPool(MHATokenToKVPool):
     Used when K and V have different head_dim (e.g., K=192, V=128 in DeepSeek-V2).
     """
 
+    def _compute_physical_head_num(self) -> int:
+        shard_count = 1
+        if self.mesh is not None:
+            shard_count = int(self.mesh.shape.get(self.kv_partition_axis, 1))
+        if self.head_num % shard_count != 0:
+            raise ValueError(
+                "SplitMHATokenToKVPool expects head_num to be divisible by shard count: "
+                f"head_num={self.head_num}, shard_count={shard_count}"
+            )
+        local_head_num = self.head_num // shard_count
+        packing = get_dtype_packing(self.dtype)
+        local_head_num_physical = ((local_head_num + packing - 1) // packing) * packing
+        return local_head_num_physical * shard_count
+
+    def _align_kv_heads(self, x: jax.Array) -> jax.Array:
+        if x.shape[1] == self.head_num_physical:
+            return x
+        repeats_per_head = self.head_num_physical // x.shape[1]
+        return jnp.repeat(x, repeats_per_head, axis=1)[:, : self.head_num_physical, :]
+
+    def prepare_split_kv_kernel_inputs(
+        self,
+        k: jax.Array,
+        v: jax.Array,
+        attention_sink: jax.Array | None = None,
+    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+        # Keep cache storage in the physical head contract, but leave live per-step
+        # tensors to be aligned later on each local shard by the attention backend.
+        return k, v, attention_sink
+
     def _create_buffers(self):
         """Create sharded separate K and V cache buffers."""
         self.kv_sharding = NamedSharding(self.mesh, P(None, self.kv_partition_axis, None))
+        self.head_num_physical = self._compute_physical_head_num()
 
         logger.info(
-            "[KVPool] SplitMHATokenToKVPool: head_dim=%s v_head_dim=%s layer_num=%s size=%s page_size=%s",
+            "[KVPool] SplitMHATokenToKVPool: head_num=%s head_num_physical=%s "
+            "head_dim=%s v_head_dim=%s layer_num=%s size=%s page_size=%s",
+            self.head_num,
+            self.head_num_physical,
             self.head_dim,
             self.v_head_dim,
             self.layer_num,
@@ -526,12 +561,12 @@ class SplitMHATokenToKVPool(MHATokenToKVPool):
 
         k_buffer_shape = (
             self.size + self.page_size,
-            self.head_num,
+            self.head_num_physical,
             self.head_dim,
         )
         v_buffer_shape = (
             self.size + self.page_size,
-            self.head_num,
+            self.head_num_physical,
             self.v_head_dim,
         )
         total_memory_per_layer = (
@@ -581,6 +616,7 @@ class SplitMHATokenToKVPool(MHATokenToKVPool):
         aux_data = {
             **parent_aux_data,
             "head_num": self.head_num,
+            "head_num_physical": self.head_num_physical,
             "head_dim": self.head_dim,
             "v_head_dim": self.v_head_dim,
             "kv_partition_axis": self.kv_partition_axis,
@@ -607,6 +643,7 @@ class SplitMHATokenToKVPool(MHATokenToKVPool):
         obj.mem_usage = aux_data["mem_usage"]
 
         obj.head_num = aux_data["head_num"]
+        obj.head_num_physical = aux_data.get("head_num_physical", obj.head_num)
         obj.head_dim = aux_data["head_dim"]
         obj.v_head_dim = aux_data.get("v_head_dim", obj.head_dim)
         obj.kv_partition_axis = aux_data["kv_partition_axis"]
@@ -621,9 +658,9 @@ class SplitMHATokenToKVPool(MHATokenToKVPool):
         raise NotImplementedError("get_fused_kv_buffer not supported for split KV cache")
 
     def get_split_kv_buffer(self, layer_id: int) -> tuple[jax.Array, jax.Array]:
-        """Get separate K and V buffers directly."""
+        """Get separate K and V buffers directly (full physical heads)."""
         layer_idx = layer_id - self.start_layer
-        return self.k_buffer[layer_idx], self.v_buffer[layer_idx]
+        return (self.k_buffer[layer_idx], self.v_buffer[layer_idx])
 
     def get_kv_buffer(self, layer_id: int) -> tuple[jax.Array, jax.Array]:
         layer_idx = layer_id - self.start_layer
@@ -647,8 +684,8 @@ class SplitMHATokenToKVPool(MHATokenToKVPool):
             v = jnp.pad(v, ((0, 0), (0, 0), (0, self.v_head_dim - v.shape[-1])))
 
         self.k_buffer[layer_idx], self.v_buffer[layer_idx] = update_kv_cache_vectorized(
-            k=k,
-            v=v,
+            k=self._align_kv_heads(k),
+            v=self._align_kv_heads(v),
             loc=loc,
             k_cache=self.k_buffer[layer_idx],
             v_cache=self.v_buffer[layer_idx],
@@ -698,8 +735,12 @@ class SplitMHATokenToKVPool(MHATokenToKVPool):
             cache_v = jnp.pad(cache_v, ((0, 0), (0, 0), (0, self.v_head_dim - cache_v.shape[-1])))
         N = self.k_buffer[layer_idx].shape[0]
         safe_loc = jnp.where(loc >= 0, loc, jnp.int32(N))
-        updated_k = self.k_buffer[layer_idx].at[safe_loc].set(cache_k, mode="drop")
-        updated_v = self.v_buffer[layer_idx].at[safe_loc].set(cache_v, mode="drop")
+        updated_k = self.k_buffer[layer_idx].at[safe_loc].set(
+            self._align_kv_heads(cache_k), mode="drop"
+        )
+        updated_v = self.v_buffer[layer_idx].at[safe_loc].set(
+            self._align_kv_heads(cache_v), mode="drop"
+        )
         return updated_k, updated_v
 
 
@@ -711,6 +752,7 @@ class SWAKVPool(KVCache):
         self,
         size: int,
         size_swa: int,
+        page_size: int,
         swa_attention_layer_ids: list[int],
         full_attention_layer_ids: list[int],
         full_pool_class: KVCache = MHATokenToKVPool,
@@ -721,11 +763,12 @@ class SWAKVPool(KVCache):
     ):
         self.size = size
         self.size_swa = size_swa
+        self.page_size = page_size
         self.swa_layer_nums = len(swa_attention_layer_ids)
         self.full_layer_nums = len(full_attention_layer_ids)
         self.mesh = kwargs["mesh"]
         self.kv_partition_axis = "tensor"
-        kwargs["page_size"] = 1
+        kwargs["page_size"] = page_size
 
         # Build separate kwargs for full / SWA pools to allow different head dims
         kwargs_full = dict(kwargs)
@@ -824,6 +867,19 @@ class SWAKVPool(KVCache):
         if hasattr(pool, "get_split_kv_buffer"):
             return pool.get_split_kv_buffer(layer_id_pool)
         return pool.get_kv_buffer(layer_id_pool)
+
+    def prepare_split_kv_kernel_inputs(
+        self,
+        layer_id: int,
+        k: jax.Array,
+        v: jax.Array,
+        attention_sink: jax.Array | None = None,
+    ):
+        layer_id_pool, is_swa = self.layers_mapping[layer_id]
+        pool = self.swa_kv_pool if is_swa else self.full_kv_pool
+        if hasattr(pool, "prepare_split_kv_kernel_inputs"):
+            return pool.prepare_split_kv_kernel_inputs(k, v, attention_sink)
+        return k, v, attention_sink
 
     def get_fused_kv_buffer(self, layer_id):
         layer_id_pool, is_swa = self.layers_mapping[layer_id]

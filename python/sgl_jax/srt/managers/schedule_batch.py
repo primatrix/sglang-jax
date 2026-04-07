@@ -246,6 +246,9 @@ class Req:
         self.last_host_node: Any = None
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: int | None = None
+        # SWA eviction: sequence positions [0, swa_evicted_seqlen) have had
+        # their SWA pool slots freed (no longer in the sliding window).
+        self.swa_evicted_seqlen: int = 0
         # The prefix length of the last prefix matching
         self.last_matched_prefix_len: int = 0
 
@@ -825,6 +828,14 @@ class ScheduleBatch:
             extend_input_logprob_token_ids = None
 
         # Allocate memory
+        # Evict SWA slots before allocation (important for chunked prefill)
+        if self.is_hybrid:
+            sliding_window_size = getattr(self.model_config, "sliding_window", None)
+            if sliding_window_size and sliding_window_size > 0:
+                ps = self.token_to_kv_pool_allocator.page_size
+                for req, pre_len in zip(reqs, prefix_lens):
+                    self._evict_swa(req, pre_len, sliding_window_size, ps)
+
         if self.token_to_kv_pool_allocator.page_size == 1:
             out_cache_loc = alloc_token_slots(self.tree_cache, extend_num_tokens)
         else:
@@ -1016,7 +1027,39 @@ class ScheduleBatch:
             self.model_config.vocab_size,
         )
 
+    def maybe_evict_swa(self):
+        """Evict SWA pool slots outside the sliding window for all requests."""
+        if not self.is_hybrid:
+            return
+        sliding_window_size = getattr(self.model_config, "sliding_window", None)
+        if sliding_window_size is None or sliding_window_size <= 0:
+            return
+        page_size = getattr(self.token_to_kv_pool_allocator, "_page_size",
+                           getattr(self.token_to_kv_pool_allocator, "page_size", 1))
+        for req in self.reqs:
+            pre_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+            self._evict_swa(req, pre_len, sliding_window_size, page_size)
+
+    def _evict_swa(self, req, pre_len: int, sliding_window_size: int, page_size: int):
+        """Free SWA pool slots for tokens outside the sliding window."""
+        new_evicted = max(req.swa_evicted_seqlen, pre_len - sliding_window_size)
+        # Page-align down
+        if page_size > 1:
+            new_evicted = (new_evicted // page_size) * page_size
+        if new_evicted <= req.swa_evicted_seqlen:
+            return
+        # Get the full-pool token indices for evicted positions
+        free_slots = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, req.swa_evicted_seqlen : new_evicted
+        ]
+        self.token_to_kv_pool_allocator.free_swa(free_slots)
+        req.swa_evicted_seqlen = new_evicted
+
     def prepare_for_decode(self):
+        # Evict SWA slots outside the sliding window before decode allocation
+        if self.is_hybrid:
+            self.maybe_evict_swa()
+
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
         if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
@@ -1193,7 +1236,24 @@ class ScheduleBatch:
         page_size: int,
         enable_static_lora: bool = False,
     ) -> ModelWorkerBatch:
-        if self.forward_mode.is_decode_or_idle():
+        # Radix cache hit n-1 tokens → extend_len=1, use DECODE path to
+        # avoid ragged-attention overhead and extra shape compilations on TPU.
+        use_decode_fastpath_for_extend = (
+            self.forward_mode == ForwardMode.EXTEND
+            and not self.return_logprob
+            and not self.return_output_logprob_only
+            and self.spec_info is None
+            and all(extend_len == 1 for extend_len in self.extend_lens)
+            and all(req.is_chunked <= 0 for req in self.reqs)
+            and all(len(req.output_ids) == 0 for req in self.reqs)
+            and all(not req.mm_inputs for req in self.reqs)
+            and all(not req.apply_for_deepstack for req in self.reqs)
+        )
+        worker_forward_mode = (
+            ForwardMode.DECODE if use_decode_fastpath_for_extend else self.forward_mode
+        )
+
+        if worker_forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
             token_paddings = bs_paddings
         else:
@@ -1250,7 +1310,7 @@ class ScheduleBatch:
             )
 
         # Calculate positions after padding
-        if self.forward_mode.is_extend():
+        if worker_forward_mode.is_extend():
             # For prefill: create positions for each token in sequences
             # Calculate total tokens without padding first
             total_tokens_before_padding = sum([extend_len for extend_len in self.extend_lens])
@@ -1348,7 +1408,7 @@ class ScheduleBatch:
             )
             invalid_seq_lens = np.array([0] * bs_padding_size, dtype=seq_lens_cpu.dtype)
             seq_lens_cpu = np.concat([seq_lens_cpu, invalid_seq_lens], axis=0)
-            if self.forward_mode.is_extend():
+            if worker_forward_mode.is_extend():
                 invalid_extend_prefix_lens = np.array(
                     [0] * bs_padding_size, dtype=extend_prefix_lens.dtype
                 )
@@ -1418,7 +1478,7 @@ class ScheduleBatch:
         if bs_padding_size > 0:
             lora_ids = lora_ids + [None] * bs_padding_size
         input_embedding = None
-        if self.forward_mode == ForwardMode.EXTEND:
+        if worker_forward_mode == ForwardMode.EXTEND:
             input_embedding_list = []
             deepstack_visual_embedding_list = []
             deepstack_visual_pos_mask_list = []
@@ -1490,7 +1550,7 @@ class ScheduleBatch:
 
         return ModelWorkerBatch(
             bid=bid,
-            forward_mode=self.forward_mode,
+            forward_mode=worker_forward_mode,
             input_ids=input_ids_cpu,
             real_input_ids_len=real_input_ids_len,
             req_pool_indices=req_pool_indices_cpu,
@@ -1505,9 +1565,11 @@ class ScheduleBatch:
             mrope_positions=mrope_positions_cpu,
             cache_loc=cache_loc_cpu,
             extend_prefix_lens=(
-                extend_prefix_lens if self.forward_mode == ForwardMode.EXTEND else None
+                extend_prefix_lens if worker_forward_mode == ForwardMode.EXTEND else None
             ),
-            extend_seq_lens=(extend_seq_lens if self.forward_mode == ForwardMode.EXTEND else None),
+            extend_seq_lens=(
+                extend_seq_lens if worker_forward_mode == ForwardMode.EXTEND else None
+            ),
             extend_logprob_start_lens=extend_logprob_start_lens,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             lora_ids=(
