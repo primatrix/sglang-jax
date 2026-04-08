@@ -24,7 +24,11 @@ from sgl_jax.srt.mem_cache.memory_pool import (
 
 
 def _make_mesh():
-    return Mesh(np.array(jax.devices()[:1]), axis_names=("tensor",))
+    # SWA pools now use DP-aware sharding specs: P("data", "tensor", None).
+    # Build a degenerate 1x1 mesh so unit tests can exercise that path on a
+    # single local device without needing multi-host setup.
+    devices = np.array(jax.devices()[:1], dtype=object).reshape(1, 1)
+    return Mesh(devices, axis_names=("data", "tensor"))
 
 
 def _make_swa_pool(size, size_swa, page_size, mesh):
@@ -495,10 +499,15 @@ class TestSWAOverlapSafety(unittest.TestCase):
         return indices
 
     def _make_batch(self, req, *, enable_overlap, forward_mode, prefix_lens=None, chunked_req=None):
-        from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
+        from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, ScheduleReqsInfo
 
-        return ScheduleBatch(
+        reqs_info = ScheduleReqsInfo(
             reqs=[req],
+            chunked_req=chunked_req,
+            prefix_lens=prefix_lens,
+        )
+        return ScheduleBatch(
+            reqs_info=[reqs_info],
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.alloc,
             tree_cache=None,
@@ -506,8 +515,7 @@ class TestSWAOverlapSafety(unittest.TestCase):
             model_config=SimpleNamespace(sliding_window=self.sliding_window),
             forward_mode=forward_mode,
             enable_overlap=enable_overlap,
-            prefix_lens=prefix_lens,
-            chunked_req=chunked_req,
+            dp_size=1,
         )
 
     def test_overlap_decode_first_batch_skips_reclaim(self):
