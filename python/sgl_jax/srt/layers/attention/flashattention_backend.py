@@ -552,7 +552,8 @@ class FlashAttention(AttentionBackend):
 
         def _ragged_paged_attention_with_fused_kv(*args):
             queries, keys, values, kv_cache_fused = args[:4]
-            other_args = args[4:]
+            other_args = args[4:-1]
+            sink_arg = args[-1]
 
             # Call fused KV kernel with head interleaving
             result, updated_kv_cache_fused = ragged_paged_attention_v3(
@@ -561,6 +562,7 @@ class FlashAttention(AttentionBackend):
                 values,
                 kv_cache_fused,
                 *other_args,
+                attention_sink=sink_arg,
                 causal=causal,
                 decode_mode=decode_mode,
                 sm_scale=scale,

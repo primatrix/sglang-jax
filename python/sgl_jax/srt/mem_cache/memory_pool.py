@@ -780,26 +780,31 @@ def update_fused_kv_cache_vectorized(
     by grouping contiguous tokens into page-sized chunks for efficient updates.
     """
 
-    # Detect whether fused_kv actually has data partition sharding.
-    # If not (e.g., in tests with single-device mesh), use None to avoid mismatch.
-    fused_kv_sharding = getattr(fused_kv, "sharding", None)
-    has_data_sharding = False
-    if fused_kv_sharding is not None and hasattr(fused_kv_sharding, "spec"):
-        spec = fused_kv_sharding.spec
-        if spec is not None and len(spec) > 0 and spec[0] is not None:
-            has_data_sharding = True
-    effective_data_axis = data_partition_axis if has_data_sharding else None
+    # Reshard fused_kv and loc to match kv_cache's sharding on the data axis,
+    # since kv_cache is the persistent buffer and may have data partition sharding
+    # while fused_kv (from test or non-DP context) may not.
+    kv_cache_sharding = getattr(kv_cache, "sharding", None)
+    if kv_cache_sharding is not None and hasattr(kv_cache_sharding, "spec"):
+        kv_spec = kv_cache_sharding.spec
+        if kv_spec is not None and len(kv_spec) > 0 and kv_spec[0] is not None:
+            from jax.sharding import NamedSharding
+
+            target_mesh = kv_cache_sharding.mesh
+            fused_kv = jax.lax.with_sharding_constraint(
+                fused_kv, NamedSharding(target_mesh, P(kv_spec[0], kv_partition_axis, None))
+            )
+            loc = jax.lax.with_sharding_constraint(loc, NamedSharding(target_mesh, P(kv_spec[0])))
 
     @jax.shard_map(
         in_specs=(
             # fused_kv: sharded by data (tokens) and tensor (heads)
-            P(effective_data_axis, kv_partition_axis, None),
+            P(data_partition_axis, kv_partition_axis, None),
             # loc: sharded by data
-            P(effective_data_axis),
+            P(data_partition_axis),
             # kv_cache: sharded by data and tensor
-            P(effective_data_axis, kv_partition_axis, None),
+            P(data_partition_axis, kv_partition_axis, None),
         ),
-        out_specs=P(effective_data_axis, kv_partition_axis, None),
+        out_specs=P(data_partition_axis, kv_partition_axis, None),
         mesh=mesh,
         check_vma=False,
     )
