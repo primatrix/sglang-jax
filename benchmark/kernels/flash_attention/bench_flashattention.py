@@ -2,10 +2,16 @@
   Usage:
   1. For test benchmark in ci
   SGLANG_JAX_IS_IN_CI=true python benchmark/kernels/flash_attention/bench_flashattention.py
-  2. For generic benchmark results
+  2. For generic benchmark results (full sweep)
   python benchmark/kernels/flash_attention/bench_flashattention.py
+  3. For custom benchmark with specific parameters
+  python benchmark/kernels/flash_attention/bench_flashattention.py \
+    --mode decode --q-head-num 4 --kv-head-num 4 --head-dim 128 \
+    --page-size 128 --batch-sizes 1,4,16,64,128,256 \
+    --sliding-windows 0,4096
 """
 
+import argparse
 import functools
 
 import jax
@@ -33,6 +39,7 @@ def benchmark_backend(
     kv_head_num,
     head_dim,
     page_size,
+    sliding_window=None,
 ):
     scale = head_dim**-0.5
 
@@ -87,7 +94,7 @@ def benchmark_backend(
 
     @functools.partial(
         jax.jit,
-        static_argnames=["sm_scale"],
+        static_argnames=["sm_scale", "sliding_window"],
     )
     def jitted_attn(
         q,
@@ -100,6 +107,7 @@ def benchmark_backend(
         cu_kv_lens,
         distribution,
         sm_scale,
+        sliding_window,
     ):
         return ragged_paged_attention(
             q,
@@ -114,6 +122,7 @@ def benchmark_backend(
             custom_mask=None,
             causal=1,
             sm_scale=sm_scale,
+            sliding_window=sliding_window,
         )
 
     attn = functools.partial(
@@ -128,6 +137,7 @@ def benchmark_backend(
         cu_kv_lens,
         distribution,
         scale,
+        sliding_window,
     )
 
     # Warmup
@@ -154,7 +164,6 @@ def benchmark_backend(
     )
     avg_time = float(np.mean(times)) if times else float("nan")
 
-    # cal num_q_heads_per_blk, num_kv_heads_per_blk
     return avg_time
 
 
@@ -245,6 +254,142 @@ def full_benchmark():
                 raise ValueError(f"run failed: {e=}")
 
             print(f"cost: {flash_time * 1000}ms")
+
+
+def custom_benchmark(args):
+    """Run benchmark with user-specified parameters via argparse."""
+    print(f"JAX devices: {jax.device_count()} x {jax.devices()[0].platform}")
+    print(f"Device: {jax.devices()[0].device_kind}")
+    print()
+
+    modes = args.mode
+    q_head_nums = args.q_head_num
+    kv_head_nums = args.kv_head_num
+    head_dims = args.head_dim
+    page_sizes = args.page_size
+    sliding_windows = [None if sw == 0 else sw for sw in args.sliding_windows]
+
+    max_context_len = args.max_context_len
+    max_kv_cache_tokens = args.max_kv_cache_tokens
+
+    for mode in modes:
+        bs_list = args.batch_sizes if mode == "decode" else args.prefill_tokens
+        print("=" * 90)
+        print(f"[{mode.upper()}] BENCHMARK RESULTS")
+        print("=" * 90)
+        header = (
+            f"{'q_h':>4} {'kv_h':>4} {'dim':>4} {'ps':>4} "
+            f"{'SW':>8} {'BS/Tok':>8} {'Time(ms)':>10} {'us/token':>10}"
+        )
+        print(header)
+        print("-" * len(header))
+
+        for q_h in q_head_nums:
+            for kv_h in kv_head_nums:
+                if q_h < kv_h or q_h % kv_h != 0:
+                    continue
+                for hd in head_dims:
+                    for ps in page_sizes:
+                        for sw in sliding_windows:
+                            sw_label = str(sw) if sw else "None"
+                            for bs in bs_list:
+                                try:
+                                    t = benchmark_backend(
+                                        mode,
+                                        max_context_len,
+                                        max_kv_cache_tokens,
+                                        bs,
+                                        q_h,
+                                        kv_h,
+                                        hd,
+                                        ps,
+                                        sliding_window=sw,
+                                    )
+                                    us_per_token = t * 1000 / bs
+                                    print(
+                                        f"{q_h:>4} {kv_h:>4} {hd:>4} {ps:>4} "
+                                        f"{sw_label:>8} {bs:>8} "
+                                        f"{t * 1000:>10.3f} {us_per_token:>10.3f}"
+                                    )
+                                except Exception as e:
+                                    print(
+                                        f"{q_h:>4} {kv_h:>4} {hd:>4} {ps:>4} "
+                                        f"{sw_label:>8} {bs:>8} "
+                                        f"{'FAILED':>10} {str(e)[:30]}"
+                                    )
+        print()
+
+
+def parse_int_list(s):
+    """Parse comma-separated int list: '1,4,16,64' -> [1, 4, 16, 64]."""
+    return [int(x.strip()) for x in s.split(",")]
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Benchmark ragged_paged_attention kernel with configurable parameters."
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="decode",
+        help="Comma-separated modes: decode,prefill (default: decode)",
+    )
+    parser.add_argument(
+        "--q-head-num",
+        type=parse_int_list,
+        default=[4],
+        help="Comma-separated q head nums (default: 4)",
+    )
+    parser.add_argument(
+        "--kv-head-num",
+        type=parse_int_list,
+        default=[2],
+        help="Comma-separated kv head nums (default: 2)",
+    )
+    parser.add_argument(
+        "--head-dim",
+        type=parse_int_list,
+        default=[128],
+        help="Comma-separated head dims (default: 128)",
+    )
+    parser.add_argument(
+        "--page-size",
+        type=parse_int_list,
+        default=[128],
+        help="Comma-separated page sizes (default: 128)",
+    )
+    parser.add_argument(
+        "--batch-sizes",
+        type=parse_int_list,
+        default=[1, 4, 8, 16, 32, 64, 128, 256],
+        help="Comma-separated decode batch sizes (default: 1,4,8,16,32,64,128,256)",
+    )
+    parser.add_argument(
+        "--prefill-tokens",
+        type=parse_int_list,
+        default=[512, 1024, 2048, 4096],
+        help="Comma-separated prefill token counts (default: 512,1024,2048,4096)",
+    )
+    parser.add_argument(
+        "--sliding-windows",
+        type=parse_int_list,
+        default=[0],
+        help="Comma-separated sliding window sizes, 0=None (default: 0)",
+    )
+    parser.add_argument(
+        "--max-context-len",
+        type=int,
+        default=40960,
+        help="Max context length for page indices allocation (default: 40960)",
+    )
+    parser.add_argument(
+        "--max-kv-cache-tokens",
+        type=int,
+        default=600000,
+        help="Max KV cache tokens (default: 600000)",
+    )
+    return parser
 
 
 class TestPerformance(CustomTestCase):
@@ -361,5 +506,9 @@ if __name__ == "__main__":
         print("Run Ragged Paged Attention Performance Test...")
         TestPerformance().test_ragged_paged_attention_performance()
     else:
-        print("Run Ragged Paged Attention Full Benchmark...")
-        full_benchmark()
+        parser = build_parser()
+        args = parser.parse_args()
+        args.mode = [m.strip() for m in args.mode.split(",")]
+        args.mode_type = args.mode[0]
+        print("Run Ragged Paged Attention Benchmark...")
+        custom_benchmark(args)
