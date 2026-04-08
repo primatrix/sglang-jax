@@ -140,7 +140,7 @@ def create_test_data(
     causal=True,
     input_ids=None,
     model_config=None,
-    max_total_token_size=710016,
+    max_total_token_size=200000,
 ):
     """Create a real ForwardBatch for testing."""
     assert mode in ["prefill", "decode"]
@@ -342,7 +342,7 @@ class TestAttention(CustomTestCase):
         mode,
         lens,
         mode_args,
-        max_total_token_size=710016,
+        max_total_token_size=200000,
         sliding_window=None,
         logit_cap=None,
         xai_temperature_len=None,
@@ -530,7 +530,11 @@ class TestAttention(CustomTestCase):
             (512, 1024),
         ]
 
-        self.run_test("prefill", lens, (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16))
+        self.run_test(
+            "prefill",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+        )
 
     def test_mha_decode_accuracy_page_size_1(self):
         """Test JAX attention accuracy against native fa"""
@@ -550,7 +554,11 @@ class TestAttention(CustomTestCase):
             (1, 1025),
         ]
 
-        self.run_test("decode", lens, (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16))
+        self.run_test(
+            "decode",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+        )
 
     def test_mha_prefill_accuracy_page_size_8(self):
         """
@@ -566,7 +574,11 @@ class TestAttention(CustomTestCase):
             (5, 33),
             (5, 5),
         ]
-        self.run_test("prefill", lens, (num_heads, head_dim, num_kv_heads, 8, jnp.bfloat16))
+        self.run_test(
+            "prefill",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 8, jnp.bfloat16),
+        )
 
     def test_mha_decode_accuracy_page_size_8(self):
         """Test JAX attention accuracy against native fa"""
@@ -579,7 +591,11 @@ class TestAttention(CustomTestCase):
             (1, 6),
             (1, 5),
         ]
-        self.run_test("decode", lens, (num_heads, head_dim, num_kv_heads, 8, jnp.bfloat16))
+        self.run_test(
+            "decode",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 8, jnp.bfloat16),
+        )
 
     def test_mha_prefill_accuracy_page_size_64(self):
         """Test JAX attention accuracy against PyTorch reference"""
@@ -597,7 +613,11 @@ class TestAttention(CustomTestCase):
             (123, 522),
             (1, 511),
         ]
-        self.run_test("prefill", lens, (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16))
+        self.run_test(
+            "prefill",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16),
+        )
 
     def test_mha_decode_accuracy_page_size_64(self):
         """Test JAX attention accuracy against native fa"""
@@ -616,7 +636,11 @@ class TestAttention(CustomTestCase):
             (1, 1024),
             (1, 1025),
         ]
-        self.run_test("decode", lens, (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16))
+        self.run_test(
+            "decode",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16),
+        )
 
     def test_gqa_prefill_accuracy_page_size_64(self):
         """Test JAX attention accuracy against PyTorch reference"""
@@ -679,7 +703,6 @@ class TestAttention(CustomTestCase):
             (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
             sliding_window=sliding_window_size,
             logit_cap=logit_cap,
-            max_total_token_size=200000,
         )
 
     def test_sliding_window_and_soft_cap_decode_accuracy(self):
@@ -704,7 +727,6 @@ class TestAttention(CustomTestCase):
             (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
             sliding_window=sliding_window_size,
             logit_cap=logit_cap,
-            max_total_token_size=200000,
         )
 
     def test_gqa_prefill_accuracy_page_size_64_temperature(self):
