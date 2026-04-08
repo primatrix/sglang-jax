@@ -382,7 +382,6 @@ class ModelRunner(BaseModelRunner):
         # KV pool, so profiling must use the same values to estimate correctly.
         head_dim = self.model_config.head_dim
         v_head_dim = getattr(self.model_config, "v_head_dim", head_dim)
-        dtype_bytes = jnp.dtype(self.kv_cache_dtype).itemsize
         num_layers = self.model_config.num_hidden_layers
 
         fa_cell_per_layer = self._compute_kv_cell_per_layer(head_dim, v_head_dim)
@@ -410,7 +409,10 @@ class ModelRunner(BaseModelRunner):
                     "TPU Memory profiling (hybrid): available=%.1fGB, "
                     "full_pool=%d tokens (%d FA layers), swa_pool=%d tokens (%d SWA layers)",
                     available_kv_cache_bytes / (1024**3),
-                    full_max_tokens, fa_layers, swa_max_tokens, swa_layers,
+                    full_max_tokens,
+                    fa_layers,
+                    swa_max_tokens,
+                    swa_layers,
                 )
             else:
                 cell_size = fa_cell_per_layer * num_layers
@@ -598,6 +600,15 @@ class ModelRunner(BaseModelRunner):
             pool_class = SplitMHATokenToKVPool if full_hd != full_vhd else MHATokenToKVPool
             head_num = self.model_config.get_total_num_kv_heads_with_replication(self.tp_size)
 
+            # SWA layers may have a different number of KV heads (e.g. MiMo-V2-Flash).
+            hf_cfg = self.model_config.hf_text_config
+            swa_kv_heads_raw = getattr(hf_cfg, "swa_num_key_value_heads", None)
+            if swa_kv_heads_raw is not None and swa_kv_heads_raw != head_num:
+                # Apply the same TP-aware replication logic used for the FA heads.
+                swa_head_num = self.tp_size if self.tp_size > swa_kv_heads_raw else swa_kv_heads_raw
+            else:
+                swa_head_num = None  # same as FA, no override needed
+
             fa_layers, swa_layers = self._get_hybrid_layer_counts()
             swa_layer_ids = getattr(self.model_config, "swa_attention_layer_ids", None)
             full_layer_ids = getattr(self.model_config, "full_attention_layer_ids", None)
@@ -617,7 +628,11 @@ class ModelRunner(BaseModelRunner):
                     full_layer_ids = list(range(n))
 
             full_max = getattr(self, "full_max_total_num_tokens", self.max_total_num_tokens)
-            swa_max = getattr(self, "swa_max_total_num_tokens", int(self.max_total_num_tokens * self.server_args.swa_full_tokens_ratio))
+            swa_max = getattr(
+                self,
+                "swa_max_total_num_tokens",
+                int(self.max_total_num_tokens * self.server_args.swa_full_tokens_ratio),
+            )
 
             self.token_to_kv_pool = SWAKVPool(
                 size=full_max,
@@ -632,6 +647,7 @@ class ModelRunner(BaseModelRunner):
                 head_dim=aligned_head_dim,
                 mesh=self.mesh,
                 v_head_dim=aligned_v_head_dim,
+                swa_head_num=swa_head_num,
             )
             # Keep is_hybrid = True so scheduler uses dual-pool path
         else:
@@ -657,7 +673,11 @@ class ModelRunner(BaseModelRunner):
         if self.token_to_kv_pool_allocator is None:
             if self.is_hybrid:
                 full_max = getattr(self, "full_max_total_num_tokens", self.max_total_num_tokens)
-                swa_max = getattr(self, "swa_max_total_num_tokens", int(self.max_total_num_tokens * self.server_args.swa_full_tokens_ratio))
+                swa_max = getattr(
+                    self,
+                    "swa_max_total_num_tokens",
+                    int(self.max_total_num_tokens * self.server_args.swa_full_tokens_ratio),
+                )
                 self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
                     full_max,
                     swa_max,
@@ -681,8 +701,16 @@ class ModelRunner(BaseModelRunner):
         # Use object.__setattr__ to bypass Flax NNX's Pytree __setattr__ check,
         # which rejects assigning data (numpy array) to a static attribute.
         # This attribute is only used on host in get_forward_metadata(), never in JIT.
-        if self.is_hybrid and hasattr(self, "attn_backend") and hasattr(self.token_to_kv_pool_allocator, "full_to_swa_index_mapping"):
-            object.__setattr__(self.attn_backend, "swa_index_mapping", self.token_to_kv_pool_allocator.full_to_swa_index_mapping)
+        if (
+            self.is_hybrid
+            and hasattr(self, "attn_backend")
+            and hasattr(self.token_to_kv_pool_allocator, "full_to_swa_index_mapping")
+        ):
+            object.__setattr__(
+                self.attn_backend,
+                "swa_index_mapping",
+                self.token_to_kv_pool_allocator.full_to_swa_index_mapping,
+            )
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
@@ -893,11 +921,19 @@ class ModelRunner(BaseModelRunner):
         L_swa = len(swa_attention_layer_ids)
 
         full_max = getattr(self, "full_max_total_num_tokens", self.max_total_num_tokens)
-        swa_max = getattr(self, "swa_max_total_num_tokens", int(self.max_total_num_tokens * self.server_args.swa_full_tokens_ratio))
+        swa_max = getattr(
+            self,
+            "swa_max_total_num_tokens",
+            int(self.max_total_num_tokens * self.server_args.swa_full_tokens_ratio),
+        )
         logger.info(
             "Hybrid model: dual pool with %d FA layers + %d SWA layers "
             "(window=%d), full_pool=%d tokens, swa_pool=%d tokens",
-            L_fa, L_swa, self.sliding_window_size, full_max, swa_max,
+            L_fa,
+            L_swa,
+            self.sliding_window_size,
+            full_max,
+            swa_max,
         )
 
     def init_lora_manager(self):
