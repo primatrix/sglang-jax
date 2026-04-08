@@ -1136,8 +1136,10 @@ class Scheduler(
                 else:
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
-            print(f"[get_next_batch_to_run] after merge: {self.running_batch.batch_size()=}",flush=True)
-
+            #print(f"[get_next_batch_to_run] after merge: {self.running_batch.batch_size()=}",flush=True)
+        
+        # Force to calculate based on budget
+        self.running_batch.batch_is_full = False
         new_batch = self.get_new_batch_prefill()
 
         # if new_batch is not None:
@@ -1276,7 +1278,7 @@ class Scheduler(
     def update_running_batch(self, batch: ScheduleBatch) -> ScheduleBatch | None:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
-        print(f"[update_running_batch] initial_bs: {initial_bs=}",flush=True)
+        #print(f"[update_running_batch] initial_bs: {initial_bs=}",flush=True)
 
         batch.filter_batch()
         if batch.is_empty():
@@ -1310,7 +1312,7 @@ class Scheduler(
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
         
-        print(f"[update_running_batch] after retract: {batch.batch_size()=}",flush=True)
+        #print(f"[update_running_batch] after retract: {batch.batch_size()=}",flush=True)
 
         # Update batch arrays
         batch.prepare_for_decode()
