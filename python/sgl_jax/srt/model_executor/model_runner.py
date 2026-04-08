@@ -555,11 +555,7 @@ class ModelRunner(BaseModelRunner):
         if backend == "native":
             from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 
-            # V is padded to head_dim in model layer; fused KV cache, no split
-            is_split_kv = False
-            return NativeAttention(
-                self.num_attn_heads, self.num_kv_heads, self.mesh, is_split_kv=is_split_kv
-            )
+            return NativeAttention(self.num_attn_heads, self.num_kv_heads, self.mesh)
         elif backend == "fa":
             from sgl_jax.srt.layers.attention.flashattention_backend import (
                 FlashAttention,

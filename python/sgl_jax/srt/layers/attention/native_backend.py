@@ -20,7 +20,6 @@ class NativeAttention(AttentionBackend):
         num_attn_heads,
         num_kv_heads,
         mesh,
-        is_split_kv: bool = False,
     ):
         self.num_heads = num_attn_heads
         if num_kv_heads is not None:
@@ -28,7 +27,6 @@ class NativeAttention(AttentionBackend):
         else:
             self.num_kv_heads = num_attn_heads
         self.mesh = mesh
-        self.is_split_kv = is_split_kv
         self.kv_sharding = NamedSharding(self.mesh, P(None, "tensor", None))
 
     def tree_flatten(self):
@@ -37,7 +35,6 @@ class NativeAttention(AttentionBackend):
             "num_heads": self.num_heads,
             "num_kv_heads": self.num_kv_heads,
             "mesh": self.mesh,
-            "is_split_kv": self.is_split_kv,
         }
         return (children, aux_data)
 
@@ -46,7 +43,7 @@ class NativeAttention(AttentionBackend):
         return cls(
             num_attn_heads=aux_data["num_heads"],
             num_kv_heads=aux_data["num_kv_heads"],
-            is_split_kv=aux_data.get("is_split_kv", False),
+            mesh=aux_data["mesh"],
         )
 
     def get_forward_metadata(self, batch: ModelWorkerBatch):
@@ -137,32 +134,21 @@ class NativeAttention(AttentionBackend):
                 layer_id, forward_batch.out_cache_loc, k, v, is_decode=is_decode
             )
 
-            if self.is_split_kv:
-                k_buf, v_buf = token_to_kv_pool.get_kv_buffer(layer_id)
-                return k_buf, v_buf, (k_buf, v_buf)
-            else:
-                # Use fused layer directly from pool; derive K/V views without extra merge
-                fused_layer = token_to_kv_pool.get_fused_kv_buffer(layer_id)
-                k = fused_layer.at[:, ::2, :].get(out_sharding=kv_sharding)
-                v = fused_layer.at[:, 1::2, :].get(out_sharding=kv_sharding)
-                return k, v, fused_layer
+            # Use fused layer directly from pool; derive K/V views without extra merge
+            fused_layer = token_to_kv_pool.get_fused_kv_buffer(layer_id)
+            k = fused_layer.at[:, ::2, :].get(out_sharding=kv_sharding)
+            v = fused_layer.at[:, 1::2, :].get(out_sharding=kv_sharding)
+            return k, v, fused_layer
         else:
-            if self.is_split_kv:
-                token_to_kv_pool.set_kv_buffer(
-                    layer_id, forward_batch.out_cache_loc, k, v, is_decode=is_decode
-                )
-                k_buf, v_buf = token_to_kv_pool.get_kv_buffer(layer_id)
-                return k_buf, v_buf, (k_buf, v_buf)
-            else:
-                updated_layer = token_to_kv_pool.set_kv_buffer_legacy(
-                    layer_id, forward_batch.out_cache_loc, k, v
-                )
-                # Functional style: treat updated_layer as authoritative fused buffer for this layer in this step
-                # Derive K/V views for attention computation from fused buffer directly
-                k = updated_layer.at[:, ::2, :].get(out_sharding=kv_sharding)
-                v = updated_layer.at[:, 1::2, :].get(out_sharding=kv_sharding)
-                # Return fused buffer directly for persistence outside JIT
-                return k, v, updated_layer
+            updated_layer = token_to_kv_pool.set_kv_buffer_legacy(
+                layer_id, forward_batch.out_cache_loc, k, v
+            )
+            # Functional style: treat updated_layer as authoritative fused buffer for this layer in this step
+            # Derive K/V views for attention computation from fused buffer directly
+            k = updated_layer.at[:, ::2, :].get(out_sharding=kv_sharding)
+            v = updated_layer.at[:, 1::2, :].get(out_sharding=kv_sharding)
+            # Return fused buffer directly for persistence outside JIT
+            return k, v, updated_layer
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
