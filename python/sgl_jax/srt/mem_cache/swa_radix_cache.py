@@ -746,11 +746,18 @@ class SWARadixCache(BasePrefixCache):
         self.swa_lru_list.reset_node_and_parents_mru(best_last_node, self.root_node)
 
         # This last_access_time is for sanity check, can be deleted after validation in production
-        cur_time = time.monotonic()
-        while node:
-            node.last_access_time = cur_time
-            cur_time -= 0.0001
-            node = node.parent
+        # Collect path from best_last_node to root, then assign increasing times so that
+        # child nodes have a strictly later timestamp than parent nodes — matching the
+        # MRU ordering established by reset_node_and_parents_mru above.
+        path = []
+        tmp = best_last_node
+        while tmp:
+            path.append(tmp)
+            tmp = tmp.parent
+        # path[0] = best_last_node (leaf-side), path[-1] = root
+        # Assign times root-first so leaf gets the latest timestamp.
+        for p in reversed(path):
+            p.last_access_time = time.monotonic()
 
         return value[:best_value_len], best_last_node
 

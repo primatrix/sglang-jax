@@ -338,6 +338,39 @@ class TestSWARadixCache(unittest.TestCase):
         # This used to fail with "Incorrect LRU list" for the full LRU.
         self.cache.sanity_check()
 
+    def test_lru_consistency(self):
+        """LRU lists stay consistent after interleaved inserts, matches, and evictions."""
+        self.cache.sliding_window_size = 5
+
+        # Build a tree with shared prefixes that forces splits
+        seq_a = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        seq_b = [1, 2, 3, 4, 5, 6, 7, 8, 11, 12]
+        seq_c = [1, 2, 3, 4, 5, 6, 13, 14, 15, 16]
+
+        self.cache.insert(seq_a, value=self._alloc_indices(len(seq_a)), prev_prefix_len=0)
+        self.cache.insert(seq_b, value=self._alloc_indices(len(seq_b)), prev_prefix_len=0)
+        self.cache.insert(seq_c, value=self._alloc_indices(len(seq_c)), prev_prefix_len=0)
+
+        # Match a sequence to shuffle MRU ordering
+        self.cache.match_prefix(seq_b)
+        self.cache.sanity_check()
+
+        # Partial full eviction then sanity check
+        self.cache.evict(full_num_tokens=4, swa_num_tokens=0)
+        self.cache.sanity_check()
+
+        # SWA-only eviction then sanity check
+        self.cache.evict(full_num_tokens=0, swa_num_tokens=4)
+        self.cache.sanity_check()
+
+        # Another match after evictions
+        self.cache.match_prefix(seq_a[:6])
+        self.cache.sanity_check()
+
+        # Evict more to stress tombstone cleanup
+        self.cache.evict(full_num_tokens=8, swa_num_tokens=8)
+        self.cache.sanity_check()
+
 
 if __name__ == "__main__":
     unittest.main()
