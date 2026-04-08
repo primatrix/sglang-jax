@@ -9,12 +9,12 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
+from sgl_jax.srt.kernels.ragged_paged_attention.util import get_dtype_packing
 from sgl_jax.srt.kernels.update_kv_cache.update_kv_cache import (
     get_num_slices_per_block,
     get_slot_mapping,
     kv_cache_update,
 )
-from sgl_jax.srt.kernels.ragged_paged_attention.util import get_dtype_packing
 
 
 def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
@@ -735,11 +735,11 @@ class SplitMHATokenToKVPool(MHATokenToKVPool):
             cache_v = jnp.pad(cache_v, ((0, 0), (0, 0), (0, self.v_head_dim - cache_v.shape[-1])))
         N = self.k_buffer[layer_idx].shape[0]
         safe_loc = jnp.where(loc >= 0, loc, jnp.int32(N))
-        updated_k = self.k_buffer[layer_idx].at[safe_loc].set(
-            self._align_kv_heads(cache_k), mode="drop"
+        updated_k = (
+            self.k_buffer[layer_idx].at[safe_loc].set(self._align_kv_heads(cache_k), mode="drop")
         )
-        updated_v = self.v_buffer[layer_idx].at[safe_loc].set(
-            self._align_kv_heads(cache_v), mode="drop"
+        updated_v = (
+            self.v_buffer[layer_idx].at[safe_loc].set(self._align_kv_heads(cache_v), mode="drop")
         )
         return updated_k, updated_v
 
@@ -759,6 +759,7 @@ class SWAKVPool(KVCache):
         swa_pool_class: KVCache = MHATokenToKVPool,
         swa_head_dim: int | None = None,
         swa_v_head_dim: int | None = None,
+        swa_head_num: int | None = None,
         **kwargs,
     ):
         self.size = size
@@ -778,6 +779,8 @@ class SWAKVPool(KVCache):
             kwargs_swa["head_dim"] = swa_head_dim
         if swa_v_head_dim is not None:
             kwargs_swa["v_head_dim"] = swa_v_head_dim
+        if swa_head_num is not None:
+            kwargs_swa["head_num"] = swa_head_num
 
         self.swa_kv_pool = swa_pool_class(
             size=size_swa,
