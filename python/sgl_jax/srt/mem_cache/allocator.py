@@ -428,6 +428,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         alloc_full_indices = self.full_attn_allocator.alloc(need_size)
         alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
+        if alloc_swa_indices is None:
+            self.full_attn_allocator.free(alloc_full_indices)
+            return None
         self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
         return alloc_full_indices
 
@@ -454,6 +457,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             prefix_lens, seq_lens, swa_last_loc, extend_num_tokens
         )
         if swa_indices is None:
+            self.full_attn_allocator.free(full_indices)
             return None
 
         # Update mapping for newly allocated indices
@@ -477,6 +481,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # Allocate from SWA pool with translated last_loc
         swa_indices = self.swa_attn_allocator.alloc_decode(seq_lens, swa_last_loc)
         if swa_indices is None:
+            self.full_attn_allocator.free(full_indices)
             return None
 
         # Update mapping for newly allocated indices
@@ -495,8 +500,16 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
     def free_swa(self, free_index: np.array):
+        if len(free_index) == 0:
+            return
         map_vals = self.full_to_swa_index_mapping[free_index]
         swa_indices = map_vals[map_vals > 0]
+        if self.page_size > 1 and len(swa_indices) > 0:
+            assert len(swa_indices) % self.page_size == 0, (
+                f"free_swa: number of mapped SWA indices ({len(swa_indices)}) "
+                f"must be a multiple of page_size={self.page_size}. "
+                f"Callers must pass page-aligned ranges to avoid partial page release."
+            )
         self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[free_index] = 0
 
