@@ -966,6 +966,52 @@ class TestGLAWrapper:
         )
 
     @requires_tops
+    def test_gla_recurrence_matches_numpy(self):
+        """fused_recurrent_simple_gla should match pure-numpy step-by-step GLA recurrence."""
+        from tops.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
+
+        seq_len, H, K = 8, _SMALL_H, _SMALL_K
+        rng = np.random.default_rng(42)
+        q_np = rng.standard_normal((seq_len, H, K)).astype(np.float32)
+        k_np = rng.standard_normal((seq_len, H, K)).astype(np.float32)
+        v_np = rng.standard_normal((seq_len, H, K)).astype(np.float32)
+        h0_np = rng.standard_normal((H, K, K)).astype(np.float32)
+        slope_np = -np.array(BailingMoeV2_5LinearAttention.build_slope_tensor(H), dtype=np.float32)
+
+        # Numpy reference: h_t = exp(slope) * h_{t-1} + k_t^T x v_t, o_t = q_t @ h_t * scale
+        scale = K**-0.5
+        decay = np.exp(slope_np)
+        h, ref_outs = h0_np.copy(), []
+        for t in range(seq_len):
+            h = decay[:, None, None] * h + np.einsum("hk,hv->hkv", k_np[t], v_np[t])
+            ref_outs.append(np.einsum("hk,hkv->hv", q_np[t], h) * scale)
+        ref_out, ref_h = np.stack(ref_outs), h
+
+        # JAX kernel (expects [B, T, H, K])
+        out_jax, state_jax = fused_recurrent_simple_gla(
+            jnp.array(q_np[None, :]),
+            jnp.array(k_np[None, :]),
+            jnp.array(v_np[None, :]),
+            g_gamma=jnp.array(slope_np),
+            initial_state=jnp.array(h0_np[None]),
+            output_final_state=True,
+            scale=None,
+        )
+
+        np.testing.assert_allclose(
+            np.array(out_jax[0]),
+            ref_out,
+            atol=1e-4,
+            err_msg="GLA output != numpy reference",
+        )
+        np.testing.assert_allclose(
+            np.array(state_jax[0]),
+            ref_h,
+            atol=1e-4,
+            err_msg="GLA final state != numpy reference",
+        )
+
+    @requires_tops
     @requires_tpu
     def test_prefill_wrapper_matches_direct_kernel(self):
         """Module prefill output should match direct scatter + simple_gla_fwd call."""
