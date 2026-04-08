@@ -372,9 +372,12 @@ class ModelRunner(BaseModelRunner):
 
         if available_kv_cache_bytes <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
-        head_dim_aligned = self.model_config.head_dim
-        if head_dim_aligned % 128 != 0:
-            head_dim_aligned = (self.model_config.head_dim + 127) // 128 * 128
+
+        # head_dim/v_head_dim handling
+        # V is padded to head_dim in model layer for fused KV cache
+        head_dim = self.model_config.head_dim
+        head_dim_aligned = (head_dim + 127) // 128 * 128
+
         cell_size = (
             self.model_config.get_num_kv_heads(self.tp_size)
             * head_dim_aligned
@@ -552,7 +555,11 @@ class ModelRunner(BaseModelRunner):
         if backend == "native":
             from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 
-            return NativeAttention(self.num_attn_heads, self.num_kv_heads, self.mesh)
+            # V is padded to head_dim in model layer; fused KV cache, no split
+            is_split_kv = False
+            return NativeAttention(
+                self.num_attn_heads, self.num_kv_heads, self.mesh, is_split_kv=is_split_kv
+            )
         elif backend == "fa":
             from sgl_jax.srt.layers.attention.flashattention_backend import (
                 FlashAttention,
@@ -605,6 +612,7 @@ class ModelRunner(BaseModelRunner):
                 forward_batch, logits_metadata
             )
             cache_miss_count = count()
+
         self._set_kv_cache_after_forward(layers_kv_fused)
 
         # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch
