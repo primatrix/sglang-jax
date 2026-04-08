@@ -1034,14 +1034,22 @@ class ScheduleBatch:
         sliding_window_size = getattr(self.model_config, "sliding_window", None)
         if sliding_window_size is None or sliding_window_size <= 0:
             return
-        page_size = getattr(self.token_to_kv_pool_allocator, "_page_size",
-                           getattr(self.token_to_kv_pool_allocator, "page_size", 1))
+        page_size = getattr(
+            self.token_to_kv_pool_allocator,
+            "_page_size",
+            getattr(self.token_to_kv_pool_allocator, "page_size", 1),
+        )
         for req in self.reqs:
             pre_len = len(req.origin_input_ids) + len(req.output_ids) - 1
             self._evict_swa(req, pre_len, sliding_window_size, page_size)
 
     def _evict_swa(self, req, pre_len: int, sliding_window_size: int, page_size: int):
         """Free SWA pool slots for tokens outside the sliding window."""
+        if page_size > 1:
+            assert req.swa_evicted_seqlen % page_size == 0, (
+                f"swa_evicted_seqlen must be page-aligned, got {req.swa_evicted_seqlen} "
+                f"with page_size={page_size}"
+            )
         new_evicted = max(req.swa_evicted_seqlen, pre_len - sliding_window_size)
         # Page-align down
         if page_size > 1:

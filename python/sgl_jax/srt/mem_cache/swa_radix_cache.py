@@ -826,6 +826,12 @@ class SWARadixCache(BasePrefixCache):
             # the prefill prefix matching will stuck.
             if update_kv_after_len < total_prefix_length + prefix_len:
                 first_diff_idx = max(0, update_kv_after_len - total_prefix_length)
+                if self.page_size > 1:
+                    # Round up to page boundary so that free() only receives
+                    # page-aligned indices for PagedTokenToKVPoolAllocator.
+                    first_diff_idx = (
+                        (first_diff_idx + self.page_size - 1) // self.page_size
+                    ) * self.page_size
                 if node.swa_tombstone:
                     assert (
                         node.swa_lock_ref == 0
