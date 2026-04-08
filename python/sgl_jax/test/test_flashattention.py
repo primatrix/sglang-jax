@@ -434,7 +434,7 @@ class TestAttention(CustomTestCase):
             forward_batch.seq_lens,
             page_table,
             forward_batch.attn_backend.forward_metadata.cu_q_lens,
-            forward_batch.attn_backend.forward_metadata.num_seqs,
+            jnp.array([forward_batch.batch_size], dtype=jnp.int32),
             custom_mask=(
                 forward_batch.spec_info.custom_mask if forward_batch.spec_info is not None else None
             ),
