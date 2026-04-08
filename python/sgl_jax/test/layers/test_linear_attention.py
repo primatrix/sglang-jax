@@ -1288,17 +1288,18 @@ class TestTPConsistency:
                 out_tpn, state_tpn = module_n(positions, hidden, fb, state_init)
 
             # bf16 row-parallel dense: TP>1 does local matmul + all-reduce,
-            # different addition order from TP=1 → max_diff ~0.25 on TPU.
+            # different addition order from TP=1.  At magnitude ~70, bf16
+            # 1 ULP = 0.5, so max_diff can reach 0.5 on v6e-4.
             np.testing.assert_allclose(
                 np.array(out_tp1),
                 np.array(out_tpn),
-                atol=3e-1,
+                atol=6e-1,
                 err_msg=f"TP={tp} decode output != TP=1",
             )
             np.testing.assert_allclose(
                 np.array(state_tp1),
                 np.array(state_tpn),
-                atol=3e-1,
+                atol=6e-1,
                 err_msg=f"TP={tp} decode state != TP=1",
             )
 
@@ -1349,12 +1350,12 @@ class TestTPConsistency:
             np.testing.assert_allclose(
                 np.array(out_tp1),
                 np.array(out_tpn),
-                atol=3e-1,
+                atol=6e-1,
                 err_msg=f"TP={tp} prefill output != TP=1",
             )
             np.testing.assert_allclose(
                 np.array(state_tp1),
                 np.array(state_tpn),
-                atol=3e-1,
+                atol=6e-1,
                 err_msg=f"TP={tp} prefill state != TP=1",
             )
