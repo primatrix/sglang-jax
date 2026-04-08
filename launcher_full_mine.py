@@ -31,6 +31,8 @@ sys.argv = [
     "native",
     "--page-size",
     "1",
+    "--max-running-requests",
+    "32",
     "--disable-precompile",
 ]
 import runpy
