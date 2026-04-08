@@ -29,30 +29,17 @@ logger = logging.getLogger(__name__)
 
 # ── Debug dump helper ──────────────────────────────────────────────
 DUMP_DIR = "/inference-models/brian/ref-mimo"
-_dump_phase = {"current": "prefill", "prefill_done": False, "decode_done": False}
 
 
 def _save_cb(arr, *, name: str):
-    phase = _dump_phase["current"]
-    if _dump_phase.get(f"{phase}_done"):
-        return
     os.makedirs(DUMP_DIR, exist_ok=True)
-    np.save(os.path.join(DUMP_DIR, f"{phase}_{name}.npy"), np.asarray(arr))
+    a = np.asarray(arr)
+    n = a.shape[0] if a.ndim >= 1 else 0
+    np.save(os.path.join(DUMP_DIR, f"t{n}_{name}.npy"), a)
 
 
 def dump(jax_arr, name: str):
     jax.debug.callback(_save_cb, jax_arr, name=name)
-
-
-def _mark_phase_done(*args):
-    phase = _dump_phase["current"]
-    _dump_phase[f"{phase}_done"] = True
-    if phase == "prefill":
-        _dump_phase["current"] = "decode"
-
-
-def mark_phase_done():
-    jax.debug.callback(_mark_phase_done)
 
 
 def _get_mimo_num_experts(config: PretrainedConfig) -> int:
@@ -795,7 +782,6 @@ class MiMoV2Model(nnx.Module):
 
         hidden_states = self.norm(hidden_states)
         dump(hidden_states, "final_hidden_states")
-        mark_phase_done()
 
         return hidden_states, layers_kv_fused, layers_topk_ids
 
