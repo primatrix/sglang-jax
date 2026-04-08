@@ -503,7 +503,7 @@ class ModelRunner(BaseModelRunner):
                 full_attention_layer_ids=self.model_config.full_attention_layer_ids,
                 dtype=self.kv_cache_dtype,
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
-                head_dim=self.model_config.head_dim,
+                head_dim=(self.model_config.head_dim + 127) // 128 * 128,
                 mesh=self.mesh,
             )
         else:
