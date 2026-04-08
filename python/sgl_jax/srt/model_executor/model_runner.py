@@ -50,6 +50,7 @@ from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import get_available_device_memory
+from sgl_jax.srt.utils.memory_budget import compute_optimal_swa_ratio
 
 logger = logging.getLogger(__name__)
 
@@ -390,10 +391,13 @@ class ModelRunner(BaseModelRunner):
             fa_layers, swa_layers = self._get_hybrid_layer_counts()
             swa_cell_per_layer = self._compute_swa_cell_per_layer(head_dim, v_head_dim)
             if fa_layers is not None:
-                # Dual pool: solve for full_max_tokens given a ratio R
-                # full_max_tokens * fa_cell * fa_layers + swa_max_tokens * swa_cell * swa_layers = available
-                # swa_max_tokens = full_max_tokens * R
-                R = self.server_args.swa_full_tokens_ratio
+                R = self._compute_optimal_swa_ratio(
+                    fa_cell_per_layer,
+                    swa_cell_per_layer,
+                    fa_layers,
+                    swa_layers,
+                    available_kv_cache_bytes,
+                )
                 full_cell = fa_cell_per_layer * fa_layers
                 swa_cell = swa_cell_per_layer * swa_layers
                 full_max_tokens = max(1, int(available_kv_cache_bytes / (full_cell + R * swa_cell)))
@@ -407,12 +411,14 @@ class ModelRunner(BaseModelRunner):
                 max_tokens = full_max_tokens  # scheduler uses full pool size
                 logger.info(
                     "TPU Memory profiling (hybrid): available=%.1fGB, "
-                    "full_pool=%d tokens (%d FA layers), swa_pool=%d tokens (%d SWA layers)",
+                    "full_pool=%d tokens (%d FA layers), swa_pool=%d tokens (%d SWA layers), "
+                    "effective_R=%.4f",
                     available_kv_cache_bytes / (1024**3),
                     full_max_tokens,
                     fa_layers,
                     swa_max_tokens,
                     swa_layers,
+                    R,
                 )
             else:
                 cell_size = fa_cell_per_layer * num_layers
@@ -492,6 +498,28 @@ class ModelRunner(BaseModelRunner):
         kv_heads_per_device = ((local_heads + packing - 1) // packing) * packing
 
         return self._compute_kv_cell_per_layer(swa_hd, swa_vhd, kv_heads_per_device)
+
+    def _compute_optimal_swa_ratio(
+        self,
+        fa_cell_per_layer: int,
+        swa_cell_per_layer: int,
+        fa_layers: int,
+        swa_layers: int,
+        available_kv_cache_bytes: int,
+    ) -> float:
+        """Compute optimal SWA-to-full token ratio for dual-pool memory allocation.
+
+        Delegates to :func:`sgl_jax.srt.utils.memory_budget.compute_optimal_swa_ratio`.
+        """
+        return compute_optimal_swa_ratio(
+            user_R=self.server_args.swa_full_tokens_ratio,
+            sliding_window=self.sliding_window_size,
+            context_len=self.model_config.context_len,
+            fa_cell_per_layer=fa_cell_per_layer,
+            swa_cell_per_layer=swa_cell_per_layer,
+            fa_layers=fa_layers,
+            swa_layers=swa_layers,
+        )
 
     @property
     def is_hybrid_gdn(self):
