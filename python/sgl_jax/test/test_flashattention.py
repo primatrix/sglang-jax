@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
+from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import (
     ref_ragged_paged_attention,
 )
 from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
@@ -345,6 +345,7 @@ class TestAttention(CustomTestCase):
         sliding_window=None,
         logit_cap=None,
         xai_temperature_len=None,
+        attention_sink=None,
     ):
         # Create mock forward_batch
         if len(mode_args) == 5:
@@ -432,7 +433,7 @@ class TestAttention(CustomTestCase):
             forward_batch.seq_lens,
             page_table,
             forward_batch.attn_backend.forward_metadata.cu_q_lens,
-            # forward_batch.attn_backend.forward_metadata.cu_kv_lens,
+            forward_batch.attn_backend.forward_metadata.num_seqs,
             custom_mask=(
                 forward_batch.spec_info.custom_mask if forward_batch.spec_info is not None else None
             ),
@@ -441,6 +442,7 @@ class TestAttention(CustomTestCase):
             sliding_window=sliding_window,
             soft_cap=logit_cap,
             xai_temperature_len=xai_temperature_len,
+            attention_sink=attention_sink,
         )
         jax.block_until_ready(expected)
 
@@ -449,7 +451,7 @@ class TestAttention(CustomTestCase):
 
         @jax.jit
         def jit_attn(q, k, v, forward_batch, token_to_kv_pool: KVCache):
-            out = attn(q, k, v, forward_batch, token_to_kv_pool)
+            out = attn(q, k, v, forward_batch, token_to_kv_pool, attention_sink=attention_sink)
             return out
 
         # run
@@ -845,6 +847,52 @@ class TestAttention(CustomTestCase):
 
     def test_gqa_decode_with_custom_mask(self):
         pass
+
+    def test_attention_sink_decode_accuracy(self):
+        """Test attention sink accuracy in decode mode with per-head sink logits"""
+        num_heads = 32
+        num_kv_heads = 8
+        head_dim = 128
+
+        lens = [
+            (1, 256),
+            (1, 512),
+            (1, 1024),
+        ]
+
+        # Per-head sink logits
+        rng = np.random.RandomState(123)
+        attention_sink = jnp.array(rng.randn(num_heads).astype(np.float32))
+
+        self.run_test(
+            "decode",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+            attention_sink=attention_sink,
+        )
+
+    def test_attention_sink_prefill_accuracy(self):
+        """Test attention sink accuracy in prefill mode with per-head sink logits"""
+        num_heads = 32
+        num_kv_heads = 8
+        head_dim = 128
+
+        lens = [
+            (1, 128),
+            (64, 64),
+            (128, 256),
+        ]
+
+        # Per-head sink logits
+        rng = np.random.RandomState(456)
+        attention_sink = jnp.array(rng.randn(num_heads).astype(np.float32))
+
+        self.run_test(
+            "prefill",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+            attention_sink=attention_sink,
+        )
 
 
 if __name__ == "__main__":
