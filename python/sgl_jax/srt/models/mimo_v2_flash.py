@@ -450,10 +450,11 @@ class MiMoMoeAttention(nnx.Module):
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
 
-        if self.layer_id == 0:
-            dump(q, "L0_q_proj_out")
-            dump(k, "L0_k_proj_out")
-            dump(v, "L0_v_proj_out")
+        if self.layer_id <= 1:
+            p = f"L{self.layer_id}"
+            dump(q, f"{p}_q_proj_out")
+            dump(k, f"{p}_k_proj_out")
+            dump(v, f"{p}_v_proj_out")
 
         q = q.reshape(-1, self.q_head_num, self.head_dim)
         k = k.reshape(-1, k.shape[-1] // self.head_dim, self.head_dim)
@@ -466,9 +467,10 @@ class MiMoMoeAttention(nnx.Module):
 
         q, k = self.rotary_emb(positions, q, k)
 
-        if self.layer_id == 0:
-            dump(q, "L0_q_after_rope")
-            dump(k, "L0_k_after_rope")
+        if self.layer_id <= 1:
+            p = f"L{self.layer_id}"
+            dump(q, f"{p}_q_after_rope")
+            dump(k, f"{p}_k_after_rope")
 
         attn_output, kv_fused = self.attn(
             q,
@@ -479,8 +481,9 @@ class MiMoMoeAttention(nnx.Module):
             attention_sink=self.attention_sink_bias,
         )
 
-        if self.layer_id == 0:
-            dump(attn_output, "L0_attn_output_raw")
+        if self.layer_id <= 1:
+            p = f"L{self.layer_id}"
+            dump(attn_output, f"{p}_attn_output_raw")
 
         # Some backends still return q_head_num * head_dim here and need an
         # explicit slice, while split-KV attention already returns q_head_num *
@@ -499,13 +502,15 @@ class MiMoMoeAttention(nnx.Module):
                     f"or {expected_v_head_dim}"
                 )
 
-        if self.layer_id == 0:
-            dump(attn_output, "L0_attn_output_sliced")
+        if self.layer_id <= 1:
+            p = f"L{self.layer_id}"
+            dump(attn_output, f"{p}_attn_output_sliced")
 
         output, _ = self.o_proj(attn_output)
 
-        if self.layer_id == 0:
-            dump(output, "L0_o_proj_out")
+        if self.layer_id <= 1:
+            p = f"L{self.layer_id}"
+            dump(output, f"{p}_o_proj_out")
 
         return output, kv_fused
 
@@ -646,6 +651,9 @@ class MiMoMoeDecoderLayer(nnx.Module):
         residual: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
 
+        _d = self.layer_id <= 1
+        p = f"L{self.layer_id}"
+
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -654,8 +662,8 @@ class MiMoMoeDecoderLayer(nnx.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
-        if self.layer_id == 0:
-            dump(hidden_states, "L0_input_layernorm_out")
+        if _d:
+            dump(hidden_states, f"{p}_input_layernorm_out")
 
         hidden_states, kv_fused = self.self_attn(
             positions=positions,
@@ -664,15 +672,15 @@ class MiMoMoeDecoderLayer(nnx.Module):
             token_to_kv_pool=token_to_kv_pool,
         )
 
-        if self.layer_id == 0:
-            dump(hidden_states, "L0_attn_residual_before_add")
+        if _d:
+            dump(hidden_states, f"{p}_attn_residual_before_add")
 
         hidden_states += residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        if self.layer_id == 0:
-            dump(hidden_states, "L0_post_attn_layernorm_out")
+        if _d:
+            dump(hidden_states, f"{p}_post_attn_layernorm_out")
 
         # optional shared expert output
         if self.shared_experts is not None:
@@ -689,8 +697,8 @@ class MiMoMoeDecoderLayer(nnx.Module):
             mlp_output = self.mlp(hidden_states)
             topk_ids = None
 
-        if self.layer_id == 0:
-            dump(mlp_output, "L0_mlp_out")
+        if _d:
+            dump(mlp_output, f"{p}_mlp_out")
 
         hidden_states = mlp_output if shared_output is None else (mlp_output + shared_output)
 
