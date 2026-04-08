@@ -22,7 +22,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 # ── Debug dump helper ──────────────────────────────────────────────
-DUMP_DIR = "/inference-models/brian/mimo-epic"
+DUMP_DIR = None  # Set to a path like "/inference-models/brian/mimo-epic" to enable
 
 
 def _save_cb(arr, *, name: str):
@@ -36,6 +36,8 @@ def _save_cb(arr, *, name: str):
 
 def dump(jax_arr: jax.Array, name: str):
     """Save *jax_arr* to ``DUMP_DIR/tN_<name>.npy`` (N=token count)."""
+    if DUMP_DIR is None:
+        return
     jax.debug.callback(_save_cb, jax_arr, name=name)
 
 
