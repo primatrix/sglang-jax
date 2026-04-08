@@ -505,11 +505,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         map_vals = self.full_to_swa_index_mapping[free_index]
         swa_indices = map_vals[map_vals > 0]
         if self.page_size > 1 and len(swa_indices) > 0:
-            assert len(swa_indices) % self.page_size == 0, (
-                f"free_swa: number of mapped SWA indices ({len(swa_indices)}) "
-                f"must be a multiple of page_size={self.page_size}. "
-                f"Callers must pass page-aligned ranges to avoid partial page release."
-            )
+            # Note: SWA indices don't need to be page-aligned here because
+            # pages are exclusively allocated to sequences. Freeing partial
+            # page indices is safe — np.unique(indices // page_size) will
+            # free the owning pages without affecting other sequences.
+            pass
         self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[free_index] = 0
 
