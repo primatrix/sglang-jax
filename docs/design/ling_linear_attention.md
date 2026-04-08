@@ -97,14 +97,37 @@ q, k, v 各自 [T, H, head_dim] = [T, 64, 128]
         cu_seqlens = self.backend.cu_seqlens_dev.value  # [N_padded+1]，各请求在 packed buffer 中的 chunk-aligned 边界
         # scatter：将 tight-packed [T, H, K] 散布到 chunk-aligned [1, T_pb, H, K]
         scatter_idx = self.backend.scatter_idx.value  # [T]，tight-packed → chunk-aligned 位置映射
-        q_packed, k_packed, v_packed = scatter_to_packed(q, k, v, scatter_idx, T_pb)
-        output_packed, new_state = simple_gla_fwd(
-            q_packed, k_packed, v_packed,      # [1, T_pb, H, K]
-            g_gamma=slopes,                    # [H] 固定衰减，每层不同
-            h0=recurrent_state,                # [N_padded, H, K, V]；首次调用由 #156 传入全零 array
-            cu_seqlens_dev=cu_seqlens,         # [N_padded+1]，非 None → 自动路由到 chunk_simple_gla_fwd_varlen
-            scale=None, use_ht=True, chunk_size=64,  # scale=None → tops 默认 K^-0.5；HF 亦未显式传 scale，一致性由第 6 节跨框架测试覆盖
-        )
+        # Pallas/Mosaic kernel 无法被 GSPMD 自动切分（custom_call 对 XLA 分区器不透明）；
+        # 用 shard_map 显式切分：每个设备在本地 H 分片上独立执行 scatter + simple_gla_fwd。
+        # cu_seqlens 以 P() replicated 传入，各设备持有完整 boundary 信息。
+        def _prefill_fn(q_local, k_local, v_local, gamma, h0, scatter_idx_p, cu_seqlens_p):
+            q_p = scatter_to_packed(q_local, scatter_idx_p, T_pb)   # [1, T_pb, H_local, K]
+            k_p = scatter_to_packed(k_local, scatter_idx_p, T_pb)
+            v_p = scatter_to_packed(v_local, scatter_idx_p, T_pb)
+            return simple_gla_fwd(
+                q_p, k_p, v_p,
+                g_gamma=gamma,          # [H_local]
+                h0=h0,                  # [N_padded, H_local, K, V]
+                cu_seqlens_dev=cu_seqlens_p,
+                scale=None, use_ht=True, chunk_size=64,
+            )
+        output_packed, new_state = shard_map(
+            _prefill_fn, mesh=self.mesh,
+            in_specs=(
+                P(None, "tensor", None),        # q
+                P(None, "tensor", None),        # k
+                P(None, "tensor", None),        # v
+                P("tensor"),                    # slopes [H_local]
+                P(None, "tensor", None, None),  # h0
+                P(),                            # scatter_idx（replicated）
+                P(),                            # cu_seqlens（replicated）
+            ),
+            out_specs=(
+                P(None, None, "tensor", None),  # output_packed
+                P(None, "tensor", None, None),  # new_state
+            ),
+            check_vma=False,
+        )(q, k, v, slopes, recurrent_state, scatter_idx, cu_seqlens)
         # output_packed [1, T_pb, H, V]；gather 回 [T, H, V]（含外层 padding slot）
         output = gather_from_packed(output_packed, scatter_idx)  # [T, H, V]
         # new_state [N_padded, H, K, V]（N_padded = cu_seqlens 长度减 1，trailing padding 槽对应零长 seq，state 为零）
@@ -129,7 +152,13 @@ slope = -BailingMoeV2_5LinearAttention.build_slope_tensor(self.num_heads) * (
 ```
 
 **TP 时 slopes 的处理**
-`g_gamma=self.slope`（形状 `[H]`）直接传入 kernel，GSPMD 自动将其随 q 的 H 维 sharding 传播切分，TP=1 和 TP>1 使用同一代码路径，无需额外处理。已通过在 CPU 和真实 TPU v6e-4 上验证 GSPMD方案可行性（TP=2/4，H=64，decode/prefill 全场景），数值精确匹配，无隐式 all-gather。
+
+两条路径的切分方式不同，原因是 Pallas/Mosaic kernel 对 GSPMD（XLA 自动分区器）不透明（`custom_call` 节点内部无法被分析），遇到分片张量时 GSPMD 会插入隐式 all-gather，而非切分 kernel。
+
+- **Decode**（`fused_recurrent_simple_gla`，纯 JAX lax.scan）：GSPMD 可自动传播 H 维 sharding，`g_gamma=self.slope`（形状 `[H]`）随 q 的 sharding 切分，TP=1 和 TP>1 同一代码路径，无需额外处理。
+- **Prefill**（`simple_gla_fwd` → Pallas kernel）：使用 `shard_map` 显式切分。`self.slope` 先 reshard 到 `P("tensor")`，`recurrent_state` 先 reshard 到 `P(None, "tensor", None, None)`，再作为 shard_map 参数传入；scatter 和 kernel call 均在 shard_map 内各设备独立执行，无 all-gather。`cu_seqlens` 以 `P()`（replicated）传入，各设备持有完整 boundary 信息。
+
+这一差异（GSPMD vs shard_map）与项目内其他 Pallas kernel 的处理方式一致（参见 `flashattention_backend.py`）。
 
 **循环状态（Recurrent State）**
 - Prefill 返回 `[N_padded, H, K, V]`（N_padded = cu_seqlens 长度减 1，与 padded batch size 一致）；Decode 返回 `[T, H, K, V]`（T = padded batch size）；形状不随序列长度增长
@@ -174,6 +203,7 @@ scatter 后 chunk-aligned buffer 中的 intra-chunk padding 位置填零（q=k=v
 | cu_seqlens 构建 | JIT 外 numpy 预计算，存入 LinearAttentionBackend | 与 FlashAttention 的 `get_forward_metadata` 模式一致；ForwardBatch 公共接口不变；cu_seqlens shape 用 padded batch size 固定，防止重编译 |
 | scatter_idx 构建 | JIT 外 numpy 预计算，存为 `nnx.data` | 形状 `[T]` 静态（不触发重编译）；JIT 内 `at[].set()` / 高级索引编译为 XLA scatter/gather，无 Python 循环 |
 | slopes 存储 | `__init__` 中计算后存为属性 | JAX JIT 将 Python 属性视为常量，等价于 PyTorch `register_buffer` |
+| prefill TP 切分方式 | `shard_map` 显式切分 | Pallas kernel 编译为 `custom_call`，GSPMD 无法感知内部语义，遇到分片输入会插入 all-gather；shard_map 让每设备直接在本地 H 分片上运行 scatter + kernel，无通信开销；与项目内 FlashAttention 等 Pallas kernel 的 TP 处理方式一致 |
 | GroupRMSNorm 集成 | 直接集成（#884 已合入） | GroupRMSNorm 已在公开仓 PR #884 实现（`layers/attention/fla/group_rmsnorm.py`），本模块直接使用，无需 stub |
 
 ---

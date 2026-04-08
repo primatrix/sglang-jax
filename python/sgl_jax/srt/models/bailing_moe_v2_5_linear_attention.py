@@ -11,6 +11,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from jax import shard_map
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.attention.fla.group_rmsnorm import GroupRMSNorm
 from sgl_jax.srt.layers.attention.fla.linear_attention_backend import (
@@ -54,6 +57,7 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
         self.num_hidden_layers = config.num_hidden_layers
+        self.mesh = mesh
         self.backend = backend
 
         # Fused QKV projection (column-parallel)
@@ -67,11 +71,11 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
             scope_name="query_key_value",
         )
 
-        # Gate projection (column-parallel)
+        # Gate projection (column-parallel, bias always False per HF reference)
         self.g_proj = LinearBase(
             input_size=self.hidden_size,
             output_size=self.num_heads * self.head_dim,
-            use_bias=getattr(config, "use_bias", False),
+            use_bias=False,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             mesh=mesh,
@@ -165,11 +169,22 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
         forward_batch,
         recurrent_state: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
+        """Forward pass.
+
+        Returns:
+            output: [T, hidden_size] in input dtype.
+            new_state: [N, H, K, V] always float32 (from kernel scan carry),
+                regardless of input dtype.
+        """
         T = hidden_states.shape[0]
 
         # 1. QKV projection
         qkv, _ = self.qkv_proj(hidden_states)
-        qkv = qkv.reshape(T, 3, self.num_heads, self.head_dim)
+        qkv = jax.lax.reshape(
+            qkv,
+            (T, 3, self.num_heads, self.head_dim),
+            out_sharding=NamedSharding(self.mesh, P(None, None, "tensor", None)),
+        )
         q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # each [T, H, K]
 
         # 2. Q/K RMSNorm (V skipped)
@@ -180,13 +195,18 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
         # 3. Partial RoPE
         q, k = self.rotary_emb(positions, q, k)
 
-        # Kernels operate in float32 for numerical stability
+        # Cast recurrent state to float32 for numerical stability
         recurrent_state = recurrent_state.astype(jnp.float32)
 
         # 4. Kernel dispatch
         if forward_batch.forward_mode.is_decode():
             if fused_recurrent_simple_gla is None:
                 raise ImportError("tops library is required for linear attention decode")
+            # Reshard recurrent_state along H so scan carry matches q/k/v sharding.
+            recurrent_state = jax.sharding.reshard(
+                recurrent_state,
+                jax.sharding.NamedSharding(self.mesh, P(None, "tensor", None, None)),
+            )
             # Decode: [T, H, K] -> [T, 1, H, K]
             q_d = q[:, None, :, :]
             k_d = k[:, None, :, :]
@@ -207,24 +227,62 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
                 raise ImportError("tops library is required for linear attention prefill")
             # Prefill: scatter to chunk-aligned layout
             T_pb = self.backend.T_packed_bucket
-            cu_seqlens = self.backend.cu_seqlens_dev.value
             scatter_idx = self.backend.scatter_idx.value
+            cu_seqlens = self.backend.cu_seqlens_dev.value
 
-            q_packed = scatter_to_packed(q, scatter_idx, T_pb)
-            k_packed = scatter_to_packed(k, scatter_idx, T_pb)
-            v_packed = scatter_to_packed(v, scatter_idx, T_pb)
-
-            output_packed, new_state = simple_gla_fwd(
-                q_packed,
-                k_packed,
-                v_packed,
-                g_gamma=self.slope,
-                h0=recurrent_state,
-                cu_seqlens_dev=cu_seqlens,
-                scale=None,
-                use_ht=True,
-                chunk_size=64,
+            # Reshard slope and h0 onto the mesh before shard_map.
+            # self.slope is a plain jnp.array (not NNX, so not pre-sharded);
+            # recurrent_state comes from the caller and may be replicated.
+            slope_sm = jax.sharding.reshard(
+                self.slope, jax.sharding.NamedSharding(self.mesh, P("tensor"))
             )
+            h0_sm = jax.sharding.reshard(
+                recurrent_state,
+                jax.sharding.NamedSharding(self.mesh, P(None, "tensor", None, None)),
+            )
+
+            # Scatter is done inside shard_map so each device handles its local H
+            # partition. GSPMD cannot auto-partition Mosaic kernels; shard_map
+            # gives explicit per-device control.
+            # cu_seqlens is passed as a replicated shard_map argument (P()).
+            # All Python-level operations on cu_seqlens_dev inside the kernel chain
+            # are ShardMapTracer-safe: identity checks (is None/is not None),
+            # .shape / len() access, JAX ops (jnp.searchsorted, slice indexing),
+            # and finally passing as a pallas_call input. No Python value extraction.
+            def _prefill_fn(q_local, k_local, v_local, gamma, h0, scatter_idx_p, cu_seqlens_p):
+                q_p = scatter_to_packed(q_local, scatter_idx_p, T_pb)
+                k_p = scatter_to_packed(k_local, scatter_idx_p, T_pb)
+                v_p = scatter_to_packed(v_local, scatter_idx_p, T_pb)
+                return simple_gla_fwd(
+                    q_p,
+                    k_p,
+                    v_p,
+                    g_gamma=gamma,
+                    h0=h0,
+                    cu_seqlens_dev=cu_seqlens_p,
+                    scale=None,
+                    use_ht=True,
+                    chunk_size=64,
+                )
+
+            output_packed, new_state = shard_map(
+                _prefill_fn,
+                mesh=self.mesh,
+                in_specs=(
+                    P(None, "tensor", None),  # q:     [T, H_local, K]
+                    P(None, "tensor", None),  # k
+                    P(None, "tensor", None),  # v
+                    P("tensor"),  # slope: [H_local]
+                    P(None, "tensor", None, None),  # h0:    [N, H_local, K, V]
+                    P(),  # scatter_idx (replicated)
+                    P(),  # cu_seqlens (replicated)
+                ),
+                out_specs=(
+                    P(None, None, "tensor", None),  # output_packed [1, T_pb, H_local, V]
+                    P(None, "tensor", None, None),  # new_state     [N, H_local, K, V]
+                ),
+                check_vma=False,
+            )(q, k, v, slope_sm, h0_sm, scatter_idx, cu_seqlens)
             attn_output = gather_from_packed(output_packed, scatter_idx)  # [T, H, V]
 
         else:

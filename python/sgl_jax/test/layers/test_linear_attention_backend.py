@@ -151,6 +151,12 @@ class TestDecodeNoOp:
         backend.get_forward_metadata(batch)
         # State unchanged from init
         assert backend.T_packed_bucket == 0
+        # cu_seqlens_dev and scatter_idx should retain their initial values
+        # after a DECODE no-op.
+        np.testing.assert_array_equal(
+            np.asarray(backend.cu_seqlens_dev), np.zeros(1, dtype=np.int32)
+        )
+        np.testing.assert_array_equal(np.asarray(backend.scatter_idx), np.zeros(1, dtype=np.int32))
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +219,39 @@ class TestScatterGather:
             np.asarray(recovered[:T_tight]), x_np[:T_tight], rtol=1e-6, atol=1e-6
         )
         # Outer padding positions gather zeros (dummy slot)
+        np.testing.assert_allclose(
+            np.asarray(recovered[T_tight:]), np.zeros((T_outer - T_tight, H, K)), atol=1e-7
+        )
+
+    def test_gather_roundtrip_outer_padding(self):
+        """T_outer > sum(extend_seq_lens): tail padding tokens map to dummy slot and gather zeros."""
+        extend_seq_lens = [50]
+        T_tight = 50
+        T_outer = 128  # scheduler bucket pads beyond real tokens
+        backend = self._make_backend_and_batch(extend_seq_lens, T_outer=T_outer)
+        H, K = 2, 4
+        rng = np.random.default_rng(2)
+        x_np = np.zeros((T_outer, H, K), dtype=np.float32)
+        x_np[:T_tight] = rng.standard_normal((T_tight, H, K)).astype(np.float32)
+        x = jnp.array(x_np)
+
+        scatter_idx = backend.scatter_idx.value
+        T_pb = backend.T_packed_bucket  # ceil(50/64)*64 = 64
+
+        # Verify tail positions in scatter_idx map to dummy slot
+        idx_np = np.asarray(scatter_idx)
+        np.testing.assert_array_equal(
+            idx_np[T_tight:], np.full(T_outer - T_tight, T_pb, dtype=np.int32)
+        )
+
+        packed = scatter_to_packed(x, scatter_idx, T_pb)
+        recovered = gather_from_packed(packed, scatter_idx)
+
+        # Real tokens roundtrip exactly
+        np.testing.assert_allclose(
+            np.asarray(recovered[:T_tight]), x_np[:T_tight], rtol=1e-6, atol=1e-6
+        )
+        # Tail padding positions gather zeros from dummy slot
         np.testing.assert_allclose(
             np.asarray(recovered[T_tight:]), np.zeros((T_outer - T_tight, H, K)), atol=1e-7
         )

@@ -86,6 +86,10 @@ class LinearAttentionBackend(nnx.Module):
 
         self.T_packed_bucket = T_pb
 
+        # Single-host: explicitly place as replicated P() on the mesh.
+        # Multi-host (process_count > 1): leave sharding=None; the arrays are
+        # small metadata (cu_seqlens, scatter_idx) and will be replicated by
+        # shard_map's in_specs=P() when consumed by the model.
         sharding = (
             NamedSharding(self.mesh, P())
             if self.mesh is not None and jax.process_count() == 1
