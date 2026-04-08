@@ -40,6 +40,7 @@ def benchmark_backend(
     head_dim,
     page_size,
     sliding_window=None,
+    kv_len=None,
 ):
     scale = head_dim**-0.5
 
@@ -88,6 +89,7 @@ def benchmark_backend(
             kv_head_num,
             head_dim,
             page_size=page_size,
+            kv_len=kv_len,
         )
     else:
         raise ValueError(f"Invalid mode: {mode=}")
@@ -268,6 +270,7 @@ def custom_benchmark(args):
     head_dims = args.head_dim
     page_sizes = args.page_size
     sliding_windows = [None if sw == 0 else sw for sw in args.sliding_windows]
+    kv_lens = args.kv_len if args.kv_len else [None]
 
     max_context_len = args.max_context_len
     max_kv_cache_tokens = args.max_kv_cache_tokens
@@ -277,9 +280,12 @@ def custom_benchmark(args):
         print("=" * 90)
         print(f"[{mode.upper()}] BENCHMARK RESULTS")
         print("=" * 90)
+        has_kv_len = mode == "decode" and any(kl is not None for kl in kv_lens)
         header = (
             f"{'q_h':>4} {'kv_h':>4} {'dim':>4} {'ps':>4} "
-            f"{'SW':>8} {'BS/Tok':>8} {'Time(ms)':>10} {'us/token':>10}"
+            f"{'SW':>8} "
+            + (f"{'kv_len':>8} " if has_kv_len else "")
+            + f"{'BS/Tok':>8} {'Time(ms)':>10} {'us/token':>10}"
         )
         print(header)
         print("-" * len(header))
@@ -292,31 +298,38 @@ def custom_benchmark(args):
                     for ps in page_sizes:
                         for sw in sliding_windows:
                             sw_label = str(sw) if sw else "None"
-                            for bs in bs_list:
-                                try:
-                                    t = benchmark_backend(
-                                        mode,
-                                        max_context_len,
-                                        max_kv_cache_tokens,
-                                        bs,
-                                        q_h,
-                                        kv_h,
-                                        hd,
-                                        ps,
-                                        sliding_window=sw,
-                                    )
-                                    us_per_token = t * 1000 / bs
-                                    print(
-                                        f"{q_h:>4} {kv_h:>4} {hd:>4} {ps:>4} "
-                                        f"{sw_label:>8} {bs:>8} "
-                                        f"{t * 1000:>10.3f} {us_per_token:>10.3f}"
-                                    )
-                                except Exception as e:
-                                    print(
-                                        f"{q_h:>4} {kv_h:>4} {hd:>4} {ps:>4} "
-                                        f"{sw_label:>8} {bs:>8} "
-                                        f"{'FAILED':>10} {str(e)[:30]}"
-                                    )
+                            for kl in kv_lens if mode == "decode" else [None]:
+                                kl_label = str(kl) if kl else "rand"
+                                for bs in bs_list:
+                                    try:
+                                        t = benchmark_backend(
+                                            mode,
+                                            max_context_len,
+                                            max_kv_cache_tokens,
+                                            bs,
+                                            q_h,
+                                            kv_h,
+                                            hd,
+                                            ps,
+                                            sliding_window=sw,
+                                            kv_len=kl,
+                                        )
+                                        us_per_token = t * 1000 / bs
+                                        line = (
+                                            f"{q_h:>4} {kv_h:>4} {hd:>4} {ps:>4} " f"{sw_label:>8} "
+                                        )
+                                        if has_kv_len:
+                                            line += f"{kl_label:>8} "
+                                        line += f"{bs:>8} {t * 1000:>10.3f} {us_per_token:>10.3f}"
+                                        print(line)
+                                    except Exception as e:
+                                        line = (
+                                            f"{q_h:>4} {kv_h:>4} {hd:>4} {ps:>4} " f"{sw_label:>8} "
+                                        )
+                                        if has_kv_len:
+                                            line += f"{kl_label:>8} "
+                                        line += f"{bs:>8} {'FAILED':>10} {str(e)[:30]}"
+                                        print(line)
         print()
 
 
@@ -388,6 +401,13 @@ def build_parser():
         type=int,
         default=600000,
         help="Max KV cache tokens (default: 600000)",
+    )
+    parser.add_argument(
+        "--kv-len",
+        type=parse_int_list,
+        default=None,
+        help="Comma-separated fixed KV lengths for decode mode (default: random 1024-2048). "
+        "Use to test sliding_window with long contexts, e.g. --kv-len 2048,8192,32768",
     )
     return parser
 
