@@ -1,12 +1,10 @@
 """MiMo-V2-Flash model implementation for SGLang-JAX."""
 
 import logging
-import os
 from typing import Any
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import nnx
 from transformers import PretrainedConfig
 
@@ -20,26 +18,6 @@ from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
-
-# ── Debug dump helper ──────────────────────────────────────────────
-DUMP_DIR = None  # Set to a path like "/inference-models/brian/mimo-epic" to enable
-
-
-def _save_cb(arr, *, name: str):
-    """Callback that saves a JAX array to .npy inside DUMP_DIR.
-    Auto-prefixes filename with 'pfN_' where N = number of tokens (first dim)."""
-    os.makedirs(DUMP_DIR, exist_ok=True)
-    a = np.asarray(arr)
-    n = a.shape[0] if a.ndim >= 1 else 0
-    np.save(os.path.join(DUMP_DIR, f"t{n}_{name}.npy"), a)
-
-
-def dump(jax_arr: jax.Array, name: str):
-    """Save *jax_arr* to ``DUMP_DIR/tN_<name>.npy`` (N=token count)."""
-    if DUMP_DIR is None:
-        return
-    jax.debug.callback(_save_cb, jax_arr, name=name)
-
 
 logger = logging.getLogger(__name__)
 
@@ -242,12 +220,6 @@ class MiMoV2Attention(nnx.Module):
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
 
-        if self.layer_id <= 1:
-            p = f"L{self.layer_id}"
-            dump(q, f"{p}_q_proj_out")
-            dump(k, f"{p}_k_proj_out")
-            dump(v, f"{p}_v_proj_out")
-
         q = q.reshape(-1, self.q_head_num, self.head_dim)
         k = k.reshape(-1, k.shape[-1] // self.head_dim, self.head_dim)
         v = v.reshape(-1, v.shape[-1] // self.v_head_dim, self.v_head_dim)
@@ -258,11 +230,6 @@ class MiMoV2Attention(nnx.Module):
 
         q, k = self.rotary_emb(positions, q, k)
 
-        if self.layer_id <= 1:
-            p = f"L{self.layer_id}"
-            dump(q, f"{p}_q_after_rope")
-            dump(k, f"{p}_k_after_rope")
-
         attn_output, kv_fused = self.attn(
             q,
             k,
@@ -271,9 +238,6 @@ class MiMoV2Attention(nnx.Module):
             token_to_kv_pool,
             attention_sink=self.attention_sink_bias,
         )
-
-        if self.layer_id <= 1:
-            dump(attn_output, f"L{self.layer_id}_attn_output_raw")
 
         # V was padded to head_dim for fused KV cache; slice back to v_head_dim
         # so o_proj receives the correct input size.
@@ -285,12 +249,7 @@ class MiMoV2Attention(nnx.Module):
                 attn_output = attn_output[..., : self.v_head_dim]
                 attn_output = attn_output.reshape(-1, expected_v_head_dim)
 
-        if self.layer_id <= 1:
-            dump(attn_output, f"L{self.layer_id}_attn_output_sliced")
-
         output, _ = self.o_proj(attn_output)
-        if self.layer_id <= 1:
-            dump(output, f"L{self.layer_id}_o_proj_out")
         return output, kv_fused
 
 
@@ -381,9 +340,6 @@ class MiMoV2DecoderLayer(nnx.Module):
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None]:
-        _d = self.layer_id <= 1  # dump layer 0 and 1
-        p = f"L{self.layer_id}"
-
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -392,9 +348,6 @@ class MiMoV2DecoderLayer(nnx.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
-        if _d:
-            dump(hidden_states, f"{p}_input_layernorm_out")
-
         hidden_states, kv_fused = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -402,24 +355,15 @@ class MiMoV2DecoderLayer(nnx.Module):
             token_to_kv_pool=token_to_kv_pool,
         )
 
-        if _d:
-            dump(hidden_states, f"{p}_attn_residual_before_add")
-
         hidden_states += residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-
-        if _d:
-            dump(hidden_states, f"{p}_post_attn_layernorm_out")
 
         if self.is_layer_sparse:
             mlp_output, topk_ids = self.mlp(hidden_states, forward_batch)
         else:
             mlp_output = self.mlp(hidden_states)
             topk_ids = None
-
-        if _d:
-            dump(mlp_output, f"{p}_mlp_out")
 
         hidden_states = mlp_output
         return hidden_states, residual, kv_fused, topk_ids
@@ -477,10 +421,6 @@ class MiMoV2Model(nnx.Module):
         residual = None
         hidden_states = self.embed_tokens(forward_batch.input_ids)
 
-        dump(hidden_states, "embedding_out")
-        dump(forward_batch.input_ids, "input_ids")
-        dump(forward_batch.positions, "positions")
-
         layers_kv_fused = []
         layers_topk_ids = []
 
@@ -499,7 +439,6 @@ class MiMoV2Model(nnx.Module):
             hidden_states += residual
 
         hidden_states = self.norm(hidden_states)
-        dump(hidden_states, "final_hidden_states")
         return hidden_states, layers_kv_fused, layers_topk_ids
 
 
@@ -859,186 +798,6 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                         )
                         new_linear.weight = nnx.Param(w_new)
                     setattr(attn, proj_name, new_linear)
-
-    def _pad_attention_head_dims(self):
-        """Pad Q/K head_dim to next 128-aligned value. V/O unchanged if already aligned.
-
-        After padding, updates attention module attrs (head_dim, sizes, RoPE head_size,
-        RadixAttention head_dim) so the forward pass uses the padded dimensions.
-        """
-        _align = lambda d: ((d + 127) // 128) * 128
-
-        for layer_idx, layer in enumerate(self.model.layers):
-            attn = layer.self_attn
-            orig_hd = attn.head_dim
-            orig_vhd = attn.v_head_dim
-            padded_hd = _align(orig_hd)
-            padded_vhd = _align(orig_vhd)
-
-            # --- Pad Q/K if head_dim is not 128-aligned ---
-            if padded_hd != orig_hd:
-                pad_amount = padded_hd - orig_hd
-
-                def _pad_head_dim(w, n_heads, orig_dim, pad_amt, padded_dim):
-                    """Reshape [hidden, n_heads*orig_dim] → pad → [hidden, n_heads*padded_dim].
-
-                    Uses jax.lax.reshape with explicit out_sharding to handle
-                    tensor-parallel sharding on the heads/dim axis.
-                    """
-                    from jax.sharding import NamedSharding
-                    from jax.sharding import PartitionSpec as P
-
-                    tp_size = self.mesh.shape["tensor"]
-                    # Choose sharding for 3D intermediate: shard whichever new dim divides TP
-                    if n_heads % tp_size == 0:
-                        mid_spec = P(None, "tensor", None)
-                    else:
-                        mid_spec = P(None, None, "tensor")
-                    mid_sharding = NamedSharding(self.mesh, mid_spec)
-
-                    w_3d = jax.lax.reshape(
-                        w, (w.shape[0], n_heads, orig_dim), out_sharding=mid_sharding
-                    )
-                    w_3d = jnp.pad(w_3d, ((0, 0), (0, 0), (0, pad_amt)))
-                    # Reshape back to 2D with tensor sharding on last dim
-                    out_sharding = NamedSharding(self.mesh, P(None, "tensor"))
-                    w_2d = jax.lax.reshape(
-                        w_3d, (w.shape[0], n_heads * padded_dim), out_sharding=out_sharding
-                    )
-                    return w_2d
-
-                # q_proj
-                qw = attn.q_proj.weight.value
-                actual_q_heads = qw.shape[1] // orig_hd
-                qw = _pad_head_dim(qw, actual_q_heads, orig_hd, pad_amount, padded_hd)
-
-                # k_proj
-                kw = attn.k_proj.weight.value
-                actual_kv_heads = kw.shape[1] // orig_hd
-                kw = _pad_head_dim(kw, actual_kv_heads, orig_hd, pad_amount, padded_hd)
-
-                with jax.set_mesh(self.mesh):
-                    q_linear = LinearBase(
-                        input_size=qw.shape[0],
-                        output_size=qw.shape[1],
-                        kernel_axes=attn.q_proj.kernel_axes,
-                        use_bias=False,
-                        params_dtype=jnp.bfloat16,
-                        mesh=self.mesh,
-                    )
-                    q_linear.weight = nnx.Param(qw)
-                    attn.q_proj = q_linear
-
-                    k_linear = LinearBase(
-                        input_size=kw.shape[0],
-                        output_size=kw.shape[1],
-                        kernel_axes=attn.k_proj.kernel_axes,
-                        use_bias=False,
-                        params_dtype=jnp.bfloat16,
-                        mesh=self.mesh,
-                    )
-                    k_linear.weight = nnx.Param(kw)
-                    attn.k_proj = k_linear
-
-                attn.head_dim = padded_hd
-                attn.q_size = actual_q_heads * padded_hd
-                attn.k_size = actual_kv_heads * padded_hd
-                # scaling stays at orig_hd ** -0.5 (effective dim unchanged)
-                attn.rotary_emb.head_size = padded_hd
-                # rotary_dim stays at orig_hd (only rotate real data dims)
-                attn.attn.head_dim = padded_hd
-                attn.attn.qk_head_dim = padded_hd
-
-                if layer_idx == 0:
-                    logger.info(
-                        "Padded Q/K head_dim %d → %d for layer %d",
-                        orig_hd,
-                        padded_hd,
-                        layer_idx,
-                    )
-
-            # --- Pad V if v_head_dim is not 128-aligned ---
-            if padded_vhd != orig_vhd:
-                vpad = padded_vhd - orig_vhd
-                from jax.sharding import NamedSharding
-                from jax.sharding import PartitionSpec as P
-
-                tp_size = self.mesh.shape["tensor"]
-
-                # v_proj weight: [hidden, actual_kv_heads * orig_vhd]
-                vw = attn.v_proj.weight.value
-                actual_v_kv_heads = vw.shape[1] // orig_vhd
-                if actual_v_kv_heads % tp_size == 0:
-                    v_mid_spec = P(None, "tensor", None)
-                else:
-                    v_mid_spec = P(None, None, "tensor")
-                vw_3d = jax.lax.reshape(
-                    vw,
-                    (vw.shape[0], actual_v_kv_heads, orig_vhd),
-                    out_sharding=NamedSharding(self.mesh, v_mid_spec),
-                )
-                vw_3d = jnp.pad(vw_3d, ((0, 0), (0, 0), (0, vpad)))
-                vw = jax.lax.reshape(
-                    vw_3d,
-                    (vw.shape[0], actual_v_kv_heads * padded_vhd),
-                    out_sharding=NamedSharding(self.mesh, P(None, "tensor")),
-                )
-
-                # o_proj weight: [actual_heads * orig_vhd, hidden]
-                ow = attn.o_proj.weight.value
-                actual_o_heads = ow.shape[0] // orig_vhd
-                if actual_o_heads % tp_size == 0:
-                    o_mid_spec = P("tensor", None, None)
-                else:
-                    o_mid_spec = P(None, "tensor", None)
-                ow_3d = jax.lax.reshape(
-                    ow,
-                    (actual_o_heads, orig_vhd, ow.shape[1]),
-                    out_sharding=NamedSharding(self.mesh, o_mid_spec),
-                )
-                ow_3d = jnp.pad(ow_3d, ((0, 0), (0, vpad), (0, 0)))
-                ow = jax.lax.reshape(
-                    ow_3d,
-                    (actual_o_heads * padded_vhd, ow.shape[1]),
-                    out_sharding=NamedSharding(self.mesh, P("tensor", None)),
-                )
-
-                with jax.set_mesh(self.mesh):
-                    v_linear = LinearBase(
-                        input_size=vw.shape[0],
-                        output_size=vw.shape[1],
-                        kernel_axes=attn.v_proj.kernel_axes,
-                        use_bias=False,
-                        params_dtype=jnp.bfloat16,
-                        mesh=self.mesh,
-                    )
-                    v_linear.weight = nnx.Param(vw)
-                    attn.v_proj = v_linear
-
-                    o_linear = LinearBase(
-                        input_size=ow.shape[0],
-                        output_size=ow.shape[1],
-                        kernel_axes=attn.o_proj.kernel_axes,
-                        use_bias=False,
-                        params_dtype=jnp.bfloat16,
-                        mesh=self.mesh,
-                    )
-                    o_linear.weight = nnx.Param(ow)
-                    attn.o_proj = o_linear
-
-                attn.v_head_dim = padded_vhd
-                attn.v_size = actual_v_kv_heads * padded_vhd
-                attn.attn.v_head_dim = padded_vhd
-
-                if layer_idx == 0:
-                    logger.info(
-                        "Padded V head_dim %d → %d for layer %d",
-                        orig_vhd,
-                        padded_vhd,
-                        layer_idx,
-                    )
-
-        logger.info("Head dim padding complete.")
 
     def _create_weight_mappings(self) -> dict:
         mappings = {
