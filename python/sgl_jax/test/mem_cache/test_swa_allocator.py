@@ -2,6 +2,7 @@
 
 import os
 import unittest
+from types import SimpleNamespace
 
 if os.environ.get("USE_DEVICE_TYPE") == "cpu":
     os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
@@ -49,9 +50,7 @@ def _make_swa_pool(size, size_swa, page_size, mesh):
 class TestSWAAllocatorTokenLevel(unittest.TestCase):
     def setUp(self):
         self.mesh = _make_mesh()
-        self.kvcache = _make_swa_pool(
-            size=64, size_swa=32, page_size=1, mesh=self.mesh
-        )
+        self.kvcache = _make_swa_pool(size=64, size_swa=32, page_size=1, mesh=self.mesh)
         self.alloc = SWATokenToKVPoolAllocator(
             size=64, size_swa=32, kvcache=self.kvcache, page_size=1
         )
@@ -235,9 +234,7 @@ class TestSWAAllocatorPaged(unittest.TestCase):
         # Actually, eaten has 64 tokens, so we want seq_lens=65.
         # last_loc should be the last slot in eaten.
         last_loc = [int(eaten[-1])]
-        result = self.alloc.alloc_decode(
-            seq_lens=[self.size_swa + 1], last_loc=last_loc
-        )
+        result = self.alloc.alloc_decode(seq_lens=[self.size_swa + 1], last_loc=last_loc)
         self.assertIsNone(result)
 
         # Full pool must have been rolled back (no leak)
@@ -319,6 +316,13 @@ class TestSWAEviction(unittest.TestCase):
                 self.output_ids = output_ids
                 self.swa_evicted_seqlen = 0
                 self.req_pool_idx = 0
+                self.decode_batch_idx = 0
+                self.extend_batch_idx = 0
+                self.is_chunked = 0
+
+            @property
+            def seqlen(self):
+                return len(self.origin_input_ids) + len(self.output_ids)
 
         return FakeReq(
             origin_input_ids=list(range(origin_len)),
@@ -356,9 +360,7 @@ class TestSWAEviction(unittest.TestCase):
         self._evict(req, pre_len)
         expected_evicted = pre_len - self.sliding_window  # 36
         self.assertEqual(req.swa_evicted_seqlen, expected_evicted)
-        self.assertEqual(
-            self.alloc.swa_available_size(), swa_before + expected_evicted
-        )
+        self.assertEqual(self.alloc.swa_available_size(), swa_before + expected_evicted)
 
     # 17
     def test_evict_idempotent(self):
@@ -391,9 +393,7 @@ class TestSWAEviction(unittest.TestCase):
         """page_size=4: frontier aligns down to page boundary."""
         # Recreate with page_size=4
         page_size = 4
-        kvcache = _make_swa_pool(
-            size=256, size_swa=256, page_size=page_size, mesh=self.mesh
-        )
+        kvcache = _make_swa_pool(size=256, size_swa=256, page_size=page_size, mesh=self.mesh)
         alloc = SWATokenToKVPoolAllocator(
             size=256, size_swa=256, kvcache=kvcache, page_size=page_size
         )
@@ -439,52 +439,155 @@ class TestSWAEviction(unittest.TestCase):
 
         self._evict(req, 128)
         expected_freed = 128 - self.sliding_window  # 64
-        self.assertEqual(
-            self.alloc.swa_available_size(), swa_before + expected_freed
-        )
+        self.assertEqual(self.alloc.swa_available_size(), swa_before + expected_freed)
 
 
 # ---------------------------------------------------------------------------
 # Class 4: Overlap safety
 # ---------------------------------------------------------------------------
 class TestSWAOverlapSafety(unittest.TestCase):
-    """Test that overlap mode applies an explicit safety margin to eviction."""
+    """Test overlap-aware reclaim timing for decode and chunked extend."""
 
-    def _compute_eviction_frontier(self, pre_len, sliding_window, enable_overlap, overlap_margin=0):
-        """Compute the eviction frontier as maybe_evict_swa would."""
-        if enable_overlap:
-            pre_len -= overlap_margin
-        return max(0, pre_len - sliding_window)
+    def setUp(self):
+        self.mesh = _make_mesh()
+        self.page_size = 1
+        self.sliding_window = 64
+        self.chunked_prefill_size = 32
+        self.pool_size = 256
+        self.pool_size_swa = 256
+        self.kvcache = _make_swa_pool(
+            size=self.pool_size,
+            size_swa=self.pool_size_swa,
+            page_size=self.page_size,
+            mesh=self.mesh,
+        )
+        self.alloc = SWATokenToKVPoolAllocator(
+            size=self.pool_size,
+            size_swa=self.pool_size_swa,
+            kvcache=self.kvcache,
+            page_size=self.page_size,
+        )
+        self.req_to_token_pool = ReqToTokenPool(size=8, max_context_len=256)
 
-    # 22 — Bug 2 test (should FAIL before fix)
-    def test_overlap_margin_more_conservative(self):
-        """Overlap mode eviction frontier must be strictly less than non-overlap."""
-        # Import the actual ScheduleBatch to check the margin constant
+    def _make_req(self, origin_len, output_len):
+        class FakeReq:
+            def __init__(self, origin_input_ids, output_ids):
+                self.origin_input_ids = origin_input_ids
+                self.output_ids = output_ids
+                self.swa_evicted_seqlen = 0
+                self.req_pool_idx = 0
+                self.decode_batch_idx = 0
+                self.extend_batch_idx = 0
+                self.is_chunked = 0
+
+            @property
+            def seqlen(self):
+                return len(self.origin_input_ids) + len(self.output_ids)
+
+        return FakeReq(
+            origin_input_ids=list(range(origin_len)),
+            output_ids=list(range(output_len)),
+        )
+
+    def _setup_req_tokens(self, req, n_tokens):
+        indices = self.alloc.alloc(n_tokens)
+        assert indices is not None, f"Failed to allocate {n_tokens} tokens"
+        self.req_to_token_pool.req_to_token[req.req_pool_idx, :n_tokens] = indices
+        return indices
+
+    def _make_batch(self, req, *, enable_overlap, forward_mode, prefix_lens=None, chunked_req=None):
         from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
 
-        # Verify the margin constant exists and is >= 1
-        self.assertTrue(
-            hasattr(ScheduleBatch, "_SWA_OVERLAP_SAFETY_MARGIN"),
-            "ScheduleBatch must define _SWA_OVERLAP_SAFETY_MARGIN",
+        return ScheduleBatch(
+            reqs=[req],
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.alloc,
+            tree_cache=None,
+            is_hybrid=True,
+            model_config=SimpleNamespace(sliding_window=self.sliding_window),
+            forward_mode=forward_mode,
+            enable_overlap=enable_overlap,
+            prefix_lens=prefix_lens,
+            chunked_req=chunked_req,
         )
-        margin = ScheduleBatch._SWA_OVERLAP_SAFETY_MARGIN
-        self.assertGreaterEqual(margin, 1)
 
-        # For any realistic pre_len > sliding_window, overlap frontier < non-overlap
-        sliding_window = 64
-        for pre_len in [100, 200, 500]:
-            frontier_normal = self._compute_eviction_frontier(
-                pre_len, sliding_window, enable_overlap=False
-            )
-            frontier_overlap = self._compute_eviction_frontier(
-                pre_len, sliding_window, enable_overlap=True, overlap_margin=margin
-            )
-            self.assertLess(
-                frontier_overlap,
-                frontier_normal,
-                f"Overlap frontier ({frontier_overlap}) should be < "
-                f"non-overlap frontier ({frontier_normal}) for pre_len={pre_len}",
-            )
+    def test_overlap_decode_first_batch_skips_reclaim(self):
+        """Overlap decode should skip reclaim while the previous batch may still read SWA pages."""
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+
+        req = self._make_req(origin_len=100, output_len=1)
+        self._setup_req_tokens(req, req.seqlen)
+        req.decode_batch_idx = 0
+        batch = self._make_batch(
+            req,
+            enable_overlap=True,
+            forward_mode=ForwardMode.DECODE,
+        )
+
+        swa_before = self.alloc.swa_available_size()
+        batch.maybe_evict_swa()
+
+        self.assertEqual(req.swa_evicted_seqlen, 0)
+        self.assertEqual(self.alloc.swa_available_size(), swa_before)
+
+    def test_overlap_decode_second_batch_reclaims(self):
+        """Overlap decode should reclaim once the request reaches the safe reclaim point."""
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+
+        req = self._make_req(origin_len=100, output_len=1)
+        self._setup_req_tokens(req, req.seqlen)
+        req.decode_batch_idx = 1
+        batch = self._make_batch(
+            req,
+            enable_overlap=True,
+            forward_mode=ForwardMode.DECODE,
+        )
+
+        swa_before = self.alloc.swa_available_size()
+        batch.maybe_evict_swa()
+
+        expected = req.seqlen - 1 - self.sliding_window
+        self.assertEqual(req.swa_evicted_seqlen, expected)
+        self.assertEqual(self.alloc.swa_available_size(), swa_before + expected)
+
+    def test_overlap_chunked_extend_skips_first_two_batches(self):
+        """Chunked extend with overlap should delay reclaim for the first two chunks."""
+        from sgl_jax.srt.managers.schedule_batch import global_server_args_dict
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+
+        req = self._make_req(origin_len=128, output_len=0)
+        self._setup_req_tokens(req, 128)
+        req.is_chunked = 1
+        batch = self._make_batch(
+            req,
+            enable_overlap=True,
+            forward_mode=ForwardMode.EXTEND,
+            prefix_lens=[128],
+            chunked_req=req,
+        )
+
+        old_chunked_prefill_size = global_server_args_dict.get("chunked_prefill_size")
+        global_server_args_dict["chunked_prefill_size"] = self.chunked_prefill_size
+        try:
+            swa_before = self.alloc.swa_available_size()
+
+            req.extend_batch_idx = 0
+            batch.maybe_evict_swa()
+            self.assertEqual(req.swa_evicted_seqlen, 0)
+
+            req.extend_batch_idx = 1
+            batch.maybe_evict_swa()
+            self.assertEqual(req.swa_evicted_seqlen, 0)
+
+            req.extend_batch_idx = 2
+            batch.maybe_evict_swa()
+
+            expected_pre_len = 128 - self.chunked_prefill_size
+            expected_evicted = expected_pre_len - self.sliding_window
+            self.assertEqual(req.swa_evicted_seqlen, expected_evicted)
+            self.assertEqual(self.alloc.swa_available_size(), swa_before + expected_evicted)
+        finally:
+            global_server_args_dict["chunked_prefill_size"] = old_chunked_prefill_size
 
 
 if __name__ == "__main__":
