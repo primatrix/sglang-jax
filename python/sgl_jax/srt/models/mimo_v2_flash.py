@@ -1,13 +1,15 @@
 import logging
-from typing import Any, Optional
+import os
+from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from transformers import PretrainedConfig
-from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
@@ -24,6 +26,33 @@ from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
+
+# ── Debug dump helper ──────────────────────────────────────────────
+DUMP_DIR = "/inference-models/brian/ref-mimo"
+_dump_phase = {"current": "prefill", "prefill_done": False, "decode_done": False}
+
+
+def _save_cb(arr, *, name: str):
+    phase = _dump_phase["current"]
+    if _dump_phase.get(f"{phase}_done"):
+        return
+    os.makedirs(DUMP_DIR, exist_ok=True)
+    np.save(os.path.join(DUMP_DIR, f"{phase}_{name}.npy"), np.asarray(arr))
+
+
+def dump(jax_arr, name: str):
+    jax.debug.callback(_save_cb, jax_arr, name=name)
+
+
+def _mark_phase_done(*args):
+    phase = _dump_phase["current"]
+    _dump_phase[f"{phase}_done"] = True
+    if phase == "prefill":
+        _dump_phase["current"] = "decode"
+
+
+def mark_phase_done():
+    jax.debug.callback(_mark_phase_done)
 
 
 def _get_mimo_num_experts(config: PretrainedConfig) -> int:
@@ -98,26 +127,36 @@ def create_moe_weights_mapping_quantized(
             sharding=sharding,
             transpose=transpose,
         )
-        
+
         # Map Scales (if quantized)
         if is_quantized:
             target_scale_name = f"{target_name}_scale"
             target_path_scale = f"{target_prefix}.{moe_path}.{target_scale_name}"
-            
+
             expert_scale_keys = [
                 f"{prefix}.{moe_path}.{source_expert_pattern.format(i=i)}.{source_name}.weight_scale_inv"
                 for i in range(num_experts)
             ]
-            
+
             # Use the kernel's 4D scale layout (E, K/wsz, 1, N).
             # For static fused MoE checkpoints with 128-block quant, the upper-layer
             # adaptation pass may requantize loaded weights/scales to subc=256 later.
             if moe_backend == "fused":
                 scale_sharding = (("data", "tensor"), None, None, None)
                 if target_name == "w2":
-                    scale_reshape = (num_experts, intermediate_size // weight_block_size, 1, hidden_size)
+                    scale_reshape = (
+                        num_experts,
+                        intermediate_size // weight_block_size,
+                        1,
+                        hidden_size,
+                    )
                 else:
-                    scale_reshape = (num_experts, hidden_size // weight_block_size, 1, intermediate_size)
+                    scale_reshape = (
+                        num_experts,
+                        hidden_size // weight_block_size,
+                        1,
+                        intermediate_size,
+                    )
             else:
                 # EPMoE scale layout: (E, k_blocks, 1, out_size)
                 # wi_0/wi_1: k_dim=hidden_size, out_size=intermediate_size → tensor-parallel on out_size
@@ -141,6 +180,7 @@ def create_moe_weights_mapping_quantized(
 
     return mappings
 
+
 class MiMoV2MLP(nnx.Module):
     """MiMo V2 MLP layer with gate, up, and down projections."""
 
@@ -152,7 +192,7 @@ class MiMoV2MLP(nnx.Module):
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
         gate_up_down_bias: bool | None = False,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         self.layer_id = layer_id
 
@@ -192,13 +232,14 @@ class MiMoV2MLP(nnx.Module):
         output, _ = self.down_proj(intermediate_parallel)
         return output
 
+
 class MiMoV2Moe(nnx.Module):
 
     def __init__(
         self,
         config: PretrainedConfig,
         layer_id: int,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         mesh: jax.sharding.Mesh = None,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
@@ -245,9 +286,7 @@ class MiMoV2Moe(nnx.Module):
 
         self.topk_method = getattr(config, "topk_method", "greedy")
         if self.topk_method == "noaux_tc":
-            self.correction_bias = nnx.Param(
-                jnp.zeros(num_experts, dtype=jnp.float32)
-            )
+            self.correction_bias = nnx.Param(jnp.zeros(num_experts, dtype=jnp.float32))
         else:
             self.correction_bias = None
 
@@ -299,7 +338,7 @@ class MiMoMoeAttention(nnx.Module):
         sliding_window_size: int | None = None,
         attention_bias: bool = False,
         attention_sink_bias: bool = False,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         partial_rotary_factor: float = 1.0,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
@@ -317,7 +356,7 @@ class MiMoMoeAttention(nnx.Module):
         self.k_head_num = num_kv_heads
         self.v_head_dim = v_head_dim if v_head_dim is not None else self.head_dim
         self.v_scale = v_scale
-    
+
         self.q_size = num_heads * self.head_dim
         self.k_size = num_kv_heads * self.head_dim
         self.v_size = num_kv_heads * self.v_head_dim
@@ -392,14 +431,11 @@ class MiMoMoeAttention(nnx.Module):
             num_kv_heads=num_kv_heads,
             layer_id=layer_id,
             v_head_dim=self.v_head_dim,
-            sliding_window_size=sliding_window_size, # -1 for no sliding window
-            
+            sliding_window_size=sliding_window_size,  # -1 for no sliding window
         )
 
         self.attention_sink_bias = (
-            nnx.Param(jnp.zeros(self.q_head_num, dtype=dtype))
-            if attention_sink_bias
-            else None
+            nnx.Param(jnp.zeros(self.q_head_num, dtype=dtype)) if attention_sink_bias else None
         )
 
     @named_scope
@@ -414,6 +450,11 @@ class MiMoMoeAttention(nnx.Module):
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
 
+        if self.layer_id == 0:
+            dump(q, "L0_q_proj_out")
+            dump(k, "L0_k_proj_out")
+            dump(v, "L0_v_proj_out")
+
         q = q.reshape(-1, self.q_head_num, self.head_dim)
         k = k.reshape(-1, k.shape[-1] // self.head_dim, self.head_dim)
         v = v.reshape(-1, v.shape[-1] // self.v_head_dim, self.v_head_dim)
@@ -425,6 +466,10 @@ class MiMoMoeAttention(nnx.Module):
 
         q, k = self.rotary_emb(positions, q, k)
 
+        if self.layer_id == 0:
+            dump(q, "L0_q_after_rope")
+            dump(k, "L0_k_after_rope")
+
         attn_output, kv_fused = self.attn(
             q,
             k,
@@ -433,6 +478,9 @@ class MiMoMoeAttention(nnx.Module):
             token_to_kv_pool,
             attention_sink=self.attention_sink_bias,
         )
+
+        if self.layer_id == 0:
+            dump(attn_output, "L0_attn_output_raw")
 
         # Some backends still return q_head_num * head_dim here and need an
         # explicit slice, while split-KV attention already returns q_head_num *
@@ -451,7 +499,14 @@ class MiMoMoeAttention(nnx.Module):
                     f"or {expected_v_head_dim}"
                 )
 
+        if self.layer_id == 0:
+            dump(attn_output, "L0_attn_output_sliced")
+
         output, _ = self.o_proj(attn_output)
+
+        if self.layer_id == 0:
+            dump(output, "L0_o_proj_out")
+
         return output, kv_fused
 
 
@@ -462,7 +517,7 @@ class MiMoMoeDecoderLayer(nnx.Module):
         self,
         config: PretrainedConfig,
         mesh: jax.sharding.Mesh,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
@@ -492,9 +547,7 @@ class MiMoMoeDecoderLayer(nnx.Module):
                     getattr(config, "sliding_window_size", None),
                 ),
                 attention_bias=config.attention_bias,
-                attention_sink_bias=getattr(
-                    config, "add_swa_attention_sink_bias", False
-                ),
+                attention_sink_bias=getattr(config, "add_swa_attention_sink_bias", False),
                 layer_id=layer_id,
                 dtype=dtype,
                 qkv_bias=getattr(config, "qkv_bias", getattr(config, "attention_bias", False)),
@@ -517,9 +570,7 @@ class MiMoMoeDecoderLayer(nnx.Module):
                 # Full attention layers use no sliding window (0 → None in RadixAttention)
                 sliding_window_size=0,
                 attention_bias=config.attention_bias,
-                attention_sink_bias=getattr(
-                    config, "add_full_attention_sink_bias", False
-                ),
+                attention_sink_bias=getattr(config, "add_full_attention_sink_bias", False),
                 layer_id=layer_id,
                 dtype=dtype,
                 qkv_bias=getattr(config, "qkv_bias", getattr(config, "attention_bias", False)),
@@ -540,7 +591,7 @@ class MiMoMoeDecoderLayer(nnx.Module):
                 mesh=mesh,
                 dtype=dtype,
             )
-        else:  
+        else:
             self.mlp = MiMoV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -603,6 +654,9 @@ class MiMoMoeDecoderLayer(nnx.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
+        if self.layer_id == 0:
+            dump(hidden_states, "L0_input_layernorm_out")
+
         hidden_states, kv_fused = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -610,9 +664,15 @@ class MiMoMoeDecoderLayer(nnx.Module):
             token_to_kv_pool=token_to_kv_pool,
         )
 
+        if self.layer_id == 0:
+            dump(hidden_states, "L0_attn_residual_before_add")
+
         hidden_states += residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+
+        if self.layer_id == 0:
+            dump(hidden_states, "L0_post_attn_layernorm_out")
 
         # optional shared expert output
         if self.shared_experts is not None:
@@ -628,6 +688,9 @@ class MiMoMoeDecoderLayer(nnx.Module):
         else:
             mlp_output = self.mlp(hidden_states)
             topk_ids = None
+
+        if self.layer_id == 0:
+            dump(mlp_output, "L0_mlp_out")
 
         hidden_states = mlp_output if shared_output is None else (mlp_output + shared_output)
 
@@ -701,6 +764,10 @@ class MiMoV2Model(nnx.Module):
     ):
         residual = None
         hidden_states = self.embed_tokens(forward_batch.input_ids)
+        dump(hidden_states, "embedding_out")
+        dump(forward_batch.input_ids, "input_ids")
+        dump(forward_batch.positions, "positions")
+
         layers_kv_fused = []
         layers_topk_ids = []
 
@@ -719,6 +786,8 @@ class MiMoV2Model(nnx.Module):
             hidden_states += residual
 
         hidden_states = self.norm(hidden_states)
+        dump(hidden_states, "final_hidden_states")
+        mark_phase_done()
 
         return hidden_states, layers_kv_fused, layers_topk_ids
 
@@ -796,7 +865,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
     def _create_moe_layer_mappings(self, layer_idx: int, model_config: ModelConfig) -> dict:
         prefix = f"model.layers.{layer_idx}"
         target_prefix = f"model.layers.{layer_idx}"
-        
+
         quant_config = getattr(self.config, "quantization_config", None)
         is_quantized = quant_config is not None
         ignored_layers = None
@@ -839,18 +908,18 @@ class MiMoV2FlashForCausalLM(nnx.Module):
 
         mappings = {}
         is_swa_layer = _is_swa_layer()
-        
+
         # QKV Projections
         # q_proj
         if is_quantized:
-             mappings[f"{prefix}.self_attn.q_proj.weight"] = WeightMapping(
+            mappings[f"{prefix}.self_attn.q_proj.weight"] = WeightMapping(
                 target_path=f"{target_prefix}.self_attn.q_proj.weight_q",
                 sharding=("tensor", None),
-                transpose=False, # Transpose removed for QuantizedLinear [out, in]
+                transpose=False,  # Transpose removed for QuantizedLinear [out, in]
                 head_dim_padding=True,
                 kv_head_padding=False,
             )
-             mappings[f"{prefix}.self_attn.q_proj.weight_scale_inv"] = WeightMapping(
+            mappings[f"{prefix}.self_attn.q_proj.weight_scale_inv"] = WeightMapping(
                 target_path=f"{target_prefix}.self_attn.q_proj.weight_scale",
                 sharding=_col_linear_scale_sharding(),
                 transpose=False,
@@ -866,14 +935,14 @@ class MiMoV2FlashForCausalLM(nnx.Module):
 
         # k_proj
         if is_quantized:
-             mappings[f"{prefix}.self_attn.k_proj.weight"] = WeightMapping(
+            mappings[f"{prefix}.self_attn.k_proj.weight"] = WeightMapping(
                 target_path=f"{target_prefix}.self_attn.k_proj.weight_q",
-                sharding=("tensor", None), # Split axis 0 (output)
+                sharding=("tensor", None),  # Split axis 0 (output)
                 transpose=False,
                 head_dim_padding=True,
                 kv_head_padding=True,
             )
-             mappings[f"{prefix}.self_attn.k_proj.weight_scale_inv"] = WeightMapping(
+            mappings[f"{prefix}.self_attn.k_proj.weight_scale_inv"] = WeightMapping(
                 target_path=f"{target_prefix}.self_attn.k_proj.weight_scale",
                 sharding=_col_linear_scale_sharding(),
                 transpose=False,
@@ -890,15 +959,15 @@ class MiMoV2FlashForCausalLM(nnx.Module):
 
         # v_proj
         if is_quantized:
-             mappings[f"{prefix}.self_attn.v_proj.weight"] = WeightMapping(
+            mappings[f"{prefix}.self_attn.v_proj.weight"] = WeightMapping(
                 target_path=f"{target_prefix}.self_attn.v_proj.weight_q",
-                sharding=("tensor", None), # Split axis 0
+                sharding=("tensor", None),  # Split axis 0
                 transpose=False,
                 head_dim_padding=False,
                 kv_head_padding=True,
                 # repeat removed
             )
-             mappings[f"{prefix}.self_attn.v_proj.weight_scale_inv"] = WeightMapping(
+            mappings[f"{prefix}.self_attn.v_proj.weight_scale_inv"] = WeightMapping(
                 target_path=f"{target_prefix}.self_attn.v_proj.weight_scale",
                 sharding=_col_linear_scale_sharding(),
                 transpose=False,
@@ -920,7 +989,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         if is_quantized and not ignore_o_proj:
             mappings[f"{prefix}.self_attn.o_proj.weight"] = WeightMapping(
                 target_path=f"{target_prefix}.self_attn.o_proj.weight_q",
-                sharding=(None, "tensor"), # Split axis 1 (Input)
+                sharding=(None, "tensor"),  # Split axis 1 (Input)
                 transpose=False,
                 head_dim_padding=True,
                 kv_head_padding=False,
@@ -938,7 +1007,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                 head_dim_padding=True,
                 kv_head_padding=False,
             )
-            
+
         # Layernorms (standard)
         mappings[f"{prefix}.input_layernorm.weight"] = WeightMapping(
             target_path=f"{target_prefix}.input_layernorm.scale",
@@ -984,9 +1053,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
 
         has_attention_sink_bias = (
             is_swa_layer and getattr(self.config, "add_swa_attention_sink_bias", False)
-        ) or (
-            (not is_swa_layer) and getattr(self.config, "add_full_attention_sink_bias", False)
-        )
+        ) or ((not is_swa_layer) and getattr(self.config, "add_full_attention_sink_bias", False))
         if has_attention_sink_bias:
             mappings[f"{prefix}.self_attn.attention_sink_bias"] = WeightMapping(
                 target_path=f"{target_prefix}.self_attn.attention_sink_bias",
@@ -1018,7 +1085,9 @@ class MiMoV2FlashForCausalLM(nnx.Module):
 
             num_experts = _get_mimo_num_experts(self.config)
             moe_backend = getattr(self.config, "moe_backend", "epmoe")
-            moe_intermediate_size = getattr(self.config, "moe_intermediate_size", self.config.intermediate_size)
+            moe_intermediate_size = getattr(
+                self.config, "moe_intermediate_size", self.config.intermediate_size
+            )
             moe_quant_block_size = getattr(model_config, "moe_quant_block_size", 256)
 
             moe_mappings = create_moe_weights_mapping_quantized(
@@ -1027,7 +1096,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                 num_experts=num_experts,
                 moe_backend=moe_backend,
                 moe_path="mlp.experts",
-                source_expert_pattern="{i}", 
+                source_expert_pattern="{i}",
                 is_quantized=is_quantized,
                 hidden_size=self.config.hidden_size,
                 intermediate_size=moe_intermediate_size,
@@ -1040,7 +1109,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                 # gate_proj
                 mappings[f"{prefix}.mlp.gate_proj.weight"] = WeightMapping(
                     target_path=f"{target_prefix}.mlp.gate_proj.weight_q",
-                    sharding=("tensor", None), # Split axis 0
+                    sharding=("tensor", None),  # Split axis 0
                     transpose=False,
                 )
                 mappings[f"{prefix}.mlp.gate_proj.weight_scale_inv"] = WeightMapping(
@@ -1051,7 +1120,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                 # up_proj
                 mappings[f"{prefix}.mlp.up_proj.weight"] = WeightMapping(
                     target_path=f"{target_prefix}.mlp.up_proj.weight_q",
-                    sharding=("tensor", None), # Split axis 0
+                    sharding=("tensor", None),  # Split axis 0
                     transpose=False,
                 )
                 mappings[f"{prefix}.mlp.up_proj.weight_scale_inv"] = WeightMapping(
@@ -1062,7 +1131,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                 # down_proj
                 mappings[f"{prefix}.mlp.down_proj.weight"] = WeightMapping(
                     target_path=f"{target_prefix}.mlp.down_proj.weight_q",
-                    sharding=(None, "tensor"), # Split axis 1
+                    sharding=(None, "tensor"),  # Split axis 1
                     transpose=False,
                 )
                 mappings[f"{prefix}.mlp.down_proj.weight_scale_inv"] = WeightMapping(
@@ -1093,7 +1162,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
             and getattr(self.config, "shared_expert_intermediate_size", 0) > 0
         ):
             if is_quantized:
-                 # gate_proj
+                # gate_proj
                 mappings[f"{prefix}.mlp.shared_expert.gate_proj.weight"] = WeightMapping(
                     target_path=f"{target_prefix}.shared_experts.gate_proj.weight_q",
                     sharding=("tensor", None),
@@ -1142,7 +1211,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                     sharding=("tensor", None),
                     transpose=True,
                 )
-            
+
             mappings[f"{prefix}.mlp.shared_expert_gate.weight"] = WeightMapping(
                 target_path=f"{target_prefix}.shared_expert_gate.weight",
                 sharding=(None, None),
