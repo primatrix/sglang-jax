@@ -790,10 +790,10 @@ def update_fused_kv_cache_vectorized(
             from jax.sharding import NamedSharding
 
             target_mesh = kv_cache_sharding.mesh
-            fused_kv = jax.lax.with_sharding_constraint(
+            fused_kv = jax.sharding.reshard(
                 fused_kv, NamedSharding(target_mesh, P(kv_spec[0], kv_partition_axis, None))
             )
-            loc = jax.lax.with_sharding_constraint(loc, NamedSharding(target_mesh, P(kv_spec[0])))
+            loc = jax.sharding.reshard(loc, NamedSharding(target_mesh, P(kv_spec[0])))
 
     @jax.shard_map(
         in_specs=(
