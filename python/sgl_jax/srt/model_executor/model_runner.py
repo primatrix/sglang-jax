@@ -386,10 +386,14 @@ class ModelRunner(BaseModelRunner):
         head_dim = self.model_config.head_dim
         head_dim_aligned = (head_dim + 127) // 128 * 128
 
+
+        def adjust_layer_num():
+            return (self.hf_text_config.swa_num_key_value_heads//self.hf_text_config.num_key_value_heads)*len(self.model_config.swa_attention_layer_ids)+len(self.model_config.full_attention_layer_ids)
+
         cell_size = (
             self.model_config.get_num_kv_heads(self.attention_tp_size)
             * head_dim_aligned
-            * self.model_config.num_hidden_layers
+            * adjust_layer_num()
             * 2
             * jnp.dtype(self.kv_cache_dtype).itemsize
         )
