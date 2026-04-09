@@ -353,5 +353,177 @@ def main():
     print(f"\n  Speedup: {speedup:.2f}x (median)")
 
 
+def build_extend_batch(
+    dp_size: int = 2,
+    per_dp_bs_size: int = 8,
+    page_size: int = 256,
+    min_seq_len: int = 256,
+    max_seq_len: int = 8192,
+    seed: int = 99,
+) -> MockBatch:
+    """Construct an extend-mode batch."""
+    rng = np.random.RandomState(seed)
+    total_bs = dp_size * per_dp_bs_size
+
+    raw_lens = rng.randint(min_seq_len, max_seq_len + 1, size=total_bs)
+    seq_lens = ((raw_lens + page_size - 1) // page_size * page_size).astype(np.int32)
+
+    # extend_seq_lens: portion being extended (subset of seq_lens)
+    extend_seq_lens = np.minimum(rng.randint(1, 2048, size=total_bs), seq_lens).astype(np.int32)
+
+    cache_loc_parts = []
+    slot_offset = 0
+    for dp in range(dp_size):
+        dp_start = dp * per_dp_bs_size
+        dp_end = dp_start + per_dp_bs_size
+        dp_seq_lens = seq_lens[dp_start:dp_end]
+        rank_total = int(np.sum(dp_seq_lens))
+        rank_slots = np.arange(slot_offset, slot_offset + rank_total, dtype=np.int32)
+        cache_loc_parts.append(rank_slots)
+        slot_offset += rank_total
+
+    max_rank_len = max(len(p) for p in cache_loc_parts)
+    for i in range(len(cache_loc_parts)):
+        if len(cache_loc_parts[i]) < max_rank_len:
+            pad = np.zeros(max_rank_len - len(cache_loc_parts[i]), dtype=np.int32)
+            cache_loc_parts[i] = np.concatenate([cache_loc_parts[i], pad])
+
+    cache_loc = np.concatenate(cache_loc_parts)
+
+    return MockBatch(
+        forward_mode=ForwardMode.EXTEND,
+        cache_loc=cache_loc,
+        seq_lens=seq_lens,
+        extend_seq_lens=extend_seq_lens,
+        dp_size=dp_size,
+        per_dp_bs_size=per_dp_bs_size,
+    )
+
+
+def test_edge_cases():
+    """Test correctness across various edge cases."""
+    page_size = 256
+    cases = [
+        # (description, batch_builder_kwargs, use_swa)
+        (
+            "decode dp=1 bs=1",
+            dict(dp_size=1, per_dp_bs_size=1, min_seq_len=256, max_seq_len=256),
+            False,
+        ),
+        (
+            "decode dp=1 bs=1 + SWA",
+            dict(dp_size=1, per_dp_bs_size=1, min_seq_len=256, max_seq_len=256),
+            True,
+        ),
+        (
+            "decode dp=4 bs=32",
+            dict(dp_size=4, per_dp_bs_size=32, min_seq_len=256, max_seq_len=65536),
+            True,
+        ),
+        (
+            "decode dp=2 bs=64 long seq",
+            dict(dp_size=2, per_dp_bs_size=64, min_seq_len=16384, max_seq_len=262144),
+            True,
+        ),
+        (
+            "decode dp=1 bs=128 no SWA",
+            dict(dp_size=1, per_dp_bs_size=128, min_seq_len=512, max_seq_len=4096),
+            False,
+        ),
+        (
+            "decode dp=2 bs=1 minimal",
+            dict(dp_size=2, per_dp_bs_size=1, min_seq_len=256, max_seq_len=256),
+            True,
+        ),
+    ]
+
+    all_passed = True
+    for desc, kwargs, use_swa in cases:
+        batch = build_decode_batch(page_size=page_size, **kwargs)
+        swa = None
+        if use_swa:
+            max_slot = int(np.max(batch.cache_loc)) + 1
+            swa = build_swa_mapping(kwargs["dp_size"], max(max_slot, 1000))
+
+        orig = get_forward_metadata_original(page_size, batch, swa)
+        opt = get_forward_metadata_optimized(page_size, batch, swa)
+
+        names = [
+            "page_indices",
+            "swa_page_indices",
+            "cu_q_lens",
+            "cu_kv_lens",
+            "seq_lens",
+            "distribution",
+        ]
+        ok = True
+        for name, o, p in zip(names, orig, opt):
+            if o is None and p is None:
+                continue
+            if not np.array_equal(o, p):
+                ok = False
+                break
+
+        status = "PASS" if ok else "FAIL"
+        if not ok:
+            all_passed = False
+        print(
+            f"  {status}  {desc}  (bs={kwargs['dp_size']*kwargs['per_dp_bs_size']}, swa={use_swa})"
+        )
+
+    # EXTEND mode tests
+    extend_cases = [
+        ("extend dp=2 bs=8 + SWA", dict(dp_size=2, per_dp_bs_size=8), True),
+        ("extend dp=1 bs=4 no SWA", dict(dp_size=1, per_dp_bs_size=4), False),
+    ]
+    for desc, kwargs, use_swa in extend_cases:
+        batch = build_extend_batch(page_size=page_size, **kwargs)
+        swa = None
+        if use_swa:
+            max_slot = int(np.max(batch.cache_loc)) + 1
+            swa = build_swa_mapping(kwargs["dp_size"], max(max_slot, 1000))
+
+        orig = get_forward_metadata_original(page_size, batch, swa)
+        opt = get_forward_metadata_optimized(page_size, batch, swa)
+
+        names = [
+            "page_indices",
+            "swa_page_indices",
+            "cu_q_lens",
+            "cu_kv_lens",
+            "seq_lens",
+            "distribution",
+        ]
+        ok = True
+        for name, o, p in zip(names, orig, opt):
+            if o is None and p is None:
+                continue
+            if not np.array_equal(o, p):
+                ok = False
+                break
+
+        status = "PASS" if ok else "FAIL"
+        if not ok:
+            all_passed = False
+        print(
+            f"  {status}  {desc}  (bs={kwargs['dp_size']*kwargs['per_dp_bs_size']}, swa={use_swa})"
+        )
+
+    return all_passed
+
+
 if __name__ == "__main__":
+    print("=" * 60)
+    print("Edge case correctness tests")
+    print("=" * 60)
+    ok = test_edge_cases()
+    if ok:
+        print("All edge cases passed!\n")
+    else:
+        print("SOME EDGE CASES FAILED!\n")
+        exit(1)
+
+    print("=" * 60)
+    print("Performance benchmark")
+    print("=" * 60)
     main()
