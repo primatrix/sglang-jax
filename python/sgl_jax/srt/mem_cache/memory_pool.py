@@ -780,21 +780,6 @@ def update_fused_kv_cache_vectorized(
     by grouping contiguous tokens into page-sized chunks for efficient updates.
     """
 
-    # Reshard fused_kv and loc to match kv_cache's sharding on the data axis,
-    # since kv_cache is the persistent buffer and may have data partition sharding
-    # while fused_kv (from test or non-DP context) may not.
-    kv_cache_sharding = getattr(kv_cache, "sharding", None)
-    if kv_cache_sharding is not None and hasattr(kv_cache_sharding, "spec"):
-        kv_spec = kv_cache_sharding.spec
-        if kv_spec is not None and len(kv_spec) > 0 and kv_spec[0] is not None:
-            from jax.sharding import NamedSharding
-
-            target_mesh = kv_cache_sharding.mesh
-            fused_kv = jax.sharding.reshard(
-                fused_kv, NamedSharding(target_mesh, P(kv_spec[0], kv_partition_axis, None))
-            )
-            loc = jax.sharding.reshard(loc, NamedSharding(target_mesh, P(kv_spec[0])))
-
     @jax.shard_map(
         in_specs=(
             # fused_kv: sharded by data (tokens) and tensor (heads)
