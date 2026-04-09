@@ -1336,7 +1336,16 @@ class ScheduleBatch:
                 if not info.reqs:
                     continue
                 for req in info.reqs:
-                    if req.decode_batch_idx % sliding_window_size == 1:
+                    # Skip decode_batch_idx=0 when overlap is enabled:
+                    # the previous batch may still be reading SWA pages.
+                    if self.enable_overlap and req.decode_batch_idx == 0:
+                        continue
+                    # Evict every page_size steps (or every step if page_size=1)
+                    # to keep SWA pool compact. Previous condition
+                    # (decode_batch_idx % sliding_window_size == 1) was too
+                    # infrequent — with sliding_window=4096, only every 4096
+                    # steps, accumulating thousands of stale SWA slots.
+                    if page_size <= 1 or req.decode_batch_idx % page_size == 0:
                         self._evict_swa(
                             req, req.seqlen - 1, sliding_window_size, page_size, dp_rank
                         )
