@@ -571,13 +571,9 @@ class FlashAttention(AttentionBackend):
 
             return result, updated_kv_cache_fused
 
-        # Reshard q/k/v to match in_specs data partition if needed (e.g. DP=1 tests)
-        data_spec_3d = NamedSharding(
-            self.mesh, P(self.attention_data_partition_axis, self.kv_partition_axis, None)
-        )
-        q_input = jax.sharding.reshard(q.reshape(q.shape[0], -1, self.head_dim), data_spec_3d)
-        k_input = jax.sharding.reshard(k.reshape(k.shape[0], -1, self.head_dim), data_spec_3d)
-        v_input = jax.sharding.reshard(v.reshape(v.shape[0], -1, self.head_dim), data_spec_3d)
+        q_input = q.reshape(q.shape[0], -1, self.head_dim)
+        k_input = k.reshape(k.shape[0], -1, self.head_dim)
+        v_input = v.reshape(v.shape[0], -1, self.head_dim)
 
         (
             attn_output,

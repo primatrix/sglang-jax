@@ -3,6 +3,7 @@ import unittest
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import (
@@ -98,36 +99,50 @@ def create_custom_mask(lens):
 
 
 def write_prefix_tokens_for_kv(forward_batch, token_to_kv_pool: KVCache, lens, k, v):
+    """Write prefix tokens to KV cache and return extend tokens.
+
+    k, v should be numpy arrays (or unsharded JAX arrays) to allow safe slicing.
+    Prefix data is resharded to match KV cache sharding before writing.
+    """
     page_size = forward_batch.attn_backend.page_size
+    kv_sharding = token_to_kv_pool.kv_sharding  # P("data", "tensor", None)
+
     # Use aligned positions for k/v indexing since k/v arrays are created with alignment gaps
-    aligned_seq_lens = ((forward_batch.seq_lens + page_size - 1) // page_size) * page_size
-    aligned_cache_loc_idx = jnp.concatenate(
-        [jnp.array([0], dtype=jnp.int32), jnp.cumsum(aligned_seq_lens)]
-    )
+    seq_lens_np = np.asarray(forward_batch.seq_lens)
+    aligned_seq_lens = ((seq_lens_np + page_size - 1) // page_size) * page_size
+    aligned_cache_loc_idx = np.concatenate([[0], np.cumsum(aligned_seq_lens)])
+
+    cache_loc_np = np.asarray(forward_batch.cache_loc)
 
     extend_k = []
     extend_v = []
+    # Convert k, v to numpy for safe slicing (avoid JAX sharding issues)
+    k_np = np.asarray(k)
+    v_np = np.asarray(v)
+
     for i, (q_len, kv_len) in enumerate(lens):
-        start = aligned_cache_loc_idx[i]
+        start = int(aligned_cache_loc_idx[i])
         prefix_end = start + (kv_len - q_len)
         extend_start = prefix_end
         extend_end = start + kv_len
 
-        print(
-            f"start: {start}, prefix_end: {prefix_end}, extend_start: {extend_start}, extend_end: {extend_end}"
-        )
-
         if kv_len > q_len:
-            # write prefix token
-            prefix_cache_loc = forward_batch.cache_loc[start:prefix_end]
-            prefix_k = k[start:prefix_end]
-            prefix_v = v[start:prefix_end]
+            # write prefix token - reshard to match KV cache sharding
+            prefix_cache_loc = jnp.array(cache_loc_np[start:prefix_end], dtype=jnp.int32)
+            prefix_k = jax.device_put(jnp.array(k_np[start:prefix_end], dtype=k.dtype), kv_sharding)
+            prefix_v = jax.device_put(jnp.array(v_np[start:prefix_end], dtype=v.dtype), kv_sharding)
+            # Reshard loc to match data axis of KV cache
+            loc_sharding = NamedSharding(kv_sharding.mesh, P(kv_sharding.spec[0]))
+            prefix_cache_loc = jax.device_put(prefix_cache_loc, loc_sharding)
             token_to_kv_pool.set_kv_buffer(0, prefix_cache_loc, prefix_k, prefix_v)
 
-        extend_k.append(k[extend_start:extend_end])
-        extend_v.append(v[extend_start:extend_end])
+        extend_k.append(k_np[extend_start:extend_end])
+        extend_v.append(v_np[extend_start:extend_end])
 
-    return jnp.concatenate(extend_k), jnp.concatenate(extend_v)
+    return (
+        jnp.array(np.concatenate(extend_k), dtype=k.dtype),
+        jnp.array(np.concatenate(extend_v), dtype=v.dtype),
+    )
 
 
 def create_test_data(
@@ -312,9 +327,6 @@ def create_test_data(
     )
     fb.attn_backend.forward_metadata = attention_backend.get_forward_metadata(mwb)
     if fb.spec_info is not None:
-        from jax.sharding import NamedSharding
-        from jax.sharding import PartitionSpec as P
-
         from sgl_jax.srt.utils.jax_utils import device_array
 
         fb.attn_backend.forward_metadata.custom_mask = device_array(
@@ -384,16 +396,14 @@ class TestAttention(CustomTestCase):
         print(f"cache_loc[100:200]: {forward_batch.cache_loc[100:200]}")
         print(f"out_cache_loc: {forward_batch.out_cache_loc[:100]}")
 
-        # Create test data
-        shading = jax.sharding.NamedSharding(mesh, P(None, "tensor"))
-        q_shard = jax.device_put(q.copy(), shading)
-        k_cache_shard = jax.device_put(k.copy(), shading)
-        v_cache_shard = jax.device_put(v.copy(), shading)
+        # write prefix tokens (k, v are unsharded for safe slicing)
+        extend_k, extend_v = write_prefix_tokens_for_kv(forward_batch, token_to_kv_pool, lens, k, v)
 
-        # write prefix tokens
-        extend_k, extend_v = write_prefix_tokens_for_kv(
-            forward_batch, token_to_kv_pool, lens, k_cache_shard, v_cache_shard
-        )
+        # Shard q/extend_k/extend_v with P("data", "tensor") to match production in_specs
+        dp_sharding = NamedSharding(mesh, P("data", "tensor"))
+        q_shard = jax.device_put(q, dp_sharding)
+        extend_k = jax.device_put(extend_k, dp_sharding)
+        extend_v = jax.device_put(extend_v, dp_sharding)
 
         # JAX attention
         attn = RadixAttention(
