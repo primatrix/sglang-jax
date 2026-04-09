@@ -27,7 +27,10 @@ class TestSWARadixCache(unittest.TestCase):
     def setUp(self):
         # Keep KV sizes small to make tests light-weight
         self.devices = jax.devices()
-        self.mesh = Mesh([self.devices[0]], axis_names=("tensor",))
+        self.mesh = Mesh(
+            np.array(self.devices[:1]).reshape(1, 1),
+            axis_names=("data", "tensor"),
+        )
 
         # Small buffers to avoid heavy allocations
         self.kv_head_num = 1
@@ -488,6 +491,52 @@ class TestSWARadixCache(unittest.TestCase):
         self.assertEqual(allocator.full_available_size(dp_rank=1), initial_full[1])
         self.assertEqual(allocator.swa_available_size(dp_rank=0), initial_swa[0])
         self.assertEqual(allocator.swa_available_size(dp_rank=1), initial_swa[1])
+
+    def test_free_swa_tombstones_tree_nodes(self):
+        """cache.free_swa must tombstone affected tree nodes and update swa_evictable_size (#226)."""
+        # Insert 16 tokens
+        indices = self._alloc_indices(16)
+        self.cache.insert(list(range(16)), indices.tolist())
+
+        # Unlock (match + lock + unlock)
+        result = self.cache.match_prefix(key=list(range(16)))
+        lock_uuid = self.cache.inc_lock_ref(result.last_device_node)
+        self.cache.dec_lock_ref(result.last_device_node, lock_uuid)
+
+        swa_evictable_before = self.cache.swa_evictable_size()
+        self.assertEqual(swa_evictable_before, 16)
+
+        # free_swa via cache (not allocator) — should tombstone + free
+        self.cache.free_swa(indices[:8], key=list(range(16)), swa_evicted_seqlen=8)
+
+        # swa_evictable_size should decrease
+        swa_evictable_after = self.cache.swa_evictable_size()
+        self.assertLess(
+            swa_evictable_after,
+            swa_evictable_before,
+            f"swa_evictable_size should decrease after free_swa. "
+            f"Before={swa_evictable_before}, After={swa_evictable_after}",
+        )
+
+        # Verify tombstone on tree nodes
+        result2 = self.cache.match_prefix(key=list(range(16)))
+        node = result2.last_device_node
+        path = []
+        walk = node
+        while walk != self.cache.root_node:
+            path.append(walk)
+            walk = walk.parent
+        path.reverse()
+
+        pos = 0
+        for n in path:
+            node_end = pos + len(n.value)
+            if node_end <= 8:
+                self.assertTrue(
+                    n.swa_tombstone,
+                    f"Node [{pos}:{node_end}] should be tombstoned",
+                )
+            pos = node_end
 
 
 if __name__ == "__main__":
