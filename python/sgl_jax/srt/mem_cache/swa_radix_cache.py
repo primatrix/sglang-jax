@@ -226,6 +226,18 @@ class LRUList:
             return False
         return node.id in self.cache
 
+        # Note: this is expensive, only use for debug
+    def sanity_check_evictable_size(self):
+        """
+        Check the evictable size (i.e. the size of the nodes that are not locked)
+        """
+        node = self.get_lru_no_lock()
+        evictable_size = 0
+        while self.in_list(node):
+            evictable_size += len(node.value)
+            node = self.get_prev_no_lock(node)
+        return evictable_size
+
     # Note: this is expensive, only use for debug or idle check
     def sanity_check(self, tree_cache: SWARadixCache):
         """
@@ -974,3 +986,15 @@ class SWARadixCache(BasePrefixCache):
                     continue
                 stack.append(child)
         return total_size, total_swa_size
+
+    def available_and_evictable_str(self) -> str:
+        full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+        swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
+        full_evictable_size = self.full_evictable_size()
+        swa_evictable_size = self.swa_evictable_size()
+        return (
+            f"Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
+            f"Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
+            f"Full LRU list evictable size: {self.full_lru_list.sanity_check_evictable_size()}\n"
+            f"SWA LRU list evictable size: {self.swa_lru_list.sanity_check_evictable_size()}\n"
+        )

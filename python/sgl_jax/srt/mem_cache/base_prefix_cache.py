@@ -1,6 +1,8 @@
 import abc
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+
 import jax
 
 if TYPE_CHECKING:
@@ -29,6 +31,7 @@ class MatchResult(NamedTuple):
 
 
 class BasePrefixCache(abc.ABC):
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     """Cache can be indexed by either rid or key."""
 
     @abc.abstractmethod
@@ -104,3 +107,10 @@ class BasePrefixCache(abc.ABC):
 
     def take_events(self):
         return []
+
+    def available_and_evictable_str(self) -> str:
+        if self.token_to_kv_pool_allocator:
+            available_size = self.token_to_kv_pool_allocator.available_size()
+            evictable_size = self.evictable_size()
+            return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
+        return f"No token_to_kv_pool_allocator is implemented"
