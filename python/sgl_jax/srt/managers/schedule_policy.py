@@ -326,10 +326,9 @@ class PrefillAdder:
             # For hybrid models, use the full pool's capacity for budget
             # estimation. SWA layers only need sliding-window tokens per request,
             # so the SWA pool should not limit admission here.
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.full_available_size(dp_rank=dp_rank)
-                + self.tree_cache.full_evictable_size(dp_rank=dp_rank)
-            )
+            available_and_evictable = self.token_to_kv_pool_allocator.full_available_size(
+                dp_rank=dp_rank
+            ) + self.tree_cache.full_evictable_size(dp_rank=dp_rank)
         else:
             available_and_evictable = self.token_to_kv_pool_allocator.available_size(
                 dp_rank=dp_rank
@@ -551,7 +550,25 @@ class PrefillAdder:
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
-        if total_tokens >= self.rem_total_tokens_for_dp(dp_rank):
+        rem_tokens_dp = self.rem_total_tokens_for_dp(dp_rank)
+        if total_tokens >= rem_tokens_dp:
+            if self.is_hybrid:
+                full_avail = self.token_to_kv_pool_allocator.full_available_size(dp_rank=dp_rank)
+                full_evict = self.tree_cache.full_evictable_size(dp_rank=dp_rank)
+            else:
+                full_avail = self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
+                full_evict = self.tree_cache.evictable_size(dp_rank=dp_rank)
+            logger.info(
+                "add_one_req NO_TOKEN dp=%d: need=%d > rem=%d "
+                "(pool_avail=%d, evictable=%d, offset=%.0f, new_token_ratio=%.3f)",
+                dp_rank,
+                total_tokens,
+                rem_tokens_dp,
+                full_avail,
+                full_evict,
+                self.rem_total_token_offset[dp_rank],
+                self.new_token_ratio,
+            )
             return AddReqResult.NO_TOKEN
 
         total_can_run = sum(len(v) for v in self.can_run_list.values())
@@ -560,7 +577,8 @@ class PrefillAdder:
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
-            if total_tokens >= self.rem_total_tokens_for_dp(dp_rank):
+            rem_tokens_dp = self.rem_total_tokens_for_dp(dp_rank)
+            if total_tokens >= rem_tokens_dp:
                 return AddReqResult.NO_TOKEN
             req.last_matched_prefix_len = prefix_len
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)

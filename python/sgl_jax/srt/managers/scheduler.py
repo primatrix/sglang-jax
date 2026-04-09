@@ -1501,6 +1501,22 @@ class Scheduler(
             dp_size=self.dp_size,
         )
 
+        # Debug: log scheduling state per DP rank
+        for dp_rank in range(self.dp_size):
+            rem_total = adder.rem_total_tokens_for_dp(dp_rank)
+            rem_cur = adder.cur_rem_tokens_for_dp(dp_rank)
+            logger.info(
+                "prefill_sched dp=%d: running=%d/%d, rem_total=%d, rem_cur=%d, "
+                "new_token_ratio=%.3f, waiting=%d",
+                dp_rank,
+                running_bs_per_dp[dp_rank],
+                self.per_dp_max_running_requests,
+                rem_total,
+                rem_cur,
+                self.new_token_ratio,
+                len(self.waiting_queue),
+            )
+
         # Process existing chunked requests for each DP rank
         for dp_rank in range(self.dp_size):
             if self.chunked_reqs[dp_rank] is not None:
@@ -1754,9 +1770,7 @@ class Scheduler(
                 if self.dp_size > 1:
                     from jax.experimental.multihost_utils import process_allgather
 
-                    next_token_ids_device = process_allgather(
-                        next_token_ids_device, tiled=True
-                    )
+                    next_token_ids_device = process_allgather(next_token_ids_device, tiled=True)
                 next_token_ids = np.array(jax.device_get(next_token_ids_device))
                 self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
         else:
