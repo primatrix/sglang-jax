@@ -13,9 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh
 
-from sgl_jax.srt.mem_cache.allocator import (
-    SWATokenToKVPoolAllocator,
-)
+from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     ReqToTokenPool,
@@ -595,6 +593,115 @@ class TestSWAOverlapSafety(unittest.TestCase):
             self.assertEqual(self.alloc.swa_available_size(), swa_before + expected_evicted)
         finally:
             global_server_args_dict["chunked_prefill_size"] = old_chunked_prefill_size
+
+
+class TestSWAMemoryBudget(unittest.TestCase):
+    """Tests for SWA memory budget calculation correctness."""
+
+    def test_cell_size_accounts_for_swa_head_count(self):
+        """Weighted cell_size must be larger than uniform cell_size when SWA has more KV heads."""
+        # MiMo-V2-Flash: 9 full layers (4 KV heads), 39 SWA layers (8 KV heads)
+        full_layers, swa_layers = 9, 39
+        full_kv_heads_per_device, swa_kv_heads_per_device = 1, 2  # TP=4
+        head_dim, dtype_bytes = 128, 2  # bf16
+
+        wrong_cell_size = (
+            full_kv_heads_per_device * head_dim * (full_layers + swa_layers) * 2 * dtype_bytes
+        )
+        correct_cell_size = (
+            (full_kv_heads_per_device * full_layers + swa_kv_heads_per_device * swa_layers)
+            * head_dim
+            * 2
+            * dtype_bytes
+        )
+        self.assertGreater(correct_cell_size, wrong_cell_size)
+
+        available_bytes = 10 * (1024**3)
+        ratio = (available_bytes // wrong_cell_size) / (available_bytes // correct_cell_size)
+        self.assertGreater(ratio, 1.5, f"Expected overestimation ratio > 1.5, got {ratio:.2f}")
+
+    def test_set_num_token_hybrid_correct_memory_budget(self):
+        """set_num_token_hybrid must not overcommit memory for hybrid models."""
+        import sys
+        from unittest.mock import MagicMock
+
+        stubs = {}
+        for mod_name in [
+            "pybase64",
+            "llguidance",
+            "sgl_jax.srt.layers.routed_experts_capturer",
+            "sgl_jax.srt.eplb.expert_location",
+            "sgl_jax.srt.constrained.llguidance_backend",
+        ]:
+            if mod_name not in sys.modules:
+                stubs[mod_name] = MagicMock()
+                sys.modules[mod_name] = stubs[mod_name]
+
+        try:
+            from sgl_jax.srt.model_executor.model_runner import ModelRunner
+        finally:
+            for mod_name in stubs:
+                sys.modules.pop(mod_name, None)
+
+        runner = MagicMock()
+        runner.sliding_window_size = 4096
+        runner.model_config = MagicMock()
+        runner.model_config.num_hidden_layers = 48
+        runner.model_config.head_dim = 128
+        runner.model_config.get_num_kv_heads.return_value = 1  # full: 4 heads / TP4
+        runner.model_config.hf_text_config = MagicMock()
+        runner.model_config.hf_text_config.swa_num_key_value_heads = 8
+        runner.attention_tp_size = 4
+        runner.kv_cache_dtype = "bfloat16"
+        runner.server_args = MagicMock()
+        runner.server_args.swa_full_tokens_ratio = 0.8
+        runner.server_args.dp_size = 1
+        runner.page_size = 1
+
+        # Simulate: profile_max_num_token computed 10000 with uniform full-attn cell_size
+        runner.max_total_num_tokens = 10000
+
+        # Mock the layer iteration so set_num_token_hybrid can classify layers
+        mock_layers = []
+        for i in range(48):
+            layer = MagicMock()
+            layer.layer_id = i
+            # layers 0-8: full attention (sliding_window_size=None)
+            # layers 9-47: SWA (sliding_window_size=4096)
+            if i < 9:
+                layer.self_attn.attn.sliding_window_size = None
+            else:
+                layer.self_attn.attn.sliding_window_size = 4096
+            mock_layers.append(layer)
+        runner.model = MagicMock()
+        runner.model.model.layers = mock_layers
+
+        ModelRunner.set_num_token_hybrid(runner)
+
+        full_max = runner.full_max_total_num_tokens
+        swa_max = runner.swa_max_total_num_tokens
+
+        # Compute costs
+        head_dim_aligned = 128
+        dtype_bytes = 2
+        full_cost = 1 * head_dim_aligned * 2 * dtype_bytes  # 512 B/token/layer
+        swa_cost = 2 * head_dim_aligned * 2 * dtype_bytes  # 1024 B/token/layer
+
+        # Budget: max_total_num_tokens was computed with uniform full_cost for all layers
+        budget_bytes = 10000 * full_cost * 48
+
+        # Actual memory the two pools will consume
+        actual_bytes = full_max * full_cost * 9 + swa_max * swa_cost * 39
+
+        self.assertLessEqual(
+            actual_bytes,
+            budget_bytes * 1.01,
+            f"Memory overcommit! actual={actual_bytes}, budget={budget_bytes}, "
+            f"full_max={full_max}, swa_max={swa_max}",
+        )
+        # Also verify pools are non-zero
+        self.assertGreater(full_max, 0)
+        self.assertGreater(swa_max, 0)
 
 
 if __name__ == "__main__":
