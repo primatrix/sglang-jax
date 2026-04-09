@@ -1724,7 +1724,14 @@ def ragged_paged_attention(
         padded_heads = actual_num_kv_heads * actual_num_q_heads_per_kv_head
         if sink.shape[0] < padded_heads:
             sink = jnp.pad(sink, (0, padded_heads - sink.shape[0]))
+        # Align num_q_heads_per_kv_head to q_packing to match kernel scratch buffer shapes
+        q_packing = get_dtype_packing(q.dtype)
+        aligned_num_q_heads_per_kv_head = align_to(actual_num_q_heads_per_kv_head, q_packing)
         attention_sink = sink.reshape(actual_num_kv_heads, actual_num_q_heads_per_kv_head, 1)
+        attention_sink = jnp.pad(
+            attention_sink,
+            ((0, 0), (0, aligned_num_q_heads_per_kv_head - actual_num_q_heads_per_kv_head), (0, 0)),
+        )
         attention_sink = jnp.repeat(attention_sink, 128, axis=-1)
 
     (

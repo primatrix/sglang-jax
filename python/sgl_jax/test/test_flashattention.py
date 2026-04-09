@@ -441,9 +441,9 @@ class TestAttention(CustomTestCase):
             q.reshape(q.shape[0], num_heads, head_dim),
             k.reshape(k.shape[0] // page_size, page_size, num_kv_heads, head_dim),
             v.reshape(v.shape[0] // page_size, page_size, num_kv_heads, head_dim),
-            forward_batch.seq_lens,
+            jnp.array(np.asarray(forward_batch.seq_lens)),
             page_table,
-            forward_batch.attn_backend.forward_metadata.cu_q_lens,
+            jnp.array(np.asarray(forward_batch.attn_backend.forward_metadata.cu_q_lens)),
             jnp.array([forward_batch.batch_size], dtype=jnp.int32),
             custom_mask=(
                 forward_batch.spec_info.custom_mask if forward_batch.spec_info is not None else None
