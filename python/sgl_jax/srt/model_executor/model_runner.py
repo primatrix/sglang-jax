@@ -782,10 +782,18 @@ class ModelRunner(BaseModelRunner):
         swa_layers_num = len(swa_attention_layer_ids)
         swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
 
+        # SWA layers may have more KV heads, costing more per token
+        full_head_num = self.model_config.get_total_num_kv_heads_with_replication(
+            self.attention_tp_size
+        )
+        hf_cfg = self.model_config.hf_text_config
+        swa_head_num = getattr(hf_cfg, "swa_num_key_value_heads", full_head_num)
+        swa_cost_ratio = swa_head_num / full_head_num if full_head_num > 0 else 1.0
+
         # Solve the equations:
-        # 1. swa_max_total_num_tokens * swa_layers_num + full_max_total_num_tokens * full_layers_num == total_tokens
+        # 1. swa_max_total_num_tokens * swa_cost_ratio * swa_layers_num + full_max_total_num_tokens * full_layers_num == total_tokens
         # 2. full_max_total_num_tokens * swa_full_tokens_ratio == swa_max_total_num_tokens
-        denominator = swa_full_tokens_ratio * swa_layers_num + full_layers_num
+        denominator = swa_full_tokens_ratio * swa_cost_ratio * swa_layers_num + full_layers_num
         self.full_max_total_num_tokens = int(total_tokens / denominator)
         self.swa_max_total_num_tokens = int(self.full_max_total_num_tokens * swa_full_tokens_ratio)
 
