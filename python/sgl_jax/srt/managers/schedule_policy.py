@@ -574,18 +574,39 @@ class PrefillAdder:
 
         total_can_run = sum(len(v) for v in self.can_run_list.values())
         if real_input_tokens >= self.rem_input_tokens and total_can_run != 0:
+            logger.info(
+                "add_one_req OTHER(rem_input) dp=%d: real_input=%d >= rem_input=%d, " "can_run=%d",
+                dp_rank,
+                real_input_tokens,
+                self.rem_input_tokens,
+                total_can_run,
+            )
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
             rem_tokens_dp = self.rem_total_tokens_for_dp(dp_rank)
             if total_tokens >= rem_tokens_dp:
+                logger.info(
+                    "add_one_req NO_TOKEN(lock) dp=%d: need=%d >= rem=%d",
+                    dp_rank,
+                    total_tokens,
+                    rem_tokens_dp,
+                )
                 return AddReqResult.NO_TOKEN
             req.last_matched_prefix_len = prefix_len
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
             total_can_run = sum(len(v) for v in self.can_run_list.values())
             if input_tokens >= self.rem_input_tokens and total_can_run != 0:
+                logger.info(
+                    "add_one_req OTHER(rem_input_lock) dp=%d: input=%d >= rem_input=%d, "
+                    "can_run=%d",
+                    dp_rank,
+                    input_tokens,
+                    self.rem_input_tokens,
+                    total_can_run,
+                )
                 return AddReqResult.OTHER
 
             if (
@@ -612,6 +633,13 @@ class PrefillAdder:
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens_list[dp_rank] // self.page_size * self.page_size
                 if trunc_len <= 0:
+                    logger.info(
+                        "add_one_req OTHER(chunk_exhausted) dp=%d: input=%d, "
+                        "rem_chunk=%d, trunc=0",
+                        dp_rank,
+                        input_tokens,
+                        self.rem_chunk_tokens_list[dp_rank],
+                    )
                     return AddReqResult.OTHER
 
                 # Chunked prefill

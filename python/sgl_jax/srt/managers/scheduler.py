@@ -1566,15 +1566,29 @@ class Scheduler(
                 if res == AddReqResult.NO_TOKEN:
                     # Mark this specific DP rank as exhausted
                     self.running_batch.reqs_info[dp_rank].batch_is_full = True
+                    logger.info(
+                        "prefill_loop: dp=%d marked batch_is_full (NO_TOKEN), "
+                        "running=%d, can_run=%d",
+                        dp_rank,
+                        len(self.running_batch.reqs_info[dp_rank].reqs),
+                        len(adder.can_run_list[dp_rank]),
+                    )
 
                     # Check if all DP ranks are exhausted
                     if self.running_batch.batch_is_full:
+                        logger.info("prefill_loop: ALL DP ranks full, break")
                         break
 
                     # Continue to try requests from other DP ranks
                     continue
                 else:
                     # OTHER: Global budget exhausted, stop entirely
+                    logger.info(
+                        "prefill_loop: break on OTHER, dp=%d, " "rem_input=%d, rem_chunk=%s",
+                        dp_rank,
+                        adder.rem_input_tokens,
+                        adder.rem_chunk_tokens_list,
+                    )
                     break
 
         # Update waiting queue
