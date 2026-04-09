@@ -388,7 +388,7 @@ class ModelRunner(BaseModelRunner):
 
 
         def adjust_layer_num():
-            return (self.hf_text_config.swa_num_key_value_heads//self.hf_text_config.num_key_value_heads)*len(self.model_config.swa_attention_layer_ids)+len(self.model_config.full_attention_layer_ids)
+            return (self.model_config.hf_text_config.swa_num_key_value_heads//self.model_config.hf_text_config.num_key_value_heads)*len(self.model_config.swa_attention_layer_ids)+len(self.model_config.full_attention_layer_ids)
 
         cell_size = (
             self.model_config.get_num_kv_heads(self.attention_tp_size)
