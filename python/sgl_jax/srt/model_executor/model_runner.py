@@ -378,6 +378,15 @@ class ModelRunner(BaseModelRunner):
             1 - self.mem_fraction_static
         )
 
+        logger.info(
+            "Memory debug: available_after_load=%.2fGB, total_before_load=%.2fGB, "
+            "reserved_fraction=%.2f, reserved=%.2fGB, available_kv_cache=%.2fGB",
+            available_device_memory / (1024**3),
+            total_device_memory / (1024**3),
+            1 - self.mem_fraction_static,
+            total_device_memory * (1 - self.mem_fraction_static) / (1024**3),
+            available_kv_cache_bytes / (1024**3),
+        )
         if available_kv_cache_bytes <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
 
