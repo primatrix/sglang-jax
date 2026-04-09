@@ -312,7 +312,6 @@ class ForwardBatch:
         model_runner: ModelRunner,
     ):
         (
-            input_ids,
             seq_lens,
             out_cache_loc,
             positions,
@@ -322,7 +321,6 @@ class ForwardBatch:
             extend_seq_lens,
         ) = device_array(
             (
-                batch.input_ids,
                 batch.seq_lens,
                 batch.out_cache_loc,
                 batch.positions,
@@ -333,6 +331,14 @@ class ForwardBatch:
             ),
             sharding=(
                 NamedSharding(model_runner.mesh, PartitionSpec("data"))
+                if jax.process_count() == 1
+                else None
+            ),
+        )
+        (input_ids,) = device_array(
+            (batch.input_ids,),
+            sharding=(
+                NamedSharding(model_runner.mesh, PartitionSpec())
                 if jax.process_count() == 1
                 else None
             ),
