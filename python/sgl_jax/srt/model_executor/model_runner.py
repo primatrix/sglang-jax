@@ -388,7 +388,17 @@ class ModelRunner(BaseModelRunner):
 
 
         def adjust_layer_num():
-            return (self.model_config.hf_text_config.swa_num_key_value_heads//self.model_config.hf_text_config.num_key_value_heads)*len(self.model_config.swa_attention_layer_ids)+len(self.model_config.full_attention_layer_ids)
+            # 0 for full attention, 1 for swa
+            full,swa=0,0
+            if getattr(self.model_config.hf_text_config, "hybrid_layer_pattern",None):
+                for pattern in self.model_config.hf_text_config.hybrid_layer_pattern:
+                    if pattern==0:
+                        full+=1
+                    elif pattern==1:
+                        swa+=1
+                return (self.model_config.hf_text_config.swa_num_key_value_heads//self.model_config.hf_text_config.num_key_value_heads)*swa+full
+            else:
+                return self.model_config.num_hidden_layers 
 
         cell_size = (
             self.model_config.get_num_kv_heads(self.attention_tp_size)
