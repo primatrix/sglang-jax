@@ -1449,98 +1449,189 @@ def _fused_ep_moe_kernel(
             for bd1c_id in range(cdiv(bd1, bd1c)):
                 for p_id in range(t_packing):
                     if w1_scale_vmem is not None and n_sg > 1:
-                        # Quantized path with multiple scale groups per tile.
-                        # Use lax.fori_loop instead of Python for-loop to avoid
-                        # static unrolling which explodes HLO size and VMEM usage.
+                        # VMEM budget for pre-dequant: bf16 buffer of
+                        # (bd1c_per_t_packing, bfc) per weight matrix.
+                        _dq_bytes = bd1c_per_t_packing * bfc * 2
+                        _use_predequant = _dq_bytes <= 2 * 1024 * 1024
+
                         for bfc_id in range(cdiv(bf, bfc)):
                             base_sg = bd1c_id * n_sg
 
-                            def _ffn1_sg_body(sg_id, carry):
-                                acc1, acc3 = carry
-                                sg_offset = sg_id * sg_k
-                                t_g = t_vmem[
+                            if _use_predequant:
+                                # Pre-dequant path: dequantize FP8 weights to
+                                # bf16 per scale group, then do one large K
+                                # matmul instead of n_sg small ones.
+                                t_full = t_vmem[
                                     pl.ds(btc_id * btc, btc),
                                     p_id,
                                     pl.ds(
-                                        bd1c_id * bd1c_per_t_packing + sg_offset,
-                                        sg_k,
+                                        bd1c_id * bd1c_per_t_packing,
+                                        bd1c_per_t_packing,
                                     ),
                                 ]
-                                w_g_slices = (
-                                    p_id,
-                                    pl.ds(
-                                        bd1c_id * bd1c_per_t_packing + sg_offset,
-                                        sg_k,
-                                    ),
-                                    pl.ds(bfc_id * bfc, bfc),
-                                )
-                                d1 = jnp.dot(
-                                    t_g,
-                                    w1_vmem[*w_g_slices],
-                                    preferred_element_type=jnp.float32,
-                                )
-                                global_sg = base_sg + sg_id
-                                # Use pl.ds for traced global_sg index.
-                                if subc_quant_n_wsz is None:
-                                    s1 = w1_scale_vmem[
+                                w1_dq_slices = []
+                                w3_dq_slices = []
+                                for sg_id in range(n_sg):
+                                    sg_offset = sg_id * sg_k
+                                    w_g_slices = (
                                         p_id,
-                                        pl.ds(global_sg, 1),
-                                        pl.ds(0, 1),
+                                        pl.ds(
+                                            bd1c_id * bd1c_per_t_packing + sg_offset,
+                                            sg_k,
+                                        ),
                                         pl.ds(bfc_id * bfc, bfc),
-                                    ]
-                                    s1 = s1.reshape(1, bfc)
-                                else:
-                                    n_sg_n = bfc // subc_quant_n_wsz
-                                    s1 = w1_scale_vmem[
-                                        p_id,
-                                        pl.ds(global_sg, 1),
-                                        pl.ds(bfc_id * n_sg_n, n_sg_n),
-                                        pl.ds(0, 1),
-                                    ]
-                                    s1 = s1.reshape(1, n_sg_n, 1)
-                                    s1 = jnp.broadcast_to(s1, (1, n_sg_n, subc_quant_n_wsz))
-                                    s1 = s1.reshape(1, bfc)
-                                d1 = d1 * jnp.broadcast_to(s1, d1.shape)
-                                acc1 = acc1 + d1
-
-                                d3 = jnp.dot(
-                                    t_g,
-                                    w3_vmem[*w_g_slices],
-                                    preferred_element_type=jnp.float32,
-                                )
-                                if w3_scale_vmem is not None:
+                                    )
+                                    global_sg = base_sg + sg_id
                                     if subc_quant_n_wsz is None:
-                                        s3 = w3_scale_vmem[
+                                        s1 = w1_scale_vmem[
                                             p_id,
                                             pl.ds(global_sg, 1),
                                             pl.ds(0, 1),
                                             pl.ds(bfc_id * bfc, bfc),
                                         ]
-                                        s3 = s3.reshape(1, bfc)
+                                        s1 = s1.reshape(1, bfc)
                                     else:
                                         n_sg_n = bfc // subc_quant_n_wsz
-                                        s3 = w3_scale_vmem[
+                                        s1 = w1_scale_vmem[
                                             p_id,
                                             pl.ds(global_sg, 1),
                                             pl.ds(bfc_id * n_sg_n, n_sg_n),
                                             pl.ds(0, 1),
                                         ]
-                                        s3 = s3.reshape(1, n_sg_n, 1)
-                                        s3 = jnp.broadcast_to(s3, (1, n_sg_n, subc_quant_n_wsz))
-                                        s3 = s3.reshape(1, bfc)
-                                    d3 = d3 * jnp.broadcast_to(s3, d3.shape)
-                                acc3 = acc3 + d3
-                                return (acc1, acc3)
+                                        s1 = s1.reshape(1, n_sg_n, 1)
+                                        s1 = jnp.broadcast_to(s1, (1, n_sg_n, subc_quant_n_wsz))
+                                        s1 = s1.reshape(1, bfc)
+                                    w1_dq_slices.append(
+                                        w1_vmem[*w_g_slices].astype(jnp.bfloat16)
+                                        * s1.astype(jnp.bfloat16)
+                                    )
+                                    if w3_scale_vmem is not None:
+                                        if subc_quant_n_wsz is None:
+                                            s3 = w3_scale_vmem[
+                                                p_id,
+                                                pl.ds(global_sg, 1),
+                                                pl.ds(0, 1),
+                                                pl.ds(bfc_id * bfc, bfc),
+                                            ]
+                                            s3 = s3.reshape(1, bfc)
+                                        else:
+                                            s3 = w3_scale_vmem[
+                                                p_id,
+                                                pl.ds(global_sg, 1),
+                                                pl.ds(bfc_id * n_sg_n, n_sg_n),
+                                                pl.ds(0, 1),
+                                            ]
+                                            s3 = s3.reshape(1, n_sg_n, 1)
+                                            s3 = jnp.broadcast_to(s3, (1, n_sg_n, subc_quant_n_wsz))
+                                            s3 = s3.reshape(1, bfc)
+                                        w3_dq_slices.append(
+                                            w3_vmem[*w_g_slices].astype(jnp.bfloat16)
+                                            * s3.astype(jnp.bfloat16)
+                                        )
+                                    else:
+                                        w3_dq_slices.append(
+                                            w3_vmem[*w_g_slices].astype(jnp.bfloat16)
+                                        )
+                                w1_dq = jnp.concatenate(w1_dq_slices, axis=0)
+                                w3_dq = jnp.concatenate(w3_dq_slices, axis=0)
+                                acc1 = jnp.dot(
+                                    t_full,
+                                    w1_dq,
+                                    preferred_element_type=jnp.float32,
+                                )
+                                acc3 = jnp.dot(
+                                    t_full,
+                                    w3_dq,
+                                    preferred_element_type=jnp.float32,
+                                )
+                            else:
+                                # Fori_loop path: n_sg small matmuls to stay
+                                # within VMEM budget.
+                                def _ffn1_sg_body(sg_id, carry):
+                                    acc1, acc3 = carry
+                                    sg_offset = sg_id * sg_k
+                                    t_g = t_vmem[
+                                        pl.ds(btc_id * btc, btc),
+                                        p_id,
+                                        pl.ds(
+                                            bd1c_id * bd1c_per_t_packing + sg_offset,
+                                            sg_k,
+                                        ),
+                                    ]
+                                    w_g_slices = (
+                                        p_id,
+                                        pl.ds(
+                                            bd1c_id * bd1c_per_t_packing + sg_offset,
+                                            sg_k,
+                                        ),
+                                        pl.ds(bfc_id * bfc, bfc),
+                                    )
+                                    d1 = jnp.dot(
+                                        t_g,
+                                        w1_vmem[*w_g_slices],
+                                        preferred_element_type=jnp.float32,
+                                    )
+                                    global_sg = base_sg + sg_id
+                                    if subc_quant_n_wsz is None:
+                                        s1 = w1_scale_vmem[
+                                            p_id,
+                                            pl.ds(global_sg, 1),
+                                            pl.ds(0, 1),
+                                            pl.ds(bfc_id * bfc, bfc),
+                                        ]
+                                        s1 = s1.reshape(1, bfc)
+                                    else:
+                                        n_sg_n = bfc // subc_quant_n_wsz
+                                        s1 = w1_scale_vmem[
+                                            p_id,
+                                            pl.ds(global_sg, 1),
+                                            pl.ds(bfc_id * n_sg_n, n_sg_n),
+                                            pl.ds(0, 1),
+                                        ]
+                                        s1 = s1.reshape(1, n_sg_n, 1)
+                                        s1 = jnp.broadcast_to(s1, (1, n_sg_n, subc_quant_n_wsz))
+                                        s1 = s1.reshape(1, bfc)
+                                    d1 = d1 * jnp.broadcast_to(s1, d1.shape)
+                                    acc1 = acc1 + d1
 
-                            acc1, acc3 = lax.fori_loop(
-                                0,
-                                n_sg,
-                                _ffn1_sg_body,
-                                (
-                                    jnp.zeros((btc, bfc), dtype=jnp.float32),
-                                    jnp.zeros((btc, bfc), dtype=jnp.float32),
-                                ),
-                            )
+                                    d3 = jnp.dot(
+                                        t_g,
+                                        w3_vmem[*w_g_slices],
+                                        preferred_element_type=jnp.float32,
+                                    )
+                                    if w3_scale_vmem is not None:
+                                        if subc_quant_n_wsz is None:
+                                            s3 = w3_scale_vmem[
+                                                p_id,
+                                                pl.ds(global_sg, 1),
+                                                pl.ds(0, 1),
+                                                pl.ds(bfc_id * bfc, bfc),
+                                            ]
+                                            s3 = s3.reshape(1, bfc)
+                                        else:
+                                            n_sg_n = bfc // subc_quant_n_wsz
+                                            s3 = w3_scale_vmem[
+                                                p_id,
+                                                pl.ds(global_sg, 1),
+                                                pl.ds(bfc_id * n_sg_n, n_sg_n),
+                                                pl.ds(0, 1),
+                                            ]
+                                            s3 = s3.reshape(1, n_sg_n, 1)
+                                            s3 = jnp.broadcast_to(s3, (1, n_sg_n, subc_quant_n_wsz))
+                                            s3 = s3.reshape(1, bfc)
+                                        d3 = d3 * jnp.broadcast_to(s3, d3.shape)
+                                    acc3 = acc3 + d3
+                                    return (acc1, acc3)
+
+                                acc1, acc3 = lax.fori_loop(
+                                    0,
+                                    n_sg,
+                                    _ffn1_sg_body,
+                                    (
+                                        jnp.zeros((btc, bfc), dtype=jnp.float32),
+                                        jnp.zeros((btc, bfc), dtype=jnp.float32),
+                                    ),
+                                )
 
                             acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
 
@@ -1713,6 +1804,16 @@ def _fused_ep_moe_kernel(
         assert bd2c % (t_packing * 128) == 0, (bd2c, t_packing)
 
         def body(btc_id, __):
+            # Pre-compute activation for quantized n_sg2 > 1 path.
+            # Avoids redundant activation_fn calls inside fori_loop
+            # (which repeats for each bd2c_id * t_packing iterations).
+            if w2_scale_vmem is not None and n_sg2 > 1:
+                for bfc_id in range(cdiv(bf, bfc)):
+                    acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
+                    acc1_tile = acc1_vmem[*acc_slices]
+                    acc3_tile = acc3_vmem[*acc_slices]
+                    acc1_vmem[*acc_slices] = activation_fn(acc1_tile, acc3_tile, act_fn)
+
             for bd2c_id in range(cdiv(bd2, bd2c)):
                 for p_id in range(t_packing):
                     res = jnp.zeros((btc, bd2c_per_t_packing), dtype=jnp.float32)
@@ -1729,25 +1830,17 @@ def _fused_ep_moe_kernel(
                     if w2_scale_vmem is not None and n_sg2 > 1:
                         for bfc_id in range(cdiv(bf, bfc)):
                             # Quantized path with multiple scale groups.
-                            # Use lax.fori_loop to avoid static unrolling.
-                            # Read per-group slices from VMEM refs and compute
-                            # activation inside the loop body, avoiding
-                            # dynamic_slice on JAX arrays (unsupported in
-                            # Pallas TPU lowering). activation is element-wise
-                            # so act(acc[slice]) == act(acc)[slice].
+                            # Activation is pre-computed above; fori_loop
+                            # only does dot + scale.
                             base_sg = bfc_id * n_sg2
 
                             def _ffn2_sg_body(sg_id, sg_acc):
                                 sg_offset = sg_id * sg_k2
-                                acc1_g = acc1_vmem[
+                                # acc1_vmem already has pre-activated values.
+                                act_g = acc1_vmem[
                                     pl.ds(btc_id * btc, btc),
                                     pl.ds(bfc_id * bfc + sg_offset, sg_k2),
                                 ]
-                                acc3_g = acc3_vmem[
-                                    pl.ds(btc_id * btc, btc),
-                                    pl.ds(bfc_id * bfc + sg_offset, sg_k2),
-                                ]
-                                act_g = activation_fn(acc1_g, acc3_g, act_fn)
                                 w2_g = w2_vmem[
                                     p_id,
                                     pl.ds(bfc_id * bfc + sg_offset, sg_k2),

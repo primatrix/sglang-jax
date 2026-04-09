@@ -34,9 +34,13 @@ spec:
       subdomain: fused-xprof-svc
       restartPolicy: Never
       nodeSelector:
-        cloud.google.com/gke-nodepool: tpu-v6e-16-xc
+        cloud.google.com/gke-nodepool: mimo-pool-3
         cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
         cloud.google.com/gke-tpu-topology: "4x4"
+      tolerations:
+        - key: google.com/tpu
+          operator: Exists
+          effect: NoSchedule
       volumes:
         - name: dev-shm
           emptyDir:
