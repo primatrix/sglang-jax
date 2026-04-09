@@ -667,6 +667,7 @@ def run_all(
     token_mask_mode: str = "none",
     token_valid_ratio: float = 1.0,
     token_mask_seed: int = 0,
+    subc_quant_wsz_override: int | None = None,
 ) -> None:
     if use_grouped_topk is None:
         use_grouped_topk = bool(num_expert_group or topk_group)
@@ -796,7 +797,10 @@ def run_all(
                 ),
             )
         # Determine subc_quant_wsz for FP8 quantization
-        subc_quant_wsz = 256 if weight_dtype == jnp.float8_e4m3fn else None
+        if subc_quant_wsz_override is not None:
+            subc_quant_wsz = subc_quant_wsz_override
+        else:
+            subc_quant_wsz = 256 if weight_dtype == jnp.float8_e4m3fn else None
 
         block_cfgs: list[FusedMoEBlockConfig | None]
         if tune_block_config:
@@ -1199,6 +1203,12 @@ def parse_args() -> argparse.Namespace:
         help="All-to-all imbalance mode.",
     )
     parser.add_argument(
+        "--subc-quant-wsz",
+        type=int,
+        default=None,
+        help="Sub-channel quantization block size (default: 256 for FP8, None for bf16).",
+    )
+    parser.add_argument(
         "--alpha",
         type=float,
         default=1.0,
@@ -1302,6 +1312,7 @@ if __name__ == "__main__":
             token_mask_mode=args.token_mask_mode,
             token_valid_ratio=args.token_valid_ratio,
             token_mask_seed=args.token_mask_seed,
+            subc_quant_wsz_override=args.subc_quant_wsz,
         )
     except BaseException as e:
         print(f"FATAL: {type(e).__name__}: {e}", flush=True)
