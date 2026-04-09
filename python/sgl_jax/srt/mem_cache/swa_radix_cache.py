@@ -672,6 +672,83 @@ class SWARadixCache(BasePrefixCache):
         self.full_lru_list.sanity_check(self)
         self.swa_lru_list.sanity_check(self)
 
+    def free_swa(self, free_index, dp_rank: int = 0, **kwargs):
+        """Free SWA slots and tombstone affected tree nodes.
+
+        Called by _evict_swa when freeing SWA slots outside the sliding window.
+        Unlike the base class which just calls allocator.free_swa, this also
+        walks the radix tree to tombstone affected nodes so match_prefix
+        knows about the SWA data gap.
+
+        Args:
+            free_index: Indices to free from SWA pool.
+            dp_rank: DP rank.
+            key: Token sequence to locate in the tree.
+            swa_evicted_seqlen: Number of tokens from start whose SWA is freed.
+        """
+        if self.disable:
+            self.token_to_kv_pool_allocator.free_swa(free_index, dp_rank=dp_rank)
+            return
+
+        key = kwargs.get("key")
+        swa_evicted_seqlen = kwargs.get("swa_evicted_seqlen", 0)
+
+        # Tombstone tree nodes BEFORE freeing (so _swa_eff_len still works)
+        if key is not None and swa_evicted_seqlen > 0:
+            self._tombstone_swa_range(key, swa_evicted_seqlen, dp_rank)
+
+        # Now free the SWA slots
+        self.token_to_kv_pool_allocator.free_swa(free_index, dp_rank=dp_rank)
+
+    def _tombstone_swa_range(
+        self, key: RadixKey | list, swa_evicted_seqlen: int, dp_rank: int = 0
+    ) -> None:
+        """Walk tree and tombstone nodes in [0:swa_evicted_seqlen]."""
+        if not isinstance(key, RadixKey):
+            key = RadixKey(key, None, None)
+
+        node = self.root_node
+        pos = 0
+        while pos < swa_evicted_seqlen:
+            child_key = self.get_child_key_fn(key)
+            if child_key not in node.children:
+                break
+            node = node.children[child_key]
+
+            prefix_len = self.key_match_fn(node.key, key)
+            if prefix_len == 0:
+                break
+
+            node_end = pos + prefix_len
+
+            if node_end <= swa_evicted_seqlen:
+                # Fully within evicted range — tombstone
+                if not node.swa_tombstone:
+                    eff = self._swa_eff_len(node.value, dp_rank=dp_rank)
+                    if len(node.children) > 0:
+                        self.swa_lru_list.remove_node(node)
+                        self._tombstone_internal_node(node)
+                    else:
+                        node.swa_tombstone = True
+                        self.swa_lru_list.remove_node(node)
+                    self.swa_evictable_size_[dp_rank] -= eff
+            elif pos < swa_evicted_seqlen < node_end:
+                # Partial overlap — split then tombstone the first part
+                split_at = swa_evicted_seqlen - pos
+                if self.page_size > 1:
+                    split_at = (split_at // self.page_size) * self.page_size
+                if 0 < split_at < prefix_len:
+                    new_parent = self._split_node(node, split_at)
+                    if not new_parent.swa_tombstone:
+                        eff = self._swa_eff_len(new_parent.value, dp_rank=dp_rank)
+                        self.swa_lru_list.remove_node(new_parent)
+                        self._tombstone_internal_node(new_parent)
+                        self.swa_evictable_size_[dp_rank] -= eff
+                break
+
+            pos = node_end
+            key = key[prefix_len:]
+
     def evictable_size(self, dp_rank: int = 0) -> tuple[int, int]:
         # Note: use full_evictable_size() and swa_evictable_size() instead.
         raise NotImplementedError
