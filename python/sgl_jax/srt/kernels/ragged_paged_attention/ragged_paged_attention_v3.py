@@ -21,6 +21,7 @@ sglang-jax specific features:
 - cu_kv_lens-based page_indices offset computation
 """
 import functools
+import inspect as _inspect
 import logging
 from enum import Enum
 
@@ -42,6 +43,16 @@ from sgl_jax.srt.kernels.ragged_paged_attention.util import (
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 DEFAULT_VMEM_LIMIT_BYTES = 120 * 1024 * 1024  # 120MB
 logger = logging.getLogger(__name__)
+
+_COMPILER_PARAMS_SUPPORTS_SEMAPHORE = (
+    "disable_semaphore_checks" in _inspect.signature(pltpu.CompilerParams).parameters
+)
+
+
+def _semaphore_kwargs(disable_semaphore_checks: bool) -> dict:
+    if _COMPILER_PARAMS_SUPPORTS_SEMAPHORE:
+        return {"disable_semaphore_checks": disable_semaphore_checks}
+    return {}
 
 
 class RpaCase(Enum):
@@ -1875,7 +1886,7 @@ def ragged_paged_attention(
                 dimension_semantics=("arbitrary",),
                 vmem_limit_bytes=vmem_limit_bytes,
                 disable_bounds_checks=True,
-                disable_semaphore_checks=disable_semaphore_checks,
+                **(_semaphore_kwargs(disable_semaphore_checks)),
             ),
             out_shape=(
                 [
