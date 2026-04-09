@@ -668,6 +668,7 @@ def run_all(
     token_valid_ratio: float = 1.0,
     token_mask_seed: int = 0,
     subc_quant_wsz_override: int | None = None,
+    subc_quant_n_wsz: int | None = None,
 ) -> None:
     if use_grouped_topk is None:
         use_grouped_topk = bool(num_expert_group or topk_group)
@@ -862,6 +863,8 @@ def run_all(
                 quantization_config=quantization_config,
             )
             if quantization_config is not None:
+                if subc_quant_n_wsz is not None:
+                    fused_layer.quant_block_n = subc_quant_n_wsz
                 fused_layer.quantize_weights()
 
             topk_module = TopK(
@@ -1209,6 +1212,12 @@ def parse_args() -> argparse.Namespace:
         help="Sub-channel quantization block size (default: 256 for FP8, None for bf16).",
     )
     parser.add_argument(
+        "--subc-quant-n-wsz",
+        type=int,
+        default=None,
+        help="N-dim block size for 2D block-wise quantization. When set, uses block_k=subc-quant-wsz, block_n=this value.",
+    )
+    parser.add_argument(
         "--alpha",
         type=float,
         default=1.0,
@@ -1313,6 +1322,7 @@ if __name__ == "__main__":
             token_valid_ratio=args.token_valid_ratio,
             token_mask_seed=args.token_mask_seed,
             subc_quant_wsz_override=args.subc_quant_wsz,
+            subc_quant_n_wsz=args.subc_quant_n_wsz,
         )
     except BaseException as e:
         print(f"FATAL: {type(e).__name__}: {e}", flush=True)
