@@ -1476,9 +1476,10 @@ class Scheduler(
 
         # Handle the cases where prefill is not allowed
         has_chunked_reqs = any(req is not None for req in self.chunked_reqs)
-        if (
-            self.running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and not has_chunked_reqs:
+        # if (
+        #     self.running_batch.batch_is_full or len(self.waiting_queue) == 0
+        # ) and not has_chunked_reqs:
+        if len(self.waiting_queue) == 0 and not has_chunked_reqs:
             return None
 
         running_bs = self.running_batch.batch_size()
