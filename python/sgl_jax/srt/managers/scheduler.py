@@ -1139,7 +1139,7 @@ class Scheduler(
             #print(f"[get_next_batch_to_run] after merge: {self.running_batch.batch_size()=}",flush=True)
         
         ## Force to calculate based on budget
-        #self.running_batch.batch_is_full = False
+        self.running_batch.batch_is_full = False
         new_batch = self.get_new_batch_prefill()
 
         # if new_batch is not None:
