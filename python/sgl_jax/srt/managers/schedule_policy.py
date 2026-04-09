@@ -558,12 +558,17 @@ class PrefillAdder:
             else:
                 full_avail = self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
                 full_evict = self.tree_cache.evictable_size(dp_rank=dp_rank)
-            print(
-                f"[SCHED] add_one_req NO_TOKEN dp={dp_rank}: need={total_tokens} > rem={rem_tokens_dp} "
-                f"(pool_avail={full_avail}, evictable={full_evict}, "
-                f"offset={self.rem_total_token_offset[dp_rank]:.0f}, "
-                f"new_token_ratio={self.new_token_ratio:.3f})",
-                flush=True,
+            logger.info(
+                "add_one_req NO_TOKEN dp=%d: need=%d > rem=%d "
+                "(pool_avail=%d, evictable=%d, offset=%.0f, "
+                "new_token_ratio=%.3f)",
+                dp_rank,
+                total_tokens,
+                rem_tokens_dp,
+                full_avail,
+                full_evict,
+                self.rem_total_token_offset[dp_rank],
+                self.new_token_ratio,
             )
             return AddReqResult.NO_TOKEN
 

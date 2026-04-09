@@ -1505,11 +1505,16 @@ class Scheduler(
         for dp_rank in range(self.dp_size):
             rem_total = adder.rem_total_tokens_for_dp(dp_rank)
             rem_cur = adder.cur_rem_tokens_for_dp(dp_rank)
-            print(
-                f"[SCHED] prefill_sched dp={dp_rank}: running={running_bs_per_dp[dp_rank]}/{self.per_dp_max_running_requests}, "
-                f"rem_total={rem_total}, rem_cur={rem_cur}, "
-                f"new_token_ratio={self.new_token_ratio:.3f}, waiting={len(self.waiting_queue)}",
-                flush=True,
+            logger.info(
+                "prefill_sched dp=%d: running=%d/%d, rem_total=%d, rem_cur=%d, "
+                "new_token_ratio=%.3f, waiting=%d",
+                dp_rank,
+                running_bs_per_dp[dp_rank],
+                self.per_dp_max_running_requests,
+                rem_total,
+                rem_cur,
+                self.new_token_ratio,
+                len(self.waiting_queue),
             )
 
         # Process existing chunked requests for each DP rank
