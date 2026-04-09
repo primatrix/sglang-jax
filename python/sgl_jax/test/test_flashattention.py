@@ -385,7 +385,7 @@ class TestAttention(CustomTestCase):
         print(f"out_cache_loc: {forward_batch.out_cache_loc[:100]}")
 
         # Create test data
-        shading = jax.sharding.NamedSharding(mesh, P("data", "tensor"))
+        shading = jax.sharding.NamedSharding(mesh, P(None, "tensor"))
         q_shard = jax.device_put(q.copy(), shading)
         k_cache_shard = jax.device_put(k.copy(), shading)
         v_cache_shard = jax.device_put(v.copy(), shading)
