@@ -571,10 +571,6 @@ class FlashAttention(AttentionBackend):
 
             return result, updated_kv_cache_fused
 
-        q_input = q.reshape(q.shape[0], -1, self.head_dim)
-        k_input = k.reshape(k.shape[0], -1, self.head_dim)
-        v_input = v.reshape(v.shape[0], -1, self.head_dim)
-
         (
             attn_output,
             updated_kv_cache_fused,
@@ -584,9 +580,9 @@ class FlashAttention(AttentionBackend):
             out_specs=out_specs,
             check_vma=False,
         )(
-            q_input,
-            k_input,
-            v_input,
+            q.reshape(q.shape[0], -1, self.head_dim),
+            k.reshape(k.shape[0], -1, self.head_dim),
+            v.reshape(v.shape[0], -1, self.head_dim),
             kv_cache_fused_paged,
             self.forward_metadata.seq_lens,
             page_indices_arg,
