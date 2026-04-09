@@ -862,6 +862,8 @@ class SWARadixCache(BasePrefixCache):
             # the prefill prefix matching will stuck.
             if update_kv_after_len < total_prefix_length + prefix_len:
                 first_diff_idx = max(0, update_kv_after_len - total_prefix_length)
+                if self.page_size > 1:
+                    first_diff_idx = (first_diff_idx // self.page_size) * self.page_size
                 node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
                 if node.swa_tombstone:
                     assert (

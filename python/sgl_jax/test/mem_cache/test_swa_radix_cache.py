@@ -27,7 +27,10 @@ class TestSWARadixCache(unittest.TestCase):
     def setUp(self):
         # Keep KV sizes small to make tests light-weight
         self.devices = jax.devices()
-        self.mesh = Mesh([self.devices[0]], axis_names=("tensor",))
+        self.mesh = Mesh(
+            np.array(self.devices[:1]).reshape(1, 1),
+            axis_names=("data", "tensor"),
+        )
 
         # Small buffers to avoid heavy allocations
         self.kv_head_num = 1
@@ -454,6 +457,108 @@ class TestSWARadixCache(unittest.TestCase):
         self.assertEqual(single.token_ids, [1])
         self.assertEqual(single.extra_key, "test_key")
         self.assertEqual(single.dp_rank, 2)
+
+    def test_paged_insert_after_tombstone_aligns_first_diff_idx(self):
+        """page_size>1: first_diff_idx must be page-aligned during tombstone recovery.
+
+        When prev_prefix_len is not page-aligned (e.g. 5 with page_size=4),
+        _insert_helper computes first_diff_idx=5.  Passing node.value[5:] to
+        PagedTokenToKVPoolAllocator.free() does ``np.unique(idx // page_size)``
+        which frees the *entire* page containing index 4 — even though index 4
+        is still in use.  The fix aligns first_diff_idx DOWN to the page
+        boundary so only complete pages are freed.
+        """
+        from unittest.mock import patch
+
+        import jax.numpy as jnp
+
+        page_size = 4
+        pool_size = 128
+        pool_size_swa = 64
+
+        # Build a paged KV pool + allocator + cache
+        # SWAKVPool requires both 'data' and 'tensor' mesh axes
+        mesh = Mesh(
+            np.array(self.devices[:1]).reshape(1, 1),
+            axis_names=("data", "tensor"),
+        )
+        kv_pool = SWAKVPool(
+            size=pool_size,
+            size_swa=pool_size_swa,
+            page_size=page_size,
+            swa_attention_layer_ids=[0],
+            full_attention_layer_ids=[1],
+            token_to_kv_pool_class=MHATokenToKVPool,
+            head_num=1,
+            head_dim=1,
+            mesh=mesh,
+            dtype=jnp.float32,
+            dp_size=1,
+        )
+        allocator = SWATokenToKVPoolAllocator(
+            size=pool_size,
+            size_swa=pool_size_swa,
+            kvcache=kv_pool,
+        )
+        req_pool = ReqToTokenPool(size=16, max_context_len=128)
+        cache = SWARadixCache(
+            req_to_token_pool=req_pool,
+            token_to_kv_pool_allocator=allocator,
+            sliding_window_size=8,
+            page_size=page_size,
+            disable=False,
+        )
+
+        # 1. Insert 12 tokens (3 pages) as sequence A
+        key_a = list(range(100, 112))
+        val_a = allocator.alloc(len(key_a))
+        self.assertIsNotNone(val_a)
+        cache.insert(key_a, value=val_a, prev_prefix_len=0)
+
+        # 2. Insert sequence B that extends A, making [100..111] an internal node
+        key_b = list(range(100, 116))  # 16 tokens, shares first 12 with A
+        val_b = allocator.alloc(len(key_b))
+        self.assertIsNotNone(val_b)
+        cache.insert(key_b, value=val_b, prev_prefix_len=0)
+
+        # 3. Evict SWA to tombstone the internal node [100..111]
+        #    Internal nodes become tombstones (not deleted) because they have children
+        cache.evict(0, swa_num_tokens=4)
+
+        # 4. Intercept free() calls during insert to verify page alignment
+        original_free = allocator.free
+        freed_lengths = []
+
+        def checking_free(free_index, dp_rank=0):
+            if len(free_index) > 0:
+                freed_lengths.append(len(free_index))
+                # The freed slice length must be a multiple of page_size
+                # (page-aligned start means the slice covers complete pages)
+                assert len(free_index) % page_size == 0, (
+                    f"free() called with {len(free_index)} indices "
+                    f"(not a multiple of page_size={page_size}). "
+                    f"first_diff_idx is likely not page-aligned."
+                )
+            return original_free(free_index, dp_rank=dp_rank)
+
+        # 5. Insert sequence C with prev_prefix_len=5 (non-page-aligned)
+        #    This hits the tombstone recovery path in _insert_helper where
+        #    first_diff_idx = max(0, 5 - 0) = 5, which is NOT page-aligned
+        key_c = list(range(100, 120))  # 20 tokens, shares prefix with tombstoned node
+        val_c = allocator.alloc(len(key_c))
+        self.assertIsNotNone(val_c)
+
+        with patch.object(allocator, "free", side_effect=checking_free):
+            cache.insert(key_c, value=val_c, prev_prefix_len=5)
+
+        # 6. Verify free was actually called (tombstone recovery path hit)
+        self.assertGreater(
+            len(freed_lengths), 0, "Expected free() to be called during tombstone recovery"
+        )
+
+        # 7. Verify cache returns a valid match
+        match = cache.match_prefix(key_c)
+        self.assertGreater(len(match.device_indices), 0)
 
     def test_swa_free_group_batching_multi_rank(self):
         """Test SWA allocator free_group batching for multiple DP ranks."""
