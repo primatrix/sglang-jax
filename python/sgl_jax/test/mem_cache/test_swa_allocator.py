@@ -13,9 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh
 
-from sgl_jax.srt.mem_cache.allocator import (
-    SWATokenToKVPoolAllocator,
-)
+from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     ReqToTokenPool,
@@ -595,6 +593,28 @@ class TestSWAOverlapSafety(unittest.TestCase):
             self.assertEqual(self.alloc.swa_available_size(), swa_before + expected_evicted)
         finally:
             global_server_args_dict["chunked_prefill_size"] = old_chunked_prefill_size
+
+    def test_decode_eviction_every_step(self):
+        """Decode eviction should happen at every decode step, not only every sliding_window steps."""
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+
+        # Use a long sequence so there's always something to evict
+        req = self._make_req(origin_len=200, output_len=1)
+        self._setup_req_tokens(req, req.seqlen)
+
+        # decode_batch_idx=2 — with old condition (% sliding_window == 1),
+        # this does NOT trigger eviction (2 % 64 != 1)
+        req.decode_batch_idx = 2
+        batch = self._make_batch(req, enable_overlap=False, forward_mode=ForwardMode.DECODE)
+        batch.maybe_evict_swa()
+
+        self.assertGreater(
+            req.swa_evicted_seqlen,
+            0,
+            f"Eviction at decode_batch_idx=2 should free tokens outside the window. "
+            f"seqlen={req.seqlen}, sliding_window={self.sliding_window}. "
+            f"The condition `decode_batch_idx % sliding_window_size == 1` skips this step.",
+        )
 
 
 if __name__ == "__main__":
