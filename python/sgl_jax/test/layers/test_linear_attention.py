@@ -363,6 +363,8 @@ class TestPrefillForward:
 
         assert output.shape == (seq_len, _SMALL_HIDDEN)
         assert new_state.shape == (N_padded, _SMALL_H, _SMALL_K, _SMALL_K)
+        assert jnp.all(jnp.isfinite(output)), "Output contains NaN/Inf"
+        assert not jnp.all(output == 0), "Output is all zeros"
 
     @requires_tops
     @requires_tpu
@@ -398,6 +400,8 @@ class TestPrefillForward:
 
         assert output.shape == (seq_len, _SMALL_HIDDEN)
         assert new_state.shape == (N_padded, _SMALL_H, _SMALL_K, _SMALL_K)
+        assert jnp.all(jnp.isfinite(output)), "Output contains NaN/Inf"
+        assert not jnp.all(output == 0), "Output is all zeros"
 
     @requires_tops
     @requires_tpu
@@ -430,6 +434,8 @@ class TestPrefillForward:
 
         assert output.shape == (seq_len, _SMALL_HIDDEN)
         assert new_state.shape == (1, _SMALL_H, _SMALL_K, _SMALL_K)
+        assert jnp.all(jnp.isfinite(output)), "Output contains NaN/Inf"
+        assert not jnp.all(output == 0), "Output is all zeros"
 
 
 # ---------------------------------------------------------------------------
@@ -646,16 +652,23 @@ class TestMultiRequestIsolation:
             positions_both = jnp.array([0, 0], dtype=jnp.int32)
             out_both, s_both = module(positions_both, hidden_both, fb, state_both)
 
+        # fused_recurrent_simple_gla uses jax.lax.scan — no cross-batch
+        # interaction, so B=1 vs B=2 results are mathematically identical.
+        # However, XLA generates different tiling for [1,H,K,V] vs [2,H,K,V],
+        # causing different bf16 accumulation order in the outer product
+        # k[:,:,:,None] * v[:,:,None,:].  Over T timesteps this accumulates
+        # to ~0.25 max_diff on v6e-1.  Same root cause as prefill dense
+        # matmul tiling divergence — not a kernel bug.
         np.testing.assert_allclose(
             np.array(out_both[0]),
             np.array(out1[0]),
-            atol=3e-1,  # TPU bf16 fused_recurrent: max diff 0.25 observed on v6e-1
+            atol=3e-1,
             err_msg="Request 1 output differs between separate and batched decode",
         )
         np.testing.assert_allclose(
             np.array(out_both[1]),
             np.array(out2[0]),
-            atol=3e-1,  # TPU bf16 fused_recurrent: max diff 0.25 observed on v6e-1
+            atol=3e-1,
             err_msg="Request 2 output differs between separate and batched decode",
         )
         np.testing.assert_allclose(
@@ -766,8 +779,19 @@ class TestMultiRequestIsolation:
 
     @requires_tops
     @requires_tpu
-    def test_prefill_decode_state_consistency(self):
-        """Prefill final state should match token-by-token decode accumulated state."""
+    def test_prefill_vs_decode_approximate_agreement(self):
+        """Prefill and token-by-token decode should produce approximately similar results.
+
+        This is a cross-algorithm sanity check, NOT an exact consistency test.
+        The chunk kernel (simple_gla_fwd, parallel matmul) and recurrent kernel
+        (fused_recurrent_simple_gla, sequential MAC) use fundamentally different
+        reduction orders.  After 64 steps of bf16 accumulation, significant
+        numerical divergence is expected.
+
+        This test catches structural bugs (wrong decay sign, transposed state,
+        missing scale) which cause order-of-magnitude differences, but cannot
+        detect subtle numerical issues within the tolerance band.
+        """
         seq_len = 64
 
         with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):

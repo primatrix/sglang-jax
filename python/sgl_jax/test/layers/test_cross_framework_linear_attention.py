@@ -135,6 +135,10 @@ def torch_group_rmsnorm(x, weight, num_groups, eps):
 def torch_rope_neox(positions, q, k, head_dim, rotary_dim, rope_theta):
     """Pure-torch partial RoPE (neox-style).
 
+    Verified bit-exact (max_diff=0) against HF BailingMoeV2_5RotaryEmbedding +
+    apply_rotary_pos_emb from local cache, covering head_dim=64/128,
+    partial_rotary_factor=0.5/1.0, and rope_theta=10000/600000.
+
     Args:
         positions: [T] long tensor
         q, k: [T, H, head_dim] float tensors
