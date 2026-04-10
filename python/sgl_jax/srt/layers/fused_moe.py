@@ -96,6 +96,9 @@ class FusedEPMoE(nnx.Module):
         self.activation_quantized_dtype = (
             quantization_config.get_moe_activation_dtype() if quantization_config else None
         )
+        self.weight_block_size = (
+            getattr(quantization_config, "weight_block_size", None) if quantization_config else None
+        )
 
         # Initialize weights.
         self.w1 = nnx.Param(
@@ -175,7 +178,10 @@ class FusedEPMoE(nnx.Module):
 
         if hasattr(self, "subc_quant_wsz"):
             del self.subc_quant_wsz
-            self.subc_quant_wsz = 256
+        if self.weight_block_size is not None:
+            self.subc_quant_wsz = self.weight_block_size[1]  # block_k
+        else:
+            self.subc_quant_wsz = 256  # default for backward compatibility
 
         with jax.set_mesh(self.mesh):
             if is_static:
