@@ -773,12 +773,16 @@ def _ragged_paged_attention_kernel_loop(
         r, l = ref.shape  # noqa
         assert l % 128 == 0
         folds = l // 128
-        ref = ref.reshape(r * folds, 128)
-        start *= folds
-        sz *= folds
-        step *= folds
+
         assert sz % step == 0
-        vec = jnp.concat([ref[pl.ds(start + i, sz // step, step)] for i in range(folds)], axis=1)
+
+        # 移除 ref.reshape，直接使用二维的动态切片 (pl.ds)
+        # 维度 0 (行): 从 start 开始，步长为 step，加载 sz // step 行
+        # 维度 1 (列): 从 i * 128 开始，加载 128 列
+        vec = jnp.concat(
+            [ref[pl.ds(start, sz // step, step), pl.ds(i * 128, 128)] for i in range(folds)], axis=1
+        )
+
         if dtype is not None:
             vec = pltpu.bitcast(vec, dtype)
         return vec
