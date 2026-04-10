@@ -9,6 +9,7 @@ if os.environ.get("USE_DEVICE_TYPE") == "cpu":
 
 import jax
 import numpy as np
+from jax.experimental import multihost_utils
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
@@ -37,7 +38,7 @@ class TestResolveFutureTokenIds(unittest.TestCase):
             )
 
             resolved = resolve_future_token_ids(input_ids, future_token_ids_map, mesh)
-            resolved_np = np.array(resolved)
+            resolved_np = multihost_utils.process_allgather(resolved, tiled=True)
 
             expected = input_ids_np.copy()
             expected[::1024] = 101
