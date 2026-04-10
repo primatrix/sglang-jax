@@ -1454,6 +1454,13 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
 
+            # Early SWA eviction: free tokens outside sliding window for
+            # requests that just completed prefill. Device-safe because
+            # last_batch's launch_done was waited in previous iteration's
+            # process_batch_result.
+            if self.is_hybrid:
+                self.running_batch.force_evict_swa()
+
         new_batch = self.get_new_batch_prefill()
 
         # if new_batch is not None:

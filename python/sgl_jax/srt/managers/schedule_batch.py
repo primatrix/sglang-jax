@@ -1380,6 +1380,29 @@ class ScheduleBatch:
         self.token_to_kv_pool_allocator.free_swa(free_slots, dp_rank=dp_rank)
         req.swa_evicted_seqlen = new_evicted
 
+    def force_evict_swa(self):
+        """Force SWA eviction for all requests — no throttling.
+
+        Called after prefill completes and device is confirmed done
+        (launch_done waited in previous process_batch_result).
+        Unlike maybe_evict_swa, this has no decode_batch_idx throttling
+        and no overlap safety margin (pre_len -= cps).
+        """
+        if not self.is_hybrid:
+            return
+        sliding_window_size = getattr(self.model_config, "sliding_window", None)
+        if sliding_window_size is None or sliding_window_size <= 0:
+            return
+        page_size = self.token_to_kv_pool_allocator.page_size
+
+        for dp_rank, info in enumerate(self.reqs_info):
+            if not info.reqs:
+                continue
+            for req in info.reqs:
+                self._evict_swa(
+                    req, req.seqlen - 1, sliding_window_size, page_size, dp_rank
+                )
+
     def prepare_for_decode(self):
         """Prepare for decode phase (unified for all dp_size >= 1).
 
