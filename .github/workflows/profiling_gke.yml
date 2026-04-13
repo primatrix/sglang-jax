@@ -6,47 +6,58 @@ on:
       branch:
         description: "Branch to profile"
         required: true
-        default: "epic/mimo-v2-flash"
-      model_path:
-        description: "Model path (HuggingFace ID or /models/...)"
-        required: true
-        default: "XiaomiMiMo/MiMo-V2-Flash"
+        default: "exp/scatter-optimization"
       topology:
         description: "TPU topology"
         required: true
         type: choice
         options:
-          - "4chip"
           - "16chip"
-        default: "4chip"
-      tp_size:
-        description: "Tensor parallel size"
+          - "4chip"
+        default: "16chip"
+      server_args:
+        description: "sglang server launch args (all flags except --host/--port/--nnodes/--node-rank/--dist-init-addr)"
         required: true
-        default: "4"
+        default: >-
+          --model-path /inference-models/MiMo-V2-Flash
+          --trust-remote-code
+          --tp-size 16 --dp-size 4 --ep-size 16
+          --moe-backend fused
+          --page-size 256
+          --context-length 262144
+          --disable-radix-cache
+          --chunked-prefill-size 2048
+          --dtype bfloat16
+          --mem-fraction-static 0.95
+          --swa-full-tokens-ratio 0.2
+          --skip-server-warmup
+          --log-level info
+          --max-running-requests 128
       num_steps:
         description: "Number of steps to profile"
         required: true
         default: "5"
-      profile_output_dir:
-        description: "GCS output dir for profile traces"
+      profile_by_stage:
+        description: "Profile prefill/decode separately"
         required: true
-        default: "gs://inference-model-storage-poc-tpu/profiling/sglang-jax"
-      num_prompts:
-        description: "Number of prompts for traffic generation"
-        required: true
-        default: "32"
-      random_input_len:
-        description: "Input length for traffic generation"
+        type: boolean
+        default: false
+      profile_stages:
+        description: "Stages to profile (comma-separated, e.g. prefill,decode)"
+        required: false
+        default: "prefill,decode"
+      traffic_input_len:
+        description: "Input token length for traffic generation"
         required: true
         default: "512"
-      random_output_len:
-        description: "Output length for traffic generation"
+      traffic_output_len:
+        description: "Output token length for traffic generation"
         required: true
-        default: "128"
-      server_args:
-        description: "Extra sglang server args"
-        required: false
-        default: ""
+        default: "32"
+      traffic_num_prompts:
+        description: "Number of concurrent prompts for traffic generation"
+        required: true
+        default: "8"
 
 permissions:
   actions: read
@@ -55,7 +66,7 @@ permissions:
 
 jobs:
   profiling:
-    name: "Profiling (${{ inputs.topology }}, tp=${{ inputs.tp_size }})"
+    name: "Profiling (${{ inputs.topology }})"
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -97,31 +108,10 @@ jobs:
         ACTOR_SAFE="${ACTOR_SAFE:-unknown}"
         echo "actor_safe=${ACTOR_SAFE}" >> "$GITHUB_OUTPUT"
 
-        PROFILE_DIR="${{ inputs.profile_output_dir }}/${JOB_NAME}"
+        PROFILE_DIR="/inference-models/workflow/MiMo-V2-Flash/profiling/workflow-${GITHUB_RUN_NUMBER}"
         echo "profile_dir=${PROFILE_DIR}" >> "$GITHUB_OUTPUT"
 
-        # Build task command:
-        # 1. Trigger profiling (async, waits for num_steps forward passes)
-        # 2. Simultaneously send traffic to generate those forward passes
-        # 3. Print the output path
-        TASK_CMD='echo "=== Starting profiling ===" '
-        TASK_CMD+="&& curl -sf -X POST 'http://127.0.0.1:30271/start_profile'"
-        TASK_CMD+=" -H 'Content-Type: application/json'"
-        TASK_CMD+=" -d '{\"output_dir\": \"${PROFILE_DIR}\", \"num_steps\": ${{ inputs.num_steps }}}' &"
-        TASK_CMD+=" PROFILE_PID=\$!"
-        TASK_CMD+=" && sleep 5"
-        TASK_CMD+=" && python3 -m sgl_jax.bench_serving"
-        TASK_CMD+=" --backend sgl-jax --host 127.0.0.1 --port 30271"
-        TASK_CMD+=" --dataset-name random"
-        TASK_CMD+=" --random-input-len ${{ inputs.random_input_len }}"
-        TASK_CMD+=" --random-output-len ${{ inputs.random_output_len }}"
-        TASK_CMD+=" --random-range-ratio 1.0"
-        TASK_CMD+=" --num-prompts ${{ inputs.num_prompts }}"
-        TASK_CMD+=" --warmup-requests 0"
-        TASK_CMD+=" && wait \$PROFILE_PID"
-        TASK_CMD+=" && echo '=== Profile saved to: ${PROFILE_DIR} ==='"
-        echo "task_command=${TASK_CMD}" >> "$GITHUB_OUTPUT"
-
+        # TPU coordinator address for 16chip
         if [ "${{ inputs.topology }}" = "16chip" ]; then
           COORD="${JOB_NAME}-0.${JOB_NAME}-headless-svc:10011"
           echo "coordinator=${COORD}" >> "$GITHUB_OUTPUT"
@@ -187,23 +177,47 @@ jobs:
           app=ci-sglang ci-task=profiling --overwrite
 
     - name: Deploy job
+      env:
+        PROFILE_DIR: ${{ steps.config.outputs.profile_dir }}
+        TRAFFIC_INPUT_LEN: ${{ inputs.traffic_input_len }}
+        TRAFFIC_OUTPUT_LEN: ${{ inputs.traffic_output_len }}
+        TRAFFIC_NUM_PROMPTS: ${{ inputs.traffic_num_prompts }}
+        NUM_STEPS: ${{ inputs.num_steps }}
+        PROFILE_BY_STAGE: ${{ inputs.profile_by_stage }}
+        PROFILE_STAGES: ${{ inputs.profile_stages }}
       run: |
         export JOB_NAME="${{ steps.config.outputs.job_name }}"
         export BRANCH="${{ inputs.branch }}"
-        export MODEL_PATH="${{ inputs.model_path }}"
-        export TP_SIZE="${{ inputs.tp_size }}"
         export SERVER_ARGS="${{ inputs.server_args }}"
-        export TASK_COMMAND="${{ steps.config.outputs.task_command }}"
         export TASK_TYPE="profiling"
         export GITHUB_ACTOR="${{ steps.config.outputs.actor_safe }}"
         export ACTIVE_DEADLINE="7200"
         export EXTRA_DEPS=""
+        export RESULTS_PATH=""
+        export GITHUB_RUN_NUMBER="${{ github.run_number }}"
+        export TOPOLOGY="${{ inputs.topology }}"
 
+        # Build profile JSON payload
+        PROFILE_JSON="{\"output_dir\": \"${PROFILE_DIR}\", \"num_steps\": ${NUM_STEPS}"
+        if [ "${PROFILE_BY_STAGE}" = "true" ]; then
+          # Convert comma-separated stages to JSON array: "prefill,decode" → '["prefill","decode"]'
+          STAGES_JSON=$(echo "${PROFILE_STAGES}" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip().split(',')))")
+          PROFILE_JSON="${PROFILE_JSON}, \"profile_by_stage\": true, \"profile_stages\": ${STAGES_JSON}"
+        fi
+        PROFILE_JSON="${PROFILE_JSON}}"
+
+        BENCH_CMD="python3 -m sgl_jax.bench_serving --backend sgl-jax --host 127.0.0.1 --port 30271 --dataset-name random --random-input-len ${TRAFFIC_INPUT_LEN} --random-output-len ${TRAFFIC_OUTPUT_LEN} --random-range-ratio 1.0 --num-prompts ${TRAFFIC_NUM_PROMPTS} --warmup-requests 0"
+
+        # Task: background traffic, trigger profiling (async), poll /profile_status until idle
+        TASK_CMD="${BENCH_CMD} & BENCH_PID=\$! && sleep 10 && echo 'Triggering profiling...' && curl -sf -X POST 'http://127.0.0.1:30271/start_profile' -H 'Content-Type: application/json' -d '${PROFILE_JSON}' && echo 'Profiling triggered, waiting for completion...' && for i in \$(seq 1 120); do sleep 5; STATUS=\$(curl -sf 'http://127.0.0.1:30271/profile_status' | python3 -c 'import sys,json; print(json.load(sys.stdin)[\"status\"])' 2>/dev/null); echo \"  profile_status: \$STATUS\"; if [ \"\$STATUS\" = 'idle' ]; then echo 'Profiling completed.'; break; fi; done && echo '=== Profile saved to: ${PROFILE_DIR} ===' && kill \$BENCH_PID 2>/dev/null; wait \$BENCH_PID 2>/dev/null; true"
+        export TASK_COMMAND_B64=$(printf '%s' "$TASK_CMD" | base64 -w0)
+
+        VARS='$JOB_NAME $BRANCH $SERVER_ARGS $TASK_COMMAND_B64 $TASK_TYPE $GITHUB_ACTOR $ACTIVE_DEADLINE $EXTRA_DEPS $TPU_COORDINATOR_ADDRESS $RESULTS_PATH $GITHUB_RUN_NUMBER $TOPOLOGY'
         if [ "${{ inputs.topology }}" = "16chip" ]; then
           export TPU_COORDINATOR_ADDRESS="${{ steps.config.outputs.coordinator }}"
-          envsubst < .github/ci/sglang-16chip-job.yaml | kubectl apply -f -
+          envsubst "$VARS" < .github/ci/sglang-16chip-job.yaml | kubectl apply -f -
         else
-          envsubst < .github/ci/sglang-4chip-job.yaml | kubectl apply -f -
+          envsubst "$VARS" < .github/ci/sglang-4chip-job.yaml | kubectl apply -f -
         fi
 
     - name: Wait for pods
@@ -238,7 +252,9 @@ jobs:
 
     - name: Stream logs
       run: |
-        kubectl logs -f "job/${{ steps.config.outputs.job_name }}" \
+        # Stream from coordinator pod (index 0) only
+        kubectl logs -f \
+          -l job-name=${{ steps.config.outputs.job_name }},batch.kubernetes.io/job-completion-index=0 \
           -c sglang-tpu --tail=1000 || true
 
     - name: Re-authenticate to GCP (post-logs)
@@ -257,12 +273,29 @@ jobs:
 
     - name: Wait for completion
       run: |
-        kubectl wait --for=condition=complete "job/${{ steps.config.outputs.job_name }}" \
-          --timeout=600s 2>/dev/null && echo "JOB SUCCEEDED" || {
-          kubectl wait --for=condition=failed "job/${{ steps.config.outputs.job_name }}" \
-            --timeout=10s 2>/dev/null && echo "JOB FAILED" && exit 1
-          echo "JOB TIMED OUT" && exit 1
-        }
+        JOB_NAME="${{ steps.config.outputs.job_name }}"
+        TIMEOUT=600
+        ELAPSED=0
+        echo "Waiting for coordinator pod to complete (timeout ${TIMEOUT}s)..."
+        while [ $ELAPSED -lt $TIMEOUT ]; do
+          PHASE=$(kubectl get pod \
+            -l job-name=${JOB_NAME},batch.kubernetes.io/job-completion-index=0 \
+            -o jsonpath='{.items[0].status.phase}' 2>/dev/null)
+          if [ "$PHASE" = "Succeeded" ]; then
+            echo "JOB SUCCEEDED"
+            break
+          fi
+          if [ "$PHASE" = "Failed" ]; then
+            echo "JOB FAILED"
+            exit 1
+          fi
+          sleep 10
+          ELAPSED=$((ELAPSED + 10))
+        done
+        if [ $ELAPSED -ge $TIMEOUT ]; then
+          echo "JOB TIMED OUT"
+          exit 1
+        fi
 
     - name: Print profile location
       if: success()

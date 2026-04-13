@@ -1,8 +1,9 @@
 # CI sglang-jax Job (4 chips) - K8s Manifests
 # 1 pod x 4 TPU chips = 4 chips, topology 2x2
 # Rendered by envsubst with:
-#   $JOB_NAME $BRANCH $MODEL_PATH $TP_SIZE $SERVER_ARGS
-#   $TASK_COMMAND $GITHUB_ACTOR $ACTIVE_DEADLINE
+#   $JOB_NAME $BRANCH $SERVER_ARGS $TASK_COMMAND_B64
+#   $TASK_TYPE $GITHUB_ACTOR $ACTIVE_DEADLINE $EXTRA_DEPS
+#   $RESULTS_PATH $GITHUB_RUN_NUMBER $TOPOLOGY
 ---
 # Headless Service for DNS resolution
 apiVersion: v1
@@ -52,6 +53,23 @@ spec:
         - |
           set -ex
 
+          # 0. Write metadata save script
+          printf '%s\n' 'import json, os, datetime' \
+            'meta = {' \
+            '    "run_number": os.environ.get("GITHUB_RUN_NUMBER", ""),' \
+            '    "branch": os.environ.get("BRANCH", ""),' \
+            '    "topology": os.environ.get("TOPOLOGY", ""),' \
+            '    "server_args": os.environ.get("SERVER_ARGS", ""),' \
+            '    "task_command": os.environ.get("TASK_COMMAND_B64", ""),' \
+            '    "task_type": os.environ.get("TASK_TYPE", ""),' \
+            '    "timestamp": datetime.datetime.utcnow().isoformat() + "Z",' \
+            '    "exit_code": int(os.environ.get("TASK_EXIT_VAL", "-1"))' \
+            '}' \
+            'with open(os.environ["RESULTS_PATH"] + "/metadata.json", "w") as f:' \
+            '    json.dump(meta, f, indent=2)' \
+            'print("Results saved to: " + os.environ["RESULTS_PATH"])' \
+            > /tmp/save_metadata.py
+
           # 1. Clone branch
           set +x
           git clone --depth=1 --branch="${BRANCH}" \
@@ -61,12 +79,9 @@ spec:
           cd /root/sglang-jax
 
           # 2. Setup Python environment
-          mkdir -p /tmp/ramdisk/logs
-          export UV_CACHE_DIR="/tmp/ramdisk/uv_cache"
-          export TMPDIR="/tmp/ramdisk"
           pip install uv
-          uv venv /tmp/ramdisk/venv
-          source /tmp/ramdisk/venv/bin/activate
+          uv venv /tmp/venv
+          source /tmp/venv/bin/activate
           uv pip install pip
           uv pip install -e "python[tpu]"
 
@@ -76,16 +91,12 @@ spec:
           fi
 
           # 4. Start sglang server in background
-          python3 -m sgl_jax.launch_server \
-            --model-path "${MODEL_PATH}" \
+          python -u -m sgl_jax.launch_server \
             --host 0.0.0.0 \
             --port 30271 \
-            --tp-size ${TP_SIZE} \
-            --device tpu \
-            --trust-remote-code \
-            --dist-init-addr 0.0.0.0:10011 \
             --nnodes 1 \
             --node-rank 0 \
+            --dist-init-addr 0.0.0.0:10011 \
             ${SERVER_ARGS} &
           SERVER_PID=$!
 
@@ -109,37 +120,50 @@ spec:
             exit 1
           fi
 
-          # 6. Run the task command (benchmark / eval / profiling)
-          eval "${TASK_COMMAND}"
-          TASK_EXIT=$?
+          # 6. Decode and run the task command
+          TASK_CMD=$(echo "$TASK_COMMAND_B64" | base64 -d)
+          echo "Running: $TASK_CMD"
+          set +e
+          eval "$TASK_CMD" 2>&1 | tee /tmp/task_output.txt
+          TASK_EXIT=${PIPESTATUS[0]}
+          set -e
 
-          # 7. Shutdown server
+          # 7. Save results to GCS if RESULTS_PATH is set
+          if [ -n "${RESULTS_PATH}" ]; then
+            mkdir -p "${RESULTS_PATH}"
+            cp /tmp/task_output.txt "${RESULTS_PATH}/output.txt"
+            TASK_EXIT_VAL=$TASK_EXIT python3 /tmp/save_metadata.py
+          fi
+
+          # 8. Shutdown server
           kill $SERVER_PID 2>/dev/null || true
           wait $SERVER_PID 2>/dev/null || true
 
           exit $TASK_EXIT
         env:
-        - name: MODEL_PATH
-          value: "${MODEL_PATH}"
-        - name: TP_SIZE
-          value: "${TP_SIZE}"
         - name: SERVER_ARGS
           value: "${SERVER_ARGS}"
         - name: EXTRA_DEPS
           value: "${EXTRA_DEPS}"
-        - name: TASK_COMMAND
-          value: "${TASK_COMMAND}"
+        - name: TASK_COMMAND_B64
+          value: "${TASK_COMMAND_B64}"
+        - name: TASK_TYPE
+          value: "${TASK_TYPE}"
+        - name: BRANCH
+          value: "${BRANCH}"
+        - name: RESULTS_PATH
+          value: "${RESULTS_PATH}"
+        - name: GITHUB_RUN_NUMBER
+          value: "${GITHUB_RUN_NUMBER}"
+        - name: TOPOLOGY
+          value: "${TOPOLOGY}"
         - name: GITHUB_TOKEN
           valueFrom:
             secretKeyRef:
               name: ${JOB_NAME}-token
               key: token
-        - name: PIP_CACHE_DIR
-          value: /tmp/ramdisk/.cache/pip
         - name: JAX_COMPILATION_CACHE_DIR
           value: /tmp/jit_cache
-        - name: HF_HOME
-          value: /models/huggingface
         resources:
           limits:
             google.com/tpu: "4"
@@ -149,12 +173,10 @@ spec:
         securityContext:
           privileged: true
         volumeMounts:
-        - mountPath: /models
-          name: gcs-fuse-csi-ephemeral
-        - mountPath: /tmp/ramdisk
-          name: tmpfs
+        - mountPath: /inference-models
+          name: model-storage
         - mountPath: /dev/shm
-          name: dshm
+          name: dev-shm
       nodeSelector:
         cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
         cloud.google.com/gke-tpu-topology: "2x2"
@@ -165,14 +187,10 @@ spec:
       volumes:
       - emptyDir:
           medium: Memory
-          sizeLimit: 200Gi
-        name: tmpfs
-      - emptyDir:
-          medium: Memory
         name: gke-gcsfuse-cache
-      - name: gcs-fuse-csi-ephemeral
+      - name: model-storage
         persistentVolumeClaim:
           claimName: inference-model-storage-poc-tpu-hns-pvc
-      - name: dshm
+      - name: dev-shm
         emptyDir:
           medium: Memory

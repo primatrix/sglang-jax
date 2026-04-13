@@ -1,9 +1,10 @@
 # CI sglang-jax Job (16 chips) - K8s Manifests
 # 4 pods x 4 TPU chips = 16 chips, topology 4x4
 # Rendered by envsubst with:
-#   $JOB_NAME $BRANCH $MODEL_PATH $TP_SIZE $SERVER_ARGS
-#   $TASK_COMMAND $GITHUB_ACTOR $ACTIVE_DEADLINE
-#   $TPU_COORDINATOR_ADDRESS
+#   $JOB_NAME $BRANCH $SERVER_ARGS $TASK_COMMAND_B64
+#   $TASK_TYPE $GITHUB_ACTOR $ACTIVE_DEADLINE
+#   $TPU_COORDINATOR_ADDRESS $EXTRA_DEPS
+#   $RESULTS_PATH $GITHUB_RUN_NUMBER $TOPOLOGY
 ---
 # Headless Service for TPU pod DNS resolution (required for JAX multi-host)
 apiVersion: v1
@@ -61,6 +62,23 @@ spec:
         - |
           set -ex
 
+          # 0. Write metadata save script
+          printf '%s\n' 'import json, os, datetime' \
+            'meta = {' \
+            '    "run_number": os.environ.get("GITHUB_RUN_NUMBER", ""),' \
+            '    "branch": os.environ.get("BRANCH", ""),' \
+            '    "topology": os.environ.get("TOPOLOGY", ""),' \
+            '    "server_args": os.environ.get("SERVER_ARGS", ""),' \
+            '    "task_command": os.environ.get("TASK_COMMAND_B64", ""),' \
+            '    "task_type": os.environ.get("TASK_TYPE", ""),' \
+            '    "timestamp": datetime.datetime.utcnow().isoformat() + "Z",' \
+            '    "exit_code": int(os.environ.get("TASK_EXIT_VAL", "-1"))' \
+            '}' \
+            'with open(os.environ["RESULTS_PATH"] + "/metadata.json", "w") as f:' \
+            '    json.dump(meta, f, indent=2)' \
+            'print("Results saved to: " + os.environ["RESULTS_PATH"])' \
+            > /tmp/save_metadata.py
+
           # 1. Clone branch
           set +x
           git clone --depth=1 --branch="${BRANCH}" \
@@ -70,12 +88,9 @@ spec:
           cd /root/sglang-jax
 
           # 2. Setup Python environment
-          mkdir -p /tmp/ramdisk/logs
-          export UV_CACHE_DIR="/tmp/ramdisk/uv_cache"
-          export TMPDIR="/tmp/ramdisk"
           pip install uv
-          uv venv /tmp/ramdisk/venv
-          source /tmp/ramdisk/venv/bin/activate
+          uv venv /tmp/venv
+          source /tmp/venv/bin/activate
           uv pip install pip
           uv pip install -e "python[tpu]"
 
@@ -94,16 +109,12 @@ spec:
           # 5. Start sglang server
           #    - Node 0 runs full stack (HTTP + scheduler)
           #    - Nodes 1-3 run scheduler only
-          python3 -m sgl_jax.launch_server \
-            --model-path "${MODEL_PATH}" \
+          python -u -m sgl_jax.launch_server \
             --host 0.0.0.0 \
             --port 30271 \
-            --tp-size ${TP_SIZE} \
-            --device tpu \
-            --trust-remote-code \
-            --dist-init-addr "${COORDINATOR_ADDR}" \
             --nnodes ${NNODES} \
             --node-rank ${NODE_RANK} \
+            --dist-init-addr "${COORDINATOR_ADDR}" \
             ${SERVER_ARGS} &
           SERVER_PID=$!
 
@@ -128,29 +139,49 @@ spec:
               exit 1
             fi
 
-            # Run the task command
-            eval "${TASK_COMMAND}"
-            TASK_EXIT=$?
+            # Decode and run the task command
+            TASK_CMD=$(echo "$TASK_COMMAND_B64" | base64 -d)
+            echo "Running: $TASK_CMD"
+            set +e
+            eval "$TASK_CMD" 2>&1 | tee /tmp/task_output.txt
+            TASK_EXIT=${PIPESTATUS[0]}
+            set -e
+
+            # Save results to GCS if RESULTS_PATH is set
+            if [ -n "${RESULTS_PATH}" ]; then
+              mkdir -p "${RESULTS_PATH}"
+              cp /tmp/task_output.txt "${RESULTS_PATH}/output.txt"
+              export TASK_EXIT_VAL=$TASK_EXIT
+              python3 /tmp/save_metadata.py
+            fi
 
             # Shutdown server
             kill $SERVER_PID 2>/dev/null || true
             wait $SERVER_PID 2>/dev/null || true
             exit $TASK_EXIT
           else
-            # 7. Worker: just wait for server process to finish
+            # 7. Worker: wait for server, force-exit if hung
+            set +e
             wait $SERVER_PID
+            exit 0
           fi
         env:
-        - name: MODEL_PATH
-          value: "${MODEL_PATH}"
-        - name: TP_SIZE
-          value: "${TP_SIZE}"
         - name: SERVER_ARGS
           value: "${SERVER_ARGS}"
         - name: EXTRA_DEPS
           value: "${EXTRA_DEPS}"
-        - name: TASK_COMMAND
-          value: "${TASK_COMMAND}"
+        - name: TASK_COMMAND_B64
+          value: "${TASK_COMMAND_B64}"
+        - name: TASK_TYPE
+          value: "${TASK_TYPE}"
+        - name: BRANCH
+          value: "${BRANCH}"
+        - name: RESULTS_PATH
+          value: "${RESULTS_PATH}"
+        - name: GITHUB_RUN_NUMBER
+          value: "${GITHUB_RUN_NUMBER}"
+        - name: TOPOLOGY
+          value: "${TOPOLOGY}"
         - name: TPU_COORDINATOR_ADDRESS
           value: "${TPU_COORDINATOR_ADDRESS}"
         - name: GITHUB_TOKEN
@@ -158,12 +189,8 @@ spec:
             secretKeyRef:
               name: ${JOB_NAME}-token
               key: token
-        - name: PIP_CACHE_DIR
-          value: /tmp/ramdisk/.cache/pip
         - name: JAX_COMPILATION_CACHE_DIR
           value: /tmp/jit_cache
-        - name: HF_HOME
-          value: /models/huggingface
         resources:
           limits:
             google.com/tpu: "4"
@@ -173,12 +200,10 @@ spec:
         securityContext:
           privileged: true
         volumeMounts:
-        - mountPath: /models
-          name: gcs-fuse-csi-ephemeral
-        - mountPath: /tmp/ramdisk
-          name: tmpfs
+        - mountPath: /inference-models
+          name: model-storage
         - mountPath: /dev/shm
-          name: dshm
+          name: dev-shm
       nodeSelector:
         cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
         cloud.google.com/gke-tpu-topology: "4x4"
@@ -189,14 +214,10 @@ spec:
       volumes:
       - emptyDir:
           medium: Memory
-          sizeLimit: 200Gi
-        name: tmpfs
-      - emptyDir:
-          medium: Memory
         name: gke-gcsfuse-cache
-      - name: gcs-fuse-csi-ephemeral
+      - name: model-storage
         persistentVolumeClaim:
           claimName: inference-model-storage-poc-tpu-hns-pvc
-      - name: dshm
+      - name: dev-shm
         emptyDir:
           medium: Memory

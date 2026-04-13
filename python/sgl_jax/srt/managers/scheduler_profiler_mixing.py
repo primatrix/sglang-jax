@@ -333,5 +333,11 @@ class SchedulerProfilerMixin:
                 recv_req.python_tracer_level,
                 recv_req.profile_id,
             )
+        elif recv_req.type == ProfileReqType.GET_STATUS:
+            in_progress = self.profile_in_progress or self._profile_manager.is_configured
+            return ProfileReqOutput(
+                success=True,
+                message="in_progress" if in_progress else "idle",
+            )
         else:
             return self.stop_profile()
