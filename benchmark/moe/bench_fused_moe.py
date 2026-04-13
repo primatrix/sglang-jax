@@ -136,7 +136,6 @@ def _estimate_vmem_bytes(
 
     token_bytes = jnp.dtype(dtype).itemsize
     weight_bytes = jnp.dtype(weight_dtype).itemsize
-    router_bytes = jnp.dtype(router_dtype).itemsize
 
     t_packing = _dtype_packing(dtype)
     padded_num_experts = ((case.num_experts + 127) // 128) * 128
@@ -146,14 +145,12 @@ def _estimate_vmem_bytes(
     a2a_max_tokens = ((bt * num_devices + bts - 1) // bts) * bts
 
     # Output-side staging (no overlap):
-    # - a2a_g_acc_vmem: (1, top_k, gcd(bt, 16), t_packing, hidden_per_pack)
+    # - a2a_g_acc_vmem: (2, top_k, gcd(bt, 16), t_packing, hidden_per_pack)
     # - b_output_x2_vmem: (2, bt, hidden_size)
     acc_bt = math.gcd(bt, 16)  # Must match fused_moe kernel scratch shape.
-    a2a_g_acc = 1 * top_k * acc_bt * hidden * token_bytes
+    a2a_g_acc = 2 * top_k * acc_bt * hidden * token_bytes
     # b_output_x2_vmem is double-buffered to overlap store(output_hbm) with next bt's compute.
     b_output = 2 * bt * hidden * token_bytes
-    # b_gating_x2_vmem is double-buffered for run_bt overlap: (2, bt, padded_num_experts)
-    b_gating = 2 * bt * padded_num_experts * router_bytes
     # t2e_routing_smem scratch is placed in SMEM (not VMEM).
     t2e_routing = 0
 
@@ -202,7 +199,6 @@ def _estimate_vmem_bytes(
     total_bytes = (
         a2a_g_acc
         + b_output
-        + b_gating
         + t2e_routing
         + w1
         + w3
@@ -215,6 +211,28 @@ def _estimate_vmem_bytes(
         + a2a_s_acc_stage_b32
         + routing_temporaries
     )
+
+    # Estimate compute intermediaries from scale-group fori_loops.
+    # With lax.fori_loop (XLA While), only ONE iteration's intermediaries
+    # are live at a time (not n_sg copies as with Python-loop unrolling).
+    compute_intermediaries = 0
+    if subc_quant_wsz is not None:
+        btc = cfg.btc
+        bfc = cfg.bfc
+        bd1c = cfg.bd1c
+        bd2c = cfg.bd2c
+        n_bd1c_tiles = (bd1 + bd1c - 1) // bd1c
+        n_bfc_tiles = (bf + bfc - 1) // bfc
+        # FFN1: each sg iteration produces 2 dot results (w1,w3) of shape (btc, bfc) f32
+        ffn1_per_sg = 2 * btc * bfc * 4
+        ffn1_total = n_bd1c_tiles * n_bfc_tiles * 1 * t_packing * ffn1_per_sg
+        # FFN2: each sg iteration produces 1 dot result of shape (btc, bd2c_per_tp) f32
+        bd2c_per_tp = bd2c // t_packing
+        n_bd2c_tiles = (bd2 + bd2c - 1) // bd2c
+        ffn2_per_sg = btc * bd2c_per_tp * 4
+        ffn2_total = n_bd2c_tiles * 1 * t_packing * ffn2_per_sg
+        compute_intermediaries = ffn1_total + ffn2_total
+    total_bytes += compute_intermediaries
 
     # Shared expert scratch buffers.
     se_w1 = 0
@@ -235,7 +253,6 @@ def _estimate_vmem_bytes(
         se_tokens = 4 * bt * bd1 * token_bytes
         # b_se_acc_vmem: F32(2, bt, hidden_size) - accumulator for SE to avoid bf16 precision loss
         se_acc = 2 * bt * hidden * 4
-        total_bytes += se_w1 + se_w3 + se_w2 + se_tokens + se_acc
 
         # Shared expert scale scratch buffers (F32).
         # b_se_w1_scale_x2_vmem: (2, t_packing, bd1 // t_packing // subc_quant_wsz, 1, bse)
@@ -246,6 +263,16 @@ def _estimate_vmem_bytes(
             se_w3_scale = intermediate_size * 4
             se_w2_scale = hidden_size * 4
             total_bytes += se_w1_scale + se_w3_scale + se_w2_scale
+
+    total_bytes += se_w1 + se_w3 + se_w2 + se_tokens + se_acc
+    total_bytes += se_w1_scale + se_w3_scale + se_w2_scale
+
+    # XLA's Memory Space Assignment (MSA) allocates significantly more VMEM
+    # than the sum of explicit scratch shapes due to buffer alignment, While
+    # loop state copies, and packing fragmentation.  Empirically measured at
+    # ~1.5x on TPU v6e with the fused MoE megakernel (67 MB scratch → 104 MB
+    # XLA actual).
+    total_bytes = int(total_bytes * 1.5)
 
     if verbose:
 
@@ -280,7 +307,7 @@ def _estimate_vmem_bytes(
         print(f"      b_acc_vmem:             {_mb(b_acc)} MB  (2, {a2a_max_tokens}, 1, {bf}) f32")
         print(f"      b_output_x2_vmem:       {_mb(b_output)} MB  (2, {bt}, {hidden})")
         print(
-            f"      a2a_g_acc_vmem:         {_mb(a2a_g_acc)} MB  (1, {top_k}, {acc_bt}, {t_packing}, {hidden // t_packing})"
+            f"      a2a_g_acc_vmem:         {_mb(a2a_g_acc)} MB  (2, {top_k}, {acc_bt}, {t_packing}, {hidden // t_packing})"
         )
         print(
             f"      b_stage_x2_vmem:        {_mb(t_stage_b32)} MB  (2, {bts}, {t_packing}, {bd1 // t_packing})"
@@ -288,8 +315,12 @@ def _estimate_vmem_bytes(
         print(
             f"      a2a_s_acc_stage_x3:     {_mb(a2a_s_acc_stage_b32)} MB  (3, {bts}, {t_packing}, {bd2 // t_packing})"
         )
-        print(f"      b_gating_x2_vmem:       {_mb(b_gating)} MB  (2, {bt}, {padded_num_experts})")
         print(f"      routing_temporaries:    {_mb(routing_temporaries)} MB")
+        if compute_intermediaries > 0:
+            print(
+                f"      compute_intermediaries: {_mb(compute_intermediaries)} MB  (fori_loop single-iteration dot products)"
+            )
+        print("      xla_msa_overhead (1.5x): included in total")
         if use_shared_expert:
             bse = cfg.bse
             print(
@@ -451,10 +482,12 @@ def select_block_configs(
             use_shared_expert=use_shared_expert,
             subc_quant_wsz=subc_quant_wsz,
         )
-        if est > tpu_vmem_budget_bytes:
+        # Reserve 10% headroom for XLA stack temporaries not captured by estimate
+        effective_budget = int(tpu_vmem_budget_bytes * 0.90)
+        if est > effective_budget:
             return (
                 False,
-                f"vmem_est={est / (1024 * 1024):.1f}MB > budget={tpu_vmem_budget_bytes / (1024 * 1024):.1f}MB",
+                f"vmem_est={est / (1024 * 1024):.1f}MB > budget={effective_budget / (1024 * 1024):.1f}MB",
             )
         return True, "ok"
 
@@ -673,6 +706,8 @@ def run_all(
     token_mask_mode: str = "none",
     token_valid_ratio: float = 1.0,
     token_mask_seed: int = 0,
+    subc_quant_wsz_override: int | None = None,
+    subc_quant_n_wsz: int | None = None,
     return_results: bool = False,
 ) -> list[dict[str, object]] | None:
     if use_grouped_topk is None:
@@ -722,6 +757,12 @@ def run_all(
 
     print(f"Running fused_moe benchmarks with weight_dtype={weight_dtype}")
     print(f"  features: shared_expert={use_shared_expert}, grouped_topk={use_grouped_topk}")
+    if subc_quant_n_wsz is not None:
+        print(
+            f"  quantization: 2D block-wise (block_k={subc_quant_wsz_override}, block_n={subc_quant_n_wsz})"
+        )
+    elif subc_quant_wsz_override is not None:
+        print(f"  quantization: 1D sub-channel (wsz={subc_quant_wsz_override})")
     print(
         "  shape: "
         f"num_experts={num_experts}, top_k={top_k}, hidden_size={hidden_size}, intermediate_size={intermediate_size}, "
@@ -822,7 +863,10 @@ def run_all(
                 ),
             )
         # Determine subc_quant_wsz for FP8 quantization
-        subc_quant_wsz = 256 if weight_dtype == jnp.float8_e4m3fn else None
+        if subc_quant_wsz_override is not None:
+            subc_quant_wsz = subc_quant_wsz_override
+        else:
+            subc_quant_wsz = 256 if weight_dtype == jnp.float8_e4m3fn else None
 
         block_cfgs: list[FusedMoEBlockConfig | None]
         if tune_block_config:
@@ -924,6 +968,10 @@ def run_all(
                 ),
             )
             if quantization_config is not None:
+                if subc_quant_wsz is not None:
+                    fused_layer.subc_quant_wsz = subc_quant_wsz
+                if subc_quant_n_wsz is not None:
+                    fused_layer.quant_block_n = subc_quant_n_wsz
                 fused_layer.quantize_weights()
 
             topk_module = TopK(
@@ -1017,9 +1065,10 @@ def run_all(
                         verbose=True,
                     )
                     vmem_mb = vmem_bytes / (1024 * 1024)
-                    vmem_remaining_mb = 64.0 - vmem_mb
+                    budget_mb = tpu_vmem_budget_bytes / (1024 * 1024)
+                    vmem_remaining_mb = budget_mb - vmem_mb
                     print(
-                        f"    => VMEM: {vmem_mb:.2f} MB / 64 MB (remaining: {vmem_remaining_mb:.2f} MB)"
+                        f"    => VMEM: {vmem_mb:.2f} MB / {budget_mb:.0f} MB (remaining: {vmem_remaining_mb:.2f} MB)"
                     )
 
                 task = "fused-moe-k_.*"
@@ -1056,7 +1105,7 @@ def run_all(
                             intermediate_size=case.intermediate_size,
                             dtype=dtype,
                             ep_size=mesh_ep,
-                            subc_quant_wsz=None,
+                            subc_quant_wsz=subc_quant_wsz,
                             block_config=block_cfg,
                         )
                     times = multiple_iteration_timeit_from_trace(
@@ -1294,6 +1343,18 @@ def parse_args() -> argparse.Namespace:
         help="All-to-all imbalance mode.",
     )
     parser.add_argument(
+        "--subc-quant-wsz",
+        type=int,
+        default=None,
+        help="Sub-channel quantization block size (default: 256 for FP8, None for bf16).",
+    )
+    parser.add_argument(
+        "--subc-quant-n-wsz",
+        type=int,
+        default=None,
+        help="N-dim block size for 2D block-wise quantization. When set, uses block_k=subc-quant-wsz, block_n=this value.",
+    )
+    parser.add_argument(
         "--alpha",
         type=float,
         default=1.0,
@@ -1420,6 +1481,8 @@ if __name__ == "__main__":
                 token_mask_mode=token_mask_mode,
                 token_valid_ratio=ratio,
                 token_mask_seed=args.token_mask_seed,
+                subc_quant_wsz_override=args.subc_quant_wsz,
+                subc_quant_n_wsz=args.subc_quant_n_wsz,
                 return_results=True,
             )
             all_results.append((ratio, token_mask_mode, results))

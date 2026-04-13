@@ -185,42 +185,86 @@ class FusedEPMoE(nnx.Module):
         self.w3_shared_scale = None
         self.w2_shared_scale = None
 
-        self.subc_quant_wsz = None  # Use default sub channel quantization block size
+        # Read block-wise quantization settings from config.
+        weight_block_size = (
+            getattr(quantization_config, "weight_block_size", None) if quantization_config else None
+        )
+        if weight_block_size is not None and len(weight_block_size) == 2:
+            self.subc_quant_wsz = int(weight_block_size[1])  # block_k
+            self.quant_block_n = int(weight_block_size[0])  # block_n
+        else:
+            self.subc_quant_wsz = None
+            self.quant_block_n = None
 
     def quantize_weights(self, is_static: bool = False):
         """Quantize MoE weights in-place. Call once after model loading."""
         if self.quantized_dtype is None:
             return
 
+        # Default subc_quant_wsz to 256 if not explicitly set.
+        wsz = self.subc_quant_wsz if self.subc_quant_wsz is not None else 256
         if hasattr(self, "subc_quant_wsz"):
             del self.subc_quant_wsz
-            self.subc_quant_wsz = 256
+        self.subc_quant_wsz = wsz
 
         with jax.set_mesh(self.mesh):
             if is_static:
                 ep_scale_sharding = P(("data", "tensor"), None, None, None)
-                # Keep a shardable placeholder shape for static checkpoints.
-                # Axis 0 is sharded by ("data", "tensor"), so it must be divisible by EP mesh size.
-                ep_scale_placeholder_shape = (self.num_experts, 1, 1, 1)
+
+                # Compute the actual kernel-expected scale shapes so the weight
+                # loader can match dimensions and assign directly.
+                if self.quant_block_n is not None:
+                    # 2D block-wise: pre-expand N_groups → N and store as
+                    # (E, K_groups, 1, N) — same as 1D format.  TPU DMA
+                    # requires last dim ≥128; N_groups would violate this.
+                    # Kernel receives subc_quant_n_wsz=None (1D code path).
+                    w1_scale_shape = (
+                        self.num_experts,
+                        self.hidden_size // wsz,
+                        1,
+                        self.intermediate_dim,
+                    )
+                    w3_scale_shape = w1_scale_shape
+                    w2_scale_shape = (
+                        self.num_experts,
+                        self.intermediate_dim // wsz,
+                        1,
+                        self.hidden_size,
+                    )
+                else:
+                    # 1D sub-channel: (E, K_groups, 1, N)
+                    w1_scale_shape = (
+                        self.num_experts,
+                        self.hidden_size // wsz,
+                        1,
+                        self.intermediate_dim,
+                    )
+                    w3_scale_shape = w1_scale_shape
+                    w2_scale_shape = (
+                        self.num_experts,
+                        self.intermediate_dim // wsz,
+                        1,
+                        self.hidden_size,
+                    )
 
                 if hasattr(self, "w1_scale"):
                     del self.w1_scale
                 self.w1_scale = nnx.Param(
-                    jnp.zeros(ep_scale_placeholder_shape, dtype=jnp.float32),
+                    jnp.zeros(w1_scale_shape, dtype=jnp.float32),
                     out_sharding=ep_scale_sharding,
                 )
 
                 if hasattr(self, "w3_scale"):
                     del self.w3_scale
                 self.w3_scale = nnx.Param(
-                    jnp.zeros(ep_scale_placeholder_shape, dtype=jnp.float32),
+                    jnp.zeros(w3_scale_shape, dtype=jnp.float32),
                     out_sharding=ep_scale_sharding,
                 )
 
                 if hasattr(self, "w2_scale"):
                     del self.w2_scale
                 self.w2_scale = nnx.Param(
-                    jnp.zeros(ep_scale_placeholder_shape, dtype=jnp.float32),
+                    jnp.zeros(w2_scale_shape, dtype=jnp.float32),
                     out_sharding=ep_scale_sharding,
                 )
 
@@ -248,24 +292,46 @@ class FusedEPMoE(nnx.Module):
                 return
 
             # Replace original weights with quantized versions
-            w1_value, w1_scale = quantize_tensor(
-                self.quantized_dtype,
-                self.w1.value,
-                axis=1,
-                block_size=self.subc_quant_wsz,
-            )
-            w3_value, w3_scale = quantize_tensor(
-                self.quantized_dtype,
-                self.w3.value,
-                axis=1,
-                block_size=self.subc_quant_wsz,
-            )
-            w2_value, w2_scale = quantize_tensor(
-                self.quantized_dtype,
-                self.w2.value,
-                axis=1,
-                block_size=self.subc_quant_wsz,
-            )
+            if self.quant_block_n is not None:
+                # 2D block-wise quantization: scale shape (E, K//block_k, N//block_n)
+                w1_value, w1_scale = quantize_tensor(
+                    self.quantized_dtype,
+                    self.w1.value,
+                    axis=(1, 2),
+                    block_size=[self.subc_quant_wsz, self.quant_block_n],
+                )
+                w3_value, w3_scale = quantize_tensor(
+                    self.quantized_dtype,
+                    self.w3.value,
+                    axis=(1, 2),
+                    block_size=[self.subc_quant_wsz, self.quant_block_n],
+                )
+                w2_value, w2_scale = quantize_tensor(
+                    self.quantized_dtype,
+                    self.w2.value,
+                    axis=(1, 2),
+                    block_size=[self.subc_quant_wsz, self.quant_block_n],
+                )
+            else:
+                # 1D sub-channel quantization: scale shape (E, K//wsz, N)
+                w1_value, w1_scale = quantize_tensor(
+                    self.quantized_dtype,
+                    self.w1.value,
+                    axis=1,
+                    block_size=self.subc_quant_wsz,
+                )
+                w3_value, w3_scale = quantize_tensor(
+                    self.quantized_dtype,
+                    self.w3.value,
+                    axis=1,
+                    block_size=self.subc_quant_wsz,
+                )
+                w2_value, w2_scale = quantize_tensor(
+                    self.quantized_dtype,
+                    self.w2.value,
+                    axis=1,
+                    block_size=self.subc_quant_wsz,
+                )
 
             # NOTE: Fused MoE shards the expert dimension across EP=(data*tensor).
             ep_sharding = P(("data", "tensor"), None, None)
@@ -276,22 +342,41 @@ class FusedEPMoE(nnx.Module):
             self.w2 = nnx.Param(w2_value, out_sharding=ep_sharding)
 
             # Update scales (reshape to 4D for GMM kernel)
+            if self.quant_block_n is not None:
+                # 2D block-wise: (E, K//block_k, N//block_n) → expand N → (E, K//block_k, N)
+                # then reshape to 1D format (E, K//block_k, 1, N).
+                # Pre-expansion avoids TPU DMA alignment issues (last dim must be ≥128).
+                w1_scale = jnp.repeat(w1_scale, self.quant_block_n, axis=2)
+                w3_scale = jnp.repeat(w3_scale, self.quant_block_n, axis=2)
+                w2_scale = jnp.repeat(w2_scale, self.quant_block_n, axis=2)
+
+            # (E, K//wsz, N) → (E, K//wsz, 1, N)
+            w1_scale_4d = w1_scale.reshape(
+                w1_scale.shape[0], w1_scale.shape[1], 1, w1_scale.shape[2]
+            )
+            w3_scale_4d = w3_scale.reshape(
+                w3_scale.shape[0], w3_scale.shape[1], 1, w3_scale.shape[2]
+            )
+            w2_scale_4d = w2_scale.reshape(
+                w2_scale.shape[0], w2_scale.shape[1], 1, w2_scale.shape[2]
+            )
+
             if hasattr(self, "w1_scale"):
                 del self.w1_scale
             self.w1_scale = nnx.Param(
-                w1_scale.reshape(w1_scale.shape[0], w1_scale.shape[1], 1, w1_scale.shape[2]),
+                w1_scale_4d,
                 out_sharding=ep_scale_sharding,
             )
             if hasattr(self, "w3_scale"):
                 del self.w3_scale
             self.w3_scale = nnx.Param(
-                w3_scale.reshape(w3_scale.shape[0], w3_scale.shape[1], 1, w3_scale.shape[2]),
+                w3_scale_4d,
                 out_sharding=ep_scale_sharding,
             )
             if hasattr(self, "w2_scale"):
                 del self.w2_scale
             self.w2_scale = nnx.Param(
-                w2_scale.reshape(w2_scale.shape[0], w2_scale.shape[1], 1, w2_scale.shape[2]),
+                w2_scale_4d,
                 out_sharding=ep_scale_sharding,
             )
 
@@ -411,6 +496,10 @@ class FusedEPMoE(nnx.Module):
             disable_sync_barrier=self.disable_sync_barrier,
             # Optional parameters (not used in basic case)
             subc_quant_wsz=subc_quant_wsz,
+            # 2D block-wise scales are pre-expanded to (E, K_groups, 1, N)
+            # during weight loading, matching the 1D sub-channel format.
+            # Pass None so the kernel uses its 1D code path (same as unit tests).
+            subc_quant_n_wsz=None,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             w3_scale=w3_scale,

@@ -198,7 +198,7 @@ class WeightLoader:
         model_param: nnx.Variable,
         target_path: str,
     ) -> jax.Array:
-        """Convert offline EPMoE scales into the 4D layout expected by GMM.
+        """Convert offline EPMoE/FusedEPMoE scales into kernel-ready 4D layout.
 
         Offline checkpoints may store MoE scales in one of several compact
         layouts, for example:
@@ -207,22 +207,36 @@ class WeightLoader:
         - block-channel: ``[E, out_dim, k_blocks]`` or ``[E, k_blocks, out_dim]``
         - 2D block quant: ``[E, out_blocks, k_blocks]``
 
-        The runtime GMM kernel consumes only ``[E, k_blocks, 1, out_dim]``.
+        The runtime GMM kernel consumes ``[E, k_blocks, 1, out_dim]``.
+        The FusedEPMoE kernel consumes ``[E, k_blocks, n_blocks, 1]``.
+
         This helper performs the cheap layout conversion during weight loading
         so the forward path does not need to reinterpret checkpoint tensors.
         """
-        if not target_path.endswith(("wi_0_scale", "wi_1_scale", "wo_scale")):
+        # Match both EPMoE (wi_0_scale etc.) and FusedEPMoE (w1_scale etc.)
+        if not target_path.endswith(
+            ("wi_0_scale", "wi_1_scale", "wo_scale", "w1_scale", "w2_scale", "w3_scale")
+        ):
             return weight
 
         if weight.ndim == 4 or model_param.value.ndim != 4:
             return weight
 
-        num_experts, k_blocks, _, out_dim = model_param.value.shape
-        if model_param.value.shape[2] != 1:
-            raise ValueError(
-                f"Expected kernel-ready EPMoE scale placeholder to have singleton dim=1, "
-                f"got shape={model_param.value.shape} for {target_path}"
-            )
+        param_shape = model_param.value.shape
+        num_experts = param_shape[0]
+
+        # --- FusedEPMoE 2D block-wise (compressed, no repeat) ---
+        # If placeholder shape is (E, K_groups, N_groups, 1) and weight is 3D,
+        # just append trailing dim.  Note: the current MiMo path pre-expands
+        # via WeightMapping(repeat=) to (E, K_groups, N), so it falls through
+        # to the "k_blocks, out_dim" branch below instead.
+        if param_shape[3] == 1 and param_shape[2] > 1 and weight.ndim == 3:
+            return weight[..., None]
+
+        # --- EPMoE / GMM path (also FusedEPMoE 1D sub-channel) ---
+        if param_shape[2] != 1:
+            return weight
+        num_experts, k_blocks, _, out_dim = param_shape
         if weight.ndim == 2 and weight.shape == (num_experts, out_dim):
             return weight[:, None, None, :]
 

@@ -164,6 +164,7 @@ class MoEKernelTest(jtu.JaxTestCase):
         act_fn="silu",
         w_dtype=None,
         subc_quant_wsz=None,
+        subc_quant_n_wsz=None,
         has_bias=False,
         has_shared_expert=False,
         use_grouped_topk=False,
@@ -189,21 +190,63 @@ class MoEKernelTest(jtu.JaxTestCase):
         if w_dtype is not None:
             if subc_quant_wsz is None:
                 subc_quant_wsz = 256
-            # Match FusedEPMoE's quantization path: block-quantize along axis=1.
-            w1, w1_scale_3d = quantize_tensor(w_dtype, w1, axis=1, block_size=subc_quant_wsz)
-            w3, w3_scale_3d = quantize_tensor(w_dtype, w3, axis=1, block_size=subc_quant_wsz)
-            w2, w2_scale_3d = quantize_tensor(w_dtype, w2, axis=1, block_size=subc_quant_wsz)
 
-            # Reshape scales to the 4D layout expected by the kernel.
-            w1_scale = w1_scale_3d.reshape(
-                w1_scale_3d.shape[0], w1_scale_3d.shape[1], 1, w1_scale_3d.shape[2]
-            )
-            w3_scale = w3_scale_3d.reshape(
-                w3_scale_3d.shape[0], w3_scale_3d.shape[1], 1, w3_scale_3d.shape[2]
-            )
-            w2_scale = w2_scale_3d.reshape(
-                w2_scale_3d.shape[0], w2_scale_3d.shape[1], 1, w2_scale_3d.shape[2]
-            )
+            if subc_quant_n_wsz is not None:
+                # 2D block-wise quantization: quantize with 2D blocking,
+                # then expand to 1D format for kernel compatibility.
+                # (TPU DMA requires last dim ≥128, 2D scale dim3=1 violates this)
+                w1, w1_scale_3d = quantize_tensor(
+                    w_dtype, w1, axis=(1, 2), block_size=[subc_quant_wsz, subc_quant_n_wsz]
+                )
+                w3, w3_scale_3d = quantize_tensor(
+                    w_dtype, w3, axis=(1, 2), block_size=[subc_quant_wsz, subc_quant_n_wsz]
+                )
+                w2, w2_scale_3d = quantize_tensor(
+                    w_dtype, w2, axis=(1, 2), block_size=[subc_quant_wsz, subc_quant_n_wsz]
+                )
+
+                # Expand 2D → 1D: (E, K//bk, N//bn) → repeat along N → (E, K//bk, N)
+                w1_scale_expanded = jnp.repeat(w1_scale_3d, subc_quant_n_wsz, axis=2)
+                w3_scale_expanded = jnp.repeat(w3_scale_3d, subc_quant_n_wsz, axis=2)
+                w2_scale_expanded = jnp.repeat(w2_scale_3d, subc_quant_n_wsz, axis=2)
+
+                # Reshape to 4D: (E, K//bk, 1, N) — same as 1D layout
+                w1_scale = w1_scale_expanded.reshape(
+                    w1_scale_expanded.shape[0],
+                    w1_scale_expanded.shape[1],
+                    1,
+                    w1_scale_expanded.shape[2],
+                )
+                w3_scale = w3_scale_expanded.reshape(
+                    w3_scale_expanded.shape[0],
+                    w3_scale_expanded.shape[1],
+                    1,
+                    w3_scale_expanded.shape[2],
+                )
+                w2_scale = w2_scale_expanded.reshape(
+                    w2_scale_expanded.shape[0],
+                    w2_scale_expanded.shape[1],
+                    1,
+                    w2_scale_expanded.shape[2],
+                )
+                # Kernel sees 1D format — no subc_quant_n_wsz needed
+                subc_quant_n_wsz = None
+            else:
+                # 1D sub-channel quantization
+                w1, w1_scale_3d = quantize_tensor(w_dtype, w1, axis=1, block_size=subc_quant_wsz)
+                w3, w3_scale_3d = quantize_tensor(w_dtype, w3, axis=1, block_size=subc_quant_wsz)
+                w2, w2_scale_3d = quantize_tensor(w_dtype, w2, axis=1, block_size=subc_quant_wsz)
+
+                # Reshape scales to the 4D layout expected by the kernel.
+                w1_scale = w1_scale_3d.reshape(
+                    w1_scale_3d.shape[0], w1_scale_3d.shape[1], 1, w1_scale_3d.shape[2]
+                )
+                w3_scale = w3_scale_3d.reshape(
+                    w3_scale_3d.shape[0], w3_scale_3d.shape[1], 1, w3_scale_3d.shape[2]
+                )
+                w2_scale = w2_scale_3d.reshape(
+                    w2_scale_3d.shape[0], w2_scale_3d.shape[1], 1, w2_scale_3d.shape[2]
+                )
 
             if has_shared_expert:
                 # Shared-expert weights use per-column scaling (axis=0) to keep
@@ -255,6 +298,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             top_k=top_k,
             act_fn=act_fn,
             subc_quant_wsz=subc_quant_wsz,
+            subc_quant_n_wsz=subc_quant_n_wsz,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             w3_scale=w3_scale,
@@ -286,6 +330,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             renormalize_topk_logits=renormalize_topk_logits,
             act_fn=act_fn,
             subc_quant_wsz=subc_quant_wsz,
+            subc_quant_n_wsz=subc_quant_n_wsz,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             w3_scale=w3_scale,
@@ -497,12 +542,8 @@ class MoEKernelTest(jtu.JaxTestCase):
         w_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float8_e5m2, jnp.float4_e2m1fn],
     )
     def test_sub_channel_quantization(self, w_dtype):
-        if w_dtype in (
-            jnp.float8_e4m3fn,
-            jnp.float8_e5m2,
-            jnp.float4_e2m1fn,
-        ) and not jtu.is_device_tpu_at_least(version=7):
-            self.skipTest("Expect TPUv7+")
+        if w_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("float4 requires TPUv7+")
         dtype = jnp.bfloat16
         top_k = 8
         num_experts = 128
@@ -534,13 +575,209 @@ class MoEKernelTest(jtu.JaxTestCase):
     @parameterized.product(
         w_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float8_e5m2, jnp.float4_e2m1fn],
     )
+    def test_sub_channel_quantization_large_tile(self, w_dtype):
+        """Like test_sub_channel_quantization but with large bd1c/bfc.
+
+        This exercises the scale-group Python for-loop (n_sg > 1) that was
+        added to avoid HLO unrolling explosion with FP8 sub-channel quant.
+        With bd1c=1024 and subc_quant_wsz=256, n_sg = 1024/2/256 = 2.
+        With bfc=1024 and subc_quant_wsz=256, n_sg2 = 1024/256 = 4.
+        """
+        if w_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("float4 requires TPUv7+")
+        dtype = jnp.bfloat16
+        top_k = 8
+        num_experts = 128
+        hidden_size = 1024
+        intermediate_size = 1024
+        num_tokens = 8 * 32
+        self._test_moe(
+            dtype=dtype,
+            top_k=top_k,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_tokens=num_tokens,
+            seed=1234,
+            renormalize_topk_logits=False,
+            w_dtype=w_dtype,
+            subc_quant_wsz=256,
+            bt=32,
+            bf=1024,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=1024,
+            bd1c=1024,
+            bd2c=1024,
+            bse=512,
+        )
+
+    @parameterized.product(
+        w_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float8_e5m2, jnp.float4_e2m1fn],
+    )
+    def test_sub_channel_quantization_group128(self, w_dtype):
+        """Test sub-channel quantization with group_size=128 (block-wise quant).
+
+        With bd1c=512 and subc_quant_wsz=128, n_sg = 512/2/128 = 2.
+        With bfc=256 and subc_quant_wsz=128, n_sg2 = 256/128 = 2.
+        """
+        if w_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("float4 requires TPUv7+")
+        dtype = jnp.bfloat16
+        top_k = 8
+        num_experts = 128
+        hidden_size = 1024
+        intermediate_size = 1024
+        num_tokens = 8 * 32
+        self._test_moe(
+            dtype=dtype,
+            top_k=top_k,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_tokens=num_tokens,
+            seed=1234,
+            renormalize_topk_logits=False,
+            w_dtype=w_dtype,
+            subc_quant_wsz=128,
+            bt=32,
+            bf=1024,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=256,
+            bd1c=256,
+            bd2c=256,
+            bse=512,
+        )
+
+    @parameterized.product(
+        w_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float8_e5m2, jnp.float4_e2m1fn],
+    )
+    def test_sub_channel_quantization_group128_large_tile(self, w_dtype):
+        """Test group_size=128 with large tiles to exercise fori_loop with more iterations.
+
+        With bd1c=1024 and subc_quant_wsz=128, n_sg = 1024/2/128 = 4.
+        With bfc=1024 and subc_quant_wsz=128, n_sg2 = 1024/128 = 8.
+        """
+        if w_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("float4 requires TPUv7+")
+        dtype = jnp.bfloat16
+        top_k = 8
+        num_experts = 128
+        hidden_size = 1024
+        intermediate_size = 1024
+        num_tokens = 8 * 32
+        self._test_moe(
+            dtype=dtype,
+            top_k=top_k,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_tokens=num_tokens,
+            seed=1234,
+            renormalize_topk_logits=False,
+            w_dtype=w_dtype,
+            subc_quant_wsz=128,
+            bt=32,
+            bf=1024,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=1024,
+            bd1c=1024,
+            bd2c=1024,
+            bse=512,
+        )
+
+    @parameterized.product(
+        w_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float8_e5m2, jnp.float4_e2m1fn],
+    )
+    def test_block_wise_quantization_2d(self, w_dtype):
+        """2D block-wise quantization: block_k=128, block_n=128.
+
+        Scale shape is (E, K//128, N//128, 1) instead of (E, K//128, 1, N).
+        Each (128, 128) sub-matrix shares one scalar scale.
+        """
+        if w_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("float4 requires TPUv7+")
+        dtype = jnp.bfloat16
+        top_k = 8
+        num_experts = 128
+        hidden_size = 1024
+        intermediate_size = 1024
+        num_tokens = 8 * 32
+        self._test_moe(
+            dtype=dtype,
+            top_k=top_k,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_tokens=num_tokens,
+            seed=1234,
+            renormalize_topk_logits=False,
+            w_dtype=w_dtype,
+            subc_quant_wsz=128,
+            subc_quant_n_wsz=128,
+            bt=32,
+            bf=1024,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=256,
+            bd1c=256,
+            bd2c=256,
+            bse=512,
+        )
+
+    @parameterized.product(
+        w_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float8_e5m2, jnp.float4_e2m1fn],
+    )
+    def test_block_wise_quantization_2d_large_tile(self, w_dtype):
+        """2D block-wise with large tiles to exercise fori_loop.
+
+        With bd1c=1024 and subc_quant_wsz=128, n_sg = 1024/2/128 = 4.
+        With bfc=1024 and subc_quant_wsz=128, n_sg2 = 1024/128 = 8.
+        N-dim block_n=128: bfc//block_n = 1024//128 = 8 groups per tile.
+        """
+        if w_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("float4 requires TPUv7+")
+        dtype = jnp.bfloat16
+        top_k = 8
+        num_experts = 128
+        hidden_size = 1024
+        intermediate_size = 1024
+        num_tokens = 8 * 32
+        self._test_moe(
+            dtype=dtype,
+            top_k=top_k,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_tokens=num_tokens,
+            seed=1234,
+            renormalize_topk_logits=False,
+            w_dtype=w_dtype,
+            subc_quant_wsz=128,
+            subc_quant_n_wsz=128,
+            bt=32,
+            bf=1024,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=1024,
+            bd1c=1024,
+            bd2c=1024,
+            bse=512,
+        )
+
+    @parameterized.product(
+        w_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float8_e5m2, jnp.float4_e2m1fn],
+    )
     def test_shared_expert_quantized(self, w_dtype):
-        if w_dtype in (
-            jnp.float8_e4m3fn,
-            jnp.float8_e5m2,
-            jnp.float4_e2m1fn,
-        ) and not jtu.is_device_tpu_at_least(version=7):
-            self.skipTest("Expect TPUv7+")
+        if w_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("float4 requires TPUv7+")
         dtype = jnp.bfloat16
         top_k = 8
         num_experts = 128
