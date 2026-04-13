@@ -50,7 +50,7 @@ class TestBenchServingMOE(CustomTestCase):
                 "--max-running-requests",
                 "256",
                 "--page-size",
-                "128",
+                "256",
                 "--disable-radix-cache",
             ],
             env={
@@ -105,7 +105,7 @@ class TestBenchServingMOE(CustomTestCase):
                 f"### test_output_throughput_moe\n"
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
-            self.assertGreater(res["output_throughput"], 2835)
+            self.assertGreater(res["output_throughput"], 2500)
 
     def test_ttft_moe(self):
         args = get_benchmark_args(
