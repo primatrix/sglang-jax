@@ -6,67 +6,47 @@ on:
       branch:
         description: "Branch to benchmark"
         required: true
-        default: "epic/mimo-v2-flash"
-      model_path:
-        description: "Model path (HuggingFace ID or /models/...)"
-        required: true
-        default: "XiaomiMiMo/MiMo-V2-Flash"
+        default: "exp/scatter-optimization"
       topology:
         description: "TPU topology"
         required: true
         type: choice
         options:
-          - "4chip"
           - "16chip"
-        default: "4chip"
-      tp_size:
-        description: "Tensor parallel size"
-        required: true
-        default: "4"
-      backend:
-        description: "Benchmark backend"
-        required: true
-        default: "sgl-jax"
-      dataset_name:
-        description: "Dataset name"
-        required: true
-        default: "random"
-      random_input_len:
-        description: "Random input length"
-        required: true
-        default: "16384"
-      random_output_len:
-        description: "Random output length"
-        required: true
-        default: "1024"
-      random_range_ratio:
-        description: "Random range ratio"
-        required: true
-        default: "1.0"
-      request_rate:
-        description: "Request rate"
-        required: true
-        default: "100"
-      num_prompts:
-        description: "Number of prompts"
-        required: true
-        default: "256"
-      max_concurrency:
-        description: "Max concurrency"
-        required: true
-        default: "64"
-      seed:
-        description: "Random seed"
-        required: true
-        default: "12345"
+          - "4chip"
+        default: "16chip"
       server_args:
-        description: "Extra sglang server args (e.g. --max-seq-len 32768)"
-        required: false
-        default: ""
-      extra_bench_args:
-        description: "Extra bench_serving args (e.g. --warmup-requests 10)"
-        required: false
-        default: ""
+        description: "sglang server launch args (all flags except --host/--port/--nnodes/--node-rank/--dist-init-addr)"
+        required: true
+        default: >-
+          --model-path /models/MiMo-V2-Flash
+          --trust-remote-code
+          --tp-size 16 --dp-size 4 --ep-size 16
+          --moe-backend fused
+          --page-size 256
+          --context-length 262144
+          --disable-radix-cache
+          --chunked-prefill-size 2048
+          --dtype bfloat16
+          --mem-fraction-static 0.95
+          --swa-full-tokens-ratio 0.2
+          --skip-server-warmup
+          --log-level info
+          --max-running-requests 128
+      bench_args:
+        description: "bench_serving args (all flags)"
+        required: true
+        default: >-
+          --backend sgl-jax
+          --host 127.0.0.1 --port 30271
+          --dataset-name random
+          --random-input-len 16384
+          --random-output-len 1024
+          --random-range-ratio 1.0
+          --flush-cache --seed 12345
+          --request-rate 100
+          --num-prompts 256
+          --max-concurrency 64
 
 permissions:
   actions: read
@@ -75,7 +55,7 @@ permissions:
 
 jobs:
   benchmark:
-    name: "Benchmark (${{ inputs.topology }}, tp=${{ inputs.tp_size }})"
+    name: "Benchmark (${{ inputs.topology }})"
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -117,21 +97,6 @@ jobs:
           | sed 's/[^a-z0-9._-]/-/g' | sed 's/^[^a-z0-9]*//' | sed 's/[^a-z0-9]*$//' | head -c 63)
         ACTOR_SAFE="${ACTOR_SAFE:-unknown}"
         echo "actor_safe=${ACTOR_SAFE}" >> "$GITHUB_OUTPUT"
-
-        # Build task command
-        TASK_CMD="python3 -m sgl_jax.bench_serving"
-        TASK_CMD+=" --backend ${{ inputs.backend }}"
-        TASK_CMD+=" --host 127.0.0.1 --port 30271"
-        TASK_CMD+=" --dataset-name ${{ inputs.dataset_name }}"
-        TASK_CMD+=" --random-input-len ${{ inputs.random_input_len }}"
-        TASK_CMD+=" --random-output-len ${{ inputs.random_output_len }}"
-        TASK_CMD+=" --random-range-ratio ${{ inputs.random_range_ratio }}"
-        TASK_CMD+=" --flush-cache --seed ${{ inputs.seed }}"
-        TASK_CMD+=" --request-rate ${{ inputs.request_rate }}"
-        TASK_CMD+=" --num-prompts ${{ inputs.num_prompts }}"
-        TASK_CMD+=" --max-concurrency ${{ inputs.max_concurrency }}"
-        TASK_CMD+=" ${{ inputs.extra_bench_args }}"
-        echo "task_command=${TASK_CMD}" >> "$GITHUB_OUTPUT"
 
         # TPU coordinator address for 16chip
         if [ "${{ inputs.topology }}" = "16chip" ]; then
@@ -202,10 +167,8 @@ jobs:
       run: |
         export JOB_NAME="${{ steps.config.outputs.job_name }}"
         export BRANCH="${{ inputs.branch }}"
-        export MODEL_PATH="${{ inputs.model_path }}"
-        export TP_SIZE="${{ inputs.tp_size }}"
         export SERVER_ARGS="${{ inputs.server_args }}"
-        export TASK_COMMAND="${{ steps.config.outputs.task_command }}"
+        export TASK_COMMAND="python3 -m sgl_jax.bench_serving ${{ inputs.bench_args }}"
         export TASK_TYPE="benchmark"
         export GITHUB_ACTOR="${{ steps.config.outputs.actor_safe }}"
         export ACTIVE_DEADLINE="7200"

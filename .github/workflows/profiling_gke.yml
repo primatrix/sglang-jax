@@ -6,23 +6,33 @@ on:
       branch:
         description: "Branch to profile"
         required: true
-        default: "epic/mimo-v2-flash"
-      model_path:
-        description: "Model path (HuggingFace ID or /models/...)"
-        required: true
-        default: "XiaomiMiMo/MiMo-V2-Flash"
+        default: "exp/scatter-optimization"
       topology:
         description: "TPU topology"
         required: true
         type: choice
         options:
-          - "4chip"
           - "16chip"
-        default: "4chip"
-      tp_size:
-        description: "Tensor parallel size"
+          - "4chip"
+        default: "16chip"
+      server_args:
+        description: "sglang server launch args (all flags except --host/--port/--nnodes/--node-rank/--dist-init-addr)"
         required: true
-        default: "4"
+        default: >-
+          --model-path /models/MiMo-V2-Flash
+          --trust-remote-code
+          --tp-size 16 --dp-size 4 --ep-size 16
+          --moe-backend fused
+          --page-size 256
+          --context-length 262144
+          --disable-radix-cache
+          --chunked-prefill-size 2048
+          --dtype bfloat16
+          --mem-fraction-static 0.95
+          --swa-full-tokens-ratio 0.2
+          --skip-server-warmup
+          --log-level info
+          --max-running-requests 128
       num_steps:
         description: "Number of steps to profile"
         required: true
@@ -31,22 +41,18 @@ on:
         description: "GCS output dir for profile traces"
         required: true
         default: "gs://inference-model-storage-poc-tpu/profiling/sglang-jax"
-      num_prompts:
-        description: "Number of prompts for traffic generation"
+      traffic_args:
+        description: "bench_serving args for traffic generation during profiling"
         required: true
-        default: "32"
-      random_input_len:
-        description: "Input length for traffic generation"
-        required: true
-        default: "512"
-      random_output_len:
-        description: "Output length for traffic generation"
-        required: true
-        default: "128"
-      server_args:
-        description: "Extra sglang server args"
-        required: false
-        default: ""
+        default: >-
+          --backend sgl-jax
+          --host 127.0.0.1 --port 30271
+          --dataset-name random
+          --random-input-len 512
+          --random-output-len 128
+          --random-range-ratio 1.0
+          --num-prompts 32
+          --warmup-requests 0
 
 permissions:
   actions: read
@@ -55,7 +61,7 @@ permissions:
 
 jobs:
   profiling:
-    name: "Profiling (${{ inputs.topology }}, tp=${{ inputs.tp_size }})"
+    name: "Profiling (${{ inputs.topology }})"
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -100,28 +106,7 @@ jobs:
         PROFILE_DIR="${{ inputs.profile_output_dir }}/${JOB_NAME}"
         echo "profile_dir=${PROFILE_DIR}" >> "$GITHUB_OUTPUT"
 
-        # Build task command:
-        # 1. Trigger profiling (async, waits for num_steps forward passes)
-        # 2. Simultaneously send traffic to generate those forward passes
-        # 3. Print the output path
-        TASK_CMD='echo "=== Starting profiling ===" '
-        TASK_CMD+="&& curl -sf -X POST 'http://127.0.0.1:30271/start_profile'"
-        TASK_CMD+=" -H 'Content-Type: application/json'"
-        TASK_CMD+=" -d '{\"output_dir\": \"${PROFILE_DIR}\", \"num_steps\": ${{ inputs.num_steps }}}' &"
-        TASK_CMD+=" PROFILE_PID=\$!"
-        TASK_CMD+=" && sleep 5"
-        TASK_CMD+=" && python3 -m sgl_jax.bench_serving"
-        TASK_CMD+=" --backend sgl-jax --host 127.0.0.1 --port 30271"
-        TASK_CMD+=" --dataset-name random"
-        TASK_CMD+=" --random-input-len ${{ inputs.random_input_len }}"
-        TASK_CMD+=" --random-output-len ${{ inputs.random_output_len }}"
-        TASK_CMD+=" --random-range-ratio 1.0"
-        TASK_CMD+=" --num-prompts ${{ inputs.num_prompts }}"
-        TASK_CMD+=" --warmup-requests 0"
-        TASK_CMD+=" && wait \$PROFILE_PID"
-        TASK_CMD+=" && echo '=== Profile saved to: ${PROFILE_DIR} ==='"
-        echo "task_command=${TASK_CMD}" >> "$GITHUB_OUTPUT"
-
+        # TPU coordinator address for 16chip
         if [ "${{ inputs.topology }}" = "16chip" ]; then
           COORD="${JOB_NAME}-0.${JOB_NAME}-headless-svc:10011"
           echo "coordinator=${COORD}" >> "$GITHUB_OUTPUT"
@@ -187,17 +172,19 @@ jobs:
           app=ci-sglang ci-task=profiling --overwrite
 
     - name: Deploy job
+      env:
+        PROFILE_DIR: ${{ steps.config.outputs.profile_dir }}
       run: |
         export JOB_NAME="${{ steps.config.outputs.job_name }}"
         export BRANCH="${{ inputs.branch }}"
-        export MODEL_PATH="${{ inputs.model_path }}"
-        export TP_SIZE="${{ inputs.tp_size }}"
         export SERVER_ARGS="${{ inputs.server_args }}"
-        export TASK_COMMAND="${{ steps.config.outputs.task_command }}"
         export TASK_TYPE="profiling"
         export GITHUB_ACTOR="${{ steps.config.outputs.actor_safe }}"
         export ACTIVE_DEADLINE="7200"
         export EXTRA_DEPS=""
+
+        # Task: trigger profiling + send traffic concurrently
+        export TASK_COMMAND="curl -sf -X POST 'http://127.0.0.1:30271/start_profile' -H 'Content-Type: application/json' -d '{\"output_dir\": \"${PROFILE_DIR}\", \"num_steps\": ${{ inputs.num_steps }}}' & PROFILE_PID=\$! && sleep 5 && python3 -m sgl_jax.bench_serving ${{ inputs.traffic_args }} && wait \$PROFILE_PID && echo '=== Profile saved to: ${PROFILE_DIR} ==='"
 
         if [ "${{ inputs.topology }}" = "16chip" ]; then
           export TPU_COORDINATOR_ADDRESS="${{ steps.config.outputs.coordinator }}"

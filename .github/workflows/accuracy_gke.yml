@@ -6,51 +6,44 @@ on:
       branch:
         description: "Branch to test"
         required: true
-        default: "epic/mimo-v2-flash"
-      model_path:
-        description: "Model path (HuggingFace ID or /models/...)"
-        required: true
-        default: "XiaomiMiMo/MiMo-V2-Flash"
+        default: "exp/scatter-optimization"
       topology:
         description: "TPU topology"
         required: true
         type: choice
         options:
-          - "4chip"
           - "16chip"
-        default: "4chip"
-      tp_size:
-        description: "Tensor parallel size"
-        required: true
-        default: "4"
-      datasets:
-        description: "Evaluation datasets (comma-separated)"
-        required: true
-        default: "gsm8k"
-      eval_batch_size:
-        description: "Evaluation batch size"
-        required: true
-        default: "32"
-      temperature:
-        description: "Generation temperature"
-        required: true
-        default: "0.8"
-      top_p:
-        description: "Generation top_p"
-        required: true
-        default: "0.95"
-      max_tokens:
-        description: "Max generation tokens (0 = use default)"
-        required: false
-        default: "0"
+          - "4chip"
+        default: "16chip"
       server_args:
-        description: "Extra sglang server args (e.g. --max-seq-len 32768)"
-        required: false
-        default: ""
-      extra_eval_args:
-        description: "Extra evalscope args (e.g. --limit 100)"
-        required: false
-        default: ""
+        description: "sglang server launch args (all flags except --host/--port/--nnodes/--node-rank/--dist-init-addr)"
+        required: true
+        default: >-
+          --model-path /models/MiMo-V2-Flash
+          --trust-remote-code
+          --tp-size 16 --dp-size 4 --ep-size 16
+          --moe-backend fused
+          --page-size 256
+          --context-length 262144
+          --disable-radix-cache
+          --chunked-prefill-size 2048
+          --dtype bfloat16
+          --mem-fraction-static 0.95
+          --swa-full-tokens-ratio 0.2
+          --skip-server-warmup
+          --log-level info
+          --max-running-requests 128
+      eval_args:
+        description: "evalscope eval args (all flags)"
+        required: true
+        default: >-
+          --model XiaomiMiMo/MiMo-V2-Flash
+          --api-url http://127.0.0.1:30271/v1/chat/completions
+          --api-key EMPTY
+          --eval-type service
+          --datasets gsm8k
+          --eval-batch-size 32
+          --generation-config '{"temperature":0.8,"top_p":0.95}'
 
 permissions:
   actions: read
@@ -59,7 +52,7 @@ permissions:
 
 jobs:
   accuracy:
-    name: "Accuracy (${{ inputs.topology }}, ${{ inputs.datasets }})"
+    name: "Accuracy (${{ inputs.topology }})"
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -100,25 +93,6 @@ jobs:
           | sed 's/[^a-z0-9._-]/-/g' | sed 's/^[^a-z0-9]*//' | sed 's/[^a-z0-9]*$//' | head -c 63)
         ACTOR_SAFE="${ACTOR_SAFE:-unknown}"
         echo "actor_safe=${ACTOR_SAFE}" >> "$GITHUB_OUTPUT"
-
-        # Build generation config JSON
-        GEN_CONFIG="{\"temperature\": ${{ inputs.temperature }},\"top_p\":${{ inputs.top_p }}"
-        if [ "${{ inputs.max_tokens }}" != "0" ]; then
-          GEN_CONFIG+=",\"max_tokens\":${{ inputs.max_tokens }}"
-        fi
-        GEN_CONFIG+="}"
-
-        # Build task command
-        TASK_CMD="evalscope eval"
-        TASK_CMD+=" --model ${{ inputs.model_path }}"
-        TASK_CMD+=" --api-url http://127.0.0.1:30271/v1/chat/completions"
-        TASK_CMD+=" --api-key EMPTY"
-        TASK_CMD+=" --eval-type service"
-        TASK_CMD+=" --datasets ${{ inputs.datasets }}"
-        TASK_CMD+=" --eval-batch-size ${{ inputs.eval_batch_size }}"
-        TASK_CMD+=" --generation-config '${GEN_CONFIG}'"
-        TASK_CMD+=" ${{ inputs.extra_eval_args }}"
-        echo "task_command=${TASK_CMD}" >> "$GITHUB_OUTPUT"
 
         # TPU coordinator address for 16chip
         if [ "${{ inputs.topology }}" = "16chip" ]; then
@@ -189,10 +163,8 @@ jobs:
       run: |
         export JOB_NAME="${{ steps.config.outputs.job_name }}"
         export BRANCH="${{ inputs.branch }}"
-        export MODEL_PATH="${{ inputs.model_path }}"
-        export TP_SIZE="${{ inputs.tp_size }}"
         export SERVER_ARGS="${{ inputs.server_args }}"
-        export TASK_COMMAND="${{ steps.config.outputs.task_command }}"
+        export TASK_COMMAND="evalscope eval ${{ inputs.eval_args }}"
         export TASK_TYPE="accuracy"
         export GITHUB_ACTOR="${{ steps.config.outputs.actor_safe }}"
         export ACTIVE_DEADLINE="10800"

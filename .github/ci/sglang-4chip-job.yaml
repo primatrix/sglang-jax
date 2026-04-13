@@ -76,16 +76,12 @@ spec:
           fi
 
           # 4. Start sglang server in background
-          python3 -m sgl_jax.launch_server \
-            --model-path "${MODEL_PATH}" \
+          python -u -m sgl_jax.launch_server \
             --host 0.0.0.0 \
             --port 30271 \
-            --tp-size ${TP_SIZE} \
-            --device tpu \
-            --trust-remote-code \
-            --dist-init-addr 0.0.0.0:10011 \
             --nnodes 1 \
             --node-rank 0 \
+            --dist-init-addr 0.0.0.0:10011 \
             ${SERVER_ARGS} &
           SERVER_PID=$!
 
@@ -119,10 +115,6 @@ spec:
 
           exit $TASK_EXIT
         env:
-        - name: MODEL_PATH
-          value: "${MODEL_PATH}"
-        - name: TP_SIZE
-          value: "${TP_SIZE}"
         - name: SERVER_ARGS
           value: "${SERVER_ARGS}"
         - name: EXTRA_DEPS

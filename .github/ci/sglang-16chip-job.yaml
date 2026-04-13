@@ -94,16 +94,12 @@ spec:
           # 5. Start sglang server
           #    - Node 0 runs full stack (HTTP + scheduler)
           #    - Nodes 1-3 run scheduler only
-          python3 -m sgl_jax.launch_server \
-            --model-path "${MODEL_PATH}" \
+          python -u -m sgl_jax.launch_server \
             --host 0.0.0.0 \
             --port 30271 \
-            --tp-size ${TP_SIZE} \
-            --device tpu \
-            --trust-remote-code \
-            --dist-init-addr "${COORDINATOR_ADDR}" \
             --nnodes ${NNODES} \
             --node-rank ${NODE_RANK} \
+            --dist-init-addr "${COORDINATOR_ADDR}" \
             ${SERVER_ARGS} &
           SERVER_PID=$!
 
@@ -141,10 +137,6 @@ spec:
             wait $SERVER_PID
           fi
         env:
-        - name: MODEL_PATH
-          value: "${MODEL_PATH}"
-        - name: TP_SIZE
-          value: "${TP_SIZE}"
         - name: SERVER_ARGS
           value: "${SERVER_ARGS}"
         - name: EXTRA_DEPS
