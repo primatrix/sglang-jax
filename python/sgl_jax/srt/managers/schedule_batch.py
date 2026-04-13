@@ -1335,11 +1335,14 @@ class ScheduleBatch:
         )
 
         if self.forward_mode is not None and self.forward_mode.is_decode():
+            # Evict every page_size steps to keep SWA pool from accumulating stale slots.
+            # Using page_size as the interval aligns with allocation granularity.
+            evict_interval = max(page_size, 1)
             for dp_rank, info in enumerate(self.reqs_info):
                 if not info.reqs:
                     continue
                 for req in info.reqs:
-                    if req.decode_batch_idx % sliding_window_size == 1:
+                    if req.decode_batch_idx % evict_interval == 1:
                         self._evict_swa(
                             req, req.seqlen - 1, sliding_window_size, page_size, dp_rank
                         )

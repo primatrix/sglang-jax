@@ -386,27 +386,32 @@ class ModelRunner(BaseModelRunner):
         head_dim = self.model_config.head_dim
         head_dim_aligned = (head_dim + 127) // 128 * 128
 
-
-        def adjust_layer_num():
-            # 0 for full attention, 1 for swa
-            full,swa=0,0
-            if getattr(self.model_config.hf_text_config, "hybrid_layer_pattern",None):
-                for pattern in self.model_config.hf_text_config.hybrid_layer_pattern:
-                    if pattern==0:
-                        full+=1
-                    elif pattern==1:
-                        swa+=1
-                return (self.model_config.hf_text_config.swa_num_key_value_heads//self.model_config.hf_text_config.num_key_value_heads)*swa+full
+        def compute_cell_size():
+            """Compute per-token KV cache size across all layers, accounting for
+            SWA layers potentially having different KV head counts."""
+            hf_config = self.model_config.hf_text_config
+            hybrid_pattern = getattr(hf_config, "hybrid_layer_pattern", None)
+            if hybrid_pattern is not None:
+                swa_kv_heads = getattr(
+                    hf_config, "swa_num_key_value_heads", hf_config.num_key_value_heads
+                )
+                fa_kv_heads = hf_config.num_key_value_heads
+                # Apply TP division
+                fa_kv_heads_tp = fa_kv_heads // self.attention_tp_size
+                swa_kv_heads_tp = swa_kv_heads // self.attention_tp_size
+                full_layers = sum(1 for p in hybrid_pattern if p == 0)
+                swa_layers = sum(1 for p in hybrid_pattern if p == 1)
+                total_head_layers = fa_kv_heads_tp * full_layers + swa_kv_heads_tp * swa_layers
             else:
-                return self.model_config.num_hidden_layers 
+                total_head_layers = (
+                    self.model_config.get_num_kv_heads(self.attention_tp_size)
+                    * self.model_config.num_hidden_layers
+                )
+            return (
+                total_head_layers * head_dim_aligned * 2 * jnp.dtype(self.kv_cache_dtype).itemsize
+            )
 
-        cell_size = (
-            self.model_config.get_num_kv_heads(self.attention_tp_size)
-            * head_dim_aligned
-            * adjust_layer_num()
-            * 2
-            * jnp.dtype(self.kv_cache_dtype).itemsize
-        )
+        cell_size = compute_cell_size()
 
         # Calculate max tokens that can fit in available memory
         max_tokens = max(1, int(available_kv_cache_bytes // cell_size))
