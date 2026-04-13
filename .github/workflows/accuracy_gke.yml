@@ -63,10 +63,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
-    - name: Checkout
+    - name: Checkout (workflow repo for K8s templates)
       uses: actions/checkout@v4
-      with:
-        ref: ${{ inputs.branch }}
 
     - name: Authenticate to GCP
       uses: google-github-actions/auth@v2
