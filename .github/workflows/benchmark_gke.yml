@@ -1,0 +1,289 @@
+name: Benchmark (GKE)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to benchmark"
+        required: true
+        default: "epic/mimo-v2-flash"
+      model_path:
+        description: "Model path (HuggingFace ID or /models/...)"
+        required: true
+        default: "XiaomiMiMo/MiMo-V2-Flash"
+      topology:
+        description: "TPU topology"
+        required: true
+        type: choice
+        options:
+          - "4chip"
+          - "16chip"
+        default: "4chip"
+      tp_size:
+        description: "Tensor parallel size"
+        required: true
+        default: "4"
+      backend:
+        description: "Benchmark backend"
+        required: true
+        default: "sgl-jax"
+      dataset_name:
+        description: "Dataset name"
+        required: true
+        default: "random"
+      random_input_len:
+        description: "Random input length"
+        required: true
+        default: "16384"
+      random_output_len:
+        description: "Random output length"
+        required: true
+        default: "1024"
+      random_range_ratio:
+        description: "Random range ratio"
+        required: true
+        default: "1.0"
+      request_rate:
+        description: "Request rate"
+        required: true
+        default: "100"
+      num_prompts:
+        description: "Number of prompts"
+        required: true
+        default: "256"
+      max_concurrency:
+        description: "Max concurrency"
+        required: true
+        default: "64"
+      seed:
+        description: "Random seed"
+        required: true
+        default: "12345"
+      server_args:
+        description: "Extra sglang server args (e.g. --max-seq-len 32768)"
+        required: false
+        default: ""
+      extra_bench_args:
+        description: "Extra bench_serving args (e.g. --warmup-requests 10)"
+        required: false
+        default: ""
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+jobs:
+  benchmark:
+    name: "Benchmark (${{ inputs.topology }}, tp=${{ inputs.tp_size }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.branch }}
+
+    - name: Authenticate to GCP
+      uses: google-github-actions/auth@v2
+      with:
+        workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+    - name: Get GKE credentials
+      uses: google-github-actions/get-gke-credentials@v2
+      with:
+        cluster_name: ${{ secrets.GKE_CLUSTER }}
+        location: ${{ secrets.GKE_LOCATION }}
+
+    - name: Cleanup stale resources
+      run: |
+        echo "Cleaning up completed/failed jobs..."
+        for job in $(kubectl get jobs -l app=ci-sglang,ci-task=benchmark \
+          -o jsonpath='{.items[?(@.status.conditions[*].type)].metadata.name}' 2>/dev/null); do
+          echo "Deleting finished job: $job"
+          kubectl delete job "$job" --ignore-not-found
+          kubectl delete service "${job}-headless-svc" --ignore-not-found
+          kubectl delete secret "${job}-token" --ignore-not-found
+        done
+
+    - name: Configure job
+      id: config
+      run: |
+        TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+        JOB_NAME="bench-${TIMESTAMP}-${GITHUB_RUN_NUMBER}"
+        echo "job_name=${JOB_NAME}" >> "$GITHUB_OUTPUT"
+
+        # Sanitize actor name for K8s labels
+        ACTOR_SAFE=$(echo "${{ github.actor }}" | tr '[:upper:]' '[:lower:]' \
+          | sed 's/[^a-z0-9._-]/-/g' | sed 's/^[^a-z0-9]*//' | sed 's/[^a-z0-9]*$//' | head -c 63)
+        ACTOR_SAFE="${ACTOR_SAFE:-unknown}"
+        echo "actor_safe=${ACTOR_SAFE}" >> "$GITHUB_OUTPUT"
+
+        # Build task command
+        TASK_CMD="python3 -m sgl_jax.bench_serving"
+        TASK_CMD+=" --backend ${{ inputs.backend }}"
+        TASK_CMD+=" --host 127.0.0.1 --port 30271"
+        TASK_CMD+=" --dataset-name ${{ inputs.dataset_name }}"
+        TASK_CMD+=" --random-input-len ${{ inputs.random_input_len }}"
+        TASK_CMD+=" --random-output-len ${{ inputs.random_output_len }}"
+        TASK_CMD+=" --random-range-ratio ${{ inputs.random_range_ratio }}"
+        TASK_CMD+=" --flush-cache --seed ${{ inputs.seed }}"
+        TASK_CMD+=" --request-rate ${{ inputs.request_rate }}"
+        TASK_CMD+=" --num-prompts ${{ inputs.num_prompts }}"
+        TASK_CMD+=" --max-concurrency ${{ inputs.max_concurrency }}"
+        TASK_CMD+=" ${{ inputs.extra_bench_args }}"
+        echo "task_command=${TASK_CMD}" >> "$GITHUB_OUTPUT"
+
+        # TPU coordinator address for 16chip
+        if [ "${{ inputs.topology }}" = "16chip" ]; then
+          COORD="${JOB_NAME}-0.${JOB_NAME}-headless-svc:10011"
+          echo "coordinator=${COORD}" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Wait for TPU queue slot
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        MAX_CONCURRENT=4
+        MAX_PER_ACTOR=2
+        MAX_QUEUE_DEPTH=6
+        MY_RUN=${{ github.run_number }}
+        ACTOR="${{ github.actor }}"
+        ACTOR_SAFE="${{ steps.config.outputs.actor_safe }}"
+        REPO="${{ github.repository }}"
+        WORKFLOW="benchmark_gke.yml"
+        TASK_LABEL="benchmark"
+
+        WAITING=$(gh api "repos/${REPO}/actions/workflows/${WORKFLOW}/runs?status=in_progress" \
+          --jq '.total_count' 2>/dev/null || echo 0)
+        if [ "$WAITING" -gt "$MAX_QUEUE_DEPTH" ]; then
+          echo "::error::Queue depth exceeded ($WAITING > $MAX_QUEUE_DEPTH). Please retry later."
+          exit 1
+        fi
+
+        echo "Run #${MY_RUN} by ${ACTOR}: waiting for queue slot (max $MAX_CONCURRENT concurrent, $MAX_PER_ACTOR per actor)..."
+
+        while true; do
+          ACTIVE=$(kubectl get jobs -l "app=ci-sglang,ci-task=$TASK_LABEL" -o json | \
+            jq '[.items[] | select(
+              (.status.conditions // [] | map(select(.type == "Complete" or .type == "Failed")) | length) == 0
+            )] | length')
+          MY_ACTIVE=$(kubectl get jobs -l "app=ci-sglang,ci-task=$TASK_LABEL,ci-actor=$ACTOR_SAFE" -o json | \
+            jq '[.items[] | select(
+              (.status.conditions // [] | map(select(.type == "Complete" or .type == "Failed")) | length) == 0
+            )] | length')
+
+          echo "--- Queue status ($(date -u +%H:%M:%S)) ---"
+          echo "  K8s active jobs: $ACTIVE/$MAX_CONCURRENT"
+          echo "  Your active jobs: $MY_ACTIVE/$MAX_PER_ACTOR ($ACTOR)"
+          echo "---"
+
+          if [ "$ACTIVE" -lt "$MAX_CONCURRENT" ] && [ "$MY_ACTIVE" -lt "$MAX_PER_ACTOR" ]; then
+            echo "Queue slot available. Proceeding!"
+            break
+          fi
+
+          if [ "$MY_ACTIVE" -ge "$MAX_PER_ACTOR" ]; then
+            echo "Waiting: you ($ACTOR) already have $MY_ACTIVE/$MAX_PER_ACTOR job(s) running."
+          else
+            echo "Waiting: queue full ($ACTIVE/$MAX_CONCURRENT active)."
+          fi
+          sleep 30
+        done
+
+    - name: Create K8s secret
+      run: |
+        kubectl create secret generic "${{ steps.config.outputs.job_name }}-token" \
+          --from-literal=token="${{ github.token }}" \
+          --dry-run=client -o yaml | kubectl apply -f -
+        kubectl label secret "${{ steps.config.outputs.job_name }}-token" \
+          app=ci-sglang ci-task=benchmark --overwrite
+
+    - name: Deploy job
+      run: |
+        export JOB_NAME="${{ steps.config.outputs.job_name }}"
+        export BRANCH="${{ inputs.branch }}"
+        export MODEL_PATH="${{ inputs.model_path }}"
+        export TP_SIZE="${{ inputs.tp_size }}"
+        export SERVER_ARGS="${{ inputs.server_args }}"
+        export TASK_COMMAND="${{ steps.config.outputs.task_command }}"
+        export TASK_TYPE="benchmark"
+        export GITHUB_ACTOR="${{ steps.config.outputs.actor_safe }}"
+        export ACTIVE_DEADLINE="7200"
+        export EXTRA_DEPS=""
+
+        if [ "${{ inputs.topology }}" = "16chip" ]; then
+          export TPU_COORDINATOR_ADDRESS="${{ steps.config.outputs.coordinator }}"
+          envsubst < .github/ci/sglang-16chip-job.yaml | kubectl apply -f -
+        else
+          envsubst < .github/ci/sglang-4chip-job.yaml | kubectl apply -f -
+        fi
+
+    - name: Wait for pods
+      run: |
+        echo "Waiting for pods to start..."
+        for i in $(seq 1 60); do
+          RUNNING=$(kubectl get pods -l job-name=${{ steps.config.outputs.job_name }} \
+            --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
+          EXPECTED=1
+          if [ "${{ inputs.topology }}" = "16chip" ]; then
+            EXPECTED=4
+          fi
+          if [ "$RUNNING" -ge "$EXPECTED" ]; then
+            echo "All $EXPECTED pods are running"
+            break
+          fi
+          echo "  Running: $RUNNING / $EXPECTED"
+          sleep 10
+        done
+
+    # Re-authenticate before long-running log stream
+    - name: Re-authenticate to GCP
+      uses: google-github-actions/auth@v2
+      with:
+        workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+    - name: Re-get GKE credentials
+      uses: google-github-actions/get-gke-credentials@v2
+      with:
+        cluster_name: ${{ secrets.GKE_CLUSTER }}
+        location: ${{ secrets.GKE_LOCATION }}
+
+    - name: Stream logs
+      run: |
+        # Stream from coordinator pod (index 0)
+        kubectl logs -f "job/${{ steps.config.outputs.job_name }}" \
+          -c sglang-tpu --tail=1000 || true
+
+    # Re-authenticate after log stream
+    - name: Re-authenticate to GCP (post-logs)
+      if: always()
+      uses: google-github-actions/auth@v2
+      with:
+        workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+    - name: Re-get GKE credentials (post-logs)
+      if: always()
+      uses: google-github-actions/get-gke-credentials@v2
+      with:
+        cluster_name: ${{ secrets.GKE_CLUSTER }}
+        location: ${{ secrets.GKE_LOCATION }}
+
+    - name: Wait for completion
+      run: |
+        kubectl wait --for=condition=complete "job/${{ steps.config.outputs.job_name }}" \
+          --timeout=600s 2>/dev/null && echo "JOB SUCCEEDED" || {
+          kubectl wait --for=condition=failed "job/${{ steps.config.outputs.job_name }}" \
+            --timeout=10s 2>/dev/null && echo "JOB FAILED" && exit 1
+          echo "JOB TIMED OUT" && exit 1
+        }
+
+    - name: Cleanup
+      if: always()
+      run: |
+        kubectl delete job "${{ steps.config.outputs.job_name }}" --ignore-not-found
+        kubectl delete service "${{ steps.config.outputs.job_name }}-headless-svc" --ignore-not-found
+        kubectl delete secret "${{ steps.config.outputs.job_name }}-token" --ignore-not-found

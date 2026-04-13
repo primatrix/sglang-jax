@@ -1,0 +1,178 @@
+# CI sglang-jax Job (4 chips) - K8s Manifests
+# 1 pod x 4 TPU chips = 4 chips, topology 2x2
+# Rendered by envsubst with:
+#   $JOB_NAME $BRANCH $MODEL_PATH $TP_SIZE $SERVER_ARGS
+#   $TASK_COMMAND $GITHUB_ACTOR $ACTIVE_DEADLINE
+---
+# Headless Service for DNS resolution
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${JOB_NAME}-headless-svc
+  namespace: default
+  labels:
+    app: ci-sglang
+spec:
+  clusterIP: None
+  selector:
+    job-name: ${JOB_NAME}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+  namespace: default
+  labels:
+    app: ci-sglang
+    ci-actor: ${GITHUB_ACTOR}
+    ci-task: ${TASK_TYPE}
+    job-name: ${JOB_NAME}
+spec:
+  backoffLimit: 0
+  completionMode: Indexed
+  completions: 1
+  parallelism: 1
+  activeDeadlineSeconds: ${ACTIVE_DEADLINE}
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      annotations:
+        gke-gcsfuse/volumes: "true"
+      labels:
+        app: ci-sglang
+        job-name: ${JOB_NAME}
+    spec:
+      containers:
+      - name: sglang-tpu
+        image: python:3.12
+        imagePullPolicy: IfNotPresent
+        command:
+        - bash
+        - -c
+        - |
+          set -ex
+
+          # 1. Clone branch
+          set +x
+          git clone --depth=1 --branch="${BRANCH}" \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/primatrix/sglang-jax.git" \
+            /root/sglang-jax
+          set -x
+          cd /root/sglang-jax
+
+          # 2. Setup Python environment
+          mkdir -p /tmp/ramdisk/logs
+          export UV_CACHE_DIR="/tmp/ramdisk/uv_cache"
+          export TMPDIR="/tmp/ramdisk"
+          pip install uv
+          uv venv /tmp/ramdisk/venv
+          source /tmp/ramdisk/venv/bin/activate
+          uv pip install pip
+          uv pip install -e "python[tpu]"
+
+          # 3. Install extra deps if specified
+          if [ -n "${EXTRA_DEPS}" ]; then
+            uv pip install ${EXTRA_DEPS}
+          fi
+
+          # 4. Start sglang server in background
+          python3 -m sgl_jax.launch_server \
+            --model-path "${MODEL_PATH}" \
+            --host 0.0.0.0 \
+            --port 30271 \
+            --tp-size ${TP_SIZE} \
+            --device tpu \
+            --trust-remote-code \
+            --dist-init-addr 0.0.0.0:10011 \
+            --nnodes 1 \
+            --node-rank 0 \
+            ${SERVER_ARGS} &
+          SERVER_PID=$!
+
+          # 5. Wait for server to be ready
+          echo "Waiting for server to be ready..."
+          for i in $(seq 1 120); do
+            if curl -sf http://127.0.0.1:30271/health > /dev/null 2>&1; then
+              echo "Server is ready after ${i}0 seconds"
+              break
+            fi
+            if ! kill -0 $SERVER_PID 2>/dev/null; then
+              echo "ERROR: Server process died"
+              exit 1
+            fi
+            sleep 10
+          done
+
+          if ! curl -sf http://127.0.0.1:30271/health > /dev/null 2>&1; then
+            echo "ERROR: Server failed to start within 1200s"
+            kill $SERVER_PID 2>/dev/null || true
+            exit 1
+          fi
+
+          # 6. Run the task command (benchmark / eval / profiling)
+          eval "${TASK_COMMAND}"
+          TASK_EXIT=$?
+
+          # 7. Shutdown server
+          kill $SERVER_PID 2>/dev/null || true
+          wait $SERVER_PID 2>/dev/null || true
+
+          exit $TASK_EXIT
+        env:
+        - name: MODEL_PATH
+          value: "${MODEL_PATH}"
+        - name: TP_SIZE
+          value: "${TP_SIZE}"
+        - name: SERVER_ARGS
+          value: "${SERVER_ARGS}"
+        - name: EXTRA_DEPS
+          value: "${EXTRA_DEPS}"
+        - name: TASK_COMMAND
+          value: "${TASK_COMMAND}"
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: ${JOB_NAME}-token
+              key: token
+        - name: PIP_CACHE_DIR
+          value: /tmp/ramdisk/.cache/pip
+        - name: JAX_COMPILATION_CACHE_DIR
+          value: /tmp/jit_cache
+        - name: HF_HOME
+          value: /models/huggingface
+        resources:
+          limits:
+            google.com/tpu: "4"
+          requests:
+            ephemeral-storage: 20Gi
+            google.com/tpu: "4"
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - mountPath: /models
+          name: gcs-fuse-csi-ephemeral
+        - mountPath: /tmp/ramdisk
+          name: tmpfs
+        - mountPath: /dev/shm
+          name: dshm
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: "2x2"
+      restartPolicy: Never
+      serviceAccountName: gcs-account
+      subdomain: ${JOB_NAME}-headless-svc
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 200Gi
+        name: tmpfs
+      - emptyDir:
+          medium: Memory
+        name: gke-gcsfuse-cache
+      - name: gcs-fuse-csi-ephemeral
+        persistentVolumeClaim:
+          claimName: inference-model-storage-poc-tpu-hns-pvc
+      - name: dshm
+        emptyDir:
+          medium: Memory
