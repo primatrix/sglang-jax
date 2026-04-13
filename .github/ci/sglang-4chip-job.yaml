@@ -131,7 +131,7 @@ spec:
         - name: JAX_COMPILATION_CACHE_DIR
           value: /tmp/jit_cache
         - name: HF_HOME
-          value: /models/huggingface
+          value: /tmp/ramdisk/huggingface
         resources:
           limits:
             google.com/tpu: "4"
