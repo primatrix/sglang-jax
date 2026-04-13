@@ -171,7 +171,7 @@ jobs:
         export GITHUB_ACTOR="${{ steps.config.outputs.actor_safe }}"
         export ACTIVE_DEADLINE="10800"
         export EXTRA_DEPS="evalscope==0.17.1"
-        export RESULTS_PATH=""
+        export RESULTS_PATH="/inference-models/workflow/MiMo-V2-Flash/accuracy/workflow-${{ github.run_number }}"
         export GITHUB_RUN_NUMBER="${{ github.run_number }}"
         export TOPOLOGY="${{ inputs.topology }}"
 
