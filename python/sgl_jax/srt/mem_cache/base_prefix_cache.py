@@ -77,6 +77,10 @@ class BasePrefixCache(abc.ABC):
     def swa_protected_size(self):
         return 0
 
+    def free_swa(self, free_index, dp_rank: int = 0, **kwargs):
+        """Free SWA pool slots. Override in SWARadixCache to also tombstone tree nodes."""
+        self.token_to_kv_pool_allocator.free_swa(free_index, dp_rank=dp_rank)
+
     def total_size(self):
         raise NotImplementedError()
 

@@ -1377,7 +1377,18 @@ class ScheduleBatch:
         free_slots = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, req.swa_evicted_seqlen : new_evicted
         ]
-        self.token_to_kv_pool_allocator.free_swa(free_slots, dp_rank=dp_rank)
+        # Free via cache layer so SWARadixCache can tombstone affected tree nodes.
+        # ChunkCache's free_swa just forwards to allocator.free_swa.
+        if self.tree_cache is not None:
+            token_ids = req.origin_input_ids + req.output_ids
+            self.tree_cache.free_swa(
+                free_slots,
+                dp_rank=dp_rank,
+                key=token_ids,
+                swa_evicted_seqlen=new_evicted,
+            )
+        else:
+            self.token_to_kv_pool_allocator.free_swa(free_slots, dp_rank=dp_rank)
         req.swa_evicted_seqlen = new_evicted
 
     def prepare_for_decode(self):
