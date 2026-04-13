@@ -4,6 +4,7 @@
 #   $JOB_NAME $BRANCH $SERVER_ARGS $TASK_COMMAND
 #   $TASK_TYPE $GITHUB_ACTOR $ACTIVE_DEADLINE
 #   $TPU_COORDINATOR_ADDRESS $EXTRA_DEPS
+#   $RESULTS_PATH $GITHUB_RUN_NUMBER $TOPOLOGY
 ---
 # Headless Service for TPU pod DNS resolution (required for JAX multi-host)
 apiVersion: v1
@@ -121,17 +122,43 @@ spec:
               exit 1
             fi
 
-            # Run the task command
-            eval "${TASK_COMMAND}"
-            TASK_EXIT=$?
+            # Run the task command and capture output
+            set +e
+            eval "${TASK_COMMAND}" 2>&1 | tee /tmp/task_output.txt
+            TASK_EXIT=${PIPESTATUS[0]}
+            set -e
+
+            # Save results to GCS if RESULTS_PATH is set
+            if [ -n "${RESULTS_PATH}" ]; then
+              mkdir -p "${RESULTS_PATH}"
+              cp /tmp/task_output.txt "${RESULTS_PATH}/output.txt"
+              TASK_EXIT_VAL=$TASK_EXIT python3 -c "
+            import json, os, datetime
+            meta = {
+                'run_number': os.environ.get('GITHUB_RUN_NUMBER', ''),
+                'branch': os.environ.get('BRANCH', ''),
+                'topology': os.environ.get('TOPOLOGY', ''),
+                'server_args': os.environ.get('SERVER_ARGS', ''),
+                'task_command': os.environ.get('TASK_COMMAND', ''),
+                'task_type': os.environ.get('TASK_TYPE', ''),
+                'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
+                'exit_code': int(os.environ.get('TASK_EXIT_VAL', '-1'))
+            }
+            with open(os.environ['RESULTS_PATH'] + '/metadata.json', 'w') as f:
+                json.dump(meta, f, indent=2)
+            print('Results saved to: ' + os.environ['RESULTS_PATH'])
+            "
+            fi
 
             # Shutdown server
             kill $SERVER_PID 2>/dev/null || true
             wait $SERVER_PID 2>/dev/null || true
             exit $TASK_EXIT
           else
-            # 7. Worker: just wait for server process to finish
+            # 7. Worker: wait for server, force-exit if hung
+            set +e
             wait $SERVER_PID
+            exit 0
           fi
         env:
         - name: SERVER_ARGS
@@ -140,6 +167,16 @@ spec:
           value: "${EXTRA_DEPS}"
         - name: TASK_COMMAND
           value: "${TASK_COMMAND}"
+        - name: TASK_TYPE
+          value: "${TASK_TYPE}"
+        - name: BRANCH
+          value: "${BRANCH}"
+        - name: RESULTS_PATH
+          value: "${RESULTS_PATH}"
+        - name: GITHUB_RUN_NUMBER
+          value: "${GITHUB_RUN_NUMBER}"
+        - name: TOPOLOGY
+          value: "${TOPOLOGY}"
         - name: TPU_COORDINATOR_ADDRESS
           value: "${TPU_COORDINATOR_ADDRESS}"
         - name: GITHUB_TOKEN
