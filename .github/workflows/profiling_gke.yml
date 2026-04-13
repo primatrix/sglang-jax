@@ -46,10 +46,6 @@ on:
         description: "Stages to profile (comma-separated, e.g. prefill,decode)"
         required: false
         default: "prefill,decode"
-      profile_output_dir:
-        description: "GCS output dir for profile traces"
-        required: true
-        default: "gs://inference-model-storage-poc-tpu/profiling/sglang-jax"
       traffic_args:
         description: "bench_serving args for traffic generation during profiling"
         required: true
@@ -112,7 +108,7 @@ jobs:
         ACTOR_SAFE="${ACTOR_SAFE:-unknown}"
         echo "actor_safe=${ACTOR_SAFE}" >> "$GITHUB_OUTPUT"
 
-        PROFILE_DIR="${{ inputs.profile_output_dir }}/${JOB_NAME}"
+        PROFILE_DIR="/inference-models/workflow/MiMo-V2-Flash/profiling/workflow-${GITHUB_RUN_NUMBER}"
         echo "profile_dir=${PROFILE_DIR}" >> "$GITHUB_OUTPUT"
 
         # TPU coordinator address for 16chip
