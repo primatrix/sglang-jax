@@ -186,11 +186,12 @@ jobs:
         # Task: trigger profiling + send traffic concurrently
         export TASK_COMMAND="curl -sf -X POST 'http://127.0.0.1:30271/start_profile' -H 'Content-Type: application/json' -d '{\"output_dir\": \"${PROFILE_DIR}\", \"num_steps\": ${{ inputs.num_steps }}}' & PROFILE_PID=\$! && sleep 5 && python3 -m sgl_jax.bench_serving ${{ inputs.traffic_args }} && wait \$PROFILE_PID && echo '=== Profile saved to: ${PROFILE_DIR} ==='"
 
+        VARS='$JOB_NAME $BRANCH $SERVER_ARGS $TASK_COMMAND $TASK_TYPE $GITHUB_ACTOR $ACTIVE_DEADLINE $EXTRA_DEPS $TPU_COORDINATOR_ADDRESS'
         if [ "${{ inputs.topology }}" = "16chip" ]; then
           export TPU_COORDINATOR_ADDRESS="${{ steps.config.outputs.coordinator }}"
-          envsubst < .github/ci/sglang-16chip-job.yaml | kubectl apply -f -
+          envsubst "$VARS" < .github/ci/sglang-16chip-job.yaml | kubectl apply -f -
         else
-          envsubst < .github/ci/sglang-4chip-job.yaml | kubectl apply -f -
+          envsubst "$VARS" < .github/ci/sglang-4chip-job.yaml | kubectl apply -f -
         fi
 
     - name: Wait for pods

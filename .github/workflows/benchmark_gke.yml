@@ -174,11 +174,12 @@ jobs:
         export ACTIVE_DEADLINE="7200"
         export EXTRA_DEPS=""
 
+        VARS='$JOB_NAME $BRANCH $SERVER_ARGS $TASK_COMMAND $TASK_TYPE $GITHUB_ACTOR $ACTIVE_DEADLINE $EXTRA_DEPS $TPU_COORDINATOR_ADDRESS'
         if [ "${{ inputs.topology }}" = "16chip" ]; then
           export TPU_COORDINATOR_ADDRESS="${{ steps.config.outputs.coordinator }}"
-          envsubst < .github/ci/sglang-16chip-job.yaml | kubectl apply -f -
+          envsubst "$VARS" < .github/ci/sglang-16chip-job.yaml | kubectl apply -f -
         else
-          envsubst < .github/ci/sglang-4chip-job.yaml | kubectl apply -f -
+          envsubst "$VARS" < .github/ci/sglang-4chip-job.yaml | kubectl apply -f -
         fi
 
     - name: Wait for pods
