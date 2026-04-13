@@ -1874,6 +1874,10 @@ class ScheduleBatch:
             total_cache_loc_size = cache_loc_paddings[bs_index]
 
         per_dp_cache_loc_size = total_cache_loc_size // self.dp_size
+        # Use np.empty instead of np.zeros to avoid costly page-fault zeroing on large
+        # arrays. Padding positions are safe to leave uninitialized: downstream
+        # FlashAttention kernel masks them out via seq_lens, and XLA clamps any
+        # out-of-range gather indices.
         cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
 
         offset_bs = 0
