@@ -19,7 +19,7 @@ on:
         description: "sglang server launch args (all flags except --host/--port/--nnodes/--node-rank/--dist-init-addr)"
         required: true
         default: >-
-          --model-path /models/MiMo-V2-Flash
+          --model-path /inference-models/MiMo-V2-Flash
           --trust-remote-code
           --tp-size 16 --dp-size 4 --ep-size 16
           --moe-backend fused

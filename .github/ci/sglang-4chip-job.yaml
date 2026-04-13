@@ -1,8 +1,8 @@
 # CI sglang-jax Job (4 chips) - K8s Manifests
 # 1 pod x 4 TPU chips = 4 chips, topology 2x2
 # Rendered by envsubst with:
-#   $JOB_NAME $BRANCH $MODEL_PATH $TP_SIZE $SERVER_ARGS
-#   $TASK_COMMAND $GITHUB_ACTOR $ACTIVE_DEADLINE
+#   $JOB_NAME $BRANCH $SERVER_ARGS $TASK_COMMAND
+#   $TASK_TYPE $GITHUB_ACTOR $ACTIVE_DEADLINE $EXTRA_DEPS
 ---
 # Headless Service for DNS resolution
 apiVersion: v1
@@ -61,12 +61,9 @@ spec:
           cd /root/sglang-jax
 
           # 2. Setup Python environment
-          mkdir -p /tmp/ramdisk/logs
-          export UV_CACHE_DIR="/tmp/ramdisk/uv_cache"
-          export TMPDIR="/tmp/ramdisk"
           pip install uv
-          uv venv /tmp/ramdisk/venv
-          source /tmp/ramdisk/venv/bin/activate
+          uv venv /tmp/venv
+          source /tmp/venv/bin/activate
           uv pip install pip
           uv pip install -e "python[tpu]"
 
@@ -126,12 +123,8 @@ spec:
             secretKeyRef:
               name: ${JOB_NAME}-token
               key: token
-        - name: PIP_CACHE_DIR
-          value: /tmp/ramdisk/.cache/pip
         - name: JAX_COMPILATION_CACHE_DIR
           value: /tmp/jit_cache
-        - name: HF_HOME
-          value: /tmp/ramdisk/huggingface
         resources:
           limits:
             google.com/tpu: "4"
@@ -141,12 +134,10 @@ spec:
         securityContext:
           privileged: true
         volumeMounts:
-        - mountPath: /models
-          name: gcs-fuse-csi-ephemeral
-        - mountPath: /tmp/ramdisk
-          name: tmpfs
+        - mountPath: /inference-models
+          name: model-storage
         - mountPath: /dev/shm
-          name: dshm
+          name: dev-shm
       nodeSelector:
         cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
         cloud.google.com/gke-tpu-topology: "2x2"
@@ -157,14 +148,10 @@ spec:
       volumes:
       - emptyDir:
           medium: Memory
-          sizeLimit: 200Gi
-        name: tmpfs
-      - emptyDir:
-          medium: Memory
         name: gke-gcsfuse-cache
-      - name: gcs-fuse-csi-ephemeral
+      - name: model-storage
         persistentVolumeClaim:
           claimName: inference-model-storage-poc-tpu-hns-pvc
-      - name: dshm
+      - name: dev-shm
         emptyDir:
           medium: Memory
