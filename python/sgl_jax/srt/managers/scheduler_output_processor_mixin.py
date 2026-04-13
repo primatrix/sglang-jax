@@ -107,8 +107,6 @@ class SchedulerOutputProcessorMixin:
                 if req.is_retracted:
                     continue
 
-                req.latest_bid = result.bid
-
                 if (
                     self.is_mixed_chunk and self.enable_overlap and req.finished()
                 ):  # TODO @Brian fix it
@@ -324,8 +322,6 @@ class SchedulerOutputProcessorMixin:
                 req: Req
                 if req.is_retracted:
                     continue
-
-                req.latest_bid = result.bid
 
                 indices_to_free = None
                 if self.enable_overlap and req.finished():
