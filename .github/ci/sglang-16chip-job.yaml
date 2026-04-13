@@ -1,7 +1,7 @@
 # CI sglang-jax Job (16 chips) - K8s Manifests
 # 4 pods x 4 TPU chips = 16 chips, topology 4x4
 # Rendered by envsubst with:
-#   $JOB_NAME $BRANCH $SERVER_ARGS $TASK_COMMAND
+#   $JOB_NAME $BRANCH $SERVER_ARGS $TASK_COMMAND_B64
 #   $TASK_TYPE $GITHUB_ACTOR $ACTIVE_DEADLINE
 #   $TPU_COORDINATOR_ADDRESS $EXTRA_DEPS
 #   $RESULTS_PATH $GITHUB_RUN_NUMBER $TOPOLOGY
@@ -69,7 +69,7 @@ spec:
             '    "branch": os.environ.get("BRANCH", ""),' \
             '    "topology": os.environ.get("TOPOLOGY", ""),' \
             '    "server_args": os.environ.get("SERVER_ARGS", ""),' \
-            '    "task_command": os.environ.get("TASK_COMMAND", ""),' \
+            '    "task_command": os.environ.get("TASK_COMMAND_B64", ""),' \
             '    "task_type": os.environ.get("TASK_TYPE", ""),' \
             '    "timestamp": datetime.datetime.utcnow().isoformat() + "Z",' \
             '    "exit_code": int(os.environ.get("TASK_EXIT_VAL", "-1"))' \
@@ -139,9 +139,11 @@ spec:
               exit 1
             fi
 
-            # Run the task command and capture output
+            # Decode and run the task command
+            TASK_CMD=$(echo "$TASK_COMMAND_B64" | base64 -d)
+            echo "Running: $TASK_CMD"
             set +e
-            eval "${TASK_COMMAND}" 2>&1 | tee /tmp/task_output.txt
+            eval "$TASK_CMD" 2>&1 | tee /tmp/task_output.txt
             TASK_EXIT=${PIPESTATUS[0]}
             set -e
 
@@ -168,8 +170,8 @@ spec:
           value: "${SERVER_ARGS}"
         - name: EXTRA_DEPS
           value: "${EXTRA_DEPS}"
-        - name: TASK_COMMAND
-          value: "${TASK_COMMAND}"
+        - name: TASK_COMMAND_B64
+          value: "${TASK_COMMAND_B64}"
         - name: TASK_TYPE
           value: "${TASK_TYPE}"
         - name: BRANCH

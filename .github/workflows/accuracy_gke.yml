@@ -160,11 +160,13 @@ jobs:
           app=ci-sglang ci-task=accuracy --overwrite
 
     - name: Deploy job
+      env:
+        EVAL_ARGS: ${{ inputs.eval_args }}
       run: |
         export JOB_NAME="${{ steps.config.outputs.job_name }}"
         export BRANCH="${{ inputs.branch }}"
         export SERVER_ARGS="${{ inputs.server_args }}"
-        export TASK_COMMAND="evalscope eval ${{ inputs.eval_args }}"
+        export TASK_COMMAND_B64=$(printf '%s' "evalscope eval ${EVAL_ARGS}" | base64 -w0)
         export TASK_TYPE="accuracy"
         export GITHUB_ACTOR="${{ steps.config.outputs.actor_safe }}"
         export ACTIVE_DEADLINE="10800"
@@ -173,7 +175,7 @@ jobs:
         export GITHUB_RUN_NUMBER="${{ github.run_number }}"
         export TOPOLOGY="${{ inputs.topology }}"
 
-        VARS='$JOB_NAME $BRANCH $SERVER_ARGS $TASK_COMMAND $TASK_TYPE $GITHUB_ACTOR $ACTIVE_DEADLINE $EXTRA_DEPS $TPU_COORDINATOR_ADDRESS $RESULTS_PATH $GITHUB_RUN_NUMBER $TOPOLOGY'
+        VARS='$JOB_NAME $BRANCH $SERVER_ARGS $TASK_COMMAND_B64 $TASK_TYPE $GITHUB_ACTOR $ACTIVE_DEADLINE $EXTRA_DEPS $TPU_COORDINATOR_ADDRESS $RESULTS_PATH $GITHUB_RUN_NUMBER $TOPOLOGY'
         if [ "${{ inputs.topology }}" = "16chip" ]; then
           export TPU_COORDINATOR_ADDRESS="${{ steps.config.outputs.coordinator }}"
           envsubst "$VARS" < .github/ci/sglang-16chip-job.yaml | kubectl apply -f -
