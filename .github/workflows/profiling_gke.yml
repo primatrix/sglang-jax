@@ -54,9 +54,9 @@ on:
           --host 127.0.0.1 --port 30271
           --dataset-name random
           --random-input-len 512
-          --random-output-len 128
+          --random-output-len 32
           --random-range-ratio 1.0
-          --num-prompts 32
+          --num-prompts 8
           --warmup-requests 0
 
 permissions:
