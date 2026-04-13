@@ -53,6 +53,23 @@ spec:
         - |
           set -ex
 
+          # 0. Write metadata save script
+          printf '%s\n' 'import json, os, datetime' \
+            'meta = {' \
+            '    "run_number": os.environ.get("GITHUB_RUN_NUMBER", ""),' \
+            '    "branch": os.environ.get("BRANCH", ""),' \
+            '    "topology": os.environ.get("TOPOLOGY", ""),' \
+            '    "server_args": os.environ.get("SERVER_ARGS", ""),' \
+            '    "task_command": os.environ.get("TASK_COMMAND", ""),' \
+            '    "task_type": os.environ.get("TASK_TYPE", ""),' \
+            '    "timestamp": datetime.datetime.utcnow().isoformat() + "Z",' \
+            '    "exit_code": int(os.environ.get("TASK_EXIT_VAL", "-1"))' \
+            '}' \
+            'with open(os.environ["RESULTS_PATH"] + "/metadata.json", "w") as f:' \
+            '    json.dump(meta, f, indent=2)' \
+            'print("Results saved to: " + os.environ["RESULTS_PATH"])' \
+            > /tmp/save_metadata.py
+
           # 1. Clone branch
           set +x
           git clone --depth=1 --branch="${BRANCH}" \
@@ -113,22 +130,7 @@ spec:
           if [ -n "${RESULTS_PATH}" ]; then
             mkdir -p "${RESULTS_PATH}"
             cp /tmp/task_output.txt "${RESULTS_PATH}/output.txt"
-            TASK_EXIT_VAL=$TASK_EXIT python3 -c "
-          import json, os, datetime
-          meta = {
-              'run_number': os.environ.get('GITHUB_RUN_NUMBER', ''),
-              'branch': os.environ.get('BRANCH', ''),
-              'topology': os.environ.get('TOPOLOGY', ''),
-              'server_args': os.environ.get('SERVER_ARGS', ''),
-              'task_command': os.environ.get('TASK_COMMAND', ''),
-              'task_type': os.environ.get('TASK_TYPE', ''),
-              'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
-              'exit_code': int(os.environ.get('TASK_EXIT_VAL', '-1'))
-          }
-          with open(os.environ['RESULTS_PATH'] + '/metadata.json', 'w') as f:
-              json.dump(meta, f, indent=2)
-          print('Results saved to: ' + os.environ['RESULTS_PATH'])
-          "
+            TASK_EXIT_VAL=$TASK_EXIT python3 /tmp/save_metadata.py
           fi
 
           # 8. Shutdown server
