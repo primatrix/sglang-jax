@@ -105,7 +105,7 @@ class TestBenchServingDenseTp4(CustomTestCase):
                 f"### test_output_throughput_default_tp_4\n"
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
-            self.assertGreater(res["output_throughput"], 9700)
+            self.assertGreater(res["output_throughput"], 9866)
 
     def test_ttft_default_tp_4(self):
         args = get_benchmark_args(
