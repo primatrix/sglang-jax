@@ -939,38 +939,35 @@ class TestSWARadixCache(unittest.TestCase):
         self._verify_size_consistency_for(cache, "after double tombstone match")
 
     def test_new_leaf_never_tombstone(self):
-        """T14: New leaf nodes are always created as non-tombstone, even when
-        swa_evicted_seqlen >= total_prefix_length + len(key).
-
-        Before the fix, the else branch could create tombstone leaves, violating
-        the invariant that leaf nodes are never tombstones.
+        """T14: When swa_evicted_seqlen >= total_prefix_length + len(key),
+        all remaining tokens are SWA-evicted. No node is created (can't be
+        non-tombstone because SWA is gone, can't be tombstone leaf because
+        of the leaf-must-not-be-tombstone invariant). Value is freed and
+        insert returns early.
         """
         cache = self._make_small_cache(sliding_window_size=4)
         key = list(range(0, 10))
         val = self._alloc_indices(len(key))
 
         # Insert with swa_evicted_seqlen=20 (>> total_prefix_length + len(key) = 10)
-        # Before fix: this would create a tombstone leaf
-        # After fix: leaf is always non-tombstone
+        # Upstream behavior: free value, return early, no node created
         cache.insert(key, value=val, prev_prefix_len=0, swa_evicted_seqlen=20)
 
         full_total, swa_total = cache.total_size()
-        self.assertEqual(full_total, 10)
-        # Leaf is non-tombstone, so SWA is also tracked
-        self.assertEqual(swa_total, 10)
+        # No node created → tree is empty
+        self.assertEqual(full_total, 0)
+        self.assertEqual(swa_total, 0)
 
-        # Verify the leaf node is NOT a tombstone
-        child_key = cache.get_child_key_fn(RadixKey([0], None, None))
-        leaf = cache.root_node.children[child_key]
-        self.assertFalse(leaf.swa_tombstone, "Leaf node must never be tombstone")
-        self.assertEqual(len(leaf.children), 0, "Should be a leaf")
+        # Root should have no children
+        self.assertEqual(len(cache.root_node.children), 0)
 
-        self._verify_size_consistency_for(cache, "after leaf non-tombstone insert")
+        self._verify_size_consistency_for(cache, "after all-evicted insert")
 
     def test_new_leaf_never_tombstone_exact_boundary(self):
         """T15: swa_evicted_seqlen == total_prefix_length + len(key) boundary case.
 
-        This is the exact boundary where the old code would create a tombstone leaf.
+        When swa_evicted_seqlen exactly equals total_prefix_length + len(key),
+        all tokens are SWA-evicted. No node is created, value is freed.
         """
         cache = self._make_small_cache(sliding_window_size=4)
         key = list(range(0, 10))
@@ -979,14 +976,13 @@ class TestSWARadixCache(unittest.TestCase):
         # swa_evicted_seqlen == total_prefix_length(0) + len(key)(10) = 10
         cache.insert(key, value=val, prev_prefix_len=0, swa_evicted_seqlen=10)
 
-        # Verify leaf is non-tombstone
-        child_key = cache.get_child_key_fn(RadixKey([0], None, None))
-        node = cache.root_node.children[child_key]
-        self.assertFalse(node.swa_tombstone, "Leaf at exact boundary must not be tombstone")
-
         full_total, swa_total = cache.total_size()
-        self.assertEqual(full_total, 10)
-        self.assertEqual(swa_total, 10)  # non-tombstone leaf counted in SWA
+        # No node created → tree is empty
+        self.assertEqual(full_total, 0)
+        self.assertEqual(swa_total, 0)
+
+        # Root should have no children
+        self.assertEqual(len(cache.root_node.children), 0)
 
         self._verify_size_consistency_for(cache, "after exact boundary insert")
 

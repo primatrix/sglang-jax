@@ -795,17 +795,20 @@ class SWARadixCache(BasePrefixCache):
             best_value_len = len(value)
             best_last_node = node
 
-        # update time for matched nodes, and make nodes closer to root to be least recently used
-        # this allows swa to evict nodes closer to root first
-        self.full_lru_list.reset_node_and_parents_mru(best_last_node, self.root_node)
-        self.swa_lru_list.reset_node_and_parents_mru(best_last_node, self.root_node)
+        # Save the deepest matched node before traversal mutates `node`
+        last_node = node
+
+        # Reset LRU on the deepest matched node (not best_last_node), aligned with upstream.
+        # This keeps nodes beyond the safe point fresh, helping future tombstone healing.
+        self.full_lru_list.reset_node_and_parents_mru(last_node, self.root_node)
+        self.swa_lru_list.reset_node_and_parents_mru(last_node, self.root_node)
 
         # This last_access_time is for sanity check, can be deleted after validation in production
         cur_time = time.monotonic()
-        while node:
-            node.last_access_time = cur_time
+        while last_node:
+            last_node.last_access_time = cur_time
             cur_time -= 0.0001
-            node = node.parent
+            last_node = last_node.parent
 
         return value[:best_value_len], best_last_node
 
@@ -965,6 +968,14 @@ class SWARadixCache(BasePrefixCache):
                 child_key = self.get_child_key_fn(key)
 
         if len(key):
+            if swa_evicted_seqlen >= total_prefix_length + len(key):
+                # All remaining tokens SWA-evicted: can't create non-tombstone leaf
+                # (leaf-must-not-be-tombstone invariant forbids tombstone leaf).
+                # Free the incoming value and return early.
+                value_dp_rank = key.dp_rank if key.dp_rank is not None else 0
+                self.token_to_kv_pool_allocator.free(value, dp_rank=value_dp_rank)
+                return total_prefix_length
+
             if (swa_evicted_seqlen > total_prefix_length
                     and swa_evicted_seqlen < total_prefix_length + len(key)):
                 # Eviction boundary falls within the new key → split into tombstone + non-tombstone
