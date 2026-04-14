@@ -833,6 +833,10 @@ def _ragged_paged_attention_kernel_loop(
         v = k >> bitwidth
         k = pltpu.bitcast(k.astype(repack_ty), kv_dtype)
         v = pltpu.bitcast(v.astype(repack_ty), kv_dtype)
+        # Upcast sub-bf16 dtypes (e.g. FP8) to bfloat16 for MXU compute.
+        if kv_packing > 2:
+            k = k.astype(jnp.bfloat16)
+            v = v.astype(jnp.bfloat16)
         return k, v
 
     def broadcast_minor(src, shape):
@@ -1722,6 +1726,12 @@ def ragged_paged_attention(
     actual_head_dim = q.shape[2]
     actual_num_kv_heads = k.shape[1]
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
+
+    # Cast new K/V to match KV cache dtype (e.g. bf16 → fp8 for FP8 KV cache).
+    kv_cache_dtype = kv_cache_fused.dtype
+    if k.dtype != kv_cache_dtype:
+        k = k.astype(kv_cache_dtype)
+        v = v.astype(kv_cache_dtype)
 
     q, kv, attention_sink = prepare_inputs(q, k, v, attention_sink)
     kv_cache_fused_processed = prepare_kv_cache_fused(kv_cache_fused)
