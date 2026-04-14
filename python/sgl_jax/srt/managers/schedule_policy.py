@@ -147,12 +147,14 @@ class SchedulePolicy:
             prefix_ids = r.adjust_max_prefix_ids()
             extra_key = r.extra_key
             # NOTE: the prefix_indices must always be aligned with last_node
-            r.prefix_indices, r.last_node, r.last_host_node, r.host_hit_length = (
-                self.tree_cache.match_prefix(
-                    rid=r.rid,
-                    key=RadixKey(token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank),
-                )
+            match_result = self.tree_cache.match_prefix(
+                rid=r.rid,
+                key=RadixKey(token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank),
             )
+            r.prefix_indices = match_result.device_indices
+            r.last_node = match_result.last_device_node
+            r.last_host_node = match_result.last_host_node
+            r.host_hit_length = match_result.host_hit_length
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from
@@ -162,10 +164,11 @@ class SchedulePolicy:
             # threshold means we cannot use in-batch prefix caching for short prefixes.
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
             if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
-                in_batch_matching_prefixes, _, _, _ = self.waiting_queue_radix_tree.match_prefix(
+                in_batch_match_result = self.waiting_queue_radix_tree.match_prefix(
                     rid=r.rid,
                     key=RadixKey(token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank),
                 )
+                in_batch_matching_prefixes = in_batch_match_result.device_indices
                 if (
                     len(in_batch_matching_prefixes)
                     >= IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD
@@ -562,6 +565,7 @@ class PrefillAdder:
             if total_tokens >= self.rem_total_tokens_for_dp(dp_rank):
                 return AddReqResult.NO_TOKEN
             req.last_matched_prefix_len = prefix_len
+            req.cache_protected_len = prefix_len
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
             total_can_run = sum(len(v) for v in self.can_run_list.values())

@@ -1,5 +1,5 @@
 import abc
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
 import jax
 
@@ -26,6 +26,7 @@ class MatchResult(NamedTuple):
     last_device_node: TreeNode | None
     last_host_node: TreeNode | None
     host_hit_length: int = 0
+    cache_protected_len: Optional[int] = None
 
 
 class BasePrefixCache(abc.ABC):
