@@ -1874,10 +1874,7 @@ class ScheduleBatch:
             total_cache_loc_size = cache_loc_paddings[bs_index]
 
         per_dp_cache_loc_size = total_cache_loc_size // self.dp_size
-        # Use np.empty instead of np.zeros to avoid costly page-fault zeroing on large
-        # arrays. Padding positions are safe to leave uninitialized: downstream
-        # FlashAttention kernel masks them out via seq_lens, and XLA clamps any
-        # out-of-range gather indices.
+        # np.empty avoids page-fault zeroing; padding positions are masked by seq_lens downstream.
         cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
 
         offset_bs = 0
@@ -1889,13 +1886,12 @@ class ScheduleBatch:
                 offset_bs += per_dp_cache_loc_size
                 continue
 
-            # Get token indices from req_to_token pool for this DP rank
             token_indices = self.req_to_token_pool.req_to_token[info.req_pool_indices]
             seq_lens = info.seq_lens
 
             n_reqs = len(seq_lens)
             if n_reqs > 0:
-                # Vectorized: compute page-aligned offsets per request
+                # Page-aligned offsets per request
                 aligned_lens = ((seq_lens + page_size - 1) // page_size) * page_size
                 offsets = np.empty(n_reqs, dtype=np.int64)
                 offsets[0] = 0
@@ -1903,18 +1899,16 @@ class ScheduleBatch:
 
                 total_elements = seq_lens.sum()
 
-                # Build flat source indices (row, col) into token_indices
+                # Vectorized source indices: (row, col) into token_indices
                 src_row = np.repeat(np.arange(n_reqs, dtype=np.int32), seq_lens)
-                # col indices: [0..s0-1, 0..s1-1, ...] — vectorized via cumsum trick
                 cumsum = np.cumsum(seq_lens)
                 col_offsets = np.repeat(cumsum - seq_lens, seq_lens)
                 src_col = np.arange(total_elements, dtype=np.int32) - col_offsets
 
-                # Build flat destination indices
+                # Vectorized destination indices
                 dest_starts = offsets + offset_bs
                 dest_indices = np.repeat(dest_starts, seq_lens) + src_col
 
-                # Single vectorized gather and scatter
                 cache_loc_cpu[dest_indices] = token_indices[src_row, src_col]
 
             # Move to next DP rank's section (fixed stride)
