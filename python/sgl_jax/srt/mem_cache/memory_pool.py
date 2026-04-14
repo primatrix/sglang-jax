@@ -320,12 +320,32 @@ class MHATokenToKVPool(KVCache):
             self.size % self.dp_size == 0 and self.size % self.page_size == 0
         ), "Cache size must be divisible by dp_size and size must be divisible by page size"
 
+        # FP8 packing (4 values per uint32) may create fewer packed head elements
+        # than the TP degree requires. Fall back to bfloat16 when incompatible.
+        buf_dtype = self.dtype
+        packing = get_dtype_packing(buf_dtype)
+        packed_heads = self.head_num * 2 // packing
+        tp_size = self.mesh.shape.get(self.kv_partition_axis, 1)
+        if packed_heads % tp_size != 0:
+            logger.warning(
+                "KV cache dtype %s packing (%d) incompatible with TP=%d for "
+                "head_num=%d (packed_heads=%d). Falling back to bfloat16.",
+                buf_dtype,
+                packing,
+                tp_size,
+                self.head_num,
+                packed_heads,
+            )
+            buf_dtype = jnp.bfloat16
+            packing = get_dtype_packing(buf_dtype)
+            packed_heads = self.head_num * 2 // packing
+        self.dtype = buf_dtype
+
         # Hack: this shape is more friendly to rpav3
-        packing = get_dtype_packing(self.dtype)
         fused_buffer_shape = (
             (self.size + self.page_size * self.dp_size) // self.page_size,
             self.page_size,
-            self.head_num * 2 // packing,  # [K0,V0,K1,V1,...]
+            packed_heads,  # [K0,V0,K1,V1,...]
             packing,
             self.head_dim,
         )

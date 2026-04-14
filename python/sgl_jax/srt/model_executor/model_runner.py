@@ -407,7 +407,9 @@ class ModelRunner(BaseModelRunner):
             * head_dim_aligned
             * adjust_layer_num()
             * 2
-            * jnp.dtype(self.kv_cache_dtype).itemsize
+            # Use bf16 itemsize for profiling when FP8 is requested but some
+            # layers may fall back to bf16 due to TP/packing constraints.
+            * max(jnp.dtype(self.kv_cache_dtype).itemsize, jnp.dtype(jnp.bfloat16).itemsize)
         )
 
         # Calculate max tokens that can fit in available memory
