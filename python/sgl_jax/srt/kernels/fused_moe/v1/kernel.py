@@ -991,9 +991,12 @@ def _fused_ep_moe_kernel(
         if disable_a2a:
             return
         my_e_id = my_id * local_num_experts + local_e_id
-        start = 0
         src_ref = a2a_s_acc_x2_hbm
-        for recv_id in range(num_devices):
+
+        # Use fori_loop to avoid statically unrolling num_devices (16) copies
+        # in HLO, which bloats the instruction graph (same rationale as
+        # start_a2a_scatter).
+        def _gather_one_recv(recv_id, start, my_e_id=my_e_id, e_sem_id=e_sem_id):
             sz = d2e_count_x2_smem[bt_sem_id, recv_id, 0, my_e_id]
             is_local = recv_id == my_id
             local_sz = lax.select(is_local, sz, 0)
@@ -1029,7 +1032,9 @@ def _fused_ep_moe_kernel(
                     device_id_type=pltpu.DeviceIdType.MESH,
                 ).start()
 
-            start += sz
+            return start + sz
+
+        lax.fori_loop(0, num_devices, _gather_one_recv, jnp.int32(0), unroll=False)
 
     def wait_a2a_gather_send(*, bt_sem_id, e_sem_id, local_e_id):
         if disable_a2a:
@@ -2595,7 +2600,9 @@ def _fused_ep_moe_kernel(
             starts=expert_starts,
             sizes=expert_sizes,
         )
-        sync_barrier()
+        # NOTE: no extra sync_barrier() here -- all_reduce_metadata() already
+        # ends with sync_barrier() (line 852) which guarantees metadata
+        # visibility on all devices before scatter begins.
 
         wait_store_output(bt_id=bt_id - 2)
 
