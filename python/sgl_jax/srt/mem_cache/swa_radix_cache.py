@@ -1041,7 +1041,7 @@ class SWARadixCache(BasePrefixCache):
         assert v == node, f"parent does not have child key, {key}"
         # Track evictable size per DP rank
         node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
-        self.full_evictable_size_[node_dp_rank] -= len(node.value)
+        self.full_evictable_size_[node_dp_rank] -= len(node.key)
 
     def _collect_leaves(self) -> list[TreeNode]:
         ret_list = []
