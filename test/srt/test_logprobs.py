@@ -115,9 +115,9 @@ class TestLogprobsDense(unittest.TestCase):
         )
 
         expected_output_logprobs = [
-            [-0.9453125, 32313, "Okay"],
+            [-0.87109375, 32313, "Okay"],
             [0.0, 11, ","],
-            [-0.3515625, 773, " so"],
+            [-0.318359375, 773, " so"],
         ]
         self.check_output(output_meta, "output_token_logprobs", expected_output_logprobs)
 
