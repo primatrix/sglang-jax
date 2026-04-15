@@ -358,6 +358,28 @@ class ModelRunner(BaseModelRunner):
                 eagle_aux_hidden_state_layer_ids = None
             self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
 
+    def adjust_layer_num(self):
+        """For hybrid models, compute effective layer count accounting for
+        SWA layers having potentially different KV head counts."""
+        if not self.is_hybrid:
+            return self.model_config.num_hidden_layers
+
+        swa_num_kv_heads = getattr(self.model_config.hf_config, "swa_num_key_value_heads", None)
+        if swa_num_kv_heads is None:
+            return self.model_config.num_hidden_layers
+
+        num_kv_heads = self.model_config.hf_config.num_key_value_heads
+        # Compute SWA vs full layer counts from hybrid_layer_pattern
+        pattern = getattr(self.model_config.hf_config, "hybrid_layer_pattern", None)
+        if pattern is None:
+            return self.model_config.num_hidden_layers
+        swa_layers = sum(1 for p in pattern if p == 1)
+        full_layers = sum(1 for p in pattern if p == 0)
+
+        # Effective layer count weighted by KV head ratio
+        effective = (swa_num_kv_heads / num_kv_heads) * swa_layers + full_layers
+        return effective
+
     def profile_max_num_token(self, total_device_memory: int):
         """
         Profile the maximum number of tokens that can fit in memory.
@@ -378,7 +400,7 @@ class ModelRunner(BaseModelRunner):
         cell_size = (
             self.model_config.get_num_kv_heads(self.tp_size)
             * head_dim_aligned
-            * self.model_config.num_hidden_layers
+            * self.adjust_layer_num()
             * 2
             * jnp.dtype(self.kv_cache_dtype).itemsize
         )
@@ -743,7 +765,7 @@ class ModelRunner(BaseModelRunner):
         # Existing max_total_num_tokens is per layer and assume all layers have the same number of tokens.
         # - Find total # of tokens available across layers.
         # - Calculate full_max_total_num_tokens and swa_max_total_num_tokens based on the given swa_full_tokens_ratio.
-        total_tokens = self.max_total_num_tokens * self.model_config.num_hidden_layers
+        total_tokens = self.max_total_num_tokens * self.adjust_layer_num()
         full_layers_num = len(full_attention_layer_ids)
         swa_layers_num = len(swa_attention_layer_ids)
         swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
