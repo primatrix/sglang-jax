@@ -798,7 +798,6 @@ class SWARadixCache(BasePrefixCache):
         # Save the deepest matched node before traversal mutates `node`
         last_node = node
 
-        # Reset LRU on the deepest matched node (not best_last_node), aligned with upstream.
         # This keeps nodes beyond the safe point fresh, helping future tombstone healing.
         self.full_lru_list.reset_node_and_parents_mru(last_node, self.root_node)
         self.swa_lru_list.reset_node_and_parents_mru(last_node, self.root_node)

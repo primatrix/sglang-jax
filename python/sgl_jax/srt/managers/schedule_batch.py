@@ -883,8 +883,7 @@ class ScheduleBatch:
         """
         self.forward_mode = ForwardMode.EXTEND
 
-        if self.is_hybrid:
-            self.maybe_evict_swa()
+        self.maybe_evict_swa()
 
         # Process each DP rank
         for dp_rank in range(self.dp_size):
@@ -1390,7 +1389,12 @@ class ScheduleBatch:
         ), f"cache_protected_len must be page aligned, {req.cache_protected_len=}, {page_size=}"
         req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
 
-        new_evicted = max(req.swa_evicted_seqlen, pre_len - sliding_window_size)
+        # Subtract an extra page_size so the eviction frontier never reaches the
+        # radix tree insert boundary (page_floor(seq_len)). This keeps at least
+        # one page of non-evicted SWA KV for the tree to store as a non-tombstone
+        # node, preserving cache reuse in multi-turn scenarios.
+        # See also: _insert_helper defensive guard in swa_radix_cache.py.
+        new_evicted = max(req.swa_evicted_seqlen, pre_len - sliding_window_size - page_size)
         if page_size > 1:
             new_evicted = (new_evicted // page_size) * page_size
         if new_evicted <= req.swa_evicted_seqlen:
@@ -1417,8 +1421,7 @@ class ScheduleBatch:
         """
         self.forward_mode = ForwardMode.DECODE
 
-        if self.is_hybrid:
-            self.maybe_evict_swa()
+        self.maybe_evict_swa()
 
         # Process each DP rank
         for dp_rank in range(self.dp_size):
