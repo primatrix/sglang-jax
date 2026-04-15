@@ -9,9 +9,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
-from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
-    ragged_paged_attention,
-)
+from sgl_jax.srt.kernels.ragged_paged_attention import ragged_paged_attention_v3
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -34,23 +32,23 @@ class FlashAttentionMetadata:
     For each init metadata function, we will try set up them in below order
     """
 
-    num_seqs: jax.Array = None
     cu_q_lens: jax.Array = None
     cu_kv_lens: jax.Array = None
     page_indices: jax.Array = None
     seq_lens: jax.Array = None
     distribution: jax.Array = None
     custom_mask: jax.Array = None
+    swa_page_indices: jax.Array = None
 
     def tree_flatten(self):
         children = (
-            self.num_seqs,
             self.cu_q_lens,
             self.cu_kv_lens,
             self.page_indices,
             self.seq_lens,
             self.distribution,
             self.custom_mask,
+            self.swa_page_indices,
         )
 
         aux_data = {}
@@ -60,13 +58,13 @@ class FlashAttentionMetadata:
     def tree_unflatten(cls, aux_data, children):
         obj = cls.__new__(cls)
 
-        obj.num_seqs = children[0]
-        obj.cu_q_lens = children[1]
-        obj.cu_kv_lens = children[2]
-        obj.page_indices = children[3]
-        obj.seq_lens = children[4]
-        obj.distribution = children[5]
-        obj.custom_mask = children[6]
+        obj.cu_q_lens = children[0]
+        obj.cu_kv_lens = children[1]
+        obj.page_indices = children[2]
+        obj.seq_lens = children[3]
+        obj.distribution = children[4]
+        obj.custom_mask = children[5]
+        obj.swa_page_indices = children[6]
 
         return obj
 
@@ -80,12 +78,11 @@ class FlashAttention(AttentionBackend):
         num_attn_heads,
         num_kv_heads,
         head_dim,
-        vmem_limit_bytes: int = 64 * (1 << 20),  # 64MB
         page_size: int = 1,
+        attention_sink: int = 0,
         kv_partition_axis: str = "tensor",
         mesh: jax.sharding.Mesh = None,
     ):
-        self.vmem_limit_bytes = vmem_limit_bytes
         self.num_heads = num_attn_heads
         if num_kv_heads is not None:
             self.num_kv_heads = num_kv_heads
@@ -93,9 +90,11 @@ class FlashAttention(AttentionBackend):
             self.num_kv_heads = num_attn_heads
         self.head_dim = head_dim
         self.page_size = page_size
+        self.attention_sink = attention_sink
         self.kv_partition_axis = kv_partition_axis
         self.forward_metadata = nnx.data(FlashAttentionMetadata())
         self.mesh = mesh
+        self.swa_index_mapping = None
 
     def get_forward_metadata(
         self,
@@ -137,29 +136,29 @@ class FlashAttention(AttentionBackend):
             ]
         )
 
-        num_seqs = np.sum(batch.seq_lens > 0, dtype=np.int32).reshape(
-            1,
-        )
+        num_seqs_val = np.sum(batch.seq_lens > 0, dtype=np.int32).item()
 
         # Construct distribution for V2 kernel: [decode_end, prefill_end, mixed_end]
         if batch.forward_mode == ForwardMode.DECODE:
             # All sequences are decode/mixed mode
-            distribution = np.array([0, 0, num_seqs.item()], dtype=np.int32)
+            distribution = np.array([0, 0, num_seqs_val], dtype=np.int32)
         elif batch.forward_mode == ForwardMode.EXTEND:
             # All sequences are prefill mode
-            distribution = np.array([0, num_seqs.item(), num_seqs.item()], dtype=np.int32)
+            distribution = np.array([0, num_seqs_val, num_seqs_val], dtype=np.int32)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
+        # swa_page_indices placeholder (will be filled in commit 2)
+        swa_page_indices = None
+
         (
-            metadata.num_seqs,
             metadata.cu_q_lens,
             metadata.cu_kv_lens,
             metadata.page_indices,
             metadata.seq_lens,
             metadata.distribution,
         ) = device_array(
-            (num_seqs, cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
+            (cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
             sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
         )
         return metadata
@@ -253,28 +252,24 @@ class FlashAttention(AttentionBackend):
                 (0, page_indices.shape[0] - len(page_indices_list)),
             )
 
-        num_seqs = np.sum(batch.seq_lens > 0, dtype=np.int32).reshape(
-            1,
-        )
+        num_seqs_val = np.sum(batch.seq_lens > 0, dtype=np.int32).item()
         # Construct distribution for V2 kernel: [decode_end, prefill_end, mixed_end]
 
         # All sequences are prefill mode
-        distribution = np.array([0, num_seqs.item(), num_seqs.item()], dtype=np.int32)
+        distribution = np.array([0, num_seqs_val, num_seqs_val], dtype=np.int32)
 
-        num_seqs = np.array(num_seqs)
         cu_q_lens = np.array(cu_q_lens)
         cu_kv_lens = np.array(cu_kv_lens)
         page_indices = np.array(page_indices)
         seq_lens = np.array(seq_lens)
         (
-            metadata.num_seqs,
             metadata.cu_q_lens,
             metadata.cu_kv_lens,
             metadata.page_indices,
             metadata.seq_lens,
             metadata.distribution,
         ) = device_array(
-            (num_seqs, cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
+            (cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
             sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
         )
         return metadata
@@ -363,16 +358,13 @@ class FlashAttention(AttentionBackend):
                 step=batch.speculative_eagle_topk,
                 dtype=np.int32,
             )
-        num_seqs = np.sum(batch.seq_lens > 0, dtype=np.int32).reshape(
-            1,
-        )
+        num_seqs_val = np.sum(batch.seq_lens > 0, dtype=np.int32).item()
 
-        distribution = np.array([0, 0, num_seqs.item()], dtype=np.int32)
+        distribution = np.array([0, 0, num_seqs_val], dtype=np.int32)
         metadata = []
         for i in range(batch.speculative_num_steps):
             metadata_tmp = FlashAttentionMetadata()
             (
-                metadata_tmp.num_seqs,
                 metadata_tmp.cu_q_lens,
                 metadata_tmp.cu_kv_lens,
                 metadata_tmp.page_indices,
@@ -380,7 +372,6 @@ class FlashAttention(AttentionBackend):
                 metadata_tmp.distribution,
             ) = device_array(
                 (
-                    num_seqs,
                     cu_q_lens,
                     cu_kv_lens[i],
                     page_indices[i],
@@ -397,9 +388,11 @@ class FlashAttention(AttentionBackend):
         aux_data = {
             "num_heads": self.num_heads,
             "num_kv_heads": self.num_kv_heads,
-            "vmem_limit_bytes": self.vmem_limit_bytes,
             "head_dim": self.head_dim,
             "page_size": self.page_size,
+            "attention_sink": self.attention_sink,
+            "kv_partition_axis": self.kv_partition_axis,
+            "mesh": self.mesh,
         }
         return (children, aux_data)
 
@@ -409,89 +402,85 @@ class FlashAttention(AttentionBackend):
             aux_data["num_heads"],
             aux_data["num_kv_heads"],
             aux_data["head_dim"],
-            aux_data["vmem_limit_bytes"],
-            aux_data["page_size"],
+            page_size=aux_data["page_size"],
+            attention_sink=aux_data["attention_sink"],
+            kv_partition_axis=aux_data.get("kv_partition_axis", "tensor"),
+            mesh=aux_data.get("mesh"),
         )
-
         obj.forward_metadata = children[0]
-
         return obj
 
     @named_scope
     def __call__(
         self,
-        q: jax.Array,  # [total_tokens, num_heads, head_dim]
-        k: jax.Array,  # [total_tokens, num_heads, head_dim]
-        v: jax.Array,  # [total_tokens, num_heads, head_dim]
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         causal: int = 1,
+        **kwargs,
     ):
-        """
-        Args:
-            q, k, v: Input tensors of shape [total_tokens, num_heads, head_dim]
-            forward_batch: ForwardBatch object containing seq_lens and batch_size
-            attention_mask: Optional attention mask
-            is_causal: Whether to apply causal masking
-        Returns:
-            Output tensor of shape [total_tokens, hidden_size]
-        """
         if forward_batch is not None and token_to_kv_pool is not None:
             kv_cache_fused = self._get_fused_kv_cache(
                 forward_batch, token_to_kv_pool, layer.layer_id
             )
         else:
-            kv_cache_fused = jnp.zeros((0, self.num_kv_heads * 2, self.head_dim), dtype=q.dtype)
+            kv_cache_fused = jnp.zeros((0, self.page_size, self.num_kv_heads * 2, self.head_dim), dtype=q.dtype)
         scale = (
             1.0 / jnp.sqrt(layer.head_dim)
             if (layer is None or layer.scaling is None)
             else layer.scaling
         )
 
-        # Prepare fused KV cache for paged format: [num_pages, page_size, num_kv_heads * 2, head_dim]
-        total_tokens = kv_cache_fused.shape[0]
-        num_pages = total_tokens // self.page_size
-        kv_cache_fused_paged = kv_cache_fused.reshape(
-            num_pages, self.page_size, -1, (self.head_dim + 127) // 128 * 128
-        )
         if self.forward_metadata.custom_mask is not None:
             causal = 0
-        # Select page indices and remap to SWA pool if KV cache supports it
+
+        # Select page indices: use swa_page_indices for SWA layers if available
         page_indices_arg = self.forward_metadata.page_indices
-        if hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
-            page_indices_arg = token_to_kv_pool.remap_cache_loc(page_indices_arg, layer.layer_id)
+        if self.forward_metadata.swa_page_indices is not None and layer.sliding_window_size is not None:
+            page_indices_arg = self.forward_metadata.swa_page_indices
+
+        # Build attention_sink array: prefer kwarg, then fall back to self.attention_sink
+        attention_sink = kwargs.get("attention_sink", None)
+        if attention_sink is None and self.attention_sink > 0:
+            attention_sink = jnp.zeros((self.num_heads,), dtype=jnp.float32)
+
+        # shard_map needs a real array; use scalar placeholder when no sink
+        attention_sink_arg = attention_sink if attention_sink is not None else jnp.float32(0.0)
+        has_attention_sink = attention_sink is not None
 
         in_specs = (
             P(None, self.kv_partition_axis),  # queries
-            P(None, self.kv_partition_axis),  # keys (new tokens)
-            P(None, self.kv_partition_axis),  # values (new tokens)
-            P(None, None, self.kv_partition_axis, None),  # kv_cache_fused (head interleaved)
+            P(None, self.kv_partition_axis),  # keys
+            P(None, self.kv_partition_axis),  # values
+            P(None, None, self.kv_partition_axis, None, None),  # kv_cache_fused 5D
             P(),  # kv_lens
             P(),  # page_indices
             P(),  # cu_q_lens
             P(),  # cu_kv_lens
             P(),  # distribution
             P(),  # custom_mask
+            P(self.kv_partition_axis) if has_attention_sink else P(),  # attention_sink
         )
         out_specs = (
             P(None, self.kv_partition_axis),  # attention output
-            P(
-                None, self.kv_partition_axis, None
-            ),  # updated kv_cache_fused (head interleaved) - 3D: [total_tokens, num_kv_heads*2, head_dim]
+            P(None, None, self.kv_partition_axis, None, None),  # updated kv_cache_fused 5D
         )
 
         def _ragged_paged_attention_with_fused_kv(*args):
-            queries, keys, values, kv_cache_fused = args[:4]
-            other_args = args[4:]
+            queries, keys, values, kv_cache_fused_arg = args[:4]
+            other_args = args[4:10]
+            sink_arg = args[10] if has_attention_sink else None
 
-            # Call fused KV kernel with head interleaving
-            result, updated_kv_cache_fused = ragged_paged_attention(
+            result, updated_kv_cache_fused = ragged_paged_attention_v3.ragged_paged_attention(
                 queries,
                 keys,
                 values,
-                kv_cache_fused,
+                kv_cache_fused_arg,
                 *other_args,
+                attention_sink=sink_arg,
                 causal=causal,
                 sm_scale=scale,
                 sliding_window=layer.sliding_window_size,
@@ -499,7 +488,6 @@ class FlashAttention(AttentionBackend):
                 xai_temperature_len=(
                     layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
                 ),
-                vmem_limit_bytes=self.vmem_limit_bytes,
             )
 
             return result, updated_kv_cache_fused
@@ -507,7 +495,7 @@ class FlashAttention(AttentionBackend):
         (
             attn_output,
             updated_kv_cache_fused,
-        ) = jax.shard_map(  # Fused KV kernel handles cache updates internally
+        ) = jax.shard_map(
             _ragged_paged_attention_with_fused_kv,
             in_specs=in_specs,
             out_specs=out_specs,
@@ -516,21 +504,15 @@ class FlashAttention(AttentionBackend):
             q.reshape(q.shape[0], -1, self.head_dim),
             k.reshape(k.shape[0], -1, self.head_dim),
             v.reshape(v.shape[0], -1, self.head_dim),
-            kv_cache_fused_paged,
+            kv_cache_fused,
             self.forward_metadata.seq_lens,
             page_indices_arg,
             self.forward_metadata.cu_q_lens,
             self.forward_metadata.cu_kv_lens,
             self.forward_metadata.distribution,
             self.forward_metadata.custom_mask,
+            attention_sink_arg,
         )
-        pad_width = (self.head_dim + 127) // 128 * 128 - self.head_dim
-        if pad_width > 0:
-            updated_kv_cache_fused = jnp.pad(
-                updated_kv_cache_fused,
-                ((0, 0), (0, 0), (0, pad_width)),
-                mode="constant",
-            )
 
         return (
             attn_output.reshape(q.shape[0], -1),

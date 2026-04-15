@@ -500,8 +500,9 @@ class ModelRunner(BaseModelRunner):
                 full_attention_layer_ids=self.model_config.full_attention_layer_ids,
                 dtype=self.kv_cache_dtype,
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
-                head_dim=self.model_config.head_dim,
+                head_dim=(self.model_config.head_dim + 127) // 128 * 128,
                 mesh=self.mesh,
+                page_size=self.page_size,
             )
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
@@ -564,6 +565,7 @@ class ModelRunner(BaseModelRunner):
                 self.model_config.head_dim,
                 page_size=self.page_size,
                 mesh=self.mesh,
+                attention_sink=getattr(self.model_config.hf_config, "attention_sink", 0),
             )
         else:
             raise ValueError(f"Unsupported attention backend: {self.server_args.attention_backend}")
@@ -619,7 +621,7 @@ class ModelRunner(BaseModelRunner):
         if self.tp_size == 1:
             target_sharding = NamedSharding(
                 self.token_to_kv_pool.mesh,
-                P(None, self.token_to_kv_pool.kv_partition_axis, None),
+                P(None, None, self.token_to_kv_pool.kv_partition_axis, None, None),
             )
             layers_kv_fused = [
                 jax.device_put(layer_kv_fused, target_sharding)
