@@ -517,26 +517,33 @@ class ModelRunner(BaseModelRunner):
 
         # Create KV pool allocator
         if self.token_to_kv_pool_allocator is None:
-            if self.page_size == 1:
-                if self.is_hybrid:
-                    self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
-                        self.full_max_total_num_tokens,
-                        self.swa_max_total_num_tokens,
-                        kvcache=self.token_to_kv_pool,
-                    )
-                else:
-                    self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
-                        size=self.max_total_num_tokens,
-                        kvcache=self.token_to_kv_pool,
-                    )
+            if self.is_hybrid:
+                self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                    self.full_max_total_num_tokens,
+                    self.swa_max_total_num_tokens,
+                    kvcache=self.token_to_kv_pool,
+                    page_size=self.page_size,
+                )
+            elif self.page_size == 1:
+                self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+                    size=self.max_total_num_tokens,
+                    kvcache=self.token_to_kv_pool,
+                )
             else:
-                assert not self.is_hybrid
                 self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                     size=self.max_total_num_tokens,
                     page_size=self.page_size,
                     kvcache=self.token_to_kv_pool,
                     debug_mode=False,
                 )
+
+        # Set swa_index_mapping on attention backend for SWA page index computation
+        if self.is_hybrid and hasattr(self.token_to_kv_pool_allocator, 'full_to_swa_index_mapping'):
+            object.__setattr__(
+                self.attn_backend,
+                'swa_index_mapping',
+                self.token_to_kv_pool_allocator.full_to_swa_index_mapping,
+            )
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
@@ -747,6 +754,12 @@ class ModelRunner(BaseModelRunner):
         denominator = swa_full_tokens_ratio * swa_layers_num + full_layers_num
         self.full_max_total_num_tokens = int(total_tokens / denominator)
         self.swa_max_total_num_tokens = int(self.full_max_total_num_tokens * swa_full_tokens_ratio)
+
+        # Align pool sizes to page_size for correct memory accounting
+        alignment = self.page_size
+        self.full_max_total_num_tokens -= self.full_max_total_num_tokens % alignment
+        self.swa_max_total_num_tokens -= self.swa_max_total_num_tokens % alignment
+
         self.max_total_num_tokens = self.full_max_total_num_tokens
 
         logger.info(

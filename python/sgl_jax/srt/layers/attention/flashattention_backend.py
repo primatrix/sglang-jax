@@ -148,19 +148,37 @@ class FlashAttention(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
-        # swa_page_indices placeholder (will be filled in commit 2)
+        # Compute swa_page_indices if SWA index mapping is available
         swa_page_indices = None
+        if self.swa_index_mapping is not None:
+            swa_cache_loc = self.swa_index_mapping[batch.cache_loc]
+            swa_indices = np.arange(0, len(swa_cache_loc), self.page_size)
+            swa_selected = swa_cache_loc[swa_indices]
+            swa_page_indices = (swa_selected // self.page_size).astype(np.int32)
 
-        (
-            metadata.cu_q_lens,
-            metadata.cu_kv_lens,
-            metadata.page_indices,
-            metadata.seq_lens,
-            metadata.distribution,
-        ) = device_array(
-            (cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
-            sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
-        )
+        if swa_page_indices is not None:
+            (
+                metadata.cu_q_lens,
+                metadata.cu_kv_lens,
+                metadata.page_indices,
+                metadata.seq_lens,
+                metadata.distribution,
+                metadata.swa_page_indices,
+            ) = device_array(
+                (cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution, swa_page_indices),
+                sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
+            )
+        else:
+            (
+                metadata.cu_q_lens,
+                metadata.cu_kv_lens,
+                metadata.page_indices,
+                metadata.seq_lens,
+                metadata.distribution,
+            ) = device_array(
+                (cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
+                sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
+            )
         return metadata
 
     def get_eagle_forward_metadata(self, batch: ModelWorkerBatch):
