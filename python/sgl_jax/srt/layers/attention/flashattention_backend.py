@@ -80,6 +80,7 @@ class FlashAttention(AttentionBackend):
         head_dim,
         page_size: int = 1,
         attention_sink: int = 0,
+        v_head_dim: int | None = None,
         kv_partition_axis: str = "tensor",
         mesh: jax.sharding.Mesh = None,
     ):
@@ -89,6 +90,7 @@ class FlashAttention(AttentionBackend):
         else:
             self.num_kv_heads = num_attn_heads
         self.head_dim = head_dim
+        self.v_head_dim = v_head_dim if v_head_dim is not None else head_dim
         self.page_size = page_size
         self.attention_sink = attention_sink
         self.kv_partition_axis = kv_partition_axis
@@ -409,6 +411,7 @@ class FlashAttention(AttentionBackend):
             "head_dim": self.head_dim,
             "page_size": self.page_size,
             "attention_sink": self.attention_sink,
+            "v_head_dim": self.v_head_dim,
             "kv_partition_axis": self.kv_partition_axis,
             "mesh": self.mesh,
         }
@@ -422,6 +425,7 @@ class FlashAttention(AttentionBackend):
             aux_data["head_dim"],
             page_size=aux_data["page_size"],
             attention_sink=aux_data["attention_sink"],
+            v_head_dim=aux_data.get("v_head_dim"),
             kv_partition_axis=aux_data.get("kv_partition_axis", "tensor"),
             mesh=aux_data.get("mesh"),
         )
@@ -521,7 +525,7 @@ class FlashAttention(AttentionBackend):
         )(
             q.reshape(q.shape[0], -1, self.head_dim),
             k.reshape(k.shape[0], -1, self.head_dim),
-            v.reshape(v.shape[0], -1, self.head_dim),
+            v.reshape(v.shape[0], -1, self.v_head_dim),
             kv_cache_fused,
             self.forward_metadata.seq_lens,
             page_indices_arg,
