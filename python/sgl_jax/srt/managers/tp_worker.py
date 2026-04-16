@@ -343,7 +343,7 @@ class ModelWorker:
 
     def set_forward_metadata(self, model_worker_batch: ModelWorkerBatch):
         self.model_runner.attn_backend.forward_metadata = (
-            self.worker.model_runner.attn_backend.get_forward_metadata(model_worker_batch)
+            self.model_runner.attn_backend.get_forward_metadata(model_worker_batch)
         )
 
     def get_max_padded_size(self):
