@@ -233,10 +233,6 @@ class MiMoV2Attention(nnx.Module):
         q = q.reshape(-1, self.q_head_num, self.head_dim)
         k = k.reshape(-1, k.shape[-1] // self.head_dim, self.head_dim)
         v = v.reshape(-1, v.shape[-1] // self.v_head_dim, self.v_head_dim)
-        # Pad V to match Q/K head_dim for fused KV cache
-        if self.v_head_dim != self.head_dim:
-            pad_size = self.head_dim - self.v_head_dim
-            v = jnp.pad(v, ((0, 0), (0, 0), (0, pad_size)))
 
         q, k = self.rotary_emb(positions, q, k)
 
@@ -248,16 +244,6 @@ class MiMoV2Attention(nnx.Module):
             token_to_kv_pool,
             attention_sink=self.attention_sink_bias.value if self.attention_sink_bias else None,
         )
-
-        # V was padded to head_dim for fused KV cache; slice back to v_head_dim
-        # so o_proj receives the correct input size.
-        if self.head_dim != self.v_head_dim:
-            expected_v_head_dim = self.q_head_num * self.v_head_dim
-            if attn_output.shape[-1] != expected_v_head_dim:
-                padded_head_dim = attn_output.shape[-1] // self.q_head_num
-                attn_output = attn_output.reshape(-1, self.q_head_num, padded_head_dim)
-                attn_output = attn_output[..., : self.v_head_dim]
-                attn_output = attn_output.reshape(-1, expected_v_head_dim)
 
         output, _ = self.o_proj(attn_output)
         return output, kv_fused

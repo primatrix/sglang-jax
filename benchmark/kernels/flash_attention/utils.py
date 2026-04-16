@@ -167,3 +167,45 @@ def create_decode_uniform_data(
         cache_loc,
         distribution,
     )
+
+
+# ---------------------------------------------------------------------------
+# Split KV helpers (separate K and V with different head_dim)
+# ---------------------------------------------------------------------------
+
+from sgl_jax.srt.kernels.ragged_paged_attention.util import get_dtype_packing, align_to
+
+
+def create_split_qkv_data(
+    total_tokens, q_head_num, kv_head_num, k_head_dim, v_head_dim, dtype=jnp.bfloat16, seed=42
+):
+    key = jax.random.PRNGKey(seed)
+    keys = jax.random.split(key, 4)
+    q = jax.random.normal(keys[0], (total_tokens, q_head_num, k_head_dim), dtype=dtype)
+    k = jax.random.normal(keys[1], (total_tokens, kv_head_num, k_head_dim), dtype=dtype)
+    v = jax.random.normal(keys[2], (total_tokens, kv_head_num, v_head_dim), dtype=dtype)
+    return q, k, v
+
+
+def create_split_kv_cache_data(
+    max_kv_cache_tokens,
+    head_num,
+    k_head_dim,
+    v_head_dim,
+    page_size=64,
+    dtype=jnp.bfloat16,
+    seed=42,
+):
+    """Create 4D native split KV caches for v3 split kernel."""
+    key = jax.random.PRNGKey(seed)
+    keys = jax.random.split(key, 3)
+    total_num_pages = cdiv(max_kv_cache_tokens, page_size)
+    k_head_dim_aligned = align_to(k_head_dim, 128)
+    v_head_dim_aligned = align_to(v_head_dim, 128)
+    k_cache = jax.random.normal(
+        keys[1], (total_num_pages, page_size, head_num, k_head_dim_aligned), dtype=dtype
+    )
+    v_cache = jax.random.normal(
+        keys[2], (total_num_pages, page_size, head_num, v_head_dim_aligned), dtype=dtype
+    )
+    return k_cache, v_cache
