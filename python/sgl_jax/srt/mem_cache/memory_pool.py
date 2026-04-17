@@ -69,7 +69,7 @@ def can_use_split_kv_cache(
         tp_devices = mesh.shape.get("tensor", 1)
         if tp_devices > 0:
             per_device_heads = head_num // tp_devices
-    return per_device_heads >= 2
+    return per_device_heads >= 2 and per_device_heads % 2 == 0
 
 
 @register_pytree_node_class

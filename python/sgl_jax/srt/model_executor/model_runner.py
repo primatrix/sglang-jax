@@ -385,7 +385,7 @@ class ModelRunner(BaseModelRunner):
         # head_dim/v_head_dim handling
         # With split KV, V uses v_head_dim; with fused KV, V is padded to head_dim
         head_dim = self.model_config.head_dim
-        v_head_dim = self.model_config.v_head_dim
+        v_head_dim = getattr(self.model_config, "v_head_dim", head_dim)
         head_dim_aligned = (head_dim + 127) // 128 * 128
         v_head_dim_aligned = (v_head_dim + 127) // 128 * 128
         split_kv_enabled = can_use_split_kv_cache(
@@ -723,6 +723,9 @@ class ModelRunner(BaseModelRunner):
             resharded = []
             for item in layers_kv_fused:
                 if isinstance(item, tuple):
+                    assert len(item) == 2, (
+                        f"Expected (k_cache, v_cache) tuple of length 2, got {len(item)}"
+                    )
                     resharded.append(
                         (
                             jax.device_put(item[0], target_sharding_5d),
