@@ -371,8 +371,6 @@ class ModelRunner(BaseModelRunner):
         Profile the maximum number of tokens that can fit in memory.
         Uses tpu_info to get accurate TPU memory information.
         """
-        # Get accurate memory information using TPU-specific methods
-        # Use tpu_info for memory information
         available_device_memory = self.get_available_device_memory()
         available_kv_cache_bytes = available_device_memory - total_device_memory * (
             1 - self.mem_fraction_static
@@ -380,6 +378,9 @@ class ModelRunner(BaseModelRunner):
 
         if available_kv_cache_bytes <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
+
+        # Store raw bytes for set_num_token_hybrid to use directly
+        self._available_kv_cache_bytes = available_kv_cache_bytes
 
         # head_dim/v_head_dim handling
         # V is padded to head_dim in model layer for fused KV cache
@@ -811,20 +812,49 @@ class ModelRunner(BaseModelRunner):
         self.model_config.full_attention_layer_ids = full_attention_layer_ids
 
         # Algorithm:
-        # Existing max_total_num_tokens is per layer and assume all layers have the same number of tokens.
-        # - Find total # of tokens available across layers.
-        # - Calculate full_max_total_num_tokens and swa_max_total_num_tokens based on the given swa_full_tokens_ratio.
-        # - Account for SWA layers potentially having different KV head count.
-        total_tokens = self.max_total_num_tokens * self.model_config.num_hidden_layers
+        # max_total_num_tokens was computed by profile_max_num_token using uniform
+        # full-attention cell_size for all layers. Convert back to bytes, then
+        # re-solve with correct per-layer costs that account for SWA layers
+        # having different KV head counts.
         full_layers_num = len(full_attention_layer_ids)
         swa_layers_num = len(swa_attention_layer_ids)
         swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
 
-        # Solve the equations:
-        # 1. swa_max_total_num_tokens * swa_layers_num + full_max_total_num_tokens * full_layers_num == total_tokens
-        # 2. full_max_total_num_tokens * swa_full_tokens_ratio == swa_max_total_num_tokens
-        denominator = swa_full_tokens_ratio * swa_layers_num + full_layers_num
-        self.full_max_total_num_tokens = int(total_tokens / denominator)
+        # Compute per-token-per-layer cost for each pool type
+        head_dim_aligned = (self.model_config.head_dim + 127) // 128 * 128
+        dtype_bytes = jnp.dtype(self.kv_cache_dtype).itemsize
+        full_kv_heads = self.model_config.get_num_kv_heads(self.attention_tp_size)
+
+        hf_cfg = self.model_config.hf_text_config
+        swa_kv_heads_total = getattr(hf_cfg, "swa_num_key_value_heads", None)
+        if swa_kv_heads_total is not None:
+            # swa_num_key_value_heads is already TP-adjusted by configure_for_tensor_parallel
+            swa_kv_heads = swa_kv_heads_total // self.attention_tp_size
+        else:
+            swa_kv_heads = full_kv_heads
+
+        full_cost = full_kv_heads * head_dim_aligned * 2 * dtype_bytes  # bytes/token/layer
+        swa_cost = swa_kv_heads * head_dim_aligned * 2 * dtype_bytes
+
+        # Use stored available bytes from profile_max_num_token directly.
+        # If intermediate adjustments (CI override, spec decode, max_total_tokens cap)
+        # modified max_total_num_tokens, convert back to bytes using uniform cell_size.
+        uniform_cell_size = full_cost * self.model_config.num_hidden_layers
+        if hasattr(self, "_available_kv_cache_bytes") and (
+            self.max_total_num_tokens == int(self._available_kv_cache_bytes // uniform_cell_size)
+        ):
+            # No intermediate adjustments — use raw bytes directly
+            available_kv_cache_bytes = self._available_kv_cache_bytes
+        else:
+            # Intermediate adjustments changed max_total_num_tokens — recover bytes
+            available_kv_cache_bytes = self.max_total_num_tokens * uniform_cell_size
+
+        # Solve: full_max * full_cost * full_layers + swa_max * swa_cost * swa_layers = available_bytes
+        # with:  swa_max = full_max * R
+        denominator = (
+            swa_full_tokens_ratio * swa_cost * swa_layers_num + full_cost * full_layers_num
+        )
+        self.full_max_total_num_tokens = int(available_kv_cache_bytes / denominator)
         self.swa_max_total_num_tokens = int(self.full_max_total_num_tokens * swa_full_tokens_ratio)
 
         # Align pool sizes to page_size and dp_size for sharding compatibility
@@ -836,9 +866,14 @@ class ModelRunner(BaseModelRunner):
         self.max_total_num_tokens = self.full_max_total_num_tokens
 
         logger.info(
-            "Use Sliding window memory pool. full_layer_tokens=%s, swa_layer_tokens=%s",
+            "Use Sliding window memory pool. full_layer_tokens=%s, swa_layer_tokens=%s, "
+            "full_kv_heads=%s, swa_kv_heads=%s, full_cost=%s, swa_cost=%s",
             self.full_max_total_num_tokens,
             self.swa_max_total_num_tokens,
+            full_kv_heads,
+            swa_kv_heads,
+            full_cost,
+            swa_cost,
         )
 
     def init_lora_manager(self):
