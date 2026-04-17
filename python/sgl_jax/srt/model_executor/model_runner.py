@@ -39,6 +39,7 @@ from sgl_jax.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     ReqToTokenPool,
     SWAKVPool,
+    can_use_split_kv_cache,
 )
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -382,9 +383,24 @@ class ModelRunner(BaseModelRunner):
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
 
         # head_dim/v_head_dim handling
-        # V is padded to head_dim in model layer for fused KV cache
+        # With split KV, V uses v_head_dim; with fused KV, V is padded to head_dim
         head_dim = self.model_config.head_dim
+        v_head_dim = getattr(self.model_config, "v_head_dim", head_dim)
         head_dim_aligned = (head_dim + 127) // 128 * 128
+        v_head_dim_aligned = (v_head_dim + 127) // 128 * 128
+        split_kv_enabled = can_use_split_kv_cache(
+            self.num_kv_heads,
+            head_dim_aligned,
+            v_head_dim_aligned,
+            mesh=self.mesh,
+        )
+
+        # If split KV (v_head_dim != head_dim), K uses head_dim and V uses v_head_dim
+        # If fused, both K and V use head_dim (V was padded in old code)
+        if split_kv_enabled:
+            per_token_kv_dim = head_dim_aligned + v_head_dim_aligned
+        else:
+            per_token_kv_dim = head_dim_aligned * 2
 
         def adjust_layer_num():
             # 0 for full attention, 1 for swa
@@ -404,9 +420,8 @@ class ModelRunner(BaseModelRunner):
 
         cell_size = (
             self.model_config.get_num_kv_heads(self.attention_tp_size)
-            * head_dim_aligned
+            * per_token_kv_dim
             * adjust_layer_num()
-            * 2
             * jnp.dtype(self.kv_cache_dtype).itemsize
         )
 
@@ -547,6 +562,7 @@ class ModelRunner(BaseModelRunner):
                 ),
                 swa_head_num=swa_head_num,
                 head_dim=(self.model_config.head_dim + 127) // 128 * 128,
+                v_head_dim=(self.model_config.v_head_dim + 127) // 128 * 128,
                 mesh=self.mesh,
                 dp_size=dp_size,
             )
@@ -559,6 +575,7 @@ class ModelRunner(BaseModelRunner):
                     self.attention_tp_size
                 ),
                 head_dim=(self.model_config.head_dim + 127) // 128 * 128,
+                v_head_dim=(self.model_config.v_head_dim + 127) // 128 * 128,
                 layer_num=self.model_config.num_hidden_layers,
                 mesh=self.mesh,
                 dp_size=dp_size,
@@ -637,6 +654,7 @@ class ModelRunner(BaseModelRunner):
                 self.model_config.head_dim,
                 page_size=self.page_size,
                 mesh=self.mesh,
+                v_head_dim=self.model_config.v_head_dim,
             )
         else:
             raise ValueError(f"Unsupported attention backend: {self.server_args.attention_backend}")
@@ -691,7 +709,7 @@ class ModelRunner(BaseModelRunner):
         # Q: Why does not call device_put in every layer?
         # A: Because it does not work and cache_miss still happens. According to benchmark(https://github.com/sgl-project/sglang-jax/pull/234), the performance is not influenced.
         if self.tp_size == 1:
-            target_sharding = NamedSharding(
+            target_sharding_5d = NamedSharding(
                 self.token_to_kv_pool.mesh,
                 P(
                     self.token_to_kv_pool.attention_data_partition_axis,
@@ -701,10 +719,24 @@ class ModelRunner(BaseModelRunner):
                     None,
                 ),
             )
-            layers_kv_fused = [
-                jax.device_put(layer_kv_fused, target_sharding)
-                for layer_kv_fused in layers_kv_fused
-            ]
+            # Handle mixed split/fused layers: each element is either a tuple
+            # (k_cache, v_cache) from split-KV layers or a single array from
+            # fused-KV layers.
+            resharded = []
+            for item in layers_kv_fused:
+                if isinstance(item, tuple):
+                    assert len(item) == 2, (
+                        f"Expected (k_cache, v_cache) tuple of length 2, got {len(item)}"
+                    )
+                    resharded.append(
+                        (
+                            jax.device_put(item[0], target_sharding_5d),
+                            jax.device_put(item[1], target_sharding_5d),
+                        )
+                    )
+                else:
+                    resharded.append(jax.device_put(item, target_sharding_5d))
+            layers_kv_fused = resharded
 
         self.token_to_kv_pool.replace_kv_buffer(layers_kv_fused)
 
