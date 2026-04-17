@@ -1,4 +1,4 @@
-"""MiMo-V2-Flash model implementation for SGLang-JAX."""
+"""MiMo-V2 model implementations (Flash and Pro) for SGLang-JAX."""
 
 import logging
 from typing import Any
@@ -865,12 +865,11 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         mappings = {}
         is_fp8 = self._is_static_quant
 
-        # Attention projections
+        # Attention Q/K/V projections (separate weights for Flash)
         for proj, sharding, kv_pad, hd_pad in [
             ("q_proj", (None, "tensor"), False, True),
             ("k_proj", (None, "tensor"), not is_fp8, True),
             ("v_proj", (None, "tensor"), not is_fp8, False),
-            ("o_proj", ("tensor", None), False, True),
         ]:
             hf_key = f"{prefix}.self_attn.{proj}"
             ignored = self._is_quant_ignored(hf_key)
@@ -890,6 +889,36 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                     sharding=(None, None),
                     transpose=False,
                 )
+
+        # Common mappings: o_proj, sink bias, layernorms, MLP/MoE
+        mappings.update(self._create_common_layer_mappings(layer_idx))
+
+        return mappings
+
+    def _create_common_layer_mappings(self, layer_idx: int) -> dict:
+        """Create weight mappings shared between Flash and Pro: o_proj, sink bias, layernorms, MLP/MoE."""
+        prefix = f"model.layers.{layer_idx}"
+        target = prefix
+        mappings = {}
+        is_fp8 = self._is_static_quant
+
+        # o_proj
+        hf_key = f"{prefix}.self_attn.o_proj"
+        ignored = self._is_quant_ignored(hf_key)
+        weight_suffix = "weight" if (not is_fp8 or ignored) else "weight_q"
+        mappings[f"{hf_key}.weight"] = WeightMapping(
+            target_path=f"{target}.self_attn.o_proj.{weight_suffix}",
+            sharding=("tensor", None),
+            transpose=True,
+            head_dim_padding=True,
+            kv_head_padding=False,
+        )
+        if is_fp8 and not ignored:
+            mappings[f"{hf_key}.weight_scale_inv"] = WeightMapping(
+                target_path=f"{target}.self_attn.o_proj.weight_scale",
+                sharding=(None, None),
+                transpose=False,
+            )
 
         # Attention sink bias
         is_swa = (
@@ -1030,4 +1059,77 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         return output, layers_kv_fused, True, layers_topk_ids
 
 
-EntryClass = [MiMoV2FlashForCausalLM]
+class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
+    """MiMo V2 Pro variant.
+
+    Same architecture as Flash, but the checkpoint stores fused ``qkv_proj``
+    weights instead of separate ``q_proj``/``k_proj``/``v_proj``.  The weight
+    loader splits the fused tensor via ``_split_qkv_weight``.
+
+    Additionally, ``v_head_dim`` (128) != ``head_dim`` (192), which is handled
+    by ``WeightLoader.v_head_dim_original``.
+    """
+
+    def _create_layer_mappings(self, layer_idx: int) -> dict:
+        prefix = f"model.layers.{layer_idx}"
+        target = prefix
+        mappings = {}
+        is_fp8 = self._is_static_quant
+
+        # Fused QKV mapping: list target_path triggers _split_qkv_weight
+        if is_fp8:
+            mappings[f"{prefix}.self_attn.qkv_proj.weight"] = WeightMapping(
+                target_path=[
+                    f"{target}.self_attn.q_proj.weight_q",
+                    f"{target}.self_attn.k_proj.weight_q",
+                    f"{target}.self_attn.v_proj.weight_q",
+                ],
+                sharding=(None, "tensor"),
+                transpose=True,
+                head_dim_padding=False,
+                kv_head_padding=False,
+            )
+            mappings[f"{prefix}.self_attn.qkv_proj.weight_scale_inv"] = WeightMapping(
+                target_path=[
+                    f"{target}.self_attn.q_proj.weight_scale",
+                    f"{target}.self_attn.k_proj.weight_scale",
+                    f"{target}.self_attn.v_proj.weight_scale",
+                ],
+                sharding=(None, None),
+                transpose=False,
+            )
+        else:
+            mappings[f"{prefix}.self_attn.qkv_proj.weight"] = WeightMapping(
+                target_path=[
+                    f"{target}.self_attn.q_proj.weight",
+                    f"{target}.self_attn.k_proj.weight",
+                    f"{target}.self_attn.v_proj.weight",
+                ],
+                sharding=(None, "tensor"),
+                transpose=True,
+                head_dim_padding=False,
+                kv_head_padding=False,
+            )
+
+        # Common mappings: o_proj, sink bias, layernorms, MLP/MoE
+        mappings.update(self._create_common_layer_mappings(layer_idx))
+        return mappings
+
+    def load_weights(self, model_config: ModelConfig):
+        # Skip _warmup_safetensors_cache: Pro ~1TB exceeds GCSFuse cache capacity
+        loader = WeightLoader(
+            model=self,
+            model_config=model_config,
+            mesh=self.mesh,
+            dtype=self.dtype,
+        )
+        self._quant_config = model_config.quantization_config
+        weight_mappings = self._create_weight_mappings()
+        loader.load_weights_from_safetensors(weight_mappings)
+        logger.info("MiMoV2Pro weights loaded successfully!")
+
+        if self._is_static_quant:
+            self._dequantize_fp8_to_bf16()
+
+
+EntryClass = [MiMoV2FlashForCausalLM, MiMoV2ProForCausalLM]

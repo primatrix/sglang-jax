@@ -137,6 +137,7 @@ class WeightLoader:
 
             self.head_dim_pad = (self.head_dim_original + 127) // 128 * 128 - self.head_dim_original
             self.head_dim = self.head_dim_original
+            self.v_head_dim_original = getattr(model_config, "v_head_dim", self.head_dim_original)
         if hasattr(self.mesh, "shape") and "tensor" in self.mesh.shape:
             self.sharding_size = self.mesh.shape["tensor"]
         else:
@@ -1533,13 +1534,28 @@ class WeightLoader:
     ):
         jax_paths = mapping.target_path
 
+        q_dim = self.num_heads * self.head_dim_original
+        k_dim = self.num_kv_heads * self.head_dim_original
+        v_dim = self.num_kv_heads * self.v_head_dim_original
+
         if hf_key.endswith(".bias"):
-            q_dim = self.num_heads * self.head_dim_original
-            kv_dim = self.num_kv_heads * self.head_dim_original
+            # Auto-detect scale tensor (block-compressed dimensions)
+            total_dim = q_dim + k_dim + v_dim
+            actual_dim = weight.shape[0]
+            if actual_dim != total_dim:
+                block_size = 128
+                expected_scale_dim = total_dim // block_size
+                assert actual_dim == expected_scale_dim, (
+                    f"QKV bias/scale split dim mismatch: got {actual_dim}, "
+                    f"expected weight={total_dim} or scale={expected_scale_dim}"
+                )
+                q_dim //= block_size
+                k_dim //= block_size
+                v_dim //= block_size
 
             q_bias = weight[:q_dim]
-            k_bias = weight[q_dim : q_dim + kv_dim]
-            v_bias = weight[q_dim + kv_dim : q_dim + 2 * kv_dim]
+            k_bias = weight[q_dim : q_dim + k_dim]
+            v_bias = weight[q_dim + k_dim : q_dim + k_dim + v_dim]
 
             if mapping.head_dim_padding and self.head_dim_pad > 0:
                 q_bias = jnp.reshape(q_bias, (self.num_heads, self.head_dim_original))
@@ -1550,25 +1566,48 @@ class WeightLoader:
                 k_bias = jnp.pad(k_bias, ((0, 0), (0, self.head_dim_pad)))
                 k_bias = jnp.reshape(k_bias, (self.num_kv_heads * self.head_dim,))
 
-                v_bias = jnp.reshape(v_bias, (self.num_kv_heads, self.head_dim_original))
-                v_bias = jnp.pad(v_bias, ((0, 0), (0, self.head_dim_pad)))
-                v_bias = jnp.reshape(v_bias, (self.num_kv_heads * self.head_dim,))
+                v_head_dim_pad = (
+                    self.v_head_dim_original + 127
+                ) // 128 * 128 - self.v_head_dim_original
+                if v_head_dim_pad > 0:
+                    v_bias = jnp.reshape(v_bias, (self.num_kv_heads, self.v_head_dim_original))
+                    v_bias = jnp.pad(v_bias, ((0, 0), (0, v_head_dim_pad)))
+                    v_padded_dim = self.v_head_dim_original + v_head_dim_pad
+                    v_bias = jnp.reshape(v_bias, (self.num_kv_heads * v_padded_dim,))
 
             splits = [q_bias, k_bias, v_bias]
         else:
-            q_dim = self.num_heads * self.head_dim_original
-            kv_dim = self.num_kv_heads * self.head_dim_original
+            # Auto-detect scale tensor (block-compressed dimensions)
+            total_dim = q_dim + k_dim + v_dim
+            split_axis = 1 if mapping.transpose else 0
+            actual_dim = weight.shape[split_axis]
+            is_scale = False
+
+            if actual_dim != total_dim:
+                block_size = 128
+                expected_scale_dim = total_dim // block_size
+                assert actual_dim == expected_scale_dim, (
+                    f"QKV split dim mismatch: got {actual_dim}, "
+                    f"expected weight={total_dim} or scale={expected_scale_dim}"
+                )
+                q_dim //= block_size
+                k_dim //= block_size
+                v_dim //= block_size
+                is_scale = True
 
             if mapping.transpose:
                 q_weight = weight[:, :q_dim]
-                k_weight = weight[:, q_dim : q_dim + kv_dim]
-                v_weight = weight[:, q_dim + kv_dim : q_dim + 2 * kv_dim]
+                k_weight = weight[:, q_dim : q_dim + k_dim]
+                v_weight = weight[:, q_dim + k_dim : q_dim + k_dim + v_dim]
             else:
                 q_weight = weight[:q_dim, :]
-                k_weight = weight[q_dim : q_dim + kv_dim, :]
-                v_weight = weight[q_dim + kv_dim : q_dim + 2 * kv_dim, :]
+                k_weight = weight[q_dim : q_dim + k_dim, :]
+                v_weight = weight[q_dim + k_dim : q_dim + k_dim + v_dim, :]
 
-            if mapping.head_dim_padding and self.head_dim_pad > 0:
+            if not is_scale and mapping.head_dim_padding and self.head_dim_pad > 0:
+                v_head_dim_pad = (
+                    self.v_head_dim_original + 127
+                ) // 128 * 128 - self.v_head_dim_original
                 if mapping.transpose:
                     q_weight = jnp.reshape(
                         q_weight,
@@ -1588,14 +1627,16 @@ class WeightLoader:
                         k_weight, (self.hidden_size, self.num_kv_heads * self.head_dim)
                     )
 
-                    v_weight = jnp.reshape(
-                        v_weight,
-                        (self.hidden_size, self.num_kv_heads, self.head_dim_original),
-                    )
-                    v_weight = jnp.pad(v_weight, ((0, 0), (0, 0), (0, self.head_dim_pad)))
-                    v_weight = jnp.reshape(
-                        v_weight, (self.hidden_size, self.num_kv_heads * self.head_dim)
-                    )
+                    if v_head_dim_pad > 0:
+                        v_weight = jnp.reshape(
+                            v_weight,
+                            (self.hidden_size, self.num_kv_heads, self.v_head_dim_original),
+                        )
+                        v_weight = jnp.pad(v_weight, ((0, 0), (0, 0), (0, v_head_dim_pad)))
+                        v_padded_dim = self.v_head_dim_original + v_head_dim_pad
+                        v_weight = jnp.reshape(
+                            v_weight, (self.hidden_size, self.num_kv_heads * v_padded_dim)
+                        )
                 else:
                     q_weight = jnp.reshape(
                         q_weight,
@@ -1615,14 +1656,16 @@ class WeightLoader:
                         k_weight, (self.num_kv_heads * self.head_dim, self.hidden_size)
                     )
 
-                    v_weight = jnp.reshape(
-                        v_weight,
-                        (self.num_kv_heads, self.head_dim_original, self.hidden_size),
-                    )
-                    v_weight = jnp.pad(v_weight, ((0, 0), (0, self.head_dim_pad), (0, 0)))
-                    v_weight = jnp.reshape(
-                        v_weight, (self.num_kv_heads * self.head_dim, self.hidden_size)
-                    )
+                    if v_head_dim_pad > 0:
+                        v_weight = jnp.reshape(
+                            v_weight,
+                            (self.num_kv_heads, self.v_head_dim_original, self.hidden_size),
+                        )
+                        v_weight = jnp.pad(v_weight, ((0, 0), (0, v_head_dim_pad), (0, 0)))
+                        v_padded_dim = self.v_head_dim_original + v_head_dim_pad
+                        v_weight = jnp.reshape(
+                            v_weight, (self.num_kv_heads * v_padded_dim, self.hidden_size)
+                        )
 
             splits = [q_weight, k_weight, v_weight]
 
@@ -1635,6 +1678,11 @@ class WeightLoader:
             sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
 
             model_param = self._get_param(params, jax_path)
+
+            # Expand 2D block-quant scale to 3D kernel-ready layout.
+            sharded_weight = self._maybe_expand_linear_block_scale(
+                sharded_weight, model_param, jax_path
+            )
 
             if sharded_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
                 model_param.value = sharded_weight
