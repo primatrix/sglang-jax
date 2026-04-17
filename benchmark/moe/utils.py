@@ -440,14 +440,14 @@ class MoEImbalanceSimulator:
         assignments = np.full((num_tokens, top_k), -1, dtype=np.int32)
         token_fill_count = np.zeros(num_tokens, dtype=np.int32)
 
-        expert_ids = np.argsort(counts)[::-1]
+        expert_ids = np.argsort(counts, kind="stable")[::-1]
 
         for e_id in expert_ids:
             needed = int(counts[e_id])
             if needed <= 0:
                 continue
 
-            sorted_token_indices = np.argsort(token_fill_count)
+            sorted_token_indices = np.argsort(token_fill_count, kind="stable")
 
             chosen_tokens = sorted_token_indices[:needed]
 
