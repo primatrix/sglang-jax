@@ -253,6 +253,9 @@ class Req:
         # SWA eviction: sequence positions [0, swa_evicted_seqlen) have had
         # their SWA pool slots freed (no longer in the sliding window).
         self.swa_evicted_seqlen: int = 0
+        # [0, cache_protected_len) tokens are owned by the radix tree;
+        # per-request SWA eviction must not free their SWA slots.
+        self.cache_protected_len: int = 0
         # The number of extend/decode batches this request has already gone through.
         # These counters gate overlap-safe SWA reclaim timing.
         self.extend_batch_idx: int = 0
@@ -380,14 +383,13 @@ class Req:
     ):
         self.fill_ids = self.origin_input_ids + self.output_ids
         if tree_cache is not None:
-            (
-                self.prefix_indices,
-                self.last_node,
-                self.last_host_node,
-                self.host_hit_length,
-            ) = tree_cache.match_prefix(
+            match_result = tree_cache.match_prefix(
                 key=RadixKey(self.adjust_max_prefix_ids(), self.extra_key, self.dp_rank),
             )
+            self.prefix_indices = match_result.device_indices
+            self.last_node = match_result.last_device_node
+            self.last_host_node = match_result.last_host_node
+            self.host_hit_length = match_result.host_hit_length
             self.last_matched_prefix_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
@@ -517,6 +519,7 @@ class Req:
         self.req_pool_idx = None
         self.already_computed = 0
         self.swa_evicted_seqlen = 0
+        self.cache_protected_len = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
         self.routed_experts = None
@@ -880,8 +883,7 @@ class ScheduleBatch:
         """
         self.forward_mode = ForwardMode.EXTEND
 
-        if self.is_hybrid:
-            self.maybe_evict_swa()
+        self.maybe_evict_swa()
 
         # Process each DP rank
         for dp_rank in range(self.dp_size):
@@ -987,7 +989,7 @@ class ScheduleBatch:
             else:
                 extend_input_logprob_token_ids = None
 
-            if self.is_hybrid:
+            if self.is_hybrid and isinstance(self.tree_cache, ChunkCache):
                 sliding_window_size = getattr(self.model_config, "sliding_window", None)
                 if sliding_window_size and sliding_window_size > 0:
                     page_size = getattr(
@@ -1266,7 +1268,7 @@ class ScheduleBatch:
             self.req_to_token_pool.free(req.req_pool_idx)
         else:
             last_uncached_pos = (
-                len(req.prefix_indices) // server_args.page_size
+                req.cache_protected_len // server_args.page_size
             ) * server_args.page_size
             token_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
@@ -1353,6 +1355,12 @@ class ScheduleBatch:
         if self.forward_mode is None or not self.forward_mode.is_extend():
             return
 
+        # Only do per-request SWA eviction during extend for ChunkCache.
+        # For SWARadixCache, tree-owned slots are protected by cache_protected_len
+        # and eviction is handled during insert.
+        if not isinstance(self.tree_cache, ChunkCache):
+            return
+
         chunked_prefill_size = global_server_args_dict["chunked_prefill_size"]
         for dp_rank, info in enumerate(self.reqs_info):
             if not info.reqs or info.prefix_lens is None:
@@ -1374,7 +1382,19 @@ class ScheduleBatch:
         dp_rank: int = 0,
     ):
         """Free SWA pool slots for tokens outside the sliding window."""
-        new_evicted = max(req.swa_evicted_seqlen, pre_len - sliding_window_size)
+        # Bump swa_evicted_seqlen to cache_protected_len upfront:
+        # tree-owned slots are never freed by per-request eviction.
+        assert (
+            req.cache_protected_len % page_size == 0
+        ), f"cache_protected_len must be page aligned, {req.cache_protected_len=}, {page_size=}"
+        req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
+
+        # Subtract an extra page_size so the eviction frontier never reaches the
+        # radix tree insert boundary (page_floor(seq_len)). This keeps at least
+        # one page of non-evicted SWA KV for the tree to store as a non-tombstone
+        # node, preserving cache reuse in multi-turn scenarios.
+        # See also: _insert_helper defensive guard in swa_radix_cache.py.
+        new_evicted = max(req.swa_evicted_seqlen, pre_len - sliding_window_size - page_size)
         if page_size > 1:
             new_evicted = (new_evicted // page_size) * page_size
         if new_evicted <= req.swa_evicted_seqlen:
@@ -1401,8 +1421,7 @@ class ScheduleBatch:
         """
         self.forward_mode = ForwardMode.DECODE
 
-        if self.is_hybrid:
-            self.maybe_evict_swa()
+        self.maybe_evict_swa()
 
         # Process each DP rank
         for dp_rank in range(self.dp_size):

@@ -393,6 +393,7 @@ class TestSWAEviction(unittest.TestCase):
                 self.origin_input_ids = origin_input_ids
                 self.output_ids = output_ids
                 self.swa_evicted_seqlen = 0
+                self.cache_protected_len = 0
                 self.req_pool_idx = 0
                 self.decode_batch_idx = 0
                 self.extend_batch_idx = 0
@@ -553,6 +554,7 @@ class TestSWAOverlapSafety(unittest.TestCase):
                 self.origin_input_ids = origin_input_ids
                 self.output_ids = output_ids
                 self.swa_evicted_seqlen = 0
+                self.cache_protected_len = 0
                 self.req_pool_idx = 0
                 self.decode_batch_idx = 0
                 self.extend_batch_idx = 0
@@ -575,17 +577,25 @@ class TestSWAOverlapSafety(unittest.TestCase):
 
     def _make_batch(self, req, *, enable_overlap, forward_mode, prefix_lens=None, chunked_req=None):
         from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, ScheduleReqsInfo
+        from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 
         reqs_info = ScheduleReqsInfo(
             reqs=[req],
             chunked_req=chunked_req,
             prefix_lens=prefix_lens,
         )
+        # Use ChunkCache for extend tests to match upstream behavior
+        # (SWA eviction during extend only happens for ChunkCache)
+        tree_cache = ChunkCache(
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.alloc,
+            page_size=self.page_size,
+        ) if forward_mode.is_extend() else None
         return ScheduleBatch(
             reqs_info=[reqs_info],
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.alloc,
-            tree_cache=None,
+            tree_cache=tree_cache,
             is_hybrid=True,
             model_config=SimpleNamespace(sliding_window=self.sliding_window),
             forward_mode=forward_mode,

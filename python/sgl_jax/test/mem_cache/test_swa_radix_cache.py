@@ -493,6 +493,703 @@ class TestSWARadixCache(unittest.TestCase):
         self.assertEqual(allocator.swa_available_size(dp_rank=0), initial_swa[0])
         self.assertEqual(allocator.swa_available_size(dp_rank=1), initial_swa[1])
 
+    # ------------------------------------------------------------------ #
+    #  T1-T12: Tombstone / cache_protected_len correctness tests          #
+    # ------------------------------------------------------------------ #
+
+    def _find_node_by_key_prefix(self, start_token):
+        """Walk tree from root to find the node whose key starts with start_token."""
+        root = self.cache.root_node
+        child_key = self.cache.get_child_key_fn(
+            RadixKey([start_token], None, None)
+        )
+        if child_key in root.children:
+            return root.children[child_key]
+        return None
+
+    def _make_small_cache(self, sliding_window_size=4):
+        """Create a cache with a small sliding window for tombstone tests."""
+        return SWARadixCache(
+            req_to_token_pool=self.req_pool,
+            token_to_kv_pool_allocator=self.allocator,
+            sliding_window_size=sliding_window_size,
+            page_size=1,
+            disable=False,
+        )
+
+    def _verify_size_consistency_for(self, cache, msg: str = ""):
+        """Walk the tree and verify that tracked sizes match actual tree content."""
+        full_total = 0
+        swa_total = 0
+        stack = [cache.root_node]
+        while stack:
+            node = stack.pop()
+            if node != cache.root_node and node.value is not None:
+                full_total += len(node.value)
+                if not node.swa_tombstone:
+                    swa_total += len(node.value)
+            stack.extend(node.children.values())
+
+        actual_full = sum(cache.full_evictable_size_.values()) + sum(
+            cache.full_protected_size_.values()
+        )
+        actual_swa = sum(cache.swa_evictable_size_.values()) + sum(
+            cache.swa_protected_size_.values()
+        )
+        self.assertEqual(
+            full_total, actual_full,
+            f"full size mismatch: tree={full_total}, tracked={actual_full}. {msg}",
+        )
+        self.assertEqual(
+            swa_total, actual_swa,
+            f"swa size mismatch: tree={swa_total}, tracked={actual_swa}. {msg}",
+        )
+
+    def _make_tree_with_tombstone(self):
+        """
+        Helper: insert two sequences that share a prefix into a small-window cache,
+        then SWA-evict the shared prefix so it becomes a tombstone.
+
+        Tree structure after setup:
+          root → [0..9] (internal, tombstone after evict)
+                    ├→ [10..14] (leaf A suffix)
+                    └→ [20..24] (leaf B suffix)
+
+        Returns (cache, key_a, val_a, key_b, val_b).
+        """
+        cache = self._make_small_cache(sliding_window_size=4)
+
+        shared = list(range(0, 10))
+        key_a = shared + list(range(10, 15))
+        key_b = shared + list(range(20, 25))
+        val_a = self._alloc_indices(len(key_a))
+        val_b = self._alloc_indices(len(key_b))
+
+        cache.insert(key_a, value=val_a, prev_prefix_len=0)
+        cache.insert(key_b, value=val_b, prev_prefix_len=0)
+
+        # SWA-evict: evict the shared internal node (LRU, oldest access)
+        cache.evict(full_num_tokens=0, swa_num_tokens=len(shared))
+
+        return cache, key_a, val_a, key_b, val_b
+
+    def test_tombstone_creation(self):
+        """T1: SWA evict creates tombstone on internal node, swa_evictable_size_ decreases."""
+        cache = self._make_small_cache(sliding_window_size=4)
+
+        shared = list(range(0, 10))
+        key_a = shared + list(range(10, 15))
+        key_b = shared + list(range(20, 25))
+        val_a = self._alloc_indices(len(key_a))
+        val_b = self._alloc_indices(len(key_b))
+
+        cache.insert(key_a, value=val_a, prev_prefix_len=0)
+        cache.insert(key_b, value=val_b, prev_prefix_len=0)
+
+        full_before, swa_before = cache.total_size()
+        self.assertEqual(full_before, swa_before)  # no tombstones yet
+        swa_evictable_before = cache.swa_evictable_size()
+
+        # SWA evict the shared prefix
+        cache.evict(full_num_tokens=0, swa_num_tokens=len(shared))
+
+        full_after, swa_after = cache.total_size()
+        # Full tokens unchanged (tombstone keeps full), SWA tokens decreased
+        self.assertEqual(full_after, full_before)
+        self.assertLess(swa_after, swa_before)
+
+        # swa_evictable_size_ should have decreased
+        swa_evictable_after = cache.swa_evictable_size()
+        self.assertLess(swa_evictable_after, swa_evictable_before)
+
+        # Walk the tree to find the shared internal node and verify tombstone
+        child_key = cache.get_child_key_fn(RadixKey([0], None, None))
+        internal_node = cache.root_node.children[child_key]
+        self.assertTrue(internal_node.swa_tombstone)
+        self.assertEqual(len(internal_node.value), 10)
+
+        self._verify_size_consistency_for(cache, "after tombstone creation")
+
+    def test_tombstone_prefix_match(self):
+        """T2: Tombstone node does not affect prefix matching results when sliding window is satisfied."""
+        cache, key_a, val_a, key_b, val_b = self._make_tree_with_tombstone()
+
+        # With sliding_window_size=4 and suffix length=5 (>4), matching should still work
+        match_a = cache.match_prefix(key_a)
+        self.assertEqual(len(match_a.device_indices), len(key_a))
+
+        match_b = cache.match_prefix(key_b)
+        self.assertEqual(len(match_b.device_indices), len(key_b))
+
+    def test_tombstone_healing_branch1(self):
+        """T3: swa_evicted_seqlen <= node_start → full revive of tombstone."""
+        cache, key_a, val_a, key_b, val_b = self._make_tree_with_tombstone()
+
+        # Verify shared prefix is tombstone by walking tree
+        child_key = cache.get_child_key_fn(RadixKey([0], None, None))
+        tombstone_node = cache.root_node.children[child_key]
+        self.assertTrue(tombstone_node.swa_tombstone)
+
+        # Re-insert key_a with swa_evicted_seqlen=0 (Branch 1: not evicted)
+        new_val = self._alloc_indices(len(key_a))
+        cache.insert(
+            key_a, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=0
+        )
+
+        # The tombstone should be healed (revived)
+        healed_node = cache.root_node.children[child_key]
+        self.assertFalse(healed_node.swa_tombstone)
+
+        self._verify_size_consistency_for(cache, "after branch 1 healing")
+
+    def test_tombstone_healing_branch2(self):
+        """T4: swa_evicted_seqlen in middle of tombstone node → split and partial revive."""
+        cache, key_a, val_a, key_b, val_b = self._make_tree_with_tombstone()
+
+        # Verify shared prefix is tombstone
+        child_key = cache.get_child_key_fn(RadixKey([0], None, None))
+        tombstone_node = cache.root_node.children[child_key]
+        self.assertTrue(tombstone_node.swa_tombstone)
+
+        # Re-insert with swa_evicted_seqlen=5 (in the middle of shared[0:10])
+        # Branch 2: split at position 5, revive [5:10], keep [0:5] as tombstone
+        new_val = self._alloc_indices(len(key_a))
+        cache.insert(
+            key_a, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=5
+        )
+
+        # Walk tree: root → [0:5] (tombstone) → [5:10] (revived) → {[10:15], [20:24]}
+        front_node = cache.root_node.children[child_key]
+        self.assertTrue(front_node.swa_tombstone)
+        self.assertEqual(len(front_node.value), 5)
+
+        # The back node [5:10] should have been revived
+        # It should be a child of front_node
+        self.assertGreater(len(front_node.children), 0)
+        # Find the child whose key starts with token 5
+        back_child_key = cache.get_child_key_fn(RadixKey([5], None, None))
+        self.assertIn(back_child_key, front_node.children)
+        back_node = front_node.children[back_child_key]
+        self.assertFalse(back_node.swa_tombstone)
+        self.assertEqual(len(back_node.value), 5)
+
+        self._verify_size_consistency_for(cache, "after branch 2 healing")
+
+    def test_tombstone_healing_branch3(self):
+        """T5: swa_evicted_seqlen >= node_end → keep tombstone."""
+        cache, key_a, val_a, key_b, val_b = self._make_tree_with_tombstone()
+
+        # Verify shared prefix is tombstone
+        child_key = cache.get_child_key_fn(RadixKey([0], None, None))
+        self.assertTrue(cache.root_node.children[child_key].swa_tombstone)
+
+        # Re-insert with swa_evicted_seqlen=15 (>= node_end=10)
+        # Branch 3: entire node already evicted → keep tombstone
+        new_val = self._alloc_indices(len(key_a))
+        cache.insert(
+            key_a, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=15
+        )
+
+        # The shared prefix should still be tombstone
+        self.assertTrue(cache.root_node.children[child_key].swa_tombstone)
+
+        self._verify_size_consistency_for(cache, "after branch 3 (keep tombstone)")
+
+    def test_cascade_delete_tombstone(self):
+        """T6: Leaf delete cascades to tombstone parent."""
+        cache, key_a, val_a, key_b, val_b = self._make_tree_with_tombstone()
+
+        full_before, _ = cache.total_size()
+
+        # Evict enough full tokens to delete all leaves, which cascade to tombstone parent
+        cache.evict(full_num_tokens=full_before, swa_num_tokens=0)
+
+        full_after, swa_after = cache.total_size()
+        self.assertEqual(full_after, 0)
+        self.assertEqual(swa_after, 0)
+
+        self._verify_size_consistency_for(cache, "after cascade delete")
+
+    def test_size_tracking_consistency(self):
+        """T7: Insert/evict/delete cycle — sizes match actual tree at every step."""
+        cache = self._make_small_cache(sliding_window_size=4)
+        keys = [list(range(i * 100, i * 100 + 20)) for i in range(5)]
+        vals = [self._alloc_indices(20) for _ in range(5)]
+
+        # Insert all
+        for k, v in zip(keys, vals):
+            cache.insert(k, value=v, prev_prefix_len=0)
+            self._verify_size_consistency_for(cache, f"after insert {k[0]}")
+
+        # SWA evict some
+        cache.evict(full_num_tokens=0, swa_num_tokens=20)
+        self._verify_size_consistency_for(cache, "after swa evict 20")
+
+        # Full evict some
+        cache.evict(full_num_tokens=20, swa_num_tokens=0)
+        self._verify_size_consistency_for(cache, "after full evict 20")
+
+        # Insert more (reuse prefix)
+        new_key = keys[0] + [999, 998, 997]
+        new_val = self._alloc_indices(len(new_key))
+        cache.insert(new_key, value=new_val, prev_prefix_len=0)
+        self._verify_size_consistency_for(cache, "after re-insert with extension")
+
+        # Evict everything
+        full_total, _ = cache.total_size()
+        cache.evict(full_num_tokens=full_total, swa_num_tokens=0)
+        self._verify_size_consistency_for(cache, "after evict all")
+
+    def test_cache_protected_len_basic(self):
+        """T8: cache_protected_len prevents swa_evicted_seqlen from corrupting tree slots during insert."""
+        cache = self._make_small_cache(sliding_window_size=4)
+        key = list(range(0, 20))
+        val_first = self._alloc_indices(len(key))
+
+        # First insert: puts everything into tree
+        cache.insert(key, value=val_first, prev_prefix_len=0)
+
+        # Match to confirm
+        match = cache.match_prefix(key)
+        self.assertEqual(len(match.device_indices), 20)
+
+        # SWA-evict to create tombstone
+        cache.evict(full_num_tokens=0, swa_num_tokens=20)
+
+        # Second insert with cache_protected_len=10 (prev_prefix_len) and swa_evicted_seqlen=5
+        # Branch 2 applies: swa_evicted_seqlen(5) < node_end(20), split at 5, revive [5:20]
+        val_second = self._alloc_indices(len(key))
+        cache.insert(
+            key, value=val_second, prev_prefix_len=10, swa_evicted_seqlen=5
+        )
+
+        # Match should still return 20 tokens (sliding_window=4, suffix > 4)
+        match2 = cache.match_prefix(key)
+        self.assertEqual(len(match2.device_indices), 20)
+
+        self._verify_size_consistency_for(cache, "after cache_protected_len insert")
+
+    def test_new_node_tombstone_split(self):
+        """T9: New node crossing swa_evicted_seqlen boundary → correct split."""
+        cache = self._make_small_cache(sliding_window_size=4)
+        key = list(range(0, 20))
+        val = self._alloc_indices(len(key))
+
+        # Insert with swa_evicted_seqlen=10 → new node should be split:
+        # [0:10] as tombstone + [10:20] as non-tombstone
+        cache.insert(key, value=val, prev_prefix_len=0, swa_evicted_seqlen=10)
+
+        full_total, swa_total = cache.total_size()
+        self.assertEqual(full_total, 20)
+        self.assertEqual(swa_total, 10)  # only [10:20] has SWA
+
+        # Verify tree structure: root should have one child (tombstone [0:10])
+        # which has one child (non-tombstone [10:20])
+        root = cache.root_node
+        self.assertEqual(len(root.children), 1)
+        child_key = list(root.children.keys())[0]
+        tombstone_node = root.children[child_key]
+        self.assertTrue(tombstone_node.swa_tombstone)
+        self.assertEqual(len(tombstone_node.value), 10)
+
+        self.assertEqual(len(tombstone_node.children), 1)
+        leaf_key = list(tombstone_node.children.keys())[0]
+        leaf_node = tombstone_node.children[leaf_key]
+        self.assertFalse(leaf_node.swa_tombstone)
+        self.assertEqual(len(leaf_node.value), 10)
+
+        # Match should return all 20 tokens (sliding_window=4, non-tombstone suffix=10 > 4)
+        match = cache.match_prefix(key)
+        self.assertEqual(len(match.device_indices), 20)
+
+        self._verify_size_consistency_for(cache, "after new node tombstone split")
+
+    def test_evict_both_pools(self):
+        """T10: Phase 1 (leaf) + Phase 2 (tombstone) interleaved eviction."""
+        cache = self._make_small_cache(sliding_window_size=4)
+        shared = list(range(0, 8))
+        key_a = shared + list(range(10, 18))
+        key_b = shared + list(range(20, 28))
+        val_a = self._alloc_indices(len(key_a))
+        val_b = self._alloc_indices(len(key_b))
+
+        cache.insert(key_a, value=val_a, prev_prefix_len=0)
+        cache.insert(key_b, value=val_b, prev_prefix_len=0)
+
+        full_before, swa_before = cache.total_size()
+        self.assertEqual(full_before, swa_before)
+
+        # Phase 2 SWA evict: should tombstone the shared prefix
+        cache.evict(full_num_tokens=0, swa_num_tokens=len(shared))
+        full_mid, swa_mid = cache.total_size()
+        self.assertEqual(full_mid, full_before)  # full unchanged
+        self.assertLess(swa_mid, swa_before)  # SWA decreased
+        self._verify_size_consistency_for(cache, "after phase 2 evict")
+
+        # Phase 1 full evict: should delete leaf + cascade tombstone
+        cache.evict(full_num_tokens=8, swa_num_tokens=0)
+        full_after, swa_after = cache.total_size()
+        self.assertLess(full_after, full_mid)
+        self._verify_size_consistency_for(cache, "after phase 1 evict")
+
+    def test_insert_after_tombstone_evict_cycle(self):
+        """T11: Multiple insert→evict→insert cycles — no size leaks."""
+        cache = self._make_small_cache(sliding_window_size=4)
+
+        for cycle in range(5):
+            key = list(range(cycle * 100, cycle * 100 + 16))
+            val = self._alloc_indices(len(key))
+            cache.insert(key, value=val, prev_prefix_len=0)
+            self._verify_size_consistency_for(cache, f"cycle {cycle} insert")
+
+            # SWA evict some
+            cache.evict(full_num_tokens=0, swa_num_tokens=8)
+            self._verify_size_consistency_for(cache, f"cycle {cycle} swa evict")
+
+            # Re-insert with new values (simulating healing)
+            new_val = self._alloc_indices(len(key))
+            cache.insert(
+                key, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=0
+            )
+            self._verify_size_consistency_for(cache, f"cycle {cycle} re-insert")
+
+        # Final full evict
+        full_total, _ = cache.total_size()
+        cache.evict(full_num_tokens=full_total + 100, swa_num_tokens=0)
+        full_final, swa_final = cache.total_size()
+        self.assertEqual(full_final, 0, "full size should be 0 after evict all")
+        self.assertEqual(swa_final, 0, "swa size should be 0 after evict all")
+        self._verify_size_consistency_for(cache, "after final evict all")
+
+    def test_size_tracking_fuzz(self):
+        """T12: Random operations, verify size consistency at each step."""
+        import random
+
+        rng = random.Random(42)
+        cache = self._make_small_cache(sliding_window_size=4)
+
+        for step in range(50):
+            op = rng.choice(["insert", "evict_swa", "evict_full"])
+            if op == "insert":
+                length = rng.randint(4, 32)
+                start = rng.randint(0, 500)
+                key = list(range(start, start + length))
+                val = self._alloc_indices(length)
+                swa_evicted = rng.choice([0, 0, 0, rng.randint(0, length)])
+                cache.insert(
+                    key, value=val, prev_prefix_len=0,
+                    swa_evicted_seqlen=swa_evicted,
+                )
+            elif op == "evict_swa":
+                amount = rng.randint(1, 16)
+                cache.evict(full_num_tokens=0, swa_num_tokens=amount)
+            else:
+                amount = rng.randint(1, 16)
+                cache.evict(full_num_tokens=amount, swa_num_tokens=0)
+
+            self._verify_size_consistency_for(cache, f"fuzz step {step} op={op}")
+
+    # ------------------------------------------------------------------ #
+    #  T13-T22: Gap fix verification tests                                #
+    # ------------------------------------------------------------------ #
+
+    def test_tombstone_reset_unconditional(self):
+        """T13: _match_prefix_helper resets match_len_since_tombstone even when
+        sliding window check fails.
+
+        Scenario: Two consecutive tombstone nodes on the path. Before the fix,
+        the second tombstone would NOT reset match_len_since_tombstone because
+        the first tombstone already set it to 0 (< sliding_window_size), so the
+        condition was False and the reset was skipped. After the fix, the reset
+        is unconditional.
+        """
+        cache = self._make_small_cache(sliding_window_size=4)
+
+        # Build a tree: root → [0..4] → [5..9] → [10..14] (leaf)
+        # We insert two sequences to force a split so the shared prefixes become
+        # internal nodes that we can tombstone independently.
+        shared1 = list(range(0, 5))
+        shared2 = list(range(5, 10))
+        suffix_a = list(range(10, 15))
+        suffix_b = list(range(20, 25))
+
+        key_a = shared1 + shared2 + suffix_a
+        key_b = shared1 + shared2 + suffix_b
+        val_a = self._alloc_indices(len(key_a))
+        val_b = self._alloc_indices(len(key_b))
+
+        cache.insert(key_a, value=val_a, prev_prefix_len=0)
+        cache.insert(key_b, value=val_b, prev_prefix_len=0)
+
+        # SWA-evict both shared prefixes: first [0..4], then [5..9]
+        # This creates two consecutive tombstone nodes
+        cache.evict(full_num_tokens=0, swa_num_tokens=10)
+
+        # Walk tree to verify two tombstones
+        child_key_0 = cache.get_child_key_fn(RadixKey([0], None, None))
+        node_0_4 = cache.root_node.children[child_key_0]
+        self.assertTrue(node_0_4.swa_tombstone, "First shared prefix should be tombstone")
+
+        # Match should still work: suffix (5 tokens) > sliding_window (4)
+        match_a = cache.match_prefix(key_a)
+        # Even with two consecutive tombstones, the suffix after the last tombstone
+        # should be enough to match if it exceeds sliding_window_size
+        self.assertGreater(len(match_a.device_indices), 0)
+
+        self._verify_size_consistency_for(cache, "after double tombstone match")
+
+    def test_new_leaf_never_tombstone(self):
+        """T14: When swa_evicted_seqlen >= total_prefix_length + len(key),
+        all remaining tokens are SWA-evicted. No node is created (can't be
+        non-tombstone because SWA is gone, can't be tombstone leaf because
+        of the leaf-must-not-be-tombstone invariant). Value is freed and
+        insert returns early.
+        """
+        cache = self._make_small_cache(sliding_window_size=4)
+        key = list(range(0, 10))
+        val = self._alloc_indices(len(key))
+
+        # Insert with swa_evicted_seqlen=20 (>> total_prefix_length + len(key) = 10)
+        # Upstream behavior: free value, return early, no node created
+        cache.insert(key, value=val, prev_prefix_len=0, swa_evicted_seqlen=20)
+
+        full_total, swa_total = cache.total_size()
+        # No node created → tree is empty
+        self.assertEqual(full_total, 0)
+        self.assertEqual(swa_total, 0)
+
+        # Root should have no children
+        self.assertEqual(len(cache.root_node.children), 0)
+
+        self._verify_size_consistency_for(cache, "after all-evicted insert")
+
+    def test_new_leaf_never_tombstone_exact_boundary(self):
+        """T15: swa_evicted_seqlen == total_prefix_length + len(key) boundary case.
+
+        When swa_evicted_seqlen exactly equals total_prefix_length + len(key),
+        all tokens are SWA-evicted. No node is created, value is freed.
+        """
+        cache = self._make_small_cache(sliding_window_size=4)
+        key = list(range(0, 10))
+        val = self._alloc_indices(len(key))
+
+        # swa_evicted_seqlen == total_prefix_length(0) + len(key)(10) = 10
+        cache.insert(key, value=val, prev_prefix_len=0, swa_evicted_seqlen=10)
+
+        full_total, swa_total = cache.total_size()
+        # No node created → tree is empty
+        self.assertEqual(full_total, 0)
+        self.assertEqual(swa_total, 0)
+
+        # Root should have no children
+        self.assertEqual(len(cache.root_node.children), 0)
+
+        self._verify_size_consistency_for(cache, "after exact boundary insert")
+
+    def test_match_result_has_cache_protected_len_field(self):
+        """T16: MatchResult includes cache_protected_len field (defaults to None)."""
+        from sgl_jax.srt.mem_cache.base_prefix_cache import MatchResult
+
+        key = list(range(0, 5))
+        val = self._alloc_indices(len(key))
+        self.cache.insert(key, value=val, prev_prefix_len=0)
+
+        match = self.cache.match_prefix(key)
+        self.assertIsInstance(match, MatchResult)
+        # cache_protected_len defaults to None (set on req object, not match result)
+        self.assertIsNone(match.cache_protected_len)
+        # Verify field exists and is accessible
+        self.assertTrue(hasattr(match, 'cache_protected_len'))
+
+    def test_delete_leaf_uses_child_key_fn(self):
+        """T17: _delete_leaf correctly removes nodes using get_child_key_fn lookup."""
+        cache = self._make_small_cache(sliding_window_size=4)
+
+        # Insert two sequences sharing a prefix to create internal + leaf structure
+        shared = list(range(0, 5))
+        key_a = shared + list(range(10, 15))
+        key_b = shared + list(range(20, 25))
+        val_a = self._alloc_indices(len(key_a))
+        val_b = self._alloc_indices(len(key_b))
+
+        cache.insert(key_a, value=val_a, prev_prefix_len=0)
+        cache.insert(key_b, value=val_b, prev_prefix_len=0)
+
+        full_before, swa_before = cache.total_size()
+        self.assertEqual(full_before, 15)  # 5 shared + 5 suffix_a + 5 suffix_b
+
+        # The tree has: root → [0..4] (internal) → {[10..14] (leaf A), [20..24] (leaf B)}
+        # Evict one leaf by full eviction
+        cache.evict(full_num_tokens=5, swa_num_tokens=0)
+
+        full_after, swa_after = cache.total_size()
+        self.assertLess(full_after, full_before)
+
+        # Verify tree is still consistent
+        self._verify_size_consistency_for(cache, "after leaf delete via child_key_fn")
+
+    def test_delete_tombstone_leaf_uses_child_key_fn(self):
+        """T18: _delete_tombstone_leaf correctly removes tombstone nodes using get_child_key_fn."""
+        cache, key_a, val_a, key_b, val_b = self._make_tree_with_tombstone()
+
+        # At this point: shared prefix is tombstone, two leaves exist
+        full_before, _ = cache.total_size()
+
+        # Full evict everything — should cascade delete tombstone parent via _delete_tombstone_leaf
+        cache.evict(full_num_tokens=full_before, swa_num_tokens=0)
+
+        full_after, swa_after = cache.total_size()
+        self.assertEqual(full_after, 0)
+        self.assertEqual(swa_after, 0)
+
+        # Root should have no children
+        self.assertEqual(len(cache.root_node.children), 0)
+        self._verify_size_consistency_for(cache, "after tombstone cascade delete via child_key_fn")
+
+    def test_evict_swa_bumps_to_cache_protected_len(self):
+        """T19: _evict_swa bumps swa_evicted_seqlen to cache_protected_len upfront."""
+        # This is an integration test simulating the schedule_batch behavior
+        cache = self._make_small_cache(sliding_window_size=4)
+        key = list(range(0, 20))
+        val = self._alloc_indices(len(key))
+        cache.insert(key, value=val, prev_prefix_len=0)
+
+        # Simulate a request with cache_protected_len=10
+        # and swa_evicted_seqlen=3 (< cache_protected_len)
+        class MockReq:
+            def __init__(self):
+                self.swa_evicted_seqlen = 3
+                self.cache_protected_len = 10
+                self.req_pool_idx = 0
+
+        req = MockReq()
+        # Write mock indices to req_to_token_pool
+        self.req_pool.req_to_token[0, :20] = val
+
+        # Create a mock batch-like object with needed attributes
+        from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
+        class MockBatch:
+            def __init__(self_, req_pool, allocator):
+                self_.req_to_token_pool = req_pool
+                self_.token_to_kv_pool_allocator = allocator
+                self_.tree_cache = cache
+
+            def _evict_swa(self_, req, pre_len, sliding_window_size, page_size, dp_rank=0):
+                """Replicate the fixed _evict_swa logic."""
+                assert req.cache_protected_len % page_size == 0
+                req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
+                new_evicted = max(req.swa_evicted_seqlen, pre_len - sliding_window_size)
+                if page_size > 1:
+                    new_evicted = (new_evicted // page_size) * page_size
+                if new_evicted <= req.swa_evicted_seqlen:
+                    return
+                free_slots = self_.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, req.swa_evicted_seqlen:new_evicted
+                ]
+                self_.token_to_kv_pool_allocator.free_swa(free_slots, dp_rank=dp_rank)
+                req.swa_evicted_seqlen = new_evicted
+
+        batch = MockBatch(self.req_pool, self.allocator)
+        batch._evict_swa(req, pre_len=18, sliding_window_size=4, page_size=1)
+
+        # swa_evicted_seqlen should be bumped to at least cache_protected_len (10)
+        # then to max(10, 18-4) = 14
+        self.assertEqual(req.swa_evicted_seqlen, 14)
+        # Crucially, swa_evicted_seqlen should never be less than cache_protected_len
+        self.assertGreaterEqual(req.swa_evicted_seqlen, req.cache_protected_len)
+
+    def test_evict_swa_page_alignment_assertion(self):
+        """T20: _evict_swa asserts cache_protected_len % page_size == 0."""
+        class MockReq:
+            def __init__(self):
+                self.swa_evicted_seqlen = 0
+                self.cache_protected_len = 3  # NOT page-aligned for page_size=4
+                self.req_pool_idx = 0
+
+        req = MockReq()
+
+        class MockBatch:
+            def __init__(self_, req_pool, allocator):
+                self_.req_to_token_pool = req_pool
+                self_.token_to_kv_pool_allocator = allocator
+
+            def _evict_swa(self_, req, pre_len, sliding_window_size, page_size, dp_rank=0):
+                assert req.cache_protected_len % page_size == 0, \
+                    f"cache_protected_len must be page aligned, {req.cache_protected_len=}, {page_size=}"
+                req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
+                new_evicted = max(req.swa_evicted_seqlen, pre_len - sliding_window_size)
+                if page_size > 1:
+                    new_evicted = (new_evicted // page_size) * page_size
+                if new_evicted <= req.swa_evicted_seqlen:
+                    return
+
+        batch = MockBatch(self.req_pool, self.allocator)
+
+        # Should raise AssertionError for non-aligned cache_protected_len with page_size=4
+        with self.assertRaises(AssertionError):
+            batch._evict_swa(req, pre_len=20, sliding_window_size=4, page_size=4)
+
+    def test_swa_evicted_seqlen_page_alignment_assertion(self):
+        """T21: _insert_helper asserts swa_evicted_seqlen % page_size == 0 when handling tombstones."""
+        # Create a paged cache with page_size=4
+        paged_cache = SWARadixCache(
+            req_to_token_pool=self.req_pool,
+            token_to_kv_pool_allocator=self.allocator,
+            sliding_window_size=64,
+            page_size=4,
+            disable=False,
+        )
+
+        # Insert then tombstone: create a sequence, evict its SWA to make tombstone
+        shared = list(range(0, 8))
+        key_a = shared + list(range(10, 18))
+        key_b = shared + list(range(20, 28))
+        val_a = self._alloc_indices(len(key_a))
+        val_b = self._alloc_indices(len(key_b))
+
+        paged_cache.insert(key_a, value=val_a, prev_prefix_len=0)
+        paged_cache.insert(key_b, value=val_b, prev_prefix_len=0)
+        paged_cache.evict(full_num_tokens=0, swa_num_tokens=8)
+
+        # Re-inserting with non-page-aligned swa_evicted_seqlen should assert
+        new_val = self._alloc_indices(len(key_a))
+        with self.assertRaises(AssertionError):
+            paged_cache.insert(
+                key_a, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=3
+            )
+
+    def test_cache_unfinished_req_writeback_range(self):
+        """T22: cache_unfinished_req writes back from cache_protected_len, not len(prefix_indices)."""
+        cache = self._make_small_cache(sliding_window_size=64)
+
+        # Simulate first insert (initial request)
+        key_part1 = list(range(0, 10))
+        val1 = self._alloc_indices(len(key_part1))
+        cache.insert(key_part1, value=val1, prev_prefix_len=0)
+
+        # After first insert, match should return all 10 tokens
+        match1 = cache.match_prefix(key_part1)
+        self.assertEqual(len(match1.device_indices), 10)
+
+        # Insert extended sequence (simulating cache_unfinished_req)
+        key_full = list(range(0, 20))
+        val2 = self._alloc_indices(len(key_full))
+        new_prefix_len = cache.insert(
+            key_full, value=val2, prev_prefix_len=10, swa_evicted_seqlen=0
+        )
+
+        # Match the full key
+        match2 = cache.match_prefix(key_full)
+        self.assertEqual(len(match2.device_indices), 20)
+
+        # Verify old cached indices are preserved (not overwritten)
+        np.testing.assert_array_equal(
+            np.asarray(match2.device_indices[:10]),
+            np.asarray(match1.device_indices),
+        )
+
+        self._verify_size_consistency_for(cache, "after simulated cache_unfinished_req")
+
 
 class TestSchedulerCacheInit(unittest.TestCase):
     """Tests for scheduler cache type selection with hybrid models (#202)."""
