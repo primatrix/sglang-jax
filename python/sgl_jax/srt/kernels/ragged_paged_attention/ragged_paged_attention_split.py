@@ -110,7 +110,7 @@ def _ragged_paged_attention_kernel_split(
     bq_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     bo_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     lse_vmem_ref,  # [actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, 128]
-    sems,  # [6, 2]
+    sems,  # [7, 2]
     l_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     acc_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim],
@@ -307,7 +307,8 @@ def _ragged_paged_attention_kernel_split(
         lax.fori_loop(0, load_q_sz, loop_body, None, unroll=False)
 
     def _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, *, wait=False):
-        sem = sems.at[0, bkv_sem_idx]
+        k_sem = sems.at[0, bkv_sem_idx]
+        v_sem = sems.at[6, bkv_sem_idx]
         k_vmem_ref = bk_x2_ref.at[bkv_sem_idx]
         v_vmem_ref = bv_x2_ref.at[bkv_sem_idx]
 
@@ -348,13 +349,13 @@ def _ragged_paged_attention_kernel_split(
                 _async_copy(
                     k_cache_hbm_ref_flat.at[pl.ds(p_idx * page_size, sz)],
                     k_vmem_ref.at[pl.ds(i * page_size, sz)],
-                    sem,
+                    k_sem,
                     wait,
                 )
                 _async_copy(
                     v_cache_hbm_ref_flat.at[pl.ds(p_idx * page_size, sz)],
                     v_vmem_ref.at[pl.ds(i * page_size, sz)],
-                    sem,
+                    v_sem,
                     wait,
                 )
                 return offset + sz
@@ -367,13 +368,13 @@ def _ragged_paged_attention_kernel_split(
             _async_copy(
                 k_hbm_ref.at[pl.ds(new_kv_len_start, size)],
                 k_vmem_ref.at[pl.ds(offset, size)],
-                sem,
+                k_sem,
                 wait,
             )
             _async_copy(
                 v_hbm_ref.at[pl.ds(new_kv_len_start, size)],
                 v_vmem_ref.at[pl.ds(offset, size)],
-                sem,
+                v_sem,
                 wait,
             )
 
@@ -382,8 +383,8 @@ def _ragged_paged_attention_kernel_split(
             offset = jnp.minimum(kv_left_frm_cache, page_size * bkv_p)
             dst_k = k_vmem_ref.at[pl.ds(0, offset + bkv_sz_frm_new)]
             dst_v = v_vmem_ref.at[pl.ds(0, offset + bkv_sz_frm_new)]
-            _async_copy(src=dst_k, dst=dst_k, sem=sem, wait=True)
-            _async_copy(src=dst_v, dst=dst_v, sem=sem, wait=True)
+            _async_copy(src=dst_k, dst=dst_k, sem=k_sem, wait=True)
+            _async_copy(src=dst_v, dst=dst_v, sem=v_sem, wait=True)
             return kv_len_start + offset, bkv_sz_frm_new
 
     def _update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz, *, wait=False):
@@ -539,26 +540,60 @@ def _ragged_paged_attention_kernel_split(
         res = pltpu.bitcast(q_ref[: actual_bq_sz * num_q_heads_per_kv_head_per_packing], q_dtype)
         return res
 
+    def _strided_load(ref, start, step):
+        """Row-stride selection on a 2D uint32 ref. Uses fold trick for 128-aligned dims."""
+        assert get_dtype_packing(ref.dtype) == 1
+        assert len(ref.shape) == 2
+        r, minor = ref.shape
+        if minor % 128 == 0:
+            folds = minor // 128
+            ref = ref.reshape(r * folds, 128)
+            start *= folds
+            step *= folds
+            return jnp.concat([ref[start + i :: step] for i in range(folds)], axis=1)
+        else:
+            return ref[start :: step]
+
     def strided_load_kv_separate(bkv_sem_idx, start, step):
         head_idx_start = start // 2
-
-        k_ref = bk_x2_ref.at[bkv_sem_idx]
-        v_ref = bv_x2_ref.at[bkv_sem_idx]
-
-        def unpack_heads(ref, head_start_idx, num_heads_to_load, head_dim_val):
-            ref_flat = ref.reshape(bkv_sz, -1, head_dim_val)
-            heads = ref_flat[:, head_start_idx : head_start_idx + num_heads_to_load, :]
-            res = []
-            for i in range(num_heads_to_load):
-                res.append(heads[:, i, :])
-            return res
-
         heads_per_load = max(1, kv_packing // 2)
 
-        ks = unpack_heads(k_ref, head_idx_start, heads_per_load, k_head_dim)
-        vs = unpack_heads(v_ref, head_idx_start, heads_per_load, v_head_dim)
+        kv_k_dtype = bk_x2_ref.dtype
+        kv_v_dtype = bv_x2_ref.dtype
 
-        return list(zip(ks, vs))
+        # Bitcast to uint32: collapses kv_packing dim (2→1 for bf16)
+        k_ref = bk_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx]
+        v_ref = bv_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx]
+
+        # Flatten to 2D: [bkv_sz * num_kv_heads_per_kv_packing, head_dim] uint32
+        k_ref_2d = k_ref.reshape(bkv_sz * num_kv_heads_per_kv_packing, k_head_dim)
+        v_ref_2d = v_ref.reshape(bkv_sz * num_kv_heads_per_kv_packing, v_head_dim)
+
+        results = []
+        for i in range(heads_per_load):
+            h = head_idx_start + i
+            g = h // kv_packing
+            p = h % kv_packing
+
+            # Row-stride selection: [bkv_sz, head_dim] uint32
+            k_packed = _strided_load(k_ref_2d, g, num_kv_heads_per_kv_packing)
+            v_packed = _strided_load(v_ref_2d, g, num_kv_heads_per_kv_packing)
+
+            if kv_packing == 1:
+                k_val = pltpu.bitcast(k_packed, kv_k_dtype)
+                v_val = pltpu.bitcast(v_packed, kv_v_dtype)
+            else:
+                # Unpack bf16 from uint32: low 16 bits = pack_idx 0, high = pack_idx 1
+                if p == 0:
+                    k_val = pltpu.bitcast(k_packed.astype(jnp.uint16), kv_k_dtype)
+                    v_val = pltpu.bitcast(v_packed.astype(jnp.uint16), kv_v_dtype)
+                else:
+                    k_val = pltpu.bitcast((k_packed >> 16).astype(jnp.uint16), kv_k_dtype)
+                    v_val = pltpu.bitcast((v_packed >> 16).astype(jnp.uint16), kv_v_dtype)
+
+            results.append((k_val, v_val))
+
+        return results
 
     def broadcast_minor(src, shape):
         if src.shape == shape:
@@ -1038,7 +1073,7 @@ def ragged_paged_attention_split(
         bq_double_buf,
         bo_double_buf,
         lse_scratch,
-        pltpu.SemaphoreType.DMA((6, 2)),
+        pltpu.SemaphoreType.DMA((7, 2)),
         l_scratch,
         m_scratch,
         acc_scratch,
