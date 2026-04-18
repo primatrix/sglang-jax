@@ -45,13 +45,12 @@ def validate_input_length(
 
 @jax.jit(static_argnames=("mesh"))
 def resolve_future_token_ids(input_ids, future_token_ids_map, mesh):
-    input_ids_global = jax.sharding.reshard(input_ids, NamedSharding(mesh, P()))
-    input_ids_global = jnp.where(
-        input_ids_global < 0,
-        future_token_ids_map[jnp.clip(-input_ids_global, a_min=0)],
-        input_ids_global,
+    out_sharding = NamedSharding(mesh, P("data"))
+    future_token_ids = future_token_ids_map.at[jnp.clip(-input_ids, min=0)].get(
+        out_sharding=out_sharding
     )
-    return jax.sharding.reshard(input_ids_global, NamedSharding(mesh, P("data")))
+    input_ids = jnp.where(input_ids < 0, future_token_ids, input_ids)
+    return jax.sharding.reshard(input_ids, out_sharding)
 
 
 @jax.jit(static_argnames=("mesh"))
