@@ -1539,23 +1539,35 @@ class WeightLoader:
         v_dim = self.num_kv_heads * self.v_head_dim_original
 
         if hf_key.endswith(".bias"):
-            # Auto-detect scale tensor (block-compressed dimensions)
+            # Auto-detect scale tensor (block-compressed dimensions). Producer
+            # may compute scale rows using head_dim_original for V (padding V
+            # per-head to head_dim_original before block-quant), so the scale
+            # has more V rows than v_dim/block_size; drop the trailing pad rows.
             total_dim = q_dim + k_dim + v_dim
+            v_dim_keep = v_dim
             actual_dim = weight.shape[0]
             if actual_dim != total_dim:
                 block_size = 128
-                expected_scale_dim = total_dim // block_size
-                assert actual_dim == expected_scale_dim, (
+                v_dim_padded = self.num_kv_heads * self.head_dim_original
+                expected_scale_dim_real = total_dim // block_size
+                expected_scale_dim_padded = (q_dim + k_dim + v_dim_padded) // block_size
+                assert actual_dim in (expected_scale_dim_real, expected_scale_dim_padded), (
                     f"QKV bias/scale split dim mismatch: got {actual_dim}, "
-                    f"expected weight={total_dim} or scale={expected_scale_dim}"
+                    f"expected weight={total_dim}, scale={expected_scale_dim_real}, "
+                    f"or padded-V scale={expected_scale_dim_padded}"
                 )
                 q_dim //= block_size
                 k_dim //= block_size
-                v_dim //= block_size
+                if actual_dim == expected_scale_dim_padded:
+                    v_dim = v_dim_padded // block_size
+                    v_dim_keep = (self.num_kv_heads * self.v_head_dim_original) // block_size
+                else:
+                    v_dim //= block_size
+                    v_dim_keep = v_dim
 
             q_bias = weight[:q_dim]
             k_bias = weight[q_dim : q_dim + k_dim]
-            v_bias = weight[q_dim + k_dim : q_dim + k_dim + v_dim]
+            v_bias = weight[q_dim + k_dim : q_dim + k_dim + v_dim_keep]
 
             if mapping.head_dim_padding and self.head_dim_pad > 0:
                 q_bias = jnp.reshape(q_bias, (self.num_heads, self.head_dim_original))
@@ -1577,32 +1589,45 @@ class WeightLoader:
 
             splits = [q_bias, k_bias, v_bias]
         else:
-            # Auto-detect scale tensor (block-compressed dimensions)
+            # Auto-detect scale tensor (block-compressed dimensions). For
+            # fused FP8 checkpoints, the producer may compute scale rows using
+            # head_dim_original for V (V padded per-head to head_dim_original
+            # before block-quant), so the scale has more V rows than
+            # v_dim/block_size. Drop the trailing pad rows after split.
             total_dim = q_dim + k_dim + v_dim
             split_axis = 1 if mapping.transpose else 0
             actual_dim = weight.shape[split_axis]
             is_scale = False
+            v_dim_keep = v_dim
 
             if actual_dim != total_dim:
                 block_size = 128
-                expected_scale_dim = total_dim // block_size
-                assert actual_dim == expected_scale_dim, (
+                v_dim_padded = self.num_kv_heads * self.head_dim_original
+                expected_scale_dim_real = total_dim // block_size
+                expected_scale_dim_padded = (q_dim + k_dim + v_dim_padded) // block_size
+                assert actual_dim in (expected_scale_dim_real, expected_scale_dim_padded), (
                     f"QKV split dim mismatch: got {actual_dim}, "
-                    f"expected weight={total_dim} or scale={expected_scale_dim}"
+                    f"expected weight={total_dim}, scale={expected_scale_dim_real}, "
+                    f"or padded-V scale={expected_scale_dim_padded}"
                 )
                 q_dim //= block_size
                 k_dim //= block_size
-                v_dim //= block_size
+                if actual_dim == expected_scale_dim_padded:
+                    v_dim = v_dim_padded // block_size
+                    v_dim_keep = (self.num_kv_heads * self.v_head_dim_original) // block_size
+                else:
+                    v_dim //= block_size
+                    v_dim_keep = v_dim
                 is_scale = True
 
             if mapping.transpose:
                 q_weight = weight[:, :q_dim]
                 k_weight = weight[:, q_dim : q_dim + k_dim]
-                v_weight = weight[:, q_dim + k_dim : q_dim + k_dim + v_dim]
+                v_weight = weight[:, q_dim + k_dim : q_dim + k_dim + v_dim_keep]
             else:
                 q_weight = weight[:q_dim, :]
                 k_weight = weight[q_dim : q_dim + k_dim, :]
-                v_weight = weight[q_dim + k_dim : q_dim + k_dim + v_dim, :]
+                v_weight = weight[q_dim + k_dim : q_dim + k_dim + v_dim_keep, :]
 
             if not is_scale and mapping.head_dim_padding and self.head_dim_pad > 0:
                 v_head_dim_pad = (
