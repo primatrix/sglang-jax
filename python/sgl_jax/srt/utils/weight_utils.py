@@ -795,7 +795,7 @@ class WeightLoader:
         stacked_shape = (num_physical_experts, *final_single_shape)
         sharding = target_sharding or jax.sharding.NamedSharding(self.mesh, P())
 
-        LOAD_WORKERS = 16
+        LOAD_WORKERS = int(os.environ.get("SGLANG_MOE_LOAD_WORKERS", "64"))
 
         def _load_stacked_slice(index):
             expert_slice = index[0]
@@ -822,37 +822,14 @@ class WeightLoader:
             else:
                 logical_indices_to_load = physical_indices
 
-            first_log_idx = logical_indices_to_load[0]
-            first_hf_key = expected_hf_keys[first_log_idx]
-            first_fname = weight_info[first_hf_key][0]["file"]
-            first_f = file_manager.get_handle(first_fname)
+            logical_to_positions: dict[int, list[int]] = {}
+            for phys_pos, log_idx in enumerate(logical_indices_to_load):
+                logical_to_positions.setdefault(log_idx, []).append(phys_pos)
 
-            if not do_transpose:
-                first_chunk = first_f.get_slice(first_hf_key)[inner_slice]
-                first_chunk = _view_as_fp8_if_needed(first_chunk, target_dtype)
-            else:
-                data = first_f.get_slice(first_hf_key)[:]
-                data = _view_as_fp8_if_needed(data, target_dtype)
-                first_chunk = np.transpose(data)[inner_slice]
-
-            out_shape = (sliced_num_physical, *first_chunk.shape)
-            out_array = np.empty(out_shape, dtype=first_chunk.dtype)
-            out_array[0] = first_chunk
-
-            logical_to_positions = {}
-            for phys_pos in range(1, sliced_num_physical):
-                log_idx = logical_indices_to_load[phys_pos]
-                if log_idx == first_log_idx:
-                    out_array[phys_pos] = first_chunk
-                else:
-                    logical_to_positions.setdefault(log_idx, []).append(phys_pos)
-
-            def load_and_fill_expert(args):
-                l_idx, positions = args
+            def _read_expert(l_idx):
                 hf_k = expected_hf_keys[l_idx]
                 fname = weight_info[hf_k][0]["file"]
                 f = file_manager.get_handle(fname)
-
                 if not do_transpose:
                     chunk = f.get_slice(hf_k)[inner_slice]
                     chunk = _view_as_fp8_if_needed(chunk, target_dtype)
@@ -860,14 +837,18 @@ class WeightLoader:
                     data = f.get_slice(hf_k)[:]
                     data = _view_as_fp8_if_needed(data, target_dtype)
                     chunk = np.transpose(data)[inner_slice]
+                return chunk
 
-                for pos in positions:
+            unique_logical = list(logical_to_positions.keys())
+            with ThreadPoolExecutor(max_workers=LOAD_WORKERS) as executor:
+                chunks = list(executor.map(_read_expert, unique_logical))
+
+            first_chunk = chunks[0]
+            out_shape = (sliced_num_physical, *first_chunk.shape)
+            out_array = np.empty(out_shape, dtype=first_chunk.dtype)
+            for l_idx, chunk in zip(unique_logical, chunks, strict=True):
+                for pos in logical_to_positions[l_idx]:
                     out_array[pos] = chunk
-
-            if logical_to_positions:
-                tasks = list(logical_to_positions.items())
-                with ThreadPoolExecutor(max_workers=LOAD_WORKERS) as executor:
-                    list(executor.map(load_and_fill_expert, tasks))
 
             return out_array
 
