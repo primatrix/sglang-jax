@@ -4,6 +4,7 @@ import logging
 import os
 import pickle
 import re
+import threading
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -93,6 +94,8 @@ class SequentialSafetensorManager:
 
     def __init__(self):
         self.handles = {}
+        self._handle_pools: dict[str, list] = {}
+        self._pool_locks: dict[str, threading.Lock] = {}
 
     def get_handle(self, filename):
         if filename not in self.handles:
@@ -100,6 +103,24 @@ class SequentialSafetensorManager:
             # device="cpu" ensures we don't accidentally alloc on GPU/TPU here.
             self.handles[filename] = safe_open(filename, framework="np", device="cpu")
         return self.handles[filename]
+
+    def get_pool_handle(self, filename, pool_size: int = 8):
+        """Return a per-thread-distinct handle to bypass the per-handle read serialization.
+
+        safetensors `safe_open` serializes slice reads on a single handle, capping
+        throughput at ~100MB/s on gcsfuse. Opening multiple handles to the same file
+        and round-robining them across reader threads unlocks per-file parallelism.
+        """
+        if filename not in self._handle_pools:
+            self._pool_locks.setdefault(filename, threading.Lock())
+            with self._pool_locks[filename]:
+                if filename not in self._handle_pools:
+                    self._handle_pools[filename] = [
+                        safe_open(filename, framework="np", device="cpu") for _ in range(pool_size)
+                    ]
+        pool = self._handle_pools[filename]
+        # Round-robin via thread id; collisions are fine since safetensors GIL-releases on read.
+        return pool[threading.get_ident() % len(pool)]
 
     def close_all(self):
         # safe_open objects don't strictly require close() as they rely on RAII/GC,
@@ -829,7 +850,7 @@ class WeightLoader:
             def _read_expert(l_idx):
                 hf_k = expected_hf_keys[l_idx]
                 fname = weight_info[hf_k][0]["file"]
-                f = file_manager.get_handle(fname)
+                f = file_manager.get_pool_handle(fname, pool_size=LOAD_WORKERS)
                 if not do_transpose:
                     chunk = f.get_slice(hf_k)[inner_slice]
                     chunk = _view_as_fp8_if_needed(chunk, target_dtype)
