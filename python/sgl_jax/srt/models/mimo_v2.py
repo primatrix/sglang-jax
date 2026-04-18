@@ -158,6 +158,7 @@ class MiMoV2Attention(nnx.Module):
         rope_scaling: dict[str, Any] | None = None,
         head_dim: int | None = None,
         v_head_dim: int | None = None,
+        v_scale: float | None = None,
         sliding_window_size: int | None = None,
         attention_sink_bias: bool = False,
         partial_rotary_factor: float = 1.0,
@@ -170,6 +171,7 @@ class MiMoV2Attention(nnx.Module):
         self.q_head_num = num_heads
         self.k_head_num = num_kv_heads
         self.v_head_dim = v_head_dim if v_head_dim is not None else self.head_dim
+        self.v_scale = v_scale
 
         self.q_size = num_heads * self.head_dim
         self.k_size = num_kv_heads * self.head_dim
@@ -256,6 +258,8 @@ class MiMoV2Attention(nnx.Module):
         q = q.reshape(-1, self.q_head_num, self.head_dim)
         k = k.reshape(-1, k.shape[-1] // self.head_dim, self.head_dim)
         v = v.reshape(-1, v.shape[-1] // self.v_head_dim, self.v_head_dim)
+        if self.v_scale is not None:
+            v = v * self.v_scale
         # Pad V to match Q/K head_dim for fused KV cache
         if self.v_head_dim != self.head_dim:
             pad_size = self.head_dim - self.v_head_dim
@@ -311,6 +315,7 @@ class MiMoV2DecoderLayer(nnx.Module):
                 rope_scaling=rope_scaling,
                 head_dim=config.swa_head_dim,
                 v_head_dim=getattr(config, "swa_v_head_dim", None),
+                v_scale=getattr(config, "attention_value_scale", None),
                 sliding_window_size=getattr(config, "sliding_window_size", None),
                 attention_sink_bias=getattr(config, "add_swa_attention_sink_bias", False),
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
@@ -328,6 +333,7 @@ class MiMoV2DecoderLayer(nnx.Module):
                 rope_scaling=rope_scaling,
                 head_dim=config.head_dim,
                 v_head_dim=getattr(config, "v_head_dim", None),
+                v_scale=getattr(config, "attention_value_scale", None),
                 sliding_window_size=0,  # full attention
                 attention_sink_bias=getattr(config, "add_full_attention_sink_bias", False),
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
