@@ -1539,6 +1539,7 @@ class WeightLoader:
         q_dim = self.num_heads * self.head_dim_original
         k_dim = self.num_kv_heads * self.head_dim_original
         v_dim = self.num_kv_heads * self.v_head_dim_original
+        v_scale_padded_per_head = False
 
         if hf_key.endswith(".bias"):
             # Auto-detect scale tensor (block-compressed dimensions). Producer
@@ -1600,6 +1601,7 @@ class WeightLoader:
             split_axis = 1 if mapping.transpose else 0
             actual_dim = weight.shape[split_axis]
             is_scale = False
+            v_scale_padded_per_head = False
             v_dim_keep = v_dim
 
             if actual_dim != total_dim:
@@ -1615,8 +1617,15 @@ class WeightLoader:
                 q_dim //= block_size
                 k_dim //= block_size
                 if actual_dim == expected_scale_dim_padded:
+                    # V scale was computed on a per-head-padded V (each head
+                    # padded from v_head_dim_original to head_dim_original
+                    # before block-quant). The V weight on disk stays compact
+                    # at v_head_dim_original, so we keep ALL padded V scale
+                    # rows here and remap to compact channels in the loop
+                    # below via expand_block_scale(channel_to_block=...).
                     v_dim = v_dim_padded // block_size
-                    v_dim_keep = (self.num_kv_heads * self.v_head_dim_original) // block_size
+                    v_dim_keep = v_dim
+                    v_scale_padded_per_head = True
                 else:
                     v_dim //= block_size
                     v_dim_keep = v_dim
@@ -1706,10 +1715,44 @@ class WeightLoader:
 
             model_param = self._get_param(params, jax_path)
 
-            # Expand 2D block-quant scale to 3D kernel-ready layout.
-            sharded_weight = self._maybe_expand_linear_block_scale(
-                sharded_weight, model_param, jax_path
-            )
+            # Special case: padded-per-head V scale needs per-channel gather
+            # because compact V channels (h * v_head_dim_original + w) map to
+            # non-contiguous padded scale rows ((h * head_dim_original + w)
+            # // block_size). Done here (post-shard) since the per-channel
+            # 3D output bypasses the standard uniform-block expansion below.
+            if (
+                not hf_key.endswith(".bias")
+                and "v_proj" in jax_path
+                and v_scale_padded_per_head
+                and jax_path.endswith("weight_scale")
+            ):
+                from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import (
+                    expand_block_scale,
+                )
+
+                block_size = 128
+                n_out_compact = self.num_kv_heads * self.v_head_dim_original
+                head_idx = jnp.arange(n_out_compact) // self.v_head_dim_original
+                within_idx = jnp.arange(n_out_compact) % self.v_head_dim_original
+                channel_to_block = (head_idx * self.head_dim_original + within_idx) // block_size
+
+                if mapping.transpose:
+                    # sharded_weight: [hidden_blocks, padded_out_blocks]
+                    scale_2d = jnp.transpose(sharded_weight, (1, 0))
+                else:
+                    scale_2d = sharded_weight
+
+                sharded_weight = expand_block_scale(
+                    scale_2d,
+                    n_out=n_out_compact,
+                    block_size_out=block_size,
+                    channel_to_block=channel_to_block,
+                )
+            else:
+                # Expand 2D block-quant scale to 3D kernel-ready layout.
+                sharded_weight = self._maybe_expand_linear_block_scale(
+                    sharded_weight, model_param, jax_path
+                )
 
             if sharded_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
                 model_param.value = sharded_weight
