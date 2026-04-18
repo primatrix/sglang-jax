@@ -71,7 +71,7 @@ class NativeAttention(AttentionBackend):
             Tuple of (output tensor of shape [total_tokens, hidden_size], kv_fused 5D)
         """
         # TODO(pc) support tree based native attention backend
-        k_buffer, v_buffer, kv_fused = self._get_and_update_kv_cache(
+        kv_fused_3d, kv_fused = self._get_and_update_kv_cache(
             k, v, forward_batch, token_to_kv_pool, layer.layer_id
         )
 
@@ -94,8 +94,7 @@ class NativeAttention(AttentionBackend):
 
         attn_output = forward_attention(
             q,
-            k_buffer,
-            v_buffer,
+            kv_fused_3d,
             forward_batch.seq_lens,
             forward_batch.cache_loc,
             forward_batch.extend_prefix_lens,
@@ -121,12 +120,14 @@ class NativeAttention(AttentionBackend):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         layer_id: int,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    ) -> tuple[jax.Array, jax.Array]:
         """
-        Update KV cache and return (k_3d, v_3d, fused_5d).
+        Update KV cache and return (fused_3d, fused_5d).
 
-        The 5D fused buffer is persisted outside JIT. The 3D k/v views are
-        used by forward_attention for the actual attention computation.
+        The 5D fused buffer is persisted outside JIT. The 3D fused buffer
+        (with interleaved K/V) is passed to forward_attention which gathers
+        relevant positions and splits K/V after gathering — avoiding
+        materializing the full K and V buffers separately.
         """
         if is_tpu_runtime():
             if forward_batch.forward_mode.is_extend():
@@ -152,11 +153,7 @@ class NativeAttention(AttentionBackend):
             out_sharding=P(None, "tensor", None),
         )
 
-        # Split interleaved [K0, V0, K1, V1, ...] into separate K and V
-        k_3d = fused_3d.at[:, ::2, :].get(out_sharding=self.kv_sharding)
-        v_3d = fused_3d.at[:, 1::2, :].get(out_sharding=self.kv_sharding)
-
-        return k_3d, v_3d, fused_5d
+        return fused_3d, fused_5d
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
@@ -167,8 +164,7 @@ class NativeAttention(AttentionBackend):
 # @partial(jax.jit, static_argnames=["num_heads", "num_kv_heads", "is_causal", "mode"])
 def forward_attention(
     q: jax.Array,
-    k_cache: jax.Array,
-    v_cache: jax.Array,
+    kv_cache: jax.Array,
     seq_lengths: jax.Array,
     loc: jax.Array,
     extend_prefix_lens: jax.Array,
@@ -185,12 +181,10 @@ def forward_attention(
 ):
     """
     Forward pass using native JAX implementation with block-diagonal attention.
-    This avoids padding while maintaining efficient matrix operations.
 
     Args:
-        q: input token in decode mode, shape(batch_size, hidden_size), each batch has one token
-        k_cache: prefix cache of key, shape(seq_len, hidden_size)
-        v_cache: prefix cache of value, shape(seq_len, hidden_size)
+        q: input tokens, shape [num_tokens, hidden_size] or [num_tokens, num_heads, head_dim]
+        kv_cache: fused KV cache with interleaved K/V heads, shape [total_tokens, heads_x2, head_dim]
         seq_lengths: sequence lengths of each batch
         loc: location of the key/value cache
         extend_prefix_lens: prefix lengths of each batch in extend mode
@@ -202,13 +196,16 @@ def forward_attention(
         sliding_window_size: sliding window size for attention
 
     Returns:
-        Output tensor of shape[batch_size, hidden_size]
+        Output tensor of shape [num_tokens, hidden_size]
     """
 
-    cache_size = k_cache.shape[0]
+    # Gather relevant positions from fused KV cache, then split K/V.
+    # This avoids materializing the full K and V buffers (which can be >5GB each).
+    cache_size = kv_cache.shape[0]
     safe_loc = jnp.where(loc > 0, loc, cache_size)
-    k_heads = k_cache.at[safe_loc].get(out_sharding=kv_sharding, mode="fill", fill_value=0)
-    v_heads = v_cache.at[safe_loc].get(out_sharding=kv_sharding, mode="fill", fill_value=0)
+    kv_gathered = kv_cache.at[safe_loc].get(out_sharding=kv_sharding, mode="fill", fill_value=0)
+    k_heads = kv_gathered.at[:, ::2, :].get(out_sharding=kv_sharding)
+    v_heads = kv_gathered.at[:, 1::2, :].get(out_sharding=kv_sharding)
 
     # Handle both 2D and 3D input formats for q
     if len(q.shape) == 2:
