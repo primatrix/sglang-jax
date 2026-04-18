@@ -368,100 +368,6 @@ class WeightLoader:
         )
         return expand_block_scale(weight, n_out, block_size_out)
 
-    def _prewarm_weight_files(
-        self,
-        weight_info: dict,
-        regular_mappings: dict,
-        moe_mappings: dict,
-    ) -> None:
-        """Stream safetensors files concurrently to populate the gcsfuse
-        file-cache before the loader pulls per-tensor slices. The loader's
-        per-tensor reads are single-stream-bound by gcsfuse (~250 MB/s); a
-        background pool with 8-16 concurrent streams reaches ~2 GB/s
-        aggregate, so the loader hits warm pages.
-
-        Disabled by default; opt in via SGLANG_PREWARM_WEIGHTS=1. Set
-        SGLANG_PREWARM_PARALLELISM (default 8) and SGLANG_PREWARM_MAX_GB
-        (default 0 = no cap) to tune."""
-        if jax.process_index() != 0:
-            return
-        if os.environ.get("SGLANG_PREWARM_WEIGHTS", "0") != "1":
-            return
-
-        files = set()
-        for hf_key in regular_mappings:
-            for info in weight_info.get(hf_key, []):
-                files.add(info["file"])
-        for moe_key, mapping in moe_mappings.items():
-            for hf_key in mapping.target_path[1:]:
-                for info in weight_info.get(hf_key, []):
-                    files.add(info["file"])
-
-        if not files:
-            return
-
-        files = sorted(files)
-        try:
-            sized = [(f, os.path.getsize(f)) for f in files]
-        except OSError as exc:
-            logger.warning("Prewarm stat failed: %s; skipping", exc)
-            return
-
-        max_gb = float(os.environ.get("SGLANG_PREWARM_MAX_GB", "0"))
-        if max_gb > 0:
-            cap_bytes = int(max_gb * 1024 * 1024 * 1024)
-            kept: list[tuple[str, int]] = []
-            running = 0
-            for f, sz in sized:
-                if running + sz > cap_bytes:
-                    break
-                kept.append((f, sz))
-                running += sz
-            sized = kept
-
-        if not sized:
-            return
-
-        max_workers = int(os.environ.get("SGLANG_PREWARM_PARALLELISM", "8"))
-        chunk_size = 8 * 1024 * 1024
-
-        def _stream(path: str) -> int:
-            try:
-                total = 0
-                with open(path, "rb", buffering=0) as fh:
-                    while True:
-                        buf = fh.read(chunk_size)
-                        if not buf:
-                            break
-                        total += len(buf)
-                return total
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Prewarm failed for %s: %s", path, exc)
-                return 0
-
-        import time
-
-        start = time.time()
-        total_target = sum(sz for _, sz in sized)
-        logger.info(
-            "Prewarming %d files (%.1f GiB) with %d concurrent streams...",
-            len(sized),
-            total_target / (1024 * 1024 * 1024),
-            max_workers,
-        )
-        total_bytes = 0
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            for n in ex.map(_stream, [f for f, _ in sized]):
-                total_bytes += n
-        elapsed = time.time() - start
-        rate_mbps = total_bytes / max(elapsed, 1e-6) / (1024 * 1024)
-        logger.info(
-            "Prewarm complete: %.2f GiB in %.1fs (%.1f MB/s aggregate)",
-            total_bytes / (1024 * 1024 * 1024),
-            elapsed,
-            rate_mbps,
-        )
-
     def _scan_weight_info(self) -> dict[str, list[dict]]:
         """
         Scan all safetensors files to build a mapping from HF key to file info.
@@ -1028,8 +934,6 @@ class WeightLoader:
         logger.info("Starting parallel weight loading via JAX Lazy Loader...")
         quant_cfg = getattr(self.model_config, "quantization_config", None)
         is_static_quant = quant_cfg is not None and quant_cfg.is_static_checkpoint
-
-        self._prewarm_weight_files(weight_info, regular_mappings, moe_mappings)
 
         with SequentialSafetensorManager() as file_manager:
             # 2. Process Regular Weights (Lazy Pull)
