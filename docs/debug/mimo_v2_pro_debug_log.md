@@ -221,14 +221,27 @@ K proj 的 `(12, 48) → [48, 1, 1536]` 证明 K weight 是 padded 存储（8 he
 
 预计 21:25 左右 ready。但 21:21 起本机 kubectl proxy (127.0.0.1:7890) 连接被重置，无法访问 GKE API。
 
-**待恢复**：
-- 等本机网络恢复后，立即 `kubectl logs v7x-mimo-pro-0-pwwjk -c v7x-mimo-pro --tail=20` 看是否 ready
-- 然后跑 coherence test：
-  ```bash
-  kubectl exec v7x-mimo-pro-0-pwwjk -c v7x-mimo-pro -- curl -s -H 'Content-Type: application/json' \
-    http://localhost:30271/generate \
-    -d '{"text":"The capital of France is","sampling_params":{"temperature":0,"max_new_tokens":32}}'
-  ```
+### 2026-04-19 epmoe 验证：megablox GMM kernel tile-size bug
+
+恢复 kubectl 后查 epmoe pod 状态：两个 pod 均 `Completed`（启动后约 75 分钟挂掉）。
+
+抓 `kubectl logs v7x-mimo-pro-0-pwwjk` 末尾发现 precompile 阶段 crash：
+
+```
+[GMM kernel] using default block sizes for key:
+  (1024, 6144, 2048, 384, 24, 'bfloat16', 'float8_e4m3fn', 6144): (128, 2048, 2048)
+  (2048, 6144, 2048, 384, 24, 'bfloat16', 'float8_e4m3fn', 6144): (256, 2048, 2048)
+  (4096, 6144, 2048, 384, 24, 'bfloat16', 'float8_e4m3fn', 6144): (384, 2048, 2048)
+
+ValueError: 4096 must be divisible by x-dimension tile size (384).
+  at megablox_gmm_kernel/gmm.py:80 (_calculate_num_tiles)
+```
+
+**根因**：default block-size 启发式按 `tm = m / 16` 之类规则选 tile_m，m=1024→128，m=2048→256，m=4096→384。但 4096 % 384 ≠ 0，`_calculate_num_tiles` 直接抛错。这是 megablox kernel 的默认 block 选择 bug，与我们的 weight loading / 模型代码无关。
+
+**结论**：epmoe 当前不可用于 chunked-prefill-size=4096 + 384 expert 的 Pro。要么换 chunked-prefill-size（4608=384×12 或 2048），要么继续用 fused 排查别的 bug。
+
+**决策**：fused 路径起码能跑通端到端、能产 logits，是唯一能继续验证 backup B/C/D 假设的 channel。改回 fused，重启。
 
 
 
