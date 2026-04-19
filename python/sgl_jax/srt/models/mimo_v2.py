@@ -29,6 +29,17 @@ logger = logging.getLogger(__name__)
 _DUMP_DIR = "/tmp/mimo_dumps"
 _DUMP_ENABLED = os.environ.get("MIMO_DEBUG_DUMP", "0") == "1"
 
+# Loud sentinel so we can verify module load + env at server startup.
+print(
+    f"[MIMO_DUMP] module loaded, MIMO_DEBUG_DUMP env={os.environ.get('MIMO_DEBUG_DUMP', 'unset')} "
+    f"_DUMP_ENABLED={_DUMP_ENABLED} pid={os.getpid()}",
+    flush=True,
+)
+if _DUMP_ENABLED:
+    os.makedirs(_DUMP_DIR, exist_ok=True)
+    with open(os.path.join(_DUMP_DIR, f"_loaded_pid{os.getpid()}.txt"), "w") as f:
+        f.write("ok\n")
+
 
 def _dump_array(arr: jax.Array, filename: str) -> None:
     """Save a JAX array to /tmp/mimo_dumps/<filename>.npy via host callback.
