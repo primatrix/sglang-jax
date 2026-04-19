@@ -383,6 +383,13 @@ class MiMoV2DecoderLayer(nnx.Module):
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None]:
+        jax.debug.print(
+            "[DBG L{lid}] in: norm={n} max={mx} hasnan={nan}",
+            lid=self.layer_id,
+            n=jnp.linalg.norm(hidden_states.astype(jnp.float32)),
+            mx=jnp.max(jnp.abs(hidden_states.astype(jnp.float32))),
+            nan=jnp.any(jnp.isnan(hidden_states)),
+        )
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -397,6 +404,13 @@ class MiMoV2DecoderLayer(nnx.Module):
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
         )
+        jax.debug.print(
+            "[DBG L{lid}] post-attn: norm={n} max={mx} hasnan={nan}",
+            lid=self.layer_id,
+            n=jnp.linalg.norm(hidden_states.astype(jnp.float32)),
+            mx=jnp.max(jnp.abs(hidden_states.astype(jnp.float32))),
+            nan=jnp.any(jnp.isnan(hidden_states)),
+        )
 
         hidden_states += residual
         residual = hidden_states
@@ -409,6 +423,14 @@ class MiMoV2DecoderLayer(nnx.Module):
             topk_ids = None
 
         hidden_states = mlp_output
+        jax.debug.print(
+            "[DBG L{lid}] post-mlp: norm={n} max={mx} hasnan={nan} sparse={sp}",
+            lid=self.layer_id,
+            n=jnp.linalg.norm(hidden_states.astype(jnp.float32)),
+            mx=jnp.max(jnp.abs(hidden_states.astype(jnp.float32))),
+            nan=jnp.any(jnp.isnan(hidden_states)),
+            sp=int(self.is_layer_sparse),
+        )
         return hidden_states, residual, kv_fused, topk_ids
 
     def _is_moe_layer(self, config) -> bool:
