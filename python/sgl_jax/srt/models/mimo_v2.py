@@ -1,10 +1,12 @@
 """MiMo-V2 model implementations (Flash and Pro) for SGLang-JAX."""
 
 import logging
+import os
 from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
@@ -22,6 +24,25 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
+
+
+_DUMP_DIR = "/tmp/mimo_dumps"
+_DUMP_ENABLED = os.environ.get("MIMO_DEBUG_DUMP", "0") == "1"
+
+
+def _dump_array(arr: jax.Array, filename: str) -> None:
+    """Save a JAX array to /tmp/mimo_dumps/<filename>.npy via host callback.
+
+    No-op unless MIMO_DEBUG_DUMP=1 is set. Each host writes its own shards.
+    """
+    if not _DUMP_ENABLED:
+        return
+
+    def _save(a):
+        os.makedirs(_DUMP_DIR, exist_ok=True)
+        np.save(os.path.join(_DUMP_DIR, filename), np.asarray(a))
+
+    jax.debug.callback(_save, arr)
 
 
 class MiMoV2MLP(nnx.Module):
@@ -383,13 +404,7 @@ class MiMoV2DecoderLayer(nnx.Module):
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None]:
-        jax.debug.print(
-            "[DBG L{lid}] in: norm={n} max={mx} hasnan={nan}",
-            lid=self.layer_id,
-            n=jnp.linalg.norm(hidden_states.astype(jnp.float32)),
-            mx=jnp.max(jnp.abs(hidden_states.astype(jnp.float32))),
-            nan=jnp.any(jnp.isnan(hidden_states)),
-        )
+        _dump_array(hidden_states, f"layer{self.layer_id:02d}_in.npy")
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -404,13 +419,7 @@ class MiMoV2DecoderLayer(nnx.Module):
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
         )
-        jax.debug.print(
-            "[DBG L{lid}] post-attn: norm={n} max={mx} hasnan={nan}",
-            lid=self.layer_id,
-            n=jnp.linalg.norm(hidden_states.astype(jnp.float32)),
-            mx=jnp.max(jnp.abs(hidden_states.astype(jnp.float32))),
-            nan=jnp.any(jnp.isnan(hidden_states)),
-        )
+        _dump_array(hidden_states, f"layer{self.layer_id:02d}_post_attn.npy")
 
         hidden_states += residual
         residual = hidden_states
@@ -423,14 +432,7 @@ class MiMoV2DecoderLayer(nnx.Module):
             topk_ids = None
 
         hidden_states = mlp_output
-        jax.debug.print(
-            "[DBG L{lid}] post-mlp: norm={n} max={mx} hasnan={nan} sparse={sp}",
-            lid=self.layer_id,
-            n=jnp.linalg.norm(hidden_states.astype(jnp.float32)),
-            mx=jnp.max(jnp.abs(hidden_states.astype(jnp.float32))),
-            nan=jnp.any(jnp.isnan(hidden_states)),
-            sp=int(self.is_layer_sparse),
-        )
+        _dump_array(hidden_states, f"layer{self.layer_id:02d}_post_mlp.npy")
         return hidden_states, residual, kv_fused, topk_ids
 
     def _is_moe_layer(self, config) -> bool:
@@ -485,6 +487,7 @@ class MiMoV2Model(nnx.Module):
     def __call__(self, forward_batch: ForwardBatch, token_to_kv_pool: KVCache):
         residual = None
         hidden_states = self.embed_tokens(forward_batch.input_ids)
+        _dump_array(hidden_states, "embed_out.npy")
 
         layers_kv_fused = []
         layers_topk_ids = []
@@ -504,6 +507,7 @@ class MiMoV2Model(nnx.Module):
             hidden_states += residual
 
         hidden_states = self.norm(hidden_states)
+        _dump_array(hidden_states, "final_norm.npy")
         return hidden_states, layers_kv_fused, layers_topk_ids
 
 
