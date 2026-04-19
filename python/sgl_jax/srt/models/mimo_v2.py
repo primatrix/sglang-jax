@@ -571,7 +571,13 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         # Post-load: dequantize FP8 attention + layer-0 MLP to bf16.
         # Q/K head_dim padding (192→256) is handled by the kernel internally.
         if self._is_static_quant:
-            self._dequantize_fp8_to_bf16()
+            if os.environ.get("MIMO_SKIP_DEQUANT", "0") == "1":
+                logger.warning(
+                    "MIMO_SKIP_DEQUANT=1: skipping _dequantize_fp8_to_bf16 — "
+                    "FP8 QuantizedLinear will run via quantized matmul kernel"
+                )
+            else:
+                self._dequantize_fp8_to_bf16()
 
     @staticmethod
     def _warmup_safetensors_cache(model_config: ModelConfig):
@@ -1182,7 +1188,13 @@ class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
         logger.info("MiMoV2Pro weights loaded successfully!")
 
         if self._is_static_quant:
-            self._dequantize_fp8_to_bf16()
+            if os.environ.get("MIMO_SKIP_DEQUANT", "0") == "1":
+                logger.warning(
+                    "MIMO_SKIP_DEQUANT=1: skipping _dequantize_fp8_to_bf16 — "
+                    "FP8 QuantizedLinear will run via quantized matmul kernel"
+                )
+            else:
+                self._dequantize_fp8_to_bf16()
 
 
 EntryClass = [MiMoV2FlashForCausalLM, MiMoV2ProForCausalLM]
