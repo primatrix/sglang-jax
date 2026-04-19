@@ -94,10 +94,15 @@ class MiMoV2MLP(nnx.Module):
         self.act_fn = jax.nn.silu
 
     def __call__(self, hidden_states: jax.Array):
+        _dump_array(hidden_states, f"layer{self.layer_id:02d}_mlp_in.npy")
         a1, _ = self.gate_proj(hidden_states)
+        _dump_array(a1, f"layer{self.layer_id:02d}_mlp_gate.npy")
         a2, _ = self.up_proj(hidden_states)
+        _dump_array(a2, f"layer{self.layer_id:02d}_mlp_up.npy")
         intermediate_parallel = a2 * self.act_fn(a1)
+        _dump_array(intermediate_parallel, f"layer{self.layer_id:02d}_mlp_inter.npy")
         output, _ = self.down_proj(intermediate_parallel)
+        _dump_array(output, f"layer{self.layer_id:02d}_mlp_out.npy")
         return output
 
 
@@ -435,6 +440,7 @@ class MiMoV2DecoderLayer(nnx.Module):
         hidden_states += residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        _dump_array(hidden_states, f"layer{self.layer_id:02d}_post_attn_norm.npy")
 
         if self.is_layer_sparse:
             mlp_output, topk_ids = self.mlp(hidden_states, forward_batch)
