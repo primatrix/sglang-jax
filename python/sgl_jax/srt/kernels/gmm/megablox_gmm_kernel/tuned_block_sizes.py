@@ -504,7 +504,7 @@ TUNED_BLOCK_SIZES = {
 
 
 # TODO (jacobplatin): make this more generic
-def round_up_to_multiple_of_128_within_limit(x: int, limit: int) -> int:
+def round_up_to_multiple_of_128_within_limit(x: int, limit: int, divides: int | None = None) -> int:
     """
     Rounds the given integer `x` up to the nearest multiple of 128, without
     exceeding the specified `limit`.
@@ -517,9 +517,17 @@ def round_up_to_multiple_of_128_within_limit(x: int, limit: int) -> int:
     evenly, and returns it.
     If no such candidate is found, returns `limit`.
 
+    If `divides` is provided, the result is additionally constrained to be a
+    divisor of `divides`: after the above selection, the result is decremented
+    by 128 until `divides % result == 0` (or 128 is reached). This is required
+    by callers (e.g. the GMM tile-size heuristic) where the kernel demands
+    `divides % tm == 0`; without it the small-x branch can return a tile size
+    that fails kernel-level divisibility checks.
+
     Args:
         x (int): The integer to round up.
         limit (int): The upper bound (must be a multiple of 128).
+        divides (int | None): If set, the returned value must divide this.
 
     Returns:
         int: The rounded value according to the rules above.
@@ -529,13 +537,19 @@ def round_up_to_multiple_of_128_within_limit(x: int, limit: int) -> int:
     """
     assert limit >= 128 and limit % 128 == 0
     if x <= 128:
-        return 128
-    if x < limit:
-        return (x + 127) // 128 * 128
-    for candidate in range(limit, 511, -128):
-        if x % candidate == 0:
-            return candidate
-    return limit
+        result = 128
+    elif x < limit:
+        result = (x + 127) // 128 * 128
+    else:
+        result = limit
+        for candidate in range(limit, 511, -128):
+            if x % candidate == 0:
+                result = candidate
+                break
+    if divides is not None:
+        while result > 128 and divides % result != 0:
+            result -= 128
+    return result
 
 
 def get_default_gmm_block_sizes(m: int, k: int, n: int, g: int) -> tuple[int, int, int]:
@@ -558,7 +572,7 @@ def get_default_gmm_block_sizes(m: int, k: int, n: int, g: int) -> tuple[int, in
     # 2m//g can be either greater or less than 512. If there are 32 tokens and
     # topk=2, m=topk * num_tokens=64, in this case, 2*m//g will be less than
     # 512.
-    tm = round_up_to_multiple_of_128_within_limit(2 * m // g, 512)
+    tm = round_up_to_multiple_of_128_within_limit(2 * m // g, 512, divides=m)
     tm = min(tm, m)  # there's a requirement that m % tm == 0
     # k/n correspond to n_input_features/n_output_features in the matmul so they
     # are normally greater than 2048, unless the num shards is large.
