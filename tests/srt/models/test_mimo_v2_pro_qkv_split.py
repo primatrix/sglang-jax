@@ -185,7 +185,10 @@ class TestSplitScalePaddedV:
             np.float32
         )
         self.fused_s = np.concatenate([self.q_scale, self.k_scale, self.v_scale_padded], axis=0)
-        assert self.fused_s.shape == (216, SCALE_COLS), f"fused_s shape: {self.fused_s.shape}"
+        assert self.fused_s.shape == (
+            Q_SCALE_ROWS + K_SCALE_ROWS + V_SCALE_ROWS_PADDED,
+            SCALE_COLS,
+        ), f"fused_s shape: {self.fused_s.shape}"
 
     def test_split_scale_padded_v_keeps_all_v_rows(self):
         helper = _get_helper()
@@ -230,7 +233,7 @@ class TestSplitScaleTransposeTrue:
         )
         fused_s = np.concatenate([self.q_scale, self.k_scale, self.v_scale_padded], axis=0)
         # Pre-transpose to [in_blocks, out_blocks]
-        self.fused_s_t = fused_s.T  # [48, 216]
+        self.fused_s_t = fused_s.T  # [SCALE_COLS, Q_SCALE_ROWS+K_SCALE_ROWS+V_SCALE_ROWS_PADDED]
 
     def test_split_scale_transpose_true_legacy_equivalent(self):
         helper = _get_helper()
@@ -281,8 +284,11 @@ class TestSplitWeightCompactVScale:
             np.float32
         )
         self.fused_s = np.concatenate([self.q_scale, self.k_scale, self.v_scale_compact], axis=0)
-        # 192 + 12 + 8 = 212 rows
-        assert self.fused_s.shape == (212, SCALE_COLS), f"fused_s shape: {self.fused_s.shape}"
+        # Q_SCALE_ROWS + K_SCALE_ROWS + V_SCALE_ROWS_COMPACT rows
+        assert self.fused_s.shape == (
+            Q_SCALE_ROWS + K_SCALE_ROWS + V_SCALE_ROWS_COMPACT,
+            SCALE_COLS,
+        ), f"fused_s shape: {self.fused_s.shape}"
 
     def test_split_weight_compact_v_scale_drops_pad(self):
         helper = _get_helper()
@@ -313,3 +319,216 @@ class TestSplitWeightCompactVScale:
         assert np.array_equal(
             np.asarray(v_out), self.v_scale_compact
         ), "V compact scale content mismatch"
+
+
+# ---------------------------------------------------------------------------
+# Test 6: MiMoV2ProForCausalLM._create_layer_mappings FP8 mapping layout
+# ---------------------------------------------------------------------------
+
+
+def _get_mimo_pro_class():
+    """Load MiMoV2ProForCausalLM with heavy deps stubbed out.
+
+    We only need the class definition and its use of WeightMapping; all other
+    sgl_jax layers/configs are replaced with lightweight stubs.
+    """
+    import importlib.util
+    import sys
+    import types
+
+    def _stub(name, attrs=None):
+        if name not in sys.modules:
+            m = types.ModuleType(name)
+            if attrs:
+                for k, v in attrs.items():
+                    setattr(m, k, v)
+            sys.modules[name] = m
+        return sys.modules[name]
+
+    # --- transformers ---
+    class _PretrainedConfig:
+        pass
+
+    transformers_mod = _stub("transformers")
+    transformers_mod.PretrainedConfig = _PretrainedConfig
+
+    # --- sgl_jax top-level and sub-packages ---
+    for name in [
+        "sgl_jax",
+        "sgl_jax.srt",
+        "sgl_jax.srt.configs",
+        "sgl_jax.srt.configs.model_config",
+        "sgl_jax.srt.layers",
+        "sgl_jax.srt.layers.embeddings",
+        "sgl_jax.srt.layers.fused_moe",
+        "sgl_jax.srt.layers.layernorm",
+        "sgl_jax.srt.layers.linear",
+        "sgl_jax.srt.layers.logits_processor",
+        "sgl_jax.srt.layers.moe",
+        "sgl_jax.srt.layers.radix_attention",
+        "sgl_jax.srt.mem_cache",
+        "sgl_jax.srt.mem_cache.memory_pool",
+        "sgl_jax.srt.model_executor",
+        "sgl_jax.srt.model_executor.forward_batch_info",
+        "sgl_jax.srt.utils",
+        "sgl_jax.srt.utils.weight_utils",
+    ]:
+        _stub(name)
+
+    # Provide minimal real-looking stubs for names used at class-definition time.
+    class _ModelConfig:
+        pass
+
+    class _LinearBase:
+        pass
+
+    class _LogitsMetadata:
+        pass
+
+    class _LogitsProcessor:
+        pass
+
+    class _KVCache:
+        pass
+
+    class _ForwardBatch:
+        pass
+
+    class _RMSNorm:
+        pass
+
+    class _Embed:
+        pass
+
+    class _ParallelLMHead:
+        pass
+
+    def _get_rope(*a, **kw):
+        pass
+
+    class _FusedEPMoE:
+        pass
+
+    class _EPMoE:
+        pass
+
+    class _GateLogit:
+        pass
+
+    class _TopK:
+        pass
+
+    def _create_moe_weights_mapping(*a, **kw):
+        return {}
+
+    class _RadixAttention:
+        pass
+
+    sys.modules["sgl_jax.srt.configs.model_config"].ModelConfig = _ModelConfig
+    sys.modules["sgl_jax.srt.layers.linear"].LinearBase = _LinearBase
+    sys.modules["sgl_jax.srt.layers.logits_processor"].LogitsMetadata = _LogitsMetadata
+    sys.modules["sgl_jax.srt.layers.logits_processor"].LogitsProcessor = _LogitsProcessor
+    sys.modules["sgl_jax.srt.mem_cache.memory_pool"].KVCache = _KVCache
+    sys.modules["sgl_jax.srt.model_executor.forward_batch_info"].ForwardBatch = _ForwardBatch
+    sys.modules["sgl_jax.srt.layers.layernorm"].RMSNorm = _RMSNorm
+    sys.modules["sgl_jax.srt.layers.embeddings"].Embed = _Embed
+    sys.modules["sgl_jax.srt.layers.embeddings"].ParallelLMHead = _ParallelLMHead
+    sys.modules["sgl_jax.srt.layers.embeddings"].get_rope = _get_rope
+    sys.modules["sgl_jax.srt.layers.fused_moe"].FusedEPMoE = _FusedEPMoE
+    sys.modules["sgl_jax.srt.layers.moe"].EPMoE = _EPMoE
+    sys.modules["sgl_jax.srt.layers.moe"].GateLogit = _GateLogit
+    sys.modules["sgl_jax.srt.layers.moe"].TopK = _TopK
+    sys.modules["sgl_jax.srt.layers.moe"].create_moe_weights_mapping = _create_moe_weights_mapping
+    sys.modules["sgl_jax.srt.layers.radix_attention"].RadixAttention = _RadixAttention
+
+    # Load weight_utils first so WeightMapping is real.
+    weight_utils_path = os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "..",
+        "..",
+        "python",
+        "sgl_jax",
+        "srt",
+        "utils",
+        "weight_utils.py",
+    )
+    if "sgl_jax.srt.utils.weight_utils" not in sys.modules or not hasattr(
+        sys.modules["sgl_jax.srt.utils.weight_utils"], "WeightMapping"
+    ):
+        spec = importlib.util.spec_from_file_location(
+            "sgl_jax.srt.utils.weight_utils", weight_utils_path
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["sgl_jax.srt.utils.weight_utils"] = mod
+        spec.loader.exec_module(mod)
+
+    wu_mod = sys.modules["sgl_jax.srt.utils.weight_utils"]
+    sys.modules["sgl_jax.srt.utils.weight_utils"].WeightLoader = wu_mod.WeightLoader
+    sys.modules["sgl_jax.srt.utils.weight_utils"].WeightMapping = wu_mod.WeightMapping
+
+    # Now load mimo_v2.py
+    mimo_path = os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "..",
+        "..",
+        "python",
+        "sgl_jax",
+        "srt",
+        "models",
+        "mimo_v2.py",
+    )
+    spec = importlib.util.spec_from_file_location("sgl_jax.srt.models.mimo_v2", mimo_path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["sgl_jax.srt.models.mimo_v2"] = mod
+    spec.loader.exec_module(mod)
+
+    return mod.MiMoV2ProForCausalLM
+
+
+class TestProFP8MappingLayout:
+    """Test 6: Pro FP8 fused QKV mapping must use transpose=False, sharding=("tensor", None).
+
+    This test calls _create_layer_mappings on a stub MiMoV2ProForCausalLM instance
+    (is_fp8=True) and asserts the weight mapping has the correct layout so that
+    weight_q is stored in HF [out, in] order, matching QuantizedLinear's contract.
+    """
+
+    def test_pro_fp8_qkv_mapping_transpose_false_sharding_tensor_none(self):
+        """FP8 fused QKV mapping: transpose=False, sharding=("tensor", None)."""
+        from unittest.mock import patch
+
+        MiMoV2ProForCausalLM = _get_mimo_pro_class()
+
+        # Create a bare stub instance — no __init__, just set _quant_config.
+        obj = object.__new__(MiMoV2ProForCausalLM)
+
+        class _QuantConfig:
+            is_static_checkpoint = True
+            ignored_layers = []
+
+        object.__setattr__(obj, "_quant_config", _QuantConfig())
+
+        # Stub _create_common_layer_mappings at the class level so we don't
+        # need self.config etc.  Use patch to avoid flax nnx __setattr__ guards.
+        with patch.object(
+            MiMoV2ProForCausalLM,
+            "_create_common_layer_mappings",
+            return_value={},
+        ):
+            mappings = obj._create_layer_mappings(0)
+
+        key = "model.layers.0.self_attn.qkv_proj.weight"
+        assert key in mappings, f"Expected key '{key}' in mappings, got: {list(mappings.keys())}"
+
+        m = mappings[key]
+        assert m.transpose is False, (
+            f"Expected transpose=False for FP8 QKV mapping, got transpose={m.transpose!r}. "
+            "The Pro FP8 fused QKV mapping must store weight_q in HF [out, in] layout "
+            "to match QuantizedLinear's kernel contract."
+        )
+        assert m.sharding == ("tensor", None), (
+            f"Expected sharding=('tensor', None) for FP8 QKV mapping, got sharding={m.sharding!r}. "
+            "With HF [out, in] layout, the output axis (axis-0) maps to 'tensor' shard."
+        )

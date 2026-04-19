@@ -1797,7 +1797,15 @@ class WeightLoader:
         total_dim = q_dim + k_dim + v_dim
 
         split_axis = 1 if transpose else 0
+        in_axis = 0 if transpose else 1
         actual_dim = fused_weight.shape[split_axis]
+        assert (
+            fused_weight.shape[in_axis] == hidden
+            or fused_weight.shape[in_axis] == hidden // block_size
+        ), (
+            f"hidden dim mismatch: expected {hidden} or {hidden // block_size} "
+            f"on axis {in_axis}, got {fused_weight.shape[in_axis]}"
+        )
 
         v_dim_keep = v_dim
 

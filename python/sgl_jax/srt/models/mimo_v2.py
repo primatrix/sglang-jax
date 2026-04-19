@@ -1143,8 +1143,8 @@ class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
                     f"{target}.self_attn.k_proj.weight_q",
                     f"{target}.self_attn.v_proj.weight_q",
                 ],
-                sharding=(None, "tensor"),
-                transpose=True,
+                sharding=("tensor", None),
+                transpose=False,
                 head_dim_padding=False,
                 kv_head_padding=False,
             )
