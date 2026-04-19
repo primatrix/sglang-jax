@@ -1761,6 +1761,80 @@ class WeightLoader:
 
             logger.debug("Split %s -> %s, shape: %s", hf_key, jax_path, processed_weight.shape)
 
+    @staticmethod
+    def _split_fused_qkv_for_test(
+        fused_weight: jax.Array,
+        *,
+        transpose: bool,
+        is_scale: bool,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim_orig: int,
+        v_head_dim_orig: int,
+        hidden: int,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Return (q, k, v) slices from a fused QKV weight or scale tensor.
+
+        Pure function for unit tests — no nnx.State / mesh / params needed.
+
+        When ``transpose=False`` the input is HF-layout ``[out_total, in]``
+        and each returned slice has shape ``[out_*, in]``.
+
+        When ``transpose=True`` the input was already transposed to
+        ``[in, out_total]`` and each returned slice has shape ``[in, out_*]``.
+
+        When ``is_scale=True`` the input is the block-quant scale
+        ``[out_blocks, in_blocks]`` (or ``[in_blocks, out_blocks]`` for
+        ``transpose=True``).  For padded-V scales (where V was computed per
+        head with padding to ``head_dim_orig``) the V slice keeps ALL padded
+        rows (``num_kv_heads * head_dim_orig // BLOCK``) so that the caller can
+        remap them via ``expand_block_scale(channel_to_block=...)``.
+        """
+        block_size = 128
+        q_dim = num_heads * head_dim_orig
+        k_dim = num_kv_heads * head_dim_orig
+        v_dim = num_kv_heads * v_head_dim_orig
+        total_dim = q_dim + k_dim + v_dim
+
+        split_axis = 1 if transpose else 0
+        actual_dim = fused_weight.shape[split_axis]
+
+        v_dim_keep = v_dim
+
+        if actual_dim != total_dim:
+            # Scale tensor: block-compressed dimensions.
+            v_dim_padded = num_kv_heads * head_dim_orig
+            expected_scale_dim_real = total_dim // block_size
+            expected_scale_dim_padded = (q_dim + k_dim + v_dim_padded) // block_size
+            assert actual_dim in (expected_scale_dim_real, expected_scale_dim_padded), (
+                f"QKV split dim mismatch: got {actual_dim}, "
+                f"expected weight={total_dim}, scale={expected_scale_dim_real}, "
+                f"or padded-V scale={expected_scale_dim_padded}"
+            )
+            assert (
+                is_scale
+            ), f"Unexpected non-scale dim mismatch: actual={actual_dim}, total={total_dim}"
+            q_dim //= block_size
+            k_dim //= block_size
+            if actual_dim == expected_scale_dim_padded:
+                # V scale computed on per-head-padded V: keep all padded rows.
+                v_dim = v_dim_padded // block_size
+                v_dim_keep = v_dim
+            else:
+                v_dim //= block_size
+                v_dim_keep = v_dim
+
+        if transpose:
+            q_out = fused_weight[:, :q_dim]
+            k_out = fused_weight[:, q_dim : q_dim + k_dim]
+            v_out = fused_weight[:, q_dim + k_dim : q_dim + k_dim + v_dim_keep]
+        else:
+            q_out = fused_weight[:q_dim, :]
+            k_out = fused_weight[q_dim : q_dim + k_dim, :]
+            v_out = fused_weight[q_dim + k_dim : q_dim + k_dim + v_dim_keep, :]
+
+        return q_out, k_out, v_out
+
     def _shard_weight(
         self, weight: jax.Array, sharding_spec: tuple, mesh: jax.sharding.Mesh = None
     ) -> jax.Array:
