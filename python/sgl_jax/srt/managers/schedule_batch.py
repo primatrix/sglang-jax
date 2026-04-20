@@ -253,9 +253,6 @@ class Req:
         # SWA eviction: sequence positions [0, swa_evicted_seqlen) have had
         # their SWA pool slots freed (no longer in the sliding window).
         self.swa_evicted_seqlen: int = 0
-        # [0, cache_protected_len) tokens are owned by the radix tree;
-        # per-request SWA eviction must not free their SWA slots.
-        self.cache_protected_len: int = 0
         # The number of extend/decode batches this request has already gone through.
         # These counters gate overlap-safe SWA reclaim timing.
         self.extend_batch_idx: int = 0
@@ -519,7 +516,6 @@ class Req:
         self.req_pool_idx = None
         self.already_computed = 0
         self.swa_evicted_seqlen = 0
-        self.cache_protected_len = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
         self.routed_experts = None
@@ -1268,7 +1264,7 @@ class ScheduleBatch:
             self.req_to_token_pool.free(req.req_pool_idx)
         else:
             last_uncached_pos = (
-                req.cache_protected_len // server_args.page_size
+                req.last_matched_prefix_len // server_args.page_size
             ) * server_args.page_size
             token_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
@@ -1342,11 +1338,15 @@ class ScheduleBatch:
             # prevents holding memory far beyond what's needed; for small windows
             # (e.g., 128) it aligns with the natural eviction boundary.
             evict_interval = max(min(sliding_window_size, page_size), 1)
+            evict_phase = 1 if evict_interval > 1 else 0
             for dp_rank, info in enumerate(self.reqs_info):
                 if not info.reqs:
                     continue
                 for req in info.reqs:
-                    if req.decode_batch_idx % evict_interval == 1:
+                    if (
+                        req.decode_batch_idx > 0
+                        and req.decode_batch_idx % evict_interval == evict_phase
+                    ):
                         self._evict_swa(
                             req, req.seqlen - 1, sliding_window_size, page_size, dp_rank
                         )
@@ -1356,8 +1356,8 @@ class ScheduleBatch:
             return
 
         # Only do per-request SWA eviction during extend for ChunkCache.
-        # For SWARadixCache, tree-owned slots are protected by cache_protected_len
-        # and eviction is handled during insert.
+        # For SWARadixCache, extend-time ownership stays with the tree and
+        # eviction is deferred to tree insert / tree-pressure handling.
         if not isinstance(self.tree_cache, ChunkCache):
             return
 
@@ -1382,12 +1382,9 @@ class ScheduleBatch:
         dp_rank: int = 0,
     ):
         """Free SWA pool slots for tokens outside the sliding window."""
-        # Bump swa_evicted_seqlen to cache_protected_len upfront:
-        # tree-owned slots are never freed by per-request eviction.
-        assert (
-            req.cache_protected_len % page_size == 0
-        ), f"cache_protected_len must be page aligned, {req.cache_protected_len=}, {page_size=}"
-        req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
+        if isinstance(self.tree_cache, SWARadixCache):
+            self.tree_cache.evict_req_swa(req, pre_len, dp_rank=dp_rank)
+            return
 
         # Subtract an extra page_size so the eviction frontier never reaches the
         # radix tree insert boundary (page_floor(seq_len)). This keeps at least
@@ -1402,15 +1399,7 @@ class ScheduleBatch:
         free_slots = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, req.swa_evicted_seqlen : new_evicted
         ]
-        # Count actual SWA slots that will be freed (those with active mapping)
-        num_swa_freed = self.token_to_kv_pool_allocator.count_swa_mapped(
-            free_slots, dp_rank=dp_rank
-        )
         self.token_to_kv_pool_allocator.free_swa(free_slots, dp_rank=dp_rank)
-        # Notify cache layer: these slots were protected (node is locked),
-        # so adjust swa_protected_size_ to prevent bookkeeping leak.
-        if num_swa_freed > 0 and isinstance(self.tree_cache, SWARadixCache):
-            self.tree_cache.adjust_swa_protected_size(-num_swa_freed, dp_rank=dp_rank)
         req.swa_evicted_seqlen = new_evicted
 
     def prepare_for_decode(self):
@@ -1906,8 +1895,10 @@ class ScheduleBatch:
             total_cache_loc_size = cache_loc_paddings[bs_index]
 
         per_dp_cache_loc_size = total_cache_loc_size // self.dp_size
-        # np.empty avoids page-fault zeroing; padding positions are masked by seq_lens downstream.
-        cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
+        # Use np.zeros so that page-alignment padding slots (between seq_len and
+        # aligned_len per request) contain index 0 — a safe sentinel for the
+        # full_to_swa_index_mapping lookup in the attention backend.
+        cache_loc_cpu = np.zeros(total_cache_loc_size, dtype=np.int32)
 
         offset_bs = 0
 

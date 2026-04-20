@@ -24,7 +24,8 @@
 | Term | Meaning |
 |------|---------|
 | `swa_evicted_seqlen` | SWA slots `[0, swa_evicted_seqlen)` have been freed |
-| `cache_protected_len` | Slots `[0, cache_protected_len)` owned by radix tree, per-request eviction cannot touch |
+| `protected prefix` | Prefix `[0, protected_prefix_len)` owned by the radix tree, derived from the request's locked `last_node` path; per-request eviction cannot touch it |
+| `last_matched_prefix_len` | Page-aligned cached prefix length kept on the request for writeback / retract bookkeeping |
 | `tombstone` | Tree node: full KV retained, SWA KV freed |
 
 ## 2. Two Cache Modes at a Glance
@@ -45,10 +46,11 @@ Frees SWA slots outside the sliding window from a request's `req_to_token` buffe
 ```
 _evict_swa(req, pre_len):
 
-  1. Clamp:  swa_evicted_seqlen = max(swa_evicted_seqlen, cache_protected_len)
-  2. Target: new_evicted = max(swa_evicted_seqlen, pre_len - sliding_window)
-  3. Align:  new_evicted = page_floor(new_evicted)
-  4. Free:   free_swa( slots[swa_evicted_seqlen : new_evicted] )
+  1. Derive: protected_prefix_len = prefix_len(req.last_node)
+  2. Clamp:  swa_evicted_seqlen = max(swa_evicted_seqlen, protected_prefix_len)
+  3. Target: new_evicted = max(swa_evicted_seqlen, pre_len - sliding_window - page_size)
+  4. Align:  new_evicted = page_floor(new_evicted)
+  5. Free:   free_swa( slots[swa_evicted_seqlen : new_evicted] )
 
 Example (sliding_window=128, page_size=256, seqlen=2049):
 
@@ -65,7 +67,7 @@ Example (sliding_window=128, page_size=256, seqlen=2049):
 | Phase  | ChunkCache | SWARadixCache                             |
 |--------|------------|-------------------------------------------|
 | Extend | Yes        | **No** (skipped)                          |
-| Decode | Yes        | Yes (but starts from `cache_protected_len`) |
+| Decode | Yes        | Yes (but starts from the tree-derived protected prefix) |
 
 ## 4. Extend Phase Behavior
 
@@ -119,25 +121,27 @@ Chk 3: |.............|################|        pre_len=4096, evict [1792,3840)
 Chk 1: |########|
        _evict_swa: SKIPPED
        cache_unfinished_req --> tree owns [0,2048), all non-tombstone
-       cache_protected_len = 2048
+       protected prefix = 2048 (derived from last_node)
 
 Chk 2: |################|
        _evict_swa: SKIPPED
        cache_unfinished_req --> tree owns [0,4096), all non-tombstone
-       cache_protected_len = 4096
+       protected prefix = 4096 (derived from last_node)
 
-       ... chunks 3, 4 ...  cache_protected_len = 8192
+       ... chunks 3, 4 ...  protected prefix = 8192
 
 First decode step:
-  swa_evicted = max(0, cache_protected_len=8192) = 8192
-  new_evicted = max(8192, 8192-128) = 8192
+  protected_prefix_len = prefix_len(last_node) = 8192
+  swa_evicted = max(0, 8192) = 8192
+  new_evicted = max(8192, 8192-128-256) = 8192
   --> NO EVICTION (all tree-protected)
 
   # = SWA in tree (non-tombstone, only freed by tree Phase 2)
 ```
 
 **Trade-off**: Prefill SWA slots stay in tree until pool pressure triggers
-tree-level eviction. Simpler ownership model, but less SWA-efficient during prefill.
+tree-level eviction. The ownership boundary now lives inside the cache layer
+instead of a request field, but prefill is still less SWA-efficient than ChunkCache.
 
 ## 5. Tree-Level Eviction (SWARadixCache)
 
@@ -240,7 +244,7 @@ new nodes.  Invariant: **leaf nodes must never be tombstone**.
 | Call site | `swa_evicted_seqlen` | Existing tombstone | New nodes |
 |-----------|---------------------|--------------------|-----------|
 | `cache_unfinished_req` | Always 0 | Branch 1 only | Case 1 only |
-| `cache_finished_req` | >= `cache_protected_len` | Prefill nodes: skip zone. Prior req's decode nodes: Branch 1/2/3 | Case 2 (normal), Case 3 (defensive) |
+| `cache_finished_req` | >= protected prefix length | Prefill nodes: skip zone. Prior req's decode nodes: Branch 1/2/3 | Case 2 (normal), Case 3 (defensive) |
 
 ## 7. LRU Policy
 
@@ -276,7 +280,7 @@ reset to MRU in both lists, keeping frequently accessed prefixes fresh.
 |                   | (per chunk)     | (tree handles)         |
 +-------------------+-----------------+------------------------+
 | Decode SWA evict  | From pos 0      | From                   |
-|                   |                 | cache_protected_len    |
+|                   |                 | protected tree prefix  |
 +-------------------+-----------------+------------------------+
 | Prefill SWA waste | Low (bounded)   | Higher (until          |
 |                   |                 | Phase 2 evicts)        |

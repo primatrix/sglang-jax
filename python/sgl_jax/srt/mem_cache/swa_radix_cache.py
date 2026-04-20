@@ -415,7 +415,7 @@ class SWARadixCache(BasePrefixCache):
         self.insert(
             RadixKey(token_ids[:page_aligned_len], req.extra_key, req.dp_rank),
             page_aligned_kv_indices,
-            req.cache_protected_len,
+            req.last_matched_prefix_len,
             swa_evicted_seqlen=req.swa_evicted_seqlen,
         )
 
@@ -445,10 +445,11 @@ class SWARadixCache(BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
+        old_prefix_len = req.last_matched_prefix_len
         new_prefix_len = self.insert(
             RadixKey(page_aligned_token_ids, req.extra_key, req.dp_rank),
             page_aligned_kv_indices,
-            req.cache_protected_len,
+            old_prefix_len,
             swa_evicted_seqlen=req.swa_evicted_seqlen,
         )
 
@@ -458,7 +459,6 @@ class SWARadixCache(BasePrefixCache):
         )
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
-        old_prefix_len = req.cache_protected_len
         assert old_prefix_len <= len(new_indices), f"{old_prefix_len=}, {new_indices=}"
         assert new_prefix_len <= len(new_indices), f"{new_prefix_len=}, {new_indices=}"
         self.req_to_token_pool.write(
@@ -476,7 +476,7 @@ class SWARadixCache(BasePrefixCache):
             req.prefix_indices = new_indices
         req.last_node = new_last_node
         req.swa_uuid_for_lock = swa_uuid_for_lock
-        req.cache_protected_len = len(new_indices)
+        req.last_matched_prefix_len = len(new_indices)
 
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)
@@ -723,15 +723,36 @@ class SWARadixCache(BasePrefixCache):
         # protected size refers to the size of the swa cache that is locked
         return self.swa_protected_size_[dp_rank]
 
-    def adjust_swa_protected_size(self, delta: int, dp_rank: int = 0):
-        """Adjust swa_protected_size_ when SWA slots are freed outside the cache layer.
+    def _node_prefix_len(self, node: TreeNode | None) -> int:
+        prefix_len = 0
+        while node and node != self.root_node:
+            prefix_len += len(node.value)
+            node = node.parent
+        return prefix_len
 
-        Called by _evict_swa (schedule_batch.py) which directly frees SWA slots
-        via allocator.free_swa() for tokens that fell outside the sliding window.
-        Since those tokens belong to locked (protected) nodes, the freed count
-        must be subtracted from swa_protected_size_ to keep bookkeeping correct.
-        """
-        self.swa_protected_size_[dp_rank] += delta
+    def evict_req_swa(self, req: Req, pre_len: int, dp_rank: int = 0) -> None:
+        """Free request-owned SWA slots while preserving the tree-owned prefix."""
+        protected_prefix_len = self._node_prefix_len(req.last_node)
+        assert (
+            protected_prefix_len % self.page_size == 0
+        ), f"protected_prefix_len must be page aligned, {protected_prefix_len=}, {self.page_size=}"
+
+        req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, protected_prefix_len)
+
+        new_evicted = max(
+            req.swa_evicted_seqlen,
+            pre_len - self.sliding_window_size - self.page_size,
+        )
+        if self.page_size > 1:
+            new_evicted = (new_evicted // self.page_size) * self.page_size
+        if new_evicted <= req.swa_evicted_seqlen:
+            return
+
+        free_slots = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, req.swa_evicted_seqlen : new_evicted
+        ]
+        self.token_to_kv_pool_allocator.free_swa(free_slots, dp_rank=dp_rank)
+        req.swa_evicted_seqlen = new_evicted
 
     def all_values_flatten(self) -> jnp.Array:
         values = []

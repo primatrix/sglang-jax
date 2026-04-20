@@ -494,7 +494,7 @@ class TestSWARadixCache(unittest.TestCase):
         self.assertEqual(allocator.swa_available_size(dp_rank=1), initial_swa[1])
 
     # ------------------------------------------------------------------ #
-    #  T1-T12: Tombstone / cache_protected_len correctness tests          #
+    #  T1-T12: Tombstone / protected-prefix correctness tests             #
     # ------------------------------------------------------------------ #
 
     def _find_node_by_key_prefix(self, start_token):
@@ -740,8 +740,8 @@ class TestSWARadixCache(unittest.TestCase):
         cache.evict(full_num_tokens=full_total, swa_num_tokens=0)
         self._verify_size_consistency_for(cache, "after evict all")
 
-    def test_cache_protected_len_basic(self):
-        """T8: cache_protected_len prevents swa_evicted_seqlen from corrupting tree slots during insert."""
+    def test_protected_prefix_basic(self):
+        """T8: The protected tree prefix prevents swa_evicted_seqlen from corrupting tree slots during insert."""
         cache = self._make_small_cache(sliding_window_size=4)
         key = list(range(0, 20))
         val_first = self._alloc_indices(len(key))
@@ -756,7 +756,7 @@ class TestSWARadixCache(unittest.TestCase):
         # SWA-evict to create tombstone
         cache.evict(full_num_tokens=0, swa_num_tokens=20)
 
-        # Second insert with cache_protected_len=10 (prev_prefix_len) and swa_evicted_seqlen=5
+        # Second insert with protected_prefix_len=10 (prev_prefix_len) and swa_evicted_seqlen=5
         # Branch 2 applies: swa_evicted_seqlen(5) < node_end(20), split at 5, revive [5:20]
         val_second = self._alloc_indices(len(key))
         cache.insert(
@@ -767,7 +767,7 @@ class TestSWARadixCache(unittest.TestCase):
         match2 = cache.match_prefix(key)
         self.assertEqual(len(match2.device_indices), 20)
 
-        self._verify_size_consistency_for(cache, "after cache_protected_len insert")
+        self._verify_size_consistency_for(cache, "after protected prefix insert")
 
     def test_new_node_tombstone_split(self):
         """T9: New node crossing swa_evicted_seqlen boundary → correct split."""
@@ -986,21 +986,6 @@ class TestSWARadixCache(unittest.TestCase):
 
         self._verify_size_consistency_for(cache, "after exact boundary insert")
 
-    def test_match_result_has_cache_protected_len_field(self):
-        """T16: MatchResult includes cache_protected_len field (defaults to None)."""
-        from sgl_jax.srt.mem_cache.base_prefix_cache import MatchResult
-
-        key = list(range(0, 5))
-        val = self._alloc_indices(len(key))
-        self.cache.insert(key, value=val, prev_prefix_len=0)
-
-        match = self.cache.match_prefix(key)
-        self.assertIsInstance(match, MatchResult)
-        # cache_protected_len defaults to None (set on req object, not match result)
-        self.assertIsNone(match.cache_protected_len)
-        # Verify field exists and is accessible
-        self.assertTrue(hasattr(match, 'cache_protected_len'))
-
     def test_delete_leaf_uses_child_key_fn(self):
         """T17: _delete_leaf correctly removes nodes using get_child_key_fn lookup."""
         cache = self._make_small_cache(sliding_window_size=4)
@@ -1046,88 +1031,70 @@ class TestSWARadixCache(unittest.TestCase):
         self.assertEqual(len(cache.root_node.children), 0)
         self._verify_size_consistency_for(cache, "after tombstone cascade delete via child_key_fn")
 
-    def test_evict_swa_bumps_to_cache_protected_len(self):
-        """T19: _evict_swa bumps swa_evicted_seqlen to cache_protected_len upfront."""
-        # This is an integration test simulating the schedule_batch behavior
+    def test_evict_req_swa_uses_locked_tree_boundary(self):
+        """T19: Request SWA eviction derives its protected boundary from the locked tree path."""
         cache = self._make_small_cache(sliding_window_size=4)
         key = list(range(0, 20))
-        val = self._alloc_indices(len(key))
-        cache.insert(key, value=val, prev_prefix_len=0)
+        tree_indices = self._alloc_indices(len(key))
+        cache.insert(key, value=tree_indices, prev_prefix_len=0)
+        match = cache.match_prefix(key)
 
-        # Simulate a request with cache_protected_len=10
-        # and swa_evicted_seqlen=3 (< cache_protected_len)
+        tail_indices = self._alloc_indices(10)
+        req_indices = np.concatenate([tree_indices, tail_indices])
+        self.req_pool.req_to_token[0, :30] = req_indices
+
         class MockReq:
-            def __init__(self):
+            def __init__(self, last_node):
                 self.swa_evicted_seqlen = 3
-                self.cache_protected_len = 10
                 self.req_pool_idx = 0
+                self.last_node = last_node
 
-        req = MockReq()
-        # Write mock indices to req_to_token_pool
-        self.req_pool.req_to_token[0, :20] = val
+        req = MockReq(match.last_device_node)
+        swa_before = self.allocator.swa_available_size()
 
-        # Create a mock batch-like object with needed attributes
-        from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
-        class MockBatch:
-            def __init__(self_, req_pool, allocator):
-                self_.req_to_token_pool = req_pool
-                self_.token_to_kv_pool_allocator = allocator
-                self_.tree_cache = cache
+        cache.evict_req_swa(req, pre_len=30)
 
-            def _evict_swa(self_, req, pre_len, sliding_window_size, page_size, dp_rank=0):
-                """Replicate the fixed _evict_swa logic."""
-                assert req.cache_protected_len % page_size == 0
-                req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
-                new_evicted = max(req.swa_evicted_seqlen, pre_len - sliding_window_size)
-                if page_size > 1:
-                    new_evicted = (new_evicted // page_size) * page_size
-                if new_evicted <= req.swa_evicted_seqlen:
-                    return
-                free_slots = self_.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, req.swa_evicted_seqlen:new_evicted
-                ]
-                self_.token_to_kv_pool_allocator.free_swa(free_slots, dp_rank=dp_rank)
-                req.swa_evicted_seqlen = new_evicted
+        # Protected prefix is 20, so only uncached tail slots [20:25) are reclaimed.
+        self.assertEqual(req.swa_evicted_seqlen, 25)
+        self.assertEqual(self.allocator.swa_available_size(), swa_before + 5)
+        self.assertEqual(self.allocator.count_swa_mapped(tree_indices), len(tree_indices))
+        self.assertEqual(self.allocator.count_swa_mapped(tail_indices[:5]), 0)
+        self.assertEqual(self.allocator.count_swa_mapped(tail_indices[5:]), 5)
 
-        batch = MockBatch(self.req_pool, self.allocator)
-        batch._evict_swa(req, pre_len=18, sliding_window_size=4, page_size=1)
+    def test_evict_req_swa_page_alignment_uses_tree_boundary(self):
+        """T20: Request SWA eviction aligns by page size using the tree-derived protected boundary."""
+        paged_cache = SWARadixCache(
+            req_to_token_pool=self.req_pool,
+            token_to_kv_pool_allocator=self.allocator,
+            sliding_window_size=4,
+            page_size=4,
+            disable=False,
+        )
 
-        # swa_evicted_seqlen should be bumped to at least cache_protected_len (10)
-        # then to max(10, 18-4) = 14
-        self.assertEqual(req.swa_evicted_seqlen, 14)
-        # Crucially, swa_evicted_seqlen should never be less than cache_protected_len
-        self.assertGreaterEqual(req.swa_evicted_seqlen, req.cache_protected_len)
+        key = list(range(0, 8))
+        tree_indices = self._alloc_indices(len(key))
+        paged_cache.insert(key, value=tree_indices, prev_prefix_len=0)
+        match = paged_cache.match_prefix(key)
 
-    def test_evict_swa_page_alignment_assertion(self):
-        """T20: _evict_swa asserts cache_protected_len % page_size == 0."""
+        tail_indices = self._alloc_indices(12)
+        req_indices = np.concatenate([tree_indices, tail_indices])
+        self.req_pool.req_to_token[0, :20] = req_indices
+
         class MockReq:
-            def __init__(self):
+            def __init__(self, last_node):
                 self.swa_evicted_seqlen = 0
-                self.cache_protected_len = 3  # NOT page-aligned for page_size=4
                 self.req_pool_idx = 0
+                self.last_node = last_node
 
-        req = MockReq()
+        req = MockReq(match.last_device_node)
 
-        class MockBatch:
-            def __init__(self_, req_pool, allocator):
-                self_.req_to_token_pool = req_pool
-                self_.token_to_kv_pool_allocator = allocator
+        paged_cache.evict_req_swa(req, pre_len=20)
 
-            def _evict_swa(self_, req, pre_len, sliding_window_size, page_size, dp_rank=0):
-                assert req.cache_protected_len % page_size == 0, \
-                    f"cache_protected_len must be page aligned, {req.cache_protected_len=}, {page_size=}"
-                req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
-                new_evicted = max(req.swa_evicted_seqlen, pre_len - sliding_window_size)
-                if page_size > 1:
-                    new_evicted = (new_evicted // page_size) * page_size
-                if new_evicted <= req.swa_evicted_seqlen:
-                    return
-
-        batch = MockBatch(self.req_pool, self.allocator)
-
-        # Should raise AssertionError for non-aligned cache_protected_len with page_size=4
-        with self.assertRaises(AssertionError):
-            batch._evict_swa(req, pre_len=20, sliding_window_size=4, page_size=4)
+        # Protected prefix is 8. The eviction frontier is 20 - 4 - 4 = 12, already aligned.
+        self.assertEqual(req.swa_evicted_seqlen, 12)
+        self.assertEqual(self.allocator.count_swa_mapped(tree_indices), len(tree_indices))
+        self.assertEqual(self.allocator.count_swa_mapped(tail_indices[:4]), 0)
+        self.assertEqual(self.allocator.count_swa_mapped(tail_indices[4:]), 8)
 
     def test_swa_evicted_seqlen_page_alignment_assertion(self):
         """T21: _insert_helper asserts swa_evicted_seqlen % page_size == 0 when handling tombstones."""
@@ -1159,7 +1126,7 @@ class TestSWARadixCache(unittest.TestCase):
             )
 
     def test_cache_unfinished_req_writeback_range(self):
-        """T22: cache_unfinished_req writes back from cache_protected_len, not len(prefix_indices)."""
+        """T22: cache_unfinished_req writes back from last_matched_prefix_len, not len(prefix_indices)."""
         cache = self._make_small_cache(sliding_window_size=64)
 
         # Simulate first insert (initial request)

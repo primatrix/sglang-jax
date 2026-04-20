@@ -565,7 +565,6 @@ class PrefillAdder:
             if total_tokens >= self.rem_total_tokens_for_dp(dp_rank):
                 return AddReqResult.NO_TOKEN
             req.last_matched_prefix_len = prefix_len
-            req.cache_protected_len = prefix_len
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
             total_can_run = sum(len(v) for v in self.can_run_list.values())
