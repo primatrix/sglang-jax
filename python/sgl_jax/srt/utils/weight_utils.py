@@ -137,6 +137,7 @@ class WeightLoader:
 
             self.head_dim_pad = (self.head_dim_original + 127) // 128 * 128 - self.head_dim_original
             self.head_dim = self.head_dim_original
+            self.v_head_dim = getattr(model_config, "v_head_dim", self.head_dim_original)
         if hasattr(self.mesh, "shape") and "tensor" in self.mesh.shape:
             self.sharding_size = self.mesh.shape["tensor"]
         else:
@@ -1533,13 +1534,18 @@ class WeightLoader:
     ):
         jax_paths = mapping.target_path
 
+        v_head_dim = getattr(self, "v_head_dim", self.head_dim_original)
+        v_head_dim_pad = (v_head_dim + 127) // 128 * 128 - v_head_dim
+        v_head_dim_padded = v_head_dim + v_head_dim_pad
+
         if hf_key.endswith(".bias"):
             q_dim = self.num_heads * self.head_dim_original
-            kv_dim = self.num_kv_heads * self.head_dim_original
+            k_dim = self.num_kv_heads * self.head_dim_original
+            v_dim = self.num_kv_heads * v_head_dim
 
             q_bias = weight[:q_dim]
-            k_bias = weight[q_dim : q_dim + kv_dim]
-            v_bias = weight[q_dim + kv_dim : q_dim + 2 * kv_dim]
+            k_bias = weight[q_dim : q_dim + k_dim]
+            v_bias = weight[q_dim + k_dim : q_dim + k_dim + v_dim]
 
             if mapping.head_dim_padding and self.head_dim_pad > 0:
                 q_bias = jnp.reshape(q_bias, (self.num_heads, self.head_dim_original))
@@ -1550,23 +1556,25 @@ class WeightLoader:
                 k_bias = jnp.pad(k_bias, ((0, 0), (0, self.head_dim_pad)))
                 k_bias = jnp.reshape(k_bias, (self.num_kv_heads * self.head_dim,))
 
-                v_bias = jnp.reshape(v_bias, (self.num_kv_heads, self.head_dim_original))
-                v_bias = jnp.pad(v_bias, ((0, 0), (0, self.head_dim_pad)))
-                v_bias = jnp.reshape(v_bias, (self.num_kv_heads * self.head_dim,))
+            if mapping.head_dim_padding and v_head_dim_pad > 0:
+                v_bias = jnp.reshape(v_bias, (self.num_kv_heads, v_head_dim))
+                v_bias = jnp.pad(v_bias, ((0, 0), (0, v_head_dim_pad)))
+                v_bias = jnp.reshape(v_bias, (self.num_kv_heads * v_head_dim_padded,))
 
             splits = [q_bias, k_bias, v_bias]
         else:
             q_dim = self.num_heads * self.head_dim_original
-            kv_dim = self.num_kv_heads * self.head_dim_original
+            k_dim = self.num_kv_heads * self.head_dim_original
+            v_dim = self.num_kv_heads * v_head_dim
 
             if mapping.transpose:
                 q_weight = weight[:, :q_dim]
-                k_weight = weight[:, q_dim : q_dim + kv_dim]
-                v_weight = weight[:, q_dim + kv_dim : q_dim + 2 * kv_dim]
+                k_weight = weight[:, q_dim : q_dim + k_dim]
+                v_weight = weight[:, q_dim + k_dim : q_dim + k_dim + v_dim]
             else:
                 q_weight = weight[:q_dim, :]
-                k_weight = weight[q_dim : q_dim + kv_dim, :]
-                v_weight = weight[q_dim + kv_dim : q_dim + 2 * kv_dim, :]
+                k_weight = weight[q_dim : q_dim + k_dim, :]
+                v_weight = weight[q_dim + k_dim : q_dim + k_dim + v_dim, :]
 
             if mapping.head_dim_padding and self.head_dim_pad > 0:
                 if mapping.transpose:
@@ -1587,15 +1595,6 @@ class WeightLoader:
                     k_weight = jnp.reshape(
                         k_weight, (self.hidden_size, self.num_kv_heads * self.head_dim)
                     )
-
-                    v_weight = jnp.reshape(
-                        v_weight,
-                        (self.hidden_size, self.num_kv_heads, self.head_dim_original),
-                    )
-                    v_weight = jnp.pad(v_weight, ((0, 0), (0, 0), (0, self.head_dim_pad)))
-                    v_weight = jnp.reshape(
-                        v_weight, (self.hidden_size, self.num_kv_heads * self.head_dim)
-                    )
                 else:
                     q_weight = jnp.reshape(
                         q_weight,
@@ -1615,13 +1614,24 @@ class WeightLoader:
                         k_weight, (self.num_kv_heads * self.head_dim, self.hidden_size)
                     )
 
+            if mapping.head_dim_padding and v_head_dim_pad > 0:
+                if mapping.transpose:
                     v_weight = jnp.reshape(
                         v_weight,
-                        (self.num_kv_heads, self.head_dim_original, self.hidden_size),
+                        (self.hidden_size, self.num_kv_heads, v_head_dim),
                     )
-                    v_weight = jnp.pad(v_weight, ((0, 0), (0, self.head_dim_pad), (0, 0)))
+                    v_weight = jnp.pad(v_weight, ((0, 0), (0, 0), (0, v_head_dim_pad)))
                     v_weight = jnp.reshape(
-                        v_weight, (self.num_kv_heads * self.head_dim, self.hidden_size)
+                        v_weight, (self.hidden_size, self.num_kv_heads * v_head_dim_padded)
+                    )
+                else:
+                    v_weight = jnp.reshape(
+                        v_weight,
+                        (self.num_kv_heads, v_head_dim, self.hidden_size),
+                    )
+                    v_weight = jnp.pad(v_weight, ((0, 0), (0, v_head_dim_pad), (0, 0)))
+                    v_weight = jnp.reshape(
+                        v_weight, (self.num_kv_heads * v_head_dim_padded, self.hidden_size)
                     )
 
             splits = [q_weight, k_weight, v_weight]
