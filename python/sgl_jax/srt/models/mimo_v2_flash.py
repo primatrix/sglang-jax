@@ -609,6 +609,28 @@ class MiMoV2FlashForCausalLM(nnx.Module):
 
         if weight_scale.ndim == 3:
             weight_bf16 = self._block_dequant(weight_q, weight_scale, head_dim=head_dim)
+        elif weight_scale.ndim == 2:
+            # Raw 2D block-quant scale [out_blocks, in_blocks] — expand to 3D first.
+            # This can happen for QKV-split scales where expansion was skipped.
+            import math
+
+            from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import (
+                expand_block_scale,
+            )
+
+            quant_cfg = getattr(self.config, "quantization_config", None)
+            block_size_out = int(quant_cfg.weight_block_size[0]) if quant_cfg else 128
+
+            dim0, dim1 = weight_q.shape
+            out_blocks = weight_scale.shape[0]
+            # Determine which weight dim is output: must satisfy ceil(dim/bs) <= out_blocks
+            n_out = dim1 if math.ceil(dim1 / block_size_out) <= out_blocks else dim0
+
+            logger.info(
+                "Expanding 2D scale %s -> 3D for dequant, n_out=%d", weight_scale.shape, n_out
+            )
+            weight_scale_3d = expand_block_scale(weight_scale, n_out, block_size_out)
+            weight_bf16 = self._block_dequant(weight_q, weight_scale_3d, head_dim=head_dim)
         elif weight_scale.ndim == 1:
             out_dim = weight_scale.shape[0]
             if weight_q.shape[1] == out_dim:

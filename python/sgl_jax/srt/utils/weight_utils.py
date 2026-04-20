@@ -1562,6 +1562,37 @@ class WeightLoader:
                 v_bias = jnp.reshape(v_bias, (self.num_kv_heads * v_head_dim_padded,))
 
             splits = [q_bias, k_bias, v_bias]
+        elif "scale" in hf_key and weight.ndim == 2:
+            # Block-quant scale: split along block dimension, not element dimension.
+            # The fused QKV scale has shape [total_blocks, in_blocks] where blocks
+            # are computed per Q/K/V segment independently.
+            import math
+
+            quant_cfg = getattr(self.model_config, "quantization_config", None)
+            block_size = int(quant_cfg.weight_block_size[0]) if quant_cfg else 128
+
+            q_dim = self.num_heads * self.head_dim_original
+            k_dim = self.num_kv_heads * self.head_dim_original
+
+            q_blocks = math.ceil(q_dim / block_size)
+            k_blocks = math.ceil(k_dim / block_size)
+            # V gets remaining blocks (may include padding to head_dim_original)
+            v_blocks = weight.shape[0] - q_blocks - k_blocks
+
+            logger.info(
+                "Splitting QKV scale %s shape=%s into Q=%d K=%d V=%d blocks",
+                hf_key,
+                weight.shape,
+                q_blocks,
+                k_blocks,
+                v_blocks,
+            )
+
+            q_scale = weight[:q_blocks, :]
+            k_scale = weight[q_blocks : q_blocks + k_blocks, :]
+            v_scale = weight[q_blocks + k_blocks :, :]
+
+            splits = [q_scale, k_scale, v_scale]
         else:
             q_dim = self.num_heads * self.head_dim_original
             k_dim = self.num_kv_heads * self.head_dim_original
@@ -1645,6 +1676,11 @@ class WeightLoader:
             sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
 
             model_param = self._get_param(params, jax_path)
+
+            # Expand 2D block-quant scale to 3D kernel-ready layout.
+            sharded_weight = self._maybe_expand_linear_block_scale(
+                sharded_weight, model_param, jax_path
+            )
 
             if sharded_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
                 model_param.value = sharded_weight
