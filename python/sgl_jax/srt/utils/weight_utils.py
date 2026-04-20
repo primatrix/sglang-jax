@@ -4,6 +4,7 @@ import logging
 import os
 import pickle
 import re
+import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -738,9 +739,9 @@ class WeightLoader:
 
             return out_array
 
-        result = jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice).astype(
-            target_dtype
-        )
+        result = jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice)
+        if result.dtype != target_dtype:
+            result = result.astype(target_dtype)
         if do_transpose and result.ndim >= 3:
             result = jnp.transpose(result, (0, 2, 1))
         return result
@@ -795,9 +796,12 @@ class WeightLoader:
         stacked_shape = (num_physical_experts, *final_single_shape)
         sharding = target_sharding or jax.sharding.NamedSharding(self.mesh, P())
 
-        LOAD_WORKERS = 16
+        LOAD_WORKERS = int(os.environ.get("SGLANG_MOE_LOAD_WORKERS", "16"))
+
+        _callback_times = []
 
         def _load_stacked_slice(index):
+            _cb_start = time.monotonic()
             expert_slice = index[0]
             inner_slice = index[1:]
 
@@ -869,11 +873,32 @@ class WeightLoader:
                 with ThreadPoolExecutor(max_workers=LOAD_WORKERS) as executor:
                     list(executor.map(load_and_fill_expert, tasks))
 
+            _callback_times.append(time.monotonic() - _cb_start)
             return out_array
 
-        return jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice).astype(
-            target_dtype
-        )
+        t0 = time.monotonic()
+        result = jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice)
+        t_callback = time.monotonic() - t0
+        t1 = time.monotonic()
+        if result.dtype != target_dtype:
+            result = result.astype(target_dtype)
+        t_astype = time.monotonic() - t1
+        if _callback_times:
+            logger.info(
+                "MoE tensor load: shape=%s dtype=%s callbacks=%d "
+                "callback_total=%.2fs (min=%.3fs max=%.3fs) "
+                "make_array=%.2fs astype=%.2fs workers=%d",
+                stacked_shape,
+                target_dtype,
+                len(_callback_times),
+                sum(_callback_times),
+                min(_callback_times),
+                max(_callback_times),
+                t_callback,
+                t_astype,
+                LOAD_WORKERS,
+            )
+        return result
 
     def load_weights_from_safetensors(
         self,
@@ -1124,6 +1149,7 @@ class WeightLoader:
                         final_sharding = jax.sharding.NamedSharding(self.mesh, P(*mapping.sharding))
 
                     # 2. Call creator
+                    _t_load_start = time.monotonic()
                     stacked_weight = self._create_stacked_moe_lazy_tensor(
                         expected_hf_keys,
                         weight_info,
@@ -1132,6 +1158,7 @@ class WeightLoader:
                         target_sharding=final_sharding,  # Global loading
                         physical_to_logical_map=mapping.physical_to_logical_map,
                     )
+                    _t_load = time.monotonic() - _t_load_start
                     loaded_shape = stacked_weight.shape
 
                     if mapping.reshape is not None:
@@ -1165,10 +1192,22 @@ class WeightLoader:
                         )
 
                     try:
+                        _t_assign_start = time.monotonic()
                         if stacked_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
                             model_param.value = stacked_weight
                         else:
                             model_param.value = stacked_weight.astype(model_param.value.dtype)
+                        _t_assign = time.monotonic() - _t_assign_start
+                        logger.info(
+                            "MoE group %s: load=%.2fs assign=%.2fs total=%.2fs "
+                            "shape=%s sharding=%s",
+                            moe_key,
+                            _t_load,
+                            _t_assign,
+                            _t_load + _t_assign,
+                            loaded_shape,
+                            mapping.sharding,
+                        )
                     except Exception as e:
                         logger.error(
                             "Failed MoE assign group=%s target=%s loaded_shape=%s final_shape=%s "
