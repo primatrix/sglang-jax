@@ -782,7 +782,25 @@ class WeightLoader:
         else:
             num_physical_experts = num_logical_experts
 
-        if do_transpose and len(single_expert_shape) >= 2:
+        # Detect whether we can defer transpose to TPU instead of doing it
+        # on CPU during loading. This is possible when do_transpose=True but
+        # the weight dimensions (all dims after expert dim) are unsharded,
+        # meaning each callback loads the full tensor. Deferring avoids the
+        # costly strided memcpy from np.transpose on non-contiguous views.
+        defer_transpose = False
+        if do_transpose and len(single_expert_shape) >= 2 and target_sharding is not None:
+            spec = target_sharding.spec
+            # spec[0] is expert dim sharding, spec[1:] are weight dims
+            weight_dims_unsharded = all(s is None for s in spec[1:])
+            if weight_dims_unsharded:
+                defer_transpose = True
+                logger.info(
+                    "MoE defer_transpose=True: will load in HF layout and "
+                    "transpose on TPU (shape=%s)",
+                    single_expert_shape,
+                )
+
+        if do_transpose and not defer_transpose and len(single_expert_shape) >= 2:
             final_single_shape = list(single_expert_shape)
             final_single_shape[-1], final_single_shape[-2] = (
                 final_single_shape[-2],
@@ -827,7 +845,7 @@ class WeightLoader:
             first_fname = weight_info[first_hf_key][0]["file"]
             first_f = file_manager.get_handle(first_fname)
 
-            if not do_transpose:
+            if not do_transpose or defer_transpose:
                 first_chunk = first_f.get_slice(first_hf_key)[inner_slice]
                 first_chunk = _view_as_fp8_if_needed(first_chunk, target_dtype)
             else:
@@ -853,7 +871,7 @@ class WeightLoader:
                 fname = weight_info[hf_k][0]["file"]
                 f = file_manager.get_handle(fname)
 
-                if not do_transpose:
+                if not do_transpose or defer_transpose:
                     chunk = f.get_slice(hf_k)[inner_slice]
                     chunk = _view_as_fp8_if_needed(chunk, target_dtype)
                 else:
@@ -871,9 +889,14 @@ class WeightLoader:
 
             return out_array
 
-        return jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice).astype(
-            target_dtype
-        )
+        result = jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice)
+        if result.dtype != target_dtype:
+            result = result.astype(target_dtype)
+        # Deferred transpose: data was loaded in HF layout [experts, out, in],
+        # now transpose to kernel layout [experts, in, out] on TPU.
+        if defer_transpose and result.ndim >= 3:
+            result = jnp.transpose(result, (0, 2, 1))
+        return result
 
     def load_weights_from_safetensors(
         self,
