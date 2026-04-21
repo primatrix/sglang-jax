@@ -78,6 +78,17 @@ class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
         quant_cfg = getattr(self.config, "quantization_config", None)
         block_size = int(quant_cfg.weight_block_size[0]) if quant_cfg else 128
 
+        logger.info(
+            "Fused QKV dequant params: head_dim=%d v_head_dim=%d num_heads=%d "
+            "num_kv_heads=%d block_size=%d layers=%s",
+            head_dim,
+            v_head_dim,
+            num_heads,
+            num_kv_heads,
+            block_size,
+            sorted(self._fused_qkv_buffers.keys()),
+        )
+
         for layer_idx in sorted(self._fused_qkv_buffers.keys()):
             buf = self._fused_qkv_buffers[layer_idx]
             fused_weight = buf["weight"]  # [total_qkv, hidden], FP8, HF layout
@@ -216,11 +227,21 @@ class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
                 + (num_kv_heads // tp) * v_head_dim
             )
             per_shard_blocks = math.ceil(per_shard / block_size)
+            logger.info(
+                "Trying tp=%d: per_shard=%d blocks=%d expected_blocks=%d expected_out=%d",
+                tp,
+                per_shard,
+                per_shard_blocks,
+                per_shard_blocks * tp,
+                per_shard * tp,
+            )
             if per_shard_blocks * tp == total_scale_blocks and per_shard * tp == total_out_dim:
                 return tp
         raise ValueError(
             f"Cannot infer QKV shard count: out_dim={total_out_dim}, "
-            f"scale_blocks={total_scale_blocks}"
+            f"scale_blocks={total_scale_blocks}, num_heads={num_heads}, "
+            f"num_kv_heads={num_kv_heads}, head_dim={head_dim}, "
+            f"v_head_dim={v_head_dim}, block_size={block_size}"
         )
 
     def _create_layer_mappings(self, layer_idx: int) -> dict:
