@@ -50,6 +50,7 @@ class WeightMapping:
     repeat: tuple[int, int] | None = None
     head_dim_padding: bool = False
     kv_head_padding: bool = False
+    split_sizes: list[int] | None = None
     concat_axis: int | None = None
     is_eagle3: bool = False
     physical_to_logical_map: np.ndarray | None = None
@@ -1533,7 +1534,27 @@ class WeightLoader:
     ):
         jax_paths = mapping.target_path
 
-        if hf_key.endswith(".bias"):
+        if mapping.split_sizes:
+            # Explicit split sizes (e.g., fused QKV with different Q/K/V dims)
+            sizes = mapping.split_sizes
+            split_axis = 1 if mapping.transpose else 0
+
+            if hf_key.endswith(".bias"):
+                splits = []
+                offset = 0
+                for s in sizes:
+                    splits.append(weight[offset : offset + s])
+                    offset += s
+            else:
+                splits = []
+                offset = 0
+                for s in sizes:
+                    if split_axis == 1:
+                        splits.append(weight[:, offset : offset + s])
+                    else:
+                        splits.append(weight[offset : offset + s, :])
+                    offset += s
+        elif hf_key.endswith(".bias"):
             q_dim = self.num_heads * self.head_dim_original
             kv_dim = self.num_kv_heads * self.head_dim_original
 

@@ -158,6 +158,7 @@ class MiMoV2Attention(nnx.Module):
         sliding_window_size: int | None = None,
         attention_sink_bias: bool = False,
         partial_rotary_factor: float = 1.0,
+        attention_value_scale: float | None = None,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
@@ -172,6 +173,7 @@ class MiMoV2Attention(nnx.Module):
         self.k_size = num_kv_heads * self.head_dim
         self.v_size = num_kv_heads * self.v_head_dim
         self.scaling = self.head_dim**-0.5
+        self.attention_value_scale = attention_value_scale
 
         self.q_proj = LinearBase(
             input_size=hidden_size,
@@ -269,6 +271,10 @@ class MiMoV2Attention(nnx.Module):
             attention_sink=self.attention_sink_bias.value if self.attention_sink_bias else None,
         )
 
+        # Apply attention value scaling (e.g. MiMo-V2-Pro uses 0.612)
+        if self.attention_value_scale is not None:
+            attn_output = attn_output * self.attention_value_scale
+
         # V was padded to head_dim for fused KV cache; slice back to v_head_dim
         # so o_proj receives the correct input size.
         if self.head_dim != self.v_head_dim:
@@ -310,6 +316,7 @@ class MiMoV2DecoderLayer(nnx.Module):
                 sliding_window_size=getattr(config, "sliding_window_size", None),
                 attention_sink_bias=getattr(config, "add_swa_attention_sink_bias", False),
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
+                attention_value_scale=getattr(config, "attention_value_scale", None),
                 layer_id=layer_id,
                 dtype=dtype,
                 mesh=mesh,
@@ -327,6 +334,7 @@ class MiMoV2DecoderLayer(nnx.Module):
                 sliding_window_size=0,  # full attention
                 attention_sink_bias=getattr(config, "add_full_attention_sink_bias", False),
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
+                attention_value_scale=getattr(config, "attention_value_scale", None),
                 layer_id=layer_id,
                 dtype=dtype,
                 mesh=mesh,
@@ -568,7 +576,39 @@ class MiMoV2FlashForCausalLM(nnx.Module):
             _, in_blocks = weight_scale.shape
             out_dim = weight_q.shape[1] if weight_q.shape[0] % in_blocks == 0 else weight_q.shape[0]
             block_size_out = 128
-            scale_3d = expand_block_scale(weight_scale, out_dim, block_size_out)
+
+            # Per-head block quant: when head_dim is not a multiple of
+            # block_size, each head's last block is shorter.  Build an
+            # explicit channel→block index so expand_block_scale maps
+            # each output channel to the correct scale row.
+            # Only needed when out_blocks * block_size != out_dim,
+            # i.e. the blocks are non-uniform (e.g. k_proj with head_dim=192).
+            # Q-proj may also have head_dim=192 but uses uniform blocks
+            # (q_dim is exactly divisible by 128), so skip it.
+            channel_to_block = None
+            out_blocks = weight_scale.shape[0]
+            if (
+                head_dim is not None
+                and head_dim % block_size_out != 0
+                and out_blocks * block_size_out != out_dim
+            ):
+                import math
+                blocks_per_head = math.ceil(head_dim / block_size_out)
+                channel_to_block = jnp.array(
+                    [
+                        (ch // head_dim) * blocks_per_head + (ch % head_dim) // block_size_out
+                        for ch in range(out_dim)
+                    ]
+                )
+                logger.info(
+                    "Per-head block quant: head_dim=%d, blocks_per_head=%d, "
+                    "out_dim=%d, out_blocks=%d, channel_to_block built",
+                    head_dim, blocks_per_head, out_dim, out_blocks,
+                )
+
+            scale_3d = expand_block_scale(
+                weight_scale, out_dim, block_size_out, channel_to_block=channel_to_block
+            )
             weight_bf16 = self._block_dequant(weight_q, scale_3d, head_dim=head_dim)
         elif weight_scale.ndim == 1:
             out_dim = weight_scale.shape[0]

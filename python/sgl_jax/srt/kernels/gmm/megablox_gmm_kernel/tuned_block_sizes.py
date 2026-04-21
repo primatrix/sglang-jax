@@ -560,6 +560,11 @@ def get_default_gmm_block_sizes(m: int, k: int, n: int, g: int) -> tuple[int, in
     # 512.
     tm = round_up_to_multiple_of_128_within_limit(2 * m // g, 512)
     tm = min(tm, m)  # there's a requirement that m % tm == 0
+    # Ensure m is divisible by tm; step down by 128 until it divides evenly.
+    while m % tm != 0 and tm > 128:
+        tm -= 128
+    if m % tm != 0:
+        tm = 128  # fallback to minimum tile size
     # k/n correspond to n_input_features/n_output_features in the matmul so they
     # are normally greater than 2048, unless the num shards is large.
     tk = round_up_to_multiple_of_128_within_limit(k, 2048)
