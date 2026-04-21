@@ -559,10 +559,6 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         """
         import glob
         import os
-
-        if os.environ.get("SGLANG_SKIP_GCSFUSE_WARMUP", ""):
-            logger.info("Skipping GCSFuse cache warmup (SGLANG_SKIP_GCSFUSE_WARMUP set)")
-            return
         from concurrent.futures import ThreadPoolExecutor
 
         model_path = model_config.model_path
