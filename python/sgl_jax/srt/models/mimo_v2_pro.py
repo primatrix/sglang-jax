@@ -11,12 +11,10 @@ import math
 
 import jax
 import jax.numpy as jnp
-from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
-from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.moe import create_moe_weights_mapping
 from sgl_jax.srt.models.mimo_v2_flash import MiMoV2FlashForCausalLM
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
@@ -39,7 +37,7 @@ class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
 
     def load_weights(self, model_config):
         """Load weights with special handling for per-shard-quantized fused QKV."""
-        loader = WeightLoader(
+        self._loader = WeightLoader(
             model=self,
             model_config=model_config,
             mesh=self.mesh,
@@ -47,14 +45,29 @@ class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
         )
         self._quant_config = model_config.quantization_config
         weight_mappings = self._create_weight_mappings()
-        loader.load_weights_from_safetensors(weight_mappings)
+        self._loader.load_weights_from_safetensors(weight_mappings)
         logger.info("MiMoV2Pro weights loaded successfully!")
 
-        if self._is_static_quant:
+        if self._loader.is_static_quant:
+            head_dim = self.config.head_dim
+            v_head_dim = getattr(self.config, "v_head_dim", head_dim)
             # Dequantize fused QKV per-shard, then split into Q/K/V bf16.
             self._dequant_fused_qkv()
             # Dequantize remaining FP8 weights (layer 0 MLP, etc).
-            self._dequantize_fp8_to_bf16()
+            self._loader.dequant_fp8_layers(
+                self.model.layers,
+                specs=[
+                    ("mlp.gate_proj", None),
+                    ("mlp.up_proj", None),
+                    ("mlp.down_proj", None),
+                ],
+                layer_filter=lambda idx, layer: idx == 0 and not layer.is_layer_sparse,
+            )
+            self._loader.replicate_kv_heads(
+                self.model.layers,
+                specs=[("self_attn.k_proj", head_dim), ("self_attn.v_proj", v_head_dim)],
+                target_kv_heads_fn=lambda attn: attn.k_head_num,
+            )
 
     def _dequant_fused_qkv(self):
         """Dequantize per-shard-interleaved fused QKV FP8 weights.
@@ -169,17 +182,11 @@ class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
                 ("k_proj", k_weight),
                 ("v_proj", v_weight),
             ]:
-                with jax.set_mesh(self.mesh):
-                    new_linear = LinearBase(
-                        input_size=in_dim,
-                        output_size=w.shape[1],
-                        kernel_axes=(None, "tensor"),
-                        use_bias=False,
-                        params_dtype=jnp.bfloat16,
-                        mesh=self.mesh,
-                    )
-                    new_linear.weight = nnx.Param(w)
-                setattr(attn, proj_name, new_linear)
+                setattr(
+                    attn,
+                    proj_name,
+                    WeightLoader.create_bf16_linear(w, (None, "tensor"), self.mesh),
+                )
 
             if layer_idx == 0:
                 logger.info(
@@ -192,9 +199,6 @@ class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
         # Clean up buffers
         self._fused_qkv_buffers.clear()
         logger.info("Fused QKV FP8 dequantization complete for all layers.")
-
-        # Replicate KV heads for TP alignment
-        self._ensure_kv_head_replication()
 
     @staticmethod
     def _infer_qkv_shards(

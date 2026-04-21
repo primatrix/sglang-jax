@@ -10,6 +10,7 @@ import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -17,6 +18,9 @@ import ml_dtypes
 import numpy as np
 from flax import nnx
 from jax.experimental import multihost_utils
+
+if TYPE_CHECKING:
+    from sgl_jax.srt.layers.linear import LinearBase
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 from safetensors import safe_open
@@ -156,6 +160,248 @@ class WeightLoader:
             )
         else:
             self.moe_abstract_mesh = None
+
+    # ------------------------------------------------------------------
+    # Quant config helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def is_static_quant(self) -> bool:
+        """Check if the model uses a static FP8 checkpoint."""
+        quant_cfg = getattr(self.model_config, "quantization_config", None)
+        return quant_cfg is not None and quant_cfg.is_static_checkpoint
+
+    def is_quant_ignored(self, hf_path: str) -> bool:
+        """Check if a HuggingFace weight path is in the quantization ignored_layers list."""
+        quant_cfg = getattr(self.model_config, "quantization_config", None)
+        if quant_cfg is None or not quant_cfg.is_static_checkpoint:
+            return True
+        ignored = quant_cfg.ignored_layers or []
+        return any(hf_path == ig or hf_path.endswith(f".{ig}") for ig in ignored)
+
+    # ------------------------------------------------------------------
+    # Post-load hooks: dequant FP8 → BF16, KV head replication
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def create_bf16_linear(
+        weight: jax.Array, kernel_axes, mesh, use_bias=False, bias=None
+    ) -> "LinearBase":
+        """Create a bf16 LinearBase from a weight array [in, out]."""
+        from sgl_jax.srt.layers.linear import LinearBase
+
+        in_features, out_features = weight.shape
+        with jax.set_mesh(mesh):
+            new_linear = LinearBase(
+                input_size=in_features,
+                output_size=out_features,
+                kernel_axes=kernel_axes,
+                use_bias=use_bias,
+                params_dtype=jnp.bfloat16,
+                mesh=mesh,
+            )
+            new_linear.weight = nnx.Param(weight)
+            if bias is not None:
+                new_linear.bias = nnx.Param(bias.astype(jnp.bfloat16))
+        return new_linear
+
+    def dequant_fp8_linear(self, ql, head_dim: int | None = None) -> "LinearBase":
+        """Dequantize a single QuantizedLinear → bf16 LinearBase.
+
+        Handles 3D block-quant scales, 1D per-channel scales, kv_head_padding,
+        and per-head block quant (when head_dim % block_size != 0).
+
+        Args:
+            ql: QuantizedLinear module with weight_q and weight_scale.
+            head_dim: If set, enables per-head block quant handling.
+        """
+        weight_q = ql.weight_q.value
+        weight_scale = ql.weight_scale.value
+
+        if weight_scale.ndim == 3:
+            weight_bf16 = self._block_dequant(weight_q, weight_scale, head_dim=head_dim)
+        elif weight_scale.ndim == 1:
+            out_dim = weight_scale.shape[0]
+            if weight_q.shape[1] == out_dim:
+                weight_bf16 = (weight_q.astype(jnp.float32) * weight_scale[None, :]).astype(
+                    jnp.bfloat16
+                )
+            else:
+                weight_bf16 = (
+                    jnp.transpose(weight_q).astype(jnp.float32) * weight_scale[None, :]
+                ).astype(jnp.bfloat16)
+        else:
+            raise ValueError(f"Unexpected weight_scale ndim={weight_scale.ndim}")
+
+        bias = ql.bias.value if ql.bias is not None else None
+        return self.create_bf16_linear(
+            weight_bf16, ql.kernel_axes, ql.mesh, ql.bias is not None, bias
+        )
+
+    @staticmethod
+    def _block_dequant(
+        weight_q: jax.Array, weight_scale: jax.Array, head_dim: int | None = None
+    ) -> jax.Array:
+        """Block-dequantize weight_q using 3D scale [in_blocks, 1, out_dim].
+
+        Returns bf16 weight in model layout [in_dim, out_dim].
+        Handles kv_head_padding (scale tiling) and per-head block quant.
+        """
+        import math
+
+        in_blocks = weight_scale.shape[0]
+        out_dim = weight_scale.shape[2]
+        dim0, dim1 = weight_q.shape
+
+        if dim1 == out_dim:
+            pass  # Model layout [in, out], no kv-padding
+        elif dim0 == out_dim:
+            weight_q = jnp.transpose(weight_q)  # HF layout [out, in]
+        elif head_dim is not None and dim1 != out_dim and dim0 != out_dim:
+            # Per-head block quant: scale was expanded for wrong n_out.
+            if dim0 % in_blocks == 0:
+                actual_out = dim1  # model layout [in, out]
+            else:
+                weight_q = jnp.transpose(weight_q)
+                actual_out = dim0  # was HF layout [out, in]
+
+            block_size = 128
+            blocks_per_head = math.ceil(head_dim / block_size)
+            num_heads = actual_out // head_dim
+
+            gather_idx = jnp.array(
+                [
+                    ((j // head_dim) * blocks_per_head + (j % head_dim) // block_size) * block_size
+                    for j in range(actual_out)
+                ]
+            )
+            weight_scale = weight_scale[:, :, gather_idx]
+            out_dim = actual_out
+
+            logger.info(
+                "Per-head block dequant: %d heads x head_dim=%d, %d blocks/head, "
+                "remapped scale to (%s)",
+                num_heads,
+                head_dim,
+                blocks_per_head,
+                weight_scale.shape,
+            )
+        elif dim1 > out_dim and dim1 % out_dim == 0:
+            # Model layout [in, kv_padded_out] — tile scale
+            kv_replicas = dim1 // out_dim
+            weight_scale = jnp.tile(weight_scale, (1, 1, kv_replicas))
+            out_dim = dim1
+        elif dim0 > out_dim and dim0 % out_dim == 0:
+            # HF layout [kv_padded_out, in] — transpose and tile scale
+            kv_replicas = dim0 // out_dim
+            weight_q = jnp.transpose(weight_q)
+            weight_scale = jnp.tile(weight_scale, (1, 1, kv_replicas))
+            out_dim = weight_q.shape[1]
+        else:
+            raise ValueError(
+                f"Cannot match weight_q shape {weight_q.shape} with scale out_dim={out_dim}"
+            )
+
+        in_dim = weight_q.shape[0]
+        block_k = in_dim // in_blocks
+        weight_f = weight_q.astype(jnp.float32).reshape(in_blocks, block_k, out_dim)
+        weight_bf16 = (weight_f * weight_scale).reshape(in_dim, out_dim).astype(jnp.bfloat16)
+        return weight_bf16
+
+    def dequant_fp8_layers(
+        self,
+        layers: list,
+        specs: list[tuple[str, int | None]],
+        *,
+        layer_filter=None,
+    ):
+        """Dequantize specified QuantizedLinear projections → bf16 LinearBase.
+
+        Args:
+            layers: model.layers list.
+            specs: list of (dotted_path, head_dim) tuples, e.g.
+                [("self_attn.q_proj", 192), ("self_attn.v_proj", 128)].
+            layer_filter: optional callable(layer_idx, layer) -> bool.
+        """
+        from sgl_jax.srt.layers.linear import QuantizedLinear
+
+        for layer_idx, layer in enumerate(layers):
+            if layer_filter is not None and not layer_filter(layer_idx, layer):
+                continue
+            for proj_path, hd in specs:
+                parts = proj_path.split(".")
+                parent = layer
+                for p in parts[:-1]:
+                    parent = getattr(parent, p)
+                attr_name = parts[-1]
+                proj = getattr(parent, attr_name)
+                if isinstance(proj, QuantizedLinear):
+                    setattr(parent, attr_name, self.dequant_fp8_linear(proj, head_dim=hd))
+                    logger.info("Dequantized layer %d %s -> bf16", layer_idx, proj_path)
+
+        logger.info("FP8 -> BF16 dequantization complete.")
+
+    def replicate_kv_heads(
+        self,
+        layers: list,
+        specs: list[tuple[str, int]],
+        target_kv_heads_fn,
+    ):
+        """Replicate KV heads for TP alignment.
+
+        Args:
+            layers: model.layers list.
+            specs: list of (dotted_path, head_dim) tuples, e.g.
+                [("self_attn.k_proj", 192), ("self_attn.v_proj", 128)].
+            target_kv_heads_fn: callable(attn_module) -> int, returns expected
+                TP-aligned KV head count.
+        """
+        from jax.sharding import NamedSharding
+        from jax.sharding import PartitionSpec as P
+
+        for layer_idx, layer in enumerate(layers):
+            attn = layer.self_attn
+            target_kv_heads = target_kv_heads_fn(attn)
+
+            for proj_path, hd in specs:
+                parts = proj_path.split(".")
+                parent = layer
+                for p in parts[:-1]:
+                    parent = getattr(parent, p)
+                attr_name = parts[-1]
+                proj = getattr(parent, attr_name)
+                w = proj.weight.value
+                expected_size = target_kv_heads * hd
+                actual_size = w.shape[1]
+
+                if actual_size == expected_size:
+                    continue
+
+                if actual_size > 0 and expected_size % actual_size == 0:
+                    num_replicas = expected_size // actual_size
+                    orig_kv = actual_size // hd
+
+                    logger.info(
+                        "KV head replication: layer %d %s %d->%d heads (%d->%d)",
+                        layer_idx,
+                        proj_path,
+                        orig_kv,
+                        target_kv_heads,
+                        actual_size,
+                        expected_size,
+                    )
+
+                    w_full = jax.device_put(w, NamedSharding(self.mesh, P()))
+                    w_3d = w_full.reshape(w.shape[0], orig_kv, hd)
+                    w_rep = jnp.repeat(w_3d, num_replicas, axis=1)
+                    w_new = w_rep.reshape(w.shape[0], expected_size)
+                    w_new = jax.device_put(w_new, NamedSharding(self.mesh, P(None, "tensor")))
+
+                    setattr(
+                        parent,
+                        attr_name,
+                        self.create_bf16_linear(w_new, proj.kernel_axes, self.mesh),
+                    )
 
     def _normalize_physical_to_logical_map(
         self,
