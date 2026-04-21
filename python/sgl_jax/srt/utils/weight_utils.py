@@ -2,6 +2,7 @@ import copy
 import glob
 import json
 import logging
+import math
 import os
 import pickle
 import re
@@ -402,6 +403,204 @@ class WeightLoader:
                         attr_name,
                         self.create_bf16_linear(w_new, proj.kernel_axes, self.mesh),
                     )
+
+    def dequant_fused_qkv(
+        self,
+        fused_qkv_buffers: dict[int, dict],
+        layers: list,
+        config,
+    ):
+        """Dequantize per-shard-interleaved fused QKV FP8 weights.
+
+        The FP8 checkpoint was quantized per-TP-shard and concatenated:
+          weight: [shard0_QKV | shard1_QKV | ... | shardN_QKV], shape [total_qkv, hidden]
+          scale:  [shard0_scale | shard1_scale | ... | shardN_scale], shape [total_blocks, in_blocks]
+
+        Each shard's QKV dim may not be a multiple of block_size, so scale blocks
+        within a shard can span K/V boundaries. We must dequantize per-shard first,
+        then extract Q/K/V from each shard.
+
+        Args:
+            fused_qkv_buffers: dict mapping layer_idx -> {"weight": ..., "scale": ...}
+            layers: model.layers list
+            config: model config with head_dim, v_head_dim, num_attention_heads, etc.
+        """
+        if not fused_qkv_buffers:
+            return
+
+        from jax.sharding import NamedSharding
+
+        head_dim = config.head_dim
+        v_head_dim = getattr(config, "v_head_dim", head_dim)
+        num_heads = config.num_attention_heads
+        num_kv_heads = config.num_key_value_heads
+
+        quant_cfg = getattr(config, "quantization_config", None)
+        block_size = int(quant_cfg.weight_block_size[0]) if quant_cfg else 128
+
+        for layer_idx in sorted(fused_qkv_buffers.keys()):
+            buf = fused_qkv_buffers[layer_idx]
+            fused_weight = buf["weight"]  # [total_qkv, hidden], FP8, HF layout
+            fused_scale = buf["scale"]  # [total_blocks, in_blocks], f32
+
+            in_dim = fused_weight.shape[1]  # hidden_size
+
+            # Infer n_shards: find TP size where per-shard blocking matches scale shape
+            n_shards, orig_kv_heads = self._infer_qkv_shards(
+                fused_weight.shape[0],
+                fused_scale.shape[0],
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                v_head_dim,
+                block_size,
+            )
+
+            per_shard_q = (num_heads // n_shards) * head_dim
+            per_shard_k = (orig_kv_heads // n_shards) * head_dim
+            per_shard_v = (orig_kv_heads // n_shards) * v_head_dim
+            per_shard_total = per_shard_q + per_shard_k + per_shard_v
+            per_shard_blocks = math.ceil(per_shard_total / block_size)
+            padded_rows = per_shard_blocks * block_size
+            in_blocks = in_dim // block_size
+
+            if layer_idx % 10 == 0:
+                logger.info(
+                    "Layer %d: dequant fused QKV FP8, n_shards=%d, "
+                    "per_shard=%d (Q=%d K=%d V=%d), blocks=%d",
+                    layer_idx,
+                    n_shards,
+                    per_shard_total,
+                    per_shard_q,
+                    per_shard_k,
+                    per_shard_v,
+                    per_shard_blocks,
+                )
+
+            q_parts, k_parts, v_parts = [], [], []
+
+            for shard_idx in range(n_shards):
+                # Extract this shard's weight and scale
+                w_start = shard_idx * per_shard_total
+                shard_w = fused_weight[w_start : w_start + per_shard_total, :]
+
+                s_start = shard_idx * per_shard_blocks
+                shard_s = fused_scale[s_start : s_start + per_shard_blocks, :]
+
+                # Pad weight rows to block boundary for dequant
+                if per_shard_total < padded_rows:
+                    shard_w = jnp.pad(shard_w, ((0, padded_rows - per_shard_total), (0, 0)))
+
+                # Block dequantize: [padded_rows, in_dim] × [blocks, in_blocks]
+                shard_f = shard_w.astype(jnp.float32).reshape(
+                    per_shard_blocks, block_size, in_blocks, block_size
+                )
+                shard_s_4d = shard_s[:, None, :, None]
+                shard_bf16 = (
+                    (shard_f * shard_s_4d)
+                    .reshape(padded_rows, in_dim)[:per_shard_total, :]
+                    .astype(jnp.bfloat16)
+                )
+
+                # Split shard into Q, K, V (contiguous within each shard)
+                q_parts.append(shard_bf16[:per_shard_q, :])
+                k_parts.append(shard_bf16[per_shard_q : per_shard_q + per_shard_k, :])
+                v_parts.append(shard_bf16[per_shard_q + per_shard_k :, :])
+
+            # Concatenate across shards → full Q/K/V in HF layout [out, in]
+            q_weight = jnp.concatenate(q_parts, axis=0)
+            k_weight = jnp.concatenate(k_parts, axis=0)
+            v_weight = jnp.concatenate(v_parts, axis=0)
+
+            # Transpose to model layout [in, out] and shard
+            q_weight = jnp.transpose(q_weight)
+            k_weight = jnp.transpose(k_weight)
+            v_weight = jnp.transpose(v_weight)
+
+            tp_sharding = NamedSharding(self.mesh, P(None, "tensor"))
+            q_weight = jax.device_put(q_weight, tp_sharding)
+            k_weight = jax.device_put(k_weight, tp_sharding)
+            v_weight = jax.device_put(v_weight, tp_sharding)
+
+            # Replace QuantizedLinear with bf16 LinearBase
+            attn = layers[layer_idx].self_attn
+            for proj_name, w in [
+                ("q_proj", q_weight),
+                ("k_proj", k_weight),
+                ("v_proj", v_weight),
+            ]:
+                setattr(
+                    attn,
+                    proj_name,
+                    self.create_bf16_linear(w, (None, "tensor"), self.mesh),
+                )
+
+            if layer_idx == 0:
+                logger.info(
+                    "Layer 0 dequant result: Q=%s K=%s V=%s",
+                    q_weight.shape,
+                    k_weight.shape,
+                    v_weight.shape,
+                )
+
+        # Clean up buffers
+        fused_qkv_buffers.clear()
+        logger.info("Fused QKV FP8 dequantization complete for all layers.")
+
+    @staticmethod
+    def _infer_qkv_shards(
+        total_out_dim: int,
+        total_scale_blocks: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        v_head_dim: int,
+        block_size: int,
+    ) -> tuple[int, int]:
+        """Infer the number of TP shards used during FP8 quantization.
+
+        The config's num_kv_heads may be GQA-replicated (e.g. 32 instead of
+        the original 8), so we also try divisors of num_kv_heads to find the
+        original value used during per-shard quantization.
+
+        Returns (tp_shards, original_num_kv_heads).
+        """
+        # Collect candidate kv_heads values: config value and its divisors
+        kv_candidates = []
+        for d in range(1, num_kv_heads + 1):
+            if num_kv_heads % d == 0:
+                kv_candidates.append(d)
+        # Try config value first, then smaller divisors (descending)
+        kv_candidates = sorted(set(kv_candidates), reverse=True)
+
+        # TP candidates: all divisors of num_heads (covers any quantization-time TP)
+        tp_candidates = sorted(d for d in range(1, num_heads + 1) if num_heads % d == 0)
+
+        for orig_kv in kv_candidates:
+            for tp in tp_candidates:
+                if orig_kv % tp != 0:
+                    continue
+                per_shard = (
+                    (num_heads // tp) * head_dim
+                    + (orig_kv // tp) * head_dim
+                    + (orig_kv // tp) * v_head_dim
+                )
+                per_shard_blocks = math.ceil(per_shard / block_size)
+                if per_shard_blocks * tp == total_scale_blocks and per_shard * tp == total_out_dim:
+                    if orig_kv != num_kv_heads:
+                        logger.info(
+                            "Inferred original num_kv_heads=%d (config has %d), tp=%d",
+                            orig_kv,
+                            num_kv_heads,
+                            tp,
+                        )
+                    return tp, orig_kv
+        raise ValueError(
+            f"Cannot infer QKV shard count: out_dim={total_out_dim}, "
+            f"scale_blocks={total_scale_blocks}, num_heads={num_heads}, "
+            f"num_kv_heads={num_kv_heads}, head_dim={head_dim}, "
+            f"v_head_dim={v_head_dim}, block_size={block_size}"
+        )
 
     def _normalize_physical_to_logical_map(
         self,
