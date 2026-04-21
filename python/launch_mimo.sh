@@ -19,7 +19,7 @@ export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS} \
   --xla_tpu_enable_all_reduce_offload_tracing=true"
 
 uv run python -u -m sgl_jax.launch_server \
-  --model-path /models/MiMo-V2-Flash \
+  --model-path /models/MiMo-V2-Flash-Base \
   --trust-remote-code \
   --tp-size 8 --ep-size 8 \
   --moe-backend fused \
