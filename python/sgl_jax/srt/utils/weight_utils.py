@@ -958,6 +958,7 @@ class WeightLoader:
 
                 can_optimize = (
                     isinstance(mapping.target_path, str)
+                    and not mapping.target_path.startswith("__FUSED_QKV_")
                     and mapping.reshape is None
                     and mapping.repeat is None  # Check repeat here too!
                     and not mapping.kv_head_padding
@@ -1478,6 +1479,22 @@ class WeightLoader:
     ):
         jax_path = mapping.target_path
         processed_weight = weight
+
+        # Handle fused QKV buffer storage (used by MiMo-V2-Pro per-shard dequant).
+        # target_path like "__FUSED_QKV_WEIGHT__42" stores into model._fused_qkv_buffers.
+        if jax_path.startswith("__FUSED_QKV_"):
+            if hasattr(self.model, "_fused_qkv_buffers"):
+                is_scale = "SCALE" in jax_path
+                layer_idx = int(jax_path.rsplit("__", 1)[-1])
+                buf = self.model._fused_qkv_buffers.setdefault(layer_idx, {})
+                buf["scale" if is_scale else "weight"] = processed_weight
+                logger.info(
+                    "Stored fused QKV %s for layer %d, shape=%s",
+                    "scale" if is_scale else "weight",
+                    layer_idx,
+                    processed_weight.shape,
+                )
+            return
 
         # Apply output_multiplier_scale to lm_head weights (matching PyTorch implementation)
         if "lm_head" in hf_key and hasattr(self.model_config.hf_config, "output_multiplier_scale"):

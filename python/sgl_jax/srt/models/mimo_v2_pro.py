@@ -1,18 +1,25 @@
 """MiMo-V2-Pro model implementation for SGLang-JAX.
 
-Inherits from MiMoV2FlashForCausalLM. The only difference is the weight format:
-Pro uses a fused qkv_proj instead of separate q/k/v_proj weights.
+Inherits from MiMoV2FlashForCausalLM. The main difference is the weight format:
+Pro uses a fused qkv_proj instead of separate q/k/v_proj weights. The FP8
+checkpoint was quantized per-TP-shard and concatenated, so the fused QKV has
+a per-shard-interleaved layout that requires special dequantization handling.
 """
 
 import logging
+import math
 
 import jax
 import jax.numpy as jnp
+from flax import nnx
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
+from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.moe import create_moe_weights_mapping
 from sgl_jax.srt.models.mimo_v2_flash import MiMoV2FlashForCausalLM
-from sgl_jax.srt.utils.weight_utils import WeightMapping
+from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +33,195 @@ class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
         dtype: jnp.dtype = jnp.bfloat16,
     ):
         super().__init__(config, mesh, dtype)
+        # Buffer to hold fused QKV FP8 weights/scales before per-shard dequant.
+        # Populated during weight loading, consumed by _dequant_fused_qkv.
+        self._fused_qkv_buffers: dict[int, dict] = {}
+
+    def load_weights(self, model_config):
+        """Load weights with special handling for per-shard-quantized fused QKV."""
+        loader = WeightLoader(
+            model=self,
+            model_config=model_config,
+            mesh=self.mesh,
+            dtype=self.dtype,
+        )
+        self._quant_config = model_config.quantization_config
+        weight_mappings = self._create_weight_mappings()
+        loader.load_weights_from_safetensors(weight_mappings)
+        logger.info("MiMoV2Pro weights loaded successfully!")
+
+        if self._is_static_quant:
+            # Dequantize fused QKV per-shard, then split into Q/K/V bf16.
+            self._dequant_fused_qkv()
+            # Dequantize remaining FP8 weights (layer 0 MLP, etc).
+            self._dequantize_fp8_to_bf16()
+
+    def _dequant_fused_qkv(self):
+        """Dequantize per-shard-interleaved fused QKV FP8 weights.
+
+        The FP8 checkpoint was quantized per-TP-shard and concatenated:
+          weight: [shard0_QKV | shard1_QKV | ... | shardN_QKV], shape [total_qkv, hidden]
+          scale:  [shard0_scale | shard1_scale | ... | shardN_scale], shape [total_blocks, in_blocks]
+
+        Each shard's QKV dim may not be a multiple of block_size, so scale blocks
+        within a shard can span K/V boundaries. We must dequantize per-shard first,
+        then extract Q/K/V from each shard.
+        """
+        if not self._fused_qkv_buffers:
+            return
+
+        head_dim = self.config.head_dim
+        v_head_dim = getattr(self.config, "v_head_dim", head_dim)
+        num_heads = self.config.num_attention_heads
+        num_kv_heads = self.config.num_key_value_heads
+
+        quant_cfg = getattr(self.config, "quantization_config", None)
+        block_size = int(quant_cfg.weight_block_size[0]) if quant_cfg else 128
+
+        for layer_idx in sorted(self._fused_qkv_buffers.keys()):
+            buf = self._fused_qkv_buffers[layer_idx]
+            fused_weight = buf["weight"]  # [total_qkv, hidden], FP8, HF layout
+            fused_scale = buf["scale"]  # [total_blocks, in_blocks], f32
+
+            in_dim = fused_weight.shape[1]  # hidden_size
+
+            # Infer n_shards: find TP size where per-shard blocking matches scale shape
+            n_shards = self._infer_qkv_shards(
+                fused_weight.shape[0],
+                fused_scale.shape[0],
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                v_head_dim,
+                block_size,
+            )
+
+            per_shard_q = (num_heads // n_shards) * head_dim
+            per_shard_k = (num_kv_heads // n_shards) * head_dim
+            per_shard_v = (num_kv_heads // n_shards) * v_head_dim
+            per_shard_total = per_shard_q + per_shard_k + per_shard_v
+            per_shard_blocks = math.ceil(per_shard_total / block_size)
+            padded_rows = per_shard_blocks * block_size
+            in_blocks = in_dim // block_size
+
+            if layer_idx % 10 == 0:
+                logger.info(
+                    "Layer %d: dequant fused QKV FP8, n_shards=%d, "
+                    "per_shard=%d (Q=%d K=%d V=%d), blocks=%d",
+                    layer_idx,
+                    n_shards,
+                    per_shard_total,
+                    per_shard_q,
+                    per_shard_k,
+                    per_shard_v,
+                    per_shard_blocks,
+                )
+
+            q_parts, k_parts, v_parts = [], [], []
+
+            for shard_idx in range(n_shards):
+                # Extract this shard's weight and scale
+                w_start = shard_idx * per_shard_total
+                shard_w = fused_weight[w_start : w_start + per_shard_total, :]
+
+                s_start = shard_idx * per_shard_blocks
+                shard_s = fused_scale[s_start : s_start + per_shard_blocks, :]
+
+                # Pad weight rows to block boundary for dequant
+                if per_shard_total < padded_rows:
+                    shard_w = jnp.pad(shard_w, ((0, padded_rows - per_shard_total), (0, 0)))
+
+                # Block dequantize: [padded_rows, in_dim] × [blocks, in_blocks]
+                shard_f = shard_w.astype(jnp.float32).reshape(
+                    per_shard_blocks, block_size, in_blocks, block_size
+                )
+                shard_s_4d = shard_s[:, None, :, None]
+                shard_bf16 = (
+                    (shard_f * shard_s_4d)
+                    .reshape(padded_rows, in_dim)[:per_shard_total, :]
+                    .astype(jnp.bfloat16)
+                )
+
+                # Split shard into Q, K, V (contiguous within each shard)
+                q_parts.append(shard_bf16[:per_shard_q, :])
+                k_parts.append(shard_bf16[per_shard_q : per_shard_q + per_shard_k, :])
+                v_parts.append(shard_bf16[per_shard_q + per_shard_k :, :])
+
+            # Concatenate across shards → full Q/K/V in HF layout [out, in]
+            q_weight = jnp.concatenate(q_parts, axis=0)
+            k_weight = jnp.concatenate(k_parts, axis=0)
+            v_weight = jnp.concatenate(v_parts, axis=0)
+
+            # Transpose to model layout [in, out] and shard
+            q_weight = jnp.transpose(q_weight)
+            k_weight = jnp.transpose(k_weight)
+            v_weight = jnp.transpose(v_weight)
+
+            tp_sharding = NamedSharding(self.mesh, P(None, "tensor"))
+            q_weight = jax.device_put(q_weight, tp_sharding)
+            k_weight = jax.device_put(k_weight, tp_sharding)
+            v_weight = jax.device_put(v_weight, tp_sharding)
+
+            # Replace QuantizedLinear with bf16 LinearBase
+            attn = self.model.layers[layer_idx].self_attn
+            for proj_name, w in [
+                ("q_proj", q_weight),
+                ("k_proj", k_weight),
+                ("v_proj", v_weight),
+            ]:
+                with jax.set_mesh(self.mesh):
+                    new_linear = LinearBase(
+                        input_size=in_dim,
+                        output_size=w.shape[1],
+                        kernel_axes=(None, "tensor"),
+                        use_bias=False,
+                        params_dtype=jnp.bfloat16,
+                        mesh=self.mesh,
+                    )
+                    new_linear.weight = nnx.Param(w)
+                setattr(attn, proj_name, new_linear)
+
+            if layer_idx == 0:
+                logger.info(
+                    "Layer 0 dequant result: Q=%s K=%s V=%s",
+                    q_weight.shape,
+                    k_weight.shape,
+                    v_weight.shape,
+                )
+
+        # Clean up buffers
+        self._fused_qkv_buffers.clear()
+        logger.info("Fused QKV FP8 dequantization complete for all layers.")
+
+        # Replicate KV heads for TP alignment
+        self._ensure_kv_head_replication()
+
+    @staticmethod
+    def _infer_qkv_shards(
+        total_out_dim: int,
+        total_scale_blocks: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        v_head_dim: int,
+        block_size: int,
+    ) -> int:
+        """Infer the number of TP shards used during FP8 quantization."""
+        for tp in (1, 2, 4, 8, 16, 32, 64):
+            if num_heads % tp != 0 or num_kv_heads % tp != 0:
+                continue
+            per_shard = (
+                (num_heads // tp) * head_dim
+                + (num_kv_heads // tp) * head_dim
+                + (num_kv_heads // tp) * v_head_dim
+            )
+            per_shard_blocks = math.ceil(per_shard / block_size)
+            if per_shard_blocks * tp == total_scale_blocks and per_shard * tp == total_out_dim:
+                return tp
+        raise ValueError(
+            f"Cannot infer QKV shard count: out_dim={total_out_dim}, "
+            f"scale_blocks={total_scale_blocks}"
+        )
 
     def _create_layer_mappings(self, layer_idx: int) -> dict:
         """Override to handle fused qkv_proj weights in MiMo-V2-Pro checkpoints."""
@@ -38,30 +234,34 @@ class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
         # --- Fused QKV projection ---
         hf_qkv_key = f"{prefix}.self_attn.qkv_proj"
         qkv_ignored = self._is_quant_ignored(hf_qkv_key)
-        qkv_weight_suffix = "weight" if (not is_fp8 or qkv_ignored) else "weight_q"
-
-        mappings[f"{hf_qkv_key}.weight"] = WeightMapping(
-            target_path=[
-                f"{target}.self_attn.q_proj.{qkv_weight_suffix}",
-                f"{target}.self_attn.k_proj.{qkv_weight_suffix}",
-                f"{target}.self_attn.v_proj.{qkv_weight_suffix}",
-            ],
-            sharding=(None, "tensor"),
-            transpose=True,
-            head_dim_padding=False,
-            kv_head_padding=not is_fp8,
-        )
 
         if is_fp8 and not qkv_ignored:
-            mappings[f"{hf_qkv_key}.weight_scale_inv"] = WeightMapping(
-                target_path=[
-                    f"{target}.self_attn.q_proj.weight_scale",
-                    f"{target}.self_attn.k_proj.weight_scale",
-                    f"{target}.self_attn.v_proj.weight_scale",
-                ],
+            # FP8 fused QKV: store raw weight+scale in buffer, dequant post-load.
+            # Use a callback mapping that stores into _fused_qkv_buffers instead of
+            # trying to split the per-shard-interleaved data.
+            mappings[f"{hf_qkv_key}.weight"] = WeightMapping(
+                target_path=f"__FUSED_QKV_WEIGHT__{layer_idx}",
                 sharding=(None, None),
                 transpose=False,
+            )
+            mappings[f"{hf_qkv_key}.weight_scale_inv"] = WeightMapping(
+                target_path=f"__FUSED_QKV_SCALE__{layer_idx}",
+                sharding=(None, None),
+                transpose=False,
+            )
+        else:
+            # BF16 or ignored: split normally (contiguous Q/K/V layout is fine)
+            qkv_weight_suffix = "weight"
+            mappings[f"{hf_qkv_key}.weight"] = WeightMapping(
+                target_path=[
+                    f"{target}.self_attn.q_proj.{qkv_weight_suffix}",
+                    f"{target}.self_attn.k_proj.{qkv_weight_suffix}",
+                    f"{target}.self_attn.v_proj.{qkv_weight_suffix}",
+                ],
+                sharding=(None, "tensor"),
+                transpose=True,
                 head_dim_padding=False,
+                kv_head_padding=True,
             )
 
         # --- o_proj (separate, same as Flash) ---
