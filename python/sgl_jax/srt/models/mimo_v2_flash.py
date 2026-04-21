@@ -512,7 +512,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         # dramatically speeds up subsequent random-access MoE expert loading.
         self._warmup_safetensors_cache(model_config)
 
-        self._loader = WeightLoader(
+        self.loader = WeightLoader(
             model=self,
             model_config=model_config,
             mesh=self.mesh,
@@ -520,14 +520,14 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         )
         self._quant_config = model_config.quantization_config
         weight_mappings = self._create_weight_mappings()
-        self._loader.load_weights_from_safetensors(weight_mappings)
+        self.loader.load_weights_from_safetensors(weight_mappings)
         logger.info("MiMoV2Flash weights loaded successfully!")
 
         # Post-load: dequantize FP8 attention + layer-0 MLP to bf16.
-        if self._loader.is_static_quant:
+        if self.loader.is_static_quant:
             head_dim = self.config.head_dim
             v_head_dim = getattr(self.config, "v_head_dim", head_dim)
-            self._loader.dequant_fp8_layers(
+            self.loader.dequant_fp8_layers(
                 self.model.layers,
                 specs=[
                     ("self_attn.q_proj", head_dim),
@@ -535,7 +535,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                     ("self_attn.v_proj", v_head_dim),
                 ],
             )
-            self._loader.dequant_fp8_layers(
+            self.loader.dequant_fp8_layers(
                 self.model.layers,
                 specs=[
                     ("mlp.gate_proj", None),
@@ -544,7 +544,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                 ],
                 layer_filter=lambda idx, layer: idx == 0 and not layer.is_layer_sparse,
             )
-            self._loader.replicate_kv_heads(
+            self.loader.replicate_kv_heads(
                 self.model.layers,
                 specs=[("self_attn.k_proj", head_dim), ("self_attn.v_proj", v_head_dim)],
                 target_kv_heads_fn=lambda attn: attn.k_head_num,
@@ -592,14 +592,6 @@ class MiMoV2FlashForCausalLM(nnx.Module):
             total_size / 1024**2 / (t1 - t0) if t1 > t0 else 0,
         )
 
-    def _is_quant_ignored(self, hf_path: str) -> bool:
-        """Delegate to WeightLoader."""
-        return self._loader.is_quant_ignored(hf_path)
-
-    @property
-    def _is_static_quant(self) -> bool:
-        return self._loader.is_static_quant
-
     def _create_weight_mappings(self) -> dict:
         mappings = {
             "model.embed_tokens.weight": WeightMapping(
@@ -631,7 +623,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         target = prefix
 
         mappings = {}
-        is_fp8 = self._is_static_quant
+        is_fp8 = self.loader.is_static_quant
 
         # Attention projections
         for proj, sharding, kv_pad, hd_pad in [
@@ -641,7 +633,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
             ("o_proj", ("tensor", None), False, True),
         ]:
             hf_key = f"{prefix}.self_attn.{proj}"
-            ignored = self._is_quant_ignored(hf_key)
+            ignored = self.loader.is_quant_ignored(hf_key)
             weight_suffix = "weight" if (not is_fp8 or ignored) else "weight_q"
 
             mappings[f"{hf_key}.weight"] = WeightMapping(

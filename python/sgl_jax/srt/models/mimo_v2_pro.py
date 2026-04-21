@@ -34,7 +34,7 @@ class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
 
     def load_weights(self, model_config):
         """Load weights with special handling for per-shard-quantized fused QKV."""
-        self._loader = WeightLoader(
+        self.loader = WeightLoader(
             model=self,
             model_config=model_config,
             mesh=self.mesh,
@@ -42,16 +42,16 @@ class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
         )
         self._quant_config = model_config.quantization_config
         weight_mappings = self._create_weight_mappings()
-        self._loader.load_weights_from_safetensors(weight_mappings)
+        self.loader.load_weights_from_safetensors(weight_mappings)
         logger.info("MiMoV2Pro weights loaded successfully!")
 
-        if self._loader.is_static_quant:
+        if self.loader.is_static_quant:
             head_dim = self.config.head_dim
             v_head_dim = getattr(self.config, "v_head_dim", head_dim)
             # Dequantize fused QKV per-shard, then split into Q/K/V bf16.
-            self._loader.dequant_fused_qkv(self._fused_qkv_buffers, self.model.layers, self.config)
+            self.loader.dequant_fused_qkv(self._fused_qkv_buffers, self.model.layers, self.config)
             # Dequantize remaining FP8 weights (layer 0 MLP, etc).
-            self._loader.dequant_fp8_layers(
+            self.loader.dequant_fp8_layers(
                 self.model.layers,
                 specs=[
                     ("mlp.gate_proj", None),
@@ -60,7 +60,7 @@ class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
                 ],
                 layer_filter=lambda idx, layer: idx == 0 and not layer.is_layer_sparse,
             )
-            self._loader.replicate_kv_heads(
+            self.loader.replicate_kv_heads(
                 self.model.layers,
                 specs=[("self_attn.k_proj", head_dim), ("self_attn.v_proj", v_head_dim)],
                 target_kv_heads_fn=lambda attn: attn.k_head_num,
@@ -72,11 +72,11 @@ class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
         target = prefix
 
         mappings = {}
-        is_fp8 = self._is_static_quant
+        is_fp8 = self.loader.is_static_quant
 
         # --- Fused QKV projection ---
         hf_qkv_key = f"{prefix}.self_attn.qkv_proj"
-        qkv_ignored = self._is_quant_ignored(hf_qkv_key)
+        qkv_ignored = self.loader.is_quant_ignored(hf_qkv_key)
 
         if is_fp8 and not qkv_ignored:
             # FP8 fused QKV: store raw weight+scale in buffer, dequant post-load.
@@ -109,7 +109,7 @@ class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
 
         # --- o_proj (separate, same as Flash) ---
         hf_o_key = f"{prefix}.self_attn.o_proj"
-        o_ignored = self._is_quant_ignored(hf_o_key)
+        o_ignored = self.loader.is_quant_ignored(hf_o_key)
         o_weight_suffix = "weight" if (not is_fp8 or o_ignored) else "weight_q"
 
         mappings[f"{hf_o_key}.weight"] = WeightMapping(
