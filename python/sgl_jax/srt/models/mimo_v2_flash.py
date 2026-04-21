@@ -306,7 +306,7 @@ class MiMoV2DecoderLayer(nnx.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         attention_value_scale = getattr(config, "attention_value_scale", None)
-
+        print(f"Initializing layer {layer_id} attention_value_scale={attention_value_scale}")
         if self._is_swa_layer(config):
             self.self_attn = MiMoV2Attention(
                 hidden_size=config.hidden_size,
