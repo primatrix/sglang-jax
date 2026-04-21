@@ -1268,6 +1268,7 @@ class ScheduleBatch:
         page_size: int,
         enable_static_lora: bool = False,
     ) -> ModelWorkerBatch:
+      with jax.profiler.TraceAnnotation("gmwb_init"):
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
             token_paddings = bs_paddings
@@ -1292,6 +1293,7 @@ class ScheduleBatch:
         req_pool_indices_cpu = self.req_pool_indices
         token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[self.req_pool_indices]
 
+      with jax.profiler.TraceAnnotation("gmwb_token_padding"):
         # padding seq
         # extend & decode: input_ids, positions, out_cache_loc, cache_loc
         padding_size = 0
@@ -1324,6 +1326,7 @@ class ScheduleBatch:
                 axis=0,
             )
 
+      with jax.profiler.TraceAnnotation("gmwb_positions"):
         # Calculate positions after padding
         if self.forward_mode.is_extend():
             # For prefill: create positions for each token in sequences
@@ -1362,6 +1365,7 @@ class ScheduleBatch:
             extend_seq_lens,
         )
 
+      with jax.profiler.TraceAnnotation("gmwb_cache_loc"):
         bs_padding_size = 0
         bs_paddings.sort()
         select_bs_index = -1
@@ -1410,6 +1414,7 @@ class ScheduleBatch:
         if len(cache_loc_flat) < total_cache_loc_size:
             cache_loc_cpu[len(cache_loc_flat) :] = 0
 
+      with jax.profiler.TraceAnnotation("gmwb_bs_padding"):
         if bs_padding_size > 0:
             invalid_req_pool_indices = np.array(
                 [-1] * bs_padding_size, dtype=req_pool_indices_cpu.dtype
@@ -1440,6 +1445,7 @@ class ScheduleBatch:
                     [extend_logprob_start_lens, invalid_extend_logprob_start_lens], axis=0
                 )
 
+      with jax.profiler.TraceAnnotation("gmwb_sampling_info"):
         sampling_info = self.sampling_info
         if self.sampling_info:
             new_temperatures = np.concatenate(
@@ -1484,6 +1490,7 @@ class ScheduleBatch:
                     ]
                 )
             sampling_info = dataclasses.replace(sampling_info, **updates)
+      with jax.profiler.TraceAnnotation("gmwb_build_result"):
         if precision_tracer.get_trace_active():
             self._generate_trace_info(real_bs, bid)
 
