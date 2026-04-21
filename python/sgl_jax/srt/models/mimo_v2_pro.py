@@ -78,17 +78,6 @@ class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
         quant_cfg = getattr(self.config, "quantization_config", None)
         block_size = int(quant_cfg.weight_block_size[0]) if quant_cfg else 128
 
-        logger.info(
-            "Fused QKV dequant params: head_dim=%d v_head_dim=%d num_heads=%d "
-            "num_kv_heads=%d block_size=%d layers=%s",
-            head_dim,
-            v_head_dim,
-            num_heads,
-            num_kv_heads,
-            block_size,
-            sorted(self._fused_qkv_buffers.keys()),
-        )
-
         for layer_idx in sorted(self._fused_qkv_buffers.keys()):
             buf = self._fused_qkv_buffers[layer_idx]
             fused_weight = buf["weight"]  # [total_qkv, hidden], FP8, HF layout
@@ -97,7 +86,7 @@ class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
             in_dim = fused_weight.shape[1]  # hidden_size
 
             # Infer n_shards: find TP size where per-shard blocking matches scale shape
-            n_shards = self._infer_qkv_shards(
+            n_shards, orig_kv_heads = self._infer_qkv_shards(
                 fused_weight.shape[0],
                 fused_scale.shape[0],
                 num_heads,
@@ -108,8 +97,8 @@ class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
             )
 
             per_shard_q = (num_heads // n_shards) * head_dim
-            per_shard_k = (num_kv_heads // n_shards) * head_dim
-            per_shard_v = (num_kv_heads // n_shards) * v_head_dim
+            per_shard_k = (orig_kv_heads // n_shards) * head_dim
+            per_shard_v = (orig_kv_heads // n_shards) * v_head_dim
             per_shard_total = per_shard_q + per_shard_k + per_shard_v
             per_shard_blocks = math.ceil(per_shard_total / block_size)
             padded_rows = per_shard_blocks * block_size
@@ -216,27 +205,42 @@ class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
         head_dim: int,
         v_head_dim: int,
         block_size: int,
-    ) -> int:
-        """Infer the number of TP shards used during FP8 quantization."""
-        for tp in (1, 2, 4, 8, 16, 32, 64):
-            if num_heads % tp != 0 or num_kv_heads % tp != 0:
-                continue
-            per_shard = (
-                (num_heads // tp) * head_dim
-                + (num_kv_heads // tp) * head_dim
-                + (num_kv_heads // tp) * v_head_dim
-            )
-            per_shard_blocks = math.ceil(per_shard / block_size)
-            logger.info(
-                "Trying tp=%d: per_shard=%d blocks=%d expected_blocks=%d expected_out=%d",
-                tp,
-                per_shard,
-                per_shard_blocks,
-                per_shard_blocks * tp,
-                per_shard * tp,
-            )
-            if per_shard_blocks * tp == total_scale_blocks and per_shard * tp == total_out_dim:
-                return tp
+    ) -> tuple[int, int]:
+        """Infer the number of TP shards used during FP8 quantization.
+
+        The config's num_kv_heads may be GQA-replicated (e.g. 32 instead of
+        the original 8), so we also try divisors of num_kv_heads to find the
+        original value used during per-shard quantization.
+
+        Returns (tp_shards, original_num_kv_heads).
+        """
+        # Collect candidate kv_heads values: config value and its divisors
+        kv_candidates = []
+        for d in range(1, num_kv_heads + 1):
+            if num_kv_heads % d == 0:
+                kv_candidates.append(d)
+        # Try config value first, then smaller divisors (descending)
+        kv_candidates = sorted(set(kv_candidates), reverse=True)
+
+        for orig_kv in kv_candidates:
+            for tp in (1, 2, 4, 8, 16, 32, 64):
+                if num_heads % tp != 0 or orig_kv % tp != 0:
+                    continue
+                per_shard = (
+                    (num_heads // tp) * head_dim
+                    + (orig_kv // tp) * head_dim
+                    + (orig_kv // tp) * v_head_dim
+                )
+                per_shard_blocks = math.ceil(per_shard / block_size)
+                if per_shard_blocks * tp == total_scale_blocks and per_shard * tp == total_out_dim:
+                    if orig_kv != num_kv_heads:
+                        logger.info(
+                            "Inferred original num_kv_heads=%d (config has %d), tp=%d",
+                            orig_kv,
+                            num_kv_heads,
+                            tp,
+                        )
+                    return tp, orig_kv
         raise ValueError(
             f"Cannot infer QKV shard count: out_dim={total_out_dim}, "
             f"scale_blocks={total_scale_blocks}, num_heads={num_heads}, "
