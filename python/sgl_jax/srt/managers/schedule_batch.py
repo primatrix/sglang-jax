@@ -798,12 +798,6 @@ class ScheduleBatch:
         for i, req in enumerate(self.reqs):
             pre_len = len(req.prefix_indices)
             if self.enable_overlap and req.is_chunked > 0:
-                # In overlap mode, the previous chunk's forward may still be
-                # in-flight reading SWA pages for positions
-                # [len_{N-2} - sliding_window, len_{N-1}). Subtracting
-                # chunked_prefill_size from pre_len shifts the eviction
-                # boundary back by exactly one chunk, which mathematically
-                # keeps new_evicted <= len_{N-2} - sliding_window.
                 chunked_prefill_size = global_server_args_dict.get("chunked_prefill_size")
                 if chunked_prefill_size is not None and chunked_prefill_size > 0:
                     pre_len -= chunked_prefill_size
