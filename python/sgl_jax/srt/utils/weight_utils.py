@@ -1,9 +1,12 @@
 import copy
 import glob
+import json
 import logging
 import os
 import pickle
 import re
+import struct
+import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -137,6 +140,7 @@ class WeightLoader:
 
             self.head_dim_pad = (self.head_dim_original + 127) // 128 * 128 - self.head_dim_original
             self.head_dim = self.head_dim_original
+            self.v_head_dim = getattr(model_config, "v_head_dim", self.head_dim_original)
         if hasattr(self.mesh, "shape") and "tensor" in self.mesh.shape:
             self.sharding_size = self.mesh.shape["tensor"]
         else:
@@ -389,6 +393,12 @@ class WeightLoader:
             iterator = tqdm(weights_files, desc="Scanning Metadata", unit="file")
 
             for st_file in iterator:
+                # Parse safetensors header for byte offsets (for bulk MoE reads)
+                with open(st_file, "rb") as raw_f:
+                    header_size = struct.unpack("<Q", raw_f.read(8))[0]
+                    raw_header = json.loads(raw_f.read(header_size))
+                data_section_offset = 8 + header_size
+
                 with safe_open(st_file, framework="flax", device="cpu") as f:
                     for key in f.keys():  # noqa: SIM118
                         slice_info = f.get_slice(key)
@@ -397,6 +407,12 @@ class WeightLoader:
                             "shape": tuple(slice_info.get_shape()),
                             "dtype": slice_info.get_dtype(),
                         }
+                        # Add byte offset info for direct reads
+                        if key in raw_header:
+                            offsets = raw_header[key].get("data_offsets")
+                            if offsets:
+                                info["byte_offset"] = data_section_offset + offsets[0]
+                                info["byte_size"] = offsets[1] - offsets[0]
                         if key not in weight_info:
                             weight_info[key] = []
                         weight_info[key].append(info)
@@ -702,7 +718,7 @@ class WeightLoader:
                     sample_map = {
                         p: logical_indices[i] for i, p in enumerate(physical_indices[:sample_size])
                     }
-                    logger.info("Cloning split-experts map (sample): %s", sample_map)
+                    logger.debug("Cloning split-experts map (sample): %s", sample_map)
             else:
                 logical_indices = physical_indices
 
@@ -737,9 +753,9 @@ class WeightLoader:
 
             return out_array
 
-        result = jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice).astype(
-            target_dtype
-        )
+        result = jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice)
+        if result.dtype != target_dtype:
+            result = result.astype(target_dtype)
         if do_transpose and result.ndim >= 3:
             result = jnp.transpose(result, (0, 2, 1))
         return result
@@ -781,7 +797,62 @@ class WeightLoader:
         else:
             num_physical_experts = num_logical_experts
 
-        if do_transpose and len(single_expert_shape) >= 2:
+        # Detect whether we can defer transpose to TPU instead of doing it
+        # on CPU during loading. This is possible when do_transpose=True but
+        # the weight dimensions (all dims after expert dim) are unsharded,
+        # meaning each callback loads the full tensor. Deferring avoids the
+        # costly strided memcpy from np.transpose on non-contiguous views.
+        defer_transpose = False
+        if do_transpose and len(single_expert_shape) >= 2 and target_sharding is not None:
+            spec = target_sharding.spec
+            # spec[0] is expert dim sharding, spec[1:] are weight dims
+            weight_dims_unsharded = all(s is None for s in spec[1:])
+            if weight_dims_unsharded:
+                defer_transpose = True
+                logger.info(
+                    "MoE defer_transpose=True: will load in HF layout and "
+                    "transpose on TPU (shape=%s)",
+                    single_expert_shape,
+                )
+
+        # Check if bulk raw byte reading is possible (byte offsets available
+        # from scan phase). This eliminates per-expert safetensors API calls
+        # and reduces GCSFuse round-trips by reading contiguous byte ranges.
+        # Skip bulk_read for small tensors (e.g. scales) — safetensors API
+        # with cached handles is faster than raw open/seek/read on GCSFuse.
+        _expert_elems = 1
+        for d in single_expert_shape:
+            _expert_elems *= d
+        _expert_bytes_est = _expert_elems * (1 if st_dtype.startswith("F8_") else 4)
+        _BULK_READ_MIN_BYTES = 1024 * 1024  # 1 MB per expert
+        bulk_read = (
+            defer_transpose
+            and _expert_bytes_est >= _BULK_READ_MIN_BYTES
+            and all(
+                "byte_offset" in weight_info[expected_hf_keys[i]][0]
+                for i in range(min(2, num_logical_experts))
+            )
+        )
+        if bulk_read:
+            logger.info(
+                "MoE bulk_read=True: using raw byte reads for %d experts",
+                num_logical_experts,
+            )
+
+        # Map safetensors dtype strings to numpy dtypes for raw reads
+        _st_to_np_dtype = {
+            "F32": np.float32,
+            "F16": np.float16,
+            "BF16": np.dtype("V2"),  # 2-byte view, reinterpret later
+            "I64": np.int64,
+            "I32": np.int32,
+            "BOOL": np.bool_,
+            "F8_E4M3": np.uint8,
+            "F8_E5M2": np.uint8,
+        }
+        np_read_dtype = _st_to_np_dtype.get(st_dtype, np.uint8)
+
+        if do_transpose and not defer_transpose and len(single_expert_shape) >= 2:
             final_single_shape = list(single_expert_shape)
             final_single_shape[-1], final_single_shape[-2] = (
                 final_single_shape[-2],
@@ -794,9 +865,14 @@ class WeightLoader:
         stacked_shape = (num_physical_experts, *final_single_shape)
         sharding = target_sharding or jax.sharding.NamedSharding(self.mesh, P())
 
-        LOAD_WORKERS = 16
+        LOAD_WORKERS = int(os.environ.get("SGLANG_MOE_LOAD_WORKERS", "16"))
+
+        _callback_times = []
+        _detailed_logged = False
 
         def _load_stacked_slice(index):
+            nonlocal _detailed_logged
+            _cb_start = time.monotonic()
             expert_slice = index[0]
             inner_slice = index[1:]
 
@@ -817,22 +893,54 @@ class WeightLoader:
                         p: logical_indices_to_load[i]
                         for i, p in enumerate(physical_indices[:sample_size])
                     }
-                    logger.info("Cloning experts map (sample): %s", sample_map)
+                    logger.debug("Cloning experts map (sample): %s", sample_map)
             else:
                 logical_indices_to_load = physical_indices
 
+            # --- Load first expert with detailed timing ---
             first_log_idx = logical_indices_to_load[0]
             first_hf_key = expected_hf_keys[first_log_idx]
             first_fname = weight_info[first_hf_key][0]["file"]
-            first_f = file_manager.get_handle(first_fname)
 
-            if not do_transpose:
+            _t0 = time.monotonic()
+            first_f = file_manager.get_handle(first_fname)
+            _t_handle = time.monotonic() - _t0
+
+            if not do_transpose or defer_transpose:
+                _t1 = time.monotonic()
                 first_chunk = first_f.get_slice(first_hf_key)[inner_slice]
+                _t_getslice = time.monotonic() - _t1
+                _t2 = time.monotonic()
                 first_chunk = _view_as_fp8_if_needed(first_chunk, target_dtype)
+                _t_fp8 = time.monotonic() - _t2
+                _t_transpose = 0.0
             else:
+                _t1 = time.monotonic()
                 data = first_f.get_slice(first_hf_key)[:]
+                _t_getslice = time.monotonic() - _t1
+                _t2 = time.monotonic()
                 data = _view_as_fp8_if_needed(data, target_dtype)
+                _t_fp8 = time.monotonic() - _t2
+                _t3 = time.monotonic()
                 first_chunk = np.transpose(data)[inner_slice]
+                _t_transpose = time.monotonic() - _t3
+
+            # Log detailed timing for first callback only
+            if not _detailed_logged:
+                _detailed_logged = True
+                expert_bytes = first_chunk.nbytes
+                logger.debug(
+                    "MoE callback[0] detail: experts_in_shard=%d "
+                    "get_handle=%.4fs get_slice=%.4fs fp8_view=%.4fs "
+                    "transpose=%.4fs expert_bytes=%d file=%s",
+                    sliced_num_physical,
+                    _t_handle,
+                    _t_getslice,
+                    _t_fp8,
+                    _t_transpose,
+                    expert_bytes,
+                    os.path.basename(first_fname),
+                )
 
             out_shape = (sliced_num_physical, *first_chunk.shape)
             out_array = np.empty(out_shape, dtype=first_chunk.dtype)
@@ -846,33 +954,273 @@ class WeightLoader:
                 else:
                     logical_to_positions.setdefault(log_idx, []).append(phys_pos)
 
+            # Per-thread timing accumulators
+            _thread_stats = {
+                "get_handle": [],
+                "get_slice": [],
+                "fp8": [],
+                "transpose": [],
+                "copy": [],
+            }
+            _thread_files = []
+
             def load_and_fill_expert(args):
                 l_idx, positions = args
                 hf_k = expected_hf_keys[l_idx]
                 fname = weight_info[hf_k][0]["file"]
-                f = file_manager.get_handle(fname)
 
-                if not do_transpose:
+                t_a = time.monotonic()
+                f = file_manager.get_handle(fname)
+                t_b = time.monotonic()
+                _thread_stats["get_handle"].append(t_b - t_a)
+
+                if not do_transpose or defer_transpose:
                     chunk = f.get_slice(hf_k)[inner_slice]
+                    t_c = time.monotonic()
+                    _thread_stats["get_slice"].append(t_c - t_b)
                     chunk = _view_as_fp8_if_needed(chunk, target_dtype)
+                    t_d = time.monotonic()
+                    _thread_stats["fp8"].append(t_d - t_c)
+                    _thread_stats["transpose"].append(0.0)
                 else:
                     data = f.get_slice(hf_k)[:]
+                    t_c = time.monotonic()
+                    _thread_stats["get_slice"].append(t_c - t_b)
                     data = _view_as_fp8_if_needed(data, target_dtype)
+                    t_d = time.monotonic()
+                    _thread_stats["fp8"].append(t_d - t_c)
                     chunk = np.transpose(data)[inner_slice]
+                    t_e = time.monotonic()
+                    _thread_stats["transpose"].append(t_e - t_d)
 
+                t_copy_start = time.monotonic()
                 for pos in positions:
                     out_array[pos] = chunk
+                _thread_stats["copy"].append(time.monotonic() - t_copy_start)
+                _thread_files.append(os.path.basename(fname))
 
             if logical_to_positions:
                 tasks = list(logical_to_positions.items())
                 with ThreadPoolExecutor(max_workers=LOAD_WORKERS) as executor:
                     list(executor.map(load_and_fill_expert, tasks))
 
+            _callback_times.append(time.monotonic() - _cb_start)
+
+            # Log aggregated thread stats for first callback
+            if len(_callback_times) == 1 and _thread_stats["get_slice"]:
+                n = len(_thread_stats["get_slice"])
+                unique_files = len(set(_thread_files))
+                logger.debug(
+                    "MoE callback[0] threads: n=%d unique_files=%d "
+                    "get_handle=%.4fs get_slice(sum=%.2fs avg=%.4fs max=%.4fs) "
+                    "fp8=%.4fs transpose(sum=%.2fs avg=%.4fs) copy=%.4fs",
+                    n,
+                    unique_files,
+                    sum(_thread_stats["get_handle"]),
+                    sum(_thread_stats["get_slice"]),
+                    sum(_thread_stats["get_slice"]) / n,
+                    max(_thread_stats["get_slice"]),
+                    sum(_thread_stats["fp8"]),
+                    sum(_thread_stats["transpose"]),
+                    sum(_thread_stats["transpose"]) / n,
+                    sum(_thread_stats["copy"]),
+                )
+
             return out_array
 
-        return jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice).astype(
-            target_dtype
-        )
+        t0 = time.monotonic()
+        if bulk_read:
+            # Host-level bulk loading: read all experts for local devices at
+            # once, then device_put in parallel. This replaces serial
+            # make_array_from_callback with a single bulk I/O + parallel
+            # device transfers.
+            local_devices = sharding.mesh.local_devices
+            n_local = len(local_devices)
+
+            # Determine which physical experts each local device needs
+            device_assignments = sharding.devices_indices_map(stacked_shape)
+            local_assignments = []
+            for dev in local_devices:
+                idx = device_assignments[dev]
+                expert_slice = idx[0]
+                s, e, st = expert_slice.indices(num_physical_experts)
+                local_assignments.append(list(range(s, e, st)))
+
+            # Collect ALL unique logical expert indices needed by this host
+            all_logical = set()
+            for phys_indices in local_assignments:
+                for p in phys_indices:
+                    if physical_to_logical_map is not None:
+                        all_logical.add(int(physical_to_logical_map[p]))
+                    else:
+                        all_logical.add(p)
+
+            # Group by file for bulk reading
+            file_groups = {}
+            for log_idx in all_logical:
+                hf_key = expected_hf_keys[log_idx]
+                info = weight_info[hf_key][0]
+                fname = info["file"]
+                byte_offset = info["byte_offset"]
+                file_groups.setdefault(fname, []).append((log_idx, byte_offset, hf_key))
+
+            # Compute per-expert byte size
+            expert_nbytes = 1
+            for d in single_expert_shape:
+                expert_nbytes *= d
+            elem_size = 1 if np_read_dtype == np.uint8 else np.dtype(np_read_dtype).itemsize
+            expert_nbytes *= elem_size
+
+            # Read all expert data from files (parallel across files)
+            expert_data_map = {}  # log_idx -> np.ndarray
+
+            def _bulk_read_file(fname, entries):
+                entries.sort(key=lambda e: e[1])
+                min_off = entries[0][1]
+                max_end = entries[-1][1] + expert_nbytes
+                rng = max_end - min_off
+                actual = len(entries) * expert_nbytes
+                result = {}
+                if rng <= actual * 2 and len(entries) > 1:
+                    with open(fname, "rb") as f:
+                        f.seek(min_off)
+                        bulk = f.read(rng)
+                    for log_idx, byte_off, hf_key in entries:
+                        local_off = byte_off - min_off
+                        arr = np.frombuffer(
+                            bulk,
+                            dtype=np_read_dtype,
+                            count=expert_nbytes // elem_size,
+                            offset=local_off,
+                        ).reshape(single_expert_shape)
+                        result[log_idx] = arr.copy()
+                else:
+                    with open(fname, "rb") as f:
+                        for log_idx, byte_off, hf_key in entries:
+                            f.seek(byte_off)
+                            raw = f.read(expert_nbytes)
+                            arr = np.frombuffer(
+                                raw,
+                                dtype=np_read_dtype,
+                            ).reshape(single_expert_shape)
+                            result[log_idx] = arr
+                return result
+
+            t_io_start = time.monotonic()
+            if len(file_groups) > 1:
+                with ThreadPoolExecutor(max_workers=len(file_groups)) as ex:
+                    futs = {
+                        ex.submit(_bulk_read_file, fn, ents): fn for fn, ents in file_groups.items()
+                    }
+                    for fut in futs:
+                        expert_data_map.update(fut.result())
+            else:
+                for fn, ents in file_groups.items():
+                    expert_data_map.update(_bulk_read_file(fn, ents))
+            t_io = time.monotonic() - t_io_start
+            total_read_mb = sum(v.nbytes for v in expert_data_map.values()) / 1e6
+
+            # Assemble per-device arrays and device_put (parallel)
+            t_assemble_start = time.monotonic()
+            n_experts_per_shard = len(local_assignments[0])
+
+            def _build_and_put(dev_idx):
+                dev = local_devices[dev_idx]
+                phys_indices = local_assignments[dev_idx]
+                shard = np.empty(
+                    (n_experts_per_shard, *single_expert_shape),
+                    dtype=np_read_dtype,
+                )
+                for pos, p in enumerate(phys_indices):
+                    log_idx = (
+                        int(physical_to_logical_map[p])
+                        if physical_to_logical_map is not None
+                        else p
+                    )
+                    shard[pos] = expert_data_map[log_idx]
+                shard = _view_as_fp8_if_needed(shard, target_dtype)
+                return jax.device_put(shard, dev)
+
+            with ThreadPoolExecutor(max_workers=n_local) as ex:
+                per_device_arrays = list(ex.map(_build_and_put, range(n_local)))
+            t_assemble = time.monotonic() - t_assemble_start
+
+            result = jax.make_array_from_single_device_arrays(
+                stacked_shape,
+                sharding,
+                per_device_arrays,
+            )
+            t_callback = time.monotonic() - t0
+
+            logger.debug(
+                "MoE host-bulk load: shape=%s dtype=%s "
+                "io=%.2fs (%.1f MB, %.1f MB/s) "
+                "assemble+put=%.2fs total=%.2fs "
+                "experts_read=%d files=%d devices=%d",
+                stacked_shape,
+                target_dtype,
+                t_io,
+                total_read_mb,
+                total_read_mb / t_io if t_io > 0 else 0,
+                t_assemble,
+                t_callback,
+                len(expert_data_map),
+                len(file_groups),
+                n_local,
+            )
+        else:
+            # Pre-warm safetensors file handles to avoid cold-start latency
+            # during serial callbacks. This is especially important for small
+            # tensors (scales) where GCSFuse file-open latency dominates.
+            unique_files = set()
+            for i in range(num_logical_experts):
+                hf_key = expected_hf_keys[i]
+                unique_files.add(weight_info[hf_key][0]["file"])
+            uncached = [fn for fn in unique_files if fn not in file_manager.handles]
+            if uncached:
+
+                def _prewarm(fn):
+                    return fn, safe_open(fn, framework="np", device="cpu")
+
+                with ThreadPoolExecutor(max_workers=min(len(uncached), 16)) as ex:
+                    for fn, handle in ex.map(_prewarm, uncached):
+                        file_manager.handles[fn] = handle
+
+            callback_fn = _load_stacked_slice
+            result = jax.make_array_from_callback(
+                stacked_shape,
+                sharding,
+                callback_fn,
+            )
+            t_callback = time.monotonic() - t0
+        t1 = time.monotonic()
+        if result.dtype != target_dtype:
+            result = result.astype(target_dtype)
+        t_astype = time.monotonic() - t1
+        # Deferred transpose: data was loaded in HF layout [experts, out, in],
+        # now transpose to kernel layout [experts, in, out] on TPU.
+        t2 = time.monotonic()
+        if defer_transpose and result.ndim >= 3:
+            result = jnp.transpose(result, (0, 2, 1))
+        t_defer = time.monotonic() - t2
+        if _callback_times:
+            defer_msg = f" defer_transpose={t_defer:.3f}s" if defer_transpose else ""
+            logger.debug(
+                "MoE tensor load: shape=%s dtype=%s callbacks=%d "
+                "callback_total=%.2fs (min=%.3fs max=%.3fs) "
+                "make_array=%.2fs astype=%.2fs workers=%d%s",
+                stacked_shape,
+                target_dtype,
+                len(_callback_times),
+                sum(_callback_times),
+                min(_callback_times),
+                max(_callback_times),
+                t_callback,
+                t_astype,
+                LOAD_WORKERS,
+                defer_msg,
+            )
+        return result
 
     def load_weights_from_safetensors(
         self,
@@ -957,6 +1305,7 @@ class WeightLoader:
 
                 can_optimize = (
                     isinstance(mapping.target_path, str)
+                    and not mapping.target_path.startswith("__FUSED_QKV_")
                     and mapping.reshape is None
                     and mapping.repeat is None  # Check repeat here too!
                     and not mapping.kv_head_padding
@@ -1122,6 +1471,7 @@ class WeightLoader:
                         final_sharding = jax.sharding.NamedSharding(self.mesh, P(*mapping.sharding))
 
                     # 2. Call creator
+                    _t_load_start = time.monotonic()
                     stacked_weight = self._create_stacked_moe_lazy_tensor(
                         expected_hf_keys,
                         weight_info,
@@ -1130,6 +1480,7 @@ class WeightLoader:
                         target_sharding=final_sharding,  # Global loading
                         physical_to_logical_map=mapping.physical_to_logical_map,
                     )
+                    _t_load = time.monotonic() - _t_load_start
                     loaded_shape = stacked_weight.shape
 
                     if mapping.reshape is not None:
@@ -1149,7 +1500,7 @@ class WeightLoader:
                     )
 
                     if is_static_quant and moe_key.endswith("_scale"):
-                        logger.info(
+                        logger.debug(
                             "MoE scale debug group=%s target=%s loaded_shape=%s final_shape=%s "
                             "param_shape=%s reshape=%s repeat=%s sharding=%s",
                             moe_key,
@@ -1163,10 +1514,22 @@ class WeightLoader:
                         )
 
                     try:
+                        _t_assign_start = time.monotonic()
                         if stacked_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
                             model_param.value = stacked_weight
                         else:
                             model_param.value = stacked_weight.astype(model_param.value.dtype)
+                        _t_assign = time.monotonic() - _t_assign_start
+                        logger.debug(
+                            "MoE group %s: load=%.2fs assign=%.2fs total=%.2fs "
+                            "shape=%s sharding=%s",
+                            moe_key,
+                            _t_load,
+                            _t_assign,
+                            _t_load + _t_assign,
+                            loaded_shape,
+                            mapping.sharding,
+                        )
                     except Exception as e:
                         logger.error(
                             "Failed MoE assign group=%s target=%s loaded_shape=%s final_shape=%s "
@@ -1247,7 +1610,7 @@ class WeightLoader:
                     )
 
                     if is_static_quant and moe_key.endswith("_scale"):
-                        logger.info(
+                        logger.debug(
                             "Split-MoE scale debug group=%s target=%s loaded_shape=%s final_shape=%s "
                             "param_shape=%s reshape=%s repeat=%s sharding=%s",
                             moe_key,
@@ -1478,6 +1841,22 @@ class WeightLoader:
         jax_path = mapping.target_path
         processed_weight = weight
 
+        # Handle fused QKV buffer storage (used by MiMo-V2-Pro per-shard dequant).
+        # target_path like "__FUSED_QKV_WEIGHT__42" stores into model._fused_qkv_buffers.
+        if jax_path.startswith("__FUSED_QKV_"):
+            if hasattr(self.model, "_fused_qkv_buffers"):
+                is_scale = "SCALE" in jax_path
+                layer_idx = int(jax_path.rsplit("__", 1)[-1])
+                buf = self.model._fused_qkv_buffers.setdefault(layer_idx, {})
+                buf["scale" if is_scale else "weight"] = processed_weight
+                logger.info(
+                    "Stored fused QKV %s for layer %d, shape=%s",
+                    "scale" if is_scale else "weight",
+                    layer_idx,
+                    processed_weight.shape,
+                )
+            return
+
         # Apply output_multiplier_scale to lm_head weights (matching PyTorch implementation)
         if "lm_head" in hf_key and hasattr(self.model_config.hf_config, "output_multiplier_scale"):
             logger.info(
@@ -1533,13 +1912,18 @@ class WeightLoader:
     ):
         jax_paths = mapping.target_path
 
+        v_head_dim = getattr(self, "v_head_dim", self.head_dim_original)
+        v_head_dim_pad = (v_head_dim + 127) // 128 * 128 - v_head_dim
+        v_head_dim_padded = v_head_dim + v_head_dim_pad
+
         if hf_key.endswith(".bias"):
             q_dim = self.num_heads * self.head_dim_original
-            kv_dim = self.num_kv_heads * self.head_dim_original
+            k_dim = self.num_kv_heads * self.head_dim_original
+            v_dim = self.num_kv_heads * v_head_dim
 
             q_bias = weight[:q_dim]
-            k_bias = weight[q_dim : q_dim + kv_dim]
-            v_bias = weight[q_dim + kv_dim : q_dim + 2 * kv_dim]
+            k_bias = weight[q_dim : q_dim + k_dim]
+            v_bias = weight[q_dim + k_dim : q_dim + k_dim + v_dim]
 
             if mapping.head_dim_padding and self.head_dim_pad > 0:
                 q_bias = jnp.reshape(q_bias, (self.num_heads, self.head_dim_original))
@@ -1550,23 +1934,56 @@ class WeightLoader:
                 k_bias = jnp.pad(k_bias, ((0, 0), (0, self.head_dim_pad)))
                 k_bias = jnp.reshape(k_bias, (self.num_kv_heads * self.head_dim,))
 
-                v_bias = jnp.reshape(v_bias, (self.num_kv_heads, self.head_dim_original))
-                v_bias = jnp.pad(v_bias, ((0, 0), (0, self.head_dim_pad)))
-                v_bias = jnp.reshape(v_bias, (self.num_kv_heads * self.head_dim,))
+            if mapping.head_dim_padding and v_head_dim_pad > 0:
+                v_bias = jnp.reshape(v_bias, (self.num_kv_heads, v_head_dim))
+                v_bias = jnp.pad(v_bias, ((0, 0), (0, v_head_dim_pad)))
+                v_bias = jnp.reshape(v_bias, (self.num_kv_heads * v_head_dim_padded,))
 
             splits = [q_bias, k_bias, v_bias]
+        elif "scale" in hf_key and weight.ndim == 2:
+            # Block-quant scale: split along block dimension, not element dimension.
+            # The fused QKV scale has shape [total_blocks, in_blocks] where blocks
+            # are computed per Q/K/V segment independently.
+            import math
+
+            quant_cfg = getattr(self.model_config, "quantization_config", None)
+            block_size = int(quant_cfg.weight_block_size[0]) if quant_cfg else 128
+
+            q_dim = self.num_heads * self.head_dim_original
+            k_dim = self.num_kv_heads * self.head_dim_original
+
+            q_blocks = math.ceil(q_dim / block_size)
+            k_blocks = math.ceil(k_dim / block_size)
+            # V gets remaining blocks (may include padding to head_dim_original)
+            v_blocks = weight.shape[0] - q_blocks - k_blocks
+
+            logger.info(
+                "Splitting QKV scale %s shape=%s into Q=%d K=%d V=%d blocks",
+                hf_key,
+                weight.shape,
+                q_blocks,
+                k_blocks,
+                v_blocks,
+            )
+
+            q_scale = weight[:q_blocks, :]
+            k_scale = weight[q_blocks : q_blocks + k_blocks, :]
+            v_scale = weight[q_blocks + k_blocks :, :]
+
+            splits = [q_scale, k_scale, v_scale]
         else:
             q_dim = self.num_heads * self.head_dim_original
-            kv_dim = self.num_kv_heads * self.head_dim_original
+            k_dim = self.num_kv_heads * self.head_dim_original
+            v_dim = self.num_kv_heads * v_head_dim
 
             if mapping.transpose:
                 q_weight = weight[:, :q_dim]
-                k_weight = weight[:, q_dim : q_dim + kv_dim]
-                v_weight = weight[:, q_dim + kv_dim : q_dim + 2 * kv_dim]
+                k_weight = weight[:, q_dim : q_dim + k_dim]
+                v_weight = weight[:, q_dim + k_dim : q_dim + k_dim + v_dim]
             else:
                 q_weight = weight[:q_dim, :]
-                k_weight = weight[q_dim : q_dim + kv_dim, :]
-                v_weight = weight[q_dim + kv_dim : q_dim + 2 * kv_dim, :]
+                k_weight = weight[q_dim : q_dim + k_dim, :]
+                v_weight = weight[q_dim + k_dim : q_dim + k_dim + v_dim, :]
 
             if mapping.head_dim_padding and self.head_dim_pad > 0:
                 if mapping.transpose:
@@ -1587,15 +2004,6 @@ class WeightLoader:
                     k_weight = jnp.reshape(
                         k_weight, (self.hidden_size, self.num_kv_heads * self.head_dim)
                     )
-
-                    v_weight = jnp.reshape(
-                        v_weight,
-                        (self.hidden_size, self.num_kv_heads, self.head_dim_original),
-                    )
-                    v_weight = jnp.pad(v_weight, ((0, 0), (0, 0), (0, self.head_dim_pad)))
-                    v_weight = jnp.reshape(
-                        v_weight, (self.hidden_size, self.num_kv_heads * self.head_dim)
-                    )
                 else:
                     q_weight = jnp.reshape(
                         q_weight,
@@ -1615,13 +2023,24 @@ class WeightLoader:
                         k_weight, (self.num_kv_heads * self.head_dim, self.hidden_size)
                     )
 
+            if mapping.head_dim_padding and v_head_dim_pad > 0:
+                if mapping.transpose:
                     v_weight = jnp.reshape(
                         v_weight,
-                        (self.num_kv_heads, self.head_dim_original, self.hidden_size),
+                        (self.hidden_size, self.num_kv_heads, v_head_dim),
                     )
-                    v_weight = jnp.pad(v_weight, ((0, 0), (0, self.head_dim_pad), (0, 0)))
+                    v_weight = jnp.pad(v_weight, ((0, 0), (0, 0), (0, v_head_dim_pad)))
                     v_weight = jnp.reshape(
-                        v_weight, (self.num_kv_heads * self.head_dim, self.hidden_size)
+                        v_weight, (self.hidden_size, self.num_kv_heads * v_head_dim_padded)
+                    )
+                else:
+                    v_weight = jnp.reshape(
+                        v_weight,
+                        (self.num_kv_heads, v_head_dim, self.hidden_size),
+                    )
+                    v_weight = jnp.pad(v_weight, ((0, 0), (0, v_head_dim_pad), (0, 0)))
+                    v_weight = jnp.reshape(
+                        v_weight, (self.num_kv_heads * v_head_dim_padded, self.hidden_size)
                     )
 
             splits = [q_weight, k_weight, v_weight]
@@ -1635,6 +2054,11 @@ class WeightLoader:
             sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
 
             model_param = self._get_param(params, jax_path)
+
+            # Expand 2D block-quant scale to 3D kernel-ready layout.
+            sharded_weight = self._maybe_expand_linear_block_scale(
+                sharded_weight, model_param, jax_path
+            )
 
             if sharded_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
                 model_param.value = sharded_weight

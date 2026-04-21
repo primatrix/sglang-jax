@@ -161,6 +161,7 @@ class MiMoV2Attention(nnx.Module):
         sliding_window_size: int | None = None,
         attention_sink_bias: bool = False,
         partial_rotary_factor: float = 1.0,
+        attention_value_scale: float | None = None,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
@@ -170,6 +171,7 @@ class MiMoV2Attention(nnx.Module):
         self.q_head_num = num_heads
         self.k_head_num = num_kv_heads
         self.v_head_dim = v_head_dim if v_head_dim is not None else self.head_dim
+        self.attention_value_scale = attention_value_scale
 
         self.q_size = num_heads * self.head_dim
         self.k_size = num_kv_heads * self.head_dim
@@ -282,6 +284,9 @@ class MiMoV2Attention(nnx.Module):
                 attn_output = attn_output[..., : self.v_head_dim]
                 attn_output = attn_output.reshape(-1, expected_v_head_dim)
 
+        if self.attention_value_scale is not None:
+            attn_output = attn_output * self.attention_value_scale
+
         output, _ = self.o_proj(attn_output)
         return output, kv_fused
 
@@ -300,6 +305,7 @@ class MiMoV2DecoderLayer(nnx.Module):
         rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
+        attention_value_scale = getattr(config, "attention_value_scale", None)
 
         if self._is_swa_layer(config):
             self.self_attn = MiMoV2Attention(
@@ -314,6 +320,7 @@ class MiMoV2DecoderLayer(nnx.Module):
                 sliding_window_size=getattr(config, "sliding_window_size", None),
                 attention_sink_bias=getattr(config, "add_swa_attention_sink_bias", False),
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
+                attention_value_scale=attention_value_scale,
                 layer_id=layer_id,
                 dtype=dtype,
                 mesh=mesh,
@@ -331,6 +338,7 @@ class MiMoV2DecoderLayer(nnx.Module):
                 sliding_window_size=0,  # full attention
                 attention_sink_bias=getattr(config, "add_full_attention_sink_bias", False),
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
+                attention_value_scale=attention_value_scale,
                 layer_id=layer_id,
                 dtype=dtype,
                 mesh=mesh,
@@ -529,6 +537,10 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         """
         import glob
         import os
+
+        if os.environ.get("SGLANG_SKIP_GCSFUSE_WARMUP", ""):
+            logger.info("Skipping GCSFuse cache warmup (SGLANG_SKIP_GCSFUSE_WARMUP set)")
+            return
         from concurrent.futures import ThreadPoolExecutor
 
         model_path = model_config.model_path
@@ -609,6 +621,28 @@ class MiMoV2FlashForCausalLM(nnx.Module):
 
         if weight_scale.ndim == 3:
             weight_bf16 = self._block_dequant(weight_q, weight_scale, head_dim=head_dim)
+        elif weight_scale.ndim == 2:
+            # Raw 2D block-quant scale [out_blocks, in_blocks] — expand to 3D first.
+            # This can happen for QKV-split scales where expansion was skipped.
+            import math
+
+            from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import (
+                expand_block_scale,
+            )
+
+            quant_cfg = getattr(self.config, "quantization_config", None)
+            block_size_out = int(quant_cfg.weight_block_size[0]) if quant_cfg else 128
+
+            dim0, dim1 = weight_q.shape
+            out_blocks = weight_scale.shape[0]
+            # Determine which weight dim is output: must satisfy ceil(dim/bs) <= out_blocks
+            n_out = dim1 if math.ceil(dim1 / block_size_out) <= out_blocks else dim0
+
+            logger.info(
+                "Expanding 2D scale %s -> 3D for dequant, n_out=%d", weight_scale.shape, n_out
+            )
+            weight_scale_3d = expand_block_scale(weight_scale, n_out, block_size_out)
+            weight_bf16 = self._block_dequant(weight_q, weight_scale_3d, head_dim=head_dim)
         elif weight_scale.ndim == 1:
             out_dim = weight_scale.shape[0]
             if weight_q.shape[1] == out_dim:
