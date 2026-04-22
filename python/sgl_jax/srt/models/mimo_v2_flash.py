@@ -172,6 +172,8 @@ class MiMoV2Attention(nnx.Module):
         self.k_head_num = num_kv_heads
         self.v_head_dim = v_head_dim if v_head_dim is not None else self.head_dim
         self.attention_value_scale = attention_value_scale
+        if attention_value_scale is not None:
+            logger.info("Layer %d: attention_value_scale=%s", layer_id, attention_value_scale)
 
         self.q_size = num_heads * self.head_dim
         self.k_size = num_kv_heads * self.head_dim
