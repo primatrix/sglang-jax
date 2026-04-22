@@ -46,6 +46,13 @@ logger = logging.getLogger(__name__)
 _decode_step_counter = 0
 
 
+def _to_numpy(x):
+    """Convert a JAX array to numpy, handling multi-host sharded arrays."""
+    if hasattr(x, "addressable_shards"):
+        return np.asarray(x.addressable_shards[0].data)
+    return np.asarray(x)
+
+
 def _dump_decode_step(dump_dir, logits, next_token_ids, batch):
     """Dump top-10 logits and selected token per decode step for divergence analysis."""
     global _decode_step_counter
@@ -53,9 +60,9 @@ def _dump_decode_step(dump_dir, logits, next_token_ids, batch):
     try:
         os.makedirs(dump_dir, exist_ok=True)
         bs = batch.real_bs
-        logits_np = np.asarray(logits[:bs])  # [bs, vocab]
-        tokens_np = np.asarray(next_token_ids[:bs])  # [bs]
-        positions = np.asarray(batch.seq_lens[:bs]) - 1  # current position
+        logits_np = _to_numpy(logits)[:bs]  # [bs, vocab]
+        tokens_np = _to_numpy(next_token_ids)[:bs]  # [bs]
+        positions = _to_numpy(batch.seq_lens)[:bs] - 1  # current position
 
         top_k = 10
         top_indices = np.argpartition(logits_np, -top_k, axis=-1)[:, -top_k:]
