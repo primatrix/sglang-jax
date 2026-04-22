@@ -43,6 +43,44 @@ from sgl_jax.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
+_decode_step_counter = 0
+
+
+def _dump_decode_step(dump_dir, logits, next_token_ids, batch):
+    """Dump top-10 logits and selected token per decode step for divergence analysis."""
+    global _decode_step_counter
+    _decode_step_counter += 1
+    try:
+        os.makedirs(dump_dir, exist_ok=True)
+        bs = batch.real_bs
+        logits_np = np.asarray(logits[:bs])  # [bs, vocab]
+        tokens_np = np.asarray(next_token_ids[:bs])  # [bs]
+        positions = np.asarray(batch.seq_lens[:bs]) - 1  # current position
+
+        top_k = 10
+        top_indices = np.argpartition(logits_np, -top_k, axis=-1)[:, -top_k:]
+        # Sort by logit value descending
+        for i in range(bs):
+            order = np.argsort(logits_np[i, top_indices[i]])[::-1]
+            top_indices[i] = top_indices[i][order]
+        top_values = np.take_along_axis(logits_np, top_indices, axis=-1)
+
+        with open(os.path.join(dump_dir, "decode_logits.jsonl"), "a") as f:
+            import json
+
+            for i in range(bs):
+                record = {
+                    "step": _decode_step_counter,
+                    "pos": int(positions[i]),
+                    "selected": int(tokens_np[i]),
+                    "top_ids": top_indices[i].tolist(),
+                    "top_vals": [round(float(v), 4) for v in top_values[i]],
+                }
+                f.write(json.dumps(record) + "\n")
+    except Exception as e:
+        logger.warning("Failed to dump decode logits: %s", e)
+
+
 class ModelWorker:
     """A tensor parallel model worker."""
 
@@ -611,6 +649,7 @@ class ModelWorker:
                 logits_output.next_token_logprobs = logprobs[: model_worker_batch.real_bs]
         if new_logits_output is not None:
             logits_output = new_logits_output
+
             if logits_output.next_token_top_logprobs_val is not None:
                 logits_output.next_token_top_logprobs_val = (
                     logits_output.next_token_top_logprobs_val.astype(jnp.float32).tolist()
@@ -637,6 +676,17 @@ class ModelWorker:
                     jnp.float32
                 ).tolist()
                 logits_output.input_top_logprobs_idx = logits_output.input_top_logprobs_idx.tolist()
+
+        # === DEBUG: dump decode logits for divergence analysis ===
+        dump_logits_dir = os.getenv("DUMP_DECODE_LOGITS_DIR", None)
+        if dump_logits_dir and forward_batch.forward_mode.is_decode():
+            _dump_decode_step(
+                dump_logits_dir,
+                logits_output.next_token_logits,
+                next_token_ids_device,
+                model_worker_batch,
+            )
+        # === END DEBUG ===
 
         return (
             logits_output,
