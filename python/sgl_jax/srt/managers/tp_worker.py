@@ -197,7 +197,13 @@ class ModelWorker:
             len(self.precompile_bs_paddings) == 0
             or self.precompile_bs_paddings[-1] < self.max_padded_batch_size
         ):
-            self.precompile_bs_paddings.append(self.max_padded_batch_size)
+            final_bs = self.max_padded_batch_size
+            # For fused MoE with FP8, local_num_tokens = bs // ep_size must be
+            # aligned to t_packing (2 for FP8). Ensure minimum batch size.
+            if server_args.moe_backend == "fused":
+                min_fused_bs = self.tp_size * 2
+                final_bs = max(final_bs, min_fused_bs)
+            self.precompile_bs_paddings.append(final_bs)
 
         # padding cache_loc_paddings
         # note: the length of following two cache_loc_paddings must keep the same to length of separate bs_paddings.
@@ -232,8 +238,15 @@ class ModelWorker:
 
         if self.precompile_token_paddings is None:
             self.precompile_token_paddings = PRECOMPILE_DEFAULT_TOKEN_PADDINGS
+
+        # For fused MoE with FP8, num_tokens must be >= ep_size * t_packing
+        # (t_packing=2 for FP8). Enforce minimum token padding.
+        min_tokens = self.max_padded_batch_size
+        if self.server_args.moe_backend == "fused":
+            min_tokens = max(min_tokens, self.tp_size * 2)
+
         for item in self.precompile_token_paddings:
-            if item >= self.max_padded_batch_size and item <= self.max_padded_num_tokens:
+            if item >= min_tokens and item <= self.max_padded_num_tokens:
                 normalized_token_paddings.append(item)
 
         normalized_token_paddings.sort()

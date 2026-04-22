@@ -1263,16 +1263,17 @@ class WeightLoader:
         # Check if bulk raw byte reading is possible (byte offsets available
         # from scan phase). This eliminates per-expert safetensors API calls
         # and reduces GCSFuse round-trips by reading contiguous byte ranges.
-        # Skip bulk_read for small tensors (e.g. scales) — safetensors API
-        # with cached handles is faster than raw open/seek/read on GCSFuse.
+        # Use total bytes across all experts as the threshold (not per-expert),
+        # so that small-per-expert tensors like scales (3KB × 384 = 1.1MB) still
+        # qualify for bulk_read instead of making hundreds of GCSFuse calls.
         _expert_elems = 1
         for d in single_expert_shape:
             _expert_elems *= d
         _expert_bytes_est = _expert_elems * (1 if st_dtype.startswith("F8_") else 4)
-        _BULK_READ_MIN_BYTES = 1024 * 1024  # 1 MB per expert
+        _BULK_READ_MIN_BYTES = 1024 * 1024  # 1 MB total across all experts
         bulk_read = (
             defer_transpose
-            and _expert_bytes_est >= _BULK_READ_MIN_BYTES
+            and _expert_bytes_est * num_logical_experts >= _BULK_READ_MIN_BYTES
             and all(
                 "byte_offset" in weight_info[expected_hf_keys[i]][0]
                 for i in range(min(2, num_logical_experts))
