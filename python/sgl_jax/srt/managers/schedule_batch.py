@@ -1332,7 +1332,9 @@ class ScheduleBatch:
                 if not info.reqs:
                     continue
                 for req in info.reqs:
-                    if req.decode_batch_idx % evict_interval == 1:
+                    if req.decode_batch_idx > 0 and (
+                        evict_interval <= 1 or req.decode_batch_idx % evict_interval == 1
+                    ):
                         self._evict_swa(
                             req, req.seqlen - 1, sliding_window_size, page_size, dp_rank
                         )
@@ -2053,6 +2055,25 @@ class ScheduleBatch:
 
         # input_embedding = None
 
+        # Merge per-DP top_logprobs_nums / token_ids_logprobs with the same
+        # offset_bs += per_dp_bs_padding padding scheme used in _merge_batch_metadata.
+        if self.return_logprob:
+            top_logprobs_nums = [0] * total_bs
+            token_ids_logprobs: list[list[int] | None] = [None] * total_bs
+            offset_bs = 0
+            for dp_rank in range(self.dp_size):
+                info = self.reqs_info[dp_rank]
+                if info.seq_lens is not None and len(info.seq_lens) > 0:
+                    dp_bs = len(info.seq_lens)
+                    if info.top_logprobs_nums is not None:
+                        top_logprobs_nums[offset_bs : offset_bs + dp_bs] = info.top_logprobs_nums
+                    if info.token_ids_logprobs is not None:
+                        token_ids_logprobs[offset_bs : offset_bs + dp_bs] = info.token_ids_logprobs
+                offset_bs += per_dp_bs_padding
+        else:
+            top_logprobs_nums = None
+            token_ids_logprobs = None
+
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -2063,8 +2084,8 @@ class ScheduleBatch:
             out_cache_loc=out_cache_loc_cpu,
             return_logprob=self.return_logprob,
             return_output_logprob_only=self.return_output_logprob_only,
-            top_logprobs_nums=None,  # TODO: @Brian pad logprob info
-            token_ids_logprobs=None,  # TODO
+            top_logprobs_nums=top_logprobs_nums,
+            token_ids_logprobs=token_ids_logprobs,
             sampling_info=sampling_info,
             positions=positions_cpu,
             mrope_positions=None,
