@@ -64,38 +64,42 @@ def xla_quantized_matmul_local(
             block_size_out = block_size_in
 
         blockwise_kernel = get_blockwise_kernel()
-        if blockwise_kernel is None:
-            raise RuntimeError(
-                "Block-wise quantized matmul requires the blockwise kernel, "
-                "but it failed to load. Please check your installation."
-            )
-        if not should_use_blockwise_kernel(
+        use_blockwise = blockwise_kernel is not None and should_use_blockwise_kernel(
             out_dim=int(out_dim),
             block_size_out=int(block_size_out),
-        ):
-            raise RuntimeError(
-                f"Block-wise kernel does not support out_dim={out_dim} with "
-                f"block_size_out={block_size_out} (known to cause NaNs)."
-            )
+        )
 
-        # w_scale is already in kernel-ready layout [in_blocks, 1, n_out].
-        x_q_dtype = act_quant_dtype if quantize_activation else x.dtype
-        tuned_value = get_safe_blockwise_tuned_value(
-            n_batch=int(x.shape[0]),
-            n_out=int(out_dim),
-            n_in=int(in_dim),
-            x_q_dtype=x_q_dtype,
-            w_q_dtype=w_q.dtype,
-            block_size_in=block_size_in,
-        )
-        out = blockwise_kernel(
-            x=x,
-            w_q=w_q,
-            w_scale=w_scale,
-            block_size=block_size_in,
-            x_q_dtype=x_q_dtype,
-            tuned_value=tuned_value,
-        )
+        if use_blockwise:
+            # w_scale is already in kernel-ready layout [in_blocks, 1, n_out].
+            x_q_dtype = act_quant_dtype if quantize_activation else x.dtype
+            tuned_value = get_safe_blockwise_tuned_value(
+                n_batch=int(x.shape[0]),
+                n_out=int(out_dim),
+                n_in=int(in_dim),
+                x_q_dtype=x_q_dtype,
+                w_q_dtype=w_q.dtype,
+                block_size_in=block_size_in,
+            )
+            out = blockwise_kernel(
+                x=x,
+                w_q=w_q,
+                w_scale=w_scale,
+                block_size=block_size_in,
+                x_q_dtype=x_q_dtype,
+                tuned_value=tuned_value,
+            )
+        else:
+            # Fallback: dequantize block-wise FP8 weight to compute_dtype, then matmul.
+            # w_scale: [in_blocks, 1, out_dim], w_q: [out_dim, in_dim]
+            w_dequant = w_q.astype(compute_dtype).reshape(out_dim, in_blocks, block_size_in)
+            w_dequant = w_dequant * jnp.transpose(w_scale, (2, 0, 1))
+            w_dequant = w_dequant.reshape(out_dim, in_dim)
+            out = lax.dot_general(
+                x.astype(compute_dtype),
+                w_dequant,
+                dimension_numbers=(((1,), (1,)), ((), ())),
+                preferred_element_type=compute_dtype,
+            )
 
     else:
         # === Standard Per-Channel Quantization Path ===

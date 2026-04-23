@@ -13,7 +13,7 @@ from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.layernorm import RMSNorm
-from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.layers.linear import LinearBase, QuantizedLinear
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK, create_moe_weights_mapping
 from sgl_jax.srt.layers.radix_attention import RadixAttention
@@ -515,7 +515,48 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         self._quant_config = model_config.quantization_config
         weight_mappings = self._create_weight_mappings()
         loader.load_weights_from_safetensors(weight_mappings)
+        self._dequantize_v_proj_layers()
         logger.info("MiMoV2Flash weights loaded successfully!")
+
+    def _dequantize_v_proj_layers(self):
+        """Dequantize v_proj from QuantizedLinear back to LinearBase.
+
+        When v_head_dim equals the blockwise kernel block_size (e.g. both 128),
+        per-shard out_dim can be too small for the FP8 blockwise kernel.
+        Dequantize v_proj weights to BF16 at load time to avoid this.
+        """
+        for layer in self.model.layers:
+            v_proj = layer.self_attn.v_proj
+            if not isinstance(v_proj, QuantizedLinear):
+                continue
+
+            w_q = v_proj.weight_q.value
+            w_scale = v_proj.weight_scale.value
+            out_dim, in_dim = w_q.shape
+
+            if w_scale.ndim == 3:
+                in_blocks = w_scale.shape[0]
+                block_size_in = in_dim // in_blocks
+                w_dequant = w_q.astype(jnp.float32).reshape(out_dim, in_blocks, block_size_in)
+                w_dequant = w_dequant * jnp.transpose(w_scale, (2, 0, 1))
+                w_dequant = w_dequant.reshape(out_dim, in_dim).astype(jnp.bfloat16)
+            else:
+                w_dequant = (w_q.astype(jnp.float32) * w_scale[:, None]).astype(jnp.bfloat16)
+
+            new_v_proj = LinearBase(
+                input_size=in_dim,
+                output_size=out_dim,
+                kernel_axes=v_proj.kernel_axes,
+                use_bias=v_proj.bias is not None,
+                params_dtype=jnp.bfloat16,
+                mesh=v_proj.mesh,
+            )
+            new_v_proj.weight = nnx.Param(w_dequant.T)
+            if v_proj.bias is not None:
+                new_v_proj.bias = nnx.Param(v_proj.bias.value)
+            layer.self_attn.v_proj = new_v_proj
+
+        logger.info("Dequantized v_proj layers from FP8 to BF16.")
 
     def _is_quant_ignored(self, hf_path: str) -> bool:
         """Check if a HuggingFace weight path is in the quantization ignored_layers list."""

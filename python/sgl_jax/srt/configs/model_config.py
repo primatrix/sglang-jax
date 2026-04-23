@@ -474,8 +474,6 @@ class ModelConfig:
             if not hasattr(self, "_original_hf_num_key_value_heads"):
                 self._original_hf_num_key_value_heads = self.hf_text_config.num_attention_heads
 
-        kv_heads_per_device = self._bump_kv_heads_for_v_head_dim(kv_heads_per_device)
-
         # CRITICAL: Set to TOTAL count for global sharding
         # JAX tensor parallel will automatically shard this across devices
         total_kv_heads = kv_heads_per_device * tensor_parallel_size
@@ -496,9 +494,6 @@ class ModelConfig:
 
             swa_kv_heads_per_device = get_num_kv_heads_by_tp(
                 self._original_swa_num_key_value_heads, tensor_parallel_size
-            )
-            swa_kv_heads_per_device = self._bump_kv_heads_for_v_head_dim(
-                swa_kv_heads_per_device, swa=True
             )
             self.hf_text_config.swa_num_key_value_heads = (
                 swa_kv_heads_per_device * tensor_parallel_size
