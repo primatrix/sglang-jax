@@ -137,6 +137,7 @@ class WeightLoader:
 
             self.head_dim_pad = (self.head_dim_original + 127) // 128 * 128 - self.head_dim_original
             self.head_dim = self.head_dim_original
+            self.v_head_dim = getattr(model_config, "v_head_dim", None) or self.head_dim_original
         if hasattr(self.mesh, "shape") and "tensor" in self.mesh.shape:
             self.sharding_size = self.mesh.shape["tensor"]
         else:
@@ -361,7 +362,7 @@ class WeightLoader:
         out_blocks = weight.shape[0]
 
         channel_to_block = None
-        if out_blocks * block_size_out < n_out and self.head_dim_pad > 0:
+        if out_blocks * block_size_out < n_out:
             channel_to_block = self._build_head_dim_channel_to_block(
                 n_out, out_blocks, target_path
             )
@@ -1504,10 +1505,10 @@ class WeightLoader:
         if mapping.repeat is not None:
             axis, times = mapping.repeat
             processed_weight = jnp.repeat(processed_weight, times, axis=axis)
-        if mapping.kv_head_padding:
-            processed_weight = self._apply_kv_head_padding(processed_weight, hf_key)
         if mapping.head_dim_padding and self.head_dim_pad > 0:
             processed_weight = self._apply_single_head_dim_padding(processed_weight, hf_key)
+        if mapping.kv_head_padding:
+            processed_weight = self._apply_kv_head_padding(processed_weight, hf_key)
 
         sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
 
@@ -1627,35 +1628,47 @@ class WeightLoader:
     def _build_head_dim_channel_to_block(
         self, n_out_padded: int, out_blocks: int, target_path: str
     ) -> jnp.ndarray:
-        """Build channel-to-block index for head_dim-padded projections.
+        """Build channel-to-block index for projections with head_dim padding
+        and/or KV head replication.
 
-        Maps each padded output channel back to the correct block in the
-        checkpoint's uniform 2D scale.
+        Maps each output channel back to the correct block in the
+        checkpoint's uniform 2D scale. Handles KV head replication via
+        modular arithmetic on the head index.
         """
-        hd_orig = self.head_dim_original
-        hd_padded = hd_orig + self.head_dim_pad
         block_size = 128
 
-        if "q_proj" in target_path:
-            n_heads = self.num_heads
+        if "v_proj" in target_path:
+            hd_orig = self.v_head_dim
+            hd_padded = self.v_head_dim
+            n_original_heads = self.num_kv_heads
         elif "k_proj" in target_path:
-            n_heads = self.num_kv_heads
+            hd_orig = self.head_dim_original
+            hd_padded = hd_orig + self.head_dim_pad
+            n_original_heads = self.num_kv_heads
+        elif "q_proj" in target_path:
+            hd_orig = self.head_dim_original
+            hd_padded = hd_orig + self.head_dim_pad
+            n_original_heads = self.num_heads
         else:
-            n_heads = n_out_padded // hd_padded
+            hd_orig = self.head_dim_original
+            hd_padded = hd_orig + self.head_dim_pad
+            n_original_heads = n_out_padded // hd_padded
 
         mapping = np.empty(n_out_padded, dtype=np.int32)
         for c in range(n_out_padded):
             head_idx = c // hd_padded
+            original_head_idx = head_idx % n_original_heads
             offset = c % hd_padded
             if offset < hd_orig:
-                orig_ch = head_idx * hd_orig + offset
+                orig_ch = original_head_idx * hd_orig + offset
             else:
-                orig_ch = head_idx * hd_orig + hd_orig - 1
+                orig_ch = original_head_idx * hd_orig + hd_orig - 1
             mapping[c] = orig_ch // block_size
 
+        n_total_heads = n_out_padded // hd_padded
         logger.info(
-            "Built head_dim channel_to_block for %s: %d heads, %d→%d head_dim, %d blocks → %d channels",
-            target_path, n_heads, hd_orig, hd_padded, out_blocks, n_out_padded,
+            "Built channel_to_block for %s: %d heads (%d original), %d→%d head_dim, %d blocks → %d channels",
+            target_path, n_total_heads, n_original_heads, hd_orig, hd_padded, out_blocks, n_out_padded,
         )
         return jnp.array(mapping, dtype=jnp.int32)
 
@@ -1712,6 +1725,8 @@ class WeightLoader:
 
         target_axis = -1
         step_size = -1
+        padded_hd = self.head_dim + self.head_dim_pad
+        is_v_proj = "v_proj" in hf_key
 
         dim0 = weight.shape[0]
         if dim0 == total_kv_heads:
@@ -1720,12 +1735,24 @@ class WeightLoader:
         elif dim0 == total_kv_heads * self.head_dim:
             target_axis = 0
             step_size = self.head_dim
+        elif self.head_dim_pad > 0 and dim0 == total_kv_heads * padded_hd:
+            target_axis = 0
+            step_size = padded_hd
+        elif is_v_proj and self.v_head_dim != self.head_dim and dim0 == total_kv_heads * self.v_head_dim:
+            target_axis = 0
+            step_size = self.v_head_dim
 
         if target_axis == -1 and weight.ndim > 1:
             dim1 = weight.shape[1]
             if dim1 == total_kv_heads * self.head_dim:
                 target_axis = 1
                 step_size = self.head_dim
+            elif self.head_dim_pad > 0 and dim1 == total_kv_heads * padded_hd:
+                target_axis = 1
+                step_size = padded_hd
+            elif is_v_proj and self.v_head_dim != self.head_dim and dim1 == total_kv_heads * self.v_head_dim:
+                target_axis = 1
+                step_size = self.v_head_dim
 
         if target_axis == -1:
             return weight

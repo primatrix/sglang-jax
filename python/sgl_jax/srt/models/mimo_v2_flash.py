@@ -566,8 +566,8 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         # Attention projections
         for proj, sharding, kv_pad, hd_pad in [
             ("q_proj", (None, "tensor"), False, True),
-            ("k_proj", (None, "tensor"), not is_fp8, True),
-            ("v_proj", (None, "tensor"), not is_fp8, False),
+            ("k_proj", (None, "tensor"), True, True),
+            ("v_proj", (None, "tensor"), True, False),
             ("o_proj", ("tensor", None), False, True),
         ]:
             hf_key = f"{prefix}.self_attn.{proj}"
