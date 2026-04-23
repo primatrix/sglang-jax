@@ -94,7 +94,7 @@ class FlashAttention(AttentionBackend):
             self.num_kv_heads = num_kv_heads
         else:
             self.num_kv_heads = num_attn_heads
-        self.head_dim = head_dim
+        self.head_dim = 256
         self.page_size = page_size
         self.kv_partition_axis = kv_partition_axis
         self.forward_metadata = nnx.data(FlashAttentionMetadata())
