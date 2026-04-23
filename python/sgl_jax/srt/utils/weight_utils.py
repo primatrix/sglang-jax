@@ -138,6 +138,13 @@ class WeightLoader:
             self.head_dim_pad = (self.head_dim_original + 127) // 128 * 128 - self.head_dim_original
             self.head_dim = self.head_dim_original
             self.v_head_dim = getattr(model_config, "v_head_dim", None) or self.head_dim_original
+
+            self.swa_num_kv_heads = getattr(
+                model_config, "_original_swa_num_key_value_heads",
+                getattr(model_config.hf_text_config, "swa_num_key_value_heads", None),
+            )
+            if self.swa_num_kv_heads is None:
+                self.swa_num_kv_heads = self.num_kv_heads
         if hasattr(self.mesh, "shape") and "tensor" in self.mesh.shape:
             self.sharding_size = self.mesh.shape["tensor"]
         else:
@@ -1625,6 +1632,26 @@ class WeightLoader:
 
         return current_level
 
+    def _is_swa_layer(self, layer_idx: int) -> bool:
+        for cfg in (self.model_config.hf_config, getattr(self.model_config, "hf_text_config", None)):
+            pattern = getattr(cfg, "hybrid_layer_pattern", None)
+            if pattern is not None and 0 <= layer_idx < len(pattern):
+                return pattern[layer_idx] == 1
+        return False
+
+    _LAYER_IDX_RE = re.compile(r"\.layers\.(\d+)\.")
+
+    def _get_effective_kv_heads(self, hf_key: str) -> int:
+        if self.swa_num_kv_heads == self.num_kv_heads:
+            return self.num_kv_heads
+        m = self._LAYER_IDX_RE.search(hf_key)
+        if m is None:
+            return self.num_kv_heads
+        layer_idx = int(m.group(1))
+        if self._is_swa_layer(layer_idx):
+            return self.swa_num_kv_heads
+        return self.num_kv_heads
+
     def _build_head_dim_channel_to_block(
         self, n_out_padded: int, out_blocks: int, target_path: str
     ) -> jnp.ndarray:
@@ -1636,15 +1663,16 @@ class WeightLoader:
         modular arithmetic on the head index.
         """
         block_size = 128
+        effective_kv_heads = self._get_effective_kv_heads(target_path)
 
         if "v_proj" in target_path:
             hd_orig = self.v_head_dim
             hd_padded = self.v_head_dim
-            n_original_heads = self.num_kv_heads
+            n_original_heads = effective_kv_heads
         elif "k_proj" in target_path:
             hd_orig = self.head_dim_original
             hd_padded = hd_orig + self.head_dim_pad
-            n_original_heads = self.num_kv_heads
+            n_original_heads = effective_kv_heads
         elif "q_proj" in target_path:
             hd_orig = self.head_dim_original
             hd_padded = hd_orig + self.head_dim_pad
@@ -1682,12 +1710,15 @@ class WeightLoader:
         pad = self.head_dim_pad
         hd_new = hd + pad
 
+        effective_kv_heads = self._get_effective_kv_heads(hf_key)
+        valid_head_counts = {self.num_heads, effective_kv_heads}
+
         for axis in range(weight.ndim):
             dim = weight.shape[axis]
             if dim % hd != 0:
                 continue
             n_heads = dim // hd
-            if n_heads not in (self.num_heads, self.num_kv_heads):
+            if n_heads not in valid_head_counts:
                 continue
 
             pre_shape = weight.shape[:axis]
@@ -1713,14 +1744,15 @@ class WeightLoader:
         2. Standard Weight (2D with shape[1]=heads*dim) -> Pad Axis 1
         3. Static Quant Weight (2D with shape[0]=heads*dim) -> Pad Axis 0
         """
-        if not (
-            any(proj in hf_key for proj in ["k_proj", "v_proj"])
-            and self.model_config.needs_kv_head_replication(self.sharding_size)
-        ):
+        if not any(proj in hf_key for proj in ["k_proj", "v_proj"]):
             return weight
 
-        total_kv_heads = self.model_config.get_total_num_kv_heads()
-        num_replicas = self.model_config.get_num_kv_head_replicas(self.sharding_size)
+        total_kv_heads = self._get_effective_kv_heads(hf_key)
+
+        if self.sharding_size <= total_kv_heads:
+            return weight
+
+        num_replicas = (self.sharding_size + total_kv_heads - 1) // total_kv_heads
         padding_strategy = self.model_config.get_kv_padding_strategy()
 
         target_axis = -1
@@ -1732,27 +1764,27 @@ class WeightLoader:
         if dim0 == total_kv_heads:
             target_axis = 0
             step_size = 1
+        elif is_v_proj and self.v_head_dim != self.head_dim and dim0 == total_kv_heads * self.v_head_dim:
+            target_axis = 0
+            step_size = self.v_head_dim
         elif dim0 == total_kv_heads * self.head_dim:
             target_axis = 0
             step_size = self.head_dim
         elif self.head_dim_pad > 0 and dim0 == total_kv_heads * padded_hd:
             target_axis = 0
             step_size = padded_hd
-        elif is_v_proj and self.v_head_dim != self.head_dim and dim0 == total_kv_heads * self.v_head_dim:
-            target_axis = 0
-            step_size = self.v_head_dim
 
         if target_axis == -1 and weight.ndim > 1:
             dim1 = weight.shape[1]
-            if dim1 == total_kv_heads * self.head_dim:
+            if is_v_proj and self.v_head_dim != self.head_dim and dim1 == total_kv_heads * self.v_head_dim:
+                target_axis = 1
+                step_size = self.v_head_dim
+            elif dim1 == total_kv_heads * self.head_dim:
                 target_axis = 1
                 step_size = self.head_dim
             elif self.head_dim_pad > 0 and dim1 == total_kv_heads * padded_hd:
                 target_axis = 1
                 step_size = padded_hd
-            elif is_v_proj and self.v_head_dim != self.head_dim and dim1 == total_kv_heads * self.v_head_dim:
-                target_axis = 1
-                step_size = self.v_head_dim
 
         if target_axis == -1:
             return weight
