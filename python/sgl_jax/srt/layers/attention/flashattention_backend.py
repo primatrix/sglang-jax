@@ -514,7 +514,7 @@ class FlashAttention(AttentionBackend):
             )
 
             return result, updated_kv_cache_fused
-
+        self.head_dim = 256
         (
             attn_output,
             updated_kv_cache_fused,
