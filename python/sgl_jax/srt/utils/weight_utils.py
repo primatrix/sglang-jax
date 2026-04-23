@@ -358,14 +358,23 @@ class WeightLoader:
         )
 
         n_out = int(model_param.value.shape[2])
+        out_blocks = weight.shape[0]
+
+        channel_to_block = None
+        if out_blocks * block_size_out < n_out and self.head_dim_pad > 0:
+            channel_to_block = self._build_head_dim_channel_to_block(
+                n_out, out_blocks, target_path
+            )
+
         logger.info(
-            "Expanding linear block-quant scale %s from %s to kernel-ready layout [%d, 1, %d]",
+            "Expanding linear block-quant scale %s from %s to kernel-ready layout [%d, 1, %d]%s",
             target_path,
             weight.shape,
             weight.shape[1],
             n_out,
+            " (with head_dim channel_to_block)" if channel_to_block is not None else "",
         )
-        return expand_block_scale(weight, n_out, block_size_out)
+        return expand_block_scale(weight, n_out, block_size_out, channel_to_block)
 
     def _scan_weight_info(self) -> dict[str, list[dict]]:
         """
@@ -1614,6 +1623,41 @@ class WeightLoader:
                     raise ValueError(f"{path} is not a valid param path")
 
         return current_level
+
+    def _build_head_dim_channel_to_block(
+        self, n_out_padded: int, out_blocks: int, target_path: str
+    ) -> jnp.ndarray:
+        """Build channel-to-block index for head_dim-padded projections.
+
+        Maps each padded output channel back to the correct block in the
+        checkpoint's uniform 2D scale.
+        """
+        hd_orig = self.head_dim_original
+        hd_padded = hd_orig + self.head_dim_pad
+        block_size = 128
+
+        if "q_proj" in target_path:
+            n_heads = self.num_heads
+        elif "k_proj" in target_path:
+            n_heads = self.num_kv_heads
+        else:
+            n_heads = n_out_padded // hd_padded
+
+        mapping = np.empty(n_out_padded, dtype=np.int32)
+        for c in range(n_out_padded):
+            head_idx = c // hd_padded
+            offset = c % hd_padded
+            if offset < hd_orig:
+                orig_ch = head_idx * hd_orig + offset
+            else:
+                orig_ch = head_idx * hd_orig + hd_orig - 1
+            mapping[c] = orig_ch // block_size
+
+        logger.info(
+            "Built head_dim channel_to_block for %s: %d heads, %d→%d head_dim, %d blocks → %d channels",
+            target_path, n_heads, hd_orig, hd_padded, out_blocks, n_out_padded,
+        )
+        return jnp.array(mapping, dtype=jnp.int32)
 
     def _apply_single_head_dim_padding(self, weight: jax.Array, hf_key: str) -> jax.Array:
         """Pad head_dim for individual projection weights (not merged QKV).
