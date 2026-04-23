@@ -1497,6 +1497,8 @@ class WeightLoader:
             processed_weight = jnp.repeat(processed_weight, times, axis=axis)
         if mapping.kv_head_padding:
             processed_weight = self._apply_kv_head_padding(processed_weight, hf_key)
+        if mapping.head_dim_padding and self.head_dim_pad > 0:
+            processed_weight = self._apply_single_head_dim_padding(processed_weight, hf_key)
 
         sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
 
@@ -1542,17 +1544,9 @@ class WeightLoader:
             v_bias = weight[q_dim + kv_dim : q_dim + 2 * kv_dim]
 
             if mapping.head_dim_padding and self.head_dim_pad > 0:
-                q_bias = jnp.reshape(q_bias, (self.num_heads, self.head_dim_original))
-                q_bias = jnp.pad(q_bias, ((0, 0), (0, self.head_dim_pad)))
-                q_bias = jnp.reshape(q_bias, (self.num_heads * self.head_dim,))
-
-                k_bias = jnp.reshape(k_bias, (self.num_kv_heads, self.head_dim_original))
-                k_bias = jnp.pad(k_bias, ((0, 0), (0, self.head_dim_pad)))
-                k_bias = jnp.reshape(k_bias, (self.num_kv_heads * self.head_dim,))
-
-                v_bias = jnp.reshape(v_bias, (self.num_kv_heads, self.head_dim_original))
-                v_bias = jnp.pad(v_bias, ((0, 0), (0, self.head_dim_pad)))
-                v_bias = jnp.reshape(v_bias, (self.num_kv_heads * self.head_dim,))
+                q_bias = self._apply_single_head_dim_padding(q_bias, hf_key)
+                k_bias = self._apply_single_head_dim_padding(k_bias, hf_key)
+                v_bias = self._apply_single_head_dim_padding(v_bias, hf_key)
 
             splits = [q_bias, k_bias, v_bias]
         else:
@@ -1569,60 +1563,9 @@ class WeightLoader:
                 v_weight = weight[q_dim + kv_dim : q_dim + 2 * kv_dim, :]
 
             if mapping.head_dim_padding and self.head_dim_pad > 0:
-                if mapping.transpose:
-                    q_weight = jnp.reshape(
-                        q_weight,
-                        (self.hidden_size, self.num_heads, self.head_dim_original),
-                    )
-                    q_weight = jnp.pad(q_weight, ((0, 0), (0, 0), (0, self.head_dim_pad)))
-                    q_weight = jnp.reshape(
-                        q_weight, (self.hidden_size, self.num_heads * self.head_dim)
-                    )
-
-                    k_weight = jnp.reshape(
-                        k_weight,
-                        (self.hidden_size, self.num_kv_heads, self.head_dim_original),
-                    )
-                    k_weight = jnp.pad(k_weight, ((0, 0), (0, 0), (0, self.head_dim_pad)))
-                    k_weight = jnp.reshape(
-                        k_weight, (self.hidden_size, self.num_kv_heads * self.head_dim)
-                    )
-
-                    v_weight = jnp.reshape(
-                        v_weight,
-                        (self.hidden_size, self.num_kv_heads, self.head_dim_original),
-                    )
-                    v_weight = jnp.pad(v_weight, ((0, 0), (0, 0), (0, self.head_dim_pad)))
-                    v_weight = jnp.reshape(
-                        v_weight, (self.hidden_size, self.num_kv_heads * self.head_dim)
-                    )
-                else:
-                    q_weight = jnp.reshape(
-                        q_weight,
-                        (self.num_heads, self.head_dim_original, self.hidden_size),
-                    )
-                    q_weight = jnp.pad(q_weight, ((0, 0), (0, self.head_dim_pad), (0, 0)))
-                    q_weight = jnp.reshape(
-                        q_weight, (self.num_heads * self.head_dim, self.hidden_size)
-                    )
-
-                    k_weight = jnp.reshape(
-                        k_weight,
-                        (self.num_kv_heads, self.head_dim_original, self.hidden_size),
-                    )
-                    k_weight = jnp.pad(k_weight, ((0, 0), (0, self.head_dim_pad), (0, 0)))
-                    k_weight = jnp.reshape(
-                        k_weight, (self.num_kv_heads * self.head_dim, self.hidden_size)
-                    )
-
-                    v_weight = jnp.reshape(
-                        v_weight,
-                        (self.num_kv_heads, self.head_dim_original, self.hidden_size),
-                    )
-                    v_weight = jnp.pad(v_weight, ((0, 0), (0, self.head_dim_pad), (0, 0)))
-                    v_weight = jnp.reshape(
-                        v_weight, (self.num_kv_heads * self.head_dim, self.hidden_size)
-                    )
+                q_weight = self._apply_single_head_dim_padding(q_weight, hf_key)
+                k_weight = self._apply_single_head_dim_padding(k_weight, hf_key)
+                v_weight = self._apply_single_head_dim_padding(v_weight, hf_key)
 
             splits = [q_weight, k_weight, v_weight]
 
@@ -1671,6 +1614,39 @@ class WeightLoader:
                     raise ValueError(f"{path} is not a valid param path")
 
         return current_level
+
+    def _apply_single_head_dim_padding(self, weight: jax.Array, hf_key: str) -> jax.Array:
+        """Pad head_dim for individual projection weights (not merged QKV).
+
+        Detects which axis contains the head dimensions by checking divisibility
+        by head_dim_original and matching the quotient against known head counts.
+        """
+        hd = self.head_dim_original
+        pad = self.head_dim_pad
+        hd_new = hd + pad
+
+        for axis in range(weight.ndim):
+            dim = weight.shape[axis]
+            if dim % hd != 0:
+                continue
+            n_heads = dim // hd
+            if n_heads not in (self.num_heads, self.num_kv_heads):
+                continue
+
+            pre_shape = weight.shape[:axis]
+            post_shape = weight.shape[axis + 1 :]
+            weight = weight.reshape(*pre_shape, n_heads, hd, *post_shape)
+            pad_widths = [(0, 0)] * weight.ndim
+            pad_widths[axis + 1] = (0, pad)
+            weight = jnp.pad(weight, pad_widths)
+            weight = weight.reshape(*pre_shape, n_heads * hd_new, *post_shape)
+            logger.info(
+                "Applied head_dim padding for %s: axis=%d, %d heads × %d→%d",
+                hf_key, axis, n_heads, hd, hd_new,
+            )
+            return weight
+
+        return weight
 
     def _apply_kv_head_padding(self, weight: jax.Array, hf_key: str) -> jax.Array:
         """Apply KV head padding/replication when tp_size > total_kv_heads.
