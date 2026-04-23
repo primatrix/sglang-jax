@@ -145,6 +145,12 @@ class WeightLoader:
             )
             if self.swa_num_kv_heads is None:
                 self.swa_num_kv_heads = self.num_kv_heads
+
+            self.target_kv_heads = model_config.num_key_value_heads
+            self.target_swa_kv_heads = getattr(
+                model_config.hf_text_config, "swa_num_key_value_heads",
+                self.target_kv_heads,
+            )
         if hasattr(self.mesh, "shape") and "tensor" in self.mesh.shape:
             self.sharding_size = self.mesh.shape["tensor"]
         else:
@@ -1652,6 +1658,12 @@ class WeightLoader:
             return self.swa_num_kv_heads
         return self.num_kv_heads
 
+    def _get_target_kv_heads(self, hf_key: str) -> int:
+        m = self._LAYER_IDX_RE.search(hf_key)
+        if m is not None and self._is_swa_layer(int(m.group(1))):
+            return self.target_swa_kv_heads
+        return self.target_kv_heads
+
     def _build_head_dim_channel_to_block(
         self, n_out_padded: int, out_blocks: int, target_path: str
     ) -> jnp.ndarray:
@@ -1747,12 +1759,13 @@ class WeightLoader:
         if not any(proj in hf_key for proj in ["k_proj", "v_proj"]):
             return weight
 
-        total_kv_heads = self._get_effective_kv_heads(hf_key)
+        original_kv_heads = self._get_effective_kv_heads(hf_key)
+        target_kv_heads = self._get_target_kv_heads(hf_key)
 
-        if self.sharding_size <= total_kv_heads:
+        if target_kv_heads <= original_kv_heads:
             return weight
 
-        num_replicas = (self.sharding_size + total_kv_heads - 1) // total_kv_heads
+        num_replicas = target_kv_heads // original_kv_heads
         padding_strategy = self.model_config.get_kv_padding_strategy()
 
         target_axis = -1
@@ -1761,28 +1774,28 @@ class WeightLoader:
         is_v_proj = "v_proj" in hf_key
 
         dim0 = weight.shape[0]
-        if dim0 == total_kv_heads:
+        if dim0 == original_kv_heads:
             target_axis = 0
             step_size = 1
-        elif is_v_proj and self.v_head_dim != self.head_dim and dim0 == total_kv_heads * self.v_head_dim:
+        elif is_v_proj and self.v_head_dim != self.head_dim and dim0 == original_kv_heads * self.v_head_dim:
             target_axis = 0
             step_size = self.v_head_dim
-        elif dim0 == total_kv_heads * self.head_dim:
+        elif dim0 == original_kv_heads * self.head_dim:
             target_axis = 0
             step_size = self.head_dim
-        elif self.head_dim_pad > 0 and dim0 == total_kv_heads * padded_hd:
+        elif self.head_dim_pad > 0 and dim0 == original_kv_heads * padded_hd:
             target_axis = 0
             step_size = padded_hd
 
         if target_axis == -1 and weight.ndim > 1:
             dim1 = weight.shape[1]
-            if is_v_proj and self.v_head_dim != self.head_dim and dim1 == total_kv_heads * self.v_head_dim:
+            if is_v_proj and self.v_head_dim != self.head_dim and dim1 == original_kv_heads * self.v_head_dim:
                 target_axis = 1
                 step_size = self.v_head_dim
-            elif dim1 == total_kv_heads * self.head_dim:
+            elif dim1 == original_kv_heads * self.head_dim:
                 target_axis = 1
                 step_size = self.head_dim
-            elif self.head_dim_pad > 0 and dim1 == total_kv_heads * padded_hd:
+            elif self.head_dim_pad > 0 and dim1 == original_kv_heads * padded_hd:
                 target_axis = 1
                 step_size = padded_hd
 
@@ -1792,7 +1805,7 @@ class WeightLoader:
         if padding_strategy == "replicate":
             replicated_parts = []
 
-            for original_head_id in range(total_kv_heads):
+            for original_head_id in range(original_kv_heads):
                 start = original_head_id * step_size
                 end = (original_head_id + 1) * step_size
 
@@ -1804,7 +1817,7 @@ class WeightLoader:
             weight = jnp.concatenate(replicated_parts, axis=target_axis)
 
         elif padding_strategy == "zero":
-            target_heads_total = total_kv_heads * num_replicas
+            target_heads_total = original_kv_heads * num_replicas
 
             if step_size == 1:
                 target_len = target_heads_total

@@ -226,7 +226,7 @@ def should_use_blockwise_kernel(
     (for example local N=128 with block_size_out=128), the TPU blockwise
     kernel can produce NaNs on Qwen3-MoE k/v projections.
     """
-    return out_dim >= block_size_out
+    return out_dim > block_size_out
 
 
 def expand_block_scale(

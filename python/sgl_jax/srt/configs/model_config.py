@@ -474,6 +474,8 @@ class ModelConfig:
             if not hasattr(self, "_original_hf_num_key_value_heads"):
                 self._original_hf_num_key_value_heads = self.hf_text_config.num_attention_heads
 
+        kv_heads_per_device = self._bump_kv_heads_for_v_head_dim(kv_heads_per_device)
+
         # CRITICAL: Set to TOTAL count for global sharding
         # JAX tensor parallel will automatically shard this across devices
         total_kv_heads = kv_heads_per_device * tensor_parallel_size
@@ -495,9 +497,33 @@ class ModelConfig:
             swa_kv_heads_per_device = get_num_kv_heads_by_tp(
                 self._original_swa_num_key_value_heads, tensor_parallel_size
             )
+            swa_kv_heads_per_device = self._bump_kv_heads_for_v_head_dim(
+                swa_kv_heads_per_device, swa=True
+            )
             self.hf_text_config.swa_num_key_value_heads = (
                 swa_kv_heads_per_device * tensor_parallel_size
             )
+
+    def _bump_kv_heads_for_v_head_dim(self, kv_heads_per_device: int, swa: bool = False) -> int:
+        """Ensure per-shard v_proj out_dim exceeds the blockwise kernel block_size.
+
+        When v_head_dim equals block_size_out (e.g. both 128), a single KV head
+        per device makes out_dim == block_size_out, which triggers NaN-producing
+        edge cases in the TPU blockwise kernel.  Doubling the per-device head
+        count forces out_dim > block_size_out.
+        """
+        v_hd_attr = "swa_v_head_dim" if swa else "v_head_dim"
+        v_head_dim = getattr(self.hf_text_config, v_hd_attr, None)
+        if v_head_dim is None:
+            return kv_heads_per_device
+        quant_cfg = getattr(self, "quantization_config", None)
+        weight_block_size = getattr(quant_cfg, "weight_block_size", None)
+        if not (isinstance(weight_block_size, (list, tuple)) and len(weight_block_size) >= 1):
+            return kv_heads_per_device
+        block_size_out = int(weight_block_size[0])
+        while kv_heads_per_device * v_head_dim <= block_size_out:
+            kv_heads_per_device *= 2
+        return kv_heads_per_device
 
     def get_original_kv_head_id(self, tp_rank: int, tensor_parallel_size: int) -> int:
         """Determine which original KV head this device should use."""
