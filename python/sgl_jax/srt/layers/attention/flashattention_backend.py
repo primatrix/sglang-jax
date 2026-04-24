@@ -511,6 +511,7 @@ class FlashAttention(AttentionBackend):
                 xai_temperature_len=(
                     layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
                 ),
+                out_dtype=jnp.float32,
             )
 
             return result, updated_kv_cache_fused
