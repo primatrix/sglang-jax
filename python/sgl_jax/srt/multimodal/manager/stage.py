@@ -84,24 +84,51 @@ class Stage:
         runtime = stage_config.runtime
         device_kind = getattr(runtime, "device_kind", "tpu")
         num_devices = runtime.num_tpus
+        use_ar_dp_mesh = (
+            stage_config.scheduler == "auto_regressive"
+            and server_args.dp_size > 1
+            and server_args.tp_size >= server_args.dp_size
+        )
+        if use_ar_dp_mesh:
+            if server_args.tp_size % server_args.dp_size != 0:
+                raise RuntimeError(
+                    "auto_regressive multimodal DP requires tp_size to be divisible by dp_size, "
+                    f"got tp_size={server_args.tp_size}, dp_size={server_args.dp_size}."
+                )
+            num_devices = server_args.tp_size
         if device_kind == "cpu":
             cpu_devices = jax.devices("cpu")
             if num_devices > len(cpu_devices):
                 raise RuntimeError(
                     f"Requested {num_devices} CPU devices, but only {len(cpu_devices)} available."
                 )
-            self.mesh = create_device_mesh(
-                ici_parallelism=[-1, num_devices],
-                dcn_parallelism=[1, 1],
-                devices=cpu_devices[:num_devices],
-            )
+            if use_ar_dp_mesh:
+                self.mesh = create_device_mesh(
+                    ici_parallelism=[server_args.dp_size, num_devices // server_args.dp_size],
+                    dcn_parallelism=[1, 1],
+                    devices=cpu_devices[:num_devices],
+                )
+            else:
+                self.mesh = create_device_mesh(
+                    ici_parallelism=[-1, num_devices],
+                    dcn_parallelism=[1, 1],
+                    devices=cpu_devices[:num_devices],
+                )
         else:
             # this parallelism setting is accord to stage config
-            self.mesh = create_device_mesh(
-                ici_parallelism=[-1, num_devices],
-                dcn_parallelism=[1, 1],
-                device_indexes=device_manager.allocate(num_devices),
-            )
+            device_indexes = device_manager.allocate(num_devices)
+            if use_ar_dp_mesh:
+                self.mesh = create_device_mesh(
+                    ici_parallelism=[server_args.dp_size, num_devices // server_args.dp_size],
+                    dcn_parallelism=[1, 1],
+                    device_indexes=device_indexes,
+                )
+            else:
+                self.mesh = create_device_mesh(
+                    ici_parallelism=[-1, num_devices],
+                    dcn_parallelism=[1, 1],
+                    device_indexes=device_indexes,
+                )
         self.stage_config = stage_config
         self.server_args = server_args
         self.stage_id = stage_config.stage_id
