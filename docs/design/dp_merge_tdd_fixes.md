@@ -219,3 +219,8 @@ Result:
   - `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_dp_sampler_regressions.py::TestDPSamplerRegressions::test_retract_decode_aborts_single_oom_request python/sgl_jax/test/test_dp_sampler_regressions.py::TestDPSamplerRegressions::test_scheduler_update_running_batch_sends_abort_req -q` passed.
   - `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_dp_sampler_regressions.py -q` passed.
   - `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_mixed_chunk_dp.py -q` passed.
+- TPU verification after fix:
+  - On `tpu7x-multi-slice-4-job-xz-0-wr6rk`, synced `/sglang-jax` to commit `7a4757b0`.
+  - `source /tmp/tpu_logs/venv/bin/activate && PYTHONPATH=python python -m unittest sgl_jax.test.test_dp_sampler_regressions -v` passed.
+  - `source /tmp/tpu_logs/venv/bin/activate && PYTHONPATH=python python -m unittest sgl_jax.test.test_sampler -v` passed.
+  - `source /tmp/tpu_logs/venv/bin/activate && PYTHONPATH=python python -m unittest sgl_jax.test.test_mixed_chunk_dp -v` passed.
