@@ -420,8 +420,11 @@ class WeightLoader:
         within a shard can span K/V boundaries. We must dequantize per-shard first,
         then extract Q/K/V from each shard.
 
+        All dequant math runs on CPU (numpy) to avoid TPU OOM.  Only the final
+        bf16 result is ``device_put`` to TPU with TP sharding.
+
         Args:
-            fused_qkv_buffers: dict mapping layer_idx -> {"weight": ..., "scale": ...}
+            fused_qkv_buffers: dict mapping layer_idx -> {"weight": np.ndarray, "scale": np.ndarray}
             layers: model.layers list
             config: model config with head_dim, v_head_dim, num_attention_heads, etc.
         """
@@ -438,10 +441,12 @@ class WeightLoader:
         quant_cfg = getattr(config, "quantization_config", None)
         block_size = int(quant_cfg.weight_block_size[0]) if quant_cfg else 128
 
+        tp_sharding = NamedSharding(self.mesh, P(None, "tensor"))
+
         for layer_idx in sorted(fused_qkv_buffers.keys()):
             buf = fused_qkv_buffers[layer_idx]
-            fused_weight = buf["weight"]  # [total_qkv, hidden], FP8, HF layout
-            fused_scale = buf["scale"]  # [total_blocks, in_blocks], f32
+            fused_weight = buf["weight"]  # numpy, [total_qkv, hidden], FP8
+            fused_scale = buf["scale"]  # numpy, [total_blocks, in_blocks], f32
 
             in_dim = fused_weight.shape[1]  # hidden_size
 
@@ -466,7 +471,7 @@ class WeightLoader:
 
             if layer_idx % 10 == 0:
                 logger.info(
-                    "Layer %d: dequant fused QKV FP8, n_shards=%d, "
+                    "Layer %d: dequant fused QKV FP8 (CPU), n_shards=%d, "
                     "per_shard=%d (Q=%d K=%d V=%d), blocks=%d",
                     layer_idx,
                     n_shards,
@@ -480,7 +485,7 @@ class WeightLoader:
             q_parts, k_parts, v_parts = [], [], []
 
             for shard_idx in range(n_shards):
-                # Extract this shard's weight and scale
+                # Extract this shard's weight and scale (numpy slicing)
                 w_start = shard_idx * per_shard_total
                 shard_w = fused_weight[w_start : w_start + per_shard_total, :]
 
@@ -489,63 +494,58 @@ class WeightLoader:
 
                 # Pad weight rows to block boundary for dequant
                 if per_shard_total < padded_rows:
-                    shard_w = jnp.pad(shard_w, ((0, padded_rows - per_shard_total), (0, 0)))
+                    shard_w = np.pad(shard_w, ((0, padded_rows - per_shard_total), (0, 0)))
 
-                # Block dequantize: [padded_rows, in_dim] × [blocks, in_blocks]
-                shard_f = shard_w.astype(jnp.float32).reshape(
+                # Block dequantize on CPU: [padded_rows, in_dim] × [blocks, in_blocks]
+                shard_f = shard_w.astype(np.float32).reshape(
                     per_shard_blocks, block_size, in_blocks, block_size
                 )
                 shard_s_4d = shard_s[:, None, :, None]
-                shard_bf16 = (
-                    (shard_f * shard_s_4d)
-                    .reshape(padded_rows, in_dim)[:per_shard_total, :]
-                    .astype(jnp.bfloat16)
-                )
+                shard_dequant = (shard_f * shard_s_4d).reshape(padded_rows, in_dim)[
+                    :per_shard_total, :
+                ]
 
-                # Split shard into Q, K, V (contiguous within each shard)
-                q_parts.append(shard_bf16[:per_shard_q, :])
-                k_parts.append(shard_bf16[per_shard_q : per_shard_q + per_shard_k, :])
-                v_parts.append(shard_bf16[per_shard_q + per_shard_k :, :])
+                # Split into Q, K, V and transpose to model layout [in, out_shard].
+                # .T is O(1) numpy view; .copy() releases the shard_dequant reference.
+                q_parts.append(shard_dequant[:per_shard_q, :].T.copy())
+                k_parts.append(shard_dequant[per_shard_q : per_shard_q + per_shard_k, :].T.copy())
+                v_parts.append(shard_dequant[per_shard_q + per_shard_k :, :].T.copy())
 
-            # Concatenate across shards → full Q/K/V in HF layout [out, in]
-            q_weight = jnp.concatenate(q_parts, axis=0)
-            k_weight = jnp.concatenate(k_parts, axis=0)
-            v_weight = jnp.concatenate(v_parts, axis=0)
+            # Free CPU buffers for this layer
+            del buf["weight"], buf["scale"]
 
-            # Transpose to model layout [in, out] and shard
-            q_weight = jnp.transpose(q_weight)
-            k_weight = jnp.transpose(k_weight)
-            v_weight = jnp.transpose(v_weight)
-
-            tp_sharding = NamedSharding(self.mesh, P(None, "tensor"))
-            q_weight = jax.device_put(q_weight, tp_sharding)
-            k_weight = jax.device_put(k_weight, tp_sharding)
-            v_weight = jax.device_put(v_weight, tp_sharding)
-
-            # Replace QuantizedLinear with bf16 LinearBase
+            # Concat on CPU, convert to bf16, device_put sharded to TPU.
+            # Process Q/K/V sequentially to limit peak CPU memory.
             attn = layers[layer_idx].self_attn
-            for proj_name, w in [
-                ("q_proj", q_weight),
-                ("k_proj", k_weight),
-                ("v_proj", v_weight),
+            for proj_name, parts in [
+                ("q_proj", q_parts),
+                ("k_proj", k_parts),
+                ("v_proj", v_parts),
             ]:
+                merged = np.concatenate(parts, axis=1).astype(ml_dtypes.bfloat16)
+                del parts[:]
+                weight = jax.device_put(jnp.array(merged), tp_sharding)
+                del merged
                 setattr(
                     attn,
                     proj_name,
-                    self.create_bf16_linear(w, (None, "tensor"), self.mesh),
+                    self.create_bf16_linear(weight, (None, "tensor"), self.mesh),
                 )
 
             if layer_idx == 0:
+                q_w = attn.q_proj.weight.value
+                k_w = attn.k_proj.weight.value
+                v_w = attn.v_proj.weight.value
                 logger.info(
                     "Layer 0 dequant result: Q=%s K=%s V=%s",
-                    q_weight.shape,
-                    k_weight.shape,
-                    v_weight.shape,
+                    q_w.shape,
+                    k_w.shape,
+                    v_w.shape,
                 )
 
         # Clean up buffers
         fused_qkv_buffers.clear()
-        logger.info("Fused QKV FP8 dequantization complete for all layers.")
+        logger.info("Fused QKV FP8 dequantization complete (CPU numpy path).")
 
     @staticmethod
     def _infer_qkv_shards(
@@ -2315,12 +2315,16 @@ class WeightLoader:
                 is_scale = "SCALE" in jax_path
                 layer_idx = int(jax_path.rsplit("__", 1)[-1])
                 buf = self.model._fused_qkv_buffers.setdefault(layer_idx, {})
-                buf["scale" if is_scale else "weight"] = processed_weight
+                # Store as numpy on CPU to avoid consuming TPU HBM.
+                # Each host computes identical dequant results from the same
+                # safetensor data; jax.device_put at the end handles sharding.
+                np_weight = np.asarray(processed_weight)
+                buf["scale" if is_scale else "weight"] = np_weight
                 logger.info(
-                    "Stored fused QKV %s for layer %d, shape=%s",
+                    "Stored fused QKV %s for layer %d, shape=%s (CPU numpy)",
                     "scale" if is_scale else "weight",
                     layer_idx,
-                    processed_weight.shape,
+                    np_weight.shape,
                 )
             return
 
