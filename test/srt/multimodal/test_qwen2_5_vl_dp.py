@@ -17,6 +17,21 @@ from sgl_jax.test.test_utils import (
 headers = {"Content-Type": "application/json"}
 
 
+def _resolve_qwen2_5_vl_model() -> str:
+    env_model = os.environ.get("SGLANG_JAX_QWEN2_5_VL_MODEL")
+    if env_model:
+        return env_model
+
+    for model_path in (
+        "/models/Qwen/Qwen2.5-VL-3B-Instruct",
+        "/models/Qwen2.5-VL-3B-Instruct",
+    ):
+        if os.path.exists(model_path):
+            return model_path
+
+    return "Qwen/Qwen2.5-VL-3B-Instruct"
+
+
 def _solid_color_png_data_uri(color: tuple[int, int, int]) -> str:
     image = Image.new("RGB", (64, 64), color)
     buf = io.BytesIO()
@@ -28,10 +43,7 @@ def _solid_color_png_data_uri(color: tuple[int, int, int]) -> str:
 class TestQwen25VLDP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = os.environ.get(
-            "SGLANG_JAX_QWEN2_5_VL_MODEL",
-            "/models/Qwen2.5-VL-3B-Instruct",
-        )
+        cls.model = _resolve_qwen2_5_vl_model()
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,

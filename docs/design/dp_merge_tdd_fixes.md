@@ -354,7 +354,7 @@ TDD plan:
 Test added:
 
 - `test/srt/multimodal/test_qwen2_5_vl_dp.py`
-- Model: `/models/Qwen2.5-VL-3B-Instruct`, downloaded from `Qwen/Qwen2.5-VL-3B-Instruct`.
+- Model: `SGLANG_JAX_QWEN2_5_VL_MODEL` when set; otherwise existing `/models/Qwen/Qwen2.5-VL-3B-Instruct` or `/models/Qwen2.5-VL-3B-Instruct`; otherwise `Qwen/Qwen2.5-VL-3B-Instruct`.
 - Request: `/v1/chat/completions` with a generated red PNG data URI and prompt `What color is this image? Answer with one word.`
 
 Failures observed before fixes:
@@ -419,6 +419,7 @@ Fixes:
   - `test/srt/multimodal/test_qwen2_5_vl_dp.py` in `e2e-test-tpu-v6e-4`.
 - `.github/workflows/pr-test.yml` installs `python[all,qwen-vl]` for the v6e-4 e2e job.
 - `python/pyproject.toml` adds a `qwen-vl` extra for `qwen-vl-utils`, `torch`, and `torchvision`.
+- `test_qwen2_5_vl_dp.py` now resolves the model path in this order: explicit `SGLANG_JAX_QWEN2_5_VL_MODEL`, existing `/models/Qwen/...`, existing flat `/models/...`, then the HF repo ID.
 
 Local verification after implementation:
 
