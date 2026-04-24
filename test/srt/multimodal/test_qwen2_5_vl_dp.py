@@ -109,7 +109,7 @@ class TestQwen25VLDP(CustomTestCase):
             json=data,
             timeout=1200,
         )
-        response.raise_for_status()
+        self.assertEqual(response.status_code, 200, response.text)
         result = response.json()
         content = result["choices"][0]["message"]["content"].lower()
         self.assertIn("red", content)
