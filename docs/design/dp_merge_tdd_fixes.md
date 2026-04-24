@@ -251,3 +251,8 @@ Result:
   - `PYTHONPATH=python python -m compileall -q benchmark/gsm8k/__init__.py benchmark/gsm8k/bench_sglang_jax.py python/sgl_jax/srt/configs/model_config.py python/sgl_jax/srt/layers/attention/mla.py python/sgl_jax/srt/layers/embeddings.py python/sgl_jax/srt/layers/moe.py python/sgl_jax/srt/managers/schedule_batch.py python/sgl_jax/srt/managers/scheduler.py python/sgl_jax/srt/models/deepseek_v3.py python/sgl_jax/srt/models/grok.py` passed.
   - `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_dp_sampler_regressions.py -q` passed.
   - `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_mixed_chunk_dp.py -q` passed.
+- TPU verification after conflict resolution:
+  - On `tpu7x-multi-slice-4-job-xz-0-wr6rk`, synced `/sglang-jax` to commit `d8bb8f11`.
+  - `source /tmp/tpu_logs/venv/bin/activate && PYTHONPATH=python python -m unittest sgl_jax.test.test_dp_sampler_regressions -v` passed.
+  - `source /tmp/tpu_logs/venv/bin/activate && PYTHONPATH=python python -m unittest sgl_jax.test.test_sampler -v` passed.
+  - `source /tmp/tpu_logs/venv/bin/activate && PYTHONPATH=python python -m unittest sgl_jax.test.test_mixed_chunk_dp -v` passed.
