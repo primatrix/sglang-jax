@@ -10,7 +10,9 @@ from unittest.mock import MagicMock
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh
+from flax import nnx
+from jax.sharding import AxisType, Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 if importlib.util.find_spec("llguidance") is None:
     llguidance_stub = types.ModuleType("llguidance")
@@ -34,7 +36,8 @@ if importlib.util.find_spec("setproctitle") is None:
     setproctitle_stub.setproctitle = lambda *args, **kwargs: None
     sys.modules["setproctitle"] = setproctitle_stub
 
-from sgl_jax.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
+from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
+from sgl_jax.srt.layers.sampler import Sampler, get_token_ids_logprobs, get_top_logprobs
 from sgl_jax.srt.managers.io_struct import AbortReq
 from sgl_jax.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -47,7 +50,7 @@ from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
-from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingMetadata
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -59,19 +62,114 @@ class TestDPSamplerRegressions(unittest.TestCase):
         batch_size: int,
         need_min_p_sampling: bool = False,
         min_p: float = 0.0,
+        top_k: int = 1,
+        top_p: float = 1.0,
+        is_all_greedy: bool = False,
         vocab_size: int = 16,
         linear_penalty: np.ndarray | None = None,
+        sampling_seeds: np.ndarray | None = None,
     ) -> SamplingBatchInfo:
         return SamplingBatchInfo(
             temperatures=np.ones((batch_size, 1), dtype=np.float32),
-            top_ps=np.ones(batch_size, dtype=np.float32),
-            top_ks=np.ones(batch_size, dtype=np.int32),
+            top_ps=np.full(batch_size, top_p, dtype=np.float32),
+            top_ks=np.full(batch_size, top_k, dtype=np.int32),
             min_ps=np.full(batch_size, min_p, dtype=np.float32),
             vocab_size=vocab_size,
-            is_all_greedy=False,
+            is_all_greedy=is_all_greedy,
             need_min_p_sampling=need_min_p_sampling,
             linear_penalty=linear_penalty,
+            sampling_seeds=sampling_seeds,
         )
+
+    def _mesh(self):
+        return Mesh(
+            np.array(jax.devices()[:1]).reshape(1, 1),
+            ("data", "tensor"),
+            axis_types=(AxisType.Explicit, AxisType.Explicit),
+        )
+
+    def _make_dp_decode_batch(
+        self,
+        *,
+        req,
+        sampling_info: SamplingBatchInfo,
+        vocab_size: int,
+        return_logprob: bool = False,
+        top_logprobs_num: int = 0,
+        token_ids_logprob: list[int] | None = None,
+    ) -> ScheduleBatch:
+        return ScheduleBatch(
+            dp_size=2,
+            has_grammar=False,
+            forward_mode=ForwardMode.DECODE,
+            return_logprob=return_logprob,
+            return_output_logprob_only=False,
+            return_hidden_states=False,
+            launch_done=None,
+            spec_algorithm=None,
+            reqs_info=[
+                ScheduleReqsInfo(
+                    reqs=[],
+                    input_ids=np.array([], dtype=np.int32),
+                    req_pool_indices=np.array([], dtype=np.int32),
+                    seq_lens=np.array([], dtype=np.int32),
+                    out_cache_loc=np.array([], dtype=np.int32),
+                    sampling_info=None,
+                ),
+                ScheduleReqsInfo(
+                    reqs=[req],
+                    input_ids=np.array([7], dtype=np.int32),
+                    req_pool_indices=np.array([0], dtype=np.int32),
+                    seq_lens=np.array([3], dtype=np.int32),
+                    out_cache_loc=np.array([2], dtype=np.int32),
+                    sampling_info=sampling_info,
+                    top_logprobs_nums=[top_logprobs_num],
+                    token_ids_logprobs=[token_ids_logprob],
+                ),
+            ],
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=np.arange(16, dtype=np.int32).reshape(1, 16)
+            ),
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=1),
+            tree_cache=None,
+            model_config=SimpleNamespace(vocab_size=vocab_size),
+        )
+
+    def _model_worker_batch_for_sampler(self, batch: ScheduleBatch):
+        return batch.get_model_worker_batch(
+            token_paddings=[4],
+            bs_paddings=[4],
+            cache_loc_paddings=[8],
+            page_size=1,
+        )
+
+    def _sample_next_tokens(
+        self,
+        batch: ScheduleBatch,
+        logits: np.ndarray,
+        *,
+        vocab_size: int,
+        use_sort_for_toppk_minp: bool = True,
+    ):
+        mesh = self._mesh()
+        model_worker_batch = self._model_worker_batch_for_sampler(batch)
+        sampling_metadata = SamplingMetadata.from_model_worker_batch(
+            model_worker_batch,
+            mesh=mesh,
+            vocab_size=vocab_size,
+        )
+        sharded_logits = jax.device_put(
+            jnp.asarray(logits, dtype=jnp.float32),
+            NamedSharding(mesh, P("data", "tensor")),
+        )
+        sampler = Sampler(rngs=nnx.Rngs(params=0), mesh=mesh)
+        next_token_ids, _, logits_output = sampler(
+            LogitsProcessorOutput(next_token_logits=sharded_logits),
+            sampling_metadata,
+            use_sort_for_toppk_minp,
+            rng_override=jax.random.PRNGKey(0),
+        )
+        return model_worker_batch, sampling_metadata, next_token_ids, logits_output
 
     def test_merge_sampling_info_preserves_min_p_flag(self):
         batch = ScheduleBatch(
@@ -102,6 +200,45 @@ class TestDPSamplerRegressions(unittest.TestCase):
             merged.min_ps,
             np.array([0.0, 0.0, 0.2, 0.0], dtype=np.float32),
         )
+
+    def test_dp_min_p_changes_sampled_token_after_model_worker_conversion(self):
+        def sample_with_min_p_flag(need_min_p_sampling: bool):
+            req = SimpleNamespace(lora_id="0", grammar=None)
+            sampling_info = self._sampling_info(
+                batch_size=1,
+                need_min_p_sampling=need_min_p_sampling,
+                min_p=0.6,
+                top_k=4,
+                vocab_size=4,
+                sampling_seeds=np.array([1634], dtype=np.int32),
+            )
+            batch = self._make_dp_decode_batch(
+                req=req,
+                sampling_info=sampling_info,
+                vocab_size=4,
+            )
+
+            _, sampling_metadata, next_token_ids, _ = self._sample_next_tokens(
+                batch,
+                np.array(
+                    [
+                        [0.0, 0.0, 0.0, 0.0],
+                        [0.0, 0.0, 0.0, 0.0],
+                        [5.0, 4.5, 0.0, -1.0],
+                        [0.0, 0.0, 0.0, 0.0],
+                    ],
+                    dtype=np.float32,
+                ),
+                vocab_size=4,
+            )
+            return np.asarray(next_token_ids), sampling_metadata
+
+        unfiltered_ids, _ = sample_with_min_p_flag(False)
+        filtered_ids, filtered_metadata = sample_with_min_p_flag(True)
+
+        self.assertEqual(unfiltered_ids[2], 2)
+        self.assertEqual(filtered_ids[2], 0)
+        self.assertTrue(filtered_metadata.need_min_p_sampling)
 
     def test_merge_sampling_info_preserves_linear_penalty_layout(self):
         batch = ScheduleBatch(
@@ -149,6 +286,50 @@ class TestDPSamplerRegressions(unittest.TestCase):
             dtype=np.float32,
         )
         np.testing.assert_array_equal(merged.linear_penalty, expected)
+
+    def test_dp_linear_penalty_changes_greedy_token_after_model_worker_conversion(self):
+        req = SimpleNamespace(lora_id="0", grammar=None)
+        sampling_info = self._sampling_info(
+            batch_size=1,
+            vocab_size=3,
+            top_k=1,
+            is_all_greedy=True,
+            linear_penalty=np.array([[-3.0, 0.0, 0.0]], dtype=np.float32),
+        )
+        batch = self._make_dp_decode_batch(
+            req=req,
+            sampling_info=sampling_info,
+            vocab_size=3,
+            return_logprob=True,
+            top_logprobs_num=2,
+            token_ids_logprob=[0, 1],
+        )
+
+        _, _, next_token_ids, logits_output = self._sample_next_tokens(
+            batch,
+            np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                    [5.0, 4.0, 1.0],
+                    [0.0, 0.0, 0.0],
+                ],
+                dtype=np.float32,
+            ),
+            vocab_size=3,
+        )
+
+        expected_logprobs = jax.nn.log_softmax(jnp.array([2.0, 4.0, 1.0]))
+        self.assertEqual(np.asarray(next_token_ids)[2], 1)
+        np.testing.assert_allclose(
+            np.asarray(logits_output.next_token_logprobs)[2],
+            np.asarray(expected_logprobs)[1],
+            rtol=1e-6,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(logits_output.next_token_top_logprobs_idx)[2],
+            np.array([1, 0], dtype=np.int32),
+        )
 
     def test_merge_sampling_info_materializes_penalty_orchestrator(self):
         class FakePenalizerOrchestrator:
@@ -204,6 +385,104 @@ class TestDPSamplerRegressions(unittest.TestCase):
         sampling_info.update_penalties()
 
         np.testing.assert_array_equal(sampling_info.linear_penalty, linear_penalty)
+
+    def test_dp_sampler_logprobs_are_returned_to_request_in_padded_layout(self):
+        class FakeReq:
+            def __init__(self):
+                self.lora_id = "0"
+                self.grammar = None
+                self.is_retracted = False
+                self.output_ids = []
+                self.return_output_logprob_only = False
+                self.return_logprob = True
+                self.output_token_logprobs_val = []
+                self.output_token_logprobs_idx = []
+                self.output_top_logprobs_val = []
+                self.output_top_logprobs_idx = []
+                self.output_token_ids_logprobs_val = []
+                self.output_token_ids_logprobs_idx = []
+                self.top_logprobs_num = 2
+                self.token_ids_logprob = [0, 2]
+                self.return_hidden_states = False
+                self.latest_bid = None
+
+            def check_finished(self, new_accepted_len=1):
+                return None
+
+            def finished(self):
+                return False
+
+        req = FakeReq()
+        sampling_info = self._sampling_info(
+            batch_size=1,
+            vocab_size=4,
+            top_k=1,
+            is_all_greedy=True,
+        )
+        batch = self._make_dp_decode_batch(
+            req=req,
+            sampling_info=sampling_info,
+            vocab_size=4,
+            return_logprob=True,
+            top_logprobs_num=req.top_logprobs_num,
+            token_ids_logprob=req.token_ids_logprob,
+        )
+        model_worker_batch, _, next_token_ids, logits_output = self._sample_next_tokens(
+            batch,
+            np.array(
+                [
+                    [0.0, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 0.0],
+                    [1.0, 4.0, 3.0, 0.0],
+                    [0.0, 0.0, 0.0, 0.0],
+                ],
+                dtype=np.float32,
+            ),
+            vocab_size=4,
+        )
+
+        scheduler = SimpleNamespace(
+            spec_algorithm=None,
+            num_generated_tokens=0,
+            enable_overlap=False,
+            token_to_kv_pool_allocator=MagicMock(),
+            tree_cache=MagicMock(),
+            forward_ct_decode=0,
+            server_args=SimpleNamespace(decode_log_interval=100),
+            set_next_batch_sampling_info_done=lambda batch: None,
+            stream_output=lambda *args, **kwargs: None,
+            log_decode_stats=lambda *args, **kwargs: None,
+            maybe_collect_routed_experts=lambda req: None,
+        )
+        result = SimpleNamespace(
+            bid=model_worker_batch.bid,
+            next_token_ids=np.asarray(next_token_ids).tolist(),
+            cache_miss_count=0,
+            logits_output=logits_output,
+        )
+
+        SchedulerOutputProcessorMixin.process_batch_result_decode(scheduler, batch, result)
+
+        expected_logprobs = np.asarray(jax.nn.log_softmax(jnp.array([1.0, 4.0, 3.0, 0.0])))
+        self.assertEqual(req.output_ids, [1])
+        self.assertEqual(req.output_token_logprobs_idx, [1])
+        np.testing.assert_allclose(req.output_token_logprobs_val, [expected_logprobs[1]])
+        np.testing.assert_array_equal(
+            np.asarray(req.output_top_logprobs_idx[0]),
+            np.array([1, 2], dtype=np.int32),
+        )
+        np.testing.assert_allclose(
+            np.asarray(req.output_top_logprobs_val[0]),
+            expected_logprobs[[1, 2]],
+        )
+        np.testing.assert_array_equal(
+            np.asarray(req.output_token_ids_logprobs_idx[0]),
+            np.array([0, 2], dtype=np.int32),
+        )
+        np.testing.assert_allclose(
+            np.asarray(req.output_token_ids_logprobs_val[0]),
+            expected_logprobs[[0, 2]],
+        )
 
     def test_retract_decode_aborts_single_oom_request(self):
         req = SimpleNamespace(
