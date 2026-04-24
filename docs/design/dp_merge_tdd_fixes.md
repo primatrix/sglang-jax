@@ -246,6 +246,8 @@ Result:
   - `schedule_batch.py`: also carried over upstream's `tree_cache.disable` handling into the DP `release_req()` path, so disabled radix cache follows the same release behavior as `ChunkCache`.
   - Automatically merged upstream additions from `#941` and `#944`, including DeepSeek V3 related files and model/layer updates.
 - Local verification after conflict resolution:
+  - `git merge-base --is-ancestor upstream/main HEAD` passed after merge commit `bb14f1260`.
+  - `git merge-tree upstream/main HEAD` exited successfully and no longer reported conflicts.
   - `PYTHONPATH=python python -m compileall -q benchmark/gsm8k/__init__.py benchmark/gsm8k/bench_sglang_jax.py python/sgl_jax/srt/configs/model_config.py python/sgl_jax/srt/layers/attention/mla.py python/sgl_jax/srt/layers/embeddings.py python/sgl_jax/srt/layers/moe.py python/sgl_jax/srt/managers/schedule_batch.py python/sgl_jax/srt/managers/scheduler.py python/sgl_jax/srt/models/deepseek_v3.py python/sgl_jax/srt/models/grok.py` passed.
   - `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_dp_sampler_regressions.py -q` passed.
   - `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_mixed_chunk_dp.py -q` passed.
