@@ -71,6 +71,11 @@ multimodal = [
     "qwix",
     "soundfile",
 ]
+qwen-vl = [
+    "qwen-vl-utils",
+    "torch",
+    "torchvision",
+]
 
 [tool.setuptools.packages.find]
 exclude = [

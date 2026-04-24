@@ -458,6 +458,7 @@ suites = {
         TestFile("python/sgl_jax/test/multimodal/test_wan_vae_precision.py", 1),
         TestFile("python/sgl_jax/test/multimodal/test_vae_scheduler.py", 2.5),
         TestFile("python/sgl_jax/test/multimodal/test_flash_attention_kernel.py", 1),
+        TestFile("python/sgl_jax/test/multimodal/test_stage_config_registry.py", 0.1),
         TestFile("python/sgl_jax/test/layers/test_group_rmsnorm.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/layers/test_linear_attention_backend.py", 1, runner="pytest"),
         TestFile(
@@ -551,6 +552,7 @@ suites = {
         TestFile("test/srt/test_server_pause_continue.py", 6),
         TestFile("test/srt/rl/test_return_routed_experts.py", 5),
         TestFile("test/srt/rl/test_multi_engines_in_one_process.py", 5),
+        TestFile("test/srt/multimodal/test_qwen2_5_vl_dp.py", 30),
         # TestFile("test/srt/multimodal/test_wan2_1_models.py", 30),
     ],
 }
