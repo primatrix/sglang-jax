@@ -1064,7 +1064,7 @@ def _ragged_paged_attention_kernel_loop(
                 acc * pl.reciprocal(l, approx=True)
                 if (l.dtype == jnp.float32 and out_dtype != jnp.float32)
                 else lax.div(acc, l)
-            ).astype(out_dtype)
+            ).astype(q_dtype)
 
             # Wait for previous bo to be fully sent before storing new bo.
             bo_sem_idx = sem_ids_ref[2]
