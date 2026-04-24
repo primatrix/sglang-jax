@@ -330,3 +330,54 @@ Remaining test-quality gap:
 
 - These tests are stronger than the original field-only checks, but they are still unit-level simulations with fake requests and logits.
 - Issue 9 remains pending until a model-facing or API-facing logprob test is enabled in the regular suite.
+
+### Fix 7: multimodal Qwen2.5-VL with DP attention
+
+Status: Implementation complete; final TPU rerun pending because local `kubectl` cannot refresh GKE credentials.
+
+TDD plan:
+
+1. Add a real e2e test for Qwen2.5-VL chat completions with `--multimodal`, `--dp-size 2`, `--tp-size 4`, and a real Hugging Face checkpoint under `/models`.
+2. Run the e2e on TPU before production changes and record the failure.
+3. Fix only the first observed failure, rerun the same e2e, and continue until the user-visible request succeeds.
+4. Re-run local DP regressions after code changes.
+5. Re-run the same TPU e2e after the final code change.
+
+Test added:
+
+- `test/srt/multimodal/test_qwen2_5_vl_dp.py`
+- Model: `/models/Qwen2.5-VL-3B-Instruct`, downloaded from `Qwen/Qwen2.5-VL-3B-Instruct`.
+- Request: `/v1/chat/completions` with a generated red PNG data URI and prompt `What color is this image? Answer with one word.`
+
+Failures observed before fixes:
+
+- First e2e run reached model forward and crashed in flash attention:
+  `ValueError: Expected cu_q_lens.shape=(4,) to be (3,).`
+- After fixing the mesh, the same e2e reached prefill output processing and crashed:
+  `AttributeError: spec_info is only available as a compatibility alias when dp_size == 1; use reqs_info for DP batches`
+- After fixing the non-spec `spec_info` write, the same e2e returned HTTP 200 but failed semantically:
+  `AssertionError: 'red' not found in 'blue'`
+
+Fixes:
+
+- `test_qwen2_5_vl_dp.py` now reports HTTP response bodies on status failures.
+- Multimodal auto-regressive stages now honor `server_args.dp_size` and `server_args.tp_size` when building the stage mesh, so the AR stage uses a real `data x tensor` mesh instead of YAML `runtime.num_tpus=1` when DP is enabled.
+- Non-spec prefill output processing no longer writes `batch.spec_info = None`, avoiding the single-DP compatibility alias on normal DP requests.
+- `ScheduleBatch.get_model_worker_batch()` now merges multimodal fields into the same padded per-DP token layout as `input_ids`:
+  - `mrope_positions` is generated per DP token section and padded to `per_dp_token_padding`.
+  - `input_embedding` is sliced by each request's extend window and written into its DP token section.
+  - `deepstack_visual_embedding` is merged into a `[layers, total_padded_tokens, hidden]` layout with zeros outside visual positions.
+
+Local verification after implementation:
+
+- `python -m compileall -q python/sgl_jax/srt/managers/schedule_batch.py python/sgl_jax/srt/managers/scheduler_output_processor_mixin.py python/sgl_jax/srt/multimodal/manager/stage.py test/srt/multimodal/test_qwen2_5_vl_dp.py` passed.
+- `python -m ruff check python/sgl_jax/srt/managers/schedule_batch.py` passed.
+- `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_dp_sampler_regressions.py -q` passed with 14 tests.
+- `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_mixed_chunk_dp.py -q` passed with 2 tests.
+
+TPU verification status:
+
+- The pre-fix and intermediate TPU runs were executed on `tpu7x-multi-slice-4-job-xz-0-wr6rk` and produced the failures above.
+- The final rerun after commit `0f44f9e2c` could not start because local `kubectl` failed before reaching the pod:
+  `gke-gcloud-auth-plugin failed` while `gcloud config config-helper` attempted to refresh an access token from `oauth2.googleapis.com` and hit SSL EOF/read timeout errors.
+  This is a local Kubernetes credential refresh/network blocker, not a model/test failure.
