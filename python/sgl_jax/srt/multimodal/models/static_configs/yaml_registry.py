@@ -35,6 +35,8 @@ class StageConfigRegistry:
         # Qwen2.5-VL series
         "Qwen/Qwen2.5-VL-7B-Instruct": "qwen2_5_vl_stage_config.yaml",
         "Qwen2.5-VL-7B-Instruct": "qwen2_5_vl_stage_config.yaml",
+        "Qwen/Qwen2.5-VL-3B-Instruct": "qwen2_5_vl_stage_config_tp4.yaml",
+        "Qwen2.5-VL-3B-Instruct": "qwen2_5_vl_stage_config_tp4.yaml",
         "Qwen/Qwen2.5-VL-32B-Instruct": "qwen2_5_vl_stage_config_tp4.yaml",
         "Qwen2.5-VL-32B-Instruct": "qwen2_5_vl_stage_config_tp4.yaml",
         "Qwen/Qwen2.5-VL-72B-Instruct": "qwen2_5_vl_stage_config_tp4.yaml",

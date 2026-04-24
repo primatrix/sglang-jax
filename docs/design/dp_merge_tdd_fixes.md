@@ -16,12 +16,13 @@ This document tracks the risks found while reviewing the DP merge branch and rec
 | 4 | Logprob options interact badly with padded DP layout | `top_logprobs_num`, `token_ids_logprob`, `return_logprob` can index wrong rows or build ragged arrays | Yes | P0 | Medium | Fixed |
 | 5 | Decode OOM graceful abort from upstream is not preserved | Decode OOM may assert/crash instead of aborting requests | Yes | P0 | Medium | Fixed |
 | 6 | Speculative decoding still references old batch fields | Spec decode/EAGLE can fail after DP refactor | Yes when spec is enabled | P1 | Medium-high | Fixed |
-| 7 | Multimodal/MRoPE/deepstack are disabled in DP model worker path | Multimodal, MRoPE, deepstack regressions | Yes | P1 | Medium-high | Pending |
+| 7 | Multimodal/MRoPE/deepstack are disabled in DP model worker path | Multimodal, MRoPE, deepstack regressions | Yes | P1 | Medium-high | Fixed |
 | 8 | Grammar masks use compact request order instead of padded DP order | JSON schema/regex/grammar rows can be misaligned | Mostly dp_size>1 | P1 | Medium | Pending |
 | 9 | Logprobs tests are skipped or incomplete | Logprob behavior is not protected by CI | Yes, worse for dp_size>1 | P1 | Medium | Pending |
 | 10 | Missing explicit `tp_size % dp_size == 0` validation | Bad launch config fails late/unclearly | No | P2 | Low | Pending |
 | 11 | `need_top_p_sampling` and `need_top_k_sampling` are not merged | Currently low functional impact because sampler uses values directly | Low | P2 | Low | Pending |
 | 12 | `repetition_penalty` and `logit_bias` do not appear wired into sampler | Parameter compatibility gap | Not clearly a DP regression | P2 | Medium | Pending |
+| 13 | Qwen2.5-VL 3B DP e2e is not part of v6e-4 CI and falls back to a non-TP4 stage config | The real multimodal DP regression can be missed by CI; 4-card CI cannot fit default ViT+AR TPU allocation | No direct runtime impact outside 3B config choice | P1 | Low | Fixed |
 
 ## Detailed Clues
 
@@ -93,6 +94,13 @@ This document tracks the risks found while reviewing the DP merge branch and rec
 - `SamplingParams` accepts `repetition_penalty` and `logit_bias`.
 - The reviewed sampler paths do not show an active implementation for either parameter.
 - This needs separate confirmation against upstream expectations.
+
+### 13. Qwen2.5-VL 3B CI Coverage
+
+- `test/srt/multimodal/test_qwen2_5_vl_dp.py` was added but not listed in `test/srt/run_suite.py`, so PR CI would not execute it.
+- The v6e-4 CI runner can run the test on a single host only if the ViT stage uses CPU and the AR stage uses all 4 TPU devices.
+- `Qwen2.5-VL-3B-Instruct` was not explicitly registered, so local paths such as `/models/Qwen2.5-VL-3B-Instruct` fell back to `qwen2_5_vl_stage_config.yaml`, whose ViT and AR stages both request TPU devices.
+- Existing `qwen2_5_vl_stage_config_tp4.yaml` is the intended single-host CI shape: ViT on CPU, AR on 4 TPU devices.
 
 ## TPU Validation Notes
 
@@ -383,3 +391,37 @@ TPU verification after fix:
   This was a local Kubernetes credential refresh/network blocker, not a model/test failure.
 - After `kubectl` recovered, synced `/sglang-jax` to commit `54739e472`.
 - `source /tmp/tpu_logs/venv/bin/activate && export SGLANG_JAX_QWEN2_5_VL_MODEL=/models/Qwen2.5-VL-3B-Instruct && PYTHONPATH=python:test/srt python -m unittest test.srt.multimodal.test_qwen2_5_vl_dp -v` passed on `tpu7x-multi-slice-4-job-xz-0-wr6rk`.
+
+### Fix 7 follow-up: Qwen2.5-VL DP e2e in v6e-4 CI
+
+Status: Fixed locally; TPU v6e-4 verification pending.
+
+TDD plan:
+
+1. Add a registry regression test proving Qwen2.5-VL 3B resolves to the single-host TP4 stage config for HF IDs, short names, and `/models/...` paths.
+2. Run the test before the registry fix and record the failure.
+3. Add explicit 3B registry entries for `qwen2_5_vl_stage_config_tp4.yaml`.
+4. Add the registry test to the regular unit suite and the real Qwen2.5-VL DP e2e to `e2e-test-tpu-v6e-4`.
+5. Install Qwen VL e2e dependencies in the v6e-4 e2e CI job.
+6. Re-run the registry test locally and run the real e2e on the v6e-4 TPU host.
+
+Failure observed before fix:
+
+- `PYTHONPATH=python python -m unittest python/sgl_jax/test/multimodal/test_stage_config_registry.py -v` failed for all tested model paths.
+- Each path resolved to `qwen2_5_vl_stage_config.yaml` instead of `qwen2_5_vl_stage_config_tp4.yaml`.
+
+Fixes:
+
+- `StageConfigRegistry` now maps `Qwen/Qwen2.5-VL-3B-Instruct` and `Qwen2.5-VL-3B-Instruct` to `qwen2_5_vl_stage_config_tp4.yaml`.
+- `python/sgl_jax/test/multimodal/test_stage_config_registry.py` guards the HF ID, short name, and `/models/...` local-path cases.
+- `test/srt/run_suite.py` now includes:
+  - `python/sgl_jax/test/multimodal/test_stage_config_registry.py` in `unit-test-tpu-v6e-1`.
+  - `test/srt/multimodal/test_qwen2_5_vl_dp.py` in `e2e-test-tpu-v6e-4`.
+- `.github/workflows/pr-test.yml` installs `python[all,qwen-vl]` for the v6e-4 e2e job.
+- `python/pyproject.toml` adds a `qwen-vl` extra for `qwen-vl-utils`, `torch`, and `torchvision`.
+
+Local verification after implementation:
+
+- `PYTHONPATH=python python -m unittest python/sgl_jax/test/multimodal/test_stage_config_registry.py -v` passed.
+- `python -m compileall -q python/sgl_jax/test/multimodal/test_stage_config_registry.py python/sgl_jax/srt/multimodal/models/static_configs/yaml_registry.py test/srt/run_suite.py test/srt/multimodal/test_qwen2_5_vl_dp.py` passed.
+- `e2e-test-tpu-v6e-4` auto partition includes `test/srt/multimodal/test_qwen2_5_vl_dp.py` in partition 0 when `--auto-partition-size 2`.
