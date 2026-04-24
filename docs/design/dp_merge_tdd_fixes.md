@@ -17,7 +17,7 @@ This document tracks the risks found while reviewing the DP merge branch and rec
 | 5 | Decode OOM graceful abort from upstream is not preserved | Decode OOM may assert/crash instead of aborting requests | Yes | P0 | Medium | Fixed |
 | 6 | Speculative decoding still references old batch fields | Spec decode/EAGLE can fail after DP refactor | Yes when spec is enabled | P1 | Medium-high | Fixed |
 | 7 | Multimodal/MRoPE/deepstack are disabled in DP model worker path | Multimodal, MRoPE, deepstack regressions | Yes | P1 | Medium-high | Fixed |
-| 8 | Grammar masks use compact request order instead of padded DP order | JSON schema/regex/grammar rows can be misaligned | Mostly dp_size>1 | P1 | Medium | Fixed locally; TPU pending |
+| 8 | Grammar masks use compact request order instead of padded DP order | JSON schema/regex/grammar rows can be misaligned | Mostly dp_size>1 | P1 | Medium | Fixed |
 | 9 | Logprobs tests are skipped or incomplete | Logprob behavior is not protected by CI | Yes, worse for dp_size>1 | P1 | Medium | Pending |
 | 10 | Missing explicit `tp_size % dp_size == 0` validation | Bad launch config fails late/unclearly | No | P2 | Low | Pending |
 | 11 | `need_top_p_sampling` and `need_top_k_sampling` are not merged | Currently low functional impact because sampler uses values directly | Low | P2 | Low | Pending |
@@ -438,7 +438,7 @@ TPU v6e-4 verification:
 
 ### Fix 8: grammar masks in DP padded layout
 
-Status: Fixed locally; TPU e2e pending.
+Status: Fixed.
 
 TDD plan:
 
@@ -469,3 +469,12 @@ Local verification after implementation:
 - `PYTHONPATH=python python -m ruff check python/sgl_jax/srt/managers/schedule_batch.py python/sgl_jax/test/test_dp_sampler_regressions.py test/srt/openai_server/features/test_dp_grammar.py test/srt/run_suite.py` passed.
 - `python -m compileall -q python/sgl_jax/srt/managers/schedule_batch.py python/sgl_jax/test/test_dp_sampler_regressions.py test/srt/openai_server/features/test_dp_grammar.py test/srt/run_suite.py` passed.
 - `e2e-test-tpu-v6e-4` auto partition includes `test/srt/openai_server/features/test_dp_grammar.py` in partition 1 when `--auto-partition-size 2`.
+
+TPU v6e-4 verification:
+
+- On `kb-tpu`, synced `/home/gcpuser/sglang-jax` to branch `fix/dp-attn-jimoosciuc` at commit `1fd839ee5`.
+- Installed missing `pytest` into `/home/gcpuser/jax-env` with `uv pip install pytest`.
+- `cd /home/gcpuser/sglang-jax && source /home/gcpuser/jax-env/bin/activate && PYTHONPATH=python python -m pytest python/sgl_jax/test/test_dp_sampler_regressions.py::TestDPSamplerRegressions::test_dp_grammar_masks_use_padded_request_layout -q` passed.
+- `cd /home/gcpuser/sglang-jax && source /home/gcpuser/jax-env/bin/activate && bash scripts/killall_sglang.sh || true && PYTHONPATH=python:test/srt python -m unittest test.srt.openai_server.features.test_dp_grammar -v` passed on v6e-4.
+- The e2e logs confirmed `Qwen/Qwen3-1.7B`, `load_format=dummy`, `tp_size=4`, `dp_size=2`, `grammar_backend=llguidance`, and the target mixed batch `#prefill per DP: [1, 1]`.
+- The e2e reported `Ran 1 test in 60.840s` and the EBNF-constrained DP-rank-1 response matched `Hello`.
