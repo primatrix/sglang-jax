@@ -217,31 +217,48 @@ class Sampler(nnx.Module):
 
 def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: list[int]):
     max_k = max(top_logprobs_nums)
+    if max_k <= 0:
+        batch_size = len(top_logprobs_nums)
+        return (
+            jnp.zeros((batch_size, 0), dtype=logprobs.dtype),
+            jnp.zeros((batch_size, 0), dtype=jnp.int32),
+        )
     values, indices = jax.lax.top_k(logprobs, max_k)
-
-    output_top_logprobs_val = []
-    output_top_logprobs_idx = []
-    for i, k in enumerate(top_logprobs_nums):
-        output_top_logprobs_val.append(values[i][:k])
-        output_top_logprobs_idx.append(indices[i][:k])
-    return jnp.array(output_top_logprobs_val), jnp.array(output_top_logprobs_idx)
+    return values, indices
 
 
 def get_token_ids_logprobs(logprobs: jax.Array, token_ids_logprobs: list[list[int]], mesh: Mesh):
-    output_token_ids_logprobs_val = []
-    output_token_ids_logprobs_idx = []
-    out_sharding = NamedSharding(mesh, P(None))
-    for i, token_ids in enumerate(token_ids_logprobs):
-        if token_ids is not None:
-            output_token_ids_logprobs_val.append(
-                logprobs.at[i, token_ids].get(out_sharding=out_sharding)
-            )
-            output_token_ids_logprobs_idx.append(token_ids)
-        else:
-            output_token_ids_logprobs_val.append([])
-            output_token_ids_logprobs_idx.append([])
+    normalized_token_ids = [token_ids or [] for token_ids in token_ids_logprobs]
+    max_len = max((len(token_ids) for token_ids in normalized_token_ids), default=0)
+    batch_size = len(normalized_token_ids)
+    if max_len == 0:
+        return (
+            jnp.zeros((batch_size, 0), dtype=logprobs.dtype),
+            jnp.zeros((batch_size, 0), dtype=jnp.int32),
+        )
 
-    return jnp.array(output_token_ids_logprobs_val), jnp.array(output_token_ids_logprobs_idx)
+    padded_token_ids = np.zeros((batch_size, max_len), dtype=np.int32)
+    valid_mask = np.zeros((batch_size, max_len), dtype=bool)
+    for i, token_ids in enumerate(normalized_token_ids):
+        if token_ids:
+            token_ids_len = len(token_ids)
+            padded_token_ids[i, :token_ids_len] = np.asarray(token_ids, dtype=np.int32)
+            valid_mask[i, :token_ids_len] = True
+
+    row_indices = jnp.arange(batch_size, dtype=jnp.int32).reshape(-1, 1)
+    token_ids_device = jnp.asarray(padded_token_ids)
+    out_sharding = NamedSharding(mesh, P(None, None)) if mesh is not None else None
+    values = (
+        logprobs.at[row_indices, token_ids_device].get(out_sharding=out_sharding)
+        if out_sharding is not None
+        else logprobs[row_indices, token_ids_device]
+    )
+    valid_mask_device = jnp.asarray(valid_mask)
+
+    return (
+        jnp.where(valid_mask_device, values, 0.0),
+        jnp.where(valid_mask_device, token_ids_device, 0),
+    )
 
 
 def multinomial(
