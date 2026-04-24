@@ -297,3 +297,31 @@ Result:
   - `source /tmp/tpu_logs/venv/bin/activate && PYTHONPATH=python python -m unittest sgl_jax.test.test_mixed_chunk_dp -v` passed.
   - `source /tmp/tpu_logs/venv/bin/activate && PYTHONPATH=python python -m unittest sgl_jax.test.speculative.test_eagle_tree_build -v` passed on TPU.
   - A real model E2E spec run is still not recorded here; `/models` on the TPU host has target checkpoints such as `Qwen3-8B`, but no obvious local EAGLE/EAGLE3 draft checkpoint was present.
+
+### Test Coverage Hardening: sampler/logprob behavior checks
+
+Status: Added behavior-level tests; no production behavior change.
+
+Reason:
+
+- The first regression tests for fixes 1-3 were intentionally narrow so the failing fields could be localized quickly.
+- Review feedback correctly pointed out that field-level tests alone are brittle: a harmless metadata rename could break the tests without proving user-visible sampler behavior regressed.
+- The retained narrow tests still help pinpoint failures, but they are now backed by behavior tests that go through the practical paths used by decode.
+
+Added tests:
+
+| Test | Practical path exercised | Old failure it protects |
+| --- | --- | --- |
+| `test_dp_min_p_changes_sampled_token_after_model_worker_conversion` | `ScheduleBatch` DP merge -> `ModelWorkerBatch` -> `SamplingMetadata` -> `Sampler` | Before fix 1, the DP merge dropped `need_min_p_sampling`; the seeded request sampled token `2` even though min-p should filter it, instead of token `0`. |
+| `test_dp_linear_penalty_changes_greedy_token_after_model_worker_conversion` | `ScheduleBatch` DP merge -> `ModelWorkerBatch` -> `SamplingMetadata` -> `Sampler` with greedy decoding | Before fix 2, the merged path dropped `linear_penalty`; greedy output stayed token `0` instead of switching to token `1` after penalty application. |
+| `test_dp_sampler_logprobs_are_returned_to_request_in_padded_layout` | `ScheduleBatch` DP merge -> `SamplingMetadata` -> `Sampler` logprob output -> `SchedulerOutputProcessorMixin.process_batch_result_decode()` | Before fix 3, padded DP rows could either build ragged logprob arrays or return row-0/padding logprobs to a real request on `dp_rank > 0`. |
+
+Verification:
+
+- `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_dp_sampler_regressions.py::TestDPSamplerRegressions::test_dp_min_p_changes_sampled_token_after_model_worker_conversion python/sgl_jax/test/test_dp_sampler_regressions.py::TestDPSamplerRegressions::test_dp_linear_penalty_changes_greedy_token_after_model_worker_conversion python/sgl_jax/test/test_dp_sampler_regressions.py::TestDPSamplerRegressions::test_dp_sampler_logprobs_are_returned_to_request_in_padded_layout -q` passed.
+- `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_dp_sampler_regressions.py -q` passed with 14 tests.
+
+Remaining test-quality gap:
+
+- These tests are stronger than the original field-only checks, but they are still unit-level simulations with fake requests and logits.
+- Issue 9 remains pending until a model-facing or API-facing logprob test is enabled in the regular suite.
