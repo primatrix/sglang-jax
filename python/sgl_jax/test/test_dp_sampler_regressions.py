@@ -3,6 +3,7 @@ import importlib.util
 import sys
 import types
 import unittest
+from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -25,12 +26,23 @@ if importlib.util.find_spec("pybase64") is None:
     pybase64_stub.b64decode = base64.b64decode
     sys.modules["pybase64"] = pybase64_stub
 
+if importlib.util.find_spec("pathwaysutils") is None:
+    sys.modules["pathwaysutils"] = types.ModuleType("pathwaysutils")
+
+if importlib.util.find_spec("setproctitle") is None:
+    setproctitle_stub = types.ModuleType("setproctitle")
+    setproctitle_stub.setproctitle = lambda *args, **kwargs: None
+    sys.modules["setproctitle"] = setproctitle_stub
+
 from sgl_jax.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
+from sgl_jax.srt.managers.io_struct import AbortReq
 from sgl_jax.srt.managers.schedule_batch import (
+    FINISH_ABORT,
     ModelWorkerSamplingInfo,
     ScheduleBatch,
     ScheduleReqsInfo,
 )
+from sgl_jax.srt.managers.scheduler import Scheduler
 from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
@@ -189,6 +201,96 @@ class TestDPSamplerRegressions(unittest.TestCase):
         sampling_info.update_penalties()
 
         np.testing.assert_array_equal(sampling_info.linear_penalty, linear_penalty)
+
+    def test_retract_decode_aborts_single_oom_request(self):
+        req = SimpleNamespace(
+            rid="oom-request",
+            output_ids=[7],
+            origin_input_ids=[1, 2, 3],
+            sampling_params=SimpleNamespace(max_new_tokens=4),
+            to_finish=None,
+        )
+        allocator = SimpleNamespace(
+            page_size=1,
+            available_size=lambda dp_rank=0: 0,
+        )
+        batch = ScheduleBatch(
+            dp_size=1,
+            reqs_info=[
+                ScheduleReqsInfo(
+                    reqs=[req],
+                    seq_lens=np.array([3], dtype=np.int32),
+                )
+            ],
+            token_to_kv_pool_allocator=allocator,
+            tree_cache=None,
+            is_hybrid=False,
+        )
+        released = []
+
+        def release_req(idx, dp_rank, remaining_req_count, server_args):
+            released.append((idx, dp_rank, remaining_req_count))
+
+        batch.release_req = release_req
+
+        retracted, new_ratio, aborted = batch.retract_decode(SimpleNamespace(page_size=1))
+
+        self.assertEqual(retracted, [])
+        self.assertEqual(aborted, [req])
+        self.assertIsInstance(req.to_finish, FINISH_ABORT)
+        self.assertEqual(req.to_finish.status_code, HTTPStatus.INTERNAL_SERVER_ERROR)
+        self.assertEqual(req.to_finish.err_type, "InternalServerError")
+        self.assertEqual(released, [(0, 0, 0)])
+        self.assertEqual(batch.batch_size(), 0)
+        self.assertEqual(new_ratio, 0.0)
+
+    def test_scheduler_update_running_batch_sends_abort_req(self):
+        req = SimpleNamespace(rid="oom-request")
+
+        class FakeBatch:
+            def __init__(self):
+                self.prepared = False
+
+            def batch_size(self):
+                return 1
+
+            def filter_batch(self):
+                return None
+
+            def is_empty(self):
+                return False
+
+            def check_decode_mem(self, buf_multiplier):
+                return False
+
+            def retract_decode(self, server_args):
+                return [], 0.25, [req]
+
+            def prepare_for_decode(self):
+                self.prepared = True
+
+        sender = SimpleNamespace(send_pyobj=MagicMock())
+        scheduler = SimpleNamespace(
+            decode_mem_cache_buf_multiplier=1,
+            new_token_ratio=0.75,
+            server_args=SimpleNamespace(),
+            _comm_backend=None,
+            send_to_tokenizer=sender,
+            _extend_requests_to_queue=MagicMock(),
+            new_token_ratio_decay=0.1,
+            min_new_token_ratio=0.1,
+        )
+        batch = FakeBatch()
+
+        result = Scheduler.update_running_batch(scheduler, batch)
+
+        self.assertIs(result, batch)
+        self.assertTrue(batch.prepared)
+        self.assertEqual(scheduler.new_token_ratio, 0.25)
+        scheduler._extend_requests_to_queue.assert_called_once_with([], is_retracted=True)
+        abort_out = sender.send_pyobj.call_args.args[0]
+        self.assertIsInstance(abort_out, AbortReq)
+        self.assertEqual(abort_out.rid, "oom-request")
 
     def test_get_top_logprobs_handles_padding_rows(self):
         logprobs = jnp.array(
