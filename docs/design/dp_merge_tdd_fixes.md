@@ -14,7 +14,7 @@ This document tracks the risks found while reviewing the DP merge branch and rec
 | 2 | `min_p` flag is dropped in `_merge_sampling_info()` | `min_p` values are copied but filtering is disabled | Yes | P0 | Low | Fixed |
 | 3 | Penalty state is dropped in merged sampling info | `frequency_penalty`, `presence_penalty`, `min_new_tokens` do not affect logits | Yes | P0 | Medium | Fixed |
 | 4 | Logprob options interact badly with padded DP layout | `top_logprobs_num`, `token_ids_logprob`, `return_logprob` can index wrong rows or build ragged arrays | Yes | P0 | Medium | Fixed |
-| 5 | Decode OOM graceful abort from upstream is not preserved | Decode OOM may assert/crash instead of aborting requests | Yes | P0 | Medium | Pending |
+| 5 | Decode OOM graceful abort from upstream is not preserved | Decode OOM may assert/crash instead of aborting requests | Yes | P0 | Medium | Fixed |
 | 6 | Speculative decoding still references old batch fields | Spec decode/EAGLE can fail after DP refactor | Yes when spec is enabled | P1 | Medium-high | Pending |
 | 7 | Multimodal/MRoPE/deepstack are disabled in DP model worker path | Multimodal, MRoPE, deepstack regressions | Yes | P1 | Medium-high | Pending |
 | 8 | Grammar masks use compact request order instead of padded DP order | JSON schema/regex/grammar rows can be misaligned | Mostly dp_size>1 | P1 | Medium | Pending |
@@ -189,3 +189,33 @@ Result:
 - TPU verification after fix:
   - On `tpu7x-multi-slice-4-job-xz-0-wr6rk`, `source /tmp/tpu_logs/venv/bin/activate && PYTHONPATH=python python -m unittest sgl_jax.test.test_dp_sampler_regressions -v` passed.
   - `source /tmp/tpu_logs/venv/bin/activate && PYTHONPATH=python python -m unittest sgl_jax.test.test_sampler -v` initially failed due stale libtpu lockfile, then passed after removing `/tmp/libtpu_lockfile`.
+
+### Fix 4: decode OOM graceful abort in DP retract path
+
+Status: Fixed.
+
+TDD plan:
+
+1. Add a regression test proving DP `retract_decode()` aborts the last request when it still cannot fit after all possible retractions, instead of asserting.
+2. Add a scheduler regression test proving the third return value from `retract_decode()` is consumed and converted into an `AbortReq` response.
+3. Observe both tests fail on the current code.
+4. Port the upstream graceful-abort behavior into the DP-aware `retract_decode()` layout.
+5. Re-run the new tests and the existing DP regression tests.
+
+Result:
+
+- Failing tests before fix:
+  - `test_retract_decode_aborts_single_oom_request`
+  - `test_scheduler_update_running_batch_sends_abort_req`
+- Failures observed:
+  - DP `retract_decode()` asserted with `[DP 0] No space for single request`.
+  - `Scheduler.update_running_batch()` still unpacked two return values and raised `ValueError: too many values to unpack (expected 2)`.
+- Fix:
+  - `ScheduleBatch.retract_decode()` now returns `(retracted_reqs, new_estimate_ratio, reqs_to_abort)`.
+  - When a DP rank's last remaining decode request still cannot fit, it marks that request with `FINISH_ABORT(..., HTTPStatus.INTERNAL_SERVER_ERROR, "InternalServerError")`, releases its KV/request-pool state, filters it out of the batch, and records it in `reqs_to_abort`.
+  - The new estimate ratio uses `total_max_new_tokens + 1`, matching upstream's zero-division guard when all requests are aborted.
+  - `Scheduler.update_running_batch()` now sends one `AbortReq` per aborted request through `_comm_backend` or `send_to_tokenizer`.
+- Local verification after fix:
+  - `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_dp_sampler_regressions.py::TestDPSamplerRegressions::test_retract_decode_aborts_single_oom_request python/sgl_jax/test/test_dp_sampler_regressions.py::TestDPSamplerRegressions::test_scheduler_update_running_batch_sends_abort_req -q` passed.
+  - `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_dp_sampler_regressions.py -q` passed.
+  - `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_mixed_chunk_dp.py -q` passed.

@@ -1115,7 +1115,7 @@ class ScheduleBatch:
         self._evict_tree_cache_if_needed(num_tokens_per_dp)
         return self._is_available_size_sufficient(num_tokens_per_dp)
 
-    def retract_decode(self, server_args: ServerArgs):
+    def retract_decode(self, server_args: ServerArgs) -> tuple[list[Req], float, list[Req]]:
         """Retract requests when memory insufficient.
 
         Each DP rank independently:
@@ -1126,6 +1126,7 @@ class ScheduleBatch:
         Returns:
             retracted_reqs: All retracted requests
             new_estimate_ratio: Updated estimate
+            reqs_to_abort: Requests that still cannot fit after retraction
         """
 
         # Helper function: check if memory is sufficient for given DP rank
@@ -1166,6 +1167,7 @@ class ScheduleBatch:
                 return self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank) >= num_tokens
 
         retracted_reqs = []
+        reqs_to_abort = []
         keep_indices_per_dp = {}
 
         # Process each DP rank independently
@@ -1191,20 +1193,7 @@ class ScheduleBatch:
             first_iter = True
             while not has_sufficient_memory(dp_rank, sorted_indices) or first_iter:
                 if len(sorted_indices) == 1:
-                    # Assert some space available
-                    if self.is_hybrid:
-                        full_avail = self.token_to_kv_pool_allocator.full_available_size(
-                            dp_rank=dp_rank
-                        )
-                        swa_avail = self.token_to_kv_pool_allocator.swa_available_size(
-                            dp_rank=dp_rank
-                        )
-                        assert (
-                            full_avail > 0 and swa_avail > 0
-                        ), f"[DP {dp_rank}] No space for single request (hybrid)"
-                    else:
-                        avail = self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
-                        assert avail > 0, f"[DP {dp_rank}] No space for single request"
+                    # Keep one request long enough to decide whether it should be aborted below.
                     break
 
                 first_iter = False
@@ -1214,6 +1203,23 @@ class ScheduleBatch:
 
                 # Release the request using its local index within this DP rank
                 self.release_req(retract_idx, dp_rank, len(sorted_indices), server_args)
+
+            if len(sorted_indices) == 1 and not has_sufficient_memory(dp_rank, sorted_indices):
+                last_idx = sorted_indices.pop()
+                last_req = info.reqs[last_idx]
+                last_req.to_finish = FINISH_ABORT(
+                    "Out of memory even after retracting all other requests "
+                    "in the decode batch. Aborting the last request.",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "InternalServerError",
+                )
+                reqs_to_abort.append(last_req)
+                self.release_req(last_idx, dp_rank, 0, server_args)
+                logger.warning(
+                    "retract_decode: aborted last request %s on DP %d due to OOM",
+                    last_req.rid,
+                    dp_rank,
+                )
 
             keep_indices_per_dp[dp_rank] = sorted_indices
 
@@ -1227,10 +1233,12 @@ class ScheduleBatch:
 
         new_estimate_ratio = (
             total_decoded_tokens + global_config.retract_decode_steps * len(all_reqs)
-        ) / total_max_new_tokens
+        ) / (
+            total_max_new_tokens + 1
+        )  # +1 to avoid zero division when all requests are aborted.
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
-        return retracted_reqs, new_estimate_ratio
+        return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
     def release_req(self, idx: int, dp_rank: int, remaing_req_count: int, server_args: ServerArgs):
         """Release a request and free its resources.
