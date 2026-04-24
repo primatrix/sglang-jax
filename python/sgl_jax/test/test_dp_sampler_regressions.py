@@ -386,6 +386,47 @@ class TestDPSamplerRegressions(unittest.TestCase):
 
         np.testing.assert_array_equal(sampling_info.linear_penalty, linear_penalty)
 
+    def test_dp_grammar_masks_use_padded_request_layout(self):
+        class FakeGrammar:
+            finished = False
+
+            def allocate_vocab_mask(self, vocab_size: int, batch_size: int):
+                return np.zeros((batch_size, (vocab_size + 31) // 32), dtype=np.int32)
+
+            def fill_vocab_mask(self, vocab_mask, idx: int):
+                vocab_mask[idx] = np.array([0x11111111, 0x22222222], dtype=np.int32)
+
+            def is_terminated(self):
+                return False
+
+        grammar = FakeGrammar()
+        batch = ScheduleBatch(
+            dp_size=2,
+            has_grammar=True,
+            reqs_info=[
+                ScheduleReqsInfo(
+                    reqs=[SimpleNamespace(grammar=None)],
+                    seq_lens=np.array([3], dtype=np.int32),
+                    sampling_info=self._sampling_info(batch_size=1, vocab_size=64),
+                ),
+                ScheduleReqsInfo(
+                    reqs=[SimpleNamespace(grammar=grammar)],
+                    seq_lens=np.array([4], dtype=np.int32),
+                    sampling_info=self._sampling_info(batch_size=1, vocab_size=64),
+                ),
+            ],
+        )
+
+        merged = batch._merge_sampling_info(per_dp_bs_size=2, total_bs=4)
+        merged.update_grammar_vocab_mask()
+
+        expected_allow_all = np.array([-1, -1], dtype=np.int32)
+        expected_grammar_mask = np.array([0x11111111, 0x22222222], dtype=np.int32)
+        np.testing.assert_array_equal(merged.vocab_mask[0], expected_allow_all)
+        np.testing.assert_array_equal(merged.vocab_mask[1], expected_allow_all)
+        np.testing.assert_array_equal(merged.vocab_mask[2], expected_grammar_mask)
+        np.testing.assert_array_equal(merged.vocab_mask[3], expected_allow_all)
+
     def test_dp_sampler_logprobs_are_returned_to_request_in_padded_layout(self):
         class FakeReq:
             def __init__(self):

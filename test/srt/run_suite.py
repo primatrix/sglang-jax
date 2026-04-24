@@ -528,6 +528,7 @@ suites = {
     ],
     "e2e-test-tpu-v6e-4": [
         TestFile("test/srt/openai_server/basic/test_tool_calls.py", 3),
+        TestFile("test/srt/openai_server/features/test_dp_grammar.py", 10),
         TestFile("test/srt/test_features.py", 10),
         TestFile("test/srt/test_chunked_prefill_size.py", 5),
         # TestFile("test/srt/test_sliding_window_attention.py", 30), # add after gpt-oss supported
