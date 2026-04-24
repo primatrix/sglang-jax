@@ -749,6 +749,138 @@ class ScheduleBatch:
         """Check if batch is empty (no requests in any DP rank)."""
         return self.batch_size() == 0
 
+    def _single_dp_info(self, field_name: str) -> ScheduleReqsInfo:
+        if self.dp_size != 1:
+            raise AttributeError(
+                f"{field_name} is only available as a compatibility alias when "
+                "dp_size == 1; use reqs_info for DP batches"
+            )
+        if not self.reqs_info:
+            raise AttributeError(f"{field_name} is unavailable because reqs_info is empty")
+        return self.reqs_info[0]
+
+    @property
+    def reqs(self):
+        return self._single_dp_info("reqs").reqs
+
+    @reqs.setter
+    def reqs(self, value):
+        self._single_dp_info("reqs").reqs = value
+
+    @property
+    def input_ids(self):
+        return self._single_dp_info("input_ids").input_ids
+
+    @input_ids.setter
+    def input_ids(self, value):
+        self._single_dp_info("input_ids").input_ids = value
+
+    @property
+    def req_pool_indices(self):
+        return self._single_dp_info("req_pool_indices").req_pool_indices
+
+    @req_pool_indices.setter
+    def req_pool_indices(self, value):
+        self._single_dp_info("req_pool_indices").req_pool_indices = value
+
+    @property
+    def seq_lens(self):
+        return self._single_dp_info("seq_lens").seq_lens
+
+    @seq_lens.setter
+    def seq_lens(self, value):
+        self._single_dp_info("seq_lens").seq_lens = value
+
+    @property
+    def out_cache_loc(self):
+        return self._single_dp_info("out_cache_loc").out_cache_loc
+
+    @out_cache_loc.setter
+    def out_cache_loc(self, value):
+        self._single_dp_info("out_cache_loc").out_cache_loc = value
+
+    @property
+    def sampling_info(self):
+        return self._single_dp_info("sampling_info").sampling_info
+
+    @sampling_info.setter
+    def sampling_info(self, value):
+        self._single_dp_info("sampling_info").sampling_info = value
+
+    @property
+    def top_logprobs_nums(self):
+        return self._single_dp_info("top_logprobs_nums").top_logprobs_nums
+
+    @top_logprobs_nums.setter
+    def top_logprobs_nums(self, value):
+        self._single_dp_info("top_logprobs_nums").top_logprobs_nums = value
+
+    @property
+    def token_ids_logprobs(self):
+        return self._single_dp_info("token_ids_logprobs").token_ids_logprobs
+
+    @token_ids_logprobs.setter
+    def token_ids_logprobs(self, value):
+        self._single_dp_info("token_ids_logprobs").token_ids_logprobs = value
+
+    @property
+    def prefix_lens(self):
+        return self._single_dp_info("prefix_lens").prefix_lens
+
+    @prefix_lens.setter
+    def prefix_lens(self, value):
+        self._single_dp_info("prefix_lens").prefix_lens = value
+
+    @property
+    def extend_lens(self):
+        return self._single_dp_info("extend_lens").extend_lens
+
+    @extend_lens.setter
+    def extend_lens(self, value):
+        self._single_dp_info("extend_lens").extend_lens = value
+
+    @property
+    def extend_num_tokens(self):
+        return self._single_dp_info("extend_num_tokens").extend_num_tokens
+
+    @extend_num_tokens.setter
+    def extend_num_tokens(self, value):
+        self._single_dp_info("extend_num_tokens").extend_num_tokens = value
+
+    @property
+    def seq_lens_sum(self):
+        return self._single_dp_info("seq_lens_sum").seq_lens_sum
+
+    @seq_lens_sum.setter
+    def seq_lens_sum(self, value):
+        self._single_dp_info("seq_lens_sum").seq_lens_sum = value
+
+    @property
+    def extend_logprob_start_lens(self):
+        return self._single_dp_info("extend_logprob_start_lens").extend_logprob_start_lens
+
+    @extend_logprob_start_lens.setter
+    def extend_logprob_start_lens(self, value):
+        self._single_dp_info("extend_logprob_start_lens").extend_logprob_start_lens = value
+
+    @property
+    def extend_input_logprob_token_ids(self):
+        return self._single_dp_info("extend_input_logprob_token_ids").extend_input_logprob_token_ids
+
+    @extend_input_logprob_token_ids.setter
+    def extend_input_logprob_token_ids(self, value):
+        self._single_dp_info("extend_input_logprob_token_ids").extend_input_logprob_token_ids = (
+            value
+        )
+
+    @property
+    def spec_info(self):
+        return self._single_dp_info("spec_info").spec_info
+
+    @spec_info.setter
+    def spec_info(self, value):
+        self._single_dp_info("spec_info").spec_info = value
+
     def alloc_req_slots(self, num_reqs: int):
         req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
         if req_pool_indices is None:
@@ -2156,6 +2288,12 @@ class ScheduleBatch:
         page_size: int,
         enable_static_lora: bool = False,
     ) -> ModelWorkerBatch:
+        if self.dp_size != 1:
+            raise NotImplementedError(
+                "Speculative decoding currently uses single-DP batch aliases and is only "
+                "supported when dp_size == 1."
+            )
+
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
@@ -2169,7 +2307,7 @@ class ScheduleBatch:
             else:
                 logits_indices = np.array([], dtype=np.int32)
 
-        acc_global_bid()
+        bid = acc_global_bid()
 
         if self.input_ids is None:
             input_ids_cpu = np.empty(0, dtype=np.int32)
@@ -2319,6 +2457,9 @@ class ScheduleBatch:
             logits_indices=logits_indices,
             lora_ids=lora_ids,
             real_bs=real_bs,
+            real_bs_per_dp=[real_bs],
+            dp_size=self.dp_size,
+            per_dp_bs_size=real_bs,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
                 if self.return_hidden_states

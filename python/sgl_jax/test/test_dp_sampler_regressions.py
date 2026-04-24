@@ -42,11 +42,14 @@ from sgl_jax.srt.managers.schedule_batch import (
     ScheduleBatch,
     ScheduleReqsInfo,
 )
-from sgl_jax.srt.managers.scheduler import Scheduler
+from sgl_jax.srt.managers.scheduler import GenerationBatchResult, Scheduler
 from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 class TestDPSamplerRegressions(unittest.TestCase):
@@ -291,6 +294,101 @@ class TestDPSamplerRegressions(unittest.TestCase):
         abort_out = sender.send_pyobj.call_args.args[0]
         self.assertIsInstance(abort_out, AbortReq)
         self.assertEqual(abort_out.rid, "oom-request")
+
+    def test_scheduler_run_batch_spec_decode_uses_single_dp_layout(self):
+        req0 = SimpleNamespace(lora_id="0", mm_inputs=None)
+        req1 = SimpleNamespace(lora_id="0", mm_inputs=None)
+        initial_spec_info = EagleDraftInput(
+            allocate_lens=np.array([4, 5], dtype=np.int32),
+        )
+        batch = ScheduleBatch(
+            dp_size=1,
+            reqs_info=[
+                ScheduleReqsInfo(
+                    reqs=[req0, req1],
+                    input_ids=np.array([11, 22], dtype=np.int32),
+                    req_pool_indices=np.array([0, 1], dtype=np.int32),
+                    seq_lens=np.array([4, 5], dtype=np.int32),
+                    out_cache_loc=np.array([8, 9], dtype=np.int32),
+                    sampling_info=self._sampling_info(batch_size=2),
+                    spec_info=initial_spec_info,
+                )
+            ],
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=np.array(
+                    [
+                        [100, 101, 102, 103, 104, 0],
+                        [200, 201, 202, 203, 204, 205],
+                    ],
+                    dtype=np.int32,
+                )
+            ),
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=1),
+            tree_cache=None,
+            forward_mode=ForwardMode.DECODE,
+            spec_algorithm=SpeculativeAlgorithm.EAGLE,
+        )
+        next_draft_input = EagleDraftInput(
+            verified_id=np.array([101, 201], dtype=np.int32),
+            allocate_lens=np.array([6, 7], dtype=np.int32),
+        )
+
+        class FakeTPWorker:
+            def get_precompile_paddings(self):
+                return [1, 2, 4], [1, 2, 4], [4, 8, 16]
+
+        class FakeDraftWorker:
+            def __init__(self):
+                self.seen_batch = None
+
+            def forward_batch_speculative_generation(self, model_worker_batch):
+                self.seen_batch = model_worker_batch
+                return GenerationBatchResult(
+                    logits_output=SimpleNamespace(),
+                    next_token_ids=np.array([10, 11, 12, 20, 0, 0], dtype=np.int32),
+                    extend_input_len_per_req=None,
+                    extend_logprob_start_len_per_req=None,
+                    bid=model_worker_batch.bid,
+                    cache_miss_count=0,
+                    next_draft_input=next_draft_input,
+                    accept_lens=np.array([3, 1], dtype=np.int32),
+                    allocate_lens=np.array([6, 7], dtype=np.int32),
+                )
+
+        draft_worker = FakeDraftWorker()
+
+        class FakeScheduler:
+            _extract_dp_output_ids = Scheduler._extract_dp_output_ids
+
+            def __init__(self):
+                self.forward_ct = 0
+                self.is_generation = True
+                self.spec_algorithm = SpeculativeAlgorithm.EAGLE
+                self.dp_size = 1
+                self.tp_worker = FakeTPWorker()
+                self.draft_worker = draft_worker
+                self.page_size = 1
+                self.server_args = SimpleNamespace(enable_static_lora=False)
+
+            def _profile_batch_predicate(self, batch):
+                return None
+
+        scheduler = FakeScheduler()
+
+        previous_alloc_len = EagleDraftInput.ALLOC_LEN_PER_DECODE
+        EagleDraftInput.ALLOC_LEN_PER_DECODE = 2
+        try:
+            result = Scheduler.run_batch(scheduler, batch)
+        finally:
+            EagleDraftInput.ALLOC_LEN_PER_DECODE = previous_alloc_len
+
+        self.assertIs(result.next_draft_input, next_draft_input)
+        self.assertEqual(result.next_token_ids, [10, 11, 12, 20, 0, 0])
+        np.testing.assert_array_equal(result.accept_lens, np.array([3, 1], dtype=np.int32))
+        np.testing.assert_array_equal(batch.reqs_info[0].seq_lens, np.array([7, 6], dtype=np.int32))
+        self.assertIs(batch.reqs_info[0].spec_info, next_draft_input)
+        self.assertEqual(draft_worker.seen_batch.dp_size, 1)
+        self.assertEqual(draft_worker.seen_batch.real_bs_per_dp, [2])
 
     def test_get_top_logprobs_handles_padding_rows(self):
         logprobs = jnp.array(

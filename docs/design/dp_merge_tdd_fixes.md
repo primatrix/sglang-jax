@@ -15,7 +15,7 @@ This document tracks the risks found while reviewing the DP merge branch and rec
 | 3 | Penalty state is dropped in merged sampling info | `frequency_penalty`, `presence_penalty`, `min_new_tokens` do not affect logits | Yes | P0 | Medium | Fixed |
 | 4 | Logprob options interact badly with padded DP layout | `top_logprobs_num`, `token_ids_logprob`, `return_logprob` can index wrong rows or build ragged arrays | Yes | P0 | Medium | Fixed |
 | 5 | Decode OOM graceful abort from upstream is not preserved | Decode OOM may assert/crash instead of aborting requests | Yes | P0 | Medium | Fixed |
-| 6 | Speculative decoding still references old batch fields | Spec decode/EAGLE can fail after DP refactor | Yes when spec is enabled | P1 | Medium-high | Pending |
+| 6 | Speculative decoding still references old batch fields | Spec decode/EAGLE can fail after DP refactor | Yes when spec is enabled | P1 | Medium-high | Fixed |
 | 7 | Multimodal/MRoPE/deepstack are disabled in DP model worker path | Multimodal, MRoPE, deepstack regressions | Yes | P1 | Medium-high | Pending |
 | 8 | Grammar masks use compact request order instead of padded DP order | JSON schema/regex/grammar rows can be misaligned | Mostly dp_size>1 | P1 | Medium | Pending |
 | 9 | Logprobs tests are skipped or incomplete | Logprob behavior is not protected by CI | Yes, worse for dp_size>1 | P1 | Medium | Pending |
@@ -256,3 +256,37 @@ Result:
   - `source /tmp/tpu_logs/venv/bin/activate && PYTHONPATH=python python -m unittest sgl_jax.test.test_dp_sampler_regressions -v` passed.
   - `source /tmp/tpu_logs/venv/bin/activate && PYTHONPATH=python python -m unittest sgl_jax.test.test_sampler -v` passed.
   - `source /tmp/tpu_logs/venv/bin/activate && PYTHONPATH=python python -m unittest sgl_jax.test.test_mixed_chunk_dp -v` passed.
+
+### Fix 6: speculative decode with single-DP DP batch layout
+
+Status: Fixed for `dp_size=1`; `dp_size>1` speculative decoding remains unsupported and now fails explicitly.
+
+TDD plan:
+
+1. Add a regression test that exercises the scheduler-level spec path, not individual fields: construct a DP-layout `ScheduleBatch`, enable `SpeculativeAlgorithm.EAGLE`, call `Scheduler.run_batch()` with a fake draft worker, and assert the scheduling result.
+2. Observe the current code fail because the spec path still reads old single-batch fields that no longer exist after the DP refactor.
+3. Add single-DP compatibility aliases so existing EAGLE code can still use the old field names when `dp_size=1`.
+4. Preserve safety for `dp_size>1` by rejecting speculative decoding explicitly instead of silently using a wrong layout.
+5. Re-run the scheduler-level spec regression and the DP regression suite.
+
+Result:
+
+- Failing behavior before fix:
+  - `ScheduleBatch.get_spec_model_worker_batch()` raised `AttributeError: 'ScheduleBatch' object has no attribute 'input_ids'`.
+  - `SchedulerOutputProcessorMixin._resolve_spec_decode_token_ids()` raised `AttributeError: 'ScheduleBatch' object has no attribute 'reqs'`.
+  - These failures are exactly the class of issue seen when enabling spec after the DP batch refactor, including `dp_size=1`.
+- Test design adjustment:
+  - The first probe used field-level tests to identify the failure, but those were too brittle.
+  - Per review feedback, the final checked-in regression is `test_scheduler_run_batch_spec_decode_uses_single_dp_layout`, which exercises `Scheduler.run_batch()` through the EAGLE branch and asserts scheduler-visible behavior only.
+- Fix:
+  - `ScheduleBatch` now exposes old single-batch aliases (`reqs`, `input_ids`, `seq_lens`, `spec_info`, etc.) only when `dp_size == 1`, backed by `reqs_info[0]`.
+  - `get_spec_model_worker_batch()` now passes `real_bs_per_dp`, `dp_size`, and `per_dp_bs_size` into `ModelWorkerBatch` on the spec path.
+  - `get_spec_model_worker_batch()` raises `NotImplementedError` for `dp_size > 1`, because multi-DP EAGLE still needs a real padded-layout implementation.
+- Local verification after fix:
+  - `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_dp_sampler_regressions.py::TestDPSamplerRegressions::test_scheduler_run_batch_spec_decode_uses_single_dp_layout -q` passed.
+  - `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_dp_sampler_regressions.py -q` passed.
+  - `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_mixed_chunk_dp.py -q` passed.
+  - `PYTHONPATH=python python -m compileall -q python/sgl_jax/srt/managers/schedule_batch.py python/sgl_jax/test/test_dp_sampler_regressions.py` passed.
+- Existing speculative unit suite note:
+  - `PYTHONPATH=python python -m pytest python/sgl_jax/test/speculative/test_eagle_tree_build.py -q` could not be used locally as a clean signal: without stubs it fails collection due missing `llguidance`; with stubs it reaches Pallas kernels and fails on CPU with `ValueError: Only interpret mode is supported on CPU backend`.
+  - TPU validation is still required for that kernel-level suite or for a real model E2E spec run.
