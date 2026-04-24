@@ -333,7 +333,7 @@ Remaining test-quality gap:
 
 ### Fix 7: multimodal Qwen2.5-VL with DP attention
 
-Status: Implementation complete; final TPU rerun pending because local `kubectl` cannot refresh GKE credentials.
+Status: Fixed.
 
 TDD plan:
 
@@ -375,9 +375,11 @@ Local verification after implementation:
 - `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_dp_sampler_regressions.py -q` passed with 14 tests.
 - `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_mixed_chunk_dp.py -q` passed with 2 tests.
 
-TPU verification status:
+TPU verification after fix:
 
 - The pre-fix and intermediate TPU runs were executed on `tpu7x-multi-slice-4-job-xz-0-wr6rk` and produced the failures above.
-- The final rerun after commit `0f44f9e2c` could not start because local `kubectl` failed before reaching the pod:
+- The first final rerun after commit `0f44f9e2c` could not start because local `kubectl` failed before reaching the pod:
   `gke-gcloud-auth-plugin failed` while `gcloud config config-helper` attempted to refresh an access token from `oauth2.googleapis.com` and hit SSL EOF/read timeout errors.
-  This is a local Kubernetes credential refresh/network blocker, not a model/test failure.
+  This was a local Kubernetes credential refresh/network blocker, not a model/test failure.
+- After `kubectl` recovered, synced `/sglang-jax` to commit `54739e472`.
+- `source /tmp/tpu_logs/venv/bin/activate && export SGLANG_JAX_QWEN2_5_VL_MODEL=/models/Qwen2.5-VL-3B-Instruct && PYTHONPATH=python:test/srt python -m unittest test.srt.multimodal.test_qwen2_5_vl_dp -v` passed on `tpu7x-multi-slice-4-job-xz-0-wr6rk`.
