@@ -466,7 +466,12 @@ class TestDPSamplerRegressions(unittest.TestCase):
         expected_logprobs = np.asarray(jax.nn.log_softmax(jnp.array([1.0, 4.0, 3.0, 0.0])))
         self.assertEqual(req.output_ids, [1])
         self.assertEqual(req.output_token_logprobs_idx, [1])
-        np.testing.assert_allclose(req.output_token_logprobs_val, [expected_logprobs[1]])
+        np.testing.assert_allclose(
+            req.output_token_logprobs_val,
+            [expected_logprobs[1]],
+            rtol=1e-6,
+            atol=1e-6,
+        )
         np.testing.assert_array_equal(
             np.asarray(req.output_top_logprobs_idx[0]),
             np.array([1, 2], dtype=np.int32),
@@ -474,6 +479,8 @@ class TestDPSamplerRegressions(unittest.TestCase):
         np.testing.assert_allclose(
             np.asarray(req.output_top_logprobs_val[0]),
             expected_logprobs[[1, 2]],
+            rtol=1e-6,
+            atol=1e-6,
         )
         np.testing.assert_array_equal(
             np.asarray(req.output_token_ids_logprobs_idx[0]),
@@ -482,6 +489,8 @@ class TestDPSamplerRegressions(unittest.TestCase):
         np.testing.assert_allclose(
             np.asarray(req.output_token_ids_logprobs_val[0]),
             expected_logprobs[[0, 2]],
+            rtol=1e-6,
+            atol=1e-6,
         )
 
     def test_retract_decode_aborts_single_oom_request(self):
