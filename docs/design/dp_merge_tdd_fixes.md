@@ -18,7 +18,7 @@ This document tracks the risks found while reviewing the DP merge branch and rec
 | 6 | Speculative decoding still references old batch fields | Spec decode/EAGLE can fail after DP refactor | Yes when spec is enabled | P1 | Medium-high | Fixed |
 | 7 | Multimodal/MRoPE/deepstack are disabled in DP model worker path | Multimodal, MRoPE, deepstack regressions | Yes | P1 | Medium-high | Fixed |
 | 8 | Grammar masks use compact request order instead of padded DP order | JSON schema/regex/grammar rows can be misaligned | Mostly dp_size>1 | P1 | Medium | Fixed |
-| 9 | Logprobs tests are skipped or incomplete | Logprob behavior is not protected by CI | Yes, worse for dp_size>1 | P1 | Medium | Pending |
+| 9 | Logprobs tests are skipped or incomplete | Logprob behavior is not protected by CI | Yes, worse for dp_size>1 | P1 | Medium | Fixed locally; TPU pending |
 | 10 | Missing explicit `tp_size % dp_size == 0` validation | Bad launch config fails late/unclearly | No | P2 | Low | Pending |
 | 11 | `need_top_p_sampling` and `need_top_k_sampling` are not merged | Currently low functional impact because sampler uses values directly | Low | P2 | Low | Pending |
 | 12 | `repetition_penalty` and `logit_bias` do not appear wired into sampler | Parameter compatibility gap | Not clearly a DP regression | P2 | Medium | Pending |
@@ -478,3 +478,29 @@ TPU v6e-4 verification:
 - `cd /home/gcpuser/sglang-jax && source /home/gcpuser/jax-env/bin/activate && bash scripts/killall_sglang.sh || true && PYTHONPATH=python:test/srt python -m unittest test.srt.openai_server.features.test_dp_grammar -v` passed on v6e-4.
 - The e2e logs confirmed `Qwen/Qwen3-1.7B`, `load_format=dummy`, `tp_size=4`, `dp_size=2`, `grammar_backend=llguidance`, and the target mixed batch `#prefill per DP: [1, 1]`.
 - The e2e reported `Ran 1 test in 60.840s` and the EBNF-constrained DP-rank-1 response matched `Hello`.
+
+### Fix 9: DP logprob e2e coverage
+
+Status: Fixed locally; TPU e2e pending.
+
+TDD plan:
+
+1. Keep the existing `test/srt/test_logprobs.py` unchanged. It is a single-TPU exact-value Engine test and should not be loosened for this DP-attn merge.
+2. Use the existing DP sampler regression tests as the failing/protective unit coverage for padded logprob layout.
+3. Add a real server e2e on the same v6e-4 DP dummy server used by the grammar test.
+4. Pin the request to `dp_rank=1` and request `return_logprob`, `top_logprobs_num`, and `token_ids_logprob`.
+5. Verify the returned `/generate` response has output logprobs, top logprobs, and requested token-id logprobs for every generated token.
+6. Run the local unit suite and then the e2e on v6e-4 TPU.
+
+Coverage added:
+
+- `test/srt/openai_server/features/test_dp_grammar.py::TestDPGrammar::test_logprobs_on_nonzero_dp_rank`
+- This reuses the `Qwen/Qwen3-1.7B` `load_format=dummy` DP server with `tp_size=4` and `dp_size=2`.
+- The request uses `dp_rank=1`, which protects the nonzero-DP padded row path.
+- `test/srt/run_suite.py` already includes this file in `e2e-test-tpu-v6e-4`.
+
+Local verification after implementation:
+
+- `PYTHONPATH=python python -m ruff check test/srt/openai_server/features/test_dp_grammar.py` passed.
+- `python -m compileall -q test/srt/openai_server/features/test_dp_grammar.py` passed.
+- `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_dp_sampler_regressions.py -q` passed with 15 tests.

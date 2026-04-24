@@ -114,6 +114,34 @@ class TestDPGrammar(CustomTestCase):
         self.assertTrue(unconstrained["text"], unconstrained)
         self.assertRegex(constrained["text"].strip(), re.compile(r"^Hello$"))
 
+    def test_logprobs_on_nonzero_dp_rank(self):
+        body = self._generate(
+            {
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 3,
+                    "top_k": 1,
+                },
+                "return_logprob": True,
+                "logprob_start_len": 1,
+                "top_logprobs_num": 2,
+                "token_ids_logprob": [0, 1],
+                "dp_rank": 1,
+            }
+        )
+
+        output_ids = body["output_ids"]
+        meta_info = body["meta_info"]
+        self.assertEqual(len(output_ids), 3, body)
+        self.assertEqual(len(meta_info["output_token_logprobs"]), len(output_ids), body)
+        self.assertEqual(len(meta_info["output_top_logprobs"]), len(output_ids), body)
+        self.assertEqual(len(meta_info["output_token_ids_logprobs"]), len(output_ids), body)
+        for top_logprobs in meta_info["output_top_logprobs"]:
+            self.assertEqual(len(top_logprobs), 2, body)
+        for token_ids_logprobs in meta_info["output_token_ids_logprobs"]:
+            self.assertEqual([item[1] for item in token_ids_logprobs], [0, 1], body)
+
 
 if __name__ == "__main__":
     unittest.main()
