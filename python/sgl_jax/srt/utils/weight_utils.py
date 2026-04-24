@@ -514,7 +514,9 @@ class WeightLoader:
             # Free CPU buffers for this layer
             del buf["weight"], buf["scale"]
 
-            # Concat on CPU, convert to bf16, device_put sharded to TPU.
+            # Concat on CPU, convert to bf16, shard to TPU via callback.
+            # Uses make_array_from_callback to avoid the allgather that
+            # device_put triggers in multi-host (assert_equal OOM).
             # Process Q/K/V sequentially to limit peak CPU memory.
             attn = layers[layer_idx].self_attn
             for proj_name, parts in [
@@ -522,9 +524,16 @@ class WeightLoader:
                 ("k_proj", k_parts),
                 ("v_proj", v_parts),
             ]:
-                merged = np.concatenate(parts, axis=1).astype(ml_dtypes.bfloat16)
+                merged = np.ascontiguousarray(
+                    np.concatenate(parts, axis=1).astype(ml_dtypes.bfloat16)
+                )
                 del parts[:]
-                weight = jax.device_put(jnp.array(merged), tp_sharding)
+                # Bind merged via default arg to avoid late-binding closure issue.
+                weight = jax.make_array_from_callback(
+                    merged.shape,
+                    tp_sharding,
+                    lambda idx, m=merged: jnp.array(m[idx]),
+                )
                 del merged
                 setattr(
                     attn,
