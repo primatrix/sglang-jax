@@ -2154,6 +2154,125 @@ class ScheduleBatch:
             grammars=[req.grammar for req in all_reqs] if self.has_grammar else None,
         )
 
+    def _merge_mrope_positions(
+        self,
+        per_dp_token_size: int,
+        total_token_size: int,
+    ) -> np.ndarray | None:
+        has_mrope = any(
+            _extract_mm_value(getattr(req, "mm_inputs", None), "mrope_positions") is not None
+            or _extract_mm_value(getattr(req, "mm_inputs", None), "mrope_position_delta")
+            is not None
+            for info in self.reqs_info
+            for req in (info.reqs or [])
+        )
+        if not has_mrope:
+            return None
+
+        mrope_positions = np.zeros((3, total_token_size), dtype=np.int32)
+        offset = 0
+        for info in self.reqs_info:
+            if info.reqs and info.seq_lens is not None:
+                dp_mrope_positions = _compute_mrope_positions_for_batch(
+                    info.reqs,
+                    self.forward_mode,
+                    info.seq_lens,
+                    per_dp_token_size,
+                    info.prefix_lens if self.forward_mode.is_extend() else None,
+                    info.extend_lens if self.forward_mode.is_extend() else None,
+                    force=True,
+                )
+                if dp_mrope_positions is not None:
+                    mrope_positions[:, offset : offset + per_dp_token_size] = dp_mrope_positions[
+                        :, :per_dp_token_size
+                    ]
+            offset += per_dp_token_size
+
+        return mrope_positions
+
+    def _merge_multimodal_inputs(
+        self,
+        per_dp_token_size: int,
+        total_token_size: int,
+    ) -> tuple[np.ndarray | None, bool, np.ndarray | None]:
+        if not self.forward_mode.is_extend():
+            return None, False, None
+
+        input_embedding_chunks = []
+        deepstack_chunks = []
+        offset = 0
+
+        for info in self.reqs_info:
+            if not info.reqs:
+                offset += per_dp_token_size
+                continue
+
+            local_token_offset = 0
+            for req, prefix_len, extend_len in zip(info.reqs, info.prefix_lens, info.extend_lens):
+                start = int(prefix_len or 0)
+                end = start + int(extend_len or 0)
+                dst_start = offset + local_token_offset
+                dst_end = dst_start + int(extend_len or 0)
+
+                mm_embedding = _extract_mm_value(
+                    getattr(req, "mm_inputs", None), "multimodal_embedding"
+                )
+                if mm_embedding is None:
+                    mm_embedding = getattr(req, "multimodal_embedding", None)
+                if mm_embedding is not None and extend_len:
+                    chunk = np.asarray(mm_embedding)[start:end]
+                    input_embedding_chunks.append((dst_start, dst_end, chunk))
+
+                if getattr(req, "apply_for_deepstack", False) and extend_len:
+                    visual_embedding = getattr(req, "deepstack_visual_embedding", None)
+                    visual_pos_mask = getattr(req, "deepstack_visual_pos_mask", None)
+                    if visual_embedding is not None and visual_pos_mask is not None:
+                        visual_embedding = np.asarray(visual_embedding)
+                        visual_pos_mask = np.asarray(visual_pos_mask).astype(bool)
+                        chunk_mask = visual_pos_mask[start:end]
+                        chunk_indices = np.flatnonzero(chunk_mask) + dst_start
+                        if chunk_indices.size:
+                            if visual_embedding.shape[1] == visual_pos_mask.shape[0]:
+                                chunk_embedding = visual_embedding[:, start:end, :][
+                                    :, chunk_mask, :
+                                ]
+                            else:
+                                full_visual_indices = np.flatnonzero(visual_pos_mask)
+                                selected_positions = np.flatnonzero(chunk_mask) + start
+                                selected_ordinals = np.searchsorted(
+                                    full_visual_indices, selected_positions
+                                )
+                                chunk_embedding = visual_embedding[:, selected_ordinals, :]
+                            deepstack_chunks.append((chunk_indices, chunk_embedding))
+
+                local_token_offset += int(extend_len or 0)
+            offset += per_dp_token_size
+
+        input_embedding = None
+        if input_embedding_chunks:
+            first_chunk = input_embedding_chunks[0][2]
+            input_embedding = np.zeros(
+                (total_token_size, first_chunk.shape[-1]),
+                dtype=first_chunk.dtype,
+            )
+            for dst_start, dst_end, chunk in input_embedding_chunks:
+                input_embedding[dst_start:dst_end] = chunk
+
+        deepstack_visual_embedding = None
+        apply_for_deepstack = False
+        if deepstack_chunks:
+            first_deepstack = deepstack_chunks[0][1]
+            deepstack_visual_embedding = np.zeros(
+                (first_deepstack.shape[0], total_token_size, first_deepstack.shape[-1]),
+                dtype=first_deepstack.dtype,
+            )
+            for chunk_indices, chunk_embedding in deepstack_chunks:
+                if chunk_indices.size == chunk_embedding.shape[1]:
+                    deepstack_visual_embedding[:, chunk_indices, :] = chunk_embedding
+            apply_for_deepstack = bool(np.any(deepstack_visual_embedding))
+
+        return input_embedding, apply_for_deepstack, deepstack_visual_embedding
+
     def get_model_worker_batch(
         self,
         token_paddings: list,
@@ -2220,7 +2339,16 @@ class ScheduleBatch:
             # Pad to total_bs
             lora_ids = lora_ids + ["0"] * (total_bs - real_bs)
 
-        # input_embedding = None
+        mrope_positions_cpu = self._merge_mrope_positions(
+            per_dp_token_padding,
+            total_token_size,
+        )
+        input_embedding, apply_for_deepstack, deepstack_visual_embedding = (
+            self._merge_multimodal_inputs(
+                per_dp_token_padding,
+                total_token_size,
+            )
+        )
 
         # Merge per-DP top_logprobs_nums / token_ids_logprobs with the same
         # offset_bs += per_dp_bs_padding padding scheme used in _merge_batch_metadata.
@@ -2255,7 +2383,7 @@ class ScheduleBatch:
             token_ids_logprobs=token_ids_logprobs,
             sampling_info=sampling_info,
             positions=positions_cpu,
-            mrope_positions=None,
+            mrope_positions=mrope_positions_cpu,
             cache_loc=cache_loc_cpu,
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
@@ -2271,9 +2399,9 @@ class ScheduleBatch:
             dp_size=self.dp_size,
             per_dp_bs_size=per_dp_bs_padding,
             launch_done=self.launch_done,
-            input_embedding=None,
-            apply_for_deepstack=False,
-            deepstack_visual_embedding=None,
+            input_embedding=input_embedding,
+            apply_for_deepstack=apply_for_deepstack,
+            deepstack_visual_embedding=deepstack_visual_embedding,
         )
 
     def get_spec_model_worker_batch(
@@ -2662,6 +2790,7 @@ def _compute_mrope_positions_for_batch(
     input_ids_len: int,
     extend_prefix_lens: np.ndarray | None,
     extend_seq_lens: np.ndarray | None,
+    force: bool = False,
 ) -> np.ndarray | None:
     mm_inputs_list = [getattr(req, "mm_inputs", None) for req in reqs]
     has_mrope = any(
@@ -2669,7 +2798,7 @@ def _compute_mrope_positions_for_batch(
         or _extract_mm_value(mm, "mrope_position_delta") is not None
         for mm in mm_inputs_list
     )
-    if not has_mrope:
+    if not has_mrope and not force:
         return None
 
     if forward_mode.is_decode():
