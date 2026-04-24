@@ -10,7 +10,7 @@ This document tracks the risks found while reviewing the DP merge branch and rec
 
 | Order | Issue | Impact | dp_size=1 impact | Priority | Difficulty | Status |
 | ---: | --- | --- | --- | --- | --- | --- |
-| 1 | Merge conflict with `upstream/main` in `schedule_batch.py` | Branch cannot be merged directly | Yes | P0 | Medium | Pending |
+| 1 | Merge conflict with `upstream/main` in `schedule_batch.py` | Branch cannot be merged directly | Yes | P0 | Medium | Fixed |
 | 2 | `min_p` flag is dropped in `_merge_sampling_info()` | `min_p` values are copied but filtering is disabled | Yes | P0 | Low | Fixed |
 | 3 | Penalty state is dropped in merged sampling info | `frequency_penalty`, `presence_penalty`, `min_new_tokens` do not affect logits | Yes | P0 | Medium | Fixed |
 | 4 | Logprob options interact badly with padded DP layout | `top_logprobs_num`, `token_ids_logprob`, `return_logprob` can index wrong rows or build ragged arrays | Yes | P0 | Medium | Fixed |
@@ -224,3 +224,28 @@ Result:
   - `source /tmp/tpu_logs/venv/bin/activate && PYTHONPATH=python python -m unittest sgl_jax.test.test_dp_sampler_regressions -v` passed.
   - `source /tmp/tpu_logs/venv/bin/activate && PYTHONPATH=python python -m unittest sgl_jax.test.test_sampler -v` passed.
   - `source /tmp/tpu_logs/venv/bin/activate && PYTHONPATH=python python -m unittest sgl_jax.test.test_mixed_chunk_dp -v` passed.
+
+### Fix 5: upstream merge conflict resolution
+
+Status: Fixed.
+
+TDD plan:
+
+1. Use `git merge-tree upstream/main HEAD` as the failing mergeability check.
+2. Observe the conflict before attempting the merge.
+3. Merge `upstream/main` and resolve conflicts while preserving the DP refactor and upstream graceful-abort behavior.
+4. Re-run mergeability, compile, and DP regression tests after the merge.
+
+Result:
+
+- Failing check before fix:
+  - `git merge-tree upstream/main HEAD` exited with conflicts in `python/sgl_jax/srt/managers/schedule_batch.py` and `python/sgl_jax/srt/managers/scheduler.py`.
+- Conflict resolution:
+  - `scheduler.py`: kept the three-value `retract_decode()` contract and `AbortReq` sending path; only the duplicated comment differed from upstream.
+  - `schedule_batch.py`: kept the DP-aware `retract_decode()`, `release_req()`, `retract_all()`, `prepare_for_idle()`, and `_evict_swa()` structure.
+  - `schedule_batch.py`: also carried over upstream's `tree_cache.disable` handling into the DP `release_req()` path, so disabled radix cache follows the same release behavior as `ChunkCache`.
+  - Automatically merged upstream additions from `#941` and `#944`, including DeepSeek V3 related files and model/layer updates.
+- Local verification after conflict resolution:
+  - `PYTHONPATH=python python -m compileall -q benchmark/gsm8k/__init__.py benchmark/gsm8k/bench_sglang_jax.py python/sgl_jax/srt/configs/model_config.py python/sgl_jax/srt/layers/attention/mla.py python/sgl_jax/srt/layers/embeddings.py python/sgl_jax/srt/layers/moe.py python/sgl_jax/srt/managers/schedule_batch.py python/sgl_jax/srt/managers/scheduler.py python/sgl_jax/srt/models/deepseek_v3.py python/sgl_jax/srt/models/grok.py` passed.
+  - `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_dp_sampler_regressions.py -q` passed.
+  - `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_mixed_chunk_dp.py -q` passed.

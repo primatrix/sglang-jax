@@ -1699,6 +1699,9 @@ class Scheduler(
                 if current_bs < self.per_dp_max_running_requests:
                     info.batch_is_full = False
 
+        if batch.is_empty():
+            return batch
+
         # Update batch arrays
         batch.prepare_for_decode()
         return batch

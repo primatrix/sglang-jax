@@ -1253,7 +1253,11 @@ class ScheduleBatch:
         req = info.reqs[idx]
         seq_lens_cpu = info.seq_lens
 
-        if isinstance(self.tree_cache, ChunkCache):
+        radix_cache_disabled = isinstance(self.tree_cache, ChunkCache) or getattr(
+            self.tree_cache, "disable", False
+        )
+
+        if radix_cache_disabled:
             # ChunkCache does not have eviction
             token_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : seq_lens_cpu[idx]
