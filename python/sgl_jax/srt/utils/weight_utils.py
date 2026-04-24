@@ -959,6 +959,54 @@ class WeightLoader:
 
         return lazy_arrays
 
+    def _load_fused_qkv_to_cpu_buffer(
+        self,
+        hf_key: str,
+        infos: list[dict],
+        mapping: "WeightMapping",
+        file_manager: SequentialSafetensorManager,
+    ):
+        """Load FP8 fused QKV weight/scale directly into CPU numpy.
+
+        Bypasses make_array_from_callback so the FP8 tensor never lands on
+        TPU HBM as a fully-replicated copy. The previous flow loaded onto
+        every TPU device (167 MB/layer × 70 layers ≈ 11.7 GB transient HBM
+        per device) and pulled back to CPU via np.asarray; nondeterministic
+        Python GC across 16 hosts left a few extra layers' worth of FP8 data
+        on some hosts' TPUs, causing TP memory imbalance check to fail.
+        """
+        if not hasattr(self.model, "_fused_qkv_buffers"):
+            logger.warning("Model has no _fused_qkv_buffers attr; skipping %s", hf_key)
+            return
+
+        target_path = mapping.target_path
+        is_scale = "SCALE" in target_path
+        layer_idx = int(target_path.rsplit("__", 1)[-1])
+
+        info = infos[0]
+        f = file_manager.get_handle(info["file"])
+        np_weight = f.get_tensor(hf_key)
+
+        # Reinterpret raw uint8 buffer as FP8 dtype when applicable.
+        st_dtype = info["dtype"]
+        fp8_dtype_map = {
+            "F8_E4M3": jnp.float8_e4m3fn,
+            "F8_E5M2": jnp.float8_e5m2,
+        }
+        if st_dtype in fp8_dtype_map:
+            np_weight = _view_as_fp8_if_needed(np_weight, fp8_dtype_map[st_dtype])
+
+        buf = self.model._fused_qkv_buffers.setdefault(layer_idx, {})
+        buf["scale" if is_scale else "weight"] = np_weight
+
+        logger.info(
+            "Loaded fused QKV %s for layer %d, shape=%s, dtype=%s (CPU direct)",
+            "scale" if is_scale else "weight",
+            layer_idx,
+            np_weight.shape,
+            np_weight.dtype,
+        )
+
     def _create_split_lazy_tensor(
         self,
         hf_key: str,
@@ -1755,6 +1803,15 @@ class WeightLoader:
                 if isinstance(mapping, str | list):
                     mapping = WeightMapping(target_path=mapping)
 
+                # Fused QKV (FP8): load directly to CPU numpy, never touch
+                # TPU HBM. Avoids per-host GC-timing imbalance from the
+                # previous TPU-then-pull-back-to-CPU detour.
+                if isinstance(mapping.target_path, str) and mapping.target_path.startswith(
+                    "__FUSED_QKV_"
+                ):
+                    self._load_fused_qkv_to_cpu_buffer(hf_key, infos, mapping, file_manager)
+                    continue
+
                 is_split_weight = len(infos) > 1 and mapping.concat_axis is not None
 
                 can_optimize = (
@@ -2297,18 +2354,25 @@ class WeightLoader:
 
         # Handle fused QKV buffer storage (used by MiMo-V2-Pro per-shard dequant).
         # target_path like "__FUSED_QKV_WEIGHT__42" stores into model._fused_qkv_buffers.
+        # NOTE: the fast path in load_weights_from_safetensors now intercepts
+        # __FUSED_QKV_* mappings and loads them directly into CPU numpy via
+        # _load_fused_qkv_to_cpu_buffer. This branch only fires if some other
+        # caller still routes a fused QKV weight through the JAX pipeline.
         if jax_path.startswith("__FUSED_QKV_"):
+            logger.warning(
+                "Fused QKV %s reached _handle_single_weight via slow path; "
+                "expected fast CPU-direct path. This causes transient TPU "
+                "HBM allocation that may unbalance multi-host memory.",
+                jax_path,
+            )
             if hasattr(self.model, "_fused_qkv_buffers"):
                 is_scale = "SCALE" in jax_path
                 layer_idx = int(jax_path.rsplit("__", 1)[-1])
                 buf = self.model._fused_qkv_buffers.setdefault(layer_idx, {})
-                # Store as numpy on CPU to avoid consuming TPU HBM.
-                # Each host computes identical dequant results from the same
-                # safetensor data; jax.device_put at the end handles sharding.
                 np_weight = np.asarray(processed_weight)
                 buf["scale" if is_scale else "weight"] = np_weight
                 logger.info(
-                    "Stored fused QKV %s for layer %d, shape=%s (CPU numpy)",
+                    "Stored fused QKV %s for layer %d, shape=%s (CPU numpy, slow)",
                     "scale" if is_scale else "weight",
                     layer_idx,
                     np_weight.shape,
