@@ -249,7 +249,8 @@ class SchedulerOutputProcessorMixin:
             cache_miss_count,
         )
 
-        batch.spec_info = result.next_draft_input
+        if result.next_draft_input is not None:
+            batch.spec_info = result.next_draft_input
 
     def _resolve_spec_decode_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
