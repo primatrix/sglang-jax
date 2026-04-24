@@ -394,7 +394,7 @@ TPU verification after fix:
 
 ### Fix 7 follow-up: Qwen2.5-VL DP e2e in v6e-4 CI
 
-Status: Fixed locally; TPU v6e-4 verification pending.
+Status: Fixed.
 
 TDD plan:
 
@@ -426,3 +426,12 @@ Local verification after implementation:
 - `PYTHONPATH=python python -m unittest python/sgl_jax/test/multimodal/test_stage_config_registry.py -v` passed.
 - `python -m compileall -q python/sgl_jax/test/multimodal/test_stage_config_registry.py python/sgl_jax/srt/multimodal/models/static_configs/yaml_registry.py test/srt/run_suite.py test/srt/multimodal/test_qwen2_5_vl_dp.py` passed.
 - `e2e-test-tpu-v6e-4` auto partition includes `test/srt/multimodal/test_qwen2_5_vl_dp.py` in partition 0 when `--auto-partition-size 2`.
+
+TPU v6e-4 verification:
+
+- On `kb-tpu`, cloned `/home/gcpuser/sglang-jax` at commit `ec599aaf6`.
+- Installed the branch into `/home/gcpuser/jax-env` with `uv pip install -e "python[all,qwen-vl]"`.
+- Copied `/models/Qwen/Qwen2.5-VL-3B-Instruct` to `/models/Qwen2.5-VL-3B-Instruct` so the e2e can use the simple default path.
+- `cd /home/gcpuser/sglang-jax && source /home/gcpuser/jax-env/bin/activate && PYTHONPATH=python python -m unittest python/sgl_jax/test/multimodal/test_stage_config_registry.py -v` passed.
+- `cd /home/gcpuser/sglang-jax && source /home/gcpuser/jax-env/bin/activate && bash scripts/killall_sglang.sh || true && PYTHONPATH=python:test/srt python -m unittest test.srt.multimodal.test_qwen2_5_vl_dp -v` passed on v6e-4.
+- The e2e logs confirmed `qwen2_5_vl_stage_config_tp4.yaml`, prefill on DP layout `#prefill per DP: [1, 0]`, HTTP 200 from `/v1/chat/completions`, and `Ran 1 test in 64.694s`.
