@@ -1946,11 +1946,13 @@ class ScheduleBatch:
         top_ks = np.ones(total_bs, dtype=np.int32)
         min_ps = np.zeros(total_bs, dtype=np.float32)
         sampling_seeds = None
+        linear_penalty = None
 
         offset_bs = 0
         has_sampling_seeds = False
         vocab_size = 0
         is_all_greedy = True
+        need_min_p_sampling = False
 
         for dp_rank in range(self.dp_size):
             info = self.reqs_info[dp_rank]
@@ -1966,12 +1968,29 @@ class ScheduleBatch:
 
             if not info.sampling_info.is_all_greedy:
                 is_all_greedy = False
+            need_min_p_sampling |= dp_sampling.need_min_p_sampling
 
             # Copy sampling parameters
             temperatures[offset_bs : offset_bs + dp_bs] = dp_sampling.temperatures[:dp_bs]
             top_ps[offset_bs : offset_bs + dp_bs] = dp_sampling.top_ps[:dp_bs]
             top_ks[offset_bs : offset_bs + dp_bs] = dp_sampling.top_ks[:dp_bs]
             min_ps[offset_bs : offset_bs + dp_bs] = dp_sampling.min_ps[:dp_bs]
+
+            dp_linear_penalty = dp_sampling.linear_penalty
+            if (
+                dp_linear_penalty is None
+                and dp_sampling.penalizer_orchestrator
+                and dp_sampling.penalizer_orchestrator.is_required
+            ):
+                dp_linear_penalty = dp_sampling.penalizer_orchestrator.apply()
+
+            if dp_linear_penalty is not None:
+                if linear_penalty is None:
+                    linear_penalty = np.zeros(
+                        (total_bs, dp_linear_penalty.shape[1]),
+                        dtype=dp_linear_penalty.dtype,
+                    )
+                linear_penalty[offset_bs : offset_bs + dp_bs] = dp_linear_penalty[:dp_bs]
 
             if dp_sampling.sampling_seeds is not None:
                 if sampling_seeds is None:
@@ -1989,7 +2008,9 @@ class ScheduleBatch:
             min_ps=min_ps,
             vocab_size=vocab_size,
             is_all_greedy=is_all_greedy,
+            need_min_p_sampling=need_min_p_sampling,
             sampling_seeds=sampling_seeds if has_sampling_seeds else None,
+            linear_penalty=linear_penalty,
             grammars=[req.grammar for req in all_reqs] if self.has_grammar else None,
         )
 
@@ -2721,7 +2742,12 @@ class ModelWorkerSamplingInfo:
         return ret
 
     def update_penalties(self):
-        self.linear_penalty = None
+        if self.linear_penalty is not None:
+            return
+        if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
+            self.linear_penalty = self.penalizer_orchestrator.apply()
+        else:
+            self.linear_penalty = None
 
     def update_grammar_vocab_mask(self):
         """Update vocabulary masks from grammars before sampling."""
