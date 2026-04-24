@@ -322,6 +322,9 @@ Verification:
 - `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_dp_sampler_regressions.py -q` passed with 14 tests.
 - First TPU run found a test-tolerance issue, not a behavior mismatch: `test_dp_sampler_logprobs_are_returned_to_request_in_padded_layout` differed from the expected float32 logprob by `8.9e-08` under `np.testing.assert_allclose()` defaults.
 - The logprob behavior test now uses `rtol=1e-6, atol=1e-6` for float32 comparisons.
+- TPU verification after tolerance adjustment:
+  - On `tpu7x-multi-slice-4-job-xz-0-wr6rk`, synced `/sglang-jax` to commit `de57abea5`.
+  - `source /tmp/tpu_logs/venv/bin/activate && PYTHONPATH=python python -m unittest sgl_jax.test.test_dp_sampler_regressions -v` passed with 14 tests.
 
 Remaining test-quality gap:
 
