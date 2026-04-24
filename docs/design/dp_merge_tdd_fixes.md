@@ -290,3 +290,10 @@ Result:
 - Existing speculative unit suite note:
   - `PYTHONPATH=python python -m pytest python/sgl_jax/test/speculative/test_eagle_tree_build.py -q` could not be used locally as a clean signal: without stubs it fails collection due missing `llguidance`; with stubs it reaches Pallas kernels and fails on CPU with `ValueError: Only interpret mode is supported on CPU backend`.
   - TPU validation is still required for that kernel-level suite or for a real model E2E spec run.
+- TPU verification after fix:
+  - On `tpu7x-multi-slice-4-job-xz-0-wr6rk`, synced `/sglang-jax` to commit `93f6ee80`.
+  - `source /tmp/tpu_logs/venv/bin/activate && PYTHONPATH=python python -m unittest sgl_jax.test.test_dp_sampler_regressions -v` passed, including the scheduler-level spec regression.
+  - `source /tmp/tpu_logs/venv/bin/activate && PYTHONPATH=python python -m unittest sgl_jax.test.test_sampler -v` passed.
+  - `source /tmp/tpu_logs/venv/bin/activate && PYTHONPATH=python python -m unittest sgl_jax.test.test_mixed_chunk_dp -v` passed.
+  - `source /tmp/tpu_logs/venv/bin/activate && PYTHONPATH=python python -m unittest sgl_jax.test.speculative.test_eagle_tree_build -v` passed on TPU.
+  - A real model E2E spec run is still not recorded here; `/models` on the TPU host has target checkpoints such as `Qwen3-8B`, but no obvious local EAGLE/EAGLE3 draft checkpoint was present.
