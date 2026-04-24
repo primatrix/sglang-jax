@@ -17,7 +17,7 @@ This document tracks the risks found while reviewing the DP merge branch and rec
 | 5 | Decode OOM graceful abort from upstream is not preserved | Decode OOM may assert/crash instead of aborting requests | Yes | P0 | Medium | Fixed |
 | 6 | Speculative decoding still references old batch fields | Spec decode/EAGLE can fail after DP refactor | Yes when spec is enabled | P1 | Medium-high | Fixed |
 | 7 | Multimodal/MRoPE/deepstack are disabled in DP model worker path | Multimodal, MRoPE, deepstack regressions | Yes | P1 | Medium-high | Fixed |
-| 8 | Grammar masks use compact request order instead of padded DP order | JSON schema/regex/grammar rows can be misaligned | Mostly dp_size>1 | P1 | Medium | Pending |
+| 8 | Grammar masks use compact request order instead of padded DP order | JSON schema/regex/grammar rows can be misaligned | Mostly dp_size>1 | P1 | Medium | Fixed locally; TPU pending |
 | 9 | Logprobs tests are skipped or incomplete | Logprob behavior is not protected by CI | Yes, worse for dp_size>1 | P1 | Medium | Pending |
 | 10 | Missing explicit `tp_size % dp_size == 0` validation | Bad launch config fails late/unclearly | No | P2 | Low | Pending |
 | 11 | `need_top_p_sampling` and `need_top_k_sampling` are not merged | Currently low functional impact because sampler uses values directly | Low | P2 | Low | Pending |
@@ -435,3 +435,37 @@ TPU v6e-4 verification:
 - `cd /home/gcpuser/sglang-jax && source /home/gcpuser/jax-env/bin/activate && PYTHONPATH=python python -m unittest python/sgl_jax/test/multimodal/test_stage_config_registry.py -v` passed.
 - `cd /home/gcpuser/sglang-jax && source /home/gcpuser/jax-env/bin/activate && bash scripts/killall_sglang.sh || true && PYTHONPATH=python:test/srt python -m unittest test.srt.multimodal.test_qwen2_5_vl_dp -v` passed on v6e-4.
 - The e2e logs confirmed `qwen2_5_vl_stage_config_tp4.yaml`, prefill on DP layout `#prefill per DP: [1, 0]`, HTTP 200 from `/v1/chat/completions`, and `Ran 1 test in 64.694s`.
+
+### Fix 8: grammar masks in DP padded layout
+
+Status: Fixed locally; TPU e2e pending.
+
+TDD plan:
+
+1. Add a regression test that builds a DP batch with one unconstrained request on DP rank 0 and one grammar-constrained request on DP rank 1.
+2. Run the regression before the fix and confirm the grammar mask is not aligned to the padded DP row.
+3. Merge grammar objects into the same padded per-DP batch layout as sampling arrays.
+4. Initialize grammar vocab masks to allow-all before filling constrained rows, so unconstrained real rows in a mixed batch are not accidentally fully masked.
+5. Add a real server e2e using `/generate` with explicit `dp_rank=0` and `dp_rank=1`, one unconstrained request and one EBNF-constrained request.
+6. Run the unit regression locally, then run the e2e on v6e-4 TPU.
+
+Failure observed before fix:
+
+- `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_dp_sampler_regressions.py::TestDPSamplerRegressions::test_dp_grammar_masks_use_padded_request_layout -q` failed.
+- The first row of `vocab_mask` was `[0, 0]` instead of allow-all `[-1, -1]`.
+- The compact grammar list would place the DP-rank-1 grammar at padded row 1 instead of global row 2, leaving the real grammar request row fully masked.
+
+Fixes:
+
+- `_merge_sampling_info()` now creates `grammars` with length `total_bs` and writes each request grammar at `dp_rank * per_dp_bs_size + local_index`.
+- `ModelWorkerSamplingInfo.update_grammar_vocab_mask()` now fills the allocated mask with `-1` before applying active grammar rows.
+- `test/srt/openai_server/features/test_dp_grammar.py` adds a real `/generate` e2e with concurrent requests pinned to different DP ranks.
+- `test/srt/run_suite.py` includes the new e2e in `e2e-test-tpu-v6e-4`.
+
+Local verification after implementation:
+
+- `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_dp_sampler_regressions.py::TestDPSamplerRegressions::test_dp_grammar_masks_use_padded_request_layout -q` passed.
+- `PYTHONPATH=python python -m pytest python/sgl_jax/test/test_dp_sampler_regressions.py -q` passed with 15 tests.
+- `PYTHONPATH=python python -m ruff check python/sgl_jax/srt/managers/schedule_batch.py python/sgl_jax/test/test_dp_sampler_regressions.py test/srt/openai_server/features/test_dp_grammar.py test/srt/run_suite.py` passed.
+- `python -m compileall -q python/sgl_jax/srt/managers/schedule_batch.py python/sgl_jax/test/test_dp_sampler_regressions.py test/srt/openai_server/features/test_dp_grammar.py test/srt/run_suite.py` passed.
+- `e2e-test-tpu-v6e-4` auto partition includes `test/srt/openai_server/features/test_dp_grammar.py` in partition 1 when `--auto-partition-size 2`.
