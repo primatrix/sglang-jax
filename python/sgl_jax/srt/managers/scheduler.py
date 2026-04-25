@@ -1518,6 +1518,13 @@ class Scheduler(
             if self.chunked_reqs[dp_rank] is not None:
                 self.chunked_reqs[dp_rank].init_next_round_input()
                 self.chunked_reqs[dp_rank] = adder.add_chunked_req(self.chunked_reqs[dp_rank])
+                # If still chunked (not the final chunk), re-mark is_chunked so the
+                # output processor keeps treating this prefill as in-progress and does
+                # not append the spurious mid-chunk sampled token nor invoke
+                # cache_finished_req (which would free req_pool_idx behind the
+                # scheduler's back, causing a later double-free at line ~1426).
+                if self.chunked_reqs[dp_rank] is not None:
+                    self.chunked_reqs[dp_rank].is_chunked += 1
 
         # Collect existing LoRA IDs in the running batch if LoRA is enabled
         if self.lora_paths is not None:
