@@ -1245,11 +1245,19 @@ class ScheduleBatch:
         req = info.reqs[idx]
         seq_lens_cpu = info.seq_lens
 
-        if isinstance(self.tree_cache, ChunkCache):
-            # ChunkCache does not have eviction
+        radix_cache_disabled = isinstance(self.tree_cache, ChunkCache) or getattr(
+            self.tree_cache, "disable", False
+        )
+
+        if radix_cache_disabled:
+            # ChunkCache or disabled radix cache: no eviction, free directly.
+            # Filter sentinel zeros: aborted/retracted reqs may have unfilled
+            # tail entries == 0 (sentinel page), which would corrupt the
+            # allocator's available_size invariant.
             token_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : seq_lens_cpu[idx]
             ]
+            token_indices = token_indices[token_indices != 0]
             self.token_to_kv_pool_allocator.free(token_indices, dp_rank)
             self.req_to_token_pool.free(req.req_pool_idx)
         else:
@@ -2370,7 +2378,7 @@ class ScheduleBatch:
         Args:
             num_tokens_per_dp: Dict mapping dp_rank to tokens needed for that rank
         """
-        if isinstance(self.tree_cache, ChunkCache):
+        if isinstance(self.tree_cache, ChunkCache) or getattr(self.tree_cache, "disable", False):
             return
 
         # Per-DP loop
