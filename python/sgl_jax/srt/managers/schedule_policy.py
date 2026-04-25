@@ -456,9 +456,10 @@ class PrefillAdder:
 
     def add_one_req_ignore_eos(self, req: Req):
         dp_rank = req.dp_rank if req.dp_rank is not None else 0
-        if self.ceil_paged_tokens(req.extend_input_len) > min(
-            self.cur_rem_tokens_for_dp(dp_rank), self.rem_total_tokens_for_dp(dp_rank)
-        ):
+        # Match add_one_req's gate: use rem_total_tokens_for_dp only (full-pool capacity for hybrid).
+        # cur_rem_tokens_for_dp would MIN against the small SWA pool and block large prompts that
+        # chunked prefill could otherwise admit one chunk at a time.
+        if self.ceil_paged_tokens(req.extend_input_len) > self.rem_total_tokens_for_dp(dp_rank):
             return AddReqResult.NO_TOKEN
 
         def add_req_state(r, insert_sort=False):

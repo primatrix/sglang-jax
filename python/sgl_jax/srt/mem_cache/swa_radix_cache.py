@@ -391,6 +391,9 @@ class SWARadixCache(BasePrefixCache):
                 req.req_pool_idx,
                 : len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
             ]
+            # Drop sentinel (unallocated) entries — present when a request is aborted
+            # mid-chunked-prefill before all chunks populated req_to_token.
+            kv_indices = kv_indices[kv_indices != 0]
             self.token_to_kv_pool_allocator.free(kv_indices, dp_rank=dp_rank)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
