@@ -103,7 +103,7 @@ def quantized_matmul_kernel(
     save_x_q = quantize_activation and n_in == 1 and n_out > 1
 
     # TODO(amandaliang): Make this configurable.
-    acc_dtype = jnp.bfloat16
+    acc_dtype = jnp.float32
     if quantize_activation and jnp.issubdtype(w_q.dtype, jnp.integer):
         acc_dtype = jnp.int32
 

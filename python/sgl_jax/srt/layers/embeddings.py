@@ -220,13 +220,13 @@ class RotaryEmbedding:
     ) -> tuple[jax.Array, jax.Array]:
         positions = positions.flatten()  # [num_tokens]
 
-        inv_freq = jnp.asarray(self._inv_freq_np, dtype=self.dtype)
+        inv_freq = jnp.asarray(self._inv_freq_np, dtype=jnp.float32)
 
         # Compute freqs = positions * inv_freq
         freqs = jnp.einsum("n,d->nd", positions.astype(jnp.float32), inv_freq)
 
-        cos = jnp.cos(freqs).astype(self.dtype)
-        sin = jnp.sin(freqs).astype(self.dtype)
+        cos = jnp.cos(freqs)
+        sin = jnp.sin(freqs)
 
         query_shape = query.shape
         num_tokens = positions.shape[0]
@@ -385,13 +385,13 @@ class MRotaryEmbedding(RotaryEmbedding):
         num_tokens = positions.shape[-1]
 
         # 1. Compute Cos/Sin for all 3 dimensions
-        inv_freq = jnp.asarray(self._inv_freq_np, dtype=self.dtype)
+        inv_freq = jnp.asarray(self._inv_freq_np, dtype=jnp.float32)
 
         # freqs: [3, num_tokens, rotary_dim // 2]
         freqs = jnp.einsum("cn,d->cnd", positions.astype(jnp.float32), inv_freq)
 
-        cos_all = jnp.cos(freqs).astype(self.dtype)
-        sin_all = jnp.sin(freqs).astype(self.dtype)
+        cos_all = jnp.cos(freqs)
+        sin_all = jnp.sin(freqs)
 
         if self.mrope_interleaved:
             # --- Interleaved Mode ---
@@ -537,8 +537,9 @@ def apply_rotary_emb(
         is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
             positional embeddings.
     """
-    cos = jnp.expand_dims(cos, axis=-2).astype(x.dtype)
-    sin = jnp.expand_dims(sin, axis=-2).astype(x.dtype)
+    orig_dtype = x.dtype
+    cos = jnp.expand_dims(cos, axis=-2)
+    sin = jnp.expand_dims(sin, axis=-2)
     if is_neox_style:
         x1, x2 = jnp.split(x, 2, axis=-1)
     else:
@@ -547,10 +548,10 @@ def apply_rotary_emb(
     o1 = x1 * cos - x2 * sin
     o2 = x2 * cos + x1 * sin
     if is_neox_style:
-        return jnp.concatenate((o1, o2), axis=-1)
+        return jnp.concatenate((o1, o2), axis=-1).astype(orig_dtype)
     else:
         stacked = jnp.stack((o1, o2), axis=-1)
-        return stacked.reshape(*stacked.shape[:-2], -1)
+        return stacked.reshape(*stacked.shape[:-2], -1).astype(orig_dtype)
 
 
 _ROPE_DICT: dict[tuple, RotaryEmbedding] = {}
@@ -765,11 +766,11 @@ class YarnRotaryEmbedding(RotaryEmbedding):
     ) -> tuple[jax.Array, jax.Array]:
         positions = positions.flatten()
 
-        inv_freq = jnp.asarray(self._inv_freq_np, dtype=self.dtype)
+        inv_freq = jnp.asarray(self._inv_freq_np, dtype=jnp.float32)
         freqs = jnp.einsum("n,d->nd", positions.astype(jnp.float32), inv_freq)
 
-        cos = (jnp.cos(freqs) * self._rope_mscale).astype(self.dtype)
-        sin = (jnp.sin(freqs) * self._rope_mscale).astype(self.dtype)
+        cos = jnp.cos(freqs) * self._rope_mscale
+        sin = jnp.sin(freqs) * self._rope_mscale
 
         query_shape = query.shape
         num_tokens = positions.shape[0]
