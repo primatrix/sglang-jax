@@ -76,9 +76,10 @@ class LinearBase(nnx.Module):
             x,
             self.weight.value,
             (((x.ndim - 1,), (0,)), ((), ())),
-            preferred_element_type=self.params_dtype,
+            preferred_element_type=jnp.float32,
             out_sharding=output_sharding,
         )
+        out = out.astype(self.params_dtype)
         if self.skip_bias_add:
             return out, self.bias
         if self.bias is not None:
