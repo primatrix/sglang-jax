@@ -132,9 +132,28 @@ class ReqToTokenPool:
 
     def free(self, free_index: int | list[int]):
         """Free request slots"""
+        # DEBUG: detect double-free / over-free
+        import traceback as _tb
+
         if isinstance(free_index, int):
+            if free_index in self.free_slots:
+                logger.error(
+                    "[req_to_token_pool] DOUBLE FREE detected: idx=%d already in free_slots\n%s",
+                    free_index,
+                    "".join(_tb.format_stack()),
+                )
+                raise AssertionError(f"req_to_token_pool double-free: idx={free_index}")
             self.free_slots.append(free_index)
         else:
+            free_set = set(self.free_slots)
+            for fi in free_index.tolist() if hasattr(free_index, "tolist") else list(free_index):
+                if fi in free_set:
+                    logger.error(
+                        "[req_to_token_pool] DOUBLE FREE detected: idx=%d already in free_slots\n%s",
+                        fi,
+                        "".join(_tb.format_stack()),
+                    )
+                    raise AssertionError(f"req_to_token_pool double-free: idx={fi}")
             self.free_slots.extend(free_index)
 
     def clear(self):
