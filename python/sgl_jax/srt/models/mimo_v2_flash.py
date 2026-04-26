@@ -1,6 +1,7 @@
 """MiMo-V2-Flash model implementation for SGLang-JAX."""
 
 import logging
+import os
 from typing import Any
 
 import jax
@@ -521,6 +522,15 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         if self._is_static_quant:
             self._dequantize_fp8_to_bf16()
 
+        # Dump QKV weights to disk if requested via env var.
+        dump_flag = os.environ.get("DUMP_QKV_WEIGHTS", "")
+        if dump_flag:
+            dump_dir = os.environ.get("DUMP_QKV_DIR", "/models/weight_dump/uniform")
+            num_layers = int(os.environ.get("DUMP_QKV_LAYERS", "3"))
+            self._dump_qkv_weights(dump_dir, num_layers)
+            import sys
+            sys.exit(0)
+
     def _is_quant_ignored(self, hf_path: str) -> bool:
         """Check if a HuggingFace weight path is in the quantization ignored_layers list."""
         quant_cfg = getattr(self, "_quant_config", None)
@@ -754,6 +764,29 @@ class MiMoV2FlashForCausalLM(nnx.Module):
             v_head_dim=attn.v_head_dim,
             target_kv_heads=attn.k_head_num,
         )
+
+    def _dump_qkv_weights(self, dump_dir: str, num_layers: int):
+        """Dump dequantized q/k/v_proj weights to .npy files for comparison."""
+        import numpy as np
+
+        os.makedirs(dump_dir, exist_ok=True)
+        num_layers = min(num_layers, len(self.model.layers))
+        logger.info("Dumping QKV weights for layers 0..%d to %s", num_layers - 1, dump_dir)
+
+        for i in range(num_layers):
+            attn = self.model.layers[i].self_attn
+            for proj_name in ("q_proj", "k_proj", "v_proj"):
+                proj = getattr(attn, proj_name)
+                w = jax.device_get(proj.weight.value)
+                w_np = np.array(w)
+                path = os.path.join(dump_dir, f"layer_{i}_{proj_name}.npy")
+                np.save(path, w_np)
+                logger.info(
+                    "  layer %d %s: shape=%s dtype=%s -> %s",
+                    i, proj_name, w_np.shape, w_np.dtype, path,
+                )
+
+        logger.info("QKV weight dump complete.")
 
     def _create_weight_mappings(self) -> dict:
         mappings = {
