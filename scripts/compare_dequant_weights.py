@@ -11,12 +11,16 @@ Usage:
 import argparse
 import os
 
+import ml_dtypes  # noqa: F401 — registers bfloat16 with numpy
 import numpy as np
 
 
 def load_weight(directory: str, layer: int, proj: str) -> np.ndarray:
     path = os.path.join(directory, f"layer_{layer}_{proj}.npy")
-    return np.load(path)
+    w = np.load(path)
+    if w.dtype == np.dtype("bfloat16") or w.dtype.name == "bfloat16":
+        w = w.astype(np.float32)
+    return w
 
 
 def boundary_analysis(diff: np.ndarray, proj: str, head_dim: int, v_head_dim: int,
@@ -83,7 +87,7 @@ def compare_one(per_head_dir: str, uniform_dir: str, layer: int, proj: str,
     result["shape"] = w_ph.shape
     result["dtype"] = str(w_ph.dtype)
 
-    diff = w_ph.astype(np.float32) - w_un.astype(np.float32)
+    diff = w_ph - w_un
     abs_diff = np.abs(diff)
 
     result["max_abs_diff"] = float(abs_diff.max())
@@ -91,7 +95,7 @@ def compare_one(per_head_dir: str, uniform_dir: str, layer: int, proj: str,
     result["std_diff"] = float(diff.std())
 
     # Relative diff (avoid div-by-zero)
-    denom = np.maximum(np.abs(w_un.astype(np.float32)), 1e-12)
+    denom = np.maximum(np.abs(w_un), 1e-12)
     rel_diff = abs_diff / denom
     result["max_rel_diff"] = float(rel_diff.max())
     result["mean_rel_diff"] = float(rel_diff.mean())
