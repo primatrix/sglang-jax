@@ -18,9 +18,13 @@ import numpy as np
 def load_weight(directory: str, layer: int, proj: str) -> np.ndarray:
     path = os.path.join(directory, f"layer_{layer}_{proj}.npy")
     w = np.load(path)
-    if w.dtype == np.dtype("bfloat16") or w.dtype.name == "bfloat16":
-        w = w.astype(np.float32)
-    return w
+    if w.dtype == ml_dtypes.bfloat16:
+        return w.astype(np.float32)
+    if w.dtype.kind == "V" and w.dtype.itemsize == 2:
+        # bfloat16 saved without ml_dtypes: numpy sees it as void/V2
+        flat = np.frombuffer(w.tobytes(), dtype=ml_dtypes.bfloat16).reshape(w.shape)
+        return flat.astype(np.float32)
+    return w.astype(np.float32)
 
 
 def boundary_analysis(diff: np.ndarray, proj: str, head_dim: int, v_head_dim: int,
