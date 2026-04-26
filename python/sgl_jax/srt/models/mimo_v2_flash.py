@@ -89,7 +89,7 @@ class MiMoV2Moe(nnx.Module):
         self.moe_gate = GateLogit(
             input_size=config.hidden_size,
             num_experts=num_experts,
-            weight_dtype=dtype,
+            weight_dtype=jnp.float32,
             score_func=getattr(config, "scoring_func", "softmax"),
         )
 

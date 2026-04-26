@@ -46,8 +46,8 @@ class GateLogit(nnx.Module):
             self.bias = None
 
     @named_scope
-    def __call__(self, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array | None]:
-        logits = jnp.dot(hidden_states, self.kernel.value)
+    def __call__(self, hidden_states: jax.Array) -> jax.Array:
+        logits = jnp.dot(hidden_states.astype(self.weight_dtype), self.kernel.value)
 
         if self.score_func:
             if self.score_func == "softmax":
