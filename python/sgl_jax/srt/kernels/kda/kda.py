@@ -213,7 +213,7 @@ def chunk_local_cumsum_vector(
     BH_padded = BH + pad_BH
 
     if chunk_indices is None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT, max_T=T)
     NT = len(chunk_indices)
 
     g_flat = jnp.pad(g_flat, ((0, 0), (0, BT), (0, 0)))
@@ -1203,8 +1203,7 @@ def chunk_kda_fwd(
         align=BT,
     )
     T = q.shape[1]
-    if chunk_indices is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT, max_T=T)
+    chunk_indices = prepare_chunk_indices(cu_seqlens, BT, max_T=T)
 
     assert T % BT == 0
 
