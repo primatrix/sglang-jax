@@ -100,3 +100,49 @@ def available_and_evictable_str(tree_cache) -> str:
         available_size = token_to_kv_pool_allocator.available_size()
         evictable_size = tree_cache.evictable_size()
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
+
+
+def release_kv_cache(req, tree_cache, is_insert: bool = True) -> None:
+    """Single entry point for releasing all KV cache held by a finished req.
+
+    Replaces scattered ``tree_cache.cache_finished_req(req)`` plus ad-hoc
+    ``out_cache_loc[i:i+1]`` frees that previously caused double-frees.
+
+    Steps:
+      1. Delegate committed-range free to the tree cache's cache_finished_req.
+      2. Free over-allocated range [committed_len, allocated_len) (page-aligned).
+      3. Free the req_to_token_pool slot.
+
+    Args:
+        req: the finished Req.
+        tree_cache: a RadixCache, ChunkCache, or compatible BasePrefixCache.
+        is_insert: kept for upstream-API compatibility; unused in sgl-jax today.
+    """
+    from sgl_jax.srt.utils.common_utils import cdiv
+
+    if req.req_pool_idx is None:
+        # Already released (e.g., retract path, or streaming session early-free).
+        return
+
+    # Step 1: free committed KV via tree cache (radix evictable insert OR direct free).
+    tree_cache.cache_finished_req(req)
+    if req.req_pool_idx is None:
+        return
+
+    # Step 2: free over-allocated KV in [start_p, end_p).
+    start_p, end_p = req.pop_overallocated_kv_cache()
+    page_size = tree_cache.page_size
+    if page_size > 1:
+        # Align start_p UP to next page boundary; the partial page before start_p
+        # is part of the committed range and was handled by cache_finished_req.
+        start_p = cdiv(start_p, page_size) * page_size
+
+    if start_p < end_p:
+        indices = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx, start_p:end_p]
+        # Filter zeros (uninitialized slots); same defensive pattern as cache_finished_req.
+        indices = indices[indices != 0]
+        if indices.size > 0:
+            tree_cache.token_to_kv_pool_allocator.free(indices)
+
+    # Step 3: release the req_to_token_pool slot.
+    tree_cache.req_to_token_pool.free(req.req_pool_idx)
