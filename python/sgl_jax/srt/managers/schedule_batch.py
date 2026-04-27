@@ -250,6 +250,17 @@ class Req:
         # The prefix length of the last prefix matching
         self.last_matched_prefix_len: int = 0
 
+        # KV cache lifecycle tracking (matches upstream sglang Req fields).
+        # committed_len: number of tokens whose KV is safe to commit to radix evictable.
+        # allocated_len: number of token slots currently allocated for this req.
+        # cache_protected_len: prefix length locked into radix at prefill start; not freed by cache_finished_req.
+        # *_freed flags guard against double pop_*_kv_cache calls.
+        self.kv_committed_len: int = 0
+        self.kv_allocated_len: int = 0
+        self.cache_protected_len: int = 0
+        self.kv_committed_freed: bool = False
+        self.kv_overallocated_freed: bool = False
+
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
         # processed.
@@ -385,6 +396,20 @@ class Req:
             )
             self.last_matched_prefix_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
+
+    def pop_committed_kv_cache(self) -> int:
+        """Return committed KV length and mark as released. Single use per finished req."""
+        assert not self.kv_committed_freed, f"double pop_committed_kv_cache for req {self.rid}"
+        self.kv_committed_freed = True
+        return self.kv_committed_len
+
+    def pop_overallocated_kv_cache(self) -> tuple[int, int]:
+        """Return [committed_len, allocated_len) over-alloc range. Single use per finished req."""
+        assert (
+            not self.kv_overallocated_freed
+        ), f"double pop_overallocated_kv_cache for req {self.rid}"
+        self.kv_overallocated_freed = True
+        return self.kv_committed_len, self.kv_allocated_len
 
     def adjust_max_prefix_ids(self):
         self.fill_ids = self.origin_input_ids + self.output_ids
