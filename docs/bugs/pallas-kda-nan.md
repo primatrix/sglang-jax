@@ -11,8 +11,8 @@ The Pallas chunked KDA kernel (`chunk_kda_fwd`) produces NaN output when gate va
 
 ## What Works vs What Doesn't
 
-| Kernel | Small gate (|g| ≤ 5) | Real-weight gate (|g| ~ 1900) |
-|--------|---------------------|-------------------------------|
+| Kernel | Small gate (\|g\| ≤ 5) | Real-weight gate (\|g\| ~ 1900) |
+|--------|------------------------|----------------------------------|
 | `naive_recurrent_kda` (pure JAX) | ✓ | ✓ |
 | `chunk_kda_fwd` (Pallas) | ✓ | **NaN** |
 
@@ -20,9 +20,11 @@ The Pallas chunked KDA kernel (`chunk_kda_fwd`) produces NaN output when gate va
 
 The KDA forward has a 4-stage pipeline. The NaN originates in the **gate cumsum** and **inter-chunk state propagation** stages — NOT in the gate activation step.
 
-问题追溯：
-gate 值在 kernel 里的关键使用点是 kda_gate_chunk_cumsum（kda.py ~line 1000-1033）：
-```
+### 问题追溯
+
+gate 值在 kernel 里的关键使用点是 `kda_gate_chunk_cumsum`（`kda.py` ~line 1000–1033）：
+
+```python
 def kda_gate_chunk_cumsum(g, A_log, chunk_size, scale=None, dt_bias=None, ...):
     g_f32 = g.astype(jnp.float32)
     if dt_bias is not None:
@@ -35,19 +37,17 @@ def kda_gate_chunk_cumsum(g, A_log, chunk_size, scale=None, dt_bias=None, ...):
     # 然后做 chunk-local cumsum，scale = 1/ln(2)
     return chunk_local_cumsum_vector(g_act, chunk_size=chunk_size, scale=scale, ...)
 ```
-这里 scale = _RCP_LN2 = 1/ln(2) ≈ 1.4427，是把 log-space 转成 log2-space 的常数。这个 scale 不是问题来源。
 
-真正的问题是 g_act 本身的量级。-exp(A_log) * softplus(g + dt_bias) 产生的值（~-60 per timestep），经过 64 步 cumsum 累积到
-~-3840，然后下游的 Pallas kernel 对这个 cumsum 做 exp() / log2() 变换时溢出。
+其中 `scale = _RCP_LN2 = 1/ln(2) ≈ 1.4427`，是把 log-space 转成 log2-space 的常数，不是问题来源。
 
-workaround 方向：问题不在于能不能绕过某个参数，而在于 Pallas kernel 缺少 per-chunk normalization。具体来说：
+真正的问题是 `g_act` 本身的量级：`-exp(A_log) * softplus(g + dt_bias)` 产生的值（~-60 per timestep），经过 64 步 cumsum 累积到 ~-3840，然后下游的 Pallas kernel 对这个 cumsum 做 `exp()` / `log2()` 变换时溢出。
 
-1. Safe gate normalization：在每个 chunk 内，cumsum 前减去 chunk 内最大值（或用 chunk 边界值做 baseline），让 exp(cumsum - baseline)
-始终在可表示范围内。GPU 的 fla Triton kernel 大概率做了类似处理。
-2. Kernel 里其实有个 safe_gate 参数（默认 True，line 334/456），但从代码看它只影响取 cumsum 的中间值位置（g_i[BC//2 : BC//2+1] vs
-g_i[0:1]），不是真正的数值稳定化。
+**Workaround 方向**：问题不在于能不能绕过某个参数，而在于 Pallas kernel 缺少 per-chunk normalization。具体来说：
 
-所以没有简单的参数级 workaround —— 需要改 Pallas kernel 内部的数值处理逻辑
+1. **Safe gate normalization** — 在每个 chunk 内，cumsum 前减去 chunk 内最大值（或用 chunk 边界值做 baseline），让 `exp(cumsum - baseline)` 始终在可表示范围内。GPU 的 fla Triton kernel 大概率做了类似处理。
+2. **`safe_gate` 参数无效** — kernel 里有个 `safe_gate` 参数（默认 `True`，line 334/456），但从代码看它只影响取 cumsum 的中间值位置（`g_i[BC//2 : BC//2+1]` vs `g_i[0:1]`），不是真正的数值稳定化。
+
+结论：没有简单的参数级 workaround —— 需要改 Pallas kernel 内部的数值处理逻辑。
 
 ### Data flow (simplified)
 
@@ -71,12 +71,6 @@ use_gate_in_kernel=False:  NaN  (21632/32768 elements)
 ### Why the naive kernel works
 
 `naive_recurrent_kda` processes one timestep at a time: `S = S * exp(g_t)`. Each `exp(g_t)` where `g_t ≈ -60` produces a very small but valid float (~1e-26). The state decays toward zero — no overflow, no NaN.
-
-The Pallas kernel uses chunked processing: it accumulates cumsums across chunks and does bulk `exp()` / `log2()` transforms on the accumulated values. A cumsum of 64 timesteps of g ≈ -60 gives cumsum ≈ -3840. While `exp(-3840) ≈ 0` is representable, the intermediate `log2()` and inter-chunk correction arithmetic overflows.
-
-### Why the GPU kernel works
-
-fla's Triton `chunk_kda` uses the same chunked algorithm but likely applies **per-chunk normalization** (subtracting the chunk maximum before exp) or stays entirely in **log-space** for the inter-chunk propagation. The Pallas port appears to lack this numerical stabilization.
 
 ## Reproduction
 
@@ -135,8 +129,6 @@ Further investigation shows the threshold is per-chunk cumsum magnitude ~100, wh
 
 Clamping to stay under the threshold (individual gate ~-1.5) would change model behavior from "fully forgotten" to "22% retention per step" — not acceptable.
 
-**Conclusion**: No layer-level workaround exists. The kernel needs internal per-chunk normalization.
-
 ### Why per-chunk normalization of cumsum doesn't help either
 
 Tested subtracting the first position's cumsum value within each chunk (64 steps) before passing to downstream Pallas functions:
@@ -156,8 +148,6 @@ The problem is **intra-chunk**, not inter-chunk. Within a single chunk of 64 ste
 - `exp2(+578)` (midpoint reference, reverse direction) → overflow to inf
 
 Even at the finest granularity the kernel uses (BC=16 sub-chunks), the cumsum magnitude (~1154) far exceeds fp32 representable range for exp2 (max ~127). **No reference-subtraction trick can fix this — the per-step gate values themselves are too large for chunked exp2 arithmetic.**
-
-The GPU's fla Triton kernel likely uses a fundamentally different numerical strategy: either full log-space arithmetic (never materializing exp), or online per-element normalization.
 
 ## Suggested Fix Direction
 
