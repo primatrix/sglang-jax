@@ -396,6 +396,9 @@ class Req:
             )
             self.last_matched_prefix_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
+        # cache_protected_len is the prefix range already in radix (locked); cache_finished_req
+        # must NOT free this range, since dec_lock_ref handles that side.
+        self.cache_protected_len = len(self.prefix_indices)
 
     def pop_committed_kv_cache(self) -> int:
         """Return committed KV length and mark as released. Single use per finished req."""
@@ -542,6 +545,13 @@ class Req:
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
+
+        # Reset KV lifecycle tracking fields.
+        self.kv_committed_len = 0
+        self.kv_allocated_len = 0
+        self.cache_protected_len = 0
+        self.kv_committed_freed = False
+        self.kv_overallocated_freed = False
 
     def set_finish_with_abort(self, error_msg: str):
         # set it to one token to skip the long prefill
@@ -874,6 +884,9 @@ class ScheduleBatch:
             req.already_computed = seq_len
             req.is_retracted = False
             req.extend_batch_idx += 1
+            # After prefill, all `seq_len` tokens have committed KV and are allocated.
+            req.kv_committed_len = seq_len
+            req.kv_allocated_len = seq_len
 
             # Compute the relative logprob_start_len in an extend batch
             if req.logprob_start_len >= pre_len:
@@ -1175,6 +1188,8 @@ class ScheduleBatch:
 
         for req in self.reqs:
             req.decode_batch_idx += 1
+            req.kv_committed_len += 1
+            req.kv_allocated_len += 1
 
     def filter_batch(
         self,
