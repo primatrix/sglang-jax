@@ -375,14 +375,13 @@ class Req:
     ):
         self.fill_ids = self.origin_input_ids + self.output_ids
         if tree_cache is not None:
-            (
-                self.prefix_indices,
-                self.last_node,
-                self.last_host_node,
-                self.host_hit_length,
-            ) = tree_cache.match_prefix(
+            match_result = tree_cache.match_prefix(
                 key=RadixKey(self.adjust_max_prefix_ids(), self.extra_key),
             )
+            self.prefix_indices = match_result.device_indices
+            self.last_node = match_result.last_device_node
+            self.last_host_node = match_result.last_host_node
+            self.host_hit_length = match_result.host_hit_length
             self.last_matched_prefix_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
@@ -753,7 +752,11 @@ class ScheduleBatch:
 
     def _evict_swa(self, req: Req, pre_len: int, sliding_window_size: int, page_size: int):
         """Evict SWA pool tokens outside the sliding window for a single request."""
-        new_evicted = max(req.swa_evicted_seqlen, pre_len - sliding_window_size)
+        if isinstance(self.tree_cache, SWARadixCache):
+            self.tree_cache.evict_req_swa(req, pre_len)
+            return
+
+        new_evicted = max(req.swa_evicted_seqlen, pre_len - sliding_window_size - page_size)
         if page_size > 1:
             new_evicted = (new_evicted // page_size) * page_size
         if new_evicted <= req.swa_evicted_seqlen:
@@ -761,10 +764,7 @@ class ScheduleBatch:
         free_slots = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, req.swa_evicted_seqlen : new_evicted
         ]
-        num_swa_freed = self.token_to_kv_pool_allocator.count_swa_mapped(free_slots)
         self.token_to_kv_pool_allocator.free_swa(free_slots)
-        if num_swa_freed > 0 and isinstance(self.tree_cache, SWARadixCache):
-            self.tree_cache.adjust_swa_protected_size(-num_swa_freed)
         req.swa_evicted_seqlen = new_evicted
 
     def maybe_evict_swa(self, sliding_window_size=None):
@@ -782,17 +782,20 @@ class ScheduleBatch:
         )
 
         if self.forward_mode is not None and self.forward_mode.is_decode():
-            # Evict at the smaller of sliding_window_size and page_size to avoid
-            # stale SWA slot accumulation.
             evict_interval = max(min(sliding_window_size, page_size), 1)
+            evict_phase = 1 if evict_interval > 1 else 0
             for req in self.reqs:
-                if req.decode_batch_idx > 0 and (
-                    evict_interval <= 1 or req.decode_batch_idx % evict_interval == 1
+                if (
+                    req.decode_batch_idx > 0
+                    and req.decode_batch_idx % evict_interval == evict_phase
                 ):
                     self._evict_swa(req, req.seqlen - 1, sliding_window_size, page_size)
             return
 
         if self.forward_mode is None or not self.forward_mode.is_extend():
+            return
+
+        if not isinstance(self.tree_cache, ChunkCache):
             return
 
         for i, req in enumerate(self.reqs):
@@ -813,8 +816,7 @@ class ScheduleBatch:
         self.forward_mode = ForwardMode.EXTEND
 
         # Evict SWA tokens before allocating, so the SWA pool has space.
-        if self.is_hybrid:
-            self.maybe_evict_swa()
+        self.maybe_evict_swa()
 
         # Allocate req slots
         bs = len(self.reqs)
@@ -1051,7 +1053,7 @@ class ScheduleBatch:
             self.req_to_token_pool.free(req.req_pool_idx)
         else:
             last_uncached_pos = (
-                len(req.prefix_indices) // server_args.page_size
+                req.last_matched_prefix_len // server_args.page_size
             ) * server_args.page_size
             token_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
@@ -1096,8 +1098,7 @@ class ScheduleBatch:
         bs = len(self.reqs)
 
         # Evict SWA tokens outside sliding window
-        if self.is_hybrid:
-            self.maybe_evict_swa()
+        self.maybe_evict_swa()
 
         if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
             # if spec decoding is used, the decode batch is prepared inside
@@ -1411,7 +1412,7 @@ class ScheduleBatch:
         total_cache_loc_size = cache_loc_paddings[select_bs_index]
         assert total_cache_loc_size >= len(cache_loc_flat)
 
-        cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
+        cache_loc_cpu = np.zeros(total_cache_loc_size, dtype=np.int32)
         if len(cache_loc_flat) > 0:
             cache_loc_cpu[: len(cache_loc_flat)] = cache_loc_flat
         # Initialize padding area to ensure multiprocess consistency
