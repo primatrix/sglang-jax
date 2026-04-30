@@ -1,14 +1,20 @@
 """Fused Expert-Parallel MoE layer using Pallas kernel."""
 
+import logging
+
 import jax
 from flax import nnx
 from jax import numpy as jnp
+from jax import shard_map
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_ep_moe
+from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
+
+logger = logging.getLogger(__name__)
 
 
 def _expand_moe_block_scale(scale_3d: jax.Array, n_out: int, block_n: int) -> jax.Array:
@@ -103,6 +109,7 @@ class FusedEPMoE(nnx.Module):
         self.disable_shared_expert = disable_shared_expert
         self.disable_all_reduce_metadata = disable_all_reduce_metadata
         self.disable_sync_barrier = disable_sync_barrier
+        self.gmm_prefill_threshold = 256
 
         metadata = get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
@@ -201,6 +208,21 @@ class FusedEPMoE(nnx.Module):
         else:
             self.quant_block_k = None
             self.quant_block_n = None
+
+        # GMM prefill path: create moe_mesh with ("expert", "tensor") axes.
+        world_size = mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
+        self.tp_size = world_size // self.ep_size
+        self.experts_per_device = self.num_experts // self.ep_size
+
+        devices = self.mesh.devices.flatten()
+        self._gmm_moe_mesh = jax.sharding.Mesh(
+            devices.reshape(self.ep_size, self.tp_size),
+            axis_names=("expert", "tensor"),
+            axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
+        )
+        self._gmm_abstract_mesh = self.mesh.abstract_mesh.update(
+            axis_sizes=(self.ep_size, self.tp_size), axis_names=("expert", "tensor")
+        )
 
     def quantize_weights(self, is_static: bool = False):
         """Quantize MoE weights in-place. Call once after model loading."""
@@ -436,19 +458,23 @@ class FusedEPMoE(nnx.Module):
         *,
         block_config: FusedMoEBlockConfig | None = None,
     ) -> jax.Array:
-        """
-        Forward pass through the fused MoE layer.
-
-        Args:
-            hidden_states: Input tokens, shape (num_tokens, hidden_size) or
-                          (batch_size, seq_len, hidden_size)
-            topk_weights: Pre-computed top-k weights
-            topk_ids: Pre-computed top-k expert IDs
-
-        Returns:
-            MoE layer output, same shape as hidden_states
-        """
         assert hidden_states.ndim == 2
+        num_tokens = hidden_states.shape[0]
+
+        use_gmm = num_tokens > self.gmm_prefill_threshold and self.num_shared_experts == 0
+        if use_gmm:
+            return self._gmm_prefill_forward(hidden_states, topk_weights, topk_ids)
+        return self._fused_forward(hidden_states, topk_weights, topk_ids, block_config=block_config)
+
+    def _fused_forward(
+        self,
+        hidden_states: jax.Array,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+        *,
+        block_config: FusedMoEBlockConfig | None = None,
+    ) -> jax.Array:
+        """Original fused Pallas kernel path — best for decode (small token count)."""
 
         w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
         w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
@@ -507,3 +533,249 @@ class FusedEPMoE(nnx.Module):
 
         output = jax.sharding.reshard(output, NamedSharding(self.mesh, P("data", None)))
         return output
+
+    def _gmm_prefill_forward(
+        self,
+        hidden_states: jax.Array,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+    ) -> jax.Array:
+        """GMM-based prefill path — better MXU utilization via MegaCore + batched experts."""
+        with jax.sharding.use_abstract_mesh(self._gmm_abstract_mesh):
+            hidden_r = jax.sharding.reshard(hidden_states, P(None))
+            topk_weights_r = jax.sharding.reshard(topk_weights, P(None))
+            topk_ids_r = jax.sharding.reshard(topk_ids, P(None))
+
+            # Reshard weights: fused EP sharding -> GMM expert-parallel sharding.
+            # For TP=1 this is a zero-copy metadata change.
+            w1_r = jax.sharding.reshard(self.w1.value, P("expert", None, "tensor"))
+            w3_r = jax.sharding.reshard(self.w3.value, P("expert", None, "tensor"))
+            w2_r = jax.sharding.reshard(self.w2.value, P("expert", "tensor", None))
+
+            has_scales = self.w1_scale is not None
+            if has_scales:
+                w1_scale_r = jax.sharding.reshard(
+                    self.w1_scale.value, P("expert", None, None, "tensor")
+                )
+                w3_scale_r = jax.sharding.reshard(
+                    self.w3_scale.value, P("expert", None, None, "tensor")
+                )
+                w2_scale_r = jax.sharding.reshard(
+                    self.w2_scale.value, P("expert", None, None, None)
+                )
+                in_specs = (
+                    P(None),
+                    P(None),
+                    P(None),
+                    P("expert", None, "tensor"),
+                    P("expert", None, "tensor"),
+                    P("expert", "tensor", None),
+                    P("expert", None, None, "tensor"),
+                    P("expert", None, None, "tensor"),
+                    P("expert", None, None, None),
+                )
+                args = (
+                    hidden_r,
+                    topk_weights_r,
+                    topk_ids_r,
+                    w1_r,
+                    w3_r,
+                    w2_r,
+                    w1_scale_r,
+                    w3_scale_r,
+                    w2_scale_r,
+                )
+            else:
+                in_specs = (
+                    P(None),
+                    P(None),
+                    P(None),
+                    P("expert", None, "tensor"),
+                    P("expert", None, "tensor"),
+                    P("expert", "tensor", None),
+                )
+                args = (
+                    hidden_r,
+                    topk_weights_r,
+                    topk_ids_r,
+                    w1_r,
+                    w3_r,
+                    w2_r,
+                )
+
+            fn = self._gmm_forward_body if has_scales else self._gmm_forward_body_no_scale
+            result = shard_map(
+                fn,
+                mesh=self._gmm_moe_mesh,
+                in_specs=in_specs,
+                out_specs=P(None),
+                check_vma=False,
+            )(*args)
+
+        return jax.sharding.reshard(result, NamedSharding(self.mesh, P("data", None)))
+
+    def _gmm_forward_body(
+        self,
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        w1,
+        w3,
+        w2,
+        w1_scale,
+        w3_scale,
+        w2_scale,
+    ):
+        """GMM compute inside shard_map: permute -> 3x GMM -> unpermute -> psum."""
+        return self._gmm_forward_impl(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            w1,
+            w3,
+            w2,
+            w1_scale,
+            w3_scale,
+            w2_scale,
+        )
+
+    def _gmm_forward_body_no_scale(
+        self,
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        w1,
+        w3,
+        w2,
+    ):
+        """GMM compute without quantization scales."""
+        return self._gmm_forward_impl(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            w1,
+            w3,
+            w2,
+            None,
+            None,
+            None,
+        )
+
+    def _gmm_forward_impl(
+        self,
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        w1,
+        w3,
+        w2,
+        w1_scale,
+        w3_scale,
+        w2_scale,
+    ):
+        """GMM compute inside shard_map: permute -> 3x GMM -> unpermute -> psum."""
+        expert_shard_id = jax.lax.axis_index("expert")
+        num_experts = self.num_experts
+        num_experts_per_tok = self.num_experts_per_tok
+        experts_per_device = self.experts_per_device
+
+        # --- Permute ---
+        flatten_experts = jnp.ravel(topk_ids)
+        sorted_experts = jnp.argsort(flatten_experts, stable=True)
+        token_indices = sorted_experts // num_experts_per_tok
+        group_sizes = jnp.bincount(flatten_experts, length=num_experts).astype(jnp.int32)
+
+        group_offset = jnp.array(expert_shard_id * experts_per_device, dtype=jnp.int32)
+
+        # --- Indexed gather ---
+        x = hidden_states[token_indices].astype(self.dtype)
+
+        # Pad for sublane alignment (required by GMM kernel).
+        from jax.experimental.pallas import tpu as pltpu
+
+        sublane_align = pltpu.get_tpu_info().get_sublane_tiling(x.dtype)
+        pad_size = (-x.shape[0]) % sublane_align
+        if pad_size > 0:
+            x = jnp.pad(x, ((0, pad_size), (0, 0)))
+            group_sizes = group_sizes.at[-1].add(pad_size)
+
+        act_q_dtype = self.activation_quantized_dtype
+        gmm_kwargs = dict(
+            group_sizes=group_sizes,
+            preferred_element_type=self.dtype,
+            group_offset=group_offset,
+            maybe_quantize_lhs=act_q_dtype is not None,
+            acc_dtype=jnp.float32,
+        )
+
+        # --- 3x GMM: gate, up, down ---
+        layer_gate = gmm(
+            lhs=x,
+            rhs=w1,
+            rhs_scale=w1_scale,
+            rhs_bias=None,
+            zero_initialize=False,
+            activation_quantized_dtype=act_q_dtype,
+            **gmm_kwargs,
+        )
+        layer_up = gmm(
+            lhs=x,
+            rhs=w3,
+            rhs_scale=w3_scale,
+            rhs_bias=None,
+            zero_initialize=False,
+            activation_quantized_dtype=act_q_dtype,
+            **gmm_kwargs,
+        )
+
+        if self.activation == "silu":
+            act = jax.nn.silu(layer_gate)
+        elif self.activation == "gelu":
+            act = jax.nn.gelu(layer_gate)
+        else:
+            raise ValueError(f"Unsupported activation: {self.activation}")
+        intermediate = jnp.multiply(act, layer_up)
+
+        output = gmm(
+            lhs=intermediate,
+            rhs=w2,
+            rhs_scale=w2_scale,
+            rhs_bias=None,
+            zero_initialize=True,
+            activation_quantized_dtype=act_q_dtype,
+            **gmm_kwargs,
+        )
+
+        # --- Unpermute ---
+        expected_tokens = sorted_experts.shape[0]
+        actual_tokens = output.shape[0]
+        if actual_tokens != expected_tokens:
+            if actual_tokens > expected_tokens:
+                output = output[:expected_tokens]
+            else:
+                pad = jnp.zeros(
+                    (expected_tokens - actual_tokens, output.shape[1]),
+                    dtype=output.dtype,
+                )
+                output = jnp.concatenate([output, pad], axis=0)
+
+        argsort_inv = jnp.argsort(sorted_experts, stable=True)
+        unsorted = jnp.take(output, argsort_inv, axis=0)
+
+        total_tokens = topk_weights.shape[0]
+        reshaped_w = jnp.reshape(topk_weights, (total_tokens, num_experts_per_tok))
+        reshaped_o = jnp.reshape(unsorted, (total_tokens, num_experts_per_tok, -1))
+
+        combined = jnp.einsum(
+            "BKE,BK->BE",
+            reshaped_o.astype(jnp.float32),
+            reshaped_w.astype(jnp.float32),
+        ).astype(self.dtype)
+
+        # --- All-reduce ---
+        if self.tp_size > 1:
+            combined = jax.lax.psum(combined, "tensor")
+        if self.ep_size > 1:
+            combined = jax.lax.psum(combined, "expert")
+
+        return combined
