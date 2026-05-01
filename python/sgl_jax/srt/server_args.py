@@ -187,6 +187,11 @@ class ServerArgs:
     expert_distribution_recorder_buffer_size: int = 100
     expert_distribution_recorder_output_file: str | None = None
 
+    enable_online_eplb: bool = False
+    online_eplb_interval_steps: int = 200
+    online_eplb_min_samples: int = 100
+    online_eplb_diff_threshold: float = 0.05
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -267,6 +272,12 @@ class ServerArgs:
 
         if self.ep_num_redundant_experts < 0:
             raise ValueError("ep_num_redundant_experts must be non-negative")
+
+        if self.enable_online_eplb:
+            if not self.ep_dispatch_algorithm:
+                raise ValueError("enable_online_eplb requires ep_dispatch_algorithm to be set")
+            if self.ep_num_redundant_experts <= 0:
+                raise ValueError("enable_online_eplb requires ep_num_redundant_experts > 0")
 
         if self.enable_expert_balance_debug and self.expert_balance_segment_counter <= 0:
             raise ValueError("expert_balance_segment_counter must be positive")
@@ -886,6 +897,29 @@ class ServerArgs:
             "--expert-distribution-recorder-output-file",
             type=str,
             help="Output file path for expert distribution recorder (.npy).",
+        )
+        parser.add_argument(
+            "--enable-online-eplb",
+            action="store_true",
+            help="Enable online EPLB: dynamically rebalance expert replicas at runtime.",
+        )
+        parser.add_argument(
+            "--online-eplb-interval-steps",
+            type=int,
+            default=ServerArgs.online_eplb_interval_steps,
+            help="Number of decode steps between online EPLB rebalance checks.",
+        )
+        parser.add_argument(
+            "--online-eplb-min-samples",
+            type=int,
+            default=ServerArgs.online_eplb_min_samples,
+            help="Minimum accumulated steps before triggering a rebalance.",
+        )
+        parser.add_argument(
+            "--online-eplb-diff-threshold",
+            type=float,
+            default=ServerArgs.online_eplb_diff_threshold,
+            help="Skip rebalance if mapping change ratio is below this threshold.",
         )
 
         parser.add_argument(

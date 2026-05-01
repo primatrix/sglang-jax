@@ -170,6 +170,10 @@ class ModelRunner(BaseModelRunner):
         self.init_routed_experts_capturer()
 
     def init_routed_experts_capturer(self):
+        enable_dist_recorder = (
+            self.server_args.enable_expert_distribution_recorder
+            or self.server_args.enable_online_eplb
+        )
         set_global_experts_capturer(
             RoutedExpertsCapturer.create(
                 mesh=self.mesh,
@@ -181,7 +185,7 @@ class ModelRunner(BaseModelRunner):
                 enable_balance_debug=self.server_args.enable_expert_balance_debug,
                 balance_segment_counter=self.server_args.expert_balance_segment_counter,
                 balance_output_file=self.server_args.expert_balance_output_file,
-                enable_dist_recorder=self.server_args.enable_expert_distribution_recorder,
+                enable_dist_recorder=enable_dist_recorder,
                 dist_recorder_buffer_size=self.server_args.expert_distribution_recorder_buffer_size,
                 dist_recorder_output_file=self.server_args.expert_distribution_recorder_output_file,
                 physical_expert_counts=self.server_args.ep_num_redundant_experts

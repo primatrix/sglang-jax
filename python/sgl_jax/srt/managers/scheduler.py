@@ -410,6 +410,28 @@ class Scheduler(
 
         self.init_metrics()
 
+        # Init online EPLB controller
+        self.online_eplb = None
+        if server_args.enable_online_eplb:
+            from sgl_jax.srt.eplb.online_eplb import OnlineEPLBController
+            from sgl_jax.srt.layers.routed_experts_capturer import (
+                get_global_experts_capturer,
+            )
+
+            model_runner = self.tp_worker.get_model_runner()
+            dist_recorder = get_global_experts_capturer().get_dist_recorder()
+            if dist_recorder is not None:
+                self.online_eplb = OnlineEPLBController(
+                    server_args=server_args,
+                    model_config=self.model_config,
+                    model_runner=model_runner,
+                    dist_recorder=dist_recorder,
+                )
+            else:
+                logger.warning(
+                    "Online EPLB enabled but dist_recorder is None. " "Online EPLB will not run."
+                )
+
         # Initialize DP scheduling state
         self.dp_round_robin_counter = 0
 
@@ -791,6 +813,9 @@ class Scheduler(
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+
+                if self.online_eplb is not None:
+                    self.online_eplb.maybe_rebalance()
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
@@ -864,6 +889,9 @@ class Scheduler(
                 self.check_memory()
                 self.check_tree_cache()
                 self.new_token_ratio = self.init_new_token_ratio
+
+            if self.online_eplb is not None and batch:
+                self.online_eplb.maybe_rebalance()
 
             self.last_batch = batch
 

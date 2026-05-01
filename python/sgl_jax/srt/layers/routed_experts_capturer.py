@@ -94,6 +94,9 @@ class RoutedExpertsCapturer(ABC):
     def reset(self):
         raise NotImplementedError
 
+    def get_dist_recorder(self) -> "_ExpertDistributionRecorder | None":
+        return None
+
 
 class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
     """Capturer for routed experts with host buffer"""
@@ -158,18 +161,12 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
 
         self._dist_recorder = None
         if enable_dist_recorder:
-            if not dist_recorder_output_file:
-                logger.warning(
-                    "Expert distribution recorder enabled, but output file is not set. "
-                    "Disabling recorder."
-                )
-            else:
-                self._dist_recorder = _ExpertDistributionRecorder(
-                    num_layers=self.num_hidden_layers,
-                    buffer_size=dist_recorder_buffer_size,
-                    output_file=dist_recorder_output_file,
-                    physical_expert_counts=physical_expert_counts,
-                )
+            self._dist_recorder = _ExpertDistributionRecorder(
+                num_layers=self.num_hidden_layers,
+                buffer_size=dist_recorder_buffer_size,
+                output_file=dist_recorder_output_file,
+                physical_expert_counts=physical_expert_counts,
+            )
 
         self._balance_missing_topk_warned = False
         self.bid = None
@@ -193,6 +190,9 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         if self.host_buffer is None:
             return 0
         return get_array_size_bytes(self.host_buffer)
+
+    def get_dist_recorder(self) -> "_ExpertDistributionRecorder | None":
+        return self._dist_recorder
 
     def _sync_fwd_experts_buffer_DtoH(
         self,
@@ -505,7 +505,7 @@ class _ExpertDistributionRecorder:
         *,
         num_layers: int,
         buffer_size: int,
-        output_file: str,
+        output_file: str | None,
         physical_expert_counts: int,
     ):
         self.num_layers = num_layers
@@ -547,7 +547,7 @@ class _ExpertDistributionRecorder:
                         self._physical_counts[layer_idx] += counts
 
             self._steps_accumulated += 1
-            if self._steps_accumulated >= self.buffer_size:
+            if self.output_file and self._steps_accumulated >= self.buffer_size:
                 self.dump()
                 self._physical_counts.fill(0)
                 self._steps_accumulated = 0
@@ -556,6 +556,31 @@ class _ExpertDistributionRecorder:
         with self._lock:
             self._physical_counts.fill(0)
             self._steps_accumulated = 0
+
+    def get_logical_counts_and_reset(self) -> tuple[np.ndarray, int] | None:
+        from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
+
+        with self._lock:
+            if self._steps_accumulated == 0:
+                return None
+            physical_counts = self._physical_counts.copy()
+            steps = self._steps_accumulated
+            self._physical_counts.fill(0)
+            self._steps_accumulated = 0
+
+        metadata = get_global_expert_location_metadata()
+        if metadata is None:
+            return physical_counts, steps
+
+        phy_to_log_map = jax.device_get(metadata.physical_to_logical_map)
+        num_logical = metadata.logical_to_all_physical_map.shape[1]
+        logical_counts = np.zeros((self.num_layers, num_logical), dtype=np.int64)
+        for layer_idx in range(self.num_layers):
+            phy_to_log = phy_to_log_map[layer_idx]
+            for p_idx, l_idx in enumerate(phy_to_log):
+                if p_idx < physical_counts.shape[1]:
+                    logical_counts[layer_idx, l_idx] += physical_counts[layer_idx, p_idx]
+        return logical_counts, steps
 
     def dump(self):
         from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
