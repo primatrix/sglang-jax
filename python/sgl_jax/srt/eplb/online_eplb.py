@@ -5,6 +5,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.eplb import eplb_algorithms
@@ -43,19 +45,25 @@ def _collect_moe_layers(module, result: list, visited: set | None = None):
                         _collect_moe_layers(item, result, visited)
 
 
-def _swap_experts_via_host(param, swaps):
-    """Permute experts by round-tripping through host memory."""
-    sharding = param.value.sharding
-    dtype = param.value.dtype
-    w_host = np.array(jax.device_get(param.value))
-    param.value = jnp.zeros((), dtype=dtype)
-    src_data = {}
-    for _, src in swaps:
-        if src not in src_data:
-            src_data[src] = w_host[src].copy()
-    for dst, src in swaps:
-        w_host[dst] = src_data[src]
-    param.value = jax.device_put(w_host, sharding)
+def _take_axis0(w, p):
+    return jnp.take(w, p, axis=0)
+
+
+_jit_cache: dict = {}
+
+
+def _permute_weight(w, perm, mesh):
+    """Permute weight along axis 0 on-device with explicit sharding + buffer donation."""
+    sharding = w.sharding
+    if sharding not in _jit_cache:
+        perm_sharding = NamedSharding(mesh, P(None))
+        _jit_cache[sharding] = jax.jit(
+            _take_axis0,
+            in_shardings=(sharding, perm_sharding),
+            out_shardings=sharding,
+            donate_argnums=(0,),
+        )
+    return _jit_cache[sharding](w, perm)
 
 
 class OnlineEPLBController:
@@ -186,6 +194,7 @@ class OnlineEPLBController:
     ):
         num_layers = old_p2l.shape[0]
         num_physical = old_p2l.shape[1]
+        mesh = self._moe_layers[0].mesh if self._moe_layers else None
 
         for moe_layer in self._moe_layers:
             layer_id = moe_layer.layer_id
@@ -200,25 +209,22 @@ class OnlineEPLBController:
                 if l_idx not in old_logical_to_physical:
                     old_logical_to_physical[l_idx] = p_idx
 
-            swaps = []
+            perm = np.arange(num_physical, dtype=np.int32)
             for dst in range(num_physical):
                 if not changed_mask[layer_id, dst]:
                     continue
                 target_logical = int(new_p2l[layer_id, dst])
                 src = old_logical_to_physical.get(target_logical, dst)
-                if src != dst:
-                    swaps.append((dst, src))
+                perm[dst] = src
 
-            if not swaps:
-                continue
-
-            _swap_experts_via_host(moe_layer.w1, swaps)
-            _swap_experts_via_host(moe_layer.w2, swaps)
-            _swap_experts_via_host(moe_layer.w3, swaps)
+            perm_jax = jnp.array(perm)
+            moe_layer.w1.value = _permute_weight(moe_layer.w1.value, perm_jax, mesh)
+            moe_layer.w2.value = _permute_weight(moe_layer.w2.value, perm_jax, mesh)
+            moe_layer.w3.value = _permute_weight(moe_layer.w3.value, perm_jax, mesh)
 
             if moe_layer.w1_scale is not None:
-                _swap_experts_via_host(moe_layer.w1_scale, swaps)
+                moe_layer.w1_scale.value = _permute_weight(moe_layer.w1_scale.value, perm_jax, mesh)
             if moe_layer.w2_scale is not None:
-                _swap_experts_via_host(moe_layer.w2_scale, swaps)
+                moe_layer.w2_scale.value = _permute_weight(moe_layer.w2_scale.value, perm_jax, mesh)
             if moe_layer.w3_scale is not None:
-                _swap_experts_via_host(moe_layer.w3_scale, swaps)
+                moe_layer.w3_scale.value = _permute_weight(moe_layer.w3_scale.value, perm_jax, mesh)
