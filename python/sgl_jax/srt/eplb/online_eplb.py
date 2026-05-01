@@ -5,8 +5,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
-from jax.sharding import NamedSharding
-from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.eplb import eplb_algorithms
@@ -45,25 +43,13 @@ def _collect_moe_layers(module, result: list, visited: set | None = None):
                         _collect_moe_layers(item, result, visited)
 
 
-def _take_axis0(w, p):
-    return jnp.take(w, p, axis=0)
-
-
-_jit_cache: dict = {}
-
-
-def _permute_weight(w, perm, mesh):
-    """Permute weight along axis 0 on-device with explicit sharding + buffer donation."""
-    sharding = w.sharding
-    if sharding not in _jit_cache:
-        perm_sharding = NamedSharding(mesh, P(None))
-        _jit_cache[sharding] = jax.jit(
-            _take_axis0,
-            in_shardings=(sharding, perm_sharding),
-            out_shardings=sharding,
-            donate_argnums=(0,),
-        )
-    return _jit_cache[sharding](w, perm)
+def _permute_weight_via_host(param, perm):
+    """Permute weight along axis 0 via host roundtrip."""
+    sharding = param.value.sharding
+    dtype = param.value.dtype
+    w_host = jax.device_get(param.value)
+    param.value = jnp.zeros((), dtype=dtype)
+    param.value = jax.device_put(w_host[perm], sharding)
 
 
 class OnlineEPLBController:
@@ -194,7 +180,6 @@ class OnlineEPLBController:
     ):
         num_layers = old_p2l.shape[0]
         num_physical = old_p2l.shape[1]
-        mesh = self._moe_layers[0].mesh if self._moe_layers else None
 
         for moe_layer in self._moe_layers:
             layer_id = moe_layer.layer_id
@@ -217,14 +202,13 @@ class OnlineEPLBController:
                 src = old_logical_to_physical.get(target_logical, dst)
                 perm[dst] = src
 
-            perm_jax = jnp.array(perm)
-            moe_layer.w1.value = _permute_weight(moe_layer.w1.value, perm_jax, mesh)
-            moe_layer.w2.value = _permute_weight(moe_layer.w2.value, perm_jax, mesh)
-            moe_layer.w3.value = _permute_weight(moe_layer.w3.value, perm_jax, mesh)
+            _permute_weight_via_host(moe_layer.w1, perm)
+            _permute_weight_via_host(moe_layer.w2, perm)
+            _permute_weight_via_host(moe_layer.w3, perm)
 
             if moe_layer.w1_scale is not None:
-                moe_layer.w1_scale.value = _permute_weight(moe_layer.w1_scale.value, perm_jax, mesh)
+                _permute_weight_via_host(moe_layer.w1_scale, perm)
             if moe_layer.w2_scale is not None:
-                moe_layer.w2_scale.value = _permute_weight(moe_layer.w2_scale.value, perm_jax, mesh)
+                _permute_weight_via_host(moe_layer.w2_scale, perm)
             if moe_layer.w3_scale is not None:
-                moe_layer.w3_scale.value = _permute_weight(moe_layer.w3_scale.value, perm_jax, mesh)
+                _permute_weight_via_host(moe_layer.w3_scale, perm)
