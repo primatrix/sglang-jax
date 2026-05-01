@@ -2676,6 +2676,12 @@ def _fused_ep_moe_kernel(
 
         wait_store_output(bt_id=bt_id - 2)
 
+        se_per_expert = (
+            max(2, cdiv(se_total_blocks, local_num_experts)) if se_total_blocks > 0 else 2
+        )
+        se_before = se_per_expert // 2
+        se_after = se_per_expert - se_before
+
         if expert_buffer_count >= local_num_experts:
             # === BATCH SCATTER PATH ===
             # Issue all scatter DMAs in one token-loop pass (bt iterations
@@ -2698,8 +2704,9 @@ def _fused_ep_moe_kernel(
                         start_fetch_bw1(0, bw1_sem_id=0, bf_id=0, bd1_id=0)
                         start_fetch_bw3(0, bw3_sem_id=0, bf_id=0, bd3_id=0)
 
-                run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
-                curr_se_block += 1
+                for _ in range(se_before):
+                    run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
+                    curr_se_block += 1
 
                 wait_a2a_scatter_recv(
                     bt_sem_id=bt_sem_id,
@@ -2714,8 +2721,9 @@ def _fused_ep_moe_kernel(
                     local_e_id=local_e_id,
                 )
 
-                run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
-                curr_se_block += 1
+                for _ in range(se_after):
+                    run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
+                    curr_se_block += 1
 
                 return curr_se_block
 
@@ -2796,8 +2804,9 @@ def _fused_ep_moe_kernel(
                         bt_start=bt_start,
                     )
 
-                run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
-                curr_se_block += 1
+                for _ in range(se_before):
+                    run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
+                    curr_se_block += 1
 
                 wait_a2a_scatter_recv(
                     bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id
@@ -2806,8 +2815,9 @@ def _fused_ep_moe_kernel(
 
                 start_a2a_gather(bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id)
 
-                run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
-                curr_se_block += 1
+                for _ in range(se_after):
+                    run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
+                    curr_se_block += 1
 
                 wait_a2a_scatter_send(
                     bt_sem_id=bt_sem_id,
