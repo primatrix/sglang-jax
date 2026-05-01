@@ -258,6 +258,38 @@ def get_simplified_key(
     )
 
 
+def _lookup_tuned_config(device_name: str, table_key: tuple) -> tuple | None:
+    """Look up tuned config, falling back to nearby num_experts if needed."""
+    for tables in [
+        TUNED_BLOCK_CONFIGS.get(device_name, {}),
+        TUNED_BLOCK_CONFIGS.get("*", {}),
+    ]:
+        cfg = tables.get(table_key)
+        if cfg is not None:
+            return cfg
+
+    # table_key = (dtype, weight_dtype, num_tokens, num_experts, top_k, ...)
+    num_experts_idx = 3
+    num_experts = table_key[num_experts_idx]
+    for candidate in [num_experts - num_experts % 64, num_experts - num_experts % 32]:
+        if candidate <= 0 or candidate == num_experts:
+            continue
+        fallback_key = table_key[:num_experts_idx] + (candidate,) + table_key[num_experts_idx + 1 :]
+        for tables in [
+            TUNED_BLOCK_CONFIGS.get(device_name, {}),
+            TUNED_BLOCK_CONFIGS.get("*", {}),
+        ]:
+            cfg = tables.get(fallback_key)
+            if cfg is not None:
+                logger.info(
+                    "Block config fallback: num_experts %d -> %d",
+                    num_experts,
+                    candidate,
+                )
+                return cfg
+    return None
+
+
 def get_tuned_fused_moe_block_config(
     *,
     num_tokens: int,
@@ -292,11 +324,7 @@ def get_tuned_fused_moe_block_config(
     device_name = keys[0]
     table_key = keys[1:]
 
-    cfg_tuple = None
-    if device_name in TUNED_BLOCK_CONFIGS:
-        cfg_tuple = TUNED_BLOCK_CONFIGS[device_name].get(table_key)
-    if cfg_tuple is None:
-        cfg_tuple = TUNED_BLOCK_CONFIGS.get("*", {}).get(table_key)
+    cfg_tuple = _lookup_tuned_config(device_name, table_key)
 
     if cfg_tuple is None:
         return DEFAULT_FUSED_MOE_BLOCK_CONFIG
