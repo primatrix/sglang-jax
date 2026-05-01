@@ -42,15 +42,17 @@ def _collect_moe_layers(module, result: list, visited: set | None = None):
                         _collect_moe_layers(item, result, visited)
 
 
-def _swap_experts(w, swaps):
-    """Swap experts in weight array using scalar indexing to avoid sharding ambiguity."""
-    src_cache = {}
+def _swap_experts_via_host(param, swaps):
+    """Permute experts by round-tripping through host memory."""
+    sharding = param.value.sharding
+    w_host = np.array(jax.device_get(param.value))
+    src_data = {}
     for _, src in swaps:
-        if src not in src_cache:
-            src_cache[src] = w[src]
+        if src not in src_data:
+            src_data[src] = w_host[src].copy()
     for dst, src in swaps:
-        w = w.at[dst].set(src_cache[src])
-    return w
+        w_host[dst] = src_data[src]
+    param.value = jax.device_put(w_host, sharding)
 
 
 class OnlineEPLBController:
@@ -206,13 +208,13 @@ class OnlineEPLBController:
             if not swaps:
                 continue
 
-            moe_layer.w1.value = _swap_experts(moe_layer.w1.value, swaps)
-            moe_layer.w2.value = _swap_experts(moe_layer.w2.value, swaps)
-            moe_layer.w3.value = _swap_experts(moe_layer.w3.value, swaps)
+            _swap_experts_via_host(moe_layer.w1, swaps)
+            _swap_experts_via_host(moe_layer.w2, swaps)
+            _swap_experts_via_host(moe_layer.w3, swaps)
 
             if moe_layer.w1_scale is not None:
-                moe_layer.w1_scale.value = _swap_experts(moe_layer.w1_scale.value, swaps)
+                _swap_experts_via_host(moe_layer.w1_scale, swaps)
             if moe_layer.w2_scale is not None:
-                moe_layer.w2_scale.value = _swap_experts(moe_layer.w2_scale.value, swaps)
+                _swap_experts_via_host(moe_layer.w2_scale, swaps)
             if moe_layer.w3_scale is not None:
-                moe_layer.w3_scale.value = _swap_experts(moe_layer.w3_scale.value, swaps)
+                _swap_experts_via_host(moe_layer.w3_scale, swaps)
