@@ -1,3 +1,4 @@
+import functools
 import logging
 import time
 
@@ -41,6 +42,11 @@ def _collect_moe_layers(module, result: list, visited: set | None = None):
                 for item in attr_value:
                     if isinstance(item, nnx.Module):
                         _collect_moe_layers(item, result, visited)
+
+
+@functools.partial(jax.jit, donate_argnums=(0,))
+def _permute_weight(w, perm):
+    return w[perm]
 
 
 class OnlineEPLBController:
@@ -193,25 +199,13 @@ class OnlineEPLBController:
                 perm[dst] = src
 
             perm_jax = jnp.array(perm)
-            moe_layer.w1.value = moe_layer.w1.value.at[perm_jax].get(
-                out_sharding=moe_layer.w1.value.sharding
-            )
-            moe_layer.w2.value = moe_layer.w2.value.at[perm_jax].get(
-                out_sharding=moe_layer.w2.value.sharding
-            )
-            moe_layer.w3.value = moe_layer.w3.value.at[perm_jax].get(
-                out_sharding=moe_layer.w3.value.sharding
-            )
+            moe_layer.w1.value = _permute_weight(moe_layer.w1.value, perm_jax)
+            moe_layer.w2.value = _permute_weight(moe_layer.w2.value, perm_jax)
+            moe_layer.w3.value = _permute_weight(moe_layer.w3.value, perm_jax)
 
             if moe_layer.w1_scale is not None:
-                moe_layer.w1_scale.value = moe_layer.w1_scale.value.at[perm_jax].get(
-                    out_sharding=moe_layer.w1_scale.value.sharding
-                )
+                moe_layer.w1_scale.value = _permute_weight(moe_layer.w1_scale.value, perm_jax)
             if moe_layer.w2_scale is not None:
-                moe_layer.w2_scale.value = moe_layer.w2_scale.value.at[perm_jax].get(
-                    out_sharding=moe_layer.w2_scale.value.sharding
-                )
+                moe_layer.w2_scale.value = _permute_weight(moe_layer.w2_scale.value, perm_jax)
             if moe_layer.w3_scale is not None:
-                moe_layer.w3_scale.value = moe_layer.w3_scale.value.at[perm_jax].get(
-                    out_sharding=moe_layer.w3_scale.value.sharding
-                )
+                moe_layer.w3_scale.value = _permute_weight(moe_layer.w3_scale.value, perm_jax)
