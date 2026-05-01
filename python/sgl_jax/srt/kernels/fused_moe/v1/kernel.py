@@ -2660,19 +2660,10 @@ def _fused_ep_moe_kernel(
         # Prepare t2e_routing
         t2e_routing = b_topk_ids_x2_vmem[bt_sem_id]
 
-        def _count_expert(i, sizes):
-            t_id = i // top_k
-            k_id = i % top_k
-            e_id = t2e_routing[t_id, k_id]
-            return sizes.at[0, e_id].add(1)
-
-        expert_sizes = lax.fori_loop(
-            0,
-            bt * top_k,
-            _count_expert,
-            jnp.zeros((1, padded_num_experts), dtype=jnp.int32),
-            unroll=False,
-        )
+        expert_iota = jax.lax.broadcasted_iota(jnp.int32, (1, 1, padded_num_experts), 2)
+        routing_expanded = jnp.expand_dims(t2e_routing[:, :top_k], axis=2)
+        mask = (routing_expanded == expert_iota).astype(jnp.int32)
+        expert_sizes = jnp.sum(mask, axis=(0, 1), keepdims=True).reshape(1, padded_num_experts)
 
         expert_starts = jnp.zeros_like(expert_sizes)
 
