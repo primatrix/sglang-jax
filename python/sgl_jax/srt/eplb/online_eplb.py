@@ -2,6 +2,7 @@ import logging
 import time
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
@@ -45,7 +46,9 @@ def _collect_moe_layers(module, result: list, visited: set | None = None):
 def _swap_experts_via_host(param, swaps):
     """Permute experts by round-tripping through host memory."""
     sharding = param.value.sharding
+    dtype = param.value.dtype
     w_host = np.array(jax.device_get(param.value))
+    param.value = jnp.zeros((), dtype=dtype)
     src_data = {}
     for _, src in swaps:
         if src not in src_data:
@@ -147,6 +150,7 @@ class OnlineEPLBController:
             return False
 
         t1 = time.perf_counter()
+        self.model_runner.model_state_leaves = []
         self._apply_weight_permutation(old_p2l, new_p2l, changed_mask)
         t_weights = time.perf_counter() - t1
 
