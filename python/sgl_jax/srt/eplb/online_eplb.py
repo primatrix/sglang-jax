@@ -193,13 +193,25 @@ class OnlineEPLBController:
                 perm[dst] = src
 
             perm_jax = jnp.array(perm)
-            moe_layer.w1.value = moe_layer.w1.value[perm_jax]
-            moe_layer.w2.value = moe_layer.w2.value[perm_jax]
-            moe_layer.w3.value = moe_layer.w3.value[perm_jax]
+            moe_layer.w1.value = moe_layer.w1.value.at[perm_jax].get(
+                out_sharding=moe_layer.w1.value.sharding
+            )
+            moe_layer.w2.value = moe_layer.w2.value.at[perm_jax].get(
+                out_sharding=moe_layer.w2.value.sharding
+            )
+            moe_layer.w3.value = moe_layer.w3.value.at[perm_jax].get(
+                out_sharding=moe_layer.w3.value.sharding
+            )
 
             if moe_layer.w1_scale is not None:
-                moe_layer.w1_scale.value = moe_layer.w1_scale.value[perm_jax]
+                moe_layer.w1_scale.value = moe_layer.w1_scale.value.at[perm_jax].get(
+                    out_sharding=moe_layer.w1_scale.value.sharding
+                )
             if moe_layer.w2_scale is not None:
-                moe_layer.w2_scale.value = moe_layer.w2_scale.value[perm_jax]
+                moe_layer.w2_scale.value = moe_layer.w2_scale.value.at[perm_jax].get(
+                    out_sharding=moe_layer.w2_scale.value.sharding
+                )
             if moe_layer.w3_scale is not None:
-                moe_layer.w3_scale.value = moe_layer.w3_scale.value[perm_jax]
+                moe_layer.w3_scale.value = moe_layer.w3_scale.value.at[perm_jax].get(
+                    out_sharding=moe_layer.w3_scale.value.sharding
+                )
