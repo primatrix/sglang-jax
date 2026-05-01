@@ -1,4 +1,3 @@
-import functools
 import logging
 import time
 
@@ -44,9 +43,19 @@ def _collect_moe_layers(module, result: list, visited: set | None = None):
                         _collect_moe_layers(item, result, visited)
 
 
-@functools.partial(jax.jit, donate_argnums=(0,))
+def _gather_impl(w, p):
+    return w[p]
+
+
+_jit_cache: dict = {}
+
+
 def _permute_weight(w, perm):
-    return w[perm]
+    """Permute array along axis 0, reusing input buffer via donation."""
+    sharding = w.sharding
+    if sharding not in _jit_cache:
+        _jit_cache[sharding] = jax.jit(_gather_impl, donate_argnums=(0,), out_shardings=sharding)
+    return _jit_cache[sharding](w, perm)
 
 
 class OnlineEPLBController:
