@@ -1607,13 +1607,19 @@ def _fused_ep_moe_kernel(
                                     ),
                                     pl.ds(bfc_id * bfc, bfc),
                                 )
-                                d1 = jnp.dot(
+                                w13_g = jnp.concatenate(
+                                    [w1_vmem[*w_g_slices], w3_vmem[*w_g_slices]],
+                                    axis=-1,
+                                )
+                                d13 = jnp.dot(
                                     t_g,
-                                    w1_vmem[*w_g_slices],
+                                    w13_g,
                                     preferred_element_type=jnp.float32,
                                 )
+                                d1 = d13[..., :bfc]
+                                d3 = d13[..., bfc:]
+
                                 global_sg = base_sg + sg_id
-                                # Use pl.ds for traced global_sg index.
                                 s1 = w1_scale_vmem[
                                     p_id,
                                     pl.ds(global_sg, 1),
@@ -1624,11 +1630,6 @@ def _fused_ep_moe_kernel(
                                 d1 = d1 * jnp.broadcast_to(s1, d1.shape)
                                 acc1 = acc1 + d1
 
-                                d3 = jnp.dot(
-                                    t_g,
-                                    w3_vmem[*w_g_slices],
-                                    preferred_element_type=jnp.float32,
-                                )
                                 if w3_scale_vmem is not None:
                                     s3 = w3_scale_vmem[
                                         p_id,
@@ -1688,11 +1689,17 @@ def _fused_ep_moe_kernel(
                                 pl.ds(bd1c_id * bd1c_per_t_packing, bd1c_per_t_packing),
                                 pl.ds(bfc_id * bfc, bfc),
                             )
-                            acc1 = jnp.dot(
+                            w13 = jnp.concatenate(
+                                [w1_vmem[*w_slices], w3_vmem[*w_slices]],
+                                axis=-1,
+                            )
+                            d13 = jnp.dot(
                                 t,
-                                w1_vmem[*w_slices],
+                                w13,
                                 preferred_element_type=jnp.float32,
                             )
+                            acc1 = d13[..., :bfc]
+                            acc3 = d13[..., bfc:]
 
                             if w1_scale_vmem is not None:
                                 w1_scale_slices = (
@@ -1705,12 +1712,6 @@ def _fused_ep_moe_kernel(
                                     w1_scale_vmem[*w1_scale_slices], acc1.shape
                                 )
                                 acc1 *= w1_scale
-
-                            acc3 = jnp.dot(
-                                t,
-                                w3_vmem[*w_slices],
-                                preferred_element_type=jnp.float32,
-                            )
 
                             if w3_scale_vmem is not None:
                                 w3_scale_slices = (
