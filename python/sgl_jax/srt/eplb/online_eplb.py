@@ -2,7 +2,6 @@ import logging
 import time
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
@@ -43,19 +42,15 @@ def _collect_moe_layers(module, result: list, visited: set | None = None):
                         _collect_moe_layers(item, result, visited)
 
 
-def _gather_impl(w, p):
-    return w[p]
-
-
-_jit_cache: dict = {}
-
-
-def _permute_weight(w, perm):
-    """Permute array along axis 0, reusing input buffer via donation."""
-    sharding = w.sharding
-    if sharding not in _jit_cache:
-        _jit_cache[sharding] = jax.jit(_gather_impl, donate_argnums=(0,), out_shardings=sharding)
-    return _jit_cache[sharding](w, perm)
+def _swap_experts(w, swaps):
+    """Swap experts in weight array using scalar indexing to avoid sharding ambiguity."""
+    src_cache = {}
+    for _, src in swaps:
+        if src not in src_cache:
+            src_cache[src] = w[src]
+    for dst, src in swaps:
+        w = w.at[dst].set(src_cache[src])
+    return w
 
 
 class OnlineEPLBController:
@@ -199,22 +194,25 @@ class OnlineEPLBController:
                 if l_idx not in old_logical_to_physical:
                     old_logical_to_physical[l_idx] = p_idx
 
-            perm = np.arange(num_physical, dtype=np.int32)
+            swaps = []
             for dst in range(num_physical):
                 if not changed_mask[layer_id, dst]:
                     continue
                 target_logical = int(new_p2l[layer_id, dst])
                 src = old_logical_to_physical.get(target_logical, dst)
-                perm[dst] = src
+                if src != dst:
+                    swaps.append((dst, src))
 
-            perm_jax = jnp.array(perm)
-            moe_layer.w1.value = _permute_weight(moe_layer.w1.value, perm_jax)
-            moe_layer.w2.value = _permute_weight(moe_layer.w2.value, perm_jax)
-            moe_layer.w3.value = _permute_weight(moe_layer.w3.value, perm_jax)
+            if not swaps:
+                continue
+
+            moe_layer.w1.value = _swap_experts(moe_layer.w1.value, swaps)
+            moe_layer.w2.value = _swap_experts(moe_layer.w2.value, swaps)
+            moe_layer.w3.value = _swap_experts(moe_layer.w3.value, swaps)
 
             if moe_layer.w1_scale is not None:
-                moe_layer.w1_scale.value = _permute_weight(moe_layer.w1_scale.value, perm_jax)
+                moe_layer.w1_scale.value = _swap_experts(moe_layer.w1_scale.value, swaps)
             if moe_layer.w2_scale is not None:
-                moe_layer.w2_scale.value = _permute_weight(moe_layer.w2_scale.value, perm_jax)
+                moe_layer.w2_scale.value = _swap_experts(moe_layer.w2_scale.value, swaps)
             if moe_layer.w3_scale is not None:
-                moe_layer.w3_scale.value = _permute_weight(moe_layer.w3_scale.value, perm_jax)
+                moe_layer.w3_scale.value = _swap_experts(moe_layer.w3_scale.value, swaps)
