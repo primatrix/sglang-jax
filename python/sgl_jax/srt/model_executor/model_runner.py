@@ -13,6 +13,7 @@ from jax._src import mesh as mesh_lib
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, MockModelConfig, ModelConfig
 from sgl_jax.srt.eplb.expert_location import (
+    get_num_experts_from_config,
     init_expert_location_metadata,
     set_global_server_args,
 )
@@ -189,7 +190,7 @@ class ModelRunner(BaseModelRunner):
                 dist_recorder_buffer_size=self.server_args.expert_distribution_recorder_buffer_size,
                 dist_recorder_output_file=self.server_args.expert_distribution_recorder_output_file,
                 physical_expert_counts=self.server_args.ep_num_redundant_experts
-                + getattr(self.model_config.hf_config, "num_experts", 0),
+                + get_num_experts_from_config(self.model_config.hf_config),
             )
         )
 

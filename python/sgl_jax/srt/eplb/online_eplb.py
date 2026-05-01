@@ -11,6 +11,7 @@ from sgl_jax.srt.eplb import eplb_algorithms
 from sgl_jax.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
+    get_num_experts_from_config,
     set_global_expert_location_metadata,
 )
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE
@@ -67,7 +68,7 @@ class OnlineEPLBController:
         self._moe_layers.sort(key=lambda m: m.layer_id if m.layer_id is not None else 0)
 
         hf_config = model_config.hf_config
-        self._num_logical_experts = getattr(hf_config, "num_experts", 0)
+        self._num_logical_experts = get_num_experts_from_config(hf_config)
         self._num_groups = getattr(hf_config, "num_expert_group", 1)
 
         metadata = get_global_expert_location_metadata()

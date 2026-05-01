@@ -15,6 +15,11 @@ from sgl_jax.srt.utils.jax_utils import device_array
 
 logger = logging.getLogger(__name__)
 
+
+def get_num_experts_from_config(config) -> int:
+    return getattr(config, "n_routed_experts", getattr(config, "num_experts", 0))
+
+
 # Global variables set during server initialization
 _GLOBAL_SERVER_ARGS = None
 _GLOBAL_EXPERT_LOCATION_METADATA = None
@@ -179,7 +184,7 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def _init_common(server_args: ServerArgs, model_config: ModelConfig):
-        num_logical_experts = getattr(model_config.hf_config, "num_experts", 0)
+        num_logical_experts = get_num_experts_from_config(model_config.hf_config)
         num_layers = getattr(model_config.hf_config, "num_hidden_layers", 0)
         num_groups = getattr(model_config.hf_config, "num_expert_group", 1)
 
