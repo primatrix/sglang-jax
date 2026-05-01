@@ -10,6 +10,7 @@ from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.layernorm import RMSNorm
@@ -741,6 +742,12 @@ class MiMoV2FlashForCausalLM(nnx.Module):
             )
             moe_backend = getattr(self.config, "moe_backend", "epmoe")
 
+            p2l_map = None
+            metadata = get_global_expert_location_metadata()
+            if metadata is not None:
+                full_p2l = jax.device_get(metadata.physical_to_logical_map)
+                p2l_map = full_p2l[layer_idx]
+
             moe_mappings = create_moe_weights_mapping(
                 prefix=prefix,
                 target_prefix=target,
@@ -748,6 +755,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                 moe_backend=moe_backend,
                 moe_path="mlp.experts",
                 source_expert_pattern="{i}",
+                physical_to_logical_map=p2l_map,
             )
 
             if is_fp8:
