@@ -270,7 +270,7 @@ class OnlineEPLBController:
             logger.info("Weight permutation: no work items")
             return
 
-        max_workers = min(6, len(work_items))
+        max_workers = min(12, len(work_items))
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             results = list(pool.map(lambda item: _permute_weight_via_host(*item), work_items))
 
