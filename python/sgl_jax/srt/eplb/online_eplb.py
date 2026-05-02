@@ -21,7 +21,7 @@ from sgl_jax.srt.server_args import ServerArgs
 logger = logging.getLogger(__name__)
 
 
-def _collect_moe_layers(module, result: list, visited: set | None = None):
+def _collect_moe_layers(module, result: list, visited: set | None = None, depth: int = 0):
     if visited is None:
         visited = set()
     obj_id = id(module)
@@ -33,14 +33,22 @@ def _collect_moe_layers(module, result: list, visited: set | None = None):
         result.append(module)
         return
 
+    if depth < 3:
+        logger.debug(
+            "Traversing %s (depth=%d), attrs: %s",
+            type(module).__name__,
+            depth,
+            [(k, type(v).__name__) for k, v in module.__dict__.items() if not k.startswith("_")],
+        )
+
     if hasattr(module, "__dict__"):
-        for attr_value in module.__dict__.values():
+        for attr_name, attr_value in module.__dict__.items():
             if isinstance(attr_value, nnx.Module):
-                _collect_moe_layers(attr_value, result, visited)
-            elif isinstance(attr_value, list):
+                _collect_moe_layers(attr_value, result, visited, depth + 1)
+            elif isinstance(attr_value, (list, tuple)):
                 for item in attr_value:
                     if isinstance(item, nnx.Module):
-                        _collect_moe_layers(item, result, visited)
+                        _collect_moe_layers(item, result, visited, depth + 1)
 
 
 def _permute_weight_via_host(param, perm):
@@ -120,6 +128,11 @@ class OnlineEPLBController:
         self._rebalance_count = 0
 
         self._moe_layers: list[FusedEPMoE] = []
+        logger.info(
+            "Collecting MoE layers from model type=%s, id=%d",
+            type(self.model_runner.model).__name__,
+            id(self.model_runner.model),
+        )
         _collect_moe_layers(self.model_runner.model, self._moe_layers)
         self._moe_layers.sort(key=lambda m: m.layer_id if m.layer_id is not None else 0)
 
