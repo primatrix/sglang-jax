@@ -237,14 +237,12 @@ class OnlineEPLBController:
 
         # Debug: capture weight fingerprints before permutation
         debug_layer = self._moe_layers[0]
-        debug_w = debug_layer.w1.value
-        pre_fp = {
-            int(old_p2l[debug_layer.layer_id, s]): float(
-                jnp.sum(jnp.abs(debug_w[s].astype(jnp.float32))).item()
-            )
-            for s in range(min(5, debug_w.shape[0]))
-        }
-        logger.info("Pre-permute fingerprints (logical→sum): %s", pre_fp)
+        debug_w_np = np.array(jax.device_get(debug_layer.w1.value))
+        pre_fp = {}
+        for s in range(min(5, debug_w_np.shape[0])):
+            logical = int(old_p2l[debug_layer.layer_id, s])
+            pre_fp[logical] = float(np.sum(np.abs(debug_w_np[s].astype(np.float32))))
+        logger.info("Pre-permute fingerprints (logical->sum): %s", pre_fp)
 
         t1 = time.perf_counter()
         self.model_runner.model_state_leaves = []
@@ -252,12 +250,12 @@ class OnlineEPLBController:
         t_weights = time.perf_counter() - t1
 
         # Debug: verify weight fingerprints after permutation
-        debug_w = debug_layer.w1.value
+        debug_w_np = np.array(jax.device_get(debug_layer.w1.value))
         layer_id = debug_layer.layer_id
         for logical_id, expected_fp in pre_fp.items():
             new_slots = np.where(new_p2l[layer_id] == logical_id)[0]
             for ns in new_slots[:2]:
-                actual_fp = float(jnp.sum(jnp.abs(debug_w[ns].astype(jnp.float32))).item())
+                actual_fp = float(np.sum(np.abs(debug_w_np[ns].astype(np.float32))))
                 match = "OK" if abs(actual_fp - expected_fp) < 1e-3 else "MISMATCH"
                 logger.info(
                     "Post-permute verify: logical=%d, new_slot=%d, "
