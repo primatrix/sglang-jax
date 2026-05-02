@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -162,6 +163,10 @@ class OnlineEPLBController:
         _collect_moe_layers(self.model_runner.model, self._moe_layers)
         self._moe_layers.sort(key=lambda m: m.layer_id if m.layer_id is not None else 0)
 
+        self._reference_treedef = None
+        _, init_state = nnx.split(self.model_runner.model)
+        _, self._reference_treedef = jax.tree_util.tree_flatten(init_state)
+
         hf_config = model_config.hf_config
         self._num_logical_experts = get_num_experts_from_config(hf_config)
         self._num_groups = getattr(hf_config, "num_expert_group", 1)
@@ -230,42 +235,20 @@ class OnlineEPLBController:
         )
         t_algo = time.perf_counter() - t0
 
+        if os.environ.get("EPLB_NOOP"):
+            logger.info("EPLB_NOOP: overriding with identity mapping for rebuild test")
+            new_p2l = old_p2l.copy()
+            new_l2p = np.array(jax.device_get(old_metadata.logical_to_all_physical_map))
+
         changed_mask = old_p2l != new_p2l
         num_changed = int(changed_mask.sum())
         total_slots = old_p2l.size
         change_ratio = num_changed / total_slots if total_slots > 0 else 0.0
 
-        # Debug: capture weight fingerprints before permutation
-        debug_layer = self._moe_layers[0]
-        debug_w_np = np.array(jax.device_get(debug_layer.w1.value))
-        pre_fp = {}
-        for s in range(min(5, debug_w_np.shape[0])):
-            logical = int(old_p2l[debug_layer.layer_id, s])
-            pre_fp[logical] = float(np.sum(np.abs(debug_w_np[s].astype(np.float32))))
-        logger.info("Pre-permute fingerprints (logical->sum): %s", pre_fp)
-
         t1 = time.perf_counter()
         self.model_runner.model_state_leaves = []
         self._apply_weight_permutation(old_p2l, new_p2l, changed_mask)
         t_weights = time.perf_counter() - t1
-
-        # Debug: verify weight fingerprints after permutation
-        debug_w_np = np.array(jax.device_get(debug_layer.w1.value))
-        layer_id = debug_layer.layer_id
-        for logical_id, expected_fp in pre_fp.items():
-            new_slots = np.where(new_p2l[layer_id] == logical_id)[0]
-            for ns in new_slots[:2]:
-                actual_fp = float(np.sum(np.abs(debug_w_np[ns].astype(np.float32))))
-                match = "OK" if abs(actual_fp - expected_fp) < 1e-3 else "MISMATCH"
-                logger.info(
-                    "Post-permute verify: logical=%d, new_slot=%d, "
-                    "expected_fp=%.4f, actual_fp=%.4f [%s]",
-                    logical_id,
-                    ns,
-                    expected_fp,
-                    actual_fp,
-                    match,
-                )
 
         new_metadata = ExpertLocationMetadata._init_raw(
             server_args=self.server_args,
@@ -275,24 +258,17 @@ class OnlineEPLBController:
         )
         set_global_expert_location_metadata(new_metadata)
 
-        # Debug: verify metadata consistency
-        l2p_check = jax.device_get(new_metadata.logical_to_rank_dispatch_physical_map)
-        p2l_check = jax.device_get(new_metadata.physical_to_logical_map)
-        for lid in range(min(5, l2p_check.shape[1])):
-            pid = int(l2p_check[layer_id, lid])
-            roundtrip = int(p2l_check[layer_id, pid])
-            ok = "OK" if roundtrip == lid else "MISMATCH"
-            logger.info(
-                "Metadata check: layer=%d, logical=%d -> physical=%d -> logical=%d [%s]",
-                layer_id,
-                lid,
-                pid,
-                roundtrip,
-                ok,
-            )
-
         _, model_state = nnx.split(self.model_runner.model)
-        self.model_runner.model_state_leaves, _ = jax.tree_util.tree_flatten(model_state)
+        self.model_runner.model_state_leaves, new_treedef = jax.tree_util.tree_flatten(model_state)
+        if new_treedef != self._reference_treedef:
+            logger.error(
+                "TREEDEF MISMATCH after rebalance! leaves=%d",
+                len(self.model_runner.model_state_leaves),
+            )
+        else:
+            logger.info("Treedef OK: %d leaves", len(self.model_runner.model_state_leaves))
+
+        self._verify_metadata(new_metadata, new_p2l)
 
         self._rebalance_count += 1
         self._prev_logical_counts = logical_counts.copy()
@@ -340,6 +316,25 @@ class OnlineEPLBController:
                 src = old_logical_to_physical.get(target_logical, dst)
                 perm[dst] = src
 
+            n_unique = len(np.unique(perm))
+            if n_unique != num_physical:
+                logger.error(
+                    "INVALID PERM layer=%d: %d unique (expected %d), dupes exist",
+                    layer_id,
+                    n_unique,
+                    num_physical,
+                )
+            missing_logical = set(range(self._num_logical_experts)) - set(
+                old_logical_to_physical.keys()
+            )
+            if missing_logical:
+                logger.error(
+                    "Layer %d: %d logical experts missing from old mapping: %s",
+                    layer_id,
+                    len(missing_logical),
+                    sorted(missing_logical)[:5],
+                )
+
             if isinstance(moe_layer, FusedEPMoE):
                 weights = [moe_layer.w1, moe_layer.w2, moe_layer.w3]
                 scales = [moe_layer.w1_scale, moe_layer.w2_scale, moe_layer.w3_scale]
@@ -379,3 +374,52 @@ class OnlineEPLBController:
             total_changed,
             max_workers,
         )
+
+    def _verify_metadata(self, metadata: ExpertLocationMetadata, p2l: np.ndarray):
+        l2p = jax.device_get(metadata.logical_to_rank_dispatch_physical_map)
+        p2l_check = jax.device_get(metadata.physical_to_logical_map)
+        num_valid = jax.device_get(metadata.logical_to_all_physical_map_num_valid)
+
+        num_layers, num_logical = l2p.shape
+        sample_layers = list(range(0, num_layers, max(1, num_layers // 5)))
+        errors = 0
+        zero_valid = 0
+        for layer_id in sample_layers:
+            for lid in range(num_logical):
+                pid = int(l2p[layer_id, lid])
+                if pid < 0 or pid >= p2l_check.shape[1]:
+                    errors += 1
+                    if errors <= 3:
+                        logger.error(
+                            "Metadata: layer=%d logical=%d -> invalid physical=%d",
+                            layer_id,
+                            lid,
+                            pid,
+                        )
+                    continue
+                roundtrip = int(p2l_check[layer_id, pid])
+                if roundtrip != lid:
+                    errors += 1
+                    if errors <= 3:
+                        logger.error(
+                            "Metadata roundtrip FAIL: layer=%d logical=%d -> phys=%d -> logical=%d",
+                            layer_id,
+                            lid,
+                            pid,
+                            roundtrip,
+                        )
+                nv = int(num_valid[layer_id, lid])
+                if nv == 0:
+                    zero_valid += 1
+        if errors:
+            logger.error(
+                "Metadata verification: %d errors across %d layers", errors, len(sample_layers)
+            )
+        else:
+            logger.info(
+                "Metadata verification OK: %d layers × %d experts checked",
+                len(sample_layers),
+                num_logical,
+            )
+        if zero_valid:
+            logger.warning("Metadata: %d (layer, expert) pairs have num_valid=0", zero_valid)
