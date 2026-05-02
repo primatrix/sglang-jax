@@ -25,11 +25,18 @@ logger = logging.getLogger(__name__)
 _MOE_LAYER_TYPES = (FusedEPMoE, EPMoE)
 
 _on_device_permute_supported: bool | None = None
+_permute_fn_cache: dict = {}
 
 
-@jax.jit
-def _jit_permute(arr, perm):
-    return arr[perm]
+def _get_permute_fn(spec):
+    if spec not in _permute_fn_cache:
+
+        @jax.jit
+        def fn(arr, perm):
+            return arr.at[perm].get(out_sharding=spec)
+
+        _permute_fn_cache[spec] = fn
+    return _permute_fn_cache[spec]
 
 
 def _permute_weight_on_device(param, perm_jax, sharding):
@@ -38,8 +45,8 @@ def _permute_weight_on_device(param, perm_jax, sharding):
         return False
 
     try:
-        result = _jit_permute(param.value, perm_jax)
-        param.value = jax.device_put(result, sharding)
+        fn = _get_permute_fn(sharding.spec)
+        param.value = fn(param.value, perm_jax)
         if _on_device_permute_supported is None:
             _on_device_permute_supported = True
             logger.info("On-device weight permutation: AVAILABLE")
