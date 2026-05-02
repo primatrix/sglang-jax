@@ -6,6 +6,8 @@ from typing import Literal
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -57,18 +59,20 @@ class ExpertLocationMetadata:
         logical_to_all_physical_map_num_valid: np.ndarray | None = None,
         physical_to_logical_map: np.ndarray | None = None,
         num_physical_experts: int = 0,
+        mesh: Mesh | None = None,
     ):
         self.ep_dispatch_algorithm = ep_dispatch_algorithm
+        sharding = NamedSharding(mesh, P()) if mesh is not None else None
         self.logical_to_rank_dispatch_physical_map = device_array(
-            logical_to_rank_dispatch_physical_map, sharding=(None)
+            logical_to_rank_dispatch_physical_map, sharding=sharding
         )
         self.logical_to_all_physical_map = device_array(
-            logical_to_all_physical_map, sharding=(None)
+            logical_to_all_physical_map, sharding=sharding
         )
         self.logical_to_all_physical_map_num_valid = device_array(
-            logical_to_all_physical_map_num_valid, sharding=(None)
+            logical_to_all_physical_map_num_valid, sharding=sharding
         )
-        self.physical_to_logical_map = device_array(physical_to_logical_map, sharding=(None))
+        self.physical_to_logical_map = device_array(physical_to_logical_map, sharding=sharding)
         self.num_physical_experts = num_physical_experts
 
     def tree_flatten(self):
@@ -97,7 +101,7 @@ class ExpertLocationMetadata:
         return obj
 
     @staticmethod
-    def init_trivial(server_args: ServerArgs, model_config: ModelConfig):
+    def init_trivial(server_args: ServerArgs, model_config: ModelConfig, mesh: Mesh | None = None):
         """Trivial location - logical expert i corresponds to physical expert i"""
         common = ExpertLocationMetadata._init_common(server_args, model_config)
 
@@ -116,6 +120,7 @@ class ExpertLocationMetadata:
             server_args,
             model_config,
             physical_to_logical_map=physical_to_logical_map,
+            mesh=mesh,
         )
 
     @staticmethod
@@ -123,6 +128,7 @@ class ExpertLocationMetadata:
         server_args: ServerArgs,
         model_config: ModelConfig,
         physical_to_logical_map,
+        mesh: Mesh | None = None,
     ):
         if not isinstance(physical_to_logical_map, np.ndarray):
             physical_to_logical_map = np.array(physical_to_logical_map)
@@ -143,10 +149,13 @@ class ExpertLocationMetadata:
             server_args=server_args,
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map,
+            mesh=mesh,
         )
 
     @staticmethod
-    def init_by_eplb(server_args: ServerArgs, model_config: ModelConfig, logical_count):
+    def init_by_eplb(
+        server_args: ServerArgs, model_config: ModelConfig, logical_count, mesh: Mesh | None = None
+    ):
         if not isinstance(logical_count, np.ndarray):
             logical_count = np.array(logical_count)
         if len(logical_count.shape) == 1:
@@ -180,6 +189,7 @@ class ExpertLocationMetadata:
             server_args=server_args,
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map,
+            mesh=mesh,
         )
 
     @staticmethod
@@ -207,6 +217,7 @@ class ExpertLocationMetadata:
         server_args: ServerArgs,
         physical_to_logical_map: np.ndarray,
         logical_to_all_physical_map: np.ndarray,
+        mesh: Mesh | None = None,
     ):
         # from jax.experimental import multihost_utils
 
@@ -255,18 +266,20 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
             physical_to_logical_map=physical_to_logical_map,
             num_physical_experts=physical_to_logical_map.shape[1],
+            mesh=mesh,
         )
 
 
 def compute_initial_expert_location_metadata(
     server_args: ServerArgs,
     model_config: ModelConfig,
+    mesh: Mesh | None = None,
 ) -> ExpertLocationMetadata | None:
     data = server_args.init_expert_location
     logger.info("Computing initial expert location metadata from: %s", data)
 
     if data == "trivial":
-        return ExpertLocationMetadata.init_trivial(server_args, model_config)
+        return ExpertLocationMetadata.init_trivial(server_args, model_config, mesh=mesh)
 
     if data.endswith(".npy"):
         try:
@@ -302,6 +315,7 @@ def compute_initial_expert_location_metadata(
             server_args,
             model_config,
             physical_to_logical_map=mapping,
+            mesh=mesh,
         )
     elif "logical_count" in data_dict:
         counts = data_dict["logical_count"]
@@ -309,18 +323,20 @@ def compute_initial_expert_location_metadata(
             "init_expert_location via init_by_eplb. Counts shape: %s",
             getattr(counts, "shape", "unknown"),
         )
-        return ExpertLocationMetadata.init_by_eplb(server_args, model_config, logical_count=counts)
+        return ExpertLocationMetadata.init_by_eplb(
+            server_args, model_config, logical_count=counts, mesh=mesh
+        )
     else:
         raise NotImplementedError(
             f"Unknown init_expert_location format. Keys found: {list(data_dict.keys())}"
         )
 
 
-def init_expert_location_metadata(server_args, model_config):
+def init_expert_location_metadata(server_args, model_config, mesh=None):
     """
     Initializes the global expert mapping.
     """
-    metadata = compute_initial_expert_location_metadata(server_args, model_config)
+    metadata = compute_initial_expert_location_metadata(server_args, model_config, mesh=mesh)
     if metadata is not None:
         set_global_expert_location_metadata(metadata)
 

@@ -244,6 +244,7 @@ class OnlineEPLBController:
             server_args=self.server_args,
             physical_to_logical_map=new_p2l,
             logical_to_all_physical_map=new_l2p,
+            mesh=self.model_runner.mesh,
         )
         set_global_expert_location_metadata(new_metadata)
 

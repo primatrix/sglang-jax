@@ -326,7 +326,7 @@ class ModelRunner(BaseModelRunner):
 
         if self.server_args.ep_dispatch_algorithm:
             with jax.set_mesh(self.mesh):
-                init_expert_location_metadata(self.server_args, self.model_config)
+                init_expert_location_metadata(self.server_args, self.model_config, mesh=self.mesh)
 
         self.model = self.model_loader.load_model(
             model_config=self.model_config,
