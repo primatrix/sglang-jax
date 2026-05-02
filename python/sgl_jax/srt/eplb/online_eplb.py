@@ -3,6 +3,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
@@ -22,6 +23,32 @@ from sgl_jax.srt.server_args import ServerArgs
 logger = logging.getLogger(__name__)
 
 _MOE_LAYER_TYPES = (FusedEPMoE, EPMoE)
+
+_on_device_permute_supported: bool | None = None
+
+
+@jax.jit
+def _jit_permute(arr, perm):
+    return arr[perm]
+
+
+def _permute_weight_on_device(param, perm_jax, sharding):
+    global _on_device_permute_supported
+    if _on_device_permute_supported is False:
+        return False
+
+    try:
+        result = _jit_permute(param.value, perm_jax)
+        param.value = jax.device_put(result, sharding)
+        if _on_device_permute_supported is None:
+            _on_device_permute_supported = True
+            logger.info("On-device weight permutation: AVAILABLE")
+        return True
+    except Exception as e:
+        if _on_device_permute_supported is None:
+            _on_device_permute_supported = False
+            logger.info("On-device weight permutation: NOT available (%s)", e)
+        return False
 
 
 def _collect_moe_layers(module, result: list, visited: set | None = None):
@@ -270,13 +297,24 @@ class OnlineEPLBController:
             logger.info("Weight permutation: no work items")
             return
 
+        global _on_device_permute_supported
+        if _on_device_permute_supported is not False:
+            first_p, first_perm = work_items[0]
+            first_perm_jax = jnp.array(first_perm, dtype=jnp.int32)
+            if _permute_weight_on_device(first_p, first_perm_jax, first_p.value.sharding):
+                for p, perm in work_items[1:]:
+                    perm_jax = jnp.array(perm, dtype=jnp.int32)
+                    _permute_weight_on_device(p, perm_jax, p.value.sharding)
+                logger.info("Weight permutation (on-device): %d tensors", len(work_items))
+                return
+
         max_workers = min(12, len(work_items))
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             results = list(pool.map(lambda item: _permute_weight_via_host(*item), work_items))
 
         total_changed = sum(results)
         logger.info(
-            "Weight permutation: %d tensors, %d shard transfers (workers=%d)",
+            "Weight permutation (host): %d tensors, %d shard transfers (workers=%d)",
             len(work_items),
             total_changed,
             max_workers,
