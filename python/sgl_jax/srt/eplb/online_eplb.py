@@ -1,5 +1,6 @@
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import jax
 import numpy as np
@@ -43,10 +44,11 @@ def _collect_moe_layers(module, result: list, visited: set | None = None):
 
 
 def _permute_weight_via_host(param, perm):
-    """Permute weight along axis 0 via per-shard host roundtrip.
+    """Permute weight along axis 0 via host roundtrip.
 
-    Only transfers device shards that actually change. Unchanged shards
-    reuse existing device buffers with zero data transfer.
+    Uses a hybrid strategy: when most device shards change, a single bulk
+    device_get/device_put is faster than per-shard transfers. When few
+    shards change, only the affected shards are transferred.
     """
     arr = param.value
     sharding = arr.sharding
@@ -63,13 +65,22 @@ def _permute_weight_via_host(param, perm):
     if not changed:
         return 0
 
+    if len(changed) > num_devices // 2:
+        arr_np = np.array(arr)
+        arr_np = arr_np[perm]
+        param.value = jax.device_put(arr_np, sharding)
+        return len(changed)
+
     needed_src = set()
     for d in changed:
         s = d * local_experts
         for i in range(local_experts):
             needed_src.add(int(perm[s + i]) // local_experts)
 
-    src_data = {s: np.array(addressable_shards[s].data) for s in needed_src}
+    with ThreadPoolExecutor(max_workers=len(needed_src)) as pool:
+        src_data = dict(
+            pool.map(lambda idx: (idx, np.array(addressable_shards[idx].data)), needed_src)
+        )
 
     per_device = []
     for d in range(num_devices):
