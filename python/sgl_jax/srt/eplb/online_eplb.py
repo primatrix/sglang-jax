@@ -1,5 +1,4 @@
 import logging
-import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -235,32 +234,15 @@ class OnlineEPLBController:
         )
         t_algo = time.perf_counter() - t0
 
-        if os.environ.get("EPLB_NOOP"):
-            logger.info("EPLB_NOOP: overriding with identity mapping for rebuild test")
-            new_p2l = old_p2l.copy()
-            new_l2p = np.array(jax.device_get(old_metadata.logical_to_all_physical_map))
-
         changed_mask = old_p2l != new_p2l
         num_changed = int(changed_mask.sum())
         total_slots = old_p2l.size
         change_ratio = num_changed / total_slots if total_slots > 0 else 0.0
 
-        pre_fingerprints = self._compute_weight_fingerprints()
-
         t1 = time.perf_counter()
         self.model_runner.model_state_leaves = []
-        if os.environ.get("EPLB_NO_WEIGHTS"):
-            logger.info("EPLB_NO_WEIGHTS: skipping weight permutation (metadata-only test)")
-        else:
-            if os.environ.get("EPLB_HOST_PERMUTE"):
-                global _on_device_permute_supported
-                _on_device_permute_supported = False
-                logger.info("EPLB_HOST_PERMUTE: forcing host-based weight permutation")
-            self._apply_weight_permutation(old_p2l, new_p2l, changed_mask)
+        self._apply_weight_permutation(old_p2l, new_p2l, changed_mask)
         t_weights = time.perf_counter() - t1
-
-        self._verify_weights_after_permutation(old_p2l, new_p2l, changed_mask)
-        self._verify_perm_correctness(pre_fingerprints, old_p2l, new_p2l, changed_mask)
 
         new_metadata = ExpertLocationMetadata._init_raw(
             server_args=self.server_args,
@@ -277,12 +259,6 @@ class OnlineEPLBController:
                 "TREEDEF MISMATCH after rebalance! leaves=%d",
                 len(self.model_runner.model_state_leaves),
             )
-        else:
-            logger.info("Treedef OK: %d leaves", len(self.model_runner.model_state_leaves))
-
-        self._verify_leaves_match_model()
-
-        self._verify_metadata(new_metadata, new_p2l)
 
         self._rebalance_count += 1
         self._prev_logical_counts = logical_counts.copy()
@@ -388,240 +364,3 @@ class OnlineEPLBController:
             total_changed,
             max_workers,
         )
-
-    def _verify_metadata(self, metadata: ExpertLocationMetadata, p2l: np.ndarray):
-        l2p = jax.device_get(metadata.logical_to_rank_dispatch_physical_map)
-        p2l_check = jax.device_get(metadata.physical_to_logical_map)
-        num_valid = jax.device_get(metadata.logical_to_all_physical_map_num_valid)
-
-        num_layers, num_logical = l2p.shape
-        sample_layers = list(range(0, num_layers, max(1, num_layers // 5)))
-        errors = 0
-        zero_valid = 0
-        for layer_id in sample_layers:
-            for lid in range(num_logical):
-                pid = int(l2p[layer_id, lid])
-                if pid < 0 or pid >= p2l_check.shape[1]:
-                    errors += 1
-                    if errors <= 3:
-                        logger.error(
-                            "Metadata: layer=%d logical=%d -> invalid physical=%d",
-                            layer_id,
-                            lid,
-                            pid,
-                        )
-                    continue
-                roundtrip = int(p2l_check[layer_id, pid])
-                if roundtrip != lid:
-                    errors += 1
-                    if errors <= 3:
-                        logger.error(
-                            "Metadata roundtrip FAIL: layer=%d logical=%d -> phys=%d -> logical=%d",
-                            layer_id,
-                            lid,
-                            pid,
-                            roundtrip,
-                        )
-                nv = int(num_valid[layer_id, lid])
-                if nv == 0:
-                    zero_valid += 1
-        if errors:
-            logger.error(
-                "Metadata verification: %d errors across %d layers", errors, len(sample_layers)
-            )
-        else:
-            logger.info(
-                "Metadata verification OK: %d layers × %d experts checked",
-                len(sample_layers),
-                num_logical,
-            )
-        if zero_valid:
-            logger.warning("Metadata: %d (layer, expert) pairs have num_valid=0", zero_valid)
-
-    def _get_first_weight(self, layer):
-        if isinstance(layer, FusedEPMoE):
-            return layer.w1
-        return layer.wi_0
-
-    def _get_first_scale(self, layer):
-        if isinstance(layer, FusedEPMoE):
-            return layer.w1_scale
-        return layer.wi_0_scale
-
-    def _verify_weights_after_permutation(
-        self, old_p2l: np.ndarray, new_p2l: np.ndarray, changed_mask: np.ndarray
-    ):
-        layer = self._moe_layers[0]
-        lid = layer.layer_id
-        if lid is None:
-            return
-
-        w_param = self._get_first_weight(layer)
-        w1_np = np.array(jax.device_get(w_param.value))
-        logger.info(
-            "Post-perm w1 shape=%s dtype=%s, slot0_sum=%.4f, slot1_sum=%.4f",
-            w1_np.shape,
-            w1_np.dtype,
-            float(np.sum(np.abs(w1_np[0].astype(np.float32)))),
-            float(np.sum(np.abs(w1_np[1].astype(np.float32)))),
-        )
-
-        s_param = self._get_first_scale(layer)
-        if s_param is not None:
-            s_np = np.array(jax.device_get(s_param.value))
-            logger.info(
-                "Post-perm w1_scale shape=%s dtype=%s, slot0_sum=%.6f",
-                s_np.shape,
-                s_np.dtype,
-                float(np.sum(np.abs(s_np[0].astype(np.float32)))),
-            )
-
-        all_same = True
-        for p in range(min(10, w1_np.shape[0])):
-            fp = float(np.sum(np.abs(w1_np[p].astype(np.float32))))
-            if fp == 0.0:
-                logger.warning("Post-perm w1[%d] is all zeros!", p)
-                all_same = False
-        if all_same:
-            logger.info("Post-perm w1 first 10 slots: no zeros detected")
-
-    def _verify_leaves_match_model(self):
-        try:
-            layer = self._moe_layers[0]
-            model_w1 = self._get_first_weight(layer).value
-            model_w1_np = np.array(jax.device_get(model_w1))
-            model_w1_fp = float(np.sum(np.abs(model_w1_np[0].astype(np.float32))))
-
-            found = False
-            for i, leaf in enumerate(self.model_runner.model_state_leaves):
-                if leaf.shape == model_w1.shape and leaf.dtype == model_w1.dtype:
-                    is_same = leaf is model_w1
-                    logger.info(
-                        "Leaf check: idx=%d, same_obj=%s, model_fp=%.4f",
-                        i,
-                        is_same,
-                        model_w1_fp,
-                    )
-                    found = True
-                    break
-            if not found:
-                logger.error("Could not find w1 in model_state_leaves!")
-        except Exception as e:
-            logger.error("_verify_leaves_match_model failed: %s", e)
-
-    def _compute_weight_fingerprints(self) -> dict:
-        """Compute per-slot fingerprints for first MoE layer before permutation."""
-        try:
-            layer = self._moe_layers[0]
-            result = {}
-
-            w_param = self._get_first_weight(layer)
-            w_np = np.array(jax.device_get(w_param.value))
-            w_fps = {}
-            for slot in range(w_np.shape[0]):
-                w_fps[slot] = float(np.sum(np.abs(w_np[slot].astype(np.float32))))
-            result["weight"] = w_fps
-
-            s_param = self._get_first_scale(layer)
-            if s_param is not None:
-                s_np = np.array(jax.device_get(s_param.value))
-                s_fps = {}
-                for slot in range(s_np.shape[0]):
-                    s_fps[slot] = float(np.sum(np.abs(s_np[slot].astype(np.float32))))
-                result["scale"] = s_fps
-                logger.info(
-                    "Pre-perm scale shape=%s, slot0=%.6f slot1=%.6f",
-                    s_np.shape,
-                    s_fps[0],
-                    s_fps[1],
-                )
-
-            return result
-        except Exception as e:
-            logger.error("_compute_weight_fingerprints failed: %s", e)
-            return {}
-
-    def _verify_perm_correctness(
-        self,
-        pre_fps: dict,
-        old_p2l: np.ndarray,
-        new_p2l: np.ndarray,
-        changed_mask: np.ndarray,
-    ):
-        """Verify that permuted weights AND scales match expected mapping."""
-        if not pre_fps:
-            return
-        try:
-            layer = self._moe_layers[0]
-            lid = layer.layer_id
-            if lid is None:
-                return
-
-            num_physical = old_p2l.shape[1]
-            old_logical_to_physical = {}
-            for p_idx in range(num_physical):
-                l_idx = int(old_p2l[lid, p_idx])
-                if l_idx not in old_logical_to_physical:
-                    old_logical_to_physical[l_idx] = p_idx
-
-            for kind in ["weight", "scale"]:
-                pre = pre_fps.get(kind)
-                if pre is None:
-                    continue
-
-                if kind == "weight":
-                    param = self._get_first_weight(layer)
-                else:
-                    param = self._get_first_scale(layer)
-
-                arr_np = np.array(jax.device_get(param.value))
-                post = {}
-                for slot in range(arr_np.shape[0]):
-                    post[slot] = float(np.sum(np.abs(arr_np[slot].astype(np.float32))))
-
-                mismatches = 0
-                for dst in range(num_physical):
-                    target_logical = int(new_p2l[lid, dst])
-                    src = old_logical_to_physical.get(target_logical, dst)
-                    expected_fp = pre.get(src, -1)
-                    actual_fp = post.get(dst, -2)
-                    if abs(expected_fp - actual_fp) > 1e-3:
-                        mismatches += 1
-                        if mismatches <= 3:
-                            logger.error(
-                                "%s PERM MISMATCH: dst=%d logical=%d src=%d "
-                                "expected=%.1f actual=%.1f",
-                                kind,
-                                dst,
-                                target_logical,
-                                src,
-                                expected_fp,
-                                actual_fp,
-                            )
-
-                if mismatches == 0:
-                    logger.info("%s perm OK: %d slots checked", kind, num_physical)
-                else:
-                    logger.error(
-                        "%s perm FAILED: %d/%d mismatches",
-                        kind,
-                        mismatches,
-                        num_physical,
-                    )
-
-            sample = list(range(0, min(8, num_physical)))
-            pre_w = pre_fps.get("weight", {})
-            w_param = self._get_first_weight(layer)
-            w_np = np.array(jax.device_get(w_param.value))
-            for s in sample:
-                post_fp = float(np.sum(np.abs(w_np[s].astype(np.float32))))
-                logger.info(
-                    "  slot %d: old_logical=%d new_logical=%d pre_fp=%.1f post_fp=%.1f",
-                    s,
-                    int(old_p2l[lid, s]),
-                    int(new_p2l[lid, s]),
-                    pre_w.get(s, -1),
-                    post_fp,
-                )
-        except Exception as e:
-            logger.error("_verify_perm_correctness failed: %s", e)
