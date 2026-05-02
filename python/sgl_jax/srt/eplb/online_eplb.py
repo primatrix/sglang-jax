@@ -235,10 +235,39 @@ class OnlineEPLBController:
         total_slots = old_p2l.size
         change_ratio = num_changed / total_slots if total_slots > 0 else 0.0
 
+        # Debug: capture weight fingerprints before permutation
+        debug_layer = self._moe_layers[0]
+        debug_w = debug_layer.w1.value
+        pre_fp = {
+            int(old_p2l[debug_layer.layer_id, s]): float(
+                jnp.sum(jnp.abs(debug_w[s].astype(jnp.float32))).item()
+            )
+            for s in range(min(5, debug_w.shape[0]))
+        }
+        logger.info("Pre-permute fingerprints (logical→sum): %s", pre_fp)
+
         t1 = time.perf_counter()
         self.model_runner.model_state_leaves = []
         self._apply_weight_permutation(old_p2l, new_p2l, changed_mask)
         t_weights = time.perf_counter() - t1
+
+        # Debug: verify weight fingerprints after permutation
+        debug_w = debug_layer.w1.value
+        layer_id = debug_layer.layer_id
+        for logical_id, expected_fp in pre_fp.items():
+            new_slots = np.where(new_p2l[layer_id] == logical_id)[0]
+            for ns in new_slots[:2]:
+                actual_fp = float(jnp.sum(jnp.abs(debug_w[ns].astype(jnp.float32))).item())
+                match = "OK" if abs(actual_fp - expected_fp) < 1e-3 else "MISMATCH"
+                logger.info(
+                    "Post-permute verify: logical=%d, new_slot=%d, "
+                    "expected_fp=%.4f, actual_fp=%.4f [%s]",
+                    logical_id,
+                    ns,
+                    expected_fp,
+                    actual_fp,
+                    match,
+                )
 
         new_metadata = ExpertLocationMetadata._init_raw(
             server_args=self.server_args,
@@ -247,6 +276,22 @@ class OnlineEPLBController:
             mesh=self.model_runner.mesh,
         )
         set_global_expert_location_metadata(new_metadata)
+
+        # Debug: verify metadata consistency
+        l2p_check = jax.device_get(new_metadata.logical_to_rank_dispatch_physical_map)
+        p2l_check = jax.device_get(new_metadata.physical_to_logical_map)
+        for lid in range(min(5, l2p_check.shape[1])):
+            pid = int(l2p_check[layer_id, lid])
+            roundtrip = int(p2l_check[layer_id, pid])
+            ok = "OK" if roundtrip == lid else "MISMATCH"
+            logger.info(
+                "Metadata check: layer=%d, logical=%d -> physical=%d -> logical=%d [%s]",
+                layer_id,
+                lid,
+                pid,
+                roundtrip,
+                ok,
+            )
 
         _, model_state = nnx.split(self.model_runner.model)
         self.model_runner.model_state_leaves, _ = jax.tree_util.tree_flatten(model_state)
