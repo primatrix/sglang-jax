@@ -245,16 +245,22 @@ class OnlineEPLBController:
         total_slots = old_p2l.size
         change_ratio = num_changed / total_slots if total_slots > 0 else 0.0
 
+        pre_fingerprints = self._compute_weight_fingerprints()
+
         t1 = time.perf_counter()
         self.model_runner.model_state_leaves = []
-        if os.environ.get("EPLB_HOST_PERMUTE"):
-            global _on_device_permute_supported
-            _on_device_permute_supported = False
-            logger.info("EPLB_HOST_PERMUTE: forcing host-based weight permutation")
-        self._apply_weight_permutation(old_p2l, new_p2l, changed_mask)
+        if os.environ.get("EPLB_NO_WEIGHTS"):
+            logger.info("EPLB_NO_WEIGHTS: skipping weight permutation (metadata-only test)")
+        else:
+            if os.environ.get("EPLB_HOST_PERMUTE"):
+                global _on_device_permute_supported
+                _on_device_permute_supported = False
+                logger.info("EPLB_HOST_PERMUTE: forcing host-based weight permutation")
+            self._apply_weight_permutation(old_p2l, new_p2l, changed_mask)
         t_weights = time.perf_counter() - t1
 
         self._verify_weights_after_permutation(old_p2l, new_p2l, changed_mask)
+        self._verify_perm_correctness(pre_fingerprints, old_p2l, new_p2l, changed_mask)
 
         new_metadata = ExpertLocationMetadata._init_raw(
             server_args=self.server_args,
@@ -502,3 +508,92 @@ class OnlineEPLBController:
                 logger.error("Could not find w1 in model_state_leaves!")
         except Exception as e:
             logger.error("_verify_leaves_match_model failed: %s", e)
+
+    def _compute_weight_fingerprints(self) -> dict[int, np.ndarray]:
+        """Compute per-slot fingerprints for first MoE layer before permutation."""
+        try:
+            layer = self._moe_layers[0]
+            w_param = self._get_first_weight(layer)
+            w_np = np.array(jax.device_get(w_param.value))
+            fps = {}
+            for slot in range(w_np.shape[0]):
+                fps[slot] = float(np.sum(np.abs(w_np[slot].astype(np.float32))))
+            return fps
+        except Exception as e:
+            logger.error("_compute_weight_fingerprints failed: %s", e)
+            return {}
+
+    def _verify_perm_correctness(
+        self,
+        pre_fps: dict[int, float],
+        old_p2l: np.ndarray,
+        new_p2l: np.ndarray,
+        changed_mask: np.ndarray,
+    ):
+        """Verify that permuted weights match expected mapping."""
+        if not pre_fps:
+            return
+        try:
+            layer = self._moe_layers[0]
+            lid = layer.layer_id
+            if lid is None:
+                return
+
+            w_param = self._get_first_weight(layer)
+            w_np = np.array(jax.device_get(w_param.value))
+            post_fps = {}
+            for slot in range(w_np.shape[0]):
+                post_fps[slot] = float(np.sum(np.abs(w_np[slot].astype(np.float32))))
+
+            num_physical = old_p2l.shape[1]
+            old_logical_to_physical = {}
+            for p_idx in range(num_physical):
+                l_idx = int(old_p2l[lid, p_idx])
+                if l_idx not in old_logical_to_physical:
+                    old_logical_to_physical[l_idx] = p_idx
+
+            mismatches = 0
+            checked = 0
+            for dst in range(num_physical):
+                target_logical = int(new_p2l[lid, dst])
+                src = old_logical_to_physical.get(target_logical, dst)
+                expected_fp = pre_fps.get(src, -1)
+                actual_fp = post_fps.get(dst, -2)
+                if abs(expected_fp - actual_fp) > 1e-3:
+                    mismatches += 1
+                    if mismatches <= 5:
+                        logger.error(
+                            "PERM MISMATCH: dst=%d target_logical=%d src=%d "
+                            "expected_fp=%.1f actual_fp=%.1f",
+                            dst,
+                            target_logical,
+                            src,
+                            expected_fp,
+                            actual_fp,
+                        )
+                checked += 1
+
+            if mismatches == 0:
+                logger.info(
+                    "Perm verification OK: %d slots checked, all fingerprints match",
+                    checked,
+                )
+            else:
+                logger.error(
+                    "Perm verification FAILED: %d/%d mismatches",
+                    mismatches,
+                    checked,
+                )
+
+            sample = list(range(0, min(8, num_physical)))
+            for s in sample:
+                logger.info(
+                    "  slot %d: old_logical=%d new_logical=%d pre_fp=%.1f post_fp=%.1f",
+                    s,
+                    int(old_p2l[lid, s]),
+                    int(new_p2l[lid, s]),
+                    pre_fps.get(s, -1),
+                    post_fps.get(s, -1),
+                )
+        except Exception as e:
+            logger.error("_verify_perm_correctness failed: %s", e)
