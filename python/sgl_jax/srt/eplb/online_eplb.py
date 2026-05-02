@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 _MOE_LAYER_TYPES = (FusedEPMoE, EPMoE)
 
 
-def _collect_moe_layers(module, result: list, visited: set | None = None, depth: int = 0):
+def _collect_moe_layers(module, result: list, visited: set | None = None):
     if visited is None:
         visited = set()
     obj_id = id(module)
@@ -37,13 +37,13 @@ def _collect_moe_layers(module, result: list, visited: set | None = None, depth:
         return
 
     if hasattr(module, "__dict__"):
-        for attr_name, attr_value in module.__dict__.items():
+        for attr_value in module.__dict__.values():
             if isinstance(attr_value, nnx.Module):
-                _collect_moe_layers(attr_value, result, visited, depth + 1)
+                _collect_moe_layers(attr_value, result, visited)
             elif isinstance(attr_value, (list, tuple)):
                 for item in attr_value:
                     if isinstance(item, nnx.Module):
-                        _collect_moe_layers(item, result, visited, depth + 1)
+                        _collect_moe_layers(item, result, visited)
 
 
 def _permute_weight_via_host(param, perm):
