@@ -509,28 +509,46 @@ class OnlineEPLBController:
         except Exception as e:
             logger.error("_verify_leaves_match_model failed: %s", e)
 
-    def _compute_weight_fingerprints(self) -> dict[int, np.ndarray]:
+    def _compute_weight_fingerprints(self) -> dict:
         """Compute per-slot fingerprints for first MoE layer before permutation."""
         try:
             layer = self._moe_layers[0]
+            result = {}
+
             w_param = self._get_first_weight(layer)
             w_np = np.array(jax.device_get(w_param.value))
-            fps = {}
+            w_fps = {}
             for slot in range(w_np.shape[0]):
-                fps[slot] = float(np.sum(np.abs(w_np[slot].astype(np.float32))))
-            return fps
+                w_fps[slot] = float(np.sum(np.abs(w_np[slot].astype(np.float32))))
+            result["weight"] = w_fps
+
+            s_param = self._get_first_scale(layer)
+            if s_param is not None:
+                s_np = np.array(jax.device_get(s_param.value))
+                s_fps = {}
+                for slot in range(s_np.shape[0]):
+                    s_fps[slot] = float(np.sum(np.abs(s_np[slot].astype(np.float32))))
+                result["scale"] = s_fps
+                logger.info(
+                    "Pre-perm scale shape=%s, slot0=%.6f slot1=%.6f",
+                    s_np.shape,
+                    s_fps[0],
+                    s_fps[1],
+                )
+
+            return result
         except Exception as e:
             logger.error("_compute_weight_fingerprints failed: %s", e)
             return {}
 
     def _verify_perm_correctness(
         self,
-        pre_fps: dict[int, float],
+        pre_fps: dict,
         old_p2l: np.ndarray,
         new_p2l: np.ndarray,
         changed_mask: np.ndarray,
     ):
-        """Verify that permuted weights match expected mapping."""
+        """Verify that permuted weights AND scales match expected mapping."""
         if not pre_fps:
             return
         try:
@@ -539,12 +557,6 @@ class OnlineEPLBController:
             if lid is None:
                 return
 
-            w_param = self._get_first_weight(layer)
-            w_np = np.array(jax.device_get(w_param.value))
-            post_fps = {}
-            for slot in range(w_np.shape[0]):
-                post_fps[slot] = float(np.sum(np.abs(w_np[slot].astype(np.float32))))
-
             num_physical = old_p2l.shape[1]
             old_logical_to_physical = {}
             for p_idx in range(num_physical):
@@ -552,48 +564,64 @@ class OnlineEPLBController:
                 if l_idx not in old_logical_to_physical:
                     old_logical_to_physical[l_idx] = p_idx
 
-            mismatches = 0
-            checked = 0
-            for dst in range(num_physical):
-                target_logical = int(new_p2l[lid, dst])
-                src = old_logical_to_physical.get(target_logical, dst)
-                expected_fp = pre_fps.get(src, -1)
-                actual_fp = post_fps.get(dst, -2)
-                if abs(expected_fp - actual_fp) > 1e-3:
-                    mismatches += 1
-                    if mismatches <= 5:
-                        logger.error(
-                            "PERM MISMATCH: dst=%d target_logical=%d src=%d "
-                            "expected_fp=%.1f actual_fp=%.1f",
-                            dst,
-                            target_logical,
-                            src,
-                            expected_fp,
-                            actual_fp,
-                        )
-                checked += 1
+            for kind in ["weight", "scale"]:
+                pre = pre_fps.get(kind)
+                if pre is None:
+                    continue
 
-            if mismatches == 0:
-                logger.info(
-                    "Perm verification OK: %d slots checked, all fingerprints match",
-                    checked,
-                )
-            else:
-                logger.error(
-                    "Perm verification FAILED: %d/%d mismatches",
-                    mismatches,
-                    checked,
-                )
+                if kind == "weight":
+                    param = self._get_first_weight(layer)
+                else:
+                    param = self._get_first_scale(layer)
+
+                arr_np = np.array(jax.device_get(param.value))
+                post = {}
+                for slot in range(arr_np.shape[0]):
+                    post[slot] = float(np.sum(np.abs(arr_np[slot].astype(np.float32))))
+
+                mismatches = 0
+                for dst in range(num_physical):
+                    target_logical = int(new_p2l[lid, dst])
+                    src = old_logical_to_physical.get(target_logical, dst)
+                    expected_fp = pre.get(src, -1)
+                    actual_fp = post.get(dst, -2)
+                    if abs(expected_fp - actual_fp) > 1e-3:
+                        mismatches += 1
+                        if mismatches <= 3:
+                            logger.error(
+                                "%s PERM MISMATCH: dst=%d logical=%d src=%d "
+                                "expected=%.1f actual=%.1f",
+                                kind,
+                                dst,
+                                target_logical,
+                                src,
+                                expected_fp,
+                                actual_fp,
+                            )
+
+                if mismatches == 0:
+                    logger.info("%s perm OK: %d slots checked", kind, num_physical)
+                else:
+                    logger.error(
+                        "%s perm FAILED: %d/%d mismatches",
+                        kind,
+                        mismatches,
+                        num_physical,
+                    )
 
             sample = list(range(0, min(8, num_physical)))
+            pre_w = pre_fps.get("weight", {})
+            w_param = self._get_first_weight(layer)
+            w_np = np.array(jax.device_get(w_param.value))
             for s in sample:
+                post_fp = float(np.sum(np.abs(w_np[s].astype(np.float32))))
                 logger.info(
                     "  slot %d: old_logical=%d new_logical=%d pre_fp=%.1f post_fp=%.1f",
                     s,
                     int(old_p2l[lid, s]),
                     int(new_p2l[lid, s]),
-                    pre_fps.get(s, -1),
-                    post_fps.get(s, -1),
+                    pre_w.get(s, -1),
+                    post_fp,
                 )
         except Exception as e:
             logger.error("_verify_perm_correctness failed: %s", e)
