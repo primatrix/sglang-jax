@@ -28,15 +28,16 @@ _on_device_permute_supported: bool | None = None
 _permute_fn_cache: dict = {}
 
 
-def _get_permute_fn(spec):
-    if spec not in _permute_fn_cache:
+def _get_permute_fn(sharding):
+    key = (id(sharding.mesh), sharding.spec)
+    if key not in _permute_fn_cache:
 
         @jax.jit
         def fn(arr, perm):
-            return arr.at[perm].get(out_sharding=spec)
+            return arr.at[perm].get(out_sharding=sharding)
 
-        _permute_fn_cache[spec] = fn
-    return _permute_fn_cache[spec]
+        _permute_fn_cache[key] = fn
+    return _permute_fn_cache[key]
 
 
 def _permute_weight_on_device(param, perm_jax, sharding):
@@ -45,7 +46,7 @@ def _permute_weight_on_device(param, perm_jax, sharding):
         return False
 
     try:
-        fn = _get_permute_fn(sharding.spec)
+        fn = _get_permute_fn(sharding)
         param.value = fn(param.value, perm_jax)
         if _on_device_permute_supported is None:
             _on_device_permute_supported = True
