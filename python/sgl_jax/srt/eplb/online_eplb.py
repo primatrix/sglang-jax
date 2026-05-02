@@ -2,7 +2,6 @@ import logging
 import time
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
@@ -44,12 +43,49 @@ def _collect_moe_layers(module, result: list, visited: set | None = None):
 
 
 def _permute_weight_via_host(param, perm):
-    """Permute weight along axis 0 via host roundtrip."""
-    sharding = param.value.sharding
-    dtype = param.value.dtype
-    w_host = jax.device_get(param.value)
-    param.value = jnp.zeros((), dtype=dtype)
-    param.value = jax.device_put(w_host[perm], sharding)
+    """Permute weight along axis 0 via per-shard host roundtrip.
+
+    Only transfers device shards that actually change. Unchanged shards
+    reuse existing device buffers with zero data transfer.
+    """
+    arr = param.value
+    sharding = arr.sharding
+    addressable_shards = sorted(arr.addressable_shards, key=lambda s: s.index[0].start)
+    num_devices = len(addressable_shards)
+    local_experts = arr.shape[0] // num_devices
+
+    changed = set()
+    for d in range(num_devices):
+        s = d * local_experts
+        if not np.array_equal(perm[s : s + local_experts], np.arange(s, s + local_experts)):
+            changed.add(d)
+
+    if not changed:
+        return 0
+
+    needed_src = set()
+    for d in changed:
+        s = d * local_experts
+        for i in range(local_experts):
+            needed_src.add(int(perm[s + i]) // local_experts)
+
+    src_data = {s: np.array(addressable_shards[s].data) for s in needed_src}
+
+    per_device = []
+    for d in range(num_devices):
+        if d not in changed:
+            per_device.append(addressable_shards[d].data)
+        else:
+            s = d * local_experts
+            ref = next(iter(src_data.values()))
+            new_shard = np.empty_like(ref)
+            for i in range(local_experts):
+                src = int(perm[s + i])
+                new_shard[i] = src_data[src // local_experts][src % local_experts]
+            per_device.append(jax.device_put(new_shard, addressable_shards[d].device))
+
+    param.value = jax.make_array_from_single_device_arrays(arr.shape, sharding, per_device)
+    return len(changed)
 
 
 class OnlineEPLBController:
@@ -180,6 +216,8 @@ class OnlineEPLBController:
     ):
         num_layers = old_p2l.shape[0]
         num_physical = old_p2l.shape[1]
+        total_shards_changed = 0
+        total_shards = 0
 
         for moe_layer in self._moe_layers:
             layer_id = moe_layer.layer_id
@@ -202,13 +240,19 @@ class OnlineEPLBController:
                 src = old_logical_to_physical.get(target_logical, dst)
                 perm[dst] = src
 
-            _permute_weight_via_host(moe_layer.w1, perm)
-            _permute_weight_via_host(moe_layer.w2, perm)
-            _permute_weight_via_host(moe_layer.w3, perm)
+            for p in [moe_layer.w1, moe_layer.w2, moe_layer.w3]:
+                n = _permute_weight_via_host(p, perm)
+                total_shards_changed += n
+                total_shards += len(p.value.addressable_shards)
 
-            if moe_layer.w1_scale is not None:
-                _permute_weight_via_host(moe_layer.w1_scale, perm)
-            if moe_layer.w2_scale is not None:
-                _permute_weight_via_host(moe_layer.w2_scale, perm)
-            if moe_layer.w3_scale is not None:
-                _permute_weight_via_host(moe_layer.w3_scale, perm)
+            for p in [moe_layer.w1_scale, moe_layer.w2_scale, moe_layer.w3_scale]:
+                if p is not None:
+                    n = _permute_weight_via_host(p, perm)
+                    total_shards_changed += n
+                    total_shards += len(p.value.addressable_shards)
+
+        logger.info(
+            "Weight permutation: %d/%d device shards transferred",
+            total_shards_changed,
+            total_shards,
+        )
