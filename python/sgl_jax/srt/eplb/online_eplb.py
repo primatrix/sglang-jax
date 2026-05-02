@@ -230,9 +230,8 @@ class OnlineEPLBController:
     ):
         num_layers = old_p2l.shape[0]
         num_physical = old_p2l.shape[1]
-        total_shards_changed = 0
-        total_shards = 0
 
+        work_items = []
         for moe_layer in self._moe_layers:
             layer_id = moe_layer.layer_id
             if layer_id is None or layer_id >= num_layers:
@@ -262,18 +261,23 @@ class OnlineEPLBController:
                 scales = [moe_layer.wi_0_scale, moe_layer.wi_1_scale, moe_layer.wo_scale]
 
             for p in weights:
-                n = _permute_weight_via_host(p, perm)
-                total_shards_changed += n
-                total_shards += len(p.value.addressable_shards)
-
+                work_items.append((p, perm))
             for p in scales:
                 if p is not None:
-                    n = _permute_weight_via_host(p, perm)
-                    total_shards_changed += n
-                    total_shards += len(p.value.addressable_shards)
+                    work_items.append((p, perm))
 
+        if not work_items:
+            logger.info("Weight permutation: no work items")
+            return
+
+        max_workers = min(6, len(work_items))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            results = list(pool.map(lambda item: _permute_weight_via_host(*item), work_items))
+
+        total_changed = sum(results)
         logger.info(
-            "Weight permutation: %d/%d device shards transferred",
-            total_shards_changed,
-            total_shards,
+            "Weight permutation: %d tensors, %d shard transfers (workers=%d)",
+            len(work_items),
+            total_changed,
+            max_workers,
         )
