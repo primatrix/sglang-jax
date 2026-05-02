@@ -138,7 +138,11 @@ class MiMoV2Moe(nnx.Module):
     def __call__(self, hidden_states: jax.Array, forward_batch: ForwardBatch):
         router_logits = self.moe_gate(hidden_states)
         correction_bias = self.correction_bias.value if self.correction_bias is not None else None
-        topk_weights, topk_ids = self.topk(router_logits, correction_bias=correction_bias)
+        topk_weights, topk_ids = self.topk(
+            router_logits,
+            correction_bias=correction_bias,
+            dispatch_info=forward_batch.expert_location_metadata,
+        )
         if self.use_fused:
             token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
             topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
