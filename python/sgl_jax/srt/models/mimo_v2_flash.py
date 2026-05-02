@@ -104,6 +104,7 @@ class MiMoV2Moe(nnx.Module):
         self.topk = TopK(
             topk=num_experts_per_tok,
             renormalize=getattr(config, "norm_topk_prob", True),
+            layer_id=layer_id,
         )
 
         if self.use_fused:
