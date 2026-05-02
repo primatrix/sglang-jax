@@ -15,10 +15,13 @@ from sgl_jax.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE
+from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.layers.routed_experts_capturer import _ExpertDistributionRecorder
 from sgl_jax.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+_MOE_LAYER_TYPES = (FusedEPMoE, EPMoE)
 
 
 def _collect_moe_layers(module, result: list, visited: set | None = None, depth: int = 0):
@@ -29,17 +32,9 @@ def _collect_moe_layers(module, result: list, visited: set | None = None, depth:
         return
     visited.add(obj_id)
 
-    if isinstance(module, FusedEPMoE):
+    if isinstance(module, _MOE_LAYER_TYPES):
         result.append(module)
         return
-
-    if depth < 3:
-        logger.debug(
-            "Traversing %s (depth=%d), attrs: %s",
-            type(module).__name__,
-            depth,
-            [(k, type(v).__name__) for k, v in module.__dict__.items() if not k.startswith("_")],
-        )
 
     if hasattr(module, "__dict__"):
         for attr_name, attr_value in module.__dict__.items():
@@ -127,12 +122,7 @@ class OnlineEPLBController:
         self._step_counter = 0
         self._rebalance_count = 0
 
-        self._moe_layers: list[FusedEPMoE] = []
-        logger.info(
-            "Collecting MoE layers from model type=%s, id=%d",
-            type(self.model_runner.model).__name__,
-            id(self.model_runner.model),
-        )
+        self._moe_layers: list = []
         _collect_moe_layers(self.model_runner.model, self._moe_layers)
         self._moe_layers.sort(key=lambda m: m.layer_id if m.layer_id is not None else 0)
 
@@ -264,12 +254,19 @@ class OnlineEPLBController:
                 src = old_logical_to_physical.get(target_logical, dst)
                 perm[dst] = src
 
-            for p in [moe_layer.w1, moe_layer.w2, moe_layer.w3]:
+            if isinstance(moe_layer, FusedEPMoE):
+                weights = [moe_layer.w1, moe_layer.w2, moe_layer.w3]
+                scales = [moe_layer.w1_scale, moe_layer.w2_scale, moe_layer.w3_scale]
+            else:
+                weights = [moe_layer.wi_0, moe_layer.wi_1, moe_layer.wo]
+                scales = [moe_layer.wi_0_scale, moe_layer.wi_1_scale, moe_layer.wo_scale]
+
+            for p in weights:
                 n = _permute_weight_via_host(p, perm)
                 total_shards_changed += n
                 total_shards += len(p.value.addressable_shards)
 
-            for p in [moe_layer.w1_scale, moe_layer.w2_scale, moe_layer.w3_scale]:
+            for p in scales:
                 if p is not None:
                     n = _permute_weight_via_host(p, perm)
                     total_shards_changed += n
