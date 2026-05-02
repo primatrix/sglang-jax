@@ -156,6 +156,7 @@ class OnlineEPLBController:
 
         self._step_counter = 0
         self._rebalance_count = 0
+        self._prev_logical_counts: np.ndarray | None = None
 
         self._moe_layers: list = []
         _collect_moe_layers(self.model_runner.model, self._moe_layers)
@@ -200,6 +201,20 @@ class OnlineEPLBController:
 
         old_p2l = jax.device_get(old_metadata.physical_to_logical_map)
 
+        if self._prev_logical_counts is not None:
+            old_norm = self._prev_logical_counts / (
+                self._prev_logical_counts.sum(axis=-1, keepdims=True) + 1e-12
+            )
+            new_norm = logical_counts / (logical_counts.sum(axis=-1, keepdims=True) + 1e-12)
+            dist_diff = float(np.abs(old_norm - new_norm).mean())
+            if dist_diff < self.diff_threshold:
+                logger.debug(
+                    "Online EPLB: skipping rebalance, dist_diff=%.6f < threshold=%.4f",
+                    dist_diff,
+                    self.diff_threshold,
+                )
+                return False
+
         t0 = time.perf_counter()
         new_p2l, new_l2p, _ = eplb_algorithms.rebalance_experts(
             tokens_per_expert=logical_counts,
@@ -220,14 +235,6 @@ class OnlineEPLBController:
         total_slots = old_p2l.size
         change_ratio = num_changed / total_slots if total_slots > 0 else 0.0
 
-        if change_ratio < self.diff_threshold:
-            logger.debug(
-                "Online EPLB: skipping rebalance, change_ratio=%.4f < threshold=%.4f",
-                change_ratio,
-                self.diff_threshold,
-            )
-            return False
-
         t1 = time.perf_counter()
         self.model_runner.model_state_leaves = []
         self._apply_weight_permutation(old_p2l, new_p2l, changed_mask)
@@ -244,6 +251,7 @@ class OnlineEPLBController:
         self.model_runner.model_state_leaves, _ = jax.tree_util.tree_flatten(model_state)
 
         self._rebalance_count += 1
+        self._prev_logical_counts = logical_counts.copy()
         logger.info(
             "Online EPLB rebalance #%d: changed=%d/%d (%.1f%%), "
             "algo=%.1fms, weights=%.1fms, samples=%d steps",
