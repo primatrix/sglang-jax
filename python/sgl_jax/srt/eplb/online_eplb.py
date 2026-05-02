@@ -208,7 +208,7 @@ class OnlineEPLBController:
             new_norm = logical_counts / (logical_counts.sum(axis=-1, keepdims=True) + 1e-12)
             dist_diff = float(np.abs(old_norm - new_norm).mean())
             if dist_diff < self.diff_threshold:
-                logger.debug(
+                logger.info(
                     "Online EPLB: skipping rebalance, dist_diff=%.6f < threshold=%.4f",
                     dist_diff,
                     self.diff_threshold,
