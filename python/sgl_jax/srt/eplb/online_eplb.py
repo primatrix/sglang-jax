@@ -247,8 +247,14 @@ class OnlineEPLBController:
 
         t1 = time.perf_counter()
         self.model_runner.model_state_leaves = []
+        if os.environ.get("EPLB_HOST_PERMUTE"):
+            global _on_device_permute_supported
+            _on_device_permute_supported = False
+            logger.info("EPLB_HOST_PERMUTE: forcing host-based weight permutation")
         self._apply_weight_permutation(old_p2l, new_p2l, changed_mask)
         t_weights = time.perf_counter() - t1
+
+        self._verify_weights_after_permutation(old_p2l, new_p2l, changed_mask)
 
         new_metadata = ExpertLocationMetadata._init_raw(
             server_args=self.server_args,
@@ -267,6 +273,8 @@ class OnlineEPLBController:
             )
         else:
             logger.info("Treedef OK: %d leaves", len(self.model_runner.model_state_leaves))
+
+        self._verify_leaves_match_model()
 
         self._verify_metadata(new_metadata, new_p2l)
 
@@ -423,3 +431,60 @@ class OnlineEPLBController:
             )
         if zero_valid:
             logger.warning("Metadata: %d (layer, expert) pairs have num_valid=0", zero_valid)
+
+    def _verify_weights_after_permutation(
+        self, old_p2l: np.ndarray, new_p2l: np.ndarray, changed_mask: np.ndarray
+    ):
+        layer = self._moe_layers[0]
+        lid = layer.layer_id
+        if lid is None:
+            return
+
+        w1_np = np.array(jax.device_get(layer.w1.value))
+        logger.info(
+            "Post-perm w1 shape=%s dtype=%s, slot0_sum=%.4f, slot1_sum=%.4f",
+            w1_np.shape,
+            w1_np.dtype,
+            float(np.sum(np.abs(w1_np[0].astype(np.float32)))),
+            float(np.sum(np.abs(w1_np[1].astype(np.float32)))),
+        )
+
+        if hasattr(layer, "w1_scale") and layer.w1_scale is not None:
+            s_np = np.array(jax.device_get(layer.w1_scale.value))
+            logger.info(
+                "Post-perm w1_scale shape=%s dtype=%s, slot0_sum=%.6f",
+                s_np.shape,
+                s_np.dtype,
+                float(np.sum(np.abs(s_np[0].astype(np.float32)))),
+            )
+
+        all_same = True
+        for p in range(min(10, w1_np.shape[0])):
+            fp = float(np.sum(np.abs(w1_np[p].astype(np.float32))))
+            if fp == 0.0:
+                logger.warning("Post-perm w1[%d] is all zeros!", p)
+                all_same = False
+        if all_same:
+            logger.info("Post-perm w1 first 10 slots: no zeros detected")
+
+    def _verify_leaves_match_model(self):
+        layer = self._moe_layers[0]
+        model_w1 = layer.w1.value
+        model_w1_fp = float(jnp.sum(jnp.abs(model_w1[0].astype(jnp.float32))))
+
+        found = False
+        for i, leaf in enumerate(self.model_runner.model_state_leaves):
+            if leaf.shape == model_w1.shape and leaf.dtype == model_w1.dtype:
+                leaf_fp = float(jnp.sum(jnp.abs(leaf[0].astype(jnp.float32))))
+                if abs(leaf_fp - model_w1_fp) < 1e-3:
+                    is_same = leaf is model_w1
+                    logger.info(
+                        "Leaf match: idx=%d, same_obj=%s, fp=%.4f",
+                        i,
+                        is_same,
+                        leaf_fp,
+                    )
+                    found = True
+                    break
+        if not found:
+            logger.error("Could not find w1 in model_state_leaves!")
