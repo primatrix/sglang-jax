@@ -432,6 +432,16 @@ class OnlineEPLBController:
         if zero_valid:
             logger.warning("Metadata: %d (layer, expert) pairs have num_valid=0", zero_valid)
 
+    def _get_first_weight(self, layer):
+        if isinstance(layer, FusedEPMoE):
+            return layer.w1
+        return layer.wi_0
+
+    def _get_first_scale(self, layer):
+        if isinstance(layer, FusedEPMoE):
+            return layer.w1_scale
+        return layer.wi_0_scale
+
     def _verify_weights_after_permutation(
         self, old_p2l: np.ndarray, new_p2l: np.ndarray, changed_mask: np.ndarray
     ):
@@ -440,7 +450,8 @@ class OnlineEPLBController:
         if lid is None:
             return
 
-        w1_np = np.array(jax.device_get(layer.w1.value))
+        w_param = self._get_first_weight(layer)
+        w1_np = np.array(jax.device_get(w_param.value))
         logger.info(
             "Post-perm w1 shape=%s dtype=%s, slot0_sum=%.4f, slot1_sum=%.4f",
             w1_np.shape,
@@ -449,8 +460,9 @@ class OnlineEPLBController:
             float(np.sum(np.abs(w1_np[1].astype(np.float32)))),
         )
 
-        if hasattr(layer, "w1_scale") and layer.w1_scale is not None:
-            s_np = np.array(jax.device_get(layer.w1_scale.value))
+        s_param = self._get_first_scale(layer)
+        if s_param is not None:
+            s_np = np.array(jax.device_get(s_param.value))
             logger.info(
                 "Post-perm w1_scale shape=%s dtype=%s, slot0_sum=%.6f",
                 s_np.shape,
@@ -469,7 +481,7 @@ class OnlineEPLBController:
 
     def _verify_leaves_match_model(self):
         layer = self._moe_layers[0]
-        model_w1 = layer.w1.value
+        model_w1 = self._get_first_weight(layer).value
         model_w1_fp = float(jnp.sum(jnp.abs(model_w1[0].astype(jnp.float32))))
 
         found = False
