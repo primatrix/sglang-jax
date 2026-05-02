@@ -233,6 +233,18 @@ class ExpertLocationMetadata:
         # physical_to_logical_map = np.array(p2l_synced)
         # logical_to_all_physical_map = np.array(l2p_synced)
 
+        if getattr(server_args, "enable_online_eplb", False):
+            num_physical = physical_to_logical_map.shape[1]
+            num_logical = logical_to_all_physical_map.shape[1]
+            min_replicas = num_physical - num_logical + 1
+            cur_replicas = logical_to_all_physical_map.shape[-1]
+            if cur_replicas < min_replicas:
+                logical_to_all_physical_map = np.pad(
+                    logical_to_all_physical_map,
+                    ((0, 0), (0, 0), (0, min_replicas - cur_replicas)),
+                    constant_values=-1,
+                )
+
         logical_to_all_physical_map_num_valid = np.sum(logical_to_all_physical_map != -1, axis=2)
         logical_to_rank_dispatch_physical_map = logical_to_all_physical_map[:, :, 0]
 
