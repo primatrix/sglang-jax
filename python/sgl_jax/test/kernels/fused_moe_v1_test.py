@@ -169,6 +169,7 @@ class MoEKernelTest(jtu.JaxTestCase):
         use_grouped_topk=False,
         num_groups=1,
         top_k_groups=1,
+        activation_quant_dtype=None,
         atol=2e-1,
         rtol=2e-1,
     ):
@@ -256,6 +257,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             top_k=top_k,
             act_fn=act_fn,
             quant_block_k=quant_block_k,
+            activation_quant_dtype=activation_quant_dtype,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             w3_scale=w3_scale,
@@ -287,6 +289,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             renormalize_topk_logits=renormalize_topk_logits,
             act_fn=act_fn,
             quant_block_k=quant_block_k,
+            activation_quant_dtype=activation_quant_dtype,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             w3_scale=w3_scale,
@@ -893,6 +896,43 @@ class MoEKernelTest(jtu.JaxTestCase):
             bd1c=256,
             bd2c=256,
             bse=512,
+        )
+
+    @parameterized.product(
+        w_dtype=[jnp.float8_e4m3fn],
+    )
+    def test_fp8_activation_quantization(self, w_dtype):
+        if not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("FP8 activation quantization requires TPUv7+")
+        dtype = jnp.bfloat16
+        top_k = 8
+        num_experts = 128
+        hidden_size = 1024
+        intermediate_size = 1024
+        num_tokens = 8 * 32
+        self._test_moe(
+            dtype=dtype,
+            top_k=top_k,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_tokens=num_tokens,
+            seed=1234,
+            renormalize_topk_logits=False,
+            w_dtype=w_dtype,
+            quant_block_k=256,
+            activation_quant_dtype=jnp.float8_e4m3fn,
+            bt=32,
+            bf=1024,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=256,
+            bd1c=256,
+            bd2c=256,
+            bse=512,
+            atol=3e-1,
+            rtol=3e-1,
         )
 
 

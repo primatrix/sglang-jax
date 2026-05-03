@@ -705,6 +705,7 @@ def run_all(
     iters: int,
     dtype: jnp.dtype = jnp.bfloat16,
     weight_dtype: jnp.dtype = jnp.bfloat16,  # Quantize the weight dtype, the activation's dtype always is bfloat16
+    activation_dtype: jnp.dtype | None = None,
     *,
     warmup_iters: int = 1,
     tune_block_config: bool = False,
@@ -904,7 +905,11 @@ def run_all(
         if weight_dtype == jnp.float8_e4m3fn:
             quantization_config = QuantizationConfig(
                 moe_weight_dtype=weight_dtype,
-                moe_activation_dtype=None,  # activation is bfloat16
+                moe_activation_dtype=activation_dtype,
+            )
+        elif activation_dtype is not None:
+            quantization_config = QuantizationConfig(
+                moe_activation_dtype=activation_dtype,
             )
         else:
             quantization_config = None
@@ -1283,6 +1288,13 @@ def parse_args() -> argparse.Namespace:
         choices=["bfloat16", "float8_e4m3fn"],
     )
     parser.add_argument(
+        "--activation-dtype",
+        type=str,
+        default=None,
+        help="Activation quantization dtype (None = no quant).",
+        choices=["float8_e4m3fn", "float8_e5m2"],
+    )
+    parser.add_argument(
         "--tune-block-config",
         action="store_true",
         help="Benchmark multiple block_config variants and print the best tuned table entry.",
@@ -1473,6 +1485,7 @@ if __name__ == "__main__":
             f"Unsupported dtype: {args.weight_dtype}. Supported: {list(DTYPE_MAP.keys())}"
         )
     weight_dtype = DTYPE_MAP[args.weight_dtype]
+    activation_dtype = DTYPE_MAP.get(args.activation_dtype)
     if args.compilation_cache_dir:
         _compilation_cache.set_cache_dir(args.compilation_cache_dir)
     tpu_vmem_budget_bytes = int(args.tpu_vmem_budget_mb) * 1024 * 1024
@@ -1493,6 +1506,7 @@ if __name__ == "__main__":
             results = run_all(
                 args.iters,
                 weight_dtype=weight_dtype,
+                activation_dtype=activation_dtype,
                 warmup_iters=args.warmup_iters,
                 tune_block_config=args.tune_block_config,
                 bt_candidates=args.bt_candidates,

@@ -339,6 +339,7 @@ def ref_moe(
     w1_shared_scale: jax.Array | None = None,  # (1, 1, se_inter)
     w2_shared_scale: jax.Array | None = None,  # (1, 1, hidden_size)
     w3_shared_scale: jax.Array | None = None,  # (1, 1, se_inter)
+    activation_quant_dtype: jnp.dtype | None = None,
 ):
     n_tokens = tokens.shape[0]  # num_tokens
     num_experts = gating_output.shape[-1]
@@ -418,6 +419,14 @@ def ref_moe(
                 ]
 
             # First linear layer (gate/up projections).
+            if activation_quant_dtype is not None:
+                _max = float(jnp.finfo(activation_quant_dtype).max)
+                _abs_max = jnp.max(jnp.abs(curr_token), axis=1, keepdims=True)
+                _abs_max = jnp.maximum(_abs_max, _max * jnp.finfo(_abs_max.dtype).tiny)
+                _scale = _abs_max / _max
+                curr_token = (curr_token / _scale).astype(activation_quant_dtype).astype(
+                    jnp.float32
+                ) * _scale
             gmm1_w1_proj = curr_token @ expert_w1  # [1, intermediate_size]
             gmm1_w3_proj = curr_token @ expert_w3  # [1, intermediate_size]
             if b1 is not None:
@@ -429,6 +438,12 @@ def ref_moe(
             act = activation_fn(gmm1_w1_proj, gmm1_w3_proj, act_fn)
 
             # Second linear layer (down projection)
+            if activation_quant_dtype is not None:
+                _max2 = float(jnp.finfo(activation_quant_dtype).max)
+                _abs_max2 = jnp.max(jnp.abs(act), axis=1, keepdims=True)
+                _abs_max2 = jnp.maximum(_abs_max2, _max2 * jnp.finfo(_abs_max2.dtype).tiny)
+                _scale2 = _abs_max2 / _max2
+                act = (act / _scale2).astype(activation_quant_dtype).astype(jnp.float32) * _scale2
             gmm_2_out = act @ expert_weight_2  # [1, hidden_size]
             if b2 is not None:
                 gmm_2_out += b2[expert_id : expert_id + 1, 0]
@@ -582,6 +597,9 @@ def _fused_ep_moe_kernel(
     bd1c: int,  # Compute size of block hidden_size.
     bd2c: int,  # Compute size of block hidden_size.
     bse: int,  # Block size for SE intermediate_size.
+    do_act_quant: bool = False,
+    act_q_dtype: jnp.dtype | None = None,
+    fp8_max: float | None = None,
 ):
     dp_rank = lax.axis_index(dp_axis_name)
     tp_rank = lax.axis_index(tp_axis_name)
@@ -638,6 +656,13 @@ def _fused_ep_moe_kernel(
         assert bf % quant_block_k == 0
         assert bd1_per_t_packing % quant_block_k == 0
         assert h_per_t_packing % quant_block_k == 0
+
+    def quantize_activation(x):
+        abs_max = jnp.max(jnp.abs(x), axis=1, keepdims=True)
+        abs_max = jnp.maximum(abs_max, fp8_max * jnp.finfo(abs_max.dtype).tiny)
+        scale = abs_max / fp8_max
+        x_q = (x / scale).astype(act_q_dtype)
+        return x_q, scale
 
     num_bf = cdiv(intermediate_size, bf)
     num_bd1 = cdiv(hidden_size, bd1)
@@ -1607,8 +1632,12 @@ def _fused_ep_moe_kernel(
                                     ),
                                     pl.ds(bfc_id * bfc, bfc),
                                 )
+                                if do_act_quant:
+                                    t_g_q, t_scale = quantize_activation(t_g)
+                                else:
+                                    t_g_q = t_g
                                 d1 = jnp.dot(
-                                    t_g,
+                                    t_g_q,
                                     w1_vmem[*w_g_slices],
                                     preferred_element_type=jnp.float32,
                                 )
@@ -1621,11 +1650,18 @@ def _fused_ep_moe_kernel(
                                     pl.ds(bfc_id * bfc, bfc),
                                 ]
                                 s1 = s1.reshape(1, bfc)
-                                d1 = d1 * jnp.broadcast_to(s1, d1.shape)
+                                if do_act_quant:
+                                    d1 = (
+                                        d1
+                                        * jnp.broadcast_to(s1, d1.shape)
+                                        * jnp.broadcast_to(t_scale, d1.shape)
+                                    )
+                                else:
+                                    d1 = d1 * jnp.broadcast_to(s1, d1.shape)
                                 acc1 = acc1 + d1
 
                                 d3 = jnp.dot(
-                                    t_g,
+                                    t_g_q,
                                     w3_vmem[*w_g_slices],
                                     preferred_element_type=jnp.float32,
                                 )
@@ -1637,7 +1673,16 @@ def _fused_ep_moe_kernel(
                                         pl.ds(bfc_id * bfc, bfc),
                                     ]
                                     s3 = s3.reshape(1, bfc)
-                                    d3 = d3 * jnp.broadcast_to(s3, d3.shape)
+                                    if do_act_quant:
+                                        d3 = (
+                                            d3
+                                            * jnp.broadcast_to(s3, d3.shape)
+                                            * jnp.broadcast_to(t_scale, d3.shape)
+                                        )
+                                    else:
+                                        d3 = d3 * jnp.broadcast_to(s3, d3.shape)
+                                elif do_act_quant:
+                                    d3 = d3 * jnp.broadcast_to(t_scale, d3.shape)
                                 acc3 = acc3 + d3
                                 return (acc1, acc3)
 
@@ -1682,6 +1727,10 @@ def _fused_ep_moe_kernel(
                             p_id,
                             pl.ds(bd1c_id * bd1c_per_t_packing, bd1c_per_t_packing),
                         ]
+                        if do_act_quant:
+                            t_q, t_scale = quantize_activation(t)
+                        else:
+                            t_q = t
                         for bfc_id in range(cdiv(bf, bfc)):
                             w_slices = (
                                 p_id,
@@ -1689,7 +1738,7 @@ def _fused_ep_moe_kernel(
                                 pl.ds(bfc_id * bfc, bfc),
                             )
                             acc1 = jnp.dot(
-                                t,
+                                t_q,
                                 w1_vmem[*w_slices],
                                 preferred_element_type=jnp.float32,
                             )
@@ -1704,10 +1753,15 @@ def _fused_ep_moe_kernel(
                                 w1_scale = jnp.broadcast_to(
                                     w1_scale_vmem[*w1_scale_slices], acc1.shape
                                 )
-                                acc1 *= w1_scale
+                                if do_act_quant:
+                                    acc1 = acc1 * w1_scale * jnp.broadcast_to(t_scale, acc1.shape)
+                                else:
+                                    acc1 *= w1_scale
+                            elif do_act_quant:
+                                acc1 = acc1 * jnp.broadcast_to(t_scale, acc1.shape)
 
                             acc3 = jnp.dot(
-                                t,
+                                t_q,
                                 w3_vmem[*w_slices],
                                 preferred_element_type=jnp.float32,
                             )
@@ -1722,7 +1776,12 @@ def _fused_ep_moe_kernel(
                                 w3_scale = jnp.broadcast_to(
                                     w3_scale_vmem[*w3_scale_slices], acc3.shape
                                 )
-                                acc3 *= w3_scale
+                                if do_act_quant:
+                                    acc3 = acc3 * w3_scale * jnp.broadcast_to(t_scale, acc3.shape)
+                                else:
+                                    acc3 *= w3_scale
+                            elif do_act_quant:
+                                acc3 = acc3 * jnp.broadcast_to(t_scale, acc3.shape)
 
                             acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
 
@@ -1834,6 +1893,10 @@ def _fused_ep_moe_kernel(
                                     pl.ds(bfc_id * bfc + sg_offset, sg_k2),
                                 ]
                                 act_g = activation_fn(acc1_g, acc3_g, act_fn)
+                                if do_act_quant:
+                                    act_g_q, act_scale = quantize_activation(act_g)
+                                else:
+                                    act_g_q = act_g
                                 w2_g = w2_vmem[
                                     p_id,
                                     pl.ds(bfc_id * bfc + sg_offset, sg_k2),
@@ -1843,7 +1906,7 @@ def _fused_ep_moe_kernel(
                                     ),
                                 ]
                                 d = jnp.dot(
-                                    act_g,
+                                    act_g_q,
                                     w2_g,
                                     preferred_element_type=jnp.float32,
                                 )
@@ -1859,7 +1922,14 @@ def _fused_ep_moe_kernel(
                                     ),
                                 ]
                                 s = s.reshape(1, bd2c_per_t_packing)
-                                d = d * jnp.broadcast_to(s, d.shape)
+                                if do_act_quant:
+                                    d = (
+                                        d
+                                        * jnp.broadcast_to(s, d.shape)
+                                        * jnp.broadcast_to(act_scale, d.shape)
+                                    )
+                                else:
+                                    d = d * jnp.broadcast_to(s, d.shape)
                                 return sg_acc + d
 
                             sg_acc = lax.fori_loop(
@@ -1877,12 +1947,16 @@ def _fused_ep_moe_kernel(
                             acc1 = acc1_vmem[*acc_slices]
                             acc3 = acc3_vmem[*acc_slices]
                             act = activation_fn(acc1, acc3, act_fn)
+                            if do_act_quant:
+                                act_q, act_scale = quantize_activation(act)
+                            else:
+                                act_q = act
                             w2 = w2_vmem[
                                 p_id,
                                 pl.ds(bfc_id * bfc, bfc),
                                 pl.ds(bd2c_id * bd2c_per_t_packing, bd2c_per_t_packing),
                             ]
-                            acc = jnp.dot(act, w2, preferred_element_type=jnp.float32)
+                            acc = jnp.dot(act_q, w2, preferred_element_type=jnp.float32)
                             if w2_scale_vmem is not None:
                                 w2_scale_slices = (
                                     p_id,
@@ -1893,7 +1967,12 @@ def _fused_ep_moe_kernel(
                                 w2_scale = jnp.broadcast_to(
                                     w2_scale_vmem[*w2_scale_slices], acc.shape
                                 )
-                                acc *= w2_scale
+                                if do_act_quant:
+                                    acc = acc * w2_scale * jnp.broadcast_to(act_scale, acc.shape)
+                                else:
+                                    acc *= w2_scale
+                            elif do_act_quant:
+                                acc = acc * jnp.broadcast_to(act_scale, acc.shape)
                             res += acc
 
                     res_slice = res_vmem.at[
@@ -3095,6 +3174,7 @@ def _validate_fused_ep_moe_args(
         "disable_all_reduce_metadata",
         "disable_sync_barrier",
         "quant_block_k",
+        "activation_quant_dtype",
         "block_config",
         "dp_axis_name",
         "tp_axis_name",
@@ -3131,6 +3211,7 @@ def fused_ep_moe(
     # to 1D format at weight-loading time by _expand_moe_block_scale(), so the
     # kernel only ever sees per-column (1D) scales shaped (E, K//block_k, 1, N).
     quant_block_k: int | None = None,
+    activation_quant_dtype: jnp.dtype | None = None,
     w1_scale: jax.Array | None = None,
     w2_scale: jax.Array | None = None,
     w3_scale: jax.Array | None = None,
@@ -3224,6 +3305,9 @@ def fused_ep_moe(
     padded_top_k = align_to(top_k, 128)
     t_dtype = tokens.dtype
     t_packing = get_dtype_packing(t_dtype)
+    do_act_quant = activation_quant_dtype is not None
+    act_q_dtype = jnp.dtype(activation_quant_dtype) if do_act_quant else None
+    fp8_max = float(jnp.finfo(act_q_dtype).max) if do_act_quant else None
     hidden_per_pack = hidden_size // t_packing
     # With run_bt tiling in the pallas kernel, a2a scratch only needs to cover one
     # bt tile. Each destination buffer holds tokens for one global expert; even
@@ -3403,6 +3487,9 @@ def fused_ep_moe(
                 disable_all_reduce_metadata=disable_all_reduce_metadata,
                 disable_sync_barrier=disable_sync_barrier,
                 quant_block_k=quant_block_k,
+                do_act_quant=do_act_quant,
+                act_q_dtype=act_q_dtype,
+                fp8_max=fp8_max,
                 bt=bt,
                 bf=block_config.bf,
                 bd1=block_config.bd1,

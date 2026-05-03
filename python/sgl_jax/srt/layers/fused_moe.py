@@ -489,6 +489,7 @@ class FusedEPMoE(nnx.Module):
             disable_sync_barrier=self.disable_sync_barrier,
             # Optional parameters (not used in basic case)
             quant_block_k=quant_block_k,
+            activation_quant_dtype=self.activation_quantized_dtype,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             w3_scale=w3_scale,
