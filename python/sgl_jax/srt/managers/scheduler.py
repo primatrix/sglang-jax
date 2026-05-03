@@ -429,6 +429,10 @@ class Scheduler(
                 )
                 if self.enable_overlap and server_args.nnodes > 1:
                     self.online_eplb.set_forward_queue(self.tp_worker.input_queue)
+                if server_args.expert_distribution_recorder_output_file:
+                    self.online_eplb.enable_snapshots(
+                        server_args.expert_distribution_recorder_output_file
+                    )
             else:
                 logger.warning(
                     "Online EPLB enabled but dist_recorder is None. " "Online EPLB will not run."

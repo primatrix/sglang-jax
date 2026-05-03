@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -175,6 +176,7 @@ class OnlineEPLBController:
         self._prev_logical_counts: np.ndarray | None = None
         self._pending_plan: _RebalancePlan | None = None
         self._forward_queue = None
+        self._snapshot_dir: str | None = None
 
         self._moe_layers: list = []
         _collect_moe_layers(self.model_runner.model, self._moe_layers)
@@ -251,6 +253,11 @@ class OnlineEPLBController:
     def set_forward_queue(self, queue):
         self._forward_queue = queue
         logger.info("OnlineEPLBController: overlap mode enabled, JAX ops routed to forward thread")
+
+    def enable_snapshots(self, directory: str):
+        os.makedirs(directory, exist_ok=True)
+        self._snapshot_dir = directory
+        logger.info("OnlineEPLBController: saving distribution snapshots to %s", directory)
 
     def _run_on_forward_thread(self, fn):
         from sgl_jax.srt.managers.tp_worker_overlap_thread import ForwardThreadTask
@@ -357,6 +364,19 @@ class OnlineEPLBController:
             and m.layer_id < old_p2l.shape[0]
             and changed_mask[m.layer_id].any()
         ]
+
+        if self._snapshot_dir is not None:
+            snap_idx = self._rebalance_count
+            np.save(
+                os.path.join(self._snapshot_dir, f"snapshot_{snap_idx:04d}.npy"),
+                {
+                    "logical_counts": logical_counts,
+                    "old_p2l": old_p2l,
+                    "new_p2l": new_p2l,
+                    "num_changed": num_changed,
+                    "total_slots": total_slots,
+                },
+            )
 
         if not changed_layer_ids:
             logger.info("Online EPLB: no layers changed, skipping")
