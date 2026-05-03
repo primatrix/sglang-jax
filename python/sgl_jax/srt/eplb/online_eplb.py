@@ -56,7 +56,7 @@ def _permute_weight_on_device(param, perm_jax, sharding):
     except Exception as e:
         if _on_device_permute_supported is None:
             _on_device_permute_supported = False
-            logger.info("On-device weight permutation: NOT available (%s)", e)
+        logger.warning("On-device weight permutation failed: %s", e)
         return False
 
 
@@ -442,9 +442,16 @@ class OnlineEPLBController:
         perm_sharding = NamedSharding(self._mesh, P())
         perm_jax = jax.device_put(perm, perm_sharding)
 
+        multi_host = self.server_args.nnodes > 1
+
         for param in all_params:
             sharding = param.value.sharding
             if not _permute_weight_on_device(param, perm_jax, sharding):
+                if multi_host:
+                    raise RuntimeError(
+                        "On-device weight permutation failed on multi-host; "
+                        "slab-diff fallback is not supported for multi-host."
+                    )
                 _permute_weight_slab_diff(param, perm)
 
     def _update_metadata_for_layers(self, layer_ids: list[int], plan: _RebalancePlan):
