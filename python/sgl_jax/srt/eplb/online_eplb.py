@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import jax
 import numpy as np
 from flax import nnx
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.eplb import eplb_algorithms
@@ -150,6 +152,7 @@ class OnlineEPLBController:
         self.model_config = model_config
         self.model_runner = model_runner
         self.dist_recorder = dist_recorder
+        self._mesh = model_runner.mesh
 
         self.interval_steps = server_args.online_eplb_interval_steps
         self.min_samples = server_args.online_eplb_min_samples
@@ -207,7 +210,8 @@ class OnlineEPLBController:
         all_params = params + [p for p in scale_params if p is not None]
         seen_specs = set()
         num_physical = all_params[0].value.shape[0]
-        identity_perm = jax.device_put(np.arange(num_physical, dtype=np.int32))
+        perm_sharding = NamedSharding(self._mesh, P())
+        identity_perm = jax.device_put(np.arange(num_physical, dtype=np.int32), perm_sharding)
 
         t0 = time.perf_counter()
         for param in all_params:
@@ -426,7 +430,8 @@ class OnlineEPLBController:
             scale_params = [moe_layer.wi_0_scale, moe_layer.wi_1_scale, moe_layer.wo_scale]
 
         all_params = params + [p for p in scale_params if p is not None]
-        perm_jax = jax.device_put(perm)
+        perm_sharding = NamedSharding(self._mesh, P())
+        perm_jax = jax.device_put(perm, perm_sharding)
 
         for param in all_params:
             sharding = param.value.sharding
