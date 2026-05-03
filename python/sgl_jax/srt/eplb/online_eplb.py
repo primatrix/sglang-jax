@@ -216,7 +216,7 @@ class OnlineEPLBController:
                 continue
             seen_specs.add(spec_key)
             fn = _get_permute_fn(sharding)
-            fn(param.value, identity_perm)
+            fn(param.value, identity_perm).block_until_ready()
 
         logger.info("Online EPLB precompile: warmed up %d permute fn(s)", len(seen_specs))
 
