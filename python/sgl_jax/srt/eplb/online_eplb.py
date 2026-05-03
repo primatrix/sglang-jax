@@ -157,7 +157,16 @@ class OnlineEPLBController:
         self.interval_steps = server_args.online_eplb_interval_steps
         self.min_samples = server_args.online_eplb_min_samples
         self.diff_threshold = server_args.online_eplb_diff_threshold
-        self.layers_per_chunk = server_args.online_eplb_layers_per_chunk
+
+        if server_args.nnodes > 1 and server_args.online_eplb_layers_per_chunk > 0:
+            logger.info(
+                "Multi-host detected (nnodes=%d): forcing layers_per_chunk=0 "
+                "to avoid cross-host JIT desync between chunks",
+                server_args.nnodes,
+            )
+            self.layers_per_chunk = 0
+        else:
+            self.layers_per_chunk = server_args.online_eplb_layers_per_chunk
 
         self._step_counter = 0
         self._rebalance_count = 0
