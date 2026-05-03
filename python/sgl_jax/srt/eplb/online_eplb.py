@@ -209,6 +209,7 @@ class OnlineEPLBController:
         num_physical = all_params[0].value.shape[0]
         identity_perm = jax.device_put(np.arange(num_physical, dtype=np.int32))
 
+        t0 = time.perf_counter()
         for param in all_params:
             sharding = param.value.sharding
             spec_key = (id(sharding.mesh), sharding.spec)
@@ -216,9 +217,16 @@ class OnlineEPLBController:
                 continue
             seen_specs.add(spec_key)
             fn = _get_permute_fn(sharding)
-            fn(param.value, identity_perm).block_until_ready()
+            result = fn(param.value, identity_perm)
+            result.block_until_ready()
+            param.value = fn(param.value, identity_perm)
+            param.value.block_until_ready()
 
-        logger.info("Online EPLB precompile: warmed up %d permute fn(s)", len(seen_specs))
+        logger.info(
+            "Online EPLB precompile: warmed up %d permute fn(s) in %.1fms",
+            len(seen_specs),
+            (time.perf_counter() - t0) * 1000,
+        )
 
     @property
     def is_rebalancing(self) -> bool:
