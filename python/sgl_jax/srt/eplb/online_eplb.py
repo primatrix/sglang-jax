@@ -345,7 +345,11 @@ class OnlineEPLBController:
             perm = self._compute_layer_perm(plan.old_p2l[layer_id], plan.new_p2l[layer_id])
             self._permute_layer_weights(layer_id, perm)
 
+        t_weights = time.perf_counter()
+
         self._update_metadata_for_layers(chunk_layer_ids, plan)
+
+        t_metadata = time.perf_counter()
 
         _, model_state = nnx.split(self.model_runner.model)
         self.model_runner.model_state_leaves, new_treedef = jax.tree_util.tree_flatten(model_state)
@@ -357,12 +361,19 @@ class OnlineEPLBController:
             )
 
         t_chunk = (time.perf_counter() - t0) * 1000
+        t_w = (t_weights - t0) * 1000
+        t_m = (t_metadata - t_weights) * 1000
+        t_s = t_chunk - t_w - t_m
         logger.info(
-            "Online EPLB chunk %d/%d: %d layers, %.1fms",
+            "Online EPLB chunk %d/%d: %d layers, %.1fms "
+            "(weights=%.1fms, metadata=%.1fms, split=%.1fms)",
             plan.current_chunk_idx + 1,
             len(plan.layer_chunks),
             len(chunk_layer_ids),
             t_chunk,
+            t_w,
+            t_m,
+            t_s,
         )
 
         plan.current_chunk_idx += 1
