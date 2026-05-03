@@ -380,9 +380,12 @@ class OnlineEPLBController:
             scale_params = [moe_layer.wi_0_scale, moe_layer.wi_1_scale, moe_layer.wo_scale]
 
         all_params = params + [p for p in scale_params if p is not None]
+        perm_jax = jax.device_put(perm)
 
         for param in all_params:
-            _permute_weight_slab_diff(param, perm)
+            sharding = param.value.sharding
+            if not _permute_weight_on_device(param, perm_jax, sharding):
+                _permute_weight_slab_diff(param, perm)
 
     def _update_metadata_for_layers(self, layer_ids: list[int], plan: _RebalancePlan):
         old_metadata = get_global_expert_location_metadata()
