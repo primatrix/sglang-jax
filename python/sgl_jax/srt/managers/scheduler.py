@@ -459,6 +459,9 @@ class Scheduler(
                 self.draft_worker.run_spec_decode_precompile()
                 logger.info("[Scheduler] Completes spec_decode worker precompile.")
 
+            if self.online_eplb is not None:
+                self.online_eplb.precompile()
+
     def sync_pub(self):
         logger.info(
             "[Publisher %s] Begins to synchronize, wait %s Subscribers",

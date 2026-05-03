@@ -193,6 +193,33 @@ class OnlineEPLBController:
             self._num_logical_experts,
         )
 
+    def precompile(self):
+        if not self._moe_layers:
+            return
+        moe_layer = self._moe_layers[0]
+        if isinstance(moe_layer, FusedEPMoE):
+            params = [moe_layer.w1, moe_layer.w2, moe_layer.w3]
+            scale_params = [moe_layer.w1_scale, moe_layer.w2_scale, moe_layer.w3_scale]
+        else:
+            params = [moe_layer.wi_0, moe_layer.wi_1, moe_layer.wo]
+            scale_params = [moe_layer.wi_0_scale, moe_layer.wi_1_scale, moe_layer.wo_scale]
+
+        all_params = params + [p for p in scale_params if p is not None]
+        seen_specs = set()
+        num_physical = all_params[0].value.shape[0]
+        identity_perm = jax.device_put(np.arange(num_physical, dtype=np.int32))
+
+        for param in all_params:
+            sharding = param.value.sharding
+            spec_key = (id(sharding.mesh), sharding.spec)
+            if spec_key in seen_specs:
+                continue
+            seen_specs.add(spec_key)
+            fn = _get_permute_fn(sharding)
+            fn(param.value, identity_perm)
+
+        logger.info("Online EPLB precompile: warmed up %d permute fn(s)", len(seen_specs))
+
     @property
     def is_rebalancing(self) -> bool:
         return self._pending_plan is not None
