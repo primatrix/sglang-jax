@@ -191,6 +191,7 @@ class ServerArgs:
     online_eplb_interval_steps: int = 200
     online_eplb_min_samples: int = 100
     online_eplb_diff_threshold: float = 0.05
+    online_eplb_layers_per_chunk: int = 0
 
     def __post_init__(self):
         # Set missing default values
@@ -920,6 +921,13 @@ class ServerArgs:
             type=float,
             default=ServerArgs.online_eplb_diff_threshold,
             help="Skip rebalance if mapping change ratio is below this threshold.",
+        )
+        parser.add_argument(
+            "--online-eplb-layers-per-chunk",
+            type=int,
+            default=ServerArgs.online_eplb_layers_per_chunk,
+            help="Layers per rebalance chunk (0 = all-at-once). "
+            "Spreads weight permutation across multiple forward passes.",
         )
 
         parser.add_argument(

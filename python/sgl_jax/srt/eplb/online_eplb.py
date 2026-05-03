@@ -1,9 +1,8 @@
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
@@ -81,60 +80,62 @@ def _collect_moe_layers(module, result: list, visited: set | None = None):
                         _collect_moe_layers(item, result, visited)
 
 
-def _permute_weight_via_host(param, perm):
-    """Permute weight along axis 0 via host roundtrip.
+def _permute_weight_slab_diff(param, perm):
+    """Permute weight along axis 0 using per-device slab diff.
 
-    Uses a hybrid strategy: when most device shards change, a single bulk
-    device_get/device_put is faster than per-shard transfers. When few
-    shards change, only the affected shards are transferred.
+    Classifies each device's local slab as unchanged (zero-copy reuse) or
+    changed (reconstruct from source shards with cross-device dedup).
     """
     arr = param.value
     sharding = arr.sharding
-    addressable_shards = sorted(arr.addressable_shards, key=lambda s: s.index[0].start)
-    num_devices = len(addressable_shards)
+    shards = sorted(arr.addressable_shards, key=lambda s: s.index[0].start)
+    num_devices = len(shards)
     local_experts = arr.shape[0] // num_devices
 
-    changed = set()
+    per_device_arrays = []
+    stats = {"unchanged": 0, "changed": 0}
+
     for d in range(num_devices):
-        s = d * local_experts
-        if not np.array_equal(perm[s : s + local_experts], np.arange(s, s + local_experts)):
-            changed.add(d)
+        slab_start = d * local_experts
+        local_perm = perm[slab_start : slab_start + local_experts]
+        identity = np.arange(slab_start, slab_start + local_experts)
 
-    if not changed:
-        return 0
+        if np.array_equal(local_perm, identity):
+            per_device_arrays.append(shards[d].data)
+            stats["unchanged"] += 1
+            continue
 
-    if len(changed) > num_devices // 2:
-        arr_np = np.array(arr)
-        arr_np = arr_np[perm]
-        param.value = jax.device_put(arr_np, sharding)
-        return len(changed)
+        stats["changed"] += 1
+        fetched_shards: dict[int, np.ndarray] = {}
+        new_slab = np.empty((local_experts, *arr.shape[1:]), dtype=arr.dtype)
 
-    needed_src = set()
-    for d in changed:
-        s = d * local_experts
         for i in range(local_experts):
-            needed_src.add(int(perm[s + i]) // local_experts)
+            src = int(local_perm[i])
+            src_dev = src // local_experts
+            src_off = src % local_experts
 
-    with ThreadPoolExecutor(max_workers=len(needed_src)) as pool:
-        src_data = dict(
-            pool.map(lambda idx: (idx, np.array(addressable_shards[idx].data)), needed_src)
-        )
+            if src_dev not in fetched_shards:
+                fetched_shards[src_dev] = np.array(shards[src_dev].data)
+            new_slab[i] = fetched_shards[src_dev][src_off]
 
-    per_device = []
-    for d in range(num_devices):
-        if d not in changed:
-            per_device.append(addressable_shards[d].data)
-        else:
-            s = d * local_experts
-            ref = next(iter(src_data.values()))
-            new_shard = np.empty_like(ref)
-            for i in range(local_experts):
-                src = int(perm[s + i])
-                new_shard[i] = src_data[src // local_experts][src % local_experts]
-            per_device.append(jax.device_put(new_shard, addressable_shards[d].device))
+        per_device_arrays.append(jax.device_put(new_slab, shards[d].device))
 
-    param.value = jax.make_array_from_single_device_arrays(arr.shape, sharding, per_device)
-    return len(changed)
+    param.value = jax.make_array_from_single_device_arrays(arr.shape, sharding, per_device_arrays)
+    return stats
+
+
+@dataclass
+class _RebalancePlan:
+    old_p2l: np.ndarray
+    new_p2l: np.ndarray
+    new_l2p: np.ndarray
+    layer_chunks: list[list[int]]
+    current_chunk_idx: int = 0
+    t_start: float = 0.0
+    num_changed_total: int = 0
+    total_slots: int = 0
+    logical_counts: np.ndarray | None = None
+    t_algo_ms: float = 0.0
 
 
 class OnlineEPLBController:
@@ -153,14 +154,19 @@ class OnlineEPLBController:
         self.interval_steps = server_args.online_eplb_interval_steps
         self.min_samples = server_args.online_eplb_min_samples
         self.diff_threshold = server_args.online_eplb_diff_threshold
+        self.layers_per_chunk = server_args.online_eplb_layers_per_chunk
 
         self._step_counter = 0
         self._rebalance_count = 0
         self._prev_logical_counts: np.ndarray | None = None
+        self._pending_plan: _RebalancePlan | None = None
 
         self._moe_layers: list = []
         _collect_moe_layers(self.model_runner.model, self._moe_layers)
         self._moe_layers.sort(key=lambda m: m.layer_id if m.layer_id is not None else 0)
+        self._moe_layer_by_id: dict[int, FusedEPMoE | EPMoE] = {
+            m.layer_id: m for m in self._moe_layers if m.layer_id is not None
+        }
 
         self._reference_treedef = None
         _, init_state = nnx.split(self.model_runner.model)
@@ -176,16 +182,25 @@ class OnlineEPLBController:
 
         logger.info(
             "OnlineEPLBController initialized: interval=%d, min_samples=%d, "
-            "diff_threshold=%.3f, moe_layers=%d, physical=%d, logical=%d",
+            "diff_threshold=%.3f, layers_per_chunk=%d, moe_layers=%d, "
+            "physical=%d, logical=%d",
             self.interval_steps,
             self.min_samples,
             self.diff_threshold,
+            self.layers_per_chunk,
             len(self._moe_layers),
             self._num_physical_experts,
             self._num_logical_experts,
         )
 
+    @property
+    def is_rebalancing(self) -> bool:
+        return self._pending_plan is not None
+
     def maybe_rebalance(self) -> bool:
+        if self._pending_plan is not None:
+            return self._execute_next_chunk()
+
         self._step_counter += 1
         if self._step_counter < self.interval_steps:
             return False
@@ -237,130 +252,169 @@ class OnlineEPLBController:
         changed_mask = old_p2l != new_p2l
         num_changed = int(changed_mask.sum())
         total_slots = old_p2l.size
-        change_ratio = num_changed / total_slots if total_slots > 0 else 0.0
 
-        t1 = time.perf_counter()
-        self.model_runner.model_state_leaves = []
-        self._apply_weight_permutation(old_p2l, new_p2l, changed_mask)
-        t_weights = time.perf_counter() - t1
+        changed_layer_ids = [
+            m.layer_id
+            for m in self._moe_layers
+            if m.layer_id is not None
+            and m.layer_id < old_p2l.shape[0]
+            and changed_mask[m.layer_id].any()
+        ]
 
-        new_metadata = ExpertLocationMetadata._init_raw(
-            server_args=self.server_args,
-            physical_to_logical_map=new_p2l,
-            logical_to_all_physical_map=new_l2p,
-            mesh=self.model_runner.mesh,
+        if not changed_layer_ids:
+            logger.info("Online EPLB: no layers changed, skipping")
+            self._prev_logical_counts = logical_counts.copy()
+            return False
+
+        layer_chunks = self._split_into_chunks(changed_layer_ids)
+        plan = _RebalancePlan(
+            old_p2l=old_p2l,
+            new_p2l=new_p2l,
+            new_l2p=new_l2p,
+            layer_chunks=layer_chunks,
+            t_start=time.perf_counter(),
+            num_changed_total=num_changed,
+            total_slots=total_slots,
+            logical_counts=logical_counts,
+            t_algo_ms=t_algo * 1000,
         )
-        set_global_expert_location_metadata(new_metadata)
+
+        logger.info(
+            "Online EPLB: starting rebalance, changed=%d/%d (%.1f%%), "
+            "algo=%.1fms, %d chunks (%d changed layers)",
+            num_changed,
+            total_slots,
+            num_changed / total_slots * 100 if total_slots else 0,
+            t_algo * 1000,
+            len(layer_chunks),
+            len(changed_layer_ids),
+        )
+
+        self._pending_plan = plan
+
+        if self.layers_per_chunk == 0:
+            while self._pending_plan is not None:
+                self._execute_next_chunk()
+        else:
+            self._execute_next_chunk()
+
+        return True
+
+    def _split_into_chunks(self, layer_ids: list[int]) -> list[list[int]]:
+        if self.layers_per_chunk <= 0:
+            return [layer_ids]
+        return [
+            layer_ids[i : i + self.layers_per_chunk]
+            for i in range(0, len(layer_ids), self.layers_per_chunk)
+        ]
+
+    def _execute_next_chunk(self) -> bool:
+        plan = self._pending_plan
+        chunk_layer_ids = plan.layer_chunks[plan.current_chunk_idx]
+
+        t0 = time.perf_counter()
+
+        for layer_id in chunk_layer_ids:
+            perm = self._compute_layer_perm(plan.old_p2l[layer_id], plan.new_p2l[layer_id])
+            self._permute_layer_weights(layer_id, perm)
+
+        self._update_metadata_for_layers(chunk_layer_ids, plan)
 
         _, model_state = nnx.split(self.model_runner.model)
         self.model_runner.model_state_leaves, new_treedef = jax.tree_util.tree_flatten(model_state)
         if new_treedef != self._reference_treedef:
             logger.error(
-                "TREEDEF MISMATCH after rebalance! leaves=%d",
+                "TREEDEF MISMATCH after chunk %d! leaves=%d",
+                plan.current_chunk_idx,
                 len(self.model_runner.model_state_leaves),
             )
 
-        self._rebalance_count += 1
-        self._prev_logical_counts = logical_counts.copy()
+        t_chunk = (time.perf_counter() - t0) * 1000
         logger.info(
-            "Online EPLB rebalance #%d: changed=%d/%d (%.1f%%), "
-            "algo=%.1fms, weights=%.1fms, samples=%d steps",
-            self._rebalance_count,
-            num_changed,
-            total_slots,
-            change_ratio * 100,
-            t_algo * 1000,
-            t_weights * 1000,
-            steps,
+            "Online EPLB chunk %d/%d: %d layers, %.1fms",
+            plan.current_chunk_idx + 1,
+            len(plan.layer_chunks),
+            len(chunk_layer_ids),
+            t_chunk,
         )
+
+        plan.current_chunk_idx += 1
+        if plan.current_chunk_idx >= len(plan.layer_chunks):
+            self._finalize_rebalance(plan)
+            self._pending_plan = None
+
         return True
 
-    def _apply_weight_permutation(
-        self,
-        old_p2l: np.ndarray,
-        new_p2l: np.ndarray,
-        changed_mask: np.ndarray,
-    ):
-        num_layers = old_p2l.shape[0]
-        num_physical = old_p2l.shape[1]
+    def _compute_layer_perm(
+        self, old_layer_p2l: np.ndarray, new_layer_p2l: np.ndarray
+    ) -> np.ndarray:
+        num_physical = len(old_layer_p2l)
 
-        work_items = []
-        for moe_layer in self._moe_layers:
-            layer_id = moe_layer.layer_id
-            if layer_id is None or layer_id >= num_layers:
+        old_logical_to_physical = {}
+        for p_idx in range(num_physical):
+            l_idx = int(old_layer_p2l[p_idx])
+            if l_idx not in old_logical_to_physical:
+                old_logical_to_physical[l_idx] = p_idx
+
+        perm = np.arange(num_physical, dtype=np.int32)
+        changed = old_layer_p2l != new_layer_p2l
+        for dst in range(num_physical):
+            if not changed[dst]:
                 continue
-            if not changed_mask[layer_id].any():
-                continue
+            target_logical = int(new_layer_p2l[dst])
+            src = old_logical_to_physical.get(target_logical, dst)
+            perm[dst] = src
 
-            old_logical_to_physical = {}
-            for p_idx in range(num_physical):
-                l_idx = int(old_p2l[layer_id, p_idx])
-                if l_idx not in old_logical_to_physical:
-                    old_logical_to_physical[l_idx] = p_idx
+        return perm
 
-            perm = np.arange(num_physical, dtype=np.int32)
-            for dst in range(num_physical):
-                if not changed_mask[layer_id, dst]:
-                    continue
-                target_logical = int(new_p2l[layer_id, dst])
-                src = old_logical_to_physical.get(target_logical, dst)
-                perm[dst] = src
-
-            n_unique = len(np.unique(perm))
-            if n_unique != num_physical:
-                logger.error(
-                    "INVALID PERM layer=%d: %d unique (expected %d), dupes exist",
-                    layer_id,
-                    n_unique,
-                    num_physical,
-                )
-            missing_logical = set(range(self._num_logical_experts)) - set(
-                old_logical_to_physical.keys()
-            )
-            if missing_logical:
-                logger.error(
-                    "Layer %d: %d logical experts missing from old mapping: %s",
-                    layer_id,
-                    len(missing_logical),
-                    sorted(missing_logical)[:5],
-                )
-
-            if isinstance(moe_layer, FusedEPMoE):
-                weights = [moe_layer.w1, moe_layer.w2, moe_layer.w3]
-                scales = [moe_layer.w1_scale, moe_layer.w2_scale, moe_layer.w3_scale]
-            else:
-                weights = [moe_layer.wi_0, moe_layer.wi_1, moe_layer.wo]
-                scales = [moe_layer.wi_0_scale, moe_layer.wi_1_scale, moe_layer.wo_scale]
-
-            for p in weights:
-                work_items.append((p, perm))
-            for p in scales:
-                if p is not None:
-                    work_items.append((p, perm))
-
-        if not work_items:
-            logger.info("Weight permutation: no work items")
+    def _permute_layer_weights(self, layer_id: int, perm: np.ndarray):
+        moe_layer = self._moe_layer_by_id.get(layer_id)
+        if moe_layer is None:
             return
 
-        global _on_device_permute_supported
-        if _on_device_permute_supported is not False:
-            first_p, first_perm = work_items[0]
-            first_perm_jax = jnp.array(first_perm, dtype=jnp.int32)
-            if _permute_weight_on_device(first_p, first_perm_jax, first_p.value.sharding):
-                for p, perm in work_items[1:]:
-                    perm_jax = jnp.array(perm, dtype=jnp.int32)
-                    _permute_weight_on_device(p, perm_jax, p.value.sharding)
-                logger.info("Weight permutation (on-device): %d tensors", len(work_items))
-                return
+        if isinstance(moe_layer, FusedEPMoE):
+            params = [moe_layer.w1, moe_layer.w2, moe_layer.w3]
+            scale_params = [moe_layer.w1_scale, moe_layer.w2_scale, moe_layer.w3_scale]
+        else:
+            params = [moe_layer.wi_0, moe_layer.wi_1, moe_layer.wo]
+            scale_params = [moe_layer.wi_0_scale, moe_layer.wi_1_scale, moe_layer.wo_scale]
 
-        max_workers = min(12, len(work_items))
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            results = list(pool.map(lambda item: _permute_weight_via_host(*item), work_items))
+        all_params = params + [p for p in scale_params if p is not None]
 
-        total_changed = sum(results)
+        for param in all_params:
+            _permute_weight_slab_diff(param, perm)
+
+    def _update_metadata_for_layers(self, layer_ids: list[int], plan: _RebalancePlan):
+        old_metadata = get_global_expert_location_metadata()
+
+        p2l = np.array(jax.device_get(old_metadata.physical_to_logical_map))
+        l2p = np.array(jax.device_get(old_metadata.logical_to_all_physical_map))
+
+        for lid in layer_ids:
+            p2l[lid] = plan.new_p2l[lid]
+            l2p[lid] = plan.new_l2p[lid]
+
+        new_metadata = ExpertLocationMetadata._init_raw(
+            server_args=self.server_args,
+            physical_to_logical_map=p2l,
+            logical_to_all_physical_map=l2p,
+            mesh=self.model_runner.mesh,
+        )
+        set_global_expert_location_metadata(new_metadata)
+
+    def _finalize_rebalance(self, plan: _RebalancePlan):
+        self._rebalance_count += 1
+        self._prev_logical_counts = plan.logical_counts.copy()
+        t_total = (time.perf_counter() - plan.t_start) * 1000
+
         logger.info(
-            "Weight permutation (host): %d tensors, %d shard transfers (workers=%d)",
-            len(work_items),
-            total_changed,
-            max_workers,
+            "Online EPLB rebalance #%d complete: changed=%d/%d (%.1f%%), "
+            "algo=%.1fms, total=%.1fms (%d chunks)",
+            self._rebalance_count,
+            plan.num_changed_total,
+            plan.total_slots,
+            plan.num_changed_total / plan.total_slots * 100 if plan.total_slots else 0,
+            plan.t_algo_ms,
+            t_total,
+            len(plan.layer_chunks),
         )
