@@ -3,6 +3,7 @@ import time
 from dataclasses import dataclass
 
 import jax
+import jax.experimental.multihost_utils as mhu
 import numpy as np
 from flax import nnx
 from jax.sharding import NamedSharding
@@ -220,7 +221,11 @@ class OnlineEPLBController:
         seen_specs = set()
         num_physical = all_params[0].value.shape[0]
         perm_sharding = NamedSharding(self._mesh, P())
-        identity_perm = jax.device_put(np.arange(num_physical, dtype=np.int32), perm_sharding)
+        perm_np = np.arange(num_physical, dtype=np.int32)
+        per_device = [jax.device_put(perm_np, d) for d in self._mesh.local_devices]
+        identity_perm = jax.make_array_from_single_device_arrays(
+            perm_np.shape, perm_sharding, per_device
+        )
 
         t0 = time.perf_counter()
         for param in all_params:
@@ -261,6 +266,11 @@ class OnlineEPLBController:
 
         if steps < self.min_samples:
             return False
+
+        if self.server_args.nnodes > 1:
+            logical_counts = np.asarray(
+                mhu.broadcast_one_to_all(logical_counts, is_source=(jax.process_index() == 0))
+            )
 
         old_metadata = get_global_expert_location_metadata()
         if old_metadata is None:
@@ -440,7 +450,11 @@ class OnlineEPLBController:
 
         all_params = params + [p for p in scale_params if p is not None]
         perm_sharding = NamedSharding(self._mesh, P())
-        perm_jax = jax.device_put(perm, perm_sharding)
+        perm_np = np.asarray(perm, dtype=np.int32)
+        per_device = [jax.device_put(perm_np, d) for d in self._mesh.local_devices]
+        perm_jax = jax.make_array_from_single_device_arrays(
+            perm_np.shape, perm_sharding, per_device
+        )
 
         multi_host = self.server_args.nnodes > 1
 
