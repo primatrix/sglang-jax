@@ -1,5 +1,6 @@
 """A tensor parallel worker."""
 
+import concurrent.futures
 import dataclasses
 import logging
 import signal
@@ -21,6 +22,14 @@ from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass
+class ForwardThreadTask:
+    """A task to be executed on the forward thread, serialized with forward passes."""
+
+    fn: object
+    future: concurrent.futures.Future
 
 
 class ModelWorkerClient:
@@ -95,12 +104,22 @@ class ModelWorkerClient:
 
     def forward_thread_func_(self):
         while True:
+            item = self.input_queue.get()
+
+            if isinstance(item, ForwardThreadTask):
+                try:
+                    result = item.fn()
+                    item.future.set_result(result)
+                except Exception as e:
+                    item.future.set_exception(e)
+                continue
+
             (
                 model_worker_batch,
                 future_token_ids_ct,
                 sampling_metadata,
                 forward_metadata,
-            ) = self.input_queue.get()
+            ) = item
             if not model_worker_batch:
                 break
 

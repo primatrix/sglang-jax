@@ -174,12 +174,6 @@ class Scheduler(
         if server_args.multimodal:
             logger.info("Multimodal mode enabled, disabling overlap schedule")
             self.enable_overlap = False
-        if server_args.enable_online_eplb and server_args.nnodes > 1 and self.enable_overlap:
-            logger.info(
-                "Multi-host online EPLB requires non-overlap schedule; "
-                "disabling overlap schedule"
-            )
-            self.enable_overlap = False
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
         # LoRA configurations
@@ -433,6 +427,8 @@ class Scheduler(
                     model_runner=model_runner,
                     dist_recorder=dist_recorder,
                 )
+                if self.enable_overlap and server_args.nnodes > 1:
+                    self.online_eplb.set_forward_queue(self.tp_worker.input_queue)
             else:
                 logger.warning(
                     "Online EPLB enabled but dist_recorder is None. " "Online EPLB will not run."

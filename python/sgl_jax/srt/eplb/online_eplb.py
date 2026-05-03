@@ -1,5 +1,6 @@
 import logging
 import time
+from concurrent.futures import Future
 from dataclasses import dataclass
 
 import jax
@@ -173,6 +174,7 @@ class OnlineEPLBController:
         self._rebalance_count = 0
         self._prev_logical_counts: np.ndarray | None = None
         self._pending_plan: _RebalancePlan | None = None
+        self._forward_queue = None
 
         self._moe_layers: list = []
         _collect_moe_layers(self.model_runner.model, self._moe_layers)
@@ -246,6 +248,17 @@ class OnlineEPLBController:
             (time.perf_counter() - t0) * 1000,
         )
 
+    def set_forward_queue(self, queue):
+        self._forward_queue = queue
+        logger.info("OnlineEPLBController: overlap mode enabled, JAX ops routed to forward thread")
+
+    def _run_on_forward_thread(self, fn):
+        from sgl_jax.srt.managers.tp_worker_overlap_thread import ForwardThreadTask
+
+        future = Future()
+        self._forward_queue.put(ForwardThreadTask(fn=fn, future=future))
+        return future.result()
+
     @property
     def is_rebalancing(self) -> bool:
         return self._pending_plan is not None
@@ -271,6 +284,8 @@ class OnlineEPLBController:
 
     def maybe_rebalance(self) -> bool:
         if self._pending_plan is not None:
+            if self._forward_queue is not None:
+                return self._run_on_forward_thread(self._execute_next_chunk)
             return self._execute_next_chunk()
 
         self._step_counter += 1
@@ -280,6 +295,11 @@ class OnlineEPLBController:
 
         result = self.dist_recorder.get_logical_counts_and_reset()
 
+        if self._forward_queue is not None:
+            return self._run_on_forward_thread(lambda: self._rebalance_core(result))
+        return self._rebalance_core(result)
+
+    def _rebalance_core(self, result) -> bool:
         if self.server_args.nnodes > 1:
             logical_counts = self._sync_counts_multi_host(result)
             if logical_counts is None:
