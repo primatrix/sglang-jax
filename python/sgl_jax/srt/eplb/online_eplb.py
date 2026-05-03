@@ -250,6 +250,25 @@ class OnlineEPLBController:
     def is_rebalancing(self) -> bool:
         return self._pending_plan is not None
 
+    def _sync_counts_multi_host(self, local_result):
+        """Broadcast counts from host 0 to all hosts via JAX collectives.
+
+        All hosts must call this method together (it contains two
+        broadcast_one_to_all collectives). Returns logical_counts or None
+        if host 0 decided to skip.
+        """
+        is_source = jax.process_index() == 0
+
+        has_counts = local_result is not None and local_result[1] >= self.min_samples
+        signal = np.array([1 if (is_source and has_counts) else 0], dtype=np.int32)
+        signal = np.asarray(mhu.broadcast_one_to_all(signal, is_source=is_source))
+        if signal[0] == 0:
+            return None
+
+        counts_shape = (self.dist_recorder.num_layers, self._num_logical_experts)
+        logical_counts = local_result[0] if is_source else np.zeros(counts_shape, dtype=np.int64)
+        return np.asarray(mhu.broadcast_one_to_all(logical_counts, is_source=is_source))
+
     def maybe_rebalance(self) -> bool:
         if self._pending_plan is not None:
             return self._execute_next_chunk()
@@ -260,17 +279,17 @@ class OnlineEPLBController:
         self._step_counter = 0
 
         result = self.dist_recorder.get_logical_counts_and_reset()
-        if result is None:
-            return False
-        logical_counts, steps = result
-
-        if steps < self.min_samples:
-            return False
 
         if self.server_args.nnodes > 1:
-            logical_counts = np.asarray(
-                mhu.broadcast_one_to_all(logical_counts, is_source=(jax.process_index() == 0))
-            )
+            logical_counts = self._sync_counts_multi_host(result)
+            if logical_counts is None:
+                return False
+        else:
+            if result is None:
+                return False
+            logical_counts, steps = result
+            if steps < self.min_samples:
+                return False
 
         old_metadata = get_global_expert_location_metadata()
         if old_metadata is None:

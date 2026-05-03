@@ -174,6 +174,12 @@ class Scheduler(
         if server_args.multimodal:
             logger.info("Multimodal mode enabled, disabling overlap schedule")
             self.enable_overlap = False
+        if server_args.enable_online_eplb and server_args.nnodes > 1 and self.enable_overlap:
+            logger.info(
+                "Multi-host online EPLB requires non-overlap schedule; "
+                "disabling overlap schedule"
+            )
+            self.enable_overlap = False
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
         # LoRA configurations
