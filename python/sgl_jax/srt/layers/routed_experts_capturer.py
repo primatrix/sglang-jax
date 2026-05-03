@@ -512,6 +512,7 @@ class _ExpertDistributionRecorder:
         self.buffer_size = buffer_size
         self.output_file = output_file
         self.physical_expert_counts = physical_expert_counts
+        self._eplb_owns_reset = False
 
         self._physical_counts = np.zeros(
             (self.num_layers, self.physical_expert_counts), dtype=np.int64
@@ -549,8 +550,9 @@ class _ExpertDistributionRecorder:
             self._steps_accumulated += 1
             if self.output_file and self._steps_accumulated >= self.buffer_size:
                 self.dump()
-                self._physical_counts.fill(0)
-                self._steps_accumulated = 0
+                if not self._eplb_owns_reset:
+                    self._physical_counts.fill(0)
+                    self._steps_accumulated = 0
 
     def reset(self):
         with self._lock:

@@ -155,6 +155,7 @@ class OnlineEPLBController:
         self.model_config = model_config
         self.model_runner = model_runner
         self.dist_recorder = dist_recorder
+        self.dist_recorder._eplb_owns_reset = True
         self._mesh = model_runner.mesh
 
         self.interval_steps = server_args.online_eplb_interval_steps
