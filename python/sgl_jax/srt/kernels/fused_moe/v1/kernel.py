@@ -669,6 +669,17 @@ def _fused_ep_moe_kernel(
             )
         pltpu.semaphore_wait(barrier_sem, num_devices)
 
+    def sync_self_fence():
+        """Local-only barrier: memory fence without cross-device synchronization."""
+        if disable_sync_barrier:
+            return
+        pltpu.semaphore_signal(
+            barrier_sem,
+            device_id=get_mesh_device_id(my_id),
+            device_id_type=pltpu.DeviceIdType.MESH,
+        )
+        pltpu.semaphore_wait(barrier_sem, 1)
+
     def start_fetch_topk(*, bt_id, priority=0):
         bt_sem_id = bt_id & jnp.int32(1)
         bt_start = bt_id * bt
@@ -2739,7 +2750,7 @@ def _fused_ep_moe_kernel(
 
             wait_a2a_scatter_send_batch()
             wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
-            sync_barrier()
+            sync_self_fence()
 
             acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
 
@@ -2839,7 +2850,7 @@ def _fused_ep_moe_kernel(
             lax.fori_loop(final_se_block, se_total_blocks, cleanup_body, None)
 
             wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
-            sync_barrier()
+            sync_self_fence()
 
             acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
 
