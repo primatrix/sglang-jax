@@ -258,6 +258,13 @@ def attn_backend_wrapper(
             ) from e
 
         linear_attn_backend = KDAAttnBackend(runner.mesh)
+    # TODO: Add runner.lightning_config property when BailingMoeV2.5 model
+    # skeleton is integrated. The config detection requires a dedicated HF
+    # config class for Ling-2.5.
+    elif getattr(runner, "lightning_config", None) is not None:
+        from sgl_jax.srt.layers.attention.linear.lightning_backend import LightningAttnBackend
+
+        linear_attn_backend = LightningAttnBackend(runner.mesh)
     else:
         raise NotImplementedError(f"No linear backend wired for hybrid config {type(cfg).__name__}")
     return HybridLinearAttnBackend(

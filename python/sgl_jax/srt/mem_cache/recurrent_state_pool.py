@@ -123,12 +123,11 @@ class RecurrentStatePool:
         assert head_dim > 0, f"head_dim must be > 0, got {head_dim}"
         assert num_k_heads > 0, f"num_k_heads must be > 0, got {num_k_heads}"
         assert head_k_dim > 0, f"head_k_dim must be > 0, got {head_k_dim}"
-        # K=1 would make conv_buffers[l][i] last dim (K-1) zero; min meaningful value is 2.
-        assert conv_kernel_size >= 2, (
-            f"conv_kernel_size must be >= 2 (got {conv_kernel_size}); "
-            "K=1 produces empty conv buffers."
+        assert conv_kernel_size >= 0, (
+            f"conv_kernel_size must be >= 0 (got {conv_kernel_size})"
         )
-        assert self.proj_size > 0, f"proj_size must be > 0, got {self.proj_size}"
+        if conv_kernel_size > 0:
+            assert self.proj_size > 0, f"proj_size must be > 0, got {self.proj_size}"
 
         # Mesh + sharding specs. Partition axis names are kept on the instance
         # (so _create_buffers / replace_buffer can reach them) but tp_size is
@@ -147,15 +146,20 @@ class RecurrentStatePool:
             f"num_k_heads {num_k_heads} must be divisible by mesh axis "
             f"'{recurrent_partition_axis}' size {recurrent_axis_size}"
         )
-        assert self.proj_size % conv_axis_size == 0, (
-            f"proj_size {self.proj_size} must be divisible by mesh axis "
-            f"'{conv_partition_axis}' size {conv_axis_size}"
-        )
+        if conv_kernel_size > 0:
+            assert self.proj_size % conv_axis_size == 0, (
+                f"proj_size {self.proj_size} must be divisible by mesh axis "
+                f"'{conv_partition_axis}' size {conv_axis_size}"
+            )
         # recurrent_buffers shape: [N+1, H, D, D] -> partition H on tensor axis.
         self.recurrent_sharding = NamedSharding(mesh, P(None, recurrent_partition_axis, None, None))
         # conv_buffers[layer][inner] shape: [N+1, proj_size, K-1] -> partition
         # proj_size on tensor axis (matches the projection's TP split).
-        self.conv_sharding = NamedSharding(mesh, P(None, conv_partition_axis, None))
+        self.conv_sharding = (
+            NamedSharding(mesh, P(None, conv_partition_axis, None))
+            if conv_kernel_size > 0
+            else None
+        )
 
         # Dual list containers; each element has +1 row reserved for dummy slot 0.
         self.recurrent_buffers, self.conv_buffers = self._create_buffers()
@@ -176,7 +180,11 @@ class RecurrentStatePool:
             self.head_dim,
             self.head_dim,
         )
-        conv_shape = (self.max_num_reqs + 1, self.proj_size, self.conv_kernel_size - 1)
+        conv_shape = (
+            (self.max_num_reqs + 1, self.proj_size, self.conv_kernel_size - 1)
+            if self.conv_kernel_size > 0
+            else None
+        )
         temporal_dtype = self.temporal_dtype
         conv_dtype = self.conv_dtype
 
@@ -190,17 +198,18 @@ class RecurrentStatePool:
                 recurrent_buffers.append(buf)
 
             conv_buffers = []
-            for _ in range(self.num_linear_recurrent_layers):
-                # Inner list currently has length 1; reserved for future
-                # multi-conv-segment expansion (mirroring PyTorch
-                # KimiLinearStateShape.conv: List[tuple]).
-                inner = []
-                buf = jax.jit(
-                    lambda: jnp.zeros(shape=conv_shape, dtype=conv_dtype),
-                    out_shardings=self.conv_sharding,
-                )()
-                inner.append(buf)
-                conv_buffers.append(inner)
+            if self.conv_kernel_size > 0:
+                for _ in range(self.num_linear_recurrent_layers):
+                    inner = []
+                    buf = jax.jit(
+                        lambda: jnp.zeros(shape=conv_shape, dtype=conv_dtype),
+                        out_shardings=self.conv_sharding,
+                    )()
+                    inner.append(buf)
+                    conv_buffers.append(inner)
+            else:
+                for _ in range(self.num_linear_recurrent_layers):
+                    conv_buffers.append([])
 
         return recurrent_buffers, conv_buffers
 
@@ -302,7 +311,7 @@ class RecurrentStatePool:
         for layer in range(self.num_linear_recurrent_layers):
             for i in range(len(new_conv[layer])):
                 buf = new_conv[layer][i]
-                if tp_degenerate and hasattr(self, "conv_sharding"):
+                if tp_degenerate and self.conv_sharding is not None:
                     buf = jax.device_put(buf, self.conv_sharding)
                 self.conv_buffers[layer][i] = buf
 

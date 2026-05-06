@@ -17,8 +17,8 @@ import pytest
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.layers.attention.fla.linear_attention_backend import (
-    LinearAttentionBackend,
+from sgl_jax.srt.layers.attention.linear.lightning_backend import (
+    LightningAttnBackend,
 )
 from sgl_jax.srt.models.bailing_moe_v2_5_linear_attention import (
     BailingMoeV2_5LinearAttention,
@@ -95,10 +95,10 @@ def _make_config():
 
 def _make_module(layer_idx=5, dtype=jnp.float32):
     config = _make_config()
-    backend = LinearAttentionBackend(mesh=mesh)
+    backend = LightningAttnBackend(mesh=mesh)
     with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
         module = BailingMoeV2_5LinearAttention(
-            config=config, layer_idx=layer_idx, mesh=mesh, backend=backend, dtype=dtype
+            config=config, layer_id=layer_idx, mesh=mesh, backend=backend, dtype=dtype
         )
     return module
 
