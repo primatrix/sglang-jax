@@ -876,7 +876,7 @@ class TestMultiRequestIsolation:
                 jax.random.PRNGKey(0), (seq_len, _SMALL_HIDDEN), dtype=jnp.bfloat16
             )
             positions = jnp.arange(seq_len, dtype=jnp.int32)
-            state_init = jnp.zeros((1, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.bfloat16)
+            state_init = jnp.zeros((1, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.float32)
 
             # --- Prefill: all tokens at once ---
             pool_pf, rec_pf = _make_mock_pool(layer_id, state_init)
@@ -912,9 +912,9 @@ class TestMultiRequestIsolation:
         # order-of-magnitude differences.
         #
         # Tolerances derived from TPU v6e-4 empirical data (2026-04-08):
-        #   state: max_abs_diff=1.14, mismatch=8/65536 (0.012%) at rtol=0.2/atol=0.5
-        #          near-zero elements (|ref|≈0.23) dominate the outliers.
-        #          atol=1.5 provides ~30% headroom above observed max.
+        #   state: chunk vs recurrent kernel accumulation divergence grows with
+        #          seq_len. On TPU v6e-4, observed max_abs_diff up to 6.5 for
+        #          seq_len=64 in bf16.
         #   output: max_abs_diff well below 0.5 (all elements pass at atol=0.5).
         np.testing.assert_allclose(
             np.array(state_prefill[0]),
@@ -1175,7 +1175,7 @@ class TestGLAWrapper:
                 config=_SMALL_CONFIG, layer_id=layer_id, mesh=mesh, backend=backend
             )
 
-            state_init = jnp.zeros((1, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.bfloat16)
+            state_init = jnp.zeros((1, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.float32)
             pool, rec_indices = _make_mock_pool(layer_id, state_init)
             _setup_backend_metadata(
                 backend, ForwardMode.EXTEND, rec_indices,
@@ -1368,7 +1368,7 @@ class TestTPConsistency:
         layer_id = 5
         hidden = jax.random.normal(jax.random.PRNGKey(0), (T, _SMALL_HIDDEN), dtype=jnp.bfloat16)
         positions = jnp.arange(T, dtype=jnp.int32)
-        state_init = jnp.zeros((T, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.bfloat16)
+        state_init = jnp.zeros((T, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.float32)
         fb = _make_forward_batch(ForwardMode.DECODE)
 
         # --- TP=1 baseline ---
@@ -1423,7 +1423,7 @@ class TestTPConsistency:
             jax.random.PRNGKey(0), (seq_len, _SMALL_HIDDEN), dtype=jnp.bfloat16
         )
         positions = jnp.arange(seq_len, dtype=jnp.int32)
-        state_init = jnp.zeros((1, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.bfloat16)
+        state_init = jnp.zeros((1, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.float32)
 
         # --- TP=1 baseline ---
         _, mesh_tp1 = tp_meshes[0]
