@@ -1,6 +1,6 @@
-"""Tests for BailingMoeV2_5LinearAttention __init__, build_slope_tensor, and forward pass.
+"""Tests for BailingMoeV2_5LinearAttention -- GLA module.
 
-Run with: pytest python/sgl_jax/test/layers/test_linear_attention.py -v
+Run with: pytest python/sgl_jax/test/layers/test_gla.py -v
 """
 
 import math
@@ -28,6 +28,49 @@ from sgl_jax.srt.models.bailing_moe_v2_5_linear_attention import (
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
 mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
+
+# ---------------------------------------------------------------------------
+# Optional imports
+# ---------------------------------------------------------------------------
+try:
+    import torch
+    import torch.nn.functional as F
+
+    _HAS_TORCH = True
+except ImportError:
+    _HAS_TORCH = False
+
+try:
+    from sgl_jax.srt.kernels.simple_gla.simple_gla import (  # noqa: F401
+        fused_recurrent_simple_gla,
+        simple_gla_fwd,
+    )
+
+    HAS_SIMPLE_GLA = True
+except ImportError:
+    HAS_SIMPLE_GLA = False
+
+# Prefill (chunk) kernel uses Pallas TPU primitives and cannot run on CPU.
+_HAS_TPU = any(d.platform == "tpu" for d in jax.devices())
+
+# ---------------------------------------------------------------------------
+# Skip markers
+# ---------------------------------------------------------------------------
+requires_torch = pytest.mark.skipif(not _HAS_TORCH, reason="torch not installed")
+requires_simple_gla = pytest.mark.skipif(
+    not HAS_SIMPLE_GLA, reason="simple_gla kernel not available"
+)
+requires_tpu = pytest.mark.skipif(not _HAS_TPU, reason="chunk kernel requires TPU")
+
+# Skip if fewer than 2 devices (CPU has only 1)
+_HAS_MULTI_DEVICE = len(jax.devices()) >= 2
+requires_multi_device = pytest.mark.skipif(
+    not _HAS_MULTI_DEVICE, reason="Need >= 2 devices for TP consistency test"
+)
+
+# ===========================================================================
+# Module test helpers (from test_linear_attention.py)
+# ===========================================================================
 
 
 def _make_config(
@@ -117,6 +160,200 @@ def _setup_backend_metadata(backend, forward_mode, recurrent_indices,
     backend.forward_metadata = metadata
     return metadata
 
+
+def _make_forward_batch(forward_mode):
+    return SimpleNamespace(forward_mode=forward_mode)
+
+
+def _reshape_qkv(qkv, T, num_heads, head_dim, m=None):
+    """Reshape fused QKV tensor respecting tensor-parallel sharding.
+
+    When running under TP, qkv has sharding P(None, "tensor") on the last dim.
+    A bare .reshape() fails because JAX cannot infer the output sharding.
+    Use jax.lax.reshape with explicit out_sharding, matching what the model does.
+    """
+    if m is None:
+        m = mesh
+    return jax.lax.reshape(
+        qkv,
+        (T, 3, num_heads, head_dim),
+        out_sharding=NamedSharding(m, P(None, None, "tensor", None)),
+    )
+
+
+_SMALL_CONFIG = _make_config(
+    hidden_size=512,
+    num_attention_heads=4,
+    head_dim=128,
+    num_hidden_layers=10,
+    partial_rotary_factor=0.5,
+    max_position_embeddings=1024,
+    rope_theta=10000,
+    group_norm_size=4,
+)
+
+_SMALL_H = 4
+_SMALL_K = 128
+_SMALL_HIDDEN = 512
+
+# ===========================================================================
+# Cross-framework helpers (from test_cross_framework_linear_attention.py)
+# ===========================================================================
+
+# TPU float32 matmul uses reduced precision (MXU accumulates in bf16),
+# causing ~0.17 max diff vs PyTorch CPU. This is a hardware characteristic,
+# not a code bug. Use platform-appropriate atol for matmul-based tests.
+_CF_IS_TPU = any(d.platform == "tpu" for d in jax.devices())
+_CF_MATMUL_ATOL = 0.2 if _CF_IS_TPU else 5e-5
+
+_CF_H = 4
+_CF_K = 64
+_CF_HIDDEN = 256
+_CF_NUM_LAYERS = 10
+_CF_NUM_GROUPS = 4
+_CF_EPS = 1e-6
+_CF_ROPE_THETA = 10000
+_CF_PARTIAL_ROTARY_FACTOR = 0.5
+_CF_ROTARY_DIM = int(_CF_K * _CF_PARTIAL_ROTARY_FACTOR)  # 32
+
+
+def _make_cf_config():
+    return SimpleNamespace(
+        hidden_size=_CF_HIDDEN,
+        num_attention_heads=_CF_H,
+        head_dim=_CF_K,
+        num_hidden_layers=_CF_NUM_LAYERS,
+        partial_rotary_factor=_CF_PARTIAL_ROTARY_FACTOR,
+        use_qk_norm=True,
+        group_norm_size=_CF_NUM_GROUPS,
+        rms_norm_eps=_CF_EPS,
+        use_qkv_bias=False,
+        use_bias=False,
+        rope_theta=_CF_ROPE_THETA,
+        max_position_embeddings=1024,
+    )
+
+
+def _make_cf_module(layer_idx=5, dtype=jnp.float32):
+    config = _make_cf_config()
+    backend = LightningAttnBackend(mesh=mesh)
+    with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
+        module = BailingMoeV2_5LinearAttention(
+            config=config, layer_id=layer_idx, mesh=mesh, backend=backend, dtype=dtype
+        )
+    return module
+
+
+# ---------------------------------------------------------------------------
+# Pure-torch reference implementations
+# ---------------------------------------------------------------------------
+
+
+def torch_rmsnorm(x, weight, eps):
+    """Pure-torch RMSNorm: x * rsqrt(mean(x^2) + eps) * weight.
+
+    Verified against HF BailingMoeV2_5RMSNorm from local cache (atol=1e-6),
+    covering both 2D and 3D input shapes.
+    """
+    x_f32 = x.float()
+    variance = x_f32.pow(2).mean(-1, keepdim=True)
+    x_normed = x_f32 * torch.rsqrt(variance + eps)
+    return (x_normed * weight.float()).to(x.dtype)
+
+
+def torch_group_rmsnorm(x, weight, num_groups, eps):
+    """Pure-torch GroupRMSNorm.
+
+    Verified against HF BailingMoeV2_5GroupRMSNorm from local cache (atol=1e-6),
+    covering num_groups=2/4/8/16 configurations.
+    """
+    orig_dtype = x.dtype
+    orig_shape = x.shape
+    group_size = x.shape[-1] // num_groups
+    x = x.reshape(*orig_shape[:-1], num_groups, group_size).float()
+    variance = x.pow(2).mean(-1, keepdim=True)
+    x = x * torch.rsqrt(variance + eps)
+    w = weight.float().reshape(num_groups, group_size)
+    return (w * x).reshape(orig_shape).to(orig_dtype)
+
+
+def torch_rope_neox(positions, q, k, head_dim, rotary_dim, rope_theta):
+    """Pure-torch partial RoPE (neox-style).
+
+    Verified bit-exact (max_diff=0) against HF BailingMoeV2_5RotaryEmbedding +
+    apply_rotary_pos_emb from local cache, covering head_dim=64/128,
+    partial_rotary_factor=0.5/1.0, and rope_theta=10000/600000.
+
+    Args:
+        positions: [T] long tensor
+        q, k: [T, H, head_dim] float tensors
+        head_dim: full head dimension
+        rotary_dim: number of dims to rotate
+        rope_theta: RoPE base frequency
+    Returns:
+        q_out, k_out: same shape as input
+    """
+    inv_freq = 1.0 / (
+        rope_theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
+    )
+    freqs = positions.float().unsqueeze(1) * inv_freq.unsqueeze(0)  # [T, rotary_dim//2]
+    cos = torch.cos(freqs).unsqueeze(1)  # [T, 1, rotary_dim//2]
+    sin = torch.sin(freqs).unsqueeze(1)  # [T, 1, rotary_dim//2]
+
+    def _apply(x):
+        x_rot = x[..., :rotary_dim]
+        x_pass = x[..., rotary_dim:]
+        x1, x2 = x_rot.chunk(2, dim=-1)
+        o1 = x1 * cos - x2 * sin
+        o2 = x2 * cos + x1 * sin
+        return torch.cat([torch.cat([o1, o2], dim=-1), x_pass], dim=-1)
+
+    return _apply(q), _apply(k)
+
+
+def jax_to_numpy(x):
+    return np.array(x)
+
+
+def numpy_gla_recurrent(q, k, v, g_gamma, h0=None, scale=None):
+    """Pure-numpy GLA recurrence reference implementation.
+
+    g_gamma semantics: decay = exp(g_gamma) per step (verified empirically).
+
+    Args:
+        q, k, v: [B, T, H, K] float arrays
+        g_gamma: [H] negative log-decay per head
+        h0: [B, H, K, K] initial state or None (zeros)
+        scale: float or None (defaults to K^-0.5)
+    Returns:
+        output: [B, T, H, K]
+        final_state: [B, H, K, K]
+    """
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    if scale is None:
+        scale = K**-0.5
+    gamma = np.exp(g_gamma)  # [H], in (0, 1) for negative g_gamma
+
+    h = np.zeros((B, H, K, V), dtype=np.float64) if h0 is None else h0.astype(np.float64).copy()
+
+    outputs = []
+    for t in range(T):
+        # Decay existing state
+        h = gamma[None, :, None, None] * h
+        # Accumulate outer product k^T @ v
+        h = h + np.einsum("bhk,bhv->bhkv", k[:, t], v[:, t])
+        # Output: q @ h * scale
+        o = np.einsum("bhk,bhkv->bhv", q[:, t], h) * scale
+        outputs.append(o)
+
+    output = np.stack(outputs, axis=1)  # [B, T, H, V]
+    return output.astype(np.float32), h.astype(np.float32)
+
+
+# ===========================================================================
+# Test classes
+# ===========================================================================
 
 # ---------------------------------------------------------------------------
 # build_slope_tensor (static method) tests
@@ -235,62 +472,265 @@ class TestModuleStructure:
 
 
 # ---------------------------------------------------------------------------
-# Forward pass tests (require simple_gla kernel)
+# Sub-component comparison tests (cross-framework)
 # ---------------------------------------------------------------------------
 
-try:
-    from sgl_jax.srt.kernels.simple_gla.simple_gla import (  # noqa: F401
-        fused_recurrent_simple_gla,
-        simple_gla_fwd,
-    )
 
-    HAS_SIMPLE_GLA = True
-except ImportError:
-    HAS_SIMPLE_GLA = False
+@requires_torch
+class TestSubComponentComparison:
+    def test_slope_computation_matches_torch(self):
+        """ALiBi slope formula: JAX vs PyTorch reference (absolute values)."""
 
-requires_simple_gla = pytest.mark.skipif(
-    not HAS_SIMPLE_GLA, reason="simple_gla kernel not available"
-)
+        def pt_build_slope_tensor(n):
+            def get_slopes_power_of_2(n):
+                start = 2 ** (-(2 ** -(math.log2(n) - 3)))
+                ratio = start
+                return [start * ratio**i for i in range(n)]
 
-# Prefill (chunk) kernel uses Pallas TPU primitives and cannot run on CPU.
-_HAS_TPU = any(d.platform == "tpu" for d in jax.devices())
-requires_tpu = pytest.mark.skipif(not _HAS_TPU, reason="chunk kernel requires TPU")
+            if math.log2(n).is_integer():
+                return get_slopes_power_of_2(n)
+            else:
+                closest = 2 ** math.floor(math.log2(n))
+                return (
+                    get_slopes_power_of_2(closest)
+                    + pt_build_slope_tensor(2 * closest)[0::2][: n - closest]
+                )
+
+        def pt_compute_slope(num_heads, layer_id, num_layers):
+            """PyTorch convention: positive slopes, 0-indexed layer_id."""
+            base = np.array(pt_build_slope_tensor(num_heads), dtype=np.float32)
+            return base * (1 - layer_id / (num_layers - 1) + 1e-5)
+
+        # Test base slopes match
+        jax_base = BailingMoeV2_5LinearAttention.build_slope_tensor(_CF_H)
+        pt_base = pt_build_slope_tensor(_CF_H)
+        np.testing.assert_array_equal(jax_base, pt_base)
+
+        # Test per-layer slopes for multiple layers (comparing absolute values)
+        for jax_layer_idx in [1, 5, 10]:
+            pt_layer_id = jax_layer_idx - 1
+            with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
+                module = _make_cf_module(layer_idx=jax_layer_idx)
+            jax_slopes = jax_to_numpy(module.slope)  # negative
+            pt_slopes = pt_compute_slope(_CF_H, pt_layer_id, _CF_NUM_LAYERS)  # positive
+            np.testing.assert_allclose(
+                np.abs(jax_slopes),
+                np.abs(pt_slopes),
+                atol=0,
+                rtol=1e-7,
+                err_msg=f"Slope mismatch at layer_idx={jax_layer_idx}",
+            )
+
+    def test_qkv_projection_matches_torch(self):
+        """QKV linear projection: JAX LinearBase vs torch F.linear."""
+        T = 8
+        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
+            module = _make_cf_module()
+            hidden_np = np.random.default_rng(42).standard_normal((T, _CF_HIDDEN)).astype(np.float32)
+            hidden_jax = jnp.array(hidden_np)
+            qkv_jax, _ = module.qkv_proj(hidden_jax)
+
+        w_np = jax_to_numpy(module.qkv_proj.weight.value)  # (in, out)
+        qkv_pt = F.linear(torch.tensor(hidden_np), torch.tensor(w_np.T))
+
+        # float32 matmul accumulation order differs between JAX and PyTorch
+        np.testing.assert_allclose(jax_to_numpy(qkv_jax), qkv_pt.numpy(), atol=_CF_MATMUL_ATOL)
+
+    def test_qk_rmsnorm_matches_torch(self):
+        """Q/K RMSNorm: JAX RMSNorm vs pure-torch reference."""
+        T = 8
+        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
+            module = _make_cf_module()
+            x_np = np.random.default_rng(43).standard_normal((T, _CF_H, _CF_K)).astype(np.float32)
+            x_jax = jnp.array(x_np)
+            q_jax = module.q_norm(x_jax)
+            k_jax = module.k_norm(x_jax)
+
+        q_scale_np = jax_to_numpy(module.q_norm.scale.value)
+        k_scale_np = jax_to_numpy(module.k_norm.scale.value)
+
+        q_pt = torch_rmsnorm(torch.tensor(x_np), torch.tensor(q_scale_np), _CF_EPS)
+        k_pt = torch_rmsnorm(torch.tensor(x_np), torch.tensor(k_scale_np), _CF_EPS)
+
+        np.testing.assert_allclose(jax_to_numpy(q_jax), q_pt.numpy(), atol=1e-5)
+        np.testing.assert_allclose(jax_to_numpy(k_jax), k_pt.numpy(), atol=1e-5)
+
+    def test_rope_matches_torch(self):
+        """Partial RoPE (neox-style): JAX RotaryEmbedding vs pure-torch reference."""
+        T = 8
+        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
+            module = _make_cf_module(dtype=jnp.float32)
+            positions = jnp.arange(T, dtype=jnp.int32)
+            x_np = np.random.default_rng(44).standard_normal((T, _CF_H, _CF_K)).astype(np.float32)
+            q_jax = jnp.array(x_np)
+            k_jax = jnp.array(x_np)
+            q_out_jax, k_out_jax = module.rotary_emb(positions, q_jax, k_jax)
+
+        q_pt = torch.tensor(x_np)
+        k_pt = torch.tensor(x_np)
+        positions_pt = torch.arange(T, dtype=torch.long)
+        q_out_pt, k_out_pt = torch_rope_neox(positions_pt, q_pt, k_pt, _CF_K, _CF_ROTARY_DIM, _CF_ROPE_THETA)
+
+        np.testing.assert_allclose(jax_to_numpy(q_out_jax), q_out_pt.numpy(), atol=1e-5)
+        np.testing.assert_allclose(jax_to_numpy(k_out_jax), k_out_pt.numpy(), atol=1e-5)
+
+    def test_g_proj_matches_torch(self):
+        """Gate projection: JAX LinearBase vs torch F.linear."""
+        T = 8
+        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
+            module = _make_cf_module()
+            hidden_np = np.random.default_rng(45).standard_normal((T, _CF_HIDDEN)).astype(np.float32)
+            hidden_jax = jnp.array(hidden_np)
+            g_jax, _ = module.g_proj(hidden_jax)
+
+        w_np = jax_to_numpy(module.g_proj.weight.value)  # (in, out)
+        g_pt = F.linear(torch.tensor(hidden_np), torch.tensor(w_np.T))
+
+        np.testing.assert_allclose(jax_to_numpy(g_jax), g_pt.numpy(), atol=_CF_MATMUL_ATOL)
+
+    def test_group_rmsnorm_gating_matches_torch(self):
+        """GroupRMSNorm + sigmoid gating: JAX vs pure-torch reference."""
+        T = 8
+        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
+            module = _make_cf_module()
+            rng = np.random.default_rng(46)
+            attn_np = rng.standard_normal((T, _CF_H * _CF_K)).astype(np.float32)
+            gate_np = rng.standard_normal((T, _CF_H * _CF_K)).astype(np.float32)
+
+            attn_jax = jnp.array(attn_np)
+            gate_jax = jax.nn.sigmoid(jnp.array(gate_np))
+            normed_jax = module.g_norm(attn_jax)
+            result_jax = normed_jax * gate_jax
+
+        g_norm_weight_np = jax_to_numpy(module.g_norm.weight.value)
+        normed_pt = torch_group_rmsnorm(
+            torch.tensor(attn_np), torch.tensor(g_norm_weight_np), _CF_NUM_GROUPS, _CF_EPS
+        )
+        gate_pt = torch.sigmoid(torch.tensor(gate_np))
+        result_pt = normed_pt * gate_pt
+
+        np.testing.assert_allclose(jax_to_numpy(result_jax), result_pt.numpy(), atol=1e-5)
+
+    def test_dense_projection_matches_torch(self):
+        """Dense (output) projection: JAX LinearBase vs torch F.linear."""
+        T = 8
+        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
+            module = _make_cf_module()
+            x_np = np.random.default_rng(47).standard_normal((T, _CF_H * _CF_K)).astype(np.float32)
+            x_jax = jnp.array(x_np)
+            out_jax, _ = module.dense(x_jax)
+
+        w_np = jax_to_numpy(module.dense.weight.value)  # (in, out)
+        out_pt = F.linear(torch.tensor(x_np), torch.tensor(w_np.T))
+
+        np.testing.assert_allclose(jax_to_numpy(out_jax), out_pt.numpy(), atol=_CF_MATMUL_ATOL)
 
 
-def _make_forward_batch(forward_mode):
-    return SimpleNamespace(forward_mode=forward_mode)
+# ---------------------------------------------------------------------------
+# Module-level mock-kernel test (cross-framework)
+# ---------------------------------------------------------------------------
 
 
-def _reshape_qkv(qkv, T, num_heads, head_dim, m=None):
-    """Reshape fused QKV tensor respecting tensor-parallel sharding.
+@requires_torch
+class TestModuleLevelMockKernel:
+    def test_forward_with_mocked_kernel(self):
+        """Full pipeline (minus kernel) with shared weights: JAX vs torch."""
+        T = 8
+        rng = np.random.default_rng(100)
 
-    When running under TP, qkv has sharding P(None, "tensor") on the last dim.
-    A bare .reshape() fails because JAX cannot infer the output sharding.
-    Use jax.lax.reshape with explicit out_sharding, matching what the model does.
-    """
-    if m is None:
-        m = mesh
-    return jax.lax.reshape(
-        qkv,
-        (T, 3, num_heads, head_dim),
-        out_sharding=NamedSharding(m, P(None, None, "tensor", None)),
-    )
+        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
+            module = _make_cf_module(dtype=jnp.float32)
+
+            hidden_np = rng.standard_normal((T, _CF_HIDDEN)).astype(np.float32)
+            dummy_attn_np = rng.standard_normal((T, _CF_H * _CF_K)).astype(np.float32)
+            positions_np = np.arange(T, dtype=np.int32)
+
+            hidden_jax = jnp.array(hidden_np)
+            positions_jax = jnp.array(positions_np)
+
+            # --- JAX side: step-by-step forward ---
+            # 1. QKV projection + reshape + split
+            qkv_jax, _ = module.qkv_proj(hidden_jax)
+            qkv_jax = jax.lax.reshape(
+                qkv_jax,
+                (T, 3, _CF_H, _CF_K),
+                out_sharding=NamedSharding(mesh, P(None, None, "tensor", None)),
+            )
+            q_jax, k_jax = qkv_jax[:, 0], qkv_jax[:, 1]
+
+            # 2. Q/K RMSNorm
+            q_jax = module.q_norm(q_jax)
+            k_jax = module.k_norm(k_jax)
+
+            # 3. RoPE
+            q_jax, k_jax = module.rotary_emb(positions_jax, q_jax, k_jax)
+
+            # 4. Mock kernel: use dummy attn_output
+            attn_jax = jnp.array(dummy_attn_np)
+
+            # 5. Gating
+            g_jax, _ = module.g_proj(hidden_jax)
+            gate_jax = jax.nn.sigmoid(g_jax)
+            gated_jax = module.g_norm(attn_jax) * gate_jax
+
+            # 6. Dense
+            output_jax, _ = module.dense(gated_jax)
+
+        # --- Extract weights ---
+        qkv_w = jax_to_numpy(module.qkv_proj.weight.value)
+        q_norm_w = jax_to_numpy(module.q_norm.scale.value)
+        k_norm_w = jax_to_numpy(module.k_norm.scale.value)
+        g_proj_w = jax_to_numpy(module.g_proj.weight.value)
+        g_norm_w = jax_to_numpy(module.g_norm.weight.value)
+        dense_w = jax_to_numpy(module.dense.weight.value)
+
+        # --- PyTorch side: same steps ---
+        hidden_pt = torch.tensor(hidden_np)
+        positions_pt = torch.arange(T, dtype=torch.long)
+
+        # 1. QKV projection + reshape + split
+        qkv_pt = F.linear(hidden_pt, torch.tensor(qkv_w.T))
+        qkv_pt = qkv_pt.reshape(T, 3, _CF_H, _CF_K)
+        q_pt, k_pt = qkv_pt[:, 0], qkv_pt[:, 1]
+
+        # 2. Q/K RMSNorm
+        q_pt = torch_rmsnorm(q_pt, torch.tensor(q_norm_w), _CF_EPS)
+        k_pt = torch_rmsnorm(k_pt, torch.tensor(k_norm_w), _CF_EPS)
+
+        # 3. RoPE
+        q_pt, k_pt = torch_rope_neox(positions_pt, q_pt, k_pt, _CF_K, _CF_ROTARY_DIM, _CF_ROPE_THETA)
+
+        # 4. Mock kernel: same dummy
+        attn_pt = torch.tensor(dummy_attn_np)
+
+        # 5. Gating
+        g_pt = F.linear(hidden_pt, torch.tensor(g_proj_w.T))
+        gate_pt = torch.sigmoid(g_pt)
+        gated_pt = torch_group_rmsnorm(attn_pt, torch.tensor(g_norm_w), _CF_NUM_GROUPS, _CF_EPS) * gate_pt
+
+        # 6. Dense
+        output_pt = F.linear(gated_pt, torch.tensor(dense_w.T))
+
+        # --- Compare intermediates ---
+        np.testing.assert_allclose(
+            jax_to_numpy(q_jax), q_pt.numpy(), atol=_CF_MATMUL_ATOL, err_msg="Q after RoPE diverged"
+        )
+        np.testing.assert_allclose(
+            jax_to_numpy(k_jax), k_pt.numpy(), atol=_CF_MATMUL_ATOL, err_msg="K after RoPE diverged"
+        )
+
+        # --- Compare final output ---
+        np.testing.assert_allclose(
+            jax_to_numpy(output_jax),
+            output_pt.numpy(),
+            atol=_CF_MATMUL_ATOL,
+            err_msg="Final output diverged",
+        )
 
 
-_SMALL_CONFIG = _make_config(
-    hidden_size=512,
-    num_attention_heads=4,
-    head_dim=128,
-    num_hidden_layers=10,
-    partial_rotary_factor=0.5,
-    max_position_embeddings=1024,
-    rope_theta=10000,
-    group_norm_size=4,
-)
-
-_SMALL_H = 4
-_SMALL_K = 128
-_SMALL_HIDDEN = 512
+# ---------------------------------------------------------------------------
+# Forward pass tests (require simple_gla kernel)
+# ---------------------------------------------------------------------------
 
 
 class TestDecodeForward:
@@ -490,179 +930,6 @@ class TestPrefillForward:
 
 
 # ---------------------------------------------------------------------------
-# White-box tests (require simple_gla kernel)
-# ---------------------------------------------------------------------------
-
-
-class TestWhiteBox:
-    def test_qkv_projection_shape(self):
-        """QKV projection should produce [T, 3*H*head_dim]."""
-        config = _make_config(
-            hidden_size=256,
-            num_attention_heads=4,
-            head_dim=64,
-            num_hidden_layers=10,
-            partial_rotary_factor=0.5,
-            max_position_embeddings=1024,
-            rope_theta=10000,
-            group_norm_size=4,
-        )
-        backend = LightningAttnBackend(mesh=mesh)
-
-        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
-            module = BailingMoeV2_5LinearAttention(
-                config=config, layer_id=5, mesh=mesh, backend=backend
-            )
-            hidden = jax.random.normal(jax.random.PRNGKey(0), (4, 256), dtype=jnp.bfloat16)
-            qkv, _ = module.qkv_proj(hidden)
-
-        assert qkv.shape == (4, 3 * 4 * 64), f"Expected (4, 768), got {qkv.shape}"
-
-    def test_gating_values_in_range(self):
-        """Sigmoid gating values should be in [0, 1]."""
-        config = _make_config(
-            hidden_size=256,
-            num_attention_heads=4,
-            head_dim=64,
-            num_hidden_layers=10,
-            partial_rotary_factor=0.5,
-            max_position_embeddings=1024,
-            rope_theta=10000,
-            group_norm_size=4,
-        )
-        backend = LightningAttnBackend(mesh=mesh)
-
-        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
-            module = BailingMoeV2_5LinearAttention(
-                config=config, layer_id=5, mesh=mesh, backend=backend
-            )
-            hidden = jax.random.normal(jax.random.PRNGKey(0), (4, 256), dtype=jnp.bfloat16)
-            g, _ = module.g_proj(hidden)
-            gate = jax.nn.sigmoid(g)
-
-        assert jnp.all(gate >= 0) and jnp.all(gate <= 1), "Gate values out of [0,1]"
-
-    def test_v_skips_rmsnorm(self):
-        """V should NOT be modified by Q/K RMSNorm."""
-        H, K = 4, 64
-        config = _make_config(
-            hidden_size=256,
-            num_attention_heads=H,
-            head_dim=K,
-            num_hidden_layers=10,
-            partial_rotary_factor=0.5,
-            max_position_embeddings=1024,
-            rope_theta=10000,
-            group_norm_size=4,
-        )
-        backend = LightningAttnBackend(mesh=mesh)
-
-        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
-            module = BailingMoeV2_5LinearAttention(
-                config=config, layer_id=5, mesh=mesh, backend=backend
-            )
-            hidden = jax.random.normal(jax.random.PRNGKey(0), (4, 256), dtype=jnp.float32)
-
-            qkv, _ = module.qkv_proj(hidden)
-            qkv = _reshape_qkv(qkv, 4, H, K)
-            q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
-
-            if module.q_norm is not None:
-                q_normed = module.q_norm(q)
-                k_normed = module.k_norm(k)
-                # Q and K should be changed by RMSNorm (sanity check)
-                assert not jnp.allclose(q, q_normed), "Q should be modified by RMSNorm"
-                assert not jnp.allclose(k, k_normed), "K should be modified by RMSNorm"
-            # V is never passed through any norm — verify by applying q_norm to v
-            # and confirming the result differs (proving norm is non-trivial),
-            # then checking the module code never does this.
-            v_if_normed = module.q_norm(v)
-            assert not jnp.allclose(
-                v, v_if_normed
-            ), "RMSNorm should be non-trivial (test validity check)"
-
-    def test_rope_only_affects_first_rotary_dims(self):
-        """RoPE should only modify the first rope_dim dims; rest unchanged."""
-        H, K = 4, 64
-        config = _make_config(
-            hidden_size=256,
-            num_attention_heads=H,
-            head_dim=K,
-            num_hidden_layers=10,
-            partial_rotary_factor=0.5,
-            max_position_embeddings=1024,
-            rope_theta=10000,
-            group_norm_size=4,
-        )
-        rope_dim = int(K * 0.5)  # 32
-        backend = LightningAttnBackend(mesh=mesh)
-
-        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
-            module = BailingMoeV2_5LinearAttention(
-                config=config, layer_id=5, mesh=mesh, backend=backend
-            )
-            hidden = jax.random.normal(jax.random.PRNGKey(0), (4, 256), dtype=jnp.float32)
-
-            qkv, _ = module.qkv_proj(hidden)
-            qkv = _reshape_qkv(qkv, 4, H, K)
-            q_pre = qkv[:, 0]
-            k_pre = qkv[:, 1]
-
-            if module.q_norm is not None:
-                q_pre = module.q_norm(q_pre)
-                k_pre = module.k_norm(k_pre)
-
-            positions = jnp.arange(4, dtype=jnp.int32)
-            q_post, k_post = module.rotary_emb(positions, q_pre, k_pre)
-
-        # Non-rotary dims unchanged
-        np.testing.assert_array_equal(
-            np.array(q_pre[:, :, rope_dim:]),
-            np.array(q_post[:, :, rope_dim:]),
-            err_msg="Q dims after rope_dim should be unchanged by RoPE",
-        )
-        np.testing.assert_array_equal(
-            np.array(k_pre[:, :, rope_dim:]),
-            np.array(k_post[:, :, rope_dim:]),
-            err_msg="K dims after rope_dim should be unchanged by RoPE",
-        )
-        # Rotary dims actually changed (positions 1,2,3 are non-zero, so RoPE
-        # must rotate them; position 0 has cos=1/sin=0 which is identity)
-        assert not np.array_equal(
-            np.array(q_pre[1:, :, :rope_dim]),
-            np.array(q_post[1:, :, :rope_dim]),
-        ), "Q rotary dims should be changed by RoPE at non-zero positions"
-        assert not np.array_equal(
-            np.array(k_pre[1:, :, :rope_dim]),
-            np.array(k_post[1:, :, :rope_dim]),
-        ), "K rotary dims should be changed by RoPE at non-zero positions"
-
-    def test_dense_projection_changes_values(self):
-        """Dense projection should produce different values from its input."""
-        H, K = 4, 64
-        config = _make_config(
-            hidden_size=256,
-            num_attention_heads=H,
-            head_dim=K,
-            num_hidden_layers=10,
-            partial_rotary_factor=0.5,
-            max_position_embeddings=1024,
-            rope_theta=10000,
-            group_norm_size=4,
-        )
-        backend = LightningAttnBackend(mesh=mesh)
-
-        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
-            module = BailingMoeV2_5LinearAttention(
-                config=config, layer_id=5, mesh=mesh, backend=backend
-            )
-            x = jax.random.normal(jax.random.PRNGKey(0), (4, H * K), dtype=jnp.bfloat16)
-            y, _ = module.dense(x)
-
-        assert not jnp.allclose(x, y), "Dense projection should change values"
-
-
-# ---------------------------------------------------------------------------
 # Multi-request isolation tests (require simple_gla kernel)
 # ---------------------------------------------------------------------------
 
@@ -714,13 +981,13 @@ class TestMultiRequestIsolation:
             out_both, pu_both = module(positions_both, hidden_both, fb, pool_both)
             s_both = _extract_state(pu_both, rec_both)
 
-        # fused_recurrent_simple_gla uses jax.lax.scan — no cross-batch
+        # fused_recurrent_simple_gla uses jax.lax.scan --- no cross-batch
         # interaction, so B=1 vs B=2 results are mathematically identical.
         # However, XLA generates different tiling for [1,H,K,V] vs [2,H,K,V],
         # causing different bf16 accumulation order in the outer product
         # k[:,:,:,None] * v[:,:,None,:].  Over T timesteps this accumulates
         # to ~0.25 max_diff on v6e-1.  Same root cause as prefill dense
-        # matmul tiling divergence — not a kernel bug.
+        # matmul tiling divergence --- not a kernel bug.
         np.testing.assert_allclose(
             np.array(out_both[0]),
             np.array(out1[0]),
@@ -815,7 +1082,7 @@ class TestMultiRequestIsolation:
 
         # Output tolerance: TPU bf16 matmul uses different tiling strategies for
         # different matrix dimensions.  Single-request (T=128) vs batched (T=256)
-        # triggers different XLA tiling → different bf16 accumulation order →
+        # triggers different XLA tiling -> different bf16 accumulation order ->
         # non-associative rounding.  Diagnostic script (debug_prefill_tp4_isolation.py)
         # confirmed all intermediate values (q/k/v, scatter, kernel, gather, gated)
         # are identical; only dense matmul output diverges.  Observed max_diff=0.5
@@ -1028,7 +1295,180 @@ class TestMultiRequestIsolation:
 
 
 # ---------------------------------------------------------------------------
-# GLA wrapper numerical verification (design doc §6)
+# White-box tests (require simple_gla kernel)
+# ---------------------------------------------------------------------------
+
+
+class TestWhiteBox:
+    def test_qkv_projection_shape(self):
+        """QKV projection should produce [T, 3*H*head_dim]."""
+        config = _make_config(
+            hidden_size=256,
+            num_attention_heads=4,
+            head_dim=64,
+            num_hidden_layers=10,
+            partial_rotary_factor=0.5,
+            max_position_embeddings=1024,
+            rope_theta=10000,
+            group_norm_size=4,
+        )
+        backend = LightningAttnBackend(mesh=mesh)
+
+        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
+            module = BailingMoeV2_5LinearAttention(
+                config=config, layer_id=5, mesh=mesh, backend=backend
+            )
+            hidden = jax.random.normal(jax.random.PRNGKey(0), (4, 256), dtype=jnp.bfloat16)
+            qkv, _ = module.qkv_proj(hidden)
+
+        assert qkv.shape == (4, 3 * 4 * 64), f"Expected (4, 768), got {qkv.shape}"
+
+    def test_gating_values_in_range(self):
+        """Sigmoid gating values should be in [0, 1]."""
+        config = _make_config(
+            hidden_size=256,
+            num_attention_heads=4,
+            head_dim=64,
+            num_hidden_layers=10,
+            partial_rotary_factor=0.5,
+            max_position_embeddings=1024,
+            rope_theta=10000,
+            group_norm_size=4,
+        )
+        backend = LightningAttnBackend(mesh=mesh)
+
+        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
+            module = BailingMoeV2_5LinearAttention(
+                config=config, layer_id=5, mesh=mesh, backend=backend
+            )
+            hidden = jax.random.normal(jax.random.PRNGKey(0), (4, 256), dtype=jnp.bfloat16)
+            g, _ = module.g_proj(hidden)
+            gate = jax.nn.sigmoid(g)
+
+        assert jnp.all(gate >= 0) and jnp.all(gate <= 1), "Gate values out of [0,1]"
+
+    def test_v_skips_rmsnorm(self):
+        """V should NOT be modified by Q/K RMSNorm."""
+        H, K = 4, 64
+        config = _make_config(
+            hidden_size=256,
+            num_attention_heads=H,
+            head_dim=K,
+            num_hidden_layers=10,
+            partial_rotary_factor=0.5,
+            max_position_embeddings=1024,
+            rope_theta=10000,
+            group_norm_size=4,
+        )
+        backend = LightningAttnBackend(mesh=mesh)
+
+        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
+            module = BailingMoeV2_5LinearAttention(
+                config=config, layer_id=5, mesh=mesh, backend=backend
+            )
+            hidden = jax.random.normal(jax.random.PRNGKey(0), (4, 256), dtype=jnp.float32)
+
+            qkv, _ = module.qkv_proj(hidden)
+            qkv = _reshape_qkv(qkv, 4, H, K)
+            q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+
+            if module.q_norm is not None:
+                q_normed = module.q_norm(q)
+                k_normed = module.k_norm(k)
+                # Q and K should be changed by RMSNorm (sanity check)
+                assert not jnp.allclose(q, q_normed), "Q should be modified by RMSNorm"
+                assert not jnp.allclose(k, k_normed), "K should be modified by RMSNorm"
+            # V is never passed through any norm --- verify by applying q_norm to v
+            # and confirming the result differs (proving norm is non-trivial),
+            # then checking the module code never does this.
+            v_if_normed = module.q_norm(v)
+            assert not jnp.allclose(
+                v, v_if_normed
+            ), "RMSNorm should be non-trivial (test validity check)"
+
+    def test_rope_only_affects_first_rotary_dims(self):
+        """RoPE should only modify the first rope_dim dims; rest unchanged."""
+        H, K = 4, 64
+        config = _make_config(
+            hidden_size=256,
+            num_attention_heads=H,
+            head_dim=K,
+            num_hidden_layers=10,
+            partial_rotary_factor=0.5,
+            max_position_embeddings=1024,
+            rope_theta=10000,
+            group_norm_size=4,
+        )
+        rope_dim = int(K * 0.5)  # 32
+        backend = LightningAttnBackend(mesh=mesh)
+
+        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
+            module = BailingMoeV2_5LinearAttention(
+                config=config, layer_id=5, mesh=mesh, backend=backend
+            )
+            hidden = jax.random.normal(jax.random.PRNGKey(0), (4, 256), dtype=jnp.float32)
+
+            qkv, _ = module.qkv_proj(hidden)
+            qkv = _reshape_qkv(qkv, 4, H, K)
+            q_pre = qkv[:, 0]
+            k_pre = qkv[:, 1]
+
+            if module.q_norm is not None:
+                q_pre = module.q_norm(q_pre)
+                k_pre = module.k_norm(k_pre)
+
+            positions = jnp.arange(4, dtype=jnp.int32)
+            q_post, k_post = module.rotary_emb(positions, q_pre, k_pre)
+
+        # Non-rotary dims unchanged
+        np.testing.assert_array_equal(
+            np.array(q_pre[:, :, rope_dim:]),
+            np.array(q_post[:, :, rope_dim:]),
+            err_msg="Q dims after rope_dim should be unchanged by RoPE",
+        )
+        np.testing.assert_array_equal(
+            np.array(k_pre[:, :, rope_dim:]),
+            np.array(k_post[:, :, rope_dim:]),
+            err_msg="K dims after rope_dim should be unchanged by RoPE",
+        )
+        # Rotary dims actually changed (positions 1,2,3 are non-zero, so RoPE
+        # must rotate them; position 0 has cos=1/sin=0 which is identity)
+        assert not np.array_equal(
+            np.array(q_pre[1:, :, :rope_dim]),
+            np.array(q_post[1:, :, :rope_dim]),
+        ), "Q rotary dims should be changed by RoPE at non-zero positions"
+        assert not np.array_equal(
+            np.array(k_pre[1:, :, :rope_dim]),
+            np.array(k_post[1:, :, :rope_dim]),
+        ), "K rotary dims should be changed by RoPE at non-zero positions"
+
+    def test_dense_projection_changes_values(self):
+        """Dense projection should produce different values from its input."""
+        H, K = 4, 64
+        config = _make_config(
+            hidden_size=256,
+            num_attention_heads=H,
+            head_dim=K,
+            num_hidden_layers=10,
+            partial_rotary_factor=0.5,
+            max_position_embeddings=1024,
+            rope_theta=10000,
+            group_norm_size=4,
+        )
+        backend = LightningAttnBackend(mesh=mesh)
+
+        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
+            module = BailingMoeV2_5LinearAttention(
+                config=config, layer_id=5, mesh=mesh, backend=backend
+            )
+            x = jax.random.normal(jax.random.PRNGKey(0), (4, H * K), dtype=jnp.bfloat16)
+            y, _ = module.dense(x)
+
+        assert not jnp.allclose(x, y), "Dense projection should change values"
+
+
+# ---------------------------------------------------------------------------
+# GLA wrapper numerical verification (design doc section 6)
 # ---------------------------------------------------------------------------
 
 
@@ -1273,14 +1713,199 @@ class TestGLAWrapper:
 
 
 # ---------------------------------------------------------------------------
-# TP consistency tests (design doc §6: TP=2 vs TP=1 numerical match)
+# Scale behavior verification (cross-framework)
 # ---------------------------------------------------------------------------
 
-# Skip if fewer than 2 devices (CPU has only 1)
-_HAS_MULTI_DEVICE = len(jax.devices()) >= 2
-requires_multi_device = pytest.mark.skipif(
-    not _HAS_MULTI_DEVICE, reason="Need >= 2 devices for TP consistency test"
-)
+
+@requires_simple_gla
+class TestScaleBehavior:
+    def test_scale_none_matches_explicit(self):
+        """fused_recurrent_simple_gla: scale=None should equal scale=K^-0.5."""
+        H, K = 4, 64
+        rng = np.random.default_rng(200)
+        q = jnp.array(rng.standard_normal((2, 1, H, K)).astype(np.float32))
+        k = jnp.array(rng.standard_normal((2, 1, H, K)).astype(np.float32))
+        v = jnp.array(rng.standard_normal((2, 1, H, K)).astype(np.float32))
+        g_gamma = jnp.array([-0.1, -0.2, -0.15, -0.25], dtype=jnp.float32)
+        state = jnp.zeros((2, H, K, K), dtype=jnp.float32)
+
+        out_none, s_none = fused_recurrent_simple_gla(
+            q, k, v, g_gamma=g_gamma, initial_state=state, output_final_state=True, scale=None
+        )
+        out_explicit, s_explicit = fused_recurrent_simple_gla(
+            q,
+            k,
+            v,
+            g_gamma=g_gamma,
+            initial_state=state,
+            output_final_state=True,
+            scale=K**-0.5,
+        )
+
+        np.testing.assert_allclose(
+            jax_to_numpy(out_none), jax_to_numpy(out_explicit), atol=1e-6, err_msg="Output differs"
+        )
+        np.testing.assert_allclose(
+            jax_to_numpy(s_none), jax_to_numpy(s_explicit), atol=1e-6, err_msg="State differs"
+        )
+
+
+# ---------------------------------------------------------------------------
+# GLA recurrence: kernel vs pure-numpy reference (cross-framework)
+# ---------------------------------------------------------------------------
+
+
+@requires_simple_gla
+class TestGLARecurrenceReference:
+    def test_decode_matches_numpy_reference(self):
+        """fused_recurrent_simple_gla output matches pure-numpy GLA recurrence."""
+        B, T, H, K = 2, 16, 4, 32
+        rng = np.random.default_rng(300)
+        q_np = rng.standard_normal((B, T, H, K)).astype(np.float32)
+        k_np = rng.standard_normal((B, T, H, K)).astype(np.float32)
+        v_np = rng.standard_normal((B, T, H, K)).astype(np.float32)
+        h0_np = rng.standard_normal((B, H, K, K)).astype(np.float32) * 0.1
+        g_gamma_np = np.array([-0.1, -0.2, -0.05, -0.15], dtype=np.float32)
+
+        # Numpy reference (float64 internally)
+        out_ref, state_ref = numpy_gla_recurrent(q_np, k_np, v_np, g_gamma_np, h0=h0_np)
+
+        # JAX kernel
+        out_jax, state_jax = fused_recurrent_simple_gla(
+            jnp.array(q_np),
+            jnp.array(k_np),
+            jnp.array(v_np),
+            g_gamma=jnp.array(g_gamma_np),
+            initial_state=jnp.array(h0_np),
+            output_final_state=True,
+            scale=None,
+        )
+
+        np.testing.assert_allclose(
+            jax_to_numpy(out_jax),
+            out_ref,
+            atol=1e-4,
+            rtol=1e-4,
+            err_msg="Decode kernel output diverges from numpy GLA reference",
+        )
+        np.testing.assert_allclose(
+            jax_to_numpy(state_jax),
+            state_ref,
+            atol=1e-4,
+            rtol=1e-4,
+            err_msg="Decode kernel final state diverges from numpy GLA reference",
+        )
+
+    @requires_simple_gla
+    @requires_tpu
+    def test_prefill_matches_numpy_reference(self):
+        """simple_gla_fwd (chunk kernel) output matches pure-numpy GLA recurrence.
+
+        Single sequence, no packing --- directly comparable to numpy reference.
+        """
+        T, H, K = 64, 4, 128  # K must be multiple of 128 (kernel constraint)
+        B = 1
+        rng = np.random.default_rng(301)
+        q_np = rng.standard_normal((B, T, H, K)).astype(np.float32)
+        k_np = rng.standard_normal((B, T, H, K)).astype(np.float32)
+        v_np = rng.standard_normal((B, T, H, K)).astype(np.float32)
+        h0_np = rng.standard_normal((B, H, K, K)).astype(np.float32) * 0.1
+        g_gamma_np = np.array([-0.1, -0.2, -0.05, -0.15], dtype=np.float32)
+
+        # Numpy reference (float64 internally)
+        out_ref, state_ref = numpy_gla_recurrent(q_np, k_np, v_np, g_gamma_np, h0=h0_np)
+
+        # Chunk kernel expects: q/k/v [1, T, H, K], cu_seqlens [2]
+        cu_seqlens = jnp.array([0, T], dtype=jnp.int32)
+        out_jax, state_jax = simple_gla_fwd(
+            jnp.array(q_np),
+            jnp.array(k_np),
+            jnp.array(v_np),
+            g_gamma=jnp.array(g_gamma_np),
+            h0=jnp.array(h0_np),
+            cu_seqlens_dev=cu_seqlens,
+            scale=None,
+            use_ht=True,
+            chunk_size=64,
+        )
+
+        # Chunk kernel uses different reduction order; allow wider tolerance
+        np.testing.assert_allclose(
+            jax_to_numpy(out_jax).reshape(B, T, H, K),
+            out_ref,
+            atol=5e-2,
+            rtol=1e-2,
+            err_msg="Prefill kernel output diverges from numpy GLA reference",
+        )
+        np.testing.assert_allclose(
+            jax_to_numpy(state_jax),
+            state_ref,
+            atol=5e-2,
+            rtol=1e-2,
+            err_msg="Prefill kernel final state diverges from numpy GLA reference",
+        )
+
+    @requires_simple_gla
+    @requires_tpu
+    def test_prefill_non_aligned_matches_numpy_reference(self):
+        """simple_gla_fwd with non-chunk-aligned seq_len (zero-padded to chunk boundary).
+
+        Verifies that scatter/padding -> kernel -> state produces results consistent
+        with numpy recurrence over the same zero-padded input.
+        """
+        T_real = 100  # non-aligned
+        CHUNK = 64
+        T_padded = ((T_real + CHUNK - 1) // CHUNK) * CHUNK  # 128
+        H, K = 4, 128
+        B = 1
+        rng = np.random.default_rng(302)
+
+        # Generate real tokens, then zero-pad to chunk-aligned length
+        q_real = rng.standard_normal((B, T_real, H, K)).astype(np.float32)
+        k_real = rng.standard_normal((B, T_real, H, K)).astype(np.float32)
+        v_real = rng.standard_normal((B, T_real, H, K)).astype(np.float32)
+
+        q_padded = np.zeros((B, T_padded, H, K), dtype=np.float32)
+        k_padded = np.zeros((B, T_padded, H, K), dtype=np.float32)
+        v_padded = np.zeros((B, T_padded, H, K), dtype=np.float32)
+        q_padded[:, :T_real] = q_real
+        k_padded[:, :T_real] = k_real
+        v_padded[:, :T_real] = v_real
+
+        h0_np = rng.standard_normal((B, H, K, K)).astype(np.float32) * 0.1
+        g_gamma_np = np.array([-0.1, -0.2, -0.05, -0.15], dtype=np.float32)
+
+        # Numpy reference: recurrence over T_padded (including zero-padded positions)
+        _, state_ref_padded = numpy_gla_recurrent(
+            q_padded, k_padded, v_padded, g_gamma_np, h0=h0_np
+        )
+
+        # Kernel with cu_seqlens set to padded length (as our LinearAttentionBackend does)
+        cu_seqlens = jnp.array([0, T_padded], dtype=jnp.int32)
+        _, state_jax = simple_gla_fwd(
+            jnp.array(q_padded),
+            jnp.array(k_padded),
+            jnp.array(v_padded),
+            g_gamma=jnp.array(g_gamma_np),
+            h0=jnp.array(h0_np),
+            cu_seqlens_dev=cu_seqlens,
+            scale=None,
+            use_ht=True,
+            chunk_size=CHUNK,
+        )
+
+        np.testing.assert_allclose(
+            jax_to_numpy(state_jax),
+            state_ref_padded,
+            atol=5e-2,
+            rtol=1e-2,
+            err_msg="Kernel state diverges from numpy reference (non-aligned T=100, padded T=128)",
+        )
+
+
+# ---------------------------------------------------------------------------
+# TP consistency tests (design doc section 6: TP=2 vs TP=1 numerical match)
+# ---------------------------------------------------------------------------
 
 
 def _make_tp_meshes():
@@ -1342,7 +1967,7 @@ def _copy_weights_across_meshes(target_module, source_module):
 
 
 class TestTPConsistency:
-    """Verify TP>1 produces same results as TP=1 (design doc §6).
+    """Verify TP>1 produces same results as TP=1 (design doc section 6).
 
     Weight transfer via _copy_weights_across_meshes: extract TP=1 weight
     values as numpy, then place on the TP=N mesh using TP=N's sharding.
@@ -1350,7 +1975,7 @@ class TestTPConsistency:
     path, not weight sharding correctness (which is the weight
     loader's responsibility).
 
-    Design doc §6 specifies atol < 1e-5. With bf16, row-parallel dense does
+    Design doc section 6 specifies atol < 1e-5. With bf16, row-parallel dense does
     local matmul + all-reduce sum whose addition order differs from TP=1,
     potentially causing bf16 rounding beyond 1e-5. If TPU tests flake at 1e-5,
     relax to 1e-2 for bf16 (matching design doc cross-framework bf16 tolerance).
