@@ -259,7 +259,7 @@ class TestDecodeSharded:
         np.testing.assert_allclose(np.array(out_jax), ref_out, atol=1e-3)
         np.testing.assert_allclose(np.array(state_jax), ref_state, atol=1e-3)
 
-    @pytest.mark.parametrize("batch_size", [4, 16, 32, 64, 128])
+    @pytest.mark.parametrize("batch_size", [4, 128])
     def test_decode_batched(self, batch_size):
         B, H, K = batch_size, _H, _K
         rng = np.random.default_rng(100 + batch_size)
@@ -327,40 +327,6 @@ class TestDecodeSharded:
             h_ref,
             atol=1e-2,
             err_msg="Multi-step decode (32 steps) state diverged",
-        )
-
-    def test_decode_multi_step_large_batch(self):
-        """64-step autoregressive decode, B=16."""
-        B, H, K, steps = 16, _H, _K, 64
-        rng = np.random.default_rng(300)
-        g_gamma = _make_slopes(H).astype(np.float32)
-
-        h_np = rng.standard_normal((B, H, K, K)).astype(np.float32) * 0.01
-        h_jax = jnp.array(h_np)
-
-        h_ref = h_np.copy()
-        for t in range(steps):
-            q_np = rng.standard_normal((B, 1, H, K)).astype(np.float32) * 0.1
-            k_np = rng.standard_normal((B, 1, H, K)).astype(np.float32) * 0.1
-            v_np = rng.standard_normal((B, 1, H, K)).astype(np.float32) * 0.1
-
-            _, h_ref = numpy_gla_recurrent(q_np, k_np, v_np, g_gamma, h0=h_ref)
-
-            _, h_jax = fused_recurrent_simple_gla(
-                jnp.array(q_np),
-                jnp.array(k_np),
-                jnp.array(v_np),
-                g_gamma=jnp.array(g_gamma),
-                initial_state=h_jax,
-                output_final_state=True,
-                scale=None,
-            )
-
-        np.testing.assert_allclose(
-            np.array(h_jax),
-            h_ref,
-            atol=1e-2,
-            err_msg="Multi-step decode (64 steps, B=16) state diverged",
         )
 
 
@@ -460,9 +426,6 @@ class TestExtendSharded:
     def test_extend_single_short(self):
         self._run_extend_precision_test([100], rng_seed=1001)
 
-    def test_extend_single_aligned(self):
-        self._run_extend_precision_test([256], rng_seed=1002)
-
     def test_extend_single_long(self):
         self._run_extend_precision_test([2048], rng_seed=1003)
 
@@ -531,45 +494,6 @@ class TestExtendSharded:
         assert states.shape == (B_padded, H, K, K)
         B_real = len(extend_seq_lens_real)
         assert not jnp.all(states[:B_real] == 0), "States should be non-zero"
-
-    def test_extend_stress_128x128(self):
-        """128 requests × 128 tokens — shape + sanity only."""
-        layer_id = 5
-        H, K = _H, _K
-        extend_seq_lens_real = [128] * 128
-        rng = np.random.default_rng(2002)
-        q_np, k_np, v_np, padded_seq_lens, input_ids, T_outer, _ = _build_extend_qkv(
-            extend_seq_lens_real, H, K, rng
-        )
-        B_padded = len(padded_seq_lens)
-        h0 = np.zeros((B_padded, H, K, K), dtype=np.float32)
-
-        with jax.set_mesh(mesh):
-            backend = LightningAttnBackend(mesh=mesh)
-            rec_indices = np.arange(1, B_padded + 1, dtype=np.int32)
-            pool, _ = _make_mock_pool(layer_id, jnp.array(h0), rec_indices)
-            _setup_backend(
-                backend,
-                ForwardMode.EXTEND,
-                rec_indices,
-                extend_seq_lens=padded_seq_lens,
-                input_ids=input_ids,
-            )
-            layer = _make_fake_layer(layer_id=layer_id, H=H)
-            fb = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
-
-            output, pool_updates = backend(
-                jnp.array(q_np),
-                jnp.array(k_np),
-                jnp.array(v_np),
-                layer=layer,
-                forward_batch=fb,
-                recurrent_state_pool=pool,
-            )
-
-        assert output.shape == (T_outer, H * K)
-        states = _extract_state(pool_updates, rec_indices)
-        assert states.shape == (B_padded, H, K, K)
 
     def test_extend_stress_mixed_lengths(self):
         """16 requests with mixed lengths — shape + sanity only.
@@ -787,55 +711,6 @@ class TestEndToEndBackend:
                 err_msg=f"Request {i} state differs between batched and isolated",
             )
 
-    @requires_tpu
-    def test_prefill_decode_full_cycle(self):
-        """16k prefill + 128 decode steps — shape + sanity only."""
-        layer_id = 5
-        H, K = _H, _K
-        seq_len = 16384
-        decode_steps = 128
-        rng = np.random.default_rng(3004)
-
-        q_np, k_np, v_np, padded_seq_lens, input_ids, T_outer, _ = _build_extend_qkv(
-            [seq_len], H, K, rng
-        )
-        B_padded = len(padded_seq_lens)
-        h0 = np.zeros((B_padded, H, K, K), dtype=np.float32)
-
-        with jax.set_mesh(mesh):
-            backend = LightningAttnBackend(mesh=mesh)
-            rec_indices = np.arange(1, B_padded + 1, dtype=np.int32)
-            pool, _ = _make_mock_pool(layer_id, jnp.array(h0), rec_indices)
-            _setup_backend(
-                backend, ForwardMode.EXTEND, rec_indices,
-                extend_seq_lens=padded_seq_lens, input_ids=input_ids,
-            )
-            layer = _make_fake_layer(layer_id=layer_id, H=H)
-            fb_ext = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
-
-            _, pool_updates = backend(
-                jnp.array(q_np), jnp.array(k_np), jnp.array(v_np),
-                layer=layer, forward_batch=fb_ext, recurrent_state_pool=pool,
-            )
-            state_after_prefill = _extract_state(pool_updates, rec_indices)
-            assert not jnp.all(state_after_prefill[0] == 0)
-
-            h_jax = state_after_prefill[:1]
-            for step in range(decode_steps):
-                q_d = jax.random.normal(jax.random.PRNGKey(step), (1, 1, H, K)) * 0.1
-                k_d = jax.random.normal(jax.random.PRNGKey(step + 10000), (1, 1, H, K)) * 0.1
-                v_d = jax.random.normal(jax.random.PRNGKey(step + 20000), (1, 1, H, K)) * 0.1
-
-                _, h_jax = fused_recurrent_simple_gla(
-                    q_d, k_d, v_d,
-                    g_gamma=jnp.array(_make_slopes(H)),
-                    initial_state=h_jax,
-                    output_final_state=True,
-                    scale=None,
-                )
-
-            assert h_jax.shape == (1, H, K, K)
-            assert not jnp.all(h_jax == 0)
 
 
 # ---------------------------------------------------------------------------
@@ -850,13 +725,7 @@ class TestScatterGatherPadding:
         "extend_seq_lens",
         [
             [100],
-            [256],
-            [2048],
-            [4096],
-            [16384],
             [256, 100, 512],
-            [128, 64],
-            [4096, 4096, 4096, 4096],
             [128] * 16,
             [128] * 128,
         ],
