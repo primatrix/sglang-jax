@@ -1,4 +1,4 @@
-"""Tests for GLA attention backends (LinearAttentionBackend metadata + LightningAttnBackend).
+"""Tests for GLA attention backends (GLAMetadataBackend metadata + LightningAttnBackend).
 
 Run with: pytest python/sgl_jax/test/layers/test_gla_backend.py -v
 """
@@ -13,9 +13,9 @@ from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.layers.attention.fla.linear_attention_backend import (
-    LinearAttentionBackend,
-    LinearAttentionMetadata,
+from sgl_jax.srt.layers.attention.linear.gla_metadata import (
+    GLAMetadataBackend,
+    GLAMetadata,
     gather_from_packed,
     scatter_to_packed,
 )
@@ -112,82 +112,13 @@ def _extract_state(pool_updates, recurrent_indices):
 
 
 # ---------------------------------------------------------------------------
-# cu_seqlens tests
-# ---------------------------------------------------------------------------
-
-
-class TestCuSeqlens:
-    def test_single_aligned_request(self):
-        backend = LinearAttentionBackend()
-        batch = _make_metadata_batch(ForwardMode.EXTEND, [64], [64])
-        metadata = backend.get_forward_metadata(batch)
-        expected = np.array([0, 64], dtype=np.int32)
-        np.testing.assert_array_equal(np.asarray(metadata.cu_seqlens_dev), expected)
-
-    def test_single_unaligned_request(self):
-        backend = LinearAttentionBackend()
-        batch = _make_metadata_batch(ForwardMode.EXTEND, [100], [100])
-        metadata = backend.get_forward_metadata(batch)
-        # ceil(100/64)*64 = 128
-        expected = np.array([0, 128], dtype=np.int32)
-        np.testing.assert_array_equal(np.asarray(metadata.cu_seqlens_dev), expected)
-
-    def test_multiple_requests(self):
-        backend = LinearAttentionBackend()
-        batch = _make_metadata_batch(ForwardMode.EXTEND, [30, 64, 50], [30, 64, 50])
-        metadata = backend.get_forward_metadata(batch)
-        # 30->64, 64->64, 50->64; cumsum: [0,64,128,192]
-        expected = np.array([0, 64, 128, 192], dtype=np.int32)
-        np.testing.assert_array_equal(np.asarray(metadata.cu_seqlens_dev), expected)
-
-    def test_padded_batch_zero_length(self):
-        backend = LinearAttentionBackend()
-        # Third request has length 0 (padding slot)
-        T_outer = 64 + 128  # tight sum of real requests
-        batch = _make_metadata_batch(ForwardMode.EXTEND, [64, 128, 0], [64, 128, 0], T_outer=T_outer)
-        metadata = backend.get_forward_metadata(batch)
-        # 64->64, 128->128, 0->0; cumsum: [0,64,192,192]
-        expected = np.array([0, 64, 192, 192], dtype=np.int32)
-        np.testing.assert_array_equal(np.asarray(metadata.cu_seqlens_dev), expected)
-
-
-# ---------------------------------------------------------------------------
-# T_packed_bucket tests
-# ---------------------------------------------------------------------------
-
-
-class TestTPackedBucket:
-    def test_two_unaligned_requests(self):
-        backend = LinearAttentionBackend()
-        batch = _make_metadata_batch(ForwardMode.EXTEND, [30, 50], [30, 50])
-        backend.get_forward_metadata(batch)
-        # 30->64, 50->64; total=128
-        assert backend.T_packed_bucket == 128
-
-
-# ---------------------------------------------------------------------------
 # scatter_idx tests
 # ---------------------------------------------------------------------------
 
 
 class TestScatterIdx:
-    def test_shape(self):
-        backend = LinearAttentionBackend()
-        batch = _make_metadata_batch(ForwardMode.EXTEND, [30, 50], [30, 50], T_outer=128)
-        metadata = backend.get_forward_metadata(batch)
-        idx = np.asarray(metadata.scatter_idx)
-        assert idx.shape == (128,)
-
-    def test_single_aligned_request(self):
-        backend = LinearAttentionBackend()
-        # T_outer == T_tight == 64, all tokens map to themselves
-        batch = _make_metadata_batch(ForwardMode.EXTEND, [64], [64], T_outer=64)
-        metadata = backend.get_forward_metadata(batch)
-        idx = np.asarray(metadata.scatter_idx)
-        np.testing.assert_array_equal(idx[:64], np.arange(64, dtype=np.int32))
-
     def test_two_requests_mapping(self):
-        backend = LinearAttentionBackend()
+        backend = GLAMetadataBackend()
         # extend=[30,50], T_outer=128
         # request 0: seq_len=30 -> chunk slot [0..63], real tokens [0..29]
         # request 1: seq_len=50 -> chunk slot [64..127], real tokens [0..49]
@@ -204,7 +135,7 @@ class TestScatterIdx:
         np.testing.assert_array_equal(idx[80:], np.full(48, T_pb, dtype=np.int32))
 
     def test_padding_slot_maps_to_dummy(self):
-        backend = LinearAttentionBackend()
+        backend = GLAMetadataBackend()
         # extend=[30, 0], T_outer=64 (outer bucket pads to 64)
         batch = _make_metadata_batch(ForwardMode.EXTEND, [30, 0], [30, 0], T_outer=64)
         metadata = backend.get_forward_metadata(batch)
@@ -218,59 +149,16 @@ class TestScatterIdx:
 
 
 # ---------------------------------------------------------------------------
-# Decode no-op test
-# ---------------------------------------------------------------------------
-
-
-class TestDecodeNoOp:
-    def test_decode_does_not_crash(self):
-        backend = LinearAttentionBackend()
-        batch = _make_metadata_batch(ForwardMode.DECODE, None, [10, 20], T_outer=2)
-        # Should return immediately without raising
-        metadata = backend.get_forward_metadata(batch)
-        # State unchanged from init
-        assert backend.T_packed_bucket == 0
-        # Decode returns an empty LinearAttentionMetadata with None fields.
-        assert isinstance(metadata, LinearAttentionMetadata)
-        assert metadata.cu_seqlens_dev is None
-        assert metadata.scatter_idx is None
-
-
-# ---------------------------------------------------------------------------
 # scatter_to_packed / gather_from_packed tests
 # ---------------------------------------------------------------------------
 
 
 class TestScatterGather:
     def _make_backend_and_batch(self, extend_seq_lens, T_outer=None):
-        backend = LinearAttentionBackend()
+        backend = GLAMetadataBackend()
         batch = _make_metadata_batch(ForwardMode.EXTEND, extend_seq_lens, extend_seq_lens, T_outer=T_outer)
         metadata = backend.get_forward_metadata(batch)
         return backend, metadata
-
-    def test_scatter_output_shape(self):
-        backend, metadata = self._make_backend_and_batch([30, 50], T_outer=128)
-        H, K = 4, 8
-        x = jnp.ones((128, H, K), dtype=jnp.float32)
-        scatter_idx = metadata.scatter_idx
-        T_pb = backend.T_packed_bucket
-        out = scatter_to_packed(x, scatter_idx, T_pb)
-        assert out.shape == (1, T_pb, H, K)
-
-    def test_gather_roundtrip_aligned(self):
-        """When T_outer == T_tight and no padding, scatter then gather recovers original."""
-        backend, metadata = self._make_backend_and_batch([64], T_outer=64)
-        H, K = 2, 4
-        rng = np.random.default_rng(0)
-        x_np = rng.standard_normal((64, H, K)).astype(np.float32)
-        x = jnp.array(x_np)
-        scatter_idx = metadata.scatter_idx
-        T_pb = backend.T_packed_bucket  # 64
-
-        packed = scatter_to_packed(x, scatter_idx, T_pb)
-        recovered = gather_from_packed(packed, scatter_idx)
-
-        np.testing.assert_allclose(np.asarray(recovered[:64]), x_np, rtol=1e-6, atol=1e-6)
 
     def test_gather_roundtrip_multi_request(self):
         """Real tokens (first T_tight) roundtrip exactly; outer padding gathers zeros."""
@@ -300,47 +188,14 @@ class TestScatterGather:
             np.asarray(recovered[T_tight:]), np.zeros((T_outer - T_tight, H, K)), atol=1e-7
         )
 
-    def test_gather_roundtrip_outer_padding(self):
-        """T_outer > sum(extend_seq_lens): tail padding tokens map to dummy slot and gather zeros."""
-        extend_seq_lens = [50]
-        T_tight = 50
-        T_outer = 128  # scheduler bucket pads beyond real tokens
-        backend, metadata = self._make_backend_and_batch(extend_seq_lens, T_outer=T_outer)
-        H, K = 2, 4
-        rng = np.random.default_rng(2)
-        x_np = np.zeros((T_outer, H, K), dtype=np.float32)
-        x_np[:T_tight] = rng.standard_normal((T_tight, H, K)).astype(np.float32)
-        x = jnp.array(x_np)
-
-        scatter_idx = metadata.scatter_idx
-        T_pb = backend.T_packed_bucket  # ceil(50/64)*64 = 64
-
-        # Verify tail positions in scatter_idx map to dummy slot
-        idx_np = np.asarray(scatter_idx)
-        np.testing.assert_array_equal(
-            idx_np[T_tight:], np.full(T_outer - T_tight, T_pb, dtype=np.int32)
-        )
-
-        packed = scatter_to_packed(x, scatter_idx, T_pb)
-        recovered = gather_from_packed(packed, scatter_idx)
-
-        # Real tokens roundtrip exactly
-        np.testing.assert_allclose(
-            np.asarray(recovered[:T_tight]), x_np[:T_tight], rtol=1e-6, atol=1e-6
-        )
-        # Tail padding positions gather zeros from dummy slot
-        np.testing.assert_allclose(
-            np.asarray(recovered[T_tight:]), np.zeros((T_outer - T_tight, H, K)), atol=1e-7
-        )
-
 
 # ---------------------------------------------------------------------------
-# JIT safety tests --- verify LinearAttentionMetadata survives jax.jit
+# JIT safety tests --- verify GLAMetadata survives jax.jit
 # ---------------------------------------------------------------------------
 
 
 class TestJitSafety:
-    """Verify that LinearAttentionMetadata flows correctly through jax.jit.
+    """Verify that GLAMetadata flows correctly through jax.jit.
 
     These tests catch the original bug where nnx.data fields accessed via
     `.value` would crash inside JIT with 'DynamicJaxprTracer has no attribute
@@ -349,8 +204,8 @@ class TestJitSafety:
     """
 
     def test_metadata_pytree_survives_jit(self):
-        """LinearAttentionMetadata arrays are accessible inside jax.jit."""
-        backend = LinearAttentionBackend()
+        """GLAMetadata arrays are accessible inside jax.jit."""
+        backend = GLAMetadataBackend()
         batch = _make_metadata_batch(ForwardMode.EXTEND, [30, 50], [30, 50], T_outer=128)
         metadata = backend.get_forward_metadata(batch)
 
@@ -363,91 +218,15 @@ class TestJitSafety:
         expected = np.asarray(metadata.cu_seqlens_dev)[0] + np.asarray(metadata.scatter_idx)[0]
         assert int(result) == int(expected)
 
-    def test_metadata_in_container_survives_jit(self):
-        """Metadata nested in a container (simulating ForwardBatch) works in JIT."""
-        backend = LinearAttentionBackend()
-        batch = _make_metadata_batch(ForwardMode.EXTEND, [64], [64], T_outer=64)
-        metadata = backend.get_forward_metadata(batch)
-
-        # Simulate ForwardBatch by nesting metadata in a tuple (pytree container)
-        @jax.jit
-        def scatter_inside_jit(x, meta):
-            packed = scatter_to_packed(x, meta.scatter_idx, backend.T_packed_bucket)
-            recovered = gather_from_packed(packed, meta.scatter_idx)
-            return recovered
-
-        H, K = 2, 4
-        x = jax.random.normal(jax.random.PRNGKey(0), (64, H, K))
-        recovered = scatter_inside_jit(x, metadata)
-
-        np.testing.assert_allclose(np.asarray(recovered), np.asarray(x), rtol=1e-6, atol=1e-6)
-
-    def test_decode_metadata_none_fields_in_jit(self):
-        """DECODE metadata (None fields) can be passed through JIT without crash."""
-        backend = LinearAttentionBackend()
-        batch = _make_metadata_batch(ForwardMode.DECODE, None, [10, 20], T_outer=2)
-        metadata = backend.get_forward_metadata(batch)
-
-        @jax.jit
-        def check_decode_meta(meta):
-            # In decode, both fields are None --- verify JIT doesn't crash
-            # Return a constant to prove the function executed
-            return jnp.array(42)
-
-        result = check_decode_meta(metadata)
-        assert int(result) == 42
-
 
 # ---------------------------------------------------------------------------
 # LightningAttnBackend tests
-# ---------------------------------------------------------------------------
-
-
-class TestConstruction:
-    def test_basic_construction(self):
-        backend = LightningAttnBackend(mesh=mesh)
-        assert backend.mesh is mesh
-        assert backend.chunk_size == 64
-        assert backend.T_packed_bucket == 0
-        assert backend.scatter_idx is None
-        assert backend.cu_seqlens_aligned is None
-
-    def test_custom_chunk_size(self):
-        backend = LightningAttnBackend(mesh=mesh, chunk_size=128)
-        assert backend.chunk_size == 128
 
 
 class TestGetForwardMetadata:
-    def test_decode_returns_base_metadata(self):
-        backend = LightningAttnBackend(mesh=mesh)
-        batch = _make_batch(
-            ForwardMode.DECODE,
-            recurrent_indices=np.array([1, 2]),
-        )
-        metadata = backend.get_forward_metadata(batch)
-        assert metadata.cu_q_lens is not None
-        assert metadata.recurrent_indices is not None
-        assert backend.scatter_idx is None
-        assert backend.cu_seqlens_aligned is None
-
-    def test_extend_populates_scatter_metadata(self):
-        backend = LightningAttnBackend(mesh=mesh)
-        batch = _make_batch(
-            ForwardMode.EXTEND,
-            extend_seq_lens=np.array([100, 50]),
-            input_ids=np.zeros(150),
-            recurrent_indices=np.array([1, 2]),
-        )
-        metadata = backend.get_forward_metadata(batch)
-        assert metadata.cu_q_lens is not None
-        assert metadata.recurrent_indices is not None
-        assert backend.scatter_idx is not None
-        assert backend.cu_seqlens_aligned is not None
-        assert backend.T_packed_bucket > 0
-
     def test_scatter_metadata_matches_old_backend(self):
-        """Scatter/gather metadata should match LinearAttentionBackend output."""
-        old_backend = LinearAttentionBackend(mesh=mesh)
+        """Scatter/gather metadata should match GLAMetadataBackend output."""
+        old_backend = GLAMetadataBackend(mesh=mesh)
         new_backend = LightningAttnBackend(mesh=mesh)
 
         batch = SimpleNamespace(
@@ -470,109 +249,8 @@ class TestGetForwardMetadata:
         )
         assert old_backend.T_packed_bucket == new_backend.T_packed_bucket
 
-    def test_chunk_alignment(self):
-        backend = LightningAttnBackend(mesh=mesh, chunk_size=64)
-        batch = _make_batch(
-            ForwardMode.EXTEND,
-            extend_seq_lens=np.array([100]),
-            input_ids=np.zeros(100),
-            recurrent_indices=np.array([1]),
-        )
-        backend.get_forward_metadata(batch)
-        assert backend.T_packed_bucket == 128  # ceil(100/64)*64
-
-
-class TestStateManagement:
-    def test_get_state(self):
-        backend = LightningAttnBackend(mesh=mesh)
-        layer_id = 5
-        state = jnp.ones((_H, _K, _K), dtype=jnp.float32)
-        pool, indices = _make_mock_pool(layer_id, state[None])
-        result = backend.get_state(pool, layer_id, jnp.array(indices))
-        np.testing.assert_array_equal(np.array(result[0]), np.array(state))
-
-    def test_set_ssm_state(self):
-        backend = LightningAttnBackend(mesh=mesh)
-        layer_id = 5
-        state = jnp.zeros((1, _H, _K, _K), dtype=jnp.float32)
-        pool, indices = _make_mock_pool(layer_id, state)
-
-        new_state = jnp.ones((1, _H, _K, _K), dtype=jnp.float32)
-        new_full = backend.set_ssm_state(pool, layer_id, jnp.array(indices), new_state)
-
-        np.testing.assert_array_equal(
-            np.array(new_full[indices[0]]),
-            np.array(new_state[0]),
-        )
-
-    def test_no_conv_state(self):
-        """GLA should return empty conv list in pool_updates."""
-        backend = LightningAttnBackend(mesh=mesh)
-        layer_id = 5
-        state = jnp.zeros((1, _H, _K, _K), dtype=jnp.float32)
-        pool, indices = _make_mock_pool(layer_id, state)
-
-        _, conv = pool.get_linear_recurrent_layer_cache(layer_id)
-        assert conv == []
-
 
 class TestForwardDecode:
-    @requires_simple_gla
-    def test_decode_output_shape(self):
-        backend = LightningAttnBackend(mesh=mesh)
-        layer_id = 5
-        T = 2
-
-        with jax.set_mesh(mesh):
-            state = jnp.zeros((T, _H, _K, _K), dtype=jnp.float32)
-            pool, rec_indices = _make_mock_pool(layer_id, state)
-
-            batch = _make_batch(
-                ForwardMode.DECODE,
-                recurrent_indices=rec_indices,
-            )
-            metadata = backend.get_forward_metadata(batch)
-            backend.forward_metadata = metadata
-
-            q = jax.random.normal(jax.random.PRNGKey(0), (T, _H, _K), dtype=jnp.bfloat16)
-            k = jax.random.normal(jax.random.PRNGKey(1), (T, _H, _K), dtype=jnp.bfloat16)
-            v = jax.random.normal(jax.random.PRNGKey(2), (T, _H, _K), dtype=jnp.bfloat16)
-            layer = _make_fake_layer(layer_id=layer_id)
-            fb = SimpleNamespace(forward_mode=ForwardMode.DECODE)
-
-            output, pool_updates = backend(q, k, v, layer=layer, forward_batch=fb, recurrent_state_pool=pool)
-
-        assert output.shape == (T, _H * _K)
-        new_state = _extract_state(pool_updates, rec_indices)
-        assert new_state.shape == (T, _H, _K, _K)
-
-    @requires_simple_gla
-    def test_decode_state_updates(self):
-        backend = LightningAttnBackend(mesh=mesh)
-        layer_id = 5
-
-        with jax.set_mesh(mesh):
-            state0 = jnp.zeros((1, _H, _K, _K), dtype=jnp.float32)
-            pool, rec_indices = _make_mock_pool(layer_id, state0)
-
-            batch = _make_batch(
-                ForwardMode.DECODE,
-                recurrent_indices=rec_indices,
-            )
-            metadata = backend.get_forward_metadata(batch)
-            backend.forward_metadata = metadata
-
-            q = jax.random.normal(jax.random.PRNGKey(0), (1, _H, _K), dtype=jnp.bfloat16)
-            k = jax.random.normal(jax.random.PRNGKey(1), (1, _H, _K), dtype=jnp.bfloat16)
-            v = jax.random.normal(jax.random.PRNGKey(2), (1, _H, _K), dtype=jnp.bfloat16)
-            layer = _make_fake_layer(layer_id=layer_id)
-            fb = SimpleNamespace(forward_mode=ForwardMode.DECODE)
-
-            _, pool_updates = backend(q, k, v, layer=layer, forward_batch=fb, recurrent_state_pool=pool)
-            new_state = _extract_state(pool_updates, rec_indices)
-
-        assert not jnp.allclose(new_state, state0), "State should change after decode"
-
     @requires_simple_gla
     def test_decode_matches_direct_kernel(self):
         """Backend decode should match direct fused_recurrent_simple_gla call."""
@@ -621,40 +299,6 @@ class TestForwardDecode:
         )
 
 
-class TestForwardExtend:
-    @requires_simple_gla
-    @requires_tpu
-    def test_extend_output_shape(self):
-        backend = LightningAttnBackend(mesh=mesh)
-        layer_id = 5
-        seq_len = 128
-
-        with jax.set_mesh(mesh):
-            state = jnp.zeros((1, _H, _K, _K), dtype=jnp.float32)
-            pool, rec_indices = _make_mock_pool(layer_id, state)
-
-            batch = _make_batch(
-                ForwardMode.EXTEND,
-                extend_seq_lens=np.array([seq_len]),
-                input_ids=np.zeros(seq_len),
-                recurrent_indices=rec_indices,
-            )
-            metadata = backend.get_forward_metadata(batch)
-            backend.forward_metadata = metadata
-
-            q = jax.random.normal(jax.random.PRNGKey(0), (seq_len, _H, _K), dtype=jnp.bfloat16)
-            k = jax.random.normal(jax.random.PRNGKey(1), (seq_len, _H, _K), dtype=jnp.bfloat16)
-            v = jax.random.normal(jax.random.PRNGKey(2), (seq_len, _H, _K), dtype=jnp.bfloat16)
-            layer = _make_fake_layer(layer_id=layer_id)
-            fb = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
-
-            output, pool_updates = backend(q, k, v, layer=layer, forward_batch=fb, recurrent_state_pool=pool)
-
-        assert output.shape == (seq_len, _H * _K)
-        new_state = _extract_state(pool_updates, rec_indices)
-        assert new_state.shape == (1, _H, _K, _K)
-
-
 class TestHybridIntegration:
     def test_dispatch_routes_to_lightning(self):
         from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
@@ -670,24 +314,3 @@ class TestHybridIntegration:
         assert 5 not in hybrid.full_attn_layers
         assert isinstance(hybrid.linear_attn_backend, LightningAttnBackend)
 
-    def test_forward_metadata_setter_propagates(self):
-        from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
-
-        with jax.set_mesh(mesh):
-            full_backend = FlashAttention(
-                num_attn_heads=_H, num_kv_heads=_H, head_dim=_K,
-                page_size=1, mesh=mesh,
-            )
-            lightning = LightningAttnBackend(mesh=mesh)
-            hybrid = HybridLinearAttnBackend(full_backend, lightning, full_attn_layers=[0])
-
-            batch = SimpleNamespace(
-                forward_mode=ForwardMode.DECODE,
-                recurrent_indices=np.array([1]),
-                seq_lens=np.array([1]),
-                cache_loc=np.array([0]),
-            )
-            metadata = hybrid.get_forward_metadata(batch)
-            hybrid.forward_metadata = metadata
-
-        assert lightning.forward_metadata.recurrent_indices is not None

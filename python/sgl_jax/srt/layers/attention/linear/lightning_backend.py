@@ -19,7 +19,7 @@ from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.layers.attention.fla.linear_attention_backend import (
+from sgl_jax.srt.layers.attention.linear.gla_metadata import (
     gather_from_packed,
     scatter_to_packed,
 )
