@@ -83,6 +83,8 @@ PHASE1_HBM_COPY_LADDER_BYTES = (
     16 * 1024 * 1024,
     64 * 1024 * 1024,
     256 * 1024 * 1024,
+    512 * 1024 * 1024,
+    1024 * 1024 * 1024,
 )
 
 PHASE1_HBM_COPY_LADDER_SHAPES: tuple[WeightTileShape, ...] = tuple(
