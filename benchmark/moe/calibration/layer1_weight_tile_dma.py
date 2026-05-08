@@ -1,16 +1,17 @@
-"""Layer 1 fused-MoE dense weight tile DMA calibration skeleton.
+"""Layer 1 fused-MoE dense weight tile DMA calibration.
 
 This module records the Phase 1 mapping from #2 JSONL rows to the real
 `start_fetch_bw1`, `start_fetch_bw2`, and `start_fetch_bw3` HBM->VMEM copies in
 `python/sgl_jax/srt/kernels/fused_moe/v1/kernel.py`.
 
-It does not run a measured benchmark yet. Until a TPU/Pallas timing kernel is
-added and wired into `bench_calibration.py`, rows built here stay
-`status=not_implemented` with empty latency samples.
+On TPU with `execution_mode=pallas`, it runs a small Pallas kernel that mirrors
+the primary bf16 weight tile async copies and self-copy wait anchors used by
+fused-MoE. Non-TPU and local smoke paths continue to emit schema-only rows.
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
 from typing import Any, Literal, Protocol, cast
@@ -29,12 +30,20 @@ T_PACKING = 2
 DMA_COUNT = T_PACKING
 
 KERNEL_PATH = "python/sgl_jax/srt/kernels/fused_moe/v1/kernel.py"
-IMPLEMENTATION_BLOCKER = (
-    "Layer 1 dense bf16 weight tile DMA mapping is specified, but the measured "
-    "Pallas microkernel is not implemented in this pass. A valid implementation "
-    "still needs a TPU-side timing kernel that starts and waits on only the "
-    "start_fetch_bw1/start_fetch_bw2/start_fetch_bw3 primary weight async copies, "
-    "plus leader-owned dispatch from bench_calibration.py."
+STATUS_MEASURED = "measured"
+STATUS_NOT_IMPLEMENTED = "not_implemented"
+DEFAULT_WARMUP_RUNS = 3
+DEFAULT_SAMPLE_RUNS = 9
+HIDDEN_SIZE = 8192
+H_PER_T_PACKING = HIDDEN_SIZE // T_PACKING
+VMEM_LIMIT_BYTES = 96 * 1024 * 1024
+LOCAL_SEMAPHORE_SHAPE = (2, 14)
+IMPLEMENTATION_NOTE = (
+    "Measured with a Pallas TPU microkernel that issues the fused-MoE "
+    "start_fetch_bw1/bw2/bw3 primary bf16 weight HBM->VMEM async copies for "
+    "t_packing=2, then waits with the same VMEM self-copy semaphore pattern. "
+    "The kernel is side-effect-only and does not add an HBM anchor write, so "
+    "bytes_hbm reports only the primary fused-MoE weight read traffic."
 )
 
 TARGET_RUNTIME_V7X32 = {
@@ -174,41 +183,155 @@ def build_not_implemented_rows(
     source: Mapping[str, Any] | None = None,
     metadata: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Build schema-compatible Layer 1 rows without reporting fake latency."""
+    """Build Layer 1 rows, measuring TPU/Pallas mode and preserving smoke rows."""
 
     if suite != SUITE_V7X32_BF16_WEIGHT_TILES:
         raise ValueError(f"Unsupported suite: {suite}")
     runtime = collect_runtime_identity() if runtime is None else runtime
+
+    if execution_mode != "pallas":
+        return _build_schema_only_rows(
+            shapes=shapes,
+            suite=suite,
+            execution_mode=execution_mode,
+            runtime=runtime,
+            source=source,
+            metadata=metadata,
+            implementation_note=_not_implemented_note(execution_mode, runtime),
+        )
+
+    unavailable_note = _pallas_unavailable_note(runtime)
+    if unavailable_note is not None:
+        return _build_schema_only_rows(
+            shapes=shapes,
+            suite=suite,
+            execution_mode=execution_mode,
+            runtime=runtime,
+            source=source,
+            metadata=metadata,
+            implementation_note=unavailable_note,
+        )
+
     rows: list[dict[str, Any]] = []
+    warmup_runs = _positive_int_env("CALIBRATION_LAYER1_WARMUP_RUNS", DEFAULT_WARMUP_RUNS)
+    sample_runs = _positive_int_env("CALIBRATION_LAYER1_SAMPLE_RUNS", DEFAULT_SAMPLE_RUNS)
+    trace_root = os.getenv("CALIBRATION_LAYER1_TRACE_ROOT", "/tmp/sglang_jax_layer1_dma_trace")
+
     for shape in shapes:
         for plan in plans_for_shape(shape):
-            row_metadata = _metadata_for_plan(plan, metadata)
+            row_metadata = _metadata_for_plan(
+                plan,
+                _with_measurement_metadata(
+                    metadata,
+                    plan=plan,
+                    warmup_runs=warmup_runs,
+                    sample_runs=sample_runs,
+                    trace_root=trace_root,
+                ),
+            )
+            try:
+                samples = _measure_weight_tile_dma_ms(
+                    plan,
+                    warmup_runs=warmup_runs,
+                    sample_runs=sample_runs,
+                    trace_root=trace_root,
+                )
+            except Exception as exc:
+                rows.append(
+                    _make_row(
+                        suite=suite,
+                        plan=plan,
+                        execution_mode=execution_mode,
+                        runtime=runtime,
+                        source=dict(source or _source()),
+                        metadata=row_metadata,
+                        status=STATUS_NOT_IMPLEMENTED,
+                        latency_ms_samples=[],
+                        implementation_note=_measurement_failed_note(exc),
+                    )
+                )
+                continue
+
             rows.append(
-                build_observation_row(
-                    scenario=SCENARIO_LAYER1_WEIGHT_TILE_DMA,
+                _make_row(
                     suite=suite,
-                    layer=1,
-                    path=plan.path,
-                    path_class=plan.path_class,
-                    dtype=DTYPE,
-                    weight_dtype=WEIGHT_DTYPE,
-                    t_packing=T_PACKING,
-                    bf=plan.bf,
-                    bd=plan.bd,
-                    tile_shape=plan.tile_shape,
-                    bytes_hbm=plan.bytes_per_fetch,
-                    bytes_per_fetch=plan.bytes_per_fetch,
-                    dma_count=plan.dma_count,
-                    status="not_implemented",
+                    plan=plan,
                     execution_mode=execution_mode,
-                    latency_ms_samples=[],
                     runtime=runtime,
                     source=dict(source or _source()),
                     metadata=row_metadata,
-                    implementation_note=IMPLEMENTATION_BLOCKER,
+                    status=STATUS_MEASURED,
+                    latency_ms_samples=samples,
+                    implementation_note=IMPLEMENTATION_NOTE,
                 )
             )
     return rows
+
+
+def _build_schema_only_rows(
+    *,
+    shapes: Iterable[WeightTileShapeLike],
+    suite: str,
+    execution_mode: str,
+    runtime: dict[str, Any],
+    source: Mapping[str, Any] | None,
+    metadata: Mapping[str, Any] | None,
+    implementation_note: str,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for shape in shapes:
+        for plan in plans_for_shape(shape):
+            rows.append(
+                _make_row(
+                    suite=suite,
+                    plan=plan,
+                    execution_mode=execution_mode,
+                    runtime=runtime,
+                    source=dict(source or _source()),
+                    metadata=_metadata_for_plan(plan, metadata),
+                    status=STATUS_NOT_IMPLEMENTED,
+                    latency_ms_samples=[],
+                    implementation_note=implementation_note,
+                )
+            )
+    return rows
+
+
+def _make_row(
+    *,
+    suite: str,
+    plan: WeightTileDMAPlan,
+    execution_mode: str,
+    runtime: dict[str, Any],
+    source: dict[str, Any],
+    metadata: dict[str, Any],
+    status: str,
+    latency_ms_samples: list[float],
+    implementation_note: str,
+) -> dict[str, Any]:
+    return build_observation_row(
+        scenario=SCENARIO_LAYER1_WEIGHT_TILE_DMA,
+        suite=suite,
+        layer=1,
+        path=plan.path,
+        path_class=plan.path_class,
+        dtype=DTYPE,
+        weight_dtype=WEIGHT_DTYPE,
+        t_packing=T_PACKING,
+        bf=plan.bf,
+        bd=plan.bd,
+        tile_shape=plan.tile_shape,
+        bytes_hbm=plan.bytes_per_fetch,
+        bytes_per_fetch=plan.bytes_per_fetch,
+        dma_count=plan.dma_count,
+        status=status,
+        execution_mode=execution_mode,
+        latency_ms_samples=latency_ms_samples,
+        runtime=runtime,
+        source=source,
+        metadata=metadata,
+        implementation_note=implementation_note,
+    )
 
 
 def _plan_for_path(
@@ -270,10 +393,52 @@ def _metadata_for_plan(
                 "bias side copies",
             ),
         },
+        "traffic": {
+            "traffic_class": "primary_hbm_to_vmem_read",
+            "bytes_hbm_primary_read": plan.bytes_per_fetch,
+            "bytes_hbm_anchor_write": 0,
+            "bytes_hbm_total_accounted": plan.bytes_per_fetch,
+            "anchor_write_required_for_observability": False,
+        },
     }
     if metadata:
         base.update(dict(metadata))
     return base
+
+
+def _with_measurement_metadata(
+    metadata: Mapping[str, Any] | None,
+    *,
+    plan: WeightTileDMAPlan,
+    warmup_runs: int,
+    sample_runs: int,
+    trace_root: str,
+) -> dict[str, Any]:
+    enriched = dict(metadata or {})
+    enriched["benchmark"] = {
+        "name": "layer1_pallas_weight_tile_dma",
+        "warmup_runs": warmup_runs,
+        "sample_runs": sample_runs,
+        "timing": "jax_profiler_trace_device_duration_ms",
+        "trace_root": trace_root,
+        "pallas_grid": (1,),
+        "vmem_limit_bytes": VMEM_LIMIT_BYTES,
+        "local_semaphore_shape": LOCAL_SEMAPHORE_SHAPE,
+        "has_side_effects": True,
+    }
+    enriched["traffic"] = {
+        "traffic_class": "primary_hbm_to_vmem_read_side_effect_only",
+        "bytes_hbm_primary_read": plan.bytes_per_fetch,
+        "bytes_hbm_anchor_write": 0,
+        "bytes_hbm_total_accounted": plan.bytes_per_fetch,
+        "anchor_write_required_for_observability": False,
+        "observability_note": (
+            "This first measured Layer 1 variant relies on Pallas side effects "
+            "and the fused-MoE VMEM self-copy wait pattern. It intentionally "
+            "avoids scalar HBM stores, which failed in earlier diagnostics."
+        ),
+    }
+    return enriched
 
 
 def _source() -> dict[str, Any]:
@@ -291,9 +456,172 @@ def _validate_bf16_shape_inputs(*, bf: int, bd: int) -> None:
         raise ValueError(f"Expected positive bf/bd, got {bf=} {bd=}.")
     if bd % T_PACKING != 0:
         raise ValueError(f"Expected bd={bd} to be divisible by t_packing={T_PACKING}.")
+    if bd > HIDDEN_SIZE:
+        raise ValueError(f"Expected bd={bd} to be <= target hidden_size={HIDDEN_SIZE}.")
 
 
 def _coerce_path_class(path_class: str) -> PathClass:
     if path_class in ("w1w3", "w2"):
         return cast(PathClass, path_class)
     raise ValueError(f"Unsupported Layer 1 path_class: {path_class}")
+
+
+def _not_implemented_note(execution_mode: str, runtime: dict[str, Any]) -> str:
+    if execution_mode == "local_smoke":
+        return (
+            "layer1_weight_tile_dma emitted schema-only rows on local_smoke; "
+            "Pallas DMA measurements require a TPU backend."
+        )
+    backend = runtime.get("default_backend")
+    return (
+        "layer1_weight_tile_dma did not emit synthetic latency samples. "
+        f"execution_mode={execution_mode!r} is not a measured Pallas mode for "
+        f"this runtime; observed JAX default_backend={backend!r}."
+    )
+
+
+def _pallas_unavailable_note(runtime: dict[str, Any]) -> str | None:
+    backend = runtime.get("default_backend")
+    if backend != "tpu":
+        return (
+            "layer1_weight_tile_dma did not emit synthetic latency samples. "
+            "Pallas DMA measurements require JAX default_backend='tpu'; "
+            f"observed default_backend={backend!r}."
+        )
+
+    try:
+        import jax  # noqa: F401
+        import jax.numpy as jnp  # noqa: F401
+        from jax.experimental import pallas as pl  # noqa: F401
+        from jax.experimental.pallas import tpu as pltpu  # noqa: F401
+
+        from benchmark.utils import multiple_iteration_timeit_from_trace  # noqa: F401
+    except Exception as exc:
+        return (
+            "layer1_weight_tile_dma could not import the JAX/Pallas trace APIs "
+            f"needed for measured DMA; {type(exc).__name__}: {exc}. "
+            "No synthetic latency samples were emitted."
+        )
+
+    return None
+
+
+def _measurement_failed_note(exc: Exception) -> str:
+    return (
+        "layer1_weight_tile_dma Pallas DMA measurement failed before producing "
+        f"trustworthy samples: {type(exc).__name__}: {exc}. No synthetic latency "
+        "samples were emitted for this shape."
+    )
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _measure_weight_tile_dma_ms(
+    plan: WeightTileDMAPlan,
+    *,
+    warmup_runs: int,
+    sample_runs: int,
+    trace_root: str,
+) -> list[float]:
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    from benchmark.utils import multiple_iteration_timeit_from_trace
+
+    source_shape = _hbm_source_shape(plan)
+    source = jnp.ones(source_shape, dtype=jnp.bfloat16)
+    jax.block_until_ready(source)
+
+    @jax.jit
+    def run_dma(weight_hbm):
+        return _pallas_weight_tile_dma_call(
+            weight_hbm, plan=plan, pl=pl, pltpu=pltpu, jax=jax, jnp=jnp
+        )
+
+    jax.block_until_ready(run_dma(source))
+    task = f"layer1_dma_{plan.path}_{plan.bf}x{plan.bd}"
+    return multiple_iteration_timeit_from_trace(
+        compute_func=run_dma,
+        data_generator=lambda: (source,),
+        task=task,
+        tries=sample_runs,
+        warmup=warmup_runs,
+        trace_root=trace_root,
+    )
+
+
+def _hbm_source_shape(plan: WeightTileDMAPlan) -> tuple[int, int, int]:
+    if plan.path == "w2":
+        return (1, plan.bf, HIDDEN_SIZE)
+    return (1, HIDDEN_SIZE, plan.bf)
+
+
+def _pallas_weight_tile_dma_call(weight_hbm, *, plan, pl, pltpu, jax, jnp):
+    bd_per_t_packing = plan.bd // T_PACKING
+    sem_index = plan.spec.semaphore_index
+    is_w2 = plan.path == "w2"
+    scratch_shape = (
+        (2, T_PACKING, plan.bf, bd_per_t_packing)
+        if is_w2
+        else (2, T_PACKING, bd_per_t_packing, plan.bf)
+    )
+
+    def kernel(weight_ref, out_ref, weight_scratch, local_sems):
+        del out_ref
+        for p in range(T_PACKING):
+            offset = p * H_PER_T_PACKING
+            if is_w2:
+                src_ref = weight_ref.at[
+                    0,
+                    pl.ds(0, plan.bf),
+                    pl.ds(offset, bd_per_t_packing),
+                ]
+            else:
+                src_ref = weight_ref.at[
+                    0,
+                    pl.ds(offset, bd_per_t_packing),
+                    pl.ds(0, plan.bf),
+                ]
+            pltpu.make_async_copy(
+                src_ref=src_ref,
+                dst_ref=weight_scratch.at[0, p],
+                sem=local_sems.at[0, sem_index],
+            ).start()
+
+        pltpu.make_async_copy(
+            src_ref=weight_scratch.at[0],
+            dst_ref=weight_scratch.at[0],
+            sem=local_sems.at[0, sem_index],
+        ).wait()
+
+    compiler_params_kwargs = {
+        "has_side_effects": True,
+        "vmem_limit_bytes": VMEM_LIMIT_BYTES,
+    }
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((1,), jnp.bfloat16),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)],
+            out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            grid=(1,),
+            scratch_shapes=[
+                pltpu.VMEM(scratch_shape, jnp.bfloat16),
+                pltpu.SemaphoreType.DMA(LOCAL_SEMAPHORE_SHAPE),
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(**compiler_params_kwargs),
+        name=f"layer1_weight_tile_dma_{plan.path}_{plan.bf}x{plan.bd}",
+    )(weight_hbm)
