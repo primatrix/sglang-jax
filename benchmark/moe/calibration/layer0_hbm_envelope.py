@@ -1,10 +1,10 @@
-"""Layer 0 HBM local DMA envelope rows for Phase 1 calibration."""
+"""Layer 0 HBM copy envelope rows for Phase 1 calibration."""
 
 from __future__ import annotations
 
 import os
-import time
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
+from math import prod
 from typing import Any
 
 from benchmark.moe.calibration.common import build_observation_row
@@ -31,9 +31,18 @@ def build_rows(
     source: dict[str, Any],
     metadata: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """Build Layer 0 rows, measuring HBM->VMEM DMA on TPU/Pallas when available."""
+    """Build Layer 0 rows using a JAX HBM copy envelope on TPU.
 
-    if execution_mode != "pallas":
+    This follows the Ironwood accelerator microbenchmark style: benchmark a
+    jitted `a.copy()`, collect profiler trace device durations, and account for
+    read plus write HBM traffic. The fused-MoE tile dimensions are still used as
+    the sweep matrix so Layer 1 can join on equivalent shapes.
+    """
+
+    if execution_mode == "pallas":
+        execution_mode = "jax_trace"
+
+    if execution_mode != "jax_trace":
         return [
             _make_row(
                 suite=suite,
@@ -44,6 +53,7 @@ def build_rows(
                 weight_dtype=weight_dtype,
                 t_packing=t_packing,
                 dma_count=dma_count,
+                bytes_hbm=shape.bytes_per_fetch * 2,
                 source=source,
                 metadata=metadata,
                 status=STATUS_NOT_IMPLEMENTED,
@@ -53,7 +63,7 @@ def build_rows(
             for shape in shapes
         ]
 
-    unavailable_note = _pallas_unavailable_note(runtime)
+    unavailable_note = _jax_trace_unavailable_note(runtime)
     if unavailable_note is not None:
         return [
             _make_row(
@@ -65,6 +75,7 @@ def build_rows(
                 weight_dtype=weight_dtype,
                 t_packing=t_packing,
                 dma_count=dma_count,
+                bytes_hbm=shape.bytes_per_fetch * 2,
                 source=source,
                 metadata=metadata,
                 status=STATUS_NOT_IMPLEMENTED,
@@ -77,18 +88,21 @@ def build_rows(
     rows: list[dict[str, Any]] = []
     warmup_runs = _positive_int_env("CALIBRATION_LAYER0_WARMUP_RUNS", DEFAULT_WARMUP_RUNS)
     sample_runs = _positive_int_env("CALIBRATION_LAYER0_SAMPLE_RUNS", DEFAULT_SAMPLE_RUNS)
+    trace_root = os.getenv("CALIBRATION_LAYER0_TRACE_ROOT", "/tmp/sglang_jax_layer0_hbm_trace")
     measured_metadata = _with_measurement_metadata(
         metadata,
         warmup_runs=warmup_runs,
         sample_runs=sample_runs,
+        trace_root=trace_root,
     )
 
     for shape in shapes:
         try:
-            samples = _measure_hbm_local_dma_ms(
+            samples = _measure_hbm_copy_ms(
                 tuple(shape.tile_shape),
                 warmup_runs=warmup_runs,
                 sample_runs=sample_runs,
+                trace_root=trace_root,
             )
         except Exception as exc:
             rows.append(
@@ -101,6 +115,7 @@ def build_rows(
                     weight_dtype=weight_dtype,
                     t_packing=t_packing,
                     dma_count=dma_count,
+                    bytes_hbm=shape.bytes_per_fetch * 2,
                     source=source,
                     metadata=measured_metadata,
                     status=STATUS_NOT_IMPLEMENTED,
@@ -120,16 +135,17 @@ def build_rows(
                 weight_dtype=weight_dtype,
                 t_packing=t_packing,
                 dma_count=dma_count,
+                bytes_hbm=shape.bytes_per_fetch * 2,
                 source=source,
                 metadata=measured_metadata,
                 status=STATUS_MEASURED,
                 latency_ms_samples=samples,
                 implementation_note=(
-                    "Measured with a Pallas TPU HBM-to-VMEM local DMA kernel, "
-                    "anchored by a full VMEM-to-HBM tile DMA store so the copied "
-                    "tile is observable. Each sample excludes compilation plus "
-                    "warmup runs; metadata.benchmark.anchor_store records the "
-                    "extra HBM write traffic."
+                    "Measured with a JAX HBM copy envelope following the "
+                    "Ironwood accelerator microbenchmark pattern. Each sample "
+                    "uses profiler trace device duration for a jitted a.copy(); "
+                    "bytes_hbm is read plus write traffic, while bytes_per_fetch "
+                    "remains the fused-MoE equivalent tile size for joins."
                 ),
             )
         )
@@ -147,6 +163,7 @@ def _make_row(
     weight_dtype: str,
     t_packing: int,
     dma_count: int,
+    bytes_hbm: int,
     source: dict[str, Any],
     metadata: dict[str, Any],
     status: str,
@@ -165,7 +182,7 @@ def _make_row(
         bf=shape.bf,
         bd=shape.bd,
         tile_shape=shape.tile_shape,
-        bytes_hbm=shape.bytes_per_fetch,
+        bytes_hbm=bytes_hbm,
         bytes_per_fetch=shape.bytes_per_fetch,
         dma_count=dma_count,
         status=status,
@@ -182,35 +199,34 @@ def _not_implemented_note(execution_mode: str, runtime: dict[str, Any]) -> str:
     if execution_mode == "local_smoke":
         return (
             "layer0_hbm_envelope emitted schema-only rows on local_smoke; "
-            "TPU/Pallas local HBM DMA measurements require execution_mode=pallas "
-            "on a TPU backend."
+            "JAX trace-derived HBM copy measurements require a TPU backend."
         )
     backend = runtime.get("default_backend")
     return (
         "layer0_hbm_envelope did not emit synthetic latency samples. "
-        f"execution_mode={execution_mode!r} is not a measured TPU/Pallas mode "
+        f"execution_mode={execution_mode!r} is not a measured JAX trace mode "
         f"for this runtime; observed JAX default_backend={backend!r}."
     )
 
 
-def _pallas_unavailable_note(runtime: dict[str, Any]) -> str | None:
+def _jax_trace_unavailable_note(runtime: dict[str, Any]) -> str | None:
     backend = runtime.get("default_backend")
     if backend != "tpu":
         return (
             "layer0_hbm_envelope did not emit synthetic latency samples. "
-            "execution_mode='pallas' requires JAX default_backend='tpu' for the "
-            f"HBM local DMA kernel; observed default_backend={backend!r}."
+            "trace-derived HBM copy measurements require JAX default_backend='tpu'; "
+            f"observed default_backend={backend!r}."
         )
 
     try:
         import jax  # noqa: F401
         import jax.numpy as jnp  # noqa: F401
-        from jax.experimental import pallas as pl  # noqa: F401
-        from jax.experimental.pallas import tpu as pltpu  # noqa: F401
+
+        from benchmark.utils import multiple_iteration_timeit_from_trace  # noqa: F401
     except Exception as exc:
         return (
-            "layer0_hbm_envelope could not import the JAX/Pallas TPU APIs needed "
-            f"for measured HBM local DMA; {type(exc).__name__}: {exc}. "
+            "layer0_hbm_envelope could not import the JAX trace APIs needed for "
+            f"measured HBM copy; {type(exc).__name__}: {exc}. "
             "No synthetic latency samples were emitted."
         )
 
@@ -219,11 +235,12 @@ def _pallas_unavailable_note(runtime: dict[str, Any]) -> str | None:
 
 def _measurement_failed_note(exc: Exception) -> str:
     return (
-        "layer0_hbm_envelope Pallas HBM local DMA measurement failed before "
+        "layer0_hbm_envelope JAX HBM copy measurement failed before "
         f"producing trustworthy samples: {type(exc).__name__}: {exc}. "
         "No synthetic latency samples were emitted for this shape. Remaining "
-        "work is to run/debug this kernel on v7x-32 and replace this fallback "
-        "with measured samples once the Pallas DMA call compiles and executes."
+        "work is to run/debug the trace-derived copy benchmark on v7x-32 and "
+        "replace this fallback with measured samples once profiler trace "
+        "durations are available."
     )
 
 
@@ -232,16 +249,20 @@ def _with_measurement_metadata(
     *,
     warmup_runs: int,
     sample_runs: int,
+    trace_root: str,
 ) -> dict[str, Any]:
     enriched = dict(metadata)
     enriched["benchmark"] = {
-        "name": "layer0_hbm_local_dma",
+        "name": "layer0_jax_hbm_copy_envelope",
+        "reference": "AI-Hypercomputer/accelerator-microbenchmarks Ironwood single_device_hbm_copy",
         "warmup_runs": warmup_runs,
         "sample_runs": sample_runs,
-        "copy_direction": "hbm_to_vmem",
-        "anchor_store": "full_tile_vmem_to_hbm",
-        "measured_hbm_traffic": "bytes_per_fetch read plus bytes_per_fetch anchor write",
-        "timing": "host_perf_counter_ms_with_block_until_ready",
+        "copy_direction": "hbm_to_hbm_copy",
+        "traffic_class": "copy_read_write",
+        "measured_hbm_traffic": "bytes_per_fetch read plus bytes_per_fetch write",
+        "traffic_multiplier": 2,
+        "timing": "jax_profiler_trace_device_duration_ms",
+        "trace_root": trace_root,
     }
     return enriched
 
@@ -257,72 +278,32 @@ def _positive_int_env(name: str, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
-def _measure_hbm_local_dma_ms(
+def _measure_hbm_copy_ms(
     tile_shape: tuple[int, int, int],
     *,
     warmup_runs: int,
     sample_runs: int,
+    trace_root: str,
 ) -> list[float]:
     import jax
     import jax.numpy as jnp
 
-    run_dma = _build_hbm_local_dma_call(tile_shape)
-    src = jnp.ones(tile_shape, dtype=jnp.bfloat16)
+    from benchmark.utils import multiple_iteration_timeit_from_trace
+
+    src = jnp.ones((prod(tile_shape),), dtype=jnp.bfloat16)
     jax.block_until_ready(src)
 
-    jax.block_until_ready(run_dma(src))
-    for _ in range(warmup_runs):
-        jax.block_until_ready(run_dma(src))
-
-    samples: list[float] = []
-    for _ in range(sample_runs):
-        start_ns = time.perf_counter_ns()
-        result = run_dma(src)
-        jax.block_until_ready(result)
-        end_ns = time.perf_counter_ns()
-        samples.append((end_ns - start_ns) / 1_000_000.0)
-    return samples
-
-
-def _build_hbm_local_dma_call(tile_shape: tuple[int, int, int]) -> Callable[[Any], Any]:
-    import jax
-    import jax.numpy as jnp
-    from jax.experimental import pallas as pl
-    from jax.experimental.pallas import tpu as pltpu
-
-    def _hbm_local_dma_kernel(src_ref, out_ref, scratch_ref, sem):
-        for packing_idx in range(src_ref.shape[0]):
-            pltpu.make_async_copy(
-                src_ref=src_ref.at[packing_idx],
-                dst_ref=scratch_ref.at[packing_idx],
-                sem=sem,
-            ).start()
-        pltpu.make_async_copy(src_ref=scratch_ref, dst_ref=scratch_ref, sem=sem).wait()
-        anchor_store = pltpu.make_async_copy(src_ref=scratch_ref, dst_ref=out_ref, sem=sem)
-        anchor_store.start()
-        anchor_store.wait()
-
     @jax.jit
-    def _run(src):
-        kernel = pl.pallas_call(
-            _hbm_local_dma_kernel,
-            out_shape=jax.ShapeDtypeStruct(tile_shape, jnp.bfloat16),
-            grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=0,
-                in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)],
-                out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                grid=(1,),
-                scratch_shapes=[
-                    pltpu.VMEM(tile_shape, jnp.bfloat16),
-                    pltpu.SemaphoreType.DMA,
-                ],
-            ),
-            compiler_params=pltpu.CompilerParams(
-                has_side_effects=True,
-                vmem_limit_bytes=32 * 1024 * 1024,
-            ),
-            name=f"layer0-hbm-local-dma-{tile_shape[0]}x{tile_shape[1]}x{tile_shape[2]}",
-        )
-        return kernel(src)
+    def copy_hbm(array):
+        return array.copy()
 
-    return _run
+    jax.block_until_ready(copy_hbm(src))
+    task = f"layer0_hbm_copy_{tile_shape[0]}x{tile_shape[1]}x{tile_shape[2]}"
+    return multiple_iteration_timeit_from_trace(
+        compute_func=copy_hbm,
+        data_generator=lambda: (src,),
+        task=task,
+        tries=sample_runs,
+        warmup=warmup_runs,
+        trace_root=trace_root,
+    )

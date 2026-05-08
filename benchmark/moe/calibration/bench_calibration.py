@@ -186,15 +186,19 @@ def _jax_backend(runtime: dict[str, Any]) -> str | None:
     return str(backend) if backend is not None else None
 
 
-def resolve_execution_mode(requested: str, runtime: dict[str, Any]) -> str:
+def resolve_execution_mode(scenario: str, requested: str, runtime: dict[str, Any]) -> str:
     if requested != "auto":
         return requested
-    return "pallas" if _jax_backend(runtime) == "tpu" else "local_smoke"
+    if _jax_backend(runtime) != "tpu":
+        return "local_smoke"
+    if scenario == SCENARIO_LAYER0_HBM_ENVELOPE:
+        return "jax_trace"
+    return "pallas"
 
 
 def build_rows(scenario: str, suite: str, execution_mode: str) -> list[dict[str, Any]]:
     runtime = collect_runtime_identity()
-    resolved_mode = resolve_execution_mode(execution_mode, runtime)
+    resolved_mode = resolve_execution_mode(scenario, execution_mode, runtime)
     if scenario == SCENARIO_LAYER0_HBM_ENVELOPE:
         return _layer0_hbm_envelope_rows(suite, resolved_mode, runtime)
     if scenario == SCENARIO_LAYER1_WEIGHT_TILE_DMA:
@@ -224,9 +228,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--execution-mode",
-        choices=("auto", "local_smoke", "pallas"),
+        choices=("auto", "local_smoke", "jax_trace", "pallas"),
         default="auto",
-        help="Execution backend. auto selects pallas on TPU and local_smoke otherwise.",
+        help=(
+            "Execution backend. auto selects jax_trace for Layer 0 on TPU, "
+            "pallas for Layer 1 on TPU, and local_smoke otherwise."
+        ),
     )
     parser.add_argument(
         "--print",
