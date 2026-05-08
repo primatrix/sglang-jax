@@ -12,6 +12,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from benchmark.moe.calibration import layer0_hbm_envelope, layer1_weight_tile_dma
 from benchmark.moe.calibration.common import (
     build_observation_row,
     collect_runtime_identity,
@@ -155,41 +156,29 @@ def _make_row(
 def _layer0_hbm_envelope_rows(
     suite: str, execution_mode: str, runtime: dict[str, Any]
 ) -> list[dict[str, Any]]:
-    return [
-        _make_row(
-            scenario=SCENARIO_LAYER0_HBM_ENVELOPE,
-            layer=0,
-            path=shape.path_class,
-            path_class=shape.path_class,
-            shape=shape,
-            execution_mode=execution_mode,
-            runtime=runtime,
-            matrix_kind="hbm_equivalent_weight_tile",
-        )
-        for shape in load_suite_shapes(suite)
-    ]
+    return layer0_hbm_envelope.build_rows(
+        suite=suite,
+        shapes=load_suite_shapes(suite),
+        execution_mode=execution_mode,
+        runtime=runtime,
+        dtype=DTYPE,
+        weight_dtype=WEIGHT_DTYPE,
+        t_packing=T_PACKING,
+        dma_count=DMA_COUNT,
+        source=_source(),
+        metadata=_suite_metadata(matrix_kind="hbm_equivalent_weight_tile"),
+    )
 
 
 def _layer1_weight_tile_dma_rows(
     suite: str, execution_mode: str, runtime: dict[str, Any]
 ) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for shape in load_suite_shapes(suite):
-        paths = ("w1", "w3") if shape.path_class == "w1w3" else ("w2",)
-        for path in paths:
-            rows.append(
-                _make_row(
-                    scenario=SCENARIO_LAYER1_WEIGHT_TILE_DMA,
-                    layer=1,
-                    path=path,
-                    path_class=shape.path_class,
-                    shape=shape,
-                    execution_mode=execution_mode,
-                    runtime=runtime,
-                    matrix_kind="fused_moe_weight_tile_dma",
-                )
-            )
-    return rows
+    return layer1_weight_tile_dma.build_not_implemented_rows(
+        suite=suite,
+        shapes=load_suite_shapes(suite),
+        execution_mode=execution_mode,
+        runtime=runtime,
+    )
 
 
 def _jax_backend(runtime: dict[str, Any]) -> str | None:
