@@ -34,11 +34,15 @@ SCENARIOS = (
 
 SUITE_V7X32_BF16_WEIGHT_TILES = "v7x32_bf16_weight_tiles"
 SUITE_V7X32_BF16_HBM_COPY_ENVELOPE = "v7x32_bf16_hbm_copy_envelope"
+SUITE_V7X32_BF16_HBM_CURVE_V2 = "v7x32_bf16_hbm_curve_v2"
 SUITE_V7X32_BF16_GEMM_ENVELOPE = "v7x32_bf16_gemm_envelope"
+SUITE_V7X32_BF16_GEMM_CURVE_V2 = "v7x32_bf16_gemm_curve_v2"
 SUITES = (
     SUITE_V7X32_BF16_WEIGHT_TILES,
     SUITE_V7X32_BF16_HBM_COPY_ENVELOPE,
+    SUITE_V7X32_BF16_HBM_CURVE_V2,
     SUITE_V7X32_BF16_GEMM_ENVELOPE,
+    SUITE_V7X32_BF16_GEMM_CURVE_V2,
 )
 
 DTYPE = "bfloat16"
@@ -109,6 +113,26 @@ PHASE1_HBM_COPY_LADDER_BYTES = (
     1024 * 1024 * 1024,
 )
 
+PHASE1_HBM_CURVE_V2_BYTES_HBM = (
+    64 * 1024,
+    128 * 1024,
+    256 * 1024,
+    512 * 1024,
+    1024 * 1024,
+    2 * 1024 * 1024,
+    4 * 1024 * 1024,
+    8 * 1024 * 1024,
+    16 * 1024 * 1024,
+    32 * 1024 * 1024,
+    64 * 1024 * 1024,
+    128 * 1024 * 1024,
+    256 * 1024 * 1024,
+    512 * 1024 * 1024,
+    1024 * 1024 * 1024,
+    2 * 1024 * 1024 * 1024,
+    4 * 1024 * 1024 * 1024,
+)
+
 PHASE1_HBM_COPY_LADDER_SHAPES: tuple[WeightTileShape, ...] = tuple(
     WeightTileShape(
         path_class="hbm_ladder",
@@ -118,6 +142,17 @@ PHASE1_HBM_COPY_LADDER_SHAPES: tuple[WeightTileShape, ...] = tuple(
         tile_shape=(1, 1, bytes_per_fetch // 2),
     )
     for bytes_per_fetch in PHASE1_HBM_COPY_LADDER_BYTES
+)
+
+PHASE1_HBM_CURVE_V2_SHAPES: tuple[WeightTileShape, ...] = tuple(
+    WeightTileShape(
+        path_class="hbm_curve_v2",
+        bf=(bytes_hbm // 2) // 2,
+        bd=1,
+        bytes_per_fetch=bytes_hbm // 2,
+        tile_shape=(1, 1, (bytes_hbm // 2) // 2),
+    )
+    for bytes_hbm in PHASE1_HBM_CURVE_V2_BYTES_HBM
 )
 
 PHASE1_GEMM_EQUIVALENT_SHAPES: tuple[GemmShape, ...] = (
@@ -169,6 +204,22 @@ PHASE1_GEMM_EQUIVALENT_SHAPES: tuple[GemmShape, ...] = (
     GemmShape("ffn2", 1024, 512, 512),
 )
 
+PHASE1_GEMM_M_SWEEP_SHAPES: tuple[GemmShape, ...] = tuple(
+    GemmShape("mxu_m_sweep", m, k, n)
+    for m in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048)
+    for k, n in ((1024, 1024), (2048, 2048), (4096, 4096))
+)
+
+PHASE1_GEMM_ASPECT_SWEEP_SHAPES: tuple[GemmShape, ...] = tuple(
+    GemmShape("mxu_aspect_sweep", m, k, n)
+    for m in (64, 256, 1024)
+    for k, n in ((512, 4096), (1024, 2048), (2048, 1024), (4096, 512))
+)
+
+PHASE1_GEMM_CURVE_V2_SHAPES: tuple[GemmShape, ...] = (
+    PHASE1_GEMM_EQUIVALENT_SHAPES + PHASE1_GEMM_M_SWEEP_SHAPES + PHASE1_GEMM_ASPECT_SWEEP_SHAPES
+)
+
 
 def load_suite_shapes(suite: str) -> tuple[WeightTileShape, ...]:
     if suite != SUITE_V7X32_BF16_WEIGHT_TILES:
@@ -181,12 +232,16 @@ def load_layer0_suite_shapes(suite: str) -> tuple[WeightTileShape, ...]:
         return PHASE1_HBM_EQUIVALENT_SHAPES
     if suite == SUITE_V7X32_BF16_HBM_COPY_ENVELOPE:
         return PHASE1_HBM_COPY_LADDER_SHAPES + PHASE1_HBM_EQUIVALENT_SHAPES
+    if suite == SUITE_V7X32_BF16_HBM_CURVE_V2:
+        return PHASE1_HBM_CURVE_V2_SHAPES + PHASE1_HBM_EQUIVALENT_SHAPES
     raise ValueError(f"Unsupported Layer 0 suite: {suite}")
 
 
 def load_layer0_gemm_suite_shapes(suite: str) -> tuple[GemmShape, ...]:
     if suite == SUITE_V7X32_BF16_GEMM_ENVELOPE:
         return PHASE1_GEMM_EQUIVALENT_SHAPES
+    if suite == SUITE_V7X32_BF16_GEMM_CURVE_V2:
+        return PHASE1_GEMM_CURVE_V2_SHAPES
     raise ValueError(f"Unsupported Layer 0 GEMM suite: {suite}")
 
 

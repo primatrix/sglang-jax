@@ -16,6 +16,7 @@ STATUS_NOT_IMPLEMENTED = "not_implemented"
 
 DEFAULT_WARMUP_RUNS = 3
 DEFAULT_SAMPLE_RUNS = 9
+DEFAULT_TRACE_DISCARD_RUNS = 1
 
 
 def build_rows(
@@ -88,11 +89,15 @@ def build_rows(
     rows: list[dict[str, Any]] = []
     warmup_runs = _positive_int_env("CALIBRATION_LAYER0_WARMUP_RUNS", DEFAULT_WARMUP_RUNS)
     sample_runs = _positive_int_env("CALIBRATION_LAYER0_SAMPLE_RUNS", DEFAULT_SAMPLE_RUNS)
+    discard_runs = _nonnegative_int_env(
+        "CALIBRATION_LAYER0_TRACE_DISCARD_RUNS", DEFAULT_TRACE_DISCARD_RUNS
+    )
     trace_root = os.getenv("CALIBRATION_LAYER0_TRACE_ROOT", "/tmp/sglang_jax_layer0_hbm_trace")
     measured_metadata = _with_measurement_metadata(
         metadata,
         warmup_runs=warmup_runs,
         sample_runs=sample_runs,
+        discard_runs=discard_runs,
         trace_root=trace_root,
     )
 
@@ -102,6 +107,7 @@ def build_rows(
                 tuple(shape.tile_shape),
                 warmup_runs=warmup_runs,
                 sample_runs=sample_runs,
+                discard_runs=discard_runs,
                 trace_root=trace_root,
             )
         except Exception as exc:
@@ -249,6 +255,7 @@ def _with_measurement_metadata(
     *,
     warmup_runs: int,
     sample_runs: int,
+    discard_runs: int,
     trace_root: str,
 ) -> dict[str, Any]:
     enriched = dict(metadata)
@@ -257,6 +264,7 @@ def _with_measurement_metadata(
         "reference": "AI-Hypercomputer/accelerator-microbenchmarks Ironwood single_device_hbm_copy",
         "warmup_runs": warmup_runs,
         "sample_runs": sample_runs,
+        "trace_discard_runs": discard_runs,
         "copy_direction": "hbm_to_hbm_copy",
         "traffic_class": "copy_read_write",
         "measured_hbm_traffic": "bytes_per_fetch read plus bytes_per_fetch write",
@@ -278,11 +286,23 @@ def _positive_int_env(name: str, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
+def _nonnegative_int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed >= 0 else default
+
+
 def _measure_hbm_copy_ms(
     tile_shape: tuple[int, int, int],
     *,
     warmup_runs: int,
     sample_runs: int,
+    discard_runs: int,
     trace_root: str,
 ) -> list[float]:
     import jax
@@ -305,5 +325,6 @@ def _measure_hbm_copy_ms(
         task=task,
         tries=sample_runs,
         warmup=warmup_runs,
+        discard_initial_samples=discard_runs,
         trace_root=trace_root,
     )

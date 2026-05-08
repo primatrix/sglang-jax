@@ -34,6 +34,7 @@ STATUS_MEASURED = "measured"
 STATUS_NOT_IMPLEMENTED = "not_implemented"
 DEFAULT_WARMUP_RUNS = 3
 DEFAULT_SAMPLE_RUNS = 9
+DEFAULT_TRACE_DISCARD_RUNS = 1
 HIDDEN_SIZE = 8192
 H_PER_T_PACKING = HIDDEN_SIZE // T_PACKING
 VMEM_LIMIT_BYTES = 96 * 1024 * 1024
@@ -215,6 +216,9 @@ def build_not_implemented_rows(
     rows: list[dict[str, Any]] = []
     warmup_runs = _positive_int_env("CALIBRATION_LAYER1_WARMUP_RUNS", DEFAULT_WARMUP_RUNS)
     sample_runs = _positive_int_env("CALIBRATION_LAYER1_SAMPLE_RUNS", DEFAULT_SAMPLE_RUNS)
+    discard_runs = _nonnegative_int_env(
+        "CALIBRATION_LAYER1_TRACE_DISCARD_RUNS", DEFAULT_TRACE_DISCARD_RUNS
+    )
     trace_root = os.getenv("CALIBRATION_LAYER1_TRACE_ROOT", "/tmp/sglang_jax_layer1_dma_trace")
 
     for shape in shapes:
@@ -226,6 +230,7 @@ def build_not_implemented_rows(
                     plan=plan,
                     warmup_runs=warmup_runs,
                     sample_runs=sample_runs,
+                    discard_runs=discard_runs,
                     trace_root=trace_root,
                 ),
             )
@@ -234,6 +239,7 @@ def build_not_implemented_rows(
                     plan,
                     warmup_runs=warmup_runs,
                     sample_runs=sample_runs,
+                    discard_runs=discard_runs,
                     trace_root=trace_root,
                 )
             except Exception as exc:
@@ -412,6 +418,7 @@ def _with_measurement_metadata(
     plan: WeightTileDMAPlan,
     warmup_runs: int,
     sample_runs: int,
+    discard_runs: int,
     trace_root: str,
 ) -> dict[str, Any]:
     enriched = dict(metadata or {})
@@ -419,6 +426,7 @@ def _with_measurement_metadata(
         "name": "layer1_pallas_weight_tile_dma",
         "warmup_runs": warmup_runs,
         "sample_runs": sample_runs,
+        "trace_discard_runs": discard_runs,
         "timing": "jax_profiler_trace_device_duration_ms",
         "trace_root": trace_root,
         "pallas_grid": (1,),
@@ -525,11 +533,23 @@ def _positive_int_env(name: str, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
+def _nonnegative_int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed >= 0 else default
+
+
 def _measure_weight_tile_dma_ms(
     plan: WeightTileDMAPlan,
     *,
     warmup_runs: int,
     sample_runs: int,
+    discard_runs: int,
     trace_root: str,
 ) -> list[float]:
     import jax
@@ -557,6 +577,7 @@ def _measure_weight_tile_dma_ms(
         task=task,
         tries=sample_runs,
         warmup=warmup_runs,
+        discard_initial_samples=discard_runs,
         trace_root=trace_root,
     )
 

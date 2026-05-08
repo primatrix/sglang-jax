@@ -120,6 +120,7 @@ def multiple_iteration_timeit_from_trace(
     task: str,
     tries: int = 5,
     warmup: int = 0,
+    discard_initial_samples: int = 0,
     trace_root: str = "/tmp/sglang_jax_moe_trace",
 ) -> list[float]:
     """
@@ -136,8 +137,21 @@ def multiple_iteration_timeit_from_trace(
         jax.block_until_ready(out)
     print(f"warmed up in {(time.perf_counter() - start) * 1000} ms")
 
-    with jax.profiler.trace(trace_dir):
-        for i in range(tries):
+    profiler_options = None
+    try:
+        profiler_options = jax.profiler.ProfileOptions()
+        profiler_options.advanced_configuration = {
+            "tpu_trace_mode": "TRACE_ONLY_XLA",
+            "tpu_num_sparse_cores_to_trace": 0,
+            "tpu_num_sparse_core_tiles_to_trace": 0,
+        }
+    except Exception:
+        profiler_options = None
+
+    trace_kwargs = {"profiler_options": profiler_options} if profiler_options is not None else {}
+    traced_tries = int(tries) + max(0, int(discard_initial_samples))
+    with jax.profiler.trace(trace_dir, **trace_kwargs):
+        for i in range(traced_tries):
             data_args = data_generator()
             with jax.profiler.StepTraceAnnotation(task, step_num=i):
                 with jax.named_scope(f"{MARKER}_{i}"):
@@ -145,4 +159,5 @@ def multiple_iteration_timeit_from_trace(
                     jax.block_until_ready(out)
 
     trace = _load_trace(trace_dir)
-    return _extract_marker_durations_ms(trace, task=task)
+    durations = _extract_marker_durations_ms(trace, task=task)
+    return durations[max(0, int(discard_initial_samples)) :]

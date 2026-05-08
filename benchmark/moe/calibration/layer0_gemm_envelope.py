@@ -14,6 +14,7 @@ STATUS_NOT_IMPLEMENTED = "not_implemented"
 
 DEFAULT_WARMUP_RUNS = 3
 DEFAULT_SAMPLE_RUNS = 9
+DEFAULT_TRACE_DISCARD_RUNS = 1
 BF16_BYTES = 2
 
 
@@ -71,6 +72,9 @@ def build_rows(
     rows: list[dict[str, Any]] = []
     warmup_runs = _positive_int_env("CALIBRATION_LAYER0_GEMM_WARMUP_RUNS", DEFAULT_WARMUP_RUNS)
     sample_runs = _positive_int_env("CALIBRATION_LAYER0_GEMM_SAMPLE_RUNS", DEFAULT_SAMPLE_RUNS)
+    discard_runs = _nonnegative_int_env(
+        "CALIBRATION_LAYER0_GEMM_TRACE_DISCARD_RUNS", DEFAULT_TRACE_DISCARD_RUNS
+    )
     trace_root = os.getenv(
         "CALIBRATION_LAYER0_GEMM_TRACE_ROOT", "/tmp/sglang_jax_layer0_gemm_trace"
     )
@@ -81,6 +85,7 @@ def build_rows(
             shape=shape,
             warmup_runs=warmup_runs,
             sample_runs=sample_runs,
+            discard_runs=discard_runs,
             trace_root=trace_root,
         )
         try:
@@ -88,6 +93,7 @@ def build_rows(
                 shape,
                 warmup_runs=warmup_runs,
                 sample_runs=sample_runs,
+                discard_runs=discard_runs,
                 trace_root=trace_root,
             )
         except Exception as exc:
@@ -194,6 +200,7 @@ def _with_measurement_metadata(
     shape: Any,
     warmup_runs: int,
     sample_runs: int,
+    discard_runs: int,
     trace_root: str,
 ) -> dict[str, Any]:
     enriched = _metadata_for_shape(metadata, shape)
@@ -201,6 +208,7 @@ def _with_measurement_metadata(
         "name": "layer0_jax_gemm_envelope",
         "warmup_runs": warmup_runs,
         "sample_runs": sample_runs,
+        "trace_discard_runs": discard_runs,
         "timing": "jax_profiler_trace_device_duration_ms",
         "trace_root": trace_root,
     }
@@ -264,11 +272,23 @@ def _positive_int_env(name: str, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
+def _nonnegative_int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed >= 0 else default
+
+
 def _measure_gemm_ms(
     shape: Any,
     *,
     warmup_runs: int,
     sample_runs: int,
+    discard_runs: int,
     trace_root: str,
 ) -> list[float]:
     import jax
@@ -292,6 +312,7 @@ def _measure_gemm_ms(
         task=task,
         tries=sample_runs,
         warmup=warmup_runs,
+        discard_initial_samples=discard_runs,
         trace_root=trace_root,
     )
 
