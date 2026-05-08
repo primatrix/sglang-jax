@@ -18,9 +18,7 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     MockRecurrentStatePool,
 )
-from sgl_jax.srt.layers.attention.linear.lightning_backend import (
-    LightningAttnBackend,
-)
+from sgl_jax.srt.layers.attention.linear.lightning_backend import LightningAttnBackend
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.models.bailing_moe_v2_5_linear_attention import (
     BailingMoeV2_5LinearAttention,
@@ -146,8 +144,9 @@ def _extract_state(pool_updates, recurrent_indices):
     return new_ssm_full[jnp.array(recurrent_indices)]
 
 
-def _setup_backend_metadata(backend, forward_mode, recurrent_indices,
-                            extend_seq_lens=None, input_ids=None):
+def _setup_backend_metadata(
+    backend, forward_mode, recurrent_indices, extend_seq_lens=None, input_ids=None
+):
     """Set up backend forward_metadata for the given forward mode."""
     batch = SimpleNamespace(forward_mode=forward_mode, recurrent_indices=recurrent_indices)
     if forward_mode == ForwardMode.DECODE:
@@ -415,7 +414,9 @@ class TestModuleLevelMockKernel:
         k_pt = torch_rmsnorm(k_pt, torch.tensor(k_norm_w), _CF_EPS)
 
         # 3. RoPE
-        q_pt, k_pt = torch_rope_neox(positions_pt, q_pt, k_pt, _CF_K, _CF_ROTARY_DIM, _CF_ROPE_THETA)
+        q_pt, k_pt = torch_rope_neox(
+            positions_pt, q_pt, k_pt, _CF_K, _CF_ROTARY_DIM, _CF_ROPE_THETA
+        )
 
         # 4. Mock kernel: same dummy
         attn_pt = torch.tensor(dummy_attn_np)
@@ -423,7 +424,9 @@ class TestModuleLevelMockKernel:
         # 5. Gating
         g_pt = F.linear(hidden_pt, torch.tensor(g_proj_w.T))
         gate_pt = torch.sigmoid(g_pt)
-        gated_pt = torch_group_rmsnorm(attn_pt, torch.tensor(g_norm_w), _CF_NUM_GROUPS, _CF_EPS) * gate_pt
+        gated_pt = (
+            torch_group_rmsnorm(attn_pt, torch.tensor(g_norm_w), _CF_NUM_GROUPS, _CF_EPS) * gate_pt
+        )
 
         # 6. Dense
         output_pt = F.linear(gated_pt, torch.tensor(dense_w.T))
@@ -616,16 +619,10 @@ class TestGLAWrapper:
             err_msg="Decode: module state != direct kernel state",
         )
 
-
     @requires_simple_gla
     @requires_tpu
     def test_prefill_wrapper_matches_direct_kernel(self):
-        """Module prefill output should match direct scatter + simple_gla_fwd call."""
-        from sgl_jax.srt.layers.attention.linear.gla_metadata import (
-            gather_from_packed,
-            scatter_to_packed,
-        )
-
+        """Module prefill output should match a direct simple_gla_fwd call (varlen kernel)."""
         seq_len = 128
         layer_id = 5
         with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
@@ -637,7 +634,9 @@ class TestGLAWrapper:
             state_init = jnp.zeros((1, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.float32)
             pool, rec_indices = _make_mock_pool(layer_id, state_init)
             _setup_backend_metadata(
-                backend, ForwardMode.EXTEND, rec_indices,
+                backend,
+                ForwardMode.EXTEND,
+                rec_indices,
                 extend_seq_lens=np.array([seq_len], dtype=np.int32),
                 input_ids=np.zeros(seq_len, dtype=np.int32),
             )
@@ -669,19 +668,14 @@ class TestGLAWrapper:
                 NamedSharding(mesh, P(None, "tensor", None, None)),
             )
 
-            scatter_idx = backend.scatter_idx
-            T_pb = backend.T_packed_bucket
-            cu_seqlens = backend.cu_seqlens_aligned
+            cu_seqlens = backend.forward_metadata.cu_q_lens
             slope_sm = jax.sharding.reshard(module.slope, NamedSharding(mesh, P("tensor")))
 
-            def _direct_prefill_fn(q_l, k_l, v_l, gamma, h0, scatter_idx_p, cu_seqlens_p):
-                q_p = scatter_to_packed(q_l, scatter_idx_p, T_pb)
-                k_p = scatter_to_packed(k_l, scatter_idx_p, T_pb)
-                v_p = scatter_to_packed(v_l, scatter_idx_p, T_pb)
+            def _direct_prefill_fn(q_l, k_l, v_l, gamma, h0, cu_seqlens_p):
                 return simple_gla_fwd(
-                    q_p,
-                    k_p,
-                    v_p,
+                    q_l,
+                    k_l,
+                    v_l,
                     g_gamma=gamma,
                     h0=h0,
                     cu_seqlens_dev=cu_seqlens_p,
@@ -694,21 +688,20 @@ class TestGLAWrapper:
                 _direct_prefill_fn,
                 mesh=mesh,
                 in_specs=(
-                    P(None, "tensor", None),  # q
-                    P(None, "tensor", None),  # k
-                    P(None, "tensor", None),  # v
+                    P(None, None, "tensor", None),  # q
+                    P(None, None, "tensor", None),  # k
+                    P(None, None, "tensor", None),  # v
                     P("tensor"),  # slope
                     P(None, "tensor", None, None),  # h0
-                    P(),  # scatter_idx
                     P(),  # cu_seqlens
                 ),
                 out_specs=(
-                    P(None, None, "tensor", None),  # output_packed
+                    P(None, None, "tensor", None),  # output
                     P(None, "tensor", None, None),  # new_state
                 ),
                 check_vma=False,
-            )(q, k, v, slope_sm, recurrent_state, scatter_idx, cu_seqlens)
-            attn_output = gather_from_packed(output_packed, scatter_idx)
+            )(q[None], k[None], v[None], slope_sm, recurrent_state, cu_seqlens)
+            attn_output = output_packed[0]
 
             # Apply same gating and dense as module
             attn_output = attn_output.reshape(seq_len, -1)
@@ -721,7 +714,7 @@ class TestGLAWrapper:
             np.array(out_module),
             np.array(out_direct),
             atol=1e-6,
-            err_msg="Prefill: module output != direct scatter + kernel + gather + gating",
+            err_msg="Prefill: module output != direct kernel + gating",
         )
         np.testing.assert_allclose(
             np.array(state_module),
@@ -768,9 +761,10 @@ def _copy_weights_across_meshes(target_module, source_module):
     existing sharding (which is already on the correct mesh).
 
     Skips the backend sub-module (LightningAttnBackend) because its state
-    (scatter_idx, cu_seqlens_dev) is runtime metadata, not model weights.
-    Overwriting it would corrupt the target's pre-computed metadata and
-    replace nnx.Variable with plain arrays (causing .value AttributeError).
+    (forward_metadata: cu_q_lens, recurrent_indices) is runtime metadata, not
+    model weights. Overwriting it would corrupt the target's pre-computed
+    metadata and replace nnx.Variable with plain arrays (causing .value
+    AttributeError).
     """
     # Temporarily detach backends so nnx.state doesn't traverse them
     src_backend = source_module.backend
@@ -887,7 +881,9 @@ class TestTPConsistency:
             )
             pool1, rec1 = _make_mock_pool(layer_id, state_init)
             _setup_backend_metadata(
-                backend1, ForwardMode.EXTEND, rec1,
+                backend1,
+                ForwardMode.EXTEND,
+                rec1,
                 extend_seq_lens=np.array([seq_len], dtype=np.int32),
                 input_ids=np.zeros(seq_len, dtype=np.int32),
             )
@@ -905,7 +901,9 @@ class TestTPConsistency:
                 _copy_weights_across_meshes(module_n, module1)
                 pool_n, rec_n = _make_mock_pool(layer_id, state_init)
                 _setup_backend_metadata(
-                    backend_n, ForwardMode.EXTEND, rec_n,
+                    backend_n,
+                    ForwardMode.EXTEND,
+                    rec_n,
                     extend_seq_lens=np.array([seq_len], dtype=np.int32),
                     input_ids=np.zeros(seq_len, dtype=np.int32),
                 )
