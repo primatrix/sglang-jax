@@ -66,12 +66,15 @@ def _make_mock_pool(layer_id, recurrent_state, recurrent_indices=None):
     return MockRecurrentStatePool(layer_caches={layer_id: (buf, [])}), recurrent_indices
 
 
-def _make_fake_layer(layer_id=5, slope=None):
-    if slope is None:
-        slope = jnp.array([-0.1, -0.2, -0.3, -0.4], dtype=jnp.float32)
+def _make_fake_layer(layer_id=5):
+    """Minimal layer stand-in for backend tests.
+
+    The backend reads ``layer.layer_id``, ``layer.num_heads``, ``layer.head_dim``,
+    ``layer.mesh``. Slope is no longer carried by the layer — it lives on
+    ``backend.tp_slope[layer_id]`` (per upstream LightningAttention pattern).
+    """
     return SimpleNamespace(
         layer_id=layer_id,
-        slope=slope,
         mesh=mesh,
         num_heads=_H,
         head_dim=_K,
@@ -93,8 +96,16 @@ class TestForwardDecode:
     @requires_simple_gla
     def test_decode_matches_direct_kernel(self):
         """Backend decode should match direct fused_recurrent_simple_gla call."""
-        backend = LightningAttnBackend(mesh=mesh)
         layer_id = 5
+        # Backend must be constructed with linear_recurrent_layer_ids so
+        # tp_slope[layer_id] is populated; the test compares against a
+        # direct kernel call using the same slope value.
+        backend = LightningAttnBackend(
+            mesh=mesh,
+            linear_recurrent_layer_ids=[layer_id],
+            num_hidden_layers=80,
+            num_heads=_H,
+        )
 
         with jax.set_mesh(mesh):
             state_init = jnp.zeros((1, _H, _K, _K), dtype=jnp.float32)
@@ -110,8 +121,8 @@ class TestForwardDecode:
             q = jax.random.normal(jax.random.PRNGKey(0), (1, _H, _K), dtype=jnp.bfloat16)
             k = jax.random.normal(jax.random.PRNGKey(1), (1, _H, _K), dtype=jnp.bfloat16)
             v = jax.random.normal(jax.random.PRNGKey(2), (1, _H, _K), dtype=jnp.bfloat16)
-            slope = jnp.array([-0.1, -0.2, -0.3, -0.4], dtype=jnp.float32)
-            layer = _make_fake_layer(layer_id=layer_id, slope=slope)
+            slope = backend.tp_slope[layer_id]
+            layer = _make_fake_layer(layer_id=layer_id)
             fb = SimpleNamespace(forward_mode=ForwardMode.DECODE)
 
             output, pool_updates = backend(
@@ -161,3 +172,139 @@ class TestHybridIntegration:
 
         assert 5 not in hybrid.full_attn_layers
         assert isinstance(hybrid.linear_attn_backend, LightningAttnBackend)
+
+    def test_attn_backend_wrapper_lightning_path(self):
+        """attn_backend_wrapper factory builds LightningAttnBackend with the
+        right tp_slope for a Lightning hybrid config.
+
+        Covers the production wire-up that the model-skeleton PR will turn
+        on. The factory must read linear_layer_ids / num_hidden_layers /
+        num_attention_heads from runner.lightning_config and forward them
+        to LightningAttnBackend so tp_slope[layer_id] is populated for
+        every Lightning layer.
+        """
+        from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
+        from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
+            attn_backend_wrapper,
+        )
+
+        # Mock the minimal runner / config shape that attn_backend_wrapper reads.
+        full_attn_layer_ids = [0, 8, 16]
+        linear_layer_ids = [i for i in range(20) if i not in full_attn_layer_ids]
+        cfg_lightning = SimpleNamespace(
+            linear_layer_ids=linear_layer_ids,
+            num_hidden_layers=20,
+            num_attention_heads=_H,
+            full_attention_layer_ids=full_attn_layer_ids,
+        )
+        runner = SimpleNamespace(
+            mesh=mesh,
+            kimi_linear_config=None,
+            linear_recurrent_config=cfg_lightning,
+            lightning_config=cfg_lightning,
+        )
+
+        with jax.set_mesh(mesh):
+            full_backend = FlashAttention(
+                num_attn_heads=_H,
+                num_kv_heads=_H,
+                head_dim=_K,
+                page_size=1,
+                mesh=mesh,
+            )
+            hybrid = attn_backend_wrapper(runner, full_backend)
+
+        assert isinstance(hybrid, HybridLinearAttnBackend)
+        assert isinstance(hybrid.linear_attn_backend, LightningAttnBackend)
+        assert hybrid.full_attn_layers == frozenset(full_attn_layer_ids)
+        # tp_slope must cover every Lightning layer id (and only those).
+        assert sorted(hybrid.linear_attn_backend.tp_slope.keys()) == sorted(linear_layer_ids)
+        # Slope vector shape matches num_heads.
+        assert hybrid.linear_attn_backend.tp_slope[linear_layer_ids[0]].shape == (_H,)
+
+
+class TestRadixLightningAttention:
+    """Direct unit tests for the dispatcher class."""
+
+    def test_construct_carries_layer_metadata(self):
+        from sgl_jax.srt.layers.radix_lightning_attention import RadixLightningAttention
+
+        wrapper = RadixLightningAttention(layer_id=7, num_heads=4, head_dim=128)
+        assert wrapper.layer_id == 7
+        assert wrapper.num_heads == 4
+        assert wrapper.head_dim == 128
+        # Slope is owned by the backend, not the wrapper.
+        assert not hasattr(wrapper, "slope")
+
+    def test_call_forwards_to_attn_backend_with_pool_kw(self):
+        """Dispatcher must call forward_batch.attn_backend with `pool=` keyword
+        so HybridLinearAttnBackend can route via the pool/None fan-out.
+        """
+        from sgl_jax.srt.layers.radix_lightning_attention import RadixLightningAttention
+
+        wrapper = RadixLightningAttention(layer_id=3, num_heads=4, head_dim=128)
+        captured = {}
+
+        def fake_attn_backend(*, q, k, v, layer, forward_batch, pool):
+            captured["q"] = q
+            captured["k"] = k
+            captured["v"] = v
+            captured["layer"] = layer
+            captured["pool"] = pool
+            captured["forward_batch"] = forward_batch
+            # Mimic backend return: (output, new_pool)
+            return (jnp.array([1.0]), pool)
+
+        fb = SimpleNamespace(forward_mode=ForwardMode.DECODE, attn_backend=fake_attn_backend)
+        q = jnp.array([10.0])
+        k = jnp.array([20.0])
+        v = jnp.array([30.0])
+        sentinel_pool = object()
+
+        out, returned_pool = wrapper(fb, q, k, v, sentinel_pool)
+
+        assert captured["layer"] is wrapper
+        assert captured["pool"] is sentinel_pool
+        assert captured["forward_batch"] is fb
+        assert captured["q"] is q and captured["k"] is k and captured["v"] is v
+        assert returned_pool is sentinel_pool
+
+
+class TestTpSlopeFailFast:
+    """tp_slope[layer_id] missing must raise a contextual KeyError."""
+
+    def test_keyerror_message_lists_registered_ids(self):
+        # Backend with only layer_ids 1, 2 registered.
+        backend = LightningAttnBackend(
+            mesh=mesh,
+            linear_recurrent_layer_ids=[1, 2],
+            num_hidden_layers=80,
+            num_heads=_H,
+        )
+        # Stub out forward_metadata so __call__ gets past the early lookup
+        # and reaches the tp_slope access. We only need to exercise the
+        # KeyError path; no actual kernel call should occur.
+        backend.forward_metadata = SimpleNamespace(recurrent_indices=jnp.array([1]))
+
+        layer = _make_fake_layer(layer_id=99)
+        pool = SimpleNamespace()
+        # We need pool.get_linear_recurrent_layer_cache to return something
+        # so get_state doesn't crash before the KeyError.
+        dummy_buf = jnp.zeros((2, _H, _K, _K), dtype=jnp.float32)
+        pool.get_linear_recurrent_layer_cache = lambda lid: (dummy_buf, [])
+
+        fb = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        with pytest.raises(KeyError) as exc_info:
+            backend(
+                jnp.zeros((1, _H, _K)),
+                jnp.zeros((1, _H, _K)),
+                jnp.zeros((1, _H, _K)),
+                layer=layer,
+                forward_batch=fb,
+                recurrent_state_pool=pool,
+            )
+
+        msg = str(exc_info.value)
+        assert "layer_id=99" in msg
+        assert "registered ids: [1, 2]" in msg
+        assert "attn_backend_wrapper" in msg

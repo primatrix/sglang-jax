@@ -260,11 +260,20 @@ def attn_backend_wrapper(
         linear_attn_backend = KDAAttnBackend(runner.mesh)
     # TODO: Add runner.lightning_config property when BailingMoeV2.5 model
     # skeleton is integrated. The config detection requires a dedicated HF
-    # config class for Ling-2.5.
+    # config class for Ling-2.5; the implementation here mirrors the KDA
+    # branch above (per-layer slope is pre-computed in __init__).
     elif getattr(runner, "lightning_config", None) is not None:
-        from sgl_jax.srt.layers.attention.linear.lightning_backend import LightningAttnBackend
+        from sgl_jax.srt.layers.attention.linear.lightning_backend import (
+            LightningAttnBackend,
+        )
 
-        linear_attn_backend = LightningAttnBackend(runner.mesh)
+        cfg_lightning = runner.lightning_config
+        linear_attn_backend = LightningAttnBackend(
+            mesh=runner.mesh,
+            linear_recurrent_layer_ids=cfg_lightning.linear_layer_ids,
+            num_hidden_layers=cfg_lightning.num_hidden_layers,
+            num_heads=cfg_lightning.num_attention_heads,
+        )
     else:
         raise NotImplementedError(f"No linear backend wired for hybrid config {type(cfg).__name__}")
     return HybridLinearAttnBackend(

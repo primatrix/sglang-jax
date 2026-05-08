@@ -313,7 +313,12 @@ class TestExtendSharded:
         h0_padded[:B_real] = h0_np
 
         with jax.set_mesh(mesh):
-            backend = LightningAttnBackend(mesh=mesh)
+            backend = LightningAttnBackend(
+                mesh=mesh,
+                linear_recurrent_layer_ids=[layer_id],
+                num_hidden_layers=80,
+                num_heads=H,
+            )
             rec_indices = np.arange(1, B_padded + 1, dtype=np.int32)
             pool, _ = _make_mock_pool(layer_id, jnp.array(h0_padded), rec_indices)
             _setup_backend(
@@ -415,7 +420,12 @@ class TestEndToEndBackend:
         _, ref_state = numpy_gla_recurrent(q_ext_np, k_ext_np, v_ext_np, g_gamma, h0=h0_np)
 
         with jax.set_mesh(mesh):
-            backend = LightningAttnBackend(mesh=mesh)
+            backend = LightningAttnBackend(
+                mesh=mesh,
+                linear_recurrent_layer_ids=[layer_id],
+                num_hidden_layers=80,
+                num_heads=H,
+            )
             padded_seq_lens, input_ids, T_outer = _build_extend_batch([seq_len])
             B_padded = len(padded_seq_lens)
 
