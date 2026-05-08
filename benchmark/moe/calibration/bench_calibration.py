@@ -12,7 +12,11 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from benchmark.moe.calibration import layer0_hbm_envelope, layer1_weight_tile_dma
+from benchmark.moe.calibration import (
+    layer0_gemm_envelope,
+    layer0_hbm_envelope,
+    layer1_weight_tile_dma,
+)
 from benchmark.moe.calibration.common import (
     build_observation_row,
     collect_runtime_identity,
@@ -20,12 +24,22 @@ from benchmark.moe.calibration.common import (
 )
 
 SCENARIO_LAYER0_HBM_ENVELOPE = "layer0_hbm_envelope"
+SCENARIO_LAYER0_GEMM_ENVELOPE = "layer0_gemm_envelope"
 SCENARIO_LAYER1_WEIGHT_TILE_DMA = "layer1_weight_tile_dma"
-SCENARIOS = (SCENARIO_LAYER0_HBM_ENVELOPE, SCENARIO_LAYER1_WEIGHT_TILE_DMA)
+SCENARIOS = (
+    SCENARIO_LAYER0_HBM_ENVELOPE,
+    SCENARIO_LAYER0_GEMM_ENVELOPE,
+    SCENARIO_LAYER1_WEIGHT_TILE_DMA,
+)
 
 SUITE_V7X32_BF16_WEIGHT_TILES = "v7x32_bf16_weight_tiles"
 SUITE_V7X32_BF16_HBM_COPY_ENVELOPE = "v7x32_bf16_hbm_copy_envelope"
-SUITES = (SUITE_V7X32_BF16_WEIGHT_TILES, SUITE_V7X32_BF16_HBM_COPY_ENVELOPE)
+SUITE_V7X32_BF16_GEMM_ENVELOPE = "v7x32_bf16_gemm_envelope"
+SUITES = (
+    SUITE_V7X32_BF16_WEIGHT_TILES,
+    SUITE_V7X32_BF16_HBM_COPY_ENVELOPE,
+    SUITE_V7X32_BF16_GEMM_ENVELOPE,
+)
 
 DTYPE = "bfloat16"
 WEIGHT_DTYPE = "bfloat16"
@@ -52,6 +66,14 @@ class WeightTileShape:
     bd: int
     bytes_per_fetch: int
     tile_shape: tuple[int, int, int]
+
+
+@dataclass(frozen=True)
+class GemmShape:
+    path: str
+    m: int
+    k: int
+    n: int
 
 
 PHASE1_HBM_EQUIVALENT_SHAPES: tuple[WeightTileShape, ...] = (
@@ -98,6 +120,55 @@ PHASE1_HBM_COPY_LADDER_SHAPES: tuple[WeightTileShape, ...] = tuple(
     for bytes_per_fetch in PHASE1_HBM_COPY_LADDER_BYTES
 )
 
+PHASE1_GEMM_EQUIVALENT_SHAPES: tuple[GemmShape, ...] = (
+    GemmShape("ffn1", 2, 1024, 2048),
+    GemmShape("ffn1", 4, 1024, 2048),
+    GemmShape("ffn1", 4, 2048, 1024),
+    GemmShape("ffn1", 8, 512, 2048),
+    GemmShape("ffn1", 8, 1024, 2048),
+    GemmShape("ffn1", 16, 512, 2048),
+    GemmShape("ffn1", 16, 1024, 1024),
+    GemmShape("ffn1", 16, 1024, 2048),
+    GemmShape("ffn1", 32, 512, 2048),
+    GemmShape("ffn1", 32, 1024, 1024),
+    GemmShape("ffn1", 32, 2048, 512),
+    GemmShape("ffn1", 32, 4096, 512),
+    GemmShape("ffn1", 64, 512, 1024),
+    GemmShape("ffn1", 64, 1024, 512),
+    GemmShape("ffn1", 64, 1024, 1024),
+    GemmShape("ffn1", 64, 1024, 2048),
+    GemmShape("ffn1", 64, 2048, 512),
+    GemmShape("ffn1", 128, 512, 512),
+    GemmShape("ffn1", 128, 512, 1024),
+    GemmShape("ffn1", 128, 1024, 2048),
+    GemmShape("ffn1", 256, 512, 2048),
+    GemmShape("ffn1", 512, 512, 2048),
+    GemmShape("ffn1", 1024, 512, 512),
+    GemmShape("ffn2", 2, 2048, 1024),
+    GemmShape("ffn2", 4, 1024, 2048),
+    GemmShape("ffn2", 4, 2048, 1024),
+    GemmShape("ffn2", 8, 2048, 512),
+    GemmShape("ffn2", 8, 2048, 1024),
+    GemmShape("ffn2", 16, 1024, 1024),
+    GemmShape("ffn2", 16, 2048, 512),
+    GemmShape("ffn2", 16, 2048, 1024),
+    GemmShape("ffn2", 32, 512, 2048),
+    GemmShape("ffn2", 32, 512, 4096),
+    GemmShape("ffn2", 32, 1024, 1024),
+    GemmShape("ffn2", 32, 2048, 512),
+    GemmShape("ffn2", 64, 512, 1024),
+    GemmShape("ffn2", 64, 512, 2048),
+    GemmShape("ffn2", 64, 1024, 512),
+    GemmShape("ffn2", 64, 1024, 1024),
+    GemmShape("ffn2", 64, 2048, 1024),
+    GemmShape("ffn2", 128, 512, 512),
+    GemmShape("ffn2", 128, 1024, 512),
+    GemmShape("ffn2", 128, 2048, 1024),
+    GemmShape("ffn2", 256, 2048, 512),
+    GemmShape("ffn2", 512, 2048, 512),
+    GemmShape("ffn2", 1024, 512, 512),
+)
+
 
 def load_suite_shapes(suite: str) -> tuple[WeightTileShape, ...]:
     if suite != SUITE_V7X32_BF16_WEIGHT_TILES:
@@ -111,6 +182,12 @@ def load_layer0_suite_shapes(suite: str) -> tuple[WeightTileShape, ...]:
     if suite == SUITE_V7X32_BF16_HBM_COPY_ENVELOPE:
         return PHASE1_HBM_COPY_LADDER_SHAPES + PHASE1_HBM_EQUIVALENT_SHAPES
     raise ValueError(f"Unsupported Layer 0 suite: {suite}")
+
+
+def load_layer0_gemm_suite_shapes(suite: str) -> tuple[GemmShape, ...]:
+    if suite == SUITE_V7X32_BF16_GEMM_ENVELOPE:
+        return PHASE1_GEMM_EQUIVALENT_SHAPES
+    raise ValueError(f"Unsupported Layer 0 GEMM suite: {suite}")
 
 
 def _source() -> dict[str, Any]:
@@ -202,6 +279,22 @@ def _layer0_hbm_envelope_rows(
     )
 
 
+def _layer0_gemm_envelope_rows(
+    suite: str, execution_mode: str, runtime: dict[str, Any]
+) -> list[dict[str, Any]]:
+    return layer0_gemm_envelope.build_rows(
+        suite=suite,
+        shapes=load_layer0_gemm_suite_shapes(suite),
+        execution_mode=execution_mode,
+        runtime=runtime,
+        dtype=DTYPE,
+        weight_dtype=WEIGHT_DTYPE,
+        t_packing=T_PACKING,
+        source=_source(),
+        metadata=_suite_metadata(matrix_kind="gemm_equivalent_shape"),
+    )
+
+
 def _layer1_weight_tile_dma_rows(
     suite: str, execution_mode: str, runtime: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -228,7 +321,7 @@ def resolve_execution_mode(scenario: str, requested: str, runtime: dict[str, Any
         return requested
     if _jax_backend(runtime) != "tpu":
         return "local_smoke"
-    if scenario == SCENARIO_LAYER0_HBM_ENVELOPE:
+    if scenario in (SCENARIO_LAYER0_HBM_ENVELOPE, SCENARIO_LAYER0_GEMM_ENVELOPE):
         return "jax_trace"
     return "pallas"
 
@@ -238,6 +331,8 @@ def build_rows(scenario: str, suite: str, execution_mode: str) -> list[dict[str,
     resolved_mode = resolve_execution_mode(scenario, execution_mode, runtime)
     if scenario == SCENARIO_LAYER0_HBM_ENVELOPE:
         return _layer0_hbm_envelope_rows(suite, resolved_mode, runtime)
+    if scenario == SCENARIO_LAYER0_GEMM_ENVELOPE:
+        return _layer0_gemm_envelope_rows(suite, resolved_mode, runtime)
     if scenario == SCENARIO_LAYER1_WEIGHT_TILE_DMA:
         return _layer1_weight_tile_dma_rows(suite, resolved_mode, runtime)
     raise ValueError(f"Unsupported scenario: {scenario}")
