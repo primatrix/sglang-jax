@@ -24,7 +24,8 @@ SCENARIO_LAYER1_WEIGHT_TILE_DMA = "layer1_weight_tile_dma"
 SCENARIOS = (SCENARIO_LAYER0_HBM_ENVELOPE, SCENARIO_LAYER1_WEIGHT_TILE_DMA)
 
 SUITE_V7X32_BF16_WEIGHT_TILES = "v7x32_bf16_weight_tiles"
-SUITES = (SUITE_V7X32_BF16_WEIGHT_TILES,)
+SUITE_V7X32_BF16_HBM_COPY_ENVELOPE = "v7x32_bf16_hbm_copy_envelope"
+SUITES = (SUITE_V7X32_BF16_WEIGHT_TILES, SUITE_V7X32_BF16_HBM_COPY_ENVELOPE)
 
 DTYPE = "bfloat16"
 WEIGHT_DTYPE = "bfloat16"
@@ -74,11 +75,40 @@ PHASE1_HBM_EQUIVALENT_SHAPES: tuple[WeightTileShape, ...] = (
     WeightTileShape("w2", 2048, 2048, 8388608, (2, 2048, 1024)),
 )
 
+PHASE1_HBM_COPY_LADDER_BYTES = (
+    64 * 1024,
+    256 * 1024,
+    1024 * 1024,
+    4 * 1024 * 1024,
+    16 * 1024 * 1024,
+    64 * 1024 * 1024,
+    256 * 1024 * 1024,
+)
+
+PHASE1_HBM_COPY_LADDER_SHAPES: tuple[WeightTileShape, ...] = tuple(
+    WeightTileShape(
+        path_class="hbm_ladder",
+        bf=bytes_per_fetch // 2,
+        bd=1,
+        bytes_per_fetch=bytes_per_fetch,
+        tile_shape=(1, 1, bytes_per_fetch // 2),
+    )
+    for bytes_per_fetch in PHASE1_HBM_COPY_LADDER_BYTES
+)
+
 
 def load_suite_shapes(suite: str) -> tuple[WeightTileShape, ...]:
     if suite != SUITE_V7X32_BF16_WEIGHT_TILES:
         raise ValueError(f"Unsupported suite: {suite}")
     return PHASE1_HBM_EQUIVALENT_SHAPES
+
+
+def load_layer0_suite_shapes(suite: str) -> tuple[WeightTileShape, ...]:
+    if suite == SUITE_V7X32_BF16_WEIGHT_TILES:
+        return PHASE1_HBM_EQUIVALENT_SHAPES
+    if suite == SUITE_V7X32_BF16_HBM_COPY_ENVELOPE:
+        return PHASE1_HBM_COPY_LADDER_SHAPES + PHASE1_HBM_EQUIVALENT_SHAPES
+    raise ValueError(f"Unsupported Layer 0 suite: {suite}")
 
 
 def _source() -> dict[str, Any]:
@@ -158,7 +188,7 @@ def _layer0_hbm_envelope_rows(
 ) -> list[dict[str, Any]]:
     return layer0_hbm_envelope.build_rows(
         suite=suite,
-        shapes=load_suite_shapes(suite),
+        shapes=load_layer0_suite_shapes(suite),
         execution_mode=execution_mode,
         runtime=runtime,
         dtype=DTYPE,
@@ -173,6 +203,11 @@ def _layer0_hbm_envelope_rows(
 def _layer1_weight_tile_dma_rows(
     suite: str, execution_mode: str, runtime: dict[str, Any]
 ) -> list[dict[str, Any]]:
+    if suite != SUITE_V7X32_BF16_WEIGHT_TILES:
+        raise ValueError(
+            f"Layer 1 weight tile DMA supports only {SUITE_V7X32_BF16_WEIGHT_TILES}, "
+            f"got {suite}."
+        )
     return layer1_weight_tile_dma.build_not_implemented_rows(
         suite=suite,
         shapes=load_suite_shapes(suite),
