@@ -67,3 +67,21 @@ def test_eagle_worker_implements_base_contract():
         "verify",
     ):
         assert hasattr(EAGLEWorker, name)
+
+
+def test_eagle_draft_worker_generate_model_worker_batch_delegates_to_compilation_manager():
+    class FakeCompilationManager:
+        def __init__(self):
+            self.calls = []
+
+        def generate_model_worker_batch(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return "batch"
+
+    worker = EagleDraftWorker.__new__(EagleDraftWorker)
+    worker.compilation_manager = FakeCompilationManager()
+
+    result = worker.generate_model_worker_batch(1, "arg", mode="decode")
+
+    assert result == "batch"
+    assert worker.compilation_manager.calls == [((1, "arg"), {"mode": "decode"})]

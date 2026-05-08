@@ -77,7 +77,7 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
                     ),
                 )
         else:
-            if self.hot_token_ids is not None:
+            if self.draft_model_runner.model.hot_token_ids is not None:
                 head = head.clone()
                 self.hot_token_ids = device_array(
                     self.draft_model_runner.model.hot_token_ids,
@@ -89,6 +89,9 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
                 )
                 head.data = head.data[self.hot_token_ids]
             self.draft_model_runner.model.set_embed_and_head(embed, head)
+
+    def generate_model_worker_batch(self, *args, **kwargs):
+        return self.compilation_manager.generate_model_worker_batch(*args, **kwargs)
 
     def draft(self, model_worker_batch):
         raise NotImplementedError
