@@ -125,9 +125,11 @@ def build_rows(
                 status=STATUS_MEASURED,
                 latency_ms_samples=samples,
                 implementation_note=(
-                    "Measured with a Pallas TPU HBM-to-VMEM local DMA kernel. "
-                    "Each sample starts two bf16 DMA copies, one per t_packing slice, "
-                    "and excludes compilation plus warmup runs."
+                    "Measured with a Pallas TPU HBM-to-VMEM local DMA kernel, "
+                    "anchored by a full VMEM-to-HBM tile DMA store so the copied "
+                    "tile is observable. Each sample excludes compilation plus "
+                    "warmup runs; metadata.benchmark.anchor_store records the "
+                    "extra HBM write traffic."
                 ),
             )
         )
@@ -237,6 +239,8 @@ def _with_measurement_metadata(
         "warmup_runs": warmup_runs,
         "sample_runs": sample_runs,
         "copy_direction": "hbm_to_vmem",
+        "anchor_store": "full_tile_vmem_to_hbm",
+        "measured_hbm_traffic": "bytes_per_fetch read plus bytes_per_fetch anchor write",
         "timing": "host_perf_counter_ms_with_block_until_ready",
     }
     return enriched
@@ -287,7 +291,6 @@ def _build_hbm_local_dma_call(tile_shape: tuple[int, int, int]) -> Callable[[Any
     from jax.experimental.pallas import tpu as pltpu
 
     def _hbm_local_dma_kernel(src_ref, out_ref, scratch_ref, sem):
-        del out_ref
         for packing_idx in range(src_ref.shape[0]):
             pltpu.make_async_copy(
                 src_ref=src_ref.at[packing_idx],
@@ -295,12 +298,15 @@ def _build_hbm_local_dma_call(tile_shape: tuple[int, int, int]) -> Callable[[Any
                 sem=sem,
             ).start()
         pltpu.make_async_copy(src_ref=scratch_ref, dst_ref=scratch_ref, sem=sem).wait()
+        anchor_store = pltpu.make_async_copy(src_ref=scratch_ref, dst_ref=out_ref, sem=sem)
+        anchor_store.start()
+        anchor_store.wait()
 
     @jax.jit
     def _run(src):
         kernel = pl.pallas_call(
             _hbm_local_dma_kernel,
-            out_shape=jax.ShapeDtypeStruct((1,), jnp.bfloat16),
+            out_shape=jax.ShapeDtypeStruct(tile_shape, jnp.bfloat16),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=0,
                 in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)],
