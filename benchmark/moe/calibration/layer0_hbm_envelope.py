@@ -286,7 +286,7 @@ def _build_hbm_local_dma_call(tile_shape: tuple[int, int, int]) -> Callable[[Any
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
 
-    def _hbm_local_dma_kernel(src_ref, out_ref, scratch_ref, sem):
+    def _hbm_local_dma_kernel(src_ref, out_ref, scratch_ref, scalar_ref, sem):
         for packing_idx in range(src_ref.shape[0]):
             pltpu.make_async_copy(
                 src_ref=src_ref.at[packing_idx],
@@ -294,7 +294,10 @@ def _build_hbm_local_dma_call(tile_shape: tuple[int, int, int]) -> Callable[[Any
                 sem=sem,
             ).start()
         pltpu.make_async_copy(src_ref=scratch_ref, dst_ref=scratch_ref, sem=sem).wait()
-        out_ref[0] = scratch_ref[0, 0, 0]
+        scalar_ref[0] = scratch_ref[0, 0, 0]
+        scalar_store = pltpu.make_async_copy(src_ref=scalar_ref, dst_ref=out_ref, sem=sem)
+        scalar_store.start()
+        scalar_store.wait()
 
     @jax.jit
     def _run(src):
@@ -308,6 +311,7 @@ def _build_hbm_local_dma_call(tile_shape: tuple[int, int, int]) -> Callable[[Any
                 grid=(1,),
                 scratch_shapes=[
                     pltpu.VMEM(tile_shape, jnp.bfloat16),
+                    pltpu.VMEM((1,), jnp.bfloat16),
                     pltpu.SemaphoreType.DMA,
                 ],
             ),
