@@ -415,6 +415,7 @@ class EagleDraftInput(SpecInput):
         SpecInput.__init__(self, SpecInputType.EAGLE_DRAFT)
 
     def get_spec_adjust_token_coefficient(self) -> tuple[int, int]:
+        """Draft input advances one logical token per request."""
         return 1, 1
 
     def tree_flatten(self):
@@ -708,6 +709,7 @@ class EagleVerifyInput(SpecInput):
         SpecInput.__init__(self, SpecInputType.EAGLE_VERIFY)
 
     def get_spec_adjust_token_coefficient(self) -> tuple[int, int]:
+        """Verify input expands each request into draft_token_num target tokens."""
         return self.draft_token_num, self.draft_token_num
 
     def tree_flatten(self):

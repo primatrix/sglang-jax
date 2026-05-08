@@ -26,6 +26,7 @@ class SpecInput(ABC):
 
     @abstractmethod
     def get_spec_adjust_token_coefficient(self) -> tuple[int, int]:
+        """Return multipliers for scheduler token accounting and logprob token accounting."""
         raise NotImplementedError
 
 
