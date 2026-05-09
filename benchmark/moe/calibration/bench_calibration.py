@@ -744,12 +744,22 @@ def _layer1_a2a_scatter_rows(
     )
 
 
+def _filter_shapes_by_bf(shapes, bf_values: tuple[int, ...] | None):
+    if bf_values is None:
+        return shapes
+    allowed = set(bf_values)
+    return tuple(shape for shape in shapes if getattr(shape, "bt", None) in allowed)
+
+
 def _layer1_a2a_gather_rows(
-    suite: str, execution_mode: str, runtime: dict[str, Any]
+    suite: str,
+    execution_mode: str,
+    runtime: dict[str, Any],
+    bf_values: tuple[int, ...] | None = None,
 ) -> list[dict[str, Any]]:
     return layer1_a2a_gather.build_rows(
         suite=suite,
-        shapes=load_layer1_a2a_gather_suite_shapes(suite),
+        shapes=_filter_shapes_by_bf(load_layer1_a2a_gather_suite_shapes(suite), bf_values),
         execution_mode=execution_mode,
         runtime=runtime,
         dtype=DTYPE,
@@ -799,7 +809,12 @@ def resolve_execution_mode(scenario: str, requested: str, runtime: dict[str, Any
     return "pallas"
 
 
-def build_rows(scenario: str, suite: str, execution_mode: str) -> list[dict[str, Any]]:
+def build_rows(
+    scenario: str,
+    suite: str,
+    execution_mode: str,
+    bf_values: tuple[int, ...] | None = None,
+) -> list[dict[str, Any]]:
     runtime = collect_runtime_identity()
     resolved_mode = resolve_execution_mode(scenario, execution_mode, runtime)
     if scenario == SCENARIO_LAYER0_HBM_ENVELOPE:
@@ -813,7 +828,7 @@ def build_rows(scenario: str, suite: str, execution_mode: str) -> list[dict[str,
     if scenario == SCENARIO_LAYER1_A2A_SCATTER:
         return _layer1_a2a_scatter_rows(suite, resolved_mode, runtime)
     if scenario == SCENARIO_LAYER1_A2A_GATHER:
-        return _layer1_a2a_gather_rows(suite, resolved_mode, runtime)
+        return _layer1_a2a_gather_rows(suite, resolved_mode, runtime, bf_values)
     if scenario == SCENARIO_LAYER1_WEIGHT_TILE_DMA:
         return _layer1_weight_tile_dma_rows(suite, resolved_mode, runtime)
     if scenario == SCENARIO_LAYER1_LOCAL_DMA:
@@ -852,6 +867,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--bf-values",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated bf/bt values to run. Currently used for "
+            "Layer 1 gather process isolation, e.g. --bf-values 1 or 1,2."
+        ),
+    )
+    parser.add_argument(
         "--print",
         action="store_true",
         help="Also print emitted JSON rows to stdout.",
@@ -859,9 +883,26 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _parse_bf_values(raw: str | None) -> tuple[int, ...] | None:
+    if raw is None or not raw.strip():
+        return None
+    values: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        values.append(int(part))
+    return tuple(values)
+
+
 def main() -> None:
     args = parse_args()
-    rows = build_rows(args.scenario, args.suite, args.execution_mode)
+    rows = build_rows(
+        args.scenario,
+        args.suite,
+        args.execution_mode,
+        _parse_bf_values(args.bf_values),
+    )
     write_jsonl(args.output, rows)
     if args.print:
         for row in rows:
