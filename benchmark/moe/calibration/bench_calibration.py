@@ -16,6 +16,7 @@ from benchmark.moe.calibration import (
     layer0_a2a_envelope,
     layer0_gemm_envelope,
     layer0_hbm_envelope,
+    layer1_a2a_scatter,
     layer1_weight_tile_dma,
 )
 from benchmark.moe.calibration.common import (
@@ -27,11 +28,15 @@ from benchmark.moe.calibration.common import (
 SCENARIO_LAYER0_HBM_ENVELOPE = "layer0_hbm_envelope"
 SCENARIO_LAYER0_GEMM_ENVELOPE = "layer0_gemm_envelope"
 SCENARIO_LAYER0_A2A_ENVELOPE = "layer0_a2a_envelope"
+SCENARIO_LAYER1_A2A_METADATA = "layer1_a2a_metadata"
+SCENARIO_LAYER1_A2A_SCATTER = "layer1_a2a_scatter"
 SCENARIO_LAYER1_WEIGHT_TILE_DMA = "layer1_weight_tile_dma"
 SCENARIOS = (
     SCENARIO_LAYER0_HBM_ENVELOPE,
     SCENARIO_LAYER0_GEMM_ENVELOPE,
     SCENARIO_LAYER0_A2A_ENVELOPE,
+    SCENARIO_LAYER1_A2A_METADATA,
+    SCENARIO_LAYER1_A2A_SCATTER,
     SCENARIO_LAYER1_WEIGHT_TILE_DMA,
 )
 
@@ -41,6 +46,7 @@ SUITE_V7X32_BF16_HBM_CURVE_V2 = "v7x32_bf16_hbm_curve_v2"
 SUITE_V7X32_BF16_GEMM_ENVELOPE = "v7x32_bf16_gemm_envelope"
 SUITE_V7X32_BF16_GEMM_CURVE_V2 = "v7x32_bf16_gemm_curve_v2"
 SUITE_V7X32_BF16_A2A_CURVE_V1 = "v7x32_bf16_a2a_curve_v1"
+SUITE_V7X32_BF16_A2A_TOPK8_V1 = "v7x32_bf16_a2a_topk8_v1"
 SUITES = (
     SUITE_V7X32_BF16_WEIGHT_TILES,
     SUITE_V7X32_BF16_HBM_COPY_ENVELOPE,
@@ -48,6 +54,7 @@ SUITES = (
     SUITE_V7X32_BF16_GEMM_ENVELOPE,
     SUITE_V7X32_BF16_GEMM_CURVE_V2,
     SUITE_V7X32_BF16_A2A_CURVE_V1,
+    SUITE_V7X32_BF16_A2A_TOPK8_V1,
 )
 
 DTYPE = "bfloat16"
@@ -264,6 +271,18 @@ PHASE1_A2A_CURVE_V1_SHAPES: tuple[CollectiveShape, ...] = tuple(
     for matrix_dim in PHASE1_A2A_CURVE_V1_MATRIX_DIMS
 )
 
+PHASE1_A2A_TOPK8_BT_VALUES = (1, 2, 4, 8, 16, 32)
+
+PHASE1_A2A_SCATTER_TOPK8_SHAPES: tuple[layer1_a2a_scatter.A2AScatterShape, ...] = tuple(
+    layer1_a2a_scatter.A2AScatterShape(path_class="scatter_topk8_ring", bt=bt)
+    for bt in PHASE1_A2A_TOPK8_BT_VALUES
+)
+
+PHASE1_A2A_METADATA_TOPK8_SHAPES: tuple[layer1_a2a_scatter.A2AMetadataShape, ...] = tuple(
+    layer1_a2a_scatter.A2AMetadataShape(path_class="metadata_topk8_ring", bt=bt)
+    for bt in PHASE1_A2A_TOPK8_BT_VALUES
+)
+
 
 def load_suite_shapes(suite: str) -> tuple[WeightTileShape, ...]:
     if suite != SUITE_V7X32_BF16_WEIGHT_TILES:
@@ -293,6 +312,22 @@ def load_layer0_a2a_suite_shapes(suite: str) -> tuple[CollectiveShape, ...]:
     if suite == SUITE_V7X32_BF16_A2A_CURVE_V1:
         return PHASE1_A2A_CURVE_V1_SHAPES
     raise ValueError(f"Unsupported Layer 0 A2A suite: {suite}")
+
+
+def load_layer1_a2a_scatter_suite_shapes(
+    suite: str,
+) -> tuple[layer1_a2a_scatter.A2AScatterShape, ...]:
+    if suite == SUITE_V7X32_BF16_A2A_TOPK8_V1:
+        return PHASE1_A2A_SCATTER_TOPK8_SHAPES
+    raise ValueError(f"Unsupported Layer 1 A2A scatter suite: {suite}")
+
+
+def load_layer1_a2a_metadata_suite_shapes(
+    suite: str,
+) -> tuple[layer1_a2a_scatter.A2AMetadataShape, ...]:
+    if suite == SUITE_V7X32_BF16_A2A_TOPK8_V1:
+        return PHASE1_A2A_METADATA_TOPK8_SHAPES
+    raise ValueError(f"Unsupported Layer 1 A2A metadata suite: {suite}")
 
 
 def _source() -> dict[str, Any]:
@@ -432,6 +467,38 @@ def _layer1_weight_tile_dma_rows(
     )
 
 
+def _layer1_a2a_metadata_rows(
+    suite: str, execution_mode: str, runtime: dict[str, Any]
+) -> list[dict[str, Any]]:
+    return layer1_a2a_scatter.build_metadata_rows(
+        suite=suite,
+        shapes=load_layer1_a2a_metadata_suite_shapes(suite),
+        execution_mode=execution_mode,
+        runtime=runtime,
+        dtype=DTYPE,
+        weight_dtype=WEIGHT_DTYPE,
+        t_packing=T_PACKING,
+        source=_source(),
+        metadata=_suite_metadata(matrix_kind="a2a_metadata_topk8"),
+    )
+
+
+def _layer1_a2a_scatter_rows(
+    suite: str, execution_mode: str, runtime: dict[str, Any]
+) -> list[dict[str, Any]]:
+    return layer1_a2a_scatter.build_rows(
+        suite=suite,
+        shapes=load_layer1_a2a_scatter_suite_shapes(suite),
+        execution_mode=execution_mode,
+        runtime=runtime,
+        dtype=DTYPE,
+        weight_dtype=WEIGHT_DTYPE,
+        t_packing=T_PACKING,
+        source=_source(),
+        metadata=_suite_metadata(matrix_kind="a2a_scatter_topk8"),
+    )
+
+
 def _jax_backend(runtime: dict[str, Any]) -> str | None:
     backend = runtime.get("default_backend")
     return str(backend) if backend is not None else None
@@ -460,6 +527,10 @@ def build_rows(scenario: str, suite: str, execution_mode: str) -> list[dict[str,
         return _layer0_gemm_envelope_rows(suite, resolved_mode, runtime)
     if scenario == SCENARIO_LAYER0_A2A_ENVELOPE:
         return _layer0_a2a_envelope_rows(suite, resolved_mode, runtime)
+    if scenario == SCENARIO_LAYER1_A2A_METADATA:
+        return _layer1_a2a_metadata_rows(suite, resolved_mode, runtime)
+    if scenario == SCENARIO_LAYER1_A2A_SCATTER:
+        return _layer1_a2a_scatter_rows(suite, resolved_mode, runtime)
     if scenario == SCENARIO_LAYER1_WEIGHT_TILE_DMA:
         return _layer1_weight_tile_dma_rows(suite, resolved_mode, runtime)
     raise ValueError(f"Unsupported scenario: {scenario}")
