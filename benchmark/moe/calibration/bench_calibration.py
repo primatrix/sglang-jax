@@ -44,6 +44,7 @@ SUITE_V7X32_BF16_WEIGHT_TILES = "v7x32_bf16_weight_tiles"
 SUITE_V7X32_BF16_HBM_COPY_ENVELOPE = "v7x32_bf16_hbm_copy_envelope"
 SUITE_V7X32_BF16_HBM_CURVE_V2 = "v7x32_bf16_hbm_curve_v2"
 SUITE_V7X32_BF16_HBM_DENSE_CURVE_V3 = "v7x32_bf16_hbm_dense_curve_v3"
+SUITE_V7X8_BF16_HBM_DENSE_CURVE_V3 = "v7x8_bf16_hbm_dense_curve_v3"
 SUITE_V7X32_BF16_GEMM_ENVELOPE = "v7x32_bf16_gemm_envelope"
 SUITE_V7X32_BF16_GEMM_CURVE_V2 = "v7x32_bf16_gemm_curve_v2"
 SUITE_V7X32_BF16_A2A_CURVE_V1 = "v7x32_bf16_a2a_curve_v1"
@@ -53,6 +54,7 @@ SUITES = (
     SUITE_V7X32_BF16_HBM_COPY_ENVELOPE,
     SUITE_V7X32_BF16_HBM_CURVE_V2,
     SUITE_V7X32_BF16_HBM_DENSE_CURVE_V3,
+    SUITE_V7X8_BF16_HBM_DENSE_CURVE_V3,
     SUITE_V7X32_BF16_GEMM_ENVELOPE,
     SUITE_V7X32_BF16_GEMM_CURVE_V2,
     SUITE_V7X32_BF16_A2A_CURVE_V1,
@@ -334,7 +336,7 @@ def load_layer0_suite_shapes(suite: str) -> tuple[WeightTileShape, ...]:
         return PHASE1_HBM_COPY_LADDER_SHAPES + PHASE1_HBM_EQUIVALENT_SHAPES
     if suite == SUITE_V7X32_BF16_HBM_CURVE_V2:
         return PHASE1_HBM_CURVE_V2_SHAPES + PHASE1_HBM_EQUIVALENT_SHAPES
-    if suite == SUITE_V7X32_BF16_HBM_DENSE_CURVE_V3:
+    if suite in (SUITE_V7X32_BF16_HBM_DENSE_CURVE_V3, SUITE_V7X8_BF16_HBM_DENSE_CURVE_V3):
         return PHASE1_HBM_DENSE_CURVE_V3_SHAPES + PHASE1_HBM_EQUIVALENT_SHAPES
     raise ValueError(f"Unsupported Layer 0 suite: {suite}")
 
@@ -398,7 +400,7 @@ def _suite_metadata(*, matrix_kind: str) -> dict[str, Any]:
 
 def _layer0_hbm_metadata(suite: str) -> dict[str, Any]:
     metadata = _suite_metadata(matrix_kind="hbm_equivalent_weight_tile")
-    if suite == SUITE_V7X32_BF16_HBM_DENSE_CURVE_V3:
+    if suite in (SUITE_V7X32_BF16_HBM_DENSE_CURVE_V3, SUITE_V7X8_BF16_HBM_DENSE_CURVE_V3):
         metadata["matrix_kind"] = "hbm_dense_curve_v3"
         metadata["includes"] = [
             "tiny_hbm_copy_rows",
