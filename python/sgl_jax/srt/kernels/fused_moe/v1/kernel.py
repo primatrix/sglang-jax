@@ -3719,7 +3719,7 @@ def fused_ep_moe(
     ):
         if needs_jax_allreduce:
             metadata_starts, metadata_sizes, metadata_d2e_counts = jax_allreduce_metadata_by_bt(
-                topk_ids,
+                topk_ids[:, :top_k],
                 padded_num_experts,
                 bt,
                 num_devices,
