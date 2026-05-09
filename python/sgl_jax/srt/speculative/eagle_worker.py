@@ -1,11 +1,8 @@
-import itertools
 import logging
-import time
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from tqdm import tqdm
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
@@ -15,7 +12,6 @@ from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
-    ForwardMode,
 )
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
@@ -125,9 +121,10 @@ class EAGLEWorker(BaseSpecWorker):
 
         else:
             cur_allocate_lens = model_worker_batch.spec_info.allocate_lens
-            model_worker_batch.spec_info = self.draft_worker.draft(model_worker_batch)
+            verify_input = self.draft_worker.draft(model_worker_batch)
+            model_worker_batch.spec_info = verify_input
 
-            batch_output = self.verify(model_worker_batch, cur_allocate_lens)
+            batch_output = self.verify(model_worker_batch, verify_input, cur_allocate_lens)
 
             self.draft_extend_after_verify(model_worker_batch, batch_output)
 
@@ -150,8 +147,13 @@ class EAGLEWorker(BaseSpecWorker):
             model_worker_batch.seq_lens,
         )
 
-    def verify(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens: jax.Array):
-        spec_info: EagleVerifyInput = model_worker_batch.spec_info
+    def verify(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        verify_input: EagleVerifyInput,
+        cur_allocate_lens: jax.Array,
+    ):
+        spec_info = verify_input
         spec_info.allocate_lens = cur_allocate_lens
         spec_info.prepare_for_verify(model_worker_batch, self.page_size, self.target_worker)
         forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
@@ -323,88 +325,10 @@ class EAGLEWorker(BaseSpecWorker):
         batch_output.accept_lens = batch_output.accept_lens[: model_worker_batch.real_bs]
 
     def run_spec_decode_precompile(self):
-        self.precompile_spec_extend()
-        self.precompile_spec_decode()
-        # FIXME precompile some kernel
+        return self.draft_worker.run_spec_decode_precompile()
 
     def precompile_spec_extend(self):
-        start_time = time.perf_counter()
-        logger.info(
-            "[SPEC_EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s",
-            self.precompile_bs_paddings[-1:],
-            self.precompile_token_paddings,
-        )
-
-        bs, _ = self.get_max_padded_size()
-        pairs = list(itertools.product([bs], self.precompile_token_paddings))
-
-        with tqdm(pairs, desc="[SPEC_EXTEND] PRECOMPILE", leave=False) as pbar:
-            for pair in pbar:
-                pair = list(pair)
-                bs, num_tokens = pair[0], pair[1]
-                pbar.set_postfix(bs=bs, tokens=num_tokens)
-                if bs > num_tokens:
-                    logger.warning("bs=%s > num_tokens=%s, skip this pair", bs, num_tokens)
-                    continue
-                model_worker_batch = self.generate_model_worker_batch(
-                    bs,
-                    num_tokens,
-                    ForwardMode.EXTEND,
-                    self.precompile_cache_loc_paddings[-1],
-                    do_penalties=False,
-                    speculative_algotithm=self.speculative_algorithm,
-                )
-                self.forward_batch_speculative_generation(model_worker_batch)
-        end_time = time.perf_counter()
-        logger.info("[SPEC_EXTEND] Precompile finished in %.0f secs", end_time - start_time)
+        return self.draft_worker.precompile_spec_extend()
 
     def precompile_spec_decode(self):
-        start_time = time.perf_counter()
-        logger.info(
-            "[SPEC_DECODE] Begin to precompile bs_paddings=%s",
-            self.precompile_bs_paddings,
-        )
-
-        with tqdm(
-            self.precompile_bs_paddings, desc="[SPEC_DECODE] PRECOMPILE", leave=False
-        ) as pbar:
-            for bs in pbar:
-                pbar.set_postfix(bs=bs)
-                # use same page aligned with precompile cache_loc_paddings
-                aligned_cache_loc_size = (
-                    (bs * self.max_req_len + self.page_size - 1) // self.page_size * self.page_size
-                )
-                model_worker_batch = self.generate_model_worker_batch(
-                    bs,
-                    bs,
-                    ForwardMode.DECODE,
-                    aligned_cache_loc_size,
-                    do_penalties=False,
-                    speculative_algotithm=self.speculative_algorithm,
-                )
-                spec_info = EagleDraftInput(
-                    # FIXME(pc) dtype should according to serverargs
-                    topk_p=jnp.ones(
-                        (bs, self.topk),
-                        dtype=jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32,
-                    ),
-                    topk_index=jnp.ones((bs, self.topk), dtype=jnp.int32),
-                    hidden_states=jnp.ones(
-                        (bs, self.model_config.hidden_size),
-                        dtype=jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32,
-                    ),
-                    verified_id=jnp.ones((bs,), dtype=jnp.int32),
-                    accept_length=jnp.ones((bs,), dtype=jnp.int32),
-                    capture_hidden_mode=CaptureHiddenMode.LAST,
-                    allocate_lens=model_worker_batch.seq_lens
-                    + EagleDraftInput.ALLOC_LEN_PER_DECODE,
-                )
-                model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-                model_worker_batch.spec_info = spec_info
-                model_worker_batch.speculative_eagle_topk = self.topk
-                model_worker_batch.speculative_num_draft_tokens = self.speculative_num_draft_tokens
-                model_worker_batch.speculative_num_steps = self.speculative_num_steps
-                self.forward_batch_speculative_generation(model_worker_batch)
-
-        end_time = time.perf_counter()
-        logger.info("[SPEC_DECODE] Precompile finished in %.0f secs", end_time - start_time)
+        return self.draft_worker.precompile_spec_decode()

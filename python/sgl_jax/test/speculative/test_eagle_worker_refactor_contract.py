@@ -120,6 +120,27 @@ def test_task5_draft_decode_methods_owned_by_draft_worker():
         assert callable(getattr(EagleDraftWorker, name))
 
 
+def test_task5_precompile_methods_owned_by_draft_worker_with_eagle_worker_wrappers():
+    for name in (
+        "run_spec_decode_precompile",
+        "precompile_spec_extend",
+        "precompile_spec_decode",
+    ):
+        assert callable(getattr(EagleDraftWorker, name))
+        assert callable(getattr(EAGLEWorker, name))
+        source = inspect.getsource(getattr(EAGLEWorker, name))
+        assert "return self.draft_worker" in source
+        assert "tqdm" not in source
+        assert "product" not in source
+        assert "generate_model_worker_batch" not in source
+
+
+def test_task5_eagle_worker_verify_explicitly_accepts_verify_input():
+    parameters = inspect.signature(EAGLEWorker.verify).parameters
+
+    assert "verify_input" in parameters
+
+
 def test_task5_eagle_worker_no_longer_owns_draft_decode_methods():
     for name in (
         "draft",
