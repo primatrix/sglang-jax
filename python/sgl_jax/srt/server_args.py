@@ -958,6 +958,17 @@ class ServerArgs:
         )
 
         parser.add_argument(
+            "--disable-jax-allreduce-metadata",
+            action="store_true",
+            default=ServerArgs.disable_jax_allreduce_metadata,
+            help=(
+                "Disable the pure JAX allreduce metadata path for fused EP-MoE; "
+                "fall back to the Pallas DMA-based allgather. "
+                "Default uses JAX path (recommended)."
+            ),
+        )
+
+        parser.add_argument(
             "--enable-nan-detection",
             action="store_true",
             help="Enable the NaN detection for debugging purposes.",
