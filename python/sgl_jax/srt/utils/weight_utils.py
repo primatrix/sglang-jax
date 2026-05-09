@@ -163,6 +163,7 @@ class WeightLoader:
             )
         else:
             self.moe_abstract_mesh = None
+        self._moe_layer_bundle_cache = {}
 
     # ------------------------------------------------------------------
     # Quant config helpers
@@ -1436,6 +1437,27 @@ class WeightLoader:
         stacked_shape = (num_physical_experts, *final_single_shape)
         sharding = target_sharding or jax.sharding.NamedSharding(self.mesh, P())
 
+        moe_bundle_match = re.match(
+            r"^(?P<base>.*\.mlp\.experts\.)\d+\." r"(?P<proj>gate_proj|up_proj|down_proj)\.weight$",
+            first_key,
+        )
+        moe_bundle_cache_key = None
+        if moe_bundle_match is not None:
+            moe_bundle_cache_key = (
+                moe_bundle_match.group("base"),
+                moe_bundle_match.group("proj"),
+                stacked_shape,
+                repr(sharding.spec),
+            )
+            cached_result = self._moe_layer_bundle_cache.pop(moe_bundle_cache_key, None)
+            if cached_result is not None:
+                logger.info(
+                    "MoE layer-bundle cache hit: %s%s",
+                    moe_bundle_match.group("base"),
+                    moe_bundle_match.group("proj"),
+                )
+                return cached_result
+
         LOAD_WORKERS = int(os.environ.get("SGLANG_MOE_LOAD_WORKERS", "16"))
 
         _callback_times = []
@@ -1625,6 +1647,230 @@ class WeightLoader:
                         all_logical.add(int(physical_to_logical_map[p]))
                     else:
                         all_logical.add(p)
+
+            # MiMo Pro EP checkpoints store gate/up/down expert weights for the same
+            # layer contiguously inside each expert shard file. Loading them as three
+            # separate MoE groups turns one sequential file span into three cold sparse
+            # passes. Bundle the three large projections once and cache the JAX arrays
+            # for the following two mapping entries.
+            if (
+                os.environ.get("SGLANG_MOE_BULK_LAYER_BUNDLE", "1") != "0"
+                and moe_bundle_match is not None
+                and defer_transpose
+                and do_transpose
+                and target_dtype in (jnp.float8_e4m3fn, jnp.float8_e5m2)
+                and all_logical
+            ):
+                bundle_projs = ("gate_proj", "up_proj", "down_proj")
+                bundle_base = moe_bundle_match.group("base")
+                current_proj = moe_bundle_match.group("proj")
+                sorted_logical = sorted(all_logical)
+                bundle_shapes = {}
+                bundle_file_groups = {}
+                bundle_valid = True
+                bundle_elem_size = (
+                    1 if np_read_dtype == np.uint8 else np.dtype(np_read_dtype).itemsize
+                )
+                for proj in bundle_projs:
+                    for log_idx in sorted_logical:
+                        hf_key = f"{bundle_base}{log_idx}.{proj}.weight"
+                        infos = weight_info.get(hf_key)
+                        if not infos or "byte_offset" not in infos[0]:
+                            bundle_valid = False
+                            break
+                        entry_info = infos[0]
+                        entry_shape = tuple(entry_info["shape"])
+                        entry_dtype = entry_info["dtype"]
+                        if entry_dtype != st_dtype:
+                            bundle_valid = False
+                            break
+                        bundle_shapes.setdefault(proj, entry_shape)
+                        if bundle_shapes[proj] != entry_shape:
+                            bundle_valid = False
+                            break
+                        entry_nbytes = int(
+                            entry_info.get(
+                                "byte_size",
+                                math.prod(entry_shape) * bundle_elem_size,
+                            )
+                        )
+                        bundle_file_groups.setdefault(entry_info["file"], []).append(
+                            (
+                                proj,
+                                log_idx,
+                                entry_info["byte_offset"],
+                                entry_shape,
+                                entry_nbytes,
+                            )
+                        )
+                    if not bundle_valid:
+                        break
+
+                if bundle_valid and len(bundle_shapes) == len(bundle_projs):
+                    try:
+                        bundle_span_ratio = float(
+                            os.environ.get("SGLANG_MOE_BULK_LAYER_BUNDLE_RATIO", "1.25")
+                        )
+                    except ValueError:
+                        bundle_span_ratio = 1.25
+                    if bundle_span_ratio <= 0:
+                        bundle_span_ratio = 1.25
+                    for entries in bundle_file_groups.values():
+                        min_off = min(byte_off for _, _, byte_off, _, _ in entries)
+                        max_end = max(byte_off + nbytes for _, _, byte_off, _, nbytes in entries)
+                        span = max_end - min_off
+                        actual = sum(nbytes for _, _, _, _, nbytes in entries)
+                        if span > actual * bundle_span_ratio:
+                            bundle_valid = False
+                            break
+
+                if bundle_valid and len(bundle_shapes) == len(bundle_projs):
+                    try:
+                        requested_bundle_workers = int(
+                            os.environ.get("SGLANG_MOE_BULK_FILE_WORKERS", "0")
+                        )
+                    except ValueError:
+                        requested_bundle_workers = 0
+                    bundle_file_workers = len(bundle_file_groups)
+                    if requested_bundle_workers > 0:
+                        bundle_file_workers = min(len(bundle_file_groups), requested_bundle_workers)
+                    bundle_file_workers = max(1, bundle_file_workers)
+
+                    bundle_data = {proj: {} for proj in bundle_projs}
+                    bundle_file_stats = []
+
+                    def _bulk_read_layer_bundle_file(fname, entries):
+                        entries.sort(key=lambda e: e[2])
+                        min_off = entries[0][2]
+                        max_end = max(byte_off + nbytes for _, _, byte_off, _, nbytes in entries)
+                        span = max_end - min_off
+                        actual = sum(nbytes for _, _, _, _, nbytes in entries)
+                        with open(fname, "rb") as f:
+                            f.seek(min_off)
+                            bulk = f.read(span)
+                        result = {proj: {} for proj in bundle_projs}
+                        for proj, log_idx, byte_off, entry_shape, entry_nbytes in entries:
+                            arr = np.frombuffer(
+                                bulk,
+                                dtype=np_read_dtype,
+                                count=entry_nbytes // bundle_elem_size,
+                                offset=byte_off - min_off,
+                            ).reshape(entry_shape)
+                            result[proj][log_idx] = arr
+                        bundle_file_stats.append(
+                            (
+                                span,
+                                actual,
+                                len(bulk),
+                                1,
+                                len(entries),
+                                True,
+                            )
+                        )
+                        return result
+
+                    t_io_start = time.monotonic()
+                    if len(bundle_file_groups) > 1:
+                        with ThreadPoolExecutor(max_workers=bundle_file_workers) as ex:
+                            futs = {
+                                ex.submit(_bulk_read_layer_bundle_file, fn, ents): fn
+                                for fn, ents in bundle_file_groups.items()
+                            }
+                            for fut in futs:
+                                file_result = fut.result()
+                                for proj in bundle_projs:
+                                    bundle_data[proj].update(file_result[proj])
+                    else:
+                        for fn, ents in bundle_file_groups.items():
+                            file_result = _bulk_read_layer_bundle_file(fn, ents)
+                            for proj in bundle_projs:
+                                bundle_data[proj].update(file_result[proj])
+                    t_io = time.monotonic() - t_io_start
+
+                    t_assemble_start = time.monotonic()
+                    n_experts_per_shard = len(local_assignments[0])
+                    bundle_arrays = {}
+
+                    def _build_projection_array(proj):
+                        proj_shape = bundle_shapes[proj]
+                        proj_stacked_shape = (num_physical_experts, *proj_shape)
+
+                        def _build_and_put(dev_idx):
+                            dev = local_devices[dev_idx]
+                            phys_indices = local_assignments[dev_idx]
+                            shard = np.empty(
+                                (n_experts_per_shard, *proj_shape),
+                                dtype=np_read_dtype,
+                            )
+                            for pos, p in enumerate(phys_indices):
+                                log_idx = (
+                                    int(physical_to_logical_map[p])
+                                    if physical_to_logical_map is not None
+                                    else p
+                                )
+                                shard[pos] = bundle_data[proj][log_idx]
+                            shard = _reinterpret_dtype_if_needed(shard, target_dtype)
+                            return jax.device_put(shard, dev)
+
+                        with ThreadPoolExecutor(max_workers=n_local) as ex:
+                            per_device_arrays = list(ex.map(_build_and_put, range(n_local)))
+                        arr = jax.make_array_from_single_device_arrays(
+                            proj_stacked_shape,
+                            sharding,
+                            per_device_arrays,
+                        )
+                        if arr.dtype != target_dtype:
+                            arr = arr.astype(target_dtype)
+                        return jnp.transpose(arr, (0, 2, 1))
+
+                    for proj in bundle_projs:
+                        bundle_arrays[proj] = _build_projection_array(proj)
+                    t_assemble = time.monotonic() - t_assemble_start
+                    t_callback = time.monotonic() - t0
+
+                    total_span_mb = sum(s[0] for s in bundle_file_stats) / 1e6
+                    total_actual_mb = sum(s[1] for s in bundle_file_stats) / 1e6
+                    total_io_read_mb = sum(s[2] for s in bundle_file_stats) / 1e6
+                    total_read_ops = sum(s[3] for s in bundle_file_stats)
+                    total_entries = sum(s[4] for s in bundle_file_stats)
+                    log_bulk = (
+                        logger.info
+                        if os.environ.get("SGLANG_MOE_BULK_LOG_INFO", "0") == "1"
+                        else logger.debug
+                    )
+                    log_bulk(
+                        "MoE layer-bundle load: base=%s current=%s "
+                        "io=%.2fs (actual=%.1f MB read=%.1f MB span=%.1f MB %.1f MB/s) "
+                        "assemble+put=%.2fs total=%.2fs files=%d read_ops=%d entries=%d "
+                        "file_workers=%d devices=%d",
+                        bundle_base,
+                        current_proj,
+                        t_io,
+                        total_actual_mb,
+                        total_io_read_mb,
+                        total_span_mb,
+                        total_io_read_mb / t_io if t_io > 0 else 0,
+                        t_assemble,
+                        t_callback,
+                        len(bundle_file_groups),
+                        total_read_ops,
+                        total_entries,
+                        bundle_file_workers,
+                        n_local,
+                    )
+
+                    for proj, arr in bundle_arrays.items():
+                        cache_key = (
+                            bundle_base,
+                            proj,
+                            (num_physical_experts, *bundle_shapes[proj]),
+                            repr(sharding.spec),
+                        )
+                        if proj == current_proj:
+                            result = arr
+                        else:
+                            self._moe_layer_bundle_cache[cache_key] = arr
+                    return result
 
             # Group by file for bulk reading
             file_groups = {}
