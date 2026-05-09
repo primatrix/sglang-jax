@@ -406,7 +406,12 @@ def _metadata_for_shape(metadata: dict[str, Any], shape: A2AScatterShape) -> dic
         "destination_layout": "scratch[topk_slot, source_rank*bt + token_id, t_packing, hidden/t_packing]",
         "traffic_class": "remote_dma_scatter_payload_only",
         "includes": ["remote_scatter_start", "send_wait", "recv_wait", "mesh_barrier"],
-        "excludes": ["metadata_allgather", "expert_compute", "a2a_gather", "output_accumulation"],
+        "excludes": [
+            "metadata_allgather",
+            "expert_compute",
+            "a2a_gather",
+            "output_accumulation",
+        ],
     }
     return enriched
 
@@ -428,7 +433,12 @@ def _metadata_for_metadata_shape(
         "rounds": _metadata_rounds(shape),
         "remote_payload_bytes_per_device": _metadata_remote_bytes_per_device(shape),
         "traffic_class": "remote_dma_metadata_allgather",
-        "includes": ["d2e_count_remote_allgather", "send_wait", "recv_wait", "mesh_barrier"],
+        "includes": [
+            "d2e_count_remote_allgather",
+            "send_wait",
+            "recv_wait",
+            "mesh_barrier",
+        ],
         "excludes": [
             "t2e_routing_smem_copy",
             "offsets_starts_sizes_smem_copy",
@@ -722,9 +732,13 @@ def _pallas_a2a_metadata_call(local_counts_hbm, *, shape, jax, pl, pltpu):
             pltpu.semaphore_wait(barrier_sem, shape.ep_size)
 
         d2e_count_vmem[...] = jnp.zeros_like(d2e_count_vmem)
-        d2e_count_vmem.at[rank, 0, pl.ds(0, shape.padded_num_experts)][...] = local_counts_ref[
-            0, pl.ds(0, shape.padded_num_experts)
-        ]
+        local_count_copy = pltpu.make_async_copy(
+            src_ref=local_counts_ref.at[pl.ds(0, 1), pl.ds(0, shape.padded_num_experts)],
+            dst_ref=d2e_count_vmem.at[rank, pl.ds(0, 1), pl.ds(0, shape.padded_num_experts)],
+            sem=send_sem,
+        )
+        local_count_copy.start()
+        local_count_copy.wait()
 
         sync_barrier()
         for round_id in range(_metadata_rounds(shape)):
@@ -736,10 +750,14 @@ def _pallas_a2a_metadata_call(local_counts_hbm, *, shape, jax, pl, pltpu):
 
             pltpu.make_async_remote_copy(
                 src_ref=d2e_count_vmem.at[
-                    pl.ds(send_start, chunk), pl.ds(0, 1), pl.ds(0, shape.padded_num_experts)
+                    pl.ds(send_start, chunk),
+                    pl.ds(0, 1),
+                    pl.ds(0, shape.padded_num_experts),
                 ],
                 dst_ref=d2e_count_vmem.at[
-                    pl.ds(send_start, chunk), pl.ds(0, 1), pl.ds(0, shape.padded_num_experts)
+                    pl.ds(send_start, chunk),
+                    pl.ds(0, 1),
+                    pl.ds(0, shape.padded_num_experts),
                 ],
                 send_sem=send_sem,
                 recv_sem=recv_sem,
@@ -748,12 +766,16 @@ def _pallas_a2a_metadata_call(local_counts_hbm, *, shape, jax, pl, pltpu):
             ).start()
 
             recv_ref = d2e_count_vmem.at[
-                pl.ds(recv_start, chunk), pl.ds(0, 1), pl.ds(0, shape.padded_num_experts)
+                pl.ds(recv_start, chunk),
+                pl.ds(0, 1),
+                pl.ds(0, shape.padded_num_experts),
             ]
             pltpu.make_async_copy(src_ref=recv_ref, dst_ref=recv_ref, sem=recv_sem).wait()
 
             send_ref = d2e_count_vmem.at[
-                pl.ds(send_start, chunk), pl.ds(0, 1), pl.ds(0, shape.padded_num_experts)
+                pl.ds(send_start, chunk),
+                pl.ds(0, 1),
+                pl.ds(0, shape.padded_num_experts),
             ]
             pltpu.make_async_copy(src_ref=send_ref, dst_ref=send_ref, sem=send_sem).wait()
 
@@ -788,7 +810,15 @@ def _pallas_a2a_metadata_call(local_counts_hbm, *, shape, jax, pl, pltpu):
 def _pallas_a2a_scatter_call(tokens_hbm, topk_ids_hbm, scratch_hbm, *, shape, jax, jnp, pl, pltpu):
     del jnp
 
-    def kernel(tokens_ref, topk_ids_ref, scratch_ref, out_ref, send_sems, recv_sems, barrier_sem):
+    def kernel(
+        tokens_ref,
+        topk_ids_ref,
+        scratch_ref,
+        out_ref,
+        send_sems,
+        recv_sems,
+        barrier_sem,
+    ):
         my_id = pl.program_id(0) * 0 + 0
         del my_id
 
