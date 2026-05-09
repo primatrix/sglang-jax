@@ -533,7 +533,7 @@ def _pallas_unavailable_note(runtime: dict[str, Any]) -> str | None:
 
 def _measurement_failed_note(exc: Exception) -> str:
     return (
-        "layer1_a2a_scatter Pallas remote-DMA measurement failed before "
+        "layer1_a2a Pallas remote-DMA measurement failed before "
         f"producing trustworthy samples: {type(exc).__name__}: {exc}. "
         "No synthetic latency samples were emitted for this shape."
     )
@@ -815,6 +815,8 @@ def _pallas_a2a_scatter_call(tokens_hbm, topk_ids_hbm, scratch_hbm, *, shape, ja
         topk_ids_ref,
         scratch_ref,
         out_ref,
+        topk_ids_vmem,
+        topk_sem,
         send_sems,
         recv_sems,
         barrier_sem,
@@ -841,9 +843,17 @@ def _pallas_a2a_scatter_call(tokens_hbm, topk_ids_hbm, scratch_hbm, *, shape, ja
             )
         pltpu.semaphore_wait(barrier_sem, shape.ep_size)
 
+        topk_copy = pltpu.make_async_copy(
+            src_ref=topk_ids_ref.at[pl.ds(0, shape.bt), pl.ds(0, shape.top_k)],
+            dst_ref=topk_ids_vmem,
+            sem=topk_sem,
+        )
+        topk_copy.start()
+        topk_copy.wait()
+
         def scatter_one(t_id, _):
             for k_id in range(shape.top_k):
-                e_id = topk_ids_ref[t_id, k_id]
+                e_id = topk_ids_vmem[t_id, k_id]
                 recv_id = e_id // shape.local_num_experts
                 e_sem_id = e_id % shape.local_num_experts
                 dst_start = rank * shape.bt + t_id
@@ -877,7 +887,7 @@ def _pallas_a2a_scatter_call(tokens_hbm, topk_ids_hbm, scratch_hbm, *, shape, ja
                 sem=recv_sems.at[k_id],
             ).wait()
 
-        out_ref[0] = tokens_ref[0, 0, 0]
+        out_ref[0] = rank.astype(out_ref.dtype)
 
     return pl.pallas_call(
         kernel,
@@ -892,6 +902,8 @@ def _pallas_a2a_scatter_call(tokens_hbm, topk_ids_hbm, scratch_hbm, *, shape, ja
             out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
             grid=(1,),
             scratch_shapes=[
+                pltpu.VMEM((shape.bt, shape.top_k), topk_ids_hbm.dtype),
+                pltpu.SemaphoreType.DMA,
                 pltpu.SemaphoreType.DMA((shape.local_num_experts,)),
                 pltpu.SemaphoreType.DMA((shape.local_num_experts,)),
                 pltpu.SemaphoreType.BARRIER,
