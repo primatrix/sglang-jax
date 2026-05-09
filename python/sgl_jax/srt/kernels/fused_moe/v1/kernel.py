@@ -512,13 +512,13 @@ def _fused_ep_moe_kernel(
     w2_shared_scale_hbm,  # None | (1, 1, hidden_size)
     metadata_starts_hbm,  # None | (num_bt, 1, padded_num_experts) int32
     metadata_sizes_hbm,  # None | (num_bt, 1, padded_num_experts) int32
-    metadata_d2e_counts_hbm,  # None | (num_bt, num_devices, 1, local_num_experts) int32
+    metadata_d2e_counts_hbm,  # None | (num_bt, num_devices, 1, padded_local_num_experts) int32
     metadata_send_counts_hbm,  # None | (num_bt, 1, padded_num_experts) int32
     # Output
     output_hbm,  # (local_num_tokens, hidden_size)
     # Scratch
     t2e_routing_x2_smem,  # (2, bt, padded_top_k)
-    d2e_count_x2_smem,  # (2, num_devices, 1, padded_num_experts | local_num_experts)
+    d2e_count_x2_smem,  # (2, num_devices, 1, padded_num_experts | padded_local_num_experts)
     d2e_send_count_x2_smem,  # None | (2, 1, padded_num_experts)
     expert_offsets_x2_smem,  # (2, 2, padded_num_experts): <bt_sem_id> x (a2a_s/a2a_g)
     expert_starts_x2_smem,  # (2, 1, padded_num_experts)
@@ -607,12 +607,13 @@ def _fused_ep_moe_kernel(
     a2a_max_tokens = a2a_s_acc_x2_hbm.shape[1]
     num_experts = a2a_g_hbm.shape[0]
     padded_num_experts = expert_sizes_x2_smem.shape[-1]
+    padded_local_num_experts = align_to(local_num_experts, 128)
     padded_top_k = t2e_routing_x2_smem.shape[-1]
     assert padded_num_experts == align_to(num_experts, 128)
     assert padded_top_k == align_to(top_k, 128)
     external_jax_metadata = use_jax_allreduce_metadata and metadata_starts_hbm is not None
     if external_jax_metadata:
-        assert d2e_count_x2_smem.shape[-1] == local_num_experts
+        assert d2e_count_x2_smem.shape[-1] == padded_local_num_experts
     else:
         assert d2e_count_x2_smem.shape[-1] == padded_num_experts
 
@@ -3220,7 +3221,7 @@ def jax_allreduce_metadata_by_bt(
     Returns:
         starts: (num_bt, 1, num_experts) int32
         sizes: (num_bt, 1, num_experts) int32
-        recv_counts: (num_bt, num_devices, 1, local_num_experts) int32
+        recv_counts: (num_bt, num_devices, 1, padded_local_num_experts) int32
         send_counts: (num_bt, 1, num_experts) int32
     """
     num_tokens = topk_ids.shape[0]
@@ -3272,12 +3273,13 @@ def jax_allreduce_metadata_by_bt(
         local_num_experts,
         axis=2,
     )[:, :, None, :]
-    send_counts = lax.dynamic_index_in_dim(
-        all_sizes,
-        my_id,
-        axis=1,
-        keepdims=False,
-    )[:, None, :]
+    padded_local_num_experts = align_to(local_num_experts, 128)
+    if padded_local_num_experts != local_num_experts:
+        recv_counts = jnp.pad(
+            recv_counts,
+            ((0, 0), (0, 0), (0, 0), (0, padded_local_num_experts - local_num_experts)),
+        )
+    send_counts = local_sizes[:, None, :]
     return starts, sizes, recv_counts, send_counts
 
 
@@ -3432,7 +3434,9 @@ def fused_ep_moe(
     needs_jax_allreduce = use_jax_allreduce_metadata and ep_size > 1 and not disable_a2a
     padded_num_experts = align_to(num_experts, 128)
     padded_top_k = align_to(top_k, 128)
-    d2e_count_num_experts = local_num_experts if needs_jax_allreduce else padded_num_experts
+    d2e_count_num_experts = (
+        align_to(local_num_experts, 128) if needs_jax_allreduce else padded_num_experts
+    )
     t_dtype = tokens.dtype
     t_packing = get_dtype_packing(t_dtype)
     hidden_per_pack = hidden_size // t_packing
