@@ -1,8 +1,17 @@
 import jax
+import jax.numpy as jnp
+import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata
+from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.managers.tp_worker import ModelWorker
+from sgl_jax.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sgl_jax.srt.speculative.base_spec_worker import BaseDraftWorker
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -10,9 +19,10 @@ from sgl_jax.srt.utils.jax_utils import device_array
 
 
 class EagleDraftWorker(ModelWorker, BaseDraftWorker):
-    def __init__(self, server_args, target_worker: ModelWorker):
+    def __init__(self, server_args, target_worker: ModelWorker, capture_for_decode=None):
         self.server_args = server_args
         self._target_worker = target_worker
+        self._capture_for_decode = capture_for_decode
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
@@ -47,6 +57,18 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
     @property
     def target_worker(self):
         return self._target_worker
+
+    @property
+    def mesh(self):
+        return self.target_worker.mesh
+
+    @mesh.setter
+    def mesh(self, value):
+        self._mesh = value
+
+    @property
+    def draft_model_runner(self):
+        return self.model_runner
 
     def _init_embed_and_head(self):
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
@@ -88,8 +110,59 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
     def draft(self, model_worker_batch):
         raise NotImplementedError
 
-    def draft_extend_for_prefill(self, model_worker_batch, target_hidden_states, next_token_ids):
-        raise NotImplementedError
+    def draft_extend_for_prefill(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        target_hidden_states: jax.Array,
+        next_token_ids: jax.Array,
+    ) -> EagleDraftInput:
+        # FIXME(pc) move this all prepare to prepare_for_extend_after_target_prefill
+        model_worker_batch.spec_info = EagleDraftInput(
+            hidden_states=target_hidden_states,
+            verified_id=next_token_ids[: model_worker_batch.real_bs],
+            num_tokens_per_batch=np.asarray(1, dtype=jnp.int32),
+            num_tokens_for_logprob_per_batch=np.asarray(1, dtype=jnp.int32),
+            allocate_lens=model_worker_batch.seq_lens,
+        )
+        model_worker_batch.return_hidden_states = False
+        model_worker_batch.spec_info.prepare_for_extend_after_target_prefill(
+            model_worker_batch=model_worker_batch
+        )
+        model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
+        forward_batch.return_logprob = False
+
+        # Set forward_metadata for draft_model_runner's attention backend
+        forward_metadata = self.draft_model_runner.attn_backend.get_eagle_forward_metadata(
+            model_worker_batch
+        )
+
+        self.draft_model_runner.attn_backend.forward_metadata = forward_metadata
+        forward_batch.forward_mode = ForwardMode.EXTEND
+        # last_idx = np.cumsum(model_worker_batch.extend_seq_lens, axis=0) - 1
+
+        logits_output, _, _ = self.draft_model_runner.forward(
+            forward_batch,
+            logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
+        )
+        logits_output.next_token_logits = logits_output.next_token_logits[
+            : model_worker_batch.real_bs, :
+        ]
+        if len(logits_output.hidden_states.shape) == 1:
+            logits_output.hidden_states = jnp.expand_dims(logits_output.hidden_states, axis=0)
+        assert isinstance(forward_batch.spec_info, EagleDraftInput)
+        forward_batch.spec_info.allocate_lens = model_worker_batch.seq_lens[
+            : model_worker_batch.real_bs
+        ]
+
+        self.capture_for_decode(logits_output, forward_batch.spec_info)
+        return forward_batch.spec_info
+
+    def capture_for_decode(self, logits_output, draft_input: EagleDraftInput):
+        if self._capture_for_decode is None:
+            raise NotImplementedError
+        self._capture_for_decode(logits_output, draft_input)
 
     def draft_extend_for_decode(self, model_worker_batch, batch_output):
         raise NotImplementedError
