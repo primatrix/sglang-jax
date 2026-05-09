@@ -712,7 +712,11 @@ def _fused_ep_moe_kernel(
         recv_sem = recv_x2_sems.at[0]
 
         if use_jax_allreduce_metadata and metadata_starts_hbm is not None:
-            metadata_sem = local_sems.at[bt_sem_id, 0]
+            metadata_starts_sem = local_sems.at[bt_sem_id, 14]
+            metadata_sizes_sem = local_sems.at[bt_sem_id, 15]
+            metadata_counts_sem = local_sems.at[bt_sem_id, 16]
+            metadata_offsets_sem = local_sems.at[bt_sem_id, 17]
+            metadata_routing_sem = local_sems.at[bt_sem_id, 18]
 
             def _copy_precomputed(
                 t2e_routing_vmem,
@@ -727,28 +731,28 @@ def _fused_ep_moe_kernel(
                 starts_load = pltpu.async_copy(
                     src_ref=metadata_starts_hbm.at[bt_id],
                     dst_ref=starts_vmem,
-                    sem=metadata_sem,
+                    sem=metadata_starts_sem,
                 )
                 sizes_load = pltpu.async_copy(
                     src_ref=metadata_sizes_hbm.at[bt_id],
                     dst_ref=sizes_vmem,
-                    sem=metadata_sem,
+                    sem=metadata_sizes_sem,
                 )
                 d2e_count_load = pltpu.async_copy(
                     src_ref=metadata_d2e_counts_hbm.at[bt_id],
                     dst_ref=d2e_count_vmem,
-                    sem=metadata_sem,
+                    sem=metadata_counts_sem,
                 )
 
                 offsets_copy = pltpu.async_copy(
                     src_ref=offsets_vmem,
                     dst_ref=expert_offsets_x2_smem.at[bt_sem_id],
-                    sem=metadata_sem,
+                    sem=metadata_offsets_sem,
                 )
                 t2e_routing_copy = pltpu.async_copy(
                     src_ref=t2e_routing_vmem,
                     dst_ref=t2e_routing_x2_smem.at[bt_sem_id],
-                    sem=metadata_sem,
+                    sem=metadata_routing_sem,
                 )
 
                 starts_load.wait()
@@ -757,17 +761,17 @@ def _fused_ep_moe_kernel(
                 starts_copy = pltpu.async_copy(
                     src_ref=starts_vmem,
                     dst_ref=expert_starts_x2_smem.at[bt_sem_id],
-                    sem=metadata_sem,
+                    sem=metadata_starts_sem,
                 )
                 sizes_copy = pltpu.async_copy(
                     src_ref=sizes_vmem,
                     dst_ref=expert_sizes_x2_smem.at[bt_sem_id],
-                    sem=metadata_sem,
+                    sem=metadata_sizes_sem,
                 )
                 d2e_count_copy = pltpu.async_copy(
                     src_ref=d2e_count_vmem,
                     dst_ref=d2e_count_x2_smem.at[bt_sem_id],
-                    sem=metadata_sem,
+                    sem=metadata_counts_sem,
                 )
 
                 t2e_routing_copy.wait()
@@ -3375,12 +3379,7 @@ def fused_ep_moe(
     bt = block_config.bt
     if bt <= 0:
         raise ValueError(f"Expected {bt=} to be > 0.")
-    # The JAX collective metadata path is stable for extend/prefill tiles.  Small
-    # decode tiles repeatedly mix XLA collectives with Pallas remote DMA in the
-    # same executable and can hang, so keep decode on the original Pallas path.
-    needs_jax_allreduce = (
-        use_jax_allreduce_metadata and ep_size > 1 and not disable_a2a and local_num_tokens >= 32
-    )
+    needs_jax_allreduce = use_jax_allreduce_metadata and ep_size > 1 and not disable_a2a
     padded_num_experts = align_to(num_experts, 128)
     padded_top_k = align_to(top_k, 128)
     t_dtype = tokens.dtype
@@ -3537,7 +3536,7 @@ def fused_ep_moe(
         # Semaphores.
         pltpu.SemaphoreType.DMA((2,)),  # token_stage_x2_sems
         pltpu.SemaphoreType.DMA((3,)),  # acc_stage_x3_sems
-        pltpu.SemaphoreType.DMA((2, 14)),  # local_sems
+        pltpu.SemaphoreType.DMA((2, 19)),  # local_sems
         pltpu.SemaphoreType.DMA((expert_buffer_count,)),  # send_x2_sems
         pltpu.SemaphoreType.DMA((expert_buffer_count,)),  # recv_x2_sems
         pltpu.SemaphoreType.DMA((expert_buffer_count,)),  # gather_send_x2_sems
