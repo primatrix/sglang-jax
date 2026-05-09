@@ -29,6 +29,8 @@ USE_SHARED_EXPERT = True
 USE_GROUPED_TOPK = True
 IMBALANCE_MODE = "sparse_hotspot"
 HOTSPOT_RATIO = 1.0
+ZERO_EXPERT_COUNT = 0
+NON_HOTSPOT_ALPHA = 100.0
 KERNEL_PATH = "python/sgl_jax/srt/kernels/fused_moe/v1/kernel.py"
 
 _DISABLE_FLAGS = (
@@ -158,6 +160,8 @@ def build_rows(
                         imbalance_mode=IMBALANCE_MODE,
                         hotspot_ratio=HOTSPOT_RATIO,
                         hotspot_count=shape.hotspot_count,
+                        zero_expert_count=ZERO_EXPERT_COUNT,
+                        non_hotspot_alpha=NON_HOTSPOT_ALPHA,
                         return_results=True,
                     )
                 benchmark_result = (result_rows or [{}])[0]
@@ -245,6 +249,8 @@ def _make_row(
         "imbalance_mode": IMBALANCE_MODE,
         "hotspot_ratio": HOTSPOT_RATIO,
         "hotspot_count": shape.hotspot_count,
+        "zero_expert_count": ZERO_EXPERT_COUNT,
+        "non_hotspot_alpha": NON_HOTSPOT_ALPHA,
     }
     row_metadata["variant"] = {
         "name": variant.name,
