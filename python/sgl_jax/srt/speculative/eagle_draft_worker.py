@@ -399,7 +399,7 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
             hidden_states=batch_output.logits_output.hidden_states,
             allocate_lens=batch_output.allocate_lens,
         )
-        model_worker_batch, logits_meatadata = draft_input.prepare_for_extend_after_verify(
+        model_worker_batch, logits_metadata = draft_input.prepare_for_extend_after_verify(
             model_worker_batch,
             self.draft_model_runner,
             batch_output,
@@ -411,7 +411,7 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
             return
         draft_logits_output, _, _ = self.draft_model_runner.forward(
             forward_batch,
-            logits_metadata=logits_meatadata,
+            logits_metadata=logits_metadata,
         )
         select_index = (
             np.arange(len(model_worker_batch.seq_lens[: model_worker_batch.real_bs]))
