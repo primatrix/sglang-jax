@@ -1,3 +1,5 @@
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -19,10 +21,9 @@ from sgl_jax.srt.utils.jax_utils import device_array
 
 
 class EagleDraftWorker(ModelWorker, BaseDraftWorker):
-    def __init__(self, server_args, target_worker: ModelWorker, capture_for_decode=None):
+    def __init__(self, server_args, target_worker: ModelWorker):
         self.server_args = server_args
         self._target_worker = target_worker
-        self._capture_for_decode = capture_for_decode
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
@@ -57,14 +58,6 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
     @property
     def target_worker(self):
         return self._target_worker
-
-    @property
-    def mesh(self):
-        return self.target_worker.mesh
-
-    @mesh.setter
-    def mesh(self, value):
-        self._mesh = value
 
     @property
     def draft_model_runner(self):
@@ -160,9 +153,27 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
         return forward_batch.spec_info
 
     def capture_for_decode(self, logits_output, draft_input: EagleDraftInput):
-        if self._capture_for_decode is None:
-            raise NotImplementedError
-        self._capture_for_decode(logits_output, draft_input)
+        topk_p, topk_index = _topk_probs_from_logits(logits_output.next_token_logits, self.topk)
+        draft_input.topk_p = topk_p
+        draft_input.topk_index = topk_index
+        draft_input.hidden_states = logits_output.hidden_states
 
     def draft_extend_for_decode(self, model_worker_batch, batch_output):
         raise NotImplementedError
+
+
+@functools.partial(jax.jit, static_argnames=["topk"])
+def _topk_probs_from_logits(
+    logits: jax.Array, topk: int, axis: int = -1
+) -> tuple[jax.Array, jax.Array]:
+    """Return top-k probabilities without materializing the full softmax tensor."""
+    working_logits = jnp.moveaxis(logits, axis, -1) if axis != -1 else logits
+    topk_logits, topk_index = jax.lax.top_k(working_logits, topk)
+    logsumexp = jax.nn.logsumexp(working_logits, axis=-1, keepdims=True)
+    topk_probs = jnp.exp(topk_logits - logsumexp)
+
+    if axis != -1:
+        topk_probs = jnp.moveaxis(topk_probs, -1, axis)
+        topk_index = jnp.moveaxis(topk_index, -1, axis)
+
+    return topk_probs, topk_index

@@ -50,7 +50,7 @@ class EAGLEWorker(BaseSpecWorker):
             server_args.speculative_algorithm
         )
         self.req_to_token_pool, self.token_to_kv_pool_allocator = target_worker.get_memory_pool()
-        self._draft_worker = EagleDraftWorker(server_args, target_worker, self.capture_for_decode)
+        self._draft_worker = EagleDraftWorker(server_args, target_worker)
         self.precompile_bs_paddings = self._draft_worker.precompile_bs_paddings
         self.precompile_cache_loc_paddings = self._draft_worker.precompile_cache_loc_paddings
         self.precompile_token_paddings = self._draft_worker.precompile_token_paddings
