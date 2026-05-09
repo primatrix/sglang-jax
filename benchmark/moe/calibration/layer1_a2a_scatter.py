@@ -31,6 +31,8 @@ T_PACKING = 2
 HIDDEN_SIZE = 8192
 H_PER_T_PACKING = HIDDEN_SIZE // T_PACKING
 TOP_K = 8
+PADDED_TOP_K = 128
+HBM_TOKEN_ALIGNMENT = 128
 EP_SIZE = 32
 LOCAL_NUM_EXPERTS = 8
 NUM_EXPERTS = EP_SIZE * LOCAL_NUM_EXPERTS
@@ -393,6 +395,7 @@ def _metadata_for_shape(metadata: dict[str, Any], shape: A2AScatterShape) -> dic
         "path_class": shape.path_class,
         "bt": shape.bt,
         "top_k": shape.top_k,
+        "padded_top_k": PADDED_TOP_K,
         "hidden_size": shape.hidden_size,
         "t_packing": T_PACKING,
         "h_per_t_packing": shape.hidden_size // T_PACKING,
@@ -400,6 +403,8 @@ def _metadata_for_shape(metadata: dict[str, Any], shape: A2AScatterShape) -> dic
         "local_num_experts": shape.local_num_experts,
         "num_experts": shape.ep_size * shape.local_num_experts,
         "routing_pattern": "e_id=(rank+k+1)%ep_size*local_num_experts+k",
+        "topk_id_layout": "HBM rows are padded to 128 columns; only first top_k entries route payloads.",
+        "scratch_token_capacity": _scratch_token_capacity(shape),
         "remote_copies_per_device": shape.bt * shape.top_k,
         "remote_payload_bytes_per_copy": shape.hidden_size * BF16_BYTES,
         "remote_payload_bytes_per_device": _payload_bytes_per_device(shape),
@@ -569,7 +574,7 @@ def _measure_a2a_scatter_ms(
         jnp.zeros(
             (
                 shape.top_k,
-                shape.ep_size * shape.bt,
+                _scratch_token_capacity(shape),
                 T_PACKING,
                 shape.hidden_size // T_PACKING,
             ),
@@ -808,8 +813,6 @@ def _pallas_a2a_metadata_call(local_counts_hbm, *, shape, jax, pl, pltpu):
 
 
 def _pallas_a2a_scatter_call(tokens_hbm, topk_ids_hbm, scratch_hbm, *, shape, jax, jnp, pl, pltpu):
-    del jnp
-
     def kernel(
         tokens_ref,
         topk_ids_ref,
@@ -845,7 +848,7 @@ def _pallas_a2a_scatter_call(tokens_hbm, topk_ids_hbm, scratch_hbm, *, shape, ja
         pltpu.semaphore_wait(barrier_sem, shape.ep_size)
 
         topk_copy = pltpu.make_async_copy(
-            src_ref=topk_ids_ref.at[pl.ds(0, shape.bt), pl.ds(0, shape.top_k)],
+            src_ref=topk_ids_ref.at[pl.ds(0, shape.bt)],
             dst_ref=topk_ids_vmem,
             sem=topk_sem,
         )
@@ -901,7 +904,7 @@ def _pallas_a2a_scatter_call(tokens_hbm, topk_ids_hbm, scratch_hbm, *, shape, ja
             out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
             grid=(1,),
             scratch_shapes=[
-                pltpu.VMEM((shape.bt, shape.top_k), topk_ids_hbm.dtype),
+                pltpu.VMEM((shape.bt, PADDED_TOP_K), topk_ids_hbm.dtype),
                 pltpu.SemaphoreType.DMA,
                 pltpu.SemaphoreType.DMA((shape.local_num_experts,)),
                 pltpu.SemaphoreType.DMA((shape.local_num_experts,)),
@@ -938,7 +941,7 @@ def _make_tokens(*, jax: Any, np: Any, sharding: Any, shape: A2AScatterShape):
 
 
 def _make_topk_ids(*, jax: Any, np: Any, sharding: Any, shape: A2AScatterShape):
-    global_shape = (shape.bt * shape.ep_size, shape.top_k)
+    global_shape = (shape.bt * shape.ep_size, PADDED_TOP_K)
 
     def data_callback(index):
         leading = index[0]
@@ -946,7 +949,7 @@ def _make_topk_ids(*, jax: Any, np: Any, sharding: Any, shape: A2AScatterShape):
         stop = int(leading.stop or global_shape[0])
         rank_id = start // shape.bt
         local_rows = stop - start
-        out = np.zeros((local_rows, shape.top_k), dtype=np.int32)
+        out = np.full((local_rows, PADDED_TOP_K), -1, dtype=np.int32)
         for k_id in range(shape.top_k):
             recv_id = (rank_id + k_id + 1) % shape.ep_size
             out[:, k_id] = recv_id * shape.local_num_experts + k_id
@@ -975,6 +978,11 @@ def _make_local_counts(*, jax: Any, np: Any, sharding: Any, shape: A2AMetadataSh
 
 def _payload_bytes_per_device(shape: A2AScatterShape) -> int:
     return shape.bt * shape.top_k * shape.hidden_size * BF16_BYTES
+
+
+def _scratch_token_capacity(shape: A2AScatterShape) -> int:
+    tokens = shape.bt * shape.ep_size
+    return ((tokens + HBM_TOKEN_ALIGNMENT - 1) // HBM_TOKEN_ALIGNMENT) * HBM_TOKEN_ALIGNMENT
 
 
 def _metadata_rounds(shape: A2AMetadataShape) -> int:

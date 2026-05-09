@@ -43,6 +43,7 @@ SCENARIOS = (
 SUITE_V7X32_BF16_WEIGHT_TILES = "v7x32_bf16_weight_tiles"
 SUITE_V7X32_BF16_HBM_COPY_ENVELOPE = "v7x32_bf16_hbm_copy_envelope"
 SUITE_V7X32_BF16_HBM_CURVE_V2 = "v7x32_bf16_hbm_curve_v2"
+SUITE_V7X32_BF16_HBM_DENSE_CURVE_V3 = "v7x32_bf16_hbm_dense_curve_v3"
 SUITE_V7X32_BF16_GEMM_ENVELOPE = "v7x32_bf16_gemm_envelope"
 SUITE_V7X32_BF16_GEMM_CURVE_V2 = "v7x32_bf16_gemm_curve_v2"
 SUITE_V7X32_BF16_A2A_CURVE_V1 = "v7x32_bf16_a2a_curve_v1"
@@ -51,6 +52,7 @@ SUITES = (
     SUITE_V7X32_BF16_WEIGHT_TILES,
     SUITE_V7X32_BF16_HBM_COPY_ENVELOPE,
     SUITE_V7X32_BF16_HBM_CURVE_V2,
+    SUITE_V7X32_BF16_HBM_DENSE_CURVE_V3,
     SUITE_V7X32_BF16_GEMM_ENVELOPE,
     SUITE_V7X32_BF16_GEMM_CURVE_V2,
     SUITE_V7X32_BF16_A2A_CURVE_V1,
@@ -155,6 +157,30 @@ PHASE1_HBM_CURVE_V2_BYTES_HBM = (
     4 * 1024 * 1024 * 1024,
 )
 
+PHASE1_HBM_DENSE_CURVE_V3_BYTES_HBM = (
+    4 * 1024,
+    8 * 1024,
+    16 * 1024,
+    32 * 1024,
+    64 * 1024,
+    128 * 1024,
+    256 * 1024,
+    512 * 1024,
+    1024 * 1024,
+    2 * 1024 * 1024,
+    4 * 1024 * 1024,
+    8 * 1024 * 1024,
+    16 * 1024 * 1024,
+    32 * 1024 * 1024,
+    64 * 1024 * 1024,
+    128 * 1024 * 1024,
+    256 * 1024 * 1024,
+    512 * 1024 * 1024,
+    1024 * 1024 * 1024,
+    2 * 1024 * 1024 * 1024,
+    4 * 1024 * 1024 * 1024,
+)
+
 PHASE1_HBM_COPY_LADDER_SHAPES: tuple[WeightTileShape, ...] = tuple(
     WeightTileShape(
         path_class="hbm_ladder",
@@ -175,6 +201,17 @@ PHASE1_HBM_CURVE_V2_SHAPES: tuple[WeightTileShape, ...] = tuple(
         tile_shape=(1, 1, (bytes_hbm // 2) // 2),
     )
     for bytes_hbm in PHASE1_HBM_CURVE_V2_BYTES_HBM
+)
+
+PHASE1_HBM_DENSE_CURVE_V3_SHAPES: tuple[WeightTileShape, ...] = tuple(
+    WeightTileShape(
+        path_class="hbm_dense_curve_v3",
+        bf=(bytes_hbm // 2) // 2,
+        bd=1,
+        bytes_per_fetch=bytes_hbm // 2,
+        tile_shape=(1, 1, (bytes_hbm // 2) // 2),
+    )
+    for bytes_hbm in PHASE1_HBM_DENSE_CURVE_V3_BYTES_HBM
 )
 
 PHASE1_GEMM_EQUIVALENT_SHAPES: tuple[GemmShape, ...] = (
@@ -297,6 +334,8 @@ def load_layer0_suite_shapes(suite: str) -> tuple[WeightTileShape, ...]:
         return PHASE1_HBM_COPY_LADDER_SHAPES + PHASE1_HBM_EQUIVALENT_SHAPES
     if suite == SUITE_V7X32_BF16_HBM_CURVE_V2:
         return PHASE1_HBM_CURVE_V2_SHAPES + PHASE1_HBM_EQUIVALENT_SHAPES
+    if suite == SUITE_V7X32_BF16_HBM_DENSE_CURVE_V3:
+        return PHASE1_HBM_DENSE_CURVE_V3_SHAPES + PHASE1_HBM_EQUIVALENT_SHAPES
     raise ValueError(f"Unsupported Layer 0 suite: {suite}")
 
 
@@ -357,6 +396,53 @@ def _suite_metadata(*, matrix_kind: str) -> dict[str, Any]:
     }
 
 
+def _layer0_hbm_metadata(suite: str) -> dict[str, Any]:
+    metadata = _suite_metadata(matrix_kind="hbm_equivalent_weight_tile")
+    if suite == SUITE_V7X32_BF16_HBM_DENSE_CURVE_V3:
+        metadata["matrix_kind"] = "hbm_dense_curve_v3"
+        metadata["includes"] = [
+            "tiny_hbm_copy_rows",
+            "knee_hbm_copy_rows",
+            "plateau_hbm_copy_rows",
+            "fused_moe_weight_tile_marker_rows",
+        ]
+        metadata["excludes"] = [
+            "fused_moe_pallas_weight_dma",
+            "remote_dma",
+            "gemm_compute",
+        ]
+        metadata["hbm_dense_curve_v3"] = {
+            "measured_bytes_hbm": list(PHASE1_HBM_DENSE_CURVE_V3_BYTES_HBM),
+            "traffic_class": "copy_read_write",
+            "bytes_hbm_formula": "2 * bytes_per_fetch",
+            "byte_groups": {
+                "tiny": [4 * 1024, 8 * 1024, 16 * 1024, 32 * 1024],
+                "small_knee": [
+                    64 * 1024,
+                    128 * 1024,
+                    256 * 1024,
+                    512 * 1024,
+                    1024 * 1024,
+                    2 * 1024 * 1024,
+                    4 * 1024 * 1024,
+                    8 * 1024 * 1024,
+                    16 * 1024 * 1024,
+                    32 * 1024 * 1024,
+                    64 * 1024 * 1024,
+                ],
+                "large_plateau": [
+                    128 * 1024 * 1024,
+                    256 * 1024 * 1024,
+                    512 * 1024 * 1024,
+                    1024 * 1024 * 1024,
+                    2 * 1024 * 1024 * 1024,
+                    4 * 1024 * 1024 * 1024,
+                ],
+            },
+        }
+    return metadata
+
+
 def _not_implemented_note(scenario: str, execution_mode: str) -> str:
     if execution_mode == "local_smoke":
         return (
@@ -415,7 +501,7 @@ def _layer0_hbm_envelope_rows(
         t_packing=T_PACKING,
         dma_count=DMA_COUNT,
         source=_source(),
-        metadata=_suite_metadata(matrix_kind="hbm_equivalent_weight_tile"),
+        metadata=_layer0_hbm_metadata(suite),
     )
 
 
