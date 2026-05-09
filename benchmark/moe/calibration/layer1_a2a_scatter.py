@@ -525,7 +525,6 @@ def _pallas_unavailable_note(runtime: dict[str, Any]) -> str | None:
         from jax.experimental import pallas as pl  # noqa: F401
         from jax.experimental.pallas import tpu as pltpu  # noqa: F401
 
-        from benchmark.moe.utils import build_mesh  # noqa: F401
         from benchmark.utils import multiple_iteration_timeit_from_trace  # noqa: F401
     except Exception as exc:
         return (
@@ -560,10 +559,9 @@ def _measure_a2a_scatter_ms(
     from jax.sharding import NamedSharding
     from jax.sharding import PartitionSpec as P
 
-    from benchmark.moe.utils import build_mesh
     from benchmark.utils import multiple_iteration_timeit_from_trace
 
-    mesh = build_mesh(ep_size=shape.ep_size, tp_size=1)
+    mesh = _build_tensor_mesh(jax=jax, np=np, ep_size=shape.ep_size, tp_size=1)
     token_sharding = NamedSharding(mesh, P("tensor", None, None))
     topk_sharding = NamedSharding(mesh, P("tensor", None))
     scratch_sharding = NamedSharding(mesh, P())
@@ -663,10 +661,9 @@ def _measure_a2a_metadata_ms(
     from jax.sharding import NamedSharding
     from jax.sharding import PartitionSpec as P
 
-    from benchmark.moe.utils import build_mesh
     from benchmark.utils import multiple_iteration_timeit_from_trace
 
-    mesh = build_mesh(ep_size=shape.ep_size, tp_size=1)
+    mesh = _build_tensor_mesh(jax=jax, np=np, ep_size=shape.ep_size, tp_size=1)
     count_sharding = NamedSharding(mesh, P("tensor", None))
     local_counts = _make_local_counts(jax=jax, np=np, sharding=count_sharding, shape=shape)
     jax.block_until_ready(local_counts)
@@ -974,6 +971,17 @@ def _make_local_counts(*, jax: Any, np: Any, sharding: Any, shape: A2AMetadataSh
         return out
 
     return jax.make_array_from_callback(global_shape, sharding, data_callback)
+
+
+def _build_tensor_mesh(*, jax: Any, np: Any, ep_size: int, tp_size: int):
+    from jax.experimental import mesh_utils
+    from jax.sharding import Mesh
+
+    if ep_size <= 0 or tp_size <= 0:
+        raise ValueError(f"Expected {ep_size=} and {tp_size=} to be > 0.")
+    devices = jax.devices()[: ep_size * tp_size]
+    device_mesh = mesh_utils.create_device_mesh((tp_size, ep_size), devices=devices)
+    return Mesh(np.asarray(device_mesh), ("data", "tensor"))
 
 
 def _payload_bytes_per_device(shape: A2AScatterShape) -> int:

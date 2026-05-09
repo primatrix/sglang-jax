@@ -19,7 +19,6 @@ from benchmark.moe.calibration import (
     layer1_a2a_scatter,
     layer1_local_dma,
     layer1_weight_tile_dma,
-    layer2_fused_moe_e2e,
 )
 from benchmark.moe.calibration.common import (
     build_observation_row,
@@ -436,10 +435,6 @@ PHASE1_LOCAL_DMA_TOPK8_SHAPES: tuple[layer1_local_dma.LocalDMAShape, ...] = tupl
     for path, path_class in PHASE1_LOCAL_DMA_TOPK8_PATH_CLASSES.items()
 )
 
-LAYER2_FUSED_MOE_E2E_DIAG_V1_SHAPES: tuple[layer2_fused_moe_e2e.FusedMoEE2EShape, ...] = (
-    layer2_fused_moe_e2e.default_shapes()
-)
-
 
 def load_suite_shapes(suite: str) -> tuple[WeightTileShape, ...]:
     if suite != SUITE_V7X32_BF16_WEIGHT_TILES:
@@ -517,10 +512,16 @@ def load_layer1_local_dma_suite_shapes(
 
 def load_layer2_fused_moe_e2e_suite_shapes(
     suite: str,
-) -> tuple[layer2_fused_moe_e2e.FusedMoEE2EShape, ...]:
+) -> tuple[Any, ...]:
     if suite == SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG_V1:
-        return LAYER2_FUSED_MOE_E2E_DIAG_V1_SHAPES
+        return _layer2_fused_moe_e2e().default_shapes()
     raise ValueError(f"Unsupported Layer 2 fused MoE E2E suite: {suite}")
+
+
+def _layer2_fused_moe_e2e():
+    from benchmark.moe.calibration import layer2_fused_moe_e2e
+
+    return layer2_fused_moe_e2e
 
 
 def _source() -> dict[str, Any]:
@@ -886,6 +887,7 @@ def build_rows(
     if scenario == SCENARIO_LAYER1_LOCAL_DMA:
         return _layer1_local_dma_rows(suite, resolved_mode, runtime)
     if scenario == SCENARIO_LAYER2_FUSED_MOE_E2E:
+        layer2_fused_moe_e2e = _layer2_fused_moe_e2e()
         return layer2_fused_moe_e2e.build_rows(
             suite=suite,
             shapes=load_layer2_fused_moe_e2e_suite_shapes(suite),

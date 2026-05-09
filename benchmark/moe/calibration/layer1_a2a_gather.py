@@ -302,7 +302,6 @@ def _pallas_unavailable_note(runtime: dict[str, Any]) -> str | None:
         from jax.experimental import pallas as pl  # noqa: F401
         from jax.experimental.pallas import tpu as pltpu  # noqa: F401
 
-        from benchmark.moe.utils import build_mesh  # noqa: F401
         from benchmark.utils import multiple_iteration_timeit_from_trace  # noqa: F401
     except Exception as exc:
         return (
@@ -337,10 +336,9 @@ def _measure_a2a_gather_ms(
     from jax.sharding import NamedSharding
     from jax.sharding import PartitionSpec as P
 
-    from benchmark.moe.utils import build_mesh
     from benchmark.utils import multiple_iteration_timeit_from_trace
 
-    mesh = build_mesh(ep_size=shape.ep_size, tp_size=1)
+    mesh = _build_tensor_mesh(jax=jax, np=np, ep_size=shape.ep_size, tp_size=1)
     acc_sharding = NamedSharding(mesh, P("tensor", None, None, None))
     gather_sharding = NamedSharding(mesh, P())
 
@@ -519,6 +517,17 @@ def _make_expert_outputs(*, jax: Any, np: Any, sharding: Any, shape: A2AGatherSh
         return np.full(local_shape, (start // shape.local_num_experts) % 128, dtype=numpy_bfloat16)
 
     return jax.make_array_from_callback(global_shape, sharding, data_callback)
+
+
+def _build_tensor_mesh(*, jax: Any, np: Any, ep_size: int, tp_size: int):
+    from jax.experimental import mesh_utils
+    from jax.sharding import Mesh
+
+    if ep_size <= 0 or tp_size <= 0:
+        raise ValueError(f"Expected {ep_size=} and {tp_size=} to be > 0.")
+    devices = jax.devices()[: ep_size * tp_size]
+    device_mesh = mesh_utils.create_device_mesh((tp_size, ep_size), devices=devices)
+    return Mesh(np.asarray(device_mesh), ("data", "tensor"))
 
 
 def _payload_bytes_per_device(shape: A2AGatherShape) -> int:
