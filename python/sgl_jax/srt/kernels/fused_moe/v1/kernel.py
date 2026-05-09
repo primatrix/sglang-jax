@@ -510,8 +510,9 @@ def _fused_ep_moe_kernel(
     w1_shared_scale_hbm,  # None | (1, 1, se_inter)
     w3_shared_scale_hbm,  # None | (1, 1, se_inter)
     w2_shared_scale_hbm,  # None | (1, 1, hidden_size)
-    global_starts_hbm,  # None | (1, num_experts) int32 — JAX 预计算的全局前缀和
-    global_sizes_hbm,  # None | (1, num_experts) int32 — JAX 预计算的全局大小
+    metadata_starts_hbm,  # None | (num_bt, 1, padded_num_experts) int32
+    metadata_sizes_hbm,  # None | (num_bt, 1, padded_num_experts) int32
+    metadata_d2e_counts_hbm,  # None | (num_bt, num_devices, 1, padded_num_experts) int32
     # Output
     output_hbm,  # (local_num_tokens, hidden_size)
     # Scratch
@@ -706,15 +707,15 @@ def _fused_ep_moe_kernel(
             sem=local_sems.at[bt_sem_id, 13],
         ).wait()
 
-    def all_reduce_metadata(*, bt_sem_id, t2e_routing, starts, sizes):
+    def all_reduce_metadata(*, bt_id, bt_sem_id, t2e_routing, starts, sizes):
         send_sem = send_x2_sems.at[0]
         recv_sem = recv_x2_sems.at[0]
 
-        # 新增：JAX 预计算路径
-        if use_jax_allreduce_metadata and global_starts_hbm is not None:
+        if use_jax_allreduce_metadata and metadata_starts_hbm is not None:
 
             def _copy_precomputed(
                 t2e_routing_vmem,
+                d2e_count_vmem,
                 offsets_vmem,
                 starts_vmem,
                 sizes_vmem,
@@ -722,19 +723,22 @@ def _fused_ep_moe_kernel(
                 offsets_vmem[...] = jnp.zeros_like(offsets_vmem)
                 t2e_routing_vmem[...] = t2e_routing
 
-                # 从 HBM 异步拷贝预计算的 starts 和 sizes 到 VMEM
                 starts_load = pltpu.async_copy(
-                    src_ref=global_starts_hbm,
+                    src_ref=metadata_starts_hbm.at[bt_id],
                     dst_ref=starts_vmem,
                     sem=send_sem,
                 )
                 sizes_load = pltpu.async_copy(
-                    src_ref=global_sizes_hbm,
+                    src_ref=metadata_sizes_hbm.at[bt_id],
                     dst_ref=sizes_vmem,
                     sem=send_sem,
                 )
+                d2e_count_load = pltpu.async_copy(
+                    src_ref=metadata_d2e_counts_hbm.at[bt_id],
+                    dst_ref=d2e_count_vmem,
+                    sem=send_sem,
+                )
 
-                # 复制到 SMEM（与现有路径相同）
                 offsets_copy = pltpu.async_copy(
                     src_ref=offsets_vmem,
                     dst_ref=expert_offsets_x2_smem.at[bt_sem_id],
@@ -746,9 +750,9 @@ def _fused_ep_moe_kernel(
                     sem=send_sem,
                 )
 
-                # 等待 HBM->VMEM 完成后再 VMEM->SMEM
                 starts_load.wait()
                 sizes_load.wait()
+                d2e_count_load.wait()
                 starts_copy = pltpu.async_copy(
                     src_ref=starts_vmem,
                     dst_ref=expert_starts_x2_smem.at[bt_sem_id],
@@ -759,8 +763,14 @@ def _fused_ep_moe_kernel(
                     dst_ref=expert_sizes_x2_smem.at[bt_sem_id],
                     sem=send_sem,
                 )
+                d2e_count_copy = pltpu.async_copy(
+                    src_ref=d2e_count_vmem,
+                    dst_ref=d2e_count_x2_smem.at[bt_sem_id],
+                    sem=send_sem,
+                )
 
                 t2e_routing_copy.wait()
+                d2e_count_copy.wait()
                 offsets_copy.wait()
                 starts_copy.wait()
                 sizes_copy.wait()
@@ -768,6 +778,7 @@ def _fused_ep_moe_kernel(
             pl.run_scoped(
                 _copy_precomputed,
                 pltpu.VMEM(t2e_routing_x2_smem.shape[1:], t2e_routing_x2_smem.dtype),
+                pltpu.VMEM(d2e_count_x2_smem.shape[1:], d2e_count_x2_smem.dtype),
                 pltpu.VMEM(expert_offsets_x2_smem.shape[1:], expert_offsets_x2_smem.dtype),
                 pltpu.VMEM(expert_starts_x2_smem.shape[1:], expert_starts_x2_smem.dtype),
                 pltpu.VMEM(expert_sizes_x2_smem.shape[1:], expert_sizes_x2_smem.dtype),
@@ -2727,14 +2738,18 @@ def _fused_ep_moe_kernel(
         # Prepare t2e_routing
         t2e_routing = b_topk_ids_x2_vmem[bt_sem_id]
 
-        expert_iota = jax.lax.broadcasted_iota(jnp.int32, (1, 1, padded_num_experts), 2)
-        routing_expanded = jnp.expand_dims(t2e_routing[:, :top_k], axis=2)
-        mask = (routing_expanded == expert_iota).astype(jnp.int32)
-        expert_sizes = jnp.sum(mask, axis=(0, 1), keepdims=True).reshape(1, padded_num_experts)
+        if use_jax_allreduce_metadata and metadata_starts_hbm is not None:
+            expert_sizes = jnp.zeros((1, padded_num_experts), dtype=jnp.int32)
+        else:
+            expert_iota = jax.lax.broadcasted_iota(jnp.int32, (1, 1, padded_num_experts), 2)
+            routing_expanded = jnp.expand_dims(t2e_routing[:, :top_k], axis=2)
+            mask = (routing_expanded == expert_iota).astype(jnp.int32)
+            expert_sizes = jnp.sum(mask, axis=(0, 1), keepdims=True).reshape(1, padded_num_experts)
 
         expert_starts = jnp.zeros_like(expert_sizes)
 
         all_reduce_metadata(
+            bt_id=bt_id,
             bt_sem_id=bt_sem_id,
             t2e_routing=t2e_routing,
             starts=expert_starts,
@@ -3144,93 +3159,71 @@ def _validate_fused_ep_moe_args(
 
 
 def compute_local_expert_sizes(topk_ids: jax.Array, num_experts: int) -> jax.Array:
-    """从 topk_ids 计算每个专家的 token 数量。
+    """Count routed tokens per expert for one local token tile.
 
-    必须在 shard_map 内部调用（输入需要是本地未分片的）。
-
-    参数：
-        topk_ids: (num_tokens, top_k) int32，每个 token 的专家 ID
-        num_experts: 专家总数
-
-    返回：
-        local_sizes: (1, num_experts) int32，本设备上每个专家的 token 数
+    Must be called inside shard_map, where topk_ids is the device-local slice.
+    Invalid/padded expert ids are accumulated into a sentinel bucket and dropped.
     """
     flat_ids = topk_ids.flatten()
-    # 过滤无效 ID（-1 表示被 mask 的 token）
-    valid_ids = jnp.where(flat_ids >= 0, flat_ids, num_experts)
-    counts = jnp.bincount(valid_ids, length=num_experts + 1)[:num_experts]
-    return counts[None, :].astype(jnp.int32)  # (1, num_experts)
+    valid = (flat_ids >= 0) & (flat_ids < num_experts)
+    safe_ids = jnp.where(valid, flat_ids, num_experts)
+    counts = jnp.bincount(safe_ids, length=num_experts + 1)[:num_experts]
+    return counts[None, :].astype(jnp.int32)
 
 
-def jax_allreduce_metadata(
+def jax_allreduce_metadata_by_bt(
     topk_ids: jax.Array,  # (num_tokens, top_k) int32
     num_experts: int,
-    mesh: jax.sharding.Mesh,
+    bt: int,
+    num_devices: int,
     dp_axis_name: str,
     tp_axis_name: str,
-) -> tuple[jax.Array, jax.Array]:
-    """纯 JAX allgather + 前缀和处理元数据。
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Compute the per-bt metadata normally produced inside the Pallas kernel.
 
-    将 compute_local_expert_sizes 和 allgather 都放在 shard_map 内部，
-    避免 jit 域外的分片计算问题。
-
-    匹配 /tmp/s1c_allreduce_bench.py 中的基准实现。
-
-    返回：
-        global_starts: (1, num_experts) int32 — 跨 EP 设备的前缀和（复制到所有设备）
-        global_sizes: (1, num_experts) int32 — 跨 EP 设备的总和（复制到所有设备）
+    Returns:
+        starts: (num_bt, 1, num_experts) int32
+        sizes: (num_bt, 1, num_experts) int32
+        d2e_counts: (num_bt, num_devices, 1, num_experts) int32
     """
-    try:
-        from jax.experimental.shard_map import shard_map
-    except ImportError:
-        from jax.shard_map import shard_map
+    num_tokens = topk_ids.shape[0]
+    if num_tokens % bt != 0:
+        raise ValueError(f"Expected local topk_ids tokens ({num_tokens}) to be divisible by {bt=}.")
 
-    num_devices = mesh.shape[dp_axis_name] * mesh.shape[tp_axis_name]
-
-    @functools.partial(
-        shard_map,
-        mesh=mesh,
-        in_specs=(
-            P(
-                (dp_axis_name, tp_axis_name),
-            ),
-        ),
-        out_specs=(
-            P(),
-            P(),
-        ),
-        check_rep=False,
+    topk_ids_by_bt = topk_ids.reshape(num_tokens // bt, bt, topk_ids.shape[-1])
+    local_sizes = jax.vmap(compute_local_expert_sizes, in_axes=(0, None))(
+        topk_ids_by_bt,
+        num_experts,
     )
-    def _compute_and_allgather(topk_ids_local):
-        # 在本设备上计算本地专家大小
-        local_sizes = compute_local_expert_sizes(topk_ids_local, num_experts)
 
-        # 跨两个轴 allgather（EP = data × tensor）
-        all_sizes = lax.all_gather(
-            local_sizes, axis_name=(dp_axis_name, tp_axis_name), axis=0, tiled=True
-        )  # (num_devices, num_experts)
+    all_sizes = lax.all_gather(
+        local_sizes,
+        axis_name=(dp_axis_name, tp_axis_name),
+        axis=1,
+        tiled=True,
+    )
+    all_sizes = all_sizes.astype(jnp.int32)
+    if all_sizes.shape[1] != num_devices:
+        raise ValueError(
+            f"Expected gathered metadata axis to be {num_devices}, got {all_sizes.shape}."
+        )
 
-        # 全局求和
-        global_sizes = jnp.sum(all_sizes, axis=0, keepdims=True)  # (1, num_experts)
+    sizes = jnp.sum(all_sizes, axis=1, keepdims=True).astype(jnp.int32)
 
-        # 前缀和：计算本设备的起始偏移
-        dp_rank = lax.axis_index(dp_axis_name)
-        tp_rank = lax.axis_index(tp_axis_name)
-        tp_size = lax.axis_size(tp_axis_name)
-        my_id = dp_rank * tp_size + tp_rank
+    dp_rank = lax.axis_index(dp_axis_name)
+    tp_rank = lax.axis_index(tp_axis_name)
+    tp_size = lax.axis_size(tp_axis_name)
+    my_id = dp_rank * tp_size + tp_rank
+    starts_by_device = jnp.cumsum(all_sizes, axis=1, dtype=jnp.int32) - all_sizes
+    starts = lax.dynamic_index_in_dim(
+        starts_by_device,
+        my_id,
+        axis=1,
+        keepdims=False,
+    )[:, None, :]
 
-        global_starts = jnp.zeros((1, num_experts), dtype=jnp.int32)
-        for dev_id in range(num_devices):
-            dev_sizes = all_sizes[dev_id : dev_id + 1]
-            global_starts += lax.select(
-                dev_id < my_id,
-                dev_sizes,
-                jnp.zeros_like(dev_sizes),
-            )
-
-        return global_starts, global_sizes
-
-    return _compute_and_allgather(topk_ids)
+    d2e_counts = all_sizes[:, :, None, :]
+    return starts, sizes, d2e_counts
 
 
 @functools.partial(
@@ -3370,9 +3363,7 @@ def fused_ep_moe(
         tp_axis_name=tp_axis_name,
     )
 
-    # 是否使用 JAX allreduce 路径预计算元数据
     needs_jax_allreduce = use_jax_allreduce_metadata and ep_size > 1 and not disable_a2a
-    num_experts_total = w2.shape[0]
 
     num_devices = ep_size
 
@@ -3605,8 +3596,9 @@ def fused_ep_moe(
                     None if w1_shared_scale is None else hbm_block_spec,  # w1_shared_scale_hbm
                     None if w3_shared_scale is None else hbm_block_spec,  # w3_shared_scale_hbm
                     None if w2_shared_scale is None else hbm_block_spec,  # w2_shared_scale_hbm
-                    None if not needs_jax_allreduce else hbm_block_spec,  # global_starts_hbm
-                    None if not needs_jax_allreduce else hbm_block_spec,  # global_sizes_hbm
+                    None if not needs_jax_allreduce else hbm_block_spec,  # metadata_starts_hbm
+                    None if not needs_jax_allreduce else hbm_block_spec,  # metadata_sizes_hbm
+                    None if not needs_jax_allreduce else hbm_block_spec,  # metadata_d2e_counts_hbm
                 ],
                 out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                 scratch_shapes=scratch_shapes,
@@ -3721,36 +3713,25 @@ def fused_ep_moe(
         w3_shared_scale=None,
         w2_shared_scale=None,
     ):
-        # 在 shard_map 内部（device-local 视角）计算 JAX allreduce 元数据
-        # 这样集合通信和 pallas_call 在同一个 shard_map 域内，避免跨域死锁
         if needs_jax_allreduce:
-            local_sizes = compute_local_expert_sizes(topk_ids, num_experts_total)
-            # allgather 跨两个轴
-            all_sizes = lax.all_gather(
-                local_sizes,
-                axis_name=(dp_axis_name, tp_axis_name),
-                axis=0,
-                tiled=True,
-            )  # (num_devices, num_experts)
-            global_sizes = jnp.sum(all_sizes, axis=0, keepdims=True).astype(jnp.int32)
-            # 前缀和：本设备起始偏移
-            dp_rank = lax.axis_index(dp_axis_name)
-            tp_rank = lax.axis_index(tp_axis_name)
-            tp_size_local = lax.axis_size(tp_axis_name)
-            my_id = dp_rank * tp_size_local + tp_rank
-            global_starts = jnp.zeros((1, num_experts_total), dtype=jnp.int32)
-            for dev_id in range(num_devices):
-                dev_sizes = all_sizes[dev_id : dev_id + 1]
-                global_starts += lax.select(
-                    dev_id < my_id,
-                    dev_sizes,
-                    jnp.zeros_like(dev_sizes),
-                )
-            global_starts_arg = pltpu.with_memory_space_constraint(global_starts, pltpu.HBM)
-            global_sizes_arg = pltpu.with_memory_space_constraint(global_sizes, pltpu.HBM)
+            metadata_starts, metadata_sizes, metadata_d2e_counts = jax_allreduce_metadata_by_bt(
+                topk_ids,
+                padded_num_experts,
+                bt,
+                num_devices,
+                dp_axis_name,
+                tp_axis_name,
+            )
+            metadata_starts_arg = pltpu.with_memory_space_constraint(metadata_starts, pltpu.HBM)
+            metadata_sizes_arg = pltpu.with_memory_space_constraint(metadata_sizes, pltpu.HBM)
+            metadata_d2e_counts_arg = pltpu.with_memory_space_constraint(
+                metadata_d2e_counts,
+                pltpu.HBM,
+            )
         else:
-            global_starts_arg = None
-            global_sizes_arg = None
+            metadata_starts_arg = None
+            metadata_sizes_arg = None
+            metadata_d2e_counts_arg = None
 
         local_output = fused_moe(
             pltpu.with_memory_space_constraint(tokens, pltpu.HBM),  # tokens_hbm
@@ -3812,8 +3793,9 @@ def fused_ep_moe(
                 if w2_shared_scale is None
                 else pltpu.with_memory_space_constraint(w2_shared_scale, pltpu.HBM)
             ),
-            global_starts_arg,
-            global_sizes_arg,
+            metadata_starts_arg,
+            metadata_sizes_arg,
+            metadata_d2e_counts_arg,
         )
         return local_output
 
