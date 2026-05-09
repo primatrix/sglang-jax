@@ -712,7 +712,7 @@ def _fused_ep_moe_kernel(
         recv_sem = recv_x2_sems.at[0]
 
         if use_jax_allreduce_metadata and metadata_starts_hbm is not None:
-            sync_barrier()
+            metadata_sem = local_sems.at[bt_sem_id, 0]
 
             def _copy_precomputed(
                 t2e_routing_vmem,
@@ -727,28 +727,28 @@ def _fused_ep_moe_kernel(
                 starts_load = pltpu.async_copy(
                     src_ref=metadata_starts_hbm.at[bt_id],
                     dst_ref=starts_vmem,
-                    sem=send_sem,
+                    sem=metadata_sem,
                 )
                 sizes_load = pltpu.async_copy(
                     src_ref=metadata_sizes_hbm.at[bt_id],
                     dst_ref=sizes_vmem,
-                    sem=send_sem,
+                    sem=metadata_sem,
                 )
                 d2e_count_load = pltpu.async_copy(
                     src_ref=metadata_d2e_counts_hbm.at[bt_id],
                     dst_ref=d2e_count_vmem,
-                    sem=send_sem,
+                    sem=metadata_sem,
                 )
 
                 offsets_copy = pltpu.async_copy(
                     src_ref=offsets_vmem,
                     dst_ref=expert_offsets_x2_smem.at[bt_sem_id],
-                    sem=send_sem,
+                    sem=metadata_sem,
                 )
                 t2e_routing_copy = pltpu.async_copy(
                     src_ref=t2e_routing_vmem,
                     dst_ref=t2e_routing_x2_smem.at[bt_sem_id],
-                    sem=send_sem,
+                    sem=metadata_sem,
                 )
 
                 starts_load.wait()
@@ -757,17 +757,17 @@ def _fused_ep_moe_kernel(
                 starts_copy = pltpu.async_copy(
                     src_ref=starts_vmem,
                     dst_ref=expert_starts_x2_smem.at[bt_sem_id],
-                    sem=send_sem,
+                    sem=metadata_sem,
                 )
                 sizes_copy = pltpu.async_copy(
                     src_ref=sizes_vmem,
                     dst_ref=expert_sizes_x2_smem.at[bt_sem_id],
-                    sem=send_sem,
+                    sem=metadata_sem,
                 )
                 d2e_count_copy = pltpu.async_copy(
                     src_ref=d2e_count_vmem,
                     dst_ref=d2e_count_x2_smem.at[bt_sem_id],
-                    sem=send_sem,
+                    sem=metadata_sem,
                 )
 
                 t2e_routing_copy.wait()
@@ -784,7 +784,6 @@ def _fused_ep_moe_kernel(
                 pltpu.VMEM(expert_starts_x2_smem.shape[1:], expert_starts_x2_smem.dtype),
                 pltpu.VMEM(expert_sizes_x2_smem.shape[1:], expert_sizes_x2_smem.dtype),
             )
-            sync_barrier()
             return
 
         # Local-only metadata path for profiling. Not correct for multi-device routing;
