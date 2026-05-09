@@ -47,6 +47,7 @@ SUITE_V7X32_BF16_HBM_DENSE_CURVE_V3 = "v7x32_bf16_hbm_dense_curve_v3"
 SUITE_V7X8_BF16_HBM_DENSE_CURVE_V3 = "v7x8_bf16_hbm_dense_curve_v3"
 SUITE_V7X32_BF16_GEMM_ENVELOPE = "v7x32_bf16_gemm_envelope"
 SUITE_V7X32_BF16_GEMM_CURVE_V2 = "v7x32_bf16_gemm_curve_v2"
+SUITE_V7X8_BF16_GEMM_SATURATION_CURVE_V3 = "v7x8_bf16_gemm_saturation_curve_v3"
 SUITE_V7X32_BF16_A2A_CURVE_V1 = "v7x32_bf16_a2a_curve_v1"
 SUITE_V7X32_BF16_A2A_TOPK8_V1 = "v7x32_bf16_a2a_topk8_v1"
 SUITES = (
@@ -57,6 +58,7 @@ SUITES = (
     SUITE_V7X8_BF16_HBM_DENSE_CURVE_V3,
     SUITE_V7X32_BF16_GEMM_ENVELOPE,
     SUITE_V7X32_BF16_GEMM_CURVE_V2,
+    SUITE_V7X8_BF16_GEMM_SATURATION_CURVE_V3,
     SUITE_V7X32_BF16_A2A_CURVE_V1,
     SUITE_V7X32_BF16_A2A_TOPK8_V1,
 )
@@ -76,6 +78,18 @@ TARGET_RUNTIME_V7X32 = {
     "jax_process_count": 4,
     "chip_count": 16,
     "tensorcore_or_jax_device_count": 32,
+}
+
+TARGET_RUNTIME_V7X8 = {
+    "device_type": "v7x",
+    "falcon_device_count": 8,
+    "falcon_device_topo": "2x2x1",
+    "replica": 1,
+    "jax_device_count": 8,
+    "jax_local_device_count": 8,
+    "jax_process_count": 1,
+    "chip_count": 4,
+    "tensorcore_or_jax_device_count": 8,
 }
 
 
@@ -271,14 +285,32 @@ PHASE1_GEMM_M_SWEEP_SHAPES: tuple[GemmShape, ...] = tuple(
     for k, n in ((1024, 1024), (2048, 2048), (4096, 4096))
 )
 
+PHASE1_GEMM_V3_M_SATURATION_SHAPES: tuple[GemmShape, ...] = tuple(
+    GemmShape("mxu_m_saturation", m, k, n)
+    for m in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
+    for k, n in ((512, 512), (1024, 1024), (2048, 2048), (4096, 4096))
+)
+
 PHASE1_GEMM_ASPECT_SWEEP_SHAPES: tuple[GemmShape, ...] = tuple(
     GemmShape("mxu_aspect_sweep", m, k, n)
     for m in (64, 256, 1024)
     for k, n in ((512, 4096), (1024, 2048), (2048, 1024), (4096, 512))
 )
 
+PHASE1_GEMM_V3_ASPECT_SHAPES: tuple[GemmShape, ...] = tuple(
+    GemmShape("mxu_aspect", m, k, n)
+    for m in (16, 64, 256, 1024, 4096)
+    for k, n in ((512, 4096), (1024, 2048), (2048, 1024), (4096, 512))
+)
+
 PHASE1_GEMM_CURVE_V2_SHAPES: tuple[GemmShape, ...] = (
     PHASE1_GEMM_EQUIVALENT_SHAPES + PHASE1_GEMM_M_SWEEP_SHAPES + PHASE1_GEMM_ASPECT_SWEEP_SHAPES
+)
+
+PHASE1_GEMM_SATURATION_CURVE_V3_SHAPES: tuple[GemmShape, ...] = (
+    PHASE1_GEMM_V3_M_SATURATION_SHAPES
+    + PHASE1_GEMM_V3_ASPECT_SHAPES
+    + PHASE1_GEMM_EQUIVALENT_SHAPES
 )
 
 PHASE1_A2A_CURVE_V1_MATRIX_DIMS = (
@@ -346,6 +378,8 @@ def load_layer0_gemm_suite_shapes(suite: str) -> tuple[GemmShape, ...]:
         return PHASE1_GEMM_EQUIVALENT_SHAPES
     if suite == SUITE_V7X32_BF16_GEMM_CURVE_V2:
         return PHASE1_GEMM_CURVE_V2_SHAPES
+    if suite == SUITE_V7X8_BF16_GEMM_SATURATION_CURVE_V3:
+        return PHASE1_GEMM_SATURATION_CURVE_V3_SHAPES
     raise ValueError(f"Unsupported Layer 0 GEMM suite: {suite}")
 
 
@@ -398,8 +432,22 @@ def _suite_metadata(*, matrix_kind: str) -> dict[str, Any]:
     }
 
 
+def _suite_metadata_for_runtime(
+    *, matrix_kind: str, target_runtime: dict[str, Any]
+) -> dict[str, Any]:
+    metadata = _suite_metadata(matrix_kind=matrix_kind)
+    metadata["target_runtime"] = target_runtime
+    return metadata
+
+
 def _layer0_hbm_metadata(suite: str) -> dict[str, Any]:
-    metadata = _suite_metadata(matrix_kind="hbm_equivalent_weight_tile")
+    target_runtime = (
+        TARGET_RUNTIME_V7X8 if suite == SUITE_V7X8_BF16_HBM_DENSE_CURVE_V3 else TARGET_RUNTIME_V7X32
+    )
+    metadata = _suite_metadata_for_runtime(
+        matrix_kind="hbm_equivalent_weight_tile",
+        target_runtime=target_runtime,
+    )
     if suite in (SUITE_V7X32_BF16_HBM_DENSE_CURVE_V3, SUITE_V7X8_BF16_HBM_DENSE_CURVE_V3):
         metadata["matrix_kind"] = "hbm_dense_curve_v3"
         metadata["includes"] = [
@@ -440,6 +488,50 @@ def _layer0_hbm_metadata(suite: str) -> dict[str, Any]:
                     2 * 1024 * 1024 * 1024,
                     4 * 1024 * 1024 * 1024,
                 ],
+            },
+        }
+    return metadata
+
+
+def _layer0_gemm_metadata(suite: str) -> dict[str, Any]:
+    metadata = _suite_metadata_for_runtime(
+        matrix_kind="gemm_equivalent_shape",
+        target_runtime=TARGET_RUNTIME_V7X32,
+    )
+    if suite == SUITE_V7X8_BF16_GEMM_SATURATION_CURVE_V3:
+        metadata = _suite_metadata_for_runtime(
+            matrix_kind="gemm_saturation_curve_v3",
+            target_runtime=TARGET_RUNTIME_V7X8,
+        )
+        metadata["includes"] = [
+            "m_saturation_sweep",
+            "aspect_ratio_sweep",
+            "fused_moe_marker_rows",
+        ]
+        metadata["excludes"] = [
+            "fused_moe_pallas_dot_scheduling",
+            "hbm_weight_dma",
+            "remote_dma",
+            "expert_routing",
+        ]
+        metadata["gemm_saturation_curve_v3"] = {
+            "operation": "jax_bfloat16_matmul",
+            "primary_metric": "tflops_per_device",
+            "target_slice": "v7x-8",
+            "m_saturation": {
+                "m": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+                "kn": [[512, 512], [1024, 1024], [2048, 2048], [4096, 4096]],
+            },
+            "aspect": {
+                "m": [16, 64, 256, 1024, 4096],
+                "kn": [[512, 4096], [1024, 2048], [2048, 1024], [4096, 512]],
+            },
+            "marker_paths": ["ffn1", "ffn2"],
+            "shape_counts": {
+                "m_saturation": len(PHASE1_GEMM_V3_M_SATURATION_SHAPES),
+                "aspect": len(PHASE1_GEMM_V3_ASPECT_SHAPES),
+                "marker": len(PHASE1_GEMM_EQUIVALENT_SHAPES),
+                "total": len(PHASE1_GEMM_SATURATION_CURVE_V3_SHAPES),
             },
         }
     return metadata
@@ -519,7 +611,7 @@ def _layer0_gemm_envelope_rows(
         weight_dtype=WEIGHT_DTYPE,
         t_packing=T_PACKING,
         source=_source(),
-        metadata=_suite_metadata(matrix_kind="gemm_equivalent_shape"),
+        metadata=_layer0_gemm_metadata(suite),
     )
 
 

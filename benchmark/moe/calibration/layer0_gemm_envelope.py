@@ -153,7 +153,9 @@ def _make_row(
     latency_ms_samples: list[float],
     implementation_note: str,
 ) -> dict[str, Any]:
-    return build_observation_row(
+    flops = _gemm_flops(shape)
+    bytes_hbm = _gemm_bytes_hbm(shape)
+    row = build_observation_row(
         scenario=SCENARIO_LAYER0_GEMM_ENVELOPE,
         suite=suite,
         layer=0,
@@ -165,8 +167,8 @@ def _make_row(
         bf=shape.m,
         bd=shape.k,
         tile_shape=(shape.m, shape.k, shape.n),
-        bytes_hbm=_gemm_bytes_hbm(shape),
-        bytes_per_fetch=_gemm_bytes_hbm(shape),
+        bytes_hbm=bytes_hbm,
+        bytes_per_fetch=bytes_hbm,
         dma_count=0,
         status=status,
         execution_mode=execution_mode,
@@ -176,6 +178,19 @@ def _make_row(
         metadata=_metadata_for_shape(metadata, shape),
         implementation_note=implementation_note,
     )
+    row.update(
+        {
+            "m": shape.m,
+            "k": shape.k,
+            "n": shape.n,
+            "flops": flops,
+            "bytes_lhs": shape.m * shape.k * BF16_BYTES,
+            "bytes_rhs": shape.k * shape.n * BF16_BYTES,
+            "bytes_out": shape.m * shape.n * BF16_BYTES,
+            "tflops_per_device": _tflops_per_device(flops, row.get("latency_ms_p50")),
+        }
+    )
+    return row
 
 
 def _metadata_for_shape(metadata: dict[str, Any], shape: Any) -> dict[str, Any]:
@@ -323,3 +338,9 @@ def _gemm_flops(shape: Any) -> int:
 
 def _gemm_bytes_hbm(shape: Any) -> int:
     return (shape.m * shape.k + shape.k * shape.n + shape.m * shape.n) * BF16_BYTES
+
+
+def _tflops_per_device(flops: int, latency_ms_p50: Any) -> float | None:
+    if not isinstance(latency_ms_p50, (int, float)) or latency_ms_p50 <= 0:
+        return None
+    return flops / (float(latency_ms_p50) * 1e9)
