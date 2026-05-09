@@ -1077,6 +1077,8 @@ def run_all(
 
             best: tuple[float, FusedMoEBlockConfig | None] | None = None
             default_ms: float | None = None
+            default_samples: list[float] = []
+            best_samples: list[float] = []
             for i, block_cfg in enumerate(block_cfgs):
                 tag = "default" if block_cfg is None else str(i)
                 if block_cfg is None:
@@ -1182,9 +1184,11 @@ def run_all(
                 print(f"     fused_moe[{tag}]: {mean_ms:.3f} ms (trace) | samples={times}")
                 if block_cfg is None:
                     default_ms = mean_ms
+                    default_samples = list(times)
                 if tune_block_config and np.isfinite(mean_ms):
                     if best is None or mean_ms < best[0]:
                         best = (mean_ms, block_cfg)
+                        best_samples = list(times)
 
             if tune_block_config and best is not None:
                 best_ms, best_cfg = best
@@ -1235,6 +1239,7 @@ def run_all(
                         best_ms, best_cfg = best
                 else:
                     best_ms, best_cfg = default_ms, None
+                    best_samples = list(default_samples)
                 results.append(
                     {
                         "case": case.name,
@@ -1244,7 +1249,15 @@ def run_all(
                         "hidden_size": case.hidden_size,
                         "intermediate_size": case.intermediate_size,
                         "ep_size": case.ep_size,
+                        "use_shared_expert": use_shared_expert,
+                        "use_grouped_topk": use_grouped_topk,
+                        "imbalance_mode": imbalance_mode,
+                        "hotspot_ratio": hotspot_ratio,
+                        "hotspot_count": hotspot_count,
                         "best_ms": best_ms,
+                        "latency_ms_samples": list(best_samples),
+                        "default_ms": default_ms,
+                        "default_samples": list(default_samples),
                         "best_cfg": best_cfg.as_kwargs() if best_cfg is not None else None,
                     }
                 )

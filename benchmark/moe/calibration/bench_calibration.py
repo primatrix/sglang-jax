@@ -1,8 +1,7 @@
-"""Phase 1 fused-MoE calibration benchmark CLI.
+"""Fused-MoE performance investigation benchmark CLI.
 
-This first pass establishes the command shape, suite matrix, scenario dispatch,
-and JSONL schema. TPU/Pallas measurement kernels are intentionally represented
-as not_implemented rows until the Layer 0 and Layer 1 benchmark issues land.
+This CLI dispatches Layer 0 hardware envelope, Layer 1 kernel-pattern module,
+and Layer 2 composed fused-MoE diagnostics into one JSONL observation schema.
 """
 
 from __future__ import annotations
@@ -20,6 +19,7 @@ from benchmark.moe.calibration import (
     layer1_a2a_scatter,
     layer1_local_dma,
     layer1_weight_tile_dma,
+    layer2_fused_moe_e2e,
 )
 from benchmark.moe.calibration.common import (
     build_observation_row,
@@ -35,6 +35,7 @@ SCENARIO_LAYER1_A2A_SCATTER = "layer1_a2a_scatter"
 SCENARIO_LAYER1_A2A_GATHER = "layer1_a2a_gather"
 SCENARIO_LAYER1_WEIGHT_TILE_DMA = "layer1_weight_tile_dma"
 SCENARIO_LAYER1_LOCAL_DMA = "layer1_local_dma"
+SCENARIO_LAYER2_FUSED_MOE_E2E = "layer2_fused_moe_e2e"
 SCENARIOS = (
     SCENARIO_LAYER0_HBM_ENVELOPE,
     SCENARIO_LAYER0_GEMM_ENVELOPE,
@@ -44,6 +45,7 @@ SCENARIOS = (
     SCENARIO_LAYER1_A2A_GATHER,
     SCENARIO_LAYER1_WEIGHT_TILE_DMA,
     SCENARIO_LAYER1_LOCAL_DMA,
+    SCENARIO_LAYER2_FUSED_MOE_E2E,
 )
 
 SUITE_V7X32_BF16_WEIGHT_TILES = "v7x32_bf16_weight_tiles"
@@ -58,6 +60,7 @@ SUITE_V7X32_BF16_A2A_CURVE_V1 = "v7x32_bf16_a2a_curve_v1"
 SUITE_V7X32_BF16_A2A_TOPK8_V1 = "v7x32_bf16_a2a_topk8_v1"
 SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT_V1 = "v7x32_bf16_a2a_topk8_preflight_v1"
 SUITE_V7X32_BF16_LOCAL_DMA_TOPK8_V1 = "v7x32_bf16_local_dma_topk8_v1"
+SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG_V1 = "v7x32_bf16_fused_moe_e2e_diag_v1"
 SUITES = (
     SUITE_V7X32_BF16_WEIGHT_TILES,
     SUITE_V7X32_BF16_HBM_COPY_ENVELOPE,
@@ -71,6 +74,7 @@ SUITES = (
     SUITE_V7X32_BF16_A2A_TOPK8_V1,
     SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT_V1,
     SUITE_V7X32_BF16_LOCAL_DMA_TOPK8_V1,
+    SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG_V1,
 )
 
 DTYPE = "bfloat16"
@@ -399,6 +403,10 @@ PHASE1_LOCAL_DMA_TOPK8_SHAPES: tuple[layer1_local_dma.LocalDMAShape, ...] = tupl
     for path, path_class in PHASE1_LOCAL_DMA_TOPK8_PATH_CLASSES.items()
 )
 
+LAYER2_FUSED_MOE_E2E_DIAG_V1_SHAPES: tuple[layer2_fused_moe_e2e.FusedMoEE2EShape, ...] = (
+    layer2_fused_moe_e2e.default_shapes()
+)
+
 
 def load_suite_shapes(suite: str) -> tuple[WeightTileShape, ...]:
     if suite != SUITE_V7X32_BF16_WEIGHT_TILES:
@@ -470,6 +478,14 @@ def load_layer1_local_dma_suite_shapes(
     if suite == SUITE_V7X32_BF16_LOCAL_DMA_TOPK8_V1:
         return PHASE1_LOCAL_DMA_TOPK8_SHAPES
     raise ValueError(f"Unsupported Layer 1 local DMA suite: {suite}")
+
+
+def load_layer2_fused_moe_e2e_suite_shapes(
+    suite: str,
+) -> tuple[layer2_fused_moe_e2e.FusedMoEE2EShape, ...]:
+    if suite == SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG_V1:
+        return LAYER2_FUSED_MOE_E2E_DIAG_V1_SHAPES
+    raise ValueError(f"Unsupported Layer 2 fused MoE E2E suite: {suite}")
 
 
 def _source() -> dict[str, Any]:
@@ -796,14 +812,15 @@ def resolve_execution_mode(scenario: str, requested: str, runtime: dict[str, Any
         return requested
     if _jax_backend(runtime) != "tpu":
         raise RuntimeError(
-            "Calibration runs require a TPU backend. Use --execution-mode local_smoke "
+            "Performance investigation runs require a TPU backend. Use --execution-mode local_smoke "
             "only for explicit local schema validation; local_smoke rows are not "
-            "calibration results."
+            "diagnostic results."
         )
     if scenario in (
         SCENARIO_LAYER0_HBM_ENVELOPE,
         SCENARIO_LAYER0_GEMM_ENVELOPE,
         SCENARIO_LAYER0_A2A_ENVELOPE,
+        SCENARIO_LAYER2_FUSED_MOE_E2E,
     ):
         return "jax_trace"
     return "pallas"
@@ -833,16 +850,27 @@ def build_rows(
         return _layer1_weight_tile_dma_rows(suite, resolved_mode, runtime)
     if scenario == SCENARIO_LAYER1_LOCAL_DMA:
         return _layer1_local_dma_rows(suite, resolved_mode, runtime)
+    if scenario == SCENARIO_LAYER2_FUSED_MOE_E2E:
+        return layer2_fused_moe_e2e.build_rows(
+            suite=suite,
+            shapes=load_layer2_fused_moe_e2e_suite_shapes(suite),
+            execution_mode=resolved_mode,
+            runtime=runtime,
+            source=_source(),
+            metadata=_suite_metadata(matrix_kind="fused_moe_e2e_overlap_diagnostic"),
+        )
     raise ValueError(f"Unsupported scenario: {scenario}")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run Phase 1 fused-MoE calibration benchmarks.")
+    parser = argparse.ArgumentParser(
+        description="Run fused-MoE performance investigation benchmarks."
+    )
     parser.add_argument(
         "--scenario",
         choices=SCENARIOS,
         required=True,
-        help="Calibration scenario to dispatch.",
+        help="Benchmark scenario to dispatch.",
     )
     parser.add_argument(
         "--suite",
@@ -854,14 +882,14 @@ def parse_args() -> argparse.Namespace:
         "--output",
         type=str,
         required=True,
-        help="Path to write JSONL calibration observations.",
+        help="Path to write JSONL observations.",
     )
     parser.add_argument(
         "--execution-mode",
         choices=("auto", "local_smoke", "jax_trace", "pallas"),
         default="auto",
         help=(
-            "Execution backend. auto selects jax_trace for Layer 0 on TPU, "
+            "Execution backend. auto selects jax_trace for Layer 0/2 on TPU, "
             "pallas for Layer 1 on TPU, and fails outside TPU. Use local_smoke "
             "only for explicit schema validation."
         ),
