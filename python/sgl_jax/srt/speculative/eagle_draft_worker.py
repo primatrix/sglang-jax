@@ -1,5 +1,3 @@
-import logging
-
 import jax
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -8,11 +6,7 @@ from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.speculative.base_spec_worker import BaseDraftWorker
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
-from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import device_array
-
-logger = logging.getLogger(__name__)
-RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
 
 
 class EagleDraftWorker(ModelWorker, BaseDraftWorker):
@@ -28,8 +22,6 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
         )
         self.req_to_token_pool, self.token_to_kv_pool_allocator = target_worker.get_memory_pool()
         self.hot_token_ids = None
-        self.num_new_pages_per_topk = None
-        self.extend_lens = None
 
         ModelWorker.__init__(
             self,
