@@ -158,10 +158,12 @@ def test_task6_eagle_worker_does_not_own_draft_extend_after_verify():
 
 
 def test_task7_eagle_worker_is_orchestration_only():
+    assert EAGLEWorker.__bases__ == (BaseSpecWorker,)
+    assert ModelWorker not in EAGLEWorker.__mro__
+
     source = inspect.getsource(EAGLEWorker)
 
     forbidden = (
-        "ModelWorker)",
         "is_draft_worker=True",
         "self.draft_model_runner.forward",
         "build_tree_kernel_efficient(",
