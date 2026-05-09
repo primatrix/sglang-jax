@@ -569,9 +569,10 @@ def _measure_a2a_scatter_ms(
     )
     jax.block_until_ready((tokens, topk_ids, scratch))
 
-    @jax.jit
-    def run_scatter(tokens_hbm, topk_ids_hbm, scratch_hbm):
-        with jax.set_mesh(mesh):
+    with jax.set_mesh(mesh):
+
+        @jax.jit
+        def run_scatter(tokens_hbm, topk_ids_hbm, scratch_hbm):
             return _sharded_scatter_call(
                 tokens_hbm,
                 topk_ids_hbm,
@@ -585,17 +586,17 @@ def _measure_a2a_scatter_ms(
                 P=P,
             )
 
-    jax.block_until_ready(run_scatter(tokens, topk_ids, scratch))
-    task = f"layer1_a2a_scatter_topk8_bt{shape.bt}_{shape.path_class}"
-    return multiple_iteration_timeit_from_trace(
-        compute_func=run_scatter,
-        data_generator=lambda: (tokens, topk_ids, scratch),
-        task=task,
-        tries=sample_runs,
-        warmup=warmup_runs,
-        discard_initial_samples=discard_runs,
-        trace_root=trace_root,
-    )
+        jax.block_until_ready(run_scatter(tokens, topk_ids, scratch))
+        task = f"layer1_a2a_scatter_topk8_bt{shape.bt}_{shape.path_class}"
+        return multiple_iteration_timeit_from_trace(
+            compute_func=run_scatter,
+            data_generator=lambda: (tokens, topk_ids, scratch),
+            task=task,
+            tries=sample_runs,
+            warmup=warmup_runs,
+            discard_initial_samples=discard_runs,
+            trace_root=trace_root,
+        )
 
 
 def _sharded_scatter_call(
@@ -655,9 +656,10 @@ def _measure_a2a_metadata_ms(
     local_counts = _make_local_counts(jax=jax, np=np, sharding=count_sharding, shape=shape)
     jax.block_until_ready(local_counts)
 
-    @jax.jit
-    def run_metadata(local_counts_hbm):
-        with jax.set_mesh(mesh):
+    with jax.set_mesh(mesh):
+
+        @jax.jit
+        def run_metadata(local_counts_hbm):
             return _sharded_metadata_call(
                 local_counts_hbm,
                 shape=shape,
@@ -668,17 +670,17 @@ def _measure_a2a_metadata_ms(
                 P=P,
             )
 
-    jax.block_until_ready(run_metadata(local_counts))
-    task = f"layer1_a2a_metadata_bt{shape.bt}_{shape.path_class}"
-    return multiple_iteration_timeit_from_trace(
-        compute_func=run_metadata,
-        data_generator=lambda: (local_counts,),
-        task=task,
-        tries=sample_runs,
-        warmup=warmup_runs,
-        discard_initial_samples=discard_runs,
-        trace_root=trace_root,
-    )
+        jax.block_until_ready(run_metadata(local_counts))
+        task = f"layer1_a2a_metadata_bt{shape.bt}_{shape.path_class}"
+        return multiple_iteration_timeit_from_trace(
+            compute_func=run_metadata,
+            data_generator=lambda: (local_counts,),
+            task=task,
+            tries=sample_runs,
+            warmup=warmup_runs,
+            discard_initial_samples=discard_runs,
+            trace_root=trace_root,
+        )
 
 
 def _sharded_metadata_call(local_counts_hbm, *, shape: A2AMetadataShape, mesh, jax, pl, pltpu, P):
