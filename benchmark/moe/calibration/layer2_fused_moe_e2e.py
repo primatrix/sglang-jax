@@ -126,7 +126,7 @@ def build_rows(
                 implementation_note="Layer2 fused MoE E2E local_smoke emits schema rows only; TPU trace execution is required for diagnostic results.",
             )
             for shape in shapes
-            for variant in VARIANTS
+            for variant in selected_variants()
         ]
 
     if runtime.get("default_backend") != "tpu":
@@ -139,7 +139,7 @@ def build_rows(
     sample_runs = int(os.getenv("CALIBRATION_LAYER2_FUSED_MOE_SAMPLE_RUNS", "5"))
     warmup_runs = int(os.getenv("CALIBRATION_LAYER2_FUSED_MOE_WARMUP_RUNS", "3"))
     for shape in shapes:
-        for variant in VARIANTS:
+        for variant in selected_variants():
             try:
                 with _variant_env(variant):
                     result_rows = run_all(
@@ -297,6 +297,30 @@ def _make_row(
 
 def default_shapes() -> tuple[FusedMoEE2EShape, ...]:
     return tuple(
-        FusedMoEE2EShape(num_tokens=4096, hotspot_count=hotspot_count)
-        for hotspot_count in (8, 16, 32, 64, 128, 256)
+        FusedMoEE2EShape(num_tokens=num_tokens, hotspot_count=hotspot_count)
+        for num_tokens in _int_tuple_env("CALIBRATION_LAYER2_FUSED_MOE_NUM_TOKENS", (4096,))
+        for hotspot_count in _int_tuple_env(
+            "CALIBRATION_LAYER2_FUSED_MOE_HOTSPOT_COUNTS",
+            (8, 16, 32, 64, 128, 256),
+        )
     )
+
+
+def selected_variants() -> tuple[FusedMoEVariant, ...]:
+    raw = os.getenv("CALIBRATION_LAYER2_FUSED_MOE_VARIANTS")
+    if not raw:
+        return VARIANTS
+    requested = {part.strip() for part in raw.split(",") if part.strip()}
+    variants = tuple(variant for variant in VARIANTS if variant.name in requested)
+    missing = requested - {variant.name for variant in variants}
+    if missing:
+        raise ValueError(f"Unknown Layer2 fused MoE variants: {sorted(missing)}")
+    return variants
+
+
+def _int_tuple_env(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    values = tuple(int(part.strip()) for part in raw.split(",") if part.strip())
+    return values or default
