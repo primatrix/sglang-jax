@@ -1644,6 +1644,38 @@ class WeightLoader:
 
             # Read all expert data from files (parallel across files)
             expert_data_map = {}  # log_idx -> np.ndarray
+            bulk_read_mode = os.environ.get("SGLANG_MOE_BULK_READ_MODE", "auto").lower()
+            if bulk_read_mode not in ("auto", "coalesce", "sparse"):
+                logger.warning(
+                    "Invalid SGLANG_MOE_BULK_READ_MODE=%r, falling back to auto",
+                    bulk_read_mode,
+                )
+                bulk_read_mode = "auto"
+            try:
+                bulk_coalesce_ratio = float(os.environ.get("SGLANG_MOE_BULK_COALESCE_RATIO", "2.0"))
+            except ValueError:
+                logger.warning(
+                    "Invalid SGLANG_MOE_BULK_COALESCE_RATIO=%r, falling back to 2.0",
+                    os.environ.get("SGLANG_MOE_BULK_COALESCE_RATIO"),
+                )
+                bulk_coalesce_ratio = 2.0
+            if bulk_coalesce_ratio <= 0:
+                bulk_coalesce_ratio = 2.0
+
+            try:
+                requested_file_workers = int(os.environ.get("SGLANG_MOE_BULK_FILE_WORKERS", "0"))
+            except ValueError:
+                logger.warning(
+                    "Invalid SGLANG_MOE_BULK_FILE_WORKERS=%r, falling back to default",
+                    os.environ.get("SGLANG_MOE_BULK_FILE_WORKERS"),
+                )
+                requested_file_workers = 0
+            file_workers = len(file_groups)
+            if requested_file_workers > 0:
+                file_workers = min(len(file_groups), requested_file_workers)
+            file_workers = max(1, file_workers)
+            log_bulk_info = os.environ.get("SGLANG_MOE_BULK_LOG_INFO", "0") == "1"
+            bulk_file_stats = []
 
             def _bulk_read_file(fname, entries):
                 entries.sort(key=lambda e: e[1])
@@ -1652,10 +1684,21 @@ class WeightLoader:
                 rng = max_end - min_off
                 actual = len(entries) * expert_nbytes
                 result = {}
-                if rng <= actual * 2 and len(entries) > 1:
+                if bulk_read_mode == "coalesce":
+                    use_coalesced_read = len(entries) > 1
+                elif bulk_read_mode == "sparse":
+                    use_coalesced_read = False
+                else:
+                    use_coalesced_read = rng <= actual * bulk_coalesce_ratio and len(entries) > 1
+
+                bytes_read = 0
+                read_ops = 0
+                if use_coalesced_read:
                     with open(fname, "rb") as f:
                         f.seek(min_off)
                         bulk = f.read(rng)
+                    bytes_read = len(bulk)
+                    read_ops = 1
                     for log_idx, byte_off, hf_key in entries:
                         local_off = byte_off - min_off
                         arr = np.frombuffer(
@@ -1670,16 +1713,28 @@ class WeightLoader:
                         for log_idx, byte_off, hf_key in entries:
                             f.seek(byte_off)
                             raw = f.read(expert_nbytes)
+                            bytes_read += len(raw)
+                            read_ops += 1
                             arr = np.frombuffer(
                                 raw,
                                 dtype=np_read_dtype,
                             ).reshape(single_expert_shape)
                             result[log_idx] = arr
+                bulk_file_stats.append(
+                    (
+                        rng,
+                        actual,
+                        bytes_read,
+                        read_ops,
+                        len(entries),
+                        use_coalesced_read,
+                    )
+                )
                 return result
 
             t_io_start = time.monotonic()
             if len(file_groups) > 1:
-                with ThreadPoolExecutor(max_workers=len(file_groups)) as ex:
+                with ThreadPoolExecutor(max_workers=file_workers) as ex:
                     futs = {
                         ex.submit(_bulk_read_file, fn, ents): fn for fn, ents in file_groups.items()
                     }
@@ -1689,7 +1744,12 @@ class WeightLoader:
                 for fn, ents in file_groups.items():
                     expert_data_map.update(_bulk_read_file(fn, ents))
             t_io = time.monotonic() - t_io_start
-            total_read_mb = sum(v.nbytes for v in expert_data_map.values()) / 1e6
+            total_span_mb = sum(s[0] for s in bulk_file_stats) / 1e6
+            total_actual_mb = sum(s[1] for s in bulk_file_stats) / 1e6
+            total_io_read_mb = sum(s[2] for s in bulk_file_stats) / 1e6
+            total_read_ops = sum(s[3] for s in bulk_file_stats)
+            total_entries = sum(s[4] for s in bulk_file_stats)
+            coalesced_files = sum(1 for s in bulk_file_stats if s[5])
 
             # Assemble per-device arrays and device_put (parallel)
             t_assemble_start = time.monotonic()
@@ -1723,20 +1783,30 @@ class WeightLoader:
             )
             t_callback = time.monotonic() - t0
 
-            logger.debug(
+            log_bulk = logger.info if log_bulk_info else logger.debug
+            log_bulk(
                 "MoE host-bulk load: shape=%s dtype=%s "
-                "io=%.2fs (%.1f MB, %.1f MB/s) "
+                "io=%.2fs (actual=%.1f MB read=%.1f MB span=%.1f MB %.1f MB/s) "
                 "assemble+put=%.2fs total=%.2fs "
-                "experts_read=%d files=%d devices=%d",
+                "experts_read=%d files=%d coalesced_files=%d read_ops=%d entries=%d "
+                "file_workers=%d mode=%s ratio=%.2f devices=%d",
                 stacked_shape,
                 target_dtype,
                 t_io,
-                total_read_mb,
-                total_read_mb / t_io if t_io > 0 else 0,
+                total_actual_mb,
+                total_io_read_mb,
+                total_span_mb,
+                total_io_read_mb / t_io if t_io > 0 else 0,
                 t_assemble,
                 t_callback,
                 len(expert_data_map),
                 len(file_groups),
+                coalesced_files,
+                total_read_ops,
+                total_entries,
+                file_workers,
+                bulk_read_mode,
+                bulk_coalesce_ratio,
                 n_local,
             )
         else:
