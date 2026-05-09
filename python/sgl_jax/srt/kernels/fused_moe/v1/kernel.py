@@ -3279,7 +3279,7 @@ def jax_allreduce_metadata_by_bt(
             recv_counts,
             ((0, 0), (0, 0), (0, 0), (0, padded_local_num_experts - local_num_experts)),
         )
-    send_counts = local_sizes[:, None, :]
+    send_counts = local_sizes
     return starts, sizes, recv_counts, send_counts
 
 
