@@ -56,6 +56,7 @@ SUITE_V7X32_BF16_GEMM_CURVE_V2 = "v7x32_bf16_gemm_curve_v2"
 SUITE_V7X8_BF16_GEMM_SATURATION_CURVE_V3 = "v7x8_bf16_gemm_saturation_curve_v3"
 SUITE_V7X32_BF16_A2A_CURVE_V1 = "v7x32_bf16_a2a_curve_v1"
 SUITE_V7X32_BF16_A2A_TOPK8_V1 = "v7x32_bf16_a2a_topk8_v1"
+SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT_V1 = "v7x32_bf16_a2a_topk8_preflight_v1"
 SUITE_V7X32_BF16_LOCAL_DMA_TOPK8_V1 = "v7x32_bf16_local_dma_topk8_v1"
 SUITES = (
     SUITE_V7X32_BF16_WEIGHT_TILES,
@@ -68,6 +69,7 @@ SUITES = (
     SUITE_V7X8_BF16_GEMM_SATURATION_CURVE_V3,
     SUITE_V7X32_BF16_A2A_CURVE_V1,
     SUITE_V7X32_BF16_A2A_TOPK8_V1,
+    SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT_V1,
     SUITE_V7X32_BF16_LOCAL_DMA_TOPK8_V1,
 )
 
@@ -351,10 +353,16 @@ PHASE1_A2A_CURVE_V1_SHAPES: tuple[CollectiveShape, ...] = tuple(
 )
 
 PHASE1_A2A_TOPK8_BT_VALUES = (1, 2, 4, 8, 16, 32)
+PHASE1_A2A_TOPK8_PREFLIGHT_BT_VALUES = (1,)
 
 PHASE1_A2A_SCATTER_TOPK8_SHAPES: tuple[layer1_a2a_scatter.A2AScatterShape, ...] = tuple(
     layer1_a2a_scatter.A2AScatterShape(path_class="scatter_topk8_ring", bt=bt)
     for bt in PHASE1_A2A_TOPK8_BT_VALUES
+)
+
+PHASE1_A2A_SCATTER_TOPK8_PREFLIGHT_SHAPES: tuple[layer1_a2a_scatter.A2AScatterShape, ...] = tuple(
+    layer1_a2a_scatter.A2AScatterShape(path_class="scatter_topk8_preflight", bt=bt)
+    for bt in PHASE1_A2A_TOPK8_PREFLIGHT_BT_VALUES
 )
 
 PHASE1_A2A_METADATA_TOPK8_SHAPES: tuple[layer1_a2a_scatter.A2AMetadataShape, ...] = tuple(
@@ -362,9 +370,19 @@ PHASE1_A2A_METADATA_TOPK8_SHAPES: tuple[layer1_a2a_scatter.A2AMetadataShape, ...
     for bt in PHASE1_A2A_TOPK8_BT_VALUES
 )
 
+PHASE1_A2A_METADATA_TOPK8_PREFLIGHT_SHAPES: tuple[layer1_a2a_scatter.A2AMetadataShape, ...] = tuple(
+    layer1_a2a_scatter.A2AMetadataShape(path_class="metadata_topk8_preflight", bt=bt)
+    for bt in PHASE1_A2A_TOPK8_PREFLIGHT_BT_VALUES
+)
+
 PHASE1_A2A_GATHER_TOPK8_SHAPES: tuple[layer1_a2a_gather.A2AGatherShape, ...] = tuple(
     layer1_a2a_gather.A2AGatherShape(path_class="gather_topk8_ring", bt=bt)
     for bt in PHASE1_A2A_TOPK8_BT_VALUES
+)
+
+PHASE1_A2A_GATHER_TOPK8_PREFLIGHT_SHAPES: tuple[layer1_a2a_gather.A2AGatherShape, ...] = tuple(
+    layer1_a2a_gather.A2AGatherShape(path_class="gather_topk8_preflight", bt=bt)
+    for bt in PHASE1_A2A_TOPK8_PREFLIGHT_BT_VALUES
 )
 
 PHASE1_LOCAL_DMA_TOPK8_PATH_CLASSES: dict[layer1_local_dma.LocalDMAPath, str] = {
@@ -421,6 +439,8 @@ def load_layer1_a2a_scatter_suite_shapes(
 ) -> tuple[layer1_a2a_scatter.A2AScatterShape, ...]:
     if suite == SUITE_V7X32_BF16_A2A_TOPK8_V1:
         return PHASE1_A2A_SCATTER_TOPK8_SHAPES
+    if suite == SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT_V1:
+        return PHASE1_A2A_SCATTER_TOPK8_PREFLIGHT_SHAPES
     raise ValueError(f"Unsupported Layer 1 A2A scatter suite: {suite}")
 
 
@@ -429,6 +449,8 @@ def load_layer1_a2a_metadata_suite_shapes(
 ) -> tuple[layer1_a2a_scatter.A2AMetadataShape, ...]:
     if suite == SUITE_V7X32_BF16_A2A_TOPK8_V1:
         return PHASE1_A2A_METADATA_TOPK8_SHAPES
+    if suite == SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT_V1:
+        return PHASE1_A2A_METADATA_TOPK8_PREFLIGHT_SHAPES
     raise ValueError(f"Unsupported Layer 1 A2A metadata suite: {suite}")
 
 
@@ -437,6 +459,8 @@ def load_layer1_a2a_gather_suite_shapes(
 ) -> tuple[layer1_a2a_gather.A2AGatherShape, ...]:
     if suite == SUITE_V7X32_BF16_A2A_TOPK8_V1:
         return PHASE1_A2A_GATHER_TOPK8_SHAPES
+    if suite == SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT_V1:
+        return PHASE1_A2A_GATHER_TOPK8_PREFLIGHT_SHAPES
     raise ValueError(f"Unsupported Layer 1 A2A gather suite: {suite}")
 
 
