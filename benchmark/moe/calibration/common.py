@@ -26,6 +26,7 @@ OBSERVATION_REQUIRED_FIELDS = (
     "bytes_hbm",
     "bytes_per_fetch",
     "dma_count",
+    "equivalent_shape_key",
     "latency_ms_samples",
     "latency_ms_p50",
     "latency_ms_p90",
@@ -221,6 +222,30 @@ def percentile(samples: list[float], percent: float) -> float | None:
     return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
 
 
+def equivalent_shape_key(
+    *,
+    path_class: str,
+    dtype: str,
+    t_packing: int,
+    bf: int,
+    bd: int,
+    tile_shape: tuple[int, ...] | list[int],
+    dma_count: int,
+) -> str:
+    tile_shape_key = "[" + ",".join(str(int(dim)) for dim in tile_shape) + "]"
+    return "|".join(
+        [
+            path_class,
+            dtype,
+            str(t_packing),
+            str(bf),
+            str(bd),
+            tile_shape_key,
+            str(dma_count),
+        ]
+    )
+
+
 def build_observation_row(
     *,
     scenario: str,
@@ -263,6 +288,15 @@ def build_observation_row(
         "bytes_hbm": bytes_hbm,
         "bytes_per_fetch": bytes_per_fetch,
         "dma_count": dma_count,
+        "equivalent_shape_key": equivalent_shape_key(
+            path_class=path_class,
+            dtype=dtype,
+            t_packing=t_packing,
+            bf=bf,
+            bd=bd,
+            tile_shape=tile_shape,
+            dma_count=dma_count,
+        ),
         "latency_ms_samples": samples,
         "latency_ms_p50": percentile(samples, 0.50),
         "latency_ms_p90": percentile(samples, 0.90),

@@ -16,7 +16,9 @@ from benchmark.moe.calibration import (
     layer0_a2a_envelope,
     layer0_gemm_envelope,
     layer0_hbm_envelope,
+    layer1_a2a_gather,
     layer1_a2a_scatter,
+    layer1_local_dma,
     layer1_weight_tile_dma,
 )
 from benchmark.moe.calibration.common import (
@@ -30,14 +32,18 @@ SCENARIO_LAYER0_GEMM_ENVELOPE = "layer0_gemm_envelope"
 SCENARIO_LAYER0_A2A_ENVELOPE = "layer0_a2a_envelope"
 SCENARIO_LAYER1_A2A_METADATA = "layer1_a2a_metadata"
 SCENARIO_LAYER1_A2A_SCATTER = "layer1_a2a_scatter"
+SCENARIO_LAYER1_A2A_GATHER = "layer1_a2a_gather"
 SCENARIO_LAYER1_WEIGHT_TILE_DMA = "layer1_weight_tile_dma"
+SCENARIO_LAYER1_LOCAL_DMA = "layer1_local_dma"
 SCENARIOS = (
     SCENARIO_LAYER0_HBM_ENVELOPE,
     SCENARIO_LAYER0_GEMM_ENVELOPE,
     SCENARIO_LAYER0_A2A_ENVELOPE,
     SCENARIO_LAYER1_A2A_METADATA,
     SCENARIO_LAYER1_A2A_SCATTER,
+    SCENARIO_LAYER1_A2A_GATHER,
     SCENARIO_LAYER1_WEIGHT_TILE_DMA,
+    SCENARIO_LAYER1_LOCAL_DMA,
 )
 
 SUITE_V7X32_BF16_WEIGHT_TILES = "v7x32_bf16_weight_tiles"
@@ -50,6 +56,7 @@ SUITE_V7X32_BF16_GEMM_CURVE_V2 = "v7x32_bf16_gemm_curve_v2"
 SUITE_V7X8_BF16_GEMM_SATURATION_CURVE_V3 = "v7x8_bf16_gemm_saturation_curve_v3"
 SUITE_V7X32_BF16_A2A_CURVE_V1 = "v7x32_bf16_a2a_curve_v1"
 SUITE_V7X32_BF16_A2A_TOPK8_V1 = "v7x32_bf16_a2a_topk8_v1"
+SUITE_V7X32_BF16_LOCAL_DMA_TOPK8_V1 = "v7x32_bf16_local_dma_topk8_v1"
 SUITES = (
     SUITE_V7X32_BF16_WEIGHT_TILES,
     SUITE_V7X32_BF16_HBM_COPY_ENVELOPE,
@@ -61,6 +68,7 @@ SUITES = (
     SUITE_V7X8_BF16_GEMM_SATURATION_CURVE_V3,
     SUITE_V7X32_BF16_A2A_CURVE_V1,
     SUITE_V7X32_BF16_A2A_TOPK8_V1,
+    SUITE_V7X32_BF16_LOCAL_DMA_TOPK8_V1,
 )
 
 DTYPE = "bfloat16"
@@ -354,6 +362,25 @@ PHASE1_A2A_METADATA_TOPK8_SHAPES: tuple[layer1_a2a_scatter.A2AMetadataShape, ...
     for bt in PHASE1_A2A_TOPK8_BT_VALUES
 )
 
+PHASE1_A2A_GATHER_TOPK8_SHAPES: tuple[layer1_a2a_gather.A2AGatherShape, ...] = tuple(
+    layer1_a2a_gather.A2AGatherShape(path_class="gather_topk8_ring", bt=bt)
+    for bt in PHASE1_A2A_TOPK8_BT_VALUES
+)
+
+PHASE1_LOCAL_DMA_TOPK8_PATH_CLASSES: dict[layer1_local_dma.LocalDMAPath, str] = {
+    "topk_fetch": "local_topk_fetch",
+    "a2a_s_tile_read": "local_a2a_s_tile_read",
+    "accumulator_store_or_rmw": "local_accumulator_rmw",
+    "output_gather_load": "local_output_gather_load",
+    "output_store": "local_output_store",
+}
+
+PHASE1_LOCAL_DMA_TOPK8_SHAPES: tuple[layer1_local_dma.LocalDMAShape, ...] = tuple(
+    layer1_local_dma.LocalDMAShape(path=path, path_class=path_class, bt=bt)
+    for bt in PHASE1_A2A_TOPK8_BT_VALUES
+    for path, path_class in PHASE1_LOCAL_DMA_TOPK8_PATH_CLASSES.items()
+)
+
 
 def load_suite_shapes(suite: str) -> tuple[WeightTileShape, ...]:
     if suite != SUITE_V7X32_BF16_WEIGHT_TILES:
@@ -405,15 +432,29 @@ def load_layer1_a2a_metadata_suite_shapes(
     raise ValueError(f"Unsupported Layer 1 A2A metadata suite: {suite}")
 
 
+def load_layer1_a2a_gather_suite_shapes(
+    suite: str,
+) -> tuple[layer1_a2a_gather.A2AGatherShape, ...]:
+    if suite == SUITE_V7X32_BF16_A2A_TOPK8_V1:
+        return PHASE1_A2A_GATHER_TOPK8_SHAPES
+    raise ValueError(f"Unsupported Layer 1 A2A gather suite: {suite}")
+
+
+def load_layer1_local_dma_suite_shapes(
+    suite: str,
+) -> tuple[layer1_local_dma.LocalDMAShape, ...]:
+    if suite == SUITE_V7X32_BF16_LOCAL_DMA_TOPK8_V1:
+        return PHASE1_LOCAL_DMA_TOPK8_SHAPES
+    raise ValueError(f"Unsupported Layer 1 local DMA suite: {suite}")
+
+
 def _source() -> dict[str, Any]:
     return {
         "coordination_repo": "jimoosciuc/fused-moe-calibration-lab",
         "coordination_docs": [
-            "docs/phase-1-execution-plan.md",
-            "docs/phase-1-input-matrix.md",
+            "docs/implementation-plan.md",
         ],
-        "implementation_issue": "jimoosciuc/fused-moe-calibration-lab#2",
-        "suite_source": "docs/phase-1-input-matrix.md",
+        "suite_source": "docs/implementation-plan.md",
     }
 
 
@@ -679,6 +720,38 @@ def _layer1_a2a_scatter_rows(
     )
 
 
+def _layer1_a2a_gather_rows(
+    suite: str, execution_mode: str, runtime: dict[str, Any]
+) -> list[dict[str, Any]]:
+    return layer1_a2a_gather.build_rows(
+        suite=suite,
+        shapes=load_layer1_a2a_gather_suite_shapes(suite),
+        execution_mode=execution_mode,
+        runtime=runtime,
+        dtype=DTYPE,
+        weight_dtype=WEIGHT_DTYPE,
+        t_packing=T_PACKING,
+        source=_source(),
+        metadata=_suite_metadata(matrix_kind="a2a_gather_topk8"),
+    )
+
+
+def _layer1_local_dma_rows(
+    suite: str, execution_mode: str, runtime: dict[str, Any]
+) -> list[dict[str, Any]]:
+    return layer1_local_dma.build_rows(
+        suite=suite,
+        shapes=load_layer1_local_dma_suite_shapes(suite),
+        execution_mode=execution_mode,
+        runtime=runtime,
+        dtype=DTYPE,
+        weight_dtype=WEIGHT_DTYPE,
+        t_packing=T_PACKING,
+        source=_source(),
+        metadata=_suite_metadata(matrix_kind="local_dma_topk8"),
+    )
+
+
 def _jax_backend(runtime: dict[str, Any]) -> str | None:
     backend = runtime.get("default_backend")
     return str(backend) if backend is not None else None
@@ -711,8 +784,12 @@ def build_rows(scenario: str, suite: str, execution_mode: str) -> list[dict[str,
         return _layer1_a2a_metadata_rows(suite, resolved_mode, runtime)
     if scenario == SCENARIO_LAYER1_A2A_SCATTER:
         return _layer1_a2a_scatter_rows(suite, resolved_mode, runtime)
+    if scenario == SCENARIO_LAYER1_A2A_GATHER:
+        return _layer1_a2a_gather_rows(suite, resolved_mode, runtime)
     if scenario == SCENARIO_LAYER1_WEIGHT_TILE_DMA:
         return _layer1_weight_tile_dma_rows(suite, resolved_mode, runtime)
+    if scenario == SCENARIO_LAYER1_LOCAL_DMA:
+        return _layer1_local_dma_rows(suite, resolved_mode, runtime)
     raise ValueError(f"Unsupported scenario: {scenario}")
 
 
