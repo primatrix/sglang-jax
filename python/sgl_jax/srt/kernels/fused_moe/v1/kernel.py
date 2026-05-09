@@ -3364,8 +3364,6 @@ def fused_ep_moe(
         tp_axis_name=tp_axis_name,
     )
 
-    needs_jax_allreduce = use_jax_allreduce_metadata and ep_size > 1 and not disable_a2a
-
     num_devices = ep_size
 
     num_tokens, hidden_size = tokens.shape
@@ -3377,6 +3375,12 @@ def fused_ep_moe(
     bt = block_config.bt
     if bt <= 0:
         raise ValueError(f"Expected {bt=} to be > 0.")
+    # The JAX collective metadata path is stable for extend/prefill tiles.  Small
+    # decode tiles repeatedly mix XLA collectives with Pallas remote DMA in the
+    # same executable and can hang, so keep decode on the original Pallas path.
+    needs_jax_allreduce = (
+        use_jax_allreduce_metadata and ep_size > 1 and not disable_a2a and local_num_tokens >= 32
+    )
     padded_num_experts = align_to(num_experts, 128)
     padded_top_k = align_to(top_k, 128)
     t_dtype = tokens.dtype
@@ -3605,7 +3609,7 @@ def fused_ep_moe(
                 scratch_shapes=scratch_shapes,
             ),
             compiler_params=pltpu.CompilerParams(
-                collective_id=1024,
+                collective_id=0,
                 allow_collective_id_without_custom_barrier=True,
                 has_side_effects=True,
                 vmem_limit_bytes=96 * 1024 * 1024,
