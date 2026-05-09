@@ -57,6 +57,7 @@ SUITE_V7X32_BF16_GEMM_ENVELOPE = "v7x32_bf16_gemm_envelope"
 SUITE_V7X32_BF16_GEMM_CURVE_V2 = "v7x32_bf16_gemm_curve_v2"
 SUITE_V7X8_BF16_GEMM_SATURATION_CURVE_V3 = "v7x8_bf16_gemm_saturation_curve_v3"
 SUITE_V7X32_BF16_A2A_CURVE_V1 = "v7x32_bf16_a2a_curve_v1"
+SUITE_V7X32_BF16_A2A_CURVE_V2 = "v7x32_bf16_a2a_curve_v2"
 SUITE_V7X32_BF16_A2A_TOPK8_V1 = "v7x32_bf16_a2a_topk8_v1"
 SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT_V1 = "v7x32_bf16_a2a_topk8_preflight_v1"
 SUITE_V7X32_BF16_LOCAL_DMA_TOPK8_V1 = "v7x32_bf16_local_dma_topk8_v1"
@@ -71,6 +72,7 @@ SUITES = (
     SUITE_V7X32_BF16_GEMM_CURVE_V2,
     SUITE_V7X8_BF16_GEMM_SATURATION_CURVE_V3,
     SUITE_V7X32_BF16_A2A_CURVE_V1,
+    SUITE_V7X32_BF16_A2A_CURVE_V2,
     SUITE_V7X32_BF16_A2A_TOPK8_V1,
     SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT_V1,
     SUITE_V7X32_BF16_LOCAL_DMA_TOPK8_V1,
@@ -340,6 +342,21 @@ PHASE1_A2A_CURVE_V1_MATRIX_DIMS = (
     16384,
 )
 
+PHASE1_A2A_CURVE_V2_MATRIX_DIMS = (
+    16,
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16384,
+    32768,
+)
+
 PHASE1_A2A_CURVE_V1_SHAPES: tuple[CollectiveShape, ...] = tuple(
     CollectiveShape(
         path_class=path_class,
@@ -354,6 +371,22 @@ PHASE1_A2A_CURVE_V1_SHAPES: tuple[CollectiveShape, ...] = tuple(
         ("a2a_4x4x2", "4x4x2"),
     )
     for matrix_dim in PHASE1_A2A_CURVE_V1_MATRIX_DIMS
+)
+
+PHASE1_A2A_CURVE_V2_SHAPES: tuple[CollectiveShape, ...] = tuple(
+    CollectiveShape(
+        path_class=path_class,
+        matrix_dim=matrix_dim,
+        mesh_shape="4x4x2",
+        sharding_strategy=sharding_strategy,
+        slice_topology="2x2x4",
+        ici_size=32,
+    )
+    for path_class, sharding_strategy in (
+        ("a2a_4x4x1", "4x4x1"),
+        ("a2a_4x4x2", "4x4x2"),
+    )
+    for matrix_dim in PHASE1_A2A_CURVE_V2_MATRIX_DIMS
 )
 
 PHASE1_A2A_TOPK8_BT_VALUES = (1, 2, 4, 8, 16, 32)
@@ -439,6 +472,8 @@ def load_layer0_gemm_suite_shapes(suite: str) -> tuple[GemmShape, ...]:
 def load_layer0_a2a_suite_shapes(suite: str) -> tuple[CollectiveShape, ...]:
     if suite == SUITE_V7X32_BF16_A2A_CURVE_V1:
         return PHASE1_A2A_CURVE_V1_SHAPES
+    if suite == SUITE_V7X32_BF16_A2A_CURVE_V2:
+        return PHASE1_A2A_CURVE_V2_SHAPES
     raise ValueError(f"Unsupported Layer 0 A2A suite: {suite}")
 
 
