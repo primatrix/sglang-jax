@@ -712,6 +712,7 @@ def _fused_ep_moe_kernel(
         recv_sem = recv_x2_sems.at[0]
 
         if use_jax_allreduce_metadata and metadata_starts_hbm is not None:
+            sync_barrier()
 
             def _copy_precomputed(
                 t2e_routing_vmem,
@@ -783,6 +784,7 @@ def _fused_ep_moe_kernel(
                 pltpu.VMEM(expert_starts_x2_smem.shape[1:], expert_starts_x2_smem.dtype),
                 pltpu.VMEM(expert_sizes_x2_smem.shape[1:], expert_sizes_x2_smem.dtype),
             )
+            sync_barrier()
             return
 
         # Local-only metadata path for profiling. Not correct for multi-device routing;
