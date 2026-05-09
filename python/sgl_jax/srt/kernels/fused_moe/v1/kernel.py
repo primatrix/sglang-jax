@@ -3370,18 +3370,9 @@ def fused_ep_moe(
         tp_axis_name=tp_axis_name,
     )
 
-    # 预计算元数据使用 JAX allreduce（如果启用）
-    if use_jax_allreduce_metadata and ep_size > 1 and not disable_a2a:
-        num_experts_total = w2.shape[0]
-        global_starts, global_sizes = jax_allreduce_metadata(
-            topk_ids, num_experts_total, mesh, dp_axis_name, tp_axis_name
-        )
-        # 输出已经是 P()（全局复制），保持原样，无需额外 reshard
-        global_starts_hbm = global_starts
-        global_sizes_hbm = global_sizes
-    else:
-        global_starts_hbm = None
-        global_sizes_hbm = None
+    # 是否使用 JAX allreduce 路径预计算元数据
+    needs_jax_allreduce = use_jax_allreduce_metadata and ep_size > 1 and not disable_a2a
+    num_experts_total = w2.shape[0]
 
     num_devices = ep_size
 
@@ -3614,8 +3605,8 @@ def fused_ep_moe(
                     None if w1_shared_scale is None else hbm_block_spec,  # w1_shared_scale_hbm
                     None if w3_shared_scale is None else hbm_block_spec,  # w3_shared_scale_hbm
                     None if w2_shared_scale is None else hbm_block_spec,  # w2_shared_scale_hbm
-                    None if global_starts_hbm is None else hbm_block_spec,  # global_starts_hbm
-                    None if global_sizes_hbm is None else hbm_block_spec,  # global_sizes_hbm
+                    None if not needs_jax_allreduce else hbm_block_spec,  # global_starts_hbm
+                    None if not needs_jax_allreduce else hbm_block_spec,  # global_sizes_hbm
                 ],
                 out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                 scratch_shapes=scratch_shapes,
@@ -3703,8 +3694,6 @@ def fused_ep_moe(
             None if w1_shared_scale is None else P(),  # w1_shared_scale
             None if w3_shared_scale is None else P(),  # w3_shared_scale
             None if w2_shared_scale is None else P(),  # w2_shared_scale
-            None if global_starts_hbm is None else P(),  # global_starts (replicated)
-            None if global_sizes_hbm is None else P(),  # global_sizes (replicated)
         ),
         out_specs=P((dp_axis_name, tp_axis_name)),
         check_vma=False,
@@ -3731,9 +3720,38 @@ def fused_ep_moe(
         w1_shared_scale=None,
         w3_shared_scale=None,
         w2_shared_scale=None,
-        global_starts=None,
-        global_sizes=None,
     ):
+        # 在 shard_map 内部（device-local 视角）计算 JAX allreduce 元数据
+        # 这样集合通信和 pallas_call 在同一个 shard_map 域内，避免跨域死锁
+        if needs_jax_allreduce:
+            local_sizes = compute_local_expert_sizes(topk_ids, num_experts_total)
+            # allgather 跨两个轴
+            all_sizes = lax.all_gather(
+                local_sizes,
+                axis_name=(dp_axis_name, tp_axis_name),
+                axis=0,
+                tiled=True,
+            )  # (num_devices, num_experts)
+            global_sizes = jnp.sum(all_sizes, axis=0, keepdims=True).astype(jnp.int32)
+            # 前缀和：本设备起始偏移
+            dp_rank = lax.axis_index(dp_axis_name)
+            tp_rank = lax.axis_index(tp_axis_name)
+            tp_size_local = lax.axis_size(tp_axis_name)
+            my_id = dp_rank * tp_size_local + tp_rank
+            global_starts = jnp.zeros((1, num_experts_total), dtype=jnp.int32)
+            for dev_id in range(num_devices):
+                dev_sizes = all_sizes[dev_id : dev_id + 1]
+                global_starts += lax.select(
+                    dev_id < my_id,
+                    dev_sizes,
+                    jnp.zeros_like(dev_sizes),
+                )
+            global_starts_arg = pltpu.with_memory_space_constraint(global_starts, pltpu.HBM)
+            global_sizes_arg = pltpu.with_memory_space_constraint(global_sizes, pltpu.HBM)
+        else:
+            global_starts_arg = None
+            global_sizes_arg = None
+
         local_output = fused_moe(
             pltpu.with_memory_space_constraint(tokens, pltpu.HBM),  # tokens_hbm
             pltpu.with_memory_space_constraint(w1, pltpu.HBM),  # w1_hbm
@@ -3794,16 +3812,8 @@ def fused_ep_moe(
                 if w2_shared_scale is None
                 else pltpu.with_memory_space_constraint(w2_shared_scale, pltpu.HBM)
             ),
-            (
-                None
-                if global_starts is None
-                else pltpu.with_memory_space_constraint(global_starts, pltpu.HBM)
-            ),
-            (
-                None
-                if global_sizes is None
-                else pltpu.with_memory_space_constraint(global_sizes, pltpu.HBM)
-            ),
+            global_starts_arg,
+            global_sizes_arg,
         )
         return local_output
 
@@ -3839,6 +3849,4 @@ def fused_ep_moe(
         w1_shared_scale,
         w3_shared_scale,
         w2_shared_scale,
-        global_starts_hbm,
-        global_sizes_hbm,
     )
