@@ -197,7 +197,7 @@ def _make_row(
         tile_shape=(shape.bt, shape.top_k, t_packing, shape.hidden_size // t_packing),
         bytes_hbm=_payload_bytes_per_device(shape),
         bytes_per_fetch=_payload_bytes_per_device(shape),
-        dma_count=shape.bt * shape.top_k,
+        dma_count=_remote_copy_count_per_device(shape),
         status=status,
         execution_mode=execution_mode,
         latency_ms_samples=latency_ms_samples,
@@ -226,11 +226,14 @@ def _metadata_for_shape(metadata: dict[str, Any], shape: A2AGatherShape) -> dict
         "ep_size": shape.ep_size,
         "local_num_experts": shape.local_num_experts,
         "num_experts": shape.ep_size * shape.local_num_experts,
-        "routing_pattern": "source_rank sends k to recv_rank=(source_rank+k+1)%ep_size; gather returns from recv_rank to source_rank",
+        "routing_pattern": "target rank sends local expert k back to source_rank=(target_rank-k-1)%ep_size; source rank waits for recv_rank=(source_rank+k+1)%ep_size",
         "local_copy_count_per_device": 0,
-        "remote_copies_per_device": shape.bt * shape.top_k,
+        "remote_copies_per_device": _remote_copy_count_per_device(shape),
+        "remote_tokens_per_device": shape.bt * shape.top_k,
+        "tokens_per_remote_copy": shape.bt,
         "remote_payload_bytes_per_copy": shape.hidden_size * BF16_BYTES,
         "remote_payload_bytes_per_device": _payload_bytes_per_device(shape),
+        "copy_granularity": "bulk_per_local_expert",
         "source_layout": "a2a_s_acc[local_expert, token, t_packing, hidden/t_packing]",
         "destination_layout": "a2a_g[global_expert, token, t_packing, hidden/t_packing] on source rank",
         "traffic_class": "remote_dma_gather_payload_only",
@@ -520,6 +523,13 @@ def _make_expert_outputs(*, jax: Any, np: Any, sharding: Any, shape: A2AGatherSh
 
 def _payload_bytes_per_device(shape: A2AGatherShape) -> int:
     return shape.bt * shape.top_k * shape.hidden_size * BF16_BYTES
+
+
+def _remote_copy_count_per_device(shape: A2AGatherShape) -> int:
+    # The fused-MoE gather path issues one bulk remote copy for each local
+    # expert/source-rank pair with nonzero tokens. This benchmark's ring pattern
+    # gives one source rank per top-k local expert.
+    return shape.top_k
 
 
 def _positive_int_env(name: str, default: int) -> int:
