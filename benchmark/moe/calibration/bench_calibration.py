@@ -386,6 +386,7 @@ PHASE1_A2A_CURVE_V2_SHAPES: tuple[CollectiveShape, ...] = tuple(
         ("a2a_4x4x2", "4x4x2"),
     )
     for matrix_dim in PHASE1_A2A_CURVE_V2_MATRIX_DIMS
+    if not (path_class == "a2a_4x4x2" and matrix_dim < 32)
 )
 
 PHASE1_A2A_TOPK8_BT_VALUES = (1, 2, 4, 8, 16, 32)
