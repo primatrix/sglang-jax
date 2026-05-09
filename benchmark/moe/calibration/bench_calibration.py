@@ -761,7 +761,11 @@ def resolve_execution_mode(scenario: str, requested: str, runtime: dict[str, Any
     if requested != "auto":
         return requested
     if _jax_backend(runtime) != "tpu":
-        return "local_smoke"
+        raise RuntimeError(
+            "Calibration runs require a TPU backend. Use --execution-mode local_smoke "
+            "only for explicit local schema validation; local_smoke rows are not "
+            "calibration results."
+        )
     if scenario in (
         SCENARIO_LAYER0_HBM_ENVELOPE,
         SCENARIO_LAYER0_GEMM_ENVELOPE,
@@ -819,7 +823,8 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help=(
             "Execution backend. auto selects jax_trace for Layer 0 on TPU, "
-            "pallas for Layer 1 on TPU, and local_smoke otherwise."
+            "pallas for Layer 1 on TPU, and fails outside TPU. Use local_smoke "
+            "only for explicit schema validation."
         ),
     )
     parser.add_argument(
