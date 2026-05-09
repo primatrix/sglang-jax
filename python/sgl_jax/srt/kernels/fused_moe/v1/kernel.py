@@ -510,6 +510,8 @@ def _fused_ep_moe_kernel(
     w1_shared_scale_hbm,  # None | (1, 1, se_inter)
     w3_shared_scale_hbm,  # None | (1, 1, se_inter)
     w2_shared_scale_hbm,  # None | (1, 1, hidden_size)
+    global_starts_hbm,  # None | (1, num_experts) int32 — JAX 预计算的全局前缀和
+    global_sizes_hbm,  # None | (1, num_experts) int32 — JAX 预计算的全局大小
     # Output
     output_hbm,  # (local_num_tokens, hidden_size)
     # Scratch
@@ -571,8 +573,6 @@ def _fused_ep_moe_kernel(
     disable_all_reduce_metadata: bool = False,
     disable_sync_barrier: bool = False,
     use_jax_allreduce_metadata: bool = True,
-    global_starts_hbm=None,
-    global_sizes_hbm=None,
     quant_block_k: int | None = None,
     # Kernel tuning params.
     bt: int,  # Outer token tile size (output tiling).
@@ -721,8 +721,18 @@ def _fused_ep_moe_kernel(
             ):
                 offsets_vmem[...] = jnp.zeros_like(offsets_vmem)
                 t2e_routing_vmem[...] = t2e_routing
-                starts_vmem[...] = global_starts_hbm
-                sizes_vmem[...] = global_sizes_hbm
+
+                # 从 HBM 异步拷贝预计算的 starts 和 sizes 到 VMEM
+                starts_load = pltpu.async_copy(
+                    src_ref=global_starts_hbm,
+                    dst_ref=starts_vmem,
+                    sem=send_sem,
+                )
+                sizes_load = pltpu.async_copy(
+                    src_ref=global_sizes_hbm,
+                    dst_ref=sizes_vmem,
+                    sem=send_sem,
+                )
 
                 # 复制到 SMEM（与现有路径相同）
                 offsets_copy = pltpu.async_copy(
@@ -735,6 +745,10 @@ def _fused_ep_moe_kernel(
                     dst_ref=t2e_routing_x2_smem.at[bt_sem_id],
                     sem=send_sem,
                 )
+
+                # 等待 HBM->VMEM 完成后再 VMEM->SMEM
+                starts_load.wait()
+                sizes_load.wait()
                 starts_copy = pltpu.async_copy(
                     src_ref=starts_vmem,
                     dst_ref=expert_starts_x2_smem.at[bt_sem_id],
@@ -3132,6 +3146,8 @@ def _validate_fused_ep_moe_args(
 def compute_local_expert_sizes(topk_ids: jax.Array, num_experts: int) -> jax.Array:
     """从 topk_ids 计算每个专家的 token 数量。
 
+    必须在 shard_map 内部调用（输入需要是本地未分片的）。
+
     参数：
         topk_ids: (num_tokens, top_k) int32，每个 token 的专家 ID
         num_experts: 专家总数
@@ -3143,22 +3159,26 @@ def compute_local_expert_sizes(topk_ids: jax.Array, num_experts: int) -> jax.Arr
     # 过滤无效 ID（-1 表示被 mask 的 token）
     valid_ids = jnp.where(flat_ids >= 0, flat_ids, num_experts)
     counts = jnp.bincount(valid_ids, length=num_experts + 1)[:num_experts]
-    return counts[None, :]  # (1, num_experts)
+    return counts[None, :].astype(jnp.int32)  # (1, num_experts)
 
 
 def jax_allreduce_metadata(
-    local_sizes: jax.Array,  # (1, num_experts) int32
+    topk_ids: jax.Array,  # (num_tokens, top_k) int32
+    num_experts: int,
     mesh: jax.sharding.Mesh,
     dp_axis_name: str,
     tp_axis_name: str,
 ) -> tuple[jax.Array, jax.Array]:
     """纯 JAX allgather + 前缀和处理元数据。
 
+    将 compute_local_expert_sizes 和 allgather 都放在 shard_map 内部，
+    避免 jit 域外的分片计算问题。
+
     匹配 /tmp/s1c_allreduce_bench.py 中的基准实现。
 
     返回：
-        global_starts: (1, num_experts) int32 — 跨 EP 设备的前缀和
-        global_sizes: (1, num_experts) int32 — 跨 EP 设备的总和
+        global_starts: (1, num_experts) int32 — 跨 EP 设备的前缀和（复制到所有设备）
+        global_sizes: (1, num_experts) int32 — 跨 EP 设备的总和（复制到所有设备）
     """
     try:
         from jax.experimental.shard_map import shard_map
@@ -3176,16 +3196,15 @@ def jax_allreduce_metadata(
             ),
         ),
         out_specs=(
-            P(
-                (dp_axis_name, tp_axis_name),
-            ),
-            P(
-                (dp_axis_name, tp_axis_name),
-            ),
+            P(),
+            P(),
         ),
         check_rep=False,
     )
-    def _allgather_and_prefix_sum(local_sizes):
+    def _compute_and_allgather(topk_ids_local):
+        # 在本设备上计算本地专家大小
+        local_sizes = compute_local_expert_sizes(topk_ids_local, num_experts)
+
         # 跨两个轴 allgather（EP = data × tensor）
         all_sizes = lax.all_gather(
             local_sizes, axis_name=(dp_axis_name, tp_axis_name), axis=0, tiled=True
@@ -3200,7 +3219,7 @@ def jax_allreduce_metadata(
         tp_size = lax.axis_size(tp_axis_name)
         my_id = dp_rank * tp_size + tp_rank
 
-        global_starts = jnp.zeros((1, all_sizes.shape[1]), dtype=jnp.int32)
+        global_starts = jnp.zeros((1, num_experts), dtype=jnp.int32)
         for dev_id in range(num_devices):
             dev_sizes = all_sizes[dev_id : dev_id + 1]
             global_starts += lax.select(
@@ -3211,7 +3230,7 @@ def jax_allreduce_metadata(
 
         return global_starts, global_sizes
 
-    return _allgather_and_prefix_sum(local_sizes)
+    return _compute_and_allgather(topk_ids)
 
 
 @functools.partial(
@@ -3354,17 +3373,12 @@ def fused_ep_moe(
     # 预计算元数据使用 JAX allreduce（如果启用）
     if use_jax_allreduce_metadata and ep_size > 1 and not disable_a2a:
         num_experts_total = w2.shape[0]
-        local_sizes = compute_local_expert_sizes(topk_ids, num_experts_total)
         global_starts, global_sizes = jax_allreduce_metadata(
-            local_sizes, mesh, dp_axis_name, tp_axis_name
+            topk_ids, num_experts_total, mesh, dp_axis_name, tp_axis_name
         )
-        # 复制到所有设备（小数组，所有设备都需要）
-        global_starts_hbm = jax.device_put(
-            global_starts, jax.sharding.NamedSharding(mesh, P(None, None))
-        )
-        global_sizes_hbm = jax.device_put(
-            global_sizes, jax.sharding.NamedSharding(mesh, P(None, None))
-        )
+        # 输出已经是 P()（全局复制），保持原样，无需额外 reshard
+        global_starts_hbm = global_starts
+        global_sizes_hbm = global_sizes
     else:
         global_starts_hbm = None
         global_sizes_hbm = None
@@ -3563,8 +3577,6 @@ def fused_ep_moe(
                 disable_all_reduce_metadata=disable_all_reduce_metadata,
                 disable_sync_barrier=disable_sync_barrier,
                 use_jax_allreduce_metadata=use_jax_allreduce_metadata,
-                global_starts_hbm=global_starts_hbm,
-                global_sizes_hbm=global_sizes_hbm,
                 quant_block_k=quant_block_k,
                 bt=bt,
                 bf=block_config.bf,
@@ -3602,6 +3614,8 @@ def fused_ep_moe(
                     None if w1_shared_scale is None else hbm_block_spec,  # w1_shared_scale_hbm
                     None if w3_shared_scale is None else hbm_block_spec,  # w3_shared_scale_hbm
                     None if w2_shared_scale is None else hbm_block_spec,  # w2_shared_scale_hbm
+                    None if global_starts_hbm is None else hbm_block_spec,  # global_starts_hbm
+                    None if global_sizes_hbm is None else hbm_block_spec,  # global_sizes_hbm
                 ],
                 out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                 scratch_shapes=scratch_shapes,
@@ -3689,6 +3703,8 @@ def fused_ep_moe(
             None if w1_shared_scale is None else P(),  # w1_shared_scale
             None if w3_shared_scale is None else P(),  # w3_shared_scale
             None if w2_shared_scale is None else P(),  # w2_shared_scale
+            None if global_starts_hbm is None else P(),  # global_starts (replicated)
+            None if global_sizes_hbm is None else P(),  # global_sizes (replicated)
         ),
         out_specs=P((dp_axis_name, tp_axis_name)),
         check_vma=False,
@@ -3715,6 +3731,8 @@ def fused_ep_moe(
         w1_shared_scale=None,
         w3_shared_scale=None,
         w2_shared_scale=None,
+        global_starts=None,
+        global_sizes=None,
     ):
         local_output = fused_moe(
             pltpu.with_memory_space_constraint(tokens, pltpu.HBM),  # tokens_hbm
@@ -3776,6 +3794,16 @@ def fused_ep_moe(
                 if w2_shared_scale is None
                 else pltpu.with_memory_space_constraint(w2_shared_scale, pltpu.HBM)
             ),
+            (
+                None
+                if global_starts is None
+                else pltpu.with_memory_space_constraint(global_starts, pltpu.HBM)
+            ),
+            (
+                None
+                if global_sizes is None
+                else pltpu.with_memory_space_constraint(global_sizes, pltpu.HBM)
+            ),
         )
         return local_output
 
@@ -3811,4 +3839,6 @@ def fused_ep_moe(
         w1_shared_scale,
         w3_shared_scale,
         w2_shared_scale,
+        global_starts_hbm,
+        global_sizes_hbm,
     )
