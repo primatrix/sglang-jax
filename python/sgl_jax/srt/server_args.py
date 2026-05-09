@@ -135,6 +135,7 @@ class ServerArgs:
     # Kernel backend
     attention_backend: str | None = "fa"
     moe_backend: str = "epmoe"
+    disable_jax_allreduce_metadata: bool = False
 
     grammar_backend: str | None = None
 
