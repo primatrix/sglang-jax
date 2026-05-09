@@ -717,6 +717,7 @@ def _pallas_a2a_metadata_call(local_counts_hbm, *, shape, jax, pl, pltpu):
         import jax.numpy as jnp
         from jax import lax
 
+        del out_ref
         rank = lax.axis_index("tensor")
 
         def get_mesh_device_id(ep_rank):
@@ -780,7 +781,6 @@ def _pallas_a2a_metadata_call(local_counts_hbm, *, shape, jax, pl, pltpu):
             pltpu.make_async_copy(src_ref=send_ref, dst_ref=send_ref, sem=send_sem).wait()
 
         sync_barrier()
-        out_ref[0] = d2e_count_vmem[rank, 0, 0]
 
     return pl.pallas_call(
         kernel,
@@ -821,6 +821,7 @@ def _pallas_a2a_scatter_call(tokens_hbm, topk_ids_hbm, scratch_hbm, *, shape, ja
         recv_sems,
         barrier_sem,
     ):
+        del out_ref
         my_id = pl.program_id(0) * 0 + 0
         del my_id
 
@@ -886,8 +887,6 @@ def _pallas_a2a_scatter_call(tokens_hbm, topk_ids_hbm, scratch_hbm, *, shape, ja
                 dst_ref=recv_ref,
                 sem=recv_sems.at[k_id],
             ).wait()
-
-        out_ref[0] = rank.astype(out_ref.dtype)
 
     return pl.pallas_call(
         kernel,
