@@ -188,6 +188,7 @@ def _metadata_for_shape(metadata: dict[str, Any], shape: Any) -> dict[str, Any]:
         "operation": "jax_lax_all_to_all",
         "path_class": shape.path_class,
         "matrix_shape": list(_matrix_shape(shape)),
+        "global_input_shape": list(_global_input_shape(shape)),
         "matrix_dim": shape.matrix_dim,
         "dtype_bytes": BF16_BYTES,
         "mesh_shape": shape.mesh_shape,
@@ -195,6 +196,8 @@ def _metadata_for_shape(metadata: dict[str, Any], shape: Any) -> dict[str, Any]:
         "ici_size": shape.ici_size,
         "sharding_strategy": shape.sharding_strategy,
         "sharding_axes": list(_sharding_axes(shape)),
+        "input_sharding": "PartitionSpec(sharding_axes, None, None)",
+        "payload_pattern": "per_collective_rank_distinct_constant_shard",
         "collective_rank": _collective_rank(shape),
         "bytes_input_per_device": _input_bytes(shape),
         "nominal_transferred_bytes_per_device": _nominal_transferred_bytes_per_device(shape),
@@ -287,7 +290,7 @@ def _measure_all_to_all_ms(
     import jax.numpy as jnp
     from jax.experimental import mesh_utils
     from jax.experimental.shard_map import shard_map
-    from jax.sharding import Mesh
+    from jax.sharding import Mesh, NamedSharding
     from jax.sharding import PartitionSpec as P
 
     from benchmark.utils import multiple_iteration_timeit_from_trace
@@ -299,7 +302,7 @@ def _measure_all_to_all_ms(
         raise ValueError(f"Need {shape.ici_size} devices, found {len(devices)}.")
     mesh = Mesh(mesh_utils.create_device_mesh(mesh_dims, devices=devices), axis_names)
     sharding_axis = _sharding_axes(shape)
-    matrix_shape = _matrix_shape(shape)
+    sharding_spec = P(sharding_axis, None, None)
 
     def all_to_all(x):
         with jax.named_scope("SGLANG_JAX_LAYER0_A2A"):
@@ -315,12 +318,17 @@ def _measure_all_to_all_ms(
         shard_map(
             all_to_all,
             mesh,
-            in_specs=P(None, None, None),
-            out_specs=P(None, None, None),
+            in_specs=sharding_spec,
+            out_specs=sharding_spec,
             check_rep=False,
         )
     )
-    src = jnp.ones(matrix_shape, dtype=jnp.bfloat16)
+    src = _make_distinct_sharded_payload(
+        jax=jax,
+        jnp=jnp,
+        sharding=NamedSharding(mesh, sharding_spec),
+        shape=shape,
+    )
     jax.block_until_ready(collective(src))
     task = (
         "layer0_a2a_"
@@ -363,6 +371,10 @@ def _matrix_shape(shape: Any) -> tuple[int, int, int]:
     return (shape.matrix_dim, BASE_N, BASE_K)
 
 
+def _global_input_shape(shape: Any) -> tuple[int, int, int]:
+    return (shape.matrix_dim * _collective_rank(shape), BASE_N, BASE_K)
+
+
 def _input_bytes(shape: Any) -> int:
     return prod(_matrix_shape(shape)) * BF16_BYTES
 
@@ -388,3 +400,28 @@ def _sharding_axes(shape: Any) -> tuple[str, ...]:
 
 def _collective_rank(shape: Any) -> int:
     return prod(dim for dim in _strategy_dims(shape.sharding_strategy) if dim > 1)
+
+
+def _make_distinct_sharded_payload(*, jax: Any, jnp: Any, sharding: Any, shape: Any):
+    import numpy as np
+
+    try:
+        from ml_dtypes import bfloat16 as numpy_bfloat16
+    except Exception:
+        numpy_bfloat16 = np.float32
+
+    global_shape = _global_input_shape(shape)
+    local_m = shape.matrix_dim
+
+    def data_callback(index):
+        leading = index[0]
+        start = int(leading.start or 0)
+        stop = int(leading.stop or global_shape[0])
+        rank_id = start // local_m
+        local_shape = (stop - start, BASE_N, BASE_K)
+        return np.full(local_shape, rank_id % 128, dtype=numpy_bfloat16)
+
+    payload = jax.make_array_from_callback(global_shape, sharding, data_callback)
+    if payload.dtype != jnp.bfloat16:
+        payload = payload.astype(jnp.bfloat16)
+    return payload
