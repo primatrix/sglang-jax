@@ -3605,7 +3605,7 @@ def fused_ep_moe(
                 scratch_shapes=scratch_shapes,
             ),
             compiler_params=pltpu.CompilerParams(
-                collective_id=0,
+                collective_id=1024,
                 allow_collective_id_without_custom_barrier=True,
                 has_side_effects=True,
                 vmem_limit_bytes=96 * 1024 * 1024,
