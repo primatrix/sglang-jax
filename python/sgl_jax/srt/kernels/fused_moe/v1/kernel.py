@@ -2744,14 +2744,14 @@ def _fused_ep_moe_kernel(
         t2e_routing = b_topk_ids_x2_vmem[bt_sem_id]
 
         if use_jax_allreduce_metadata and metadata_starts_hbm is not None:
-            expert_sizes = jnp.zeros((1, padded_num_experts), dtype=jnp.int32)
+            expert_sizes = None
+            expert_starts = None
         else:
             expert_iota = jax.lax.broadcasted_iota(jnp.int32, (1, 1, padded_num_experts), 2)
             routing_expanded = jnp.expand_dims(t2e_routing[:, :top_k], axis=2)
             mask = (routing_expanded == expert_iota).astype(jnp.int32)
             expert_sizes = jnp.sum(mask, axis=(0, 1), keepdims=True).reshape(1, padded_num_experts)
-
-        expert_starts = jnp.zeros_like(expert_sizes)
+            expert_starts = jnp.zeros_like(expert_sizes)
 
         all_reduce_metadata(
             bt_id=bt_id,
@@ -3219,13 +3219,16 @@ def jax_allreduce_metadata_by_bt(
     tp_rank = lax.axis_index(tp_axis_name)
     tp_size = lax.axis_size(tp_axis_name)
     my_id = dp_rank * tp_size + tp_rank
-    starts_by_device = jnp.cumsum(all_sizes, axis=1, dtype=jnp.int32) - all_sizes
-    starts = lax.dynamic_index_in_dim(
-        starts_by_device,
-        my_id,
+    # Only this device's prefix is consumed by the Pallas kernel.  Computing
+    # starts for every device with cumsum creates unnecessary work in the JAX
+    # metadata path, especially at larger EP sizes.
+    device_ids = lax.broadcasted_iota(jnp.int32, (num_devices,), 0)
+    prefix_mask = device_ids < my_id
+    starts = jnp.sum(
+        jnp.where(prefix_mask[None, :, None], all_sizes, jnp.zeros_like(all_sizes)),
         axis=1,
-        keepdims=False,
-    )[:, None, :]
+        keepdims=True,
+    ).astype(jnp.int32)
 
     d2e_counts = all_sizes[:, :, None, :]
     return starts, sizes, d2e_counts
