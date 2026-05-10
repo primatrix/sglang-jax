@@ -1419,8 +1419,8 @@ def _pallas_a2a_scatter_call(
             sem=metadata_sem,
         )
         starts_copy.start()
-        sizes_copy.start()
         starts_copy.wait()
+        sizes_copy.start()
         sizes_copy.wait()
         starts_to_smem = pltpu.async_copy(
             src_ref=starts_vmem,
@@ -1433,8 +1433,8 @@ def _pallas_a2a_scatter_call(
             sem=metadata_sem,
         )
         starts_to_smem.start()
-        sizes_to_smem.start()
         starts_to_smem.wait()
+        sizes_to_smem.start()
         sizes_to_smem.wait()
         for e_id in range(PADDED_NUM_EXPERTS):
             offsets_smem[e_id] = jnp.int32(0)
