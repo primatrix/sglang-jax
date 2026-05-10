@@ -470,7 +470,7 @@ PHASE1_WAIT_PRIMITIVE_SHAPES: tuple[layer1_wait.WaitShape, ...] = tuple(
     for repetitions in PHASE1_WAIT_REPETITIONS
     for path, path_class in (
         ("mesh_barrier", "mesh_barrier_all_peers"),
-        ("remote_dma_wait_min_tile", "remote_dma_wait_bf16_t_packing_tile"),
+        ("remote_dma_wait_packed_token", "remote_dma_wait_bf16_t_packing_token"),
     )
 )
 
