@@ -1,0 +1,26 @@
+# Cloud Build pipeline for the Falcon fused-MoE calibration TPU image.
+#
+# Driven by hack/build-falcon-calibration-image.sh.
+# Substitutions:
+#   _IMAGE    fully-qualified Artifact Registry image name without tag
+#   _TAG      image tag
+#   _GIT_SHA  source commit baked into the image label/env
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    id: build
+    args:
+      - build
+      - --file=images/falcon-calibration/Dockerfile
+      - --build-arg=SOURCE_COMMIT=${_GIT_SHA}
+      - --tag=${_IMAGE}:${_TAG}
+      - .
+
+images:
+  - ${_IMAGE}:${_TAG}
+
+options:
+  machineType: E2_HIGHCPU_8
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 1800s

@@ -1,0 +1,13 @@
+.git
+.gitignore
+.gcloudignore
+
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+python/.pytest_cache/
+python/.ruff_cache/
+
+docs/superpowers/
