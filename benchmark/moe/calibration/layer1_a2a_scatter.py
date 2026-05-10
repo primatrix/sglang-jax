@@ -2,9 +2,13 @@
 
 This module intentionally splits communication into sub-scenarios:
 
-* metadata allgather: mirrors the recursive-doubling `all_reduce_metadata`
-  remote-DMA exchange over per-device expert counts.
-* scatter: mirrors `start_a2a_scatter_batch` payload remote DMA for top_k=8.
+* metadata d2e_count allgather: mirrors only the recursive-doubling remote-DMA
+  exchange over per-device expert counts.
+* metadata full: mirrors the full `all_reduce_metadata` stage closely enough
+  for pipeline scheduling: t2e routing staging, offsets/starts/sizes SMEM
+  copies, d2e_count allgather, and local prefix reduction.
+* scatter: mirrors `start_a2a_scatter_batch` payload local/remote DMA for
+  top_k=8.
 
 The combined metadata+scatter scenario should be added after both sub-scenarios
 compile and measure cleanly on v7x-32.
@@ -21,6 +25,7 @@ from benchmark.moe.calibration.common import build_observation_row
 
 SCENARIO_LAYER1_A2A_SCATTER = "layer1_a2a_scatter"
 SCENARIO_LAYER1_A2A_METADATA = "layer1_a2a_metadata"
+SCENARIO_LAYER1_A2A_METADATA_FULL = "layer1_a2a_metadata_full"
 STATUS_MEASURED = "measured"
 STATUS_NOT_IMPLEMENTED = "not_implemented"
 
@@ -48,6 +53,7 @@ DEFAULT_TRACE_DISCARD_RUNS = 1
 class A2AScatterShape:
     path_class: str
     bt: int
+    local_routes_per_token: int = 0
     top_k: int = TOP_K
     hidden_size: int = HIDDEN_SIZE
     ep_size: int = EP_SIZE
@@ -62,6 +68,128 @@ class A2AMetadataShape:
     ep_size: int = EP_SIZE
     local_num_experts: int = LOCAL_NUM_EXPERTS
     padded_num_experts: int = PADDED_NUM_EXPERTS
+
+
+def build_metadata_full_rows(
+    *,
+    suite: str,
+    shapes: Iterable[A2AMetadataShape],
+    execution_mode: str,
+    runtime: dict[str, Any],
+    dtype: str,
+    weight_dtype: str,
+    t_packing: int,
+    source: dict[str, Any],
+    metadata: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if execution_mode != "pallas":
+        return [
+            _make_metadata_full_row(
+                suite=suite,
+                shape=shape,
+                execution_mode=execution_mode,
+                runtime=runtime,
+                dtype=dtype,
+                weight_dtype=weight_dtype,
+                t_packing=t_packing,
+                source=source,
+                metadata=metadata,
+                status=STATUS_NOT_IMPLEMENTED,
+                latency_ms_samples=[],
+                implementation_note=_not_implemented_note(execution_mode, runtime),
+            )
+            for shape in shapes
+        ]
+
+    unavailable_note = _pallas_unavailable_note(runtime)
+    if unavailable_note is not None:
+        return [
+            _make_metadata_full_row(
+                suite=suite,
+                shape=shape,
+                execution_mode=execution_mode,
+                runtime=runtime,
+                dtype=dtype,
+                weight_dtype=weight_dtype,
+                t_packing=t_packing,
+                source=source,
+                metadata=metadata,
+                status=STATUS_NOT_IMPLEMENTED,
+                latency_ms_samples=[],
+                implementation_note=unavailable_note,
+            )
+            for shape in shapes
+        ]
+
+    rows: list[dict[str, Any]] = []
+    warmup_runs = _positive_int_env("CALIBRATION_LAYER1_A2A_WARMUP_RUNS", DEFAULT_WARMUP_RUNS)
+    sample_runs = _positive_int_env("CALIBRATION_LAYER1_A2A_SAMPLE_RUNS", DEFAULT_SAMPLE_RUNS)
+    discard_runs = _nonnegative_int_env(
+        "CALIBRATION_LAYER1_A2A_TRACE_DISCARD_RUNS", DEFAULT_TRACE_DISCARD_RUNS
+    )
+    trace_root = os.getenv("CALIBRATION_LAYER1_A2A_TRACE_ROOT", "/tmp/sglang_jax_layer1_a2a_trace")
+
+    for shape in shapes:
+        measured_metadata = _with_metadata_full_measurement_metadata(
+            metadata,
+            shape=shape,
+            warmup_runs=warmup_runs,
+            sample_runs=sample_runs,
+            discard_runs=discard_runs,
+            trace_root=trace_root,
+        )
+        try:
+            samples = _measure_a2a_metadata_full_ms(
+                shape,
+                warmup_runs=warmup_runs,
+                sample_runs=sample_runs,
+                discard_runs=discard_runs,
+                trace_root=trace_root,
+            )
+        except Exception as exc:
+            rows.append(
+                _make_metadata_full_row(
+                    suite=suite,
+                    shape=shape,
+                    execution_mode=execution_mode,
+                    runtime=runtime,
+                    dtype=dtype,
+                    weight_dtype=weight_dtype,
+                    t_packing=t_packing,
+                    source=source,
+                    metadata=measured_metadata,
+                    status=STATUS_NOT_IMPLEMENTED,
+                    latency_ms_samples=[],
+                    implementation_note=_measurement_failed_note(exc),
+                )
+            )
+            continue
+
+        rows.append(
+            _make_metadata_full_row(
+                suite=suite,
+                shape=shape,
+                execution_mode=execution_mode,
+                runtime=runtime,
+                dtype=dtype,
+                weight_dtype=weight_dtype,
+                t_packing=t_packing,
+                source=source,
+                metadata=measured_metadata,
+                status=STATUS_MEASURED,
+                latency_ms_samples=samples,
+                implementation_note=(
+                    "Measured with a Pallas TPU microkernel aligned to the full "
+                    "fused-MoE all_reduce_metadata stage: synthetic t2e routing "
+                    "staging, offsets/starts/sizes/d2e_count SMEM copies, "
+                    "recursive-doubling d2e_count remote DMA, and local "
+                    "reduced_sizes/reduced_starts computation. It excludes "
+                    "topk HBM fetch, scatter, expert compute, and gather."
+                ),
+            )
+        )
+
+    return rows
 
 
 def build_metadata_rows(
@@ -174,10 +302,11 @@ def build_metadata_rows(
                 latency_ms_samples=samples,
                 implementation_note=(
                     "Measured with a Pallas TPU microkernel that mirrors the "
-                    "fused-MoE all_reduce_metadata recursive-doubling remote "
-                    "DMA allgather over d2e_count. It includes the mesh "
-                    "barriers and send/recv wait anchors, but not scatter, "
-                    "expert compute, or gather."
+                    "fused-MoE recursive-doubling remote DMA allgather over "
+                    "d2e_count only. It includes the mesh barriers and "
+                    "send/recv wait anchors, but excludes t2e routing staging, "
+                    "offset/start/size SMEM copies, scatter, expert compute, "
+                    "and gather."
                 ),
             )
         )
@@ -347,6 +476,46 @@ def _make_metadata_row(
     )
 
 
+def _make_metadata_full_row(
+    *,
+    suite: str,
+    shape: A2AMetadataShape,
+    execution_mode: str,
+    runtime: dict[str, Any],
+    dtype: str,
+    weight_dtype: str,
+    t_packing: int,
+    source: dict[str, Any],
+    metadata: dict[str, Any],
+    status: str,
+    latency_ms_samples: list[float],
+    implementation_note: str,
+) -> dict[str, Any]:
+    return build_observation_row(
+        scenario=SCENARIO_LAYER1_A2A_METADATA_FULL,
+        suite=suite,
+        layer=1,
+        path="metadata_full",
+        path_class=shape.path_class,
+        dtype=dtype,
+        weight_dtype=weight_dtype,
+        t_packing=t_packing,
+        bf=shape.bt,
+        bd=shape.padded_num_experts,
+        tile_shape=(shape.ep_size, 1, shape.padded_num_experts),
+        bytes_hbm=_metadata_full_bytes_per_device(shape),
+        bytes_per_fetch=_metadata_remote_bytes_per_device(shape),
+        dma_count=_metadata_rounds(shape) + 5,
+        status=status,
+        execution_mode=execution_mode,
+        latency_ms_samples=latency_ms_samples,
+        runtime=runtime,
+        source=source,
+        metadata=_metadata_for_metadata_full_shape(metadata, shape),
+        implementation_note=implementation_note,
+    )
+
+
 def _make_row(
     *,
     suite: str,
@@ -403,14 +572,29 @@ def _metadata_for_shape(metadata: dict[str, Any], shape: A2AScatterShape) -> dic
         "local_num_experts": shape.local_num_experts,
         "num_experts": shape.ep_size * shape.local_num_experts,
         "routing_pattern": "e_id=(rank+k+1)%ep_size*local_num_experts+k",
+        "local_routes_per_token": shape.local_routes_per_token,
         "topk_id_layout": "HBM rows are padded to 128 columns; only first top_k entries route payloads.",
         "scratch_token_capacity": _scratch_token_capacity(shape),
-        "remote_copies_per_device": shape.bt * shape.top_k,
+        "local_copies_per_device": shape.bt * shape.local_routes_per_token,
+        "remote_copies_per_device": _remote_scatter_copies_per_device(shape),
         "remote_payload_bytes_per_copy": shape.hidden_size * BF16_BYTES,
-        "remote_payload_bytes_per_device": _payload_bytes_per_device(shape),
+        "local_payload_bytes_per_device": _local_scatter_bytes_per_device(shape),
+        "remote_payload_bytes_per_device": _remote_scatter_bytes_per_device(shape),
+        "payload_bytes_per_device": _payload_bytes_per_device(shape),
         "destination_layout": "scratch[topk_slot, source_rank*bt + token_id, t_packing, hidden/t_packing]",
-        "traffic_class": "remote_dma_scatter_payload_only",
-        "includes": ["remote_scatter_start", "send_wait", "recv_wait", "mesh_barrier"],
+        "traffic_class": (
+            "remote_dma_scatter_payload_only"
+            if shape.local_routes_per_token == 0
+            else "mixed_local_remote_scatter_payload"
+        ),
+        "includes": [
+            "topk_ids_hbm_to_vmem",
+            "local_scatter_start",
+            "remote_scatter_start",
+            "send_wait",
+            "recv_wait",
+            "mesh_barrier",
+        ],
         "excludes": [
             "metadata_allgather",
             "expert_compute",
@@ -455,6 +639,48 @@ def _metadata_for_metadata_shape(
     return enriched
 
 
+def _metadata_for_metadata_full_shape(
+    metadata: dict[str, Any], shape: A2AMetadataShape
+) -> dict[str, Any]:
+    enriched = dict(metadata)
+    enriched["a2a_metadata_full"] = {
+        "kernel_reference": "python/sgl_jax/srt/kernels/fused_moe/v1/kernel.py:all_reduce_metadata",
+        "operation": "full_metadata_stage_microbench",
+        "path_class": shape.path_class,
+        "bt": shape.bt,
+        "top_k": shape.top_k,
+        "ep_size": shape.ep_size,
+        "local_num_experts": shape.local_num_experts,
+        "num_experts": shape.ep_size * shape.local_num_experts,
+        "padded_top_k": PADDED_TOP_K,
+        "padded_num_experts": shape.padded_num_experts,
+        "rounds": _metadata_rounds(shape),
+        "remote_payload_bytes_per_device": _metadata_remote_bytes_per_device(shape),
+        "local_metadata_bytes_per_device": _metadata_local_bytes_per_device(shape),
+        "traffic_class": "metadata_full_stage",
+        "includes": [
+            "synthetic_t2e_routing_vmem_staging",
+            "t2e_routing_smem_copy",
+            "offsets_zero_and_smem_copy",
+            "d2e_count_init",
+            "d2e_count_remote_allgather",
+            "reduced_sizes_reduced_starts_loop",
+            "starts_sizes_d2e_count_smem_copy",
+            "send_wait",
+            "recv_wait",
+            "mesh_barrier",
+        ],
+        "excludes": [
+            "topk_hbm_fetch",
+            "scatter",
+            "expert_compute",
+            "gather",
+            "output_accumulation",
+        ],
+    }
+    return enriched
+
+
 def _with_measurement_metadata(
     metadata: dict[str, Any],
     *,
@@ -488,6 +714,27 @@ def _with_metadata_measurement_metadata(
     enriched = _metadata_for_metadata_shape(metadata, shape)
     enriched["benchmark"] = {
         "name": "layer1_pallas_a2a_metadata_allgather",
+        "warmup_runs": warmup_runs,
+        "sample_runs": sample_runs,
+        "trace_discard_runs": discard_runs,
+        "timing": "jax_profiler_trace_device_duration_ms",
+        "trace_root": trace_root,
+    }
+    return enriched
+
+
+def _with_metadata_full_measurement_metadata(
+    metadata: dict[str, Any],
+    *,
+    shape: A2AMetadataShape,
+    warmup_runs: int,
+    sample_runs: int,
+    discard_runs: int,
+    trace_root: str,
+) -> dict[str, Any]:
+    enriched = _metadata_for_metadata_full_shape(metadata, shape)
+    enriched["benchmark"] = {
+        "name": "layer1_pallas_a2a_metadata_full",
         "warmup_runs": warmup_runs,
         "sample_runs": sample_runs,
         "trace_discard_runs": discard_runs,
@@ -695,6 +942,55 @@ def _measure_a2a_metadata_ms(
         )
 
 
+def _measure_a2a_metadata_full_ms(
+    shape: A2AMetadataShape,
+    *,
+    warmup_runs: int,
+    sample_runs: int,
+    discard_runs: int,
+    trace_root: str,
+) -> list[float]:
+    import jax
+    import numpy as np
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import NamedSharding
+    from jax.sharding import PartitionSpec as P
+
+    from benchmark.utils import multiple_iteration_timeit_from_trace
+
+    mesh = _build_tensor_mesh(jax=jax, np=np, ep_size=shape.ep_size, tp_size=1)
+    count_sharding = NamedSharding(mesh, P("tensor", None))
+    local_counts = _make_local_counts(jax=jax, np=np, sharding=count_sharding, shape=shape)
+    jax.block_until_ready(local_counts)
+
+    with jax.set_mesh(mesh):
+
+        @jax.jit
+        def run_metadata_full(local_counts_hbm):
+            return _sharded_metadata_full_call(
+                local_counts_hbm,
+                shape=shape,
+                mesh=mesh,
+                jax=jax,
+                pl=pl,
+                pltpu=pltpu,
+                P=P,
+            )
+
+        jax.block_until_ready(run_metadata_full(local_counts))
+        task = f"layer1_a2a_metadata_full_bt{shape.bt}_{shape.path_class}"
+        return multiple_iteration_timeit_from_trace(
+            compute_func=run_metadata_full,
+            data_generator=lambda: (local_counts,),
+            task=task,
+            tries=sample_runs,
+            warmup=warmup_runs,
+            discard_initial_samples=discard_runs,
+            trace_root=trace_root,
+        )
+
+
 def _sharded_metadata_call(local_counts_hbm, *, shape: A2AMetadataShape, mesh, jax, pl, pltpu, P):
     @jax.shard_map(
         mesh=mesh,
@@ -704,6 +1000,27 @@ def _sharded_metadata_call(local_counts_hbm, *, shape: A2AMetadataShape, mesh, j
     )
     def per_rank(local_counts):
         return _pallas_a2a_metadata_call(
+            local_counts,
+            shape=shape,
+            jax=jax,
+            pl=pl,
+            pltpu=pltpu,
+        )
+
+    return per_rank(local_counts_hbm)
+
+
+def _sharded_metadata_full_call(
+    local_counts_hbm, *, shape: A2AMetadataShape, mesh, jax, pl, pltpu, P
+):
+    @jax.shard_map(
+        mesh=mesh,
+        in_specs=P("tensor", None),
+        out_specs=P("tensor"),
+        check_vma=False,
+    )
+    def per_rank(local_counts):
+        return _pallas_a2a_metadata_full_call(
             local_counts,
             shape=shape,
             jax=jax,
@@ -809,6 +1126,176 @@ def _pallas_a2a_metadata_call(local_counts_hbm, *, shape, jax, pl, pltpu):
     )(local_counts_hbm)
 
 
+def _pallas_a2a_metadata_full_call(local_counts_hbm, *, shape, jax, pl, pltpu):
+    def kernel(
+        local_counts_ref,
+        out_ref,
+        t2e_routing_vmem,
+        d2e_count_vmem,
+        offsets_vmem,
+        starts_vmem,
+        sizes_vmem,
+        t2e_routing_smem,
+        d2e_count_smem,
+        offsets_smem,
+        starts_smem,
+        sizes_smem,
+        send_sem,
+        recv_sem,
+        barrier_sem,
+    ):
+        import jax.numpy as jnp
+        from jax import lax
+
+        del out_ref
+        rank = lax.axis_index("tensor")
+
+        def get_mesh_device_id(ep_rank):
+            return (0, ep_rank)
+
+        def sync_barrier():
+            for peer in range(shape.ep_size):
+                pltpu.semaphore_signal(
+                    barrier_sem,
+                    device_id=get_mesh_device_id(peer),
+                    device_id_type=pltpu.DeviceIdType.MESH,
+                )
+            pltpu.semaphore_wait(barrier_sem, shape.ep_size)
+
+        offsets_vmem[...] = jnp.zeros_like(offsets_vmem)
+        offsets_copy = pltpu.async_copy(
+            src_ref=offsets_vmem,
+            dst_ref=offsets_smem,
+            sem=send_sem,
+        )
+
+        t2e_routing_vmem[...] = jnp.full_like(t2e_routing_vmem, -1)
+
+        def write_token(t_id, _):
+            for k_id in range(shape.top_k):
+                recv_id = (rank + jnp.int32(k_id + 1)) % jnp.int32(shape.ep_size)
+                e_id = recv_id * jnp.int32(shape.local_num_experts) + jnp.int32(k_id)
+                t2e_routing_vmem[t_id, k_id] = e_id
+            return None
+
+        lax.fori_loop(0, shape.bt, write_token, None, unroll=False)
+
+        t2e_routing_copy = pltpu.async_copy(
+            src_ref=t2e_routing_vmem,
+            dst_ref=t2e_routing_smem,
+            sem=send_sem,
+        )
+
+        d2e_count_vmem[...] = jnp.zeros_like(d2e_count_vmem)
+        local_count_copy = pltpu.make_async_copy(
+            src_ref=local_counts_ref.at[pl.ds(0, 1), pl.ds(0, shape.padded_num_experts)],
+            dst_ref=d2e_count_vmem.at[rank, pl.ds(0, 1), pl.ds(0, shape.padded_num_experts)],
+            sem=send_sem,
+        )
+        local_count_copy.start()
+        local_count_copy.wait()
+
+        sync_barrier()
+        for round_id in range(_metadata_rounds(shape)):
+            sync_barrier()
+            chunk = 1 << round_id
+            peer_id = rank ^ jnp.int32(chunk)
+            send_start = (rank >> round_id) << round_id
+            recv_start = (peer_id >> round_id) << round_id
+
+            pltpu.make_async_remote_copy(
+                src_ref=d2e_count_vmem.at[
+                    pl.ds(send_start, chunk),
+                    pl.ds(0, 1),
+                    pl.ds(0, shape.padded_num_experts),
+                ],
+                dst_ref=d2e_count_vmem.at[
+                    pl.ds(send_start, chunk),
+                    pl.ds(0, 1),
+                    pl.ds(0, shape.padded_num_experts),
+                ],
+                send_sem=send_sem,
+                recv_sem=recv_sem,
+                device_id=get_mesh_device_id(peer_id),
+                device_id_type=pltpu.DeviceIdType.MESH,
+            ).start()
+
+            recv_ref = d2e_count_vmem.at[
+                pl.ds(recv_start, chunk),
+                pl.ds(0, 1),
+                pl.ds(0, shape.padded_num_experts),
+            ]
+            pltpu.make_async_copy(src_ref=recv_ref, dst_ref=recv_ref, sem=recv_sem).wait()
+
+            send_ref = d2e_count_vmem.at[
+                pl.ds(send_start, chunk),
+                pl.ds(0, 1),
+                pl.ds(0, shape.padded_num_experts),
+            ]
+            pltpu.make_async_copy(src_ref=send_ref, dst_ref=send_ref, sem=send_sem).wait()
+
+        sync_barrier()
+
+        reduced_sizes = jnp.zeros_like(sizes_vmem)
+        reduced_starts = jnp.zeros_like(starts_vmem)
+        for dev_id in range(shape.ep_size):
+            dev_sizes = d2e_count_vmem[dev_id]
+            reduced_sizes += dev_sizes
+            reduced_starts += lax.select(
+                jnp.int32(dev_id) < rank, dev_sizes, jnp.zeros_like(dev_sizes)
+            )
+
+        starts_vmem[...] = reduced_starts
+        sizes_vmem[...] = reduced_sizes
+
+        starts_copy = pltpu.async_copy(src_ref=starts_vmem, dst_ref=starts_smem, sem=send_sem)
+        sizes_copy = pltpu.async_copy(src_ref=sizes_vmem, dst_ref=sizes_smem, sem=send_sem)
+        d2e_count_copy = pltpu.async_copy(
+            src_ref=d2e_count_vmem,
+            dst_ref=d2e_count_smem,
+            sem=send_sem,
+        )
+
+        t2e_routing_copy.wait()
+        d2e_count_copy.wait()
+        offsets_copy.wait()
+        starts_copy.wait()
+        sizes_copy.wait()
+
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((1,), local_counts_hbm.dtype),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)],
+            out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            grid=(1,),
+            scratch_shapes=[
+                pltpu.VMEM((shape.bt, PADDED_TOP_K), local_counts_hbm.dtype),
+                pltpu.VMEM((shape.ep_size, 1, shape.padded_num_experts), local_counts_hbm.dtype),
+                pltpu.VMEM((2, shape.padded_num_experts), local_counts_hbm.dtype),
+                pltpu.VMEM((1, shape.padded_num_experts), local_counts_hbm.dtype),
+                pltpu.VMEM((1, shape.padded_num_experts), local_counts_hbm.dtype),
+                pltpu.SMEM((shape.bt, PADDED_TOP_K), local_counts_hbm.dtype),
+                pltpu.SMEM((shape.ep_size, 1, shape.padded_num_experts), local_counts_hbm.dtype),
+                pltpu.SMEM((2, shape.padded_num_experts), local_counts_hbm.dtype),
+                pltpu.SMEM((1, shape.padded_num_experts), local_counts_hbm.dtype),
+                pltpu.SMEM((1, shape.padded_num_experts), local_counts_hbm.dtype),
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.BARRIER,
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            collective_id=3,
+            allow_collective_id_without_custom_barrier=True,
+            has_side_effects=True,
+            vmem_limit_bytes=VMEM_LIMIT_BYTES,
+        ),
+        name=f"layer1_a2a_metadata_full_bt{shape.bt}",
+    )(local_counts_hbm)
+
+
 def _pallas_a2a_scatter_call(tokens_hbm, topk_ids_hbm, scratch_hbm, *, shape, jax, jnp, pl, pltpu):
     def kernel(
         tokens_ref,
@@ -858,14 +1345,21 @@ def _pallas_a2a_scatter_call(tokens_hbm, topk_ids_hbm, scratch_hbm, *, shape, ja
                 recv_id = e_id // shape.local_num_experts
                 e_sem_id = e_id % shape.local_num_experts
                 dst_start = rank * shape.bt + t_id
-                pltpu.make_async_remote_copy(
-                    src_ref=tokens_ref.at[pl.ds(t_id, 1)],
-                    dst_ref=scratch_ref.at[e_sem_id, pl.ds(dst_start, 1)],
-                    send_sem=send_sems.at[e_sem_id],
-                    recv_sem=recv_sems.at[e_sem_id],
-                    device_id=get_mesh_device_id(recv_id),
-                    device_id_type=pltpu.DeviceIdType.MESH,
-                ).start()
+                if k_id < shape.local_routes_per_token:
+                    pltpu.make_async_copy(
+                        src_ref=tokens_ref.at[pl.ds(t_id, 1)],
+                        dst_ref=scratch_ref.at[e_sem_id, pl.ds(dst_start, 1)],
+                        sem=recv_sems.at[e_sem_id],
+                    ).start()
+                else:
+                    pltpu.make_async_remote_copy(
+                        src_ref=tokens_ref.at[pl.ds(t_id, 1)],
+                        dst_ref=scratch_ref.at[e_sem_id, pl.ds(dst_start, 1)],
+                        send_sem=send_sems.at[e_sem_id],
+                        recv_sem=recv_sems.at[e_sem_id],
+                        device_id=get_mesh_device_id(recv_id),
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).start()
             return None
 
         from jax import lax
@@ -873,14 +1367,19 @@ def _pallas_a2a_scatter_call(tokens_hbm, topk_ids_hbm, scratch_hbm, *, shape, ja
         lax.fori_loop(0, shape.bt, scatter_one, None, unroll=False)
 
         for k_id in range(shape.top_k):
-            send_ref = scratch_ref.at[k_id, pl.ds(0, shape.bt)]
-            pltpu.make_async_copy(
-                src_ref=send_ref,
-                dst_ref=send_ref,
-                sem=send_sems.at[k_id],
-            ).wait()
+            if k_id >= shape.local_routes_per_token:
+                send_ref = scratch_ref.at[k_id, pl.ds(0, shape.bt)]
+                pltpu.make_async_copy(
+                    src_ref=send_ref,
+                    dst_ref=send_ref,
+                    sem=send_sems.at[k_id],
+                ).wait()
 
-            source_rank = (rank + shape.ep_size - k_id - 1) % shape.ep_size
+            if k_id < shape.local_routes_per_token:
+                source_rank = rank
+            else:
+                remote_offset = k_id - shape.local_routes_per_token
+                source_rank = (rank + shape.ep_size - remote_offset - 1) % shape.ep_size
             recv_ref = scratch_ref.at[k_id, pl.ds(source_rank * shape.bt, shape.bt)]
             pltpu.make_async_copy(
                 src_ref=recv_ref,
@@ -948,7 +1447,11 @@ def _make_topk_ids(*, jax: Any, np: Any, sharding: Any, shape: A2AScatterShape):
         local_rows = stop - start
         out = np.full((local_rows, PADDED_TOP_K), -1, dtype=np.int32)
         for k_id in range(shape.top_k):
-            recv_id = (rank_id + k_id + 1) % shape.ep_size
+            if k_id < shape.local_routes_per_token:
+                recv_id = rank_id
+            else:
+                remote_offset = k_id - shape.local_routes_per_token
+                recv_id = (rank_id + remote_offset + 1) % shape.ep_size
             out[:, k_id] = recv_id * shape.local_num_experts + k_id
         return out
 
@@ -988,6 +1491,22 @@ def _payload_bytes_per_device(shape: A2AScatterShape) -> int:
     return shape.bt * shape.top_k * shape.hidden_size * BF16_BYTES
 
 
+def _remote_scatter_copies_per_device(shape: A2AScatterShape) -> int:
+    return shape.bt * max(shape.top_k - shape.local_routes_per_token, 0)
+
+
+def _local_scatter_copies_per_device(shape: A2AScatterShape) -> int:
+    return shape.bt * min(shape.local_routes_per_token, shape.top_k)
+
+
+def _remote_scatter_bytes_per_device(shape: A2AScatterShape) -> int:
+    return _remote_scatter_copies_per_device(shape) * shape.hidden_size * BF16_BYTES
+
+
+def _local_scatter_bytes_per_device(shape: A2AScatterShape) -> int:
+    return _local_scatter_copies_per_device(shape) * shape.hidden_size * BF16_BYTES
+
+
 def _scratch_token_capacity(shape: A2AScatterShape) -> int:
     tokens = shape.bt * shape.ep_size
     return ((tokens + HBM_TOKEN_ALIGNMENT - 1) // HBM_TOKEN_ALIGNMENT) * HBM_TOKEN_ALIGNMENT
@@ -1000,6 +1519,19 @@ def _metadata_rounds(shape: A2AMetadataShape) -> int:
 def _metadata_remote_bytes_per_device(shape: A2AMetadataShape) -> int:
     copied_rows = shape.ep_size - 1
     return copied_rows * shape.padded_num_experts * 4
+
+
+def _metadata_local_bytes_per_device(shape: A2AMetadataShape) -> int:
+    routing_bytes = shape.bt * PADDED_TOP_K * 4
+    offsets_bytes = 2 * shape.padded_num_experts * 4
+    starts_bytes = shape.padded_num_experts * 4
+    sizes_bytes = shape.padded_num_experts * 4
+    d2e_count_bytes = shape.ep_size * shape.padded_num_experts * 4
+    return routing_bytes + offsets_bytes + starts_bytes + sizes_bytes + d2e_count_bytes
+
+
+def _metadata_full_bytes_per_device(shape: A2AMetadataShape) -> int:
+    return _metadata_remote_bytes_per_device(shape) + _metadata_local_bytes_per_device(shape)
 
 
 def _positive_int_env(name: str, default: int) -> int:

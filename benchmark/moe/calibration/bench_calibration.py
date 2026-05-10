@@ -32,6 +32,7 @@ SCENARIO_LAYER0_HBM_ENVELOPE = "layer0_hbm_envelope"
 SCENARIO_LAYER0_GEMM_ENVELOPE = "layer0_gemm_envelope"
 SCENARIO_LAYER0_A2A_ENVELOPE = "layer0_a2a_envelope"
 SCENARIO_LAYER1_A2A_METADATA = "layer1_a2a_metadata"
+SCENARIO_LAYER1_A2A_METADATA_FULL = "layer1_a2a_metadata_full"
 SCENARIO_LAYER1_A2A_SCATTER = "layer1_a2a_scatter"
 SCENARIO_LAYER1_A2A_GATHER = "layer1_a2a_gather"
 SCENARIO_LAYER1_WEIGHT_TILE_DMA = "layer1_weight_tile_dma"
@@ -44,6 +45,7 @@ SCENARIOS = (
     SCENARIO_LAYER0_GEMM_ENVELOPE,
     SCENARIO_LAYER0_A2A_ENVELOPE,
     SCENARIO_LAYER1_A2A_METADATA,
+    SCENARIO_LAYER1_A2A_METADATA_FULL,
     SCENARIO_LAYER1_A2A_SCATTER,
     SCENARIO_LAYER1_A2A_GATHER,
     SCENARIO_LAYER1_WEIGHT_TILE_DMA,
@@ -65,6 +67,8 @@ SUITE_V7X32_BF16_A2A_CURVE_V1 = "v7x32_bf16_a2a_curve_v1"
 SUITE_V7X32_BF16_A2A_CURVE_V2 = "v7x32_bf16_a2a_curve_v2"
 SUITE_V7X32_BF16_A2A_TOPK8_V1 = "v7x32_bf16_a2a_topk8_v1"
 SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT_V1 = "v7x32_bf16_a2a_topk8_preflight_v1"
+SUITE_V7X32_BF16_A2A_TOPK8 = "v7x32_bf16_a2a_topk8"
+SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT = "v7x32_bf16_a2a_topk8_preflight"
 SUITE_V7X32_BF16_LOCAL_DMA_TOPK8 = "v7x32_bf16_local_dma_topk8"
 SUITE_V7X8_BF16_LOCAL_DMA_TOPK8 = "v7x8_bf16_local_dma_topk8"
 SUITE_V7X8_BF16_FFN_LOOP_CONTEXT = "v7x8_bf16_ffn_loop_context"
@@ -83,6 +87,8 @@ SUITES = (
     SUITE_V7X32_BF16_A2A_CURVE_V2,
     SUITE_V7X32_BF16_A2A_TOPK8_V1,
     SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT_V1,
+    SUITE_V7X32_BF16_A2A_TOPK8,
+    SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT,
     SUITE_V7X32_BF16_LOCAL_DMA_TOPK8,
     SUITE_V7X8_BF16_LOCAL_DMA_TOPK8,
     SUITE_V7X8_BF16_FFN_LOOP_CONTEXT,
@@ -409,6 +415,16 @@ PHASE1_A2A_SCATTER_TOPK8_SHAPES: tuple[layer1_a2a_scatter.A2AScatterShape, ...] 
     for bt in PHASE1_A2A_TOPK8_BT_VALUES
 )
 
+PHASE1_A2A_SCATTER_TOPK8_MIXED_SHAPES: tuple[layer1_a2a_scatter.A2AScatterShape, ...] = tuple(
+    layer1_a2a_scatter.A2AScatterShape(
+        path_class=f"scatter_topk8_mixed_local{k_local}",
+        bt=bt,
+        local_routes_per_token=k_local,
+    )
+    for bt in (2, 4, 8, 16, 32, 64, 128)
+    for k_local in (1, 4)
+)
+
 PHASE1_A2A_SCATTER_TOPK8_PREFLIGHT_SHAPES: tuple[layer1_a2a_scatter.A2AScatterShape, ...] = tuple(
     layer1_a2a_scatter.A2AScatterShape(path_class="scatter_topk8_preflight", bt=bt)
     for bt in PHASE1_A2A_TOPK8_PREFLIGHT_BT_VALUES
@@ -518,15 +534,22 @@ def load_layer1_a2a_scatter_suite_shapes(
         return PHASE1_A2A_SCATTER_TOPK8_SHAPES
     if suite == SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT_V1:
         return PHASE1_A2A_SCATTER_TOPK8_PREFLIGHT_SHAPES
+    if suite == SUITE_V7X32_BF16_A2A_TOPK8:
+        return PHASE1_A2A_SCATTER_TOPK8_MIXED_SHAPES
+    if suite == SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT:
+        return PHASE1_A2A_SCATTER_TOPK8_PREFLIGHT_SHAPES
     raise ValueError(f"Unsupported Layer 1 A2A scatter suite: {suite}")
 
 
 def load_layer1_a2a_metadata_suite_shapes(
     suite: str,
 ) -> tuple[layer1_a2a_scatter.A2AMetadataShape, ...]:
-    if suite == SUITE_V7X32_BF16_A2A_TOPK8_V1:
+    if suite in (SUITE_V7X32_BF16_A2A_TOPK8_V1, SUITE_V7X32_BF16_A2A_TOPK8):
         return PHASE1_A2A_METADATA_TOPK8_SHAPES
-    if suite == SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT_V1:
+    if suite in (
+        SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT_V1,
+        SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT,
+    ):
         return PHASE1_A2A_METADATA_TOPK8_PREFLIGHT_SHAPES
     raise ValueError(f"Unsupported Layer 1 A2A metadata suite: {suite}")
 
@@ -823,11 +846,14 @@ def _layer1_weight_tile_dma_rows(
 
 
 def _layer1_a2a_metadata_rows(
-    suite: str, execution_mode: str, runtime: dict[str, Any]
+    suite: str,
+    execution_mode: str,
+    runtime: dict[str, Any],
+    bf_values: tuple[int, ...] | None = None,
 ) -> list[dict[str, Any]]:
     return layer1_a2a_scatter.build_metadata_rows(
         suite=suite,
-        shapes=load_layer1_a2a_metadata_suite_shapes(suite),
+        shapes=_filter_shapes_by_bf(load_layer1_a2a_metadata_suite_shapes(suite), bf_values),
         execution_mode=execution_mode,
         runtime=runtime,
         dtype=DTYPE,
@@ -838,12 +864,34 @@ def _layer1_a2a_metadata_rows(
     )
 
 
+def _layer1_a2a_metadata_full_rows(
+    suite: str,
+    execution_mode: str,
+    runtime: dict[str, Any],
+    bf_values: tuple[int, ...] | None = None,
+) -> list[dict[str, Any]]:
+    return layer1_a2a_scatter.build_metadata_full_rows(
+        suite=suite,
+        shapes=_filter_shapes_by_bf(load_layer1_a2a_metadata_suite_shapes(suite), bf_values),
+        execution_mode=execution_mode,
+        runtime=runtime,
+        dtype=DTYPE,
+        weight_dtype=WEIGHT_DTYPE,
+        t_packing=T_PACKING,
+        source=_source(),
+        metadata=_suite_metadata(matrix_kind="a2a_metadata_full_topk8"),
+    )
+
+
 def _layer1_a2a_scatter_rows(
-    suite: str, execution_mode: str, runtime: dict[str, Any]
+    suite: str,
+    execution_mode: str,
+    runtime: dict[str, Any],
+    bf_values: tuple[int, ...] | None = None,
 ) -> list[dict[str, Any]]:
     return layer1_a2a_scatter.build_rows(
         suite=suite,
-        shapes=load_layer1_a2a_scatter_suite_shapes(suite),
+        shapes=_filter_shapes_by_bf(load_layer1_a2a_scatter_suite_shapes(suite), bf_values),
         execution_mode=execution_mode,
         runtime=runtime,
         dtype=DTYPE,
@@ -994,9 +1042,11 @@ def build_rows(
     if scenario == SCENARIO_LAYER0_A2A_ENVELOPE:
         return _layer0_a2a_envelope_rows(suite, resolved_mode, runtime)
     if scenario == SCENARIO_LAYER1_A2A_METADATA:
-        return _layer1_a2a_metadata_rows(suite, resolved_mode, runtime)
+        return _layer1_a2a_metadata_rows(suite, resolved_mode, runtime, bf_values)
+    if scenario == SCENARIO_LAYER1_A2A_METADATA_FULL:
+        return _layer1_a2a_metadata_full_rows(suite, resolved_mode, runtime, bf_values)
     if scenario == SCENARIO_LAYER1_A2A_SCATTER:
-        return _layer1_a2a_scatter_rows(suite, resolved_mode, runtime)
+        return _layer1_a2a_scatter_rows(suite, resolved_mode, runtime, bf_values)
     if scenario == SCENARIO_LAYER1_A2A_GATHER:
         return _layer1_a2a_gather_rows(suite, resolved_mode, runtime, bf_values)
     if scenario == SCENARIO_LAYER1_WEIGHT_TILE_DMA:
