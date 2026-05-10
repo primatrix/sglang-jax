@@ -1066,6 +1066,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also print emitted JSON rows to stdout.",
     )
+    parser.add_argument(
+        "--require-measured",
+        action="store_true",
+        help="Fail the process unless every emitted row has measured latency samples.",
+    )
     return parser.parse_args()
 
 
@@ -1089,6 +1094,25 @@ def main() -> None:
         args.execution_mode,
         _parse_bf_values(args.bf_values),
     )
+    if args.require_measured:
+        bad_rows = [
+            {
+                "scenario": row.get("scenario"),
+                "suite": row.get("suite"),
+                "path": row.get("path"),
+                "path_class": row.get("path_class"),
+                "bf": row.get("bf"),
+                "status": row.get("status"),
+                "sample_count": len(row.get("latency_ms_samples") or []),
+            }
+            for row in rows
+            if row.get("status") != "measured" or not row.get("latency_ms_samples")
+        ]
+        if not rows or bad_rows:
+            raise RuntimeError(
+                "Calibration run did not produce measured rows: "
+                + json.dumps(bad_rows, sort_keys=True)
+            )
     write_jsonl(args.output, rows)
     if args.print:
         for row in rows:
