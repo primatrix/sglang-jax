@@ -1366,6 +1366,8 @@ def _pallas_a2a_scatter_call(
         scratch_ref,
         out_ref,
         topk_ids_vmem,
+        starts_vmem,
+        sizes_vmem,
         starts_smem,
         sizes_smem,
         offsets_smem,
@@ -1408,18 +1410,32 @@ def _pallas_a2a_scatter_call(
         topk_copy.wait()
         starts_copy = pltpu.make_async_copy(
             src_ref=starts_ref.at[0, pl.ds(0, PADDED_NUM_EXPERTS)],
-            dst_ref=starts_smem.at[pl.ds(0, PADDED_NUM_EXPERTS)],
+            dst_ref=starts_vmem.at[pl.ds(0, PADDED_NUM_EXPERTS)],
             sem=metadata_sem,
         )
         sizes_copy = pltpu.make_async_copy(
             src_ref=sizes_ref.at[pl.ds(0, PADDED_NUM_EXPERTS)],
-            dst_ref=sizes_smem.at[pl.ds(0, PADDED_NUM_EXPERTS)],
+            dst_ref=sizes_vmem.at[pl.ds(0, PADDED_NUM_EXPERTS)],
             sem=metadata_sem,
         )
         starts_copy.start()
         sizes_copy.start()
         starts_copy.wait()
         sizes_copy.wait()
+        starts_to_smem = pltpu.async_copy(
+            src_ref=starts_vmem,
+            dst_ref=starts_smem,
+            sem=metadata_sem,
+        )
+        sizes_to_smem = pltpu.async_copy(
+            src_ref=sizes_vmem,
+            dst_ref=sizes_smem,
+            sem=metadata_sem,
+        )
+        starts_to_smem.start()
+        sizes_to_smem.start()
+        starts_to_smem.wait()
+        sizes_to_smem.wait()
         for e_id in range(PADDED_NUM_EXPERTS):
             offsets_smem[e_id] = jnp.int32(0)
         for slot in range(shape.local_num_experts):
@@ -1515,6 +1531,8 @@ def _pallas_a2a_scatter_call(
             grid=(1,),
             scratch_shapes=[
                 pltpu.VMEM((shape.bt, PADDED_TOP_K), topk_ids_hbm.dtype),
+                pltpu.VMEM((PADDED_NUM_EXPERTS,), topk_ids_hbm.dtype),
+                pltpu.VMEM((PADDED_NUM_EXPERTS,), topk_ids_hbm.dtype),
                 pltpu.SMEM((PADDED_NUM_EXPERTS,), topk_ids_hbm.dtype),
                 pltpu.SMEM((PADDED_NUM_EXPERTS,), topk_ids_hbm.dtype),
                 pltpu.SMEM((PADDED_NUM_EXPERTS,), topk_ids_hbm.dtype),
