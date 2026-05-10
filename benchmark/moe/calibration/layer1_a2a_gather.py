@@ -19,10 +19,18 @@ SCENARIO_LAYER1_A2A_GATHER = "layer1_a2a_gather"
 STATUS_MEASURED = "measured"
 STATUS_NOT_IMPLEMENTED = "not_implemented"
 
+
+def _dtype_bytes(dtype: str) -> int:
+    if dtype in ("bfloat16", "float16"):
+        return 2
+    if dtype in ("float32", "int32"):
+        return 4
+    raise ValueError(f"Unsupported dtype for byte accounting: {dtype}")
+
+
 DTYPE = "bfloat16"
 WEIGHT_DTYPE = "bfloat16"
-BF16_BYTES = 2
-T_PACKING = 2
+T_PACKING = 32 // (_dtype_bytes(DTYPE) * 8)
 HIDDEN_SIZE = 8192
 TOP_K = 8
 EP_SIZE = 32
@@ -231,7 +239,7 @@ def _metadata_for_shape(metadata: dict[str, Any], shape: A2AGatherShape) -> dict
         "remote_copies_per_device": _remote_copy_count_per_device(shape),
         "remote_tokens_per_device": shape.bt * shape.top_k,
         "tokens_per_remote_copy": shape.bt,
-        "remote_payload_bytes_per_copy": shape.hidden_size * BF16_BYTES,
+        "remote_payload_bytes_per_copy": shape.hidden_size * _dtype_bytes(DTYPE),
         "remote_payload_bytes_per_device": _payload_bytes_per_device(shape),
         "copy_granularity": "bulk_per_local_expert",
         "source_layout": "a2a_s_acc[local_expert, token, t_packing, hidden/t_packing]",
@@ -422,6 +430,7 @@ def _pallas_a2a_gather_call(expert_outputs_hbm, gathered_hbm, *, shape, jax, pl,
         from jax import lax
 
         rank = lax.axis_index("tensor")
+        local_num_experts_i32 = shape.local_num_experts
 
         def get_mesh_device_id(ep_rank):
             return (0, ep_rank)
@@ -435,36 +444,70 @@ def _pallas_a2a_gather_call(expert_outputs_hbm, gathered_hbm, *, shape, jax, pl,
         pltpu.semaphore_wait(barrier_sem, shape.ep_size)
 
         def start_one(local_e_id, _):
+            # Mirror fused_moe.start_a2a_gather: iterate over all possible
+            # receivers and derive a dynamic size/start from d2e_count. The
+            # ring pattern has exactly one nonzero remote destination per
+            # local expert, but using dynamic remote_sz exercises the same DMA
+            # lowering shape as the production kernel.
             source_rank = (rank + shape.ep_size - local_e_id - 1) % shape.ep_size
-            global_e_id = rank * shape.local_num_experts + local_e_id
-            pltpu.make_async_remote_copy(
-                src_ref=expert_outputs_ref.at[pl.ds(local_e_id, 1), pl.ds(0, shape.bt)],
-                dst_ref=gathered_ref.at[pl.ds(global_e_id, 1), pl.ds(0, shape.bt)],
-                send_sem=send_sems.at[local_e_id],
-                recv_sem=gather_sem,
-                device_id=get_mesh_device_id(source_rank),
-                device_id_type=pltpu.DeviceIdType.MESH,
-            ).start()
+            global_e_id = rank * local_num_experts_i32 + local_e_id
+            start = 0
+
+            for recv_id in range(shape.ep_size):
+                sz = lax.select(recv_id == source_rank, shape.bt, 0)
+                remote_sz = sz
+
+                @pl.when(remote_sz != 0)
+                def _remote_copy(
+                    start=start,
+                    remote_sz=remote_sz,
+                    global_e_id=global_e_id,
+                    local_e_id=local_e_id,
+                    recv_id=recv_id,
+                ):
+                    pltpu.make_async_remote_copy(
+                        src_ref=expert_outputs_ref.at[local_e_id, pl.ds(start, remote_sz)],
+                        dst_ref=gathered_ref.at[global_e_id, pl.ds(0, remote_sz)],
+                        send_sem=send_sems.at[local_e_id],
+                        recv_sem=gather_sem,
+                        device_id=get_mesh_device_id(recv_id),
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).start()
+
+                start += sz
             return None
 
         lax.fori_loop(0, shape.top_k, start_one, None, unroll=False)
 
         def wait_send_one(local_e_id, _):
-            ref = expert_outputs_ref.at[pl.ds(local_e_id, 1), pl.ds(0, shape.bt)]
-            pltpu.make_async_copy(
-                src_ref=ref,
-                dst_ref=ref,
-                sem=send_sems.at[local_e_id],
-            ).wait()
+            source_rank = (rank + shape.ep_size - local_e_id - 1) % shape.ep_size
+            remote_sz = 0
+            for recv_id in range(shape.ep_size):
+                remote_sz += lax.select(recv_id == source_rank, shape.bt, 0)
+
+            @pl.when(remote_sz != 0)
+            def _():
+                ref = expert_outputs_ref.at[local_e_id, pl.ds(0, remote_sz)]
+                pltpu.make_async_copy(
+                    src_ref=ref,
+                    dst_ref=ref,
+                    sem=send_sems.at[local_e_id],
+                ).wait()
+
             return None
 
         lax.fori_loop(0, shape.top_k, wait_send_one, None, unroll=False)
 
         def wait_recv_one(k_id, _):
             recv_rank = (rank + k_id + 1) % shape.ep_size
-            global_e_id = recv_rank * shape.local_num_experts + k_id
-            ref = gathered_ref.at[pl.ds(global_e_id, 1), pl.ds(0, shape.bt)]
-            pltpu.make_async_copy(src_ref=ref, dst_ref=ref, sem=gather_sem).wait()
+            global_e_id = recv_rank * local_num_experts_i32 + k_id
+            sz = lax.select(k_id >= 0, shape.bt, 0)
+
+            @pl.when(sz != 0)
+            def _():
+                ref = gathered_ref.at[global_e_id, pl.ds(0, sz)]
+                pltpu.make_async_copy(src_ref=ref, dst_ref=ref, sem=gather_sem).wait()
+
             return None
 
         lax.fori_loop(0, shape.top_k, wait_recv_one, None, unroll=False)
@@ -531,7 +574,7 @@ def _build_tensor_mesh(*, jax: Any, np: Any, ep_size: int, tp_size: int):
 
 
 def _payload_bytes_per_device(shape: A2AGatherShape) -> int:
-    return shape.bt * shape.top_k * shape.hidden_size * BF16_BYTES
+    return shape.bt * shape.top_k * shape.hidden_size * _dtype_bytes(DTYPE)
 
 
 def _remote_copy_count_per_device(shape: A2AGatherShape) -> int:
