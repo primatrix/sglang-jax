@@ -701,6 +701,87 @@ def select_block_configs(
     return selected
 
 
+def _config_tuple(cfg: FusedMoEBlockConfig) -> tuple[int, ...]:
+    return (
+        cfg.bt,
+        cfg.bf,
+        cfg.bd1,
+        cfg.bd2,
+        cfg.bts if cfg.bts is not None else cfg.bt,
+        cfg.btc,
+        cfg.bfc,
+        cfg.bd1c,
+        cfg.bd2c,
+        cfg.bse,
+    )
+
+
+def _config_metadata(cfg: FusedMoEBlockConfig | None) -> dict[str, int] | None:
+    return None if cfg is None else cfg.as_kwargs()
+
+
+def _resolve_tuned_block_config(
+    *,
+    case: MoEBenchmarkCase,
+    dtype: jnp.dtype,
+    weight_dtype: jnp.dtype,
+    use_shared_expert: bool,
+    use_grouped_topk: bool,
+    mesh_ep: int,
+    quant_block_k: int | None,
+) -> tuple[FusedMoEBlockConfig, dict[str, object]]:
+    from sgl_jax.srt.kernels.fused_moe.v1.tuned_block_configs import (
+        TUNED_BLOCK_CONFIGS,
+        get_simplified_key,
+        get_tuned_fused_moe_block_config,
+    )
+
+    key = get_simplified_key(
+        dtype=dtype,
+        weight_dtype=weight_dtype,
+        num_tokens=case.num_tokens,
+        num_experts=case.num_experts,
+        top_k=case.top_k,
+        hidden_size=case.hidden_size,
+        intermediate_size=case.intermediate_size,
+        ep_size=mesh_ep,
+        use_shared_expert=use_shared_expert,
+        use_grouped_topk=use_grouped_topk,
+    )
+    device_name = key[0]
+    table_key = key[1:]
+    table_hit = table_key in TUNED_BLOCK_CONFIGS.get(
+        device_name, {}
+    ) or table_key in TUNED_BLOCK_CONFIGS.get("*", {})
+    raw_cfg = get_tuned_fused_moe_block_config(
+        num_tokens=case.num_tokens,
+        num_experts=case.num_experts,
+        top_k=case.top_k,
+        hidden_size=case.hidden_size,
+        intermediate_size=case.intermediate_size,
+        dtype=dtype,
+        weight_dtype=weight_dtype,
+        ep_size=mesh_ep,
+        use_shared_expert=use_shared_expert,
+        use_grouped_topk=use_grouped_topk,
+    )
+    effective_cfg = raw_cfg.effective_for(
+        num_tokens=case.num_tokens,
+        ep_size=mesh_ep,
+        dtype=dtype,
+        quant_block_k=quant_block_k,
+    )
+    return effective_cfg, {
+        "device_name": device_name,
+        "table_key": list(table_key),
+        "table_hit": table_hit,
+        "raw_config": _config_metadata(raw_cfg),
+        "effective_config": _config_metadata(effective_cfg),
+        "raw_config_tuple": list(_config_tuple(raw_cfg)),
+        "effective_config_tuple": list(_config_tuple(effective_cfg)),
+    }
+
+
 def run_all(
     iters: int,
     dtype: jnp.dtype = jnp.bfloat16,
@@ -781,10 +862,16 @@ def run_all(
         print("No runnable fused_moe cases after filtering tp_size!=1.")
         return [] if return_results else None
 
-    tuned_results: dict[str, dict[tuple, tuple[int, int, int, int, int, int, int, int, int]]] = {}
+    tuned_results: dict[str, dict[tuple, tuple[int, ...]]] = {}
     if tune_block_config:
         from sgl_jax.srt.utils.jax_utils import get_device_name
     results: list[dict[str, object]] = []
+    block_config_mode = os.getenv("FUSED_MOE_BENCHMARK_BLOCK_CONFIG_MODE", "runtime_tuned")
+    if block_config_mode not in ("runtime_tuned", "none", "explicit_tuned"):
+        raise ValueError(
+            "FUSED_MOE_BENCHMARK_BLOCK_CONFIG_MODE must be one of "
+            "'runtime_tuned', 'none', or 'explicit_tuned'."
+        )
 
     print(f"Running fused_moe benchmarks with weight_dtype={weight_dtype}")
     print(f"  features: shared_expert={use_shared_expert}, grouped_topk={use_grouped_topk}")
@@ -977,6 +1064,7 @@ def run_all(
                 fused_layer.quantize_weights()
 
             block_cfgs: list[FusedMoEBlockConfig | None]
+            tuned_cfg_info: dict[str, object] | None = None
             if tune_block_config:
                 case_excl_key = (
                     case.num_tokens,
@@ -1005,7 +1093,20 @@ def run_all(
                     excluded_configs=EXCLUDED_BLOCK_CONFIGS.get(case_excl_key),
                 )
             else:
-                block_cfgs = [None]
+                effective_tuned_cfg, tuned_cfg_info = _resolve_tuned_block_config(
+                    case=case,
+                    dtype=dtype,
+                    weight_dtype=weight_dtype,
+                    use_shared_expert=use_shared_expert,
+                    use_grouped_topk=use_grouped_topk,
+                    mesh_ep=mesh_ep,
+                    quant_block_k=quant_block_k,
+                )
+                print(f"  tuned lookup: {tuned_cfg_info}", flush=True)
+                if block_config_mode == "explicit_tuned":
+                    block_cfgs = [effective_tuned_cfg]
+                else:
+                    block_cfgs = [None]
 
             topk_module = TopK(
                 topk=case.top_k,
@@ -1182,7 +1283,7 @@ def run_all(
                     times = times[1:]
                 mean_ms = float(np.mean(times)) if times else float("nan")
                 print(f"     fused_moe[{tag}]: {mean_ms:.3f} ms (trace) | samples={times}")
-                if block_cfg is None:
+                if block_cfg is None or not tune_block_config:
                     default_ms = mean_ms
                     default_samples = list(times)
                 if tune_block_config and np.isfinite(mean_ms):
@@ -1238,7 +1339,8 @@ def run_all(
                     else:
                         best_ms, best_cfg = best
                 else:
-                    best_ms, best_cfg = default_ms, None
+                    best_ms = default_ms
+                    best_cfg = block_cfgs[0] if block_config_mode == "explicit_tuned" else None
                     best_samples = list(default_samples)
                 results.append(
                     {
@@ -1259,6 +1361,10 @@ def run_all(
                         "default_ms": default_ms,
                         "default_samples": list(default_samples),
                         "best_cfg": best_cfg.as_kwargs() if best_cfg is not None else None,
+                        "block_config_mode": (
+                            "candidate_sweep" if tune_block_config else block_config_mode
+                        ),
+                        "resolved_tuned_block_config": tuned_cfg_info,
                     }
                 )
 
