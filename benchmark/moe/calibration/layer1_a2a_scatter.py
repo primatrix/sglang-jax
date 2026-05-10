@@ -30,10 +30,19 @@ SCENARIO_LAYER1_A2A_METADATA_FULL = "layer1_a2a_metadata_full"
 STATUS_MEASURED = "measured"
 STATUS_NOT_IMPLEMENTED = "not_implemented"
 
+
+def _dtype_bytes(dtype: str) -> int:
+    if dtype in ("bfloat16", "float16"):
+        return 2
+    if dtype in ("float32", "int32"):
+        return 4
+    raise ValueError(f"Unsupported dtype for byte accounting: {dtype}")
+
+
 DTYPE = "bfloat16"
 WEIGHT_DTYPE = "bfloat16"
-BF16_BYTES = 2
-T_PACKING = 2
+DTYPE_BYTES = _dtype_bytes(DTYPE)
+T_PACKING = 32 // (DTYPE_BYTES * 8)
 HIDDEN_SIZE = 8192
 H_PER_T_PACKING = HIDDEN_SIZE // T_PACKING
 TOP_K = 8
@@ -55,6 +64,8 @@ class A2AScatterShape:
     path_class: str
     bt: int
     local_routes_per_token: int = 0
+    routing_mode: str = "fixed_local"
+    routing_seed: int = 17
     top_k: int = TOP_K
     hidden_size: int = HIDDEN_SIZE
     ep_size: int = EP_SIZE
@@ -558,6 +569,7 @@ def _make_row(
 
 
 def _metadata_for_shape(metadata: dict[str, Any], shape: A2AScatterShape) -> dict[str, Any]:
+    routing_stats = _routing_stats(shape)
     enriched = dict(metadata)
     enriched["a2a_scatter"] = {
         "kernel_reference": "python/sgl_jax/srt/kernels/fused_moe/v1/kernel.py:start_a2a_scatter_batch",
@@ -572,32 +584,40 @@ def _metadata_for_shape(metadata: dict[str, Any], shape: A2AScatterShape) -> dic
         "ep_size": shape.ep_size,
         "local_num_experts": shape.local_num_experts,
         "num_experts": shape.ep_size * shape.local_num_experts,
-        "routing_pattern": "e_id=(rank+k+1)%ep_size*local_num_experts+k",
-        "local_routes_per_token": shape.local_routes_per_token,
-        "local_routes_probability_uniform_topk": _local_routes_probability(shape),
-        "expected_local_routes_per_token_uniform_topk": shape.top_k
-        * shape.local_num_experts
-        / (shape.ep_size * shape.local_num_experts),
-        "locality_model": (
-            "stratified_fixed_local_routes; combine local0/local1/local2/... rows "
-            "with the hypergeometric probabilities for uniform top-k over all experts"
+        "routing_mode": shape.routing_mode,
+        "routing_seed": (shape.routing_seed if shape.routing_mode == "uniform_topk" else None),
+        "routing_pattern": (
+            "seeded uniform top-k without replacement over all experts"
+            if shape.routing_mode == "uniform_topk"
+            else "e_id=(rank+k+1)%ep_size*local_num_experts+k"
         ),
+        "local_routes_per_token": shape.local_routes_per_token,
         "topk_id_layout": "HBM rows are padded to 128 columns; only first top_k entries route payloads.",
         "scratch_token_capacity": _scratch_token_capacity(shape),
-        "local_copies_per_device": shape.bt * shape.local_routes_per_token,
-        "remote_copies_per_device": _remote_scatter_copies_per_device(shape),
-        "remote_payload_bytes_per_copy": shape.hidden_size * BF16_BYTES,
-        "local_payload_bytes_per_device": _local_scatter_bytes_per_device(shape),
-        "remote_payload_bytes_per_device": _remote_scatter_bytes_per_device(shape),
+        "local_copies_per_device": routing_stats["local_copies_per_device"],
+        "remote_copies_per_device": routing_stats["remote_copies_per_device"],
+        "remote_payload_bytes_per_copy": shape.hidden_size * DTYPE_BYTES,
+        "local_payload_bytes_per_device": routing_stats["local_payload_bytes_per_device"],
+        "remote_payload_bytes_per_device": routing_stats["remote_payload_bytes_per_device"],
         "payload_bytes_per_device": _payload_bytes_per_device(shape),
-        "destination_layout": "scratch[topk_slot, source_rank*bt + token_id, t_packing, hidden/t_packing]",
+        "nonzero_send_peers_per_device": routing_stats["nonzero_send_peers_per_device"],
+        "nonzero_recv_peers_per_device": routing_stats["nonzero_recv_peers_per_device"],
+        "local_routes_histogram": routing_stats["local_routes_histogram"],
+        "expert_token_count_max": routing_stats["expert_token_count_max"],
+        "expert_token_count_nonzero": routing_stats["expert_token_count_nonzero"],
+        "destination_layout": "scratch[local_expert_slot, expert_start + offset, t_packing, hidden/t_packing]",
         "traffic_class": (
-            "remote_dma_scatter_payload_only"
-            if shape.local_routes_per_token == 0
-            else "mixed_local_remote_scatter_payload"
+            "realistic_uniform_topk_scatter_payload"
+            if shape.routing_mode == "uniform_topk"
+            else (
+                "remote_dma_scatter_payload_only"
+                if shape.local_routes_per_token == 0
+                else "mixed_local_remote_scatter_payload"
+            )
         ),
         "includes": [
-            "topk_ids_hbm_to_vmem",
+            "precomputed_t2e_routing_hbm_to_vmem",
+            "precomputed_starts_sizes_hbm_to_vmem",
             "local_scatter_start",
             "remote_scatter_start",
             "send_wait",
@@ -820,13 +840,17 @@ def _measure_a2a_scatter_ms(
     token_sharding = NamedSharding(mesh, P("tensor", None, None))
     topk_sharding = NamedSharding(mesh, P("tensor", None))
     scratch_sharding = NamedSharding(mesh, P())
+    starts_sharding = NamedSharding(mesh, P("tensor", None))
+    sizes_sharding = NamedSharding(mesh, P())
 
     tokens = _make_tokens(jax=jax, np=np, sharding=token_sharding, shape=shape)
     topk_ids = _make_topk_ids(jax=jax, np=np, sharding=topk_sharding, shape=shape)
+    starts = _make_starts_by_rank(jax=jax, np=np, sharding=starts_sharding, shape=shape)
+    sizes = _make_sizes(jax=jax, np=np, sharding=sizes_sharding, shape=shape)
     scratch = jax.device_put(
         jnp.zeros(
             (
-                shape.top_k,
+                shape.local_num_experts,
                 _scratch_token_capacity(shape),
                 T_PACKING,
                 shape.hidden_size // T_PACKING,
@@ -835,15 +859,17 @@ def _measure_a2a_scatter_ms(
         ),
         scratch_sharding,
     )
-    jax.block_until_ready((tokens, topk_ids, scratch))
+    jax.block_until_ready((tokens, topk_ids, starts, sizes, scratch))
 
     with jax.set_mesh(mesh):
 
         @jax.jit
-        def run_scatter(tokens_hbm, topk_ids_hbm, scratch_hbm):
+        def run_scatter(tokens_hbm, topk_ids_hbm, starts_hbm, sizes_hbm, scratch_hbm):
             return _sharded_scatter_call(
                 tokens_hbm,
                 topk_ids_hbm,
+                starts_hbm,
+                sizes_hbm,
                 scratch_hbm,
                 shape=shape,
                 mesh=mesh,
@@ -854,11 +880,11 @@ def _measure_a2a_scatter_ms(
                 P=P,
             )
 
-        jax.block_until_ready(run_scatter(tokens, topk_ids, scratch))
+        jax.block_until_ready(run_scatter(tokens, topk_ids, starts, sizes, scratch))
         task = f"layer1_a2a_scatter_topk8_bt{shape.bt}_{shape.path_class}"
         return multiple_iteration_timeit_from_trace(
             compute_func=run_scatter,
-            data_generator=lambda: (tokens, topk_ids, scratch),
+            data_generator=lambda: (tokens, topk_ids, starts, sizes, scratch),
             task=task,
             tries=sample_runs,
             warmup=warmup_runs,
@@ -870,6 +896,8 @@ def _measure_a2a_scatter_ms(
 def _sharded_scatter_call(
     tokens_hbm,
     topk_ids_hbm,
+    starts_hbm,
+    sizes_hbm,
     scratch_hbm,
     *,
     shape: A2AScatterShape,
@@ -882,14 +910,22 @@ def _sharded_scatter_call(
 ):
     @jax.shard_map(
         mesh=mesh,
-        in_specs=(P("tensor", None, None), P("tensor", None), P()),
+        in_specs=(
+            P("tensor", None, None),
+            P("tensor", None),
+            P("tensor", None),
+            P(),
+            P(),
+        ),
         out_specs=P("tensor"),
         check_vma=False,
     )
-    def per_rank(tokens_local, topk_ids_local, scratch_replicated):
+    def per_rank(tokens_local, topk_ids_local, starts_local, sizes_replicated, scratch_replicated):
         return _pallas_a2a_scatter_call(
             tokens_local,
             topk_ids_local,
+            starts_local,
+            sizes_replicated,
             scratch_replicated,
             shape=shape,
             jax=jax,
@@ -898,7 +934,7 @@ def _sharded_scatter_call(
             pltpu=pltpu,
         )
 
-    return per_rank(tokens_hbm, topk_ids_hbm, scratch_hbm)
+    return per_rank(tokens_hbm, topk_ids_hbm, starts_hbm, sizes_hbm, scratch_hbm)
 
 
 def _measure_a2a_metadata_ms(
@@ -1309,14 +1345,33 @@ def _pallas_a2a_metadata_full_call(local_counts_hbm, topk_ids_hbm, *, shape, jax
     )(local_counts_hbm, topk_ids_hbm)
 
 
-def _pallas_a2a_scatter_call(tokens_hbm, topk_ids_hbm, scratch_hbm, *, shape, jax, jnp, pl, pltpu):
+def _pallas_a2a_scatter_call(
+    tokens_hbm,
+    topk_ids_hbm,
+    starts_hbm,
+    sizes_hbm,
+    scratch_hbm,
+    *,
+    shape,
+    jax,
+    jnp,
+    pl,
+    pltpu,
+):
     def kernel(
         tokens_ref,
         topk_ids_ref,
+        starts_ref,
+        sizes_ref,
         scratch_ref,
         out_ref,
         topk_ids_vmem,
+        starts_vmem,
+        sizes_vmem,
+        offsets_vmem,
+        send_counts_vmem,
         topk_sem,
+        metadata_sem,
         send_sems,
         recv_sems,
         barrier_sem,
@@ -1351,54 +1406,96 @@ def _pallas_a2a_scatter_call(tokens_hbm, topk_ids_hbm, scratch_hbm, *, shape, ja
         )
         topk_copy.start()
         topk_copy.wait()
+        starts_copy = pltpu.make_async_copy(
+            src_ref=starts_ref.at[0, pl.ds(0, PADDED_NUM_EXPERTS)],
+            dst_ref=starts_vmem.at[pl.ds(0, PADDED_NUM_EXPERTS)],
+            sem=metadata_sem,
+        )
+        sizes_copy = pltpu.make_async_copy(
+            src_ref=sizes_ref.at[pl.ds(0, PADDED_NUM_EXPERTS)],
+            dst_ref=sizes_vmem.at[pl.ds(0, PADDED_NUM_EXPERTS)],
+            sem=metadata_sem,
+        )
+        starts_copy.start()
+        sizes_copy.start()
+        starts_copy.wait()
+        sizes_copy.wait()
+        offsets_vmem[...] = jnp.zeros_like(offsets_vmem)
+        send_counts_vmem[...] = jnp.zeros_like(send_counts_vmem)
 
         def scatter_one(t_id, _):
             for k_id in range(shape.top_k):
                 e_id = topk_ids_vmem[t_id, k_id]
-                recv_id = e_id // shape.local_num_experts
-                e_sem_id = e_id % shape.local_num_experts
-                dst_start = rank * shape.bt + t_id
-                if k_id < shape.local_routes_per_token:
+                is_valid = e_id >= 0
+                e_id_safe = jnp.where(is_valid, e_id, jnp.int32(0))
+                recv_id = e_id_safe // shape.local_num_experts
+                e_sem_id = e_id_safe % shape.local_num_experts
+                offset = offsets_vmem[e_id_safe]
+                offsets_vmem[e_id_safe] = offset + jnp.where(is_valid, jnp.int32(1), jnp.int32(0))
+                dst_start = starts_vmem[e_id_safe] + offset
+                is_local = recv_id == rank
+                local_sz = jnp.where(is_valid & is_local, jnp.int32(1), jnp.int32(0))
+                remote_sz = jnp.where(is_valid & ~is_local, jnp.int32(1), jnp.int32(0))
+                send_counts_vmem[e_sem_id] = send_counts_vmem[e_sem_id] + remote_sz
+
+                @pl.when(local_sz != 0)
+                def _local_copy(e_sem_id=e_sem_id, dst_start=dst_start, local_sz=local_sz):
                     pltpu.make_async_copy(
-                        src_ref=tokens_ref.at[pl.ds(t_id, 1)],
-                        dst_ref=scratch_ref.at[e_sem_id, pl.ds(dst_start, 1)],
+                        src_ref=tokens_ref.at[pl.ds(t_id, local_sz)],
+                        dst_ref=scratch_ref.at[e_sem_id, pl.ds(dst_start, local_sz)],
                         sem=recv_sems.at[e_sem_id],
                     ).start()
-                else:
+
+                @pl.when(remote_sz != 0)
+                def _remote_copy(
+                    recv_id=recv_id,
+                    e_sem_id=e_sem_id,
+                    dst_start=dst_start,
+                    remote_sz=remote_sz,
+                ):
                     pltpu.make_async_remote_copy(
-                        src_ref=tokens_ref.at[pl.ds(t_id, 1)],
-                        dst_ref=scratch_ref.at[e_sem_id, pl.ds(dst_start, 1)],
+                        src_ref=tokens_ref.at[pl.ds(t_id, remote_sz)],
+                        dst_ref=scratch_ref.at[e_sem_id, pl.ds(dst_start, remote_sz)],
                         send_sem=send_sems.at[e_sem_id],
                         recv_sem=recv_sems.at[e_sem_id],
                         device_id=get_mesh_device_id(recv_id),
                         device_id_type=pltpu.DeviceIdType.MESH,
                     ).start()
+
             return None
 
         from jax import lax
 
         lax.fori_loop(0, shape.bt, scatter_one, None, unroll=False)
 
-        for k_id in range(shape.top_k):
-            if k_id >= shape.local_routes_per_token:
-                send_ref = scratch_ref.at[k_id, pl.ds(0, shape.bt)]
+        def wait_send_one(slot, _):
+            scatter_send_sz = send_counts_vmem[slot]
+
+            @pl.when(scatter_send_sz != 0)
+            def _():
+                ref = scratch_ref.at[slot, pl.ds(0, scatter_send_sz)]
+                pltpu.make_async_copy(src_ref=ref, dst_ref=ref, sem=send_sems.at[slot]).wait()
+
+            return None
+
+        lax.fori_loop(0, shape.local_num_experts, wait_send_one, None, unroll=False)
+
+        def wait_recv_one(local_e_id, _):
+            e_id = rank * shape.local_num_experts + local_e_id
+            recv_sz = sizes_vmem[e_id]
+
+            @pl.when(recv_sz != 0)
+            def _():
+                ref = scratch_ref.at[local_e_id, pl.ds(0, recv_sz)]
                 pltpu.make_async_copy(
-                    src_ref=send_ref,
-                    dst_ref=send_ref,
-                    sem=send_sems.at[k_id],
+                    src_ref=ref,
+                    dst_ref=ref,
+                    sem=recv_sems.at[local_e_id],
                 ).wait()
 
-            if k_id < shape.local_routes_per_token:
-                source_rank = rank
-            else:
-                remote_offset = k_id - shape.local_routes_per_token
-                source_rank = (rank + shape.ep_size - remote_offset - 1) % shape.ep_size
-            recv_ref = scratch_ref.at[k_id, pl.ds(source_rank * shape.bt, shape.bt)]
-            pltpu.make_async_copy(
-                src_ref=recv_ref,
-                dst_ref=recv_ref,
-                sem=recv_sems.at[k_id],
-            ).wait()
+            return None
+
+        lax.fori_loop(0, shape.local_num_experts, wait_recv_one, None, unroll=False)
 
     return pl.pallas_call(
         kernel,
@@ -1409,11 +1506,18 @@ def _pallas_a2a_scatter_call(tokens_hbm, topk_ids_hbm, scratch_hbm, *, shape, ja
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
             ],
             out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
             grid=(1,),
             scratch_shapes=[
                 pltpu.VMEM((shape.bt, PADDED_TOP_K), topk_ids_hbm.dtype),
+                pltpu.VMEM((PADDED_NUM_EXPERTS,), topk_ids_hbm.dtype),
+                pltpu.VMEM((PADDED_NUM_EXPERTS,), topk_ids_hbm.dtype),
+                pltpu.VMEM((PADDED_NUM_EXPERTS,), topk_ids_hbm.dtype),
+                pltpu.VMEM((shape.local_num_experts,), topk_ids_hbm.dtype),
+                pltpu.SemaphoreType.DMA,
                 pltpu.SemaphoreType.DMA,
                 pltpu.SemaphoreType.DMA((shape.local_num_experts,)),
                 pltpu.SemaphoreType.DMA((shape.local_num_experts,)),
@@ -1427,7 +1531,7 @@ def _pallas_a2a_scatter_call(tokens_hbm, topk_ids_hbm, scratch_hbm, *, shape, ja
             vmem_limit_bytes=VMEM_LIMIT_BYTES,
         ),
         name=f"layer1_a2a_scatter_topk8_bt{shape.bt}",
-    )(tokens_hbm, topk_ids_hbm, scratch_hbm)
+    )(tokens_hbm, topk_ids_hbm, starts_hbm, sizes_hbm, scratch_hbm)
 
 
 def _make_tokens(*, jax: Any, np: Any, sharding: Any, shape: A2AScatterShape):
@@ -1459,16 +1563,75 @@ def _make_topk_ids(*, jax: Any, np: Any, sharding: Any, shape: A2AScatterShape):
         rank_id = start // shape.bt
         local_rows = stop - start
         out = np.full((local_rows, PADDED_TOP_K), -1, dtype=np.int32)
-        for k_id in range(shape.top_k):
-            if k_id < shape.local_routes_per_token:
-                recv_id = rank_id
-            else:
-                remote_offset = k_id - shape.local_routes_per_token
-                recv_id = (rank_id + remote_offset + 1) % shape.ep_size
-            out[:, k_id] = recv_id * shape.local_num_experts + k_id
+        for local_row, global_token_id in enumerate(range(start, stop)):
+            out[local_row, : shape.top_k] = _topk_ids_for_token(
+                np=np,
+                global_token_id=global_token_id,
+                rank_id=rank_id,
+                shape=shape,
+            )
         return out
 
     return jax.make_array_from_callback(global_shape, sharding, data_callback)
+
+
+def _make_starts_by_rank(*, jax: Any, np: Any, sharding: Any, shape: A2AScatterShape):
+    counts = _counts_by_rank(np=np, shape=shape)
+    starts = np.zeros((shape.ep_size, PADDED_NUM_EXPERTS), dtype=np.int32)
+    running = np.zeros((PADDED_NUM_EXPERTS,), dtype=np.int32)
+    for rank_id in range(shape.ep_size):
+        starts[rank_id] = running
+        running = running + counts[rank_id]
+    return jax.make_array_from_callback(
+        starts.shape,
+        sharding,
+        lambda index: starts[index],
+    )
+
+
+def _make_sizes(*, jax: Any, np: Any, sharding: Any, shape: A2AScatterShape):
+    sizes = _counts_by_rank(np=np, shape=shape).sum(axis=0).astype(np.int32)
+    return jax.make_array_from_callback(
+        sizes.shape,
+        sharding,
+        lambda index: sizes[index],
+    )
+
+
+def _topk_ids_for_token(*, np: Any, global_token_id: int, rank_id: int, shape: A2AScatterShape):
+    if shape.routing_mode == "uniform_topk":
+        rng = np.random.default_rng(shape.routing_seed + int(global_token_id))
+        return rng.choice(
+            shape.ep_size * shape.local_num_experts,
+            size=shape.top_k,
+            replace=False,
+        ).astype(np.int32)
+
+    out = np.empty((shape.top_k,), dtype=np.int32)
+    for k_id in range(shape.top_k):
+        if k_id < shape.local_routes_per_token:
+            recv_id = rank_id
+        else:
+            remote_offset = k_id - shape.local_routes_per_token
+            recv_id = (rank_id + remote_offset + 1) % shape.ep_size
+        out[k_id] = recv_id * shape.local_num_experts + k_id
+    return out
+
+
+def _counts_by_rank(*, np: Any, shape: A2AScatterShape):
+    counts = np.zeros((shape.ep_size, PADDED_NUM_EXPERTS), dtype=np.int32)
+    for rank_id in range(shape.ep_size):
+        for token_id in range(shape.bt):
+            global_token_id = rank_id * shape.bt + token_id
+            topk_ids = _topk_ids_for_token(
+                np=np,
+                global_token_id=global_token_id,
+                rank_id=rank_id,
+                shape=shape,
+            )
+            for e_id in topk_ids:
+                counts[rank_id, int(e_id)] += 1
+    return counts
 
 
 def _make_local_counts(*, jax: Any, np: Any, sharding: Any, shape: A2AMetadataShape):
@@ -1519,23 +1682,27 @@ def _build_tensor_mesh(*, jax: Any, np: Any, ep_size: int, tp_size: int):
 
 
 def _payload_bytes_per_device(shape: A2AScatterShape) -> int:
-    return shape.bt * shape.top_k * shape.hidden_size * BF16_BYTES
+    return shape.bt * shape.top_k * shape.hidden_size * DTYPE_BYTES
 
 
 def _remote_scatter_copies_per_device(shape: A2AScatterShape) -> int:
+    if shape.routing_mode == "uniform_topk":
+        return int(round(_routing_stats(shape)["remote_copies_per_device"]))
     return shape.bt * max(shape.top_k - shape.local_routes_per_token, 0)
 
 
 def _local_scatter_copies_per_device(shape: A2AScatterShape) -> int:
+    if shape.routing_mode == "uniform_topk":
+        return int(round(_routing_stats(shape)["local_copies_per_device"]))
     return shape.bt * min(shape.local_routes_per_token, shape.top_k)
 
 
 def _remote_scatter_bytes_per_device(shape: A2AScatterShape) -> int:
-    return _remote_scatter_copies_per_device(shape) * shape.hidden_size * BF16_BYTES
+    return _remote_scatter_copies_per_device(shape) * shape.hidden_size * DTYPE_BYTES
 
 
 def _local_scatter_bytes_per_device(shape: A2AScatterShape) -> int:
-    return _local_scatter_copies_per_device(shape) * shape.hidden_size * BF16_BYTES
+    return _local_scatter_copies_per_device(shape) * shape.hidden_size * DTYPE_BYTES
 
 
 def _local_routes_probability(shape: A2AScatterShape) -> float:
@@ -1553,6 +1720,85 @@ def _local_routes_probability(shape: A2AScatterShape) -> float:
         * comb(remote_experts, remote_routes)
         / comb(total_experts, shape.top_k)
     )
+
+
+def _routing_stats(shape: A2AScatterShape) -> dict[str, Any]:
+    if shape.routing_mode != "uniform_topk":
+        local_copies = shape.bt * min(shape.local_routes_per_token, shape.top_k)
+        remote_copies = shape.bt * max(shape.top_k - shape.local_routes_per_token, 0)
+        return {
+            "local_copies_per_device": local_copies,
+            "remote_copies_per_device": remote_copies,
+            "local_payload_bytes_per_device": local_copies * shape.hidden_size * DTYPE_BYTES,
+            "remote_payload_bytes_per_device": remote_copies * shape.hidden_size * DTYPE_BYTES,
+            "nonzero_send_peers_per_device": (
+                0 if remote_copies == 0 else shape.top_k - shape.local_routes_per_token
+            ),
+            "nonzero_recv_peers_per_device": (
+                0 if remote_copies == 0 else shape.top_k - shape.local_routes_per_token
+            ),
+            "local_routes_histogram": {str(shape.local_routes_per_token): shape.bt},
+            "expert_token_count_max": shape.bt,
+            "expert_token_count_nonzero": shape.top_k,
+        }
+
+    import numpy as np
+
+    counts = _counts_by_rank(np=np, shape=shape)
+    local_counts = []
+    remote_counts = []
+    send_peer_counts = []
+    recv_peer_counts = []
+    local_routes_histogram: dict[int, int] = {}
+
+    for rank_id in range(shape.ep_size):
+        local = 0
+        remote = 0
+        send_peers = set()
+        recv_peers = set()
+        for token_id in range(shape.bt):
+            global_token_id = rank_id * shape.bt + token_id
+            topk_ids = _topk_ids_for_token(
+                np=np,
+                global_token_id=global_token_id,
+                rank_id=rank_id,
+                shape=shape,
+            )
+            token_local = 0
+            for e_id in topk_ids:
+                recv_id = int(e_id) // shape.local_num_experts
+                if recv_id == rank_id:
+                    local += 1
+                    token_local += 1
+                else:
+                    remote += 1
+                    send_peers.add(recv_id)
+            local_routes_histogram[token_local] = local_routes_histogram.get(token_local, 0) + 1
+        for peer_id in range(shape.ep_size):
+            local_expert_start = rank_id * shape.local_num_experts
+            local_expert_stop = local_expert_start + shape.local_num_experts
+            if counts[peer_id, local_expert_start:local_expert_stop].sum() > 0:
+                recv_peers.add(peer_id)
+        local_counts.append(local)
+        remote_counts.append(remote)
+        send_peer_counts.append(len(send_peers))
+        recv_peer_counts.append(len(recv_peers))
+
+    def avg(values: list[int]) -> float:
+        return float(sum(values) / len(values)) if values else 0.0
+
+    total_expert_counts = counts.sum(axis=0)
+    return {
+        "local_copies_per_device": avg(local_counts),
+        "remote_copies_per_device": avg(remote_counts),
+        "local_payload_bytes_per_device": avg(local_counts) * shape.hidden_size * DTYPE_BYTES,
+        "remote_payload_bytes_per_device": avg(remote_counts) * shape.hidden_size * DTYPE_BYTES,
+        "nonzero_send_peers_per_device": avg(send_peer_counts),
+        "nonzero_recv_peers_per_device": avg(recv_peer_counts),
+        "local_routes_histogram": {str(k): v for k, v in sorted(local_routes_histogram.items())},
+        "expert_token_count_max": int(total_expert_counts.max(initial=0)),
+        "expert_token_count_nonzero": int((total_expert_counts > 0).sum()),
+    }
 
 
 def _scratch_token_capacity(shape: A2AScatterShape) -> int:

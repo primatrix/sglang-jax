@@ -417,12 +417,11 @@ PHASE1_A2A_SCATTER_TOPK8_SHAPES: tuple[layer1_a2a_scatter.A2AScatterShape, ...] 
 
 PHASE1_A2A_SCATTER_TOPK8_MIXED_SHAPES: tuple[layer1_a2a_scatter.A2AScatterShape, ...] = tuple(
     layer1_a2a_scatter.A2AScatterShape(
-        path_class=f"scatter_topk8_mixed_local{k_local}",
+        path_class="scatter_topk8_uniform",
         bt=bt,
-        local_routes_per_token=k_local,
+        routing_mode="uniform_topk",
     )
     for bt in (2, 4, 8, 16, 32, 64, 128)
-    for k_local in (0, 1, 2, 3)
 )
 
 PHASE1_A2A_SCATTER_TOPK8_PREFLIGHT_SHAPES: tuple[layer1_a2a_scatter.A2AScatterShape, ...] = tuple(
@@ -504,7 +503,10 @@ def load_layer0_suite_shapes(suite: str) -> tuple[WeightTileShape, ...]:
         return PHASE1_HBM_COPY_LADDER_SHAPES + PHASE1_HBM_EQUIVALENT_SHAPES
     if suite == SUITE_V7X32_BF16_HBM_CURVE_V2:
         return PHASE1_HBM_CURVE_V2_SHAPES + PHASE1_HBM_EQUIVALENT_SHAPES
-    if suite in (SUITE_V7X32_BF16_HBM_DENSE_CURVE_V3, SUITE_V7X8_BF16_HBM_DENSE_CURVE_V3):
+    if suite in (
+        SUITE_V7X32_BF16_HBM_DENSE_CURVE_V3,
+        SUITE_V7X8_BF16_HBM_DENSE_CURVE_V3,
+    ):
         return PHASE1_HBM_DENSE_CURVE_V3_SHAPES + PHASE1_HBM_EQUIVALENT_SHAPES
     raise ValueError(f"Unsupported Layer 0 suite: {suite}")
 
@@ -646,7 +648,10 @@ def _layer0_hbm_metadata(suite: str) -> dict[str, Any]:
         matrix_kind="hbm_equivalent_weight_tile",
         target_runtime=target_runtime,
     )
-    if suite in (SUITE_V7X32_BF16_HBM_DENSE_CURVE_V3, SUITE_V7X8_BF16_HBM_DENSE_CURVE_V3):
+    if suite in (
+        SUITE_V7X32_BF16_HBM_DENSE_CURVE_V3,
+        SUITE_V7X8_BF16_HBM_DENSE_CURVE_V3,
+    ):
         metadata["matrix_kind"] = "hbm_dense_curve_v3"
         metadata["includes"] = [
             "tiny_hbm_copy_rows",
