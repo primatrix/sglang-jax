@@ -782,6 +782,48 @@ def _resolve_tuned_block_config(
     }
 
 
+def _manual_block_config_from_env(
+    *,
+    case: MoEBenchmarkCase,
+    dtype: jnp.dtype,
+    mesh_ep: int,
+    quant_block_k: int | None,
+) -> tuple[FusedMoEBlockConfig, dict[str, object]]:
+    raw = os.getenv("FUSED_MOE_BENCHMARK_BLOCK_CONFIG", "")
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    if len(parts) != 10:
+        raise ValueError(
+            "FUSED_MOE_BENCHMARK_BLOCK_CONFIG must contain 10 comma-separated "
+            "integers in tuned-table order: bt,bf,bd1,bd2,bts,btc,bfc,bd1c,bd2c,bse."
+        )
+    bt, bf, bd1, bd2, bts, btc, bfc, bd1c, bd2c, bse = (int(part) for part in parts)
+    raw_cfg = FusedMoEBlockConfig(
+        bt=bt,
+        bf=bf,
+        bd1=bd1,
+        bd2=bd2,
+        bts=bts,
+        btc=btc,
+        bfc=bfc,
+        bd1c=bd1c,
+        bd2c=bd2c,
+        bse=bse,
+    )
+    effective_cfg = raw_cfg.effective_for(
+        num_tokens=case.num_tokens,
+        ep_size=mesh_ep,
+        dtype=dtype,
+        quant_block_k=quant_block_k,
+    )
+    return effective_cfg, {
+        "source": "FUSED_MOE_BENCHMARK_BLOCK_CONFIG",
+        "raw_config": _config_metadata(raw_cfg),
+        "effective_config": _config_metadata(effective_cfg),
+        "raw_config_tuple": list(_config_tuple(raw_cfg)),
+        "effective_config_tuple": list(_config_tuple(effective_cfg)),
+    }
+
+
 def run_all(
     iters: int,
     dtype: jnp.dtype = jnp.bfloat16,
@@ -867,10 +909,10 @@ def run_all(
         from sgl_jax.srt.utils.jax_utils import get_device_name
     results: list[dict[str, object]] = []
     block_config_mode = os.getenv("FUSED_MOE_BENCHMARK_BLOCK_CONFIG_MODE", "runtime_tuned")
-    if block_config_mode not in ("runtime_tuned", "none", "explicit_tuned"):
+    if block_config_mode not in ("runtime_tuned", "none", "explicit_tuned", "manual"):
         raise ValueError(
             "FUSED_MOE_BENCHMARK_BLOCK_CONFIG_MODE must be one of "
-            "'runtime_tuned', 'none', or 'explicit_tuned'."
+            "'runtime_tuned', 'none', 'explicit_tuned', or 'manual'."
         )
 
     print(f"Running fused_moe benchmarks with weight_dtype={weight_dtype}")
@@ -1103,7 +1145,20 @@ def run_all(
                     quant_block_k=quant_block_k,
                 )
                 print(f"  tuned lookup: {tuned_cfg_info}", flush=True)
-                if block_config_mode == "explicit_tuned":
+                if block_config_mode == "manual":
+                    manual_cfg, manual_info = _manual_block_config_from_env(
+                        case=case,
+                        dtype=dtype,
+                        mesh_ep=mesh_ep,
+                        quant_block_k=quant_block_k,
+                    )
+                    tuned_cfg_info = {
+                        "runtime_tuned": tuned_cfg_info,
+                        "manual_override": manual_info,
+                    }
+                    print(f"  manual block config: {manual_info}", flush=True)
+                    block_cfgs = [manual_cfg]
+                elif block_config_mode == "explicit_tuned":
                     block_cfgs = [effective_tuned_cfg]
                 else:
                     block_cfgs = [None]
