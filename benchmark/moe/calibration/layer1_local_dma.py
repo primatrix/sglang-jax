@@ -16,13 +16,11 @@ from typing import Any, Literal
 from benchmark.moe.calibration.common import build_observation_row
 
 SCENARIO_LAYER1_LOCAL_DMA = "layer1_local_dma"
-SUITE_V7X32_BF16_LOCAL_DMA_TOPK8_V1 = "v7x32_bf16_local_dma_topk8_v1"
-SUITE_V7X8_BF16_LOCAL_DMA_TOPK8_V1 = "v7x8_bf16_local_dma_topk8_v1"
-SUITE_V7X8_BF16_LOCAL_DMA_TOPK8_V2 = "v7x8_bf16_local_dma_topk8_v2"
+SUITE_V7X32_BF16_LOCAL_DMA_TOPK8 = "v7x32_bf16_local_dma_topk8"
+SUITE_V7X8_BF16_LOCAL_DMA_TOPK8 = "v7x8_bf16_local_dma_topk8"
 SUPPORTED_SUITES = (
-    SUITE_V7X32_BF16_LOCAL_DMA_TOPK8_V1,
-    SUITE_V7X8_BF16_LOCAL_DMA_TOPK8_V1,
-    SUITE_V7X8_BF16_LOCAL_DMA_TOPK8_V2,
+    SUITE_V7X32_BF16_LOCAL_DMA_TOPK8,
+    SUITE_V7X8_BF16_LOCAL_DMA_TOPK8,
 )
 
 STATUS_NOT_IMPLEMENTED = "not_implemented"
