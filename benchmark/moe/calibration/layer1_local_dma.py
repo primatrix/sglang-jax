@@ -1,9 +1,8 @@
 """Layer 1 fused-MoE local HBM/VMEM DMA calibration rows.
 
-This first local-DMA pass covers non-weight fused-MoE primitives that are local
-to a device. It emits complete, parseable smoke rows for the path taxonomy and
-byte model; TPU/Pallas measurement kernels are intentionally left unavailable
-until the primitive microkernels are implemented.
+This local-DMA pass covers non-weight fused-MoE primitives that are local to a
+device. TPU runs measure the path taxonomy with small Pallas microkernels; local
+smoke runs emit schema-only rows.
 """
 
 from __future__ import annotations
@@ -444,7 +443,7 @@ def _local_dma_inputs(plan: LocalDMAPlan, *, jax: Any, jnp: Any) -> tuple[Any, .
     if shape.path == "output_gather_load":
         return (jnp.ones((shape.bt, shape.top_k, shape.t_packing, hpt), dtype=jnp.bfloat16),)
     if shape.path == "output_store":
-        return (jnp.ones((shape.bt, shape.hidden_size), dtype=jnp.bfloat16),)
+        return (jnp.ones((1,), dtype=jnp.bfloat16),)
     raise ValueError(f"Unsupported Layer 1 local DMA path: {shape.path}")
 
 
@@ -456,6 +455,7 @@ def _pallas_local_dma_call(arrays, *, plan, jax, jnp, pl, pltpu):
         weights, ids = arrays
 
         def kernel(weights_ref, ids_ref, out_ref, weights_vmem, ids_vmem, sems):
+            del out_ref
             weights_copy = pltpu.make_async_copy(
                 src_ref=weights_ref,
                 dst_ref=weights_vmem,
@@ -470,7 +470,6 @@ def _pallas_local_dma_call(arrays, *, plan, jax, jnp, pl, pltpu):
             ids_copy.start()
             weights_copy.wait()
             ids_copy.wait()
-            out_ref[0] = weights_vmem[0, 0] + ids_vmem[0, 0].astype(jnp.float32)
 
         return pl.pallas_call(
             kernel,
@@ -575,19 +574,18 @@ def _pallas_local_dma_call(arrays, *, plan, jax, jnp, pl, pltpu):
         )
 
     if shape.path == "output_store":
-        (src,) = arrays
+        (seed,) = arrays
 
-        def kernel(src_ref, out_ref, tile_vmem, sems):
-            load = pltpu.make_async_copy(src_ref=src_ref, dst_ref=tile_vmem, sem=sems.at[0])
-            load.start()
-            load.wait()
+        def kernel(seed_ref, out_ref, tile_vmem, sems):
+            # Keep the measured HBM traffic to the VMEM->HBM output store.
+            tile_vmem[...] = jnp.zeros_like(tile_vmem) + seed_ref[0]
             store = pltpu.make_async_copy(src_ref=tile_vmem, dst_ref=out_ref, sem=sems.at[0])
             store.start()
             store.wait()
 
         return _single_input_pallas_call(
             kernel,
-            src,
+            seed,
             out_shape=jax.ShapeDtypeStruct((shape.bt, shape.hidden_size), jnp.bfloat16),
             scratch_shapes=[
                 pltpu.VMEM((shape.bt, shape.hidden_size), jnp.bfloat16),
