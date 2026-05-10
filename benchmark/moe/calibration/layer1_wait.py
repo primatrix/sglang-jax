@@ -27,8 +27,11 @@ HIDDEN_SIZE = 8192
 EP_SIZE = 32
 KERNEL_PATH = "python/sgl_jax/srt/kernels/fused_moe/v1/kernel.py"
 VMEM_LIMIT_BYTES = 96 * 1024 * 1024
+REMOTE_DMA_ROW_PACKING = T_PACKING
+REMOTE_DMA_VECTOR_ALIGN = 128
+REMOTE_DMA_MIN_TILE_BYTES = REMOTE_DMA_ROW_PACKING * REMOTE_DMA_VECTOR_ALIGN * BF16_BYTES
 
-WaitPath = Literal["mesh_barrier", "remote_dma_wait_1token"]
+WaitPath = Literal["mesh_barrier", "remote_dma_wait_min_tile"]
 
 
 @dataclass(frozen=True)
@@ -176,8 +179,21 @@ def _metadata_for_shape(
         "path": shape.path,
         "path_class": shape.path_class,
         "repetitions": shape.repetitions,
+        "remote_dma_row_packing": 0 if shape.path == "mesh_barrier" else REMOTE_DMA_ROW_PACKING,
+        "remote_dma_min_tile_shape": (
+            []
+            if shape.path == "mesh_barrier"
+            else [REMOTE_DMA_ROW_PACKING, REMOTE_DMA_VECTOR_ALIGN]
+        ),
+        "remote_dma_min_tile_bytes": (
+            0 if shape.path == "mesh_barrier" else REMOTE_DMA_MIN_TILE_BYTES
+        ),
+        "remote_dma_payload_shape_per_copy": (
+            [] if shape.path == "mesh_barrier" else [REMOTE_DMA_ROW_PACKING, shape.hidden_size]
+        ),
         "hidden_size": shape.hidden_size,
         "ep_size": shape.ep_size,
+        "hbm_row_count": _hbm_row_count(shape),
         "tile_shape": _tile_shape(shape),
         "bytes_hbm": _bytes_hbm(shape),
         "dma_count": _dma_count(shape),
@@ -210,10 +226,9 @@ def _measure_wait_ms(
     src_sharding = NamedSharding(mesh, P("tensor", None))
     dst_sharding = NamedSharding(mesh, P())
     payload_elems = _payload_elems(shape)
-    src = jax.device_put(jnp.ones((shape.ep_size, payload_elems), dtype=jnp.bfloat16), src_sharding)
-    dst = jax.device_put(
-        jnp.zeros((shape.ep_size, payload_elems), dtype=jnp.bfloat16), dst_sharding
-    )
+    hbm_rows = _hbm_row_count(shape)
+    src = jax.device_put(jnp.ones((hbm_rows, payload_elems), dtype=jnp.bfloat16), src_sharding)
+    dst = jax.device_put(jnp.zeros((hbm_rows, payload_elems), dtype=jnp.bfloat16), dst_sharding)
     jax.block_until_ready((src, dst))
 
     with jax.set_mesh(mesh):
@@ -286,17 +301,32 @@ def _pallas_wait_call(src_hbm, dst_hbm, *, shape: WaitShape, jax, pl, pltpu):
         def remote_roundtrip():
             peer = (rank + 1) % shape.ep_size
             recv_peer = (rank + shape.ep_size - 1) % shape.ep_size
+            recv_base = recv_peer * REMOTE_DMA_ROW_PACKING
+            send_base = 0
+            dst_base = rank * REMOTE_DMA_ROW_PACKING
             pltpu.make_async_remote_copy(
-                src_ref=src_ref.at[pl.ds(0, 1), pl.ds(0, _payload_elems(shape))],
-                dst_ref=dst_ref.at[pl.ds(rank, 1), pl.ds(0, _payload_elems(shape))],
+                src_ref=src_ref.at[
+                    pl.ds(send_base, REMOTE_DMA_ROW_PACKING),
+                    pl.ds(0, _payload_elems(shape)),
+                ],
+                dst_ref=dst_ref.at[
+                    pl.ds(dst_base, REMOTE_DMA_ROW_PACKING),
+                    pl.ds(0, _payload_elems(shape)),
+                ],
                 send_sem=send_sem,
                 recv_sem=recv_sem,
                 device_id=get_mesh_device_id(peer),
                 device_id_type=pltpu.DeviceIdType.MESH,
             ).start()
-            recv_ref = dst_ref.at[pl.ds(recv_peer, 1), pl.ds(0, _payload_elems(shape))]
+            recv_ref = dst_ref.at[
+                pl.ds(recv_base, REMOTE_DMA_ROW_PACKING),
+                pl.ds(0, _payload_elems(shape)),
+            ]
             pltpu.make_async_copy(src_ref=recv_ref, dst_ref=recv_ref, sem=recv_sem).wait()
-            send_ref = src_ref.at[pl.ds(0, 1), pl.ds(0, _payload_elems(shape))]
+            send_ref = src_ref.at[
+                pl.ds(send_base, REMOTE_DMA_ROW_PACKING),
+                pl.ds(0, _payload_elems(shape)),
+            ]
             pltpu.make_async_copy(src_ref=send_ref, dst_ref=send_ref, sem=send_sem).wait()
 
         for _ in range(shape.repetitions):
@@ -344,17 +374,25 @@ def _build_tensor_mesh(*, jax: Any, np: Any, ep_size: int, tp_size: int):
 
 
 def _tile_shape(shape: WaitShape) -> tuple[int, ...]:
-    return (shape.repetitions, _payload_elems(shape))
+    if shape.path == "mesh_barrier":
+        return (shape.repetitions, _payload_elems(shape))
+    return (shape.repetitions, REMOTE_DMA_ROW_PACKING, _payload_elems(shape))
 
 
 def _payload_elems(shape: WaitShape) -> int:
     return 1 if shape.path == "mesh_barrier" else shape.hidden_size
 
 
+def _hbm_row_count(shape: WaitShape) -> int:
+    if shape.path == "mesh_barrier":
+        return shape.ep_size
+    return shape.ep_size * REMOTE_DMA_ROW_PACKING
+
+
 def _bytes_hbm(shape: WaitShape) -> int:
     if shape.path == "mesh_barrier":
         return 0
-    return shape.repetitions * shape.hidden_size * BF16_BYTES
+    return shape.repetitions * REMOTE_DMA_ROW_PACKING * shape.hidden_size * BF16_BYTES
 
 
 def _dma_count(shape: WaitShape) -> int:
@@ -366,7 +404,7 @@ def _dma_count(shape: WaitShape) -> int:
 def _includes(shape: WaitShape) -> list[str]:
     if shape.path == "mesh_barrier":
         return ["mesh_barrier_signal_all_peers", "mesh_barrier_wait_all_peers"]
-    return ["mesh_barrier", "one_token_remote_dma_start", "recv_wait", "send_wait"]
+    return ["mesh_barrier", "t_packing_aligned_remote_dma_start", "recv_wait", "send_wait"]
 
 
 def _positive_int_env(name: str, default: int) -> int:
