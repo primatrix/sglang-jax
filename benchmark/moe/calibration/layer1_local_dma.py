@@ -577,8 +577,9 @@ def _pallas_local_dma_call(arrays, *, plan, jax, jnp, pl, pltpu):
         (seed,) = arrays
 
         def kernel(seed_ref, out_ref, tile_vmem, sems):
+            del seed_ref
             # Keep the measured HBM traffic to the VMEM->HBM output store.
-            tile_vmem[...] = jnp.zeros_like(tile_vmem) + seed_ref[0]
+            tile_vmem[...] = jnp.zeros_like(tile_vmem)
             store = pltpu.make_async_copy(src_ref=tile_vmem, dst_ref=out_ref, sem=sems.at[0])
             store.start()
             store.wait()
