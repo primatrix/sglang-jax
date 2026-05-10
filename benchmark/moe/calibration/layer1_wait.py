@@ -268,6 +268,7 @@ def _pallas_wait_call(src_hbm, dst_hbm, *, shape: WaitShape, jax, pl, pltpu):
     def kernel(src_ref, dst_ref, out_ref, send_sem, recv_sem, barrier_sem):
         from jax import lax
 
+        del out_ref
         rank = lax.axis_index("tensor")
 
         def get_mesh_device_id(ep_rank):
@@ -305,7 +306,6 @@ def _pallas_wait_call(src_hbm, dst_hbm, *, shape: WaitShape, jax, pl, pltpu):
                 sync_barrier()
                 remote_roundtrip()
                 sync_barrier()
-        out_ref[0] = src_ref[0, 0]
 
     return pl.pallas_call(
         kernel,

@@ -1104,6 +1104,7 @@ def main() -> None:
                 "bf": row.get("bf"),
                 "status": row.get("status"),
                 "sample_count": len(row.get("latency_ms_samples") or []),
+                "implementation_note": row.get("implementation_note"),
             }
             for row in rows
             if row.get("status") != "measured" or not row.get("latency_ms_samples")
