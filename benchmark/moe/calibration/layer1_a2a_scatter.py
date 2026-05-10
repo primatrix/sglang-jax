@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass
+from math import comb
 from typing import Any
 
 from benchmark.moe.calibration.common import build_observation_row
@@ -573,6 +574,14 @@ def _metadata_for_shape(metadata: dict[str, Any], shape: A2AScatterShape) -> dic
         "num_experts": shape.ep_size * shape.local_num_experts,
         "routing_pattern": "e_id=(rank+k+1)%ep_size*local_num_experts+k",
         "local_routes_per_token": shape.local_routes_per_token,
+        "local_routes_probability_uniform_topk": _local_routes_probability(shape),
+        "expected_local_routes_per_token_uniform_topk": shape.top_k
+        * shape.local_num_experts
+        / (shape.ep_size * shape.local_num_experts),
+        "locality_model": (
+            "stratified_fixed_local_routes; combine local0/local1/local2/... rows "
+            "with the hypergeometric probabilities for uniform top-k over all experts"
+        ),
         "topk_id_layout": "HBM rows are padded to 128 columns; only first top_k entries route payloads.",
         "scratch_token_capacity": _scratch_token_capacity(shape),
         "local_copies_per_device": shape.bt * shape.local_routes_per_token,
@@ -1527,6 +1536,23 @@ def _remote_scatter_bytes_per_device(shape: A2AScatterShape) -> int:
 
 def _local_scatter_bytes_per_device(shape: A2AScatterShape) -> int:
     return _local_scatter_copies_per_device(shape) * shape.hidden_size * BF16_BYTES
+
+
+def _local_routes_probability(shape: A2AScatterShape) -> float:
+    total_experts = shape.ep_size * shape.local_num_experts
+    local_experts = shape.local_num_experts
+    local_routes = shape.local_routes_per_token
+    if local_routes < 0 or local_routes > min(shape.top_k, local_experts):
+        return 0.0
+    remote_experts = total_experts - local_experts
+    remote_routes = shape.top_k - local_routes
+    if remote_routes < 0 or remote_routes > remote_experts:
+        return 0.0
+    return (
+        comb(local_experts, local_routes)
+        * comb(remote_experts, remote_routes)
+        / comb(total_experts, shape.top_k)
+    )
 
 
 def _scratch_token_capacity(shape: A2AScatterShape) -> int:

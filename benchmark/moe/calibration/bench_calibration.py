@@ -422,7 +422,7 @@ PHASE1_A2A_SCATTER_TOPK8_MIXED_SHAPES: tuple[layer1_a2a_scatter.A2AScatterShape,
         local_routes_per_token=k_local,
     )
     for bt in (2, 4, 8, 16, 32, 64, 128)
-    for k_local in (1, 4)
+    for k_local in (0, 1, 2, 3)
 )
 
 PHASE1_A2A_SCATTER_TOPK8_PREFLIGHT_SHAPES: tuple[layer1_a2a_scatter.A2AScatterShape, ...] = tuple(
