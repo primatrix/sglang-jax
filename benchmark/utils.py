@@ -13,6 +13,7 @@ from typing import Any
 import jax
 
 MARKER = "SGLANG_JAX_BENCH"
+TRACE_TIMING_SUMMARY = "trace_timing_summary.json"
 
 _COMPILATION_CACHE_ENV_VARS = ("SGLANG_JAX_COMPILATION_CACHE_DIR", "JAX_COMPILATION_CACHE_DIR")
 
@@ -124,6 +125,125 @@ def _extract_marker_durations_ms(trace: dict[str, Any], task: str | None = None)
     return []
 
 
+def _event_duration_ms(event: dict[str, Any]) -> float | None:
+    args = event.get("args", {})
+    if args.get("device_duration_ps"):
+        return float(args["device_duration_ps"]) / 1e9
+    if "dur" in event:
+        return float(event["dur"]) / 1e3
+    return None
+
+
+def _percentile(samples: list[float], percent: float) -> float | None:
+    if not samples:
+        return None
+    ordered = sorted(samples)
+    if len(ordered) == 1:
+        return ordered[0]
+    index = (len(ordered) - 1) * percent
+    lower = int(index)
+    upper = min(lower + 1, len(ordered) - 1)
+    if lower == upper:
+        return ordered[lower]
+    fraction = index - lower
+    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+
+
+def _event_group_name(event: dict[str, Any]) -> str | None:
+    name = str(event.get("name", ""))
+    text = _event_text(event).lower()
+    if name == "barrier-cores":
+        return "barrier_cores"
+    if "all_to_all" in text or "all-to-all" in text:
+        return "all_to_all_op"
+    if name.startswith("jit_all_to_all("):
+        return "jit_all_to_all"
+    if "remote" in text and ("dma" in text or "copy" in text):
+        return "remote_dma_or_copy"
+    if "dma" in text:
+        return "dma"
+    if "wait" in text or "sync" in text:
+        return "wait_or_sync"
+    return None
+
+
+def _samples_summary(samples: list[float]) -> dict[str, Any]:
+    return {
+        "count": len(samples),
+        "min_ms": min(samples) if samples else None,
+        "p50_ms": _percentile(samples, 0.5),
+        "p90_ms": _percentile(samples, 0.9),
+        "max_ms": max(samples) if samples else None,
+        "samples_ms": samples,
+    }
+
+
+def _trace_timing_summary(
+    trace: dict[str, Any],
+    *,
+    task: str,
+    marker_ms: list[float],
+    discard_initial_samples: int,
+) -> dict[str, Any]:
+    event_groups: dict[str, list[float]] = {}
+    for event in trace.get("traceEvents", []):
+        group = _event_group_name(event)
+        if group is None:
+            continue
+        duration_ms = _event_duration_ms(event)
+        if duration_ms is None:
+            continue
+        event_groups.setdefault(group, []).append(duration_ms)
+
+    discarded = max(0, int(discard_initial_samples))
+    measured_marker_ms = marker_ms[discarded:]
+    barrier_ms = sorted(event_groups.get("barrier_cores", []))
+    barrier_representative_ms = _percentile(barrier_ms, 0.5)
+    marker_minus_barrier_ms = None
+    if barrier_representative_ms is not None:
+        marker_minus_barrier_ms = [
+            max(0.0, sample - barrier_representative_ms) for sample in measured_marker_ms
+        ]
+
+    return {
+        "schema_version": 1,
+        "task": task,
+        "marker": MARKER,
+        "timing_semantics": {
+            "marker_ms": "StepTraceAnnotation boundary around one benchmark iteration.",
+            "barrier_cores_ms": "Device trace barrier-cores events; these may overlap marker work and are not safely subtractive per event.",
+            "marker_minus_barrier_cores_ms": (
+                "Diagnostic residual using marker sample minus p50 barrier_cores. "
+                "This is not pure communication time."
+            ),
+            "event_groups": "Best-effort trace decomposition by event name/tf_op.",
+        },
+        "discard_initial_samples": discarded,
+        "marker_ms_all": marker_ms,
+        "marker_ms": measured_marker_ms,
+        "marker_summary": _samples_summary(measured_marker_ms),
+        "barrier_cores_summary": _samples_summary(barrier_ms),
+        "marker_minus_barrier_cores_ms": marker_minus_barrier_ms,
+        "marker_minus_barrier_cores_summary": (
+            _samples_summary(marker_minus_barrier_ms)
+            if marker_minus_barrier_ms is not None
+            else _samples_summary([])
+        ),
+        "event_group_summaries": {
+            group: _samples_summary(sorted(samples))
+            for group, samples in sorted(event_groups.items())
+        },
+    }
+
+
+def _write_trace_timing_summary(trace_dir: str, summary: dict[str, Any]) -> None:
+    path = pathlib.Path(trace_dir) / TRACE_TIMING_SUMMARY
+    try:
+        path.write_text(json.dumps(summary, indent=2, sort_keys=True))
+    except Exception:
+        return
+
+
 def _load_trace(trace_root: str) -> dict[str, Any]:
     trace_dir = pathlib.Path(trace_root) / "plugins" / "profile"
     if not trace_dir.exists():
@@ -194,4 +314,11 @@ def multiple_iteration_timeit_from_trace(
 
     trace = _load_trace(trace_dir)
     durations = _extract_marker_durations_ms(trace, task=task)
-    return durations[max(0, int(discard_initial_samples)) :]
+    summary = _trace_timing_summary(
+        trace,
+        task=task,
+        marker_ms=durations,
+        discard_initial_samples=discard_initial_samples,
+    )
+    _write_trace_timing_summary(trace_dir, summary)
+    return summary["marker_ms"]
