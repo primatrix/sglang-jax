@@ -1410,12 +1410,12 @@ def _pallas_a2a_scatter_call(
         topk_copy.wait()
         starts_copy = pltpu.make_async_copy(
             src_ref=starts_ref.at[0, pl.ds(0, PADDED_NUM_EXPERTS)],
-            dst_ref=starts_vmem.at[pl.ds(0, PADDED_NUM_EXPERTS)],
+            dst_ref=starts_vmem.at[0, pl.ds(0, PADDED_NUM_EXPERTS)],
             sem=metadata_sem,
         )
         sizes_copy = pltpu.make_async_copy(
-            src_ref=sizes_ref.at[pl.ds(0, PADDED_NUM_EXPERTS)],
-            dst_ref=sizes_vmem.at[pl.ds(0, PADDED_NUM_EXPERTS)],
+            src_ref=sizes_ref.at[0, pl.ds(0, PADDED_NUM_EXPERTS)],
+            dst_ref=sizes_vmem.at[0, pl.ds(0, PADDED_NUM_EXPERTS)],
             sem=metadata_sem,
         )
         starts_copy.start()
@@ -1450,7 +1450,7 @@ def _pallas_a2a_scatter_call(
                 e_sem_id = e_id_safe % shape.local_num_experts
                 offset = offsets_smem[e_id_safe]
                 offsets_smem[e_id_safe] = offset + jnp.where(is_valid, jnp.int32(1), jnp.int32(0))
-                dst_start = starts_smem[e_id_safe] + offset
+                dst_start = starts_smem[0, e_id_safe] + offset
                 is_local = recv_id == rank
                 local_sz = jnp.where(is_valid & is_local, jnp.int32(1), jnp.int32(0))
                 remote_sz = jnp.where(is_valid & ~is_local, jnp.int32(1), jnp.int32(0))
@@ -1500,7 +1500,7 @@ def _pallas_a2a_scatter_call(
 
         def wait_recv_one(local_e_id, _):
             e_id = rank * shape.local_num_experts + local_e_id
-            recv_sz = sizes_smem[e_id]
+            recv_sz = sizes_smem[0, e_id]
 
             @pl.when(recv_sz != 0)
             def _():
@@ -1531,10 +1531,10 @@ def _pallas_a2a_scatter_call(
             grid=(1,),
             scratch_shapes=[
                 pltpu.VMEM((shape.bt, PADDED_TOP_K), topk_ids_hbm.dtype),
-                pltpu.VMEM((PADDED_NUM_EXPERTS,), topk_ids_hbm.dtype),
-                pltpu.VMEM((PADDED_NUM_EXPERTS,), topk_ids_hbm.dtype),
-                pltpu.SMEM((PADDED_NUM_EXPERTS,), topk_ids_hbm.dtype),
-                pltpu.SMEM((PADDED_NUM_EXPERTS,), topk_ids_hbm.dtype),
+                pltpu.VMEM((1, PADDED_NUM_EXPERTS), topk_ids_hbm.dtype),
+                pltpu.VMEM((1, PADDED_NUM_EXPERTS), topk_ids_hbm.dtype),
+                pltpu.SMEM((1, PADDED_NUM_EXPERTS), topk_ids_hbm.dtype),
+                pltpu.SMEM((1, PADDED_NUM_EXPERTS), topk_ids_hbm.dtype),
                 pltpu.SMEM((PADDED_NUM_EXPERTS,), topk_ids_hbm.dtype),
                 pltpu.SMEM((shape.local_num_experts,), topk_ids_hbm.dtype),
                 pltpu.SemaphoreType.DMA,
@@ -1610,7 +1610,7 @@ def _make_starts_by_rank(*, jax: Any, np: Any, sharding: Any, shape: A2AScatterS
 
 
 def _make_sizes(*, jax: Any, np: Any, sharding: Any, shape: A2AScatterShape):
-    sizes = _counts_by_rank(np=np, shape=shape).sum(axis=0).astype(np.int32)
+    sizes = _counts_by_rank(np=np, shape=shape).sum(axis=0).astype(np.int32)[None, :]
     return jax.make_array_from_callback(
         sizes.shape,
         sharding,
