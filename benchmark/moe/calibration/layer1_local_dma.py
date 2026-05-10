@@ -8,6 +8,7 @@ until the primitive microkernels are implemented.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -18,6 +19,10 @@ SCENARIO_LAYER1_LOCAL_DMA = "layer1_local_dma"
 SUITE_V7X32_BF16_LOCAL_DMA_TOPK8_V1 = "v7x32_bf16_local_dma_topk8_v1"
 
 STATUS_NOT_IMPLEMENTED = "not_implemented"
+STATUS_MEASURED = "measured"
+DEFAULT_WARMUP_RUNS = 3
+DEFAULT_SAMPLE_RUNS = 5
+DEFAULT_TRACE_DISCARD_RUNS = 1
 DTYPE = "bfloat16"
 WEIGHT_DTYPE = "bfloat16"
 BF16_BYTES = 2
@@ -92,23 +97,82 @@ def build_rows(
     if dtype != DTYPE or weight_dtype != WEIGHT_DTYPE or t_packing != T_PACKING:
         raise ValueError("layer1_local_dma v1 supports only bf16 tokens/weights with t_packing=2.")
 
-    return [
-        _make_row(
-            suite=suite,
-            plan=plan_for_shape(shape),
-            execution_mode=execution_mode,
-            runtime=runtime,
-            dtype=dtype,
-            weight_dtype=weight_dtype,
-            t_packing=t_packing,
-            source=source,
-            metadata=metadata,
-            status=STATUS_NOT_IMPLEMENTED,
-            latency_ms_samples=[],
-            implementation_note=_not_implemented_note(execution_mode, runtime),
+    plans = [plan_for_shape(shape) for shape in shapes]
+    if execution_mode != "pallas" or runtime.get("default_backend") != "tpu":
+        return [
+            _make_row(
+                suite=suite,
+                plan=plan,
+                execution_mode=execution_mode,
+                runtime=runtime,
+                dtype=dtype,
+                weight_dtype=weight_dtype,
+                t_packing=t_packing,
+                source=source,
+                metadata=metadata,
+                status=STATUS_NOT_IMPLEMENTED,
+                latency_ms_samples=[],
+                implementation_note=_not_implemented_note(execution_mode, runtime),
+            )
+            for plan in plans
+        ]
+
+    rows: list[dict[str, Any]] = []
+    warmup_runs = _positive_int_env("CALIBRATION_LAYER1_WARMUP_RUNS", DEFAULT_WARMUP_RUNS)
+    sample_runs = _positive_int_env("CALIBRATION_LAYER1_SAMPLE_RUNS", DEFAULT_SAMPLE_RUNS)
+    discard_runs = _nonnegative_int_env(
+        "CALIBRATION_LAYER1_TRACE_DISCARD_RUNS", DEFAULT_TRACE_DISCARD_RUNS
+    )
+    trace_root = os.getenv("CALIBRATION_LAYER1_TRACE_ROOT", "/tmp/sglang_jax_layer1_local_dma")
+
+    for plan in plans:
+        try:
+            samples = _measure_local_dma_ms(
+                plan,
+                warmup_runs=warmup_runs,
+                sample_runs=sample_runs,
+                discard_runs=discard_runs,
+                trace_root=trace_root,
+            )
+        except Exception as exc:
+            rows.append(
+                _make_row(
+                    suite=suite,
+                    plan=plan,
+                    execution_mode=execution_mode,
+                    runtime=runtime,
+                    dtype=dtype,
+                    weight_dtype=weight_dtype,
+                    t_packing=t_packing,
+                    source=source,
+                    metadata=metadata,
+                    status=STATUS_NOT_IMPLEMENTED,
+                    latency_ms_samples=[],
+                    implementation_note=f"Layer1 local DMA measurement failed: {type(exc).__name__}: {exc}",
+                )
+            )
+            continue
+
+        rows.append(
+            _make_row(
+                suite=suite,
+                plan=plan,
+                execution_mode=execution_mode,
+                runtime=runtime,
+                dtype=dtype,
+                weight_dtype=weight_dtype,
+                t_packing=t_packing,
+                source=source,
+                metadata=metadata,
+                status=STATUS_MEASURED,
+                latency_ms_samples=samples,
+                implementation_note=(
+                    "Measured one fused-MoE local HBM/VMEM primitive using a Pallas "
+                    "microkernel with the matching copy direction, tile shape, and wait anchors."
+                ),
+            )
         )
-        for shape in shapes
-    ]
+    return rows
 
 
 def plan_for_shape(shape: LocalDMAShape) -> LocalDMAPlan:
@@ -326,6 +390,259 @@ def _validate_shape(shape: LocalDMAShape) -> None:
             f"Expected hidden_size={shape.hidden_size} to be divisible by "
             f"t_packing={shape.t_packing}."
         )
+
+
+def _measure_local_dma_ms(
+    plan: LocalDMAPlan,
+    *,
+    warmup_runs: int,
+    sample_runs: int,
+    discard_runs: int,
+    trace_root: str,
+) -> list[float]:
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    from benchmark.utils import multiple_iteration_timeit_from_trace
+
+    inputs = _local_dma_inputs(plan, jax=jax, jnp=jnp)
+    jax.block_until_ready(inputs)
+
+    @jax.jit
+    def run_dma(*arrays):
+        return _pallas_local_dma_call(arrays, plan=plan, jax=jax, jnp=jnp, pl=pl, pltpu=pltpu)
+
+    jax.block_until_ready(run_dma(*inputs))
+    task = f"layer1_local_dma_{plan.shape.path}_bt{plan.shape.bt}"
+    return multiple_iteration_timeit_from_trace(
+        compute_func=run_dma,
+        data_generator=lambda: inputs,
+        task=task,
+        tries=sample_runs,
+        warmup=warmup_runs,
+        discard_initial_samples=discard_runs,
+        trace_root=trace_root,
+    )
+
+
+def _local_dma_inputs(plan: LocalDMAPlan, *, jax: Any, jnp: Any) -> tuple[Any, ...]:
+    shape = plan.shape
+    hpt = shape.hidden_size // shape.t_packing
+    if shape.path == "topk_fetch":
+        weights = jnp.ones((shape.bt, PADDED_TOP_K), dtype=jnp.float32)
+        ids = jnp.ones((shape.bt, PADDED_TOP_K), dtype=jnp.int32)
+        return (weights, ids)
+    if shape.path in ("a2a_s_tile_read", "accumulator_store_or_rmw"):
+        return (jnp.ones((shape.bt, shape.t_packing, hpt), dtype=jnp.bfloat16),)
+    if shape.path == "output_gather_load":
+        return (jnp.ones((shape.bt, shape.top_k, shape.t_packing, hpt), dtype=jnp.bfloat16),)
+    if shape.path == "output_store":
+        return (jnp.ones((shape.bt, shape.hidden_size), dtype=jnp.bfloat16),)
+    raise ValueError(f"Unsupported Layer 1 local DMA path: {shape.path}")
+
+
+def _pallas_local_dma_call(arrays, *, plan, jax, jnp, pl, pltpu):
+    shape = plan.shape
+    hpt = shape.hidden_size // shape.t_packing
+
+    if shape.path == "topk_fetch":
+        weights, ids = arrays
+
+        def kernel(weights_ref, ids_ref, out_ref, weights_vmem, ids_vmem, sems):
+            weights_copy = pltpu.make_async_copy(
+                src_ref=weights_ref,
+                dst_ref=weights_vmem,
+                sem=sems.at[0],
+            )
+            ids_copy = pltpu.make_async_copy(
+                src_ref=ids_ref,
+                dst_ref=ids_vmem,
+                sem=sems.at[1],
+            )
+            weights_copy.start()
+            ids_copy.start()
+            weights_copy.wait()
+            ids_copy.wait()
+            out_ref[0] = weights_vmem[0, 0] + ids_vmem[0, 0].astype(jnp.float32)
+
+        return pl.pallas_call(
+            kernel,
+            out_shape=jax.ShapeDtypeStruct((1,), jnp.float32),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=0,
+                in_specs=[
+                    pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                    pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                ],
+                out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                grid=(1,),
+                scratch_shapes=[
+                    pltpu.VMEM((shape.bt, PADDED_TOP_K), jnp.float32),
+                    pltpu.VMEM((shape.bt, PADDED_TOP_K), jnp.int32),
+                    pltpu.SemaphoreType.DMA((2,)),
+                ],
+            ),
+            compiler_params=pltpu.CompilerParams(has_side_effects=True),
+            name=f"layer1_local_dma_topk_fetch_bt{shape.bt}",
+        )(weights, ids)
+
+    if shape.path == "a2a_s_tile_read":
+        (src,) = arrays
+
+        def kernel(src_ref, out_ref, tile_vmem, sems):
+            del out_ref
+            copy = pltpu.make_async_copy(src_ref=src_ref, dst_ref=tile_vmem, sem=sems.at[0])
+            copy.start()
+            copy.wait()
+
+        return _single_input_pallas_call(
+            kernel,
+            src,
+            out_shape=jax.ShapeDtypeStruct((1,), jnp.bfloat16),
+            scratch_shapes=[
+                pltpu.VMEM((shape.bt, shape.t_packing, hpt), jnp.bfloat16),
+                pltpu.SemaphoreType.DMA((1,)),
+            ],
+            jax=jax,
+            pl=pl,
+            pltpu=pltpu,
+            name=f"layer1_local_dma_a2a_s_tile_read_bt{shape.bt}",
+        )
+
+    if shape.path == "accumulator_store_or_rmw":
+        (src,) = arrays
+
+        def kernel(src_ref, out_ref, tile_vmem, sems):
+            load = pltpu.make_async_copy(src_ref=src_ref, dst_ref=tile_vmem, sem=sems.at[0])
+            load.start()
+            load.wait()
+            store = pltpu.make_async_copy(src_ref=tile_vmem, dst_ref=out_ref, sem=sems.at[0])
+            store.start()
+            store.wait()
+
+        return _single_input_pallas_call(
+            kernel,
+            src,
+            out_shape=jax.ShapeDtypeStruct((shape.bt, shape.t_packing, hpt), jnp.bfloat16),
+            scratch_shapes=[
+                pltpu.VMEM((shape.bt, shape.t_packing, hpt), jnp.bfloat16),
+                pltpu.SemaphoreType.DMA((1,)),
+            ],
+            jax=jax,
+            pl=pl,
+            pltpu=pltpu,
+            name=f"layer1_local_dma_accumulator_rmw_bt{shape.bt}",
+        )
+
+    if shape.path == "output_gather_load":
+        (src,) = arrays
+
+        def kernel(src_ref, out_ref, tile_vmem, sems):
+            del out_ref
+
+            def copy_one(i, _):
+                t_i = i // shape.top_k
+                k_i = i % shape.top_k
+                copy = pltpu.make_async_copy(
+                    src_ref=src_ref.at[t_i, k_i],
+                    dst_ref=tile_vmem.at[t_i, k_i],
+                    sem=sems.at[0],
+                )
+                copy.start()
+                copy.wait()
+
+            jax.lax.fori_loop(0, shape.bt * shape.top_k, copy_one, None, unroll=False)
+
+        return _single_input_pallas_call(
+            kernel,
+            src,
+            out_shape=jax.ShapeDtypeStruct((1,), jnp.bfloat16),
+            scratch_shapes=[
+                pltpu.VMEM((shape.bt, shape.top_k, shape.t_packing, hpt), jnp.bfloat16),
+                pltpu.SemaphoreType.DMA((1,)),
+            ],
+            jax=jax,
+            pl=pl,
+            pltpu=pltpu,
+            name=f"layer1_local_dma_output_gather_load_bt{shape.bt}",
+        )
+
+    if shape.path == "output_store":
+        (src,) = arrays
+
+        def kernel(src_ref, out_ref, tile_vmem, sems):
+            load = pltpu.make_async_copy(src_ref=src_ref, dst_ref=tile_vmem, sem=sems.at[0])
+            load.start()
+            load.wait()
+            store = pltpu.make_async_copy(src_ref=tile_vmem, dst_ref=out_ref, sem=sems.at[0])
+            store.start()
+            store.wait()
+
+        return _single_input_pallas_call(
+            kernel,
+            src,
+            out_shape=jax.ShapeDtypeStruct((shape.bt, shape.hidden_size), jnp.bfloat16),
+            scratch_shapes=[
+                pltpu.VMEM((shape.bt, shape.hidden_size), jnp.bfloat16),
+                pltpu.SemaphoreType.DMA((1,)),
+            ],
+            jax=jax,
+            pl=pl,
+            pltpu=pltpu,
+            name=f"layer1_local_dma_output_store_bt{shape.bt}",
+        )
+
+    raise ValueError(f"Unsupported Layer 1 local DMA path: {shape.path}")
+
+
+def _single_input_pallas_call(
+    kernel,
+    src,
+    *,
+    out_shape,
+    scratch_shapes: list[Any],
+    jax,
+    pl,
+    pltpu,
+    name: str,
+):
+    return pl.pallas_call(
+        kernel,
+        out_shape=out_shape,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)],
+            out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            grid=(1,),
+            scratch_shapes=scratch_shapes,
+        ),
+        compiler_params=pltpu.CompilerParams(has_side_effects=True),
+        name=name,
+    )(src)
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _nonnegative_int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed >= 0 else default
 
 
 def _not_implemented_note(execution_mode: str, runtime: dict[str, Any]) -> str:
