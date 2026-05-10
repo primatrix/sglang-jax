@@ -17,7 +17,9 @@ from benchmark.moe.calibration import (
     layer0_hbm_envelope,
     layer1_a2a_gather,
     layer1_a2a_scatter,
+    layer1_ffn_compute,
     layer1_local_dma,
+    layer1_wait,
     layer1_weight_tile_dma,
 )
 from benchmark.moe.calibration.common import (
@@ -34,6 +36,8 @@ SCENARIO_LAYER1_A2A_SCATTER = "layer1_a2a_scatter"
 SCENARIO_LAYER1_A2A_GATHER = "layer1_a2a_gather"
 SCENARIO_LAYER1_WEIGHT_TILE_DMA = "layer1_weight_tile_dma"
 SCENARIO_LAYER1_LOCAL_DMA = "layer1_local_dma"
+SCENARIO_LAYER1_FFN_COMPUTE = "layer1_ffn_compute"
+SCENARIO_LAYER1_WAIT = "layer1_wait"
 SCENARIO_LAYER2_FUSED_MOE_E2E = "layer2_fused_moe_e2e"
 SCENARIOS = (
     SCENARIO_LAYER0_HBM_ENVELOPE,
@@ -44,6 +48,8 @@ SCENARIOS = (
     SCENARIO_LAYER1_A2A_GATHER,
     SCENARIO_LAYER1_WEIGHT_TILE_DMA,
     SCENARIO_LAYER1_LOCAL_DMA,
+    SCENARIO_LAYER1_FFN_COMPUTE,
+    SCENARIO_LAYER1_WAIT,
     SCENARIO_LAYER2_FUSED_MOE_E2E,
 )
 
@@ -61,6 +67,8 @@ SUITE_V7X32_BF16_A2A_TOPK8_V1 = "v7x32_bf16_a2a_topk8_v1"
 SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT_V1 = "v7x32_bf16_a2a_topk8_preflight_v1"
 SUITE_V7X32_BF16_LOCAL_DMA_TOPK8 = "v7x32_bf16_local_dma_topk8"
 SUITE_V7X8_BF16_LOCAL_DMA_TOPK8 = "v7x8_bf16_local_dma_topk8"
+SUITE_V7X8_BF16_FFN_LOOP_CONTEXT = "v7x8_bf16_ffn_loop_context"
+SUITE_V7X32_BF16_WAIT_PRIMITIVES = "v7x32_bf16_wait_primitives"
 SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG_V1 = "v7x32_bf16_fused_moe_e2e_diag_v1"
 SUITES = (
     SUITE_V7X32_BF16_WEIGHT_TILES,
@@ -77,6 +85,8 @@ SUITES = (
     SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT_V1,
     SUITE_V7X32_BF16_LOCAL_DMA_TOPK8,
     SUITE_V7X8_BF16_LOCAL_DMA_TOPK8,
+    SUITE_V7X8_BF16_FFN_LOOP_CONTEXT,
+    SUITE_V7X32_BF16_WAIT_PRIMITIVES,
     SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG_V1,
 )
 
@@ -438,6 +448,32 @@ PHASE1_LOCAL_DMA_TOPK8_SHAPES: tuple[layer1_local_dma.LocalDMAShape, ...] = tupl
     for path, path_class in PHASE1_LOCAL_DMA_TOPK8_PATH_CLASSES.items()
 )
 
+PHASE1_FFN_LOOP_CONTEXT_PATH_CLASSES: dict[layer1_ffn_compute.FFNPath, str] = {
+    "dynamic_ffn1_init": "ffn1_loop_init",
+    "dynamic_ffn1_accumulate": "ffn1_loop_accumulate",
+    "dynamic_ffn2_first": "ffn2_loop_first",
+    "dynamic_ffn2_later": "ffn2_loop_later",
+}
+
+PHASE1_FFN_DYN_SZ_VALUES = (1, 2, 4, 8, 16, 32, 64, 128)
+
+PHASE1_FFN_LOOP_CONTEXT_SHAPES: tuple[layer1_ffn_compute.FFNComputeShape, ...] = tuple(
+    layer1_ffn_compute.FFNComputeShape(path=path, path_class=path_class, dyn_sz=dyn_sz)
+    for dyn_sz in PHASE1_FFN_DYN_SZ_VALUES
+    for path, path_class in PHASE1_FFN_LOOP_CONTEXT_PATH_CLASSES.items()
+)
+
+PHASE1_WAIT_REPETITIONS = (1, 2, 4, 8, 16)
+
+PHASE1_WAIT_PRIMITIVE_SHAPES: tuple[layer1_wait.WaitShape, ...] = tuple(
+    layer1_wait.WaitShape(path=path, path_class=path_class, repetitions=repetitions)
+    for repetitions in PHASE1_WAIT_REPETITIONS
+    for path, path_class in (
+        ("mesh_barrier", "mesh_barrier_all_peers"),
+        ("remote_dma_wait_1token", "remote_dma_wait_one_token"),
+    )
+)
+
 
 def load_suite_shapes(suite: str) -> tuple[WeightTileShape, ...]:
     if suite != SUITE_V7X32_BF16_WEIGHT_TILES:
@@ -514,6 +550,22 @@ def load_layer1_local_dma_suite_shapes(
     ):
         return PHASE1_LOCAL_DMA_TOPK8_SHAPES
     raise ValueError(f"Unsupported Layer 1 local DMA suite: {suite}")
+
+
+def load_layer1_ffn_compute_suite_shapes(
+    suite: str,
+) -> tuple[layer1_ffn_compute.FFNComputeShape, ...]:
+    if suite == SUITE_V7X8_BF16_FFN_LOOP_CONTEXT:
+        return PHASE1_FFN_LOOP_CONTEXT_SHAPES
+    raise ValueError(f"Unsupported Layer 1 FFN compute suite: {suite}")
+
+
+def load_layer1_wait_suite_shapes(
+    suite: str,
+) -> tuple[layer1_wait.WaitShape, ...]:
+    if suite == SUITE_V7X32_BF16_WAIT_PRIMITIVES:
+        return PHASE1_WAIT_PRIMITIVE_SHAPES
+    raise ValueError(f"Unsupported Layer 1 wait suite: {suite}")
 
 
 def load_layer2_fused_moe_e2e_suite_shapes(
@@ -806,7 +858,12 @@ def _filter_shapes_by_bf(shapes, bf_values: tuple[int, ...] | None):
     if bf_values is None:
         return shapes
     allowed = set(bf_values)
-    return tuple(shape for shape in shapes if getattr(shape, "bt", None) in allowed)
+    return tuple(
+        shape
+        for shape in shapes
+        if getattr(shape, "bt", getattr(shape, "dyn_sz", getattr(shape, "repetitions", None)))
+        in allowed
+    )
 
 
 def _layer1_a2a_gather_rows(
@@ -853,6 +910,50 @@ def _layer1_local_dma_rows(
     )
 
 
+def _layer1_ffn_compute_rows(
+    suite: str,
+    execution_mode: str,
+    runtime: dict[str, Any],
+    bf_values: tuple[int, ...] | None = None,
+) -> list[dict[str, Any]]:
+    return layer1_ffn_compute.build_rows(
+        suite=suite,
+        shapes=_filter_shapes_by_bf(load_layer1_ffn_compute_suite_shapes(suite), bf_values),
+        execution_mode=execution_mode,
+        runtime=runtime,
+        dtype=DTYPE,
+        weight_dtype=WEIGHT_DTYPE,
+        t_packing=T_PACKING,
+        source=_source(),
+        metadata=_suite_metadata_for_runtime(
+            matrix_kind="ffn_loop_context_compute",
+            target_runtime=TARGET_RUNTIME_V7X8,
+        ),
+    )
+
+
+def _layer1_wait_rows(
+    suite: str,
+    execution_mode: str,
+    runtime: dict[str, Any],
+    bf_values: tuple[int, ...] | None = None,
+) -> list[dict[str, Any]]:
+    return layer1_wait.build_rows(
+        suite=suite,
+        shapes=_filter_shapes_by_bf(load_layer1_wait_suite_shapes(suite), bf_values),
+        execution_mode=execution_mode,
+        runtime=runtime,
+        dtype=DTYPE,
+        weight_dtype=WEIGHT_DTYPE,
+        t_packing=T_PACKING,
+        source=_source(),
+        metadata=_suite_metadata_for_runtime(
+            matrix_kind="wait_barrier_primitives",
+            target_runtime=TARGET_RUNTIME_V7X32,
+        ),
+    )
+
+
 def _jax_backend(runtime: dict[str, Any]) -> str | None:
     backend = runtime.get("default_backend")
     return str(backend) if backend is not None else None
@@ -871,6 +972,7 @@ def resolve_execution_mode(scenario: str, requested: str, runtime: dict[str, Any
         SCENARIO_LAYER0_HBM_ENVELOPE,
         SCENARIO_LAYER0_GEMM_ENVELOPE,
         SCENARIO_LAYER0_A2A_ENVELOPE,
+        SCENARIO_LAYER1_FFN_COMPUTE,
         SCENARIO_LAYER2_FUSED_MOE_E2E,
     ):
         return "jax_trace"
@@ -901,6 +1003,10 @@ def build_rows(
         return _layer1_weight_tile_dma_rows(suite, resolved_mode, runtime)
     if scenario == SCENARIO_LAYER1_LOCAL_DMA:
         return _layer1_local_dma_rows(suite, resolved_mode, runtime, bf_values)
+    if scenario == SCENARIO_LAYER1_FFN_COMPUTE:
+        return _layer1_ffn_compute_rows(suite, resolved_mode, runtime, bf_values)
+    if scenario == SCENARIO_LAYER1_WAIT:
+        return _layer1_wait_rows(suite, resolved_mode, runtime, bf_values)
     if scenario == SCENARIO_LAYER2_FUSED_MOE_E2E:
         layer2_fused_moe_e2e = _layer2_fused_moe_e2e()
         return layer2_fused_moe_e2e.build_rows(
