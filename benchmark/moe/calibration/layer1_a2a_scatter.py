@@ -1432,9 +1432,7 @@ def _pallas_a2a_scatter_call(
             dst_ref=sizes_smem,
             sem=metadata_sem,
         )
-        starts_to_smem.start()
         starts_to_smem.wait()
-        sizes_to_smem.start()
         sizes_to_smem.wait()
         for e_id in range(PADDED_NUM_EXPERTS):
             offsets_smem[e_id] = jnp.int32(0)
