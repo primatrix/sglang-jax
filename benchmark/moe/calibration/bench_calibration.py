@@ -61,6 +61,7 @@ SUITE_V7X32_BF16_A2A_TOPK8_V1 = "v7x32_bf16_a2a_topk8_v1"
 SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT_V1 = "v7x32_bf16_a2a_topk8_preflight_v1"
 SUITE_V7X32_BF16_LOCAL_DMA_TOPK8_V1 = "v7x32_bf16_local_dma_topk8_v1"
 SUITE_V7X8_BF16_LOCAL_DMA_TOPK8_V1 = "v7x8_bf16_local_dma_topk8_v1"
+SUITE_V7X8_BF16_LOCAL_DMA_TOPK8_V2 = "v7x8_bf16_local_dma_topk8_v2"
 SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG_V1 = "v7x32_bf16_fused_moe_e2e_diag_v1"
 SUITES = (
     SUITE_V7X32_BF16_WEIGHT_TILES,
@@ -77,6 +78,7 @@ SUITES = (
     SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT_V1,
     SUITE_V7X32_BF16_LOCAL_DMA_TOPK8_V1,
     SUITE_V7X8_BF16_LOCAL_DMA_TOPK8_V1,
+    SUITE_V7X8_BF16_LOCAL_DMA_TOPK8_V2,
     SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG_V1,
 )
 
@@ -508,7 +510,11 @@ def load_layer1_a2a_gather_suite_shapes(
 def load_layer1_local_dma_suite_shapes(
     suite: str,
 ) -> tuple[layer1_local_dma.LocalDMAShape, ...]:
-    if suite in (SUITE_V7X32_BF16_LOCAL_DMA_TOPK8_V1, SUITE_V7X8_BF16_LOCAL_DMA_TOPK8_V1):
+    if suite in (
+        SUITE_V7X32_BF16_LOCAL_DMA_TOPK8_V1,
+        SUITE_V7X8_BF16_LOCAL_DMA_TOPK8_V1,
+        SUITE_V7X8_BF16_LOCAL_DMA_TOPK8_V2,
+    ):
         return PHASE1_LOCAL_DMA_TOPK8_SHAPES
     raise ValueError(f"Unsupported Layer 1 local DMA suite: {suite}")
 
@@ -832,7 +838,9 @@ def _layer1_local_dma_rows(
     bf_values: tuple[int, ...] | None = None,
 ) -> list[dict[str, Any]]:
     target_runtime = (
-        TARGET_RUNTIME_V7X8 if suite == SUITE_V7X8_BF16_LOCAL_DMA_TOPK8_V1 else TARGET_RUNTIME_V7X32
+        TARGET_RUNTIME_V7X8
+        if suite in (SUITE_V7X8_BF16_LOCAL_DMA_TOPK8_V1, SUITE_V7X8_BF16_LOCAL_DMA_TOPK8_V2)
+        else TARGET_RUNTIME_V7X32
     )
     return layer1_local_dma.build_rows(
         suite=suite,

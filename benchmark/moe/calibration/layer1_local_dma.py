@@ -7,6 +7,7 @@ smoke runs emit schema-only rows.
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -17,9 +18,11 @@ from benchmark.moe.calibration.common import build_observation_row
 SCENARIO_LAYER1_LOCAL_DMA = "layer1_local_dma"
 SUITE_V7X32_BF16_LOCAL_DMA_TOPK8_V1 = "v7x32_bf16_local_dma_topk8_v1"
 SUITE_V7X8_BF16_LOCAL_DMA_TOPK8_V1 = "v7x8_bf16_local_dma_topk8_v1"
+SUITE_V7X8_BF16_LOCAL_DMA_TOPK8_V2 = "v7x8_bf16_local_dma_topk8_v2"
 SUPPORTED_SUITES = (
     SUITE_V7X32_BF16_LOCAL_DMA_TOPK8_V1,
     SUITE_V7X8_BF16_LOCAL_DMA_TOPK8_V1,
+    SUITE_V7X8_BF16_LOCAL_DMA_TOPK8_V2,
 )
 
 STATUS_NOT_IMPLEMENTED = "not_implemented"
@@ -230,12 +233,14 @@ def _make_row(
         latency_ms_samples=latency_ms_samples,
         runtime=runtime,
         source=source,
-        metadata=_metadata_for_plan(metadata, plan),
+        metadata=_metadata_for_plan(metadata, plan, status=status),
         implementation_note=implementation_note,
     )
 
 
-def _metadata_for_plan(metadata: dict[str, Any], plan: LocalDMAPlan) -> dict[str, Any]:
+def _metadata_for_plan(
+    metadata: dict[str, Any], plan: LocalDMAPlan, *, status: str
+) -> dict[str, Any]:
     shape = plan.shape
     enriched = dict(metadata)
     enriched["includes"] = list(plan.includes)
@@ -259,7 +264,7 @@ def _metadata_for_plan(metadata: dict[str, Any], plan: LocalDMAPlan) -> dict[str
         "dma_count": plan.dma_count,
         "includes": list(plan.includes),
         "excludes": list(plan.excludes),
-        "measurement_status": "schema_only",
+        "measurement_status": "measured" if status == STATUS_MEASURED else "schema_only",
     }
     return enriched
 
@@ -281,6 +286,7 @@ def _topk_fetch_plan(shape: LocalDMAShape) -> LocalDMAPlan:
             "topk_weight_dtype": "float32",
             "topk_id_dtype": "int32",
             "padding_note": "kernel pads top-k rows to padded_top_k=128 before local fetch",
+            "semaphore_pattern": "one shared DMA semaphore for weights and ids; wait via VMEM self-copy drain",
         },
         traffic_class="local_hbm_to_vmem_topk_fetch",
         kernel_reference=f"{KERNEL_PATH}:start_fetch_topk",
@@ -350,6 +356,9 @@ def _output_gather_load_plan(shape: LocalDMAShape) -> LocalDMAPlan:
             "destination": "a2a_g_acc_vmem[buf_id, k_id, t_i:t_i+1, :, 0:hidden/t_packing]",
             "copies": "one local HBM->VMEM DMA per valid token per top_k expert",
             "valid_token_assumption": "smoke rows model all bt tokens as valid",
+            "acc_bt": math.gcd(shape.bt, 16),
+            "num_acc_tiles": shape.bt // math.gcd(shape.bt, 16),
+            "semaphore_pattern": "all copies in an acc tile share one DMA semaphore; wait drains acc_bt * top_k signals",
         },
         traffic_class="local_hbm_to_vmem_output_gather_load",
         kernel_reference=f"{KERNEL_PATH}:start_load_acc_bt",
@@ -464,12 +473,20 @@ def _pallas_local_dma_call(arrays, *, plan, jax, jnp, pl, pltpu):
             ids_copy = pltpu.make_async_copy(
                 src_ref=ids_ref,
                 dst_ref=ids_vmem,
-                sem=sems.at[1],
+                sem=sems.at[0],
             )
             weights_copy.start()
             ids_copy.start()
-            weights_copy.wait()
-            ids_copy.wait()
+            pltpu.make_async_copy(
+                src_ref=weights_vmem,
+                dst_ref=weights_vmem,
+                sem=sems.at[0],
+            ).wait()
+            pltpu.make_async_copy(
+                src_ref=ids_vmem,
+                dst_ref=ids_vmem,
+                sem=sems.at[0],
+            ).wait()
 
         return pl.pallas_call(
             kernel,
@@ -485,7 +502,7 @@ def _pallas_local_dma_call(arrays, *, plan, jax, jnp, pl, pltpu):
                 scratch_shapes=[
                     pltpu.VMEM((shape.bt, PADDED_TOP_K), jnp.float32),
                     pltpu.VMEM((shape.bt, PADDED_TOP_K), jnp.int32),
-                    pltpu.SemaphoreType.DMA((2,)),
+                    pltpu.SemaphoreType.DMA((1,)),
                 ],
             ),
             compiler_params=pltpu.CompilerParams(has_side_effects=True),
@@ -542,29 +559,61 @@ def _pallas_local_dma_call(arrays, *, plan, jax, jnp, pl, pltpu):
 
     if shape.path == "output_gather_load":
         (src,) = arrays
+        acc_bt = math.gcd(shape.bt, 16)
+        num_acc_tiles = shape.bt // acc_bt
 
         def kernel(src_ref, out_ref, tile_vmem, sems):
             del out_ref
 
-            def copy_one(i, _):
-                t_i = i // shape.top_k
-                k_i = i % shape.top_k
-                copy = pltpu.make_async_copy(
-                    src_ref=src_ref.at[t_i, k_i],
-                    dst_ref=tile_vmem.at[t_i, k_i],
-                    sem=sems.at[0],
-                )
-                copy.start()
-                copy.wait()
+            def start_tile(tile_id):
+                tile_start = tile_id * acc_bt
+                buf_id = tile_id & 1
 
-            jax.lax.fori_loop(0, shape.bt * shape.top_k, copy_one, None, unroll=False)
+                def copy_one(i, _):
+                    t_i = i // shape.top_k
+                    k_i = i % shape.top_k
+                    copy = pltpu.make_async_copy(
+                        src_ref=src_ref.at[tile_start + t_i, k_i],
+                        dst_ref=tile_vmem.at[buf_id, k_i, t_i],
+                        sem=sems.at[0],
+                    )
+                    copy.start()
+                    return None
+
+                jax.lax.fori_loop(0, acc_bt * shape.top_k, copy_one, None, unroll=False)
+
+            def wait_tile(tile_id):
+                buf_id = tile_id & 1
+
+                def wait_one(_, __):
+                    ref = tile_vmem.at[buf_id, 0, pl.ds(0, 1)]
+                    pltpu.make_async_copy(
+                        src_ref=ref,
+                        dst_ref=ref,
+                        sem=sems.at[0],
+                    ).wait()
+                    return None
+
+                jax.lax.fori_loop(0, acc_bt * shape.top_k, wait_one, None, unroll=False)
+
+            start_tile(jnp.int32(0))
+
+            def run_tile(tile_id, _):
+                @pl.when(tile_id != num_acc_tiles - 1)
+                def _():
+                    start_tile(tile_id + 1)
+
+                wait_tile(tile_id)
+                return None
+
+            jax.lax.fori_loop(0, num_acc_tiles, run_tile, None, unroll=False)
 
         return _single_input_pallas_call(
             kernel,
             src,
             out_shape=jax.ShapeDtypeStruct((1,), jnp.bfloat16),
             scratch_shapes=[
-                pltpu.VMEM((shape.bt, shape.top_k, shape.t_packing, hpt), jnp.bfloat16),
+                pltpu.VMEM((2, shape.top_k, acc_bt, shape.t_packing, hpt), jnp.bfloat16),
                 pltpu.SemaphoreType.DMA((1,)),
             ],
             jax=jax,
