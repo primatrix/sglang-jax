@@ -1368,8 +1368,8 @@ def _pallas_a2a_scatter_call(
         topk_ids_vmem,
         starts_vmem,
         sizes_vmem,
-        offsets_vmem,
-        send_counts_vmem,
+        offsets_smem,
+        send_counts_smem,
         topk_sem,
         metadata_sem,
         send_sems,
@@ -1420,8 +1420,8 @@ def _pallas_a2a_scatter_call(
         sizes_copy.start()
         starts_copy.wait()
         sizes_copy.wait()
-        offsets_vmem[...] = jnp.zeros_like(offsets_vmem)
-        send_counts_vmem[...] = jnp.zeros_like(send_counts_vmem)
+        offsets_smem[...] = jnp.zeros_like(offsets_smem)
+        send_counts_smem[...] = jnp.zeros_like(send_counts_smem)
 
         def scatter_one(t_id, _):
             for k_id in range(shape.top_k):
@@ -1430,13 +1430,13 @@ def _pallas_a2a_scatter_call(
                 e_id_safe = jnp.where(is_valid, e_id, jnp.int32(0))
                 recv_id = e_id_safe // shape.local_num_experts
                 e_sem_id = e_id_safe % shape.local_num_experts
-                offset = offsets_vmem[e_id_safe]
-                offsets_vmem[e_id_safe] = offset + jnp.where(is_valid, jnp.int32(1), jnp.int32(0))
+                offset = offsets_smem[e_id_safe]
+                offsets_smem[e_id_safe] = offset + jnp.where(is_valid, jnp.int32(1), jnp.int32(0))
                 dst_start = starts_vmem[e_id_safe] + offset
                 is_local = recv_id == rank
                 local_sz = jnp.where(is_valid & is_local, jnp.int32(1), jnp.int32(0))
                 remote_sz = jnp.where(is_valid & ~is_local, jnp.int32(1), jnp.int32(0))
-                send_counts_vmem[e_sem_id] = send_counts_vmem[e_sem_id] + remote_sz
+                send_counts_smem[e_sem_id] = send_counts_smem[e_sem_id] + remote_sz
 
                 @pl.when(local_sz != 0)
                 def _local_copy(e_sem_id=e_sem_id, dst_start=dst_start, local_sz=local_sz):
@@ -1469,7 +1469,7 @@ def _pallas_a2a_scatter_call(
         lax.fori_loop(0, shape.bt, scatter_one, None, unroll=False)
 
         def wait_send_one(slot, _):
-            scatter_send_sz = send_counts_vmem[slot]
+            scatter_send_sz = send_counts_smem[slot]
 
             @pl.when(scatter_send_sz != 0)
             def _():
@@ -1515,8 +1515,8 @@ def _pallas_a2a_scatter_call(
                 pltpu.VMEM((shape.bt, PADDED_TOP_K), topk_ids_hbm.dtype),
                 pltpu.VMEM((PADDED_NUM_EXPERTS,), topk_ids_hbm.dtype),
                 pltpu.VMEM((PADDED_NUM_EXPERTS,), topk_ids_hbm.dtype),
-                pltpu.VMEM((PADDED_NUM_EXPERTS,), topk_ids_hbm.dtype),
-                pltpu.VMEM((shape.local_num_experts,), topk_ids_hbm.dtype),
+                pltpu.SMEM((PADDED_NUM_EXPERTS,), topk_ids_hbm.dtype),
+                pltpu.SMEM((shape.local_num_experts,), topk_ids_hbm.dtype),
                 pltpu.SemaphoreType.DMA,
                 pltpu.SemaphoreType.DMA,
                 pltpu.SemaphoreType.DMA((shape.local_num_experts,)),
