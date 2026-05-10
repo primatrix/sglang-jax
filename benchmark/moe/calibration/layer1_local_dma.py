@@ -329,7 +329,7 @@ def _accumulator_store_or_rmw_plan(shape: LocalDMAShape) -> LocalDMAPlan:
             "store_destination": "a2a_s_acc_x2_hbm[e_sem_id, tile_start:tile_start+bt, :, bd2_slice]",
             "bd2": shape.hidden_size,
             "bd2_per_t_packing": shape.hidden_size // shape.t_packing,
-            "rmw_note": "v1 accounts one local read plus one local write for the RMW-capable path",
+            "rmw_note": "accounts one local read plus one local write for the RMW-capable path",
         },
         traffic_class="local_hbm_vmem_accumulator_rmw",
         kernel_reference=(
