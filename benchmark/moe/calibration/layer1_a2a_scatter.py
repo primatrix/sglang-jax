@@ -181,10 +181,10 @@ def build_metadata_full_rows(
                 implementation_note=(
                     "Measured with a Pallas TPU microkernel aligned to the full "
                     "fused-MoE all_reduce_metadata stage: synthetic t2e routing "
-                    "staging, offsets/starts/sizes/d2e_count SMEM copies, "
+                    "HBM-to-VMEM staging, offsets/starts/sizes/d2e_count SMEM copies, "
                     "recursive-doubling d2e_count remote DMA, and local "
                     "reduced_sizes/reduced_starts computation. It excludes "
-                    "topk HBM fetch, scatter, expert compute, and gather."
+                    "scatter, expert compute, and gather."
                 ),
             )
         )
@@ -659,7 +659,7 @@ def _metadata_for_metadata_full_shape(
         "local_metadata_bytes_per_device": _metadata_local_bytes_per_device(shape),
         "traffic_class": "metadata_full_stage",
         "includes": [
-            "synthetic_t2e_routing_vmem_staging",
+            "synthetic_t2e_routing_hbm_to_vmem_staging",
             "t2e_routing_smem_copy",
             "offsets_zero_and_smem_copy",
             "d2e_count_init",
@@ -671,7 +671,6 @@ def _metadata_for_metadata_full_shape(
             "mesh_barrier",
         ],
         "excludes": [
-            "topk_hbm_fetch",
             "scatter",
             "expert_compute",
             "gather",
@@ -961,15 +960,18 @@ def _measure_a2a_metadata_full_ms(
 
     mesh = _build_tensor_mesh(jax=jax, np=np, ep_size=shape.ep_size, tp_size=1)
     count_sharding = NamedSharding(mesh, P("tensor", None))
+    topk_sharding = NamedSharding(mesh, P("tensor", None))
     local_counts = _make_local_counts(jax=jax, np=np, sharding=count_sharding, shape=shape)
-    jax.block_until_ready(local_counts)
+    topk_ids = _make_metadata_topk_ids(jax=jax, np=np, sharding=topk_sharding, shape=shape)
+    jax.block_until_ready((local_counts, topk_ids))
 
     with jax.set_mesh(mesh):
 
         @jax.jit
-        def run_metadata_full(local_counts_hbm):
+        def run_metadata_full(local_counts_hbm, topk_ids_hbm):
             return _sharded_metadata_full_call(
                 local_counts_hbm,
+                topk_ids_hbm,
                 shape=shape,
                 mesh=mesh,
                 jax=jax,
@@ -978,11 +980,11 @@ def _measure_a2a_metadata_full_ms(
                 P=P,
             )
 
-        jax.block_until_ready(run_metadata_full(local_counts))
+        jax.block_until_ready(run_metadata_full(local_counts, topk_ids))
         task = f"layer1_a2a_metadata_full_bt{shape.bt}_{shape.path_class}"
         return multiple_iteration_timeit_from_trace(
             compute_func=run_metadata_full,
-            data_generator=lambda: (local_counts,),
+            data_generator=lambda: (local_counts, topk_ids),
             task=task,
             tries=sample_runs,
             warmup=warmup_runs,
@@ -1011,24 +1013,25 @@ def _sharded_metadata_call(local_counts_hbm, *, shape: A2AMetadataShape, mesh, j
 
 
 def _sharded_metadata_full_call(
-    local_counts_hbm, *, shape: A2AMetadataShape, mesh, jax, pl, pltpu, P
+    local_counts_hbm, topk_ids_hbm, *, shape: A2AMetadataShape, mesh, jax, pl, pltpu, P
 ):
     @jax.shard_map(
         mesh=mesh,
-        in_specs=P("tensor", None),
+        in_specs=(P("tensor", None), P("tensor", None)),
         out_specs=P("tensor"),
         check_vma=False,
     )
-    def per_rank(local_counts):
+    def per_rank(local_counts, topk_ids):
         return _pallas_a2a_metadata_full_call(
             local_counts,
+            topk_ids,
             shape=shape,
             jax=jax,
             pl=pl,
             pltpu=pltpu,
         )
 
-    return per_rank(local_counts_hbm)
+    return per_rank(local_counts_hbm, topk_ids_hbm)
 
 
 def _pallas_a2a_metadata_call(local_counts_hbm, *, shape, jax, pl, pltpu):
@@ -1126,9 +1129,10 @@ def _pallas_a2a_metadata_call(local_counts_hbm, *, shape, jax, pl, pltpu):
     )(local_counts_hbm)
 
 
-def _pallas_a2a_metadata_full_call(local_counts_hbm, *, shape, jax, pl, pltpu):
+def _pallas_a2a_metadata_full_call(local_counts_hbm, topk_ids_hbm, *, shape, jax, pl, pltpu):
     def kernel(
         local_counts_ref,
+        topk_ids_ref,
         out_ref,
         t2e_routing_vmem,
         d2e_count_vmem,
@@ -1169,16 +1173,13 @@ def _pallas_a2a_metadata_full_call(local_counts_hbm, *, shape, jax, pl, pltpu):
             sem=send_sem,
         )
 
-        t2e_routing_vmem[...] = jnp.full_like(t2e_routing_vmem, -1)
-
-        def write_token(t_id, _):
-            for k_id in range(shape.top_k):
-                recv_id = (rank + jnp.int32(k_id + 1)) % jnp.int32(shape.ep_size)
-                e_id = recv_id * jnp.int32(shape.local_num_experts) + jnp.int32(k_id)
-                t2e_routing_vmem[t_id, k_id] = e_id
-            return None
-
-        lax.fori_loop(0, shape.bt, write_token, None, unroll=False)
+        topk_copy = pltpu.make_async_copy(
+            src_ref=topk_ids_ref.at[pl.ds(0, shape.bt)],
+            dst_ref=t2e_routing_vmem,
+            sem=send_sem,
+        )
+        topk_copy.start()
+        topk_copy.wait()
 
         t2e_routing_copy = pltpu.async_copy(
             src_ref=t2e_routing_vmem,
@@ -1267,7 +1268,10 @@ def _pallas_a2a_metadata_full_call(local_counts_hbm, *, shape, jax, pl, pltpu):
         out_shape=jax.ShapeDtypeStruct((1,), local_counts_hbm.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
-            in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)],
+            in_specs=[
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            ],
             out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
             grid=(1,),
             scratch_shapes=[
@@ -1293,7 +1297,7 @@ def _pallas_a2a_metadata_full_call(local_counts_hbm, *, shape, jax, pl, pltpu):
             vmem_limit_bytes=VMEM_LIMIT_BYTES,
         ),
         name=f"layer1_a2a_metadata_full_bt{shape.bt}",
-    )(local_counts_hbm)
+    )(local_counts_hbm, topk_ids_hbm)
 
 
 def _pallas_a2a_scatter_call(tokens_hbm, topk_ids_hbm, scratch_hbm, *, shape, jax, jnp, pl, pltpu):
@@ -1471,6 +1475,24 @@ def _make_local_counts(*, jax: Any, np: Any, sharding: Any, shape: A2AMetadataSh
                 recv_id = (rank_id + k_id + 1) % shape.ep_size
                 e_id = recv_id * shape.local_num_experts + k_id
                 out[local_row, e_id] = shape.bt
+        return out
+
+    return jax.make_array_from_callback(global_shape, sharding, data_callback)
+
+
+def _make_metadata_topk_ids(*, jax: Any, np: Any, sharding: Any, shape: A2AMetadataShape):
+    global_shape = (shape.bt * shape.ep_size, PADDED_TOP_K)
+
+    def data_callback(index):
+        leading = index[0]
+        start = int(leading.start or 0)
+        stop = int(leading.stop or global_shape[0])
+        rank_id = start // shape.bt
+        local_rows = stop - start
+        out = np.full((local_rows, PADDED_TOP_K), -1, dtype=np.int32)
+        for k_id in range(shape.top_k):
+            recv_id = (rank_id + k_id + 1) % shape.ep_size
+            out[:, k_id] = recv_id * shape.local_num_experts + k_id
         return out
 
     return jax.make_array_from_callback(global_shape, sharding, data_callback)
