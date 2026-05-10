@@ -1,13 +1,19 @@
 .git
 .gitignore
 .gcloudignore
+.DS_Store
+.claude/
+.gemini/
 
 __pycache__/
 **/__pycache__/
 *.py[cod]
 .mypy_cache/
 .ruff_cache/
+.github/
 python/.pytest_cache/
 python/.ruff_cache/
 
+docs/
 docs/superpowers/
+test/
