@@ -17,6 +17,11 @@ from benchmark.moe.calibration.common import build_observation_row
 
 SCENARIO_LAYER1_LOCAL_DMA = "layer1_local_dma"
 SUITE_V7X32_BF16_LOCAL_DMA_TOPK8_V1 = "v7x32_bf16_local_dma_topk8_v1"
+SUITE_V7X8_BF16_LOCAL_DMA_TOPK8_V1 = "v7x8_bf16_local_dma_topk8_v1"
+SUPPORTED_SUITES = (
+    SUITE_V7X32_BF16_LOCAL_DMA_TOPK8_V1,
+    SUITE_V7X8_BF16_LOCAL_DMA_TOPK8_V1,
+)
 
 STATUS_NOT_IMPLEMENTED = "not_implemented"
 STATUS_MEASURED = "measured"
@@ -92,7 +97,7 @@ def build_rows(
     source: dict[str, Any],
     metadata: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    if suite != SUITE_V7X32_BF16_LOCAL_DMA_TOPK8_V1:
+    if suite not in SUPPORTED_SUITES:
         raise ValueError(f"Unsupported Layer 1 local DMA suite: {suite}")
     if dtype != DTYPE or weight_dtype != WEIGHT_DTYPE or t_packing != T_PACKING:
         raise ValueError("layer1_local_dma v1 supports only bf16 tokens/weights with t_packing=2.")
