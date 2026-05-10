@@ -1420,8 +1420,10 @@ def _pallas_a2a_scatter_call(
         sizes_copy.start()
         starts_copy.wait()
         sizes_copy.wait()
-        offsets_smem[...] = jnp.zeros_like(offsets_smem)
-        send_counts_smem[...] = jnp.zeros_like(send_counts_smem)
+        for e_id in range(PADDED_NUM_EXPERTS):
+            offsets_smem[e_id] = jnp.int32(0)
+        for slot in range(shape.local_num_experts):
+            send_counts_smem[slot] = jnp.int32(0)
 
         def scatter_one(t_id, _):
             for k_id in range(shape.top_k):
