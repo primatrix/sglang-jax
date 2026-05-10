@@ -824,11 +824,14 @@ def _layer1_a2a_gather_rows(
 
 
 def _layer1_local_dma_rows(
-    suite: str, execution_mode: str, runtime: dict[str, Any]
+    suite: str,
+    execution_mode: str,
+    runtime: dict[str, Any],
+    bf_values: tuple[int, ...] | None = None,
 ) -> list[dict[str, Any]]:
     return layer1_local_dma.build_rows(
         suite=suite,
-        shapes=load_layer1_local_dma_suite_shapes(suite),
+        shapes=_filter_shapes_by_bf(load_layer1_local_dma_suite_shapes(suite), bf_values),
         execution_mode=execution_mode,
         runtime=runtime,
         dtype=DTYPE,
@@ -886,7 +889,7 @@ def build_rows(
     if scenario == SCENARIO_LAYER1_WEIGHT_TILE_DMA:
         return _layer1_weight_tile_dma_rows(suite, resolved_mode, runtime)
     if scenario == SCENARIO_LAYER1_LOCAL_DMA:
-        return _layer1_local_dma_rows(suite, resolved_mode, runtime)
+        return _layer1_local_dma_rows(suite, resolved_mode, runtime, bf_values)
     if scenario == SCENARIO_LAYER2_FUSED_MOE_E2E:
         layer2_fused_moe_e2e = _layer2_fused_moe_e2e()
         return layer2_fused_moe_e2e.build_rows(
@@ -938,7 +941,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional comma-separated bf/bt values to run. Currently used for "
-            "Layer 1 gather process isolation, e.g. --bf-values 1 or 1,2."
+            "Layer 1 gather/local-DMA process isolation, e.g. --bf-values 1 or 1,2."
         ),
     )
     parser.add_argument(
