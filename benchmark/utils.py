@@ -39,18 +39,23 @@ def _maybe_enable_compilation_cache_from_env() -> None:
 _maybe_enable_compilation_cache_from_env()
 
 
+def _event_text(event: dict[str, Any]) -> str:
+    args = event.get("args", {})
+    return " ".join(
+        str(part)
+        for part in (
+            event.get("name", ""),
+            event.get("cat", ""),
+            args.get("long_name", ""),
+            args.get("tf_op", ""),
+            args.get("op_name", ""),
+            args.get("hlo_module", ""),
+        )
+        if part
+    )
+
+
 def _extract_marker_durations_ms(trace: dict[str, Any], task: str | None = None) -> list[float]:
-    marker_events: list[dict[str, Any]] = []
-    for e in trace.get("traceEvents", []):
-        args = e.get("args", {})
-        tf_op = args.get("tf_op", "")
-        if MARKER in tf_op:
-            marker_events.append(e)
-
-    marker_call_done_events = [e for e in marker_events if e.get("name", "").endswith("call-done")]
-    if marker_call_done_events:
-        marker_events = marker_call_done_events
-
     def _durations_by_pid(events: list[dict[str, Any]]) -> dict[int, list[float]]:
         by_pid: dict[int, list[dict[str, Any]]] = {}
         for e in events:
@@ -72,23 +77,51 @@ def _extract_marker_durations_ms(trace: dict[str, Any], task: str | None = None)
                 durations[pid] = pid_durations
         return durations
 
-    if not marker_events:
-        if not task:
-            return []
-        event_matcher = re.compile(task)
-        events = []
-        for e in trace.get("traceEvents", []):
-            if "name" in e and event_matcher.match(e["name"]):
-                events.append(e)
+    def _dominant_pid_durations(events: list[dict[str, Any]]) -> list[float]:
         durations_by_pid = _durations_by_pid(events)
         if not durations_by_pid:
             return []
         return max(sorted(durations_by_pid.items()), key=lambda kv: len(kv[1]))[1]
 
-    durations_by_pid = _durations_by_pid(marker_events)
-    if not durations_by_pid:
-        return []
-    return max(sorted(durations_by_pid.items()), key=lambda kv: len(kv[1]))[1]
+    trace_events = trace.get("traceEvents", [])
+
+    # Prefer explicit benchmark step markers. These are host trace annotation
+    # boundaries around one timed iteration and exist even when compute_func is
+    # already jitted, where an outer jax.named_scope may not enter XLA.
+    marker_step_events = [
+        e
+        for e in trace_events
+        if (
+            str(e.get("name", "")).startswith(f"{MARKER}:")
+            or str((e.get("args", {}) or {}).get("long_name", "")).startswith(f"{MARKER}:")
+        )
+        and "step_num" in (e.get("args", {}) or {})
+    ]
+    marker_durations = _dominant_pid_durations(marker_step_events)
+    if marker_durations:
+        return marker_durations
+
+    # If a benchmark marker is emitted inside compiled work, it may show up in
+    # tf_op/op_name/hlo_module instead of the event name.
+    marker_events = [e for e in trace_events if MARKER in _event_text(e)]
+    marker_call_done_events = [e for e in marker_events if e.get("name", "").endswith("call-done")]
+    if marker_call_done_events:
+        marker_events = marker_call_done_events
+    marker_durations = _dominant_pid_durations(marker_events)
+    if marker_durations:
+        return marker_durations
+
+    if task:
+        event_matcher = re.compile(task)
+        events = []
+        for e in trace_events:
+            if "name" in e and event_matcher.match(e["name"]):
+                events.append(e)
+        task_durations = _dominant_pid_durations(events)
+        if task_durations:
+            return task_durations
+
+    return []
 
 
 def _load_trace(trace_root: str) -> dict[str, Any]:
@@ -150,10 +183,11 @@ def multiple_iteration_timeit_from_trace(
 
     trace_kwargs = {"profiler_options": profiler_options} if profiler_options is not None else {}
     traced_tries = int(tries) + max(0, int(discard_initial_samples))
+    marker_task = f"{MARKER}:{task}"
     with jax.profiler.trace(trace_dir, **trace_kwargs):
         for i in range(traced_tries):
             data_args = data_generator()
-            with jax.profiler.StepTraceAnnotation(task, step_num=i):
+            with jax.profiler.StepTraceAnnotation(marker_task, step_num=i):
                 with jax.named_scope(f"{MARKER}_{i}"):
                     out = compute_func(*data_args)
                     jax.block_until_ready(out)
