@@ -86,28 +86,42 @@ def _extract_marker_durations_ms(trace: dict[str, Any], task: str | None = None)
 
     trace_events = trace.get("traceEvents", [])
 
-    # Prefer explicit benchmark step markers. These are host trace annotation
-    # boundaries around one timed iteration and exist even when compute_func is
-    # already jitted, where an outer jax.named_scope may not enter XLA.
-    marker_step_events = [
+    if task:
+        preferred_patterns = []
+        if task.startswith("layer0_a2a_"):
+            preferred_patterns.append("SGLANG_JAX_LAYER0_A2A")
+        scatter_match = re.search(r"(layer1_a2a_scatter_topk8_bt\d+)", task)
+        if scatter_match:
+            preferred_patterns.append(scatter_match.group(1))
+        gather_match = re.search(r"(layer1_a2a_gather_topk8_bt\d+)", task)
+        if gather_match:
+            preferred_patterns.append(gather_match.group(1))
+        if task.startswith("layer1_wait_"):
+            preferred_patterns.append(task)
+
+        preferred_events = [
+            e
+            for e in trace_events
+            if preferred_patterns
+            and any(pattern in _event_text(e) for pattern in preferred_patterns)
+            and (e.get("args", {}) or {}).get("device_duration_ps")
+            and not str(e.get("name", "")).startswith("jit_")
+        ]
+        preferred_durations = _dominant_pid_durations(preferred_events)
+        if preferred_durations:
+            return preferred_durations
+
+    # Prefer compiled/device marker events, matching the Ironwood
+    # microbenchmarks. StepTraceAnnotation events and outer jit call-done
+    # events are host/envelope windows and are kept only as fallbacks.
+    marker_events = [
         e
         for e in trace_events
-        if (
-            str(e.get("name", "")).startswith(f"{MARKER}:")
-            or str((e.get("args", {}) or {}).get("long_name", "")).startswith(f"{MARKER}:")
-        )
-        and "step_num" in (e.get("args", {}) or {})
+        if MARKER in _event_text(e)
+        and not str(e.get("name", "")).startswith(f"{MARKER}:")
+        and not str((e.get("args", {}) or {}).get("long_name", "")).startswith(f"{MARKER}:")
+        and not str(e.get("name", "")).endswith("call-done")
     ]
-    marker_durations = _dominant_pid_durations(marker_step_events)
-    if marker_durations:
-        return marker_durations
-
-    # If a benchmark marker is emitted inside compiled work, it may show up in
-    # tf_op/op_name/hlo_module instead of the event name.
-    marker_events = [e for e in trace_events if MARKER in _event_text(e)]
-    marker_call_done_events = [e for e in marker_events if e.get("name", "").endswith("call-done")]
-    if marker_call_done_events:
-        marker_events = marker_call_done_events
     marker_durations = _dominant_pid_durations(marker_events)
     if marker_durations:
         return marker_durations
@@ -121,6 +135,19 @@ def _extract_marker_durations_ms(trace: dict[str, Any], task: str | None = None)
         task_durations = _dominant_pid_durations(events)
         if task_durations:
             return task_durations
+
+    marker_step_events = [
+        e
+        for e in trace_events
+        if (
+            str(e.get("name", "")).startswith(f"{MARKER}:")
+            or str((e.get("args", {}) or {}).get("long_name", "")).startswith(f"{MARKER}:")
+        )
+        and "step_num" in (e.get("args", {}) or {})
+    ]
+    marker_step_durations = _dominant_pid_durations(marker_step_events)
+    if marker_step_durations:
+        return marker_step_durations
 
     return []
 
@@ -210,11 +237,10 @@ def _trace_timing_summary(
         "task": task,
         "marker": MARKER,
         "timing_semantics": {
-            "marker_ms": "StepTraceAnnotation boundary around one benchmark iteration.",
-            "barrier_cores_ms": "Device trace barrier-cores events; these may overlap marker work and are not safely subtractive per event.",
+            "marker_ms": "Preferred device marker duration from named_scope/tf_op device_duration_ps; falls back to task-matched device event, then host StepTraceAnnotation only if no device marker exists.",
+            "barrier_cores_ms": "Device trace barrier-cores events; diagnostic only.",
             "marker_minus_barrier_cores_ms": (
-                "Diagnostic residual using marker sample minus p50 barrier_cores. "
-                "This is not pure communication time."
+                "Deprecated diagnostic residual. Do not use as communication time."
             ),
             "event_groups": "Best-effort trace decomposition by event name/tf_op.",
         },
