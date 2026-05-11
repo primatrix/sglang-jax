@@ -22,6 +22,11 @@ cdiv = pl.cdiv
 # hardware (v6e-32GB → ~960MB, v7x-96GB → ~2.9GB) instead of a fixed cap.
 _A2A_HBM_FRACTION = 0.03
 
+# For decode-sized tiles, waiting for gather receives by scanning all global
+# experts is mostly control overhead.  Route-scanning waits once per unique
+# local routed expert and keeps the old full-expert scan for larger tiles.
+_A2A_GATHER_ROUTE_SCAN_MAX_ROUTES = 256
+
 
 @functools.lru_cache(maxsize=1)
 def _device_hbm_bytes() -> int:
@@ -1141,6 +1146,32 @@ def _fused_ep_moe_kernel(
         # We conservatively wait once for every expert that has nonzero tokens
         # routed from `my_id` (local copies for local experts and remote receives
         # for remote experts both signal the same `a2a_gather_sem` on this device).
+        def _wait_by_routes(seen_vmem):
+            seen_vmem[...] = jnp.zeros_like(seen_vmem)
+
+            def _wait_one_route(t_id, _):
+                for k_id in range(top_k):
+                    e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
+                    is_valid = e_id >= 0
+                    e_id_safe = lax.select(is_valid, e_id, jnp.int32(0))
+                    seen = seen_vmem[e_id_safe]
+                    sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, e_id_safe]
+                    should_wait = is_valid & (seen == 0) & (sz != 0)
+                    seen_vmem[e_id_safe] = lax.select(is_valid, jnp.int32(1), seen)
+
+                    @pl.when(should_wait)
+                    def _():
+                        ref = a2a_g_hbm.at[e_id_safe, pl.ds(0, sz)]
+                        pltpu.make_async_copy(
+                            src_ref=ref,
+                            dst_ref=ref,
+                            sem=a2a_gather_sem,
+                        ).wait()
+
+                return None
+
+            lax.fori_loop(0, bt, _wait_one_route, None, unroll=False)
+
         def _wait_one_expert(e_id, _):
             sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, e_id]
 
@@ -1155,7 +1186,13 @@ def _fused_ep_moe_kernel(
 
             return None
 
-        lax.fori_loop(0, num_experts, _wait_one_expert, None, unroll=False)
+        if bt * top_k < num_experts and bt * top_k <= _A2A_GATHER_ROUTE_SCAN_MAX_ROUTES:
+            pl.run_scoped(
+                _wait_by_routes,
+                pltpu.VMEM((padded_num_experts,), jnp.int32),
+            )
+        else:
+            lax.fori_loop(0, num_experts, _wait_one_expert, None, unroll=False)
 
     def start_fetch_and_wait_se_scales():
         if w1_shared_hbm is None:
