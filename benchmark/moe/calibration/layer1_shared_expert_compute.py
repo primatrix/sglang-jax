@@ -1,4 +1,4 @@
-"""Layer 1 fused-MoE shared-expert slice calibration."""
+"""Layer 1 fused-MoE shared-expert Pallas compute calibration."""
 
 from __future__ import annotations
 
@@ -25,9 +25,15 @@ BF16_BYTES = 2
 F32_BYTES = 4
 T_PACKING = 2
 HIDDEN_SIZE = 8192
+INTERMEDIATE_SIZE = 2048
 KERNEL_PATH = "python/sgl_jax/srt/kernels/fused_moe/v1/kernel.py"
 
-SharedExpertPath = Literal["shared_expert_slice"]
+SharedExpertPath = Literal[
+    "shared_expert_gate_up_init",
+    "shared_expert_gate_up_accumulate",
+    "shared_expert_down_first",
+    "shared_expert_down_later",
+]
 
 
 @dataclass(frozen=True)
@@ -41,6 +47,7 @@ class SharedExpertShape:
     bd2: int
     config_label: str
     hidden_size: int = HIDDEN_SIZE
+    intermediate_size: int = INTERMEDIATE_SIZE
     t_packing: int = T_PACKING
 
 
@@ -62,7 +69,7 @@ def build_rows(
         raise ValueError("layer1_shared_expert_compute supports only bf16 with t_packing=2.")
 
     rows: list[dict[str, Any]] = []
-    if execution_mode != "jax_trace" or runtime.get("default_backend") != "tpu":
+    if execution_mode != "pallas" or runtime.get("default_backend") != "tpu":
         return [
             _make_row(
                 suite=suite,
@@ -91,50 +98,40 @@ def build_rows(
     for shape in shapes:
         _validate_shape(shape)
         try:
-            samples = _measure_shared_ms(
+            samples = _measure_shared_pallas_ms(
                 shape,
                 warmup_runs=warmup_runs,
                 sample_runs=sample_runs,
                 discard_runs=discard_runs,
                 trace_root=trace_root,
             )
-            rows.append(
-                _make_row(
-                    suite=suite,
-                    shape=shape,
-                    execution_mode=execution_mode,
-                    runtime=runtime,
-                    dtype=dtype,
-                    weight_dtype=weight_dtype,
-                    t_packing=t_packing,
-                    source=source,
-                    metadata=metadata,
-                    status=STATUS_MEASURED,
-                    latency_ms_samples=samples,
-                    implementation_note=(
-                        "Measured one fused-MoE shared-expert block compute slice with JAX trace "
-                        "timing: W1/W3 gate/up, activation, W2 down projection, and f32 output "
-                        "accumulation. It excludes async weight/token prefetch."
-                    ),
-                )
+            status = STATUS_MEASURED
+            note = (
+                "Measured a Pallas shared-expert compute tile aligned to "
+                "run_shared_expert_slice. It excludes async shared weight/token prefetch, "
+                "routed expert FFN, and remote DMA."
             )
         except Exception as exc:
-            rows.append(
-                _make_row(
-                    suite=suite,
-                    shape=shape,
-                    execution_mode=execution_mode,
-                    runtime=runtime,
-                    dtype=dtype,
-                    weight_dtype=weight_dtype,
-                    t_packing=t_packing,
-                    source=source,
-                    metadata=metadata,
-                    status=STATUS_NOT_IMPLEMENTED,
-                    latency_ms_samples=[],
-                    implementation_note=f"Layer1 shared expert measurement failed: {type(exc).__name__}: {exc}",
-                )
+            samples = []
+            status = STATUS_NOT_IMPLEMENTED
+            note = f"Layer1 Pallas shared expert measurement failed: {type(exc).__name__}: {exc}"
+
+        rows.append(
+            _make_row(
+                suite=suite,
+                shape=shape,
+                execution_mode=execution_mode,
+                runtime=runtime,
+                dtype=dtype,
+                weight_dtype=weight_dtype,
+                t_packing=t_packing,
+                source=source,
+                metadata=metadata,
+                status=status,
+                latency_ms_samples=samples,
+                implementation_note=note,
             )
+        )
     return rows
 
 
@@ -182,6 +179,8 @@ def _metadata_for_shape(
     metadata: dict[str, Any], shape: SharedExpertShape, *, status: str
 ) -> dict[str, Any]:
     enriched = dict(metadata)
+    num_bd1 = _ceil_div(shape.hidden_size, shape.bd1)
+    num_bd2 = _ceil_div(shape.hidden_size, shape.bd2)
     enriched["shared_expert_compute"] = {
         "kernel_path": KERNEL_PATH,
         "kernel_reference": f"{KERNEL_PATH}:run_shared_expert_slice",
@@ -192,35 +191,42 @@ def _metadata_for_shape(
         "bt": shape.bt,
         "bse": shape.bse,
         "hidden_size": shape.hidden_size,
+        "intermediate_size": shape.intermediate_size,
         "t_packing": shape.t_packing,
         "h_per_t_packing": shape.hidden_size // shape.t_packing,
         "bd1": shape.bd1,
         "bd2": shape.bd2,
-        "num_bd1": _ceil_div(shape.hidden_size, shape.bd1),
-        "num_bd2": _ceil_div(shape.hidden_size, shape.bd2),
+        "num_bd1": num_bd1,
+        "num_bd2": num_bd2,
+        "se_total_blocks": _ceil_div(shape.intermediate_size, shape.bse),
         "tile_shape": _tile_shape(shape),
         "flops": _flops(shape),
         "bytes_hbm": _bytes_hbm(shape),
-        "traffic_class": "shared_expert_compute_slice",
+        "traffic_class": "shared_expert_pallas_compute_tile",
         "measurement_status": "measured" if status == STATUS_MEASURED else "schema_only",
-        "includes": [
-            "shared_expert_gate_dot",
-            "shared_expert_up_dot",
-            "shared_expert_activation",
-            "shared_expert_down_dot",
-            "shared_expert_f32_accumulate",
-        ],
+        "measurement_scope": _measurement_scope(shape),
+        "block_cost_formula": {
+            "gate_up_tiles": num_bd1,
+            "down_tiles": num_bd2,
+            "first_block": "num_bd1 * gate_up_init + num_bd2 * down_first",
+            "later_block": "num_bd1 * gate_up_init + num_bd2 * down_later",
+        },
+        "includes": _includes(shape),
         "excludes": [
             "shared_expert_weight_hbm_to_vmem_prefetch",
             "shared_expert_token_hbm_to_vmem_prefetch",
             "routed_expert_ffn",
             "remote_dma",
+            "metadata_allgather",
+            "scatter",
+            "gather",
         ],
+        "pallas_aligned": True,
     }
     return enriched
 
 
-def _measure_shared_ms(
+def _measure_shared_pallas_ms(
     shape: SharedExpertShape,
     *,
     warmup_runs: int,
@@ -237,14 +243,14 @@ def _measure_shared_ms(
     jax.block_until_ready(inputs)
 
     @jax.jit
-    def run_shared(*arrays):
-        with jax.named_scope("SGLANG_JAX_LAYER1_SHARED_EXPERT"):
-            return _shared_loop(shape, arrays, jnp=jnp)
+    def run_shared_pallas(*arrays):
+        with jax.named_scope("SGLANG_JAX_LAYER1_SHARED_EXPERT_PALLAS"):
+            return _pallas_shared_call(shape, arrays, jax=jax, jnp=jnp)
 
-    jax.block_until_ready(run_shared(*inputs))
-    task = f"layer1_shared_expert_{shape.config_label}"
+    jax.block_until_ready(run_shared_pallas(*inputs))
+    task = f"layer1_shared_expert_{shape.path}_{shape.config_label}"
     return multiple_iteration_timeit_from_trace(
-        compute_func=run_shared,
+        compute_func=run_shared_pallas,
         data_generator=lambda: inputs,
         task=task,
         tries=sample_runs,
@@ -255,62 +261,151 @@ def _measure_shared_ms(
 
 
 def _make_inputs(shape: SharedExpertShape, *, jnp: Any) -> tuple[Any, ...]:
-    hpt = shape.hidden_size // shape.t_packing
     bd1_per_pack = shape.bd1 // shape.t_packing
     bd2_per_pack = shape.bd2 // shape.t_packing
-    num_bd1 = _ceil_div(shape.hidden_size, shape.bd1)
-    num_bd2 = _ceil_div(shape.hidden_size, shape.bd2)
-    tokens = jnp.ones((shape.bt, shape.t_packing, hpt), dtype=jnp.bfloat16)
-    w1 = jnp.ones((shape.t_packing, num_bd1, bd1_per_pack, shape.bse), dtype=jnp.bfloat16)
-    w3 = jnp.ones((shape.t_packing, num_bd1, bd1_per_pack, shape.bse), dtype=jnp.bfloat16)
-    w2 = jnp.ones((shape.t_packing, num_bd2, shape.bse, bd2_per_pack), dtype=jnp.bfloat16)
-    out = jnp.ones((shape.bt, shape.t_packing, hpt), dtype=jnp.float32)
-    return tokens, w1, w3, w2, out
+    if shape.path in ("shared_expert_gate_up_init", "shared_expert_gate_up_accumulate"):
+        tokens = jnp.ones((shape.bt, shape.t_packing, bd1_per_pack), dtype=jnp.bfloat16)
+        w1 = jnp.ones((shape.t_packing, bd1_per_pack, shape.bse), dtype=jnp.bfloat16)
+        w3 = jnp.ones((shape.t_packing, bd1_per_pack, shape.bse), dtype=jnp.bfloat16)
+        acc = jnp.ones((2, shape.bt, shape.bse), dtype=jnp.float32)
+        return tokens, w1, w3, acc
+    gate = jnp.ones((shape.bt, shape.bse), dtype=jnp.float32)
+    up = jnp.ones((shape.bt, shape.bse), dtype=jnp.float32)
+    w2 = jnp.ones((shape.t_packing, shape.bse, bd2_per_pack), dtype=jnp.bfloat16)
+    out = jnp.ones((shape.bt, shape.t_packing, bd2_per_pack), dtype=jnp.float32)
+    return gate, up, w2, out
 
 
-def _shared_loop(shape: SharedExpertShape, arrays: tuple[Any, ...], *, jnp: Any):
-    tokens, w1, w3, w2, out = arrays
+def _pallas_shared_call(shape: SharedExpertShape, arrays: tuple[Any, ...], *, jax: Any, jnp: Any):
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
     bd1_per_pack = shape.bd1 // shape.t_packing
     bd2_per_pack = shape.bd2 // shape.t_packing
-    num_bd1 = _ceil_div(shape.hidden_size, shape.bd1)
-    num_bd2 = _ceil_div(shape.hidden_size, shape.bd2)
-    gate = jnp.zeros((shape.bt, shape.bse), dtype=jnp.float32)
-    up = jnp.zeros((shape.bt, shape.bse), dtype=jnp.float32)
 
-    for bd1_id in range(num_bd1):
+    if shape.path in ("shared_expert_gate_up_init", "shared_expert_gate_up_accumulate"):
+        tokens, w1, w3, acc = arrays
+        should_init = shape.path == "shared_expert_gate_up_init"
+
+        def kernel(tokens_ref, w1_ref, w3_ref, acc_ref, out_ref):
+            if should_init:
+                gate_acc = jnp.zeros((shape.bt, shape.bse), dtype=jnp.float32)
+                up_acc = jnp.zeros((shape.bt, shape.bse), dtype=jnp.float32)
+            else:
+                gate_acc = acc_ref[0]
+                up_acc = acc_ref[1]
+
+            for p_id in range(shape.t_packing):
+                token_slice = tokens_ref[pl.ds(0, shape.bt), p_id, pl.ds(0, bd1_per_pack)]
+                w1_tile = w1_ref[p_id, pl.ds(0, bd1_per_pack), pl.ds(0, shape.bse)]
+                w3_tile = w3_ref[p_id, pl.ds(0, bd1_per_pack), pl.ds(0, shape.bse)]
+                gate_acc += jnp.dot(token_slice, w1_tile, preferred_element_type=jnp.float32)
+                up_acc += jnp.dot(token_slice, w3_tile, preferred_element_type=jnp.float32)
+
+            out_ref[0] = gate_acc
+            out_ref[1] = up_acc
+
+        return pl.pallas_call(
+            kernel,
+            out_shape=jax.ShapeDtypeStruct((2, shape.bt, shape.bse), jnp.float32),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=0,
+                in_specs=[
+                    pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM),
+                    pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM),
+                    pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM),
+                    pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM),
+                ],
+                out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM),
+                grid=(1,),
+            ),
+            compiler_params=pltpu.CompilerParams(has_side_effects=True),
+            name=f"layer1_shared_expert_{shape.path}_{shape.config_label}",
+        )(tokens, w1, w3, acc)
+
+    gate, up, w2, out = arrays
+    should_init = shape.path == "shared_expert_down_first"
+
+    def kernel(gate_ref, up_ref, w2_ref, out_ref, result_ref):
+        act = _jax_silu(gate_ref[...], jnp=jnp) * up_ref[...]
         for p_id in range(shape.t_packing):
-            k_start = bd1_id * bd1_per_pack
-            lhs = tokens[:, p_id, k_start : k_start + bd1_per_pack]
-            gate += jnp.dot(lhs, w1[p_id, bd1_id], preferred_element_type=jnp.float32)
-            up += jnp.dot(lhs, w3[p_id, bd1_id], preferred_element_type=jnp.float32)
+            down = jnp.dot(
+                act,
+                w2_ref[p_id, pl.ds(0, shape.bse), pl.ds(0, bd2_per_pack)],
+                preferred_element_type=jnp.float32,
+            )
+            if should_init:
+                result_ref[pl.ds(0, shape.bt), p_id, pl.ds(0, bd2_per_pack)] = down
+            else:
+                result_ref[pl.ds(0, shape.bt), p_id, pl.ds(0, bd2_per_pack)] = (
+                    out_ref[pl.ds(0, shape.bt), p_id, pl.ds(0, bd2_per_pack)] + down
+                )
 
-    act = jax_silu(gate, jnp=jnp) * up
-    for bd2_id in range(num_bd2):
-        for p_id in range(shape.t_packing):
-            k_start = bd2_id * bd2_per_pack
-            down = jnp.dot(act, w2[p_id, bd2_id], preferred_element_type=jnp.float32)
-            out = out.at[:, p_id, k_start : k_start + bd2_per_pack].add(down)
-    return out
-
-
-def jax_silu(x, *, jnp: Any):
-    return x * jnp.reciprocal(1.0 + jnp.exp(-x))
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((shape.bt, shape.t_packing, bd2_per_pack), jnp.float32),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            in_specs=[
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM),
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM),
+            grid=(1,),
+        ),
+        compiler_params=pltpu.CompilerParams(has_side_effects=True),
+        name=f"layer1_shared_expert_{shape.path}_{shape.config_label}",
+    )(gate, up, w2, out)
 
 
 def _tile_shape(shape: SharedExpertShape) -> tuple[int, ...]:
-    return (shape.bt, shape.t_packing, shape.hidden_size // shape.t_packing, shape.bse)
+    if shape.path in ("shared_expert_gate_up_init", "shared_expert_gate_up_accumulate"):
+        return (shape.bt, shape.t_packing, shape.bd1 // shape.t_packing, shape.bse)
+    return (shape.bt, shape.bse, shape.t_packing, shape.bd2 // shape.t_packing)
 
 
 def _bytes_hbm(shape: SharedExpertShape) -> int:
-    token_bytes = shape.bt * shape.hidden_size * BF16_BYTES
-    w1w3_bytes = 2 * shape.hidden_size * shape.bse * BF16_BYTES
-    w2_bytes = shape.bse * shape.hidden_size * BF16_BYTES
-    out_bytes = shape.bt * shape.hidden_size * F32_BYTES
-    return token_bytes + w1w3_bytes + w2_bytes + out_bytes
+    if shape.path in ("shared_expert_gate_up_init", "shared_expert_gate_up_accumulate"):
+        token_bytes = shape.bt * shape.bd1 * BF16_BYTES
+        weight_bytes = 2 * shape.bd1 * shape.bse * BF16_BYTES
+        acc_bytes = 2 * shape.bt * shape.bse * F32_BYTES
+        return token_bytes + weight_bytes + acc_bytes
+    acc_bytes = 2 * shape.bt * shape.bse * F32_BYTES
+    weight_bytes = shape.bse * shape.bd2 * BF16_BYTES
+    output_bytes = shape.bt * shape.bd2 * F32_BYTES
+    return acc_bytes + weight_bytes + output_bytes
 
 
 def _flops(shape: SharedExpertShape) -> int:
-    return 6 * shape.bt * shape.hidden_size * shape.bse
+    if shape.path in ("shared_expert_gate_up_init", "shared_expert_gate_up_accumulate"):
+        return 4 * shape.bt * shape.bd1 * shape.bse
+    return 2 * shape.bt * shape.bse * shape.bd2
+
+
+def _includes(shape: SharedExpertShape) -> list[str]:
+    if shape.path in ("shared_expert_gate_up_init", "shared_expert_gate_up_accumulate"):
+        return [
+            "pallas_shared_expert_gate_dot_single_bd1_tile",
+            "pallas_shared_expert_up_dot_single_bd1_tile",
+            "gate_up_accumulator_update",
+        ]
+    return [
+        "pallas_shared_expert_activation",
+        "pallas_shared_expert_down_dot_single_bd2_tile",
+        "shared_output_f32_init_or_accumulate",
+    ]
+
+
+def _measurement_scope(shape: SharedExpertShape) -> str:
+    if shape.path in ("shared_expert_gate_up_init", "shared_expert_gate_up_accumulate"):
+        return "single_shared_expert_gate_up_bd1_tile"
+    return "single_shared_expert_down_bd2_tile"
+
+
+def _jax_silu(x, *, jnp: Any):
+    return x * jnp.reciprocal(1.0 + jnp.exp(-x))
 
 
 def _validate_shape(shape: SharedExpertShape) -> None:
@@ -318,10 +413,21 @@ def _validate_shape(shape: SharedExpertShape) -> None:
         raise ValueError(f"Expected positive bt/bse, got {shape.bt=} {shape.bse=}.")
     if shape.hidden_size != HIDDEN_SIZE:
         raise ValueError(f"Expected hidden_size={HIDDEN_SIZE}, got {shape.hidden_size}.")
+    if shape.intermediate_size != INTERMEDIATE_SIZE:
+        raise ValueError(
+            f"Expected intermediate_size={INTERMEDIATE_SIZE}, got {shape.intermediate_size}."
+        )
     if shape.t_packing != T_PACKING:
         raise ValueError(f"Expected t_packing={T_PACKING}, got {shape.t_packing}.")
-    if shape.bd1 % shape.t_packing != 0 or shape.bd2 % shape.t_packing != 0:
-        raise ValueError("bd1/bd2 must be divisible by t_packing.")
+    tile_align = shape.t_packing * 128
+    if shape.bd1 % tile_align != 0:
+        raise ValueError(f"Expected bd1 to be aligned to {tile_align}.")
+    if shape.bd2 % tile_align != 0:
+        raise ValueError(f"Expected bd2 to be aligned to {tile_align}.")
+    if shape.hidden_size % shape.bd1 != 0 or shape.hidden_size % shape.bd2 != 0:
+        raise ValueError("hidden_size must be divisible by bd1 and bd2.")
+    if shape.intermediate_size % shape.bse != 0:
+        raise ValueError("intermediate_size must be divisible by bse.")
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -354,6 +460,6 @@ def _not_implemented_note(execution_mode: str, runtime: dict[str, Any]) -> str:
     if execution_mode == "local_smoke":
         return "layer1_shared_expert_compute emitted schema-only rows on local_smoke."
     return (
-        "layer1_shared_expert_compute requires TPU jax_trace execution; "
+        "layer1_shared_expert_compute requires TPU pallas execution; "
         f"observed mode={execution_mode}, backend={runtime.get('default_backend')!r}."
     )

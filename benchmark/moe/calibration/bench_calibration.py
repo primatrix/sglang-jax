@@ -737,12 +737,19 @@ PHASE1_FFN_PALLAS_TUNED_FAMILY_SHAPES: tuple[layer1_ffn_pallas_compute.FFNPallas
     for path, path_class in PHASE1_FFN_PALLAS_PATH_CLASSES.items()
 )
 
+PHASE1_SHARED_EXPERT_PATH_CLASSES: dict[layer1_shared_expert_compute.SharedExpertPath, str] = {
+    "shared_expert_gate_up_init": "shared_expert_pallas_gate_up_init",
+    "shared_expert_gate_up_accumulate": "shared_expert_pallas_gate_up_accumulate",
+    "shared_expert_down_first": "shared_expert_pallas_down_first",
+    "shared_expert_down_later": "shared_expert_pallas_down_later",
+}
+
 PHASE1_SHARED_EXPERT_TUNED_FAMILY_SHAPES: tuple[
     layer1_shared_expert_compute.SharedExpertShape, ...
 ] = tuple(
     layer1_shared_expert_compute.SharedExpertShape(
-        path="shared_expert_slice",
-        path_class="shared_expert_tuned_slice",
+        path=path,
+        path_class=path_class,
         num_tokens=num_tokens,
         bt=bt,
         bse=bse,
@@ -751,6 +758,7 @@ PHASE1_SHARED_EXPERT_TUNED_FAMILY_SHAPES: tuple[
         config_label=f"tokens{num_tokens}_bt{bt}_bse{bse}_bd{bd1}",
     )
     for num_tokens, bt, _bf, bd1, bd2, _bts, _btc, _bfc, _bd1c, _bd2c, bse in PHASE1_FFN_TUNED_FAMILY_CONFIGS
+    for path, path_class in PHASE1_SHARED_EXPERT_PATH_CLASSES.items()
 )
 
 PHASE1_WAIT_REPETITIONS = (1, 2, 4, 8, 16)

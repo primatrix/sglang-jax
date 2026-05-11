@@ -111,6 +111,16 @@ def _extract_marker_durations_with_source_ms(
             if ffn_jit_durations:
                 return ffn_jit_durations, "jit_function_device_event"
         if task.startswith("layer1_shared_expert_"):
+            shared_pallas_events = [
+                e
+                for e in trace_events
+                if "layer1_shared_expert_" in _event_text(e)
+                and (e.get("args", {}) or {}).get("device_duration_ps")
+                and not str(e.get("name", "")).startswith("jit_")
+            ]
+            shared_pallas_durations = _dominant_pid_durations(shared_pallas_events)
+            if shared_pallas_durations:
+                return shared_pallas_durations, "pallas_shared_expert_device_event"
             shared_jit_events = [
                 e
                 for e in trace_events
