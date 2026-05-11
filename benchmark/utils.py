@@ -99,6 +99,16 @@ def _extract_marker_durations_with_source_ms(
             ffn_jit_durations = _dominant_pid_durations(ffn_jit_events)
             if ffn_jit_durations:
                 return ffn_jit_durations, "jit_function_device_event"
+        if task.startswith("layer1_shared_expert_"):
+            shared_jit_events = [
+                e
+                for e in trace_events
+                if str(e.get("name", "")).startswith("jit_run_shared(")
+                and (e.get("args", {}) or {}).get("device_duration_ps")
+            ]
+            shared_jit_durations = _dominant_pid_durations(shared_jit_events)
+            if shared_jit_durations:
+                return shared_jit_durations, "jit_function_device_event"
 
         preferred_patterns = []
         if task.startswith("layer0_a2a_"):
@@ -129,6 +139,8 @@ def _extract_marker_durations_with_source_ms(
             preferred_patterns.append(task.replace("layer1_dma_", "layer1_weight_tile_dma_", 1))
         if task.startswith("layer1_wait_"):
             preferred_patterns.append(task)
+        if task.startswith("layer1_shared_expert_"):
+            preferred_patterns.append("SGLANG_JAX_LAYER1_SHARED_EXPERT")
 
         preferred_events = [
             e
