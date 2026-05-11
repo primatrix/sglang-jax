@@ -18,6 +18,7 @@ from benchmark.moe.calibration import (
     layer0_hbm_envelope,
     layer1_a2a_gather,
     layer1_a2a_scatter,
+    layer1_dma_overlap,
     layer1_ffn_compute,
     layer1_local_dma,
     layer1_shared_expert_compute,
@@ -37,6 +38,7 @@ SCENARIO_LAYER1_A2A_METADATA = "layer1_a2a_metadata"
 SCENARIO_LAYER1_A2A_METADATA_FULL = "layer1_a2a_metadata_full"
 SCENARIO_LAYER1_A2A_SCATTER = "layer1_a2a_scatter"
 SCENARIO_LAYER1_A2A_GATHER = "layer1_a2a_gather"
+SCENARIO_LAYER1_DMA_OVERLAP = "layer1_dma_overlap"
 SCENARIO_LAYER1_WEIGHT_TILE_DMA = "layer1_weight_tile_dma"
 SCENARIO_LAYER1_LOCAL_DMA = "layer1_local_dma"
 SCENARIO_LAYER1_FFN_COMPUTE = "layer1_ffn_compute"
@@ -51,6 +53,7 @@ SCENARIOS = (
     SCENARIO_LAYER1_A2A_METADATA_FULL,
     SCENARIO_LAYER1_A2A_SCATTER,
     SCENARIO_LAYER1_A2A_GATHER,
+    SCENARIO_LAYER1_DMA_OVERLAP,
     SCENARIO_LAYER1_WEIGHT_TILE_DMA,
     SCENARIO_LAYER1_LOCAL_DMA,
     SCENARIO_LAYER1_FFN_COMPUTE,
@@ -73,6 +76,7 @@ SUITE_V7X32_BF16_A2A_TOPK8_V1 = "v7x32_bf16_a2a_topk8_v1"
 SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT_V1 = "v7x32_bf16_a2a_topk8_preflight_v1"
 SUITE_V7X32_BF16_A2A_TOPK8 = "v7x32_bf16_a2a_topk8"
 SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT = "v7x32_bf16_a2a_topk8_preflight"
+SUITE_V7X32_BF16_DMA_OVERLAP_DECODE64 = "v7x32_bf16_dma_overlap_decode64"
 SUITE_V7X32_BF16_LOCAL_DMA_TOPK8 = "v7x32_bf16_local_dma_topk8"
 SUITE_V7X8_BF16_LOCAL_DMA_TOPK8 = "v7x8_bf16_local_dma_topk8"
 SUITE_V7X8_BF16_FFN_LOOP_CONTEXT = "v7x8_bf16_ffn_loop_context"
@@ -95,6 +99,7 @@ SUITES = (
     SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT_V1,
     SUITE_V7X32_BF16_A2A_TOPK8,
     SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT,
+    SUITE_V7X32_BF16_DMA_OVERLAP_DECODE64,
     SUITE_V7X32_BF16_LOCAL_DMA_TOPK8,
     SUITE_V7X8_BF16_LOCAL_DMA_TOPK8,
     SUITE_V7X8_BF16_FFN_LOOP_CONTEXT,
@@ -457,6 +462,75 @@ PHASE1_A2A_GATHER_TOPK8_PREFLIGHT_SHAPES: tuple[layer1_a2a_gather.A2AGatherShape
     for bt in PHASE1_A2A_TOPK8_PREFLIGHT_BT_VALUES
 )
 
+DECODE64_REMOTE_BYTES = 2 * 8 * 8192 * 2
+MIB = 1024 * 1024
+
+PHASE1_DMA_OVERLAP_DECODE64_SHAPES: tuple[layer1_dma_overlap.DMAOverlapShape, ...] = (
+    layer1_dma_overlap.DMAOverlapShape(
+        path="barrier_only_decode64",
+        path_class="barrier_only",
+        bt=2,
+        remote_bytes=0,
+        remote_copy_count=0,
+        weight_bytes=0,
+        weight_copy_count=0,
+    ),
+    layer1_dma_overlap.DMAOverlapShape(
+        path="remote_scatter_256k",
+        path_class="remote_only",
+        bt=2,
+        remote_bytes=DECODE64_REMOTE_BYTES,
+        remote_copy_count=16,
+        weight_bytes=0,
+        weight_copy_count=0,
+    ),
+    layer1_dma_overlap.DMAOverlapShape(
+        path="remote_gather_256k",
+        path_class="remote_only",
+        bt=2,
+        remote_bytes=DECODE64_REMOTE_BYTES,
+        remote_copy_count=8,
+        weight_bytes=0,
+        weight_copy_count=0,
+    ),
+    *(
+        layer1_dma_overlap.DMAOverlapShape(
+            path=f"weight_{weight_mib}m",
+            path_class="weight_only",
+            bt=2,
+            remote_bytes=0,
+            remote_copy_count=0,
+            weight_bytes=weight_mib * MIB,
+            weight_copy_count=max(1, weight_mib // 8),
+        )
+        for weight_mib in (4, 8, 16)
+    ),
+    *(
+        layer1_dma_overlap.DMAOverlapShape(
+            path=f"scatter_256k_plus_weight_{weight_mib}m",
+            path_class="remote_plus_weight",
+            bt=2,
+            remote_bytes=DECODE64_REMOTE_BYTES,
+            remote_copy_count=16,
+            weight_bytes=weight_mib * MIB,
+            weight_copy_count=max(1, weight_mib // 8),
+        )
+        for weight_mib in (4, 8, 16)
+    ),
+    *(
+        layer1_dma_overlap.DMAOverlapShape(
+            path=f"gather_256k_plus_weight_{weight_mib}m",
+            path_class="remote_plus_weight",
+            bt=2,
+            remote_bytes=DECODE64_REMOTE_BYTES,
+            remote_copy_count=8,
+            weight_bytes=weight_mib * MIB,
+            weight_copy_count=max(1, weight_mib // 8),
+        )
+        for weight_mib in (4, 8, 16)
+    ),
+)
+
 PHASE1_LOCAL_DMA_TOPK8_PATH_CLASSES: dict[layer1_local_dma.LocalDMAPath, str] = {
     "topk_fetch": "local_topk_fetch",
     "a2a_s_tile_read": "local_a2a_s_tile_read",
@@ -668,6 +742,14 @@ def load_layer1_a2a_gather_suite_shapes(
     if suite == SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT_V1:
         return PHASE1_A2A_GATHER_TOPK8_PREFLIGHT_SHAPES
     raise ValueError(f"Unsupported Layer 1 A2A gather suite: {suite}")
+
+
+def load_layer1_dma_overlap_suite_shapes(
+    suite: str,
+) -> tuple[layer1_dma_overlap.DMAOverlapShape, ...]:
+    if suite == SUITE_V7X32_BF16_DMA_OVERLAP_DECODE64:
+        return PHASE1_DMA_OVERLAP_DECODE64_SHAPES
+    raise ValueError(f"Unsupported Layer 1 DMA overlap suite: {suite}")
 
 
 def load_layer1_local_dma_suite_shapes(
@@ -1092,6 +1174,26 @@ def _layer1_a2a_gather_rows(
     )
 
 
+def _layer1_dma_overlap_rows(
+    suite: str,
+    execution_mode: str,
+    runtime: dict[str, Any],
+    bf_values: tuple[int, ...] | None = None,
+    path_values: tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
+    return layer1_dma_overlap.build_rows(
+        suite=suite,
+        shapes=_filter_shapes(load_layer1_dma_overlap_suite_shapes(suite), bf_values, path_values),
+        execution_mode=execution_mode,
+        runtime=runtime,
+        dtype=DTYPE,
+        weight_dtype=WEIGHT_DTYPE,
+        t_packing=T_PACKING,
+        source=_source(),
+        metadata=_suite_metadata(matrix_kind="remote_weight_dma_overlap_decode64"),
+    )
+
+
 def _layer1_local_dma_rows(
     suite: str,
     execution_mode: str,
@@ -1238,6 +1340,8 @@ def build_rows(
         return _layer1_a2a_scatter_rows(suite, resolved_mode, runtime, bf_values, path_values)
     if scenario == SCENARIO_LAYER1_A2A_GATHER:
         return _layer1_a2a_gather_rows(suite, resolved_mode, runtime, bf_values, path_values)
+    if scenario == SCENARIO_LAYER1_DMA_OVERLAP:
+        return _layer1_dma_overlap_rows(suite, resolved_mode, runtime, bf_values, path_values)
     if scenario == SCENARIO_LAYER1_WEIGHT_TILE_DMA:
         return _layer1_weight_tile_dma_rows(suite, resolved_mode, runtime)
     if scenario == SCENARIO_LAYER1_LOCAL_DMA:
