@@ -3219,13 +3219,15 @@ def jax_allreduce_metadata_by_bt(
     tp_rank = lax.axis_index(tp_axis_name)
     tp_size = lax.axis_size(tp_axis_name)
     my_id = dp_rank * tp_size + tp_rank
-    starts_by_device = jnp.cumsum(all_sizes, axis=1, dtype=jnp.int32) - all_sizes
-    starts = lax.dynamic_index_in_dim(
-        starts_by_device,
-        my_id,
+    # Only this device's prefix is consumed by the Pallas kernel. Computing
+    # starts for every device adds decode-side work without changing outputs.
+    device_ids = lax.broadcasted_iota(jnp.int32, (num_devices,), 0)
+    prefix_mask = device_ids < my_id
+    starts = jnp.sum(
+        jnp.where(prefix_mask[None, :, None], all_sizes, jnp.zeros_like(all_sizes)),
         axis=1,
-        keepdims=False,
-    )[:, None, :]
+        keepdims=True,
+    ).astype(jnp.int32)
 
     d2e_counts = all_sizes[:, :, None, :]
     return starts, sizes, d2e_counts
