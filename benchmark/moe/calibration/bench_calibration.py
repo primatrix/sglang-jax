@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,6 +20,7 @@ from benchmark.moe.calibration import (
     layer1_a2a_scatter,
     layer1_ffn_compute,
     layer1_local_dma,
+    layer1_shared_expert_compute,
     layer1_wait,
     layer1_weight_tile_dma,
 )
@@ -38,6 +40,7 @@ SCENARIO_LAYER1_A2A_GATHER = "layer1_a2a_gather"
 SCENARIO_LAYER1_WEIGHT_TILE_DMA = "layer1_weight_tile_dma"
 SCENARIO_LAYER1_LOCAL_DMA = "layer1_local_dma"
 SCENARIO_LAYER1_FFN_COMPUTE = "layer1_ffn_compute"
+SCENARIO_LAYER1_SHARED_EXPERT_COMPUTE = "layer1_shared_expert_compute"
 SCENARIO_LAYER1_WAIT = "layer1_wait"
 SCENARIO_LAYER2_FUSED_MOE_E2E = "layer2_fused_moe_e2e"
 SCENARIOS = (
@@ -51,6 +54,7 @@ SCENARIOS = (
     SCENARIO_LAYER1_WEIGHT_TILE_DMA,
     SCENARIO_LAYER1_LOCAL_DMA,
     SCENARIO_LAYER1_FFN_COMPUTE,
+    SCENARIO_LAYER1_SHARED_EXPERT_COMPUTE,
     SCENARIO_LAYER1_WAIT,
     SCENARIO_LAYER2_FUSED_MOE_E2E,
 )
@@ -72,6 +76,8 @@ SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT = "v7x32_bf16_a2a_topk8_preflight"
 SUITE_V7X32_BF16_LOCAL_DMA_TOPK8 = "v7x32_bf16_local_dma_topk8"
 SUITE_V7X8_BF16_LOCAL_DMA_TOPK8 = "v7x8_bf16_local_dma_topk8"
 SUITE_V7X8_BF16_FFN_LOOP_CONTEXT = "v7x8_bf16_ffn_loop_context"
+SUITE_V7X8_BF16_FFN_TUNED_FAMILY = "v7x8_bf16_ffn_tuned_family"
+SUITE_V7X8_BF16_SHARED_EXPERT_TUNED_FAMILY = "v7x8_bf16_shared_expert_tuned_family"
 SUITE_V7X32_BF16_WAIT_PRIMITIVES = "v7x32_bf16_wait_primitives"
 SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG_V1 = "v7x32_bf16_fused_moe_e2e_diag_v1"
 SUITES = (
@@ -92,6 +98,8 @@ SUITES = (
     SUITE_V7X32_BF16_LOCAL_DMA_TOPK8,
     SUITE_V7X8_BF16_LOCAL_DMA_TOPK8,
     SUITE_V7X8_BF16_FFN_LOOP_CONTEXT,
+    SUITE_V7X8_BF16_FFN_TUNED_FAMILY,
+    SUITE_V7X8_BF16_SHARED_EXPERT_TUNED_FAMILY,
     SUITE_V7X32_BF16_WAIT_PRIMITIVES,
     SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG_V1,
 )
@@ -478,6 +486,102 @@ PHASE1_FFN_LOOP_CONTEXT_SHAPES: tuple[layer1_ffn_compute.FFNComputeShape, ...] =
     for path, path_class in PHASE1_FFN_LOOP_CONTEXT_PATH_CLASSES.items()
 )
 
+PHASE1_FFN_TUNED_FAMILY_CONFIGS = (
+    # num_tokens, bt, bf, bd1, bd2, bts, btc, bfc, bd1c, bd2c, bse
+    (64, 2, 2048, 2048, 2048, 64, 64, 2048, 2048, 2048, 256),
+    (128, 4, 2048, 2048, 2048, 128, 128, 2048, 2048, 2048, 256),
+    (256, 8, 2048, 1024, 1024, 256, 256, 2048, 1024, 1024, 2048),
+    (512, 16, 2048, 1024, 1024, 512, 512, 2048, 1024, 1024, 1024),
+    (1024, 32, 2048, 1024, 1024, 32, 32, 2048, 1024, 1024, 1024),
+    (2048, 64, 1024, 2048, 2048, 64, 64, 1024, 2048, 2048, 512),
+    (4096, 128, 512, 1024, 1024, 1024, 1024, 512, 1024, 1024, 512),
+)
+
+PHASE1_GEMM_TUNED_FAMILY_SHAPES: tuple[GemmShape, ...] = (
+    tuple(
+        GemmShape("tuned_family_ffn1", btc, bd1 // T_PACKING, bf)
+        for _num_tokens, _bt, bf, bd1, _bd2, _bts, btc, _bfc, _bd1c, _bd2c, _bse in PHASE1_FFN_TUNED_FAMILY_CONFIGS
+    )
+    + tuple(
+        GemmShape("tuned_family_ffn2", btc, bf, bd2 // T_PACKING)
+        for _num_tokens, _bt, bf, _bd1, bd2, _bts, btc, _bfc, _bd1c, _bd2c, _bse in PHASE1_FFN_TUNED_FAMILY_CONFIGS
+    )
+    + tuple(
+        GemmShape("tuned_family_shared_w1w3", bt, bd1 // T_PACKING, bse)
+        for _num_tokens, bt, _bf, bd1, _bd2, _bts, _btc, _bfc, _bd1c, _bd2c, bse in PHASE1_FFN_TUNED_FAMILY_CONFIGS
+    )
+    + tuple(
+        GemmShape("tuned_family_shared_w2", bt, bse, bd2 // T_PACKING)
+        for _num_tokens, bt, _bf, _bd1, bd2, _bts, _btc, _bfc, _bd1c, _bd2c, bse in PHASE1_FFN_TUNED_FAMILY_CONFIGS
+    )
+)
+
+PHASE1_GEMM_SATURATION_CURVE_V3_SHAPES = (
+    PHASE1_GEMM_SATURATION_CURVE_V3_SHAPES + PHASE1_GEMM_TUNED_FAMILY_SHAPES
+)
+
+
+def _tuned_family_dyn_values(*, bt: int, bts: int, btc: int) -> tuple[int, ...]:
+    max_per_expert = bt * 32
+    values = set(_power_of_two_ladder(max_per_expert))
+    values.update({bt, bts, btc, max_per_expert})
+    for boundary in (btc, 2 * btc, 4 * btc, 8 * btc, bts, 2 * bts):
+        for delta in (-1, 0, 1):
+            values.add(boundary + delta)
+    for numerator, denominator in ((1, 4), (1, 2), (3, 4)):
+        values.add(max(1, (max_per_expert * numerator) // denominator))
+    values.add(max_per_expert)
+    return tuple(v for v in sorted(values) if 0 < v <= max_per_expert)
+
+
+def _power_of_two_ladder(limit: int) -> tuple[int, ...]:
+    values = []
+    value = 1
+    while value <= limit:
+        values.append(value)
+        value *= 2
+    return tuple(values)
+
+
+PHASE1_FFN_TUNED_FAMILY_SHAPES: tuple[layer1_ffn_compute.FFNComputeShape, ...] = tuple(
+    layer1_ffn_compute.FFNComputeShape(
+        path=path,
+        path_class=path_class,
+        dyn_sz=dyn_sz,
+        config_label=f"tokens{num_tokens}_bt{bt}_bts{bts}_bf{bf}_bd{bd1}",
+        num_tokens=num_tokens,
+        bt=bt,
+        bts=bts,
+        kernel_tiled=True,
+        bf=bf,
+        bfc=bfc,
+        btc=btc,
+        bd1=bd1,
+        bd2=bd2,
+        bd1c=bd1c,
+        bd2c=bd2c,
+    )
+    for num_tokens, bt, bf, bd1, bd2, bts, btc, bfc, bd1c, bd2c, _bse in PHASE1_FFN_TUNED_FAMILY_CONFIGS
+    for dyn_sz in _tuned_family_dyn_values(bt=bt, bts=bts, btc=btc)
+    for path, path_class in PHASE1_FFN_LOOP_CONTEXT_PATH_CLASSES.items()
+)
+
+PHASE1_SHARED_EXPERT_TUNED_FAMILY_SHAPES: tuple[
+    layer1_shared_expert_compute.SharedExpertShape, ...
+] = tuple(
+    layer1_shared_expert_compute.SharedExpertShape(
+        path="shared_expert_slice",
+        path_class="shared_expert_tuned_slice",
+        num_tokens=num_tokens,
+        bt=bt,
+        bse=bse,
+        bd1=bd1,
+        bd2=bd2,
+        config_label=f"tokens{num_tokens}_bt{bt}_bse{bse}_bd{bd1}",
+    )
+    for num_tokens, bt, _bf, bd1, bd2, _bts, _btc, _bfc, _bd1c, _bd2c, bse in PHASE1_FFN_TUNED_FAMILY_CONFIGS
+)
+
 PHASE1_WAIT_REPETITIONS = (1, 2, 4, 8, 16)
 
 PHASE1_WAIT_PRIMITIVE_SHAPES: tuple[layer1_wait.WaitShape, ...] = tuple(
@@ -582,6 +686,13 @@ def load_layer1_ffn_compute_suite_shapes(
 ) -> tuple[layer1_ffn_compute.FFNComputeShape, ...]:
     if suite == SUITE_V7X8_BF16_FFN_LOOP_CONTEXT:
         return PHASE1_FFN_LOOP_CONTEXT_SHAPES
+    if suite == SUITE_V7X8_BF16_FFN_TUNED_FAMILY:
+        shapes = PHASE1_FFN_TUNED_FAMILY_SHAPES
+        raw_num_tokens = os.getenv("CALIBRATION_LAYER1_FFN_TUNED_NUM_TOKENS")
+        if raw_num_tokens:
+            allowed = {int(part.strip()) for part in raw_num_tokens.split(",") if part.strip()}
+            shapes = tuple(shape for shape in shapes if shape.num_tokens in allowed)
+        return shapes
     raise ValueError(f"Unsupported Layer 1 FFN compute suite: {suite}")
 
 
@@ -591,6 +702,19 @@ def load_layer1_wait_suite_shapes(
     if suite == SUITE_V7X32_BF16_WAIT_PRIMITIVES:
         return PHASE1_WAIT_PRIMITIVE_SHAPES
     raise ValueError(f"Unsupported Layer 1 wait suite: {suite}")
+
+
+def load_layer1_shared_expert_suite_shapes(
+    suite: str,
+) -> tuple[layer1_shared_expert_compute.SharedExpertShape, ...]:
+    if suite == SUITE_V7X8_BF16_SHARED_EXPERT_TUNED_FAMILY:
+        shapes = PHASE1_SHARED_EXPERT_TUNED_FAMILY_SHAPES
+        raw_num_tokens = os.getenv("CALIBRATION_LAYER1_SHARED_TUNED_NUM_TOKENS")
+        if raw_num_tokens:
+            allowed = {int(part.strip()) for part in raw_num_tokens.split(",") if part.strip()}
+            shapes = tuple(shape for shape in shapes if shape.num_tokens in allowed)
+        return shapes
+    raise ValueError(f"Unsupported Layer 1 shared expert suite: {suite}")
 
 
 def load_layer2_fused_moe_e2e_suite_shapes(
@@ -710,6 +834,7 @@ def _layer0_gemm_metadata(suite: str) -> dict[str, Any]:
             "m_saturation_sweep",
             "aspect_ratio_sweep",
             "fused_moe_marker_rows",
+            "tuned_family_equivalent_gemm_rows",
         ]
         metadata["excludes"] = [
             "fused_moe_pallas_dot_scheduling",
@@ -729,11 +854,19 @@ def _layer0_gemm_metadata(suite: str) -> dict[str, Any]:
                 "m": [16, 64, 256, 1024, 4096],
                 "kn": [[512, 4096], [1024, 2048], [2048, 1024], [4096, 512]],
             },
-            "marker_paths": ["ffn1", "ffn2"],
+            "marker_paths": [
+                "ffn1",
+                "ffn2",
+                "tuned_family_ffn1",
+                "tuned_family_ffn2",
+                "tuned_family_shared_w1w3",
+                "tuned_family_shared_w2",
+            ],
             "shape_counts": {
                 "m_saturation": len(PHASE1_GEMM_V3_M_SATURATION_SHAPES),
                 "aspect": len(PHASE1_GEMM_V3_ASPECT_SHAPES),
                 "marker": len(PHASE1_GEMM_EQUIVALENT_SHAPES),
+                "tuned_family_marker": len(PHASE1_GEMM_TUNED_FAMILY_SHAPES),
                 "total": len(PHASE1_GEMM_SATURATION_CURVE_V3_SHAPES),
             },
         }
@@ -921,7 +1054,7 @@ def _filter_shapes(
         filtered = tuple(
             shape
             for shape in filtered
-            if getattr(shape, "bt", getattr(shape, "dyn_sz", getattr(shape, "repetitions", None)))
+            if getattr(shape, "dyn_sz", getattr(shape, "bt", getattr(shape, "repetitions", None)))
             in allowed
         )
     if path_values is None:
@@ -1008,6 +1141,31 @@ def _layer1_ffn_compute_rows(
     )
 
 
+def _layer1_shared_expert_rows(
+    suite: str,
+    execution_mode: str,
+    runtime: dict[str, Any],
+    bf_values: tuple[int, ...] | None = None,
+    path_values: tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
+    return layer1_shared_expert_compute.build_rows(
+        suite=suite,
+        shapes=_filter_shapes(
+            load_layer1_shared_expert_suite_shapes(suite), bf_values, path_values
+        ),
+        execution_mode=execution_mode,
+        runtime=runtime,
+        dtype=DTYPE,
+        weight_dtype=WEIGHT_DTYPE,
+        t_packing=T_PACKING,
+        source=_source(),
+        metadata=_suite_metadata_for_runtime(
+            matrix_kind="shared_expert_compute_slice",
+            target_runtime=TARGET_RUNTIME_V7X8,
+        ),
+    )
+
+
 def _layer1_wait_rows(
     suite: str,
     execution_mode: str,
@@ -1050,6 +1208,7 @@ def resolve_execution_mode(scenario: str, requested: str, runtime: dict[str, Any
         SCENARIO_LAYER0_GEMM_ENVELOPE,
         SCENARIO_LAYER0_A2A_ENVELOPE,
         SCENARIO_LAYER1_FFN_COMPUTE,
+        SCENARIO_LAYER1_SHARED_EXPERT_COMPUTE,
         SCENARIO_LAYER2_FUSED_MOE_E2E,
     ):
         return "jax_trace"
@@ -1085,6 +1244,8 @@ def build_rows(
         return _layer1_local_dma_rows(suite, resolved_mode, runtime, bf_values, path_values)
     if scenario == SCENARIO_LAYER1_FFN_COMPUTE:
         return _layer1_ffn_compute_rows(suite, resolved_mode, runtime, bf_values, path_values)
+    if scenario == SCENARIO_LAYER1_SHARED_EXPERT_COMPUTE:
+        return _layer1_shared_expert_rows(suite, resolved_mode, runtime, bf_values, path_values)
     if scenario == SCENARIO_LAYER1_WAIT:
         return _layer1_wait_rows(suite, resolved_mode, runtime, bf_values, path_values)
     if scenario == SCENARIO_LAYER2_FUSED_MOE_E2E:

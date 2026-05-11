@@ -17,7 +17,11 @@ from benchmark.moe.calibration.common import build_observation_row
 
 SCENARIO_LAYER1_FFN_COMPUTE = "layer1_ffn_compute"
 SUITE_V7X8_BF16_FFN_LOOP_CONTEXT = "v7x8_bf16_ffn_loop_context"
-SUPPORTED_SUITES = (SUITE_V7X8_BF16_FFN_LOOP_CONTEXT,)
+SUITE_V7X8_BF16_FFN_TUNED_FAMILY = "v7x8_bf16_ffn_tuned_family"
+SUPPORTED_SUITES = (
+    SUITE_V7X8_BF16_FFN_LOOP_CONTEXT,
+    SUITE_V7X8_BF16_FFN_TUNED_FAMILY,
+)
 
 STATUS_MEASURED = "measured"
 STATUS_NOT_IMPLEMENTED = "not_implemented"
@@ -52,11 +56,18 @@ class FFNComputeShape:
     path: FFNPath
     path_class: str
     dyn_sz: int
+    config_label: str = "loop_context"
+    num_tokens: int | None = None
+    bt: int | None = None
+    bts: int | None = None
+    kernel_tiled: bool = False
     hidden_size: int = HIDDEN_SIZE
     intermediate_size: int = INTERMEDIATE_SIZE
     t_packing: int = T_PACKING
     bd1: int = BD1
     bd2: int = BD2
+    bd1c: int = BD1
+    bd2c: int = BD2
     bf: int = BF
     bfc: int = BFC
     btc: int = BTC
@@ -122,6 +133,12 @@ def build_rows(
                 "t_packing=2, bf/bfc/btc blocking, FFN1 dual gate/up dot or FFN2 activation+down dot, "
                 "and init/accumulate semantics. It excludes remote DMA and weight prefetch."
             )
+            if shape.kernel_tiled:
+                note = (
+                    "Measured fused-MoE dynamic FFN tuned-family compute with JAX trace timing: "
+                    "static btc row tiles, bd1/bd2 hidden slicing, t_packing=2 p-loop, "
+                    "and init/accumulate semantics. It excludes remote DMA and weight prefetch."
+                )
         except Exception as exc:
             samples = []
             status = STATUS_NOT_IMPLEMENTED
@@ -196,12 +213,19 @@ def _metadata_for_shape(
         "path": shape.path,
         "path_class": shape.path_class,
         "dyn_sz": shape.dyn_sz,
+        "effective_m": _effective_rows(shape),
+        "config_label": shape.config_label,
+        "num_tokens": shape.num_tokens,
+        "bt": shape.bt,
+        "bts": shape.bts,
         "hidden_size": shape.hidden_size,
         "intermediate_size": shape.intermediate_size,
         "t_packing": shape.t_packing,
         "h_per_t_packing": shape.hidden_size // shape.t_packing,
         "bd1": shape.bd1,
         "bd2": shape.bd2,
+        "bd1c": shape.bd1c,
+        "bd2c": shape.bd2c,
         "bf": shape.bf,
         "bfc": shape.bfc,
         "btc": shape.btc,
@@ -225,6 +249,7 @@ def _metadata_for_shape(
             "num_bd2": _ceil_div(shape.hidden_size, shape.bd2),
             "num_bf": _ceil_div(shape.intermediate_size, shape.bf),
             "num_bfc": _ceil_div(shape.bf, shape.bfc),
+            "kernel_tiled": shape.kernel_tiled,
         },
     }
     return enriched
@@ -267,71 +292,107 @@ def _measure_ffn_ms(
 
 
 def _make_inputs(shape: FFNComputeShape, *, jnp: Any) -> tuple[Any, ...]:
-    dyn = max(shape.dyn_sz, 1)
+    dyn = _effective_rows(shape)
     hpt = shape.hidden_size // shape.t_packing
     if shape.path in ("dynamic_ffn1_init", "dynamic_ffn1_accumulate"):
         tokens = jnp.ones((dyn, shape.t_packing, hpt), dtype=jnp.bfloat16)
-        w1 = jnp.ones((shape.t_packing, hpt, shape.bf), dtype=jnp.bfloat16)
-        w3 = jnp.ones((shape.t_packing, hpt, shape.bf), dtype=jnp.bfloat16)
+        if shape.kernel_tiled:
+            bd1_per_pack = shape.bd1 // shape.t_packing
+            num_bd1 = _ceil_div(shape.hidden_size, shape.bd1)
+            w_shape = (shape.t_packing, num_bd1, bd1_per_pack, shape.bf)
+        else:
+            w_shape = (shape.t_packing, hpt, shape.bf)
+        w1 = jnp.ones(w_shape, dtype=jnp.bfloat16)
+        w3 = jnp.ones(w_shape, dtype=jnp.bfloat16)
         acc1 = jnp.ones((dyn, shape.bf), dtype=jnp.float32)
         acc3 = jnp.ones((dyn, shape.bf), dtype=jnp.float32)
         return (tokens, w1, w3, acc1, acc3)
     acc1 = jnp.ones((dyn, shape.bf), dtype=jnp.float32)
     acc3 = jnp.ones((dyn, shape.bf), dtype=jnp.float32)
-    w2 = jnp.ones((shape.t_packing, shape.bf, hpt), dtype=jnp.bfloat16)
+    if shape.kernel_tiled:
+        bd2_per_pack = shape.bd2 // shape.t_packing
+        num_bd2 = _ceil_div(shape.hidden_size, shape.bd2)
+        w2_shape = (shape.t_packing, num_bd2, shape.bf, bd2_per_pack)
+    else:
+        w2_shape = (shape.t_packing, shape.bf, hpt)
+    w2 = jnp.ones(w2_shape, dtype=jnp.bfloat16)
     res = jnp.ones((dyn, shape.t_packing, hpt), dtype=jnp.bfloat16)
     return (acc1, acc3, w2, res)
 
 
 def _ffn1_loop(shape: FFNComputeShape, arrays: tuple[Any, ...], *, jnp: Any):
     tokens, w1, w3, acc1_init, acc3_init = arrays
-    dyn = max(shape.dyn_sz, 1)
+    dyn = _effective_rows(shape)
     num_loops = _ceil_div(shape.dyn_sz, shape.btc) if shape.dyn_sz > 0 else 0
     should_init = shape.path == "dynamic_ffn1_init"
     acc1_out = acc1_init
     acc3_out = acc3_init
+    bd1_per_pack = shape.bd1 // shape.t_packing
+    num_bd1 = _ceil_div(shape.hidden_size, shape.bd1)
     for btc_id in range(num_loops):
         start = btc_id * shape.btc
-        token_count = min(shape.btc, dyn - start)
-        token_count = max(token_count, 1)
+        token_count = shape.btc if shape.kernel_tiled else max(min(shape.btc, dyn - start), 1)
 
-        for p_id in range(shape.t_packing):
-            lhs = tokens[start : start + token_count, p_id, :]
-            d1 = jnp.dot(lhs, w1[p_id], preferred_element_type=jnp.float32)
-            d3 = jnp.dot(lhs, w3[p_id], preferred_element_type=jnp.float32)
-            old1 = acc1_out[start : start + token_count, :]
-            old3 = acc3_out[start : start + token_count, :]
-            new1 = d1 if should_init and p_id == 0 else old1 + d1
-            new3 = d3 if should_init and p_id == 0 else old3 + d3
-            acc1_out = acc1_out.at[start : start + token_count, :].set(new1)
-            acc3_out = acc3_out.at[start : start + token_count, :].set(new3)
+        for bd1_id in range(num_bd1 if shape.kernel_tiled else 1):
+            for p_id in range(shape.t_packing):
+                if shape.kernel_tiled:
+                    k_start = bd1_id * bd1_per_pack
+                    lhs = tokens[
+                        start : start + token_count, p_id, k_start : k_start + bd1_per_pack
+                    ]
+                    rhs1 = w1[p_id, bd1_id]
+                    rhs3 = w3[p_id, bd1_id]
+                else:
+                    lhs = tokens[start : start + token_count, p_id, :]
+                    rhs1 = w1[p_id]
+                    rhs3 = w3[p_id]
+                d1 = jnp.dot(lhs, rhs1, preferred_element_type=jnp.float32)
+                d3 = jnp.dot(lhs, rhs3, preferred_element_type=jnp.float32)
+                old1 = acc1_out[start : start + token_count, :]
+                old3 = acc3_out[start : start + token_count, :]
+                is_first_acc = p_id == 0 and bd1_id == 0
+                new1 = d1 if should_init and is_first_acc else old1 + d1
+                new3 = d3 if should_init and is_first_acc else old3 + d3
+                acc1_out = acc1_out.at[start : start + token_count, :].set(new1)
+                acc3_out = acc3_out.at[start : start + token_count, :].set(new3)
     return acc1_out + acc3_out
 
 
 def _ffn2_loop(shape: FFNComputeShape, arrays: tuple[Any, ...], *, jnp: Any):
     acc1, acc3, w2, res_init = arrays
-    dyn = max(shape.dyn_sz, 1)
+    dyn = _effective_rows(shape)
     num_loops = _ceil_div(shape.dyn_sz, shape.btc) if shape.dyn_sz > 0 else 0
     should_init = shape.path == "dynamic_ffn2_first"
     res_out = res_init
+    bd2_per_pack = shape.bd2 // shape.t_packing
+    num_bd2 = _ceil_div(shape.hidden_size, shape.bd2)
     for btc_id in range(num_loops):
         start = btc_id * shape.btc
-        token_count = min(shape.btc, dyn - start)
-        token_count = max(token_count, 1)
+        token_count = shape.btc if shape.kernel_tiled else max(min(shape.btc, dyn - start), 1)
         act = (
             jax_silu(acc1[start : start + token_count, :], jnp=jnp)
             * acc3[start : start + token_count, :]
         )
 
-        for p_id in range(shape.t_packing):
-            d = jnp.dot(act, w2[p_id], preferred_element_type=jnp.float32).astype(jnp.bfloat16)
-            old = res_out[start : start + token_count, p_id, :]
-            new = (
-                d
-                if should_init
-                else (old.astype(jnp.float32) + d.astype(jnp.float32)).astype(jnp.bfloat16)
-            )
-            res_out = res_out.at[start : start + token_count, p_id, :].set(new)
+        for bd2_id in range(num_bd2 if shape.kernel_tiled else 1):
+            for p_id in range(shape.t_packing):
+                if shape.kernel_tiled:
+                    rhs = w2[p_id, bd2_id]
+                    k_start = bd2_id * bd2_per_pack
+                else:
+                    rhs = w2[p_id]
+                    k_start = 0
+                    bd2_per_pack = shape.hidden_size // shape.t_packing
+                d = jnp.dot(act, rhs, preferred_element_type=jnp.float32).astype(jnp.bfloat16)
+                old = res_out[start : start + token_count, p_id, k_start : k_start + bd2_per_pack]
+                new = (
+                    d
+                    if should_init
+                    else (old.astype(jnp.float32) + d.astype(jnp.float32)).astype(jnp.bfloat16)
+                )
+                res_out = res_out.at[
+                    start : start + token_count, p_id, k_start : k_start + bd2_per_pack
+                ].set(new)
     return res_out
 
 
@@ -340,13 +401,14 @@ def jax_silu(x, *, jnp: Any):
 
 
 def _tile_shape(shape: FFNComputeShape) -> tuple[int, ...]:
+    rows = _effective_rows(shape) if shape.kernel_tiled else shape.dyn_sz
     if shape.path in ("dynamic_ffn1_init", "dynamic_ffn1_accumulate"):
-        return (shape.dyn_sz, shape.t_packing, shape.hidden_size // shape.t_packing, shape.bf)
-    return (shape.dyn_sz, shape.bf, shape.t_packing, shape.hidden_size // shape.t_packing)
+        return (rows, shape.t_packing, shape.hidden_size // shape.t_packing, shape.bf)
+    return (rows, shape.bf, shape.t_packing, shape.hidden_size // shape.t_packing)
 
 
 def _bytes_hbm(shape: FFNComputeShape) -> int:
-    dyn = max(shape.dyn_sz, 1)
+    dyn = _effective_rows(shape)
     if shape.path in ("dynamic_ffn1_init", "dynamic_ffn1_accumulate"):
         token_bytes = dyn * shape.hidden_size * BF16_BYTES
         weight_bytes = 2 * shape.hidden_size * shape.bf * BF16_BYTES
@@ -359,10 +421,18 @@ def _bytes_hbm(shape: FFNComputeShape) -> int:
 
 
 def _flops(shape: FFNComputeShape) -> int:
-    dyn = shape.dyn_sz
+    dyn = _effective_rows(shape)
     if shape.path in ("dynamic_ffn1_init", "dynamic_ffn1_accumulate"):
         return 4 * dyn * shape.hidden_size * shape.bf
     return 2 * dyn * shape.bf * shape.hidden_size
+
+
+def _effective_rows(shape: FFNComputeShape) -> int:
+    if shape.dyn_sz <= 0:
+        return 1
+    if not shape.kernel_tiled:
+        return max(shape.dyn_sz, 1)
+    return _ceil_div(shape.dyn_sz, shape.btc) * shape.btc
 
 
 def _includes(shape: FFNComputeShape) -> list[str]:
