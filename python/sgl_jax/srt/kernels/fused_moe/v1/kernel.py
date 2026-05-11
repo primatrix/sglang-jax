@@ -565,11 +565,14 @@ def _fused_ep_moe_kernel(
     act_fn: str,
     # Profiling / ablation flags (reserved; no-op in this branch).
     disable_a2a: bool = False,
+    disable_a2a_scatter: bool = False,
+    disable_a2a_gather: bool = False,
     disable_dynamic_ffn1: bool = False,
     disable_dynamic_ffn2: bool = False,
     disable_weight_load: bool = False,
     disable_a2a_s_tile_read: bool = False,
     disable_a2a_s_acc_tile_write: bool = False,
+    disable_output_accumulate: bool = False,
     disable_shared_expert: bool = False,
     disable_all_reduce_metadata: bool = False,
     disable_sync_barrier: bool = False,
@@ -979,7 +982,7 @@ def _fused_ep_moe_kernel(
         )
 
     def start_a2a_scatter(*, bt_sem_id, e_sem_id, local_e_id, bt_start):
-        if disable_a2a:
+        if disable_a2a or disable_a2a_scatter:
             return
 
         # Counting the number of remote sends from the current device.
@@ -1042,7 +1045,7 @@ def _fused_ep_moe_kernel(
         a2a_s_sends_x2_smem[e_sem_id] = send_sz
 
     def start_a2a_scatter_batch(*, bt_sem_id, bt_start):
-        if disable_a2a:
+        if disable_a2a or disable_a2a_scatter:
             return
         for slot in range(expert_buffer_count):
             a2a_s_sends_x2_smem[slot] = jnp.int32(0)
@@ -1097,7 +1100,7 @@ def _fused_ep_moe_kernel(
         lax.fori_loop(0, bt, _scatter_one_batch, None, unroll=False)
 
     def wait_a2a_scatter_send_batch():
-        if disable_a2a:
+        if disable_a2a or disable_a2a_scatter:
             return
 
         def _wait_one(slot, _):
@@ -1117,7 +1120,7 @@ def _fused_ep_moe_kernel(
         lax.fori_loop(0, jnp.int32(expert_buffer_count), _wait_one, None, unroll=False)
 
     def wait_a2a_scatter_recv(*, bt_sem_id, e_sem_id, local_e_id):
-        if disable_a2a:
+        if disable_a2a or disable_a2a_scatter:
             return
         e_id = my_id * local_num_experts + local_e_id
         sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
@@ -1133,7 +1136,7 @@ def _fused_ep_moe_kernel(
             ).wait()
 
     def wait_a2a_scatter_send(*, bt_sem_id, e_sem_id, local_e_id):
-        if disable_a2a:
+        if disable_a2a or disable_a2a_scatter:
             return
         scatter_send_sz = a2a_s_sends_x2_smem[e_sem_id]
         should_wait = scatter_send_sz != 0
@@ -1149,7 +1152,7 @@ def _fused_ep_moe_kernel(
             ).wait()
 
     def start_a2a_gather(*, bt_sem_id, e_sem_id, local_e_id):
-        if disable_a2a:
+        if disable_a2a or disable_a2a_gather:
             return
         my_e_id = my_id * local_num_experts + local_e_id
         start = 0
@@ -1193,7 +1196,7 @@ def _fused_ep_moe_kernel(
             start += sz
 
     def wait_a2a_gather_send(*, bt_sem_id, e_sem_id, local_e_id):
-        if disable_a2a:
+        if disable_a2a or disable_a2a_gather:
             return
         my_e_id = my_id * local_num_experts + local_e_id
         sz = expert_sizes_x2_smem[bt_sem_id, 0, my_e_id]
@@ -1214,7 +1217,7 @@ def _fused_ep_moe_kernel(
             ).wait()
 
     def wait_a2a_gather_recv_all(*, bt_sem_id):
-        if disable_a2a:
+        if disable_a2a or disable_a2a_gather:
             return
 
         # `a2a_gather_sem` is signaled once per (expert -> this device) copy in the
@@ -2437,6 +2440,10 @@ def _fused_ep_moe_kernel(
         lax.cond(has_tokens, _run_active, _run_inactive, operand=None)
 
     def acc_and_store_output(*, bt_sem_id, out_buf_id):
+        if disable_output_accumulate:
+            b_output_x2_vmem.at[out_buf_id][...] = jnp.zeros_like(b_output_x2_vmem[out_buf_id])
+            return None
+
         acc_bt = a2a_g_acc_vmem.shape[2]
         assert bt % acc_bt == 0, (bt, acc_bt)
         num_acc_tiles = bt // acc_bt
@@ -3245,11 +3252,14 @@ def jax_allreduce_metadata_by_bt(
         "routed_scaling_factor",
         "act_fn",
         "disable_a2a",
+        "disable_a2a_scatter",
+        "disable_a2a_gather",
         "disable_dynamic_ffn1",
         "disable_dynamic_ffn2",
         "disable_weight_load",
         "disable_a2a_s_tile_read",
         "disable_a2a_s_acc_tile_write",
+        "disable_output_accumulate",
         "disable_shared_expert",
         "disable_all_reduce_metadata",
         "disable_sync_barrier",
@@ -3278,11 +3288,14 @@ def fused_ep_moe(
     act_fn: str = "silu",
     # Profiling / ablation flags (reserved; no-op in this branch).
     disable_a2a: bool = False,
+    disable_a2a_scatter: bool = False,
+    disable_a2a_gather: bool = False,
     disable_dynamic_ffn1: bool = False,
     disable_dynamic_ffn2: bool = False,
     disable_weight_load: bool = False,
     disable_a2a_s_tile_read: bool = False,
     disable_a2a_s_acc_tile_write: bool = False,
+    disable_output_accumulate: bool = False,
     disable_shared_expert: bool = False,
     disable_all_reduce_metadata: bool = False,
     disable_sync_barrier: bool = False,
@@ -3556,11 +3569,14 @@ def fused_ep_moe(
                 tp_axis_name=tp_axis_name,
                 act_fn=act_fn,
                 disable_a2a=disable_a2a,
+                disable_a2a_scatter=disable_a2a_scatter,
+                disable_a2a_gather=disable_a2a_gather,
                 disable_dynamic_ffn1=disable_dynamic_ffn1,
                 disable_dynamic_ffn2=disable_dynamic_ffn2,
                 disable_weight_load=disable_weight_load,
                 disable_a2a_s_tile_read=disable_a2a_s_tile_read,
                 disable_a2a_s_acc_tile_write=disable_a2a_s_acc_tile_write,
+                disable_output_accumulate=disable_output_accumulate,
                 disable_shared_expert=disable_shared_expert,
                 disable_all_reduce_metadata=disable_all_reduce_metadata,
                 disable_sync_barrier=disable_sync_barrier,

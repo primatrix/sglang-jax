@@ -318,10 +318,46 @@ def select_cases(cases: Iterable[MoEBenchmarkCase] | None = None) -> Iterable[Mo
         If `case.ep_size` is None, try EP sizes starting from device_count.
         Always return (ep_size, tp_size) such that ep_size * tp_size == device_count.
         """
-        if case.ep_size is None:
-            target_ep = num_devices
-        else:
+        if case.ep_size is not None and case.tp_size is not None:
+            if case.ep_size * case.tp_size != num_devices:
+                raise ValueError(
+                    f"Requested ep_size * tp_size must equal visible device count: "
+                    f"{case.ep_size} * {case.tp_size} != {num_devices}."
+                )
+            if case.num_tokens % case.ep_size != 0:
+                raise ValueError(
+                    f"Requested ep_size={case.ep_size} does not divide num_tokens={case.num_tokens}."
+                )
+            if case.num_experts % case.ep_size != 0:
+                raise ValueError(
+                    f"Requested ep_size={case.ep_size} does not divide num_experts={case.num_experts}."
+                )
+            return case.ep_size, case.tp_size
+
+        if case.ep_size is not None:
             target_ep = case.ep_size
+            if num_devices % target_ep != 0:
+                raise ValueError(
+                    f"Requested ep_size={target_ep} is incompatible with visible devices={num_devices}."
+                )
+            if case.num_tokens % target_ep != 0:
+                raise ValueError(
+                    f"Requested ep_size={target_ep} does not divide num_tokens={case.num_tokens}."
+                )
+            if case.num_experts % target_ep != 0:
+                raise ValueError(
+                    f"Requested ep_size={target_ep} does not divide num_experts={case.num_experts}."
+                )
+            return target_ep, num_devices // target_ep
+
+        if case.tp_size is not None:
+            if num_devices % case.tp_size != 0:
+                raise ValueError(
+                    f"Requested tp_size={case.tp_size} is incompatible with visible devices={num_devices}."
+                )
+            target_ep = num_devices // case.tp_size
+        else:
+            target_ep = num_devices
         target_ep = min(target_ep, case.num_experts, num_devices)
 
         for ep in range(target_ep, 0, -1):
