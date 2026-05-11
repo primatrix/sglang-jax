@@ -77,6 +77,7 @@ SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT_V1 = "v7x32_bf16_a2a_topk8_preflight_v1"
 SUITE_V7X32_BF16_A2A_TOPK8 = "v7x32_bf16_a2a_topk8"
 SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT = "v7x32_bf16_a2a_topk8_preflight"
 SUITE_V7X32_BF16_DMA_OVERLAP_DECODE64 = "v7x32_bf16_dma_overlap_decode64"
+SUITE_V7X32_BF16_DMA_OVERLAP_DECODE64_AMPLIFIED = "v7x32_bf16_dma_overlap_decode64_amplified"
 SUITE_V7X32_BF16_LOCAL_DMA_TOPK8 = "v7x32_bf16_local_dma_topk8"
 SUITE_V7X8_BF16_LOCAL_DMA_TOPK8 = "v7x8_bf16_local_dma_topk8"
 SUITE_V7X8_BF16_FFN_LOOP_CONTEXT = "v7x8_bf16_ffn_loop_context"
@@ -100,6 +101,7 @@ SUITES = (
     SUITE_V7X32_BF16_A2A_TOPK8,
     SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT,
     SUITE_V7X32_BF16_DMA_OVERLAP_DECODE64,
+    SUITE_V7X32_BF16_DMA_OVERLAP_DECODE64_AMPLIFIED,
     SUITE_V7X32_BF16_LOCAL_DMA_TOPK8,
     SUITE_V7X8_BF16_LOCAL_DMA_TOPK8,
     SUITE_V7X8_BF16_FFN_LOOP_CONTEXT,
@@ -531,6 +533,33 @@ PHASE1_DMA_OVERLAP_DECODE64_SHAPES: tuple[layer1_dma_overlap.DMAOverlapShape, ..
     ),
 )
 
+
+def _amplified_dma_overlap_shape(
+    shape: layer1_dma_overlap.DMAOverlapShape, repeat_count: int
+) -> layer1_dma_overlap.DMAOverlapShape:
+    return layer1_dma_overlap.DMAOverlapShape(
+        path=f"{shape.path}_rep{repeat_count}",
+        path_class=shape.path_class,
+        bt=shape.bt,
+        remote_bytes=shape.remote_bytes,
+        remote_copy_count=shape.remote_copy_count,
+        weight_bytes=shape.weight_bytes,
+        weight_copy_count=shape.weight_copy_count,
+        repeat_count=repeat_count,
+        hidden_size=shape.hidden_size,
+        ep_size=shape.ep_size,
+    )
+
+
+PHASE1_DMA_OVERLAP_DECODE64_AMPLIFIED_SHAPES: tuple[layer1_dma_overlap.DMAOverlapShape, ...] = (
+    tuple(
+        _amplified_dma_overlap_shape(shape, repeat_count)
+        for repeat_count in (8, 32)
+        for shape in PHASE1_DMA_OVERLAP_DECODE64_SHAPES
+        if shape.path_class != "barrier_only" or shape.path == "barrier_only_decode64"
+    )
+)
+
 PHASE1_LOCAL_DMA_TOPK8_PATH_CLASSES: dict[layer1_local_dma.LocalDMAPath, str] = {
     "topk_fetch": "local_topk_fetch",
     "a2a_s_tile_read": "local_a2a_s_tile_read",
@@ -749,6 +778,8 @@ def load_layer1_dma_overlap_suite_shapes(
 ) -> tuple[layer1_dma_overlap.DMAOverlapShape, ...]:
     if suite == SUITE_V7X32_BF16_DMA_OVERLAP_DECODE64:
         return PHASE1_DMA_OVERLAP_DECODE64_SHAPES
+    if suite == SUITE_V7X32_BF16_DMA_OVERLAP_DECODE64_AMPLIFIED:
+        return PHASE1_DMA_OVERLAP_DECODE64_AMPLIFIED_SHAPES
     raise ValueError(f"Unsupported Layer 1 DMA overlap suite: {suite}")
 
 

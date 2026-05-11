@@ -49,6 +49,7 @@ class DMAOverlapShape:
     remote_copy_count: int
     weight_bytes: int
     weight_copy_count: int
+    repeat_count: int = 1
     hidden_size: int = HIDDEN_SIZE
     ep_size: int = EP_SIZE
 
@@ -174,9 +175,10 @@ def build_rows(
                 implementation_note=(
                     "Measured with a controlled Pallas TPU microkernel that can issue "
                     "remote A2A make_async_remote_copy, HBM->VMEM make_async_copy, "
-                    "or both in the same marker window. Compare barrier-adjusted "
-                    "remote_only, weight_only, and remote_plus_weight rows to estimate "
-                    "DMA overlap/contention for fused-MoE scheduling."
+                    "or both in the same device marker window. Compare raw marker "
+                    "durations at the same repeat_count across remote_only, "
+                    "weight_only, and remote_plus_weight rows to classify "
+                    "overlap/contention for fused-MoE scheduling."
                 ),
             )
         )
@@ -211,9 +213,9 @@ def _make_row(
         bf=shape.bt,
         bd=shape.hidden_size,
         tile_shape=_tile_shape(shape),
-        bytes_hbm=shape.remote_bytes + shape.weight_bytes,
+        bytes_hbm=(shape.remote_bytes + shape.weight_bytes) * shape.repeat_count,
         bytes_per_fetch=max(shape.remote_bytes, shape.weight_bytes),
-        dma_count=shape.remote_copy_count + shape.weight_copy_count,
+        dma_count=(shape.remote_copy_count + shape.weight_copy_count) * shape.repeat_count,
         status=status,
         execution_mode=execution_mode,
         latency_ms_samples=latency_ms_samples,
@@ -234,13 +236,16 @@ def _metadata_for_shape(metadata: dict[str, Any], shape: DMAOverlapShape) -> dic
         "path": shape.path,
         "path_class": shape.path_class,
         "bt": shape.bt,
+        "repeat_count": shape.repeat_count,
         "hidden_size": shape.hidden_size,
         "ep_size": shape.ep_size,
         "remote": {
             "enabled": shape.has_remote,
             "operation": "pltpu.make_async_remote_copy",
             "payload_bytes_per_device": shape.remote_bytes,
+            "payload_bytes_per_device_total": shape.remote_bytes * shape.repeat_count,
             "copy_count_per_device": shape.remote_copy_count,
+            "copy_count_per_device_total": shape.remote_copy_count * shape.repeat_count,
             "payload_bytes_per_copy": _bytes_per_remote_copy(shape),
             "pattern": "each rank sends to (rank + 1) % ep_size and receives from previous rank",
         },
@@ -248,17 +253,23 @@ def _metadata_for_shape(metadata: dict[str, Any], shape: DMAOverlapShape) -> dic
             "enabled": shape.has_weight,
             "operation": "pltpu.make_async_copy",
             "payload_bytes_per_device": shape.weight_bytes,
+            "payload_bytes_per_device_total": shape.weight_bytes * shape.repeat_count,
             "copy_count_per_device": shape.weight_copy_count,
+            "copy_count_per_device_total": shape.weight_copy_count * shape.repeat_count,
             "payload_bytes_per_copy": _bytes_per_weight_copy(shape),
             "pattern": "HBM->VMEM copy with the same self-copy wait anchor family as weight prefetch",
         },
         "interpretation": {
-            "barrier_adjustment": (
-                "Use barrier_only to adjust remote_only and remote_plus_weight before "
-                "comparing with weight_only."
+            "timing_source": (
+                "Use raw device marker durations from benchmark/utils.py. The marker "
+                "excludes host/JIT envelope timing but includes any synchronization "
+                "inside the measured Pallas function."
             ),
-            "full_overlap_test": "T_both_adj ~= max(T_remote_adj, T_weight)",
-            "no_overlap_test": "T_both_adj ~= T_remote_adj + T_weight",
+            "comparison_unit": "Compare rows with identical repeat_count and payload sizes.",
+            "full_overlap_test": "T_both ~= max(T_remote, T_weight)",
+            "no_overlap_test": "T_both ~= T_remote + T_weight",
+            "partial_overlap_test": "max(T_remote,T_weight) < T_both < T_remote + T_weight",
+            "barrier_residual": "Do not use marker_minus_barrier_cores as communication time.",
         },
     }
     return enriched
@@ -467,72 +478,73 @@ def _pallas_dma_overlap_call(
 
         sync_barrier()
 
-        if shape.has_remote:
-            for copy_id in range(shape.remote_copy_count):
-                pltpu.make_async_remote_copy(
-                    src_ref=remote_src_ref.at[
+        for _ in range(shape.repeat_count):
+            if shape.has_remote:
+                for copy_id in range(shape.remote_copy_count):
+                    pltpu.make_async_remote_copy(
+                        src_ref=remote_src_ref.at[
+                            copy_id,
+                            pl.ds(0, T_PACKING),
+                            pl.ds(0, remote_elems_per_copy),
+                        ],
+                        dst_ref=remote_dst_ref.at[
+                            rank,
+                            copy_id,
+                            pl.ds(0, T_PACKING),
+                            pl.ds(0, remote_elems_per_copy),
+                        ],
+                        send_sem=remote_send_sem,
+                        recv_sem=remote_recv_sem,
+                        device_id=get_mesh_device_id(peer),
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).start()
+
+            if shape.has_weight:
+                for copy_id in range(shape.weight_copy_count):
+                    pltpu.make_async_copy(
+                        src_ref=weight_src_ref.at[
+                            copy_id,
+                            pl.ds(0, T_PACKING),
+                            pl.ds(0, weight_elems_per_copy),
+                        ],
+                        dst_ref=weight_scratch.at[
+                            copy_id,
+                            pl.ds(0, T_PACKING),
+                            pl.ds(0, weight_elems_per_copy),
+                        ],
+                        sem=weight_sem,
+                    ).start()
+
+            if shape.has_remote:
+                for copy_id in range(shape.remote_copy_count):
+                    recv_ref = remote_dst_ref.at[
+                        recv_peer,
                         copy_id,
                         pl.ds(0, T_PACKING),
                         pl.ds(0, remote_elems_per_copy),
-                    ],
-                    dst_ref=remote_dst_ref.at[
-                        rank,
+                    ]
+                    pltpu.make_async_copy(
+                        src_ref=recv_ref, dst_ref=recv_ref, sem=remote_recv_sem
+                    ).wait()
+
+                for copy_id in range(shape.remote_copy_count):
+                    send_ref = remote_src_ref.at[
                         copy_id,
                         pl.ds(0, T_PACKING),
                         pl.ds(0, remote_elems_per_copy),
-                    ],
-                    send_sem=remote_send_sem,
-                    recv_sem=remote_recv_sem,
-                    device_id=get_mesh_device_id(peer),
-                    device_id_type=pltpu.DeviceIdType.MESH,
-                ).start()
+                    ]
+                    pltpu.make_async_copy(
+                        src_ref=send_ref, dst_ref=send_ref, sem=remote_send_sem
+                    ).wait()
 
-        if shape.has_weight:
-            for copy_id in range(shape.weight_copy_count):
-                pltpu.make_async_copy(
-                    src_ref=weight_src_ref.at[
+            if shape.has_weight:
+                for copy_id in range(shape.weight_copy_count):
+                    ref = weight_scratch.at[
                         copy_id,
                         pl.ds(0, T_PACKING),
                         pl.ds(0, weight_elems_per_copy),
-                    ],
-                    dst_ref=weight_scratch.at[
-                        copy_id,
-                        pl.ds(0, T_PACKING),
-                        pl.ds(0, weight_elems_per_copy),
-                    ],
-                    sem=weight_sem,
-                ).start()
-
-        if shape.has_remote:
-            for copy_id in range(shape.remote_copy_count):
-                recv_ref = remote_dst_ref.at[
-                    recv_peer,
-                    copy_id,
-                    pl.ds(0, T_PACKING),
-                    pl.ds(0, remote_elems_per_copy),
-                ]
-                pltpu.make_async_copy(
-                    src_ref=recv_ref, dst_ref=recv_ref, sem=remote_recv_sem
-                ).wait()
-
-            for copy_id in range(shape.remote_copy_count):
-                send_ref = remote_src_ref.at[
-                    copy_id,
-                    pl.ds(0, T_PACKING),
-                    pl.ds(0, remote_elems_per_copy),
-                ]
-                pltpu.make_async_copy(
-                    src_ref=send_ref, dst_ref=send_ref, sem=remote_send_sem
-                ).wait()
-
-        if shape.has_weight:
-            for copy_id in range(shape.weight_copy_count):
-                ref = weight_scratch.at[
-                    copy_id,
-                    pl.ds(0, T_PACKING),
-                    pl.ds(0, weight_elems_per_copy),
-                ]
-                pltpu.make_async_copy(src_ref=ref, dst_ref=ref, sem=weight_sem).wait()
+                    ]
+                    pltpu.make_async_copy(src_ref=ref, dst_ref=ref, sem=weight_sem).wait()
 
         sync_barrier()
 
@@ -613,8 +625,9 @@ def _weight_scratch_shape(shape: DMAOverlapShape) -> tuple[int, int, int]:
     return (max(1, shape.weight_copy_count), T_PACKING, max(1, _elements_per_weight_copy(shape)))
 
 
-def _tile_shape(shape: DMAOverlapShape) -> tuple[int, int, int, int]:
+def _tile_shape(shape: DMAOverlapShape) -> tuple[int, int, int, int, int]:
     return (
+        shape.repeat_count,
         max(1, shape.remote_copy_count),
         max(1, shape.weight_copy_count),
         T_PACKING,
