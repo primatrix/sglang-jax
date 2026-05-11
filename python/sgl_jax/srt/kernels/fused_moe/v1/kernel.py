@@ -990,15 +990,20 @@ def _fused_ep_moe_kernel(
             pltpu.VMEM(expert_sizes_x2_smem.shape[1:], expert_sizes_x2_smem.dtype),
         )
 
+    def get_a2a_scatter_remote_send_sz(*, bt_sem_id, local_e_id):
+        send_sz = jnp.int32(0)
+        for recv_id in range(num_devices):
+            e_id = recv_id * local_num_experts + local_e_id
+            sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, e_id]
+            send_sz += lax.select(recv_id == my_id, jnp.int32(0), sz)
+        return send_sz
+
     def start_a2a_scatter(*, bt_sem_id, e_sem_id, local_e_id, bt_start):
         if disable_a2a or disable_a2a_scatter:
             return
 
-        # Counting the number of remote sends from the current device.
         # Use `lax.fori_loop` to avoid unrolling `bt` (huge MLIR / slow compile).
-        def _scatter_one(
-            t_id, send_sz, e_sem_id=e_sem_id, local_e_id=local_e_id, bt_start=bt_start
-        ):
+        def _scatter_one(t_id, _, e_sem_id=e_sem_id, local_e_id=local_e_id, bt_start=bt_start):
             src_t_id = bt_start + t_id
             for k_id in range(top_k):
                 e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
@@ -1011,7 +1016,6 @@ def _fused_ep_moe_kernel(
                 is_local = recv_id == my_id
                 local_sz = lax.select(is_local, sz, jnp.int32(0))
                 remote_sz = lax.select(is_local, jnp.int32(0), sz)
-                send_sz += remote_sz
                 expert_offsets_x2_smem[bt_sem_id, 0, e_id_safe] = offset + local_sz + remote_sz
                 start = expert_starts_x2_smem[bt_sem_id, 0, e_id_safe] + offset
 
@@ -1042,22 +1046,19 @@ def _fused_ep_moe_kernel(
                         device_id_type=pltpu.DeviceIdType.MESH,
                     ).start()
 
-            return send_sz
+            return None
 
-        send_sz = lax.fori_loop(
+        lax.fori_loop(
             0,
             bt,
             _scatter_one,
-            jnp.int32(0),
+            None,
             unroll=False,
         )
-        a2a_s_sends_x2_smem[e_sem_id] = send_sz
 
     def start_a2a_scatter_batch(*, bt_sem_id, bt_start):
         if disable_a2a or disable_a2a_scatter:
             return
-        for slot in range(expert_buffer_count):
-            a2a_s_sends_x2_smem[slot] = jnp.int32(0)
 
         def _scatter_one_batch(t_id, _, bt_start=bt_start):
             src_t_id = bt_start + t_id
@@ -1074,8 +1075,6 @@ def _fused_ep_moe_kernel(
                 remote_sz = lax.select(is_local, jnp.int32(0), sz)
                 expert_offsets_x2_smem[bt_sem_id, 0, e_id_safe] = offset + local_sz + remote_sz
                 start = expert_starts_x2_smem[bt_sem_id, 0, e_id_safe] + offset
-                cur_sends = a2a_s_sends_x2_smem[e_sem_id_k]
-                a2a_s_sends_x2_smem[e_sem_id_k] = cur_sends + remote_sz
 
                 @pl.when(local_sz != 0)
                 def _local_copy(
@@ -1108,12 +1107,15 @@ def _fused_ep_moe_kernel(
 
         lax.fori_loop(0, bt, _scatter_one_batch, None, unroll=False)
 
-    def wait_a2a_scatter_send_batch():
+    def wait_a2a_scatter_send_batch(*, bt_sem_id):
         if disable_a2a or disable_a2a_scatter:
             return
 
         def _wait_one(slot, _):
-            scatter_send_sz = a2a_s_sends_x2_smem[slot]
+            scatter_send_sz = get_a2a_scatter_remote_send_sz(
+                bt_sem_id=bt_sem_id,
+                local_e_id=slot,
+            )
 
             @pl.when(scatter_send_sz != 0)
             def _():
@@ -1147,7 +1149,10 @@ def _fused_ep_moe_kernel(
     def wait_a2a_scatter_send(*, bt_sem_id, e_sem_id, local_e_id):
         if disable_a2a or disable_a2a_scatter:
             return
-        scatter_send_sz = a2a_s_sends_x2_smem[e_sem_id]
+        scatter_send_sz = get_a2a_scatter_remote_send_sz(
+            bt_sem_id=bt_sem_id,
+            local_e_id=local_e_id,
+        )
         should_wait = scatter_send_sz != 0
 
         @pl.when(should_wait)
@@ -2840,7 +2845,7 @@ def _fused_ep_moe_kernel(
 
             lax.fori_loop(final_se_block, se_total_blocks, cleanup_body_batch, None)
 
-            wait_a2a_scatter_send_batch()
+            wait_a2a_scatter_send_batch(bt_sem_id=bt_sem_id)
             wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
             sync_barrier()
 
