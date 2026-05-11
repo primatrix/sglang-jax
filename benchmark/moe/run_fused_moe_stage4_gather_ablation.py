@@ -59,6 +59,8 @@ def flags(**overrides: str) -> dict[str, str]:
         "FUSED_MOE_BENCHMARK_DISABLE_A2A": "False",
         "FUSED_MOE_BENCHMARK_DISABLE_A2A_SCATTER": "False",
         "FUSED_MOE_BENCHMARK_DISABLE_A2A_GATHER": "False",
+        "FUSED_MOE_BENCHMARK_ENABLE_A2A_SCATTER_EXPERT_MERGE": "False",
+        "FUSED_MOE_BENCHMARK_ENABLE_A2A_GATHER_DEVICE_MERGE": "False",
         "FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN1": "False",
         "FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN2": "False",
         "FUSED_MOE_BENCHMARK_DISABLE_WEIGHT_LOAD": "False",
@@ -96,14 +98,39 @@ CASE_ENVS = {
         **COMM_SKELETON,
         FUSED_MOE_BENCHMARK_DISABLE_A2A_SCATTER="True",
     ),
+    "stage4_gather_device_merge_only": flags(
+        **COMM_SKELETON,
+        FUSED_MOE_BENCHMARK_DISABLE_A2A_SCATTER="True",
+        FUSED_MOE_BENCHMARK_ENABLE_A2A_GATHER_DEVICE_MERGE="True",
+    ),
     # Scatter alone, retained so gather_actual can be cross-checked as A2A - scatter.
     "stage2_scatter_only": flags(
         **COMM_SKELETON,
         FUSED_MOE_BENCHMARK_DISABLE_A2A_GATHER="True",
     ),
+    "stage2_scatter_expert_merge_only": flags(
+        **COMM_SKELETON,
+        FUSED_MOE_BENCHMARK_DISABLE_A2A_GATHER="True",
+        FUSED_MOE_BENCHMARK_ENABLE_A2A_SCATTER_EXPERT_MERGE="True",
+    ),
     "a2a_total_only": flags(**COMM_SKELETON),
+    "a2a_total_merge": flags(
+        **COMM_SKELETON,
+        FUSED_MOE_BENCHMARK_ENABLE_A2A_SCATTER_EXPERT_MERGE="True",
+        FUSED_MOE_BENCHMARK_ENABLE_A2A_GATHER_DEVICE_MERGE="True",
+    ),
     # Real compute path with output accumulation disabled, so gather can be toggled safely.
     "full_no_output": flags(FUSED_MOE_BENCHMARK_DISABLE_OUTPUT_ACCUMULATE="True"),
+    "full_scatter_expert_merge": flags(
+        FUSED_MOE_BENCHMARK_ENABLE_A2A_SCATTER_EXPERT_MERGE="True",
+    ),
+    "full_gather_device_merge": flags(
+        FUSED_MOE_BENCHMARK_ENABLE_A2A_GATHER_DEVICE_MERGE="True",
+    ),
+    "full_both_merge": flags(
+        FUSED_MOE_BENCHMARK_ENABLE_A2A_SCATTER_EXPERT_MERGE="True",
+        FUSED_MOE_BENCHMARK_ENABLE_A2A_GATHER_DEVICE_MERGE="True",
+    ),
     "full_no_gather_no_output": flags(
         FUSED_MOE_BENCHMARK_DISABLE_A2A_GATHER="True",
         FUSED_MOE_BENCHMARK_DISABLE_OUTPUT_ACCUMULATE="True",

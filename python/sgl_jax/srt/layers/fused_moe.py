@@ -69,6 +69,8 @@ class FusedEPMoE(nnx.Module):
         disable_a2a: bool = False,
         disable_a2a_scatter: bool = False,
         disable_a2a_gather: bool = False,
+        enable_a2a_scatter_expert_merge: bool = False,
+        enable_a2a_gather_device_merge: bool = False,
         a2a_hbm_fraction: float | None = None,
         disable_dynamic_ffn1: bool = False,
         disable_dynamic_ffn2: bool = False,
@@ -102,6 +104,8 @@ class FusedEPMoE(nnx.Module):
         self.disable_a2a = disable_a2a
         self.disable_a2a_scatter = disable_a2a_scatter
         self.disable_a2a_gather = disable_a2a_gather
+        self.enable_a2a_scatter_expert_merge = enable_a2a_scatter_expert_merge
+        self.enable_a2a_gather_device_merge = enable_a2a_gather_device_merge
         self.a2a_hbm_fraction = a2a_hbm_fraction
         self.disable_dynamic_ffn1 = disable_dynamic_ffn1
         self.disable_dynamic_ffn2 = disable_dynamic_ffn2
@@ -491,6 +495,8 @@ class FusedEPMoE(nnx.Module):
             disable_a2a=self.disable_a2a,
             disable_a2a_scatter=self.disable_a2a_scatter,
             disable_a2a_gather=self.disable_a2a_gather,
+            enable_a2a_scatter_expert_merge=self.enable_a2a_scatter_expert_merge,
+            enable_a2a_gather_device_merge=self.enable_a2a_gather_device_merge,
             a2a_hbm_fraction=self.a2a_hbm_fraction,
             disable_dynamic_ffn1=self.disable_dynamic_ffn1,
             disable_dynamic_ffn2=self.disable_dynamic_ffn2,

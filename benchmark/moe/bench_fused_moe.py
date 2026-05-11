@@ -985,6 +985,14 @@ def run_all(
                     "FUSED_MOE_BENCHMARK_DISABLE_A2A_GATHER",
                     all_disable=all_disable,
                 ),
+                enable_a2a_scatter_expert_merge=_env_bool(
+                    "FUSED_MOE_BENCHMARK_ENABLE_A2A_SCATTER_EXPERT_MERGE",
+                    False,
+                ),
+                enable_a2a_gather_device_merge=_env_bool(
+                    "FUSED_MOE_BENCHMARK_ENABLE_A2A_GATHER_DEVICE_MERGE",
+                    False,
+                ),
                 a2a_hbm_fraction=a2a_hbm_fraction,
                 disable_dynamic_ffn1=_with_all_disable(
                     "FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN1",

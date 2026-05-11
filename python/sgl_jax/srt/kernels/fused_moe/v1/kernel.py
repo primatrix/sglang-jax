@@ -568,6 +568,8 @@ def _fused_ep_moe_kernel(
     disable_a2a: bool = False,
     disable_a2a_scatter: bool = False,
     disable_a2a_gather: bool = False,
+    enable_a2a_scatter_expert_merge: bool = False,
+    enable_a2a_gather_device_merge: bool = False,
     disable_dynamic_ffn1: bool = False,
     disable_dynamic_ffn2: bool = False,
     disable_weight_load: bool = False,
@@ -1100,6 +1102,109 @@ def _fused_ep_moe_kernel(
 
         lax.fori_loop(0, bt, _scatter_one_batch, None, unroll=False)
 
+    def start_a2a_scatter_batch_expert_merge(*, bt_sem_id, bt_start):
+        if disable_a2a or disable_a2a_scatter:
+            return
+        for slot in range(expert_buffer_count):
+            a2a_s_sends_x2_smem[slot] = jnp.int32(0)
+
+        def _pack_one_batch(t_id, _, bt_start=bt_start):
+            src_t_id = bt_start + t_id
+            for k_id in range(top_k):
+                e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
+                is_valid = e_id >= 0
+                e_id_safe = lax.select(is_valid, e_id, jnp.int32(0))
+                e_sem_id_k = e_id_safe % jnp.int32(local_num_experts)
+                offset = expert_offsets_x2_smem[bt_sem_id, 0, e_id_safe]
+                sz = lax.select(is_valid, jnp.int32(1), jnp.int32(0))
+                expert_offsets_x2_smem[bt_sem_id, 0, e_id_safe] = offset + sz
+                cur_packs = a2a_s_sends_x2_smem[e_sem_id_k]
+                a2a_s_sends_x2_smem[e_sem_id_k] = cur_packs + sz
+
+                @pl.when(sz != 0)
+                def _copy_to_pack(
+                    src_t_id=src_t_id,
+                    e_id_safe=e_id_safe,
+                    offset=offset,
+                    sz=sz,
+                    e_sem_id_k=e_sem_id_k,
+                ):
+                    # Reuse a2a_g_hbm as a scatter-only HBM staging buffer. At
+                    # this point gather has not started, so this scratch is free.
+                    pltpu.make_async_copy(
+                        src_ref=tokens_hbm.at[pl.ds(src_t_id, sz)],
+                        dst_ref=a2a_g_hbm.at[e_id_safe, pl.ds(offset, sz)],
+                        sem=send_x2_sems.at[e_sem_id_k],
+                    ).start()
+
+            return None
+
+        lax.fori_loop(0, bt, _pack_one_batch, None, unroll=False)
+
+        def _wait_pack_slot(slot, _):
+            pack_count = a2a_s_sends_x2_smem[slot]
+
+            def _wait_one_pack_copy(_, __):
+                pack_ref = a2a_g_hbm.at[slot, pl.ds(0, 1)]
+                pltpu.make_async_copy(
+                    src_ref=pack_ref,
+                    dst_ref=pack_ref,
+                    sem=send_x2_sems.at[slot],
+                ).wait()
+                return None
+
+            lax.fori_loop(0, pack_count, _wait_one_pack_copy, None, unroll=False)
+            a2a_s_sends_x2_smem[slot] = jnp.int32(0)
+            return None
+
+        lax.fori_loop(0, jnp.int32(expert_buffer_count), _wait_pack_slot, None, unroll=False)
+
+        def _send_one_expert(e_id, _):
+            e_id = e_id.astype(jnp.int32)
+            e_sem_id_k = e_id % jnp.int32(local_num_experts)
+            recv_id = e_id // jnp.int32(local_num_experts)
+            local_count = d2e_count_x2_smem[bt_sem_id, my_id, 0, e_id]
+            dst_start = expert_starts_x2_smem[bt_sem_id, 0, e_id]
+
+            @pl.when(local_count != 0)
+            def _send_packed_expert(
+                e_id=e_id,
+                e_sem_id_k=e_sem_id_k,
+                recv_id=recv_id,
+                local_count=local_count,
+                dst_start=dst_start,
+            ):
+                is_local = recv_id == my_id
+
+                @pl.when(is_local)
+                def _local_expert_copy():
+                    pltpu.make_async_copy(
+                        src_ref=a2a_g_hbm.at[e_id, pl.ds(0, local_count)],
+                        dst_ref=a2a_s_x2_hbm.at[e_sem_id_k, pl.ds(dst_start, local_count)],
+                        sem=recv_x2_sems.at[e_sem_id_k],
+                    ).start()
+
+                @pl.when(jnp.logical_not(is_local))
+                def _remote_expert_copy():
+                    pltpu.make_async_remote_copy(
+                        src_ref=a2a_g_hbm.at[e_id, pl.ds(0, local_count)],
+                        dst_ref=a2a_s_x2_hbm.at[e_sem_id_k, pl.ds(dst_start, local_count)],
+                        send_sem=send_x2_sems.at[e_sem_id_k],
+                        recv_sem=recv_x2_sems.at[e_sem_id_k],
+                        device_id=get_mesh_device_id(recv_id),
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).start()
+                    send_ref = a2a_g_hbm.at[e_id, pl.ds(0, local_count)]
+                    pltpu.make_async_copy(
+                        src_ref=send_ref,
+                        dst_ref=send_ref,
+                        sem=send_x2_sems.at[e_sem_id_k],
+                    ).wait()
+
+            return None
+
+        lax.fori_loop(0, num_experts, _send_one_expert, None, unroll=False)
+
     def wait_a2a_scatter_send_batch():
         if disable_a2a or disable_a2a_scatter:
             return
@@ -1196,6 +1301,104 @@ def _fused_ep_moe_kernel(
 
             start += sz
 
+    def start_a2a_gather_device_merge_batch(*, bt_sem_id):
+        if disable_a2a or disable_a2a_gather:
+            return
+
+        for recv_id in range(num_devices):
+            total_sz = jnp.int32(0)
+            for local_e_id in range(local_num_experts):
+                my_e_id = my_id * local_num_experts + local_e_id
+                total_sz += d2e_count_x2_smem[bt_sem_id, recv_id, 0, my_e_id]
+
+            @pl.when(total_sz != 0)
+            def _pack_and_send_recv(recv_id=recv_id):
+                for local_e_id in range(local_num_experts):
+                    my_e_id = my_id * local_num_experts + local_e_id
+                    sz = d2e_count_x2_smem[bt_sem_id, recv_id, 0, my_e_id]
+                    src_start = jnp.int32(0)
+                    for prev_recv_id in range(recv_id):
+                        src_start += d2e_count_x2_smem[bt_sem_id, prev_recv_id, 0, my_e_id]
+
+                    @pl.when(sz != 0)
+                    def _pack_one_local_expert(
+                        local_e_id=local_e_id,
+                        src_start=src_start,
+                        sz=sz,
+                    ):
+                        pltpu.make_async_copy(
+                            src_ref=a2a_s_acc_x2_hbm.at[local_e_id, pl.ds(src_start, sz)],
+                            dst_ref=a2a_s_x2_hbm.at[local_e_id, pl.ds(0, sz)],
+                            sem=gather_send_x2_sems.at[local_e_id],
+                        ).start()
+
+                for local_e_id in range(local_num_experts):
+                    my_e_id = my_id * local_num_experts + local_e_id
+                    sz = d2e_count_x2_smem[bt_sem_id, recv_id, 0, my_e_id]
+
+                    @pl.when(sz != 0)
+                    def _wait_pack(local_e_id=local_e_id, sz=sz):
+                        ref = a2a_s_x2_hbm.at[local_e_id, pl.ds(0, sz)]
+                        pltpu.make_async_copy(
+                            src_ref=ref,
+                            dst_ref=ref,
+                            sem=gather_send_x2_sems.at[local_e_id],
+                        ).wait()
+
+                dst_e_start = my_id * local_num_experts
+                is_local_recv = recv_id == my_id
+
+                @pl.when(is_local_recv)
+                def _local_merged_copy():
+                    pltpu.make_async_copy(
+                        src_ref=a2a_s_x2_hbm.at[
+                            pl.ds(0, local_num_experts),
+                            pl.ds(0, bt),
+                            pl.ds(0, t_packing),
+                            pl.ds(0, h_per_t_packing),
+                        ],
+                        dst_ref=a2a_g_hbm.at[
+                            pl.ds(dst_e_start, local_num_experts),
+                            pl.ds(0, bt),
+                            pl.ds(0, t_packing),
+                            pl.ds(0, h_per_t_packing),
+                        ],
+                        sem=gather_send_x2_sems.at[0],
+                    ).start()
+                    ref = a2a_s_x2_hbm.at[0, pl.ds(0, bt)]
+                    pltpu.make_async_copy(
+                        src_ref=ref,
+                        dst_ref=ref,
+                        sem=gather_send_x2_sems.at[0],
+                    ).wait()
+
+                @pl.when(jnp.logical_not(is_local_recv))
+                def _remote_merged_copy(recv_id=recv_id):
+                    pltpu.make_async_remote_copy(
+                        src_ref=a2a_s_x2_hbm.at[
+                            pl.ds(0, local_num_experts),
+                            pl.ds(0, bt),
+                            pl.ds(0, t_packing),
+                            pl.ds(0, h_per_t_packing),
+                        ],
+                        dst_ref=a2a_g_hbm.at[
+                            pl.ds(dst_e_start, local_num_experts),
+                            pl.ds(0, bt),
+                            pl.ds(0, t_packing),
+                            pl.ds(0, h_per_t_packing),
+                        ],
+                        send_sem=gather_send_x2_sems.at[0],
+                        recv_sem=a2a_gather_sem,
+                        device_id=get_mesh_device_id(recv_id),
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).start()
+                    ref = a2a_s_x2_hbm.at[0, pl.ds(0, bt)]
+                    pltpu.make_async_copy(
+                        src_ref=ref,
+                        dst_ref=ref,
+                        sem=gather_send_x2_sems.at[0],
+                    ).wait()
+
     def wait_a2a_gather_send(*, bt_sem_id, e_sem_id, local_e_id):
         if disable_a2a or disable_a2a_gather:
             return
@@ -1243,6 +1446,30 @@ def _fused_ep_moe_kernel(
             return None
 
         lax.fori_loop(0, num_experts, _wait_one_expert, None, unroll=False)
+
+    def wait_a2a_gather_recv_all_merged(*, bt_sem_id):
+        if disable_a2a or disable_a2a_gather:
+            return
+
+        def _wait_one_src_device(src_id, _):
+            total_sz = jnp.int32(0)
+            for local_e_id in range(local_num_experts):
+                e_id = src_id * local_num_experts + local_e_id
+                total_sz += d2e_count_x2_smem[bt_sem_id, my_id, 0, e_id]
+
+            @pl.when((src_id != my_id) & (total_sz != 0))
+            def _():
+                e_start = src_id * local_num_experts
+                ref = a2a_g_hbm.at[e_start, pl.ds(0, bt)]
+                pltpu.make_async_copy(
+                    src_ref=ref,
+                    dst_ref=ref,
+                    sem=a2a_gather_sem,
+                ).wait()
+
+            return None
+
+        lax.fori_loop(0, num_devices, _wait_one_src_device, None, unroll=False)
 
     def start_fetch_and_wait_se_scales():
         if w1_shared_hbm is None:
@@ -2782,7 +3009,10 @@ def _fused_ep_moe_kernel(
             # Issue all scatter DMAs in one token-loop pass (bt iterations
             # instead of bt * local_num_experts), then run a tight compute loop
             # where each expert waits only its own recv semaphore.
-            start_a2a_scatter_batch(bt_sem_id=bt_sem_id, bt_start=bt_start)
+            if enable_a2a_scatter_expert_merge:
+                start_a2a_scatter_batch_expert_merge(bt_sem_id=bt_sem_id, bt_start=bt_start)
+            else:
+                start_a2a_scatter_batch(bt_sem_id=bt_sem_id, bt_start=bt_start)
 
             init_carry = jnp.int32(0)
 
@@ -2810,11 +3040,12 @@ def _fused_ep_moe_kernel(
                 )
                 expert_ffn(bt_sem_id, e_sem_id_local, local_e_id)
 
-                start_a2a_gather(
-                    bt_sem_id=bt_sem_id,
-                    e_sem_id=e_sem_id_local,
-                    local_e_id=local_e_id,
-                )
+                if not enable_a2a_gather_device_merge:
+                    start_a2a_gather(
+                        bt_sem_id=bt_sem_id,
+                        e_sem_id=e_sem_id_local,
+                        local_e_id=local_e_id,
+                    )
 
                 for _ in range(se_after):
                     run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
@@ -2833,20 +3064,25 @@ def _fused_ep_moe_kernel(
             lax.fori_loop(final_se_block, se_total_blocks, cleanup_body_batch, None)
 
             wait_a2a_scatter_send_batch()
-            wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
+            if enable_a2a_gather_device_merge:
+                start_a2a_gather_device_merge_batch(bt_sem_id=bt_sem_id)
+                wait_a2a_gather_recv_all_merged(bt_sem_id=bt_sem_id)
+            else:
+                wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
             sync_barrier()
 
             acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
 
             start_send_bo(bt_id=bt_id)
 
-            tail_start = max(local_num_experts - expert_buffer_count, 0)
-            for tail_local_e_id in range(tail_start, local_num_experts):
-                wait_a2a_gather_send(
-                    bt_sem_id=bt_sem_id,
-                    e_sem_id=tail_local_e_id,
-                    local_e_id=tail_local_e_id,
-                )
+            if not enable_a2a_gather_device_merge:
+                tail_start = max(local_num_experts - expert_buffer_count, 0)
+                for tail_local_e_id in range(tail_start, local_num_experts):
+                    wait_a2a_gather_send(
+                        bt_sem_id=bt_sem_id,
+                        e_sem_id=tail_local_e_id,
+                        local_e_id=tail_local_e_id,
+                    )
 
             @pl.when(bt_id + 1 < num_bt)
             def _():
@@ -3255,6 +3491,8 @@ def jax_allreduce_metadata_by_bt(
         "disable_a2a",
         "disable_a2a_scatter",
         "disable_a2a_gather",
+        "enable_a2a_scatter_expert_merge",
+        "enable_a2a_gather_device_merge",
         "a2a_hbm_fraction",
         "disable_dynamic_ffn1",
         "disable_dynamic_ffn2",
@@ -3292,6 +3530,8 @@ def fused_ep_moe(
     disable_a2a: bool = False,
     disable_a2a_scatter: bool = False,
     disable_a2a_gather: bool = False,
+    enable_a2a_scatter_expert_merge: bool = False,
+    enable_a2a_gather_device_merge: bool = False,
     a2a_hbm_fraction: float | None = None,
     disable_dynamic_ffn1: bool = False,
     disable_dynamic_ffn2: bool = False,
@@ -3586,6 +3826,8 @@ def fused_ep_moe(
                 disable_a2a=disable_a2a,
                 disable_a2a_scatter=disable_a2a_scatter,
                 disable_a2a_gather=disable_a2a_gather,
+                enable_a2a_scatter_expert_merge=enable_a2a_scatter_expert_merge,
+                enable_a2a_gather_device_merge=enable_a2a_gather_device_merge,
                 disable_dynamic_ffn1=disable_dynamic_ffn1,
                 disable_dynamic_ffn2=disable_dynamic_ffn2,
                 disable_weight_load=disable_weight_load,
