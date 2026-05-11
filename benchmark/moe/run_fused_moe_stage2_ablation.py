@@ -5,6 +5,7 @@ import argparse
 import datetime as dt
 import json
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -203,23 +204,6 @@ def run_case(
     dist_addr = f"{rank0_ip}:{group['dist_port']}"
     remote_logs: dict[str, str] = {}
     env = " ".join(f"{k}={v}" for k, v in CASE_ENVS[case_name].items())
-    token_args = " ".join(str(x) for x in args.num_tokens)
-    extra_args = " ".join(args.extra_args or [])
-
-    base_cmd = f"""
-cd {args.repo_dir}
-export PYTHONPATH=$PWD/python
-export JAX_COMPILATION_CACHE_DIR={args.compilation_cache_dir}
-{env} /tmp/tpu_logs/venv/bin/python -u -m benchmark.moe.bench_fused_moe \\
-  --shape-preset {args.shape_preset} \\
-  --ep-size {ep_size} --tp-size 1 \\
-  --num-tokens {token_args} \\
-  --iters {args.iters} --warmup-iters {args.warmup_iters} \\
-  --imbalance-mode {args.imbalance_mode} \\
-  --hotspot-ratio {args.hotspot_ratio} \\
-  --hotspot-count {args.hotspot_count} \\
-  {extra_args}
-"""
 
     procs: dict[str, subprocess.Popen] = {}
     order = list(range(1, len(pods))) + [0]
@@ -227,17 +211,47 @@ export JAX_COMPILATION_CACHE_DIR={args.compilation_cache_dir}
         pod = pods[rank]
         remote_log = f"/tmp/stage2_a2a_{run_id}_{group_name}_{case_name}_rank{rank}.log"
         remote_logs[pod] = remote_log
-        dist_args = ""
+        bench_args = [
+            "--shape-preset",
+            args.shape_preset,
+            "--ep-size",
+            ep_size,
+            "--tp-size",
+            1,
+            "--num-tokens",
+            *args.num_tokens,
+            "--iters",
+            args.iters,
+            "--warmup-iters",
+            args.warmup_iters,
+            "--imbalance-mode",
+            args.imbalance_mode,
+            "--hotspot-ratio",
+            args.hotspot_ratio,
+            "--hotspot-count",
+            args.hotspot_count,
+        ]
         if len(pods) > 1:
-            dist_args = (
-                f" --dist-init-addr {dist_addr}"
-                f" --num-processes {len(pods)}"
-                f" --process-id {rank}"
-                f" --distributed-init-timeout {args.distributed_init_timeout}"
+            bench_args.extend(
+                [
+                    "--dist-init-addr",
+                    dist_addr,
+                    "--num-processes",
+                    len(pods),
+                    "--process-id",
+                    rank,
+                    "--distributed-init-timeout",
+                    args.distributed_init_timeout,
+                ]
             )
+        bench_args.extend(args.extra_args or [])
+        bench_args_str = " ".join(shlex.quote(str(x)) for x in bench_args)
         script = f"""
 set -euo pipefail
-({base_cmd} {dist_args}) > {remote_log} 2>&1
+cd {args.repo_dir}
+export PYTHONPATH=$PWD/python
+export JAX_COMPILATION_CACHE_DIR={args.compilation_cache_dir}
+{env} /tmp/tpu_logs/venv/bin/python -u -m benchmark.moe.bench_fused_moe {bench_args_str} > {remote_log} 2>&1
 tail -n 80 {remote_log}
 """
         print(f"start {group_name}/{case_name} rank={rank} pod={pod}")
