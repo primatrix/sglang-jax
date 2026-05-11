@@ -572,13 +572,17 @@ def _make_remote_src(*, jax: Any, np: Any, sharding: Any, shape: DMAOverlapShape
     except Exception:
         numpy_bfloat16 = np.float32
 
-    global_shape = (shape.ep_size, *(_remote_src_local_shape(shape)))
+    global_shape = (
+        shape.ep_size * max(1, shape.remote_copy_count),
+        T_PACKING,
+        max(1, _elements_per_remote_copy(shape)),
+    )
 
     def data_callback(index):
         leading = index[0]
         start = int(leading.start or 0)
         stop = int(leading.stop or global_shape[0])
-        local_shape = (stop - start, *(_remote_src_local_shape(shape)))
+        local_shape = (stop - start, T_PACKING, max(1, _elements_per_remote_copy(shape)))
         return np.full(local_shape, start % 128, dtype=numpy_bfloat16)
 
     return jax.make_array_from_callback(global_shape, sharding, data_callback)
