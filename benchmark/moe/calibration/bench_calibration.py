@@ -63,6 +63,7 @@ SCENARIOS = (
 )
 
 SUITE_V7X32_BF16_WEIGHT_TILES = "v7x32_bf16_weight_tiles"
+SUITE_V7X8_BF16_WEIGHT_TILE_DMA_TUNED_FAMILY = "v7x8_bf16_weight_tile_dma_tuned_family"
 SUITE_V7X32_BF16_HBM_COPY_ENVELOPE = "v7x32_bf16_hbm_copy_envelope"
 SUITE_V7X32_BF16_HBM_CURVE_V2 = "v7x32_bf16_hbm_curve_v2"
 SUITE_V7X32_BF16_HBM_DENSE_CURVE_V3 = "v7x32_bf16_hbm_dense_curve_v3"
@@ -87,6 +88,7 @@ SUITE_V7X32_BF16_WAIT_PRIMITIVES = "v7x32_bf16_wait_primitives"
 SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG = "v7x32_bf16_fused_moe_e2e_diag"
 SUITES = (
     SUITE_V7X32_BF16_WEIGHT_TILES,
+    SUITE_V7X8_BF16_WEIGHT_TILE_DMA_TUNED_FAMILY,
     SUITE_V7X32_BF16_HBM_COPY_ENVELOPE,
     SUITE_V7X32_BF16_HBM_CURVE_V2,
     SUITE_V7X32_BF16_HBM_DENSE_CURVE_V3,
@@ -187,6 +189,38 @@ PHASE1_HBM_EQUIVALENT_SHAPES: tuple[WeightTileShape, ...] = (
     WeightTileShape("w2", 1024, 4096, 8388608, (2, 1024, 2048)),
     WeightTileShape("w2", 2048, 1024, 4194304, (2, 2048, 512)),
     WeightTileShape("w2", 2048, 2048, 8388608, (2, 2048, 1024)),
+)
+
+PHASE1_WEIGHT_TILE_DMA_TUNED_FAMILY_SHAPES: tuple[WeightTileShape, ...] = tuple(
+    WeightTileShape(
+        path_class=path_class,
+        bf=width,
+        bd=depth,
+        bytes_per_fetch=width * depth * 2,
+        tile_shape=(
+            (T_PACKING, depth // T_PACKING, width)
+            if path_class in ("w1w3", "shared_w1w3")
+            else (T_PACKING, width, depth // T_PACKING)
+        ),
+    )
+    for _num_tokens, _bt, routed_bf, bd1, bd2, _bts, _btc, _bfc, _bd1c, _bd2c, bse in (
+        (64, 2, 2048, 2048, 2048, 64, 64, 2048, 2048, 2048, 256),
+        (128, 4, 2048, 2048, 2048, 128, 128, 2048, 2048, 2048, 256),
+        (256, 8, 2048, 1024, 1024, 256, 256, 2048, 1024, 1024, 2048),
+        (512, 16, 2048, 1024, 1024, 512, 512, 2048, 1024, 1024, 1024),
+        (1024, 32, 2048, 1024, 1024, 32, 32, 2048, 1024, 1024, 1024),
+        (2048, 64, 1024, 2048, 2048, 64, 64, 1024, 2048, 2048, 512),
+        (4096, 128, 512, 1024, 1024, 1024, 1024, 512, 1024, 1024, 512),
+    )
+    for path_class, width, depth in (
+        ("w1w3", routed_bf, bd1),
+        ("w2", routed_bf, bd2),
+        ("shared_w1w3", bse, bd1),
+        ("shared_w2", bse, bd2),
+    )
+)
+PHASE1_WEIGHT_TILE_DMA_TUNED_FAMILY_SHAPES = tuple(
+    dict.fromkeys(PHASE1_WEIGHT_TILE_DMA_TUNED_FAMILY_SHAPES)
 )
 
 PHASE1_HBM_COPY_LADDER_BYTES = (
@@ -698,9 +732,11 @@ PHASE1_WAIT_PRIMITIVE_SHAPES: tuple[layer1_wait.WaitShape, ...] = tuple(
 
 
 def load_suite_shapes(suite: str) -> tuple[WeightTileShape, ...]:
-    if suite != SUITE_V7X32_BF16_WEIGHT_TILES:
-        raise ValueError(f"Unsupported suite: {suite}")
-    return PHASE1_HBM_EQUIVALENT_SHAPES
+    if suite == SUITE_V7X32_BF16_WEIGHT_TILES:
+        return PHASE1_HBM_EQUIVALENT_SHAPES
+    if suite == SUITE_V7X8_BF16_WEIGHT_TILE_DMA_TUNED_FAMILY:
+        return PHASE1_WEIGHT_TILE_DMA_TUNED_FAMILY_SHAPES
+    raise ValueError(f"Unsupported suite: {suite}")
 
 
 def load_layer0_suite_shapes(suite: str) -> tuple[WeightTileShape, ...]:
@@ -1081,19 +1117,49 @@ def _layer0_a2a_envelope_rows(
 
 
 def _layer1_weight_tile_dma_rows(
-    suite: str, execution_mode: str, runtime: dict[str, Any]
+    suite: str,
+    execution_mode: str,
+    runtime: dict[str, Any],
+    bf_values: tuple[int, ...] | None = None,
+    path_values: tuple[str, ...] | None = None,
+    bd_values: tuple[int, ...] | None = None,
 ) -> list[dict[str, Any]]:
-    if suite != SUITE_V7X32_BF16_WEIGHT_TILES:
+    if suite not in (
+        SUITE_V7X32_BF16_WEIGHT_TILES,
+        SUITE_V7X8_BF16_WEIGHT_TILE_DMA_TUNED_FAMILY,
+    ):
         raise ValueError(
-            f"Layer 1 weight tile DMA supports only {SUITE_V7X32_BF16_WEIGHT_TILES}, "
+            "Layer 1 weight tile DMA supports only "
+            f"{SUITE_V7X32_BF16_WEIGHT_TILES} or {SUITE_V7X8_BF16_WEIGHT_TILE_DMA_TUNED_FAMILY}, "
             f"got {suite}."
         )
-    return layer1_weight_tile_dma.build_not_implemented_rows(
+    target_runtime = (
+        TARGET_RUNTIME_V7X8
+        if suite == SUITE_V7X8_BF16_WEIGHT_TILE_DMA_TUNED_FAMILY
+        else TARGET_RUNTIME_V7X32
+    )
+    rows = layer1_weight_tile_dma.build_not_implemented_rows(
         suite=suite,
-        shapes=load_suite_shapes(suite),
+        shapes=_filter_shapes_by_bd(
+            _filter_shapes_by_bf(load_suite_shapes(suite), bf_values),
+            bd_values,
+        ),
         execution_mode=execution_mode,
         runtime=runtime,
+        source=_source(),
+        metadata=_suite_metadata_for_runtime(
+            matrix_kind="fused_moe_weight_tile_dma",
+            target_runtime=target_runtime,
+        ),
     )
+    if path_values is None:
+        return rows
+    allowed_paths = set(path_values)
+    return [
+        row
+        for row in rows
+        if row.get("path") in allowed_paths or row.get("path_class") in allowed_paths
+    ]
 
 
 def _layer1_a2a_metadata_rows(
@@ -1167,7 +1233,11 @@ def _filter_shapes(
         filtered = tuple(
             shape
             for shape in filtered
-            if getattr(shape, "dyn_sz", getattr(shape, "bt", getattr(shape, "repetitions", None)))
+            if getattr(
+                shape,
+                "dyn_sz",
+                getattr(shape, "bt", getattr(shape, "repetitions", getattr(shape, "bf", None))),
+            )
             in allowed
         )
     if path_values is None:
@@ -1183,6 +1253,13 @@ def _filter_shapes(
 
 def _filter_shapes_by_bf(shapes, bf_values: tuple[int, ...] | None):
     return _filter_shapes(shapes, bf_values, None)
+
+
+def _filter_shapes_by_bd(shapes, bd_values: tuple[int, ...] | None):
+    if bd_values is None:
+        return tuple(shapes)
+    allowed = set(bd_values)
+    return tuple(shape for shape in shapes if getattr(shape, "bd", None) in allowed)
 
 
 def _layer1_a2a_gather_rows(
@@ -1354,6 +1431,7 @@ def build_rows(
     execution_mode: str,
     bf_values: tuple[int, ...] | None = None,
     path_values: tuple[str, ...] | None = None,
+    bd_values: tuple[int, ...] | None = None,
 ) -> list[dict[str, Any]]:
     runtime = collect_runtime_identity()
     resolved_mode = resolve_execution_mode(scenario, execution_mode, runtime)
@@ -1374,7 +1452,9 @@ def build_rows(
     if scenario == SCENARIO_LAYER1_DMA_OVERLAP:
         return _layer1_dma_overlap_rows(suite, resolved_mode, runtime, bf_values, path_values)
     if scenario == SCENARIO_LAYER1_WEIGHT_TILE_DMA:
-        return _layer1_weight_tile_dma_rows(suite, resolved_mode, runtime)
+        return _layer1_weight_tile_dma_rows(
+            suite, resolved_mode, runtime, bf_values, path_values, bd_values
+        )
     if scenario == SCENARIO_LAYER1_LOCAL_DMA:
         return _layer1_local_dma_rows(suite, resolved_mode, runtime, bf_values, path_values)
     if scenario == SCENARIO_LAYER1_FFN_COMPUTE:
@@ -1438,6 +1518,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--bd-values",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated bd values. Used with layer1_weight_tile_dma "
+            "to isolate one bf/bd/path shape per Python process."
+        ),
+    )
+    parser.add_argument(
         "--path-values",
         type=str,
         default=None,
@@ -1486,6 +1575,7 @@ def main() -> None:
         args.execution_mode,
         _parse_bf_values(args.bf_values),
         _parse_string_values(args.path_values),
+        _parse_bf_values(args.bd_values),
     )
     if args.require_measured:
         bad_rows = [

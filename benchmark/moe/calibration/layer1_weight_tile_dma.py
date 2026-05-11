@@ -1,7 +1,8 @@
 """Layer 1 fused-MoE dense weight tile DMA calibration.
 
-This module records the Phase 1 mapping from #2 JSONL rows to the real
-`start_fetch_bw1`, `start_fetch_bw2`, and `start_fetch_bw3` HBM->VMEM copies in
+This module records the Phase 1 mapping from JSONL rows to the real routed
+expert `start_fetch_bw1`, `start_fetch_bw2`, `start_fetch_bw3` and shared expert
+`start_fetch_se_w1`, `start_fetch_se_w2`, `start_fetch_se_w3` HBM->VMEM copies in
 `python/sgl_jax/srt/kernels/fused_moe/v1/kernel.py`.
 
 On TPU with `execution_mode=pallas`, it runs a small Pallas kernel that mirrors
@@ -23,6 +24,11 @@ from benchmark.moe.calibration.common import (
 
 SCENARIO_LAYER1_WEIGHT_TILE_DMA = "layer1_weight_tile_dma"
 SUITE_V7X32_BF16_WEIGHT_TILES = "v7x32_bf16_weight_tiles"
+SUITE_V7X8_BF16_WEIGHT_TILE_DMA_TUNED_FAMILY = "v7x8_bf16_weight_tile_dma_tuned_family"
+SUPPORTED_SUITES = (
+    SUITE_V7X32_BF16_WEIGHT_TILES,
+    SUITE_V7X8_BF16_WEIGHT_TILE_DMA_TUNED_FAMILY,
+)
 DTYPE = "bfloat16"
 WEIGHT_DTYPE = "bfloat16"
 BF16_BYTES = 2
@@ -59,8 +65,8 @@ TARGET_RUNTIME_V7X32 = {
     "tensorcore_or_jax_device_count": 32,
 }
 
-WeightPath = Literal["w1", "w2", "w3"]
-PathClass = Literal["w1w3", "w2"]
+WeightPath = Literal["w1", "w2", "w3", "se_w1", "se_w2", "se_w3"]
+PathClass = Literal["w1w3", "w2", "shared_w1w3", "shared_w2"]
 
 
 class WeightTileShapeLike(Protocol):
@@ -150,6 +156,54 @@ WEIGHT_DMA_PATH_SPECS: dict[WeightPath, WeightDMAPathSpec] = {
         destination_slice="b_w3_x2_vmem[bw3_sem_id, p]",
         scratch_shape="(2, t_packing, bd1 // t_packing, bf)",
     ),
+    "se_w1": WeightDMAPathSpec(
+        path="se_w1",
+        path_class="shared_w1w3",
+        start_fetch="start_fetch_se_w1(grp_sem_id, block_id, bd1_idx)",
+        wait_fetch="wait_fetch_se_w1(grp_sem_id)",
+        kernel_line=1451,
+        weight_ref="w1_shared_hbm",
+        vmem_ref="b_se_w1_x2_vmem",
+        semaphore_index=5,
+        source_slice=(
+            "w1_shared_hbm[p * h_per_t_packing + bd1_idx * bd1_per_t_packing : "
+            "+ bd1_per_t_packing, block_id * bse : + bse]"
+        ),
+        destination_slice="b_se_w1_x2_vmem[grp_sem_id, p]",
+        scratch_shape="(2, t_packing, bd1 // t_packing, bse)",
+    ),
+    "se_w2": WeightDMAPathSpec(
+        path="se_w2",
+        path_class="shared_w2",
+        start_fetch="start_fetch_se_w2(grp_sem_id, block_id, bd2_idx)",
+        wait_fetch="wait_fetch_se_w2(grp_sem_id)",
+        kernel_line=1506,
+        weight_ref="w2_shared_hbm",
+        vmem_ref="b_se_w2_x2_vmem",
+        semaphore_index=6,
+        source_slice=(
+            "w2_shared_hbm[block_id * bse : + bse, "
+            "p * h_per_t_packing + bd2_idx * bd2_per_t_packing : + bd2_per_t_packing]"
+        ),
+        destination_slice="b_se_w2_x2_vmem[grp_sem_id, p]",
+        scratch_shape="(2, t_packing, bse, bd2 // t_packing)",
+    ),
+    "se_w3": WeightDMAPathSpec(
+        path="se_w3",
+        path_class="shared_w1w3",
+        start_fetch="start_fetch_se_w3(grp_sem_id, block_id, bd1_idx)",
+        wait_fetch="wait_fetch_se_w3(grp_sem_id)",
+        kernel_line=1478,
+        weight_ref="w3_shared_hbm",
+        vmem_ref="b_se_w3_x2_vmem",
+        semaphore_index=7,
+        source_slice=(
+            "w3_shared_hbm[p * h_per_t_packing + bd1_idx * bd1_per_t_packing : "
+            "+ bd1_per_t_packing, block_id * bse : + bse]"
+        ),
+        destination_slice="b_se_w3_x2_vmem[grp_sem_id, p]",
+        scratch_shape="(2, t_packing, bd1 // t_packing, bse)",
+    ),
 }
 
 
@@ -157,9 +211,9 @@ def dense_bf16_tile_shape(path: WeightPath, *, bf: int, bd: int) -> tuple[int, i
     """Return the primary weight tile shape copied by the start_fetch p-loop."""
 
     _validate_bf16_shape_inputs(bf=bf, bd=bd)
-    if path in ("w1", "w3"):
+    if path in ("w1", "w3", "se_w1", "se_w3"):
         return (T_PACKING, bd // T_PACKING, bf)
-    if path == "w2":
+    if path in ("w2", "se_w2"):
         return (T_PACKING, bf, bd // T_PACKING)
     raise ValueError(f"Unsupported Layer 1 weight path: {path}")
 
@@ -171,7 +225,14 @@ def dense_bf16_bytes_per_fetch(*, bf: int, bd: int) -> int:
 
 def plans_for_shape(shape: WeightTileShapeLike) -> tuple[WeightTileDMAPlan, ...]:
     path_class = _coerce_path_class(shape.path_class)
-    paths: tuple[WeightPath, ...] = ("w1", "w3") if path_class == "w1w3" else ("w2",)
+    if path_class == "w1w3":
+        paths: tuple[WeightPath, ...] = ("w1", "w3")
+    elif path_class == "w2":
+        paths = ("w2",)
+    elif path_class == "shared_w1w3":
+        paths = ("se_w1", "se_w3")
+    else:
+        paths = ("se_w2",)
     return tuple(_plan_for_path(path, path_class=path_class, shape=shape) for path in paths)
 
 
@@ -186,7 +247,7 @@ def build_not_implemented_rows(
 ) -> list[dict[str, Any]]:
     """Build Layer 1 rows, measuring TPU/Pallas mode and preserving smoke rows."""
 
-    if suite != SUITE_V7X32_BF16_WEIGHT_TILES:
+    if suite not in SUPPORTED_SUITES:
         raise ValueError(f"Unsupported suite: {suite}")
     runtime = collect_runtime_identity() if runtime is None else runtime
 
@@ -397,6 +458,7 @@ def _metadata_for_plan(
                 "full fused-MoE control flow",
                 "quant scale side copies",
                 "bias side copies",
+                "dot/MXU compute",
             ),
         },
         "traffic": {
@@ -469,7 +531,7 @@ def _validate_bf16_shape_inputs(*, bf: int, bd: int) -> None:
 
 
 def _coerce_path_class(path_class: str) -> PathClass:
-    if path_class in ("w1w3", "w2"):
+    if path_class in ("w1w3", "w2", "shared_w1w3", "shared_w2"):
         return cast(PathClass, path_class)
     raise ValueError(f"Unsupported Layer 1 path_class: {path_class}")
 
@@ -582,7 +644,11 @@ def _measure_weight_tile_dma_ms(
     )
 
 
-def _hbm_source_shape(plan: WeightTileDMAPlan) -> tuple[int, int, int]:
+def _hbm_source_shape(plan: WeightTileDMAPlan) -> tuple[int, ...]:
+    if plan.path == "se_w2":
+        return (plan.bf, HIDDEN_SIZE)
+    if plan.path in ("se_w1", "se_w3"):
+        return (HIDDEN_SIZE, plan.bf)
     if plan.path == "w2":
         return (1, plan.bf, HIDDEN_SIZE)
     return (1, HIDDEN_SIZE, plan.bf)
@@ -591,7 +657,8 @@ def _hbm_source_shape(plan: WeightTileDMAPlan) -> tuple[int, int, int]:
 def _pallas_weight_tile_dma_call(weight_hbm, *, plan, pl, pltpu, jax, jnp):
     bd_per_t_packing = plan.bd // T_PACKING
     sem_index = plan.spec.semaphore_index
-    is_w2 = plan.path == "w2"
+    is_w2 = plan.path in ("w2", "se_w2")
+    is_shared = plan.path.startswith("se_")
     scratch_shape = (
         (2, T_PACKING, plan.bf, bd_per_t_packing)
         if is_w2
@@ -602,11 +669,21 @@ def _pallas_weight_tile_dma_call(weight_hbm, *, plan, pl, pltpu, jax, jnp):
         del out_ref
         for p in range(T_PACKING):
             offset = p * H_PER_T_PACKING
-            if is_w2:
+            if is_w2 and is_shared:
+                src_ref = weight_ref.at[
+                    pl.ds(0, plan.bf),
+                    pl.ds(offset, bd_per_t_packing),
+                ]
+            elif is_w2:
                 src_ref = weight_ref.at[
                     0,
                     pl.ds(0, plan.bf),
                     pl.ds(offset, bd_per_t_packing),
+                ]
+            elif is_shared:
+                src_ref = weight_ref.at[
+                    pl.ds(offset, bd_per_t_packing),
+                    pl.ds(0, plan.bf),
                 ]
             else:
                 src_ref = weight_ref.at[
