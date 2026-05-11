@@ -20,6 +20,7 @@ from benchmark.moe.calibration import (
     layer1_a2a_scatter,
     layer1_dma_overlap,
     layer1_ffn_compute,
+    layer1_ffn_pallas_compute,
     layer1_local_dma,
     layer1_shared_expert_compute,
     layer1_wait,
@@ -42,6 +43,7 @@ SCENARIO_LAYER1_DMA_OVERLAP = "layer1_dma_overlap"
 SCENARIO_LAYER1_WEIGHT_TILE_DMA = "layer1_weight_tile_dma"
 SCENARIO_LAYER1_LOCAL_DMA = "layer1_local_dma"
 SCENARIO_LAYER1_FFN_COMPUTE = "layer1_ffn_compute"
+SCENARIO_LAYER1_FFN_PALLAS_COMPUTE = "layer1_ffn_pallas_compute"
 SCENARIO_LAYER1_SHARED_EXPERT_COMPUTE = "layer1_shared_expert_compute"
 SCENARIO_LAYER1_WAIT = "layer1_wait"
 SCENARIO_LAYER2_FUSED_MOE_E2E = "layer2_fused_moe_e2e"
@@ -57,6 +59,7 @@ SCENARIOS = (
     SCENARIO_LAYER1_WEIGHT_TILE_DMA,
     SCENARIO_LAYER1_LOCAL_DMA,
     SCENARIO_LAYER1_FFN_COMPUTE,
+    SCENARIO_LAYER1_FFN_PALLAS_COMPUTE,
     SCENARIO_LAYER1_SHARED_EXPERT_COMPUTE,
     SCENARIO_LAYER1_WAIT,
     SCENARIO_LAYER2_FUSED_MOE_E2E,
@@ -83,6 +86,7 @@ SUITE_V7X32_BF16_LOCAL_DMA_TOPK8 = "v7x32_bf16_local_dma_topk8"
 SUITE_V7X8_BF16_LOCAL_DMA_TOPK8 = "v7x8_bf16_local_dma_topk8"
 SUITE_V7X8_BF16_FFN_LOOP_CONTEXT = "v7x8_bf16_ffn_loop_context"
 SUITE_V7X8_BF16_FFN_TUNED_FAMILY = "v7x8_bf16_ffn_tuned_family"
+SUITE_V7X8_BF16_FFN_PALLAS_TUNED_FAMILY = "v7x8_bf16_ffn_pallas_tuned_family"
 SUITE_V7X8_BF16_SHARED_EXPERT_TUNED_FAMILY = "v7x8_bf16_shared_expert_tuned_family"
 SUITE_V7X32_BF16_WAIT_PRIMITIVES = "v7x32_bf16_wait_primitives"
 SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG = "v7x32_bf16_fused_moe_e2e_diag"
@@ -108,6 +112,7 @@ SUITES = (
     SUITE_V7X8_BF16_LOCAL_DMA_TOPK8,
     SUITE_V7X8_BF16_FFN_LOOP_CONTEXT,
     SUITE_V7X8_BF16_FFN_TUNED_FAMILY,
+    SUITE_V7X8_BF16_FFN_PALLAS_TUNED_FAMILY,
     SUITE_V7X8_BF16_SHARED_EXPERT_TUNED_FAMILY,
     SUITE_V7X32_BF16_WAIT_PRIMITIVES,
     SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG,
@@ -703,6 +708,35 @@ PHASE1_FFN_TUNED_FAMILY_SHAPES: tuple[layer1_ffn_compute.FFNComputeShape, ...] =
     for path, path_class in PHASE1_FFN_LOOP_CONTEXT_PATH_CLASSES.items()
 )
 
+PHASE1_FFN_PALLAS_PATH_CLASSES: dict[layer1_ffn_pallas_compute.FFNPallasPath, str] = {
+    "dynamic_ffn1_init": "ffn1_pallas_init",
+    "dynamic_ffn1_accumulate": "ffn1_pallas_accumulate",
+    "dynamic_ffn2_first": "ffn2_pallas_first",
+    "dynamic_ffn2_later": "ffn2_pallas_later",
+}
+
+PHASE1_FFN_PALLAS_TUNED_FAMILY_SHAPES: tuple[layer1_ffn_pallas_compute.FFNPallasShape, ...] = tuple(
+    layer1_ffn_pallas_compute.FFNPallasShape(
+        path=path,
+        path_class=path_class,
+        dyn_sz=dyn_sz,
+        config_label=f"tokens{num_tokens}_bt{bt}_bts{bts}_bf{bf}_bd{bd1}",
+        num_tokens=num_tokens,
+        bt=bt,
+        bts=bts,
+        bf=bf,
+        bfc=bfc,
+        btc=btc,
+        bd1=bd1,
+        bd2=bd2,
+        bd1c=bd1c,
+        bd2c=bd2c,
+    )
+    for num_tokens, bt, bf, bd1, bd2, bts, btc, bfc, bd1c, bd2c, _bse in PHASE1_FFN_TUNED_FAMILY_CONFIGS
+    for dyn_sz in _tuned_family_dyn_values(bt=bt, bts=bts, btc=btc)
+    for path, path_class in PHASE1_FFN_PALLAS_PATH_CLASSES.items()
+)
+
 PHASE1_SHARED_EXPERT_TUNED_FAMILY_SHAPES: tuple[
     layer1_shared_expert_compute.SharedExpertShape, ...
 ] = tuple(
@@ -843,6 +877,19 @@ def load_layer1_ffn_compute_suite_shapes(
             shapes = tuple(shape for shape in shapes if shape.num_tokens in allowed)
         return shapes
     raise ValueError(f"Unsupported Layer 1 FFN compute suite: {suite}")
+
+
+def load_layer1_ffn_pallas_suite_shapes(
+    suite: str,
+) -> tuple[layer1_ffn_pallas_compute.FFNPallasShape, ...]:
+    if suite == SUITE_V7X8_BF16_FFN_PALLAS_TUNED_FAMILY:
+        shapes = PHASE1_FFN_PALLAS_TUNED_FAMILY_SHAPES
+        raw_num_tokens = os.getenv("CALIBRATION_LAYER1_FFN_PALLAS_TUNED_NUM_TOKENS")
+        if raw_num_tokens:
+            allowed = {int(part.strip()) for part in raw_num_tokens.split(",") if part.strip()}
+            shapes = tuple(shape for shape in shapes if shape.num_tokens in allowed)
+        return shapes
+    raise ValueError(f"Unsupported Layer 1 Pallas FFN suite: {suite}")
 
 
 def load_layer1_wait_suite_shapes(
@@ -1351,6 +1398,29 @@ def _layer1_ffn_compute_rows(
     )
 
 
+def _layer1_ffn_pallas_compute_rows(
+    suite: str,
+    execution_mode: str,
+    runtime: dict[str, Any],
+    bf_values: tuple[int, ...] | None = None,
+    path_values: tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
+    return layer1_ffn_pallas_compute.build_rows(
+        suite=suite,
+        shapes=_filter_shapes(load_layer1_ffn_pallas_suite_shapes(suite), bf_values, path_values),
+        execution_mode=execution_mode,
+        runtime=runtime,
+        dtype=DTYPE,
+        weight_dtype=WEIGHT_DTYPE,
+        t_packing=T_PACKING,
+        source=_source(),
+        metadata=_suite_metadata_for_runtime(
+            matrix_kind="ffn_pallas_compute",
+            target_runtime=TARGET_RUNTIME_V7X8,
+        ),
+    )
+
+
 def _layer1_shared_expert_rows(
     suite: str,
     execution_mode: str,
@@ -1422,6 +1492,8 @@ def resolve_execution_mode(scenario: str, requested: str, runtime: dict[str, Any
         SCENARIO_LAYER2_FUSED_MOE_E2E,
     ):
         return "jax_trace"
+    if scenario == SCENARIO_LAYER1_FFN_PALLAS_COMPUTE:
+        return "pallas"
     return "pallas"
 
 
@@ -1459,6 +1531,10 @@ def build_rows(
         return _layer1_local_dma_rows(suite, resolved_mode, runtime, bf_values, path_values)
     if scenario == SCENARIO_LAYER1_FFN_COMPUTE:
         return _layer1_ffn_compute_rows(suite, resolved_mode, runtime, bf_values, path_values)
+    if scenario == SCENARIO_LAYER1_FFN_PALLAS_COMPUTE:
+        return _layer1_ffn_pallas_compute_rows(
+            suite, resolved_mode, runtime, bf_values, path_values
+        )
     if scenario == SCENARIO_LAYER1_SHARED_EXPERT_COMPUTE:
         return _layer1_shared_expert_rows(suite, resolved_mode, runtime, bf_values, path_values)
     if scenario == SCENARIO_LAYER1_WAIT:

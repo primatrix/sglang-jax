@@ -89,6 +89,17 @@ def _extract_marker_durations_with_source_ms(
     trace_events = trace.get("traceEvents", [])
 
     if task:
+        if task.startswith("layer1_ffn_pallas_"):
+            ffn_pallas_events = [
+                e
+                for e in trace_events
+                if "layer1_ffn_pallas_" in _event_text(e)
+                and (e.get("args", {}) or {}).get("device_duration_ps")
+                and not str(e.get("name", "")).startswith("jit_")
+            ]
+            ffn_pallas_durations = _dominant_pid_durations(ffn_pallas_events)
+            if ffn_pallas_durations:
+                return ffn_pallas_durations, "pallas_ffn_device_event"
         if task.startswith("layer1_ffn_"):
             ffn_jit_events = [
                 e
