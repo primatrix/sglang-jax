@@ -315,9 +315,46 @@ def select_cases(cases: Iterable[MoEBenchmarkCase] | None = None) -> Iterable[Mo
     def choose_parallelism(case: MoEBenchmarkCase) -> tuple[int, int]:
         """Pick (ep_size, tp_size) for benchmarks.
 
-        If `case.ep_size` is None, try EP sizes starting from device_count.
-        Always return (ep_size, tp_size) such that ep_size * tp_size == device_count.
+        If `case.ep_size` / `case.tp_size` are explicit, honor them and fail
+        loudly on incompatible shapes. Silent down-selection makes distributed
+        EP experiments too easy to misread.
         """
+
+        def validate(ep: int, tp: int) -> tuple[int, int]:
+            if ep <= 0 or tp <= 0:
+                raise ValueError(f"Expected positive parallelism, got {ep=} {tp=}.")
+            if ep * tp > num_devices:
+                raise ValueError(
+                    f"Requested {ep=} {tp=} uses {ep * tp} devices, "
+                    f"but only {num_devices} JAX devices are visible."
+                )
+            if case.num_tokens % ep != 0:
+                raise ValueError(f"Expected {case.num_tokens=} to be divisible by {ep=}.")
+            if case.num_experts % ep != 0:
+                raise ValueError(f"Expected {case.num_experts=} to be divisible by {ep=}.")
+            return ep, tp
+
+        if case.ep_size is not None and case.tp_size is not None:
+            return validate(case.ep_size, case.tp_size)
+
+        if case.ep_size is not None:
+            ep = case.ep_size
+            if num_devices % ep == 0:
+                tp = num_devices // ep
+            else:
+                tp = 1
+            return validate(ep, tp)
+
+        if case.tp_size is not None:
+            tp = case.tp_size
+            if num_devices % tp != 0:
+                raise ValueError(f"Expected {num_devices=} to be divisible by {tp=}.")
+            target_ep = num_devices // tp
+            for ep in range(min(target_ep, case.num_experts), 0, -1):
+                if case.num_tokens % ep == 0 and case.num_experts % ep == 0:
+                    return validate(ep, tp)
+            return validate(1, tp)
+
         if case.ep_size is None:
             target_ep = num_devices
         else:
