@@ -1365,12 +1365,23 @@ def _fused_ep_moe_kernel(
                         ],
                         sem=gather_send_x2_sems.at[0],
                     ).start()
-                    ref = a2a_s_x2_hbm.at[0, pl.ds(0, bt)]
-                    pltpu.make_async_copy(
-                        src_ref=ref,
-                        dst_ref=ref,
-                        sem=gather_send_x2_sems.at[0],
-                    ).wait()
+
+                    def _wait_one_merged_row(_, __):
+                        ref = a2a_s_x2_hbm.at[0, pl.ds(0, bt)]
+                        pltpu.make_async_copy(
+                            src_ref=ref,
+                            dst_ref=ref,
+                            sem=gather_send_x2_sems.at[0],
+                        ).wait()
+                        return None
+
+                    lax.fori_loop(
+                        0,
+                        jnp.int32(local_num_experts),
+                        _wait_one_merged_row,
+                        None,
+                        unroll=False,
+                    )
 
                 @pl.when(jnp.logical_not(is_local_recv))
                 def _remote_merged_copy(recv_id=recv_id):
@@ -1392,12 +1403,23 @@ def _fused_ep_moe_kernel(
                         device_id=get_mesh_device_id(recv_id),
                         device_id_type=pltpu.DeviceIdType.MESH,
                     ).start()
-                    ref = a2a_s_x2_hbm.at[0, pl.ds(0, bt)]
-                    pltpu.make_async_copy(
-                        src_ref=ref,
-                        dst_ref=ref,
-                        sem=gather_send_x2_sems.at[0],
-                    ).wait()
+
+                    def _wait_one_merged_row(_, __):
+                        ref = a2a_s_x2_hbm.at[0, pl.ds(0, bt)]
+                        pltpu.make_async_copy(
+                            src_ref=ref,
+                            dst_ref=ref,
+                            sem=gather_send_x2_sems.at[0],
+                        ).wait()
+                        return None
+
+                    lax.fori_loop(
+                        0,
+                        jnp.int32(local_num_experts),
+                        _wait_one_merged_row,
+                        None,
+                        unroll=False,
+                    )
 
     def wait_a2a_gather_send(*, bt_sem_id, e_sem_id, local_e_id):
         if disable_a2a or disable_a2a_gather:
@@ -1460,12 +1482,23 @@ def _fused_ep_moe_kernel(
             @pl.when((src_id != my_id) & (total_sz != 0))
             def _():
                 e_start = src_id * local_num_experts
-                ref = a2a_g_hbm.at[e_start, pl.ds(0, bt)]
-                pltpu.make_async_copy(
-                    src_ref=ref,
-                    dst_ref=ref,
-                    sem=a2a_gather_sem,
-                ).wait()
+
+                def _wait_one_merged_row(_, __):
+                    ref = a2a_g_hbm.at[e_start, pl.ds(0, bt)]
+                    pltpu.make_async_copy(
+                        src_ref=ref,
+                        dst_ref=ref,
+                        sem=a2a_gather_sem,
+                    ).wait()
+                    return None
+
+                lax.fori_loop(
+                    0,
+                    jnp.int32(local_num_experts),
+                    _wait_one_merged_row,
+                    None,
+                    unroll=False,
+                )
 
             return None
 
