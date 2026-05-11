@@ -742,6 +742,8 @@ PHASE1_SHARED_EXPERT_PATH_CLASSES: dict[layer1_shared_expert_compute.SharedExper
     "shared_expert_gate_up_accumulate": "shared_expert_pallas_gate_up_accumulate",
     "shared_expert_down_first": "shared_expert_pallas_down_first",
     "shared_expert_down_later": "shared_expert_pallas_down_later",
+    "shared_expert_slice_first": "shared_expert_pallas_slice_first",
+    "shared_expert_slice_later": "shared_expert_pallas_slice_later",
 }
 
 PHASE1_SHARED_EXPERT_TUNED_FAMILY_SHAPES: tuple[

@@ -33,6 +33,8 @@ SharedExpertPath = Literal[
     "shared_expert_gate_up_accumulate",
     "shared_expert_down_first",
     "shared_expert_down_later",
+    "shared_expert_slice_first",
+    "shared_expert_slice_later",
 ]
 
 
@@ -107,7 +109,7 @@ def build_rows(
             )
             status = STATUS_MEASURED
             note = (
-                "Measured a Pallas shared-expert compute tile aligned to "
+                "Measured a Pallas shared-expert compute unit aligned to "
                 "run_shared_expert_slice. It excludes async shared weight/token prefetch, "
                 "routed expert FFN, and remote DMA."
             )
@@ -202,7 +204,7 @@ def _metadata_for_shape(
         "tile_shape": _tile_shape(shape),
         "flops": _flops(shape),
         "bytes_hbm": _bytes_hbm(shape),
-        "traffic_class": "shared_expert_pallas_compute_tile",
+        "traffic_class": _traffic_class(shape),
         "measurement_status": "measured" if status == STATUS_MEASURED else "schema_only",
         "measurement_scope": _measurement_scope(shape),
         "block_cost_formula": {
@@ -210,6 +212,8 @@ def _metadata_for_shape(
             "down_tiles": num_bd2,
             "first_block": "num_bd1 * gate_up_init + num_bd2 * down_first",
             "later_block": "num_bd1 * gate_up_init + num_bd2 * down_later",
+            "whole_slice_first": "shared_expert_slice_first",
+            "whole_slice_later": "shared_expert_slice_later",
         },
         "includes": _includes(shape),
         "excludes": [
@@ -263,6 +267,14 @@ def _measure_shared_pallas_ms(
 def _make_inputs(shape: SharedExpertShape, *, jnp: Any) -> tuple[Any, ...]:
     bd1_per_pack = shape.bd1 // shape.t_packing
     bd2_per_pack = shape.bd2 // shape.t_packing
+    h_per_pack = shape.hidden_size // shape.t_packing
+    if shape.path in ("shared_expert_slice_first", "shared_expert_slice_later"):
+        tokens = jnp.ones((shape.bt, shape.t_packing, h_per_pack), dtype=jnp.bfloat16)
+        w1 = jnp.ones((shape.t_packing, h_per_pack, shape.bse), dtype=jnp.bfloat16)
+        w3 = jnp.ones((shape.t_packing, h_per_pack, shape.bse), dtype=jnp.bfloat16)
+        w2 = jnp.ones((shape.t_packing, shape.bse, h_per_pack), dtype=jnp.bfloat16)
+        out = jnp.ones((shape.bt, shape.t_packing, h_per_pack), dtype=jnp.float32)
+        return tokens, w1, w3, w2, out
     if shape.path in ("shared_expert_gate_up_init", "shared_expert_gate_up_accumulate"):
         tokens = jnp.ones((shape.bt, shape.t_packing, bd1_per_pack), dtype=jnp.bfloat16)
         w1 = jnp.ones((shape.t_packing, bd1_per_pack, shape.bse), dtype=jnp.bfloat16)
@@ -282,6 +294,73 @@ def _pallas_shared_call(shape: SharedExpertShape, arrays: tuple[Any, ...], *, ja
 
     bd1_per_pack = shape.bd1 // shape.t_packing
     bd2_per_pack = shape.bd2 // shape.t_packing
+    h_per_pack = shape.hidden_size // shape.t_packing
+    num_bd1 = _ceil_div(shape.hidden_size, shape.bd1)
+    num_bd2 = _ceil_div(shape.hidden_size, shape.bd2)
+
+    if shape.path in ("shared_expert_slice_first", "shared_expert_slice_later"):
+        tokens, w1, w3, w2, out = arrays
+        should_init = shape.path == "shared_expert_slice_first"
+
+        def kernel(tokens_ref, w1_ref, w3_ref, w2_ref, out_ref, result_ref, gate_vmem, up_vmem):
+            gate_vmem[...] = jnp.zeros_like(gate_vmem)
+            up_vmem[...] = jnp.zeros_like(up_vmem)
+
+            for bd1_idx in range(num_bd1):
+                hidden_slice = pl.ds(bd1_idx * bd1_per_pack, bd1_per_pack)
+                for p_id in range(shape.t_packing):
+                    token_slice = tokens_ref[pl.ds(0, shape.bt), p_id, hidden_slice]
+                    w1_tile = w1_ref[p_id, hidden_slice, pl.ds(0, shape.bse)]
+                    w3_tile = w3_ref[p_id, hidden_slice, pl.ds(0, shape.bse)]
+                    gate_vmem[...] += jnp.dot(
+                        token_slice,
+                        w1_tile,
+                        preferred_element_type=jnp.float32,
+                    )
+                    up_vmem[...] += jnp.dot(
+                        token_slice,
+                        w3_tile,
+                        preferred_element_type=jnp.float32,
+                    )
+
+            act = _jax_silu(gate_vmem[...], jnp=jnp) * up_vmem[...]
+
+            for bd2_idx in range(num_bd2):
+                hidden_slice = pl.ds(bd2_idx * bd2_per_pack, bd2_per_pack)
+                for p_id in range(shape.t_packing):
+                    down = jnp.dot(
+                        act,
+                        w2_ref[p_id, pl.ds(0, shape.bse), hidden_slice],
+                        preferred_element_type=jnp.float32,
+                    )
+                    out_slice = (pl.ds(0, shape.bt), p_id, hidden_slice)
+                    if should_init:
+                        result_ref[out_slice] = down
+                    else:
+                        result_ref[out_slice] = out_ref[out_slice] + down
+
+        return pl.pallas_call(
+            kernel,
+            out_shape=jax.ShapeDtypeStruct((shape.bt, shape.t_packing, h_per_pack), jnp.float32),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=0,
+                in_specs=[
+                    pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM),
+                    pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM),
+                    pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM),
+                    pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM),
+                    pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM),
+                ],
+                out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM),
+                grid=(1,),
+                scratch_shapes=[
+                    pltpu.VMEM((shape.bt, shape.bse), jnp.float32),
+                    pltpu.VMEM((shape.bt, shape.bse), jnp.float32),
+                ],
+            ),
+            compiler_params=pltpu.CompilerParams(has_side_effects=True),
+            name=f"layer1_shared_expert_{shape.path}_{shape.config_label}",
+        )(tokens, w1, w3, w2, out)
 
     if shape.path in ("shared_expert_gate_up_init", "shared_expert_gate_up_accumulate"):
         tokens, w1, w3, acc = arrays
@@ -361,12 +440,29 @@ def _pallas_shared_call(shape: SharedExpertShape, arrays: tuple[Any, ...], *, ja
 
 
 def _tile_shape(shape: SharedExpertShape) -> tuple[int, ...]:
+    if shape.path in ("shared_expert_slice_first", "shared_expert_slice_later"):
+        return (
+            shape.bt,
+            shape.t_packing,
+            shape.hidden_size // shape.t_packing,
+            shape.bse,
+            shape.t_packing,
+            shape.hidden_size // shape.t_packing,
+        )
     if shape.path in ("shared_expert_gate_up_init", "shared_expert_gate_up_accumulate"):
         return (shape.bt, shape.t_packing, shape.bd1 // shape.t_packing, shape.bse)
     return (shape.bt, shape.bse, shape.t_packing, shape.bd2 // shape.t_packing)
 
 
 def _bytes_hbm(shape: SharedExpertShape) -> int:
+    if shape.path in ("shared_expert_slice_first", "shared_expert_slice_later"):
+        token_bytes = shape.bt * shape.hidden_size * BF16_BYTES
+        w1_w3_bytes = 2 * shape.hidden_size * shape.bse * BF16_BYTES
+        w2_bytes = shape.bse * shape.hidden_size * BF16_BYTES
+        output_bytes = shape.bt * shape.hidden_size * F32_BYTES
+        if shape.path == "shared_expert_slice_later":
+            output_bytes *= 2
+        return token_bytes + w1_w3_bytes + w2_bytes + output_bytes
     if shape.path in ("shared_expert_gate_up_init", "shared_expert_gate_up_accumulate"):
         token_bytes = shape.bt * shape.bd1 * BF16_BYTES
         weight_bytes = 2 * shape.bd1 * shape.bse * BF16_BYTES
@@ -379,12 +475,23 @@ def _bytes_hbm(shape: SharedExpertShape) -> int:
 
 
 def _flops(shape: SharedExpertShape) -> int:
+    if shape.path in ("shared_expert_slice_first", "shared_expert_slice_later"):
+        gate_up = 4 * shape.bt * shape.hidden_size * shape.bse
+        down = 2 * shape.bt * shape.bse * shape.hidden_size
+        return gate_up + down
     if shape.path in ("shared_expert_gate_up_init", "shared_expert_gate_up_accumulate"):
         return 4 * shape.bt * shape.bd1 * shape.bse
     return 2 * shape.bt * shape.bse * shape.bd2
 
 
 def _includes(shape: SharedExpertShape) -> list[str]:
+    if shape.path in ("shared_expert_slice_first", "shared_expert_slice_later"):
+        return [
+            "pallas_shared_expert_gate_up_all_bd1_tiles",
+            "pallas_shared_expert_activation",
+            "pallas_shared_expert_down_all_bd2_tiles",
+            "shared_output_f32_init_or_accumulate",
+        ]
     if shape.path in ("shared_expert_gate_up_init", "shared_expert_gate_up_accumulate"):
         return [
             "pallas_shared_expert_gate_dot_single_bd1_tile",
@@ -399,9 +506,17 @@ def _includes(shape: SharedExpertShape) -> list[str]:
 
 
 def _measurement_scope(shape: SharedExpertShape) -> str:
+    if shape.path in ("shared_expert_slice_first", "shared_expert_slice_later"):
+        return "single_run_shared_expert_slice_block"
     if shape.path in ("shared_expert_gate_up_init", "shared_expert_gate_up_accumulate"):
         return "single_shared_expert_gate_up_bd1_tile"
     return "single_shared_expert_down_bd2_tile"
+
+
+def _traffic_class(shape: SharedExpertShape) -> str:
+    if shape.path in ("shared_expert_slice_first", "shared_expert_slice_later"):
+        return "shared_expert_pallas_compute_slice"
+    return "shared_expert_pallas_compute_tile"
 
 
 def _jax_silu(x, *, jnp: Any):
