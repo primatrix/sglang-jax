@@ -23,7 +23,7 @@ cdiv = pl.cdiv
 _A2A_HBM_FRACTION = 0.03
 
 # For decode-sized tiles, waiting for gather receives by scanning all global
-# experts is mostly control overhead.  Route-scanning waits once per unique
+# experts is mostly control overhead. Route-scanning waits once per unique
 # local routed expert and keeps the old full-expert scan for larger tiles.
 _A2A_GATHER_ROUTE_SCAN_MAX_ROUTES = 256
 
@@ -1156,7 +1156,7 @@ def _fused_ep_moe_kernel(
                     sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, e_id_safe]
                     should_wait = is_valid & (seen == 0) & (sz != 0)
                     expert_offsets_x2_smem[bt_sem_id, 1, e_id_safe] = lax.select(
-                        is_valid, jnp.int32(1), seen
+                        is_valid, jnp.int32(-1), seen
                     )
 
                     @pl.when(should_wait)
@@ -1171,18 +1171,6 @@ def _fused_ep_moe_kernel(
                 return None
 
             lax.fori_loop(0, bt, _wait_one_route, None, unroll=False)
-
-            def _clear_seen_route(t_id, _):
-                for k_id in range(top_k):
-                    e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
-
-                    @pl.when(e_id >= 0)
-                    def _():
-                        expert_offsets_x2_smem[bt_sem_id, 1, e_id] = jnp.int32(0)
-
-                return None
-
-            lax.fori_loop(0, bt, _clear_seen_route, None, unroll=False)
 
         def _wait_one_expert(e_id, _):
             sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, e_id]
@@ -2415,7 +2403,14 @@ def _fused_ep_moe_kernel(
                 def _():
                     for k_id in range(top_k):
                         e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
-                        offset = expert_offsets_x2_smem[bt_sem_id, 1, e_id]
+                        offset_raw = expert_offsets_x2_smem[bt_sem_id, 1, e_id]
+                        if (
+                            bt * top_k < num_experts
+                            and bt * top_k <= _A2A_GATHER_ROUTE_SCAN_MAX_ROUTES
+                        ):
+                            offset = lax.select(offset_raw < 0, jnp.int32(0), offset_raw)
+                        else:
+                            offset = offset_raw
                         expert_offsets_x2_smem[bt_sem_id, 1, e_id] = offset + 1
                         pltpu.make_async_copy(
                             src_ref=a2a_g_hbm.at[e_id, pl.ds(offset, 1)],
