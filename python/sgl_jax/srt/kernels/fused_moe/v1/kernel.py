@@ -1146,18 +1146,18 @@ def _fused_ep_moe_kernel(
         # We conservatively wait once for every expert that has nonzero tokens
         # routed from `my_id` (local copies for local experts and remote receives
         # for remote experts both signal the same `a2a_gather_sem` on this device).
-        def _wait_by_routes(seen_vmem):
-            seen_vmem[...] = jnp.zeros_like(seen_vmem)
+        def _wait_by_routes(seen_smem):
+            seen_smem[...] = jnp.zeros_like(seen_smem)
 
             def _wait_one_route(t_id, _):
                 for k_id in range(top_k):
                     e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
                     is_valid = e_id >= 0
                     e_id_safe = lax.select(is_valid, e_id, jnp.int32(0))
-                    seen = seen_vmem[e_id_safe]
+                    seen = seen_smem[e_id_safe]
                     sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, e_id_safe]
                     should_wait = is_valid & (seen == 0) & (sz != 0)
-                    seen_vmem[e_id_safe] = lax.select(is_valid, jnp.int32(1), seen)
+                    seen_smem[e_id_safe] = lax.select(is_valid, jnp.int32(1), seen)
 
                     @pl.when(should_wait)
                     def _():
@@ -1189,7 +1189,7 @@ def _fused_ep_moe_kernel(
         if bt * top_k < num_experts and bt * top_k <= _A2A_GATHER_ROUTE_SCAN_MAX_ROUTES:
             pl.run_scoped(
                 _wait_by_routes,
-                pltpu.VMEM((padded_num_experts,), jnp.int32),
+                pltpu.SMEM((padded_num_experts,), jnp.int32),
             )
         else:
             lax.fori_loop(0, num_experts, _wait_one_expert, None, unroll=False)
