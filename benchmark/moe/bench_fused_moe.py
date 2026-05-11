@@ -985,6 +985,7 @@ def run_all(
                     "FUSED_MOE_BENCHMARK_DISABLE_A2A_GATHER",
                     all_disable=all_disable,
                 ),
+                defer_a2a_gather=_env_bool("FUSED_MOE_BENCHMARK_DEFER_A2A_GATHER", False),
                 a2a_hbm_fraction=a2a_hbm_fraction,
                 disable_dynamic_ffn1=_with_all_disable(
                     "FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN1",

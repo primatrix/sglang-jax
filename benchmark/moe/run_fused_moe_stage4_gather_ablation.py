@@ -59,6 +59,7 @@ def flags(**overrides: str) -> dict[str, str]:
         "FUSED_MOE_BENCHMARK_DISABLE_A2A": "False",
         "FUSED_MOE_BENCHMARK_DISABLE_A2A_SCATTER": "False",
         "FUSED_MOE_BENCHMARK_DISABLE_A2A_GATHER": "False",
+        "FUSED_MOE_BENCHMARK_DEFER_A2A_GATHER": "False",
         "FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN1": "False",
         "FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN2": "False",
         "FUSED_MOE_BENCHMARK_DISABLE_WEIGHT_LOAD": "False",
@@ -96,6 +97,11 @@ CASE_ENVS = {
         **COMM_SKELETON,
         FUSED_MOE_BENCHMARK_DISABLE_A2A_SCATTER="True",
     ),
+    "stage4_gather_deferred_only": flags(
+        **COMM_SKELETON,
+        FUSED_MOE_BENCHMARK_DISABLE_A2A_SCATTER="True",
+        FUSED_MOE_BENCHMARK_DEFER_A2A_GATHER="True",
+    ),
     # Scatter alone, retained so gather_actual can be cross-checked as A2A - scatter.
     "stage2_scatter_only": flags(
         **COMM_SKELETON,
@@ -104,6 +110,10 @@ CASE_ENVS = {
     "a2a_total_only": flags(**COMM_SKELETON),
     # Real compute path with output accumulation disabled, so gather can be toggled safely.
     "full_no_output": flags(FUSED_MOE_BENCHMARK_DISABLE_OUTPUT_ACCUMULATE="True"),
+    "full_no_output_deferred": flags(
+        FUSED_MOE_BENCHMARK_DISABLE_OUTPUT_ACCUMULATE="True",
+        FUSED_MOE_BENCHMARK_DEFER_A2A_GATHER="True",
+    ),
     "full_no_gather_no_output": flags(
         FUSED_MOE_BENCHMARK_DISABLE_A2A_GATHER="True",
         FUSED_MOE_BENCHMARK_DISABLE_OUTPUT_ACCUMULATE="True",
@@ -347,22 +357,27 @@ def print_delta_summary(out_dir: Path, group_name: str) -> None:
     print("\nStage4 gather delta:")
     print(
         "tokens | control_ms | gather_only_ms | gather_delta_ms | "
-        "a2a_total_ms | scatter_only_ms | a2a_minus_scatter_ms | visible_full_delta_ms"
+        "deferred_gather_ms | a2a_total_ms | scatter_only_ms | "
+        "a2a_minus_scatter_ms | visible_full_delta_ms | deferred_full_delta_ms"
     )
     token_set = set(by_case["stage4_control"]) & set(by_case["stage4_gather_only"])
     for tokens in sorted(token_set):
         control = by_case["stage4_control"][tokens]
         gather = by_case["stage4_gather_only"][tokens]
         gather_delta = gather - control
+        deferred_gather = by_case.get("stage4_gather_deferred_only", {}).get(tokens, float("nan"))
         a2a_total = by_case.get("a2a_total_only", {}).get(tokens, float("nan"))
         scatter = by_case.get("stage2_scatter_only", {}).get(tokens, float("nan"))
         a2a_minus_scatter = a2a_total - scatter
         full_no_output = by_case.get("full_no_output", {}).get(tokens, float("nan"))
         full_no_gather = by_case.get("full_no_gather_no_output", {}).get(tokens, float("nan"))
         visible = full_no_output - full_no_gather
+        deferred_full = by_case.get("full_no_output_deferred", {}).get(tokens, float("nan"))
+        deferred_visible = deferred_full - full_no_gather
         print(
             f"{tokens:6d} | {control:10.3f} | {gather:14.3f} | {gather_delta:15.3f} | "
-            f"{a2a_total:12.3f} | {scatter:15.3f} | {a2a_minus_scatter:20.3f} | {visible:21.3f}"
+            f"{deferred_gather:18.3f} | {a2a_total:12.3f} | {scatter:15.3f} | "
+            f"{a2a_minus_scatter:20.3f} | {visible:21.3f} | {deferred_visible:22.3f}"
         )
 
 
@@ -376,10 +391,12 @@ def parse_args() -> argparse.Namespace:
         default=[
             "stage4_control",
             "stage4_gather_only",
+            "stage4_gather_deferred_only",
             "stage2_scatter_only",
             "a2a_total_only",
             "full_no_gather_no_output",
             "full_no_output",
+            "full_no_output_deferred",
             "full",
         ],
     )

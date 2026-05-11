@@ -568,6 +568,7 @@ def _fused_ep_moe_kernel(
     disable_a2a: bool = False,
     disable_a2a_scatter: bool = False,
     disable_a2a_gather: bool = False,
+    defer_a2a_gather: bool = False,
     disable_dynamic_ffn1: bool = False,
     disable_dynamic_ffn2: bool = False,
     disable_weight_load: bool = False,
@@ -2810,11 +2811,12 @@ def _fused_ep_moe_kernel(
                 )
                 expert_ffn(bt_sem_id, e_sem_id_local, local_e_id)
 
-                start_a2a_gather(
-                    bt_sem_id=bt_sem_id,
-                    e_sem_id=e_sem_id_local,
-                    local_e_id=local_e_id,
-                )
+                if not defer_a2a_gather:
+                    start_a2a_gather(
+                        bt_sem_id=bt_sem_id,
+                        e_sem_id=e_sem_id_local,
+                        local_e_id=local_e_id,
+                    )
 
                 for _ in range(se_after):
                     run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
@@ -2831,6 +2833,24 @@ def _fused_ep_moe_kernel(
                 return None
 
             lax.fori_loop(final_se_block, se_total_blocks, cleanup_body_batch, None)
+
+            if defer_a2a_gather:
+
+                def start_deferred_gather_batch(local_e_id, _):
+                    start_a2a_gather(
+                        bt_sem_id=bt_sem_id,
+                        e_sem_id=local_e_id,
+                        local_e_id=local_e_id,
+                    )
+                    return None
+
+                lax.fori_loop(
+                    0,
+                    local_num_experts,
+                    start_deferred_gather_batch,
+                    None,
+                    unroll=False,
+                )
 
             wait_a2a_scatter_send_batch()
             wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
@@ -3255,6 +3275,7 @@ def jax_allreduce_metadata_by_bt(
         "disable_a2a",
         "disable_a2a_scatter",
         "disable_a2a_gather",
+        "defer_a2a_gather",
         "a2a_hbm_fraction",
         "disable_dynamic_ffn1",
         "disable_dynamic_ffn2",
@@ -3292,6 +3313,7 @@ def fused_ep_moe(
     disable_a2a: bool = False,
     disable_a2a_scatter: bool = False,
     disable_a2a_gather: bool = False,
+    defer_a2a_gather: bool = False,
     a2a_hbm_fraction: float | None = None,
     disable_dynamic_ffn1: bool = False,
     disable_dynamic_ffn2: bool = False,
@@ -3419,6 +3441,11 @@ def fused_ep_moe(
     a2a_scratch_budget = int(_device_hbm_bytes() * a2a_scratch_fraction)
     bytes_per_slot = 2 * a2a_max_tokens * hidden_size * jnp.dtype(t_dtype).itemsize
     expert_buffer_count = min(local_num_experts, max(2, a2a_scratch_budget // bytes_per_slot))
+    if defer_a2a_gather and expert_buffer_count < local_num_experts:
+        raise ValueError(
+            "defer_a2a_gather requires the batch scatter path "
+            f"({expert_buffer_count=} < {local_num_experts=})."
+        )
     if os.getenv("SGLANG_JAX_FUSED_MOE_DEBUG_CONFIG", "0") in ("1", "true", "True"):
         print(
             "fused_ep_moe config: "
@@ -3586,6 +3613,7 @@ def fused_ep_moe(
                 disable_a2a=disable_a2a,
                 disable_a2a_scatter=disable_a2a_scatter,
                 disable_a2a_gather=disable_a2a_gather,
+                defer_a2a_gather=defer_a2a_gather,
                 disable_dynamic_ffn1=disable_dynamic_ffn1,
                 disable_dynamic_ffn2=disable_dynamic_ffn2,
                 disable_weight_load=disable_weight_load,
