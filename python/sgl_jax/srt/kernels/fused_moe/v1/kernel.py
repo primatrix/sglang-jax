@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import math
+import os
 from dataclasses import dataclass
 
 import jax
@@ -137,7 +138,16 @@ class FusedMoEBlockConfig:
             bt, bf, bd1, bd2, btc, bfc, bd1c, bd2c, bse, bts = aux_data
             bts = None if bts == 0 else int(bts)
         return cls(
-            bt=bt, bf=bf, bd1=bd1, bd2=bd2, btc=btc, bfc=bfc, bd1c=bd1c, bd2c=bd2c, bse=bse, bts=bts
+            bt=bt,
+            bf=bf,
+            bd1=bd1,
+            bd2=bd2,
+            btc=btc,
+            bfc=bfc,
+            bd1c=bd1c,
+            bd2c=bd2c,
+            bse=bse,
+            bts=bts,
         )
 
     def as_kwargs(self) -> dict[str, int]:
@@ -283,7 +293,6 @@ def validate_fused_moe_block_config(
         raise ValueError(f"Expected {bd2=} to be aligned to {bd2c=}.")
     if hidden_size % bd1 != 0 or hidden_size % bd2 != 0:
         raise ValueError(f"Expected {hidden_size=} to be aligned to {bd1=} and {bd2=}.")
-
     if quant_block_k is not None:
         if quant_block_k <= 0:
             raise ValueError(f"Expected {quant_block_k=} to be non-negative.")
@@ -3254,6 +3263,7 @@ def jax_allreduce_metadata_by_bt(
         "disable_a2a",
         "disable_a2a_scatter",
         "disable_a2a_gather",
+        "a2a_hbm_fraction",
         "disable_dynamic_ffn1",
         "disable_dynamic_ffn2",
         "disable_weight_load",
@@ -3290,6 +3300,7 @@ def fused_ep_moe(
     disable_a2a: bool = False,
     disable_a2a_scatter: bool = False,
     disable_a2a_gather: bool = False,
+    a2a_hbm_fraction: float | None = None,
     disable_dynamic_ffn1: bool = False,
     disable_dynamic_ffn2: bool = False,
     disable_weight_load: bool = False,
@@ -3410,9 +3421,21 @@ def fused_ep_moe(
     # buffer-reuse barriers), but fall back when prefill tiles make the scratch
     # too large for HBM.  Each slot costs two scatter buffers of shape
     # [a2a_max_tokens, hidden_size] in t_dtype.
-    a2a_scratch_budget = int(_device_hbm_bytes() * _A2A_HBM_FRACTION)
+    a2a_scratch_fraction = _A2A_HBM_FRACTION if a2a_hbm_fraction is None else a2a_hbm_fraction
+    if a2a_scratch_fraction <= 0:
+        raise ValueError(f"Expected {a2a_scratch_fraction=} to be > 0.")
+    a2a_scratch_budget = int(_device_hbm_bytes() * a2a_scratch_fraction)
     bytes_per_slot = 2 * a2a_max_tokens * hidden_size * jnp.dtype(t_dtype).itemsize
     expert_buffer_count = min(local_num_experts, max(2, a2a_scratch_budget // bytes_per_slot))
+    if os.getenv("SGLANG_JAX_FUSED_MOE_DEBUG_CONFIG", "0") in ("1", "true", "True"):
+        print(
+            "fused_ep_moe config: "
+            f"ep_size={ep_size}, local_num_experts={local_num_experts}, "
+            f"bt={bt}, bts={block_config.bts}, hidden_size={hidden_size}, "
+            f"a2a_hbm_fraction={a2a_scratch_fraction}, "
+            f"a2a_max_tokens={a2a_max_tokens}, bytes_per_slot={bytes_per_slot}, "
+            f"expert_buffer_count={expert_buffer_count}"
+        )
     bd1_per_pack = block_config.bd1 // t_packing
     bd2_per_pack = block_config.bd2 // t_packing
 

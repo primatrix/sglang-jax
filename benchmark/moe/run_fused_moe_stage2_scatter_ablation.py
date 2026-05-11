@@ -15,6 +15,11 @@ KUBECTL = [
     "gke_poc-tpu-partner_us-central1_tpuv7x-64-node",
 ]
 
+KUBECTL_STREAM_RESET_MARKERS = (
+    "error reading from error stream",
+    "connection reset by peer",
+)
+
 GROUPS = {
     "ep8": {
         "pods": ["s1c-ep8-0-lrpqn"],
@@ -185,6 +190,15 @@ def parse_rank0_log(text: str) -> list[dict[str, object]]:
     return rows
 
 
+def is_kubectl_stream_reset(error: str) -> bool:
+    return any(marker in error for marker in KUBECTL_STREAM_RESET_MARKERS)
+
+
+def covers_requested_tokens(rows: list[dict[str, object]], tokens: list[int]) -> bool:
+    seen = {int(row["num_tokens"]) for row in rows}
+    return set(tokens).issubset(seen)
+
+
 def bench_args(args: argparse.Namespace, group: dict[str, object], rank: int, dist_addr: str):
     items: list[object] = [
         "--shape-preset",
@@ -208,6 +222,8 @@ def bench_args(args: argparse.Namespace, group: dict[str, object], rank: int, di
         "--compilation-cache-dir",
         args.compilation_cache_dir,
     ]
+    if args.a2a_hbm_fraction is not None:
+        items.extend(["--a2a-hbm-fraction", args.a2a_hbm_fraction])
     if len(group["pods"]) > 1:
         items.extend(
             [
@@ -236,7 +252,8 @@ def run_case(
     group = GROUPS[group_name]
     pods = group["pods"]
     dist_addr = f"{get_pod_ip(pods[0])}:{group['dist_port']}"
-    env = " ".join(f"{k}={v}" for k, v in CASE_ENVS[case_name].items())
+    case_env = dict(CASE_ENVS[case_name])
+    env = " ".join(f"{k}={v}" for k, v in case_env.items())
     remote_logs: dict[str, str] = {}
     procs: dict[str, subprocess.Popen] = {}
 
@@ -259,6 +276,7 @@ tail -n 80 {remote_log}
 
     rows: list[dict[str, object]] = []
     errors: dict[str, str] = {}
+    pod_rows: dict[str, list[dict[str, object]]] = {}
     for pod, proc in procs.items():
         stdout, stderr = proc.communicate(timeout=args.case_timeout)
         (out_dir / f"{group_name}_{case_name}_{pod}.tail.log").write_text(stdout + stderr)
@@ -269,17 +287,27 @@ tail -n 80 {remote_log}
         local_name = out_dir / f"{group_name}_{case_name}_{pod}.full.log"
         proc = remote(pod, f"cat {remote_log}", timeout=120, check=False)
         local_name.write_text(proc.stdout + proc.stderr)
+        pod_rows[pod] = parse_rank0_log(proc.stdout)
         if pod == pods[0]:
-            rows = parse_rank0_log(proc.stdout)
+            rows = pod_rows[pod]
+
+    tolerated_errors = {}
+    for pod, error in list(errors.items()):
+        if is_kubectl_stream_reset(error) and covers_requested_tokens(
+            pod_rows.get(pod, []), args.num_tokens
+        ):
+            tolerated_errors[pod] = error
+            del errors[pod]
 
     record = {
         "group": group_name,
         "case_name": case_name,
         "shape_preset": args.shape_preset,
-        "env": CASE_ENVS[case_name],
+        "env": case_env,
         "remote_logs": remote_logs,
         "rows": rows,
         "errors": errors,
+        "tolerated_errors": tolerated_errors,
     }
     with (out_dir / f"summary_{group_name}.jsonl").open("a") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -334,6 +362,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--imbalance-mode", default="balanced")
     parser.add_argument("--hotspot-ratio", type=float, default=1.0)
     parser.add_argument("--hotspot-count", type=int, default=48)
+    parser.add_argument(
+        "--a2a-hbm-fraction",
+        type=float,
+        default=None,
+        help="Override A2A scratch HBM fraction to study batch vs pipelined scatter.",
+    )
     parser.add_argument("--distributed-init-timeout", type=int, default=300)
     parser.add_argument("--case-timeout", type=int, default=1800)
     parser.add_argument("--repo-dir", default="/tmp/tpu_logs/sglang-jax")

@@ -123,6 +123,16 @@ def _env_bool_opt(name: str) -> bool | None:
     return _env_bool(name)
 
 
+def _env_int(name: str, default: int) -> int:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError as exc:
+        raise ValueError(f"Invalid integer env var {name}={val!r}.") from exc
+
+
 def _with_all_disable(env_name: str, *, all_disable: bool) -> bool:
     """Use per-flag env override if set; otherwise fall back to all_disable."""
     specific = _env_bool_opt(env_name)
@@ -641,7 +651,9 @@ def select_block_configs(
                                 bse=bse,
                             )
                             effective = raw.effective_for(
-                                num_tokens=case.num_tokens, ep_size=case.ep_size, dtype=dtype
+                                num_tokens=case.num_tokens,
+                                ep_size=case.ep_size,
+                                dtype=dtype,
                             )
                             add(raw=raw, effective=effective)
 
@@ -775,6 +787,7 @@ def run_all(
     quant_block_k_override: int | None = None,
     ep_size: int | None = None,
     tp_size: int | None = None,
+    a2a_hbm_fraction: float | None = None,
     return_results: bool = False,
 ) -> list[dict[str, object]] | None:
     if use_grouped_topk is None:
@@ -984,6 +997,7 @@ def run_all(
                     "FUSED_MOE_BENCHMARK_DISABLE_A2A_GATHER",
                     all_disable=all_disable,
                 ),
+                a2a_hbm_fraction=a2a_hbm_fraction,
                 disable_dynamic_ffn1=_with_all_disable(
                     "FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN1",
                     all_disable=all_disable,
@@ -1390,6 +1404,15 @@ def parse_args() -> argparse.Namespace:
         help="Explicit benchmark TP/data-axis size. Fused EP-MoE benchmark normally uses 1.",
     )
     parser.add_argument(
+        "--a2a-hbm-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Override the HBM fraction used for A2A scratch buffers. "
+            "This is a Stage2 experiment knob for batch-vs-pipelined scatter."
+        ),
+    )
+    parser.add_argument(
         "--dist-init-addr",
         type=str,
         default=None,
@@ -1672,6 +1695,7 @@ if __name__ == "__main__":
                 quant_block_k_override=args.quant_block_k,
                 ep_size=args.ep_size,
                 tp_size=args.tp_size,
+                a2a_hbm_fraction=args.a2a_hbm_fraction,
                 return_results=True,
             )
             all_results.append((ratio, token_mask_mode, results))
