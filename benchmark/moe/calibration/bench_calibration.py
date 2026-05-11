@@ -855,10 +855,11 @@ def _layer1_a2a_metadata_rows(
     execution_mode: str,
     runtime: dict[str, Any],
     bf_values: tuple[int, ...] | None = None,
+    path_values: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     return layer1_a2a_scatter.build_metadata_rows(
         suite=suite,
-        shapes=_filter_shapes_by_bf(load_layer1_a2a_metadata_suite_shapes(suite), bf_values),
+        shapes=_filter_shapes(load_layer1_a2a_metadata_suite_shapes(suite), bf_values, path_values),
         execution_mode=execution_mode,
         runtime=runtime,
         dtype=DTYPE,
@@ -874,10 +875,11 @@ def _layer1_a2a_metadata_full_rows(
     execution_mode: str,
     runtime: dict[str, Any],
     bf_values: tuple[int, ...] | None = None,
+    path_values: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     return layer1_a2a_scatter.build_metadata_full_rows(
         suite=suite,
-        shapes=_filter_shapes_by_bf(load_layer1_a2a_metadata_suite_shapes(suite), bf_values),
+        shapes=_filter_shapes(load_layer1_a2a_metadata_suite_shapes(suite), bf_values, path_values),
         execution_mode=execution_mode,
         runtime=runtime,
         dtype=DTYPE,
@@ -893,10 +895,11 @@ def _layer1_a2a_scatter_rows(
     execution_mode: str,
     runtime: dict[str, Any],
     bf_values: tuple[int, ...] | None = None,
+    path_values: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     return layer1_a2a_scatter.build_rows(
         suite=suite,
-        shapes=_filter_shapes_by_bf(load_layer1_a2a_scatter_suite_shapes(suite), bf_values),
+        shapes=_filter_shapes(load_layer1_a2a_scatter_suite_shapes(suite), bf_values, path_values),
         execution_mode=execution_mode,
         runtime=runtime,
         dtype=DTYPE,
@@ -907,16 +910,33 @@ def _layer1_a2a_scatter_rows(
     )
 
 
-def _filter_shapes_by_bf(shapes, bf_values: tuple[int, ...] | None):
-    if bf_values is None:
-        return shapes
-    allowed = set(bf_values)
+def _filter_shapes(
+    shapes,
+    bf_values: tuple[int, ...] | None,
+    path_values: tuple[str, ...] | None,
+):
+    filtered = tuple(shapes)
+    if bf_values is not None:
+        allowed = set(bf_values)
+        filtered = tuple(
+            shape
+            for shape in filtered
+            if getattr(shape, "bt", getattr(shape, "dyn_sz", getattr(shape, "repetitions", None)))
+            in allowed
+        )
+    if path_values is None:
+        return filtered
+    allowed_paths = set(path_values)
     return tuple(
         shape
-        for shape in shapes
-        if getattr(shape, "bt", getattr(shape, "dyn_sz", getattr(shape, "repetitions", None)))
-        in allowed
+        for shape in filtered
+        if getattr(shape, "path", None) in allowed_paths
+        or getattr(shape, "path_class", None) in allowed_paths
     )
+
+
+def _filter_shapes_by_bf(shapes, bf_values: tuple[int, ...] | None):
+    return _filter_shapes(shapes, bf_values, None)
 
 
 def _layer1_a2a_gather_rows(
@@ -924,10 +944,11 @@ def _layer1_a2a_gather_rows(
     execution_mode: str,
     runtime: dict[str, Any],
     bf_values: tuple[int, ...] | None = None,
+    path_values: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     return layer1_a2a_gather.build_rows(
         suite=suite,
-        shapes=_filter_shapes_by_bf(load_layer1_a2a_gather_suite_shapes(suite), bf_values),
+        shapes=_filter_shapes(load_layer1_a2a_gather_suite_shapes(suite), bf_values, path_values),
         execution_mode=execution_mode,
         runtime=runtime,
         dtype=DTYPE,
@@ -943,13 +964,14 @@ def _layer1_local_dma_rows(
     execution_mode: str,
     runtime: dict[str, Any],
     bf_values: tuple[int, ...] | None = None,
+    path_values: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     target_runtime = (
         TARGET_RUNTIME_V7X8 if suite == SUITE_V7X8_BF16_LOCAL_DMA_TOPK8 else TARGET_RUNTIME_V7X32
     )
     return layer1_local_dma.build_rows(
         suite=suite,
-        shapes=_filter_shapes_by_bf(load_layer1_local_dma_suite_shapes(suite), bf_values),
+        shapes=_filter_shapes(load_layer1_local_dma_suite_shapes(suite), bf_values, path_values),
         execution_mode=execution_mode,
         runtime=runtime,
         dtype=DTYPE,
@@ -968,10 +990,11 @@ def _layer1_ffn_compute_rows(
     execution_mode: str,
     runtime: dict[str, Any],
     bf_values: tuple[int, ...] | None = None,
+    path_values: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     return layer1_ffn_compute.build_rows(
         suite=suite,
-        shapes=_filter_shapes_by_bf(load_layer1_ffn_compute_suite_shapes(suite), bf_values),
+        shapes=_filter_shapes(load_layer1_ffn_compute_suite_shapes(suite), bf_values, path_values),
         execution_mode=execution_mode,
         runtime=runtime,
         dtype=DTYPE,
@@ -990,10 +1013,11 @@ def _layer1_wait_rows(
     execution_mode: str,
     runtime: dict[str, Any],
     bf_values: tuple[int, ...] | None = None,
+    path_values: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     return layer1_wait.build_rows(
         suite=suite,
-        shapes=_filter_shapes_by_bf(load_layer1_wait_suite_shapes(suite), bf_values),
+        shapes=_filter_shapes(load_layer1_wait_suite_shapes(suite), bf_values, path_values),
         execution_mode=execution_mode,
         runtime=runtime,
         dtype=DTYPE,
@@ -1037,6 +1061,7 @@ def build_rows(
     suite: str,
     execution_mode: str,
     bf_values: tuple[int, ...] | None = None,
+    path_values: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     runtime = collect_runtime_identity()
     resolved_mode = resolve_execution_mode(scenario, execution_mode, runtime)
@@ -1047,21 +1072,21 @@ def build_rows(
     if scenario == SCENARIO_LAYER0_A2A_ENVELOPE:
         return _layer0_a2a_envelope_rows(suite, resolved_mode, runtime)
     if scenario == SCENARIO_LAYER1_A2A_METADATA:
-        return _layer1_a2a_metadata_rows(suite, resolved_mode, runtime, bf_values)
+        return _layer1_a2a_metadata_rows(suite, resolved_mode, runtime, bf_values, path_values)
     if scenario == SCENARIO_LAYER1_A2A_METADATA_FULL:
-        return _layer1_a2a_metadata_full_rows(suite, resolved_mode, runtime, bf_values)
+        return _layer1_a2a_metadata_full_rows(suite, resolved_mode, runtime, bf_values, path_values)
     if scenario == SCENARIO_LAYER1_A2A_SCATTER:
-        return _layer1_a2a_scatter_rows(suite, resolved_mode, runtime, bf_values)
+        return _layer1_a2a_scatter_rows(suite, resolved_mode, runtime, bf_values, path_values)
     if scenario == SCENARIO_LAYER1_A2A_GATHER:
-        return _layer1_a2a_gather_rows(suite, resolved_mode, runtime, bf_values)
+        return _layer1_a2a_gather_rows(suite, resolved_mode, runtime, bf_values, path_values)
     if scenario == SCENARIO_LAYER1_WEIGHT_TILE_DMA:
         return _layer1_weight_tile_dma_rows(suite, resolved_mode, runtime)
     if scenario == SCENARIO_LAYER1_LOCAL_DMA:
-        return _layer1_local_dma_rows(suite, resolved_mode, runtime, bf_values)
+        return _layer1_local_dma_rows(suite, resolved_mode, runtime, bf_values, path_values)
     if scenario == SCENARIO_LAYER1_FFN_COMPUTE:
-        return _layer1_ffn_compute_rows(suite, resolved_mode, runtime, bf_values)
+        return _layer1_ffn_compute_rows(suite, resolved_mode, runtime, bf_values, path_values)
     if scenario == SCENARIO_LAYER1_WAIT:
-        return _layer1_wait_rows(suite, resolved_mode, runtime, bf_values)
+        return _layer1_wait_rows(suite, resolved_mode, runtime, bf_values, path_values)
     if scenario == SCENARIO_LAYER2_FUSED_MOE_E2E:
         layer2_fused_moe_e2e = _layer2_fused_moe_e2e()
         return layer2_fused_moe_e2e.build_rows(
@@ -1117,6 +1142,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--path-values",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated path or path_class values to run. Use with "
+            "--bf-values to isolate one Pallas shape per Python process."
+        ),
+    )
+    parser.add_argument(
         "--print",
         action="store_true",
         help="Also print emitted JSON rows to stdout.",
@@ -1141,6 +1175,13 @@ def _parse_bf_values(raw: str | None) -> tuple[int, ...] | None:
     return tuple(values)
 
 
+def _parse_string_values(raw: str | None) -> tuple[str, ...] | None:
+    if raw is None or not raw.strip():
+        return None
+    values = tuple(part.strip() for part in raw.split(",") if part.strip())
+    return values or None
+
+
 def main() -> None:
     args = parse_args()
     rows = build_rows(
@@ -1148,6 +1189,7 @@ def main() -> None:
         args.suite,
         args.execution_mode,
         _parse_bf_values(args.bf_values),
+        _parse_string_values(args.path_values),
     )
     if args.require_measured:
         bad_rows = [

@@ -317,7 +317,8 @@ def _measure_gemm_ms(
 
     @jax.jit
     def gemm(lhs_arg, rhs_arg):
-        return lhs_arg @ rhs_arg
+        with jax.named_scope("SGLANG_JAX_LAYER0_GEMM"):
+            return lhs_arg @ rhs_arg
 
     jax.block_until_ready(gemm(lhs, rhs))
     task = f"layer0_gemm_{shape.path}_{shape.m}x{shape.k}x{shape.n}"

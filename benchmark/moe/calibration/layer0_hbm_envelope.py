@@ -315,7 +315,8 @@ def _measure_hbm_copy_ms(
 
     @jax.jit
     def copy_hbm(array):
-        return array.copy()
+        with jax.named_scope("SGLANG_JAX_LAYER0_HBM"):
+            return array.copy()
 
     jax.block_until_ready(copy_hbm(src))
     task = f"layer0_hbm_copy_{tile_shape[0]}x{tile_shape[1]}x{tile_shape[2]}"

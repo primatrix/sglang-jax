@@ -248,9 +248,10 @@ def _measure_ffn_ms(
 
     @jax.jit
     def run_ffn(*arrays):
-        if shape.path in ("dynamic_ffn1_init", "dynamic_ffn1_accumulate"):
-            return _ffn1_loop(shape, arrays, jnp=jnp)
-        return _ffn2_loop(shape, arrays, jnp=jnp)
+        with jax.named_scope("SGLANG_JAX_LAYER1_FFN"):
+            if shape.path in ("dynamic_ffn1_init", "dynamic_ffn1_accumulate"):
+                return _ffn1_loop(shape, arrays, jnp=jnp)
+            return _ffn2_loop(shape, arrays, jnp=jnp)
 
     jax.block_until_ready(run_ffn(*inputs))
     task = f"layer1_ffn_{shape.path}_dyn{shape.dyn_sz}"

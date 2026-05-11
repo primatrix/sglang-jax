@@ -56,7 +56,9 @@ def _event_text(event: dict[str, Any]) -> str:
     )
 
 
-def _extract_marker_durations_ms(trace: dict[str, Any], task: str | None = None) -> list[float]:
+def _extract_marker_durations_with_source_ms(
+    trace: dict[str, Any], task: str | None = None
+) -> tuple[list[float], str]:
     def _durations_by_pid(events: list[dict[str, Any]]) -> dict[int, list[float]]:
         by_pid: dict[int, list[dict[str, Any]]] = {}
         for e in events:
@@ -87,15 +89,37 @@ def _extract_marker_durations_ms(trace: dict[str, Any], task: str | None = None)
     trace_events = trace.get("traceEvents", [])
 
     if task:
+        if task.startswith("layer1_ffn_"):
+            ffn_jit_events = [
+                e
+                for e in trace_events
+                if str(e.get("name", "")).startswith("jit_run_ffn(")
+                and (e.get("args", {}) or {}).get("device_duration_ps")
+            ]
+            ffn_jit_durations = _dominant_pid_durations(ffn_jit_events)
+            if ffn_jit_durations:
+                return ffn_jit_durations, "jit_function_device_event"
+
         preferred_patterns = []
         if task.startswith("layer0_a2a_"):
             preferred_patterns.append("SGLANG_JAX_LAYER0_A2A")
+        if task.startswith("layer0_hbm_"):
+            preferred_patterns.append("SGLANG_JAX_LAYER0_HBM")
+        if task.startswith("layer0_gemm_"):
+            preferred_patterns.append("SGLANG_JAX_LAYER0_GEMM")
         scatter_match = re.search(r"(layer1_a2a_scatter_topk8_bt\d+)", task)
         if scatter_match:
             preferred_patterns.append(scatter_match.group(1))
         gather_match = re.search(r"(layer1_a2a_gather_topk8_bt\d+)", task)
         if gather_match:
             preferred_patterns.append(gather_match.group(1))
+        metadata_match = re.search(r"(layer1_a2a_metadata(?:_full)?_bt\d+)", task)
+        if metadata_match:
+            preferred_patterns.append(metadata_match.group(1))
+        if task.startswith("layer1_local_dma_"):
+            preferred_patterns.append(task)
+        if task.startswith("layer1_dma_"):
+            preferred_patterns.append(task.replace("layer1_dma_", "layer1_weight_tile_dma_", 1))
         if task.startswith("layer1_wait_"):
             preferred_patterns.append(task)
 
@@ -109,7 +133,7 @@ def _extract_marker_durations_ms(trace: dict[str, Any], task: str | None = None)
         ]
         preferred_durations = _dominant_pid_durations(preferred_events)
         if preferred_durations:
-            return preferred_durations
+            return preferred_durations, "preferred_device_event"
 
     # Prefer compiled/device marker events, matching the Ironwood
     # microbenchmarks. StepTraceAnnotation events and outer jit call-done
@@ -118,23 +142,56 @@ def _extract_marker_durations_ms(trace: dict[str, Any], task: str | None = None)
         e
         for e in trace_events
         if MARKER in _event_text(e)
+        and (e.get("args", {}) or {}).get("device_duration_ps")
         and not str(e.get("name", "")).startswith(f"{MARKER}:")
         and not str((e.get("args", {}) or {}).get("long_name", "")).startswith(f"{MARKER}:")
         and not str(e.get("name", "")).endswith("call-done")
     ]
     marker_durations = _dominant_pid_durations(marker_events)
     if marker_durations:
-        return marker_durations
+        return marker_durations, "bench_marker_device_event"
+
+    if task and task.startswith("layer0_hbm_"):
+        copy_events = [
+            e
+            for e in trace_events
+            if (e.get("args", {}) or {}).get("device_duration_ps")
+            and (
+                str(e.get("name", "")).startswith("copy")
+                or " copy(" in str((e.get("args", {}) or {}).get("long_name", ""))
+            )
+        ]
+        copy_durations = _dominant_pid_durations(copy_events)
+        if copy_durations:
+            return copy_durations, "hlo_copy_device_event"
+
+    if task and task.startswith("layer0_gemm_"):
+        dot_events = [
+            e
+            for e in trace_events
+            if (e.get("args", {}) or {}).get("device_duration_ps")
+            and (
+                str(e.get("name", "")).startswith("dot")
+                or " dot(" in str((e.get("args", {}) or {}).get("long_name", ""))
+            )
+        ]
+        dot_durations = _dominant_pid_durations(dot_events)
+        if dot_durations:
+            return dot_durations, "hlo_dot_device_event"
 
     if task:
         event_matcher = re.compile(task)
         events = []
         for e in trace_events:
-            if "name" in e and event_matcher.match(e["name"]):
+            if (
+                "name" in e
+                and event_matcher.match(e["name"])
+                and (e.get("args", {}) or {}).get("device_duration_ps")
+            ):
                 events.append(e)
         task_durations = _dominant_pid_durations(events)
         if task_durations:
-            return task_durations
+            return task_durations, "task_matched_device_event"
 
     marker_step_events = [
         e
@@ -147,9 +204,22 @@ def _extract_marker_durations_ms(trace: dict[str, Any], task: str | None = None)
     ]
     marker_step_durations = _dominant_pid_durations(marker_step_events)
     if marker_step_durations:
-        return marker_step_durations
+        return marker_step_durations, "host_step_trace_annotation"
 
-    return []
+    return [], "missing"
+
+
+def _extract_marker_durations_ms(trace: dict[str, Any], task: str | None = None) -> list[float]:
+    durations, _ = _extract_marker_durations_with_source_ms(trace, task=task)
+    return durations
+
+
+def _allow_host_trace_fallback() -> bool:
+    return os.getenv("CALIBRATION_ALLOW_HOST_TRACE_FALLBACK", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
 
 def _event_duration_ms(event: dict[str, Any]) -> float | None:
@@ -210,6 +280,7 @@ def _trace_timing_summary(
     *,
     task: str,
     marker_ms: list[float],
+    marker_source: str,
     discard_initial_samples: int,
 ) -> dict[str, Any]:
     event_groups: dict[str, list[float]] = {}
@@ -237,7 +308,8 @@ def _trace_timing_summary(
         "task": task,
         "marker": MARKER,
         "timing_semantics": {
-            "marker_ms": "Preferred device marker duration from named_scope/tf_op device_duration_ps; falls back to task-matched device event, then host StepTraceAnnotation only if no device marker exists.",
+            "marker_ms": "Preferred device marker duration from named_scope/tf_op device_duration_ps; host StepTraceAnnotation is diagnostic-only unless CALIBRATION_ALLOW_HOST_TRACE_FALLBACK=1.",
+            "marker_source": "Source used for marker_ms. Values ending in device_event are valid measured performance data; host_step_trace_annotation is an envelope fallback and should not be used for calibration.",
             "barrier_cores_ms": "Device trace barrier-cores events; diagnostic only.",
             "marker_minus_barrier_cores_ms": (
                 "Deprecated diagnostic residual. Do not use as communication time."
@@ -245,6 +317,8 @@ def _trace_timing_summary(
             "event_groups": "Best-effort trace decomposition by event name/tf_op.",
         },
         "discard_initial_samples": discarded,
+        "marker_source": marker_source,
+        "host_trace_fallback_allowed": _allow_host_trace_fallback(),
         "marker_ms_all": marker_ms,
         "marker_ms": measured_marker_ms,
         "marker_summary": _samples_summary(measured_marker_ms),
@@ -339,12 +413,23 @@ def multiple_iteration_timeit_from_trace(
                     jax.block_until_ready(out)
 
     trace = _load_trace(trace_dir)
-    durations = _extract_marker_durations_ms(trace, task=task)
+    durations, marker_source = _extract_marker_durations_with_source_ms(trace, task=task)
     summary = _trace_timing_summary(
         trace,
         task=task,
         marker_ms=durations,
+        marker_source=marker_source,
         discard_initial_samples=discard_initial_samples,
     )
     _write_trace_timing_summary(trace_dir, summary)
+    if (
+        marker_source in {"host_step_trace_annotation", "missing"}
+        and not _allow_host_trace_fallback()
+    ):
+        raise RuntimeError(
+            "Trace timing did not produce a device-duration marker for "
+            f"{task!r}; marker_source={marker_source!r}. Host StepTraceAnnotation "
+            "is an envelope diagnostic and is not accepted as calibration latency. "
+            f"Trace summary was written under {trace_dir!r}."
+        )
     return summary["marker_ms"]

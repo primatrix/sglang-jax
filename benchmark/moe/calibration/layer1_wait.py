@@ -370,13 +370,18 @@ def _pallas_wait_call(src_hbm, dst_hbm, *, shape: WaitShape, jax, pl, pltpu):
             ],
         ),
         compiler_params=pltpu.CompilerParams(
-            collective_id=5,
+            collective_id=_collective_id(shape),
             allow_collective_id_without_custom_barrier=True,
             has_side_effects=True,
             vmem_limit_bytes=VMEM_LIMIT_BYTES,
         ),
         name=f"layer1_wait_{shape.path}_rep{shape.repetitions}",
     )(src_hbm, dst_hbm)
+
+
+def _collective_id(shape: WaitShape) -> int:
+    path_offset = 0 if shape.path == "mesh_barrier" else 1
+    return 50 + shape.repetitions * 2 + path_offset
 
 
 def _build_tensor_mesh(*, jax: Any, np: Any, ep_size: int, tp_size: int):
