@@ -118,6 +118,13 @@ def _extract_marker_durations_with_source_ms(
             preferred_patterns.append(metadata_match.group(1))
         if task.startswith("layer1_local_dma_"):
             preferred_patterns.append(task)
+            preferred_patterns.append(
+                task.replace(
+                    "layer1_local_dma_accumulator_store_or_rmw_",
+                    "layer1_local_dma_accumulator_rmw_",
+                    1,
+                )
+            )
         if task.startswith("layer1_dma_"):
             preferred_patterns.append(task.replace("layer1_dma_", "layer1_weight_tile_dma_", 1))
         if task.startswith("layer1_wait_"):
