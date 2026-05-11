@@ -13,7 +13,7 @@ from benchmark.moe.bench_fused_moe import run_all
 from benchmark.moe.calibration.common import build_observation_row
 
 SCENARIO_LAYER2_FUSED_MOE_E2E = "layer2_fused_moe_e2e"
-SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG_V1 = "v7x32_bf16_fused_moe_e2e_diag_v1"
+SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG = "v7x32_bf16_fused_moe_e2e_diag"
 
 DTYPE = "bfloat16"
 WEIGHT_DTYPE = "bfloat16"
@@ -109,7 +109,7 @@ def build_rows(
     source: dict[str, Any],
     metadata: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    if suite != SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG_V1:
+    if suite != SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG:
         raise ValueError(f"Unsupported Layer 2 fused MoE E2E suite: {suite}")
 
     if execution_mode == "local_smoke":

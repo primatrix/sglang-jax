@@ -79,7 +79,7 @@ SUITE_V7X8_BF16_FFN_LOOP_CONTEXT = "v7x8_bf16_ffn_loop_context"
 SUITE_V7X8_BF16_FFN_TUNED_FAMILY = "v7x8_bf16_ffn_tuned_family"
 SUITE_V7X8_BF16_SHARED_EXPERT_TUNED_FAMILY = "v7x8_bf16_shared_expert_tuned_family"
 SUITE_V7X32_BF16_WAIT_PRIMITIVES = "v7x32_bf16_wait_primitives"
-SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG_V1 = "v7x32_bf16_fused_moe_e2e_diag_v1"
+SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG = "v7x32_bf16_fused_moe_e2e_diag"
 SUITES = (
     SUITE_V7X32_BF16_WEIGHT_TILES,
     SUITE_V7X32_BF16_HBM_COPY_ENVELOPE,
@@ -101,7 +101,7 @@ SUITES = (
     SUITE_V7X8_BF16_FFN_TUNED_FAMILY,
     SUITE_V7X8_BF16_SHARED_EXPERT_TUNED_FAMILY,
     SUITE_V7X32_BF16_WAIT_PRIMITIVES,
-    SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG_V1,
+    SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG,
 )
 
 DTYPE = "bfloat16"
@@ -720,7 +720,7 @@ def load_layer1_shared_expert_suite_shapes(
 def load_layer2_fused_moe_e2e_suite_shapes(
     suite: str,
 ) -> tuple[Any, ...]:
-    if suite == SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG_V1:
+    if suite == SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG:
         return _layer2_fused_moe_e2e().default_shapes()
     raise ValueError(f"Unsupported Layer 2 fused MoE E2E suite: {suite}")
 

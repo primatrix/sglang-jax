@@ -782,6 +782,130 @@ def _resolve_tuned_block_config(
     }
 
 
+def _topk_ids_from_logits(logits: jax.Array | np.ndarray, top_k: int) -> np.ndarray:
+    logits_np = np.asarray(logits)
+    if logits_np.ndim != 2:
+        raise ValueError(f"Expected router logits to be 2D, got shape={logits_np.shape}.")
+    if top_k <= 0 or top_k > logits_np.shape[1]:
+        raise ValueError(f"Expected 0 < {top_k=} <= num_experts={logits_np.shape[1]}.")
+    candidate = np.argpartition(-logits_np, kth=top_k - 1, axis=1)[:, :top_k]
+    candidate_scores = np.take_along_axis(logits_np, candidate, axis=1)
+    order = np.argsort(-candidate_scores, axis=1, kind="stable")
+    return np.take_along_axis(candidate, order, axis=1).astype(np.int32, copy=False)
+
+
+def _routing_diagnostics_from_logits(
+    *,
+    logits: jax.Array | np.ndarray,
+    top_k: int,
+    ep_size: int,
+    bt: int,
+    num_experts: int,
+) -> dict[str, object]:
+    topk_ids = _topk_ids_from_logits(logits, top_k)
+    num_tokens = int(topk_ids.shape[0])
+    local_num_tokens = num_tokens // ep_size
+    local_num_experts = num_experts // ep_size
+    if num_tokens % ep_size != 0:
+        raise ValueError(f"Expected {num_tokens=} divisible by {ep_size=}.")
+    if local_num_tokens % bt != 0:
+        raise ValueError(f"Expected {local_num_tokens=} divisible by {bt=}.")
+
+    num_bt = local_num_tokens // bt
+    active_counts: list[int] = []
+    global_nonzero_counts: list[int] = []
+    global_max_counts: list[int] = []
+    global_p50_counts: list[float] = []
+    global_p90_counts: list[float] = []
+    local_active_by_bt: list[dict[str, object]] = []
+
+    for bt_id in range(num_bt):
+        global_counts = np.zeros((num_experts,), dtype=np.int32)
+        for rank in range(ep_size):
+            start = rank * local_num_tokens + bt_id * bt
+            end = start + bt
+            ids = topk_ids[start:end].reshape(-1)
+            ids = ids[ids >= 0]
+            if ids.size:
+                global_counts += np.bincount(ids, minlength=num_experts).astype(np.int32)
+
+        nonzero = global_counts[global_counts > 0]
+        global_nonzero_counts.append(int(nonzero.size))
+        global_max_counts.append(int(nonzero.max()) if nonzero.size else 0)
+        global_p50_counts.append(float(np.percentile(nonzero, 50)) if nonzero.size else 0.0)
+        global_p90_counts.append(float(np.percentile(nonzero, 90)) if nonzero.size else 0.0)
+
+        per_rank_active: list[int] = []
+        for rank in range(ep_size):
+            e_start = rank * local_num_experts
+            e_end = e_start + local_num_experts
+            active = int(np.count_nonzero(global_counts[e_start:e_end]))
+            per_rank_active.append(active)
+            active_counts.append(active)
+        local_active_by_bt.append(
+            {
+                "bt_id": bt_id,
+                "min": min(per_rank_active),
+                "p50": float(np.percentile(per_rank_active, 50)),
+                "p90": float(np.percentile(per_rank_active, 90)),
+                "max": max(per_rank_active),
+                "mean": float(np.mean(per_rank_active)),
+                "histogram": {
+                    str(v): int(per_rank_active.count(v)) for v in sorted(set(per_rank_active))
+                },
+            }
+        )
+
+    active_hist = {str(v): int(active_counts.count(v)) for v in sorted(set(active_counts))}
+    token_counts = np.bincount(topk_ids.reshape(-1), minlength=num_experts)
+    return {
+        "num_tokens": num_tokens,
+        "local_num_tokens": local_num_tokens,
+        "ep_size": ep_size,
+        "bt": bt,
+        "num_bt": num_bt,
+        "top_k": top_k,
+        "num_experts": num_experts,
+        "local_num_experts": local_num_experts,
+        "assignments_per_bt": ep_size * bt * top_k,
+        "global_expert_nonzero_total": int(np.count_nonzero(token_counts)),
+        "global_expert_max_total": int(token_counts.max()) if token_counts.size else 0,
+        "local_active_experts": {
+            "min": min(active_counts) if active_counts else 0,
+            "p50": float(np.percentile(active_counts, 50)) if active_counts else 0.0,
+            "p90": float(np.percentile(active_counts, 90)) if active_counts else 0.0,
+            "max": max(active_counts) if active_counts else 0,
+            "mean": float(np.mean(active_counts)) if active_counts else 0.0,
+            "histogram": active_hist,
+        },
+        "global_expert_counts_per_bt": {
+            "nonzero_min": min(global_nonzero_counts) if global_nonzero_counts else 0,
+            "nonzero_p50": (
+                float(np.percentile(global_nonzero_counts, 50)) if global_nonzero_counts else 0.0
+            ),
+            "nonzero_p90": (
+                float(np.percentile(global_nonzero_counts, 90)) if global_nonzero_counts else 0.0
+            ),
+            "nonzero_max": max(global_nonzero_counts) if global_nonzero_counts else 0,
+            "max_count_min": min(global_max_counts) if global_max_counts else 0,
+            "max_count_p50": (
+                float(np.percentile(global_max_counts, 50)) if global_max_counts else 0.0
+            ),
+            "max_count_p90": (
+                float(np.percentile(global_max_counts, 90)) if global_max_counts else 0.0
+            ),
+            "max_count_max": max(global_max_counts) if global_max_counts else 0,
+            "nonzero_count_p50": (
+                float(np.percentile(global_p50_counts, 50)) if global_p50_counts else 0.0
+            ),
+            "nonzero_count_p90": (
+                float(np.percentile(global_p90_counts, 90)) if global_p90_counts else 0.0
+            ),
+        },
+        "local_active_by_bt": local_active_by_bt,
+    }
+
+
 def _manual_block_config_from_env(
     *,
     case: MoEBenchmarkCase,
@@ -1388,15 +1512,32 @@ def run_all(
             if return_results:
                 best_ms: float | None
                 best_cfg: FusedMoEBlockConfig | None
+                routing_cfg_info: dict[str, object] | None
                 if tune_block_config:
                     if best is None:
                         best_ms, best_cfg = float("nan"), None
                     else:
                         best_ms, best_cfg = best
+                    routing_cfg_info = _config_metadata(best_cfg) if best_cfg is not None else None
                 else:
                     best_ms = default_ms
                     best_cfg = block_cfgs[0] if block_config_mode == "explicit_tuned" else None
                     best_samples = list(default_samples)
+                    if best_cfg is not None:
+                        routing_cfg_info = _config_metadata(best_cfg)
+                    elif tuned_cfg_info is not None:
+                        routing_cfg_info = (tuned_cfg_info or {}).get("effective_config")
+                    else:
+                        routing_cfg_info = None
+                routing_diagnostics: dict[str, object] | None = None
+                if routing_cfg_info is not None:
+                    routing_diagnostics = _routing_diagnostics_from_logits(
+                        logits=custom_logits,
+                        top_k=case.top_k,
+                        ep_size=mesh_ep,
+                        bt=int(routing_cfg_info["bt"]),
+                        num_experts=case.num_experts,
+                    )
                 results.append(
                     {
                         "case": case.name,
@@ -1420,6 +1561,7 @@ def run_all(
                             "candidate_sweep" if tune_block_config else block_config_mode
                         ),
                         "resolved_tuned_block_config": tuned_cfg_info,
+                        "routing_diagnostics": routing_diagnostics,
                     }
                 )
 
