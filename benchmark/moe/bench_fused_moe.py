@@ -55,6 +55,28 @@ SHAPE_PRESETS: dict[str, dict[str, object]] = {
         "use_shared_expert": True,
         "weight_dtype": "bfloat16",
     },
+    # /models/MiMo-V2-Flash config.json (model_type=mimo_v2_flash).
+    "mimo_v2_flash": {
+        "num_experts": 256,
+        "top_k": 8,
+        "hidden_size": 4096,
+        "intermediate_size": 2048,
+        "num_expert_group": 0,
+        "topk_group": 0,
+        "use_shared_expert": False,
+        "weight_dtype": "bfloat16",
+    },
+    # /models/MiMo-V2-Pro-Private config.json (model_type=mimo_v2).
+    "mimo_v2_pro": {
+        "num_experts": 384,
+        "top_k": 8,
+        "hidden_size": 6144,
+        "intermediate_size": 2048,
+        "num_expert_group": 0,
+        "topk_group": 0,
+        "use_shared_expert": False,
+        "weight_dtype": "bfloat16",
+    },
 }
 
 # ---------------------------------------------------------------------------
