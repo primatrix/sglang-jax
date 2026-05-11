@@ -351,7 +351,7 @@ def _measure_dma_overlap_ms(
     from benchmark.utils import multiple_iteration_timeit_from_trace
 
     mesh = _build_tensor_mesh(jax=jax, np=np, ep_size=shape.ep_size, tp_size=1)
-    remote_src_sharding = NamedSharding(mesh, P("tensor", None, None, None))
+    remote_src_sharding = NamedSharding(mesh, P("tensor", None, None))
     replicated_sharding = NamedSharding(mesh, P())
 
     remote_src = _make_remote_src(jax=jax, np=np, sharding=remote_src_sharding, shape=shape)
@@ -410,7 +410,7 @@ def _sharded_dma_overlap_call(
 ):
     @jax.shard_map(
         mesh=mesh,
-        in_specs=(P("tensor", None, None, None), P(), P()),
+        in_specs=(P("tensor", None, None), P(), P()),
         out_specs=P("tensor"),
         check_vma=False,
     )
