@@ -292,7 +292,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hotspot-ratio", type=float, default=1.0)
     parser.add_argument("--hotspot-count", type=int, default=48)
     parser.add_argument("--repo-dir", default="/tmp/tpu_logs/sglang-jax")
-    parser.add_argument("--remote", default="origin")
+    parser.add_argument("--remote", default="primatrix")
     parser.add_argument("--ref", default="exp/fused-ep-moe-stage2-a2a")
     parser.add_argument("--skip-setup", action="store_true")
     parser.add_argument("--out-dir", default=None)
