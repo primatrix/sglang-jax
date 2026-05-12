@@ -97,6 +97,27 @@ VARIANTS: tuple[FusedMoEVariant, ...] = (
         ("FUSED_MOE_BENCHMARK_DISABLE_SHARED_EXPERT",),
         "Whether shared expert work is useful overlap filler or critical-path cost.",
     ),
+    FusedMoEVariant(
+        "disable_all_reduce_metadata",
+        ("FUSED_MOE_BENCHMARK_DISABLE_ALL_REDUCE_METADATA",),
+        "Whether metadata all-reduce is exposed on the composed critical path.",
+    ),
+    FusedMoEVariant(
+        "disable_metadata_and_shared_expert",
+        (
+            "FUSED_MOE_BENCHMARK_DISABLE_ALL_REDUCE_METADATA",
+            "FUSED_MOE_BENCHMARK_DISABLE_SHARED_EXPERT",
+        ),
+        "Whether metadata and shared expert are already overlapped or mostly serial.",
+    ),
+    FusedMoEVariant(
+        "disable_metadata_and_weight_load",
+        (
+            "FUSED_MOE_BENCHMARK_DISABLE_ALL_REDUCE_METADATA",
+            "FUSED_MOE_BENCHMARK_DISABLE_WEIGHT_LOAD",
+        ),
+        "Whether metadata and weight-load exposure overlap in the composed schedule.",
+    ),
 )
 
 
