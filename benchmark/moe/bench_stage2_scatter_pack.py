@@ -53,6 +53,7 @@ from benchmark.utils import multiple_iteration_timeit_from_trace
 
 MODES = (
     "direct",
+    "direct_run_merge",
     "hbm_pack_serial",
     "hbm_pack_overlap",
     "hbm_pack_demux",
@@ -212,6 +213,121 @@ def _direct_scatter_kernel(
         return None
 
     lax.fori_loop(0, local_num_tokens, _token_body, None, unroll=False)
+
+    for src in range(num_devices):
+        recv_count = _recv_count_from_src(
+            jnp.int32(src),
+            my_id=my_id,
+            local_num_tokens=local_num_tokens,
+            top_k=top_k,
+            fanout=fanout,
+            num_devices=num_devices,
+        )
+        _wait_dma(recv_hbm.at[src], recv_sems.at[src], recv_count)
+
+    for dst in range(num_devices):
+        _wait_dma(recv_hbm.at[0], send_sems.at[dst], send_counts_smem[dst])
+
+    _sync_barrier(barrier_sem, num_devices=num_devices, tp_size=tp_size)
+    _store_zero(out_hbm, out_vmem, out_sem)
+
+
+def _direct_run_merge_scatter_kernel(
+    tokens_hbm,
+    recv_hbm,
+    out_hbm,
+    send_counts_smem,
+    send_sems,
+    recv_sems,
+    barrier_sem,
+    out_vmem,
+    out_sem,
+    *,
+    top_k: int,
+    fanout: int,
+    dp_axis_name: str,
+    tp_axis_name: str,
+):
+    """Merge naturally contiguous source-token runs without a pack buffer.
+
+    This is a timing-only upper-bound experiment: it scans by dst/k and writes a
+    k-major receiver order, so it does not preserve the exact direct scatter
+    ordering required by the fused MoE gather path.
+    """
+    dp_rank = lax.axis_index(dp_axis_name)
+    tp_rank = lax.axis_index(tp_axis_name)
+    tp_size = lax.axis_size(tp_axis_name)
+    dp_size = lax.axis_size(dp_axis_name)
+    my_id = dp_rank * tp_size + tp_rank
+    num_devices = dp_size * tp_size
+    local_num_tokens = tokens_hbm.shape[0]
+
+    def _mesh_device_id(ep_rank):
+        return (ep_rank // tp_size, ep_rank % tp_size)
+
+    for dev in range(num_devices):
+        send_counts_smem[dev] = jnp.int32(0)
+
+    for dst in range(num_devices):
+        for k_id in range(top_k):
+
+            def _token_while_body(t_id):
+                dst_i = jnp.int32(dst)
+                k_i = jnp.int32(k_id)
+                is_match = (
+                    _dest_for(
+                        my_id,
+                        t_id,
+                        k_i,
+                        fanout=fanout,
+                        num_devices=num_devices,
+                    )
+                    == dst_i
+                )
+
+                def _run_cond(run_len):
+                    next_t = t_id + run_len
+                    return (
+                        is_match
+                        & (next_t < local_num_tokens)
+                        & (
+                            _dest_for(
+                                my_id,
+                                next_t,
+                                k_i,
+                                fanout=fanout,
+                                num_devices=num_devices,
+                            )
+                            == dst_i
+                        )
+                    )
+
+                run_len = lax.while_loop(
+                    _run_cond,
+                    lambda run_len: run_len + jnp.int32(1),
+                    jnp.int32(1),
+                )
+
+                @pl.when(is_match)
+                def _copy_run():
+                    offset = send_counts_smem[dst]
+                    send_counts_smem[dst] = offset + run_len
+                    pltpu.make_async_remote_copy(
+                        src_ref=tokens_hbm.at[pl.ds(t_id, run_len)],
+                        dst_ref=recv_hbm.at[my_id, pl.ds(offset, run_len)],
+                        send_sem=send_sems.at[dst],
+                        recv_sem=recv_sems.at[my_id],
+                        device_id=_mesh_device_id(jnp.int32(dst)),
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).start()
+
+                return lax.select(is_match, t_id + run_len, t_id + jnp.int32(1))
+
+            lax.while_loop(
+                lambda t_id: t_id < local_num_tokens,
+                _token_while_body,
+                jnp.int32(0),
+            )
 
     for src in range(num_devices):
         recv_count = _recv_count_from_src(
@@ -670,10 +786,11 @@ def _make_kernel(
     hbm_block_spec = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     out_shape = jax.ShapeDtypeStruct((128,), jnp.float32)
 
-    if mode == "direct":
+    if mode in ("direct", "direct_run_merge"):
+        kernel = _direct_scatter_kernel if mode == "direct" else _direct_run_merge_scatter_kernel
         pallas_fn = pl.pallas_call(
             functools.partial(
-                _direct_scatter_kernel,
+                kernel,
                 top_k=top_k,
                 fanout=fanout,
                 dp_axis_name="data",
@@ -702,7 +819,7 @@ def _make_kernel(
                 has_side_effects=True,
                 vmem_limit_bytes=vmem_limit_bytes,
             ),
-            name=f"{MARKER}_stage2_scatter_direct_fanout{fanout}",
+            name=f"{MARKER}_stage2_scatter_{mode}_fanout{fanout}",
         )
     elif mode in ("hbm_pack_serial", "hbm_pack_overlap", "hbm_pack_demux"):
         pallas_fn = pl.pallas_call(
@@ -794,7 +911,7 @@ def _make_kernel(
         check_vma=False,
     )
     def run(tokens):
-        if mode == "direct":
+        if mode in ("direct", "direct_run_merge"):
             recv = pl.empty(hbm_shape, dtype)
             return pallas_fn(
                 pltpu.with_memory_space_constraint(tokens, pltpu.HBM),

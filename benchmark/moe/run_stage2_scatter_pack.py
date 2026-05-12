@@ -231,6 +231,7 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         choices=[
             "direct",
+            "direct_run_merge",
             "hbm_pack_serial",
             "hbm_pack_overlap",
             "hbm_pack_demux",
@@ -239,6 +240,7 @@ def parse_args() -> argparse.Namespace:
         ],
         default=[
             "direct",
+            "direct_run_merge",
             "hbm_pack_serial",
             "hbm_pack_overlap",
             "hbm_pack_demux",
