@@ -23,6 +23,12 @@ cdiv = pl.cdiv
 # hardware (v6e-32GB → ~960MB, v7x-96GB → ~2.9GB) instead of a fixed cap.
 _A2A_HBM_FRACTION = 0.03
 
+# For decode-sized tiles, waiting for gather receives by scanning all global
+# experts is mostly scalar-control overhead. Route-scanning waits once per
+# unique local routed expert and keeps the old full-expert scan for larger
+# tiles where the route scan would be no cheaper.
+_A2A_GATHER_ROUTE_SCAN_MAX_ROUTES = 256
+
 
 @functools.lru_cache(maxsize=1)
 def _device_hbm_bytes() -> int:
@@ -577,6 +583,7 @@ def _fused_ep_moe_kernel(
     disable_shared_expert: bool = False,
     disable_all_reduce_metadata: bool = False,
     disable_sync_barrier: bool = False,
+    disable_a2a_gather_route_wait: bool = False,
     use_jax_allreduce_metadata: bool = True,
     quant_block_k: int | None = None,
     # Kernel tuning params.
@@ -1228,6 +1235,32 @@ def _fused_ep_moe_kernel(
         # We conservatively wait once for every expert that has nonzero tokens
         # routed from `my_id` (local copies for local experts and remote receives
         # for remote experts both signal the same `a2a_gather_sem` on this device).
+        def _wait_by_routes():
+            def _wait_one_route(t_id, _):
+                for k_id in range(top_k):
+                    e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
+                    is_valid = e_id >= 0
+                    e_id_safe = lax.select(is_valid, e_id, jnp.int32(0))
+                    seen = expert_offsets_x2_smem[bt_sem_id, 1, e_id_safe]
+                    sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, e_id_safe]
+                    should_wait = is_valid & (seen == 0) & (sz != 0)
+                    expert_offsets_x2_smem[bt_sem_id, 1, e_id_safe] = lax.select(
+                        is_valid, jnp.int32(-1), seen
+                    )
+
+                    @pl.when(should_wait)
+                    def _():
+                        ref = a2a_g_hbm.at[e_id_safe, pl.ds(0, sz)]
+                        pltpu.make_async_copy(
+                            src_ref=ref,
+                            dst_ref=ref,
+                            sem=a2a_gather_sem,
+                        ).wait()
+
+                return None
+
+            lax.fori_loop(0, bt, _wait_one_route, None, unroll=False)
+
         def _wait_one_expert(e_id, _):
             sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, e_id]
 
@@ -1242,7 +1275,14 @@ def _fused_ep_moe_kernel(
 
             return None
 
-        lax.fori_loop(0, num_experts, _wait_one_expert, None, unroll=False)
+        if (
+            not disable_a2a_gather_route_wait
+            and bt * top_k < num_experts
+            and bt * top_k <= _A2A_GATHER_ROUTE_SCAN_MAX_ROUTES
+        ):
+            _wait_by_routes()
+        else:
+            lax.fori_loop(0, num_experts, _wait_one_expert, None, unroll=False)
 
     def start_fetch_and_wait_se_scales():
         if w1_shared_hbm is None:
@@ -2460,7 +2500,15 @@ def _fused_ep_moe_kernel(
                 def _():
                     for k_id in range(top_k):
                         e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
-                        offset = expert_offsets_x2_smem[bt_sem_id, 1, e_id]
+                        offset_raw = expert_offsets_x2_smem[bt_sem_id, 1, e_id]
+                        if (
+                            not disable_a2a_gather_route_wait
+                            and bt * top_k < num_experts
+                            and bt * top_k <= _A2A_GATHER_ROUTE_SCAN_MAX_ROUTES
+                        ):
+                            offset = lax.select(offset_raw < 0, jnp.int32(0), offset_raw)
+                        else:
+                            offset = offset_raw
                         expert_offsets_x2_smem[bt_sem_id, 1, e_id] = offset + 1
                         pltpu.make_async_copy(
                             src_ref=a2a_g_hbm.at[e_id, pl.ds(offset, 1)],
@@ -3265,6 +3313,7 @@ def jax_allreduce_metadata_by_bt(
         "disable_shared_expert",
         "disable_all_reduce_metadata",
         "disable_sync_barrier",
+        "disable_a2a_gather_route_wait",
         "use_jax_allreduce_metadata",
         "quant_block_k",
         "block_config",
@@ -3302,6 +3351,7 @@ def fused_ep_moe(
     disable_shared_expert: bool = False,
     disable_all_reduce_metadata: bool = False,
     disable_sync_barrier: bool = False,
+    disable_a2a_gather_route_wait: bool = False,
     use_jax_allreduce_metadata: bool = True,
     # Quantization block size along the K (reduction) dimension.  Models with
     # 2D block-wise quantization (block_k, block_n) have their scales expanded
@@ -3595,6 +3645,7 @@ def fused_ep_moe(
                 disable_shared_expert=disable_shared_expert,
                 disable_all_reduce_metadata=disable_all_reduce_metadata,
                 disable_sync_barrier=disable_sync_barrier,
+                disable_a2a_gather_route_wait=disable_a2a_gather_route_wait,
                 use_jax_allreduce_metadata=use_jax_allreduce_metadata,
                 quant_block_k=quant_block_k,
                 bt=bt,

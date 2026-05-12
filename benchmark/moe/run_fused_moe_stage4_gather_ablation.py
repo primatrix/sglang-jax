@@ -68,6 +68,7 @@ def flags(**overrides: str) -> dict[str, str]:
         "FUSED_MOE_BENCHMARK_DISABLE_SHARED_EXPERT": "False",
         "FUSED_MOE_BENCHMARK_DISABLE_ALL_REDUCE_METADATA": "False",
         "FUSED_MOE_BENCHMARK_DISABLE_SYNC_BARRIER": "False",
+        "FUSED_MOE_BENCHMARK_DISABLE_A2A_GATHER_ROUTE_WAIT": "False",
     }
     base.update(overrides)
     return base
@@ -107,6 +108,18 @@ CASE_ENVS = {
     "full_no_gather_no_output": flags(
         FUSED_MOE_BENCHMARK_DISABLE_A2A_GATHER="True",
         FUSED_MOE_BENCHMARK_DISABLE_OUTPUT_ACCUMULATE="True",
+    ),
+    "stage4_gather_only_route_wait_off": flags(
+        **COMM_SKELETON,
+        FUSED_MOE_BENCHMARK_DISABLE_A2A_SCATTER="True",
+        FUSED_MOE_BENCHMARK_DISABLE_A2A_GATHER_ROUTE_WAIT="True",
+    ),
+    "full_no_output_route_wait_off": flags(
+        FUSED_MOE_BENCHMARK_DISABLE_OUTPUT_ACCUMULATE="True",
+        FUSED_MOE_BENCHMARK_DISABLE_A2A_GATHER_ROUTE_WAIT="True",
+    ),
+    "full_route_wait_off": flags(
+        FUSED_MOE_BENCHMARK_DISABLE_A2A_GATHER_ROUTE_WAIT="True",
     ),
 }
 
