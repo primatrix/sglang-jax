@@ -242,6 +242,7 @@ def parse_args() -> argparse.Namespace:
             "vmem_pack_overlap",
             "direct_expert",
             "hbm_expert_pack",
+            "hbm_expert_pack_early",
             "vmem_expert_pack",
         ],
         default=[
@@ -254,6 +255,7 @@ def parse_args() -> argparse.Namespace:
             "vmem_pack_overlap",
             "direct_expert",
             "hbm_expert_pack",
+            "hbm_expert_pack_early",
             "vmem_expert_pack",
         ],
     )

@@ -36,6 +36,12 @@ This benchmark isolates the Stage2 scatter design space:
       HBM pack by (destination, local expert), then one remote DMA per
       destination/expert pair. This avoids receiver demux.
 
+  hbm_expert_pack_early
+      HBM pack by (destination, local expert), but start the remote DMA for a
+      pair as soon as that pair's final packed token is written. This keeps a
+      single token scan and tries to overlap later pack work with earlier remote
+      sends.
+
   vmem_expert_pack
       Streaming per-expert VMEM pack. One small VMEM buffer is reused for each
       destination/expert pair, then sent with VMEM -> remote HBM DMA.
@@ -73,6 +79,7 @@ MODES = (
     "vmem_pack_overlap",
     "direct_expert",
     "hbm_expert_pack",
+    "hbm_expert_pack_early",
     "vmem_expert_pack",
 )
 
@@ -1035,6 +1042,117 @@ def _hbm_expert_pack_scatter_kernel(
     _store_zero(out_hbm, out_vmem, out_sem)
 
 
+def _hbm_expert_pack_early_scatter_kernel(
+    tokens_hbm,
+    pack_hbm,
+    recv_hbm,
+    out_hbm,
+    send_counts_smem,
+    pack_offsets_smem,
+    pack_sems,
+    send_sems,
+    recv_sems,
+    barrier_sem,
+    out_vmem,
+    out_sem,
+    *,
+    local_num_experts: int,
+    top_k: int,
+    fanout: int,
+    dp_axis_name: str,
+    tp_axis_name: str,
+):
+    dp_rank = lax.axis_index(dp_axis_name)
+    tp_rank = lax.axis_index(tp_axis_name)
+    tp_size = lax.axis_size(tp_axis_name)
+    dp_size = lax.axis_size(dp_axis_name)
+    my_id = dp_rank * tp_size + tp_rank
+    num_devices = dp_size * tp_size
+    local_num_tokens = tokens_hbm.shape[0]
+
+    def _mesh_device_id(ep_rank):
+        return (ep_rank // tp_size, ep_rank % tp_size)
+
+    for dst in range(num_devices):
+        for local_e_id in range(local_num_experts):
+            send_counts_smem[dst, local_e_id] = jnp.int32(0)
+            pack_offsets_smem[dst, local_e_id] = jnp.int32(0)
+
+    def _count_body(t_id, _):
+        for k_id in range(top_k):
+            dst = _dest_for(
+                my_id,
+                t_id,
+                jnp.int32(k_id),
+                fanout=fanout,
+                num_devices=num_devices,
+            )
+            local_e_id = _expert_for(
+                t_id,
+                jnp.int32(k_id),
+                local_num_experts=local_num_experts,
+            )
+            send_counts_smem[dst, local_e_id] = send_counts_smem[dst, local_e_id] + jnp.int32(1)
+        return None
+
+    lax.fori_loop(0, local_num_tokens, _count_body, None, unroll=False)
+
+    def _pack_body(t_id, _):
+        for k_id in range(top_k):
+            dst = _dest_for(
+                my_id,
+                t_id,
+                jnp.int32(k_id),
+                fanout=fanout,
+                num_devices=num_devices,
+            )
+            local_e_id = _expert_for(
+                t_id,
+                jnp.int32(k_id),
+                local_num_experts=local_num_experts,
+            )
+            offset = pack_offsets_smem[dst, local_e_id]
+            next_offset = offset + jnp.int32(1)
+            pack_offsets_smem[dst, local_e_id] = next_offset
+            count = send_counts_smem[dst, local_e_id]
+            pltpu.make_async_copy(
+                src_ref=tokens_hbm.at[pl.ds(t_id, 1)],
+                dst_ref=pack_hbm.at[dst, local_e_id, pl.ds(offset, 1)],
+                sem=pack_sems.at[dst, local_e_id],
+            ).start()
+
+            @pl.when(next_offset == count)
+            def _copy_completed_pair(dst=dst, local_e_id=local_e_id, count=count):
+                _wait_dma(pack_hbm.at[dst, local_e_id], pack_sems.at[dst, local_e_id], count)
+                pltpu.make_async_remote_copy(
+                    src_ref=pack_hbm.at[dst, local_e_id, pl.ds(0, count)],
+                    dst_ref=recv_hbm.at[local_e_id, my_id, pl.ds(0, count)],
+                    send_sem=send_sems.at[dst, local_e_id],
+                    recv_sem=recv_sems.at[local_e_id, my_id],
+                    device_id=_mesh_device_id(dst),
+                    device_id_type=pltpu.DeviceIdType.MESH,
+                ).start()
+
+        return None
+
+    lax.fori_loop(0, local_num_tokens, _pack_body, None, unroll=False)
+
+    _wait_expert_remote_by_src(
+        recv_hbm,
+        send_counts_smem,
+        send_sems,
+        recv_sems,
+        my_id=my_id,
+        local_num_tokens=local_num_tokens,
+        local_num_experts=local_num_experts,
+        top_k=top_k,
+        fanout=fanout,
+        num_devices=num_devices,
+    )
+    _sync_barrier(barrier_sem, num_devices=num_devices, tp_size=tp_size)
+    _store_zero(out_hbm, out_vmem, out_sem)
+
+
 def _vmem_expert_pack_scatter_kernel(
     tokens_hbm,
     recv_hbm,
@@ -1380,6 +1498,44 @@ def _make_kernel(
             ),
             name=f"{MARKER}_stage2_scatter_{mode}_fanout{fanout}",
         )
+    elif mode == "hbm_expert_pack_early":
+        pallas_fn = pl.pallas_call(
+            functools.partial(
+                _hbm_expert_pack_early_scatter_kernel,
+                local_num_experts=local_num_experts,
+                top_k=top_k,
+                fanout=fanout,
+                dp_axis_name="data",
+                tp_axis_name="tensor",
+            ),
+            out_shape=out_shape,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=0,
+                in_specs=[
+                    hbm_block_spec,
+                    hbm_block_spec,
+                    hbm_block_spec,
+                ],
+                out_specs=hbm_block_spec,
+                scratch_shapes=[
+                    pltpu.SMEM((ep_size, local_num_experts), jnp.int32),
+                    pltpu.SMEM((ep_size, local_num_experts), jnp.int32),
+                    pltpu.SemaphoreType.DMA((ep_size, local_num_experts)),
+                    pltpu.SemaphoreType.DMA((ep_size, local_num_experts)),
+                    pltpu.SemaphoreType.DMA((local_num_experts, ep_size)),
+                    pltpu.SemaphoreType.BARRIER,
+                    pltpu.VMEM((128,), jnp.float32),
+                    pltpu.SemaphoreType.DMA,
+                ],
+            ),
+            compiler_params=pltpu.CompilerParams(
+                collective_id=0,
+                allow_collective_id_without_custom_barrier=True,
+                has_side_effects=True,
+                vmem_limit_bytes=vmem_limit_bytes,
+            ),
+            name=f"{MARKER}_stage2_scatter_{mode}_fanout{fanout}",
+        )
     elif mode == "vmem_expert_pack":
         pallas_fn = pl.pallas_call(
             functools.partial(
@@ -1451,7 +1607,7 @@ def _make_kernel(
                 pltpu.with_memory_space_constraint(tokens, pltpu.HBM),
                 pltpu.with_memory_space_constraint(recv, pltpu.HBM),
             )
-        if mode == "hbm_expert_pack":
+        if mode in ("hbm_expert_pack", "hbm_expert_pack_early"):
             pack = pl.empty(expert_pack_shape, dtype)
             recv = pl.empty(expert_recv_shape, dtype)
             return pallas_fn(
