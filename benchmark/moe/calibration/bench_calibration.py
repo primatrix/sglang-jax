@@ -23,6 +23,7 @@ from benchmark.moe.calibration import (
     layer1_ffn_pallas_compute,
     layer1_local_dma,
     layer1_shared_expert_compute,
+    layer1_shared_expert_tp_compute,
     layer1_wait,
     layer1_weight_tile_dma,
 )
@@ -45,6 +46,7 @@ SCENARIO_LAYER1_LOCAL_DMA = "layer1_local_dma"
 SCENARIO_LAYER1_FFN_COMPUTE = "layer1_ffn_compute"
 SCENARIO_LAYER1_FFN_PALLAS_COMPUTE = "layer1_ffn_pallas_compute"
 SCENARIO_LAYER1_SHARED_EXPERT_COMPUTE = "layer1_shared_expert_compute"
+SCENARIO_LAYER1_SHARED_EXPERT_TP_COMPUTE = "layer1_shared_expert_tp_compute"
 SCENARIO_LAYER1_WAIT = "layer1_wait"
 SCENARIO_LAYER2_FUSED_MOE_E2E = "layer2_fused_moe_e2e"
 SCENARIOS = (
@@ -61,6 +63,7 @@ SCENARIOS = (
     SCENARIO_LAYER1_FFN_COMPUTE,
     SCENARIO_LAYER1_FFN_PALLAS_COMPUTE,
     SCENARIO_LAYER1_SHARED_EXPERT_COMPUTE,
+    SCENARIO_LAYER1_SHARED_EXPERT_TP_COMPUTE,
     SCENARIO_LAYER1_WAIT,
     SCENARIO_LAYER2_FUSED_MOE_E2E,
 )
@@ -88,6 +91,7 @@ SUITE_V7X8_BF16_FFN_LOOP_CONTEXT = "v7x8_bf16_ffn_loop_context"
 SUITE_V7X8_BF16_FFN_TUNED_FAMILY = "v7x8_bf16_ffn_tuned_family"
 SUITE_V7X8_BF16_FFN_PALLAS_TUNED_FAMILY = "v7x8_bf16_ffn_pallas_tuned_family"
 SUITE_V7X8_BF16_SHARED_EXPERT_TUNED_FAMILY = "v7x8_bf16_shared_expert_tuned_family"
+SUITE_V7X8_BF16_SHARED_EXPERT_TP_DECODE64 = "v7x8_bf16_shared_expert_tp_decode64"
 SUITE_V7X32_BF16_WAIT_PRIMITIVES = "v7x32_bf16_wait_primitives"
 SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG = "v7x32_bf16_fused_moe_e2e_diag"
 SUITES = (
@@ -114,6 +118,7 @@ SUITES = (
     SUITE_V7X8_BF16_FFN_TUNED_FAMILY,
     SUITE_V7X8_BF16_FFN_PALLAS_TUNED_FAMILY,
     SUITE_V7X8_BF16_SHARED_EXPERT_TUNED_FAMILY,
+    SUITE_V7X8_BF16_SHARED_EXPERT_TP_DECODE64,
     SUITE_V7X32_BF16_WAIT_PRIMITIVES,
     SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG,
 )
@@ -767,6 +772,29 @@ PHASE1_SHARED_EXPERT_TUNED_FAMILY_SHAPES: tuple[
     for path, path_class in PHASE1_SHARED_EXPERT_PATH_CLASSES.items()
 )
 
+PHASE1_SHARED_EXPERT_TP_PATH_CLASSES: dict[
+    layer1_shared_expert_tp_compute.SharedExpertTPPath, str
+] = {
+    "se_tp_compute_only": "shared_expert_tp_compute_only",
+    "se_tp_psum_only": "shared_expert_tp_psum_only",
+    "se_tp_compute_plus_psum": "shared_expert_tp_compute_plus_psum",
+}
+
+PHASE1_SHARED_EXPERT_TP_DECODE64_SHAPES: tuple[
+    layer1_shared_expert_tp_compute.SharedExpertTPShape, ...
+] = tuple(
+    layer1_shared_expert_tp_compute.SharedExpertTPShape(
+        path=path,
+        path_class=path_class,
+        num_tokens=64,
+        bt=2,
+        tp_size=tp_size,
+        config_label=f"decode64_bt2_tp{tp_size}",
+    )
+    for tp_size in (1, 2, 4)
+    for path, path_class in PHASE1_SHARED_EXPERT_TP_PATH_CLASSES.items()
+)
+
 PHASE1_WAIT_REPETITIONS = (1, 2, 4, 8, 16)
 
 PHASE1_WAIT_PRIMITIVE_SHAPES: tuple[layer1_wait.WaitShape, ...] = tuple(
@@ -925,6 +953,14 @@ def load_layer1_shared_expert_suite_shapes(
             shapes = tuple(shape for shape in shapes if shape.num_tokens in allowed)
         return shapes
     raise ValueError(f"Unsupported Layer 1 shared expert suite: {suite}")
+
+
+def load_layer1_shared_expert_tp_suite_shapes(
+    suite: str,
+) -> tuple[layer1_shared_expert_tp_compute.SharedExpertTPShape, ...]:
+    if suite == SUITE_V7X8_BF16_SHARED_EXPERT_TP_DECODE64:
+        return PHASE1_SHARED_EXPERT_TP_DECODE64_SHAPES
+    raise ValueError(f"Unsupported Layer 1 shared expert TP suite: {suite}")
 
 
 def load_layer2_fused_moe_e2e_suite_shapes(
@@ -1460,6 +1496,31 @@ def _layer1_shared_expert_rows(
     )
 
 
+def _layer1_shared_expert_tp_rows(
+    suite: str,
+    execution_mode: str,
+    runtime: dict[str, Any],
+    bf_values: tuple[int, ...] | None = None,
+    path_values: tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
+    return layer1_shared_expert_tp_compute.build_rows(
+        suite=suite,
+        shapes=_filter_shapes(
+            load_layer1_shared_expert_tp_suite_shapes(suite), bf_values, path_values
+        ),
+        execution_mode=execution_mode,
+        runtime=runtime,
+        dtype=DTYPE,
+        weight_dtype=WEIGHT_DTYPE,
+        t_packing=T_PACKING,
+        source=_source(),
+        metadata=_suite_metadata_for_runtime(
+            matrix_kind="shared_expert_tp_compute",
+            target_runtime=TARGET_RUNTIME_V7X8,
+        ),
+    )
+
+
 def _layer1_wait_rows(
     suite: str,
     execution_mode: str,
@@ -1503,6 +1564,7 @@ def resolve_execution_mode(scenario: str, requested: str, runtime: dict[str, Any
         SCENARIO_LAYER0_A2A_ENVELOPE,
         SCENARIO_LAYER1_FFN_COMPUTE,
         SCENARIO_LAYER1_SHARED_EXPERT_COMPUTE,
+        SCENARIO_LAYER1_SHARED_EXPERT_TP_COMPUTE,
         SCENARIO_LAYER2_FUSED_MOE_E2E,
     ):
         return "jax_trace"
@@ -1551,6 +1613,8 @@ def build_rows(
         )
     if scenario == SCENARIO_LAYER1_SHARED_EXPERT_COMPUTE:
         return _layer1_shared_expert_rows(suite, resolved_mode, runtime, bf_values, path_values)
+    if scenario == SCENARIO_LAYER1_SHARED_EXPERT_TP_COMPUTE:
+        return _layer1_shared_expert_tp_rows(suite, resolved_mode, runtime, bf_values, path_values)
     if scenario == SCENARIO_LAYER1_WAIT:
         return _layer1_wait_rows(suite, resolved_mode, runtime, bf_values, path_values)
     if scenario == SCENARIO_LAYER2_FUSED_MOE_E2E:
