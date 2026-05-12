@@ -28,6 +28,18 @@ This benchmark isolates the Stage2 scatter design space:
       Same as vmem_pack, but with two VMEM pack buffers so remote DMA for
       dst=N can overlap with VMEM packing for dst=N+1.
 
+  direct_expert
+      token-wise HBM -> remote HBM scatter, but preserving the real fused MoE
+      receiver layout: remote buffers are split by local expert.
+
+  hbm_expert_pack
+      HBM pack by (destination, local expert), then one remote DMA per
+      destination/expert pair. This avoids receiver demux.
+
+  vmem_expert_pack
+      Streaming per-expert VMEM pack. One small VMEM buffer is reused for each
+      destination/expert pair, then sent with VMEM -> remote HBM DMA.
+
 The routing pattern is deterministic and intentionally controlled by fanout, so
 the same script can run on EP=8/32/64 without model weights.
 """
@@ -59,6 +71,9 @@ MODES = (
     "hbm_pack_demux",
     "vmem_pack",
     "vmem_pack_overlap",
+    "direct_expert",
+    "hbm_expert_pack",
+    "vmem_expert_pack",
 )
 
 
@@ -74,6 +89,10 @@ def _dest_for(src_rank, t_id, k_id, *, fanout: int, num_devices: int):
     # caller to [1, num_devices - 1].
     lane = (t_id + k_id) % jnp.int32(fanout)
     return (src_rank + jnp.int32(1) + lane) % jnp.int32(num_devices)
+
+
+def _expert_for(t_id, k_id, *, local_num_experts: int):
+    return (t_id + k_id) % jnp.int32(local_num_experts)
 
 
 def _compute_send_counts(
@@ -122,6 +141,41 @@ def _recv_count_from_src(
                 num_devices=num_devices,
             )
             count += lax.select(dst == my_id, jnp.int32(1), jnp.int32(0))
+        return count
+
+    return lax.fori_loop(0, local_num_tokens, _token_body, jnp.int32(0), unroll=False)
+
+
+def _recv_count_expert_from_src(
+    src_rank,
+    local_e_id,
+    *,
+    my_id,
+    local_num_tokens: int,
+    local_num_experts: int,
+    top_k: int,
+    fanout: int,
+    num_devices: int,
+):
+    def _token_body(t_id, count):
+        for k_id in range(top_k):
+            dst = _dest_for(
+                src_rank,
+                t_id,
+                jnp.int32(k_id),
+                fanout=fanout,
+                num_devices=num_devices,
+            )
+            expert = _expert_for(
+                t_id,
+                jnp.int32(k_id),
+                local_num_experts=local_num_experts,
+            )
+            count += lax.select(
+                (dst == my_id) & (expert == local_e_id),
+                jnp.int32(1),
+                jnp.int32(0),
+            )
         return count
 
     return lax.fori_loop(0, local_num_tokens, _token_body, jnp.int32(0), unroll=False)
@@ -761,12 +815,346 @@ def _vmem_pack_scatter_kernel(
     _store_zero(out_hbm, out_vmem, out_sem)
 
 
+def _wait_expert_remote_by_src(
+    recv_hbm,
+    send_counts_smem,
+    send_sems,
+    recv_sems,
+    *,
+    my_id,
+    local_num_tokens: int,
+    local_num_experts: int,
+    top_k: int,
+    fanout: int,
+    num_devices: int,
+):
+    total_pairs = num_devices * local_num_experts
+
+    def _recv_pair_body(pair_id, _):
+        local_e_id = pair_id // jnp.int32(num_devices)
+        src = pair_id - local_e_id * jnp.int32(num_devices)
+        recv_count = _recv_count_expert_from_src(
+            src,
+            local_e_id,
+            my_id=my_id,
+            local_num_tokens=local_num_tokens,
+            local_num_experts=local_num_experts,
+            top_k=top_k,
+            fanout=fanout,
+            num_devices=num_devices,
+        )
+        _wait_dma(recv_hbm.at[local_e_id, src], recv_sems.at[local_e_id, src], recv_count)
+        return None
+
+    lax.fori_loop(0, jnp.int32(total_pairs), _recv_pair_body, None, unroll=False)
+
+    def _send_pair_body(pair_id, _):
+        dst = pair_id // jnp.int32(local_num_experts)
+        local_e_id = pair_id - dst * jnp.int32(local_num_experts)
+        send_count = send_counts_smem[dst, local_e_id]
+        _wait_dma(recv_hbm.at[0, 0], send_sems.at[dst, local_e_id], send_count)
+        return None
+
+    lax.fori_loop(0, jnp.int32(total_pairs), _send_pair_body, None, unroll=False)
+
+
+def _direct_expert_scatter_kernel(
+    tokens_hbm,
+    recv_hbm,
+    out_hbm,
+    send_counts_smem,
+    send_sems,
+    recv_sems,
+    barrier_sem,
+    out_vmem,
+    out_sem,
+    *,
+    local_num_experts: int,
+    top_k: int,
+    fanout: int,
+    dp_axis_name: str,
+    tp_axis_name: str,
+):
+    dp_rank = lax.axis_index(dp_axis_name)
+    tp_rank = lax.axis_index(tp_axis_name)
+    tp_size = lax.axis_size(tp_axis_name)
+    dp_size = lax.axis_size(dp_axis_name)
+    my_id = dp_rank * tp_size + tp_rank
+    num_devices = dp_size * tp_size
+    local_num_tokens = tokens_hbm.shape[0]
+
+    def _mesh_device_id(ep_rank):
+        return (ep_rank // tp_size, ep_rank % tp_size)
+
+    for dst in range(num_devices):
+        for local_e_id in range(local_num_experts):
+            send_counts_smem[dst, local_e_id] = jnp.int32(0)
+
+    def _token_body(t_id, _):
+        for k_id in range(top_k):
+            dst = _dest_for(
+                my_id,
+                t_id,
+                jnp.int32(k_id),
+                fanout=fanout,
+                num_devices=num_devices,
+            )
+            local_e_id = _expert_for(
+                t_id,
+                jnp.int32(k_id),
+                local_num_experts=local_num_experts,
+            )
+            offset = send_counts_smem[dst, local_e_id]
+            send_counts_smem[dst, local_e_id] = offset + jnp.int32(1)
+            pltpu.make_async_remote_copy(
+                src_ref=tokens_hbm.at[pl.ds(t_id, 1)],
+                dst_ref=recv_hbm.at[local_e_id, my_id, pl.ds(offset, 1)],
+                send_sem=send_sems.at[dst, local_e_id],
+                recv_sem=recv_sems.at[local_e_id, my_id],
+                device_id=_mesh_device_id(dst),
+                device_id_type=pltpu.DeviceIdType.MESH,
+            ).start()
+        return None
+
+    lax.fori_loop(0, local_num_tokens, _token_body, None, unroll=False)
+
+    _wait_expert_remote_by_src(
+        recv_hbm,
+        send_counts_smem,
+        send_sems,
+        recv_sems,
+        my_id=my_id,
+        local_num_tokens=local_num_tokens,
+        local_num_experts=local_num_experts,
+        top_k=top_k,
+        fanout=fanout,
+        num_devices=num_devices,
+    )
+    _sync_barrier(barrier_sem, num_devices=num_devices, tp_size=tp_size)
+    _store_zero(out_hbm, out_vmem, out_sem)
+
+
+def _hbm_expert_pack_scatter_kernel(
+    tokens_hbm,
+    pack_hbm,
+    recv_hbm,
+    out_hbm,
+    send_counts_smem,
+    pack_offsets_smem,
+    pack_sems,
+    send_sems,
+    recv_sems,
+    barrier_sem,
+    out_vmem,
+    out_sem,
+    *,
+    local_num_experts: int,
+    top_k: int,
+    fanout: int,
+    dp_axis_name: str,
+    tp_axis_name: str,
+):
+    dp_rank = lax.axis_index(dp_axis_name)
+    tp_rank = lax.axis_index(tp_axis_name)
+    tp_size = lax.axis_size(tp_axis_name)
+    dp_size = lax.axis_size(dp_axis_name)
+    my_id = dp_rank * tp_size + tp_rank
+    num_devices = dp_size * tp_size
+    local_num_tokens = tokens_hbm.shape[0]
+
+    def _mesh_device_id(ep_rank):
+        return (ep_rank // tp_size, ep_rank % tp_size)
+
+    for dst in range(num_devices):
+        for local_e_id in range(local_num_experts):
+            send_counts_smem[dst, local_e_id] = jnp.int32(0)
+            pack_offsets_smem[dst, local_e_id] = jnp.int32(0)
+
+    def _pack_body(t_id, _):
+        for k_id in range(top_k):
+            dst = _dest_for(
+                my_id,
+                t_id,
+                jnp.int32(k_id),
+                fanout=fanout,
+                num_devices=num_devices,
+            )
+            local_e_id = _expert_for(
+                t_id,
+                jnp.int32(k_id),
+                local_num_experts=local_num_experts,
+            )
+            offset = pack_offsets_smem[dst, local_e_id]
+            pack_offsets_smem[dst, local_e_id] = offset + jnp.int32(1)
+            send_counts_smem[dst, local_e_id] = offset + jnp.int32(1)
+            pltpu.make_async_copy(
+                src_ref=tokens_hbm.at[pl.ds(t_id, 1)],
+                dst_ref=pack_hbm.at[dst, local_e_id, pl.ds(offset, 1)],
+                sem=pack_sems.at[dst, local_e_id],
+            ).start()
+        return None
+
+    lax.fori_loop(0, local_num_tokens, _pack_body, None, unroll=False)
+
+    total_pairs = num_devices * local_num_experts
+
+    def _remote_pair_body(pair_id, _):
+        dst = pair_id // jnp.int32(local_num_experts)
+        local_e_id = pair_id - dst * jnp.int32(local_num_experts)
+        count = send_counts_smem[dst, local_e_id]
+        _wait_dma(pack_hbm.at[dst, local_e_id], pack_sems.at[dst, local_e_id], count)
+
+        @pl.when(count != 0)
+        def _copy_to_dst(dst=dst, local_e_id=local_e_id, count=count):
+            pltpu.make_async_remote_copy(
+                src_ref=pack_hbm.at[dst, local_e_id, pl.ds(0, count)],
+                dst_ref=recv_hbm.at[local_e_id, my_id, pl.ds(0, count)],
+                send_sem=send_sems.at[dst, local_e_id],
+                recv_sem=recv_sems.at[local_e_id, my_id],
+                device_id=_mesh_device_id(dst),
+                device_id_type=pltpu.DeviceIdType.MESH,
+            ).start()
+
+        return None
+
+    lax.fori_loop(0, jnp.int32(total_pairs), _remote_pair_body, None, unroll=False)
+
+    _wait_expert_remote_by_src(
+        recv_hbm,
+        send_counts_smem,
+        send_sems,
+        recv_sems,
+        my_id=my_id,
+        local_num_tokens=local_num_tokens,
+        local_num_experts=local_num_experts,
+        top_k=top_k,
+        fanout=fanout,
+        num_devices=num_devices,
+    )
+    _sync_barrier(barrier_sem, num_devices=num_devices, tp_size=tp_size)
+    _store_zero(out_hbm, out_vmem, out_sem)
+
+
+def _vmem_expert_pack_scatter_kernel(
+    tokens_hbm,
+    recv_hbm,
+    out_hbm,
+    send_counts_smem,
+    pack_count_smem,
+    pack_vmem,
+    pack_sem,
+    send_sem,
+    recv_sems,
+    barrier_sem,
+    out_vmem,
+    out_sem,
+    *,
+    local_num_experts: int,
+    top_k: int,
+    fanout: int,
+    dp_axis_name: str,
+    tp_axis_name: str,
+):
+    dp_rank = lax.axis_index(dp_axis_name)
+    tp_rank = lax.axis_index(tp_axis_name)
+    tp_size = lax.axis_size(tp_axis_name)
+    dp_size = lax.axis_size(dp_axis_name)
+    my_id = dp_rank * tp_size + tp_rank
+    num_devices = dp_size * tp_size
+    local_num_tokens = tokens_hbm.shape[0]
+
+    def _mesh_device_id(ep_rank):
+        return (ep_rank // tp_size, ep_rank % tp_size)
+
+    for dst in range(num_devices):
+        for local_e_id in range(local_num_experts):
+            send_counts_smem[dst, local_e_id] = jnp.int32(0)
+
+    total_pairs = num_devices * local_num_experts
+
+    def _pair_body(pair_id, _):
+        dst = pair_id // jnp.int32(local_num_experts)
+        local_e_id = pair_id - dst * jnp.int32(local_num_experts)
+        pack_count_smem[0] = jnp.int32(0)
+
+        def _pack_token_body(t_id, _):
+            for k_id in range(top_k):
+                route_dst = _dest_for(
+                    my_id,
+                    t_id,
+                    jnp.int32(k_id),
+                    fanout=fanout,
+                    num_devices=num_devices,
+                )
+                route_expert = _expert_for(
+                    t_id,
+                    jnp.int32(k_id),
+                    local_num_experts=local_num_experts,
+                )
+                should_pack = (route_dst == dst) & (route_expert == local_e_id)
+
+                @pl.when(should_pack)
+                def _copy_one(t_id=t_id):
+                    offset = pack_count_smem[0]
+                    pack_count_smem[0] = offset + jnp.int32(1)
+                    pltpu.make_async_copy(
+                        src_ref=tokens_hbm.at[pl.ds(t_id, 1)],
+                        dst_ref=pack_vmem.at[pl.ds(offset, 1)],
+                        sem=pack_sem,
+                    ).start()
+
+            return None
+
+        lax.fori_loop(0, local_num_tokens, _pack_token_body, None, unroll=False)
+
+        count = pack_count_smem[0]
+        send_counts_smem[dst, local_e_id] = count
+        _wait_dma(pack_vmem, pack_sem, count)
+
+        @pl.when(count != 0)
+        def _copy_to_dst(dst=dst, local_e_id=local_e_id, count=count):
+            pltpu.make_async_remote_copy(
+                src_ref=pack_vmem.at[pl.ds(0, count)],
+                dst_ref=recv_hbm.at[local_e_id, my_id, pl.ds(0, count)],
+                send_sem=send_sem,
+                recv_sem=recv_sems.at[local_e_id, my_id],
+                device_id=_mesh_device_id(dst),
+                device_id_type=pltpu.DeviceIdType.MESH,
+            ).start()
+            _wait_dma(pack_vmem, send_sem, count)
+
+        return None
+
+    lax.fori_loop(0, jnp.int32(total_pairs), _pair_body, None, unroll=False)
+
+    def _recv_pair_body(pair_id, _):
+        local_e_id = pair_id // jnp.int32(num_devices)
+        src = pair_id - local_e_id * jnp.int32(num_devices)
+        recv_count = _recv_count_expert_from_src(
+            src,
+            local_e_id,
+            my_id=my_id,
+            local_num_tokens=local_num_tokens,
+            local_num_experts=local_num_experts,
+            top_k=top_k,
+            fanout=fanout,
+            num_devices=num_devices,
+        )
+        _wait_dma(recv_hbm.at[local_e_id, src], recv_sems.at[local_e_id, src], recv_count)
+        return None
+
+    lax.fori_loop(0, jnp.int32(total_pairs), _recv_pair_body, None, unroll=False)
+    _sync_barrier(barrier_sem, num_devices=num_devices, tp_size=tp_size)
+    _store_zero(out_hbm, out_vmem, out_sem)
+
+
 def _make_kernel(
     *,
     mode: str,
     mesh: jax.sharding.Mesh,
     global_tokens: int,
     hidden_size: int,
+    num_experts: int,
     top_k: int,
     fanout: int,
     dtype: jnp.dtype,
@@ -775,13 +1163,32 @@ def _make_kernel(
     ep_size = mesh.shape["tensor"] * mesh.shape["data"]
     if global_tokens % ep_size:
         raise ValueError(f"Expected {global_tokens=} divisible by {ep_size=}.")
+    if num_experts % ep_size:
+        raise ValueError(f"Expected {num_experts=} divisible by {ep_size=}.")
     local_tokens = global_tokens // ep_size
+    local_num_experts = num_experts // ep_size
     t_packing = _dtype_packing(dtype)
     if hidden_size % t_packing:
         raise ValueError(f"Expected {hidden_size=} aligned to {t_packing=}.")
     hidden_per_pack = hidden_size // t_packing
     max_copies_per_peer = local_tokens * top_k
+    expert_capacity = math.ceil(max_copies_per_peer / local_num_experts) + top_k
     hbm_shape = (ep_size, max_copies_per_peer, t_packing, hidden_per_pack)
+    expert_recv_shape = (
+        local_num_experts,
+        ep_size,
+        expert_capacity,
+        t_packing,
+        hidden_per_pack,
+    )
+    expert_pack_shape = (
+        ep_size,
+        local_num_experts,
+        expert_capacity,
+        t_packing,
+        hidden_per_pack,
+    )
+    expert_vmem_pack_shape = (expert_capacity, t_packing, hidden_per_pack)
     vmem_pack_shape = (2, max_copies_per_peer, t_packing, hidden_per_pack)
     hbm_block_spec = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     out_shape = jax.ShapeDtypeStruct((128,), jnp.float32)
@@ -900,6 +1307,117 @@ def _make_kernel(
             ),
             name=f"{MARKER}_stage2_scatter_{mode}_fanout{fanout}",
         )
+    elif mode == "direct_expert":
+        pallas_fn = pl.pallas_call(
+            functools.partial(
+                _direct_expert_scatter_kernel,
+                local_num_experts=local_num_experts,
+                top_k=top_k,
+                fanout=fanout,
+                dp_axis_name="data",
+                tp_axis_name="tensor",
+            ),
+            out_shape=out_shape,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=0,
+                in_specs=[
+                    hbm_block_spec,
+                    hbm_block_spec,
+                ],
+                out_specs=hbm_block_spec,
+                scratch_shapes=[
+                    pltpu.SMEM((ep_size, local_num_experts), jnp.int32),
+                    pltpu.SemaphoreType.DMA((ep_size, local_num_experts)),
+                    pltpu.SemaphoreType.DMA((local_num_experts, ep_size)),
+                    pltpu.SemaphoreType.BARRIER,
+                    pltpu.VMEM((128,), jnp.float32),
+                    pltpu.SemaphoreType.DMA,
+                ],
+            ),
+            compiler_params=pltpu.CompilerParams(
+                collective_id=0,
+                allow_collective_id_without_custom_barrier=True,
+                has_side_effects=True,
+                vmem_limit_bytes=vmem_limit_bytes,
+            ),
+            name=f"{MARKER}_stage2_scatter_{mode}_fanout{fanout}",
+        )
+    elif mode == "hbm_expert_pack":
+        pallas_fn = pl.pallas_call(
+            functools.partial(
+                _hbm_expert_pack_scatter_kernel,
+                local_num_experts=local_num_experts,
+                top_k=top_k,
+                fanout=fanout,
+                dp_axis_name="data",
+                tp_axis_name="tensor",
+            ),
+            out_shape=out_shape,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=0,
+                in_specs=[
+                    hbm_block_spec,
+                    hbm_block_spec,
+                    hbm_block_spec,
+                ],
+                out_specs=hbm_block_spec,
+                scratch_shapes=[
+                    pltpu.SMEM((ep_size, local_num_experts), jnp.int32),
+                    pltpu.SMEM((ep_size, local_num_experts), jnp.int32),
+                    pltpu.SemaphoreType.DMA((ep_size, local_num_experts)),
+                    pltpu.SemaphoreType.DMA((ep_size, local_num_experts)),
+                    pltpu.SemaphoreType.DMA((local_num_experts, ep_size)),
+                    pltpu.SemaphoreType.BARRIER,
+                    pltpu.VMEM((128,), jnp.float32),
+                    pltpu.SemaphoreType.DMA,
+                ],
+            ),
+            compiler_params=pltpu.CompilerParams(
+                collective_id=0,
+                allow_collective_id_without_custom_barrier=True,
+                has_side_effects=True,
+                vmem_limit_bytes=vmem_limit_bytes,
+            ),
+            name=f"{MARKER}_stage2_scatter_{mode}_fanout{fanout}",
+        )
+    elif mode == "vmem_expert_pack":
+        pallas_fn = pl.pallas_call(
+            functools.partial(
+                _vmem_expert_pack_scatter_kernel,
+                local_num_experts=local_num_experts,
+                top_k=top_k,
+                fanout=fanout,
+                dp_axis_name="data",
+                tp_axis_name="tensor",
+            ),
+            out_shape=out_shape,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=0,
+                in_specs=[
+                    hbm_block_spec,
+                    hbm_block_spec,
+                ],
+                out_specs=hbm_block_spec,
+                scratch_shapes=[
+                    pltpu.SMEM((ep_size, local_num_experts), jnp.int32),
+                    pltpu.SMEM((1,), jnp.int32),
+                    pltpu.VMEM(expert_vmem_pack_shape, dtype),
+                    pltpu.SemaphoreType.DMA,
+                    pltpu.SemaphoreType.DMA,
+                    pltpu.SemaphoreType.DMA((local_num_experts, ep_size)),
+                    pltpu.SemaphoreType.BARRIER,
+                    pltpu.VMEM((128,), jnp.float32),
+                    pltpu.SemaphoreType.DMA,
+                ],
+            ),
+            compiler_params=pltpu.CompilerParams(
+                collective_id=0,
+                allow_collective_id_without_custom_barrier=True,
+                has_side_effects=True,
+                vmem_limit_bytes=vmem_limit_bytes,
+            ),
+            name=f"{MARKER}_stage2_scatter_{mode}_fanout{fanout}",
+        )
     else:
         raise ValueError(f"Unsupported {mode=}.")
 
@@ -926,6 +1444,26 @@ def _make_kernel(
                 pltpu.with_memory_space_constraint(pack, pltpu.HBM),
                 pltpu.with_memory_space_constraint(recv, pltpu.HBM),
                 pltpu.with_memory_space_constraint(demux, pltpu.HBM),
+            )
+        if mode == "direct_expert":
+            recv = pl.empty(expert_recv_shape, dtype)
+            return pallas_fn(
+                pltpu.with_memory_space_constraint(tokens, pltpu.HBM),
+                pltpu.with_memory_space_constraint(recv, pltpu.HBM),
+            )
+        if mode == "hbm_expert_pack":
+            pack = pl.empty(expert_pack_shape, dtype)
+            recv = pl.empty(expert_recv_shape, dtype)
+            return pallas_fn(
+                pltpu.with_memory_space_constraint(tokens, pltpu.HBM),
+                pltpu.with_memory_space_constraint(pack, pltpu.HBM),
+                pltpu.with_memory_space_constraint(recv, pltpu.HBM),
+            )
+        if mode == "vmem_expert_pack":
+            recv = pl.empty(expert_recv_shape, dtype)
+            return pallas_fn(
+                pltpu.with_memory_space_constraint(tokens, pltpu.HBM),
+                pltpu.with_memory_space_constraint(recv, pltpu.HBM),
             )
         recv = pl.empty(hbm_shape, dtype)
         return pallas_fn(
@@ -989,6 +1527,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--num-tokens", nargs="+", type=int, default=[512, 8192])
     parser.add_argument("--hidden-size", type=int, default=8192)
+    parser.add_argument("--num-experts", type=int, default=256)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument(
         "--fanout",
@@ -1029,7 +1568,8 @@ def main() -> None:
         "stage2 scatter pack benchmark: "
         f"process={jax.process_index()}/{jax.process_count()}, "
         f"local_devices={len(jax.local_devices())}, global_devices={len(jax.devices())}, "
-        f"ep_size={args.ep_size}, hidden_size={args.hidden_size}, top_k={args.top_k}, "
+        f"ep_size={args.ep_size}, hidden_size={args.hidden_size}, "
+        f"num_experts={args.num_experts}, top_k={args.top_k}, "
         f"vmem_limit_mb={args.vmem_limit_mb}"
     )
 
@@ -1049,6 +1589,7 @@ def main() -> None:
                         mesh=mesh,
                         global_tokens=tokens,
                         hidden_size=args.hidden_size,
+                        num_experts=args.num_experts,
                         top_k=args.top_k,
                         fanout=fanout,
                         dtype=dtype,

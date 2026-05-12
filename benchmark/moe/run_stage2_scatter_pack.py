@@ -116,6 +116,8 @@ def bench_args(args: argparse.Namespace, group: dict[str, object], rank: int, di
         *args.num_tokens,
         "--hidden-size",
         args.hidden_size,
+        "--num-experts",
+        args.num_experts,
         "--top-k",
         args.top_k,
         "--fanout",
@@ -224,6 +226,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--groups", nargs="+", choices=sorted(GROUPS), default=["ep8"])
     parser.add_argument("--num-tokens", nargs="+", type=int, default=[512, 8192])
     parser.add_argument("--hidden-size", type=int, default=8192)
+    parser.add_argument("--num-experts", type=int, default=256)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--fanout", nargs="+", type=int, default=[1, 4, 8])
     parser.add_argument(
@@ -237,6 +240,9 @@ def parse_args() -> argparse.Namespace:
             "hbm_pack_demux",
             "vmem_pack",
             "vmem_pack_overlap",
+            "direct_expert",
+            "hbm_expert_pack",
+            "vmem_expert_pack",
         ],
         default=[
             "direct",
@@ -246,6 +252,9 @@ def parse_args() -> argparse.Namespace:
             "hbm_pack_demux",
             "vmem_pack",
             "vmem_pack_overlap",
+            "direct_expert",
+            "hbm_expert_pack",
+            "vmem_expert_pack",
         ],
     )
     parser.add_argument("--iters", type=int, default=5)
