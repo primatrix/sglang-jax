@@ -713,6 +713,10 @@ PHASE1_FFN_PALLAS_PATH_CLASSES: dict[layer1_ffn_pallas_compute.FFNPallasPath, st
     "dynamic_ffn1_accumulate": "ffn1_pallas_accumulate",
     "dynamic_ffn2_first": "ffn2_pallas_first",
     "dynamic_ffn2_later": "ffn2_pallas_later",
+    "dynamic_ffn1_whole_init": "ffn1_pallas_whole_init",
+    "dynamic_ffn1_whole_accumulate": "ffn1_pallas_whole_accumulate",
+    "dynamic_ffn2_whole_first": "ffn2_pallas_whole_first",
+    "dynamic_ffn2_whole_later": "ffn2_pallas_whole_later",
 }
 
 PHASE1_FFN_PALLAS_TUNED_FAMILY_SHAPES: tuple[layer1_ffn_pallas_compute.FFNPallasShape, ...] = tuple(

@@ -38,6 +38,10 @@ FFNPallasPath = Literal[
     "dynamic_ffn1_accumulate",
     "dynamic_ffn2_first",
     "dynamic_ffn2_later",
+    "dynamic_ffn1_whole_init",
+    "dynamic_ffn1_whole_accumulate",
+    "dynamic_ffn2_whole_first",
+    "dynamic_ffn2_whole_later",
 ]
 
 
@@ -235,17 +239,13 @@ def _metadata_for_shape(
             "local_accumulator_hbm_rmw",
         ],
         "loop_context": {
-            "measurement_scope": "single_dynamic_ffn_weight_tile",
+            "measurement_scope": _measurement_scope(shape),
             "num_bts_tiles": _ceil_div(shape.dyn_sz, shape.bts) if shape.dyn_sz > 0 else 0,
             "num_btc_tiles": _ceil_div(shape.dyn_sz, shape.btc) if shape.dyn_sz > 0 else 0,
             "num_bd1": _ceil_div(shape.hidden_size, shape.bd1),
             "num_bd2": _ceil_div(shape.hidden_size, shape.bd2),
-            "measured_bd1_tiles": (
-                1 if shape.path in ("dynamic_ffn1_init", "dynamic_ffn1_accumulate") else 0
-            ),
-            "measured_bd2_tiles": (
-                1 if shape.path in ("dynamic_ffn2_first", "dynamic_ffn2_later") else 0
-            ),
+            "measured_bd1_tiles": _measured_bd1_tiles(shape),
+            "measured_bd2_tiles": _measured_bd2_tiles(shape),
             "num_bf": _ceil_div(shape.intermediate_size, shape.bf),
             "num_bfc": _ceil_div(shape.bf, shape.bfc),
             "pallas_aligned": True,
@@ -290,18 +290,23 @@ def _measure_ffn_pallas_ms(
 
 def _make_inputs(shape: FFNPallasShape, *, jnp: Any) -> tuple[Any, ...]:
     dyn = _effective_rows(shape)
+    h_per_pack = shape.hidden_size // shape.t_packing
     bd1_per_pack = shape.bd1 // shape.t_packing
     bd2_per_pack = shape.bd2 // shape.t_packing
-    if shape.path in ("dynamic_ffn1_init", "dynamic_ffn1_accumulate"):
+    if _is_ffn1(shape):
+        input_width = h_per_pack if _is_whole(shape) else bd1_per_pack
         tokens = jnp.ones((dyn, shape.t_packing, bd1_per_pack), dtype=jnp.bfloat16)
-        w1 = jnp.ones((shape.t_packing, bd1_per_pack, shape.bf), dtype=jnp.bfloat16)
-        w3 = jnp.ones((shape.t_packing, bd1_per_pack, shape.bf), dtype=jnp.bfloat16)
+        if _is_whole(shape):
+            tokens = jnp.ones((dyn, shape.t_packing, input_width), dtype=jnp.bfloat16)
+        w1 = jnp.ones((shape.t_packing, input_width, shape.bf), dtype=jnp.bfloat16)
+        w3 = jnp.ones((shape.t_packing, input_width, shape.bf), dtype=jnp.bfloat16)
         acc = jnp.ones((2, dyn, shape.bf), dtype=jnp.float32)
         return tokens, w1, w3, acc
     acc1 = jnp.ones((dyn, shape.bf), dtype=jnp.float32)
     acc3 = jnp.ones((dyn, shape.bf), dtype=jnp.float32)
-    w2 = jnp.ones((shape.t_packing, shape.bf, bd2_per_pack), dtype=jnp.bfloat16)
-    res = jnp.ones((dyn, shape.t_packing, bd2_per_pack), dtype=jnp.bfloat16)
+    output_width = h_per_pack if _is_whole(shape) else bd2_per_pack
+    w2 = jnp.ones((shape.t_packing, shape.bf, output_width), dtype=jnp.bfloat16)
+    res = jnp.ones((dyn, shape.t_packing, output_width), dtype=jnp.bfloat16)
     return acc1, acc3, w2, res
 
 
@@ -310,18 +315,23 @@ def _pallas_ffn_call(shape: FFNPallasShape, arrays: tuple[Any, ...], *, jax: Any
     from jax.experimental.pallas import tpu as pltpu
 
     dyn = _effective_rows(shape)
+    h_per_pack = shape.hidden_size // shape.t_packing
+    bd1_per_pack = shape.bd1 // shape.t_packing
     bd1c_per_pack = shape.bd1c // shape.t_packing
     bd2_per_pack = shape.bd2 // shape.t_packing
     bd2c_per_pack = shape.bd2c // shape.t_packing
+    num_bd1 = _ceil_div(shape.hidden_size, shape.bd1)
+    num_bd2 = _ceil_div(shape.hidden_size, shape.bd2)
     num_bd1c = _ceil_div(shape.bd1, shape.bd1c)
     num_bd2c = _ceil_div(shape.bd2, shape.bd2c)
     num_bfc = _ceil_div(shape.bf, shape.bfc)
     num_loops = _ceil_div(shape.dyn_sz, shape.btc) if shape.dyn_sz > 0 else 0
     num_token_tiles = _ceil_div(shape.dyn_sz, shape.bts) if shape.dyn_sz > 0 else 0
 
-    if shape.path in ("dynamic_ffn1_init", "dynamic_ffn1_accumulate"):
+    if _is_ffn1(shape):
         tokens, w1, w3, acc = arrays
-        should_init = shape.path == "dynamic_ffn1_init"
+        should_init = shape.path in ("dynamic_ffn1_init", "dynamic_ffn1_whole_init")
+        bd1_outer_loops = num_bd1 if _is_whole(shape) else 1
 
         def kernel(tokens_ref, w1_ref, w3_ref, acc_ref, out_ref, acc1_vmem, acc3_vmem):
             if should_init:
@@ -333,30 +343,32 @@ def _pallas_ffn_call(shape: FFNPallasShape, arrays: tuple[Any, ...], *, jax: Any
 
             for btc_id in range(num_loops):
                 token_slice = pl.ds(btc_id * shape.btc, shape.btc)
-                for bd1c_id in range(num_bd1c):
-                    k_slice = pl.ds(bd1c_id * bd1c_per_pack, bd1c_per_pack)
-                    for p_id in range(shape.t_packing):
-                        t = tokens_ref[token_slice, p_id, k_slice]
-                        for bfc_id in range(num_bfc):
-                            f_slice = pl.ds(bfc_id * shape.bfc, shape.bfc)
-                            w_slice = (
-                                p_id,
-                                k_slice,
-                                f_slice,
-                            )
-                            d1 = jnp.dot(
-                                t,
-                                w1_ref[w_slice],
-                                preferred_element_type=jnp.float32,
-                            )
-                            d3 = jnp.dot(
-                                t,
-                                w3_ref[w_slice],
-                                preferred_element_type=jnp.float32,
-                            )
-                            out_slice = (token_slice, f_slice)
-                            acc1_vmem[out_slice] += d1
-                            acc3_vmem[out_slice] += d3
+                for bd1_id in range(bd1_outer_loops):
+                    bd1_base = bd1_id * bd1_per_pack
+                    for bd1c_id in range(num_bd1c):
+                        k_slice = pl.ds(bd1_base + bd1c_id * bd1c_per_pack, bd1c_per_pack)
+                        for p_id in range(shape.t_packing):
+                            t = tokens_ref[token_slice, p_id, k_slice]
+                            for bfc_id in range(num_bfc):
+                                f_slice = pl.ds(bfc_id * shape.bfc, shape.bfc)
+                                w_slice = (
+                                    p_id,
+                                    k_slice,
+                                    f_slice,
+                                )
+                                d1 = jnp.dot(
+                                    t,
+                                    w1_ref[w_slice],
+                                    preferred_element_type=jnp.float32,
+                                )
+                                d3 = jnp.dot(
+                                    t,
+                                    w3_ref[w_slice],
+                                    preferred_element_type=jnp.float32,
+                                )
+                                out_slice = (token_slice, f_slice)
+                                acc1_vmem[out_slice] += d1
+                                acc3_vmem[out_slice] += d3
             out_ref[0] = acc1_vmem[...]
             out_ref[1] = acc3_vmem[...]
 
@@ -383,7 +395,9 @@ def _pallas_ffn_call(shape: FFNPallasShape, arrays: tuple[Any, ...], *, jax: Any
         )(tokens, w1, w3, acc)
 
     acc1, acc3, w2, res = arrays
-    should_init = shape.path == "dynamic_ffn2_first"
+    should_init = shape.path in ("dynamic_ffn2_first", "dynamic_ffn2_whole_first")
+    output_width = h_per_pack if _is_whole(shape) else bd2_per_pack
+    bd2_outer_loops = num_bd2 if _is_whole(shape) else 1
 
     def kernel(acc1_ref, acc3_ref, w2_ref, res_ref, out_ref, res_vmem):
         for token_tile_id in range(num_token_tiles):
@@ -403,33 +417,35 @@ def _pallas_ffn_call(shape: FFNPallasShape, arrays: tuple[Any, ...], *, jax: Any
                 )
                 local_token_slice = pl.ds(btc_id * shape.btc, shape.btc)
 
-                for bd2c_id in range(num_bd2c):
-                    out_k_slice = pl.ds(bd2c_id * bd2c_per_pack, bd2c_per_pack)
-                    for p_id in range(shape.t_packing):
-                        partial = jnp.zeros((shape.btc, bd2c_per_pack), dtype=jnp.float32)
-                        for bfc_id in range(num_bfc):
-                            f_slice = pl.ds(bfc_id * shape.bfc, shape.bfc)
-                            a1 = acc1_ref[global_token_slice, f_slice]
-                            a3 = acc3_ref[global_token_slice, f_slice]
-                            act = _jax_silu(a1, jnp=jnp) * a3
-                            w = w2_ref[p_id, f_slice, out_k_slice]
-                            partial += jnp.dot(
-                                act,
-                                w,
-                                preferred_element_type=jnp.float32,
-                            )
-                        res_slice = (local_token_slice, p_id, out_k_slice)
-                        if should_init:
-                            res_vmem[res_slice] = partial.astype(jnp.bfloat16)
-                        else:
-                            res_vmem[res_slice] = (
-                                res_vmem[res_slice].astype(jnp.float32) + partial
-                            ).astype(jnp.bfloat16)
+                for bd2_id in range(bd2_outer_loops):
+                    bd2_base = bd2_id * bd2_per_pack
+                    for bd2c_id in range(num_bd2c):
+                        out_k_slice = pl.ds(bd2_base + bd2c_id * bd2c_per_pack, bd2c_per_pack)
+                        for p_id in range(shape.t_packing):
+                            partial = jnp.zeros((shape.btc, bd2c_per_pack), dtype=jnp.float32)
+                            for bfc_id in range(num_bfc):
+                                f_slice = pl.ds(bfc_id * shape.bfc, shape.bfc)
+                                a1 = acc1_ref[global_token_slice, f_slice]
+                                a3 = acc3_ref[global_token_slice, f_slice]
+                                act = _jax_silu(a1, jnp=jnp) * a3
+                                w = w2_ref[p_id, f_slice, out_k_slice]
+                                partial += jnp.dot(
+                                    act,
+                                    w,
+                                    preferred_element_type=jnp.float32,
+                                )
+                            res_slice = (local_token_slice, p_id, out_k_slice)
+                            if should_init:
+                                res_vmem[res_slice] = partial.astype(jnp.bfloat16)
+                            else:
+                                res_vmem[res_slice] = (
+                                    res_vmem[res_slice].astype(jnp.float32) + partial
+                                ).astype(jnp.bfloat16)
             out_ref[global_tile_slice] = res_vmem[...]
 
     return pl.pallas_call(
         kernel,
-        out_shape=jax.ShapeDtypeStruct((dyn, shape.t_packing, bd2_per_pack), jnp.bfloat16),
+        out_shape=jax.ShapeDtypeStruct((dyn, shape.t_packing, output_width), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=[
@@ -441,7 +457,7 @@ def _pallas_ffn_call(shape: FFNPallasShape, arrays: tuple[Any, ...], *, jax: Any
             out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM),
             grid=(1,),
             scratch_shapes=[
-                pltpu.VMEM((shape.bts, shape.t_packing, bd2_per_pack), jnp.bfloat16),
+                pltpu.VMEM((shape.bts, shape.t_packing, output_width), jnp.bfloat16),
             ],
         ),
         compiler_params=pltpu.CompilerParams(has_side_effects=True),
@@ -451,29 +467,37 @@ def _pallas_ffn_call(shape: FFNPallasShape, arrays: tuple[Any, ...], *, jax: Any
 
 def _tile_shape(shape: FFNPallasShape) -> tuple[int, ...]:
     rows = _effective_rows(shape)
-    if shape.path in ("dynamic_ffn1_init", "dynamic_ffn1_accumulate"):
+    if _is_whole(shape):
+        if _is_ffn1(shape):
+            return (rows, shape.t_packing, shape.hidden_size // shape.t_packing, shape.bf)
+        return (rows, shape.bf, shape.t_packing, shape.hidden_size // shape.t_packing)
+    if _is_ffn1(shape):
         return (rows, shape.t_packing, shape.bd1 // shape.t_packing, shape.bf)
     return (rows, shape.bf, shape.t_packing, shape.bd2 // shape.t_packing)
 
 
 def _bytes_hbm(shape: FFNPallasShape) -> int:
     dyn = _effective_rows(shape)
-    if shape.path in ("dynamic_ffn1_init", "dynamic_ffn1_accumulate"):
-        token_bytes = dyn * shape.bd1 * BF16_BYTES
-        weight_bytes = 2 * shape.bd1 * shape.bf * BF16_BYTES
+    input_width = shape.hidden_size if _is_whole(shape) else shape.bd1
+    output_width = shape.hidden_size if _is_whole(shape) else shape.bd2
+    if _is_ffn1(shape):
+        token_bytes = dyn * input_width * BF16_BYTES
+        weight_bytes = 2 * input_width * shape.bf * BF16_BYTES
         acc_bytes = 2 * dyn * shape.bf * F32_BYTES
         return token_bytes + weight_bytes + acc_bytes
     acc_bytes = 2 * dyn * shape.bf * F32_BYTES
-    weight_bytes = shape.bf * shape.bd2 * BF16_BYTES
-    output_bytes = dyn * shape.bd2 * BF16_BYTES
+    weight_bytes = shape.bf * output_width * BF16_BYTES
+    output_bytes = dyn * output_width * BF16_BYTES
     return acc_bytes + weight_bytes + output_bytes
 
 
 def _flops(shape: FFNPallasShape) -> int:
     dyn = _effective_rows(shape)
-    if shape.path in ("dynamic_ffn1_init", "dynamic_ffn1_accumulate"):
-        return 4 * dyn * shape.bd1 * shape.bf
-    return 2 * dyn * shape.bf * shape.bd2
+    if _is_ffn1(shape):
+        input_width = shape.hidden_size if _is_whole(shape) else shape.bd1
+        return 4 * dyn * input_width * shape.bf
+    output_width = shape.hidden_size if _is_whole(shape) else shape.bd2
+    return 2 * dyn * shape.bf * output_width
 
 
 def _effective_rows(shape: FFNPallasShape) -> int:
@@ -483,8 +507,20 @@ def _effective_rows(shape: FFNPallasShape) -> int:
 
 
 def _includes(shape: FFNPallasShape) -> list[str]:
-    if shape.path in ("dynamic_ffn1_init", "dynamic_ffn1_accumulate"):
+    if _is_ffn1(shape):
+        if _is_whole(shape):
+            return [
+                "pallas_dynamic_ffn1_gate_dot_all_bd1_tiles",
+                "pallas_dynamic_ffn1_up_dot_all_bd1_tiles",
+                "acc1_acc3_update",
+            ]
         return ["pallas_dynamic_ffn1_gate_dot", "pallas_dynamic_ffn1_up_dot", "acc1_acc3_update"]
+    if _is_whole(shape):
+        return [
+            "pallas_silu_multiply_activation",
+            "pallas_dynamic_ffn2_down_dot_all_bd2_tiles",
+            "res_init_or_accumulate",
+        ]
     return [
         "pallas_silu_multiply_activation",
         "pallas_dynamic_ffn2_down_dot",
@@ -493,9 +529,40 @@ def _includes(shape: FFNPallasShape) -> list[str]:
 
 
 def _kernel_reference(shape: FFNPallasShape) -> str:
-    if shape.path in ("dynamic_ffn1_init", "dynamic_ffn1_accumulate"):
+    if _is_ffn1(shape):
         return f"{KERNEL_PATH}:dynamic_ffn1/run_gate_up_slices"
     return f"{KERNEL_PATH}:dynamic_ffn2/run_down_slices"
+
+
+def _measurement_scope(shape: FFNPallasShape) -> str:
+    if _is_whole(shape):
+        return "single_dynamic_ffn_whole_stage"
+    return "single_dynamic_ffn_weight_tile"
+
+
+def _measured_bd1_tiles(shape: FFNPallasShape) -> int:
+    if not _is_ffn1(shape):
+        return 0
+    return _ceil_div(shape.hidden_size, shape.bd1) if _is_whole(shape) else 1
+
+
+def _measured_bd2_tiles(shape: FFNPallasShape) -> int:
+    if _is_ffn1(shape):
+        return 0
+    return _ceil_div(shape.hidden_size, shape.bd2) if _is_whole(shape) else 1
+
+
+def _is_ffn1(shape: FFNPallasShape) -> bool:
+    return shape.path in (
+        "dynamic_ffn1_init",
+        "dynamic_ffn1_accumulate",
+        "dynamic_ffn1_whole_init",
+        "dynamic_ffn1_whole_accumulate",
+    )
+
+
+def _is_whole(shape: FFNPallasShape) -> bool:
+    return "_whole_" in shape.path
 
 
 def _validate_shape(shape: FFNPallasShape) -> None:
