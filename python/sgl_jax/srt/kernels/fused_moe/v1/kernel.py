@@ -1241,12 +1241,8 @@ def _fused_ep_moe_kernel(
                     e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
                     is_valid = e_id >= 0
                     e_id_safe = lax.select(is_valid, e_id, jnp.int32(0))
-                    seen = expert_offsets_x2_smem[bt_sem_id, 1, e_id_safe]
                     sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, e_id_safe]
-                    should_wait = is_valid & (seen == 0) & (sz != 0)
-                    expert_offsets_x2_smem[bt_sem_id, 1, e_id_safe] = lax.select(
-                        is_valid, jnp.int32(-1), seen
-                    )
+                    should_wait = is_valid & (sz != 0)
 
                     @pl.when(should_wait)
                     def _():
@@ -1256,6 +1252,7 @@ def _fused_ep_moe_kernel(
                             dst_ref=ref,
                             sem=a2a_gather_sem,
                         ).wait()
+                        d2e_count_x2_smem[bt_sem_id, my_id, 0, e_id_safe] = jnp.int32(0)
 
                 return None
 
@@ -2500,15 +2497,7 @@ def _fused_ep_moe_kernel(
                 def _():
                     for k_id in range(top_k):
                         e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
-                        offset_raw = expert_offsets_x2_smem[bt_sem_id, 1, e_id]
-                        if (
-                            not disable_a2a_gather_route_wait
-                            and bt * top_k < num_experts
-                            and bt * top_k <= _A2A_GATHER_ROUTE_SCAN_MAX_ROUTES
-                        ):
-                            offset = lax.select(offset_raw < 0, jnp.int32(0), offset_raw)
-                        else:
-                            offset = offset_raw
+                        offset = expert_offsets_x2_smem[bt_sem_id, 1, e_id]
                         expert_offsets_x2_smem[bt_sem_id, 1, e_id] = offset + 1
                         pltpu.make_async_copy(
                             src_ref=a2a_g_hbm.at[e_id, pl.ds(offset, 1)],
