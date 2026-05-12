@@ -249,6 +249,9 @@ def _metadata_for_shape(
             "num_bf": _ceil_div(shape.intermediate_size, shape.bf),
             "num_bfc": _ceil_div(shape.bf, shape.bfc),
             "pallas_aligned": True,
+            "whole_stage_input_mode": (
+                "reuse_single_bd_tile_in_kernel_loop" if _is_whole(shape) else "single_bd_tile"
+            ),
         },
     }
     return enriched
@@ -290,23 +293,18 @@ def _measure_ffn_pallas_ms(
 
 def _make_inputs(shape: FFNPallasShape, *, jnp: Any) -> tuple[Any, ...]:
     dyn = _effective_rows(shape)
-    h_per_pack = shape.hidden_size // shape.t_packing
     bd1_per_pack = shape.bd1 // shape.t_packing
     bd2_per_pack = shape.bd2 // shape.t_packing
     if _is_ffn1(shape):
-        input_width = h_per_pack if _is_whole(shape) else bd1_per_pack
         tokens = jnp.ones((dyn, shape.t_packing, bd1_per_pack), dtype=jnp.bfloat16)
-        if _is_whole(shape):
-            tokens = jnp.ones((dyn, shape.t_packing, input_width), dtype=jnp.bfloat16)
-        w1 = jnp.ones((shape.t_packing, input_width, shape.bf), dtype=jnp.bfloat16)
-        w3 = jnp.ones((shape.t_packing, input_width, shape.bf), dtype=jnp.bfloat16)
+        w1 = jnp.ones((shape.t_packing, bd1_per_pack, shape.bf), dtype=jnp.bfloat16)
+        w3 = jnp.ones((shape.t_packing, bd1_per_pack, shape.bf), dtype=jnp.bfloat16)
         acc = jnp.ones((2, dyn, shape.bf), dtype=jnp.float32)
         return tokens, w1, w3, acc
     acc1 = jnp.ones((dyn, shape.bf), dtype=jnp.float32)
     acc3 = jnp.ones((dyn, shape.bf), dtype=jnp.float32)
-    output_width = h_per_pack if _is_whole(shape) else bd2_per_pack
-    w2 = jnp.ones((shape.t_packing, shape.bf, output_width), dtype=jnp.bfloat16)
-    res = jnp.ones((dyn, shape.t_packing, output_width), dtype=jnp.bfloat16)
+    w2 = jnp.ones((shape.t_packing, shape.bf, bd2_per_pack), dtype=jnp.bfloat16)
+    res = jnp.ones((dyn, shape.t_packing, bd2_per_pack), dtype=jnp.bfloat16)
     return acc1, acc3, w2, res
 
 
@@ -315,8 +313,6 @@ def _pallas_ffn_call(shape: FFNPallasShape, arrays: tuple[Any, ...], *, jax: Any
     from jax.experimental.pallas import tpu as pltpu
 
     dyn = _effective_rows(shape)
-    h_per_pack = shape.hidden_size // shape.t_packing
-    bd1_per_pack = shape.bd1 // shape.t_packing
     bd1c_per_pack = shape.bd1c // shape.t_packing
     bd2_per_pack = shape.bd2 // shape.t_packing
     bd2c_per_pack = shape.bd2c // shape.t_packing
@@ -344,9 +340,8 @@ def _pallas_ffn_call(shape: FFNPallasShape, arrays: tuple[Any, ...], *, jax: Any
             for btc_id in range(num_loops):
                 token_slice = pl.ds(btc_id * shape.btc, shape.btc)
                 for bd1_id in range(bd1_outer_loops):
-                    bd1_base = bd1_id * bd1_per_pack
                     for bd1c_id in range(num_bd1c):
-                        k_slice = pl.ds(bd1_base + bd1c_id * bd1c_per_pack, bd1c_per_pack)
+                        k_slice = pl.ds(bd1c_id * bd1c_per_pack, bd1c_per_pack)
                         for p_id in range(shape.t_packing):
                             t = tokens_ref[token_slice, p_id, k_slice]
                             for bfc_id in range(num_bfc):
@@ -396,7 +391,6 @@ def _pallas_ffn_call(shape: FFNPallasShape, arrays: tuple[Any, ...], *, jax: Any
 
     acc1, acc3, w2, res = arrays
     should_init = shape.path in ("dynamic_ffn2_first", "dynamic_ffn2_whole_first")
-    output_width = h_per_pack if _is_whole(shape) else bd2_per_pack
     bd2_outer_loops = num_bd2 if _is_whole(shape) else 1
 
     def kernel(acc1_ref, acc3_ref, w2_ref, res_ref, out_ref, res_vmem):
@@ -418,9 +412,8 @@ def _pallas_ffn_call(shape: FFNPallasShape, arrays: tuple[Any, ...], *, jax: Any
                 local_token_slice = pl.ds(btc_id * shape.btc, shape.btc)
 
                 for bd2_id in range(bd2_outer_loops):
-                    bd2_base = bd2_id * bd2_per_pack
                     for bd2c_id in range(num_bd2c):
-                        out_k_slice = pl.ds(bd2_base + bd2c_id * bd2c_per_pack, bd2c_per_pack)
+                        out_k_slice = pl.ds(bd2c_id * bd2c_per_pack, bd2c_per_pack)
                         for p_id in range(shape.t_packing):
                             partial = jnp.zeros((shape.btc, bd2c_per_pack), dtype=jnp.float32)
                             for bfc_id in range(num_bfc):
@@ -445,7 +438,7 @@ def _pallas_ffn_call(shape: FFNPallasShape, arrays: tuple[Any, ...], *, jax: Any
 
     return pl.pallas_call(
         kernel,
-        out_shape=jax.ShapeDtypeStruct((dyn, shape.t_packing, output_width), jnp.bfloat16),
+        out_shape=jax.ShapeDtypeStruct((dyn, shape.t_packing, bd2_per_pack), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=[
@@ -457,7 +450,7 @@ def _pallas_ffn_call(shape: FFNPallasShape, arrays: tuple[Any, ...], *, jax: Any
             out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM),
             grid=(1,),
             scratch_shapes=[
-                pltpu.VMEM((shape.bts, shape.t_packing, output_width), jnp.bfloat16),
+                pltpu.VMEM((shape.bts, shape.t_packing, bd2_per_pack), jnp.bfloat16),
             ],
         ),
         compiler_params=pltpu.CompilerParams(has_side_effects=True),
@@ -469,8 +462,20 @@ def _tile_shape(shape: FFNPallasShape) -> tuple[int, ...]:
     rows = _effective_rows(shape)
     if _is_whole(shape):
         if _is_ffn1(shape):
-            return (rows, shape.t_packing, shape.hidden_size // shape.t_packing, shape.bf)
-        return (rows, shape.bf, shape.t_packing, shape.hidden_size // shape.t_packing)
+            return (
+                rows,
+                shape.t_packing,
+                shape.bd1 // shape.t_packing,
+                shape.bf,
+                _ceil_div(shape.hidden_size, shape.bd1),
+            )
+        return (
+            rows,
+            shape.bf,
+            shape.t_packing,
+            shape.bd2 // shape.t_packing,
+            _ceil_div(shape.hidden_size, shape.bd2),
+        )
     if _is_ffn1(shape):
         return (rows, shape.t_packing, shape.bd1 // shape.t_packing, shape.bf)
     return (rows, shape.bf, shape.t_packing, shape.bd2 // shape.t_packing)
