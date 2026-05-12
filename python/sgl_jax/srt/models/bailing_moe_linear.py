@@ -564,11 +564,8 @@ class BailingMoELinearModel(nnx.Module):
             0 if is_linear_layer(i, self.layer_group_size) else 1
             for i in range(config.num_hidden_layers)
         ]
-        if self.layer_group_size <= 0 or config.num_hidden_layers % self.layer_group_size != 0:
-            raise ValueError(
-                f"num_hidden_layers={config.num_hidden_layers} must be divisible by "
-                f"positive layer_group_size={self.layer_group_size}"
-            )
+        if self.layer_group_size <= 0:
+            raise ValueError(f"layer_group_size must be positive, got {self.layer_group_size}")
 
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
