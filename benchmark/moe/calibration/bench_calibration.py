@@ -959,7 +959,12 @@ def load_layer1_shared_expert_tp_suite_shapes(
     suite: str,
 ) -> tuple[layer1_shared_expert_tp_compute.SharedExpertTPShape, ...]:
     if suite == SUITE_V7X8_BF16_SHARED_EXPERT_TP_DECODE64:
-        return PHASE1_SHARED_EXPERT_TP_DECODE64_SHAPES
+        shapes = PHASE1_SHARED_EXPERT_TP_DECODE64_SHAPES
+        raw_tp_sizes = os.getenv("CALIBRATION_LAYER1_SHARED_TP_SIZES")
+        if raw_tp_sizes:
+            allowed = {int(part.strip()) for part in raw_tp_sizes.split(",") if part.strip()}
+            shapes = tuple(shape for shape in shapes if shape.tp_size in allowed)
+        return shapes
     raise ValueError(f"Unsupported Layer 1 shared expert TP suite: {suite}")
 
 
