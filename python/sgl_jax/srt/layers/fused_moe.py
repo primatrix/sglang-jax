@@ -79,7 +79,6 @@ class FusedEPMoE(nnx.Module):
         disable_shared_expert: bool = False,
         disable_all_reduce_metadata: bool = False,
         disable_sync_barrier: bool = False,
-        disable_a2a_gather_route_wait: bool = False,
         use_jax_allreduce_metadata: bool = True,
     ):
         self.hidden_size = hidden_size
@@ -113,7 +112,6 @@ class FusedEPMoE(nnx.Module):
         self.disable_shared_expert = disable_shared_expert
         self.disable_all_reduce_metadata = disable_all_reduce_metadata
         self.disable_sync_barrier = disable_sync_barrier
-        self.disable_a2a_gather_route_wait = disable_a2a_gather_route_wait
         self.use_jax_allreduce_metadata = use_jax_allreduce_metadata
 
         metadata = get_global_expert_location_metadata()
@@ -503,7 +501,6 @@ class FusedEPMoE(nnx.Module):
             disable_shared_expert=self.disable_shared_expert,
             disable_all_reduce_metadata=self.disable_all_reduce_metadata,
             disable_sync_barrier=self.disable_sync_barrier,
-            disable_a2a_gather_route_wait=self.disable_a2a_gather_route_wait,
             use_jax_allreduce_metadata=self.use_jax_allreduce_metadata,
             # Optional parameters (not used in basic case)
             quant_block_k=quant_block_k,

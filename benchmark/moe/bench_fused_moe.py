@@ -1022,10 +1022,6 @@ def run_all(
                     "FUSED_MOE_BENCHMARK_DISABLE_SYNC_BARRIER",
                     all_disable=all_disable,
                 ),
-                disable_a2a_gather_route_wait=_env_bool(
-                    "FUSED_MOE_BENCHMARK_DISABLE_A2A_GATHER_ROUTE_WAIT",
-                    False,
-                ),
             )
             if quantization_config is not None:
                 if quant_block_k is not None:
