@@ -67,10 +67,15 @@ class FusedEPMoE(nnx.Module):
         quantization_config=None,
         # Profiling / ablation flags (primarily for microbenching).
         disable_a2a: bool = False,
+        disable_a2a_scatter: bool = False,
+        disable_a2a_gather: bool = False,
+        a2a_hbm_fraction: float | None = None,
         disable_dynamic_ffn1: bool = False,
         disable_dynamic_ffn2: bool = False,
         disable_weight_load: bool = False,
+        disable_a2a_s_tile_read: bool = False,
         disable_a2a_s_acc_tile_write: bool = False,
+        disable_output_accumulate: bool = False,
         disable_shared_expert: bool = False,
         disable_all_reduce_metadata: bool = False,
         disable_sync_barrier: bool = False,
@@ -98,10 +103,15 @@ class FusedEPMoE(nnx.Module):
         )
         self.mesh = mesh
         self.disable_a2a = disable_a2a
+        self.disable_a2a_scatter = disable_a2a_scatter
+        self.disable_a2a_gather = disable_a2a_gather
+        self.a2a_hbm_fraction = a2a_hbm_fraction
         self.disable_dynamic_ffn1 = disable_dynamic_ffn1
         self.disable_dynamic_ffn2 = disable_dynamic_ffn2
         self.disable_weight_load = disable_weight_load
+        self.disable_a2a_s_tile_read = disable_a2a_s_tile_read
         self.disable_a2a_s_acc_tile_write = disable_a2a_s_acc_tile_write
+        self.disable_output_accumulate = disable_output_accumulate
         self.disable_shared_expert = disable_shared_expert
         self.disable_all_reduce_metadata = disable_all_reduce_metadata
         self.disable_sync_barrier = disable_sync_barrier
@@ -485,10 +495,15 @@ class FusedEPMoE(nnx.Module):
             act_fn=self.activation,
             block_config=block_config,
             disable_a2a=self.disable_a2a,
+            disable_a2a_scatter=self.disable_a2a_scatter,
+            disable_a2a_gather=self.disable_a2a_gather,
+            a2a_hbm_fraction=self.a2a_hbm_fraction,
             disable_dynamic_ffn1=self.disable_dynamic_ffn1,
             disable_dynamic_ffn2=self.disable_dynamic_ffn2,
             disable_weight_load=self.disable_weight_load,
+            disable_a2a_s_tile_read=self.disable_a2a_s_tile_read,
             disable_a2a_s_acc_tile_write=self.disable_a2a_s_acc_tile_write,
+            disable_output_accumulate=self.disable_output_accumulate,
             disable_shared_expert=self.disable_shared_expert,
             disable_all_reduce_metadata=self.disable_all_reduce_metadata,
             disable_sync_barrier=self.disable_sync_barrier,

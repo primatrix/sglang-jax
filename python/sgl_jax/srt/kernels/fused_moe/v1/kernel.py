@@ -566,10 +566,14 @@ def _fused_ep_moe_kernel(
     act_fn: str,
     # Profiling / ablation flags (reserved; no-op in this branch).
     disable_a2a: bool = False,
+    disable_a2a_scatter: bool = False,
+    disable_a2a_gather: bool = False,
     disable_dynamic_ffn1: bool = False,
     disable_dynamic_ffn2: bool = False,
     disable_weight_load: bool = False,
+    disable_a2a_s_tile_read: bool = False,
     disable_a2a_s_acc_tile_write: bool = False,
+    disable_output_accumulate: bool = False,
     disable_shared_expert: bool = False,
     disable_all_reduce_metadata: bool = False,
     disable_sync_barrier: bool = False,
@@ -982,7 +986,7 @@ def _fused_ep_moe_kernel(
         )
 
     def start_a2a_scatter(*, bt_sem_id, e_sem_id, local_e_id, bt_start):
-        if disable_a2a:
+        if disable_a2a or disable_a2a_scatter:
             return
 
         # Counting the number of remote sends from the current device.
@@ -1045,7 +1049,7 @@ def _fused_ep_moe_kernel(
         a2a_s_sends_x2_smem[e_sem_id] = send_sz
 
     def start_a2a_scatter_batch(*, bt_sem_id, bt_start):
-        if disable_a2a:
+        if disable_a2a or disable_a2a_scatter:
             return
         for slot in range(expert_buffer_count):
             a2a_s_sends_x2_smem[slot] = jnp.int32(0)
@@ -1100,7 +1104,7 @@ def _fused_ep_moe_kernel(
         lax.fori_loop(0, bt, _scatter_one_batch, None, unroll=False)
 
     def wait_a2a_scatter_send_batch():
-        if disable_a2a:
+        if disable_a2a or disable_a2a_scatter:
             return
 
         def _wait_one(slot, _):
@@ -1121,7 +1125,7 @@ def _fused_ep_moe_kernel(
 
     def start_a2a_scatter_batch_dma(*, bt_sem_id, bt_start):
         """Permute tokens by expert into permuted_tokens_hbm, then batch DMA."""
-        if disable_a2a or not use_batch_dma_scatter:
+        if disable_a2a or disable_a2a_scatter or not use_batch_dma_scatter:
             return
         for slot in range(expert_buffer_count):
             a2a_s_sends_x2_smem[slot] = jnp.int32(0)
@@ -1170,9 +1174,7 @@ def _fused_ep_moe_kernel(
             @pl.when(total_count != 0)
             def _wait_permute():
                 ref = permuted_tokens_hbm.at[pl.ds(0, total_count)]
-                pltpu.make_async_copy(
-                    src_ref=ref, dst_ref=ref, sem=permute_sem
-                ).wait()
+                pltpu.make_async_copy(src_ref=ref, dst_ref=ref, sem=permute_sem).wait()
 
             # Phase 2: batch DMA scatter - one DMA per global expert.
             def _batch_scatter(e_id, _):
@@ -1207,9 +1209,7 @@ def _fused_ep_moe_kernel(
                     e_sem_id_k=e_sem_id_k,
                     recv_id=recv_id,
                 ):
-                    a2a_s_sends_x2_smem[e_sem_id_k] = (
-                        a2a_s_sends_x2_smem[e_sem_id_k] + count
-                    )
+                    a2a_s_sends_x2_smem[e_sem_id_k] = a2a_s_sends_x2_smem[e_sem_id_k] + count
                     pltpu.make_async_remote_copy(
                         src_ref=permuted_tokens_hbm.at[pl.ds(src_start, count)],
                         dst_ref=a2a_s_x2_hbm.at[e_sem_id_k, pl.ds(dst_start, count)],
@@ -1221,9 +1221,7 @@ def _fused_ep_moe_kernel(
 
                 return None
 
-            lax.fori_loop(
-                0, jnp.int32(padded_num_experts), _batch_scatter, None, unroll=False
-            )
+            lax.fori_loop(0, jnp.int32(padded_num_experts), _batch_scatter, None, unroll=False)
 
         pl.run_scoped(
             _body,
@@ -1234,7 +1232,7 @@ def _fused_ep_moe_kernel(
 
     def start_a2a_scatter_vmem_permute(*, bt_sem_id, bt_start):
         """Load tokens to VMEM, reorder with vector ops, scatter from VMEM."""
-        if disable_a2a or not use_vmem_permute_scatter:
+        if disable_a2a or disable_a2a_scatter or not use_vmem_permute_scatter:
             return
         for slot in range(expert_buffer_count):
             a2a_s_sends_x2_smem[slot] = jnp.int32(0)
@@ -1255,7 +1253,10 @@ def _fused_ep_moe_kernel(
                 return acc + count
 
             lax.fori_loop(
-                0, jnp.int32(padded_num_experts), _prefix_sum, jnp.int32(0),
+                0,
+                jnp.int32(padded_num_experts),
+                _prefix_sum,
+                jnp.int32(0),
                 unroll=False,
             )
 
@@ -1293,9 +1294,7 @@ def _fused_ep_moe_kernel(
 
             # Phase 3: batch scatter from VMEM.
             def _batch_scatter(e_id, _):
-                e_id_safe = lax.select(
-                    e_id < num_global_experts, e_id, jnp.int32(0)
-                )
+                e_id_safe = lax.select(e_id < num_global_experts, e_id, jnp.int32(0))
                 e_sem_id_k = e_id_safe % jnp.int32(local_num_experts)
                 recv_id = e_id_safe // jnp.int32(local_num_experts)
                 count = d2e_count_x2_smem[bt_sem_id, my_id, 0, e_id_safe]
@@ -1314,9 +1313,7 @@ def _fused_ep_moe_kernel(
                 ):
                     pltpu.make_async_copy(
                         src_ref=vmem_permuted.at[pl.ds(src_start, count)],
-                        dst_ref=a2a_s_x2_hbm.at[
-                            e_sem_id_k, pl.ds(dst_start, count)
-                        ],
+                        dst_ref=a2a_s_x2_hbm.at[e_sem_id_k, pl.ds(dst_start, count)],
                         sem=recv_x2_sems.at[e_sem_id_k],
                     ).start()
 
@@ -1328,14 +1325,10 @@ def _fused_ep_moe_kernel(
                     e_sem_id_k=e_sem_id_k,
                     recv_id=recv_id,
                 ):
-                    a2a_s_sends_x2_smem[e_sem_id_k] = (
-                        a2a_s_sends_x2_smem[e_sem_id_k] + count
-                    )
+                    a2a_s_sends_x2_smem[e_sem_id_k] = a2a_s_sends_x2_smem[e_sem_id_k] + count
                     pltpu.make_async_remote_copy(
                         src_ref=vmem_permuted.at[pl.ds(src_start, count)],
-                        dst_ref=a2a_s_x2_hbm.at[
-                            e_sem_id_k, pl.ds(dst_start, count)
-                        ],
+                        dst_ref=a2a_s_x2_hbm.at[e_sem_id_k, pl.ds(dst_start, count)],
                         send_sem=send_x2_sems.at[e_sem_id_k],
                         recv_sem=recv_x2_sems.at[e_sem_id_k],
                         device_id=get_mesh_device_id(recv_id),
@@ -1345,7 +1338,10 @@ def _fused_ep_moe_kernel(
                 return None
 
             lax.fori_loop(
-                0, jnp.int32(padded_num_experts), _batch_scatter, None,
+                0,
+                jnp.int32(padded_num_experts),
+                _batch_scatter,
+                None,
                 unroll=False,
             )
 
@@ -1360,7 +1356,7 @@ def _fused_ep_moe_kernel(
 
     def start_a2a_scatter_overlap(*, bt_sem_id, bt_start):
         """Double-buffered VMEM gather overlapped with DMA scatter."""
-        if disable_a2a or not use_overlap_scatter:
+        if disable_a2a or disable_a2a_scatter or not use_overlap_scatter:
             return
         for slot in range(expert_buffer_count):
             a2a_s_sends_x2_smem[slot] = jnp.int32(0)
@@ -1406,9 +1402,7 @@ def _fused_ep_moe_kernel(
 
             def _start_scatter(e_id, vmem_buf, count):
                 """Start DMA scatter for one expert from vmem_buf."""
-                e_id_safe = lax.select(
-                    e_id < num_global_experts, e_id, jnp.int32(0)
-                )
+                e_id_safe = lax.select(e_id < num_global_experts, e_id, jnp.int32(0))
                 e_sem_id_k = e_id_safe % jnp.int32(local_num_experts)
                 recv_id = e_id_safe // jnp.int32(local_num_experts)
                 dst_start = expert_starts_x2_smem[bt_sem_id, 0, e_id_safe]
@@ -1424,9 +1418,7 @@ def _fused_ep_moe_kernel(
                 ):
                     pltpu.make_async_copy(
                         src_ref=vmem_buf.at[pl.ds(0, count)],
-                        dst_ref=a2a_s_x2_hbm.at[
-                            e_sem_id_k, pl.ds(dst_start, count)
-                        ],
+                        dst_ref=a2a_s_x2_hbm.at[e_sem_id_k, pl.ds(dst_start, count)],
                         sem=recv_x2_sems.at[e_sem_id_k],
                     ).start()
 
@@ -1437,14 +1429,10 @@ def _fused_ep_moe_kernel(
                     e_sem_id_k=e_sem_id_k,
                     recv_id=recv_id,
                 ):
-                    a2a_s_sends_x2_smem[e_sem_id_k] = (
-                        a2a_s_sends_x2_smem[e_sem_id_k] + count
-                    )
+                    a2a_s_sends_x2_smem[e_sem_id_k] = a2a_s_sends_x2_smem[e_sem_id_k] + count
                     pltpu.make_async_remote_copy(
                         src_ref=vmem_buf.at[pl.ds(0, count)],
-                        dst_ref=a2a_s_x2_hbm.at[
-                            e_sem_id_k, pl.ds(dst_start, count)
-                        ],
+                        dst_ref=a2a_s_x2_hbm.at[e_sem_id_k, pl.ds(dst_start, count)],
                         send_sem=send_x2_sems.at[e_sem_id_k],
                         recv_sem=recv_x2_sems.at[e_sem_id_k],
                         device_id=get_mesh_device_id(recv_id),
@@ -1512,7 +1500,11 @@ def _fused_ep_moe_kernel(
 
             num_pairs = (padded_num_experts + 1) // 2
             lax.fori_loop(
-                0, jnp.int32(num_pairs), _process_pair, None, unroll=False,
+                0,
+                jnp.int32(num_pairs),
+                _process_pair,
+                None,
+                unroll=False,
             )
 
         pl.run_scoped(
@@ -1526,7 +1518,7 @@ def _fused_ep_moe_kernel(
         )
 
     def wait_a2a_scatter_recv(*, bt_sem_id, e_sem_id, local_e_id):
-        if disable_a2a:
+        if disable_a2a or disable_a2a_scatter:
             return
         e_id = my_id * local_num_experts + local_e_id
         sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
@@ -1542,7 +1534,7 @@ def _fused_ep_moe_kernel(
             ).wait()
 
     def wait_a2a_scatter_send(*, bt_sem_id, e_sem_id, local_e_id):
-        if disable_a2a:
+        if disable_a2a or disable_a2a_scatter:
             return
         scatter_send_sz = a2a_s_sends_x2_smem[e_sem_id]
         should_wait = scatter_send_sz != 0
@@ -1558,7 +1550,7 @@ def _fused_ep_moe_kernel(
             ).wait()
 
     def start_a2a_gather(*, bt_sem_id, e_sem_id, local_e_id):
-        if disable_a2a:
+        if disable_a2a or disable_a2a_gather:
             return
         my_e_id = my_id * local_num_experts + local_e_id
         start = 0
@@ -1602,7 +1594,7 @@ def _fused_ep_moe_kernel(
             start += sz
 
     def wait_a2a_gather_send(*, bt_sem_id, e_sem_id, local_e_id):
-        if disable_a2a:
+        if disable_a2a or disable_a2a_gather:
             return
         my_e_id = my_id * local_num_experts + local_e_id
         sz = expert_sizes_x2_smem[bt_sem_id, 0, my_e_id]
@@ -1623,7 +1615,7 @@ def _fused_ep_moe_kernel(
             ).wait()
 
     def wait_a2a_gather_recv_all(*, bt_sem_id):
-        if disable_a2a:
+        if disable_a2a or disable_a2a_gather:
             return
 
         # `a2a_gather_sem` is signaled once per (expert -> this device) copy in the
@@ -2795,6 +2787,10 @@ def _fused_ep_moe_kernel(
         lax.cond(has_tokens, _run_active, _run_inactive, operand=None)
 
     def acc_and_store_output(*, bt_sem_id, out_buf_id):
+        if disable_output_accumulate:
+            b_output_x2_vmem.at[out_buf_id][...] = jnp.zeros_like(b_output_x2_vmem[out_buf_id])
+            return None
+
         acc_bt = a2a_g_acc_vmem.shape[2]
         assert bt % acc_bt == 0, (bt, acc_bt)
         num_acc_tiles = bt // acc_bt
@@ -3165,17 +3161,21 @@ def _fused_ep_moe_kernel(
                     local_e_id=local_e_id,
                 )
 
-                def _vmem_prefetch_body(vmem_expert_tokens, prefetch_sem,
-                                        e_sem_id_local=e_sem_id_local,
-                                        local_e_id=local_e_id):
+                def _vmem_prefetch_body(
+                    vmem_expert_tokens,
+                    prefetch_sem,
+                    e_sem_id_local=e_sem_id_local,
+                    local_e_id=local_e_id,
+                ):
                     e_id = my_id * local_num_experts + local_e_id
                     dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
 
-                    @pl.when(dyn_sz > 0)
+                    @pl.when((dyn_sz > 0) & jnp.logical_not(disable_a2a_s_tile_read))
                     def _start_prefetch():
                         pltpu.make_async_copy(
                             src_ref=a2a_s_x2_hbm.at[
-                                e_sem_id_local, pl.ds(0, dyn_sz),
+                                e_sem_id_local,
+                                pl.ds(0, dyn_sz),
                             ],
                             dst_ref=vmem_expert_tokens.at[pl.ds(0, dyn_sz)],
                             sem=prefetch_sem,
@@ -3183,11 +3183,12 @@ def _fused_ep_moe_kernel(
 
                         ref = vmem_expert_tokens.at[pl.ds(0, dyn_sz)]
                         pltpu.make_async_copy(
-                            src_ref=ref, dst_ref=ref, sem=prefetch_sem,
+                            src_ref=ref,
+                            dst_ref=ref,
+                            sem=prefetch_sem,
                         ).wait()
 
-                    expert_ffn(bt_sem_id, e_sem_id_local, local_e_id,
-                               vmem_expert_tokens)
+                    expert_ffn(bt_sem_id, e_sem_id_local, local_e_id, vmem_expert_tokens)
 
                 pl.run_scoped(
                     _vmem_prefetch_body,
@@ -3293,17 +3294,21 @@ def _fused_ep_moe_kernel(
                     bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id
                 )
 
-                def _vmem_prefetch_body_pip(vmem_expert_tokens, prefetch_sem,
-                                            curr_e_sem_id=curr_e_sem_id,
-                                            local_e_id=local_e_id):
+                def _vmem_prefetch_body_pip(
+                    vmem_expert_tokens,
+                    prefetch_sem,
+                    curr_e_sem_id=curr_e_sem_id,
+                    local_e_id=local_e_id,
+                ):
                     e_id = my_id * local_num_experts + local_e_id
                     dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
 
-                    @pl.when(dyn_sz > 0)
+                    @pl.when((dyn_sz > 0) & jnp.logical_not(disable_a2a_s_tile_read))
                     def _start_prefetch():
                         pltpu.make_async_copy(
                             src_ref=a2a_s_x2_hbm.at[
-                                curr_e_sem_id, pl.ds(0, dyn_sz),
+                                curr_e_sem_id,
+                                pl.ds(0, dyn_sz),
                             ],
                             dst_ref=vmem_expert_tokens.at[pl.ds(0, dyn_sz)],
                             sem=prefetch_sem,
@@ -3311,11 +3316,12 @@ def _fused_ep_moe_kernel(
 
                         ref = vmem_expert_tokens.at[pl.ds(0, dyn_sz)]
                         pltpu.make_async_copy(
-                            src_ref=ref, dst_ref=ref, sem=prefetch_sem,
+                            src_ref=ref,
+                            dst_ref=ref,
+                            sem=prefetch_sem,
                         ).wait()
 
-                    expert_ffn(bt_sem_id, curr_e_sem_id, local_e_id,
-                               vmem_expert_tokens)
+                    expert_ffn(bt_sem_id, curr_e_sem_id, local_e_id, vmem_expert_tokens)
 
                 pl.run_scoped(
                     _vmem_prefetch_body_pip,
@@ -3667,10 +3673,15 @@ def jax_allreduce_metadata_by_bt(
         "routed_scaling_factor",
         "act_fn",
         "disable_a2a",
+        "disable_a2a_scatter",
+        "disable_a2a_gather",
+        "a2a_hbm_fraction",
         "disable_dynamic_ffn1",
         "disable_dynamic_ffn2",
         "disable_weight_load",
+        "disable_a2a_s_tile_read",
         "disable_a2a_s_acc_tile_write",
+        "disable_output_accumulate",
         "disable_shared_expert",
         "disable_all_reduce_metadata",
         "disable_sync_barrier",
@@ -3702,10 +3713,15 @@ def fused_ep_moe(
     act_fn: str = "silu",
     # Profiling / ablation flags (reserved; no-op in this branch).
     disable_a2a: bool = False,
+    disable_a2a_scatter: bool = False,
+    disable_a2a_gather: bool = False,
+    a2a_hbm_fraction: float | None = None,
     disable_dynamic_ffn1: bool = False,
     disable_dynamic_ffn2: bool = False,
     disable_weight_load: bool = False,
+    disable_a2a_s_tile_read: bool = False,
     disable_a2a_s_acc_tile_write: bool = False,
+    disable_output_accumulate: bool = False,
     disable_shared_expert: bool = False,
     disable_all_reduce_metadata: bool = False,
     disable_sync_barrier: bool = False,
@@ -3823,7 +3839,8 @@ def fused_ep_moe(
     # buffer-reuse barriers), but fall back when prefill tiles make the scratch
     # too large for HBM.  Each slot costs two scatter buffers of shape
     # [a2a_max_tokens, hidden_size] in t_dtype.
-    a2a_scratch_budget = int(_device_hbm_bytes() * _A2A_HBM_FRACTION)
+    a2a_fraction = _A2A_HBM_FRACTION if a2a_hbm_fraction is None else a2a_hbm_fraction
+    a2a_scratch_budget = int(_device_hbm_bytes() * a2a_fraction)
     bytes_per_slot = 2 * a2a_max_tokens * hidden_size * jnp.dtype(t_dtype).itemsize
     expert_buffer_count = min(local_num_experts, max(2, a2a_scratch_budget // bytes_per_slot))
     bd1_per_pack = block_config.bd1 // t_packing
@@ -3982,10 +3999,14 @@ def fused_ep_moe(
                 tp_axis_name=tp_axis_name,
                 act_fn=act_fn,
                 disable_a2a=disable_a2a,
+                disable_a2a_scatter=disable_a2a_scatter,
+                disable_a2a_gather=disable_a2a_gather,
                 disable_dynamic_ffn1=disable_dynamic_ffn1,
                 disable_dynamic_ffn2=disable_dynamic_ffn2,
                 disable_weight_load=disable_weight_load,
+                disable_a2a_s_tile_read=disable_a2a_s_tile_read,
                 disable_a2a_s_acc_tile_write=disable_a2a_s_acc_tile_write,
+                disable_output_accumulate=disable_output_accumulate,
                 disable_shared_expert=disable_shared_expert,
                 disable_all_reduce_metadata=disable_all_reduce_metadata,
                 disable_sync_barrier=disable_sync_barrier,
@@ -4200,7 +4221,9 @@ def fused_ep_moe(
                 a2a_s_acc_x2_hbm_scratch, pltpu.HBM
             ),  # a2a_s_acc_x2_hbm
             pltpu.with_memory_space_constraint(a2a_g_hbm_scratch, pltpu.HBM),  # a2a_g_hbm
-            pltpu.with_memory_space_constraint(permuted_tokens_hbm_scratch, pltpu.HBM),  # permuted_tokens_hbm
+            pltpu.with_memory_space_constraint(
+                permuted_tokens_hbm_scratch, pltpu.HBM
+            ),  # permuted_tokens_hbm
             (
                 None
                 if w1_shared is None

@@ -45,6 +45,42 @@ from sgl_jax.srt.layers.moe import FusedEPMoE, TopK
 DEFAULT_TPU_VMEM_BUDGET_MB = 96
 DEFAULT_TPU_VMEM_BUDGET_BYTES = DEFAULT_TPU_VMEM_BUDGET_MB * 1024 * 1024
 
+SHAPE_PRESETS: dict[str, dict[str, object]] = {
+    # RFC-0026 Ling2.6-1T MoE layer dimensions.
+    "ling2_6_1t": {
+        "num_experts": 256,
+        "top_k": 8,
+        "hidden_size": 8192,
+        "intermediate_size": 2048,
+        "num_expert_group": 8,
+        "topk_group": 4,
+        "use_shared_expert": True,
+        "weight_dtype": "bfloat16",
+    },
+    # /models/MiMo-V2-Flash config.json.
+    "mimo_v2_flash": {
+        "num_experts": 256,
+        "top_k": 8,
+        "hidden_size": 4096,
+        "intermediate_size": 2048,
+        "num_expert_group": 0,
+        "topk_group": 0,
+        "use_shared_expert": False,
+        "weight_dtype": "bfloat16",
+    },
+    # /models/MiMo-V2-Pro-Private config.json.
+    "mimo_v2_pro": {
+        "num_experts": 384,
+        "top_k": 8,
+        "hidden_size": 6144,
+        "intermediate_size": 2048,
+        "num_expert_group": 0,
+        "topk_group": 0,
+        "use_shared_expert": False,
+        "weight_dtype": "bfloat16",
+    },
+}
+
 # ---------------------------------------------------------------------------
 # NOTE: skip some config kernel will crash when running.
 # Per-case block-config exclusion list.
@@ -513,6 +549,28 @@ def select_block_configs(
             v //= 2
         return sorted(set(out), reverse=True)
 
+    def _pow2_floor(x: float) -> int:
+        if x <= 1:
+            return 1
+        return 1 << int(math.floor(math.log2(x)))
+
+    def _pow2_ceil(x: float) -> int:
+        if x <= 1:
+            return 1
+        return 1 << int(math.ceil(math.log2(x)))
+
+    def _pow2_ladder(*, start: int, limit: int) -> list[int]:
+        if limit <= 0:
+            return []
+        v = max(1, _pow2_floor(start))
+        while v < start:
+            v *= 2
+        out: list[int] = []
+        while v <= limit:
+            out.append(v)
+            v *= 2
+        return out
+
     def add(*, raw: FusedMoEBlockConfig, effective: FusedMoEBlockConfig) -> None:
         ok, reason = validate(effective)
         if not ok:
@@ -555,29 +613,23 @@ def select_block_configs(
 
     for bt in bt_candidates:
         if bts_candidates_i is None:
-            # When `bts` isn't explicitly provided, pick a small default set around the
-            # *expected* per-expert token count within one `bt` tile:
+            # When `bts` isn't explicitly provided, cover both the balanced expected
+            # per-expert token count and larger staging/compute tiles up to the legal
+            # per-expert upper bound.
             #
             #   E[dyn_sz] ~= bt * ep_size * top_k / num_experts
             #
-            # This better matches the post-routing/A2A compute dimension than tying `bts`
-            # directly to `bt` (which can be tiny in decode when `num_tokens/ep_size` is small).
+            # The larger power-of-two tail matters for small-token EP cases: although
+            # `bt` is capped by local_num_tokens, a local expert can receive tokens
+            # from every EP rank after A2A, and using `bts/btc == bt` can leave the
+            # expert FFN as tiny underfilled GEMMs.
             max_bts = bt * case.ep_size
             expected = bt * case.ep_size * case.top_k / case.num_experts
-
-            def _pow2_floor(x: float) -> int:
-                if x <= 1:
-                    return 1
-                return 1 << (int(math.floor(math.log2(x))))
-
-            def _pow2_ceil(x: float) -> int:
-                if x <= 1:
-                    return 1
-                return 1 << (int(math.ceil(math.log2(x))))
 
             lo = _pow2_floor(expected)
             hi = _pow2_ceil(expected)
             bts_list = [bt, lo, hi, hi * 2]
+            bts_list.extend(_pow2_ladder(start=max(bt, hi * 4), limit=max_bts))
             bts_list = sorted({v for v in bts_list if 0 < v <= max_bts})
         else:
             # When explicitly provided, allow `bts` to exceed `bt` (up to `bt * ep_size`).
@@ -739,6 +791,9 @@ def run_all(
     token_valid_ratio: float = 1.0,
     token_mask_seed: int = 0,
     quant_block_k_override: int | None = None,
+    ep_size: int | None = None,
+    tp_size: int | None = None,
+    a2a_hbm_fraction: float | None = None,
     return_results: bool = False,
 ) -> list[dict[str, object]] | None:
     if use_grouped_topk is None:
@@ -761,6 +816,8 @@ def run_all(
         renormalize_topk_logits=renormalize_topk_logits,
         num_expert_group=num_expert_group,
         topk_group=topk_group,
+        ep_size=ep_size,
+        tp_size=tp_size,
         name_prefix="fused_moe",
     )
 
@@ -938,6 +995,15 @@ def run_all(
                     "FUSED_MOE_BENCHMARK_DISABLE_A2A",
                     all_disable=all_disable,
                 ),
+                disable_a2a_scatter=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_A2A_SCATTER",
+                    all_disable=all_disable,
+                ),
+                disable_a2a_gather=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_A2A_GATHER",
+                    all_disable=all_disable,
+                ),
+                a2a_hbm_fraction=a2a_hbm_fraction,
                 disable_dynamic_ffn1=_with_all_disable(
                     "FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN1",
                     all_disable=all_disable,
@@ -950,8 +1016,16 @@ def run_all(
                     "FUSED_MOE_BENCHMARK_DISABLE_WEIGHT_LOAD",
                     all_disable=all_disable,
                 ),
+                disable_a2a_s_tile_read=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_A2A_S_TILE_READ",
+                    all_disable=all_disable,
+                ),
                 disable_a2a_s_acc_tile_write=_with_all_disable(
                     "FUSED_MOE_BENCHMARK_DISABLE_A2A_S_ACC_TILE_WRITE",
+                    all_disable=all_disable,
+                ),
+                disable_output_accumulate=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_OUTPUT_ACCUMULATE",
                     all_disable=all_disable,
                 ),
                 disable_shared_expert=_with_all_disable(
@@ -966,9 +1040,6 @@ def run_all(
                     "FUSED_MOE_BENCHMARK_DISABLE_SYNC_BARRIER",
                     all_disable=all_disable,
                 ),
-                use_batch_dma_scatter=_env_bool("FUSED_MOE_BENCHMARK_USE_BATCH_DMA_SCATTER"),
-                use_vmem_permute_scatter=_env_bool("FUSED_MOE_BENCHMARK_USE_VMEM_PERMUTE_SCATTER"),
-                use_overlap_scatter=_env_bool("FUSED_MOE_BENCHMARK_USE_OVERLAP_SCATTER"),
             )
             if quantization_config is not None:
                 if quant_block_k is not None:
@@ -1265,6 +1336,45 @@ def run_all(
     return None
 
 
+def _apply_shape_preset(args: argparse.Namespace) -> None:
+    if not args.shape_preset:
+        return
+    preset = SHAPE_PRESETS[args.shape_preset]
+    for name, value in preset.items():
+        setattr(args, name, value)
+    print(f"Applied shape preset: {args.shape_preset}")
+
+
+def _initialize_distributed_if_requested(args: argparse.Namespace) -> None:
+    if args.dist_init_addr is None and args.num_processes is None and args.process_id is None:
+        return
+    missing = [
+        name
+        for name in ("dist_init_addr", "num_processes", "process_id")
+        if getattr(args, name) is None
+    ]
+    if missing:
+        raise ValueError(
+            "Distributed benchmark init requires --dist-init-addr, "
+            f"--num-processes, and --process-id. Missing: {missing}"
+        )
+    if jax.distributed.is_initialized():
+        print("JAX distributed is already initialized; skipping benchmark init.")
+        return
+    jax.distributed.initialize(
+        coordinator_address=args.dist_init_addr,
+        num_processes=args.num_processes,
+        process_id=args.process_id,
+        local_device_ids=args.local_device_ids,
+        initialization_timeout=args.distributed_init_timeout,
+    )
+    print(
+        "Initialized JAX distributed: "
+        f"process={jax.process_index()}/{jax.process_count()}, "
+        f"local_devices={len(jax.local_devices())}, global_devices={len(jax.devices())}"
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark fused_moe.")
     parser.add_argument("--iters", type=int, default=3, help="Number of benchmark iterations.")
@@ -1280,6 +1390,65 @@ def parse_args() -> argparse.Namespace:
         default="bfloat16",
         help="Data type to benchmark.",
         choices=["bfloat16", "float8_e4m3fn"],
+    )
+    parser.add_argument(
+        "--shape-preset",
+        choices=sorted(SHAPE_PRESETS.keys()),
+        default=None,
+        help="Optional model-shape preset. Preset values override explicit shape flags.",
+    )
+    parser.add_argument(
+        "--ep-size",
+        type=int,
+        default=None,
+        help="Explicit EP size. Fails if the requested EP is incompatible with visible devices.",
+    )
+    parser.add_argument(
+        "--tp-size",
+        type=int,
+        default=None,
+        help="Explicit benchmark TP/data-axis size. Fused EP-MoE benchmark normally uses 1.",
+    )
+    parser.add_argument(
+        "--a2a-hbm-fraction",
+        type=float,
+        default=None,
+        help="Override the HBM fraction used for A2A scratch buffers.",
+    )
+    parser.add_argument(
+        "--dist-init-addr",
+        type=str,
+        default=None,
+        help="JAX distributed coordinator address, e.g. rank0-ip:30000.",
+    )
+    parser.add_argument(
+        "--num-processes",
+        "--nnodes",
+        dest="num_processes",
+        type=int,
+        default=None,
+        help="Number of JAX distributed processes.",
+    )
+    parser.add_argument(
+        "--process-id",
+        "--node-rank",
+        dest="process_id",
+        type=int,
+        default=None,
+        help="This process rank for JAX distributed initialization.",
+    )
+    parser.add_argument(
+        "--local-device-ids",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Optional local device ids passed to jax.distributed.initialize.",
+    )
+    parser.add_argument(
+        "--distributed-init-timeout",
+        type=int,
+        default=300,
+        help="Timeout in seconds for jax.distributed.initialize.",
     )
     parser.add_argument(
         "--tune-block-config",
@@ -1302,9 +1471,10 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         help=(
             "Candidate list for bts (token staging tile inside expert_ffn). "
-            "When omitted, bts is auto-searched as a <=bt ladder (bt, bt/2, bt/4, ...) "
-            "to fit within the VMEM budget (bts must be <= bt). "
-            "Example: --bts-candidates 8 16 32 64"
+            "When omitted, bts is auto-searched around the expected per-expert "
+            "token count plus a power-of-two tail up to bt * ep_size. Explicit "
+            "candidates may exceed bt but must fit within bt * ep_size and VMEM. "
+            "Example: --bts-candidates 8 16 32 64 128 256 512"
         ),
     )
     parser.add_argument(
@@ -1333,7 +1503,7 @@ def parse_args() -> argparse.Namespace:
         help="Token counts to benchmark (e.g. --num-tokens 128 512 4096). Default: a fixed ladder.",
     )
     parser.add_argument("--num-experts", type=int, default=256)
-    parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument("--top-k", "--topk", dest="top_k", type=int, default=8)
     parser.add_argument("--hidden-size", type=int, default=2048)
     parser.add_argument("--intermediate-size", type=int, default=512)
     parser.add_argument("--activation", type=str, default="silu")
@@ -1456,6 +1626,8 @@ if __name__ == "__main__":
     except Exception:
         pass
     args = parse_args()
+    _apply_shape_preset(args)
+    _initialize_distributed_if_requested(args)
     if args.token_valid_ratios is None:
         if args.token_mask_mode == "none" and args.token_valid_ratio < 1.0:
             args.token_mask_mode = "random"
@@ -1525,6 +1697,9 @@ if __name__ == "__main__":
                 token_valid_ratio=ratio,
                 token_mask_seed=args.token_mask_seed,
                 quant_block_k_override=args.quant_block_k,
+                ep_size=args.ep_size,
+                tp_size=args.tp_size,
+                a2a_hbm_fraction=args.a2a_hbm_fraction,
                 return_results=True,
             )
             all_results.append((ratio, token_mask_mode, results))
