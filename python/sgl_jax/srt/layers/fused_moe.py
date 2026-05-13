@@ -74,6 +74,8 @@ class FusedEPMoE(nnx.Module):
         disable_a2a_s_acc_tile_write: bool = False,
         disable_shared_expert: bool = False,
         disable_all_reduce_metadata: bool = False,
+        metadata_algorithm: str = "recursive_doubling",
+        disable_metadata_background: bool = False,
         disable_sync_barrier: bool = False,
     ):
         self.hidden_size = hidden_size
@@ -102,6 +104,8 @@ class FusedEPMoE(nnx.Module):
         self.disable_a2a_s_acc_tile_write = disable_a2a_s_acc_tile_write
         self.disable_shared_expert = disable_shared_expert
         self.disable_all_reduce_metadata = disable_all_reduce_metadata
+        self.metadata_algorithm = metadata_algorithm
+        self.disable_metadata_background = disable_metadata_background
         self.disable_sync_barrier = disable_sync_barrier
 
         metadata = get_global_expert_location_metadata()
@@ -486,6 +490,8 @@ class FusedEPMoE(nnx.Module):
             disable_a2a_s_acc_tile_write=self.disable_a2a_s_acc_tile_write,
             disable_shared_expert=self.disable_shared_expert,
             disable_all_reduce_metadata=self.disable_all_reduce_metadata,
+            metadata_algorithm=self.metadata_algorithm,
+            disable_metadata_background=self.disable_metadata_background,
             disable_sync_barrier=self.disable_sync_barrier,
             # Optional parameters (not used in basic case)
             quant_block_k=quant_block_k,

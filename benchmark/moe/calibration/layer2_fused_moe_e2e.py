@@ -256,6 +256,12 @@ def _make_row(
         "name": variant.name,
         "disabled_flags": list(variant.disables),
         "diagnostic_question": variant.diagnostic_question,
+        "metadata_algorithm": os.getenv(
+            "FUSED_MOE_BENCHMARK_METADATA_ALGORITHM", "recursive_doubling"
+        ),
+        "disable_metadata_background": os.getenv(
+            "FUSED_MOE_BENCHMARK_DISABLE_METADATA_BACKGROUND", "0"
+        ),
     }
     row_metadata["benchmark_result"] = benchmark_result
     row_metadata["kernel_mapping"] = {

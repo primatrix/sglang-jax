@@ -569,6 +569,8 @@ def _fused_ep_moe_kernel(
     disable_a2a_s_acc_tile_write: bool = False,
     disable_shared_expert: bool = False,
     disable_all_reduce_metadata: bool = False,
+    metadata_algorithm: str = "recursive_doubling",
+    disable_metadata_background: bool = False,
     disable_sync_barrier: bool = False,
     quant_block_k: int | None = None,
     # Kernel tuning params.
@@ -803,9 +805,55 @@ def _fused_ep_moe_kernel(
 
             curr_background_state = background_state
             sync_barrier()
+            if metadata_algorithm == "direct_allgather":
+                for peer_id in range(num_devices):
+
+                    @pl.when(jnp.int32(peer_id) != my_id)
+                    def _issue(peer_id=peer_id):
+                        pltpu.make_async_remote_copy(
+                            src_ref=d2e_count_vmem.at[
+                                my_id, pl.ds(0, 1), pl.ds(0, padded_num_experts)
+                            ],
+                            dst_ref=d2e_count_vmem.at[
+                                my_id, pl.ds(0, 1), pl.ds(0, padded_num_experts)
+                            ],
+                            send_sem=send_sem,
+                            recv_sem=recv_sem,
+                            device_id=get_mesh_device_id(peer_id),
+                            device_id_type=pltpu.DeviceIdType.MESH,
+                        ).start()
+
+                # One scheduling window after all independent metadata sends are
+                # issued. The scheduler, not metadata, decides what background work
+                # this represents.
+                for _ in range(min(num_devices - 1, se_total_blocks)):
+                    curr_background_state = background_step(curr_background_state)
+
+                for peer_id in range(num_devices):
+
+                    @pl.when(jnp.int32(peer_id) != my_id)
+                    def _wait_recv(peer_id=peer_id):
+                        recv_ref = d2e_count_vmem.at[
+                            peer_id, pl.ds(0, 1), pl.ds(0, padded_num_experts)
+                        ]
+                        pltpu.make_async_copy(
+                            src_ref=recv_ref, dst_ref=recv_ref, sem=recv_sem
+                        ).wait()
+
+                for peer_id in range(num_devices):
+
+                    @pl.when(jnp.int32(peer_id) != my_id)
+                    def _wait_send(peer_id=peer_id):
+                        send_ref = d2e_count_vmem.at[
+                            my_id, pl.ds(0, 1), pl.ds(0, padded_num_experts)
+                        ]
+                        pltpu.make_async_copy(
+                            src_ref=send_ref, dst_ref=send_ref, sem=send_sem
+                        ).wait()
+
             # Fast path for power-of-two device counts: recursive doubling
             # allgather in O(log2(num_devices)) rounds.
-            if num_devices > 0 and (num_devices & (num_devices - 1)) == 0:
+            elif num_devices > 0 and (num_devices & (num_devices - 1)) == 0:
                 rounds = int(math.log2(num_devices))
                 for round_id in range(rounds):
                     sync_barrier()
@@ -2685,7 +2733,7 @@ def _fused_ep_moe_kernel(
         wait_store_output(bt_id=bt_id - 2)
 
         def schedule_background_work(curr_se_block):
-            if w1_shared_hbm is None or disable_shared_expert:
+            if w1_shared_hbm is None or disable_shared_expert or disable_metadata_background:
                 return curr_se_block
 
             @pl.when(curr_se_block < se_total_blocks)
@@ -3126,6 +3174,8 @@ def _validate_fused_ep_moe_args(
         "disable_a2a_s_acc_tile_write",
         "disable_shared_expert",
         "disable_all_reduce_metadata",
+        "metadata_algorithm",
+        "disable_metadata_background",
         "disable_sync_barrier",
         "quant_block_k",
         "block_config",
@@ -3158,6 +3208,8 @@ def fused_ep_moe(
     disable_a2a_s_acc_tile_write: bool = False,
     disable_shared_expert: bool = False,
     disable_all_reduce_metadata: bool = False,
+    metadata_algorithm: str = "recursive_doubling",
+    disable_metadata_background: bool = False,
     disable_sync_barrier: bool = False,
     # Quantization block size along the K (reduction) dimension.  Models with
     # 2D block-wise quantization (block_k, block_n) have their scales expanded
@@ -3182,6 +3234,13 @@ def fused_ep_moe(
 ):
 
     ep_size = get_ep_size(mesh, dp_axis_name, tp_axis_name)
+    if metadata_algorithm not in ("recursive_doubling", "direct_allgather"):
+        raise ValueError(
+            "metadata_algorithm must be one of "
+            "('recursive_doubling', 'direct_allgather'), got "
+            f"{metadata_algorithm!r}."
+        )
+
     if ep_size > 1 and not disable_a2a:
         if disable_all_reduce_metadata:
             raise ValueError(
@@ -3434,6 +3493,8 @@ def fused_ep_moe(
                 disable_a2a_s_acc_tile_write=disable_a2a_s_acc_tile_write,
                 disable_shared_expert=disable_shared_expert,
                 disable_all_reduce_metadata=disable_all_reduce_metadata,
+                metadata_algorithm=metadata_algorithm,
+                disable_metadata_background=disable_metadata_background,
                 disable_sync_barrier=disable_sync_barrier,
                 quant_block_k=quant_block_k,
                 bt=bt,

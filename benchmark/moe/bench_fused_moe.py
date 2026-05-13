@@ -1164,6 +1164,9 @@ def run_all(
 
         with jax.set_mesh(mesh):
             all_disable = _env_bool("FUSED_MOE_BENCHMARK_ALL_DISABLE", False)
+            metadata_algorithm = os.getenv(
+                "FUSED_MOE_BENCHMARK_METADATA_ALGORITHM", "recursive_doubling"
+            ).strip()
             fused_layer = FusedEPMoE(
                 hidden_size=case.hidden_size,
                 num_experts=case.num_experts,
@@ -1217,6 +1220,11 @@ def run_all(
                 ),
                 disable_all_reduce_metadata=_with_all_disable(
                     "FUSED_MOE_BENCHMARK_DISABLE_ALL_REDUCE_METADATA",
+                    all_disable=all_disable,
+                ),
+                metadata_algorithm=metadata_algorithm,
+                disable_metadata_background=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_METADATA_BACKGROUND",
                     all_disable=all_disable,
                 ),
                 disable_sync_barrier=_with_all_disable(
