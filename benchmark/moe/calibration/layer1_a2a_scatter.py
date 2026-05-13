@@ -1380,13 +1380,13 @@ def _pallas_a2a_scatter_call(
         sizes_smem,
         offsets_smem,
         send_counts_smem,
+        out_vmem,
         topk_sem,
         metadata_sem,
         send_sems,
         recv_sems,
         barrier_sem,
     ):
-        del out_ref
         my_id = pl.program_id(0) * 0 + 0
         del my_id
 
@@ -1544,19 +1544,26 @@ def _pallas_a2a_scatter_call(
             ).start()
             return None
 
-        def anchor_scan_side_effect():
-            ref = scratch_ref.at[0, pl.ds(0, 1)]
-            pltpu.make_async_copy(src_ref=ref, dst_ref=ref, sem=send_sems.at[0]).wait()
+        def commit_send_count_summary():
+            total = jnp.int32(0)
+            for slot in range(shape.local_num_experts):
+                total += send_counts_smem[slot]
+            out_vmem[0] = total
+            pltpu.make_async_copy(
+                src_ref=out_vmem,
+                dst_ref=out_ref,
+                sem=metadata_sem,
+            ).wait()
 
         from jax import lax
 
         if shape.scatter_mode == "scan_only_batch":
             lax.fori_loop(0, shape.bt, scan_one_batch, None, unroll=False)
-            anchor_scan_side_effect()
+            commit_send_count_summary()
             return
         if shape.scatter_mode == "scan_only_scatter_one_x8":
             lax.fori_loop(0, shape.local_num_experts, scan_expert_one, None, unroll=False)
-            anchor_scan_side_effect()
+            commit_send_count_summary()
             return
         if shape.scatter_mode == "descriptor_issue_only":
             lax.fori_loop(0, shape.bt * shape.top_k, issue_descriptor_one, None, unroll=False)
@@ -1591,10 +1598,11 @@ def _pallas_a2a_scatter_call(
             return None
 
         lax.fori_loop(0, shape.local_num_experts, wait_recv_one, None, unroll=False)
+        commit_send_count_summary()
 
     return pl.pallas_call(
         kernel,
-        out_shape=jax.ShapeDtypeStruct((1,), tokens_hbm.dtype),
+        out_shape=jax.ShapeDtypeStruct((1,), jnp.int32),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=[
@@ -1614,6 +1622,7 @@ def _pallas_a2a_scatter_call(
                 pltpu.SMEM((1, PADDED_NUM_EXPERTS), topk_ids_hbm.dtype),
                 pltpu.SMEM((PADDED_NUM_EXPERTS,), topk_ids_hbm.dtype),
                 pltpu.SMEM((shape.local_num_experts,), topk_ids_hbm.dtype),
+                pltpu.VMEM((1,), jnp.int32),
                 pltpu.SemaphoreType.DMA,
                 pltpu.SemaphoreType.DMA,
                 pltpu.SemaphoreType.DMA((shape.local_num_experts,)),
