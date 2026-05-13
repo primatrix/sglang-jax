@@ -66,6 +66,7 @@ class A2AScatterShape:
     local_routes_per_token: int = 0
     routing_mode: str = "fixed_local"
     routing_seed: int = 17
+    scatter_mode: str = "batch"
     top_k: int = TOP_K
     hidden_size: int = HIDDEN_SIZE
     ep_size: int = EP_SIZE
@@ -585,6 +586,7 @@ def _metadata_for_shape(metadata: dict[str, Any], shape: A2AScatterShape) -> dic
         "local_num_experts": shape.local_num_experts,
         "num_experts": shape.ep_size * shape.local_num_experts,
         "routing_mode": shape.routing_mode,
+        "scatter_mode": shape.scatter_mode,
         "routing_seed": (shape.routing_seed if shape.routing_mode == "uniform_topk" else None),
         "routing_pattern": (
             "seeded uniform top-k without replacement over all experts"
@@ -618,10 +620,16 @@ def _metadata_for_shape(metadata: dict[str, Any], shape: A2AScatterShape) -> dic
         "includes": [
             "precomputed_t2e_routing_hbm_to_vmem",
             "precomputed_starts_sizes_hbm_to_vmem",
-            "local_scatter_start",
-            "remote_scatter_start",
-            "send_wait",
-            "recv_wait",
+            *(
+                [
+                    "local_scatter_start",
+                    "remote_scatter_start",
+                    "send_wait",
+                    "recv_wait",
+                ]
+                if shape.scatter_mode in ("batch", "descriptor_issue_only")
+                else ["routing_scan", "offset_update", "send_count_update"]
+            ),
             "mesh_barrier",
         ],
         "excludes": [
@@ -1378,7 +1386,6 @@ def _pallas_a2a_scatter_call(
         recv_sems,
         barrier_sem,
     ):
-        del out_ref
         my_id = pl.program_id(0) * 0 + 0
         del my_id
 
@@ -1439,7 +1446,7 @@ def _pallas_a2a_scatter_call(
         for slot in range(shape.local_num_experts):
             send_counts_smem[slot] = jnp.int32(0)
 
-        def scatter_one(t_id, _):
+        def scatter_one_batch(t_id, _):
             for k_id in range(shape.top_k):
                 e_id = topk_ids_vmem[t_id, k_id]
                 is_valid = e_id >= 0
@@ -1480,9 +1487,76 @@ def _pallas_a2a_scatter_call(
 
             return None
 
+        def scan_one_batch(t_id, _):
+            for k_id in range(shape.top_k):
+                e_id = topk_ids_vmem[t_id, k_id]
+                is_valid = e_id >= 0
+                e_id_safe = jnp.where(is_valid, e_id, jnp.int32(0))
+                e_sem_id = e_id_safe % shape.local_num_experts
+                offset = offsets_smem[e_id_safe]
+                offsets_smem[e_id_safe] = offset + jnp.where(is_valid, jnp.int32(1), jnp.int32(0))
+                recv_id = e_id_safe // shape.local_num_experts
+                remote_sz = jnp.where(is_valid & (recv_id != rank), jnp.int32(1), jnp.int32(0))
+                send_counts_smem[e_sem_id] = send_counts_smem[e_sem_id] + remote_sz
+            return None
+
+        def scan_expert_one(local_e_id, _):
+            def scan_token_one(t_id, __):
+                for k_id in range(shape.top_k):
+                    e_id = topk_ids_vmem[t_id, k_id]
+                    is_valid = e_id >= 0
+                    e_id_safe = jnp.where(is_valid, e_id, jnp.int32(0))
+                    recv_id = e_id_safe // shape.local_num_experts
+                    is_active_expert = is_valid & (
+                        e_id_safe % shape.local_num_experts == local_e_id
+                    )
+                    offset = offsets_smem[e_id_safe]
+                    offsets_smem[e_id_safe] = offset + jnp.where(
+                        is_active_expert, jnp.int32(1), jnp.int32(0)
+                    )
+                    remote_sz = jnp.where(
+                        is_active_expert & (recv_id != rank), jnp.int32(1), jnp.int32(0)
+                    )
+                    send_counts_smem[local_e_id] = send_counts_smem[local_e_id] + remote_sz
+                return None
+
+            lax.fori_loop(0, shape.bt, scan_token_one, None, unroll=False)
+            return None
+
+        def issue_descriptor_one(item_id, _):
+            # Descriptor-only path: predecoded work items, no t2e routing scan.
+            # This isolates remote-copy issue/wait cost from predicate-heavy routing logic.
+            t_id = item_id // shape.top_k
+            k_id = item_id - t_id * shape.top_k
+            recv_id = (rank + k_id + 1) % shape.ep_size
+            e_sem_id = k_id % shape.local_num_experts
+            dst_start = t_id
+            send_counts_smem[e_sem_id] = send_counts_smem[e_sem_id] + jnp.int32(1)
+
+            pltpu.make_async_remote_copy(
+                src_ref=tokens_ref.at[pl.ds(t_id, 1)],
+                dst_ref=scratch_ref.at[e_sem_id, pl.ds(dst_start, 1)],
+                send_sem=send_sems.at[e_sem_id],
+                recv_sem=recv_sems.at[e_sem_id],
+                device_id=get_mesh_device_id(recv_id),
+                device_id_type=pltpu.DeviceIdType.MESH,
+            ).start()
+            return None
+
         from jax import lax
 
-        lax.fori_loop(0, shape.bt, scatter_one, None, unroll=False)
+        if shape.scatter_mode == "scan_only_batch":
+            lax.fori_loop(0, shape.bt, scan_one_batch, None, unroll=False)
+            out_ref[0] = send_counts_smem[0].astype(out_ref.dtype)
+            return
+        if shape.scatter_mode == "scan_only_scatter_one_x8":
+            lax.fori_loop(0, shape.local_num_experts, scan_expert_one, None, unroll=False)
+            out_ref[0] = send_counts_smem[0].astype(out_ref.dtype)
+            return
+        if shape.scatter_mode == "descriptor_issue_only":
+            lax.fori_loop(0, shape.bt * shape.top_k, issue_descriptor_one, None, unroll=False)
+        else:
+            lax.fori_loop(0, shape.bt, scatter_one_batch, None, unroll=False)
 
         def wait_send_one(slot, _):
             scatter_send_sz = send_counts_smem[slot]
@@ -1512,6 +1586,7 @@ def _pallas_a2a_scatter_call(
             return None
 
         lax.fori_loop(0, shape.local_num_experts, wait_recv_one, None, unroll=False)
+        out_ref[0] = send_counts_smem[0].astype(out_ref.dtype)
 
     return pl.pallas_call(
         kernel,

@@ -79,6 +79,7 @@ SUITE_V7X32_BF16_A2A_CURVE_V2 = "v7x32_bf16_a2a_curve_v2"
 SUITE_V7X32_BF16_A2A_TOPK8_V1 = "v7x32_bf16_a2a_topk8_v1"
 SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT_V1 = "v7x32_bf16_a2a_topk8_preflight_v1"
 SUITE_V7X32_BF16_A2A_TOPK8 = "v7x32_bf16_a2a_topk8"
+SUITE_V7X32_BF16_A2A_SCATTER_BREAKDOWN = "v7x32_bf16_a2a_scatter_breakdown"
 SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT = "v7x32_bf16_a2a_topk8_preflight"
 SUITE_V7X32_BF16_DMA_OVERLAP_DECODE64 = "v7x32_bf16_dma_overlap_decode64"
 SUITE_V7X32_BF16_DMA_OVERLAP_DECODE64_AMPLIFIED = "v7x32_bf16_dma_overlap_decode64_amplified"
@@ -105,6 +106,7 @@ SUITES = (
     SUITE_V7X32_BF16_A2A_TOPK8_V1,
     SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT_V1,
     SUITE_V7X32_BF16_A2A_TOPK8,
+    SUITE_V7X32_BF16_A2A_SCATTER_BREAKDOWN,
     SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT,
     SUITE_V7X32_BF16_DMA_OVERLAP_DECODE64,
     SUITE_V7X32_BF16_DMA_OVERLAP_DECODE64_AMPLIFIED,
@@ -478,6 +480,29 @@ PHASE1_A2A_SCATTER_TOPK8_MIXED_SHAPES: tuple[layer1_a2a_scatter.A2AScatterShape,
     for bt in (2, 4, 8, 16, 32, 64, 128)
 )
 
+PHASE1_A2A_SCATTER_BREAKDOWN_SHAPES: tuple[layer1_a2a_scatter.A2AScatterShape, ...] = tuple(
+    layer1_a2a_scatter.A2AScatterShape(
+        path_class=f"scatter_topk8_uniform_{scatter_mode}",
+        bt=bt,
+        routing_mode="uniform_topk",
+        scatter_mode=scatter_mode,
+    )
+    for bt in (32, 128)
+    for scatter_mode in (
+        "batch",
+        "scan_only_batch",
+        "scan_only_scatter_one_x8",
+    )
+) + tuple(
+    layer1_a2a_scatter.A2AScatterShape(
+        path_class="scatter_topk8_descriptor_issue_only",
+        bt=bt,
+        routing_mode="fixed_local",
+        scatter_mode="descriptor_issue_only",
+    )
+    for bt in (32, 128)
+)
+
 PHASE1_A2A_SCATTER_TOPK8_PREFLIGHT_SHAPES: tuple[layer1_a2a_scatter.A2AScatterShape, ...] = tuple(
     layer1_a2a_scatter.A2AScatterShape(path_class="scatter_topk8_preflight", bt=bt)
     for bt in PHASE1_A2A_TOPK8_PREFLIGHT_BT_VALUES
@@ -829,6 +854,8 @@ def load_layer1_a2a_scatter_suite_shapes(
         return PHASE1_A2A_SCATTER_TOPK8_PREFLIGHT_SHAPES
     if suite == SUITE_V7X32_BF16_A2A_TOPK8:
         return PHASE1_A2A_SCATTER_TOPK8_MIXED_SHAPES
+    if suite == SUITE_V7X32_BF16_A2A_SCATTER_BREAKDOWN:
+        return PHASE1_A2A_SCATTER_BREAKDOWN_SHAPES
     if suite == SUITE_V7X32_BF16_A2A_TOPK8_PREFLIGHT:
         return PHASE1_A2A_SCATTER_TOPK8_PREFLIGHT_SHAPES
     raise ValueError(f"Unsupported Layer 1 A2A scatter suite: {suite}")
