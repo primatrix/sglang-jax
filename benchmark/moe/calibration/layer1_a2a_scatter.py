@@ -435,14 +435,7 @@ def build_rows(
                 metadata=measured_metadata,
                 status=STATUS_MEASURED,
                 latency_ms_samples=samples,
-                implementation_note=(
-                    "Measured with a Pallas TPU microkernel that mirrors the "
-                    "fused-MoE start_a2a_scatter_batch remote-DMA structure: "
-                    "top_k=8, one token payload per async remote copy, "
-                    "rank-dependent routing, per-slot send/recv semaphores, "
-                    "and self-copy wait anchors. It measures scatter only, not "
-                    "metadata allgather, expert compute, or gather."
-                ),
+                implementation_note=_scatter_implementation_note(shape),
             )
         )
 
@@ -544,21 +537,30 @@ def _make_row(
     latency_ms_samples: list[float],
     implementation_note: str,
 ) -> dict[str, Any]:
+    is_scan_only = shape.scatter_mode.startswith("scan_only_")
     return build_observation_row(
         scenario=SCENARIO_LAYER1_A2A_SCATTER,
         suite=suite,
         layer=1,
-        path="remote_scatter",
+        path="routing_scan" if is_scan_only else "remote_scatter",
         path_class=shape.path_class,
         dtype=dtype,
         weight_dtype=weight_dtype,
         t_packing=t_packing,
         bf=shape.bt,
-        bd=shape.hidden_size,
-        tile_shape=(shape.bt, shape.top_k, T_PACKING, shape.hidden_size // T_PACKING),
-        bytes_hbm=_payload_bytes_per_device(shape),
-        bytes_per_fetch=_payload_bytes_per_device(shape),
-        dma_count=shape.bt * shape.top_k,
+        bd=PADDED_TOP_K if is_scan_only else shape.hidden_size,
+        tile_shape=(
+            (shape.bt, PADDED_TOP_K)
+            if is_scan_only
+            else (shape.bt, shape.top_k, T_PACKING, shape.hidden_size // T_PACKING)
+        ),
+        bytes_hbm=(
+            _routing_bytes_per_device(shape) if is_scan_only else _payload_bytes_per_device(shape)
+        ),
+        bytes_per_fetch=(
+            _routing_bytes_per_device(shape) if is_scan_only else _payload_bytes_per_device(shape)
+        ),
+        dma_count=0 if is_scan_only else shape.bt * shape.top_k,
         status=status,
         execution_mode=execution_mode,
         latency_ms_samples=latency_ms_samples,
@@ -572,9 +574,16 @@ def _make_row(
 def _metadata_for_shape(metadata: dict[str, Any], shape: A2AScatterShape) -> dict[str, Any]:
     routing_stats = _routing_stats(shape)
     enriched = dict(metadata)
+    is_scan_only = shape.scatter_mode.startswith("scan_only_")
     enriched["a2a_scatter"] = {
-        "kernel_reference": "python/sgl_jax/srt/kernels/fused_moe/v1/kernel.py:start_a2a_scatter_batch",
-        "operation": "pallas_make_async_remote_copy",
+        "kernel_reference": (
+            "python/sgl_jax/srt/kernels/fused_moe/v1/kernel.py:start_a2a_scatter"
+            if is_scan_only
+            else "python/sgl_jax/srt/kernels/fused_moe/v1/kernel.py:start_a2a_scatter_batch"
+        ),
+        "operation": (
+            "local_pallas_routing_scan" if is_scan_only else "pallas_make_async_remote_copy"
+        ),
         "path_class": shape.path_class,
         "bt": shape.bt,
         "top_k": shape.top_k,
@@ -619,21 +628,22 @@ def _metadata_for_shape(metadata: dict[str, Any], shape: A2AScatterShape) -> dic
         ),
         "includes": [
             "precomputed_t2e_routing_hbm_to_vmem",
-            "precomputed_starts_sizes_hbm_to_vmem",
             *(
-                [
+                ["routing_scan", "offset_update", "send_count_update", "hbm_output_anchor"]
+                if is_scan_only
+                else [
+                    "precomputed_starts_sizes_hbm_to_vmem",
                     "local_scatter_start",
                     "remote_scatter_start",
                     "send_wait",
                     "recv_wait",
                 ]
-                if shape.scatter_mode in ("batch", "descriptor_issue_only")
-                else ["routing_scan", "offset_update", "send_count_update"]
             ),
-            "mesh_barrier",
+            *(["mesh_barrier"] if not is_scan_only else []),
         ],
         "excludes": [
             "metadata_allgather",
+            *(["payload_local_dma", "payload_remote_dma"] if is_scan_only else []),
             "expert_compute",
             "a2a_gather",
             "output_accumulation",
@@ -834,6 +844,15 @@ def _measure_a2a_scatter_ms(
     discard_runs: int,
     trace_root: str,
 ) -> list[float]:
+    if shape.scatter_mode.startswith("scan_only_"):
+        return _measure_a2a_scatter_scan_ms(
+            shape,
+            warmup_runs=warmup_runs,
+            sample_runs=sample_runs,
+            discard_runs=discard_runs,
+            trace_root=trace_root,
+        )
+
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -901,6 +920,49 @@ def _measure_a2a_scatter_ms(
         )
 
 
+def _measure_a2a_scatter_scan_ms(
+    shape: A2AScatterShape,
+    *,
+    warmup_runs: int,
+    sample_runs: int,
+    discard_runs: int,
+    trace_root: str,
+) -> list[float]:
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    from benchmark.utils import multiple_iteration_timeit_from_trace
+
+    topk_ids = jax.device_put(_make_topk_ids_local(np=np, shape=shape))
+    jax.block_until_ready(topk_ids)
+
+    @jax.jit
+    def run_scan(topk_ids_hbm):
+        return _pallas_a2a_scatter_scan_call(
+            topk_ids_hbm,
+            shape=shape,
+            jax=jax,
+            jnp=jnp,
+            pl=pl,
+            pltpu=pltpu,
+        )
+
+    jax.block_until_ready(run_scan(topk_ids))
+    task = f"layer1_a2a_scatter_scan_bt{shape.bt}_{shape.path_class}"
+    return multiple_iteration_timeit_from_trace(
+        compute_func=run_scan,
+        data_generator=lambda: (topk_ids,),
+        task=task,
+        tries=sample_runs,
+        warmup=warmup_runs,
+        discard_initial_samples=discard_runs,
+        trace_root=trace_root,
+    )
+
+
 def _sharded_scatter_call(
     tokens_hbm,
     topk_ids_hbm,
@@ -943,6 +1005,114 @@ def _sharded_scatter_call(
         )
 
     return per_rank(tokens_hbm, topk_ids_hbm, starts_hbm, sizes_hbm, scratch_hbm)
+
+
+def _pallas_a2a_scatter_scan_call(
+    topk_ids_hbm,
+    *,
+    shape,
+    jax,
+    jnp,
+    pl,
+    pltpu,
+):
+    def kernel(
+        topk_ids_ref,
+        out_ref,
+        topk_ids_vmem,
+        offsets_smem,
+        send_counts_smem,
+        out_vmem,
+        copy_sem,
+    ):
+        rank = jnp.int32(0)
+
+        topk_copy = pltpu.make_async_copy(
+            src_ref=topk_ids_ref.at[pl.ds(0, shape.bt)],
+            dst_ref=topk_ids_vmem,
+            sem=copy_sem,
+        )
+        topk_copy.start()
+        topk_copy.wait()
+
+        for e_id in range(PADDED_NUM_EXPERTS):
+            offsets_smem[e_id] = jnp.int32(0)
+        for slot in range(shape.local_num_experts):
+            send_counts_smem[slot] = jnp.int32(0)
+
+        def scan_one_batch(t_id, _):
+            for k_id in range(shape.top_k):
+                e_id = topk_ids_vmem[t_id, k_id]
+                is_valid = e_id >= 0
+                e_id_safe = jnp.where(is_valid, e_id, jnp.int32(0))
+                e_sem_id = e_id_safe % shape.local_num_experts
+                offset = offsets_smem[e_id_safe]
+                offsets_smem[e_id_safe] = offset + jnp.where(is_valid, jnp.int32(1), jnp.int32(0))
+                recv_id = e_id_safe // shape.local_num_experts
+                remote_sz = jnp.where(is_valid & (recv_id != rank), jnp.int32(1), jnp.int32(0))
+                send_counts_smem[e_sem_id] = send_counts_smem[e_sem_id] + remote_sz
+            return None
+
+        def scan_expert_one(local_e_id, _):
+            def scan_token_one(t_id, __):
+                for k_id in range(shape.top_k):
+                    e_id = topk_ids_vmem[t_id, k_id]
+                    is_valid = e_id >= 0
+                    e_id_safe = jnp.where(is_valid, e_id, jnp.int32(0))
+                    recv_id = e_id_safe // shape.local_num_experts
+                    is_active_expert = is_valid & (
+                        e_id_safe % shape.local_num_experts == local_e_id
+                    )
+                    offset = offsets_smem[e_id_safe]
+                    offsets_smem[e_id_safe] = offset + jnp.where(
+                        is_active_expert, jnp.int32(1), jnp.int32(0)
+                    )
+                    remote_sz = jnp.where(
+                        is_active_expert & (recv_id != rank), jnp.int32(1), jnp.int32(0)
+                    )
+                    send_counts_smem[local_e_id] = send_counts_smem[local_e_id] + remote_sz
+                return None
+
+            lax.fori_loop(0, shape.bt, scan_token_one, None, unroll=False)
+            return None
+
+        from jax import lax
+
+        if shape.scatter_mode == "scan_only_batch":
+            lax.fori_loop(0, shape.bt, scan_one_batch, None, unroll=False)
+        elif shape.scatter_mode == "scan_only_scatter_one_x8":
+            lax.fori_loop(0, shape.local_num_experts, scan_expert_one, None, unroll=False)
+        else:
+            raise ValueError(f"Unsupported scan-only scatter_mode={shape.scatter_mode!r}")
+
+        total = jnp.int32(0)
+        for slot in range(shape.local_num_experts):
+            total += send_counts_smem[slot]
+        out_vmem[...] = jnp.zeros((1,), jnp.int32) + total
+        pltpu.make_async_copy(src_ref=out_vmem, dst_ref=out_ref, sem=copy_sem).wait()
+
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((1,), jnp.int32),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)],
+            out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            grid=(1,),
+            scratch_shapes=[
+                pltpu.VMEM((shape.bt, PADDED_TOP_K), topk_ids_hbm.dtype),
+                pltpu.SMEM((PADDED_NUM_EXPERTS,), topk_ids_hbm.dtype),
+                pltpu.SMEM((shape.local_num_experts,), topk_ids_hbm.dtype),
+                pltpu.VMEM((1,), jnp.int32),
+                pltpu.SemaphoreType.DMA,
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            has_side_effects=True,
+            vmem_limit_bytes=VMEM_LIMIT_BYTES,
+        ),
+        name=f"layer1_a2a_scatter_scan_bt{shape.bt}",
+    )(topk_ids_hbm)
 
 
 def _measure_a2a_metadata_ms(
@@ -1704,6 +1874,18 @@ def _make_topk_ids(*, jax: Any, np: Any, sharding: Any, shape: A2AScatterShape):
     return jax.make_array_from_callback(global_shape, sharding, data_callback)
 
 
+def _make_topk_ids_local(*, np: Any, shape: A2AScatterShape):
+    out = np.full((shape.bt, PADDED_TOP_K), -1, dtype=np.int32)
+    for local_token_id in range(shape.bt):
+        out[local_token_id, : shape.top_k] = _topk_ids_for_token(
+            np=np,
+            global_token_id=local_token_id,
+            rank_id=0,
+            shape=shape,
+        )
+    return out
+
+
 def _make_starts_by_rank(*, jax: Any, np: Any, sharding: Any, shape: A2AScatterShape):
     counts = _counts_by_rank(np=np, shape=shape)
     starts = np.zeros((shape.ep_size, PADDED_NUM_EXPERTS), dtype=np.int32)
@@ -1812,6 +1994,33 @@ def _build_tensor_mesh(*, jax: Any, np: Any, ep_size: int, tp_size: int):
 
 def _payload_bytes_per_device(shape: A2AScatterShape) -> int:
     return shape.bt * shape.top_k * shape.hidden_size * DTYPE_BYTES
+
+
+def _routing_bytes_per_device(shape: A2AScatterShape) -> int:
+    return shape.bt * PADDED_TOP_K * _dtype_bytes("int32")
+
+
+def _scatter_implementation_note(shape: A2AScatterShape) -> str:
+    if shape.scatter_mode.startswith("scan_only_"):
+        return (
+            "Measured with a local Pallas TPU microkernel that isolates fused-MoE "
+            "scatter routing scan, predicate checks, expert offset updates, and "
+            "per-slot send-count updates. It excludes payload local/remote DMA, "
+            "metadata allgather, expert compute, and gather."
+        )
+    if shape.scatter_mode == "descriptor_issue_only":
+        return (
+            "Measured with a Pallas TPU microkernel that issues descriptor-like "
+            "remote DMA payload copies without scanning t2e routing. It isolates "
+            "payload remote-DMA issue/wait cost from routing scan and offset logic."
+        )
+    return (
+        "Measured with a Pallas TPU microkernel that mirrors the fused-MoE "
+        "start_a2a_scatter_batch remote-DMA structure: top_k=8, one token payload "
+        "per async remote copy, rank-dependent routing, per-slot send/recv "
+        "semaphores, and self-copy wait anchors. It measures scatter only, not "
+        "metadata allgather, expert compute, or gather."
+    )
 
 
 def _remote_scatter_copies_per_device(shape: A2AScatterShape) -> int:
