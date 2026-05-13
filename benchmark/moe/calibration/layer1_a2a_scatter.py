@@ -1555,14 +1555,37 @@ def _pallas_a2a_scatter_call(
                 sem=metadata_sem,
             ).wait()
 
+        def issue_remote_anchor():
+            # Keep scan-only kernels on the same remote-DMA/semaphore path as
+            # real scatter. Both scan-only modes include this identical anchor,
+            # so their delta isolates repeated routing-scan overhead.
+            recv_id = (rank + jnp.int32(1)) % jnp.int32(shape.ep_size)
+            anchor_ref = scratch_ref.at[0, pl.ds(0, 1)]
+            pltpu.make_async_remote_copy(
+                src_ref=tokens_ref.at[pl.ds(0, 1)],
+                dst_ref=anchor_ref,
+                send_sem=send_sems.at[0],
+                recv_sem=recv_sems.at[0],
+                device_id=get_mesh_device_id(recv_id),
+                device_id_type=pltpu.DeviceIdType.MESH,
+            ).start()
+            pltpu.make_async_copy(
+                src_ref=anchor_ref, dst_ref=anchor_ref, sem=send_sems.at[0]
+            ).wait()
+            pltpu.make_async_copy(
+                src_ref=anchor_ref, dst_ref=anchor_ref, sem=recv_sems.at[0]
+            ).wait()
+
         from jax import lax
 
         if shape.scatter_mode == "scan_only_batch":
             lax.fori_loop(0, shape.bt, scan_one_batch, None, unroll=False)
+            issue_remote_anchor()
             commit_send_count_summary()
             return
         if shape.scatter_mode == "scan_only_scatter_one_x8":
             lax.fori_loop(0, shape.local_num_experts, scan_expert_one, None, unroll=False)
+            issue_remote_anchor()
             commit_send_count_summary()
             return
         if shape.scatter_mode == "descriptor_issue_only":
