@@ -929,26 +929,32 @@ def _measure_a2a_scatter_scan_ms(
     trace_root: str,
 ) -> list[float]:
     import jax
-    import jax.numpy as jnp
     import numpy as np
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import NamedSharding
+    from jax.sharding import PartitionSpec as P
 
     from benchmark.utils import multiple_iteration_timeit_from_trace
 
-    topk_ids = jax.device_put(_make_topk_ids_local(np=np, shape=shape))
+    mesh = _build_tensor_mesh(jax=jax, np=np, ep_size=shape.ep_size, tp_size=1)
+    topk_sharding = NamedSharding(mesh, P("tensor", None))
+    topk_ids = _make_topk_ids(jax=jax, np=np, sharding=topk_sharding, shape=shape)
     jax.block_until_ready(topk_ids)
 
-    @jax.jit
-    def run_scan(topk_ids_hbm):
-        return _pallas_a2a_scatter_scan_call(
-            topk_ids_hbm,
-            shape=shape,
-            jax=jax,
-            jnp=jnp,
-            pl=pl,
-            pltpu=pltpu,
-        )
+    with jax.set_mesh(mesh):
+
+        @jax.jit
+        def run_scan(topk_ids_hbm):
+            return _sharded_scatter_scan_call(
+                topk_ids_hbm,
+                shape=shape,
+                mesh=mesh,
+                jax=jax,
+                pl=pl,
+                pltpu=pltpu,
+                P=P,
+            )
 
     jax.block_until_ready(run_scan(topk_ids))
     task = f"layer1_a2a_scatter_scan_bt{shape.bt}_{shape.path_class}"
@@ -1007,15 +1013,44 @@ def _sharded_scatter_call(
     return per_rank(tokens_hbm, topk_ids_hbm, starts_hbm, sizes_hbm, scratch_hbm)
 
 
+def _sharded_scatter_scan_call(
+    topk_ids_hbm,
+    *,
+    shape: A2AScatterShape,
+    mesh,
+    jax,
+    pl,
+    pltpu,
+    P,
+):
+    @jax.shard_map(
+        mesh=mesh,
+        in_specs=P("tensor", None),
+        out_specs=P("tensor"),
+        check_vma=False,
+    )
+    def per_rank(topk_ids_local):
+        return _pallas_a2a_scatter_scan_call(
+            topk_ids_local,
+            shape=shape,
+            jax=jax,
+            pl=pl,
+            pltpu=pltpu,
+        )
+
+    return per_rank(topk_ids_hbm)
+
+
 def _pallas_a2a_scatter_scan_call(
     topk_ids_hbm,
     *,
     shape,
     jax,
-    jnp,
     pl,
     pltpu,
 ):
+    import jax.numpy as jnp
+
     def kernel(
         topk_ids_ref,
         out_ref,
@@ -1872,18 +1907,6 @@ def _make_topk_ids(*, jax: Any, np: Any, sharding: Any, shape: A2AScatterShape):
         return out
 
     return jax.make_array_from_callback(global_shape, sharding, data_callback)
-
-
-def _make_topk_ids_local(*, np: Any, shape: A2AScatterShape):
-    out = np.full((shape.bt, PADDED_TOP_K), -1, dtype=np.int32)
-    for local_token_id in range(shape.bt):
-        out[local_token_id, : shape.top_k] = _topk_ids_for_token(
-            np=np,
-            global_token_id=local_token_id,
-            rank_id=0,
-            shape=shape,
-        )
-    return out
 
 
 def _make_starts_by_rank(*, jax: Any, np: Any, sharding: Any, shape: A2AScatterShape):
