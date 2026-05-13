@@ -39,10 +39,11 @@ from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
 )
 from sgl_jax.srt.layers.moe import FusedEPMoE, TopK
 
-# Match the fused_moe kernel's current pallas VMEM limit (96 MiB).
-# The estimator still applies its own MSA overhead factor, and callers can
-# further tighten the search with `--tpu-vmem-headroom-ratio`.
-DEFAULT_TPU_VMEM_BUDGET_MB = 96
+# Match the effective TPU VMEM capacity reported by XLA on v7x.  The fused-MoE
+# Pallas call currently passes a larger vmem_limit_bytes value, but v7x compile
+# errors still report a 64 MiB VMEM capacity; using 96 MiB here admits configs
+# that cannot compile.
+DEFAULT_TPU_VMEM_BUDGET_MB = 64
 DEFAULT_TPU_VMEM_BUDGET_BYTES = DEFAULT_TPU_VMEM_BUDGET_MB * 1024 * 1024
 
 # ---------------------------------------------------------------------------
