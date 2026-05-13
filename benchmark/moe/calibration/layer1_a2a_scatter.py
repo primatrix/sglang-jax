@@ -1386,6 +1386,7 @@ def _pallas_a2a_scatter_call(
         recv_sems,
         barrier_sem,
     ):
+        del out_ref
         my_id = pl.program_id(0) * 0 + 0
         del my_id
 
@@ -1543,15 +1544,19 @@ def _pallas_a2a_scatter_call(
             ).start()
             return None
 
+        def anchor_scan_side_effect():
+            ref = scratch_ref.at[0, pl.ds(0, 1)]
+            pltpu.make_async_copy(src_ref=ref, dst_ref=ref, sem=send_sems.at[0]).wait()
+
         from jax import lax
 
         if shape.scatter_mode == "scan_only_batch":
             lax.fori_loop(0, shape.bt, scan_one_batch, None, unroll=False)
-            out_ref[0] = send_counts_smem[0].astype(out_ref.dtype)
+            anchor_scan_side_effect()
             return
         if shape.scatter_mode == "scan_only_scatter_one_x8":
             lax.fori_loop(0, shape.local_num_experts, scan_expert_one, None, unroll=False)
-            out_ref[0] = send_counts_smem[0].astype(out_ref.dtype)
+            anchor_scan_side_effect()
             return
         if shape.scatter_mode == "descriptor_issue_only":
             lax.fori_loop(0, shape.bt * shape.top_k, issue_descriptor_one, None, unroll=False)
@@ -1586,7 +1591,6 @@ def _pallas_a2a_scatter_call(
             return None
 
         lax.fori_loop(0, shape.local_num_experts, wait_recv_one, None, unroll=False)
-        out_ref[0] = send_counts_smem[0].astype(out_ref.dtype)
 
     return pl.pallas_call(
         kernel,
