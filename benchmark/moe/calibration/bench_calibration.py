@@ -929,6 +929,10 @@ def load_layer1_ffn_pallas_suite_shapes(
         if raw_num_tokens:
             allowed = {int(part.strip()) for part in raw_num_tokens.split(",") if part.strip()}
             shapes = tuple(shape for shape in shapes if shape.num_tokens in allowed)
+        raw_dyn_values = os.getenv("CALIBRATION_LAYER1_FFN_PALLAS_DYN_VALUES")
+        if raw_dyn_values:
+            allowed_dyn = {int(part.strip()) for part in raw_dyn_values.split(",") if part.strip()}
+            shapes = tuple(shape for shape in shapes if shape.dyn_sz in allowed_dyn)
         return shapes
     raise ValueError(f"Unsupported Layer 1 Pallas FFN suite: {suite}")
 
