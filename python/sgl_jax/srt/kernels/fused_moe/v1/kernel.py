@@ -703,7 +703,15 @@ def _fused_ep_moe_kernel(
             sem=local_sems.at[bt_sem_id, 13],
         ).wait()
 
-    def all_reduce_metadata(*, bt_sem_id, t2e_routing, starts, sizes):
+    def all_reduce_metadata(
+        *,
+        bt_sem_id,
+        t2e_routing,
+        starts,
+        sizes,
+        background_state,
+        background_step,
+    ):
         send_sem = send_x2_sems.at[0]
         recv_sem = recv_x2_sems.at[0]
 
@@ -765,7 +773,7 @@ def _fused_ep_moe_kernel(
                 pltpu.VMEM(expert_starts_x2_smem.shape[1:], expert_starts_x2_smem.dtype),
                 pltpu.VMEM(expert_sizes_x2_smem.shape[1:], expert_sizes_x2_smem.dtype),
             )
-            return
+            return background_state
 
         # Allgather to collect per-device sizes, then local prefix-sum to compute
         # `starts` and global `sizes`.
@@ -793,6 +801,7 @@ def _fused_ep_moe_kernel(
             d2e_count_vmem[...] = jnp.zeros_like(d2e_count_vmem)
             d2e_count_vmem[my_id] = sizes
 
+            curr_background_state = background_state
             sync_barrier()
             # Fast path for power-of-two device counts: recursive doubling
             # allgather in O(log2(num_devices)) rounds.
@@ -821,6 +830,8 @@ def _fused_ep_moe_kernel(
                         device_id_type=pltpu.DeviceIdType.MESH,
                     ).start()
 
+                    curr_background_state = background_step(curr_background_state)
+
                     recv_ref = d2e_count_vmem.at[
                         pl.ds(recv_start, chunk), pl.ds(0, 1), pl.ds(0, padded_num_experts)
                     ]
@@ -841,6 +852,8 @@ def _fused_ep_moe_kernel(
                         device_id=get_mesh_device_id(peer_id),
                         device_id_type=pltpu.DeviceIdType.MESH,
                     ).start()
+
+                    curr_background_state = background_step(curr_background_state)
 
                     src_peer = (my_id + num_devices - step) % num_devices
                     recv_ref = d2e_count_vmem.at[
@@ -886,7 +899,9 @@ def _fused_ep_moe_kernel(
             starts_copy.wait()
             sizes_copy.wait()
 
-        pl.run_scoped(
+            return curr_background_state
+
+        return pl.run_scoped(
             _all_reduce_metadata,
             pltpu.VMEM(t2e_routing_x2_smem.shape[1:], t2e_routing_x2_smem.dtype),
             pltpu.VMEM(d2e_count_x2_smem.shape[1:], d2e_count_x2_smem.dtype),
@@ -2667,14 +2682,30 @@ def _fused_ep_moe_kernel(
 
         expert_starts = jnp.zeros_like(expert_sizes)
 
-        all_reduce_metadata(
+        wait_store_output(bt_id=bt_id - 2)
+
+        def schedule_background_work(curr_se_block):
+            if w1_shared_hbm is None or disable_shared_expert:
+                return curr_se_block
+
+            @pl.when(curr_se_block < se_total_blocks)
+            def _():
+                run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
+
+            return lax.select(
+                curr_se_block < se_total_blocks,
+                curr_se_block + jnp.int32(1),
+                curr_se_block,
+            )
+
+        metadata_se_block = all_reduce_metadata(
             bt_sem_id=bt_sem_id,
             t2e_routing=t2e_routing,
             starts=expert_starts,
             sizes=expert_sizes,
+            background_state=jnp.int32(0),
+            background_step=schedule_background_work,
         )
-
-        wait_store_output(bt_id=bt_id - 2)
 
         se_per_expert = (
             max(2, cdiv(se_total_blocks, local_num_experts)) if se_total_blocks > 0 else 2
@@ -2689,7 +2720,7 @@ def _fused_ep_moe_kernel(
             # where each expert waits only its own recv semaphore.
             start_a2a_scatter_batch(bt_sem_id=bt_sem_id, bt_start=bt_start)
 
-            init_carry = jnp.int32(0)
+            init_carry = metadata_se_block
 
             def compute_expert_batch(local_e_id, curr_se_block):
                 e_sem_id_local = local_e_id
@@ -2765,7 +2796,7 @@ def _fused_ep_moe_kernel(
                 bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=0, bt_start=bt_start
             )
 
-            init_carry = (e_sem_id, jnp.int32(0))
+            init_carry = (e_sem_id, metadata_se_block)
 
             def run_per_expert_pipelined(local_e_id, carry):
                 curr_e_sem_id, curr_se_block = carry
