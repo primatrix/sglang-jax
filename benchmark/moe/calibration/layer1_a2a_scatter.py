@@ -17,6 +17,7 @@ compile and measure cleanly on v7x-32.
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from math import comb
@@ -737,12 +738,21 @@ def _with_measurement_metadata(
     trace_root: str,
 ) -> dict[str, Any]:
     enriched = _metadata_for_shape(metadata, shape)
+    is_scan_only = shape.scatter_mode.startswith("scan_only_")
     enriched["benchmark"] = {
-        "name": "layer1_pallas_a2a_scatter_topk8",
+        "name": (
+            "layer1_jax_a2a_scatter_routing_scan"
+            if is_scan_only
+            else "layer1_pallas_a2a_scatter_topk8"
+        ),
         "warmup_runs": warmup_runs,
         "sample_runs": sample_runs,
         "trace_discard_runs": discard_runs,
-        "timing": "jax_profiler_trace_device_duration_ms",
+        "timing": (
+            "jax_block_until_ready_elapsed_ms"
+            if is_scan_only
+            else "jax_profiler_trace_device_duration_ms"
+        ),
         "trace_root": trace_root,
     }
     return enriched
@@ -934,8 +944,6 @@ def _measure_a2a_scatter_scan_ms(
     from jax.sharding import NamedSharding
     from jax.sharding import PartitionSpec as P
 
-    from benchmark.utils import multiple_iteration_timeit_from_trace
-
     mesh = _build_tensor_mesh(jax=jax, np=np, ep_size=shape.ep_size, tp_size=1)
     topk_sharding = NamedSharding(mesh, P("tensor", None))
     topk_ids = _make_topk_ids(jax=jax, np=np, sharding=topk_sharding, shape=shape)
@@ -954,16 +962,19 @@ def _measure_a2a_scatter_scan_ms(
             )
 
     jax.block_until_ready(run_scan(topk_ids))
-    task = f"layer1_a2a_scatter_scan_bt{shape.bt}_{shape.path_class}"
-    return multiple_iteration_timeit_from_trace(
-        compute_func=run_scan,
-        data_generator=lambda: (topk_ids,),
-        task=task,
-        tries=sample_runs,
-        warmup=warmup_runs,
-        discard_initial_samples=discard_runs,
-        trace_root=trace_root,
-    )
+    for _ in range(warmup_runs):
+        jax.block_until_ready(run_scan(topk_ids))
+
+    samples: list[float] = []
+    total_runs = discard_runs + sample_runs
+    for run_idx in range(total_runs):
+        start = time.perf_counter()
+        result = run_scan(topk_ids)
+        jax.block_until_ready(result)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        if run_idx >= discard_runs:
+            samples.append(elapsed_ms)
+    return samples
 
 
 def _sharded_scatter_call(
