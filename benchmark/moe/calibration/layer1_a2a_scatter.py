@@ -1548,7 +1548,7 @@ def _pallas_a2a_scatter_call(
             total = jnp.int32(0)
             for slot in range(shape.local_num_experts):
                 total += send_counts_smem[slot]
-            out_vmem[0] = total
+            out_vmem[...] = jnp.zeros((1,), jnp.int32) + total
             pltpu.make_async_copy(
                 src_ref=out_vmem,
                 dst_ref=out_ref,
