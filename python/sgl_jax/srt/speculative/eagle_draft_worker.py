@@ -31,6 +31,32 @@ logger = logging.getLogger(__name__)
 RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
 
 
+def _take_with_optional_out_sharding(array: jax.Array, index: jax.Array, trailing_slice=False):
+    """Gather rows from ``array`` while preserving the source sharding when possible.
+
+    Plain ``array[index]`` without ``out_sharding`` produces a fresh, often
+    differently-sharded result for every distinct ``index.shape``. The
+    persistent JIT cache keys gathers by their result sharding, so the
+    EAGLE post-processing path otherwise compiles a new gather kernel for
+    each real batch size at runtime. Reusing the source sharding makes
+    those gathers stable across runtime batch sizes and lets the cache hit.
+    """
+    out_sharding = getattr(array, "sharding", None)
+    if not isinstance(out_sharding, (NamedSharding, P)):
+        return array[index, :] if trailing_slice else array[index]
+    if trailing_slice:
+        return array.at[index, :].get(out_sharding=out_sharding)
+    return array.at[index].get(out_sharding=out_sharding)
+
+
+def _pad_1d_array(value, target_size: int, pad_value: int = -1) -> np.ndarray:
+    value = np.asarray(value)
+    pad_size = target_size - value.shape[0]
+    if pad_size <= 0:
+        return value
+    return np.pad(value, (0, pad_size), constant_values=pad_value)
+
+
 class EagleDraftWorker(BaseDraftWorker):
     """EAGLE draft model worker.
 
@@ -138,6 +164,97 @@ class EagleDraftWorker(BaseDraftWorker):
 
     def get_max_padded_size(self):
         return self._worker.get_max_padded_size()
+
+    def _remap_hot_token_ids(self, token_ids):
+        """Map draft-token ids back to full vocab ids while keeping sharding stable.
+
+        Uses ``_take_with_optional_out_sharding`` so the gather kernel cache key
+        does not depend on the runtime ``token_ids`` shape/sharding.
+        """
+        if not isinstance(token_ids, jax.Array):
+            token_ids = jnp.asarray(token_ids)
+        out_sharding = NamedSharding(
+            self.mesh,
+            P("data", None) if token_ids.ndim == 2 else P("data"),
+        )
+        return self.hot_token_ids.at[token_ids].get(out_sharding=out_sharding)
+
+    # -- Phase-1 runtime padding helpers (cache-miss fixes) --
+
+    def _get_phase1_runtime_bs_candidates(self) -> list[int]:
+        max_bs = max(self.precompile_bs_paddings) if self.precompile_bs_paddings else 0
+        if max_bs <= 0:
+            return []
+        return [bs for bs in (1, 2, 4, 8, 16) if bs <= max_bs]
+
+    def _get_phase1_runtime_bs_padding(self, real_bs: int) -> int:
+        for bs in self._get_phase1_runtime_bs_candidates():
+            if bs >= real_bs:
+                return bs
+        return real_bs
+
+    def _get_phase1_runtime_indices(self, real_bs: int) -> np.ndarray:
+        """Indices of length ``padded_bs`` selecting the first ``real_bs`` rows.
+
+        Padding entries point back at the last real row so downstream gathers
+        produce well-defined values for unused slots while keeping the gather
+        shape stable across requests with the same padded bucket.
+        """
+        padded_bs = self._get_phase1_runtime_bs_padding(real_bs)
+        indices = np.arange(padded_bs, dtype=np.int32)
+        if padded_bs > real_bs:
+            indices[real_bs:] = max(real_bs - 1, 0)
+        return indices
+
+    def _get_padding_bs_for_real_bs(self, real_bs: int) -> int:
+        for bs in sorted(self.precompile_bs_paddings):
+            if bs >= real_bs:
+                return bs
+        raise RuntimeError("did not get comperate padding bs, it should not happened")
+
+    def pad_out_cache_loc_for_verify(self, model_worker_batch: ModelWorkerBatch) -> None:
+        """Pad ``out_cache_loc`` to ``bs * num_draft_tokens`` for the verify path.
+
+        Real batches at runtime ship a tightly-packed ``out_cache_loc`` whose
+        size depends on the live request count. The verify forward expects a
+        bucketed shape; without this pad each fresh batch retraces.
+        """
+        target_size = model_worker_batch.seq_lens.shape[0] * self.speculative_num_draft_tokens
+        model_worker_batch.out_cache_loc = _pad_1d_array(
+            model_worker_batch.out_cache_loc,
+            target_size,
+            -1,
+        )
+
+    def _trim_prefill_spec_info_to_real_bs(
+        self, draft_input: EagleDraftInput, real_bs: int
+    ) -> None:
+        """Trim padded prefill spec_info rows to the real batch via stable gather.
+
+        The padded prefill output carries trailing rows from padding entries.
+        We strip them with ``_take_with_optional_out_sharding`` so the trim
+        gather kernel is itself shape-stable across runtime real_bs values.
+        """
+        keep_indices_host = np.arange(real_bs, dtype=np.int32)
+        keep_indices = device_array(
+            keep_indices_host,
+            sharding=NamedSharding(self.mesh, P("data")),
+        )
+
+        def take_rows(value):
+            if value is None:
+                return None
+            if isinstance(value, jax.Array):
+                return _take_with_optional_out_sharding(
+                    value, keep_indices, trailing_slice=value.ndim > 1
+                )
+            return value[:real_bs]
+
+        draft_input.hidden_states = take_rows(draft_input.hidden_states)
+        draft_input.verified_id = take_rows(draft_input.verified_id)
+        draft_input.topk_p = take_rows(draft_input.topk_p)
+        draft_input.topk_index = take_rows(draft_input.topk_index)
+        draft_input.allocate_lens = take_rows(draft_input.allocate_lens)
 
     # -- BaseDraftWorker interface --
 
