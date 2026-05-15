@@ -506,6 +506,15 @@ class EagleDraftWorker(BaseDraftWorker):
             model_worker_batch.seq_lens = np.pad(
                 model_worker_batch.seq_lens, ((0, bs - model_worker_batch.seq_lens.shape[0]),)
             )
+            # Pad ``req_pool_indices`` alongside ``seq_lens`` so the verify
+            # forward sees a stable per-bucket pytree leaf size — without this
+            # the JIT cache key drifts each time real_bs changes (cache-miss
+            # fix mirroring epic/mtp_refactor_phase1).
+            model_worker_batch.req_pool_indices = np.pad(
+                model_worker_batch.req_pool_indices,
+                ((0, bs - model_worker_batch.req_pool_indices.shape[0]),),
+                constant_values=-1,
+            )
             if model_worker_batch.spec_info.allocate_lens is not None:
                 model_worker_batch.spec_info.allocate_lens = np.pad(
                     model_worker_batch.spec_info.allocate_lens,
