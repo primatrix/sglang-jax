@@ -13,8 +13,11 @@ from sgl_jax.srt.managers.scheduler import GenerationBatchResult
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
-from sgl_jax.srt.speculative.base_worker import BaseSpecWorker, replicate_to_mesh
-from sgl_jax.srt.speculative.eagle_draft_worker import EagleDraftWorker
+from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
+from sgl_jax.srt.speculative.eagle_draft_worker import (
+    EagleDraftWorker,
+    _take_with_optional_out_sharding,
+)
 from sgl_jax.srt.speculative.eagle_util import (
     EagleDraftInput,
     EagleVerifyInput,
@@ -143,6 +146,10 @@ class EAGLEWorker(BaseSpecWorker):
     def verify(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens: jax.Array):
         spec_info: EagleVerifyInput = model_worker_batch.spec_info
         spec_info.allocate_lens = cur_allocate_lens
+        # Pad ``out_cache_loc`` to the bucketed ``bs * num_draft_tokens`` shape so
+        # the verify forward sees the same pytree leaf size at runtime as it did
+        # during precompile (cache-miss fix; see eagle_draft_worker.pad_out_cache_loc_for_verify).
+        self.draft_worker.pad_out_cache_loc_for_verify(model_worker_batch)
         spec_info.prepare_for_verify(model_worker_batch, self.page_size, self.target_worker)
         forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
@@ -151,9 +158,12 @@ class EAGLEWorker(BaseSpecWorker):
         logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
             model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
         )
-        logits_output.next_token_logits, logits_output.hidden_states = replicate_to_mesh(
-            self.mesh, logits_output.next_token_logits, logits_output.hidden_states
-        )
+        # Keep ``logits_output`` arrays at the JIT-output sharding (typically
+        # ``Explicit('data', 'tensor')``) instead of replicate_to_mesh-ing them.
+        # The downstream ``draft_extend_for_decode`` JIT call's cache key
+        # depends on ``forward_batch.spec_info.hidden_states`` sharding;
+        # matching the EXTEND-path sharding (also Explicit) keeps a single
+        # cache entry per (bs, mode) instead of two.
         spec_info.hidden_states = logits_output.hidden_states
         (
             predict,
@@ -177,9 +187,17 @@ class EAGLEWorker(BaseSpecWorker):
         req_ids = np.arange(len(accept_index)) // accept_width
         per_req_last = req_ids * draft_n + draft_n - 1
         safe_index = np.where(accept_index >= 0, accept_index, per_req_last)
-        logits_output.next_token_logits = logits_output.next_token_logits[safe_index, :]
-        logits_output.hidden_states = logits_output.hidden_states[safe_index, :]
-        model_worker_batch.positions = model_worker_batch.positions[safe_index]
+        # Gather via ``_take_with_optional_out_sharding`` so the gather kernel's
+        # output sharding tracks the source array's sharding (cache-miss fix).
+        logits_output.next_token_logits = _take_with_optional_out_sharding(
+            logits_output.next_token_logits, safe_index, trailing_slice=True
+        )
+        logits_output.hidden_states = _take_with_optional_out_sharding(
+            logits_output.hidden_states, safe_index, trailing_slice=True
+        )
+        model_worker_batch.positions = _take_with_optional_out_sharding(
+            model_worker_batch.positions, safe_index
+        )
         new_seq_lens = model_worker_batch.seq_lens + accept_length
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
