@@ -890,6 +890,17 @@ class EagleDraftWorker(BaseDraftWorker):
                         ),
                         sharding=data_2d_sharding,
                     )
+                    token_list_host = np.zeros(
+                        (
+                            bs,
+                            self.topk + (self.speculative_num_steps - 1) * self.topk * self.topk,
+                        ),
+                        dtype=np.int32,
+                    )
+                    token_list_replicated = device_array(
+                        token_list_host,
+                        sharding=replicated_2d_sharding,
+                    )
                     parents_list = device_array(
                         np.zeros(
                             (bs, self.topk + 1 + (self.speculative_num_steps - 1) * self.topk),
@@ -904,10 +915,10 @@ class EagleDraftWorker(BaseDraftWorker):
                         seq_lens_replicated = device_array(
                             seq_lens_host, sharding=replicated_sharding
                         )
-                        for precompile_verified_id in (
-                            verified_id_host,
-                            verified_id,
-                            replicated_verified_id,
+                        for precompile_verified_id, precompile_token_list in (
+                            (verified_id_host, token_list_host),
+                            (verified_id, token_list),
+                            (replicated_verified_id, token_list_replicated),
                         ):
                             for seq_lens in (
                                 seq_lens_host,
@@ -917,7 +928,7 @@ class EagleDraftWorker(BaseDraftWorker):
                                 tree_outputs = build_tree_kernel_efficient(
                                     precompile_verified_id,
                                     score_list,
-                                    token_list,
+                                    precompile_token_list,
                                     parents_list,
                                     seq_lens,
                                     np.asarray(context_len * bs, dtype=np.int32),
