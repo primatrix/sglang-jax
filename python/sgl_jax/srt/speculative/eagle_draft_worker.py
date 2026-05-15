@@ -44,8 +44,12 @@ def _take_with_optional_out_sharding(array: jax.Array, index: jax.Array, trailin
     those gathers stable across runtime batch sizes and lets the cache hit.
     """
     out_sharding = getattr(array, "sharding", None)
-    if not isinstance(out_sharding, (NamedSharding, P)):
+    # numpy arrays / non-jax inputs: plain indexing is fine
+    if out_sharding is None:
         return array[index, :] if trailing_slice else array[index]
+    # JAX 0.8.1+ rejects naked sharded gathers regardless of sharding class
+    # (NamedSharding, GSPMDSharding, SingleDeviceSharding, ...). Always go
+    # through .at[].get with an explicit out_sharding.
     if trailing_slice:
         return array.at[index, :].get(out_sharding=out_sharding)
     return array.at[index].get(out_sharding=out_sharding)
