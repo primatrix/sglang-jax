@@ -1167,7 +1167,9 @@ def select_top_k_tokens_step_greater_0(
         selected_input_index = topk_cs_index.flatten() // topk + jnp.repeat(
             jnp.arange(0, hidden_states.shape[0], topk), topk
         )
-        hidden_states = hidden_states[selected_input_index, :]
+        hidden_states = _take_with_optional_out_sharding(
+            hidden_states, selected_input_index, trailing_slice=True
+        )
     tree_info = (
         expand_scores,
         topk_index,
