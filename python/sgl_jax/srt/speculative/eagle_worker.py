@@ -278,18 +278,18 @@ class EAGLEWorker(BaseSpecWorker):
     def run_spec_decode_precompile(self):
         self.precompile_spec_extend()
         self.precompile_spec_decode()
-        # FIXME precompile some kernel
+        self.draft_worker.precompile_runtime_jax_helpers()
 
     def precompile_spec_extend(self):
         start_time = time.perf_counter()
         logger.info(
             "[SPEC_EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s",
-            self.precompile_bs_paddings[-1:],
+            self.precompile_bs_paddings,
             self.precompile_token_paddings,
         )
 
-        bs, _ = self.draft_worker.get_max_padded_size()
-        pairs = list(itertools.product([bs], self.precompile_token_paddings))
+        pairs = list(itertools.product(self.precompile_bs_paddings, self.precompile_token_paddings))
+        cache_loc_by_bs = dict(zip(self.precompile_bs_paddings, self.precompile_cache_loc_paddings))
 
         with tqdm(pairs, desc="[SPEC_EXTEND] PRECOMPILE", leave=False) as pbar:
             for pair in pbar:
@@ -303,25 +303,29 @@ class EAGLEWorker(BaseSpecWorker):
                     bs,
                     num_tokens,
                     ForwardMode.EXTEND,
-                    self.precompile_cache_loc_paddings[-1],
+                    cache_loc_by_bs[bs],
                     speculative_algorithm=self.speculative_algorithm,
                     dp_size=1,
                     per_dp_bs_size=bs,
                 )
                 self.forward_batch_speculative_generation(model_worker_batch)
+                jax.device_get(model_worker_batch.input_ids)
         end_time = time.perf_counter()
         logger.info("[SPEC_EXTEND] Precompile finished in %.0f secs", end_time - start_time)
 
     def precompile_spec_decode(self):
         start_time = time.perf_counter()
+        max_bs = max(self.precompile_bs_paddings) if self.precompile_bs_paddings else 0
+        runtime_bs_candidates = list(range(1, min(max_bs, 16) + 1))
+        decode_bs_candidates = sorted(
+            set(runtime_bs_candidates + list(self.precompile_bs_paddings))
+        )
         logger.info(
             "[SPEC_DECODE] Begin to precompile bs_paddings=%s",
-            self.precompile_bs_paddings,
+            decode_bs_candidates,
         )
 
-        with tqdm(
-            self.precompile_bs_paddings, desc="[SPEC_DECODE] PRECOMPILE", leave=False
-        ) as pbar:
+        with tqdm(decode_bs_candidates, desc="[SPEC_DECODE] PRECOMPILE", leave=False) as pbar:
             for bs in pbar:
                 pbar.set_postfix(bs=bs)
                 aligned_cache_loc_size = (
