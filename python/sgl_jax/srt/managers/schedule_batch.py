@@ -2280,6 +2280,32 @@ class ScheduleBatch:
             extend_seq_lens,
         )
 
+        # Pad spec extend batch to precompile buckets so the JIT cache hits the
+        # same shape on every real-world request.
+        if self.forward_mode.is_extend():
+            token_padding, _ = pad_to_bucket(real_input_ids_len, token_paddings)
+            bs_padding, _ = pad_to_bucket(real_bs, bs_paddings[-1:])
+
+            input_ids_cpu = _pad_first_dim(input_ids_cpu, token_padding, 0)
+            positions_cpu = _pad_first_dim(positions_cpu, token_padding, 0)
+            out_cache_loc_cpu = _pad_first_dim(out_cache_loc_cpu, token_padding, -1)
+            if mrope_positions_cpu is not None:
+                mrope_pad_size = token_padding - mrope_positions_cpu.shape[1]
+                if mrope_pad_size > 0:
+                    mrope_positions_cpu = np.pad(
+                        mrope_positions_cpu,
+                        ((0, 0), (0, mrope_pad_size)),
+                        constant_values=0,
+                    )
+
+            seq_lens_cpu = _pad_first_dim(seq_lens_cpu, bs_padding, 0)
+            req_pool_indices_cpu = _pad_first_dim(req_pool_indices_cpu, bs_padding, -1)
+            extend_seq_lens = _pad_first_dim(extend_seq_lens, bs_padding, 0)
+            extend_prefix_lens = _pad_first_dim(extend_prefix_lens, bs_padding, 0)
+            extend_logprob_start_lens = _pad_first_dim(extend_logprob_start_lens, bs_padding, 0)
+            logits_indices = _pad_first_dim(logits_indices, bs_padding, 0)
+            self.per_dp_bs_size = bs_padding
+
         cache_loc_flat = np.array([], dtype=np.int32)
 
         if len(seq_lens_cpu) > 0:
@@ -2344,10 +2370,39 @@ class ScheduleBatch:
                     # Assign
                     cache_loc_flat[dst_indices] = source_data
 
+        # Pad cache_loc to the largest precompile cache_loc bucket so the spec
+        # extend forward keeps a stable input shape.
+        if self.forward_mode.is_extend():
+            cache_loc_padding = cache_loc_paddings[-1]
+            if len(cache_loc_flat) > cache_loc_padding:
+                raise ValueError(
+                    f"Spec extend cache_loc length {len(cache_loc_flat)} exceeds "
+                    f"precompile cache_loc bucket {cache_loc_padding}."
+                )
+            cache_loc_padded = np.zeros(cache_loc_padding, dtype=np.int32)
+            cache_loc_padded[: len(cache_loc_flat)] = cache_loc_flat
+            cache_loc_flat = cache_loc_padded
+
         if precision_tracer.get_trace_active():
             self._generate_trace_info(real_bs, bid)
         # Extract lora_ids from requests
         lora_ids = [req.lora_id for req in self.reqs]
+        if self.forward_mode.is_extend() and len(lora_ids) < len(seq_lens_cpu):
+            lora_ids = lora_ids + ["0"] * (len(seq_lens_cpu) - len(lora_ids))
+
+        top_logprobs_nums = self.top_logprobs_nums
+        token_ids_logprobs = self.token_ids_logprobs
+        if self.forward_mode.is_extend():
+            if top_logprobs_nums is not None and len(top_logprobs_nums) < len(seq_lens_cpu):
+                top_logprobs_nums = top_logprobs_nums + [0] * (
+                    len(seq_lens_cpu) - len(top_logprobs_nums)
+                )
+            if token_ids_logprobs is not None and len(token_ids_logprobs) < len(seq_lens_cpu):
+                token_ids_logprobs = token_ids_logprobs + [None] * (
+                    len(seq_lens_cpu) - len(token_ids_logprobs)
+                )
+
+        sampling_total_bs = self.per_dp_bs_size if self.forward_mode.is_extend() else real_bs
 
         return ModelWorkerBatch(
             bid=bid,
@@ -2359,9 +2414,9 @@ class ScheduleBatch:
             out_cache_loc=out_cache_loc_cpu,
             return_logprob=self.return_logprob,
             return_output_logprob_only=self.return_output_logprob_only,
-            top_logprobs_nums=self.top_logprobs_nums,
-            token_ids_logprobs=self.token_ids_logprobs,
-            sampling_info=self._merge_sampling_info(real_bs, real_bs),
+            top_logprobs_nums=top_logprobs_nums,
+            token_ids_logprobs=token_ids_logprobs,
+            sampling_info=self._merge_sampling_info(sampling_total_bs, sampling_total_bs),
             positions=positions_cpu,
             mrope_positions=mrope_positions_cpu,
             cache_loc=cache_loc_flat,
@@ -2374,7 +2429,7 @@ class ScheduleBatch:
             real_bs=real_bs,
             real_bs_per_dp=[real_bs],
             dp_size=self.dp_size,
-            per_dp_bs_size=real_bs,
+            per_dp_bs_size=sampling_total_bs,
             logits_indices_selector=np.arange(real_bs, dtype=np.int32),
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
@@ -2554,6 +2609,18 @@ class ScheduleBatch:
 def align_to_size(lst: list, size: int, value: int = 0) -> list:
     align_len = (len(lst) + size - 1) // size * size
     return lst[:] + [value] * (align_len - len(lst))
+
+
+def _pad_first_dim(value: Any, target_size: int, pad_value: int | float = 0):
+    if value is None:
+        return None
+    value = np.asarray(value)
+    pad_size = target_size - value.shape[0]
+    if pad_size <= 0:
+        return value
+    pad_width = [(0, 0)] * value.ndim
+    pad_width[0] = (0, pad_size)
+    return np.pad(value, pad_width, constant_values=pad_value)
 
 
 def _extract_mm_value(mm_inputs: Any, key: str):

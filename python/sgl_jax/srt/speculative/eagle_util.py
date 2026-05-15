@@ -506,7 +506,7 @@ class EagleDraftInput:
 
         # Prefill only generate 1 token.
         assert (
-            self.verified_id.shape[0] == model_worker_batch.real_bs
+            self.verified_id.shape[0] >= model_worker_batch.real_bs
         ), f"{self.verified_id.shape=} {model_worker_batch.real_bs=}"
 
         pt = 0
