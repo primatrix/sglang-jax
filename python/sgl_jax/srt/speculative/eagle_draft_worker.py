@@ -1151,7 +1151,10 @@ def select_top_k_tokens_step_0(
     return input_ids, hidden_states, scores, tree_info
 
 
-@functools.partial(jax.jit, static_argnames=["topk"])
+# NOTE: not @jax.jit. Inside a JIT trace hidden_states.sharding is the
+# tracer's abstract sharding (often not NamedSharding); the per-row gather
+# below has to be done eagerly so we can branch on the concrete sharding
+# class and supply an explicit out_sharding (JAX 0.8.1 requirement).
 def select_top_k_tokens_step_greater_0(
     i: jax.Array,
     topk_p: jax.Array,
@@ -1171,9 +1174,12 @@ def select_top_k_tokens_step_greater_0(
         selected_input_index = topk_cs_index.flatten() // topk + jnp.repeat(
             jnp.arange(0, hidden_states.shape[0], topk), topk
         )
-        hidden_states = _take_with_optional_out_sharding(
-            hidden_states, selected_input_index, trailing_slice=True
-        )
+        if isinstance(hidden_states.sharding, NamedSharding):
+            hidden_states = hidden_states.at[selected_input_index, :].get(
+                out_sharding=NamedSharding(hidden_states.sharding.mesh, P("data", None))
+            )
+        else:
+            hidden_states = hidden_states[selected_input_index, :]
     tree_info = (
         expand_scores,
         topk_index,
