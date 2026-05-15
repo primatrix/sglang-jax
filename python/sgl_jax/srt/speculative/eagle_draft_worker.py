@@ -1175,8 +1175,12 @@ def select_top_k_tokens_step_greater_0(
             jnp.arange(0, hidden_states.shape[0], topk), topk
         )
         if isinstance(hidden_states.sharding, NamedSharding):
+            # Reuse the source sharding rather than forcing a fixed spec —
+            # forcing P("data", None) on an input that is replicated or
+            # sharded along tensor would silently reshard and shift data
+            # across devices, breaking downstream draft consumers.
             hidden_states = hidden_states.at[selected_input_index, :].get(
-                out_sharding=NamedSharding(hidden_states.sharding.mesh, P("data", None))
+                out_sharding=hidden_states.sharding
             )
         else:
             hidden_states = hidden_states[selected_input_index, :]
