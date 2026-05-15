@@ -343,7 +343,7 @@ class EagleDraftWorker(BaseDraftWorker):
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
         real_indices = device_array(
-            np.arange(model_worker_batch.real_bs, dtype=np.int32),
+            self._get_phase1_runtime_indices(model_worker_batch.real_bs),
             sharding=index_sharding,
         )
         logits_output.next_token_logits = _take_with_optional_out_sharding(
@@ -358,9 +358,8 @@ class EagleDraftWorker(BaseDraftWorker):
         forward_batch.spec_info.verified_id = _take_with_optional_out_sharding(
             forward_batch.spec_info.verified_id, real_indices
         )
-        forward_batch.spec_info.allocate_lens = model_worker_batch.seq_lens[
-            : model_worker_batch.real_bs
-        ]
+        runtime_bs = real_indices.shape[0]
+        forward_batch.spec_info.allocate_lens = model_worker_batch.seq_lens[:runtime_bs]
 
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 
