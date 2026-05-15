@@ -509,6 +509,9 @@ class EagleDraftInput:
             self.verified_id.shape[0] >= model_worker_batch.real_bs
         ), f"{self.verified_id.shape=} {model_worker_batch.real_bs=}"
 
+        # Pull verified_id to host once so subsequent per-row indexing avoids
+        # JAX 0.8.1 sharded-gather errors (out_sharding cannot be inferred).
+        verified_id_cpu = np.asarray(jax.device_get(self.verified_id))[: model_worker_batch.real_bs]
         pt = 0
         for i in range(model_worker_batch.real_bs):
             extend_len = model_worker_batch.extend_seq_lens[i]
@@ -516,7 +519,7 @@ class EagleDraftInput:
 
             # TODO: batch.input_ids should on tpu
             model_worker_batch.input_ids[pt : pt + extend_len] = np.concatenate(
-                (input_ids[1:], self.verified_id[i].reshape(1))
+                (input_ids[1:], verified_id_cpu[i : i + 1])
             )
             pt += extend_len
 
