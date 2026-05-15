@@ -362,6 +362,7 @@ class EagleDraftWorker(BaseDraftWorker):
         forward_batch.spec_info.allocate_lens = model_worker_batch.seq_lens[:runtime_bs]
 
         self.capture_for_decode(logits_output, forward_batch.spec_info)
+        self._trim_prefill_spec_info_to_real_bs(forward_batch.spec_info, model_worker_batch.real_bs)
 
     def draft_extend_for_decode(
         self, model_worker_batch: ModelWorkerBatch, batch_output: GenerationBatchResult
