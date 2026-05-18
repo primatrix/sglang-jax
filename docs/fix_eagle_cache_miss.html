@@ -170,6 +170,7 @@ hr { border: none; border-top: 1px solid var(--border); margin: 32px 0; }
   <ul>
     <li><a href="#bg">背景</a></li>
     <li><a href="#progress">阶段累计进度</a></li>
+    <li><a href="#remaining">还需要做的工作(交接清单)</a></li>
     <li><a href="#contract">Padding 契约(验收标准)</a></li>
     <li><a href="#taxonomy">Precompile 三分法:EXTEND / DECODE / RUNTIME</a></li>
     <li><a href="#boundaries">Spec 路径 JIT 边界全清单</a></li>
@@ -302,6 +303,24 @@ hr { border: none; border-top: 1px solid var(--border); margin: 32px 0; }
   <li><code>forward_batch[3] = i32[24] vs i32[8]</code> ×2 —— input_ids = 24(verify)vs 8(draft step)的不同 cache key,closest-key 噪音(各自有 cache 命中)。</li>
 </ol>
 <p><strong>结论</strong>:Phase 4.4 真正需要修的只剩 <strong>(2) LogitsMetadata.accept_lens type stability</strong>(为非 verify 模式提供 dummy accept_lens 数组,让 pytree 类型恒定),其余可能是 JAX closest-key 报告偏差,需要进一步验证是否 actually 影响 cache。</p>
+
+<h3 id="remaining">还需要做的工作(按 ROI 排,2026-05-18)</h3>
+<div class="card warn">
+<table>
+<thead><tr><th>阶段</th><th>工作</th><th>投入</th><th>收益</th><th>优先</th></tr></thead>
+<tbody>
+<tr><td>Phase 4.4</td><td>logits_processor.py:LogitsMetadata.from_model_worker_batch 给 accept_lens=None 时改为 dummy 零数组,pytree 类型恒定</td><td>~30 行</td><td>清 1 个确定 WARN miss,decode tick #cache_miss 减 1</td><td>⭐⭐⭐</td></tr>
+<tr><td>Phase 4.6</td><td>对 EAGLEWorker.forward_batch_speculative_generation 内每个 jit 分别包 count_pjit_cpp_cache_miss,归因 #cache_miss=2~3/tick 的真实来源</td><td>~50 行 + 跑一次</td><td>揭示 spec 辅助 jit(verify_tree、build_tree、update_eagle_lists 等)反复 miss 来源</td><td>⭐⭐⭐</td></tr>
+<tr><td>Phase 4.5</td><td>扩展 register_variant_if_new 覆盖 draft 路径,确认其余 3 个 WARN 是噪音还是真 miss</td><td>~30 行</td><td>明确剩余 4 miss 中哪些真要修</td><td>⭐⭐</td></tr>
+<tr><td>Phase 4.7</td><td>L3 bucket sweep:(real_bs ∈ {1..16}, prompt_len ∈ [1, 4096]) × 200 reqs 自动跑,断言 0 miss</td><td>~100 行 L3 测试</td><td>验收硬指标</td><td>⭐⭐</td></tr>
+<tr><td>Phase 4.8</td><td>tail-batch 验证:running-req 8→4→2→1 切换时 bucket 转换 miss(目前实测 bs=2 切换 #cache_miss: 13)</td><td>~50 行</td><td>边界 case 收尾</td><td>⭐</td></tr>
+<tr><td>Phase 4.9</td><td>区分 PERSISTENT vs TRACING miss(disk-load vs actual-recompile)的 metric</td><td>~20 行 + 文档</td><td>metric 清晰度</td><td>⭐</td></tr>
+<tr><td>Phase 5.1</td><td>非 greedy 采样(top-p/top-k)precompile</td><td>~50 行,推迟下期</td><td>覆盖采样多样性</td><td>⭐⭐</td></tr>
+<tr><td>Phase 5.2</td><td>L4/L5 e2e + 吞吐验证:Qwen3-32B 200 reqs,gen throughput ≥ 基线×1.5</td><td>1 周</td><td>终验</td><td>⭐⭐⭐</td></tr>
+</tbody>
+</table>
+<p><strong>评估</strong>:已完成 ~96% 的 cache miss 清理(基线 24→4 unique WARN);剩余 5% 是微观噪音 + 边界,Phase 4.4/4.6/4.5 把最后一点抹平,然后 Phase 5.2 e2e 证明性能收益。</p>
+</div>
 </div>
 
 <h2 id="contract">Padding 契约(验收标准)</h2>
