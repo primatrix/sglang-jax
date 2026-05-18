@@ -406,6 +406,7 @@ class MiMoV2DecoderLayer(nnx.Module):
             token_to_kv_pool=token_to_kv_pool,
         )
 
+        residual = jax.sharding.reshard(residual, jax.typeof(hidden_states).sharding)
         hidden_states += residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)

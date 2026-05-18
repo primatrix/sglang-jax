@@ -16,6 +16,17 @@ from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 
 
+def _effective_output_scatter_dimension(
+    output_scatter_dimension: int | None,
+    kernel_axes: Sequence[str | None] | None,
+) -> int | None:
+    if output_scatter_dimension is not None:
+        return output_scatter_dimension
+    if kernel_axes is not None and kernel_axes[0] is not None and kernel_axes[-1] is None:
+        return 0
+    return None
+
+
 class LinearBase(nnx.Module):
     """Base linear layer.
 
@@ -73,7 +84,21 @@ class LinearBase(nnx.Module):
     @named_scope
     def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         """Forward pass of the linear layer."""
-        output_pspec = P("data", *([None] * (x.ndim - 2)), self.kernel_axes[-1])
+        input_axis, output_axis = self.kernel_axes[0], self.kernel_axes[-1]
+        output_pspec = P("data", *([None] * (x.ndim - 2)), output_axis)
+
+        scatter_dimension = _effective_output_scatter_dimension(
+            self.output_scatter_dimension, self.kernel_axes
+        )
+        if scatter_dimension is not None and input_axis is not None:
+            output_pspec, _ = prepare_scattered_spec_if_needed(
+                output_pspec,
+                scatter_dimension,
+                scatter_axis=input_axis,
+                full_dim_size=x.shape[scatter_dimension],
+                mesh=self.mesh,
+            )
+
         output_sharding = NamedSharding(self.mesh, output_pspec)
         out = lax.dot_general(
             x,
@@ -424,15 +449,18 @@ class QuantizedLinear(nnx.Module):
 
         out_specs = P("data", output_axis)
 
-        # When ``output_scatter_dimension`` is set, stack ``input_axis`` onto
-        # whatever already partitions that dim (e.g. ``"data"`` from DP) so
-        # DP+SP compose.
-        if self.output_scatter_dimension is not None:
+        # Row-parallel projections scatter dim 0 by default. Stack the input
+        # axis onto whatever already partitions that dim (e.g. ``"data"`` from
+        # DP) so DP+SP compose.
+        scatter_dimension = _effective_output_scatter_dimension(
+            self.output_scatter_dimension, self.kernel_axes
+        )
+        if scatter_dimension is not None:
             out_specs, do_scatter = prepare_scattered_spec_if_needed(
                 out_specs,
-                self.output_scatter_dimension,
+                scatter_dimension,
                 scatter_axis=input_axis,
-                full_dim_size=x.shape[self.output_scatter_dimension],
+                full_dim_size=x.shape[scatter_dimension],
                 mesh=self.mesh,
             )
         else:
@@ -449,7 +477,7 @@ class QuantizedLinear(nnx.Module):
                 allow_narrow_n_blockwise=self.allow_narrow_n_blockwise,
                 # Pass the dim only when we've actually decided to scatter,
                 # so the kernel doesn't need to second-guess us.
-                output_scatter_dimension=self.output_scatter_dimension if do_scatter else None,
+                output_scatter_dimension=scatter_dimension if do_scatter else None,
             ),
             mesh=self.mesh,
             in_specs=in_specs,

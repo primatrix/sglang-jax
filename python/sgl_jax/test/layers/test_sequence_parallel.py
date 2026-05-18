@@ -1,9 +1,9 @@
-"""Sequence-parallel scatter tests for QuantizedLinear, EPMoE, and Grok modules.
+"""Sequence-parallel scatter tests for row-parallel projections and MoE modules.
 
-Both layers fall back to a full all-reduce when ``should_scatter`` returns
-False (small batches or tp_size==1) and switch to a reduce-scatter on the
-sequence/token dimension when it returns True. These tests exercise both
-branches and verify the result is numerically equivalent.
+Row-parallel projections fall back to a full all-reduce when
+``should_scatter`` returns False (small batches or tp_size==1) and switch to a
+reduce-scatter on the sequence/token dimension when it returns True. These
+tests exercise both branches and verify the result is numerically equivalent.
 
 The Grok wiring tests guard against regressions of the form "the flag is
 plumbed through ``ServerArgs`` and the model config but doesn't actually
@@ -22,7 +22,9 @@ from flax import nnx
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.layers.linear import QuantizedLinear
+from sgl_jax.srt.layers.embeddings import Embed
+from sgl_jax.srt.layers.linear import LinearBase, QuantizedLinear
+from sgl_jax.srt.layers.logits_processor import LogitsProcessor
 from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.models.grok import Grok1Attention, Grok1DecoderLayer, Grok1MLP
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
@@ -56,27 +58,26 @@ def _as_fp32(x):
 
 
 class TestQuantizedLinearScatter(CustomTestCase):
-    """``QuantizedLinear.output_scatter_dimension`` behavior."""
+    """``QuantizedLinear`` row-parallel output scatter behavior."""
 
     @unittest.skipIf(_TP_SIZE < 2, "Needs >=2 tensor-parallel devices.")
     def test_scatter_active_above_threshold(self):
         """At/above threshold, output is reduce-scattered on dim 0 over `tensor`."""
         batch = _TP_SIZE * _MIN_LOCAL  # exactly at threshold
-        scatter_out, baseline_out = self._run_pair(batch)
+        explicit_out, default_out = self._run_pair(batch)
 
         # Scatter path: dim 0 stripes across the data and tensor axes
         # (data axis is size 1 here so it's effectively just "tensor", but
         # the spec records both names — see TestDpSpComposition for the
         # observable dp>1 case).
-        self.assertEqual(_spec_dim(scatter_out.sharding, 0), ("data", "tensor"))
-        # Baseline: DP-only sharding (no SP combine).
-        self.assertEqual(_spec_dim(baseline_out.sharding, 0), "data")
+        self.assertEqual(_spec_dim(explicit_out.sharding, 0), ("data", "tensor"))
+        self.assertEqual(_spec_dim(default_out.sharding, 0), ("data", "tensor"))
 
         # Same math, just different communication pattern. Tolerances cover
         # bf16 reduction-order drift over a 256-wide row-parallel sum (max
         # observed abs diff ~0.5 against mean |y| ~12).
         np.testing.assert_allclose(
-            _as_fp32(scatter_out), _as_fp32(baseline_out), rtol=0.05, atol=1.0
+            _as_fp32(explicit_out), _as_fp32(default_out), rtol=0.05, atol=1.0
         )
 
     @unittest.skipIf(_TP_SIZE < 2, "Needs >=2 tensor-parallel devices.")
@@ -90,8 +91,8 @@ class TestQuantizedLinearScatter(CustomTestCase):
         self.assertEqual(_spec_dim(scatter_out.sharding, 0), "data")
 
     @unittest.skipIf(_TP_SIZE < 2, "Needs >=2 tensor-parallel devices.")
-    def test_scatter_disabled_when_dimension_is_none(self):
-        """``output_scatter_dimension=None`` keeps the DP-only spec regardless of size."""
+    def test_row_parallel_scatters_by_default(self):
+        """Row-parallel quantized matmul scatters dim 0 without a caller flag."""
         batch = _TP_SIZE * _MIN_LOCAL  # would-be scatter size
         x_host, weight_q, weight_scale = _make_quant_linear_inputs(batch, in_dim=256, out_dim=512)
 
@@ -100,26 +101,112 @@ class TestQuantizedLinearScatter(CustomTestCase):
             x = jax.device_put(x_host, NamedSharding(_MESH, P(None, "tensor")))
             out, _ = ql(x)
 
-        # No combine: dim 0 keeps the baseline ``"data"`` axis.
-        self.assertEqual(_spec_dim(out.sharding, 0), "data")
+        self.assertEqual(_spec_dim(out.sharding, 0), ("data", "tensor"))
 
     def _run_pair(self, batch: int):
         in_dim, out_dim = 256, 512
         x_host, weight_q, weight_scale = _make_quant_linear_inputs(batch, in_dim, out_dim)
 
         with jax.set_mesh(_MESH):
-            ql_scatter = _build_quant_linear(
+            ql_explicit = _build_quant_linear(
                 weight_q, weight_scale, _MESH, output_scatter_dimension=0
             )
-            ql_baseline = _build_quant_linear(
+            ql_default = _build_quant_linear(
                 weight_q, weight_scale, _MESH, output_scatter_dimension=None
             )
 
             x = jax.device_put(x_host, NamedSharding(_MESH, P(None, "tensor")))
-            out_scatter, _ = ql_scatter(x)
-            out_baseline, _ = ql_baseline(x)
+            explicit_out, _ = ql_explicit(x)
+            default_out, _ = ql_default(x)
 
-        return out_scatter, out_baseline
+        return explicit_out, default_out
+
+
+class TestLinearBaseScatter(CustomTestCase):
+    """``LinearBase`` row-parallel output scatter behavior."""
+
+    @unittest.skipIf(_TP_SIZE < 2, "Needs >=2 tensor-parallel devices.")
+    def test_row_parallel_scatter_active_above_threshold(self):
+        batch = _TP_SIZE * _MIN_LOCAL
+        in_dim, out_dim = 256, 512
+        key = jax.random.PRNGKey(11)
+        k_x, k_w = jax.random.split(key)
+        x_host = jax.random.normal(k_x, (batch, in_dim), dtype=jnp.bfloat16)
+        w_host = jax.random.normal(k_w, (in_dim, out_dim), dtype=jnp.bfloat16)
+
+        with jax.set_mesh(_MESH):
+            lin_explicit = _build_linear_base(w_host, _MESH, output_scatter_dimension=0)
+            lin_default = _build_linear_base(w_host, _MESH, output_scatter_dimension=None)
+            x = jax.device_put(x_host, NamedSharding(_MESH, P(None, "tensor")))
+            explicit_out, _ = lin_explicit(x)
+            default_out, _ = lin_default(x)
+
+        self.assertEqual(_spec_dim(explicit_out.sharding, 0), ("data", "tensor"))
+        self.assertEqual(_spec_dim(default_out.sharding, 0), ("data", "tensor"))
+        np.testing.assert_allclose(
+            _as_fp32(explicit_out), _as_fp32(default_out), rtol=0.05, atol=1.0
+        )
+
+
+class TestAttentionQkvBoundary(CustomTestCase):
+    """Column-parallel QKV projections gather token sharding for attention."""
+
+    @unittest.skipIf(_TP_SIZE < 2, "Needs >=2 tensor-parallel devices.")
+    def test_column_parallel_projection_outputs_full_tokens_per_tensor_rank(self):
+        num_tokens, hidden_size, qkv_size = _TP_SIZE * _MIN_LOCAL, 128, 256
+        key = jax.random.PRNGKey(17)
+        k_x, k_w = jax.random.split(key)
+        x_host = jax.random.normal(k_x, (num_tokens, hidden_size), dtype=jnp.bfloat16)
+        w_host = jax.random.normal(k_w, (hidden_size, qkv_size), dtype=jnp.bfloat16)
+
+        with jax.set_mesh(_MESH):
+            q_proj = LinearBase(
+                input_size=hidden_size,
+                output_size=qkv_size,
+                use_bias=False,
+                mesh=_MESH,
+                kernel_axes=(None, "tensor"),
+                params_dtype=jnp.bfloat16,
+            )
+            q_proj.weight = nnx.Param(w_host, out_sharding=P(None, "tensor"))
+            hidden = jax.device_put(x_host, NamedSharding(_MESH, P(("data", "tensor"), None)))
+            q, _ = q_proj(hidden)
+
+        self.assertEqual(_spec_dim(q.sharding, 0), "data")
+        self.assertEqual(_spec_dim(q.sharding, 1), "tensor")
+        expected = jnp.dot(x_host, w_host)
+        np.testing.assert_allclose(_as_fp32(q), _as_fp32(expected), rtol=0.05, atol=1.0)
+
+
+class TestLogitsProcessorTokenShardedHidden(CustomTestCase):
+    """Logits boundary accepts token-sharded hidden states."""
+
+    @unittest.skipIf(_TP_SIZE < 2, "Needs >=2 tensor-parallel devices.")
+    def test_get_logits_gathers_token_sharding_before_vocab_parallel_dot(self):
+        num_tokens, hidden_size, vocab_size = _TP_SIZE * 4, 128, 512
+        key = jax.random.PRNGKey(23)
+        k_hidden, k_embed = jax.random.split(key)
+        hidden_host = jax.random.normal(k_hidden, (num_tokens, hidden_size), dtype=jnp.bfloat16)
+        embed_host = jax.random.normal(k_embed, (vocab_size, hidden_size), dtype=jnp.bfloat16)
+
+        with jax.set_mesh(_MESH):
+            processor = LogitsProcessor(vocab_size=vocab_size, mesh=_MESH)
+            lm_head = Embed(
+                num_embeddings=vocab_size,
+                features=hidden_size,
+                dtype=jnp.bfloat16,
+                param_dtype=jnp.bfloat16,
+                kernel_axes=("tensor", None),
+                mesh=_MESH,
+            )
+            lm_head.embedding = nnx.Param(embed_host, out_sharding=P("tensor", None))
+            hidden = jax.device_put(hidden_host, NamedSharding(_MESH, P(("data", "tensor"), None)))
+            logits = processor._get_logits(hidden, lm_head)
+
+        self.assertEqual(_spec_dim(logits.sharding, 0), "data")
+        self.assertEqual(_spec_dim(logits.sharding, 1), "tensor")
+        expected = jnp.dot(hidden_host, embed_host.T)
+        np.testing.assert_allclose(_as_fp32(logits), _as_fp32(expected), rtol=0.05, atol=1.0)
 
 
 def _make_quant_linear_inputs(batch: int, in_dim: int, out_dim: int):
@@ -147,6 +234,20 @@ def _build_quant_linear(weight_q, weight_scale, mesh, *, output_scatter_dimensio
     ql.weight_q = nnx.Param(weight_q, out_sharding=P(None, "tensor"))
     ql.weight_scale = nnx.Param(weight_scale, out_sharding=P(None))
     return ql
+
+
+def _build_linear_base(weight, mesh, *, output_scatter_dimension):
+    lin = LinearBase(
+        input_size=weight.shape[0],
+        output_size=weight.shape[1],
+        use_bias=False,
+        mesh=mesh,
+        kernel_axes=("tensor", None),
+        params_dtype=jnp.bfloat16,
+        output_scatter_dimension=output_scatter_dimension,
+    )
+    lin.weight = nnx.Param(weight, out_sharding=P("tensor", None))
+    return lin
 
 
 def _make_moe_mesh(ep_size: int, tp_size: int) -> Mesh:
@@ -282,7 +383,7 @@ class TestGrokLayerSequenceParallelWiring(CustomTestCase):
         self.assertIsNone(mlp.gate_proj.output_scatter_dimension)
         self.assertIsNone(mlp.up_proj.output_scatter_dimension)
 
-    def test_grok1_mlp_disables_scatter_by_default(self):
+    def test_grok1_mlp_leaves_legacy_flag_unset_by_default(self):
         mesh = _single_node_mesh()
         with jax.set_mesh(mesh):
             mlp = Grok1MLP(hidden_size=128, intermediate_size=256, layer_id=0, mesh=mesh)
@@ -306,7 +407,7 @@ class TestGrokLayerSequenceParallelWiring(CustomTestCase):
         self.assertIsNone(attn.k_proj.output_scatter_dimension)
         self.assertIsNone(attn.v_proj.output_scatter_dimension)
 
-    def test_grok1_attention_disables_scatter_by_default(self):
+    def test_grok1_attention_leaves_legacy_flag_unset_by_default(self):
         mesh = _single_node_mesh()
         cfg = SimpleNamespace(head_dim=64)
         with jax.set_mesh(mesh):
@@ -401,24 +502,23 @@ class TestDpSpComposition(CustomTestCase):
         x_host, weight_q, weight_scale = _make_quant_linear_inputs(batch, in_dim, out_dim)
 
         with jax.set_mesh(mesh):
-            ql_scatter = _build_quant_linear(
+            ql_explicit = _build_quant_linear(
                 weight_q, weight_scale, mesh, output_scatter_dimension=0
             )
-            ql_baseline = _build_quant_linear(
+            ql_default = _build_quant_linear(
                 weight_q, weight_scale, mesh, output_scatter_dimension=None
             )
             x = jax.device_put(x_host, NamedSharding(mesh, P("data", "tensor")))
-            out_scatter, _ = ql_scatter(x)
-            out_baseline, _ = ql_baseline(x)
+            explicit_out, _ = ql_explicit(x)
+            default_out, _ = ql_default(x)
 
         # The whole point of this test: dim 0 should stripe across BOTH axes,
         # not have "data" replaced by "tensor".
-        self.assertEqual(_spec_dim(out_scatter.sharding, 0), ("data", "tensor"))
-        # Baseline keeps the DP-only sharding.
-        self.assertEqual(_spec_dim(out_baseline.sharding, 0), "data")
+        self.assertEqual(_spec_dim(explicit_out.sharding, 0), ("data", "tensor"))
+        self.assertEqual(_spec_dim(default_out.sharding, 0), ("data", "tensor"))
 
         np.testing.assert_allclose(
-            _as_fp32(out_scatter), _as_fp32(out_baseline), rtol=0.05, atol=1.0
+            _as_fp32(explicit_out), _as_fp32(default_out), rtol=0.05, atol=1.0
         )
 
     @unittest.skipIf(_TOTAL_DEVICES < 8, "Needs >=8 devices for dp=2, tp=4.")
