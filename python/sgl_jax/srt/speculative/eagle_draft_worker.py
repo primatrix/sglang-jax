@@ -221,14 +221,20 @@ class EagleDraftWorker(BaseDraftWorker):
         # Phase 2 padding may set leading dim to padded_bs > real_bs;
         # JAX >=0.7 refuses ambiguous gather sharding on slicing a sharded
         # array, so use dynamic_slice instead of __getitem__.
+        # NOTE(phase 3.6): we cannot keep these at padded_bs because the
+        # downstream EagleDraftInput / padding_for_decode pipeline expects
+        # real_bs-shaped inputs (verified_id comes in at real_bs and gets
+        # padded later). Leaving padded shape here breaks the next decode
+        # tick (hidden_states/embeds shape mismatch in llama_eagle3). The
+        # cost: capture_for_decode's topk_probs_from_logits sees real_bs,
+        # which can miss the precompiled (bs_bucket, V) cache key; Phase 4
+        # will resolve that by padding the whole draft pipeline to padded_bs.
         real_bs = int(model_worker_batch.real_bs)
         logits_output.next_token_logits = jax.lax.dynamic_slice_in_dim(
             logits_output.next_token_logits, 0, real_bs, axis=0
         )
         if len(logits_output.hidden_states.shape) == 1:
             logits_output.hidden_states = jnp.expand_dims(logits_output.hidden_states, axis=0)
-        # Slice hidden_states leading dim to real_bs as well so downstream
-        # capture_for_decode / spec decode see (real_bs, hidden), not padded.
         if logits_output.hidden_states.shape[0] > real_bs:
             logits_output.hidden_states = jax.lax.dynamic_slice_in_dim(
                 logits_output.hidden_states, 0, real_bs, axis=0
