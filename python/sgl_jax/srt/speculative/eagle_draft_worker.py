@@ -218,15 +218,23 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
-        logits_output.next_token_logits = logits_output.next_token_logits[
-            : model_worker_batch.real_bs, :
-        ]
+        # Phase 2 padding may set leading dim to padded_bs > real_bs;
+        # JAX >=0.7 refuses ambiguous gather sharding on slicing a sharded
+        # array, so use dynamic_slice instead of __getitem__.
+        real_bs = int(model_worker_batch.real_bs)
+        logits_output.next_token_logits = jax.lax.dynamic_slice_in_dim(
+            logits_output.next_token_logits, 0, real_bs, axis=0
+        )
         if len(logits_output.hidden_states.shape) == 1:
             logits_output.hidden_states = jnp.expand_dims(logits_output.hidden_states, axis=0)
+        # Slice hidden_states leading dim to real_bs as well so downstream
+        # capture_for_decode / spec decode see (real_bs, hidden), not padded.
+        if logits_output.hidden_states.shape[0] > real_bs:
+            logits_output.hidden_states = jax.lax.dynamic_slice_in_dim(
+                logits_output.hidden_states, 0, real_bs, axis=0
+            )
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
-        forward_batch.spec_info.allocate_lens = model_worker_batch.seq_lens[
-            : model_worker_batch.real_bs
-        ]
+        forward_batch.spec_info.allocate_lens = model_worker_batch.seq_lens[:real_bs]
 
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 

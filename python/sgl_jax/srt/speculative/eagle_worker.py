@@ -297,12 +297,15 @@ class EAGLEWorker(BaseSpecWorker):
         start_time = time.perf_counter()
         logger.info(
             "[SPEC_EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s",
-            self.precompile_bs_paddings[-1:],
+            self.precompile_bs_paddings,
             self.precompile_token_paddings,
         )
 
-        bs, _ = self.draft_worker.get_max_padded_size()
-        pairs = list(itertools.product([bs], self.precompile_token_paddings))
+        # Phase 3.1 (F2): trace every (bs_bucket, token_bucket) pair so the
+        # runtime pad_to_bucket(real_bs, bs_paddings) always lands on a key
+        # that was precompiled. Previously only [max_bs] was used and small bs
+        # prefills cold-compiled on first request.
+        pairs = list(itertools.product(self.precompile_bs_paddings, self.precompile_token_paddings))
 
         with tqdm(pairs, desc="[SPEC_EXTEND] PRECOMPILE", leave=False) as pbar:
             for pair in pbar:
