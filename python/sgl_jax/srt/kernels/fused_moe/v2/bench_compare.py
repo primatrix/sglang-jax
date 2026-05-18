@@ -62,7 +62,6 @@ use_fp8 = os.environ.get("BENCH_FP8", "1") == "1"
 quant_block_k = int(os.environ.get("BENCH_QBK", "128"))
 use_trace = os.environ.get("BENCH_TRACE", "0") == "1"
 direct_scaled_dot = os.environ.get("BENCH_DIRECT_SCALED_DOT", "0") == "1"
-v2_decode_mode = os.environ.get("BENCH_V2_DECODE_MODE", "0") == "1"
 v2_bf_override = os.environ.get("BENCH_V2_BF")
 v2_bt_override = os.environ.get("BENCH_V2_BT")
 v2_btc_override = os.environ.get("BENCH_V2_BTC")
@@ -114,8 +113,6 @@ log(f"tokens={token_candidates} warmup={warmup} iters={iters} timing={'trace' if
 log("metadata modes: V1=jax_out_of_kernel V2=in_kernel")
 if direct_scaled_dot:
     log("direct_scaled_dot=True")
-if v2_decode_mode:
-    log("v2_decode_mode=True")
 
 
 def make_sharded(rng_key, shape, dtype, scale=1.0):
@@ -450,7 +447,6 @@ for num_tokens in token_candidates:
             w1_scale=w1_scale_s, w2_scale=w2_scale_s, w3_scale=w3_scale_s,
             use_jax_allreduce_metadata=False,
             direct_scaled_dot=direct_scaled_dot,
-            decode_mode=v2_decode_mode,
         )
 
     log("  V2: compiling + running...")

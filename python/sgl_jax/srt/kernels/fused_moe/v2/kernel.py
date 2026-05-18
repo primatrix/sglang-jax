@@ -309,7 +309,6 @@ def _fused_ep_moe_kernel(
     disable_dynamic_ffn2: bool = False,
     disable_acc_and_store: bool = False,
     use_jax_allreduce_metadata: bool = True,
-    decode_mode: bool = False,
     direct_scaled_dot: bool = False,
     bt: int,
     bf: int,
@@ -351,8 +350,7 @@ def _fused_ep_moe_kernel(
     # is valid only when next expert bf0 lands in slot0 and will not be clobbered
     # by another bts tile of the current expert.
     can_cross_expert_prefetch = (
-        not decode_mode
-        and not disable_weight_load
+        not disable_weight_load
         and direct_scaled_dot
         and w1_scale_hbm is not None
         and w2_scale_hbm is not None
@@ -1137,35 +1135,27 @@ def _fused_ep_moe_kernel(
                     sem=x_stage_sem.at[0],
                 ).wait()
 
-                # Weight prologue (double-buffer only)
-                if not decode_mode:
-                    if can_split_w13_w2_prefetch:
-                        use_prefetched_bf0 = jnp.logical_and(
-                            bf0_w13_prefetched, bts_id == jnp.int32(0)
-                        )
+                if can_split_w13_w2_prefetch:
+                    use_prefetched_bf0 = jnp.logical_and(
+                        bf0_w13_prefetched, bts_id == jnp.int32(0)
+                    )
 
-                        @pl.when(jnp.logical_not(use_prefetched_bf0))
-                        def _():
-                            start_fetch_w1(local_e_id, 0, 0, priority=1)
-                            start_fetch_w3(local_e_id, 0, 0, priority=1)
-                        start_fetch_w2(local_e_id, 0, 0, priority=1)
-                    else:
+                    @pl.when(jnp.logical_not(use_prefetched_bf0))
+                    def _():
                         start_fetch_w1(local_e_id, 0, 0, priority=1)
                         start_fetch_w3(local_e_id, 0, 0, priority=1)
-                        start_fetch_w2(local_e_id, 0, 0, priority=1)
-                    if num_bf >= 2:
-                        start_fetch_w1(local_e_id, 1, 1)
-                        start_fetch_w3(local_e_id, 1, 1)
-                        start_fetch_w2(local_e_id, 1, 1, priority=1)
+                    start_fetch_w2(local_e_id, 0, 0, priority=1)
+                else:
+                    start_fetch_w1(local_e_id, 0, 0, priority=1)
+                    start_fetch_w3(local_e_id, 0, 0, priority=1)
+                    start_fetch_w2(local_e_id, 0, 0, priority=1)
+                if num_bf >= 2:
+                    start_fetch_w1(local_e_id, 1, 1)
+                    start_fetch_w3(local_e_id, 1, 1)
+                    start_fetch_w2(local_e_id, 1, 1, priority=1)
 
                 for bf_id in range(num_bf):
-                    if decode_mode:
-                        slot = 0
-                        start_fetch_w1(local_e_id, 0, bf_id, priority=1)
-                        start_fetch_w3(local_e_id, 0, bf_id, priority=1)
-                        start_fetch_w2(local_e_id, 0, bf_id, priority=1)
-                    else:
-                        slot = bf_id % 2
+                    slot = bf_id % 2
 
                     next_bf_id = bf_id + 2
 
@@ -1295,7 +1285,7 @@ def _fused_ep_moe_kernel(
 
                         lax.fori_loop(0, num_btc_per_bts, gate_up_btc, None)
 
-                    if not decode_mode and can_split_w13_w2_prefetch:
+                    if can_split_w13_w2_prefetch:
                         if bf_id == num_bf - 2:
                             next_has_prefetch = start_prefetch_expert_bf0_w13(
                                 bt_sem_id,
@@ -1378,11 +1368,10 @@ def _fused_ep_moe_kernel(
 
                     # Same-expert bf+2 keeps the original full-slot rolling point:
                     # W1/W3/W2 are fetched together after down frees the slot.
-                    if not decode_mode:
-                        if next_bf_id < num_bf:
-                            start_fetch_w1(local_e_id, slot, next_bf_id)
-                            start_fetch_w3(local_e_id, slot, next_bf_id)
-                            start_fetch_w2(local_e_id, slot, next_bf_id, priority=1)
+                    if next_bf_id < num_bf:
+                        start_fetch_w1(local_e_id, slot, next_bf_id)
+                        start_fetch_w3(local_e_id, slot, next_bf_id)
+                        start_fetch_w2(local_e_id, slot, next_bf_id, priority=1)
 
                 # Final writeback: f32 → bf16, then DMA to HBM (once per bts tile)
                 def writeback_btc(btc_id, ___):
@@ -1843,7 +1832,7 @@ def jax_allreduce_metadata_by_bt(
         "disable_acc_and_store",
         "use_jax_allreduce_metadata",
         "block_config", "dp_axis_name", "tp_axis_name",
-        "quant_block_k", "decode_mode", "direct_scaled_dot",
+        "quant_block_k", "direct_scaled_dot",
     ],
 )
 def fused_ep_moe_v2(
@@ -1873,7 +1862,6 @@ def fused_ep_moe_v2(
     w2_scale: jax.Array | None = None,
     w3_scale: jax.Array | None = None,
     block_config: FusedMoEBlockConfig | None = None,
-    decode_mode: bool = False,
     direct_scaled_dot: bool = False,
     dp_axis_name: str = "data",
     tp_axis_name: str = "tensor",
@@ -1968,7 +1956,7 @@ def fused_ep_moe_v2(
 
     acc_bt = math.gcd(bt, 16)
     hbm_spec = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
-    wb_slots = 1 if decode_mode else 2
+    wb_slots = 2
     use_w1_dequant_scratch = w1_scale is not None and not direct_scaled_dot
     use_w3_dequant_scratch = w3_scale is not None and not direct_scaled_dot
     use_w2_dequant_scratch = w2_scale is not None and not direct_scaled_dot
@@ -2060,7 +2048,6 @@ def fused_ep_moe_v2(
                 disable_dynamic_ffn2=disable_dynamic_ffn2,
                 disable_acc_and_store=disable_acc_and_store,
                 use_jax_allreduce_metadata=use_jax_allreduce_metadata,
-                decode_mode=decode_mode,
                 direct_scaled_dot=direct_scaled_dot,
                 bt=bt, bf=bf, btc=btc, bts=bts, bse=bse,
                 quant_block_k=quant_block_k,

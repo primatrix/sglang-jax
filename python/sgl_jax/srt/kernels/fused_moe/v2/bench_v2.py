@@ -205,7 +205,6 @@ quant_block_k = int(os.environ.get("BENCH_QBK", "128"))
 tune_mode = os.environ.get("BENCH_TUNE", "0") == "1"
 use_wall = os.environ.get("BENCH_WALL", "0") == "1"
 use_split = os.environ.get("BENCH_SPLIT", "0") == "1"
-decode_mode = os.environ.get("BENCH_DECODE_MODE", "0") == "1"
 direct_scaled_dot = os.environ.get("BENCH_DIRECT_SCALED_DOT", "0") == "1"
 inkernel_metadata = os.environ.get("BENCH_INKERNEL_MD", "0") == "1"
 if use_split:
@@ -234,8 +233,6 @@ ablation_flags = {
 active_ablation = [k for k, v in ablation_flags.items() if v]
 if active_ablation:
     log(f"ablation flags: {active_ablation}")
-if decode_mode:
-    log("decode_mode=True (single-buffer weights, serial bf loop)")
 if direct_scaled_dot:
     log("direct_scaled_dot=True (fp8 dot per quant group, scale after dot)")
 if inkernel_metadata:
@@ -401,7 +398,6 @@ for num_tokens in token_candidates:
                 disable_dynamic_ffn1=disable_dynamic_ffn1,
                 disable_dynamic_ffn2=disable_dynamic_ffn2,
                 disable_acc_and_store=disable_acc_and_store,
-                decode_mode=decode_mode,
                 direct_scaled_dot=direct_scaled_dot,
                 use_jax_allreduce_metadata=not inkernel_metadata,
             )
