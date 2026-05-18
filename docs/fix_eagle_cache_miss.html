@@ -169,6 +169,7 @@ hr { border: none; border-top: 1px solid var(--border); margin: 32px 0; }
   <strong>目录</strong>
   <ul>
     <li><a href="#bg">背景</a></li>
+    <li><a href="#progress">阶段累计进度</a></li>
     <li><a href="#contract">Padding 契约(验收标准)</a></li>
     <li><a href="#taxonomy">Precompile 三分法:EXTEND / DECODE / RUNTIME</a></li>
     <li><a href="#boundaries">Spec 路径 JIT 边界全清单</a></li>
@@ -253,6 +254,48 @@ hr { border: none; border-top: 1px solid var(--border); margin: 32px 0; }
 
 <div class="card warn">
 <strong>Phase 1 验证后更新</strong>(2026-05-18):Phase 1.2 把 cache_miss 计数从「只计 target forward」扩展到「整个 spec 路径」后,decode 稳态 <code>#cache_miss</code> 实际值是 <strong>2 ~ 6 / tick</strong>(基线显示的 1/tick 只是冰山一角)。这说明真实 miss 主要来自此前未计数的 <code>verify_tree_greedy / build_tree / update_eagle_lists / select_top_k</code> 等 spec 辅助 jit,F2/F4 修复目标因此提高:不只是降到 0,而是把这 2~6 完全清掉。
+</div>
+
+<h3 id="progress">阶段累计进度(2026-05-18)</h3>
+<div class="card ok">
+<table>
+<thead><tr><th>阶段</th><th>commit</th><th>状态</th><th>关键收益</th></tr></thead>
+<tbody>
+<tr><td>Phase 1 — 诊断仪表</td><td><code>c89e9620</code></td><td>✅</td><td>SGLANG_JAX_EXPLAIN_CACHE_MISSES env + register_variant_if_new WARN + cache_miss_probe + 全 spec 路径 miss 计数</td></tr>
+<tr><td>Phase 2 — EXTEND padding 契约</td><td><code>ad2df3d9</code></td><td>✅</td><td>spec extend bs/tokens ceil 到桶;同形状重复请求第二次起 0 miss;14/14 L1 测试通过</td></tr>
+<tr><td>Phase 3.1 — EXTEND 全 bs 桶</td><td><code>a096ddff</code></td><td>✅</td><td>precompile_spec_extend 遍历 (bs × token) 笛卡尔积;首请求 EXTEND 0 miss;<code>draft_extend_for_prefill</code> 用 dynamic_slice 适配 JAX 0.7 sharding</td></tr>
+<tr><td>Phase 3.2/3.3/3.4 — DECODE 覆盖 + 动态常量</td><td><code>e7ce4a1f</code></td><td>✅</td><td>custom_mask 单桶 padding(F2);precompile_spec_decode 多遍 (bs × seq_len);<code>cache_loc_paddings[bs_idx]</code> 对齐 runtime;<code>TARGET_PADDING=16384</code> 改为动态(F6)</td></tr>
+<tr><td>Phase 3.6 — 调研收尾</td><td><code>cbbd1636</code></td><td>📝</td><td>验证「移除 real_bs slice」会破坏下游 shape(9 vs 8 reshape),加注释避免后人重复尝试</td></tr>
+<tr><td>Phase 4.1 — spec_info sharding 对齐</td><td><code>13b5e5d9</code></td><td>✅</td><td>padding_for_decode + precompile dummy 显式 NamedSharding(P());select_top_k_step_0 4 miss → 0</td></tr>
+<tr><td>Phase 4.2 — draft pipeline padded_bs 化</td><td>—</td><td>🔍 spike 失败</td><td>去掉 draft_extend_for_prefill real_bs slice 后 select_top_k 收到 (9,1) 而非 (8,1);9 来源不明,需诊断后再设计</td></tr>
+</tbody>
+</table>
+
+<p><strong>实测对比表(8 并发 real_bs=1+7 请求,niu-v6e4-sleep)</strong></p>
+<table>
+<thead><tr><th>指标</th><th>基线</th><th>Phase 2</th><th>Phase 3</th><th>Phase 4.1</th></tr></thead>
+<tbody>
+<tr><td>启动总时长</td><td>5m49s</td><td>3m6s</td><td>7m50s</td><td>5m20s</td></tr>
+<tr><td>precompile variant 数</td><td>8</td><td>16</td><td>28</td><td>28</td></tr>
+<tr><td>首请求新增 variant</td><td>22~48</td><td>1</td><td>0</td><td>0</td></tr>
+<tr><td>jitted_run_model runtime miss</td><td>48</td><td>—</td><td>18</td><td>24</td></tr>
+<tr><td>select_top_k_step_0 miss</td><td>—</td><td>4</td><td>4</td><td><strong>0 ✅</strong></td></tr>
+<tr><td>topk_probs miss(capture/extend)</td><td>—</td><td>2</td><td>2</td><td>4</td></tr>
+<tr><td>decode 稳态 #cache_miss/tick</td><td>1*</td><td>2~6</td><td>2~6</td><td>2~6</td></tr>
+</tbody>
+</table>
+<p class="muted">* 基线 1/tick 是测量假象(只计 target forward),Phase 1 后揭露真实是 2~6/tick;Phase 4.2 目标清零。</p>
+
+<p><strong>Phase 4.2 spike crash 追踪</strong></p>
+<p>spike 改动:<code>draft_extend_for_prefill</code> 不再切 next_token_logits / hidden_states 到 real_bs,保持 padded_bs 端到端。</p>
+<p>失败堆栈(8 并发 real_bs=1+7):<code>select_top_k_tokens_step_0</code> 收到 <code>topk_p shape=(9, 1)</code> 但 precompile 是 <code>(8, 1)</code>,后续 draft model rotary_emb 报 <code>ShardingTypeError: reshape bfloat16[9@data,64@tensor,80] → (8, 72, 80)</code>。</p>
+<p><strong>9 vs 8 来源未明</strong>,可能链条:
+<ol>
+  <li><code>capture_for_decode</code> 收到的 next_token_logits 实际 shape 可能不是 padded_bs=8(模型 with capture_hidden_mode=LAST 走 logits_indices_selector,返回 real_bs=7)</li>
+  <li><code>padding_for_decode</code> pad 时算出来的目标 bs 可能与 <code>draft_forward</code> 入口的 <code>seq_lens.shape[0]</code> 不一致</li>
+  <li><code>scheduler.run_batch</code> 在 prefill 后对 <code>info.seq_lens += 1</code>,padding 后元素数可能与 real_bs 不一致</li>
+</ol>
+下一步用 print 诊断 <code>draft_forward</code> 入口形状,定位 9 出现的精确步骤。</p>
 </div>
 
 <h2 id="contract">Padding 契约(验收标准)</h2>
