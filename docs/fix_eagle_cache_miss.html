@@ -1,0 +1,1009 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>EAGLE/MTP Precompile Cache-Miss 修复计划</title>
+<style>
+:root {
+  --bg: #0f1117;
+  --panel: #161922;
+  --panel-2: #1c2030;
+  --border: #2a2f42;
+  --text: #e6e8ee;
+  --muted: #9aa3b2;
+  --accent: #7aa2f7;
+  --accent-2: #bb9af7;
+  --ok: #9ece6a;
+  --warn: #e0af68;
+  --err: #f7768e;
+  --code-bg: #11141c;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  line-height: 1.7;
+  font-size: 15px;
+}
+.container {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 48px 32px 96px;
+}
+h1 {
+  font-size: 30px;
+  margin: 0 0 8px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.subtitle { color: var(--muted); margin-bottom: 32px; }
+h2 {
+  font-size: 22px;
+  margin: 48px 0 16px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+h3 {
+  font-size: 17px;
+  margin: 24px 0 12px;
+  color: var(--accent);
+}
+code {
+  background: var(--code-bg);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: "JetBrains Mono", "Fira Code", Menlo, monospace;
+  font-size: 13px;
+  color: #c0caf5;
+}
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  padding: 14px 18px;
+  border-radius: 8px;
+  overflow-x: auto;
+  font-size: 13px;
+  line-height: 1.55;
+}
+pre code { background: none; padding: 0; }
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 18px 22px;
+  margin: 16px 0;
+}
+.card.warn { border-left: 4px solid var(--warn); }
+.card.err  { border-left: 4px solid var(--err); }
+.card.ok   { border-left: 4px solid var(--ok); }
+.card.info { border-left: 4px solid var(--accent); }
+
+.tag {
+  display: inline-block;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  color: var(--muted);
+  margin-left: 8px;
+  vertical-align: middle;
+  letter-spacing: 0.5px;
+}
+.tag.r { background: rgba(247,118,142,0.12); color: var(--err); }
+.tag.f { background: rgba(158,206,106,0.12); color: var(--ok); }
+
+ul, ol { padding-left: 22px; }
+li { margin: 6px 0; }
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 14px;
+  margin: 12px 0;
+}
+
+.path {
+  color: var(--accent-2);
+  font-family: "JetBrains Mono", Menlo, monospace;
+  font-size: 12.5px;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 12px 0;
+  font-size: 14px;
+}
+th, td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+th { color: var(--muted); font-weight: 500; background: var(--panel-2); }
+
+.toc {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 22px;
+  margin: 24px 0;
+}
+.toc a { color: var(--accent); text-decoration: none; }
+.toc a:hover { text-decoration: underline; }
+.toc ul { margin: 6px 0; }
+
+.step {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 12px 0;
+}
+.step-num {
+  flex: 0 0 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  color: #0f1117;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.step-body { flex: 1; }
+
+.muted { color: var(--muted); }
+hr { border: none; border-top: 1px solid var(--border); margin: 32px 0; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>EAGLE/MTP Precompile Cache-Miss 修复计划</h1>
+<div class="subtitle">基于 <code>dev/fix-cache-miss</code> · 涉及 EAGLE3 spec decode 路径</div>
+
+<div class="toc">
+  <strong>目录</strong>
+  <ul>
+    <li><a href="#bg">背景</a></li>
+    <li><a href="#contract">Padding 契约(验收标准)</a></li>
+    <li><a href="#taxonomy">Precompile 三分法:EXTEND / DECODE / RUNTIME</a></li>
+    <li><a href="#boundaries">Spec 路径 JIT 边界全清单</a></li>
+    <li><a href="#root">根因清单 (R1–R8)</a></li>
+    <li><a href="#fix">修复策略 (F1–F8)</a></li>
+    <li><a href="#plan">执行路线(5 阶段 + 验收)</a></li>
+    <li><a href="#mru">最小可复现单元(MRU)验证框架</a></li>
+    <li><a href="#files">涉及文件</a></li>
+    <li><a href="#open">待澄清</a></li>
+  </ul>
+</div>
+
+<h2 id="bg">背景</h2>
+<div class="card info">
+开启 <code>--speculative-algorithm EAGLE3</code> 后,即使去掉 <code>--disable-precompile</code>,precompile 完成后首批请求仍触发大量 XLA 重编译。原因分两类:
+<ol>
+  <li><strong>Precompile 覆盖不全</strong> —— 多处 jit 边界没在 precompile 阶段被以全部 bucket 组合 trace 一次。</li>
+  <li><strong>EAGLE runtime padding 不一致</strong> —— 部分张量按 <code>real_bs</code> 成形,或 pad 到非 bucket 值,导致即使输入 batch 命中 bucket,内部张量 shape 仍变化。</li>
+</ol>
+调试入口:在 <code>ModelRunner.__init__</code> / scheduler 启动处加上 <code>jax.config.update("jax_explain_cache_misses", True)</code>(由 env var 控制),配合现有 <span class="path">tp_worker.py:418</span> 处 <code>count_pjit_cpp_cache_miss</code> 包到 <code>forward(...)</code> 一并使用,就能复现每条 miss 的 <code>(mode, bs, num_tokens, step_id)</code> 指纹。
+</div>
+
+<h3>基线测量(niu-v6e4-sleep · 2026-05-18)</h3>
+<div class="card err">
+<p><strong>实测配置</strong>:Qwen3-32B + Qwen3-32B_eagle3,tp=4,num_steps=2,num_draft_tokens=3,topk=1,<code>precompile-bs-paddings 1 4 8 16</code>,<code>precompile-token-paddings 256 1024 2048 4096</code>,<code>JAX_EXPLAIN_CACHE_MISSES=true</code>。</p>
+
+<table>
+<thead><tr><th>阶段</th><th>耗时</th></tr></thead>
+<tbody>
+<tr><td>启动 → 模型加载完成 → SPEC_EXTEND 开始</td><td>36 s(05:02:56 → 05:03:32)</td></tr>
+<tr><td>SPEC_EXTEND (bs=[16] × token=[256,1024,2048,4096])</td><td><strong>84 s</strong></td></tr>
+<tr><td>SPEC_DECODE (bs=[1,4,8,16])</td><td><strong>229 s</strong></td></tr>
+<tr><td><strong>启动总耗时(到 server ready)</strong></td><td><strong>5 m 49 s</strong></td></tr>
+<tr><td>Precompile 阶段内部 PERSISTENT CACHE MISS</td><td><strong>464 次</strong>(precompile 自己就在 miss)</td></tr>
+</tbody>
+</table>
+
+<p><strong>Precompile 阶段 miss 分布</strong>(jit 函数 × 次数):</p>
+<table>
+<thead><tr><th>jit 函数</th><th>miss 次数</th></tr></thead>
+<tbody>
+<tr><td>ragged_paged_attention</td><td>38</td></tr>
+<tr><td>jitted_run_model(target + draft 模型 forward)</td><td>36</td></tr>
+<tr><td>update_eagle_lists(static <code>i</code>)</td><td>14</td></tr>
+<tr><td>topk_probs_from_logits</td><td>14</td></tr>
+<tr><td>verify_tree_greedy / verify_tree_greedy_pallas_call</td><td>6 + 6</td></tr>
+<tr><td>build_tree_kernel_efficient_preprocess</td><td>6</td></tr>
+<tr><td>build_eagle_tree_structure / pallas_call</td><td>6 + 6</td></tr>
+<tr><td>jitted_sampler</td><td>6</td></tr>
+</tbody>
+</table>
+
+<p><strong>Precompile 完成后再发请求(首请求测量)</strong></p>
+<table>
+<thead><tr><th>场景</th><th>TRACING MISS</th><th>PERSISTENT MISS</th><th>scheduler counter</th></tr></thead>
+<tbody>
+<tr><td>1 条 7-token 短请求</td><td><strong>22</strong></td><td>8</td><td>Prefill #cache_miss: 2;Decode 稳态每 tick <code>#cache_miss: 1</code></td></tr>
+<tr><td>8 条并行 ~64-token 请求</td><td><strong>48</strong></td><td>46</td><td>Prefill #cache_miss: 2;Decode 稳态每 tick <code>#cache_miss: 1</code></td></tr>
+</tbody>
+</table>
+
+<p><strong>首请求 miss 分布</strong>(8 并发场景):</p>
+<ul>
+  <li><code>jitted_run_model</code>: 28(target + draft forward,每个新 (bs, forward_mode) 组合一次)</li>
+  <li><code>ragged_paged_attention</code>: 8(flash attn pallas,同上联动)</li>
+  <li><code>select_top_k_tokens</code>: 4</li>
+  <li><code>jitted_sampler</code>: 4</li>
+  <li><code>capture_for_decode</code>: 2</li>
+  <li><code>Sampler.__call__.<lambda></code>: 2</li>
+</ul>
+
+<p><strong>关键结论</strong></p>
+<ol>
+  <li><strong>precompile 自己就漏了 464 项</strong> —— SPEC_EXTEND 只对 bs=[16] 单值 trace(印证 R3),但模型 forward 同时还要 trace TARGET_VERIFY / DRAFT_EXTEND_AFTER_VERIFY 等多种 forward_mode + capture_hidden_mode 组合,这些组合在 precompile 循环里没穷举。</li>
+  <li><strong>首请求 +22~48 次 miss</strong> —— 即便走 precompile 已覆盖的 bs/token,某些 (forward_mode, capture_hidden_mode, batch_size) pytree 静态 metadata 组合仍未命中。</li>
+  <li><strong>decode 稳态每 tick #cache_miss: 1</strong> —— 长期存在的"每个 decode tick 都在重编译一次"现象。这是用户体感最差的部分(吞吐被压制),也是 F2/F4 必须根除的核心目标。</li>
+  <li><strong>SPEC_DECODE precompile 229s</strong> —— 即使只 4 个 bs 桶,内部完整链路 trace 已经 ~57s/桶,F2 加上 step_id × bs × token 矩阵后启动时间会显著上升,需要在做 F2 时同步关注。</li>
+</ol>
+
+<p class="muted">Artifacts: <code>niu-v6e4-sleep:/tmp/baseline_artifacts/baseline.log</code>(6091 行原始日志,含完整 TRACING CACHE MISS 解释)。</p>
+</div>
+
+<div class="card warn">
+<strong>Phase 1 验证后更新</strong>(2026-05-18):Phase 1.2 把 cache_miss 计数从「只计 target forward」扩展到「整个 spec 路径」后,decode 稳态 <code>#cache_miss</code> 实际值是 <strong>2 ~ 6 / tick</strong>(基线显示的 1/tick 只是冰山一角)。这说明真实 miss 主要来自此前未计数的 <code>verify_tree_greedy / build_tree / update_eagle_lists / select_top_k</code> 等 spec 辅助 jit,F2/F4 修复目标因此提高:不只是降到 0,而是把这 2~6 完全清掉。
+</div>
+
+<h2 id="contract">Padding 契约(验收标准)</h2>
+
+<div class="card info">
+<p>所有 spec 路径(extend / decode / draft 多步 / verify)在进入任何 jit 边界前,<strong>必须把 runtime 形状向上取整到最近的 precompile bucket</strong>。precompile bucket 是「契约值」,runtime 不允许产生 bucket 外的 shape。</p>
+</div>
+
+<table>
+<thead><tr><th>维度</th><th>输入定义域</th><th>映射规则</th><th>示例 (bucket = [1, 8, 16])</th></tr></thead>
+<tbody>
+<tr>
+  <td>batch size</td>
+  <td><code>1 ≤ real_bs ≤ max_bs_bucket</code></td>
+  <td><code>padded_bs = min{ b ∈ bs_buckets : b ≥ real_bs }</code></td>
+  <td>5 → 8; 9 → 16; 16 → 16</td>
+</tr>
+<tr>
+  <td>prefill token 数</td>
+  <td><code>1 ≤ num_tokens ≤ max_token_bucket</code></td>
+  <td><code>padded_tokens = min{ t ∈ token_buckets : t ≥ num_tokens }</code></td>
+  <td>(bucket=[64,128,256,512]) 100 → 128; 500 → 512</td>
+</tr>
+<tr>
+  <td>cache_loc</td>
+  <td>由 <code>padded_bs</code> 决定</td>
+  <td>查表 <code>cache_loc_buckets[bs_idx]</code>(含 spec 增量,见 F7)</td>
+  <td>—</td>
+</tr>
+<tr>
+  <td>tree mask <code>max_context_len</code></td>
+  <td>由 <code>max(seq_lens)</code> 决定</td>
+  <td>同 prefill token 桶向上取整,无 fallback(见 F5)</td>
+  <td>—</td>
+</tr>
+</tbody>
+</table>
+
+<div class="card warn">
+<strong>越界处理</strong>:<code>real_bs &gt; max_bs_bucket</code> 或 <code>num_tokens &gt; max_token_bucket</code> 时,直接报错并提示扩大 <code>--precompile-bs-paddings / --precompile-token-paddings</code>。<strong>禁止</strong>静默 fallback 到「向上取下一个 2 的幂」之类的非 bucket 值 —— 这正是 R6 的 bug 模式。
+</div>
+
+<div class="card info">
+<strong>对齐非 MTP 路径的现有做法</strong>(无需另造轮子,直接复用):
+<ul>
+  <li><strong>统一的查桶函数</strong>:<span class="path">common_utils.py:42</span> <code>pad_to_bucket(value, buckets)</code> —— 内部 <code>bisect.bisect_left</code> 找最小 ≥ value 的 bucket;<code>idx &gt;= len(buckets)</code> 直接 <code>raise ValueError("No bucket &gt;= {value}. Available: ... Increase bucket sizes or max capacity.")</code>。这就是非 MTP 的「越界禁止 fallback」实现。
+    <pre><code>def pad_to_bucket(value, buckets):
+    idx = bisect.bisect_left(buckets, value)
+    if idx &lt; len(buckets):
+        return buckets[idx], idx
+    raise ValueError(f"No bucket &gt;= {value}. Available: {buckets}. ...")</code></pre>
+  </li>
+  <li><strong>buckets 一定包含 max 哨兵</strong>:<span class="path">compilation_manager.py:75-92</span> <code>_compute_token_buckets / _compute_bs_buckets</code> 在末尾必定追加 <code>max_padded_num_tokens / max_padded_batch_size</code>,确保用户传入的最大配置一定是某个 bucket,<code>real_bs ≤ max_bs_bucket</code> 永远能命中。</li>
+  <li><strong>调度侧统一调用点</strong>:<span class="path">schedule_batch.py:1747-1748,1922</span> 已经在调度合批时调用 <code>pad_to_bucket(total_bs, bs_paddings)</code> / <code>pad_to_bucket(max_tokens, token_paddings)</code> —— spec 路径要复用同一函数与同一 bucket 列表(<code>model_runner.compilation_manager.bs_buckets / token_buckets</code>),不得另起一套。</li>
+</ul>
+<p>因此 F3 / F4 / F5 的「向上取整」<strong>具体落地 = 在 spec 入口处调用 <code>pad_to_bucket</code></strong>,使用与非 MTP 完全相同的 buckets 与 raise 行为,产生 bucket 外形状这条路径在代码层面就不存在。</p>
+</div>
+
+<div class="card ok">
+<strong>验收条件</strong>(F1–F8 全部完成后必须满足):
+<ol>
+  <li>给定 <code>--precompile-bs-paddings 1 8 16</code>:对 <code>real_bs ∈ {1..16}</code> 的任意 decode 请求,首次 forward 的 <code>cache_miss_count = 0</code>。</li>
+  <li>给定 <code>--precompile-token-paddings 64 128 256 512 1024</code>:对 <code>num_tokens ∈ [1, 1024]</code> 的任意 prefill 请求,首次 forward 的 <code>cache_miss_count = 0</code>。</li>
+  <li><code>SGLANG_JAX_EXPLAIN_CACHE_MISSES=1</code> 下整个压测周期无 <code>jax_explain_cache_misses</code> 日志输出。</li>
+  <li>同时混合多种 bs 与 prompt 长度的并发场景下,稳定后 <code>cache_miss_count</code> 始终为 0。</li>
+</ol>
+</div>
+
+<h2 id="taxonomy">Precompile 三分法:EXTEND / DECODE / RUNTIME</h2>
+
+<div class="card info">
+对 spec 路径而言,需要 precompile 的不止是「模型 forward」一个 jit。把所有 device 上要跑的 jit 分成三类:
+<ol>
+  <li><strong>EXTEND</strong> —— prefill 时进入 device 的所有 jit(target extend forward、draft extend forward、capture 后的 topk)。</li>
+  <li><strong>DECODE</strong> —— decode tick 时模型 forward 类 jit(draft 多步 forward、target verify forward、draft refresh forward)。</li>
+  <li><strong>RUNTIME</strong> —— forward 之外、在 decode tick 内被调用的所有辅助 jit / Pallas 内核(tree 结构构建、verify 树采样、topk_probs_from_logits、select_top_k、update_eagle_lists、采样器、renorm 等)。这一类是非 MTP 模式没有、最容易被忽略的部分。</li>
+</ol>
+三类都需要按 <code>(bs 桶, seq_len 桶)</code> 笛卡尔积 precompile(部分边界还要叠加 <code>step_id</code> 维度,见 <a href="#boundaries">边界清单</a>)。
+</div>
+
+<div class="card err">
+<strong>核心不变量(precompile 完成后必须始终成立)</strong>:
+<blockquote style="border-left:3px solid var(--err); padding-left:14px; margin:8px 0; color:#fff;">
+MTP 运行过程中,任何一个在 device 上执行的函数,其每一个输入张量的 shape 都必须命中已经 precompile 过的 cache key。
+</blockquote>
+这是验收的终极硬约束。任何打破这一不变量的代码路径都视为 bug。
+</div>
+
+<h3>三类的 precompile 维度</h3>
+<table>
+<thead><tr><th>类别</th><th>典型 jit 边界</th><th>precompile 遍历维度</th><th>条目数量级</th></tr></thead>
+<tbody>
+<tr>
+  <td><strong>EXTEND</strong></td>
+  <td>A1 target extend / A3 draft extend / A4 capture topk / A2 sampler</td>
+  <td><code>(bs 桶) × (token 桶)</code></td>
+  <td>|bs| × |token|</td>
+</tr>
+<tr>
+  <td><strong>DECODE</strong></td>
+  <td>B4 draft model per step / C3 target verify / D2 draft refresh</td>
+  <td>
+    B4: <code>(bs 桶) × step_id(0..N-2)</code><br>
+    C3: <code>(bs 桶) × (max_seq_len 桶)</code><br>
+    D2: <code>(bs 桶) × (max_seq_len 桶)</code>
+  </td>
+  <td>|bs| × (N + 2·|token|)</td>
+</tr>
+<tr>
+  <td><strong>RUNTIME</strong></td>
+  <td>B1/B2/B3/B6/B7 · C1/C2/C4/C5/C6 · D1/D3/D4 · E1~E11</td>
+  <td>
+    B3 update_eagle_lists: <code>(bs 桶) × step_id</code><br>
+    C2 build_eagle_tree_structure: <code>(bs 桶) × (max_context_len 桶)</code><br>
+    C5/C6 非 greedy 采样: <code>(bs 桶) × {greedy, top-k, top-p}</code><br>
+    其余: <code>(bs 桶)</code>
+  </td>
+  <td>≈ |bs| × (N + |token| + 3) + O(|bs|)</td>
+</tr>
+</tbody>
+</table>
+
+<h3>接受率(accept_lens)导致的 shape 漂移</h3>
+<div class="card warn">
+spec 流程里有一类 shape <strong>不是固定的</strong>,而是由 verify 阶段的接受率决定 —— 主要是 <code>verified_id</code>、<code>extend_seq_lens</code>、以及由它们派生的 <code>cu_q_lens / cu_kv_lens / page_indices</code>。这是 RUNTIME / DECODE 类 cache miss 的最大来源。
+<p style="margin-top:10px;"><strong>padding 处理原则</strong>(F4 落地细则):</p>
+<ul>
+  <li>形状统一按 <code>padded_bs × draft_token_num</code>(verify 输出固定 leading dim);</li>
+  <li><code>accept_lens</code> 在 padding 行填 0,真实行保留 1..N;</li>
+  <li>需要按 <code>accept_lens</code> 切片的位置(<code>select_index</code>、<code>extend_seq_lens</code>)改为在 padded_bs 维度上构造,padding 行取 dummy 索引,保证 gather 合法且结果不被消费;</li>
+  <li>「padding token 不申请 KV cache」继续遵守 —— page_indices 在 padding 行复用 dummy page,确保 shape 命中桶且不污染真实 KV。</li>
+</ul>
+</div>
+
+<h3>三类 precompile 在代码中的落地组织</h3>
+<table>
+<thead><tr><th>类别</th><th>负责模块</th><th>当前状态</th><th>修复方向</th></tr></thead>
+<tbody>
+<tr>
+  <td>EXTEND</td>
+  <td><span class="path">compilation_manager.py:_precompile_extend</span> + <span class="path">eagle_worker.py:precompile_spec_extend</span></td>
+  <td>非 MTP 完整;spec 路径绕过非 MTP(R1)且只 trace 单个 bs(R3)</td>
+  <td>F1 + F2:spec 模式下先跑完非 MTP <code>_precompile_extend</code>,再 spec 自身遍历 <code>(bs, token)</code></td>
+</tr>
+<tr>
+  <td>DECODE</td>
+  <td><span class="path">compilation_manager.py:_precompile_decode</span> + <span class="path">eagle_worker.py:precompile_spec_decode</span></td>
+  <td>非 MTP 完整;spec 路径仅按 bs 单维度,缺 step_id × max_seq_len</td>
+  <td>F2:新增 step_id ∈ [0,N-1] 与 max_seq_len 桶维度,覆盖 B4/C3/D2</td>
+</tr>
+<tr>
+  <td>RUNTIME</td>
+  <td><strong>当前没有独立 precompile 入口</strong>,仅靠「跑一次完整 spec 链路」顺带 trace 一次</td>
+  <td>大量 cache 项靠运气覆盖,B3 step_id × bs、C2 max_context_len 桶、C5/C6 非 greedy 完全缺失</td>
+  <td>F2 子项:在 <code>precompile_spec_decode</code> 末尾追加 <strong>独立的 RUNTIME 遍历循环</strong>,以最小 dummy 输入显式调用 E1~E11 的每个 jit / Pallas wrapper,覆盖 (bs, step_id, sampling_mode) 组合</td>
+</tr>
+</tbody>
+</table>
+
+<h2 id="boundaries">Spec 路径 JIT 边界全清单</h2>
+
+<div class="card info">
+非 MTP 一个 decode tick 只跑 <code>jitted_run_model(target) → jitted_sampler</code> 两个 jit 边界。<br>
+开启 EAGLE/MTP 后,一个 decode tick 内会经历 <strong>draft 多步 → verify → draft_extend_for_decode</strong>,新增大量 jit 入口,且<strong>同一函数会因 step_id / shape 不同产生多个 cache 项</strong>。下表按阶段穷举,所有「NEW」均为 precompile 必须覆盖的对象。
+</div>
+
+<h3>阶段 A — Prefill (extend) with spec</h3>
+<table>
+<thead><tr><th>#</th><th>边界</th><th>Call site</th><th>Jit / 形状静态键</th><th>形状决定因素</th><th>vs 非 MTP</th></tr></thead>
+<tbody>
+<tr><td>A1</td><td>Target extend forward</td><td class="path">eagle_worker.py:130 → model_runner.py:205-222 (jitted_run_model)</td><td>pytree shape + model_state_def</td><td>(bs, tokens) 双桶 + <code>capture_hidden_mode=FULL</code></td><td>REUSED but reshape(FULL vs LAST)</td></tr>
+<tr><td>A2</td><td>Target sample (extend)</td><td class="path">tp_worker.py:425 → jitted_sampler</td><td>sampler_state_def</td><td>(bs, vocab)</td><td>REUSED unchanged</td></tr>
+<tr><td>A3</td><td>Draft extend forward</td><td class="path">eagle_draft_worker.py:217 → draft 的 jitted_run_model</td><td>同 A1(draft model_state)</td><td>(bs, tokens) 双桶 + LAST</td><td>NEW</td></tr>
+<tr><td>A4</td><td>topk_probs_from_logits (capture)</td><td class="path">eagle_draft_worker.py:285 (capture_for_decode)</td><td>static topk</td><td>(real_bs, vocab)</td><td>NEW</td></tr>
+</tbody>
+</table>
+
+<h3>阶段 B — Decode tick · draft 多步循环(<code>for i in range(num_steps)</code>)</h3>
+<div class="card warn">
+<strong>步内循环是 cache 数量放大的核心</strong>:每个 step_id 都可能成为独立 cache 项。<code>update_eagle_lists</code> 用 static <code>i</code> ⇒ <strong>N 个 cache 项 / bs 桶</strong>;<code>draft 模型 forward</code> 用 dynamic <code>seq_lens_list[i]</code>(shape 相同但 values 含 step 偏移)⇒ shape-only 缓存可复用,需逐项确认。
+</div>
+<table>
+<thead><tr><th>#</th><th>边界</th><th>Jit 文件:行</th><th>形状决定因素 / 静态键</th><th>cache 项数 / bs 桶</th></tr></thead>
+<tbody>
+<tr><td>B1</td><td>select_top_k_tokens_step_0</td><td class="path">eagle_draft_worker.py:611 @jit static=[topk]</td><td>(bs, topk)</td><td>1</td></tr>
+<tr><td>B2</td><td>select_top_k_tokens_step_greater_0</td><td class="path">eagle_draft_worker.py:633 @jit static=[topk]</td><td>(bs, topk*topk) etc;<code>i</code> traced</td><td>1(i≥1 共享)</td></tr>
+<tr><td>B3</td><td>update_eagle_lists</td><td class="path">eagle_draft_worker.py:549 @jit static=[i,topk]</td><td>list shape 随 step 增长</td><td><strong>N(每个 step_id 一项)</strong></td></tr>
+<tr><td>B4</td><td>Draft model decode forward (per step)</td><td class="path">eagle_draft_worker.py:438 → draft jitted_run_model</td><td>(bs*topk, H) + per-step <code>metadata_per_step[i]</code></td><td>N-1(shape-only,需确认)</td></tr>
+<tr><td>B5</td><td>get_eagle_multi_step_metadata 输出</td><td class="path">flashattention_backend.py:308-417 (host)</td><td>page_indices pad 到 <code>TARGET_PADDING=16384</code> 魔法值</td><td>(host,但供 B4 用)</td></tr>
+<tr><td>B6</td><td>topk_probs_from_logits (per step)</td><td class="path">eagle_draft_worker.py:443 (= E1)</td><td>(bs*topk, vocab)</td><td>1(共享 E1)</td></tr>
+<tr><td>B7</td><td>build_tree_mask_for_draft_decode(topk&gt;1)</td><td class="path">eagle_util.py:239-296(纯 numpy,非 jit)</td><td>输出 size = <code>Σ topk*(seq_len_i + (step+1)*topk)</code>,<strong>取决于 seq_lens 值</strong></td><td>间接拉高 B4 cache 项</td></tr>
+</tbody>
+</table>
+
+<h3>阶段 C — Decode tick · Target verify</h3>
+<table>
+<thead><tr><th>#</th><th>边界</th><th>Jit 文件:行 / 静态键</th><th>形状决定因素</th><th>风险</th></tr></thead>
+<tbody>
+<tr><td>C1</td><td>build_tree_kernel_efficient_preprocess</td><td class="path">eagle_util.py:184 @jit static=[num_verify_tokens, batch_size, speculative_num_steps]</td><td>scores/tokens/parents 三个 list 形状</td><td>每 bs 桶 1 项</td></tr>
+<tr><td>C2</td><td>build_eagle_tree_structure (Pallas)</td><td class="path">build_eagle_tree_structure_kernel.py:301-309, 415-423 static=[draft_token_num, topk, max_context_len, tree_mask_mode]</td><td>max_context_len 由 <code>_pick_context_len(max(seq_lens))</code></td><td><strong>max(seq_lens) 命不中 token 桶 → R6 fallback</strong></td></tr>
+<tr><td>C3</td><td>Target verify forward (jitted_run_model)</td><td class="path">eagle_worker.py:152 → model_runner.py:205-222</td><td>(bs*draft_token_num,) + <strong>custom_mask size = Σ q_i*kv_i,随 seq_lens 真实值变化</strong></td><td><strong>★ 最高 miss 风险</strong></td></tr>
+<tr><td>C4</td><td>verify_tree_greedy</td><td class="path">verify_tree_greedy_kernel.py:267 @jit static=[speculative_num_steps, num_draft_tokens] + 内层 pallas static=[draft_token_num, num_spec_tokens]</td><td>(bs*draft_token_num, vocab)</td><td>每 bs 桶 1 项</td></tr>
+<tr><td>C5</td><td>top_k_renorm_prob / top_p_renorm_prob</td><td class="path">kernel.py:93, :118(隐式 jit)</td><td>(bs*draft_token_num, vocab)</td><td><strong>precompile 未覆盖(只跑了 greedy)</strong></td></tr>
+<tr><td>C6</td><td>tree_speculative_sampling_target_only</td><td class="path">kernel.py:158(Pallas)</td><td>同 C4 + coins</td><td><strong>precompile 未覆盖(非 greedy)</strong></td></tr>
+</tbody>
+</table>
+
+<h3>阶段 D — Decode tick · draft_extend_for_decode(verify 后刷新 hidden)</h3>
+<table>
+<thead><tr><th>#</th><th>边界</th><th>Jit 文件:行</th><th>形状决定因素</th><th>风险</th></tr></thead>
+<tbody>
+<tr><td>D1</td><td>prepare_for_extend_after_verify(host)</td><td class="path">eagle_util.py:523-560</td><td>extend_seq_lens 取决于 <code>accept_lens</code></td><td>R4 实锤:real_bs / accept 切片</td></tr>
+<tr><td>D2</td><td>Draft extend forward(decode-refresh)</td><td class="path">eagle_draft_worker.py:252 → draft jitted_run_model</td><td>(bs*draft_token_num,) + cu_q/cu_kv/page_indices(由 allocate_lens+seq_lens 推导)</td><td>★ accept_lens 漂移即 miss</td></tr>
+<tr><td>D3</td><td>topk_probs_from_logits</td><td class="path">eagle_draft_worker.py:267 (= E1)</td><td>(bs, vocab)</td><td>1</td></tr>
+<tr><td>D4</td><td>replicate_to_mesh</td><td class="path">eagle_draft_worker.py:262</td><td>触发 reshard 编译</td><td>shape-only 一项 / bs 桶</td></tr>
+</tbody>
+</table>
+
+<h3>阶段 E — 跨阶段公共内核</h3>
+<table>
+<thead><tr><th>#</th><th>内核</th><th>来源 / 静态键</th><th>共享情况</th></tr></thead>
+<tbody>
+<tr><td>E1</td><td>topk_probs_from_logits</td><td class="path">eagle_draft_worker.py:516 @jit static=[topk]</td><td>A4/B6/D3 共用,按 logits shape 区分:<code>(real_bs,V) / (bs,V) / (bs*topk,V)</code> ≥3 项 / bs 桶</td></tr>
+<tr><td>E2</td><td>update_eagle_lists</td><td>同 B3</td><td>N 项 / bs 桶</td></tr>
+<tr><td>E3/E4</td><td>select_top_k_tokens_step_(0|>0)</td><td>同 B1/B2</td><td>各 1 / bs 桶</td></tr>
+<tr><td>E5</td><td>update_forward_batch_info</td><td class="path">eagle_draft_worker.py:579-581(非 jit,FIXME)</td><td>无 compile,改 pytree</td></tr>
+<tr><td>E6</td><td>build_tree_kernel_efficient_preprocess</td><td>同 C1</td><td>1 / bs 桶</td></tr>
+<tr><td>E7</td><td>build_eagle_tree_structure</td><td>同 C2</td><td>max_context_len fallback ⇒ R6 风险</td></tr>
+<tr><td>E8/E9</td><td>verify_tree_greedy(+ Pallas 内层)</td><td>同 C4</td><td>1 / bs 桶</td></tr>
+<tr><td>E10</td><td>top_k_renorm / top_p_renorm / tree_sampling</td><td>同 C5/C6</td><td><strong>precompile 缺失</strong></td></tr>
+<tr><td>E11</td><td>build_tree_mask_for_draft_decode</td><td class="path">eagle_util.py:239-296(numpy)</td><td>shape 随 seq_lens 值变化 → 拉 B4 cache</td></tr>
+</tbody>
+</table>
+
+<h3>Decode tick 高风险 miss 源(必须 F2/F3/F4/F5/F6 联合修复)</h3>
+<div class="card err">
+<ol>
+  <li><strong>C3 target verify 的 <code>custom_mask</code> 形状</strong> = <code>Σ q_i·kv_i</code>,直接随 seq_lens 真实值变化 —— 仅 bs 桶不够,必须按 (bs 桶, max_seq_len 桶) 双维度 precompile,运行时把 <code>custom_mask</code> pad 到对应桶尺寸。</li>
+  <li><strong>D2 draft refresh 的 cu_q/cu_kv/page_indices 形状</strong>取决于 accept_lens;F4 要求 padded_bs 化后,<code>accept_lens</code> 在 padding 行填 0、保留 (padded_bs, draft_token_num) 形状一致。</li>
+  <li><strong>C2 / E7 的 <code>max_context_len</code></strong>:R6 fallback 必须去掉,改严格 <code>pad_to_bucket</code>。</li>
+  <li><strong>B3 / E2 的 step_id 静态键</strong>:N 项 cache / bs 桶不可避免,但 precompile 必须显式遍历 step_id ∈ [0, num_steps),否则首请求即逐步 miss。</li>
+  <li><strong>B5 的 <code>TARGET_PADDING=16384</code></strong>:F6 把它移入 compilation_manager.cache_loc_paddings,与 bs 桶联动。</li>
+  <li><strong>C5/C6/E10 非 greedy 路径</strong>:precompile_spec_decode 只构造 greedy dummy,生产首次出现 top-p/top-k>1 请求时冷编译;F2 必须为「sampling_info 的代表性组合」额外补 1~2 条 trace。</li>
+</ol>
+</div>
+
+<h3>Precompile 覆盖矩阵(F1/F2 完成后必须满足)</h3>
+<table>
+<thead><tr><th>边界集合</th><th>遍历维度</th><th>条目数</th></tr></thead>
+<tbody>
+<tr><td>A1, A3, A4(prefill)</td><td>(bs 桶) × (token 桶)</td><td>|bs| × |token|</td></tr>
+<tr><td>B1, B6, E1, C1, C4, D2, D3(decode 主体)</td><td>(bs 桶)</td><td>|bs|</td></tr>
+<tr><td>B3 / E2 (update_eagle_lists, static i)</td><td>(bs 桶) × (step_id 0..N-1)</td><td>|bs| × N</td></tr>
+<tr><td>B4 (draft model per step)</td><td>(bs 桶) × (step_id 0..N-2)</td><td>|bs| × (N-1)</td></tr>
+<tr><td>C2 / E7(build_eagle_tree_structure,static max_context_len)</td><td>(bs 桶) × (max_seq_len 桶子集)</td><td>|bs| × |token 子集|</td></tr>
+<tr><td>C3 target verify(custom_mask 形状)</td><td>(bs 桶) × (max_seq_len 桶子集)</td><td>|bs| × |token 子集|</td></tr>
+<tr><td>C5/C6/E10 非 greedy 采样</td><td>(bs 桶) × (greedy / top-k / top-p)</td><td>|bs| × ≤3</td></tr>
+</tbody>
+</table>
+
+<h2 id="root">根因清单</h2>
+
+<div class="card err">
+  <h3>R1. 开启 spec 后,target 模型 precompile 被完全跳过 <span class="tag r">覆盖</span></h3>
+  <p><span class="path">scheduler.py:433-441</span> 在 <code>spec_algorithm</code> 非 None 时只跑 <code>draft_worker.run_spec_decode_precompile()</code>,标准 <code>tp_worker.run_precompile()</code> 不执行。</p>
+  <ul>
+    <li>target extend 只在 <code>bs = max_padded_batch_size, token_bucket=*</code> 这一条线上被 trace (<span class="path">eagle_worker.py:283-313</span>);</li>
+    <li>target decode (verify) 只在 <code>(bs, draft_token_num)</code> 一组上被 trace (<span class="path">eagle_worker.py:315-366</span>);</li>
+    <li>标准 <code>_precompile_decode</code> 的 <code>bs × bs</code> decode 矩阵完全没跑。</li>
+  </ul>
+</div>
+
+<div class="card err">
+  <h3>R2. Draft 模型 precompile 覆盖不全 <span class="tag r">覆盖</span></h3>
+  <p><code>precompile_spec_decode</code> 对每个 bs 只调用一次完整链路,但 draft 多步循环中 <strong>每个 step_id 对应一组独立的 attention metadata</strong>(<span class="path">flashattention_backend.py:335-379</span>);循环只跑一次 → step 0..N-1 都只在该 bs 下被 trace,其它 bs bucket 完全没跑过完整 N 步循环。</p>
+  <p>另外,draft 底层 <code>ModelWorker.compilation_manager</code> 存在,但 <code>run_precompile()</code> 在 spec 路径下被绕过 —— draft <code>forward</code> 自身的 token/bs 桶完全没 trace。</p>
+</div>
+
+<div class="card err">
+  <h3>R3. Extend 阶段 spec 侧无 bs padding <span class="tag r">padding</span></h3>
+  <p><span class="path">eagle_worker.py:80-111</span> 显式注释 <code># FIXME(pc) add padding logic here</code>。prefill 真实 bs 直接进入 target extend 和 <code>draft_extend_for_prefill</code>,而 R1 已说明 target extend 只在 <code>bs = max_padded_batch_size</code> precompile,真实 bs 不命中 → 重编译。</p>
+</div>
+
+<div class="card err">
+  <h3>R4. <code>draft_extend_for_decode</code> 输入按 real_bs 切片,非 padded_bs <span class="tag r">padding</span></h3>
+  <p><code>verify</code> 在 <span class="path">eagle_worker.py:159-204</span> 产出的 <code>verified_id / hidden_states</code> 形状为 <code>padded_bs*(spec_steps+1)</code>,但下游:</p>
+  <ul>
+    <li><code>select_index</code> 由 real_bs + <code>accept_lens[: real_bs]</code> 构造 (<span class="path">eagle_draft_worker.py:256-261</span>);</li>
+    <li><code>rep_logits[select_index]</code> 得到 real_bs 长度,送入 jitted <code>topk_probs_from_logits</code>;</li>
+    <li><code>extend_seq_lens = full(bs_real, step_plus_1)</code> 中的 bs 是 real_bs。</li>
+  </ul>
+  <p>同一 padded_bs 下,real_bs 不同 → shape 不同 → 重编译。</p>
+</div>
+
+<div class="card warn">
+  <h3>R5. <code>padding_for_decode</code> input_ids 重置 <span class="tag r">需复核</span></h3>
+  <p><span class="path">eagle_draft_worker.py:387-388</span> 末尾把 <code>input_ids / positions</code> 重置为 <code>np.empty(bs * topk, np.int32)</code>。topk 在 precompile 中只取 CLI 配置那一个值;若运行时 topk 动态变化才会有问题(当前看是静态,作为「确认无问题」纳入复核)。</p>
+</div>
+
+<div class="card err">
+  <h3>R6. <code>build_tree_kernel_efficient</code> <code>max_context_len</code> 兜底非 bucket <span class="tag r">padding</span></h3>
+  <p><span class="path">eagle_draft_worker.py:451-457</span> <code>_pick_context_len</code> 当 <code>max_seq_len</code> 不在 <code>precompile_token_paddings</code> 内,fallback <code>1 &lt;&lt; (max_seq_len-1).bit_length()</code>,该值未必在 bucket 集合内 → 新 cache 项。</p>
+</div>
+
+<div class="card err">
+  <h3>R7. <code>TARGET_PADDING = 16384</code> 硬编码 <span class="tag r">魔法值</span></h3>
+  <p><span class="path">flashattention_backend.py:373</span>:<code># FIXME Handle padding, this will be move to precompile</code>。当 <code>bs * cdiv(max_seq_len + spec_steps*topk, page_size) &gt; 16384</code> 时不再 pad,shape 由真实值决定 → miss。</p>
+</div>
+
+<div class="card err">
+  <h3>R8. cache_loc / page_indices 桶未覆盖 spec 增量 <span class="tag r">覆盖</span></h3>
+  <p><code>_compute_cache_loc_buckets</code>(<span class="path">common_utils.py:95-97</span>)按 <code>bs_bucket * ceil_to_page(max_req_len)</code> 算,只在标准 decode 场景下成立。EAGLE verify / draft 多步会消耗额外 page,最大可能 cache_loc 应额外加 <code>(spec_steps+1)*draft_token_num * bs</code> 的余量。</p>
+</div>
+
+<h2 id="fix">修复策略</h2>
+
+<div class="grid">
+
+<div class="card ok">
+<h3>F1. 标准 precompile 在 spec 模式下也跑 <span class="tag f">→ R1</span></h3>
+<p><span class="path">scheduler.py:433-441</span>:无论是否启用 spec,都先执行 <code>tp_worker.run_precompile()</code>,再执行 <code>draft_worker.run_spec_decode_precompile()</code>。仅延长启动时间,无精度影响。</p>
+</div>
+
+<div class="card ok">
+<h3>F2. Spec precompile 覆盖完整 (bs × step) 矩阵 <span class="tag f">→ R2</span></h3>
+<p>重写 <code>EAGLEWorker.precompile_spec_decode</code>:外层遍历 <code>precompile_bs_paddings</code>,内层显式 trace 每个 step 的 draft forward 与 verify。<code>precompile_spec_extend</code> 改为遍历 <code>(bs_bucket, token_bucket)</code> 而非只 <code>(max_padded_bs, token_bucket)</code>。</p>
+</div>
+
+<div class="card ok">
+<h3>F3. Extend 阶段加 spec bs padding <span class="tag f">→ R3</span></h3>
+<p>实现 <span class="path">eagle_worker.py:80-111</span> FIXME:prefill 进入 spec 路径前,<strong>按 <a href="#contract">Padding 契约</a> 向上取整</strong>把 <code>model_worker_batch</code> 的 <code>seq_lens / input_ids / positions / cache_loc / extend_seq_lens</code> 对齐到 <code>(padded_bs, padded_tokens)</code> 双桶;padding token 不申请 KV cache。</p>
+</div>
+
+<div class="card ok">
+<h3>F4. <code>draft_extend_for_decode</code> 全程 padded_bs 化 <span class="tag f">→ R4</span></h3>
+<p>所有按 real_bs 切片的位置改为 padded_bs(<code>padded_bs</code> 由 <a href="#contract">契约</a> ceil 到 <code>bs_buckets</code>):<code>select_index</code> 在 padded_bs 维度上构造,padding 行 <code>accept_lens</code> 填 0,<code>select_index</code> 取固定 dummy 行;<code>extend_seq_lens</code> 长度 = padded_bs,padding 位填 0(padding token 不申请 KV)。</p>
+</div>
+
+<div class="card ok">
+<h3>F5. <code>build_tree_kernel_efficient</code> 严格 bucket 化 <span class="tag f">→ R6</span></h3>
+<p><code>_pick_context_len</code> 去掉 <code>bit_length</code> fallback,改为「<code>bisect_left</code> 到下一个 <code>precompile_token_paddings</code> 桶,超出则报错」,确保只产生 bucket 内的 shape。</p>
+</div>
+
+<div class="card ok">
+<h3>F6. 把 <code>TARGET_PADDING</code> 移入 precompile 配置 <span class="tag f">→ R7</span></h3>
+<p><code>compilation_manager</code> 计算 <code>cache_loc_paddings</code> 时加入 spec 增量;<code>get_eagle_multi_step_metadata</code> 中 <code>TARGET_PADDING</code> 改由 <code>model_runner.compilation_manager.cache_loc_paddings[bs_idx]</code> 提供,消除魔法常数 16384。</p>
+</div>
+
+<div class="card ok">
+<h3>F7. cache_loc / page_indices bucket 含 spec 余量 <span class="tag f">→ R8</span></h3>
+<pre><code>cache_loc_bucket = bs_bucket * ceil_to_page(max_req_len)
+                 + bs_bucket * ceil_to_page((spec_steps + 1) * draft_token_num)</code></pre>
+<p>确保所有 verify / 多步 draft 的 cache_loc 都落在已 trace 形状内。</p>
+</div>
+
+<div class="card ok">
+<h3>F8. cache-miss 诊断开关 <span class="tag f">→ 全部</span></h3>
+<ul>
+  <li>env var <code>SGLANG_JAX_EXPLAIN_CACHE_MISSES=1</code> 时,<code>ModelRunner.__init__</code> 调用 <code>jax.config.update("jax_explain_cache_misses", True)</code>;</li>
+  <li>把 <code>count_pjit_cpp_cache_miss</code> 包裹范围从 <code>sample(...)</code> 扩展到 <code>tp_worker.forward_batch_generation</code> 全 forward;</li>
+  <li>落实 <span class="path">compilation_manager.py:329</span> <code>register_variant_if_new</code> 调用点,首次出现的 variant key 打日志。</li>
+</ul>
+</div>
+
+</div>
+
+<h2 id="plan">执行路线(5 阶段 + 验收)</h2>
+
+<div class="card info">
+所有阶段验收数字以「<a href="#bg">基线测量</a>」为锚:启动 <strong>5m49s</strong> · precompile PERSISTENT MISS <strong>464</strong> · 首请求 TRACING MISS <strong>22~48</strong> · decode 稳态 <code>#cache_miss: 1</code>/tick。
+</div>
+
+<h3>阶段依赖图</h3>
+<pre><code>Phase 1 (诊断) ──┬─► Phase 2 (契约) ──┬─► Phase 3 (覆盖) ──┐
+                                       └─► Phase 4 (padding) ─► Phase 5 (e2e)</code></pre>
+<p class="muted">Phase 2 与 Phase 4 改动文件几乎不重叠,可并行;Phase 3 依赖 Phase 1 的诊断输出。</p>
+
+<!-- =============== Phase 1 =============== -->
+<div class="card ok">
+<h3>Phase 1 — 诊断设施 <span class="tag f">F8 + L0</span></h3>
+<p><strong>做什么</strong></p>
+<ul>
+  <li>加 env <code>SGLANG_JAX_EXPLAIN_CACHE_MISSES=1</code>,<code>ModelRunner.__init__</code> 调 <code>jax.config.update("jax_explain_cache_misses", True)</code>。</li>
+  <li><code>count_pjit_cpp_cache_miss</code> 包裹范围从 <span class="path">tp_worker.py:425</span>(只包 sample)扩到 <code>tp_worker.forward_batch_generation</code> 全 forward。</li>
+  <li>落实 <span class="path">compilation_manager.py:329</span> <code>register_variant_if_new</code>:首次出现的 variant key 打 WARN。</li>
+  <li>实现 <code>cache_miss_probe</code> contextmanager(<a href="#mru">MRU</a> 通用 fixture)。</li>
+</ul>
+<p><strong>改动</strong>:<span class="path">tp_worker.py</span> · <span class="path">model_runner.py</span> · <span class="path">compilation_manager.py</span> 各 ~10 行 + 新增 <span class="path">test/srt/speculative/utils.py</span>(cache_miss_probe)</p>
+<p><strong>验收(L0)</strong></p>
+<ul>
+  <li>pod 重跑同一启动命令,日志中出现 <code>register_variant_if_new</code> 标记;<code>#cache_miss</code> 数与基线一致(本阶段不修任何 miss,只让它可见)。</li>
+  <li>单元测试:<code>cache_miss_probe</code> 在 trivial jit 上 miss=0;shape 变化时 miss&gt;0。</li>
+</ul>
+</div>
+
+<!-- =============== Phase 2 =============== -->
+<div class="card ok">
+<h3>Phase 2 — Padding 契约统一 <span class="tag f">F5 + 部分 F1</span></h3>
+<p><strong>做什么</strong></p>
+<ul>
+  <li>spec 路径所有按 bs/token 取整位置统一调用 <code>common_utils.pad_to_bucket(value, buckets)</code>(与非 MTP 同源)。</li>
+  <li>删 <code>_pick_context_len</code> 里 <code>1 &lt;&lt; (len-1).bit_length()</code> fallback,越界直接 raise。</li>
+  <li>F1:<span class="path">scheduler.py:433-441</span> 改为 spec 模式下先跑非 MTP <code>tp_worker.run_precompile()</code>,再跑 spec precompile。</li>
+</ul>
+<p><strong>改动</strong>:<span class="path">scheduler.py</span> · <span class="path">eagle_draft_worker.py:_pick_context_len</span> · spec 路径内所有 ad-hoc padding 替换点</p>
+<p><strong>验收(L0 + L1)</strong></p>
+<ul>
+  <li>L0:<code>pad_to_bucket(5, [1,8,16]) == 8</code>;越界 raise。</li>
+  <li>L1:对 <code>(real_bs ∈ {1..16}, prompt_len ∈ {1..max_token})</code> 任意组合调 padding,断言所有输出 leading dim ∈ bucket 集合。</li>
+  <li>pod 启动后,SPEC_EXTEND 日志的 <code>bs_paddings</code> 从基线 <code>[16]</code> 变成 <code>[1,4,8,16]</code> 全列表。</li>
+</ul>
+</div>
+
+<!-- =============== Phase 3 =============== -->
+<div class="card ok">
+<h3>Phase 3 — Precompile 矩阵补全 <span class="tag f">F2 + F6 + F7</span></h3>
+<p><strong>做什么</strong></p>
+<ul>
+  <li>重写 <code>precompile_spec_extend</code>:外层遍历 <code>(用户输入 bs 桶, token 桶)</code> 笛卡尔积(决策 #7 方案 B),配套 <code>get_spec_model_worker_batch</code> EXTEND 分支调 <code>pad_to_bucket(real_bs, bs_paddings)</code> 把 leading dim ceil 到最近桶。</li>
+  <li>重写 <code>precompile_spec_decode</code>:外层 bs,内层显式 trace
+    <ul>
+      <li>draft model forward × <code>step_id ∈ [0, num_steps)</code></li>
+      <li>target verify × <code>(bs, max_seq_len 桶)</code>(custom_mask 桶化:新增 <code>custom_mask_buckets</code>,基于 token 桶子集)</li>
+      <li>draft_extend_for_decode × <code>(bs, max_seq_len 桶)</code></li>
+    </ul>
+  </li>
+  <li>末尾追加 <strong>RUNTIME 独立遍历</strong>:直接 import E1~E11 每个 jit / Pallas wrapper,用 mock dummy 张量手动调一次,覆盖 <code>(bs 桶) × step_id</code>。</li>
+  <li>F6:<code>TARGET_PADDING=16384</code> 改查 <code>compilation_manager.cache_loc_paddings[bs_idx]</code>。</li>
+  <li>F7:<code>_compute_cache_loc_buckets</code> 加 spec 增量 <code>+ bs * ceil_to_page((spec_steps+1)*draft_token_num)</code>。</li>
+</ul>
+<p><strong>改动</strong>:<span class="path">eagle_worker.py:precompile_spec_*</span>(主)· <span class="path">compilation_manager.py</span> · <span class="path">flashattention_backend.py:373</span> · <span class="path">common_utils.py</span></p>
+<p><strong>验收(L2 + L3)</strong></p>
+<ul>
+  <li>L2:每个 RUNTIME jit 单独测,warmup 全 bucket 后用同 bucket 不同 value 调 100 次,断言 miss=0。</li>
+  <li>L3(pod,4 卡):跑完整 precompile,然后做 <code>(real_bs ∈ {1..16}, prompt_len ∈ {1..4096}) × 20 组</code> 单步 forward,断言:
+    <ul>
+      <li><strong>precompile PERSISTENT MISS &lt; 200</strong>(基线 464)</li>
+      <li><strong>首请求 TRACING MISS = 0</strong>(基线 22~48 → 0)</li>
+    </ul>
+  </li>
+</ul>
+</div>
+
+<!-- =============== Phase 4 =============== -->
+<div class="card ok">
+<h3>Phase 4 — Padding 行为对齐 <span class="tag f">F3 + F4</span></h3>
+<p><strong>做什么</strong></p>
+<ul>
+  <li>F3:<span class="path">eagle_worker.py:80-111</span> 实现 spec extend 的 bs/token padding(那条 FIXME)。padding token 不申请 KV cache;page_indices 在 padding 行复用 batch 内首个真实 page(系统无 reserved page,见<a href="#contract">设计决策 #3</a>)。</li>
+  <li>F4:<code>prepare_for_extend_after_verify</code> / <code>draft_extend_for_decode</code> 中所有按 <code>real_bs</code> 切片的位置(<code>select_index</code>、<code>extend_seq_lens</code>、<code>rep_logits[select_index]</code>)改为 padded_bs:padding 行 <code>accept_lens=0</code>、<code>select_index</code> 取一个 dummy 行。</li>
+</ul>
+<p><strong>改动</strong>:<span class="path">eagle_worker.py:80-111</span> · <span class="path">eagle_util.py:523-560</span> · <span class="path">eagle_draft_worker.py:233-278</span></p>
+<p><strong>验收(L1 + L3)</strong></p>
+<ul>
+  <li>L1:构造 <code>(padded_bs=8, real_bs=5, accept_lens=[1,2,3,1,1,1,1,1])</code>,跑 <code>prepare_for_extend_after_verify</code>,断言输出 leading dim == 8、padding 行 <code>extend_seq_lens=0</code>、<code>select_index</code> 合法。</li>
+  <li>L3(pod):接受率漂移场景(随机 accept_lens 跑 200 个 decode tick),断言 <strong>decode 稳态 <code>#cache_miss = 0</code></strong>(基线每 tick 1)。</li>
+  <li>pod 重跑顶部 launch + 8 并发请求,基线 48 次首请求 miss → <strong>应为 0</strong>。</li>
+</ul>
+</div>
+
+<!-- =============== Phase 5 =============== -->
+<div class="card ok">
+<h3>Phase 5 — 整体回归与 e2e <span class="tag f">L4 + L5</span></h3>
+<p><strong>做什么</strong></p>
+<ul>
+  <li>L4 stub 模型全链路:50 个混合 (bs, prompt_len) 并发请求,聚合 cache_miss。</li>
+  <li>L5 真模型 e2e:Qwen3-32B 上跑顶部 launch 命令,200 个不同长度 prompt。</li>
+</ul>
+<p><strong>终验指标(对照基线)</strong></p>
+<table>
+<thead><tr><th>指标</th><th>基线</th><th>目标</th></tr></thead>
+<tbody>
+<tr><td>Precompile PERSISTENT MISS</td><td>464</td><td>&lt; 50(只剩 JAX 内部 transpose/elementwise 等不可避)</td></tr>
+<tr><td>首请求 TRACING MISS</td><td>22 ~ 48</td><td><strong>0</strong></td></tr>
+<tr><td>Decode 稳态 <code>#cache_miss</code>/tick</td><td>1</td><td><strong>0</strong></td></tr>
+<tr><td>Decode gen throughput</td><td>基线吞吐</td><td>≥ 基线 × 1.5</td></tr>
+<tr><td>启动总时长</td><td>5 m 49 s</td><td>不超过 +30%(本期不优化,只验不退化太多)</td></tr>
+<tr><td><code>JAX_EXPLAIN_CACHE_MISSES=1</code> 日志输出</td><td>大量</td><td><strong>稳态后 0 条</strong></td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>启动命令模板(每阶段 pod 验证)</h3>
+<pre><code>kubectl exec niu-v6e4-sleep -- bash -lc '
+  cd /tmp/sglang-jax-baseline &&
+  SGLANG_JAX_EXPLAIN_CACHE_MISSES=1 \
+  python3 -m sgl_jax.launch_server \
+    --model-path Qwen/Qwen3-32B --download-dir /models \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path AngelSlim/Qwen3-32B_eagle3 \
+    --speculative-draft-model-revision 67caf31f9062d7ab64872e0a111d499bc16cd205 \
+    --speculative-eagle-topk 1 --speculative-num-steps 2 --speculative-num-draft-tokens 3 \
+    --skip-server-warmup --disable-overlap-schedule \
+    --tp-size 4 --mem-fraction-static 0.7 \
+    --context-length 4096 --max-prefill-tokens 4096 --chunked-prefill-size -1 \
+    --max-running-requests 16 \
+    --precompile-bs-paddings 1 4 8 16 \
+    --precompile-token-paddings 256 1024 2048 4096 \
+    --page-size 64 --attention-backend fa --dtype bfloat16 --port 8000
+'</code></pre>
+
+<h3>风险项(明确)</h3>
+<div class="card warn">
+<ol>
+  <li><strong>C3 verify <code>custom_mask</code> 桶化细节</strong>:决策已定(复用 token 桶子集),但 ceil 写法、桶数选择、padding 位填值需在 Phase 3 写代码时定;可能需再开一次 explore 看 <code>custom_mask</code> 怎么进入 jit。</li>
+  <li><strong>StubModelRunner 是否能跑通</strong>:L3/L4 强依赖。若跑不通,L3 退化为「真模型 + 极短 max_total_tokens」做小 e2e。建议 Phase 1 末尾插一个 50 行 spike 提前验证。</li>
+</ol>
+</div>
+
+<h2 id="mru">最小可复现单元(MRU)验证框架</h2>
+
+<div class="card info">
+e2e 每次都要加载 Qwen3-32B,验证迭代代价大。建立 <strong>分层 MRU 测试</strong>,在不加载真实模型的前提下,确保每个 padding 函数 / RUNTIME jit / DECODE jit 的形状契约成立,<strong>所有层全绿后才跑 e2e</strong>。
+</div>
+
+<div class="card err">
+<strong>验证环境(强制约束)</strong>
+<ul>
+  <li>所有验证 <strong>不在本地</strong>执行(本地无 TPU,Pallas / mesh 行为与 v6e 有差异,L2 起就不可靠)。</li>
+  <li>统一登录 <code>niu-v6e4-sleep</code>(4 卡 v6e),在 pod 内运行:
+    <pre><code>kubectl exec -it niu-v6e4-sleep -- /bin/bash
+cd /path/to/sglang-jax        # pod 内仓库路径
+uv sync                       # 同步 sglang-jax 依赖
+source .venv/bin/activate     # 或 uv run pytest ...</code></pre>
+  </li>
+  <li>L0~L2 用例不需要 4 卡(纯 CPU/单芯也行),但仍在 pod 内跑以保证 JAX/XLA 版本与 e2e 完全一致。</li>
+  <li>L3~L5 显式占用全部 4 卡 v6e(tp=4)。</li>
+</ul>
+</div>
+
+<h3>分层目标</h3>
+<table>
+<thead><tr><th>层</th><th>对象</th><th>是否需要模型权重</th><th>运行环境</th><th>单次耗时目标</th><th>验证手段</th></tr></thead>
+<tbody>
+<tr><td>L0</td><td>纯 Python 辅助函数(pad_to_bucket、_pick_context_len、bucket 计算等)</td><td>否</td><td>pod / 任意</td><td>&lt; 0.1s</td><td>pytest 断言返回值</td></tr>
+<tr><td>L1</td><td>shape 契约(host 端):padding_for_decode、prepare_for_extend_after_verify 等纯 numpy/host 逻辑</td><td>否</td><td>pod / 单芯</td><td>&lt; 0.5s</td><td>构造 dummy <code>ModelWorkerBatch</code> + <code>EagleDraftInput</code>,断言所有输出张量 shape ∈ bucket 集合</td></tr>
+<tr><td>L2</td><td>单个 RUNTIME jit / Pallas 内核(E1~E11、B1/B2/B3/B6、C1/C2/C4)</td><td>否</td><td>pod / 单芯 v6e</td><td>1~5s / 用例</td><td>构造 dummy 输入直接调用 jitted fn;用 <code>jax_explain_cache_misses</code> + <code>count_pjit_cpp_cache_miss</code> 断言 0 miss</td></tr>
+<tr><td>L3</td><td>单步 DECODE jit(B4 draft forward、C3 verify forward、D2 draft refresh)用 <strong>极小 stub 模型</strong></td><td>stub(随机权重 1~2 层,hidden=128)</td><td>pod / 4 卡 v6e(tp=4)</td><td>10~30s / suite</td><td>跑迷你 precompile,然后用 bucket 内外的多种 (bs, seq_len, accept_lens) 组合调用,断言 0 miss</td></tr>
+<tr><td>L4</td><td>spec 完整链路 + stub 模型</td><td>stub</td><td>pod / 4 卡 v6e(tp=4)</td><td>1~3 min</td><td>跑完整 <code>forward_batch_speculative_generation</code>,断言端到端 0 miss</td></tr>
+<tr><td>L5</td><td>真模型 e2e(Qwen3-32B + Qwen3-32B_eagle3)</td><td>是</td><td>pod / 4 卡 v6e(tp=4)</td><td>10+ min</td><td>仅在 L0~L4 全绿后跑;用文章顶部那条 launch 命令</td></tr>
+</tbody>
+</table>
+
+<h3>Pod 上的运行模板</h3>
+<div class="card ok">
+<strong>L0~L2(秒级,日常迭代用)</strong>
+<pre><code>kubectl exec -it niu-v6e4-sleep -- bash -lc '
+  cd /workspace/sglang-jax &&
+  uv sync &&
+  SGLANG_JAX_EXPLAIN_CACHE_MISSES=1 \
+  uv run pytest test/srt/speculative/test_cache_miss_l0.py \
+                test/srt/speculative/test_cache_miss_l1.py \
+                test/srt/speculative/test_cache_miss_l2.py -x -q
+'</code></pre>
+
+<strong>L3~L4(stub 模型,占 4 卡)</strong>
+<pre><code>kubectl exec -it niu-v6e4-sleep -- bash -lc '
+  cd /workspace/sglang-jax &&
+  uv sync &&
+  SGLANG_JAX_EXPLAIN_CACHE_MISSES=1 \
+  uv run pytest test/srt/speculative/test_cache_miss_l3.py \
+                test/srt/speculative/test_cache_miss_l4.py -x -q
+'</code></pre>
+
+<strong>L5(真模型 e2e,全绿后才跑)</strong>
+<pre><code>kubectl exec -it niu-v6e4-sleep -- bash -lc '
+  cd /workspace/sglang-jax &&
+  uv sync &&
+  SGLANG_JAX_EXPLAIN_CACHE_MISSES=1 \
+  uv run python -m sgl_jax \
+    --model Qwen/Qwen3-32B \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path AngelSlim/Qwen3-32B_eagle3 \
+    --speculative-eagle-topk 1 --speculative-num-steps 2 \
+    --speculative-num-draft-tokens 3 \
+    --tp-size 4 --mem-fraction-static 0.8 --context-length 4096 \
+    --page-size 64 --attention-backend fa --dtype bfloat16 --port 8000 \
+    --skip-server-warmup
+'</code></pre>
+<p class="muted">先确认 <code>kubectl get pod niu-v6e4-sleep</code> 是 Running;pod 内仓库路径与 uv venv 位置以实际为准。</p>
+</div>
+
+<h3>通用 fixture / 工具</h3>
+
+<div class="card ok">
+<strong>cache_miss_probe</strong> —— 包一个 contextmanager,内部启用 explain + 用 <code>jtu.count_pjit_cpp_cache_miss</code> 计数,退出时返回 miss 数:
+<pre><code>from contextlib import contextmanager
+import jax
+from jax._src import test_util as jtu
+
+@contextmanager
+def cache_miss_probe(label):
+    prev = jax.config.read("jax_explain_cache_misses")
+    jax.config.update("jax_explain_cache_misses", True)
+    with jtu.count_pjit_cpp_cache_miss() as count:
+        yield count
+    jax.config.update("jax_explain_cache_misses", prev)
+    print(f"[{label}] cache_miss={count[0]}")</code></pre>
+所有 L2~L4 用例用 <code>assert count[0] == 0, ...</code> 断言。
+</div>
+
+<div class="card ok">
+<strong>StubModelRunner</strong> —— 同 <code>ModelRunner</code> 接口,但:
+<ul>
+  <li>模型层数固定 1~2 层,hidden=128,num_attn_heads=4;</li>
+  <li>权重 <code>jnp.zeros</code> 或随机小张量;</li>
+  <li>page_size、num_pages 用最小可工作值;</li>
+  <li>compilation_manager 沿用真实实现,但 <code>max_padded_batch_size / max_padded_num_tokens</code> 设小(如 16 / 1024)。</li>
+</ul>
+让 L3/L4 在 CPU 或 1 device TPU 上几十秒内完成 precompile。
+</div>
+
+<h3>L0 测试矩阵(单元)</h3>
+<table>
+<thead><tr><th>用例</th><th>输入</th><th>期望</th></tr></thead>
+<tbody>
+<tr><td>pad_to_bucket 命中</td><td>value=5, buckets=[1,8,16]</td><td>(8, 1)</td></tr>
+<tr><td>pad_to_bucket 越界</td><td>value=20, buckets=[1,8,16]</td><td>raise ValueError</td></tr>
+<tr><td>_pick_context_len 命中</td><td>seq_len=300, token_buckets=[64,128,256,512]</td><td>512</td></tr>
+<tr><td>_pick_context_len 越界</td><td>seq_len=9999, token_buckets=[64,…,8192]</td><td>raise(F5 修复后)</td></tr>
+<tr><td>cache_loc_buckets 含 spec 增量</td><td>bs_bucket=8, spec_steps=2, draft_token_num=3</td><td>原值 + ceil_to_page(9*8)(F7)</td></tr>
+</tbody>
+</table>
+
+<h3>L1 测试矩阵(host shape 契约)</h3>
+<table>
+<thead><tr><th>用例</th><th>输入</th><th>期望(所有输出 shape)</th></tr></thead>
+<tbody>
+<tr><td>padding_for_decode bs=5,bucket=[1,8,16]</td><td>real_bs=5</td><td>seq_lens / input_ids / positions / cache_loc shape leading dim ∈ {8, 8*topk}</td></tr>
+<tr><td>padding_for_decode accept_lens 漂移</td><td>real_bs=8, accept_lens=[1,2,3,1,1,1,1,1]</td><td>(padded_bs, draft_token_num) 形状稳定,accept_lens padding 行=0</td></tr>
+<tr><td>prepare_for_extend_after_verify F4 后</td><td>padded_bs=8, real_bs=5</td><td>extend_seq_lens.shape == (8,);select_index 维度 ∈ bucket</td></tr>
+<tr><td>build_tree_mask_for_draft_decode</td><td>不同 seq_lens 值同 bs 桶</td><td>输出 size 等于 <code>topk*Σ(padded_seq_len + (step+1)*topk)</code>,padded_seq_len 来自 token 桶</td></tr>
+</tbody>
+</table>
+
+<h3>L2 测试矩阵(单 jit / 内核)</h3>
+<div class="card">
+<p>对每个 RUNTIME jit 写一个 <code>test_no_miss_after_warmup</code>:</p>
+<ol>
+  <li>先用一组 dummy 输入(命中预期 bucket)调用一次 —— 触发编译;</li>
+  <li>在 <code>cache_miss_probe</code> 中,用 <strong>同 bucket 但 value 不同</strong>、以及 <strong>不同 bucket</strong> 的多组输入调用;</li>
+  <li>断言「同 bucket 不同 value 的调用」miss=0;</li>
+  <li>断言「不同 bucket 但属预期遍历集」的调用,在补跑那些 bucket 的 warmup 后再次为 0。</li>
+</ol>
+<p>覆盖列表:</p>
+<table>
+<thead><tr><th>jit</th><th>bucket 维度</th></tr></thead>
+<tbody>
+<tr><td>E1 topk_probs_from_logits</td><td>(vocab 不变, leading ∈ {real_bs, bs, bs*topk})</td></tr>
+<tr><td>B1/B2 select_top_k_tokens</td><td>(bs)</td></tr>
+<tr><td>B3 update_eagle_lists</td><td>(bs, step_id ∈ [0,N))</td></tr>
+<tr><td>C1 build_tree_kernel_efficient_preprocess</td><td>(bs)</td></tr>
+<tr><td>C2 build_eagle_tree_structure</td><td>(bs, max_context_len)</td></tr>
+<tr><td>C4 verify_tree_greedy</td><td>(bs)</td></tr>
+<tr><td>C5/C6 非 greedy 采样</td><td>(bs, sampling_mode)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>L3 测试矩阵(stub 模型 + 单步)</h3>
+<table>
+<thead><tr><th>用例</th><th>步骤</th><th>断言</th></tr></thead>
+<tbody>
+<tr><td>EXTEND 全 bucket 扫</td><td>用 StubModelRunner 跑完整 EXTEND precompile,随后对 (real_bs, num_tokens) ∈ 全网格点(包括 bucket 边界与中间值)各跑一次 prefill</td><td>每次 miss=0</td></tr>
+<tr><td>DECODE 单步 + 接受率漂移</td><td>precompile 后,对 (real_bs ∈ {1..max_bs_bucket}, accept_lens 随机 ∈ {1..N+1}) 跑 100 次 decode tick</td><td>稳态后 miss=0</td></tr>
+<tr><td>非 greedy 采样</td><td>切换 sampling_info 到 top-p / top-k,跑 10 次 tick</td><td>warmup 后 miss=0</td></tr>
+</tbody>
+</table>
+
+<h3>L4 测试(stub 模型 + 全链路)</h3>
+<div class="card">
+<ol>
+  <li>StubModelRunner 初始化 → 跑 spec precompile(F1+F2 后的版本)。</li>
+  <li>构造 50 个混合请求(随机 prompt 长度 1~max_token_bucket、随机生成长度),用 spec 完整链路并发处理。</li>
+  <li>在每次 <code>forward_batch_speculative_generation</code> 外层套 <code>cache_miss_probe</code>,聚合统计。</li>
+  <li><strong>验收</strong>:总 miss 数 ≤ precompile 阶段一次性应有的 miss(即 stub precompile 实际 trace 数);稳态后 miss=0。</li>
+</ol>
+</div>
+
+<h3>CI 接入</h3>
+<div class="card ok">
+<ul>
+  <li>所有 pytest 命令都通过 <code>kubectl exec niu-v6e4-sleep -- ... uv run pytest ...</code> 触发,本地与 CI 共用同一份脚本(避免本地行为漂移)。</li>
+  <li><code>test/srt/speculative/test_cache_miss_l0.py</code> ~ <code>l2.py</code> 进 PR 必跑(几秒级)。</li>
+  <li><code>test/srt/speculative/test_cache_miss_l3.py / l4.py</code> 进 nightly,占用 4 卡 v6e。</li>
+  <li>L5 真模型 e2e 仅 release / 大改动时跑。</li>
+  <li>任何 L0~L4 失败 → 阻塞 PR;不允许在没修好 cache miss 的情况下进 e2e。</li>
+</ul>
+</div>
+
+<h3>调试技巧</h3>
+<div class="card warn">
+<ul>
+  <li>L2 失败时,在 probe 内同时开 <code>JAX_LOG_COMPILES=1</code>,日志会打印每次编译的 jaxpr,直接定位是哪个 static arg / shape 变了。</li>
+  <li>L3 怀疑某个 bucket 漏 trace,把 <code>compilation_manager.cache_loc_buckets</code> 与 <code>bs_buckets</code> 打到日志头,运行时把命中桶 index 也打印,对比就能立刻发现。</li>
+  <li>所有 L 用例统一通过环境变量 <code>SGLANG_JAX_EXPLAIN_CACHE_MISSES=1</code> 一键启用 explain 日志,避免散落配置。</li>
+</ul>
+</div>
+
+<h2 id="files">涉及文件</h2>
+<table>
+<thead><tr><th>路径</th><th>关注点</th></tr></thead>
+<tbody>
+<tr><td class="path">python/sgl_jax/srt/managers/scheduler.py:433-441</td><td>precompile 入口分支</td></tr>
+<tr><td class="path">python/sgl_jax/srt/model_executor/compilation_manager.py</td><td>buckets + precompile loops</td></tr>
+<tr><td class="path">python/sgl_jax/srt/speculative/eagle_worker.py:80-366</td><td>spec 编排 + spec precompile</td></tr>
+<tr><td class="path">python/sgl_jax/srt/speculative/eagle_draft_worker.py:233-457</td><td>padding_for_decode / draft_extend_for_decode</td></tr>
+<tr><td class="path">python/sgl_jax/srt/speculative/eagle_util.py:523-845</td><td>prepare_for_verify / extend_after_verify</td></tr>
+<tr><td class="path">python/sgl_jax/srt/layers/attention/flashattention_backend.py:195-399</td><td>eagle forward / multi-step metadata / 16384</td></tr>
+<tr><td class="path">python/sgl_jax/srt/utils/common_utils.py:38-97</td><td>bucket 定义</td></tr>
+<tr><td class="path">python/sgl_jax/srt/managers/tp_worker.py:388-429</td><td>cache_miss 包裹范围</td></tr>
+</tbody>
+</table>
+
+<h2 id="open">待澄清</h2>
+<div class="card warn">
+<ul>
+  <li><code>draft_model_runner.forward</code> 的 jit 边界 / cache key 细节未读;F2 实施前需要确认它确实按 <code>(num_tokens, bs)</code> 形状变化做 cache key,否则需要在 model 层补 <code>static_argnames</code>。</li>
+  <li>是否所有调用都已确保「padding token 不申请 KV cache」需要随 F3/F4 联动复核。</li>
+  <li><strong>StubModelRunner 的最小接口面</strong>:ModelRunner 依赖较重(权重 / KV pool / sharding / attention backend),L3/L4 写起来前需要一次小 spike,先确认能用 hidden=128、1~2 层、最小 num_pages 起一个跑通 precompile 的 mock;否则 L3/L4 可能阻塞。</li>
+</ul>
+</div>
+
+<h2>设计决策(已敲定)</h2>
+<div class="card ok">
+<ol>
+  <li><strong>C3 verify <code>custom_mask</code> 桶化</strong>:不再 pad 到最大值,复用 EXTEND 一样的桶思路 —— 新增一份 <code>custom_mask_buckets</code>(基于 <code>precompile_token_paddings</code> 的子集),运行时把 <code>custom_mask</code> 长度通过 <code>pad_to_bucket</code> ceil 到最近 bucket。precompile 时遍历 <code>(bs 桶) × (custom_mask 桶)</code>。</li>
+  <li><strong>RUNTIME 独立遍历</strong>:在 <code>precompile_spec_decode</code> 末尾 <strong>直接 import 每个 jit / Pallas wrapper 手动调用</strong>,不走完整 spec 链路。对 B3 / E2 (<code>update_eagle_lists</code>) 等 score_list/token_list/parents_list 随 step_id 变化的形状,通过 mock 构造 dummy 张量并 ceil 到合适 bucket。</li>
+  <li><strong>系统无 reserved padding page</strong>:F4 中 padding 行的 <code>page_indices</code> 不取 reserved page,改用其它合法 dummy 策略(例如复用 batch 内首个真实 page,确保 gather 合法且不写入)。</li>
+  <li><strong>L5 StubModelRunner</strong>:暂未敲定,移至「待澄清」继续跟。</li>
+  <li><strong>采样路径</strong>:本期只验证 greedy。C5/C6 非 greedy precompile 推迟到下一期,文档保留但不进 L2 矩阵。</li>
+  <li><strong>Precompile 启动耗时</strong>:本期不优化,先以「基线测量」为准。</li>
+  <li><strong>Spec EXTEND bs 对齐策略(2026-05-18 新增)</strong>:走「方案 B — precompile 端覆盖用户输入的所有 bs 桶 + runtime 端 ceil pad」。
+    <ul>
+      <li>precompile 端:<code>precompile_spec_extend</code> 改为 <code>product(user_bs_buckets, token_buckets)</code>,遍历用户通过 <code>--precompile-bs-paddings</code> 传入的所有 bs 桶,而非只 <code>[max_bs]</code>。</li>
+      <li>runtime 端:<code>get_spec_model_worker_batch</code> 在 EXTEND 分支调 <code>pad_to_bucket(real_bs, user_bs_buckets)</code>,把 <code>seq_lens / input_ids / positions / cache_loc</code> 等 leading dim 抬到 ≥ real_bs 的最近桶。
+        <pre><code># 伪代码(实际写在 get_spec_model_worker_batch)
+if forward_mode.is_extend():
+    padded_bs, _ = pad_to_bucket(real_bs, bs_paddings)   # bs_paddings 用户传入
+    seq_lens   = pad_seq_lens_to(padded_bs)              # padding 行填 0
+    input_ids  = pad_to(padded_tokens, dummy=0)          # padding token 不申请 KV
+    positions  = pad_to(padded_tokens, dummy=0)
+    cache_loc  = pad_to(cache_loc_paddings[bs_idx])      # 同 bs 索引</code></pre>
+      </li>
+      <li>越界由 <code>pad_to_bucket</code> raise(与<a href="#contract">契约</a>一致);用户必须保证 <code>max(bs) ≥ max_running_requests</code>。</li>
+      <li><strong>不</strong>采用方案 A(强制 pad 到 max_bs 一刀切),原因:spec decode throughput 收益本就建立在「不浪费算力」上,extend 也不应强抬到 max_bs;启动时间增加(≈ <code>|bs|</code> 倍)本期接受。</li>
+    </ul>
+  </li>
+</ol>
+</div>
+
+</div>
+</body>
+</html>
