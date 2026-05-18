@@ -77,6 +77,19 @@ class EAGLEWorker(BaseSpecWorker):
         self,
         model_worker_batch: ModelWorkerBatch,
     ):
+        import jax._src.test_util as jtu
+
+        with jtu.count_pjit_cpp_cache_miss() as outer_count:
+            batch_output = self._forward_batch_speculative_generation_inner(model_worker_batch)
+            total_misses = outer_count()
+        # outer_count already includes inner target/sample/spec-aux jits.
+        batch_output.cache_miss_count = total_misses
+        return batch_output
+
+    def _forward_batch_speculative_generation_inner(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+    ):
         if model_worker_batch.forward_mode.is_extend():
             # FIXME(pc) add padding logic here
             if model_worker_batch.sampling_info.temperatures.ndim == 1:

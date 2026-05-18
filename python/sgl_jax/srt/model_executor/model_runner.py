@@ -119,6 +119,10 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
     def initialize(self):
         server_args = self.server_args
 
+        if get_bool_env_var("SGLANG_JAX_EXPLAIN_CACHE_MISSES"):
+            jax.config.update("jax_explain_cache_misses", True)
+            logger.info("Enabled jax_explain_cache_misses (SGLANG_JAX_EXPLAIN_CACHE_MISSES=1)")
+
         # Set highest matmul precision only for GPU/CUDA to improve numerical stability.
         # Do this at runtime (not import time) to avoid initializing busy backends.
         try:

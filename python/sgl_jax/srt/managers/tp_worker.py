@@ -328,6 +328,32 @@ class ModelWorker:
     def get_pad_input_ids_func(self):
         return getattr(self.model_runner.model, "pad_input_ids", None)
 
+    def _maybe_warn_new_variant(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        forward_batch,
+        logits_metadata,
+    ):
+        """Warn when forward sees a (mode, bs, num_tokens, capture) combo
+        not yet recorded in CompilationManager - the first occurrence of such
+        a key means a JIT recompile is about to happen."""
+        try:
+            variant_key = (
+                str(model_worker_batch.forward_mode),
+                int(forward_batch.batch_size),
+                int(forward_batch.input_ids.shape[0]),
+                str(getattr(model_worker_batch, "capture_hidden_mode", None)),
+                bool(getattr(logits_metadata, "extend_return_logprob", False)),
+            )
+            if self.compilation_manager.register_variant_if_new(variant_key):
+                logger.warning(
+                    "[CACHE_MISS] first-seen forward variant: %s "
+                    "(triggers JIT recompile; precompile should cover it)",
+                    variant_key,
+                )
+        except Exception as exc:
+            logger.debug("register_variant_if_new failed: %s", exc)
+
     def get_memory_pool(self):
         return (
             self.model_runner.req_to_token_pool,
@@ -385,6 +411,7 @@ class ModelWorker:
 
         self.model_runner.attn_backend.forward_metadata = forward_metadata
         logits_metadata = LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh)
+        self._maybe_warn_new_variant(model_worker_batch, forward_batch, logits_metadata)
         logits_output, cache_miss_count, layers_topk_ids = self.model_runner.forward(
             forward_batch,
             logits_metadata=logits_metadata,
