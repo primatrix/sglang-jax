@@ -309,6 +309,8 @@ def _fused_ep_moe_kernel(
     disable_dynamic_ffn2: bool = False,
     disable_acc_and_store: bool = False,
     use_jax_allreduce_metadata: bool = True,
+    cross_expert_prefetch_mode: str = "full",
+    next_w2_prologue_priority: int = 1,
     direct_scaled_dot: bool = False,
     bt: int,
     bf: int,
@@ -346,11 +348,14 @@ def _fused_ep_moe_kernel(
 
     n_sg = h_per_t // quant_block_k if quant_block_k is not None else 1
     n_sg2 = bf // quant_block_k if quant_block_k is not None else 1
+    enable_cross_expert_prefetch = cross_expert_prefetch_mode != "none"
+    full_cross_expert_prefetch = cross_expert_prefetch_mode == "full"
     # This is a legality guard, not a tuning flag. The rolling slot reuse below
     # is valid only when next expert bf0 lands in slot0 and will not be clobbered
     # by another bts tile of the current expert.
     can_cross_expert_prefetch = (
-        not disable_weight_load
+        enable_cross_expert_prefetch
+        and not disable_weight_load
         and direct_scaled_dot
         and w1_scale_hbm is not None
         and w2_scale_hbm is not None
@@ -361,7 +366,12 @@ def _fused_ep_moe_kernel(
     # Same legality envelope as cross-expert prefetch: this experiment reuses
     # W1/W3 VMEM slots before W2 is dead, so keep it to the direct-scaled-dot
     # path where W1/W3 are not read after gate/up.
-    can_split_w13_w2_prefetch = can_cross_expert_prefetch
+    can_split_w13_w2_prefetch = (
+        can_cross_expert_prefetch and not full_cross_expert_prefetch
+    )
+    can_full_cross_expert_prefetch = (
+        can_cross_expert_prefetch and full_cross_expert_prefetch
+    )
 
     se_inter_size = 0
     se_total_blocks = 0
@@ -1034,8 +1044,9 @@ def _fused_ep_moe_kernel(
         )
         return has_tokens_to_prefetch, safe_local_e_id
 
-    def start_prefetch_expert_bf0_w13(
+    def start_prefetch_expert_bf0(
         bt_sem_id, local_e_id, *, slot=0, priority=1, enabled=True,
+        include_w2=False,
     ):
         has_tokens_to_prefetch, safe_local_e_id = get_prefetch_expert_bf0_target(
             bt_sem_id, local_e_id, enabled=enabled,
@@ -1045,6 +1056,8 @@ def _fused_ep_moe_kernel(
         def _():
             start_fetch_w1(safe_local_e_id, slot, 0, priority=priority)
             start_fetch_w3(safe_local_e_id, slot, 0, priority=priority)
+            if include_w2:
+                start_fetch_w2(safe_local_e_id, slot, 0, priority=priority)
 
         return has_tokens_to_prefetch
 
@@ -1094,7 +1107,7 @@ def _fused_ep_moe_kernel(
 
     # ===== Expert FFN: Strix-style double-buffer pipeline =====
 
-    def expert_ffn(bt_sem_id, e_sem_id, local_e_id, bf0_w13_prefetched):
+    def expert_ffn(bt_sem_id, e_sem_id, local_e_id, bf0_prefetched):
         e_id = my_id * local_num_experts + local_e_id
         dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
         has_tokens = dyn_sz > 0
@@ -1107,8 +1120,9 @@ def _fused_ep_moe_kernel(
                     e_sem_id=e_sem_id,
                     local_e_id=local_e_id - expert_buffer_count,
                 )
-            return start_prefetch_expert_bf0_w13(
+            return start_prefetch_expert_bf0(
                 bt_sem_id, local_e_id + jnp.int32(1),
+                include_w2=can_full_cross_expert_prefetch,
             )
 
         def _run_active(_):
@@ -1121,7 +1135,7 @@ def _fused_ep_moe_kernel(
             # Tokens load once per bts tile, reused across all bf tiles.
             # Weights re-prefetch per bts tile (redundant when num_bts_tiles=1,
             # which is the common case — avg ~20 tokens per expert).
-            def bts_body(bts_id, next_bf0_w13_prefetched):
+            def bts_body(bts_id, next_bf0_prefetched):
                 tile_start = bts_id * bts
 
                 # Load tokens for this bts tile (once, reused across all bf tiles)
@@ -1135,16 +1149,22 @@ def _fused_ep_moe_kernel(
                     sem=x_stage_sem.at[0],
                 ).wait()
 
-                if can_split_w13_w2_prefetch:
+                if can_cross_expert_prefetch:
                     use_prefetched_bf0 = jnp.logical_and(
-                        bf0_w13_prefetched, bts_id == jnp.int32(0)
+                        bf0_prefetched, bts_id == jnp.int32(0)
                     )
 
                     @pl.when(jnp.logical_not(use_prefetched_bf0))
                     def _():
                         start_fetch_w1(local_e_id, 0, 0, priority=1)
                         start_fetch_w3(local_e_id, 0, 0, priority=1)
-                    start_fetch_w2(local_e_id, 0, 0, priority=1)
+                        if can_full_cross_expert_prefetch:
+                            start_fetch_w2(local_e_id, 0, 0, priority=1)
+                    if can_split_w13_w2_prefetch:
+                        start_fetch_w2(
+                            local_e_id, 0, 0,
+                            priority=next_w2_prologue_priority,
+                        )
                 else:
                     start_fetch_w1(local_e_id, 0, 0, priority=1)
                     start_fetch_w3(local_e_id, 0, 0, priority=1)
@@ -1287,19 +1307,21 @@ def _fused_ep_moe_kernel(
 
                     if can_split_w13_w2_prefetch:
                         if bf_id == num_bf - 2:
-                            next_has_prefetch = start_prefetch_expert_bf0_w13(
+                            next_has_prefetch = start_prefetch_expert_bf0(
                                 bt_sem_id,
                                 local_e_id + jnp.int32(1),
                                 slot=slot,
                                 priority=1,
                                 enabled=(num_bts_tiles == jnp.int32(1)),
+                                include_w2=False,
                             )
-                            next_bf0_w13_prefetched = jnp.logical_or(
-                                next_bf0_w13_prefetched, next_has_prefetch
+                            next_bf0_prefetched = jnp.logical_or(
+                                next_bf0_prefetched, next_has_prefetch
                             )
 
-                    # Next-expert W2 is intentionally not cross-prefetched here:
-                    # its own prologue can start W2 while W1/W3 drive gate/up.
+                    # In w13 mode, next-expert W2 is intentionally not
+                    # cross-prefetched here: its own prologue can start W2
+                    # while W1/W3 drive gate/up.
                     wait_fetch_w2(slot)
                     dequant_w2(slot)
 
@@ -1372,6 +1394,18 @@ def _fused_ep_moe_kernel(
                         start_fetch_w1(local_e_id, slot, next_bf_id)
                         start_fetch_w3(local_e_id, slot, next_bf_id)
                         start_fetch_w2(local_e_id, slot, next_bf_id, priority=1)
+                    if can_full_cross_expert_prefetch and bf_id == num_bf - 2:
+                        next_has_prefetch = start_prefetch_expert_bf0(
+                            bt_sem_id,
+                            local_e_id + jnp.int32(1),
+                            slot=slot,
+                            priority=1,
+                            enabled=(num_bts_tiles == jnp.int32(1)),
+                            include_w2=True,
+                        )
+                        next_bf0_prefetched = jnp.logical_or(
+                            next_bf0_prefetched, next_has_prefetch
+                        )
 
                 # Final writeback: f32 → bf16, then DMA to HBM (once per bts tile)
                 def writeback_btc(btc_id, ___):
@@ -1396,7 +1430,7 @@ def _fused_ep_moe_kernel(
                     sem=y_store_sem.at[0],
                 ).wait()
 
-                return next_bf0_w13_prefetched
+                return next_bf0_prefetched
 
             return lax.fori_loop(
                 0, num_bts_tiles, bts_body, jnp.bool_(False), unroll=False,
@@ -1833,6 +1867,7 @@ def jax_allreduce_metadata_by_bt(
         "use_jax_allreduce_metadata",
         "block_config", "dp_axis_name", "tp_axis_name",
         "quant_block_k", "direct_scaled_dot",
+        "cross_expert_prefetch_mode", "next_w2_prologue_priority",
     ],
 )
 def fused_ep_moe_v2(
@@ -1863,9 +1898,17 @@ def fused_ep_moe_v2(
     w3_scale: jax.Array | None = None,
     block_config: FusedMoEBlockConfig | None = None,
     direct_scaled_dot: bool = False,
+    cross_expert_prefetch_mode: str = "full",
+    next_w2_prologue_priority: int = 1,
     dp_axis_name: str = "data",
     tp_axis_name: str = "tensor",
 ):
+    if cross_expert_prefetch_mode not in ("none", "full", "w13"):
+        raise ValueError(
+            f"Unsupported {cross_expert_prefetch_mode=}; "
+            "expected one of 'none', 'full', or 'w13'."
+        )
+
     ep_size = get_ep_size(mesh, dp_axis_name, tp_axis_name)
     num_devices = ep_size
 
@@ -1964,6 +2007,9 @@ def fused_ep_moe_v2(
     scope_name = f"fused-moe-v2-k_{top_k}-bt_{bt}_{bts}_{btc}-bf_{bf}"
     if direct_scaled_dot:
         scope_name += "-direct_scaled_dot"
+    scope_name += f"-xprefetch_{cross_expert_prefetch_mode}"
+    if cross_expert_prefetch_mode == "w13":
+        scope_name += f"-w2p_{next_w2_prologue_priority}"
     if w1_shared is not None:
         scope_name += f"-se_bse_{bse}"
 
@@ -2048,6 +2094,8 @@ def fused_ep_moe_v2(
                 disable_dynamic_ffn2=disable_dynamic_ffn2,
                 disable_acc_and_store=disable_acc_and_store,
                 use_jax_allreduce_metadata=use_jax_allreduce_metadata,
+                cross_expert_prefetch_mode=cross_expert_prefetch_mode,
+                next_w2_prologue_priority=next_w2_prologue_priority,
                 direct_scaled_dot=direct_scaled_dot,
                 bt=bt, bf=bf, btc=btc, bts=bts, bse=bse,
                 quant_block_k=quant_block_k,

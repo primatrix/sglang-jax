@@ -164,6 +164,13 @@ def parse_csv_int(env_key: str, default: list[int]) -> list[int]:
     return [int(x.strip()) for x in v.split(",")]
 
 
+def parse_csv_str(env_key: str, default: list[str]) -> list[str]:
+    v = os.environ.get(env_key)
+    if v is None:
+        return default
+    return [x.strip() for x in v.split(",")]
+
+
 def parse_csv_int_or_none(env_key: str) -> list[int | None]:
     v = os.environ.get(env_key)
     if v is None:
@@ -207,6 +214,18 @@ use_wall = os.environ.get("BENCH_WALL", "0") == "1"
 use_split = os.environ.get("BENCH_SPLIT", "0") == "1"
 direct_scaled_dot = os.environ.get("BENCH_DIRECT_SCALED_DOT", "0") == "1"
 inkernel_metadata = os.environ.get("BENCH_INKERNEL_MD", "0") == "1"
+cross_expert_prefetch_modes = parse_csv_str("BENCH_CROSS_EXPERT_PREFETCH", ["full"])
+next_w2_prologue_priorities = parse_csv_int("BENCH_NEXT_W2_PRIORITY", [1])
+valid_cross_expert_prefetch_modes = {"none", "full", "w13"}
+invalid_modes = [
+    mode for mode in cross_expert_prefetch_modes
+    if mode not in valid_cross_expert_prefetch_modes
+]
+if invalid_modes:
+    raise ValueError(
+        f"Unsupported BENCH_CROSS_EXPERT_PREFETCH values {invalid_modes}; "
+        "expected one of none, full, or w13."
+    )
 if use_split:
     timeit_fn = None
     timing_label = "split"
@@ -237,6 +256,10 @@ if direct_scaled_dot:
     log("direct_scaled_dot=True (fp8 dot per quant group, scale after dot)")
 if inkernel_metadata:
     log("inkernel_metadata=True (in-kernel ICI allgather, no JAX lax.all_gather)")
+log(
+    "cross_expert_prefetch="
+    f"{cross_expert_prefetch_modes} next_w2_priority={next_w2_prologue_priorities}"
+)
 
 bt_candidates = parse_csv_int("BENCH_BT", [128])
 bf_candidates = parse_csv_int("BENCH_BF", [256])
@@ -358,12 +381,24 @@ for num_tokens in token_candidates:
     topk_logits = jnp.take_along_axis(gating, topk_idx, axis=-1)
     topk_wts = jax.nn.softmax(topk_logits, axis=-1)
 
-    configs_to_try = list(itertools.product(bt_candidates, bf_candidates, btc_candidates, bts_candidates))
+    configs_to_try = list(itertools.product(
+        bt_candidates,
+        bf_candidates,
+        btc_candidates,
+        bts_candidates,
+        cross_expert_prefetch_modes,
+        next_w2_prologue_priorities,
+    ))
     seen_resolved_configs = set()
 
-    for bt, bf, btc, bts in configs_to_try:
+    for bt, bf, btc, bts, xprefetch_mode, next_w2_priority in configs_to_try:
+        if xprefetch_mode != "w13" and next_w2_priority != next_w2_prologue_priorities[0]:
+            continue
         bc = FusedMoEBlockConfig(bt=bt, bf=bf, btc=btc, bse=bse, bts=bts)
-        tag = f"bt={bt},bf={bf},btc={btc},bts={bts}"
+        tag = (
+            f"bt={bt},bf={bf},btc={btc},bts={bts},"
+            f"xprefetch={xprefetch_mode},w2p={next_w2_priority}"
+        )
 
         padded_nt = num_tokens
         local_nt_raw = num_tokens // ep_size
@@ -378,8 +413,19 @@ for num_tokens in token_candidates:
             log(f"  SKIP {tag}: {e}")
             continue
 
-        tag_resolved = f"bt={bc_resolved.bt},bf={bc_resolved.bf},btc={bc_resolved.btc},bts={bc_resolved.bts}"
-        resolved_key = (bc_resolved.bt, bc_resolved.bf, bc_resolved.btc, bc_resolved.bts)
+        tag_resolved = (
+            f"bt={bc_resolved.bt},bf={bc_resolved.bf},"
+            f"btc={bc_resolved.btc},bts={bc_resolved.bts},"
+            f"xprefetch={xprefetch_mode},w2p={next_w2_priority}"
+        )
+        resolved_key = (
+            bc_resolved.bt,
+            bc_resolved.bf,
+            bc_resolved.btc,
+            bc_resolved.bts,
+            xprefetch_mode,
+            next_w2_priority,
+        )
         if resolved_key in seen_resolved_configs:
             log(f"  SKIP duplicate resolved config {tag} -> {tag_resolved}")
             continue
@@ -399,6 +445,8 @@ for num_tokens in token_candidates:
                 disable_dynamic_ffn2=disable_dynamic_ffn2,
                 disable_acc_and_store=disable_acc_and_store,
                 direct_scaled_dot=direct_scaled_dot,
+                cross_expert_prefetch_mode=xprefetch_mode,
+                next_w2_prologue_priority=next_w2_priority,
                 use_jax_allreduce_metadata=not inkernel_metadata,
             )
 
