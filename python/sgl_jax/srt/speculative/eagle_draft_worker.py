@@ -401,6 +401,20 @@ class EagleDraftWorker(BaseDraftWorker):
         model_worker_batch.input_ids = np.empty(bs * self.topk, np.int32)
         model_worker_batch.positions = np.empty(bs * self.topk, np.int32)
 
+        # Phase 4.1: spec_info fields above were just np.pad'd on host. When
+        # they hit the next jit they get auto-uploaded with default sharding
+        # (which depends on the surrounding mesh and shows up as
+        # Explicit('data','tensor') in cache keys). Precompile dummies use
+        # jnp.ones with no constraint (shows as {} in cache keys), creating a
+        # JIT cache-key mismatch on select_top_k_tokens_step_0. Force-place
+        # each field on the replicated NamedSharding here so runtime always
+        # matches the precompile dummy.
+        replicated = NamedSharding(self.mesh, P())
+        for field in ("verified_id", "topk_p", "topk_index", "hidden_states"):
+            arr = getattr(model_worker_batch.spec_info, field, None)
+            if arr is not None:
+                setattr(model_worker_batch.spec_info, field, jax.device_put(arr, replicated))
+
     def draft_forward(self, model_worker_batch: ModelWorkerBatch):
         topk_p, topk_index, hidden_states = (
             model_worker_batch.spec_info.topk_p,

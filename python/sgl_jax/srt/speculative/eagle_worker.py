@@ -5,6 +5,8 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from tqdm import tqdm
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
@@ -375,18 +377,23 @@ class EAGLEWorker(BaseSpecWorker):
                 # Leave room for the draft tokens that verify appends.
                 effective_seq_len = max(1, seq_len - self.speculative_num_draft_tokens)
                 model_worker_batch.seq_lens = np.full(bs, effective_seq_len, dtype=np.int32)
+                # Phase 4.1: explicit replicated sharding so the dummy spec_info
+                # fields match runtime (padding_for_decode now device_put's the
+                # same fields to NamedSharding(mesh, P())); otherwise
+                # select_top_k_tokens_step_0 hits a cache-key mismatch on
+                # sharding spec.
+                replicated = NamedSharding(self.draft_worker.mesh, P())
+                dtype = jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32
                 spec_info = EagleDraftInput(
-                    # FIXME(pc) dtype should according to serverargs
-                    topk_p=jnp.ones(
-                        (bs, self.topk),
-                        dtype=jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32,
+                    topk_p=jax.device_put(jnp.ones((bs, self.topk), dtype=dtype), replicated),
+                    topk_index=jax.device_put(
+                        jnp.ones((bs, self.topk), dtype=jnp.int32), replicated
                     ),
-                    topk_index=jnp.ones((bs, self.topk), dtype=jnp.int32),
-                    hidden_states=jnp.ones(
-                        (bs, self.draft_worker.model_config.hidden_size),
-                        dtype=jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32,
+                    hidden_states=jax.device_put(
+                        jnp.ones((bs, self.draft_worker.model_config.hidden_size), dtype=dtype),
+                        replicated,
                     ),
-                    verified_id=jnp.ones((bs,), dtype=jnp.int32),
+                    verified_id=jax.device_put(jnp.ones((bs,), dtype=jnp.int32), replicated),
                     accept_length=jnp.ones((bs,), dtype=jnp.int32),
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                     allocate_lens=model_worker_batch.seq_lens
