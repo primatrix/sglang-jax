@@ -84,6 +84,8 @@ class FlashAttention(AttentionBackend):
         kv_partition_axis: str = "tensor",
         attention_data_partition_axis: str = "data",
         mesh: jax.sharding.Mesh = None,
+        spec_custom_mask_bucket: int | None = None,
+        spec_multi_step_page_bucket: int | None = None,
     ):
         self.num_heads = num_attn_heads
         if num_kv_heads is not None:
@@ -96,6 +98,12 @@ class FlashAttention(AttentionBackend):
         self.attention_data_partition_axis = attention_data_partition_axis
         self.forward_metadata = nnx.data(FlashAttentionMetadata())
         self.mesh = mesh
+        # Phase 3.2: single fixed bucket for TARGET_VERIFY custom_mask shape;
+        # see ModelRunner._compute_spec_custom_mask_bucket. None = no padding.
+        self.spec_custom_mask_bucket = spec_custom_mask_bucket
+        # Phase 3.4 (F6): page_indices bucket for draft multi-step decode.
+        # Replaces the hardcoded TARGET_PADDING=16384. None = use legacy 16384.
+        self.spec_multi_step_page_bucket = spec_multi_step_page_bucket
         # SWA dual-pool support: set by model_runner after pool creation.
         # Accessed on host during metadata construction.
 
@@ -211,6 +219,15 @@ class FlashAttention(AttentionBackend):
                 metadata.custom_mask = batch.spec_info.custom_mask.astype(jnp.int32)
             else:
                 metadata.custom_mask = batch.spec_info.custom_mask
+            # Phase 3.2 (F2): pad custom_mask to a fixed bucket so the verify
+            # forward's JIT cache key stays constant regardless of per-request
+            # seq_lens. cu_kv_lens already encodes the valid window so the
+            # kernel never reads past the real region; the tail just needs to
+            # exist for shape stability.
+            bucket = self.spec_custom_mask_bucket
+            if bucket is not None and metadata.custom_mask.shape[0] < bucket:
+                pad_len = bucket - metadata.custom_mask.shape[0]
+                metadata.custom_mask = jnp.pad(metadata.custom_mask, (0, pad_len))
         else:
             metadata.custom_mask = None
 
@@ -369,10 +386,16 @@ class FlashAttention(AttentionBackend):
 
             page_indices_cur_step = (result_locs // self.page_size).astype(np.int32)
 
-            # FIXME Handle padding, this will be move to precompile
-            TARGET_PADDING = 16384
-            if page_indices_cur_step.shape[0] < TARGET_PADDING:
-                padding_size = TARGET_PADDING - page_indices_cur_step.shape[0]
+            # Phase 3.4 (F6): bucket size now sourced from precompile config
+            # (ModelRunner._compute_spec_multi_step_page_bucket); falls back to
+            # the legacy 16384 when unset so non-spec callers stay untouched.
+            target_padding = (
+                self.spec_multi_step_page_bucket
+                if self.spec_multi_step_page_bucket is not None
+                else 16384
+            )
+            if page_indices_cur_step.shape[0] < target_padding:
+                padding_size = target_padding - page_indices_cur_step.shape[0]
                 # Use np.pad to keep it on CPU/Numpy until device_array call
                 page_indices_cur_step = np.pad(page_indices_cur_step, (0, padding_size))
 

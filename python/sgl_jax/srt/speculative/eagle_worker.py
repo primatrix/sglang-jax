@@ -315,11 +315,16 @@ class EAGLEWorker(BaseSpecWorker):
                 if bs > num_tokens:
                     logger.warning("bs=%s > num_tokens=%s, skip this pair", bs, num_tokens)
                     continue
+                bs_idx = self.precompile_bs_paddings.index(bs)
+                # Use per-bs cache_loc bucket so the precompiled forward's
+                # cache_loc shape matches runtime padding (Phase 2 pads
+                # cache_loc to precompile_cache_loc_paddings[bs_idx]).
+                cache_loc_size = self.precompile_cache_loc_paddings[bs_idx]
                 model_worker_batch = self.draft_worker.compilation_manager._make_dummy_batch(
                     bs,
                     num_tokens,
                     ForwardMode.EXTEND,
-                    self.precompile_cache_loc_paddings[-1],
+                    cache_loc_size,
                     speculative_algorithm=self.speculative_algorithm,
                     dp_size=1,
                     per_dp_bs_size=bs,
@@ -330,21 +335,32 @@ class EAGLEWorker(BaseSpecWorker):
 
     def precompile_spec_decode(self):
         start_time = time.perf_counter()
+        # Phase 3.3 (F2): iterate (bs_bucket, seq_len_bucket) so the spec-side
+        # RUNTIME jits whose cache key depends on max_seq_len (notably
+        # build_eagle_tree_structure's static max_context_len and the verify
+        # forward's custom_mask shape) are all warmed up at startup.
+        seq_len_buckets = [
+            s
+            for s in self.precompile_token_paddings
+            if s >= 1 and s <= self.draft_worker.max_req_len
+        ]
+        if not seq_len_buckets:
+            seq_len_buckets = [max(1, self.draft_worker.max_req_len)]
         logger.info(
-            "[SPEC_DECODE] Begin to precompile bs_paddings=%s",
+            "[SPEC_DECODE] Begin to precompile bs_paddings=%s seq_len_buckets=%s",
             self.precompile_bs_paddings,
+            seq_len_buckets,
         )
 
-        with tqdm(
-            self.precompile_bs_paddings, desc="[SPEC_DECODE] PRECOMPILE", leave=False
-        ) as pbar:
-            for bs in pbar:
-                pbar.set_postfix(bs=bs)
-                aligned_cache_loc_size = (
-                    (bs * self.draft_worker.max_req_len + self.page_size - 1)
-                    // self.page_size
-                    * self.page_size
-                )
+        pairs = list(itertools.product(self.precompile_bs_paddings, seq_len_buckets))
+        with tqdm(pairs, desc="[SPEC_DECODE] PRECOMPILE", leave=False) as pbar:
+            for bs, seq_len in pbar:
+                pbar.set_postfix(bs=bs, seq_len=seq_len)
+                bs_idx = self.precompile_bs_paddings.index(bs)
+                # Use per-bs cache_loc bucket so precompile shape matches
+                # runtime padding (decode side pads cache_loc to
+                # precompile_cache_loc_paddings[bs_idx] via padding_for_decode).
+                aligned_cache_loc_size = self.precompile_cache_loc_paddings[bs_idx]
                 model_worker_batch = self.draft_worker.compilation_manager._make_dummy_batch(
                     bs,
                     bs,
@@ -354,6 +370,11 @@ class EAGLEWorker(BaseSpecWorker):
                     dp_size=1,
                     per_dp_bs_size=bs,
                 )
+                # Override dummy seq_lens so build_eagle_tree_structure /
+                # custom_mask see the seq_len bucket we want to trace.
+                # Leave room for the draft tokens that verify appends.
+                effective_seq_len = max(1, seq_len - self.speculative_num_draft_tokens)
+                model_worker_batch.seq_lens = np.full(bs, effective_seq_len, dtype=np.int32)
                 spec_info = EagleDraftInput(
                     # FIXME(pc) dtype should according to serverargs
                     topk_p=jnp.ones(

@@ -385,6 +385,49 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 eagle_aux_hidden_state_layer_ids = None
             self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
 
+    def _compute_spec_custom_mask_bucket(self) -> int | None:
+        """Phase 3.2 (F2): single bucket for TARGET_VERIFY custom_mask shape.
+
+        custom_mask size = sum_i(q_i * kv_i); to keep verify forward's JIT
+        cache key stable we pad mask length to a fixed bucket regardless of
+        per-request seq_lens. Returns None when spec is disabled so the
+        attention backend stays untouched.
+        """
+        if self.spec_algorithm is None or self.spec_algorithm.is_none():
+            return None
+        sargs = self.server_args
+        draft_token_num = getattr(sargs, "speculative_num_draft_tokens", 0) or 0
+        if draft_token_num <= 0:
+            return None
+        token_buckets = sargs.precompile_token_paddings
+        max_token_bucket = max(token_buckets) if token_buckets else sargs.max_prefill_tokens
+        max_bs = sargs.max_running_requests or 1
+        # custom_mask size for verify = bs * draft_token_num * (seq_len + draft_token_num)
+        return int(max_bs * draft_token_num * (max_token_bucket + draft_token_num))
+
+    def _compute_spec_multi_step_page_bucket(self) -> int | None:
+        """Phase 3.4 (F6): replaces the hardcoded TARGET_PADDING=16384 in
+        get_eagle_multi_step_metadata. page_indices for each draft step must
+        pad to a fixed size so the draft model's per-step JIT cache key is
+        stable. Bucket = max_bs * cdiv(max_token + (steps+1)*draft_tokens*topk,
+        page_size)."""
+        if self.spec_algorithm is None or self.spec_algorithm.is_none():
+            return None
+        sargs = self.server_args
+        draft_token_num = getattr(sargs, "speculative_num_draft_tokens", 0) or 0
+        num_steps = getattr(sargs, "speculative_num_steps", 0) or 0
+        topk = getattr(sargs, "speculative_eagle_topk", 1) or 1
+        if draft_token_num <= 0 or num_steps <= 0:
+            return None
+        token_buckets = sargs.precompile_token_paddings
+        max_token_bucket = max(token_buckets) if token_buckets else sargs.max_prefill_tokens
+        max_bs = sargs.max_running_requests or 1
+        page = self.page_size
+        # extra slack for draft multi-step's incremental page growth
+        extra = (num_steps + 1) * draft_token_num * topk
+        per_seq_pages = (max_token_bucket + extra + page - 1) // page
+        return int(max_bs * per_seq_pages)
+
     def adjust_layer_num(self):
         """For hybrid models, compute effective layer count accounting for
         SWA layers having potentially different KV head counts."""
@@ -468,6 +511,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 head_dim,
                 page_size=self.page_size,
                 mesh=self.mesh,
+                spec_custom_mask_bucket=self._compute_spec_custom_mask_bucket(),
+                spec_multi_step_page_bucket=self._compute_spec_multi_step_page_bucket(),
             )
 
         else:
