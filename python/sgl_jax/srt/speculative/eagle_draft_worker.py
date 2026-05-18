@@ -218,31 +218,18 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
-        # Phase 2 padding may set leading dim to padded_bs > real_bs;
-        # JAX >=0.7 refuses ambiguous gather sharding on slicing a sharded
-        # array, so use dynamic_slice instead of __getitem__.
-        # NOTE(phase 3.6): we cannot keep these at padded_bs because the
-        # downstream EagleDraftInput / padding_for_decode pipeline expects
-        # real_bs-shaped inputs (verified_id comes in at real_bs and gets
-        # padded later). Leaving padded shape here breaks the next decode
-        # tick (hidden_states/embeds shape mismatch in llama_eagle3). The
-        # cost: capture_for_decode's topk_probs_from_logits sees real_bs,
-        # which can miss the precompiled (bs_bucket, V) cache key; Phase 4
-        # will resolve that by padding the whole draft pipeline to padded_bs.
-        real_bs = int(model_worker_batch.real_bs)
-        logits_output.next_token_logits = jax.lax.dynamic_slice_in_dim(
-            logits_output.next_token_logits, 0, real_bs, axis=0
-        )
+        # Phase 4.2 (F4): model returns logits at padded_bs (Phase 2 padded
+        # logits_indices). Keep that shape into capture_for_decode so the
+        # topk_probs jit cache key sees a bucket value; capture_for_decode
+        # itself slices outputs back to real_bs so the scheduler can
+        # concatenate per-batch spec_info by real_bs without inflating it.
         if len(logits_output.hidden_states.shape) == 1:
             logits_output.hidden_states = jnp.expand_dims(logits_output.hidden_states, axis=0)
-        if logits_output.hidden_states.shape[0] > real_bs:
-            logits_output.hidden_states = jax.lax.dynamic_slice_in_dim(
-                logits_output.hidden_states, 0, real_bs, axis=0
-            )
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
+        real_bs = int(model_worker_batch.real_bs)
         forward_batch.spec_info.allocate_lens = model_worker_batch.seq_lens[:real_bs]
 
-        self.capture_for_decode(logits_output, forward_batch.spec_info)
+        self.capture_for_decode(logits_output, forward_batch.spec_info, real_bs=real_bs)
 
     def draft_extend_for_decode(
         self, model_worker_batch: ModelWorkerBatch, batch_output: GenerationBatchResult
@@ -294,12 +281,25 @@ class EagleDraftWorker(BaseDraftWorker):
     # -- Internal draft helpers --
 
     def capture_for_decode(
-        self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
+        self,
+        logits_output: LogitsProcessorOutput,
+        draft_input: EagleDraftInput,
+        real_bs: int | None = None,
     ):
+        # Inputs are padded to padded_bs so topk_probs_from_logits hits the
+        # precompiled (bs_bucket, V) cache key. Outputs are sliced back to
+        # real_bs because the scheduler concatenates per-batch spec_info by
+        # real_bs - storing padded rows would inflate the next decode batch
+        # (causing the (9, 1) topk_p that crashed the Phase 4.2 spike).
         topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
+        hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
+        if real_bs is not None and topk_p.shape[0] > real_bs:
+            topk_p = jax.lax.dynamic_slice_in_dim(topk_p, 0, real_bs, axis=0)
+            topk_index = jax.lax.dynamic_slice_in_dim(topk_index, 0, real_bs, axis=0)
+            hidden_states = jax.lax.dynamic_slice_in_dim(hidden_states, 0, real_bs, axis=0)
         draft_input.topk_p = topk_p
         draft_input.topk_index = topk_index
-        draft_input.hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
+        draft_input.hidden_states = hidden_states
 
     def padding_for_decode(self, model_worker_batch: ModelWorkerBatch):
         _, padding_bs_index = self.get_padding_bs(model_worker_batch.real_bs)
