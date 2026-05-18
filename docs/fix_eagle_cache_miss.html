@@ -267,35 +267,41 @@ hr { border: none; border-top: 1px solid var(--border); margin: 32px 0; }
 <tr><td>Phase 3.2/3.3/3.4 — DECODE 覆盖 + 动态常量</td><td><code>e7ce4a1f</code></td><td>✅</td><td>custom_mask 单桶 padding(F2);precompile_spec_decode 多遍 (bs × seq_len);<code>cache_loc_paddings[bs_idx]</code> 对齐 runtime;<code>TARGET_PADDING=16384</code> 改为动态(F6)</td></tr>
 <tr><td>Phase 3.6 — 调研收尾</td><td><code>cbbd1636</code></td><td>📝</td><td>验证「移除 real_bs slice」会破坏下游 shape(9 vs 8 reshape),加注释避免后人重复尝试</td></tr>
 <tr><td>Phase 4.1 — spec_info sharding 对齐</td><td><code>13b5e5d9</code></td><td>✅</td><td>padding_for_decode + precompile dummy 显式 NamedSharding(P());select_top_k_step_0 4 miss → 0</td></tr>
-<tr><td>Phase 4.2 — draft pipeline padded_bs 化</td><td>—</td><td>🔍 spike 失败</td><td>去掉 draft_extend_for_prefill real_bs slice 后 select_top_k 收到 (9,1) 而非 (8,1);9 来源不明,需诊断后再设计</td></tr>
+<tr><td>Phase 4.2 — capture_for_decode hits bucket</td><td><code>a470bb26</code></td><td>✅</td><td>capture 输入保持 padded(命中 precompile);输出 dynamic_slice 切回 real_bs 给 scheduler concat;capture topk_probs miss 4→0</td></tr>
+<tr><td>Phase 4.3 — draft_extend_for_decode select_index</td><td><code>8e1d9745</code></td><td>✅</td><td>同 4.2 模式:select_index 改 padded_bs,gather 输出命中 bucket,再切回 real_bs。结构正确</td></tr>
+<tr><td>Phase 4.4a 诊断</td><td>(uncommitted DIAG)</td><td>📝</td><td>剩余 4 misses 定位:(1) forward_batch[12][3]=spec_info.verified_id/retrive_index 真实 7,跨 forward_mode 比较产生 noise;(2) args[4][1]=LogitsMetadata.accept_lens leaf↔None 类型翻转;(3-4) 不同 forward_mode 的 input_ids 24/8 closest-key noise(实际各自有 cache 命中)</td></tr>
 </tbody>
 </table>
 
 <p><strong>实测对比表(8 并发 real_bs=1+7 请求,niu-v6e4-sleep)</strong></p>
 <table>
-<thead><tr><th>指标</th><th>基线</th><th>Phase 2</th><th>Phase 3</th><th>Phase 4.1</th></tr></thead>
+<thead><tr><th>指标</th><th>基线</th><th>Phase 2</th><th>Phase 3</th><th>Phase 4.1</th><th>Phase 4.2/4.3</th></tr></thead>
 <tbody>
-<tr><td>启动总时长</td><td>5m49s</td><td>3m6s</td><td>7m50s</td><td>5m20s</td></tr>
-<tr><td>precompile variant 数</td><td>8</td><td>16</td><td>28</td><td>28</td></tr>
-<tr><td>首请求新增 variant</td><td>22~48</td><td>1</td><td>0</td><td>0</td></tr>
-<tr><td>jitted_run_model runtime miss</td><td>48</td><td>—</td><td>18</td><td>24</td></tr>
-<tr><td>select_top_k_step_0 miss</td><td>—</td><td>4</td><td>4</td><td><strong>0 ✅</strong></td></tr>
-<tr><td>topk_probs miss(capture/extend)</td><td>—</td><td>2</td><td>2</td><td>4</td></tr>
-<tr><td>decode 稳态 #cache_miss/tick</td><td>1*</td><td>2~6</td><td>2~6</td><td>2~6</td></tr>
+<tr><td>启动总时长</td><td>5m49s</td><td>3m6s</td><td>7m50s</td><td>5m20s</td><td>5m10s</td></tr>
+<tr><td>precompile variant 数</td><td>8</td><td>16</td><td>28</td><td>28</td><td>28</td></tr>
+<tr><td>首请求新增 variant</td><td>22~48</td><td>1</td><td>0</td><td>0</td><td>0</td></tr>
+<tr><td>jitted_run_model runtime miss(unique WARN)</td><td>24</td><td>—</td><td>9</td><td>12</td><td><strong>4</strong></td></tr>
+<tr><td>select_top_k_step_0 miss</td><td>—</td><td>4</td><td>4</td><td><strong>0 ✅</strong></td><td>0</td></tr>
+<tr><td>topk_probs miss(capture/extend)</td><td>—</td><td>2</td><td>2</td><td>4</td><td><strong>0 ✅</strong></td></tr>
+<tr><td>decode 稳态 #cache_miss/tick</td><td>1*</td><td>2~6</td><td>2~6</td><td>2~6</td><td>2~3</td></tr>
 </tbody>
 </table>
-<p class="muted">* 基线 1/tick 是测量假象(只计 target forward),Phase 1 后揭露真实是 2~6/tick;Phase 4.2 目标清零。</p>
+<p class="muted">* 基线 1/tick 是测量假象(只计 target forward),Phase 1 后揭露真实是 2~6/tick;Phase 4.x 已减半到 2~3。</p>
 
-<p><strong>Phase 4.2 spike crash 追踪</strong></p>
-<p>spike 改动:<code>draft_extend_for_prefill</code> 不再切 next_token_logits / hidden_states 到 real_bs,保持 padded_bs 端到端。</p>
-<p>失败堆栈(8 并发 real_bs=1+7):<code>select_top_k_tokens_step_0</code> 收到 <code>topk_p shape=(9, 1)</code> 但 precompile 是 <code>(8, 1)</code>,后续 draft model rotary_emb 报 <code>ShardingTypeError: reshape bfloat16[9@data,64@tensor,80] → (8, 72, 80)</code>。</p>
-<p><strong>9 vs 8 来源未明</strong>,可能链条:
+<p><strong>Phase 4.2 spike crash 追踪 → 已修复</strong></p>
+<p>spike 改动:<code>draft_extend_for_prefill</code> 不再切 next_token_logits / hidden_states 到 real_bs。</p>
+<p>失败堆栈:<code>select_top_k_tokens_step_0</code> 收到 <code>topk_p shape=(9, 1)</code>,draft rotary_emb 报 <code>ShardingTypeError: reshape bfloat16[9@data,64@tensor,80] → (8, 72, 80)</code>。</p>
+<p><strong>9 vs 8 根因(诊断结果)</strong>:模型实际返回 padded_bs=8(Phase 2 padded 了 logits_indices)。第二 prefill capture 出 spec_info.topk_p=(8, 1) + 第一 prefill (1, 1) → scheduler concat = (1+8, 1) = (9, 1) ← 9 现身。</p>
+<p><strong>正解</strong>(Phase 4.2 commit <code>a470bb26</code>):capture_for_decode 接受 padded 输入(命中 precompile bucket)+ 输出 <code>dynamic_slice_in_dim</code> 切回 real_bs(scheduler concat 正确)。同模式 Phase 4.3 应用到 draft_extend_for_decode 的 select_index gather。</p>
+
+<p><strong>Phase 4.4 剩余 4 miss 诊断(2026-05-18)</strong></p>
+<p>方法:DIAG 加 print 到 tp_worker.forward_batch_generation + draft_model_runner.forward 各调用点。结果:**所有 forward 实际 shape 都已 padded**(bs ∈ {1,4,8,16},input_ids 命中 bucket),但 JIT 仍报 4 个 unique miss。closest-key 解读:</p>
 <ol>
-  <li><code>capture_for_decode</code> 收到的 next_token_logits 实际 shape 可能不是 padded_bs=8(模型 with capture_hidden_mode=LAST 走 logits_indices_selector,返回 real_bs=7)</li>
-  <li><code>padding_for_decode</code> pad 时算出来的目标 bs 可能与 <code>draft_forward</code> 入口的 <code>seq_lens.shape[0]</code> 不一致</li>
-  <li><code>scheduler.run_batch</code> 在 prefill 后对 <code>info.seq_lens += 1</code>,padding 后元素数可能与 real_bs 不一致</li>
+  <li><code>forward_batch[12][3] = i32[7] vs i32[8]</code> —— spec_info 第 4 子项(EagleVerifyInput[3]=retrive_index 或 EagleDraftInput[3]=verified_id)。跨 forward_mode 比较 noise。</li>
+  <li><code>args[4][1] NoneType vs leaf</code> —— LogitsMetadata.accept_lens 在不同 forward_mode 中 None / jax.Array 翻转 ← <strong>真正可修</strong>。</li>
+  <li><code>forward_batch[3] = i32[24] vs i32[8]</code> ×2 —— input_ids = 24(verify)vs 8(draft step)的不同 cache key,closest-key 噪音(各自有 cache 命中)。</li>
 </ol>
-下一步用 print 诊断 <code>draft_forward</code> 入口形状,定位 9 出现的精确步骤。</p>
+<p><strong>结论</strong>:Phase 4.4 真正需要修的只剩 <strong>(2) LogitsMetadata.accept_lens type stability</strong>(为非 verify 模式提供 dummy accept_lens 数组,让 pytree 类型恒定),其余可能是 JAX closest-key 报告偏差,需要进一步验证是否 actually 影响 cache。</p>
 </div>
 
 <h2 id="contract">Padding 契约(验收标准)</h2>
