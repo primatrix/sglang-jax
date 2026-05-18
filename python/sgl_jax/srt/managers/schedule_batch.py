@@ -2349,6 +2349,47 @@ class ScheduleBatch:
         # Extract lora_ids from requests
         lora_ids = [req.lora_id for req in self.reqs]
 
+        # Spec EXTEND: pad bs / tokens / cache_loc to the nearest precompiled
+        # bucket so the target/draft model JITs hit a precompiled cache key.
+        # DECODE side is padded later by EagleDraftWorker.padding_for_decode.
+        padded_bs = real_bs
+        padded_tokens = real_input_ids_len
+        padded_cache_loc = len(cache_loc_flat)
+        if self.forward_mode.is_extend() and real_bs > 0:
+            padded_bs, bs_idx = pad_to_bucket(real_bs, bs_paddings)
+            padded_tokens, _ = pad_to_bucket(max(real_input_ids_len, 1), token_paddings)
+            padded_cache_loc = cache_loc_paddings[bs_idx]
+            (
+                input_ids_cpu,
+                positions_cpu,
+                mrope_positions_cpu,
+                seq_lens_cpu,
+                req_pool_indices_cpu,
+                extend_prefix_lens,
+                extend_seq_lens,
+                logits_indices,
+                cache_loc_flat,
+                out_cache_loc_cpu,
+            ) = self._pad_spec_extend_arrays(
+                padded_bs=padded_bs,
+                padded_tokens=padded_tokens,
+                padded_cache_loc=padded_cache_loc,
+                input_ids_cpu=input_ids_cpu,
+                positions_cpu=positions_cpu,
+                mrope_positions_cpu=mrope_positions_cpu,
+                seq_lens_cpu=seq_lens_cpu,
+                req_pool_indices_cpu=req_pool_indices_cpu,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_seq_lens=extend_seq_lens,
+                logits_indices=logits_indices,
+                cache_loc_flat=cache_loc_flat,
+                out_cache_loc_cpu=out_cache_loc_cpu,
+            )
+
+        # sampling_info shape must match padded_bs so the sampler hits the same
+        # JIT cache key as during precompile.
+        sampling_info = self._merge_sampling_info(padded_bs, padded_bs)
+
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -2361,7 +2402,7 @@ class ScheduleBatch:
             return_output_logprob_only=self.return_output_logprob_only,
             top_logprobs_nums=self.top_logprobs_nums,
             token_ids_logprobs=self.token_ids_logprobs,
-            sampling_info=self._merge_sampling_info(real_bs, real_bs),
+            sampling_info=sampling_info,
             positions=positions_cpu,
             mrope_positions=mrope_positions_cpu,
             cache_loc=cache_loc_flat,
@@ -2374,7 +2415,7 @@ class ScheduleBatch:
             real_bs=real_bs,
             real_bs_per_dp=[real_bs],
             dp_size=self.dp_size,
-            per_dp_bs_size=real_bs,
+            per_dp_bs_size=padded_bs,
             logits_indices_selector=np.arange(real_bs, dtype=np.int32),
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
@@ -2389,6 +2430,87 @@ class ScheduleBatch:
             spec_info=self.spec_info,
             spec_algorithm=self.spec_algorithm,
             tree_cache=self.tree_cache,
+        )
+
+    @staticmethod
+    def _pad_spec_extend_arrays(
+        *,
+        padded_bs: int,
+        padded_tokens: int,
+        padded_cache_loc: int,
+        input_ids_cpu: np.ndarray,
+        positions_cpu: np.ndarray,
+        mrope_positions_cpu,
+        seq_lens_cpu: np.ndarray,
+        req_pool_indices_cpu: np.ndarray,
+        extend_prefix_lens: np.ndarray,
+        extend_seq_lens: np.ndarray,
+        logits_indices: np.ndarray,
+        cache_loc_flat: np.ndarray,
+        out_cache_loc_cpu,
+    ):
+        """Pad spec-extend arrays to bucket sizes; padding rows produce zero
+        attention contribution (extend_seq_lens=0)."""
+
+        def _pad_1d(arr, target_len, fill=0):
+            if arr is None or len(arr) >= target_len:
+                return arr
+            pad = np.full(target_len - len(arr), fill, dtype=arr.dtype)
+            return np.concatenate([arr, pad])
+
+        # Per-token arrays
+        input_ids_cpu = _pad_1d(input_ids_cpu, padded_tokens, fill=0)
+        positions_cpu = _pad_1d(positions_cpu, padded_tokens, fill=0)
+        if isinstance(mrope_positions_cpu, np.ndarray):
+            # mrope_positions has shape (3, T) for multi-modal; otherwise 1D.
+            if mrope_positions_cpu.ndim == 2 and mrope_positions_cpu.shape[1] < padded_tokens:
+                extra = padded_tokens - mrope_positions_cpu.shape[1]
+                mrope_positions_cpu = np.concatenate(
+                    [
+                        mrope_positions_cpu,
+                        np.zeros(
+                            (mrope_positions_cpu.shape[0], extra), dtype=mrope_positions_cpu.dtype
+                        ),
+                    ],
+                    axis=1,
+                )
+            elif mrope_positions_cpu.ndim == 1:
+                mrope_positions_cpu = _pad_1d(mrope_positions_cpu, padded_tokens, fill=0)
+
+        # Per-batch arrays. seq_lens / extend_seq_lens / extend_prefix_lens
+        # all get 0 in padding rows so attention is a no-op for those rows.
+        seq_lens_cpu = _pad_1d(seq_lens_cpu, padded_bs, fill=0)
+        req_pool_indices_cpu = _pad_1d(req_pool_indices_cpu, padded_bs, fill=0)
+        extend_prefix_lens = _pad_1d(extend_prefix_lens, padded_bs, fill=0)
+        extend_seq_lens = _pad_1d(extend_seq_lens, padded_bs, fill=0)
+        # logits_indices points at last position of each request in the flat
+        # token stream; padding rows reuse the last real index (gather is legal
+        # and its result is discarded via real_bs slicing).
+        if logits_indices is not None and len(logits_indices) < padded_bs:
+            dummy = logits_indices[-1] if len(logits_indices) > 0 else 0
+            logits_indices = _pad_1d(logits_indices, padded_bs, fill=dummy)
+
+        # cache_loc: pad with 0 (any value works because attention won't visit
+        # those slots given extend_seq_lens=0 for padding rows).
+        if cache_loc_flat is not None and len(cache_loc_flat) < padded_cache_loc:
+            cache_loc_flat = _pad_1d(cache_loc_flat, padded_cache_loc, fill=0)
+
+        # out_cache_loc: only used to record where new KV got written. Padding
+        # rows write nothing, so length match is enough.
+        if isinstance(out_cache_loc_cpu, np.ndarray) and len(out_cache_loc_cpu) < padded_tokens:
+            out_cache_loc_cpu = _pad_1d(out_cache_loc_cpu, padded_tokens, fill=0)
+
+        return (
+            input_ids_cpu,
+            positions_cpu,
+            mrope_positions_cpu,
+            seq_lens_cpu,
+            req_pool_indices_cpu,
+            extend_prefix_lens,
+            extend_seq_lens,
+            logits_indices,
+            cache_loc_flat,
+            out_cache_loc_cpu,
         )
 
     def _generate_trace_info(self, real_bs: int, bid: int) -> list[str]:

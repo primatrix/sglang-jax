@@ -24,7 +24,7 @@ from sgl_jax.srt.speculative.eagle_util import (
     build_tree_mask_for_draft_decode,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
-from sgl_jax.srt.utils.common_utils import get_bool_env_var
+from sgl_jax.srt.utils.common_utils import get_bool_env_var, pad_to_bucket
 from sgl_jax.srt.utils.jax_utils import device_array
 
 logger = logging.getLogger(__name__)
@@ -450,11 +450,13 @@ class EagleDraftWorker(BaseDraftWorker):
 
     def _pick_context_len(self, max_seq_len: int) -> int:
         max_seq_len = max(int(max_seq_len), 1)
-        if self.precompile_token_paddings:
-            for padding in self.precompile_token_paddings:
-                if padding >= max_seq_len:
-                    return padding
-        return 1 << (max_seq_len - 1).bit_length()
+        if not self.precompile_token_paddings:
+            raise RuntimeError(
+                "precompile_token_paddings is empty; spec path requires explicit buckets "
+                "to keep tree-kernel shapes bucketed."
+            )
+        padded, _ = pad_to_bucket(max_seq_len, self.precompile_token_paddings)
+        return padded
 
     def copy_model_worker_batch_to_cpu(self, model_worker_batch: ModelWorkerBatch):
         model_worker_batch.input_ids = np.array(

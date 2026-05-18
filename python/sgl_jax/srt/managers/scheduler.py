@@ -436,6 +436,15 @@ class Scheduler(
                 self.tp_worker.run_precompile()
                 logger.info("[Scheduler] Completes worker precompile.")
             else:
+                # F1: run the non-spec target precompile first so the target
+                # model's (forward_mode=EXTEND/DECODE, bs_bucket, token_bucket)
+                # grid is covered. The spec precompile below only exercises
+                # spec-specific shapes (TARGET_VERIFY / DRAFT_EXTEND_AFTER_VERIFY)
+                # and a single bs bucket on EXTEND, so it leaves gaps that this
+                # call fills.
+                logger.info("[Scheduler] Begins to run target worker precompile.")
+                self.tp_worker.run_precompile()
+                logger.info("[Scheduler] Completes target worker precompile.")
                 logger.info("[Scheduler] Begins to run spec_decode worker precompile.")
                 self.draft_worker.run_spec_decode_precompile()
                 logger.info("[Scheduler] Completes spec_decode worker precompile.")
