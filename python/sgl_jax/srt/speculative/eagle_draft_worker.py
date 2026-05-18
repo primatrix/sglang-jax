@@ -254,12 +254,27 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch,
             logits_metadata=logits_metadata,
         )
-        select_index = (
-            np.arange(len(model_worker_batch.seq_lens[: model_worker_batch.real_bs]))
-            * (self.speculative_num_steps + 1)
-            + batch_output.accept_lens[: model_worker_batch.real_bs]
-            - 1
+        # Phase 4.3 (F4): build select_index at padded_bs so the gather output
+        # (rep_logits[select_index], rep_hidden[select_index]) hits the
+        # precompiled (padded_bs, V/hidden) cache key in topk_probs_from_logits.
+        # Padding rows take dummy index 0 (safe because the result is sliced
+        # back to real_bs before being stored in spec_info, matching the
+        # capture_for_decode pattern from Phase 4.2).
+        real_bs = int(model_worker_batch.real_bs)
+        padded_bs = int(model_worker_batch.seq_lens.shape[0])
+        accept_lens_full = np.asarray(batch_output.accept_lens)
+        if accept_lens_full.shape[0] < padded_bs:
+            accept_lens_full = np.pad(
+                accept_lens_full,
+                ((0, padded_bs - accept_lens_full.shape[0]),),
+            )
+        # Real rows pick last accepted token per req; padding rows fall back to
+        # index 0 (a dummy slot inside the same req-stride window; gather is
+        # safe and its output is discarded by the real_bs slice below).
+        select_index = np.arange(padded_bs) * (self.speculative_num_steps + 1) + (
+            accept_lens_full - 1
         )
+        select_index[real_bs:] = 0
         rep_logits, rep_hidden = replicate_to_mesh(
             self.mesh, draft_logits_output.next_token_logits, draft_logits_output.hidden_states
         )
@@ -269,11 +284,21 @@ class EagleDraftWorker(BaseDraftWorker):
             draft_logits_output.next_token_logits, self.topk
         )
 
-        batch_output.next_draft_input.hidden_states = draft_logits_output.hidden_states
+        # Slice outputs back to real_bs so the scheduler concatenates per-batch
+        # spec_info without inflating it (same invariant as capture_for_decode).
+        if real_bs < padded_bs:
+            topk_p = jax.lax.dynamic_slice_in_dim(topk_p, 0, real_bs, axis=0)
+            topk_index = jax.lax.dynamic_slice_in_dim(topk_index, 0, real_bs, axis=0)
+            sliced_hidden = jax.lax.dynamic_slice_in_dim(
+                draft_logits_output.hidden_states, 0, real_bs, axis=0
+            )
+        else:
+            sliced_hidden = draft_logits_output.hidden_states
+        batch_output.next_draft_input.hidden_states = sliced_hidden
         batch_output.next_draft_input.topk_p = topk_p
         batch_output.next_draft_input.topk_index = topk_index
         batch_output.next_draft_input.verified_id = batch_output.next_draft_input.verified_id[
-            select_index
+            select_index[:real_bs]
         ]
         batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
         batch_output.accept_lens = batch_output.accept_lens[: model_worker_batch.real_bs]
