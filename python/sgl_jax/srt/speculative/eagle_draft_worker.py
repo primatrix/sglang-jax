@@ -453,6 +453,17 @@ class EagleDraftWorker(BaseDraftWorker):
                 )
             )
         bs = self.precompile_bs_paddings[padding_bs_index]
+        # Phase 4.8: pad req_pool_indices to the bs bucket so per-bs first-seen
+        # variants disappear as running-req drops (e.g. 8 -> 3 still uses the
+        # padded_bs=4 bucket; without this padding, jit cache_key sees
+        # req_pool_indices i32[3@data] for the first such tick and retraces).
+        # Padding value 0 is safe because the corresponding seq_lens row is
+        # also zeroed (line 469-471), so attention skips those rows.
+        if bs - model_worker_batch.req_pool_indices.shape[0] > 0:
+            model_worker_batch.req_pool_indices = np.pad(
+                model_worker_batch.req_pool_indices,
+                ((0, bs - model_worker_batch.req_pool_indices.shape[0]),),
+            )
         if bs - model_worker_batch.spec_info.verified_id.shape[0] > 0:
             model_worker_batch.spec_info.verified_id = np.pad(
                 model_worker_batch.spec_info.verified_id,
@@ -512,6 +523,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 setattr(model_worker_batch.spec_info, field, jax.device_put(arr, replicated))
 
     def draft_forward(self, model_worker_batch: ModelWorkerBatch):
+        explain = get_bool_env_var("SGLANG_JAX_EXPLAIN_CACHE_MISSES")
         topk_p, topk_index, hidden_states = (
             model_worker_batch.spec_info.topk_p,
             model_worker_batch.spec_info.topk_index,
@@ -542,33 +554,63 @@ class EagleDraftWorker(BaseDraftWorker):
         forward_batch.cache_loc = np.empty((1,))
         forward_batch.spec_info = EagleDraftInput()
         forward_batch.spec_info.hidden_states = jnp.empty((bs * self.topk, hidden_states.shape[1]))
+        # Phase 4.7b: per-step sub-jit cache-miss counters. select_top_k /
+        # update_lists / model forward / topk_probs / replicate are each
+        # separate jits; we attribute remaining draft=1/tick to whichever
+        # step still trace-keys on a drifting in_avals.
+        step_counts = []
         for i in range(self.speculative_num_steps):
-
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
-            )
-            score_list, token_list, parents_list = update_eagle_lists(
-                i, score_list, token_list, parents_list, tree_info, self.topk
-            )
+            counts = {}
+            with _maybe_count_misses() as c_select:
+                input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                    i, topk_p, topk_index, hidden_states, scores, self.topk
+                )
+                counts["select"] = c_select() if explain else 0
+            with _maybe_count_misses() as c_lists:
+                score_list, token_list, parents_list = update_eagle_lists(
+                    i, score_list, token_list, parents_list, tree_info, self.topk
+                )
+                counts["lists"] = c_lists() if explain else 0
             if i == self.speculative_num_steps - 1:
+                step_counts.append(counts)
                 break
 
-            forward_batch = update_forward_batch_info(
-                forward_batch, i, input_ids, hidden_states, positions_base
-            )
+            with _maybe_count_misses() as c_update_fb:
+                forward_batch = update_forward_batch_info(
+                    forward_batch, i, input_ids, hidden_states, positions_base
+                )
+                counts["update_fb"] = c_update_fb() if explain else 0
             self.draft_model_runner.attn_backend.forward_metadata = metadata_per_step[i]
 
             forward_batch.bid = model_worker_batch.bid
-            logits_output, _, _ = self.draft_model_runner.forward(
-                forward_batch,
-                logits_metadata=logits_metadata,
-            )
+            with _maybe_count_misses() as c_fwd:
+                logits_output, _, _ = self.draft_model_runner.forward(
+                    forward_batch,
+                    logits_metadata=logits_metadata,
+                )
+                counts["fwd"] = c_fwd() if explain else 0
 
-            topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
+            with _maybe_count_misses() as c_topk:
+                topk_p, topk_index = topk_probs_from_logits(
+                    logits_output.next_token_logits, self.topk
+                )
+                counts["topk"] = c_topk() if explain else 0
 
             if self.hot_token_ids is not None:
                 topk_index = self.hot_token_ids[topk_index]
-            hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
+            with _maybe_count_misses() as c_replicate:
+                hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
+                counts["replicate"] = c_replicate() if explain else 0
+            step_counts.append(counts)
+
+        if explain and any(any(v for v in s.values()) for s in step_counts):
+            for i, c in enumerate(step_counts):
+                if any(v for v in c.values()):
+                    logger.warning(
+                        "[PHASE4.7b draft_forward step=%d] %s",
+                        i,
+                        " ".join(f"{k}={v}" for k, v in c.items()),
+                    )
 
         return score_list, token_list, parents_list
 
