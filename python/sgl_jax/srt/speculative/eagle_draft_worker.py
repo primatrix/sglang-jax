@@ -28,6 +28,22 @@ from sgl_jax.srt.utils.common_utils import get_bool_env_var, pad_to_bucket
 from sgl_jax.srt.utils.jax_utils import device_array
 
 logger = logging.getLogger(__name__)
+
+
+def _maybe_count_misses():
+    """Phase 4.5b: nullable count_pjit_cpp_cache_miss context. Active only
+    under SGLANG_JAX_EXPLAIN_CACHE_MISSES so production paths see no
+    instrumentation overhead. Calling the returned value yields 0 when
+    inactive."""
+    import contextlib
+
+    import jax._src.test_util as jtu
+
+    if get_bool_env_var("SGLANG_JAX_EXPLAIN_CACHE_MISSES"):
+        return jtu.count_pjit_cpp_cache_miss()
+    return contextlib.nullcontext(lambda: 0)
+
+
 RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
 
 
@@ -142,32 +158,44 @@ class EagleDraftWorker(BaseDraftWorker):
     # -- BaseDraftWorker interface --
 
     def draft(self, model_worker_batch: ModelWorkerBatch) -> None:
+        explain = get_bool_env_var("SGLANG_JAX_EXPLAIN_CACHE_MISSES")
         self.padding_for_decode(model_worker_batch)
-        score_list, token_list, parents_list = self.draft_forward(model_worker_batch)
+        with _maybe_count_misses() as c_draft_fwd:
+            score_list, token_list, parents_list = self.draft_forward(model_worker_batch)
+            n_draft_fwd = c_draft_fwd() if explain else 0
         verified_seq_lens = model_worker_batch.seq_lens - 1
         max_seq_len = int(np.max(verified_seq_lens)) if verified_seq_lens.size > 0 else 1
         max_context_len = self._pick_context_len(max_seq_len)
-        (
-            tree_mask,
-            position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            draft_tokens,
-        ) = build_tree_kernel_efficient(
-            model_worker_batch.spec_info.verified_id,
-            score_list,
-            token_list,
-            parents_list,
-            verified_seq_lens,
-            np.sum(verified_seq_lens),
-            self.topk,
-            self.speculative_num_draft_tokens,
-            max_context_len,
-            model_worker_batch.seq_lens.shape[0],
-            model_worker_batch.speculative_num_steps,
-            self.mesh,
-        )
+        with _maybe_count_misses() as c_tree:
+            (
+                tree_mask,
+                position,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                draft_tokens,
+            ) = build_tree_kernel_efficient(
+                model_worker_batch.spec_info.verified_id,
+                score_list,
+                token_list,
+                parents_list,
+                verified_seq_lens,
+                np.sum(verified_seq_lens),
+                self.topk,
+                self.speculative_num_draft_tokens,
+                max_context_len,
+                model_worker_batch.seq_lens.shape[0],
+                model_worker_batch.speculative_num_steps,
+                self.mesh,
+            )
+            n_tree = c_tree() if explain else 0
+        if explain and (n_draft_fwd or n_tree):
+            logger.warning(
+                "[PHASE4.5b draft] draft_forward=%d build_tree=%d (max_context_len=%d)",
+                n_draft_fwd,
+                n_tree,
+                max_context_len,
+            )
         model_worker_batch.spec_info = EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
@@ -236,6 +264,7 @@ class EagleDraftWorker(BaseDraftWorker):
     ) -> None:
         if batch_output.next_draft_input.verified_id.shape[0] <= 0:
             return
+        explain = get_bool_env_var("SGLANG_JAX_EXPLAIN_CACHE_MISSES")
         draft_input = EagleDraftInput(
             hidden_states=batch_output.logits_output.hidden_states,
             allocate_lens=batch_output.allocate_lens,
@@ -250,10 +279,12 @@ class EagleDraftWorker(BaseDraftWorker):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
         if forward_batch.input_ids.shape[0] <= 0:
             return
-        draft_logits_output, _, _ = self.draft_model_runner.forward(
-            forward_batch,
-            logits_metadata=logits_metadata,
-        )
+        with _maybe_count_misses() as c_draft_fwd:
+            draft_logits_output, _, _ = self.draft_model_runner.forward(
+                forward_batch,
+                logits_metadata=logits_metadata,
+            )
+            n_draft_fwd = c_draft_fwd() if explain else 0
         # Phase 4.3 (F4): build select_index at padded_bs so the gather output
         # (rep_logits[select_index], rep_hidden[select_index]) hits the
         # precompiled (padded_bs, V/hidden) cache key in topk_probs_from_logits.
@@ -278,22 +309,36 @@ class EagleDraftWorker(BaseDraftWorker):
         rep_logits, rep_hidden = replicate_to_mesh(
             self.mesh, draft_logits_output.next_token_logits, draft_logits_output.hidden_states
         )
-        draft_logits_output.next_token_logits = rep_logits[select_index]
-        draft_logits_output.hidden_states = rep_hidden[select_index]
-        topk_p, topk_index = topk_probs_from_logits(
-            draft_logits_output.next_token_logits, self.topk
-        )
+        with _maybe_count_misses() as c_gather:
+            draft_logits_output.next_token_logits = rep_logits[select_index]
+            draft_logits_output.hidden_states = rep_hidden[select_index]
+            n_gather = c_gather() if explain else 0
+        with _maybe_count_misses() as c_topk:
+            topk_p, topk_index = topk_probs_from_logits(
+                draft_logits_output.next_token_logits, self.topk
+            )
+            n_topk = c_topk() if explain else 0
 
         # Slice outputs back to real_bs so the scheduler concatenates per-batch
         # spec_info without inflating it (same invariant as capture_for_decode).
-        if real_bs < padded_bs:
-            topk_p = jax.lax.dynamic_slice_in_dim(topk_p, 0, real_bs, axis=0)
-            topk_index = jax.lax.dynamic_slice_in_dim(topk_index, 0, real_bs, axis=0)
-            sliced_hidden = jax.lax.dynamic_slice_in_dim(
-                draft_logits_output.hidden_states, 0, real_bs, axis=0
+        with _maybe_count_misses() as c_slice:
+            if real_bs < padded_bs:
+                topk_p = jax.lax.dynamic_slice_in_dim(topk_p, 0, real_bs, axis=0)
+                topk_index = jax.lax.dynamic_slice_in_dim(topk_index, 0, real_bs, axis=0)
+                sliced_hidden = jax.lax.dynamic_slice_in_dim(
+                    draft_logits_output.hidden_states, 0, real_bs, axis=0
+                )
+            else:
+                sliced_hidden = draft_logits_output.hidden_states
+            n_slice = c_slice() if explain else 0
+        if explain and (n_draft_fwd or n_gather or n_topk or n_slice):
+            logger.warning(
+                "[PHASE4.5b refresh] draft_fwd=%d gather=%d topk=%d slice=%d",
+                n_draft_fwd,
+                n_gather,
+                n_topk,
+                n_slice,
             )
-        else:
-            sliced_hidden = draft_logits_output.hidden_states
         batch_output.next_draft_input.hidden_states = sliced_hidden
         batch_output.next_draft_input.topk_p = topk_p
         batch_output.next_draft_input.topk_index = topk_index

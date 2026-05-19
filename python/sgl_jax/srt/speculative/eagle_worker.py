@@ -88,10 +88,100 @@ class EAGLEWorker(BaseSpecWorker):
         batch_output.cache_miss_count = total_misses
         return batch_output
 
+    def _spec_info_shape_sig(self, spec_info) -> str:
+        """Build a compact shape signature of spec_info device fields so the
+        Phase 4.5 variant tracker can detect runtime shape drift (e.g.
+        accept_length, hidden_states, custom_mask) that doesn't show up in
+        the basic (mode, bs, num_tokens, capture) key. Host-only fields and
+        scalars are skipped."""
+        if spec_info is None:
+            return "none"
+        parts = [type(spec_info).__name__]
+        for field in (
+            "accept_length",
+            "hidden_states",
+            "verified_id",
+            "topk_p",
+            "topk_index",
+            "custom_mask",
+            "draft_token",
+            "positions",
+            "retrive_index",
+            "retrive_next_token",
+            "retrive_next_sibling",
+            "kv_indptr",
+            "kv_indices",
+            "seq_lens_for_draft_extend",
+        ):
+            val = getattr(spec_info, field, None)
+            if val is None:
+                continue
+            shape = getattr(val, "shape", None)
+            if shape is None:
+                continue
+            parts.append(f"{field}{tuple(shape)}")
+        return "|".join(parts)
+
+    def _maybe_warn_spec_variant(self, phase: str, model_worker_batch) -> None:
+        """Phase 4.5: register a per-phase variant key in the shared
+        CompilationManager set so the first appearance of a (phase, mode,
+        bs, tokens, capture, spec_info_sig) combination emits a WARN. Used
+        to attribute remaining JIT first-seen misses to either a missing
+        precompile bucket (basic 5-tuple drift) or runtime spec_info shape
+        drift (spec_info_sig drift). Only active when explain is on.
+
+        Note: uses `seq_lens.shape[0]` (padded_bs) rather than `real_bs` so
+        the key matches what the JIT actually trace-keys on (padded shapes
+        after Phase 2 _pad_spec_extend_arrays). Runtime batches with
+        real_bs=7 padded to padded_bs=8 must hit the precompile entry."""
+        if not get_bool_env_var("SGLANG_JAX_EXPLAIN_CACHE_MISSES"):
+            return
+        try:
+            input_ids = getattr(model_worker_batch, "input_ids", None)
+            seq_lens = getattr(model_worker_batch, "seq_lens", None)
+            num_tokens = int(input_ids.shape[0]) if input_ids is not None else -1
+            padded_bs = int(seq_lens.shape[0]) if seq_lens is not None else -1
+            variant_key = (
+                "spec_phase",
+                phase,
+                str(model_worker_batch.forward_mode),
+                padded_bs,
+                num_tokens,
+                str(getattr(model_worker_batch, "capture_hidden_mode", None)),
+                self._spec_info_shape_sig(getattr(model_worker_batch, "spec_info", None)),
+            )
+            if self.target_worker.compilation_manager.register_variant_if_new(variant_key):
+                logger.warning("[PHASE4.5 new spec variant] %s", variant_key)
+        except Exception as exc:
+            logger.debug("Phase 4.5 register failed: %s", exc)
+
+    def _maybe_count_misses(self):
+        """Phase 4.5b helper: return a count_pjit_cpp_cache_miss context when
+        explain is on, else a no-op. Used by verify/draft/etc. to nest
+        sub-jit miss attribution. Calling the returned context value gives
+        the miss count when explain is on, 0 otherwise."""
+        import contextlib
+
+        import jax._src.test_util as jtu
+
+        if get_bool_env_var("SGLANG_JAX_EXPLAIN_CACHE_MISSES"):
+            return jtu.count_pjit_cpp_cache_miss()
+        return contextlib.nullcontext(lambda: 0)
+
     def _forward_batch_speculative_generation_inner(
         self,
         model_worker_batch: ModelWorkerBatch,
     ):
+        # Phase 4.6: split outer cache_miss_count into per-jit phases so we
+        # can attribute decode-tick miss counts to a specific sub-step
+        # (draft multi-step vs. target verify vs. draft refresh). Only wrap
+        # sub-jits when SGLANG_JAX_EXPLAIN_CACHE_MISSES=1; otherwise stay on
+        # the plain code path so instrumentation doesn't perturb cache state.
+        explain = get_bool_env_var("SGLANG_JAX_EXPLAIN_CACHE_MISSES")
+
+        def _maybe_count():
+            return self._maybe_count_misses()
+
         if model_worker_batch.forward_mode.is_extend():
             # FIXME(pc) add padding logic here
             if model_worker_batch.sampling_info.temperatures.ndim == 1:
@@ -105,13 +195,25 @@ class EAGLEWorker(BaseSpecWorker):
                 vocab_size=self.target_worker.model_config.vocab_size,
             )
             # target extend
-            logits_output, next_token_ids, cache_miss_count, bid, seq_lens = (
-                self.forward_target_extend(model_worker_batch, sampling_metadata)
-            )
+            self._maybe_warn_spec_variant("target_extend", model_worker_batch)
+            with _maybe_count() as c_target:
+                logits_output, next_token_ids, cache_miss_count, bid, seq_lens = (
+                    self.forward_target_extend(model_worker_batch, sampling_metadata)
+                )
+                n_target = c_target() if explain else 0
             # draft extend for Update Draft State
-            self.draft_worker.draft_extend_for_prefill(
-                model_worker_batch, logits_output.hidden_states, next_token_ids
-            )
+            self._maybe_warn_spec_variant("draft_extend_for_prefill", model_worker_batch)
+            with _maybe_count() as c_draft_prefill:
+                self.draft_worker.draft_extend_for_prefill(
+                    model_worker_batch, logits_output.hidden_states, next_token_ids
+                )
+                n_draft_prefill = c_draft_prefill() if explain else 0
+            if explain and (n_target or n_draft_prefill):
+                logger.warning(
+                    "[PHASE4.6 EXTEND] target=%d draft_extend_for_prefill=%d",
+                    n_target,
+                    n_draft_prefill,
+                )
             # FIXME(pc) refactor this to batch output
             batch_output = GenerationBatchResult(
                 logits_output=logits_output,
@@ -127,11 +229,28 @@ class EAGLEWorker(BaseSpecWorker):
 
         else:
             cur_allocate_lens = model_worker_batch.spec_info.allocate_lens
-            self.draft_worker.draft(model_worker_batch)
+            self._maybe_warn_spec_variant("draft_multi_step", model_worker_batch)
+            with _maybe_count() as c_draft:
+                self.draft_worker.draft(model_worker_batch)
+                n_draft = c_draft() if explain else 0
 
-            batch_output = self.verify(model_worker_batch, cur_allocate_lens)
+            self._maybe_warn_spec_variant("verify", model_worker_batch)
+            with _maybe_count() as c_verify:
+                batch_output = self.verify(model_worker_batch, cur_allocate_lens)
+                n_verify = c_verify() if explain else 0
 
-            self.draft_worker.draft_extend_for_decode(model_worker_batch, batch_output)
+            self._maybe_warn_spec_variant("draft_refresh", model_worker_batch)
+            with _maybe_count() as c_refresh:
+                self.draft_worker.draft_extend_for_decode(model_worker_batch, batch_output)
+                n_refresh = c_refresh() if explain else 0
+
+            if explain and (n_draft or n_verify or n_refresh):
+                logger.warning(
+                    "[PHASE4.6 DECODE tick] draft=%d verify=%d draft_extend_for_decode=%d",
+                    n_draft,
+                    n_verify,
+                    n_refresh,
+                )
 
             return batch_output
 
@@ -157,6 +276,7 @@ class EAGLEWorker(BaseSpecWorker):
     # -- Verify --
 
     def verify(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens: jax.Array):
+        explain = get_bool_env_var("SGLANG_JAX_EXPLAIN_CACHE_MISSES")
         spec_info: EagleVerifyInput = model_worker_batch.spec_info
         spec_info.allocate_lens = cur_allocate_lens
         spec_info.prepare_for_verify(model_worker_batch, self.page_size, self.target_worker)
@@ -164,24 +284,31 @@ class EAGLEWorker(BaseSpecWorker):
             model_worker_batch
         )
 
-        logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
-            model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
-        )
-        logits_output.next_token_logits, logits_output.hidden_states = replicate_to_mesh(
-            self.mesh, logits_output.next_token_logits, logits_output.hidden_states
-        )
+        # Phase 4.5b: target verify forward (jitted_run_model on target).
+        with self._maybe_count_misses() as c_target_forward:
+            logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
+                model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
+            )
+            n_target_forward = c_target_forward() if explain else 0
+        with self._maybe_count_misses() as c_replicate:
+            logits_output.next_token_logits, logits_output.hidden_states = replicate_to_mesh(
+                self.mesh, logits_output.next_token_logits, logits_output.hidden_states
+            )
+            n_replicate = c_replicate() if explain else 0
         spec_info.hidden_states = logits_output.hidden_states
-        (
-            predict,
-            verified_id,
-            accept_length,
-            accept_index,
-        ) = spec_info.sample(
-            model_worker_batch,
-            logits_output,
-            self.draft_worker.draft_model_runner.rngs,
-            self.mesh,
-        )
+        with self._maybe_count_misses() as c_sample:
+            (
+                predict,
+                verified_id,
+                accept_length,
+                accept_index,
+            ) = spec_info.sample(
+                model_worker_batch,
+                logits_output,
+                self.draft_worker.draft_model_runner.rngs,
+                self.mesh,
+            )
+            n_sample = c_sample() if explain else 0
         # accept_index uses -1 for rejected slots; gathering with -1 picks the
         # global last element, so dext later writes rejected tokens' draft-KV at
         # a foreign position inside each req's page (corrupts prefix KV for all
@@ -193,10 +320,20 @@ class EAGLEWorker(BaseSpecWorker):
         req_ids = np.arange(len(accept_index)) // accept_width
         per_req_last = req_ids * draft_n + draft_n - 1
         safe_index = np.where(accept_index >= 0, accept_index, per_req_last)
-        logits_output.next_token_logits = logits_output.next_token_logits[safe_index, :]
-        logits_output.hidden_states = logits_output.hidden_states[safe_index, :]
-        model_worker_batch.positions = model_worker_batch.positions[safe_index]
-        new_seq_lens = model_worker_batch.seq_lens + accept_length
+        with self._maybe_count_misses() as c_gather:
+            logits_output.next_token_logits = logits_output.next_token_logits[safe_index, :]
+            logits_output.hidden_states = logits_output.hidden_states[safe_index, :]
+            model_worker_batch.positions = model_worker_batch.positions[safe_index]
+            new_seq_lens = model_worker_batch.seq_lens + accept_length
+            n_gather = c_gather() if explain else 0
+        if explain and (n_target_forward or n_replicate or n_sample or n_gather):
+            logger.warning(
+                "[PHASE4.5b verify] target_forward=%d replicate=%d sample=%d gather=%d",
+                n_target_forward,
+                n_replicate,
+                n_sample,
+                n_gather,
+            )
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,
