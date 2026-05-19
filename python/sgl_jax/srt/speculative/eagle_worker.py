@@ -388,10 +388,18 @@ class EAGLEWorker(BaseSpecWorker):
                 n_sample,
                 n_gather,
             )
+        # Phase 4.8b: cur_allocate_lens above is padded to padded_bs to keep
+        # the verify/refresh JIT cache key stable. Strip the padding before
+        # handing it back to scheduler-visible state, otherwise
+        # ScheduleBatch.filter_batch will see allocate_lens shape > batch_size
+        # after a sibling req finishes and EagleDraftInput.prepare_for_decode
+        # asserts.
+        real_bs = int(model_worker_batch.real_bs)
+        scheduler_allocate_lens = cur_allocate_lens[:real_bs]
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,
-            allocate_lens=cur_allocate_lens,
+            allocate_lens=scheduler_allocate_lens,
             hidden_states=logits_output.hidden_states,
         )
 
@@ -402,7 +410,7 @@ class EAGLEWorker(BaseSpecWorker):
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
             # FIXME(pc) this field is for overlap
-            allocate_lens=cur_allocate_lens,
+            allocate_lens=scheduler_allocate_lens,
             bid=model_worker_batch.bid,
             cache_miss_count=cache_miss_count,
             extend_input_len_per_req=None,

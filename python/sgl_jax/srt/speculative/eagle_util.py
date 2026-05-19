@@ -681,12 +681,16 @@ class EagleDraftInput:
             self.topk_index = self.topk_index[: len(new_indices)]
             self.hidden_states = self.hidden_states[: len(new_indices)]
             self.verified_id = self.verified_id[: len(new_indices)]
+            if self.allocate_lens is not None:
+                self.allocate_lens = self.allocate_lens[: len(new_indices)]
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
             self.topk_p = self.topk_p[new_indices]
             self.topk_index = self.topk_index[new_indices]
             self.hidden_states = self.hidden_states[new_indices]
             self.verified_id = self.verified_id[new_indices]
+            if self.allocate_lens is not None:
+                self.allocate_lens = self.allocate_lens[new_indices]
 
     def merge_batch(self, spec_info: EagleDraftInput):
         # FIXME(pc) need support overlap here
