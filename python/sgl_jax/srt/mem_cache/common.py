@@ -125,9 +125,6 @@ def release_kv_cache(
     tree_cache.cache_finished_req(req, is_insert=is_insert)
 
     start_p, end_p = req.pop_overallocated_kv_cache()
-    assert (
-        start_p == end_p
-    ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
 
     page_size = tree_cache.page_size
     if page_size > 1:
@@ -135,6 +132,7 @@ def release_kv_cache(
 
     if start_p < end_p:
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx, start_p:end_p]
+        indices_to_free = indices_to_free[indices_to_free != 0]
         tree_cache.token_to_kv_pool_allocator.free(indices_to_free, dp_rank=dp_rank)
 
     tree_cache.req_to_token_pool.free(req)
