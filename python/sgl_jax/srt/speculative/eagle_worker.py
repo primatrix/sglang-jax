@@ -278,6 +278,25 @@ class EAGLEWorker(BaseSpecWorker):
     def verify(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens: jax.Array):
         explain = get_bool_env_var("SGLANG_JAX_EXPLAIN_CACHE_MISSES")
         spec_info: EagleVerifyInput = model_worker_batch.spec_info
+        # Phase 4.8b: cur_allocate_lens is captured from
+        # model_worker_batch.spec_info.allocate_lens BEFORE
+        # EagleDraftWorker.padding_for_decode pads it to padded_bs, so it
+        # arrives here at real_bs. Pad to padded_bs so the downstream
+        # refresh JIT (which uses cur_allocate_lens via
+        # GenerationBatchResult.allocate_lens -> EagleDraftInput.allocate_lens
+        # -> forward_batch[12][4] leaf) sees a stable bucket-sized shape
+        # instead of i32[real_bs] drifting across bs-bucket transitions.
+        # Padding rows are 0, matching the seq_lens=0 row convention used
+        # elsewhere (attention skips zeroed rows).
+        padded_bs_local = int(model_worker_batch.seq_lens.shape[0])
+        if cur_allocate_lens is not None and cur_allocate_lens.shape[0] < padded_bs_local:
+            pad_len = padded_bs_local - cur_allocate_lens.shape[0]
+            cur_allocate_lens = np.concatenate(
+                [
+                    np.asarray(cur_allocate_lens, dtype=np.int32),
+                    np.zeros(pad_len, dtype=np.int32),
+                ]
+            )
         spec_info.allocate_lens = cur_allocate_lens
         spec_info.prepare_for_verify(model_worker_batch, self.page_size, self.target_worker)
         # Phase 4.7: pad `out_cache_loc` to a fixed bucket size so the target
