@@ -599,6 +599,9 @@ class EagleDraftInput:
         info.seq_lens_sum = np.sum(info.seq_lens).item()
         info.out_cache_loc = out_cache_loc
 
+        for i, req in enumerate(info.reqs):
+            req.kv_allocated_len = int(new_allocate_lens[i])
+
     def prepare_for_draft_decode(
         self, model_worker_batch: ModelWorkerBatch, topk: int, num_steps: int
     ):

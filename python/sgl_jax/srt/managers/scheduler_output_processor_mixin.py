@@ -13,7 +13,6 @@ from sgl_jax.srt.managers.io_struct import AbortReq, BatchTokenIDOut
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 from sgl_jax.srt.mem_cache.common import release_kv_cache
 from sgl_jax.srt.precision_tracer import precision_tracer
-from sgl_jax.srt.utils.common_utils import cdiv
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.scheduler import (
@@ -344,28 +343,12 @@ class SchedulerOutputProcessorMixin:
                 elif self.spec_algorithm.is_eagle():
                     req.output_ids.extend([int(t) for t in next_token_id])
                     new_accepted_len = len(next_token_id)
+                    req.kv_committed_len += new_accepted_len
 
                 req.check_finished(new_accepted_len)
 
                 if req.finished():
                     self.maybe_collect_routed_experts(req)
-                    if batch.spec_algorithm is not None and batch.spec_algorithm.is_eagle():
-                        cur_allocate_len = info.spec_info.allocate_lens[i]
-                        all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-                        if self.page_size > 1:
-                            all_token_len = cdiv(all_token_len, self.page_size) * self.page_size
-                        kv_indices = self.req_to_token_pool.req_to_token[
-                            req.req_pool_idx,
-                            all_token_len:cur_allocate_len,
-                        ]
-                        kv_indices = kv_indices[kv_indices != 0]
-                        from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
-
-                        assert (
-                            len(kv_indices) <= EagleDraftInput.ALLOC_LEN_PER_DECODE
-                        ), f"redundant kv indices {len(kv_indices)=} should less than {EagleDraftInput.ALLOC_LEN_PER_DECODE=}"
-
-                        self.token_to_kv_pool_allocator.free(kv_indices, dp_rank)
                     # End trace for finished request
                     if precision_tracer.get_trace_active():
                         precision_tracer.set_request_status_to_completed(req.rid)
