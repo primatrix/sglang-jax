@@ -276,8 +276,32 @@ class EagleDraftWorker(BaseDraftWorker):
             self.speculative_num_draft_tokens,
         )
 
+        # Phase 4.7: pad `out_cache_loc` on host (numpy) before
+        # ForwardBatch.init_new uploads it, so the draft refresh JIT sees
+        # a stable bucket-sized forward_batch[3] shape. Snapshot the
+        # original (scheduler-owned slot list) and restore after the
+        # forward; mutating it permanently leaks KV slots because
+        # scheduler release would walk past the real allocations.
+        # Padding rows point at slot 0 (dummy; not consumed because
+        # extend_seq_lens zeros padding rows).
+        padded_bs = int(model_worker_batch.seq_lens.shape[0])
+        out_cache_loc_target = padded_bs * (self.speculative_num_steps + 1)
+        original_out_cache_loc = model_worker_batch.out_cache_loc
+        if (
+            original_out_cache_loc is not None
+            and original_out_cache_loc.shape[0] < out_cache_loc_target
+        ):
+            pad_len = out_cache_loc_target - original_out_cache_loc.shape[0]
+            model_worker_batch.out_cache_loc = np.concatenate(
+                [
+                    np.asarray(original_out_cache_loc, dtype=np.int32),
+                    np.zeros(pad_len, dtype=np.int32),
+                ]
+            )
+
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
         if forward_batch.input_ids.shape[0] <= 0:
+            model_worker_batch.out_cache_loc = original_out_cache_loc
             return
         with _maybe_count_misses() as c_draft_fwd:
             draft_logits_output, _, _ = self.draft_model_runner.forward(
@@ -285,6 +309,8 @@ class EagleDraftWorker(BaseDraftWorker):
                 logits_metadata=logits_metadata,
             )
             n_draft_fwd = c_draft_fwd() if explain else 0
+        # Restore so scheduler KV release sees the original slot set.
+        model_worker_batch.out_cache_loc = original_out_cache_loc
         # Phase 4.3 (F4): build select_index at padded_bs so the gather output
         # (rep_logits[select_index], rep_hidden[select_index]) hits the
         # precompiled (padded_bs, V/hidden) cache key in topk_probs_from_logits.

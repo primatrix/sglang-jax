@@ -280,6 +280,37 @@ class EAGLEWorker(BaseSpecWorker):
         spec_info: EagleVerifyInput = model_worker_batch.spec_info
         spec_info.allocate_lens = cur_allocate_lens
         spec_info.prepare_for_verify(model_worker_batch, self.page_size, self.target_worker)
+        # Phase 4.7: pad `out_cache_loc` to a fixed bucket size so the target
+        # verify JIT sees a stable `forward_batch[3]` shape. The scheduler's
+        # `prepare_for_decode` allocates `extend_num_tokens` slots per tick
+        # whose count drifts with per-request accept_lens, so without
+        # padding the verify JIT recompiles every tick.
+        #
+        # Pad on host (numpy) and let ForwardBatch.init_new pick up the
+        # padded array as the device-side `out_cache_loc`. We snapshot
+        # the original out_cache_loc, swap in the padded copy, then
+        # restore so the scheduler-visible `model_worker_batch.out_cache_loc`
+        # still has the exact slot count it allocated (mutating it
+        # permanently leaked 256 KV slots and tripped check_memory).
+        #
+        # Padding rows point at slot 0 — a dummy slot the scheduler never
+        # tracks, masked off by extend_seq_lens=0 — so writes are dead
+        # stores and the slot 0 KV is never read back.
+        padded_bs = int(model_worker_batch.seq_lens.shape[0])
+        out_cache_loc_target = padded_bs * self.speculative_num_draft_tokens
+        original_out_cache_loc = model_worker_batch.out_cache_loc
+        if (
+            original_out_cache_loc is not None
+            and original_out_cache_loc.shape[0] < out_cache_loc_target
+        ):
+            pad_len = out_cache_loc_target - original_out_cache_loc.shape[0]
+            padded = np.concatenate(
+                [
+                    np.asarray(original_out_cache_loc, dtype=np.int32),
+                    np.zeros(pad_len, dtype=np.int32),
+                ]
+            )
+            model_worker_batch.out_cache_loc = padded
         forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
@@ -290,6 +321,10 @@ class EAGLEWorker(BaseSpecWorker):
                 model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
             )
             n_target_forward = c_target_forward() if explain else 0
+        # Restore scheduler-visible out_cache_loc so KV release after the
+        # forward sees the original (un-padded) slot set; otherwise the
+        # padded-to-slot-0 view leaks KV slots.
+        model_worker_batch.out_cache_loc = original_out_cache_loc
         with self._maybe_count_misses() as c_replicate:
             logits_output.next_token_logits, logits_output.hidden_states = replicate_to_mesh(
                 self.mesh, logits_output.next_token_logits, logits_output.hidden_states
