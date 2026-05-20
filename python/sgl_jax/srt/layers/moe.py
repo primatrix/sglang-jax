@@ -419,6 +419,13 @@ class EPMoE(nnx.Module):
         # pre-replicated to ``P(None)``; hoisting the decision keeps it safe
         # if that ever changes.
         do_scatter = should_scatter(hidden_states.shape[0], self.tp_size)
+        jax.debug.print(
+            "EPMoE.__call__ debug: tokens={t}, tp_size={tp}, do_scatter={s}, input_sharding={sh}",
+            t=hidden_states.shape[0],
+            tp=self.tp_size,
+            s=do_scatter,
+            sh=str(hidden_states.sharding),
+        )
 
         # Run MoE computation on the expert-parallel mesh
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
