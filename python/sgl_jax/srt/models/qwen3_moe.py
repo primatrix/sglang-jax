@@ -319,6 +319,15 @@ class QWen3MoeDecoderLayer(nnx.Module):
 
             if self.use_fused:
                 token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
+                # Reshard topk_ids to the simpler ("data", None) sharding so it
+                # broadcasts with token_valid_mask which always has ("data",)
+                # sharding from forward_batch metadata. The downstream FusedEPMoE
+                # reshards its inputs to P(None) inside its abstract-mesh scope
+                # anyway, so this reshard isn't an extra cost.
+                topk_ids = jax.sharding.reshard(
+                    topk_ids,
+                    jax.sharding.NamedSharding(self.mesh, P("data", None)),
+                )
                 topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
             else:
                 pass
