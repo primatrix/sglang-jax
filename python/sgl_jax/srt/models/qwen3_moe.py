@@ -290,6 +290,13 @@ class QWen3MoeDecoderLayer(nnx.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
+            # Reshard residual to match hidden_states' sharding. Cross-layer:
+            # the previous layer's mlp output (hidden_states) may be reduce-
+            # scattered to (("data","tensor"), None) by row-parallel auto-scatter,
+            # but the saved residual can have a different sharding (intermediate
+            # ops like layernorm may not preserve the scattered axis end-to-end).
+            # Mirrors the same reshard already done after self_attn below.
+            residual = jax.sharding.reshard(residual, jax.typeof(hidden_states).sharding)
             hidden_states += residual
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -383,6 +390,8 @@ class QWen3MoeModel(nnx.Module):
             layers_topk_ids.append(topk_ids)
 
         if residual is not None:
+            # Same cross-layer reshard reason as the decoder layer's else branch.
+            residual = jax.sharding.reshard(residual, jax.typeof(hidden_states).sharding)
             hidden_states += residual
             hidden_states = self.norm(hidden_states)
         else:
