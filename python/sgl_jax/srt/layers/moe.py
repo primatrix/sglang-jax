@@ -420,11 +420,12 @@ class EPMoE(nnx.Module):
         # if that ever changes.
         do_scatter = should_scatter(hidden_states.shape[0], self.tp_size)
         jax.debug.print(
-            "EPMoE.__call__ debug: tokens={t}, tp_size={tp}, do_scatter={s}, input_sharding={sh}",
+            "EPMoE.__call__ debug: tokens={t}, local_tp_size={tp}, global_tensor={gt}, do_scatter={s}, input_sharding={sh}",
             t=hidden_states.shape[0],
             tp=self.tp_size,
+            gt=self.mesh.shape.get("tensor", 1),
             s=do_scatter,
-            sh=str(hidden_states.sharding),
+            sh=str(jax.typeof(hidden_states).sharding),
         )
 
         # Run MoE computation on the expert-parallel mesh
