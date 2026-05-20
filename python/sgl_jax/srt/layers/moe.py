@@ -418,9 +418,7 @@ class EPMoE(nnx.Module):
         # in ``QuantizedLinear``). Safe today only because input is
         # pre-replicated to ``P(None)``; hoisting the decision keeps it safe
         # if that ever changes.
-        do_scatter = self.enable_sequence_parallel and should_scatter(
-            hidden_states.shape[0], self.tp_size
-        )
+        do_scatter = should_scatter(hidden_states.shape[0], self.tp_size)
 
         # Run MoE computation on the expert-parallel mesh
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
