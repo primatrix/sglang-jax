@@ -418,15 +418,14 @@ class EPMoE(nnx.Module):
         # in ``QuantizedLinear``). Safe today only because input is
         # pre-replicated to ``P(None)``; hoisting the decision keeps it safe
         # if that ever changes.
-        do_scatter = should_scatter(hidden_states.shape[0], self.tp_size)
-        jax.debug.print(
-            "EPMoE.__call__ debug: tokens={t}, local_tp_size={tp}, global_tensor={gt}, do_scatter={s}, input_sharding={sh}",
-            t=hidden_states.shape[0],
-            tp=self.tp_size,
-            gt=self.mesh.shape.get("tensor", 1),
-            s=do_scatter,
-            sh=str(jax.typeof(hidden_states).sharding),
-        )
+        #
+        # Use the *global* "tensor" axis size, not ``self.tp_size`` which is
+        # the within-MoE tp count (world_size / ep_size). For configs where
+        # ep_size == world_size (e.g. TP=EP=8), ``self.tp_size`` is 1 and
+        # ``should_scatter`` would always return False, leaving EPMoE out of
+        # sync with LinearBase's auto-scatter on the global tensor axis.
+        global_tensor_size = self.mesh.shape.get("tensor", 1)
+        do_scatter = should_scatter(hidden_states.shape[0], global_tensor_size)
 
         # Run MoE computation on the expert-parallel mesh
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
