@@ -28,6 +28,26 @@ logger = logging.getLogger(__name__)
 init_fn = nnx.initializers.uniform()
 
 
+def _sh(x):
+    """Return sharding repr; handles None and trace errors."""
+    if x is None:
+        return "None"
+    try:
+        return str(jax.typeof(x).sharding.spec)
+    except Exception as e:
+        return f"<err:{e}>"
+
+
+def _trace(label, layer_id, **arrays):
+    """Print trace-time sharding info. Only fires for layer_id <= 1 to limit output."""
+    if layer_id is not None and layer_id > 1:
+        return
+    parts = [f"[SHARD] layer={layer_id} {label}"]
+    for name, arr in arrays.items():
+        parts.append(f"{name}={_sh(arr)}")
+    print(" | ".join(parts), flush=True)
+
+
 class QWen3MoeAttention(nnx.Module):
     def __init__(
         self,
@@ -286,13 +306,16 @@ class QWen3MoeDecoderLayer(nnx.Module):
         residual: jax.Array | None = None,
         dispatch_info: ExpertLocationMetadata | None = None,
     ):
+        _trace("entry", self.layer_id, hidden_states=hidden_states, residual=residual)
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
+            _trace("else: pre-add", self.layer_id, hidden_states=hidden_states, residual=residual)
             hidden_states += residual
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        _trace("after input_layernorm", self.layer_id, hidden_states=hidden_states, residual=residual)
 
         hidden_states, kv_fused = self.self_attn(
             positions=positions,
@@ -300,15 +323,21 @@ class QWen3MoeDecoderLayer(nnx.Module):
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
         )
+        _trace("after self_attn", self.layer_id, hidden_states=hidden_states, residual=residual)
 
         residual = jax.sharding.reshard(residual, jax.typeof(hidden_states).sharding)
+        _trace("after candidate-reshard(residual)", self.layer_id, hidden_states=hidden_states, residual=residual)
         hidden_states += residual
+        _trace("after post-attn add", self.layer_id, hidden_states=hidden_states, residual=residual)
         residual = hidden_states
+        _trace("after residual=hidden_states", self.layer_id, hidden_states=hidden_states, residual=residual)
         hidden_states = self.post_attention_layernorm(hidden_states)
+        _trace("after post_attn_layernorm", self.layer_id, hidden_states=hidden_states, residual=residual)
 
         if self.is_moe_layer:
             router_logits = self.moe_gate(hidden_states)
             topk_weights, topk_ids = self.topk(router_logits, dispatch_info=dispatch_info)
+            _trace("after gate+topk", self.layer_id, hidden_states=hidden_states, residual=residual, topk_ids=topk_ids)
 
             if self.use_fused:
                 token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
@@ -319,7 +348,9 @@ class QWen3MoeDecoderLayer(nnx.Module):
         else:
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
+        _trace("after mlp", self.layer_id, hidden_states=hidden_states, residual=residual)
 
+        _trace("RETURN", self.layer_id, hidden_states=hidden_states, residual=residual)
         return hidden_states, residual, kv_fused, jax.sharding.reshard(topk_ids, P(None))
 
 
@@ -367,10 +398,12 @@ class QWen3MoeModel(nnx.Module):
         token_to_kv_pool: KVCache,
     ) -> tuple[jax.Array, list[jax.Array]]:
         hidden_states = self.embed_tokens(forward_batch.input_ids)
+        _trace("Model.entry (post-embed)", None, hidden_states=hidden_states)
         residual = None
         layers_kv_fused = []
         layers_topk_ids = []
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
+            _trace("Model.loop pre-call", i, hidden_states=hidden_states, residual=residual)
             hidden_states, residual, kv_fused, topk_ids = layer(
                 forward_batch.positions,
                 hidden_states,
@@ -379,10 +412,12 @@ class QWen3MoeModel(nnx.Module):
                 residual,
                 dispatch_info=forward_batch.expert_location_metadata,
             )
+            _trace("Model.loop post-call", i, hidden_states=hidden_states, residual=residual)
             layers_kv_fused.append(kv_fused)
             layers_topk_ids.append(topk_ids)
 
         if residual is not None:
+            _trace("Model.final pre-add", None, hidden_states=hidden_states, residual=residual)
             hidden_states += residual
             hidden_states = self.norm(hidden_states)
         else:
