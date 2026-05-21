@@ -76,6 +76,8 @@ class FusedEPMoE(nnx.Module):
         disable_all_reduce_metadata: bool = False,
         disable_sync_barrier: bool = False,
         use_jax_allreduce_metadata: bool = True,
+        input_sharding: jax.sharding.Sharding | None = None,
+        output_sharding: jax.sharding.Sharding | None = None,
     ):
         self.hidden_size = hidden_size
         self.num_experts_per_tok = num_experts_per_tok
@@ -105,6 +107,8 @@ class FusedEPMoE(nnx.Module):
         self.disable_all_reduce_metadata = disable_all_reduce_metadata
         self.disable_sync_barrier = disable_sync_barrier
         self.use_jax_allreduce_metadata = use_jax_allreduce_metadata
+        self.input_sharding = input_sharding
+        self.output_sharding = output_sharding
 
         metadata = get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
@@ -436,6 +440,16 @@ class FusedEPMoE(nnx.Module):
                     out_sharding=P(None, None, None),
                 )
 
+    def effective_input_sharding(self, shape: tuple[int, ...]) -> jax.sharding.Sharding:
+        return self.input_sharding or NamedSharding(
+            self.mesh, P("data", *([None] * (len(shape) - 1)))
+        )
+
+    def effective_output_sharding(self, shape: tuple[int, ...]) -> jax.sharding.Sharding:
+        return self.output_sharding or NamedSharding(
+            self.mesh, P("data", *([None] * (len(shape) - 1)))
+        )
+
     def __call__(
         self,
         hidden_states: jax.Array,
@@ -457,6 +471,14 @@ class FusedEPMoE(nnx.Module):
             MoE layer output, same shape as hidden_states
         """
         assert hidden_states.ndim == 2
+        if self.input_sharding is not None:
+            input_sharding = self.effective_input_sharding(hidden_states.shape)
+            token_axis = input_sharding.spec[0]
+            hidden_states = jax.sharding.reshard(hidden_states, input_sharding)
+            topk_weights = jax.sharding.reshard(
+                topk_weights, NamedSharding(self.mesh, P(token_axis, None))
+            )
+            topk_ids = jax.sharding.reshard(topk_ids, NamedSharding(self.mesh, P(token_axis, None)))
 
         w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
         w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
@@ -514,5 +536,5 @@ class FusedEPMoE(nnx.Module):
             tp_axis_name="tensor",
         )
 
-        output = jax.sharding.reshard(output, NamedSharding(self.mesh, P("data", None)))
+        output = jax.sharding.reshard(output, self.effective_output_sharding(hidden_states.shape))
         return output

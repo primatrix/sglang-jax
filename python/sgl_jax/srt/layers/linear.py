@@ -11,9 +11,21 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import expand_block_scale
 from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul_local
-from sgl_jax.srt.utils.parallel_utils import prepare_scattered_spec_if_needed
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
+
+
+def _shard_map_output_partition_dim(
+    sharding: jax.sharding.Sharding, axis_name: str | None
+) -> int | None:
+    if axis_name is None:
+        return None
+    for dim, axis in enumerate(sharding.spec):
+        if axis == axis_name:
+            return dim
+        if isinstance(axis, tuple) and axis_name in axis:
+            return dim
+    return None
 
 
 class LinearBase(nnx.Module):
@@ -40,7 +52,8 @@ class LinearBase(nnx.Module):
         params_dtype: jnp.dtype | None = jnp.bfloat16,
         kernel_axes: Sequence[str | None] | None = None,
         scope_name: str = "linear_base",
-        output_scatter_dimension: int | None = None,
+        input_sharding: jax.sharding.Sharding | None = None,
+        output_sharding: jax.sharding.Sharding | None = None,
     ):
         """Initialize parameters and quantization method."""
         self.skip_bias_add = skip_bias_add
@@ -48,7 +61,8 @@ class LinearBase(nnx.Module):
         self.kernel_axes = kernel_axes
         self.mesh = mesh
         self.name = scope_name
-        self.output_scatter_dimension = output_scatter_dimension
+        self.input_sharding = input_sharding
+        self.output_sharding = output_sharding
 
         self.weight = nnx.Param(
             jax.random.normal(
@@ -70,11 +84,23 @@ class LinearBase(nnx.Module):
         else:
             self.bias = None
 
+    def effective_input_sharding(self, shape: tuple[int, ...]) -> jax.sharding.Sharding:
+        return self.input_sharding or NamedSharding(
+            self.mesh, P("data", *([None] * (len(shape) - 1)))
+        )
+
+    def effective_output_sharding(self, shape: tuple[int, ...]) -> jax.sharding.Sharding:
+        output_axis = self.kernel_axes[-1]
+        default_output_layout = P("data", *([None] * (len(shape) - 2)), output_axis)
+        return self.output_sharding or NamedSharding(self.mesh, default_output_layout)
+
     @named_scope
     def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         """Forward pass of the linear layer."""
-        output_pspec = P("data", *([None] * (x.ndim - 2)), self.kernel_axes[-1])
-        output_sharding = NamedSharding(self.mesh, output_pspec)
+        if self.input_sharding is not None:
+            x = jax.sharding.reshard(x, self.input_sharding)
+
+        output_sharding = self.effective_output_sharding(x.shape)
         out = lax.dot_general(
             x,
             self.weight.value,
@@ -214,7 +240,8 @@ class QuantizedLinear(nnx.Module):
         weight_block_size: tuple[int, int] | None = None,
         allow_narrow_n_blockwise: bool = False,
         scope_name: str = "quantized_linear",
-        output_scatter_dimension: int | None = None,
+        input_sharding: jax.sharding.Sharding | None = None,
+        output_sharding: jax.sharding.Sharding | None = None,
     ):
         """Initialize the quantized linear layer with pre-quantized weights."""
         # Auto-expand 2D block-quant scale to 3D kernel-ready layout.
@@ -242,7 +269,8 @@ class QuantizedLinear(nnx.Module):
         self.weight_block_size = weight_block_size
         self.allow_narrow_n_blockwise = allow_narrow_n_blockwise
         self.name = scope_name
-        self.output_scatter_dimension = output_scatter_dimension
+        self.input_sharding = input_sharding
+        self.output_sharding = output_sharding
 
     @classmethod
     def from_linear(
@@ -381,7 +409,8 @@ class QuantizedLinear(nnx.Module):
             weight_block_size=effective_weight_block_size,
             allow_narrow_n_blockwise=allow_narrow_n_blockwise,
             scope_name=f"quantized_{linear.name}",
-            output_scatter_dimension=linear.output_scatter_dimension,
+            input_sharding=linear.input_sharding,
+            output_sharding=linear.output_sharding,
         )
 
     @named_scope
@@ -395,6 +424,9 @@ class QuantizedLinear(nnx.Module):
             Tuple of (output, bias) where output is [..., output_size]
             and bias is returned if skip_bias_add is True
         """
+        if self.input_sharding is not None:
+            x = jax.sharding.reshard(x, self.input_sharding)
+
         # Determine if we should quantize activations.
         quantize_activation = self.activation_dtype is not None
 
@@ -422,21 +454,8 @@ class QuantizedLinear(nnx.Module):
             w_scale_spec = P(output_axis)
         in_specs = (P("data", input_axis), P(output_axis, input_axis), w_scale_spec)
 
-        out_specs = P("data", output_axis)
-
-        # When ``output_scatter_dimension`` is set, stack ``input_axis`` onto
-        # whatever already partitions that dim (e.g. ``"data"`` from DP) so
-        # DP+SP compose.
-        if self.output_scatter_dimension is not None:
-            out_specs, do_scatter = prepare_scattered_spec_if_needed(
-                out_specs,
-                self.output_scatter_dimension,
-                scatter_axis=input_axis,
-                full_dim_size=x.shape[self.output_scatter_dimension],
-                mesh=self.mesh,
-            )
-        else:
-            do_scatter = False
+        output_sharding = self.output_sharding or NamedSharding(self.mesh, P("data", output_axis))
+        output_partition_dim = _shard_map_output_partition_dim(output_sharding, input_axis)
 
         output = shard_map(
             partial(
@@ -447,13 +466,11 @@ class QuantizedLinear(nnx.Module):
                 weight_block_size=self.weight_block_size,
                 activation_quant_dtype=self.activation_dtype,
                 allow_narrow_n_blockwise=self.allow_narrow_n_blockwise,
-                # Pass the dim only when we've actually decided to scatter,
-                # so the kernel doesn't need to second-guess us.
-                output_scatter_dimension=self.output_scatter_dimension if do_scatter else None,
+                output_scatter_dimension=output_partition_dim,
             ),
             mesh=self.mesh,
             in_specs=in_specs,
-            out_specs=out_specs,
+            out_specs=output_sharding.spec,
             check_vma=False,
         )(x_2d, self.weight_q.value, scale_val)
 

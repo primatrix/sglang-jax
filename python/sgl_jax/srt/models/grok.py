@@ -195,7 +195,11 @@ class Grok1MLP(nnx.Module):
             params_dtype=dtype,
             kernel_axes=("tensor", None),
             mesh=mesh,
-            output_scatter_dimension=0 if enable_sequence_parallel else None,
+            output_sharding=(
+                NamedSharding(mesh, P(("data", "tensor"), None))
+                if enable_sequence_parallel
+                else None
+            ),
         )
         self.act_fn = GeluAndMul(approximate="tanh")
         self.layer_id = layer_id
@@ -289,7 +293,11 @@ class Grok1MoE(nnx.Module):
                 dtype=dtype,
                 layer_id=layer_id,
                 quantization_config=getattr(config, "quantization_config", None),
-                enable_sequence_parallel=getattr(config, "enable_sequence_parallel", False),
+                output_sharding=(
+                    NamedSharding(mesh, P(("data", "tensor"), None))
+                    if getattr(config, "enable_sequence_parallel", False)
+                    else None
+                ),
             )
 
     @log_shardings("GrokMoE")
@@ -457,7 +465,11 @@ class Grok1Attention(nnx.Module):
             params_dtype=jnp.bfloat16,
             kernel_axes=("tensor", None),
             mesh=mesh,
-            output_scatter_dimension=0 if enable_sequence_parallel else None,
+            output_sharding=(
+                NamedSharding(mesh, P(("data", "tensor"), None))
+                if enable_sequence_parallel
+                else None
+            ),
         )
 
         # Initialize rotary embeddings based on scaling configuration

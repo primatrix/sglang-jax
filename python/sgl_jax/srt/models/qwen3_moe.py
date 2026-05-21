@@ -98,6 +98,7 @@ class QWen3MoeAttention(nnx.Module):
             kernel_axes=("tensor", None),
             params_dtype=dtype,
             mesh=mesh,
+            output_sharding=NamedSharding(mesh, P(("data", "tensor"), None)),
         )
         self.rotary_emb = RotaryEmbedding(
             head_size=self.head_dim,
@@ -115,6 +116,9 @@ class QWen3MoeAttention(nnx.Module):
             layer_id=layer_id,
         )
 
+    def effective_output_sharding(self, shape: tuple[int, ...]) -> jax.sharding.Sharding:
+        return self.c_proj.effective_output_sharding(shape)
+
     def __call__(
         self,
         positions: jax.Array,
@@ -122,6 +126,10 @@ class QWen3MoeAttention(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
     ) -> tuple[jax.Array, jax.Array]:
+        hidden_states = jax.sharding.reshard(
+            hidden_states,
+            NamedSharding(self.mesh, P("data", None)),
+        )
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
@@ -237,6 +245,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
             )
 
             if self.use_fused:
+                moe_sharding = NamedSharding(mesh, P(("data", "tensor"), None))
                 self.mlp = FusedEPMoE(
                     hidden_size=config.hidden_size,
                     num_experts=num_experts,
@@ -250,8 +259,11 @@ class QWen3MoeDecoderLayer(nnx.Module):
                     layer_id=layer_id,
                     renormalize_topk_logits=config.norm_topk_prob,
                     quantization_config=getattr(config, "quantization_config", None),
+                    input_sharding=moe_sharding,
+                    output_sharding=moe_sharding,
                 )
             else:
+                moe_sharding = NamedSharding(mesh, P(("data", "tensor"), None))
                 self.mlp = EPMoE(
                     hidden_size=config.hidden_size,
                     num_experts=num_experts,
@@ -263,6 +275,8 @@ class QWen3MoeDecoderLayer(nnx.Module):
                     dtype=dtype,
                     layer_id=layer_id,
                     quantization_config=getattr(config, "quantization_config", None),
+                    input_sharding=moe_sharding,
+                    output_sharding=moe_sharding,
                 )
             self.is_moe_layer = True
 
@@ -301,6 +315,10 @@ class QWen3MoeDecoderLayer(nnx.Module):
             token_to_kv_pool=token_to_kv_pool,
         )
 
+        residual = jax.sharding.reshard(
+            residual,
+            self.self_attn.effective_output_sharding(hidden_states.shape),
+        )
         hidden_states += residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -311,15 +329,29 @@ class QWen3MoeDecoderLayer(nnx.Module):
 
             if self.use_fused:
                 token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
+                topk_axis = self.mlp.effective_input_sharding(hidden_states.shape).spec[0]
+                token_valid_mask = jax.sharding.reshard(
+                    token_valid_mask,
+                    NamedSharding(self.mesh, P(topk_axis)),
+                )
+                topk_ids = jax.sharding.reshard(
+                    topk_ids,
+                    NamedSharding(self.mesh, P(topk_axis, None)),
+                )
                 topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
             else:
                 pass
             hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
         else:
+            hidden_states = jax.sharding.reshard(
+                hidden_states,
+                NamedSharding(self.mesh, P("data", None)),
+            )
             hidden_states = self.mlp(hidden_states)
+            residual = jax.sharding.reshard(residual, NamedSharding(self.mesh, P("data", None)))
             topk_ids = None
 
-        return hidden_states, residual, kv_fused, jax.sharding.reshard(topk_ids, P(None))
+        return hidden_states, residual, kv_fused, topk_ids
 
 
 class QWen3MoeModel(nnx.Module):

@@ -1,5 +1,6 @@
 """GMM-based Expert-Parallel MoE layer and weight mapping utilities."""
 
+import math
 from functools import partial
 
 import jax
@@ -15,7 +16,6 @@ from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
 # Re-export for backward compatibility: external code imports from this module.
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE  # noqa: F401
 from sgl_jax.srt.layers.gate import GateLogit, TopK  # noqa: F401
-from sgl_jax.srt.utils.parallel_utils import should_scatter
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import (
     quantize_tensor,
@@ -40,7 +40,8 @@ class EPMoE(nnx.Module):
         quantization_config=None,
         physical_to_logical_map: "jax.Array | None" = None,
         pre_gather_quant_dtype=None,
-        enable_sequence_parallel=False,
+        input_sharding: jax.sharding.Sharding | None = None,
+        output_sharding: jax.sharding.Sharding | None = None,
     ):
         self.num_experts_per_tok = num_experts_per_tok
         self.physical_to_logical_map = physical_to_logical_map
@@ -61,7 +62,8 @@ class EPMoE(nnx.Module):
         self.mesh = mesh
         self.activation = activation
         self.hidden_size = hidden_size
-        self.enable_sequence_parallel = enable_sequence_parallel
+        self.input_sharding = input_sharding
+        self.output_sharding = output_sharding
 
         # Get quantization settings from config
         self.quantized_dtype = (
@@ -78,7 +80,7 @@ class EPMoE(nnx.Module):
             raise ValueError(
                 f"num_experts({self.num_experts}) must be divisible by ep_size ({self.ep_size})"
             )
-        world_size = self.mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
+        world_size = math.prod(self.mesh.shape.values())
         self.tp_size = world_size // self.ep_size
         self.experts_per_device = self.num_experts // self.ep_size
 
@@ -404,23 +406,40 @@ class EPMoE(nnx.Module):
                 out_sharding=P("expert", None, None, None),
             )
 
+    def effective_input_sharding(self, shape: tuple[int, ...]) -> jax.sharding.Sharding:
+        return self.input_sharding or jax.sharding.NamedSharding(
+            self.mesh, P("data", *([None] * (len(shape) - 1)))
+        )
+
+    def effective_output_sharding(self, shape: tuple[int, ...]) -> jax.sharding.Sharding:
+        return self.output_sharding or jax.sharding.NamedSharding(
+            self.mesh, P("data", *([None] * (len(shape) - 1)))
+        )
+
     @named_scope
     def __call__(self, hidden_states, topk_weights, topk_ids) -> jax.Array:
         # Activation quantization is now handled per-GEMM inside _gmm_compute
         # (aligned with sglang-gpu scheme: quantize before each GEMM, dequantize after)
+        if self.input_sharding is not None:
+            input_sharding = self.effective_input_sharding(hidden_states.shape)
+            token_axis = input_sharding.spec[0]
+            hidden_states = jax.sharding.reshard(hidden_states, input_sharding)
+            topk_weights = jax.sharding.reshard(
+                topk_weights,
+                jax.sharding.NamedSharding(self.mesh, P(token_axis, None)),
+            )
+            topk_ids = jax.sharding.reshard(
+                topk_ids,
+                jax.sharding.NamedSharding(self.mesh, P(token_axis, None)),
+            )
 
-        # Decide once whether SP should reduce-scatter the post-MoE result.
-        # Three things downstream consume this: the shard_map ``out_specs``,
-        # ``_forward``'s ``psum`` vs ``psum_scatter`` choice, and the
-        # post-shard_map reshard back to the original mesh. They MUST agree
-        # — if they ever diverge, ``out_specs`` lies about what the kernel
-        # produced and shard_map concatenates duplicates (see the bug fixed
-        # in ``QuantizedLinear``). Safe today only because input is
-        # pre-replicated to ``P(None)``; hoisting the decision keeps it safe
-        # if that ever changes.
-        do_scatter = self.enable_sequence_parallel and should_scatter(
-            hidden_states.shape[0], self.tp_size
-        )
+        output_sharding = self.effective_output_sharding(hidden_states.shape)
+        if self.output_sharding is not None:
+            out_specs = P("tensor", *([None] * (hidden_states.ndim - 1)))
+            do_scatter = True
+        else:
+            out_specs = P(*([None] * hidden_states.ndim))
+            do_scatter = False
 
         # Run MoE computation on the expert-parallel mesh
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
@@ -445,7 +464,6 @@ class EPMoE(nnx.Module):
                 scale_name="wo_scale",
             )
 
-            out_specs = P("tensor", None) if do_scatter else P(None)
             result = shard_map(
                 partial(self._forward, do_scatter=do_scatter),
                 mesh=self.moe_mesh,
@@ -488,9 +506,7 @@ class EPMoE(nnx.Module):
         # "tensor" axis; preserve that by combining ``"data"`` with
         # ``"tensor"`` on the original mesh so the next decoder layer keeps
         # the SP shard. Otherwise fall back to DP-only on ``"data"``.
-        token_axis = ("data", "tensor") if do_scatter else "data"
-        out_pspec = P(token_axis, *([None] * (result.ndim - 1)))
-        return jax.sharding.reshard(result, jax.sharding.NamedSharding(self.mesh, out_pspec))
+        return jax.sharding.reshard(result, output_sharding)
 
     def _forward(
         self,
