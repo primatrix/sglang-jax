@@ -1179,6 +1179,11 @@ class Scheduler(
         ret["new_token_ratio"] = self.new_token_ratio
         ret["init_new_token_ratio"] = self.init_new_token_ratio
 
+        if self.spec_num_total_forward_ct > 0:
+            ret["avg_spec_accept_length"] = (
+                self.spec_num_total_accepted_tokens / self.spec_num_total_forward_ct
+            )
+
         return GetInternalStateReqOutput(internal_state=ret)
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
