@@ -175,6 +175,7 @@ class CompletionRequest(BaseModel):
 
     # For request id
     rid: list[str] | str | None = None
+    disagg_transfer_id: list[str] | str | None = None
 
     return_routed_experts: list[bool] | bool | None = None
 
@@ -436,6 +437,7 @@ class ChatCompletionRequest(BaseModel):
 
     # For request id
     rid: list[str] | str | None = None
+    disagg_transfer_id: list[str] | str | None = None
 
     # For PD disaggregation
     bootstrap_host: str | None = None

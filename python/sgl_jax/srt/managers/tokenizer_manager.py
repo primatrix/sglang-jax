@@ -3,6 +3,8 @@
 import asyncio
 import contextlib
 import copy
+import zlib
+from urllib.parse import urlparse
 import dataclasses
 import json
 import logging
@@ -371,6 +373,68 @@ class TokenizerManager:
             obj.lora_id,
             obj.extra_key,
             obj.return_routed_experts,
+        )
+
+        # PD disaggregation passthrough (Stage 2). When the engine is
+        # running in disaggregation_mode=decode, the request body MUST
+        # carry bootstrap_{host,port,room}; reject early instead of
+        # propagating a half-populated tokenized object to the
+        # scheduler.
+        #
+        # Stage 3 router integration: if the request didn't carry
+        # bootstrap_* fields but the engine knows its bootstrap URL,
+        # auto-derive them so the router doesn't need to know about
+        # PD. ``bootstrap_room`` is a stable 32-bit hash of the
+        # request id so a retry of the same rid lands on the same P.
+        if (
+            getattr(self.server_args, "disaggregation_mode", "null")
+            == "decode"
+        ):
+            bootstrap_url = getattr(
+                self.server_args, "disaggregation_bootstrap_url", None
+            )
+            if (
+                obj.bootstrap_host is None
+                or obj.bootstrap_port is None
+            ) and bootstrap_url is not None:
+                parsed = urlparse(bootstrap_url)
+                if parsed.hostname is not None and parsed.port is not None:
+                    if obj.bootstrap_host is None:
+                        # urlparse strips IPv6 brackets; restore them so
+                        # downstream ``f"{host}:{port}"`` builders
+                        # produce a parseable URL. Stage 3 review I1.
+                        host = parsed.hostname
+                        if ":" in host:
+                            host = f"[{host}]"
+                        obj.bootstrap_host = host
+                    if obj.bootstrap_port is None:
+                        obj.bootstrap_port = parsed.port
+            if obj.bootstrap_room is None and obj.rid is not None:
+                # zlib.crc32 on Python 3 already returns an unsigned
+                # 32-bit int; the explicit & 0xFFFFFFFF earlier was
+                # redundant (Stage 3 review M2).
+                obj.bootstrap_room = zlib.crc32(
+                    str(obj.rid).encode("utf-8")
+                )
+            missing = [
+                name for name in (
+                    "bootstrap_host", "bootstrap_port", "bootstrap_room"
+                )
+                if getattr(obj, name, None) is None
+            ]
+            if missing:
+                raise ValueError(
+                    "disaggregation_mode=decode requires the request "
+                    f"to provide {missing}; got obj.bootstrap_host="
+                    f"{obj.bootstrap_host!r}, "
+                    f"obj.bootstrap_port={obj.bootstrap_port!r}, "
+                    f"obj.bootstrap_room={obj.bootstrap_room!r}"
+                )
+        tokenized_obj.bootstrap_host = getattr(obj, "bootstrap_host", None)
+        tokenized_obj.bootstrap_port = getattr(obj, "bootstrap_port", None)
+        tokenized_obj.bootstrap_room = getattr(obj, "bootstrap_room", None)
+        tokenized_obj.disagg_transfer_id = getattr(
+            obj, "disagg_transfer_id", None
         )
         # note: When only `return_logprob` is specified, we assume that only the output probability is required.
         if (

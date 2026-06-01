@@ -211,6 +211,14 @@ class Req:
         self.lora_id = lora_id if lora_id is not None else "0"
         self.dp_rank = dp_rank
 
+        # PD disaggregation routing keys (Stage 2). Populated by the
+        # scheduler from the tokenized request when running in
+        # disaggregation_mode != "null"; otherwise None.
+        self.bootstrap_host: str | None = None
+        self.bootstrap_port: int | None = None
+        self.bootstrap_room: int | None = None
+        self.disagg_transfer_id: str | None = None
+
         # Memory pool info
         self.req_pool_idx: int | None = None
         self.recurrent_pool_idx: int | None = None
@@ -392,6 +400,71 @@ class Req:
         tree_cache: BasePrefixCache | None = None,
     ):
         self.fill_ids = self.origin_input_ids + self.output_ids
+        # PD-disagg decode-side override (Stage 2.5): if a PD request
+        # already had its KV written into the paged pool by the
+        # decode mixin's ``_write_kv_to_pool``, its ``prefix_indices``
+        # was set there. The standard tree_cache.match_prefix would
+        # overwrite it with an empty match (the cache doesn't know
+        # about the externally-written KV per RFC-2 ADR-7). Keep the
+        # pre-set prefix_indices for this req's first decode iter so
+        # ``extend_input_len`` is 0 and the scheduler routes the req
+        # straight to decode without re-prefilling. A scheduler-set
+        # marker flag (``_pd_skip_prefix_match``) opts in.
+        if getattr(self, "_pd_skip_prefix_match", False):
+            # Consume the marker; from the next iter onwards the
+            # standard tree_cache path applies (output_ids are now in
+            # tree_cache via cache_finished_req on terminal).
+            self._pd_skip_prefix_match = False
+            # tree_cache.match_prefix normally also sets last_node /
+            # last_host_node / host_hit_length on the req; mirror
+            # those defaults so add_one_req downstream doesn't trip
+            # on missing attributes. schedule_policy._lock_node
+            # requires a real TreeNode (it indexes node.lock_ref),
+            # so route through tree_cache's root.
+            root = (
+                getattr(tree_cache, "root_node", None)
+                if tree_cache is not None else None
+            )
+            self.last_node = root
+            self.last_host_node = root
+            self.host_hit_length = 0
+            self.last_matched_prefix_len = len(self.prefix_indices)
+            self.extend_input_len = (
+                len(self.fill_ids) - len(self.prefix_indices)
+            )
+            return
+        # Stage 4 e2e FINDING-C: any PD request that hasn't started
+        # decoding yet (output_ids empty) must skip the radix
+        # ``match_prefix`` step entirely. Two distinct cases:
+        #   * P side: a previous PD req with the same prompt cached
+        #     its slots in radix; those slots have since been freed
+        #     by ``cache_finished_req``. Matching against them would
+        #     return stale indices that ``_extract_req_kv``'s gather
+        #     either OOMs (jit_reshard recompile) or shape-mismatches
+        #     on (FINDING-D is a downstream symptom of the same
+        #     root cause).
+        #   * D side first intake (before _write_kv_to_pool runs):
+        #     prefix_indices must stay empty so the scheduler doesn't
+        #     try to run a normal prefill on cached prefix that D
+        #     doesn't actually own.
+        # Once decode begins (``output_ids`` non-empty on D), the
+        # standard tree_cache path resumes so D's own decoded tokens
+        # benefit from prefix sharing across requests.
+        if (
+            getattr(self, "bootstrap_room", None) is not None
+            and not self.output_ids
+        ):
+            self.prefix_indices = []
+            self.last_matched_prefix_len = 0
+            self.extend_input_len = len(self.fill_ids)
+            root = (
+                getattr(tree_cache, "root_node", None)
+                if tree_cache is not None else None
+            )
+            self.last_node = root
+            self.last_host_node = root
+            self.host_hit_length = 0
+            return
         if tree_cache is not None:
             (
                 self.prefix_indices,
