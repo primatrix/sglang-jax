@@ -577,7 +577,7 @@ class FlashAttention(AttentionBackend):
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
         num_page_per_req = cdiv(max_context_len, page_size)
-        res = 1024 * 1024 // 2 // num_page_per_req // 4
+        res = 1024 * 1024 // num_page_per_req // 4
         assert (
             res > 0
         ), f"max running requests: {res} must larger than 0, please increase page size or decrease max context length"
