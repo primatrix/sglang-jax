@@ -53,46 +53,48 @@ for e in evs:
         if e["name"] == "process_name": pn[e["pid"]] = a.get("name", "")
         if e["name"] == "thread_name": tn[(e["pid"], e["tid"])] = a.get("name", "")
 
-print("\n=== TPU-device thread/track names ===")
+print("\n=== all process names ===", sorted(set(pn.values())))
+print("=== all thread/track names ===")
 for (p, t), nm in sorted(tn.items(), key=lambda x: x[1]):
-    if "TPU" in pn.get(p, ""):
-        print(f"  [{pn[p]}] {nm}")
+    print(f"  [{pn.get(p,'')}] {nm}")
 
 print("\n=== phase counts ===", dict(collections.Counter(e.get("ph") for e in evs)))
 cser = collections.Counter(e.get("name", "") for e in evs if e.get("ph") == "C")
 print("=== counter(C) series ===")
 for nm, c in cser.most_common(40):
     print(f"  {c:5d}  {nm}")
-print("=== sample C events (name,args) ===")
 shown = 0
 for e in evs:
     if e.get("ph") == "C" and shown < 25:
-        print("  ", e.get("name"), e.get("args")); shown += 1
+        print("   C:", e.get("name"), e.get("args")); shown += 1
 
-# per-scope device time (region trace)
+# per-scope device time (region trace), crash-safe
 byname = collections.Counter()
 for e in evs:
     if e.get("ph") == "X" and "dur" in e and pn.get(e.get("pid")) == "/device:TPU:0":
         byname[e.get("name", "")] += e["dur"]
 kern = sum(v for n, v in byname.items() if "grouped-topk-v3" in n)
 print(f"\n=== per-scope device time (kernel custom-call = {kern/10:.2f}us/iter) ===")
-for sc in SCOPES:
-    t = sum(v for n, v in byname.items() if sc in n)
-    print(f"  {sc:14s} {t/10:8.3f} us  {100*t/kern:5.1f}%")
+if kern > 0:
+    for sc in SCOPES:
+        t = sum(v for n, v in byname.items() if sc in n)
+        print(f"  {sc:14s} {t/10:8.3f} us  {100*t/kern:5.1f}%")
+else:
+    print("  (no device events in trace.json.gz for this counter run)")
 
 # grep xplane for readable counter/util names
-xp = glob.glob(latest + "/*.xplane.pb")
-if xp:
+for xp in glob.glob(latest + "/*.xplane.pb"):
+    print(f"\n=== xplane {os.path.basename(xp)} ({os.path.getsize(xp)/1e6:.1f} MB) readable strings ===")
     try:
-        out = subprocess.run(["strings", xp[0]], capture_output=True, text=True, timeout=60).stdout
-        hits = sorted({l for l in out.splitlines()
+        out = subprocess.run(["strings", "-n", "4", xp], capture_output=True, text=True, timeout=120).stdout
+        hits = sorted({l.strip() for l in out.splitlines()
                        if any(x.lower() in l.lower() for x in
                               ("vpu", "scalar", "xlu", "vector", "utiliz", "flop", "occup", "duty",
-                               "active", "cycles", "perf_counter", "mxu"))
-                       and 3 < len(l) < 60})
-        print(f"\n=== xplane readable counter-ish strings ({len(hits)}) ===")
-        for h in hits[:60]:
-            print("  ", h)
+                               "active", "cycle", "perf_counter", "counter", "mxu", "busy", "idle",
+                               "sync_wait", "bundle"))
+                       and 3 < len(l) < 70})
+        for h in hits[:80]:
+            print("   ", h)
     except Exception as e:  # noqa: BLE001
-        print("strings failed:", e)
+        print("   strings failed:", e)
 print("=== counters profile exit: 0 ===")
