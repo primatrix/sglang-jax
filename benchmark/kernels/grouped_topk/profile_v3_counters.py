@@ -82,6 +82,41 @@ if kern > 0:
 else:
     print("  (no device events in trace.json.gz for this counter run)")
 
+# --- duty cycle: merged busy-time per track vs wall (XLA Modules) ---
+def _merged_busy(track):
+    ivs = sorted(((e["ts"], e["ts"] + e["dur"]) for e in evs
+                  if e.get("ph") == "X" and "dur" in e
+                  and pn.get(e.get("pid")) == "/device:TPU:0"
+                  and tn.get((e.get("pid"), e.get("tid"))) == track), key=lambda x: x[0])
+    busy = 0; cs = ce = None
+    for s, en in ivs:
+        if ce is None or s > ce:
+            if ce is not None: busy += ce - cs
+            cs, ce = s, en
+        else:
+            ce = max(ce, en)
+    if ce is not None: busy += ce - cs
+    return busy
+
+wall = _merged_busy("XLA Modules")
+print(f"\n=== track merged-busy vs wall (per iter; wall=XLA Modules={wall/10:.2f}us) ===")
+for tk in ["XLA Modules", "XLA Ops", "Tensor Core", "TC Overlay", "Async XLA Ops"]:
+    bd = _merged_busy(tk)
+    duty = 100 * bd / wall if wall else float("nan")
+    print(f"  {tk:16s} busy={bd/10:8.2f}us  duty={duty:6.1f}%")
+
+# --- dump counter-track events (values sampled by periodic counters) ---
+for tk in ["_counters_", "counters_0"]:
+    cvs = [e for e in evs if tn.get((e.get("pid"), e.get("tid"))) == tk]
+    print(f"\n=== track '{tk}': {len(cvs)} events ===")
+    seen = {}
+    for e in cvs:
+        nm = e.get("name", "")
+        if nm not in seen:
+            seen[nm] = (e.get("ph"), e.get("args"))
+    for nm, (ph, args) in list(seen.items())[:30]:
+        print(f"   ph={ph} name={nm} args={args}")
+
 # grep xplane for readable counter/util names
 for xp in glob.glob(latest + "/*.xplane.pb"):
     print(f"\n=== xplane {os.path.basename(xp)} ({os.path.getsize(xp)/1e6:.1f} MB) readable strings ===")
@@ -89,11 +124,10 @@ for xp in glob.glob(latest + "/*.xplane.pb"):
         out = subprocess.run(["strings", "-n", "4", xp], capture_output=True, text=True, timeout=120).stdout
         hits = sorted({l.strip() for l in out.splitlines()
                        if any(x.lower() in l.lower() for x in
-                              ("vpu", "scalar", "xlu", "vector", "utiliz", "flop", "occup", "duty",
-                               "active", "cycle", "perf_counter", "counter", "mxu", "busy", "idle",
-                               "sync_wait", "bundle"))
+                              ("vpu", "scalar core", "xlu", "vector unit", "utiliz", "flop", "occup",
+                               "duty", "vpu active", "mxu", "vector active"))
                        and 3 < len(l) < 70})
-        for h in hits[:80]:
+        for h in hits[:60]:
             print("   ", h)
     except Exception as e:  # noqa: BLE001
         print("   strings failed:", e)
