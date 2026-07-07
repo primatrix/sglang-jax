@@ -77,23 +77,33 @@ def _grouped_topk_kernel_v2(
         ids_init = jnp.full((topk, bt), -1, dtype=jnp.int32) # [topk, bt]
         w_init = jnp.zeros((topk, bt), dtype=jnp.float32) # [topk, bt]
 
+        def _argmax_reducer(a, b):
+            # keep the higher post-bias score; tie -> lower expert index (matches jax.lax.top_k)
+            sa, wa, ia = a
+            sb, wb, ib = b
+            take_a = jnp.logical_or(sa > sb, jnp.logical_and(sa == sb, ia < ib))
+            return (
+                jnp.where(take_a, sa, sb),
+                jnp.where(take_a, wa, wb),
+                jnp.where(take_a, ia, ib),
+            )
+
         def _pick(k, carry):
             cur, ids_buf, w_buf = carry
-            # One reduction for the winner index via hardware argmax (v1/group_top2 already rely on
-            # it lowering). This replaces the previous max + (cur==cmax) + masked-min sequence
-            # (2 reductions + 2 elementwise) with a single argmax. Trade-off: argmax uses the
-            # hardware tie-break, not lowest-index — differs from the reference ONLY on exact-equal
-            # scores, where the tied experts are interchangeable (downstream needs the set + weight
-            # pairing, and the harness cross-check is by expert-set).
-            idx = jnp.argmax(cur, axis=0, keepdims=True).astype(jnp.int32)  # [1, BT]
-            sel = e_iota == idx  # [E, BT]
-            # weight = PRE-bias logit at the winner (masked sum-reduction; gather is unsupported in
-            # Pallas/Mosaic — jnp.take_along_axis -> _gather_lowering_rule AssertionError on TPU).
-            wval = jnp.sum(jnp.where(sel, logits, 0.0), axis=0, keepdims=True)  # [1, BT] pre-bias
+            # ONE variadic reduction over (post-bias score, PRE-bias logit, expert index): returns
+            # the winner's index AND its weight together, with exact lowest-index tie-break. Replaces
+            # the previous 2 reductions/pick (argmax + masked weight-sum). No gather (unsupported).
+            _, wval, idx = jax.lax.reduce(
+                (cur, logits, e_iota),
+                (NEG_INF, jnp.float32(0.0), jnp.int32(E)),
+                _argmax_reducer,
+                dimensions=(0,),
+            )  # each [BT]
+            idx = idx[None, :]  # [1, BT]
             write = row_iota == k  # [topk, BT] one-hot on row k (loop index)
             ids_buf = jnp.where(write, idx, ids_buf)
-            w_buf = jnp.where(write, wval.astype(jnp.float32), w_buf)
-            cur = jnp.where(sel, NEG_INF, cur)  # drop the winner before the next pick
+            w_buf = jnp.where(write, wval[None, :], w_buf)
+            cur = jnp.where(e_iota == idx, NEG_INF, cur)  # drop the winner before the next pick
             return cur, ids_buf, w_buf
         _, ids_out, w_out = jax.lax.fori_loop(
             0, topk, _pick, (masked, ids_init, w_init), unroll=unroll_factor
