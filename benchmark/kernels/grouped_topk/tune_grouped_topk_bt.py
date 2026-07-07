@@ -38,19 +38,6 @@ except Exception:  # noqa: BLE001
     # is already defined at module scope; nothing to import.
     pass
 
-try:
-    from sgl_jax.srt.kernels.grouped_topk.v2.kernel import grouped_topk_pallas_v2
-except Exception:  # noqa: BLE001
-    pass
-
-
-def _kernel_for(variant):
-    """Return the (BT, unroll)-tunable kernel callable for a variant name."""
-    if variant == "v1":
-        return grouped_topk_pallas
-    if variant == "v2":
-        return grouped_topk_pallas_v2
-    raise ValueError(f"unknown variant {variant!r} (expected v1 or v2)")
 
 TRACE_ROOT = os.environ.get("TOPK_TRACE_ROOT", "/tmp/tpu_logs/topk_tune")
 VMEM_DEFAULT = 64 * 2**20  # v7x VMEM if get_tpu_info() is unavailable
@@ -127,8 +114,8 @@ def _logits(T, E, seed=2):
     return jax.nn.sigmoid(jax.random.normal(jax.random.PRNGKey(seed), (T, E), dtype=jnp.float32))
 
 
-def tune_one(T, E, G, Gtop, k, *, tries, vmem_frac, interpret, cap_bytes, variant="v1"):
-    kernel_fn = _kernel_for(variant)
+def tune_one(T, E, G, Gtop, k, *, tries, vmem_frac, interpret, cap_bytes):
+    kernel_fn = grouped_topk_pallas
     logits = jax.device_put(_logits(T, E))
     bias = jax.device_put(jax.random.normal(jax.random.PRNGKey(1), (E,), dtype=jnp.float32) * 0.1)
     budget = vmem_frac * cap_bytes
@@ -189,13 +176,9 @@ def main():
     ap.add_argument("--configs", default="256/8/4/8,512/8/4/8", help="E/G/Gtop/k comma list")
     ap.add_argument("--tries", type=int, default=3)
     ap.add_argument("--vmem-frac", type=float, default=0.9)
-    ap.add_argument("--variant", choices=["v1", "v2"], default="v1", help="kernel to tune")
     ap.add_argument("--interpret", action="store_true")
     a = ap.parse_args()
-    print(
-        f"JAX {jax.__version__} | {jax.devices()[0].platform} | n_dev {len(jax.devices())} "
-        f"| variant {a.variant}"
-    )
+    print(f"JAX {jax.__version__} | {jax.devices()[0].platform} | n_dev {len(jax.devices())}")
     try:
         import libtpu
 
@@ -219,12 +202,11 @@ def main():
                 vmem_frac=a.vmem_frac,
                 interpret=a.interpret,
                 cap_bytes=cap,
-                variant=a.variant,
             )
             if r:
                 best[(T, E, G, Gtop, k)] = r[0]  # (best_bt, best_unroll)
     # paste-ready block for tuned_block_sizes.py: (pow2(T), E, G, Gtop, k) -> (BT, unroll)
-    print(f"\n# --- paste-ready for TUNED_BT[{dev!r}] (variant {a.variant}) ---")
+    print(f"\n# --- paste-ready for TUNED_BT[{dev!r}] ---")
     for (T, E, G, Gtop, k), (bt, u) in sorted(best.items()):
         p2 = 1 << (T - 1).bit_length()
         print(f"#   ({p2}, {E}, {G}, {Gtop}, {k}): ({bt}, {u}),")

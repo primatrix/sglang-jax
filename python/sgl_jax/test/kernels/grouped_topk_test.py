@@ -17,7 +17,6 @@ from sgl_jax.srt.kernels.grouped_topk.v1.kernel import (
     _largest_safe_divisor,
     grouped_topk_pallas,
 )
-from sgl_jax.srt.kernels.grouped_topk.v2.kernel import grouped_topk_pallas_v2
 
 
 def ref_biased_grouped_topk(router_logits, correction_bias, *, num_expert_group, topk_group, topk):
@@ -87,70 +86,6 @@ def test_pallas_eq_ref(E, G, Gtop, k, name, bs):
         err_msg=f"{name} bs={bs}: weights differ",
     )
 
-
-@pytest.mark.parametrize("E,G,Gtop,k,name", CONFIGS)
-@pytest.mark.parametrize("bs", BATCHES)
-def test_pallas_v2_eq_ref(E, G, Gtop, k, name, bs):
-    """v2 (token-in-lane [E,BT] layout) must be id-for-id identical to the reference, same as v1."""
-    logits = _logits(bs, E, seed=2)
-    bias = jax.random.normal(jax.random.PRNGKey(1), (E,), dtype=jnp.float32) * 0.1
-
-    w_ref, ids_ref = ref_biased_grouped_topk(
-        logits, bias, num_expert_group=G, topk_group=Gtop, topk=k
-    )
-    w_pal, ids_pal = grouped_topk_pallas_v2(
-        logits,
-        bias,
-        num_expert_group=G,
-        topk_group=Gtop,
-        topk=k,
-        block_tokens=256,
-        interpret=True,
-    )
-    np.testing.assert_array_equal(
-        np.array(ids_pal), np.array(ids_ref), err_msg=f"v2 {name} bs={bs}: top-k ids differ"
-    )
-    np.testing.assert_allclose(
-        np.array(w_pal),
-        np.array(w_ref),
-        rtol=0,
-        atol=1e-6,
-        err_msg=f"v2 {name} bs={bs}: weights differ",
-    )
-
-
-def test_v2_matches_ref_on_flat_ties():
-    """v2 must reproduce the lowest-index tie-break when all scores are equal (the reduction axis
-    moved from lane to sublane — verify Mosaic tie behavior on the new axis is still lowest-index)."""
-    E, G, Gtop, k, bs = 256, 8, 4, 8, 512
-    logits = jnp.full((bs, E), 0.5, dtype=jnp.float32)
-    bias = jnp.zeros((E,), dtype=jnp.float32)
-    w_ref, ids_ref = ref_biased_grouped_topk(
-        logits, bias, num_expert_group=G, topk_group=Gtop, topk=k
-    )
-    w_pal, ids_pal = grouped_topk_pallas_v2(
-        logits, bias, num_expert_group=G, topk_group=Gtop, topk=k, block_tokens=bs, interpret=True
-    )
-    np.testing.assert_array_equal(np.array(ids_pal), np.array(ids_ref))
-    np.testing.assert_allclose(np.array(w_pal), np.array(w_ref), rtol=0, atol=1e-6)
-
-
-def test_v2_matches_ref_on_partial_ties():
-    """v2 within-group tie (experts 3 and 5 share a score) with distinct pre-bias weights."""
-    E, G, Gtop, k, bs = 256, 8, 4, 8, 512
-    logits = _logits(bs, E, seed=11)
-    logits = logits.at[:, 5].set(logits[:, 3])
-    bias = jax.random.normal(jax.random.PRNGKey(5), (E,), dtype=jnp.float32) * 0.1
-    w_ref, ids_ref = ref_biased_grouped_topk(
-        logits, bias, num_expert_group=G, topk_group=Gtop, topk=k
-    )
-    w_pal, ids_pal = grouped_topk_pallas_v2(
-        logits, bias, num_expert_group=G, topk_group=Gtop, topk=k, block_tokens=bs, interpret=True
-    )
-    np.testing.assert_array_equal(np.array(ids_pal), np.array(ids_ref))
-    np.testing.assert_allclose(np.array(w_pal), np.array(w_ref), rtol=0, atol=1e-6)
-
-
 def test_against_real_topk_module():
     """If the sgl_jax model stack imports cleanly, also check vs the real TopK module."""
     real_topk = pytest.importorskip("sgl_jax.srt.layers.gate", reason="gate.py import").TopK
@@ -169,20 +104,22 @@ def test_against_real_topk_module():
 @pytest.mark.parametrize(
     "bs,expected",
     [
-        (5000, 1000),  # 5000=2^3·5^4: 8-aligned divisors <=2048 are 8/40/200/1000 -> 1000
-        (4000, 2000),  # 4000=2^5·5^3: max 8-aligned divisor <=2048 is 2000
-        (2048, 2048),  # already a safe power-of-2 tile
-        (1024, 1024),
-        (5003, None),  # prime -> no 8-aligned divisor, caller falls back to whole batch
-        (100, None),  # 100=2^2·5^2 has no multiple-of-8 divisor
+        (5000, None),  # 5000=2^3·5^4 has no 128-multiple divisor
+        (4000, None),  # 4000=2^5·5^3 has no 128-multiple divisor
+        (2048, 2048),  # 2048=128*16, a safe power-of-2 tile
+        (1024, 1024),  # 1024=128*8
+        (1536, 1536),  # 1536=128*12 (<=2048), a 128-aligned divisor
+        (5003, None),  # prime -> no 128-aligned divisor, caller falls back to whole batch
+        (100, None),  # 100=2^2·5^2 has no 128-multiple divisor
     ],
 )
 def test_largest_safe_divisor(bs, expected):
-    """The auto fallback must pick a VMEM-safe, 8-aligned divisor of bs (or None)."""
+    """The auto fallback must pick a VMEM-safe, 128-aligned divisor of bs (tokens are in the lane
+    dim, so the block must be a 128-multiple), or None."""
     d = _largest_safe_divisor(bs)
     assert d == expected, f"bs={bs}: got {d}, want {expected}"
     if d is not None:
-        assert bs % d == 0 and d % 8 == 0 and d <= SAFE_AUTO_BT
+        assert bs % d == 0 and d % 128 == 0 and d <= SAFE_AUTO_BT
 
 
 def test_auto_block_tokens_nondivisible():
@@ -204,13 +141,13 @@ def test_auto_block_tokens_nondivisible():
 @pytest.mark.parametrize(
     "E,G,Gtop,k,name",
     [
-        (256, 8, 4, 8, "n_pad>0_k8"),  # padded_topk=128, n_pad=120 (filler-column path)
-        (256, 4, 4, 128, "n_pad==0_k128"),  # padded_topk=128, n_pad=0 (no filler)
+        (256, 8, 4, 8, "k8"),  # typical routing k
+        (256, 4, 4, 128, "k128"),  # large k (topk == experts/2)
     ],
 )
 def test_topk_pad_boundary(E, G, Gtop, k, name):
-    """Exercise both the n_pad>0 (topk<128) and n_pad==0 (topk==128) output-padding paths,
-    and that the returned shape is sliced back to exactly (bs, topk)."""
+    """Output is [BS, topk] (topk in the sublane dim, no 128 padding); check small and large k both
+    return the exact (bs, topk) shape and correct values."""
     bs = 512
     logits = _logits(bs, E, seed=11)
     bias = jax.random.normal(jax.random.PRNGKey(5), (E,), dtype=jnp.float32) * 0.1

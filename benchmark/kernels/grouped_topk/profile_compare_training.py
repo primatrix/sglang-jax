@@ -24,13 +24,9 @@ from sgl_jax.srt.kernels.grouped_topk.legacy.topk_v1_training import (
     grouped_topk_pallas_training,
 )
 from sgl_jax.srt.kernels.grouped_topk.v1.kernel import grouped_topk_pallas
-from sgl_jax.srt.kernels.grouped_topk.v2.kernel import grouped_topk_pallas_v2
-from sgl_jax.srt.kernels.grouped_topk.v2.kernel3 import grouped_topk_pallas_v3
 
 SCOPE_V1_FUSED = "bench_grouped_topk_v1_fused"
 SCOPE_V1_TRAINING_GATHER = "bench_grouped_topk_v1_training_gather"
-SCOPE_V2_LANE = "bench_grouped_topk_v2_lane"
-SCOPE_V3_LANE = "bench_grouped_topk_v3_lane"
 
 
 def _parse_csv_ints(value: str) -> list[int]:
@@ -249,35 +245,9 @@ def _make_jitted_variants(
                 interpret=interpret,
             )
 
-    def v2_lane(logits, bias):
-        with jax.named_scope(SCOPE_V2_LANE):
-            return grouped_topk_pallas_v2(
-                logits,
-                bias,
-                num_expert_group=n_group,
-                topk_group=topk_group,
-                topk=topk,
-                block_tokens=block_tokens,
-                interpret=interpret,
-            )
-
-    def v3_lane(logits, bias):
-        with jax.named_scope(SCOPE_V3_LANE):
-            return grouped_topk_pallas_v3(
-                logits,
-                bias,
-                num_expert_group=n_group,
-                topk_group=topk_group,
-                topk=topk,
-                block_tokens=block_tokens,
-                interpret=interpret,
-            )
-
     return {
         "v1_fused": (SCOPE_V1_FUSED, jax.jit(v1_fused)),
         "v1_training_gather": (SCOPE_V1_TRAINING_GATHER, jax.jit(v1_training_gather)),
-        "v2_lane": (SCOPE_V2_LANE, jax.jit(v2_lane)),
-        "v3_lane": (SCOPE_V3_LANE, jax.jit(v3_lane)),
     }
 
 
@@ -318,26 +288,9 @@ def run_comparison(
 
             fused_weights, fused_ids = variants["v1_fused"][1](logits, bias)
             training_weights, training_ids = variants["v1_training_gather"][1](logits, bias)
-            v2_weights, v2_ids = variants["v2_lane"][1](logits, bias)
-            v3_weights, v3_ids = variants["v3_lane"][1](logits, bias)
-            jax.block_until_ready(
-                (
-                    fused_weights,
-                    fused_ids,
-                    training_weights,
-                    training_ids,
-                    v2_weights,
-                    v2_ids,
-                    v3_weights,
-                    v3_ids,
-                )
-            )
+            jax.block_until_ready((fused_weights, fused_ids, training_weights, training_ids))
             if not _routing_equal(fused_weights, fused_ids, training_weights, training_ids):
                 raise AssertionError(f"v1_fused vs v1_training_gather routing differs for T={tokens}")
-            if not _routing_equal(fused_weights, fused_ids, v2_weights, v2_ids):
-                raise AssertionError(f"v2_lane vs v1_fused routing differs for T={tokens}")
-            if not _routing_equal(fused_weights, fused_ids, v3_weights, v3_ids):
-                raise AssertionError(f"v3_lane vs v1_fused routing differs for T={tokens}")
 
             for variant, (scope, fn) in variants.items():
                 samples_ms, timing_source, variant_trace = _trace_profile_ms(
