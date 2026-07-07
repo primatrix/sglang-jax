@@ -82,10 +82,13 @@ def main():
             b = jax.device_put(jax.random.normal(jax.random.PRNGKey(9), (E,), jnp.float32) * 0.1)
             row = []
             for u in Us:
-                fn = jax.jit(lambda l, bb, u=u: grouped_topk_pallas_v3(
-                    l, bb, num_expert_group=G, topk_group=Gtop, topk=k, unroll=u))
-                row.append(_module_us(_trace(fn, lg, b, f"t{T}u{u}")))
-            print(f"{T:>6} " + " ".join(f"{v:8.2f}" for v in row))
+                try:
+                    fn = jax.jit(lambda l, bb, u=u: grouped_topk_pallas_v3(
+                        l, bb, num_expert_group=G, topk_group=Gtop, topk=k, unroll=u))
+                    row.append(f"{_module_us(_trace(fn, lg, b, f't{T}u{u}')):8.2f}")
+                except Exception as e:  # noqa: BLE001
+                    row.append(f"{('ERR:'+type(e).__name__):>8}")
+            print(f"{T:>6} " + " ".join(row))
     else:
         T = 16384
         lg = jax.device_put(jax.nn.sigmoid(jax.random.normal(jax.random.PRNGKey(T), (T, E), jnp.float32)))
