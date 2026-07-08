@@ -374,21 +374,8 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
                 for variant in ("v1", "v2")
             }
 
+            token_rows: list[dict[str, Any]] = []
             outputs: dict[str, tuple[jax.Array, jax.Array]] = {}
-            for variant, (_, fn) in compiled.items():
-                outputs[variant] = jax.block_until_ready(fn(logits, bias))
-
-            v1_weights, v1_ids = outputs["v1"]
-            v2_weights, v2_ids = outputs["v2"]
-            ids_equal = bool(jnp.array_equal(v1_ids, v2_ids))
-            max_weight_abs_diff = float(jnp.max(jnp.abs(v1_weights - v2_weights)))
-            compare = {
-                "T": tokens,
-                "ids_equal": ids_equal,
-                "max_weight_abs_diff": max_weight_abs_diff,
-            }
-            print("COMPARE " + json.dumps(compare, sort_keys=True), flush=True)
-
             for variant in ("v1", "v2"):
                 scope, fn = compiled[variant]
 
@@ -405,6 +392,7 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
                     warmup=args.warmup,
                     iters=args.iters,
                 )
+                outputs[variant] = jax.block_until_ready(fn(logits, bias))
                 llo_files: list[str] = []
                 if tokens == args.profile_tokens:
                     _copy_trace_tree(current_trace_root, artifact_profile_root / tag)
@@ -432,6 +420,20 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
                     trace_meta=trace_meta,
                     llo_files=llo_files,
                 )
+                token_rows.append(row)
+
+            v1_weights, v1_ids = outputs["v1"]
+            v2_weights, v2_ids = outputs["v2"]
+            ids_equal = bool(jnp.array_equal(v1_ids, v2_ids))
+            max_weight_abs_diff = float(jnp.max(jnp.abs(v1_weights - v2_weights)))
+            compare = {
+                "T": tokens,
+                "ids_equal": ids_equal,
+                "max_weight_abs_diff": max_weight_abs_diff,
+            }
+            print("COMPARE " + json.dumps(compare, sort_keys=True), flush=True)
+
+            for row in token_rows:
                 row.update(compare)
                 out.write(json.dumps(row, sort_keys=True) + "\n")
                 out.flush()
