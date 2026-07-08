@@ -43,6 +43,10 @@ def _parse_csv_ints(value: str) -> list[int]:
     return [int(part.strip()) for part in value.split(",") if part.strip()]
 
 
+def _parse_csv_strings(value: str) -> list[str]:
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
 def _logits(tokens: int, experts: int, seed: int) -> jax.Array:
     return jax.nn.sigmoid(
         jax.random.normal(jax.random.PRNGKey(seed), (tokens, experts), dtype=jnp.float32)
@@ -340,6 +344,12 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
     llo_variant_root.mkdir(parents=True, exist_ok=True)
 
     token_sizes = _parse_csv_ints(args.tokens)
+    variants = _parse_csv_strings(args.variants)
+    unknown_variants = sorted(set(variants) - {"v1", "v2"})
+    if unknown_variants:
+        raise ValueError(f"unknown variants: {unknown_variants}")
+    if not variants:
+        raise ValueError("--variants must contain at least one variant")
     block_tokens: int | str = "auto" if args.block_tokens == "auto" else int(args.block_tokens)
 
     print(
@@ -371,12 +381,12 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
                     block_tokens=block_tokens,
                     interpret=args.interpret,
                 )
-                for variant in ("v1", "v2")
+                for variant in variants
             }
 
             token_rows: list[dict[str, Any]] = []
             outputs: dict[str, tuple[jax.Array, jax.Array]] = {}
-            for variant in ("v1", "v2"):
+            for variant in variants:
                 scope, fn = compiled[variant]
 
                 def run_fn(fn=fn):
@@ -422,16 +432,16 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
                 )
                 token_rows.append(row)
 
-            v1_weights, v1_ids = outputs["v1"]
-            v2_weights, v2_ids = outputs["v2"]
-            ids_equal = bool(jnp.array_equal(v1_ids, v2_ids))
-            max_weight_abs_diff = float(jnp.max(jnp.abs(v1_weights - v2_weights)))
-            compare = {
-                "T": tokens,
-                "ids_equal": ids_equal,
-                "max_weight_abs_diff": max_weight_abs_diff,
-            }
-            print("COMPARE " + json.dumps(compare, sort_keys=True), flush=True)
+            compare: dict[str, Any] = {}
+            if {"v1", "v2"}.issubset(outputs):
+                v1_weights, v1_ids = outputs["v1"]
+                v2_weights, v2_ids = outputs["v2"]
+                compare = {
+                    "T": tokens,
+                    "ids_equal": bool(jnp.array_equal(v1_ids, v2_ids)),
+                    "max_weight_abs_diff": float(jnp.max(jnp.abs(v1_weights - v2_weights))),
+                }
+                print("COMPARE " + json.dumps(compare, sort_keys=True), flush=True)
 
             for row in token_rows:
                 row.update(compare)
@@ -441,26 +451,38 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
                 print("METRIC " + json.dumps(row, sort_keys=True), flush=True)
 
     print("\n=== grouped_topk v1 vs v2 ===", flush=True)
-    print(
-        f"{'T':>7} {'v1_ms':>10} {'v2_ms':>10} {'v2/v1':>8} {'v1_BT':>7} {'v2_BT':>7}",
-        flush=True,
-    )
     by_t = {(row["T"], row["variant"]): row for row in rows}
-    for tokens in token_sizes:
-        v1 = by_t[(tokens, "v1")]
-        v2 = by_t[(tokens, "v2")]
-        ratio = v2["median_ms"] / v1["median_ms"]
+    if {"v1", "v2"}.issubset(variants):
         print(
-            f"{tokens:>7} {v1['median_ms']:>10.4f} {v2['median_ms']:>10.4f} {ratio:>8.3f} "
-            f"{v1['block_tokens_resolved']:>7} {v2['block_tokens_resolved']:>7}",
+            f"{'T':>7} {'v1_ms':>10} {'v2_ms':>10} {'v2/v1':>8} {'v1_BT':>7} {'v2_BT':>7}",
             flush=True,
         )
+        for tokens in token_sizes:
+            v1 = by_t[(tokens, "v1")]
+            v2 = by_t[(tokens, "v2")]
+            ratio = v2["median_ms"] / v1["median_ms"]
+            print(
+                f"{tokens:>7} {v1['median_ms']:>10.4f} {v2['median_ms']:>10.4f} {ratio:>8.3f} "
+                f"{v1['block_tokens_resolved']:>7} {v2['block_tokens_resolved']:>7}",
+                flush=True,
+            )
+    else:
+        print(f"{'T':>7} {'variant':>8} {'median_ms':>10} {'BT':>7}", flush=True)
+        for tokens in token_sizes:
+            for variant in variants:
+                row = by_t[(tokens, variant)]
+                print(
+                    f"{tokens:>7} {variant:>8} {row['median_ms']:>10.4f} "
+                    f"{row['block_tokens_resolved']:>7}",
+                    flush=True,
+                )
     return rows
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokens", default="128,512,4096,16384")
+    parser.add_argument("--variants", default="v1,v2")
     parser.add_argument("--experts", type=int, default=256)
     parser.add_argument("--groups", type=int, default=8)
     parser.add_argument("--topk-groups", type=int, default=4)
