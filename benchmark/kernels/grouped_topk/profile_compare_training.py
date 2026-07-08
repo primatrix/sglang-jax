@@ -198,6 +198,21 @@ def _summary_row(
     }
 
 
+def _routing_equal(w_a, ids_a, w_b, ids_b) -> bool:
+    """Order-independent routing equality: sort each row by expert id and compare the resulting
+    (id, weight) pairs. Robust to the internal top-k ordering of near-tied scores (which can differ
+    harmlessly between kernels — see kernel report §3.4) while still catching a genuinely different
+    expert set or mismatched weight. Downstream MoE re-sorts by expert id, so only the set + pairing
+    matters, not the descending-by-score order."""
+    order_a = jnp.argsort(ids_a, axis=1)
+    order_b = jnp.argsort(ids_b, axis=1)
+    ia = jnp.take_along_axis(ids_a, order_a, axis=1)
+    ib = jnp.take_along_axis(ids_b, order_b, axis=1)
+    wa = jnp.take_along_axis(w_a, order_a, axis=1)
+    wb = jnp.take_along_axis(w_b, order_b, axis=1)
+    return bool(jnp.array_equal(ia, ib)) and bool(jnp.allclose(wa, wb, rtol=0, atol=1e-6))
+
+
 def _make_jitted_variants(
     *,
     n_group: int,
@@ -274,10 +289,8 @@ def run_comparison(
             fused_weights, fused_ids = variants["v1_fused"][1](logits, bias)
             training_weights, training_ids = variants["v1_training_gather"][1](logits, bias)
             jax.block_until_ready((fused_weights, fused_ids, training_weights, training_ids))
-            if not bool(jnp.array_equal(fused_ids, training_ids)):
-                raise AssertionError(f"top-k ids differ for T={tokens}")
-            if not bool(jnp.allclose(fused_weights, training_weights, rtol=0, atol=1e-6)):
-                raise AssertionError(f"top-k weights differ for T={tokens}")
+            if not _routing_equal(fused_weights, fused_ids, training_weights, training_ids):
+                raise AssertionError(f"v1_fused vs v1_training_gather routing differs for T={tokens}")
 
             for variant, (scope, fn) in variants.items():
                 samples_ms, timing_source, variant_trace = _trace_profile_ms(
