@@ -38,9 +38,15 @@ logger = logging.getLogger(__name__)
 NEG_INF = -jnp.inf
 _I32_MIN = jnp.iinfo(jnp.int32).min
 
-# Largest token block (grid>1) known to fit v7x VMEM with double-buffered [E,BT] inputs. The "auto"
-# path never tiles above this without warning.
+# Largest token block known to fit v7x VMEM at E=256 with double-buffered [E,BT] inputs. The auto
+# path scales this cap inversely with E so E=512 uses BT<=1024 (BT=2048 exceeds scoped VMEM).
 SAFE_AUTO_BT = 2048
+SAFE_AUTO_TILE_ELEMENTS = 256 * SAFE_AUTO_BT
+
+
+def _safe_auto_bt_cap(num_experts: int, align: int = 128) -> int:
+    cap = min(SAFE_AUTO_BT, max(align, SAFE_AUTO_TILE_ELEMENTS // num_experts))
+    return (cap // align) * align
 
 
 def _largest_safe_divisor(bs: int, cap: int = SAFE_AUTO_BT, align: int = 128) -> int | None:
@@ -159,28 +165,36 @@ def _grouped_topk_kernel(
             cur = jnp.where(sel, _I32_MIN if packed else NEG_INF, cur)  # drop the winner
             return cur, idx.astype(jnp.int32), sel
 
-        # Python-unroll the small static top-k. This removes the loop-carried row iota and full
-        # output buffers used by the original fori_loop while preserving exact selection order.
+        # Python-unroll the small static top-k. Direct output-row writes save a little time for the
+        # larger measured tiles, while stacking wins clearly for the smallest tiles. Both paths are
+        # compile-time choices and preserve exact selection order. Keep the existing packed path on
+        # stacking because the direct-write measurements cover the f32 contract only.
         cur = work0
-        selected_ids = []
-        selected_masks = []
-        for _ in range(topk):
-            cur, idx, sel = _select_one(cur)
-            selected_ids.append(jnp.squeeze(idx, axis=0))
-            selected_masks.append(sel)
-        ids_out = jnp.stack(selected_ids, axis=0)
-        w_out = jnp.stack(
-            [
-                jnp.squeeze(
+        direct_row_write = not packed and (bt >= 1024 or (E >= 512 and bt >= 256))
+        if direct_row_write:
+            for k in range(topk):
+                cur, idx, sel = _select_one(cur)
+                ids_ref[k, :] = jnp.squeeze(idx, axis=0)
+                w_ref[k, :] = jnp.squeeze(
                     jnp.sum(jnp.where(sel, logits, 0.0), axis=0, keepdims=True), axis=0
                 )
-                for sel in selected_masks
-            ],
-            axis=0,
-        )
-
-    ids_ref[...] = ids_out  # [topk, BT]
-    w_ref[...] = w_out
+        else:
+            selected_ids = []
+            selected_masks = []
+            for _ in range(topk):
+                cur, idx, sel = _select_one(cur)
+                selected_ids.append(jnp.squeeze(idx, axis=0))
+                selected_masks.append(sel)
+            ids_ref[...] = jnp.stack(selected_ids, axis=0)
+            w_ref[...] = jnp.stack(
+                [
+                    jnp.squeeze(
+                        jnp.sum(jnp.where(sel, logits, 0.0), axis=0, keepdims=True), axis=0
+                    )
+                    for sel in selected_masks
+                ],
+                axis=0,
+            )
 
 
 def grouped_topk_pallas(
@@ -210,14 +224,17 @@ def grouped_topk_pallas(
     bias = correction_bias.astype(jnp.float32)
 
     if block_tokens == "auto":
-        bt = _largest_safe_divisor(bs, cap=SAFE_AUTO_BT, align=128) or bs
-        if bt > SAFE_AUTO_BT:
+        auto_cap = _safe_auto_bt_cap(e)
+        bt = _largest_safe_divisor(bs, cap=auto_cap, align=128) or bs
+        if bt > auto_cap:
             logger.warning(
                 "grouped_topk: auto block_tokens fell back to whole-batch BT=%d (BS=%d has no "
-                "128-aligned VMEM-safe divisor); a single [%d,%d] tile may exceed VMEM. Pad local "
+                "128-aligned VMEM-safe divisor <=%d); a single [%d,%d] tile may exceed VMEM. "
+                "Pad local "
                 "tokens to a multiple of 128 or pass an explicit block_tokens.",
                 bt,
                 bs,
+                auto_cap,
                 bs,
                 e,
             )

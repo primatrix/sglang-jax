@@ -15,6 +15,7 @@ import pytest
 from sgl_jax.srt.kernels.grouped_topk.v1.kernel import (
     SAFE_AUTO_BT,
     _largest_safe_divisor,
+    _safe_auto_bt_cap,
     grouped_topk_pallas,
 )
 
@@ -149,6 +150,13 @@ def test_largest_safe_divisor(bs, expected):
     assert d == expected, f"bs={bs}: got {d}, want {expected}"
     if d is not None:
         assert bs % d == 0 and d % 128 == 0 and d <= SAFE_AUTO_BT
+
+
+def test_safe_auto_bt_cap_scales_with_experts():
+    assert _safe_auto_bt_cap(128) == 2048
+    assert _safe_auto_bt_cap(256) == 2048
+    assert _safe_auto_bt_cap(512) == 1024
+    assert _safe_auto_bt_cap(1024) == 512
 
 
 def test_auto_block_tokens_nondivisible():
