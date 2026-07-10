@@ -284,7 +284,8 @@ def grouped_topk_pallas(
     bias = correction_bias.astype(jnp.float32)
 
     if block_tokens == "auto":
-        bt = _largest_safe_divisor(bs, cap=SAFE_AUTO_BT, align=128) or bs
+        auto_cap = 512 if implementation == "pairwise_group_top2" else SAFE_AUTO_BT
+        bt = _largest_safe_divisor(bs, cap=auto_cap, align=128) or bs
         if bt > SAFE_AUTO_BT:
             logger.warning(
                 "grouped_topk: auto block_tokens fell back to whole-batch BT=%d (BS=%d has no "
