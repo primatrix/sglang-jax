@@ -113,6 +113,7 @@ def _grouped_topk_kernel(
             group_scores = jnp.squeeze(v1 + v2, axis=1)  # [G, BT]
 
     use_float_tie = implementation != "baseline"
+    use_hierarchical = implementation == "hierarchical_topk"
     use_static_unroll = implementation in (
         "static_unroll",
         "batched_weights",
@@ -120,6 +121,7 @@ def _grouped_topk_kernel(
         "static_input_dtype",
         "static_input_parallel",
         "pairwise_group_top2",
+        "hierarchical_topk",
     )
     use_batched_weights = implementation == "batched_weights"
 
@@ -150,10 +152,44 @@ def _grouped_topk_kernel(
 
     # ③ mask experts in dropped groups -> -inf. Applied ONCE (loop-invariant) before the pick loop.
     with jax.named_scope("expert_mask"):
-        masked = jnp.reshape(
-            jnp.where(group_mask[:, None, :], jnp.reshape(scores, (n_group, S, bt)), NEG_INF),
-            (E, bt),
-        )  # [E, BT]
+        if use_hierarchical:
+            grouped_scores = jnp.reshape(scores, (n_group, S, bt))
+            grouped_logits = jnp.reshape(logits, (n_group, S, bt))
+            local_iota = jax.lax.broadcasted_iota(jnp.int32, (n_group, S, bt), 1)
+            group_iota = jax.lax.broadcasted_iota(jnp.int32, (n_group, 1, bt), 0)
+            local_work = grouped_scores
+            candidate_scores = []
+            candidate_ids = []
+            candidate_logits = []
+            for _ in range(topk):
+                local_idx = _stable_index(local_work, local_iota, S, axis=1)
+                local_sel = local_iota == local_idx
+                candidate_scores.append(
+                    jnp.sum(jnp.where(local_sel, grouped_scores, 0.0), axis=1)
+                )
+                candidate_ids.append(
+                    jnp.squeeze(group_iota * S + local_idx, axis=1).astype(jnp.int32)
+                )
+                candidate_logits.append(
+                    jnp.sum(jnp.where(local_sel, grouped_logits, 0.0), axis=1)
+                )
+                local_work = jnp.where(local_sel, NEG_INF, local_work)
+            candidate_scores = jnp.stack(candidate_scores, axis=1)  # [G, k, BT]
+            candidate_scores = jnp.where(group_mask[:, None, :], candidate_scores, NEG_INF)
+            candidate_ids = jnp.reshape(jnp.stack(candidate_ids, axis=1), (n_group * topk, bt))
+            candidate_logits = jnp.reshape(
+                jnp.stack(candidate_logits, axis=1), (n_group * topk, bt)
+            )
+            masked = jnp.reshape(candidate_scores, (n_group * topk, bt))
+        else:
+            masked = jnp.reshape(
+                jnp.where(
+                    group_mask[:, None, :],
+                    jnp.reshape(scores, (n_group, S, bt)),
+                    NEG_INF,
+                ),
+                (E, bt),
+            )  # [E, BT]
 
     # ④ select `topk` experts, lowest-index tie-break; weight = PRE-bias logit at the winner. A
     #    fori_loop carries the [E,BT] working array and writes each pick into ROW k of the [topk,BT]
@@ -169,7 +205,9 @@ def _grouped_topk_kernel(
     #        bits are zero, so packing the id into those 16 bits discards nothing). See gate.py:
     #        the caller selects packed only when router_logits is bf16.
     with jax.named_scope("final_select"):
-        e_iota = jax.lax.broadcasted_iota(jnp.int32, (E, bt), 0)
+        selection_size = n_group * topk if use_hierarchical else E
+        e_iota = jax.lax.broadcasted_iota(jnp.int32, (selection_size, bt), 0)
+        source_logits = candidate_logits if use_hierarchical else logits
         if packed:
             # Index goes in the low 16 bits (bf16-rounded mantissa, all zero; score lives in bits
             # 16-31). op count is identical to a tighter b (masks are compile-time constants).
@@ -190,7 +228,7 @@ def _grouped_topk_kernel(
                 kmax = jnp.max(cur, axis=0, keepdims=True)  # [1, BT] single reduction
                 idx = (E - 1) - (kmax & low_mask)  # [1, BT] lowest-index winner from the low bits
             else:
-                idx = _stable_index(cur, e_iota, E, axis=0)
+                idx = _stable_index(cur, e_iota, selection_size, axis=0)
             sel = e_iota == idx  # [E, BT]
             cur = jnp.where(sel, _I32_MIN if packed else NEG_INF, cur)  # drop the winner
             return cur, idx.astype(jnp.int32), sel
@@ -201,7 +239,19 @@ def _grouped_topk_kernel(
             selected_masks = []
             for _ in range(topk):
                 cur, idx, sel = _select_one(cur)
-                selected_ids.append(jnp.squeeze(idx, axis=0))
+                if use_hierarchical:
+                    selected_ids.append(
+                        jnp.squeeze(
+                            jnp.sum(
+                                jnp.where(sel, candidate_ids.astype(jnp.float32), 0.0),
+                                axis=0,
+                                keepdims=True,
+                            ),
+                            axis=0,
+                        ).astype(jnp.int32)
+                    )
+                else:
+                    selected_ids.append(jnp.squeeze(idx, axis=0))
                 if not use_batched_weights:
                     selected_masks.append(sel)
             ids_out = jnp.stack(selected_ids, axis=0)
@@ -213,7 +263,9 @@ def _grouped_topk_kernel(
                 w_out = jnp.stack(
                     [
                         jnp.squeeze(
-                            jnp.sum(jnp.where(sel, logits, 0.0), axis=0, keepdims=True),
+                            jnp.sum(
+                                jnp.where(sel, source_logits, 0.0), axis=0, keepdims=True
+                            ),
                             axis=0,
                         )
                         for sel in selected_masks
@@ -275,6 +327,7 @@ def grouped_topk_pallas(
         "static_input_dtype",
         "static_input_parallel",
         "pairwise_group_top2",
+        "hierarchical_topk",
     ):
         raise ValueError(f"unknown grouped-topk implementation: {implementation}")
     preserve_input_dtype = implementation in ("static_input_dtype", "static_input_parallel")
