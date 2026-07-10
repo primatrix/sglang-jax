@@ -114,6 +114,7 @@ def _grouped_topk_kernel(
 
     use_float_tie = implementation != "baseline"
     use_hierarchical = implementation == "hierarchical_topk"
+    use_direct_row_write = implementation == "direct_row_write"
     use_static_unroll = implementation in (
         "static_unroll",
         "batched_weights",
@@ -233,7 +234,15 @@ def _grouped_topk_kernel(
             cur = jnp.where(sel, _I32_MIN if packed else NEG_INF, cur)  # drop the winner
             return cur, idx.astype(jnp.int32), sel
 
-        if use_static_unroll:
+        if use_direct_row_write:
+            cur = work0
+            for k in range(topk):
+                cur, idx, sel = _select_one(cur)
+                ids_ref[k, :] = jnp.squeeze(idx, axis=0)
+                w_ref[k, :] = jnp.squeeze(
+                    jnp.sum(jnp.where(sel, logits, 0.0), axis=0, keepdims=True), axis=0
+                )
+        elif use_static_unroll:
             cur = work0
             selected_ids = []
             selected_masks = []
@@ -290,8 +299,9 @@ def _grouped_topk_kernel(
                 0, topk, _pick, (work0, ids_init, w_init), unroll=True
             )
 
-    ids_ref[...] = ids_out  # [topk, BT]
-    w_ref[...] = w_out
+    if not use_direct_row_write:
+        ids_ref[...] = ids_out  # [topk, BT]
+        w_ref[...] = w_out
 
 
 def grouped_topk_pallas(
@@ -328,6 +338,7 @@ def grouped_topk_pallas(
         "static_input_parallel",
         "pairwise_group_top2",
         "hierarchical_topk",
+        "direct_row_write",
     ):
         raise ValueError(f"unknown grouped-topk implementation: {implementation}")
     preserve_input_dtype = implementation in ("static_input_dtype", "static_input_parallel")
