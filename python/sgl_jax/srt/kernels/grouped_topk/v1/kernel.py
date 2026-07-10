@@ -30,6 +30,7 @@ import os
 
 import jax
 import jax.experimental.pallas as pl
+import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 
 logger = logging.getLogger(__name__)
@@ -92,7 +93,12 @@ def _grouped_topk_kernel(
         group_scores = jnp.squeeze(v1 + v2, axis=1)  # [G, BT]
 
     use_float_tie = implementation != "baseline"
-    use_static_unroll = implementation in ("static_unroll", "batched_weights")
+    use_static_unroll = implementation in (
+        "static_unroll",
+        "batched_weights",
+        "static_input_dtype",
+        "static_input_parallel",
+    )
     use_batched_weights = implementation == "batched_weights"
 
     def _stable_index(values, iota, size, axis):
@@ -238,9 +244,19 @@ def grouped_topk_pallas(
     exactly when router_logits is bf16; the default f32 path is unchanged.
     """
     bs, e = router_logits.shape
-    if implementation not in ("baseline", "float_tie", "static_unroll", "batched_weights"):
+    if implementation not in (
+        "baseline",
+        "float_tie",
+        "static_unroll",
+        "batched_weights",
+        "static_input_dtype",
+        "static_input_parallel",
+    ):
         raise ValueError(f"unknown grouped-topk implementation: {implementation}")
-    router_logits = router_logits.astype(jnp.float32)
+    preserve_input_dtype = implementation in ("static_input_dtype", "static_input_parallel")
+    parallel_grid = implementation == "static_input_parallel"
+    if not preserve_input_dtype:
+        router_logits = router_logits.astype(jnp.float32)
     bias = correction_bias.astype(jnp.float32)
 
     if block_tokens == "auto":
@@ -290,5 +306,8 @@ def grouped_topk_pallas(
         ],
         interpret=interpret,
         name=f"grouped-topk-{implementation}" + ("-packed" if packed else ""),
+        compiler_params=(
+            pltpu.CompilerParams(dimension_semantics=("parallel",)) if parallel_grid else None
+        ),
     )(router_logits, bias)
     return weights_t.T, ids_t.T

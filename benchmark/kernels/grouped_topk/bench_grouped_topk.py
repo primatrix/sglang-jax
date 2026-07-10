@@ -140,9 +140,14 @@ def _trace_scope_us(run_fn, scope, tag, warmup=3, iters=20):
     return scope_tot / max(nmod, 1), len(names)
 
 
-def bench_config(name, E, G, Gtop, k, Ts, implementations):
-    w_gate = jax.device_put(jax.random.normal(jax.random.PRNGKey(3), (H, E), dtype=jnp.float32))
-    bias = jax.device_put(jax.random.normal(jax.random.PRNGKey(1), (E,), dtype=jnp.float32) * 0.1)
+def bench_config(name, E, G, Gtop, k, Ts, implementations, input_dtype):
+    dtype = jnp.bfloat16 if input_dtype == "bf16" else jnp.float32
+    w_gate = jax.device_put(jax.random.normal(jax.random.PRNGKey(3), (H, E), dtype=dtype))
+    bias = jax.device_put(
+        (jax.random.normal(jax.random.PRNGKey(1), (E,), dtype=jnp.float32) * 0.1).astype(
+            dtype
+        )
+    )
     sfn = jax.jit(make_sort(w_gate, bias, G, Gtop, k))
     ffns = {
         implementation: jax.jit(make_fused(w_gate, bias, G, Gtop, k, implementation))
@@ -152,7 +157,7 @@ def bench_config(name, E, G, Gtop, k, Ts, implementations):
     print(f"{'T':>7} {'variant':>16} {'sort_us':>9} {'fused_us':>9} {'speedup':>8} | {'nS':>3} {'nF':>3}")
     failed_checks = []
     for T in Ts:
-        h = jax.device_put(jax.random.normal(jax.random.PRNGKey(5), (T, H), dtype=jnp.float32))
+        h = jax.device_put(jax.random.normal(jax.random.PRNGKey(5), (T, H), dtype=dtype))
         jax.block_until_ready(sfn(h))
         ref_out = sfn(h)
         baseline_out = ffns["baseline"](h)
@@ -206,6 +211,7 @@ def main():
         default="baseline,float_tie,static_unroll,batched_weights",
         help="comma-separated cumulative implementation variants",
     )
+    ap.add_argument("--input-dtype", choices=("f32", "bf16"), default="f32")
     a = ap.parse_args()
     print(f"JAX {jax.__version__} | {jax.devices()[0].platform} | n_dev {len(jax.devices())}")
     try:
@@ -223,7 +229,7 @@ def main():
     for spec in a.configs.split(","):
         name, cfg = spec.split(":")
         E, G, Gtop, k = (int(v) for v in cfg.split("/"))
-        bench_config(name, E, G, Gtop, k, Ts, implementations)
+        bench_config(name, E, G, Gtop, k, Ts, implementations, a.input_dtype)
 
 
 if __name__ == "__main__":
