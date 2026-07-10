@@ -96,8 +96,9 @@ def _grouped_topk_kernel(
             # This removes argmax/iota/mask state from the two-pass top-2 path.
             lhs = sg[:, :, None, :]  # [G, S, 1, BT]
             rhs = sg[:, None, :, :]  # [G, 1, S, BT]
-            lhs_idx = jnp.arange(S, dtype=jnp.int32)[None, :, None, None]
-            rhs_idx = jnp.arange(S, dtype=jnp.int32)[None, None, :, None]
+            pair_shape = (n_group, S, S, bt)
+            lhs_idx = jax.lax.broadcasted_iota(jnp.int32, pair_shape, 1)
+            rhs_idx = jax.lax.broadcasted_iota(jnp.int32, pair_shape, 2)
             better = (rhs > lhs) | ((rhs == lhs) & (rhs_idx < lhs_idx))
             rank = jnp.sum(better.astype(jnp.int32), axis=2)
             v1 = jnp.sum(jnp.where(rank == 0, sg, 0.0), axis=1)
