@@ -86,15 +86,30 @@ def _grouped_topk_kernel(
     with jax.named_scope("bias_add"):
         scores = logits + bias_ref[...][:, None]  # [E, BT] post-bias
 
-    # ① group score = sum of top-2 within each group, via 2-pass max (no sort). argmax tie-break is
-    #    irrelevant here — the top-2 sum is identical whichever of two equal maxima is masked first.
+    use_pairwise_group_rank = implementation == "pairwise_group_top2"
+
+    # ① group score = sum of top-2 within each group.
     with jax.named_scope("group_top2"):
         sg = jnp.reshape(scores, (n_group, S, bt))  # [G, S, BT]
-        v1 = jnp.max(sg, axis=1, keepdims=True)
-        i1 = jnp.argmax(sg, axis=1, keepdims=True)
-        s_iota = jax.lax.broadcasted_iota(jnp.int32, (n_group, S, bt), 1)
-        v2 = jnp.max(jnp.where(s_iota == i1, NEG_INF, sg), axis=1, keepdims=True)
-        group_scores = jnp.squeeze(v1 + v2, axis=1)  # [G, BT]
+        if use_pairwise_group_rank:
+            # For S=32, compute the stable local rank of every score with pairwise comparisons.
+            # This removes argmax/iota/mask state from the two-pass top-2 path.
+            lhs = sg[:, :, None, :]  # [G, S, 1, BT]
+            rhs = sg[:, None, :, :]  # [G, 1, S, BT]
+            lhs_idx = jnp.arange(S, dtype=jnp.int32)[None, :, None, None]
+            rhs_idx = jnp.arange(S, dtype=jnp.int32)[None, None, :, None]
+            better = (rhs > lhs) | ((rhs == lhs) & (rhs_idx < lhs_idx))
+            rank = jnp.sum(better.astype(jnp.int32), axis=2)
+            v1 = jnp.sum(jnp.where(rank == 0, sg, 0.0), axis=1)
+            v2 = jnp.sum(jnp.where(rank == 1, sg, 0.0), axis=1)
+            group_scores = v1 + v2
+        else:
+            # The top-2 sum is tie-independent, so argmax ordering is irrelevant here.
+            v1 = jnp.max(sg, axis=1, keepdims=True)
+            i1 = jnp.argmax(sg, axis=1, keepdims=True)
+            s_iota = jax.lax.broadcasted_iota(jnp.int32, (n_group, S, bt), 1)
+            v2 = jnp.max(jnp.where(s_iota == i1, NEG_INF, sg), axis=1, keepdims=True)
+            group_scores = jnp.squeeze(v1 + v2, axis=1)  # [G, BT]
 
     use_float_tie = implementation != "baseline"
     use_static_unroll = implementation in (
@@ -103,6 +118,7 @@ def _grouped_topk_kernel(
         "static_parallel",
         "static_input_dtype",
         "static_input_parallel",
+        "pairwise_group_top2",
     )
     use_batched_weights = implementation == "batched_weights"
 
@@ -257,6 +273,7 @@ def grouped_topk_pallas(
         "static_parallel",
         "static_input_dtype",
         "static_input_parallel",
+        "pairwise_group_top2",
     ):
         raise ValueError(f"unknown grouped-topk implementation: {implementation}")
     preserve_input_dtype = implementation in ("static_input_dtype", "static_input_parallel")
