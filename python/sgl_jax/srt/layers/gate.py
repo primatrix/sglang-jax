@@ -101,12 +101,21 @@ class TopK(nnx.Module):
         correction_bias: jax.Array = None,
         dispatch_info: ExpertLocationMetadata | None = None,
     ):
-        router_logits = router_logits.astype(jnp.float32)
+        # The Pallas biased-grouped kernel widens bf16 after loading its input tile. All other
+        # routing paths retain the existing f32 contract.
+        use_bf16_grouped_kernel = (
+            router_logits.dtype == jnp.bfloat16
+            and correction_bias is not None
+            and (self.num_expert_group > 0 or self.topk_group > 0)
+            and _grouped_topk_kernel_enabled()
+        )
+        if not use_bf16_grouped_kernel:
+            router_logits = router_logits.astype(jnp.float32)
 
         if self.num_expert_group > 0 or self.topk_group > 0:
             if correction_bias is not None:
                 topk_weights, topk_ids = self._biased_grouped_topk(
-                    router_logits, correction_bias, packed=router_logits.dtype == jnp.bfloat16
+                    router_logits, correction_bias, packed=False
                 )
             else:
                 topk_weights, topk_ids = self._grouped_topk(router_logits)

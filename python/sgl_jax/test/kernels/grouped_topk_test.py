@@ -235,6 +235,37 @@ _requires_tpu = pytest.mark.skipif(
 
 
 @_requires_tpu
+@pytest.mark.parametrize("bs", (256, 1024, 2048))
+def test_unpacked_bf16_input_matches_external_f32_cast(bs):
+    """Moving the lossless bf16->f32 widening into Pallas must not change routing outputs."""
+    E, G, Gtop, k = 256, 8, 4, 8
+    logits = _logits(bs, E, seed=17).astype(jnp.bfloat16)
+    bias = (jax.random.normal(jax.random.PRNGKey(6), (E,), dtype=jnp.float32) * 0.1).astype(
+        jnp.bfloat16
+    )
+    w_external, ids_external = grouped_topk_pallas(
+        logits.astype(jnp.float32),
+        bias,
+        num_expert_group=G,
+        topk_group=Gtop,
+        topk=k,
+        block_tokens="auto",
+        interpret=False,
+    )
+    w_internal, ids_internal = grouped_topk_pallas(
+        logits,
+        bias,
+        num_expert_group=G,
+        topk_group=Gtop,
+        topk=k,
+        block_tokens="auto",
+        interpret=False,
+    )
+    np.testing.assert_array_equal(np.array(ids_internal), np.array(ids_external))
+    np.testing.assert_array_equal(np.array(w_internal), np.array(w_external))
+
+
+@_requires_tpu
 @pytest.mark.parametrize("E,G,Gtop,k,name", CONFIGS)
 @pytest.mark.parametrize("bs", BATCHES)
 def test_packed_eq_ref_bf16(E, G, Gtop, k, name, bs):

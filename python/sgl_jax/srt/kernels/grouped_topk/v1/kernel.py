@@ -67,7 +67,7 @@ def get_interpret() -> bool:
 
 
 def _grouped_topk_kernel(
-    logits_ref,  # [BT, E] f32  (router_logits, PRE-bias) — loaded token-major
+    logits_ref,  # [BT, E] bf16/f32 (router_logits, PRE-bias) — loaded token-major
     bias_ref,  # [E]     f32  (correction_bias)
     w_ref,  # [topk, BT] f32  out: weights   (topk in sublane, BT in lane)
     ids_ref,  # [topk, BT] i32  out: expert ids
@@ -77,12 +77,18 @@ def _grouped_topk_kernel(
     topk: int,
     num_experts: int,
     packed: bool = False,
+    input_bf16: bool = False,
 ):
     S = num_experts // n_group
     E = num_experts
 
     # Transpose to [E, BT]: experts in sublane, tokens in lane. Every reduction below is over axis 0.
-    logits = logits_ref[...].astype(jnp.float32).T  # [E, BT] pre-bias
+    if input_bf16:
+        # Keep the HBM/VMEM input tile compact, then widen after the expert-major transpose.
+        logits = logits_ref[...].T.astype(jnp.float32)
+    else:
+        # Preserve the established f32 lowering and its gate-fed layout.
+        logits = logits_ref[...].astype(jnp.float32).T
     bt = logits.shape[1]
     with jax.named_scope("bias_add"):
         scores = logits + bias_ref[...][:, None]  # [E, BT] post-bias
@@ -215,12 +221,14 @@ def grouped_topk_pallas(
     lane dim), falling back to a single whole-batch block. Final selection is Python-unrolled
     because topk is small and static.
 
-    `packed=True` uses the bf16 packed-key final select (single reduction per pick, bit-exact to
-    `lax.top_k` at bf16 precision). It is lossless only for bf16 inputs, so the caller enables it
-    exactly when router_logits is bf16; the default f32 path is unchanged.
+    bf16 router logits stay bf16 through the Pallas input boundary and are widened to f32 inside the
+    kernel before bias addition. `packed=True` is a separate, explicit bf16-rounded final-select
+    contract; normal callers leave it disabled so selection remains on f32 post-bias scores.
     """
     bs, e = router_logits.shape
-    router_logits = router_logits.astype(jnp.float32)
+    input_bf16 = router_logits.dtype == jnp.bfloat16
+    if not input_bf16:
+        router_logits = router_logits.astype(jnp.float32)
     bias = correction_bias.astype(jnp.float32)
 
     if block_tokens == "auto":
@@ -252,6 +260,7 @@ def grouped_topk_pallas(
         topk=topk,
         num_experts=e,
         packed=packed,
+        input_bf16=input_bf16,
     )
     # Kernel emits [topk, BS] (BS in lanes, dense); the `.T` to the [BS, topk] contract lowers to a
     # free bitcast ([topk,BS]{1,0} == [BS,topk]{0,1}), avoiding an output relayout copy.
