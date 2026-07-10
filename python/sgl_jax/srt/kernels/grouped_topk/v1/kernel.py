@@ -77,7 +77,11 @@ def _grouped_topk_kernel(
     E = num_experts
 
     # Transpose to [E, BT]: experts in sublane, tokens in lane. Every reduction below is over axis 0.
-    logits = logits_ref[...].astype(jnp.float32).T  # [E, BT] pre-bias
+    transpose_before_cast = implementation in ("static_input_dtype", "static_input_parallel")
+    if transpose_before_cast:
+        logits = logits_ref[...].T.astype(jnp.float32)  # bf16 tile: transpose, then widen
+    else:
+        logits = logits_ref[...].astype(jnp.float32).T  # f32 tile / historical lowering
     bt = logits.shape[1]
     with jax.named_scope("bias_add"):
         scores = logits + bias_ref[...][:, None]  # [E, BT] post-bias
@@ -96,6 +100,7 @@ def _grouped_topk_kernel(
     use_static_unroll = implementation in (
         "static_unroll",
         "batched_weights",
+        "static_parallel",
         "static_input_dtype",
         "static_input_parallel",
     )
@@ -249,12 +254,13 @@ def grouped_topk_pallas(
         "float_tie",
         "static_unroll",
         "batched_weights",
+        "static_parallel",
         "static_input_dtype",
         "static_input_parallel",
     ):
         raise ValueError(f"unknown grouped-topk implementation: {implementation}")
     preserve_input_dtype = implementation in ("static_input_dtype", "static_input_parallel")
-    parallel_grid = implementation == "static_input_parallel"
+    parallel_grid = implementation in ("static_parallel", "static_input_parallel")
     if not preserve_input_dtype:
         router_logits = router_logits.astype(jnp.float32)
     bias = correction_bias.astype(jnp.float32)
