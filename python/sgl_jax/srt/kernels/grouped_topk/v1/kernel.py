@@ -14,12 +14,13 @@ Design — tokens in the lane dim (`[E, BT]`):
 Algorithm (matches `_biased_grouped_topk` exactly, ties included):
     scores = router_logits + correction_bias                    # post-bias "scores_for_choice"
     ① group score = sum of top-2 per group (2-pass max, no sort)
-    ② select `topk_group` groups        (max + masked-min: lowest-index tie-break)
-    ③ mask dropped groups to -inf, select `topk` experts (max + masked-min), weight = PRE-bias logit
+    ② select `topk_group` groups        (max + reversed-index max: stable tie-break)
+    ③ mask dropped groups to -inf, select `topk` experts likewise, weight = PRE-bias logit
 Renormalize / routed_scaling_factor are applied by the caller (`TopK.__call__`).
 
-Tie-break: selection uses `max` + masked `min(iota)` (smallest index achieving the max) rather than
-`argmax`, because TPU Mosaic's reduction argmax does not break ties toward the lowest index.
+Tie-break: selection uses two float `max` reductions. The second reduces reversed expert indices
+among values equal to the first maximum, recovering the lowest index without an integer reduction.
+Reversed indices are exactly representable in f32 for every supported expert/group count.
 """
 
 from __future__ import annotations
@@ -30,7 +31,6 @@ import os
 
 import jax
 import jax.experimental.pallas as pl
-import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 
 logger = logging.getLogger(__name__)
@@ -71,74 +71,36 @@ def _grouped_topk_kernel(
     topk: int,
     num_experts: int,
     packed: bool = False,
-    implementation: str = "baseline",
 ):
     S = num_experts // n_group
     E = num_experts
 
     # Transpose to [E, BT]: experts in sublane, tokens in lane. Every reduction below is over axis 0.
-    transpose_before_cast = implementation in ("static_input_dtype", "static_input_parallel")
-    if transpose_before_cast:
-        logits = logits_ref[...].T.astype(jnp.float32)  # bf16 tile: transpose, then widen
-    else:
-        logits = logits_ref[...].astype(jnp.float32).T  # f32 tile / historical lowering
+    logits = logits_ref[...].astype(jnp.float32).T  # [E, BT] pre-bias
     bt = logits.shape[1]
     with jax.named_scope("bias_add"):
         scores = logits + bias_ref[...][:, None]  # [E, BT] post-bias
 
-    use_pairwise_group_rank = implementation == "pairwise_group_top2"
-
     # ① group score = sum of top-2 within each group.
     with jax.named_scope("group_top2"):
         sg = jnp.reshape(scores, (n_group, S, bt))  # [G, S, BT]
-        if use_pairwise_group_rank:
-            # For S=32, compute the stable local rank of every score with pairwise comparisons.
-            # This removes argmax/iota/mask state from the two-pass top-2 path.
-            lhs = sg[:, :, None, :]  # [G, S, 1, BT]
-            rhs = sg[:, None, :, :]  # [G, 1, S, BT]
-            pair_shape = (n_group, S, S, bt)
-            lhs_idx = jax.lax.broadcasted_iota(jnp.int32, pair_shape, 1)
-            rhs_idx = jax.lax.broadcasted_iota(jnp.int32, pair_shape, 2)
-            better = (rhs > lhs) | ((rhs == lhs) & (rhs_idx < lhs_idx))
-            rank = jnp.sum(better.astype(jnp.int32), axis=2)
-            v1 = jnp.sum(jnp.where(rank == 0, sg, 0.0), axis=1)
-            v2 = jnp.sum(jnp.where(rank == 1, sg, 0.0), axis=1)
-            group_scores = v1 + v2
-        else:
-            # The top-2 sum is tie-independent, so argmax ordering is irrelevant here.
-            v1 = jnp.max(sg, axis=1, keepdims=True)
-            i1 = jnp.argmax(sg, axis=1, keepdims=True)
-            s_iota = jax.lax.broadcasted_iota(jnp.int32, (n_group, S, bt), 1)
-            v2 = jnp.max(jnp.where(s_iota == i1, NEG_INF, sg), axis=1, keepdims=True)
-            group_scores = jnp.squeeze(v1 + v2, axis=1)  # [G, BT]
-
-    use_float_tie = implementation != "baseline"
-    use_hierarchical = implementation == "hierarchical_topk"
-    use_direct_row_write = implementation == "direct_row_write"
-    use_static_unroll = implementation in (
-        "static_unroll",
-        "batched_weights",
-        "static_parallel",
-        "static_input_dtype",
-        "static_input_parallel",
-        "pairwise_group_top2",
-        "hierarchical_topk",
-    )
-    use_batched_weights = implementation == "batched_weights"
+        # The top-2 sum is tie-independent, so argmax ordering is irrelevant here.
+        v1 = jnp.max(sg, axis=1, keepdims=True)
+        i1 = jnp.argmax(sg, axis=1, keepdims=True)
+        s_iota = jax.lax.broadcasted_iota(jnp.int32, (n_group, S, bt), 1)
+        v2 = jnp.max(jnp.where(s_iota == i1, NEG_INF, sg), axis=1, keepdims=True)
+        group_scores = jnp.squeeze(v1 + v2, axis=1)  # [G, BT]
 
     def _stable_index(values, iota, size, axis):
         vmax = jnp.max(values, axis=axis, keepdims=True)
-        if use_float_tie:
-            # TPU float reductions are substantially cheaper than integer reductions. Reversed
-            # indices are exact in f32 for all supported expert/group counts.
-            rev = (size - 1 - iota).astype(jnp.float32)
-            rev_idx = jnp.max(
-                jnp.where(values == vmax, rev, jnp.float32(-1.0)),
-                axis=axis,
-                keepdims=True,
-            )
-            return (size - 1 - rev_idx.astype(jnp.int32)).astype(jnp.int32)
-        return jnp.min(jnp.where(values == vmax, iota, size), axis=axis, keepdims=True)
+        # TPU float reductions are substantially cheaper than integer reductions.
+        rev = (size - 1 - iota).astype(jnp.float32)
+        rev_idx = jnp.max(
+            jnp.where(values == vmax, rev, jnp.float32(-1.0)),
+            axis=axis,
+            keepdims=True,
+        )
+        return (size - 1 - rev_idx.astype(jnp.int32)).astype(jnp.int32)
 
     # ② select `topk_group` groups, lowest-index tie-break.
     with jax.named_scope("group_select"):
@@ -153,62 +115,25 @@ def _grouped_topk_kernel(
 
     # ③ mask experts in dropped groups -> -inf. Applied ONCE (loop-invariant) before the pick loop.
     with jax.named_scope("expert_mask"):
-        if use_hierarchical:
-            grouped_scores = jnp.reshape(scores, (n_group, S, bt))
-            grouped_logits = jnp.reshape(logits, (n_group, S, bt))
-            local_iota = jax.lax.broadcasted_iota(jnp.int32, (n_group, S, bt), 1)
-            group_iota = jax.lax.broadcasted_iota(jnp.int32, (n_group, 1, bt), 0)
-            local_work = grouped_scores
-            candidate_scores = []
-            candidate_ids = []
-            candidate_logits = []
-            for _ in range(topk):
-                local_idx = _stable_index(local_work, local_iota, S, axis=1)
-                local_sel = local_iota == local_idx
-                candidate_scores.append(
-                    jnp.sum(jnp.where(local_sel, grouped_scores, 0.0), axis=1)
-                )
-                candidate_ids.append(
-                    jnp.squeeze(group_iota * S + local_idx, axis=1).astype(jnp.int32)
-                )
-                candidate_logits.append(
-                    jnp.sum(jnp.where(local_sel, grouped_logits, 0.0), axis=1)
-                )
-                local_work = jnp.where(local_sel, NEG_INF, local_work)
-            candidate_scores = jnp.stack(candidate_scores, axis=1)  # [G, k, BT]
-            candidate_scores = jnp.where(group_mask[:, None, :], candidate_scores, NEG_INF)
-            candidate_ids = jnp.reshape(jnp.stack(candidate_ids, axis=1), (n_group * topk, bt))
-            candidate_logits = jnp.reshape(
-                jnp.stack(candidate_logits, axis=1), (n_group * topk, bt)
-            )
-            masked = jnp.reshape(candidate_scores, (n_group * topk, bt))
-        else:
-            masked = jnp.reshape(
-                jnp.where(
-                    group_mask[:, None, :],
-                    jnp.reshape(scores, (n_group, S, bt)),
-                    NEG_INF,
-                ),
-                (E, bt),
-            )  # [E, BT]
+        masked = jnp.reshape(
+            jnp.where(group_mask[:, None, :], jnp.reshape(scores, (n_group, S, bt)), NEG_INF),
+            (E, bt),
+        )  # [E, BT]
 
-    # ④ select `topk` experts, lowest-index tie-break; weight = PRE-bias logit at the winner. A
-    #    fori_loop carries the [E,BT] working array and writes each pick into ROW k of the [topk,BT]
-    #    outputs, so per-block VMEM stays O(E*BT), independent of topk. Fully unrolled (topk is
-    #    small and static) so the picks overlap.
+    # ④ select `topk` experts, lowest-index tie-break; weight = PRE-bias logit at the winner. The
+    #    small static top-k is Python-unrolled, so the picks overlap without loop-carried output
+    #    buffers or a row iota.
     #
     #    Two selection modes (compile-time `packed`):
-    #      packed=False — the f32 contract: `max` + masked-`min` finds the smallest expert id at the
-    #        max score, bit-exact to `lax.top_k` on the f32 scores.
+    #      packed=False — the f32 contract: two float `max` reductions find the smallest expert id
+    #        at the max score, bit-exact to `lax.top_k` on the f32 scores.
     #      packed=True  — the bf16 contract: bf16-round each score into an int32 order-preserving key
     #        (plain int order == (score DESC, index ASC)), so each pick is ONE reduction + a low-bit
     #        decode instead of the max+masked-min pair. Lossless for bf16 inputs (the low 16 mantissa
     #        bits are zero, so packing the id into those 16 bits discards nothing). See gate.py:
     #        the caller selects packed only when router_logits is bf16.
     with jax.named_scope("final_select"):
-        selection_size = n_group * topk if use_hierarchical else E
-        e_iota = jax.lax.broadcasted_iota(jnp.int32, (selection_size, bt), 0)
-        source_logits = candidate_logits if use_hierarchical else logits
+        e_iota = jax.lax.broadcasted_iota(jnp.int32, (E, bt), 0)
         if packed:
             # Index goes in the low 16 bits (bf16-rounded mantissa, all zero; score lives in bits
             # 16-31). op count is identical to a tighter b (masks are compile-time constants).
@@ -229,79 +154,33 @@ def _grouped_topk_kernel(
                 kmax = jnp.max(cur, axis=0, keepdims=True)  # [1, BT] single reduction
                 idx = (E - 1) - (kmax & low_mask)  # [1, BT] lowest-index winner from the low bits
             else:
-                idx = _stable_index(cur, e_iota, selection_size, axis=0)
+                idx = _stable_index(cur, e_iota, E, axis=0)
             sel = e_iota == idx  # [E, BT]
             cur = jnp.where(sel, _I32_MIN if packed else NEG_INF, cur)  # drop the winner
             return cur, idx.astype(jnp.int32), sel
 
-        if use_direct_row_write:
-            cur = work0
-            for k in range(topk):
-                cur, idx, sel = _select_one(cur)
-                ids_ref[k, :] = jnp.squeeze(idx, axis=0)
-                w_ref[k, :] = jnp.squeeze(
+        # Python-unroll the small static top-k. This removes the loop-carried row iota and full
+        # output buffers used by the original fori_loop while preserving exact selection order.
+        cur = work0
+        selected_ids = []
+        selected_masks = []
+        for _ in range(topk):
+            cur, idx, sel = _select_one(cur)
+            selected_ids.append(jnp.squeeze(idx, axis=0))
+            selected_masks.append(sel)
+        ids_out = jnp.stack(selected_ids, axis=0)
+        w_out = jnp.stack(
+            [
+                jnp.squeeze(
                     jnp.sum(jnp.where(sel, logits, 0.0), axis=0, keepdims=True), axis=0
                 )
-        elif use_static_unroll:
-            cur = work0
-            selected_ids = []
-            selected_masks = []
-            for _ in range(topk):
-                cur, idx, sel = _select_one(cur)
-                if use_hierarchical:
-                    selected_ids.append(
-                        jnp.squeeze(
-                            jnp.sum(
-                                jnp.where(sel, candidate_ids.astype(jnp.float32), 0.0),
-                                axis=0,
-                                keepdims=True,
-                            ),
-                            axis=0,
-                        ).astype(jnp.int32)
-                    )
-                else:
-                    selected_ids.append(jnp.squeeze(idx, axis=0))
-                if not use_batched_weights:
-                    selected_masks.append(sel)
-            ids_out = jnp.stack(selected_ids, axis=0)
-            if use_batched_weights:
-                # Extract every pre-bias weight after selection, sharing the broadcast/compare.
-                all_sel = e_iota[None, :, :] == ids_out[:, None, :]
-                w_out = jnp.sum(jnp.where(all_sel, logits[None, :, :], 0.0), axis=1)
-            else:
-                w_out = jnp.stack(
-                    [
-                        jnp.squeeze(
-                            jnp.sum(
-                                jnp.where(sel, source_logits, 0.0), axis=0, keepdims=True
-                            ),
-                            axis=0,
-                        )
-                        for sel in selected_masks
-                    ],
-                    axis=0,
-                )
-        else:
-            row_iota = jax.lax.broadcasted_iota(jnp.int32, (topk, bt), 0)
-            ids_init = jnp.full((topk, bt), -1, dtype=jnp.int32)
-            w_init = jnp.zeros((topk, bt), dtype=jnp.float32)
+                for sel in selected_masks
+            ],
+            axis=0,
+        )
 
-            def _pick(k, carry):
-                cur, ids_buf, w_buf = carry
-                cur, idx, sel = _select_one(cur)
-                wval = jnp.sum(jnp.where(sel, logits, 0.0), axis=0, keepdims=True)
-                write = row_iota == k
-                ids_buf = jnp.where(write, idx, ids_buf)
-                w_buf = jnp.where(write, wval.astype(jnp.float32), w_buf)
-                return cur, ids_buf, w_buf
-
-            _, ids_out, w_out = jax.lax.fori_loop(
-                0, topk, _pick, (work0, ids_init, w_init), unroll=True
-            )
-
-    if not use_direct_row_write:
-        ids_ref[...] = ids_out  # [topk, BT]
-        w_ref[...] = w_out
+    ids_ref[...] = ids_out  # [topk, BT]
+    w_ref[...] = w_out
 
 
 def grouped_topk_pallas(
@@ -314,42 +193,24 @@ def grouped_topk_pallas(
     block_tokens: int | str = "auto",
     interpret: bool | None = None,
     packed: bool = False,
-    implementation: str = "baseline",
 ):
     """Biased grouped top-k via argmax-selection. Returns (topk_weights[BS,k], topk_ids[BS,k]).
 
     Drop-in for `gate.py:TopK._biased_grouped_topk` (renormalize / routed_scaling_factor applied by
     the caller). `block_tokens="auto"` picks the largest 128-aligned divisor of BS (tokens are in the
-    lane dim), falling back to a single whole-batch block. The final-select `fori_loop` is fully
-    unrolled (topk is small and static).
+    lane dim), falling back to a single whole-batch block. Final selection is Python-unrolled
+    because topk is small and static.
 
     `packed=True` uses the bf16 packed-key final select (single reduction per pick, bit-exact to
     `lax.top_k` at bf16 precision). It is lossless only for bf16 inputs, so the caller enables it
     exactly when router_logits is bf16; the default f32 path is unchanged.
     """
     bs, e = router_logits.shape
-    if implementation not in (
-        "baseline",
-        "float_tie",
-        "static_unroll",
-        "batched_weights",
-        "static_parallel",
-        "static_input_dtype",
-        "static_input_parallel",
-        "pairwise_group_top2",
-        "hierarchical_topk",
-        "direct_row_write",
-    ):
-        raise ValueError(f"unknown grouped-topk implementation: {implementation}")
-    preserve_input_dtype = implementation in ("static_input_dtype", "static_input_parallel")
-    parallel_grid = implementation in ("static_parallel", "static_input_parallel")
-    if not preserve_input_dtype:
-        router_logits = router_logits.astype(jnp.float32)
+    router_logits = router_logits.astype(jnp.float32)
     bias = correction_bias.astype(jnp.float32)
 
     if block_tokens == "auto":
-        auto_cap = 512 if implementation == "pairwise_group_top2" else SAFE_AUTO_BT
-        bt = _largest_safe_divisor(bs, cap=auto_cap, align=128) or bs
+        bt = _largest_safe_divisor(bs, cap=SAFE_AUTO_BT, align=128) or bs
         if bt > SAFE_AUTO_BT:
             logger.warning(
                 "grouped_topk: auto block_tokens fell back to whole-batch BT=%d (BS=%d has no "
@@ -374,7 +235,6 @@ def grouped_topk_pallas(
         topk=topk,
         num_experts=e,
         packed=packed,
-        implementation=implementation,
     )
     # Kernel emits [topk, BS] (BS in lanes, dense); the `.T` to the [BS, topk] contract lowers to a
     # free bitcast ([topk,BS]{1,0} == [BS,topk]{0,1}), avoiding an output relayout copy.
@@ -394,9 +254,6 @@ def grouped_topk_pallas(
             jax.ShapeDtypeStruct((topk, bs), jnp.int32),
         ],
         interpret=interpret,
-        name=f"grouped-topk-{implementation}" + ("-packed" if packed else ""),
-        compiler_params=(
-            pltpu.CompilerParams(dimension_semantics=("parallel",)) if parallel_grid else None
-        ),
+        name="grouped-topk-packed" if packed else "grouped-topk",
     )(router_logits, bias)
     return weights_t.T, ids_t.T
