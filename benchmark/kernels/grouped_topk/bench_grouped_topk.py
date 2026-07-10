@@ -70,7 +70,7 @@ def make_sort(w_gate, bias, G, Gtop, k):
     return fn
 
 
-def make_fused(w_gate, bias, G, Gtop, k):
+def make_fused(w_gate, bias, G, Gtop, k, implementation="baseline"):
     def fn(hidden):
         logits = _gate(hidden, w_gate)  # gate OUTSIDE the scope
         with jax.named_scope(SCOPE_FUSED):
@@ -82,6 +82,7 @@ def make_fused(w_gate, bias, G, Gtop, k):
                 topk=k,
                 block_tokens="auto",
                 interpret=False,
+                implementation=implementation,
             )
 
     return fn
@@ -139,21 +140,36 @@ def _trace_scope_us(run_fn, scope, tag, warmup=3, iters=20):
     return scope_tot / max(nmod, 1), len(names)
 
 
-def bench_config(name, E, G, Gtop, k, Ts):
+def bench_config(name, E, G, Gtop, k, Ts, implementations):
     w_gate = jax.device_put(jax.random.normal(jax.random.PRNGKey(3), (H, E), dtype=jnp.float32))
     bias = jax.device_put(jax.random.normal(jax.random.PRNGKey(1), (E,), dtype=jnp.float32) * 0.1)
     sfn = jax.jit(make_sort(w_gate, bias, G, Gtop, k))
-    ffn = jax.jit(make_fused(w_gate, bias, G, Gtop, k))
+    ffns = {
+        implementation: jax.jit(make_fused(w_gate, bias, G, Gtop, k, implementation))
+        for implementation in implementations
+    }
     print(f"\n=== {name} (E={E}, G={G}, Gtop={Gtop}, k={k}) ===")
-    print(f"{'T':>7} {'sort_us':>9} {'fused_us':>9} {'speedup':>8} | {'nS':>3} {'nF':>3}")
+    print(f"{'T':>7} {'variant':>16} {'sort_us':>9} {'fused_us':>9} {'speedup':>8} | {'nS':>3} {'nF':>3}")
     for T in Ts:
         h = jax.device_put(jax.random.normal(jax.random.PRNGKey(5), (T, H), dtype=jnp.float32))
         jax.block_until_ready(sfn(h))
-        jax.block_until_ready(ffn(h))
+        ref_out = sfn(h)
+        for ffn in ffns.values():
+            got = ffn(h)
+            if not jnp.array_equal(got[1], ref_out[1]):
+                raise AssertionError("fused ids differ from sort reference")
+            if not jnp.allclose(got[0], ref_out[0], rtol=0, atol=1e-6):
+                raise AssertionError("fused weights differ from sort reference")
         sort_us, nS = _trace_scope_us(functools.partial(sfn, h), SCOPE_SORT, f"sort_{name}_{T}")
-        fused_us, nF = _trace_scope_us(functools.partial(ffn, h), SCOPE_FUSED, f"fused_{name}_{T}")
-        sp = sort_us / fused_us if (fused_us == fused_us and fused_us > 0) else float("nan")
-        print(f"{T:>7} {sort_us:>9.2f} {fused_us:>9.2f} {sp:>7.2f}x | {nS:>3} {nF:>3}")
+        for implementation, ffn in ffns.items():
+            fused_us, nF = _trace_scope_us(
+                functools.partial(ffn, h), SCOPE_FUSED, f"fused_{implementation}_{name}_{T}"
+            )
+            sp = sort_us / fused_us if (fused_us == fused_us and fused_us > 0) else float("nan")
+            print(
+                f"{T:>7} {implementation:>16} {sort_us:>9.2f} {fused_us:>9.2f} "
+                f"{sp:>7.2f}x | {nS:>3} {nF:>3}"
+            )
 
 
 def main():
@@ -161,6 +177,11 @@ def main():
     ap.add_argument("--T", default="64,128,256,512,1024,2048,4096,8192,16384,32768")
     ap.add_argument(
         "--configs", default="A_E256:256/8/4/8,B_E512:512/8/4/8", help="name:E/G/Gtop/k comma list"
+    )
+    ap.add_argument(
+        "--implementations",
+        default="baseline,float_tie,static_unroll,batched_weights",
+        help="comma-separated cumulative implementation variants",
     )
     a = ap.parse_args()
     print(f"JAX {jax.__version__} | {jax.devices()[0].platform} | n_dev {len(jax.devices())}")
@@ -175,10 +196,11 @@ def main():
         "router_logits gate-fed for the realistic good layout). No subtraction."
     )
     Ts = [int(x) for x in a.T.split(",")]
+    implementations = a.implementations.split(",")
     for spec in a.configs.split(","):
         name, cfg = spec.split(":")
         E, G, Gtop, k = (int(v) for v in cfg.split("/"))
-        bench_config(name, E, G, Gtop, k, Ts)
+        bench_config(name, E, G, Gtop, k, Ts, implementations)
 
 
 if __name__ == "__main__":
