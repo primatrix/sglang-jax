@@ -155,20 +155,32 @@ def bench_config(name, E, G, Gtop, k, Ts, implementations):
         h = jax.device_put(jax.random.normal(jax.random.PRNGKey(5), (T, H), dtype=jnp.float32))
         jax.block_until_ready(sfn(h))
         ref_out = sfn(h)
+        baseline_out = ffns["baseline"](h)
         valid_ffns = {}
         for implementation, ffn in ffns.items():
             got = ffn(h)
             ids_equal = bool(jnp.array_equal(got[1], ref_out[1]))
+            ids_equal_baseline = bool(jnp.array_equal(got[1], baseline_out[1]))
+            weights_equal_baseline = bool(jnp.array_equal(got[0], baseline_out[0]))
             max_abs_weight_diff = float(jnp.max(jnp.abs(got[0] - ref_out[0])))
-            weights_close = max_abs_weight_diff <= 1e-6
             print(
                 f"CHECK T={T} variant={implementation} ids_equal={ids_equal} "
-                f"max_abs_weight_diff={max_abs_weight_diff:.9g}"
+                f"baseline_bit_exact={ids_equal_baseline and weights_equal_baseline} "
+                f"ref_max_abs_weight_diff={max_abs_weight_diff:.9g}"
             )
-            if ids_equal and weights_close:
+            if ids_equal and ids_equal_baseline and weights_equal_baseline:
                 valid_ffns[implementation] = ffn
             else:
-                failed_checks.append((T, implementation, ids_equal, max_abs_weight_diff))
+                failed_checks.append(
+                    (
+                        T,
+                        implementation,
+                        ids_equal,
+                        ids_equal_baseline,
+                        weights_equal_baseline,
+                        max_abs_weight_diff,
+                    )
+                )
         sort_us, nS = _trace_scope_us(functools.partial(sfn, h), SCOPE_SORT, f"sort_{name}_{T}")
         for implementation, ffn in valid_ffns.items():
             fused_us, nF = _trace_scope_us(
