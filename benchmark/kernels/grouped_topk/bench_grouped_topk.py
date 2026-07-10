@@ -150,18 +150,27 @@ def bench_config(name, E, G, Gtop, k, Ts, implementations):
     }
     print(f"\n=== {name} (E={E}, G={G}, Gtop={Gtop}, k={k}) ===")
     print(f"{'T':>7} {'variant':>16} {'sort_us':>9} {'fused_us':>9} {'speedup':>8} | {'nS':>3} {'nF':>3}")
+    failed_checks = []
     for T in Ts:
         h = jax.device_put(jax.random.normal(jax.random.PRNGKey(5), (T, H), dtype=jnp.float32))
         jax.block_until_ready(sfn(h))
         ref_out = sfn(h)
-        for ffn in ffns.values():
-            got = ffn(h)
-            if not jnp.array_equal(got[1], ref_out[1]):
-                raise AssertionError("fused ids differ from sort reference")
-            if not jnp.allclose(got[0], ref_out[0], rtol=0, atol=1e-6):
-                raise AssertionError("fused weights differ from sort reference")
-        sort_us, nS = _trace_scope_us(functools.partial(sfn, h), SCOPE_SORT, f"sort_{name}_{T}")
+        valid_ffns = {}
         for implementation, ffn in ffns.items():
+            got = ffn(h)
+            ids_equal = bool(jnp.array_equal(got[1], ref_out[1]))
+            max_abs_weight_diff = float(jnp.max(jnp.abs(got[0] - ref_out[0])))
+            weights_close = max_abs_weight_diff <= 1e-6
+            print(
+                f"CHECK T={T} variant={implementation} ids_equal={ids_equal} "
+                f"max_abs_weight_diff={max_abs_weight_diff:.9g}"
+            )
+            if ids_equal and weights_close:
+                valid_ffns[implementation] = ffn
+            else:
+                failed_checks.append((T, implementation, ids_equal, max_abs_weight_diff))
+        sort_us, nS = _trace_scope_us(functools.partial(sfn, h), SCOPE_SORT, f"sort_{name}_{T}")
+        for implementation, ffn in valid_ffns.items():
             fused_us, nF = _trace_scope_us(
                 functools.partial(ffn, h), SCOPE_FUSED, f"fused_{implementation}_{name}_{T}"
             )
@@ -170,6 +179,8 @@ def bench_config(name, E, G, Gtop, k, Ts, implementations):
                 f"{T:>7} {implementation:>16} {sort_us:>9.2f} {fused_us:>9.2f} "
                 f"{sp:>7.2f}x | {nS:>3} {nF:>3}"
             )
+    if failed_checks:
+        raise AssertionError(f"fused correctness failures: {failed_checks}")
 
 
 def main():
