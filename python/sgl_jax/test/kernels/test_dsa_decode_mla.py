@@ -248,6 +248,126 @@ class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
         self.assertEqual(actual.dtype, jnp.bfloat16)
         np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=1e-2)
 
+    def test_interpret_2048_selected_slots_matches_reference(self):
+        """A fixed K=2048 must not unroll one Pallas conditional per slot."""
+        rng = np.random.default_rng(3)
+        ql_nope = jnp.asarray(
+            rng.standard_normal((1, 1, 128), dtype=np.float32), dtype=jnp.bfloat16
+        )
+        q_pe = jnp.asarray(
+            rng.standard_normal((1, 1, 128), dtype=np.float32), dtype=jnp.bfloat16
+        )
+        cache_kv = jnp.asarray(
+            rng.standard_normal((1, 2048, 1, 256), dtype=np.float32), dtype=jnp.bfloat16
+        )
+        topk_slots = jnp.asarray((np.arange(2048, dtype=np.int32) * 17) % 2048)[None, :]
+        valid_counts = jnp.asarray([2048], dtype=jnp.int32)
+
+        actual = dsa_decode_mla_attention(
+            ql_nope,
+            q_pe,
+            cache_kv,
+            topk_slots,
+            valid_counts,
+            sm_scale=0.01,
+            interpret=True,
+        )
+        # NumPy's macOS BLAS can emit spurious FP warnings for this large,
+        # finite FP32 matmul; the oracle result itself remains finite.
+        with np.errstate(all="ignore"):
+            expected = reference_dsa_decode_mla_attention(
+                ql_nope, q_pe, cache_kv, topk_slots, valid_counts, sm_scale=0.01
+            )
+
+        self.assertTrue(np.isfinite(expected).all())
+        np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=1e-2)
+
+    def test_unchecked_launch_is_jittable_in_interpret_mode(self):
+        from sgl_jax.srt.kernels.mla.dsa import dsa_decode_mla_attention_unchecked
+
+        ql_nope, q_pe, cache_kv, topk_slots, valid_counts = self._inputs()
+        ql_nope = jnp.asarray(ql_nope, dtype=jnp.bfloat16)
+        q_pe = jnp.asarray(q_pe, dtype=jnp.bfloat16)
+        cache_kv = jnp.asarray(cache_kv, dtype=jnp.bfloat16)
+        topk_slots = jnp.asarray(topk_slots)
+        valid_counts = jnp.asarray(valid_counts)
+
+        @jax.jit
+        def launch(ql_nope, q_pe, cache_kv, topk_slots, valid_counts):
+            return dsa_decode_mla_attention_unchecked(
+                ql_nope,
+                q_pe,
+                cache_kv,
+                topk_slots,
+                valid_counts,
+                sm_scale=0.25,
+                interpret=True,
+            )
+
+        actual = launch(ql_nope, q_pe, cache_kv, topk_slots, valid_counts)
+        expected = reference_dsa_decode_mla_attention(
+            ql_nope, q_pe, cache_kv, topk_slots, valid_counts, sm_scale=0.25
+        )
+
+        np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=1e-2)
+
+    def test_validated_wrapper_rejects_invalid_inputs_before_dispatch(self):
+        ql_nope, q_pe, cache_kv, topk_slots, valid_counts = self._inputs()
+        invalid_cases = (
+            ("shape", ql_nope[..., None], q_pe, cache_kv, topk_slots, valid_counts),
+            ("dtype", ql_nope.astype(np.int32), q_pe, cache_kv, topk_slots, valid_counts),
+            (
+                "count",
+                ql_nope,
+                q_pe,
+                cache_kv,
+                topk_slots,
+                np.array([topk_slots.shape[1] + 1, valid_counts[1]], dtype=np.int32),
+            ),
+            (
+                "bounds",
+                ql_nope,
+                q_pe,
+                cache_kv,
+                np.array(
+                    [[np.prod(cache_kv.shape[:3]), *topk_slots[0, 1:]], topk_slots[1]],
+                    dtype=np.int32,
+                ),
+                valid_counts,
+            ),
+        )
+
+        for name, *inputs in invalid_cases:
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    dsa_decode_mla_attention(*inputs, sm_scale=0.25, interpret=True, validate=True)
+
+    def test_tpu_non_interpret_matches_reference_with_dynamic_slots(self):
+        if jax.default_backend() != "tpu":
+            self.skipTest("interpret=False Pallas lowering requires a TPU")
+
+        ql_nope, q_pe, cache_kv, _topk_slots, _valid_counts = self._inputs()
+        topk_slots = np.array([[19, 0, 19, 7, -1], [8, 1, 8, -1, -1]], dtype=np.int32)
+        valid_counts = np.array([4, 3], dtype=np.int32)
+        ql_nope = jnp.asarray(ql_nope, dtype=jnp.bfloat16)
+        q_pe = jnp.asarray(q_pe, dtype=jnp.bfloat16)
+        cache_kv = jnp.asarray(cache_kv, dtype=jnp.bfloat16)
+
+        actual = dsa_decode_mla_attention(
+            ql_nope,
+            q_pe,
+            cache_kv,
+            jnp.asarray(topk_slots),
+            jnp.asarray(valid_counts),
+            sm_scale=0.25,
+            interpret=False,
+        )
+        expected = reference_dsa_decode_mla_attention(
+            ql_nope, q_pe, cache_kv, topk_slots, valid_counts, sm_scale=0.25
+        )
+
+        np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=1e-2)
+
     def test_non_interpret_requires_tpu_on_cpu(self):
         if jax.default_backend() == "tpu":
             self.skipTest("the non-interpret TPU guard applies only on CPU")
