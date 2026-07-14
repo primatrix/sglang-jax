@@ -1,0 +1,65 @@
+name: dsa-decode-mla-v7x8-20260714
+exp_type: profiling
+cluster_name: tpuv7x-64-node
+artifact_type: GCS
+tags:
+  - dsa
+  - mla
+  - pallas
+  - correctness
+  - performance
+role_to_task_spec:
+  worker:
+    replica: 1
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x1
+    supply_mode: reservation
+    envs:
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /tmp/dsa-decode-mla/tmp
+      PIP_CACHE_DIR: /tmp/dsa-decode-mla/pip-cache
+      JAX_COMPILATION_CACHE_DIR: /tmp/dsa-decode-mla/jit-cache
+      LIBTPU_INIT_ARGS: >-
+        --xla_tpu_dvfs_p_state=7
+        --xla_enable_custom_call_region_trace=true
+        --xla_xprof_register_llo_debug_info=true
+    command: |
+      bash -lc '
+      set -euxo pipefail
+      ROOT=/tmp/dsa-decode-mla
+      RESULTS=${ROOT}/results
+      mkdir -p "${ROOT}/tmp" "${ROOT}/pip-cache" "${ROOT}/jit-cache" "${RESULTS}"
+      ulimit -c 0
+
+      git clone --depth 1 --branch develop/dsa-decode-mla \
+        https://github.com/primatrix/sglang-jax.git "${ROOT}/repo"
+      cd "${ROOT}/repo"
+      git rev-parse HEAD | tee "${RESULTS}/git_head.txt"
+      python -m pip install --no-deps -e python
+      python - <<"PY" | tee "${RESULTS}/environment.txt"
+      import jax
+      print(f"backend={jax.default_backend()}")
+      print(f"jax={jax.__version__}")
+      print(f"devices={jax.devices()}")
+      PY
+
+      python -m unittest -v \
+        sgl_jax.test.kernels.test_dsa_decode_mla.TestDSADecodeMLAPallas.test_tpu_non_interpret_matches_reference_with_dynamic_slots \
+        sgl_jax.test.kernels.test_dsa_decode_mla.TestDSADecodeMLAPallas.test_tpu_non_interpret_glm_shape_2048_matches_reference \
+        | tee "${RESULTS}/correctness.log"
+
+      python benchmark/kernels/mla/bench_dsa_decode_mla.py \
+        --batch-size 1 --context-length 160000 --top-k 2048 \
+        --warmup-iters 50 --iters 200 --profile --profile-iters 3 \
+        --profile-dir "${RESULTS}/profile_b1_ctx160k" \
+        --output "${RESULTS}/bench_b1_ctx160k.json" \
+        | tee "${RESULTS}/bench_b1_ctx160k.log"
+      python benchmark/kernels/mla/bench_dsa_decode_mla.py \
+        --batch-size 32 --context-length 32000 --top-k 2048 \
+        --warmup-iters 50 --iters 200 --profile --profile-iters 3 \
+        --profile-dir "${RESULTS}/profile_b32_ctx32k" \
+        --output "${RESULTS}/bench_b32_ctx32k.json" \
+        | tee "${RESULTS}/bench_b32_ctx32k.log"
+      '
