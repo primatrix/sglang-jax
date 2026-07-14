@@ -2,9 +2,11 @@
 
 import unittest
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
+from sgl_jax.srt.kernels.mla.dsa.kernel import dsa_decode_mla_attention
 from sgl_jax.srt.kernels.mla.dsa.reference import (
     dense_selected_mla_attention,
     reference_dsa_decode_mla_attention,
@@ -160,3 +162,103 @@ class TestDSADecodeMLAReference(unittest.TestCase):
         )
 
         np.testing.assert_array_equal(reference, dense)
+
+
+class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
+    """Exercise the Pallas DSA decode kernel in local interpret mode."""
+
+    def test_interpret_matches_reference(self):
+        ql_nope, q_pe, cache_kv, topk_slots, valid_counts = self._inputs()
+        ql_nope = jnp.asarray(ql_nope, dtype=jnp.bfloat16)
+        q_pe = jnp.asarray(q_pe, dtype=jnp.bfloat16)
+        cache_kv = jnp.asarray(cache_kv, dtype=jnp.bfloat16)
+
+        actual = dsa_decode_mla_attention(
+            ql_nope,
+            q_pe,
+            cache_kv,
+            jnp.asarray(topk_slots),
+            jnp.asarray(valid_counts),
+            sm_scale=0.25,
+            interpret=True,
+        )
+        expected = reference_dsa_decode_mla_attention(
+            ql_nope, q_pe, cache_kv, topk_slots, valid_counts, sm_scale=0.25
+        )
+
+        self.assertEqual(actual.dtype, jnp.bfloat16)
+        np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=1e-2)
+
+    def test_interpret_handles_page_sizes_duplicates_and_padding(self):
+        rng = np.random.default_rng(1)
+        ql_nope = rng.standard_normal((2, 2, 128), dtype=np.float32)
+        q_pe = rng.standard_normal((2, 2, 128), dtype=np.float32)
+
+        for page_size in (8, 16, 32, 64):
+            with self.subTest(page_size=page_size):
+                cache_kv = rng.standard_normal((2, page_size, 1, 256), dtype=np.float32)
+                # A padded -1 would select this large value if it were read.
+                cache_kv[-1, -1, 0] = 10_000.0
+                topk_slots = np.array(
+                    [
+                        [page_size + 1, 0, page_size + 1, page_size - 1, -1],
+                        [page_size + 2, 1, page_size + 2, -1, -1],
+                    ],
+                    dtype=np.int32,
+                )
+                valid_counts = np.array([4, 3], dtype=np.int32)
+                expected = reference_dsa_decode_mla_attention(
+                    ql_nope, q_pe, cache_kv, topk_slots, valid_counts, sm_scale=0.25
+                )
+
+                actual = dsa_decode_mla_attention(
+                    jnp.asarray(ql_nope, dtype=jnp.bfloat16),
+                    jnp.asarray(q_pe, dtype=jnp.bfloat16),
+                    jnp.asarray(cache_kv, dtype=jnp.bfloat16),
+                    jnp.asarray(topk_slots),
+                    jnp.asarray(valid_counts),
+                    sm_scale=0.25,
+                    interpret=True,
+                )
+
+                np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=1e-2)
+
+    def test_interpret_pads_latent_and_rope_dimensions_independently(self):
+        rng = np.random.default_rng(2)
+        ql_nope = rng.standard_normal((2, 2, 96), dtype=np.float32)
+        q_pe = rng.standard_normal((2, 2, 64), dtype=np.float32)
+        cache_kv = rng.standard_normal((2, 8, 2, 256), dtype=np.float32)
+        topk_slots = np.array([[17, 2, 31, -1], [16, 0, -1, -1]], dtype=np.int32)
+        valid_counts = np.array([3, 2], dtype=np.int32)
+
+        actual = dsa_decode_mla_attention(
+            jnp.asarray(ql_nope, dtype=jnp.bfloat16),
+            jnp.asarray(q_pe, dtype=jnp.bfloat16),
+            jnp.asarray(cache_kv, dtype=jnp.bfloat16),
+            jnp.asarray(topk_slots),
+            jnp.asarray(valid_counts),
+            sm_scale=0.25,
+            interpret=True,
+        )
+        expected = reference_dsa_decode_mla_attention(
+            ql_nope, q_pe, cache_kv, topk_slots, valid_counts, sm_scale=0.25
+        )
+
+        self.assertEqual(actual.shape, ql_nope.shape)
+        self.assertEqual(actual.dtype, jnp.bfloat16)
+        np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=1e-2)
+
+    def test_non_interpret_requires_tpu_on_cpu(self):
+        if jax.default_backend() == "tpu":
+            self.skipTest("the non-interpret TPU guard applies only on CPU")
+
+        ql_nope, q_pe, cache_kv, topk_slots, valid_counts = self._inputs()
+        with self.assertRaisesRegex(RuntimeError, "requires a TPU"):
+            dsa_decode_mla_attention(
+                jnp.asarray(ql_nope, dtype=jnp.bfloat16),
+                jnp.asarray(q_pe, dtype=jnp.bfloat16),
+                jnp.asarray(cache_kv, dtype=jnp.bfloat16),
+                jnp.asarray(topk_slots),
+                jnp.asarray(valid_counts),
+                sm_scale=0.25,
+            )
