@@ -53,9 +53,8 @@ class TestDSADecodeMLAReference(unittest.TestCase):
 
     def _assert_validation_error(self, inputs):
         for function in (reference_dsa_decode_mla_attention, dense_selected_mla_attention):
-            with self.subTest(function=function.__name__):
-                with self.assertRaises(ValueError):
-                    function(*inputs, sm_scale=1.0)
+            with self.subTest(function=function.__name__), self.assertRaises(ValueError):
+                function(*inputs, sm_scale=1.0)
 
     def test_selected_slot_reference_matches_dense_gather(self):
         """Physical slot gather agrees bit-for-bit with a dense-cache oracle."""
@@ -338,9 +337,8 @@ class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
         )
 
         for name, *inputs in invalid_cases:
-            with self.subTest(name=name):
-                with self.assertRaises(ValueError):
-                    dsa_decode_mla_attention(*inputs, sm_scale=0.25, interpret=True, validate=True)
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                dsa_decode_mla_attention(*inputs, sm_scale=0.25, interpret=True, validate=True)
 
     def test_tpu_non_interpret_matches_reference_with_dynamic_slots(self):
         if jax.default_backend() != "tpu":
@@ -366,6 +364,59 @@ class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
             ql_nope, q_pe, cache_kv, topk_slots, valid_counts, sm_scale=0.25
         )
 
+        np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=1e-2)
+
+    def test_tpu_non_interpret_glm_shape_2048_matches_reference(self):
+        """Exercise the Falcon gate at the GLM MLA widths and DSA Top-K."""
+        if jax.default_backend() != "tpu":
+            self.skipTest("interpret=False Pallas lowering requires a TPU")
+
+        rng = np.random.default_rng(4)
+        batch_size = 1
+        num_heads = 8  # TP-local head count for the single-host Falcon gate.
+        latent_dim = 512
+        rope_dim = 64
+        top_k = 2048
+        page_size = 128
+        cache_kv = jnp.asarray(
+            rng.standard_normal(
+                (top_k // page_size, page_size, 1, latent_dim + rope_dim),
+                dtype=np.float32,
+            ),
+            dtype=jnp.bfloat16,
+        )
+        ql_nope = jnp.asarray(
+            rng.standard_normal((batch_size, num_heads, latent_dim), dtype=np.float32),
+            dtype=jnp.bfloat16,
+        )
+        q_pe = jnp.asarray(
+            rng.standard_normal((batch_size, num_heads, rope_dim), dtype=np.float32),
+            dtype=jnp.bfloat16,
+        )
+        topk_slots = jnp.asarray(
+            ((np.arange(top_k, dtype=np.int32) * 17) % top_k)[None, :]
+        )
+        valid_counts = jnp.asarray([top_k], dtype=jnp.int32)
+
+        actual = dsa_decode_mla_attention(
+            ql_nope,
+            q_pe,
+            cache_kv,
+            topk_slots,
+            valid_counts,
+            sm_scale=(latent_dim + rope_dim) ** -0.5,
+            interpret=False,
+        )
+        expected = reference_dsa_decode_mla_attention(
+            ql_nope,
+            q_pe,
+            cache_kv,
+            topk_slots,
+            valid_counts,
+            sm_scale=(latent_dim + rope_dim) ** -0.5,
+        )
+
+        self.assertTrue(np.isfinite(np.asarray(actual)).all())
         np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=1e-2)
 
     def test_non_interpret_requires_tpu_on_cpu(self):
