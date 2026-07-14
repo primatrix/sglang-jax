@@ -109,6 +109,7 @@ def _dsa_decode_mla_kernel(
     ql_nope_vmem_ref,
     q_pe_vmem_ref,
     cache_vector_vmem_ref,
+    output_vmem_ref,
     dma_sem,
     *,
     latent_dim: int,
@@ -197,7 +198,10 @@ def _dsa_decode_mla_kernel(
         unroll=False,
     )
 
-    output_ref[batch_index] = (running_value / running_sum[:, None]).astype(output_ref.dtype)
+    output_vmem_ref[:, :latent_dim] = (running_value / running_sum[:, None]).astype(
+        output_vmem_ref.dtype
+    )
+    copy_to_vmem(output_vmem_ref.at[:, :latent_dim], output_ref.at[batch_index])
 
 
 def dsa_decode_mla_attention_unchecked(
@@ -263,6 +267,7 @@ def dsa_decode_mla_attention_unchecked(
                 pltpu.VMEM((num_heads, padded_latent_dim), ql_nope.dtype),
                 pltpu.VMEM((num_heads, padded_rope_dim), q_pe.dtype),
                 pltpu.VMEM((padded_latent_dim + padded_rope_dim,), cache_kv.dtype),
+                pltpu.VMEM((num_heads, padded_latent_dim), ql_nope.dtype),
                 pltpu.SemaphoreType.DMA,
             ),
         ),
