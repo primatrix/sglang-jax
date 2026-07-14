@@ -1,4 +1,4 @@
-name: dsa-decode-mla-v7x8-20260714
+name: dsa-decode-mla-v7x8-20260714-r4
 exp_type: profiling
 cluster_name: tpuv7x-64-node
 artifact_type: GCS
@@ -21,10 +21,9 @@ role_to_task_spec:
       TMPDIR: /tmp/dsa-decode-mla/tmp
       PIP_CACHE_DIR: /tmp/dsa-decode-mla/pip-cache
       JAX_COMPILATION_CACHE_DIR: /tmp/dsa-decode-mla/jit-cache
-      LIBTPU_INIT_ARGS: >-
-        --xla_tpu_dvfs_p_state=7
-        --xla_enable_custom_call_region_trace=true
-        --xla_xprof_register_llo_debug_info=true
+      # JAX 0.8.1/libtpu 0.0.30 does not accept the newer LLO trace flags.
+      # jax.profiler.trace() below still captures a standard XProf trace.
+      LIBTPU_INIT_ARGS: --xla_tpu_dvfs_p_state=7
     command: |
       bash -lc '
       set -euxo pipefail
@@ -37,6 +36,9 @@ role_to_task_spec:
         https://github.com/primatrix/sglang-jax.git "${ROOT}/repo"
       cd "${ROOT}/repo"
       git rev-parse HEAD | tee "${RESULTS}/git_head.txt"
+      python -m pip install -U "jax[tpu]==0.8.1" \
+        -i https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
+        -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
       python -m pip install --no-deps -e python
       python - <<"PY" | tee "${RESULTS}/environment.txt"
       import jax
