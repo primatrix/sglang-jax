@@ -100,12 +100,16 @@ def _validate_inputs(
 
 
 def _dsa_decode_mla_kernel(
+    topk_slots_ref,
+    valid_counts_ref,
     ql_nope_ref,
     q_pe_ref,
     cache_kv_ref,
-    topk_slots_ref,
-    valid_counts_ref,
     output_ref,
+    ql_nope_vmem_ref,
+    q_pe_vmem_ref,
+    cache_vector_vmem_ref,
+    dma_sem,
     *,
     latent_dim: int,
     rope_dim: int,
@@ -118,8 +122,26 @@ def _dsa_decode_mla_kernel(
     """Process every selected cache vector for one batch element online."""
     batch_index = pl.program_id(0)
     num_heads = ql_nope_ref.shape[1]
-    ql_nope = ql_nope_ref[batch_index].astype(jnp.float32)
-    q_pe = q_pe_ref[batch_index].astype(jnp.float32)
+    cache_flat_hbm_ref = cache_kv_ref.reshape((-1, cache_kv_ref.shape[-1]))
+
+    def copy_to_vmem(source_ref, destination_ref):
+        copy = pltpu.make_async_copy(source_ref, destination_ref, dma_sem)
+        copy.start()
+        copy.wait()
+
+    # TPU Pallas permits direct loads only from VMEM/SMEM.  Keep the external
+    # tensors in HBM, and DMA exactly the query rows and selected KV vector
+    # that this program consumes into VMEM.
+    copy_to_vmem(
+        ql_nope_ref.at[batch_index],
+        ql_nope_vmem_ref.at[:, :latent_dim],
+    )
+    copy_to_vmem(
+        q_pe_ref.at[batch_index],
+        q_pe_vmem_ref.at[:, :rope_dim],
+    )
+    ql_nope = ql_nope_vmem_ref[:, :latent_dim].astype(jnp.float32)
+    q_pe = q_pe_vmem_ref[:, :rope_dim].astype(jnp.float32)
 
     # The cache reserves independent 128-aligned segments for the latent and
     # RoPE dimensions.  Padding query segments separately preserves that layout.
@@ -143,16 +165,11 @@ def _dsa_decode_mla_kernel(
         def update(state):
             max_logits, exp_sums, weighted_values = state
             physical_slot = topk_slots_ref[batch_index, selected_index]
-            page_index = physical_slot // page_size
-            offset_in_page = physical_slot % page_size
-            packed_row = offset_in_page // cache_kv_ref.shape[2]
-            packed_offset = offset_in_page % cache_kv_ref.shape[2]
-
-            # This is the only cache read for this selected slot.  The physical
-            # slot mapping is page * (packed_rows * packing) + offset.
-            cache_vector = cache_kv_ref[page_index, packed_row, packed_offset, :].astype(
-                jnp.float32
-            )
+            # Flattening preserves the physical mapping
+            # page * (packed_rows * packing) + offset.  This is the only KV
+            # DMA issued for the selected slot.
+            copy_to_vmem(cache_flat_hbm_ref.at[physical_slot], cache_vector_vmem_ref)
+            cache_vector = cache_vector_vmem_ref[...].astype(jnp.float32)
             scores = jnp.sum(ql_nope * cache_vector[:padded_latent_dim], axis=-1)
             scores += jnp.sum(q_pe * cache_vector[padded_latent_dim:], axis=-1)
             scores *= jnp.float32(sm_scale)
@@ -212,7 +229,7 @@ def dsa_decode_mla_attention_unchecked(
     topk_slots = jnp.asarray(topk_slots)
     valid_counts = jnp.asarray(valid_counts)
 
-    batch_size, _num_heads, latent_dim = ql_nope.shape
+    batch_size, num_heads, latent_dim = ql_nope.shape
     rope_dim = q_pe.shape[-1]
     padded_latent_dim = _align_to_128(latent_dim)
     padded_rope_dim = _align_to_128(rope_dim)
@@ -231,25 +248,34 @@ def dsa_decode_mla_attention_unchecked(
             sm_scale=float(sm_scale),
         ),
         out_shape=jax.ShapeDtypeStruct(ql_nope.shape, ql_nope.dtype),
-        grid=(batch_size,),
-        in_specs=(
-            pl.BlockSpec(memory_space=pltpu.HBM),
-            pl.BlockSpec(memory_space=pltpu.HBM),
-            pl.BlockSpec(memory_space=pltpu.HBM),
-            pl.BlockSpec(memory_space=pltpu.HBM),
-            pl.BlockSpec(memory_space=pltpu.HBM),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            # The selected physical slots and valid lengths are small metadata
+            # arrays, so keep them in SMEM and load only KV payloads from HBM.
+            num_scalar_prefetch=2,
+            grid=(batch_size,),
+            in_specs=(
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            ),
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            scratch_shapes=(
+                pltpu.VMEM((num_heads, padded_latent_dim), ql_nope.dtype),
+                pltpu.VMEM((num_heads, padded_rope_dim), q_pe.dtype),
+                pltpu.VMEM((padded_latent_dim + padded_rope_dim,), cache_kv.dtype),
+                pltpu.SemaphoreType.DMA,
+            ),
         ),
-        out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
         interpret=interpret,
         name="dsa-decode-mla",
     )
     return kernel(
+        topk_slots,
+        valid_counts,
         ql_nope,
         q_pe,
         cache_kv,
-        topk_slots,
-        valid_counts,
     )
 
 

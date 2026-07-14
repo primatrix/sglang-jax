@@ -378,9 +378,10 @@ class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
         rope_dim = 64
         top_k = 2048
         page_size = 128
+        padded_cache_width = 512 + 128
         cache_kv = jnp.asarray(
             rng.standard_normal(
-                (top_k // page_size, page_size, 1, latent_dim + rope_dim),
+                (top_k // page_size, page_size, 1, padded_cache_width),
                 dtype=np.float32,
             ),
             dtype=jnp.bfloat16,
