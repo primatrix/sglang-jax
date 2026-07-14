@@ -139,9 +139,8 @@ def _dsa_decode_mla_kernel(
     running_value = jnp.zeros((num_heads, latent_dim), dtype=jnp.float32)
     valid_count = valid_counts_ref[batch_index]
 
-    for selected_index in range(max_selected):
-
-        def update(state, selected_index=selected_index):
+    def body(selected_index, state):
+        def update(state):
             max_logits, exp_sums, weighted_values = state
             physical_slot = topk_slots_ref[batch_index, selected_index]
             page_index = physical_slot // page_size
@@ -166,17 +165,25 @@ def _dsa_decode_mla_kernel(
             new_values = weighted_values * old_scale[:, None] + new_scale[:, None] * values
             return new_max, new_sums, new_values
 
-        running_max, running_sum, running_value = lax.cond(
+        return lax.cond(
             selected_index < valid_count,
             update,
             lambda state: state,
-            (running_max, running_sum, running_value),
+            state,
         )
+
+    running_max, running_sum, running_value = lax.fori_loop(
+        0,
+        max_selected,
+        body,
+        (running_max, running_sum, running_value),
+        unroll=False,
+    )
 
     output_ref[batch_index] = (running_value / running_sum[:, None]).astype(output_ref.dtype)
 
 
-def dsa_decode_mla_attention(
+def dsa_decode_mla_attention_unchecked(
     ql_nope: jax.Array,
     q_pe: jax.Array,
     cache_kv: jax.Array,
@@ -185,17 +192,14 @@ def dsa_decode_mla_attention(
     *,
     sm_scale: float,
     interpret: bool = False,
-    validate: bool = True,
 ) -> jax.Array:
-    """Apply sparse DSA decode MLA attention to selected packed-cache slots.
+    """Launch sparse DSA decode MLA attention without host-side validation.
 
-    ``interpret=True`` executes Pallas locally and is intended for correctness
-    tests.  A real Pallas launch requires a TPU; host validation is enabled by
-    default and can be disabled by trusted benchmark callers.
+    This path contains no NumPy conversions and can be nested in ``jax.jit``.
+    Callers must validate producer-side shapes, dtypes, counts, and physical
+    slots before using it.  ``interpret=True`` executes Pallas locally; a real
+    launch requires a TPU.
     """
-    if validate:
-        _validate_inputs(ql_nope, q_pe, cache_kv, topk_slots, valid_counts, sm_scale)
-
     if not interpret and jax.default_backend() != "tpu":
         raise RuntimeError(
             "dsa_decode_mla_attention requires a TPU when interpret=False; "
@@ -249,4 +253,34 @@ def dsa_decode_mla_attention(
     )
 
 
-__all__ = ["dsa_decode_mla_attention"]
+def dsa_decode_mla_attention(
+    ql_nope: jax.Array,
+    q_pe: jax.Array,
+    cache_kv: jax.Array,
+    topk_slots: jax.Array,
+    valid_counts: jax.Array,
+    *,
+    sm_scale: float,
+    interpret: bool = False,
+    validate: bool = True,
+) -> jax.Array:
+    """Apply sparse DSA decode MLA attention to selected packed-cache slots.
+
+    Host validation is enabled by default for eager callers.  For a call nested
+    in ``jax.jit``, validate inputs at their producer and call
+    :func:`dsa_decode_mla_attention_unchecked` instead.
+    """
+    if validate:
+        _validate_inputs(ql_nope, q_pe, cache_kv, topk_slots, valid_counts, sm_scale)
+    return dsa_decode_mla_attention_unchecked(
+        ql_nope,
+        q_pe,
+        cache_kv,
+        topk_slots,
+        valid_counts,
+        sm_scale=sm_scale,
+        interpret=interpret,
+    )
+
+
+__all__ = ["dsa_decode_mla_attention", "dsa_decode_mla_attention_unchecked"]
