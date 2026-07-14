@@ -8,6 +8,7 @@ physical slot is laid out as ``page * page_size + offset`` where
 
 from __future__ import annotations
 
+import jax.numpy as jnp
 import numpy as np
 
 _ALIGNMENT = 128
@@ -17,19 +18,26 @@ def _align_to_128(dim: int) -> int:
     return ((dim + _ALIGNMENT - 1) // _ALIGNMENT) * _ALIGNMENT
 
 
+def _is_floating_dtype(dtype: np.dtype) -> bool:
+    """Recognize NumPy floating types plus JAX's host-materialized BF16."""
+    return bool(np.issubdtype(dtype, np.floating) or dtype == jnp.bfloat16)
+
+
 def _validate_inputs(
     ql_nope: np.ndarray,
     q_pe: np.ndarray,
     cache_kv: np.ndarray,
     selected_slots: np.ndarray,
     valid_counts: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int]:
+    sm_scale: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int, np.float32]:
     """Materialize and validate every prototype input on the host."""
     ql_nope = np.asarray(ql_nope)
     q_pe = np.asarray(q_pe)
     cache_kv = np.asarray(cache_kv)
     selected_slots = np.asarray(selected_slots)
     valid_counts = np.asarray(valid_counts)
+    sm_scale = np.asarray(sm_scale)
 
     if ql_nope.ndim != 3 or q_pe.ndim != 3:
         raise ValueError("ql_nope and q_pe must be rank-3 [batch, heads, width] arrays")
@@ -39,6 +47,11 @@ def _validate_inputs(
         raise ValueError("selected_slots must be rank-2 [batch, max_selected] array")
     if valid_counts.ndim != 1:
         raise ValueError("valid_counts must be rank-1 [batch] array")
+    if sm_scale.ndim != 0 or not np.issubdtype(sm_scale.dtype, np.number):
+        raise ValueError("sm_scale must be a numeric scalar")
+    sm_scale = np.float32(sm_scale)
+    if not np.isfinite(sm_scale):
+        raise ValueError("sm_scale must be finite")
 
     if ql_nope.shape[:2] != q_pe.shape[:2]:
         raise ValueError("ql_nope and q_pe must have matching batch and head dimensions")
@@ -54,7 +67,7 @@ def _validate_inputs(
         raise ValueError("cache_kv pages, packed_rows, and packing must be nonzero")
 
     for name, array in (("ql_nope", ql_nope), ("q_pe", q_pe), ("cache_kv", cache_kv)):
-        if not np.issubdtype(array.dtype, np.floating):
+        if not _is_floating_dtype(array.dtype):
             raise ValueError(f"{name} must have a floating-point dtype")
     if selected_slots.dtype != np.int32:
         raise ValueError("selected_slots must have dtype int32")
@@ -90,6 +103,7 @@ def _validate_inputs(
         valid_counts,
         lkv_padded,
         rope_padded,
+        sm_scale,
     )
 
 
@@ -99,6 +113,8 @@ def reference_dsa_decode_mla_attention(
     cache_kv: np.ndarray,
     selected_slots: np.ndarray,
     valid_counts: np.ndarray,
+    *,
+    sm_scale: float,
 ) -> np.ndarray:
     """Compute selected-slot decode MLA by explicitly decoding physical slots.
 
@@ -114,7 +130,8 @@ def reference_dsa_decode_mla_attention(
         valid_counts,
         lkv_padded,
         rope_padded,
-    ) = _validate_inputs(ql_nope, q_pe, cache_kv, selected_slots, valid_counts)
+        sm_scale,
+    ) = _validate_inputs(ql_nope, q_pe, cache_kv, selected_slots, valid_counts, sm_scale)
 
     lkv_dim = ql_nope.shape[-1]
     if lkv_dim != lkv_padded:
@@ -138,6 +155,7 @@ def reference_dsa_decode_mla_attention(
 
         query = np.concatenate((ql_nope[batch_index], q_pe[batch_index]), axis=-1)
         scores = query @ gathered.T
+        scores *= sm_scale
         scores -= np.max(scores, axis=-1, keepdims=True)
         weights = np.exp(scores)
         weights /= np.sum(weights, axis=-1, keepdims=True)
@@ -152,6 +170,8 @@ def dense_selected_mla_attention(
     cache_kv: np.ndarray,
     selected_slots: np.ndarray,
     valid_counts: np.ndarray,
+    *,
+    sm_scale: float,
 ) -> np.ndarray:
     """Compute selected-slot decode MLA through an independently dense gather.
 
@@ -167,7 +187,8 @@ def dense_selected_mla_attention(
         valid_counts,
         lkv_padded,
         rope_padded,
-    ) = _validate_inputs(ql_nope, q_pe, cache_kv, selected_slots, valid_counts)
+        sm_scale,
+    ) = _validate_inputs(ql_nope, q_pe, cache_kv, selected_slots, valid_counts, sm_scale)
 
     latent_width = ql_nope.shape[-1]
     padded_nope = np.zeros((*ql_nope.shape[:2], lkv_padded), dtype=np.float32)
@@ -184,6 +205,7 @@ def dense_selected_mla_attention(
         gathered = dense_cache[selected_slots[batch_index, :valid_count]]
         query = np.concatenate((padded_nope[batch_index], padded_rope[batch_index]), axis=-1)
         logits = query @ gathered.T
+        logits *= sm_scale
         shifted_logits = logits - np.max(logits, axis=-1, keepdims=True)
         probabilities = np.exp(shifted_logits)
         probabilities /= np.sum(probabilities, axis=-1, keepdims=True)
