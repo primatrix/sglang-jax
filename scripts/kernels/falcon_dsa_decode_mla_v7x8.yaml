@@ -1,4 +1,4 @@
-name: dsa-decode-mla-v7x8-20260714
+name: dsa-decode-mla-v7x8-20260714-r2
 exp_type: profiling
 cluster_name: tpuv7x-64-node
 artifact_type: GCS
@@ -37,6 +37,9 @@ role_to_task_spec:
         https://github.com/primatrix/sglang-jax.git "${ROOT}/repo"
       cd "${ROOT}/repo"
       git rev-parse HEAD | tee "${RESULTS}/git_head.txt"
+      python -m pip install -U "jax[tpu]==0.8.1" \
+        -i https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
+        -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
       python -m pip install --no-deps -e python
       python - <<"PY" | tee "${RESULTS}/environment.txt"
       import jax
