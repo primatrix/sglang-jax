@@ -32,7 +32,6 @@ import numpy as np
 from sgl_jax.srt.kernels.mla.dsa import (
     SPARSECORE_COMPILER_OPTIONS,
     dsa_decode_mla_attention_unchecked,
-    materialize_selected_kv_sparsecore_pipeline_unchecked,
     materialize_selected_kv_sparsecore_unchecked,
     materialize_selected_kv_xla,
     prepare_safe_topk_slots,
@@ -46,7 +45,6 @@ BENCHMARK_VARIANTS = (
     "sparsecore-pipeline",
     "sparsecore",
     "xla-gather",
-    "pipeline-gather-only",
     "gather-only",
     "attention-only",
     "dense-jax-baseline",
@@ -84,7 +82,6 @@ def estimate_variant_kv_bytes(
         "sparsecore-pipeline": 3 * selected_bytes,
         "sparsecore": 3 * selected_bytes,
         "xla-gather": 3 * selected_bytes,
-        "pipeline-gather-only": 2 * selected_bytes,
         "gather-only": 2 * selected_bytes,
         "attention-only": selected_bytes,
         "dense-jax-baseline": dense_bytes,
@@ -330,13 +327,6 @@ def main() -> None:
             sm_scale=sm_scale,
             gather_impl="xla",
         ),
-        "pipeline-gather-only": lambda: (
-            materialize_selected_kv_sparsecore_pipeline_unchecked(
-                cache_kv,
-                safe_topk_slots,
-                gather_block=128,
-            )
-        ),
         "gather-only": lambda: materialize_selected_kv_sparsecore_unchecked(
             cache_kv,
             safe_topk_slots,
@@ -397,7 +387,6 @@ def main() -> None:
             in {
                 "sparsecore-pipeline",
                 "sparsecore",
-                "pipeline-gather-only",
                 "gather-only",
             }
             else None
