@@ -929,6 +929,65 @@ class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
         self.assertTrue(np.isfinite(np.asarray(actual)).all())
         np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=1e-2)
 
+    def test_tpu_pipeline_composed_batch_32_glm_shape_2048_matches_reference(self):
+        """Gate batched GLM DSA pipeline correctness at the serving shape."""
+        if jax.default_backend() != "tpu":
+            self.skipTest("interpret=False Pallas lowering requires a TPU")
+
+        rng = np.random.default_rng(6)
+        batch_size = 32
+        num_heads = 8
+        latent_dim = 512
+        rope_dim = 64
+        top_k = 2048
+        page_size = 128
+        padded_cache_width = 512 + 128
+        cache_kv = jnp.asarray(
+            rng.standard_normal(
+                (top_k // page_size, page_size // 2, 2, padded_cache_width),
+                dtype=np.float32,
+            ),
+            dtype=jnp.bfloat16,
+        )
+        ql_nope = jnp.asarray(
+            rng.standard_normal((batch_size, num_heads, latent_dim), dtype=np.float32),
+            dtype=jnp.bfloat16,
+        )
+        q_pe = jnp.asarray(
+            rng.standard_normal((batch_size, num_heads, rope_dim), dtype=np.float32),
+            dtype=jnp.bfloat16,
+        )
+        base_slots = (np.arange(top_k, dtype=np.int32) * 17) % top_k
+        topk_slots = jnp.asarray(
+            np.stack(
+                [np.roll(base_slots, batch_index) for batch_index in range(batch_size)]
+            ),
+            dtype=jnp.int32,
+        )
+        valid_counts = jnp.full((batch_size,), top_k, dtype=jnp.int32)
+
+        actual = dsa_decode_mla_attention(
+            ql_nope,
+            q_pe,
+            cache_kv,
+            topk_slots,
+            valid_counts,
+            sm_scale=256**-0.5,
+            interpret=False,
+            gather_impl="sparsecore-pipeline",
+        )
+        expected = reference_dsa_decode_mla_attention(
+            ql_nope,
+            q_pe,
+            cache_kv,
+            np.asarray(topk_slots),
+            np.asarray(valid_counts),
+            sm_scale=256**-0.5,
+        )
+
+        self.assertTrue(np.isfinite(np.asarray(actual)).all())
+        np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=1e-2)
+
     def test_tpu_pipeline_composed_batch_32_matches_reference(self):
         if jax.default_backend() != "tpu":
             self.skipTest("interpret=False Pallas lowering requires a TPU")

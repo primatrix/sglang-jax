@@ -50,6 +50,7 @@ role_to_task_spec:
       python -m unittest -v \
         sgl_jax.test.kernels.test_dsa_decode_mla.TestDSASparseCoreGather.test_pipelined_sparsecore_gather_matches_xla \
         sgl_jax.test.kernels.test_dsa_decode_mla.TestDSADecodeMLAPallas.test_tpu_pipeline_glm_shape_2048_matches_reference \
+        sgl_jax.test.kernels.test_dsa_decode_mla.TestDSADecodeMLAPallas.test_tpu_pipeline_composed_batch_32_glm_shape_2048_matches_reference \
         sgl_jax.test.kernels.test_dsa_decode_mla.TestDSADecodeMLAPallas.test_tpu_pipeline_composed_batch_32_matches_reference \
         2>&1 | tee "${RESULTS}/pipeline_correctness.log"
 
