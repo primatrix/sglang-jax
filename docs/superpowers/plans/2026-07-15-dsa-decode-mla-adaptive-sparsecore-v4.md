@@ -259,8 +259,10 @@ git commit -m "feat(kernels): auto-size DSA pipeline gather"
 
 Add a new test with `batch_size=32`, `num_heads=8`, `latent_dim=512`,
 `rope_dim=64`, `top_k=2048`, `page_size=128`, and cache shape
-`(16, 64, 2, 640)`.  Make each batch row a different cyclic permutation of
-`(arange(2048) * 17) % 2048`; call the public DSA operation with
+`(512, 64, 2, 640)` (64K physical slots).  Make each batch row use a distinct,
+non-overlapping 2048-slot range, internally permuted as
+`(arange(2048) * 17) % 2048 + batch_index * 2048`; assert row and global slot
+uniqueness before the TPU-only branch.  Call the public DSA operation with
 `gather_impl="sparsecore-pipeline"` and default auto block.  Compare it with
 `reference_dsa_decode_mla_attention` at `rtol=2e-2, atol=1e-2` after checking
 that all output values are finite.
