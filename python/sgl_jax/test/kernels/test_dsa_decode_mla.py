@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from sgl_jax.srt.kernels.mla.dsa.attention import selected_mla_attention
 from sgl_jax.srt.kernels.mla.dsa.gather import (
     materialize_selected_kv_sparsecore,
     materialize_selected_kv_xla,
@@ -15,6 +16,7 @@ from sgl_jax.srt.kernels.mla.dsa.kernel import dsa_decode_mla_attention
 from sgl_jax.srt.kernels.mla.dsa.reference import (
     dense_selected_mla_attention,
     reference_dsa_decode_mla_attention,
+    reference_selected_mla_attention,
 )
 
 
@@ -139,6 +141,181 @@ class TestDSASparseCoreGather(unittest.TestCase):
         )
 
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
+class TestDSASelectedMLAAttention(unittest.TestCase):
+    def _assert_selected_attention_matches_reference(
+        self,
+        ql_nope,
+        q_pe,
+        selected_kv,
+        valid_counts,
+        *,
+        sm_scale,
+    ):
+        actual = selected_mla_attention(
+            jnp.asarray(ql_nope, dtype=jnp.bfloat16),
+            jnp.asarray(q_pe, dtype=jnp.bfloat16),
+            jnp.asarray(selected_kv, dtype=jnp.bfloat16),
+            jnp.asarray(valid_counts, dtype=jnp.int32),
+            sm_scale=sm_scale,
+            interpret=True,
+        )
+        # macOS Accelerate can emit spurious FP warnings for the large finite
+        # GLM FP32 matmuls; explicit finiteness checks remain authoritative.
+        with np.errstate(all="ignore"):
+            expected = reference_selected_mla_attention(
+                jnp.asarray(ql_nope, dtype=jnp.bfloat16),
+                jnp.asarray(q_pe, dtype=jnp.bfloat16),
+                jnp.asarray(selected_kv, dtype=jnp.bfloat16),
+                np.asarray(valid_counts, dtype=np.int32),
+                sm_scale=sm_scale,
+            )
+
+        self.assertEqual(actual.shape, np.shape(ql_nope))
+        self.assertEqual(actual.dtype, jnp.bfloat16)
+        self.assertTrue(np.isfinite(np.asarray(actual)).all())
+        self.assertTrue(np.isfinite(expected).all())
+        np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=1e-2)
+
+    def test_interpret_matches_materialized_selected_reference(self):
+        rng = np.random.default_rng(20)
+        ql_nope = rng.standard_normal((2, 2, 128), dtype=np.float32)
+        q_pe = rng.standard_normal((2, 2, 128), dtype=np.float32)
+        selected_kv = rng.standard_normal((2, 8, 256), dtype=np.float32)
+        valid_counts = np.array([5, 3], dtype=np.int32)
+        selected_kv[0, 5:] = 10_000.0
+        selected_kv[1, 3:] = -10_000.0
+
+        self._assert_selected_attention_matches_reference(
+            ql_nope,
+            q_pe,
+            selected_kv,
+            valid_counts,
+            sm_scale=0.25,
+        )
+
+    def test_interpret_pads_latent_and_rope_independently(self):
+        rng = np.random.default_rng(21)
+        ql_nope = rng.standard_normal((1, 2, 96), dtype=np.float32)
+        q_pe = rng.standard_normal((1, 2, 64), dtype=np.float32)
+        selected_kv = rng.standard_normal((1, 8, 256), dtype=np.float32)
+        valid_counts = np.array([7], dtype=np.int32)
+
+        self._assert_selected_attention_matches_reference(
+            ql_nope,
+            q_pe,
+            selected_kv,
+            valid_counts,
+            sm_scale=0.25,
+        )
+
+    def test_interpret_retains_duplicate_mass_and_is_permutation_invariant(self):
+        rng = np.random.default_rng(22)
+        ql_nope = rng.standard_normal((1, 2, 128), dtype=np.float32)
+        q_pe = rng.standard_normal((1, 2, 128), dtype=np.float32)
+        unique_kv = rng.standard_normal((4, 256), dtype=np.float32)
+        selected_kv = np.stack(
+            [unique_kv[2], unique_kv[0], unique_kv[2], unique_kv[1]], axis=0
+        )[None, ...]
+        permuted_kv = selected_kv[:, [3, 2, 0, 1]]
+        valid_counts = np.array([4], dtype=np.int32)
+
+        original = selected_mla_attention(
+            jnp.asarray(ql_nope, dtype=jnp.bfloat16),
+            jnp.asarray(q_pe, dtype=jnp.bfloat16),
+            jnp.asarray(selected_kv, dtype=jnp.bfloat16),
+            jnp.asarray(valid_counts),
+            sm_scale=0.25,
+            interpret=True,
+        )
+        permuted = selected_mla_attention(
+            jnp.asarray(ql_nope, dtype=jnp.bfloat16),
+            jnp.asarray(q_pe, dtype=jnp.bfloat16),
+            jnp.asarray(permuted_kv, dtype=jnp.bfloat16),
+            jnp.asarray(valid_counts),
+            sm_scale=0.25,
+            interpret=True,
+        )
+
+        np.testing.assert_allclose(
+            np.asarray(original), np.asarray(permuted), rtol=2e-2, atol=1e-2
+        )
+        self._assert_selected_attention_matches_reference(
+            ql_nope,
+            q_pe,
+            selected_kv,
+            valid_counts,
+            sm_scale=0.25,
+        )
+
+    def test_interpret_glm_shape_2048_matches_reference(self):
+        rng = np.random.default_rng(23)
+        ql_nope = rng.standard_normal((1, 8, 512), dtype=np.float32)
+        q_pe = rng.standard_normal((1, 8, 64), dtype=np.float32)
+        selected_kv = rng.standard_normal((1, 2048, 640), dtype=np.float32)
+        valid_counts = np.array([2048], dtype=np.int32)
+
+        self._assert_selected_attention_matches_reference(
+            ql_nope,
+            q_pe,
+            selected_kv,
+            valid_counts,
+            sm_scale=256**-0.5,
+        )
+
+
+@unittest.skipUnless(
+    jax.default_backend() == "tpu", "TensorCore Pallas lowering requires a TPU"
+)
+class TestDSASelectedMLAAttentionTPU(unittest.TestCase):
+    def _assert_tpu_case(self, *, latent_dim, rope_dim, top_k, seed):
+        rng = np.random.default_rng(seed)
+        ql_nope = jnp.asarray(
+            rng.standard_normal((1, 8, latent_dim), dtype=np.float32),
+            dtype=jnp.bfloat16,
+        )
+        q_pe = jnp.asarray(
+            rng.standard_normal((1, 8, rope_dim), dtype=np.float32),
+            dtype=jnp.bfloat16,
+        )
+        selected_kv = jnp.asarray(
+            rng.standard_normal(
+                (
+                    1,
+                    top_k,
+                    ((latent_dim + 127) // 128) * 128
+                    + ((rope_dim + 127) // 128) * 128,
+                ),
+                dtype=np.float32,
+            ),
+            dtype=jnp.bfloat16,
+        )
+        valid_counts = jnp.asarray([top_k], dtype=jnp.int32)
+
+        actual = selected_mla_attention(
+            ql_nope,
+            q_pe,
+            selected_kv,
+            valid_counts,
+            sm_scale=256**-0.5,
+            interpret=False,
+        )
+        expected = reference_selected_mla_attention(
+            ql_nope,
+            q_pe,
+            selected_kv,
+            np.asarray(valid_counts),
+            sm_scale=256**-0.5,
+        )
+
+        np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=1e-2)
+
+    def test_tpu_selected_attention_small_aligned_case(self):
+        self._assert_tpu_case(latent_dim=128, rope_dim=128, top_k=128, seed=24)
+
+    def test_tpu_selected_attention_glm_shape(self):
+        self._assert_tpu_case(latent_dim=512, rope_dim=64, top_k=2048, seed=25)
 
 
 class TestDSADecodeMLAReference(unittest.TestCase):

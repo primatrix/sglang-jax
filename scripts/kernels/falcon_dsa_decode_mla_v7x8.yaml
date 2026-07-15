@@ -1,4 +1,4 @@
-name: dsa-sc-gather-v7x8-20260715-r2
+name: dsa-selected-attention-v7x8-20260715-r1
 exp_type: correctness
 cluster_name: tpuv7x-64-node
 artifact_type: GCS
@@ -48,7 +48,7 @@ role_to_task_spec:
       PY
 
       python -m unittest -v \
-        sgl_jax.test.kernels.test_dsa_decode_mla.TestDSASparseCoreGather.test_sparsecore_gather_matches_xla_for_packed_bfloat16_cache \
-        sgl_jax.test.kernels.test_dsa_decode_mla.TestDSASparseCoreGather.test_sparsecore_gather_matches_xla_at_glm_width_and_topk \
-        2>&1 | tee "${RESULTS}/sparsecore_gather_correctness.log"
+        sgl_jax.test.kernels.test_dsa_decode_mla.TestDSASelectedMLAAttentionTPU.test_tpu_selected_attention_small_aligned_case \
+        sgl_jax.test.kernels.test_dsa_decode_mla.TestDSASelectedMLAAttentionTPU.test_tpu_selected_attention_glm_shape \
+        2>&1 | tee "${RESULTS}/selected_attention_correctness.log"
       '

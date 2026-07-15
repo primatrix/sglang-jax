@@ -212,3 +212,65 @@ def dense_selected_mla_attention(
         output[batch_index] = probabilities @ gathered[:, :latent_width]
 
     return output
+
+
+def reference_selected_mla_attention(
+    ql_nope: np.ndarray,
+    q_pe: np.ndarray,
+    selected_kv: np.ndarray,
+    valid_counts: np.ndarray,
+    *,
+    sm_scale: float,
+) -> np.ndarray:
+    """FP32 oracle for attention over an already materialized KV tensor."""
+    ql_nope = np.asarray(ql_nope)
+    q_pe = np.asarray(q_pe)
+    selected_kv = np.asarray(selected_kv)
+    valid_counts = np.asarray(valid_counts)
+    sm_scale = np.asarray(sm_scale)
+
+    if ql_nope.ndim != 3 or q_pe.ndim != 3 or selected_kv.ndim != 3:
+        raise ValueError("queries and selected_kv must be rank-3 arrays")
+    if valid_counts.ndim != 1:
+        raise ValueError("valid_counts must be rank-1")
+    if ql_nope.shape[:2] != q_pe.shape[:2]:
+        raise ValueError("Q-nope and Q-RoPE batch/head dimensions must match")
+    if selected_kv.shape[0] != ql_nope.shape[0]:
+        raise ValueError("selected_kv must have one row per query batch item")
+    if valid_counts.shape != (ql_nope.shape[0],):
+        raise ValueError("valid_counts must have one entry per batch item")
+    if sm_scale.ndim != 0 or not np.isfinite(sm_scale):
+        raise ValueError("sm_scale must be a finite scalar")
+
+    latent_dim = ql_nope.shape[-1]
+    padded_latent_dim = _align_to_128(latent_dim)
+    padded_rope_dim = _align_to_128(q_pe.shape[-1])
+    if selected_kv.shape[-1] != padded_latent_dim + padded_rope_dim:
+        raise ValueError(
+            "selected_kv width must equal padded latent plus padded RoPE widths"
+        )
+    if np.any(valid_counts <= 0) or np.any(valid_counts > selected_kv.shape[1]):
+        raise ValueError("valid_counts entries must be in [1, selected_kv.shape[1]]")
+
+    ql_nope = ql_nope.astype(np.float32, copy=False)
+    q_pe = q_pe.astype(np.float32, copy=False)
+    selected_kv = selected_kv.astype(np.float32, copy=False)
+    padded_nope = np.pad(
+        ql_nope, ((0, 0), (0, 0), (0, padded_latent_dim - latent_dim))
+    )
+    padded_pe = np.pad(
+        q_pe, ((0, 0), (0, 0), (0, padded_rope_dim - q_pe.shape[-1]))
+    )
+    output = np.empty_like(ql_nope, dtype=np.float32)
+
+    for batch_index, valid_count in enumerate(valid_counts):
+        selected = selected_kv[batch_index, : int(valid_count)]
+        scores = padded_nope[batch_index] @ selected[:, :padded_latent_dim].T
+        scores += padded_pe[batch_index] @ selected[:, padded_latent_dim:].T
+        scores *= np.float32(sm_scale)
+        scores -= np.max(scores, axis=-1, keepdims=True)
+        probabilities = np.exp(scores)
+        probabilities /= np.sum(probabilities, axis=-1, keepdims=True)
+        output[batch_index] = probabilities @ selected[:, :latent_dim]
+
+    return output
