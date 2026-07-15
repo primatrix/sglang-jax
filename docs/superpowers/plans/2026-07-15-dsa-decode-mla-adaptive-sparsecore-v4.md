@@ -309,7 +309,7 @@ are present and both estimate `3 * selected_bytes`.
 Run:
 
 ```bash
-PYTHONPATH=python uv run --directory python python -m unittest \
+PYTHONPATH="$PWD:$PWD/python" uv run --directory python python -m unittest \
   sgl_jax.test.kernels.test_bench_dsa_decode_mla
 ```
 
@@ -342,7 +342,7 @@ The benchmark JSON and log must remain in the experiment artifact directory.
 Run:
 
 ```bash
-PYTHONPATH=python uv run --directory python python -m unittest \
+PYTHONPATH="$PWD:$PWD/python" uv run --directory python python -m unittest \
   sgl_jax.test.kernels.test_bench_dsa_decode_mla
 ```
 
