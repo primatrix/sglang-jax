@@ -8,6 +8,7 @@ from typing import Literal
 
 import jax
 import jax.numpy as jnp
+from jax.experimental.pallas import tpu as pltpu
 import numpy as np
 
 from sgl_jax.srt.kernels.mla.dsa.attention import (
@@ -19,6 +20,7 @@ from sgl_jax.srt.kernels.mla.dsa.gather import (
     materialize_selected_kv_sparsecore_unchecked,
     materialize_selected_kv_xla,
     prepare_safe_topk_slots,
+    resolve_sparsecore_pipeline_gather_block,
 )
 
 _ALIGNMENT = 128
@@ -126,6 +128,29 @@ def _resolve_gather_impl(
     return gather_impl
 
 
+def _resolve_gather_block(
+    gather_impl: GatherImplementation,
+    gather_block: int | str,
+    *,
+    batch_size: int,
+    max_selected: int,
+    cache_width: int,
+    reported_cores: int,
+    num_subcores: int,
+) -> int:
+    """Resolve an auto gather window without changing explicit requests."""
+    if gather_impl != "sparsecore-pipeline":
+        return _DEFAULT_GATHER_BLOCK if gather_block == "auto" else gather_block
+    return resolve_sparsecore_pipeline_gather_block(
+        gather_block,
+        batch_size=batch_size,
+        padded_selected=max_selected,
+        cache_width=cache_width,
+        reported_cores=reported_cores,
+        num_subcores=num_subcores,
+    )
+
+
 def dsa_decode_mla_attention_unchecked(
     ql_nope: jax.Array,
     q_pe: jax.Array,
@@ -211,7 +236,7 @@ def dsa_decode_mla_attention(
     interpret: bool = False,
     validate: bool = True,
     gather_impl: GatherImplementation = "auto",
-    gather_block: int = _DEFAULT_GATHER_BLOCK,
+    gather_block: int | str = "auto",
 ) -> jax.Array:
     """Apply sparse DSA decode MLA attention to selected physical slots."""
     _resolve_gather_impl(gather_impl, interpret=interpret)
@@ -225,8 +250,24 @@ def dsa_decode_mla_attention(
             sm_scale,
         )
     resolved_gather = _resolve_gather_impl(gather_impl, interpret=interpret)
+    resolved_gather_block = (
+        _DEFAULT_GATHER_BLOCK if gather_block == "auto" else gather_block
+    )
+    if resolved_gather == "sparsecore-pipeline":
+        sparsecore_info = pltpu.get_tpu_info().sparse_core
+        if sparsecore_info is None:
+            raise RuntimeError("The current TPU does not expose SparseCores")
+        resolved_gather_block = _resolve_gather_block(
+            resolved_gather,
+            gather_block,
+            batch_size=ql_nope.shape[0],
+            max_selected=topk_slots.shape[1],
+            cache_width=cache_kv.shape[-1],
+            reported_cores=sparsecore_info.num_cores,
+            num_subcores=sparsecore_info.num_subcores,
+        )
     if resolved_gather == "sparsecore":
-        return _sparsecore_composed_launcher(float(sm_scale), gather_block)(
+        return _sparsecore_composed_launcher(float(sm_scale), resolved_gather_block)(
             ql_nope,
             q_pe,
             cache_kv,
@@ -235,7 +276,7 @@ def dsa_decode_mla_attention(
         )
     if resolved_gather == "sparsecore-pipeline":
         return _sparsecore_pipeline_composed_launcher(
-            float(sm_scale), gather_block
+            float(sm_scale), resolved_gather_block
         )(
             ql_nope,
             q_pe,
@@ -252,7 +293,7 @@ def dsa_decode_mla_attention(
         sm_scale=sm_scale,
         interpret=interpret,
         gather_impl=gather_impl,
-        gather_block=gather_block,
+        gather_block=resolved_gather_block,
     )
 
 
