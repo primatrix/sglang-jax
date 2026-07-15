@@ -28,7 +28,7 @@ from sgl_jax.srt.kernels.mla.dsa.reference import (
 
 
 class TestDSASelectedKVGather(unittest.TestCase):
-    def test_pipeline_dispatch_resolves_auto_and_preserves_explicit_block(self):
+    def test_pipeline_dispatch_keeps_auto_default_and_explicit_blocks(self):
         self.assertEqual(
             _resolve_gather_block(
                 "sparsecore-pipeline",
@@ -39,7 +39,7 @@ class TestDSASelectedKVGather(unittest.TestCase):
                 reported_cores=4,
                 num_subcores=16,
             ),
-            64,
+            128,
         )
         self.assertEqual(
             _resolve_gather_block(
@@ -66,7 +66,7 @@ class TestDSASelectedKVGather(unittest.TestCase):
             128,
         )
 
-    def test_auto_pipeline_uses_64_rows_only_for_single_glm_request(self):
+    def test_auto_pipeline_keeps_128_rows_for_single_glm_request(self):
         self.assertEqual(
             resolve_sparsecore_pipeline_gather_block(
                 "auto",
@@ -76,7 +76,7 @@ class TestDSASelectedKVGather(unittest.TestCase):
                 reported_cores=4,
                 num_subcores=16,
             ),
-            64,
+            128,
         )
         self.assertEqual(
             resolve_sparsecore_pipeline_gather_block(
@@ -99,6 +99,17 @@ class TestDSASelectedKVGather(unittest.TestCase):
                 num_subcores=16,
             ),
             128,
+        )
+        self.assertEqual(
+            resolve_sparsecore_pipeline_gather_block(
+                64,
+                batch_size=1,
+                padded_selected=2048,
+                cache_width=640,
+                reported_cores=4,
+                num_subcores=16,
+            ),
+            64,
         )
         self.assertEqual(
             resolve_sparsecore_pipeline_gather_block(

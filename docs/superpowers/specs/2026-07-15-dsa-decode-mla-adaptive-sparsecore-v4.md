@@ -10,12 +10,12 @@ physical selected slots -> SparseCore indirect gather -> contiguous selected KV
 ```
 
 Do not revisit direct TensorCore per-slot DMA, page-bucketed dense reads, or a
-new attention tile in this iteration.  Falcon measurements show that selected
+new attention tile in this iteration. Falcon measurements show that selected
 MLA attention is a minority of the operation time; the irregular gather is the
-bottleneck.  The one new hypothesis is that the latency-critical single-request
-decode case underutilizes SparseCore because the current 128-row window creates
-only 16 windows for `K=2048`, enough for one 16-subcore SparseCore but not the
-two active SparseCores exposed by the pinned Falcon runtime.
+bottleneck. The 64-row automatic specialization is **rejected**: the focused
+Falcon result did not establish a robust or meaningful performance win. The
+automatic pipeline choice is therefore the proven 128-row window; 64 remains
+an explicit diagnostic benchmark option only.
 
 ## Target layout and unchanged semantics
 
@@ -35,28 +35,26 @@ replaced with the safe physical slot zero for the gather and masked in the
 attention stage.  No Top-K, indexer, cache-lifecycle, IndexShare, prefill, or
 model-runner integration is added here.
 
-## Adaptive window policy
+## Window policy after the Falcon experiment
 
-The policy is used only for the `sparsecore-pipeline` implementation and only
-when the public caller requests the default `gather_block="auto"`:
+The policy is used only for the `sparsecore-pipeline` implementation. When the
+public caller requests the default `gather_block="auto"`, it resolves to 128
+rows for every shape and topology:
 
 | Static shape | Window | SparseCore workers | Windows per worker |
 | --- | ---: | ---: | ---: |
-| `B=1, Kpad=2048, W=640` | 64 rows | 2 cores x 16 subcores = 32 | 1 |
-| `B>=2, Kpad=2048, W=640` | 128 rows | up to 2 x 16 | at least 1 |
-| any unsupported shape or explicit integer | 128 rows / explicit value | existing planner | existing behavior |
+| auto, including `B=1, Kpad=2048, W=640` | 128 rows | existing planner | existing behavior |
+| explicit `gather_block=64` | 64 rows | explicit experiment only | existing planner |
+| any other explicit valid integer | explicit value | existing planner | existing behavior |
 
-At width 640, a 64-row BF16 output tile is 80 KiB; double buffering needs about
-160 KiB per vector subcore.  This is below the existing 128-row design's
-320 KiB budget, and 64 is still a multiple of SparseCore's required vector
-width.  The change lets one request produce 32 independent gather windows,
-which exactly fills the two active 16-subcore SparseCores already exercised by
-the successful B=32 pipeline run.  It does not rely on or alter physical-slot
-locality.
+At width 640, a 64-row BF16 output tile remains a valid explicit experiment:
+it is 80 KiB and double buffering needs about 160 KiB per vector subcore. It
+creates 32 independent windows for a single request, enough to fill two active
+16-subcore SparseCores, but that theoretical occupancy advantage did not
+translate into a reproducible latency improvement.
 
-The explicit `gather_block=128` API remains available for reproduction.  The
-automatic policy does not select a smaller block for unknown `K`, width, or
-runtime topology; it conservatively retains the current 128-row choice.
+The explicit `gather_block=64` and `gather_block=128` APIs remain available for
+reproduction. The automatic policy conservatively retains the 128-row choice.
 
 ## Why this is the next experiment
 
@@ -65,8 +63,21 @@ legacy SparseCore gather plus attention at `B=1,K=2048,context=160K` took
 1.220 ms median, of which gather alone took 1.222 ms and attention alone 0.157
 ms.  At `B=32,context=32K`, the manually pipelined implementation measured
 1.139 ms median versus 1.887 ms for legacy SparseCore composition, so exposing
-all SparseCore workers can matter.  The B=1 pipeline case has not yet been
-measured.
+all SparseCore workers can matter. The B=1 pipeline case was measured in
+Falcon experiment `exp-ezueatb6qw` at `B=1,K=2048,context=160K` with 50
+warm-ups and 200 device-timed iterations:
+
+| Variant | Median (ms) | p99 (ms) |
+| --- | ---: | ---: |
+| implicit `sparsecore-pipeline` (128 rows) | 1.1989 | 1.2370 |
+| explicit `sparsecore-pipeline-64` | 1.2039 | 1.2301 |
+| explicit `sparsecore-pipeline-128` | 1.2082 | 1.2438 |
+| `xla-gather` (gather-only diagnostic) | 0.2001 | not recorded |
+
+The small, mixed differences between the three pipeline readings do not show a
+robust 64-row win: explicit 64 is slower at the median than implicit 128 and
+only marginally lower at p99, while explicit 128 has a nearby result. This
+rejects the automatic adaptation without changing its mathematical result.
 
 The current `dense-jax-baseline` is a reshape/einsum workload, not the serving
 MLA-v2 ragged-paged kernel.  It may be retained for a workload sanity check but
@@ -76,31 +87,31 @@ decode invocation before any sparse-performance claim.
 
 ## Required validation
 
-1. **Planner contract on CPU:** auto resolution chooses 64 only for the
-   single-request GLM static shape; explicit 128 and non-pipeline paths remain
-   128.
+1. **Planner contract on CPU:** auto resolution remains 128 for the
+   single-request GLM static shape and all other shapes; explicit 64 and 128
+   remain valid, unchanged requests.
 2. **Falcon numerical gate:** compare `B=1,H=8,L=512,R=64,K=2048` pipeline
-   output using auto/64 against the independent explicit packed-cache FP32
+   output using auto against the independent explicit packed-cache FP32
    oracle.  Also compare `B=32` at the same GLM width and K, not the previous
    small `K=128,W=256` proxy.  Require BF16 `rtol=2e-2, atol=1e-2` and finite
    output.
-3. **Falcon discriminator:** at `B=1,K=2048,context=160K`, time pipeline-64,
-   pipeline-128, legacy SparseCore, XLA gather, and selected attention using
-   the same slots and 50 warm-ups plus 200 device-timed iterations.  The new
-   implementation is retained only if pipeline-64 improves the median and p99
-   over pipeline-128 without a correctness regression.
+3. **Falcon discriminator:** retain the `B=1,K=2048,context=160K` explicit
+   64/128 variants, legacy SparseCore, XLA gather, and selected-attention
+   measurements using the same slots and 50 warm-ups plus 200 device-timed
+   iterations. They remain diagnostic gates; they do not alter automatic
+   dispatch unless a future result shows a robust improvement.
 4. **Production baseline:** run the existing MLA-v2 ragged-paged decode kernel
    with the same BF16 cache, query dimensions, request count, and context;
    record compilation and device latency separately.  No dispatch threshold or
    end-to-end DSA benefit is claimed until this comparison is available.
 
-## Rejection criteria and next branch
+## Outcome and next branch
 
-Reject adaptive-64 if it fails to compile with the two-core SparseCore mesh,
-is numerically different from the oracle, or does not beat pipeline-128 at
-the B=1 gate.  In that case preserve the already-correct 128-row pipeline and
-investigate the actual indexer slot distribution before considering a
-locality-aware hybrid (contiguous TensorCore DMA for long physical runs plus
-SparseCore gather for the remainder).  Page bucketing is intentionally not a
-default: it can multiply read volume by orders of magnitude for dispersed
-Top-K rows.
+`exp-ezueatb6qw` met the rejection condition: adaptive 64 did not beat the
+128-row policy robustly at the B=1 gate. Preserve the already-correct 128-row
+pipeline, the explicit window variants, and all Falcon correctness gates.
+Investigate actual indexer slot distributions and add the production MLA-v2
+ragged-paged comparison before considering a locality-aware hybrid (contiguous
+TensorCore DMA for long physical runs plus SparseCore gather for the remainder).
+Page bucketing is intentionally not a default: it can multiply read volume by
+orders of magnitude for dispersed Top-K rows.

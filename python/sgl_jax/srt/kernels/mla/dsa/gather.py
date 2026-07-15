@@ -132,26 +132,17 @@ def resolve_sparsecore_pipeline_gather_block(
     reported_cores: int,
     num_subcores: int,
 ) -> int:
-    """Resolve the pipeline gather window from static shape and topology."""
+    """Resolve auto to the established pipeline default without changing ints.
+
+    The static-shape and topology arguments remain part of this public planner
+    contract so callers can continue to use one resolver for automatic and
+    explicitly requested windows. Falcon did not establish a robust benefit
+    for the 64-row specialization, so automatic selection deliberately keeps
+    the proven 128-row window.
+    """
     if requested != "auto":
         _validate_gather_block(requested)
         return requested
-    if (
-        batch_size == 1
-        and padded_selected == 2048
-        and cache_width == 640
-        and _active_sparsecore_cores(reported_cores) >= 2
-        and num_subcores == 16
-    ):
-        candidate = 64
-        _plan_sparsecore_pipeline(
-            batch_size=batch_size,
-            padded_selected=padded_selected,
-            gather_block=candidate,
-            available_cores=_active_sparsecore_cores(reported_cores),
-            num_subcores=num_subcores,
-        )
-        return candidate
     return _DEFAULT_GATHER_BLOCK
 
 

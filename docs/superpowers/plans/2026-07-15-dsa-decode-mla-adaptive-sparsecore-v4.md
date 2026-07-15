@@ -1,14 +1,44 @@
-# DSA Decode MLA Adaptive SparseCore Window Implementation Plan
+# DSA Decode MLA Adaptive SparseCore Window Plan and Experiment Record
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Use both active Falcon SparseCores for the latency-critical `B=1, K=2048` DSA decode gather while preserving the established two-stage MLA contract.
+**Goal:** Evaluate whether using both active Falcon SparseCores improves the
+latency-critical `B=1, K=2048` DSA decode gather, while preserving the
+established two-stage MLA contract. Retain automatic 128-row dispatch unless
+the measurement shows a robust improvement.
 
-**Architecture:** The public DSA dispatcher resolves `gather_block="auto"` from static shape and runtime SparseCore topology.  Only the known GLM single-request pipeline shape resolves to 64; every other auto case retains 128.  SparseCore still materializes selected rows and TensorCore still performs the contiguous selected MLA calculation.
+**Architecture:** The public DSA dispatcher retains `gather_block="auto"` as
+an API, but it conservatively resolves to 128 rows for every pipeline shape.
+Explicit 64 and 128 variants remain available for diagnostic benchmark runs.
+SparseCore still materializes selected rows and TensorCore still performs the
+contiguous selected MLA calculation.
+
+## Falcon outcome and rejection path (2026-07-15)
+
+Falcon experiment `exp-ezueatb6qw` measured the focused
+`B=1,K=2048,context=160K` gate after 50 warm-ups and 200 device-timed
+iterations:
+
+| Variant | Median (ms) | p99 (ms) |
+| --- | ---: | ---: |
+| implicit `sparsecore-pipeline` (128 rows) | 1.1989 | 1.2370 |
+| explicit `sparsecore-pipeline-64` | 1.2039 | 1.2301 |
+| explicit `sparsecore-pipeline-128` | 1.2082 | 1.2438 |
+| `xla-gather` (gather-only diagnostic) | 0.2001 | not recorded |
+
+Adaptive 64 is rejected for automatic dispatch: its small, mixed deltas do not
+show a robust or meaningful improvement over the 128-row policy. The
+rejection-path implementation keeps automatic pipeline selection at 128,
+retains the explicit 64/128 benchmark variants, and retains all existing
+Falcon correctness gates (B=1 GLM, B=32 GLM, and gather equality). The
+historical implementation steps below document the experiment that led to this
+decision; this outcome supersedes their automatic-64 policy.
 
 **Tech Stack:** Python 3.12, JAX 0.8.1, Pallas TPU SparseCore, BF16, unittest, Falcon v7x-8.
 
 ---
+
+## Historical experiment steps (automatic-64 policy superseded)
 
 ### Task 1: Specify and test auto-window resolution
 
