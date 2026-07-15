@@ -52,9 +52,9 @@ Add tests that assert:
 Run:
 
 ```bash
-PYTHONPATH=python /Users/jiongxuan/workspace/sglang-jax/python/.venv/bin/python \
-  -m pytest python/sgl_jax/test/kernels/test_dsa_decode_mla.py \
-  python/sgl_jax/test/kernels/test_bench_dsa_decode_mla.py -q
+PYTHONPATH=python:. /Users/jiongxuan/workspace/sglang-jax/python/.venv/bin/python \
+  -m unittest -v sgl_jax.test.kernels.test_dsa_decode_mla \
+  sgl_jax.test.kernels.test_bench_dsa_decode_mla
 ```
 
 Expected: benchmark-layout and scale assertions fail against the current
@@ -183,9 +183,9 @@ The real SparseCore kernel cannot be established by CPU interpret mode. Run
 all non-TPU tests and Ruff first:
 
 ```bash
-PYTHONPATH=python /Users/jiongxuan/workspace/sglang-jax/python/.venv/bin/python \
-  -m pytest python/sgl_jax/test/kernels/test_dsa_decode_mla.py -q
-/Users/jiongxuan/workspace/sglang-jax/python/.venv/bin/ruff check \
+PYTHONPATH=python:. /Users/jiongxuan/workspace/sglang-jax/python/.venv/bin/python \
+  -m unittest -v sgl_jax.test.kernels.test_dsa_decode_mla
+ruff check \
   python/sgl_jax/srt/kernels/mla/dsa \
   python/sgl_jax/test/kernels/test_dsa_decode_mla.py
 ```
@@ -323,9 +323,9 @@ unused invalid Pallas path.
 ### Step 3: Run all local DSA tests
 
 ```bash
-PYTHONPATH=python /Users/jiongxuan/workspace/sglang-jax/python/.venv/bin/python \
-  -m pytest python/sgl_jax/test/kernels/test_dsa_decode_mla.py \
-  python/sgl_jax/test/kernels/test_bench_dsa_decode_mla.py -q
+PYTHONPATH=python:. /Users/jiongxuan/workspace/sglang-jax/python/.venv/bin/python \
+  -m unittest -v sgl_jax.test.kernels.test_dsa_decode_mla \
+  sgl_jax.test.kernels.test_bench_dsa_decode_mla
 ```
 
 Expected: all CPU/interpret tests pass and only TPU-specific tests skip.
@@ -384,8 +384,8 @@ median, p99, mean, and minimum. Add a smaller smoke mode for remote gates.
 ### Step 3: Run local benchmark contract tests and commit
 
 ```bash
-PYTHONPATH=python /Users/jiongxuan/workspace/sglang-jax/python/.venv/bin/python \
-  -m pytest python/sgl_jax/test/kernels/test_bench_dsa_decode_mla.py -q
+PYTHONPATH=python:. /Users/jiongxuan/workspace/sglang-jax/python/.venv/bin/python \
+  -m unittest -v sgl_jax.test.kernels.test_bench_dsa_decode_mla
 git add benchmark/kernels/mla/bench_dsa_decode_mla.py \
   python/sgl_jax/test/kernels/test_bench_dsa_decode_mla.py \
   scripts/kernels/falcon_dsa_decode_mla_v7x8.yaml
@@ -443,10 +443,10 @@ git commit -m "docs: report Falcon DSA MLA v2 results"
 Run from a clean worktree:
 
 ```bash
-PYTHONPATH=python /Users/jiongxuan/workspace/sglang-jax/python/.venv/bin/python \
-  -m pytest python/sgl_jax/test/kernels/test_dsa_decode_mla.py \
-  python/sgl_jax/test/kernels/test_bench_dsa_decode_mla.py -q
-/Users/jiongxuan/workspace/sglang-jax/python/.venv/bin/ruff check \
+PYTHONPATH=python:. /Users/jiongxuan/workspace/sglang-jax/python/.venv/bin/python \
+  -m unittest -v sgl_jax.test.kernels.test_dsa_decode_mla \
+  sgl_jax.test.kernels.test_bench_dsa_decode_mla
+ruff check \
   python/sgl_jax/srt/kernels/mla/dsa \
   python/sgl_jax/test/kernels/test_dsa_decode_mla.py \
   python/sgl_jax/test/kernels/test_bench_dsa_decode_mla.py \

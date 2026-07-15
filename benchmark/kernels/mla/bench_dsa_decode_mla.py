@@ -33,6 +33,7 @@ from sgl_jax.srt.kernels.mla.dsa import dsa_decode_mla_attention_unchecked
 
 
 _ALIGNMENT = 128
+GLM_ATTENTION_SCALE = 256**-0.5
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,8 +78,8 @@ def make_benchmark_inputs(
         raise ValueError(f"all benchmark dimensions must be positive: {', '.join(invalid)}")
     if top_k > context_length:
         raise ValueError("top_k must not exceed context_length")
-    if page_size % _ALIGNMENT and _ALIGNMENT % page_size:
-        raise ValueError("page_size must divide 128 or be divisible by 128")
+    if page_size % 2 or (page_size % _ALIGNMENT and _ALIGNMENT % page_size):
+        raise ValueError("page_size must be even and divide 128 or be divisible by 128")
     if slot_order not in {"unsorted", "page-sorted"}:
         raise ValueError("slot_order must be 'unsorted' or 'page-sorted'")
 
@@ -88,7 +89,7 @@ def make_benchmark_inputs(
     ql_nope = rng.standard_normal((batch_size, num_heads, latent_dim), dtype=np.float32)
     q_pe = rng.standard_normal((batch_size, num_heads, rope_dim), dtype=np.float32)
     cache_kv = rng.standard_normal(
-        (num_pages, page_size, 1, padded_width), dtype=np.float32
+        (num_pages, page_size // 2, 2, padded_width), dtype=np.float32
     )
 
     # Spread selections across the full context.  Each row has the same
@@ -177,6 +178,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--latent-dim", type=int, default=512)
     parser.add_argument("--rope-dim", type=int, default=64)
     parser.add_argument("--page-size", type=int, default=128)
+    parser.add_argument(
+        "--sm-scale",
+        type=float,
+        default=None,
+        help="Attention scale; defaults to GLM's unabsorbed 256-d QK scale.",
+    )
     parser.add_argument("--slot-order", choices=("unsorted", "page-sorted"), default="unsorted")
     parser.add_argument("--variant", choices=("sparse", "dense", "both"), default="both")
     parser.add_argument("--warmup-iters", type=int, default=50)
@@ -213,7 +220,9 @@ def main() -> None:
     cache_kv = jnp.asarray(host_inputs.cache_kv, dtype=jnp.bfloat16)
     topk_slots = jnp.asarray(host_inputs.topk_slots, dtype=jnp.int32)
     valid_counts = jnp.asarray(host_inputs.valid_counts, dtype=jnp.int32)
-    sm_scale = (args.latent_dim + args.rope_dim) ** -0.5
+    sm_scale = GLM_ATTENTION_SCALE if args.sm_scale is None else args.sm_scale
+    if not np.isfinite(sm_scale):
+        raise ValueError("sm-scale must be finite")
 
     sparse = jax.jit(
         lambda: dsa_decode_mla_attention_unchecked(
@@ -249,6 +258,7 @@ def main() -> None:
             "latent_dim": args.latent_dim,
             "rope_dim": args.rope_dim,
             "page_size": args.page_size,
+            "sm_scale": sm_scale,
             "slot_order": args.slot_order,
             "dtype": "bfloat16",
         },
