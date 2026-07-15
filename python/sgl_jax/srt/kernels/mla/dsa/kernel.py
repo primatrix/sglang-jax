@@ -197,7 +197,7 @@ def _sparsecore_pipeline_composed_launcher(sm_scale: float, gather_block: int):
         gather_impl="sparsecore-pipeline",
         gather_block=gather_block,
     )
-    return jax.jit(launch)
+    return jax.jit(launch, compiler_options=SPARSECORE_COMPILER_OPTIONS)
 
 
 def dsa_decode_mla_attention(

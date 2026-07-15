@@ -393,7 +393,13 @@ def main() -> None:
     for variant in chosen:
         compiler_options = (
             SPARSECORE_COMPILER_OPTIONS
-            if variant in {"sparsecore", "gather-only"}
+            if variant
+            in {
+                "sparsecore-pipeline",
+                "sparsecore",
+                "pipeline-gather-only",
+                "gather-only",
+            }
             else None
         )
         compiled, compile_ms = _compile_variant(

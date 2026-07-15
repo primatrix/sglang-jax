@@ -273,7 +273,7 @@ def _sparsecore_pipeline_launcher(gather_block: int):
         materialize_selected_kv_sparsecore_pipeline_unchecked,
         gather_block=gather_block,
     )
-    return jax.jit(launch)
+    return jax.jit(launch, compiler_options=SPARSECORE_COMPILER_OPTIONS)
 
 
 def materialize_selected_kv_sparsecore(

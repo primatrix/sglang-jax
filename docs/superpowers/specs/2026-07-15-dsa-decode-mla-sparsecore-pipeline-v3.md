@@ -67,9 +67,11 @@ In JAX 0.8.1 the mesh's visible axis names are the literal `core` and
 
 Within each worker, `emit_pipeline` loads the next index block while the body
 issues the current indirect gather and the previous output block is committed
-to HBM. No global compiler option is attached to this `pl.kernel` path; the
-official core-map API owns its device shape. The legacy `pallas_call` path
-retains `xla_tpu_use_tc_device_shape_on_sc=false` for controlled comparison.
+to HBM. Falcon's JAX 0.8.1/libtpu 0.0.30 runtime still requires
+`xla_tpu_use_tc_device_shape_on_sc=false` on the outermost JIT. Without it,
+the compiler exposes only two active TC-shaped cores and rejects the four-core
+SparseCore mesh. Both legacy and pipeline launchers therefore put this option
+only on their top-level JIT; raw unchecked calls remain composable.
 
 ## Evidence gates
 
