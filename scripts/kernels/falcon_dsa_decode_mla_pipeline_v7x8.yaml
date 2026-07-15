@@ -1,4 +1,4 @@
-name: dsa-sc-pipeline-b32-v7x8-20260715-r5
+name: dsa-sc-pipeline-adaptive-v7x8-20260715-r1
 exp_type: profiling
 cluster_name: tpuv7x-64-node
 artifact_type: GCS
@@ -55,9 +55,9 @@ role_to_task_spec:
         2>&1 | tee "${RESULTS}/pipeline_correctness.log"
 
       python benchmark/kernels/mla/bench_dsa_decode_mla.py \
-        --batch-size 32 --context-length 32000 --top-k 2048 \
-        --slot-distribution uniform --variant sparsecore-pipeline \
+        --batch-size 1 --context-length 160000 --top-k 2048 \
+        --slot-distribution uniform --variant all \
         --warmup-iters 50 --iters 200 \
-        --output "${RESULTS}/b32_ctx32000_sparsecore-pipeline.json" \
-        2>&1 | tee "${RESULTS}/b32_ctx32000_sparsecore-pipeline.log"
+        --output "${RESULTS}/b1_ctx160000_adaptive_pipeline.json" \
+        2>&1 | tee "${RESULTS}/b1_ctx160000_adaptive_pipeline.log"
       '

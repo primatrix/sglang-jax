@@ -43,6 +43,8 @@ _ALIGNMENT = 128
 GLM_ATTENTION_SCALE = 256**-0.5
 BENCHMARK_VARIANTS = (
     "sparsecore-pipeline",
+    "sparsecore-pipeline-64",
+    "sparsecore-pipeline-128",
     "sparsecore",
     "xla-gather",
     "gather-only",
@@ -80,6 +82,8 @@ def estimate_variant_kv_bytes(
     return {
         "selected_tensor": selected_bytes,
         "sparsecore-pipeline": 3 * selected_bytes,
+        "sparsecore-pipeline-64": 3 * selected_bytes,
+        "sparsecore-pipeline-128": 3 * selected_bytes,
         "sparsecore": 3 * selected_bytes,
         "xla-gather": 3 * selected_bytes,
         "gather-only": 2 * selected_bytes,
@@ -309,6 +313,26 @@ def main() -> None:
             sm_scale=sm_scale,
             gather_impl="sparsecore-pipeline",
         ),
+        "sparsecore-pipeline-64": lambda: dsa_decode_mla_attention_unchecked(
+            ql_nope,
+            q_pe,
+            cache_kv,
+            topk_slots,
+            valid_counts,
+            sm_scale=sm_scale,
+            gather_impl="sparsecore-pipeline",
+            gather_block=64,
+        ),
+        "sparsecore-pipeline-128": lambda: dsa_decode_mla_attention_unchecked(
+            ql_nope,
+            q_pe,
+            cache_kv,
+            topk_slots,
+            valid_counts,
+            sm_scale=sm_scale,
+            gather_impl="sparsecore-pipeline",
+            gather_block=128,
+        ),
         "sparsecore": lambda: dsa_decode_mla_attention_unchecked(
             ql_nope,
             q_pe,
@@ -386,6 +410,8 @@ def main() -> None:
             if variant
             in {
                 "sparsecore-pipeline",
+                "sparsecore-pipeline-64",
+                "sparsecore-pipeline-128",
                 "sparsecore",
                 "gather-only",
             }

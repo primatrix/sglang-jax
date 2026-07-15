@@ -85,17 +85,14 @@ class TestDSADecodeMLABenchmarkInputs(unittest.TestCase):
         self.assertGreater(uniform_pages.size, clustered_pages.size)
 
     def test_benchmark_variants_and_kv_byte_estimates_are_explicit(self):
-        self.assertEqual(
-            BENCHMARK_VARIANTS,
-            (
-                "sparsecore-pipeline",
-                "sparsecore",
-                "xla-gather",
-                "gather-only",
-                "attention-only",
-                "dense-jax-baseline",
-            ),
-        )
+        self.assertIn("sparsecore-pipeline", BENCHMARK_VARIANTS)
+        self.assertIn("sparsecore-pipeline-64", BENCHMARK_VARIANTS)
+        self.assertIn("sparsecore-pipeline-128", BENCHMARK_VARIANTS)
+        self.assertIn("sparsecore", BENCHMARK_VARIANTS)
+        self.assertIn("xla-gather", BENCHMARK_VARIANTS)
+        self.assertIn("gather-only", BENCHMARK_VARIANTS)
+        self.assertIn("attention-only", BENCHMARK_VARIANTS)
+        self.assertIn("dense-jax-baseline", BENCHMARK_VARIANTS)
         estimates = estimate_variant_kv_bytes(
             batch_size=2,
             context_length=32,
@@ -108,6 +105,8 @@ class TestDSADecodeMLABenchmarkInputs(unittest.TestCase):
         self.assertEqual(estimates["gather-only"], 2 * selected_bytes)
         self.assertEqual(estimates["attention-only"], selected_bytes)
         self.assertEqual(estimates["sparsecore-pipeline"], 3 * selected_bytes)
+        self.assertEqual(estimates["sparsecore-pipeline-64"], 3 * selected_bytes)
+        self.assertEqual(estimates["sparsecore-pipeline-128"], 3 * selected_bytes)
         self.assertEqual(estimates["sparsecore"], 3 * selected_bytes)
         self.assertEqual(estimates["xla-gather"], 3 * selected_bytes)
         self.assertEqual(estimates["dense-jax-baseline"], 2 * 32 * 256 * 2)
