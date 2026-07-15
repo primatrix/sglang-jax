@@ -132,9 +132,11 @@ Before dispatch, replace padding slots with safe slot zero. Valid slots have
 already been range-checked. The attention stage still uses `valid_counts`, so
 the safe rows are never observed by softmax.
 
-Use a static gather block `G`, initially 128:
+Flatten `[B, Kpad]` to one logical slot stream at the Pallas-call boundary and
+use a static gather block `G`, initially 128. This avoids `None`/squeezed block
+dimensions, which the JAX 0.8.1 SparseCore lowering does not support:
 
-- grid: `(B, ceil(K / G))`;
+- grid: `(B * Kpad / G,)`;
 - slots input block: `[G]` in VMEM;
 - cache source: `[capacity, width]` in HBM;
 - output block and indirect DMA target: `[G, width]` in VMEM.

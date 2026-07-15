@@ -152,7 +152,9 @@ when the default backend is not TPU.
 ### Step 2: Implement the official JAX 0.8.1 gather pattern
 
 Add a SparseCore Pallas kernel whose cache input has HBM memory space and
-whose slot block has VMEM memory space. For each `(batch, gather_block)` grid
+whose slot block has VMEM memory space. Flatten batch and selected dimensions
+at the Pallas-call boundary because JAX 0.8.1 SparseCore does not support
+`None`/squeezed block dimensions. For each one-dimensional gather-block grid
 program, execute the equivalent of:
 
 ```python

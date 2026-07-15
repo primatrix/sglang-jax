@@ -91,25 +91,26 @@ def materialize_selected_kv_sparsecore_unchecked(
 
     cache_width = cache_kv.shape[-1]
     logical_cache = cache_kv.reshape((-1, cache_width))
+    flattened_slots = safe_topk_slots.reshape((-1,))
     out_shape = jax.ShapeDtypeStruct(
-        (batch_size, padded_selected, cache_width), cache_kv.dtype
+        (batch_size * padded_selected, cache_width), cache_kv.dtype
     )
 
     gather_call = pl.pallas_call(
         _sparsecore_gather_kernel,
         out_shape=out_shape,
-        grid=(batch_size, padded_selected // gather_block),
+        grid=(batch_size * padded_selected // gather_block,),
         in_specs=(
             pl.BlockSpec(memory_space=pltpu.HBM),
             pl.BlockSpec(
-                (None, gather_block),
-                lambda batch_index, block_index: (batch_index, block_index),
+                (gather_block,),
+                lambda block_index: (block_index,),
                 memory_space=pltpu.VMEM,
             ),
         ),
         out_specs=pl.BlockSpec(
-            (None, gather_block, cache_width),
-            lambda batch_index, block_index: (batch_index, block_index, 0),
+            (gather_block, cache_width),
+            lambda block_index: (block_index, 0),
             memory_space=pltpu.VMEM,
         ),
         compiler_params=pltpu.CompilerParams(
@@ -121,7 +122,8 @@ def materialize_selected_kv_sparsecore_unchecked(
         gather_call,
         compiler_options={"xla_tpu_use_tc_device_shape_on_sc": "false"},
     )
-    return compiled_gather(logical_cache, safe_topk_slots)
+    gathered = compiled_gather(logical_cache, flattened_slots)
+    return gathered.reshape((batch_size, padded_selected, cache_width))
 
 
 def materialize_selected_kv_sparsecore(
