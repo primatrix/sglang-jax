@@ -49,11 +49,12 @@ window(step) = first_window + step
 ```
 
 At GLM Top-K 2048 there are 16 windows per request. Falcon's JAX 0.8.1 v7x
-runtime reports four logical SparseCores, each with 16 subcores:
+runtime reports four physical SparseCores, but its compiler permits two active
+logical SparseCore dimensions, each with 16 subcores:
 
 - B=1: select 1 SparseCore, use 16 subcores, 1 window per worker;
-- B=8: select 4 SparseCores, use 64 subcores, 2 windows per worker;
-- B=32: select 4 SparseCores, use 64 subcores, 8 windows per worker.
+- B=8: select 2 SparseCores, use 32 subcores, 4 windows per worker;
+- B=32: select 2 SparseCores, use 32 subcores, 16 windows per worker.
 
 For other shapes, use the largest available SparseCore count that evenly
 divides the number of windows. Reject shapes with fewer than one window per
@@ -63,7 +64,9 @@ legacy and XLA paths remain available for those shapes.
 In JAX 0.8.1 the mesh's visible axis names are the literal `core` and
 `subcore`; custom names stored on `VectorSubcoreMesh` are not reflected in its
 `shape` mapping. Kernel code must therefore use those literal names with
-`jax.lax.axis_index`.
+`jax.lax.axis_index`. The planner also caps the reported physical count at two
+active cores; a four-core mesh fails compilation with `iteration bound 4`
+greater than `active cores 2`.
 
 Within each worker, `emit_pipeline` loads the next index block while the body
 issues the current indirect gather and the previous output block is committed

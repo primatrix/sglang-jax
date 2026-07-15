@@ -12,9 +12,17 @@ from jax.experimental.pallas import tpu_sc as plsc
 
 _DEFAULT_GATHER_BLOCK = 128
 _MIN_SC_VECTOR_WIDTH = 8
+_JAX_081_MAX_ACTIVE_SC_CORES = 2
 SPARSECORE_COMPILER_OPTIONS = {
     "xla_tpu_use_tc_device_shape_on_sc": "false"
 }
+
+
+def _active_sparsecore_cores(reported_cores: int) -> int:
+    """Return the SC core count usable by the pinned Falcon compiler."""
+    if not isinstance(reported_cores, int) or reported_cores <= 0:
+        raise ValueError("reported SparseCore count must be a positive integer")
+    return min(reported_cores, _JAX_081_MAX_ACTIVE_SC_CORES)
 
 
 def _validate_gather_block(gather_block: int) -> None:
@@ -200,7 +208,7 @@ def materialize_selected_kv_sparsecore_pipeline_unchecked(
         batch_size=batch_size,
         padded_selected=padded_selected,
         gather_block=gather_block,
-        available_cores=sparsecore_info.num_cores,
+        available_cores=_active_sparsecore_cores(sparsecore_info.num_cores),
         num_subcores=sparsecore_info.num_subcores,
     )
 

@@ -1,4 +1,4 @@
-name: dsa-sc-pipeline-b32-v7x8-20260715-r4
+name: dsa-sc-pipeline-b32-v7x8-20260715-r5
 exp_type: profiling
 cluster_name: tpuv7x-64-node
 artifact_type: GCS

@@ -8,6 +8,7 @@ import numpy as np
 
 from sgl_jax.srt.kernels.mla.dsa.attention import selected_mla_attention
 from sgl_jax.srt.kernels.mla.dsa.gather import (
+    _active_sparsecore_cores,
     _plan_sparsecore_pipeline,
     materialize_selected_kv_sparsecore,
     materialize_selected_kv_sparsecore_pipeline,
@@ -24,6 +25,7 @@ from sgl_jax.srt.kernels.mla.dsa.reference import (
 
 class TestDSASelectedKVGather(unittest.TestCase):
     def test_sparsecore_pipeline_plan_uses_each_worker_once(self):
+        self.assertEqual(_active_sparsecore_cores(4), 2)
         self.assertEqual(
             _plan_sparsecore_pipeline(
                 batch_size=1,
