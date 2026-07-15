@@ -766,7 +766,7 @@ class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
 
         np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=1e-2)
 
-    def test_tpu_non_interpret_glm_shape_2048_matches_reference(self):
+    def test_tpu_pipeline_glm_shape_2048_matches_reference(self):
         """Exercise the Falcon gate at the GLM MLA widths and DSA Top-K."""
         if jax.default_backend() != "tpu":
             self.skipTest("interpret=False Pallas lowering requires a TPU")
@@ -807,6 +807,7 @@ class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
             valid_counts,
             sm_scale=256**-0.5,
             interpret=False,
+            gather_impl="sparsecore-pipeline",
         )
         expected = reference_dsa_decode_mla_attention(
             ql_nope,
@@ -820,7 +821,7 @@ class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
         self.assertTrue(np.isfinite(np.asarray(actual)).all())
         np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=1e-2)
 
-    def test_tpu_composed_batch_32_matches_reference(self):
+    def test_tpu_pipeline_composed_batch_32_matches_reference(self):
         if jax.default_backend() != "tpu":
             self.skipTest("interpret=False Pallas lowering requires a TPU")
 
@@ -867,6 +868,7 @@ class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
             valid_counts,
             sm_scale=256**-0.5,
             interpret=False,
+            gather_impl="sparsecore-pipeline",
         )
         expected = reference_dsa_decode_mla_attention(
             ql_nope,
