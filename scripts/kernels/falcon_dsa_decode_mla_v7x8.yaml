@@ -1,4 +1,4 @@
-name: dsa-perf-smoke-v7x8-20260715-r2
+name: dsa-perf-matrix-v7x8-20260715-r1
 exp_type: profiling
 cluster_name: tpuv7x-64-node
 artifact_type: GCS
@@ -47,23 +47,32 @@ role_to_task_spec:
       print(f"devices={jax.devices()}")
       PY
 
-      python -m unittest -v \
-        sgl_jax.test.kernels.test_dsa_decode_mla.TestDSADecodeMLAPallas.test_tpu_non_interpret_matches_reference_with_dynamic_slots \
-        sgl_jax.test.kernels.test_dsa_decode_mla.TestDSADecodeMLAPallas.test_tpu_non_interpret_glm_shape_2048_matches_reference \
-        sgl_jax.test.kernels.test_dsa_decode_mla.TestDSADecodeMLAPallas.test_tpu_composed_batch_32_matches_reference \
-        2>&1 | tee "${RESULTS}/composed_correctness.log"
+      for BATCH in 1 8 32; do
+        for CONTEXT in 8000 32000 128000 160000; do
+          PROFILE_ARGS=()
+          if [[ "${BATCH}" == 1 && "${CONTEXT}" == 160000 ]] || \
+             [[ "${BATCH}" == 32 && "${CONTEXT}" == 32000 ]]; then
+            PROFILE_ARGS=(
+              --profile --profile-iters 3 --profile-variant sparsecore
+              --profile-dir "${RESULTS}/profile_b${BATCH}_ctx${CONTEXT}"
+            )
+          fi
+          python benchmark/kernels/mla/bench_dsa_decode_mla.py \
+            --batch-size "${BATCH}" --context-length "${CONTEXT}" --top-k 2048 \
+            --slot-distribution uniform --variant all \
+            --warmup-iters 50 --iters 200 \
+            --output "${RESULTS}/uniform_b${BATCH}_ctx${CONTEXT}.json" \
+            "${PROFILE_ARGS[@]}" \
+            2>&1 | tee "${RESULTS}/uniform_b${BATCH}_ctx${CONTEXT}.log"
+        done
+      done
 
-      python benchmark/kernels/mla/bench_dsa_decode_mla.py \
-        --batch-size 1 --context-length 32000 --top-k 2048 \
-        --variant all --warmup-iters 5 --iters 20 \
-        --profile --profile-iters 3 --profile-variant sparsecore \
-        --profile-dir "${RESULTS}/profile_b1_ctx32k" \
-        --output "${RESULTS}/smoke_b1_ctx32k.json" \
-        2>&1 | tee "${RESULTS}/smoke_b1_ctx32k.log"
-
-      python benchmark/kernels/mla/bench_dsa_decode_mla.py \
-        --batch-size 8 --context-length 32000 --top-k 2048 \
-        --variant all --warmup-iters 5 --iters 20 \
-        --output "${RESULTS}/smoke_b8_ctx32k.json" \
-        2>&1 | tee "${RESULTS}/smoke_b8_ctx32k.log"
+      for BATCH in 1 32; do
+        python benchmark/kernels/mla/bench_dsa_decode_mla.py \
+          --batch-size "${BATCH}" --context-length 160000 --top-k 2048 \
+          --slot-distribution clustered --variant all \
+          --warmup-iters 50 --iters 200 \
+          --output "${RESULTS}/clustered_b${BATCH}_ctx160000.json" \
+          2>&1 | tee "${RESULTS}/clustered_b${BATCH}_ctx160000.log"
+      done
       '
