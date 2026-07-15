@@ -1,0 +1,70 @@
+name: dsa-sc-pipeline-gate-v7x8-20260715-r1
+exp_type: profiling
+cluster_name: tpuv7x-64-node
+artifact_type: GCS
+tags:
+  - dsa
+  - mla
+  - pallas
+  - sparsecore
+  - pipeline
+role_to_task_spec:
+  worker:
+    replica: 1
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x1
+    supply_mode: reservation
+    envs:
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /tmp/dsa-sc-pipeline/tmp
+      PIP_CACHE_DIR: /tmp/dsa-sc-pipeline/pip-cache
+      JAX_COMPILATION_CACHE_DIR: /tmp/dsa-sc-pipeline/jit-cache
+      LIBTPU_INIT_ARGS: --xla_tpu_dvfs_p_state=7
+    command: |
+      bash -lc '
+      set -euxo pipefail
+      ROOT=/tmp/dsa-sc-pipeline
+      RESULTS=${ROOT}/results
+      mkdir -p "${ROOT}/tmp" "${ROOT}/pip-cache" "${ROOT}/jit-cache" "${RESULTS}"
+      ulimit -c 0
+
+      git clone --depth 1 --branch develop/dsa-decode-mla \
+        https://github.com/primatrix/sglang-jax.git "${ROOT}/repo"
+      cd "${ROOT}/repo"
+      git rev-parse HEAD | tee "${RESULTS}/git_head.txt"
+      python -m pip install -U "jax[tpu]==0.8.1" \
+        -i https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
+        -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+      python -m pip install --no-deps -e python
+      python - <<"PY" | tee "${RESULTS}/environment.txt"
+      import jax
+      from jax.experimental.pallas import tpu as pltpu
+      print(f"backend={jax.default_backend()}")
+      print(f"jax={jax.__version__}")
+      print(f"devices={jax.devices()}")
+      print(f"tpu_info={pltpu.get_tpu_info()}")
+      PY
+
+      python -m unittest -v \
+        sgl_jax.test.kernels.test_dsa_decode_mla.TestDSASparseCoreGather.test_pipelined_sparsecore_gather_matches_xla \
+        sgl_jax.test.kernels.test_dsa_decode_mla.TestDSADecodeMLAPallas.test_tpu_pipeline_glm_shape_2048_matches_reference \
+        sgl_jax.test.kernels.test_dsa_decode_mla.TestDSADecodeMLAPallas.test_tpu_pipeline_composed_batch_32_matches_reference \
+        2>&1 | tee "${RESULTS}/pipeline_correctness.log"
+
+      for CASE in b1_ctx160000 b32_ctx32000; do
+        case "${CASE}" in
+          b1_ctx160000) BATCH=1; CONTEXT=160000 ;;
+          b32_ctx32000) BATCH=32; CONTEXT=32000 ;;
+        esac
+        for VARIANT in sparsecore-pipeline pipeline-gather-only; do
+          python benchmark/kernels/mla/bench_dsa_decode_mla.py \
+            --batch-size "${BATCH}" --context-length "${CONTEXT}" --top-k 2048 \
+            --slot-distribution uniform --variant "${VARIANT}" \
+            --warmup-iters 50 --iters 200 \
+            --output "${RESULTS}/${CASE}_${VARIANT}.json" \
+            2>&1 | tee "${RESULTS}/${CASE}_${VARIANT}.log"
+        done
+      done
+      '
