@@ -88,8 +88,10 @@ class TestDSADecodeMLABenchmarkInputs(unittest.TestCase):
         self.assertEqual(
             BENCHMARK_VARIANTS,
             (
+                "sparsecore-pipeline",
                 "sparsecore",
                 "xla-gather",
+                "pipeline-gather-only",
                 "gather-only",
                 "attention-only",
                 "dense-jax-baseline",
@@ -104,8 +106,10 @@ class TestDSADecodeMLABenchmarkInputs(unittest.TestCase):
         )
         selected_bytes = 2 * 8 * 256 * 2
         self.assertEqual(estimates["selected_tensor"], selected_bytes)
+        self.assertEqual(estimates["pipeline-gather-only"], 2 * selected_bytes)
         self.assertEqual(estimates["gather-only"], 2 * selected_bytes)
         self.assertEqual(estimates["attention-only"], selected_bytes)
+        self.assertEqual(estimates["sparsecore-pipeline"], 3 * selected_bytes)
         self.assertEqual(estimates["sparsecore"], 3 * selected_bytes)
         self.assertEqual(estimates["xla-gather"], 3 * selected_bytes)
         self.assertEqual(estimates["dense-jax-baseline"], 2 * 32 * 256 * 2)

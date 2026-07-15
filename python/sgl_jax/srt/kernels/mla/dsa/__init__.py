@@ -7,6 +7,8 @@ from sgl_jax.srt.kernels.mla.dsa.attention import (
 from sgl_jax.srt.kernels.mla.dsa.gather import (
     SPARSECORE_COMPILER_OPTIONS,
     materialize_selected_kv_sparsecore,
+    materialize_selected_kv_sparsecore_pipeline,
+    materialize_selected_kv_sparsecore_pipeline_unchecked,
     materialize_selected_kv_sparsecore_unchecked,
     materialize_selected_kv_xla,
     prepare_safe_topk_slots,
@@ -27,6 +29,8 @@ __all__ = [
     "dsa_decode_mla_attention",
     "dsa_decode_mla_attention_unchecked",
     "materialize_selected_kv_sparsecore",
+    "materialize_selected_kv_sparsecore_pipeline",
+    "materialize_selected_kv_sparsecore_pipeline_unchecked",
     "materialize_selected_kv_sparsecore_unchecked",
     "materialize_selected_kv_xla",
     "prepare_safe_topk_slots",

@@ -32,6 +32,7 @@ import numpy as np
 from sgl_jax.srt.kernels.mla.dsa import (
     SPARSECORE_COMPILER_OPTIONS,
     dsa_decode_mla_attention_unchecked,
+    materialize_selected_kv_sparsecore_pipeline_unchecked,
     materialize_selected_kv_sparsecore_unchecked,
     materialize_selected_kv_xla,
     prepare_safe_topk_slots,
@@ -42,8 +43,10 @@ from sgl_jax.srt.kernels.mla.dsa import (
 _ALIGNMENT = 128
 GLM_ATTENTION_SCALE = 256**-0.5
 BENCHMARK_VARIANTS = (
+    "sparsecore-pipeline",
     "sparsecore",
     "xla-gather",
+    "pipeline-gather-only",
     "gather-only",
     "attention-only",
     "dense-jax-baseline",
@@ -78,8 +81,10 @@ def estimate_variant_kv_bytes(
     dense_bytes = batch_size * context_length * cache_width * itemsize
     return {
         "selected_tensor": selected_bytes,
+        "sparsecore-pipeline": 3 * selected_bytes,
         "sparsecore": 3 * selected_bytes,
         "xla-gather": 3 * selected_bytes,
+        "pipeline-gather-only": 2 * selected_bytes,
         "gather-only": 2 * selected_bytes,
         "attention-only": selected_bytes,
         "dense-jax-baseline": dense_bytes,
@@ -298,6 +303,15 @@ def main() -> None:
     jax.block_until_ready(selected_kv)
 
     variants: dict[str, Callable[[], jax.Array]] = {
+        "sparsecore-pipeline": lambda: dsa_decode_mla_attention_unchecked(
+            ql_nope,
+            q_pe,
+            cache_kv,
+            topk_slots,
+            valid_counts,
+            sm_scale=sm_scale,
+            gather_impl="sparsecore-pipeline",
+        ),
         "sparsecore": lambda: dsa_decode_mla_attention_unchecked(
             ql_nope,
             q_pe,
@@ -315,6 +329,13 @@ def main() -> None:
             valid_counts,
             sm_scale=sm_scale,
             gather_impl="xla",
+        ),
+        "pipeline-gather-only": lambda: (
+            materialize_selected_kv_sparsecore_pipeline_unchecked(
+                cache_kv,
+                safe_topk_slots,
+                gather_block=128,
+            )
         ),
         "gather-only": lambda: materialize_selected_kv_sparsecore_unchecked(
             cache_kv,

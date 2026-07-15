@@ -15,6 +15,7 @@ from sgl_jax.srt.kernels.mla.dsa.attention import (
 )
 from sgl_jax.srt.kernels.mla.dsa.gather import (
     SPARSECORE_COMPILER_OPTIONS,
+    materialize_selected_kv_sparsecore_pipeline_unchecked,
     materialize_selected_kv_sparsecore_unchecked,
     materialize_selected_kv_xla,
     prepare_safe_topk_slots,
@@ -22,7 +23,9 @@ from sgl_jax.srt.kernels.mla.dsa.gather import (
 
 _ALIGNMENT = 128
 _DEFAULT_GATHER_BLOCK = 128
-GatherImplementation = Literal["auto", "sparsecore", "xla"]
+GatherImplementation = Literal[
+    "auto", "sparsecore", "sparsecore-pipeline", "xla"
+]
 
 
 def _align_to_128(dim: int) -> int:
@@ -110,12 +113,15 @@ def _validate_inputs(
 
 def _resolve_gather_impl(
     gather_impl: GatherImplementation, *, interpret: bool
-) -> Literal["sparsecore", "xla"]:
-    if gather_impl not in ("auto", "sparsecore", "xla"):
-        raise ValueError("gather_impl must be 'auto', 'sparsecore', or 'xla'")
+) -> Literal["sparsecore", "sparsecore-pipeline", "xla"]:
+    if gather_impl not in ("auto", "sparsecore", "sparsecore-pipeline", "xla"):
+        raise ValueError(
+            "gather_impl must be 'auto', 'sparsecore', "
+            "'sparsecore-pipeline', or 'xla'"
+        )
     if gather_impl == "auto":
         return "xla" if interpret else "sparsecore"
-    if gather_impl == "sparsecore" and interpret:
+    if gather_impl in ("sparsecore", "sparsecore-pipeline") and interpret:
         raise ValueError("SparseCore gather does not support Pallas interpret mode")
     return gather_impl
 
@@ -134,17 +140,24 @@ def dsa_decode_mla_attention_unchecked(
 ) -> jax.Array:
     """Compose selected-KV materialization and attention without host checks."""
     resolved_gather = _resolve_gather_impl(gather_impl, interpret=interpret)
-    if resolved_gather == "sparsecore":
+    if resolved_gather in ("sparsecore", "sparsecore-pipeline"):
         safe_slots = prepare_safe_topk_slots(
             topk_slots,
             valid_counts,
             gather_block=gather_block,
         )
-        selected_kv = materialize_selected_kv_sparsecore_unchecked(
-            cache_kv,
-            safe_slots,
-            gather_block=gather_block,
-        )
+        if resolved_gather == "sparsecore-pipeline":
+            selected_kv = materialize_selected_kv_sparsecore_pipeline_unchecked(
+                cache_kv,
+                safe_slots,
+                gather_block=gather_block,
+            )
+        else:
+            selected_kv = materialize_selected_kv_sparsecore_unchecked(
+                cache_kv,
+                safe_slots,
+                gather_block=gather_block,
+            )
     else:
         selected_kv = materialize_selected_kv_xla(
             cache_kv,
@@ -175,6 +188,18 @@ def _sparsecore_composed_launcher(sm_scale: float, gather_block: int):
     return jax.jit(launch, compiler_options=SPARSECORE_COMPILER_OPTIONS)
 
 
+@functools.cache
+def _sparsecore_pipeline_composed_launcher(sm_scale: float, gather_block: int):
+    launch = functools.partial(
+        dsa_decode_mla_attention_unchecked,
+        sm_scale=sm_scale,
+        interpret=False,
+        gather_impl="sparsecore-pipeline",
+        gather_block=gather_block,
+    )
+    return jax.jit(launch)
+
+
 def dsa_decode_mla_attention(
     ql_nope: jax.Array,
     q_pe: jax.Array,
@@ -199,8 +224,19 @@ def dsa_decode_mla_attention(
             valid_counts,
             sm_scale,
         )
-    if _resolve_gather_impl(gather_impl, interpret=interpret) == "sparsecore":
+    resolved_gather = _resolve_gather_impl(gather_impl, interpret=interpret)
+    if resolved_gather == "sparsecore":
         return _sparsecore_composed_launcher(float(sm_scale), gather_block)(
+            ql_nope,
+            q_pe,
+            cache_kv,
+            topk_slots,
+            valid_counts,
+        )
+    if resolved_gather == "sparsecore-pipeline":
+        return _sparsecore_pipeline_composed_launcher(
+            float(sm_scale), gather_block
+        )(
             ql_nope,
             q_pe,
             cache_kv,

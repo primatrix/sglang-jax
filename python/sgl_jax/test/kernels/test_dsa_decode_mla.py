@@ -8,7 +8,9 @@ import numpy as np
 
 from sgl_jax.srt.kernels.mla.dsa.attention import selected_mla_attention
 from sgl_jax.srt.kernels.mla.dsa.gather import (
+    _plan_sparsecore_pipeline,
     materialize_selected_kv_sparsecore,
+    materialize_selected_kv_sparsecore_pipeline,
     materialize_selected_kv_xla,
     prepare_safe_topk_slots,
 )
@@ -21,6 +23,28 @@ from sgl_jax.srt.kernels.mla.dsa.reference import (
 
 
 class TestDSASelectedKVGather(unittest.TestCase):
+    def test_sparsecore_pipeline_plan_uses_each_worker_once(self):
+        self.assertEqual(
+            _plan_sparsecore_pipeline(
+                batch_size=1,
+                padded_selected=2048,
+                gather_block=128,
+                available_cores=2,
+                num_subcores=16,
+            ),
+            (1, 16, 1),
+        )
+        self.assertEqual(
+            _plan_sparsecore_pipeline(
+                batch_size=32,
+                padded_selected=2048,
+                gather_block=128,
+                available_cores=2,
+                num_subcores=16,
+            ),
+            (2, 32, 16),
+        )
+
     def test_safe_slots_are_padded_and_invalid_entries_use_slot_zero(self):
         topk_slots = jnp.asarray([[5, 3, -1], [2, -1, -1]], dtype=jnp.int32)
         valid_counts = jnp.asarray([2, 1], dtype=jnp.int32)
@@ -96,6 +120,25 @@ class TestDSASelectedKVGather(unittest.TestCase):
     jax.default_backend() == "tpu", "SparseCore Pallas lowering requires a TPU"
 )
 class TestDSASparseCoreGather(unittest.TestCase):
+    def test_pipelined_sparsecore_gather_matches_xla(self):
+        rng = np.random.default_rng(9)
+        cache_kv = jnp.asarray(
+            rng.standard_normal((4, 64, 2, 640), dtype=np.float32),
+            dtype=jnp.bfloat16,
+        )
+        slots = (np.arange(2048, dtype=np.int32) * 127) % 512
+        topk_slots = jnp.asarray(slots[None, :], dtype=jnp.int32)
+        valid_counts = jnp.asarray([2048], dtype=jnp.int32)
+
+        expected = materialize_selected_kv_xla(
+            cache_kv, topk_slots, valid_counts, gather_block=128
+        )
+        actual = materialize_selected_kv_sparsecore_pipeline(
+            cache_kv, topk_slots, valid_counts, gather_block=128
+        )
+
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
     def test_sparsecore_gather_matches_xla_for_packed_bfloat16_cache(self):
         rng = np.random.default_rng(10)
         cache_kv = jnp.asarray(
