@@ -6,8 +6,10 @@ import jax.numpy as jnp
 import numpy as np
 
 from benchmark.kernels.mla.bench_dsa_decode_mla import (
+    BENCHMARK_VARIANTS,
     GLM_ATTENTION_SCALE,
     dense_full_context_mla_attention,
+    estimate_variant_kv_bytes,
     make_benchmark_inputs,
 )
 from sgl_jax.srt.kernels.mla.dsa.reference import reference_dsa_decode_mla_attention
@@ -58,6 +60,55 @@ class TestDSADecodeMLABenchmarkInputs(unittest.TestCase):
                 np.sort(unsorted.topk_slots[batch_index]),
                 sorted_inputs.topk_slots[batch_index],
             )
+
+    def test_clustered_fixture_touches_fewer_pages_than_uniform(self):
+        common_kwargs = dict(
+            batch_size=1,
+            context_length=4096,
+            top_k=128,
+            num_heads=2,
+            latent_dim=128,
+            rope_dim=64,
+            page_size=128,
+            slot_order="page-sorted",
+            seed=3,
+        )
+        uniform = make_benchmark_inputs(slot_distribution="uniform", **common_kwargs)
+        clustered = make_benchmark_inputs(
+            slot_distribution="clustered", **common_kwargs
+        )
+
+        uniform_pages = np.unique(uniform.topk_slots[0] // common_kwargs["page_size"])
+        clustered_pages = np.unique(
+            clustered.topk_slots[0] // common_kwargs["page_size"]
+        )
+        self.assertGreater(uniform_pages.size, clustered_pages.size)
+
+    def test_benchmark_variants_and_kv_byte_estimates_are_explicit(self):
+        self.assertEqual(
+            BENCHMARK_VARIANTS,
+            (
+                "sparsecore",
+                "xla-gather",
+                "gather-only",
+                "attention-only",
+                "dense-jax-baseline",
+            ),
+        )
+        estimates = estimate_variant_kv_bytes(
+            batch_size=2,
+            context_length=32,
+            top_k=8,
+            cache_width=256,
+            itemsize=2,
+        )
+        selected_bytes = 2 * 8 * 256 * 2
+        self.assertEqual(estimates["selected_tensor"], selected_bytes)
+        self.assertEqual(estimates["gather-only"], 2 * selected_bytes)
+        self.assertEqual(estimates["attention-only"], selected_bytes)
+        self.assertEqual(estimates["sparsecore"], 3 * selected_bytes)
+        self.assertEqual(estimates["xla-gather"], 3 * selected_bytes)
+        self.assertEqual(estimates["dense-jax-baseline"], 2 * 32 * 256 * 2)
 
     def test_fixture_rejects_invalid_top_k_and_alignment(self):
         common_kwargs = dict(

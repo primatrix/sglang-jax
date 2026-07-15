@@ -1,4 +1,4 @@
-"""TPU microbenchmark for the prototype sparse DSA decode MLA kernel.
+"""TPU microbenchmark for the staged sparse DSA decode MLA kernel.
 
 The dense variant intentionally scans every token in the same packed cache.
 It is a workload baseline rather than the production MLA-v2 kernel: the two
@@ -29,11 +29,23 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sgl_jax.srt.kernels.mla.dsa import dsa_decode_mla_attention_unchecked
+from sgl_jax.srt.kernels.mla.dsa import (
+    dsa_decode_mla_attention_unchecked,
+    materialize_selected_kv_sparsecore,
+    materialize_selected_kv_xla,
+    selected_mla_attention_unchecked,
+)
 
 
 _ALIGNMENT = 128
 GLM_ATTENTION_SCALE = 256**-0.5
+BENCHMARK_VARIANTS = (
+    "sparsecore",
+    "xla-gather",
+    "gather-only",
+    "attention-only",
+    "dense-jax-baseline",
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -51,6 +63,27 @@ def _align_to_128(dim: int) -> int:
     return ((dim + _ALIGNMENT - 1) // _ALIGNMENT) * _ALIGNMENT
 
 
+def estimate_variant_kv_bytes(
+    *,
+    batch_size: int,
+    context_length: int,
+    top_k: int,
+    cache_width: int,
+    itemsize: int,
+) -> dict[str, int]:
+    """Estimate major selected/full-cache payload bytes for each variant."""
+    selected_bytes = batch_size * top_k * cache_width * itemsize
+    dense_bytes = batch_size * context_length * cache_width * itemsize
+    return {
+        "selected_tensor": selected_bytes,
+        "sparsecore": 3 * selected_bytes,
+        "xla-gather": 3 * selected_bytes,
+        "gather-only": 2 * selected_bytes,
+        "attention-only": selected_bytes,
+        "dense-jax-baseline": dense_bytes,
+    }
+
+
 def make_benchmark_inputs(
     *,
     batch_size: int,
@@ -61,6 +94,7 @@ def make_benchmark_inputs(
     rope_dim: int,
     page_size: int,
     slot_order: str,
+    slot_distribution: str = "uniform",
     seed: int = 0,
 ) -> BenchmarkInputs:
     """Create deterministic packed-cache inputs with physical selected slots."""
@@ -82,6 +116,8 @@ def make_benchmark_inputs(
         raise ValueError("page_size must be even and divide 128 or be divisible by 128")
     if slot_order not in {"unsorted", "page-sorted"}:
         raise ValueError("slot_order must be 'unsorted' or 'page-sorted'")
+    if slot_distribution not in {"uniform", "clustered"}:
+        raise ValueError("slot_distribution must be 'uniform' or 'clustered'")
 
     padded_width = _align_to_128(latent_dim) + _align_to_128(rope_dim)
     num_pages = (context_length + page_size - 1) // page_size
@@ -92,9 +128,12 @@ def make_benchmark_inputs(
         (num_pages, page_size // 2, 2, padded_width), dtype=np.float32
     )
 
-    # Spread selections across the full context.  Each row has the same
-    # multiset; only the caller-visible selected-slot order differs.
-    base_slots = (np.arange(top_k, dtype=np.int32) * context_length) // top_k
+    # Each batch row has the same multiset; the distribution controls locality
+    # and slot_order controls only the caller-visible order.
+    if slot_distribution == "uniform":
+        base_slots = (np.arange(top_k, dtype=np.int32) * context_length) // top_k
+    else:
+        base_slots = np.arange(top_k, dtype=np.int32)
     topk_slots = np.empty((batch_size, top_k), dtype=np.int32)
     for batch_index in range(batch_size):
         if slot_order == "page-sorted":
@@ -160,6 +199,15 @@ def _time_compiled(
     }
 
 
+def _compile_variant(
+    compute: Callable[[], jax.Array],
+) -> tuple[Callable[[], jax.Array], float]:
+    start = time.perf_counter_ns()
+    compiled = jax.jit(compute).lower().compile()
+    compile_ms = (time.perf_counter_ns() - start) / 1_000_000.0
+    return compiled, compile_ms
+
+
 def _capture_profile(
     compute: Callable[[], jax.Array], *, profile_dir: str, iters: int, name: str) -> None:
     pathlib.Path(profile_dir).mkdir(parents=True, exist_ok=True)
@@ -185,12 +233,21 @@ def _parse_args() -> argparse.Namespace:
         help="Attention scale; defaults to GLM's unabsorbed 256-d QK scale.",
     )
     parser.add_argument("--slot-order", choices=("unsorted", "page-sorted"), default="unsorted")
-    parser.add_argument("--variant", choices=("sparse", "dense", "both"), default="both")
+    parser.add_argument(
+        "--slot-distribution",
+        choices=("uniform", "clustered"),
+        default="uniform",
+    )
+    parser.add_argument(
+        "--variant", choices=("all", *BENCHMARK_VARIANTS), default="all"
+    )
     parser.add_argument("--warmup-iters", type=int, default=50)
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-iters", type=int, default=3)
-    parser.add_argument("--profile-variant", choices=("sparse", "dense"), default="sparse")
+    parser.add_argument(
+        "--profile-variant", choices=BENCHMARK_VARIANTS, default="sparsecore"
+    )
     parser.add_argument("--profile-dir", default="/tmp/dsa-decode-mla-profile")
     parser.add_argument("--output", help="Optional path for the JSON summary.")
     parser.add_argument("--seed", type=int, default=0)
@@ -213,6 +270,7 @@ def main() -> None:
         rope_dim=args.rope_dim,
         page_size=args.page_size,
         slot_order=args.slot_order,
+        slot_distribution=args.slot_distribution,
         seed=args.seed,
     )
     ql_nope = jnp.asarray(host_inputs.ql_nope, dtype=jnp.bfloat16)
@@ -224,27 +282,60 @@ def main() -> None:
     if not np.isfinite(sm_scale):
         raise ValueError("sm-scale must be finite")
 
-    sparse = jax.jit(
-        lambda: dsa_decode_mla_attention_unchecked(
+    selected_kv = materialize_selected_kv_xla(
+        cache_kv, topk_slots, valid_counts, gather_block=128
+    )
+    jax.block_until_ready(selected_kv)
+
+    variants: dict[str, Callable[[], jax.Array]] = {
+        "sparsecore": lambda: dsa_decode_mla_attention_unchecked(
             ql_nope,
             q_pe,
             cache_kv,
             topk_slots,
             valid_counts,
             sm_scale=sm_scale,
-        )
-    )
-    dense = jax.jit(
-        lambda: dense_full_context_mla_attention(
+            gather_impl="sparsecore",
+        ),
+        "xla-gather": lambda: dsa_decode_mla_attention_unchecked(
+            ql_nope,
+            q_pe,
+            cache_kv,
+            topk_slots,
+            valid_counts,
+            sm_scale=sm_scale,
+            gather_impl="xla",
+        ),
+        "gather-only": lambda: materialize_selected_kv_sparsecore(
+            cache_kv,
+            topk_slots,
+            valid_counts,
+            gather_block=128,
+        ),
+        "attention-only": lambda: selected_mla_attention_unchecked(
+            ql_nope,
+            q_pe,
+            selected_kv,
+            valid_counts,
+            sm_scale=sm_scale,
+        ),
+        "dense-jax-baseline": lambda: dense_full_context_mla_attention(
             ql_nope,
             q_pe,
             cache_kv,
             context_length=args.context_length,
             sm_scale=sm_scale,
-        )
+        ),
+    }
+    chosen = BENCHMARK_VARIANTS if args.variant == "all" else (args.variant,)
+    cache_width = cache_kv.shape[-1]
+    kv_byte_estimates = estimate_variant_kv_bytes(
+        batch_size=args.batch_size,
+        context_length=args.context_length,
+        top_k=args.top_k,
+        cache_width=cache_width,
+        itemsize=2,
     )
-    variants: dict[str, Callable[[], jax.Array]] = {"sparse": sparse, "dense": dense}
-    chosen = ("sparse", "dense") if args.variant == "both" else (args.variant,)
 
     summary: dict[str, object] = {
         "backend": jax.default_backend(),
@@ -260,24 +351,33 @@ def main() -> None:
             "page_size": args.page_size,
             "sm_scale": sm_scale,
             "slot_order": args.slot_order,
+            "slot_distribution": args.slot_distribution,
             "dtype": "bfloat16",
         },
+        "estimated_kv_bytes": kv_byte_estimates,
         "warmup_iters": args.warmup_iters,
         "timed_iters": args.iters,
         "results": {},
     }
+    compiled_variants: dict[str, Callable[[], jax.Array]] = {}
     for variant in chosen:
+        compiled, compile_ms = _compile_variant(variants[variant])
+        compiled_variants[variant] = compiled
         metrics = _time_compiled(
-            variants[variant], warmup_iters=args.warmup_iters, iters=args.iters
+            compiled, warmup_iters=args.warmup_iters, iters=args.iters
         )
+        metrics["compile_ms"] = compile_ms
         summary["results"][variant] = metrics
-        print(f"{variant}: median={metrics['median_ms']:.4f} ms p99={metrics['p99_ms']:.4f} ms")
+        print(
+            f"{variant}: compile={compile_ms:.2f} ms "
+            f"median={metrics['median_ms']:.4f} ms p99={metrics['p99_ms']:.4f} ms"
+        )
 
     if args.profile:
         if args.profile_variant not in chosen:
             raise ValueError("profile-variant must be included in --variant")
         _capture_profile(
-            variants[args.profile_variant],
+            compiled_variants[args.profile_variant],
             profile_dir=args.profile_dir,
             iters=args.profile_iters,
             name=f"dsa_decode_mla_{args.profile_variant}",
