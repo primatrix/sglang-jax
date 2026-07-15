@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import functools
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -9,6 +11,9 @@ from jax.experimental.pallas import tpu as pltpu
 
 _DEFAULT_GATHER_BLOCK = 128
 _MIN_SC_VECTOR_WIDTH = 8
+SPARSECORE_COMPILER_OPTIONS = {
+    "xla_tpu_use_tc_device_shape_on_sc": "false"
+}
 
 
 def _validate_gather_block(gather_block: int) -> None:
@@ -118,12 +123,17 @@ def materialize_selected_kv_sparsecore_unchecked(
         ),
         name="dsa-selected-kv-sparsecore-gather",
     )
-    compiled_gather = jax.jit(
-        gather_call,
-        compiler_options={"xla_tpu_use_tc_device_shape_on_sc": "false"},
-    )
-    gathered = compiled_gather(logical_cache, flattened_slots)
+    gathered = gather_call(logical_cache, flattened_slots)
     return gathered.reshape((batch_size, padded_selected, cache_width))
+
+
+@functools.cache
+def _sparsecore_gather_launcher(gather_block: int):
+    launch = functools.partial(
+        materialize_selected_kv_sparsecore_unchecked,
+        gather_block=gather_block,
+    )
+    return jax.jit(launch, compiler_options=SPARSECORE_COMPILER_OPTIONS)
 
 
 def materialize_selected_kv_sparsecore(
@@ -137,9 +147,7 @@ def materialize_selected_kv_sparsecore(
     safe_slots = prepare_safe_topk_slots(
         topk_slots, valid_counts, gather_block=gather_block
     )
-    return materialize_selected_kv_sparsecore_unchecked(
-        cache_kv, safe_slots, gather_block=gather_block
-    )
+    return _sparsecore_gather_launcher(gather_block)(cache_kv, safe_slots)
 
 
 __all__ = [
@@ -147,4 +155,5 @@ __all__ = [
     "materialize_selected_kv_sparsecore_unchecked",
     "materialize_selected_kv_xla",
     "prepare_safe_topk_slots",
+    "SPARSECORE_COMPILER_OPTIONS",
 ]

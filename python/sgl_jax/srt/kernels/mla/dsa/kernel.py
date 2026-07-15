@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import math
 from typing import Literal
 
@@ -13,8 +14,10 @@ from sgl_jax.srt.kernels.mla.dsa.attention import (
     selected_mla_attention_unchecked,
 )
 from sgl_jax.srt.kernels.mla.dsa.gather import (
-    materialize_selected_kv_sparsecore,
+    SPARSECORE_COMPILER_OPTIONS,
+    materialize_selected_kv_sparsecore_unchecked,
     materialize_selected_kv_xla,
+    prepare_safe_topk_slots,
 )
 
 _ALIGNMENT = 128
@@ -132,10 +135,14 @@ def dsa_decode_mla_attention_unchecked(
     """Compose selected-KV materialization and attention without host checks."""
     resolved_gather = _resolve_gather_impl(gather_impl, interpret=interpret)
     if resolved_gather == "sparsecore":
-        selected_kv = materialize_selected_kv_sparsecore(
-            cache_kv,
+        safe_slots = prepare_safe_topk_slots(
             topk_slots,
             valid_counts,
+            gather_block=gather_block,
+        )
+        selected_kv = materialize_selected_kv_sparsecore_unchecked(
+            cache_kv,
+            safe_slots,
             gather_block=gather_block,
         )
     else:
@@ -154,6 +161,18 @@ def dsa_decode_mla_attention_unchecked(
         sm_scale=sm_scale,
         interpret=interpret,
     )
+
+
+@functools.cache
+def _sparsecore_composed_launcher(sm_scale: float, gather_block: int):
+    launch = functools.partial(
+        dsa_decode_mla_attention_unchecked,
+        sm_scale=sm_scale,
+        interpret=False,
+        gather_impl="sparsecore",
+        gather_block=gather_block,
+    )
+    return jax.jit(launch, compiler_options=SPARSECORE_COMPILER_OPTIONS)
 
 
 def dsa_decode_mla_attention(
@@ -179,6 +198,14 @@ def dsa_decode_mla_attention(
             topk_slots,
             valid_counts,
             sm_scale,
+        )
+    if _resolve_gather_impl(gather_impl, interpret=interpret) == "sparsecore":
+        return _sparsecore_composed_launcher(float(sm_scale), gather_block)(
+            ql_nope,
+            q_pe,
+            cache_kv,
+            topk_slots,
+            valid_counts,
         )
     return dsa_decode_mla_attention_unchecked(
         ql_nope,

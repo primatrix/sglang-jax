@@ -165,7 +165,8 @@ Give the output a VMEM block spec and let the Pallas block pipeline commit it
 to the global HBM result. This mirrors JAX 0.8.1's official SparseCore gather
 test and avoids a redundant explicit copy. Do not add data-dependent loops.
 
-Wrap the `pallas_call` in:
+The unchecked `pallas_call` remains raw so it can compose with TensorCore.
+Wrap the outermost eager/composed call in:
 
 ```python
 jax.jit(

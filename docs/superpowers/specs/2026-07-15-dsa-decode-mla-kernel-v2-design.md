@@ -150,10 +150,11 @@ global HBM result; the kernel does not issue a redundant explicit second copy.
 The stage uses
 `CompilerParams(kernel_type=KernelType.SC_VECTOR_SUBCORE)`. JAX's SparseCore
 tests require the compiler option
-`xla_tpu_use_tc_device_shape_on_sc=false`; the prototype will compile this
-stage through a small inner `jax.jit` that owns that option. Model integration
-must later confirm whether to keep the separately compiled call or merge the
-option into the model-runner JIT.
+`xla_tpu_use_tc_device_shape_on_sc=false`. JAX 0.8.1 rejects compiler options
+on a nested JIT, so the unchecked gather remains a raw Pallas call and the
+outermost composed JIT owns this option. Eager public wrappers create that
+top-level JIT themselves; later model-runner integration must merge the same
+option into its outer JIT.
 
 ### Stage B: TensorCore selected MLA attention
 

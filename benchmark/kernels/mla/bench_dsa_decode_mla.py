@@ -30,9 +30,11 @@ import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.kernels.mla.dsa import (
+    SPARSECORE_COMPILER_OPTIONS,
     dsa_decode_mla_attention_unchecked,
-    materialize_selected_kv_sparsecore,
+    materialize_selected_kv_sparsecore_unchecked,
     materialize_selected_kv_xla,
+    prepare_safe_topk_slots,
     selected_mla_attention_unchecked,
 )
 
@@ -201,9 +203,14 @@ def _time_compiled(
 
 def _compile_variant(
     compute: Callable[[], jax.Array],
+    *,
+    compiler_options: dict[str, str] | None = None,
 ) -> tuple[Callable[[], jax.Array], float]:
     start = time.perf_counter_ns()
-    compiled = jax.jit(compute).lower().compile()
+    compiled = jax.jit(
+        compute,
+        compiler_options=compiler_options,
+    ).lower().compile()
     compile_ms = (time.perf_counter_ns() - start) / 1_000_000.0
     return compiled, compile_ms
 
@@ -285,6 +292,9 @@ def main() -> None:
     selected_kv = materialize_selected_kv_xla(
         cache_kv, topk_slots, valid_counts, gather_block=128
     )
+    safe_topk_slots = prepare_safe_topk_slots(
+        topk_slots, valid_counts, gather_block=128
+    )
     jax.block_until_ready(selected_kv)
 
     variants: dict[str, Callable[[], jax.Array]] = {
@@ -306,10 +316,9 @@ def main() -> None:
             sm_scale=sm_scale,
             gather_impl="xla",
         ),
-        "gather-only": lambda: materialize_selected_kv_sparsecore(
+        "gather-only": lambda: materialize_selected_kv_sparsecore_unchecked(
             cache_kv,
-            topk_slots,
-            valid_counts,
+            safe_topk_slots,
             gather_block=128,
         ),
         "attention-only": lambda: selected_mla_attention_unchecked(
@@ -361,7 +370,14 @@ def main() -> None:
     }
     compiled_variants: dict[str, Callable[[], jax.Array]] = {}
     for variant in chosen:
-        compiled, compile_ms = _compile_variant(variants[variant])
+        compiler_options = (
+            SPARSECORE_COMPILER_OPTIONS
+            if variant in {"sparsecore", "gather-only"}
+            else None
+        )
+        compiled, compile_ms = _compile_variant(
+            variants[variant], compiler_options=compiler_options
+        )
         compiled_variants[variant] = compiled
         metrics = _time_compiled(
             compiled, warmup_iters=args.warmup_iters, iters=args.iters

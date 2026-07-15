@@ -5,6 +5,7 @@ from sgl_jax.srt.kernels.mla.dsa.attention import (
     selected_mla_attention_unchecked,
 )
 from sgl_jax.srt.kernels.mla.dsa.gather import (
+    SPARSECORE_COMPILER_OPTIONS,
     materialize_selected_kv_sparsecore,
     materialize_selected_kv_sparsecore_unchecked,
     materialize_selected_kv_xla,
@@ -33,4 +34,5 @@ __all__ = [
     "reference_selected_mla_attention",
     "selected_mla_attention",
     "selected_mla_attention_unchecked",
+    "SPARSECORE_COMPILER_OPTIONS",
 ]
