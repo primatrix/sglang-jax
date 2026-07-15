@@ -1,4 +1,4 @@
-name: dsa-sc-pipeline-gate-v7x8-20260715-r1
+name: dsa-sc-pipeline-gate-v7x8-20260715-r2
 exp_type: profiling
 cluster_name: tpuv7x-64-node
 artifact_type: GCS

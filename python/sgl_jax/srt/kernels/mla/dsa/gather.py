@@ -210,8 +210,10 @@ def materialize_selected_kv_sparsecore_pipeline_unchecked(
     out_shape = jax.ShapeDtypeStruct(
         (batch_size * padded_selected, cache_width), cache_kv.dtype
     )
-    core_axis_name = "dsa_sc_core"
-    subcore_axis_name = "dsa_sc_subcore"
+    # JAX 0.8.1's VectorSubcoreMesh exposes these literal axis names from its
+    # ``shape`` property even though the constructor also carries name fields.
+    core_axis_name = "core"
+    subcore_axis_name = "subcore"
     mesh = plsc.VectorSubcoreMesh(
         core_axis_name=core_axis_name,
         subcore_axis_name=subcore_axis_name,
