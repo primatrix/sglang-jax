@@ -134,11 +134,10 @@ def resolve_sparsecore_pipeline_gather_block(
 ) -> int:
     """Resolve auto to the established pipeline default without changing ints.
 
-    The static-shape and topology arguments remain part of this public planner
-    contract so callers can continue to use one resolver for automatic and
-    explicitly requested windows. Falcon did not establish a robust benefit
-    for the 64-row specialization, so automatic selection deliberately keeps
-    the proven 128-row window.
+    The static-shape and topology arguments are retained for compatibility
+    with the previous shape-aware policy, but deliberately have no effect.
+    Falcon did not establish a robust benefit for the 64-row specialization,
+    so automatic selection keeps the proven 128-row window.
     """
     if requested != "auto":
         _validate_gather_block(requested)
