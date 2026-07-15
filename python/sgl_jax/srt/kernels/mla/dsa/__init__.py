@@ -1,5 +1,9 @@
 """Sparse DSA decode MLA kernels and host-side reference helpers."""
 
+from sgl_jax.srt.kernels.mla.dsa.gather import (
+    materialize_selected_kv_xla,
+    prepare_safe_topk_slots,
+)
 from sgl_jax.srt.kernels.mla.dsa.kernel import (
     dsa_decode_mla_attention,
     dsa_decode_mla_attention_unchecked,
@@ -14,5 +18,7 @@ __all__ = [
     "dense_selected_mla_attention",
     "dsa_decode_mla_attention",
     "dsa_decode_mla_attention_unchecked",
+    "materialize_selected_kv_xla",
+    "prepare_safe_topk_slots",
     "reference_dsa_decode_mla_attention",
 ]

@@ -6,11 +6,87 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from sgl_jax.srt.kernels.mla.dsa.gather import (
+    materialize_selected_kv_xla,
+    prepare_safe_topk_slots,
+)
 from sgl_jax.srt.kernels.mla.dsa.kernel import dsa_decode_mla_attention
 from sgl_jax.srt.kernels.mla.dsa.reference import (
     dense_selected_mla_attention,
     reference_dsa_decode_mla_attention,
 )
+
+
+class TestDSASelectedKVGather(unittest.TestCase):
+    def test_safe_slots_are_padded_and_invalid_entries_use_slot_zero(self):
+        topk_slots = jnp.asarray([[5, 3, -1], [2, -1, -1]], dtype=jnp.int32)
+        valid_counts = jnp.asarray([2, 1], dtype=jnp.int32)
+
+        actual = prepare_safe_topk_slots(
+            topk_slots, valid_counts, gather_block=8
+        )
+
+        expected = np.array(
+            [[5, 3, 0, 0, 0, 0, 0, 0], [2, 0, 0, 0, 0, 0, 0, 0]],
+            dtype=np.int32,
+        )
+        np.testing.assert_array_equal(np.asarray(actual), expected)
+
+    def test_safe_slot_gather_block_is_validated(self):
+        topk_slots = jnp.asarray([[0]], dtype=jnp.int32)
+        valid_counts = jnp.asarray([1], dtype=jnp.int32)
+
+        for gather_block in (0, -8, 3):
+            with self.subTest(gather_block=gather_block), self.assertRaises(ValueError):
+                prepare_safe_topk_slots(
+                    topk_slots, valid_counts, gather_block=gather_block
+                )
+
+    def test_xla_materialization_matches_explicit_packed_cache_mapping(self):
+        page_size = 8
+        width = 256
+        cache_kv = np.empty((2, page_size // 2, 2, width), dtype=np.float32)
+        for physical_slot in range(2 * page_size):
+            page, offset = divmod(physical_slot, page_size)
+            packed_row, lane = divmod(offset, 2)
+            cache_kv[page, packed_row, lane] = physical_slot
+
+        topk_slots = jnp.asarray(
+            [[9, 0, 7, 9, -1], [15, 1, -1, -1, -1]], dtype=jnp.int32
+        )
+        valid_counts = jnp.asarray([4, 2], dtype=jnp.int32)
+
+        actual = materialize_selected_kv_xla(
+            jnp.asarray(cache_kv, dtype=jnp.bfloat16),
+            topk_slots,
+            valid_counts,
+            gather_block=8,
+        )
+
+        expected_slots = np.array(
+            [[9, 0, 7, 9, 0, 0, 0, 0], [15, 1, 0, 0, 0, 0, 0, 0]],
+            dtype=np.int32,
+        )
+        expected = np.broadcast_to(expected_slots[..., None], (2, 8, width))
+        self.assertEqual(actual.dtype, jnp.bfloat16)
+        np.testing.assert_array_equal(np.asarray(actual), expected)
+
+    def test_xla_materialization_is_jittable(self):
+        cache_kv = jnp.arange(2 * 4 * 2 * 128, dtype=jnp.bfloat16).reshape(
+            2, 4, 2, 128
+        )
+        topk_slots = jnp.asarray([[15, 0, -1]], dtype=jnp.int32)
+        valid_counts = jnp.asarray([2], dtype=jnp.int32)
+
+        materialize = jax.jit(
+            lambda cache, slots, counts: materialize_selected_kv_xla(
+                cache, slots, counts, gather_block=8
+            )
+        )
+        actual = materialize(cache_kv, topk_slots, valid_counts)
+
+        expected = cache_kv.reshape(-1, 128)[jnp.asarray([15, 0, 0, 0, 0, 0, 0, 0])]
+        np.testing.assert_array_equal(np.asarray(actual[0]), np.asarray(expected))
 
 
 class TestDSADecodeMLAReference(unittest.TestCase):
