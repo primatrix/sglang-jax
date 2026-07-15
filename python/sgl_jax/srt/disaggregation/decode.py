@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -27,6 +28,84 @@ if TYPE_CHECKING:
     from sgl_jax.srt.managers.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
+
+
+def _batch_req_count(batch) -> int:
+    if batch is None:
+        return 0
+    reqs_info = getattr(batch, "reqs_info", None)
+    if reqs_info is None:
+        return len(getattr(batch, "reqs", ()) or ())
+    return sum(len(info.reqs) if info.reqs else 0 for info in reqs_info)
+
+
+def _req_dp_rank(req) -> int:
+    return int(getattr(req, "dp_rank", 0) or 0)
+
+
+def _raiden_endpoint_for_dp(
+    *,
+    p_host: str,
+    p_endpoints: list[dict] | None,
+    local_eps: list[dict] | None,
+    fallback_base_port: int,
+    dp_rank: int,
+    dp_size: int,
+) -> object:
+    """Build a raiden remote endpoint, narrowing endpoint shards for DP."""
+
+    def _split_host_port(endpoint: object | None, default_port: int) -> tuple[str, int]:
+        if endpoint is not None:
+            try:
+                host, port_s = str(endpoint).rsplit(":", 1)
+                if host:
+                    return host, int(port_s)
+            except Exception:  # noqa: BLE001
+                pass
+        return p_host, int(default_port)
+
+    def _host_port(endpoint: object | None, default_port: int) -> str:
+        host, port = _split_host_port(endpoint, default_port)
+        return f"{host}:{port}"
+
+    def _first_endpoint() -> object | None:
+        if not p_endpoints:
+            return None
+        try:
+            return p_endpoints[0].get("endpoint")
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _filter_dp_shards(ep: dict) -> dict | None:
+        shards = list(ep.get("shards") or [])
+        if dp_size <= 1 or not shards:
+            return {"endpoint": _host_port(ep.get("endpoint"), fallback_base_port), "shards": shards}
+        if len(shards) % dp_size != 0:
+            return {"endpoint": _host_port(ep.get("endpoint"), fallback_base_port), "shards": shards}
+        per_dp = len(shards) // dp_size
+        start = int(dp_rank or 0) * per_dp
+        selected = shards[start : start + per_dp]
+        if not selected:
+            return None
+        return {"endpoint": _host_port(ep.get("endpoint"), fallback_base_port), "shards": selected}
+
+    if p_endpoints and dp_size > 1:
+        filtered = [_filter_dp_shards(dict(ep)) for ep in p_endpoints]
+        filtered = [ep for ep in filtered if ep is not None]
+        if filtered:
+            return filtered
+
+    local_eps = local_eps or []
+    if len(local_eps) <= 1:
+        return _host_port(_first_endpoint(), fallback_base_port)
+    base_host, base_port = _split_host_port(_first_endpoint(), fallback_base_port)
+    return [
+        {
+            "endpoint": f"{base_host}:{base_port + i}",
+            "shards": list(ep.get("shards") or []),
+        }
+        for i, ep in enumerate(local_eps)
+    ]
 
 
 @dataclass
@@ -181,6 +260,82 @@ class SchedulerDisaggregationDecodeMixin:
 
             self.last_batch = batch
 
+    def event_loop_overlap_disagg_decode(self: Scheduler) -> None:
+        """Decode event loop with host/device overlap."""
+
+        from sgl_jax.srt.managers.schedule_batch import ForwardMode, ScheduleBatch
+
+        wd = self.disagg_decode_watchdog
+        wd.start()
+        self.result_queue = deque()
+
+        while True:
+            wd.beat("recv_requests")
+            recv_reqs = (
+                self._comm_backend.recv_requests()
+                if self._comm_backend is not None
+                else self.recv_requests()
+            )
+            recv_reqs = self.select_dp_for_request(recv_reqs)
+            wd.beat("process_input_requests")
+            self.process_input_requests_disagg_decode(recv_reqs)
+
+            if self._engine_paused:
+                continue
+
+            wd.beat("process_decode_queue")
+            self.process_decode_queue()
+
+            wd.beat("get_next_batch")
+            batch = self.get_next_batch_to_run()
+            self.cur_batch = batch
+
+            if batch:
+                batch.launch_done = threading.Event()
+                wd.beat("run_batch")
+                result = self.run_batch(batch)
+                self.result_queue.append((batch.copy(), result))
+
+                if self.last_batch is None:
+                    tmp_batch = ScheduleBatch.init_new(
+                        reqs=[[] for _ in range(self.dp_size)],
+                        req_to_token_pool=self.req_to_token_pool,
+                        token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                        tree_cache=self.tree_cache,
+                        model_config=self.model_config,
+                        enable_overlap=self.enable_overlap,
+                        dp_size=self.dp_size,
+                        spec_algorithm=self.spec_algorithm,
+                        mesh=self.mesh,
+                    )
+                    tmp_batch.forward_mode = ForwardMode.DUMMY_FIRST
+                    tmp_batch.next_batch_sampling_info = (
+                        self._current_sampling_info_owner().cur_sampling_info
+                    )
+                    self.process_batch_result(tmp_batch, None, batch.launch_done)
+
+                wd.beat("process_decode_queue_after_launch")
+                self.process_decode_queue()
+            else:
+                wd.beat("idle")
+                self.new_token_ratio = self.init_new_token_ratio
+                if self._comm_backend is not None:
+                    self._comm_backend.wait_for_new_requests(0.001)
+
+            if self.last_batch:
+                wd.beat("process_batch_result")
+                tmp_batch, tmp_result = self.result_queue.popleft()
+                tmp_batch.next_batch_sampling_info = (
+                    self._current_sampling_info_owner().cur_sampling_info if batch else None
+                )
+                self.process_batch_result(
+                    tmp_batch,
+                    tmp_result,
+                    batch.launch_done if batch else None,
+                )
+
+            self.last_batch = batch
+
     def _decode_backlog_snapshot(self: Scheduler) -> str:
         """One-line backlog snapshot for the watchdog stall report.
 
@@ -198,7 +353,7 @@ class SchedulerDisaggregationDecodeMixin:
             kv_avail = self.token_to_kv_pool_allocator.available_size()
         except Exception:
             kv_avail = -1
-        running = len(self.running_batch.reqs) if self.running_batch is not None else 0
+        running = _batch_req_count(self.running_batch)
         return (
             f"prealloc_q={prealloc} transfer_q={transfer} "
             f"inflight_send={ns} inflight_recv={nr} "
@@ -232,17 +387,31 @@ class SchedulerDisaggregationDecodeMixin:
             try:
                 from sgl_jax.srt.disaggregation.common.metrics import time_phase
 
+                prefill_dp_rank = getattr(
+                    req,
+                    "disagg_prefill_dp_rank",
+                    getattr(req, "dp_rank", 0),
+                )
                 self._pd_mark_time(req, "bootstrap_start")
                 with time_phase("bootstrap", "decode"):
                     if jax.process_count() > 1:
                         # Multi-host caches the matched peer after the first
                         # lookup, so this does no per-request network I/O.
-                        p_info = self._pick_prefill_peer_for_this_host()
+                        p_info = self._pick_prefill_peer_for_this_host(
+                            dp_rank=prefill_dp_rank
+                        )
                     else:
                         # Local cache resolution (sglang-style): a warm cache
                         # does zero network I/O, so this no longer blocks the
                         # event loop.
-                        p_info = self.disagg_prefill_info_cache.pick_for_room(req.bootstrap_room)
+                        try:
+                            p_info = self.disagg_prefill_info_cache.pick_for_room(
+                                req.bootstrap_room, dp_rank=prefill_dp_rank
+                            )
+                        except TypeError:
+                            p_info = self.disagg_prefill_info_cache.pick_for_room(
+                                req.bootstrap_room
+                            )
                 self._pd_mark_time(req, "bootstrap_done")
             except Exception:
                 logger.exception(
@@ -265,13 +434,16 @@ class SchedulerDisaggregationDecodeMixin:
                 from sgl_jax.srt.disaggregation.bootstrap import (
                     check_prefill_compat,
                     resolve_kv_dtype_name,
+                    resolve_kv_pool_dtype,
                 )
 
                 local_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
                 check_prefill_compat(
                     p_info,
                     local_page_size=self.server_args.page_size,
-                    local_kv_dtype=resolve_kv_dtype_name(local_kv_pool.dtype),
+                    local_kv_dtype=resolve_kv_dtype_name(
+                        resolve_kv_pool_dtype(local_kv_pool)
+                    ),
                 )
             except ValueError as exc:
                 logger.error(
@@ -326,12 +498,40 @@ class SchedulerDisaggregationDecodeMixin:
                     state = KVPoll.FAILED
             if state == KVPoll.SUCCESS:
                 try:
+                    if self.disagg_kv_manager.use_raiden:
+                        # raiden landed the KV directly into D's device pool
+                        # blocks and the decode bookkeeping was set at admission,
+                        # so skip the path-A pull-result scatter (_write_kv_to_pool).
+                        # NEEDS-TPU-VERIFICATION: confirm the blocks are correct
+                        # and no write-back is required.
+                        self._pd_mark_time(entry.req, "done_recving")
+                        self._pd_mark_time(entry.req, "transfer_done")
+                        self._enqueue_for_decode(entry.req)
+                        self._pd_mark_time(entry.req, "enqueue_decode")
+                        self._pd_mark_time(entry.req, "first_token")
+                        from sgl_jax.srt.disaggregation.req_time_stats import (
+                            maybe_log_time_stats,
+                        )
+
+                        maybe_log_time_stats(
+                            entry.req.pd_time_stats,
+                            req_id=entry.req_id,
+                            enabled=getattr(
+                                self.server_args,
+                                "enable_request_time_stats_logging",
+                                False,
+                            ),
+                        )
+                        continue
                     kv_result = entry.receiver.result
                     kv = kv_result["kv"] if kv_result else None
+                    self._pd_mark_time(entry.req, "done_recving")
+                    self._pd_mark_time(entry.req, "transfer_done")
                     self._maybe_log_decode_pull_debug(entry.req, kv)
                     self._write_kv_to_pool(entry.req, entry.kv_indices, kv)
                     self._record_decode_transfer_bytes(kv)
                     self._enqueue_for_decode(entry.req)
+                    self._pd_mark_time(entry.req, "enqueue_decode")
                     self._pd_mark_time(entry.req, "first_token")
                     from sgl_jax.srt.disaggregation.req_time_stats import (
                         maybe_log_time_stats,
@@ -353,7 +553,9 @@ class SchedulerDisaggregationDecodeMixin:
                         entry.req_id,
                     )
                     if entry.kv_indices is not None:
-                        self._release_decode_kv_indices(entry.kv_indices)
+                        self._release_decode_kv_indices(
+                            entry.kv_indices, dp_rank=_req_dp_rank(entry.req)
+                        )
                     self._abort_decode_request(entry.req, "kv_writeback")
             else:
                 logger.warning(
@@ -364,31 +566,45 @@ class SchedulerDisaggregationDecodeMixin:
                 )
                 self._record_decode_transfer_failure("receiver_terminal_failed")
                 if entry.kv_indices is not None:
-                    self._release_decode_kv_indices(entry.kv_indices)
+                    self._release_decode_kv_indices(
+                        entry.kv_indices, dp_rank=_req_dp_rank(entry.req)
+                    )
                 self._abort_decode_request(entry.req, "receiver_terminal_failed")
 
-    def _pick_prefill_peer_for_this_host(self: Scheduler) -> dict[str, object]:
+    def _pick_prefill_peer_for_this_host(
+        self: Scheduler, dp_rank: int | None = None
+    ) -> dict[str, object]:
         """Multi-host: find the P host whose jax_process_index matches ours.
         That host's local KV shard is exactly the slice this D host needs.
         Requires P/D to have the same nproc (same-TP constraint).
         """
-        if getattr(self, "_disagg_prefill_peer", None) is not None:
+        cache = getattr(self, "_disagg_prefill_peers", {})
+        if dp_rank is not None and dp_rank in cache:
+            return cache[dp_rank]
+        if dp_rank is None and getattr(self, "_disagg_prefill_peer", None) is not None:
             return self._disagg_prefill_peer
         my_pidx = jax.process_index()
         my_nproc = jax.process_count()
         all_p = self.disagg_bootstrap_client.list_prefills()
         for p in all_p:
             if int(p.get("jax_process_index", -1)) == my_pidx:
+                if dp_rank is not None and int(p.get("system_dp_rank", 0)) != dp_rank:
+                    continue
                 if int(p.get("jax_process_count", 0)) != my_nproc:
                     raise RuntimeError(
                         f"P/D process_count mismatch: P={p.get('jax_process_count')} "
                         f"D={my_nproc}. Per-host shard transfer requires same nproc."
                     )
-                self._disagg_prefill_peer = p
+                if dp_rank is not None:
+                    cache[dp_rank] = p
+                    self._disagg_prefill_peers = cache
+                else:
+                    self._disagg_prefill_peer = p
                 return p
         raise RuntimeError(
-            f"no prefill host with jax_process_index={my_pidx} registered "
-            f"(got {[(p.get('host'), p.get('jax_process_index')) for p in all_p]})"
+            f"no prefill host with jax_process_index={my_pidx} "
+            f"{'and dp_rank=' + str(dp_rank) if dp_rank is not None else ''} registered "
+            f"(got {[(p.get('host'), p.get('jax_process_index'), p.get('system_dp_rank')) for p in all_p]})"
         )
 
     def _drain_transfer_queue_synced(self: Scheduler) -> list[DecodeBookkeeping]:
@@ -446,11 +662,12 @@ class SchedulerDisaggregationDecodeMixin:
         page_size = allocator.page_size
         reserved_per = self.server_args.disaggregation_num_reserved_decode_tokens
         max_inflight = self.server_args.disaggregation_max_inflight_transfers
-        n_running = len(self.running_batch.reqs) if self.running_batch is not None else 0
+        n_running = _batch_req_count(self.running_batch)
         n_transfer = len(self.disagg_transfer_queue)
         admitted = 0
 
         for entry in self.disagg_prealloc_queue.items_fifo():
+            dp_rank = _req_dp_rank(entry.req)
             # In-flight transfer cap: each admitted transfer holds a pulled KV
             # destination buffer on decode HBM (untracked by the paged-pool
             # budget below) until it is scattered. Stop admitting once the cap
@@ -462,17 +679,34 @@ class SchedulerDisaggregationDecodeMixin:
             seqlen = len(entry.req.origin_input_ids)
             page_aligned = ((seqlen + page_size - 1) // page_size) * page_size
             reserved = reserved_per * (n_running + n_transfer + admitted)
-            if page_aligned + reserved > allocator.available_size():
+            if page_aligned + reserved > allocator.available_size(dp_rank=dp_rank):
                 # Insufficient capacity: defer this and all later (FIFO) reqs.
                 break
 
-            kv_indices = allocator.alloc(page_aligned)
+            kv_indices = allocator.alloc(page_aligned, dp_rank=dp_rank)
             if kv_indices is None:
                 # Budget check should prevent this; treat a surprise shortfall
                 # as transient and retry next tick rather than abort.
                 break
 
+            if getattr(self.disagg_kv_manager, "use_raiden", False):
+                admitted_raiden = self._admit_one_raiden(entry, kv_indices, page_size)
+                if admitted_raiden is None:
+                    # P hasn't published this req's block metadata yet (bootstrap
+                    # 404). Free the slot we just allocated and leave the entry in
+                    # the prealloc queue to retry next tick (deferral, not abort).
+                    self._release_decode_kv_indices(kv_indices, dp_rank=dp_rank)
+                    continue
+                if admitted_raiden is False:
+                    # Setup failed and the request was already aborted inside the
+                    # helper; move on.
+                    continue
+                admitted += 1
+                continue
+
             try:
+                self._pd_mark_time(entry.req, "metadata_ready")
+                self._pd_mark_time(entry.req, "kv_alloc_done")
                 receiver = self.disagg_kv_manager.create_receiver(entry.req.rid)
                 spec = self._build_kv_spec_for_req(entry.req)
                 p_info = entry.p_info
@@ -483,15 +717,17 @@ class SchedulerDisaggregationDecodeMixin:
                         specs={"kv": spec},
                         p_side_channel_host=str(p_info["host"]),
                         p_side_channel_port=int(p_info["side_channel_port"]),
+                        time_stats=entry.req.pd_time_stats,
                     )
                 )
+                self._pd_mark_time(entry.req, "receiver_init_done")
             except Exception:
                 logger.exception(
                     "failed to set up KVReceiver for req_id=%s",
                     entry.req.rid,
                 )
                 self._record_decode_transfer_failure("receiver_init")
-                self._release_decode_kv_indices(kv_indices)
+                self._release_decode_kv_indices(kv_indices, dp_rank=dp_rank)
                 self.disagg_prealloc_queue.remove(entry.req_id)
                 self._abort_decode_request(entry.req, "receiver_init")
                 continue
@@ -504,11 +740,209 @@ class SchedulerDisaggregationDecodeMixin:
             self.disagg_transfer_queue.add(entry)
             admitted += 1
 
+    def _admit_one_raiden(self: Scheduler, entry, kv_indices, page_size: int):
+        """raiden admission for a single prealloc entry.
+
+        Returns:
+          * ``True``  -- admitted to the transfer queue.
+          * ``None``  -- P's per-request block metadata not yet published
+            (bootstrap 404); caller should defer (free kv_indices, retry).
+          * ``False`` -- setup failed and the request was aborted here.
+        """
+
+        import numpy as np
+
+        req = entry.req
+        try:
+            info = self.disagg_bootstrap_client.get_transfer_info(req.bootstrap_room)
+        except Exception:
+            logger.exception(
+                "raiden get_transfer_info raised for room=%s",
+                req.bootstrap_room,
+            )
+            return None
+        if info is None:
+            # Not published yet -> defer.
+            return None
+
+        try:
+            import json as _json
+
+            # Chunked transfer: P publishes one entry per chunk. Admit as soon as
+            # chunk 0 exists; the receiver discovers + starts the rest as P
+            # produces them (transfer/compute overlap). The endpoint descriptor
+            # is chunk-independent, so read it from the first available chunk.
+            chunks = info.get("chunks", {}) or {}
+            if not chunks:
+                return None
+            self._pd_mark_time(req, "metadata_ready")
+            first_info = chunks[min(chunks)]
+            endpoints_json = first_info.get("raiden_endpoints_json", "") or ""
+            p_info = entry.p_info
+            p_host = p_info["host"]
+            # Producer's advertised base control port: prefer the port carried in
+            # its endpoint descriptors, else the explicit control port field.
+            p_endpoints = _json.loads(endpoints_json) if endpoints_json else None
+            if p_endpoints:
+                base_port = int(str(p_endpoints[0]["endpoint"]).rsplit(":", 1)[1])
+            else:
+                base_port = int(first_info.get("local_control_port", 0))
+
+            # Shape remote_endpoint by the CONSUMER's local sub-manager count,
+            # mirroring tpu-inference's _remote_endpoint. A single sub-manager
+            # (TP=1 / single-chip) must get a plain "host:port" string; passing a
+            # list-of-dict here hits start_read's broadcast overload and raiden
+            # returns failed_recving immediately. Only >1 sub-managers use the
+            # shard-matched list form (base_port + i per local endpoint).
+            local_eps = self.disagg_kv_manager.raiden_wrapper.endpoints or []
+            remote_endpoint = _raiden_endpoint_for_dp(
+                p_host=str(p_host),
+                p_endpoints=p_endpoints,
+                local_eps=local_eps,
+                fallback_base_port=base_port,
+                dp_rank=int(getattr(req, "dp_rank", 0) or 0),
+                dp_size=int(getattr(self, "dp_size", 1) or 1),
+            )
+
+            # Whole-prompt local device page ids (sequence order). The receiver
+            # slices these per chunk via each chunk's chunk_page_offset, so the
+            # local blocks line up one-to-one with P's per-chunk remote blocks.
+            kv_indices_np = (
+                np.asarray(kv_indices)
+                if not isinstance(kv_indices, np.ndarray)
+                else kv_indices
+            )
+            allocator = self.token_to_kv_pool_allocator
+            local_page_ids = [int(p) for p in (kv_indices_np[::page_size] // page_size)]
+            local_pages = tuple(local_page_ids)
+            self._pd_mark_time(req, "kv_alloc_done")
+
+            # SWA hybrid-attention: build SWA-pool local pages (tail only) and
+            # remote endpoint from the SWA engine's endpoint descriptors.
+            swa_local_pages: tuple[int, ...] | None = None
+            swa_local_page_by_full_page: dict[int, int] | None = None
+            swa_remote_endpoint: object | None = None
+            swa_mapping = getattr(allocator, "full_to_swa_index_mapping", None)
+            if swa_mapping is not None and hasattr(self, "sliding_window_size"):
+                seqlen = len(req.origin_input_ids)
+                sliding = self.sliding_window_size or 0
+                if isinstance(swa_mapping, list):
+                    swa_mapping = swa_mapping[int(getattr(req, "dp_rank", 0) or 0)]
+                window_start = max(0, seqlen - sliding)
+                first_tail_page = window_start // page_size
+                last_tail_page = (seqlen + page_size - 1) // page_size
+                page_map: dict[int, int] = {}
+                for full_page in range(first_tail_page, last_tail_page):
+                    token_pos = full_page * page_size
+                    if token_pos >= len(kv_indices_np):
+                        break
+                    swa_token_idx = int(swa_mapping[int(kv_indices_np[token_pos])])
+                    if swa_token_idx >= page_size:
+                        page_map[full_page] = swa_token_idx // page_size
+                if page_map:
+                    swa_local_page_by_full_page = page_map
+                    swa_local_pages = tuple(page_map[p] for p in sorted(page_map))
+
+                # SWA remote endpoint from P's SWA engine descriptors.
+                swa_eps_json = first_info.get("swa_raiden_endpoints_json", "") or ""
+                if swa_eps_json:
+                    swa_p_endpoints = _json.loads(swa_eps_json)
+                    swa_base_port = int(
+                        str(swa_p_endpoints[0]["endpoint"]).rsplit(":", 1)[1]
+                    )
+                    swa_local_eps = (
+                        self.disagg_kv_manager.raiden_wrapper.endpoints_swa or []
+                    )
+                    swa_remote_endpoint = _raiden_endpoint_for_dp(
+                        p_host=str(p_host),
+                        p_endpoints=swa_p_endpoints,
+                        local_eps=swa_local_eps,
+                        fallback_base_port=swa_base_port,
+                        dp_rank=int(getattr(req, "dp_rank", 0) or 0),
+                        dp_size=int(getattr(self, "dp_size", 1) or 1),
+                    )
+
+            receiver = self.disagg_kv_manager.create_receiver(req.rid)
+            receiver.init(
+                PMetadata(
+                    remote_addr=(f"{p_info['host']}:{p_info['transfer_port']}"),
+                    uuid=req.disagg_transfer_id or req.rid,
+                    specs={},
+                    p_side_channel_host=str(p_info["host"]),
+                    p_side_channel_port=int(p_info["side_channel_port"]),
+                    remote_endpoint=remote_endpoint,
+                    bootstrap_room=req.bootstrap_room,
+                    local_pages=local_pages,
+                    swa_remote_endpoint=swa_remote_endpoint,
+                    swa_local_pages=swa_local_pages,
+                    swa_local_page_by_full_page=swa_local_page_by_full_page,
+                    time_stats=req.pd_time_stats,
+                )
+            )
+            self._pd_mark_time(req, "receiver_init_done")
+        except Exception:
+            logger.exception(
+                "failed to set up raiden KVReceiver for req_id=%s",
+                req.rid,
+            )
+            self._record_decode_transfer_failure("receiver_init")
+            self._release_decode_kv_indices(kv_indices, dp_rank=_req_dp_rank(req))
+            self.disagg_prealloc_queue.remove(entry.req_id)
+            self._abort_decode_request(req, "receiver_init")
+            return False
+
+        entry.kv_indices = kv_indices
+        entry.receiver = receiver
+        entry.started = True
+        # raiden lands the KV straight into D's device pool blocks, so the
+        # post-transfer Pallas write-back is skipped (see process_decode_queue).
+        # Set the decode bookkeeping (prefix_indices / fill_ids) now so the req
+        # is ready to enqueue on SUCCESS.
+        self._raiden_set_decode_bookkeeping(req, kv_indices)
+        self._pd_mark_time(req, "transfer_entry")
+        self.disagg_prealloc_queue.remove(entry.req_id)
+        self.disagg_transfer_queue.add(entry)
+        return True
+
+    def _raiden_set_decode_bookkeeping(self: Scheduler, req, kv_indices) -> None:
+        """Set prefix_indices / fill_ids for a raiden-transferred req.
+
+        raiden writes KV directly into the device pool, so unlike path-A there is
+        no ``_write_kv_to_pool`` scatter. This mirrors the bookkeeping tail of
+        ``_write_kv_to_pool`` without touching the pool tensors.
+        NEEDS-TPU-VERIFICATION: confirm raiden's landed layout matches the
+        allocator slot order so prefix_indices point at the correct pages.
+        """
+
+        import numpy as np
+
+        kv_indices_np = (
+            np.asarray(kv_indices)
+            if not isinstance(kv_indices, np.ndarray)
+            else kv_indices
+        )
+        seqlen = len(req.origin_input_ids)
+        valid_slots = kv_indices_np[:seqlen]
+        if len(valid_slots) > 0:
+            req.prefix_indices = valid_slots[:-1]
+        else:
+            req.prefix_indices = valid_slots
+        req.last_matched_prefix_len = len(req.prefix_indices)
+        # Reuse the transferred KV as prefix (extend_input_len=1) instead of
+        # re-prefilling the whole prompt on decode. Mirrors path-A's
+        # _write_kv_to_pool; without this the raiden path re-runs a full prefill
+        # (cached-token=0), wasting the transfer and leaking the prealloc pages.
+        req._pd_skip_prefix_match = True
+        req._pd_prealloc_kv_indices = kv_indices_np
+        req.fill_ids = list(req.origin_input_ids) + list(req.output_ids)
+
     # ------------------------------------------------------------------
     # Overridable / test-friendly hooks
     # ------------------------------------------------------------------
 
-    def _pd_mark_time(self: Scheduler, req: Req, name: str) -> None:
+    def _pd_mark_time(
+        self: Scheduler, req: Req, name: str, *, overwrite: bool = False
+    ) -> None:
         """Record a PD lifecycle mark on ``req`` (no-op unless enabled)."""
 
         if not getattr(self.server_args, "enable_request_time_stats_logging", False):
@@ -520,9 +954,9 @@ class SchedulerDisaggregationDecodeMixin:
             role = getattr(self.server_args, "disaggregation_mode", "decode")
             ts = TimeStats(role)
             req.pd_time_stats = ts
-        ts.mark(name)
+        ts.mark(name, overwrite=overwrite)
 
-    def _release_decode_kv_indices(self: Scheduler, kv_indices) -> None:
+    def _release_decode_kv_indices(self: Scheduler, kv_indices, dp_rank: int = 0) -> None:
         """Release KV indices back to the allocator."""
 
         if kv_indices is None:
@@ -530,7 +964,7 @@ class SchedulerDisaggregationDecodeMixin:
         allocator = self.token_to_kv_pool_allocator
         if allocator is not None:
             try:
-                allocator.free(kv_indices)
+                allocator.free(kv_indices, dp_rank=dp_rank)
             except Exception:
                 logger.exception("failed to free kv_indices=%r", kv_indices)
 

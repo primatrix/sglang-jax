@@ -1,7 +1,9 @@
 # Single-host PD eval/benchmark job on GKE.
 # DeepSeek-R1-Distill-Qwen-1.5B, TP=1 per role on pd-v6e-1 (single chip/host).
 # Pod 0 runs bootstrap + prefill; pod 1 runs decode + router + a driver that
-# runs GSM8K (correctness) then a bench_serving smoke (in4k/out1k conc64).
+# runs GSM8K (correctness) then a conc=1 serial TTFT sweep (out=1, inputs
+# 512/1024/2048/4096) aligned to pd_ttft_profiling_report.md, to A/B raiden
+# latency against the path-A baseline table in pd_ttft_results.md.
 # Rendered by deploy.sh, which injects <JOB_NAME>/<SSH_KEY_B64>/<GH_ORG>/<BRANCH>.
 ---
 apiVersion: v1
@@ -66,6 +68,12 @@ spec:
           value: "16"
         - name: GSM_MAXTOK
           value: "512"
+        - name: TTFT_INPUTS
+          value: "512 1024 2048 4096"
+        - name: SGLANG_JAX_USE_RAIDEN
+          value: "1"
+        - name: TF_CPP_MIN_LOG_LEVEL
+          value: "0"
         command:
         - bash
         - -c
@@ -81,7 +89,7 @@ spec:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan github.com >> ~/.ssh/known_hosts
 
-          apt-get update && apt-get install -y iproute2 tmux vim
+          apt-get update && apt-get install -y iproute2 tmux vim build-essential
 
           export UV_CACHE_DIR="/tmp/tpu_logs/uv_cache"
           export UV_PYTHON_INSTALL_DIR="/tmp/tpu_logs/python"
@@ -91,6 +99,59 @@ spec:
           uv pip install pip py-spy
           git clone git@github.com:<GH_ORG>/sglang-jax.git --branch "${BRANCH}"
           cd sglang-jax && uv pip install -e python[all] && uv pip install datasets
+
+          echo "=== Installing tpu-raiden (JAX data plane) ==="
+          RAIDEN_OK=0
+          # Cache built artifact (source tree + compiled .so) on the /models
+          # gcsfuse bucket so repeat runs skip the ~30min Bazel build. Keyed by
+          # the pinned jax version so a toolchain bump invalidates it.
+          RAIDEN_CACHE="/models/raiden/tpu-raiden-jax-0.10.2.tgz"
+          # Option A: /models cache hit (fast path, ~1-2min).
+          if [ -f "$RAIDEN_CACHE" ]; then
+            echo "raiden cache found at $RAIDEN_CACHE; extracting"
+            mkdir -p /tmp/tpu-raiden
+            if tar xzf "$RAIDEN_CACHE" -C /tmp && \
+               uv pip install -r /tmp/tpu-raiden/requirements.txt >/dev/null 2>&1; then
+              export PYTHONPATH="/tmp/tpu-raiden:${PYTHONPATH:-}"
+              python -c "import tpu_raiden.frameworks.jax._tpu_raiden_jax" 2>/dev/null && \
+                RAIDEN_OK=1 && echo "tpu-raiden loaded from /models cache"
+            fi
+            [ "$RAIDEN_OK" = "1" ] || echo "cache present but unusable; falling back to build"
+          fi
+          # Option B: prebuilt GAR wheel (only if this pod's SA can read the AR).
+          if [ "$RAIDEN_OK" != "1" ]; then
+            if pip install keyrings.google-artifactregistry-auth >/dev/null 2>&1 && \
+               uv pip install tpu-raiden-jax \
+                 --extra-index-url https://us-python.pkg.dev/cloud-tpu-inference-test/tpu-raiden/simple/ >/dev/null 2>&1 && \
+               python -c "import tpu_raiden.frameworks.jax._tpu_raiden_jax" 2>/dev/null; then
+              RAIDEN_OK=1
+              echo "tpu-raiden installed from GAR wheel"
+            fi
+          fi
+          # Option C: build from source with Bazel (self-contained fallback);
+          # on success, populate the /models cache for the next run.
+          if [ "$RAIDEN_OK" != "1" ]; then
+            echo "cache/wheel unavailable; building tpu-raiden from source"
+            git clone --depth 1 https://github.com/google/tpu-raiden.git /tmp/tpu-raiden
+            ( cd /tmp/tpu-raiden && \
+              BAZEL_OUTPUT_BASE=/tmp/tpu_logs/raiden_bazel_out \
+              BAZEL_CACHE_DIR=/tmp/tpu_logs/raiden_bazel_cache \
+              HERMETIC_PYTHON_VERSION=3.12 ./build.sh jax )
+            export PYTHONPATH="/tmp/tpu-raiden:${PYTHONPATH:-}"
+            if python -c "import tpu_raiden.frameworks.jax._tpu_raiden_jax"; then
+              RAIDEN_OK=1
+              echo "saving raiden build to $RAIDEN_CACHE (best-effort)"
+              mkdir -p /models/raiden
+              TMP_TGZ="/models/raiden/.build-${JOB_COMPLETION_INDEX:-0}.tgz"
+              tar czf "$TMP_TGZ" -C /tmp \
+                --exclude='tpu-raiden/bazel-*' --exclude='tpu-raiden/.git' tpu-raiden \
+                && mv -f "$TMP_TGZ" "$RAIDEN_CACHE" \
+                && echo "raiden build cached to /models" \
+                || echo "WARN: failed to write raiden cache (non-fatal)"
+            fi
+          fi
+          [ "$RAIDEN_OK" = "1" ] || { echo "FATAL: tpu-raiden not importable"; exit 1; }
+          echo "tpu-raiden ready (PYTHONPATH=${PYTHONPATH:-<site-packages>})"
 
           INDEX=${JOB_COMPLETION_INDEX}
           echo "=== Pod index: $INDEX BRANCH=${BRANCH} (single-host PD, DeepSeek-1.5B TP=1) ==="
@@ -111,6 +172,7 @@ spec:
               --disaggregation-bootstrap-url "http://${P_HOST}:8998" \
               --chunked-prefill-size 16384 \
               --disaggregation-enable-d2h \
+              --disaggregation-use-raiden \
               --enable-metrics \
               2>&1 | tee /tmp/prefill_server.log &
 
@@ -146,6 +208,7 @@ spec:
               --disaggregation-bootstrap-url "http://${P_HOST}:8998" \
               --chunked-prefill-size 16384 \
               --disaggregation-enable-d2h \
+              --disaggregation-use-raiden \
               --disaggregation-max-inflight-transfers ${CAP} \
               --mem-fraction-static 0.80 \
               --enable-metrics \
@@ -188,25 +251,30 @@ spec:
             cat /tmp/gsm8k_result.jsonl 2>/dev/null || echo "(no gsm8k result, rc=${GSM_RC})"
 
             echo "=========================================="
-            echo "SMOKE conc=${CONCURRENCY} n=${NUM_PROMPTS} in=${INPUT_LEN} out=${OUTPUT_LEN} CAP=${CAP}"
+            echo "TTFT sweep conc=1 serial (out=1) inputs=${TTFT_INPUTS}"
+            echo "aligned to pd_ttft_profiling_report.md methodology"
             echo "=========================================="
             set +e
-            timeout 1800 python -m sgl_jax.bench_serving \
-              --backend sgl-jax \
-              --base-url http://localhost:30000 \
-              --model "$MODEL_PATH" \
-              --dataset-name random \
-              --random-input-len ${INPUT_LEN} \
-              --random-output-len ${OUTPUT_LEN} \
-              --random-range-ratio 1.0 \
-              --num-prompts ${NUM_PROMPTS} \
-              --max-concurrency ${CONCURRENCY} \
-              --warmup-requests 4 \
-              --output-file /tmp/bench_smoke.jsonl
-            SMOKE_RC=$?
+            for L in ${TTFT_INPUTS}; do
+              echo "--- TTFT input_len=${L} (warmup=3 measure=10, conc=1) ---"
+              timeout 900 python -m sgl_jax.bench_serving \
+                --backend sgl-jax \
+                --base-url http://localhost:30000 \
+                --model "$MODEL_PATH" \
+                --dataset-name random \
+                --random-input-len ${L} \
+                --random-output-len 1 \
+                --random-range-ratio 1.0 \
+                --num-prompts 13 \
+                --max-concurrency 1 \
+                --warmup-requests 3 \
+                --output-file /tmp/ttft_${L}.jsonl
+              echo "--- ttft result input_len=${L} (BRANCH=${BRANCH}) ---"
+              cat /tmp/ttft_${L}.jsonl 2>/dev/null || echo "(no ttft result for ${L})"
+            done
             set -e
-            echo "--- smoke result (BRANCH=${BRANCH}) ---"
-            cat /tmp/bench_smoke.jsonl 2>/dev/null || echo "(no smoke result, rc=${SMOKE_RC})"
+            echo "--- raiden decode PD-TIME-STATS kv_wait sample ---"
+            grep -E "PD-TIME-STATS" /tmp/decode_server.log 2>/dev/null | tail -60 || echo "(no PD-TIME-STATS)"
 
             echo "=========================================="
             echo "OOM/abort markers (decode): "

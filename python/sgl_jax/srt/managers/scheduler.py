@@ -117,6 +117,17 @@ RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
 
+def _count_batch_reqs_for_pd_state(batch) -> int:
+    if batch is None:
+        return 0
+    if hasattr(batch, "is_empty") and batch.is_empty():
+        return 0
+    reqs_info = getattr(batch, "reqs_info", None)
+    if reqs_info is None:
+        return 0
+    return sum(len(info.reqs) for info in reqs_info if getattr(info, "reqs", None))
+
+
 class SyncError(Exception):
     pass
 
@@ -193,9 +204,6 @@ class Scheduler(
         if server_args.multimodal:
             logger.info("Multimodal mode enabled, disabling overlap schedule")
             self.enable_overlap = False
-        if server_args.disaggregation_mode != "null":
-            logger.info("PD disaggregation mode enabled, disabling overlap schedule")
-            self.enable_overlap = False
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
         # PD disaggregation runtime attributes. They are populated by
@@ -205,6 +213,7 @@ class Scheduler(
         self.disagg_bootstrap_server = None
         self.disagg_heartbeat = None
         self.disagg_bootstrap_key = None
+        self.disagg_bootstrap_keys = None
         self.disagg_shutdown = None
         self.disagg_use_d2h_staging = False
         self.disagg_prefill_queue = None
@@ -1256,6 +1265,7 @@ class Scheduler(
         req.bootstrap_host = recv_req.bootstrap_host
         req.bootstrap_port = recv_req.bootstrap_port
         req.bootstrap_room = recv_req.bootstrap_room
+        req.disagg_prefill_dp_rank = getattr(recv_req, "disagg_prefill_dp_rank", None)
         req.disagg_transfer_id = recv_req.disagg_transfer_id or req.rid
         if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
             req.mm_inputs = recv_req.mm_inputs
@@ -1416,6 +1426,7 @@ class Scheduler(
         ret["running_batch_rids"] = [req.rid for req in all_reqs] if len(all_reqs) != 0 else []
 
         # scheduling state
+        ret["enable_overlap"] = self.enable_overlap
         ret["cur_batch_is_none"] = self.cur_batch is None
         ret["last_batch_is_none"] = self.last_batch is None
         ret["chunked_req_is_none"] = all(r is None for r in self.chunked_reqs)
@@ -1451,8 +1462,48 @@ class Scheduler(
         ret["disagg_prefill_queue_size"] = len(self.disagg_prefill_queue or ())
         ret["disagg_prealloc_queue_size"] = len(self.disagg_prealloc_queue or ())
         ret["disagg_transfer_queue_size"] = len(self.disagg_transfer_queue or ())
+        ret["pd_decode_admission"] = self._get_pd_decode_admission_state()
+        ret["pd_schedule_activity"] = self.get_schedule_activity_state()
 
         return GetInternalStateReqOutput(internal_state=ret)
+
+    def _get_pd_decode_admission_state(self) -> dict:
+        prealloc_q = getattr(self, "disagg_prealloc_queue", None)
+        if prealloc_q is None:
+            return {}
+
+        transfer_q = getattr(self, "disagg_transfer_queue", None)
+        allocator = getattr(self, "token_to_kv_pool_allocator", None)
+        entries = list(prealloc_q.items_fifo()) if hasattr(prealloc_q, "items_fifo") else []
+
+        oldest_wait_ms = None
+        if entries:
+            req = getattr(entries[0], "req", None)
+            time_stats = getattr(req, "pd_time_stats", None)
+            marks = getattr(time_stats, "marks", None) if time_stats is not None else None
+            start = marks.get("prealloc_entry") if marks is not None else None
+            if start is not None:
+                oldest_wait_ms = (time.perf_counter() - start) * 1000.0
+
+        kv_available_by_dp = []
+        if allocator is not None:
+            for dp_rank in range(int(getattr(self, "dp_size", 1) or 1)):
+                kv_available_by_dp.append(int(allocator.available_size(dp_rank=dp_rank)))
+
+        return {
+            "prealloc_queue_size": len(prealloc_q),
+            "transfer_queue_size": len(transfer_q) if transfer_q is not None else 0,
+            "running_reqs": _count_batch_reqs_for_pd_state(
+                getattr(self, "running_batch", None)
+            ),
+            "max_inflight_transfers": self.server_args.disaggregation_max_inflight_transfers,
+            "reserved_decode_tokens": self.server_args.disaggregation_num_reserved_decode_tokens,
+            "kv_available_by_dp": kv_available_by_dp,
+            "oldest_prealloc_wait_ms": oldest_wait_ms,
+            "pending_prealloc_prompt_tokens": sum(
+                len(getattr(entry.req, "origin_input_ids", ()) or ()) for entry in entries
+            ),
+        }
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         """Handle internal state updates, including precision tracer configuration"""
@@ -2206,6 +2257,7 @@ class Scheduler(
     def run_batch(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run a batch."""
         self.forward_ct += 1
+        schedule_activity_start = time.perf_counter()
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
@@ -2271,6 +2323,11 @@ class Scheduler(
                 precompile_bs_paddings,
                 precompile_cache_loc_paddings,
             )
+        self.record_schedule_activity(
+            batch,
+            schedule_activity_start,
+            time.perf_counter(),
+        )
         bid = model_worker_batch.bid
 
         # These 2 values are needed for processing the output, but the values can be
@@ -2649,9 +2706,15 @@ def dispatch_scheduler_event_loop(scheduler: Scheduler, server_args: ServerArgs)
 
     mode = server_args.disaggregation_mode
     if mode == "prefill":
-        scheduler.event_loop_normal_disagg_prefill()
+        if scheduler.enable_overlap:
+            scheduler.event_loop_overlap_disagg_prefill()
+        else:
+            scheduler.event_loop_normal_disagg_prefill()
     elif mode == "decode":
-        scheduler.event_loop_normal_disagg_decode()
+        if scheduler.enable_overlap:
+            scheduler.event_loop_overlap_disagg_decode()
+        else:
+            scheduler.event_loop_normal_disagg_decode()
     elif scheduler.enable_overlap:
         scheduler.event_loop_overlap()
     else:

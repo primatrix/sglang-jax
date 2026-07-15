@@ -416,6 +416,8 @@ class TokenizerManager:
         tokenized_obj.bootstrap_host = getattr(obj, "bootstrap_host", None)
         tokenized_obj.bootstrap_port = getattr(obj, "bootstrap_port", None)
         tokenized_obj.bootstrap_room = getattr(obj, "bootstrap_room", None)
+        tokenized_obj.dp_rank = getattr(obj, "dp_rank", None)
+        tokenized_obj.disagg_prefill_dp_rank = getattr(obj, "disagg_prefill_dp_rank", None)
         tokenized_obj.disagg_transfer_id = getattr(obj, "disagg_transfer_id", None)
         # note: When only `return_logprob` is specified, we assume that only the output probability is required.
         if (
@@ -1031,6 +1033,12 @@ class TokenizerManager:
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
             }
+            dp_rank = getattr(state.obj, "dp_rank", None)
+            if dp_rank is not None:
+                meta_info["dp_rank"] = dp_rank
+            disagg_prefill_dp_rank = getattr(state.obj, "disagg_prefill_dp_rank", None)
+            if disagg_prefill_dp_rank is not None:
+                meta_info["disagg_prefill_dp_rank"] = disagg_prefill_dp_rank
 
             if getattr(state.obj, "return_logprob", False) or getattr(
                 state.obj, "return_output_logprob_only", False

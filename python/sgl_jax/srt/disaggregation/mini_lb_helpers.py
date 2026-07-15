@@ -19,6 +19,21 @@ def generate_bootstrap_room() -> int:
     return random.randint(0, 2**63 - 1)
 
 
+def align_bootstrap_room_to_prefill(
+    room: int,
+    *,
+    prefill_index: int | None,
+    prefill_count: int | None,
+) -> int:
+    if prefill_index is None or prefill_count is None:
+        return room
+    count = int(prefill_count)
+    if count <= 1:
+        return room
+    index = int(prefill_index) % count
+    return room + ((index - room) % count)
+
+
 def get_request_batch_size(request: dict[str, Any]) -> int | None:
     base_size = _get_base_batch_size(request)
     return None if base_size == 1 else base_size
@@ -98,19 +113,26 @@ def inject_bootstrap_fields(
     prefill_server: str,
     bootstrap_port: int | None,
     bootstrap_host_override: str | None = None,
+    prefill_index: int | None = None,
+    prefill_count: int | None = None,
 ) -> dict[str, Any]:
     parsed = urllib.parse.urlparse(prefill_server)
     hostname = bootstrap_host_override or maybe_wrap_ipv6_address(parsed.hostname or "")
-    room = generate_bootstrap_room()
+    room = align_bootstrap_room_to_prefill(
+        generate_bootstrap_room(),
+        prefill_index=prefill_index,
+        prefill_count=prefill_count,
+    )
     modified_request = ensure_request_identity_fields(request_data)
 
     batch_size = get_request_batch_size(modified_request)
+    room_stride = max(1, int(prefill_count or 1))
     if batch_size is not None:
         modified_request.update(
             {
                 "bootstrap_host": [hostname] * batch_size,
                 "bootstrap_port": [bootstrap_port] * batch_size,
-                "bootstrap_room": [room + i for i in range(batch_size)],
+                "bootstrap_room": [room + i * room_stride for i in range(batch_size)],
             }
         )
     else:

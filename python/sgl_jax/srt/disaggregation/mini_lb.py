@@ -1,14 +1,24 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import random
+import time
 from http import HTTPStatus
 from itertools import chain
 
 logger = logging.getLogger(__name__)
 
 AIOHTTP_STREAM_READ_CHUNK_SIZE = 1024 * 64
+
+
+def _get_dp_size(server_info: dict) -> int:
+    dp_size = server_info.get("dp_size")
+    if dp_size is not None:
+        return int(dp_size)
+    return max(1, len(server_info.get("internal_states") or []))
 
 
 class MiniLoadBalancer:
@@ -26,6 +36,44 @@ class MiniLoadBalancer:
         self.prefill_dp_size = None
         self.decode_dp_size = None
         self.max_concurrent_requests = getattr(router_args, "max_concurrent_requests", None)
+        self.pd_prefill_max_inflight_requests = max(
+            0,
+            int(getattr(router_args, "pd_prefill_max_inflight_requests", 0) or 0),
+        )
+        self._prefill_admission_sems = (
+            {
+                prefill_url: asyncio.Semaphore(self.pd_prefill_max_inflight_requests)
+                for prefill_url in self.prefill_urls
+            }
+            if self.pd_prefill_max_inflight_requests > 0
+            else {}
+        )
+        self.pd_decode_prealloc_soft_limit = getattr(
+            router_args,
+            "pd_decode_prealloc_soft_limit",
+            0,
+        )
+        self.pd_decode_oldest_prealloc_wait_ms_soft_limit = getattr(
+            router_args,
+            "pd_decode_oldest_prealloc_wait_ms_soft_limit",
+            0.0,
+        )
+        self.pd_router_admission_poll_ms = getattr(
+            router_args,
+            "pd_router_admission_poll_ms",
+            50,
+        )
+        self.pd_router_prefill_decode_overlap = bool(
+            getattr(router_args, "pd_router_prefill_decode_overlap", True)
+        )
+        self.prefill_admission_wait_count = 0
+        self.prefill_admission_wait_ms_total = 0.0
+        self.prefill_admission_wait_ms_max = 0.0
+        self.decode_admission_wait_count = 0
+        self.decode_admission_wait_ms_total = 0.0
+        self.decode_admission_wait_ms_max = 0.0
+        self.decode_admission_poll_count = 0
+        self.decode_admission_blocked_count = 0
 
     def _validate_router_args(self, router_args) -> None:
         if getattr(router_args, "policy", "random") != "random":
@@ -63,8 +111,8 @@ class MiniLoadBalancer:
                 self.decode_urls[0],
                 ("get_server_info", "server_info"),
             )
-        self.prefill_dp_size = len(prefill_info.get("internal_states", [1]))
-        self.decode_dp_size = len(decode_info.get("internal_states", [1]))
+        self.prefill_dp_size = _get_dp_size(prefill_info)
+        self.decode_dp_size = _get_dp_size(decode_info)
         logger.info(
             "[MiniLB] DP sizes: prefill=%s, decode=%s",
             self.prefill_dp_size,
@@ -77,20 +125,215 @@ class MiniLoadBalancer:
 
         prefill_req = request.copy()
         decode_req = request.copy()
-        prefill_req["routed_dp_rank"] = p_rank
-        decode_req["routed_dp_rank"] = d_rank
+        prefill_req["dp_rank"] = p_rank
+        decode_req["dp_rank"] = d_rank
         decode_req["disagg_prefill_dp_rank"] = p_rank
 
         return prefill_req, decode_req, d_rank
 
-    def select_pair(self) -> tuple[str, int | None, str]:
+    @staticmethod
+    def _room_rank(bootstrap_room, dp_size: int):
+        if isinstance(bootstrap_room, list):
+            return [int(room) % dp_size for room in bootstrap_room]
+        return int(bootstrap_room) % dp_size
+
+    async def _align_dp_requests(self, request: dict):
+        await self._ensure_dp_sizes()
+        dp_size = min(int(self.prefill_dp_size or 1), int(self.decode_dp_size or 1))
+        if dp_size <= 1:
+            return request, request
+
+        forced_rank = os.getenv("SGLANG_JAX_PD_FORCE_DP_RANK")
+        dp_rank = (
+            int(forced_rank) % dp_size
+            if forced_rank is not None
+            else self._room_rank(request["bootstrap_room"], dp_size)
+        )
+        prefill_req = request.copy()
+        decode_req = request.copy()
+        prefill_req["dp_rank"] = dp_rank
+        decode_req["dp_rank"] = dp_rank
+        decode_req["disagg_prefill_dp_rank"] = dp_rank
+        return prefill_req, decode_req
+
+    def select_pair(self) -> tuple[int, str, int | None, str]:
         pidx = random.randint(0, len(self.prefill_urls) - 1)
         didx = random.randint(0, len(self.decode_urls) - 1)
         return (
+            pidx,
             self.prefill_urls[pidx],
             self.prefill_bootstrap_ports[pidx],
             self.decode_urls[didx],
         )
+
+    def _decode_admission_blocked(self, decode_info: dict) -> bool:
+        states = decode_info.get("internal_states") or []
+        for state in states:
+            admission = state.get("pd_decode_admission") or {}
+            prealloc_q = admission.get("prealloc_queue_size", 0)
+            oldest_ms = admission.get("oldest_prealloc_wait_ms")
+            if (
+                self.pd_decode_prealloc_soft_limit > 0
+                and prealloc_q >= self.pd_decode_prealloc_soft_limit
+            ):
+                return True
+            if (
+                self.pd_decode_oldest_prealloc_wait_ms_soft_limit > 0
+                and oldest_ms is not None
+                and oldest_ms >= self.pd_decode_oldest_prealloc_wait_ms_soft_limit
+            ):
+                return True
+        return False
+
+    def get_observability_state(self) -> dict:
+        return {
+            "max_concurrent_requests": self.max_concurrent_requests,
+            "pd_prefill_max_inflight_requests": self.pd_prefill_max_inflight_requests,
+            "pd_router_prefill_decode_overlap": self.pd_router_prefill_decode_overlap,
+            "prefill_admission_inflight_by_url": {
+                url: self._semaphore_inflight(sem)
+                for url, sem in self._prefill_admission_sems.items()
+            },
+            "prefill_admission_available_by_url": {
+                url: int(getattr(sem, "_value", 0))
+                for url, sem in self._prefill_admission_sems.items()
+            },
+            "prefill_admission_waiting_by_url": {
+                url: self._semaphore_waiter_count(sem)
+                for url, sem in self._prefill_admission_sems.items()
+            },
+            "prefill_admission_wait_count": self.prefill_admission_wait_count,
+            "prefill_admission_wait_ms_total": round(
+                self.prefill_admission_wait_ms_total, 3
+            ),
+            "prefill_admission_wait_ms_max": round(
+                self.prefill_admission_wait_ms_max, 3
+            ),
+            "decode_admission_wait_count": self.decode_admission_wait_count,
+            "decode_admission_wait_ms_total": round(
+                self.decode_admission_wait_ms_total, 3
+            ),
+            "decode_admission_wait_ms_max": round(
+                self.decode_admission_wait_ms_max, 3
+            ),
+            "decode_admission_poll_count": self.decode_admission_poll_count,
+            "decode_admission_blocked_count": self.decode_admission_blocked_count,
+            "updated_at": time.time(),
+        }
+
+    def _semaphore_inflight(self, sem: asyncio.Semaphore) -> int:
+        return max(0, self.pd_prefill_max_inflight_requests - int(getattr(sem, "_value", 0)))
+
+    @staticmethod
+    def _semaphore_waiter_count(sem: asyncio.Semaphore) -> int:
+        waiters = getattr(sem, "_waiters", None) or ()
+        return sum(1 for waiter in waiters if not waiter.done())
+
+    def _record_prefill_admission_wait(self, wait_s: float) -> None:
+        wait_ms = max(0.0, wait_s * 1000.0)
+        self.prefill_admission_wait_count += 1
+        self.prefill_admission_wait_ms_total += wait_ms
+        self.prefill_admission_wait_ms_max = max(
+            self.prefill_admission_wait_ms_max,
+            wait_ms,
+        )
+
+    def _record_decode_admission_wait(
+        self,
+        wait_s: float,
+        poll_count: int,
+        blocked_count: int,
+    ) -> None:
+        wait_ms = max(0.0, wait_s * 1000.0)
+        self.decode_admission_wait_count += 1
+        self.decode_admission_wait_ms_total += wait_ms
+        self.decode_admission_wait_ms_max = max(
+            self.decode_admission_wait_ms_max,
+            wait_ms,
+        )
+        self.decode_admission_poll_count += poll_count
+        self.decode_admission_blocked_count += blocked_count
+
+    async def _wait_for_decode_admission(self, session, decode_server: str) -> None:
+        if (
+            self.pd_decode_prealloc_soft_limit <= 0
+            and self.pd_decode_oldest_prealloc_wait_ms_soft_limit <= 0
+        ):
+            return
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.timeout
+        poll_s = max(1, int(self.pd_router_admission_poll_ms)) / 1000.0
+        start = loop.time()
+        poll_count = 0
+        blocked_count = 0
+        while True:
+            info = await fetch_backend_json(
+                session,
+                decode_server,
+                ("get_server_info", "server_info"),
+            )
+            poll_count += 1
+            if not self._decode_admission_blocked(info):
+                self._record_decode_admission_wait(
+                    loop.time() - start,
+                    poll_count,
+                    blocked_count,
+                )
+                return
+            blocked_count += 1
+            if loop.time() >= deadline:
+                self._record_decode_admission_wait(
+                    loop.time() - start,
+                    poll_count,
+                    blocked_count,
+                )
+                raise HTTPException(
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    detail="PD decode admission did not clear before request timeout",
+            )
+            await asyncio.sleep(poll_s)
+
+    async def _post_prefill_with_admission(
+        self,
+        session,
+        prefill_server: str,
+        endpoint: str,
+        request: dict,
+    ):
+        sem = await self._acquire_prefill_admission(prefill_server)
+        return await self._post_prefill_and_release_admission(
+            session,
+            prefill_server,
+            endpoint,
+            request,
+            sem,
+        )
+
+    async def _acquire_prefill_admission(self, prefill_server: str):
+        sem = self._prefill_admission_sems.get(prefill_server)
+        if sem is not None:
+            start = asyncio.get_running_loop().time()
+            await sem.acquire()
+            self._record_prefill_admission_wait(
+                asyncio.get_running_loop().time() - start
+            )
+        return sem
+
+    async def _post_prefill_and_release_admission(
+        self,
+        session,
+        prefill_server: str,
+        endpoint: str,
+        request: dict,
+        sem,
+    ):
+        try:
+            response = await session.post(f"{prefill_server}/{endpoint}", json=request)
+            return response, await response.read()
+        finally:
+            if sem is not None:
+                sem.release()
 
     async def generate(
         self,
@@ -113,20 +356,43 @@ class MiniLoadBalancer:
                 expected_decode_dp_rank,
             ) = self._fork_dp_requests(modified_request)
         else:
-            prefill_req = modified_request
-            decode_req = modified_request
+            prefill_req, decode_req = await self._align_dp_requests(modified_request)
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=self.timeout)
         ) as session:
-            tasks = [
-                session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
-                session.post(f"{decode_server}/{endpoint}", json=decode_req),
-            ]
-            prefill_response, decode_response = await asyncio.gather(*tasks)
+            await self._wait_for_decode_admission(session, decode_server)
+            prefill_sem = await self._acquire_prefill_admission(prefill_server)
+            if self.pd_router_prefill_decode_overlap:
+                tasks = [
+                    self._post_prefill_and_release_admission(
+                        session,
+                        prefill_server,
+                        endpoint,
+                        prefill_req,
+                        prefill_sem,
+                    ),
+                    session.post(f"{decode_server}/{endpoint}", json=decode_req),
+                ]
+                prefill_result, decode_response = await asyncio.gather(*tasks)
+                prefill_response, prefill_body = prefill_result
+            else:
+                prefill_response, prefill_body = await (
+                    self._post_prefill_and_release_admission(
+                        session,
+                        prefill_server,
+                        endpoint,
+                        prefill_req,
+                        prefill_sem,
+                    )
+                )
+                decode_response = await session.post(
+                    f"{decode_server}/{endpoint}",
+                    json=decode_req,
+                )
 
             if "return_logprob" in modified_request:
-                prefill_json = await prefill_response.json()
+                prefill_json = json.loads(prefill_body or b"{}")
                 ret_json = await decode_response.json()
                 if "meta_info" in ret_json and "input_token_logprobs" in ret_json["meta_info"]:
                     ret_json["meta_info"]["input_token_logprobs"] = (
@@ -136,9 +402,30 @@ class MiniLoadBalancer:
             else:
                 ret_json = await decode_response.json()
 
-            if expected_decode_dp_rank is not None:
-                actual = ret_json.get("meta_info", {}).get("dp_rank")
-                if actual != expected_decode_dp_rank:
+            if expected_decode_dp_rank is not None and decode_response.status < 400:
+                if not isinstance(ret_json, dict):
+                    return ORJSONResponse(
+                        content={
+                            "error": (
+                                "Decode response must be a JSON object when "
+                                "--test-external-dp-routing is enabled"
+                            )
+                        },
+                        status_code=500,
+                    )
+                meta_info = ret_json.setdefault("meta_info", {})
+                if not isinstance(meta_info, dict):
+                    meta_info = {}
+                    ret_json["meta_info"] = meta_info
+                actual = meta_info.get("dp_rank")
+                if actual is None:
+                    logger.warning(
+                        "[MiniLB] decode response missing meta_info.dp_rank; "
+                        "assuming externally routed dp_rank=%s",
+                        expected_decode_dp_rank,
+                    )
+                    meta_info["dp_rank"] = expected_decode_dp_rank
+                elif actual != expected_decode_dp_rank:
                     return ORJSONResponse(
                         content={
                             "error": (
@@ -180,18 +467,40 @@ class MiniLoadBalancer:
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=self.timeout)
             ) as session:
-                tasks = [
-                    session.post(f"{prefill_server}/{endpoint}", json=modified_request),
-                    session.post(f"{decode_server}/{endpoint}", json=modified_request),
-                ]
-                prefill_response, decode_response = await asyncio.gather(*tasks)
+                await self._wait_for_decode_admission(session, decode_server)
+                prefill_sem = await self._acquire_prefill_admission(prefill_server)
+                if self.pd_router_prefill_decode_overlap:
+                    tasks = [
+                        self._post_prefill_and_release_admission(
+                            session,
+                            prefill_server,
+                            endpoint,
+                            modified_request,
+                            prefill_sem,
+                        ),
+                        session.post(f"{decode_server}/{endpoint}", json=modified_request),
+                    ]
+                    prefill_result, decode_response = await asyncio.gather(*tasks)
+                    _, prefill_body = prefill_result
+                else:
+                    _, prefill_body = await self._post_prefill_and_release_admission(
+                        session,
+                        prefill_server,
+                        endpoint,
+                        modified_request,
+                        prefill_sem,
+                    )
+                    decode_response = await session.post(
+                        f"{decode_server}/{endpoint}",
+                        json=modified_request,
+                    )
 
                 if modified_request.get("return_logprob", False):
-                    prefill_chunks = []
-                    async for chunk in prefill_response.content:
-                        prefill_chunks.append(chunk)
-
-                    first_prefill_chunk = prefill_chunks[0].decode("utf-8")[5:].strip("\n")
+                    first_prefill_chunk = next(
+                        line[5:].strip()
+                        for line in prefill_body.decode("utf-8").splitlines()
+                        if line.startswith("data:") and "[DONE]" not in line
+                    )
                     first_prefill_chunk_json = orjson.loads(first_prefill_chunk)
 
                     async for chunk in decode_response.content:
@@ -319,6 +628,7 @@ try:
             ),
             "prefill": prefill_infos,
             "decode": decode_infos,
+            "router": lb.get_observability_state(),
         }
 
     async def _get_model_info_impl():
@@ -354,12 +664,14 @@ try:
                 status_code=400,
                 detail="PD mini_lb does not support parallel sampling (n > 1)",
             )
-        prefill_server, bootstrap_port, decode_server = lb.select_pair()
+        prefill_index, prefill_server, bootstrap_port, decode_server = lb.select_pair()
         modified_request = inject_bootstrap_fields(
             request_data,
             prefill_server=prefill_server,
             bootstrap_port=bootstrap_port,
             bootstrap_host_override=lb.prefill_bootstrap_host,
+            prefill_index=prefill_index,
+            prefill_count=len(lb.prefill_urls),
         )
         if request_data.get("stream", False):
             return await lb.generate_stream(

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
+from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
@@ -24,6 +26,15 @@ if TYPE_CHECKING:
     from sgl_jax.srt.managers.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
+
+
+def _batch_reqs(batch) -> tuple[Req, ...]:
+    if batch is None:
+        return ()
+    reqs_info = getattr(batch, "reqs_info", None)
+    if reqs_info is None:
+        return tuple(getattr(batch, "reqs", ()) or ())
+    return tuple(req for info in reqs_info for req in (info.reqs or ()))
 
 
 # Bucket page counts to bound XLA's per-shape compile pool.
@@ -119,6 +130,7 @@ class PrefillBookkeeping:
     # terminal state — used to release ``req_to_token_pool`` and any
     # owned KV indices.
     on_terminal: object | None = None
+    time_stats: object | None = None
 
 
 class PrefillBootstrapQueue:
@@ -137,12 +149,16 @@ class PrefillBootstrapQueue:
         req_id: str,
         sender: JaxTransferKVSender,
         on_terminal=None,
+        time_stats=None,
     ) -> None:
         with self._lock:
             if req_id in self._entries:
                 raise ValueError(f"PrefillBootstrapQueue already tracks " f"req_id={req_id!r}")
             self._entries[req_id] = PrefillBookkeeping(
-                req_id=req_id, sender=sender, on_terminal=on_terminal
+                req_id=req_id,
+                sender=sender,
+                on_terminal=on_terminal,
+                time_stats=time_stats,
             )
 
     def drain_terminal(self) -> list[PrefillBookkeeping]:
@@ -153,6 +169,12 @@ class PrefillBootstrapQueue:
             for req_id, entry in list(self._entries.items()):
                 state = entry.sender.poll()
                 if state in (KVPoll.SUCCESS, KVPoll.FAILED):
+                    mark = getattr(entry.time_stats, "mark", None)
+                    if mark is not None:
+                        mark(
+                            "sender_done" if state == KVPoll.SUCCESS else "sender_failed",
+                            overwrite=True,
+                        )
                     terminal.append(entry)
                     del self._entries[req_id]
         return terminal
@@ -192,10 +214,16 @@ class SchedulerDisaggregationPrefillMixin:
             self.cur_batch = batch
 
             if batch:
-                for req in batch.reqs:
+                batch_reqs = _batch_reqs(batch)
+                for req in batch_reqs:
                     if req.bootstrap_room is not None:
                         self._pd_mark_time(req, "forward_start")
+                forward_start = time.perf_counter()
                 result = self.run_batch(batch)
+                forward_duration = time.perf_counter() - forward_start
+                for req in batch_reqs:
+                    if req.bootstrap_room is not None:
+                        self._pd_add_duration(req, "forward_chunk", forward_duration)
                 self.process_prefill_chunk(batch, result)
             else:
                 self.send_kv_chunk()
@@ -206,33 +234,137 @@ class SchedulerDisaggregationPrefillMixin:
             self.send_kv_chunk()
             # PD reqs are finished and released inside process_prefill_chunk;
             # do not merge them into running_batch.
+            batch_reqs = _batch_reqs(batch)
             self.last_batch = (
-                None if batch and any(r.bootstrap_room is not None for r in batch.reqs) else batch
+                None
+                if batch and any(r.bootstrap_room is not None for r in batch_reqs)
+                else batch
             )
 
-    def process_prefill_chunk(self: Scheduler, batch, result) -> None:
+    def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
+        """Prefill-only event loop with host/device overlap."""
+
+        from sgl_jax.srt.managers.schedule_batch import ForwardMode, ScheduleBatch
+
+        self.result_queue = deque()
+        last_launched_batch = None
+
+        while True:
+            recv_reqs = (
+                self._comm_backend.recv_requests()
+                if self._comm_backend is not None
+                else self.recv_requests()
+            )
+            recv_reqs = self.select_dp_for_request(recv_reqs)
+            self.process_input_requests(recv_reqs)
+
+            if self._engine_paused:
+                continue
+
+            batch = self.get_next_batch_to_run()
+            self.cur_batch = batch
+
+            if batch:
+                batch_reqs = _batch_reqs(batch)
+                for req in batch_reqs:
+                    if req.bootstrap_room is not None:
+                        self._pd_mark_time(req, "forward_start")
+                batch._pd_forward_started_at = time.perf_counter()
+                batch.launch_done = threading.Event()
+                result = self.run_batch(batch)
+                queued_batch = batch.copy()
+                queued_batch._pd_forward_started_at = batch._pd_forward_started_at
+                queued_batch._pd_chunked_reqs = tuple(
+                    r for r in getattr(self, "chunked_reqs", ()) if r is not None
+                )
+                self.result_queue.append((queued_batch, result))
+
+                if last_launched_batch is None:
+                    tmp_batch = ScheduleBatch.init_new(
+                        reqs=[[] for _ in range(self.dp_size)],
+                        req_to_token_pool=self.req_to_token_pool,
+                        token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                        tree_cache=self.tree_cache,
+                        model_config=self.model_config,
+                        enable_overlap=self.enable_overlap,
+                        dp_size=self.dp_size,
+                        spec_algorithm=self.spec_algorithm,
+                        mesh=self.mesh,
+                    )
+                    tmp_batch.forward_mode = ForwardMode.DUMMY_FIRST
+                    tmp_batch.next_batch_sampling_info = (
+                        self._current_sampling_info_owner().cur_sampling_info
+                    )
+                    self.process_batch_result(tmp_batch, None, batch.launch_done)
+            else:
+                self.send_kv_chunk()
+                self.new_token_ratio = self.init_new_token_ratio
+                if self._comm_backend is not None:
+                    self._comm_backend.wait_for_new_requests(0.001)
+
+            if last_launched_batch is not None:
+                tmp_batch, tmp_result = self.result_queue.popleft()
+                tmp_batch.next_batch_sampling_info = (
+                    self._current_sampling_info_owner().cur_sampling_info if batch else None
+                )
+                self.process_prefill_chunk(
+                    tmp_batch,
+                    tmp_result,
+                    batch.launch_done if batch else None,
+                )
+
+            self.send_kv_chunk()
+            last_launched_batch = batch
+            # PD reqs are finished and released inside process_prefill_chunk;
+            # do not expose the launched PD batch through self.last_batch where
+            # get_next_batch_to_run would merge it into running_batch.
+            self.last_batch = None
+
+    def process_prefill_chunk(self: Scheduler, batch, result, launch_done=None) -> None:
         """Extract KV for PD reqs and hand off to sender."""
 
-        pd_reqs = [req for req in batch.reqs if req.bootstrap_room is not None]
+        batch_reqs = _batch_reqs(batch)
+        pd_reqs = [req for req in batch_reqs if req.bootstrap_room is not None]
         if not pd_reqs:
-            self.process_batch_result(batch, result)
+            self.process_batch_result(batch, result, launch_done)
             return
 
+        if getattr(self, "enable_overlap", False):
+            self.tp_worker.resolve_last_batch_result(launch_done)
+
+        forward_started_at = getattr(batch, "_pd_forward_started_at", None)
+        forward_duration = (
+            None if forward_started_at is None else time.perf_counter() - forward_started_at
+        )
         for req in pd_reqs:
-            self._pd_mark_time(req, "forward_done")
+            self._pd_mark_time(req, "forward_done", overwrite=True)
+            if forward_duration is not None:
+                self._pd_add_duration(req, "forward_chunk", forward_duration)
 
         self.set_next_batch_sampling_info_done(batch)
 
-        chunked_now = tuple(r for r in getattr(self, "chunked_reqs", ()) if r is not None)
-        for req in batch.reqs:
+        chunked_now = getattr(batch, "_pd_chunked_reqs", None)
+        if chunked_now is None:
+            chunked_now = tuple(r for r in getattr(self, "chunked_reqs", ()) if r is not None)
+        use_raiden = self.disagg_kv_manager.use_raiden
+        for req in batch_reqs:
             if req.bootstrap_room is None:
                 continue
-            if any(req is cr for cr in chunked_now):
+            req_id = req.rid
+            is_mid_chunk = any(req is cr for cr in chunked_now)
+            if use_raiden:
+                # raiden path: hand off THIS chunk's device page subset now (no
+                # gather / no D2H). Each chunk is published as its own uuid so
+                # its pull overlaps the next chunk's compute. Mid-chunk reqs are
+                # NOT skipped — that is the whole point of chunked transfer.
+                self._raiden_handoff_chunk(req, req_id, is_final=not is_mid_chunk)
+                continue
+            # path A (D2H / HBM): single-shot, extract on the FINAL chunk only.
+            if is_mid_chunk:
                 # Still mid-chunk: KV is incomplete, and releasing the
                 # req_pool_idx here would leak the slot the next chunk
                 # round re-allocates. Extract on the final chunk.
                 continue
-            req_id = req.rid
             if req_id in self.disagg_prefill_queue._entries:
                 continue
             try:
@@ -323,7 +455,12 @@ class SchedulerDisaggregationPrefillMixin:
             def _on_terminal(req_obj=req, sender_obj=sender, _released=released):
                 self._on_prefill_transfer_terminal(req_obj, sender_obj, already_released=_released)
 
-            self.disagg_prefill_queue.add(req_id, sender, on_terminal=_on_terminal)
+            self.disagg_prefill_queue.add(
+                req_id,
+                sender,
+                on_terminal=_on_terminal,
+                time_stats=req.pd_time_stats,
+            )
 
     def send_kv_chunk(self: Scheduler) -> None:
         """Reap senders that reached SUCCESS / FAILED."""
@@ -345,7 +482,9 @@ class SchedulerDisaggregationPrefillMixin:
     # Overridable / test-friendly hooks
     # ------------------------------------------------------------------
 
-    def _pd_mark_time(self: Scheduler, req: Req, name: str) -> None:
+    def _pd_mark_time(
+        self: Scheduler, req: Req, name: str, *, overwrite: bool = False
+    ) -> None:
         """Record a PD lifecycle mark on ``req`` (no-op unless enabled)."""
 
         if not getattr(self.server_args, "enable_request_time_stats_logging", False):
@@ -357,7 +496,197 @@ class SchedulerDisaggregationPrefillMixin:
             role = getattr(self.server_args, "disaggregation_mode", "prefill")
             ts = TimeStats(role)
             req.pd_time_stats = ts
-        ts.mark(name)
+        ts.mark(name, overwrite=overwrite)
+
+    def _pd_add_duration(self: Scheduler, req: Req, name: str, seconds: float) -> None:
+        if not getattr(self.server_args, "enable_request_time_stats_logging", False):
+            return
+        from sgl_jax.srt.disaggregation.req_time_stats import TimeStats
+
+        ts = req.pd_time_stats
+        if ts is None:
+            role = getattr(self.server_args, "disaggregation_mode", "prefill")
+            ts = TimeStats(role)
+            req.pd_time_stats = ts
+        ts.add_duration(name, seconds)
+
+    def _pd_increment(self: Scheduler, req: Req, name: str, amount: int = 1) -> None:
+        if not getattr(self.server_args, "enable_request_time_stats_logging", False):
+            return
+        from sgl_jax.srt.disaggregation.req_time_stats import TimeStats
+
+        ts = req.pd_time_stats
+        if ts is None:
+            role = getattr(self.server_args, "disaggregation_mode", "prefill")
+            ts = TimeStats(role)
+            req.pd_time_stats = ts
+        ts.increment(name, amount)
+
+    def _extract_req_block_ids_range(
+        self: Scheduler, req: Req, start: int, end: int
+    ) -> list[int]:
+        """raiden chunked path: the device page (block) ids covering token range
+        ``[start, end)`` of ``req``.
+
+        Chunk boundaries are page-aligned (the scheduler truncates chunks to
+        page multiples), so ``start`` is a multiple of ``page_size`` and
+        ``start // page_size`` is this chunk's sequence-relative page offset. The
+        final chunk's ``end`` need not be aligned; the last (partial) page is
+        rounded up so its block is included exactly once.
+
+        Returns full-pool block ids. Use ``_extract_swa_block_ids_for_chunk``
+        for the SWA-pool counterpart on hybrid-SWA models.
+        """
+
+        import numpy as _np
+
+        req_to_token = self.req_to_token_pool.req_to_token
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        page_size = kv_pool.page_size
+        first_page = start // page_size
+        last_page = (end + page_size - 1) // page_size  # exclusive
+        page_id_source = req_to_token[
+            req.req_pool_idx,
+            first_page * page_size : last_page * page_size : page_size,
+        ]
+        page_ids = _np.asarray(page_id_source) // page_size
+        return [int(p) for p in page_ids]
+
+    def _extract_swa_block_ids_for_chunk(
+        self: Scheduler,
+        req: Req,
+        start: int,
+        end: int,
+        page_size: int,
+        sliding_window_size: int,
+    ) -> list[int]:
+        """Extract SWA-pool block ids for the token range ``[start, end)``.
+
+        Translates full-pool token indices to SWA-pool indices via
+        ``full_to_swa_index_mapping``, then filters to only the sliding-window
+        tail (``window_start..seqlen``).  Returns an empty list when the chunk
+        lies entirely before the tail window or the allocator has no SWA pool.
+        """
+
+        import numpy as _np
+
+        allocator = self.token_to_kv_pool_allocator
+        mapping = getattr(allocator, "full_to_swa_index_mapping", None)
+        if mapping is None:
+            return []
+        if isinstance(mapping, list):
+            mapping = mapping[int(getattr(req, "dp_rank", 0) or 0)]
+
+        seqlen = len(req.origin_input_ids)
+        window_start = max(0, seqlen - sliding_window_size)
+        tail_start = max(start, window_start)
+        if tail_start >= end or tail_start >= seqlen:
+            return []
+
+        first_page = tail_start // page_size
+        last_page = (min(end, seqlen) + page_size - 1) // page_size
+
+        req_to_token = self.req_to_token_pool.req_to_token
+        swa_page_ids = []
+        for p in range(first_page, last_page):
+            full_token_idx = int(req_to_token[req.req_pool_idx, p * page_size])
+            swa_token_idx = int(mapping[full_token_idx])
+            if swa_token_idx >= page_size:
+                swa_page_ids.append(swa_token_idx // page_size)
+
+        local_swa_page_ids = sorted(set(swa_page_ids))
+        return local_swa_page_ids
+
+    def _raiden_handoff_chunk(self: Scheduler, req: Req, req_id: str, *, is_final: bool) -> None:
+        """raiden per-chunk handoff: publish THIS chunk's device page subset to D
+        right after its forward, so D's pull overlaps the next chunk's compute.
+
+        Each chunk is registered under its own raiden uuid (register_read is
+        overwrite-per-uuid, not cumulative). The sender is created on chunk 0 and
+        reused for later chunks; the request is enqueued on the prefill transfer
+        queue exactly once (chunk 0). ``is_final`` fixes the total chunk count.
+        """
+
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        page_size = kv_pool.page_size
+        chunk_index = getattr(req, "_pd_chunk_index", 0)
+        sender = getattr(req, "_pd_sender", None)
+        try:
+            start = len(req.prefix_indices)
+            end = start + req.extend_input_len
+            page_offset = start // page_size
+            block_ids = self._extract_req_block_ids_range(req, start, end)
+            # SWA (hybrid attention) tail blocks — only the sliding-window
+            # tail pages, translated to the SWA pool's index space. Empty for
+            # non-SWA models (no full_to_swa_index_mapping).
+            swa_block_ids = self._extract_swa_block_ids_for_chunk(
+                req,
+                start,
+                end,
+                page_size,
+                getattr(self, "sliding_window_size", None) or 0,
+            )
+            if sender is None:
+                sender = self.disagg_kv_manager.create_sender(req_id)
+                sender.init(
+                    kv_indices=None,
+                    transfer_id=req.disagg_transfer_id or req_id,
+                )
+                req._pd_sender = sender
+            if chunk_index == 0:
+                self._pd_mark_time(req, "transfer_start")
+            handoff_start = time.perf_counter()
+            sender.send_chunk(
+                chunk_index,
+                block_ids,
+                bootstrap_room=req.bootstrap_room,
+                is_final=is_final,
+                chunk_page_offset=page_offset,
+                swa_block_ids=swa_block_ids or None,
+            )
+            handoff_duration = time.perf_counter() - handoff_start
+            self._pd_add_duration(req, "chunk_handoff", handoff_duration)
+            self._pd_increment(req, "chunks_registered")
+            if chunk_index == 0:
+                self._pd_mark_time(req, "first_chunk_registered")
+            if is_final:
+                self._pd_mark_time(req, "last_chunk_registered", overwrite=True)
+        except Exception as exc:
+            logger.exception(
+                "raiden per-chunk handoff failed for req_id=%s chunk=%s; aborting",
+                req_id,
+                chunk_index,
+            )
+            if sender is not None:
+                with suppress(Exception):
+                    sender.abort()
+                with suppress(Exception):
+                    sender.clear()
+            self._abort_prefill_req(
+                req,
+                f"Prefill raiden handoff failed for req_id={req_id!r}: {exc}",
+                metric_reason="sender_init",
+            )
+            return
+
+        req._pd_chunk_index = chunk_index + 1
+        if chunk_index == 0:
+            # Enqueue exactly once. raiden references the device KV pool blocks
+            # directly, so they MUST stay alive until poll_stats() reports
+            # done_sending for EVERY chunk; the terminal callback frees them once
+            # the whole transfer completes (already_released=False). ChunkCache
+            # keeps earlier chunks' pages resident until then, so registering
+            # chunk 0 early is safe. NEEDS-TPU-VERIFICATION: raiden holds no
+            # residual device reference after done_sending.
+            def _on_terminal(req_obj=req, sender_obj=sender):
+                self._on_prefill_transfer_terminal(req_obj, sender_obj, already_released=False)
+
+            self.disagg_prefill_queue.add(
+                req_id,
+                sender,
+                on_terminal=_on_terminal,
+                time_stats=req.pd_time_stats,
+            )
 
     def _extract_req_kv(self: Scheduler, req: Req):
         """Gather prefilled KV from the paged pool for ``req``.

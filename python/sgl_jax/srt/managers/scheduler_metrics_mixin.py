@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
@@ -17,6 +18,117 @@ logger = logging.getLogger(__name__)
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 
 
+class ScheduleActivityTracker:
+    def __init__(self, window_seconds: float = 60.0):
+        self.window_seconds = float(window_seconds)
+        self.events = deque()
+        self.last_forward_end: float | None = None
+        self.last_mode: str | None = None
+        self.last_batch_size = 0
+        self.last_new_tokens = 0
+        self.last_forward_s = 0.0
+        self.last_idle_gap_s: float | None = None
+
+    def record_forward(
+        self,
+        *,
+        mode: str,
+        batch_size: int,
+        new_tokens: int,
+        start: float,
+        end: float,
+    ) -> None:
+        duration_s = max(0.0, end - start)
+        idle_gap_s = (
+            None
+            if self.last_forward_end is None
+            else max(0.0, start - self.last_forward_end)
+        )
+        event = {
+            "mode": mode,
+            "batch_size": int(batch_size),
+            "new_tokens": int(new_tokens),
+            "start": float(start),
+            "end": float(end),
+            "duration_s": duration_s,
+            "idle_gap_s": idle_gap_s,
+        }
+        self.events.append(event)
+        self.last_forward_end = float(end)
+        self.last_mode = mode
+        self.last_batch_size = int(batch_size)
+        self.last_new_tokens = int(new_tokens)
+        self.last_forward_s = duration_s
+        self.last_idle_gap_s = idle_gap_s
+        self._prune(float(end))
+
+    def snapshot(self, now: float | None = None) -> dict:
+        now = time.perf_counter() if now is None else float(now)
+        self._prune(now)
+        ret = {
+            "last_mode": self.last_mode,
+            "last_batch_size": self.last_batch_size,
+            "last_new_tokens": self.last_new_tokens,
+            "last_forward_ms": _round_ms(self.last_forward_s),
+            "last_idle_gap_ms": (
+                None if self.last_idle_gap_s is None else _round_ms(self.last_idle_gap_s)
+            ),
+        }
+        for window_s in (1.0, 5.0, 60.0):
+            ret.update(self._snapshot_window(now, window_s))
+        return ret
+
+    def _snapshot_window(self, now: float, window_s: float) -> dict:
+        start_cutoff = now - window_s
+        count = 0
+        intervals: list[tuple[float, float]] = []
+        for event in self.events:
+            overlap_start = max(event["start"], start_cutoff)
+            overlap_end = min(event["end"], now)
+            if overlap_end <= overlap_start:
+                continue
+            count += 1
+            intervals.append((overlap_start, overlap_end))
+
+        busy_s = _merged_interval_seconds(intervals)
+        idle_s = max(0.0, window_s - busy_s)
+
+        suffix = str(int(window_s))
+        return {
+            f"forward_count_{suffix}s": count,
+            f"busy_ms_{suffix}s": _round_ms(busy_s),
+            f"busy_fraction_{suffix}s": round(min(1.0, busy_s / window_s), 4),
+            f"idle_gap_ms_{suffix}s": _round_ms(idle_s),
+        }
+
+    def _prune(self, now: float) -> None:
+        cutoff = now - self.window_seconds
+        while self.events and self.events[0]["end"] < cutoff:
+            self.events.popleft()
+
+
+def _round_ms(seconds: float) -> float:
+    return round(float(seconds) * 1000.0, 3)
+
+
+def _merged_interval_seconds(intervals: list[tuple[float, float]]) -> float:
+    if not intervals:
+        return 0.0
+
+    intervals = sorted(intervals)
+    total_s = 0.0
+    current_start, current_end = intervals[0]
+    for start, end in intervals[1:]:
+        if start <= current_end:
+            current_end = max(current_end, end)
+            continue
+        total_s += current_end - current_start
+        current_start, current_end = start, end
+
+    total_s += current_end - current_start
+    return total_s
+
+
 class SchedulerMetricsMixin:
     def init_metrics(self: Scheduler):
         self.last_gen_throughput: float = 0.0
@@ -27,6 +139,28 @@ class SchedulerMetricsMixin:
         self.cum_spec_accept_length = 0
         self.cum_spec_accept_count = 0
         self.total_retracted_reqs = 0
+        self.schedule_activity = ScheduleActivityTracker()
+
+    def record_schedule_activity(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        start: float,
+        end: float,
+    ) -> None:
+        tracker = getattr(self, "schedule_activity", None)
+        if tracker is None:
+            return
+        tracker.record_forward(
+            mode=_forward_mode_label(batch),
+            batch_size=batch.batch_size(),
+            new_tokens=_forward_new_tokens(batch),
+            start=start,
+            end=end,
+        )
+
+    def get_schedule_activity_state(self: Scheduler) -> dict:
+        tracker = getattr(self, "schedule_activity", None)
+        return tracker.snapshot() if tracker is not None else {}
 
     def log_prefill_stats(
         self: Scheduler,
@@ -150,3 +284,30 @@ class SchedulerMetricsMixin:
             msg += f"#cache_miss: {batch.cache_miss_count}"
 
         logger.info(msg)
+
+
+def _forward_mode_label(batch: ScheduleBatch) -> str:
+    forward_mode = getattr(batch, "forward_mode", None)
+    if forward_mode is None:
+        return "unknown"
+    if forward_mode.is_extend():
+        return "prefill"
+    if forward_mode.is_decode():
+        return "decode"
+    if forward_mode.is_idle():
+        return "idle"
+    if getattr(forward_mode, "is_dummy_first", lambda: False)():
+        return "dummy_first"
+    return str(forward_mode)
+
+
+def _forward_new_tokens(batch: ScheduleBatch) -> int:
+    forward_mode = getattr(batch, "forward_mode", None)
+    if forward_mode is not None and forward_mode.is_decode():
+        return batch.batch_size()
+
+    total = 0
+    for info in getattr(batch, "reqs_info", ()) or ():
+        for req in getattr(info, "reqs", ()) or ():
+            total += int(getattr(req, "extend_input_len", 0) or 0)
+    return total

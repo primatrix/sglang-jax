@@ -280,3 +280,316 @@ def _reset_singleton_for_test() -> None:
     global _GLOBAL_WRAPPER
     with _GLOBAL_LOCK:
         _GLOBAL_WRAPPER = None
+
+
+# =====================================================================
+# raiden data plane (Phase 0): tpu-raiden TransferEngine wrapper
+# =====================================================================
+#
+# The raiden path replaces the four ``jax.experimental.transfer`` calls above
+# with tpu-raiden's ``KVCacheManager`` (repurposed as a TransferEngine). Unlike
+# path-A — which registers per-request host/HBM *buffers* keyed by a crc32 uuid
+# and pulls them whole — raiden references the *device KV pool tensors directly*
+# and moves them at *block* granularity:
+#
+#   * producer(P): ``register_read(req_id, uuid, block_ids)`` marks the device
+#     blocks (= sgl-jax pages) of a request as readable.
+#   * consumer(D): ``start_read(req_id, uuid, remote_endpoint, remote_block_ids,
+#     local_block_ids)`` asynchronously pulls those blocks straight into D's
+#     device KV pool blocks (no Pallas write-back needed).
+#   * both sides poll ``poll_stats() -> (done_sending, done_recving,
+#     failed_recving)`` — lists of *req_id strings* (NOT uuids). Completion is
+#     ``req_id in done_*``; this replaces the ZMQ pull-done ack side channel.
+#
+# The control plane is raiden's own TCP socket (``local_control_port``); the
+# endpoint descriptors are read back from ``get_local_endpoints()`` and
+# advertised over bootstrap so D can reach P.
+
+_GLOBAL_RAIDEN_LOCK = threading.Lock()
+_GLOBAL_RAIDEN_WRAPPER: RaidenTransferWrapper | None = None
+
+
+class RaidenTransferWrapper:
+    """Process-level wrapper over tpu-raiden's ``KVCacheManager``.
+
+    One engine per process, constructed lazily in :meth:`start` from the
+    device KV pool's per-layer tensors. The engine *references* those tensors
+    (does not own them), so the pool must already be created and sharded before
+    ``start()`` is called.
+
+    Thread-safety: ``register_read`` / ``start_read`` / ``poll_stats`` are thin
+    pass-throughs to the compiled engine; the module keeps no per-request book
+    (raiden tracks state internally, keyed by ``req_id``). ``start()`` is
+    idempotent and guarded.
+    """
+
+    def __init__(
+        self,
+        host_ip: str,
+        control_port: int = 0,
+        *,
+        parallelism: int = 1,
+    ) -> None:
+        self._host_ip = host_ip
+        self._control_port = control_port
+        self._parallelism = max(1, int(parallelism))
+        self._init_lock = threading.Lock()
+        self._engine: Any | None = None
+        self._engine_full: Any | None = None
+        self._engine_swa: Any | None = None
+        self._started = False
+        self._is_hybrid_swa = False
+        self._endpoints: list[Any] | None = None
+        self._endpoints_swa: list[Any] | None = None
+        self._stats_lock = threading.Lock()
+        self._swa_send_req_ids: set[str] = set()
+        self._swa_recv_req_ids: set[str] = set()
+        self._done_sending_full: set[str] = set()
+        self._done_recving_full: set[str] = set()
+        self._done_sending_swa: set[str] = set()
+        self._done_recving_swa: set[str] = set()
+        self._failed_recving_full: set[str] = set()
+        self._failed_recving_swa: set[str] = set()
+
+    @property
+    def host_ip(self) -> str:
+        return self._host_ip
+
+    @property
+    def is_started(self) -> bool:
+        return self._started
+
+    @property
+    def is_hybrid_swa(self) -> bool:
+        return self._is_hybrid_swa
+
+    @property
+    def engine(self) -> Any:
+        return self._engine
+
+    @property
+    def engine_full(self) -> Any:
+        return self._engine_full or self._engine
+
+    @property
+    def engine_swa(self) -> Any | None:
+        return self._engine_swa
+
+    @property
+    def endpoints(self) -> list[Any] | None:
+        """raiden endpoint descriptors (from ``get_local_endpoints()``).
+
+        These are what D passes as ``remote_endpoint`` to ``start_read`` and
+        what P advertises via bootstrap. Available only after :meth:`start`.
+        """
+
+        return self._endpoints
+
+    @property
+    def endpoints_swa(self) -> list[Any] | None:
+        """SWA engine endpoint descriptors (hybrid SWA models only)."""
+        return self._endpoints_swa
+
+    def start(
+        self,
+        kv_caches: list[Any],
+        *,
+        max_blocks: int,
+        num_slots: int,
+        timeout_s: float = 120.0,
+        kv_caches_swa: list[Any] | None = None,
+    ) -> Any:
+        """Idempotent. Construct one (or two) KVCacheManager over ``kv_caches``.
+
+        ``kv_caches`` is the device full-attention pool's per-layer tensor list.
+        ``kv_caches_swa`` (optional) is the SWA pool's per-layer tensor list for
+        hybrid (SWA+full) models. When both are given, two independent raiden
+        engines are created — one per pool — because raiden broadcasts the same
+        block_ids to all layers in an engine, but full and SWA layers use
+        different page numbering.
+
+        ``max_blocks`` / ``num_slots`` / ``timeout_s`` apply to both engines.
+        """
+
+        if self._started:
+            return self._engine_full if self._is_hybrid_swa else self._engine
+        with self._init_lock:
+            if self._started:
+                return self._engine_full if self._is_hybrid_swa else self._engine
+            from tpu_raiden.api.jax.kv_cache_manager import KVCacheManager
+
+            if not kv_caches:
+                raise ValueError("RaidenTransferWrapper.start requires kv_caches")
+            self._is_hybrid_swa = bool(kv_caches_swa)
+            self._engine = KVCacheManager(
+                kv_caches=list(kv_caches),
+                local_control_port=self._control_port,
+                max_blocks=int(max_blocks),
+                num_slots=int(num_slots),
+                timeout_s=float(timeout_s),
+                parallelism=self._parallelism,
+                unsafe_skip_buffer_lock=True,
+            )
+            self._endpoints = self._engine.get_local_endpoints()
+            self._engine_full = self._engine  # alias for clarity in dual-engine mode
+
+            if self._is_hybrid_swa:
+                # SWA engine gets its own control port (0 = kernel picks).
+                self._engine_swa = KVCacheManager(
+                    kv_caches=list(kv_caches_swa),
+                    local_control_port=0,
+                    max_blocks=int(max_blocks),
+                    num_slots=int(num_slots),
+                    timeout_s=float(timeout_s),
+                    parallelism=self._parallelism,
+                    unsafe_skip_buffer_lock=True,
+                )
+                self._endpoints_swa = self._engine_swa.get_local_endpoints()
+            else:
+                self._engine_swa = None
+                self._endpoints_swa = None
+
+            self._started = True
+            logger.info(
+                "RaidenTransferWrapper started host=%s control_port=%s is_hybrid_swa=%s "
+                "endpoints=%s%s (jax_version=%s)",
+                self._host_ip,
+                self._control_port,
+                self._is_hybrid_swa,
+                self._endpoints,
+                f" endpoints_swa={self._endpoints_swa}" if self._is_hybrid_swa else "",
+                jax.__version__,
+            )
+        return self._engine_full if self._is_hybrid_swa else self._engine
+
+    def register_read(
+        self,
+        req_id: str,
+        uuid: int,
+        block_ids: list[int],
+        *,
+        swa_block_ids: list[int] | None = None,
+    ) -> bool:
+        """Producer: mark ``block_ids`` of ``req_id`` readable.
+
+        For hybrid SWA models, ``swa_block_ids`` registers the SWA-layer blocks
+        on the SWA engine under the same uuid (the engines are independent so
+        there is no uuid collision). Returns the full-engine result (SWA
+        registration is best-effort logged).
+        """
+
+        if not self._started:
+            raise RuntimeError("RaidenTransferWrapper.start() must be called before register_read()")
+        result = bool(self._engine_full.register_read(req_id, uuid, list(block_ids)))
+        if self._is_hybrid_swa and swa_block_ids:
+            self._engine_swa.register_read(req_id, uuid, list(swa_block_ids))
+            with self._stats_lock:
+                self._swa_send_req_ids.add(req_id)
+        return result
+
+    def start_read(
+        self,
+        req_id: str,
+        uuid: int,
+        remote_endpoint: Any,
+        remote_block_ids: list[int],
+        local_block_ids: list[int],
+        *,
+        parallelism: int = 1,
+        swa_remote_endpoint: Any = None,
+        swa_remote_block_ids: list[int] | None = None,
+        swa_local_block_ids: list[int] | None = None,
+    ) -> None:
+        """Consumer: asynchronously pull blocks from producer into local pool.
+
+        For hybrid SWA models, ``swa_*`` arguments drive a parallel start_read
+        on the SWA engine with the SWA-pool page indices.
+        """
+
+        if not self._started:
+            raise RuntimeError("RaidenTransferWrapper.start() must be called before start_read()")
+        self._engine_full.start_read(
+            req_id,
+            uuid,
+            remote_endpoint,
+            list(remote_block_ids),
+            list(local_block_ids),
+            parallelism,
+        )
+        if self._is_hybrid_swa and swa_remote_endpoint is not None:
+            self._engine_swa.start_read(
+                req_id,
+                uuid,
+                swa_remote_endpoint,
+                list(swa_remote_block_ids or []),
+                list(swa_local_block_ids or []),
+                parallelism,
+            )
+            if swa_remote_block_ids and swa_local_block_ids:
+                with self._stats_lock:
+                    self._swa_recv_req_ids.add(req_id)
+
+    def poll_stats(self) -> tuple[list[str], list[str], list[str]]:
+        """Non-blocking poll: ``(done_sending, done_recving, failed_recving)``
+        as lists of *req_id strings*. Aggregated across both engines when hybrid
+        SWA is active."""
+
+        if not self._started:
+            raise RuntimeError("RaidenTransferWrapper.start() must be called before poll_stats()")
+        done_s, done_r, failed_r = self._engine_full.poll_stats()
+        if not self._is_hybrid_swa:
+            return done_s, done_r, failed_r
+
+        ds, dr, fr = self._engine_swa.poll_stats()
+        with self._stats_lock:
+            # raiden reports a req_id once when it transitions to done. Keep a
+            # cumulative view here so a full-engine completion observed before
+            # the SWA-engine completion is not lost while waiting for SWA.
+            self._done_sending_full.update(done_s)
+            self._done_recving_full.update(done_r)
+            self._failed_recving_full.update(failed_r)
+            self._done_sending_swa.update(ds)
+            self._done_recving_swa.update(dr)
+            self._failed_recving_swa.update(fr)
+
+            done_s_both = sorted(
+                rid
+                for rid in self._done_sending_full
+                if rid not in self._swa_send_req_ids or rid in self._done_sending_swa
+            )
+            done_r_both = sorted(
+                rid
+                for rid in self._done_recving_full
+                if rid not in self._swa_recv_req_ids or rid in self._done_recving_swa
+            )
+            failed_r_any = sorted(self._failed_recving_full | self._failed_recving_swa)
+        return done_s_both, done_r_both, failed_r_any
+
+
+def get_or_create_raiden_wrapper(
+    host_ip: str,
+    control_port: int = 0,
+    *,
+    parallelism: int = 1,
+) -> RaidenTransferWrapper:
+    """Return the process-level raiden wrapper, creating it on first call.
+
+    Only stores config; the engine is constructed on :meth:`start` once the KV
+    pool tensors are available.
+    """
+
+    global _GLOBAL_RAIDEN_WRAPPER
+    with _GLOBAL_RAIDEN_LOCK:
+        if _GLOBAL_RAIDEN_WRAPPER is None:
+            _GLOBAL_RAIDEN_WRAPPER = RaidenTransferWrapper(
+                host_ip, control_port, parallelism=parallelism
+            )
+        return _GLOBAL_RAIDEN_WRAPPER
+
+
+def _reset_raiden_singleton_for_test() -> None:
+    """Test-only: clear the module-level raiden singleton between cases."""
+
+    global _GLOBAL_RAIDEN_WRAPPER
+    with _GLOBAL_RAIDEN_LOCK:
+        _GLOBAL_RAIDEN_WRAPPER = None

@@ -26,12 +26,25 @@ _PHASE_SPECS: dict[str, tuple[tuple[str, str, str], ...]] = {
         ("queue_entry", "forward_start", "queue"),
         ("forward_start", "forward_done", "forward"),
         ("forward_done", "transfer_start", "stage"),
+        ("transfer_start", "first_chunk_registered", "first_chunk_register_wait"),
+        ("first_chunk_registered", "last_chunk_registered", "chunk_register_span"),
+        ("last_chunk_registered", "sender_done", "sender_done_wait"),
+        ("sender_done", "transfer_done", "prefill_reap_gap"),
+        ("last_chunk_registered", "transfer_done", "transfer_tail"),
         ("transfer_start", "transfer_done", "transfer"),
         ("queue_entry", "transfer_done", "total"),
     ),
     "decode": (
         ("bootstrap_start", "bootstrap_done", "bootstrap"),
+        ("prealloc_entry", "metadata_ready", "metadata_wait"),
+        ("metadata_ready", "kv_alloc_done", "kv_alloc"),
+        ("kv_alloc_done", "receiver_init_done", "receiver_init"),
+        ("receiver_init_done", "transfer_entry", "transfer_setup"),
         ("prealloc_entry", "transfer_entry", "prealloc_wait"),
+        ("transfer_entry", "first_chunk_start_read", "first_chunk_wait"),
+        ("first_chunk_start_read", "last_chunk_start_read", "chunk_start_span"),
+        ("last_chunk_start_read", "done_recving", "transfer_tail"),
+        ("done_recving", "enqueue_decode", "enqueue_decode"),
         ("transfer_entry", "first_token", "kv_wait"),
         ("bootstrap_start", "first_token", "total"),
     ),
@@ -41,22 +54,37 @@ _PHASE_SPECS: dict[str, tuple[tuple[str, str, str], ...]] = {
 class TimeStats:
     """Lifecycle marks + derived phase durations for one request."""
 
-    __slots__ = ("role", "marks", "_clock")
+    __slots__ = ("role", "marks", "duration_totals", "counts", "_clock")
 
     def __init__(self, role: str, *, clock: Callable[[], float] = time.perf_counter) -> None:
         self.role = role
         self.marks: dict[str, float] = {}
+        self.duration_totals: dict[str, float] = {}
+        self.counts: dict[str, int] = {}
         self._clock = clock
 
-    def mark(self, name: str) -> None:
+    def mark(self, name: str, *, overwrite: bool = False) -> None:
         """Record the current time for ``name`` (first write wins)."""
-        if name not in self.marks:
+        if overwrite or name not in self.marks:
             self.marks[name] = self._clock()
+
+    def add_duration(self, name: str, seconds: float) -> None:
+        """Accumulate a repeatable duration, e.g. one entry per chunk."""
+        self.duration_totals[name] = self.duration_totals.get(name, 0.0) + max(
+            0.0,
+            float(seconds),
+        )
+        self.increment(name)
+
+    def increment(self, name: str, amount: int = 1) -> None:
+        self.counts[name] = self.counts.get(name, 0) + int(amount)
 
     def duration(self, start: str, end: str) -> float | None:
         a = self.marks.get(start)
         b = self.marks.get(end)
         if a is None or b is None:
+            return None
+        if b < a:
             return None
         return b - a
 
@@ -72,8 +100,18 @@ class TimeStats:
 
 def format_time_stats(ts: TimeStats, *, req_id: str) -> str:
     phases = ts.phases()
-    if phases:
-        body = " ".join(f"{label}={dur * 1000:.1f}ms" for label, dur in phases.items())
+    fields = [f"{label}={dur * 1000:.1f}ms" for label, dur in phases.items()]
+    for label, total in ts.duration_totals.items():
+        count = max(1, ts.counts.get(label, 0))
+        fields.append(f"{label}_sum={total * 1000:.1f}ms")
+        fields.append(f"{label}_count={count}")
+        fields.append(f"{label}_avg={(total / count) * 1000:.1f}ms")
+    for label, count in ts.counts.items():
+        if label not in ts.duration_totals:
+            fields.append(f"{label}_count={count}")
+
+    if fields:
+        body = " ".join(fields)
     else:
         # Unknown role or no derivable phases: fall back to raw marks so the
         # line is still informative.
