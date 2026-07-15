@@ -123,6 +123,38 @@ def _plan_sparsecore_pipeline(
     return num_cores, num_workers, num_windows // num_workers
 
 
+def resolve_sparsecore_pipeline_gather_block(
+    requested: int | str,
+    *,
+    batch_size: int,
+    padded_selected: int,
+    cache_width: int,
+    reported_cores: int,
+    num_subcores: int,
+) -> int:
+    """Resolve the pipeline gather window from static shape and topology."""
+    if requested != "auto":
+        _validate_gather_block(requested)
+        return requested
+    if (
+        batch_size == 1
+        and padded_selected == 2048
+        and cache_width == 640
+        and _active_sparsecore_cores(reported_cores) >= 2
+        and num_subcores == 16
+    ):
+        candidate = 64
+        _plan_sparsecore_pipeline(
+            batch_size=batch_size,
+            padded_selected=padded_selected,
+            gather_block=candidate,
+            available_cores=_active_sparsecore_cores(reported_cores),
+            num_subcores=num_subcores,
+        )
+        return candidate
+    return _DEFAULT_GATHER_BLOCK
+
+
 def _sparsecore_gather_kernel(cache_hbm_ref, slot_indices_ref, output_vmem_ref):
     """Gather major-dimension cache rows with one SparseCore indirect DMA."""
     pltpu.sync_copy(cache_hbm_ref.at[slot_indices_ref], output_vmem_ref)

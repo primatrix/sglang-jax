@@ -14,6 +14,7 @@ from sgl_jax.srt.kernels.mla.dsa.gather import (
     materialize_selected_kv_sparsecore_pipeline,
     materialize_selected_kv_xla,
     prepare_safe_topk_slots,
+    resolve_sparsecore_pipeline_gather_block,
 )
 from sgl_jax.srt.kernels.mla.dsa.kernel import dsa_decode_mla_attention
 from sgl_jax.srt.kernels.mla.dsa.reference import (
@@ -24,6 +25,52 @@ from sgl_jax.srt.kernels.mla.dsa.reference import (
 
 
 class TestDSASelectedKVGather(unittest.TestCase):
+    def test_auto_pipeline_uses_64_rows_only_for_single_glm_request(self):
+        self.assertEqual(
+            resolve_sparsecore_pipeline_gather_block(
+                "auto",
+                batch_size=1,
+                padded_selected=2048,
+                cache_width=640,
+                reported_cores=4,
+                num_subcores=16,
+            ),
+            64,
+        )
+        self.assertEqual(
+            resolve_sparsecore_pipeline_gather_block(
+                "auto",
+                batch_size=2,
+                padded_selected=2048,
+                cache_width=640,
+                reported_cores=4,
+                num_subcores=16,
+            ),
+            128,
+        )
+        self.assertEqual(
+            resolve_sparsecore_pipeline_gather_block(
+                "auto",
+                batch_size=1,
+                padded_selected=512,
+                cache_width=640,
+                reported_cores=4,
+                num_subcores=16,
+            ),
+            128,
+        )
+        self.assertEqual(
+            resolve_sparsecore_pipeline_gather_block(
+                128,
+                batch_size=1,
+                padded_selected=2048,
+                cache_width=640,
+                reported_cores=4,
+                num_subcores=16,
+            ),
+            128,
+        )
+
     def test_sparsecore_pipeline_plan_uses_each_worker_once(self):
         self.assertEqual(_active_sparsecore_cores(4), 2)
         self.assertEqual(
