@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from benchmark.kernels.mla.bench_dsa_decode_mla import (
+    GLM_ATTENTION_SCALE,
     dense_full_context_mla_attention,
     make_benchmark_inputs,
 )
@@ -28,12 +29,15 @@ class TestDSADecodeMLABenchmarkInputs(unittest.TestCase):
 
         self.assertEqual(inputs.ql_nope.shape, (2, 3, 128))
         self.assertEqual(inputs.q_pe.shape, (2, 3, 64))
-        self.assertEqual(inputs.cache_kv.shape, (2, 16, 1, 256))
+        self.assertEqual(inputs.cache_kv.shape, (2, 8, 2, 256))
         self.assertEqual(inputs.topk_slots.shape, (2, 8))
         self.assertTrue(np.array_equal(inputs.valid_counts, np.array([8, 8], dtype=np.int32)))
         self.assertTrue(np.all(inputs.topk_slots >= 0))
         self.assertTrue(np.all(inputs.topk_slots < 32))
         self.assertFalse(np.array_equal(inputs.topk_slots[0], np.sort(inputs.topk_slots[0])))
+
+    def test_glm_benchmark_uses_unabsorbed_qk_scale(self):
+        self.assertEqual(GLM_ATTENTION_SCALE, 256**-0.5)
 
     def test_sorted_fixture_has_the_same_selected_slot_multiset(self):
         common_kwargs = dict(

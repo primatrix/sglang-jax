@@ -18,7 +18,7 @@ class TestDSADecodeMLAReference(unittest.TestCase):
 
     def setUp(self):
         rng = np.random.default_rng(0)
-        self.cache_kv = rng.standard_normal((3, 8, 1, 256), dtype=np.float32)
+        self.cache_kv = rng.standard_normal((3, 4, 2, 256), dtype=np.float32)
         self.ql_nope = rng.standard_normal((2, 2, 128), dtype=np.float32)
         self.q_pe = rng.standard_normal((2, 2, 128), dtype=np.float32)
         self.selected_slots = np.array(
@@ -162,6 +162,41 @@ class TestDSADecodeMLAReference(unittest.TestCase):
 
         np.testing.assert_array_equal(reference, dense)
 
+    def test_reference_decodes_production_bfloat16_packing_two(self):
+        """Physical slots address page, packed row, then BF16 lane."""
+        page_size = 8
+        cache_kv = np.zeros((2, page_size // 2, 2, 256), dtype=np.float32)
+        for physical_slot in range(2 * page_size):
+            page, offset = divmod(physical_slot, page_size)
+            packed_row, lane = divmod(offset, 2)
+            cache_kv[page, packed_row, lane, :128] = physical_slot
+
+        ql_nope = np.zeros((1, 1, 128), dtype=np.float32)
+        q_pe = np.zeros((1, 1, 128), dtype=np.float32)
+        selected_slots = np.array([[1, 6, 7, 8, 15]], dtype=np.int32)
+        valid_counts = np.array([5], dtype=np.int32)
+
+        actual = reference_dsa_decode_mla_attention(
+            ql_nope,
+            q_pe,
+            cache_kv,
+            selected_slots,
+            valid_counts,
+            sm_scale=256**-0.5,
+        )
+        dense = dense_selected_mla_attention(
+            ql_nope,
+            q_pe,
+            cache_kv,
+            selected_slots,
+            valid_counts,
+            sm_scale=256**-0.5,
+        )
+
+        expected_value = np.mean(selected_slots, dtype=np.float32)
+        np.testing.assert_array_equal(actual, dense)
+        np.testing.assert_array_equal(actual, np.full_like(actual, expected_value))
+
 
 class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
     """Exercise the Pallas DSA decode kernel in local interpret mode."""
@@ -195,9 +230,11 @@ class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
 
         for page_size in (8, 16, 32, 64):
             with self.subTest(page_size=page_size):
-                cache_kv = rng.standard_normal((2, page_size, 1, 256), dtype=np.float32)
+                cache_kv = rng.standard_normal(
+                    (2, page_size // 2, 2, 256), dtype=np.float32
+                )
                 # A padded -1 would select this large value if it were read.
-                cache_kv[-1, -1, 0] = 10_000.0
+                cache_kv[-1, -1, -1] = 10_000.0
                 topk_slots = np.array(
                     [
                         [page_size + 1, 0, page_size + 1, page_size - 1, -1],
@@ -257,7 +294,7 @@ class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
             rng.standard_normal((1, 1, 128), dtype=np.float32), dtype=jnp.bfloat16
         )
         cache_kv = jnp.asarray(
-            rng.standard_normal((1, 2048, 1, 256), dtype=np.float32), dtype=jnp.bfloat16
+            rng.standard_normal((1, 1024, 2, 256), dtype=np.float32), dtype=jnp.bfloat16
         )
         topk_slots = jnp.asarray((np.arange(2048, dtype=np.int32) * 17) % 2048)[None, :]
         valid_counts = jnp.asarray([2048], dtype=jnp.int32)
@@ -381,7 +418,7 @@ class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
         padded_cache_width = 512 + 128
         cache_kv = jnp.asarray(
             rng.standard_normal(
-                (top_k // page_size, page_size, 1, padded_cache_width),
+                (top_k // page_size, page_size // 2, 2, padded_cache_width),
                 dtype=np.float32,
             ),
             dtype=jnp.bfloat16,
@@ -405,7 +442,7 @@ class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
             cache_kv,
             topk_slots,
             valid_counts,
-            sm_scale=(latent_dim + rope_dim) ** -0.5,
+            sm_scale=256**-0.5,
             interpret=False,
         )
         expected = reference_dsa_decode_mla_attention(
@@ -414,7 +451,7 @@ class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
             cache_kv,
             topk_slots,
             valid_counts,
-            sm_scale=(latent_dim + rope_dim) ** -0.5,
+            sm_scale=256**-0.5,
         )
 
         self.assertTrue(np.isfinite(np.asarray(actual)).all())
