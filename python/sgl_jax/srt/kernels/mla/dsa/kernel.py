@@ -254,6 +254,8 @@ def dsa_decode_mla_attention(
         _DEFAULT_GATHER_BLOCK if gather_block == "auto" else gather_block
     )
     if resolved_gather == "sparsecore-pipeline":
+        if jax.default_backend() != "tpu":
+            raise RuntimeError("SparseCore selected KV materialization requires a TPU")
         sparsecore_info = pltpu.get_tpu_info().sparse_core
         if sparsecore_info is None:
             raise RuntimeError("The current TPU does not expose SparseCores")

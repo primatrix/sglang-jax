@@ -639,6 +639,24 @@ class TestDSADecodeMLAReference(unittest.TestCase):
 class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
     """Exercise the Pallas DSA decode kernel in local interpret mode."""
 
+    @unittest.skipUnless(jax.default_backend() == "cpu", "CPU regression test")
+    def test_pipeline_requires_tpu_before_querying_topology(self):
+        ql_nope, q_pe, cache_kv, topk_slots, valid_counts = self._inputs()
+
+        with self.assertRaisesRegex(
+            RuntimeError, "SparseCore selected KV materialization requires a TPU"
+        ):
+            dsa_decode_mla_attention(
+                jnp.asarray(ql_nope, dtype=jnp.bfloat16),
+                jnp.asarray(q_pe, dtype=jnp.bfloat16),
+                jnp.asarray(cache_kv, dtype=jnp.bfloat16),
+                jnp.asarray(topk_slots),
+                jnp.asarray(valid_counts),
+                sm_scale=0.25,
+                gather_impl="sparsecore-pipeline",
+                gather_block="auto",
+            )
+
     def test_interpret_matches_reference(self):
         ql_nope, q_pe, cache_kv, topk_slots, valid_counts = self._inputs()
         ql_nope = jnp.asarray(ql_nope, dtype=jnp.bfloat16)
