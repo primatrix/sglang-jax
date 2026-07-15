@@ -72,7 +72,7 @@ warm-ups and 200 device-timed iterations:
 | implicit `sparsecore-pipeline` (128 rows) | 1.1989 | 1.2370 |
 | explicit `sparsecore-pipeline-64` | 1.2039 | 1.2301 |
 | explicit `sparsecore-pipeline-128` | 1.2082 | 1.2438 |
-| `xla-gather` (gather-only diagnostic) | 0.2001 | not recorded |
+| `xla-gather` (composed selected-MLA variant) | 0.2001 | 0.6374 |
 
 The small, mixed differences between the three pipeline readings do not show a
 robust 64-row win: explicit 64 is slower at the median than implicit 128 and

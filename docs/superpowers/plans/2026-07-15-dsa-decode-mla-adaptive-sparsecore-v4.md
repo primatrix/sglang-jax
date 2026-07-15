@@ -24,7 +24,7 @@ iterations:
 | implicit `sparsecore-pipeline` (128 rows) | 1.1989 | 1.2370 |
 | explicit `sparsecore-pipeline-64` | 1.2039 | 1.2301 |
 | explicit `sparsecore-pipeline-128` | 1.2082 | 1.2438 |
-| `xla-gather` (gather-only diagnostic) | 0.2001 | not recorded |
+| `xla-gather` (composed selected-MLA variant) | 0.2001 | 0.6374 |
 
 Adaptive 64 is rejected for automatic dispatch: its small, mixed deltas do not
 show a robust or meaningful improvement over the 128-row policy. The
