@@ -1,4 +1,4 @@
-name: dsa-selected-attention-v7x8-20260715-r1
+name: dsa-composed-v7x8-20260715-r1
 exp_type: correctness
 cluster_name: tpuv7x-64-node
 artifact_type: GCS
@@ -48,7 +48,8 @@ role_to_task_spec:
       PY
 
       python -m unittest -v \
-        sgl_jax.test.kernels.test_dsa_decode_mla.TestDSASelectedMLAAttentionTPU.test_tpu_selected_attention_small_aligned_case \
-        sgl_jax.test.kernels.test_dsa_decode_mla.TestDSASelectedMLAAttentionTPU.test_tpu_selected_attention_glm_shape \
-        2>&1 | tee "${RESULTS}/selected_attention_correctness.log"
+        sgl_jax.test.kernels.test_dsa_decode_mla.TestDSADecodeMLAPallas.test_tpu_non_interpret_matches_reference_with_dynamic_slots \
+        sgl_jax.test.kernels.test_dsa_decode_mla.TestDSADecodeMLAPallas.test_tpu_non_interpret_glm_shape_2048_matches_reference \
+        sgl_jax.test.kernels.test_dsa_decode_mla.TestDSADecodeMLAPallas.test_tpu_composed_batch_32_matches_reference \
+        2>&1 | tee "${RESULTS}/composed_correctness.log"
       '

@@ -520,6 +520,7 @@ class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
             jnp.asarray(valid_counts),
             sm_scale=0.25,
             interpret=True,
+            gather_impl="xla",
         )
         expected = reference_dsa_decode_mla_attention(
             ql_nope, q_pe, cache_kv, topk_slots, valid_counts, sm_scale=0.25
@@ -682,6 +683,20 @@ class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 dsa_decode_mla_attention(*inputs, sm_scale=0.25, interpret=True, validate=True)
 
+    def test_invalid_gather_implementation_is_rejected(self):
+        ql_nope, q_pe, cache_kv, topk_slots, valid_counts = self._inputs()
+        with self.assertRaisesRegex(ValueError, "gather_impl"):
+            dsa_decode_mla_attention(
+                ql_nope,
+                q_pe,
+                cache_kv,
+                topk_slots,
+                valid_counts,
+                sm_scale=0.25,
+                interpret=True,
+                gather_impl="unknown",
+            )
+
     def test_tpu_non_interpret_matches_reference_with_dynamic_slots(self):
         if jax.default_backend() != "tpu":
             self.skipTest("interpret=False Pallas lowering requires a TPU")
@@ -760,6 +775,65 @@ class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
         )
 
         self.assertTrue(np.isfinite(np.asarray(actual)).all())
+        np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=1e-2)
+
+    def test_tpu_composed_batch_32_matches_reference(self):
+        if jax.default_backend() != "tpu":
+            self.skipTest("interpret=False Pallas lowering requires a TPU")
+
+        rng = np.random.default_rng(5)
+        batch_size = 32
+        num_heads = 8
+        latent_dim = rope_dim = 128
+        top_k = 128
+        page_size = 128
+        context_length = 256
+        cache_kv = jnp.asarray(
+            rng.standard_normal(
+                (context_length // page_size, page_size // 2, 2, 256),
+                dtype=np.float32,
+            ),
+            dtype=jnp.bfloat16,
+        )
+        ql_nope = jnp.asarray(
+            rng.standard_normal(
+                (batch_size, num_heads, latent_dim), dtype=np.float32
+            ),
+            dtype=jnp.bfloat16,
+        )
+        q_pe = jnp.asarray(
+            rng.standard_normal(
+                (batch_size, num_heads, rope_dim), dtype=np.float32
+            ),
+            dtype=jnp.bfloat16,
+        )
+        base_slots = np.arange(top_k, dtype=np.int32) * 2
+        topk_slots = jnp.asarray(
+            np.stack(
+                [np.roll(base_slots, batch_index) for batch_index in range(batch_size)]
+            ),
+            dtype=jnp.int32,
+        )
+        valid_counts = jnp.full((batch_size,), top_k, dtype=jnp.int32)
+
+        actual = dsa_decode_mla_attention(
+            ql_nope,
+            q_pe,
+            cache_kv,
+            topk_slots,
+            valid_counts,
+            sm_scale=256**-0.5,
+            interpret=False,
+        )
+        expected = reference_dsa_decode_mla_attention(
+            ql_nope,
+            q_pe,
+            cache_kv,
+            np.asarray(topk_slots),
+            np.asarray(valid_counts),
+            sm_scale=256**-0.5,
+        )
+
         np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=1e-2)
 
     def test_non_interpret_requires_tpu_on_cpu(self):
