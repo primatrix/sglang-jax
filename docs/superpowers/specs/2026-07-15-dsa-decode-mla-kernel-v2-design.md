@@ -137,12 +137,13 @@ Use a static gather block `G`, initially 128:
 - grid: `(B, ceil(K / G))`;
 - slots input block: `[G]` in VMEM;
 - cache source: `[capacity, width]` in HBM;
-- indirect DMA target: `[G, width]` in VMEM;
-- output block: `[G, width]` in HBM.
+- output block and indirect DMA target: `[G, width]` in VMEM.
 
 Each program performs one indirect HBM-to-VMEM gather using the `G` physical
-slot offsets, then one regular VMEM-to-HBM copy. `K` is padded to `G`; `width`
-is already a multiple of 128. The output is `[B, Kpad, width]`.
+slot offsets. The Pallas block pipeline commits that VMEM output block to the
+global HBM result; the kernel does not issue a redundant explicit second copy.
+`K` is padded to `G`; `width` is already a multiple of 128. The output is
+`[B, Kpad, width]`.
 
 The stage uses
 `CompilerParams(kernel_type=KernelType.SC_VECTOR_SUBCORE)`. JAX's SparseCore
