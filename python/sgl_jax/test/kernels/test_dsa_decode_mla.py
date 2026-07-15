@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.kernels.mla.dsa.gather import (
+    materialize_selected_kv_sparsecore,
     materialize_selected_kv_xla,
     prepare_safe_topk_slots,
 )
@@ -87,6 +88,57 @@ class TestDSASelectedKVGather(unittest.TestCase):
 
         expected = cache_kv.reshape(-1, 128)[jnp.asarray([15, 0, 0, 0, 0, 0, 0, 0])]
         np.testing.assert_array_equal(np.asarray(actual[0]), np.asarray(expected))
+
+
+@unittest.skipUnless(
+    jax.default_backend() == "tpu", "SparseCore Pallas lowering requires a TPU"
+)
+class TestDSASparseCoreGather(unittest.TestCase):
+    def test_sparsecore_gather_matches_xla_for_packed_bfloat16_cache(self):
+        rng = np.random.default_rng(10)
+        cache_kv = jnp.asarray(
+            rng.standard_normal((3, 32, 2, 128), dtype=np.float32),
+            dtype=jnp.bfloat16,
+        )
+        topk_slots = jnp.asarray(
+            [[129, 0, 63, 129, -1], [191, 64, -1, -1, -1]],
+            dtype=jnp.int32,
+        )
+        valid_counts = jnp.asarray([4, 2], dtype=jnp.int32)
+
+        expected = materialize_selected_kv_xla(
+            cache_kv, topk_slots, valid_counts, gather_block=128
+        )
+        actual = materialize_selected_kv_sparsecore(
+            cache_kv, topk_slots, valid_counts, gather_block=128
+        )
+
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+    def test_sparsecore_gather_matches_xla_at_glm_width_and_topk(self):
+        rng = np.random.default_rng(11)
+        page_size = 128
+        context_length = 4096
+        top_k = 2048
+        cache_kv = jnp.asarray(
+            rng.standard_normal(
+                (context_length // page_size, page_size // 2, 2, 640),
+                dtype=np.float32,
+            ),
+            dtype=jnp.bfloat16,
+        )
+        slots = (np.arange(top_k, dtype=np.int32) * 1543) % context_length
+        topk_slots = jnp.asarray(slots[None, :], dtype=jnp.int32)
+        valid_counts = jnp.asarray([top_k], dtype=jnp.int32)
+
+        expected = materialize_selected_kv_xla(
+            cache_kv, topk_slots, valid_counts, gather_block=128
+        )
+        actual = materialize_selected_kv_sparsecore(
+            cache_kv, topk_slots, valid_counts, gather_block=128
+        )
+
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
 class TestDSADecodeMLAReference(unittest.TestCase):

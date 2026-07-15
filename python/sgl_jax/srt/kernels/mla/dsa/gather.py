@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 _DEFAULT_GATHER_BLOCK = 128
 _MIN_SC_VECTOR_WIDTH = 8
@@ -65,4 +67,82 @@ def materialize_selected_kv_xla(
     return logical_cache[safe_slots]
 
 
-__all__ = ["materialize_selected_kv_xla", "prepare_safe_topk_slots"]
+def _sparsecore_gather_kernel(cache_hbm_ref, slot_indices_ref, output_vmem_ref):
+    """Gather major-dimension cache rows with one SparseCore indirect DMA."""
+    pltpu.sync_copy(cache_hbm_ref.at[slot_indices_ref], output_vmem_ref)
+
+
+def materialize_selected_kv_sparsecore_unchecked(
+    cache_kv: jax.Array,
+    safe_topk_slots: jax.Array,
+    *,
+    gather_block: int = _DEFAULT_GATHER_BLOCK,
+) -> jax.Array:
+    """Run SparseCore gather on already-safe, gather-block-padded slots."""
+    _validate_gather_block(gather_block)
+    if jax.default_backend() != "tpu":
+        raise RuntimeError("SparseCore selected KV materialization requires a TPU")
+
+    cache_kv = jnp.asarray(cache_kv)
+    safe_topk_slots = jnp.asarray(safe_topk_slots, dtype=jnp.int32)
+    batch_size, padded_selected = safe_topk_slots.shape
+    if padded_selected % gather_block:
+        raise ValueError("safe_topk_slots width must be divisible by gather_block")
+
+    cache_width = cache_kv.shape[-1]
+    logical_cache = cache_kv.reshape((-1, cache_width))
+    out_shape = jax.ShapeDtypeStruct(
+        (batch_size, padded_selected, cache_width), cache_kv.dtype
+    )
+
+    gather_call = pl.pallas_call(
+        _sparsecore_gather_kernel,
+        out_shape=out_shape,
+        grid=(batch_size, padded_selected // gather_block),
+        in_specs=(
+            pl.BlockSpec(memory_space=pltpu.HBM),
+            pl.BlockSpec(
+                (None, gather_block),
+                lambda batch_index, block_index: (batch_index, block_index),
+                memory_space=pltpu.VMEM,
+            ),
+        ),
+        out_specs=pl.BlockSpec(
+            (None, gather_block, cache_width),
+            lambda batch_index, block_index: (batch_index, block_index, 0),
+            memory_space=pltpu.VMEM,
+        ),
+        compiler_params=pltpu.CompilerParams(
+            kernel_type=pltpu.KernelType.SC_VECTOR_SUBCORE
+        ),
+        name="dsa-selected-kv-sparsecore-gather",
+    )
+    compiled_gather = jax.jit(
+        gather_call,
+        compiler_options={"xla_tpu_use_tc_device_shape_on_sc": "false"},
+    )
+    return compiled_gather(logical_cache, safe_topk_slots)
+
+
+def materialize_selected_kv_sparsecore(
+    cache_kv: jax.Array,
+    topk_slots: jax.Array,
+    valid_counts: jax.Array,
+    *,
+    gather_block: int = _DEFAULT_GATHER_BLOCK,
+) -> jax.Array:
+    """Make selected slots safe, then materialize them with SparseCore."""
+    safe_slots = prepare_safe_topk_slots(
+        topk_slots, valid_counts, gather_block=gather_block
+    )
+    return materialize_selected_kv_sparsecore_unchecked(
+        cache_kv, safe_slots, gather_block=gather_block
+    )
+
+
+__all__ = [
+    "materialize_selected_kv_sparsecore",
+    "materialize_selected_kv_sparsecore_unchecked",
+    "materialize_selected_kv_xla",
+    "prepare_safe_topk_slots",
+]

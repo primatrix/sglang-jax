@@ -1,5 +1,5 @@
-name: dsa-decode-mla-v7x8-20260714-r5
-exp_type: profiling
+name: dsa-sc-gather-v7x8-20260715-r1
+exp_type: correctness
 cluster_name: tpuv7x-64-node
 artifact_type: GCS
 tags:
@@ -48,20 +48,7 @@ role_to_task_spec:
       PY
 
       python -m unittest -v \
-        sgl_jax.test.kernels.test_dsa_decode_mla.TestDSADecodeMLAPallas.test_tpu_non_interpret_matches_reference_with_dynamic_slots \
-        sgl_jax.test.kernels.test_dsa_decode_mla.TestDSADecodeMLAPallas.test_tpu_non_interpret_glm_shape_2048_matches_reference \
-        | tee "${RESULTS}/correctness.log"
-
-      python benchmark/kernels/mla/bench_dsa_decode_mla.py \
-        --batch-size 1 --context-length 160000 --top-k 2048 \
-        --warmup-iters 50 --iters 200 --profile --profile-iters 3 \
-        --profile-dir "${RESULTS}/profile_b1_ctx160k" \
-        --output "${RESULTS}/bench_b1_ctx160k.json" \
-        | tee "${RESULTS}/bench_b1_ctx160k.log"
-      python benchmark/kernels/mla/bench_dsa_decode_mla.py \
-        --batch-size 32 --context-length 32000 --top-k 2048 \
-        --warmup-iters 50 --iters 200 --profile --profile-iters 3 \
-        --profile-dir "${RESULTS}/profile_b32_ctx32k" \
-        --output "${RESULTS}/bench_b32_ctx32k.json" \
-        | tee "${RESULTS}/bench_b32_ctx32k.log"
+        sgl_jax.test.kernels.test_dsa_decode_mla.TestDSASparseCoreGather.test_sparsecore_gather_matches_xla_for_packed_bfloat16_cache \
+        sgl_jax.test.kernels.test_dsa_decode_mla.TestDSASparseCoreGather.test_sparsecore_gather_matches_xla_at_glm_width_and_topk \
+        2>&1 | tee "${RESULTS}/sparsecore_gather_correctness.log"
       '
