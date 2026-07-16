@@ -1,0 +1,5 @@
+project-includes = [
+    "python/**/*.py",
+    "python/**/*.ipynb",
+]
+search-path = ["python"]

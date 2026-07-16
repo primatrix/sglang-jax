@@ -179,7 +179,8 @@ class MultimodalDataItem:
     modality: Modality
     hash: int | None = None
     pad_value: int | None = None
-    offsets: list | None = None
+    # Inclusive token-index ranges of multimodal placeholders in input_ids.
+    placeholder_ranges: list[tuple[int, int]] | None = None
 
     # Raw features returned by processor, e.g. pixel_values or audio_features
     feature: jax.Array | np.ndarray | None = None
@@ -288,9 +289,9 @@ class MultimodalDataItem:
                     [jax.device_put(self.feature), jax.device_put(other.feature)], axis=0
                 )
 
-        # Merge offsets
-        if self.offsets is not None and other.offsets is not None:
-            self.offsets += other.offsets
+        # Merge placeholder ranges
+        if self.placeholder_ranges is not None and other.placeholder_ranges is not None:
+            self.placeholder_ranges += other.placeholder_ranges
 
         # Update hash
         self.hash = hash((self.hash, other.hash))

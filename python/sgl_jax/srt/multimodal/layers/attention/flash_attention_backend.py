@@ -54,21 +54,21 @@ class FlashAttentionBackend(AttentionBackend):
 
 
 class VisionFlashAttentionBackend(AttentionBackend):
-    """DP-only segment-flash attention for the in-model VLM ViT (encode path).
+    """Batch-sharded segment-flash attention for the in-model VLM ViT.
 
     Kept SEPARATE from ``FlashAttentionBackend`` (which is head-TP, used by
     ``USPAttention`` for Flux / Wan / Qwen3-Omni audio) so that class stays
-    untouched. Here the ViT is DP-only with replicated weights:
-    batch on ``data``; heads / T / head_dim are NOT sharded on ``tensor``; and
-    ``segment_ids`` is per-image, riding the batch (``data``) axis rather than
-    being replicated. Wraps the SAME pallas segment-flash kernel as
+    untouched. Here the ViT weights are replicated while the vision batch is
+    sharded over both mesh axes; heads / T / head_dim remain unsharded. Wraps
+    the SAME pallas segment-flash kernel as
     ``FlashAttentionBackend`` -- only the shard specs differ. Reusable across
     in-model VLM ViTs (Qwen2.5-VL, future Qwen3-Omni, ...).
     """
 
     def __init__(self, mesh, sm_scale=1.0, causal=False, vmem_limit_bytes=128 * 1024 * 1024):
-        qkv_spec = P("data", None, None, None)  # dp on data; no head-TP
-        seg_spec = P("data", None)  # per-image segment ids ride the batch axis
+        batch_axis = ("data", "tensor") if "tensor" in mesh.axis_names else "data"
+        qkv_spec = P(batch_axis, None, None, None)
+        seg_spec = P(batch_axis, None)
         in_specs = (qkv_spec, qkv_spec, qkv_spec, seg_spec)
         out_specs = qkv_spec
 

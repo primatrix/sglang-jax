@@ -1,9 +1,10 @@
 """Qwen2.5-VL concrete vision metadata and builder.
 
 Split out of the main model file ``models/qwen2_5_vl.py`` but still Qwen2.5-VL
-arch code. This module registers its builder at import time; the main model
-file imports it at top level, so ``ModelRegistry`` loading Qwen2.5-VL triggers
-the registration (see ``multimodal/common/vision_metadata.py``). The main model
+arch code. The main model file imports and calls
+``register_qwen25vl_vision_encoder()`` at top level, which registers a
+:class:`Qwen25VLVisionPlugin` with ``multimodal/common/vision_plan_builder`` so
+that ``ModelRegistry`` loading Qwen2.5-VL wires in the encoder. The main model
 file only consumes the produced ``meta`` in its ViT encode body.
 """
 
@@ -13,10 +14,8 @@ from typing import Any
 import numpy as np
 from jax.tree_util import register_pytree_node_class
 
-from sgl_jax.srt.multimodal.common.modality_enum import MultimodalDataItem
-from sgl_jax.srt.multimodal.common.vision_metadata import (
-    register_vision_metadata_builder,
-)
+from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
+from sgl_jax.srt.multimodal.common.vision_plan_builder import register_vision_encoder
 
 
 @register_pytree_node_class
@@ -43,6 +42,29 @@ class Qwen25VLVisionMetadata:
             self.cu_image_seqlens,
         )
         aux_data = {}  # static sizes/roles may live here; runtime does not depend on it
+        return (children, aux_data)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(*children)
+
+
+@register_pytree_node_class
+@dataclass
+class Qwen25VLVisionEncodeInputs:
+    """Qwen2.5-VL ViT encode inputs for one DP encode round.
+
+    Common code treats this as an opaque pytree. The Qwen ViT encode body reads
+    the concrete fields ``patches`` / ``valid`` / ``meta``.
+    """
+
+    patches: Any
+    valid: Any
+    meta: Any
+
+    def tree_flatten(self):
+        children = (self.patches, self.valid, self.meta)
+        aux_data = {}
         return (children, aux_data)
 
     @classmethod
@@ -78,7 +100,7 @@ def _item_grid_thw(item: MultimodalDataItem) -> tuple:
 
 
 def _placeholder_rows(item) -> int:
-    return sum(int(end) - int(start) + 1 for start, end in item.offsets or [])
+    return sum(int(end) - int(start) + 1 for start, end in item.placeholder_ranges or [])
 
 
 class Qwen25VLVisionMetadataBuilder:
@@ -360,6 +382,23 @@ class Qwen25VLVisionMetadataBuilder:
         )
 
 
-register_vision_metadata_builder(
-    "Qwen2_5_VLForConditionalGeneration", Qwen25VLVisionMetadataBuilder
-)
+class Qwen25VLVisionPlugin:
+    """Wire the Qwen2.5-VL metadata builder into the generic vision framework."""
+
+    output_modality = Modality.IMAGE
+
+    def __init__(self, model_config):
+        self._metadata = Qwen25VLVisionMetadataBuilder(model_config)
+
+    def get_metadata(self, items) -> Qwen25VLVisionMetadata:
+        return self._metadata.get_metadata(items)
+
+    def stack_metadata(self, lane_metadata, patch_k) -> Qwen25VLVisionMetadata:
+        return self._metadata.stack_metadata(lane_metadata, patch_k)
+
+    def make_encode_inputs(self, patches, valid, meta) -> Qwen25VLVisionEncodeInputs:
+        return Qwen25VLVisionEncodeInputs(patches, valid, meta)
+
+
+def register_qwen25vl_vision_encoder() -> None:
+    register_vision_encoder("Qwen2_5_VLForConditionalGeneration", Qwen25VLVisionPlugin)

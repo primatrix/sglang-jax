@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 GRAMMAR_BACKEND_CHOICES = ["llguidance", "none"]
 _REJECTED_PD_HOST_ALIASES = frozenset({"localhost"})
+_MULTIMODAL_CHUNKED_PREFILL_ARCHITECTURES = frozenset({"Qwen2_5_VLForConditionalGeneration"})
 
 
 def apply_multimodal_model_defaults(server_args, model_config) -> None:
@@ -41,7 +42,12 @@ def apply_multimodal_model_defaults(server_args, model_config) -> None:
     if not server_args.disable_overlap_schedule:
         logger.info("Multimodal model detected, disabling overlap schedule")
         server_args.disable_overlap_schedule = True
-    if server_args.chunked_prefill_size is None or server_args.chunked_prefill_size > 0:
+    hf_config = getattr(model_config, "hf_config", None)
+    architectures = set(getattr(hf_config, "architectures", None) or [])
+    supports_chunked_prefill = bool(architectures & _MULTIMODAL_CHUNKED_PREFILL_ARCHITECTURES)
+    if not supports_chunked_prefill and (
+        server_args.chunked_prefill_size is None or server_args.chunked_prefill_size > 0
+    ):
         logger.info("Multimodal model detected, disabling chunked prefill")
         server_args.chunked_prefill_size = -1
     if server_args.enable_mixed_chunk:
@@ -54,8 +60,7 @@ def apply_multimodal_model_defaults(server_args, model_config) -> None:
 def _validate_disaggregation_host_ip(host_ip: str) -> str:
     if host_ip in _REJECTED_PD_HOST_ALIASES:
         raise ValueError(
-            "--disaggregation-host-ip must be a routable address; "
-            f"got loopback alias {host_ip!r}"
+            f"--disaggregation-host-ip must be a routable address; got loopback alias {host_ip!r}"
         )
     try:
         addr = ipaddress.ip_address(host_ip)
@@ -64,8 +69,7 @@ def _validate_disaggregation_host_ip(host_ip: str) -> str:
     if addr.is_loopback or addr.is_unspecified:
         kind = "loopback" if addr.is_loopback else "bind/unspecified"
         raise ValueError(
-            "--disaggregation-host-ip must be a routable address; "
-            f"got {kind} address {host_ip!r}"
+            f"--disaggregation-host-ip must be a routable address; got {kind} address {host_ip!r}"
         )
     return host_ip
 
@@ -327,9 +331,9 @@ class ServerArgs:
         # update device
         if self.device:
             platform_env = os.environ.get("JAX_PLATFORMS", self.device)
-            assert (
-                self.device == platform_env
-            ), f"device {self.device} is not consistent with 'JAX_PLATFORMS' {platform_env}"
+            assert self.device == platform_env, (
+                f"device {self.device} is not consistent with 'JAX_PLATFORMS' {platform_env}"
+            )
         else:
             platform_env = os.environ.get("JAX_PLATFORMS", "")
             if platform_env != "":
@@ -1639,7 +1643,7 @@ class ServerArgs:
             "--disaggregation-bootstrap-timeout-seconds",
             type=float,
             default=ServerArgs.disaggregation_bootstrap_timeout_seconds,
-            help="Bootstrap-server query timeout in seconds. <=0 to " "disable.",
+            help="Bootstrap-server query timeout in seconds. <=0 to disable.",
         )
         parser.add_argument(
             "--disaggregation-pull-timeout-seconds",
@@ -1662,7 +1666,7 @@ class ServerArgs:
             "--disaggregation-orphan-reaper-interval-seconds",
             type=float,
             default=ServerArgs.disaggregation_orphan_reaper_interval_seconds,
-            help="How often the background reaper scans for orphan " "senders/receivers.",
+            help="How often the background reaper scans for orphan senders/receivers.",
         )
         parser.add_argument(
             "--disaggregation-decode-watchdog-seconds",
@@ -1768,9 +1772,9 @@ class ServerArgs:
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
         if self.chunked_prefill_size > 0:
-            assert (
-                self.chunked_prefill_size % self.page_size == 0
-            ), "chunked_prefill_size must be divisible by page_size"
+            assert self.chunked_prefill_size % self.page_size == 0, (
+                "chunked_prefill_size must be divisible by page_size"
+            )
 
         # Check LoRA configuration
         self.check_lora_server_args()
@@ -1803,9 +1807,9 @@ class ServerArgs:
         if not self.enable_lora and not self.enable_static_lora:
             return
 
-        assert not (
-            self.enable_lora and self.enable_static_lora
-        ), f"{self.enable_lora} and {self.enable_static_lora} can not be enable at the same time"
+        assert not (self.enable_lora and self.enable_static_lora), (
+            f"{self.enable_lora} and {self.enable_static_lora} can not be enable at the same time"
+        )
 
         self.enable_lora = True
 
@@ -1816,27 +1820,27 @@ class ServerArgs:
         if self.lora_target_modules:
             self.lora_target_modules = set(self.lora_target_modules)
             if "all" in self.lora_target_modules:
-                assert (
-                    len(self.lora_target_modules) == 1
-                ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
+                assert len(self.lora_target_modules) == 1, (
+                    "If 'all' is specified in --lora-target-modules, it should be the only module specified."
+                )
                 self.lora_target_modules = set(SUPPORTED_LORA_TARGET_MODULES)
 
         # Ensure sufficient information is provided for LoRA initialization.
-        assert self.lora_paths or (
-            self.max_lora_rank and self.lora_target_modules
-        ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+        assert self.lora_paths or (self.max_lora_rank and self.lora_target_modules), (
+            "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+        )
 
         def check_static_lora_args():
-            assert (
-                self.lora_scaling is not None
-            ), "lora_scaling is required when enable-static-lora is enabled"
+            assert self.lora_scaling is not None, (
+                "lora_scaling is required when enable-static-lora is enabled"
+            )
 
-            assert (
-                self.lora_paths is None
-            ), "lora-paths is not required when enable-static-lora is enabled"
-            assert (
-                self.max_loras_per_batch == 1
-            ), "max-loras-per-batch is required to be 1 when enable-static-lora is enabled"
+            assert self.lora_paths is None, (
+                "lora-paths is not required when enable-static-lora is enabled"
+            )
+            assert self.max_loras_per_batch == 1, (
+                "max-loras-per-batch is required to be 1 when enable-static-lora is enabled"
+            )
 
         def check_dynamic_lora_args():
             # Normalize lora_paths to List[LoRARef]
@@ -1896,9 +1900,9 @@ class ServerArgs:
 
                     # Validate max_loaded_loras
                     if self.max_loaded_loras is not None:
-                        assert (
-                            self.max_loaded_loras >= self.max_loras_per_batch
-                        ), "max_loaded_loras must be >= max_loras_per_batch"
+                        assert self.max_loaded_loras >= self.max_loras_per_batch, (
+                            "max_loaded_loras must be >= max_loras_per_batch"
+                        )
 
                     logger.info(
                         "Loaded %d LoRA adapters: %s",

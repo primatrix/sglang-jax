@@ -3032,15 +3032,16 @@ class ScheduleBatch:
         mrope_positions = _mm["mrope_positions"]
         apply_for_deepstack = _mm["apply_for_deepstack"]
         deepstack_visual_embedding = _mm["deepstack_visual_embedding"]
-        # Build the vision encode/merge plan only for ordinary prefill. Other
-        # forward modes leave the plan unset, and the runner treats a non-None
-        # plan as the sole vision-forward signal.
+        # Build a vision encode/merge plan for the current extend window. For
+        # chunked prefill, the builder clips full-prompt placeholder ranges to
+        # [prefix_len, seq_len); chunks without visual rows return no plan.
         if self.contains_mm_inputs() and self.forward_mode == ForwardMode.EXTEND:
             mm_embed_plan = build_mm_embed_plan(
                 self.reqs_info,
                 self.dp_size,
                 self.model_config,
                 per_dp_token_padding,
+                tp_size=(int(self.mesh.shape.get("tensor", 1)) if self.mesh is not None else 1),
             )
         else:
             mm_embed_plan = None

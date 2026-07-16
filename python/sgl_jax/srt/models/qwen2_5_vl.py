@@ -17,17 +17,14 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.qwen2 import Qwen2Model, create_qwen2_weight_mappings
-
-# Import the Qwen2.5-VL vision-metadata module so model import triggers builder
-# registration; the encode body consumes only the opaque ``meta`` pytree.
-from sgl_jax.srt.models.vision_metadata import (  # noqa: F401
-    qwen2_5_vl as _qwen25vl_vision_metadata,
-)
+from sgl_jax.srt.models.vision_metadata.qwen2_5_vl import register_qwen25vl_vision_encoder
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
     QwenVLModelVitConfig,
 )
 from sgl_jax.srt.multimodal.kernels.flash_attention import SegmentIds
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
+
+register_qwen25vl_vision_encoder()
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -42,8 +39,17 @@ def _apply_data_sharding(x: jax.Array, mesh: Mesh, spec: PartitionSpec) -> jax.A
     return jax.lax.with_sharding_constraint(x, sharding)
 
 
+def _vision_batch_axis(mesh: Mesh):
+    """Shard the vision batch over every device executing the replicated ViT."""
+    return ("data", "tensor") if "tensor" in mesh.axis_names else "data"
+
+
+def _vision_batch_spec(mesh: Mesh, *tail) -> PartitionSpec:
+    return PartitionSpec(_vision_batch_axis(mesh), *tail)
+
+
 def _apply_rotary_pos_emb_vision(x: jax.Array, rotary_pos_emb: jax.Array) -> jax.Array:
-    # x: [dp, T, N, H]; rotary_pos_emb: [dp, T, rot] (per-image, dp-leading).
+    # x: [batch, T, N, H]; rotary_pos_emb: [batch, T, rot].
     _, _, _, H = x.shape
     half_dim = H // 2
 
@@ -53,8 +59,8 @@ def _apply_rotary_pos_emb_vision(x: jax.Array, rotary_pos_emb: jax.Array) -> jax
     cos_emb = jnp.cos(rotary_pos_emb)
     sin_emb = jnp.sin(rotary_pos_emb)
 
-    # rope already carries the dp (batch) axis -> only insert the heads (N) axis.
-    cos_emb = cos_emb[:, :, None, :]  # [dp, T, 1, rot]
+    # RoPE already carries the batch axis; insert only the head axis.
+    cos_emb = cos_emb[:, :, None, :]  # [batch, T, 1, rot]
     sin_emb = sin_emb[:, :, None, :]
 
     x_rotated_real = x_real * cos_emb - x_imag * sin_emb
@@ -70,10 +76,10 @@ def _vision_attention(
     v: jax.Array,
     seg: jax.Array,
 ) -> jax.Array:
-    """Run DP-leading block-diagonal vision attention."""
-    dp, T, N, H = q.shape
+    """Run batch-leading block-diagonal vision attention."""
+    _, T, _, _ = q.shape
 
-    # [dp, T, N, H] -> [dp, N, T, H] for the kernel.
+    # [batch, T, N, H] -> [batch, N, T, H] for the kernel.
     q = jnp.transpose(q, (0, 2, 1, 3))
     k = jnp.transpose(k, (0, 2, 1, 3))
     v = jnp.transpose(v, (0, 2, 1, 3))
@@ -85,14 +91,14 @@ def _vision_attention(
         q = jnp.pad(q, ((0, 0), (0, 0), (0, pad), (0, 0)))
         k = jnp.pad(k, ((0, 0), (0, 0), (0, pad), (0, 0)))
         v = jnp.pad(v, ((0, 0), (0, 0), (0, pad), (0, 0)))
-        seg = jnp.pad(seg, ((0, 0), (0, pad)), constant_values=-1)  # [dp, T_aligned]
+        seg = jnp.pad(seg, ((0, 0), (0, pad)), constant_values=-1)  # [batch, T_aligned]
 
     segment_ids = SegmentIds(q=seg, kv=seg)
 
-    output = backend(q, k, v, segment_ids)  # [dp, N, T_aligned, H]
+    output = backend(q, k, v, segment_ids)  # [batch, N, T_aligned, H]
 
     output = output[:, :, :T, :]  # slice back to real seq
-    # [dp, N, T, H] -> [dp, T, N, H]
+    # [batch, N, T, H] -> [batch, T, N, H]
     return jnp.transpose(output, (0, 2, 1, 3))
 
 
@@ -124,12 +130,11 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        # x is (dp, seq_len, C * T * H * W) -- dp-leading batched;
-        # seq_len == the per-request packed patch count (== patch_k in the plan).
-        dp, seq_len, dim = x.shape
+        # x is [batch, seq_len, C*T*H*W]; seq_len is the padded patch bucket.
+        batch_size, seq_len, dim = x.shape
         C = dim // (self.temporal_patch_size * self.patch_size * self.patch_size)
         x = x.reshape(
-            dp,
+            batch_size,
             seq_len,
             C,
             self.temporal_patch_size,
@@ -140,19 +145,22 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
             x = _apply_data_sharding(
                 x,
                 self.mesh,
-                PartitionSpec("data", None, None, None, None, None),
+                _vision_batch_spec(self.mesh, None, None, None, None, None),
             )
-        # [dp, seq, C, T, H, W] -> [dp, seq, T, H, W, C]
+        # [batch, seq, C, T, H, W] -> [batch, seq, T, H, W, C]
         x = jnp.transpose(x, (0, 1, 3, 4, 5, 2))
         flat_sharding = out_sharding = None
         if self.mesh is not None and "data" in self.mesh.abstract_mesh.explicit_axes:
-            flat_sharding = NamedSharding(self.mesh, PartitionSpec("data", None, None, None, None))
+            flat_sharding = NamedSharding(
+                self.mesh,
+                _vision_batch_spec(self.mesh, None, None, None, None),
+            )
             out_sharding = NamedSharding(
                 self.mesh,
-                PartitionSpec("data", None, None, None, None, None),
+                _vision_batch_spec(self.mesh, None, None, None, None, None),
             )
         x = x.reshape(
-            dp * seq_len,
+            batch_size * seq_len,
             self.temporal_patch_size,
             self.patch_size,
             self.patch_size,
@@ -161,7 +169,7 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
         )
         x = self.proj(x, out_sharding=flat_sharding)
         x = x.reshape(
-            dp,
+            batch_size,
             seq_len,
             1,
             1,
@@ -169,13 +177,13 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
             self.hidden_size,
             out_sharding=out_sharding,
         )
-        # After conv: [dp, seq, 1, 1, 1, hidden_size].
+        # After conv: [batch, seq, 1, 1, 1, hidden_size].
         x = jnp.squeeze(x, axis=(2, 3, 4))
         if self.mesh is not None:
             x = _apply_data_sharding(
                 x,
                 self.mesh,
-                PartitionSpec("data", None, None),
+                _vision_batch_spec(self.mesh, None, None),
             )
         return x
 
@@ -252,7 +260,7 @@ class Qwen2_5_VisionAttention(nnx.Module):
             rngs=_rngs,
         )
 
-        # DP-only vision attention backend reused across all
+        # Lane-batched vision attention backend reused across all
         # in-model VLMs. Lazy import avoids a module-level import cycle
         # (flash_attention_backend -> schedule_batch -> models). ``mesh`` is None
         # only during eval_shape (which never calls __call__), so guard it.
@@ -272,8 +280,8 @@ class Qwen2_5_VisionAttention(nnx.Module):
         cu_window_seqlens: jax.Array,
         valid: jax.Array | None = None,
     ) -> jax.Array:
-        """Run one dp-leading ViT attention block."""
-        dp, T, D = x.shape
+        """Run one batch-leading ViT attention block."""
+        batch_size, T, D = x.shape
 
         positions = jnp.arange(T, dtype=cu_window_seqlens.dtype)
         seg = jnp.sum(
@@ -281,32 +289,36 @@ class Qwen2_5_VisionAttention(nnx.Module):
             axis=1,
         ).astype(jnp.int32)
         if self.mesh is not None:
-            seg = _apply_data_sharding(seg, self.mesh, PartitionSpec("data", None))
+            seg = _apply_data_sharding(seg, self.mesh, _vision_batch_spec(self.mesh, None))
         if valid is not None:
-            is_real = positions[None, :] < jnp.reshape(valid, (dp, 1))
+            is_real = positions[None, :] < jnp.reshape(valid, (batch_size, 1))
             if self.mesh is not None:
-                is_real = _apply_data_sharding(is_real, self.mesh, PartitionSpec("data", None))
+                is_real = _apply_data_sharding(
+                    is_real,
+                    self.mesh,
+                    _vision_batch_spec(self.mesh, None),
+                )
             seg = jnp.where(is_real, seg, jnp.full_like(seg, -1))
 
         # Project to Q, K, V
-        qkv = self.qkv_proj(x)  # [dp, T, 3D]
-        q, k, v = jnp.split(qkv, 3, axis=-1)  # [dp, T, D] each
+        qkv = self.qkv_proj(x)  # [batch, T, 3D]
+        q, k, v = jnp.split(qkv, 3, axis=-1)  # [batch, T, D] each
 
-        # Wrapper uses dp-leading [dp, T, N, H]; _vision_attention adapts this
+        # Wrapper uses batch-leading [batch, T, N, H]; _vision_attention adapts this
         # layout to the backend's kernel contract.
-        q = q.reshape(dp, T, self.num_heads, self.head_dim)
-        k = k.reshape(dp, T, self.num_heads, self.head_dim)
-        v = v.reshape(dp, T, self.num_heads, self.head_dim)
+        q = q.reshape(batch_size, T, self.num_heads, self.head_dim)
+        k = k.reshape(batch_size, T, self.num_heads, self.head_dim)
+        v = v.reshape(batch_size, T, self.num_heads, self.head_dim)
 
-        # Apply rotary embeddings (rope is per-image [dp, T, rot])
+        # Apply rotary embeddings (RoPE is per batch entry: [batch, T, rot]).
         q = _apply_rotary_pos_emb_vision(q, rotary_pos_emb)
         k = _apply_rotary_pos_emb_vision(k, rotary_pos_emb)
 
-        # Block-diagonal segment flash attention via the DP-only backend.
-        output = _vision_attention(self.attn_backend, q, k, v, seg)  # [dp, T, N, H]
+        # Block-diagonal segment flash attention over the batch.
+        output = _vision_attention(self.attn_backend, q, k, v, seg)  # [batch, T, N, H]
 
-        # [dp, T, N, H] -> [dp, T, D]
-        output = output.reshape(dp, T, D)
+        # [batch, T, N, H] -> [batch, T, D]
+        output = output.reshape(batch_size, T, D)
 
         return self.proj(output)
 
@@ -384,27 +396,29 @@ class Qwen2_5_VisionPatchMerger(nnx.Module):
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        # x: [dp, T, ctx] (dp-leading).
+        # x: [batch, T, ctx].
         x = self.ln_q(x)
-        dp = x.shape[0]
-        # Keep dp on axis 0: the sms² spatial-merge stays WITHIN each image.
-        # ``reshape(-1, ...)`` here would interleave T and dp and silently mix
-        # across images.
+        batch_size = x.shape[0]
+        # Keep batch on axis 0: the sms² spatial merge stays within each batch
+        # entry. ``reshape(-1, ...)`` would interleave entries.
         out_sharding = None
         if self.mesh is not None and "data" in self.mesh.abstract_mesh.explicit_axes:
-            out_sharding = NamedSharding(self.mesh, PartitionSpec("data", None, None))
+            out_sharding = NamedSharding(
+                self.mesh,
+                _vision_batch_spec(self.mesh, None, None),
+            )
         x = x.reshape(
-            dp,
+            batch_size,
             -1,
             self.hidden_size,
             out_sharding=out_sharding,
-        )  # [dp, T/sms², ctx*sms²]
+        )  # [batch, T/sms², ctx*sms²]
         if self.mesh is not None and out_sharding is None:
-            x = _apply_data_sharding(x, self.mesh, PartitionSpec("data", None, None))
+            x = _apply_data_sharding(x, self.mesh, _vision_batch_spec(self.mesh, None, None))
         x = self.mlp_fc1(x)
         x = self.mlp_act(x)
         x = self.mlp_fc2(x)
-        return x  # [dp, T/sms², d_model]
+        return x  # [batch, T/sms², d_model]
 
 
 class Qwen2_5_VisionTransformer(nnx.Module):
@@ -460,12 +474,12 @@ class Qwen2_5_VisionTransformer(nnx.Module):
 
     def __call__(
         self,
-        pixels: jax.Array,
+        patches: jax.Array,
         meta,
         valid: jax.Array | None = None,
     ) -> jax.Array:
         return self.compute_hidden_states(
-            pixels,
+            patches,
             meta.window_index,
             meta.cu_window_seqlens,
             meta.rotary_pos_emb,
@@ -475,25 +489,27 @@ class Qwen2_5_VisionTransformer(nnx.Module):
 
     def compute_hidden_states(
         self,
-        pixels: jax.Array,
+        patches: jax.Array,
         window_index: jax.Array,
         cu_window_seqlens: jax.Array,
         rotary_pos_emb: jax.Array,
         cu_image_seqlens: jax.Array,
         valid: jax.Array | None = None,
     ) -> jax.Array:
-        """Run the dp-leading ViT encode body."""
-        # pixels: [dp, seq, dim_in] (dp-leading batched).
-        hidden_states = self.patch_embed(pixels)  # [dp, seq, D]
-        dp = pixels.shape[0]
-        seq_len = pixels.shape[1]
+        """Run the batched ViT encode body."""
+        # patches: [batch, seq, dim_in].
+        hidden_states = self.patch_embed(patches)  # [batch, seq, D]
+        batch_size = patches.shape[0]
+        seq_len = patches.shape[1]
         u = self.spatial_merge_unit
 
-        hidden_states = hidden_states.reshape(dp, seq_len // u, u, -1)  # [dp, seq//u, u, D]
+        hidden_states = hidden_states.reshape(
+            batch_size, seq_len // u, u, -1
+        )  # [batch, seq//u, u, D]
         # Reorder spatial-merge units into window order per image.
         gather_idx = jnp.broadcast_to(window_index[:, :, None, None], hidden_states.shape)
         hidden_states = jnp.take_along_axis(hidden_states, gather_idx, axis=1)
-        hidden_states = hidden_states.reshape(dp, seq_len, -1)  # [dp, T, D]
+        hidden_states = hidden_states.reshape(batch_size, seq_len, -1)  # [batch, T, D]
 
         for layer_num, blk in enumerate(self.blocks):
             # Full-attention blocks must segment by image, not by the packed
@@ -509,17 +525,17 @@ class Qwen2_5_VisionTransformer(nnx.Module):
                 valid,
             )
 
-        # adapter (merger): [dp, T, D] -> [dp, T/sms², d_model]
+        # adapter (merger): [batch, T, D] -> [batch, T/sms², d_model]
         hidden_states = self.merger(hidden_states)
         # Restore raster order per image.
-        reverse_indices = jnp.argsort(window_index, axis=1)  # [dp, seq//u]
+        reverse_indices = jnp.argsort(window_index, axis=1)  # [batch, seq//u]
         rev_idx = jnp.broadcast_to(reverse_indices[:, :, None], hidden_states.shape)
         hidden_states = jnp.take_along_axis(hidden_states, rev_idx, axis=1)
-        return hidden_states  # [dp, out_rows, H]
+        return hidden_states  # [batch, out_rows, H]
 
-    def encode(self, pixels: jax.Array, meta, valid: jax.Array | None = None) -> jax.Array:
+    def encode(self, patches: jax.Array, meta, valid: jax.Array | None = None) -> jax.Array:
         if self.mesh is None:
-            return self.encode_jit(pixels, meta, valid)
+            return self.encode_jit(patches, meta, valid)
         try:
             ctx = jax.sharding.use_mesh(self.mesh)
         except AttributeError:
@@ -528,17 +544,17 @@ class Qwen2_5_VisionTransformer(nnx.Module):
             except AttributeError:
                 ctx = self.mesh
         with ctx:
-            return self.encode_jit(pixels, meta, valid)
+            return self.encode_jit(patches, meta, valid)
 
     @jax.jit
-    def encode_jit(self, pixels: jax.Array, meta, valid: jax.Array | None = None) -> jax.Array:
-        features = self(pixels, meta, valid)  # [dp, out_rows, H]
+    def encode_jit(self, patches: jax.Array, meta, valid: jax.Array | None = None) -> jax.Array:
+        features = self(patches, meta, valid)  # [batch, out_rows, H]
         if self.mesh is None:
             return features
         return _apply_data_sharding(
             features,
             self.mesh,
-            PartitionSpec("data", None, None),
+            _vision_batch_spec(self.mesh, None, None),
         )
 
 
@@ -585,14 +601,8 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         )
 
     def get_image_feature(self, enc):
-        """Encode one DP round of images.
-
-        ``enc.meta`` carries scheduler-built ViT aux
-        (``window_index`` / ``cu_window_seqlens`` / ``cu_image_seqlens`` /
-        ``rotary_pos_emb``).
-        Returns dp-leading image features with shape ``[dp, out_rows, H]``.
-        """
-        return self.visual.encode(enc.pixels, enc.meta, enc.valid)
+        """Encode a model-neutral batch with replicated ViT weights."""
+        return self.visual.encode(enc.patches, enc.meta, enc.valid)
 
     def load_weights(self, model_config: ModelConfig):
         # Load text backbone and lm_head weights.

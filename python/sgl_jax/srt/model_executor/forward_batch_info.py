@@ -145,28 +145,32 @@ class CaptureHiddenMode(IntEnum):
 
 
 def _device_put_embed_plan(plan, mesh):
-    """Place every array leaf in the embed plan on data-leading sharding."""
+    """Place multimodal lane arrays over the data and tensor mesh axes."""
 
-    def _data_leading_spec(arr):
+    def _lane_spec(arr):
         ndim = np.asarray(arr).ndim
-        if ndim == 0:
-            return PartitionSpec()
-        return PartitionSpec("data", *([None] * (ndim - 1)))
+        if ndim < 2:
+            raise ValueError(
+                "Multimodal lane arrays must have leading [dp,tp] axes, "
+                f"got shape={np.asarray(arr).shape}."
+            )
+        return PartitionSpec("data", "tensor", *([None] * (ndim - 2)))
 
-    def _put(arr):
+    def _put(arr, spec):
         if arr is None:
             return None
-        (placed,) = device_array((arr,), sharding=NamedSharding(mesh, _data_leading_spec(arr)))
+        (placed,) = device_array((arr,), sharding=NamedSharding(mesh, spec))
         return placed
 
-    for rounds in plan.rounds_by_modality.values():
-        for rnd in rounds:
-            enc = rnd.encode_inputs
-            enc.pixels = _put(enc.pixels)
-            enc.valid = _put(enc.valid)
-            enc.meta = jax.tree.map(_put, enc.meta)
-            rnd.src_idx = _put(rnd.src_idx)
-            rnd.mask = _put(rnd.mask)
+    for batch in plan.values():
+        batch.encode_inputs = jax.tree.map(
+            lambda value: _put(value, _lane_spec(value)),
+            batch.encode_inputs,
+        )
+        merge = batch.merge
+        merge.src_idx = _put(merge.src_idx, PartitionSpec("data", "tensor", None))
+        merge.dst_idx = _put(merge.dst_idx, PartitionSpec("data", "tensor", None))
+        merge.mask = _put(merge.mask, PartitionSpec("data", "tensor", None))
     return plan
 
 
@@ -219,7 +223,7 @@ class ForwardBatch:
     # Encoder-Decoder specific fields
     attention_mask: jax.Array | None = None
     deterministic: bool = True
-    # Multimodal cached vision embeddings (prefill only)
+    # Cached multimodal embeddings (prefill only)
     input_embedding: jax.Array | None = None
     # MRoPE positions [3, total_tokens] for Qwen2.5-VL
     mrope_positions: jax.Array | None = None
@@ -479,11 +483,8 @@ class ForwardBatch:
                 sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
             )
 
-        # In-model VLM embed plan: device_put each EmbedRound's array leaves onto
-        # the encode input sharding (pixels/valid + VisionMetadata leaves) and
-        # merge shard_map input sharding (src_idx/mask). Zero computation -- just
-        # placement. aux is precomputed host-side by the scheduler and carried in
-        # the plan.
+        # In-model VLM embed plan: place every [dp,tp]-leading encoder and merge
+        # leaf on its owning device lane. Metadata is precomputed host-side.
         mm_embed_plan = None
         if getattr(batch, "mm_embed_plan", None) is not None:
             mm_embed_plan = _device_put_embed_plan(batch.mm_embed_plan, model_runner.mesh)
