@@ -14,7 +14,7 @@
 - Branch: `develop/glm52-dsa-falcon`
 - Active v7x-8 debug experiment: `exp-gq082n4nzb`
 - Active v7x-32 debug experiment: `exp-x9ghpgedxk`
-- Pending CPU checkpoint downloader: `exp-9oj6o2sohe`
+- Active v7x-8 host-CPU checkpoint downloader: `exp-q7odgo8q9x`
 - Model source: [zai-org/GLM-5.2](https://huggingface.co/zai-org/GLM-5.2)
 
 ## 已确认的 checkpoint 配置
@@ -43,7 +43,7 @@
 
 没有发现 GLM-5 或 GLM-5.2 checkpoint/config。未使用 provider CLI 直接读取 bucket。
 
-CPU 下载 manifest：
+最初提交的 CPU 下载 manifest：
 
 ```text
 scripts/kernels/falcon_glm52_model_download_cpu.yaml
@@ -53,7 +53,27 @@ completion  = /models/GLM-5.2/_DOWNLOAD_COMPLETE
 experiment  = exp-9oj6o2sohe
 ```
 
-截至本记录，任务为 `PENDING/Unschedulable`。Falcon 报告 6 个匹配 CPU node 均为 `Insufficient cpu`；其余节点存在 taint 或 affinity 不匹配。任务继续排队，获得资源后会用 `hf download` 写入 `/models/GLM-5.2`，并以 `_DOWNLOAD_COMPLETE` 标记完成；下载支持断点续传。
+该任务 `exp-9oj6o2sohe` 实际没有开始下载。`device_type: cpu` 将它限制到 6 个 CPU node，这些节点全部报 `Insufficient cpu`；其余节点因 taint 或 affinity 不匹配无法承载。降低 250m CPU request 没有意义，因此已 abort。两个不声明 device 的旧式 generic manifest 和一个在 v7x cluster 显式请求 CPU 的试验也没有进入资源调度，均已 abort。
+
+当前改用 v7x-8 pod 的 host CPU 和网络，TPU 本身不参与下载：
+
+```text
+manifest    = scripts/kernels/falcon_glm52_model_download_v7x8.yaml
+source      = zai-org/GLM-5.2
+destination = /models/GLM-5.2
+completion  = /models/GLM-5.2/_DOWNLOAD_COMPLETE
+experiment  = exp-q7odgo8q9x
+transport   = hf-xet -> writable GCSFuse streaming write
+```
+
+任务约 7 秒完成调度并进入 `RUNNING`。host 有 224 CPU、有效内存约 945 GiB，启用了 Hugging Face Xet high-performance 和 sequential reconstruction；GCSFuse mount 启用了 streaming writes。metadata 13 秒下载完成，index 校验得到 282 个预期 shard。最近两次 60 秒进度采样：
+
+```text
+15/282 shards,  80,391,064,128 bytes
+24/282 shards, 128,645,946,912 bytes
+```
+
+最近一分钟约写入 48.3 GB，启动以来平均约 0.71 GB/s；按当前样本粗估剩余约 30--40 分钟。分片完成是突发式的，因此这里只作为观察值，不作为完成承诺。下载支持断点续传；只有 config、index 和全部非空 shard 校验通过后才写 `_DOWNLOAD_COMPLETE`。
 
 ## Falcon 环境
 
@@ -193,7 +213,7 @@ min_ms    = 2.166540
 
 ## 下一步
 
-1. 等待 `exp-9oj6o2sohe` 获得 CPU，确认 `/models/GLM-5.2/_DOWNLOAD_COMPLETE`。
+1. 观察 `exp-q7odgo8q9x`，确认 `/models/GLM-5.2/_DOWNLOAD_COMPLETE`；完成后 abort 下载 pod，释放 v7x-8 reservation。
 2. 在 v7x-32 加载真实 checkpoint，先跑短 prefill + reference sparse decode，确认内存和参数映射。
 3. 保持同一 selection/cache state 切换到 Pallas，比较 latent output 和最终 logits。
 4. 覆盖 `full → shared → full` 的 IndexShare，以及两个 ragged request 的 chunked prefill → decode。
@@ -201,4 +221,4 @@ min_ms    = 2.166540
 
 ## 资源清理
 
-`exp-gq082n4nzb` 和 `exp-x9ghpgedxk` 暂时保留用于继续调试，`exp-9oj6o2sohe` 保留排队下载。真实权重验证结束后再显式 abort。
+`exp-gq082n4nzb` 和 `exp-x9ghpgedxk` 暂时保留用于继续调试。`exp-q7odgo8q9x` 保持运行以完成 checkpoint 下载；原 CPU 下载及三个不可调度的替代试验均已 abort。真实权重验证结束后再显式清理调试资源。

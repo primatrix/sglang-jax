@@ -1,0 +1,142 @@
+name: glm52-model-download-v7x8-hostcpu-20260718-v1
+exp_type: TRAINING
+cluster_name: tpu-training-antgroup
+artifact_type: GCS
+tags:
+  - sglang-jax
+  - glm-5.2
+  - model-download
+  - host-cpu
+  - v7x-8
+config: '{"source":"zai-org/GLM-5.2","destination":"gs://inference-model-storage-poc-tpu-hns/GLM-5.2","resume":true,"transport":"hf-xet-to-gcsfuse-streaming","tpu_usage":"host-cpu-only"}'
+role_to_task_spec:
+  worker:
+    replica: 1
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x1
+    supply_mode: reservation
+    envs:
+      HF_HOME: /tmp/huggingface
+      HF_XET_CACHE: /tmp/huggingface/xet
+      HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY: "1"
+      PIP_CACHE_DIR: /tmp/pip-cache
+      PYTHONUNBUFFERED: "1"
+    command: |
+      bash <<'BASH'
+      set -euo pipefail
+      ulimit -c 0
+
+      MODEL_DIR=/models/GLM-5.2
+      COMPLETE_MARKER="$MODEL_DIR/_DOWNLOAD_COMPLETE"
+      mkdir -p /tmp/huggingface/xet /tmp/pip-cache "$MODEL_DIR"
+
+      if [[ -f "$COMPLETE_MARKER" ]]; then
+        echo "GLM52_CHECKPOINT_ALREADY_COMPLETE"
+        exit 0
+      fi
+
+      python3 -m pip install --no-cache-dir --upgrade "huggingface_hub[hf_xet]>=0.33"
+
+      host_mem_kib=$(awk '/MemTotal:/ {print $2}' /proc/meminfo)
+      cgroup_mem_bytes=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo max)
+      mem_kib=$host_mem_kib
+      if [[ "$cgroup_mem_bytes" != "max" ]] && [[ "$cgroup_mem_bytes" =~ ^[0-9]+$ ]]; then
+        cgroup_mem_kib=$((cgroup_mem_bytes / 1024))
+        if (( cgroup_mem_kib < mem_kib )); then
+          mem_kib=$cgroup_mem_kib
+        fi
+      fi
+      echo "download_host_cpus=$(nproc)"
+      echo "download_effective_mem_kib=$mem_kib"
+      if (( mem_kib >= 64 * 1024 * 1024 )); then
+        export HF_XET_HIGH_PERFORMANCE=1
+        echo "HF_XET_HIGH_PERFORMANCE=1"
+      else
+        echo "HF_XET_HIGH_PERFORMANCE=0 (effective memory below 64 GiB)"
+      fi
+
+      # Fetch metadata first so mount/auth failures surface before the 1.5 TB
+      # weight transfer and so the expected shard set is available to inspect.
+      hf download zai-org/GLM-5.2 \
+        --local-dir "$MODEL_DIR" \
+        --exclude "*.safetensors" \
+        --max-workers 4
+
+      python3 - "$MODEL_DIR" <<'PY'
+      import json
+      import pathlib
+      import sys
+
+      model_dir = pathlib.Path(sys.argv[1])
+      index = json.loads((model_dir / "model.safetensors.index.json").read_text())
+      expected_shards = sorted(set(index["weight_map"].values()))
+      print(f"GLM52_CHECKPOINT_METADATA_READY expected_shards={len(expected_shards)}")
+      PY
+
+      python3 -u - "$MODEL_DIR" <<'PY' &
+      import pathlib
+      import sys
+      import time
+
+      model_dir = pathlib.Path(sys.argv[1])
+      while True:
+          shards = list(model_dir.glob("*.safetensors"))
+          completed_bytes = sum(path.stat().st_size for path in shards)
+          print(
+              "GLM52_DOWNLOAD_PROGRESS "
+              f"completed_shards={len(shards)}/282 "
+              f"completed_bytes={completed_bytes}",
+              flush=True,
+          )
+          time.sleep(60)
+      PY
+      monitor_pid=$!
+      stop_monitor() {
+        kill "$monitor_pid" 2>/dev/null || true
+        wait "$monitor_pid" 2>/dev/null || true
+      }
+      trap stop_monitor EXIT
+
+      max_workers=4
+      if (( mem_kib >= 16 * 1024 * 1024 )); then
+        max_workers=8
+      fi
+      echo "download_max_workers=$max_workers"
+      hf download zai-org/GLM-5.2 \
+        --local-dir "$MODEL_DIR" \
+        --include "*.safetensors" \
+        --max-workers "$max_workers"
+
+      python3 - "$MODEL_DIR" <<'PY'
+      import json
+      import pathlib
+      import sys
+
+      model_dir = pathlib.Path(sys.argv[1])
+      index_path = model_dir / "model.safetensors.index.json"
+      config_path = model_dir / "config.json"
+      if not index_path.is_file() or not config_path.is_file():
+          raise SystemExit("missing config.json or model.safetensors.index.json")
+      index = json.loads(index_path.read_text())
+      expected_shards = sorted(set(index["weight_map"].values()))
+      missing = [name for name in expected_shards if not (model_dir / name).is_file()]
+      empty = [name for name in expected_shards if (model_dir / name).stat().st_size == 0]
+      if missing or empty:
+          raise SystemExit(f"checkpoint validation failed: missing={missing}, empty={empty}")
+      print(f"GLM52_CHECKPOINT_VALIDATED shards={len(expected_shards)}")
+      PY
+
+      date -u +%Y-%m-%dT%H:%M:%SZ > "$COMPLETE_MARKER"
+      echo "GLM52_CHECKPOINT_DOWNLOAD_COMPLETE"
+      BASH
+    mounts:
+      - name: model-storage
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        mount_path: /models
+        read_only: false
+        mount_options:
+          - implicit-dirs
+          - write:enable-streaming-writes:true
