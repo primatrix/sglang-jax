@@ -1004,6 +1004,7 @@ class Glm5DecoderLayer(nnx.Module):
             name="attention_output",
             layer_id=self.layer_id,
             forward_mode=forward_mode,
+            forward_batch=forward_batch,
         )
         hidden_states += residual
         residual = hidden_states
@@ -1013,6 +1014,7 @@ class Glm5DecoderLayer(nnx.Module):
             name="residual_post_attention",
             layer_id=self.layer_id,
             forward_mode=forward_mode,
+            forward_batch=forward_batch,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
 
@@ -1031,33 +1033,28 @@ class Glm5DecoderLayer(nnx.Module):
             )
 
             hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
-            maybe_dump_jax_array(
-                hidden_states,
-                component="decoder_layer",
-                name="mlp_output",
-                layer_id=self.layer_id,
-                forward_mode=forward_mode,
-            )
-
             if shared_output is not None:
                 hidden_states = hidden_states + shared_output
         else:
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
-            maybe_dump_jax_array(
-                hidden_states,
-                component="decoder_layer",
-                name="mlp_output",
-                layer_id=self.layer_id,
-                forward_mode=forward_mode,
-            )
 
         maybe_dump_jax_array(
             hidden_states,
             component="decoder_layer",
+            name="mlp_output",
+            layer_id=self.layer_id,
+            forward_mode=forward_mode,
+            forward_batch=forward_batch,
+        )
+
+        maybe_dump_jax_array(
+            hidden_states + residual,
+            component="decoder_layer",
             name="hidden_states_post_mlp",
             layer_id=self.layer_id,
             forward_mode=forward_mode,
+            forward_batch=forward_batch,
         )
 
         return (
@@ -1120,6 +1117,7 @@ class Glm5Model(nnx.Module):
             name="hidden_states",
             layer_id=None,
             forward_mode=forward_mode,
+            forward_batch=forward_batch,
         )
         residual = None
         layers_kv_fused = []
@@ -1162,6 +1160,7 @@ class Glm5Model(nnx.Module):
             name="normalized_hidden_states",
             layer_id=None,
             forward_mode=forward_mode,
+            forward_batch=forward_batch,
         )
         return (
             hidden_states,
@@ -1230,6 +1229,7 @@ class Glm5ForCausalLM(nnx.Module):
                 name="next_token_logits",
                 layer_id=None,
                 forward_mode=getattr(forward_batch, "forward_mode", None),
+                forward_batch=forward_batch,
             )
 
         pool_updates = {"token_to_kv_pool": layers_kv_fused}

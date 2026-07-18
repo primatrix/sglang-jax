@@ -18,7 +18,7 @@ def test_dsa_backend_emits_semantic_debug_tensors(monkeypatch):
 
     calls = []
 
-    def capture(value, *, component, name, layer_id, forward_mode):
+    def capture(value, *, component, name, layer_id, forward_mode, **_kwargs):
         calls.append(
             {
                 "value": value,
@@ -93,10 +93,15 @@ def test_dsa_backend_emits_semantic_debug_tensors(monkeypatch):
         ("dsa_selection", "physical_slots"),
         ("dsa_attention", "q_latent"),
         ("dsa_attention", "q_rope"),
+        ("dsa_attention", "new_c_kv"),
+        ("dsa_attention", "new_k_pe"),
+        ("dsa_attention", "write_slots"),
         ("dsa_attention", "o_latent"),
     }
     assert all(call["layer_id"] == 3 for call in calls)
     assert all(call["forward_mode"] == ForwardMode.DECODE for call in calls)
+    o_latent = next(call["value"] for call in calls if call["name"] == "o_latent")
+    assert o_latent.dtype == jnp.bfloat16
 
 
 def test_dsa_metadata_builds_causal_candidates_for_decode_and_prefill():

@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -126,6 +127,88 @@ def test_debug_dump_callback_writes_array_and_manifest(monkeypatch, tmp_path):
     assert " " not in arrays[0].name
 
 
+def test_debug_dump_forward_occurrence_is_independent_of_callback_order(
+    monkeypatch, tmp_path
+):
+    from sgl_jax.srt.utils.debug_utils import maybe_dump_jax_array
+
+    def run_callbacks(output_dir, reverse):
+        _enable_dump(monkeypatch, output_dir)
+        pending = []
+        monkeypatch.setattr(
+            jax.debug,
+            "callback",
+            lambda callback, *values, **_kwargs: pending.append((callback, values)),
+        )
+        for token in (11, 29):
+            forward_batch = SimpleNamespace(
+                input_ids=jnp.array([token], dtype=jnp.int32),
+                positions=jnp.array([token - 1], dtype=jnp.int32),
+                seq_lens=jnp.array([token], dtype=jnp.int32),
+            )
+            maybe_dump_jax_array(
+                jnp.array([token], dtype=jnp.int32),
+                component="logits",
+                name="token",
+                forward_batch=forward_batch,
+            )
+        for callback, values in pending[:: -1 if reverse else 1]:
+            callback(*(np.asarray(value) for value in values))
+        rows = [
+            json.loads(line)
+            for line in next(output_dir.glob("manifest-*.jsonl")).read_text().splitlines()
+        ]
+        return {
+            int(np.load(output_dir / row["filename"])[0]): row["occurrence"]
+            for row in rows
+        }
+
+    in_order = run_callbacks(tmp_path / "in-order", reverse=False)
+    reverse_order = run_callbacks(tmp_path / "reverse-order", reverse=True)
+
+    assert in_order == reverse_order
+    assert len(set(in_order.values())) == 2
+
+
+def test_debug_dump_rejects_reused_directory_after_process_restart(monkeypatch, tmp_path):
+    from sgl_jax.srt.utils import debug_utils
+
+    _enable_dump(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        jax.debug,
+        "callback",
+        lambda callback, value, **_kwargs: callback(np.asarray(value)),
+    )
+    debug_utils.maybe_dump_jax_array(
+        jnp.array([1], dtype=jnp.int32), component="dsa", name="ids"
+    )
+
+    debug_utils._DEBUG_DUMP_INITIALIZED.clear()
+    debug_utils._DEBUG_DUMP_OCCURRENCES.clear()
+    with pytest.raises(RuntimeError, match="already contains debug dumps"):
+        debug_utils.maybe_dump_jax_array(
+            jnp.array([2], dtype=jnp.int32), component="dsa", name="ids"
+        )
+
+
+def test_debug_dump_sanitized_names_do_not_collide(monkeypatch, tmp_path):
+    from sgl_jax.srt.utils.debug_utils import maybe_dump_jax_array
+
+    _enable_dump(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        jax.debug,
+        "callback",
+        lambda callback, value, **_kwargs: callback(np.asarray(value)),
+    )
+
+    maybe_dump_jax_array(jnp.array([1]), component="dsa", name="a/b")
+    maybe_dump_jax_array(jnp.array([2]), component="dsa", name="a b")
+
+    arrays = list(tmp_path.glob("*.npy"))
+    assert len(arrays) == 2
+    assert {int(np.load(path)[0]) for path in arrays} == {1, 2}
+
+
 def test_debug_dump_executes_from_jitted_code(monkeypatch, tmp_path):
     from sgl_jax.srt.utils.debug_utils import maybe_dump_jax_array
 
@@ -133,12 +216,18 @@ def test_debug_dump_executes_from_jitted_code(monkeypatch, tmp_path):
 
     @jax.jit
     def dump_from_jit(value):
+        forward_batch = SimpleNamespace(
+            input_ids=jnp.array([7], dtype=jnp.int32),
+            positions=jnp.array([3], dtype=jnp.int32),
+            seq_lens=jnp.array([4], dtype=jnp.int32),
+        )
         return maybe_dump_jax_array(
             value,
             component="decoder_layer",
             name="hidden_states",
             layer_id=1,
             forward_mode="extend",
+            forward_batch=forward_batch,
         )
 
     value = jnp.array([1.0, 2.0], dtype=jnp.float32)

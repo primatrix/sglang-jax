@@ -250,6 +250,7 @@ class DsaAttentionBackend(AttentionBackend):
             name="q_index",
             layer_id=layer_id,
             forward_mode=forward_mode,
+            forward_batch=forward_batch,
         )
         maybe_dump_jax_array(
             head_weights,
@@ -257,6 +258,7 @@ class DsaAttentionBackend(AttentionBackend):
             name="head_weights",
             layer_id=layer_id,
             forward_mode=forward_mode,
+            forward_batch=forward_batch,
         )
         maybe_dump_jax_array(
             index_k,
@@ -264,6 +266,7 @@ class DsaAttentionBackend(AttentionBackend):
             name="index_k",
             layer_id=layer_id,
             forward_mode=forward_mode,
+            forward_batch=forward_batch,
         )
 
         current_cache = indexer_k_pool.get_buffer(layer_id)
@@ -324,6 +327,7 @@ class DsaAttentionBackend(AttentionBackend):
             name="logical_topk_ids",
             layer_id=layer_id,
             forward_mode=forward_mode,
+            forward_batch=forward_batch,
         )
         maybe_dump_jax_array(
             selected_counts,
@@ -331,6 +335,7 @@ class DsaAttentionBackend(AttentionBackend):
             name="selected_counts",
             layer_id=layer_id,
             forward_mode=forward_mode,
+            forward_batch=forward_batch,
         )
         selection = logical_topk_to_physical_slots(
             logical_topk_ids=logical_topk_ids,
@@ -346,6 +351,7 @@ class DsaAttentionBackend(AttentionBackend):
             name="physical_slots",
             layer_id=layer_id,
             forward_mode=forward_mode,
+            forward_batch=forward_batch,
         )
         return (
             DsaTopKState(
@@ -383,6 +389,7 @@ class DsaAttentionBackend(AttentionBackend):
             name="q_latent",
             layer_id=layer.layer_id,
             forward_mode=forward_mode,
+            forward_batch=forward_batch,
         )
         maybe_dump_jax_array(
             q_rope,
@@ -390,10 +397,35 @@ class DsaAttentionBackend(AttentionBackend):
             name="q_rope",
             layer_id=layer.layer_id,
             forward_mode=forward_mode,
+            forward_batch=forward_batch,
         )
 
         new_c_kv = k if k.ndim == 2 else jnp.squeeze(k, axis=1)
         new_k_pe = k_rope if k_rope.ndim == 2 else jnp.squeeze(k_rope, axis=1)
+        maybe_dump_jax_array(
+            new_c_kv,
+            component="dsa_attention",
+            name="new_c_kv",
+            layer_id=layer.layer_id,
+            forward_mode=forward_mode,
+            forward_batch=forward_batch,
+        )
+        maybe_dump_jax_array(
+            new_k_pe,
+            component="dsa_attention",
+            name="new_k_pe",
+            layer_id=layer.layer_id,
+            forward_mode=forward_mode,
+            forward_batch=forward_batch,
+        )
+        maybe_dump_jax_array(
+            forward_batch.out_cache_loc,
+            component="dsa_attention",
+            name="write_slots",
+            layer_id=layer.layer_id,
+            forward_mode=forward_mode,
+            forward_batch=forward_batch,
+        )
         cache = token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
         updated_cache = write_mla_kv_cache(
             cache,
@@ -463,14 +495,16 @@ class DsaAttentionBackend(AttentionBackend):
                 latent_dim=self.kv_lora_rank,
                 rope_dim=self.qk_rope_head_dim,
             )
+        output = output.astype(jnp.bfloat16)
         maybe_dump_jax_array(
             output,
             component="dsa_attention",
             name="o_latent",
             layer_id=layer.layer_id,
             forward_mode=forward_mode,
+            forward_batch=forward_batch,
         )
-        return output.astype(jnp.bfloat16), updated_cache
+        return output, updated_cache
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:

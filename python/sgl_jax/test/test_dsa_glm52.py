@@ -1404,7 +1404,7 @@ def test_glm_decoder_layer_emits_attention_residual_and_mlp_debug_tensors(monkey
 
     calls = []
 
-    def capture(value, *, component, name, layer_id, forward_mode):
+    def capture(value, *, component, name, layer_id, forward_mode, **_kwargs):
         calls.append((component, name, layer_id, forward_mode, np.asarray(value)))
         return value
 
@@ -1440,7 +1440,61 @@ def test_glm_decoder_layer_emits_attention_residual_and_mlp_debug_tensors(monkey
     np.testing.assert_array_equal(calls[0][4], np.array([[0.0, 0.0]], dtype=np.float32))
     np.testing.assert_array_equal(calls[1][4], np.array([[1.0, 2.0]], dtype=np.float32))
     np.testing.assert_array_equal(calls[2][4], np.array([[11.0, 12.0]], dtype=np.float32))
-    np.testing.assert_array_equal(calls[3][4], np.array([[11.0, 12.0]], dtype=np.float32))
+    np.testing.assert_array_equal(calls[3][4], np.array([[12.0, 14.0]], dtype=np.float32))
+
+
+def test_glm_decoder_mlp_debug_includes_shared_expert_and_delayed_residual(monkeypatch):
+    from types import SimpleNamespace
+
+    from sgl_jax.srt.models import glm5_moe
+    from sgl_jax.srt.models.glm5_moe import Glm5DecoderLayer
+
+    calls = {}
+
+    def capture(value, *, name, **_kwargs):
+        calls[name] = np.asarray(value)
+        return value
+
+    monkeypatch.setattr(glm5_moe, "maybe_dump_jax_array", capture)
+
+    class SelfAttention:
+        def __call__(self, **kwargs):
+            return jnp.zeros_like(kwargs["hidden_states"]), "mla", None, None
+
+    class Gate:
+        bias = None
+
+        def __call__(self, hidden_states):
+            return jnp.zeros((hidden_states.shape[0], 2), dtype=jnp.float32)
+
+    layer = SimpleNamespace(
+        layer_id=5,
+        input_layernorm=lambda value: value,
+        self_attn=SelfAttention(),
+        post_attention_layernorm=lambda value: value,
+        is_moe_layer=True,
+        shared_experts=lambda value: value + 100,
+        moe_gate=Gate(),
+        topk=lambda *_args, **_kwargs: (
+            jnp.ones((1, 1), dtype=jnp.float32),
+            jnp.zeros((1, 1), dtype=jnp.int32),
+        ),
+        mlp=lambda value, *_args: value + 10,
+    )
+    Glm5DecoderLayer.__call__(
+        layer,
+        positions=jnp.array([0], dtype=jnp.int32),
+        hidden_states=jnp.array([[1.0, 2.0]], dtype=jnp.float32),
+        forward_batch=SimpleNamespace(forward_mode="decode"),
+        token_to_kv_pool="mla-pool",
+    )
+
+    np.testing.assert_array_equal(
+        calls["mlp_output"], np.array([[112.0, 114.0]], dtype=np.float32)
+    )
+    np.testing.assert_array_equal(
+        calls["hidden_states_post_mlp"], np.array([[113.0, 116.0]], dtype=np.float32)
+    )
 
 
 def test_glm_model_and_causal_lm_emit_global_debug_tensors(monkeypatch):
@@ -1451,7 +1505,7 @@ def test_glm_model_and_causal_lm_emit_global_debug_tensors(monkeypatch):
 
     calls = []
 
-    def capture(value, *, component, name, layer_id, forward_mode):
+    def capture(value, *, component, name, layer_id, forward_mode, **_kwargs):
         calls.append((component, name, layer_id, forward_mode, np.asarray(value)))
         return value
 

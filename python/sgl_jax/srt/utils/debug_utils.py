@@ -1,4 +1,5 @@
 import functools
+import hashlib
 import json
 import os
 import re
@@ -9,6 +10,7 @@ from enum import IntEnum
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 
@@ -24,6 +26,7 @@ FRAMEWORK_LOG_LEVEL = FrameworkLogLevel(int(os.environ.get("SGLANG_FRAMEWORK_LOG
 
 _DEBUG_DUMP_LOCK = threading.Lock()
 _DEBUG_DUMP_OCCURRENCES = defaultdict(int)
+_DEBUG_DUMP_INITIALIZED = set()
 _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
@@ -33,8 +36,10 @@ def _debug_dump_filter(name):
 
 
 def _sanitize_filename_part(value):
-    sanitized = _UNSAFE_FILENAME_CHARS.sub("-", str(value)).strip(".-")
-    return sanitized or "unknown"
+    raw_value = str(value)
+    sanitized = _UNSAFE_FILENAME_CHARS.sub("-", raw_value).strip(".-") or "unknown"
+    digest = hashlib.blake2s(raw_value.encode("utf-8"), digest_size=4).hexdigest()
+    return f"{sanitized}-{digest}"
 
 
 def _normalize_forward_mode(forward_mode):
@@ -45,19 +50,62 @@ def _normalize_forward_mode(forward_mode):
     return str(forward_mode)
 
 
-def _write_debug_dump(host_value, *, dump_dir, metadata):
+def _forward_fingerprint(forward_batch):
+    if forward_batch is None:
+        return None
+    values = [
+        getattr(forward_batch, "input_ids", None),
+        getattr(forward_batch, "positions", None),
+        getattr(forward_batch, "seq_lens", None),
+    ]
+    if all(value is None for value in values):
+        return None
+
+    fingerprint = jnp.asarray(2166136261, dtype=jnp.uint32)
+    for field_index, value in enumerate(values):
+        if value is None:
+            continue
+        flattened = jnp.ravel(jnp.asarray(value, dtype=jnp.uint32))
+        indices = jnp.arange(1, flattened.size + 1, dtype=jnp.uint32)
+        field_hash = jnp.sum(
+            (flattened + jnp.asarray(97 * (field_index + 1), dtype=jnp.uint32))
+            * (indices * jnp.asarray(16777619, dtype=jnp.uint32)),
+            dtype=jnp.uint32,
+        )
+        fingerprint = (fingerprint ^ field_hash) * jnp.asarray(16777619, dtype=jnp.uint32)
+    return fingerprint
+
+
+def _write_debug_dump(host_value, host_occurrence=None, *, dump_dir, metadata):
     host_array = np.asarray(host_value)
-    semantic_key = (
-        metadata["process"],
-        metadata["component"],
-        metadata["layer"],
-        metadata["forward_mode"],
-        metadata["name"],
-    )
 
     with _DEBUG_DUMP_LOCK:
-        occurrence = _DEBUG_DUMP_OCCURRENCES[semantic_key]
-        _DEBUG_DUMP_OCCURRENCES[semantic_key] += 1
+        output_dir = Path(dump_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        initialization_key = (str(output_dir.resolve()), metadata["process"])
+        manifest_path = output_dir / f"manifest-p{metadata['process']:05d}.jsonl"
+        if initialization_key not in _DEBUG_DUMP_INITIALIZED:
+            existing_arrays = next(output_dir.glob(f"p{metadata['process']:05d}__*.npy"), None)
+            if manifest_path.exists() or existing_arrays is not None:
+                raise RuntimeError(
+                    f"debug dump directory already contains debug dumps for process "
+                    f"{metadata['process']}: {output_dir}"
+                )
+            _DEBUG_DUMP_INITIALIZED.add(initialization_key)
+
+        semantic_key = (
+            str(output_dir.resolve()),
+            metadata["process"],
+            metadata["component"],
+            metadata["layer"],
+            metadata["forward_mode"],
+            metadata["name"],
+        )
+        if host_occurrence is None:
+            occurrence = _DEBUG_DUMP_OCCURRENCES[semantic_key]
+            _DEBUG_DUMP_OCCURRENCES[semantic_key] += 1
+        else:
+            occurrence = int(np.asarray(host_occurrence, dtype=np.uint32).item())
         filename = "__".join(
             (
                 f"p{metadata['process']:05d}",
@@ -68,9 +116,12 @@ def _write_debug_dump(host_value, *, dump_dir, metadata):
                 f"o{occurrence:05d}",
             )
         ) + ".npy"
-        output_dir = Path(dump_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / filename
+        if output_path.exists():
+            raise RuntimeError(
+                "debug tensor semantic key already exists; use unique request inputs and a "
+                f"fresh dump directory: {output_path}"
+            )
 
         temporary_path = None
         try:
@@ -91,7 +142,6 @@ def _write_debug_dump(host_value, *, dump_dir, metadata):
             "shape": list(host_array.shape),
             "dtype": str(host_array.dtype),
         }
-        manifest_path = output_dir / f"manifest-p{metadata['process']:05d}.jsonl"
         with manifest_path.open("a", encoding="utf-8") as manifest:
             manifest.write(json.dumps(manifest_row, sort_keys=True) + "\n")
 
@@ -103,6 +153,7 @@ def maybe_dump_jax_array(
     name,
     layer_id=None,
     forward_mode=None,
+    forward_batch=None,
 ):
     """Optionally dump a JAX value on its host while returning it unchanged."""
     if os.environ.get("SGLANG_JAX_DEBUG_DUMP", "0") != "1":
@@ -127,10 +178,12 @@ def maybe_dump_jax_array(
         "name": str(name),
     }
     dump_dir = os.environ.get("SGLANG_JAX_DEBUG_DUMP_DIR", "debug_dumps")
-    jax.debug.callback(
-        functools.partial(_write_debug_dump, dump_dir=dump_dir, metadata=metadata),
-        value,
-    )
+    callback = functools.partial(_write_debug_dump, dump_dir=dump_dir, metadata=metadata)
+    forward_fingerprint = _forward_fingerprint(forward_batch)
+    if forward_fingerprint is None:
+        jax.debug.callback(callback, value)
+    else:
+        jax.debug.callback(callback, value, forward_fingerprint)
     return value
 
 
