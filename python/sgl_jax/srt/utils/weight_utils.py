@@ -58,6 +58,90 @@ _SAFETENSORS_DTYPE_TO_JAX: dict[str, jnp.dtype] = {
 }
 
 
+def _read_safetensors_metadata(st_file: str) -> list[tuple[str, dict[str, Any]]]:
+    """Read tensor metadata without mmaping the safetensors data section."""
+    with open(st_file, "rb") as raw_f:
+        header_size = struct.unpack("<Q", raw_f.read(8))[0]
+        raw_header = json.loads(raw_f.read(header_size))
+    data_section_offset = 8 + header_size
+
+    entries = []
+    for key, meta in raw_header.items():
+        if key == "__metadata__":
+            continue
+        info = {
+            "file": st_file,
+            "shape": tuple(meta["shape"]),
+            "dtype": meta["dtype"],
+        }
+        offsets = meta.get("data_offsets")
+        if offsets:
+            info["byte_offset"] = data_section_offset + offsets[0]
+            info["byte_size"] = offsets[1] - offsets[0]
+        entries.append((key, info))
+    return entries
+
+
+def _scan_safetensors_metadata(
+    weights_files: list[str],
+    *,
+    num_threads: int,
+    show_progress: bool = False,
+) -> dict[str, list[dict[str, Any]]]:
+    """Scan safetensors headers concurrently while preserving file order."""
+    if num_threads < 1:
+        raise ValueError(f"num_threads must be positive, got {num_threads}")
+    if not weights_files:
+        return {}
+
+    weight_info: dict[str, list[dict[str, Any]]] = {}
+    with ThreadPoolExecutor(max_workers=min(num_threads, len(weights_files))) as executor:
+        file_entries = executor.map(_read_safetensors_metadata, weights_files)
+        if show_progress:
+            file_entries = tqdm(
+                file_entries,
+                total=len(weights_files),
+                desc="Scanning Metadata",
+                unit="file",
+            )
+        for entries in file_entries:
+            for key, info in entries:
+                weight_info.setdefault(key, []).append(info)
+    return weight_info
+
+
+def _read_sparse_safetensors_entries(
+    entries: list[tuple[str, int, int]],
+    *,
+    expert_nbytes: int,
+    np_read_dtype: npt.DTypeLike,
+    single_expert_shape: tuple[int, ...],
+    max_workers: int,
+) -> dict[int, np.ndarray]:
+    """Read independent safetensors ranges concurrently."""
+    if max_workers < 1:
+        raise ValueError(f"max_workers must be positive, got {max_workers}")
+    if not entries:
+        return {}
+
+    def _read_entry(entry: tuple[str, int, int]) -> tuple[int, np.ndarray]:
+        filename, logical_index, byte_offset = entry
+        with open(filename, "rb") as fp:
+            fp.seek(byte_offset)
+            raw = fp.read(expert_nbytes)
+        if len(raw) != expert_nbytes:
+            raise OSError(
+                f"short read for expert {logical_index} in {filename}: "
+                f"{len(raw)} != {expert_nbytes}"
+            )
+        return logical_index, np.frombuffer(raw, dtype=np_read_dtype).reshape(
+            single_expert_shape
+        )
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(entries))) as executor:
+        return dict(executor.map(_read_entry, entries))
+
+
 def _reinterpret_dtype_if_needed(data: np.ndarray, target_dtype: jnp.dtype) -> np.ndarray:
     if data.dtype == np.uint8:
         if target_dtype == jnp.float8_e4m3fn:
@@ -1035,45 +1119,27 @@ class WeightLoader:
                 raise RuntimeError(f"Cannot find any *.safetensors files in {model_path}")
 
             weights_files.sort()
-            weight_info: dict[str, list[dict[str, Any]]] = {}
-
+            try:
+                metadata_scan_threads = int(
+                    os.getenv("SGLANG_JAX_METADATA_SCAN_THREADS", "8")
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "SGLANG_JAX_METADATA_SCAN_THREADS must be an integer"
+                ) from exc
             logger.info(
-                "Scanning metadata for %s model files (single host only)...", len(weights_files)
+                "Scanning metadata for %s model files with %s threads "
+                "(single host only)...",
+                len(weights_files),
+                metadata_scan_threads,
             )
-            # Use tqdm only on master to avoid log spam
-            iterator = tqdm(weights_files, desc="Scanning Metadata", unit="file")
-
-            for st_file in iterator:
-                # Read the safetensors header directly: 8-byte length prefix +
-                # JSON header that lists {dtype, shape, data_offsets} per tensor.
-                # That's all we need — do NOT use safe_open here. safe_open mmaps
-                # the entire file, and on GCSFuse a single page fault triggers a
-                # chunked-download (download-chunk-size-mb), so scanning 34 files
-                # winds up downloading the full ~30GB model just to read metadata.
-                with open(st_file, "rb") as raw_f:
-                    header_size = struct.unpack("<Q", raw_f.read(8))[0]
-                    raw_header = json.loads(raw_f.read(header_size))
-                data_section_offset = 8 + header_size
-
-                for key, meta in raw_header.items():
-                    if key == "__metadata__":
-                        continue
-                    info = {
-                        "file": st_file,
-                        "shape": tuple(meta["shape"]),
-                        # Keep dtype as the safetensors string — downstream
-                        # consumers (_create_lazy_tensors, MoE bulk_read) all
-                        # already look up _SAFETENSORS_DTYPE_TO_JAX by string,
-                        # and st_dtype.startswith("F8_") in MoE path needs str.
-                        "dtype": meta["dtype"],
-                    }
-                    offsets = meta.get("data_offsets")
-                    if offsets:
-                        info["byte_offset"] = data_section_offset + offsets[0]
-                        info["byte_size"] = offsets[1] - offsets[0]
-                    if key not in weight_info:
-                        weight_info[key] = []
-                    weight_info[key].append(info)
+            # Read only the 8-byte prefix and JSON header from each shard. Avoid
+            # safe_open here: mmap page faults can download large GCSFuse chunks.
+            weight_info = _scan_safetensors_metadata(
+                weights_files,
+                num_threads=metadata_scan_threads,
+                show_progress=True,
+            )
 
             # Serialize the result
             serialized_data = pickle.dumps(weight_info)
@@ -1740,15 +1806,20 @@ class WeightLoader:
                         ).reshape(single_expert_shape)
                         result[log_idx] = arr.copy()
                 else:
-                    with open(fname, "rb") as f:
-                        for log_idx, byte_off, hf_key in entries:
-                            f.seek(byte_off)
-                            raw = f.read(expert_nbytes)
-                            arr = np.frombuffer(
-                                raw,
-                                dtype=np_read_dtype,
-                            ).reshape(single_expert_shape)
-                            result[log_idx] = arr
+                    range_workers = max(
+                        1,
+                        int(os.environ.get("SGLANG_MOE_RANGE_LOAD_WORKERS", "32"))
+                        // max(1, len(file_groups)),
+                    )
+                    result.update(
+                        _read_sparse_safetensors_entries(
+                            [(fname, log_idx, byte_off) for log_idx, byte_off, _ in entries],
+                            expert_nbytes=expert_nbytes,
+                            np_read_dtype=np_read_dtype,
+                            single_expert_shape=single_expert_shape,
+                            max_workers=range_workers,
+                        )
+                    )
                 return result
 
             t_io_start = time.monotonic()

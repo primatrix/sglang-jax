@@ -1387,10 +1387,22 @@ class Glm5ForCausalLM(nnx.Module):
             num_shared = getattr(self.config, "n_shared_experts", 0)
             if num_shared > 0:
                 sp = f"{prefix}.mlp.shared_experts"
-                st = f"{target_prefix}.shared_experts"
-                add_linear(f"{sp}.gate_proj", f"{st}.gate_proj", (None, "tensor"))
-                add_linear(f"{sp}.up_proj", f"{st}.up_proj", (None, "tensor"))
-                add_linear(f"{sp}.down_proj", f"{st}.down_proj", ("tensor", None))
+                if moe_backend == MoEBackend.FUSED:
+                    for hf_name, target_name in (
+                        ("gate_proj", "w1_shared"),
+                        ("up_proj", "w3_shared"),
+                        ("down_proj", "w2_shared"),
+                    ):
+                        mappings[f"{sp}.{hf_name}.weight"] = WeightMapping(
+                            target_path=f"{target_prefix}.mlp.{target_name}",
+                            sharding=(None, None),
+                            transpose=True,
+                        )
+                else:
+                    st = f"{target_prefix}.shared_experts"
+                    add_linear(f"{sp}.gate_proj", f"{st}.gate_proj", (None, "tensor"))
+                    add_linear(f"{sp}.up_proj", f"{st}.up_proj", (None, "tensor"))
+                    add_linear(f"{sp}.down_proj", f"{st}.down_proj", ("tensor", None))
 
         return mappings
 

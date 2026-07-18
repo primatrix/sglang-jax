@@ -211,3 +211,5 @@ def test_real_runner_has_checkpoint_backend_request_and_teardown_gates():
     assert "setsid" in runner
     assert 'kill -TERM -- "-$SERVER_PGID"' in runner
     assert "expected_topk_width=20" in runner
+    assert 'SGLANG_JAX_SKIP_GCSFUSE_WARMUP="${SGLANG_JAX_SKIP_GCSFUSE_WARMUP:-1}"' in runner
+    assert "GLM52_DSA_SOURCE_REV" in runner

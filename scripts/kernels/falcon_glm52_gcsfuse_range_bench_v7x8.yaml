@@ -1,0 +1,45 @@
+name: glm52-gcsfuse-range-bench-v7x8-20260719
+exp_type: TRAINING
+cluster_name: tpu-training-antgroup
+artifact_type: GCS
+tags:
+  - sglang-jax
+  - glm-5.2
+  - gcsfuse-benchmark
+  - v7x-8
+config: '{"purpose":"benchmark GLM-5.2 expert range reads without GCSFuse range-file caching"}'
+role_to_task_spec:
+  worker:
+    replica: 1
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x1
+    supply_mode: reservation
+    envs:
+      PYTHONUNBUFFERED: "1"
+      LIBTPU_INIT_ARGS: --xla_tpu_dvfs_p_state=7
+    command: |
+      bash -lc '
+      set -euo pipefail
+      ulimit -c 0
+      echo GLM52_GCSFUSE_RANGE_BENCH_READY
+      sleep 604800
+      '
+    mounts:
+      - name: model-storage
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        mount_path: /models
+        read_only: true
+        mount_options:
+          - implicit-dirs
+          - metadata-cache:ttl-secs:-1
+          - metadata-cache:stat-cache-max-size-mb:512
+          - metadata-cache:type-cache-max-size-mb:64
+          - file-cache:max-size-mb:5120
+          - file-cache:cache-file-for-range-read:false
+          - file-system:kernel-list-cache-ttl-secs:-1
+          - file-cache:enable-parallel-downloads:true
+          - file-cache:parallel-downloads-per-file:32
+          - read_ahead_kb=1024

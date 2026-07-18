@@ -6,6 +6,39 @@ import numpy as np
 import pytest
 
 
+def test_glm52_fused_moe_maps_shared_experts_into_fused_weight_slots():
+    from sgl_jax.srt.configs.model_config import MoEBackend
+    from sgl_jax.srt.models.glm5_moe import Glm5ForCausalLM
+
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            n_routed_experts=256,
+            n_shared_experts=1,
+            moe_backend=MoEBackend.FUSED,
+        )
+    )
+
+    mappings = Glm5ForCausalLM._create_moe_layer_mappings(
+        model,
+        layer_idx=3,
+        target_idx=3,
+        is_mlp_layer=False,
+    )
+
+    expected_targets = {
+        "gate_proj": "model.layers.3.mlp.w1_shared",
+        "up_proj": "model.layers.3.mlp.w3_shared",
+        "down_proj": "model.layers.3.mlp.w2_shared",
+    }
+    for projection, target_path in expected_targets.items():
+        mapping = mappings[
+            f"model.layers.3.mlp.shared_experts.{projection}.weight"
+        ]
+        assert mapping.target_path == target_path
+        assert mapping.sharding == (None, None)
+        assert mapping.transpose is True
+
+
 def test_dsa_selection_pytree_keeps_array_children_and_static_producer_layer():
     from sgl_jax.srt.layers.attention.dsa_types import DsaSelection
 

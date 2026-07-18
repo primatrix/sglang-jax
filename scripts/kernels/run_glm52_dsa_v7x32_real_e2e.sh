@@ -18,6 +18,12 @@ HEALTH_TIMEOUT_SECONDS="${GLM52_DSA_HEALTH_TIMEOUT_SECONDS:-10800}"
 GENERATE_TIMEOUT_SECONDS="${GLM52_DSA_GENERATE_TIMEOUT_SECONDS:-1200}"
 SHUTDOWN_TIMEOUT_SECONDS="${GLM52_DSA_SHUTDOWN_TIMEOUT_SECONDS:-90}"
 ACK_TIMEOUT_SECONDS="${GLM52_DSA_ACK_TIMEOUT_SECONDS:-180}"
+export SGLANG_JAX_SKIP_GCSFUSE_WARMUP="${SGLANG_JAX_SKIP_GCSFUSE_WARMUP:-1}"
+SOURCE_REV="${GLM52_DSA_SOURCE_REV:-}"
+if [[ -z "$SOURCE_REV" ]]; then
+  SOURCE_REV="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
+fi
+SOURCE_REV="${SOURCE_REV:-unknown}"
 MIN_FOLLOWER_TIMEOUT_SECONDS=$((
   START_TIMEOUT_SECONDS + HEALTH_TIMEOUT_SECONDS + 3 * GENERATE_TIMEOUT_SECONDS +
   SHUTDOWN_TIMEOUT_SECONDS + ACK_TIMEOUT_SECONDS + 600
@@ -124,12 +130,13 @@ export PYTHONPATH="$ROOT/python${PYTHONPATH:+:$PYTHONPATH}"
   echo "nnodes=$NNODES"
   echo "dist_addr=$DIST_ADDR"
   echo "run_id=$RUN_ID"
-  echo "commit=$(git rev-parse HEAD)"
+  echo "commit=$SOURCE_REV"
   echo "model=$MODEL_PATH"
   echo "checkpoint_complete=$(cat "$COMPLETE_MARKER")"
   echo "load_format=safetensors"
   echo "parallelism=tp32_dp1_ep32"
   echo "attention_backend=$ATTENTION_BACKEND"
+  echo "skip_gcsfuse_warmup=$SGLANG_JAX_SKIP_GCSFUSE_WARMUP"
   echo "created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } | tee "$OUT/run_context.txt"
 
