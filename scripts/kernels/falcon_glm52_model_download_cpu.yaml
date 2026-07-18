@@ -1,0 +1,52 @@
+name: glm52-model-download-cpu-20260718
+exp_type: TRAINING
+cluster_name: tpu-training-antgroup
+artifact_type: GCS
+tags:
+  - sglang-jax
+  - glm-5.2
+  - model-download
+  - cpu
+config: '{"source":"zai-org/GLM-5.2","destination":"gs://inference-model-storage-poc-tpu-hns/GLM-5.2","resume":true}'
+role_to_task_spec:
+  worker:
+    replica: 1
+    image: python:3.11-slim
+    device_type: cpu
+    resources:
+      cpu_request: "250m"
+      cpu_limit: "1"
+      memory_request: 1Gi
+      memory_limit: 4Gi
+    envs:
+      HF_HOME: /tmp/huggingface
+      HF_XET_HIGH_PERFORMANCE: "1"
+      PIP_CACHE_DIR: /tmp/pip-cache
+      PYTHONUNBUFFERED: "1"
+    command: |
+      bash -lc '
+      set -euxo pipefail
+      ulimit -c 0
+      mkdir -p /tmp/huggingface /tmp/pip-cache /models/GLM-5.2
+
+      if test -f /models/GLM-5.2/_DOWNLOAD_COMPLETE; then
+        echo "GLM52_CHECKPOINT_ALREADY_COMPLETE"
+        exit 0
+      fi
+
+      python3 -m pip install --no-cache-dir "huggingface_hub[hf_xet]>=0.33"
+      hf download zai-org/GLM-5.2 \
+        --local-dir /models/GLM-5.2 \
+        --max-workers 4
+
+      date -u +%Y-%m-%dT%H:%M:%SZ > /models/GLM-5.2/_DOWNLOAD_COMPLETE
+      echo "GLM52_CHECKPOINT_DOWNLOAD_COMPLETE"
+      '
+    mounts:
+      - name: model-storage
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        mount_path: /models
+        read_only: false
+        mount_options:
+          - implicit-dirs

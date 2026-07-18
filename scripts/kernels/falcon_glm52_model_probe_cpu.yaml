@@ -1,0 +1,48 @@
+name: glm52-model-probe-cpu-20260718-v2
+exp_type: TRAINING
+cluster_name: tpu-training-antgroup
+artifact_type: GCS
+tags:
+  - sglang-jax
+  - glm-5.2
+  - model-probe
+  - cpu
+config: '{"purpose":"probe GLM-5.2 checkpoint under the shared /models GCS mount"}'
+role_to_task_spec:
+  worker:
+    replica: 1
+    image: python:3.11-slim
+    device_type: cpu
+    resources:
+      cpu_request: "250m"
+      cpu_limit: "500m"
+      memory_request: 512Mi
+      memory_limit: 2Gi
+    command: |
+      bash -lc '
+      set -euo pipefail
+      echo "MODEL_BUCKET=inference-model-storage-poc-tpu-hns"
+      echo "MODEL_ROOT_MATCHES_BEGIN"
+      find /models -mindepth 1 -maxdepth 1 -type d -printf "%f\n" \
+        | sort \
+        | grep -Ei "glm|zai|chatglm" \
+        || true
+      echo "MODEL_ROOT_MATCHES_END"
+      echo "MODEL_CONFIG_MATCHES_BEGIN"
+      find /models -mindepth 2 -maxdepth 4 -type f -name config.json -print \
+        | grep -Ei "glm|zai|chatglm" \
+        || true
+      echo "MODEL_CONFIG_MATCHES_END"
+      '
+    mounts:
+      - name: model-storage
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        mount_path: /models
+        read_only: true
+        mount_options:
+          - implicit-dirs
+          - metadata-cache:ttl-secs:-1
+          - metadata-cache:stat-cache-max-size-mb:512
+          - metadata-cache:type-cache-max-size-mb:64
+          - file-system:kernel-list-cache-ttl-secs:-1

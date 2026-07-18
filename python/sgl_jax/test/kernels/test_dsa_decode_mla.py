@@ -435,6 +435,14 @@ class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
                 ),
                 valid_counts,
             ),
+            (
+                "packing",
+                ql_nope,
+                q_pe,
+                cache_kv.reshape(cache_kv.shape[0], -1, 1, cache_kv.shape[-1]),
+                topk_slots,
+                valid_counts,
+            ),
         )
 
         for name, *inputs in invalid_cases:

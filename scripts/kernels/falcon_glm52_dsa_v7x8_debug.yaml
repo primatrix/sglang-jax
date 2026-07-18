@@ -1,0 +1,95 @@
+name: glm52-dsa-v7x8-debug-20260718-v2
+exp_type: TRAINING
+cluster_name: tpu-training-antgroup
+artifact_type: GCS
+tags:
+  - sglang-jax
+  - glm-5.2
+  - dsa
+  - kernel-debug
+  - v7x-8
+config: '{"source_repo":"https://github.com/cjx0709/sglang-jax.git","source_ref":"develop/glm52-dsa-falcon","purpose":"GLM-5.2 DSA Pallas correctness and E2E debug"}'
+role_to_task_spec:
+  worker:
+    replica: 1
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x1
+    supply_mode: reservation
+    envs:
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /tmp/tpu_logs/tmp
+      PIP_CACHE_DIR: /tmp/tpu_logs/pip-cache
+      UV_CACHE_DIR: /tmp/tpu_logs/uv-cache
+      JAX_COMPILATION_CACHE_DIR: /tmp/tpu_logs/jax-cache
+      LIBTPU_INIT_ARGS: --xla_tpu_dvfs_p_state=7
+      SGLANG_JAX_REPO: https://github.com/cjx0709/sglang-jax.git
+      SGLANG_JAX_REF: develop/glm52-dsa-falcon
+    command: |
+      bash -lc '
+      set -euxo pipefail
+      ulimit -c 0
+      mkdir -p \
+        /tmp/tpu_logs/tmp \
+        /tmp/tpu_logs/pip-cache \
+        /tmp/tpu_logs/uv-cache \
+        /tmp/tpu_logs/jax-cache \
+        /tmp/glm52-dsa
+
+      apt-get update -y
+      apt-get install -y --no-install-recommends git ca-certificates
+
+      rm -rf /tmp/glm52-dsa/sglang-jax
+      git clone -q --depth 1 "${SGLANG_JAX_REPO}" /tmp/glm52-dsa/sglang-jax
+      cd /tmp/glm52-dsa/sglang-jax
+      git fetch -q --depth 1 origin "${SGLANG_JAX_REF}"
+      git checkout -q FETCH_HEAD
+      git rev-parse HEAD
+
+      /opt/venv/bin/python3 - <<"PY"
+      import importlib.metadata as md
+      import jax
+
+      for package in ("jax", "jaxlib", "libtpu", "flax"):
+          try:
+              print(f"{package}={md.version(package)}")
+          except md.PackageNotFoundError:
+              print(f"{package}=MISSING")
+      print(f"platform={jax.default_backend()}")
+      print(f"local_device_count={jax.local_device_count()}")
+      print(f"devices={jax.local_devices()}")
+      PY
+
+      echo "MODEL_ROOT_MATCHES_BEGIN"
+      find /models -mindepth 1 -maxdepth 1 -type d -printf "%f\n" \
+        | sort \
+        | grep -Ei "glm|zai|chatglm" \
+        || true
+      echo "MODEL_ROOT_MATCHES_END"
+      echo "MODEL_CONFIG_MATCHES_BEGIN"
+      find /models -mindepth 2 -maxdepth 4 -type f -name config.json -print \
+        | grep -Ei "glm|zai|chatglm" \
+        || true
+      echo "MODEL_CONFIG_MATCHES_END"
+
+      echo "GLM52_DSA_DEBUG_READY"
+      sleep 604800
+      '
+    mounts:
+      - name: model-storage
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        mount_path: /models
+        read_only: true
+        mount_options:
+          - implicit-dirs
+          - metadata-cache:ttl-secs:-1
+          - metadata-cache:stat-cache-max-size-mb:512
+          - metadata-cache:type-cache-max-size-mb:64
+          - file-cache:max-size-mb:5120
+          - file-cache:cache-file-for-range-read:true
+          - file-system:kernel-list-cache-ttl-secs:-1
+          - file-cache:enable-parallel-downloads:true
+          - file-cache:parallel-downloads-per-file:32
+          - read_ahead_kb=1024

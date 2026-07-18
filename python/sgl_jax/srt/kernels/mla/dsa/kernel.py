@@ -69,6 +69,8 @@ def _validate_inputs(
         raise ValueError("topk_slots must reserve at least one slot per batch item")
     if any(dim == 0 for dim in cache_kv.shape[:3]):
         raise ValueError("cache_kv pages, packed_rows, and packing must be nonzero")
+    if cache_kv.shape[2] != 2:
+        raise ValueError("cache_kv packing must be 2 for the production BF16 cache layout")
 
     for name, array in (("ql_nope", ql_nope), ("q_pe", q_pe), ("cache_kv", cache_kv)):
         if not _is_floating_dtype(array.dtype):
@@ -123,7 +125,7 @@ def _dsa_decode_mla_kernel(
     """Process every selected cache vector for one batch element online."""
     batch_index = pl.program_id(0)
     num_heads = ql_nope_ref.shape[1]
-    cache_flat_hbm_ref = cache_kv_ref.reshape((-1, cache_kv_ref.shape[-1]))
+    packing = cache_kv_ref.shape[2]
 
     def copy_to_vmem(source_ref, destination_ref):
         copy = pltpu.make_async_copy(source_ref, destination_ref, dma_sem)
@@ -133,29 +135,14 @@ def _dsa_decode_mla_kernel(
     # TPU Pallas permits direct loads only from VMEM/SMEM.  Keep the external
     # tensors in HBM, and DMA exactly the query rows and selected KV vector
     # that this program consumes into VMEM.
-    copy_to_vmem(
-        ql_nope_ref.at[batch_index],
-        ql_nope_vmem_ref.at[:, :latent_dim],
-    )
-    copy_to_vmem(
-        q_pe_ref.at[batch_index],
-        q_pe_vmem_ref.at[:, :rope_dim],
-    )
-    ql_nope = ql_nope_vmem_ref[:, :latent_dim].astype(jnp.float32)
-    q_pe = q_pe_vmem_ref[:, :rope_dim].astype(jnp.float32)
-
-    # The cache reserves independent 128-aligned segments for the latent and
-    # RoPE dimensions.  Padding query segments separately preserves that layout.
-    if latent_dim != padded_latent_dim:
-        ql_nope = jnp.concatenate(
-            (ql_nope, jnp.zeros((num_heads, padded_latent_dim - latent_dim), jnp.float32)),
-            axis=-1,
-        )
-    if rope_dim != padded_rope_dim:
-        q_pe = jnp.concatenate(
-            (q_pe, jnp.zeros((num_heads, padded_rope_dim - rope_dim), jnp.float32)),
-            axis=-1,
-        )
+    # Mosaic HBM DMAs require the innermost slice width to match its 128-wide
+    # tiling.  The caller pads both query segments before entering Pallas, so
+    # DMA the complete aligned rows rather than slicing back to the logical
+    # latent/RoPE widths here.
+    copy_to_vmem(ql_nope_ref.at[batch_index], ql_nope_vmem_ref)
+    copy_to_vmem(q_pe_ref.at[batch_index], q_pe_vmem_ref)
+    ql_nope = ql_nope_vmem_ref[...].astype(jnp.float32)
+    q_pe = q_pe_vmem_ref[...].astype(jnp.float32)
 
     running_max = jnp.full((num_heads,), -jnp.inf, dtype=jnp.float32)
     running_sum = jnp.zeros((num_heads,), dtype=jnp.float32)
@@ -166,11 +153,19 @@ def _dsa_decode_mla_kernel(
         def update(state):
             max_logits, exp_sums, weighted_values = state
             physical_slot = topk_slots_ref[batch_index, selected_index]
-            # Flattening preserves the physical mapping
-            # page * (packed_rows * packing) + offset.  This is the only KV
-            # DMA issued for the selected slot.
-            copy_to_vmem(cache_flat_hbm_ref.at[physical_slot], cache_vector_vmem_ref)
-            cache_vector = cache_vector_vmem_ref[...].astype(jnp.float32)
+            page_index = physical_slot // page_size
+            page_offset = physical_slot % page_size
+            packed_row = page_offset // packing
+            packing_index = page_offset % packing
+            # HBM cache rows are tiled in pairs.  DMA the production cache's
+            # complete packing group, then select the requested physical row
+            # from VMEM; a one-row HBM slice is illegal on v7x.
+            copy_to_vmem(cache_kv_ref.at[page_index, packed_row], cache_vector_vmem_ref)
+            cache_pair = cache_vector_vmem_ref[...].astype(jnp.float32)
+            packing_mask = (jnp.arange(packing, dtype=jnp.int32) == packing_index).astype(
+                jnp.float32
+            )
+            cache_vector = jnp.sum(cache_pair * packing_mask[:, None], axis=0)
             scores = jnp.sum(ql_nope * cache_vector[:padded_latent_dim], axis=-1)
             scores += jnp.sum(q_pe * cache_vector[padded_latent_dim:], axis=-1)
             scores *= jnp.float32(sm_scale)
@@ -198,12 +193,15 @@ def _dsa_decode_mla_kernel(
         unroll=False,
     )
 
-    output_vmem_ref[:, :latent_dim] = lax.cond(
+    output = lax.cond(
         valid_count > 0,
         lambda: (running_value / running_sum[:, None]).astype(output_vmem_ref.dtype),
         lambda: jnp.zeros((num_heads, latent_dim), dtype=output_vmem_ref.dtype),
     )
-    copy_to_vmem(output_vmem_ref.at[:, :latent_dim], output_ref.at[batch_index])
+    if latent_dim != padded_latent_dim:
+        output = jnp.pad(output, ((0, 0), (0, padded_latent_dim - latent_dim)))
+    output_vmem_ref[...] = output
+    copy_to_vmem(output_vmem_ref, output_ref.at[batch_index])
 
 
 def dsa_decode_mla_attention_unchecked(
@@ -235,12 +233,23 @@ def dsa_decode_mla_attention_unchecked(
     topk_slots = jnp.asarray(topk_slots)
     valid_counts = jnp.asarray(valid_counts)
 
+    if cache_kv.shape[2] != 2:
+        raise ValueError("cache_kv packing must be 2 for the production BF16 cache layout")
+
     batch_size, num_heads, latent_dim = ql_nope.shape
     rope_dim = q_pe.shape[-1]
     padded_latent_dim = _align_to_128(latent_dim)
     padded_rope_dim = _align_to_128(rope_dim)
     page_size = cache_kv.shape[1] * cache_kv.shape[2]
     max_selected = topk_slots.shape[1]
+
+    # Keep every HBM<->VMEM DMA at a 128-aligned innermost width.  Padding is
+    # performed outside Pallas so Mosaic sees aligned HBM memrefs; the logical
+    # latent width is sliced back off after the kernel returns.
+    if latent_dim != padded_latent_dim:
+        ql_nope = jnp.pad(ql_nope, ((0, 0), (0, 0), (0, padded_latent_dim - latent_dim)))
+    if rope_dim != padded_rope_dim:
+        q_pe = jnp.pad(q_pe, ((0, 0), (0, 0), (0, padded_rope_dim - rope_dim)))
 
     kernel = pl.pallas_call(
         functools.partial(
@@ -253,7 +262,7 @@ def dsa_decode_mla_attention_unchecked(
             max_selected=max_selected,
             sm_scale=float(sm_scale),
         ),
-        out_shape=jax.ShapeDtypeStruct(ql_nope.shape, jnp.bfloat16),
+        out_shape=jax.ShapeDtypeStruct((batch_size, num_heads, padded_latent_dim), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             # The selected physical slots and valid lengths are small metadata
             # arrays, so keep them in SMEM and load only KV payloads from HBM.
@@ -268,7 +277,10 @@ def dsa_decode_mla_attention_unchecked(
             scratch_shapes=(
                 pltpu.VMEM((num_heads, padded_latent_dim), ql_nope.dtype),
                 pltpu.VMEM((num_heads, padded_rope_dim), q_pe.dtype),
-                pltpu.VMEM((padded_latent_dim + padded_rope_dim,), cache_kv.dtype),
+                pltpu.VMEM(
+                    (cache_kv.shape[2], padded_latent_dim + padded_rope_dim),
+                    cache_kv.dtype,
+                ),
                 pltpu.VMEM((num_heads, padded_latent_dim), jnp.bfloat16),
                 pltpu.SemaphoreType.DMA,
             ),
@@ -283,7 +295,7 @@ def dsa_decode_mla_attention_unchecked(
         ql_nope,
         q_pe,
         cache_kv,
-    )
+    )[..., :latent_dim]
 
 
 def dsa_decode_mla_attention(
