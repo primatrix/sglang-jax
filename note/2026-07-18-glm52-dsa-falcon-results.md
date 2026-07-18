@@ -1,146 +1,59 @@
-# GLM-5.2 DSA Falcon 调试记录
+# GLM-5.2 DSA Falcon 调试与真实权重 E2E 记录
 
-## 目标与当前结论
+## 结论
 
-目标是在 Falcon v7x 上跑通 GLM-5.2 的 DSA 最小闭环。当前状态：
+当前 `develop/glm52-dsa-falcon` 已在 Falcon v7x-32 上完成 GLM-5.2 BF16 真实权重的 DSA 最小闭环：
 
-- baseline sparse MLA Pallas kernel 已通过 v7x-8 真 TPU correctness。
-- 32 芯显式 mesh 下的 TopK=2048 reference + Pallas smoke 已在 4 个 process 全部通过。
-- GLM-5.2 dummy-weight server 已在 v7x-32 完成 prefill → decode → HTTP response 的分布式 E2E。
-- 真实 checkpoint 尚未下载完成，因此真实权重、最终 logits 和模型质量闭环仍未完成，不能声明真实模型 E2E 已通过。
+- checkpoint 完整：282 个 safetensors shard，共 `1,506,667,387,408` bytes。
+- TP32 / DP1 / EP32、fused MoE、DSA Pallas kernel 能完成真实权重加载、prefill、chunked prefill、ragged batch、decode 和 HTTP response。
+- short、257-token chunked、9/133-token ragged 三类请求均通过响应 schema、finite logprob、top-20 宽度和请求数量校验。
+- DSA 重复运行逐位可复现：output IDs、生成 token logprob、top-20 token/logprob 全部完全一致。
+- 与 FA baseline 比较时，所有生成 token IDs 完全一致，top-20 最低重合率为 `0.90 / 0.95 / 0.95`。
+- 严格 `max generated-token logprob abs error <= 0.05` 门未通过；三类请求分别为 `0.0703125 / 0.171875 / 0.203125`。因此可以声明功能 E2E 正常，不能声明严格 0.05 logprob 精度门通过。
 
-资源与分支：
+本轮序列长度均小于 checkpoint 的 `index_topk=2048`，DSA 选中了完整因果 token 集。当前 DSA/FA 差异不是稀疏截断，而是 Pallas 在线 softmax、Top-K 返回顺序与 FA block kernel 之间稳定的 BF16 数值路径差异。是否接受 `0.25` 的观察性上界，需要模型质量或产品侧另行确认，本文不把放宽阈值包装成严格精度通过。
 
+## 代码与运行环境
+
+- Workspace: `/Users/jiongxuan/workspace/sglang-jax/.worktrees/glm52-dsa-falcon`
 - Branch: `develop/glm52-dsa-falcon`
-- Active v7x-8 debug experiment: `exp-gq082n4nzb`
-- Active v7x-32 debug experiment: `exp-x9ghpgedxk`
-- Active v7x-8 host-CPU checkpoint downloader: `exp-q7odgo8q9x`
-- Model source: [zai-org/GLM-5.2](https://huggingface.co/zai-org/GLM-5.2)
+- 实验 source revision: `bd8ffe3f0+overlay-491dfb1e+runner-50015d51`
+- 模型: `zai-org/GLM-5.2`
+- 模型目录: `/models/GLM-5.2`
+- Falcon v7x-32 experiment: `exp-sff91uc6va`
+- topology: 4 replicas，`2x2x4`，每 host 8 个 local TPU devices，共 32 devices
+- JAX / jaxlib: `0.9.0 / 0.9.0`
+- libtpu: `0.0.34`
+- flax: `0.12.4`
+- transformers: `4.57.6`
 
-## 已确认的 checkpoint 配置
-
-官方 `config.json` 与当前 fixture 对齐：
+checkpoint 关键配置：
 
 - architecture: `GlmMoeDsaForCausalLM`
-- dtype: BF16
 - hidden size / layers: `6144 / 78`
-- `kv_lora_rank`: `512`
-- `q_lora_rank`: `2048`
+- `kv_lora_rank / q_lora_rank`: `512 / 2048`
 - `qk_nope_head_dim / qk_rope_head_dim`: `192 / 64`
 - attention heads: `64`
 - `index_head_dim / index_n_heads / index_topk`: `128 / 32 / 2048`
 - `index_topk_freq / index_skip_topk_offset`: `4 / 3`
-- experts / top-k experts: `256 / 8`
+- routed experts / selected experts: `256 / 8`
 
-模型仓库约 1.51 TB、包含 282 个 safetensors shard。v7x-8 主要用于 kernel 调试；完整模型使用 v7x-32（4 replicas、32 JAX devices、`2x2x4`）。
+## Reference 与 production kernel
 
-## `/models` 探查与下载
+当前 reference 是 `python/sgl_jax/srt/kernels/dsa/reference.py` 中的 `dsa_sparse_mla_reference`：
 
-通过 Falcon pod 内的 GCSFuse mount 检查 `inference-model-storage-poc-tpu-hns`，已有 GLM 目录只有：
+- 按 `physical_slots + selected_counts` gather MLA cache。
+- score、softmax 和 PV 使用 FP32。
+- 同时提供 Index-K cache 和 MLA KV cache 的 reference write，以及 logical-to-physical slot 转换。
 
-- `/models/GLM-4.5`
-- `/models/GLM-4.5-Air`
+TPU production 路径是 `python/sgl_jax/srt/kernels/mla/dsa/kernel.py` 中的 `dsa_decode_mla_attention_unchecked`：
 
-没有发现 GLM-5 或 GLM-5.2 checkpoint/config。未使用 provider CLI 直接读取 bucket。
+- Top-K metadata 保留在 HBM，按 128-wide chunk DMA 到 VMEM。
+- 每个 selected slot DMA 完整 `[2, 640]` packing group。
+- VMEM 内使用 FP32 online softmax 累积，输出 BF16。
+- 显式 mesh 下由 `DsaAttentionBackend` 使用 `jax.shard_map` 进入每个 addressable shard 的 Pallas manual region。
 
-最初提交的 CPU 下载 manifest：
-
-```text
-scripts/kernels/falcon_glm52_model_download_cpu.yaml
-source      = zai-org/GLM-5.2
-destination = /models/GLM-5.2
-completion  = /models/GLM-5.2/_DOWNLOAD_COMPLETE
-experiment  = exp-9oj6o2sohe
-```
-
-该任务 `exp-9oj6o2sohe` 实际没有开始下载。`device_type: cpu` 将它限制到 6 个 CPU node，这些节点全部报 `Insufficient cpu`；其余节点因 taint 或 affinity 不匹配无法承载。降低 250m CPU request 没有意义，因此已 abort。两个不声明 device 的旧式 generic manifest 和一个在 v7x cluster 显式请求 CPU 的试验也没有进入资源调度，均已 abort。
-
-当前改用 v7x-8 pod 的 host CPU 和网络，TPU 本身不参与下载：
-
-```text
-manifest    = scripts/kernels/falcon_glm52_model_download_v7x8.yaml
-source      = zai-org/GLM-5.2
-destination = /models/GLM-5.2
-completion  = /models/GLM-5.2/_DOWNLOAD_COMPLETE
-experiment  = exp-q7odgo8q9x
-transport   = hf-xet -> writable GCSFuse streaming write
-```
-
-任务约 7 秒完成调度并进入 `RUNNING`。host 有 224 CPU、有效内存约 945 GiB，启用了 Hugging Face Xet high-performance 和 sequential reconstruction；GCSFuse mount 启用了 streaming writes。metadata 13 秒下载完成，index 校验得到 282 个预期 shard。最近两次 60 秒进度采样：
-
-```text
-15/282 shards,  80,391,064,128 bytes
-24/282 shards, 128,645,946,912 bytes
-```
-
-最近一分钟约写入 48.3 GB，启动以来平均约 0.71 GB/s；按当前样本粗估剩余约 30--40 分钟。分片完成是突发式的，因此这里只作为观察值，不作为完成承诺。下载支持断点续传；只有 config、index 和全部非空 shard 校验通过后才写 `_DOWNLOAD_COMPLETE`。
-
-## Falcon 环境
-
-v7x-8 experiment `exp-gq082n4nzb`：
-
-```text
-device_topo=2x2x1
-replica=1
-local_device_count=8
-jax/jaxlib=0.9.0
-libtpu=0.0.34
-```
-
-v7x-32 experiment `exp-x9ghpgedxk`：
-
-```text
-device_topo=2x2x4
-replica=4
-global/local devices=32/8
-jax/jaxlib=0.9.0
-libtpu=0.0.34
-flax=0.12.4
-```
-
-当前分支尚未 push，实验最初从 upstream main clone，再使用 `falcon exp cp` 注入本地 patch。manifest 默认从 `https://github.com/cjx0709/sglang-jax.git` 获取 `develop/glm52-dsa-falcon`；远端分支存在后可直接复现。
-
-## 真机故障与修复
-
-### Mosaic DMA 与内存布局
-
-1. q/RoPE HBM slice 的最内维 64 不满足 Mosaic 128-wide tile。在 Pallas 外分别把 latent 和 RoPE query pad 到 128 对齐，DMA 完整行。
-2. flatten 后 DMA 单个 `[1, 640]` cache row 不满足 HBM first-dimension tile 2。把 physical slot 解码为 `page / packed_row / packing_index`，DMA 完整 `[2, 640]` packing group。
-3. VMEM 上用动态 `packing_index` 直接取 row，Mosaic 无法证明 index 对齐。改为 one-hot VPU 运算选择 packing row。
-4. GLM prefill batch 的 `[128, 2048]` Top-K 表单独就占满 v7x 的 1 MiB SMEM，再加 valid count 会编译失败。现在只把 valid count scalar-prefetch 到 SMEM；Top-K 表留在 HBM，reshape 为 128-wide chunks，每个 program 按需 DMA 一个 chunk 到 VMEM，再用 128-way VPU mask 选择 slot。
-
-validated API 明确要求 production cache `packing == 2`，避免接受真机无法 lower 的 layout。
-
-### JAX 0.9 显式 mesh
-
-1. 对 Index-K cache、candidate rows/keys、logical → physical slots 和 MLA cache write 的 gather/scatter 补充显式 `out_sharding` 或 operand sharding。MLA reference gather 使用 physical-slot 的 data sharding，保持 Top-K 轴在 tensor mesh 上 replicated；如果沿用 query 的 head sharding，会把 tensor 轴错误放到 Top-K 并触发 `DuplicateSpecError`。
-2. 外层 selection compaction 不再使用会生成 replicated iota 的 stable `jnp.argsort`；改用显式 sharding 的 `lax.broadcasted_iota` 和 `lax.sort_key_val`。
-3. 显式 mesh 内不能直接调用 Pallas。DSA backend 现在用 `jax.shard_map` 建立 manual region：query/output 按 `P(data, tensor, None)`，cache/slots/counts 按 data axis 分片，再执行本地 Pallas kernel。
-
-## Correctness 证据
-
-本地完整 DSA 回归：
-
-```bash
-../../.venv/bin/python -m pytest -q \
-  python/sgl_jax/test/kernels/test_dsa_decode_mla.py \
-  python/sgl_jax/test/test_dsa_backend.py \
-  python/sgl_jax/test/test_dsa_reference.py \
-  python/sgl_jax/test/test_dsa_glm52.py \
-  python/sgl_jax/test/test_model_runner_kv_cache_mixin.py
-```
-
-结果：`95 passed, 2 skipped, 1 warning, 39 subtests passed in 12.22s`。两个 skip 是本机没有 TPU 的 non-interpret case；warning 是仓库已有的 `jax.experimental.shard_map` deprecation。
-
-Falcon v7x-8 完整 kernel 文件：
-
-```bash
-scripts/kernels/run_glm52_dsa_v7x8_debug.sh full
-```
-
-最新结果：`34 passed, 1 skipped in 10.70s`。测试覆盖 dynamic physical slots，`valid_count=0/1/127/128/129/255/256`，非对齐 `max_selected=129/2050`，以及 `latent=512 / rope=64 / topk=2048 / page_size=128` 的 GLM shape。
-
-Falcon v7x-32 manual-shard smoke：
+v7x-32 reference/Pallas smoke 已在四个 process 全部通过：
 
 ```text
 GLM52_DSA_V7X32_REFERENCE_AND_SHARDMAP_OK process_id=0 local_devices=8
@@ -149,76 +62,218 @@ GLM52_DSA_V7X32_REFERENCE_AND_SHARDMAP_OK process_id=2 local_devices=8
 GLM52_DSA_V7X32_REFERENCE_AND_SHARDMAP_OK process_id=3 local_devices=8
 ```
 
-该 smoke 使用 32-device 显式 `data=1 / tensor=32` mesh 和 TopK=2048。输入按 slot/head 构造为可区分的非零值，`valid_count=129`，未计数 tail 指向高值哨兵；四个 process 都逐 addressable shard 比较 reference 和 Pallas 数值，Falcon command exit 0。
+该 smoke 使用 32-device 显式 `data=1 / tensor=32` mesh、TopK=2048 和 `valid_count=129`，以 `rtol=2e-2 / atol=1e-2` 比较 Pallas 与 JAX reference。
 
-## v7x-32 dummy-weight E2E
+## Checkpoint 下载与 GCSFuse 加速
 
-运行入口：
+`/models` 最初没有 GLM-5.2。CPU-only Falcon manifest 因 CPU pool 无可调度资源而未开始下载，最终使用 v7x-8 pod 的 host CPU/network 下载，TPU 不参与：
 
-```text
-manifest = scripts/kernels/falcon_glm52_dsa_v7x32_dummy_debug.yaml
-runner   = scripts/kernels/run_glm52_dsa_v7x32_dummy_e2e.sh
-model    = zai-org/GLM-5.2
-load     = dummy
-parallel = TP32 / DP1 / EP32
-backend  = DSA + fused MoE
-context  = 4096
-prefill  = chunked, max 128
-```
+- downloader experiment: `exp-q7odgo8q9x`
+- transport: `hf-xet` + writable GCSFuse streaming write
+- completion marker: `/models/GLM-5.2/_DOWNLOAD_COMPLETE`
+- marker: `2026-07-18T16:26:20Z`
 
-runner 要求每次调用提供跨 rank 共享且不可复用的 nonce，例如：
+下载完成后校验 index 中 282 个 shard 均存在且非空，总大小为 `1,506,667,387,408` bytes。
 
-```bash
-GLM52_DSA_RUN_ID=glm52-dsa-e2e-<unique> \
-  scripts/kernels/run_glm52_dsa_v7x32_dummy_e2e.sh
-```
+最初真实加载的主要问题不是模型下载，而是 GCSFuse 读取配置：
 
-关键结果：
+- 旧 mount 使用 `file-cache:cache-file-for-range-read:true`。
+- 每 host 每个 MoE projection 实际需要 64/256 experts，约 1.6106 GB，但 experts 在文件中稀疏分布，跨度约 15.3 GB。
+- 旧路径每组读取约 64--77 秒，225 组预计超过 4 小时。
 
-- 543 个缺失参数由 dummy initializer 补齐；MLA absorb 和 fused MLP 初始化完成。
-- KV 可用约 38.6 GB，模型配置 4096 tokens，cache 总量约 0.39 GB。
-- EXTEND precompile 约 79 秒，通过。
-- DECODE precompile 约 67 秒，通过。
-- `/health` 返回 200。
-- 请求：`input_ids=[1,2,3,4]`，`max_new_tokens=2`。
-- 稳定 runner 复跑响应：`output_ids=[0,0]`，`prompt_tokens=4`，`completion_tokens=2`，`e2e_latency=1.4566s`。
-- runner 输出 `GLM52_DSA_DUMMY_PREFILL_DECODE_OK`，Falcon command exit 0。
-
-dummy 权重下输出 0 是预期现象。这个结果验证的是 32 芯 topology、模型构建、DSA selection/cache、Pallas dispatch、prefill/decode 控制流和 HTTP server 链路，不验证真实模型 logits。
-
-runner 使用本次 nonce 隔离 control directory，只有 rank 0 在 HTTP 响应校验通过后写 `SUCCESS + STOP`；失败 rank 写独立 `FAIL-rank-N`，follower 完成限时 teardown 后写 `ACK-rank-N`。本次稳定复跑最终得到 `SUCCESS`、`STOP` 和 rank 1/2/3 的全部 ACK，无 FAIL。health/generate、follower wait、ACK wait 和 TERM → KILL teardown 都有 deadline；末尾的 rank 0 `Killed` 是 server 在 60 秒 TERM deadline 后被 runner 强制清理，不是 E2E 失败。结束后确认四个 host 均无残留 `sgl_jax.launch_server` 进程。
-
-## Kernel 微基准
-
-运行：
-
-```bash
-scripts/kernels/run_glm52_dsa_v7x8_bench.sh
-```
-
-Shape：B1、context 160000、TopK 2048、8 local heads、latent 512、RoPE 64、page 128、BF16、`sm_scale=0.0625`，2 次 warmup、5 次计时。
-
-最新 HBM chunk metadata 实现：
+最终 experiment 使用：
 
 ```text
-median_ms = 2.168382
-mean_ms   = 2.170685
-p99_ms    = 2.178637
-min_ms    = 2.166540
+file-cache:cache-file-for-range-read:false
+SGLANG_JAX_METADATA_SCAN_THREADS=32
+SGLANG_MOE_RANGE_LOAD_WORKERS=32
+SGLANG_JAX_SKIP_GCSFUSE_WARMUP=1
 ```
 
-改造前 SMEM metadata 实现的 median 为 1.956691 ms；当前约慢 10.8%，但解除 `[128, 2048]` Top-K 表在 GLM prefill 编译中的 SMEM OOM。后续可以考虑流水化 metadata DMA，或为 decode B1 和 prefill batch 拆分 specialization。
+代码侧增加：
 
-这是 baseline correctness kernel 的短微基准，不代表完整模型 token latency，也未包含 Indexer、Top-K、cache write 或跨 host 通信。
+- 只读取 safetensors 8-byte prefix + JSON header 的并发 metadata scan。
+- 对稀疏 expert ranges 做受控并发精确读取，并检查 short read。
+- 允许跳过会触发大文件下载的 GCSFuse warm-up。
+- `scripts/kernels/inspect_glm52_moe_layout.py` 用于检查 expert byte-range 分布。
 
-## 下一步
+冷缓存真实 run008：
 
-1. 观察 `exp-q7odgo8q9x`，确认 `/models/GLM-5.2/_DOWNLOAD_COMPLETE`；完成后 abort 下载 pod，释放 v7x-8 reservation。
-2. 在 v7x-32 加载真实 checkpoint，先跑短 prefill + reference sparse decode，确认内存和参数映射。
-3. 保持同一 selection/cache state 切换到 Pallas，比较 latent output 和最终 logits。
-4. 覆盖 `full → shared → full` 的 IndexShare，以及两个 ragged request 的 chunked prefill → decode。
-5. 补齐真实权重下的 compile time、峰值内存和 token latency；这些证据完成前，不声明真实模型 E2E 通过。
+| 阶段 | rank 2 耗时 |
+| --- | ---: |
+| 282 shard metadata | 22m09s（8 threads） |
+| 1194 regular weights | 22m33s |
+| 225 MoE groups | 4m55s |
+| server healthy | 3162s，总计约 52m42s |
 
-## 资源清理
+MoE 每组读取 1.6106 GB，冷缓存常见 `0.63--1.82s`，约 `0.89--2.55 GB/s`；旧路径为 64--77 秒。
 
-`exp-gq082n4nzb` 和 `exp-x9ghpgedxk` 暂时保留用于继续调试。`exp-q7odgo8q9x` 保持运行以完成 checkpoint 下载；原 CPU 下载及三个不可调度的替代试验均已 abort。真实权重验证结束后再显式清理调试资源。
+同一 pod 热缓存的 FA run：
+
+| 阶段 | rank 2 耗时 |
+| --- | ---: |
+| 282 shard metadata | <1s（32 threads） |
+| 1194 regular weights | 10s |
+| 225 MoE groups | 32s |
+| server healthy | 181s，总计 3m01s |
+
+## 真实权重问题与修复
+
+第一次完整 regular-weight load 暴露 fused shared expert 映射错误：
+
+```text
+model.layers.3.mlp.shared_experts.gate_proj.weight
+```
+
+旧逻辑映射到不存在的 `model.layers.3.shared_experts...`。fused MoE 下已改为：
+
+```text
+gate_proj -> model.layers.<n>.mlp.w1_shared
+up_proj   -> model.layers.<n>.mlp.w3_shared
+down_proj -> model.layers.<n>.mlp.w2_shared
+```
+
+三者均 transpose，并使用 replicated `(None, None)` sharding。修复有单测覆盖，真实 checkpoint 的 1194 regular weights 和 225 MoE groups 随后全部加载成功。
+
+## 真实 DSA E2E
+
+运行配置：
+
+```text
+load_format=safetensors
+dtype=bfloat16
+parallelism=TP32 / DP1 / EP32
+moe_backend=fused
+attention_backend=dsa
+page_size=128
+context_length=4096
+chunked_prefill_size=128
+max_prefill_tokens=256
+max_total_tokens=4096
+```
+
+主验证 run：`glm52-real-dsa-20260719-008`。
+
+请求集：
+
+1. short：4 input tokens，生成 2 tokens。
+2. chunked：257 input tokens，跨越 128-token chunk 边界，生成 2 tokens。
+3. ragged：两个并发请求，input 长度 9 和 133，各生成 2 tokens。
+
+结果：
+
+| 请求 | output IDs | E2E latency |
+| --- | --- | ---: |
+| short | `[5, 6]` | 155.18s |
+| chunked | `[198, 220]` | 270.58s |
+| ragged-9 | `[209, 210]` | 150.37s |
+| ragged-133 | `[69, 1589]` | 150.37s |
+
+这些 latency 包含首次真实执行的编译、同步和日志回传，不是 steady-state benchmark。runner 最终输出：
+
+```text
+GLM52_DSA_REAL_E2E_OK backend=dsa requests=3
+```
+
+## FA baseline 与精度结果
+
+FA run：`glm52-real-fa-20260719-001`。除 `attention_backend=fa` 外，checkpoint、并行配置、dtype 和请求完全一致。
+
+| 请求 | IDs 相同 | 最大生成 logprob 绝对误差 | 最低 top-20 overlap | 0.05 严格门 |
+| --- | --- | ---: | ---: | --- |
+| short | 是 | 0.0703125 | 0.90 | 失败 |
+| chunked | 是 | 0.171875 | 0.95 | 失败 |
+| ragged | 是 | 0.203125 | 0.95 | 失败 |
+
+其他事实：
+
+- 所有 output logprob 都是 finite。
+- 每一行都返回 20 个 top-logprobs。
+- 所有 response count 和 schema 均一致。
+- 若仅作为观察性检查使用 `max logprob abs error <= 0.25`，三类请求通过；这不是严格门结论。
+
+DSA 重复 run：`glm52-real-dsa-20260719-009`。run008 与 run009 使用零容差比较：
+
+| 请求 | output IDs | 最大生成 logprob 误差 | 最低 top-20 overlap |
+| --- | --- | ---: | ---: |
+| short | 完全一致 | 0 | 1.0 |
+| chunked | 完全一致 | 0 | 1.0 |
+| ragged | 完全一致 | 0 | 1.0 |
+
+所以当前数值偏移稳定、可复现，不是并发竞态或随机采样导致。
+
+## Artifact
+
+Falcon artifact root：
+
+```text
+/gcs/experiments/exp-sff91uc6va/artifacts/art-i9c3i0yvvw
+```
+
+关键目录：
+
+```text
+rank-0/glm52-real-dsa-20260719-008/
+rank-0/glm52-real-fa-20260719-001/
+rank-0/glm52-real-dsa-20260719-009/
+```
+
+run008 的 `precision/` 中包含：
+
+- `*.comparison.json`：DSA vs FA，严格 0.05 门，预期记录为失败。
+- `*.comparison-observational.json`：DSA vs FA，观察性 0.25 上界。
+- `*.dsa-repeat.json`：run008 vs run009，零容差可复现性比较。
+
+每个 run 目录还包含 request、response、schema report、summary、server command、run context 和各 rank server log。
+
+## 复现命令
+
+runner：
+
+```bash
+GLM52_DSA_RUN_ID=<unique-run-id> \
+GLM52_ATTENTION_BACKEND=dsa \
+GLM52_DSA_ROOT=/tmp/glm52-dsa-v7x32/sglang-jax \
+GLM52_DSA_PYBIN=/opt/venv/bin/python3 \
+GLM52_DSA_PORT=<unique-port> \
+SGLANG_JAX_METADATA_SCAN_THREADS=32 \
+SGLANG_MOE_RANGE_LOAD_WORKERS=32 \
+bash scripts/kernels/run_glm52_dsa_v7x32_real_e2e.sh
+```
+
+切换 FA baseline 时只改：
+
+```bash
+GLM52_ATTENTION_BACKEND=fa
+```
+
+比较：
+
+```bash
+python scripts/kernels/compare_glm52_e2e_results.py \
+  --candidate <dsa-response.json> \
+  --baseline <fa-response.json> \
+  --max-logprob-abs-error 0.05 \
+  --min-topk-overlap 0.90 \
+  --expected-topk-width 20 \
+  --output <comparison.json>
+```
+
+## 已知限制与下一步
+
+1. 当前 E2E 只覆盖到 257 input tokens，尚未覆盖 `context > index_topk` 的真实稀疏截断质量。
+2. 0.05 logprob 严格门未通过。若要求收紧，优先增加逐层 attention output trace，比较 DSA Pallas、DSA FP32 reference 和 FA，定位误差累积起点。
+3. 可评估“候选数小于等于 `index_topk` 时保持 causal slot 顺序”的数值路径，但必须先补 reference/排序语义测试，不能仅为让 E2E 阈值通过而改行为。
+4. 当前 kernel 是 correctness-first 实现。DSA 首次执行 latency 明显高于 FA，尚未做 production 性能优化。
+5. 真实模型质量仍需更长 prompt、更多 decode tokens 和任务级 eval；本轮只证明最小功能闭环及短序列 logits 一致性范围。
+
+## 清理
+
+验证结束后已完成资源清理：
+
+- v7x32 验证实验 `exp-sff91uc6va` 已 abort；artifact payload 已在 abort 前确认并上传到上述路径。
+- v7x8 debug 实验 `exp-gq082n4nzb` 已 abort。
+- 权重下载实验 `exp-q7odgo8q9x` 已成功结束。
+- 旧实验 `exp-x9...` 和 range benchmark `exp-r78...` 已 abort，clone 实验 `exp-1vt...` 已失败退出，没有继续占用计算资源。
+
+Falcon 对已 abort 实验的 artifact 链接可能显示为 `failed`，但本轮列出的结果文件已实际落入 GCS artifact root。runner 结束时出现的 `Killed` 是生成结果后清理 server process group；本轮成功 run 均已写入 `SUCCESS` 和全部 follower ACK，不代表 E2E 失败。
