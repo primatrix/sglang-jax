@@ -36,27 +36,11 @@ if [[ -z "$RUN_ID" ]]; then
   echo "GLM52_DSA_RUN_ID must be a unique value shared by all ranks" >&2
   exit 2
 fi
-if [[ "$ATTENTION_BACKEND" != "dsa" && "$ATTENTION_BACKEND" != "fa" ]]; then
-  echo "GLM52_ATTENTION_BACKEND must be dsa or fa, got: ${ATTENTION_BACKEND}" >&2
-  exit 2
-fi
-if [[ "$REQUEST_PROFILE" != "smoke" && "$REQUEST_PROFILE" != "boundary" ]]; then
-  echo "GLM52_DSA_REQUEST_PROFILE must be smoke or boundary, got: ${REQUEST_PROFILE}" >&2
-  exit 2
-fi
-if [[ ! "$MAX_NEW_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
-  echo "GLM52_DSA_MAX_NEW_TOKENS must be a positive integer, got: ${MAX_NEW_TOKENS}" >&2
-  exit 2
-fi
-if [[ ! -f "$COMPLETE_MARKER" ]]; then
-  echo "checkpoint completion marker is missing: ${COMPLETE_MARKER}" >&2
-  exit 2
-fi
-
 OUT="${ARTIFACT_ROOT}/rank-${RANK}/${RUN_ID}"
 CONTROL_PARENT="${ARTIFACT_ROOT}/control"
 CONTROL_DIR="${CONTROL_PARENT}/${RUN_ID}"
 START="${CONTROL_DIR}/START"
+ALL_READY="${CONTROL_DIR}/ALL_READY"
 SUCCESS="${CONTROL_DIR}/SUCCESS"
 STOP="${CONTROL_DIR}/STOP"
 FAIL_RANK="${CONTROL_DIR}/FAIL-rank-${RANK}"
@@ -65,11 +49,7 @@ SERVER_LOG="/tmp/tpu_logs/glm52-real-${ATTENTION_BACKEND}-${RUN_ID}-rank${RANK}.
 SERVER_PID=""
 SERVER_PGID=""
 
-mkdir -p "$OUT" "$CONTROL_PARENT"
-if [[ "${SGLANG_JAX_DEBUG_DUMP:-0}" == "1" ]]; then
-  export SGLANG_JAX_DEBUG_DUMP_DIR="$OUT/debug_dumps"
-  mkdir -p "$SGLANG_JAX_DEBUG_DUMP_DIR"
-fi
+mkdir -p "$CONTROL_PARENT"
 if [[ "$RANK" == "0" ]]; then
   if ! mkdir "$CONTROL_DIR"; then
     echo "run id already exists; choose a new GLM52_DSA_RUN_ID: ${RUN_ID}" >&2
@@ -121,6 +101,13 @@ all_followers_acked() {
   done
 }
 
+all_ranks_ready() {
+  local rank
+  for ((rank = 0; rank < NNODES; rank++)); do
+    [[ -f "${CONTROL_DIR}/READY-rank-${rank}" ]] || return 1
+  done
+}
+
 finish_server() {
   local status=$?
   trap - EXIT
@@ -128,14 +115,65 @@ finish_server() {
     touch "$FAIL_RANK" "$STOP" 2>/dev/null || true
   fi
   stop_server
-  if [[ -f "$SERVER_LOG" ]]; then
+  if [[ -f "$SERVER_LOG" && -d "$OUT" ]]; then
     cp -f "$SERVER_LOG" "$OUT/server-rank${RANK}.log" || true
   fi
   exit "$status"
 }
 trap finish_server EXIT
 
+if [[ "$ATTENTION_BACKEND" != "dsa" && "$ATTENTION_BACKEND" != "fa" ]]; then
+  echo "GLM52_ATTENTION_BACKEND must be dsa or fa, got: ${ATTENTION_BACKEND}" >&2
+  exit 2
+fi
+if [[ "$REQUEST_PROFILE" != "smoke" && "$REQUEST_PROFILE" != "boundary" ]]; then
+  echo "GLM52_DSA_REQUEST_PROFILE must be smoke or boundary, got: ${REQUEST_PROFILE}" >&2
+  exit 2
+fi
+if [[ ! "$MAX_NEW_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "GLM52_DSA_MAX_NEW_TOKENS must be a positive integer, got: ${MAX_NEW_TOKENS}" >&2
+  exit 2
+fi
+if [[ ! -f "$COMPLETE_MARKER" ]]; then
+  echo "checkpoint completion marker is missing: ${COMPLETE_MARKER}" >&2
+  exit 2
+fi
+
+mkdir -p "$OUT"
+if [[ "${SGLANG_JAX_DEBUG_DUMP:-0}" == "1" ]]; then
+  export SGLANG_JAX_DEBUG_DUMP_DIR="$OUT/debug_dumps"
+  mkdir -p "$SGLANG_JAX_DEBUG_DUMP_DIR"
+fi
+
 touch "${CONTROL_DIR}/READY-rank-${RANK}"
+ready_deadline=$(($(date +%s) + START_TIMEOUT_SECONDS))
+if [[ "$RANK" == "0" ]]; then
+  until all_ranks_ready; do
+    if has_failures; then
+      echo "rank 0 observed a peer preflight failure" >&2
+      exit 1
+    fi
+    if (( $(date +%s) >= ready_deadline )); then
+      echo "timed out waiting for all ranks to finish preflight" >&2
+      exit 1
+    fi
+    sleep 2
+  done
+  touch "$ALL_READY"
+else
+  while [[ ! -f "$ALL_READY" ]]; do
+    if has_failures; then
+      echo "rank ${RANK} observed a peer preflight failure" >&2
+      exit 1
+    fi
+    if (( $(date +%s) >= ready_deadline )); then
+      echo "rank ${RANK} timed out waiting for all-rank preflight" >&2
+      exit 1
+    fi
+    sleep 2
+  done
+fi
+
 cd "$ROOT"
 export PYTHONPATH="$ROOT/python${PYTHONPATH:+:$PYTHONPATH}"
 

@@ -100,11 +100,18 @@ def test_compare_aligns_semantic_keys_and_reports_raw_metrics(tmp_path):
         name="logical_topk_ids",
         occurrence=2,
     )
+    counts_key = _row(
+        "candidate-counts.npy",
+        component="dsa_selection",
+        name="selected_counts",
+        occurrence=2,
+    )
     _write_dump(
         candidate,
         [
             (float_key, np.array([1.0, 2.5, 2.0, 4.0], dtype=np.float32)),
             (topk_key, np.array([[1, 2, 9, 4]], dtype=np.int32)),
+            (counts_key, np.array([4], dtype=np.int32)),
         ],
     )
     _write_dump(
@@ -118,13 +125,17 @@ def test_compare_aligns_semantic_keys_and_reports_raw_metrics(tmp_path):
                 {**float_key, "filename": "baseline-hidden.npy"},
                 np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32),
             ),
+            (
+                {**counts_key, "filename": "baseline-counts.npy"},
+                np.array([4], dtype=np.int32),
+            ),
         ],
     )
 
     report = compare.compare_dump_directories(candidate, baseline)
 
     assert report["passed"] is True
-    assert report["tensor_count"] == 2
+    assert report["tensor_count"] == 3
     assert report["missing_from_candidate"] == []
     assert report["missing_from_baseline"] == []
     assert report["manifest_errors"] == []
@@ -148,6 +159,101 @@ def test_compare_aligns_semantic_keys_and_reports_raw_metrics(tmp_path):
     topk = comparisons["logical_topk_ids"]
     assert topk["metrics"]["topk_overlap"] == pytest.approx(0.75)
     json.dumps(report, sort_keys=True, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    ("candidate_ids", "baseline_ids", "candidate_count", "baseline_count", "expected"),
+    [
+        ([7, 9, -1, -1], [9, 7, -1, -1], 2, 2, 1.0),
+        ([-1, -1, -1, -1], [-1, -1, -1, -1], 0, 0, 1.0),
+        ([7, -1, -1, -1], [-1, -1, -1, -1], 1, 0, 0.0),
+        ([1, 2, 3, 4], [1, 2, 9, 4], 4, 4, 0.75),
+    ],
+)
+def test_logical_topk_overlap_uses_selected_count_prefixes(
+    tmp_path,
+    candidate_ids,
+    baseline_ids,
+    candidate_count,
+    baseline_count,
+    expected,
+):
+    compare = _load_compare_module()
+    candidate = tmp_path / "candidate"
+    baseline = tmp_path / "baseline"
+    ids_key = _row(
+        "candidate-ids.npy", component="dsa_selection", name="logical_topk_ids"
+    )
+    counts_key = _row(
+        "candidate-counts.npy", component="dsa_selection", name="selected_counts"
+    )
+    _write_dump(
+        candidate,
+        [
+            (ids_key, np.array([candidate_ids], dtype=np.int32)),
+            (counts_key, np.array([candidate_count], dtype=np.int32)),
+        ],
+    )
+    _write_dump(
+        baseline,
+        [
+            (
+                {**ids_key, "filename": "baseline-ids.npy"},
+                np.array([baseline_ids], dtype=np.int32),
+            ),
+            (
+                {**counts_key, "filename": "baseline-counts.npy"},
+                np.array([baseline_count], dtype=np.int32),
+            ),
+        ],
+    )
+
+    report = compare.compare_dump_directories(candidate, baseline)
+
+    comparison = next(
+        item for item in report["comparisons"] if item["key"]["name"] == "logical_topk_ids"
+    )
+    assert comparison["metrics"]["topk_overlap"] == pytest.approx(expected)
+
+
+def test_logical_topk_overlap_rejects_duplicate_valid_ids(tmp_path):
+    compare = _load_compare_module()
+    candidate = tmp_path / "candidate"
+    baseline = tmp_path / "baseline"
+    ids_key = _row(
+        "candidate-ids.npy", component="dsa_selection", name="logical_topk_ids"
+    )
+    counts_key = _row(
+        "candidate-counts.npy", component="dsa_selection", name="selected_counts"
+    )
+    _write_dump(
+        candidate,
+        [
+            (ids_key, np.array([[3, 3, -1, -1]], dtype=np.int32)),
+            (counts_key, np.array([2], dtype=np.int32)),
+        ],
+    )
+    _write_dump(
+        baseline,
+        [
+            (
+                {**ids_key, "filename": "baseline-ids.npy"},
+                np.array([[3, 4, -1, -1]], dtype=np.int32),
+            ),
+            (
+                {**counts_key, "filename": "baseline-counts.npy"},
+                np.array([2], dtype=np.int32),
+            ),
+        ],
+    )
+
+    report = compare.compare_dump_directories(candidate, baseline)
+
+    comparison = next(
+        item for item in report["comparisons"] if item["key"]["name"] == "logical_topk_ids"
+    )
+    assert comparison["passed"] is False
+    assert comparison["failures"] == ["candidate valid Top-K prefix contains duplicate IDs"]
 
 
 def test_compare_discovers_nested_non_process_manifest_names(tmp_path):
@@ -174,6 +280,76 @@ def test_compare_discovers_nested_non_process_manifest_names(tmp_path):
     assert report["passed"] is True
     assert report["tensor_count"] == 1
     assert report["manifest_errors"] == []
+
+
+def test_nested_manifest_cannot_reference_sibling_dump_tree(tmp_path):
+    compare = _load_compare_module()
+    candidate = tmp_path / "candidate"
+    baseline = tmp_path / "baseline"
+    rank_a = candidate / "rank-a"
+    rank_b = candidate / "rank-b"
+    rank_a.mkdir(parents=True)
+    rank_b.mkdir(parents=True)
+    np.save(rank_b / "hidden.npy", np.array([1.0], dtype=np.float32))
+    row = _row("../rank-b/hidden.npy")
+    (rank_a / "manifest-a.jsonl").write_text(
+        json.dumps({**row, "shape": [1], "dtype": "float32"}) + "\n",
+        encoding="utf-8",
+    )
+    _write_dump(
+        baseline,
+        [(_row("baseline.npy"), np.array([1.0], dtype=np.float32))],
+    )
+
+    report = compare.compare_dump_directories(candidate, baseline)
+
+    assert report["passed"] is False
+    assert report["manifest_errors"] == [
+        "candidate:rank-a/manifest-a.jsonl:1: filename escapes the manifest directory"
+    ]
+
+
+def test_manifest_rejects_symlinked_tensor_even_when_target_is_local(tmp_path):
+    compare = _load_compare_module()
+    candidate = tmp_path / "candidate"
+    baseline = tmp_path / "baseline"
+    candidate.mkdir()
+    np.save(candidate / "real.npy", np.array([1.0], dtype=np.float32))
+    (candidate / "linked.npy").symlink_to("real.npy")
+    row = _row("linked.npy")
+    _write_manifest(candidate, row, shape=(1,), dtype="float32")
+    _write_dump(
+        baseline,
+        [(_row("baseline.npy"), np.array([1.0], dtype=np.float32))],
+    )
+
+    report = compare.compare_dump_directories(candidate, baseline)
+
+    assert report["passed"] is False
+    assert report["manifest_errors"] == [
+        "candidate:manifest-p00000.jsonl:1: tensor path must not be a symlink"
+    ]
+
+
+def test_symlinked_manifest_is_rejected(tmp_path):
+    compare = _load_compare_module()
+    candidate = tmp_path / "candidate"
+    baseline = tmp_path / "baseline"
+    candidate.mkdir()
+    real_manifest = candidate / "rows.jsonl"
+    real_manifest.write_text("", encoding="utf-8")
+    (candidate / "manifest-linked.jsonl").symlink_to(real_manifest.name)
+    _write_dump(
+        baseline,
+        [(_row("baseline.npy"), np.array([1.0], dtype=np.float32))],
+    )
+
+    report = compare.compare_dump_directories(candidate, baseline)
+
+    assert report["passed"] is False
+    assert report["manifest_errors"] == [
+        "candidate:manifest-linked.jsonl: manifest path must not be a symlink"
+    ]
 
 
 def test_compare_reports_non_utf8_manifest_without_crashing(tmp_path):
@@ -308,16 +484,35 @@ def test_cli_reports_truncated_tensor_files_as_deterministic_json_failure(
     assert report["first_failing_key"] == report["comparisons"][0]["key"]
 
 
-@pytest.mark.parametrize("dtype", [np.int64, np.uint32, np.bool_])
-def test_metric_values_promote_all_numeric_dtypes_to_float32(dtype):
+@pytest.mark.parametrize(
+    ("dtype", "expected_dtype"),
+    [
+        (np.float16, np.float32),
+        (np.float32, np.float32),
+        (np.float64, np.float64),
+        (np.int64, np.int64),
+        (np.uint32, np.uint32),
+        (np.bool_, np.bool_),
+    ],
+)
+def test_metric_values_only_promote_low_precision_floats(dtype, expected_dtype):
     compare = _load_compare_module()
 
     values = compare._as_metric_values(np.array([0, 1], dtype=dtype))
 
+    assert values.dtype == np.dtype(expected_dtype)
+
+
+def test_metric_values_promote_bfloat16_to_float32():
+    compare = _load_compare_module()
+    bfloat16 = pytest.importorskip("ml_dtypes").bfloat16
+
+    values = compare._as_metric_values(np.array([0, 1], dtype=bfloat16))
+
     assert values.dtype == np.dtype(np.float32)
 
 
-def test_integer_difference_metrics_are_computed_after_float32_promotion():
+def test_integer_difference_metrics_preserve_units_above_float32_exact_range():
     compare = _load_compare_module()
 
     metrics = compare._metrics(
@@ -326,7 +521,18 @@ def test_integer_difference_metrics_are_computed_after_float32_promotion():
         tensor_name="selected_counts",
     )
 
-    assert metrics["max_abs"] == 0.0
+    assert metrics["max_abs"] == 1.0
+
+
+def test_complex_metrics_are_rejected_instead_of_dropping_imaginary_values():
+    compare = _load_compare_module()
+
+    with pytest.raises(TypeError, match="complex tensors are unsupported"):
+        compare._metrics(
+            np.array([1 + 2j], dtype=np.complex64),
+            np.array([1 + 3j], dtype=np.complex64),
+            tensor_name="hidden_states",
+        )
 
 
 def test_max_float_opposing_signs_produce_finite_strict_json_metrics(tmp_path):

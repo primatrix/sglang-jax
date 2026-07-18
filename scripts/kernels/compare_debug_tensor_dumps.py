@@ -99,6 +99,11 @@ def _read_manifests(
 
     for manifest in manifests:
         manifest_name = _manifest_label(directory, manifest)
+        if manifest.is_symlink():
+            errors.append(
+                f"{label}:{manifest_name}: manifest path must not be a symlink"
+            )
+            continue
         try:
             lines = manifest.read_text(encoding="utf-8").splitlines()
         except UnicodeDecodeError:
@@ -145,10 +150,14 @@ def _read_manifests(
                 errors.append(f"{location}: dtype must be a non-empty string")
                 continue
             array_path = manifest.parent / filename
+            if array_path.is_symlink():
+                errors.append(f"{location}: tensor path must not be a symlink")
+                continue
             try:
-                array_path.resolve().relative_to(directory.resolve())
+                resolved_array_path = array_path.resolve()
+                resolved_array_path.relative_to(manifest.parent.resolve())
             except (OSError, ValueError):
-                errors.append(f"{location}: filename escapes the dump directory")
+                errors.append(f"{location}: filename escapes the manifest directory")
                 continue
             if key in rows:
                 rendered_key = json.dumps(_key_dict(key), sort_keys=True)
@@ -156,7 +165,7 @@ def _read_manifests(
                 duplicate_keys.append(key)
                 continue
             rows[key] = {
-                "array_path": array_path,
+                "array_path": resolved_array_path,
                 "declared_shape": tuple(shape),
                 "declared_dtype": dtype,
                 "location": location,
@@ -203,6 +212,10 @@ def _load_array(record: dict[str, Any], label: str) -> tuple[np.ndarray | None, 
 
 def _as_metric_values(array: np.ndarray) -> np.ndarray:
     dtype_name = str(array.dtype)
+    if dtype_name == "bfloat16":
+        return array.astype(np.float32)
+    if np.issubdtype(array.dtype, np.complexfloating):
+        raise TypeError("complex tensors are unsupported")
     try:
         numeric = np.issubdtype(array.dtype, np.number) or np.issubdtype(
             array.dtype, np.bool_
@@ -211,11 +224,18 @@ def _as_metric_values(array: np.ndarray) -> np.ndarray:
         numeric = dtype_name == "bfloat16"
     if not numeric:
         raise TypeError(f"unsupported non-numeric dtype {array.dtype}")
-    return array.astype(np.float32)
+    if np.issubdtype(array.dtype, np.floating) and array.dtype.itemsize < 4:
+        return array.astype(np.float32)
+    return array
 
 
 def _topk_overlap(
-    candidate: np.ndarray, baseline: np.ndarray, *, tensor_name: str
+    candidate: np.ndarray,
+    baseline: np.ndarray,
+    *,
+    tensor_name: str,
+    candidate_counts: np.ndarray | None = None,
+    baseline_counts: np.ndarray | None = None,
 ) -> float | None:
     try:
         integer_ids = np.issubdtype(candidate.dtype, np.integer)
@@ -231,26 +251,94 @@ def _topk_overlap(
         return None
     candidate_rows = candidate.reshape(-1, width)
     baseline_rows = baseline.reshape(-1, width)
-    overlaps = [
-        len(set(candidate_row.tolist()) & set(baseline_row.tolist())) / width
-        for candidate_row, baseline_row in zip(
-            candidate_rows, baseline_rows, strict=True
+    if tensor_name == "logical_topk_ids":
+        if candidate_counts is None or baseline_counts is None:
+            raise ValueError(
+                "logical_topk_ids requires matching selected_counts tensors"
+            )
+        for label, counts in (
+            ("candidate", candidate_counts),
+            ("baseline", baseline_counts),
+        ):
+            try:
+                integer_counts = np.issubdtype(counts.dtype, np.integer)
+            except TypeError:
+                integer_counts = False
+            if not integer_counts:
+                raise ValueError(f"{label} selected_counts must have integer dtype")
+            if counts.size != candidate_rows.shape[0]:
+                raise ValueError(
+                    f"{label} selected_counts shape is incompatible with logical_topk_ids"
+                )
+        candidate_widths = candidate_counts.reshape(-1)
+        baseline_widths = baseline_counts.reshape(-1)
+    else:
+        candidate_widths = np.full(candidate_rows.shape[0], width, dtype=np.int64)
+        baseline_widths = np.full(baseline_rows.shape[0], width, dtype=np.int64)
+
+    overlaps = []
+    for candidate_row, baseline_row, candidate_width, baseline_width in zip(
+        candidate_rows,
+        baseline_rows,
+        candidate_widths,
+        baseline_widths,
+        strict=True,
+    ):
+        candidate_width = int(candidate_width)
+        baseline_width = int(baseline_width)
+        if not 0 <= candidate_width <= width:
+            raise ValueError(
+                f"candidate selected_count {candidate_width} is outside [0, {width}]"
+            )
+        if not 0 <= baseline_width <= width:
+            raise ValueError(
+                f"baseline selected_count {baseline_width} is outside [0, {width}]"
+            )
+        candidate_ids = candidate_row[:candidate_width].tolist()
+        baseline_ids = baseline_row[:baseline_width].tolist()
+        if len(set(candidate_ids)) != len(candidate_ids):
+            raise ValueError("candidate valid Top-K prefix contains duplicate IDs")
+        if len(set(baseline_ids)) != len(baseline_ids):
+            raise ValueError("baseline valid Top-K prefix contains duplicate IDs")
+        denominator = max(candidate_width, baseline_width)
+        overlaps.append(
+            1.0
+            if denominator == 0
+            else len(set(candidate_ids) & set(baseline_ids)) / denominator
         )
-    ]
     return float(min(overlaps)) if overlaps else None
 
 
 def _metrics(
-    candidate: np.ndarray, baseline: np.ndarray, *, tensor_name: str
+    candidate: np.ndarray,
+    baseline: np.ndarray,
+    *,
+    tensor_name: str,
+    candidate_counts: np.ndarray | None = None,
+    baseline_counts: np.ndarray | None = None,
 ) -> dict[str, float | None]:
     candidate_values = _as_metric_values(candidate)
     baseline_values = _as_metric_values(baseline)
     if not np.all(np.isfinite(candidate_values)) or not np.all(np.isfinite(baseline_values)):
         raise ValueError("tensor contains non-finite values")
 
-    candidate_metric_values = candidate_values.astype(np.float64)
-    baseline_metric_values = baseline_values.astype(np.float64)
-    difference = np.abs(candidate_metric_values - baseline_metric_values)
+    integer_values = np.issubdtype(candidate_values.dtype, np.integer) or np.issubdtype(
+        candidate_values.dtype, np.bool_
+    )
+    if integer_values:
+        difference = np.asarray(
+            np.abs(
+                candidate_values.astype(object) - baseline_values.astype(object)
+            ),
+            dtype=np.float64,
+        )
+    else:
+        candidate_metric_values = candidate_values.astype(np.float64)
+        baseline_metric_values = baseline_values.astype(np.float64)
+        with np.errstate(over="ignore", invalid="ignore"):
+            difference = np.abs(candidate_metric_values - baseline_metric_values)
+    if not np.all(np.isfinite(difference)):
+        raise ValueError("metric difference overflowed to a non-finite value")
     if difference.size:
         max_abs = float(np.max(difference))
         mean_abs = float(np.mean(difference, dtype=np.float64))
@@ -258,8 +346,8 @@ def _metrics(
     else:
         max_abs = mean_abs = p99_abs = 0.0
 
-    candidate_flat = candidate_metric_values.reshape(-1)
-    baseline_flat = baseline_metric_values.reshape(-1)
+    candidate_flat = candidate_values.astype(np.float64).reshape(-1)
+    baseline_flat = baseline_values.astype(np.float64).reshape(-1)
     candidate_norm = float(np.linalg.norm(candidate_flat))
     baseline_norm = float(np.linalg.norm(baseline_flat))
     cosine = None
@@ -275,7 +363,11 @@ def _metrics(
         "p99_abs": p99_abs,
         "cosine": cosine,
         "topk_overlap": _topk_overlap(
-            candidate, baseline, tensor_name=tensor_name
+            candidate,
+            baseline,
+            tensor_name=tensor_name,
+            candidate_counts=candidate_counts,
+            baseline_counts=baseline_counts,
         ),
     }
 
@@ -371,10 +463,33 @@ def compare_dump_directories(
 
         metrics = dict(EMPTY_METRICS)
         if not failures and candidate is not None and baseline is not None:
+            candidate_counts = None
+            baseline_counts = None
+            if key[3] == "logical_topk_ids":
+                counts_key = (*key[:3], "selected_counts", *key[4:])
+                if counts_key in candidate_rows:
+                    candidate_counts, count_errors = _load_array(
+                        candidate_rows[counts_key], "candidate selected_counts"
+                    )
+                    failures.extend(count_errors)
+                if counts_key in baseline_rows:
+                    baseline_counts, count_errors = _load_array(
+                        baseline_rows[counts_key], "baseline selected_counts"
+                    )
+                    failures.extend(count_errors)
             try:
-                metrics = _metrics(candidate, baseline, tensor_name=str(key[3]))
+                if failures:
+                    raise ValueError(failures[0])
+                metrics = _metrics(
+                    candidate,
+                    baseline,
+                    tensor_name=str(key[3]),
+                    candidate_counts=candidate_counts,
+                    baseline_counts=baseline_counts,
+                )
             except (TypeError, ValueError) as error:
-                failures.append(str(error))
+                if str(error) not in failures:
+                    failures.append(str(error))
             else:
                 failures.extend(_threshold_failures(metrics, thresholds))
 

@@ -346,3 +346,28 @@ def test_real_runner_exports_rank_local_debug_dump_directory_when_enabled():
     assert dump_gate in runner
     assert dump_export in runner
     assert runner.index(dump_export) < runner.index("setsid")
+
+
+def test_real_runner_installs_failure_trap_before_rank_local_preflight():
+    runner = RUNNER_PATH.read_text(encoding="utf-8")
+
+    trap_index = runner.index("trap finish_server EXIT")
+    for rank_local_preflight in (
+        'if [[ "$ATTENTION_BACKEND" != "dsa"',
+        'if [[ "$REQUEST_PROFILE" != "smoke"',
+        'if [[ ! -f "$COMPLETE_MARKER" ]]',
+        'mkdir -p "$OUT"',
+    ):
+        assert trap_index < runner.index(rank_local_preflight)
+
+
+def test_real_runner_rendezvous_waits_for_every_rank_before_server_launch():
+    runner = RUNNER_PATH.read_text(encoding="utf-8")
+
+    ready_index = runner.index('touch "${CONTROL_DIR}/READY-rank-${RANK}"')
+    wait_index = runner.index("all_ranks_ready")
+    all_ready_index = runner.index('touch "$ALL_READY"')
+    launch_index = runner.index('setsid "$PYBIN"')
+    assert ready_index < all_ready_index < launch_index
+    assert wait_index < launch_index
+    assert 'if has_failures; then' in runner[ready_index:launch_index]
