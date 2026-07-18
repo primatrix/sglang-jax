@@ -2,12 +2,20 @@ import importlib.util
 import json
 import math
 import stat
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[3]
 COMPARE_PATH = ROOT / "scripts/kernels/compare_glm52_e2e_results.py"
 RUNNER_PATH = ROOT / "scripts/kernels/run_glm52_dsa_v7x32_real_e2e.sh"
+REQUEST_GENERATOR_MARKER = (
+    '"$PYBIN" - "$OUT" "$REQUEST_PROFILE" "$MAX_NEW_TOKENS" "$MODEL_PATH" '
+    "<<'PY'\n"
+)
 
 
 def _load_compare_module():
@@ -17,6 +25,54 @@ def _load_compare_module():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def _request_generator_source():
+    runner = RUNNER_PATH.read_text(encoding="utf-8")
+    assert REQUEST_GENERATOR_MARKER in runner
+    remainder = runner.split(REQUEST_GENERATOR_MARKER, maxsplit=1)[1]
+    source, separator, _remainder = remainder.partition("\nPY\n")
+    assert separator
+    return source
+
+
+def _run_request_generator(tmp_path, *, profile, max_new_tokens, vocab_size=256):
+    model_dir = tmp_path / f"{profile}-model"
+    output_dir = tmp_path / f"{profile}-output"
+    model_dir.mkdir()
+    output_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({"vocab_size": vocab_size}), encoding="utf-8"
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-",
+            str(output_dir),
+            profile,
+            str(max_new_tokens),
+            str(model_dir),
+        ],
+        input=_request_generator_source(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    request_names = (output_dir / "request_names.txt").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    requests = {
+        name: json.loads(
+            (output_dir / f"{name}.request.json").read_text(encoding="utf-8")
+        )
+        for name in request_names
+    }
+    return requests
+
+
+def _input_rows(input_ids):
+    return input_ids if input_ids and isinstance(input_ids[0], list) else [input_ids]
 
 
 def _response(
@@ -226,6 +282,50 @@ def test_real_runner_supports_smoke_and_boundary_request_profiles():
     assert '"ignore_eos": True' in runner
     assert 'config["vocab_size"]' in runner
     assert "0 <= token_id < vocab_size" in runner
+
+
+@pytest.mark.parametrize(
+    ("profile", "max_new_tokens", "expected_lengths"),
+    [
+        (
+            "smoke",
+            2,
+            {"short": [4], "chunked": [257], "ragged": [9, 133]},
+        ),
+        (
+            "boundary",
+            1,
+            {
+                "boundary_2047": [2047],
+                "boundary_2048": [2048],
+                "boundary_2049": [2049],
+                "boundary_3072": [3072],
+            },
+        ),
+    ],
+)
+def test_real_runner_executes_request_generator_profiles(
+    tmp_path, profile, max_new_tokens, expected_lengths
+):
+    vocab_size = 256
+
+    requests = _run_request_generator(
+        tmp_path,
+        profile=profile,
+        max_new_tokens=max_new_tokens,
+        vocab_size=vocab_size,
+    )
+
+    assert list(requests) == list(expected_lengths)
+    for name, expected in expected_lengths.items():
+        payload = requests[name]
+        rows = _input_rows(payload["input_ids"])
+        assert [len(row) for row in rows] == expected
+        assert all(0 <= token_id < vocab_size for row in rows for token_id in row)
+        assert payload["sampling_params"]["ignore_eos"] is True
+        assert payload["sampling_params"]["max_new_tokens"] == max_new_tokens
+        assert payload["return_logprob"] is True
+        assert payload["top_logprobs_num"] == 20
 
 
 def test_real_runner_derives_expected_counts_from_generated_requests():

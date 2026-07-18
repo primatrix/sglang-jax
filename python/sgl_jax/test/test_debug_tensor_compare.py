@@ -40,6 +40,32 @@ def _write_dump(directory, rows):
         )
 
 
+def _write_named_dump(root, manifest_name, row, array):
+    manifest = root / manifest_name
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    host_array = np.asarray(array)
+    np.save(manifest.parent / row["filename"], host_array, allow_pickle=False)
+    manifest.write_text(
+        json.dumps(
+            {
+                **row,
+                "shape": list(host_array.shape),
+                "dtype": str(host_array.dtype),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_manifest(directory, row, *, shape, dtype):
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "manifest-p00000.jsonl").write_text(
+        json.dumps({**row, "shape": list(shape), "dtype": str(dtype)}) + "\n",
+        encoding="utf-8",
+    )
+
+
 def _row(
     filename,
     *,
@@ -120,6 +146,126 @@ def test_compare_aligns_semantic_keys_and_reports_raw_metrics(tmp_path):
     topk = comparisons["logical_topk_ids"]
     assert topk["metrics"]["topk_overlap"] == pytest.approx(0.75)
     json.dumps(report, sort_keys=True, allow_nan=False)
+
+
+def test_compare_discovers_nested_non_process_manifest_names(tmp_path):
+    compare = _load_compare_module()
+    candidate = tmp_path / "candidate"
+    baseline = tmp_path / "baseline"
+    key = _row("hidden.npy", process=7)
+    array = np.array([1.0, 2.0], dtype=np.float32)
+    _write_named_dump(
+        candidate,
+        "rank-7/run-a/debug_dumps/manifest-worker.jsonl",
+        key,
+        array,
+    )
+    _write_named_dump(
+        baseline,
+        "artifacts/host-7/manifest-reference.jsonl",
+        key,
+        array,
+    )
+
+    report = compare.compare_dump_directories(candidate, baseline)
+
+    assert report["passed"] is True
+    assert report["tensor_count"] == 1
+    assert report["manifest_errors"] == []
+
+
+def test_compare_reports_non_utf8_manifest_without_crashing(tmp_path):
+    compare = _load_compare_module()
+    candidate = tmp_path / "candidate"
+    baseline = tmp_path / "baseline"
+    candidate.mkdir()
+    (candidate / "manifest-p00000.jsonl").write_bytes(b"\xff\xfe\x00")
+    _write_dump(
+        baseline,
+        [(_row("baseline.npy"), np.array([1.0], dtype=np.float32))],
+    )
+
+    report = compare.compare_dump_directories(candidate, baseline)
+
+    assert report["passed"] is False
+    assert report["manifest_errors"] == [
+        "candidate:manifest-p00000.jsonl: manifest is not valid UTF-8"
+    ]
+
+
+def test_compare_reports_npz_as_unsupported_loadable(tmp_path):
+    compare = _load_compare_module()
+    candidate = tmp_path / "candidate"
+    baseline = tmp_path / "baseline"
+    key = _row("candidate.npz")
+    candidate.mkdir()
+    np.savez(candidate / key["filename"], values=np.array([1.0], dtype=np.float32))
+    _write_manifest(candidate, key, shape=(1,), dtype="float32")
+    _write_dump(
+        baseline,
+        [
+            (
+                {**key, "filename": "baseline.npy"},
+                np.array([1.0], dtype=np.float32),
+            )
+        ],
+    )
+
+    report = compare.compare_dump_directories(candidate, baseline)
+
+    assert report["passed"] is False
+    assert report["comparisons"][0]["failures"] == [
+        "candidate: loaded object is not an ndarray: NpzFile"
+    ]
+    json.dumps(report, sort_keys=True, allow_nan=False)
+
+
+def test_load_array_closes_unsupported_loadable(monkeypatch, tmp_path):
+    compare = _load_compare_module()
+
+    class UnsupportedLoadable:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    loadable = UnsupportedLoadable()
+    monkeypatch.setattr(compare.np, "load", lambda *_args, **_kwargs: loadable)
+    record = {
+        "array_path": tmp_path / "unsupported",
+        "declared_shape": (1,),
+        "declared_dtype": "float32",
+    }
+
+    array, errors = compare._load_array(record, "candidate")
+
+    assert array is None
+    assert errors == [
+        "candidate: loaded object is not an ndarray: UnsupportedLoadable"
+    ]
+    assert loadable.closed is True
+
+
+@pytest.mark.parametrize("dtype", [np.int64, np.uint32, np.bool_])
+def test_metric_values_promote_all_numeric_dtypes_to_float32(dtype):
+    compare = _load_compare_module()
+
+    values = compare._as_metric_values(np.array([0, 1], dtype=dtype))
+
+    assert values.dtype == np.dtype(np.float32)
+
+
+def test_integer_difference_metrics_are_computed_after_float32_promotion():
+    compare = _load_compare_module()
+
+    metrics = compare._metrics(
+        np.array([16_777_217], dtype=np.int64),
+        np.array([16_777_216], dtype=np.int64),
+        tensor_name="selected_counts",
+    )
+
+    assert metrics["max_abs"] == 0.0
 
 
 @pytest.mark.parametrize(

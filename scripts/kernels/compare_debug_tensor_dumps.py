@@ -90,16 +90,19 @@ def _read_manifests(
         return rows, [f"{label}: dump directory does not exist or is not a directory"], []
 
     manifests = sorted(
-        directory.rglob("manifest-p*.jsonl"),
+        directory.rglob("manifest-*.jsonl"),
         key=lambda path: path.relative_to(directory).as_posix(),
     )
     if not manifests:
-        return rows, [f"{label}: no manifest-p*.jsonl files found"], []
+        return rows, [f"{label}: no manifest-*.jsonl files found"], []
 
     for manifest in manifests:
         manifest_name = _manifest_label(directory, manifest)
         try:
             lines = manifest.read_text(encoding="utf-8").splitlines()
+        except UnicodeDecodeError:
+            errors.append(f"{label}:{manifest_name}: manifest is not valid UTF-8")
+            continue
         except OSError as error:
             errors.append(f"{label}:{manifest_name}: cannot read manifest: {error}")
             continue
@@ -166,6 +169,20 @@ def _load_array(record: dict[str, Any], label: str) -> tuple[np.ndarray | None, 
         array = np.load(record["array_path"], allow_pickle=False)
     except (OSError, ValueError) as error:
         return None, [f"{label}: cannot load tensor: {error}"]
+    if not isinstance(array, np.ndarray):
+        loadable_type = type(array).__name__
+        close = getattr(array, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as error:  # pragma: no cover - defensive for third-party loaders.
+                return None, [
+                    f"{label}: loaded object is not an ndarray: {loadable_type}; "
+                    f"close failed: {type(error).__name__}"
+                ]
+        return None, [
+            f"{label}: loaded object is not an ndarray: {loadable_type}"
+        ]
     if tuple(array.shape) != record["declared_shape"]:
         errors.append(
             f"{label}: manifest shape {list(record['declared_shape'])} does not match "
@@ -182,20 +199,14 @@ def _load_array(record: dict[str, Any], label: str) -> tuple[np.ndarray | None, 
 def _as_metric_values(array: np.ndarray) -> np.ndarray:
     dtype_name = str(array.dtype)
     try:
-        floating = np.issubdtype(array.dtype, np.floating)
-    except TypeError:
-        floating = dtype_name == "bfloat16"
-    if floating or dtype_name == "bfloat16":
-        return array.astype(np.float32)
-    try:
         numeric = np.issubdtype(array.dtype, np.number) or np.issubdtype(
             array.dtype, np.bool_
         )
     except TypeError:
-        numeric = False
+        numeric = dtype_name == "bfloat16"
     if not numeric:
         raise TypeError(f"unsupported non-numeric dtype {array.dtype}")
-    return array.astype(np.float64)
+    return array.astype(np.float32)
 
 
 def _topk_overlap(

@@ -325,27 +325,27 @@ def request(input_ids):
     }
 
 
-def boundary_input_ids(length, offset):
+def vocab_input_ids(length, offset):
     return [(offset + index) % vocab_size for index in range(length)]
 
 
 if profile == "smoke":
     requests = {
-        "short": request([1, 2, 3, 4]),
-        "chunked": request([100 + (index % 1000) for index in range(257)]),
+        "short": request(vocab_input_ids(4, 1)),
+        "chunked": request(vocab_input_ids(257, 100)),
         "ragged": request(
             [
-                [200 + index for index in range(9)],
-                [500 + (index % 1000) for index in range(133)],
+                vocab_input_ids(9, 200),
+                vocab_input_ids(133, 500),
             ]
         ),
     }
 else:
     requests = {
-        "boundary_2047": request(boundary_input_ids(2047, 100)),
-        "boundary_2048": request(boundary_input_ids(2048, 200)),
-        "boundary_2049": request(boundary_input_ids(2049, 300)),
-        "boundary_3072": request(boundary_input_ids(3072, 400)),
+        "boundary_2047": request(vocab_input_ids(2047, 100)),
+        "boundary_2048": request(vocab_input_ids(2048, 200)),
+        "boundary_2049": request(vocab_input_ids(2049, 300)),
+        "boundary_3072": request(vocab_input_ids(3072, 400)),
     }
 
 
