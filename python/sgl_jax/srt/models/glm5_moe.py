@@ -45,7 +45,9 @@ class GlmNorm(nnx.Module):
         return normalized * self.weight.value + self.bias.value
 
 
-def get_hadamard_matrix(n):
+def get_hadamard_matrix(n: int) -> jax.Array:
+    if n <= 0 or n & (n - 1):
+        raise ValueError(f"Hadamard dimension must be a positive power of two; got {n}")
     if n == 1:
         return jnp.array([[1.0]])
     h = get_hadamard_matrix(n // 2)
@@ -59,12 +61,42 @@ class GlmDsaIndexer(nnx.Module):
         q_lora_rank: int,
         index_head_dim: int,
         index_n_heads: int,
+        index_topk: int,
+        rope_head_dim: int,
+        max_position_embeddings: int,
+        rope_theta: float,
+        rope_scaling: dict[str, Any] | None,
+        indexer_rope_interleave: bool,
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
         scope_name: str = "indexer",
     ):
-        self.head_dim = index_head_dim
-        self.n_head = index_n_heads
+        if index_head_dim <= 0 or index_head_dim & (index_head_dim - 1):
+            raise ValueError(
+                "index_head_dim must be a positive power of two for the "
+                f"Hadamard transform; got {index_head_dim}"
+            )
+        if index_n_heads <= 0:
+            raise ValueError(f"index_n_heads must be positive; got {index_n_heads}")
+        if index_topk <= 1:
+            raise ValueError(f"index_topk must be greater than one; got {index_topk}")
+        if rope_head_dim <= 0 or rope_head_dim > index_head_dim:
+            raise ValueError(
+                "rope_head_dim must be in (0, index_head_dim]; got "
+                f"rope_head_dim={rope_head_dim}, index_head_dim={index_head_dim}"
+            )
+
+        self.index_head_dim = index_head_dim
+        self.index_n_heads = index_n_heads
+        self.index_topk = index_topk
+        self.rope_head_dim = rope_head_dim
+        self.max_position_embeddings = max_position_embeddings
+        self.rope_theta = rope_theta
+        # RotaryEmbedding does not yet implement scaled RoPE. Keep the exact
+        # checkpoint value visible so the Falcon parity gate cannot silently
+        # claim that scaling was applied.
+        self.rope_scaling = rope_scaling
+        self.indexer_rope_interleave = indexer_rope_interleave
         self.mesh = mesh
 
         self.wq_b = LinearBase(
@@ -96,54 +128,150 @@ class GlmDsaIndexer(nnx.Module):
             mesh=mesh,
             scope_name="weights_proj",
         )
+        self.rotary_emb = RotaryEmbedding(
+            head_size=index_head_dim,
+            rotary_dim=rope_head_dim,
+            max_position_embeddings=max_position_embeddings,
+            base=rope_theta,
+            is_neox_style=not indexer_rope_interleave,
+            dtype=dtype,
+            mesh=mesh,
+        )
 
-    def __call__(
-        self, hidden_states: jax.Array, qr: jax.Array, positions: jax.Array, rotary_emb: Any
+    @staticmethod
+    def score_candidates(
+        q_index: jax.Array,
+        head_weights: jax.Array,
+        k_index_cache: jax.Array,
+        candidate_slots: jax.Array,
     ) -> jax.Array:
-        # 1. Project Query and Key
-        query, _ = self.wq_b(qr)
-        query = query.reshape(-1, self.n_head, self.head_dim)
+        """Compute the unmasked GLM DSA score for each candidate slot."""
+        if q_index.ndim != 3:
+            raise ValueError(f"q_index must have rank 3; got {q_index.ndim}")
+        if head_weights.shape != q_index.shape[:2]:
+            raise ValueError(
+                "head_weights must match q_index [tokens, heads]; got "
+                f"{head_weights.shape} and {q_index.shape}"
+            )
+        if k_index_cache.ndim != 2 or k_index_cache.shape[1] != q_index.shape[2]:
+            raise ValueError(
+                "k_index_cache must have shape [slots, q_index_dim]; got "
+                f"{k_index_cache.shape} for q_index {q_index.shape}"
+            )
+        if k_index_cache.shape[0] == 0:
+            raise ValueError("k_index_cache must contain at least one safe slot")
+        if candidate_slots.ndim != 2 or candidate_slots.shape[0] != q_index.shape[0]:
+            raise ValueError(
+                "candidate_slots must have shape [tokens, candidates]; got "
+                f"{candidate_slots.shape} for q_index {q_index.shape}"
+            )
+        if candidate_slots.dtype != jnp.int32:
+            raise TypeError(f"candidate_slots must have dtype int32; got {candidate_slots.dtype}")
 
+        safe_slots = jnp.clip(candidate_slots, 0, k_index_cache.shape[0] - 1)
+        candidate_keys = k_index_cache[safe_slots]
+        logits = jnp.einsum(
+            "thd,tcd->tch",
+            q_index.astype(jnp.float32),
+            candidate_keys.astype(jnp.float32),
+        )
+        scores = jnp.sum(
+            jax.nn.relu(logits) * head_weights[:, None, :].astype(jnp.float32),
+            axis=-1,
+        )
+        return scores * (q_index.shape[2] ** -0.5) * (q_index.shape[1] ** -0.5)
+
+    @staticmethod
+    def select_topk(
+        q_index: jax.Array,
+        head_weights: jax.Array,
+        k_index_cache: jax.Array,
+        candidate_slots: jax.Array,
+        candidate_logical_ids: jax.Array,
+        candidate_counts: jax.Array,
+        *,
+        index_topk: int,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Select logical IDs while reading Index-K from physical candidate slots."""
+        if index_topk <= 1:
+            raise ValueError(f"index_topk must be greater than one; got {index_topk}")
+        if candidate_logical_ids.shape != candidate_slots.shape:
+            raise ValueError(
+                "candidate_logical_ids must match candidate_slots shape; got "
+                f"{candidate_logical_ids.shape} and {candidate_slots.shape}"
+            )
+        if candidate_logical_ids.dtype != jnp.int32:
+            raise TypeError(
+                "candidate_logical_ids must have dtype int32; got " f"{candidate_logical_ids.dtype}"
+            )
+        if candidate_counts.shape != (q_index.shape[0],):
+            raise ValueError(
+                f"candidate_counts must have shape {(q_index.shape[0],)}; "
+                f"got {candidate_counts.shape}"
+            )
+        if candidate_counts.dtype != jnp.int32:
+            raise TypeError(f"candidate_counts must have dtype int32; got {candidate_counts.dtype}")
+
+        candidate_width = candidate_slots.shape[1]
+        scores = GlmDsaIndexer.score_candidates(
+            q_index,
+            head_weights,
+            k_index_cache,
+            candidate_slots,
+        )
+
+        bounded_counts = jnp.clip(candidate_counts, 0, candidate_width)
+        candidate_valid = jnp.arange(candidate_width)[None, :] < bounded_counts[:, None]
+        scores = jnp.where(candidate_valid, scores, -jnp.inf)
+
+        pad_width = max(0, index_topk - candidate_width)
+        if pad_width:
+            scores = jnp.pad(scores, ((0, 0), (0, pad_width)), constant_values=-jnp.inf)
+            candidate_logical_ids = jnp.pad(
+                candidate_logical_ids,
+                ((0, 0), (0, pad_width)),
+                constant_values=-1,
+            )
+
+        _, topk_offsets = jax.lax.top_k(scores, index_topk)
+        logical_topk_ids = jnp.take_along_axis(candidate_logical_ids, topk_offsets, axis=1)
+        selected_counts = jnp.minimum(bounded_counts, index_topk).astype(jnp.int32)
+        selected_valid = jnp.arange(index_topk)[None, :] < selected_counts[:, None]
+        logical_topk_ids = jnp.where(selected_valid, logical_topk_ids, -1).astype(jnp.int32)
+        return logical_topk_ids, selected_counts
+
+    def _hadamard_rotate(self, value: jax.Array) -> jax.Array:
+        matrix = get_hadamard_matrix(self.index_head_dim).astype(value.dtype)
+        matrix = matrix * jnp.asarray(self.index_head_dim**-0.5, dtype=value.dtype)
+        return jnp.einsum("...d,de->...e", value, matrix)
+
+    def project_query(
+        self,
+        hidden_states: jax.Array,
+        q_lora: jax.Array,
+        positions: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        query, _ = self.wq_b(q_lora)
+        query = query.reshape(-1, self.index_n_heads, self.index_head_dim)
+        query, _ = self.rotary_emb(positions, query, query[:, :1, :])
+        query = self._hadamard_rotate(query)
+        head_weights, _ = self.weights_proj(hidden_states)
+        return query, head_weights
+
+    def project_key(self, hidden_states: jax.Array, positions: jax.Array) -> jax.Array:
         key, _ = self.wk(hidden_states)
         key = self.k_norm(key)
+        key_with_head = key[:, None, :]
+        _, key_with_head = self.rotary_emb(positions, key_with_head, key_with_head)
+        return self._hadamard_rotate(key_with_head[:, 0, :])
 
-        # Apply RoPE
-        rope_dim = 64
-        q_rope = query[:, :, :rope_dim]
-        k_rope = key[:, :rope_dim]
-        k_rope = k_rope[:, None, :]  # Add head dim for RoPE
-
-        q_rope, k_rope = rotary_emb(positions, q_rope, k_rope)
-        k_rope = k_rope.squeeze(1)  # Remove head dim
-
-        query = query.at[:, :, :rope_dim].set(q_rope)
-        key = key.at[:, :rope_dim].set(k_rope)
-
-        # Apply Hadamard Transform
-        h_matrix = get_hadamard_matrix(128)
-        h_matrix = h_matrix * (128**-0.5)
-
-        query = jnp.einsum("thd,de->the", query, h_matrix)
-        key = jnp.einsum("td,de->te", key, h_matrix)
-
-        # 2. Compute Logits (simplified dense dot product)
-        key_replicated = jax.sharding.reshard(
-            key, jax.sharding.NamedSharding(self.mesh, P(None, None))
-        )
-        logits = jnp.einsum("ijk,lk->ijl", query, key_replicated)
-
-        # 3. Apply weights_proj
-        weights, _ = self.weights_proj(hidden_states)
-
-        # Scale and apply weights
-        scaling = self.head_dim**-0.5
-        logits = logits * scaling * weights[:, :, None]
-
-        # 4. Top-K Selection (Top-1 for now to match dummy shape [T, n_head])
-        _, topk_ids = jax.lax.top_k(logits, 1)
-        topk_ids = topk_ids.squeeze(-1)
-
-        return topk_ids
+    def __call__(
+        self, hidden_states: jax.Array, q_lora: jax.Array, positions: jax.Array
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Project current tokens; Task 3 supplies cached candidates for Top-K."""
+        query, head_weights = self.project_query(hidden_states, q_lora, positions)
+        key = self.project_key(hidden_states, positions)
+        return query, head_weights, key
 
 
 class Glm5Attention(nnx.Module):
@@ -157,6 +285,11 @@ class Glm5Attention(nnx.Module):
         rope_theta: float = 1000000,
         rope_scaling: dict[str, Any] | None = None,
         head_dim: int | None = None,
+        qk_rope_head_dim: int = 64,
+        index_head_dim: int = 128,
+        index_n_heads: int = 32,
+        index_topk: int = 2048,
+        indexer_rope_interleave: bool = False,
         rms_norm_eps: float = None,
         use_qk_norm: bool = True,
         rotary_dim: int = 0,
@@ -173,8 +306,8 @@ class Glm5Attention(nnx.Module):
         self.kv_head_num = num_kv_heads
 
         self.qk_nope_head_dim = 192
-        self.qk_rope_head_dim = 64
-        self.qk_head_dim = 256
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.v_head_dim = 256
         self.kv_lora_rank = 512
         self.q_lora_rank = 2048
@@ -248,8 +381,14 @@ class Glm5Attention(nnx.Module):
             self.indexer = GlmDsaIndexer(
                 hidden_size=hidden_size,
                 q_lora_rank=self.q_lora_rank,
-                index_head_dim=128,
-                index_n_heads=32,
+                index_head_dim=index_head_dim,
+                index_n_heads=index_n_heads,
+                index_topk=index_topk,
+                rope_head_dim=self.qk_rope_head_dim,
+                max_position_embeddings=max_position_embeddings,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                indexer_rope_interleave=indexer_rope_interleave,
                 mesh=mesh,
                 dtype=dtype,
                 scope_name="indexer",
@@ -412,7 +551,7 @@ class Glm5Attention(nnx.Module):
         q = q.reshape(-1, self.num_heads, self.qk_head_dim)
 
         if self.indexer is not None:
-            _ = self.indexer(hidden_states, q_compressed, positions, self.rotary_emb)
+            _ = self.indexer(hidden_states, q_compressed, positions)
 
         q_nope = q[:, :, : self.qk_nope_head_dim]
         q_rope = q[:, :, self.qk_nope_head_dim :]
@@ -601,6 +740,15 @@ class Glm5DecoderLayer(nnx.Module):
         max_position_embeddings = getattr(config, "max_position_embeddings", 131072)
         self.head_dim = getattr(config, "head_dim", None) or 128
         use_qk_norm = getattr(config, "use_qk_norm", True)
+        qk_rope_head_dim = getattr(
+            config,
+            "qk_rope_head_dim",
+            getattr(config, "rope_head_dim", 64),
+        )
+        index_head_dim = getattr(config, "index_head_dim", 128)
+        index_n_heads = getattr(config, "index_n_heads", 32)
+        index_topk = getattr(config, "index_topk", 2048)
+        indexer_rope_interleave = getattr(config, "indexer_rope_interleave", False)
 
         partial_rotary_factor = getattr(config, "partial_rotary_factor", 0.5)
         rotary_dim = int(self.head_dim * partial_rotary_factor)
@@ -619,6 +767,11 @@ class Glm5DecoderLayer(nnx.Module):
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             head_dim=self.head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            index_head_dim=index_head_dim,
+            index_n_heads=index_n_heads,
+            index_topk=index_topk,
+            indexer_rope_interleave=indexer_rope_interleave,
             rms_norm_eps=config.rms_norm_eps,
             use_qk_norm=use_qk_norm,
             rotary_dim=rotary_dim,

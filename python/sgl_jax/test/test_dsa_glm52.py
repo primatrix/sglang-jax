@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -200,9 +202,7 @@ def test_dsa_topk_state_pytree_preserves_request_boundary_arrays():
     restored = jax.tree_util.tree_unflatten(tree_def, leaves)
 
     assert len(leaves) == 4
-    np.testing.assert_array_equal(
-        restored.selection.physical_slots, selection.physical_slots
-    )
+    np.testing.assert_array_equal(restored.selection.physical_slots, selection.physical_slots)
     assert restored.selection.producer_layer == 6
     np.testing.assert_array_equal(restored.query_offsets, state.query_offsets)
     np.testing.assert_array_equal(restored.request_offsets, state.request_offsets)
@@ -275,3 +275,402 @@ def test_dsa_topk_state_validation_rejects_offset_rank_and_dtype_mismatches():
                 query_offsets=query_offsets,
                 request_offsets=request_offsets,
             ).validate(mode="prefill")
+
+
+def test_glm_dsa_select_topk_uses_configured_dimensions_and_returns_exact_topk():
+    from sgl_jax.srt.models.glm5_moe import GlmDsaIndexer
+
+    q_index = jnp.array(
+        [[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]],
+        dtype=jnp.float32,
+    )
+    head_weights = jnp.array([[1.0, 2.0]], dtype=jnp.float32)
+    k_index_cache = jnp.array(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [2.0, 1.0, 0.0, 0.0],
+            [-1.0, 3.0, 0.0, 0.0],
+        ],
+        dtype=jnp.float32,
+    )
+
+    ids, selected_counts = GlmDsaIndexer.select_topk(
+        q_index=q_index,
+        head_weights=head_weights,
+        k_index_cache=k_index_cache,
+        candidate_slots=jnp.array([[0, 1, 2, 3]], dtype=jnp.int32),
+        candidate_logical_ids=jnp.array([[10, 20, 30, 40]], dtype=jnp.int32),
+        candidate_counts=jnp.array([4], dtype=jnp.int32),
+        index_topk=3,
+    )
+
+    assert ids.dtype == jnp.int32
+    assert selected_counts.dtype == jnp.int32
+    np.testing.assert_array_equal(ids, np.array([[40, 30, 20]], dtype=np.int32))
+    np.testing.assert_array_equal(selected_counts, np.array([3], dtype=np.int32))
+
+
+def test_glm_dsa_score_candidates_applies_relu_head_gates_and_both_scales():
+    from sgl_jax.srt.models.glm5_moe import GlmDsaIndexer
+
+    scores = GlmDsaIndexer.score_candidates(
+        q_index=jnp.array(
+            [[[2.0, 0.0, 0.0, 0.0], [-1.0, 0.0, 0.0, 0.0]]],
+            dtype=jnp.float32,
+        ),
+        head_weights=jnp.array([[3.0, 5.0]], dtype=jnp.float32),
+        k_index_cache=jnp.array(
+            [[1.0, 0.0, 0.0, 0.0], [-1.0, 0.0, 0.0, 0.0]],
+            dtype=jnp.float32,
+        ),
+        candidate_slots=jnp.array([[0, 1]], dtype=jnp.int32),
+    )
+
+    scale = (4**-0.5) * (2**-0.5)
+    np.testing.assert_allclose(
+        scores,
+        np.array([[6.0 * scale, 5.0 * scale]], dtype=np.float32),
+        rtol=1e-6,
+    )
+
+
+def test_glm_dsa_indexer_rejects_top1_configuration():
+    from sgl_jax.srt.models.glm5_moe import GlmDsaIndexer
+
+    with pytest.raises(ValueError, match="greater than one"):
+        GlmDsaIndexer.select_topk(
+            q_index=jnp.ones((1, 1, 2), dtype=jnp.float32),
+            head_weights=jnp.ones((1, 1), dtype=jnp.float32),
+            k_index_cache=jnp.ones((1, 2), dtype=jnp.float32),
+            candidate_slots=jnp.zeros((1, 1), dtype=jnp.int32),
+            candidate_logical_ids=jnp.zeros((1, 1), dtype=jnp.int32),
+            candidate_counts=jnp.ones((1,), dtype=jnp.int32),
+            index_topk=1,
+        )
+
+
+def test_glm_dsa_select_topk_pads_when_candidates_are_fewer_than_topk():
+    from sgl_jax.srt.models.glm5_moe import GlmDsaIndexer
+
+    ids, selected_counts = GlmDsaIndexer.select_topk(
+        q_index=jnp.array([[[1.0, 0.0, 0.0, 0.0]]], dtype=jnp.float32),
+        head_weights=jnp.ones((1, 1), dtype=jnp.float32),
+        k_index_cache=jnp.array(
+            [[1.0, 0.0, 0.0, 0.0], [2.0, 0.0, 0.0, 0.0]],
+            dtype=jnp.float32,
+        ),
+        candidate_slots=jnp.array([[0, 1]], dtype=jnp.int32),
+        candidate_logical_ids=jnp.array([[0, 1]], dtype=jnp.int32),
+        candidate_counts=jnp.array([2], dtype=jnp.int32),
+        index_topk=3,
+    )
+
+    np.testing.assert_array_equal(ids, np.array([[1, 0, -1]], dtype=np.int32))
+    np.testing.assert_array_equal(selected_counts, np.array([2], dtype=np.int32))
+
+
+def test_glm_dsa_select_topk_masks_by_count_while_preserving_logical_zero():
+    from sgl_jax.srt.models.glm5_moe import GlmDsaIndexer
+
+    ids, selected_counts = GlmDsaIndexer.select_topk(
+        q_index=jnp.array([[[1.0, 0.0]]], dtype=jnp.float32),
+        head_weights=jnp.ones((1, 1), dtype=jnp.float32),
+        k_index_cache=jnp.array([[1.0, 0.0], [2.0, 0.0], [100.0, 0.0]], dtype=jnp.float32),
+        candidate_slots=jnp.array([[0, 1, 2]], dtype=jnp.int32),
+        candidate_logical_ids=jnp.array([[0, 1, 2]], dtype=jnp.int32),
+        candidate_counts=jnp.array([2], dtype=jnp.int32),
+        index_topk=3,
+    )
+
+    np.testing.assert_array_equal(ids, np.array([[1, 0, -1]], dtype=np.int32))
+    np.testing.assert_array_equal(selected_counts, np.array([2], dtype=np.int32))
+
+
+def test_glm_dsa_select_topk_zero_count_returns_only_sentinels():
+    from sgl_jax.srt.models.glm5_moe import GlmDsaIndexer
+
+    ids, selected_counts = GlmDsaIndexer.select_topk(
+        q_index=jnp.ones((1, 2, 4), dtype=jnp.float32),
+        head_weights=jnp.ones((1, 2), dtype=jnp.float32),
+        k_index_cache=jnp.ones((2, 4), dtype=jnp.float32),
+        candidate_slots=jnp.array([[0, 1]], dtype=jnp.int32),
+        candidate_logical_ids=jnp.array([[0, 1]], dtype=jnp.int32),
+        candidate_counts=jnp.array([0], dtype=jnp.int32),
+        index_topk=2,
+    )
+
+    np.testing.assert_array_equal(ids, np.array([[-1, -1]], dtype=np.int32))
+    np.testing.assert_array_equal(selected_counts, np.array([0], dtype=np.int32))
+
+
+def test_glm_dsa_select_topk_is_jittable_and_deterministic_for_ties():
+    from sgl_jax.srt.models.glm5_moe import GlmDsaIndexer
+
+    select = jax.jit(
+        lambda q, weights, cache, slots, counts: GlmDsaIndexer.select_topk(
+            q,
+            weights,
+            cache,
+            slots,
+            slots,
+            counts,
+            index_topk=3,
+        )
+    )
+    inputs = (
+        jnp.array([[[1.0, 0.0]]], dtype=jnp.float32),
+        jnp.ones((1, 1), dtype=jnp.float32),
+        jnp.array([[1.0, 0.0], [1.0, 0.0], [0.5, 0.0]], dtype=jnp.float32),
+        jnp.array([[1, 0, 2]], dtype=jnp.int32),
+        jnp.array([3], dtype=jnp.int32),
+    )
+
+    first_ids, first_counts = select(*inputs)
+    second_ids, second_counts = select(*inputs)
+
+    np.testing.assert_array_equal(first_ids, np.array([[1, 0, 2]], dtype=np.int32))
+    np.testing.assert_array_equal(second_ids, first_ids)
+    np.testing.assert_array_equal(first_counts, np.array([3], dtype=np.int32))
+    np.testing.assert_array_equal(second_counts, first_counts)
+
+
+def test_glm_dsa_indexer_projects_query_weights_and_key_with_configured_dimension(
+    monkeypatch,
+):
+    import sgl_jax.srt.models.glm5_moe as glm5_moe
+
+    class StubLinear:
+        def __init__(self, *, scope_name, **kwargs):
+            del kwargs
+            self.scope_name = scope_name
+
+        def __call__(self, inputs):
+            token_count = inputs.shape[0]
+            outputs = {
+                "wq_b": jnp.array(
+                    [[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]],
+                    dtype=jnp.float32,
+                ),
+                "wk": jnp.array([[0.0, 0.0, 1.0, 0.0]], dtype=jnp.float32),
+                "weights_proj": jnp.array([[2.0, -1.0]], dtype=jnp.float32),
+            }
+            return (
+                jnp.broadcast_to(
+                    outputs[self.scope_name], (token_count, *outputs[self.scope_name].shape[1:])
+                ),
+                None,
+            )
+
+    class TrackingNorm:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+        def __call__(self, inputs):
+            return inputs * 2.0 + 1.0
+
+    class TrackingRotary:
+        calls = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def __call__(self, positions, query, key):
+            self.calls.append(np.asarray(positions))
+            return query + 1.0, key + 2.0
+
+    monkeypatch.setattr(glm5_moe, "LinearBase", StubLinear)
+    monkeypatch.setattr(glm5_moe, "GlmNorm", TrackingNorm)
+    monkeypatch.setattr(glm5_moe, "RotaryEmbedding", TrackingRotary)
+    indexer = glm5_moe.GlmDsaIndexer(
+        hidden_size=3,
+        q_lora_rank=2,
+        index_head_dim=4,
+        index_n_heads=2,
+        index_topk=3,
+        rope_head_dim=2,
+        max_position_embeddings=256,
+        rope_theta=1234.0,
+        rope_scaling={"factor": 2.0},
+        indexer_rope_interleave=False,
+        mesh=None,
+        dtype=jnp.float32,
+    )
+    hidden_states = jnp.zeros((1, 3), dtype=jnp.float32)
+    q_lora = jnp.zeros((1, 2), dtype=jnp.float32)
+    positions = jnp.array([7], dtype=jnp.int32)
+
+    q_index, head_weights = indexer.project_query(hidden_states, q_lora, positions)
+    k_index = indexer.project_key(hidden_states, positions)
+    call_result = indexer(hidden_states, q_lora, positions)
+
+    np.testing.assert_allclose(
+        q_index,
+        np.array(
+            [[[2.5, 0.5, 0.5, 0.5], [2.5, -0.5, 0.5, -0.5]]],
+            dtype=np.float32,
+        ),
+    )
+    np.testing.assert_array_equal(head_weights, np.array([[2.0, -1.0]], dtype=np.float32))
+    np.testing.assert_allclose(k_index, np.array([[7.0, 1.0, -1.0, -1.0]], dtype=np.float32))
+    for actual, expected in zip(call_result, (q_index, head_weights, k_index), strict=True):
+        np.testing.assert_array_equal(actual, expected)
+    assert len(TrackingRotary.calls) == 4
+    for seen_positions in TrackingRotary.calls:
+        np.testing.assert_array_equal(seen_positions, np.array([7], dtype=np.int32))
+
+
+@pytest.mark.parametrize(
+    ("indexer_rope_interleave", "expected_neox_style"),
+    [(False, True), (True, False)],
+)
+def test_glm_dsa_indexer_stores_config_and_owns_rotary_embedding(
+    monkeypatch, indexer_rope_interleave, expected_neox_style
+):
+    import sgl_jax.srt.models.glm5_moe as glm5_moe
+
+    class StubLinear:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(glm5_moe, "LinearBase", StubLinear)
+    rope_scaling = {"rope_type": "linear", "factor": 2.0}
+    indexer = glm5_moe.GlmDsaIndexer(
+        hidden_size=3,
+        q_lora_rank=2,
+        index_head_dim=8,
+        index_n_heads=5,
+        index_topk=7,
+        rope_head_dim=6,
+        max_position_embeddings=4096,
+        rope_theta=9876.0,
+        rope_scaling=rope_scaling,
+        indexer_rope_interleave=indexer_rope_interleave,
+        mesh=None,
+        dtype=jnp.float32,
+    )
+
+    assert indexer.index_head_dim == 8
+    assert indexer.index_n_heads == 5
+    assert indexer.index_topk == 7
+    assert indexer.rope_head_dim == 6
+    assert indexer.max_position_embeddings == 4096
+    assert indexer.rope_theta == 9876.0
+    assert indexer.rope_scaling is rope_scaling
+    assert indexer.indexer_rope_interleave is indexer_rope_interleave
+    assert isinstance(indexer.rotary_emb, glm5_moe.RotaryEmbedding)
+    assert indexer.rotary_emb.head_size == 8
+    assert indexer.rotary_emb.rotary_dim == 6
+    assert indexer.rotary_emb.is_neox_style is expected_neox_style
+
+
+def test_glm_dsa_indexer_requires_power_of_two_head_dimension():
+    from sgl_jax.srt.models.glm5_moe import GlmDsaIndexer
+
+    with pytest.raises(ValueError, match="positive power of two"):
+        GlmDsaIndexer(
+            hidden_size=3,
+            q_lora_rank=2,
+            index_head_dim=6,
+            index_n_heads=2,
+            index_topk=3,
+            rope_head_dim=4,
+            max_position_embeddings=128,
+            rope_theta=10000.0,
+            rope_scaling=None,
+            indexer_rope_interleave=False,
+            mesh=None,
+            dtype=jnp.float32,
+        )
+
+
+def test_glm5_attention_passes_nondefault_indexer_config(monkeypatch):
+    import sgl_jax.srt.models.glm5_moe as glm5_moe
+
+    class StopConstruction(Exception):
+        pass
+
+    captured = {}
+
+    class StubLayer:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+    class CapturingIndexer:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            raise StopConstruction
+
+    monkeypatch.setattr(glm5_moe, "LinearBase", StubLayer)
+    monkeypatch.setattr(glm5_moe, "RMSNorm", StubLayer)
+    monkeypatch.setattr(glm5_moe, "GlmDsaIndexer", CapturingIndexer)
+
+    with pytest.raises(StopConstruction):
+        glm5_moe.Glm5Attention(
+            hidden_size=16,
+            num_heads=2,
+            num_kv_heads=1,
+            max_position_embeddings=8192,
+            mesh=None,
+            rope_theta=54321.0,
+            rope_scaling={"factor": 4.0},
+            index_head_dim=8,
+            index_n_heads=5,
+            index_topk=7,
+            qk_rope_head_dim=6,
+            indexer_rope_interleave=True,
+            use_qk_norm=False,
+        )
+
+    assert captured["index_head_dim"] == 8
+    assert captured["index_n_heads"] == 5
+    assert captured["index_topk"] == 7
+    assert captured["rope_head_dim"] == 6
+    assert captured["max_position_embeddings"] == 8192
+    assert captured["rope_theta"] == 54321.0
+    assert captured["rope_scaling"] == {"factor": 4.0}
+    assert captured["indexer_rope_interleave"] is True
+
+
+def test_glm5_decoder_layer_propagates_nondefault_indexer_config(monkeypatch):
+    import sgl_jax.srt.models.glm5_moe as glm5_moe
+
+    class StopConstruction(Exception):
+        pass
+
+    captured = {}
+
+    class CapturingAttention:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            raise StopConstruction
+
+    monkeypatch.setattr(glm5_moe, "Glm5Attention", CapturingAttention)
+    config = SimpleNamespace(
+        hidden_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        max_position_embeddings=8192,
+        rope_theta=54321.0,
+        rope_scaling={"factor": 4.0},
+        head_dim=8,
+        qk_rope_head_dim=6,
+        index_head_dim=8,
+        index_n_heads=5,
+        index_topk=7,
+        indexer_rope_interleave=True,
+        rms_norm_eps=1e-5,
+        use_qk_norm=False,
+    )
+
+    with pytest.raises(StopConstruction):
+        glm5_moe.Glm5DecoderLayer(config=config, mesh=None, layer_id=0, dtype=jnp.float32)
+
+    assert captured["index_head_dim"] == 8
+    assert captured["index_n_heads"] == 5
+    assert captured["index_topk"] == 7
+    assert captured["qk_rope_head_dim"] == 6
+    assert captured["indexer_rope_interleave"] is True
+    assert captured["max_position_embeddings"] == 8192
+    assert captured["rope_theta"] == 54321.0
+    assert captured["rope_scaling"] == {"factor": 4.0}
