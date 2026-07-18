@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -167,6 +168,10 @@ def _load_array(record: dict[str, Any], label: str) -> tuple[np.ndarray | None, 
     errors: list[str] = []
     try:
         array = np.load(record["array_path"], allow_pickle=False)
+    except EOFError:
+        return None, [f"{label}: cannot load tensor: unexpected end of file"]
+    except zipfile.BadZipFile:
+        return None, [f"{label}: cannot load tensor: invalid ZIP archive"]
     except (OSError, ValueError) as error:
         return None, [f"{label}: cannot load tensor: {error}"]
     if not isinstance(array, np.ndarray):
@@ -243,7 +248,9 @@ def _metrics(
     if not np.all(np.isfinite(candidate_values)) or not np.all(np.isfinite(baseline_values)):
         raise ValueError("tensor contains non-finite values")
 
-    difference = np.abs(candidate_values - baseline_values)
+    candidate_metric_values = candidate_values.astype(np.float64)
+    baseline_metric_values = baseline_values.astype(np.float64)
+    difference = np.abs(candidate_metric_values - baseline_metric_values)
     if difference.size:
         max_abs = float(np.max(difference))
         mean_abs = float(np.mean(difference, dtype=np.float64))
@@ -251,8 +258,8 @@ def _metrics(
     else:
         max_abs = mean_abs = p99_abs = 0.0
 
-    candidate_flat = candidate_values.reshape(-1).astype(np.float64)
-    baseline_flat = baseline_values.reshape(-1).astype(np.float64)
+    candidate_flat = candidate_metric_values.reshape(-1)
+    baseline_flat = baseline_metric_values.reshape(-1)
     candidate_norm = float(np.linalg.norm(candidate_flat))
     baseline_norm = float(np.linalg.norm(baseline_flat))
     cosine = None

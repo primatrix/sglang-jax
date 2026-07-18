@@ -1,6 +1,8 @@
 import importlib.util
 import json
 import math
+import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -247,6 +249,65 @@ def test_load_array_closes_unsupported_loadable(monkeypatch, tmp_path):
     assert loadable.closed is True
 
 
+@pytest.mark.parametrize(
+    ("filename", "contents", "expected_failure"),
+    [
+        (
+            "empty.npy",
+            b"",
+            "candidate: cannot load tensor: unexpected end of file",
+        ),
+        (
+            "truncated.npz",
+            b"PK\x03\x04truncated",
+            "candidate: cannot load tensor: invalid ZIP archive",
+        ),
+    ],
+)
+def test_cli_reports_truncated_tensor_files_as_deterministic_json_failure(
+    tmp_path, filename, contents, expected_failure
+):
+    candidate = tmp_path / "candidate"
+    baseline = tmp_path / "baseline"
+    output = tmp_path / "report.json"
+    key = _row(filename)
+    _write_manifest(candidate, key, shape=(1,), dtype="float32")
+    (candidate / filename).write_bytes(contents)
+    _write_dump(
+        baseline,
+        [
+            (
+                {**key, "filename": "baseline.npy"},
+                np.array([1.0], dtype=np.float32),
+            )
+        ],
+    )
+    command = [
+        sys.executable,
+        str(COMPARE_PATH),
+        "--candidate",
+        str(candidate),
+        "--baseline",
+        str(baseline),
+        "--output",
+        str(output),
+    ]
+
+    first = subprocess.run(command, text=True, capture_output=True, check=False)
+    first_text = output.read_text(encoding="utf-8")
+    second = subprocess.run(command, text=True, capture_output=True, check=False)
+    second_text = output.read_text(encoding="utf-8")
+
+    assert first.returncode == second.returncode == 1
+    assert first.stderr == second.stderr == ""
+    assert first_text == second_text
+    assert first.stdout == second.stdout
+    report = json.loads(first_text, parse_constant=lambda value: pytest.fail(value))
+    assert report["passed"] is False
+    assert report["comparisons"][0]["failures"] == [expected_failure]
+    assert report["first_failing_key"] == report["comparisons"][0]["key"]
+
+
 @pytest.mark.parametrize("dtype", [np.int64, np.uint32, np.bool_])
 def test_metric_values_promote_all_numeric_dtypes_to_float32(dtype):
     compare = _load_compare_module()
@@ -266,6 +327,34 @@ def test_integer_difference_metrics_are_computed_after_float32_promotion():
     )
 
     assert metrics["max_abs"] == 0.0
+
+
+def test_max_float_opposing_signs_produce_finite_strict_json_metrics(tmp_path):
+    compare = _load_compare_module()
+    candidate = tmp_path / "candidate"
+    baseline = tmp_path / "baseline"
+    maximum = np.finfo(np.float32).max
+    key = _row("candidate.npy")
+    _write_dump(candidate, [(key, np.array([maximum], dtype=np.float32))])
+    _write_dump(
+        baseline,
+        [
+            (
+                {**key, "filename": "baseline.npy"},
+                np.array([-maximum], dtype=np.float32),
+            )
+        ],
+    )
+
+    report = compare.compare_dump_directories(candidate, baseline)
+
+    assert report["passed"] is True
+    metrics = report["comparisons"][0]["metrics"]
+    assert metrics["max_abs"] == pytest.approx(float(maximum) * 2.0)
+    assert all(
+        value is None or math.isfinite(value) for value in metrics.values()
+    )
+    json.dumps(report, sort_keys=True, allow_nan=False)
 
 
 @pytest.mark.parametrize(
