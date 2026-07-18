@@ -105,6 +105,22 @@ def torch_glm_dsa_select(
         raise ValueError(f"index_topk must be greater than one; got {index_topk}")
 
     candidate_width = candidate_slots.shape[1]
+    concrete_counts = candidate_counts.tolist()
+    if any(count < 0 or count > candidate_width for count in concrete_counts):
+        raise ValueError(
+            "candidate_counts entries must be in [0, candidate_width]"
+        )
+    for token, count in enumerate(concrete_counts):
+        counted_slots = candidate_slots[token, :count]
+        invalid = (counted_slots < 0) | (
+            counted_slots >= k_index_cache.shape[0]
+        )
+        if bool(invalid.any()):
+            raise ValueError(
+                "counted candidate_slots must be valid K-cache addresses; "
+                f"token={token}, count={count}"
+            )
+
     safe_slots = candidate_slots.clamp(0, k_index_cache.shape[0] - 1).long()
     candidate_keys = k_index_cache[safe_slots]
     logits = torch.einsum(
@@ -323,9 +339,13 @@ def torch_dsa_sparse_mla(
     if max_selected == 0:
         raise ValueError("physical_slots must reserve at least one slot per token")
 
+    if isinstance(sm_scale, torch.Tensor):
+        _require_cpu("sm_scale", sm_scale)
     scale = torch.as_tensor(sm_scale, dtype=torch.float32)
     if scale.ndim != 0:
         raise ValueError("sm_scale must be a scalar")
+    if not bool(torch.isfinite(scale)):
+        raise ValueError("sm_scale must be finite")
     capacity = cache.shape[0] * page_size
     concrete_counts = selected_counts.tolist()
     if any(count < 0 or count > max_selected for count in concrete_counts):
@@ -342,7 +362,7 @@ def torch_dsa_sparse_mla(
 
     token_rows = cache.reshape(
         cache.shape[0], packed_rows_per_page, cache.shape[3]
-    )[:, :page_size].reshape(capacity, cache.shape[3]).float()
+    )[:, :page_size].reshape(capacity, cache.shape[3])
     output = torch.zeros(
         (token_count, head_count, latent_dim), dtype=torch.float32
     )
@@ -351,7 +371,7 @@ def torch_dsa_sparse_mla(
             continue
         rows = token_rows.index_select(
             0, physical_slots[token, :count].long()
-        )
+        ).float()
         selected_latent = rows[:, :latent_dim]
         selected_rope = rows[
             :, latent_aligned : latent_aligned + rope_dim

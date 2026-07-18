@@ -141,6 +141,22 @@ def _mla_fixture():
     return q_latent, q_rope, cache
 
 
+def _zero_count_sparse_mla(sm_scale):
+    from sgl_jax.srt.kernels.dsa.torch_reference import torch_dsa_sparse_mla
+
+    return torch_dsa_sparse_mla(
+        q_latent=torch.zeros((1, 1, 3), dtype=torch.float32),
+        q_rope=torch.zeros((1, 1, 2), dtype=torch.float32),
+        cache=torch.zeros((1, 1, 2, 256), dtype=torch.bfloat16),
+        physical_slots=torch.tensor([[-999]], dtype=torch.int32),
+        selected_counts=torch.tensor([0], dtype=torch.int32),
+        sm_scale=sm_scale,
+        page_size=2,
+        latent_dim=3,
+        rope_dim=2,
+    )
+
+
 def _torch_dense_visible_mla(
     q_latent: torch.Tensor,
     q_rope: torch.Tensor,
@@ -161,6 +177,49 @@ def _torch_dense_visible_mla(
     weights = torch.softmax(torch.einsum("hc,kc->hk", query, keys) * sm_scale, dim=-1)
     return torch.einsum(
         "hk,kc->hc", weights, visible_rows[:, :MLA_LATENT_DIM]
+    )
+
+
+def test_torch_cpu_selection_matches_literal_multi_head_known_answer():
+    from sgl_jax.srt.kernels.dsa.torch_reference import torch_glm_dsa_select
+
+    result = torch_glm_dsa_select(
+        q_index=torch.tensor(
+            [[[1.0, -1.0], [-2.0, 1.0]]], dtype=torch.float32
+        ),
+        head_weights=torch.tensor([[2.0, -0.5]], dtype=torch.float32),
+        k_index_cache=torch.tensor(
+            [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]],
+            dtype=torch.float32,
+        ),
+        candidate_slots=torch.tensor([[0, 1, 2]], dtype=torch.int32),
+        candidate_logical_ids=torch.tensor(
+            [[17, 23, 31]], dtype=torch.int32
+        ),
+        candidate_counts=torch.tensor([3], dtype=torch.int32),
+        index_topk=3,
+    )
+
+    # ReLU logits by candidate are [[1, 0], [0, 1], [0, 2]].
+    # Applying signed head weights gives [2, -0.5, -1], and the literal
+    # head_dim**-0.5 * num_heads**-0.5 scale is 0.5.
+    torch.testing.assert_close(
+        result.scores,
+        torch.tensor([[1.0, -0.25, -0.5]], dtype=torch.float32),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        result.logical_topk_ids,
+        torch.tensor([[17, 23, 31]], dtype=torch.int32),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        result.selected_counts,
+        torch.tensor([3], dtype=torch.int32),
+        rtol=0,
+        atol=0,
     )
 
 
@@ -336,6 +395,80 @@ def test_torch_cpu_selection_handles_empty_candidate_width():
     )
 
 
+@pytest.mark.parametrize("candidate_count", (-1, 4))
+def test_torch_cpu_selection_rejects_candidate_counts_outside_width(
+    candidate_count,
+):
+    from sgl_jax.srt.kernels.dsa.torch_reference import torch_glm_dsa_select
+
+    with pytest.raises(
+        ValueError,
+        match=r"candidate_counts entries must be in \[0, candidate_width\]",
+    ):
+        torch_glm_dsa_select(
+            q_index=torch.ones((1, 2, 4), dtype=torch.float32),
+            head_weights=torch.ones((1, 2), dtype=torch.float32),
+            k_index_cache=torch.ones((3, 4), dtype=torch.float32),
+            candidate_slots=torch.tensor([[0, 1, 2]], dtype=torch.int32),
+            candidate_logical_ids=torch.tensor(
+                [[10, 11, 12]], dtype=torch.int32
+            ),
+            candidate_counts=torch.tensor(
+                [candidate_count], dtype=torch.int32
+            ),
+            index_topk=3,
+        )
+
+
+@pytest.mark.parametrize("invalid_slot", (-1, 3))
+def test_torch_cpu_selection_rejects_invalid_counted_candidate_slots(
+    invalid_slot,
+):
+    from sgl_jax.srt.kernels.dsa.torch_reference import torch_glm_dsa_select
+
+    with pytest.raises(ValueError, match="counted candidate_slots must be valid"):
+        torch_glm_dsa_select(
+            q_index=torch.ones((1, 2, 4), dtype=torch.float32),
+            head_weights=torch.ones((1, 2), dtype=torch.float32),
+            k_index_cache=torch.ones((3, 4), dtype=torch.float32),
+            candidate_slots=torch.tensor(
+                [[0, invalid_slot, 2]], dtype=torch.int32
+            ),
+            candidate_logical_ids=torch.tensor(
+                [[10, 11, 12]], dtype=torch.int32
+            ),
+            candidate_counts=torch.tensor([2], dtype=torch.int32),
+            index_topk=3,
+        )
+
+
+def test_torch_cpu_selection_ignores_arbitrary_slots_outside_counted_prefix():
+    from sgl_jax.srt.kernels.dsa.torch_reference import torch_glm_dsa_select
+
+    result = torch_glm_dsa_select(
+        q_index=torch.ones((1, 2, 4), dtype=torch.float32),
+        head_weights=torch.ones((1, 2), dtype=torch.float32),
+        k_index_cache=torch.ones((3, 4), dtype=torch.float32),
+        candidate_slots=torch.tensor([[1, -999, 999]], dtype=torch.int32),
+        candidate_logical_ids=torch.tensor([[10, 11, 12]], dtype=torch.int32),
+        candidate_counts=torch.tensor([1], dtype=torch.int32),
+        index_topk=3,
+    )
+
+    torch.testing.assert_close(
+        result.logical_topk_ids,
+        torch.tensor([[10, -1, -1]], dtype=torch.int32),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        result.selected_counts,
+        torch.tensor([1], dtype=torch.int32),
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_torch_logical_mapping_matches_jax_with_selection_output_and_compaction():
     from sgl_jax.srt.kernels.dsa.reference import (
         logical_topk_to_physical_slots,
@@ -387,6 +520,113 @@ def test_torch_logical_mapping_matches_jax_with_selection_output_and_compaction(
         ),
     )
     assert torch_mapping.producer_layer == jax_mapping.producer_layer == 7
+
+
+def test_torch_sparse_mla_gathers_source_dtype_rows_before_fp32_conversion():
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from sgl_jax.srt.kernels.dsa.torch_reference import torch_dsa_sparse_mla
+
+    gathered_source_dtypes = []
+
+    class CaptureIndexSelectDtype(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            del types
+            if func is torch.ops.aten.index_select.default:
+                gathered_source_dtypes.append(args[0].dtype)
+            return func(*args, **(kwargs or {}))
+
+    with CaptureIndexSelectDtype():
+        torch_dsa_sparse_mla(
+            q_latent=torch.zeros((1, 1, 3), dtype=torch.bfloat16),
+            q_rope=torch.zeros((1, 1, 2), dtype=torch.bfloat16),
+            cache=torch.zeros((1, 1, 2, 256), dtype=torch.bfloat16),
+            physical_slots=torch.tensor([[1]], dtype=torch.int32),
+            selected_counts=torch.tensor([1], dtype=torch.int32),
+            sm_scale=1.0,
+            page_size=2,
+            latent_dim=3,
+            rope_dim=2,
+        )
+
+    assert gathered_source_dtypes == [torch.bfloat16]
+
+
+def test_torch_sparse_mla_rejects_non_cpu_tensor_scale():
+    with pytest.raises(ValueError, match="sm_scale must be a CPU tensor"):
+        _zero_count_sparse_mla(torch.empty((), device="meta"))
+
+
+def test_torch_sparse_mla_rejects_nonscalar_scale():
+    with pytest.raises(ValueError, match="sm_scale must be a scalar"):
+        _zero_count_sparse_mla(torch.tensor([1.0], dtype=torch.float32))
+
+
+@pytest.mark.parametrize(
+    "sm_scale",
+    (
+        float("nan"),
+        float("inf"),
+        -float("inf"),
+        torch.tensor(float("nan"), dtype=torch.float32),
+    ),
+)
+def test_torch_sparse_mla_rejects_nonfinite_scale(sm_scale):
+    with pytest.raises(ValueError, match="sm_scale must be finite"):
+        _zero_count_sparse_mla(sm_scale)
+
+
+def test_torch_sparse_mla_matches_literal_packed_cache_sentinels():
+    from sgl_jax.srt.kernels.dsa.torch_reference import torch_dsa_sparse_mla
+
+    page_size = 3
+    packing = 2
+    latent_dim = 3
+    rope_dim = 1
+    latent_aligned = 128
+    cache = torch.zeros((2, 2, packing, 256), dtype=torch.float32)
+
+    physical_slots = (2, 3)
+    addresses = []
+    for slot in physical_slots:
+        page = slot // page_size
+        offset = slot % page_size
+        row = offset // packing
+        lane = offset % packing
+        addresses.append((page, offset, row, lane))
+    assert addresses == [(0, 2, 1, 0), (1, 0, 0, 0)]
+
+    cache[0, 1, 0, :latent_dim] = torch.tensor([1.0, 2.0, 3.0])
+    cache[0, 1, 0, latent_aligned] = 0.0
+    cache[1, 0, 0, :latent_dim] = torch.tensor([5.0, 6.0, 7.0])
+    cache[1, 0, 0, latent_aligned] = torch.log(torch.tensor(3.0))
+
+    # Packed offset 3 exists in storage but is outside page_size. A naive flat
+    # reshape would incorrectly use this poison row for physical slot 3.
+    cache[0, 1, 1, :latent_dim] = torch.tensor([101.0, 102.0, 103.0])
+    cache[0, 1, 1, latent_aligned] = 100.0
+    # Poison the unaligned location too: rope starts at latent_aligned, not 3.
+    cache[:, :, :, latent_dim] = 100.0
+
+    output = torch_dsa_sparse_mla(
+        q_latent=torch.zeros((1, 1, latent_dim), dtype=torch.float32),
+        q_rope=torch.ones((1, 1, rope_dim), dtype=torch.float32),
+        cache=cache,
+        physical_slots=torch.tensor([physical_slots], dtype=torch.int32),
+        selected_counts=torch.tensor([2], dtype=torch.int32),
+        sm_scale=torch.tensor(1.0, dtype=torch.float32),
+        page_size=page_size,
+        latent_dim=latent_dim,
+        rope_dim=rope_dim,
+    )
+
+    # Scores [0, log(3)] produce weights [1/4, 3/4].
+    torch.testing.assert_close(
+        output,
+        torch.tensor([[[4.0, 5.0, 6.0]]], dtype=torch.float32),
+        rtol=1e-6,
+        atol=1e-6,
+    )
 
 
 def test_torch_sparse_mla_matches_jax_and_dense_with_integrated_selection():
