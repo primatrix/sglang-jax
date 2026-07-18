@@ -114,7 +114,7 @@ def maybe_dump_jax_array(
     processes = _debug_dump_filter("SGLANG_JAX_DEBUG_DUMP_PROCESSES")
     if components and str(component) not in components:
         return value
-    if layers and (layer_id is None or str(layer_id) not in layers):
+    if layers and layer_id is not None and str(layer_id) not in layers:
         return value
     if processes and str(process) not in processes:
         return value

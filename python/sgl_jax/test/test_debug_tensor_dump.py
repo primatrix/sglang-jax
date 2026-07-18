@@ -60,6 +60,24 @@ def test_debug_dump_filters_component_layer_and_process(
     assert len(calls) == expected_calls
 
 
+def test_debug_dump_layer_filter_keeps_global_components(monkeypatch, tmp_path):
+    from sgl_jax.srt.utils.debug_utils import maybe_dump_jax_array
+
+    _enable_dump(monkeypatch, tmp_path)
+    monkeypatch.setenv("SGLANG_JAX_DEBUG_DUMP_LAYERS", "3,39")
+    calls = []
+    monkeypatch.setattr(jax.debug, "callback", lambda *args, **kwargs: calls.append(args))
+
+    maybe_dump_jax_array(
+        jnp.ones((2,), dtype=jnp.float32),
+        component="logits",
+        name="next_token_logits",
+        layer_id=None,
+    )
+
+    assert len(calls) == 1
+
+
 def test_debug_dump_callback_writes_array_and_manifest(monkeypatch, tmp_path):
     from sgl_jax.srt.utils.debug_utils import maybe_dump_jax_array
 
