@@ -22,6 +22,7 @@ from sgl_jax.srt.kernels.mla.dsa.kernel import dsa_decode_mla_attention_unchecke
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.attention.dsa_types import DsaTopKState
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+from sgl_jax.srt.utils.debug_utils import maybe_dump_jax_array
 from sgl_jax.srt.utils.jax_utils import device_array
 
 
@@ -242,6 +243,29 @@ class DsaAttentionBackend(AttentionBackend):
         if indexer_k_pool.index_head_dim != self.index_head_dim:
             raise ValueError("Index-K pool and backend index_head_dim must match")
 
+        forward_mode = getattr(forward_batch, "forward_mode", None)
+        maybe_dump_jax_array(
+            q_index,
+            component="dsa_indexer",
+            name="q_index",
+            layer_id=layer_id,
+            forward_mode=forward_mode,
+        )
+        maybe_dump_jax_array(
+            head_weights,
+            component="dsa_indexer",
+            name="head_weights",
+            layer_id=layer_id,
+            forward_mode=forward_mode,
+        )
+        maybe_dump_jax_array(
+            index_k,
+            component="dsa_indexer",
+            name="index_k",
+            layer_id=layer_id,
+            forward_mode=forward_mode,
+        )
+
         current_cache = indexer_k_pool.get_buffer(layer_id)
         updated_cache = write_indexer_k_cache(
             current_cache,
@@ -294,6 +318,20 @@ class DsaAttentionBackend(AttentionBackend):
             candidate_counts,
             index_topk=self.index_topk,
         )
+        maybe_dump_jax_array(
+            logical_topk_ids,
+            component="dsa_selection",
+            name="logical_topk_ids",
+            layer_id=layer_id,
+            forward_mode=forward_mode,
+        )
+        maybe_dump_jax_array(
+            selected_counts,
+            component="dsa_selection",
+            name="selected_counts",
+            layer_id=layer_id,
+            forward_mode=forward_mode,
+        )
         selection = logical_topk_to_physical_slots(
             logical_topk_ids=logical_topk_ids,
             selected_counts=selected_counts,
@@ -301,6 +339,13 @@ class DsaAttentionBackend(AttentionBackend):
             query_request_indices=metadata.query_request_indices,
             query_positions=metadata.query_positions,
             producer_layer=layer_id,
+        )
+        maybe_dump_jax_array(
+            selection.physical_slots,
+            component="dsa_selection",
+            name="physical_slots",
+            layer_id=layer_id,
+            forward_mode=forward_mode,
         )
         return (
             DsaTopKState(
@@ -330,6 +375,22 @@ class DsaAttentionBackend(AttentionBackend):
             raise ValueError("DSA backend requires q_rope and k_rope")
         if not isinstance(dsa_state, DsaTopKState):
             raise TypeError("DSA backend requires a DsaTopKState")
+
+        forward_mode = getattr(forward_batch, "forward_mode", None)
+        maybe_dump_jax_array(
+            q,
+            component="dsa_attention",
+            name="q_latent",
+            layer_id=layer.layer_id,
+            forward_mode=forward_mode,
+        )
+        maybe_dump_jax_array(
+            q_rope,
+            component="dsa_attention",
+            name="q_rope",
+            layer_id=layer.layer_id,
+            forward_mode=forward_mode,
+        )
 
         new_c_kv = k if k.ndim == 2 else jnp.squeeze(k, axis=1)
         new_k_pe = k_rope if k_rope.ndim == 2 else jnp.squeeze(k_rope, axis=1)
@@ -402,6 +463,13 @@ class DsaAttentionBackend(AttentionBackend):
                 latent_dim=self.kv_lora_rank,
                 rope_dim=self.qk_rope_head_dim,
             )
+        maybe_dump_jax_array(
+            output,
+            component="dsa_attention",
+            name="o_latent",
+            layer_id=layer.layer_id,
+            forward_mode=forward_mode,
+        )
         return output.astype(jnp.bfloat16), updated_cache
 
     @staticmethod

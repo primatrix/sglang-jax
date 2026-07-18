@@ -1365,6 +1365,7 @@ def test_glm_decoder_layer_returns_moe_dsa_and_index_updates_separately():
             return hidden_states + 10
 
     layer = SimpleNamespace(
+        layer_id=0,
         input_layernorm=lambda value: value,
         self_attn=SelfAttention(),
         post_attention_layernorm=lambda value: value,
@@ -1393,6 +1394,111 @@ def test_glm_decoder_layer_returns_moe_dsa_and_index_updates_separately():
     assert returned_moe_ids is moe_ids
     assert dsa_state is state
     assert index_update == "index-update"
+
+
+def test_glm_decoder_layer_emits_attention_residual_and_mlp_debug_tensors(monkeypatch):
+    from types import SimpleNamespace
+
+    from sgl_jax.srt.models import glm5_moe
+    from sgl_jax.srt.models.glm5_moe import Glm5DecoderLayer
+
+    calls = []
+
+    def capture(value, *, component, name, layer_id, forward_mode):
+        calls.append((component, name, layer_id, forward_mode, np.asarray(value)))
+        return value
+
+    monkeypatch.setattr(glm5_moe, "maybe_dump_jax_array", capture, raising=False)
+
+    class SelfAttention:
+        def __call__(self, **kwargs):
+            return jnp.zeros_like(kwargs["hidden_states"]), "mla", None, None
+
+    layer = SimpleNamespace(
+        layer_id=4,
+        input_layernorm=lambda value: value,
+        self_attn=SelfAttention(),
+        post_attention_layernorm=lambda value: value,
+        is_moe_layer=False,
+        mlp=lambda value: value + 10,
+    )
+    forward_batch = SimpleNamespace(forward_mode="decode")
+    Glm5DecoderLayer.__call__(
+        layer,
+        positions=jnp.array([0], dtype=jnp.int32),
+        hidden_states=jnp.array([[1.0, 2.0]], dtype=jnp.float32),
+        forward_batch=forward_batch,
+        token_to_kv_pool="mla-pool",
+    )
+
+    assert [(component, name, layer_id, mode) for component, name, layer_id, mode, _ in calls] == [
+        ("decoder_layer", "attention_output", 4, "decode"),
+        ("decoder_layer", "residual_post_attention", 4, "decode"),
+        ("decoder_layer", "mlp_output", 4, "decode"),
+        ("decoder_layer", "hidden_states_post_mlp", 4, "decode"),
+    ]
+    np.testing.assert_array_equal(calls[0][4], np.array([[0.0, 0.0]], dtype=np.float32))
+    np.testing.assert_array_equal(calls[1][4], np.array([[1.0, 2.0]], dtype=np.float32))
+    np.testing.assert_array_equal(calls[2][4], np.array([[11.0, 12.0]], dtype=np.float32))
+    np.testing.assert_array_equal(calls[3][4], np.array([[11.0, 12.0]], dtype=np.float32))
+
+
+def test_glm_model_and_causal_lm_emit_global_debug_tensors(monkeypatch):
+    from types import SimpleNamespace
+
+    from sgl_jax.srt.models import glm5_moe
+    from sgl_jax.srt.models.glm5_moe import Glm5ForCausalLM, Glm5Model
+
+    calls = []
+
+    def capture(value, *, component, name, layer_id, forward_mode):
+        calls.append((component, name, layer_id, forward_mode, np.asarray(value)))
+        return value
+
+    monkeypatch.setattr(glm5_moe, "maybe_dump_jax_array", capture, raising=False)
+    forward_batch = SimpleNamespace(
+        input_ids=jnp.array([3], dtype=jnp.int32),
+        positions=jnp.array([0], dtype=jnp.int32),
+        expert_location_metadata=None,
+        forward_mode="extend",
+    )
+    model = SimpleNamespace(
+        embed_tokens=lambda input_ids: input_ids[:, None].astype(jnp.float32),
+        layers=[],
+        norm=lambda hidden_states: hidden_states + 1,
+    )
+    hidden_states, *_ = Glm5Model.__call__(
+        model,
+        forward_batch,
+        token_to_kv_pool="mla-pool",
+    )
+
+    class StubModel:
+        def __call__(self, *_args):
+            return hidden_states, [], [], [], []
+
+    logits = SimpleNamespace(next_token_logits=jnp.array([[0.25, -0.5]], dtype=jnp.float32))
+    causal_lm = SimpleNamespace(
+        model=StubModel(),
+        config=SimpleNamespace(tie_word_embeddings=False),
+        lm_head="lm-head",
+        logits_processor=lambda *_args: logits,
+    )
+    Glm5ForCausalLM.__call__(
+        causal_lm,
+        forward_batch,
+        SimpleNamespace(token_to_kv_pool="mla-pool"),
+        logits_metadata="metadata",
+    )
+
+    assert [(component, name, layer_id, mode) for component, name, layer_id, mode, _ in calls] == [
+        ("embed", "hidden_states", None, "extend"),
+        ("final", "normalized_hidden_states", None, "extend"),
+        ("logits", "next_token_logits", None, "extend"),
+    ]
+    np.testing.assert_array_equal(calls[0][4], np.array([[3.0]], dtype=np.float32))
+    np.testing.assert_array_equal(calls[1][4], np.array([[4.0]], dtype=np.float32))
+    np.testing.assert_array_equal(calls[2][4], np.array([[0.25, -0.5]], dtype=np.float32))
 
 
 def test_glm_model_threads_dsa_state_separately_from_moe_topk_ids():

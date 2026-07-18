@@ -7,6 +7,98 @@ import numpy as np
 import pytest
 
 
+def test_dsa_backend_emits_semantic_debug_tensors(monkeypatch):
+    from sgl_jax.srt.layers.attention import dsa_backend
+    from sgl_jax.srt.layers.attention.dsa_backend import (
+        DsaAttentionBackend,
+        DsaAttentionMetadata,
+    )
+    from sgl_jax.srt.mem_cache.dsa_pool import DsaIndexerKPool
+    from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+
+    calls = []
+
+    def capture(value, *, component, name, layer_id, forward_mode):
+        calls.append(
+            {
+                "value": value,
+                "component": component,
+                "name": name,
+                "layer_id": layer_id,
+                "forward_mode": forward_mode,
+            }
+        )
+        return value
+
+    monkeypatch.setattr(dsa_backend, "maybe_dump_jax_array", capture, raising=False)
+    backend = DsaAttentionBackend(
+        num_attn_heads=1,
+        kv_lora_rank=3,
+        qk_nope_head_dim=3,
+        qk_rope_head_dim=2,
+        v_head_dim=3,
+        index_head_dim=2,
+        index_topk=2,
+        page_size=4,
+        mesh=None,
+    )
+    backend.forward_metadata = DsaAttentionMetadata(
+        req_to_token_slots=jnp.array([[0, 1]], dtype=jnp.int32),
+        query_request_indices=jnp.array([0], dtype=jnp.int32),
+        query_positions=jnp.array([1], dtype=jnp.int32),
+        query_offsets=jnp.array([0, 1], dtype=jnp.int32),
+        request_offsets=jnp.array([0, 2], dtype=jnp.int32),
+    )
+    index_pool = DsaIndexerKPool(
+        size=8,
+        page_size=4,
+        index_head_dim=2,
+        layer_num=1,
+        layer_ids=(3,),
+        mesh=None,
+    )
+    forward_batch = SimpleNamespace(
+        out_cache_loc=jnp.array([1], dtype=jnp.int32),
+        forward_mode=ForwardMode.DECODE,
+    )
+    state, _ = backend.build_dsa_state(
+        layer_id=3,
+        q_index=jnp.array([[[1.0, 0.0]]], dtype=jnp.float32),
+        head_weights=jnp.array([[1.0]], dtype=jnp.float32),
+        index_k=jnp.array([[0.5, 0.0]], dtype=jnp.float32),
+        forward_batch=forward_batch,
+        indexer_k_pool=index_pool,
+        prev_dsa_state=None,
+    )
+
+    cache = jnp.zeros((2, 2, 2, 256), dtype=jnp.bfloat16)
+    backend(
+        jnp.ones((1, 1, 3), dtype=jnp.bfloat16),
+        jnp.ones((1, 1, 3), dtype=jnp.bfloat16),
+        jnp.ones((1, 1, 3), dtype=jnp.bfloat16),
+        layer=SimpleNamespace(layer_id=3, scaling=1.0),
+        forward_batch=forward_batch,
+        token_to_kv_pool=SimpleNamespace(get_fused_kv_buffer=lambda _layer_id: cache),
+        q_rope=jnp.ones((1, 1, 2), dtype=jnp.bfloat16),
+        k_rope=jnp.ones((1, 1, 2), dtype=jnp.bfloat16),
+        dsa_state=state,
+    )
+
+    assert {(call["component"], call["name"]) for call in calls} == {
+        ("dsa_indexer", "q_index"),
+        ("dsa_indexer", "head_weights"),
+        ("dsa_indexer", "index_k"),
+        ("dsa_selection", "logical_topk_ids"),
+        ("dsa_selection", "selected_counts"),
+        ("dsa_selection", "physical_slots"),
+        ("dsa_attention", "q_latent"),
+        ("dsa_attention", "q_rope"),
+        ("dsa_attention", "o_latent"),
+    }
+    assert all(call["layer_id"] == 3 for call in calls)
+    assert all(call["forward_mode"] == ForwardMode.DECODE for call in calls)
+
+
 def test_dsa_metadata_builds_causal_candidates_for_decode_and_prefill():
     from sgl_jax.srt.layers.attention.dsa_backend import DsaAttentionBackend
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode

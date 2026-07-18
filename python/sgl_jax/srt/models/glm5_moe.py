@@ -25,6 +25,7 @@ from sgl_jax.srt.layers.moe import (
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.utils.debug_utils import maybe_dump_jax_array
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -996,8 +997,23 @@ class Glm5DecoderLayer(nnx.Module):
             indexer_k_pool=indexer_k_pool,
             prev_dsa_state=prev_dsa_state,
         )
+        forward_mode = getattr(forward_batch, "forward_mode", None)
+        maybe_dump_jax_array(
+            hidden_states,
+            component="decoder_layer",
+            name="attention_output",
+            layer_id=self.layer_id,
+            forward_mode=forward_mode,
+        )
         hidden_states += residual
         residual = hidden_states
+        maybe_dump_jax_array(
+            residual,
+            component="decoder_layer",
+            name="residual_post_attention",
+            layer_id=self.layer_id,
+            forward_mode=forward_mode,
+        )
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         if self.is_moe_layer:
@@ -1015,12 +1031,34 @@ class Glm5DecoderLayer(nnx.Module):
             )
 
             hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
+            maybe_dump_jax_array(
+                hidden_states,
+                component="decoder_layer",
+                name="mlp_output",
+                layer_id=self.layer_id,
+                forward_mode=forward_mode,
+            )
 
             if shared_output is not None:
                 hidden_states = hidden_states + shared_output
         else:
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
+            maybe_dump_jax_array(
+                hidden_states,
+                component="decoder_layer",
+                name="mlp_output",
+                layer_id=self.layer_id,
+                forward_mode=forward_mode,
+            )
+
+        maybe_dump_jax_array(
+            hidden_states,
+            component="decoder_layer",
+            name="hidden_states_post_mlp",
+            layer_id=self.layer_id,
+            forward_mode=forward_mode,
+        )
 
         return (
             hidden_states,
@@ -1075,6 +1113,14 @@ class Glm5Model(nnx.Module):
         indexer_k_pool=None,
     ):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
+        forward_mode = getattr(forward_batch, "forward_mode", None)
+        maybe_dump_jax_array(
+            hidden_states,
+            component="embed",
+            name="hidden_states",
+            layer_id=None,
+            forward_mode=forward_mode,
+        )
         residual = None
         layers_kv_fused = []
         layers_topk_ids = []
@@ -1110,6 +1156,13 @@ class Glm5Model(nnx.Module):
             hidden_states += residual
 
         hidden_states = self.norm(hidden_states)
+        maybe_dump_jax_array(
+            hidden_states,
+            component="final",
+            name="normalized_hidden_states",
+            layer_id=None,
+            forward_mode=forward_mode,
+        )
         return (
             hidden_states,
             layers_kv_fused,
@@ -1168,6 +1221,16 @@ class Glm5ForCausalLM(nnx.Module):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
             output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
+
+        next_token_logits = getattr(output, "next_token_logits", None)
+        if next_token_logits is not None:
+            maybe_dump_jax_array(
+                next_token_logits,
+                component="logits",
+                name="next_token_logits",
+                layer_id=None,
+                forward_mode=getattr(forward_batch, "forward_mode", None),
+            )
 
         pool_updates = {"token_to_kv_pool": layers_kv_fused}
         if indexer_k_pool is not None:
