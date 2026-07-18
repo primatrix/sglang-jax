@@ -674,3 +674,154 @@ def test_glm5_decoder_layer_propagates_nondefault_indexer_config(monkeypatch):
     assert captured["max_position_embeddings"] == 8192
     assert captured["rope_theta"] == 54321.0
     assert captured["rope_scaling"] == {"factor": 4.0}
+
+
+def test_dsa_indexer_k_pool_uses_packed_paged_bf16_layout_and_is_a_pytree():
+    from sgl_jax.srt.mem_cache.dsa_pool import DsaIndexerKPool
+
+    pool = DsaIndexerKPool(
+        size=8,
+        page_size=4,
+        index_head_dim=3,
+        layer_num=2,
+        mesh=None,
+    )
+
+    assert pool.dtype == jnp.bfloat16
+    assert pool.packing == 2
+    assert pool.aligned_head_dim == 128
+    assert pool.get_buffer(0).shape == (3, 2, 2, 128)
+    leaves, tree_def = jax.tree_util.tree_flatten(pool)
+    restored = jax.tree_util.tree_unflatten(tree_def, leaves)
+    assert len(leaves) == 2
+    assert restored.get_buffer(1).shape == (3, 2, 2, 128)
+
+
+def test_dsa_indexer_k_pool_replace_buffer_uses_local_layer_storage():
+    from sgl_jax.srt.mem_cache.dsa_pool import DsaIndexerKPool
+
+    pool = DsaIndexerKPool(
+        size=8,
+        page_size=4,
+        index_head_dim=3,
+        layer_num=2,
+        mesh=None,
+        start_layer=4,
+    )
+    first = jnp.ones_like(pool.get_buffer(4))
+    second = jnp.full_like(pool.get_buffer(5), 2)
+    pool.replace_buffer([first, second])
+
+    assert pool.end_layer == 5
+    np.testing.assert_array_equal(pool.get_buffer(4), first)
+    np.testing.assert_array_equal(pool.get_buffer(5), second)
+
+
+def test_dsa_indexer_k_pool_rejects_multi_dp_until_slots_are_globalized():
+    from sgl_jax.srt.mem_cache.dsa_pool import DsaIndexerKPool
+
+    with pytest.raises(NotImplementedError, match="single-DP"):
+        DsaIndexerKPool(
+            size=8,
+            page_size=4,
+            index_head_dim=3,
+            layer_num=1,
+            mesh=None,
+            dp_size=2,
+        )
+
+
+def test_write_indexer_k_cache_handles_slot_zero_page_boundaries_and_padding():
+    from sgl_jax.srt.kernels.dsa.reference import (
+        gather_indexer_k_cache,
+        write_indexer_k_cache,
+    )
+    from sgl_jax.srt.mem_cache.dsa_pool import DsaIndexerKPool
+
+    pool = DsaIndexerKPool(
+        size=8,
+        page_size=4,
+        index_head_dim=3,
+        layer_num=1,
+        mesh=None,
+    )
+    updated = write_indexer_k_cache(
+        pool.get_buffer(0),
+        index_k=jnp.array(
+            [[1, 2, 3], [4, 5, 6], [7, 8, 9], [99, 99, 99]],
+            dtype=jnp.bfloat16,
+        ),
+        write_slots=jnp.array([0, 3, 4, -1], dtype=jnp.int32),
+        page_size=4,
+        index_head_dim=3,
+    )
+
+    gathered = gather_indexer_k_cache(
+        updated,
+        physical_slots=jnp.array([[0, 3, 4, 1]], dtype=jnp.int32),
+        page_size=4,
+        index_head_dim=3,
+    )
+    np.testing.assert_array_equal(
+        gathered,
+        np.array([[[1, 2, 3], [4, 5, 6], [7, 8, 9], [0, 0, 0]]]),
+    )
+
+
+def test_logical_topk_to_physical_slots_compacts_causal_valid_unique_ids():
+    from sgl_jax.srt.kernels.dsa.reference import logical_topk_to_physical_slots
+
+    selection = logical_topk_to_physical_slots(
+        logical_topk_ids=jnp.array(
+            [[0, 2, 1, -1], [3, 1, 1, 0], [0, 2, 4, 1]],
+            dtype=jnp.int32,
+        ),
+        selected_counts=jnp.array([3, 4, 4], dtype=jnp.int32),
+        req_to_token_slots=jnp.array(
+            [[0, 5, 9, 12, -1], [7, 8, -1, -1, -1]],
+            dtype=jnp.int32,
+        ),
+        query_request_indices=jnp.array([0, 0, 1], dtype=jnp.int32),
+        query_positions=jnp.array([2, 2, 2], dtype=jnp.int32),
+        producer_layer=6,
+    )
+
+    np.testing.assert_array_equal(
+        selection.logical_topk_ids,
+        np.array([[0, 2, 1, -1], [1, 0, -1, -1], [0, 1, -1, -1]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        selection.physical_slots,
+        np.array([[0, 9, 5, 0], [5, 0, 0, 0], [7, 8, 0, 0]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        selection.selected_counts,
+        np.array([3, 2, 2], dtype=np.int32),
+    )
+    assert selection.producer_layer == 6
+    selection.validate(mode="prefill")
+
+
+def test_logical_topk_to_physical_slots_is_jittable():
+    from sgl_jax.srt.kernels.dsa.reference import logical_topk_to_physical_slots
+
+    transform = jax.jit(
+        lambda ids, counts, mapping, reqs, positions: logical_topk_to_physical_slots(
+            logical_topk_ids=ids,
+            selected_counts=counts,
+            req_to_token_slots=mapping,
+            query_request_indices=reqs,
+            query_positions=positions,
+            producer_layer=2,
+        )
+    )
+    selection = transform(
+        jnp.array([[1, 0]], dtype=jnp.int32),
+        jnp.array([2], dtype=jnp.int32),
+        jnp.array([[0, 4]], dtype=jnp.int32),
+        jnp.array([0], dtype=jnp.int32),
+        jnp.array([1], dtype=jnp.int32),
+    )
+
+    np.testing.assert_array_equal(selection.physical_slots, np.array([[4, 0]], dtype=np.int32))
+    np.testing.assert_array_equal(selection.selected_counts, np.array([2], dtype=np.int32))
