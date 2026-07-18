@@ -170,6 +170,53 @@ def test_debug_dump_forward_occurrence_is_independent_of_callback_order(
     assert len(set(in_order.values())) == 2
 
 
+def test_debug_dump_forward_occurrence_includes_array_shape(monkeypatch, tmp_path):
+    from sgl_jax.srt.utils.debug_utils import maybe_dump_jax_array
+
+    _enable_dump(monkeypatch, tmp_path)
+    pending = []
+    monkeypatch.setattr(
+        jax.debug,
+        "callback",
+        lambda callback, *values, **_kwargs: pending.append((callback, values)),
+    )
+    for shape in ((2,), (1, 2)):
+        maybe_dump_jax_array(
+            jnp.asarray([len(shape)], dtype=jnp.int32),
+            component="logits",
+            name="shape_probe",
+            forward_batch=SimpleNamespace(
+                input_ids=jnp.asarray([1, 2], dtype=jnp.int32).reshape(shape),
+                positions=jnp.asarray([0, 1], dtype=jnp.int32),
+                seq_lens=jnp.asarray([2], dtype=jnp.int32),
+            ),
+        )
+    for callback, values in pending:
+        callback(*(np.asarray(value) for value in values))
+
+    rows = [
+        json.loads(line)
+        for line in next(tmp_path.glob("manifest-*.jsonl")).read_text().splitlines()
+    ]
+    assert len({row["occurrence"] for row in rows}) == 2
+
+
+def test_debug_dump_sum_does_not_evaluate_when_disabled(monkeypatch):
+    from sgl_jax.srt.utils.debug_utils import maybe_dump_jax_array_sum
+
+    class AdditionMustNotRun:
+        def __add__(self, _other):
+            raise AssertionError("disabled debug dump evaluated an addition")
+
+    monkeypatch.delenv("SGLANG_JAX_DEBUG_DUMP", raising=False)
+    maybe_dump_jax_array_sum(
+        AdditionMustNotRun(),
+        AdditionMustNotRun(),
+        component="decoder_layer",
+        name="hidden_states_post_mlp",
+    )
+
+
 def test_debug_dump_rejects_reused_directory_after_process_restart(monkeypatch, tmp_path):
     from sgl_jax.srt.utils import debug_utils
 

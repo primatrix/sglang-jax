@@ -61,19 +61,43 @@ def _forward_fingerprint(forward_batch):
     if all(value is None for value in values):
         return None
 
-    fingerprint = jnp.asarray(2166136261, dtype=jnp.uint32)
+    fingerprint = (
+        jnp.asarray(2166136261, dtype=jnp.uint32),
+        jnp.asarray(2246822519, dtype=jnp.uint32),
+    )
+
+    def mix_word(state, word):
+        low, high = state
+        word = jnp.asarray(word, dtype=jnp.uint32)
+        low = (low ^ word) * jnp.asarray(16777619, dtype=jnp.uint32)
+        low = (low ^ (low >> jnp.asarray(16, dtype=jnp.uint32))) * jnp.asarray(
+            2246822519, dtype=jnp.uint32
+        )
+        high = (high + word + jnp.asarray(2654435769, dtype=jnp.uint32)) * jnp.asarray(
+            3266489917, dtype=jnp.uint32
+        )
+        high = high ^ (high >> jnp.asarray(13, dtype=jnp.uint32))
+        return low, high
+
     for field_index, value in enumerate(values):
         if value is None:
             continue
         flattened = jnp.ravel(jnp.asarray(value, dtype=jnp.uint32))
-        indices = jnp.arange(1, flattened.size + 1, dtype=jnp.uint32)
-        field_hash = jnp.sum(
-            (flattened + jnp.asarray(97 * (field_index + 1), dtype=jnp.uint32))
-            * (indices * jnp.asarray(16777619, dtype=jnp.uint32)),
-            dtype=jnp.uint32,
+        fingerprint = mix_word(
+            fingerprint, jnp.asarray(0xD5A00000 + field_index, dtype=jnp.uint32)
         )
-        fingerprint = (fingerprint ^ field_hash) * jnp.asarray(16777619, dtype=jnp.uint32)
-    return fingerprint
+        fingerprint = mix_word(fingerprint, jnp.asarray(value.ndim, dtype=jnp.uint32))
+        for dimension in value.shape:
+            fingerprint = mix_word(
+                fingerprint, jnp.asarray(dimension, dtype=jnp.uint32)
+            )
+        fingerprint = jax.lax.fori_loop(
+            0,
+            flattened.size,
+            lambda index, state: mix_word(state, flattened[index]),
+            fingerprint,
+        )
+    return jnp.stack(fingerprint)
 
 
 def _write_debug_dump(host_value, host_occurrence=None, *, dump_dir, metadata):
@@ -105,7 +129,12 @@ def _write_debug_dump(host_value, host_occurrence=None, *, dump_dir, metadata):
             occurrence = _DEBUG_DUMP_OCCURRENCES[semantic_key]
             _DEBUG_DUMP_OCCURRENCES[semantic_key] += 1
         else:
-            occurrence = int(np.asarray(host_occurrence, dtype=np.uint32).item())
+            occurrence_words = np.asarray(host_occurrence, dtype=np.uint32).reshape(-1)
+            if occurrence_words.shape != (2,):
+                raise RuntimeError(
+                    "debug forward occurrence must contain exactly two uint32 words"
+                )
+            occurrence = int(occurrence_words[0]) | (int(occurrence_words[1]) << 32)
         filename = "__".join(
             (
                 f"p{metadata['process']:05d}",
@@ -184,6 +213,15 @@ def maybe_dump_jax_array(
         jax.debug.callback(callback, value)
     else:
         jax.debug.callback(callback, value, forward_fingerprint)
+    return value
+
+
+def maybe_dump_jax_array_sum(left, right, **metadata):
+    """Dump a derived sum without constructing it when tensor dumping is disabled."""
+    if os.environ.get("SGLANG_JAX_DEBUG_DUMP", "0") != "1":
+        return None
+    value = left + right
+    maybe_dump_jax_array(value, **metadata)
     return value
 
 

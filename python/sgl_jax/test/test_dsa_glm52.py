@@ -1409,6 +1409,12 @@ def test_glm_decoder_layer_emits_attention_residual_and_mlp_debug_tensors(monkey
         return value
 
     monkeypatch.setattr(glm5_moe, "maybe_dump_jax_array", capture, raising=False)
+    monkeypatch.setattr(
+        glm5_moe,
+        "maybe_dump_jax_array_sum",
+        lambda left, right, **kwargs: capture(left + right, **kwargs),
+        raising=False,
+    )
 
     class SelfAttention:
         def __call__(self, **kwargs):
@@ -1456,6 +1462,12 @@ def test_glm_decoder_mlp_debug_includes_shared_expert_and_delayed_residual(monke
         return value
 
     monkeypatch.setattr(glm5_moe, "maybe_dump_jax_array", capture)
+    monkeypatch.setattr(
+        glm5_moe,
+        "maybe_dump_jax_array_sum",
+        lambda left, right, **kwargs: capture(left + right, **kwargs),
+        raising=False,
+    )
 
     class SelfAttention:
         def __call__(self, **kwargs):

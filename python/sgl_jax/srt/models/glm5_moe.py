@@ -25,7 +25,7 @@ from sgl_jax.srt.layers.moe import (
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.utils.debug_utils import maybe_dump_jax_array
+from sgl_jax.srt.utils.debug_utils import maybe_dump_jax_array, maybe_dump_jax_array_sum
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -1048,8 +1048,9 @@ class Glm5DecoderLayer(nnx.Module):
             forward_batch=forward_batch,
         )
 
-        maybe_dump_jax_array(
-            hidden_states + residual,
+        maybe_dump_jax_array_sum(
+            hidden_states,
+            residual,
             component="decoder_layer",
             name="hidden_states_post_mlp",
             layer_id=self.layer_id,
