@@ -10,6 +10,7 @@ from transformers import PretrainedConfig
 from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
 from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
 from sgl_jax.srt.kernels.fused_mlp import apply_fused_mlp_with_padding
+from sgl_jax.srt.layers.attention.dsa_types import DsaTopKState
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
@@ -481,6 +482,7 @@ class Glm5Attention(nnx.Module):
         k_rope: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        dsa_state: DsaTopKState | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         # "thd,rhd->thr"
         ql_nope = jax.lax.dot_general(
@@ -491,14 +493,19 @@ class Glm5Attention(nnx.Module):
         ql_nope = ql_nope.transpose(1, 0, 2)
 
         c_kv_3d = compressed[:, None, :]
+        attention_kwargs = {
+            "q_rope": q_rope,
+            "k_rope": k_rope,
+        }
+        if dsa_state is not None:
+            attention_kwargs["dsa_state"] = dsa_state
         attn_output, kv_fused = self.attn_mqa(
             ql_nope,
             c_kv_3d,
             c_kv_3d,
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
-            q_rope=q_rope,
-            k_rope=k_rope,
+            **attention_kwargs,
         )
         # "thr,rhd->thd"
         o_v = jax.lax.dot_general(
@@ -518,6 +525,7 @@ class Glm5Attention(nnx.Module):
         k_rope: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        dsa_state: DsaTopKState | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         kv, _ = self.kv_b_proj(compressed)
         kv = kv.reshape(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
@@ -532,11 +540,66 @@ class Glm5Attention(nnx.Module):
         q = jnp.concatenate([q_nope, q_rope], axis=-1)
         k = jnp.concatenate([k_nope, k_rope], axis=-1)
 
+        attention_kwargs = {}
+        if dsa_state is not None:
+            attention_kwargs["dsa_state"] = dsa_state
         attn_output, kv_fused = self.attn_mha(
-            q, k, v, forward_batch=forward_batch, token_to_kv_pool=token_to_kv_pool
+            q,
+            k,
+            v,
+            forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
+            **attention_kwargs,
         )
         attn_output = attn_output.reshape(-1, self.num_heads * self.v_head_dim)
         return attn_output, kv_fused
+
+    def _build_or_share_dsa_state(
+        self,
+        *,
+        hidden_states: jax.Array,
+        q_lora: jax.Array,
+        positions: jax.Array,
+        forward_batch: ForwardBatch,
+        indexer_k_pool,
+        prev_dsa_state: DsaTopKState | None,
+    ) -> tuple[DsaTopKState | None, jax.Array | None]:
+        """Build a full-layer selection or reuse the previous IndexShare state."""
+        if indexer_k_pool is None:
+            return (prev_dsa_state if self.indexer is None else None), None
+
+        if self.indexer is None:
+            if prev_dsa_state is None:
+                raise ValueError(
+                    f"shared GLM DSA layer {self.layer_id} requires a previous full-layer state"
+                )
+            return prev_dsa_state, None
+
+        build_dsa_state = getattr(forward_batch.attn_backend, "build_dsa_state", None)
+        if build_dsa_state is None:
+            raise TypeError("an Index-K pool requires an attention backend with build_dsa_state()")
+        q_index, head_weights, index_k = self.indexer(
+            hidden_states,
+            q_lora,
+            positions,
+        )
+        state, updated_index_cache = build_dsa_state(
+            layer_id=self.layer_id,
+            q_index=q_index,
+            head_weights=head_weights,
+            index_k=index_k,
+            forward_batch=forward_batch,
+            indexer_k_pool=indexer_k_pool,
+            prev_dsa_state=prev_dsa_state,
+        )
+        if not isinstance(state, DsaTopKState):
+            raise TypeError("build_dsa_state() must return a DsaTopKState")
+        if state.selection.producer_layer != self.layer_id:
+            raise ValueError(
+                "full GLM DSA layer must own the produced selection; got "
+                f"producer={state.selection.producer_layer}, layer={self.layer_id}"
+            )
+        return state, updated_index_cache
 
     def __call__(
         self,
@@ -544,14 +607,22 @@ class Glm5Attention(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-    ) -> tuple[jax.Array, jax.Array]:
+        indexer_k_pool=None,
+        prev_dsa_state: DsaTopKState | None = None,
+    ) -> tuple[jax.Array, jax.Array, DsaTopKState | None, jax.Array | None]:
         q_compressed, _ = self.q_a_proj(hidden_states)
         q_compressed = self.q_a_layernorm(q_compressed)
         q, _ = self.q_b_proj(q_compressed)
         q = q.reshape(-1, self.num_heads, self.qk_head_dim)
 
-        if self.indexer is not None:
-            _ = self.indexer(hidden_states, q_compressed, positions)
+        dsa_state, indexer_k_update = self._build_or_share_dsa_state(
+            hidden_states=hidden_states,
+            q_lora=q_compressed,
+            positions=positions,
+            forward_batch=forward_batch,
+            indexer_k_pool=indexer_k_pool,
+            prev_dsa_state=prev_dsa_state,
+        )
 
         q_nope = q[:, :, : self.qk_nope_head_dim]
         q_rope = q[:, :, self.qk_nope_head_dim :]
@@ -565,15 +636,27 @@ class Glm5Attention(nnx.Module):
 
         if self.use_absorbed:
             attn_output, kv_fused = self._forward_mqa(
-                q_nope, q_rope, compressed, k_rope, forward_batch, token_to_kv_pool
+                q_nope,
+                q_rope,
+                compressed,
+                k_rope,
+                forward_batch,
+                token_to_kv_pool,
+                dsa_state,
             )
         else:
             attn_output, kv_fused = self._forward_mha(
-                q_nope, q_rope, compressed, k_rope, forward_batch, token_to_kv_pool
+                q_nope,
+                q_rope,
+                compressed,
+                k_rope,
+                forward_batch,
+                token_to_kv_pool,
+                dsa_state,
             )
 
         output, _ = self.o_proj(attn_output)
-        return output, kv_fused
+        return output, kv_fused, dsa_state, indexer_k_update
 
 
 class Glm5MLP(nnx.Module):
@@ -887,9 +970,11 @@ class Glm5DecoderLayer(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        indexer_k_pool=None,
         residual: jax.Array | None = None,
+        prev_dsa_state: DsaTopKState | None = None,
         dispatch_info: ExpertLocationMetadata | None = None,
-    ) -> tuple[jax.Array, jax.Array]:
+    ):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -898,11 +983,13 @@ class Glm5DecoderLayer(nnx.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
-        hidden_states, kv_fused = self.self_attn(
+        hidden_states, kv_fused, dsa_state, indexer_k_update = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
+            indexer_k_pool=indexer_k_pool,
+            prev_dsa_state=prev_dsa_state,
         )
         hidden_states += residual
         residual = hidden_states
@@ -930,7 +1017,14 @@ class Glm5DecoderLayer(nnx.Module):
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
 
-        return hidden_states, residual, kv_fused, topk_ids
+        return (
+            hidden_states,
+            residual,
+            kv_fused,
+            topk_ids,
+            dsa_state,
+            indexer_k_update,
+        )
 
 
 class Glm5Model(nnx.Module):
@@ -973,28 +1067,51 @@ class Glm5Model(nnx.Module):
         self,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-    ) -> jax.Array:
+        indexer_k_pool=None,
+    ):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         residual = None
         layers_kv_fused = []
         layers_topk_ids = []
+        layers_dsa_states = []
+        layers_indexer_k_updates = []
+        prev_dsa_state = None
         for layer in self.layers:
-            hidden_states, residual, kv_fused, topk_ids = layer(
+            (
+                hidden_states,
+                residual,
+                kv_fused,
+                topk_ids,
+                dsa_state,
+                indexer_k_update,
+            ) = layer(
                 forward_batch.positions,
                 hidden_states,
                 forward_batch,
                 token_to_kv_pool,
+                indexer_k_pool,
                 residual,
+                prev_dsa_state=prev_dsa_state,
                 dispatch_info=forward_batch.expert_location_metadata,
             )
             layers_kv_fused.append(kv_fused)
             layers_topk_ids.append(topk_ids)
+            layers_dsa_states.append(dsa_state)
+            if indexer_k_update is not None:
+                layers_indexer_k_updates.append(indexer_k_update)
+            prev_dsa_state = dsa_state
 
         if residual is not None:
             hidden_states += residual
 
         hidden_states = self.norm(hidden_states)
-        return hidden_states, layers_kv_fused, layers_topk_ids
+        return (
+            hidden_states,
+            layers_kv_fused,
+            layers_topk_ids,
+            layers_dsa_states,
+            layers_indexer_k_updates,
+        )
 
 
 class Glm5ForCausalLM(nnx.Module):
@@ -1029,9 +1146,17 @@ class Glm5ForCausalLM(nnx.Module):
         logits_metadata: LogitsMetadata,
     ):
         kv_pool = memory_pools.token_to_kv_pool
-        hidden_states, layers_kv_fused, layers_topk_ids = self.model(
+        indexer_k_pool = getattr(memory_pools, "indexer_k_pool", None)
+        (
+            hidden_states,
+            layers_kv_fused,
+            layers_topk_ids,
+            _,
+            layers_indexer_k_updates,
+        ) = self.model(
             forward_batch,
             kv_pool,
+            indexer_k_pool,
         )
 
         if not getattr(self.config, "tie_word_embeddings", False):
@@ -1039,7 +1164,10 @@ class Glm5ForCausalLM(nnx.Module):
         else:
             output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
 
-        return output, {"token_to_kv_pool": layers_kv_fused}, True, layers_topk_ids
+        pool_updates = {"token_to_kv_pool": layers_kv_fused}
+        if indexer_k_pool is not None:
+            pool_updates["indexer_k_pool"] = layers_indexer_k_updates
+        return output, pool_updates, True, layers_topk_ids
 
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(

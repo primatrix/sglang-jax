@@ -32,6 +32,7 @@ class DsaIndexerKPool:
         dp_size: int = 1,
         start_layer: int | None = None,
         end_layer: int | None = None,
+        layer_ids: tuple[int, ...] | None = None,
     ) -> None:
         if size <= 0 or page_size <= 0 or layer_num <= 0 or dp_size <= 0:
             raise ValueError("size, page_size, layer_num, and dp_size must be positive")
@@ -52,10 +53,24 @@ class DsaIndexerKPool:
         self.layer_num = layer_num
         self.mesh = mesh
         self.dp_size = dp_size
-        self.start_layer = 0 if start_layer is None else start_layer
-        self.end_layer = self.start_layer + layer_num - 1 if end_layer is None else end_layer
-        if self.end_layer - self.start_layer + 1 != layer_num:
-            raise ValueError("start_layer/end_layer span must match layer_num")
+        if layer_ids is None:
+            self.start_layer = 0 if start_layer is None else start_layer
+            self.end_layer = self.start_layer + layer_num - 1 if end_layer is None else end_layer
+            if self.end_layer - self.start_layer + 1 != layer_num:
+                raise ValueError("start_layer/end_layer span must match layer_num")
+            self.layer_ids = tuple(range(self.start_layer, self.end_layer + 1))
+        else:
+            if start_layer is not None or end_layer is not None:
+                raise ValueError("layer_ids cannot be combined with start_layer/end_layer")
+            self.layer_ids = tuple(layer_ids)
+            if len(self.layer_ids) != layer_num:
+                raise ValueError("layer_ids length must match layer_num")
+            if any(layer_id < 0 for layer_id in self.layer_ids):
+                raise ValueError("layer_ids must be nonnegative")
+            if self.layer_ids != tuple(sorted(set(self.layer_ids))):
+                raise ValueError("layer_ids must be unique and strictly increasing")
+            self.start_layer = self.layer_ids[0]
+            self.end_layer = self.layer_ids[-1]
         self.dtype = jnp.bfloat16
         self.packing = get_dtype_packing(self.dtype)
         self.total_num_pages = (size + page_size * dp_size) // page_size
@@ -86,11 +101,10 @@ class DsaIndexerKPool:
             return [create() for _ in range(self.layer_num)]
 
     def get_buffer(self, layer_id: int) -> jax.Array:
-        offset = layer_id - self.start_layer
-        if offset < 0 or offset >= self.layer_num:
-            raise IndexError(
-                f"layer_id {layer_id} is outside [{self.start_layer}, {self.end_layer}]"
-            )
+        try:
+            offset = self.layer_ids.index(layer_id)
+        except ValueError as error:
+            raise IndexError(f"layer_id {layer_id} has no Index-K storage") from error
         return self.k_buffer[offset]
 
     def replace_buffer(self, buffers: list[jax.Array]) -> None:
@@ -113,6 +127,7 @@ class DsaIndexerKPool:
             "dp_size": self.dp_size,
             "start_layer": self.start_layer,
             "end_layer": self.end_layer,
+            "layer_ids": self.layer_ids,
             "dtype": self.dtype,
             "packing": self.packing,
             "total_num_pages": self.total_num_pages,

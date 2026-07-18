@@ -865,3 +865,459 @@ def test_non_hybrid_memory_pools_register_indexer_k_pool_and_require_both_update
     assert indexer_pool.replaced == ["index"]
     with pytest.raises(ValueError, match="must exactly match"):
         pools.replace_all({"token_to_kv_pool": ["mla-only"]})
+
+
+def test_glm_attention_full_builds_and_shared_reuses_indexshare_state():
+    from types import SimpleNamespace
+
+    from sgl_jax.srt.layers.attention.dsa_types import DsaSelection, DsaTopKState
+    from sgl_jax.srt.models.glm5_moe import Glm5Attention
+
+    selection = DsaSelection(
+        logical_topk_ids=jnp.array([[1, 0]], dtype=jnp.int32),
+        physical_slots=jnp.array([[9, 0]], dtype=jnp.int32),
+        selected_counts=jnp.array([2], dtype=jnp.int32),
+        producer_layer=0,
+    )
+    produced_state = DsaTopKState(
+        selection=selection,
+        query_offsets=jnp.array([0, 1], dtype=jnp.int32),
+        request_offsets=jnp.array([0], dtype=jnp.int32),
+    )
+
+    class CountingIndexer:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, hidden_states, q_lora, positions):
+            self.calls += 1
+            return hidden_states[:, None, :2], q_lora[:, :1], hidden_states[:, :2]
+
+    class Backend:
+        def __init__(self):
+            self.calls = 0
+
+        def build_dsa_state(self, **kwargs):
+            self.calls += 1
+            assert kwargs["layer_id"] == 0
+            assert kwargs["prev_dsa_state"] is None
+            return produced_state, "updated-full-index-cache"
+
+    class IndexPool:
+        def get_buffer(self, layer_id):
+            return f"unchanged-index-cache-{layer_id}"
+
+    backend = Backend()
+    forward_batch = SimpleNamespace(attn_backend=backend)
+    index_pool = IndexPool()
+    indexer = CountingIndexer()
+    full_attention = SimpleNamespace(layer_id=0, indexer=indexer)
+    shared_attention = SimpleNamespace(layer_id=1, indexer=None)
+    hidden = jnp.ones((1, 4), dtype=jnp.float32)
+    q_lora = jnp.ones((1, 3), dtype=jnp.float32)
+    positions = jnp.array([2], dtype=jnp.int32)
+
+    full_state, full_update = Glm5Attention._build_or_share_dsa_state(
+        full_attention,
+        hidden_states=hidden,
+        q_lora=q_lora,
+        positions=positions,
+        forward_batch=forward_batch,
+        indexer_k_pool=index_pool,
+        prev_dsa_state=None,
+    )
+    shared_state, shared_update = Glm5Attention._build_or_share_dsa_state(
+        shared_attention,
+        hidden_states=hidden,
+        q_lora=q_lora,
+        positions=positions,
+        forward_batch=forward_batch,
+        indexer_k_pool=index_pool,
+        prev_dsa_state=full_state,
+    )
+
+    assert indexer.calls == 1
+    assert backend.calls == 1
+    assert full_state is produced_state
+    assert shared_state is produced_state
+    assert full_update == "updated-full-index-cache"
+    assert shared_update is None
+
+
+def test_indexer_k_pool_maps_sparse_full_layer_ids_to_compact_storage():
+    from sgl_jax.srt.mem_cache.dsa_pool import DsaIndexerKPool
+
+    pool = DsaIndexerKPool(
+        size=4,
+        page_size=2,
+        index_head_dim=2,
+        layer_num=2,
+        layer_ids=(0, 2),
+        mesh=None,
+    )
+
+    assert pool.get_buffer(0) is pool.k_buffer[0]
+    assert pool.get_buffer(2) is pool.k_buffer[1]
+    with pytest.raises(IndexError, match="no Index-K storage"):
+        pool.get_buffer(1)
+
+    leaves, tree_def = jax.tree_util.tree_flatten(pool)
+    restored = jax.tree_util.tree_unflatten(tree_def, leaves)
+    assert restored.layer_ids == (0, 2)
+    assert restored.get_buffer(2) is restored.k_buffer[1]
+
+
+def test_full_shared_full_schedule_uses_compact_indexer_k_pool_order():
+    from types import SimpleNamespace
+
+    from sgl_jax.srt.layers.attention.dsa_types import DsaSelection, DsaTopKState
+    from sgl_jax.srt.mem_cache.dsa_pool import DsaIndexerKPool
+    from sgl_jax.srt.models.glm5_moe import Glm5Attention
+
+    pool = DsaIndexerKPool(
+        size=4,
+        page_size=2,
+        index_head_dim=2,
+        layer_num=2,
+        layer_ids=(0, 2),
+        mesh=None,
+    )
+
+    class Indexer:
+        def __call__(self, hidden_states, q_lora, positions):
+            del positions
+            return hidden_states[:, None, :2], q_lora[:, :1], hidden_states[:, :2]
+
+    class Backend:
+        def __init__(self):
+            self.layers = []
+
+        def build_dsa_state(self, *, layer_id, indexer_k_pool, **kwargs):
+            del kwargs
+            self.layers.append(layer_id)
+            state = DsaTopKState(
+                selection=DsaSelection(
+                    logical_topk_ids=jnp.array([[0]], dtype=jnp.int32),
+                    physical_slots=jnp.array([[0]], dtype=jnp.int32),
+                    selected_counts=jnp.array([1], dtype=jnp.int32),
+                    producer_layer=layer_id,
+                ),
+                query_offsets=jnp.array([0, 1], dtype=jnp.int32),
+                request_offsets=jnp.array([0], dtype=jnp.int32),
+            )
+            return state, indexer_k_pool.get_buffer(layer_id)
+
+    backend = Backend()
+    forward_batch = SimpleNamespace(attn_backend=backend)
+    attentions = [
+        SimpleNamespace(layer_id=0, indexer=Indexer()),
+        SimpleNamespace(layer_id=1, indexer=None),
+        SimpleNamespace(layer_id=2, indexer=Indexer()),
+    ]
+    hidden = jnp.ones((1, 4), dtype=jnp.float32)
+    q_lora = jnp.ones((1, 3), dtype=jnp.float32)
+    positions = jnp.array([0], dtype=jnp.int32)
+
+    states = []
+    updates = []
+    previous = None
+    for attention in attentions:
+        previous, update = Glm5Attention._build_or_share_dsa_state(
+            attention,
+            hidden_states=hidden,
+            q_lora=q_lora,
+            positions=positions,
+            forward_batch=forward_batch,
+            indexer_k_pool=pool,
+            prev_dsa_state=previous,
+        )
+        states.append(previous)
+        if update is not None:
+            updates.append(update)
+
+    assert backend.layers == [0, 2]
+    assert [state.selection.producer_layer for state in states] == [0, 0, 2]
+    assert updates[0] is pool.k_buffer[0]
+    assert updates[1] is pool.k_buffer[1]
+
+
+def test_glm_attention_forwards_dsa_kwarg_only_for_nonempty_state(monkeypatch):
+    from types import SimpleNamespace
+
+    from sgl_jax.srt.layers.attention.dsa_types import DsaSelection, DsaTopKState
+    from sgl_jax.srt.models import glm5_moe
+    from sgl_jax.srt.models.glm5_moe import Glm5Attention
+
+    broadcast_to = jnp.broadcast_to
+    monkeypatch.setattr(
+        glm5_moe.jnp,
+        "broadcast_to",
+        lambda array, shape, **_: broadcast_to(array, shape),
+    )
+
+    state = DsaTopKState(
+        selection=DsaSelection(
+            logical_topk_ids=jnp.array([[0]], dtype=jnp.int32),
+            physical_slots=jnp.array([[0]], dtype=jnp.int32),
+            selected_counts=jnp.array([1], dtype=jnp.int32),
+            producer_layer=0,
+        ),
+        query_offsets=jnp.array([0, 1], dtype=jnp.int32),
+        request_offsets=jnp.array([0], dtype=jnp.int32),
+    )
+
+    class CaptureAttention:
+        def __init__(self):
+            self.kwargs = []
+
+        def __call__(self, q, k, v, **kwargs):
+            del q, k
+            self.kwargs.append(kwargs)
+            return v, "kv-update"
+
+    mqa_backend = CaptureAttention()
+    mqa = SimpleNamespace(
+        w_uk=SimpleNamespace(value=jnp.ones((1, 1, 1), dtype=jnp.float32)),
+        w_uv=SimpleNamespace(value=jnp.ones((1, 1, 1), dtype=jnp.float32)),
+        attn_mqa=mqa_backend,
+        num_heads=1,
+        v_head_dim=1,
+    )
+    mqa_args = (
+        jnp.ones((1, 1, 1), dtype=jnp.float32),
+        jnp.ones((1, 1, 1), dtype=jnp.float32),
+        jnp.ones((1, 1), dtype=jnp.float32),
+        jnp.ones((1, 1, 1), dtype=jnp.float32),
+        "forward-batch",
+        "mla-pool",
+    )
+    Glm5Attention._forward_mqa(mqa, *mqa_args, dsa_state=None)
+    Glm5Attention._forward_mqa(mqa, *mqa_args, dsa_state=state)
+
+    assert "dsa_state" not in mqa_backend.kwargs[0]
+    assert mqa_backend.kwargs[1]["dsa_state"] is state
+
+    mha_backend = CaptureAttention()
+    mha = SimpleNamespace(
+        kv_b_proj=lambda compressed: (
+            jnp.ones((compressed.shape[0], 2), dtype=jnp.float32),
+            None,
+        ),
+        num_heads=1,
+        qk_nope_head_dim=1,
+        v_head_dim=1,
+        qk_rope_head_dim=1,
+        attn_mha=mha_backend,
+    )
+    mha_args = (
+        jnp.ones((1, 1, 1), dtype=jnp.float32),
+        jnp.ones((1, 1, 1), dtype=jnp.float32),
+        jnp.ones((1, 1), dtype=jnp.float32),
+        jnp.ones((1, 1, 1), dtype=jnp.float32),
+        "forward-batch",
+        "mha-pool",
+    )
+    Glm5Attention._forward_mha(mha, *mha_args, dsa_state=None)
+    Glm5Attention._forward_mha(mha, *mha_args, dsa_state=state)
+
+    assert "dsa_state" not in mha_backend.kwargs[0]
+    assert mha_backend.kwargs[1]["dsa_state"] is state
+
+
+def test_glm_decoder_layer_returns_moe_dsa_and_index_updates_separately():
+    from types import SimpleNamespace
+
+    from sgl_jax.srt.layers.attention.dsa_types import DsaSelection, DsaTopKState
+    from sgl_jax.srt.models.glm5_moe import Glm5DecoderLayer
+
+    state = DsaTopKState(
+        selection=DsaSelection(
+            logical_topk_ids=jnp.array([[0]], dtype=jnp.int32),
+            physical_slots=jnp.array([[0]], dtype=jnp.int32),
+            selected_counts=jnp.array([1], dtype=jnp.int32),
+            producer_layer=0,
+        ),
+        query_offsets=jnp.array([0, 1], dtype=jnp.int32),
+        request_offsets=jnp.array([0], dtype=jnp.int32),
+    )
+    moe_ids = jnp.array([[4, 7]], dtype=jnp.int32)
+
+    class SelfAttention:
+        def __call__(self, **kwargs):
+            assert kwargs["indexer_k_pool"] == "index-pool"
+            assert kwargs["prev_dsa_state"] is state
+            return jnp.zeros_like(kwargs["hidden_states"]), "mla-update", state, "index-update"
+
+    class Gate:
+        bias = None
+
+        def __call__(self, hidden_states):
+            return jnp.zeros((hidden_states.shape[0], 8), dtype=jnp.float32)
+
+    class ExpertTopK:
+        def __call__(self, router_logits, correction_bias, *, dispatch_info):
+            del router_logits, correction_bias, dispatch_info
+            return jnp.ones((1, 2), dtype=jnp.float32), moe_ids
+
+    class Moe:
+        def __call__(self, hidden_states, topk_weights, topk_ids):
+            del topk_weights
+            assert topk_ids is moe_ids
+            return hidden_states + 10
+
+    layer = SimpleNamespace(
+        input_layernorm=lambda value: value,
+        self_attn=SelfAttention(),
+        post_attention_layernorm=lambda value: value,
+        is_moe_layer=True,
+        shared_experts=None,
+        moe_gate=Gate(),
+        topk=ExpertTopK(),
+        mlp=Moe(),
+    )
+    result = Glm5DecoderLayer.__call__(
+        layer,
+        positions=jnp.array([0], dtype=jnp.int32),
+        hidden_states=jnp.array([[1.0, 2.0]], dtype=jnp.float32),
+        forward_batch="forward-batch",
+        token_to_kv_pool="mla-pool",
+        indexer_k_pool="index-pool",
+        residual=None,
+        prev_dsa_state=state,
+        dispatch_info="dispatch",
+    )
+
+    hidden, residual, mla_update, returned_moe_ids, dsa_state, index_update = result
+    np.testing.assert_array_equal(hidden, np.array([[11.0, 12.0]], dtype=np.float32))
+    np.testing.assert_array_equal(residual, np.array([[1.0, 2.0]], dtype=np.float32))
+    assert mla_update == "mla-update"
+    assert returned_moe_ids is moe_ids
+    assert dsa_state is state
+    assert index_update == "index-update"
+
+
+def test_glm_model_threads_dsa_state_separately_from_moe_topk_ids():
+    from types import SimpleNamespace
+
+    from sgl_jax.srt.layers.attention.dsa_types import DsaSelection, DsaTopKState
+    from sgl_jax.srt.models.glm5_moe import Glm5Model
+
+    state = DsaTopKState(
+        selection=DsaSelection(
+            logical_topk_ids=jnp.array([[0]], dtype=jnp.int32),
+            physical_slots=jnp.array([[0]], dtype=jnp.int32),
+            selected_counts=jnp.array([1], dtype=jnp.int32),
+            producer_layer=0,
+        ),
+        query_offsets=jnp.array([0, 1], dtype=jnp.int32),
+        request_offsets=jnp.array([0], dtype=jnp.int32),
+    )
+
+    class StubLayer:
+        def __init__(self, layer_id):
+            self.layer_id = layer_id
+            self.seen_prev = []
+
+        def __call__(
+            self,
+            positions,
+            hidden_states,
+            forward_batch,
+            token_to_kv_pool,
+            indexer_k_pool,
+            residual,
+            *,
+            prev_dsa_state,
+            dispatch_info,
+        ):
+            del positions, forward_batch, token_to_kv_pool, indexer_k_pool, residual, dispatch_info
+            self.seen_prev.append(prev_dsa_state)
+            next_state = state if self.layer_id == 0 else prev_dsa_state
+            index_update = f"index-{self.layer_id}" if self.layer_id == 0 else None
+            return (
+                hidden_states + 1,
+                None,
+                f"mla-{self.layer_id}",
+                jnp.array([100 + self.layer_id], dtype=jnp.int32),
+                next_state,
+                index_update,
+            )
+
+    layers = [StubLayer(0), StubLayer(1)]
+    model = SimpleNamespace(
+        embed_tokens=lambda input_ids: input_ids[:, None].astype(jnp.float32),
+        layers=layers,
+        norm=lambda hidden_states: hidden_states,
+    )
+    forward_batch = SimpleNamespace(
+        input_ids=jnp.array([3], dtype=jnp.int32),
+        positions=jnp.array([0], dtype=jnp.int32),
+        expert_location_metadata=None,
+    )
+
+    hidden, mla_updates, moe_topk_ids, dsa_states, index_updates = Glm5Model.__call__(
+        model,
+        forward_batch,
+        token_to_kv_pool="mla-pool",
+        indexer_k_pool="index-pool",
+    )
+
+    np.testing.assert_array_equal(hidden, np.array([[5.0]], dtype=np.float32))
+    assert mla_updates == ["mla-0", "mla-1"]
+    np.testing.assert_array_equal(moe_topk_ids[0], np.array([100], dtype=np.int32))
+    np.testing.assert_array_equal(moe_topk_ids[1], np.array([101], dtype=np.int32))
+    assert dsa_states == [state, state]
+    assert index_updates == ["index-0"]
+    assert layers[0].seen_prev == [None]
+    assert layers[1].seen_prev == [state]
+
+
+def test_glm_causal_lm_returns_dual_pool_updates_without_relabeling_moe_topk():
+    from types import SimpleNamespace
+
+    from sgl_jax.srt.models.glm5_moe import Glm5ForCausalLM
+
+    moe_topk_ids = [jnp.array([[4, 7]], dtype=jnp.int32)]
+
+    class StubModel:
+        def __init__(self):
+            self.args = None
+
+        def __call__(self, forward_batch, token_to_kv_pool, indexer_k_pool):
+            self.args = (forward_batch, token_to_kv_pool, indexer_k_pool)
+            return (
+                jnp.array([[3.0]], dtype=jnp.float32),
+                ["mla-update"],
+                moe_topk_ids,
+                ["dsa-state"],
+                ["index-update"],
+            )
+
+    stub_model = StubModel()
+    causal_lm = SimpleNamespace(
+        model=stub_model,
+        config=SimpleNamespace(tie_word_embeddings=False),
+        lm_head="lm-head",
+        logits_processor=lambda hidden, head, metadata: (hidden, head, metadata),
+    )
+    forward_batch = object()
+    memory_pools = SimpleNamespace(
+        token_to_kv_pool="mla-pool",
+        indexer_k_pool="index-pool",
+    )
+
+    output, pool_updates, callback_flag, returned_topk = Glm5ForCausalLM.__call__(
+        causal_lm,
+        forward_batch,
+        memory_pools,
+        logits_metadata="logits-metadata",
+    )
+
+    assert output[1:] == ("lm-head", "logits-metadata")
+    assert pool_updates == {
+        "token_to_kv_pool": ["mla-update"],
+        "indexer_k_pool": ["index-update"],
+    }
+    assert callback_flag is True
+    assert returned_topk is moe_topk_ids
+    assert stub_model.args == (forward_batch, "mla-pool", "index-pool")
