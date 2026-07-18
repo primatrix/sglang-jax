@@ -290,6 +290,46 @@ def _build_non_hybrid_memory_pools(
     return MemoryPools(**pools)
 
 
+def _dsa_full_layer_ids(hf_text_config, layer_num: int) -> tuple[int, ...]:
+    """Return model layer IDs that own full Indexer-K buffers."""
+    indexer_types = getattr(hf_text_config, "indexer_types", None)
+    if indexer_types is None:
+        return tuple(range(layer_num))
+    if len(indexer_types) < layer_num:
+        raise ValueError(f"indexer_types has {len(indexer_types)} entries for {layer_num} layers")
+    invalid = sorted(set(indexer_types[:layer_num]) - {"full", "shared"})
+    if invalid:
+        raise ValueError(f"unsupported GLM indexer_types entries: {invalid}")
+    layer_ids = tuple(
+        layer_id
+        for layer_id, indexer_type in enumerate(indexer_types[:layer_num])
+        if indexer_type == "full"
+    )
+    if not layer_ids:
+        raise ValueError("DSA requires at least one full Indexer layer")
+    return layer_ids
+
+
+def _build_dsa_indexer_k_pool(runner, dp_size: int):
+    """Create compact Index-K storage in full-layer order."""
+    from sgl_jax.srt.mem_cache.dsa_pool import DsaIndexerKPool
+
+    config = runner.model_config.hf_text_config
+    layer_ids = _dsa_full_layer_ids(config, runner._kv_pool_layer_count())
+    index_head_dim = getattr(config, "index_head_dim", None)
+    if index_head_dim is None:
+        raise ValueError("DSA config requires index_head_dim")
+    return DsaIndexerKPool(
+        size=runner.max_total_num_tokens,
+        page_size=runner.page_size,
+        index_head_dim=index_head_dim,
+        layer_num=len(layer_ids),
+        layer_ids=layer_ids,
+        mesh=runner.mesh,
+        dp_size=dp_size,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Mixin class
 # ---------------------------------------------------------------------------
@@ -306,7 +346,7 @@ class ModelRunnerKVCacheMixin:
         dtype_size = jnp.dtype(self.kv_cache_dtype).itemsize
         num_layers = self._kv_pool_layer_count()
 
-        if self.use_mla_backend and self.server_args.attention_backend == "fa":
+        if self.use_mla_backend and self.server_args.attention_backend in ("fa", "dsa"):
             cfg = self.model_config.hf_text_config
             kv_dim = align128(cfg.kv_lora_rank) + align128(cfg.qk_rope_head_dim)
             # MLA v2 kernel packs page_size up to kv_packing boundary.
@@ -316,7 +356,18 @@ class ModelRunnerKVCacheMixin:
             kv_packing = 32 // dtype_bits
             aligned_ps = (self.page_size + kv_packing - 1) // kv_packing * kv_packing
             per_token = kv_dim * aligned_ps * dtype_size // self.page_size
-            return per_token * num_layers
+            main_cache_cost = per_token * num_layers
+            if self.server_args.attention_backend == "fa":
+                return main_cache_cost
+
+            index_dtype_size = jnp.dtype(jnp.bfloat16).itemsize
+            index_packing = 32 // (index_dtype_size * 8)
+            index_aligned_ps = (self.page_size + index_packing - 1) // index_packing * index_packing
+            index_per_token = (
+                align128(cfg.index_head_dim) * index_aligned_ps * index_dtype_size // self.page_size
+            )
+            full_layer_count = len(_dsa_full_layer_ids(cfg, num_layers))
+            return main_cache_cost + index_per_token * full_layer_count
 
         swa_num_kv_heads = getattr(self.model_config.hf_config, "swa_num_key_value_heads", None)
         if swa_num_kv_heads is not None:
@@ -679,7 +730,7 @@ class ModelRunnerKVCacheMixin:
                 mesh=self.mesh,
                 dp_size=dp_size,
             )
-        elif self.use_mla_backend and self.server_args.attention_backend == "fa":
+        elif self.use_mla_backend and self.server_args.attention_backend in ("fa", "dsa"):
             from sgl_jax.srt.mem_cache.memory_pool import MLATokenToKVPool
 
             hf_text_config = self.model_config.hf_text_config
@@ -708,6 +759,12 @@ class ModelRunnerKVCacheMixin:
                 dp_size=dp_size,
             )
 
+        self.indexer_k_pool = None
+        if self.server_args.attention_backend == "dsa":
+            if has_recurrent_state:
+                raise NotImplementedError("DSA does not support hybrid recurrent models")
+            self.indexer_k_pool = _build_dsa_indexer_k_pool(self, dp_size)
+
         # --- MemoryPools wrapper (+ hybrid ReqToTokenPool) ---
         if has_recurrent_state:
             state_size = self.server_args.max_recurrent_state_size
@@ -724,7 +781,10 @@ class ModelRunnerKVCacheMixin:
                 ping_pong_slots=_recurrent_ping_pong_slots(self.server_args),
             )
         else:
-            self.memory_pools = _build_non_hybrid_memory_pools(self.token_to_kv_pool)
+            self.memory_pools = _build_non_hybrid_memory_pools(
+                self.token_to_kv_pool,
+                indexer_k_pool=self.indexer_k_pool,
+            )
 
         # --- Allocator ---
         if self.token_to_kv_pool_allocator is None:

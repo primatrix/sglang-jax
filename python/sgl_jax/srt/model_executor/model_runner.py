@@ -47,6 +47,29 @@ from sgl_jax.srt.utils.jax_utils import get_available_device_memory
 logger = logging.getLogger(__name__)
 
 
+def _restore_single_tp_pool_update_shardings(pool_updates, memory_pools):
+    """Re-place donated single-TP pool updates using each pool's own sharding."""
+
+    def restore(update, pool):
+        target_sharding = getattr(pool, "kv_sharding", None)
+        if target_sharding is None:
+            target_sharding = getattr(pool, "k_sharding", None)
+        if target_sharding is None:
+            return update
+        return jax.tree.map(
+            lambda value: jax.device_put(value, target_sharding),
+            update,
+        )
+
+    if isinstance(pool_updates, dict):
+        return {
+            key: restore(update, getattr(memory_pools, key)) for key, update in pool_updates.items()
+        }
+    if isinstance(pool_updates, list):
+        return restore(pool_updates, memory_pools.token_to_kv_pool)
+    return pool_updates
+
+
 def _maybe_apply_recurrent_cow(forward_batch, memory_pools):
     """One-shot CoW: clone matched tree slots (src, 0 = skip) into running slots
     before any recurrent read; no-op when nothing is pending."""
@@ -328,12 +351,15 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.model_config.hf_config.use_jax_allreduce_metadata = (
             not self.server_args.disable_jax_allreduce_metadata
         )
-        # Pick MLA forward path at server start. Only `fa` selects absorbed
-        # (the MLA Pallas kernel); `fa_mha` and `native` both decompress latent
+        # Pick MLA forward path at server start. `fa` and `dsa` select absorbed
+        # MLA; `fa_mha` and `native` both decompress latent
         # KV via kv_b_proj and run standard attention. Read by
         # DeepseekV3DecoderLayer to construct DeepseekV3Attention; harmless on
         # non-MLA models that ignore the attribute.
-        self.model_config.hf_config.use_absorbed_mla = self.server_args.attention_backend == "fa"
+        self.model_config.hf_config.use_absorbed_mla = self.server_args.attention_backend in (
+            "fa",
+            "dsa",
+        )
         self.model_config.hf_config.enable_sequence_parallel = (
             self.server_args.enable_sequence_parallel
         )
@@ -479,6 +505,34 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 attention_data_partition_axis="data",
             )
 
+        elif backend == "dsa" and self.use_mla_backend:
+            from sgl_jax.srt.layers.attention.dsa_backend import DsaAttentionBackend
+
+            cfg = self.model_config.hf_text_config
+            required = (
+                "index_head_dim",
+                "index_topk",
+                "kv_lora_rank",
+                "qk_nope_head_dim",
+                "qk_rope_head_dim",
+                "v_head_dim",
+            )
+            missing = [name for name in required if getattr(cfg, name, None) is None]
+            if missing:
+                raise ValueError(f"DSA backend requires config fields: {missing}")
+            full_attn_backend = DsaAttentionBackend(
+                num_attn_heads=self.num_attn_heads,
+                kv_lora_rank=cfg.kv_lora_rank,
+                qk_nope_head_dim=cfg.qk_nope_head_dim,
+                qk_rope_head_dim=cfg.qk_rope_head_dim,
+                v_head_dim=cfg.v_head_dim,
+                index_head_dim=cfg.index_head_dim,
+                index_topk=cfg.index_topk,
+                page_size=self.page_size,
+                mesh=self.mesh,
+                attention_data_partition_axis="data",
+            )
+
         elif backend in ("fa", "fa_mha"):
             from sgl_jax.srt.layers.attention.flashattention_backend import (
                 FlashAttention,
@@ -533,9 +587,11 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
             # tp_size==1: sharding constraint is lost after JIT; re-place explicitly.
             # See https://github.com/sgl-project/sglang-jax/issues/233
-            if self.tp_size == 1 and isinstance(pool_updates, list):
-                target_sharding = self.token_to_kv_pool.kv_sharding
-                pool_updates = [jax.device_put(kv, target_sharding) for kv in pool_updates]
+            if self.tp_size == 1:
+                pool_updates = _restore_single_tp_pool_update_shardings(
+                    pool_updates,
+                    self.memory_pools,
+                )
             self.memory_pools.replace_all(pool_updates)
 
         # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch

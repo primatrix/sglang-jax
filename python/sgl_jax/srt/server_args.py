@@ -1356,6 +1356,7 @@ class ServerArgs:
                 "native",
                 "fa",
                 "fa_mha",
+                "dsa",
             ],
             default=ServerArgs.attention_backend,
             help=(
@@ -1363,7 +1364,8 @@ class ServerArgs:
                 "'fa' = FlashAttention for MHA models, MLA Pallas kernel (absorbed) for MLA models. "
                 "'fa_mha' = force the MHA FlashAttention path for MLA models too "
                 "(decompress latent KV per-forward via kv_b_proj; ~70x more KV cache than 'fa', "
-                "intended for kernel A/B on short contexts)."
+                "intended for kernel A/B on short contexts). "
+                "'dsa' = absorbed MLA with framework Indexer/Top-K and selected sparse attention."
             ),
         )
         parser.add_argument(
