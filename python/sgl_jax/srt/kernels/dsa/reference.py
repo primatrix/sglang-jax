@@ -87,6 +87,7 @@ def write_mla_kv_cache(
     updated = cache.at[page, row, lane, :latent_dim].set(
         new_c_kv.astype(cache.dtype),
         mode="drop",
+        out_sharding=jax.typeof(cache).sharding,
     )
     return updated.at[
         page,
@@ -96,6 +97,7 @@ def write_mla_kv_cache(
     ].set(
         new_k_pe.astype(cache.dtype),
         mode="drop",
+        out_sharding=jax.typeof(cache).sharding,
     )
 
 
@@ -175,7 +177,16 @@ def dsa_sparse_mla_reference(
     offset = safe_slots % page_size
     row = offset // packing
     lane = offset % packing
-    gathered = cache[page, row, lane].astype(jnp.float32)
+    gathered = (
+        cache.at[page, row, lane]
+        .get(
+            # Cache rows are selected per token, not per attention head. Keep
+            # the gathered Top-K axis replicated across the tensor mesh axis;
+            # q_latent's sharding would incorrectly place `tensor` on Top-K.
+            out_sharding=jax.typeof(physical_slots).sharding,
+        )
+        .astype(jnp.float32)
+    )
     selected_latent = gathered[..., :latent_dim]
     selected_rope = gathered[..., latent_aligned : latent_aligned + rope_dim]
 
@@ -249,6 +260,7 @@ def write_indexer_k_cache(
     return cache.at[page, row, lane, :index_head_dim].set(
         index_k.astype(cache.dtype),
         mode="drop",
+        out_sharding=jax.typeof(cache).sharding,
     )
 
 
@@ -276,7 +288,9 @@ def gather_indexer_k_cache(
     offset = safe_slots % page_size
     row = offset // packing
     lane = offset % packing
-    gathered = cache[page, row, lane, :index_head_dim]
+    gathered = cache.at[page, row, lane, :index_head_dim].get(
+        out_sharding=jax.typeof(physical_slots).sharding,
+    )
     return jnp.where(valid[..., None], gathered, jnp.zeros_like(gathered))
 
 
@@ -331,7 +345,9 @@ def logical_topk_to_physical_slots(
 
     safe_requests = jnp.clip(query_request_indices, 0, max(request_count - 1, 0))
     safe_logical = jnp.clip(logical_topk_ids, 0, max(max_request_tokens - 1, 0))
-    physical_slots = req_to_token_slots[safe_requests[:, None], safe_logical]
+    physical_slots = req_to_token_slots.at[safe_requests[:, None], safe_logical].get(
+        out_sharding=jax.typeof(logical_topk_ids).sharding,
+    )
     valid = (
         rank_valid
         & request_valid[:, None]
@@ -341,7 +357,18 @@ def logical_topk_to_physical_slots(
         & (physical_slots >= 0)
     )
 
-    compact_order = jnp.argsort(~valid, axis=1, stable=True)
+    sort_iota = jax.lax.broadcasted_iota(
+        jnp.int32,
+        valid.shape,
+        1,
+        out_sharding=jax.typeof(valid).sharding,
+    )
+    _, compact_order = jax.lax.sort_key_val(
+        ~valid,
+        sort_iota,
+        dimension=1,
+        is_stable=True,
+    )
     compact_logical = jnp.take_along_axis(logical_topk_ids, compact_order, axis=1)
     compact_physical = jnp.take_along_axis(physical_slots, compact_order, axis=1)
     compact_counts = jnp.sum(valid, axis=1, dtype=jnp.int32)

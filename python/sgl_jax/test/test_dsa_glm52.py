@@ -335,6 +335,45 @@ def test_glm_dsa_score_candidates_applies_relu_head_gates_and_both_scales():
     )
 
 
+def test_glm_dsa_score_candidates_uses_slot_sharding_for_candidate_gather(monkeypatch):
+    from sgl_jax.srt.models.glm5_moe import GlmDsaIndexer
+
+    query_sharding = object()
+    slot_sharding = object()
+    captured = {}
+
+    class FakeAt:
+        def __getitem__(self, index):
+            captured["index"] = index
+            return self
+
+        def get(self, **kwargs):
+            captured["kwargs"] = kwargs
+            return jnp.ones((1, 2, 4), dtype=jnp.float32)
+
+    class FakeCache:
+        ndim = 2
+        shape = (4, 4)
+        at = FakeAt()
+
+    candidate_slots = jnp.array([[0, 1]], dtype=jnp.int32)
+
+    def fake_typeof(array):
+        sharding = slot_sharding if array is candidate_slots else query_sharding
+        return SimpleNamespace(sharding=sharding)
+
+    monkeypatch.setattr(jax, "typeof", fake_typeof)
+    scores = GlmDsaIndexer.score_candidates(
+        q_index=jnp.ones((1, 2, 4), dtype=jnp.float32),
+        head_weights=jnp.ones((1, 2), dtype=jnp.float32),
+        k_index_cache=FakeCache(),
+        candidate_slots=candidate_slots,
+    )
+
+    assert scores.shape == (1, 2)
+    assert captured["kwargs"]["out_sharding"] is slot_sharding
+
+
 def test_glm_dsa_indexer_rejects_top1_configuration():
     from sgl_jax.srt.models.glm5_moe import GlmDsaIndexer
 
@@ -766,6 +805,133 @@ def test_write_indexer_k_cache_handles_slot_zero_page_boundaries_and_padding():
         gathered,
         np.array([[[1, 2, 3], [4, 5, 6], [7, 8, 9], [0, 0, 0]]]),
     )
+
+
+def test_write_indexer_k_cache_preserves_operand_sharding_on_scatter(monkeypatch):
+    from sgl_jax.srt.kernels.dsa.reference import write_indexer_k_cache
+
+    expected_sharding = object()
+    captured = {}
+
+    class FakeAt:
+        def __getitem__(self, index):
+            captured["index"] = index
+            return self
+
+        def set(self, values, **kwargs):
+            captured["values"] = values
+            captured["kwargs"] = kwargs
+            return "updated"
+
+    class FakeCache:
+        ndim = 4
+        shape = (2, 2, 2, 128)
+        dtype = jnp.bfloat16
+        at = FakeAt()
+
+    monkeypatch.setattr(jax, "typeof", lambda _array: SimpleNamespace(sharding=expected_sharding))
+    result = write_indexer_k_cache(
+        FakeCache(),
+        index_k=jnp.ones((1, 128), dtype=jnp.bfloat16),
+        write_slots=jnp.array([0], dtype=jnp.int32),
+        page_size=4,
+        index_head_dim=128,
+    )
+
+    assert result == "updated"
+    assert captured["kwargs"]["out_sharding"] is expected_sharding
+
+
+def test_dsa_candidate_row_gather_preserves_mapping_sharding(monkeypatch):
+    from sgl_jax.srt.layers.attention.dsa_backend import _gather_candidate_rows
+
+    expected_sharding = object()
+    captured = {}
+
+    class FakeAt:
+        def __getitem__(self, index):
+            captured["index"] = index
+            return self
+
+        def get(self, **kwargs):
+            captured["kwargs"] = kwargs
+            return "candidate-rows"
+
+    mapping = SimpleNamespace(at=FakeAt())
+    monkeypatch.setattr(jax, "typeof", lambda _array: SimpleNamespace(sharding=expected_sharding))
+    result = _gather_candidate_rows(mapping, "safe-requests")
+
+    assert result == "candidate-rows"
+    assert captured["index"] == "safe-requests"
+    assert captured["kwargs"]["out_sharding"] is expected_sharding
+
+
+def test_logical_slot_mapping_uses_logical_id_sharding_for_gather(monkeypatch):
+    from sgl_jax.srt.kernels.dsa.reference import logical_topk_to_physical_slots
+
+    expected_sharding = object()
+    captured = {}
+
+    class FakeAt:
+        def __getitem__(self, index):
+            captured["index"] = index
+            return self
+
+        def get(self, **kwargs):
+            captured["kwargs"] = kwargs
+            return jnp.array([[3, 4]], dtype=jnp.int32)
+
+    class FakeMapping:
+        ndim = 2
+        dtype = jnp.int32
+        shape = (1, 2)
+        at = FakeAt()
+
+    original_typeof = jax.typeof
+    logical_ids = jnp.array([[0, 1]], dtype=jnp.int32)
+
+    def fake_typeof(array):
+        if array is logical_ids:
+            return SimpleNamespace(sharding=expected_sharding)
+        return original_typeof(array)
+
+    monkeypatch.setattr(jax, "typeof", fake_typeof)
+    selection = logical_topk_to_physical_slots(
+        logical_topk_ids=logical_ids,
+        selected_counts=jnp.array([2], dtype=jnp.int32),
+        req_to_token_slots=FakeMapping(),
+        query_request_indices=jnp.array([0], dtype=jnp.int32),
+        query_positions=jnp.array([1], dtype=jnp.int32),
+        producer_layer=0,
+    )
+
+    assert selection.physical_slots.shape == (1, 2)
+    assert captured["kwargs"]["out_sharding"] is expected_sharding
+
+
+def test_logical_slot_compaction_builds_sort_iota_with_validity_sharding(monkeypatch):
+    from sgl_jax.srt.kernels.dsa.reference import logical_topk_to_physical_slots
+
+    original_broadcasted_iota = jax.lax.broadcasted_iota
+    captured = {}
+
+    def capture_iota(*args, **kwargs):
+        captured["kwargs"] = kwargs
+        return original_broadcasted_iota(*args, **kwargs)
+
+    monkeypatch.setattr(jax.lax, "broadcasted_iota", capture_iota)
+    logical_ids = jnp.array([[2, 0, 1]], dtype=jnp.int32)
+    selection = logical_topk_to_physical_slots(
+        logical_topk_ids=logical_ids,
+        selected_counts=jnp.array([3], dtype=jnp.int32),
+        req_to_token_slots=jnp.array([[4, -1, 8]], dtype=jnp.int32),
+        query_request_indices=jnp.array([0], dtype=jnp.int32),
+        query_positions=jnp.array([2], dtype=jnp.int32),
+        producer_layer=0,
+    )
+
+    np.testing.assert_array_equal(selection.logical_topk_ids, np.array([[2, 0, -1]]))
+    assert captured["kwargs"]["out_sharding"] == jax.typeof(logical_ids).sharding
 
 
 def test_logical_topk_to_physical_slots_compacts_causal_valid_unique_ids():

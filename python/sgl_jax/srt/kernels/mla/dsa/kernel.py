@@ -102,8 +102,8 @@ def _validate_inputs(
 
 
 def _dsa_decode_mla_kernel(
-    topk_slots_ref,
     valid_counts_ref,
+    topk_slots_ref,
     ql_nope_ref,
     q_pe_ref,
     cache_kv_ref,
@@ -112,6 +112,7 @@ def _dsa_decode_mla_kernel(
     q_pe_vmem_ref,
     cache_vector_vmem_ref,
     output_vmem_ref,
+    topk_slots_vmem_ref,
     dma_sem,
     *,
     latent_dim: int,
@@ -119,7 +120,7 @@ def _dsa_decode_mla_kernel(
     padded_latent_dim: int,
     padded_rope_dim: int,
     page_size: int,
-    max_selected: int,
+    padded_max_selected: int,
     sm_scale: float,
 ):
     """Process every selected cache vector for one batch element online."""
@@ -149,46 +150,72 @@ def _dsa_decode_mla_kernel(
     running_value = jnp.zeros((num_heads, latent_dim), dtype=jnp.float32)
     valid_count = valid_counts_ref[batch_index]
 
-    def body(selected_index, state):
-        def update(state):
-            max_logits, exp_sums, weighted_values = state
-            physical_slot = topk_slots_ref[batch_index, selected_index]
-            page_index = physical_slot // page_size
-            page_offset = physical_slot % page_size
-            packed_row = page_offset // packing
-            packing_index = page_offset % packing
-            # HBM cache rows are tiled in pairs.  DMA the production cache's
-            # complete packing group, then select the requested physical row
-            # from VMEM; a one-row HBM slice is illegal on v7x.
-            copy_to_vmem(cache_kv_ref.at[page_index, packed_row], cache_vector_vmem_ref)
-            cache_pair = cache_vector_vmem_ref[...].astype(jnp.float32)
-            packing_mask = (jnp.arange(packing, dtype=jnp.int32) == packing_index).astype(
-                jnp.float32
+    def chunk_body(chunk_index, state):
+        def process_chunk(state):
+            copy_to_vmem(
+                topk_slots_ref.at[batch_index, chunk_index],
+                topk_slots_vmem_ref,
             )
-            cache_vector = jnp.sum(cache_pair * packing_mask[:, None], axis=0)
-            scores = jnp.sum(ql_nope * cache_vector[:padded_latent_dim], axis=-1)
-            scores += jnp.sum(q_pe * cache_vector[padded_latent_dim:], axis=-1)
-            scores *= jnp.float32(sm_scale)
 
-            new_max = jnp.maximum(max_logits, scores)
-            old_scale = jnp.exp(max_logits - new_max)
-            new_scale = jnp.exp(scores - new_max)
-            new_sums = exp_sums * old_scale + new_scale
-            values = cache_vector[:latent_dim]
-            new_values = weighted_values * old_scale[:, None] + new_scale[:, None] * values
-            return new_max, new_sums, new_values
+            def slot_body(slot_in_chunk, state):
+                selected_index = chunk_index * 128 + slot_in_chunk
+
+                def update(state):
+                    max_logits, exp_sums, weighted_values = state
+                    # Dynamic scalar VMEM loads must be tile-aligned on Mosaic.
+                    # Select from one native 128-wide metadata tile with VPU ops.
+                    slot_mask = (jnp.arange(128, dtype=jnp.int32) == slot_in_chunk).astype(
+                        jnp.int32
+                    )
+                    physical_slot = jnp.sum(topk_slots_vmem_ref[...] * slot_mask)
+                    page_index = physical_slot // page_size
+                    page_offset = physical_slot % page_size
+                    packed_row = page_offset // packing
+                    packing_index = page_offset % packing
+                    # HBM cache rows are tiled in pairs.  DMA the production cache's
+                    # complete packing group, then select the requested physical row
+                    # from VMEM; a one-row HBM slice is illegal on v7x.
+                    copy_to_vmem(
+                        cache_kv_ref.at[page_index, packed_row],
+                        cache_vector_vmem_ref,
+                    )
+                    cache_pair = cache_vector_vmem_ref[...].astype(jnp.float32)
+                    packing_mask = (jnp.arange(packing, dtype=jnp.int32) == packing_index).astype(
+                        jnp.float32
+                    )
+                    cache_vector = jnp.sum(cache_pair * packing_mask[:, None], axis=0)
+                    scores = jnp.sum(ql_nope * cache_vector[:padded_latent_dim], axis=-1)
+                    scores += jnp.sum(q_pe * cache_vector[padded_latent_dim:], axis=-1)
+                    scores *= jnp.float32(sm_scale)
+
+                    new_max = jnp.maximum(max_logits, scores)
+                    old_scale = jnp.exp(max_logits - new_max)
+                    new_scale = jnp.exp(scores - new_max)
+                    new_sums = exp_sums * old_scale + new_scale
+                    values = cache_vector[:latent_dim]
+                    new_values = weighted_values * old_scale[:, None] + new_scale[:, None] * values
+                    return new_max, new_sums, new_values
+
+                return lax.cond(
+                    selected_index < valid_count,
+                    update,
+                    lambda state: state,
+                    state,
+                )
+
+            return lax.fori_loop(0, 128, slot_body, state, unroll=False)
 
         return lax.cond(
-            selected_index < valid_count,
-            update,
+            chunk_index * 128 < valid_count,
+            process_chunk,
             lambda state: state,
             state,
         )
 
     running_max, running_sum, running_value = lax.fori_loop(
         0,
-        max_selected,
-        body,
+        padded_max_selected // 128,
+        chunk_body,
         (running_max, running_sum, running_value),
         unroll=False,
     )
@@ -242,6 +269,7 @@ def dsa_decode_mla_attention_unchecked(
     padded_rope_dim = _align_to_128(rope_dim)
     page_size = cache_kv.shape[1] * cache_kv.shape[2]
     max_selected = topk_slots.shape[1]
+    padded_max_selected = _align_to_128(max_selected)
 
     # Keep every HBM<->VMEM DMA at a 128-aligned innermost width.  Padding is
     # performed outside Pallas so Mosaic sees aligned HBM memrefs; the logical
@@ -250,6 +278,14 @@ def dsa_decode_mla_attention_unchecked(
         ql_nope = jnp.pad(ql_nope, ((0, 0), (0, 0), (0, padded_latent_dim - latent_dim)))
     if rope_dim != padded_rope_dim:
         q_pe = jnp.pad(q_pe, ((0, 0), (0, 0), (0, padded_rope_dim - rope_dim)))
+    if max_selected != padded_max_selected:
+        topk_slots = jnp.pad(
+            topk_slots,
+            ((0, 0), (0, padded_max_selected - max_selected)),
+        )
+    # A 2D [chunks, 128] view gives HBM and VMEM the same native int32
+    # tiling; a long 1D VMEM allocation otherwise chooses a 1024-wide tile.
+    topk_slots = topk_slots.reshape(batch_size, padded_max_selected // 128, 128)
 
     kernel = pl.pallas_call(
         functools.partial(
@@ -259,16 +295,18 @@ def dsa_decode_mla_attention_unchecked(
             padded_latent_dim=padded_latent_dim,
             padded_rope_dim=padded_rope_dim,
             page_size=page_size,
-            max_selected=max_selected,
+            padded_max_selected=padded_max_selected,
             sm_scale=float(sm_scale),
         ),
         out_shape=jax.ShapeDtypeStruct((batch_size, num_heads, padded_latent_dim), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            # The selected physical slots and valid lengths are small metadata
-            # arrays, so keep them in SMEM and load only KV payloads from HBM.
-            num_scalar_prefetch=2,
+            # Only valid lengths stay in SMEM. A GLM prefill batch carries a
+            # [128, 2048] Top-K table, which alone fills v7x's 1 MiB SMEM.
+            # Keep it in HBM and DMA one aligned row per batch program to VMEM.
+            num_scalar_prefetch=1,
             grid=(batch_size,),
             in_specs=(
+                pl.BlockSpec(memory_space=pltpu.HBM),
                 pl.BlockSpec(memory_space=pltpu.HBM),
                 pl.BlockSpec(memory_space=pltpu.HBM),
                 pl.BlockSpec(memory_space=pltpu.HBM),
@@ -282,6 +320,7 @@ def dsa_decode_mla_attention_unchecked(
                     cache_kv.dtype,
                 ),
                 pltpu.VMEM((num_heads, padded_latent_dim), jnp.bfloat16),
+                pltpu.VMEM((128,), jnp.int32),
                 pltpu.SemaphoreType.DMA,
             ),
         ),
@@ -290,8 +329,8 @@ def dsa_decode_mla_attention_unchecked(
         name="dsa-decode-mla",
     )
     return kernel(
-        topk_slots,
         valid_counts,
+        topk_slots,
         ql_nope,
         q_pe,
         cache_kv,

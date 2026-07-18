@@ -1,0 +1,97 @@
+name: glm52-dsa-v7x32-dummy-debug-20260718-v1
+exp_type: TRAINING
+cluster_name: tpu-training-antgroup
+artifact_type: GCS
+tags:
+  - sglang-jax
+  - glm-5.2
+  - dsa
+  - dummy-e2e
+  - v7x-32
+config: '{"source_repo":"https://github.com/cjx0709/sglang-jax.git","source_ref":"develop/glm52-dsa-falcon","purpose":"GLM-5.2 DSA distributed dummy server smoke before checkpoint availability"}'
+role_to_task_spec:
+  worker:
+    replica: 4
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x4
+    supply_mode: reservation
+    envs:
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /tmp/tpu_logs/tmp
+      PIP_CACHE_DIR: /tmp/tpu_logs/pip-cache
+      UV_CACHE_DIR: /tmp/tpu_logs/uv-cache
+      JAX_COMPILATION_CACHE_DIR: /tmp/tpu_logs/jax-cache
+      JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES: "0"
+      JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "0"
+      LIBTPU_INIT_ARGS: --xla_tpu_dvfs_p_state=7
+      SGLANG_JAX_REPO: https://github.com/cjx0709/sglang-jax.git
+      SGLANG_JAX_REF: develop/glm52-dsa-falcon
+    command: |
+      bash <<'BASH'
+      set -euxo pipefail
+      ulimit -c 0
+
+      RANK="${FALCON_JAX_PROCESS_ID:-${JOB_COMPLETION_INDEX:-0}}"
+      NNODES="${FALCON_JAX_PROCESS_COUNT:-4}"
+      mkdir -p \
+        /tmp/tpu_logs/tmp \
+        /tmp/tpu_logs/pip-cache \
+        /tmp/tpu_logs/uv-cache \
+        /tmp/tpu_logs/jax-cache \
+        /tmp/glm52-dsa-v7x32
+
+      apt-get update -y
+      apt-get install -y --no-install-recommends git ca-certificates curl
+
+      rm -rf /tmp/glm52-dsa-v7x32/sglang-jax
+      git clone -q --depth 1 "${SGLANG_JAX_REPO}" /tmp/glm52-dsa-v7x32/sglang-jax
+      cd /tmp/glm52-dsa-v7x32/sglang-jax
+      git fetch -q --depth 1 origin "${SGLANG_JAX_REF}"
+      git checkout -q FETCH_HEAD
+      git rev-parse HEAD
+
+      # Do not install the [all]/[tpu] extra here: this image carries the
+      # validated JAX 0.9.0/libtpu 0.0.34 pair, while the repo extra currently
+      # pins JAX 0.8.1. Base runtime dependencies leave the TPU stack intact.
+      /opt/venv/bin/python3 -m pip install --no-cache-dir -e python
+
+      /opt/venv/bin/python3 - <<'PY'
+      import importlib.metadata as md
+      import jax
+
+      for package in ("jax", "jaxlib", "libtpu", "flax"):
+          try:
+              print(f"{package}={md.version(package)}")
+          except md.PackageNotFoundError:
+              print(f"{package}=MISSING")
+      print(f"backend={jax.default_backend()}")
+      print(f"local_device_count={jax.local_device_count()}")
+      assert md.version("jax") == "0.9.0"
+      assert md.version("jaxlib") == "0.9.0"
+      assert md.version("libtpu") == "0.0.34"
+      assert jax.default_backend() == "tpu"
+      assert jax.local_device_count() == 8
+      PY
+
+      echo "GLM52_DSA_V7X32_DEBUG_READY rank=${RANK} nnodes=${NNODES}"
+      sleep 604800
+      BASH
+    mounts:
+      - name: model-storage
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        mount_path: /models
+        read_only: true
+        mount_options:
+          - implicit-dirs
+          - metadata-cache:ttl-secs:-1
+          - metadata-cache:stat-cache-max-size-mb:512
+          - metadata-cache:type-cache-max-size-mb:64
+          - file-cache:max-size-mb:10240
+          - file-cache:cache-file-for-range-read:true
+          - file-system:kernel-list-cache-ttl-secs:-1
+          - file-cache:enable-parallel-downloads:true
+          - file-cache:parallel-downloads-per-file:32
+          - read_ahead_kb=1024

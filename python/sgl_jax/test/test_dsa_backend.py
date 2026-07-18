@@ -221,6 +221,20 @@ def test_dsa_attention_dispatches_updated_cache_to_pallas_kernel(monkeypatch):
 
     calls = {}
 
+    mesh = jax.sharding.Mesh(
+        np.asarray(jax.devices()).reshape(1, 1),
+        ("data", "tensor"),
+    )
+
+    def fake_shard_map(fn, *, mesh, in_specs, out_specs, check_vma):
+        calls["shard_map"] = {
+            "mesh": mesh,
+            "in_specs": in_specs,
+            "out_specs": out_specs,
+            "check_vma": check_vma,
+        }
+        return fn
+
     def fake_kernel(q, q_rope, cache, slots, counts, *, sm_scale, interpret):
         calls.update(
             cache=cache,
@@ -232,6 +246,7 @@ def test_dsa_attention_dispatches_updated_cache_to_pallas_kernel(monkeypatch):
         return jnp.full_like(q, 7)
 
     monkeypatch.setattr(dsa_backend, "dsa_decode_mla_attention_unchecked", fake_kernel)
+    monkeypatch.setattr(jax, "shard_map", fake_shard_map)
     backend = DsaAttentionBackend(
         num_attn_heads=1,
         kv_lora_rank=3,
@@ -241,7 +256,7 @@ def test_dsa_attention_dispatches_updated_cache_to_pallas_kernel(monkeypatch):
         index_head_dim=2,
         index_topk=2,
         page_size=4,
-        mesh=None,
+        mesh=mesh,
         use_pallas_kernel=True,
     )
     cache = jnp.zeros((2, 2, 2, 256), dtype=jnp.bfloat16)
@@ -278,6 +293,18 @@ def test_dsa_attention_dispatches_updated_cache_to_pallas_kernel(monkeypatch):
     )
     assert calls["sm_scale"] == 0.5
     assert calls["interpret"] is False
+    assert calls["shard_map"] == {
+        "mesh": mesh,
+        "in_specs": (
+            jax.sharding.PartitionSpec("data", "tensor", None),
+            jax.sharding.PartitionSpec("data", "tensor", None),
+            jax.sharding.PartitionSpec("data", None, None, None),
+            jax.sharding.PartitionSpec("data", None),
+            jax.sharding.PartitionSpec("data"),
+        ),
+        "out_specs": jax.sharding.PartitionSpec("data", "tensor", None),
+        "check_vma": False,
+    }
 
 
 def test_dsa_cli_pool_cost_and_compact_full_layer_pool():

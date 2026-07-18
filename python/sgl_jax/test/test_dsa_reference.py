@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -72,6 +74,95 @@ def test_write_mla_kv_cache_uses_token_slots_across_page_boundary_and_drops_padd
     np.testing.assert_array_equal(cached_latent[1], np.zeros(LATENT_DIM))
     np.testing.assert_array_equal(cached_rope[1], np.zeros(ROPE_DIM))
     assert cache.dtype == jnp.bfloat16
+
+
+def test_write_mla_kv_cache_preserves_operand_sharding_on_both_scatters(monkeypatch):
+    from sgl_jax.srt.kernels.dsa.reference import write_mla_kv_cache
+
+    expected_sharding = object()
+    captured = []
+
+    class FakeAt:
+        def __init__(self, cache):
+            self.cache = cache
+
+        def __getitem__(self, index):
+            captured.append({"index": index})
+            return self
+
+        def set(self, values, **kwargs):
+            captured[-1]["values"] = values
+            captured[-1]["kwargs"] = kwargs
+            return self.cache
+
+    class FakeCache:
+        ndim = 4
+        shape = (2, 2, 2, CACHE_WIDTH)
+        dtype = jnp.bfloat16
+
+        def __init__(self):
+            self.at = FakeAt(self)
+
+    monkeypatch.setattr(jax, "typeof", lambda _array: SimpleNamespace(sharding=expected_sharding))
+    result = write_mla_kv_cache(
+        FakeCache(),
+        new_c_kv=jnp.ones((1, LATENT_DIM), dtype=jnp.bfloat16),
+        new_k_pe=jnp.ones((1, ROPE_DIM), dtype=jnp.bfloat16),
+        write_slots=jnp.array([0], dtype=jnp.int32),
+        page_size=PAGE_SIZE,
+        latent_dim=LATENT_DIM,
+        rope_dim=ROPE_DIM,
+    )
+
+    assert isinstance(result, FakeCache)
+    assert len(captured) == 2
+    assert all(entry["kwargs"]["out_sharding"] is expected_sharding for entry in captured)
+
+
+def test_sparse_mla_reference_uses_slot_sharding_for_cache_gather(monkeypatch):
+    from sgl_jax.srt.kernels.dsa.reference import dsa_sparse_mla_reference
+
+    expected_sharding = object()
+    captured = {}
+
+    class FakeAt:
+        def __getitem__(self, index):
+            captured["index"] = index
+            return self
+
+        def get(self, **kwargs):
+            captured["kwargs"] = kwargs
+            return jnp.ones((1, 2, CACHE_WIDTH), dtype=jnp.bfloat16)
+
+    class FakeCache:
+        ndim = 4
+        shape = (1, 2, 2, CACHE_WIDTH)
+        dtype = jnp.bfloat16
+        at = FakeAt()
+
+    physical_slots = jnp.array([[0, 1]], dtype=jnp.int32)
+    original_typeof = jax.typeof
+
+    def fake_typeof(array):
+        if array is physical_slots:
+            return SimpleNamespace(sharding=expected_sharding)
+        return original_typeof(array)
+
+    monkeypatch.setattr(jax, "typeof", fake_typeof)
+    output = dsa_sparse_mla_reference(
+        q_latent=jnp.ones((1, 1, LATENT_DIM), dtype=jnp.bfloat16),
+        q_rope=jnp.ones((1, 1, ROPE_DIM), dtype=jnp.bfloat16),
+        cache=FakeCache(),
+        physical_slots=physical_slots,
+        selected_counts=jnp.array([2], dtype=jnp.int32),
+        sm_scale=1.0,
+        page_size=PAGE_SIZE,
+        latent_dim=LATENT_DIM,
+        rope_dim=ROPE_DIM,
+    )
+
+    assert output.shape == (1, 1, LATENT_DIM)
+    assert captured["kwargs"]["out_sharding"] is expected_sharding
 
 
 def test_sparse_mla_reference_matches_dense_all_visible_and_is_slot_order_invariant():

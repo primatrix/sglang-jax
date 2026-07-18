@@ -170,7 +170,12 @@ class GlmDsaIndexer(nnx.Module):
             raise TypeError(f"candidate_slots must have dtype int32; got {candidate_slots.dtype}")
 
         safe_slots = jnp.clip(candidate_slots, 0, k_index_cache.shape[0] - 1)
-        candidate_keys = k_index_cache[safe_slots]
+        candidate_keys = k_index_cache.at[safe_slots].get(
+            # Candidate rows follow token/data sharding. Index heads are
+            # currently replicated, but tying this gather to q_index would
+            # place a future tensor axis on the candidate dimension.
+            out_sharding=jax.typeof(candidate_slots).sharding,
+        )
         logits = jnp.einsum(
             "thd,tcd->tch",
             q_index.astype(jnp.float32),

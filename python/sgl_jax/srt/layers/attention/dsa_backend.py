@@ -54,6 +54,13 @@ class DsaAttentionMetadata:
         return cls(*children)
 
 
+def _gather_candidate_rows(req_to_token_slots, safe_requests):
+    """Gather request rows while keeping the mapping's data sharding explicit."""
+    return req_to_token_slots.at[safe_requests].get(
+        out_sharding=jax.typeof(req_to_token_slots).sharding,
+    )
+
+
 @dataclass
 class DsaAttentionBackend(AttentionBackend):
     """Correctness-first DSA backend: write caches, then run sparse MLA reference."""
@@ -254,7 +261,10 @@ class DsaAttentionBackend(AttentionBackend):
             0,
             max(request_count - 1, 0),
         )
-        candidate_slots = metadata.req_to_token_slots[safe_requests]
+        candidate_slots = _gather_candidate_rows(
+            metadata.req_to_token_slots,
+            safe_requests,
+        )
         candidate_logical_ids = jnp.broadcast_to(
             jnp.arange(candidate_width, dtype=jnp.int32)[None, :],
             candidate_slots.shape,
@@ -339,15 +349,47 @@ class DsaAttentionBackend(AttentionBackend):
             else layer.scaling
         )
         if self.use_pallas_kernel:
-            output = dsa_decode_mla_attention_unchecked(
-                q,
-                q_rope,
-                updated_cache,
-                dsa_state.selection.physical_slots,
-                dsa_state.selection.selected_counts,
-                sm_scale=sm_scale,
-                interpret=False,
-            )
+
+            def _run_pallas(q_, q_rope_, cache_, slots_, counts_):
+                return dsa_decode_mla_attention_unchecked(
+                    q_,
+                    q_rope_,
+                    cache_,
+                    slots_,
+                    counts_,
+                    sm_scale=sm_scale,
+                    interpret=False,
+                )
+
+            if self.mesh is None:
+                output = _run_pallas(
+                    q,
+                    q_rope,
+                    updated_cache,
+                    dsa_state.selection.physical_slots,
+                    dsa_state.selection.selected_counts,
+                )
+            else:
+                dpa = self.attention_data_partition_axis
+                output = jax.shard_map(
+                    _run_pallas,
+                    mesh=self.mesh,
+                    in_specs=(
+                        P(dpa, "tensor", None),
+                        P(dpa, "tensor", None),
+                        P(dpa, None, None, None),
+                        P(dpa, None),
+                        P(dpa),
+                    ),
+                    out_specs=P(dpa, "tensor", None),
+                    check_vma=False,
+                )(
+                    q,
+                    q_rope,
+                    updated_cache,
+                    dsa_state.selection.physical_slots,
+                    dsa_state.selection.selected_counts,
+                )
         else:
             output = dsa_sparse_mla_reference(
                 q,

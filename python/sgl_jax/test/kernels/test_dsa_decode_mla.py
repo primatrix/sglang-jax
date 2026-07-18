@@ -382,6 +382,56 @@ class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
         self.assertTrue(np.isfinite(expected).all())
         np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=1e-2)
 
+    def test_interpret_chunk_boundaries_and_non_aligned_topk_widths(self):
+        """Partial second chunks and padded final chunks must ignore tail slots."""
+        rng = np.random.default_rng(31)
+        page_size = 128
+        capacity = 512
+        ql_nope_base = rng.standard_normal((7, 2, 128), dtype=np.float32)
+        q_pe_base = rng.standard_normal((7, 2, 64), dtype=np.float32)
+        cache_kv = rng.standard_normal((4, page_size // 2, 2, 256), dtype=np.float32)
+        # Every uncounted tail points here. If a chunk guard is wrong, this
+        # high-value row dominates the output instead of remaining invisible.
+        cache_kv.reshape(capacity, 256)[-1] = 10_000.0
+
+        cases = (
+            (129, np.array([0, 1, 127, 128, 129], dtype=np.int32)),
+            (2050, np.array([0, 1, 127, 128, 129, 255, 256], dtype=np.int32)),
+        )
+        for max_selected, valid_counts in cases:
+            with self.subTest(max_selected=max_selected):
+                batch_size = valid_counts.size
+                topk_slots = np.full((batch_size, max_selected), capacity - 1, dtype=np.int32)
+                valid_prefix = (np.arange(256, dtype=np.int32) * 17) % (capacity - 1)
+                for row, count in zip(topk_slots, valid_counts, strict=True):
+                    row[:count] = valid_prefix[:count]
+
+                ql_nope = ql_nope_base[:batch_size]
+                q_pe = q_pe_base[:batch_size]
+                actual = dsa_decode_mla_attention(
+                    jnp.asarray(ql_nope, dtype=jnp.bfloat16),
+                    jnp.asarray(q_pe, dtype=jnp.bfloat16),
+                    jnp.asarray(cache_kv, dtype=jnp.bfloat16),
+                    jnp.asarray(topk_slots),
+                    jnp.asarray(valid_counts),
+                    sm_scale=0.01,
+                    interpret=True,
+                )
+                # NumPy's macOS BLAS can emit spurious FP warnings for these
+                # finite FP32 matmuls; the oracle result is checked below.
+                with np.errstate(all="ignore"):
+                    expected = reference_dsa_decode_mla_attention(
+                        ql_nope,
+                        q_pe,
+                        cache_kv,
+                        topk_slots,
+                        valid_counts,
+                        sm_scale=0.01,
+                    )
+
+                self.assertTrue(np.isfinite(expected).all())
+                np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=1e-2)
+
     def test_unchecked_launch_is_jittable_in_interpret_mode(self):
         from sgl_jax.srt.kernels.mla.dsa import dsa_decode_mla_attention_unchecked
 
