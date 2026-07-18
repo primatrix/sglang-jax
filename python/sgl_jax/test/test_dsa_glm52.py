@@ -825,3 +825,43 @@ def test_logical_topk_to_physical_slots_is_jittable():
 
     np.testing.assert_array_equal(selection.physical_slots, np.array([[4, 0]], dtype=np.int32))
     np.testing.assert_array_equal(selection.selected_counts, np.array([2], dtype=np.int32))
+
+
+def test_non_hybrid_memory_pools_register_indexer_k_pool_and_require_both_updates():
+    from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
+        _build_non_hybrid_memory_pools,
+    )
+
+    class FakePool:
+        def __init__(self):
+            self.replaced = None
+
+        def replace_buffer(self, value):
+            self.replaced = value
+
+    token_pool = FakePool()
+    indexer_pool = FakePool()
+    dense_pool = FakePool()
+    dense_pools = _build_non_hybrid_memory_pools(dense_pool)
+    with pytest.raises(AttributeError, match="indexer_k_pool"):
+        _ = dense_pools.indexer_k_pool
+    dense_pools.replace_all(["dense-mla"])
+    assert dense_pool.replaced == ["dense-mla"]
+
+    pools = _build_non_hybrid_memory_pools(
+        token_pool,
+        indexer_k_pool=indexer_pool,
+    )
+
+    assert pools.token_to_kv_pool is token_pool
+    assert pools.indexer_k_pool is indexer_pool
+    pools.replace_all(
+        {
+            "token_to_kv_pool": ["mla"],
+            "indexer_k_pool": ["index"],
+        }
+    )
+    assert token_pool.replaced == ["mla"]
+    assert indexer_pool.replaced == ["index"]
+    with pytest.raises(ValueError, match="must exactly match"):
+        pools.replace_all({"token_to_kv_pool": ["mla-only"]})

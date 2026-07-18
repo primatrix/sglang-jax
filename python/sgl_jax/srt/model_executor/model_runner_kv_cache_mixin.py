@@ -278,9 +278,16 @@ def _build_hybrid_pools(
     return rsp, hybrid_pool, mp
 
 
-def _build_non_hybrid_memory_pools(token_to_kv_pool) -> MemoryPools:
-    """Wrap a single KV pool in MemoryPools."""
-    return MemoryPools(token_to_kv_pool=token_to_kv_pool)
+def _build_non_hybrid_memory_pools(
+    token_to_kv_pool,
+    *,
+    indexer_k_pool=None,
+) -> MemoryPools:
+    """Wrap the main KV pool and an optional DSA Index-K pool."""
+    pools = {"token_to_kv_pool": token_to_kv_pool}
+    if indexer_k_pool is not None:
+        pools["indexer_k_pool"] = indexer_k_pool
+    return MemoryPools(**pools)
 
 
 # ---------------------------------------------------------------------------
