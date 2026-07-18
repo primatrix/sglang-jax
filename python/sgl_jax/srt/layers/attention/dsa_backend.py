@@ -18,6 +18,7 @@ from sgl_jax.srt.kernels.dsa.reference import (
     write_indexer_k_cache,
     write_mla_kv_cache,
 )
+from sgl_jax.srt.kernels.mla.dsa.kernel import dsa_decode_mla_attention_unchecked
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.attention.dsa_types import DsaTopKState
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
@@ -69,6 +70,7 @@ class DsaAttentionBackend(AttentionBackend):
         page_size: int,
         mesh: jax.sharding.Mesh | None,
         attention_data_partition_axis: str = "data",
+        use_pallas_kernel: bool | None = None,
     ):
         if page_size <= 0:
             raise ValueError("DSA page_size must be positive")
@@ -84,6 +86,9 @@ class DsaAttentionBackend(AttentionBackend):
         self.page_size = page_size
         self.mesh = mesh
         self.attention_data_partition_axis = attention_data_partition_axis
+        self.use_pallas_kernel = (
+            jax.default_backend() == "tpu" if use_pallas_kernel is None else use_pallas_kernel
+        )
         self.forward_metadata = nnx.data(DsaAttentionMetadata())
 
     def _device_metadata(self, metadata: DsaAttentionMetadata) -> DsaAttentionMetadata:
@@ -202,6 +207,7 @@ class DsaAttentionBackend(AttentionBackend):
             "page_size": self.page_size,
             "mesh": self.mesh,
             "attention_data_partition_axis": self.attention_data_partition_axis,
+            "use_pallas_kernel": self.use_pallas_kernel,
         }
         return children, aux_data
 
@@ -332,18 +338,29 @@ class DsaAttentionBackend(AttentionBackend):
             if layer is None or layer.scaling is None
             else layer.scaling
         )
-        output = dsa_sparse_mla_reference(
-            q,
-            q_rope,
-            updated_cache,
-            dsa_state.selection.physical_slots,
-            dsa_state.selection.selected_counts,
-            sm_scale=sm_scale,
-            page_size=self.page_size,
-            latent_dim=self.kv_lora_rank,
-            rope_dim=self.qk_rope_head_dim,
-        )
-        return output.astype(q.dtype), updated_cache
+        if self.use_pallas_kernel:
+            output = dsa_decode_mla_attention_unchecked(
+                q,
+                q_rope,
+                updated_cache,
+                dsa_state.selection.physical_slots,
+                dsa_state.selection.selected_counts,
+                sm_scale=sm_scale,
+                interpret=False,
+            )
+        else:
+            output = dsa_sparse_mla_reference(
+                q,
+                q_rope,
+                updated_cache,
+                dsa_state.selection.physical_slots,
+                dsa_state.selection.selected_counts,
+                sm_scale=sm_scale,
+                page_size=self.page_size,
+                latent_dim=self.kv_lora_rank,
+                rope_dim=self.qk_rope_head_dim,
+            )
+        return output.astype(jnp.bfloat16), updated_cache
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:

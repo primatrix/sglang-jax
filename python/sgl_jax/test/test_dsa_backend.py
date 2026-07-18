@@ -214,6 +214,72 @@ def test_dsa_attention_writes_main_mla_cache_before_sparse_read():
     np.testing.assert_array_equal(flattened[0, 128:130], [0.25, -0.5])
 
 
+def test_dsa_attention_dispatches_updated_cache_to_pallas_kernel(monkeypatch):
+    from sgl_jax.srt.layers.attention import dsa_backend
+    from sgl_jax.srt.layers.attention.dsa_backend import DsaAttentionBackend
+    from sgl_jax.srt.layers.attention.dsa_types import DsaSelection, DsaTopKState
+
+    calls = {}
+
+    def fake_kernel(q, q_rope, cache, slots, counts, *, sm_scale, interpret):
+        calls.update(
+            cache=cache,
+            slots=slots,
+            counts=counts,
+            sm_scale=sm_scale,
+            interpret=interpret,
+        )
+        return jnp.full_like(q, 7)
+
+    monkeypatch.setattr(dsa_backend, "dsa_decode_mla_attention_unchecked", fake_kernel)
+    backend = DsaAttentionBackend(
+        num_attn_heads=1,
+        kv_lora_rank=3,
+        qk_nope_head_dim=3,
+        qk_rope_head_dim=2,
+        v_head_dim=3,
+        index_head_dim=2,
+        index_topk=2,
+        page_size=4,
+        mesh=None,
+        use_pallas_kernel=True,
+    )
+    cache = jnp.zeros((2, 2, 2, 256), dtype=jnp.bfloat16)
+    pool = SimpleNamespace(get_fused_kv_buffer=lambda layer_id: cache)
+    state = DsaTopKState(
+        selection=DsaSelection(
+            logical_topk_ids=jnp.array([[0]], dtype=jnp.int32),
+            physical_slots=jnp.array([[0]], dtype=jnp.int32),
+            selected_counts=jnp.array([1], dtype=jnp.int32),
+            producer_layer=0,
+        ),
+        query_offsets=jnp.array([0, 1], dtype=jnp.int32),
+        request_offsets=jnp.array([0, 1], dtype=jnp.int32),
+    )
+    q = jnp.ones((1, 1, 3), dtype=jnp.bfloat16)
+    new_c = jnp.array([[[2.0, 3.0, 4.0]]], dtype=jnp.bfloat16)
+
+    output, _ = backend(
+        q,
+        new_c,
+        new_c,
+        layer=SimpleNamespace(layer_id=0, scaling=0.5),
+        forward_batch=SimpleNamespace(out_cache_loc=jnp.array([0], dtype=jnp.int32)),
+        token_to_kv_pool=pool,
+        q_rope=jnp.ones((1, 1, 2), dtype=jnp.bfloat16),
+        k_rope=jnp.array([[[5.0, 6.0]]], dtype=jnp.bfloat16),
+        dsa_state=state,
+    )
+
+    np.testing.assert_array_equal(output, jnp.full_like(q, 7))
+    np.testing.assert_array_equal(
+        np.asarray(calls["cache"], dtype=np.float32).reshape(-1, 256)[0, :3],
+        [2.0, 3.0, 4.0],
+    )
+    assert calls["sm_scale"] == 0.5
+    assert calls["interpret"] is False
+
+
 def test_dsa_cli_pool_cost_and_compact_full_layer_pool():
     from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
         ModelRunnerKVCacheMixin,

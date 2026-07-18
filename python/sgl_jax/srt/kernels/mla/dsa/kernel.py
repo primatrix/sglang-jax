@@ -85,8 +85,8 @@ def _validate_inputs(
         )
 
     max_selected = topk_slots.shape[1]
-    if np.any(valid_counts <= 0) or np.any(valid_counts > max_selected):
-        raise ValueError("valid_counts entries must be in [1, max_selected]")
+    if np.any(valid_counts < 0) or np.any(valid_counts > max_selected):
+        raise ValueError("valid_counts entries must be in [0, max_selected]")
 
     capacity = int(np.prod(cache_kv.shape[:3]))
     if np.any(topk_slots < -1):
@@ -198,8 +198,10 @@ def _dsa_decode_mla_kernel(
         unroll=False,
     )
 
-    output_vmem_ref[:, :latent_dim] = (running_value / running_sum[:, None]).astype(
-        output_vmem_ref.dtype
+    output_vmem_ref[:, :latent_dim] = lax.cond(
+        valid_count > 0,
+        lambda: (running_value / running_sum[:, None]).astype(output_vmem_ref.dtype),
+        lambda: jnp.zeros((num_heads, latent_dim), dtype=output_vmem_ref.dtype),
     )
     copy_to_vmem(output_vmem_ref.at[:, :latent_dim], output_ref.at[batch_index])
 
@@ -251,7 +253,7 @@ def dsa_decode_mla_attention_unchecked(
             max_selected=max_selected,
             sm_scale=float(sm_scale),
         ),
-        out_shape=jax.ShapeDtypeStruct(ql_nope.shape, ql_nope.dtype),
+        out_shape=jax.ShapeDtypeStruct(ql_nope.shape, jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             # The selected physical slots and valid lengths are small metadata
             # arrays, so keep them in SMEM and load only KV payloads from HBM.
@@ -267,7 +269,7 @@ def dsa_decode_mla_attention_unchecked(
                 pltpu.VMEM((num_heads, padded_latent_dim), ql_nope.dtype),
                 pltpu.VMEM((num_heads, padded_rope_dim), q_pe.dtype),
                 pltpu.VMEM((padded_latent_dim + padded_rope_dim,), cache_kv.dtype),
-                pltpu.VMEM((num_heads, padded_latent_dim), ql_nope.dtype),
+                pltpu.VMEM((num_heads, padded_latent_dim), jnp.bfloat16),
                 pltpu.SemaphoreType.DMA,
             ),
         ),

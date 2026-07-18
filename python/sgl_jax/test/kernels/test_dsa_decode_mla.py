@@ -21,9 +21,7 @@ class TestDSADecodeMLAReference(unittest.TestCase):
         self.cache_kv = rng.standard_normal((3, 4, 2, 256), dtype=np.float32)
         self.ql_nope = rng.standard_normal((2, 2, 128), dtype=np.float32)
         self.q_pe = rng.standard_normal((2, 2, 128), dtype=np.float32)
-        self.selected_slots = np.array(
-            [[0, 7, 8, 19, -1], [23, 1, 8, -1, -1]], dtype=np.int32
-        )
+        self.selected_slots = np.array([[0, 7, 8, 19, -1], [23, 1, 8, -1, -1]], dtype=np.int32)
         self.valid_counts = np.array([4, 3], dtype=np.int32)
 
     def _inputs(self):
@@ -118,10 +116,20 @@ class TestDSADecodeMLAReference(unittest.TestCase):
         valid_counts[0] = selected_slots.shape[1] + 1
         self._assert_validation_error((ql_nope, q_pe, cache_kv, selected_slots, valid_counts))
 
-    def test_zero_count_raises(self):
+    def test_zero_count_returns_zero(self):
         ql_nope, q_pe, cache_kv, selected_slots, valid_counts = self._inputs()
         valid_counts[0] = 0
-        self._assert_validation_error((ql_nope, q_pe, cache_kv, selected_slots, valid_counts))
+        for function in (reference_dsa_decode_mla_attention, dense_selected_mla_attention):
+            with self.subTest(function=function.__name__):
+                output = function(
+                    ql_nope,
+                    q_pe,
+                    cache_kv,
+                    selected_slots,
+                    valid_counts,
+                    sm_scale=1.0,
+                )
+                np.testing.assert_array_equal(output[0], np.zeros_like(output[0]))
 
     def test_negative_valid_slot_raises(self):
         ql_nope, q_pe, cache_kv, selected_slots, valid_counts = self._inputs()
@@ -148,9 +156,7 @@ class TestDSADecodeMLAReference(unittest.TestCase):
     def test_duplicate_and_nonmonotonic_valid_slots_work(self):
         """Valid selected slots preserve caller order and permit duplicates."""
         ql_nope, q_pe, cache_kv, _selected_slots, _valid_counts = self._inputs()
-        selected_slots = np.array(
-            [[19, 0, 19, 7, -1], [8, 1, 8, -1, -1]], dtype=np.int32
-        )
+        selected_slots = np.array([[19, 0, 19, 7, -1], [8, 1, 8, -1, -1]], dtype=np.int32)
         valid_counts = np.array([4, 3], dtype=np.int32)
 
         reference = reference_dsa_decode_mla_attention(
@@ -223,6 +229,68 @@ class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
         self.assertEqual(actual.dtype, jnp.bfloat16)
         np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=1e-2)
 
+    def test_interpret_fp32_query_still_returns_bfloat16(self):
+        ql_nope, q_pe, cache_kv, topk_slots, valid_counts = self._inputs()
+
+        actual = dsa_decode_mla_attention(
+            jnp.asarray(ql_nope, dtype=jnp.float32),
+            jnp.asarray(q_pe, dtype=jnp.float32),
+            jnp.asarray(cache_kv, dtype=jnp.bfloat16),
+            jnp.asarray(topk_slots),
+            jnp.asarray(valid_counts),
+            sm_scale=0.25,
+            interpret=True,
+        )
+
+        self.assertEqual(actual.dtype, jnp.bfloat16)
+
+    def test_interpret_zero_count_returns_zero(self):
+        ql_nope, q_pe, cache_kv, topk_slots, valid_counts = self._inputs()
+        valid_counts[:] = 0
+
+        actual = dsa_decode_mla_attention(
+            jnp.asarray(ql_nope, dtype=jnp.bfloat16),
+            jnp.asarray(q_pe, dtype=jnp.bfloat16),
+            jnp.asarray(cache_kv, dtype=jnp.bfloat16),
+            jnp.asarray(topk_slots),
+            jnp.asarray(valid_counts),
+            sm_scale=0.25,
+            interpret=True,
+        )
+
+        np.testing.assert_array_equal(np.asarray(actual), np.zeros_like(ql_nope))
+
+    def test_interpret_prefill_rows_share_slot_abi_with_ragged_counts(self):
+        rng = np.random.default_rng(23)
+        ql_nope = rng.standard_normal((4, 2, 128), dtype=np.float32)
+        q_pe = rng.standard_normal((4, 2, 64), dtype=np.float32)
+        cache_kv = rng.standard_normal((2, 8, 2, 256), dtype=np.float32)
+        selected_slots = np.array(
+            [[0, 0, 0], [0, 1, 0], [16, 0, 0], [16, 17, 18]],
+            dtype=np.int32,
+        )
+        valid_counts = np.array([1, 2, 1, 3], dtype=np.int32)
+
+        actual = dsa_decode_mla_attention(
+            jnp.asarray(ql_nope, dtype=jnp.bfloat16),
+            jnp.asarray(q_pe, dtype=jnp.bfloat16),
+            jnp.asarray(cache_kv, dtype=jnp.bfloat16),
+            jnp.asarray(selected_slots),
+            jnp.asarray(valid_counts),
+            sm_scale=0.25,
+            interpret=True,
+        )
+        expected = reference_dsa_decode_mla_attention(
+            ql_nope,
+            q_pe,
+            cache_kv,
+            selected_slots,
+            valid_counts,
+            sm_scale=0.25,
+        )
+
+        np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=1e-2)
+
     def test_interpret_handles_page_sizes_duplicates_and_padding(self):
         rng = np.random.default_rng(1)
         ql_nope = rng.standard_normal((2, 2, 128), dtype=np.float32)
@@ -230,9 +298,7 @@ class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
 
         for page_size in (8, 16, 32, 64):
             with self.subTest(page_size=page_size):
-                cache_kv = rng.standard_normal(
-                    (2, page_size // 2, 2, 256), dtype=np.float32
-                )
+                cache_kv = rng.standard_normal((2, page_size // 2, 2, 256), dtype=np.float32)
                 # A padded -1 would select this large value if it were read.
                 cache_kv[-1, -1, -1] = 10_000.0
                 topk_slots = np.array(
@@ -290,9 +356,7 @@ class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
         ql_nope = jnp.asarray(
             rng.standard_normal((1, 1, 128), dtype=np.float32), dtype=jnp.bfloat16
         )
-        q_pe = jnp.asarray(
-            rng.standard_normal((1, 1, 128), dtype=np.float32), dtype=jnp.bfloat16
-        )
+        q_pe = jnp.asarray(rng.standard_normal((1, 1, 128), dtype=np.float32), dtype=jnp.bfloat16)
         cache_kv = jnp.asarray(
             rng.standard_normal((1, 1024, 2, 256), dtype=np.float32), dtype=jnp.bfloat16
         )
@@ -431,9 +495,7 @@ class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
             rng.standard_normal((batch_size, num_heads, rope_dim), dtype=np.float32),
             dtype=jnp.bfloat16,
         )
-        topk_slots = jnp.asarray(
-            ((np.arange(top_k, dtype=np.int32) * 17) % top_k)[None, :]
-        )
+        topk_slots = jnp.asarray(((np.arange(top_k, dtype=np.int32) * 17) % top_k)[None, :])
         valid_counts = jnp.asarray([top_k], dtype=jnp.int32)
 
         actual = dsa_decode_mla_attention(

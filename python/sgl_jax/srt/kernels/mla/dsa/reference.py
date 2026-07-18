@@ -82,8 +82,8 @@ def _validate_inputs(
         )
 
     max_selected = selected_slots.shape[1]
-    if np.any(valid_counts <= 0) or np.any(valid_counts > max_selected):
-        raise ValueError("valid_counts entries must be in [1, max_selected]")
+    if np.any(valid_counts < 0) or np.any(valid_counts > max_selected):
+        raise ValueError("valid_counts entries must be in [0, max_selected]")
 
     capacity = int(np.prod(cache_kv.shape[:3]))
     if np.any(selected_slots < -1):
@@ -143,10 +143,12 @@ def reference_dsa_decode_mla_attention(
     packed_rows = cache_kv.shape[1]
     packing = cache_kv.shape[2]
     page_size = packed_rows * packing
-    output = np.empty((batch_size, num_heads, lkv_dim), dtype=np.float32)
+    output = np.zeros((batch_size, num_heads, lkv_dim), dtype=np.float32)
 
     for batch_index in range(batch_size):
         valid_count = int(valid_counts[batch_index])
+        if valid_count == 0:
+            continue
         gathered = np.empty((valid_count, cache_kv.shape[-1]), dtype=np.float32)
         for gathered_index, physical_slot in enumerate(selected_slots[batch_index, :valid_count]):
             page, offset = divmod(int(physical_slot), page_size)
@@ -198,10 +200,12 @@ def dense_selected_mla_attention(
 
     batch_size, num_heads, _ = padded_nope.shape
     dense_cache = cache_kv.reshape(-1, cache_kv.shape[-1])
-    output = np.empty((batch_size, num_heads, latent_width), dtype=np.float32)
+    output = np.zeros((batch_size, num_heads, latent_width), dtype=np.float32)
 
     for batch_index in range(batch_size):
         valid_count = int(valid_counts[batch_index])
+        if valid_count == 0:
+            continue
         gathered = dense_cache[selected_slots[batch_index, :valid_count]]
         query = np.concatenate((padded_nope[batch_index], padded_rope[batch_index]), axis=-1)
         logits = query @ gathered.T
