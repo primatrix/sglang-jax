@@ -197,7 +197,7 @@ def test_real_runner_has_checkpoint_backend_request_and_teardown_gates():
         "--load-format safetensors",
         "--attention-backend \"$ATTENTION_BACKEND\"",
         "all_followers_acked",
-        "for request_name in short chunked ragged",
+        "request_names.txt",
         '"return_logprob": True',
         '"top_logprobs_num": 20',
         "GLM52_DSA_REAL_E2E_OK",
@@ -213,3 +213,36 @@ def test_real_runner_has_checkpoint_backend_request_and_teardown_gates():
     assert "expected_topk_width=20" in runner
     assert 'SGLANG_JAX_SKIP_GCSFUSE_WARMUP="${SGLANG_JAX_SKIP_GCSFUSE_WARMUP:-1}"' in runner
     assert "GLM52_DSA_SOURCE_REV" in runner
+
+
+def test_real_runner_supports_smoke_and_boundary_request_profiles():
+    runner = RUNNER_PATH.read_text(encoding="utf-8")
+
+    assert 'REQUEST_PROFILE="${GLM52_DSA_REQUEST_PROFILE:-smoke}"' in runner
+    assert 'MAX_NEW_TOKENS="${GLM52_DSA_MAX_NEW_TOKENS:-2}"' in runner
+    assert 'if [[ "$REQUEST_PROFILE" != "smoke" && "$REQUEST_PROFILE" != "boundary" ]]' in runner
+    for length in (2047, 2048, 2049, 3072):
+        assert f'"boundary_{length}"' in runner
+    assert '"ignore_eos": True' in runner
+    assert 'config["vocab_size"]' in runner
+    assert "0 <= token_id < vocab_size" in runner
+
+
+def test_real_runner_derives_expected_counts_from_generated_requests():
+    runner = RUNNER_PATH.read_text(encoding="utf-8")
+
+    assert 'request_names = (out / "request_names.txt").read_text' in runner
+    assert 'request = json.loads((out / f"{name}.request.json").read_text())' in runner
+    assert 'expected_counts = input_token_counts(request["input_ids"])' in runner
+    assert 'expected_completion_tokens = request["sampling_params"]["max_new_tokens"]' in runner
+    assert 'expected_prompt_tokens = {"short": [4]' not in runner
+
+
+def test_real_runner_exports_rank_local_debug_dump_directory_when_enabled():
+    runner = RUNNER_PATH.read_text(encoding="utf-8")
+    dump_gate = 'if [[ "${SGLANG_JAX_DEBUG_DUMP:-0}" == "1" ]]; then'
+    dump_export = 'export SGLANG_JAX_DEBUG_DUMP_DIR="$OUT/debug_dumps"'
+
+    assert dump_gate in runner
+    assert dump_export in runner
+    assert runner.index(dump_export) < runner.index("setsid")

@@ -13,6 +13,8 @@ RUN_ID="${GLM52_DSA_RUN_ID:-}"
 MODEL_PATH="${GLM52_MODEL_PATH:-/models/GLM-5.2}"
 COMPLETE_MARKER="${MODEL_PATH}/_DOWNLOAD_COMPLETE"
 ATTENTION_BACKEND="${GLM52_ATTENTION_BACKEND:-dsa}"
+REQUEST_PROFILE="${GLM52_DSA_REQUEST_PROFILE:-smoke}"
+MAX_NEW_TOKENS="${GLM52_DSA_MAX_NEW_TOKENS:-2}"
 START_TIMEOUT_SECONDS="${GLM52_DSA_START_TIMEOUT_SECONDS:-300}"
 HEALTH_TIMEOUT_SECONDS="${GLM52_DSA_HEALTH_TIMEOUT_SECONDS:-10800}"
 GENERATE_TIMEOUT_SECONDS="${GLM52_DSA_GENERATE_TIMEOUT_SECONDS:-1200}"
@@ -38,6 +40,14 @@ if [[ "$ATTENTION_BACKEND" != "dsa" && "$ATTENTION_BACKEND" != "fa" ]]; then
   echo "GLM52_ATTENTION_BACKEND must be dsa or fa, got: ${ATTENTION_BACKEND}" >&2
   exit 2
 fi
+if [[ "$REQUEST_PROFILE" != "smoke" && "$REQUEST_PROFILE" != "boundary" ]]; then
+  echo "GLM52_DSA_REQUEST_PROFILE must be smoke or boundary, got: ${REQUEST_PROFILE}" >&2
+  exit 2
+fi
+if [[ ! "$MAX_NEW_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "GLM52_DSA_MAX_NEW_TOKENS must be a positive integer, got: ${MAX_NEW_TOKENS}" >&2
+  exit 2
+fi
 if [[ ! -f "$COMPLETE_MARKER" ]]; then
   echo "checkpoint completion marker is missing: ${COMPLETE_MARKER}" >&2
   exit 2
@@ -56,6 +66,10 @@ SERVER_PID=""
 SERVER_PGID=""
 
 mkdir -p "$OUT" "$CONTROL_PARENT"
+if [[ "${SGLANG_JAX_DEBUG_DUMP:-0}" == "1" ]]; then
+  export SGLANG_JAX_DEBUG_DUMP_DIR="$OUT/debug_dumps"
+  mkdir -p "$SGLANG_JAX_DEBUG_DUMP_DIR"
+fi
 if [[ "$RANK" == "0" ]]; then
   if ! mkdir "$CONTROL_DIR"; then
     echo "run id already exists; choose a new GLM52_DSA_RUN_ID: ${RUN_ID}" >&2
@@ -136,6 +150,10 @@ export PYTHONPATH="$ROOT/python${PYTHONPATH:+:$PYTHONPATH}"
   echo "load_format=safetensors"
   echo "parallelism=tp32_dp1_ep32"
   echo "attention_backend=$ATTENTION_BACKEND"
+  echo "request_profile=$REQUEST_PROFILE"
+  echo "max_new_tokens=$MAX_NEW_TOKENS"
+  echo "debug_dump=${SGLANG_JAX_DEBUG_DUMP:-0}"
+  echo "debug_dump_dir=${SGLANG_JAX_DEBUG_DUMP_DIR:-disabled}"
   echo "skip_gcsfuse_warmup=$SGLANG_JAX_SKIP_GCSFUSE_WARMUP"
   echo "created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } | tee "$OUT/run_context.txt"
@@ -274,43 +292,84 @@ while true; do
   sleep 10
 done
 
-"$PYBIN" - "$OUT" <<'PY'
+"$PYBIN" - "$OUT" "$REQUEST_PROFILE" "$MAX_NEW_TOKENS" "$MODEL_PATH" <<'PY'
 import json
 import pathlib
 import sys
 
 out = pathlib.Path(sys.argv[1])
-requests = {
-    "short": {
-        "input_ids": [1, 2, 3, 4],
-        "sampling_params": {"temperature": 0.0, "max_new_tokens": 2, "ignore_eos": True},
+profile = sys.argv[2]
+max_new_tokens = int(sys.argv[3])
+model_dir = pathlib.Path(sys.argv[4])
+config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+vocab_size = int(config["vocab_size"])
+if vocab_size <= 0:
+    raise SystemExit(f"invalid vocab_size: {vocab_size}")
+
+
+def sampling_params():
+    return {
+        "temperature": 0.0,
+        "max_new_tokens": max_new_tokens,
+        "ignore_eos": True,
+    }
+
+
+def request(input_ids):
+    return {
+        "input_ids": input_ids,
+        "sampling_params": sampling_params(),
         "return_logprob": True,
         "top_logprobs_num": 20,
         "return_text_in_logprobs": False,
-    },
-    "chunked": {
-        "input_ids": [100 + (index % 1000) for index in range(257)],
-        "sampling_params": {"temperature": 0.0, "max_new_tokens": 2, "ignore_eos": True},
-        "return_logprob": True,
-        "top_logprobs_num": 20,
-        "return_text_in_logprobs": False,
-    },
-    "ragged": {
-        "input_ids": [
-            [200 + index for index in range(9)],
-            [500 + (index % 1000) for index in range(133)],
-        ],
-        "sampling_params": {"temperature": 0.0, "max_new_tokens": 2, "ignore_eos": True},
-        "return_logprob": True,
-        "top_logprobs_num": 20,
-        "return_text_in_logprobs": False,
-    },
-}
+    }
+
+
+def boundary_input_ids(length, offset):
+    return [(offset + index) % vocab_size for index in range(length)]
+
+
+if profile == "smoke":
+    requests = {
+        "short": request([1, 2, 3, 4]),
+        "chunked": request([100 + (index % 1000) for index in range(257)]),
+        "ragged": request(
+            [
+                [200 + index for index in range(9)],
+                [500 + (index % 1000) for index in range(133)],
+            ]
+        ),
+    }
+else:
+    requests = {
+        "boundary_2047": request(boundary_input_ids(2047, 100)),
+        "boundary_2048": request(boundary_input_ids(2048, 200)),
+        "boundary_2049": request(boundary_input_ids(2049, 300)),
+        "boundary_3072": request(boundary_input_ids(3072, 400)),
+    }
+
+
+def flattened_input_ids(input_ids):
+    if input_ids and isinstance(input_ids[0], list):
+        return [token_id for row in input_ids for token_id in row]
+    return input_ids
+
+
 for name, payload in requests.items():
+    token_ids = flattened_input_ids(payload["input_ids"])
+    if not token_ids or not all(
+        isinstance(token_id, int) and 0 <= token_id < vocab_size
+        for token_id in token_ids
+    ):
+        raise SystemExit(f"{name}: input token IDs must be within [0, {vocab_size})")
     (out / f"{name}.request.json").write_text(json.dumps(payload), encoding="utf-8")
+(out / "request_names.txt").write_text(
+    "".join(f"{name}\n" for name in requests), encoding="utf-8"
+)
 PY
 
-for request_name in short chunked ragged; do
+while IFS= read -r request_name; do
+  [[ -n "$request_name" ]] || continue
   curl -sS --fail-with-body \
     --connect-timeout 5 \
     --max-time "$GENERATE_TIMEOUT_SECONDS" \
@@ -318,9 +377,10 @@ for request_name in short chunked ragged; do
     -H 'Content-Type: application/json' \
     --data-binary "@${OUT}/${request_name}.request.json" \
     | tee "$OUT/${request_name}.json"
-done
+done < "$OUT/request_names.txt"
 
-for request_name in short chunked ragged; do
+while IFS= read -r request_name; do
+  [[ -n "$request_name" ]] || continue
   "$PYBIN" "$ROOT/scripts/kernels/compare_glm52_e2e_results.py" \
     --candidate "$OUT/${request_name}.json" \
     --baseline "$OUT/${request_name}.json" \
@@ -328,7 +388,7 @@ for request_name in short chunked ragged; do
     --min-topk-overlap 1 \
     --expected-topk-width 20 \
     --output "$OUT/${request_name}.schema.json"
-done
+done < "$OUT/request_names.txt"
 
 "$PYBIN" - "$OUT" "$ATTENTION_BACKEND" <<'PY' | tee "$OUT/generate_check.txt"
 import json
@@ -338,11 +398,21 @@ import sys
 
 out = pathlib.Path(sys.argv[1])
 backend = sys.argv[2]
-expected_prompt_tokens = {"short": [4], "chunked": [257], "ragged": [9, 133]}
-expected_completion_tokens = 2
 expected_topk_width=20
 summary = {}
-for name, expected_counts in expected_prompt_tokens.items():
+
+
+def input_token_counts(input_ids):
+    if input_ids and isinstance(input_ids[0], list):
+        return [len(row) for row in input_ids]
+    return [len(input_ids)]
+
+
+request_names = (out / "request_names.txt").read_text(encoding="utf-8").splitlines()
+for name in request_names:
+    request = json.loads((out / f"{name}.request.json").read_text())
+    expected_counts = input_token_counts(request["input_ids"])
+    expected_completion_tokens = request["sampling_params"]["max_new_tokens"]
     payload = json.loads((out / f"{name}.json").read_text())
     responses = payload if isinstance(payload, list) else [payload]
     if len(responses) != len(expected_counts):
