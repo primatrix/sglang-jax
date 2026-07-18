@@ -282,6 +282,60 @@ def test_torch_cpu_selection_validates_tensor_abi():
         torch_glm_dsa_select(**{**args, "index_topk": 1})
 
 
+@pytest.mark.parametrize(
+    "input_name", ("q_index", "head_weights", "k_index_cache")
+)
+def test_torch_cpu_selection_rejects_non_floating_score_inputs(input_name):
+    from sgl_jax.srt.kernels.dsa.torch_reference import torch_glm_dsa_select
+
+    args = dict(
+        q_index=torch.ones((1, 2, 4), dtype=torch.bfloat16),
+        head_weights=torch.ones((1, 2), dtype=torch.bfloat16),
+        k_index_cache=torch.ones((2, 4), dtype=torch.bfloat16),
+        candidate_slots=torch.tensor([[0, 1]], dtype=torch.int32),
+        candidate_logical_ids=torch.tensor([[3, 4]], dtype=torch.int32),
+        candidate_counts=torch.tensor([2], dtype=torch.int32),
+        index_topk=2,
+    )
+    args[input_name] = args[input_name].to(torch.int32)
+
+    with pytest.raises(TypeError, match=rf"{input_name} must have floating dtype"):
+        torch_glm_dsa_select(**args)
+
+
+def test_torch_cpu_selection_handles_empty_candidate_width():
+    from sgl_jax.srt.kernels.dsa.torch_reference import torch_glm_dsa_select
+
+    token_count = 2
+    index_topk = 4
+    result = torch_glm_dsa_select(
+        q_index=torch.ones((token_count, 2, 4), dtype=torch.bfloat16),
+        head_weights=torch.ones((token_count, 2), dtype=torch.bfloat16),
+        k_index_cache=torch.ones((1, 4), dtype=torch.bfloat16),
+        candidate_slots=torch.empty((token_count, 0), dtype=torch.int32),
+        candidate_logical_ids=torch.empty(
+            (token_count, 0), dtype=torch.int32
+        ),
+        candidate_counts=torch.zeros((token_count,), dtype=torch.int32),
+        index_topk=index_topk,
+    )
+
+    assert result.scores.shape == (token_count, index_topk)
+    assert torch.isneginf(result.scores).all()
+    torch.testing.assert_close(
+        result.logical_topk_ids,
+        torch.full((token_count, index_topk), -1, dtype=torch.int32),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        result.selected_counts,
+        torch.zeros((token_count,), dtype=torch.int32),
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_torch_logical_mapping_matches_jax_with_selection_output_and_compaction():
     from sgl_jax.srt.kernels.dsa.reference import (
         logical_topk_to_physical_slots,

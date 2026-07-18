@@ -48,6 +48,16 @@ def torch_glm_dsa_select(
     ):
         _require_cpu(name, value)
 
+    for name, value in (
+        ("q_index", q_index),
+        ("head_weights", head_weights),
+        ("k_index_cache", k_index_cache),
+    ):
+        if not torch.is_floating_point(value):
+            raise TypeError(
+                f"{name} must have floating dtype; got {value.dtype}"
+            )
+
     if q_index.ndim != 3:
         raise ValueError(f"q_index must have rank 3; got {q_index.ndim}")
     token_count, num_heads, head_dim = q_index.shape
