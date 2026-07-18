@@ -1,5 +1,6 @@
 """Tests for the host-side DSA decode MLA reference implementation."""
 
+import json
 import unittest
 
 import jax
@@ -576,6 +577,85 @@ class TestDSADecodeMLAPallas(TestDSADecodeMLAReference):
 
         self.assertTrue(np.isfinite(np.asarray(actual)).all())
         np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=1e-2)
+
+    def test_tpu_non_interpret_glm_length_matrix_matches_torch_cpu(self):
+        """Compare target-shape Pallas directly with the independent Torch golden."""
+        if jax.default_backend() != "tpu":
+            self.skipTest("interpret=False Pallas lowering requires a TPU")
+
+        import torch
+
+        from sgl_jax.srt.kernels.dsa.torch_reference import torch_dsa_sparse_mla
+
+        candidate_lengths = (127, 128, 129, 2047, 2048, 2049, 3072, 4096)
+        top_k = 2048
+        page_size = 128
+        capacity = 4096
+        local_heads = 2  # GLM's 64 global heads sharded over TP=32.
+        latent_dim = 512
+        rope_dim = 64
+        cache_width = latent_dim + 128
+        rng = np.random.default_rng(0xD5A52)
+
+        cache_np = rng.standard_normal(
+            (capacity // page_size, page_size // 2, 2, cache_width),
+            dtype=np.float32,
+        )
+        q_latent_np = rng.standard_normal(
+            (len(candidate_lengths), local_heads, latent_dim), dtype=np.float32
+        )
+        q_rope_np = rng.standard_normal(
+            (len(candidate_lengths), local_heads, rope_dim), dtype=np.float32
+        )
+        physical_slots = np.full(
+            (len(candidate_lengths), top_k), capacity - 1, dtype=np.int32
+        )
+        selected_counts = np.minimum(candidate_lengths, top_k).astype(np.int32)
+        for row, (candidate_length, selected_count) in enumerate(
+            zip(candidate_lengths, selected_counts, strict=True)
+        ):
+            physical_slots[row, :selected_count] = rng.permutation(candidate_length)[
+                :selected_count
+            ]
+
+        torch_output = torch_dsa_sparse_mla(
+            torch.from_numpy(q_latent_np).to(torch.bfloat16),
+            torch.from_numpy(q_rope_np).to(torch.bfloat16),
+            torch.from_numpy(cache_np).to(torch.bfloat16),
+            torch.from_numpy(physical_slots),
+            torch.from_numpy(selected_counts),
+            sm_scale=256**-0.5,
+            page_size=page_size,
+            latent_dim=latent_dim,
+            rope_dim=rope_dim,
+        ).numpy()
+        actual = dsa_decode_mla_attention(
+            jnp.asarray(q_latent_np, dtype=jnp.bfloat16),
+            jnp.asarray(q_rope_np, dtype=jnp.bfloat16),
+            jnp.asarray(cache_np, dtype=jnp.bfloat16),
+            jnp.asarray(physical_slots),
+            jnp.asarray(selected_counts),
+            sm_scale=256**-0.5,
+            interpret=False,
+        )
+        actual_np = np.asarray(actual, dtype=np.float32)
+        difference = np.abs(actual_np - torch_output)
+        metrics = []
+        for row, candidate_length in enumerate(candidate_lengths):
+            row_difference = difference[row]
+            metrics.append(
+                {
+                    "candidate_length": candidate_length,
+                    "selected_count": int(selected_counts[row]),
+                    "max_abs": float(row_difference.max()),
+                    "mean_abs": float(row_difference.mean()),
+                    "p99_abs": float(np.percentile(row_difference, 99)),
+                }
+            )
+        print("GLM52_DSA_TORCH_PALLAS_METRICS=" + json.dumps(metrics, sort_keys=True))
+
+        self.assertTrue(np.isfinite(actual_np).all())
+        np.testing.assert_allclose(actual_np, torch_output, rtol=2e-2, atol=1e-2)
 
     def test_non_interpret_requires_tpu_on_cpu(self):
         if jax.default_backend() == "tpu":
