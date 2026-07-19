@@ -61,7 +61,7 @@ class _StageBasedTrigger:
 
         # Maybe stop
         if ((s := self.running_state) is not None) and (
-            (s.curr_count > self.stage_configs[s.curr_stage].target_count)
+            (s.curr_count >= self.stage_configs[s.curr_stage].target_count)
             or (stage != s.curr_stage)
         ):
             del self.stage_configs[s.curr_stage]

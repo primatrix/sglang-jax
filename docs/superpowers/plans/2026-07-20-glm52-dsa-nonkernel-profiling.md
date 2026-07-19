@@ -65,13 +65,16 @@ Run the same pytest command and require PASS.
 **Files:**
 
 - Modify: `scripts/kernels/run_glm52_dsa_v7x32_real_e2e.sh`
+- Modify: `python/sgl_jax/srt/managers/scheduler_profiler_mixing.py`
 - Modify: `python/sgl_jax/test/test_glm52_e2e_compare.py`
+- Create: `python/sgl_jax/test/test_scheduler_profiler_mixin.py`
 
 ### Step 1: Write failing runner contract tests
 
 Require a new `GLM52_DSA_REQUEST_PROFILE=profile` that generates two identical 3072-token
 requests named `profile_warmup` and `profile_measured`. Require at least
-`profile_steps + 2` decode tokens so the stage trigger has a later decode step on which to
+`profile_steps + 3` output tokens so the request still has enough decode forwards after the
+first token is sampled by prefill, and the stage trigger has a later decode step on which to
 stop and flush. Assert the runner:
 
 - uses `/tmp/tpu_logs` for active trace writes;
@@ -84,7 +87,8 @@ Run:
 
 ```bash
 ../../.venv/bin/python -m pytest -q \
-  python/sgl_jax/test/test_glm52_e2e_compare.py -k 'profile_request or profile_runner'
+  python/sgl_jax/test/test_glm52_e2e_compare.py \
+  -k 'profile_client or profile_runner or executes_request_generator_profiles'
 ```
 
 Expected: FAIL because the runner does not support the profile contract.
@@ -103,6 +107,7 @@ Run:
 
 ```bash
 ../../.venv/bin/python -m pytest -q python/sgl_jax/test/test_glm52_e2e_compare.py
+../../.venv/bin/python -m pytest -q python/sgl_jax/test/test_scheduler_profiler_mixin.py
 bash -n scripts/kernels/run_glm52_dsa_v7x32_real_e2e.sh
 python -m py_compile scripts/kernels/profile_glm52_dsa_server.py
 ```
@@ -115,7 +120,9 @@ Expected: all commands exit 0.
 git add \
   scripts/kernels/profile_glm52_dsa_server.py \
   scripts/kernels/run_glm52_dsa_v7x32_real_e2e.sh \
-  python/sgl_jax/test/test_glm52_e2e_compare.py
+  python/sgl_jax/srt/managers/scheduler_profiler_mixing.py \
+  python/sgl_jax/test/test_glm52_e2e_compare.py \
+  python/sgl_jax/test/test_scheduler_profiler_mixin.py
 git commit -m "feat(profile): capture GLM-5.2 prefill and decode traces"
 ```
 

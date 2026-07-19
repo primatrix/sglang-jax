@@ -17,6 +17,11 @@ MOE_BACKEND="${GLM52_MOE_BACKEND:-fused}"
 REQUEST_PROFILE="${GLM52_DSA_REQUEST_PROFILE:-smoke}"
 MAX_NEW_TOKENS="${GLM52_DSA_MAX_NEW_TOKENS:-2}"
 DISABLE_PRECOMPILE="${GLM52_DSA_DISABLE_PRECOMPILE:-0}"
+PROFILE_STEPS="${GLM52_DSA_PROFILE_STEPS:-4}"
+PROFILE_HOST_TRACER_LEVEL="${GLM52_DSA_PROFILE_HOST_TRACER_LEVEL:-2}"
+PROFILE_PYTHON_TRACER_LEVEL="${GLM52_DSA_PROFILE_PYTHON_TRACER_LEVEL:-1}"
+PROFILE_TIMEOUT_SECONDS="${GLM52_DSA_PROFILE_TIMEOUT_SECONDS:-1800}"
+PROFILE_TMP="/tmp/tpu_logs/glm52-profile-${RUN_ID}"
 START_TIMEOUT_SECONDS="${GLM52_DSA_START_TIMEOUT_SECONDS:-300}"
 HEALTH_TIMEOUT_SECONDS="${GLM52_DSA_HEALTH_TIMEOUT_SECONDS:-10800}"
 GENERATE_TIMEOUT_SECONDS="${GLM52_DSA_GENERATE_TIMEOUT_SECONDS:-1200}"
@@ -105,6 +110,17 @@ stop_server() {
   SERVER_PGID=""
 }
 
+copy_profile_output() {
+  if [[ "$REQUEST_PROFILE" != "profile" || ! -d "$PROFILE_TMP" || ! -d "$OUT" ]]; then
+    return
+  fi
+  mkdir -p "$OUT/profile"
+  if ! cp -a "$PROFILE_TMP"/. "$OUT/profile/"; then
+    echo "failed to copy rank ${RANK} profile output into artifact" >&2
+    return 1
+  fi
+}
+
 has_failures() {
   compgen -G "${CONTROL_DIR}/FAIL-rank-*" >/dev/null
 }
@@ -125,14 +141,20 @@ all_ranks_ready() {
 
 finish_server() {
   local status=$?
+  local copy_status=0
   trap - EXIT
   if (( status != 0 )); then
     touch "$FAIL_RANK" "$STOP" 2>/dev/null || true
   fi
   stop_server
   stop_server_log_monitor
+  copy_profile_output || copy_status=$?
   if [[ -f "$SERVER_LOG" && -d "$OUT" ]]; then
     cp -f "$SERVER_LOG" "$OUT/server-rank${RANK}.log" || true
+  fi
+  if (( status == 0 && copy_status != 0 )); then
+    status=$copy_status
+    touch "$FAIL_RANK" "$STOP" 2>/dev/null || true
   fi
   exit "$status"
 }
@@ -146,8 +168,8 @@ if [[ "$MOE_BACKEND" != "fused" && "$MOE_BACKEND" != "epmoe" ]]; then
   echo "GLM52_MOE_BACKEND must be fused or epmoe, got: ${MOE_BACKEND}" >&2
   exit 2
 fi
-if [[ "$REQUEST_PROFILE" != "smoke" && "$REQUEST_PROFILE" != "boundary" && "$REQUEST_PROFILE" != "boundary_single" && "$REQUEST_PROFILE" != "precompile_repeat" ]]; then
-  echo "GLM52_DSA_REQUEST_PROFILE must be smoke, boundary, boundary_single, or precompile_repeat; got: ${REQUEST_PROFILE}" >&2
+if [[ "$REQUEST_PROFILE" != "smoke" && "$REQUEST_PROFILE" != "boundary" && "$REQUEST_PROFILE" != "boundary_single" && "$REQUEST_PROFILE" != "precompile_repeat" && "$REQUEST_PROFILE" != "profile" ]]; then
+  echo "GLM52_DSA_REQUEST_PROFILE must be smoke, boundary, boundary_single, precompile_repeat, or profile; got: ${REQUEST_PROFILE}" >&2
   exit 2
 fi
 if [[ ! "$MAX_NEW_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
@@ -158,12 +180,36 @@ if [[ "$DISABLE_PRECOMPILE" != "0" && "$DISABLE_PRECOMPILE" != "1" ]]; then
   echo "GLM52_DSA_DISABLE_PRECOMPILE must be 0 or 1, got: ${DISABLE_PRECOMPILE}" >&2
   exit 2
 fi
+if [[ ! "$PROFILE_STEPS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "GLM52_DSA_PROFILE_STEPS must be a positive integer, got: ${PROFILE_STEPS}" >&2
+  exit 2
+fi
+if [[ ! "$PROFILE_HOST_TRACER_LEVEL" =~ ^[0-3]$ ]]; then
+  echo "GLM52_DSA_PROFILE_HOST_TRACER_LEVEL must be 0, 1, 2, or 3; got: ${PROFILE_HOST_TRACER_LEVEL}" >&2
+  exit 2
+fi
+if [[ ! "$PROFILE_PYTHON_TRACER_LEVEL" =~ ^[0-1]$ ]]; then
+  echo "GLM52_DSA_PROFILE_PYTHON_TRACER_LEVEL must be 0 or 1; got: ${PROFILE_PYTHON_TRACER_LEVEL}" >&2
+  exit 2
+fi
+if [[ ! "$PROFILE_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "GLM52_DSA_PROFILE_TIMEOUT_SECONDS must be a positive integer, got: ${PROFILE_TIMEOUT_SECONDS}" >&2
+  exit 2
+fi
+if [[ "$REQUEST_PROFILE" == "profile" ]] && (( MAX_NEW_TOKENS < PROFILE_STEPS + 3 )); then
+  echo "profile mode requires GLM52_DSA_MAX_NEW_TOKENS >= profile steps + 3" >&2
+  exit 2
+fi
 if [[ ! -f "$COMPLETE_MARKER" ]]; then
   echo "checkpoint completion marker is missing: ${COMPLETE_MARKER}" >&2
   exit 2
 fi
 
 mkdir -p "$OUT"
+if [[ "$REQUEST_PROFILE" == "profile" ]]; then
+  rm -rf "$PROFILE_TMP"
+  mkdir -p "$PROFILE_TMP"
+fi
 if [[ "${SGLANG_JAX_DEBUG_DUMP:-0}" == "1" ]]; then
   export SGLANG_JAX_DEBUG_DUMP_DIR="$OUT/debug_dumps"
   mkdir -p "$SGLANG_JAX_DEBUG_DUMP_DIR"
@@ -217,6 +263,11 @@ export PYTHONPATH="$ROOT/python${PYTHONPATH:+:$PYTHONPATH}"
   echo "max_new_tokens=$MAX_NEW_TOKENS"
   echo "max_running_requests=64"
   echo "disable_precompile=$DISABLE_PRECOMPILE"
+  echo "profile_steps=$PROFILE_STEPS"
+  echo "profile_host_tracer_level=$PROFILE_HOST_TRACER_LEVEL"
+  echo "profile_python_tracer_level=$PROFILE_PYTHON_TRACER_LEVEL"
+  echo "profile_timeout_seconds=$PROFILE_TIMEOUT_SECONDS"
+  echo "profile_tmp=$PROFILE_TMP"
   echo "dsa_context_paddings=512,1024,2048,4096"
   echo "debug_dump=${SGLANG_JAX_DEBUG_DUMP:-0}"
   echo "debug_dump_dir=${SGLANG_JAX_DEBUG_DUMP_DIR:-disabled}"
@@ -441,6 +492,11 @@ elif profile == "precompile_repeat":
         "precompile_first": request(vocab_input_ids(3072, 400)),
         "precompile_repeat": request(vocab_input_ids(3072, 400)),
     }
+elif profile == "profile":
+    requests = {
+        "profile_warmup": request(vocab_input_ids(3072, 400)),
+        "profile_measured": request(vocab_input_ids(3072, 400)),
+    }
 else:
     requests = {
         "boundary_3072": request(vocab_input_ids(3072, 400)),
@@ -466,16 +522,29 @@ for name, payload in requests.items():
 )
 PY
 
-while IFS= read -r request_name; do
-  [[ -n "$request_name" ]] || continue
-  curl -sS --fail-with-body \
-    --connect-timeout 5 \
-    --max-time "$GENERATE_TIMEOUT_SECONDS" \
-    -X POST "http://127.0.0.1:${PORT}/generate" \
-    -H 'Content-Type: application/json' \
-    --data-binary "@${OUT}/${request_name}.request.json" \
-    | tee "$OUT/${request_name}.json"
-done < "$OUT/request_names.txt"
+if [[ "$REQUEST_PROFILE" == "profile" ]]; then
+  "$PYBIN" "$ROOT/scripts/kernels/profile_glm52_dsa_server.py" \
+    --base-url "http://127.0.0.1:${PORT}" \
+    --output-dir "$OUT" \
+    --profile-output-dir "$PROFILE_TMP" \
+    --warmup-request "$OUT/profile_warmup.request.json" \
+    --measured-request "$OUT/profile_measured.request.json" \
+    --num-steps "$PROFILE_STEPS" \
+    --host-tracer-level "$PROFILE_HOST_TRACER_LEVEL" \
+    --python-tracer-level "$PROFILE_PYTHON_TRACER_LEVEL" \
+    --timeout-seconds "$PROFILE_TIMEOUT_SECONDS"
+else
+  while IFS= read -r request_name; do
+    [[ -n "$request_name" ]] || continue
+    curl -sS --fail-with-body \
+      --connect-timeout 5 \
+      --max-time "$GENERATE_TIMEOUT_SECONDS" \
+      -X POST "http://127.0.0.1:${PORT}/generate" \
+      -H 'Content-Type: application/json' \
+      --data-binary "@${OUT}/${request_name}.request.json" \
+      | tee "$OUT/${request_name}.json"
+  done < "$OUT/request_names.txt"
+fi
 
 while IFS= read -r request_name; do
   [[ -n "$request_name" ]] || continue

@@ -12,6 +12,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[3]
 COMPARE_PATH = ROOT / "scripts/kernels/compare_glm52_e2e_results.py"
 RUNNER_PATH = ROOT / "scripts/kernels/run_glm52_dsa_v7x32_real_e2e.sh"
+PROFILE_CLIENT_PATH = ROOT / "scripts/kernels/profile_glm52_dsa_server.py"
 REQUEST_GENERATOR_MARKER = (
     '"$PYBIN" - "$OUT" "$REQUEST_PROFILE" "$MAX_NEW_TOKENS" "$MODEL_PATH" '
     "<<'PY'\n"
@@ -21,6 +22,15 @@ REQUEST_GENERATOR_MARKER = (
 def _load_compare_module():
     assert COMPARE_PATH.is_file(), f"missing comparator: {COMPARE_PATH}"
     spec = importlib.util.spec_from_file_location("glm52_e2e_compare", COMPARE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_profile_client_module():
+    assert PROFILE_CLIENT_PATH.is_file(), f"missing profile client: {PROFILE_CLIENT_PATH}"
+    spec = importlib.util.spec_from_file_location("glm52_profile_client", PROFILE_CLIENT_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -279,7 +289,8 @@ def test_real_runner_supports_smoke_and_boundary_request_profiles():
     assert (
         'if [[ "$REQUEST_PROFILE" != "smoke" && "$REQUEST_PROFILE" != "boundary" '
         '&& "$REQUEST_PROFILE" != "boundary_single" '
-        '&& "$REQUEST_PROFILE" != "precompile_repeat" ]]' in runner
+        '&& "$REQUEST_PROFILE" != "precompile_repeat" '
+        '&& "$REQUEST_PROFILE" != "profile" ]]' in runner
     )
     for length in (2047, 2048, 2049, 3072):
         assert f'"boundary_{length}"' in runner
@@ -316,6 +327,11 @@ def test_real_runner_supports_smoke_and_boundary_request_profiles():
             1,
             {"precompile_first": [3072], "precompile_repeat": [3072]},
         ),
+        (
+            "profile",
+            8,
+            {"profile_warmup": [3072], "profile_measured": [3072]},
+        ),
     ],
 )
 def test_real_runner_executes_request_generator_profiles(
@@ -343,6 +359,217 @@ def test_real_runner_executes_request_generator_profiles(
     if profile == "precompile_repeat":
         assert requests["precompile_first"] == requests["precompile_repeat"]
         assert payload["top_logprobs_num"] == 20
+    if profile == "profile":
+        assert requests["profile_warmup"] == requests["profile_measured"]
+        assert payload["top_logprobs_num"] == 20
+
+
+class _FakeProfileTransport:
+    def __init__(self, statuses):
+        self.statuses = list(statuses)
+        self.calls = []
+        self.generation_count = 0
+
+    def post(self, path, payload, timeout_seconds):
+        self.calls.append(("POST", path, payload, timeout_seconds))
+        if path == "/generate":
+            self.generation_count += 1
+            return {"output_ids": [100 + self.generation_count]}
+        return "ok"
+
+    def get(self, path, timeout_seconds):
+        self.calls.append(("GET", path, None, timeout_seconds))
+        return {"status": self.statuses.pop(0)}
+
+
+class _IncrementingClock:
+    def __init__(self):
+        self.value = 0.0
+
+    def __call__(self):
+        self.value += 1.0
+        return self.value
+
+
+class _FailingProfileTransport(_FakeProfileTransport):
+    def __init__(self, *, fail_path):
+        super().__init__(["in_progress"])
+        self.fail_path = fail_path
+
+    def post(self, path, payload, timeout_seconds):
+        if path == self.fail_path and path == "/generate" and self.generation_count == 1:
+            self.calls.append(("POST", path, payload, timeout_seconds))
+            raise TimeoutError("measured request timed out")
+        return super().post(path, payload, timeout_seconds)
+
+    def get(self, path, timeout_seconds):
+        if path == self.fail_path:
+            self.calls.append(("GET", path, None, timeout_seconds))
+            raise RuntimeError("status query failed")
+        return super().get(path, timeout_seconds)
+
+
+class _FailingGenerateAndCleanupTransport(_FailingProfileTransport):
+    def __init__(self):
+        super().__init__(fail_path="/generate")
+
+    def post(self, path, payload, timeout_seconds):
+        if path == "/stop_profile":
+            self.calls.append(("POST", path, payload, timeout_seconds))
+            raise RuntimeError("cleanup stop failed")
+        return super().post(path, payload, timeout_seconds)
+
+
+def test_profile_client_warms_up_profiles_and_waits_for_idle(tmp_path):
+    profile_client = _load_profile_client_module()
+    transport = _FakeProfileTransport(["in_progress", "idle"])
+
+    timeline = profile_client.run_profile_session(
+        output_dir=tmp_path,
+        profile_output_dir="/tmp/tpu_logs/glm52-profile-test",
+        warmup_request={"input_ids": [1, 2, 3]},
+        measured_request={"input_ids": [1, 2, 3]},
+        num_steps=4,
+        host_tracer_level=2,
+        python_tracer_level=1,
+        timeout_seconds=30,
+        poll_interval_seconds=0,
+        transport=transport,
+        monotonic=_IncrementingClock(),
+        sleep=lambda _seconds: None,
+    )
+
+    assert [(method, path) for method, path, *_rest in transport.calls] == [
+        ("POST", "/generate"),
+        ("POST", "/start_profile"),
+        ("POST", "/generate"),
+        ("GET", "/profile_status"),
+        ("GET", "/profile_status"),
+    ]
+    start_payload = transport.calls[1][2]
+    assert start_payload == {
+        "output_dir": "/tmp/tpu_logs/glm52-profile-test",
+        "num_steps": 4,
+        "host_tracer_level": 2,
+        "python_tracer_level": 1,
+        "profile_by_stage": True,
+        "profile_stages": ["prefill", "decode"],
+    }
+    assert json.loads((tmp_path / "profile_warmup.json").read_text()) == {
+        "output_ids": [101]
+    }
+    assert json.loads((tmp_path / "profile_measured.json").read_text()) == {
+        "output_ids": [102]
+    }
+    persisted_timeline = json.loads((tmp_path / "profile_timeline.json").read_text())
+    assert persisted_timeline == timeline
+    assert timeline["final_profile_status"] == "idle"
+    assert timeline["settings"]["profile_stages"] == ["prefill", "decode"]
+    assert timeline["warmup"]["duration_seconds"] > 0
+    assert timeline["measured"]["duration_seconds"] > 0
+
+
+def test_profile_client_stops_profile_when_wait_times_out(tmp_path):
+    profile_client = _load_profile_client_module()
+    transport = _FakeProfileTransport(["in_progress"] * 8)
+
+    with pytest.raises(TimeoutError, match="profile did not become idle"):
+        profile_client.run_profile_session(
+            output_dir=tmp_path,
+            profile_output_dir="/tmp/tpu_logs/glm52-profile-timeout",
+            warmup_request={"input_ids": [1]},
+            measured_request={"input_ids": [1]},
+            num_steps=1,
+            host_tracer_level=2,
+            python_tracer_level=1,
+            timeout_seconds=2,
+            poll_interval_seconds=0,
+            transport=transport,
+            monotonic=_IncrementingClock(),
+            sleep=lambda _seconds: None,
+        )
+
+    assert any(
+        method == "POST" and path == "/stop_profile"
+        for method, path, *_rest in transport.calls
+    )
+
+
+@pytest.mark.parametrize("fail_path", ["/generate", "/profile_status"])
+def test_profile_client_stops_profile_when_profiled_http_call_fails(
+    tmp_path, fail_path
+):
+    profile_client = _load_profile_client_module()
+    transport = _FailingProfileTransport(fail_path=fail_path)
+
+    with pytest.raises((RuntimeError, TimeoutError)):
+        profile_client.run_profile_session(
+            output_dir=tmp_path,
+            profile_output_dir="/tmp/tpu_logs/glm52-profile-http-failure",
+            warmup_request={"input_ids": [1]},
+            measured_request={"input_ids": [1]},
+            num_steps=1,
+            host_tracer_level=2,
+            python_tracer_level=1,
+            timeout_seconds=30,
+            poll_interval_seconds=0,
+            transport=transport,
+            monotonic=_IncrementingClock(),
+            sleep=lambda _seconds: None,
+        )
+
+    assert [(method, path) for method, path, *_rest in transport.calls][-1] == (
+        "POST",
+        "/stop_profile",
+    )
+
+
+def test_profile_client_preserves_original_error_when_cleanup_stop_fails(tmp_path):
+    profile_client = _load_profile_client_module()
+    transport = _FailingGenerateAndCleanupTransport()
+
+    with pytest.raises(TimeoutError, match="measured request timed out"):
+        profile_client.run_profile_session(
+            output_dir=tmp_path,
+            profile_output_dir="/tmp/tpu_logs/glm52-profile-cleanup-failure",
+            warmup_request={"input_ids": [1]},
+            measured_request={"input_ids": [1]},
+            num_steps=1,
+            host_tracer_level=2,
+            python_tracer_level=1,
+            timeout_seconds=30,
+            poll_interval_seconds=0,
+            transport=transport,
+            monotonic=_IncrementingClock(),
+            sleep=lambda _seconds: None,
+        )
+
+    assert sum(
+        method == "POST" and path == "/stop_profile"
+        for method, path, *_rest in transport.calls
+    ) == 1
+
+
+def test_profile_runner_uses_rank_local_trace_and_validated_stage_settings():
+    runner = RUNNER_PATH.read_text(encoding="utf-8")
+
+    for required in (
+        'PROFILE_STEPS="${GLM52_DSA_PROFILE_STEPS:-4}"',
+        'PROFILE_HOST_TRACER_LEVEL="${GLM52_DSA_PROFILE_HOST_TRACER_LEVEL:-2}"',
+        'PROFILE_PYTHON_TRACER_LEVEL="${GLM52_DSA_PROFILE_PYTHON_TRACER_LEVEL:-1}"',
+        'PROFILE_TMP="/tmp/tpu_logs/glm52-profile-${RUN_ID}"',
+        '"$ROOT/scripts/kernels/profile_glm52_dsa_server.py"',
+        'cp -a "$PROFILE_TMP"/. "$OUT/profile/"',
+        '(( MAX_NEW_TOKENS < PROFILE_STEPS + 3 ))',
+    ):
+        assert required in runner
+
+    assert 'if [[ "$REQUEST_PROFILE" == "profile" ]]; then' in runner
+    finish_body = runner.split("finish_server() {", maxsplit=1)[1].split("\n}", maxsplit=1)[0]
+    assert finish_body.index("\n  stop_server\n") < finish_body.index(
+        "\n  copy_profile_output || copy_status=$?\n"
+    )
+    assert "copy_profile_output || copy_status=$?" in finish_body
 
 
 def test_real_runner_derives_expected_counts_from_generated_requests():
