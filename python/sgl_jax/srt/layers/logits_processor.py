@@ -200,6 +200,19 @@ class LogitsMetadata:
             extend_return_logprob = extend_return_top_logprob = extend_token_ids_logprob = False
             extend_logprob_pruned_lens_cpu = extend_seq_lens_cpu = None
 
+        # Output-token top-k is produced by Sampler, not LogitsProcessor. Keep
+        # those request options out of the model JIT key unless EXTEND actually
+        # computes prompt-token logprobs; otherwise output-logprob requests
+        # would recompile the full model for metadata this function never reads.
+        if extend_return_logprob:
+            model_top_logprobs_nums = batch.top_logprobs_nums
+            model_token_ids_logprobs = batch.token_ids_logprobs
+        else:
+            extend_return_top_logprob = False
+            extend_token_ids_logprob = False
+            model_top_logprobs_nums = None
+            model_token_ids_logprobs = None
+
         sharding = NamedSharding(mesh, P("data"))
         (
             extend_seq_lens_device,
@@ -239,8 +252,8 @@ class LogitsMetadata:
                 else None
             ),
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
-            top_logprobs_nums=batch.top_logprobs_nums,
-            token_ids_logprobs=batch.token_ids_logprobs,
+            top_logprobs_nums=model_top_logprobs_nums,
+            token_ids_logprobs=model_token_ids_logprobs,
             extend_input_logprob_token_ids_device=extend_input_logprob_token_ids_device,
             input_logprob_indices_device=input_logprob_indices_device,
         )

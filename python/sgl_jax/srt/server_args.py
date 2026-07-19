@@ -190,6 +190,7 @@ class ServerArgs:
     precompile_token_paddings: list[int] | None = None
     precompile_bs_paddings: list[int] | None = None
     precompile_dsa_context_paddings: list[int] | None = None
+    precompile_top_logprobs: list[int] | None = None
 
     disable_precompile: bool = False
 
@@ -1349,6 +1350,12 @@ class ServerArgs:
             type=int,
             nargs="+",
             help="Set page-aligned context-width buckets for DSA JAX JIT precompile",
+        )
+        parser.add_argument(
+            "--precompile-top-logprobs",
+            type=int,
+            nargs="+",
+            help="Also precompile return-logprob sampling paths for these top-k widths",
         )
         parser.add_argument(
             "--disable-precompile",

@@ -1,10 +1,12 @@
 import unittest
 from unittest.mock import MagicMock
 
+import jax
 import numpy as np
 
 from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 from sgl_jax.srt.utils.common_utils import align_bs_for_fused_ep, pad_to_bucket
 
 
@@ -39,6 +41,7 @@ def _make_server_args(**overrides):
     args.precompile_token_paddings = None
     args.precompile_bs_paddings = None
     args.precompile_dsa_context_paddings = None
+    args.precompile_top_logprobs = None
     args.attention_backend = "fa"
     args.moe_backend = "none"
     args.enable_static_lora = False
@@ -82,6 +85,33 @@ class TestBucketComputation(unittest.TestCase):
             moe_backend="fused",
         )
         assert cm.dsa_context_buckets == []
+
+    def test_top_logprob_buckets_are_sorted_unique_and_validated(self):
+        cm = CompilationManager(
+            server_args=_make_server_args(precompile_top_logprobs=[20, 5, 20]),
+            max_padded_batch_size=64,
+            max_padded_num_tokens=256,
+            dp_size=1,
+            tp_size=32,
+            page_size=128,
+            max_req_len=4096,
+            vocab_size=32000,
+            moe_backend="fused",
+        )
+        assert cm.top_logprob_buckets == [5, 20]
+
+        with self.assertRaisesRegex(ValueError, "precompile top-logprob"):
+            CompilationManager(
+                server_args=_make_server_args(precompile_top_logprobs=[0]),
+                max_padded_batch_size=64,
+                max_padded_num_tokens=256,
+                dp_size=1,
+                tp_size=32,
+                page_size=128,
+                max_req_len=4096,
+                vocab_size=32000,
+                moe_backend="fused",
+            )
 
     def test_token_buckets_default(self):
         cm = CompilationManager(
@@ -329,6 +359,66 @@ class TestDummyBatch(unittest.TestCase):
         np.testing.assert_array_equal(batch.positions[:128], np.arange(896, 1024))
         np.testing.assert_array_equal(batch.out_cache_loc[:128], np.arange(897, 1025))
         assert batch.logits_indices[0] == 127
+
+    def test_extend_dsa_top_logprob_dummy_matches_output_topk_runtime_shape(self):
+        bs, num_tokens = 64, 128
+        batch = self.cm._make_dummy_batch(
+            bs,
+            num_tokens,
+            ForwardMode.EXTEND,
+            bs * 4096,
+            dsa_context_len=1024,
+            top_logprobs_num=20,
+        )
+
+        assert batch.return_logprob is True
+        assert batch.return_output_logprob_only is False
+        assert batch.top_logprobs_nums == [20] + [0] * (bs - 1)
+        assert batch.token_ids_logprobs == [None] * bs
+        np.testing.assert_array_equal(batch.extend_logprob_start_lens[:2], [127, 0])
+        assert batch.extend_input_logprob_token_ids.shape == (num_tokens,)
+        assert batch.input_logprob_indices.shape == (num_tokens,)
+
+    def test_decode_dsa_top_logprob_dummy_uses_padded_runtime_metadata(self):
+        bs = 64
+        batch = self.cm._make_dummy_batch(
+            bs,
+            bs,
+            ForwardMode.DECODE,
+            bs * 4096,
+            dsa_context_len=2048,
+            top_logprobs_num=20,
+        )
+
+        assert batch.return_logprob is True
+        assert batch.top_logprobs_nums == [20] + [0] * (bs - 1)
+        assert batch.extend_logprob_start_lens is None
+        assert batch.extend_input_logprob_token_ids is None
+        assert batch.input_logprob_indices is None
+
+        mesh = jax.sharding.Mesh(np.array(jax.devices()), ("data",))
+        logits_metadata = LogitsMetadata.from_model_worker_batch(batch, mesh)
+        assert logits_metadata.top_logprobs_nums is None
+        assert logits_metadata.token_ids_logprobs is None
+
+    def test_unused_extend_output_topk_metadata_shares_plain_model_variant(self):
+        bs, num_tokens = 64, 128
+        batch = self.cm._make_dummy_batch(
+            bs,
+            num_tokens,
+            ForwardMode.EXTEND,
+            bs * 4096,
+            dsa_context_len=1024,
+            top_logprobs_num=20,
+        )
+        batch.extend_logprob_start_lens = batch.extend_seq_lens.copy()
+
+        mesh = jax.sharding.Mesh(np.array(jax.devices()), ("data",))
+        logits_metadata = LogitsMetadata.from_model_worker_batch(batch, mesh)
+        assert logits_metadata.extend_return_logprob is False
+        assert logits_metadata.extend_return_top_logprob is False
+        assert logits_metadata.top_logprobs_nums is None
+        assert logits_metadata.token_ids_logprobs is None
 
     def test_dp_metadata(self):
         cm = CompilationManager(

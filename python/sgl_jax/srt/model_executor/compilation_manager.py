@@ -61,6 +61,9 @@ class CompilationManager:
         self.dsa_context_buckets = self._compute_dsa_context_buckets(
             server_args.precompile_dsa_context_paddings
         )
+        self.top_logprob_buckets = self._compute_top_logprob_buckets(
+            server_args.precompile_top_logprobs
+        )
 
         self._compiled_variants: set[tuple] = set()
 
@@ -124,6 +127,18 @@ class CompilationManager:
             )
         )
 
+    def _compute_top_logprob_buckets(self, user_values: list[int] | None) -> list[int]:
+        if user_values is None:
+            return []
+        buckets = sorted(set(user_values))
+        invalid = [value for value in buckets if value <= 0 or value > self.vocab_size]
+        if invalid:
+            raise ValueError(
+                "precompile top-logprob widths must be within "
+                f"[1, {self.vocab_size}], got {invalid}"
+            )
+        return buckets
+
     # ---- Pre-compilation ----
 
     def precompile_all(
@@ -157,18 +172,27 @@ class CompilationManager:
         bs = self.max_padded_batch_size
         logger.info(
             "[EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s "
-            "dsa_context_paddings=%s",
+            "dsa_context_paddings=%s top_logprobs=%s",
             [bs],
             self.token_buckets,
             self.dsa_context_buckets or None,
+            self.top_logprob_buckets or None,
         )
 
         context_buckets = self.dsa_context_buckets or [None]
-        pairs = list(itertools.product([bs], self.token_buckets, context_buckets))
+        logprob_buckets = [None, *self.top_logprob_buckets]
+        pairs = list(
+            itertools.product([bs], self.token_buckets, context_buckets, logprob_buckets)
+        )
         with tqdm(pairs, desc="[EXTEND] PRECOMPILE", leave=False) as pbar:
             for pair in pbar:
-                bs_val, num_tokens, context_bucket = pair
-                pbar.set_postfix(bs=bs_val, tokens=num_tokens, context=context_bucket)
+                bs_val, num_tokens, context_bucket, top_logprobs_num = pair
+                pbar.set_postfix(
+                    bs=bs_val,
+                    tokens=num_tokens,
+                    context=context_bucket,
+                    topk=top_logprobs_num,
+                )
                 if bs_val > num_tokens:
                     logger.warning("bs=%s > num_tokens=%s, skip this pair", bs_val, num_tokens)
                     continue
@@ -184,6 +208,7 @@ class CompilationManager:
                         if context_bucket is not None
                         else None
                     ),
+                    top_logprobs_num=top_logprobs_num,
                 )
                 if prepare_lora_fn is not None:
                     prepare_lora_fn(batch)
@@ -204,7 +229,13 @@ class CompilationManager:
                     sampling_metadata=sampling_metadata,
                 )
                 self._compiled_variants.add(
-                    (ForwardMode.EXTEND, num_tokens, bs_val, context_bucket, False)
+                    (
+                        ForwardMode.EXTEND,
+                        num_tokens,
+                        bs_val,
+                        context_bucket,
+                        top_logprobs_num,
+                    )
                 )
 
         end_time = time.perf_counter()
@@ -224,15 +255,18 @@ class CompilationManager:
 
         start_time = time.perf_counter()
         logger.info(
-            "[DECODE] Begin to precompile bs_paddings=%s dsa_context_paddings=%s",
+            "[DECODE] Begin to precompile bs_paddings=%s dsa_context_paddings=%s "
+            "top_logprobs=%s",
             self.bs_buckets,
             self.dsa_context_buckets or None,
+            self.top_logprob_buckets or None,
         )
 
         pairs = list(
             itertools.product(
                 enumerate(self.bs_buckets),
                 self.dsa_context_buckets or [None],
+                [None, *self.top_logprob_buckets],
             )
         )
         with tqdm(
@@ -241,8 +275,12 @@ class CompilationManager:
             leave=False,
             total=len(pairs),
         ) as pbar:
-            for (i, bs_val), context_bucket in pbar:
-                pbar.set_postfix(bs=bs_val, context=context_bucket)
+            for (i, bs_val), context_bucket, top_logprobs_num in pbar:
+                pbar.set_postfix(
+                    bs=bs_val,
+                    context=context_bucket,
+                    topk=top_logprobs_num,
+                )
                 aligned_cache_loc_size = self.cache_loc_buckets[i]
                 batch = self._make_dummy_batch(
                     bs_val,
@@ -256,6 +294,7 @@ class CompilationManager:
                         if context_bucket is not None
                         else None
                     ),
+                    top_logprobs_num=top_logprobs_num,
                 )
                 if prepare_lora_fn is not None:
                     prepare_lora_fn(batch)
@@ -282,7 +321,13 @@ class CompilationManager:
                     _, next_token_ids, _ = result
                     set_future_token_ids(future_token_ids_map, 0, next_token_ids, mesh)
                 self._compiled_variants.add(
-                    (ForwardMode.DECODE, bs_val, bs_val, context_bucket, False)
+                    (
+                        ForwardMode.DECODE,
+                        bs_val,
+                        bs_val,
+                        context_bucket,
+                        top_logprobs_num,
+                    )
                 )
 
         end_time = time.perf_counter()
@@ -300,6 +345,7 @@ class CompilationManager:
         dp_size: int = 1,
         per_dp_bs_size: int = 0,
         dsa_context_len: int | None = None,
+        top_logprobs_num: int | None = None,
     ):
         import jax.numpy as jnp
 
@@ -392,13 +438,41 @@ class CompilationManager:
 
         if speculative_algorithm is None:
             sampling_info = ModelWorkerSamplingInfo.generate_for_precompile(bs, self.vocab_size)
-            return_output_logprob_only = True
+            return_output_logprob_only = top_logprobs_num is None
         else:
             sampling_info = ModelWorkerSamplingInfo.generate_for_precompile_all_greedy(
                 bs, self.vocab_size
             )
             sampling_info.vocab_mask = None
             return_output_logprob_only = False
+
+        return_logprob = top_logprobs_num is not None
+        if return_logprob:
+            if top_logprobs_num <= 0 or top_logprobs_num > self.vocab_size:
+                raise ValueError(
+                    "top_logprobs_num must be within "
+                    f"[1, {self.vocab_size}], got {top_logprobs_num}"
+                )
+            top_logprobs_nums = [top_logprobs_num] * active_bs + [0] * (bs - active_bs)
+            token_ids_logprobs = [None] * bs
+            if mode == ForwardMode.EXTEND:
+                extend_logprob_start_lens = extend_seq_lens.copy()
+                extend_logprob_start_lens[:active_bs] = np.maximum(
+                    extend_logprob_start_lens[:active_bs] - 1,
+                    0,
+                )
+                extend_input_logprob_token_ids = np.zeros(num_tokens, dtype=np.int32)
+                input_logprob_indices = np.zeros(num_tokens, dtype=np.int32)
+            else:
+                extend_logprob_start_lens = None
+                extend_input_logprob_token_ids = None
+                input_logprob_indices = None
+        else:
+            top_logprobs_nums = None
+            token_ids_logprobs = None
+            extend_logprob_start_lens = None
+            extend_input_logprob_token_ids = None
+            input_logprob_indices = None
 
         return ModelWorkerBatch(
             bid=1,
@@ -409,19 +483,19 @@ class CompilationManager:
             req_pool_indices=np.arange(bs, dtype=np.int32),
             seq_lens=seq_lens,
             out_cache_loc=np.concat([valid_out_cache_loc, invalid_out_cache_loc], axis=0),
-            return_logprob=False,
+            return_logprob=return_logprob,
             return_output_logprob_only=return_output_logprob_only,
             sampling_info=sampling_info,
-            extend_input_logprob_token_ids=None,
+            extend_input_logprob_token_ids=extend_input_logprob_token_ids,
             positions=np.concat([valid_positions, invalid_positions], axis=0),
             cache_loc=np.concat([valid_cache_loc, invalid_cache_loc], axis=0),
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
-            top_logprobs_nums=None,
-            token_ids_logprobs=None,
-            extend_logprob_start_lens=None,
+            top_logprobs_nums=top_logprobs_nums,
+            token_ids_logprobs=token_ids_logprobs,
+            extend_logprob_start_lens=extend_logprob_start_lens,
             logits_indices=logits_indices,
-            input_logprob_indices=None,
+            input_logprob_indices=input_logprob_indices,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL if self.multimodal else CaptureHiddenMode.NULL
             ),

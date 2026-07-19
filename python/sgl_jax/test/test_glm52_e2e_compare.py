@@ -405,6 +405,7 @@ def test_real_runner_precompiles_dsa_context_buckets():
     runner = RUNNER_PATH.read_text(encoding="utf-8")
 
     assert "--precompile-dsa-context-paddings 512 1024 2048 4096" in runner
+    assert "--precompile-top-logprobs 20" in runner
     assert 'echo "dsa_context_paddings=512,1024,2048,4096"' in runner
 
 

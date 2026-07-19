@@ -277,6 +277,7 @@ SERVER_ARGS=(
   --precompile-bs-paddings 1 2
   --precompile-token-paddings 128 256
   --precompile-dsa-context-paddings 512 1024 2048 4096
+  --precompile-top-logprobs 20
 )
 
 if [[ "$DISABLE_PRECOMPILE" == "1" ]]; then

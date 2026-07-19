@@ -496,9 +496,13 @@ def test_dsa_cli_pool_cost_and_compact_full_layer_pool():
             "--precompile-dsa-context-paddings",
             "512",
             "2048",
+            "--precompile-top-logprobs",
+            "5",
+            "20",
         ]
     )
     assert args.precompile_dsa_context_paddings == [512, 2048]
+    assert args.precompile_top_logprobs == [5, 20]
 
     config = SimpleNamespace(
         kv_lora_rank=3,
