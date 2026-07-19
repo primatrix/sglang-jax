@@ -33,6 +33,8 @@ def test_debug_dump_is_disabled_by_default(monkeypatch):
         ("SGLANG_JAX_DEBUG_DUMP_COMPONENTS", "logits", 0),
         ("SGLANG_JAX_DEBUG_DUMP_LAYERS", "1,3,5", 1),
         ("SGLANG_JAX_DEBUG_DUMP_LAYERS", "1,5", 0),
+        ("SGLANG_JAX_DEBUG_DUMP_NAMES", "q_index,hidden_states", 1),
+        ("SGLANG_JAX_DEBUG_DUMP_NAMES", "hidden_states", 0),
         ("SGLANG_JAX_DEBUG_DUMP_PROCESSES", "2,7", 1),
         # Process filtering must retain the callback in every rank's HLO so
         # multi-controller TPU programs have identical launch sequences.

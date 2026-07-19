@@ -193,10 +193,13 @@ def maybe_dump_jax_array(
     process = jax.process_index()
     components = _debug_dump_filter("SGLANG_JAX_DEBUG_DUMP_COMPONENTS")
     layers = _debug_dump_filter("SGLANG_JAX_DEBUG_DUMP_LAYERS")
+    names = _debug_dump_filter("SGLANG_JAX_DEBUG_DUMP_NAMES")
     processes = _debug_dump_filter("SGLANG_JAX_DEBUG_DUMP_PROCESSES")
     if components and str(component) not in components:
         return value
     if layers and layer_id is not None and str(layer_id) not in layers:
+        return value
+    if names and str(name) not in names:
         return value
     write_on_process = not processes or str(process) in processes
 
