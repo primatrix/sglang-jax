@@ -5,6 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import ml_dtypes
 import numpy as np
 import pytest
 
@@ -159,6 +160,31 @@ def test_compare_aligns_semantic_keys_and_reports_raw_metrics(tmp_path):
     topk = comparisons["logical_topk_ids"]
     assert topk["metrics"]["topk_overlap"] == pytest.approx(0.75)
     json.dumps(report, sort_keys=True, allow_nan=False)
+
+
+def test_compare_recovers_jax_bfloat16_saved_as_void2(tmp_path):
+    compare = _load_compare_module()
+    candidate = tmp_path / "candidate"
+    baseline = tmp_path / "baseline"
+    key = _row("hidden.npy")
+    for directory, values in (
+        (candidate, [1.0, 2.5]),
+        (baseline, [1.0, 2.0]),
+    ):
+        directory.mkdir()
+        bfloat16 = np.asarray(values, dtype=ml_dtypes.bfloat16)
+        # JAX host callbacks currently expose bfloat16 to np.save as raw V2.
+        np.save(directory / key["filename"], bfloat16.view("V2"), allow_pickle=False)
+        _write_manifest(directory, key, shape=bfloat16.shape, dtype="bfloat16")
+
+    report = compare.compare_dump_directories(candidate, baseline)
+
+    assert report["passed"] is True
+    comparison = report["comparisons"][0]
+    assert comparison["candidate_dtype"] == "bfloat16"
+    assert comparison["baseline_dtype"] == "bfloat16"
+    assert comparison["dtype_match"] is True
+    assert comparison["metrics"]["max_abs"] == pytest.approx(0.5)
 
 
 def test_compare_can_drop_cancelled_forwards_without_terminal_marker(tmp_path):

@@ -13,9 +13,9 @@ from typing import Any
 import numpy as np
 
 try:
-    import ml_dtypes  # noqa: F401  # Register bfloat16 with NumPy.
+    import ml_dtypes
 except ImportError:  # pragma: no cover - JAX environments provide ml_dtypes.
-    pass
+    ml_dtypes = None
 
 
 KEY_FIELDS = (
@@ -223,6 +223,15 @@ def _load_array(record: dict[str, Any], label: str) -> tuple[np.ndarray | None, 
         return None, [
             f"{label}: loaded object is not an ndarray: {loadable_type}"
         ]
+    if (
+        record["declared_dtype"] == "bfloat16"
+        and array.dtype.kind == "V"
+        and array.dtype.itemsize == 2
+    ):
+        if ml_dtypes is None:
+            errors.append(f"{label}: ml_dtypes is required to decode bfloat16 tensor")
+        else:
+            array = array.view(ml_dtypes.bfloat16)
     if tuple(array.shape) != record["declared_shape"]:
         errors.append(
             f"{label}: manifest shape {list(record['declared_shape'])} does not match "
