@@ -176,6 +176,11 @@ def _load_safetensors_metadata_cache(
     try:
         with gzip.open(cache_path, "rt", encoding="utf-8") as fp:
             payload = json.load(fp)
+        if not isinstance(payload, Mapping):
+            logger.warning(
+                "Ignoring malformed safetensors metadata cache: %s", cache_path
+            )
+            return None
         if payload.get("schema_version") != _SAFETENSORS_METADATA_CACHE_VERSION:
             logger.warning("Ignoring incompatible safetensors metadata cache: %s", cache_path)
             return None

@@ -1,3 +1,4 @@
+import gzip
 import json
 import struct
 import subprocess
@@ -120,6 +121,25 @@ def test_safetensors_metadata_cache_rejects_changed_shard(tmp_path):
     shard.write_bytes(shard.read_bytes() + b"changed")
 
     assert _load_safetensors_metadata_cache(cache, weights_files) is None
+
+
+def test_safetensors_metadata_cache_rejects_non_object_payload(tmp_path):
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    _write_safetensors_header(
+        shard,
+        {
+            "model.weight": {
+                "dtype": "BF16",
+                "shape": [1],
+                "data_offsets": [0, 2],
+            }
+        },
+    )
+    cache = tmp_path / "sglang_jax.safetensors_metadata.v1.json.gz"
+    with gzip.open(cache, "wt", encoding="utf-8") as fp:
+        json.dump([], fp)
+
+    assert _load_safetensors_metadata_cache(cache, [str(shard)]) is None
 
 
 def test_weight_loader_uses_default_metadata_cache_before_scanning(tmp_path, monkeypatch):
