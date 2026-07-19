@@ -187,6 +187,50 @@ def test_compare_recovers_jax_bfloat16_saved_as_void2(tmp_path):
     assert comparison["metrics"]["max_abs"] == pytest.approx(0.5)
 
 
+def test_compare_uses_debug_context_token_valid_mask_for_metrics(tmp_path):
+    compare = _load_compare_module()
+    candidate = tmp_path / "candidate"
+    baseline = tmp_path / "baseline"
+    hidden_key = _row("hidden.npy", occurrence=7)
+    mask_key = _row(
+        "mask.npy",
+        component="debug_context",
+        layer=None,
+        name="token_valid_mask",
+        occurrence=7,
+    )
+    _write_dump(
+        candidate,
+        [
+            (hidden_key, np.array([[1.0, 2.0], [100.0, 200.0]], dtype=np.float32)),
+            (mask_key, np.array([True, False], dtype=np.bool_)),
+        ],
+    )
+    _write_dump(
+        baseline,
+        [
+            (
+                {**hidden_key, "filename": "baseline-hidden.npy"},
+                np.array([[1.0, 2.0], [-100.0, -200.0]], dtype=np.float32),
+            ),
+            (
+                {**mask_key, "filename": "baseline-mask.npy"},
+                np.array([True, False], dtype=np.bool_),
+            ),
+        ],
+    )
+
+    report = compare.compare_dump_directories(candidate, baseline)
+
+    comparison = next(
+        item for item in report["comparisons"] if item["key"]["name"] == "hidden_states"
+    )
+    assert comparison["valid_row_count"] == 1
+    assert comparison["metrics"]["max_abs"] == 0.0
+    assert comparison["metrics"]["mean_abs"] == 0.0
+    assert comparison["metrics"]["p99_abs"] == 0.0
+
+
 def test_compare_can_drop_cancelled_forwards_without_terminal_marker(tmp_path):
     compare = _load_compare_module()
     candidate = tmp_path / "candidate"

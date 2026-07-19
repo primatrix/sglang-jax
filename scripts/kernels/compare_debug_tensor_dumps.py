@@ -56,6 +56,17 @@ def _forward_key(key: tuple[Any, ...]) -> tuple[Any, ...]:
     return key[2], key[4], key[5]
 
 
+def _token_valid_mask_key(key: tuple[Any, ...]) -> tuple[Any, ...]:
+    return (
+        "debug_context",
+        None,
+        key[2],
+        "token_valid_mask",
+        key[4],
+        key[5],
+    )
+
+
 def _filter_complete_forwards(
     rows: dict[tuple[Any, ...], dict[str, Any]], marker: tuple[str, str]
 ) -> tuple[dict[tuple[Any, ...], dict[str, Any]], dict[str, int]]:
@@ -510,7 +521,43 @@ def compare_dump_directories(
                 failures.append(f"dtype mismatch: {candidate.dtype} != {baseline.dtype}")
 
         metrics = dict(EMPTY_METRICS)
+        valid_row_count = None
         if not failures and candidate is not None and baseline is not None:
+            candidate_metric_array = candidate
+            baseline_metric_array = baseline
+            candidate_mask = baseline_mask = None
+            mask_key = _token_valid_mask_key(key)
+            is_mask_tensor = key[0] == "debug_context" and key[3] == "token_valid_mask"
+            if not is_mask_tensor and mask_key in candidate_rows and mask_key in baseline_rows:
+                candidate_mask, mask_errors = _load_array(
+                    candidate_rows[mask_key], "candidate token_valid_mask"
+                )
+                failures.extend(mask_errors)
+                baseline_mask, mask_errors = _load_array(
+                    baseline_rows[mask_key], "baseline token_valid_mask"
+                )
+                failures.extend(mask_errors)
+                if candidate_mask is not None and baseline_mask is not None:
+                    if candidate_mask.dtype != np.bool_ or candidate_mask.ndim != 1:
+                        failures.append("candidate token_valid_mask must be a rank-1 bool tensor")
+                    if baseline_mask.dtype != np.bool_ or baseline_mask.ndim != 1:
+                        failures.append("baseline token_valid_mask must be a rank-1 bool tensor")
+                    if (
+                        candidate_mask.shape != baseline_mask.shape
+                        or not np.array_equal(candidate_mask, baseline_mask)
+                    ):
+                        failures.append("candidate and baseline token_valid_mask tensors differ")
+                    if (
+                        not failures
+                        and candidate.ndim > 0
+                        and baseline.ndim > 0
+                        and candidate.shape[0] == candidate_mask.size
+                        and baseline.shape[0] == baseline_mask.size
+                    ):
+                        valid_row_count = int(np.count_nonzero(candidate_mask))
+                        candidate_metric_array = candidate[candidate_mask]
+                        baseline_metric_array = baseline[baseline_mask]
+
             candidate_counts = None
             baseline_counts = None
             if key[3] == "logical_topk_ids":
@@ -525,12 +572,23 @@ def compare_dump_directories(
                         baseline_rows[counts_key], "baseline selected_counts"
                     )
                     failures.extend(count_errors)
+                if (
+                    valid_row_count is not None
+                    and candidate_counts is not None
+                    and baseline_counts is not None
+                    and candidate_counts.ndim > 0
+                    and baseline_counts.ndim > 0
+                    and candidate_counts.shape[0] == candidate_mask.size
+                    and baseline_counts.shape[0] == baseline_mask.size
+                ):
+                    candidate_counts = candidate_counts[candidate_mask]
+                    baseline_counts = baseline_counts[baseline_mask]
             try:
                 if failures:
                     raise ValueError(failures[0])
                 metrics = _metrics(
-                    candidate,
-                    baseline,
+                    candidate_metric_array,
+                    baseline_metric_array,
                     tensor_name=str(key[3]),
                     candidate_counts=candidate_counts,
                     baseline_counts=baseline_counts,
@@ -549,6 +607,7 @@ def compare_dump_directories(
             "baseline_dtype": str(baseline.dtype) if baseline is not None else None,
             "shape_match": shape_match,
             "dtype_match": dtype_match,
+            "valid_row_count": valid_row_count,
             "metrics": metrics,
             "failures": failures,
             "passed": not failures,
