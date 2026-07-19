@@ -132,8 +132,8 @@ if [[ "$MOE_BACKEND" != "fused" && "$MOE_BACKEND" != "epmoe" ]]; then
   echo "GLM52_MOE_BACKEND must be fused or epmoe, got: ${MOE_BACKEND}" >&2
   exit 2
 fi
-if [[ "$REQUEST_PROFILE" != "smoke" && "$REQUEST_PROFILE" != "boundary" ]]; then
-  echo "GLM52_DSA_REQUEST_PROFILE must be smoke or boundary, got: ${REQUEST_PROFILE}" >&2
+if [[ "$REQUEST_PROFILE" != "smoke" && "$REQUEST_PROFILE" != "boundary" && "$REQUEST_PROFILE" != "boundary_single" ]]; then
+  echo "GLM52_DSA_REQUEST_PROFILE must be smoke, boundary, or boundary_single; got: ${REQUEST_PROFILE}" >&2
   exit 2
 fi
 if [[ ! "$MAX_NEW_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
@@ -395,11 +395,15 @@ if profile == "smoke":
             ]
         ),
     }
-else:
+elif profile == "boundary":
     requests = {
         "boundary_2047": request(vocab_input_ids(2047, 100)),
         "boundary_2048": request(vocab_input_ids(2048, 200)),
         "boundary_2049": request(vocab_input_ids(2049, 300)),
+        "boundary_3072": request(vocab_input_ids(3072, 400)),
+    }
+else:
+    requests = {
         "boundary_3072": request(vocab_input_ids(3072, 400)),
     }
 
