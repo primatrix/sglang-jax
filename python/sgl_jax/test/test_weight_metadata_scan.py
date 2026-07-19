@@ -1,4 +1,5 @@
 import gzip
+import hashlib
 import json
 import struct
 import subprocess
@@ -25,8 +26,23 @@ METADATA_CACHE_BUILDER = ROOT / "scripts/models/build_safetensors_metadata_cache
 
 def _write_safetensors_header(path, tensors):
     header = json.dumps(tensors).encode("utf-8")
-    path.write_bytes(struct.pack("<Q", len(header)) + header)
+    data_size = max(
+        (
+            meta.get("data_offsets", [0, 0])[1]
+            for key, meta in tensors.items()
+            if key != "__metadata__"
+        ),
+        default=0,
+    )
+    path.write_bytes(struct.pack("<Q", len(header)) + header + bytes(data_size))
     return 8 + len(header)
+
+
+def _weight_info_digest(weight_info):
+    canonical = json.dumps(
+        weight_info, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 @pytest.mark.parametrize("num_threads", [1, 4])
@@ -100,6 +116,68 @@ def test_safetensors_metadata_cache_round_trip(tmp_path):
     _write_safetensors_metadata_cache(cache, weights_files, expected)
 
     assert _load_safetensors_metadata_cache(cache, weights_files) == expected
+
+
+def test_safetensors_metadata_cache_rejects_weight_info_digest_mismatch(tmp_path):
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    _write_safetensors_header(
+        shard,
+        {
+            "model.weight": {
+                "dtype": "BF16",
+                "shape": [1],
+                "data_offsets": [0, 2],
+            }
+        },
+    )
+    weights_files = [str(shard)]
+    cache = tmp_path / "sglang_jax.safetensors_metadata.v1.json.gz"
+    expected = _scan_safetensors_metadata(weights_files, num_threads=1)
+    _write_safetensors_metadata_cache(cache, weights_files, expected)
+    with gzip.open(cache, "rt", encoding="utf-8") as fp:
+        payload = json.load(fp)
+    assert isinstance(payload["weight_info_sha256"], str)
+    payload["weight_info"]["model.weight"][0]["shape"] = [999]
+    with gzip.open(cache, "wt", encoding="utf-8") as fp:
+        json.dump(payload, fp)
+
+    assert _load_safetensors_metadata_cache(cache, weights_files) is None
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("shape", [999]),
+        ("byte_offset", 0),
+        ("byte_size", 999),
+    ],
+)
+def test_safetensors_metadata_cache_rejects_semantically_invalid_entry(
+    tmp_path, field, value
+):
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    _write_safetensors_header(
+        shard,
+        {
+            "model.weight": {
+                "dtype": "BF16",
+                "shape": [1],
+                "data_offsets": [0, 2],
+            }
+        },
+    )
+    weights_files = [str(shard)]
+    cache = tmp_path / "sglang_jax.safetensors_metadata.v1.json.gz"
+    expected = _scan_safetensors_metadata(weights_files, num_threads=1)
+    _write_safetensors_metadata_cache(cache, weights_files, expected)
+    with gzip.open(cache, "rt", encoding="utf-8") as fp:
+        payload = json.load(fp)
+    payload["weight_info"]["model.weight"][0][field] = value
+    payload["weight_info_sha256"] = _weight_info_digest(payload["weight_info"])
+    with gzip.open(cache, "wt", encoding="utf-8") as fp:
+        json.dump(payload, fp)
+
+    assert _load_safetensors_metadata_cache(cache, weights_files) is None
 
 
 def test_safetensors_metadata_cache_rejects_changed_shard(tmp_path):

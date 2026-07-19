@@ -2,6 +2,7 @@ import copy
 import contextlib
 import gzip
 import glob
+import hashlib
 import json
 import logging
 import math
@@ -125,10 +126,17 @@ def _safetensors_shard_fingerprint(weights_files: list[str]) -> list[dict[str, A
     ]
 
 
+def _serialized_safetensors_weight_info_sha256(weight_info: Any) -> str:
+    canonical = json.dumps(
+        weight_info, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def _is_valid_serialized_safetensors_weight_info(
     weight_info: Any,
     *,
-    shard_names: set[str],
+    shard_sizes: Mapping[str, int],
 ) -> bool:
     if not isinstance(weight_info, Mapping) or not weight_info:
         return False
@@ -144,18 +152,29 @@ def _is_valid_serialized_safetensors_weight_info(
         for info in infos:
             if not isinstance(info, Mapping):
                 return False
-            if info.get("file") not in shard_names:
+            shard_name = info.get("file")
+            if shard_name not in shard_sizes:
                 return False
             shape = info.get("shape")
             if not isinstance(shape, list) or not all(
                 is_nonnegative_int(dim) for dim in shape
             ):
                 return False
-            if info.get("dtype") not in _SAFETENSORS_DTYPE_TO_JAX:
+            dtype_name = info.get("dtype")
+            if dtype_name not in _SAFETENSORS_DTYPE_TO_JAX:
                 return False
-            if not is_nonnegative_int(info.get("byte_offset")):
+            byte_offset = info.get("byte_offset")
+            byte_size = info.get("byte_size")
+            if not is_nonnegative_int(byte_offset) or byte_offset < 8:
                 return False
-            if not is_nonnegative_int(info.get("byte_size")):
+            if not is_nonnegative_int(byte_size):
+                return False
+            expected_byte_size = math.prod(shape) * jnp.dtype(
+                _SAFETENSORS_DTYPE_TO_JAX[dtype_name]
+            ).itemsize
+            if byte_size != expected_byte_size:
+                return False
+            if byte_offset + byte_size > shard_sizes[shard_name]:
                 return False
     return True
 
@@ -187,6 +206,9 @@ def _write_safetensors_metadata_cache(
         "schema_version": _SAFETENSORS_METADATA_CACHE_VERSION,
         "shards": _safetensors_shard_fingerprint(weights_files),
         "weight_info": serializable_weight_info,
+        "weight_info_sha256": _serialized_safetensors_weight_info_sha256(
+            serializable_weight_info
+        ),
     }
 
     cache_path = os.fspath(cache_path)
@@ -224,12 +246,23 @@ def _load_safetensors_metadata_cache(
             return None
 
         root = os.path.dirname(os.path.abspath(weights_files[0]))
-        shard_names = {
-            os.path.relpath(os.path.abspath(path), root) for path in weights_files
+        shard_sizes = {
+            os.path.relpath(os.path.abspath(path), root): os.path.getsize(path)
+            for path in weights_files
         }
         serialized_weight_info = payload.get("weight_info")
+        expected_weight_info_sha256 = payload.get("weight_info_sha256")
+        if (
+            not isinstance(expected_weight_info_sha256, str)
+            or expected_weight_info_sha256
+            != _serialized_safetensors_weight_info_sha256(serialized_weight_info)
+        ):
+            logger.warning(
+                "Ignoring corrupt safetensors metadata cache: %s", cache_path
+            )
+            return None
         if not _is_valid_serialized_safetensors_weight_info(
-            serialized_weight_info, shard_names=shard_names
+            serialized_weight_info, shard_sizes=shard_sizes
         ):
             logger.warning(
                 "Ignoring malformed safetensors metadata cache: %s", cache_path
