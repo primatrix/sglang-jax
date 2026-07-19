@@ -119,6 +119,130 @@ MoE 每组读取 1.6106 GB，冷缓存常见 `0.63--1.82s`，约 `0.89--2.55 GB/
 | 225 MoE groups | 32s |
 | server healthy | 181s，总计 3m01s |
 
+## Fresh-node 启动、metadata sidecar 与 precompile
+
+### 为什么看起来像“precompile 卡死”
+
+原 runner 把 server stdout/stderr 全部重定向到 rank 本地文件，只在进程退出时复制到
+artifact。Falcon 实时 stdout 因而只有 health-check 的 `curl` 失败，看不到 metadata、
+权重加载和预编译进度。
+
+`1845199aa` 增加了 rank-0 只读日志 monitor。它从 server log 第一行开始跟随，只镜像
+以下阶段边界到 Falcon stdout，并在退出时按独立 process group 清理：
+
+- metadata scan 或 sidecar hit；
+- parallel weight loading 完成；
+- MLA/Fused MLP absorb 完成；
+- 每个 EXTEND/DECODE precompile variant 的进度；
+- server ready。
+
+fresh-node baseline 为 `exp-mzbjj4o3f6`（job `job-w8hms841fl`，artifact
+`art-5195yimbtv`，source `05ad390e9`）：
+
+| 阶段 | 耗时 |
+| --- | ---: |
+| 282 shard metadata header scan | 22m12s |
+| 权重加载 | 27m14s |
+| absorb | 3s |
+| EXTEND 8/8 | 604s |
+| DECODE 5/5 | 295s |
+| server ready | 3904s（65m04s） |
+
+因此服务并没有卡在 precompile：前 49 分钟主要是在 fresh GCSFuse 节点读取 metadata
+和真实权重，之后 15 分钟才是有界的 13 个预编译 variant。
+
+### Versioned metadata sidecar
+
+`16d3a7f09` 增加 gzip-JSON sidecar：
+
+```text
+/models/GLM-5.2/sglang_jax.safetensors_metadata.v1.json.gz
+```
+
+sidecar 保存 tensor key、shape、dtype、shard 相对路径、byte offset/size，以及 shard
+basename/size fingerprint。process 0 先加载并校验 sidecar；miss、过期或损坏时安全回退
+到原并发 header scanner，最终仍广播同一种 `weight_info` 结构。
+
+独立 review 进一步发现“合法 JSON 但内部内容损坏”仍可能误命中，随后在
+`97f05a640 / f20b2426f / ec1061e92` 中补齐：
+
+- payload 和 `weight_info` 的结构/非空校验；
+- canonical `weight_info` SHA256；
+- shard 名称、dtype、shape、`shape × dtype == byte_size`；
+- `byte_offset >= 8` 和 `offset + size <= shard size`。
+
+测试覆盖旧无 digest 文件、stale shard、digest mismatch、空 metadata、未知 shard，
+以及重算 digest 后的非法 shape/offset/size。最终独立复审结论为无 Critical/Important。
+
+由于 Falcon CPU pool 当时不可调度，sidecar 仍使用 v7x-8 pod 的 host CPU 生成，TPU
+不参与计算。首版任务 `exp-oyhebgisn4` 证明方案可用；完整性版最终任务为：
+
+```text
+experiment: exp-9h2a7czdt2
+job:        job-jbka9fa213
+artifact:   art-8bnaxyq6q2
+source:     ec1061e92
+shards:     282
+tensors:    59,585
+bytes:      621,430
+GCS SHA256: 8d2b8157b7468b649f828c1f315fd330106dfa6c272da62593b1b44852897373
+metadata SHA256: 6c7e0fcb14f7cf3a5ea1c3d3785a99549beab0fd5bf1ddb80e66047cedb10b24
+build:      11s
+validation: 5s
+```
+
+### Fresh-node v7x-32 验证
+
+验证任务使用 4×v7x-8、TP32/DP1/EP32、fused MoE、DSA、3072-token
+`precompile_repeat`，模型挂载保持 read-only：
+
+```text
+experiment: exp-zeb34sbqwj
+job:        job-si7hvggx15
+artifact:   art-9v9fkmhhvg
+source:     16d3a7f09
+run id:     glm52-dsa-metadata-cache-20260719-001
+```
+
+四个 pod 均 succeeded。可比的 runner 时间线为：
+
+| 阶段 | 耗时 | 说明 |
+| --- | ---: | --- |
+| server launch 到 weight loading | 约 39s | 包含模型初始化；sidecar 独立冷加载为 5s |
+| 权重加载 | 26m48s | 与 baseline 27m14s 一致 |
+| absorb | 37s | fresh-node 波动 |
+| EXTEND | 614s | 8/8，约 74--85s/variant |
+| DECODE | 290s | 5/5 |
+| server ready | 2589s（43m09s） | runner 实测 |
+
+与 baseline 的 3904s 相比减少 1315s（21m55s，约 33.7%），基本等于被消除的
+22m12s metadata header scan。现在 fresh-node 的主要启动成本是实际权重读取
+（1608s，约 62%）和显式预编译（904s，约 35%），不是未解释的卡死。
+
+两次完全相同的 3072-token、one-token generation 结果：
+
+| 指标 | first | repeat |
+| --- | ---: | ---: |
+| latency | 99.9987s | 99.9844s |
+| output ID | `[198]` | `[198]` |
+| output logprob | `-4.1875` | `-4.1875` |
+| cache_miss_count | 1 | 1 |
+
+严格 first/repeat gate 为：
+
+```text
+output_ids_equal=true
+max_output_logprob_abs_error=0
+max_shared_topk_logprob_abs_error=0
+min_topk_overlap=1.0
+schema_valid=true
+passed=true
+```
+
+两次 latency 基本相同，`cache_miss_count` 也都为 1，所以没有“只发生在首轮”的冷编译。
+这里验证的是单个 active request、top-20、3072-token DSA bucket；不能外推为所有
+active batch occupancy、混合 top-k 宽度都已预编译。
+
 ## 真实权重问题与修复
 
 第一次完整 regular-weight load 暴露 fused shared expert 映射错误：

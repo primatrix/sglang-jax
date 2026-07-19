@@ -1,0 +1,91 @@
+name: glm52-metadata-sidecar-v7x8-hostcpu-20260719-v2
+exp_type: TRAINING
+cluster_name: tpu-training-antgroup
+artifact_type: GCS
+tags:
+  - sglang-jax
+  - glm-5.2
+  - model-metadata
+  - host-cpu
+  - v7x-8
+config: '{"source_rev":"ec1061e92","purpose":"build integrity-checked GLM-5.2 safetensors metadata sidecar","tpu_usage":"host-cpu-only"}'
+role_to_task_spec:
+  worker:
+    replica: 1
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x1
+    supply_mode: reservation
+    envs:
+      JAX_PLATFORMS: cpu
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /tmp/tpu_logs/tmp
+      PIP_CACHE_DIR: /tmp/tpu_logs/pip-cache
+      SGLANG_JAX_METADATA_SCAN_THREADS: "32"
+    command: |
+      bash <<'BASH'
+      set -euxo pipefail
+      ulimit -c 0
+
+      ROOT=/tmp/glm52-metadata-sidecar/sglang-jax
+      SOURCE=/models/codex-sources/sglang-jax-glm52-dsa-ec1061e92.tar.gz
+      SOURCE_SHA=171907621860ac2ffd1db23d42fac8733e4aff770bc7149e4e05fe4d69b372dc
+      MODEL_DIR=/models/GLM-5.2
+      SIDECAR="$MODEL_DIR/sglang_jax.safetensors_metadata.v1.json.gz"
+      mkdir -p /tmp/tpu_logs/tmp /tmp/tpu_logs/pip-cache "$ROOT" "$ARTIFACT_LOCAL_DIR"
+      echo "$SOURCE_SHA  $SOURCE" | sha256sum -c -
+      tar -xzf "$SOURCE" -C "$ROOT"
+      /opt/venv/bin/python3 -m pip install --disable-pip-version-check -e "$ROOT/python"
+
+      rm -f "$SIDECAR"
+      started_at=$(date +%s)
+      /opt/venv/bin/python3 -u "$ROOT/scripts/models/build_safetensors_metadata_cache.py" \
+        --model-path "$MODEL_DIR" \
+        --output "$SIDECAR" \
+        --threads 32
+      finished_at=$(date +%s)
+      build_seconds=$((finished_at - started_at))
+
+      load_started_at=$(date +%s)
+      PYTHONPATH="$ROOT/python" /opt/venv/bin/python3 - "$MODEL_DIR" "$SIDECAR" <<'PY'
+      import glob
+      import os
+      import sys
+
+      from sgl_jax.srt.utils.weight_utils import _load_safetensors_metadata_cache
+
+      model_dir, sidecar = sys.argv[1:]
+      shards = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
+      metadata = _load_safetensors_metadata_cache(sidecar, shards)
+      if metadata is None:
+          raise SystemExit("generated metadata sidecar failed validation")
+      print(f"GLM52_METADATA_SIDECAR_VALID shards={len(shards)} tensors={len(metadata)}")
+      PY
+      load_finished_at=$(date +%s)
+      load_seconds=$((load_finished_at - load_started_at))
+
+      {
+        echo "source_rev=ec1061e92"
+        echo "sidecar=$SIDECAR"
+        echo "sidecar_bytes=$(stat -c %s "$SIDECAR")"
+        echo "sidecar_sha256=$(sha256sum "$SIDECAR" | awk '{print $1}')"
+        echo "build_seconds=$build_seconds"
+        echo "validation_load_seconds=$load_seconds"
+        echo "completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      } | tee "$ARTIFACT_LOCAL_DIR/metadata-sidecar-summary.txt"
+      BASH
+    mounts:
+      - name: model-storage
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        mount_path: /models
+        read_only: false
+        mount_options:
+          - implicit-dirs
+          - write:enable-streaming-writes:true
+          - metadata-cache:ttl-secs:-1
+          - metadata-cache:stat-cache-max-size-mb:512
+          - metadata-cache:type-cache-max-size-mb:64
+          - file-system:kernel-list-cache-ttl-secs:-1
+          - read_ahead_kb=1024
