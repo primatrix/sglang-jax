@@ -84,18 +84,20 @@ def write_mla_kv_cache(
     lane = offset % packing
     page = jnp.where(valid, page, cache.shape[0])
 
-    updated = cache.at[page, row, lane, :latent_dim].set(
-        new_c_kv.astype(cache.dtype),
-        mode="drop",
-        out_sharding=jax.typeof(cache).sharding,
+    packed_values = jnp.concatenate(
+        (
+            new_c_kv.astype(cache.dtype),
+            jnp.zeros(
+                (new_c_kv.shape[0], latent_aligned - latent_dim),
+                dtype=cache.dtype,
+            ),
+            new_k_pe.astype(cache.dtype),
+        ),
+        axis=-1,
     )
-    return updated.at[
-        page,
-        row,
-        lane,
-        latent_aligned : latent_aligned + rope_dim,
-    ].set(
-        new_k_pe.astype(cache.dtype),
+    update_width = latent_aligned + rope_dim
+    return cache.at[page, row, lane, :update_width].set(
+        packed_values,
         mode="drop",
         out_sharding=jax.typeof(cache).sharding,
     )

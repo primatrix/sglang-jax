@@ -76,7 +76,7 @@ def test_write_mla_kv_cache_uses_token_slots_across_page_boundary_and_drops_padd
     assert cache.dtype == jnp.bfloat16
 
 
-def test_write_mla_kv_cache_preserves_operand_sharding_on_both_scatters(monkeypatch):
+def test_write_mla_kv_cache_packs_latent_and_rope_into_one_sharded_scatter(monkeypatch):
     from sgl_jax.srt.kernels.dsa.reference import write_mla_kv_cache
 
     expected_sharding = object()
@@ -115,8 +115,11 @@ def test_write_mla_kv_cache_preserves_operand_sharding_on_both_scatters(monkeypa
     )
 
     assert isinstance(result, FakeCache)
-    assert len(captured) == 2
-    assert all(entry["kwargs"]["out_sharding"] is expected_sharding for entry in captured)
+    assert len(captured) == 1
+    scatter = captured[0]
+    assert scatter["kwargs"]["out_sharding"] is expected_sharding
+    assert scatter["values"].shape == (1, LATENT_ALIGNED + ROPE_DIM)
+    assert scatter["index"][-1] == slice(None, LATENT_ALIGNED + ROPE_DIM)
 
 
 def test_sparse_mla_reference_uses_slot_sharding_for_cache_gather(monkeypatch):
