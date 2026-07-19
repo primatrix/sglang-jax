@@ -51,7 +51,7 @@ SERVER_LOG="/tmp/tpu_logs/glm52-real-${ATTENTION_BACKEND}-${RUN_ID}-rank${RANK}.
 SERVER_PID=""
 SERVER_PGID=""
 SERVER_LOG_MONITOR_PID=""
-SERVER_PROGRESS_PATTERN='Scanning metadata|Starting parallel weight loading|Scanning Metadata:.*100%|All weights loaded successfully|Absorbed MLA weights|\[(EXTEND|DECODE)\].*PRECOMPILE|Precompile finished|Application startup complete|The server is fired up'
+SERVER_PROGRESS_PATTERN='Scanning metadata|Starting parallel weight loading|Loaded safetensors metadata cache|Scanning Metadata:.*100%|All weights loaded successfully|Absorbed MLA weights|\[(EXTEND|DECODE)\].*PRECOMPILE|Precompile finished|Application startup complete|The server is fired up'
 
 mkdir -p "$CONTROL_PARENT"
 if [[ "$RANK" == "0" ]]; then

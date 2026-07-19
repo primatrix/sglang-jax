@@ -1,13 +1,25 @@
 import json
 import struct
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from sgl_jax.srt.utils import weight_utils
 from sgl_jax.srt.utils.weight_utils import (
+    SAFETENSORS_METADATA_CACHE_BASENAME,
+    WeightLoader,
+    _load_safetensors_metadata_cache,
     _read_sparse_safetensors_entries,
     _scan_safetensors_metadata,
+    _write_safetensors_metadata_cache,
 )
+
+ROOT = Path(__file__).resolve().parents[3]
+METADATA_CACHE_BUILDER = ROOT / "scripts/models/build_safetensors_metadata_cache.py"
 
 
 def _write_safetensors_header(path, tensors):
@@ -66,6 +78,118 @@ def test_scan_safetensors_metadata_preserves_file_order(tmp_path, num_threads):
 
 def test_scan_safetensors_metadata_accepts_empty_file_list():
     assert _scan_safetensors_metadata([], num_threads=4) == {}
+
+
+def test_safetensors_metadata_cache_round_trip(tmp_path):
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    _write_safetensors_header(
+        shard,
+        {
+            "model.weight": {
+                "dtype": "BF16",
+                "shape": [2, 4],
+                "data_offsets": [0, 16],
+            }
+        },
+    )
+    weights_files = [str(shard)]
+    expected = _scan_safetensors_metadata(weights_files, num_threads=1)
+    cache = tmp_path / "sglang_jax.safetensors_metadata.v1.json.gz"
+
+    _write_safetensors_metadata_cache(cache, weights_files, expected)
+
+    assert _load_safetensors_metadata_cache(cache, weights_files) == expected
+
+
+def test_safetensors_metadata_cache_rejects_changed_shard(tmp_path):
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    _write_safetensors_header(
+        shard,
+        {
+            "model.weight": {
+                "dtype": "BF16",
+                "shape": [1],
+                "data_offsets": [0, 2],
+            }
+        },
+    )
+    weights_files = [str(shard)]
+    expected = _scan_safetensors_metadata(weights_files, num_threads=1)
+    cache = tmp_path / "sglang_jax.safetensors_metadata.v1.json.gz"
+    _write_safetensors_metadata_cache(cache, weights_files, expected)
+    shard.write_bytes(shard.read_bytes() + b"changed")
+
+    assert _load_safetensors_metadata_cache(cache, weights_files) is None
+
+
+def test_weight_loader_uses_default_metadata_cache_before_scanning(tmp_path, monkeypatch):
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    _write_safetensors_header(
+        shard,
+        {
+            "model.weight": {
+                "dtype": "BF16",
+                "shape": [2],
+                "data_offsets": [0, 4],
+            }
+        },
+    )
+    weights_files = [str(shard)]
+    expected = _scan_safetensors_metadata(weights_files, num_threads=1)
+    cache = tmp_path / SAFETENSORS_METADATA_CACHE_BASENAME
+    _write_safetensors_metadata_cache(cache, weights_files, expected)
+    loader = WeightLoader.__new__(WeightLoader)
+    loader.model_config = SimpleNamespace(model_path=str(tmp_path))
+    loader._weight_info_cache = None
+
+    monkeypatch.setattr(weight_utils.jax, "process_index", lambda: 0)
+    monkeypatch.setattr(
+        weight_utils.multihost_utils,
+        "broadcast_one_to_all",
+        lambda value, is_source: value,
+    )
+
+    def fail_scan(*args, **kwargs):
+        raise AssertionError("header scanner should not run on a valid cache hit")
+
+    monkeypatch.setattr(weight_utils, "_scan_safetensors_metadata", fail_scan)
+
+    assert loader._scan_weight_info() == expected
+
+
+def test_safetensors_metadata_cache_builder_writes_loadable_sidecar(tmp_path):
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    _write_safetensors_header(
+        shard,
+        {
+            "model.weight": {
+                "dtype": "BF16",
+                "shape": [2],
+                "data_offsets": [0, 4],
+            }
+        },
+    )
+    cache = tmp_path / "metadata.json.gz"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(METADATA_CACHE_BUILDER),
+            "--model-path",
+            str(tmp_path),
+            "--output",
+            str(cache),
+            "--threads",
+            "1",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "shards=1 tensors=1" in result.stdout
+    assert _load_safetensors_metadata_cache(cache, [str(shard)]) is not None
 
 
 def test_read_sparse_safetensors_entries_reads_offsets_concurrently(tmp_path):

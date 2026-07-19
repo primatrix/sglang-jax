@@ -388,6 +388,7 @@ def test_real_runner_streams_rank_zero_startup_progress_to_falcon_stdout():
     assert 'tail -n +1 -F "$SERVER_LOG"' in runner
     assert "tr '\\r' '\\n'" in runner
     assert "Scanning metadata|Starting parallel weight loading" in runner
+    assert "Loaded safetensors metadata cache" in runner
     assert "Precompile finished|Application startup complete" in runner
     assert runner.index("start_server_log_monitor") < runner.index("health_deadline=")
 

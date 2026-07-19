@@ -1,4 +1,6 @@
 import copy
+import contextlib
+import gzip
 import glob
 import json
 import logging
@@ -57,6 +59,9 @@ _SAFETENSORS_DTYPE_TO_JAX: dict[str, jnp.dtype] = {
     "F8_E5M2": jnp.float8_e5m2,
 }
 
+_SAFETENSORS_METADATA_CACHE_VERSION = 1
+SAFETENSORS_METADATA_CACHE_BASENAME = "sglang_jax.safetensors_metadata.v1.json.gz"
+
 
 def _read_safetensors_metadata(st_file: str) -> list[tuple[str, dict[str, Any]]]:
     """Read tensor metadata without mmaping the safetensors data section."""
@@ -107,6 +112,92 @@ def _scan_safetensors_metadata(
         for entries in file_entries:
             for key, info in entries:
                 weight_info.setdefault(key, []).append(info)
+    return weight_info
+
+
+def _safetensors_shard_fingerprint(weights_files: list[str]) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": os.path.basename(path),
+            "size": os.path.getsize(path),
+        }
+        for path in weights_files
+    ]
+
+
+def _write_safetensors_metadata_cache(
+    cache_path: str | os.PathLike[str],
+    weights_files: list[str],
+    weight_info: dict[str, list[dict[str, Any]]],
+) -> None:
+    if not weights_files:
+        raise ValueError("cannot cache safetensors metadata without shard files")
+
+    root = os.path.dirname(os.path.abspath(weights_files[0]))
+    if any(os.path.dirname(os.path.abspath(path)) != root for path in weights_files):
+        raise ValueError("all safetensors shards must share one directory")
+
+    serializable_weight_info = {
+        key: [
+            {
+                **info,
+                "file": os.path.relpath(info["file"], root),
+                "shape": list(info["shape"]),
+            }
+            for info in infos
+        ]
+        for key, infos in weight_info.items()
+    }
+    payload = {
+        "schema_version": _SAFETENSORS_METADATA_CACHE_VERSION,
+        "shards": _safetensors_shard_fingerprint(weights_files),
+        "weight_info": serializable_weight_info,
+    }
+
+    cache_path = os.fspath(cache_path)
+    temp_path = f"{cache_path}.tmp-{os.getpid()}"
+    try:
+        with gzip.open(temp_path, "wt", encoding="utf-8") as fp:
+            json.dump(payload, fp, separators=(",", ":"), sort_keys=True)
+        os.replace(temp_path, cache_path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(temp_path)
+
+
+def _load_safetensors_metadata_cache(
+    cache_path: str | os.PathLike[str],
+    weights_files: list[str],
+) -> dict[str, list[dict[str, Any]]] | None:
+    if not weights_files:
+        return None
+
+    cache_path = os.fspath(cache_path)
+    try:
+        with gzip.open(cache_path, "rt", encoding="utf-8") as fp:
+            payload = json.load(fp)
+        if payload.get("schema_version") != _SAFETENSORS_METADATA_CACHE_VERSION:
+            logger.warning("Ignoring incompatible safetensors metadata cache: %s", cache_path)
+            return None
+        if payload.get("shards") != _safetensors_shard_fingerprint(weights_files):
+            logger.warning("Ignoring stale safetensors metadata cache: %s", cache_path)
+            return None
+
+        root = os.path.dirname(os.path.abspath(weights_files[0]))
+        weight_info = {
+            key: [
+                {
+                    **info,
+                    "file": os.path.join(root, info["file"]),
+                    "shape": tuple(info["shape"]),
+                }
+                for info in infos
+            ]
+            for key, infos in payload["weight_info"].items()
+        }
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        logger.warning("Failed to load safetensors metadata cache %s: %s", cache_path, exc)
+        return None
     return weight_info
 
 
@@ -1119,27 +1210,51 @@ class WeightLoader:
                 raise RuntimeError(f"Cannot find any *.safetensors files in {model_path}")
 
             weights_files.sort()
-            try:
-                metadata_scan_threads = int(
-                    os.getenv("SGLANG_JAX_METADATA_SCAN_THREADS", "8")
+            configured_cache_path = os.getenv("SGLANG_JAX_SAFETENSORS_METADATA_CACHE")
+            metadata_cache_path = configured_cache_path or os.path.join(
+                model_path, SAFETENSORS_METADATA_CACHE_BASENAME
+            )
+            weight_info = None
+            if os.path.isfile(metadata_cache_path):
+                cache_start_time = time.perf_counter()
+                weight_info = _load_safetensors_metadata_cache(
+                    metadata_cache_path, weights_files
                 )
-            except ValueError as exc:
-                raise ValueError(
-                    "SGLANG_JAX_METADATA_SCAN_THREADS must be an integer"
-                ) from exc
-            logger.info(
-                "Scanning metadata for %s model files with %s threads "
-                "(single host only)...",
-                len(weights_files),
-                metadata_scan_threads,
-            )
-            # Read only the 8-byte prefix and JSON header from each shard. Avoid
-            # safe_open here: mmap page faults can download large GCSFuse chunks.
-            weight_info = _scan_safetensors_metadata(
-                weights_files,
-                num_threads=metadata_scan_threads,
-                show_progress=True,
-            )
+                if weight_info is not None:
+                    logger.info(
+                        "Loaded safetensors metadata cache %s in %.1fs. Total keys: %s",
+                        metadata_cache_path,
+                        time.perf_counter() - cache_start_time,
+                        len(weight_info),
+                    )
+            elif configured_cache_path:
+                logger.warning(
+                    "Configured safetensors metadata cache does not exist: %s",
+                    metadata_cache_path,
+                )
+
+            if weight_info is None:
+                try:
+                    metadata_scan_threads = int(
+                        os.getenv("SGLANG_JAX_METADATA_SCAN_THREADS", "8")
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        "SGLANG_JAX_METADATA_SCAN_THREADS must be an integer"
+                    ) from exc
+                logger.info(
+                    "Scanning metadata for %s model files with %s threads "
+                    "(single host only)...",
+                    len(weights_files),
+                    metadata_scan_threads,
+                )
+                # Read only the 8-byte prefix and JSON header from each shard. Avoid
+                # safe_open here: mmap page faults can download large GCSFuse chunks.
+                weight_info = _scan_safetensors_metadata(
+                    weights_files,
+                    num_threads=metadata_scan_threads,
+                    show_progress=True,
+                )
 
             # Serialize the result
             serialized_data = pickle.dumps(weight_info)
