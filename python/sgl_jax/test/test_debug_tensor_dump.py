@@ -155,6 +155,39 @@ def test_debug_dump_callback_writes_array_and_manifest(monkeypatch, tmp_path):
     assert " " not in arrays[0].name
 
 
+def test_debug_dump_masks_padded_token_rows_in_callback(monkeypatch, tmp_path):
+    from sgl_jax.srt.utils.debug_utils import maybe_dump_jax_array
+
+    _enable_dump(monkeypatch, tmp_path)
+    callback_values = []
+
+    def run_callback(callback, value, *extra_values, **_kwargs):
+        callback_values.append(np.asarray(value))
+        callback(np.asarray(value), *(np.asarray(item) for item in extra_values))
+
+    monkeypatch.setattr(jax.debug, "callback", run_callback)
+    forward_batch = SimpleNamespace(
+        input_ids=jnp.array([3, 0], dtype=jnp.int32),
+        positions=jnp.array([0, 0], dtype=jnp.int32),
+        seq_lens=jnp.array([1, 0], dtype=jnp.int32),
+        get_token_valid_mask=lambda num_tokens: jnp.array(
+            [True, False], dtype=jnp.bool_
+        ),
+    )
+
+    maybe_dump_jax_array(
+        jnp.array([[1.0, 2.0], [100.0, 200.0]], dtype=jnp.float32),
+        component="decoder_layer",
+        name="hidden_states_post_mlp",
+        layer_id=3,
+        forward_batch=forward_batch,
+    )
+
+    np.testing.assert_array_equal(
+        callback_values[0], np.array([[1.0, 2.0], [0.0, 0.0]], dtype=np.float32)
+    )
+
+
 def test_debug_dump_forward_occurrence_is_independent_of_callback_order(
     monkeypatch, tmp_path
 ):

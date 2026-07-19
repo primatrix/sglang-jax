@@ -1120,6 +1120,16 @@ class Glm5Model(nnx.Module):
             forward_mode=forward_mode,
             forward_batch=forward_batch,
         )
+        token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
+        if token_valid_mask is not None:
+            maybe_dump_jax_array(
+                token_valid_mask,
+                component="debug_context",
+                name="token_valid_mask",
+                layer_id=None,
+                forward_mode=forward_mode,
+                forward_batch=forward_batch,
+            )
         residual = None
         layers_kv_fused = []
         layers_topk_ids = []

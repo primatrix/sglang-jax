@@ -100,6 +100,23 @@ def _forward_fingerprint(forward_batch):
     return jnp.stack(fingerprint)
 
 
+def _mask_invalid_token_rows(value, forward_batch):
+    if forward_batch is None or getattr(value, "ndim", 0) == 0:
+        return value
+    get_token_valid_mask = getattr(forward_batch, "get_token_valid_mask", None)
+    if not callable(get_token_valid_mask):
+        return value
+    token_valid_mask = get_token_valid_mask(value.shape[0])
+    if token_valid_mask is None or token_valid_mask.shape != (value.shape[0],):
+        return value
+    broadcast_shape = (value.shape[0],) + (1,) * (value.ndim - 1)
+    return jnp.where(
+        token_valid_mask.reshape(broadcast_shape),
+        value,
+        jnp.zeros((), dtype=value.dtype),
+    )
+
+
 def _write_debug_dump(host_value, host_occurrence=None, *, dump_dir, metadata, enabled=True):
     if not enabled:
         return
@@ -221,10 +238,11 @@ def maybe_dump_jax_array(
         enabled=write_on_process,
     )
     forward_fingerprint = _forward_fingerprint(forward_batch)
+    dump_value = _mask_invalid_token_rows(value, forward_batch)
     if forward_fingerprint is None:
-        jax.debug.callback(callback, value)
+        jax.debug.callback(callback, dump_value)
     else:
-        jax.debug.callback(callback, value, forward_fingerprint)
+        jax.debug.callback(callback, dump_value, forward_fingerprint)
     return value
 
 
