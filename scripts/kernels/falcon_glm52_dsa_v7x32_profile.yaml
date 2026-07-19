@@ -1,4 +1,4 @@
-name: glm52-dsa-v7x32-mla-cache-single-scatter-20260720-v1
+name: glm52-dsa-v7x32-mla-cache-single-scatter-20260720-v2
 exp_type: PROFILING
 artifact_type: trace
 cluster_name: tpu-training-antgroup
@@ -13,7 +13,7 @@ tags:
   - decode
   - v7x-32
   - mla-cache-single-scatter
-config: '{"source_rev":"6630ebb457b8bd2937ef8c13730987749c20a02d","workload":"real-weight GLM-5.2 DSA 3072 input / 8 output","profile_steps_per_stage":4,"host_tracer_level":2,"python_tracer_level":1,"scope":"non-Pallas MLA cache single-scatter candidate"}'
+config: '{"source_rev":"0324d5a0bf98944417d0a563fced8bf02a704db7","workload":"real-weight GLM-5.2 DSA 3072 input / 8 output","profile_steps_per_stage":4,"host_tracer_level":2,"python_tracer_level":1,"scope":"non-Pallas MLA cache single-scatter candidate with explicit padding sharding"}'
 role_to_task_spec:
   worker:
     replica: 4
@@ -39,9 +39,9 @@ role_to_task_spec:
       ulimit -c 0
 
       ROOT=/tmp/glm52-dsa-v7x32/sglang-jax
-      SOURCE_REV=6630ebb457b8bd2937ef8c13730987749c20a02d
-      SOURCE=/models/codex-sources/sglang-jax-glm52-dsa-6630ebb457.tar.gz
-      SOURCE_SHA256=eb5100f491cb1d22a85a08061db8f0464bf9706bb9016cab4b77b5198d28109c
+      SOURCE_REV=0324d5a0bf98944417d0a563fced8bf02a704db7
+      SOURCE=/models/codex-sources/sglang-jax-glm52-dsa-0324d5a0b.tar.gz
+      SOURCE_SHA256=4bc479b874183445b8cbbe5cfed2f7a04b11b4c6987d1a66cbda3de60d0cba75
       mkdir -p /tmp/tpu_logs/tmp /tmp/tpu_logs/pip-cache /tmp/tpu_logs/uv-cache /tmp/tpu_logs/jax-cache
       rm -rf "$ROOT"
       mkdir -p "$ROOT"
@@ -51,7 +51,7 @@ role_to_task_spec:
 
       export GLM52_DSA_ROOT="$ROOT"
       export GLM52_DSA_PYBIN=/opt/venv/bin/python3
-      export GLM52_DSA_RUN_ID=glm52-dsa-mla-cache-single-scatter-20260720-001
+      export GLM52_DSA_RUN_ID=glm52-dsa-mla-cache-single-scatter-20260720-002
       export GLM52_DSA_SOURCE_REV="$SOURCE_REV"
       export GLM52_ATTENTION_BACKEND=dsa
       export GLM52_MOE_BACKEND=fused
