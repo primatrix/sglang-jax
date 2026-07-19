@@ -94,6 +94,7 @@ def write_mla_kv_cache(
             jnp.zeros(
                 (new_c_kv.shape[0], latent_aligned - latent_dim),
                 dtype=cache.dtype,
+                out_sharding=jax.typeof(new_c_kv).sharding,
             ),
             new_k_pe.astype(cache.dtype),
         ),

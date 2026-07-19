@@ -111,6 +111,13 @@ def test_write_mla_kv_cache_packs_latent_and_rope_into_one_sharded_scatter(monke
 
     expected_sharding = object()
     captured = []
+    zeros_kwargs = []
+    original_zeros = jnp.zeros
+
+    def tracked_zeros(*args, **kwargs):
+        zeros_kwargs.append(kwargs)
+        local_kwargs = {key: value for key, value in kwargs.items() if key != "out_sharding"}
+        return original_zeros(*args, **local_kwargs)
 
     class FakeAt:
         def __init__(self, cache):
@@ -134,6 +141,7 @@ def test_write_mla_kv_cache_packs_latent_and_rope_into_one_sharded_scatter(monke
             self.at = FakeAt(self)
 
     monkeypatch.setattr(jax, "typeof", lambda _array: SimpleNamespace(sharding=expected_sharding))
+    monkeypatch.setattr(jnp, "zeros", tracked_zeros)
     result = write_mla_kv_cache(
         FakeCache(),
         new_c_kv=jnp.ones((1, LATENT_DIM), dtype=jnp.bfloat16),
@@ -150,6 +158,7 @@ def test_write_mla_kv_cache_packs_latent_and_rope_into_one_sharded_scatter(monke
     assert scatter["kwargs"]["out_sharding"] is expected_sharding
     assert scatter["values"].shape == (1, LATENT_ALIGNED + ROPE_DIM)
     assert scatter["index"][-1] == slice(None, LATENT_ALIGNED + ROPE_DIM)
+    assert zeros_kwargs == [{"dtype": jnp.bfloat16, "out_sharding": expected_sharding}]
 
 
 def test_sparse_mla_reference_uses_slot_sharding_for_cache_gather(monkeypatch):
