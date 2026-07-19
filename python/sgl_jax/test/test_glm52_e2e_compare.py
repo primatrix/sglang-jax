@@ -276,7 +276,10 @@ def test_real_runner_supports_smoke_and_boundary_request_profiles():
 
     assert 'REQUEST_PROFILE="${GLM52_DSA_REQUEST_PROFILE:-smoke}"' in runner
     assert 'MAX_NEW_TOKENS="${GLM52_DSA_MAX_NEW_TOKENS:-2}"' in runner
-    assert 'if [[ "$REQUEST_PROFILE" != "smoke" && "$REQUEST_PROFILE" != "boundary" ]]' in runner
+    assert (
+        'if [[ "$REQUEST_PROFILE" != "smoke" && "$REQUEST_PROFILE" != "boundary" '
+        '&& "$REQUEST_PROFILE" != "boundary_single" ]]' in runner
+    )
     for length in (2047, 2048, 2049, 3072):
         assert f'"boundary_{length}"' in runner
     assert '"ignore_eos": True' in runner
@@ -301,6 +304,11 @@ def test_real_runner_supports_smoke_and_boundary_request_profiles():
                 "boundary_2049": [2049],
                 "boundary_3072": [3072],
             },
+        ),
+        (
+            "boundary_single",
+            1,
+            {"boundary_3072": [3072]},
         ),
     ],
 )
