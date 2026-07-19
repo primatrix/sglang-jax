@@ -1120,7 +1120,12 @@ class Glm5Model(nnx.Module):
             forward_mode=forward_mode,
             forward_batch=forward_batch,
         )
-        token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
+        get_token_valid_mask = getattr(forward_batch, "get_token_valid_mask", None)
+        token_valid_mask = (
+            get_token_valid_mask(hidden_states.shape[0])
+            if callable(get_token_valid_mask)
+            else None
+        )
         if token_valid_mask is not None:
             maybe_dump_jax_array(
                 token_valid_mask,
