@@ -2,7 +2,7 @@
 
 ## 结论
 
-截至 `develop/glm52-dsa-falcon` 的 `a974bdbb4`，GLM-5.2 DSA 已在 Falcon
+截至 `develop/glm52-dsa-falcon` 的 `09a901413`，GLM-5.2 DSA 已在 Falcon
 v7x-32 上完成 correctness-first 的真实权重 E2E 闭环：TP32 / DP1 / EP32、fused
 MoE、chunked prefill、ragged batch、真实 Top-K 截断和 decode 都可以运行并返回稳定结果。
 
@@ -125,26 +125,74 @@ sidecar 消除了约 22 分钟 metadata header scan；剩余启动时间主要�
 99.9844s
 ```
 
-两次 `cache_miss_count=1`，结果完全一致，没有只发生在首轮的额外编译迹象。但现有数据
-只有请求 wall time，尚未拆分以下组成：
+两次 `cache_miss_count=1`，结果完全一致，没有只发生在首轮的额外编译迹象。下面的
+Falcon profile 已进一步确认，`~100s` 不是隐式 JIT，而是 3072-token 请求被拆成 24 个
+128-token prefill chunk 后的真实执行时间；后半段 chunk 随可见上下文增长到约 6s。
 
-- prefill 各 chunk 的 device execution 和 host gap；
-- decode 单步 device execution 和 host scheduler/sampling/result-processing gap；
-- tokenizer、HTTP、IPC、batch construction、KV/cache bookkeeping 等 CPU overhead；
-- DSA attention 之外的 MoE、dense layer、collective 和 sampling 占比。
+### Falcon prefill/decode profile
 
-因此 `~100s` 只能作为 profiling 前的 E2E 基线，不能直接归因于 DSA kernel。
+基线 profile 使用 source `65b35076d53d4d0dc50432b17e3789e817361f74`，Falcon
+`exp-7yo6j8fajf` / artifact `art-k06il4ul4q`，真实 checkpoint、TP32 / DP1 / EP32、
+fused MoE、3072 input / 8 output。正确性和 response schema gate 全部通过。
+
+server-ready 仍是 fresh-node 路径：权重加载约 `26m52s`，absorb 约 `38s`，EXTEND
+precompile 约 `600s`，DECODE precompile 约 `291s`，总计 `2579s`。server-ready 后没有
+新的 compile/cache-miss 日志。
+
+rank-0 的阶段 trace 和 XProf 汇总如下。XProf category 是 local-device HLO self-time
+aggregate，不能直接相加成 request wall；trace span/model envelope 才是 rank-0 wall
+近似。
+
+| 指标 | Prefill capture | Decode capture |
+| --- | ---: | ---: |
+| rank-0 trace span | 1127.888ms | 6059.490ms |
+| `jit_jitted_run_model` | 604.401ms | 5886.527ms |
+| XProf HLO self-time aggregate | 22432.095ms | 55143.598ms |
+| custom kernel | 67.7% | 89.3% |
+| elementwise | 17.6% | 6.0% |
+| custom fusion | 10.9% | 2.1% |
+| async | 2.8% | 2.0% |
+
+decode 的 top operators 全是 `dsa-decode-mla.*`；因此 decode 已明确是 DSA Pallas
+kernel 主导，而不是 Python/HTTP 主导。prefill 的非 Pallas device work 主要来自 DSA
+selection/cache bookkeeping、fused MoE 和 collectives。
+
+host trace 中，prefill/decode 的 `device_get` 分别为 `601.1ms / 5884.8ms`，与 device
+model envelope 对齐，含义是 host 在等待 TPU 完成，不是等量的 CPU 计算。可见的
+`copy_to_host_async` 仅 `0.05ms / 0.06ms`。decode 的 `run_batch=82.3ms` 和
+`sample=78.7ms` 又包含约 `75.7ms` 的 profiler start；排除 profiler 控制后，没有发现
+单步 `>=100ms` 的可避免 host/Python gap。
+
+本次 profiled request wall 为 `167.518s`，比未 profile 的同 shape warmup
+`102.616s` 慢 `64.902s`。server log 显示 prefill/decode 各有一次同步 trace flush，
+分别暂停约 `31s / 33s`；profile finalize 在 request 返回后仅 `0.337s`。因此
+`167.518s` 是诊断开销，不能用作 production E2E 基线。warmup 与此前两次约 100s 的
+结果一致。
+
+### 首个 non-Pallas 优化候选
+
+按 rank-0 TPU:0 的 source 聚合，`write_mla_kv_cache` 在每层对同一 physical slot
+连续执行两次 scatter：`reference.py:87` 写 latent，`reference.py:97` 写 RoPE。prefill
+capture 中两组 scatter 分别为 `47.634ms / 45.456ms`，合计 `93.090ms`，占
+`jit_jitted_run_model` 的 `15.4%`；decode 中合计 `127.852ms`，只占 `2.2%`。
+
+两段目标区间不重叠，且都从同一 token/update 输入构造。把它们打包成一次连续 scatter
+不改变 physical slot、有效位、latent/RoPE 数值或 Pallas attention kernel，是当前最大且
+可单独测试的 non-Pallas prefill 候选。理论上只可能消除其中一次 scatter 的固定/循环
+开销，不能把 `15.4%` 全部当成预期收益；最终只接受同 shape Falcon 复测中超出噪声的
+实际改善。
 
 ## Profiling 阶段的范围
 
-下一阶段先不优化 DSA Pallas kernel，而是：
+下一阶段仍不优化 DSA Pallas kernel，而是：
 
 1. 在完全预热、相同 shape 的请求上分别采集 prefill/decode JAX device trace。
 2. 同时开启 host tracer 和受控 Python tracing，拆分 scheduler、batch preparation、
    dispatch/wait、sampling、result handling 与 HTTP/tokenizer 开销。
-3. 将 request wall time、server batch step 和 device trace 对齐，先量化 device busy 与
-   host gap，再选择最大的非 DSA-kernel 瓶颈。
-4. 每次只修改一个已被 trace 证明的瓶颈，保持 correctness gates 不变，复测相同工作负载。
+3. 将 request wall time、server batch step 和 device trace 对齐；当前已确认 host gap
+   很小，decode 由 DSA Pallas 主导。
+4. 首先合并 MLA cache 的两次连续 scatter，保持 correctness gates 不变，并复测相同
+   3072/8 工作负载。
 
 首轮优化不包含 DSA gather/DMA/计算布局；kernel 优化留到 non-kernel overhead 已可解释、
 E2E 测量稳定之后。
@@ -156,3 +204,8 @@ E2E 测量稳定之后。
 - CPU/Torch 与 Pallas matrix：Falcon `exp-6dqnqemqcd`。
 - fresh-node sidecar + precompile：Falcon `exp-zeb34sbqwj`，artifact `art-9v9fkmhhvg`。
 - sidecar 构建/完整性校验：Falcon `exp-9h2a7czdt2`，artifact `art-8bnaxyq6q2`。
+- non-kernel profile：Falcon `exp-7yo6j8fajf`，artifact `art-k06il4ul4q`，source
+  `65b35076d53d4d0dc50432b17e3789e817361f74`。
+- prefill/decode XProf：`an-wbmml9rf8u` / `an-qxbsln3gxe`。
+- host/Python trace：`an-wa47uzjlnm`；profile wall-gap：`an-tiifhhulg7`；non-DSA
+  device source breakdown：`an-0emu7qinah`。
