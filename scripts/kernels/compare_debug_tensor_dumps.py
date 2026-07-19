@@ -52,6 +52,32 @@ def _key_sort_value(key: tuple[Any, ...]) -> tuple[Any, ...]:
     )
 
 
+def _forward_key(key: tuple[Any, ...]) -> tuple[Any, ...]:
+    return key[2], key[4], key[5]
+
+
+def _filter_complete_forwards(
+    rows: dict[tuple[Any, ...], dict[str, Any]], marker: tuple[str, str]
+) -> tuple[dict[tuple[Any, ...], dict[str, Any]], dict[str, int]]:
+    component, name = marker
+    all_forwards = {_forward_key(key) for key in rows}
+    completed_forwards = {
+        _forward_key(key)
+        for key in rows
+        if key[0] == component and key[3] == name
+    }
+    filtered = {
+        key: record
+        for key, record in rows.items()
+        if _forward_key(key) in completed_forwards
+    }
+    return filtered, {
+        "completed_forward_count": len(completed_forwards),
+        "dropped_incomplete_forward_count": len(all_forwards - completed_forwards),
+        "dropped_tensor_count": len(rows) - len(filtered),
+    }
+
+
 def _validate_key(row: dict[str, Any]) -> tuple[Any, ...]:
     missing = [field for field in KEY_FIELDS if field not in row]
     if missing:
@@ -408,6 +434,7 @@ def compare_dump_directories(
     max_p99_abs: float | None = None,
     min_cosine: float | None = None,
     min_topk_overlap: float | None = None,
+    complete_forward_marker: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     """Return a deterministic, JSON-compatible tensor comparison report."""
     candidate_rows, candidate_errors, candidate_duplicates = _read_manifests(
@@ -416,6 +443,18 @@ def compare_dump_directories(
     baseline_rows, baseline_errors, baseline_duplicates = _read_manifests(
         Path(baseline_dir), "baseline"
     )
+    candidate_completion = baseline_completion = {
+        "completed_forward_count": None,
+        "dropped_incomplete_forward_count": 0,
+        "dropped_tensor_count": 0,
+    }
+    if complete_forward_marker is not None:
+        candidate_rows, candidate_completion = _filter_complete_forwards(
+            candidate_rows, complete_forward_marker
+        )
+        baseline_rows, baseline_completion = _filter_complete_forwards(
+            baseline_rows, complete_forward_marker
+        )
     candidate_keys = set(candidate_rows)
     baseline_keys = set(baseline_rows)
     missing_candidate_keys = sorted(
@@ -517,6 +556,32 @@ def compare_dump_directories(
         "tensor_count": len(common_keys),
         "candidate_tensor_count": len(candidate_rows),
         "baseline_tensor_count": len(baseline_rows),
+        "complete_forward_marker": (
+            {
+                "component": complete_forward_marker[0],
+                "name": complete_forward_marker[1],
+            }
+            if complete_forward_marker is not None
+            else None
+        ),
+        "candidate_completed_forward_count": candidate_completion[
+            "completed_forward_count"
+        ],
+        "baseline_completed_forward_count": baseline_completion[
+            "completed_forward_count"
+        ],
+        "candidate_dropped_incomplete_forward_count": candidate_completion[
+            "dropped_incomplete_forward_count"
+        ],
+        "baseline_dropped_incomplete_forward_count": baseline_completion[
+            "dropped_incomplete_forward_count"
+        ],
+        "candidate_dropped_tensor_count": candidate_completion[
+            "dropped_tensor_count"
+        ],
+        "baseline_dropped_tensor_count": baseline_completion[
+            "dropped_tensor_count"
+        ],
         "manifest_errors": manifest_errors,
         "missing_from_candidate": [
             _key_dict(key) for key in missing_candidate_keys
@@ -552,6 +617,13 @@ def _unit_float(value: str) -> float:
     return parsed
 
 
+def _component_name(value: str) -> tuple[str, str]:
+    parts = value.split(":", 1)
+    if len(parts) != 2 or not all(parts):
+        raise argparse.ArgumentTypeError("must be COMPONENT:NAME")
+    return parts[0], parts[1]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Compare JAX debug tensor manifests by semantic key."
@@ -576,6 +648,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--min-cosine", type=_unit_float)
     parser.add_argument("--min-topk-overlap", type=_unit_float)
+    parser.add_argument(
+        "--complete-forward-marker",
+        type=_component_name,
+        help=(
+            "Compare only forwards containing COMPONENT:NAME; useful for dropping "
+            "partially executed callbacks from cancelled scheduler work."
+        ),
+    )
     args = parser.parse_args(argv)
 
     report = compare_dump_directories(
@@ -586,6 +666,7 @@ def main(argv: list[str] | None = None) -> int:
         max_p99_abs=args.max_p99_abs,
         min_cosine=args.min_cosine,
         min_topk_overlap=args.min_topk_overlap,
+        complete_forward_marker=args.complete_forward_marker,
     )
     rendered = json.dumps(report, indent=2, sort_keys=True, allow_nan=False)
     if args.output is not None:

@@ -161,6 +161,63 @@ def test_compare_aligns_semantic_keys_and_reports_raw_metrics(tmp_path):
     json.dumps(report, sort_keys=True, allow_nan=False)
 
 
+def test_compare_can_drop_cancelled_forwards_without_terminal_marker(tmp_path):
+    compare = _load_compare_module()
+    candidate = tmp_path / "candidate"
+    baseline = tmp_path / "baseline"
+    complete_hidden = _row("candidate-complete-hidden.npy", occurrence=10)
+    complete_logits = _row(
+        "candidate-complete-logits.npy",
+        component="logits",
+        layer=None,
+        name="next_token_logits",
+        occurrence=10,
+    )
+    candidate_partial = _row("candidate-partial.npy", layer=2, occurrence=20)
+    baseline_partial = _row("baseline-partial.npy", layer=7, occurrence=30)
+    _write_dump(
+        candidate,
+        [
+            (complete_hidden, np.array([1.0], dtype=np.float32)),
+            (complete_logits, np.array([2.0], dtype=np.float32)),
+            (candidate_partial, np.array([3.0], dtype=np.float32)),
+        ],
+    )
+    _write_dump(
+        baseline,
+        [
+            (
+                {**complete_hidden, "filename": "baseline-complete-hidden.npy"},
+                np.array([1.0], dtype=np.float32),
+            ),
+            (
+                {**complete_logits, "filename": "baseline-complete-logits.npy"},
+                np.array([2.0], dtype=np.float32),
+            ),
+            (baseline_partial, np.array([4.0], dtype=np.float32)),
+        ],
+    )
+
+    report = compare.compare_dump_directories(
+        candidate,
+        baseline,
+        complete_forward_marker=("logits", "next_token_logits"),
+    )
+
+    assert report["passed"] is True
+    assert report["tensor_count"] == 2
+    assert report["complete_forward_marker"] == {
+        "component": "logits",
+        "name": "next_token_logits",
+    }
+    assert report["candidate_completed_forward_count"] == 1
+    assert report["baseline_completed_forward_count"] == 1
+    assert report["candidate_dropped_incomplete_forward_count"] == 1
+    assert report["baseline_dropped_incomplete_forward_count"] == 1
+    assert report["candidate_dropped_tensor_count"] == 1
+    assert report["baseline_dropped_tensor_count"] == 1
+
+
 @pytest.mark.parametrize(
     ("candidate_ids", "baseline_ids", "candidate_count", "baseline_count", "expected"),
     [
