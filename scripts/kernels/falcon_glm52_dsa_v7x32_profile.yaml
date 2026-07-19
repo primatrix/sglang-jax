@@ -1,0 +1,83 @@
+name: glm52-dsa-v7x32-nonkernel-profile-20260720-v1
+exp_type: PROFILING
+artifact_type: trace
+cluster_name: tpu-training-antgroup
+profile: true
+tags:
+  - profile
+  - sglang-jax
+  - glm-5.2
+  - dsa
+  - serving
+  - prefill
+  - decode
+  - v7x-32
+config: '{"source_rev":"65b35076d53d4d0dc50432b17e3789e817361f74","workload":"real-weight GLM-5.2 DSA 3072 input / 8 output","profile_steps_per_stage":4,"host_tracer_level":2,"python_tracer_level":1,"scope":"non-DSA-kernel baseline"}'
+role_to_task_spec:
+  worker:
+    replica: 4
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x4
+    supply_mode: reservation
+    envs:
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /tmp/tpu_logs/tmp
+      PIP_CACHE_DIR: /tmp/tpu_logs/pip-cache
+      UV_CACHE_DIR: /tmp/tpu_logs/uv-cache
+      JAX_COMPILATION_CACHE_DIR: /tmp/tpu_logs/jax-cache
+      JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES: "0"
+      JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "0"
+      LIBTPU_INIT_ARGS: --xla_tpu_dvfs_p_state=7
+      SGLANG_JAX_METADATA_SCAN_THREADS: "32"
+      SGLANG_MOE_RANGE_LOAD_WORKERS: "32"
+    command: |
+      bash <<'BASH'
+      set -euxo pipefail
+      ulimit -c 0
+
+      ROOT=/tmp/glm52-dsa-v7x32/sglang-jax
+      SOURCE_REV=65b35076d53d4d0dc50432b17e3789e817361f74
+      mkdir -p /tmp/tpu_logs/tmp /tmp/tpu_logs/pip-cache /tmp/tpu_logs/uv-cache /tmp/tpu_logs/jax-cache
+      rm -rf "$ROOT"
+      git clone -q --depth 1 --branch develop/glm52-dsa-falcon \
+        https://github.com/cjx0709/sglang-jax.git "$ROOT"
+      cd "$ROOT"
+      test "$(git rev-parse HEAD)" = "$SOURCE_REV"
+      /opt/venv/bin/python3 -m pip install --disable-pip-version-check -e "$ROOT/python"
+
+      export GLM52_DSA_ROOT="$ROOT"
+      export GLM52_DSA_PYBIN=/opt/venv/bin/python3
+      export GLM52_DSA_RUN_ID=glm52-dsa-nonkernel-profile-20260720-001
+      export GLM52_DSA_SOURCE_REV="$SOURCE_REV"
+      export GLM52_ATTENTION_BACKEND=dsa
+      export GLM52_MOE_BACKEND=fused
+      export GLM52_DSA_REQUEST_PROFILE=profile
+      export GLM52_DSA_MAX_NEW_TOKENS=8
+      export GLM52_DSA_PROFILE_STEPS=4
+      export GLM52_DSA_PROFILE_HOST_TRACER_LEVEL=2
+      export GLM52_DSA_PROFILE_PYTHON_TRACER_LEVEL=1
+      export GLM52_DSA_PROFILE_TIMEOUT_SECONDS=1800
+      export GLM52_DSA_GENERATE_TIMEOUT_SECONDS=3600
+      export GLM52_DSA_HEALTH_TIMEOUT_SECONDS=10800
+      export SGLANG_JAX_SKIP_GCSFUSE_WARMUP=1
+      exec bash "$ROOT/scripts/kernels/run_glm52_dsa_v7x32_real_e2e.sh"
+      BASH
+    mounts:
+      - name: model-storage
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        mount_path: /models
+        read_only: true
+        mount_options:
+          - implicit-dirs
+          - metadata-cache:ttl-secs:-1
+          - metadata-cache:stat-cache-max-size-mb:512
+          - metadata-cache:type-cache-max-size-mb:64
+          - file-cache:max-size-mb:10240
+          - file-cache:cache-file-for-range-read:false
+          - file-system:kernel-list-cache-ttl-secs:-1
+          - file-cache:enable-parallel-downloads:true
+          - file-cache:parallel-downloads-per-file:32
+          - read_ahead_kb=1024
