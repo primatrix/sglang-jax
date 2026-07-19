@@ -371,3 +371,14 @@ def test_real_runner_rendezvous_waits_for_every_rank_before_server_launch():
     assert ready_index < all_ready_index < launch_index
     assert wait_index < launch_index
     assert 'if has_failures; then' in runner[ready_index:launch_index]
+
+
+def test_real_runner_can_bound_debug_batch_size_and_skip_precompile():
+    runner = RUNNER_PATH.read_text(encoding="utf-8")
+
+    assert 'MAX_RUNNING_REQUESTS="${GLM52_DSA_MAX_RUNNING_REQUESTS:-64}"' in runner
+    assert 'DISABLE_PRECOMPILE="${GLM52_DSA_DISABLE_PRECOMPILE:-0}"' in runner
+    assert '--max-running-requests "$MAX_RUNNING_REQUESTS"' in runner
+    assert 'if [[ "$DISABLE_PRECOMPILE" == "1" ]]; then' in runner
+    assert 'SERVER_ARGS+=(--disable-precompile)' in runner
+    assert 'if [[ "$DISABLE_PRECOMPILE" != "0" && "$DISABLE_PRECOMPILE" != "1" ]]' in runner

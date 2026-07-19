@@ -15,6 +15,8 @@ COMPLETE_MARKER="${MODEL_PATH}/_DOWNLOAD_COMPLETE"
 ATTENTION_BACKEND="${GLM52_ATTENTION_BACKEND:-dsa}"
 REQUEST_PROFILE="${GLM52_DSA_REQUEST_PROFILE:-smoke}"
 MAX_NEW_TOKENS="${GLM52_DSA_MAX_NEW_TOKENS:-2}"
+MAX_RUNNING_REQUESTS="${GLM52_DSA_MAX_RUNNING_REQUESTS:-64}"
+DISABLE_PRECOMPILE="${GLM52_DSA_DISABLE_PRECOMPILE:-0}"
 START_TIMEOUT_SECONDS="${GLM52_DSA_START_TIMEOUT_SECONDS:-300}"
 HEALTH_TIMEOUT_SECONDS="${GLM52_DSA_HEALTH_TIMEOUT_SECONDS:-10800}"
 GENERATE_TIMEOUT_SECONDS="${GLM52_DSA_GENERATE_TIMEOUT_SECONDS:-1200}"
@@ -134,6 +136,14 @@ if [[ ! "$MAX_NEW_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
   echo "GLM52_DSA_MAX_NEW_TOKENS must be a positive integer, got: ${MAX_NEW_TOKENS}" >&2
   exit 2
 fi
+if [[ ! "$MAX_RUNNING_REQUESTS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "GLM52_DSA_MAX_RUNNING_REQUESTS must be a positive integer, got: ${MAX_RUNNING_REQUESTS}" >&2
+  exit 2
+fi
+if [[ "$DISABLE_PRECOMPILE" != "0" && "$DISABLE_PRECOMPILE" != "1" ]]; then
+  echo "GLM52_DSA_DISABLE_PRECOMPILE must be 0 or 1, got: ${DISABLE_PRECOMPILE}" >&2
+  exit 2
+fi
 if [[ ! -f "$COMPLETE_MARKER" ]]; then
   echo "checkpoint completion marker is missing: ${COMPLETE_MARKER}" >&2
   exit 2
@@ -190,6 +200,8 @@ export PYTHONPATH="$ROOT/python${PYTHONPATH:+:$PYTHONPATH}"
   echo "attention_backend=$ATTENTION_BACKEND"
   echo "request_profile=$REQUEST_PROFILE"
   echo "max_new_tokens=$MAX_NEW_TOKENS"
+  echo "max_running_requests=$MAX_RUNNING_REQUESTS"
+  echo "disable_precompile=$DISABLE_PRECOMPILE"
   echo "debug_dump=${SGLANG_JAX_DEBUG_DUMP:-0}"
   echo "debug_dump_dir=${SGLANG_JAX_DEBUG_DUMP_DIR:-disabled}"
   echo "skip_gcsfuse_warmup=$SGLANG_JAX_SKIP_GCSFUSE_WARMUP"
@@ -254,7 +266,7 @@ SERVER_ARGS=(
   --chunked-prefill-size 128
   --max-prefill-tokens 256
   --max-total-tokens 4096
-  --max-running-requests 64
+  --max-running-requests "$MAX_RUNNING_REQUESTS"
   --mem-fraction-static 0.95
   --disable-radix-cache
   --skip-server-warmup
@@ -263,6 +275,10 @@ SERVER_ARGS=(
   --precompile-bs-paddings 1 2
   --precompile-token-paddings 128 256
 )
+
+if [[ "$DISABLE_PRECOMPILE" == "1" ]]; then
+  SERVER_ARGS+=(--disable-precompile)
+fi
 
 {
   printf 'SERVER_COMMAND='
