@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import MagicMock
 
+import numpy as np
+
 from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.utils.common_utils import align_bs_for_fused_ep, pad_to_bucket
@@ -36,6 +38,8 @@ def _make_server_args(**overrides):
     args = MagicMock()
     args.precompile_token_paddings = None
     args.precompile_bs_paddings = None
+    args.precompile_dsa_context_paddings = None
+    args.attention_backend = "fa"
     args.moe_backend = "none"
     args.enable_static_lora = False
     args.multimodal = False
@@ -45,6 +49,40 @@ def _make_server_args(**overrides):
 
 
 class TestBucketComputation(unittest.TestCase):
+    def test_dsa_context_buckets_cover_max_request_length(self):
+        cm = CompilationManager(
+            server_args=_make_server_args(
+                precompile_dsa_context_paddings=[256, 1024, 2048],
+                attention_backend="dsa",
+            ),
+            max_padded_batch_size=64,
+            max_padded_num_tokens=256,
+            dp_size=1,
+            tp_size=32,
+            page_size=128,
+            max_req_len=4095,
+            vocab_size=32000,
+            moe_backend="fused",
+        )
+        assert cm.dsa_context_buckets == [256, 1024, 2048, 4096]
+
+    def test_non_dsa_backend_ignores_dsa_context_buckets(self):
+        cm = CompilationManager(
+            server_args=_make_server_args(
+                precompile_dsa_context_paddings=[512, 2048],
+                attention_backend="fa",
+            ),
+            max_padded_batch_size=64,
+            max_padded_num_tokens=256,
+            dp_size=1,
+            tp_size=32,
+            page_size=128,
+            max_req_len=4095,
+            vocab_size=32000,
+            moe_backend="fused",
+        )
+        assert cm.dsa_context_buckets == []
+
     def test_token_buckets_default(self):
         cm = CompilationManager(
             server_args=_make_server_args(),
@@ -256,6 +294,41 @@ class TestDummyBatch(unittest.TestCase):
         assert batch.extend_seq_lens is None
         assert batch.extend_prefix_lens is None
         assert batch.logits_indices is None
+
+    def test_decode_batch_can_target_a_dsa_context_bucket(self):
+        bs = 64
+        cache_loc_size = bs * 4096
+        batch = self.cm._make_dummy_batch(
+            bs,
+            bs,
+            ForwardMode.DECODE,
+            cache_loc_size,
+            dsa_context_len=2048,
+        )
+        assert batch.real_bs == 1
+        assert batch.real_input_ids_len == 1
+        np.testing.assert_array_equal(batch.seq_lens[:2], [2048, 0])
+        np.testing.assert_array_equal(batch.positions[:2], [2047, 0])
+        np.testing.assert_array_equal(batch.out_cache_loc[:2], [2048, -1])
+        np.testing.assert_array_equal(batch.cache_loc[:2048], np.arange(1, 2049))
+
+    def test_extend_batch_can_target_a_dsa_context_bucket(self):
+        bs, num_tokens = 64, 128
+        batch = self.cm._make_dummy_batch(
+            bs,
+            num_tokens,
+            ForwardMode.EXTEND,
+            bs * 4096,
+            dsa_context_len=1024,
+        )
+        assert batch.real_bs == 1
+        assert batch.real_input_ids_len == num_tokens
+        np.testing.assert_array_equal(batch.seq_lens[:2], [1024, 0])
+        np.testing.assert_array_equal(batch.extend_seq_lens[:2], [128, 0])
+        np.testing.assert_array_equal(batch.extend_prefix_lens[:2], [896, 0])
+        np.testing.assert_array_equal(batch.positions[:128], np.arange(896, 1024))
+        np.testing.assert_array_equal(batch.out_cache_loc[:128], np.arange(897, 1025))
+        assert batch.logits_indices[0] == 127
 
     def test_dp_metadata(self):
         cm = CompilationManager(

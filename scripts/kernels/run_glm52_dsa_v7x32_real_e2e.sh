@@ -132,8 +132,8 @@ if [[ "$MOE_BACKEND" != "fused" && "$MOE_BACKEND" != "epmoe" ]]; then
   echo "GLM52_MOE_BACKEND must be fused or epmoe, got: ${MOE_BACKEND}" >&2
   exit 2
 fi
-if [[ "$REQUEST_PROFILE" != "smoke" && "$REQUEST_PROFILE" != "boundary" && "$REQUEST_PROFILE" != "boundary_single" ]]; then
-  echo "GLM52_DSA_REQUEST_PROFILE must be smoke, boundary, or boundary_single; got: ${REQUEST_PROFILE}" >&2
+if [[ "$REQUEST_PROFILE" != "smoke" && "$REQUEST_PROFILE" != "boundary" && "$REQUEST_PROFILE" != "boundary_single" && "$REQUEST_PROFILE" != "precompile_repeat" ]]; then
+  echo "GLM52_DSA_REQUEST_PROFILE must be smoke, boundary, boundary_single, or precompile_repeat; got: ${REQUEST_PROFILE}" >&2
   exit 2
 fi
 if [[ ! "$MAX_NEW_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
@@ -203,6 +203,7 @@ export PYTHONPATH="$ROOT/python${PYTHONPATH:+:$PYTHONPATH}"
   echo "max_new_tokens=$MAX_NEW_TOKENS"
   echo "max_running_requests=64"
   echo "disable_precompile=$DISABLE_PRECOMPILE"
+  echo "dsa_context_paddings=512,1024,2048,4096"
   echo "debug_dump=${SGLANG_JAX_DEBUG_DUMP:-0}"
   echo "debug_dump_dir=${SGLANG_JAX_DEBUG_DUMP_DIR:-disabled}"
   echo "skip_gcsfuse_warmup=$SGLANG_JAX_SKIP_GCSFUSE_WARMUP"
@@ -275,6 +276,7 @@ SERVER_ARGS=(
   --decode-log-interval 1
   --precompile-bs-paddings 1 2
   --precompile-token-paddings 128 256
+  --precompile-dsa-context-paddings 512 1024 2048 4096
 )
 
 if [[ "$DISABLE_PRECOMPILE" == "1" ]]; then
@@ -401,6 +403,11 @@ elif profile == "boundary":
         "boundary_2048": request(vocab_input_ids(2048, 200)),
         "boundary_2049": request(vocab_input_ids(2049, 300)),
         "boundary_3072": request(vocab_input_ids(3072, 400)),
+    }
+elif profile == "precompile_repeat":
+    requests = {
+        "precompile_first": request(vocab_input_ids(3072, 400)),
+        "precompile_repeat": request(vocab_input_ids(3072, 400)),
     }
 else:
     requests = {

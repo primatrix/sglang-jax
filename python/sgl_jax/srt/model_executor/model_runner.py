@@ -531,6 +531,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 page_size=self.page_size,
                 mesh=self.mesh,
                 attention_data_partition_axis="data",
+                context_buckets=getattr(self.server_args, "precompile_dsa_context_paddings", None),
+                max_context_len=getattr(self.model_config, "context_len", None),
             )
 
         elif backend in ("fa", "fa_mha"):

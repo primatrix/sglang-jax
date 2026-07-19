@@ -189,6 +189,7 @@ class ServerArgs:
 
     precompile_token_paddings: list[int] | None = None
     precompile_bs_paddings: list[int] | None = None
+    precompile_dsa_context_paddings: list[int] | None = None
 
     disable_precompile: bool = False
 
@@ -1342,6 +1343,12 @@ class ServerArgs:
             type=int,
             nargs="+",
             help="Set the list of batch sizes buckets for jax jit",
+        )
+        parser.add_argument(
+            "--precompile-dsa-context-paddings",
+            type=int,
+            nargs="+",
+            help="Set page-aligned context-width buckets for DSA JAX JIT precompile",
         )
         parser.add_argument(
             "--disable-precompile",

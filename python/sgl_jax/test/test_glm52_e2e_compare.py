@@ -278,7 +278,8 @@ def test_real_runner_supports_smoke_and_boundary_request_profiles():
     assert 'MAX_NEW_TOKENS="${GLM52_DSA_MAX_NEW_TOKENS:-2}"' in runner
     assert (
         'if [[ "$REQUEST_PROFILE" != "smoke" && "$REQUEST_PROFILE" != "boundary" '
-        '&& "$REQUEST_PROFILE" != "boundary_single" ]]' in runner
+        '&& "$REQUEST_PROFILE" != "boundary_single" '
+        '&& "$REQUEST_PROFILE" != "precompile_repeat" ]]' in runner
     )
     for length in (2047, 2048, 2049, 3072):
         assert f'"boundary_{length}"' in runner
@@ -310,6 +311,11 @@ def test_real_runner_supports_smoke_and_boundary_request_profiles():
             1,
             {"boundary_3072": [3072]},
         ),
+        (
+            "precompile_repeat",
+            1,
+            {"precompile_first": [3072], "precompile_repeat": [3072]},
+        ),
     ],
 )
 def test_real_runner_executes_request_generator_profiles(
@@ -333,6 +339,9 @@ def test_real_runner_executes_request_generator_profiles(
         assert payload["sampling_params"]["ignore_eos"] is True
         assert payload["sampling_params"]["max_new_tokens"] == max_new_tokens
         assert payload["return_logprob"] is True
+
+    if profile == "precompile_repeat":
+        assert requests["precompile_first"] == requests["precompile_repeat"]
         assert payload["top_logprobs_num"] == 20
 
 
@@ -390,6 +399,13 @@ def test_real_runner_preserves_ep_capacity_when_skipping_precompile():
     assert 'if [[ "$DISABLE_PRECOMPILE" == "1" ]]; then' in runner
     assert 'SERVER_ARGS+=(--disable-precompile)' in runner
     assert 'if [[ "$DISABLE_PRECOMPILE" != "0" && "$DISABLE_PRECOMPILE" != "1" ]]' in runner
+
+
+def test_real_runner_precompiles_dsa_context_buckets():
+    runner = RUNNER_PATH.read_text(encoding="utf-8")
+
+    assert "--precompile-dsa-context-paddings 512 1024 2048 4096" in runner
+    assert 'echo "dsa_context_paddings=512,1024,2048,4096"' in runner
 
 
 def test_real_runner_can_isolate_attention_dumps_with_epmoe():

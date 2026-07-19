@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass
 
 import jax
@@ -21,6 +22,7 @@ from sgl_jax.srt.kernels.dsa.reference import (
 from sgl_jax.srt.kernels.mla.dsa.kernel import dsa_decode_mla_attention_unchecked
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.attention.dsa_types import DsaTopKState
+from sgl_jax.srt.layers.attention.dsa_utils import normalize_dsa_context_buckets
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.debug_utils import maybe_dump_jax_array
 from sgl_jax.srt.utils.jax_utils import device_array
@@ -79,6 +81,8 @@ class DsaAttentionBackend(AttentionBackend):
         mesh: jax.sharding.Mesh | None,
         attention_data_partition_axis: str = "data",
         use_pallas_kernel: bool | None = None,
+        context_buckets: list[int] | tuple[int, ...] | None = None,
+        max_context_len: int | None = None,
     ):
         if page_size <= 0:
             raise ValueError("DSA page_size must be positive")
@@ -96,6 +100,11 @@ class DsaAttentionBackend(AttentionBackend):
         self.attention_data_partition_axis = attention_data_partition_axis
         self.use_pallas_kernel = (
             jax.default_backend() == "tpu" if use_pallas_kernel is None else use_pallas_kernel
+        )
+        self.context_buckets = normalize_dsa_context_buckets(
+            context_buckets,
+            page_size=page_size,
+            max_context_len=max_context_len,
         )
         self.forward_metadata = nnx.data(DsaAttentionMetadata())
 
@@ -137,8 +146,17 @@ class DsaAttentionBackend(AttentionBackend):
         positions = np.asarray(batch.positions, dtype=np.int32)
         token_count = len(batch.input_ids)
         request_count = len(seq_lens)
-        candidate_width = max(1, int(seq_lens.max(initial=0)))
-        candidate_width = (candidate_width + self.page_size - 1) // self.page_size * self.page_size
+        max_seq_len = max(1, int(seq_lens.max(initial=0)))
+        if self.context_buckets is None:
+            candidate_width = (max_seq_len + self.page_size - 1) // self.page_size * self.page_size
+        else:
+            bucket_index = bisect.bisect_left(self.context_buckets, max_seq_len)
+            if bucket_index == len(self.context_buckets):
+                raise ValueError(
+                    f"sequence length {max_seq_len} exceeds the largest DSA context bucket "
+                    f"{self.context_buckets[-1]}"
+                )
+            candidate_width = self.context_buckets[bucket_index]
 
         aligned_lens = ((seq_lens + self.page_size - 1) // self.page_size * self.page_size).astype(
             np.int32
@@ -216,6 +234,7 @@ class DsaAttentionBackend(AttentionBackend):
             "mesh": self.mesh,
             "attention_data_partition_axis": self.attention_data_partition_axis,
             "use_pallas_kernel": self.use_pallas_kernel,
+            "context_buckets": self.context_buckets,
         }
         return children, aux_data
 

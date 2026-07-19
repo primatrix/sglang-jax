@@ -176,6 +176,77 @@ def test_dsa_metadata_builds_causal_candidates_for_decode_and_prefill():
             backend.get_forward_metadata(unsupported)
 
 
+def test_dsa_metadata_uses_configured_context_buckets():
+    from sgl_jax.srt.layers.attention.dsa_backend import DsaAttentionBackend
+    from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+
+    backend = DsaAttentionBackend(
+        num_attn_heads=1,
+        kv_lora_rank=3,
+        qk_nope_head_dim=3,
+        qk_rope_head_dim=2,
+        v_head_dim=3,
+        index_head_dim=2,
+        index_topk=2,
+        page_size=4,
+        mesh=None,
+        context_buckets=[8, 16],
+    )
+    decode = SimpleNamespace(
+        dp_size=1,
+        forward_mode=ForwardMode.DECODE,
+        seq_lens=np.array([9, 0], dtype=np.int32),
+        cache_loc=np.arange(32, dtype=np.int32),
+        input_ids=np.array([7, 0], dtype=np.int32),
+        positions=np.array([8, 0], dtype=np.int32),
+        extend_seq_lens=None,
+    )
+
+    metadata = backend.get_forward_metadata(decode)
+
+    assert metadata.req_to_token_slots.shape == (2, 16)
+    with pytest.raises(ValueError, match="exceeds the largest DSA context bucket"):
+        decode.seq_lens[0] = 17
+        backend.get_forward_metadata(decode)
+
+
+def test_dsa_metadata_covers_falcon_max_request_boundary():
+    from sgl_jax.srt.layers.attention.dsa_backend import DsaAttentionBackend
+    from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+
+    backend = DsaAttentionBackend(
+        num_attn_heads=1,
+        kv_lora_rank=3,
+        qk_nope_head_dim=3,
+        qk_rope_head_dim=2,
+        v_head_dim=3,
+        index_head_dim=2,
+        index_topk=2,
+        page_size=128,
+        mesh=None,
+        context_buckets=[512, 1024, 2048],
+        max_context_len=4095,
+    )
+    cache_loc = np.zeros(4096, dtype=np.int32)
+    cache_loc[:4095] = np.arange(1, 4096, dtype=np.int32)
+    decode = SimpleNamespace(
+        dp_size=1,
+        forward_mode=ForwardMode.DECODE,
+        seq_lens=np.array([4095], dtype=np.int32),
+        cache_loc=cache_loc,
+        input_ids=np.array([7], dtype=np.int32),
+        positions=np.array([4094], dtype=np.int32),
+        extend_seq_lens=None,
+    )
+
+    metadata = backend.get_forward_metadata(decode)
+
+    assert backend.context_buckets == (512, 1024, 2048, 4096)
+    assert metadata.req_to_token_slots.shape == (1, 4096)
+    assert int(metadata.req_to_token_slots[0, 4094]) == 4095
+    assert int(metadata.req_to_token_slots[0, 4095]) == 0
+
+
 def test_dsa_backend_writes_index_cache_then_builds_physical_selection():
     from sgl_jax.srt.kernels.dsa.reference import write_indexer_k_cache
     from sgl_jax.srt.layers.attention.dsa_backend import (
@@ -415,6 +486,19 @@ def test_dsa_cli_pool_cost_and_compact_full_layer_pool():
     ServerArgs.add_cli_args(parser)
     args = parser.parse_args(["--model-path", "dummy", "--attention-backend", "dsa"])
     assert args.attention_backend == "dsa"
+
+    args = parser.parse_args(
+        [
+            "--model-path",
+            "dummy",
+            "--attention-backend",
+            "dsa",
+            "--precompile-dsa-context-paddings",
+            "512",
+            "2048",
+        ]
+    )
+    assert args.precompile_dsa_context_paddings == [512, 2048]
 
     config = SimpleNamespace(
         kv_lora_rank=3,
