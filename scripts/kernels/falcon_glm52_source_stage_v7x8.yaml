@@ -1,0 +1,54 @@
+name: glm52-dsa-source-stage-v7x8-20260720-v2
+exp_type: TRAINING
+artifact_type: GCS
+cluster_name: tpu-training-antgroup
+tags:
+  - sglang-jax
+  - glm-5.2
+  - source-stage
+config: '{"source_rev":"65b35076d53d4d0dc50432b17e3789e817361f74","source_sha256":"619887b5103fa13f781f56b0e59fa42cf36b41471ab09d7b0524a13ee22ba329","tpu_usage":"host-cpu-only"}'
+role_to_task_spec:
+  worker:
+    replica: 1
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x1
+    supply_mode: reservation
+    command: |
+      bash <<'BASH'
+      set -euxo pipefail
+      ulimit -c 0
+
+      TARGET=/models/codex-sources/sglang-jax-glm52-dsa-65b35076d53d4d0d.tar.gz
+      SHA256=619887b5103fa13f781f56b0e59fa42cf36b41471ab09d7b0524a13ee22ba329
+      mkdir -p /models/codex-sources
+      if [[ -s "$TARGET" ]] && echo "$SHA256  $TARGET" | sha256sum -c -; then
+        echo "GLM52_SOURCE_ALREADY_STAGED path=$TARGET"
+        exit 0
+      fi
+
+      echo "GLM52_SOURCE_STAGE_READY"
+      deadline=$(($(date +%s) + 900))
+      while [[ ! -f /tmp/GLM52_SOURCE_STAGE_COMPLETE ]]; do
+        if (( $(date +%s) >= deadline )); then
+          echo "timed out waiting for Falcon exp cp/exec completion" >&2
+          exit 1
+        fi
+        sleep 2
+      done
+      echo "$SHA256  $TARGET" | sha256sum -c -
+      echo "GLM52_SOURCE_STAGED path=$TARGET bytes=$(stat -c %s "$TARGET")"
+      BASH
+    mounts:
+      - name: model-storage
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        mount_path: /models
+        read_only: false
+        mount_options:
+          - implicit-dirs
+          - metadata-cache:ttl-secs:-1
+          - metadata-cache:stat-cache-max-size-mb:64
+          - metadata-cache:type-cache-max-size-mb:16
+          - file-system:kernel-list-cache-ttl-secs:-1

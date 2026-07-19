@@ -1,4 +1,4 @@
-name: glm52-dsa-v7x32-nonkernel-profile-20260720-v1
+name: glm52-dsa-v7x32-nonkernel-profile-20260720-v2
 exp_type: PROFILING
 artifact_type: trace
 cluster_name: tpu-training-antgroup
@@ -39,12 +39,13 @@ role_to_task_spec:
 
       ROOT=/tmp/glm52-dsa-v7x32/sglang-jax
       SOURCE_REV=65b35076d53d4d0dc50432b17e3789e817361f74
+      SOURCE=/models/codex-sources/sglang-jax-glm52-dsa-65b35076d53d4d0d.tar.gz
+      SOURCE_SHA256=619887b5103fa13f781f56b0e59fa42cf36b41471ab09d7b0524a13ee22ba329
       mkdir -p /tmp/tpu_logs/tmp /tmp/tpu_logs/pip-cache /tmp/tpu_logs/uv-cache /tmp/tpu_logs/jax-cache
       rm -rf "$ROOT"
-      git clone -q --depth 1 --branch develop/glm52-dsa-falcon \
-        https://github.com/cjx0709/sglang-jax.git "$ROOT"
-      cd "$ROOT"
-      test "$(git rev-parse HEAD)" = "$SOURCE_REV"
+      mkdir -p "$ROOT"
+      echo "$SOURCE_SHA256  $SOURCE" | sha256sum -c -
+      tar -xzf "$SOURCE" -C "$ROOT"
       /opt/venv/bin/python3 -m pip install --disable-pip-version-check -e "$ROOT/python"
 
       export GLM52_DSA_ROOT="$ROOT"
