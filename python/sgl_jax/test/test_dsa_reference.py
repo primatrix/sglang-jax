@@ -76,6 +76,36 @@ def test_write_mla_kv_cache_uses_token_slots_across_page_boundary_and_drops_padd
     assert cache.dtype == jnp.bfloat16
 
 
+def test_write_mla_kv_cache_zeroes_latent_gap_preserves_tail_and_drops_capacity_slot():
+    sentinel = np.float32(7)
+    cache = jnp.full_like(_empty_cache(), sentinel)
+    capacity = cache.shape[0] * PAGE_SIZE
+    valid_slot = 1
+    latent = np.array([[1, 2, 3], [31, 32, 33]], dtype=np.float32)
+    rope = np.array([[4, 5], [34, 35]], dtype=np.float32)
+
+    updated = jax.jit(_write)(cache, latent, rope, [valid_slot, capacity])
+    slot_rows = np.asarray(updated, dtype=np.float32).reshape(capacity, CACHE_WIDTH)
+
+    np.testing.assert_array_equal(slot_rows[valid_slot, :LATENT_DIM], latent[0])
+    np.testing.assert_array_equal(
+        slot_rows[valid_slot, LATENT_DIM:LATENT_ALIGNED],
+        np.zeros(LATENT_ALIGNED - LATENT_DIM, dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        slot_rows[valid_slot, LATENT_ALIGNED : LATENT_ALIGNED + ROPE_DIM],
+        rope[0],
+    )
+    np.testing.assert_array_equal(
+        slot_rows[valid_slot, LATENT_ALIGNED + ROPE_DIM :],
+        np.full(CACHE_WIDTH - LATENT_ALIGNED - ROPE_DIM, sentinel, dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        np.delete(slot_rows, valid_slot, axis=0),
+        np.full((capacity - 1, CACHE_WIDTH), sentinel, dtype=np.float32),
+    )
+
+
 def test_write_mla_kv_cache_packs_latent_and_rope_into_one_sharded_scatter(monkeypatch):
     from sgl_jax.srt.kernels.dsa.reference import write_mla_kv_cache
 

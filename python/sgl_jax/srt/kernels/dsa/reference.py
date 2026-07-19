@@ -51,7 +51,11 @@ def write_mla_kv_cache(
     latent_dim: int,
     rope_dim: int,
 ) -> jax.Array:
-    """Functionally write latent MLA KV values to token-granular physical slots."""
+    """Functionally write latent MLA KV values to token-granular physical slots.
+
+    Callers must ensure valid ``write_slots`` are unique. JAX scatter conflict
+    resolution for duplicate valid indices is not part of this function's contract.
+    """
     latent_aligned, _ = _validate_packed_mla_cache(
         cache,
         page_size=page_size,
