@@ -295,6 +295,85 @@ Falcon TPU 上又直接比较了 production Pallas kernel 与同一批 Torch FP3
 `0.0019080639`，低于既定 `atol=0.01`。因此整数 selection/mapping 要求精确一致，
 但 BF16 Pallas 输出不要求与 FP32 Torch 逐 bit 一致。
 
+### CPU oracle 与 TPU kernel 稳态耗时
+
+CPU 数字来自 Apple M4、PyTorch 2.13.0、4 个 intra-op threads。每组先 warm-up，
+下表为单 query eager median；这些数字只描述独立 correctness oracle，不代表 serving
+吞吐。
+
+| candidate length | Indexer selection | logical-to-physical Python mapping | sparse MLA FP32（2 heads） |
+| ---: | ---: | ---: | ---: |
+| 127 | 0.0853 ms | 0.2587 ms | 0.1328 ms |
+| 128 | 0.0832 ms | 0.2731 ms | 0.1243 ms |
+| 129 | 0.0824 ms | 0.2715 ms | 0.1278 ms |
+| 2047 | 0.2925 ms | 4.1620 ms | 1.6950 ms |
+| 2048 | 0.2491 ms | 4.0577 ms | 1.2594 ms |
+
+TPU 数字来自 Falcon v7x-8 experiment `exp-6dqnqemqcd`，JAX 0.9.0，均为编译和
+20 次 warm-up 后的 device-synchronized steady-state。benchmark 的 JIT 函数显式接收
+3/5 个 runtime array arguments，避免把闭包数组降成 StableHLO constants 后发生常量
+折叠。`H=2 / latent=512 / rope=64` 对应 GLM-5.2 在 TP32 下的单 shard 形状。
+
+| workload | median | p99 | 结论 |
+| --- | ---: | ---: | --- |
+| sparse B1/H2/C160k/top-k2048，unsorted | 2.1947 ms | 2.3469 ms | 当前 production-shape prototype |
+| sparse B1/H2/C160k/top-k2048，page-sorted | 2.1632 ms | 2.1844 ms | 没有实质改善 |
+| sparse B8/H2/C32k/top-k2048 | 16.5070 ms | 17.0481 ms | 约 485 query-kernel/s |
+| dense B1/H2/C160k workload baseline | 0.9916 ms | 1.0174 ms | 不是 production MLA-v2 kernel |
+
+dense 行扫描相同 packed cache 的完整 160k context，但与 Top-K sparse 的 attention
+domain 不同，只能作为 workload baseline。即使按这个有利于 dense 的实现口径，当前
+sparse prototype 在 B1 下仍约慢 `2.21x`。因此本轮可以声明 correctness-first kernel
+已跑通，不能声明 DSA kernel 已获得性能收益；下一阶段需要优化 Pallas gather、DMA 和
+计算布局，而不是用 E2E 首次编译 latency 评价 kernel 性能。
+
+### GPQA-Diamond E2E smoke 口径
+
+评测脚本 `scripts/kernels/eval_glm52_gpqa_smoke.py` 复用了公开
+`zai-org/glm-simple-evals` 的 GPQA prompt、`Random(0)` 子集和选项排列、末尾 1024
+字符上的 `ANSWER: [A-D]` 直接提取语义。请求显式启用 thinking，采用
+`temperature=1.0 / top_p=0.95`，并保存逐题 prompt、原始响应、usage、finish reason
+和 latency。
+
+官方 GLM-5.2 model card 声明 GPQA-Diamond `91.2`，reasoning task 最大生成长度为
+`163,840` token；公开 harness 的正式 GPQA 配置是全量 198 题、8 repeats。本轮受
+Falcon 原型吞吐和 8k context 限制，只运行固定 seed 的小样本和最多 4096 completion
+token。因此结果只用于发现明显功能/精度退化，不是官方准确率复现，百分点差异也不能
+脱离 Wilson 置信区间和截断率解读。
+
+先运行的单题 2048-token 探针在 `2311.2s` 后以 `finish_reason=length` 结束：
+`prompt=366 / completion=2048`，输出仍在推理，没有产生 `ANSWER:`。这不是可判定的
+模型答错，而是一次明确的 budget truncation；它也证明当前 DSA E2E 路径能连续完成
+2048 次 decode，但单请求端到端速度还远未达到实用 serving 水平。
+
+随后在 Falcon v7x-32 experiment `exp-zhtkxigcy9` 上运行固定 `Random(0)` 的 4 题
+smoke，TP32 / DP1 / EP32、fused MoE、DSA、`max_tokens=4096`、concurrency 4。服务
+token pool 为 8192，因此实际最多同时 decode 2 题；整组 wall time 为 `4203.8s`
+（70.1 分钟），请求 median 为 `2919.6s`（48.7 分钟）。
+
+| index | domain | gold | extracted | finish | completion tokens | latency | score |
+| ---: | --- | --- | --- | --- | ---: | ---: | ---: |
+| 0 | Chemistry | D | - | length | 4096 | 4203.8s | 0 |
+| 1 | Physics | D | - | length | 4096 | 2665.0s | 0 |
+| 2 | Physics | C | C | stop | 967 | 375.5s | 1 |
+| 3 | Biology | C | - | length | 4096 | 3174.1s | 0 |
+
+按公开 harness 的 direct-regex 计分，raw accuracy 为 `1/4 = 25.0%`，Wilson 95% CI
+为 `[4.56%, 69.94%]`，相对官方 `91.2%` 低 `66.2pp`。但 3/4 样本全部用满
+4096 token 且仍在连贯推理，截断率 `75%`；唯一自然 `stop` 的样本为 `1/1` 正确，
+completed-only Wilson 95% CI 为 `[20.65%, 100%]`。因此 `-66.2pp` 主要反映本轮
+generation budget，不是可以归因给 DSA kernel 的精度差异；该 smoke 证明真实模型能
+在 DSA 路径长时间连续 decode、自然结束时产生可提取正确答案，但不足以判断是否复现
+官方 GPQA 准确率。
+
+结果与日志保存于 artifact `art-1qqd0xsl54`：
+
+```text
+rank-0/gpqa-smoke-20260719/gpqa4-max4096-final.json
+rank-0/gpqa-smoke-20260719/eval_glm52_gpqa_smoke-final.py
+rank-{0,1,2,3}/gpqa-smoke-20260719/server-v3-rank{0,1,2,3}.log
+```
+
 ## PR #1062 风格逐层 dump 与短序列定位
 
 在 `jax.debug.callback + np.save` 的基本模式上增加了 disabled-by-default 环境开关、

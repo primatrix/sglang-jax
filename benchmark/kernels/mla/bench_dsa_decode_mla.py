@@ -75,7 +75,9 @@ def make_benchmark_inputs(
     }
     invalid = [name for name, value in dimensions.items() if value <= 0]
     if invalid:
-        raise ValueError(f"all benchmark dimensions must be positive: {', '.join(invalid)}")
+        raise ValueError(
+            f"all benchmark dimensions must be positive: {', '.join(invalid)}"
+        )
     if top_k > context_length:
         raise ValueError("top_k must not exceed context_length")
     if page_size % 2 or (page_size % _ALIGNMENT and _ALIGNMENT % page_size):
@@ -125,11 +127,15 @@ def dense_full_context_mla_attention(
     rope_dim = q_pe.shape[-1]
     padded_latent_dim = _align_to_128(latent_dim)
     padded_rope_dim = _align_to_128(rope_dim)
-    cache = cache_kv.reshape((-1, cache_kv.shape[-1]))[:context_length].astype(jnp.float32)
+    cache = cache_kv.reshape((-1, cache_kv.shape[-1]))[:context_length].astype(
+        jnp.float32
+    )
     ql_nope = ql_nope.astype(jnp.float32)
     q_pe = q_pe.astype(jnp.float32)
     if latent_dim != padded_latent_dim:
-        ql_nope = jnp.pad(ql_nope, ((0, 0), (0, 0), (0, padded_latent_dim - latent_dim)))
+        ql_nope = jnp.pad(
+            ql_nope, ((0, 0), (0, 0), (0, padded_latent_dim - latent_dim))
+        )
     if rope_dim != padded_rope_dim:
         q_pe = jnp.pad(q_pe, ((0, 0), (0, 0), (0, padded_rope_dim - rope_dim)))
 
@@ -138,6 +144,34 @@ def dense_full_context_mla_attention(
     probabilities = jax.nn.softmax(logits * jnp.float32(sm_scale), axis=-1)
     output = jnp.einsum("bht,tl->bhl", probabilities, cache[:, :latent_dim])
     return output.astype(output_dtype)
+
+
+def build_benchmark_variants(
+    *, context_length: int, sm_scale: float
+) -> dict[str, Callable[..., jax.Array]]:
+    """Build JIT functions whose large arrays remain runtime arguments."""
+    sparse = jax.jit(
+        lambda ql_nope, q_pe, cache_kv, topk_slots, valid_counts: (
+            dsa_decode_mla_attention_unchecked(
+                ql_nope,
+                q_pe,
+                cache_kv,
+                topk_slots,
+                valid_counts,
+                sm_scale=sm_scale,
+            )
+        )
+    )
+    dense = jax.jit(
+        lambda ql_nope, q_pe, cache_kv: dense_full_context_mla_attention(
+            ql_nope,
+            q_pe,
+            cache_kv,
+            context_length=context_length,
+            sm_scale=sm_scale,
+        )
+    )
+    return {"sparse": sparse, "dense": dense}
 
 
 def _time_compiled(
@@ -161,7 +195,8 @@ def _time_compiled(
 
 
 def _capture_profile(
-    compute: Callable[[], jax.Array], *, profile_dir: str, iters: int, name: str) -> None:
+    compute: Callable[[], jax.Array], *, profile_dir: str, iters: int, name: str
+) -> None:
     pathlib.Path(profile_dir).mkdir(parents=True, exist_ok=True)
     with jax.profiler.trace(profile_dir):
         for step in range(iters):
@@ -184,13 +219,19 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Attention scale; defaults to GLM's unabsorbed 256-d QK scale.",
     )
-    parser.add_argument("--slot-order", choices=("unsorted", "page-sorted"), default="unsorted")
-    parser.add_argument("--variant", choices=("sparse", "dense", "both"), default="both")
+    parser.add_argument(
+        "--slot-order", choices=("unsorted", "page-sorted"), default="unsorted"
+    )
+    parser.add_argument(
+        "--variant", choices=("sparse", "dense", "both"), default="both"
+    )
     parser.add_argument("--warmup-iters", type=int, default=50)
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-iters", type=int, default=3)
-    parser.add_argument("--profile-variant", choices=("sparse", "dense"), default="sparse")
+    parser.add_argument(
+        "--profile-variant", choices=("sparse", "dense"), default="sparse"
+    )
     parser.add_argument("--profile-dir", default="/tmp/dsa-decode-mla-profile")
     parser.add_argument("--output", help="Optional path for the JSON summary.")
     parser.add_argument("--seed", type=int, default=0)
@@ -202,7 +243,9 @@ def main() -> None:
     if jax.default_backend() != "tpu":
         raise RuntimeError("bench_dsa_decode_mla.py must run on a TPU")
     if args.warmup_iters < 0 or args.iters <= 0 or args.profile_iters <= 0:
-        raise ValueError("warmup-iters must be nonnegative; iters and profile-iters must be positive")
+        raise ValueError(
+            "warmup-iters must be nonnegative; iters and profile-iters must be positive"
+        )
 
     host_inputs = make_benchmark_inputs(
         batch_size=args.batch_size,
@@ -224,26 +267,20 @@ def main() -> None:
     if not np.isfinite(sm_scale):
         raise ValueError("sm-scale must be finite")
 
-    sparse = jax.jit(
-        lambda: dsa_decode_mla_attention_unchecked(
+    compiled_variants = build_benchmark_variants(
+        context_length=args.context_length,
+        sm_scale=sm_scale,
+    )
+    variants: dict[str, Callable[[], jax.Array]] = {
+        "sparse": lambda: compiled_variants["sparse"](
             ql_nope,
             q_pe,
             cache_kv,
             topk_slots,
             valid_counts,
-            sm_scale=sm_scale,
-        )
-    )
-    dense = jax.jit(
-        lambda: dense_full_context_mla_attention(
-            ql_nope,
-            q_pe,
-            cache_kv,
-            context_length=args.context_length,
-            sm_scale=sm_scale,
-        )
-    )
-    variants: dict[str, Callable[[], jax.Array]] = {"sparse": sparse, "dense": dense}
+        ),
+        "dense": lambda: compiled_variants["dense"](ql_nope, q_pe, cache_kv),
+    }
     chosen = ("sparse", "dense") if args.variant == "both" else (args.variant,)
 
     summary: dict[str, object] = {
@@ -271,7 +308,9 @@ def main() -> None:
             variants[variant], warmup_iters=args.warmup_iters, iters=args.iters
         )
         summary["results"][variant] = metrics
-        print(f"{variant}: median={metrics['median_ms']:.4f} ms p99={metrics['p99_ms']:.4f} ms")
+        print(
+            f"{variant}: median={metrics['median_ms']:.4f} ms p99={metrics['p99_ms']:.4f} ms"
+        )
 
     if args.profile:
         if args.profile_variant not in chosen:

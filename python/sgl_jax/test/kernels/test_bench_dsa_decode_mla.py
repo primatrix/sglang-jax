@@ -1,10 +1,13 @@
 """Host-side contract tests for the DSA decode MLA benchmark fixture."""
 
+import inspect
 import unittest
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
+import benchmark.kernels.mla.bench_dsa_decode_mla as benchmark_module
 from benchmark.kernels.mla.bench_dsa_decode_mla import (
     GLM_ATTENTION_SCALE,
     dense_full_context_mla_attention,
@@ -106,3 +109,47 @@ class TestDSADecodeMLABenchmarkInputs(unittest.TestCase):
 
         self.assertEqual(actual.dtype, jnp.bfloat16)
         np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=1e-2)
+
+    def test_compiled_variants_receive_runtime_arrays_instead_of_closed_constants(self):
+        self.assertTrue(
+            hasattr(benchmark_module, "build_benchmark_variants"),
+            "benchmark variants must be built as argument-taking JIT functions",
+        )
+        inputs = make_benchmark_inputs(
+            batch_size=1,
+            context_length=32,
+            top_k=8,
+            num_heads=2,
+            latent_dim=128,
+            rope_dim=64,
+            page_size=16,
+            slot_order="unsorted",
+            seed=3,
+        )
+        ql_nope = jnp.asarray(inputs.ql_nope, dtype=jnp.bfloat16)
+        q_pe = jnp.asarray(inputs.q_pe, dtype=jnp.bfloat16)
+        cache_kv = jnp.asarray(inputs.cache_kv, dtype=jnp.bfloat16)
+
+        variants = benchmark_module.build_benchmark_variants(
+            context_length=32,
+            sm_scale=GLM_ATTENTION_SCALE,
+        )
+
+        dense_jaxpr = jax.make_jaxpr(variants["dense"])(ql_nope, q_pe, cache_kv).jaxpr
+        self.assertEqual(len(inspect.signature(variants["sparse"]).parameters), 5)
+        self.assertEqual(len(dense_jaxpr.invars), 3)
+
+        def collect_non_scalar_const_shapes(jaxpr):
+            shapes = [
+                var.aval.shape
+                for var in jaxpr.constvars
+                if getattr(var.aval, "shape", ())
+            ]
+            for equation in jaxpr.eqns:
+                for parameter in equation.params.values():
+                    nested = getattr(parameter, "jaxpr", None)
+                    if nested is not None:
+                        shapes.extend(collect_non_scalar_const_shapes(nested))
+            return shapes
+
+        self.assertEqual(collect_non_scalar_const_shapes(dense_jaxpr), [])
