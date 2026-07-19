@@ -7,6 +7,7 @@ import numpy as np
 from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata
+from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.utils.common_utils import align_bs_for_fused_ep, pad_to_bucket
 
 
@@ -112,6 +113,30 @@ class TestBucketComputation(unittest.TestCase):
                 vocab_size=32000,
                 moe_backend="fused",
             )
+
+    def test_decode_top_logprob_precompile_does_not_repeat_for_each_context(self):
+        cm = CompilationManager(
+            server_args=_make_server_args(
+                attention_backend="dsa",
+                precompile_bs_paddings=[64],
+                precompile_dsa_context_paddings=[512, 1024],
+                precompile_top_logprobs=[20],
+            ),
+            max_padded_batch_size=64,
+            max_padded_num_tokens=256,
+            dp_size=1,
+            tp_size=32,
+            page_size=128,
+            max_req_len=1024,
+            vocab_size=32000,
+            moe_backend="fused",
+        )
+
+        assert cm._decode_precompile_pairs() == [
+            ((0, 64), 512, None),
+            ((0, 64), 1024, None),
+            ((0, 64), 512, 20),
+        ]
 
     def test_token_buckets_default(self):
         cm = CompilationManager(
@@ -379,6 +404,28 @@ class TestDummyBatch(unittest.TestCase):
         assert batch.extend_input_logprob_token_ids.shape == (num_tokens,)
         assert batch.input_logprob_indices.shape == (num_tokens,)
 
+        mesh = jax.sharding.Mesh(np.array(jax.devices()).reshape(1, 1), ("data", "tensor"))
+        logits_metadata = LogitsMetadata.from_model_worker_batch(batch, mesh)
+        sampling_metadata = SamplingMetadata.from_model_worker_batch(
+            batch,
+            mesh=mesh,
+            vocab_size=self.cm.vocab_size,
+        )
+        assert logits_metadata.top_logprobs_nums == [20]
+        assert sampling_metadata.top_logprobs_nums == [20]
+
+        batch.top_logprobs_nums = [20, 5] + [0] * (bs - 2)
+        mixed_logits_metadata = LogitsMetadata.from_model_worker_batch(batch, mesh)
+        mixed_sampling_metadata = SamplingMetadata.from_model_worker_batch(
+            batch,
+            mesh=mesh,
+            vocab_size=self.cm.vocab_size,
+        )
+        assert mixed_logits_metadata.top_logprobs_nums == [20]
+        assert mixed_sampling_metadata.top_logprobs_nums == [20]
+        assert jax.tree.structure(mixed_logits_metadata) == jax.tree.structure(logits_metadata)
+        assert jax.tree.structure(mixed_sampling_metadata) == jax.tree.structure(sampling_metadata)
+
     def test_decode_dsa_top_logprob_dummy_uses_padded_runtime_metadata(self):
         bs = 64
         batch = self.cm._make_dummy_batch(
@@ -396,7 +443,7 @@ class TestDummyBatch(unittest.TestCase):
         assert batch.extend_input_logprob_token_ids is None
         assert batch.input_logprob_indices is None
 
-        mesh = jax.sharding.Mesh(np.array(jax.devices()), ("data",))
+        mesh = jax.sharding.Mesh(np.array(jax.devices()).reshape(1, 1), ("data", "tensor"))
         logits_metadata = LogitsMetadata.from_model_worker_batch(batch, mesh)
         assert logits_metadata.top_logprobs_nums is None
         assert logits_metadata.token_ids_logprobs is None
@@ -413,12 +460,23 @@ class TestDummyBatch(unittest.TestCase):
         )
         batch.extend_logprob_start_lens = batch.extend_seq_lens.copy()
 
-        mesh = jax.sharding.Mesh(np.array(jax.devices()), ("data",))
+        mesh = jax.sharding.Mesh(np.array(jax.devices()).reshape(1, 1), ("data", "tensor"))
         logits_metadata = LogitsMetadata.from_model_worker_batch(batch, mesh)
+        plain_batch = self.cm._make_dummy_batch(
+            bs,
+            num_tokens,
+            ForwardMode.EXTEND,
+            bs * 4096,
+            dsa_context_len=1024,
+        )
+        plain_logits_metadata = LogitsMetadata.from_model_worker_batch(plain_batch, mesh)
         assert logits_metadata.extend_return_logprob is False
         assert logits_metadata.extend_return_top_logprob is False
         assert logits_metadata.top_logprobs_nums is None
         assert logits_metadata.token_ids_logprobs is None
+        assert logits_metadata.extend_input_logprob_token_ids_device is None
+        assert logits_metadata.input_logprob_indices_device is None
+        assert jax.tree.structure(logits_metadata) == jax.tree.structure(plain_logits_metadata)
 
     def test_dp_metadata(self):
         cm = CompilationManager(

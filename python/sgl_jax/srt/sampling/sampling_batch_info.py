@@ -193,10 +193,22 @@ class SamplingMetadata:
                 target_shape, linear_penalty_sharding
             )
 
+        top_logprobs_nums = (
+            None
+            if batch.top_logprobs_nums is None
+            else [max(batch.top_logprobs_nums, default=0)]
+        )
+        token_ids_logprobs = (
+            [[]]
+            if batch.token_ids_logprobs is not None
+            and any(item is not None for item in batch.token_ids_logprobs)
+            else None
+        )
+
         return cls(
             return_logprob=batch.return_logprob,
-            top_logprobs_nums=batch.top_logprobs_nums,
-            token_ids_logprobs=batch.token_ids_logprobs,
+            top_logprobs_nums=top_logprobs_nums,
+            token_ids_logprobs=token_ids_logprobs,
             temperatures=temperatures_device,
             top_ps=top_ps_device,
             top_ks=top_ks_device,

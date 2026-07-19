@@ -205,14 +205,24 @@ class LogitsMetadata:
         # computes prompt-token logprobs; otherwise output-logprob requests
         # would recompile the full model for metadata this function never reads.
         if extend_return_logprob:
-            model_top_logprobs_nums = batch.top_logprobs_nums
-            model_token_ids_logprobs = batch.token_ids_logprobs
+            model_top_logprobs_nums = [max(batch.top_logprobs_nums, default=0)]
+            model_token_ids_logprobs = (
+                [[]] if extend_token_ids_logprob else None
+            )
         else:
             extend_return_top_logprob = False
             extend_token_ids_logprob = False
+            extend_seq_lens_cpu = None
+            extend_logprob_pruned_lens_cpu = None
             model_top_logprobs_nums = None
             model_token_ids_logprobs = None
 
+        model_extend_input_logprob_token_ids = (
+            batch.extend_input_logprob_token_ids if extend_return_logprob else None
+        )
+        model_input_logprob_indices = (
+            batch.input_logprob_indices if extend_return_logprob else None
+        )
         sharding = NamedSharding(mesh, P("data"))
         (
             extend_seq_lens_device,
@@ -223,8 +233,8 @@ class LogitsMetadata:
             (
                 batch.extend_seq_lens,
                 batch.logits_indices,
-                batch.extend_input_logprob_token_ids,
-                batch.input_logprob_indices,
+                model_extend_input_logprob_token_ids,
+                model_input_logprob_indices,
             ),
             sharding=sharding,
         )
@@ -248,7 +258,7 @@ class LogitsMetadata:
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=(
                 batch.extend_logprob_start_lens.tolist()
-                if batch.return_logprob and batch.extend_logprob_start_lens is not None
+                if extend_return_logprob and batch.extend_logprob_start_lens is not None
                 else None
             ),
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,

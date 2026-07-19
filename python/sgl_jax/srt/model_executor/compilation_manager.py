@@ -139,6 +139,24 @@ class CompilationManager:
             )
         return buckets
 
+    def _decode_precompile_pairs(self):
+        indexed_bs = list(enumerate(self.bs_buckets))
+        context_buckets = self.dsa_context_buckets or [None]
+        pairs = list(itertools.product(indexed_bs, context_buckets, [None]))
+        if self.top_logprob_buckets:
+            # LogitsMetadata removes output-only top-k fields from the DECODE
+            # model JIT key, and Sampler depends on batch shape but not context.
+            # One context per (bs, top-k) therefore covers the extra sampler
+            # variant after the ordinary path compiles every model context.
+            pairs.extend(
+                itertools.product(
+                    indexed_bs,
+                    context_buckets[:1],
+                    self.top_logprob_buckets,
+                )
+            )
+        return pairs
+
     # ---- Pre-compilation ----
 
     def precompile_all(
@@ -262,13 +280,7 @@ class CompilationManager:
             self.top_logprob_buckets or None,
         )
 
-        pairs = list(
-            itertools.product(
-                enumerate(self.bs_buckets),
-                self.dsa_context_buckets or [None],
-                [None, *self.top_logprob_buckets],
-            )
-        )
+        pairs = self._decode_precompile_pairs()
         with tqdm(
             pairs,
             desc="[DECODE] PRECOMPILE",
