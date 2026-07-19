@@ -13,6 +13,7 @@ RUN_ID="${GLM52_DSA_RUN_ID:-}"
 MODEL_PATH="${GLM52_MODEL_PATH:-/models/GLM-5.2}"
 COMPLETE_MARKER="${MODEL_PATH}/_DOWNLOAD_COMPLETE"
 ATTENTION_BACKEND="${GLM52_ATTENTION_BACKEND:-dsa}"
+MOE_BACKEND="${GLM52_MOE_BACKEND:-fused}"
 REQUEST_PROFILE="${GLM52_DSA_REQUEST_PROFILE:-smoke}"
 MAX_NEW_TOKENS="${GLM52_DSA_MAX_NEW_TOKENS:-2}"
 DISABLE_PRECOMPILE="${GLM52_DSA_DISABLE_PRECOMPILE:-0}"
@@ -127,6 +128,10 @@ if [[ "$ATTENTION_BACKEND" != "dsa" && "$ATTENTION_BACKEND" != "fa" ]]; then
   echo "GLM52_ATTENTION_BACKEND must be dsa or fa, got: ${ATTENTION_BACKEND}" >&2
   exit 2
 fi
+if [[ "$MOE_BACKEND" != "fused" && "$MOE_BACKEND" != "epmoe" ]]; then
+  echo "GLM52_MOE_BACKEND must be fused or epmoe, got: ${MOE_BACKEND}" >&2
+  exit 2
+fi
 if [[ "$REQUEST_PROFILE" != "smoke" && "$REQUEST_PROFILE" != "boundary" ]]; then
   echo "GLM52_DSA_REQUEST_PROFILE must be smoke or boundary, got: ${REQUEST_PROFILE}" >&2
   exit 2
@@ -193,6 +198,7 @@ export PYTHONPATH="$ROOT/python${PYTHONPATH:+:$PYTHONPATH}"
   echo "load_format=safetensors"
   echo "parallelism=tp32_dp1_ep32"
   echo "attention_backend=$ATTENTION_BACKEND"
+  echo "moe_backend=$MOE_BACKEND"
   echo "request_profile=$REQUEST_PROFILE"
   echo "max_new_tokens=$MAX_NEW_TOKENS"
   echo "max_running_requests=64"
@@ -248,7 +254,7 @@ SERVER_ARGS=(
   --tp-size 32
   --dp-size 1
   --ep-size 32
-  --moe-backend fused
+  --moe-backend "$MOE_BACKEND"
   --nnodes "$NNODES"
   --node-rank "$RANK"
   --dist-init-addr "$DIST_ADDR"

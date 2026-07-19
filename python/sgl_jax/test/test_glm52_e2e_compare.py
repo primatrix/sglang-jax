@@ -382,3 +382,12 @@ def test_real_runner_preserves_ep_capacity_when_skipping_precompile():
     assert 'if [[ "$DISABLE_PRECOMPILE" == "1" ]]; then' in runner
     assert 'SERVER_ARGS+=(--disable-precompile)' in runner
     assert 'if [[ "$DISABLE_PRECOMPILE" != "0" && "$DISABLE_PRECOMPILE" != "1" ]]' in runner
+
+
+def test_real_runner_can_isolate_attention_dumps_with_epmoe():
+    runner = RUNNER_PATH.read_text(encoding="utf-8")
+
+    assert 'MOE_BACKEND="${GLM52_MOE_BACKEND:-fused}"' in runner
+    assert 'if [[ "$MOE_BACKEND" != "fused" && "$MOE_BACKEND" != "epmoe" ]]' in runner
+    assert 'echo "moe_backend=$MOE_BACKEND"' in runner
+    assert '--moe-backend "$MOE_BACKEND"' in runner
