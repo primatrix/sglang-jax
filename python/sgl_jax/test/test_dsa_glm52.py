@@ -1563,13 +1563,17 @@ def test_glm_model_and_causal_lm_emit_global_debug_tensors(monkeypatch):
     assert [(component, name, layer_id, mode) for component, name, layer_id, mode, _ in calls] == [
         ("embed", "hidden_states", None, "extend"),
         ("debug_context", "token_valid_mask", None, "extend"),
+        ("debug_context", "token_positions", None, "extend"),
         ("final", "normalized_hidden_states", None, "extend"),
         ("logits", "next_token_logits", None, "extend"),
+        ("debug_context", "forward_complete", None, "extend"),
     ]
     np.testing.assert_array_equal(calls[0][4], np.array([[3.0]], dtype=np.float32))
     np.testing.assert_array_equal(calls[1][4], np.array([True]))
-    np.testing.assert_array_equal(calls[2][4], np.array([[4.0]], dtype=np.float32))
-    np.testing.assert_array_equal(calls[3][4], np.array([[0.25, -0.5]], dtype=np.float32))
+    np.testing.assert_array_equal(calls[2][4], np.array([0], dtype=np.int32))
+    np.testing.assert_array_equal(calls[3][4], np.array([[4.0]], dtype=np.float32))
+    np.testing.assert_array_equal(calls[4][4], np.array([[0.25, -0.5]], dtype=np.float32))
+    np.testing.assert_array_equal(calls[5][4], np.array(1, dtype=np.int8))
 
 
 def test_glm_model_threads_dsa_state_separately_from_moe_topk_ids():

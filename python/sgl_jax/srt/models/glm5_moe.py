@@ -1135,6 +1135,15 @@ class Glm5Model(nnx.Module):
                 forward_mode=forward_mode,
                 forward_batch=forward_batch,
             )
+        if forward_batch.positions is not None:
+            maybe_dump_jax_array(
+                forward_batch.positions,
+                component="debug_context",
+                name="token_positions",
+                layer_id=None,
+                forward_mode=forward_mode,
+                forward_batch=forward_batch,
+            )
         residual = None
         layers_kv_fused = []
         layers_topk_ids = []
@@ -1243,6 +1252,14 @@ class Glm5ForCausalLM(nnx.Module):
                 next_token_logits,
                 component="logits",
                 name="next_token_logits",
+                layer_id=None,
+                forward_mode=getattr(forward_batch, "forward_mode", None),
+                forward_batch=forward_batch,
+            )
+            maybe_dump_jax_array(
+                jnp.asarray(1, dtype=jnp.int8),
+                component="debug_context",
+                name="forward_complete",
                 layer_id=None,
                 forward_mode=getattr(forward_batch, "forward_mode", None),
                 forward_batch=forward_batch,
