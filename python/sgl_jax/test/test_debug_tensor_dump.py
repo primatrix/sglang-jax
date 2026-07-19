@@ -34,7 +34,9 @@ def test_debug_dump_is_disabled_by_default(monkeypatch):
         ("SGLANG_JAX_DEBUG_DUMP_LAYERS", "1,3,5", 1),
         ("SGLANG_JAX_DEBUG_DUMP_LAYERS", "1,5", 0),
         ("SGLANG_JAX_DEBUG_DUMP_PROCESSES", "2,7", 1),
-        ("SGLANG_JAX_DEBUG_DUMP_PROCESSES", "2,6", 0),
+        # Process filtering must retain the callback in every rank's HLO so
+        # multi-controller TPU programs have identical launch sequences.
+        ("SGLANG_JAX_DEBUG_DUMP_PROCESSES", "2,6", 1),
     ],
 )
 def test_debug_dump_filters_component_layer_and_process(
@@ -59,6 +61,30 @@ def test_debug_dump_filters_component_layer_and_process(
 
     assert returned is array
     assert len(calls) == expected_calls
+
+
+def test_debug_dump_process_filter_schedules_noop_callback(monkeypatch, tmp_path):
+    from sgl_jax.srt.utils.debug_utils import maybe_dump_jax_array
+
+    _enable_dump(monkeypatch, tmp_path)
+    monkeypatch.setenv("SGLANG_JAX_DEBUG_DUMP_PROCESSES", "0")
+    monkeypatch.setattr(jax, "process_index", lambda: 3)
+    callbacks = []
+
+    def run_callback(callback, *values, **_kwargs):
+        callbacks.append(callback)
+        callback(*(np.asarray(value) for value in values))
+
+    monkeypatch.setattr(jax.debug, "callback", run_callback)
+    maybe_dump_jax_array(
+        jnp.ones((2,), dtype=jnp.float32),
+        component="decoder_layer",
+        name="hidden_states",
+        layer_id=3,
+    )
+
+    assert len(callbacks) == 1
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_debug_dump_layer_filter_keeps_global_components(monkeypatch, tmp_path):

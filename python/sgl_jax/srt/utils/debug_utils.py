@@ -94,13 +94,15 @@ def _forward_fingerprint(forward_batch):
         fingerprint = jax.lax.fori_loop(
             0,
             flattened.size,
-            lambda index, state: mix_word(state, flattened[index]),
+            lambda index, state, flattened=flattened: mix_word(state, flattened[index]),
             fingerprint,
         )
     return jnp.stack(fingerprint)
 
 
-def _write_debug_dump(host_value, host_occurrence=None, *, dump_dir, metadata):
+def _write_debug_dump(host_value, host_occurrence=None, *, dump_dir, metadata, enabled=True):
+    if not enabled:
+        return
     host_array = np.asarray(host_value)
 
     with _DEBUG_DUMP_LOCK:
@@ -196,8 +198,7 @@ def maybe_dump_jax_array(
         return value
     if layers and layer_id is not None and str(layer_id) not in layers:
         return value
-    if processes and str(process) not in processes:
-        return value
+    write_on_process = not processes or str(process) in processes
 
     metadata = {
         "process": process,
@@ -207,7 +208,15 @@ def maybe_dump_jax_array(
         "name": str(name),
     }
     dump_dir = os.environ.get("SGLANG_JAX_DEBUG_DUMP_DIR", "debug_dumps")
-    callback = functools.partial(_write_debug_dump, dump_dir=dump_dir, metadata=metadata)
+    # Keep the callback in every rank's HLO even when only selected processes
+    # write files. Omitting it on other ranks changes multi-controller TPU
+    # launch ordering and can halt the device with a launch-id mismatch.
+    callback = functools.partial(
+        _write_debug_dump,
+        dump_dir=dump_dir,
+        metadata=metadata,
+        enabled=write_on_process,
+    )
     forward_fingerprint = _forward_fingerprint(forward_batch)
     if forward_fingerprint is None:
         jax.debug.callback(callback, value)
