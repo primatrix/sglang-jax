@@ -50,6 +50,8 @@ ACK_RANK="${CONTROL_DIR}/ACK-rank-${RANK}"
 SERVER_LOG="/tmp/tpu_logs/glm52-real-${ATTENTION_BACKEND}-${RUN_ID}-rank${RANK}.log"
 SERVER_PID=""
 SERVER_PGID=""
+SERVER_LOG_MONITOR_PID=""
+SERVER_PROGRESS_PATTERN='Scanning metadata|Starting parallel weight loading|Scanning Metadata:.*100%|All weights loaded successfully|Absorbed MLA weights|\[(EXTEND|DECODE)\].*PRECOMPILE|Precompile finished|Application startup complete|The server is fired up'
 
 mkdir -p "$CONTROL_PARENT"
 if [[ "$RANK" == "0" ]]; then
@@ -68,6 +70,17 @@ else
     sleep 2
   done
 fi
+
+stop_server_log_monitor() {
+  if [[ -z "$SERVER_LOG_MONITOR_PID" ]]; then
+    return
+  fi
+  if kill -0 "$SERVER_LOG_MONITOR_PID" 2>/dev/null; then
+    kill -TERM -- "-$SERVER_LOG_MONITOR_PID" 2>/dev/null || true
+  fi
+  wait "$SERVER_LOG_MONITOR_PID" 2>/dev/null || true
+  SERVER_LOG_MONITOR_PID=""
+}
 
 stop_server() {
   if [[ -z "$SERVER_PID" ]]; then
@@ -117,6 +130,7 @@ finish_server() {
     touch "$FAIL_RANK" "$STOP" 2>/dev/null || true
   fi
   stop_server
+  stop_server_log_monitor
   if [[ -f "$SERVER_LOG" && -d "$OUT" ]]; then
     cp -f "$SERVER_LOG" "$OUT/server-rank${RANK}.log" || true
   fi
@@ -290,10 +304,27 @@ fi
   printf '\n'
 } | tee "$OUT/server_command.txt"
 
+stream_server_log() {
+  tail -n +1 -F "$SERVER_LOG" 2>/dev/null \
+    | tr '\r' '\n' \
+    | grep --line-buffered -E "$SERVER_PROGRESS_PATTERN"
+}
+
+start_server_log_monitor() {
+  if [[ "$RANK" != "0" ]]; then
+    return
+  fi
+  export SERVER_LOG SERVER_PROGRESS_PATTERN
+  export -f stream_server_log
+  setsid bash -c stream_server_log &
+  SERVER_LOG_MONITOR_PID=$!
+}
+
 : > "$SERVER_LOG"
 setsid "$PYBIN" -u -m sgl_jax.launch_server "${SERVER_ARGS[@]}" > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 SERVER_PGID=$SERVER_PID
+start_server_log_monitor
 
 if [[ "$RANK" != "0" ]]; then
   follower_deadline=$(($(date +%s) + FOLLOWER_TIMEOUT_SECONDS))

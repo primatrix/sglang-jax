@@ -378,6 +378,20 @@ def test_real_runner_installs_failure_trap_before_rank_local_preflight():
         assert trap_index < runner.index(rank_local_preflight)
 
 
+def test_real_runner_streams_rank_zero_startup_progress_to_falcon_stdout():
+    runner = RUNNER_PATH.read_text(encoding="utf-8")
+
+    assert 'SERVER_LOG_MONITOR_PID=""' in runner
+    assert "start_server_log_monitor()" in runner
+    assert "stop_server_log_monitor()" in runner
+    assert 'if [[ "$RANK" != "0" ]]; then' in runner
+    assert 'tail -n +1 -F "$SERVER_LOG"' in runner
+    assert "tr '\\r' '\\n'" in runner
+    assert "Scanning metadata|Starting parallel weight loading" in runner
+    assert "Precompile finished|Application startup complete" in runner
+    assert runner.index("start_server_log_monitor") < runner.index("health_deadline=")
+
+
 def test_real_runner_rendezvous_waits_for_every_rank_before_server_launch():
     runner = RUNNER_PATH.read_text(encoding="utf-8")
 
