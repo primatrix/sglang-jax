@@ -10,8 +10,10 @@
 - DSA 重复运行逐位可复现：output IDs、生成 token logprob、top-20 token/logprob 全部完全一致。
 - 与 FA baseline 比较时，所有生成 token IDs 完全一致，top-20 最低重合率为 `0.90 / 0.95 / 0.95`。
 - 严格 `max generated-token logprob abs error <= 0.05` 门未通过；三类请求分别为 `0.0703125 / 0.171875 / 0.203125`。因此可以声明功能 E2E 正常，不能声明严格 0.05 logprob 精度门通过。
+- 独立 PyTorch CPU golden 已覆盖 select、logical-to-physical mapping 和 sparse MLA；TPU Pallas 对 Torch FP32 的最坏 max abs 为 `0.0019080639`。
+- 3072-token 真实权重请求已越过 `index_topk=2048`：3073 个 prefill/decode query 中 1025 个发生真实截断，selection/mapping validator 零失败。
 
-本轮序列长度均小于 checkpoint 的 `index_topk=2048`，DSA 选中了完整因果 token 集。当前 DSA/FA 差异不是稀疏截断，而是 Pallas 在线 softmax、Top-K 返回顺序与 FA block kernel 之间稳定的 BF16 数值路径差异。是否接受 `0.25` 的观察性上界，需要模型质量或产品侧另行确认，本文不把放宽阈值包装成严格精度通过。
+短序列 DSA/FA 对照均小于 checkpoint 的 `index_topk=2048`，DSA 选中了完整因果 token 集；其中的差异来自 Pallas 在线 softmax、Top-K 返回顺序与 FA block kernel 之间稳定的 BF16 数值路径。长序列从 position 2048 开始不再与 dense attention 数学等价，因此只对 selection/mapping 与独立 sparse-MLA golden 做 correctness gate，不要求长序列 DSA logits 等于 dense logits。
 
 ## 代码与运行环境
 
@@ -259,19 +261,149 @@ python scripts/kernels/compare_glm52_e2e_results.py \
   --output <comparison.json>
 ```
 
+## 独立 PyTorch CPU golden
+
+后续验证增加了 `python/sgl_jax/srt/kernels/dsa/torch_reference.py`。该模块只依赖
+PyTorch，不导入 JAX，也不被 serving 路径引用；它独立实现：
+
+- GLM Indexer score、causal mask、Top-K logical ID 和 selected count。
+- logical ID 到 paged physical slot 的映射与 padding 语义。
+- 按 selected count gather KV、FP32 softmax/PV 的 sparse MLA。
+
+CPU cross-framework matrix 覆盖 candidate length
+`1/127/128/129/257/2047/2048/2049/3072/4096`。无 tie 的确定性 fixture 中，
+Torch 与 JAX 的 selected count 和 logical ID 精确一致；physical slot 精确一致；
+sparse MLA FP32 输出通过 `rtol=1e-5 / atol=1e-5`。额外覆盖 count
+`0/1/127/128/129/2047/2048`、乱序 page、ragged count、padding、重复和非法
+counted slot。
+
+Falcon TPU 上又直接比较了 production Pallas kernel 与同一批 Torch FP32 fixture，
+四个 process 全部完成：
+
+| candidate length | Pallas vs Torch max abs |
+| ---: | ---: |
+| 127 | 0.0013763905 |
+| 128 | 0.0019080639 |
+| 129 | 0.0013590455 |
+| 2047 | 0.0018008351 |
+| 2048 | 0.0008915663 |
+| 2049 | 0.0004876256 |
+| 3072 | 0.0006479323 |
+| 4096 | 0.0007084906 |
+
+所有 selected count 都精确等于 `min(candidate_length, 2048)`；最坏 max abs 为
+`0.0019080639`，低于既定 `atol=0.01`。因此整数 selection/mapping 要求精确一致，
+但 BF16 Pallas 输出不要求与 FP32 Torch 逐 bit 一致。
+
+## PR #1062 风格逐层 dump 与短序列定位
+
+在 `jax.debug.callback + np.save` 的基本模式上增加了 disabled-by-default 环境开关、
+component/layer/name/process filter、原子 NPY、JSONL manifest、跨 DSA/FA 的 forward
+fingerprint、完成 marker、padding valid-row mask 和多 controller rank-symmetric callback。
+比较器会丢弃取消请求留下的不完整 forward，并只在有效 token row 上计算
+max/mean/p99/cosine/top-k 指标。
+
+当前 Falcon debug experiment：
+
+```text
+experiment: exp-8m0q7a4og9
+job:        job-5lnyeg3uih
+artifact:   art-paz8z33izy
+root:       /gcs/experiments/exp-8m0q7a4og9/artifacts/art-paz8z33izy
+```
+
+短序列 DSA/FA 对照分别为：
+
+```text
+rank-0/glm52-dsa-smoke-layerwise-validrows-20260719-h/
+rank-0/glm52-fa-smoke-layerwise-validrows-20260719-i/
+```
+
+二者都完成 9 个可对齐 forward、162 个有效 tensor；取消请求的 17/15 个 partial
+tensor 被 completion marker 正确过滤。token valid mask 和 embedding 完全一致。
+代表层 `hidden_states_post_mlp` 的跨 forward 最坏值如下：
+
+| layer | max abs | max mean abs | max p99 abs | min cosine |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 0.0009766 | 0.00001675 | 0.0001221 | 0.9999933 |
+| 8 | 0.0151367 | 0.0003710 | 0.0024414 | 0.9996736 |
+| 16 | 0.0898438 | 0.0031990 | 0.0117188 | 0.9956896 |
+| 24 | 0.6796875 | 0.0077235 | 0.0344238 | 0.9926439 |
+| 32 | 1.046875 | 0.0203119 | 0.0859375 | 0.9797363 |
+| 40 | 1.828125 | 0.0511159 | 0.2050781 | 0.9688853 |
+| 48 | 5.6875 | 0.0832045 | 0.3398438 | 0.9685246 |
+| 56 | 23.375 | 0.1303098 | 0.5742188 | 0.9647017 |
+| 64 | 21.75 | 0.1780528 | 0.7421875 | 0.9697885 |
+| 72 | 10.0 | 0.2492665 | 1.0410156 | 0.9719749 |
+| 77 | 50.625 | 0.3631349 | 1.984375 | 0.9792287 |
+
+layer 0 只有 BF16 量级的小差异，之后随 78 层平滑累积，没有发现某一层突然出现的
+selection 或 layout 错误。这与短上下文 `visible <= index_topk` 时 DSA/FA 关注同一
+causal token 集、但使用不同在线 softmax/归约顺序的预期一致。
+
+在 one-token HTTP 对照中，三类请求 output ID 仍完全相同：
+
+| 请求 | output ID | output logprob max abs | top-20 overlap | 0.25/0.90 gate |
+| --- | --- | ---: | ---: | --- |
+| short | `[5]` | 0.07421875 | 0.80 | 失败 |
+| chunked | `[198]` | 0.0625 | 0.95 | 通过 |
+| ragged | `[209] / [69]` | 0.09375 | 0.95 | 通过 |
+
+所以“功能与 token 结果一致”和“严格 logits/top-k 精度门通过”必须分开陈述；short
+的 top-20 overlap 仍是已知未通过项。
+
+## 3072-token 真实稀疏 E2E
+
+长上下文 run 使用 source revision `ca0f380c2`、TP32/DP1/EP32、DSA、diagnostic
+EP-MoE、128-token chunked prefill 和 one-token generation：
+
+```text
+rank-0/glm52-dsa-boundary3072-selection-20260719-k/
+```
+
+单个 3072-token prompt 的所有 query positions 都会被逐块执行，因此一次请求同时覆盖
+2047/2048 边界和 3072 长度，不需要把四个边界 prompt 串行重跑。结果：
+
+- 四个 rank 均 exit 0，runner 输出 `GLM52_DSA_REAL_E2E_OK backend=dsa requests=1`。
+- response schema 和 finite logprob 通过；output ID 为 `[198]`，logprob 为 `-4.15625`。
+- 端到端 latency 为 `2032.53s`，包含逐层 debug callback 和每块同步，不是性能基准。
+- 25 个完成 forward = 24 个 prefill chunk + 1 个 position 3072 decode。
+- 3073 个 active query 中 1025 个满足 `position + 1 > 2048`，真实进入 Top-K 截断。
+
+正式 validator report：
+
+```text
+rank-0/glm52-dsa-boundary3072-selection-20260719-k/precision/boundary-selection.json
+```
+
+报告结果为 `passed=true`、`failures=[]`、positions `0..3072`，并确认 required
+positions `2046/2047/2048/3071` 全部存在。每个有效 query 都满足：
+
+- `selected_count == min(position + 1, 2048)`。
+- counted logical ID 无重复、非负且不指向 future token。
+- 未截断时 logical ID set 精确覆盖完整 causal set。
+- counted physical slot 非负且无重复。
+- logical/physical padding suffix 分别为 `-1/0`。
+
+真实长序列报告检查 integration invariants；截断后 2048 个 token 的 score 排名正确性由
+独立 Torch/JAX selection fixture matrix 覆盖，sparse MLA 数值由 Torch/Pallas length
+matrix 覆盖。长序列 DSA 与 dense attention 本来选择不同 token 集，二者最终 logits
+不作为数学相等 gate。
+
 ## 已知限制与下一步
 
-1. 当前 E2E 只覆盖到 257 input tokens，尚未覆盖 `context > index_topk` 的真实稀疏截断质量。
-2. 0.05 logprob 严格门未通过。若要求收紧，优先增加逐层 attention output trace，比较 DSA Pallas、DSA FP32 reference 和 FA，定位误差累积起点。
-3. 可评估“候选数小于等于 `index_topk` 时保持 causal slot 顺序”的数值路径，但必须先补 reference/排序语义测试，不能仅为让 E2E 阈值通过而改行为。
-4. 当前 kernel 是 correctness-first 实现。DSA 首次执行 latency 明显高于 FA，尚未做 production 性能优化。
-5. 真实模型质量仍需更长 prompt、更多 decode tokens 和任务级 eval；本轮只证明最小功能闭环及短序列 logits 一致性范围。
+1. short 的严格 logits/top-20 gate 未全部通过；逐层证据显示是从 layer 0 的 BF16 小误差平滑累积，不是已确认的 selection/layout 单点错误。
+2. 3072-token run 证明 sparse integration 和 one-token response 正常，不等于任务级模型质量通过；仍需更多长 prompt、更多 decode token 和下游 eval。
+3. 长序列 diagnostic run 使用 EP-MoE。带全量 debug dump 的 fused shared-expert BSE 512 路径需要约 96 MiB VMEM、超过单核 64 MiB；短序列无全量 debug 的 fused MoE E2E 已通过。
+4. 当前 kernel 是 correctness-first 实现。逐块长跑约 80 秒且含 debug callback/同步，不能作为 production 性能数据；尚未完成 kernel 性能优化。
+5. 可评估 `visible <= index_topk` 时保持 causal slot 顺序以收紧 DSA/FA 数值差，但必须先定义排序语义和模型质量 gate，不能仅为通过阈值而改变行为。
 
 ## 清理
 
 验证结束后已完成资源清理：
 
 - v7x32 验证实验 `exp-sff91uc6va` 已 abort；artifact payload 已在 abort 前确认并上传到上述路径。
+- v7x32 layerwise/long-context 实验 `exp-8m0q7a4og9` 已 abort；`art-paz8z33izy` 中的 response 和 boundary report 已在 abort 前确认。
 - v7x8 debug 实验 `exp-gq082n4nzb` 已 abort。
 - 权重下载实验 `exp-q7odgo8q9x` 已成功结束。
 - 旧实验 `exp-x9...` 和 range benchmark `exp-r78...` 已 abort，clone 实验 `exp-1vt...` 已失败退出，没有继续占用计算资源。
