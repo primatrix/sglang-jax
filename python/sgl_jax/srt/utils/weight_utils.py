@@ -125,6 +125,41 @@ def _safetensors_shard_fingerprint(weights_files: list[str]) -> list[dict[str, A
     ]
 
 
+def _is_valid_serialized_safetensors_weight_info(
+    weight_info: Any,
+    *,
+    shard_names: set[str],
+) -> bool:
+    if not isinstance(weight_info, Mapping) or not weight_info:
+        return False
+
+    def is_nonnegative_int(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+    for key, infos in weight_info.items():
+        if not isinstance(key, str) or not key:
+            return False
+        if not isinstance(infos, list) or not infos:
+            return False
+        for info in infos:
+            if not isinstance(info, Mapping):
+                return False
+            if info.get("file") not in shard_names:
+                return False
+            shape = info.get("shape")
+            if not isinstance(shape, list) or not all(
+                is_nonnegative_int(dim) for dim in shape
+            ):
+                return False
+            if info.get("dtype") not in _SAFETENSORS_DTYPE_TO_JAX:
+                return False
+            if not is_nonnegative_int(info.get("byte_offset")):
+                return False
+            if not is_nonnegative_int(info.get("byte_size")):
+                return False
+    return True
+
+
 def _write_safetensors_metadata_cache(
     cache_path: str | os.PathLike[str],
     weights_files: list[str],
@@ -189,6 +224,17 @@ def _load_safetensors_metadata_cache(
             return None
 
         root = os.path.dirname(os.path.abspath(weights_files[0]))
+        shard_names = {
+            os.path.relpath(os.path.abspath(path), root) for path in weights_files
+        }
+        serialized_weight_info = payload.get("weight_info")
+        if not _is_valid_serialized_safetensors_weight_info(
+            serialized_weight_info, shard_names=shard_names
+        ):
+            logger.warning(
+                "Ignoring malformed safetensors metadata cache: %s", cache_path
+            )
+            return None
         weight_info = {
             key: [
                 {
@@ -198,7 +244,7 @@ def _load_safetensors_metadata_cache(
                 }
                 for info in infos
             ]
-            for key, infos in payload["weight_info"].items()
+            for key, infos in serialized_weight_info.items()
         }
     except (OSError, ValueError, KeyError, TypeError) as exc:
         logger.warning("Failed to load safetensors metadata cache %s: %s", cache_path, exc)
