@@ -5,6 +5,10 @@ It is a workload baseline rather than the production MLA-v2 kernel: the two
 variants have different attention domains (Top-K versus full context), but
 identical cache, query, precision, and launch environment.
 
+The dense workload baseline assumes ``request_layout=shared`` and
+``valid_count_pattern=full``. Production handoff cases with disjoint decode
+regions or causal prefill must use ``--variant sparse``.
+
 Examples:
 
   python benchmark/kernels/mla/bench_dsa_decode_mla.py \
@@ -54,16 +58,30 @@ def _align_to_128(dim: int) -> int:
 def make_benchmark_inputs(
     *,
     batch_size: int,
+    active_batch_size: int | None = None,
     context_length: int,
+    cache_capacity: int | None = None,
     top_k: int,
     num_heads: int,
     latent_dim: int,
     rope_dim: int,
     page_size: int,
     slot_order: str,
+    request_layout: str = "shared",
+    valid_count_pattern: str = "full",
+    start_position: int = 0,
     seed: int = 0,
 ) -> BenchmarkInputs:
-    """Create deterministic packed-cache inputs with physical selected slots."""
+    """Create deterministic packed-cache inputs with physical selected slots.
+
+    ``batch_size`` is the static physical query bucket. Only the first
+    ``active_batch_size`` rows are counted. ``top_k`` is the static slot-table
+    width and can be larger than the visible context in causal prefill.
+    ``request_layout=disjoint`` gives every active decode row its own context
+    region so multi-row cases do not get artificial inter-request cache reuse.
+    """
+    if active_batch_size is None:
+        active_batch_size = batch_size
     dimensions = {
         "batch_size": batch_size,
         "context_length": context_length,
@@ -78,15 +96,44 @@ def make_benchmark_inputs(
         raise ValueError(
             f"all benchmark dimensions must be positive: {', '.join(invalid)}"
         )
-    if top_k > context_length:
-        raise ValueError("top_k must not exceed context_length")
+    if not 0 < active_batch_size <= batch_size:
+        raise ValueError(
+            "active_batch_size must be in [1, batch_size]; got "
+            f"{active_batch_size} for batch_size={batch_size}"
+        )
     if page_size % 2 or (page_size % _ALIGNMENT and _ALIGNMENT % page_size):
         raise ValueError("page_size must be even and divide 128 or be divisible by 128")
     if slot_order not in {"unsorted", "page-sorted"}:
         raise ValueError("slot_order must be 'unsorted' or 'page-sorted'")
+    if request_layout not in {"shared", "disjoint"}:
+        raise ValueError("request_layout must be 'shared' or 'disjoint'")
+    if valid_count_pattern not in {"full", "causal"}:
+        raise ValueError("valid_count_pattern must be 'full' or 'causal'")
+    if valid_count_pattern == "causal" and request_layout != "shared":
+        raise ValueError("causal prefill requires request_layout='shared'")
+    if start_position < 0:
+        raise ValueError("start_position must be nonnegative")
+    if (
+        valid_count_pattern == "causal"
+        and start_position + active_batch_size > context_length
+    ):
+        raise ValueError(
+            "causal context_length must cover start_position plus active rows"
+        )
+
+    minimum_cache_capacity = context_length * (
+        active_batch_size if request_layout == "disjoint" else 1
+    )
+    if cache_capacity is None:
+        cache_capacity = minimum_cache_capacity
+    if cache_capacity < minimum_cache_capacity:
+        raise ValueError(
+            "cache_capacity is too small for the requested address layout; "
+            f"need at least {minimum_cache_capacity}, got {cache_capacity}"
+        )
 
     padded_width = _align_to_128(latent_dim) + _align_to_128(rope_dim)
-    num_pages = (context_length + page_size - 1) // page_size
+    num_pages = (cache_capacity + page_size - 1) // page_size
     rng = np.random.default_rng(seed)
     ql_nope = rng.standard_normal((batch_size, num_heads, latent_dim), dtype=np.float32)
     q_pe = rng.standard_normal((batch_size, num_heads, rope_dim), dtype=np.float32)
@@ -94,22 +141,35 @@ def make_benchmark_inputs(
         (num_pages, page_size // 2, 2, padded_width), dtype=np.float32
     )
 
-    # Spread selections across the full context.  Each row has the same
-    # multiset; only the caller-visible selected-slot order differs.
-    base_slots = (np.arange(top_k, dtype=np.int32) * context_length) // top_k
-    topk_slots = np.empty((batch_size, top_k), dtype=np.int32)
-    for batch_index in range(batch_size):
-        if slot_order == "page-sorted":
-            topk_slots[batch_index] = base_slots
+    # Only counted prefixes carry semantics. Spread each prefix over the
+    # visible context so long-context cases exercise the full cache footprint.
+    topk_slots = np.zeros((batch_size, top_k), dtype=np.int32)
+    valid_counts = np.zeros((batch_size,), dtype=np.int32)
+    for batch_index in range(active_batch_size):
+        if valid_count_pattern == "causal":
+            visible_length = start_position + batch_index + 1
         else:
-            topk_slots[batch_index] = np.roll(base_slots, batch_index + 1)
+            visible_length = context_length
+        region_offset = (
+            batch_index * context_length if request_layout == "disjoint" else 0
+        )
+        count = min(top_k, visible_length)
+        valid_counts[batch_index] = count
+        base_slots = (
+            np.arange(count, dtype=np.int64) * visible_length // count
+        ).astype(np.int32)
+        if slot_order == "page-sorted":
+            counted_slots = base_slots
+        else:
+            counted_slots = rng.permutation(base_slots)
+        topk_slots[batch_index, :count] = counted_slots + region_offset
 
     return BenchmarkInputs(
         ql_nope=ql_nope,
         q_pe=q_pe,
         cache_kv=cache_kv,
         topk_slots=topk_slots,
-        valid_counts=np.full((batch_size,), top_k, dtype=np.int32),
+        valid_counts=valid_counts,
     )
 
 
@@ -177,6 +237,10 @@ def build_benchmark_variants(
 def _time_compiled(
     compute: Callable[[], jax.Array], *, warmup_iters: int, iters: int
 ) -> dict[str, float]:
+    compile_start = time.perf_counter_ns()
+    jax.block_until_ready(compute())
+    compile_ms = (time.perf_counter_ns() - compile_start) / 1_000_000.0
+
     for _ in range(warmup_iters):
         jax.block_until_ready(compute())
 
@@ -187,7 +251,9 @@ def _time_compiled(
         latency_ms.append((time.perf_counter_ns() - start) / 1_000_000.0)
 
     return {
+        "compile_ms": float(compile_ms),
         "median_ms": float(np.median(latency_ms)),
+        "p95_ms": float(np.percentile(latency_ms, 95)),
         "p99_ms": float(np.percentile(latency_ms, 99)),
         "mean_ms": float(np.mean(latency_ms)),
         "min_ms": float(np.min(latency_ms)),
@@ -207,9 +273,21 @@ def _capture_profile(
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--active-batch-size",
+        type=int,
+        default=None,
+        help="Counted query rows inside the static --batch-size bucket.",
+    )
     parser.add_argument("--context-length", type=int, default=160_000)
+    parser.add_argument(
+        "--cache-capacity",
+        type=int,
+        default=None,
+        help="Token slots allocated in the synthetic cache; defaults to the minimum layout capacity.",
+    )
     parser.add_argument("--top-k", type=int, default=2048)
-    parser.add_argument("--num-heads", type=int, default=8)
+    parser.add_argument("--num-heads", type=int, default=2)
     parser.add_argument("--latent-dim", type=int, default=512)
     parser.add_argument("--rope-dim", type=int, default=64)
     parser.add_argument("--page-size", type=int, default=128)
@@ -221,6 +299,18 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--slot-order", choices=("unsorted", "page-sorted"), default="unsorted"
+    )
+    parser.add_argument(
+        "--request-layout", choices=("shared", "disjoint"), default="shared"
+    )
+    parser.add_argument(
+        "--valid-count-pattern", choices=("full", "causal"), default="full"
+    )
+    parser.add_argument(
+        "--start-position",
+        type=int,
+        default=0,
+        help="Logical position of row zero for --valid-count-pattern causal.",
     )
     parser.add_argument(
         "--variant", choices=("sparse", "dense", "both"), default="both"
@@ -249,13 +339,18 @@ def main() -> None:
 
     host_inputs = make_benchmark_inputs(
         batch_size=args.batch_size,
+        active_batch_size=args.active_batch_size,
         context_length=args.context_length,
+        cache_capacity=args.cache_capacity,
         top_k=args.top_k,
         num_heads=args.num_heads,
         latent_dim=args.latent_dim,
         rope_dim=args.rope_dim,
         page_size=args.page_size,
         slot_order=args.slot_order,
+        request_layout=args.request_layout,
+        valid_count_pattern=args.valid_count_pattern,
+        start_position=args.start_position,
         seed=args.seed,
     )
     ql_nope = jnp.asarray(host_inputs.ql_nope, dtype=jnp.bfloat16)
@@ -289,7 +384,26 @@ def main() -> None:
         "devices": [str(device) for device in jax.devices()],
         "input": {
             "batch_size": args.batch_size,
+            "active_batch_size": (
+                args.batch_size
+                if args.active_batch_size is None
+                else args.active_batch_size
+            ),
             "context_length": args.context_length,
+            "cache_capacity": (
+                args.cache_capacity
+                if args.cache_capacity is not None
+                else args.context_length
+                * (
+                    (
+                        args.batch_size
+                        if args.active_batch_size is None
+                        else args.active_batch_size
+                    )
+                    if args.request_layout == "disjoint"
+                    else 1
+                )
+            ),
             "top_k": args.top_k,
             "num_heads": args.num_heads,
             "latent_dim": args.latent_dim,
@@ -297,6 +411,9 @@ def main() -> None:
             "page_size": args.page_size,
             "sm_scale": sm_scale,
             "slot_order": args.slot_order,
+            "request_layout": args.request_layout,
+            "valid_count_pattern": args.valid_count_pattern,
+            "start_position": args.start_position,
             "dtype": "bfloat16",
         },
         "warmup_iters": args.warmup_iters,
@@ -309,7 +426,9 @@ def main() -> None:
         )
         summary["results"][variant] = metrics
         print(
-            f"{variant}: median={metrics['median_ms']:.4f} ms p99={metrics['p99_ms']:.4f} ms"
+            f"{variant}: compile={metrics['compile_ms']:.1f} ms "
+            f"median={metrics['median_ms']:.4f} ms "
+            f"p95={metrics['p95_ms']:.4f} ms p99={metrics['p99_ms']:.4f} ms"
         )
 
     if args.profile:

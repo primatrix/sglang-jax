@@ -1,5 +1,11 @@
 # GLM-5.2 DSA 当前状态快照（2026-07-20）
 
+> 2026-07-20 scope update：服务侧 prefill/decode 性能差异已经能够由真实 static
+> bucket、selected-cache 访存和当前 correctness-first Pallas 实现解释，本轮不再重复
+> E2E profile。后续工作收敛为给算子同事交付独立 CPU PyTorch golden、冻结 ABI 和
+> production-derived performance shapes；详见
+> `note/2026-07-20-glm52-dsa-kernel-handoff.md`。
+
 ## 结论
 
 截至 `develop/glm52-dsa-falcon` 的 profile manifest commit `8dd4aca49`（复测 source

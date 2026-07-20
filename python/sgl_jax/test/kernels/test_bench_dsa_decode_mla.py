@@ -2,6 +2,7 @@
 
 import inspect
 import unittest
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -17,6 +18,44 @@ from sgl_jax.srt.kernels.mla.dsa.reference import reference_dsa_decode_mla_atten
 
 
 class TestDSADecodeMLABenchmarkInputs(unittest.TestCase):
+    def test_timing_excludes_explicit_compile_and_reports_p95(self):
+        clock = iter(
+            [
+                0,
+                50_000_000,
+                100_000_000,
+                101_000_000,
+                200_000_000,
+                202_000_000,
+            ]
+        )
+        calls = 0
+
+        def compute():
+            nonlocal calls
+            calls += 1
+            return object()
+
+        with (
+            mock.patch.object(
+                benchmark_module.time,
+                "perf_counter_ns",
+                side_effect=lambda: next(clock),
+            ),
+            mock.patch.object(
+                benchmark_module.jax,
+                "block_until_ready",
+                side_effect=lambda value: value,
+            ),
+        ):
+            metrics = benchmark_module._time_compiled(compute, warmup_iters=0, iters=2)
+
+        self.assertEqual(calls, 3)
+        self.assertEqual(metrics["compile_ms"], 50.0)
+        self.assertEqual(metrics["median_ms"], 1.5)
+        self.assertAlmostEqual(metrics["p95_ms"], 1.95)
+        self.assertAlmostEqual(metrics["p99_ms"], 1.99)
+
     def test_fixture_uses_packed_cache_and_valid_selected_physical_slots(self):
         inputs = make_benchmark_inputs(
             batch_size=2,
@@ -38,6 +77,14 @@ class TestDSADecodeMLABenchmarkInputs(unittest.TestCase):
         self.assertTrue(np.all(inputs.topk_slots >= 0))
         self.assertTrue(np.all(inputs.topk_slots < 32))
         self.assertFalse(np.array_equal(inputs.topk_slots[0], np.sort(inputs.topk_slots[0])))
+        sorted_slots = np.sort(inputs.topk_slots[0])
+        self.assertTrue(
+            all(
+                not np.array_equal(inputs.topk_slots[0], np.roll(sorted_slots, shift))
+                for shift in range(sorted_slots.size)
+            ),
+            "unsorted slots must be a permutation, not a rotated sequential scan",
+        )
 
     def test_glm_benchmark_uses_unabsorbed_qk_scale(self):
         self.assertEqual(GLM_ATTENTION_SCALE, 256**-0.5)
@@ -62,7 +109,7 @@ class TestDSADecodeMLABenchmarkInputs(unittest.TestCase):
                 sorted_inputs.topk_slots[batch_index],
             )
 
-    def test_fixture_rejects_invalid_top_k_and_alignment(self):
+    def test_fixture_rejects_invalid_dimensions_and_alignment(self):
         common_kwargs = dict(
             batch_size=1,
             context_length=32,
@@ -73,10 +120,99 @@ class TestDSADecodeMLABenchmarkInputs(unittest.TestCase):
             page_size=16,
             slot_order="unsorted",
         )
-        with self.assertRaisesRegex(ValueError, "top_k"):
-            make_benchmark_inputs(**{**common_kwargs, "top_k": 33})
+        with self.assertRaisesRegex(ValueError, "dimensions"):
+            make_benchmark_inputs(**{**common_kwargs, "top_k": 0})
         with self.assertRaisesRegex(ValueError, "page_size"):
             make_benchmark_inputs(**{**common_kwargs, "page_size": 12})
+        with self.assertRaisesRegex(ValueError, "active_batch_size"):
+            make_benchmark_inputs(**{**common_kwargs, "active_batch_size": 2})
+
+    def test_fixture_zeroes_inactive_physical_bucket_rows(self):
+        inputs = make_benchmark_inputs(
+            batch_size=64,
+            active_batch_size=1,
+            context_length=4096,
+            top_k=2048,
+            num_heads=2,
+            latent_dim=512,
+            rope_dim=64,
+            page_size=128,
+            slot_order="unsorted",
+            valid_count_pattern="full",
+            seed=4,
+        )
+
+        self.assertEqual(inputs.ql_nope.shape, (64, 2, 512))
+        self.assertEqual(inputs.topk_slots.shape, (64, 2048))
+        self.assertEqual(inputs.valid_counts.tolist(), [2048] + [0] * 63)
+        self.assertTrue(np.all(inputs.topk_slots[1:] == 0))
+
+    def test_fixture_uses_disjoint_request_regions_for_multirow_pressure(self):
+        inputs = make_benchmark_inputs(
+            batch_size=2,
+            active_batch_size=2,
+            context_length=32,
+            top_k=8,
+            num_heads=2,
+            latent_dim=128,
+            rope_dim=64,
+            page_size=16,
+            slot_order="unsorted",
+            request_layout="disjoint",
+            seed=7,
+        )
+
+        self.assertEqual(inputs.cache_kv.shape, (4, 8, 2, 256))
+        self.assertTrue(np.all(inputs.topk_slots[0, :8] < 32))
+        self.assertTrue(np.all(inputs.topk_slots[1, :8] >= 32))
+        self.assertTrue(np.all(inputs.topk_slots[1, :8] < 64))
+        self.assertEqual(
+            np.intersect1d(inputs.topk_slots[0, :8], inputs.topk_slots[1, :8]).size,
+            0,
+        )
+
+    def test_fixture_builds_causal_prefill_counts_with_static_kmax(self):
+        inputs = make_benchmark_inputs(
+            batch_size=128,
+            active_batch_size=128,
+            context_length=128,
+            top_k=2048,
+            num_heads=2,
+            latent_dim=512,
+            rope_dim=64,
+            page_size=128,
+            slot_order="unsorted",
+            valid_count_pattern="causal",
+            start_position=0,
+            seed=5,
+        )
+
+        self.assertEqual(inputs.topk_slots.shape, (128, 2048))
+        self.assertEqual(inputs.valid_counts.tolist(), list(range(1, 129)))
+        for row, count in enumerate(inputs.valid_counts):
+            counted = inputs.topk_slots[row, :count]
+            self.assertTrue(np.all(counted >= 0))
+            self.assertTrue(np.all(counted <= row))
+            self.assertTrue(np.all(inputs.topk_slots[row, count:] == 0))
+
+    def test_fixture_builds_saturated_prefill_counts_after_topk_boundary(self):
+        inputs = make_benchmark_inputs(
+            batch_size=128,
+            active_batch_size=128,
+            context_length=2176,
+            top_k=2048,
+            num_heads=2,
+            latent_dim=512,
+            rope_dim=64,
+            page_size=128,
+            slot_order="page-sorted",
+            valid_count_pattern="causal",
+            start_position=2048,
+            seed=6,
+        )
+
+        self.assertEqual(inputs.valid_counts.tolist(), [2048] * 128)
+        self.assertTrue(np.all(inputs.topk_slots[:, :2048] < 2176))
 
     def test_dense_baseline_matches_full_selected_reference_and_preserves_bf16(self):
         inputs = make_benchmark_inputs(
@@ -140,11 +276,7 @@ class TestDSADecodeMLABenchmarkInputs(unittest.TestCase):
         self.assertEqual(len(dense_jaxpr.invars), 3)
 
         def collect_non_scalar_const_shapes(jaxpr):
-            shapes = [
-                var.aval.shape
-                for var in jaxpr.constvars
-                if getattr(var.aval, "shape", ())
-            ]
+            shapes = [var.aval.shape for var in jaxpr.constvars if getattr(var.aval, "shape", ())]
             for equation in jaxpr.eqns:
                 for parameter in equation.params.values():
                     nested = getattr(parameter, "jaxpr", None)
