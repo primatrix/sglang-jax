@@ -2,7 +2,8 @@
 
 ## 结论
 
-截至 `develop/glm52-dsa-falcon` 的 `09a901413`，GLM-5.2 DSA 已在 Falcon
+截至 `develop/glm52-dsa-falcon` 的 profile manifest commit `8dd4aca49`（复测 source
+`0324d5a0b`），GLM-5.2 DSA 已在 Falcon
 v7x-32 上完成 correctness-first 的真实权重 E2E 闭环：TP32 / DP1 / EP32、fused
 MoE、chunked prefill、ragged batch、真实 Top-K 截断和 decode 都可以运行并返回稳定结果。
 
@@ -16,6 +17,9 @@ MoE、chunked prefill、ragged batch、真实 Top-K 截断和 decode 都可以�
   validator 零失败；相同请求重复运行的 output ID、logprob 和 top-20 完全一致。
 - short、chunked 和 ragged 请求的 DSA/FA greedy output ID 相同，当前实现不存在已知的
   selection、paged mapping 或请求调度功能错误。
+- 首个 non-Pallas 优化已通过同 shape Falcon 复测：MLA cache 的 latent/RoPE 两次 scatter
+  合成一次后，prefill/decode 的单层 cache-write device time 分别下降 `48.8% / 53.1%`；
+  DSA custom-kernel 总量基本不变，correctness/schema gate 全部保持通过。
 
 当前不能声明：
 
@@ -182,6 +186,59 @@ capture 中两组 scatter 分别为 `47.634ms / 45.456ms`，合计 `93.090ms`，
 开销，不能把 `15.4%` 全部当成预期收益；最终只接受同 shape Falcon 复测中超出噪声的
 实际改善。
 
+### MLA cache single-scatter 复测结果
+
+实现提交为 `d18e21c95`，补充 padding/invalid-slot contract 为 `6630ebb457`。第一次
+candidate `exp-owybp7zc86` 在首次 EXTEND trace 暴露 JAX 0.9.0 explicit-sharding 问题：
+新增 alignment padding 是 replicated sharding，而 latent/RoPE 是
+`PartitionSpec("data", None)`，`concatenate` 抛出 `ShardingTypeError`。修复提交
+`0324d5a0b` 让 padding 显式继承 `new_c_kv` 的 `out_sharding`，对应回归测试先 RED 后
+GREEN；本地完整 DSA/profile regression 为 `117 passed`。
+
+修复后的 source 经 staging `exp-9k9z3qx0ks` / `art-mtacuv18v3` 写入共享模型盘，SHA256
+为 `4bc479b874183445b8cbbe5cfed2f7a04b11b4c6987d1a66cbda3de60d0cba75`。同 shape
+candidate 为 `exp-6sroakc4lh` / `art-q8dine8622`，source
+`0324d5a0bf98944417d0a563fced8bf02a704db7`。checkpoint、TP32/DP1/EP32、fused MoE、
+3072 input / 8 output、chunk size、precompile variants 和 tracer levels 与 baseline 完全相同。
+
+正确性 gate 全部通过：两次请求的 output ID、output logprob、shared top-20 logprob 都是
+零误差，top-20 overlap `1.0`，schema 无错误，终态日志为
+`GLM52_DSA_REAL_E2E_OK backend=dsa requests=2`。
+
+XProf 和 rank-0 TPU:0 精确 source 聚合如下。不同 profile 的 trace 边界捕获到的 layer
+event 数量不同，因此 cache write 使用每个 event 的平均时长；`jit_jitted_run_model` 使用
+单次最大 envelope。XProf HLO self-time 是 32 个 local device 的 aggregate。
+
+| 指标 | Baseline | Single-scatter | 变化 |
+| --- | ---: | ---: | ---: |
+| Prefill `jit_jitted_run_model` | 604.401ms | 561.371ms | -7.1% |
+| Prefill HLO self-time aggregate | 22432.095ms | 20450.354ms | -8.8% |
+| Prefill elementwise aggregate | 3947.990ms | 1993.050ms | -49.5% |
+| Prefill custom-kernel aggregate | 15190.020ms | 15175.350ms | -0.1% |
+| Prefill cache-write / event | 1.981ms | 1.014ms | -48.8% |
+| Decode `jit_jitted_run_model` | 5886.527ms | 5804.940ms | -1.4% |
+| Decode HLO self-time aggregate | 55143.598ms | 53448.362ms | -3.1% |
+| Decode elementwise aggregate | 3297.700ms | 1671.080ms | -49.3% |
+| Decode custom-kernel aggregate | 49251.400ms | 49245.740ms | -0.0% |
+| Decode cache-write / event | 2.113ms | 0.991ms | -53.1% |
+
+source event family 从 baseline 的 `reference.py:87 / :97` 两组变为 candidate 的
+`reference.py:104` 一组；`reference.py:91` 的 padding fusion 每个 event 约 `0.01us`，
+不是第二个 scatter。prefill DSA custom call 的归一化时长约
+`2.367ms -> 2.366ms`，decode 约 `71.873ms -> 70.959ms`，没有把 Pallas kernel 的变化
+误归因给本次优化。
+
+未 profile 的同 shape warmup wall 从 `102.616s` 降到 `100.345s`（-2.2%）。profiled
+request 从 `167.518s` 降到 `148.018s`，但两次都包含同步 trace flush，不能把 -11.6%
+当作 production 收益。candidate 的 `device_get` 最大时长仍与 device model envelope
+对齐（prefill `557.4ms`、decode `5800.1ms`），而 `copy_to_host_async` 仍为亚毫秒级；没有
+出现新的 host/Python 瓶颈。
+
+固定 acceptance gate 的结论是保留实现：correctness/schema 不变；两组 scatter 变一组；
+prefill 目标区域和 model envelope 都有超出 trace noise 的下降；decode 无回退。当前
+E2E 仍由 24 个 chunk 的模型执行和 DSA Pallas decode 主导，下一步再讨论 DSA kernel，
+不继续挤压本轮 non-kernel 范围。
+
 ## Profiling 阶段的范围
 
 下一阶段仍不优化 DSA Pallas kernel，而是：
@@ -209,3 +266,9 @@ E2E 测量稳定之后。
 - prefill/decode XProf：`an-wbmml9rf8u` / `an-qxbsln3gxe`。
 - host/Python trace：`an-wa47uzjlnm`；profile wall-gap：`an-tiifhhulg7`；non-DSA
   device source breakdown：`an-0emu7qinah`。
+- single-scatter candidate：Falcon `exp-6sroakc4lh`，artifact `art-q8dine8622`，source
+  `0324d5a0bf98944417d0a563fced8bf02a704db7`；source staging `exp-9k9z3qx0ks` /
+  `art-mtacuv18v3`。
+- candidate prefill/decode XProf：`an-u4d5j18uat` / `an-7ncficq29z`；candidate
+  source/host/timing breakdown：`an-nd08uoij7w`；精确 baseline MLA cache 聚合：
+  `an-o9l9bonmc2`。

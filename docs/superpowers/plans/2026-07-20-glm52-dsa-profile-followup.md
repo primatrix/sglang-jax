@@ -16,7 +16,7 @@
 
 - Modify: `python/sgl_jax/test/test_dsa_reference.py`
 
-- [ ] **Step 1: 把 sharding test 改成 single-scatter contract**
+- [x] **Step 1: 把 sharding test 改成 single-scatter contract**
 
 将 `test_write_mla_kv_cache_preserves_operand_sharding_on_both_scatters` 重命名为
 `test_write_mla_kv_cache_packs_latent_and_rope_into_one_sharded_scatter`，保留 `FakeCache`
@@ -29,7 +29,7 @@ assert captured[0]["values"].shape == (1, LATENT_ALIGNED + ROPE_DIM)
 assert captured[0]["index"][-1] == slice(None, LATENT_ALIGNED + ROPE_DIM)
 ```
 
-- [ ] **Step 2: 运行 focused test 并确认 RED**
+- [x] **Step 2: 运行 focused test 并确认 RED**
 
 Run:
 
@@ -48,7 +48,7 @@ Expected: FAIL，显示当前实现捕获到 2 次 `.set`。
 - Modify: `python/sgl_jax/srt/kernels/dsa/reference.py`
 - Test: `python/sgl_jax/test/test_dsa_reference.py`
 
-- [ ] **Step 1: 构造 packed update 并只调用一次 `.set`**
+- [x] **Step 1: 构造 packed update 并只调用一次 `.set`**
 
 在 slot index 计算之后，用 cache dtype 构造 alignment padding，再拼接 latent/RoPE：
 
@@ -58,6 +58,7 @@ rope = new_k_pe.astype(cache.dtype)
 latent_padding = jnp.zeros(
     (new_c_kv.shape[0], latent_aligned - latent_dim),
     dtype=cache.dtype,
+    out_sharding=jax.typeof(new_c_kv).sharding,
 )
 packed_update = jnp.concatenate((latent, latent_padding, rope), axis=-1)
 update_width = latent_aligned + rope_dim
@@ -71,7 +72,7 @@ return cache.at[page, row, lane, :update_width].set(
 这会保留 RoPE 尾部之后的 cache 内容；latent alignment gap 是未被 attention/indexer
 读取的 padding，写成 0 不改变语义。
 
-- [ ] **Step 2: 运行 focused test 并确认 GREEN**
+- [x] **Step 2: 运行 focused test 并确认 GREEN**
 
 Run:
 
@@ -83,7 +84,7 @@ Run:
 
 Expected: PASS。
 
-- [ ] **Step 3: 运行 DSA correctness regression**
+- [x] **Step 3: 运行 DSA correctness regression**
 
 Run:
 
@@ -98,7 +99,7 @@ Run:
 Expected: PASS；CPU/Torch selection、mapping、sparse MLA 和 backend integration gate
 均不变。
 
-- [ ] **Step 4: 提交 isolated implementation**
+- [x] **Step 4: 提交 isolated implementation**
 
 ```bash
 git add \
@@ -114,13 +115,13 @@ git commit -m "perf(dsa): combine MLA cache writes"
 - Modify: `scripts/kernels/falcon_glm52_dsa_v7x32_profile.yaml`
 - Modify: `note/2026-07-20-glm52-dsa-current-status.md`
 
-- [ ] **Step 1: 固化并 stage candidate source**
+- [x] **Step 1: 固化并 stage candidate source**
 
 将 Task 2 commit 打成 source archive，经 Falcon CPU staging experiment 放到 `/models`
 共享路径；记录 archive SHA256 和 staging exp/artifact。profile manifest 必须 pin 到该 commit
 和 archive checksum。
 
-- [ ] **Step 2: 提交完全相同的 v7x-32 profile**
+- [x] **Step 2: 提交完全相同的 v7x-32 profile**
 
 Run:
 
@@ -134,7 +135,7 @@ falcon workflow profile collect <candidate-exp-id> --timeout 2h --output json
 保持 checkpoint、TP32/DP1/EP32、fused MoE、3072 input、8 output、chunk size、
 precompile variants、tracer levels和 correctness schema gate 全部不变。
 
-- [ ] **Step 3: 对 candidate 的 prefill/decode 分别运行 XProf 和 source breakdown**
+- [x] **Step 3: 对 candidate 的 prefill/decode 分别运行 XProf 和 source breakdown**
 
 对 rank-0 `prefill` / `decode` subpath 分别创建 `xprof-summary`，再运行与 baseline
 `an-0emu7qinah` 同逻辑的 source breakdown analyzer。记录：
@@ -147,7 +148,7 @@ request warmup wall time
 output ids/logprobs/top-20 schema gates
 ```
 
-- [ ] **Step 4: 按固定 acceptance gate 决定保留或回滚**
+- [x] **Step 4: 按固定 acceptance gate 决定保留或回滚**
 
 仅在以下条件全部满足时保留：
 
@@ -168,12 +169,12 @@ implementation，不改写历史。
 - Modify: `note/2026-07-20-glm52-dsa-current-status.md`
 - Modify: `docs/superpowers/plans/2026-07-20-glm52-dsa-profile-followup.md`
 
-- [ ] **Step 1: 写入 before/after 和 Falcon IDs**
+- [x] **Step 1: 写入 before/after 和 Falcon IDs**
 
 记录 baseline/candidate exp、artifact、analysis、source commit，以及每项 acceptance gate 的
 结果；明确区分 profiler overhead 与 unprofiled E2E wall。
 
-- [ ] **Step 2: 最终本地验证**
+- [x] **Step 2: 最终本地验证**
 
 Run:
 
@@ -192,7 +193,7 @@ python -m py_compile scripts/kernels/profile_glm52_dsa_server.py
 
 Expected: all commands exit 0。
 
-- [ ] **Step 3: 提交 profile evidence**
+- [x] **Step 3: 提交 profile evidence**
 
 ```bash
 git add \
@@ -201,3 +202,13 @@ git add \
   docs/superpowers/plans/2026-07-20-glm52-dsa-profile-followup.md
 git commit -m "docs(dsa): record MLA cache-write profile"
 ```
+
+## 执行结果（2026-07-20）
+
+- 初次 candidate `exp-owybp7zc86` 在 JAX 0.9.0 首次 EXTEND trace 暴露 padding
+  sharding 不一致；TDD 修复为 `0324d5a0b`。
+- 成功复测：`exp-6sroakc4lh` / `art-q8dine8622`；prefill/decode XProf 为
+  `an-u4d5j18uat` / `an-7ncficq29z`。
+- 两组 scatter 已变成一组；prefill/decode 单 event cache-write 时长分别下降
+  `48.8% / 53.1%`，model envelope 分别下降 `7.1% / 1.4%`。
+- correctness/schema gate 不变，DSA custom-kernel aggregate 不变，accept implementation。
