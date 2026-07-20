@@ -1,6 +1,7 @@
 """Host-side contract tests for the DSA decode MLA benchmark fixture."""
 
 import inspect
+import sys
 import unittest
 from unittest import mock
 
@@ -124,57 +125,43 @@ class TestDSADecodeMLABenchmarkInputs(unittest.TestCase):
             make_benchmark_inputs(**{**common_kwargs, "top_k": 0})
         with self.assertRaisesRegex(ValueError, "page_size"):
             make_benchmark_inputs(**{**common_kwargs, "page_size": 12})
-        with self.assertRaisesRegex(ValueError, "active_batch_size"):
-            make_benchmark_inputs(**{**common_kwargs, "active_batch_size": 2})
+        parameters = inspect.signature(make_benchmark_inputs).parameters
+        self.assertNotIn("active_batch_size", parameters)
+        self.assertNotIn("cache_capacity", parameters)
+        self.assertNotIn("request_layout", parameters)
 
-    def test_fixture_zeroes_inactive_physical_bucket_rows(self):
-        inputs = make_benchmark_inputs(
-            batch_size=64,
-            active_batch_size=1,
-            context_length=4096,
-            top_k=2048,
-            num_heads=2,
-            latent_dim=512,
-            rope_dim=64,
-            page_size=128,
-            slot_order="unsorted",
-            valid_count_pattern="full",
-            seed=4,
+    def test_cli_defaults_to_one_head_single_device_decode_case(self):
+        with mock.patch.object(sys, "argv", ["bench_dsa_decode_mla.py"]):
+            args = benchmark_module._parse_args()
+
+        self.assertEqual(args.batch_size, 1)
+        self.assertEqual(args.num_heads, 1)
+        self.assertEqual(args.context_length, 8192)
+        self.assertEqual(args.top_k, 2048)
+        self.assertEqual(args.variant, "sparse")
+
+    def test_cli_rejects_dimensions_outside_single_head_handoff_contract(self):
+        invalid_arguments = (
+            ("--num-heads", "8"),
+            ("--latent-dim", "128"),
+            ("--rope-dim", "128"),
+            ("--page-size", "64"),
         )
+        for flag, value in invalid_arguments:
+            with (
+                self.subTest(flag=flag),
+                mock.patch.object(sys, "argv", ["bench_dsa_decode_mla.py", flag, value]),
+                self.assertRaises(SystemExit),
+            ):
+                benchmark_module._parse_args()
 
-        self.assertEqual(inputs.ql_nope.shape, (64, 2, 512))
-        self.assertEqual(inputs.topk_slots.shape, (64, 2048))
-        self.assertEqual(inputs.valid_counts.tolist(), [2048] + [0] * 63)
-        self.assertTrue(np.all(inputs.topk_slots[1:] == 0))
-
-    def test_fixture_uses_disjoint_request_regions_for_multirow_pressure(self):
-        inputs = make_benchmark_inputs(
-            batch_size=2,
-            active_batch_size=2,
-            context_length=32,
-            top_k=8,
-            num_heads=2,
-            latent_dim=128,
-            rope_dim=64,
-            page_size=16,
-            slot_order="unsorted",
-            request_layout="disjoint",
-            seed=7,
-        )
-
-        self.assertEqual(inputs.cache_kv.shape, (4, 8, 2, 256))
-        self.assertTrue(np.all(inputs.topk_slots[0, :8] < 32))
-        self.assertTrue(np.all(inputs.topk_slots[1, :8] >= 32))
-        self.assertTrue(np.all(inputs.topk_slots[1, :8] < 64))
-        self.assertEqual(
-            np.intersect1d(inputs.topk_slots[0, :8], inputs.topk_slots[1, :8]).size,
-            0,
-        )
+    def test_device_selection_uses_one_local_device_without_count_requirement(self):
+        devices = [object() for _ in range(32)]
+        self.assertIs(benchmark_module._select_benchmark_device(devices), devices[0])
 
     def test_fixture_builds_causal_prefill_counts_with_static_kmax(self):
         inputs = make_benchmark_inputs(
             batch_size=128,
-            active_batch_size=128,
             context_length=128,
             top_k=2048,
             num_heads=2,
@@ -198,7 +185,6 @@ class TestDSADecodeMLABenchmarkInputs(unittest.TestCase):
     def test_fixture_builds_saturated_prefill_counts_after_topk_boundary(self):
         inputs = make_benchmark_inputs(
             batch_size=128,
-            active_batch_size=128,
             context_length=2176,
             top_k=2048,
             num_heads=2,

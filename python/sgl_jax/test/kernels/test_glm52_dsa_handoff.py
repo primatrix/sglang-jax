@@ -13,129 +13,68 @@ from benchmark.kernels.mla.glm52_dsa_handoff import (
 )
 
 
-def test_production_contract_uses_tp32_local_shape():
-    assert GLM52_DSA_CONTRACT.total_query_heads == 64
-    assert GLM52_DSA_CONTRACT.tensor_parallel_size == 32
-    assert GLM52_DSA_CONTRACT.local_query_heads == 2
+def test_contract_contains_only_kernel_local_dimensions():
+    assert not hasattr(GLM52_DSA_CONTRACT, "total_query_heads")
+    assert not hasattr(GLM52_DSA_CONTRACT, "tensor_parallel_size")
     assert GLM52_DSA_CONTRACT.latent_dim == 512
     assert GLM52_DSA_CONTRACT.rope_dim == 64
     assert GLM52_DSA_CONTRACT.cache_width == 640
     assert GLM52_DSA_CONTRACT.page_size == 128
     assert GLM52_DSA_CONTRACT.packing == 2
     assert GLM52_DSA_CONTRACT.index_topk == 2048
+    assert GLM52_DSA_CONTRACT.index_heads == 32
+    assert GLM52_DSA_CONTRACT.index_head_dim == 128
     assert GLM52_DSA_CONTRACT.attention_scale == 256**-0.5
 
 
-def test_performance_manifest_covers_required_decode_and_prefill_shapes():
+def test_performance_manifest_is_a_small_single_head_kernel_matrix():
     cases = {case.name: case for case in PERFORMANCE_CASES}
     assert set(cases) == {
-        "decode-bucket-a1-c512",
-        "decode-bucket-a1-c1024",
-        "decode-bucket-a1-c2048",
-        "decode-bucket-a1-c4096",
-        "decode-bucket-a8-c4096",
-        "decode-bucket-a32-c4096",
-        "decode-bucket-a64-c4096",
-        "decode-long-a1-c160k",
-        "decode-throughput-a8-c32k",
-        "prefill-t128-start0",
-        "prefill-t128-start2048",
+        "debug-q1-h1-c128-k128",
+        "decode-q1-h1-c8192-k2048",
+        "prefill-q128-h1-start2048-k2048",
     }
 
-    assert cases["decode-bucket-a1-c512"].shape_tuple == (
-        "decode",
-        64,
-        1,
-        512,
-        2048,
-    )
-    assert cases["decode-bucket-a1-c1024"].shape_tuple == (
-        "decode",
-        64,
-        1,
-        1024,
-        2048,
-    )
-    assert cases["decode-bucket-a1-c2048"].shape_tuple == (
-        "decode",
-        64,
-        1,
-        2048,
-        2048,
-    )
-
-    assert cases["decode-bucket-a1-c4096"].shape_tuple == (
-        "decode",
-        64,
-        1,
-        4096,
-        2048,
-    )
-    assert cases["decode-bucket-a64-c4096"].shape_tuple == (
-        "decode",
-        64,
-        64,
-        4096,
-        2048,
-    )
-    assert cases["decode-bucket-a8-c4096"].active_query_rows == 8
-    assert cases["decode-bucket-a32-c4096"].active_query_rows == 32
-    assert cases["decode-bucket-a64-c4096"].minimum_cache_capacity == 262_144
-    assert cases["decode-throughput-a8-c32k"].minimum_cache_capacity == 256_000
-    assert cases["prefill-t128-start2048"].minimum_cache_capacity == 2176
-    assert cases["decode-long-a1-c160k"].shape_tuple == (
+    assert cases["debug-q1-h1-c128-k128"].shape_tuple == (
         "decode",
         1,
         1,
-        160_000,
-        2048,
+        128,
+        128,
     )
-    assert cases["decode-throughput-a8-c32k"].shape_tuple == (
+    assert cases["decode-q1-h1-c8192-k2048"].shape_tuple == (
         "decode",
-        8,
-        8,
-        32_000,
+        1,
+        1,
+        8192,
         2048,
     )
-    assert cases["prefill-t128-start0"].shape_tuple == (
+    assert cases["prefill-q128-h1-start2048-k2048"].shape_tuple == (
         "prefill",
         128,
-        128,
-        128,
-        2048,
-    )
-    assert cases["prefill-t128-start0"].start_position == 0
-    assert cases["prefill-t128-start2048"].shape_tuple == (
-        "prefill",
-        128,
-        128,
+        1,
         2176,
         2048,
     )
-    assert cases["prefill-t128-start2048"].start_position == 2048
+    assert cases["prefill-q128-h1-start2048-k2048"].start_position == 2048
 
 
-def test_every_performance_case_uses_production_kernel_dimensions():
+def test_every_performance_case_is_single_head_and_kernel_local():
     for case in PERFORMANCE_CASES:
-        assert case.num_heads == GLM52_DSA_CONTRACT.local_query_heads
+        assert case.num_heads == 1
         assert case.latent_dim == GLM52_DSA_CONTRACT.latent_dim
         assert case.rope_dim == GLM52_DSA_CONTRACT.rope_dim
         assert case.page_size == GLM52_DSA_CONTRACT.page_size
-        if case.mode == "prefill":
-            assert case.request_layout == "shared"
-        else:
-            assert case.request_layout == "disjoint"
 
 
-def test_performance_manifest_rejects_nonproduction_kernel_dimensions():
-    with pytest.raises(ValueError, match="production kernel dimensions"):
+def test_performance_manifest_rejects_multihead_microbench_cases():
+    with pytest.raises(ValueError, match="one independent head"):
         SparseMlaPerfCase(
             name="wrong-head-count",
             mode="decode",
-            physical_query_rows=1,
-            active_query_rows=1,
+            query_rows=1,
             context_length=2048,
-            num_heads=4,
+            num_heads=2,
         )
 
 
@@ -215,17 +154,9 @@ def test_cpu_exporter_declares_all_stages_and_round_trips(tmp_path):
         assert arrays["expected_output"].dtype == np.float32
         assert arrays["physical_slots"].dtype == np.int32
         assert arrays["selected_counts"].dtype == np.int32
-        assert arrays["expected_output"].shape == (7, 2, 512)
-        assert arrays["selected_counts"].tolist() == [
-            0,
-            1,
-            127,
-            128,
-            129,
-            2047,
-            2048,
-        ]
-        counted_slots = arrays["physical_slots"][3, :128]
+        assert arrays["expected_output"].shape == (4, 1, 512)
+        assert arrays["selected_counts"].tolist() == [0, 1, 128, 2048]
+        counted_slots = arrays["physical_slots"][2, :128]
         sorted_slots = np.sort(counted_slots)
         assert all(
             not np.array_equal(counted_slots, np.roll(sorted_slots, shift))

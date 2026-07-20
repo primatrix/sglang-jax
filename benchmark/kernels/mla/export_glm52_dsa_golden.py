@@ -393,15 +393,16 @@ def _sparse_mla_case(
     *, generator: torch.Generator
 ) -> tuple[dict[str, np.ndarray], dict[str, str]]:
     contract = GLM52_DSA_CONTRACT
-    query_rows = 7
+    query_rows = 4
+    num_heads = 1
     context_length = 2176
     page_count = (context_length + contract.page_size - 1) // contract.page_size
     q_latent = _bf16_random(
-        (query_rows, contract.local_query_heads, contract.latent_dim),
+        (query_rows, num_heads, contract.latent_dim),
         generator=generator,
     )
     q_rope = _bf16_random(
-        (query_rows, contract.local_query_heads, contract.rope_dim),
+        (query_rows, num_heads, contract.rope_dim),
         generator=generator,
     )
     cache = _bf16_random(
@@ -413,8 +414,8 @@ def _sparse_mla_case(
         ),
         generator=generator,
     )
-    selected_counts = torch.tensor([0, 1, 127, 128, 129, 2047, 2048], dtype=torch.int32)
-    visible_lengths = (1, 1, 127, 128, 129, 2047, context_length)
+    selected_counts = torch.tensor([0, 1, 128, 2048], dtype=torch.int32)
+    visible_lengths = (1, 1, 128, context_length)
     physical_slots = torch.zeros((query_rows, contract.index_topk), dtype=torch.int32)
     for row, (count, visible_length) in enumerate(
         zip(selected_counts.tolist(), visible_lengths, strict=True)
@@ -535,12 +536,13 @@ def export_golden_bundle(
     cases.append(
         _write_case(
             output_dir,
-            name="sparse-mla-production-dims",
+            name="sparse-mla-single-head",
             stage="sparse_mla",
             arrays=sparse_arrays,
             semantic_dtypes=sparse_dtypes,
             metadata={
-                "selected_counts": [0, 1, 127, 128, 129, 2047, 2048],
+                "selected_counts": [0, 1, 128, 2048],
+                "num_heads": 1,
                 "slot_order": "unsorted",
                 "fp32_score_softmax_and_accumulation": True,
             },
@@ -552,10 +554,7 @@ def export_golden_bundle(
         "seed": seed,
         "candidate_lengths": list(concrete_lengths),
         "contract": dataclasses.asdict(GLM52_DSA_CONTRACT)
-        | {
-            "local_query_heads": GLM52_DSA_CONTRACT.local_query_heads,
-            "cache_width": GLM52_DSA_CONTRACT.cache_width,
-        },
+        | {"cache_width": GLM52_DSA_CONTRACT.cache_width},
         "abi": {
             "indexer_selection": {
                 "q_index_axes": ["query", "index_head", "index_feature"],
@@ -609,13 +608,13 @@ def export_golden_bundle(
                 "output_count": "number of valid unique compacted entries",
             },
             "final_sparse_mla": {
-                "q_latent_axes": ["query", "local_head", "latent_feature"],
-                "q_rope_axes": ["query", "local_head", "rope_feature"],
+                "q_latent_axes": ["query", "head", "latent_feature"],
+                "q_rope_axes": ["query", "head", "rope_feature"],
                 "cache_axis_names": ["page", "packed_row", "lane", "feature"],
                 "physical_slots_axes": ["query", "selected_rank"],
                 "selected_counts_axes": ["query"],
                 "sm_scale_axes": [],
-                "output_axes": ["query", "local_head", "latent_feature"],
+                "output_axes": ["query", "head", "latent_feature"],
                 "physical_slot_decode": {
                     "page": "slot // 128",
                     "offset": "slot % 128",
