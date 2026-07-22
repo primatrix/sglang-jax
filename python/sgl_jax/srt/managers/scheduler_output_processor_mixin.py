@@ -78,9 +78,9 @@ class SchedulerOutputProcessorMixin:
     We put them into a separate file to make the `scheduler.py` shorter.
     """
 
-    def _resolve_normal_overlap_result(self, result, launch_done=None):
+    def _resolve_overlap_v2_result(self, result, launch_done=None):
         if result.worker_batch is not None:
-            return self.tp_worker.resolve_result(
+            return self.tp_worker.resolve_last_batch_result(
                 result.logits_output,
                 result.next_token_ids,
                 result.worker_batch,
@@ -135,7 +135,7 @@ class SchedulerOutputProcessorMixin:
                     launch_done.wait()
             else:
                 logits_output, next_token_ids, cache_miss_count = (
-                    self._resolve_normal_overlap_result(result, launch_done)
+                    self._resolve_overlap_v2_result(result, launch_done)
                 )
         else:
             # Move next_token_ids and logprobs to cpu
@@ -405,7 +405,7 @@ class SchedulerOutputProcessorMixin:
                 next_token_logprobs = None
             else:
                 logits_output, next_token_ids, cache_miss_count = (
-                    self._resolve_normal_overlap_result(result, launch_done)
+                    self._resolve_overlap_v2_result(result, launch_done)
                 )
                 next_token_logprobs = logits_output.next_token_logprobs
         else:
