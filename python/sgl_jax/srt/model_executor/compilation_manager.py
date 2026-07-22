@@ -12,6 +12,7 @@ from tqdm import tqdm
 from sgl_jax.srt.utils.common_utils import (
     PRECOMPILE_DEFAULT_BS_PADDINGS,
     PRECOMPILE_DEFAULT_TOKEN_PADDINGS,
+    resolve_vision_patch_buckets,
 )
 
 if TYPE_CHECKING:
@@ -34,7 +35,8 @@ class CompilationManager:
         page_size: int,
         max_req_len: int,
         vocab_size: int,
-        multimodal: bool = False,
+        precompile_in_model_vision: bool = False,
+        capture_hidden_states: bool = False,
         has_recurrent_state: bool = False,
         moe_backend: str | None = None,
     ):
@@ -45,7 +47,8 @@ class CompilationManager:
         self.max_padded_batch_size = max_padded_batch_size
         self.max_padded_num_tokens = max_padded_num_tokens
         self.vocab_size = vocab_size
-        self.multimodal = multimodal
+        self.precompile_in_model_vision = precompile_in_model_vision
+        self.capture_hidden_states = capture_hidden_states
         self.has_recurrent_state = has_recurrent_state
         # Callers pass the *effective* backend (ModelConfig.moe_backend), which
         # resolves architectures that hard-code FusedEPMoE (e.g. Qwen3.5) to
@@ -57,6 +60,9 @@ class CompilationManager:
         self.token_buckets = self._compute_token_buckets(server_args.precompile_token_paddings)
         self.bs_buckets = self._compute_bs_buckets(server_args.precompile_bs_paddings)
         self.cache_loc_buckets = self._compute_cache_loc_buckets()
+        self.vision_patch_buckets = resolve_vision_patch_buckets(
+            getattr(server_args, "precompile_vision_patch_paddings", None)
+        )
 
         self._compiled_variants: set[tuple] = set()
 
@@ -101,6 +107,37 @@ class CompilationManager:
         pages_per_req = (self.max_req_len + self.page_size - 1) // self.page_size * self.page_size
         return [bs * pages_per_req for bs in self.bs_buckets]
 
+    def _extend_variant_names(self, model_runner: ModelRunner) -> tuple[str, ...]:
+        variants = ["text"]
+        if self.precompile_in_model_vision and getattr(
+            model_runner.model, "materialize_input_embeddings", False
+        ):
+            variants.append("multimodal")
+        return tuple(variants)
+
+    @staticmethod
+    def _populate_dummy_multimodal_inputs(batch, model_runner: ModelRunner) -> None:
+        """Populate the array leaves produced by the runtime vision merge.
+
+        The values are irrelevant for compilation. Shapes, dtypes, and shardings
+        are established by ``ForwardBatch.init_new`` to match real VLM EXTEND
+        batches.
+        """
+        hidden_size = model_runner.model_config.hidden_size
+        num_tokens = len(batch.input_ids)
+        dtype = np.dtype(model_runner.model_config.dtype)
+        batch.input_embedding = np.zeros((num_tokens, hidden_size), dtype=dtype)
+
+        deepstack_layers = getattr(model_runner.model, "deepstack_visual_layers", 0)
+        if isinstance(deepstack_layers, int) and deepstack_layers > 0:
+            batch.deepstack_visual_embedding = np.zeros(
+                (deepstack_layers, num_tokens, hidden_size),
+                dtype=dtype,
+            )
+            # Real Qwen3-VL requests carry True. Keeping the dummy identical also
+            # exercises the DeepStack addition branch while adding only zeros.
+            batch.apply_for_deepstack = True
+
     # ---- Pre-compilation ----
 
     def precompile_all(
@@ -114,8 +151,147 @@ class CompilationManager:
         self._precompile_extend(
             forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
         )
+        if self.precompile_in_model_vision:
+            self._precompile_vision(model_runner, mesh)
         self._precompile_decode(
             forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
+        )
+
+    def _precompile_vision(self, model_runner: ModelRunner, mesh):
+        """Warm ViT encode and token-shaped merge executables across buckets.
+
+        Runs the exact runtime embed path (``general_mm_embed_routine`` ->
+        ``embed_mm_inputs`` -> encode + merge) with a zero-filled, all-masked
+        dummy plan (no token rows are touched).
+
+        Encoder output length is derived from the patch bucket and routing is
+        padded to the token bucket. Warm every patch bucket once, then every
+        reachable output length against every token bucket.
+        """
+        from types import SimpleNamespace
+
+        import jax
+        from jax.sharding import NamedSharding, PartitionSpec
+
+        from sgl_jax.srt.model_executor.forward_batch_info import _device_put_embed_plan
+        from sgl_jax.srt.multimodal.in_model.host_orchestration import (
+            general_mm_embed_routine,
+        )
+        from sgl_jax.srt.multimodal.in_model.registry import (
+            resolve_encoder_plan_builder,
+        )
+
+        builder = resolve_encoder_plan_builder(
+            model_runner.model_config,
+            input_buckets=self.vision_patch_buckets,
+        )
+        if builder is None:
+            logger.info("[VISION] No in-model plan builder; skipping vision precompile.")
+            return
+        if not self.vision_patch_buckets:
+            logger.info("[VISION] No vision buckets configured; skipping vision precompile.")
+            return
+
+        multimodal_model = model_runner.model
+        language_backbone = multimodal_model.model
+        # Match the runtime encode lane count: DP-Encoder fans over the tensor
+        # devices, TP-Encoder uses a single collaborative lane per DP rank.
+        from sgl_jax.srt.multimodal.layers.vision_sharding import encode_lane_count
+
+        encode_lanes = encode_lane_count(mesh, getattr(multimodal_model, "encoder_tp", False))
+
+        # Token buckets the runtime merge will actually see (dp-aligned).
+        token_buckets = self.token_buckets or [max(self.dp_size, 1)]
+        min_token = token_buckets[0]
+
+        def warm(patch_bucket, num_tokens) -> bool:
+            input_ids = jax.device_put(
+                np.zeros((num_tokens,), dtype=np.int32),
+                NamedSharding(mesh, PartitionSpec("data")),
+            )
+            plan = builder.dummy_plan(
+                self.dp_size,
+                encode_lanes,
+                patch_bucket,
+                num_tokens // self.dp_size,
+            )
+            _device_put_embed_plan(plan, mesh)
+            forward_batch = SimpleNamespace(input_embedding=None)
+            try:
+                general_mm_embed_routine(
+                    input_ids=input_ids,
+                    forward_batch=forward_batch,
+                    language_model=language_backbone,
+                    multimodal_model=multimodal_model,
+                    mm_embed_plan=plan,
+                )
+                jax.block_until_ready(forward_batch.input_embedding)
+                return True
+            except Exception as exc:  # pragma: no cover - best-effort warmup
+                logger.warning(
+                    "[VISION] Skipping warmup (patch=%s, tokens=%s): %s",
+                    patch_bucket,
+                    num_tokens,
+                    exc,
+                )
+                return False
+
+        # Warm every encoder input shape, then each output length and token shape.
+        input_bucket_by_output_length: dict[int, int] = {}
+        for patch_bucket in self.vision_patch_buckets:
+            output_length = builder.get_num_output_tokens(patch_bucket)
+            input_bucket_by_output_length.setdefault(
+                output_length,
+                patch_bucket,
+            )
+
+        combos = [
+            ("encoder", patch_bucket, min_token) for patch_bucket in self.vision_patch_buckets
+        ]
+        combos += [
+            ("merge", patch_bucket, num_tokens)
+            for patch_bucket in input_bucket_by_output_length.values()
+            for num_tokens in token_buckets[1:]
+        ]
+
+        start_time = time.perf_counter()
+        phase_times = {"encoder": [], "merge": []}
+        logger.info("[VISION] Begin to precompile %d model-shape combos", len(combos))
+        warmed = 0
+        with tqdm(combos, desc="[VISION] PRECOMPILE", leave=False) as pbar:
+            for phase, patch_bucket, num_tokens in pbar:
+                output_length = builder.get_num_output_tokens(patch_bucket)
+                pbar.set_postfix(
+                    phase=phase,
+                    patch=patch_bucket,
+                    output=output_length,
+                    tokens=num_tokens,
+                )
+                combo_start = time.perf_counter()
+                success = warm(patch_bucket, num_tokens)
+                elapsed = time.perf_counter() - combo_start
+                phase_times[phase].append(elapsed)
+                logger.info(
+                    "[VISION] %s warmup patch=%d output=%d tokens=%d %s in %.2fs",
+                    phase,
+                    patch_bucket,
+                    output_length,
+                    num_tokens,
+                    "finished" if success else "failed",
+                    elapsed,
+                )
+                if success:
+                    self._compiled_variants.add(("VISION", patch_bucket, num_tokens))
+                    warmed += 1
+        total_time = time.perf_counter() - start_time
+        logger.info(
+            "[VISION] Precompile finished: warmed %d/%d combos in %.2fs "
+            "(encoder sweep %.2fs, merge sweep %.2fs)",
+            warmed,
+            len(combos),
+            total_time,
+            sum(phase_times["encoder"]),
+            sum(phase_times["merge"]),
         )
 
     def _precompile_extend(
@@ -132,17 +308,19 @@ class CompilationManager:
 
         start_time = time.perf_counter()
         bs = self.max_padded_batch_size
+        variant_names = self._extend_variant_names(model_runner)
         logger.info(
-            "[EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s",
+            "[EXTEND] Begin to precompile variants=%s bs_paddings=%s token_paddings=%s",
+            variant_names,
             [bs],
             self.token_buckets,
         )
 
-        pairs = list(itertools.product([bs], self.token_buckets))
+        pairs = list(itertools.product(variant_names, [bs], self.token_buckets))
         with tqdm(pairs, desc="[EXTEND] PRECOMPILE", leave=False) as pbar:
             for pair in pbar:
-                bs_val, num_tokens = pair
-                pbar.set_postfix(bs=bs_val, tokens=num_tokens)
+                variant_name, bs_val, num_tokens = pair
+                pbar.set_postfix(variant=variant_name, bs=bs_val, tokens=num_tokens)
                 if bs_val > num_tokens:
                     logger.warning("bs=%s > num_tokens=%s, skip this pair", bs_val, num_tokens)
                     continue
@@ -154,6 +332,8 @@ class CompilationManager:
                     dp_size=self.dp_size,
                     per_dp_bs_size=bs_val // self.dp_size,
                 )
+                if variant_name == "multimodal":
+                    self._populate_dummy_multimodal_inputs(batch, model_runner)
                 if prepare_lora_fn is not None:
                     prepare_lora_fn(batch)
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
@@ -169,10 +349,14 @@ class CompilationManager:
                 forward_fn(
                     batch,
                     launch_done=None,
-                    skip_sample=False,
+                    skip_sample=variant_name == "multimodal",
                     sampling_metadata=sampling_metadata,
                 )
-                self._compiled_variants.add((ForwardMode.EXTEND, num_tokens, bs_val, False))
+                if variant_name == "text":
+                    variant_key = (ForwardMode.EXTEND, num_tokens, bs_val, False)
+                else:
+                    variant_key = ("VLM_EXTEND", num_tokens, bs_val)
+                self._compiled_variants.add(variant_key)
 
         end_time = time.perf_counter()
         logger.info("[EXTEND] Precompile finished in %.0f secs", end_time - start_time)
@@ -322,7 +506,7 @@ class CompilationManager:
             logits_indices=logits_indices,
             input_logprob_indices=None,
             capture_hidden_mode=(
-                CaptureHiddenMode.FULL if self.multimodal else CaptureHiddenMode.NULL
+                CaptureHiddenMode.FULL if self.capture_hidden_states else CaptureHiddenMode.NULL
             ),
             spec_algorithm=spec_algorithm_value,
             lora_ids=lora_ids,

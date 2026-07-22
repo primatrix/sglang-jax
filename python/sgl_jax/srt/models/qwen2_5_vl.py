@@ -583,6 +583,9 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
     transparently by ``Qwen2Model`` (mrope-aware RoPE + 3-D positions).
     """
 
+    materialize_input_embeddings = True
+    mrope_position_axes = 3
+
     def __init__(self, config=None, dtype=None, mesh=None, rngs=None):
         super().__init__()
         self.mesh = mesh

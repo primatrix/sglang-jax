@@ -66,7 +66,11 @@ from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.srt.sampling.sampling_params import DEFAULT_SAMPLING_SEED, SamplingParams
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
-from sgl_jax.srt.utils.common_utils import get_bool_env_var, pad_to_bucket
+from sgl_jax.srt.utils.common_utils import (
+    get_bool_env_var,
+    pad_to_bucket,
+    resolve_vision_patch_buckets,
+)
 
 if TYPE_CHECKING:
     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
@@ -83,6 +87,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "speculative_accept_threshold_single",
     "speculative_accept_threshold_acc",
     "enable_deterministic_sampling",
+    "precompile_vision_patch_paddings",
     "vision_encoder_parallel",
 ]
 
@@ -3094,6 +3099,9 @@ class ScheduleBatch:
                 # DP-Encoder fans a DP rank's requests across the tensor devices;
                 # TP-Encoder keeps a single collaborative lane per DP rank.
                 tp_size=encode_lane_count(self.mesh, encoder_tp),
+                input_buckets=resolve_vision_patch_buckets(
+                    global_server_args_dict.get("precompile_vision_patch_paddings")
+                ),
             )
         else:
             mm_embed_plan = None

@@ -38,6 +38,17 @@ logger = logging.getLogger(__name__)
 
 PRECOMPILE_DEFAULT_TOKEN_PADDINGS = [1 << i for i in range(6, 14)]
 PRECOMPILE_DEFAULT_BS_PADDINGS = [1 << i for i in range(0, 9)]
+PRECOMPILE_DEFAULT_VISION_PATCH_PADDINGS = [256, 512, 1024, 2048, 4096, 5120, 8192, 16384]
+
+
+def resolve_vision_patch_buckets(user_paddings: list[int] | None) -> list[int]:
+    """Sorted, de-duplicated positive patch buckets (single source of truth).
+
+    Shared by precompile (``CompilationManager``) and the runtime plan builder so
+    both pad ``patch_k`` to the same values; otherwise the warmup misses.
+    """
+    paddings = user_paddings or PRECOMPILE_DEFAULT_VISION_PATCH_PADDINGS
+    return sorted({p for p in paddings if p > 0})
 
 
 def align_bs_for_fused_ep(bs: int, ep_size: int) -> int:

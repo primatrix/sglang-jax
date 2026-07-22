@@ -1,8 +1,17 @@
 import unittest
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import jax.numpy as jnp
+import numpy as np
 
 from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
-from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sgl_jax.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
+from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.utils.common_utils import align_bs_for_fused_ep, pad_to_bucket
 
 
@@ -36,6 +45,7 @@ def _make_server_args(**overrides):
     args = MagicMock()
     args.precompile_token_paddings = None
     args.precompile_bs_paddings = None
+    args.precompile_vision_patch_paddings = None
     args.moe_backend = "none"
     args.enable_static_lora = False
     args.multimodal = False
@@ -45,6 +55,27 @@ def _make_server_args(**overrides):
 
 
 class TestBucketComputation(unittest.TestCase):
+    def test_vision_patch_buckets(self):
+        defaults = self._manager()
+        custom = self._manager(
+            precompile_vision_patch_paddings=[256, 64, 1024],
+        )
+        self.assertIn(5120, defaults.vision_patch_buckets)
+        self.assertEqual(custom.vision_patch_buckets, [64, 256, 1024])
+
+    @staticmethod
+    def _manager(**overrides):
+        return CompilationManager(
+            server_args=_make_server_args(**overrides),
+            max_padded_batch_size=8,
+            max_padded_num_tokens=2048,
+            dp_size=1,
+            tp_size=1,
+            page_size=64,
+            max_req_len=2048,
+            vocab_size=1000,
+        )
+
     def test_token_buckets_default(self):
         cm = CompilationManager(
             server_args=_make_server_args(),
@@ -281,7 +312,7 @@ class TestDummyBatch(unittest.TestCase):
         assert batch.per_dp_bs_size == 16
         assert batch.real_bs_per_dp == [16, 16, 16, 16]
 
-    def test_multimodal_capture_hidden(self):
+    def test_multistage_capture_hidden(self):
         cm = CompilationManager(
             server_args=_make_server_args(),
             max_padded_batch_size=32,
@@ -291,10 +322,137 @@ class TestDummyBatch(unittest.TestCase):
             page_size=128,
             max_req_len=4096,
             vocab_size=32000,
-            multimodal=True,
+            capture_hidden_states=True,
         )
         batch = cm._make_dummy_batch(32, 128, ForwardMode.EXTEND, 512)
         assert batch.capture_hidden_mode == CaptureHiddenMode.FULL
+
+    def test_in_model_vision_does_not_capture_hidden(self):
+        cm = CompilationManager(
+            server_args=_make_server_args(),
+            max_padded_batch_size=32,
+            max_padded_num_tokens=512,
+            dp_size=1,
+            tp_size=4,
+            page_size=128,
+            max_req_len=4096,
+            vocab_size=32000,
+            precompile_in_model_vision=True,
+        )
+        batch = cm._make_dummy_batch(32, 128, ForwardMode.EXTEND, 512)
+        assert batch.capture_hidden_mode == CaptureHiddenMode.NULL
+
+    def test_multimodal_extend_has_separate_precompile_variant(self):
+        cm = CompilationManager(
+            server_args=_make_server_args(),
+            max_padded_batch_size=32,
+            max_padded_num_tokens=512,
+            dp_size=1,
+            tp_size=4,
+            page_size=128,
+            max_req_len=4096,
+            vocab_size=32000,
+            precompile_in_model_vision=True,
+        )
+        model_runner = MagicMock()
+        model_runner.model.materialize_input_embeddings = True
+
+        assert cm._extend_variant_names(model_runner) == ("text", "multimodal")
+
+    def test_text_only_extend_has_one_precompile_variant(self):
+        model_runner = MagicMock()
+        model_runner.model.materialize_input_embeddings = True
+
+        assert self.cm._extend_variant_names(model_runner) == ("text",)
+
+    def test_populate_dummy_multimodal_inputs(self):
+        cm = CompilationManager(
+            server_args=_make_server_args(),
+            max_padded_batch_size=32,
+            max_padded_num_tokens=512,
+            dp_size=1,
+            tp_size=4,
+            page_size=128,
+            max_req_len=4096,
+            vocab_size=32000,
+            precompile_in_model_vision=True,
+        )
+        batch = cm._make_dummy_batch(8, 32, ForwardMode.EXTEND, 512)
+        model_runner = MagicMock()
+        model_runner.model_config.hidden_size = 16
+        model_runner.model_config.dtype = jnp.bfloat16
+        model_runner.model.deepstack_visual_layers = 3
+
+        cm._populate_dummy_multimodal_inputs(batch, model_runner)
+
+        assert batch.input_embedding.shape == (32, 16)
+        assert batch.input_embedding.dtype == np.dtype(jnp.bfloat16)
+        assert batch.deepstack_visual_embedding.shape == (3, 32, 16)
+        assert batch.deepstack_visual_embedding.dtype == np.dtype(jnp.bfloat16)
+        assert batch.apply_for_deepstack is True
+
+    def test_precompile_extend_warms_text_and_multimodal_signatures(self):
+        cm = CompilationManager(
+            server_args=_make_server_args(
+                precompile_token_paddings=[4],
+                precompile_bs_paddings=[2],
+            ),
+            max_padded_batch_size=2,
+            max_padded_num_tokens=4,
+            dp_size=1,
+            tp_size=1,
+            page_size=4,
+            max_req_len=8,
+            vocab_size=16,
+            precompile_in_model_vision=True,
+        )
+        model_runner = MagicMock()
+        model_runner.model.materialize_input_embeddings = True
+        model_runner.model.deepstack_visual_layers = 2
+        model_runner.model_config.hidden_size = 8
+        model_runner.model_config.dtype = jnp.bfloat16
+        calls = []
+
+        def forward_fn(batch, **kwargs):
+            calls.append(
+                {
+                    "input_embedding": batch.input_embedding,
+                    "deepstack": batch.deepstack_visual_embedding,
+                    "apply_deepstack": batch.apply_for_deepstack,
+                    "skip_sample": kwargs["skip_sample"],
+                }
+            )
+
+        def init_forward_batch(batch, _model_runner):
+            return SimpleNamespace(input_ids=batch.input_ids)
+
+        with (
+            patch.object(ForwardBatch, "init_new", side_effect=init_forward_batch),
+            patch.object(
+                SamplingMetadata,
+                "from_model_worker_batch",
+                return_value=MagicMock(),
+            ),
+        ):
+            cm._precompile_extend(
+                forward_fn,
+                model_runner,
+                mesh=MagicMock(),
+                prepare_lora_fn=None,
+                future_token_ids_map=None,
+            )
+
+        assert len(calls) == 2
+        assert calls[0] == {
+            "input_embedding": None,
+            "deepstack": None,
+            "apply_deepstack": False,
+            "skip_sample": False,
+        }
+        assert calls[1]["input_embedding"].shape == (4, 8)
+        assert calls[1]["deepstack"].shape == (2, 4, 8)
+        assert calls[1]["apply_deepstack"] is True
+        assert calls[1]["skip_sample"] is True
 
     def test_invalid_cache_loc_raises(self):
         with self.assertRaises(ValueError):
