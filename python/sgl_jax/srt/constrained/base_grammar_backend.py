@@ -62,7 +62,10 @@ class BaseGrammarBackend:
             if isinstance(value, futures.Future):
                 return value, False  # Still compiling
             else:
-                return value, True  # Cache hit
+                return (
+                    value if value is INVALID_GRAMMAR_OBJ else value.copy(),
+                    True,
+                )
 
         # Not in cache, submit async compilation
         key_type, key_string = key
