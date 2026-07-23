@@ -6,16 +6,17 @@ variants have different attention domains (Top-K versus full context), but
 identical cache, query, precision, and launch environment.
 
 The benchmark does not create a mesh and does not depend on model TP size.
-The handoff cases use one independently processed head.
+``--num-heads`` is the local Q-head tensor dimension; it does not select or
+require a TPU mesh.
 
 Examples:
 
   python benchmark/kernels/mla/bench_dsa_decode_mla.py \
-    --batch-size 1 --num-heads 1 --context-length 8192 --top-k 2048
+    --batch-size 1 --num-heads 8 --context-length 8192 --top-k 2048
 
   # Capture an XProf trace after normal timing warm-ups.
   python benchmark/kernels/mla/bench_dsa_decode_mla.py \
-    --batch-size 1 --num-heads 1 --context-length 8192 --top-k 2048 \
+    --batch-size 1 --num-heads 8 --context-length 8192 --top-k 2048 \
     --profile --profile-dir /tmp/dsa-profile-q1
 """
 
@@ -248,7 +249,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--context-length", type=int, default=8192)
     parser.add_argument("--top-k", type=int, default=2048)
-    parser.add_argument("--num-heads", type=int, choices=(1,), default=1)
+    parser.add_argument("--num-heads", type=int, default=1)
     parser.add_argument("--latent-dim", type=int, choices=(512,), default=512)
     parser.add_argument("--rope-dim", type=int, choices=(64,), default=64)
     parser.add_argument("--page-size", type=int, choices=(128,), default=128)

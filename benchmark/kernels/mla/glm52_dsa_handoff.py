@@ -1,7 +1,9 @@
 """Kernel-local GLM-5.2 DSA dimensions and microbenchmark cases.
 
 This host-only manifest deliberately excludes model mesh and TP bucket sizes.
-Every case is runnable on one TPU device and isolates one attention head.
+Every case is runnable on one TPU device; H is the local Q-head count, not a
+mesh size.  The small H=1 case is only a debug fixture, while H=8/16 are the
+representative local production shapes.
 """
 
 from __future__ import annotations
@@ -32,7 +34,11 @@ GLM52_DSA_CONTRACT = Glm52DsaContract()
 
 @dataclass(frozen=True)
 class SparseMlaPerfCase:
-    """One single-device sparse-MLA workload presented to the operator."""
+    """One single-device sparse-MLA workload presented to the operator.
+
+    ``num_heads`` is deliberately an ordinary local tensor dimension.  It is
+    neither a TP size nor a requirement to launch that many devices.
+    """
 
     name: str
     mode: str
@@ -55,8 +61,8 @@ class SparseMlaPerfCase:
             raise ValueError("query_rows, context_length, and top_k must be positive")
         if self.top_k > GLM52_DSA_CONTRACT.index_topk:
             raise ValueError("top_k must not exceed the GLM-5.2 K_max")
-        if self.num_heads != 1:
-            raise ValueError("microbenchmark cases isolate one independent head")
+        if self.num_heads <= 0:
+            raise ValueError("num_heads must be positive")
         production_features = (
             GLM52_DSA_CONTRACT.latent_dim,
             GLM52_DSA_CONTRACT.rope_dim,
@@ -100,17 +106,27 @@ PERFORMANCE_CASES = (
         top_k=128,
     ),
     SparseMlaPerfCase(
-        name="decode-q1-h1-c8192-k2048",
+        name="decode-q1-h8-c8192-k2048",
         mode="decode",
         query_rows=1,
         context_length=8192,
+        num_heads=8,
     ),
     SparseMlaPerfCase(
-        name="prefill-q128-h1-start2048-k2048",
+        name="prefill-q2048-h8-start8192-k2048",
         mode="prefill",
-        query_rows=128,
-        context_length=2176,
-        start_position=2048,
+        query_rows=2048,
+        context_length=10240,
+        num_heads=8,
+        start_position=8192,
+    ),
+    SparseMlaPerfCase(
+        name="prefill-q4096-h16-start16384-k2048",
+        mode="prefill",
+        query_rows=4096,
+        context_length=20480,
+        num_heads=16,
+        start_position=16384,
     ),
 )
 

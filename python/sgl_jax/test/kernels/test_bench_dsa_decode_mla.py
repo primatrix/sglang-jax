@@ -140,9 +140,16 @@ class TestDSADecodeMLABenchmarkInputs(unittest.TestCase):
         self.assertEqual(args.top_k, 2048)
         self.assertEqual(args.variant, "sparse")
 
-    def test_cli_rejects_dimensions_outside_single_head_handoff_contract(self):
+    def test_cli_accepts_local_head_count_without_encoding_a_mesh_size(self):
+        with mock.patch.object(
+            sys, "argv", ["bench_dsa_decode_mla.py", "--num-heads", "8"]
+        ):
+            args = benchmark_module._parse_args()
+
+        self.assertEqual(args.num_heads, 8)
+
+    def test_cli_rejects_non_production_feature_dimensions(self):
         invalid_arguments = (
-            ("--num-heads", "8"),
             ("--latent-dim", "128"),
             ("--rope-dim", "128"),
             ("--page-size", "64"),

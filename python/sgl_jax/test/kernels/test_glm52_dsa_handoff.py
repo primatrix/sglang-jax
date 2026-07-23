@@ -27,12 +27,13 @@ def test_contract_contains_only_kernel_local_dimensions():
     assert GLM52_DSA_CONTRACT.attention_scale == 256**-0.5
 
 
-def test_performance_manifest_is_a_small_single_head_kernel_matrix():
+def test_performance_manifest_uses_parameterized_local_head_shapes():
     cases = {case.name: case for case in PERFORMANCE_CASES}
     assert set(cases) == {
         "debug-q1-h1-c128-k128",
-        "decode-q1-h1-c8192-k2048",
-        "prefill-q128-h1-start2048-k2048",
+        "decode-q1-h8-c8192-k2048",
+        "prefill-q2048-h8-start8192-k2048",
+        "prefill-q4096-h16-start16384-k2048",
     }
 
     assert cases["debug-q1-h1-c128-k128"].shape_tuple == (
@@ -42,40 +43,48 @@ def test_performance_manifest_is_a_small_single_head_kernel_matrix():
         128,
         128,
     )
-    assert cases["decode-q1-h1-c8192-k2048"].shape_tuple == (
+    assert cases["decode-q1-h8-c8192-k2048"].shape_tuple == (
         "decode",
         1,
-        1,
+        8,
         8192,
         2048,
     )
-    assert cases["prefill-q128-h1-start2048-k2048"].shape_tuple == (
+    assert cases["prefill-q2048-h8-start8192-k2048"].shape_tuple == (
         "prefill",
-        128,
-        1,
-        2176,
+        2048,
+        8,
+        10240,
         2048,
     )
-    assert cases["prefill-q128-h1-start2048-k2048"].start_position == 2048
+    assert cases["prefill-q2048-h8-start8192-k2048"].start_position == 8192
+    assert cases["prefill-q4096-h16-start16384-k2048"].shape_tuple == (
+        "prefill",
+        4096,
+        16,
+        20480,
+        2048,
+    )
+    assert cases["prefill-q4096-h16-start16384-k2048"].start_position == 16384
 
 
-def test_every_performance_case_is_single_head_and_kernel_local():
+def test_every_performance_case_is_kernel_local_with_a_debug_or_local_head_count():
     for case in PERFORMANCE_CASES:
-        assert case.num_heads == 1
+        assert case.num_heads in {1, 8, 16}
         assert case.latent_dim == GLM52_DSA_CONTRACT.latent_dim
         assert case.rope_dim == GLM52_DSA_CONTRACT.rope_dim
         assert case.page_size == GLM52_DSA_CONTRACT.page_size
 
 
-def test_performance_manifest_rejects_multihead_microbench_cases():
-    with pytest.raises(ValueError, match="one independent head"):
-        SparseMlaPerfCase(
-            name="wrong-head-count",
-            mode="decode",
-            query_rows=1,
-            context_length=2048,
-            num_heads=2,
-        )
+def test_performance_case_keeps_local_head_count_parameterized():
+    case = SparseMlaPerfCase(
+        name="local-head-count-is-not-a-mesh-size",
+        mode="decode",
+        query_rows=1,
+        context_length=2048,
+        num_heads=2,
+    )
+    assert case.shape_tuple == ("decode", 1, 2, 2048, 2048)
 
 
 def test_cpu_exporter_declares_all_stages_and_round_trips(tmp_path):
