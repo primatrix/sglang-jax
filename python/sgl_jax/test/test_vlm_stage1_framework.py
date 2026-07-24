@@ -728,7 +728,11 @@ def test_device_put_plan_shards_lane_axes():
 
 @pytest.mark.parametrize(
     ("arch", "chunked", "radix", "mixed_chunk"),
-    [(ARCH, 4096, False, True), ("UnsupportedVLM", -1, True, False)],
+    [
+        (ARCH, 4096, False, True),
+        ("Qwen3VLForConditionalGeneration", 4096, False, False),
+        ("UnsupportedVLM", -1, True, False),
+    ],
 )
 def test_multimodal_defaults_follow_capabilities(arch, chunked, radix, mixed_chunk):
     args = SimpleNamespace(
