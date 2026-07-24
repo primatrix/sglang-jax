@@ -34,7 +34,7 @@ class ModalityEmbedBatch:
     # orchestration only tree-maps over it, never reads its fields.
     encode_inputs: Any
     merge: DeviceMergePlan
-    source_capacity: int | None = None
+    encoder_output_length: int | None = None
 
 
 # One encoder batch per modality for one language-model forward.

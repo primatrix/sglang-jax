@@ -18,14 +18,15 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.qwen2 import Qwen2Model, create_qwen2_weight_mappings
-from sgl_jax.srt.models.vision_metadata.qwen2_5_vl import (
-    register_qwen25vl_vision_encoder,
-)
 from sgl_jax.srt.multimodal.common.modality_enum import Modality
-from sgl_jax.srt.multimodal.common.vision_plan_builder import VisionEncodeInputs
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
     QwenVLModelVitConfig,
 )
+from sgl_jax.srt.multimodal.in_model.encoder_planning import EncodeInputs
+from sgl_jax.srt.multimodal.in_model.encoders.qwen2_5_vl import (
+    Qwen25VLVisionPlanBuilder,
+)
+from sgl_jax.srt.multimodal.in_model.registry import register_encoder_plan_builder
 from sgl_jax.srt.multimodal.kernels.flash_attention import SegmentIds
 from sgl_jax.srt.multimodal.layers.vision_sharding import (
     VisionShardSpecs,
@@ -34,7 +35,10 @@ from sgl_jax.srt.multimodal.layers.vision_sharding import (
 )
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
-register_qwen25vl_vision_encoder()
+register_encoder_plan_builder(
+    "Qwen2_5_VLForConditionalGeneration",
+    Qwen25VLVisionPlanBuilder,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -48,7 +52,10 @@ def _apply_rotary_pos_emb_vision(x: jax.Array, rotary_pos_emb: jax.Array) -> jax
     x_real, x_imag = x[..., :half_dim], x[..., half_dim:]
     cos = jnp.cos(rotary_pos_emb)[:, :, None, :]
     sin = jnp.sin(rotary_pos_emb)[:, :, None, :]
-    return jnp.concatenate([x_real * cos - x_imag * sin, x_real * sin + x_imag * cos], axis=-1)
+    return jnp.concatenate(
+        [x_real * cos - x_imag * sin, x_real * sin + x_imag * cos],
+        axis=-1,
+    ).astype(x.dtype)
 
 
 def _vision_attention(
@@ -604,7 +611,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
 
         # Vision encoder parallelism. DP-Encoder (default) replicates the ViT and
         # fans requests across all devices; TP-Encoder (opt-in, tensor axis > 1)
-        # shards ViT weights over "tensor". mm_utils reads self.encoder_tp to pick
+        # shards ViT weights over "tensor". host_orchestration reads self.encoder_tp to pick
         # matching merge/write shardings.
         from sgl_jax.srt.managers.schedule_batch import global_server_args_dict
 
@@ -621,15 +628,13 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
             vision_tp=vision_tp,
         )
 
-    def get_multimodal_encoder(
-        self, modality: Modality
-    ) -> Callable[[VisionEncodeInputs], jax.Array]:
+    def get_multimodal_encoder(self, modality: Modality) -> Callable[[EncodeInputs], jax.Array]:
         if modality is Modality.IMAGE:
             return self._encode_vision
         raise ValueError(f"{type(self).__name__} does not support {modality.name} encoding")
 
-    def _encode_vision(self, inputs: VisionEncodeInputs) -> jax.Array:
-        return self.visual.encode(inputs.patches, inputs.meta, inputs.valid)
+    def _encode_vision(self, inputs: EncodeInputs) -> jax.Array:
+        return self.visual.encode(inputs.features, inputs.meta, inputs.valid)
 
     def load_weights(self, model_config: ModelConfig):
         # Text backbone + lm_head.
