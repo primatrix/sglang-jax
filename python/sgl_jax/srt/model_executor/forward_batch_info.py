@@ -421,10 +421,24 @@ class ForwardBatch:
             ),
             sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
         )
-        mrope_positions = None
-        if batch.mrope_positions is not None:
+        mrope_positions = batch.mrope_positions
+        mrope_position_axes = getattr(
+            getattr(model_runner, "model", None),
+            "mrope_position_axes",
+            0,
+        )
+        if (
+            mrope_positions is None
+            and isinstance(mrope_position_axes, int)
+            and mrope_position_axes > 0
+        ):
+            mrope_positions = np.broadcast_to(
+                batch.positions,
+                (mrope_position_axes, len(batch.positions)),
+            ).copy()
+        if mrope_positions is not None:
             (mrope_positions,) = device_array(
-                (batch.mrope_positions,),
+                (mrope_positions,),
                 sharding=(NamedSharding(model_runner.mesh, PartitionSpec(None, "data"))),
             )
         input_embedding = None
@@ -460,7 +474,12 @@ class ForwardBatch:
         if batch.apply_for_deepstack:
             (deepstack_visual_embedding,) = device_array(
                 (batch.deepstack_visual_embedding,),
-                sharding=(NamedSharding(model_runner.mesh, PartitionSpec(None, None))),
+                sharding=(
+                    NamedSharding(
+                        model_runner.mesh,
+                        PartitionSpec(None, "data", None),
+                    )
+                ),
             )
         if deepstack_visual_embedding is not None:
             deepstack_visual_embedding = deepstack_visual_embedding.astype(jnp.bfloat16)

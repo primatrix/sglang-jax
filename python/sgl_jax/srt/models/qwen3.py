@@ -500,7 +500,12 @@ class QWen3Model(nnx.Module):
             )
             deepstack = getattr(forward_batch, "deepstack_visual_embedding", None)
             if deepstack is not None and layer_id < deepstack.shape[0]:
-                hidden_states += deepstack[layer_id].astype(hidden_states.dtype)
+                hidden_states = jax.lax.cond(
+                    forward_batch.apply_for_deepstack,
+                    lambda values: values[0] + values[1].astype(values[0].dtype),
+                    lambda values: values[0],
+                    (hidden_states, deepstack[layer_id]),
+                )
             layers_kv_fused.append(kv_fused)
             layers_callback_flag.extend(callback_flag)
 
