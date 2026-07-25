@@ -189,7 +189,7 @@ class SamplingMetadata:
             )
         if linear_penalty_device is None:
             target_shape = (batch.sampling_info.temperatures.shape[0], vocab_size)
-            linear_penalty_device = _get_or_create_zero_penalty_device(
+            linear_penalty_device = get_or_create_zero_penalty_device(
                 target_shape, linear_penalty_sharding
             )
 
@@ -211,7 +211,7 @@ class SamplingMetadata:
         )
 
 
-def _get_or_create_zero_penalty_device(
+def get_or_create_zero_penalty_device(
     shape: tuple[int, int],
     sharding: NamedSharding | None,
 ) -> jax.Array:

@@ -259,7 +259,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             rng_step,
             *args,
         ):
-
             model_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, model_state)
             rng_key = jax.random.fold_in(base_rng_key, rng_step)
@@ -282,6 +281,11 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             )
 
         self.jitted_run_model = run_model_wrapper
+        self.jitted_run_model_with_memory_pools = partial(
+            jitted_run_model,
+            model_def,
+            model_state_def,
+        )
 
         self.jitted_sampler = partial(
             jitted_sampler,
@@ -612,31 +616,36 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
     ):
-        cache_miss_count = 0
+        return self._dispatch_jitted_model(
+            lambda: self.jitted_run_model(forward_batch, logits_metadata)
+        )
+
+    def _dispatch_jitted_model(self, run):
         import jax._src.test_util as jtu
 
-        # _donate_lock (set by PD scheduler init) serializes the donate-dispatch
-        # → replace_all window against the main-thread scatter_from_dmesh which
-        # also donates the same kv_buffer list. IFRT marks the input deleted the
-        # instant kDonateInput dispatches, so a GIL switch in this window lets
-        # scatter read a deleted array.
-        _kv_lock = getattr(self.token_to_kv_pool, "_donate_lock", None)
-        with _kv_lock if _kv_lock is not None else contextlib.nullcontext():
+        # Serialize donation against host-side cache writes, then publish the
+        # returned buffers before another dispatch can observe the old pools.
+        kv_lock = getattr(self.token_to_kv_pool, "_donate_lock", None)
+        with kv_lock if kv_lock is not None else contextlib.nullcontext():
             with jtu.count_pjit_cpp_cache_miss() as count:
-                output, pool_updates, _, layers_topk_ids = self.jitted_run_model(
-                    forward_batch, logits_metadata
-                )
+                output, pool_updates, _, layers_topk_ids, *extra_outputs = run()
                 cache_miss_count = count()
 
-            # tp_size==1: sharding constraint is lost after JIT; re-place explicitly.
-            # See https://github.com/sgl-project/sglang-jax/issues/233
             if self.tp_size == 1 and isinstance(pool_updates, list):
                 target_sharding = self.token_to_kv_pool.kv_sharding
                 pool_updates = [jax.device_put(kv, target_sharding) for kv in pool_updates]
             self.memory_pools.replace_all(pool_updates)
 
-        # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch
-        return output, cache_miss_count, layers_topk_ids
+        return output, cache_miss_count, layers_topk_ids, *extra_outputs
+
+    def _get_mesh_context(self):
+        try:
+            return jax.sharding.use_mesh(self.mesh)
+        except AttributeError:
+            try:
+                return jax.set_mesh(self.mesh)
+            except AttributeError:
+                return self.mesh
 
     def forward_and_sample(
         self, forward_batch, logits_metadata, sampling_metadata, future_map, future_ct
@@ -687,21 +696,32 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             ret = self._forward_raw(forward_batch, logits_metadata)
         return ret
 
+    def forward_with_jitted_runner(
+        self,
+        runner,
+        forward_batch: ForwardBatch,
+        logits_metadata: LogitsMetadata,
+        *runner_args,
+    ):
+        self.forward_pass_id += 1
+        precision_tracer.start_batch_trace(forward_batch.bid)
+        precision_tracer.set_current_forward_pass_id(self.forward_pass_id)
+        with jax.profiler.TraceAnnotation("_forward_raw"), self._get_mesh_context():
+            return self._dispatch_jitted_model(
+                lambda: runner(
+                    forward_batch,
+                    self.memory_pools,
+                    logits_metadata,
+                    *runner_args,
+                )
+            )
+
     def _forward_raw(
         self,
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
     ) -> tuple[LogitsProcessorOutput, int]:
-        # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
-        # on jax >=0.7.1, we need to use set_mesh.
-        try:
-            ctx = jax.sharding.use_mesh(self.mesh)
-        except AttributeError:
-            try:
-                ctx = jax.set_mesh(self.mesh)
-            except AttributeError:
-                ctx = self.mesh
-        with ctx:
+        with self._get_mesh_context():
             if forward_batch.forward_mode.is_decode() or forward_batch.forward_mode.is_extend():
                 ret = self._forward(forward_batch, logits_metadata)
             elif forward_batch.forward_mode.is_idle():
@@ -725,15 +745,15 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         Returns:
             A list of next_token_ids
         """
-        # Advance step counter (pure Python, zero device overhead).
-        # fold_in(base_key, step) inside JIT produces a unique RNG per step.
-        self._sampler_step += 1
-        # Penalty application has been moved to the Sampler for better JIT performance
         return self.jitted_sampler(
-            self._sampler_step,
+            self.next_sampler_step(),
             logits_output,
             sampling_metadata,
         )
+
+    def next_sampler_step(self) -> int:
+        self._sampler_step += 1
+        return self._sampler_step
 
     def compute_logprobs(self, logits, token_ids: jax.Array) -> jax.Array:
         return self.jitted_compute_logprobs(logits, token_ids)

@@ -1208,7 +1208,7 @@ class Scheduler(
 
             context = None
             if batch:
-                batch.launch_done = threading.Event()
+                batch.launch_done = None
                 with jax.profiler.TraceAnnotation("run_batch_forward"):
                     context = self._launch_batch_forward(batch)
 
@@ -1220,7 +1220,7 @@ class Scheduler(
                 self.process_batch_result(
                     last_batch,
                     last_result,
-                    batch.launch_done if batch else None,
+                    None,
                 )
 
             if context is not None:
@@ -1756,7 +1756,7 @@ class Scheduler(
                 protected = self.tree_cache.protected_size(dp_rank=dp)
                 if avail + evict + protected != size_per_rank:
                     leak_msgs.append(
-                        f"[dp={dp}] expected={size_per_rank}, " f"{avail=}, {evict=}, {protected=}"
+                        f"[dp={dp}] expected={size_per_rank}, {avail=}, {evict=}, {protected=}"
                     )
             if leak_msgs:
                 raise ValueError(
@@ -1849,9 +1849,9 @@ class Scheduler(
                 if info.chunked_req is not None:
                     # Verify consistency: info.chunked_req should match self.chunked_reqs[dp_rank]
                     if dp_rank in chunked_req_to_exclude:
-                        assert (
-                            chunked_req_to_exclude[dp_rank] is info.chunked_req
-                        ), f"Chunked request mismatch for DP rank {dp_rank}"
+                        assert chunked_req_to_exclude[dp_rank] is info.chunked_req, (
+                            f"Chunked request mismatch for DP rank {dp_rank}"
+                        )
                     else:
                         # This shouldn't happen, but handle it gracefully
                         chunked_req_to_exclude[dp_rank] = info.chunked_req
@@ -2005,9 +2005,9 @@ class Scheduler(
         for req in self.waiting_queue:
             # Get DP rank for this request
             dp_rank = req.dp_rank
-            assert (
-                dp_rank is not None
-            ), "dp_rank is None in waiting_queue; dp should be assigned before enqueue."
+            assert dp_rank is not None, (
+                "dp_rank is None in waiting_queue; dp should be assigned before enqueue."
+            )
 
             # Check whether dp is full load
             if self.running_batch.reqs_info[dp_rank].batch_is_full or (
@@ -2119,9 +2119,9 @@ class Scheduler(
         # Update chunked requests for each DP rank
         for dp_rank in range(self.dp_size):
             if adder.new_chunked_reqs[dp_rank] is not None:
-                assert (
-                    self.chunked_reqs[dp_rank] is None
-                ), f"Chunked request already exists for DP rank {dp_rank} when adding new chunked req"
+                assert self.chunked_reqs[dp_rank] is None, (
+                    f"Chunked request already exists for DP rank {dp_rank} when adding new chunked req"
+                )
                 self.chunked_reqs[dp_rank] = adder.new_chunked_reqs[dp_rank]
             # Increment for any chunked req (new OR continuing) to keep
             # process_batch_result_prefill from sampling on intermediate chunks.
@@ -2243,7 +2243,7 @@ class Scheduler(
                 )
             else:
                 logger.info(
-                    "Testing retraction." " #retracted_reqs: %d, #aborted_reqs: %d",
+                    "Testing retraction. #retracted_reqs: %d, #aborted_reqs: %d",
                     num_retracted_reqs,
                     len(reqs_to_abort),
                 )
@@ -2298,6 +2298,9 @@ class Scheduler(
                 ]
 
     def _prepare_relay_metadata(self, batch, worker_batch):
+        if batch.forward_mode.is_decode():
+            return
+
         total_tokens = len(worker_batch.input_ids)
         per_dp_tokens = total_tokens // self.dp_size
         indices = np.zeros(total_tokens, dtype=np.int32)
@@ -2335,10 +2338,12 @@ class Scheduler(
         self.forward_ct += 1
         self._profile_batch_predicate(batch)
         paddings = self.tp_worker.get_precompile_paddings()
+        use_decode_workspace = self.tp_worker.can_use_decode_workspace(batch)
         worker_batch = batch.get_model_worker_batch(
             *paddings,
             self.page_size,
             self.server_args.enable_static_lora,
+            use_decode_workspace=use_decode_workspace,
         )
         self._prepare_relay_metadata(batch, worker_batch)
         return self.tp_worker.launch_forward(worker_batch)
@@ -2399,7 +2404,6 @@ class Scheduler(
                 with jax.profiler.TraceAnnotation(
                     f"forward_batch_generation_overlap {self.forward_ct}"
                 ):
-
                     logits_output, next_token_ids, cache_miss_count = (
                         self.tp_worker.forward_batch_generation(
                             model_worker_batch, sampling_metadata=None
