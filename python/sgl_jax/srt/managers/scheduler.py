@@ -1849,9 +1849,9 @@ class Scheduler(
                 if info.chunked_req is not None:
                     # Verify consistency: info.chunked_req should match self.chunked_reqs[dp_rank]
                     if dp_rank in chunked_req_to_exclude:
-                        assert chunked_req_to_exclude[dp_rank] is info.chunked_req, (
-                            f"Chunked request mismatch for DP rank {dp_rank}"
-                        )
+                        assert (
+                            chunked_req_to_exclude[dp_rank] is info.chunked_req
+                        ), f"Chunked request mismatch for DP rank {dp_rank}"
                     else:
                         # This shouldn't happen, but handle it gracefully
                         chunked_req_to_exclude[dp_rank] = info.chunked_req
@@ -2005,9 +2005,9 @@ class Scheduler(
         for req in self.waiting_queue:
             # Get DP rank for this request
             dp_rank = req.dp_rank
-            assert dp_rank is not None, (
-                "dp_rank is None in waiting_queue; dp should be assigned before enqueue."
-            )
+            assert (
+                dp_rank is not None
+            ), "dp_rank is None in waiting_queue; dp should be assigned before enqueue."
 
             # Check whether dp is full load
             if self.running_batch.reqs_info[dp_rank].batch_is_full or (
@@ -2119,9 +2119,9 @@ class Scheduler(
         # Update chunked requests for each DP rank
         for dp_rank in range(self.dp_size):
             if adder.new_chunked_reqs[dp_rank] is not None:
-                assert self.chunked_reqs[dp_rank] is None, (
-                    f"Chunked request already exists for DP rank {dp_rank} when adding new chunked req"
-                )
+                assert (
+                    self.chunked_reqs[dp_rank] is None
+                ), f"Chunked request already exists for DP rank {dp_rank} when adding new chunked req"
                 self.chunked_reqs[dp_rank] = adder.new_chunked_reqs[dp_rank]
             # Increment for any chunked req (new OR continuing) to keep
             # process_batch_result_prefill from sampling on intermediate chunks.

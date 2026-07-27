@@ -899,9 +899,9 @@ class ScheduleBatch:
         # Validate input
         assert len(reqs) == dp_size, f"reqs length {len(reqs)} != dp_size {dp_size}"
         if chunked_reqs is not None:
-            assert len(chunked_reqs) == dp_size, (
-                f"chunked_reqs length {len(chunked_reqs)} != dp_size {dp_size}"
-            )
+            assert (
+                len(chunked_reqs) == dp_size
+            ), f"chunked_reqs length {len(chunked_reqs)} != dp_size {dp_size}"
         else:
             chunked_reqs = [None] * dp_size
 
@@ -912,9 +912,9 @@ class ScheduleBatch:
         return_output_logprob_only = all(req.return_output_logprob_only for req in all_reqs)
         is_hybrid = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-            assert tree_cache is None or isinstance(tree_cache, (SWARadixCache, ChunkCache)), (
-                "SWARadixCache or ChunkCache is required for SWATokenToKVPoolAllocator"
-            )
+            assert tree_cache is None or isinstance(
+                tree_cache, (SWARadixCache, ChunkCache)
+            ), "SWARadixCache or ChunkCache is required for SWATokenToKVPoolAllocator"
             is_hybrid = True
 
         is_hybrid_recurrent = isinstance(req_to_token_pool, HybridReqToTokenPool)
@@ -1511,7 +1511,9 @@ class ScheduleBatch:
 
         new_estimate_ratio = (
             total_decoded_tokens + global_config.retract_decode_steps * len(all_reqs)
-        ) / (total_max_new_tokens + 1)  # +1 to avoid zero division when all reqs aborted
+        ) / (
+            total_max_new_tokens + 1
+        )  # +1 to avoid zero division when all reqs aborted
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
@@ -1917,9 +1919,9 @@ class ScheduleBatch:
         Merge each DP rank independently.
         """
         # Ensure both batches have same dp_size
-        assert self.dp_size == other.dp_size, (
-            f"Cannot merge batches with different dp_size: {self.dp_size} vs {other.dp_size}"
-        )
+        assert (
+            self.dp_size == other.dp_size
+        ), f"Cannot merge batches with different dp_size: {self.dp_size} vs {other.dp_size}"
 
         # Merge each DP rank independently
         for dp_rank in range(self.dp_size):
@@ -3276,9 +3278,9 @@ class ScheduleBatch:
         enable_static_lora: bool = False,
         draft_token_num: int = 1,
     ) -> ModelWorkerBatch:
-        assert self.forward_mode.is_decode_or_idle(), (
-            "spec extend must use get_model_worker_batch, only decode reaches here"
-        )
+        assert (
+            self.forward_mode.is_decode_or_idle()
+        ), "spec extend must use get_model_worker_batch, only decode reaches here"
         return self._get_spec_decode_mwb_dp(bs_paddings, enable_static_lora, draft_token_num)
 
     def _generate_trace_info(self, real_bs: int, bid: int) -> list[str]:

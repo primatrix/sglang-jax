@@ -12,6 +12,12 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.managers.tp_worker import ModelWorker
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sgl_jax.srt.sampling.sampling_batch_info import (
+    SamplingMetadata,
+    _get_or_create_zero_penalty_device,
+)
+from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils.overlap_utils import (
     DecodeBatchDescriptor,
     DecodeBatchInputs,
@@ -22,12 +28,6 @@ from sgl_jax.srt.utils.overlap_utils import (
     resolve_relay_inputs,
     update_decode_result,
 )
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sgl_jax.srt.sampling.sampling_batch_info import (
-    SamplingMetadata,
-    get_or_create_zero_penalty_device,
-)
-from sgl_jax.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 _DECODE_WORKSPACE_BACKENDS = {"FlashAttention", "MLAAttentionBackend"}
@@ -329,7 +329,7 @@ class ModelWorkerOverlap(ModelWorker):
         batch_inputs: DecodeBatchInputs,
     ) -> SamplingMetadata:
         spec = batch.decode_workspace_spec
-        linear_penalty = get_or_create_zero_penalty_device(
+        linear_penalty = _get_or_create_zero_penalty_device(
             (len(batch.seq_lens), self.model_config.vocab_size),
             NamedSharding(self.mesh, P("data", "tensor")),
         )
