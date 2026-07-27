@@ -30,7 +30,9 @@ class _LanguageModel(Protocol):
 class _MultimodalModel(Protocol):
     mesh: Mesh
 
-    def get_multimodal_encoder(self, modality: Modality) -> Callable[[Any], jax.Array]: ...
+    def get_multimodal_encoder(
+        self, modality: Modality
+    ) -> Callable[[Any], jax.Array | tuple[jax.Array, jax.Array]]: ...
 
 
 class _ForwardBatch(Protocol):
@@ -267,13 +269,13 @@ def _encode_inputs_lane_shape(encode_inputs: Any) -> tuple[int, int]:
 
 
 def embed_mm_inputs(
-    mm_embed_plan,
-    input_ids,
-    input_embedding,
-    multimodal_model,
+    mm_embed_plan: MultimodalEmbedPlan,
+    input_ids: jax.Array,
+    input_embedding: Callable[[jax.Array], jax.Array],
+    multimodal_model: _MultimodalModel,
     *,
-    return_deepstack=False,
-):
+    return_deepstack: bool = False,
+) -> jax.Array | tuple[jax.Array, jax.Array | None]:
     """Encode each fixed-shape modality batch and merge it into token embeddings.
 
     ``running`` starts as the plain text embedding. Each modality batch encodes
