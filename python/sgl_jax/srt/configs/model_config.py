@@ -185,6 +185,23 @@ class ModelConfig:
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.sliding_window = getattr(self.hf_text_config, "sliding_window", None)
 
+        if (
+            not is_draft_model
+            and self.hf_config.architectures[0] in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
+            and (
+                getattr(self.hf_config, "vision_config", None) is not None
+                or getattr(self.hf_config, "audio_config", None) is not None
+            )
+        ):
+            self.hf_config.architectures[0] = {
+                "MiMoV2ForCausalLM": "MiMoV2ForConditionalGeneration",
+                "MiMoV2FlashForCausalLM": "MiMoV2FlashForConditionalGeneration",
+            }[self.hf_config.architectures[0]]
+            if self.quantization_config is not None:
+                for rule in self.quantization_config.linear_rules or ():
+                    if rule.get("module_path") == ".*":
+                        rule["module_path"] = r"(?:model|lm_head)(?:/.*)?"
+
         if is_draft_model and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
@@ -961,6 +978,8 @@ multimodal_model_archs = [
     "Mistral3ForConditionalGeneration",
     "MultiModalityCausalLM",
     "MllamaForConditionalGeneration",
+    "MiMoV2ForConditionalGeneration",
+    "MiMoV2FlashForConditionalGeneration",
     "Qwen2AudioForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",

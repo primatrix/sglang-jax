@@ -226,6 +226,7 @@ def preprocess_video(source, video_config: dict) -> np.ndarray:
 
 
 class QwenVLProcessor(BaseMultimodalProcessor):
+    uses_mrope = True
     models = (
         "Qwen2VLForConditionalGeneration",
         "Qwen2_5_VLForConditionalGeneration",
@@ -354,7 +355,7 @@ class QwenVLProcessor(BaseMultimodalProcessor):
                 video_grid_thw=video_grid_thw,
                 spatial_merge_size=vision_config.spatial_merge_size,
             )
-        else:
+        elif self.uses_mrope:
             mrope_positions, mrope_position_delta = compute_mrope_positions(
                 input_ids=input_ids,
                 image_grid_thw=image_grid_thw,
@@ -366,7 +367,10 @@ class QwenVLProcessor(BaseMultimodalProcessor):
                 spatial_merge_size=vision_config.spatial_merge_size,
                 tokens_per_second=getattr(vision_config, "tokens_per_second", None),
             )
-        mrope_position_delta = np.asarray([[mrope_position_delta]], dtype=np.int32)
+        else:
+            mrope_positions = mrope_position_delta = None
+        if mrope_position_delta is not None:
+            mrope_position_delta = np.asarray([[mrope_position_delta]], dtype=np.int32)
 
         return MultimodalInputs(
             mm_items=mm_items,
