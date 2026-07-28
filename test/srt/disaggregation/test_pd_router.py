@@ -42,7 +42,7 @@ class TestGenerateBootstrapRoom:
     def test_room_in_range(self):
         for _ in range(100):
             room = generate_bootstrap_room()
-            assert 0 <= room < 2**63
+            assert 0 <= room <= 2**31 - 1
 
 
 class TestGetRequestBatchSize:

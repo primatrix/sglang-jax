@@ -399,7 +399,7 @@ class TokenizerManager:
                     if obj.bootstrap_port is None:
                         obj.bootstrap_port = parsed.port
             if obj.bootstrap_room is None and obj.rid is not None:
-                obj.bootstrap_room = zlib.crc32(str(obj.rid).encode("utf-8"))
+                obj.bootstrap_room = zlib.crc32(str(obj.rid).encode("utf-8")) & 0x7FFFFFFF
             missing = [
                 name
                 for name in ("bootstrap_host", "bootstrap_port", "bootstrap_room")
