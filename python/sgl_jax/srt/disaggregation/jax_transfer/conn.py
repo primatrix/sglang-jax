@@ -195,7 +195,7 @@ class JaxTransferKVManager(CommonKVManager):
             raise RuntimeError("host KV pool is full")
         return buffer_id
 
-    def prefill_transport_metadata(self) -> dict[str, object]:
+    def prefill_transport_metadata(self, dp_rank: int = 0) -> dict[str, object]:  # noqa: ARG002
         return {"engine": self.engine_name}
 
     def start_prefill(self, context: PrefillTransferContext) -> PrefillTransfer:
@@ -243,7 +243,7 @@ class JaxTransferKVManager(CommonKVManager):
             raise
         return DecodeAdmission.admitted(receiver)
 
-    def cleanup_transfer(self, bootstrap_room: int | None) -> None:  # noqa: ARG002
+    def cleanup_transfer(self, bootstrap_room: int | None, *, source_dp_rank: int = 0) -> None:  # noqa: ARG002
         return
 
     # ------------------------------------------------------------------

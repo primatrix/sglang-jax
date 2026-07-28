@@ -52,6 +52,47 @@ class RaidenMetadata:
     local_block_ids: tuple[int, ...]
     bootstrap_room: int | None
     jax_process_index: int = 0
+    source_dp_rank: int = 0
+    local_dp_rank: int = 0
+
+
+def _remote_endpoint_from_published(peer_host: str, peer_endpoints: list[object]) -> object:
+    """Preserve producer ports/shards while replacing non-routable endpoint hosts."""
+
+    if not peer_endpoints:
+        raise ValueError("prefill did not publish Raiden endpoints")
+    formatted_host = (
+        f"[{peer_host}]" if ":" in peer_host and not peer_host.startswith("[") else peer_host
+    )
+    rewritten: list[dict[str, object]] = []
+    for raw in peer_endpoints:
+        if not isinstance(raw, dict):
+            raise TypeError(f"Raiden endpoint descriptor must be a mapping, got {raw!r}")
+        endpoint = str(raw.get("endpoint", ""))
+        try:
+            port = int(endpoint.rsplit(":", 1)[1])
+        except (IndexError, ValueError) as exc:
+            raise ValueError(f"invalid Raiden endpoint {endpoint!r}") from exc
+        if not 0 < port <= 65535:
+            raise ValueError(f"invalid Raiden endpoint port: {port}")
+        descriptor = dict(raw)
+        descriptor["endpoint"] = f"{formatted_host}:{port}"
+        rewritten.append(descriptor)
+    if len(rewritten) == 1:
+        return rewritten[0]["endpoint"]
+    return rewritten
+
+
+def _endpoint_shard_layout(endpoints: list[object]) -> tuple[tuple[int, ...], ...]:
+    layout = []
+    for raw in endpoints:
+        if not isinstance(raw, dict):
+            raise TypeError(f"Raiden endpoint descriptor must be a mapping, got {raw!r}")
+        shards = raw.get("shards")
+        if not isinstance(shards, list):
+            raise TypeError(f"Raiden endpoint shards must be a list, got {shards!r}")
+        layout.append(tuple(int(shard) for shard in shards))
+    return tuple(layout)
 
 
 class RaidenTransferKVManager(CommonKVManager):
@@ -83,15 +124,21 @@ class RaidenTransferKVManager(CommonKVManager):
     def reserve_prefill_buffer(self, existing: int | None) -> int | None:
         return existing
 
-    def prefill_transport_metadata(self) -> dict[str, object]:
-        endpoints = list(self.wrapper.endpoints or [])
-        control_port = self.wrapper.control_port
-        if endpoints:
-            control_port = int(str(endpoints[0]["endpoint"]).rsplit(":", 1)[1])
-        if not 0 < control_port <= 65535:
-            raise RuntimeError("Raiden did not publish a valid control endpoint")
+    def prefill_transport_metadata(self, dp_rank: int = 0) -> dict[str, object]:
+        try:
+            endpoints = self.wrapper.endpoints_by_dp_rank[int(dp_rank)]
+        except KeyError as exc:
+            raise ValueError(
+                f"Raiden has no endpoints for dp_rank={dp_rank}; "
+                f"available={sorted(self.wrapper.endpoints_by_dp_rank)}"
+            ) from exc
+        if not endpoints:
+            raise RuntimeError(f"Raiden did not publish endpoints for dp_rank={dp_rank}")
+        control_port = int(str(endpoints[0]["endpoint"]).rsplit(":", 1)[1])
         return {
             "engine": self.engine_name,
+            "dp_rank": int(dp_rank),
+            "dp_size": self.wrapper.dp_size,
             "local_control_port": control_port,
             "endpoints": endpoints,
         }
@@ -104,6 +151,7 @@ class RaidenTransferKVManager(CommonKVManager):
             sender.attach_block_ids(
                 context.block_ids_factory(),
                 bootstrap_room=context.bootstrap_room,
+                dp_rank=context.dp_rank,
             )
             if context.on_ready is not None:
                 context.on_ready()
@@ -124,6 +172,7 @@ class RaidenTransferKVManager(CommonKVManager):
             info = self.bootstrap_client.get_transfer_info(
                 context.bootstrap_room,
                 jax_process_index=peer_process_index,
+                source_dp_rank=context.source_dp_rank,
             )
         except Exception as exc:  # transient bootstrap failure
             logger.warning(
@@ -142,6 +191,12 @@ class RaidenTransferKVManager(CommonKVManager):
                     "Raiden transfer ID mismatch: "
                     f"expected={context.transfer_id!r}, got={info.get('transfer_id')!r}"
                 )
+            published_source_rank = int(info.get("source_dp_rank", 0))
+            if published_source_rank != context.source_dp_rank:
+                raise ValueError(
+                    "Raiden transfer source rank mismatch: "
+                    f"expected={context.source_dp_rank}, got={published_source_rank}"
+                )
             metadata = info.get("transport_metadata", info)
             if not isinstance(metadata, dict):
                 raise TypeError("Raiden request transport_metadata must be a mapping")
@@ -158,6 +213,20 @@ class RaidenTransferKVManager(CommonKVManager):
                 peer_metadata = context.peer_info
             if not isinstance(peer_metadata, dict):
                 raise TypeError("prefill transport_metadata must be a mapping")
+            peer_dp_rank = int(
+                peer_metadata.get("dp_rank", context.peer_info.get("system_dp_rank", 0))
+            )
+            if peer_dp_rank != context.source_dp_rank:
+                raise ValueError(
+                    "prefill endpoint rank mismatch: "
+                    f"expected={context.source_dp_rank}, got={peer_dp_rank}"
+                )
+            peer_dp_size = int(peer_metadata.get("dp_size", self.wrapper.dp_size))
+            if peer_dp_size != self.wrapper.dp_size:
+                raise ValueError(
+                    "Raiden DP topology mismatch: "
+                    f"prefill={peer_dp_size}, decode={self.wrapper.dp_size}"
+                )
             peer_endpoints = peer_metadata.get("endpoints")
             if peer_endpoints is None:
                 serialized_endpoints = peer_metadata.get("raiden_endpoints_json", "")
@@ -166,31 +235,26 @@ class RaidenTransferKVManager(CommonKVManager):
                 )
             if not isinstance(peer_endpoints, list):
                 raise TypeError("Raiden endpoints must be a list")
-            base_port = int(peer_metadata.get("local_control_port", 0))
-            if peer_endpoints:
-                base_port = int(str(peer_endpoints[0]["endpoint"]).rsplit(":", 1)[1])
-            if not 0 < base_port <= 65535:
-                raise ValueError(f"invalid Raiden control port: {base_port}")
-
-            local_endpoints = list(self.wrapper.endpoints or [])
-            if peer_endpoints and len(peer_endpoints) != len(local_endpoints):
+            try:
+                local_endpoints = self.wrapper.endpoints_by_dp_rank[context.local_dp_rank]
+            except KeyError as exc:
+                raise ValueError(
+                    f"Raiden has no local manager for dp_rank={context.local_dp_rank}"
+                ) from exc
+            if len(peer_endpoints) != len(local_endpoints):
                 raise ValueError(
                     "Raiden endpoint topology mismatch: "
                     f"prefill={len(peer_endpoints)}, decode={len(local_endpoints)}"
                 )
+            peer_layout = _endpoint_shard_layout(peer_endpoints)
+            local_layout = _endpoint_shard_layout(local_endpoints)
+            if peer_layout != local_layout:
+                raise ValueError(
+                    "Raiden endpoint shard layout mismatch: "
+                    f"prefill={peer_layout}, decode={local_layout}"
+                )
             peer_host = str(context.peer_info["host"])
-            if len(local_endpoints) <= 1:
-                remote_endpoint: object = f"{peer_host}:{base_port}"
-            else:
-                # The structured form keeps each local sub-manager matched to
-                # the producer sub-manager serving the same shards.
-                remote_endpoint = [
-                    {
-                        "endpoint": f"{peer_host}:{base_port + index}",
-                        "shards": list(endpoint["shards"]),
-                    }
-                    for index, endpoint in enumerate(local_endpoints)
-                ]
+            remote_endpoint = _remote_endpoint_from_published(peer_host, peer_endpoints)
 
             kv_indices = np.asarray(context.kv_indices)
             local_pages = kv_indices[:: context.page_size] // context.page_size
@@ -210,6 +274,8 @@ class RaidenTransferKVManager(CommonKVManager):
                     local_block_ids=local_block_ids,
                     bootstrap_room=context.bootstrap_room,
                     jax_process_index=peer_process_index,
+                    source_dp_rank=context.source_dp_rank,
+                    local_dp_rank=context.local_dp_rank,
                 )
             )
             return DecodeAdmission.admitted(receiver)
@@ -225,13 +291,20 @@ class RaidenTransferKVManager(CommonKVManager):
         transfer_id: str,
         block_ids: list[int],
         bootstrap_room: int | None,
+        dp_rank: int,
     ) -> bool:
-        needed = self.wrapper.register_read(req_id, _uuid_to_int(transfer_id), block_ids)
+        needed = self.wrapper.register_read(
+            req_id,
+            _uuid_to_int(transfer_id),
+            block_ids,
+            dp_rank=dp_rank,
+        )
         if bootstrap_room is not None:
             self.bootstrap_client.register_transfer(
                 bootstrap_room,
                 transfer_id,
                 jax_process_index=jax.process_index(),
+                source_dp_rank=dp_rank,
                 transport_metadata={"remote_block_ids": list(block_ids)},
             )
         return needed
@@ -241,6 +314,7 @@ class RaidenTransferKVManager(CommonKVManager):
         bootstrap_room: int | None,
         *,
         jax_process_index: int | None = None,
+        source_dp_rank: int = 0,
     ) -> None:
         if bootstrap_room is None:
             return
@@ -250,6 +324,7 @@ class RaidenTransferKVManager(CommonKVManager):
             self.bootstrap_client.pop_transfer(
                 bootstrap_room,
                 jax_process_index=jax_process_index,
+                source_dp_rank=source_dp_rank,
             )
 
     def poll_engine(self) -> None:
@@ -300,6 +375,7 @@ class RaidenTransferKVSender(KVSender, StateHolder):
         self._transfer_id: str | None = None
         self._block_ids: list[int] | None = None
         self._bootstrap_room: int | None = None
+        self._dp_rank: int = 0
         self._state_lock = threading.Lock()
         self._timer: object | None = None
         self._transfer_started_at: float | None = None
@@ -316,11 +392,18 @@ class RaidenTransferKVSender(KVSender, StateHolder):
         self._transfer_id = transfer_id or self._req_id
         self._transition_to(KVPoll.WAITING_FOR_INPUT)
 
-    def attach_block_ids(self, block_ids: list[int], *, bootstrap_room: int | None) -> None:
+    def attach_block_ids(
+        self,
+        block_ids: list[int],
+        *,
+        bootstrap_room: int | None,
+        dp_rank: int,
+    ) -> None:
         if self._block_ids is not None:
             raise RuntimeError(f"sender {self._req_id!r} is already configured")
         self._block_ids = list(block_ids)
         self._bootstrap_room = bootstrap_room
+        self._dp_rank = int(dp_rank)
 
     def send(self) -> None:
         if self._block_ids is None:
@@ -331,6 +414,7 @@ class RaidenTransferKVSender(KVSender, StateHolder):
                 self.uuid,
                 self._block_ids,
                 self._bootstrap_room,
+                self._dp_rank,
             )
             self._transition_to(KVPoll.TRANSFERRING)
             self._timer = time_phase("ack", "prefill")
@@ -388,7 +472,7 @@ class RaidenTransferKVSender(KVSender, StateHolder):
                 reason=reason,
             )
         self._manager.forget(self.uuid)
-        self._manager.cleanup_transfer(self._bootstrap_room)
+        self._manager.cleanup_transfer(self._bootstrap_room, source_dp_rank=self._dp_rank)
         with suppress(Exception):
             PD_TRANSFER_FAILURES_TOTAL.labels(reason=reason, role="prefill").inc()
         self._manager._prune_sender(self._req_id)
@@ -443,6 +527,7 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
                         self._metadata.remote_endpoint,
                         list(self._metadata.remote_block_ids),
                         list(self._metadata.local_block_ids),
+                        local_dp_rank=self._metadata.local_dp_rank,
                     )
                 except Exception:  # noqa: BLE001
                     logger.exception("Raiden start_read() failed for %s", self._req_id)
@@ -475,6 +560,7 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
             self._manager.cleanup_transfer(
                 self._metadata.bootstrap_room,
                 jax_process_index=self._metadata.jax_process_index,
+                source_dp_rank=self._metadata.source_dp_rank,
             )
             self._manager._prune_receiver(self._req_id)
         return self.state
@@ -518,6 +604,7 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
         self._manager.cleanup_transfer(
             metadata.bootstrap_room if metadata else None,
             jax_process_index=metadata.jax_process_index if metadata else None,
+            source_dp_rank=metadata.source_dp_rank if metadata else 0,
         )
         with suppress(Exception):
             PD_TRANSFER_FAILURES_TOTAL.labels(reason=reason, role="decode").inc()
