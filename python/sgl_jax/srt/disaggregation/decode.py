@@ -1002,6 +1002,9 @@ class SchedulerDisaggregationDecodeMixin:
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
         per_layer_tail = kv_pool.get_kv_buffer(kv_pool.start_layer).shape[1:]
         if jax.process_count() > 1 and kv.is_fully_addressable:
+            # Pulled KV is this host's local shard on a 1-D local mesh.
+            # Assemble it into the global pool sharding (zero-copy: each NP
+            # contributes its own addressable_shards).
             pool_pspec = kv_pool.kv_sharding.spec
             stacked_spec = PartitionSpec(None, None, *pool_pspec[1:])
             gsh = NamedSharding(kv_pool.mesh, stacked_spec)
@@ -1016,6 +1019,9 @@ class SchedulerDisaggregationDecodeMixin:
             np.asarray(kv_indices) if not isinstance(kv_indices, np.ndarray) else kv_indices
         )
         padded_pages = kv[0].shape[0]
+        # page_ids_padded is only consumed by the debug verifier below, which is
+        # a no-op unless SGL_JAX_PD_DEBUG_KV is set. The write itself is
+        # token-level via ``loc``, so skip this numpy work on the production path.
         from sgl_jax.srt.disaggregation.debug_utils import kv_debug_enabled
 
         if kv_debug_enabled(req.rid):
@@ -1029,6 +1035,10 @@ class SchedulerDisaggregationDecodeMixin:
         else:
             page_ids_padded = None
 
+        # Write via the in-place Pallas kernel (``update_fused_kv_cache_vectorized``
+        # with ``input_output_aliases``), so the footprint scales with the tokens
+        # written. ``loc`` is per-token absolute pool slots; -1 marks padding
+        # tokens that are skipped.
         total_tokens = padded_pages * page_size
         loc_np = np.full(total_tokens, -1, dtype=np.int32)
         loc_np[:seqlen] = kv_indices_np[:seqlen]
@@ -1090,6 +1100,7 @@ class SchedulerDisaggregationDecodeMixin:
                     kv_pool.attention_data_partition_axis,
                     kv_pool.mesh,
                 )
+        # Set prefix_indices to all-but-last so extend_input_len=1.
         valid_slots = kv_indices_np[:seqlen]
         if len(valid_slots) >= 1:
             req.prefix_indices = valid_slots[:-1]
@@ -1098,6 +1109,8 @@ class SchedulerDisaggregationDecodeMixin:
         req.last_matched_prefix_len = len(req.prefix_indices)
         req._pd_skip_prefix_match = True
         req._pd_prealloc_kv_indices = kv_indices_np
+        # Make sure fill_ids is set so the scheduler doesn't re-derive
+        # an empty prefill chunk.
         req.fill_ids = list(req.origin_input_ids) + list(req.output_ids)
         self._maybe_verify_decode_writeback_debug(req, kv_pool, page_ids_padded, kv)
 
