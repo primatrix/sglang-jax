@@ -227,7 +227,7 @@ def preprocess_video(source, video_config: dict) -> np.ndarray:
 
 class QwenVLProcessor(BaseMultimodalProcessor):
     uses_mrope = True
-    models = (
+    models: tuple[str, ...] = (
         "Qwen2VLForConditionalGeneration",
         "Qwen2_5_VLForConditionalGeneration",
         "Qwen3VLForConditionalGeneration",

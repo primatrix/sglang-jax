@@ -5,18 +5,18 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from sgl_jax.srt.multimodal.in_model.encoder_planning import EncoderPlanBuilder
+from sgl_jax.srt.multimodal.in_model.encoder_planning import EncoderPlanBuilderProtocol
 
 if TYPE_CHECKING:
     from sgl_jax.srt.configs.model_config import ModelConfig
 
 
-_BUILDER_FACTORIES: dict[str, Callable[[Any], EncoderPlanBuilder]] = {}
+_BUILDER_FACTORIES: dict[str, Callable[[Any], EncoderPlanBuilderProtocol]] = {}
 
 
 def register_encoder_plan_builder(
     arch: str,
-    factory: Callable[[Any], EncoderPlanBuilder],
+    factory: Callable[[Any], EncoderPlanBuilderProtocol],
 ) -> None:
     _BUILDER_FACTORIES[arch] = factory
 
@@ -24,7 +24,7 @@ def register_encoder_plan_builder(
 def resolve_encoder_plan_builder(
     model_config: ModelConfig,
     input_buckets: Any | None = None,
-) -> EncoderPlanBuilder | None:
+) -> EncoderPlanBuilderProtocol | None:
     hf_config = getattr(model_config, "hf_config", None)
     architectures = getattr(hf_config, "architectures", None) or []
     factory = _BUILDER_FACTORIES.get(architectures[0]) if architectures else None

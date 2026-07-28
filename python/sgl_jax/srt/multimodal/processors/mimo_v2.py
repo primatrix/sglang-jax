@@ -6,27 +6,62 @@ import copy
 import io
 import json
 import os
+from collections.abc import Mapping, Sequence
 from types import SimpleNamespace
+from typing import Any, cast
 from urllib.parse import unquote, urlparse
 
 import numpy as np
+import numpy.typing as npt
 import requests
+from PIL.Image import Image
+from transformers import PretrainedConfig
+from transformers.processing_utils import ProcessorMixin
 
+from sgl_jax.srt.managers.io_struct import (
+    EmbeddingReqInput,
+    GenerateReqInput,
+    ImageData,
+)
 from sgl_jax.srt.multimodal.common.modality_enum import (
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
 )
 from sgl_jax.srt.multimodal.processors.qwen_vl import QwenVLProcessor
+from sgl_jax.srt.server_args import ServerArgs
+
+IntArray = npt.NDArray[np.int32]
+FloatArray = npt.NDArray[np.float32]
+AudioSource = (
+    str
+    | bytes
+    | os.PathLike[str]
+    | npt.NDArray[Any]
+    | tuple[npt.NDArray[Any], int]
+    | list[Any]
+    | dict[str, Any]
+)
+AudioInput = AudioSource | list[AudioSource] | None
+ImageSource = (
+    str | bytes | os.PathLike[str] | Image | ImageData | npt.NDArray[Any] | dict[str, object]
+)
+ImageInput = ImageSource | list[ImageSource] | list[list[ImageSource]] | None
 
 
-def _value(config, name, default=None):
+def _value(
+    config: Mapping[str, Any] | object | None,
+    name: str,
+    default: Any = None,
+) -> Any:
     if config is None:
         return default
-    return config.get(name, default) if isinstance(config, dict) else getattr(config, name, default)
+    return (
+        config.get(name, default) if isinstance(config, Mapping) else getattr(config, name, default)
+    )
 
 
-def _config_value(config, name, default=None):
+def _config_value(config: object, name: str, default: Any = None) -> Any:
     value = getattr(config, name, None)
     return (
         value
@@ -36,7 +71,7 @@ def _config_value(config, name, default=None):
 
 
 class _MiMoAudioCodec:
-    def __init__(self, model_path):
+    def __init__(self, model_path: str) -> None:
         import torch
         from transformers import AutoModel
 
@@ -68,7 +103,7 @@ class _MiMoAudioCodec:
         self.processor = MiMoAudioProcessor()
 
     @staticmethod
-    def _waveform(source):
+    def _waveform(source: AudioSource) -> tuple[FloatArray, int]:
         import soundfile as sf
 
         if isinstance(source, dict):
@@ -79,7 +114,8 @@ class _MiMoAudioCodec:
         if isinstance(source, np.ndarray):
             return source.astype(np.float32), 24000
         if isinstance(source, bytes):
-            return sf.read(io.BytesIO(source), dtype="float32")
+            waveform, sampling_rate = sf.read(io.BytesIO(source), dtype="float32")
+            return np.asarray(waveform, dtype=np.float32), int(sampling_rate)
         if isinstance(source, os.PathLike):
             source = os.fspath(source)
         if not isinstance(source, str):
@@ -87,21 +123,25 @@ class _MiMoAudioCodec:
         if source.startswith(("http://", "https://")):
             response = requests.get(source, timeout=30)
             response.raise_for_status()
-            return sf.read(io.BytesIO(response.content), dtype="float32")
+            waveform, sampling_rate = sf.read(io.BytesIO(response.content), dtype="float32")
+            return np.asarray(waveform, dtype=np.float32), int(sampling_rate)
         if source.startswith("data:") and "base64," in source:
             payload = base64.b64decode(source.split("base64,", 1)[1])
-            return sf.read(io.BytesIO(payload), dtype="float32")
+            waveform, sampling_rate = sf.read(io.BytesIO(payload), dtype="float32")
+            return np.asarray(waveform, dtype=np.float32), int(sampling_rate)
         if source.startswith("file://"):
             source = unquote(urlparse(source).path)
         if os.path.isfile(source):
-            return sf.read(source, dtype="float32")
+            waveform, sampling_rate = sf.read(source, dtype="float32")
+            return np.asarray(waveform, dtype=np.float32), int(sampling_rate)
         try:
             payload = base64.b64decode(source, validate=True)
         except ValueError as error:
             raise ValueError("Unsupported MiMoV2 audio source.") from error
-        return sf.read(io.BytesIO(payload), dtype="float32")
+        waveform, sampling_rate = sf.read(io.BytesIO(payload), dtype="float32")
+        return np.asarray(waveform, dtype=np.float32), int(sampling_rate)
 
-    def encode(self, source):
+    def encode(self, source: AudioSource) -> IntArray:
         waveform, sampling_rate = self._waveform(source)
         if waveform.ndim == 2:
             axis = 0 if waveform.shape[0] <= 8 < waveform.shape[1] else 1
@@ -127,7 +167,10 @@ class _MiMoAudioCodec:
                     return_codes_only=True,
                 )
                 parts.append(codes)
-        return self.torch.cat(parts, dim=-1).transpose(0, 1).cpu().numpy()
+        return np.asarray(
+            self.torch.cat(parts, dim=-1).transpose(0, 1).cpu().numpy(),
+            dtype=np.int32,
+        )
 
 
 class MiMoV2Processor(QwenVLProcessor):
@@ -137,7 +180,12 @@ class MiMoV2Processor(QwenVLProcessor):
         "MiMoV2FlashForConditionalGeneration",
     )
 
-    def __init__(self, hf_config, server_args, processor):
+    def __init__(
+        self,
+        hf_config: PretrainedConfig,
+        server_args: ServerArgs,
+        processor: ProcessorMixin,
+    ) -> None:
         if isinstance(getattr(hf_config, "vision_config", None), dict):
             hf_config = copy.copy(hf_config)
             hf_config.vision_config = SimpleNamespace(**hf_config.vision_config)
@@ -155,9 +203,15 @@ class MiMoV2Processor(QwenVLProcessor):
             _value(audio_config, "speech_vocab_size", 1280),
             self.audio_channels,
         )
-        self._audio_codec = None
+        self._audio_codec: _MiMoAudioCodec | None = None
 
-    async def process_mm_data_async(self, image_data, input_text, request_obj, **kwargs):
+    async def process_mm_data_async(
+        self,
+        image_data: ImageInput,
+        input_text: str | list[int],
+        request_obj: GenerateReqInput | EmbeddingReqInput,
+        **kwargs: object,
+    ) -> MultimodalInputs:
         if isinstance(input_text, list):
             raise ValueError("MiMoV2 multimodal requests require text input.")
         has_vision = getattr(self.hf_config, "vision_config", None) is not None
@@ -191,7 +245,7 @@ class MiMoV2Processor(QwenVLProcessor):
         self._merge_audio(output, codes)
         return output
 
-    def _encode_audio(self, source):
+    def _encode_audio(self, source: AudioSource) -> IntArray:
         if isinstance(source, dict) and "codes" in source:
             source = source["codes"]
         array = np.asarray(source) if isinstance(source, (list, np.ndarray)) else None
@@ -203,7 +257,7 @@ class MiMoV2Processor(QwenVLProcessor):
             self._audio_codec = _MiMoAudioCodec(self.server_args.model_path)
         return self._normalize_codes(self._audio_codec.encode(source))
 
-    def _normalize_codes(self, values):
+    def _normalize_codes(self, values: npt.ArrayLike) -> IntArray:
         values = np.asarray(values)
         if values.ndim != 2:
             raise ValueError(f"MiMoV2 audio codes must be 2D, got {values.shape}.")
@@ -225,7 +279,7 @@ class MiMoV2Processor(QwenVLProcessor):
         return values.astype(np.int32, copy=False)
 
     @staticmethod
-    def _audio_sources(data):
+    def _audio_sources(data: AudioInput) -> list[AudioSource]:
         if data is None:
             return []
         if isinstance(data, list) and data and isinstance(data[0], (int, float, np.number)):
@@ -241,22 +295,31 @@ class MiMoV2Processor(QwenVLProcessor):
             and np.issubdtype(array.dtype, np.integer)
         ):
             return [data]
-        return data if isinstance(data, list) else [data]
+        return cast(list[AudioSource], data) if isinstance(data, list) else [data]
 
     @staticmethod
-    def _int_list(value, length):
-        values = value.split("-") if isinstance(value, str) else value
-        values = list(values) if isinstance(values, (list, tuple)) else [values]
-        values = [int(item) for item in values]
+    def _int_list(value: int | str | Sequence[int], length: int) -> list[int]:
+        if isinstance(value, str):
+            values = [int(item) for item in value.split("-")]
+        elif isinstance(value, int):
+            values = [value]
+        else:
+            values = [int(item) for item in value]
         if len(values) == 1:
             values *= length
         if len(values) != length:
             raise ValueError(f"Expected {length} values, got {len(values)}.")
         return values
 
-    def _merge_audio(self, output, code_arrays):
+    def _merge_audio(
+        self,
+        output: MultimodalInputs,
+        code_arrays: Sequence[IntArray],
+    ) -> None:
+        if output.input_ids is None:
+            raise ValueError("MiMoV2 processor output is missing input_ids.")
         input_ids = list(output.input_ids)
-        items = []
+        items: list[MultimodalDataItem] = []
         cursor = 0
         for values in code_arrays:
             values = np.asarray(values)
@@ -296,7 +359,9 @@ class MiMoV2Processor(QwenVLProcessor):
         output.mm_items.extend(items)
         self._refresh_vision_ranges(output)
 
-    def _refresh_vision_ranges(self, output):
+    def _refresh_vision_ranges(self, output: MultimodalInputs) -> None:
+        if output.input_ids is None:
+            raise ValueError("MiMoV2 processor output is missing input_ids.")
         for modality, token_id, grid_key in (
             (Modality.IMAGE, output.im_token_id, "image_grid_thw"),
             (Modality.VIDEO, output.video_token_id, "video_grid_thw"),
@@ -304,6 +369,8 @@ class MiMoV2Processor(QwenVLProcessor):
             items = [item for item in output.mm_items if item.modality is modality]
             if not items:
                 continue
+            if token_id is None:
+                raise ValueError(f"MiMoV2 processor output is missing {grid_key} token id.")
             grids = [tuple(np.asarray(item.get(grid_key)).reshape(-1)) for item in items]
             ranges = self._compute_placeholder_ranges(
                 output.input_ids,

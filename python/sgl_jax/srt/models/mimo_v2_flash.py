@@ -523,10 +523,14 @@ class MiMoV2Model(nnx.Module):
             param_dtype=dtype,
         )
 
-    def get_input_embeddings(self):
+    def get_input_embeddings(self) -> Embed:
         return self.embed_tokens
 
-    def __call__(self, forward_batch: ForwardBatch, token_to_kv_pool: KVCache):
+    def __call__(
+        self,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+    ) -> tuple[jax.Array, list[Any], list[Any]]:
         residual = None
         input_embeds = (
             forward_batch.input_embedding

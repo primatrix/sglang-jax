@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import NamedSharding
+from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
+from transformers import PretrainedConfig
 
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
@@ -17,7 +19,10 @@ from sgl_jax.srt.models.mimo_v2_flash import MiMoV2FlashForCausalLM
 from sgl_jax.srt.models.mimo_v2_pro import MiMoV2ForCausalLM
 from sgl_jax.srt.multimodal.common.modality_enum import Modality
 from sgl_jax.srt.multimodal.in_model.encoder_planning import EncodeInputs
-from sgl_jax.srt.multimodal.in_model.encoders.mimo_v2 import MiMoV2PlanBuilder
+from sgl_jax.srt.multimodal.in_model.encoders.mimo_v2 import (
+    MiMoV2PlanBuilder,
+    MiMoV2VisionMetadata,
+)
 from sgl_jax.srt.multimodal.in_model.registry import register_encoder_plan_builder
 from sgl_jax.srt.multimodal.kernels.flash_attention import SegmentIds
 from sgl_jax.srt.multimodal.layers.vision_sharding import (
@@ -26,6 +31,12 @@ from sgl_jax.srt.multimodal.layers.vision_sharding import (
     resolve_encoder_tp,
 )
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
+
+if TYPE_CHECKING:
+    from sgl_jax.srt.configs.model_config import ModelConfig
+    from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
+        VisionFlashAttentionBackend,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -37,17 +48,24 @@ for _architecture in _ARCHITECTURES:
     register_encoder_plan_builder(_architecture, MiMoV2PlanBuilder)
 
 
-def _value(config, name, default=None):
-    return config.get(name, default) if isinstance(config, dict) else getattr(config, name, default)
+ConfigLike = PretrainedConfig | Mapping[str, Any] | SimpleNamespace
 
 
-def _int_list(value, length):
+def _value(config: ConfigLike | None, name: str, default: Any = None) -> Any:
+    if config is None:
+        return default
+    return (
+        config.get(name, default) if isinstance(config, Mapping) else getattr(config, name, default)
+    )
+
+
+def _int_list(value: int | str | Sequence[int], length: int) -> list[int]:
     if isinstance(value, str):
         values = [int(item) for item in value.split("-")]
-    elif isinstance(value, (list, tuple)):
-        values = [int(item) for item in value]
+    elif isinstance(value, int):
+        values = [value]
     else:
-        values = [int(value)]
+        values = [int(item) for item in value]
     if len(values) == 1:
         values *= length
     if len(values) != length:
@@ -55,7 +73,7 @@ def _int_list(value, length):
     return values
 
 
-def _apply_rope(x, freqs):
+def _apply_rope(x: jax.Array, freqs: jax.Array) -> jax.Array:
     original_dtype = x.dtype
     x = x.astype(jnp.float32)
     half = x.shape[-1] // 2
@@ -64,7 +82,7 @@ def _apply_rope(x, freqs):
     return (x * cos + rotated * sin).astype(original_dtype)
 
 
-def _take_units(x, index, unit):
+def _take_units(x: jax.Array, index: jax.Array, unit: int) -> jax.Array:
     batch, length = x.shape[:2]
     tail = x.shape[2:]
     x = x.reshape(batch, length // unit, unit, *tail)
@@ -73,7 +91,14 @@ def _take_units(x, index, unit):
     return jnp.take_along_axis(x, gather, axis=1).reshape(batch, length, *tail)
 
 
-def _dense_vision_attention(q, k, v, segments, window_size, sinks):
+def _dense_vision_attention(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    segments: jax.Array,
+    window_size: int,
+    sinks: jax.Array | None,
+) -> jax.Array:
     scores = jnp.einsum("bthd,bshd->bhts", q, k) / math.sqrt(q.shape[-1])
     valid = segments >= 0
     mask = valid[:, :, None] & valid[:, None, :]
@@ -97,7 +122,13 @@ def _dense_vision_attention(q, k, v, segments, window_size, sinks):
     return jnp.where(valid[:, :, None, None], output, 0)
 
 
-def _flash_vision_attention(backend, q, k, v, segments):
+def _flash_vision_attention(
+    backend: VisionFlashAttentionBackend,
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    segments: jax.Array,
+) -> jax.Array:
     length = q.shape[1]
     aligned = max(256, ((length + 127) // 128) * 128)
     pad = aligned - length
@@ -111,7 +142,14 @@ def _flash_vision_attention(backend, q, k, v, segments):
 
 
 class MiMoVisionPatchEmbed(nnx.Module):
-    def __init__(self, config, dtype, rngs, mesh, tp):
+    def __init__(
+        self,
+        config: ConfigLike,
+        dtype: jnp.dtype,
+        rngs: nnx.Rngs,
+        mesh: Mesh,
+        tp: bool,
+    ) -> None:
         self.channels = int(_value(config, "in_channels", None) or _value(config, "in_chans", 3))
         self.temporal = int(_value(config, "temporal_patch_size", 2))
         self.patch = int(_value(config, "patch_size", 16))
@@ -128,7 +166,7 @@ class MiMoVisionPatchEmbed(nnx.Module):
             rngs=rngs,
         )
 
-    def __call__(self, patches):
+    def __call__(self, patches: jax.Array) -> jax.Array:
         batch, length = patches.shape[:2]
         flat_sharding = self.specs.batch_sharding(None, None, None, None)
         patches = patches.reshape(
@@ -147,7 +185,13 @@ class MiMoVisionPatchEmbed(nnx.Module):
 
 
 class MiMoVisionMLP(nnx.Module):
-    def __init__(self, config, dtype, mesh, specs):
+    def __init__(
+        self,
+        config: ConfigLike,
+        dtype: jnp.dtype,
+        mesh: Mesh,
+        specs: VisionShardSpecs,
+    ) -> None:
         hidden = int(_value(config, "hidden_size"))
         intermediate = int(_value(config, "intermediate_size"))
         self.gate_proj = LinearBase(
@@ -177,7 +221,7 @@ class MiMoVisionMLP(nnx.Module):
         self.specs = specs
         self.activation = _value(config, "hidden_act", "silu")
 
-    def __call__(self, hidden):
+    def __call__(self, hidden: jax.Array) -> jax.Array:
         gate, _ = self.gate_proj(hidden, out_sharding=self.specs.col_out(hidden.ndim))
         up, _ = self.up_proj(hidden, out_sharding=self.specs.col_out(hidden.ndim))
         activation = jax.nn.silu if self.activation == "silu" else jax.nn.gelu
@@ -188,7 +232,14 @@ class MiMoVisionMLP(nnx.Module):
 
 
 class MiMoVisionAttention(nnx.Module):
-    def __init__(self, config, dtype, mesh, specs, use_sinks):
+    def __init__(
+        self,
+        config: ConfigLike,
+        dtype: jnp.dtype,
+        mesh: Mesh,
+        specs: VisionShardSpecs,
+        use_sinks: bool,
+    ) -> None:
         hidden = int(_value(config, "hidden_size"))
         self.heads = int(_value(config, "num_heads"))
         self.kv_heads = int(_value(config, "num_key_value_heads", self.heads) or self.heads)
@@ -223,7 +274,7 @@ class MiMoVisionAttention(nnx.Module):
             if use_sinks
             else None
         )
-        if mesh is None or jax.default_backend() == "cpu":
+        if jax.default_backend() == "cpu":
             self.backend = None
         else:
             from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
@@ -237,7 +288,13 @@ class MiMoVisionAttention(nnx.Module):
                 head_tp=specs.tp,
             )
 
-    def __call__(self, hidden, freqs, segments, window_size):
+    def __call__(
+        self,
+        hidden: jax.Array,
+        freqs: jax.Array,
+        segments: jax.Array,
+        window_size: int,
+    ) -> jax.Array:
         batch, length = hidden.shape[:2]
         q, _ = self.q_proj(hidden, out_sharding=self.specs.col_out(hidden.ndim))
         k, _ = self.k_proj(hidden, out_sharding=self.specs.col_out(hidden.ndim))
@@ -265,7 +322,15 @@ class MiMoVisionAttention(nnx.Module):
 
 
 class MiMoVisionBlock(nnx.Module):
-    def __init__(self, config, dtype, rngs, mesh, tp, use_sinks):
+    def __init__(
+        self,
+        config: ConfigLike,
+        dtype: jnp.dtype,
+        rngs: nnx.Rngs,
+        mesh: Mesh,
+        tp: bool,
+        use_sinks: bool,
+    ) -> None:
         hidden = int(_value(config, "hidden_size"))
         epsilon = float(_value(config, "rms_norm_eps", 1e-6))
         self.norm1 = nnx.RMSNorm(hidden, epsilon=epsilon, dtype=dtype, param_dtype=dtype, rngs=rngs)
@@ -274,13 +339,26 @@ class MiMoVisionBlock(nnx.Module):
         self.attn = MiMoVisionAttention(config, dtype, mesh, specs, use_sinks)
         self.mlp = MiMoVisionMLP(config, dtype, mesh, specs)
 
-    def __call__(self, hidden, freqs, segments, window_size):
+    def __call__(
+        self,
+        hidden: jax.Array,
+        freqs: jax.Array,
+        segments: jax.Array,
+        window_size: int,
+    ) -> jax.Array:
         hidden += self.attn(self.norm1(hidden), freqs, segments, window_size)
         return hidden + self.mlp(self.norm2(hidden))
 
 
 class MiMoVisionPatchMerger(nnx.Module):
-    def __init__(self, config, dtype, rngs, mesh, tp):
+    def __init__(
+        self,
+        config: ConfigLike,
+        dtype: jnp.dtype,
+        rngs: nnx.Rngs,
+        mesh: Mesh,
+        tp: bool,
+    ) -> None:
         context = int(_value(config, "hidden_size"))
         unit = int(_value(config, "spatial_merge_size", 2)) ** 2
         hidden = context * unit
@@ -311,7 +389,7 @@ class MiMoVisionPatchMerger(nnx.Module):
             kernel_axes=self.specs.row_kernel_axes,
         )
 
-    def __call__(self, hidden):
+    def __call__(self, hidden: jax.Array) -> jax.Array:
         hidden = self.ln_q(hidden).reshape(
             hidden.shape[0],
             -1,
@@ -324,7 +402,14 @@ class MiMoVisionPatchMerger(nnx.Module):
 
 
 class MiMoVisionTransformer(nnx.Module):
-    def __init__(self, config, dtype, rngs, mesh, tp):
+    def __init__(
+        self,
+        config: ConfigLike,
+        dtype: jnp.dtype,
+        rngs: nnx.Rngs,
+        mesh: Mesh,
+        tp: bool,
+    ) -> None:
         self.config = config
         self.mesh = mesh
         self.specs = VisionShardSpecs(mesh, tp)
@@ -346,23 +431,31 @@ class MiMoVisionTransformer(nnx.Module):
         )
         self.merger = MiMoVisionPatchMerger(config, dtype, rngs, mesh, tp)
 
-    def __call__(self, patches, meta, valid):
+    def __call__(
+        self,
+        patches: jax.Array,
+        meta: MiMoV2VisionMetadata,
+        valid: jax.Array,
+    ) -> jax.Array:
+        col_index = jnp.asarray(meta.col_index)
+        rotary_freqs = jnp.asarray(meta.rotary_freqs)
+        segment_ids = jnp.asarray(meta.segment_ids)
         hidden = self.patch_embed(patches)
         segments = jnp.where(
             jnp.arange(hidden.shape[1])[None] < valid[:, None],
-            meta.segment_ids,
+            segment_ids,
             -1,
         )
-        col_freqs = _take_units(meta.rotary_freqs, meta.col_index, self.unit)
-        reverse_col_index = jnp.argsort(meta.col_index, axis=1)
+        col_freqs = _take_units(rotary_freqs, col_index, self.unit)
+        reverse_col_index = jnp.argsort(col_index, axis=1)
         for index, block in enumerate(self.blocks):
             col = self.window_types[index] == 1
             previous_col = index > 0 and self.window_types[index - 1] == 1
             if col and not previous_col:
-                hidden = _take_units(hidden, meta.col_index, self.unit)
+                hidden = _take_units(hidden, col_index, self.unit)
             elif previous_col and not col:
                 hidden = _take_units(hidden, reverse_col_index, self.unit)
-            freqs = col_freqs if col else meta.rotary_freqs
+            freqs = col_freqs if col else rotary_freqs
             window = -1 if index in self.full_blocks else self.window_size
             hidden = block(hidden, freqs, segments, window)
         output = self.merger(hidden)
@@ -374,7 +467,7 @@ class MiMoVisionTransformer(nnx.Module):
         )
 
     @jax.jit
-    def encode(self, inputs):
+    def encode(self, inputs: EncodeInputs) -> jax.Array:
         output = self(inputs.features, inputs.meta, inputs.valid)
         if self.mesh is not None:
             output = apply_data_sharding(output, self.mesh, self.specs.batch_spec(None, None))
@@ -382,7 +475,14 @@ class MiMoVisionTransformer(nnx.Module):
 
 
 class MiMoAudioCodeEmbedding(nnx.Module):
-    def __init__(self, size, features, dtype, mesh, specs):
+    def __init__(
+        self,
+        size: int,
+        features: int,
+        dtype: jnp.dtype,
+        mesh: Mesh,
+        specs: VisionShardSpecs,
+    ) -> None:
         self.embedding = nnx.Param(
             jax.random.normal(
                 jax.random.PRNGKey(0),
@@ -394,7 +494,7 @@ class MiMoAudioCodeEmbedding(nnx.Module):
         self.mesh = mesh
         self.specs = specs
 
-    def __call__(self, indices):
+    def __call__(self, indices: jax.Array) -> jax.Array:
         return (
             self.embedding[...]
             .at[indices]
@@ -408,7 +508,13 @@ class MiMoAudioCodeEmbedding(nnx.Module):
 
 
 class MiMoAudioAttention(nnx.Module):
-    def __init__(self, config, dtype, mesh, specs):
+    def __init__(
+        self,
+        config: ConfigLike,
+        dtype: jnp.dtype,
+        mesh: Mesh,
+        specs: VisionShardSpecs,
+    ) -> None:
         hidden = int(_value(config, "input_local_dim"))
         self.heads = int(_value(config, "input_local_attn_heads"))
         self.head_dim = int(_value(config, "input_local_head_dim", hidden // self.heads))
@@ -436,7 +542,7 @@ class MiMoAudioAttention(nnx.Module):
             kernel_axes=(None, None),
         )
 
-    def __call__(self, hidden):
+    def __call__(self, hidden: jax.Array) -> jax.Array:
         batch, length = hidden.shape[:2]
         out_sharding = self.specs.row_out(hidden.ndim)
         q, _ = self.q_proj(hidden, out_sharding=out_sharding)
@@ -470,7 +576,13 @@ class MiMoAudioAttention(nnx.Module):
 
 
 class MiMoAudioMLP(nnx.Module):
-    def __init__(self, config, dtype, mesh, specs):
+    def __init__(
+        self,
+        config: ConfigLike,
+        dtype: jnp.dtype,
+        mesh: Mesh,
+        specs: VisionShardSpecs,
+    ) -> None:
         hidden = int(_value(config, "input_local_dim"))
         intermediate = int(_value(config, "input_local_intermediate_size"))
         linear = lambda input_size, output_size: LinearBase(
@@ -486,7 +598,7 @@ class MiMoAudioMLP(nnx.Module):
         self.down_proj = linear(intermediate, hidden)
         self.specs = specs
 
-    def __call__(self, hidden):
+    def __call__(self, hidden: jax.Array) -> jax.Array:
         out_sharding = self.specs.row_out(hidden.ndim)
         gate, _ = self.gate_proj(hidden, out_sharding=out_sharding)
         up, _ = self.up_proj(hidden, out_sharding=out_sharding)
@@ -494,7 +606,13 @@ class MiMoAudioMLP(nnx.Module):
 
 
 class MiMoAudioBlock(nnx.Module):
-    def __init__(self, config, dtype, mesh, specs):
+    def __init__(
+        self,
+        config: ConfigLike,
+        dtype: jnp.dtype,
+        mesh: Mesh,
+        specs: VisionShardSpecs,
+    ) -> None:
         hidden = int(_value(config, "input_local_dim"))
         epsilon = float(_value(config, "rms_norm_eps", 1e-6))
         self.input_layernorm = RMSNorm(hidden, epsilon=epsilon, param_dtype=dtype)
@@ -502,13 +620,19 @@ class MiMoAudioBlock(nnx.Module):
         self.self_attn = MiMoAudioAttention(config, dtype, mesh, specs)
         self.mlp = MiMoAudioMLP(config, dtype, mesh, specs)
 
-    def __call__(self, hidden):
+    def __call__(self, hidden: jax.Array) -> jax.Array:
         hidden += self.self_attn(self.input_layernorm(hidden))
         return hidden + self.mlp(self.post_attention_layernorm(hidden))
 
 
 class MiMoAudioTransformer(nnx.Module):
-    def __init__(self, config, dtype, mesh, specs):
+    def __init__(
+        self,
+        config: ConfigLike,
+        dtype: jnp.dtype,
+        mesh: Mesh,
+        specs: VisionShardSpecs,
+    ) -> None:
         self.layers = nnx.List(
             [
                 MiMoAudioBlock(config, dtype, mesh, specs)
@@ -525,14 +649,20 @@ class MiMoAudioTransformer(nnx.Module):
             else None
         )
 
-    def __call__(self, hidden):
+    def __call__(self, hidden: jax.Array) -> jax.Array:
         for layer in self.layers:
             hidden = layer(hidden)
         return self.norm(hidden) if self.norm is not None else hidden
 
 
 class MiMoAudioEncoder(nnx.Module):
-    def __init__(self, config, dtype, mesh, encoder_tp):
+    def __init__(
+        self,
+        config: ConfigLike,
+        dtype: jnp.dtype,
+        mesh: Mesh,
+        encoder_tp: bool,
+    ) -> None:
         self.config = config
         self.mesh = mesh
         self.dtype = dtype
@@ -587,7 +717,7 @@ class MiMoAudioEncoder(nnx.Module):
         else:
             raise ValueError(f"Unsupported MiMoV2 audio projection_layers={projection_layers}.")
 
-    def __call__(self, codes, valid):
+    def __call__(self, codes: jax.Array, valid: jax.Array) -> jax.Array:
         codes = codes.astype(jnp.int32)
         position_valid = jnp.arange(codes.shape[1])[None] < valid[:, None]
         zero_ids = jnp.asarray(self.zero_ids, dtype=jnp.int32)
@@ -634,7 +764,7 @@ class MiMoAudioEncoder(nnx.Module):
         )
 
     @jax.jit
-    def encode(self, inputs):
+    def encode(self, inputs: EncodeInputs) -> jax.Array:
         output = self(inputs.features, inputs.valid)
         return apply_data_sharding(output, self.mesh, self.specs.batch_spec(None, None))
 
@@ -642,8 +772,21 @@ class MiMoAudioEncoder(nnx.Module):
 class _MiMoV2MultimodalMixin:
     materialize_input_embeddings = True
 
-    def __init__(self, config=None, dtype=None, mesh=None, **kwargs):
-        super().__init__(config=config, dtype=dtype, mesh=mesh, **kwargs)
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        mesh: Mesh | None = None,
+        **kwargs: object,
+    ) -> None:
+        if mesh is None:
+            raise ValueError("MiMoV2 multimodal models require a device mesh.")
+        super().__init__(  # type: ignore[call-arg]
+            config=config,
+            dtype=dtype,
+            mesh=mesh,
+            **kwargs,
+        )
         from sgl_jax.srt.managers.schedule_batch import global_server_args_dict
 
         self.encoder_tp = resolve_encoder_tp(
@@ -676,8 +819,8 @@ class _MiMoV2MultimodalMixin:
             return self.audio_encoder.encode
         raise ValueError(f"{type(self).__name__} does not support {modality.name} encoding.")
 
-    def load_weights(self, model_config):
-        super().load_weights(model_config)
+    def load_weights(self, model_config: ModelConfig) -> None:
+        super().load_weights(model_config)  # type: ignore[misc]
         mappings = self._tower_weight_mappings()
         if not mappings:
             return
@@ -695,22 +838,30 @@ class _MiMoV2MultimodalMixin:
             get_total_num_kv_heads=lambda: kv_heads,
             _dummy_mode=getattr(model_config, "_dummy_mode", False),
         )
-        loader = WeightLoader(self, tower_config, self.mesh, self.dtype)
+        loader = WeightLoader(
+            cast(nnx.Module, self),
+            cast("ModelConfig", tower_config),
+            self.mesh,
+            self.dtype,
+        )
         loader.load_weights_from_safetensors(mappings)
         logger.info("MiMoV2 multimodal tower weights loaded successfully.")
 
-    def _tower_weight_mappings(self):
-        mappings = {}
+    def _tower_weight_mappings(self) -> dict[str, WeightMapping]:
+        mappings: dict[str, WeightMapping] = {}
         if self.visual is not None:
             mappings.update(self._vision_weight_mappings())
         if self.audio_encoder is not None:
             mappings.update(self._audio_weight_mappings())
         return mappings
 
-    def _vision_weight_mappings(self):
-        specs = self.visual.specs
+    def _vision_weight_mappings(self) -> dict[str, WeightMapping]:
+        visual = self.visual
+        if visual is None:
+            raise RuntimeError("MiMoV2 vision weight mappings require a vision tower.")
+        specs = visual.specs
         col, row = specs.col_kernel_axes, specs.row_kernel_axes
-        mappings = {
+        mappings: dict[str, WeightMapping] = {
             "visual.patch_embed.proj.weight": WeightMapping(
                 "visual.patch_embed.proj.kernel",
                 (None, None, None, None, None),
@@ -725,7 +876,7 @@ class _MiMoV2MultimodalMixin:
         }
         mappings.update(self._linear_mappings("visual.merger.mlp.0", "visual.merger.mlp_fc1", col))
         mappings.update(self._linear_mappings("visual.merger.mlp.2", "visual.merger.mlp_fc2", row))
-        for index, block in enumerate(self.visual.blocks):
+        for index, block in enumerate(visual.blocks):
             source = target = f"visual.blocks.{index}"
             for norm in ("norm1", "norm2"):
                 mappings[f"{source}.{norm}.weight"] = WeightMapping(
@@ -757,9 +908,11 @@ class _MiMoV2MultimodalMixin:
                 )
         return mappings
 
-    def _audio_weight_mappings(self):
+    def _audio_weight_mappings(self) -> dict[str, WeightMapping]:
         encoder = self.audio_encoder
-        mappings = {}
+        if encoder is None:
+            raise RuntimeError("MiMoV2 audio weight mappings require an audio tower.")
+        mappings: dict[str, WeightMapping] = {}
         for index in range(encoder.channels):
             mappings[f"speech_embeddings.{index}.weight"] = WeightMapping(
                 f"audio_encoder.speech_embeddings.{index}.embedding",
@@ -808,7 +961,11 @@ class _MiMoV2MultimodalMixin:
         return mappings
 
     @staticmethod
-    def _linear_mappings(source, target, sharding):
+    def _linear_mappings(
+        source: str,
+        target: str,
+        sharding: tuple[Any, ...],
+    ) -> dict[str, WeightMapping]:
         return {
             f"{source}.weight": WeightMapping(f"{target}.weight", sharding, transpose=True),
             f"{source}.bias": WeightMapping(f"{target}.bias", (sharding[-1],), transpose=False),

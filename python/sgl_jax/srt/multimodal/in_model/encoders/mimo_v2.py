@@ -1,18 +1,38 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any, Self
 
+import jax
 import numpy as np
+import numpy.typing as npt
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 from sgl_jax.srt.multimodal.in_model.encoder_planning import EncoderPlanBuilder
+from sgl_jax.srt.multimodal.in_model.plan import MultimodalEmbedPlan
+
+if TYPE_CHECKING:
+    from sgl_jax.srt.configs.model_config import ModelConfig
+    from sgl_jax.srt.managers.schedule_batch import Req, ScheduleReqsInfo
 
 
-def _value(config, name, default=None):
-    return config.get(name, default) if isinstance(config, dict) else getattr(config, name, default)
+IntArray = npt.NDArray[np.int32] | jax.Array
+FloatArray = npt.NDArray[np.float32] | jax.Array
+
+
+def _value(
+    config: Mapping[str, Any] | object | None,
+    name: str,
+    default: Any = None,
+) -> Any:
+    if config is None:
+        return default
+    return (
+        config.get(name, default) if isinstance(config, Mapping) else getattr(config, name, default)
+    )
 
 
 def _grid(item: MultimodalDataItem) -> tuple[int, int, int]:
@@ -22,17 +42,21 @@ def _grid(item: MultimodalDataItem) -> tuple[int, int, int]:
     rows = np.asarray(value)
     if rows.size != 3:
         raise ValueError(f"MiMoV2 vision item requires one (t, h, w) grid, got {rows.shape}.")
-    return tuple(int(x) for x in rows.reshape(-1))
+    flat = rows.reshape(-1)
+    return int(flat[0]), int(flat[1]), int(flat[2])
 
 
 def _placeholder_rows(item: MultimodalDataItem) -> int:
     return sum(end - start for start, end in item.placeholder_ranges or ())
 
 
-def _int_list(value, length):
-    values = value.split("-") if isinstance(value, str) else value
-    values = list(values) if isinstance(values, (list, tuple)) else [values]
-    values = [int(item) for item in values]
+def _int_list(value: int | str | Sequence[int], length: int) -> list[int]:
+    if isinstance(value, str):
+        values = [int(item) for item in value.split("-")]
+    elif isinstance(value, int):
+        values = [value]
+    else:
+        values = [int(item) for item in value]
     if len(values) == 1:
         values *= length
     if len(values) != length:
@@ -43,15 +67,21 @@ def _int_list(value, length):
 @register_pytree_node_class
 @dataclass
 class MiMoV2VisionMetadata:
-    col_index: Any
-    rotary_freqs: Any
-    segment_ids: Any
+    col_index: IntArray
+    rotary_freqs: FloatArray
+    segment_ids: IntArray
 
-    def tree_flatten(self):
+    def tree_flatten(
+        self,
+    ) -> tuple[tuple[IntArray, FloatArray, IntArray], None]:
         return (self.col_index, self.rotary_freqs, self.segment_ids), None
 
     @classmethod
-    def tree_unflatten(cls, _, children):
+    def tree_unflatten(
+        cls,
+        _aux_data: None,
+        children: tuple[IntArray, FloatArray, IntArray],
+    ) -> Self:
         return cls(*children)
 
 
@@ -59,7 +89,11 @@ class MiMoV2VisionPlanBuilder(EncoderPlanBuilder):
     input_modalities = (Modality.IMAGE, Modality.MULTI_IMAGES, Modality.VIDEO)
     output_modality = Modality.IMAGE
 
-    def __init__(self, model_config, input_buckets=None):
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        input_buckets: Sequence[int] | None = None,
+    ) -> None:
         super().__init__(input_buckets)
         config = getattr(model_config.hf_config, "vision_config", None)
         if config is None:
@@ -78,7 +112,10 @@ class MiMoV2VisionPlanBuilder(EncoderPlanBuilder):
             self.in_channels * self.temporal_patch_size * self.patch_size * self.patch_size
         )
 
-    def _metadata_for_grid(self, grid):
+    def _metadata_for_grid(
+        self,
+        grid: tuple[int, int, int],
+    ) -> tuple[IntArray, FloatArray, IntArray]:
         t, h, w = grid
         merge = self.spatial_merge_size
         if min(grid) <= 0 or h % merge or w % merge:
@@ -104,10 +141,13 @@ class MiMoV2VisionPlanBuilder(EncoderPlanBuilder):
         segments = np.repeat(np.arange(t, dtype=np.int32), h * w)
         return col_index, freqs, segments
 
-    def get_metadata(self, items):
-        col_indices = []
-        freqs = []
-        segments = []
+    def get_metadata(
+        self,
+        items: Sequence[MultimodalDataItem],
+    ) -> MiMoV2VisionMetadata:
+        col_indices: list[IntArray] = []
+        freqs: list[FloatArray] = []
+        segments: list[IntArray] = []
         unit_offset = 0
         segment_offset = 0
         for item in items:
@@ -136,13 +176,17 @@ class MiMoV2VisionPlanBuilder(EncoderPlanBuilder):
             np.concatenate(segments),
         )
 
-    def dummy_metadata(self, input_capacity):
+    def dummy_metadata(self, input_capacity: int) -> MiMoV2VisionMetadata:
         self._validate_capacity(input_capacity)
         merge = self.spatial_merge_size
         index, freqs, segments = self._metadata_for_grid((1, merge, input_capacity // merge))
         return MiMoV2VisionMetadata(index, freqs, segments)
 
-    def pad_metadata(self, meta, input_capacity):
+    def pad_metadata(
+        self,
+        meta: MiMoV2VisionMetadata,
+        input_capacity: int,
+    ) -> MiMoV2VisionMetadata:
         self._validate_capacity(input_capacity)
         units = input_capacity // self.spatial_merge_unit
         if meta.col_index.size > units or meta.rotary_freqs.shape[0] > input_capacity:
@@ -155,11 +199,11 @@ class MiMoV2VisionPlanBuilder(EncoderPlanBuilder):
         segments[: meta.segment_ids.size] = meta.segment_ids
         return MiMoV2VisionMetadata(col_index, freqs, segments)
 
-    def get_num_output_tokens(self, input_len):
+    def get_num_output_tokens(self, input_len: int) -> int:
         self._validate_capacity(input_len)
         return input_len // self.spatial_merge_unit
 
-    def _validate_capacity(self, capacity):
+    def _validate_capacity(self, capacity: int) -> None:
         if capacity <= 0 or capacity % self.spatial_merge_unit:
             raise ValueError(
                 f"MiMoV2 vision input rows must be a positive multiple of "
@@ -170,13 +214,13 @@ class MiMoV2VisionPlanBuilder(EncoderPlanBuilder):
 @register_pytree_node_class
 @dataclass
 class MiMoV2AudioMetadata:
-    marker: Any
+    marker: IntArray
 
-    def tree_flatten(self):
+    def tree_flatten(self) -> tuple[tuple[IntArray], None]:
         return (self.marker,), None
 
     @classmethod
-    def tree_unflatten(cls, _, children):
+    def tree_unflatten(cls, _aux_data: None, children: tuple[IntArray]) -> Self:
         return cls(*children)
 
 
@@ -184,7 +228,11 @@ class MiMoV2AudioPlanBuilder(EncoderPlanBuilder):
     input_modalities = (Modality.AUDIO,)
     output_modality = Modality.AUDIO
 
-    def __init__(self, model_config, input_buckets=None):
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        input_buckets: Sequence[int] | None = None,
+    ) -> None:
         super().__init__(input_buckets)
         config = getattr(model_config.hf_config, "audio_config", None)
         if config is None:
@@ -196,9 +244,9 @@ class MiMoV2AudioPlanBuilder(EncoderPlanBuilder):
         self.vocab_sizes = _int_list(_value(config, "speech_vocab_size"), self.channels)
         self.feature_dim = self.channels
 
-    def select_items(self, req):
+    def select_items(self, req: Req) -> list[MultimodalDataItem]:
         items = super().select_items(req)
-        padded = []
+        padded: list[MultimodalDataItem] = []
         for item in items:
             codes = np.asarray(item.feature)
             if codes.ndim != 2 or codes.shape[1] < self.channels or not codes.shape[0]:
@@ -222,17 +270,24 @@ class MiMoV2AudioPlanBuilder(EncoderPlanBuilder):
             padded.append(clone)
         return padded
 
-    def get_metadata(self, items):
+    def get_metadata(
+        self,
+        items: Sequence[MultimodalDataItem],
+    ) -> MiMoV2AudioMetadata:
         return MiMoV2AudioMetadata(np.asarray([len(items)], dtype=np.int32))
 
-    def dummy_metadata(self, input_capacity):
+    def dummy_metadata(self, input_capacity: int) -> MiMoV2AudioMetadata:
         return MiMoV2AudioMetadata(np.asarray([0], dtype=np.int32))
 
-    def pad_metadata(self, meta, input_capacity):
+    def pad_metadata(
+        self,
+        meta: MiMoV2AudioMetadata,
+        input_capacity: int,
+    ) -> MiMoV2AudioMetadata:
         self.get_num_output_tokens(input_capacity)
         return meta
 
-    def get_num_output_tokens(self, input_len):
+    def get_num_output_tokens(self, input_len: int) -> int:
         if input_len <= 0 or input_len % self.group_size:
             raise ValueError(
                 f"MiMoV2 audio code rows must be a positive multiple of "
@@ -242,9 +297,9 @@ class MiMoV2AudioPlanBuilder(EncoderPlanBuilder):
 
 
 class MiMoV2PlanBuilder:
-    def __init__(self, model_config):
+    def __init__(self, model_config: ModelConfig) -> None:
         config = model_config.hf_config
-        self.builders = []
+        self.builders: list[EncoderPlanBuilder] = []
         if getattr(config, "vision_config", None) is not None:
             self.builders.append(MiMoV2VisionPlanBuilder(model_config))
         if getattr(config, "audio_config", None) is not None:
@@ -253,28 +308,40 @@ class MiMoV2PlanBuilder:
             raise ValueError("MiMoV2 multimodal planning requires vision_config or audio_config.")
 
     @property
-    def input_buckets(self):
+    def input_buckets(self) -> Sequence[int] | None:
         return self.builders[0].input_buckets
 
     @input_buckets.setter
-    def input_buckets(self, value):
+    def input_buckets(self, value: Sequence[int] | None) -> None:
         for builder in self.builders:
-            builder.input_buckets = value
+            builder.input_buckets = tuple(value) if value is not None else None
 
-    def build(self, *args, **kwargs):
-        plan = {}
+    def build(
+        self,
+        reqs_info: list[ScheduleReqsInfo] | None,
+        dp_size: int,
+        per_dp_token: int,
+        tp_size: int,
+    ) -> MultimodalEmbedPlan | None:
+        plan: MultimodalEmbedPlan = {}
         for builder in self.builders:
-            if batch := builder.build(*args, **kwargs):
+            if batch := builder.build(reqs_info, dp_size, per_dp_token, tp_size):
                 plan.update(batch)
         return plan or None
 
-    def dummy_plan(self, *args, **kwargs):
-        plan = {}
+    def dummy_plan(
+        self,
+        dp_size: int,
+        tp_size: int,
+        input_bucket: int,
+        per_dp_token: int,
+    ) -> MultimodalEmbedPlan:
+        plan: MultimodalEmbedPlan = {}
         for builder in self.builders:
-            plan.update(builder.dummy_plan(*args, **kwargs))
+            plan.update(builder.dummy_plan(dp_size, tp_size, input_bucket, per_dp_token))
         return plan
 
-    def get_num_output_tokens(self, input_len):
+    def get_num_output_tokens(self, input_len: int) -> int:
         lengths = {builder.get_num_output_tokens(input_len) for builder in self.builders}
         if len(lengths) != 1:
             raise ValueError("MiMoV2 encoder towers must use the same input/output ratio.")

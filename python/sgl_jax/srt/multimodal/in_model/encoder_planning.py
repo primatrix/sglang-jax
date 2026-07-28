@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import jax
 import numpy as np
@@ -23,7 +23,7 @@ from sgl_jax.srt.multimodal.in_model.plan import (
 )
 
 if TYPE_CHECKING:
-    from sgl_jax.srt.managers.schedule_batch import ScheduleReqsInfo
+    from sgl_jax.srt.managers.schedule_batch import Req, ScheduleReqsInfo
 
 
 def _ceil_to_bucket(value: int, buckets: Sequence[int] | None) -> int:
@@ -63,6 +63,28 @@ class EncodeInputs:
         return cls(*children)
 
 
+class EncoderPlanBuilderProtocol(Protocol):
+    input_buckets: Sequence[int] | None
+
+    def build(
+        self,
+        reqs_info: list[ScheduleReqsInfo] | None,
+        dp_size: int,
+        per_dp_token: int,
+        tp_size: int,
+    ) -> MultimodalEmbedPlan | None: ...
+
+    def dummy_plan(
+        self,
+        dp_size: int,
+        tp_size: int,
+        input_bucket: int,
+        per_dp_token: int,
+    ) -> MultimodalEmbedPlan: ...
+
+    def get_num_output_tokens(self, input_len: int) -> int: ...
+
+
 class EncoderPlanBuilder(ABC):
     """Base planner for one encoder input contract."""
 
@@ -76,7 +98,7 @@ class EncoderPlanBuilder(ABC):
     ) -> None:
         self.input_buckets = tuple(input_buckets) if input_buckets else None
 
-    def select_items(self, req) -> list[MultimodalDataItem]:
+    def select_items(self, req: Req) -> list[MultimodalDataItem]:
         mm_inputs = req.mm_inputs
         if mm_inputs is None or isinstance(mm_inputs, dict) and "mm_items" not in mm_inputs:
             return []
