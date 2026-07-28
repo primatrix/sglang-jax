@@ -105,7 +105,7 @@ def local_kv_spec_for_pool(kv_pool, layer_num: int, padded_pages: int) -> jax.Sh
     from jax.sharding import PartitionSpec as _P
 
     pool_pspec = kv_pool.kv_sharding.spec
-    per_layer_tail = kv_pool.kv_buffer[0].shape[1:]
+    per_layer_tail = kv_pool.get_kv_buffer(kv_pool.start_layer).shape[1:]
     gshape = (layer_num, padded_pages) + per_layer_tail
     gspec = (None, None) + tuple(pool_pspec[1:])
     sharded_dims = [i for i, s in enumerate(gspec) if s is not None]
