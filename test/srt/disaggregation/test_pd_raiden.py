@@ -8,13 +8,13 @@ import types
 from unittest import mock
 
 import pytest
-
 from sgl_jax.raiden import raiden_requested
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
 from sgl_jax.srt.disaggregation.base.transfer import (
     AdmissionState,
     DecodeTransferContext,
 )
+from sgl_jax.srt.disaggregation.common.capacity import per_rank_inflight_limit
 from sgl_jax.srt.disaggregation.factory import create_transfer_backend
 from sgl_jax.srt.disaggregation.raiden_transfer.conn import (
     RaidenMetadata,
@@ -385,6 +385,16 @@ def test_raiden_cli_is_opt_in():
     )
     assert defaults.disaggregation_use_raiden is False
     assert selected.disaggregation_use_raiden is True
+
+
+@pytest.mark.parametrize(
+    ("max_inflight", "dp_size", "expected"),
+    [(8, 1, 8), (8, 2, 4), (32, 4, 8), (10, 4, 3), (0, 4, 0)],
+)
+def test_raiden_inflight_capacity_is_partitioned_per_rank(
+    max_inflight, dp_size, expected
+):
+    assert per_rank_inflight_limit(max_inflight, dp_size) == expected
 
 
 @pytest.mark.parametrize(
