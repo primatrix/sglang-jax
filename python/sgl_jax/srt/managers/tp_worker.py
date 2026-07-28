@@ -462,7 +462,7 @@ class ModelWorker:
                 model_worker_batch
             )
 
-        if sampling_metadata is None and not skip_sample:
+        if sampling_metadata is None:
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
                 model_worker_batch,
                 0,
@@ -507,13 +507,26 @@ class ModelWorker:
             logits_metadata=logits_metadata,
         )
 
-        self._finalize_forward(
-            model_worker_batch,
-            forward_batch,
-            logits_output,
-            layers_topk_ids,
-            launch_done,
+        self.dump_topk_ids(layers_topk_ids, model_worker_batch)
+
+        if launch_done is not None:
+            launch_done.set()
+
+        self.sync_queue.put(
+            (
+                layers_topk_ids,
+                model_worker_batch,
+            )
         )
+
+        # SAVE last layer logits
+        save_logits_file_info = os.getenv("DUMP_LAST_LAYER_LOGITS_FILENAMES", None)
+        if save_logits_file_info:
+            save_logits_with_txt(
+                logits_output.next_token_logits[: model_worker_batch.real_bs, :],
+                save_logits_file_info,
+                forward_batch.forward_mode,
+            )
 
         if skip_sample:
             next_token_ids_device = None
@@ -546,27 +559,6 @@ class ModelWorker:
             next_token_ids_device,
             cache_miss_count,
         )
-
-    def _finalize_forward(
-        self,
-        batch,
-        forward_batch,
-        logits_output,
-        layers_topk_ids,
-        launch_done,
-    ):
-        self.dump_topk_ids(layers_topk_ids, batch)
-        if launch_done is not None:
-            launch_done.set()
-        self.sync_queue.put((layers_topk_ids, batch))
-
-        save_logits_file_info = os.getenv("DUMP_LAST_LAYER_LOGITS_FILENAMES")
-        if save_logits_file_info:
-            save_logits_with_txt(
-                logits_output.next_token_logits[: batch.real_bs, :],
-                save_logits_file_info,
-                forward_batch.forward_mode,
-            )
 
     def _materialize_logprobs_to_host(
         self,

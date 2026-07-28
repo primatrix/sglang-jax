@@ -349,38 +349,7 @@ class ForwardBatch:
         cls,
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
-        device_overrides: dict[str, jax.Array] | None = None,
     ):
-        values = {
-            "input_ids": batch.input_ids,
-            "seq_lens": batch.seq_lens,
-            "out_cache_loc": batch.out_cache_loc,
-            "positions": batch.positions,
-            "req_pool_indices": batch.req_pool_indices,
-            "cache_loc": batch.cache_loc,
-            "extend_prefix_lens": batch.extend_prefix_lens,
-            "extend_seq_lens": batch.extend_seq_lens,
-        }
-        override_keys = set(device_overrides or ())
-        if device_overrides:
-            values.update(device_overrides)
-
-        value_items = list(values.items())
-        device_values = list(values.values())
-        host_indices = [
-            i
-            for i, (name, value) in enumerate(value_items)
-            if value is not None and name not in override_keys
-        ]
-        if host_indices:
-            host_values = tuple(device_values[i] for i in host_indices)
-            converted = device_array(
-                host_values,
-                sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
-            )
-            for i, value in zip(host_indices, converted):
-                device_values[i] = value
-
         (
             input_ids,
             seq_lens,
@@ -390,7 +359,19 @@ class ForwardBatch:
             cache_loc,
             extend_prefix_lens,
             extend_seq_lens,
-        ) = device_values
+        ) = device_array(
+            (
+                batch.input_ids,
+                batch.seq_lens,
+                batch.out_cache_loc,
+                batch.positions,
+                batch.req_pool_indices,
+                batch.cache_loc,
+                batch.extend_prefix_lens,
+                batch.extend_seq_lens,
+            ),
+            sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
+        )
         mrope_positions = None
         if batch.mrope_positions is not None:
             (mrope_positions,) = device_array(

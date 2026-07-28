@@ -60,7 +60,6 @@ from sgl_jax.srt.sampling.sampling_params import DEFAULT_SAMPLING_SEED, Sampling
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
 from sgl_jax.srt.utils.common_utils import get_bool_env_var, pad_to_bucket
-from sgl_jax.srt.utils.overlap_utils import DecodeWorkspaceBatchSpec
 
 if TYPE_CHECKING:
     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
@@ -2099,79 +2098,6 @@ class ScheduleBatch:
 
         return input_ids_cpu, positions_cpu, out_cache_loc_cpu, real_input_ids_len
 
-    def _merge_decode_out_cache_loc(
-        self,
-        per_dp_bs_size: int,
-        total_bs: int,
-    ) -> np.ndarray:
-        out_cache_loc = np.full(total_bs, -1, dtype=np.int32)
-        for dp_rank, info in enumerate(self.reqs_info):
-            if info.out_cache_loc is None:
-                continue
-            size = len(info.out_cache_loc)
-            offset = dp_rank * per_dp_bs_size
-            out_cache_loc[offset : offset + size] = info.out_cache_loc
-        return out_cache_loc
-
-    def _merge_decode_page_indices(
-        self,
-        bs_paddings: list,
-        cache_loc_paddings: list,
-        page_size: int,
-        per_dp_bs_size: int,
-    ) -> np.ndarray:
-        total_bs = per_dp_bs_size * self.dp_size
-        _, bs_index = pad_to_bucket(total_bs, bs_paddings)
-        total_cache_loc_size = cache_loc_paddings[bs_index]
-        if total_cache_loc_size % self.dp_size != 0:
-            raise ValueError("Decode cache_loc bucket must be divisible by dp_size.")
-
-        per_dp_cache_loc_size = total_cache_loc_size // self.dp_size
-        if per_dp_cache_loc_size % page_size != 0:
-            raise ValueError("Per-DP decode cache_loc bucket must be page aligned.")
-
-        per_dp_page_size = per_dp_cache_loc_size // page_size
-        page_indices = np.zeros(total_cache_loc_size // page_size, dtype=np.int32)
-        req_to_token = self.req_to_token_pool.req_to_token
-        req_to_token_flat = req_to_token.reshape(-1)
-        max_context_len = req_to_token.shape[1]
-
-        for dp_rank, info in enumerate(self.reqs_info):
-            if info.seq_lens is None or len(info.seq_lens) == 0:
-                continue
-
-            seq_lens = np.asarray(info.seq_lens)
-            req_pool_indices = np.asarray(info.req_pool_indices)
-            page_counts = (seq_lens + page_size - 1) // page_size
-            total_pages = int(page_counts.sum())
-            if total_pages > per_dp_page_size:
-                raise ValueError("Decode page table exceeds its per-DP bucket.")
-
-            page_offsets = np.empty(len(page_counts), dtype=np.int64)
-            page_offsets[0] = 0
-            np.cumsum(page_counts[:-1], out=page_offsets[1:])
-            row_base = req_pool_indices.astype(np.int64) * max_context_len
-            flat_src = np.repeat(row_base - page_offsets * page_size, page_counts)
-            flat_src += np.arange(total_pages, dtype=np.int64) * page_size
-            page_starts = req_to_token_flat[flat_src]
-
-            offset = dp_rank * per_dp_page_size
-            page_indices[offset : offset + total_pages] = page_starts // page_size
-
-        return page_indices
-
-    def _get_decode_workspace_batch_spec(self) -> DecodeWorkspaceBatchSpec:
-        sampling_infos = [
-            info.sampling_info for info in self.reqs_info if info.sampling_info is not None
-        ]
-        if not sampling_infos:
-            raise ValueError("Decode workspace requires sampling metadata.")
-        return DecodeWorkspaceBatchSpec(
-            is_all_greedy=all(info.is_all_greedy for info in sampling_infos),
-            need_min_p_sampling=any(info.need_min_p_sampling for info in sampling_infos),
-            has_sampling_seeds=any(info.sampling_seeds is not None for info in sampling_infos),
-        )
-
     def _merge_multimodal(
         self,
         per_dp_token_size: int,
@@ -2966,10 +2892,7 @@ class ScheduleBatch:
         cache_loc_paddings: list,
         page_size: int,
         enable_static_lora: bool = False,
-        use_decode_workspace: bool = False,
     ) -> ModelWorkerBatch:
-        if use_decode_workspace:
-            assert self.forward_mode.is_decode()
         if self.forward_mode.is_decode_or_idle():
             token_paddings = bs_paddings
         else:
@@ -2986,6 +2909,11 @@ class ScheduleBatch:
         # Save per_dp_bs_size for later use (e.g., in process_batch_result_decode)
         self.per_dp_bs_size = per_dp_bs_padding
 
+        # Step 2: Merge input_ids, positions, and out_cache_loc from all DP ranks
+        input_ids_cpu, positions_cpu, out_cache_loc_cpu, real_input_ids_len = (
+            self._merge_input_and_positions(per_dp_token_padding, total_token_size)
+        )
+
         # Step 3: Merge batch-level metadata from all DP ranks
         (
             req_pool_indices_cpu,
@@ -2999,45 +2927,17 @@ class ScheduleBatch:
             logits_indices_selector,
         ) = self._merge_batch_metadata(per_dp_bs_padding, total_bs)
 
-        # Step 2: Merge token-level inputs. Decode workspace reconstructs
-        # input_ids/positions from request state and only needs new KV locations.
-        if use_decode_workspace:
-            input_ids_cpu = np.empty(0, dtype=np.int32)
-            positions_cpu = np.empty(0, dtype=np.int32)
-            out_cache_loc_cpu = self._merge_decode_out_cache_loc(per_dp_bs_padding, total_bs)
-            real_input_ids_len = real_bs
-            cache_loc_cpu = np.empty(0, dtype=np.int32)
-            decode_page_indices_cpu = self._merge_decode_page_indices(
-                bs_paddings,
-                cache_loc_paddings,
-                page_size,
-                per_dp_bs_padding,
-            )
-        else:
-            input_ids_cpu, positions_cpu, out_cache_loc_cpu, real_input_ids_len = (
-                self._merge_input_and_positions(per_dp_token_padding, total_token_size)
-            )
-            cache_loc_cpu = self._merge_cache_loc(
-                bs_paddings,
-                cache_loc_paddings,
-                page_size,
-                per_dp_bs_padding,
-            )
-            decode_page_indices_cpu = None
+        # Step 4: Merge cache_loc from all DP ranks
+        cache_loc_cpu = self._merge_cache_loc(
+            bs_paddings, cache_loc_paddings, page_size, per_dp_bs_padding
+        )
 
         # Step 5: Merge sampling info from all DP ranks
-        sampling_info = (
-            None if use_decode_workspace else self._merge_sampling_info(per_dp_bs_padding, total_bs)
-        )
-        decode_workspace_spec = (
-            self._get_decode_workspace_batch_spec() if use_decode_workspace else None
-        )
+        sampling_info = self._merge_sampling_info(per_dp_bs_padding, total_bs)
 
         # Step 5.5: Merge recurrent_indices from all DP ranks
         recurrent_indices_cpu = None
-        if not use_decode_workspace and any(
-            info.recurrent_indices is not None for info in self.reqs_info
-        ):
+        if any(info.recurrent_indices is not None for info in self.reqs_info):
             recurrent_indices_cpu = np.zeros(total_bs, dtype=np.int32)
             offset_bs = 0
             for dp_rank in range(self.dp_size):
@@ -3053,9 +2953,7 @@ class ScheduleBatch:
         # Step 5.5b: Merge recurrent CoW src indices (extend only) and consume
         # the per-req src so later decode/mixed forwards don't re-clone.
         recurrent_cow_src_indices_cpu = None
-        if not use_decode_workspace and any(
-            info.recurrent_cow_src_indices is not None for info in self.reqs_info
-        ):
+        if any(info.recurrent_cow_src_indices is not None for info in self.reqs_info):
             recurrent_cow_src_indices_cpu = np.zeros(total_bs, dtype=np.int32)
             offset_bs = 0
             for dp_rank in range(self.dp_size):
@@ -3080,9 +2978,7 @@ class ScheduleBatch:
         # Merge recurrent track metadata (extra-buffer; see ScheduleReqsInfo).
         recurrent_track_indices_cpu = None
         recurrent_track_mask_cpu = None
-        if not use_decode_workspace and any(
-            info.recurrent_track_mask is not None for info in self.reqs_info
-        ):
+        if any(info.recurrent_track_mask is not None for info in self.reqs_info):
             recurrent_track_indices_cpu = np.zeros(total_bs, dtype=np.int32)
             recurrent_track_mask_cpu = np.zeros(total_bs, dtype=np.int32)
             offset_bs = 0
@@ -3109,8 +3005,8 @@ class ScheduleBatch:
 
         # has_initial_state[i] = True iff slot i already holds
         # prior KV/recurrent state (extend with prefix, or any decode slot).
-        has_initial_state_cpu = None if use_decode_workspace else np.ones(total_bs, dtype=np.bool_)
-        if not use_decode_workspace and self.forward_mode.is_extend():
+        has_initial_state_cpu = np.ones(total_bs, dtype=np.bool_)
+        if self.forward_mode.is_extend():
             offset_bs = 0
             for dp_rank in range(self.dp_size):
                 dp_bs = real_bs_per_dp[dp_rank]
@@ -3142,17 +3038,11 @@ class ScheduleBatch:
         # reqs_info[*].reqs; see ScheduleBatch._merge_multimodal. Each is
         # None/False for pure-text batches, so non-multimodal paths stay
         # unchanged.
-        if use_decode_workspace:
-            input_embedding = None
-            mrope_positions = None
-            apply_for_deepstack = False
-            deepstack_visual_embedding = None
-        else:
-            _mm = self._merge_multimodal(per_dp_token_padding, total_token_size)
-            input_embedding = _mm["input_embedding"]
-            mrope_positions = _mm["mrope_positions"]
-            apply_for_deepstack = _mm["apply_for_deepstack"]
-            deepstack_visual_embedding = _mm["deepstack_visual_embedding"]
+        _mm = self._merge_multimodal(per_dp_token_padding, total_token_size)
+        input_embedding = _mm["input_embedding"]
+        mrope_positions = _mm["mrope_positions"]
+        apply_for_deepstack = _mm["apply_for_deepstack"]
+        deepstack_visual_embedding = _mm["deepstack_visual_embedding"]
 
         # Merge per-DP top_logprobs_nums / token_ids_logprobs with the same
         # offset_bs += per_dp_bs_padding padding scheme used in _merge_batch_metadata.
@@ -3265,8 +3155,6 @@ class ScheduleBatch:
             recurrent_track_mask=recurrent_track_mask_cpu,
             has_initial_state=has_initial_state_cpu,
             spec_algorithm=self.spec_algorithm,
-            decode_workspace_spec=decode_workspace_spec,
-            decode_page_indices=decode_page_indices_cpu,
         )
 
     def get_spec_model_worker_batch(
@@ -3732,8 +3620,6 @@ class ModelWorkerBatch:
 
     relay_input_indices: np.ndarray | None = None
     relay_input_mask: np.ndarray | None = None
-    decode_workspace_spec: DecodeWorkspaceBatchSpec | None = None
-    decode_page_indices: np.ndarray | None = None
 
     def get_original_input_len(self):
         """
