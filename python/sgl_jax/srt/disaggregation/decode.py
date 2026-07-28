@@ -283,6 +283,15 @@ class SchedulerDisaggregationDecodeMixin:
             if self._engine_paused:
                 continue
 
+            # Drain the forward thread BEFORE any SPMD collective so that
+            # process_allgather in process_decode_queue never races with
+            # jit_jitted_sampler on the forward thread.
+            if self.last_batch:
+                wd.beat("process_batch_result")
+                tmp_batch, tmp_result = self.result_queue.popleft()
+                tmp_batch.next_batch_sampling_info = None
+                self.process_batch_result(tmp_batch, tmp_result, None)
+
             wd.beat("process_decode_queue")
             self.process_decode_queue()
 
@@ -313,26 +322,21 @@ class SchedulerDisaggregationDecodeMixin:
                         self._current_sampling_info_owner().cur_sampling_info
                     )
                     self.process_batch_result(tmp_batch, None, batch.launch_done)
-
-                wd.beat("process_decode_queue_after_launch")
-                self.process_decode_queue()
+                else:
+                    # Signal sampling_info_done for the just-launched batch.
+                    # Originally this was done by set_next_batch_sampling_info_done
+                    # during the previous batch's process_batch_result, but we now
+                    # drain the previous batch before launching.
+                    cur_si = self._current_sampling_info_owner().cur_sampling_info
+                    if cur_si is not None and cur_si.sampling_info_done is not None:
+                        if cur_si.grammars is not None:
+                            cur_si.update_grammar_vocab_mask()
+                        cur_si.sampling_info_done.set()
             else:
                 wd.beat("idle")
                 self.new_token_ratio = self.init_new_token_ratio
                 if self._comm_backend is not None:
                     self._comm_backend.wait_for_new_requests(0.001)
-
-            if self.last_batch:
-                wd.beat("process_batch_result")
-                tmp_batch, tmp_result = self.result_queue.popleft()
-                tmp_batch.next_batch_sampling_info = (
-                    self._current_sampling_info_owner().cur_sampling_info if batch else None
-                )
-                self.process_batch_result(
-                    tmp_batch,
-                    tmp_result,
-                    batch.launch_done if batch else None,
-                )
 
             self.last_batch = batch
 
