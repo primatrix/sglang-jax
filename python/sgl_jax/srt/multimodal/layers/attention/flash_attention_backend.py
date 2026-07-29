@@ -4,7 +4,10 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
-from sgl_jax.srt.multimodal.kernels.flash_attention import flash_attention
+from sgl_jax.srt.multimodal.kernels.flash_attention import (
+    DEFAULT_VMEM_LIMIT_BYTES,
+    flash_attention,
+)
 
 
 def align_to(x, a):
@@ -12,7 +15,13 @@ def align_to(x, a):
 
 
 class FlashAttentionBackend(AttentionBackend):
-    def __init__(self, mesh, sm_scale=1.0, causal=False, vmem_limit_bytes=128 * 1024 * 1024):
+    def __init__(
+        self,
+        mesh,
+        sm_scale=1.0,
+        causal=False,
+        vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+    ):
         in_specs = (
             P("data", "tensor", None, None),  # q
             P("data", "tensor", None, None),  # k
@@ -54,21 +63,39 @@ class FlashAttentionBackend(AttentionBackend):
 
 
 class VisionFlashAttentionBackend(AttentionBackend):
-    """DP-only segment-flash attention for the in-model VLM ViT (encode path).
+    """Batch-sharded segment-flash attention for the in-model VLM ViT.
 
     Kept SEPARATE from ``FlashAttentionBackend`` (which is head-TP, used by
     ``USPAttention`` for Flux / Wan / Qwen3-Omni audio) so that class stays
-    untouched. Here the ViT is DP-only with replicated weights:
-    batch on ``data``; heads / T / head_dim are NOT sharded on ``tensor``; and
-    ``segment_ids`` is per-image, riding the batch (``data``) axis rather than
-    being replicated. Wraps the SAME pallas segment-flash kernel as
-    ``FlashAttentionBackend`` -- only the shard specs differ. Reusable across
-    in-model VLM ViTs (Qwen2.5-VL, future Qwen3-Omni, ...).
+    untouched. In the default (replicated) mode the ViT weights are replicated
+    while the vision batch is sharded over both mesh axes; heads / T / head_dim
+    remain unsharded. With ``head_tp=True`` the batch is sharded over ``"data"``
+    only and the head axis over ``"tensor"`` (the weight-TP layout, matching the
+    sibling ``FlashAttentionBackend`` specs). Wraps the SAME pallas segment-flash
+    kernel -- only the shard specs differ. Reusable across in-model VLM ViTs
+    (Qwen2.5-VL, future Qwen3-Omni, ...).
     """
 
-    def __init__(self, mesh, sm_scale=1.0, causal=False, vmem_limit_bytes=128 * 1024 * 1024):
-        qkv_spec = P("data", None, None, None)  # dp on data; no head-TP
-        seg_spec = P("data", None)  # per-image segment ids ride the batch axis
+    def __init__(
+        self,
+        mesh,
+        sm_scale=1.0,
+        causal=False,
+        vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+        head_tp: bool = False,
+        max_segment_len: int | None = None,
+        block_sparse_segments: bool = False,
+    ):
+        self.max_segment_len = max_segment_len
+        self.block_sparse_segments = block_sparse_segments
+        if head_tp:
+            batch_axis = "data"
+            head_axis = "tensor"
+        else:
+            batch_axis = ("data", "tensor") if "tensor" in mesh.axis_names else "data"
+            head_axis = None
+        qkv_spec = P(batch_axis, head_axis, None, None)  # [batch, heads, T, head_dim]
+        seg_spec = P(batch_axis, None)
         in_specs = (qkv_spec, qkv_spec, qkv_spec, seg_spec)
         out_specs = qkv_spec
 
@@ -81,16 +108,16 @@ class VisionFlashAttentionBackend(AttentionBackend):
                 sm_scale=sm_scale,
                 causal=causal,
                 vmem_limit_bytes=vmem_limit_bytes,
+                max_segment_len=max_segment_len,
+                block_sparse_segments=block_sparse_segments,
             )
 
-        self.jit_flash_attention = jax.jit(
-            jax.shard_map(
-                _flash_attention, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False
-            )
+        self.flash_attention = jax.shard_map(
+            _flash_attention, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False
         )
 
     def __call__(self, q, k, v, segment_ids):
-        return self.jit_flash_attention(q, k, v, segment_ids)
+        return self.flash_attention(q, k, v, segment_ids)
 
     def get_forward_metadata(self, batch: ModelWorkerBatch):
         """Init the metadata for a forward pass and return it"""

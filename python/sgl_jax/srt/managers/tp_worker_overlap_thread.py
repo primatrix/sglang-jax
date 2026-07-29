@@ -24,6 +24,12 @@ from sgl_jax.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
+def future_token_ids_from_req_pool_indices(req_pool_indices) -> np.ndarray:
+    """Encode request-owned relay slots as negative placeholder token IDs."""
+    req_pool_indices = np.asarray(req_pool_indices, dtype=np.int32)
+    return np.where(req_pool_indices >= 0, -(req_pool_indices + 1), 0).astype(np.int32)
+
+
 class ModelWorkerClient:
     """A tensor parallel model worker."""
 
@@ -44,10 +50,10 @@ class ModelWorkerClient:
         self.device = self.worker.device
         self.cur_sampling_info = None
 
-        # Init future mappings
-        self.future_token_ids_ct = 0
-        self.future_token_ids_limit = self.max_running_requests * 3
-        self.future_token_ids_map = jnp.zeros((self.max_running_requests * 5,), dtype=jnp.int32)
+        # A request owns one relay slot for as long as its req_pool_idx is live.
+        # Slot 0 is reserved for padded rows (req_pool_idx == -1).
+        req_pool_size = self.worker.model_runner.req_to_token_pool.size
+        self.future_token_ids_map = jnp.zeros((req_pool_size + 1,), dtype=jnp.int32)
         self.mesh = mesh
         sharding = NamedSharding(mesh, PartitionSpec(None))
         self.future_token_ids_map = jax.device_put(self.future_token_ids_map, sharding)
@@ -113,7 +119,6 @@ class ModelWorkerClient:
         while True:
             (
                 model_worker_batch,
-                future_token_ids_ct,
                 sampling_metadata,
                 forward_metadata,
             ) = self.input_queue.get()
@@ -140,7 +145,7 @@ class ModelWorkerClient:
             # Update the future token ids map
             self.future_token_ids_map = set_future_token_ids(
                 self.future_token_ids_map,
-                future_token_ids_ct,
+                model_worker_batch.forward_batch.req_pool_indices,
                 next_token_ids,
                 self.mesh,
             )
@@ -249,22 +254,14 @@ class ModelWorkerClient:
         self.input_queue.put(
             (
                 model_worker_batch,
-                self.future_token_ids_ct,
                 sampling_metadata,
                 forward_metadata,
             )
         )
 
-        # Allocate output future objects
-        bs = len(model_worker_batch.seq_lens)
-
-        future_next_token_ids = np.arange(
-            -(self.future_token_ids_ct + 1),
-            -(self.future_token_ids_ct + 1 + bs),
-            -1,
-            dtype=np.int32,
+        future_next_token_ids = future_token_ids_from_req_pool_indices(
+            model_worker_batch.req_pool_indices
         )
-        self.future_token_ids_ct = (self.future_token_ids_ct + bs) % self.future_token_ids_limit
         return None, future_next_token_ids, 0
 
     def run_precompile(self):
@@ -286,4 +283,4 @@ class ModelWorkerClient:
         return self.worker.get_tokens_per_layer_info()
 
     def __delete__(self):
-        self.input_queue.put((None, None, None, None))
+        self.input_queue.put((None, None, None))

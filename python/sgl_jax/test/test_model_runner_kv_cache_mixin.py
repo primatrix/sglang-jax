@@ -2,6 +2,7 @@ import types
 
 import pytest
 
+from sgl_jax.srt.model_executor.model_runner import _multimodal_embedding_cache_size
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
     _enforce_recurrent_state_server_constraints,
@@ -52,3 +53,29 @@ def test_recurrent_admission_cap_already_aligned_unchanged():
     # 16 // 2 = 8 is already a dp_size=4 multiple.
     cap = ModelRunnerKVCacheMixin._resolve_max_num_reqs(_fake_runner(16, 4), 1000)
     assert cap == 8
+
+
+def test_embedding_cache_is_reserved_from_kv_budget():
+    runner = types.SimpleNamespace(
+        get_available_device_memory=lambda: 900,
+        mem_fraction_static=0.8,
+        multimodal_embedding_cache=types.SimpleNamespace(max_bytes=100),
+        linear_recurrent_config=None,
+    )
+    assert ModelRunnerKVCacheMixin._profile_available_bytes(runner, 1000) == 600
+
+
+def test_embedding_cache_is_only_reserved_by_in_model_prefill():
+    config = types.SimpleNamespace(
+        is_multimodal=True,
+        hf_config=types.SimpleNamespace(architectures=["Qwen2_5_VLForConditionalGeneration"]),
+    )
+    args = types.SimpleNamespace(
+        mm_embedding_cache_size_mb=128,
+        multimodal=False,
+        enable_lora=False,
+        disaggregation_mode="null",
+    )
+    assert _multimodal_embedding_cache_size(config, args) == 128 * 1024**2
+    args.multimodal = True
+    assert _multimodal_embedding_cache_size(config, args) == 0

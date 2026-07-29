@@ -349,6 +349,8 @@ class ModelRunnerKVCacheMixin:
         """Profile available bytes for KV cache (+ recurrent state)."""
         available_device_memory = self.get_available_device_memory()
         rest_memory = available_device_memory - total_device_memory * (1 - self.mem_fraction_static)
+        if self.multimodal_embedding_cache is not None:
+            rest_memory -= self.multimodal_embedding_cache.max_bytes
         if rest_memory <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
 

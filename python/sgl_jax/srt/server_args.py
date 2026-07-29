@@ -29,30 +29,31 @@ logger = logging.getLogger(__name__)
 
 GRAMMAR_BACKEND_CHOICES = ["llguidance", "none"]
 _REJECTED_PD_HOST_ALIASES = frozenset({"localhost"})
-_MULTIMODAL_CHUNKED_PREFILL_ARCHITECTURES = frozenset({"Qwen2_5_VLForConditionalGeneration"})
-_MULTIMODAL_RADIX_CACHE_ARCHITECTURES = frozenset({"Qwen2_5_VLForConditionalGeneration"})
+_MULTIMODAL_MIXED_CHUNK_ARCHITECTURES = frozenset({"Qwen2_5_VLForConditionalGeneration"})
 
 
 def apply_multimodal_model_defaults(server_args, model_config) -> None:
     if not model_config.is_multimodal:
         return
 
-    hf_config = getattr(model_config, "hf_config", None)
-    architectures = set(getattr(hf_config, "architectures", None) or [])
+    from sgl_jax.srt.models.registry import ModelRegistry
 
-    supports_radix_cache = bool(architectures & _MULTIMODAL_RADIX_CACHE_ARCHITECTURES)
-    if not supports_radix_cache and not server_args.disable_radix_cache:
+    hf_config = getattr(model_config, "hf_config", None)
+    architectures = list(getattr(hf_config, "architectures", None) or [])
+    in_model = ModelRegistry.is_in_model_multimodal(architectures)
+
+    if not in_model and not server_args.disable_radix_cache:
         logger.info("Multimodal model detected, disabling radix cache")
         server_args.disable_radix_cache = True
 
-    supports_chunked_prefill = bool(architectures & _MULTIMODAL_CHUNKED_PREFILL_ARCHITECTURES)
-    if not supports_chunked_prefill and (
+    if not in_model and (
         server_args.chunked_prefill_size is None or server_args.chunked_prefill_size > 0
     ):
         logger.info("Multimodal model detected, disabling chunked prefill")
         server_args.chunked_prefill_size = -1
-    if server_args.enable_mixed_chunk:
-        logger.info("Multimodal model detected, disabling mixed chunk")
+    supports_mixed_chunk = bool(set(architectures) & _MULTIMODAL_MIXED_CHUNK_ARCHITECTURES)
+    if server_args.enable_mixed_chunk and not supports_mixed_chunk:
+        logger.info("Multimodal model does not support mixed chunk; disabling it")
         server_args.enable_mixed_chunk = False
     if server_args.limit_mm_data_per_request is None:
         server_args.limit_mm_data_per_request = {"image": 16}
@@ -61,8 +62,7 @@ def apply_multimodal_model_defaults(server_args, model_config) -> None:
 def _validate_disaggregation_host_ip(host_ip: str) -> str:
     if host_ip in _REJECTED_PD_HOST_ALIASES:
         raise ValueError(
-            "--disaggregation-host-ip must be a routable address; "
-            f"got loopback alias {host_ip!r}"
+            f"--disaggregation-host-ip must be a routable address; got loopback alias {host_ip!r}"
         )
     try:
         addr = ipaddress.ip_address(host_ip)
@@ -71,8 +71,7 @@ def _validate_disaggregation_host_ip(host_ip: str) -> str:
     if addr.is_loopback or addr.is_unspecified:
         kind = "loopback" if addr.is_loopback else "bind/unspecified"
         raise ValueError(
-            "--disaggregation-host-ip must be a routable address; "
-            f"got {kind} address {host_ip!r}"
+            f"--disaggregation-host-ip must be a routable address; got {kind} address {host_ip!r}"
         )
     return host_ip
 
@@ -215,6 +214,11 @@ class ServerArgs:
 
     precompile_token_paddings: list[int] | None = None
     precompile_bs_paddings: list[int] | None = None
+    precompile_vision_patch_paddings: list[int] | None = None
+
+    # Vision encoder parallelism inside each DP group: "dp" load-balances images
+    # over tensor devices; "tp" shards ViT weights and replicates each image.
+    vision_encoder_parallel: str = "dp"
 
     disable_precompile: bool = False
 
@@ -253,6 +257,7 @@ class ServerArgs:
     # Multimodal
     multimodal: bool = False
     limit_mm_data_per_request: dict[str, int] | None = None
+    mm_embedding_cache_size_mb: int = 0
 
     enable_return_routed_experts: bool = False
     enable_expert_balance_debug: bool = False
@@ -334,9 +339,9 @@ class ServerArgs:
         # update device
         if self.device:
             platform_env = os.environ.get("JAX_PLATFORMS", self.device)
-            assert (
-                self.device == platform_env
-            ), f"device {self.device} is not consistent with 'JAX_PLATFORMS' {platform_env}"
+            assert self.device == platform_env, (
+                f"device {self.device} is not consistent with 'JAX_PLATFORMS' {platform_env}"
+            )
         else:
             platform_env = os.environ.get("JAX_PLATFORMS", "")
             if platform_env != "":
@@ -514,6 +519,8 @@ class ServerArgs:
             self.model_path = download_from_hf(self.model_path, allow_patterns=None)
             if self.limit_mm_data_per_request is None:
                 self.limit_mm_data_per_request = {"image": 16}
+        if self.mm_embedding_cache_size_mb < 0:
+            raise ValueError("--mm-embedding-cache-size-mb must be non-negative")
 
         if self.ep_num_redundant_experts < 0:
             raise ValueError("ep_num_redundant_experts must be non-negative")
@@ -1367,6 +1374,22 @@ class ServerArgs:
             help="Set the list of batch sizes buckets for jax jit",
         )
         parser.add_argument(
+            "--precompile-vision-patch-paddings",
+            type=int,
+            nargs="+",
+            default=ServerArgs.precompile_vision_patch_paddings,
+            help="JIT buckets for the vision encoder patch dimension.",
+        )
+        parser.add_argument(
+            "--vision-encoder-parallel",
+            type=str,
+            choices=["dp", "tp"],
+            default=ServerArgs.vision_encoder_parallel,
+            help="Vision encoder parallelism within each DP group. 'dp' (default) "
+            "load-balances images over tensor devices; 'tp' shards ViT weights and "
+            "replicates each image within the group (requires tp_size > 1).",
+        )
+        parser.add_argument(
             "--disable-precompile",
             action="store_true",
             help="whether disable precompile",
@@ -1498,6 +1521,12 @@ class ServerArgs:
             type=json.loads,
             default=ServerArgs.limit_mm_data_per_request,
             help="JSON object that limits the number of multimodal items per request, e.g. '{\"image\": 16}'.",
+        )
+        parser.add_argument(
+            "--mm-embedding-cache-size-mb",
+            type=int,
+            default=ServerArgs.mm_embedding_cache_size_mb,
+            help="Per-device memory budget in MiB for multimodal embeddings; 0 disables it.",
         )
 
         # LoRA
@@ -1646,7 +1675,7 @@ class ServerArgs:
             "--disaggregation-bootstrap-timeout-seconds",
             type=float,
             default=ServerArgs.disaggregation_bootstrap_timeout_seconds,
-            help="Bootstrap-server query timeout in seconds. <=0 to " "disable.",
+            help="Bootstrap-server query timeout in seconds. <=0 to disable.",
         )
         parser.add_argument(
             "--disaggregation-pull-timeout-seconds",
@@ -1669,7 +1698,7 @@ class ServerArgs:
             "--disaggregation-orphan-reaper-interval-seconds",
             type=float,
             default=ServerArgs.disaggregation_orphan_reaper_interval_seconds,
-            help="How often the background reaper scans for orphan " "senders/receivers.",
+            help="How often the background reaper scans for orphan senders/receivers.",
         )
         parser.add_argument(
             "--disaggregation-decode-watchdog-seconds",
@@ -1775,9 +1804,9 @@ class ServerArgs:
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
         if self.chunked_prefill_size > 0:
-            assert (
-                self.chunked_prefill_size % self.page_size == 0
-            ), "chunked_prefill_size must be divisible by page_size"
+            assert self.chunked_prefill_size % self.page_size == 0, (
+                "chunked_prefill_size must be divisible by page_size"
+            )
 
         # Check LoRA configuration
         self.check_lora_server_args()
@@ -1810,9 +1839,9 @@ class ServerArgs:
         if not self.enable_lora and not self.enable_static_lora:
             return
 
-        assert not (
-            self.enable_lora and self.enable_static_lora
-        ), f"{self.enable_lora} and {self.enable_static_lora} can not be enable at the same time"
+        assert not (self.enable_lora and self.enable_static_lora), (
+            f"{self.enable_lora} and {self.enable_static_lora} can not be enable at the same time"
+        )
 
         self.enable_lora = True
 
@@ -1823,27 +1852,27 @@ class ServerArgs:
         if self.lora_target_modules:
             self.lora_target_modules = set(self.lora_target_modules)
             if "all" in self.lora_target_modules:
-                assert (
-                    len(self.lora_target_modules) == 1
-                ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
+                assert len(self.lora_target_modules) == 1, (
+                    "If 'all' is specified in --lora-target-modules, it should be the only module specified."
+                )
                 self.lora_target_modules = set(SUPPORTED_LORA_TARGET_MODULES)
 
         # Ensure sufficient information is provided for LoRA initialization.
-        assert self.lora_paths or (
-            self.max_lora_rank and self.lora_target_modules
-        ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+        assert self.lora_paths or (self.max_lora_rank and self.lora_target_modules), (
+            "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+        )
 
         def check_static_lora_args():
-            assert (
-                self.lora_scaling is not None
-            ), "lora_scaling is required when enable-static-lora is enabled"
+            assert self.lora_scaling is not None, (
+                "lora_scaling is required when enable-static-lora is enabled"
+            )
 
-            assert (
-                self.lora_paths is None
-            ), "lora-paths is not required when enable-static-lora is enabled"
-            assert (
-                self.max_loras_per_batch == 1
-            ), "max-loras-per-batch is required to be 1 when enable-static-lora is enabled"
+            assert self.lora_paths is None, (
+                "lora-paths is not required when enable-static-lora is enabled"
+            )
+            assert self.max_loras_per_batch == 1, (
+                "max-loras-per-batch is required to be 1 when enable-static-lora is enabled"
+            )
 
         def check_dynamic_lora_args():
             # Normalize lora_paths to List[LoRARef]
@@ -1903,9 +1932,9 @@ class ServerArgs:
 
                     # Validate max_loaded_loras
                     if self.max_loaded_loras is not None:
-                        assert (
-                            self.max_loaded_loras >= self.max_loras_per_batch
-                        ), "max_loaded_loras must be >= max_loras_per_batch"
+                        assert self.max_loaded_loras >= self.max_loras_per_batch, (
+                            "max_loaded_loras must be >= max_loras_per_batch"
+                        )
 
                     logger.info(
                         "Loaded %d LoRA adapters: %s",

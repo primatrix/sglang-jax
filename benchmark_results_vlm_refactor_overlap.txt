@@ -1,0 +1,175 @@
+Qwen/Qwen2.5-VL-32B-Instruct
+Server: vlm-refactor (TPU v6e-4, topology 2x2)
+Overlap schedule: enabled
+
+[Latency] 2 images, 720p, 10 prompts, max concurrency 1, flush cache
+
+============ Serving Benchmark Result ============
+Backend:                                 sglang-oai-chat
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  65.66
+Total input tokens:                      24766
+Total input text tokens:                 806
+Total input vision tokens:               23960
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    1100
+Total cached tokens:                     0
+Cache hit rate:                          0.0000
+Request throughput (req/s):              0.15
+Input token throughput (tok/s):          377.17
+Output token throughput (tok/s):         64.27
+Peak output token throughput (tok/s):    69.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          441.43
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   6565.86
+Median E2E Latency (ms):                 5313.02
+P90 E2E Latency (ms):                    11679.34
+P99 E2E Latency (ms):                    14320.10
+---------------Time to First Token----------------
+Mean TTFT (ms):                          433.15
+Median TTFT (ms):                        433.25
+P99 TTFT (ms):                           436.35
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          14.56
+Median TPOT (ms):                        14.56
+P99 TPOT (ms):                           14.59
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           23.47
+Median ITL (ms):                         28.61
+P95 ITL (ms):                            29.86
+P99 ITL (ms):                            30.07
+Max ITL (ms):                            44.05
+==================================================
+
+[Throughput] 2 images, 720p, 160 prompts, max concurrency 32
+
+============ Serving Benchmark Result ============
+Backend:                                 sglang-oai-chat
+Traffic request rate:                    inf
+Max request concurrency:                 32
+Successful requests:                     160
+Benchmark duration (s):                  93.79
+Total input tokens:                      396527
+Total input text tokens:                 13167
+Total input vision tokens:               383360
+Total generated tokens:                  80375
+Total generated tokens (retokenized):    15425
+Total cached tokens:                     0
+Cache hit rate:                          0.0000
+Request throughput (req/s):              1.71
+Input token throughput (tok/s):          4227.86
+Output token throughput (tok/s):         856.98
+Peak output token throughput (tok/s):    1581.00
+Peak concurrent requests:                37
+Total token throughput (tok/s):          5084.84
+Concurrency:                             28.89
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   16937.68
+Median E2E Latency (ms):                 17222.30
+P90 E2E Latency (ms):                    31333.08
+P99 E2E Latency (ms):                    34078.26
+---------------Time to First Token----------------
+Mean TTFT (ms):                          1451.87
+Median TTFT (ms):                        516.71
+P99 TTFT (ms):                           5606.42
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          30.98
+Median TPOT (ms):                        31.58
+P99 TPOT (ms):                           41.72
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           52.83
+Median ITL (ms):                         38.62
+P95 ITL (ms):                            257.88
+P99 ITL (ms):                            370.69
+Max ITL (ms):                            2372.82
+==================================================
+
+[Latency] 5 images, 1080p, 10 prompts, max concurrency 1
+
+============ Serving Benchmark Result ============
+Backend:                                 sglang-oai-chat
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  88.65
+Total input tokens:                      135466
+Total input text tokens:                 816
+Total input vision tokens:               134650
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    819
+Total cached tokens:                     0
+Cache hit rate:                          0.0000
+Request throughput (req/s):              0.11
+Input token throughput (tok/s):          1528.14
+Output token throughput (tok/s):         47.60
+Peak output token throughput (tok/s):    64.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          1575.74
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   8864.30
+Median E2E Latency (ms):                 7557.65
+P90 E2E Latency (ms):                    14219.78
+P99 E2E Latency (ms):                    16962.43
+---------------Time to First Token----------------
+Mean TTFT (ms):                          2452.49
+Median TTFT (ms):                        2452.28
+P99 TTFT (ms):                           2462.79
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          15.22
+Median TPOT (ms):                        15.22
+P99 TPOT (ms):                           15.24
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           26.01
+Median ITL (ms):                         30.25
+P95 ITL (ms):                            31.11
+P99 ITL (ms):                            31.40
+Max ITL (ms):                            46.29
+==================================================
+
+[Latency] 10 images, 1080p, 10 prompts, max concurrency 1
+
+============ Serving Benchmark Result ============
+Backend:                                 sglang-oai-chat
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  121.69
+Total input tokens:                      270120
+Total input text tokens:                 820
+Total input vision tokens:               269300
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    1015
+Total cached tokens:                     0
+Cache hit rate:                          0.0000
+Request throughput (req/s):              0.08
+Input token throughput (tok/s):          2219.81
+Output token throughput (tok/s):         34.68
+Peak output token throughput (tok/s):    63.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          2254.49
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   12168.16
+Median E2E Latency (ms):                 10754.40
+P90 E2E Latency (ms):                    17769.05
+P99 E2E Latency (ms):                    20671.80
+---------------Time to First Token----------------
+Mean TTFT (ms):                          5438.79
+Median TTFT (ms):                        5434.06
+P99 TTFT (ms):                           5511.97
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          15.97
+Median TPOT (ms):                        15.97
+P99 TPOT (ms):                           16.00
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           26.21
+Median ITL (ms):                         31.76
+P95 ITL (ms):                            32.39
+P99 ITL (ms):                            32.61
+Max ITL (ms):                            49.47
+==================================================
