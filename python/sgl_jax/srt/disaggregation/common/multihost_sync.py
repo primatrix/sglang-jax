@@ -32,7 +32,7 @@ def synced_terminal_rooms(
 
     from jax.experimental import multihost_utils
 
-    local = np.full((_SYNC_MAX_INFLIGHT, 2), -1, dtype=np.int64)
+    local = np.full((_SYNC_MAX_INFLIGHT, 2), -1, dtype=np.int32)
     for i, e in enumerate(entries):
         if i >= _SYNC_MAX_INFLIGHT:
             break
@@ -51,7 +51,7 @@ def synced_terminal_rooms(
     for p in range(nproc):
         for i in range(_SYNC_MAX_INFLIGHT):
             room = int(gathered[p, i, 0])
-            if room < 0:
+            if room == -1:
                 continue
             per_room.setdefault(room, []).append(int(gathered[p, i, 1]))
     success: set[int] = set()

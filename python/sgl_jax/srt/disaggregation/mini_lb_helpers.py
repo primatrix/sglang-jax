@@ -16,7 +16,7 @@ def maybe_wrap_ipv6_address(address: str) -> str:
 
 
 def generate_bootstrap_room() -> int:
-    return random.randint(0, 2**63 - 1)
+    return random.randint(0, 2**31 - 1)
 
 
 def align_bootstrap_room_to_prefill(
