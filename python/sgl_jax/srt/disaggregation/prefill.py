@@ -233,10 +233,7 @@ class SchedulerDisaggregationPrefillMixin:
             if is_mid_chunk:
                 # Still mid-chunk: KV is incomplete, and releasing the
                 # req_pool_idx here would leak the slot the next chunk
-                # round re-allocates. Both engines transfer only after the final
-                # chunk; transfer/forward overlap is intentionally out of scope.
-                assert req.is_chunked > 0
-                req.is_chunked -= 1
+                # round re-allocates. Extract on the final chunk.
                 continue
             if req_id in self.disagg_prefill_queue._entries:
                 continue
