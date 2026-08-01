@@ -25,6 +25,12 @@ from sgl_jax.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
+def future_token_ids_from_req_pool_indices(req_pool_indices) -> np.ndarray:
+    """Encode request-owned relay slots as negative placeholder token IDs."""
+    req_pool_indices = np.asarray(req_pool_indices, dtype=np.int32)
+    return np.where(req_pool_indices >= 0, -(req_pool_indices + 1), 0)
+
+
 class ModelWorkerClient:
     """A tensor parallel model worker."""
 
@@ -46,9 +52,10 @@ class ModelWorkerClient:
         self.cur_sampling_info = None
 
         # Init future mappings
-        self.future_token_ids_ct = 0
-        self.future_token_ids_limit = self.max_running_requests * 3
-        self.future_token_ids_map = jnp.zeros((self.max_running_requests * 5,), dtype=jnp.int32)
+        # A request owns one relay slot for as long as its req_pool_idx is live.
+        # Slot 0 is reserved for padded rows (req_pool_idx == -1).
+        req_pool_size = self.worker.model_runner.req_to_token_pool.size
+        self.future_token_ids_map = jnp.zeros((req_pool_size + 1,), dtype=jnp.int32)
         self.mesh = mesh
         sharding = NamedSharding(mesh, PartitionSpec(None))
         self.future_token_ids_map = jax.device_put(self.future_token_ids_map, sharding)
@@ -109,34 +116,11 @@ class ModelWorkerClient:
         while True:
             (
                 model_worker_batch,
-                future_token_ids_ct,
                 sampling_metadata,
                 forward_metadata,
             ) = self.input_queue.get()
             if not model_worker_batch:
                 break
-
-            if self.worker._pd_fuse_for_batch(model_worker_batch):
-                # Fused path: resolve/set_future are inlined into the single jit.
-                # Batch-level check (not the worker flag): logprob batches take
-                # the regular 3-tuple path inside forward_batch_generation, so
-                # selecting the fused 4-tuple unpack here would crash on them.
-                with jax.profiler.TraceAnnotation(
-                    f"forward_batch_generation {model_worker_batch.bid}"
-                ):
-                    logits_output, next_token_ids, cache_miss_count, new_future_map = (
-                        self.worker.forward_batch_generation(
-                            model_worker_batch,
-                            model_worker_batch.launch_done,
-                            sampling_metadata=sampling_metadata,
-                            forward_metadata=forward_metadata,
-                            future_map=self.future_token_ids_map,
-                            future_ct=future_token_ids_ct,
-                        )
-                    )
-                self.future_token_ids_map = new_future_map
-                self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
-                continue
 
             # Resolve future tokens in the input
             input_ids = model_worker_batch.forward_batch.input_ids
@@ -154,15 +138,16 @@ class ModelWorkerClient:
                         forward_metadata=forward_metadata,
                     )
                 )
-            # Feed the raw sampler output (stable P('data') sharding) so
-            # set_future's cpp-fastpath cache hits; async_gather afterwards.
+            next_token_ids = self.async_gather_fn(next_token_ids)
+            # Update the future token ids map: each request writes into the relay
+            # slot it owns (keyed by req_pool_idx), so a completed prefill that has
+            # not decoded yet can never be overwritten by a later batch.
             self.future_token_ids_map = set_future_token_ids(
                 self.future_token_ids_map,
-                future_token_ids_ct,
+                model_worker_batch.forward_batch.req_pool_indices,
                 next_token_ids,
                 self.mesh,
             )
-            next_token_ids = self.async_gather_fn(next_token_ids)
             self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
 
     def resolve_last_batch_result(self, launch_done: threading.Event | None = None):
@@ -288,26 +273,44 @@ class ModelWorkerClient:
         self.input_queue.put(
             (
                 model_worker_batch,
-                self.future_token_ids_ct,
                 sampling_metadata,
                 forward_metadata,
             )
         )
 
-        # Allocate output future objects
-        bs = len(model_worker_batch.seq_lens)
-
-        future_next_token_ids = np.arange(
-            -(self.future_token_ids_ct + 1),
-            -(self.future_token_ids_ct + 1 + bs),
-            -1,
-            dtype=np.int32,
+        future_next_token_ids = future_token_ids_from_req_pool_indices(
+            model_worker_batch.req_pool_indices
         )
-        self.future_token_ids_ct = (self.future_token_ids_ct + bs) % self.future_token_ids_limit
         return None, future_next_token_ids, 0
 
-    def run_precompile(self, only: str | None = None):
-        self.worker.run_precompile(self.future_token_ids_map, only=only)
+    def run_precompile(self):
+        self.worker.run_precompile(self.future_token_ids_map)
+        # CompilationManager exercises the underlying worker directly, while
+        # runtime overlap execution additionally gathers sampled tokens to a
+        # replicated layout before updating the relay map. Warm that exact
+        # wrapper path for every decode bucket so the first real request does
+        # not compile async_gather_fn/set_future_token_ids.
+        _, bs_buckets, _ = self.worker.get_precompile_paddings()
+        data_sharding = NamedSharding(self.mesh, PartitionSpec("data"))
+        relay = self.future_token_ids_map
+        for bs in bs_buckets:
+            req_pool_indices = jax.device_put(
+                jnp.arange(bs, dtype=jnp.int32),
+                data_sharding,
+            )
+            next_token_ids = jax.device_put(
+                jnp.zeros(bs, dtype=jnp.int32),
+                data_sharding,
+            )
+            next_token_ids = self.async_gather_fn(next_token_ids)
+            relay = set_future_token_ids(
+                relay,
+                req_pool_indices,
+                next_token_ids,
+                self.mesh,
+            )
+            jax.block_until_ready((next_token_ids, relay))
+        self.future_token_ids_map = relay
 
     @property
     def page_size(self) -> int:
@@ -325,4 +328,4 @@ class ModelWorkerClient:
         return self.worker.get_tokens_per_layer_info()
 
     def __delete__(self):
-        self.input_queue.put((None, None, None, None))
+        self.input_queue.put((None, None, None))
