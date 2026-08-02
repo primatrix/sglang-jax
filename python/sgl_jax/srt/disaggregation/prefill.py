@@ -713,24 +713,48 @@ class SchedulerDisaggregationPrefillMixin:
         from jax.sharding import PartitionSpec as _P
 
         page_ids = _np.asarray(page_id_source) // page_size
-        if padded_pages > num_pages:
+        pad_len = padded_pages - num_pages
+        if pad_len > 0:
             page_ids = _np.concatenate(
-                [page_ids, _np.zeros(padded_pages - num_pages, dtype=page_ids.dtype)]
+                [page_ids, _np.zeros(pad_len, dtype=page_ids.dtype)]
             )
         idx_sharding = _NamedSharding(kv_pool.mesh, _P(None))
         page_indices = jax.device_put(page_ids, idx_sharding)
+
+        # For SWAKVPool, remap full-pool page IDs to SWA-pool page IDs.
+        from sgl_jax.srt.mem_cache.memory_pool import SWAKVPool
+
+        swa_page_indices = None
+        is_swa_pool = isinstance(kv_pool, SWAKVPool)
+        if is_swa_pool:
+            mapping = kv_pool.full_to_swa_index_mapping
+            if isinstance(mapping, list):
+                mapping = mapping[int(getattr(req, "dp_rank", 0) or 0)]
+            if mapping is not None:
+                full_token_ids = _np.asarray(page_id_source)
+                swa_page_ids = _np.asarray(mapping)[full_token_ids] // page_size
+                if pad_len > 0:
+                    swa_page_ids = _np.concatenate(
+                        [swa_page_ids, _np.zeros(pad_len, dtype=swa_page_ids.dtype)]
+                    )
+                swa_page_indices = jax.device_put(swa_page_ids, idx_sharding)
+
         # out_sharding describes the gather output, not the pool.
         pool_pspec = kv_pool.kv_sharding.spec
         gather_pspec = _P(None, *pool_pspec[1:])
         gather_out_sharding = _NamedSharding(kv_pool.mesh, gather_pspec)
-        layer_buffers = [
-            kv_pool.get_kv_buffer(layer_id)
-            for layer_id in range(
-                kv_pool.start_layer,
-                kv_pool.start_layer + kv_pool.layer_num,
-            )
-        ]
-        layer_kvs = _jit_gather_all_layers(layer_buffers, page_indices, gather_out_sharding)
+        layer_kvs = []
+        for layer_id in range(
+            kv_pool.start_layer,
+            kv_pool.start_layer + kv_pool.layer_num,
+        ):
+            buf = kv_pool.get_kv_buffer(layer_id)
+            if swa_page_indices is not None and kv_pool.layers_mapping[layer_id][1]:
+                idx = swa_page_indices
+            else:
+                idx = page_indices
+            layer_kvs.append(_jit_gather_one_layer(buf, idx, gather_out_sharding))
+
         if jax.process_count() > 1:
             # Multi-host: expose only this host's TP shard as a fully-addressable
             # local-mesh array; each P host registers its 1/nproc slice and the
