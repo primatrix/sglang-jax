@@ -245,7 +245,14 @@ class ModelWorker:
 
         # precompile
         from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
+        from sgl_jax.srt.models.registry import ModelRegistry
 
+        use_multistage_multimodal = server_args.multimodal
+        use_in_model_multimodal = (
+            self.model_config.is_multimodal
+            and ModelRegistry.is_in_model_multimodal(self.model_config.hf_config.architectures)
+            and not use_multistage_multimodal
+        )
         self.compilation_manager = CompilationManager(
             server_args=server_args,
             max_padded_batch_size=self.max_padded_batch_size,
@@ -255,7 +262,10 @@ class ModelWorker:
             page_size=self.page_size,
             max_req_len=self.max_req_len,
             vocab_size=self.model_config.vocab_size,
-            multimodal=server_args.multimodal,
+            # Multimodal models use the regular in-model path by default.
+            # --multimodal selects the standalone multistage pipeline instead.
+            precompile_in_model_multimodal=use_in_model_multimodal,
+            capture_hidden_states=use_multistage_multimodal,
             has_recurrent_state=self.model_runner.linear_recurrent_config is not None,
             moe_backend=effective_moe_backend,
         )

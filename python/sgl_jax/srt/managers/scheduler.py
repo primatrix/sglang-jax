@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -121,6 +122,21 @@ TEST_RETRACT_INTERVAL = int(os.environ.get("SGLANG_TEST_RETRACT_INTERVAL", "3"))
 TEST_RETRACT_NO_PREFILL_BS = int(os.environ.get("SGLANG_TEST_RETRACT_NO_PREFILL_BS", str(2**31)))
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
+
+
+def _clear_embedding_pools(
+    workers: Iterable[ModelWorker | ModelWorkerClient | None],
+) -> None:
+    seen: set[int] = set()
+    for worker in workers:
+        if worker is None:
+            continue
+        runner = worker.get_model_runner()
+        if id(runner) in seen:
+            continue
+        seen.add(id(runner))
+        if getattr(runner, "embedding_pool", None) is not None:
+            runner.embedding_pool.clear()
 
 
 class SyncError(Exception):
@@ -1551,7 +1567,10 @@ class Scheduler(
         pd_prefill = len(self.disagg_prefill_queue or ())
         pd_prealloc = len(self.disagg_prealloc_queue or ())
         pd_transfer = len(self.disagg_transfer_queue or ())
-        has_pending = has_pending or pd_prefill > 0 or pd_prealloc > 0 or pd_transfer > 0
+        pd_inflight = getattr(self, "_pd_inflight", 0)
+        has_pending = (
+            has_pending or pd_prefill > 0 or pd_prealloc > 0 or pd_transfer > 0 or pd_inflight > 0
+        )
 
         if has_pending:
             msg = (
@@ -1559,7 +1578,8 @@ class Scheduler(
                 f"waiting={waiting_reqs}, pending_dp={pending_dp_reqs}, running={running_reqs}, "
                 f"cur_batch={current_batch_reqs}, last_batch={last_batch_reqs}, "
                 f"chunked={chunked_pending}, pending_results={pending_results}, "
-                f"pd_prefill={pd_prefill}, pd_prealloc={pd_prealloc}, pd_transfer={pd_transfer}"
+                f"pd_prefill={pd_prefill}, pd_prealloc={pd_prealloc}, "
+                f"pd_transfer={pd_transfer}, pd_inflight={pd_inflight}"
             )
             return False, msg
 
@@ -1599,6 +1619,9 @@ class Scheduler(
             self.token_to_kv_pool_allocator.clear()
         if self.grammar_backend is not None:
             self.grammar_backend.reset()
+        _clear_embedding_pools(
+            (self.tp_worker, self.tp_worker_p, *getattr(self, "tp_workers_p", ()))
+        )
 
         self.num_generated_tokens = 0
         self.forward_ct_decode = 0

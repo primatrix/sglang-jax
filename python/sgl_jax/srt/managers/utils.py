@@ -55,7 +55,8 @@ def resolve_future_token_ids(input_ids, future_token_ids_map, mesh):
 
 
 @jax.jit(static_argnames=("mesh"))
-def set_future_token_ids(future_token_ids_map, future_token_ids_ct, next_token_ids, mesh):
+def set_future_token_ids(future_token_ids_map, req_pool_indices, next_token_ids, mesh):
+    req_pool_indices_global = jax.sharding.reshard(req_pool_indices, NamedSharding(mesh, P()))
     next_token_ids_global = jax.sharding.reshard(next_token_ids, NamedSharding(mesh, P()))
-    start_indices = (future_token_ids_ct + 1,)
-    return jax.lax.dynamic_update_slice(future_token_ids_map, next_token_ids_global, start_indices)
+    relay_indices = req_pool_indices_global + 1
+    return future_token_ids_map.at[relay_indices].set(next_token_ids_global)
