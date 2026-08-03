@@ -250,7 +250,7 @@ def _make_scatter_kernel(
                 local_expert = expert_id % LOCAL_EXPERTS
                 slot = my_id * capacity + occurrence
                 source = tokens_ref.at[pl.ds(token_id, 1)]
-                destination = scatter_ref.at[pl.ds(local_expert * NDEV * capacity + slot, 1)]
+                destination = scatter_ref.at[local_expert, pl.ds(slot, 1)]
                 is_local = owner == my_id
 
                 @pl.when(is_local)
@@ -281,7 +281,7 @@ def _make_scatter_kernel(
 
                 @pl.when(recv_count != 0)
                 def _wait_recv(local_expert=local_expert, recv_count=recv_count):
-                    ref = scatter_ref.at[pl.ds(local_expert * NDEV * capacity, recv_count)]
+                    ref = scatter_ref.at[local_expert, pl.ds(0, recv_count)]
                     pltpu.make_async_copy(
                         src_ref=ref,
                         dst_ref=ref,
@@ -293,7 +293,7 @@ def _make_scatter_kernel(
 
                 @pl.when(send_count != 0)
                 def _wait_send(local_expert=local_expert, send_count=send_count):
-                    ref = scatter_ref.at[pl.ds(local_expert * NDEV * capacity, send_count)]
+                    ref = scatter_ref.at[local_expert, pl.ds(0, send_count)]
                     pltpu.make_async_copy(
                         src_ref=ref,
                         dst_ref=ref,
@@ -305,7 +305,7 @@ def _make_scatter_kernel(
     return pl.pallas_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct(
-            (LOCAL_EXPERTS * NDEV * capacity, *inner),
+            (LOCAL_EXPERTS, NDEV * capacity, *inner),
             dtype,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -357,12 +357,10 @@ def _make_gather_kernel(
                 for source_id in range(NDEV):
                     count = owner_counts_ref[source_id, local_expert]
                     source = expert_output_ref.at[
-                        pl.ds(
-                            (local_expert * NDEV + source_id) * capacity,
-                            count,
-                        )
+                        local_expert,
+                        pl.ds(source_id * capacity, count),
                     ]
-                    destination = gather_ref.at[pl.ds(global_expert * capacity, count)]
+                    destination = gather_ref.at[global_expert, pl.ds(0, count)]
                     is_local = source_id == my_id
 
                     @pl.when(jnp.logical_and(is_local, count != 0))
@@ -398,7 +396,7 @@ def _make_gather_kernel(
 
                 @pl.when(count != 0)
                 def _wait():
-                    ref = gather_ref.at[pl.ds(global_expert * capacity, count)]
+                    ref = gather_ref.at[global_expert, pl.ds(0, count)]
                     pltpu.make_async_copy(
                         src_ref=ref,
                         dst_ref=ref,
@@ -414,7 +412,7 @@ def _make_gather_kernel(
 
                 @pl.when(send_count != 0)
                 def _wait_send(local_expert=local_expert, send_count=send_count):
-                    ref = expert_output_ref.at[pl.ds(local_expert * NDEV * capacity, send_count)]
+                    ref = expert_output_ref.at[local_expert, pl.ds(0, send_count)]
                     pltpu.make_async_copy(
                         src_ref=ref,
                         dst_ref=ref,
@@ -425,7 +423,7 @@ def _make_gather_kernel(
 
     return pl.pallas_call(
         kernel,
-        out_shape=jax.ShapeDtypeStruct((NUM_EXPERTS * capacity, *inner), dtype),
+        out_shape=jax.ShapeDtypeStruct((NUM_EXPERTS, capacity, *inner), dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
             in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)],
@@ -526,10 +524,10 @@ def _inner_shape(dtype: jnp.dtype, hidden: int) -> tuple[int, ...]:
 
 
 def _encoded_tokens(tokens: int, hidden: int) -> jax.Array:
-    per_device = np.empty((NDEV, tokens, hidden), dtype=np.int32)
+    per_device = np.empty((NDEV, tokens, 1, hidden), dtype=np.int32)
     for source in range(NDEV):
         for token in range(tokens):
-            per_device[source, token] = source * 1000 + token + 1
+            per_device[source, token, 0] = source * 1000 + token + 1
     return _make_sharded_from_per_device(per_device)
 
 
@@ -539,19 +537,19 @@ def _expected_roundtrip(
     hidden: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     expected_scatter = np.zeros(
-        (NDEV, LOCAL_EXPERTS * NDEV * capacity, hidden),
+        (NDEV, LOCAL_EXPERTS, NDEV * capacity, 1, hidden),
         dtype=np.int32,
     )
     scatter_mask = np.zeros(
-        (NDEV, LOCAL_EXPERTS * NDEV * capacity, 1),
+        (NDEV, LOCAL_EXPERTS, NDEV * capacity, 1, 1),
         dtype=np.bool_,
     )
     expected_gather = np.zeros(
-        (NDEV, NUM_EXPERTS * capacity, hidden),
+        (NDEV, NUM_EXPERTS, capacity, 1, hidden),
         dtype=np.int32,
     )
     gather_mask = np.zeros(
-        (NDEV, NUM_EXPERTS * capacity, 1),
+        (NDEV, NUM_EXPERTS, capacity, 1, 1),
         dtype=np.bool_,
     )
     for source in range(NDEV):
@@ -562,12 +560,11 @@ def _expected_roundtrip(
                 occurrence = int(plan.occurrences[source, token, k_id])
                 owner = expert // LOCAL_EXPERTS
                 local_expert = expert % LOCAL_EXPERTS
-                scatter_slot = local_expert * NDEV * capacity + source * capacity + occurrence
-                gather_slot = expert * capacity + occurrence
-                expected_scatter[owner, scatter_slot] = value
-                scatter_mask[owner, scatter_slot] = True
-                expected_gather[source, gather_slot] = value
-                gather_mask[source, gather_slot] = True
+                scatter_slot = source * capacity + occurrence
+                expected_scatter[owner, local_expert, scatter_slot, 0] = value
+                scatter_mask[owner, local_expert, scatter_slot, 0] = True
+                expected_gather[source, expert, occurrence, 0] = value
+                gather_mask[source, expert, occurrence, 0] = True
     return (
         _make_sharded_from_per_device(expected_scatter),
         _make_sharded_from_per_device(scatter_mask),
@@ -714,7 +711,7 @@ def _benchmark_case(dtype_name: str, plan: RoutePlan, capacity: int) -> list[dic
     ) = _metadata(plan)
     token_values = _make_zero_sharded((plan.tokens, *inner), dtype)
     expert_output = _make_zero_sharded(
-        (LOCAL_EXPERTS * NDEV * capacity, *inner),
+        (LOCAL_EXPERTS, NDEV * capacity, *inner),
         dtype,
     )
 
