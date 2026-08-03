@@ -59,6 +59,10 @@ ITERS = int(os.environ.get("BENCH_ITERS", "50"))
 DTYPE = os.environ.get("BENCH_DTYPE", "both").lower()
 CHECK = os.environ.get("BENCH_CHECK", "1") == "1"
 OUTPUT = os.environ.get("BENCH_OUTPUT")
+PROFILE_DIR = os.environ.get("BENCH_PROFILE_DIR")
+PROFILE_TOKENS = int(os.environ.get("BENCH_PROFILE_TOKENS", "16"))
+PROFILE_ROUTE_SEED = int(os.environ.get("BENCH_PROFILE_ROUTE_SEED", "0"))
+PROFILE_ITERS = int(os.environ.get("BENCH_PROFILE_ITERS", "20"))
 ROUTE_BASE_SEED = int(os.environ.get("BENCH_ROUTE_BASE_SEED", "20260803"))
 
 NDEV = jax.device_count()
@@ -76,6 +80,10 @@ if any(tokens not in TOKENS_CASES for tokens in CHECK_TOKENS):
     raise SystemExit("BENCH_CHECK_TOKENS must be a subset of BENCH_TOKENS_PER_DEVICE")
 if DTYPE not in {"bf16", "fp8", "both"}:
     raise SystemExit(f"BENCH_DTYPE must be bf16, fp8, or both, got {DTYPE}")
+if PROFILE_DIR and PROFILE_TOKENS not in TOKENS_CASES:
+    raise SystemExit("BENCH_PROFILE_TOKENS must be in BENCH_TOKENS_PER_DEVICE")
+if PROFILE_DIR and PROFILE_ROUTE_SEED not in ROUTE_SEEDS:
+    raise SystemExit("BENCH_PROFILE_ROUTE_SEED must be in BENCH_ROUTE_SEEDS")
 
 LOCAL_EXPERTS = NUM_EXPERTS // NDEV
 devices = list(jax.devices())
@@ -443,6 +451,117 @@ def _make_gather_kernel(
     )
 
 
+def _make_scatter_baseline_kernel(
+    tokens: int,
+    capacity: int,
+    inner: tuple[int, ...],
+    dtype: jnp.dtype,
+):
+    def kernel(
+        routes_ref,
+        occurrences_ref,
+        send_counts_ref,
+        recv_counts_ref,
+        tokens_ref,
+        scatter_ref,
+        send_sem,
+        recv_sem,
+        barrier_sem,
+    ):
+        del (
+            routes_ref,
+            occurrences_ref,
+            send_counts_ref,
+            recv_counts_ref,
+            tokens_ref,
+            scatter_ref,
+            send_sem,
+            recv_sem,
+        )
+        num_devices = lax.axis_size(TP) * lax.axis_size(DP)
+        _barrier(barrier_sem, num_devices)
+        with jax.named_scope(f"small_token_scatter_baseline_t{tokens}"):
+            pass
+        _barrier(barrier_sem, num_devices)
+
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct(
+            (LOCAL_EXPERTS, NDEV * capacity, *inner),
+            dtype,
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=4,
+            in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)],
+            out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            scratch_shapes=[
+                pltpu.SemaphoreType.DMA((LOCAL_EXPERTS,)),
+                pltpu.SemaphoreType.DMA((LOCAL_EXPERTS,)),
+                pltpu.SemaphoreType.BARRIER,
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            collective_id=722_000 + tokens,
+            allow_collective_id_without_custom_barrier=True,
+            has_side_effects=True,
+        ),
+        name=f"small_token_scatter_baseline_t{tokens}",
+    )
+
+
+def _make_gather_baseline_kernel(
+    tokens: int,
+    capacity: int,
+    inner: tuple[int, ...],
+    dtype: jnp.dtype,
+):
+    def kernel(
+        owner_counts_ref,
+        source_counts_ref,
+        send_counts_ref,
+        expert_output_ref,
+        gather_ref,
+        send_sem,
+        recv_sem,
+        barrier_sem,
+    ):
+        del (
+            owner_counts_ref,
+            source_counts_ref,
+            send_counts_ref,
+            expert_output_ref,
+            gather_ref,
+            send_sem,
+            recv_sem,
+        )
+        num_devices = lax.axis_size(TP) * lax.axis_size(DP)
+        _barrier(barrier_sem, num_devices)
+        with jax.named_scope(f"small_token_gather_baseline_t{tokens}"):
+            pass
+        _barrier(barrier_sem, num_devices)
+
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((NUM_EXPERTS, capacity, *inner), dtype),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)],
+            out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            scratch_shapes=[
+                pltpu.SemaphoreType.DMA((LOCAL_EXPERTS,)),
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.BARRIER,
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            collective_id=723_000 + tokens,
+            allow_collective_id_without_custom_barrier=True,
+            has_side_effects=True,
+        ),
+        name=f"small_token_gather_baseline_t{tokens}",
+    )
+
+
 @functools.cache
 def _scatter_runner(tokens: int, capacity: int, inner: tuple[int, ...], dtype: jnp.dtype):
     kernel = _make_scatter_kernel(tokens, capacity, inner, dtype)
@@ -463,6 +582,50 @@ def _scatter_runner(tokens: int, capacity: int, inner: tuple[int, ...], dtype: j
 @functools.cache
 def _gather_runner(tokens: int, capacity: int, inner: tuple[int, ...], dtype: jnp.dtype):
     kernel = _make_gather_kernel(tokens, capacity, inner, dtype)
+
+    @jax.jit
+    @jax.shard_map(
+        mesh=mesh,
+        in_specs=(row_spec, row_spec, row_spec, row_spec),
+        out_specs=row_spec,
+        check_vma=False,
+    )
+    def run(owner_counts, source_counts, send_counts, expert_output):
+        return kernel(owner_counts, source_counts, send_counts, expert_output)
+
+    return run
+
+
+@functools.cache
+def _scatter_baseline_runner(
+    tokens: int,
+    capacity: int,
+    inner: tuple[int, ...],
+    dtype: jnp.dtype,
+):
+    kernel = _make_scatter_baseline_kernel(tokens, capacity, inner, dtype)
+
+    @jax.jit
+    @jax.shard_map(
+        mesh=mesh,
+        in_specs=(row_spec, row_spec, row_spec, row_spec, row_spec),
+        out_specs=row_spec,
+        check_vma=False,
+    )
+    def run(routes, occurrences, send_counts, recv_counts, token_values):
+        return kernel(routes, occurrences, send_counts, recv_counts, token_values)
+
+    return run
+
+
+@functools.cache
+def _gather_baseline_runner(
+    tokens: int,
+    capacity: int,
+    inner: tuple[int, ...],
+    dtype: jnp.dtype,
+):
+    kernel = _make_gather_baseline_kernel(tokens, capacity, inner, dtype)
 
     @jax.jit
     @jax.shard_map(
@@ -658,14 +821,19 @@ def _result(
     bytes_per_element = 2 if dtype_name == "bf16" else 1
     p50_ms = _percentile(samples_ms, 0.50)
     p90_ms = _percentile(samples_ms, 0.90)
-    ici_rows_mean = float(np.mean(plan.cross_chip_rows_by_source))
+    is_baseline = operation.endswith("_baseline")
+    ici_rows_mean = 0.0 if is_baseline else float(np.mean(plan.cross_chip_rows_by_source))
     ici_bytes_mean = ici_rows_mean * H * bytes_per_element
-    if operation == "scatter":
+    if operation.startswith("scatter"):
         ici_messages_mean = ici_rows_mean
         block_rows = np.ones((1,), dtype=np.int32)
     else:
-        ici_messages_mean = float(np.mean(plan.cross_chip_gather_blocks_by_owner))
-        block_rows = plan.cross_chip_gather_block_rows
+        ici_messages_mean = (
+            0.0 if is_baseline else float(np.mean(plan.cross_chip_gather_blocks_by_owner))
+        )
+        block_rows = (
+            np.zeros((1,), dtype=np.int32) if is_baseline else plan.cross_chip_gather_block_rows
+        )
     return {
         "operation": operation,
         "dtype": dtype_name,
@@ -725,8 +893,22 @@ def _benchmark_case(dtype_name: str, plan: RoutePlan, capacity: int) -> list[dic
             token_values,
         ),
     )
+    scatter_baseline_samples = _timed(
+        _scatter_baseline_runner(plan.tokens, capacity, inner, dtype),
+        (
+            routes,
+            occurrences,
+            scatter_send_counts,
+            scatter_recv_counts,
+            token_values,
+        ),
+    )
     gather_samples = _timed(
         _gather_runner(plan.tokens, capacity, inner, dtype),
+        (owner_counts, source_counts, gather_send_counts, expert_output),
+    )
+    gather_baseline_samples = _timed(
+        _gather_baseline_runner(plan.tokens, capacity, inner, dtype),
         (owner_counts, source_counts, gather_send_counts, expert_output),
     )
     return [
@@ -738,13 +920,102 @@ def _benchmark_case(dtype_name: str, plan: RoutePlan, capacity: int) -> list[dic
             samples_ms=scatter_samples,
         ),
         _result(
+            operation="scatter_baseline",
+            dtype_name=dtype_name,
+            plan=plan,
+            capacity=capacity,
+            samples_ms=scatter_baseline_samples,
+        ),
+        _result(
             operation="gather",
             dtype_name=dtype_name,
             plan=plan,
             capacity=capacity,
             samples_ms=gather_samples,
         ),
+        _result(
+            operation="gather_baseline",
+            dtype_name=dtype_name,
+            plan=plan,
+            capacity=capacity,
+            samples_ms=gather_baseline_samples,
+        ),
     ]
+
+
+def _profile_representative(dtype_names: tuple[str, ...]) -> None:
+    if not PROFILE_DIR:
+        return
+
+    plan = PLANS[PROFILE_TOKENS, PROFILE_ROUTE_SEED]
+    capacity = CAPACITY_BY_TOKENS[PROFILE_TOKENS]
+    for dtype_name in dtype_names:
+        dtype = jnp.bfloat16 if dtype_name == "bf16" else jnp.float8_e4m3fn
+        inner = _inner_shape(dtype, H)
+        (
+            routes,
+            occurrences,
+            scatter_send_counts,
+            scatter_recv_counts,
+            owner_counts,
+            source_counts,
+            gather_send_counts,
+        ) = _metadata(plan)
+        token_values = _make_zero_sharded((plan.tokens, *inner), dtype)
+        expert_output = _make_zero_sharded(
+            (LOCAL_EXPERTS, NDEV * capacity, *inner),
+            dtype,
+        )
+        calls = (
+            (
+                "scatter",
+                _scatter_runner(plan.tokens, capacity, inner, dtype),
+                (
+                    routes,
+                    occurrences,
+                    scatter_send_counts,
+                    scatter_recv_counts,
+                    token_values,
+                ),
+            ),
+            (
+                "scatter_baseline",
+                _scatter_baseline_runner(plan.tokens, capacity, inner, dtype),
+                (
+                    routes,
+                    occurrences,
+                    scatter_send_counts,
+                    scatter_recv_counts,
+                    token_values,
+                ),
+            ),
+            (
+                "gather",
+                _gather_runner(plan.tokens, capacity, inner, dtype),
+                (owner_counts, source_counts, gather_send_counts, expert_output),
+            ),
+            (
+                "gather_baseline",
+                _gather_baseline_runner(plan.tokens, capacity, inner, dtype),
+                (owner_counts, source_counts, gather_send_counts, expert_output),
+            ),
+        )
+        for _, run, arguments in calls:
+            jax.block_until_ready(run(*arguments))
+
+        trace_dir = str(Path(PROFILE_DIR) / dtype_name)
+        log(
+            f"profiling tokens={PROFILE_TOKENS} seed={PROFILE_ROUTE_SEED} "
+            f"dtype={dtype_name} iterations={PROFILE_ITERS} dir={trace_dir}"
+        )
+        jax.profiler.start_trace(trace_dir, create_perfetto_link=False)
+        for operation, run, arguments in calls:
+            for _ in range(PROFILE_ITERS):
+                with jax.profiler.TraceAnnotation(
+                    f"profile_{operation}_{dtype_name}_t{PROFILE_TOKENS}"
+                ):
+                    jax.block_until_ready(run(*arguments))
+        jax.profiler.stop_trace()
 
 
 def _write_results(results: list[dict[str, object]]) -> None:
@@ -778,6 +1049,7 @@ def main() -> None:
                 results.extend(case_results)
                 for result in case_results:
                     log(json.dumps(result, sort_keys=True))
+    _profile_representative(dtype_names)
     _write_results(results)
     log("done")
 
