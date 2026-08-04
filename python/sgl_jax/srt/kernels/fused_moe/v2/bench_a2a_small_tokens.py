@@ -64,6 +64,8 @@ PROFILE_TOKENS = int(os.environ.get("BENCH_PROFILE_TOKENS", "16"))
 PROFILE_ROUTE_SEED = int(os.environ.get("BENCH_PROFILE_ROUTE_SEED", "0"))
 PROFILE_ITERS = int(os.environ.get("BENCH_PROFILE_ITERS", "20"))
 ROUTE_BASE_SEED = int(os.environ.get("BENCH_ROUTE_BASE_SEED", "20260803"))
+METADATA_TILE_TOKENS = int(os.environ.get("BENCH_METADATA_TILE_TOKENS", "128"))
+METADATA_MINOR = 128
 
 NDEV = jax.device_count()
 if NDEV < 2:
@@ -72,6 +74,8 @@ if NUM_EXPERTS % NDEV != 0:
     raise SystemExit(f"num_experts={NUM_EXPERTS} must be divisible by device_count={NDEV}")
 if TOP_K > NUM_EXPERTS:
     raise SystemExit(f"top_k={TOP_K} must not exceed num_experts={NUM_EXPERTS}")
+if METADATA_TILE_TOKENS <= 0:
+    raise SystemExit(f"invalid BENCH_METADATA_TILE_TOKENS={METADATA_TILE_TOKENS}")
 if not TOKENS_CASES or min(TOKENS_CASES) <= 0:
     raise SystemExit(f"invalid token cases: {TOKENS_CASES}")
 if not ROUTE_SEEDS:
@@ -227,7 +231,8 @@ def _make_scatter_kernel(
     inner: tuple[int, ...],
     dtype: jnp.dtype,
 ):
-    assignments = tokens * TOP_K
+    metadata_rows_per_tile = (METADATA_TILE_TOKENS * TOP_K + METADATA_MINOR - 1) // METADATA_MINOR
+    metadata_tiles = (tokens + METADATA_TILE_TOKENS - 1) // METADATA_TILE_TOKENS
 
     def kernel(
         send_counts_ref,
@@ -238,7 +243,10 @@ def _make_scatter_kernel(
         scatter_ref,
         send_sem,
         recv_sem,
+        metadata_sem,
         barrier_sem,
+        routes_vmem,
+        occurrences_vmem,
     ):
         tp_size = lax.axis_size(TP)
         dp_size = lax.axis_size(DP)
@@ -248,41 +256,75 @@ def _make_scatter_kernel(
         _barrier(barrier_sem, num_devices)
 
         with jax.named_scope(f"small_token_scatter_t{tokens}"):
+            for metadata_tile in range(metadata_tiles):
+                token_start = metadata_tile * METADATA_TILE_TOKENS
+                tile_tokens = min(METADATA_TILE_TOKENS, tokens - token_start)
+                tile_assignments = tile_tokens * TOP_K
+                tile_rows = (tile_assignments + METADATA_MINOR - 1) // METADATA_MINOR
+                metadata_row_start = metadata_tile * metadata_rows_per_tile
 
-            def fire_assignment(assignment_id, _):
-                token_id = assignment_id // TOP_K
-                k_id = assignment_id % TOP_K
-                expert_id = routes_ref[token_id, k_id]
-                occurrence = occurrences_ref[token_id, k_id]
-                owner = expert_id // LOCAL_EXPERTS
-                local_expert = expert_id % LOCAL_EXPERTS
-                slot = my_id * capacity + occurrence
-                source = tokens_ref.at[pl.ds(token_id, 1)]
-                destination = scatter_ref.at[local_expert, pl.ds(slot, 1)]
-                is_local = owner == my_id
+                routes_copy = pltpu.make_async_copy(
+                    src_ref=routes_ref.at[
+                        pl.ds(metadata_row_start, tile_rows),
+                        pl.ds(0, METADATA_MINOR),
+                    ],
+                    dst_ref=routes_vmem.at[
+                        pl.ds(0, tile_rows),
+                        pl.ds(0, METADATA_MINOR),
+                    ],
+                    sem=metadata_sem.at[0],
+                )
+                occurrences_copy = pltpu.make_async_copy(
+                    src_ref=occurrences_ref.at[
+                        pl.ds(metadata_row_start, tile_rows),
+                        pl.ds(0, METADATA_MINOR),
+                    ],
+                    dst_ref=occurrences_vmem.at[
+                        pl.ds(0, tile_rows),
+                        pl.ds(0, METADATA_MINOR),
+                    ],
+                    sem=metadata_sem.at[1],
+                )
+                routes_copy.start()
+                occurrences_copy.start()
+                routes_copy.wait()
+                occurrences_copy.wait()
 
-                @pl.when(is_local)
-                def _local_copy():
-                    pltpu.make_async_copy(
-                        src_ref=source,
-                        dst_ref=destination,
-                        sem=recv_sem.at[local_expert],
-                    ).start()
+                def fire_assignment(tile_assignment_id, _, token_start=token_start):
+                    metadata_row = tile_assignment_id // METADATA_MINOR
+                    metadata_col = tile_assignment_id % METADATA_MINOR
+                    token_id = token_start + tile_assignment_id // TOP_K
+                    expert_id = routes_vmem[metadata_row, metadata_col]
+                    occurrence = occurrences_vmem[metadata_row, metadata_col]
+                    owner = expert_id // LOCAL_EXPERTS
+                    local_expert = expert_id % LOCAL_EXPERTS
+                    slot = my_id * capacity + occurrence
+                    source = tokens_ref.at[pl.ds(token_id, 1)]
+                    destination = scatter_ref.at[local_expert, pl.ds(slot, 1)]
+                    is_local = owner == my_id
 
-                @pl.when(jnp.logical_not(is_local))
-                def _remote_copy():
-                    pltpu.make_async_remote_copy(
-                        src_ref=source,
-                        dst_ref=destination,
-                        send_sem=send_sem.at[local_expert],
-                        recv_sem=recv_sem.at[local_expert],
-                        device_id=_mesh_id(owner),
-                        device_id_type=pltpu.DeviceIdType.MESH,
-                    ).start()
+                    @pl.when(is_local)
+                    def _local_copy():
+                        pltpu.make_async_copy(
+                            src_ref=source,
+                            dst_ref=destination,
+                            sem=recv_sem.at[local_expert],
+                        ).start()
 
-                return None
+                    @pl.when(jnp.logical_not(is_local))
+                    def _remote_copy():
+                        pltpu.make_async_remote_copy(
+                            src_ref=source,
+                            dst_ref=destination,
+                            send_sem=send_sem.at[local_expert],
+                            recv_sem=recv_sem.at[local_expert],
+                            device_id=_mesh_id(owner),
+                            device_id_type=pltpu.DeviceIdType.MESH,
+                        ).start()
 
-            lax.fori_loop(0, assignments, fire_assignment, None, unroll=False)
+                    return None
+
+                lax.fori_loop(0, tile_assignments, fire_assignment, None, unroll=False)
 
             for local_expert in range(LOCAL_EXPERTS):
                 recv_count = recv_counts_ref[local_expert]
@@ -331,7 +373,10 @@ def _make_scatter_kernel(
             scratch_shapes=[
                 pltpu.SemaphoreType.DMA((LOCAL_EXPERTS,)),
                 pltpu.SemaphoreType.DMA((LOCAL_EXPERTS,)),
+                pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.BARRIER,
+                pltpu.VMEM((metadata_rows_per_tile, METADATA_MINOR), jnp.int32),
+                pltpu.VMEM((metadata_rows_per_tile, METADATA_MINOR), jnp.int32),
             ],
         ),
         compiler_params=pltpu.CompilerParams(
@@ -679,9 +724,16 @@ def _make_zero_sharded(local_shape: tuple[int, ...], dtype: jnp.dtype) -> jax.Ar
 
 
 def _metadata(plan: RoutePlan) -> tuple[jax.Array, ...]:
+    assignments = plan.tokens * TOP_K
+    metadata_rows = (assignments + METADATA_MINOR - 1) // METADATA_MINOR
+    padded_assignments = metadata_rows * METADATA_MINOR
+    routes = np.full((NDEV, padded_assignments), -1, dtype=np.int32)
+    occurrences = np.zeros((NDEV, padded_assignments), dtype=np.int32)
+    routes[:, :assignments] = plan.routes.reshape(NDEV, assignments)
+    occurrences[:, :assignments] = plan.occurrences.reshape(NDEV, assignments)
     return (
-        _make_sharded_from_per_device(plan.routes),
-        _make_sharded_from_per_device(plan.occurrences),
+        _make_sharded_from_per_device(routes.reshape(NDEV, metadata_rows, METADATA_MINOR)),
+        _make_sharded_from_per_device(occurrences.reshape(NDEV, metadata_rows, METADATA_MINOR)),
         _make_sharded_from_per_device(plan.scatter_send_counts),
         _make_sharded_from_per_device(plan.scatter_recv_counts),
         _make_sharded_from_per_device(plan.owner_counts),
