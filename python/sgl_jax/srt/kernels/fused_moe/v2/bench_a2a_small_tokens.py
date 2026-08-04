@@ -231,7 +231,6 @@ def _make_scatter_kernel(
     inner: tuple[int, ...],
     dtype: jnp.dtype,
 ):
-    metadata_rows_per_tile = (METADATA_TILE_TOKENS * TOP_K + METADATA_MINOR - 1) // METADATA_MINOR
     metadata_tiles = (tokens + METADATA_TILE_TOKENS - 1) // METADATA_TILE_TOKENS
 
     def kernel(
@@ -247,6 +246,8 @@ def _make_scatter_kernel(
         barrier_sem,
         routes_vmem,
         occurrences_vmem,
+        routes_smem,
+        occurrences_smem,
     ):
         tp_size = lax.axis_size(TP)
         dp_size = lax.axis_size(DP)
@@ -260,29 +261,21 @@ def _make_scatter_kernel(
                 token_start = metadata_tile * METADATA_TILE_TOKENS
                 tile_tokens = min(METADATA_TILE_TOKENS, tokens - token_start)
                 tile_assignments = tile_tokens * TOP_K
-                tile_rows = (tile_assignments + METADATA_MINOR - 1) // METADATA_MINOR
-                metadata_row_start = metadata_tile * metadata_rows_per_tile
 
                 routes_copy = pltpu.make_async_copy(
                     src_ref=routes_ref.at[
-                        pl.ds(metadata_row_start, tile_rows),
+                        pl.ds(token_start, METADATA_TILE_TOKENS),
                         pl.ds(0, METADATA_MINOR),
                     ],
-                    dst_ref=routes_vmem.at[
-                        pl.ds(0, tile_rows),
-                        pl.ds(0, METADATA_MINOR),
-                    ],
+                    dst_ref=routes_vmem,
                     sem=metadata_sem.at[0],
                 )
                 occurrences_copy = pltpu.make_async_copy(
                     src_ref=occurrences_ref.at[
-                        pl.ds(metadata_row_start, tile_rows),
+                        pl.ds(token_start, METADATA_TILE_TOKENS),
                         pl.ds(0, METADATA_MINOR),
                     ],
-                    dst_ref=occurrences_vmem.at[
-                        pl.ds(0, tile_rows),
-                        pl.ds(0, METADATA_MINOR),
-                    ],
+                    dst_ref=occurrences_vmem,
                     sem=metadata_sem.at[1],
                 )
                 routes_copy.start()
@@ -290,12 +283,25 @@ def _make_scatter_kernel(
                 routes_copy.wait()
                 occurrences_copy.wait()
 
+                routes_to_smem = pltpu.async_copy(
+                    src_ref=routes_vmem,
+                    dst_ref=routes_smem,
+                    sem=metadata_sem.at[0],
+                )
+                occurrences_to_smem = pltpu.async_copy(
+                    src_ref=occurrences_vmem,
+                    dst_ref=occurrences_smem,
+                    sem=metadata_sem.at[1],
+                )
+                routes_to_smem.wait()
+                occurrences_to_smem.wait()
+
                 def fire_assignment(tile_assignment_id, _, token_start=token_start):
-                    metadata_row = tile_assignment_id // METADATA_MINOR
-                    metadata_col = tile_assignment_id % METADATA_MINOR
-                    token_id = token_start + tile_assignment_id // TOP_K
-                    expert_id = routes_vmem[metadata_row, metadata_col]
-                    occurrence = occurrences_vmem[metadata_row, metadata_col]
+                    tile_token_id = tile_assignment_id // TOP_K
+                    k_id = tile_assignment_id % TOP_K
+                    token_id = token_start + tile_token_id
+                    expert_id = routes_smem[tile_token_id, k_id]
+                    occurrence = occurrences_smem[tile_token_id, k_id]
                     owner = expert_id // LOCAL_EXPERTS
                     local_expert = expert_id % LOCAL_EXPERTS
                     slot = my_id * capacity + occurrence
@@ -361,8 +367,8 @@ def _make_scatter_kernel(
         grid_spec=pltpu.PrefetchScalarGridSpec(
             # routes/occurrences scale with tokens and exceed SMEM at the
             # EP16 16K-global-token case. Keep only the small per-expert
-            # count vectors in scalar-prefetch and read route metadata from
-            # HBM, matching the large-shape production constraint.
+            # count vectors in scalar-prefetch and stage route metadata via
+            # HBM -> VMEM -> SMEM tiles, matching the production kernel.
             num_scalar_prefetch=2,
             in_specs=[
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
@@ -375,8 +381,10 @@ def _make_scatter_kernel(
                 pltpu.SemaphoreType.DMA((LOCAL_EXPERTS,)),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.BARRIER,
-                pltpu.VMEM((metadata_rows_per_tile, METADATA_MINOR), jnp.int32),
-                pltpu.VMEM((metadata_rows_per_tile, METADATA_MINOR), jnp.int32),
+                pltpu.VMEM((METADATA_TILE_TOKENS, METADATA_MINOR), jnp.int32),
+                pltpu.VMEM((METADATA_TILE_TOKENS, METADATA_MINOR), jnp.int32),
+                pltpu.SMEM((METADATA_TILE_TOKENS, METADATA_MINOR), jnp.int32),
+                pltpu.SMEM((METADATA_TILE_TOKENS, METADATA_MINOR), jnp.int32),
             ],
         ),
         compiler_params=pltpu.CompilerParams(
@@ -724,16 +732,15 @@ def _make_zero_sharded(local_shape: tuple[int, ...], dtype: jnp.dtype) -> jax.Ar
 
 
 def _metadata(plan: RoutePlan) -> tuple[jax.Array, ...]:
-    assignments = plan.tokens * TOP_K
-    metadata_rows = (assignments + METADATA_MINOR - 1) // METADATA_MINOR
-    padded_assignments = metadata_rows * METADATA_MINOR
-    routes = np.full((NDEV, padded_assignments), -1, dtype=np.int32)
-    occurrences = np.zeros((NDEV, padded_assignments), dtype=np.int32)
-    routes[:, :assignments] = plan.routes.reshape(NDEV, assignments)
-    occurrences[:, :assignments] = plan.occurrences.reshape(NDEV, assignments)
+    metadata_tiles = (plan.tokens + METADATA_TILE_TOKENS - 1) // METADATA_TILE_TOKENS
+    padded_tokens = metadata_tiles * METADATA_TILE_TOKENS
+    routes = np.full((NDEV, padded_tokens, METADATA_MINOR), -1, dtype=np.int32)
+    occurrences = np.zeros((NDEV, padded_tokens, METADATA_MINOR), dtype=np.int32)
+    routes[:, : plan.tokens, :TOP_K] = plan.routes
+    occurrences[:, : plan.tokens, :TOP_K] = plan.occurrences
     return (
-        _make_sharded_from_per_device(routes.reshape(NDEV, metadata_rows, METADATA_MINOR)),
-        _make_sharded_from_per_device(occurrences.reshape(NDEV, metadata_rows, METADATA_MINOR)),
+        _make_sharded_from_per_device(routes),
+        _make_sharded_from_per_device(occurrences),
         _make_sharded_from_per_device(plan.scatter_send_counts),
         _make_sharded_from_per_device(plan.scatter_recv_counts),
         _make_sharded_from_per_device(plan.owner_counts),
