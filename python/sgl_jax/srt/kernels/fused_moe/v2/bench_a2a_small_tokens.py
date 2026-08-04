@@ -230,10 +230,10 @@ def _make_scatter_kernel(
     assignments = tokens * TOP_K
 
     def kernel(
-        routes_ref,
-        occurrences_ref,
         send_counts_ref,
         recv_counts_ref,
+        routes_ref,
+        occurrences_ref,
         tokens_ref,
         scatter_ref,
         send_sem,
@@ -317,8 +317,16 @@ def _make_scatter_kernel(
             dtype,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=4,
-            in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)],
+            # routes/occurrences scale with tokens and exceed SMEM at the
+            # EP16 16K-global-token case. Keep only the small per-expert
+            # count vectors in scalar-prefetch and read route metadata from
+            # HBM, matching the large-shape production constraint.
+            num_scalar_prefetch=2,
+            in_specs=[
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            ],
             out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
             scratch_shapes=[
                 pltpu.SemaphoreType.DMA((LOCAL_EXPERTS,)),
@@ -458,10 +466,10 @@ def _make_scatter_baseline_kernel(
     dtype: jnp.dtype,
 ):
     def kernel(
-        routes_ref,
-        occurrences_ref,
         send_counts_ref,
         recv_counts_ref,
+        routes_ref,
+        occurrences_ref,
         tokens_ref,
         scatter_ref,
         send_sem,
@@ -491,8 +499,12 @@ def _make_scatter_baseline_kernel(
             dtype,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=4,
-            in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)],
+            num_scalar_prefetch=2,
+            in_specs=[
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            ],
             out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
             scratch_shapes=[
                 pltpu.SemaphoreType.DMA((LOCAL_EXPERTS,)),
@@ -574,7 +586,7 @@ def _scatter_runner(tokens: int, capacity: int, inner: tuple[int, ...], dtype: j
         check_vma=False,
     )
     def run(routes, occurrences, send_counts, recv_counts, token_values):
-        return kernel(routes, occurrences, send_counts, recv_counts, token_values)
+        return kernel(send_counts, recv_counts, routes, occurrences, token_values)
 
     return run
 
@@ -613,7 +625,7 @@ def _scatter_baseline_runner(
         check_vma=False,
     )
     def run(routes, occurrences, send_counts, recv_counts, token_values):
-        return kernel(routes, occurrences, send_counts, recv_counts, token_values)
+        return kernel(send_counts, recv_counts, routes, occurrences, token_values)
 
     return run
 
