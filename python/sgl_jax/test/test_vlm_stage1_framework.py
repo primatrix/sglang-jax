@@ -30,7 +30,10 @@ from sgl_jax.srt.multimodal.in_model.interface import (
     InModelMultimodalContract,
     PackedMultimodalEmbedding,
 )
-from sgl_jax.srt.multimodal.in_model.lane_packing import balance_lanes
+from sgl_jax.srt.multimodal.in_model.lane_packing import (
+    balance_lanes,
+    replicate_across_mesh,
+)
 from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
     VisionAttentionMetadata,
     VisionFlashAttentionBackend,
@@ -355,6 +358,16 @@ def test_qwen2_encode_items_spmd(encoder_tp):
     np.testing.assert_array_equal(first, second)
     assert first.sharding.spec == PartitionSpec("data", None)
     assert calls == 2
+
+
+def test_replicate_across_mesh_reuses_rank_explicit_replication():
+    mesh = _mesh(dp=2, tp=2)
+    value = jax.device_put(
+        jnp.zeros((4, 8, 16)),
+        NamedSharding(mesh, PartitionSpec(None, None, None)),
+    )
+
+    assert replicate_across_mesh(value, mesh) is value
 
 
 def test_qwen3_vision_precompile_warms_configured_buckets():

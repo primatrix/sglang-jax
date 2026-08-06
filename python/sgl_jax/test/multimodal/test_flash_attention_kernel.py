@@ -9,6 +9,7 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.multimodal.kernels.flash_attention import (
     BlockSizes,
     SegmentIds,
+    _get_block_sparse_default_block_sizes,
     _segment_block_sparse_schedule,
     flash_attention,
     mha_reference_no_custom_vjp,
@@ -123,6 +124,13 @@ class TestFlashAttentionKernel(unittest.TestCase):
                 dtype=np.int32,
             ),
         )
+
+    def test_block_sparse_32k_uses_v7x_safe_tiles(self):
+        blocks = _get_block_sparse_default_block_sizes(32 * 1024, 32 * 1024)
+
+        self.assertEqual(blocks.block_q, 512)
+        self.assertEqual(blocks.block_k_major, 256)
+        self.assertEqual(blocks.block_k, 128)
 
     def test_block_sparse_interpret_matches_reference(self):
         key = jax.random.key(17)

@@ -135,12 +135,23 @@ class VisionFlashAttentionBackend(AttentionBackend):
         mesh,
         sm_scale=1.0,
         causal=False,
-        vmem_limit_bytes=128 * 1024 * 1024,
+        vmem_limit_bytes: int | None = None,
         head_tp: bool = False,
         block_sparse_segments: bool = False,
     ):
         self.block_sparse_segments = block_sparse_segments
         interpret = mesh.devices.flat[0].platform == "cpu"
+        if vmem_limit_bytes is None:
+            if mesh.devices.flat[0].platform == "tpu":
+                from jax.experimental.pallas import tpu as pltpu
+
+                # Keep the Pallas program below the physical VMEM capacity.
+                # The old 128 MiB default lets the compiler produce programs
+                # that exceed v7x's 64 MiB per-core limit.
+                vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+            else:
+                vmem_limit_bytes = 128 * 1024 * 1024
+        self.vmem_limit_bytes = vmem_limit_bytes
         if head_tp:
             if "tensor" not in mesh.axis_names:
                 raise ValueError("head_tp requires a tensor mesh axis")
@@ -167,7 +178,7 @@ class VisionFlashAttentionBackend(AttentionBackend):
                 segment_ids=segment_ids,
                 sm_scale=sm_scale,
                 causal=causal,
-                vmem_limit_bytes=vmem_limit_bytes,
+                vmem_limit_bytes=self.vmem_limit_bytes,
                 block_sparse_segments=block_sparse_segments,
                 interpret=interpret,
             )

@@ -328,10 +328,15 @@ def _get_block_sparse_default_block_sizes(q_seq_len: int, kv_seq_len: int) -> Bl
             f"KV length divisible by 128, got {q_seq_len=} and {kv_seq_len=}"
         )
 
-    # The larger configuration was the best measured v6e point for packed
-    # totals >= 8K.  The smaller configuration avoids excessive padding and
-    # compile time for short inputs.
-    if q_seq_len >= 8192 and kv_seq_len % 512 == 0:
+    # A 1024x512 major tile spills enough registers for Qwen2.5-VL's 32K
+    # vision bucket to exceed v7x's 64 MiB VMEM.  Use the bounded 512x256
+    # configuration there; it also keeps the block-sparse schedule at exactly
+    # the 8192-entry prefetch limit.  The larger configuration remains the
+    # best measured v6e point for packed totals between 8K and 16K.
+    if q_seq_len >= 32 * 1024 and kv_seq_len % 256 == 0:
+        target_block_q = 512
+        block_k_major = 256
+    elif q_seq_len >= 8192 and kv_seq_len % 512 == 0:
         target_block_q = 1024
         block_k_major = 512
     else:
