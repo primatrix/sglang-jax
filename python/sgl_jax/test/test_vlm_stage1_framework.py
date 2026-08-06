@@ -14,6 +14,7 @@ from sgl_jax.srt.managers.schedule_batch import (
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.models.qwen2_5_vl import Qwen2_5_VisionTransformer
+from sgl_jax.srt.models.qwen3_vl import Qwen3VLVisionModel
 from sgl_jax.srt.multimodal.common.modality_enum import (
     Modality,
     MultimodalDataItem,
@@ -354,6 +355,69 @@ def test_qwen2_encode_items_spmd(encoder_tp):
     np.testing.assert_array_equal(first, second)
     assert first.sharding.spec == PartitionSpec("data", None)
     assert calls == 2
+
+
+def test_qwen3_vision_precompile_warms_configured_buckets():
+    config = _vision_config(
+        spatial_merge_size=2,
+        window_size=2,
+        num_position_embeddings=16,
+        deepstack_visual_indexes=[],
+    )
+    mesh = _mesh()
+    with jax.set_mesh(mesh):
+        visual = Qwen3VLVisionModel(
+            config,
+            jnp.float32,
+            mesh=mesh,
+            input_buckets=(4, 8),
+        )
+    assert _assert_vision_precompile(visual) == [
+        ((1, 4, 1), (1, 4, 4), (1, 4, 4), (1, 4, 2), (1, 2)),
+        ((1, 8, 1), (1, 4, 8), (1, 4, 8), (1, 8, 2), (1, 3)),
+    ]
+
+
+def test_qwen3_vision_rejects_unaligned_buckets():
+    with pytest.raises(ValueError, match="positive multiples of 4"):
+        Qwen3VLVisionModel(
+            _vision_config(spatial_merge_size=2),
+            jnp.float32,
+            mesh=_mesh(),
+            input_buckets=(3,),
+        )
+
+
+@pytest.mark.skipif(
+    "TPU" not in jax.devices()[0].device_kind,
+    reason="Tiny test dims (head_dim=2) exercise the block-sparse kernel, which "
+    "only lowers on TPU; the CPU interpret path rejects the degenerate shape.",
+)
+@pytest.mark.parametrize("encoder_tp", [False, True])
+def test_qwen3_encode_items_spmd(encoder_tp):
+    mesh = _mesh(dp=2, tp=2)
+    config = _vision_config(
+        num_position_embeddings=16,
+        depth=1,
+        deepstack_visual_indexes=[0],
+        num_heads=2,
+    )
+    with jax.set_mesh(mesh):
+        visual = Qwen3VLVisionModel(
+            config,
+            jnp.float32,
+            mesh=mesh,
+            tp=encoder_tp,
+            input_buckets=(4,),
+        )
+    items = _items([(1, 1, 2), (1, 1, 4)], [(0, 2), (2, 6)])
+    packed = visual.encode_items(items)
+    assert [length for _, _, length in packed.placements] == [2, 4]
+    assert packed.output.sharding.is_fully_replicated
+    assert packed.output.sharding.device_set == set(mesh.devices.flat)
+    assert packed.deepstack is not None
+    assert packed.deepstack.sharding.is_fully_replicated
+    assert packed.deepstack.sharding.device_set == set(mesh.devices.flat)
 
 
 def test_batch_separates_patch_and_placeholder_counts():
@@ -797,6 +861,7 @@ def test_embedding_pool_reuses_full_item_across_chunks():
     ("arch", "chunked", "radix", "mixed_chunk"),
     [
         (ARCH, 4096, False, True),
+        ("Qwen3VLForConditionalGeneration", 4096, False, False),
         ("UnsupportedVLM", -1, True, False),
     ],
 )
@@ -935,3 +1000,54 @@ def test_qwen2_metadata_is_host_planned_and_bucket_stable():
     )
     jax.block_until_ready(visual.encode(second_patches, second_metadata))
     assert visual._encode_jit._cache_size() == cache_size
+
+
+def test_qwen3_metadata_is_host_planned_and_bucket_stable():
+    config = _vision_config(
+        spatial_merge_size=2,
+        num_position_embeddings=16,
+        deepstack_visual_indexes=[],
+    )
+    mesh = _mesh()
+    with jax.set_mesh(mesh):
+        visual = Qwen3VLVisionModel(config, jnp.float32, mesh=mesh, input_buckets=(32,))
+    first = _items([(2, 2, 2)], [(0, 2)])
+    *inputs, placements = visual._batch_items(first)
+    features, pos_indices, pos_weights, position_ids, metadata = inputs
+
+    assert placements == ((0, 0, 2),)
+    assert [
+        np.asarray(features).shape,
+        np.asarray(pos_indices).shape,
+        np.asarray(pos_weights).shape,
+        np.asarray(position_ids).shape,
+        np.asarray(metadata.cu_seqlens).shape,
+    ] == [
+        (1, 32, 1),
+        (1, 4, 32),
+        (1, 4, 32),
+        (1, 32, 2),
+        (1, 9),
+    ]
+    np.testing.assert_array_equal(
+        np.asarray(position_ids)[0, :8],
+        [[0, 0], [0, 1], [1, 0], [1, 1]] * 2,
+    )
+    np.testing.assert_array_equal(np.asarray(metadata.cu_seqlens)[0], [0, 4, 8, 8, 8, 8, 8, 8, 8])
+    np.testing.assert_array_equal(
+        visual._lane_metadata([], 32)[-1],
+        np.zeros(9, dtype=np.int32),
+    )
+    np.testing.assert_allclose(np.asarray(pos_weights)[0, :, :8].sum(axis=0), 1.0)
+    np.testing.assert_array_equal(np.asarray(pos_indices)[0, 0, :8], [0, 3, 12, 15] * 2)
+    _assert_no_grid_layout_planning(jax.make_jaxpr(visual)(*inputs))
+
+    jax.block_until_ready(visual.encode(*inputs))
+    cache_size = visual.encode._cache_size()
+    *second_inputs, _ = visual._batch_items(_items([(1, 2, 4)], [(0, 2)]))
+    assert not np.array_equal(
+        np.asarray(metadata.cu_seqlens),
+        np.asarray(second_inputs[-1].cu_seqlens),
+    )
+    jax.block_until_ready(visual.encode(*second_inputs))
+    assert visual.encode._cache_size() == cache_size
