@@ -171,6 +171,12 @@ class VisionFlashAttentionBackend(AttentionBackend):
                 q.shape[2],
                 search_method="scan",
             )
+            # The tuned dense single-step path keeps the entire K/V sequence in
+            # each Pallas input window. At the 32K vision bucket that alone can
+            # exceed v7x VMEM once the full encoder is fused. Use the segmented
+            # tiled path for every long vision layer; it is exact for both the
+            # local-window and full-frame metadata layouts.
+            use_block_sparse_segments = block_sparse_segments or q.shape[2] >= 32 * 1024
             return flash_attention(
                 q,
                 k,
@@ -179,7 +185,7 @@ class VisionFlashAttentionBackend(AttentionBackend):
                 sm_scale=sm_scale,
                 causal=causal,
                 vmem_limit_bytes=self.vmem_limit_bytes,
-                block_sparse_segments=block_sparse_segments,
+                block_sparse_segments=use_block_sparse_segments,
                 interpret=interpret,
             )
 

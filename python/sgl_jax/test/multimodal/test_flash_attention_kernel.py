@@ -97,7 +97,7 @@ class TestFlashAttentionKernel(unittest.TestCase):
             dtype=jnp.int32,
         )
 
-        block_mask, prefetch_k = _segment_block_sparse_schedule(
+        block_mask = _segment_block_sparse_schedule(
             segment_ids,
             segment_ids,
             block_q=4,
@@ -110,16 +110,6 @@ class TestFlashAttentionKernel(unittest.TestCase):
                 [
                     [[1, 0], [0, 1]],
                     [[1, 0], [0, 0]],
-                ],
-                dtype=np.int32,
-            ),
-        )
-        np.testing.assert_array_equal(
-            prefetch_k,
-            np.asarray(
-                [
-                    [[0, 0], [1, 1]],
-                    [[0, 0], [0, 0]],
                 ],
                 dtype=np.int32,
             ),

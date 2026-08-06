@@ -21,9 +21,9 @@ DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 NUM_LANES = 128
 NUM_SUBLANES = 8
 
-# The two int32 schedule tensors are scalar-prefetched into TPU SMEM.  Keep
-# their combined footprint bounded (2 * 8192 * 4 bytes == 64 KiB) and fall
-# back to the dense segmented grid for larger untuned shapes.
+# The int32 block mask is scalar-prefetched into TPU SMEM. Keep its footprint
+# bounded (8192 * 4 bytes == 32 KiB) and fall back to the dense segmented grid
+# for larger untuned shapes.
 _MAX_BLOCK_SPARSE_PREFETCH_ENTRIES = 8192
 
 
@@ -381,8 +381,8 @@ def _segment_block_sparse_schedule(
     *,
     block_q: int,
     block_k_major: int,
-) -> tuple[jax.Array, jax.Array]:
-    """Build exact-safe block overlap and next-valid-K prefetch schedules.
+) -> jax.Array:
+    """Build an exact-safe block-overlap schedule.
 
     Range overlap can produce false positives for non-monotonic IDs, which only
     costs extra work.  It cannot produce false negatives when a segment ID is
@@ -397,17 +397,7 @@ def _segment_block_sparse_schedule(
         & (kv_min[:, None, :] <= q_max[:, :, None])
     )
 
-    num_kv_blocks = block_mask.shape[-1]
-    kv_indices = jnp.arange(num_kv_blocks, dtype=jnp.int32)
-    candidates = jnp.where(block_mask, kv_indices, num_kv_blocks)
-    next_k = jax.lax.associative_scan(
-        jnp.minimum,
-        candidates,
-        axis=candidates.ndim - 1,
-        reverse=True,
-    )
-    prefetch_k = jnp.where(next_k < num_kv_blocks, next_k, 0).astype(jnp.int32)
-    return block_mask.astype(jnp.int32), prefetch_k
+    return block_mask.astype(jnp.int32)
 
 
 def _flash_attention_kernel(q_tile_ref, *args, **kwargs):
@@ -423,13 +413,11 @@ def _flash_attention_kernel(q_tile_ref, *args, **kwargs):
 
 def _flash_attention_block_sparse_kernel(
     block_mask_ref,
-    prefetch_k_ref,
     q_tile_ref,
     *args,
     **kwargs,
 ):
     """Flash wrapper that suppresses Q/K block pairs absent from the schedule."""
-    del prefetch_k_ref
     block_b = q_tile_ref.shape[0]
     for batch_idx in range(block_b):
         _flash_attention_kernel_single_batch(
@@ -711,13 +699,13 @@ def _flash_attention_impl(
         and block_sparse_entries <= _MAX_BLOCK_SPARSE_PREFETCH_ENTRIES
     )
     if use_block_sparse_segments:
-        block_mask, prefetch_k = _segment_block_sparse_schedule(
+        block_mask = _segment_block_sparse_schedule(
             segment_ids.q,
             segment_ids.kv,
             block_q=block_q,
             block_k_major=block_k_major,
         )
-        scalar_prefetches = (block_mask, prefetch_k)
+        scalar_prefetches = (block_mask,)
     else:
         scalar_prefetches = ()
 
@@ -740,10 +728,8 @@ def _flash_attention_impl(
         kv_seq_index,
         *scalar_prefetch,
     ):
-        if use_block_sparse_segments:
-            _, prefetch_k_ref = scalar_prefetch
-            next_kv_index = prefetch_k_ref[batch_index, q_seq_index, kv_seq_index]
-        elif causal:
+        del scalar_prefetch
+        if causal:
             # If the kv block is skipped, prefetch the next valid kv block, i.e. the
             # 0th one to be used for the next block_q rows.
             next_kv_index = lax.select(
@@ -854,10 +840,8 @@ def _flash_attention_impl(
             *scalar_prefetch,
         ):
             del head_index
-            if use_block_sparse_segments:
-                _, prefetch_k_ref = scalar_prefetch
-                next_kv_index = prefetch_k_ref[batch_index, q_seq_index, kv_seq_index]
-            elif causal:
+            del scalar_prefetch
+            if causal:
                 next_kv_index = lax.select(
                     below_or_on_diag(q_seq_index, block_q, kv_seq_index, block_k_major),
                     kv_seq_index,
