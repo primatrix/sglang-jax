@@ -10,6 +10,7 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 
 from sgl_jax.srt.layers.embeddings import Embed
 from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.multimodal.kernels.varlen_attention import varlen_attention
 
 
 class Vision3DPatchEmbed(nnx.Module):
@@ -186,6 +187,10 @@ class VisionAttention(nnx.Module):
         hidden_states: jax.Array,  # (seq_len, hidden_size)
         position_ids: jax.Array,  # (seq_len, 2)
         attention_mask: jax.Array | None = None,
+        *,
+        cu_seqlens: jax.Array | None = None,
+        attention_sink: jax.Array | None = None,
+        window_size: tuple[int, int] = (-1, -1),
     ) -> jax.Array:
         """
         Forward pass of vision attention.
@@ -193,7 +198,10 @@ class VisionAttention(nnx.Module):
         Args:
             hidden_states: (seq_len, hidden_size)
             position_ids: (seq_len, 2) - 2D spatial positions
-            attention_mask: Optional attention mask
+            attention_mask: Optional additive dense mask for compatibility.
+            cu_seqlens: Preferred packed sequence boundaries for sparse attention.
+            attention_sink: Optional per-head phantom-token logits.
+            window_size: Inclusive (left, right) local-attention bounds.
 
         Returns:
             output: (seq_len, hidden_size)
@@ -216,28 +224,80 @@ class VisionAttention(nnx.Module):
         cos, sin = jnp.cos(emb), jnp.sin(emb)
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
-        # Scaled dot-product attention (post-scaling to match PyTorch's eager_attention_forward)
-        q_t = jnp.transpose(q, (1, 0, 2))  # (heads, q_len, head_dim)
-        k_t = jnp.transpose(k, (1, 0, 2))  # (heads, k_len, head_dim)
-        attn_weights = jax.lax.dot_general(
-            q_t,
-            k_t,
-            (((2,), (2,)), ((0,), (0,))),
-            precision=Precision.HIGHEST,
-        )
-        attn_weights = attn_weights * self.scaling
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-        # Compute softmax in float32 for numerical stability
-        attn_weights = jax.nn.softmax(attn_weights.astype(jnp.float32), axis=-1).astype(q.dtype)
-        v_t = jnp.transpose(v, (1, 0, 2))  # (heads, k_len, head_dim)
-        attn_output = jax.lax.dot_general(
-            attn_weights,
-            v_t,
-            (((2,), (1,)), ((0,), (0,))),
-            precision=Precision.HIGHEST,
-        )
-        attn_output = jnp.transpose(attn_output, (1, 0, 2))  # (q_len, heads, head_dim)
+        if cu_seqlens is None:
+            # Compatibility path for direct callers that still provide an
+            # additive dense mask. The encoder itself always uses cu_seqlens.
+            q_t = jnp.transpose(q, (1, 0, 2))
+            k_t = jnp.transpose(k, (1, 0, 2))
+            attn_weights = jax.lax.dot_general(
+                q_t,
+                k_t,
+                (((2,), (2,)), ((0,), (0,))),
+                precision=Precision.HIGHEST,
+            )
+            attn_weights = attn_weights * self.scaling
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask
+            attn_weights = jax.nn.softmax(attn_weights.astype(jnp.float32), axis=-1).astype(q.dtype)
+            v_t = jnp.transpose(v, (1, 0, 2))
+            attn_output = jax.lax.dot_general(
+                attn_weights,
+                v_t,
+                (((2,), (1,)), ((0,), (0,))),
+                precision=Precision.HIGHEST,
+            )
+            attn_output = jnp.transpose(attn_output, (1, 0, 2))
+        elif jax.default_backend() == "cpu":
+            num_seqs = jnp.sum(jnp.diff(cu_seqlens) > 0, dtype=jnp.int32).reshape(1)
+            attn_output = varlen_attention(
+                q,
+                k,
+                v,
+                cu_seqlens,
+                num_seqs,
+                sm_scale=self.scaling,
+                window_size=window_size,
+                attention_sink=attention_sink,
+                interpret=True,
+            )
+        else:
+            num_seqs = jnp.sum(jnp.diff(cu_seqlens) > 0, dtype=jnp.int32).reshape(1)
+            qkv_spec = P(None, "tensor", None)
+            if attention_sink is None:
+                local_attention = jax.shard_map(
+                    lambda local_q, local_k, local_v, local_cu, local_ns: varlen_attention(
+                        local_q,
+                        local_k,
+                        local_v,
+                        local_cu,
+                        local_ns,
+                        sm_scale=self.scaling,
+                        window_size=window_size,
+                    ),
+                    mesh=self.mesh,
+                    in_specs=(qkv_spec, qkv_spec, qkv_spec, P(), P()),
+                    out_specs=qkv_spec,
+                    check_vma=False,
+                )
+                attn_output = local_attention(q, k, v, cu_seqlens, num_seqs)
+            else:
+                local_attention = jax.shard_map(
+                    lambda local_q, local_k, local_v, local_cu, local_ns, local_sink: varlen_attention(
+                        local_q,
+                        local_k,
+                        local_v,
+                        local_cu,
+                        local_ns,
+                        sm_scale=self.scaling,
+                        window_size=window_size,
+                        attention_sink=local_sink,
+                    ),
+                    mesh=self.mesh,
+                    in_specs=(qkv_spec, qkv_spec, qkv_spec, P(), P(), P("tensor")),
+                    out_specs=qkv_spec,
+                    check_vma=False,
+                )
+                attn_output = local_attention(q, k, v, cu_seqlens, num_seqs, attention_sink)
 
         # Reshape with explicit sharding for TP compatibility
         attn_output = jax.lax.reshape(
@@ -359,6 +419,10 @@ class VisionTransformerBlock(nnx.Module):
         hidden_states: jax.Array,
         position_ids: jax.Array,
         attention_mask: jax.Array | None = None,
+        *,
+        cu_seqlens: jax.Array | None = None,
+        attention_sink: jax.Array | None = None,
+        window_size: tuple[int, int] = (-1, -1),
     ) -> jax.Array:
         """
         Forward pass of transformer block.
@@ -366,14 +430,24 @@ class VisionTransformerBlock(nnx.Module):
         Args:
             hidden_states: (seq_len, hidden_size)
             position_ids: (seq_len, 2)
-            attention_mask: Optional mask
+            attention_mask: Optional additive dense mask for compatibility.
+            cu_seqlens: Preferred packed sequence boundaries for sparse attention.
+            attention_sink: Optional per-head phantom-token logits.
+            window_size: Inclusive (left, right) local-attention bounds.
 
         Returns:
             hidden_states: (seq_len, hidden_size)
         """
         residual = hidden_states
         hidden_states = self.norm1(hidden_states)
-        hidden_states = self.attn(hidden_states, position_ids, attention_mask)
+        hidden_states = self.attn(
+            hidden_states,
+            position_ids,
+            attention_mask,
+            cu_seqlens=cu_seqlens,
+            attention_sink=attention_sink,
+            window_size=window_size,
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -758,6 +832,14 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
 
         return mask
 
+    def _create_cu_seqlens(self, grid_thw: jax.Array) -> jax.Array:
+        """Build packed per-frame boundaries without a quadratic dense mask."""
+        sequence_lengths = []
+        for t, h, w in grid_thw:
+            sequence_lengths.extend([int(h) * int(w)] * int(t))
+        lengths = jnp.asarray(sequence_lengths, dtype=jnp.int32)
+        return jnp.concatenate((jnp.zeros((1,), dtype=jnp.int32), jnp.cumsum(lengths)))
+
     def _validate_input_shapes(self, grid_thw: jax.Array):
         """
         Validate that input dimensions are divisible by spatial_merge_size.
@@ -812,8 +894,9 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
         # 3. Compute 2D position IDs for RoPE
         position_ids = self.compute_2d_position_ids(grid_thw)
 
-        # 4. Create attention mask
-        attention_mask = self._create_attention_mask(grid_thw)
+        # 4. Compact frame boundaries. The ragged kernel uses these to skip
+        # cross-frame Q/K blocks without constructing a [patches, patches] mask.
+        cu_seqlens = self._create_cu_seqlens(grid_thw)
 
         # 5. Through Transformer Blocks
         deepstack_features = []
@@ -821,7 +904,7 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
             hidden_states = block(
                 hidden_states=hidden_states,
                 position_ids=position_ids,
-                attention_mask=attention_mask,
+                cu_seqlens=cu_seqlens,
             )
 
             # Extract deepstack features
