@@ -151,7 +151,11 @@ class ModelWorkerClient:
             )
             self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
 
-    def resolve_last_batch_result(self, launch_done: threading.Event | None = None):
+    def resolve_last_batch_result(
+        self,
+        launch_done: threading.Event | None = None,
+        materialize_next_token_ids: bool = True,
+    ):
         """
         This function is called to resolve the last batch result and
         wait for the current batch to be launched. Used in overlap mode.
@@ -160,6 +164,11 @@ class ModelWorkerClient:
         parallel, then materializes them. This lets the four arrays we need
         overlap on PCIe rather than serializing the per-array sync that
         jax.device_get does.
+
+        When ``materialize_next_token_ids`` is False the sampled tokens are
+        left on device (the caller resolves them later through the relay map)
+        and ``None`` is returned in their place; the logprob/hidden-state
+        copies still run.
         """
         _r0 = time.perf_counter()
         _, logits_output, next_token_ids, cache_miss_count = self.output_queue.get()
@@ -180,7 +189,10 @@ class ModelWorkerClient:
             if logits_output.hidden_states is not None
             else None
         )
-        next_token_ids = jax.device_get(next_token_ids).tolist()
+        if materialize_next_token_ids:
+            next_token_ids = jax.device_get(next_token_ids).tolist()
+        else:
+            next_token_ids = None
 
         # Step 2: materialize. The first np.asarray waits for that array's
         # copy; the others have been making progress in parallel.
