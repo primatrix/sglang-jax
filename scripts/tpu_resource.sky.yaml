@@ -1,11 +1,11 @@
 # Launch TPU resources for development with SkyPilot command:
 #   sky launch tpu_resource.sky.yaml
 resources:
-  accelerators: $ACCELERATOR
+  accelerators: tpu-v6e-1
+  region: asia
   accelerator_args:
       tpu_vm: True
       runtime_version: v2-alpha-tpuv6e
-  use_spot: True # The default instance is spot.
 
 setup: |
   if [ -d "sglang-jax" ]; then pip uninstall -y sgl-jax || true && rm -rf sglang-jax; fi

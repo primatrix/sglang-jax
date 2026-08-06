@@ -1,6 +1,7 @@
 # adapted from https://github.com/jax-ml/jax/blob/main/jax/experimental/pallas/ops/tpu/flash_attention.py
 # ruff: noqa: E741
 """Flash Attention TPU kernel."""
+
 from __future__ import annotations
 
 import dataclasses
@@ -19,6 +20,11 @@ from sgl_jax.srt.multimodal.kernels.tuned_block_sizes import get_tuned_block_siz
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 NUM_LANES = 128
 NUM_SUBLANES = 8
+
+# The two int32 schedule tensors are scalar-prefetched into TPU SMEM.  Keep
+# their combined footprint bounded (2 * 8192 * 4 bytes == 64 KiB) and fall
+# back to the dense segmented grid for larger untuned shapes.
+_MAX_BLOCK_SPARSE_PREFETCH_ENTRIES = 8192
 
 
 class SegmentIds(NamedTuple):
@@ -69,7 +75,7 @@ class BlockSizes:
                 )
             if major % minor != 0:
                 raise ValueError(
-                    f"{prefix}{suffix}={minor} should divide" f" {prefix}_major{suffix}={major}"
+                    f"{prefix}{suffix}={minor} should divide {prefix}_major{suffix}={major}"
                 )
 
         verify_major_minor("block_k", "", self.block_k_major, self.block_k)
@@ -121,6 +127,7 @@ class BlockSizes:
         "debug",
         "interpret",
         "vmem_limit_bytes",
+        "block_sparse_segments",
     ],
 )
 def flash_attention(
@@ -136,7 +143,17 @@ def flash_attention(
     debug: bool = False,
     interpret: bool = False,  # interpret=True for cpu
     vmem_limit_bytes: int = 128 * 1024 * 1024,
+    block_sparse_segments: bool = False,
 ):
+    """Compute FlashAttention with an optional block-sparse segment schedule.
+
+    ``block_sparse_segments`` is an execution optimization for packed,
+    non-causal self-attention.  It skips Q/K major-block pairs whose
+    non-negative segment-id ranges cannot overlap, while the existing
+    token-level segment equality mask preserves exact results inside every
+    scheduled pair.  Oversized schedules safely fall back to dense segmented
+    FlashAttention.
+    """
     batch_size, num_heads, q_seq_len, d_model = q.shape
     batch_size_k, num_heads_k, kv_seq_len, d_model_k = k.shape
     batch_size_v, num_heads_v, kv_seq_len_v, d_model_v = v.shape
@@ -152,7 +169,7 @@ def flash_attention(
         )
     if d_model != d_model_k:
         raise ValueError(
-            f"Model dimension mismatch: got {d_model} and {d_model_k} (for q and k" " respectively)"
+            f"Model dimension mismatch: got {d_model} and {d_model_k} (for q and k respectively)"
         )
     if d_model != d_model_v:
         raise NotImplementedError("V model dimension unequal to KV model dimension unsupported")
@@ -174,10 +191,28 @@ def flash_attention(
                 f"KV segment ids shape mismatch: expected ({batch_size=},"
                 f" {kv_seq_len=},), got {segment_ids.kv.shape}"
             )
+    if block_sparse_segments:
+        if segment_ids is None:
+            raise ValueError("block_sparse_segments requires segment_ids")
+        if not jnp.issubdtype(segment_ids.q.dtype, jnp.integer) or not jnp.issubdtype(
+            segment_ids.kv.dtype, jnp.integer
+        ):
+            raise ValueError("block_sparse_segments requires integer segment_ids")
+        if q_seq_len != kv_seq_len:
+            raise ValueError("block_sparse_segments requires equal Q and KV sequence lengths")
+        if causal:
+            raise ValueError("block_sparse_segments is only supported for non-causal attention")
+        if ab is not None:
+            raise ValueError("block_sparse_segments is not supported with attention bias")
     if block_sizes is None:
-        block_sizes = BlockSizes.get_default(batch_size, num_heads, q_seq_len, kv_seq_len, d_model)
+        if block_sparse_segments:
+            block_sizes = _get_block_sparse_default_block_sizes(q_seq_len, kv_seq_len)
+        else:
+            block_sizes = BlockSizes.get_default(
+                batch_size, num_heads, q_seq_len, kv_seq_len, d_model
+            )
         # todo: tune the block sizes properly.
-        if kv_seq_len <= 92800:
+        if not block_sparse_segments and kv_seq_len <= 92800:
             # Override block_k/block_k_major to use `_flash_attention_kernel_single_batch_single_step`.
             bq = get_tuned_block_sizes(
                 q.dtype, k.dtype, v.dtype, batch_size, num_heads, q_seq_len, kv_seq_len, d_model
@@ -201,6 +236,7 @@ def flash_attention(
         debug,
         interpret,
         vmem_limit_bytes,
+        block_sparse_segments,
     )
 
 
@@ -217,6 +253,7 @@ def _flash_attention(
     debug,
     interpret,
     vmem_limit_bytes,
+    block_sparse_segments,
 ):
     return _flash_attention_impl(
         q,
@@ -234,6 +271,7 @@ def _flash_attention(
         debug,
         interpret,
         vmem_limit_bytes,
+        block_sparse_segments,
     )
 
 
@@ -248,10 +286,27 @@ def _flash_attention_fwd(
     sm_scale,
     block_sizes,
     debug,
+    interpret=False,
+    vmem_limit_bytes=128 * 1024 * 1024,
+    block_sparse_segments=False,
 ):
     if save_residuals:
         raise NotImplementedError("Higher-order AD not supported")
-    o, l, m = _flash_attention(q, k, v, ab, segment_ids, True, causal, sm_scale, block_sizes, debug)
+    o, l, m = _flash_attention(
+        q,
+        k,
+        v,
+        ab,
+        segment_ids,
+        True,
+        causal,
+        sm_scale,
+        block_sizes,
+        debug,
+        interpret,
+        vmem_limit_bytes,
+        block_sparse_segments,
+    )
     return o, (q, k, v, ab, segment_ids, o, l, m)
 
 
@@ -265,6 +320,91 @@ def below_or_on_diag(r, r_blk_size, c, c_blk_size):
     return ((r + 1) * r_blk_size - 1) > (c * c_blk_size)
 
 
+def _get_block_sparse_default_block_sizes(q_seq_len: int, kv_seq_len: int) -> BlockSizes:
+    """Choose a bounded-VMEM default for segmented block-sparse attention."""
+    if q_seq_len < MIN_BLOCK_SIZE or kv_seq_len % MIN_BLOCK_SIZE:
+        raise ValueError(
+            "block-sparse FlashAttention requires Q length >= 128 and "
+            f"KV length divisible by 128, got {q_seq_len=} and {kv_seq_len=}"
+        )
+
+    # The larger configuration was the best measured v6e point for packed
+    # totals >= 8K.  The smaller configuration avoids excessive padding and
+    # compile time for short inputs.
+    if q_seq_len >= 8192 and kv_seq_len % 512 == 0:
+        target_block_q = 1024
+        block_k_major = 512
+    else:
+        target_block_q = 512
+        block_k_major = 256 if kv_seq_len % 256 == 0 else 128
+    block_q = min(target_block_q, (q_seq_len // MIN_BLOCK_SIZE) * MIN_BLOCK_SIZE)
+    return BlockSizes(
+        block_q=block_q,
+        block_k_major=block_k_major,
+        block_k=MIN_BLOCK_SIZE,
+        block_b=1,
+    )
+
+
+def _segment_block_ranges(
+    segment_ids: jax.Array,
+    block_size: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Return inclusive non-negative segment-id ranges for every token block."""
+    batch_size, sequence_length = segment_ids.shape
+    num_blocks = pl.cdiv(sequence_length, block_size)
+    padded_length = num_blocks * block_size
+    if padded_length != sequence_length:
+        segment_ids = jnp.pad(
+            segment_ids,
+            ((0, 0), (0, padded_length - sequence_length)),
+            constant_values=-1,
+        )
+    blocks = segment_ids.reshape(batch_size, num_blocks, block_size)
+    valid = blocks >= 0
+    minimum = jnp.min(
+        jnp.where(valid, blocks, jnp.iinfo(jnp.int32).max),
+        axis=-1,
+    )
+    maximum = jnp.max(jnp.where(valid, blocks, -1), axis=-1)
+    return minimum, maximum, jnp.any(valid, axis=-1)
+
+
+def _segment_block_sparse_schedule(
+    q_segment_ids: jax.Array,
+    kv_segment_ids: jax.Array,
+    *,
+    block_q: int,
+    block_k_major: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Build exact-safe block overlap and next-valid-K prefetch schedules.
+
+    Range overlap can produce false positives for non-monotonic IDs, which only
+    costs extra work.  It cannot produce false negatives when a segment ID is
+    shared, and the token-level equality mask remains authoritative.
+    """
+    q_min, q_max, q_valid = _segment_block_ranges(q_segment_ids, block_q)
+    kv_min, kv_max, kv_valid = _segment_block_ranges(kv_segment_ids, block_k_major)
+    block_mask = (
+        q_valid[:, :, None]
+        & kv_valid[:, None, :]
+        & (q_min[:, :, None] <= kv_max[:, None, :])
+        & (kv_min[:, None, :] <= q_max[:, :, None])
+    )
+
+    num_kv_blocks = block_mask.shape[-1]
+    kv_indices = jnp.arange(num_kv_blocks, dtype=jnp.int32)
+    candidates = jnp.where(block_mask, kv_indices, num_kv_blocks)
+    next_k = jax.lax.associative_scan(
+        jnp.minimum,
+        candidates,
+        axis=candidates.ndim - 1,
+        reverse=True,
+    )
+    prefetch_k = jnp.where(next_k < num_kv_blocks, next_k, 0).astype(jnp.int32)
+    return block_mask.astype(jnp.int32), prefetch_k
+
+
 def _flash_attention_kernel(q_tile_ref, *args, **kwargs):
     block_b = q_tile_ref.shape[0]
     # If we're not going to tile the softmax, then we can avoid a bunch of VPU ops.
@@ -274,6 +414,26 @@ def _flash_attention_kernel(q_tile_ref, *args, **kwargs):
         kernel = _flash_attention_kernel_single_batch
     for batch_idx in range(block_b):
         kernel((batch_idx, 0), q_tile_ref, *args, **kwargs)
+
+
+def _flash_attention_block_sparse_kernel(
+    block_mask_ref,
+    prefetch_k_ref,
+    q_tile_ref,
+    *args,
+    **kwargs,
+):
+    """Flash wrapper that suppresses Q/K block pairs absent from the schedule."""
+    del prefetch_k_ref
+    block_b = q_tile_ref.shape[0]
+    for batch_idx in range(block_b):
+        _flash_attention_kernel_single_batch(
+            (batch_idx, 0),
+            q_tile_ref,
+            *args,
+            block_mask_ref=block_mask_ref,
+            **kwargs,
+        )
 
 
 def _flash_attention_kernel_single_batch(
@@ -296,6 +456,7 @@ def _flash_attention_kernel_single_batch(
     block_k,
     kv_seq_len,
     mask_value,
+    block_mask_ref=None,
 ):
     block_k_major = k_tile_ref.shape[2]
     block_q = q_tile_ref.shape[2]
@@ -310,7 +471,13 @@ def _flash_attention_kernel_single_batch(
         acc_scratch_ref[batch_idx] = jnp.zeros(acc_scratch_ref.shape[2:], jnp.float32)
 
     q_seq_idx = pl.program_id(2)
-    should_run = below_or_on_diag(q_seq_idx, block_q, kv_seq_idx, block_k_major) if causal else True
+    if block_mask_ref is not None:
+        global_batch_idx = pl.program_id(0) * q_tile_ref.shape[0] + batch_idx[0]
+        should_run = block_mask_ref[global_batch_idx, q_seq_idx, kv_seq_idx] != 0
+    else:
+        should_run = (
+            below_or_on_diag(q_seq_idx, block_q, kv_seq_idx, block_k_major) if causal else True
+        )
 
     @pl.when(should_run)
     def run():
@@ -518,6 +685,7 @@ def _flash_attention_impl(
     debug,
     interpret,
     vmem_limit_bytes,
+    block_sparse_segments,
 ):
     batch_size, num_heads, q_seq_len, head_dim = q.shape
     _, _, kv_seq_len, _ = k.shape
@@ -526,19 +694,51 @@ def _flash_attention_impl(
     _verify_block("block_k", "kv_seq_len", block_k, kv_seq_len)
     _verify_block("block_b", "batch", block_b, batch_size, should_divide=False)
 
+    if block_sparse_segments and block_b != 1:
+        raise ValueError("block_sparse_segments requires block_b=1")
+
+    num_q_blocks = pl.cdiv(q_seq_len, block_q)
+    num_kv_blocks = kv_seq_len // block_k_major
+    block_sparse_entries = batch_size * num_q_blocks * num_kv_blocks
+    use_block_sparse_segments = (
+        block_sparse_segments
+        and block_k != kv_seq_len
+        and block_sparse_entries <= _MAX_BLOCK_SPARSE_PREFETCH_ENTRIES
+    )
+    if use_block_sparse_segments:
+        block_mask, prefetch_k = _segment_block_sparse_schedule(
+            segment_ids.q,
+            segment_ids.kv,
+            block_q=block_q,
+            block_k_major=block_k_major,
+        )
+        scalar_prefetches = (block_mask, prefetch_k)
+    else:
+        scalar_prefetches = ()
+
     # TODO(apaszke): Tile over heads as well.
     grid = (
         pl.cdiv(batch_size, block_b),
         num_heads,
-        pl.cdiv(q_seq_len, block_q),
-        kv_seq_len // block_k_major,
+        num_q_blocks,
+        num_kv_blocks,
     )
 
-    def q_index_map(batch_index, head_index, q_seq_index, _):
+    def q_index_map(batch_index, head_index, q_seq_index, _, *scalar_prefetch):
+        del scalar_prefetch
         return (batch_index, head_index, q_seq_index, 0)
 
-    def kv_index_map(batch_index, head_index, q_seq_index, kv_seq_index):
-        if causal:
+    def kv_index_map(
+        batch_index,
+        head_index,
+        q_seq_index,
+        kv_seq_index,
+        *scalar_prefetch,
+    ):
+        if use_block_sparse_segments:
+            _, prefetch_k_ref = scalar_prefetch
+            next_kv_index = prefetch_k_ref[batch_index, q_seq_index, kv_seq_index]
+        elif causal:
             # If the kv block is skipped, prefetch the next valid kv block, i.e. the
             # 0th one to be used for the next block_q rows.
             next_kv_index = lax.select(
@@ -550,7 +750,14 @@ def _flash_attention_impl(
             next_kv_index = kv_seq_index
         return (batch_index, head_index, next_kv_index, 0)
 
-    def ab_index_map(batch_index, head_index, q_seq_index, kv_seq_index):
+    def ab_index_map(
+        batch_index,
+        head_index,
+        q_seq_index,
+        kv_seq_index,
+        *scalar_prefetch,
+    ):
+        del scalar_prefetch
         if causal:
             should_run = below_or_on_diag(q_seq_index, block_q, kv_seq_index, block_k_major)
             # If the ab block is skipped, prefetch the next valid ab block, i.e. the
@@ -567,14 +774,20 @@ def _flash_attention_impl(
 
         return (batch_index, head_index, next_q_index, next_kv_index)
 
-    def o_index_map(batch_index, head_index, q_seq_index, _):
+    def o_index_map(batch_index, head_index, q_seq_index, _, *scalar_prefetch):
+        del scalar_prefetch
         return (batch_index, head_index, q_seq_index, 0)
 
-    def lm_index_map(batch_index, head_index, q_seq_index, _):
+    def lm_index_map(batch_index, head_index, q_seq_index, _, *scalar_prefetch):
+        del scalar_prefetch
         return (batch_index, head_index, q_seq_index, 0)
 
     kernel = functools.partial(
-        _flash_attention_kernel,
+        (
+            _flash_attention_block_sparse_kernel
+            if use_block_sparse_segments
+            else _flash_attention_kernel
+        ),
         causal=causal,
         mask_value=DEFAULT_MASK_VALUE,
         sm_scale=sm_scale,
@@ -618,13 +831,28 @@ def _flash_attention_impl(
     q_segment_ids = kv_segment_ids = None
     if segment_ids is not None:
 
-        def q_segment_ids_index_map(batch_index, head_index, q_seq_index, _):
-            del head_index
+        def q_segment_ids_index_map(
+            batch_index,
+            head_index,
+            q_seq_index,
+            _,
+            *scalar_prefetch,
+        ):
+            del head_index, scalar_prefetch
             return (batch_index, q_seq_index, 0)
 
-        def kv_segment_ids_index_map(batch_index, head_index, q_seq_index, kv_seq_index):
+        def kv_segment_ids_index_map(
+            batch_index,
+            head_index,
+            q_seq_index,
+            kv_seq_index,
+            *scalar_prefetch,
+        ):
             del head_index
-            if causal:
+            if use_block_sparse_segments:
+                _, prefetch_k_ref = scalar_prefetch
+                next_kv_index = prefetch_k_ref[batch_index, q_seq_index, kv_seq_index]
+            elif causal:
                 next_kv_index = lax.select(
                     below_or_on_diag(q_seq_index, block_q, kv_seq_index, block_k_major),
                     kv_seq_index,
@@ -668,7 +896,7 @@ def _flash_attention_impl(
     o, *aux = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=0,
+            num_scalar_prefetch=len(scalar_prefetches),
             grid=grid,
             in_specs=in_specs,
             out_specs=out_specs,
@@ -697,7 +925,7 @@ def _flash_attention_impl(
             kernel_inputs_specs=(q, k, v, ab, q_segment_ids, kv_segment_ids),
             kernel_outputs_specs=out_shape,
         ),
-    )(q, k, v, ab, q_segment_ids, kv_segment_ids)
+    )(*scalar_prefetches, q, k, v, ab, q_segment_ids, kv_segment_ids)
     if save_residuals:
         l, m = (v[..., 0] for v in aux[-2:])
         return (o, l, m)

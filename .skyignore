@@ -1,0 +1,10 @@
+.git/
+.venv/
+python/.venv/
+work_dirs/
+xprof/
+artifacts/
+test-logs/
+**/__pycache__/
+*.pyc
+.DS_Store
