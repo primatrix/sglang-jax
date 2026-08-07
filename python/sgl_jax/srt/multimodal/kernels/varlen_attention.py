@@ -350,15 +350,16 @@ def _prepare_mha_layout(
     v: jax.Array,
     attention_sink: jax.Array | float | None,
     *,
-    bq_sz: int,
-    bkv_sz: int,
+    bq_size: int,
+    bkv_size: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array | None, int, int]:
     """Build token-major exact-head Q/O and interleaved word-packed K/V."""
     original_q_capacity, num_heads, actual_head_dim = q.shape
+    original_kv_capacity = k.shape[0]
     padded_head_dim = _align_to(actual_head_dim, 128)
     q_internal = jnp.pad(
         q,
-        ((0, bq_sz - 1), (0, 0), (0, padded_head_dim - actual_head_dim)),
+        ((0, bq_size - 1), (0, 0), (0, padded_head_dim - actual_head_dim)),
         constant_values=0,
     )
 
@@ -373,20 +374,16 @@ def _prepare_mha_layout(
     actual_combined_kv_heads = 2 * num_heads
     padded_combined_kv_heads = _align_to(actual_combined_kv_heads, kv_packing)
     # K0,V0,K1,V1,... makes K and V for one head share one BF16 word.
-    kv_interleaved = jnp.stack((k, v), axis=2).reshape(
-        k.shape[0], actual_combined_kv_heads, actual_head_dim
-    )
-    kv_padded = jnp.pad(
-        kv_interleaved,
+    kv_internal = jnp.pad(
+        jnp.concat([k, v], axis=-1).reshape(k.shape[0], actual_combined_kv_heads, actual_head_dim),
         (
-            (0, bkv_sz - 1),
+            (0, bkv_size - 1),
             (0, padded_combined_kv_heads - actual_combined_kv_heads),
             (0, padded_head_dim - actual_head_dim),
         ),
         constant_values=0,
-    )
-    kv_internal = kv_padded.reshape(
-        kv_padded.shape[0],
+    ).reshape(
+        original_kv_capacity + bkv_size - 1,
         padded_combined_kv_heads // kv_packing,
         kv_packing,
         padded_head_dim,
@@ -416,10 +413,10 @@ def _mha_kernel(
     # HBM output.
     o_hbm_ref,
     # VMEM scratch.
-    bkv_x2_ref,
-    bq_x2_ref,
-    bo_x2_ref,
-    sems,
+    bkv_dbuf_ref,
+    bq_dbuf_ref,
+    bo_dbuf_ref,
+    dma_sems,
     l_ref,
     m_ref,
     acc_ref,
@@ -430,8 +427,8 @@ def _mha_kernel(
     mask_value: float,
     k_scale: float | None,
     v_scale: float | None,
-    bq_sz: int,
-    bkv_sz: int,
+    bq_size: int,
+    bkv_size: int,
 ):
     """One Pallas program containing all sequence, tile, and head loops."""
     num_seqs = num_seqs_ref[0]
@@ -448,10 +445,10 @@ def _mha_kernel(
             kv_hbm_ref,
             attention_sink_ref,
             o_hbm_ref,
-            bkv_x2_ref,
-            bq_x2_ref,
-            bo_x2_ref,
-            sems,
+            bkv_dbuf_ref,
+            bq_dbuf_ref,
+            bo_dbuf_ref,
+            dma_sems,
             l_ref,
             m_ref,
             acc_ref,
@@ -461,8 +458,8 @@ def _mha_kernel(
             mask_value=mask_value,
             k_scale=k_scale,
             v_scale=v_scale,
-            bq_sz=bq_sz,
-            bkv_sz=bkv_sz,
+            bq_size=bq_size,
+            bkv_size=bkv_size,
         )
 
 
@@ -476,10 +473,10 @@ def _mha_sequence(
     kv_hbm_ref,
     attention_sink_ref,
     o_hbm_ref,
-    bkv_x2_ref,
-    bq_x2_ref,
-    bo_x2_ref,
-    sems,
+    bkv_dbuf_ref,
+    bq_dbuf_ref,
+    bo_dbuf_ref,
+    dma_sems,
     l_ref,
     m_ref,
     acc_ref,
@@ -490,12 +487,12 @@ def _mha_sequence(
     mask_value: float,
     k_scale: float | None,
     v_scale: float | None,
-    bq_sz: int,
-    bkv_sz: int,
+    bq_size: int,
+    bkv_size: int,
 ):
     _, num_heads, head_dim = q_hbm_ref.shape
     _, combined_kv_heads_per_packing, kv_packing, _ = kv_hbm_ref.shape
-    bkv_stride = bkv_x2_ref.shape[2]
+    bkv_stride = bkv_dbuf_ref.shape[2]
     q_dtype = q_hbm_ref.dtype
     kv_dtype = kv_hbm_ref.dtype
     left_window, right_window = window_size
@@ -503,32 +500,32 @@ def _mha_sequence(
     q_start = cu_lens_ref[seq_idx]
     q_end = cu_lens_ref[seq_idx + 1]
     seq_len = q_end - q_start
-    num_bq = pl.cdiv(seq_len, bq_sz)
+    num_bq = pl.cdiv(seq_len, bq_size)
 
     def _fetch_bq(target_seq_idx, bq_idx, sem_idx, *, wait=False):
-        start = cu_lens_ref[target_seq_idx] + bq_idx * bq_sz
+        start = cu_lens_ref[target_seq_idx] + bq_idx * bq_size
         _make_async_copy(
-            q_hbm_ref.at[pl.ds(start, bq_sz)],
-            bq_x2_ref.at[sem_idx],
-            sems.at[1, sem_idx],
+            q_hbm_ref.at[pl.ds(start, bq_size)],
+            bq_dbuf_ref.at[sem_idx],
+            dma_sems.at[1, sem_idx],
             wait,
         )
 
     def _fetch_bkv(target_seq_idx, bkv_idx, sem_idx, *, wait=False):
-        start = cu_lens_ref[target_seq_idx] + bkv_idx * bkv_sz
+        start = cu_lens_ref[target_seq_idx] + bkv_idx * bkv_size
         _make_async_copy(
-            kv_hbm_ref.at[pl.ds(start, bkv_sz)],
-            bkv_x2_ref.at[sem_idx, :, :combined_kv_heads_per_packing],
-            sems.at[0, sem_idx],
+            kv_hbm_ref.at[pl.ds(start, bkv_size)],
+            bkv_dbuf_ref.at[sem_idx, :, :combined_kv_heads_per_packing],
+            dma_sems.at[0, sem_idx],
             wait,
         )
 
     def _send_bo(target_seq_idx, bq_idx, sem_idx, *, wait=False):
-        start = cu_lens_ref[target_seq_idx] + bq_idx * bq_sz
+        start = cu_lens_ref[target_seq_idx] + bq_idx * bq_size
         _make_async_copy(
-            bo_x2_ref.at[sem_idx],
-            o_hbm_ref.at[pl.ds(start, bq_sz)],
-            sems.at[2, sem_idx],
+            bo_dbuf_ref.at[sem_idx],
+            o_hbm_ref.at[pl.ds(start, bq_size)],
+            dma_sems.at[2, sem_idx],
             wait,
         )
 
@@ -562,26 +559,26 @@ def _mha_sequence(
             bo_ids_ref[sem_idx] = -1
 
     def load_bq(sem_idx, head_idx):
-        return bq_x2_ref[sem_idx, :, head_idx, :]
+        return bq_dbuf_ref[sem_idx, :, head_idx, :]
 
     def load_bkv(sem_idx, head_idx):
         packed_ref = (
-            bkv_x2_ref.bitcast(jnp.uint32).at[sem_idx].reshape(bkv_sz * bkv_stride, head_dim)
+            bkv_dbuf_ref.bitcast(jnp.uint32).at[sem_idx].reshape(bkv_size * bkv_stride, head_dim)
         )
         if kv_packing == 1:
             start = head_idx * 2
             k_block = _strided_load(
-                packed_ref, start, bkv_sz * bkv_stride, bkv_stride, dtype=kv_dtype
+                packed_ref, start, bkv_size * bkv_stride, bkv_stride, dtype=kv_dtype
             )
             v_block = _strided_load(
-                packed_ref, start + 1, bkv_sz * bkv_stride, bkv_stride, dtype=kv_dtype
+                packed_ref, start + 1, bkv_size * bkv_stride, bkv_stride, dtype=kv_dtype
             )
             return k_block, v_block
 
         kv_heads_per_word = kv_packing // 2
         word_offset = head_idx // kv_heads_per_word
         kv_idx_in_word = head_idx % kv_heads_per_word
-        packed = _strided_load(packed_ref, word_offset, bkv_sz * bkv_stride, bkv_stride)
+        packed = _strided_load(packed_ref, word_offset, bkv_size * bkv_stride, bkv_stride)
         bitwidth = 32 // kv_packing
         repack_ty = jnp.dtype(f"uint{bitwidth}")
         k_bits = packed >> (kv_idx_in_word * 2 * bitwidth)
@@ -657,7 +654,7 @@ def _mha_sequence(
     previous_seq_idx = jnp.maximum(seq_idx - 1, 0)
     previous_seq_len = q_start - cu_lens_ref[previous_seq_idx]
 
-    @pl.when(jnp.logical_and(seq_idx > 0, jnp.mod(previous_seq_len, bq_sz) != 0))
+    @pl.when(jnp.logical_and(seq_idx > 0, jnp.mod(previous_seq_len, bq_size) != 0))
     def drain_previous_sequence_outputs():
         # A final partial Q tile still issues a full-block DMA.  Drain both
         # output slots before the next packed sequence writes the overlapping
@@ -673,7 +670,7 @@ def _mha_sequence(
             m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
             for head_idx in range(num_heads):
                 sink = attention_sink_ref[head_idx]
-                m_ref.at[head_idx][...] = jnp.tile(sink[None, :], (bq_sz, 1))
+                m_ref.at[head_idx][...] = jnp.tile(sink[None, :], (bq_size, 1))
         else:
             l_ref[...] = jnp.zeros_like(l_ref)
             m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
@@ -686,15 +683,15 @@ def _mha_sequence(
             sem_ids_ref[0] = next_q_sem_idx
             start_fetch_bq(next_seq_idx, next_bq_idx, next_q_sem_idx)
 
-        processed_q = bq_idx * bq_sz
+        processed_q = bq_idx * bq_size
         prune_window_blocks = mask_value == DEFAULT_MASK_VALUE or mask_value == float("-inf")
         start_bkv_idx = 0
         if left_window >= 0 and prune_window_blocks:
-            start_bkv_idx = jnp.maximum(processed_q - left_window, 0) // bkv_sz
+            start_bkv_idx = jnp.maximum(processed_q - left_window, 0) // bkv_size
         iteration_kv_end = seq_len
         if right_window >= 0 and prune_window_blocks:
-            iteration_kv_end = jnp.minimum(seq_len, processed_q + bq_sz + right_window)
-        end_bkv_idx = pl.cdiv(iteration_kv_end, bkv_sz)
+            iteration_kv_end = jnp.minimum(seq_len, processed_q + bq_size + right_window)
+        end_bkv_idx = pl.cdiv(iteration_kv_end, bkv_size)
 
         @pl.loop(start_bkv_idx, end_bkv_idx, unroll=False)
         def loop_kv_block(bkv_idx):
@@ -707,7 +704,7 @@ def _mha_sequence(
             next_seq_for_kv = lax.select(is_last_q, seq_idx + 1, seq_idx)
             next_bkv_idx = lax.select(is_last_bkv, 0, next_bkv_idx)
             if left_window >= 0 and prune_window_blocks:
-                next_q_start_bkv = jnp.maximum(next_q_for_kv * bq_sz - left_window, 0) // bkv_sz
+                next_q_start_bkv = jnp.maximum(next_q_for_kv * bq_size - left_window, 0) // bkv_size
                 next_bkv_idx = lax.select(is_last_bkv, next_q_start_bkv, next_bkv_idx)
             next_kv_sem_idx = 1 - kv_sem_idx
 
@@ -721,12 +718,12 @@ def _mha_sequence(
                 wait_fetch_bq(seq_idx, bq_idx, q_sem_idx)
 
             wait_fetch_bkv(seq_idx, bkv_idx, kv_sem_idx)
-            processed_kv = bkv_idx * bkv_sz
+            processed_kv = bkv_idx * bkv_size
 
             for head_idx in range(num_heads):
                 q_block = load_bq(q_sem_idx, head_idx)
                 k_block, v_block = load_bkv(kv_sem_idx, head_idx)
-                lm_slice = (head_idx, pl.ds(0, bq_sz))
+                lm_slice = (head_idx, pl.ds(0, bq_size))
                 flash_attention_step(
                     q_block,
                     k_block,
@@ -746,7 +743,7 @@ def _mha_sequence(
         bo_sem_idx = sem_ids_ref[2]
         sem_ids_ref[2] = 1 - bo_sem_idx
         wait_send_bo(bo_sem_idx)
-        bo_x2_ref.at[bo_sem_idx][...] = jnp.transpose(out, (1, 0, 2))
+        bo_dbuf_ref.at[bo_sem_idx][...] = jnp.transpose(out, (1, 0, 2))
         start_send_bo(seq_idx, bq_idx, bo_sem_idx)
 
     @pl.when(seq_idx == num_seqs - 1)
@@ -816,8 +813,8 @@ def _mha_attention(
             mask_value=mask_value,
             k_scale=k_scale,
             v_scale=v_scale,
-            bq_sz=num_queries_per_block,
-            bkv_sz=num_kv_per_block,
+            bq_size=num_queries_per_block,
+            bkv_size=num_kv_per_block,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(scalar_prefetches),
@@ -854,12 +851,12 @@ def _prepare_packed_layout(
     v: jax.Array,
     attention_sink: jax.Array | float | None,
     *,
-    bq_sz: int,
-    bkv_sz: int,
+    bq_size: int,
+    bkv_size: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array | None, int, int, int]:
     """Pack Q/KV into complete 32-bit words and reserve static-DMA tail slack."""
     original_q_capacity, actual_num_q_heads, actual_head_dim = q.shape
-    q_capacity = _align_to(original_q_capacity + bq_sz, bq_sz)
+    q_capacity = _align_to(original_q_capacity + bq_size, bq_size)
     q = jnp.pad(q, ((0, q_capacity - original_q_capacity), (0, 0), (0, 0)))
     actual_num_kv_heads = k.shape[1]
     actual_q_per_kv = actual_num_q_heads // actual_num_kv_heads
@@ -891,7 +888,7 @@ def _prepare_packed_layout(
     )
 
     original_kv_capacity = k.shape[0]
-    kv_capacity = _align_to(original_kv_capacity + bkv_sz, bkv_sz)
+    kv_capacity = _align_to(original_kv_capacity + bkv_size, bkv_size)
     k = jnp.pad(k, ((0, kv_capacity - original_kv_capacity), (0, 0), (0, 0)))
     v = jnp.pad(v, ((0, kv_capacity - original_kv_capacity), (0, 0), (0, 0)))
     actual_combined_kv_heads = actual_num_kv_heads * 2
@@ -968,10 +965,10 @@ def _packed_kernel(
     # HBM output.
     o_hbm_ref,
     # VMEM scratch.
-    bkv_x2_ref,
-    bq_x2_ref,
-    bo_x2_ref,
-    sems,
+    bkv_dbuf_ref,
+    bq_dbuf_ref,
+    bo_dbuf_ref,
+    dma_sems,
     l_ref,
     m_ref,
     acc_ref,
@@ -982,8 +979,8 @@ def _packed_kernel(
     mask_value: float,
     k_scale: float | None,
     v_scale: float | None,
-    bq_sz: int,
-    bkv_sz: int,
+    bq_size: int,
+    bkv_size: int,
 ):
     """Single-program wrapper; all sequence/Q/KV/head loops live in the kernel."""
     num_seqs = num_seqs_ref[0]
@@ -1000,10 +997,10 @@ def _packed_kernel(
             kv_hbm_ref,
             attention_sink_ref,
             o_hbm_ref,
-            bkv_x2_ref,
-            bq_x2_ref,
-            bo_x2_ref,
-            sems,
+            bkv_dbuf_ref,
+            bq_dbuf_ref,
+            bo_dbuf_ref,
+            dma_sems,
             l_ref,
             m_ref,
             acc_ref,
@@ -1013,8 +1010,8 @@ def _packed_kernel(
             mask_value=mask_value,
             k_scale=k_scale,
             v_scale=v_scale,
-            bq_sz=bq_sz,
-            bkv_sz=bkv_sz,
+            bq_size=bq_size,
+            bkv_size=bkv_size,
         )
 
 
@@ -1028,10 +1025,10 @@ def _packed_sequence(
     kv_hbm_ref,
     attention_sink_ref,
     o_hbm_ref,
-    bkv_x2_ref,
-    bq_x2_ref,
-    bo_x2_ref,
-    sems,
+    bkv_dbuf_ref,
+    bq_dbuf_ref,
+    bo_dbuf_ref,
+    dma_sems,
     l_ref,
     m_ref,
     acc_ref,
@@ -1042,13 +1039,13 @@ def _packed_sequence(
     mask_value: float,
     k_scale: float | None,
     v_scale: float | None,
-    bq_sz: int,
-    bkv_sz: int,
+    bq_size: int,
+    bkv_size: int,
 ):
     actual_num_kv_heads, _, q_per_kv_per_packing, q_packing, head_dim = q_hbm_ref.shape
     _, _, kv_packing, _ = kv_hbm_ref.shape
     q_per_kv = q_per_kv_per_packing * q_packing
-    bkv_stride = bkv_x2_ref.shape[2]
+    bkv_stride = bkv_dbuf_ref.shape[2]
     q_dtype = q_hbm_ref.dtype
     kv_dtype = kv_hbm_ref.dtype
     left_window, right_window = window_size
@@ -1057,32 +1054,32 @@ def _packed_sequence(
     q_start = cu_lens_ref[seq_idx]
     q_end = cu_lens_ref[seq_idx + 1]
     seq_len = q_end - q_start
-    num_bq = pl.cdiv(seq_len, bq_sz)
+    num_bq = pl.cdiv(seq_len, bq_size)
 
     def _fetch_bq(target_seq_idx, bq_idx, sem_idx, *, wait=False):
-        start = cu_lens_ref[target_seq_idx] + bq_idx * bq_sz
+        start = cu_lens_ref[target_seq_idx] + bq_idx * bq_size
         _make_async_copy(
-            q_hbm_ref.at[:, pl.ds(start, bq_sz)],
-            bq_x2_ref.at[sem_idx],
-            sems.at[1, sem_idx],
+            q_hbm_ref.at[:, pl.ds(start, bq_size)],
+            bq_dbuf_ref.at[sem_idx],
+            dma_sems.at[1, sem_idx],
             wait,
         )
 
     def _fetch_bkv(target_seq_idx, bkv_idx, sem_idx, *, wait=False):
-        start = cu_lens_ref[target_seq_idx] + bkv_idx * bkv_sz
+        start = cu_lens_ref[target_seq_idx] + bkv_idx * bkv_size
         _make_async_copy(
-            kv_hbm_ref.at[pl.ds(start, bkv_sz)],
-            bkv_x2_ref.at[sem_idx, :, :combined_kv_heads_per_packing],
-            sems.at[0, sem_idx],
+            kv_hbm_ref.at[pl.ds(start, bkv_size)],
+            bkv_dbuf_ref.at[sem_idx, :, :combined_kv_heads_per_packing],
+            dma_sems.at[0, sem_idx],
             wait,
         )
 
     def _send_bo(target_seq_idx, bq_idx, sem_idx, *, wait=False):
-        start = cu_lens_ref[target_seq_idx] + bq_idx * bq_sz
+        start = cu_lens_ref[target_seq_idx] + bq_idx * bq_size
         _make_async_copy(
-            bo_x2_ref.at[sem_idx],
-            o_hbm_ref.at[:, pl.ds(start, bq_sz)],
-            sems.at[2, sem_idx],
+            bo_dbuf_ref.at[sem_idx],
+            o_hbm_ref.at[:, pl.ds(start, bq_size)],
+            dma_sems.at[2, sem_idx],
             wait,
         )
 
@@ -1114,30 +1111,30 @@ def _packed_sequence(
 
     def load_bq(sem_idx, kv_head_idx):
         packed_ref = (
-            bq_x2_ref.bitcast(jnp.uint32)
+            bq_dbuf_ref.bitcast(jnp.uint32)
             .at[sem_idx, kv_head_idx]
-            .reshape(bq_sz * q_per_kv_per_packing, head_dim)
+            .reshape(bq_size * q_per_kv_per_packing, head_dim)
         )
-        return _strided_load(packed_ref, 0, bq_sz * q_per_kv_per_packing, 1, dtype=q_dtype)
+        return _strided_load(packed_ref, 0, bq_size * q_per_kv_per_packing, 1, dtype=q_dtype)
 
     def load_bkv(sem_idx, kv_head_idx):
         packed_ref = (
-            bkv_x2_ref.bitcast(jnp.uint32).at[sem_idx].reshape(bkv_sz * bkv_stride, head_dim)
+            bkv_dbuf_ref.bitcast(jnp.uint32).at[sem_idx].reshape(bkv_size * bkv_stride, head_dim)
         )
         if kv_packing == 1:
             start = kv_head_idx * 2
             k_block = _strided_load(
-                packed_ref, start, bkv_sz * bkv_stride, bkv_stride, dtype=kv_dtype
+                packed_ref, start, bkv_size * bkv_stride, bkv_stride, dtype=kv_dtype
             )
             v_block = _strided_load(
-                packed_ref, start + 1, bkv_sz * bkv_stride, bkv_stride, dtype=kv_dtype
+                packed_ref, start + 1, bkv_size * bkv_stride, bkv_stride, dtype=kv_dtype
             )
             return k_block, v_block
 
         kv_heads_per_word = kv_packing // 2
         word_offset = kv_head_idx // kv_heads_per_word
         kv_idx_in_word = kv_head_idx % kv_heads_per_word
-        packed = _strided_load(packed_ref, word_offset, bkv_sz * bkv_stride, bkv_stride)
+        packed = _strided_load(packed_ref, word_offset, bkv_size * bkv_stride, bkv_stride)
         bitwidth = 32 // kv_packing
         repack_ty = jnp.dtype(f"uint{bitwidth}")
         k_bits = packed >> (kv_idx_in_word * 2 * bitwidth)
@@ -1210,7 +1207,7 @@ def _packed_sequence(
     previous_seq_idx = jnp.maximum(seq_idx - 1, 0)
     previous_seq_len = q_start - cu_lens_ref[previous_seq_idx]
 
-    @pl.when(jnp.logical_and(seq_idx > 0, jnp.mod(previous_seq_len, bq_sz) != 0))
+    @pl.when(jnp.logical_and(seq_idx > 0, jnp.mod(previous_seq_len, bq_size) != 0))
     def drain_previous_sequence_outputs():
         wait_send_bo(0)
         wait_send_bo(1)
@@ -1225,7 +1222,9 @@ def _packed_sequence(
             m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
             for kv_head_idx in range(actual_num_kv_heads):
                 sinks = attention_sink_ref[kv_head_idx]
-                m_ref.at[kv_head_idx, pl.ds(0, bq_sz * q_per_kv)][...] = jnp.tile(sinks, (bq_sz, 1))
+                m_ref.at[kv_head_idx, pl.ds(0, bq_size * q_per_kv)][...] = jnp.tile(
+                    sinks, (bq_size, 1)
+                )
         else:
             l_ref[...] = jnp.zeros_like(l_ref)
             m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
@@ -1238,15 +1237,15 @@ def _packed_sequence(
             sem_ids_ref[0] = next_q_sem_idx
             start_fetch_bq(next_seq_idx, next_bq_idx, next_q_sem_idx)
 
-        processed_q = bq_idx * bq_sz
+        processed_q = bq_idx * bq_size
         prune_window_blocks = mask_value == DEFAULT_MASK_VALUE or mask_value == float("-inf")
         start_bkv_idx = 0
         if left_window >= 0 and prune_window_blocks:
-            start_bkv_idx = jnp.maximum(processed_q - left_window, 0) // bkv_sz
+            start_bkv_idx = jnp.maximum(processed_q - left_window, 0) // bkv_size
         iteration_kv_end = seq_len
         if right_window >= 0 and prune_window_blocks:
-            iteration_kv_end = jnp.minimum(seq_len, processed_q + bq_sz + right_window)
-        end_bkv_idx = pl.cdiv(iteration_kv_end, bkv_sz)
+            iteration_kv_end = jnp.minimum(seq_len, processed_q + bq_size + right_window)
+        end_bkv_idx = pl.cdiv(iteration_kv_end, bkv_size)
 
         @pl.loop(start_bkv_idx, end_bkv_idx, unroll=False)
         def loop_kv_block(bkv_idx):
@@ -1259,7 +1258,7 @@ def _packed_sequence(
             next_seq_for_kv = lax.select(is_last_q, seq_idx + 1, seq_idx)
             next_bkv_idx = lax.select(is_last_bkv, 0, next_bkv_idx)
             if left_window >= 0 and prune_window_blocks:
-                next_q_start_bkv = jnp.maximum(next_q_for_kv * bq_sz - left_window, 0) // bkv_sz
+                next_q_start_bkv = jnp.maximum(next_q_for_kv * bq_size - left_window, 0) // bkv_size
                 next_bkv_idx = lax.select(is_last_bkv, next_q_start_bkv, next_bkv_idx)
             next_kv_sem_idx = 1 - kv_sem_idx
 
@@ -1273,12 +1272,12 @@ def _packed_sequence(
                 wait_fetch_bq(seq_idx, bq_idx, q_sem_idx)
 
             wait_fetch_bkv(seq_idx, bkv_idx, kv_sem_idx)
-            processed_kv = bkv_idx * bkv_sz
+            processed_kv = bkv_idx * bkv_size
 
             for kv_head_idx in range(actual_num_kv_heads):
                 q_block = load_bq(q_sem_idx, kv_head_idx)
                 k_block, v_block = load_bkv(kv_sem_idx, kv_head_idx)
-                lm_slice = (kv_head_idx, pl.ds(0, bq_sz * q_per_kv))
+                lm_slice = (kv_head_idx, pl.ds(0, bq_size * q_per_kv))
                 flash_attention_step(
                     q_block,
                     k_block,
@@ -1298,9 +1297,9 @@ def _packed_sequence(
         bo_sem_idx = sem_ids_ref[2]
         sem_ids_ref[2] = 1 - bo_sem_idx
         wait_send_bo(bo_sem_idx)
-        bo_x2_ref.at[bo_sem_idx][...] = out.reshape(
+        bo_dbuf_ref.at[bo_sem_idx][...] = out.reshape(
             actual_num_kv_heads,
-            bq_sz,
+            bq_size,
             q_per_kv_per_packing,
             q_packing,
             head_dim,
@@ -1345,8 +1344,8 @@ def _packed_attention(
         k,
         v,
         attention_sink,
-        bq_sz=num_queries_per_block,
-        bkv_sz=num_kv_per_block,
+        bq_size=num_queries_per_block,
+        bkv_size=num_kv_per_block,
     )
     actual_num_kv_heads, _, q_per_kv_per_packing, q_packing, head_dim = q_internal.shape
     combined_kv_heads_per_packing = kv_internal.shape[1]
@@ -1398,8 +1397,8 @@ def _packed_attention(
             mask_value=mask_value,
             k_scale=k_scale,
             v_scale=v_scale,
-            bq_sz=num_queries_per_block,
-            bkv_sz=num_kv_per_block,
+            bq_size=num_queries_per_block,
+            bkv_size=num_kv_per_block,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(scalar_prefetches),
@@ -1564,8 +1563,8 @@ def varlen_attention(
         k,
         v,
         attention_sink,
-        bq_sz=num_queries_per_block,
-        bkv_sz=num_kv_per_block,
+        bq_size=num_queries_per_block,
+        bkv_size=num_kv_per_block,
     )
     out_internal = _mha_attention(
         q_internal,
