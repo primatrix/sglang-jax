@@ -41,12 +41,17 @@ TUNED_VARLEN_BLOCK_SIZES = {
         ("bfloat16", "bfloat16", "bfloat16", 16, 4096, 4096, 80, "full"): (256, 1024),
         ("bfloat16", "bfloat16", "bfloat16", 16, 8192, 8192, 80, "full"): (256, 1024),
         ("bfloat16", "bfloat16", "bfloat16", 16, 16384, 16384, 80, "full"): (256, 1024),
+        # 32768 reuses the 16384 block sizes: VMEM is bounded by the block tile
+        # (not the total sequence length), so these fit v7x's 64 MiB while the
+        # default 512/512 overflows it. Block sizes carried over, not re-tuned.
+        ("bfloat16", "bfloat16", "bfloat16", 16, 32768, 32768, 80, "full"): (256, 1024),
         ("bfloat16", "bfloat16", "bfloat16", 16, 256, 256, 80, "window"): (128, 256),
         ("bfloat16", "bfloat16", "bfloat16", 16, 1024, 1024, 80, "window"): (128, 256),
         ("bfloat16", "bfloat16", "bfloat16", 16, 2048, 2048, 80, "window"): (128, 256),
         ("bfloat16", "bfloat16", "bfloat16", 16, 4096, 4096, 80, "window"): (128, 256),
         ("bfloat16", "bfloat16", "bfloat16", 16, 8192, 8192, 80, "window"): (128, 256),
         ("bfloat16", "bfloat16", "bfloat16", 16, 16384, 16384, 80, "window"): (128, 256),
+        ("bfloat16", "bfloat16", "bfloat16", 16, 32768, 32768, 80, "window"): (128, 256),
     }
 }
 
