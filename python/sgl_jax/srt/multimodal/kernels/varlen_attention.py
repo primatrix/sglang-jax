@@ -49,6 +49,10 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sgl_jax.srt.multimodal.kernels.varlen_tuned_block_sizes import (
+    get_varlen_tuned_block_sizes,
+)
+
 DEFAULT_MASK_VALUE: Final[float] = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 DEFAULT_Q_BLOCK: Final[int] = 512
 DEFAULT_KV_BLOCK: Final[int] = 512
@@ -984,7 +988,7 @@ def _packed_kernel(
     """Single-program wrapper; all sequence/Q/KV/head loops live in the kernel."""
     num_seqs = num_seqs_ref[0]
 
-    @pl.loop(0, num_seqs, unroll=False)
+    @pl.loop(0, num_seqs)
     def loop_sequence(seq_idx):
         _packed_sequence(
             seq_idx,
@@ -1457,9 +1461,10 @@ def varlen_attention(
     k_scale: float | None = None,
     v_scale: float | None = None,
     attention_sink: jax.Array | float | None = None,
-    num_queries_per_block: int = DEFAULT_Q_BLOCK,
-    num_kv_per_block: int = DEFAULT_KV_BLOCK,
+    num_queries_per_block: int | None = None,
+    num_kv_per_block: int | None = None,
     vmem_limit_bytes: int | None = DEFAULT_VMEM_LIMIT_BYTES,
+    tune_layout: str | None = None,
     interpret: bool = False,
 ) -> jax.Array:
     """Variable-length packed full-prefill attention on TPU.
@@ -1485,6 +1490,26 @@ def varlen_attention(
     has extra capacity beyond the last valid token, that output suffix is
     intentionally unspecified.
     """
+    # Resolve auto (None) block sizes from the tuned table. ``window_size``
+    # discriminates windowed vs full attention (covers the MiMo mask path);
+    # segmentation-window callers may force it via ``tune_layout="window"``.
+    if num_queries_per_block is None or num_kv_per_block is None:
+        layout = tune_layout or ("window" if window_size != (-1, -1) else "full")
+        tuned_bq, tuned_bkv = get_varlen_tuned_block_sizes(
+            q.dtype,
+            k.dtype,
+            v.dtype,
+            q.shape[1],
+            q.shape[0],
+            k.shape[0],
+            q.shape[2],
+            layout,
+        )
+        if num_queries_per_block is None:
+            num_queries_per_block = tuned_bq
+        if num_kv_per_block is None:
+            num_kv_per_block = tuned_bkv
+
     static_validate_inputs(
         q,
         k,
