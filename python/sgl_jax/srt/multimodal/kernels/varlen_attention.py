@@ -1444,6 +1444,7 @@ def _packed_attention(
         "num_queries_per_block",
         "num_kv_per_block",
         "vmem_limit_bytes",
+        "tune_layout",
         "interpret",
     ),
 )

@@ -262,6 +262,7 @@ class Qwen2_5_VisionAttention(nnx.Module):
                 causal=False,
                 head_tp=self.specs.tp,
                 block_sparse_segments=block_sparse_segments,
+                use_varlen=True,
             )
         else:
             self.attn_backend = None

@@ -257,10 +257,12 @@ class VisionVarlenAttentionBackend(AttentionBackend):
         sm_scale: float = 1.0,
         head_tp: bool = False,
         vmem_limit_bytes: int = 128 * 1024 * 1024,
+        tune_layout: str | None = None,
     ):
         self.mesh = mesh
         self.sm_scale = sm_scale
         self.vmem_limit_bytes = vmem_limit_bytes
+        self.tune_layout = tune_layout
         self.interpret = mesh.devices.flat[0].platform == "cpu"
         if head_tp:
             if "tensor" not in mesh.axis_names:
@@ -279,11 +281,16 @@ class VisionVarlenAttentionBackend(AttentionBackend):
         q,  # [B, T, heads, head_dim]
         k,  # [B, T, kv_heads, head_dim]
         v,  # [B, T, kv_heads, head_dim]
-        cu_seqlens,  # int32[B, boundary_capacity + 1]
+        cu_seqlens,  # int32[B, boundary_capacity + 1] or VisionAttentionMetadata
         attention_sink=None,  # float[heads] or None
         *,
         window_size: tuple[int, int] = (-1, -1),
     ):
+        # Accept either a raw cu_seqlens array (MiMo/Omni) or the shared
+        # VisionAttentionMetadata (Qwen VL), so this backend is a drop-in for
+        # VisionFlashAttentionBackend's (q, k, v, metadata) contract too.
+        if isinstance(cu_seqlens, VisionAttentionMetadata):
+            cu_seqlens = cu_seqlens.cu_seqlens
         if q.shape[0] != cu_seqlens.shape[0]:
             raise ValueError(
                 f"vision cu_seqlens batch must match q/k/v: {cu_seqlens.shape[0]} != {q.shape[0]}"
@@ -305,6 +312,7 @@ class VisionVarlenAttentionBackend(AttentionBackend):
                 window_size=window_size,
                 attention_sink=lane_sink,
                 vmem_limit_bytes=self.vmem_limit_bytes,
+                tune_layout=self.tune_layout,
                 interpret=self.interpret,
             )
 
@@ -342,8 +350,23 @@ def make_vision_attention_backend(
     causal: bool = False,
     head_tp: bool = False,
     block_sparse_segments: bool = False,
-) -> VisionFlashAttentionBackend:
-    """Build the batch-sharded vision flash backend (interpret on CPU meshes)."""
+    use_varlen: bool = False,
+) -> AttentionBackend:
+    """Build the batch-sharded vision attention backend (interpret on CPU meshes).
+
+    ``use_varlen`` routes the tower through the packed ``varlen_attention``
+    kernel instead of the dense/block-sparse ``flash_attention`` kernel. Varlen
+    walks each cu_seqlens segment, so window layers cost O(sum segment^2) rather
+    than the dense O(T^2); ``tune_layout`` picks the v7x-tuned block sizes
+    (``full`` for the whole-frame layers, ``window`` for the windowed layers).
+    """
+    if use_varlen:
+        return VisionVarlenAttentionBackend(
+            mesh,
+            sm_scale=sm_scale,
+            head_tp=head_tp,
+            tune_layout="full" if block_sparse_segments else "window",
+        )
     return VisionFlashAttentionBackend(
         mesh,
         sm_scale=sm_scale,
