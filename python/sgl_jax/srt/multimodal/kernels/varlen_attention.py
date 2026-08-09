@@ -514,19 +514,21 @@ def _mha_sequence(
     def _fetch_bkv(target_seq_idx, bkv_idx, sem_idx, *, wait=False):
         # K and V live in separate HBM buffers; one DMA each into its own VMEM
         # double buffer (channel 0 = K, channel 1 = V), sharing the sem slot.
+        # The buffers reserve a bank-conflict-avoiding head-stride pad, so the
+        # DMA writes only the first ``num_heads`` head slots.
         start = cu_lens_ref[target_seq_idx] + bkv_idx * bkv_size
         copy_size = bkv_size
         if use_dynamic_dma:
             copy_size = jnp.minimum(bkv_size, cu_lens_ref[target_seq_idx + 1] - start)
         _make_async_copy(
             k_hbm_ref.at[pl.ds(start, copy_size)],
-            bk_dbuf_ref.at[sem_idx, pl.ds(0, copy_size)],
+            bk_dbuf_ref.at[sem_idx, pl.ds(0, copy_size), :num_heads],
             dma_sems.at[0, sem_idx],
             wait,
         )
         _make_async_copy(
             v_hbm_ref.at[pl.ds(start, copy_size)],
-            bv_dbuf_ref.at[sem_idx, pl.ds(0, copy_size)],
+            bv_dbuf_ref.at[sem_idx, pl.ds(0, copy_size), :num_heads],
             dma_sems.at[1, sem_idx],
             wait,
         )
@@ -767,13 +769,21 @@ def _mha_attention(
     """Launch the token-major MHA Pallas kernel on a prepared layout."""
     _, num_heads, q_head_dim = q_internal.shape
     kv_head_dim = k_internal.shape[-1]
+    # Reading ``[:, head, :]`` from a ``[bkv, num_heads, D]`` VMEM buffer strides
+    # tokens by ``num_heads``; a power-of-two head count (e.g. 16) collides on the
+    # VMEM banks. Pad the head-stride to an odd count -- the same fix the packed
+    # fallback applies to ``bkv_stride`` -- so the large per-tile KV read stays
+    # conflict-free. The pad slot is never DMA'd into or read.
+    bkv_head_stride = num_heads
+    if _has_bank_conflicts(bkv_head_stride):
+        bkv_head_stride += 1
 
     bk_double_buffer = pltpu.VMEM(
-        (2, num_kv_per_block, num_heads, kv_head_dim),
+        (2, num_kv_per_block, bkv_head_stride, kv_head_dim),
         k_internal.dtype,
     )
     bv_double_buffer = pltpu.VMEM(
-        (2, num_kv_per_block, num_heads, kv_head_dim),
+        (2, num_kv_per_block, bkv_head_stride, kv_head_dim),
         v_internal.dtype,
     )
     bq_double_buffer = pltpu.VMEM(
