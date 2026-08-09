@@ -356,21 +356,16 @@ def _prepare_mha_layout(
     bq_size: int,
     bkv_size: int,
     interpret: bool,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None, int, int]:
-    """Keep Q/K/V token-major at native head_dim; no concat, no head-dim pad.
-
-    K and V stay as two separate ``[tokens, heads, head_dim]`` buffers so the
-    kernel prefetches each with its own DMA instead of materializing a fused
-    ``concat([k, v])`` buffer on the host. Sequence-bounded dynamic DMAs mean no
-    fixed-block token tail is needed on TPU; the HLO interpreter cannot discharge
-    dynamic DMA sizes, so token slack is retained only for its correctness path.
-    """
+) -> tuple[jax.Array, jax.Array, jax.Array | None, int, int]:
+    """Build exact-capacity native-D Q/O and 128-aligned packed K/V."""
     original_q_capacity, num_heads, actual_head_dim = q.shape
+    original_kv_capacity = k.shape[0]
+    padded_head_dim = _align_to(actual_head_dim, 128)
     q_token_padding = bq_size - 1 if interpret else 0
     kv_token_padding = bkv_size - 1 if interpret else 0
-    q_internal = jnp.pad(q, ((0, q_token_padding), (0, 0), (0, 0))) if interpret else q
-    k_internal = jnp.pad(k, ((0, kv_token_padding), (0, 0), (0, 0))) if interpret else k
-    v_internal = jnp.pad(v, ((0, kv_token_padding), (0, 0), (0, 0))) if interpret else v
+    q_internal = (
+        jnp.pad(q, ((0, q_token_padding), (0, 0), (0, 0))) if interpret else q
+    )
 
     sink_internal = None
     if attention_sink is not None:
@@ -379,7 +374,24 @@ def _prepare_mha_layout(
             sink = jnp.full((num_heads,), sink, dtype=jnp.float32)
         sink_internal = jnp.repeat(sink[:, None], 128, axis=-1)
 
-    return q_internal, k_internal, v_internal, sink_internal, actual_head_dim, original_q_capacity
+    kv_packing = _dtype_packing(k.dtype)
+    actual_combined_kv_heads = 2 * num_heads
+    padded_combined_kv_heads = _align_to(actual_combined_kv_heads, kv_packing)
+    kv_internal = jnp.pad(
+        jnp.concat([k, v], axis=-1).reshape(k.shape[0], actual_combined_kv_heads, actual_head_dim),
+        (
+            (0, kv_token_padding),
+            (0, padded_combined_kv_heads - actual_combined_kv_heads),
+            (0, padded_head_dim - actual_head_dim),
+        ),
+        constant_values=0,
+    ).reshape(
+        original_kv_capacity + kv_token_padding,
+        padded_combined_kv_heads // kv_packing,
+        kv_packing,
+        padded_head_dim,
+    )
+    return q_internal, kv_internal, sink_internal, actual_head_dim, original_q_capacity
 
 
 def _restore_mha_output(
@@ -399,14 +411,12 @@ def _mha_kernel(
     bo_ids_ref,
     # HBM inputs.
     q_hbm_ref,
-    k_hbm_ref,
-    v_hbm_ref,
+    kv_hbm_ref,
     attention_sink_ref,
     # HBM output.
     o_hbm_ref,
     # VMEM scratch.
-    bk_dbuf_ref,
-    bv_dbuf_ref,
+    bkv_dbuf_ref,
     bq_dbuf_ref,
     bo_dbuf_ref,
     dma_sems,
@@ -436,12 +446,10 @@ def _mha_kernel(
             sem_ids_ref,
             bo_ids_ref,
             q_hbm_ref,
-            k_hbm_ref,
-            v_hbm_ref,
+            kv_hbm_ref,
             attention_sink_ref,
             o_hbm_ref,
-            bk_dbuf_ref,
-            bv_dbuf_ref,
+            bkv_dbuf_ref,
             bq_dbuf_ref,
             bo_dbuf_ref,
             dma_sems,
@@ -467,12 +475,10 @@ def _mha_sequence(
     sem_ids_ref,
     bo_ids_ref,
     q_hbm_ref,
-    k_hbm_ref,
-    v_hbm_ref,
+    kv_hbm_ref,
     attention_sink_ref,
     o_hbm_ref,
-    bk_dbuf_ref,
-    bv_dbuf_ref,
+    bkv_dbuf_ref,
     bq_dbuf_ref,
     bo_dbuf_ref,
     dma_sems,
@@ -491,7 +497,10 @@ def _mha_sequence(
     use_dynamic_dma: bool,
 ):
     _, num_heads, q_head_dim = q_hbm_ref.shape
+    _, combined_kv_heads_per_packing, kv_packing, kv_head_dim = kv_hbm_ref.shape
+    bkv_stride = bkv_dbuf_ref.shape[2]
     q_dtype = q_hbm_ref.dtype
+    kv_dtype = kv_hbm_ref.dtype
     left_window, right_window = window_size
 
     q_start = cu_lens_ref[seq_idx]
@@ -507,27 +516,23 @@ def _mha_sequence(
         _make_async_copy(
             q_hbm_ref.at[pl.ds(start, copy_size)],
             bq_dbuf_ref.at[sem_idx, pl.ds(0, copy_size)],
-            dma_sems.at[2, sem_idx],
+            dma_sems.at[1, sem_idx],
             wait,
         )
 
     def _fetch_bkv(target_seq_idx, bkv_idx, sem_idx, *, wait=False):
-        # K and V live in separate HBM buffers; one DMA each into its own VMEM
-        # double buffer (channel 0 = K, channel 1 = V), sharing the sem slot.
         start = cu_lens_ref[target_seq_idx] + bkv_idx * bkv_size
         copy_size = bkv_size
         if use_dynamic_dma:
             copy_size = jnp.minimum(bkv_size, cu_lens_ref[target_seq_idx + 1] - start)
         _make_async_copy(
-            k_hbm_ref.at[pl.ds(start, copy_size)],
-            bk_dbuf_ref.at[sem_idx, pl.ds(0, copy_size)],
+            kv_hbm_ref.at[pl.ds(start, copy_size)],
+            bkv_dbuf_ref.at[
+                sem_idx,
+                pl.ds(0, copy_size),
+                :combined_kv_heads_per_packing,
+            ],
             dma_sems.at[0, sem_idx],
-            wait,
-        )
-        _make_async_copy(
-            v_hbm_ref.at[pl.ds(start, copy_size)],
-            bv_dbuf_ref.at[sem_idx, pl.ds(0, copy_size)],
-            dma_sems.at[1, sem_idx],
             wait,
         )
 
@@ -539,7 +544,7 @@ def _mha_sequence(
         _make_async_copy(
             bo_dbuf_ref.at[sem_idx, pl.ds(0, copy_size)],
             o_hbm_ref.at[pl.ds(start, copy_size)],
-            dma_sems.at[3, sem_idx],
+            dma_sems.at[2, sem_idx],
             wait,
         )
 
@@ -576,10 +581,32 @@ def _mha_sequence(
         return bq_dbuf_ref[sem_idx, :, head_idx, :]
 
     def load_bkv(sem_idx, head_idx):
-        # Token-major K/V: a plain VMEM slice per head, no bitcast/unpack.
+        packed_ref = (
+            bkv_dbuf_ref.bitcast(jnp.uint32)
+            .at[sem_idx]
+            .reshape(bkv_size * bkv_stride, kv_head_dim)
+        )
+        if kv_packing == 1:
+            start = head_idx * 2
+            k_block = _strided_load(
+                packed_ref, start, bkv_size * bkv_stride, bkv_stride, dtype=kv_dtype
+            )
+            v_block = _strided_load(
+                packed_ref, start + 1, bkv_size * bkv_stride, bkv_stride, dtype=kv_dtype
+            )
+            return k_block[:, :q_head_dim], v_block[:, :q_head_dim]
+
+        kv_heads_per_word = kv_packing // 2
+        word_offset = head_idx // kv_heads_per_word
+        kv_idx_in_word = head_idx % kv_heads_per_word
+        packed = _strided_load(packed_ref, word_offset, bkv_size * bkv_stride, bkv_stride)
+        bitwidth = 32 // kv_packing
+        repack_ty = jnp.dtype(f"uint{bitwidth}")
+        k_bits = packed >> (kv_idx_in_word * 2 * bitwidth)
+        v_bits = k_bits >> bitwidth
         return (
-            bk_dbuf_ref[sem_idx, :, head_idx, :],
-            bv_dbuf_ref[sem_idx, :, head_idx, :],
+            pltpu.bitcast(k_bits.astype(repack_ty), kv_dtype)[:, :q_head_dim],
+            pltpu.bitcast(v_bits.astype(repack_ty), kv_dtype)[:, :q_head_dim],
         )
 
     def flash_attention_step(
@@ -747,8 +774,7 @@ def _mha_sequence(
 
 def _mha_attention(
     q_internal: jax.Array,
-    k_internal: jax.Array,
-    v_internal: jax.Array,
+    kv_internal: jax.Array,
     cu_seqlens: jax.Array,
     num_seqs: jax.Array,
     attention_sink_internal: jax.Array | None,
@@ -766,15 +792,16 @@ def _mha_attention(
 ) -> jax.Array:
     """Launch the token-major MHA Pallas kernel on a prepared layout."""
     _, num_heads, q_head_dim = q_internal.shape
-    kv_head_dim = k_internal.shape[-1]
+    kv_head_dim = kv_internal.shape[-1]
+    combined_kv_heads_per_packing = kv_internal.shape[1]
+    kv_packing = kv_internal.shape[2]
+    bkv_stride = combined_kv_heads_per_packing
+    if _has_bank_conflicts(bkv_stride):
+        bkv_stride += 1
 
-    bk_double_buffer = pltpu.VMEM(
-        (2, num_kv_per_block, num_heads, kv_head_dim),
-        k_internal.dtype,
-    )
-    bv_double_buffer = pltpu.VMEM(
-        (2, num_kv_per_block, num_heads, kv_head_dim),
-        v_internal.dtype,
+    bkv_double_buffer = pltpu.VMEM(
+        (2, num_kv_per_block, bkv_stride, kv_packing, kv_head_dim),
+        kv_internal.dtype,
     )
     bq_double_buffer = pltpu.VMEM(
         (2, num_queries_per_block, num_heads, q_head_dim),
@@ -794,7 +821,6 @@ def _mha_attention(
         jnp.full((4,), -1, dtype=jnp.int32),
     )
     in_specs = (
-        pl.BlockSpec(memory_space=pltpu.HBM),
         pl.BlockSpec(memory_space=pltpu.HBM),
         pl.BlockSpec(memory_space=pltpu.HBM),
         (pl.BlockSpec(memory_space=pltpu.VMEM) if attention_sink_internal is not None else None),
@@ -818,11 +844,10 @@ def _mha_attention(
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             grid=(1,),
             scratch_shapes=(
-                bk_double_buffer,
-                bv_double_buffer,
+                bkv_double_buffer,
                 bq_double_buffer,
                 bo_double_buffer,
-                pltpu.SemaphoreType.DMA((4, 2)),
+                pltpu.SemaphoreType.DMA((3, 2)),
                 lm_scratch,
                 lm_scratch,
                 acc_scratch,
@@ -836,9 +861,7 @@ def _mha_attention(
         name="varlen_attention_mha",
         interpret=interpret,
     )
-    return kernel(
-        *scalar_prefetches, q_internal, k_internal, v_internal, attention_sink_internal
-    )
+    return kernel(*scalar_prefetches, q_internal, kv_internal, attention_sink_internal)
 
 
 # =========================================================================== #
@@ -1554,8 +1577,7 @@ def varlen_attention(
 
     (
         q_internal,
-        k_internal,
-        v_internal,
+        kv_internal,
         attention_sink_internal,
         actual_head_dim,
         original_q_capacity,
@@ -1570,8 +1592,7 @@ def varlen_attention(
     )
     out_internal = _mha_attention(
         q_internal,
-        k_internal,
-        v_internal,
+        kv_internal,
         cu_seqlens,
         num_seqs,
         attention_sink_internal,
