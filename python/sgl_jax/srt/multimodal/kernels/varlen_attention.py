@@ -500,36 +500,42 @@ def _mha_sequence(
     num_bq = pl.cdiv(seq_len, bq_size)
 
     def _fetch_bq(target_seq_idx, bq_idx, sem_idx, *, wait=False):
+        # Head-major VMEM buffer [.., H, N, D]: transpose token<->head at DMA
+        # time with one strided copy per head (source is token-major HBM). This
+        # keeps head off the bf16-packed sublane axis, so load_bq is a clean
+        # contiguous slice (no vunpack/vrot).
         start = cu_lens_ref[target_seq_idx] + bq_idx * bq_size
         copy_size = bq_size
         if use_dynamic_dma:
             copy_size = jnp.minimum(bq_size, cu_lens_ref[target_seq_idx + 1] - start)
-        _make_async_copy(
-            q_hbm_ref.at[pl.ds(start, copy_size)],
-            bq_dbuf_ref.at[sem_idx, pl.ds(0, copy_size)],
-            dma_sems.at[2, sem_idx],
-            wait,
-        )
+        for h in range(num_heads):
+            _make_async_copy(
+                q_hbm_ref.at[pl.ds(start, copy_size), h],
+                bq_dbuf_ref.at[sem_idx, h, pl.ds(0, copy_size)],
+                dma_sems.at[2, sem_idx],
+                wait,
+            )
 
     def _fetch_bkv(target_seq_idx, bkv_idx, sem_idx, *, wait=False):
-        # K and V live in separate HBM buffers; one DMA each into its own VMEM
-        # double buffer (channel 0 = K, channel 1 = V), sharing the sem slot.
+        # Head-major K/V buffers, one strided DMA per head each (channel 0 = K,
+        # channel 1 = V), sharing the sem slot.
         start = cu_lens_ref[target_seq_idx] + bkv_idx * bkv_size
         copy_size = bkv_size
         if use_dynamic_dma:
             copy_size = jnp.minimum(bkv_size, cu_lens_ref[target_seq_idx + 1] - start)
-        _make_async_copy(
-            k_hbm_ref.at[pl.ds(start, copy_size)],
-            bk_dbuf_ref.at[sem_idx, pl.ds(0, copy_size)],
-            dma_sems.at[0, sem_idx],
-            wait,
-        )
-        _make_async_copy(
-            v_hbm_ref.at[pl.ds(start, copy_size)],
-            bv_dbuf_ref.at[sem_idx, pl.ds(0, copy_size)],
-            dma_sems.at[1, sem_idx],
-            wait,
-        )
+        for h in range(num_heads):
+            _make_async_copy(
+                k_hbm_ref.at[pl.ds(start, copy_size), h],
+                bk_dbuf_ref.at[sem_idx, h, pl.ds(0, copy_size)],
+                dma_sems.at[0, sem_idx],
+                wait,
+            )
+            _make_async_copy(
+                v_hbm_ref.at[pl.ds(start, copy_size), h],
+                bv_dbuf_ref.at[sem_idx, h, pl.ds(0, copy_size)],
+                dma_sems.at[1, sem_idx],
+                wait,
+            )
 
     def _send_bo(target_seq_idx, bq_idx, sem_idx, *, wait=False):
         start = cu_lens_ref[target_seq_idx] + bq_idx * bq_size
@@ -573,13 +579,13 @@ def _mha_sequence(
             bo_ids_ref[sem_idx] = -1
 
     def load_bq(sem_idx, head_idx):
-        return bq_dbuf_ref[sem_idx, :, head_idx, :]
+        # Head-major: clean contiguous [N, D] slice, head is the major index.
+        return bq_dbuf_ref[sem_idx, head_idx, :, :]
 
     def load_bkv(sem_idx, head_idx):
-        # Token-major K/V: a plain VMEM slice per head, no bitcast/unpack.
         return (
-            bk_dbuf_ref[sem_idx, :, head_idx, :],
-            bv_dbuf_ref[sem_idx, :, head_idx, :],
+            bk_dbuf_ref[sem_idx, head_idx, :, :],
+            bv_dbuf_ref[sem_idx, head_idx, :, :],
         )
 
     def flash_attention_step(
@@ -769,15 +775,15 @@ def _mha_attention(
     kv_head_dim = k_internal.shape[-1]
 
     bk_double_buffer = pltpu.VMEM(
-        (2, num_kv_per_block, num_heads, kv_head_dim),
+        (2, num_heads, num_kv_per_block, kv_head_dim),
         k_internal.dtype,
     )
     bv_double_buffer = pltpu.VMEM(
-        (2, num_kv_per_block, num_heads, kv_head_dim),
+        (2, num_heads, num_kv_per_block, kv_head_dim),
         v_internal.dtype,
     )
     bq_double_buffer = pltpu.VMEM(
-        (2, num_queries_per_block, num_heads, q_head_dim),
+        (2, num_heads, num_queries_per_block, q_head_dim),
         q_internal.dtype,
     )
     bo_double_buffer = pltpu.VMEM(
