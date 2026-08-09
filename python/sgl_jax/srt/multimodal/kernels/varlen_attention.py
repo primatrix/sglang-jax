@@ -357,20 +357,33 @@ def _prepare_mha_layout(
     bkv_size: int,
     interpret: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None, int, int]:
-    """Keep Q/K/V token-major at native head_dim; no concat, no head-dim pad.
+    """Token-major Q/K/V with two adjacent heads packed into the minor tile.
 
-    K and V stay as two separate ``[tokens, heads, head_dim]`` buffers so the
-    kernel prefetches each with its own DMA instead of materializing a fused
-    ``concat([k, v])`` buffer on the host. Sequence-bounded dynamic DMAs mean no
-    fixed-block token tail is needed on TPU; the HLO interpreter cannot discharge
-    dynamic DMA sizes, so token slack is retained only for its correctness path.
+    A single bf16 head is ``head_dim`` (128 padded) = 256 B, only half of the
+    512 B native vector/DMA unit, so per-head loads are sub-native and Mosaic
+    pads/relayouts them. Reshaping ``[T, H, D] -> [T, H/2, 2, D]`` (free -- two
+    adjacent heads are already contiguous) makes each ``[2, D]`` tile a full
+    512 B unit. The kernel loads a head-pair natively, then runs the two heads
+    through the per-head attention matmuls. No host ``concat`` is needed.
     """
     original_q_capacity, num_heads, actual_head_dim = q.shape
+    heads_per_group = 2
+    if num_heads % heads_per_group != 0:
+        raise ValueError(
+            f"MHA head-pair packing requires an even num_heads, got {num_heads}"
+        )
+    num_groups = num_heads // heads_per_group
     q_token_padding = bq_size - 1 if interpret else 0
     kv_token_padding = bkv_size - 1 if interpret else 0
-    q_internal = jnp.pad(q, ((0, q_token_padding), (0, 0), (0, 0))) if interpret else q
-    k_internal = jnp.pad(k, ((0, kv_token_padding), (0, 0), (0, 0))) if interpret else k
-    v_internal = jnp.pad(v, ((0, kv_token_padding), (0, 0), (0, 0))) if interpret else v
+
+    def _prep(x, token_padding):
+        if interpret:
+            x = jnp.pad(x, ((0, token_padding), (0, 0), (0, 0)))
+        return x.reshape(x.shape[0], num_groups, heads_per_group, actual_head_dim)
+
+    q_internal = _prep(q, q_token_padding)
+    k_internal = _prep(k, kv_token_padding)
+    v_internal = _prep(v, kv_token_padding)
 
     sink_internal = None
     if attention_sink is not None:
@@ -490,7 +503,8 @@ def _mha_sequence(
     bkv_size: int,
     use_dynamic_dma: bool,
 ):
-    _, num_heads, q_head_dim = q_hbm_ref.shape
+    _, num_groups, heads_per_group, q_head_dim = q_hbm_ref.shape
+    num_heads = num_groups * heads_per_group
     q_dtype = q_hbm_ref.dtype
     left_window, right_window = window_size
 
@@ -512,8 +526,8 @@ def _mha_sequence(
         )
 
     def _fetch_bkv(target_seq_idx, bkv_idx, sem_idx, *, wait=False):
-        # K and V live in separate HBM buffers; one DMA each into its own VMEM
-        # double buffer (channel 0 = K, channel 1 = V), sharing the sem slot.
+        # K and V are separate HBM buffers, each shaped [tokens, H/2, 2, D];
+        # one DMA each into its own VMEM double buffer (channel 0 = K, 1 = V).
         start = cu_lens_ref[target_seq_idx] + bkv_idx * bkv_size
         copy_size = bkv_size
         if use_dynamic_dma:
@@ -572,14 +586,15 @@ def _mha_sequence(
             # per-tile buffer reuse below.
             bo_ids_ref[sem_idx] = -1
 
-    def load_bq(sem_idx, head_idx):
-        return bq_dbuf_ref[sem_idx, :, head_idx, :]
+    def load_bq(sem_idx, group_idx):
+        # Native 512 B load of a head-pair: [bq, heads_per_group, D].
+        return bq_dbuf_ref[sem_idx, :, group_idx, :, :]
 
-    def load_bkv(sem_idx, head_idx):
-        # Token-major K/V: a plain VMEM slice per head, no bitcast/unpack.
+    def load_bkv(sem_idx, group_idx):
+        # Native 512 B loads of a head-pair; slice per head for the matmul.
         return (
-            bk_dbuf_ref[sem_idx, :, head_idx, :],
-            bv_dbuf_ref[sem_idx, :, head_idx, :],
+            bk_dbuf_ref[sem_idx, :, group_idx, :, :],
+            bv_dbuf_ref[sem_idx, :, group_idx, :, :],
         )
 
     def flash_attention_step(
@@ -713,21 +728,23 @@ def _mha_sequence(
             wait_fetch_bkv(seq_idx, bkv_idx, kv_sem_idx)
             processed_kv = bkv_idx * bkv_size
 
-            for head_idx in range(num_heads):
-                q_block = load_bq(q_sem_idx, head_idx)
-                k_block, v_block = load_bkv(kv_sem_idx, head_idx)
-                lm_slice = (head_idx, pl.ds(0, bq_size))
-                flash_attention_step(
-                    q_block,
-                    k_block,
-                    v_block,
-                    l_ref.at[*lm_slice],
-                    m_ref.at[*lm_slice],
-                    acc_ref.at[*lm_slice],
-                    processed_q=processed_q,
-                    processed_kv=processed_kv,
-                    physical_kv_len=seq_len,
-                )
+            for group_idx in range(num_groups):
+                q_group = load_bq(q_sem_idx, group_idx)
+                k_group, v_group = load_bkv(kv_sem_idx, group_idx)
+                for head_in_group in range(heads_per_group):
+                    head_idx = group_idx * heads_per_group + head_in_group
+                    lm_slice = (head_idx, pl.ds(0, bq_size))
+                    flash_attention_step(
+                        q_group[:, head_in_group, :],
+                        k_group[:, head_in_group, :],
+                        v_group[:, head_in_group, :],
+                        l_ref.at[*lm_slice],
+                        m_ref.at[*lm_slice],
+                        acc_ref.at[*lm_slice],
+                        processed_q=processed_q,
+                        processed_kv=processed_kv,
+                        physical_kv_len=seq_len,
+                    )
 
         acc = acc_ref[...]
         denominator = _broadcast_minor(l_ref[...], acc.shape)
@@ -765,19 +782,22 @@ def _mha_attention(
     interpret: bool,
 ) -> jax.Array:
     """Launch the token-major MHA Pallas kernel on a prepared layout."""
-    _, num_heads, q_head_dim = q_internal.shape
+    _, num_groups, heads_per_group, q_head_dim = q_internal.shape
+    num_heads = num_groups * heads_per_group
     kv_head_dim = k_internal.shape[-1]
 
+    # K/V/Q double buffers keep the [.., H/2, 2, D] head-pair tiling so each
+    # per-token unit is a full 512 B native vector; output stays per-head.
     bk_double_buffer = pltpu.VMEM(
-        (2, num_kv_per_block, num_heads, kv_head_dim),
+        (2, num_kv_per_block, num_groups, heads_per_group, kv_head_dim),
         k_internal.dtype,
     )
     bv_double_buffer = pltpu.VMEM(
-        (2, num_kv_per_block, num_heads, kv_head_dim),
+        (2, num_kv_per_block, num_groups, heads_per_group, kv_head_dim),
         v_internal.dtype,
     )
     bq_double_buffer = pltpu.VMEM(
-        (2, num_queries_per_block, num_heads, q_head_dim),
+        (2, num_queries_per_block, num_groups, heads_per_group, q_head_dim),
         q_internal.dtype,
     )
     bo_double_buffer = pltpu.VMEM(
@@ -832,7 +852,9 @@ def _mha_attention(
             dimension_semantics=("arbitrary",),
             vmem_limit_bytes=vmem_limit_bytes,
         ),
-        out_shape=jax.ShapeDtypeStruct(q_internal.shape, q_internal.dtype),
+        out_shape=jax.ShapeDtypeStruct(
+            (q_internal.shape[0], num_heads, q_head_dim), q_internal.dtype
+        ),
         name="varlen_attention_mha",
         interpret=interpret,
     )
