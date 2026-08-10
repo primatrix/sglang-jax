@@ -1,0 +1,8 @@
+{"backend": "tpu", "devices": ["TPU_0(process=0,(0,0,0,0))"], "event": "environment", "interpret": false, "iters": 50, "jax": "0.10.2", "jaxlib": "0.10.2", "k": 2048, "libtpu": "0.0.42.1", "page_size": 64, "page_table_size": 4224, "q": 2048, "seq_lens": [131584, 132096], "warmup": 10}
+{"block_q": null, "event": "timing", "mean_ms": 25.41362876, "median_ms": 25.40552, "minimum_ms": 25.379861, "p90_ms": 25.4528131, "speedup_vs_xla": null, "variant": "xla"}
+{"block_q": null, "counts_equal": true, "event": "correctness", "slots_equal": true, "variant": "xla_phase1"}
+{"block_q": null, "event": "timing", "mean_ms": 25.44606972, "median_ms": 25.444855, "minimum_ms": 25.400661, "p90_ms": 25.4666591, "speedup_vs_xla": 0.9984541079129748, "variant": "xla_phase1"}
+{"block_q": null, "counts_equal": true, "event": "correctness", "slots_equal": true, "variant": "xla_shared_metadata"}
+{"block_q": null, "event": "timing", "mean_ms": 25.42166894, "median_ms": 25.4226655, "minimum_ms": 25.376631, "p90_ms": 25.446052, "speedup_vs_xla": 0.999325582126705, "variant": "xla_shared_metadata"}
+{"block_q": 128, "error": "Cannot do int indexing on TPU", "error_type": "ValueError", "event": "candidate_error", "variant": "pallas"}
+{"block_q": 256, "error": "Cannot do int indexing on TPU", "error_type": "ValueError", "event": "candidate_error", "variant": "pallas"}
