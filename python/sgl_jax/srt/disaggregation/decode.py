@@ -624,6 +624,7 @@ class SchedulerDisaggregationDecodeMixin:
             entries,
             poll_fn=lambda e: e.receiver.poll(),
             room_fn=lambda e: getattr(e.req, "bootstrap_room", None),
+            dp_size=self.dp_size,
         )
         if not success and not failed:
             return []

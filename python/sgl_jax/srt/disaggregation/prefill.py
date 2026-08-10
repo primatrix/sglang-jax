@@ -97,7 +97,7 @@ def _global_to_local_shard(arr: jax.Array) -> jax.Array:
 
 def local_kv_spec_for_pool(kv_pool, layer_num: int, padded_pages: int) -> jax.ShapeDtypeStruct:
     """Build the ShapeDtypeStruct that D should pull on a multi-host process:
-    this host's 1/nproc slice of the stacked KV, on a 1-D local mesh.
+    this host's local slice of the stacked KV, on a 1-D local mesh.
     """
     import numpy as _np
     from jax.sharding import Mesh as _Mesh
@@ -113,8 +113,9 @@ def local_kv_spec_for_pool(kv_pool, layer_num: int, padded_pages: int) -> jax.Sh
         raise ValueError(f"expected one sharded dim in KV spec, got {gspec}")
     sd = sharded_dims[0]
     ldev = jax.local_devices()
-    nproc = jax.process_count()
-    lshape = tuple(gshape[i] // nproc if i == sd else gshape[i] for i in range(len(gshape)))
+    ndev_on_axis = kv_pool.mesh.devices.shape[kv_pool.mesh.axis_names.index(gspec[sd])]
+    nproc_on_axis = ndev_on_axis // len(ldev)
+    lshape = tuple(gshape[i] // nproc_on_axis if i == sd else gshape[i] for i in range(len(gshape)))
     lmesh = _Mesh(_np.asarray(ldev), ("_local",))
     lspec = _P(*("_local" if i == sd else None for i in range(len(gshape))))
     return jax.ShapeDtypeStruct(lshape, kv_pool.dtype, sharding=_NamedSharding(lmesh, lspec))
