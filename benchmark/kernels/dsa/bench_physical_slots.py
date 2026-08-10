@@ -70,6 +70,86 @@ def logical_topk_to_physical_slots_xla(
     return physical_slots.astype(jnp.int32), selected_counts
 
 
+def logical_topk_to_physical_slots_xla_phase1(
+    topk,
+    seq_lens,
+    page_indices,
+    cu_q_lens,
+    cu_kv_lens,
+    page_size,
+):
+    """Phase-1 algebraic cleanup proposed by the optimization plan."""
+
+    num_tokens = topk.shape[0]
+    token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
+    seq_ids = jnp.searchsorted(cu_q_lens[1:], token_ids, side="right")
+    seq_ids = jnp.clip(seq_ids, 0, seq_lens.shape[0] - 1)
+
+    logical = jnp.maximum(topk, 0)
+    page_local = logical // page_size
+    page_offset = logical - page_local * page_size
+    page_starts = cu_kv_lens[:-1] // page_size
+    page_ptr = page_starts[seq_ids, None] + page_local
+    ptr_in_bounds = (page_ptr >= 0) & (page_ptr < page_indices.shape[0])
+    safe_ptr = jnp.clip(page_ptr, 0, page_indices.shape[0] - 1)
+    physical_pages = page_indices[safe_ptr]
+    query_valid = token_ids < cu_q_lens[-1]
+    valid = (
+        query_valid[:, None]
+        & (topk >= 0)
+        & (logical < seq_lens[seq_ids, None])
+        & ptr_in_bounds
+        & (physical_pages >= 0)
+    )
+    physical_slots = physical_pages * page_size + page_offset
+    return jnp.where(valid, physical_slots, jnp.int32(0)), jnp.sum(
+        valid, axis=1, dtype=jnp.int32
+    )
+
+
+def build_shared_metadata(seq_lens, cu_q_lens, cu_kv_lens, page_size, num_tokens):
+    """Build the query metadata that Phase 3 proposes to share per forward."""
+
+    token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
+    seq_ids = jnp.searchsorted(cu_q_lens[1:], token_ids, side="right")
+    seq_ids = jnp.clip(seq_ids, 0, seq_lens.shape[0] - 1)
+    return (
+        seq_lens[seq_ids],
+        (cu_kv_lens[:-1] // page_size)[seq_ids],
+        token_ids < cu_q_lens[-1],
+    )
+
+
+def logical_topk_to_physical_slots_xla_shared_metadata(
+    topk,
+    seq_len_by_query,
+    page_start_by_query,
+    query_valid,
+    page_indices,
+    page_size,
+):
+    """Mapper-only upper bound when metadata is shared with other DSA work."""
+
+    logical = jnp.maximum(topk, 0)
+    page_local = logical // page_size
+    page_offset = logical - page_local * page_size
+    page_ptr = page_start_by_query[:, None] + page_local
+    ptr_in_bounds = (page_ptr >= 0) & (page_ptr < page_indices.shape[0])
+    safe_ptr = jnp.clip(page_ptr, 0, page_indices.shape[0] - 1)
+    physical_pages = page_indices[safe_ptr]
+    valid = (
+        query_valid[:, None]
+        & (topk >= 0)
+        & (logical < seq_len_by_query[:, None])
+        & ptr_in_bounds
+        & (physical_pages >= 0)
+    )
+    physical_slots = physical_pages * page_size + page_offset
+    return jnp.where(valid, physical_slots, jnp.int32(0)), jnp.sum(
+        valid, axis=1, dtype=jnp.int32
+    )
+
+
 @dataclass(frozen=True)
 class Timing:
     variant: str
@@ -236,6 +316,67 @@ def main():
         json.dumps({"event": "timing", **asdict(xla_timing)}, sort_keys=True),
         flush=True,
     )
+
+    xla_variants = {
+        "xla_phase1": jax.jit(
+            functools.partial(
+                logical_topk_to_physical_slots_xla_phase1,
+                page_size=args.page_size,
+            )
+        ),
+    }
+    shared_metadata = jax.jit(
+        functools.partial(
+            build_shared_metadata,
+            page_size=args.page_size,
+            num_tokens=args.q,
+        )
+    )(inputs[1], inputs[3], inputs[4])
+    jax.block_until_ready(shared_metadata)
+    shared_inputs = (inputs[0], *shared_metadata, inputs[2])
+    xla_variants["xla_shared_metadata"] = jax.jit(
+        functools.partial(
+            logical_topk_to_physical_slots_xla_shared_metadata,
+            page_size=args.page_size,
+        )
+    )
+
+    for variant, variant_fn in xla_variants.items():
+        variant_inputs = shared_inputs if variant == "xla_shared_metadata" else inputs
+        variant_output = jax.block_until_ready(variant_fn(*variant_inputs))
+        slots_equal = bool(jnp.array_equal(xla_output[0], variant_output[0]))
+        counts_equal = bool(jnp.array_equal(xla_output[1], variant_output[1]))
+        print(
+            json.dumps(
+                {
+                    "event": "correctness",
+                    "variant": variant,
+                    "block_q": None,
+                    "slots_equal": slots_equal,
+                    "counts_equal": counts_equal,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        if not slots_equal or not counts_equal:
+            raise AssertionError(f"{variant} output mismatch")
+        samples = _measure(
+            variant_fn,
+            variant_inputs,
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        timing = _summarize(
+            variant,
+            None,
+            samples,
+            baseline_ms=xla_timing.median_ms,
+        )
+        print(
+            json.dumps({"event": "timing", **asdict(timing)}, sort_keys=True),
+            flush=True,
+        )
 
     for block_q in block_q_values:
         try:
