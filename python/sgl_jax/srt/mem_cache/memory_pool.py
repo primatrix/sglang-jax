@@ -816,6 +816,26 @@ class SWAKVPool(KVCache):
         self.swa_kv_pool.replace_buffer(swa_kv_buffer)
         self.full_kv_pool.replace_buffer(full_kv_buffer)
 
+    @property
+    def layer_num(self):
+        return self.swa_layer_nums + self.full_layer_nums
+
+    @property
+    def start_layer(self):
+        return min(self.layers_mapping.keys())
+
+    @property
+    def kv_sharding(self):
+        return self.full_kv_pool.kv_sharding
+
+    @property
+    def dtype(self):
+        return self.full_kv_pool.dtype
+
+    @property
+    def attention_data_partition_axis(self):
+        return self.full_kv_pool.attention_data_partition_axis
+
     def remap_cache_loc(self, loc: jax.Array, layer_id: int) -> jax.Array:
         """
         Remap cache locations from the full-attention token space to the SWA

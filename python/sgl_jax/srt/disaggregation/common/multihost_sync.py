@@ -22,12 +22,16 @@ def synced_terminal_rooms(
     entries: Iterable,
     poll_fn: Callable[[object], KVPoll],
     room_fn: Callable[[object], int | None],
+    dp_size: int = 1,
 ) -> tuple[set[int], set[int]]:
     """Return ``(success_rooms, failed_rooms)`` agreed across all processes.
 
     ``poll_fn`` is wrapped in a try/except so a per-NP receiver exception
     becomes FAILED instead of skipping the allgather (which would desync
     the SPMD program counter).
+
+    With ``dp_size > 1`` each request is handled by only ``nproc // dp_size``
+    processes (one DP rank).  The success threshold is lowered accordingly.
     """
 
     from jax.experimental import multihost_utils
@@ -47,6 +51,7 @@ def synced_terminal_rooms(
         local[i, 1] = 1 if st == KVPoll.SUCCESS else (-2 if st == KVPoll.FAILED else 0)
     gathered = multihost_utils.process_allgather(local)
     nproc = int(gathered.shape[0])
+    nproc_per_dp = nproc // max(dp_size, 1)
     per_room: dict[int, list[int]] = {}
     for p in range(nproc):
         for i in range(_SYNC_MAX_INFLIGHT):
@@ -59,6 +64,6 @@ def synced_terminal_rooms(
     for room, sts in per_room.items():
         if -2 in sts:
             failed.add(room)
-        elif len(sts) >= nproc and all(s == 1 for s in sts):
+        elif len(sts) >= nproc_per_dp and all(s == 1 for s in sts):
             success.add(room)
     return success, failed

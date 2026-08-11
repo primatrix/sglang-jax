@@ -624,6 +624,7 @@ class SchedulerDisaggregationDecodeMixin:
             entries,
             poll_fn=lambda e: e.receiver.poll(),
             room_fn=lambda e: getattr(e.req, "bootstrap_room", None),
+            dp_size=self.dp_size,
         )
         if not success and not failed:
             return []
@@ -982,7 +983,7 @@ class SchedulerDisaggregationDecodeMixin:
             from sgl_jax.srt.disaggregation.prefill import local_kv_spec_for_pool
 
             return local_kv_spec_for_pool(kv_pool, kv_pool.layer_num, padded_pages)
-        per_layer_tail = kv_pool.kv_buffer[0].shape[1:]
+        per_layer_tail = kv_pool.get_kv_buffer(kv_pool.start_layer).shape[1:]
         shape = (padded_pages, *per_layer_tail)
         sharding = kv_pool.kv_sharding
         return [
@@ -1000,6 +1001,7 @@ class SchedulerDisaggregationDecodeMixin:
             )
 
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        per_layer_tail = kv_pool.get_kv_buffer(kv_pool.start_layer).shape[1:]
         if jax.process_count() > 1 and kv.is_fully_addressable:
             # Pulled KV is this host's local shard on a 1-D local mesh.
             # Assemble it into the global pool sharding (zero-copy: each NP
@@ -1007,7 +1009,6 @@ class SchedulerDisaggregationDecodeMixin:
             pool_pspec = kv_pool.kv_sharding.spec
             stacked_spec = PartitionSpec(None, None, *pool_pspec[1:])
             gsh = NamedSharding(kv_pool.mesh, stacked_spec)
-            per_layer_tail = kv_pool.kv_buffer[0].shape[1:]
             gshape = (kv.shape[0], kv.shape[1]) + per_layer_tail
             kv = jax.make_array_from_single_device_arrays(
                 gshape, gsh, [s.data for s in kv.addressable_shards]
@@ -1042,24 +1043,57 @@ class SchedulerDisaggregationDecodeMixin:
         total_tokens = padded_pages * page_size
         loc_np = np.full(total_tokens, -1, dtype=np.int32)
         loc_np[:seqlen] = kv_indices_np[:seqlen]
-        loc = jax.device_put(
-            jnp.asarray(loc_np),
-            NamedSharding(kv_pool.mesh, PartitionSpec(kv_pool.attention_data_partition_axis)),
+        loc_sharding = NamedSharding(
+            kv_pool.mesh, PartitionSpec(kv_pool.attention_data_partition_axis)
         )
+        loc = jax.device_put(jnp.asarray(loc_np), loc_sharding)
+
+        from sgl_jax.srt.mem_cache.memory_pool import SWAKVPool
+
+        is_swa_pool = isinstance(kv_pool, SWAKVPool)
+        swa_loc = None
+        if is_swa_pool:
+            mapping = kv_pool.full_to_swa_index_mapping
+            if mapping is not None:
+                if isinstance(mapping, list):
+                    dp_rank = int(getattr(req, "dp_rank", 0) or 0)
+                    mapping = mapping[dp_rank]
+                swa_loc_np = np.full_like(loc_np, -1)
+                valid = loc_np >= 0
+                swa_loc_np[valid] = np.asarray(mapping)[loc_np[valid]]
+                swa_loc = jax.device_put(jnp.asarray(swa_loc_np), loc_sharding)
 
         for i, layer_id in enumerate(
             range(kv_pool.start_layer, kv_pool.start_layer + kv_pool.layer_num)
         ):
-            layer_idx = layer_id - kv_pool.start_layer
-            kv_pool.kv_buffer[layer_idx] = write_kv_layer(
-                kv[i],
-                loc,
-                kv_pool.kv_buffer[layer_idx],
-                page_size,
-                kv_pool.kv_partition_axis,
-                kv_pool.attention_data_partition_axis,
-                kv_pool.mesh,
-            )
+            if is_swa_pool:
+                layer_id_pool, is_swa_layer = kv_pool.layers_mapping[layer_id]
+                if is_swa_layer:
+                    sub_pool = kv_pool.swa_kv_pool
+                    layer_loc = swa_loc if swa_loc is not None else loc
+                else:
+                    sub_pool = kv_pool.full_kv_pool
+                    layer_loc = loc
+                sub_pool.kv_buffer[layer_id_pool] = write_kv_layer(
+                    kv[i],
+                    layer_loc,
+                    sub_pool.kv_buffer[layer_id_pool],
+                    page_size,
+                    sub_pool.kv_partition_axis,
+                    sub_pool.attention_data_partition_axis,
+                    sub_pool.mesh,
+                )
+            else:
+                layer_idx = layer_id - kv_pool.start_layer
+                kv_pool.kv_buffer[layer_idx] = write_kv_layer(
+                    kv[i],
+                    loc,
+                    kv_pool.kv_buffer[layer_idx],
+                    page_size,
+                    kv_pool.kv_partition_axis,
+                    kv_pool.attention_data_partition_axis,
+                    kv_pool.mesh,
+                )
         # Set prefix_indices to all-but-last so extend_input_len=1.
         valid_slots = kv_indices_np[:seqlen]
         if len(valid_slots) >= 1:
