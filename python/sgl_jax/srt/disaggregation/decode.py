@@ -1055,19 +1055,12 @@ class SchedulerDisaggregationDecodeMixin:
         if is_swa_pool:
             mapping = kv_pool.full_to_swa_index_mapping
             if mapping is not None:
+                if isinstance(mapping, list):
+                    dp_rank = int(getattr(req, "dp_rank", 0) or 0)
+                    mapping = mapping[dp_rank]
                 swa_loc_np = np.full_like(loc_np, -1)
                 valid = loc_np >= 0
-                if isinstance(mapping, list):
-                    tokens_per_rank = len(loc_np) // kv_pool.dp_size
-                    for rank in range(kv_pool.dp_size):
-                        s = rank * tokens_per_rank
-                        e = s + tokens_per_rank
-                        rank_valid = valid[s:e]
-                        swa_loc_np[s:e][rank_valid] = np.asarray(
-                            mapping[rank]
-                        )[loc_np[s:e][rank_valid]]
-                else:
-                    swa_loc_np[valid] = np.asarray(mapping)[loc_np[valid]]
+                swa_loc_np[valid] = np.asarray(mapping)[loc_np[valid]]
                 swa_loc = jax.device_put(jnp.asarray(swa_loc_np), loc_sharding)
 
         for i, layer_id in enumerate(
