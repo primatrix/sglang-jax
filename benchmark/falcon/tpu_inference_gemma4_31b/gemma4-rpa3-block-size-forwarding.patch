@@ -1,0 +1,31 @@
+diff --git a/tpu_inference/layers/common/attention_interface.py b/tpu_inference/layers/common/attention_interface.py
+index 3f71b3c3..126db9d7 100644
+--- a/tpu_inference/layers/common/attention_interface.py
++++ b/tpu_inference/layers/common/attention_interface.py
+@@ -64,6 +64,18 @@ ragged_paged_attention_hd64 = rpa_hd64.ragged_paged_attention_hd64
+ get_kv_cache_shape_hd64 = rpa_hd64.get_kv_cache_shape
+
+
++def _rpa_v3_block_size_kwargs() -> dict[str, tuple[int, int, int, int]]:
++    """Return optional RPA v3 block-size overrides for common attention."""
++    if envs.USE_BATCHED_RPA_KERNEL:
++        return {}
++    env_to_kwarg = {
++        "d_block_sizes": envs.RPA_V3_DECODE_BLOCK_SIZES,
++        "p_block_sizes": envs.RPA_V3_PREFILL_BLOCK_SIZES,
++        "m_block_sizes": envs.RPA_V3_MIXED_BLOCK_SIZES,
++    }
++    return {key: tuple(value) for key, value in env_to_kwarg.items() if value}
++
++
+ def sharded_flash_attention(
+     mesh: Mesh,
+     causal: bool = True,
+@@ -456,6 +468,7 @@ def sharded_ragged_paged_attention(
+         if not use_hd64:
+             kwargs["update_kv_cache"] = update_kv_cache
+             kwargs["use_causal_mask"] = use_causal_mask
++            kwargs.update(_rpa_v3_block_size_kwargs())
+         return func(*args, **kwargs)
+
+     return jax.shard_map(

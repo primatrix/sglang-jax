@@ -1,0 +1,162 @@
+name: tpu-inference-gemma4-31b-mm-spmd-rpa3-256-cleanup-final
+exp_type: TRAINING
+artifact_type: GCS
+cluster_name: tpu-training-antgroup
+priority: 0
+model_version: google-gemma-4-31b-it
+config: '{"kind":"serving-performance","mode":"multimodal","attention_kernel":"rpa3","parallel_mode":"single-process-spmd","rpa3_prefill_block_sizes":[256,256,128,128],"rpa3_mixed_block_sizes":[256,256,128,128],"common_attention_block_size_forwarding_patch":true,"benchmark_cleanup_before_exit_patch":true,"model":"google/gemma-4-31B-it","hardware":"v7x-8","image":"vllm/vllm-tpu:nightly-20260810-a5596b2-f5bb701","tpu_inference_commit":"a5596b27f02d1b1f1fb64c8bd4b0a73ae19b0336","vllm_commit":"f5bb701fa270f5c801f1572e1478b56f292d8dfc"}'
+tags: [benchmark, performance, tpu-inference, gemma4, multimodal, spmd, rpa3, tuned, patched]
+role_to_task_spec:
+  worker:
+    command: |
+      set -eu
+      export TMPDIR="${TMPDIR:-/tmp/tpu_logs/tmp}"
+      export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/tmp/tpu_logs/pip-cache}"
+      export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/tpu_logs/uv-cache}"
+      export HF_HOME="${HF_HOME:-/tmp/tpu_logs/huggingface}"
+      export VLLM_XLA_CACHE_PATH="${VLLM_XLA_CACHE_PATH:-/tmp/tpu_logs/vllm-xla-cache}"
+      export JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-/tmp/tpu_logs/jax-cache}"
+      export UPLOAD_DB=false
+      export MLCOMPASS_EXPORT_ENABLED=false
+      export BUILDKITE=false
+      export RUN_TYPE=FALCON
+      export DEVICE=v7x-8
+      export RECORD_ID=gemma4-31b-mm-spmd-rpa3-v7x8
+      export TPU_MULTIPROCESS_DP=0
+      export USE_BATCHED_RPA_KERNEL=0
+      export RPA_V3_PREFILL_BLOCK_SIZES=256,256,128,128
+      export RPA_V3_MIXED_BLOCK_SIZES=256,256,128,128
+      OUT="${ARTIFACT_LOCAL_DIR:-/tmp/falcon-artifacts}"
+      mkdir -p "$OUT" "$TMPDIR" "$PIP_CACHE_DIR" "$UV_CACHE_DIR" \
+        "$HF_HOME" "$VLLM_XLA_CACHE_PATH" "$JAX_COMPILATION_CACHE_DIR"
+      ulimit -c 0
+
+      SRC=/tmp/tpu-inference-a5596b2
+      git init "$SRC"
+      git -C "$SRC" remote add origin https://github.com/vllm-project/tpu-inference.git
+      git -C "$SRC" fetch --depth 1 origin a5596b27f02d1b1f1fb64c8bd4b0a73ae19b0336
+      git -C "$SRC" -c advice.detachedHead=false checkout FETCH_HEAD
+      git -C "$SRC" apply - <<'PATCH'
+      diff --git a/tpu_inference/layers/common/attention_interface.py b/tpu_inference/layers/common/attention_interface.py
+      index 3f71b3c3..126db9d7 100644
+      --- a/tpu_inference/layers/common/attention_interface.py
+      +++ b/tpu_inference/layers/common/attention_interface.py
+      @@ -64,6 +64,18 @@ ragged_paged_attention_hd64 = rpa_hd64.ragged_paged_attention_hd64
+       get_kv_cache_shape_hd64 = rpa_hd64.get_kv_cache_shape
+
+
+      +def _rpa_v3_block_size_kwargs() -> dict[str, tuple[int, int, int, int]]:
+      +    """Return optional RPA v3 block-size overrides for common attention."""
+      +    if envs.USE_BATCHED_RPA_KERNEL:
+      +        return {}
+      +    env_to_kwarg = {
+      +        "d_block_sizes": envs.RPA_V3_DECODE_BLOCK_SIZES,
+      +        "p_block_sizes": envs.RPA_V3_PREFILL_BLOCK_SIZES,
+      +        "m_block_sizes": envs.RPA_V3_MIXED_BLOCK_SIZES,
+      +    }
+      +    return {key: tuple(value) for key, value in env_to_kwarg.items() if value}
+      +
+      +
+       def sharded_flash_attention(
+           mesh: Mesh,
+           causal: bool = True,
+      @@ -456,6 +468,7 @@ def sharded_ragged_paged_attention(
+               if not use_hd64:
+                   kwargs["update_kv_cache"] = update_kv_cache
+                   kwargs["use_causal_mask"] = use_causal_mask
+      +            kwargs.update(_rpa_v3_block_size_kwargs())
+               return func(*args, **kwargs)
+
+           return jax.shard_map(
+      PATCH
+      git -C "$SRC" apply - <<'CLEANUP_PATCH'
+      diff --git a/.buildkite/benchmark/scripts/run_bm.sh b/.buildkite/benchmark/scripts/run_bm.sh
+      --- a/.buildkite/benchmark/scripts/run_bm.sh
+      +++ b/.buildkite/benchmark/scripts/run_bm.sh
+      @@ -204,6 +204,11 @@ report_and_exit() {
+         echo "--- Calling report_result.sh for RECORD_ID=${record_id} with exit_code=${exit_code}"
+         bash "$SCRIPT_DIR/report_result.sh" "$record_id" "$exit_code" || exit $?
+
+      +  # Run cleanup before leaving the function, then disable the EXIT trap.
+      +  # This avoids Bash pop_var_context errors after multiprocess shutdown.
+      +  cleanup || true
+      +  trap - EXIT INT TERM
+      +
+         # Exit with the originally provided exit code.
+         exit "$exit_code"
+       }
+      CLEANUP_PATCH
+      export PYTHONPATH="$SRC${PYTHONPATH:+:$PYTHONPATH}"
+      cd "$SRC"
+
+      CASE_SRC=.buildkite/benchmark/cases/daily/Gemma4-31B-dataset_custom-inlen_1024-outlen_500.json
+      CASE_RUN=/tmp/gemma4-31b-mm-spmd-rpa3-v7x8.json
+      python3 - "$CASE_SRC" "$CASE_RUN" <<'PY'
+      import json
+      import sys
+
+      source, destination = sys.argv[1:]
+      target = "Gemma4-31B-1k/1f512x512/500-GBS256"
+      with open(source, encoding="utf-8") as handle:
+          data = json.load(handle)
+      for key in ("GCP_PROJECT_ID", "GCS_BUCKET", "GCP_INSTANCE_ID", "GCP_DATABASE_ID"):
+          data["global_env"].pop(key, None)
+      data["global_env"]["DEVICE"] = "v7x-8"
+      data["benchmark_cases"] = [
+          case for case in data["benchmark_cases"] if case["case_name"] == target
+      ]
+      if len(data["benchmark_cases"]) != 1:
+          raise SystemExit(f"expected exactly one case named {target!r}")
+      selected = data["benchmark_cases"][0]
+      selected["server_command_options"]["env"]["TPU_MULTIPROCESS_DP"] = "0"
+      selected["server_command_options"]["env"]["USE_BATCHED_RPA_KERNEL"] = "0"
+      selected["server_command_options"]["env"]["RPA_V3_PREFILL_BLOCK_SIZES"] = "256,256,128,128"
+      selected["server_command_options"]["env"]["RPA_V3_MIXED_BLOCK_SIZES"] = "256,256,128,128"
+      with open(destination, "w", encoding="utf-8") as handle:
+          json.dump(data, handle, indent=2)
+          handle.write("\n")
+      PY
+
+      cp "$CASE_SRC" "$OUT/upstream-case.json"
+      cp "$CASE_RUN" "$OUT/falcon-runtime-case.json"
+      git diff -- tpu_inference/layers/common/attention_interface.py \
+        > "$OUT/gemma4-rpa3-block-size-forwarding.patch"
+      git diff -- .buildkite/benchmark/scripts/run_bm.sh \
+        > "$OUT/benchmark-cleanup-before-exit.patch"
+      git rev-parse HEAD > "$OUT/tpu-inference-commit.txt"
+      {
+        echo 'image=vllm/vllm-tpu:nightly-20260810-a5596b2-f5bb701'
+        echo 'image_digest=sha256:56e225be2b4e8466464f4ec938234499a74b2652704d7f561088548ffff3ff6d'
+        echo 'parallel_mode=single-process-spmd'
+        echo 'attention_kernel=rpa3'
+        echo 'TPU_MULTIPROCESS_DP=0'
+        echo 'USE_BATCHED_RPA_KERNEL=0'
+        echo 'RPA_V3_PREFILL_BLOCK_SIZES=256,256,128,128'
+        echo 'RPA_V3_MIXED_BLOCK_SIZES=256,256,128,128'
+        echo 'common_attention_block_size_forwarding_patch=true'
+        echo 'benchmark_cleanup_before_exit_patch=true'
+        python3 - <<'PY'
+      import importlib.metadata as md
+      for package in ("vllm", "tpu-inference", "jax", "jaxlib", "libtpu"):
+          try:
+              print(f"{package}={md.version(package)}")
+          except md.PackageNotFoundError:
+              print(f"{package}=MISSING")
+      PY
+      } > "$OUT/versions.txt"
+
+      if ARTIFACT_FOLDER="$OUT" \
+        bash .buildkite/benchmark/scripts/run_bm.sh \
+          "$CASE_RUN" 'Gemma4-31B-1k/1f512x512/500-GBS256' \
+          > "$OUT/runner.log" 2>&1; then
+        cat "$OUT/runner.log"
+      else
+        status=$?
+        cat "$OUT/runner.log"
+        exit "$status"
+      fi
+    replica: 1
+    image: vllm/vllm-tpu:nightly-20260810-a5596b2-f5bb701
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x1

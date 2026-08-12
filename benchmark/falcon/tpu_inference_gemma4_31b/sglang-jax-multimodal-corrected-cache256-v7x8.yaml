@@ -1,0 +1,179 @@
+name: sglang-jax-gemma4-31b-mm-corrected-cache256-20260810-174007z
+exp_type: TRAINING
+artifact_type: GCS
+cluster_name: tpu-training-antgroup
+priority: 0
+model_version: google-gemma-4-31b-it
+config: '{"kind":"serving-performance","mode":"multimodal","model":"google/gemma-4-31B-it","hardware":"v7x-8","precision":"fp8-w8a8-text-bf16-vision-kv-e4m3","dp":4,"tp":2,"prompts":1000,"input_len":1024,"image":"1x512x512-jpeg","output_len":500,"max_running_requests_global":1024,"max_prefill_tokens_global":16384,"chunked_prefill_size_per_rank":4096,"mm_embedding_cache_size_mb_per_device":256,"mm_embedding_page_size":64}'
+tags: [benchmark, performance, sglang-jax, gemma4, multimodal, cache256, corrected-dp-budget]
+role_to_task_spec:
+  worker:
+    command: |
+      set -eu
+      export TMPDIR="${TMPDIR:-/tmp/tpu_logs/tmp}"
+      export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/tmp/tpu_logs/pip-cache}"
+      export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/tpu_logs/uv-cache}"
+      export JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-/tmp/tpu_logs/jax-cache}"
+      export HF_HOME=/tmp/tpu_logs/huggingface
+      export HF_HUB_CACHE=/tmp/tpu_logs/huggingface/hub
+      export TRANSFORMERS_CACHE=/tmp/tpu_logs/huggingface/hub
+      export XDG_CACHE_HOME=/tmp/tpu_logs/cache
+      OUT="${ARTIFACT_LOCAL_DIR:-/tmp/falcon-artifacts}"
+      mkdir -p "$TMPDIR" "$PIP_CACHE_DIR" "$UV_CACHE_DIR" \
+        "$JAX_COMPILATION_CACHE_DIR" "$HF_HUB_CACHE" "$XDG_CACHE_HOME" "$OUT"
+      ulimit -c 0
+
+      cd /tmp
+      git clone --branch feat/vlm-dev4 https://github.com/primatrix/sglang-jax.git
+      cd /tmp/sglang-jax
+      git checkout 021d1469e0034181836be95342dd486d2f468f77
+      touch /tmp/FALCON_SOURCE_READY
+      PATCH_READY=0
+      for i in $(seq 1 240); do
+        if [ -f /tmp/FALCON_PATCH_READY ]; then
+          PATCH_READY=1
+          break
+        fi
+        sleep 5
+      done
+      if [ "$PATCH_READY" != "1" ]; then
+        echo "Timed out waiting for workspace source overlay"
+        exit 1
+      fi
+
+      pip install -q -e python
+      pip install -q --upgrade 'transformers>=5.5.0'
+      pip install -q torch torchvision --index-url https://download.pytorch.org/whl/cpu
+      export PYTHONPATH="/tmp/sglang-jax/python:${PYTHONPATH:-}"
+
+      git rev-parse HEAD > "$OUT/sglang-jax-base-commit.txt"
+      sha256sum \
+        python/sgl_jax/srt/configs/gemma4.py \
+        python/sgl_jax/srt/configs/model_config.py \
+        python/sgl_jax/srt/hf_transformers_utils.py \
+        python/sgl_jax/srt/layers/attention/flashattention_backend.py \
+        python/sgl_jax/srt/model_executor/model_runner_kv_cache_mixin.py \
+        python/sgl_jax/srt/models/gemma4.py \
+        python/sgl_jax/srt/models/gemma4_vision.py \
+        python/sgl_jax/srt/multimodal/processors/gemma4.py \
+        python/sgl_jax/srt/utils/quantization/configs/fp8_w8a8_text_only.yaml \
+        > "$OUT/source-overlay.sha256"
+      python3 - <<'PY' > "$OUT/versions.txt"
+      import importlib.metadata as md
+      for package in ("jax", "jaxlib", "libtpu", "sglang-jax", "transformers", "torch"):
+          try:
+              print(f"{package}={md.version(package)}")
+          except md.PackageNotFoundError:
+              print(f"{package}=MISSING")
+      PY
+      cat > "$OUT/server-config.txt" <<'EOF'
+      max_running_requests_global=1024
+      max_prefill_tokens_global=16384
+      chunked_prefill_size_per_rank=4096
+      mm_embedding_cache_size_mb_per_device=256
+      mm_embedding_page_size=64
+      vision_encoder_parallel=dp
+      EOF
+
+      SERVER_PID=""
+      cleanup() {
+        if [ -n "$SERVER_PID" ]; then
+          kill "$SERVER_PID" 2>/dev/null || true
+          wait "$SERVER_PID" 2>/dev/null || true
+        fi
+      }
+      trap cleanup EXIT
+
+      python -m sgl_jax.launch_server \
+        --trust-remote-code --skip-server-warmup \
+        --device tpu --tp-size 8 --dp-size 4 \
+        --model-path google/gemma-4-31B-it \
+        --dtype bfloat16 \
+        --quantization-config-path python/sgl_jax/srt/utils/quantization/configs/fp8_w8a8_text_only.yaml \
+        --kv-cache-dtype fp8_e4m3 \
+        --context-length 2048 --max-seq-len 2048 \
+        --max-running-requests 1024 \
+        --max-prefill-tokens 16384 --chunked-prefill-size 4096 \
+        --mem-fraction-static 0.9 \
+        --page-size 128 --disable-radix-cache \
+        --vision-encoder-parallel dp \
+        --mm-embedding-cache-size-mb 256 \
+        --mm-embedding-page-size 64 \
+        --random-seed 0 \
+        --download-dir /tmp/tpu_logs/huggingface/hub \
+        --host 0.0.0.0 --port 30000 \
+        > "$OUT/server.log" 2>&1 &
+      SERVER_PID=$!
+
+      READY=0
+      for i in $(seq 1 480); do
+        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+          echo "launch_server died before ready"
+          cat "$OUT/server.log"
+          exit 1
+        fi
+        if curl -sf http://localhost:30000/get_server_info > "$OUT/server-info.json"; then
+          echo "server ready after ${i}0s"
+          READY=1
+          break
+        fi
+        sleep 10
+      done
+      if [ "$READY" != "1" ]; then
+        echo "launch_server did not become ready within 4800s"
+        tail -n 400 "$OUT/server.log"
+        exit 1
+      fi
+
+      if python -m sgl_jax.bench_serving \
+        --backend sglang-oai-chat \
+        --host 127.0.0.1 --port 30000 \
+        --model google/gemma-4-31B-it \
+        --tokenizer google/gemma-4-31B-it \
+        --dataset-name image \
+        --num-prompts 1000 \
+        --random-input-len 1024 \
+        --random-output-len 500 \
+        --random-range-ratio 1.0 \
+        --image-count 1 \
+        --image-resolution 512x512 \
+        --image-format jpeg \
+        --image-content random \
+        --request-rate inf \
+        --seed 0 \
+        --warmup-requests 1 \
+        --output-file "$OUT/benchmark.jsonl" \
+        > "$OUT/client.log" 2>&1; then
+        cat "$OUT/client.log"
+      else
+        status=$?
+        cat "$OUT/client.log"
+        tail -n 400 "$OUT/server.log"
+        exit "$status"
+      fi
+
+      python3 - "$OUT/benchmark.jsonl" <<'PY'
+      import json
+      import sys
+      with open(sys.argv[1], encoding="utf-8") as handle:
+          result = json.loads(list(handle)[-1])
+      keys = (
+          "completed", "duration", "request_throughput", "output_throughput",
+          "total_throughput", "median_ttft_ms", "p99_ttft_ms",
+          "median_tpot_ms", "p99_tpot_ms", "median_itl_ms", "p99_itl_ms",
+          "median_e2e_latency_ms", "p99_e2e_latency_ms",
+          "total_input_text_tokens", "total_input_vision_tokens",
+          "total_cached_tokens", "cache_hit_rate",
+      )
+      print("SGLANG_BENCH_RESULT=" + json.dumps({key: result[key] for key in keys}), flush=True)
+      if result["completed"] != 1000:
+          raise SystemExit(f"expected 1000 completed requests, got {result['completed']}")
+      PY
+
+      cleanup
+      SERVER_PID=""
+    replica: 1
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x1
