@@ -157,6 +157,7 @@ class OpenAIServingChat(OpenAIServingBase):
         """Apply Jinja chat template"""
         prompt = ""
         prompt_ids = []
+        prompt_from_mm_template = False
         openai_compatible_messages = []
         image_data = []
         video_data = []
@@ -235,7 +236,10 @@ Assistant: {% endif %}"""
                     tools=tools,
                     **chat_template_kwargs,
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
+                # The multimodal processor consumes this string and tokenizes it
+                # together with the image inputs later. Avoid encoding it here
+                # only to immediately decode it below.
+                prompt_from_mm_template = True
             else:
                 prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                     openai_compatible_messages,
@@ -261,12 +265,17 @@ Assistant: {% endif %}"""
             prompt_ids = prompt_ids["input_ids"]
 
         if assistant_prefix:
+            # Preserve the existing token-level concatenation semantics for the
+            # uncommon continue_final_message path.
+            if prompt_from_mm_template:
+                prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
+                prompt_from_mm_template = False
             encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
             if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
                 encoded = encoded[1:]
             prompt_ids += encoded
 
-        if is_multimodal:
+        if is_multimodal and not prompt_from_mm_template:
             prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
 
         stop = request.stop
