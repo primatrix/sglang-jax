@@ -1,0 +1,94 @@
+name: tpu-inference-gemma4-31b-mm-spmd-20260810-135317z
+exp_type: TRAINING
+artifact_type: GCS
+cluster_name: tpu-training-antgroup
+priority: 0
+model_version: google-gemma-4-31b-it
+config: '{"kind":"serving-performance","mode":"multimodal","parallel_mode":"single-process-spmd","model":"google/gemma-4-31B-it","hardware":"v7x-8","image":"vllm/vllm-tpu:nightly-20260810-a5596b2-f5bb701","tpu_inference_commit":"a5596b27f02d1b1f1fb64c8bd4b0a73ae19b0336","vllm_commit":"f5bb701fa270f5c801f1572e1478b56f292d8dfc"}'
+tags: [benchmark, performance, tpu-inference, gemma4, multimodal, spmd]
+role_to_task_spec:
+  worker:
+    command: |
+      set -eu
+      export TMPDIR="${TMPDIR:-/tmp/tpu_logs/tmp}"
+      export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/tmp/tpu_logs/pip-cache}"
+      export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/tpu_logs/uv-cache}"
+      export HF_HOME="${HF_HOME:-/tmp/tpu_logs/huggingface}"
+      export VLLM_XLA_CACHE_PATH="${VLLM_XLA_CACHE_PATH:-/tmp/tpu_logs/vllm-xla-cache}"
+      export JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-/tmp/tpu_logs/jax-cache}"
+      export UPLOAD_DB=false
+      export MLCOMPASS_EXPORT_ENABLED=false
+      export BUILDKITE=false
+      export RUN_TYPE=FALCON
+      export DEVICE=v7x-8
+      export RECORD_ID=gemma4-31b-mm-spmd-v7x8
+      OUT="${ARTIFACT_LOCAL_DIR:-/tmp/falcon-artifacts}"
+      mkdir -p "$OUT" "$TMPDIR" "$PIP_CACHE_DIR" "$UV_CACHE_DIR" \
+        "$HF_HOME" "$VLLM_XLA_CACHE_PATH" "$JAX_COMPILATION_CACHE_DIR"
+      ulimit -c 0
+
+      SRC=/tmp/tpu-inference-a5596b2
+      git init "$SRC"
+      git -C "$SRC" remote add origin https://github.com/vllm-project/tpu-inference.git
+      git -C "$SRC" fetch --depth 1 origin a5596b27f02d1b1f1fb64c8bd4b0a73ae19b0336
+      git -C "$SRC" -c advice.detachedHead=false checkout FETCH_HEAD
+      cd "$SRC"
+
+      CASE_SRC=.buildkite/benchmark/cases/daily/Gemma4-31B-dataset_custom-inlen_1024-outlen_500.json
+      CASE_RUN=/tmp/gemma4-31b-mm-spmd-v7x8.json
+      python3 - "$CASE_SRC" "$CASE_RUN" <<'PY'
+      import json
+      import sys
+
+      source, destination = sys.argv[1:]
+      target = "Gemma4-31B-1k/1f512x512/500-GBS256"
+      with open(source, encoding="utf-8") as handle:
+          data = json.load(handle)
+      for key in ("GCP_PROJECT_ID", "GCS_BUCKET", "GCP_INSTANCE_ID", "GCP_DATABASE_ID"):
+          data["global_env"].pop(key, None)
+      data["global_env"]["DEVICE"] = "v7x-8"
+      data["benchmark_cases"] = [
+          case for case in data["benchmark_cases"] if case["case_name"] == target
+      ]
+      if len(data["benchmark_cases"]) != 1:
+          raise SystemExit(f"expected exactly one case named {target!r}")
+      selected = data["benchmark_cases"][0]
+      selected["server_command_options"]["env"]["TPU_MULTIPROCESS_DP"] = "0"
+      with open(destination, "w", encoding="utf-8") as handle:
+          json.dump(data, handle, indent=2)
+          handle.write("\n")
+      PY
+
+      cp "$CASE_SRC" "$OUT/upstream-case.json"
+      cp "$CASE_RUN" "$OUT/falcon-runtime-case.json"
+      git rev-parse HEAD > "$OUT/tpu-inference-commit.txt"
+      {
+        echo 'image=vllm/vllm-tpu:nightly-20260810-a5596b2-f5bb701'
+        echo 'image_digest=sha256:56e225be2b4e8466464f4ec938234499a74b2652704d7f561088548ffff3ff6d'
+        echo 'parallel_mode=single-process-spmd'
+        echo 'TPU_MULTIPROCESS_DP=0'
+        python3 - <<'PY'
+      import importlib.metadata as md
+      for package in ("vllm", "tpu-inference", "jax", "jaxlib", "libtpu"):
+          try:
+              print(f"{package}={md.version(package)}")
+          except md.PackageNotFoundError:
+              print(f"{package}=MISSING")
+      PY
+      } > "$OUT/versions.txt"
+
+      if ARTIFACT_FOLDER="$OUT" \
+        bash .buildkite/benchmark/scripts/run_bm.sh \
+          "$CASE_RUN" 'Gemma4-31B-1k/1f512x512/500-GBS256' \
+          > "$OUT/runner.log" 2>&1; then
+        cat "$OUT/runner.log"
+      else
+        status=$?
+        cat "$OUT/runner.log"
+        exit "$status"
+      fi
+    replica: 1
+    image: vllm/vllm-tpu:nightly-20260810-a5596b2-f5bb701
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x1
