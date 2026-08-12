@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from sgl_jax.srt.managers.schedule_batch import Req, ScheduleBatch
+from sgl_jax.srt.managers.schedule_batch import (
+    Req,
+    ScheduleBatch,
+    swa_eviction_interval,
+)
 from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -374,17 +378,22 @@ class PrefillAdder:
     def _swa_budget_for_req(self, extend_input_len: int, dp_rank: int) -> int:
         """SWA pool budget per request.
 
-        With chunked prefill + overlap, peak SWA occupancy per request is
-        one chunk plus the sliding window. Floor at sliding_window_size
-        to reserve room for decode phase.
+        A decoding request keeps allocating one SWA slot per step while its
+        out-of-window slots are only reclaimed every ``evict_interval`` steps
+        (see :func:`swa_eviction_interval` / ``ScheduleBatch.maybe_evict_swa``).
+        Its peak live SWA footprint between eviction ticks is therefore
+        ``sliding_window + evict_interval``, not just ``sliding_window``.
+        Reserving that peak (shared formula with the evictor) keeps admission
+        and eviction consistent, so the adder stops before the SWA pool is
+        tipped into a decode-time retraction.
         """
         rem_chunk = (
             self.rem_chunk_tokens_list[dp_rank] if self.rem_chunk_tokens_list is not None else None
         )
         alloc = min(extend_input_len, rem_chunk) if rem_chunk is not None else extend_input_len
-        return (
-            self.ceil_paged_tokens(max(alloc, self.tree_cache.sliding_window_size)) + self.page_size
-        )
+        sw = self.tree_cache.sliding_window_size
+        evict_interval = swa_eviction_interval(sw, self.page_size)
+        return self.ceil_paged_tokens(max(alloc, sw + evict_interval))
 
     @property
     def rem_total_tokens(self):

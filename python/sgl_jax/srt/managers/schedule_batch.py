@@ -814,6 +814,21 @@ def _build_recurrent_track_entries(
     )
 
 
+def swa_eviction_interval(sliding_window_size: int, page_size: int) -> int:
+    """Page-aligned decode-step interval between SWA evictions.
+
+    Single source of truth shared by :meth:`ScheduleBatch.maybe_evict_swa`
+    (which actually evicts on this cadence) and the prefill admission budget
+    in ``schedule_policy.PrefillAdder._swa_budget_for_req`` (which must reserve
+    the peak SWA footprint a decoding request holds *between* eviction ticks).
+    Keeping both call sites on this one function makes admission and eviction
+    consistent for any ``SGL_JAX_SWA_EVICTION_INTERVAL_MULTIPLIER``.
+    """
+    multiplier = float(os.environ.get("SGL_JAX_SWA_EVICTION_INTERVAL_MULTIPLIER", "1.0"))
+    interval = max(page_size, int(sliding_window_size * multiplier))
+    return (interval // page_size) * page_size
+
+
 @dataclasses.dataclass
 class ScheduleBatch:
     """Store all information of a batch on the scheduler.
@@ -1588,9 +1603,7 @@ class ScheduleBatch:
         )
 
         if self.forward_mode is not None and self.forward_mode.is_decode():
-            multiplier = float(os.environ.get("SGL_JAX_SWA_EVICTION_INTERVAL_MULTIPLIER", "1.0"))
-            evict_interval = max(page_size, int(sliding_window_size * multiplier))
-            evict_interval = (evict_interval // page_size) * page_size
+            evict_interval = swa_eviction_interval(sliding_window_size, page_size)
             for dp_rank, info in enumerate(self.reqs_info):
                 if not info.reqs:
                     continue
