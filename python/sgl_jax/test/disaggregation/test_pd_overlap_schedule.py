@@ -160,12 +160,41 @@ def test_decode_overlap_drains_forward_thread_before_decode_queue():
 
     batch = FakeBatch()
 
+    iteration = [0]
+
+    class PreloadedDeque:
+        """A deque that ignores the first assignment (the loop's __init__
+        reset) and starts pre-populated so we can test the second iteration."""
+
+        def __init__(self):
+            from collections import deque
+
+            self._inner = deque(
+                [(SimpleNamespace(next_batch_sampling_info=None), SimpleNamespace())]
+            )
+            self._assigned = False
+
+        def popleft(self):
+            return self._inner.popleft()
+
+        def append(self, item):
+            self._inner.append(item)
+
     class FakeScheduler:
         disagg_decode_watchdog = FakeWatchdog()
         _comm_backend = None
         _engine_paused = False
         last_batch = object()
-        result_queue = None
+        init_new_token_ratio = 1.0
+        new_token_ratio = 1.0
+
+        def __init__(self):
+            self.result_queue = PreloadedDeque()
+
+        def __setattr__(self, name, value):
+            if name == "result_queue" and hasattr(self, "result_queue"):
+                return
+            super().__setattr__(name, value)
 
         def recv_requests(self):
             calls.append("recv")
@@ -183,7 +212,7 @@ def test_decode_overlap_drains_forward_thread_before_decode_queue():
 
         def get_next_batch_to_run(self):
             calls.append("get_next_batch")
-            return batch
+            return None
 
         def run_batch(self, batch):
             calls.append("run_batch")
@@ -194,12 +223,6 @@ def test_decode_overlap_drains_forward_thread_before_decode_queue():
 
         def process_batch_result(self, batch, result, launch_done=None):
             calls.append("batch_result")
-
-    from collections import deque
-
-    FakeScheduler.result_queue = deque(
-        [(SimpleNamespace(next_batch_sampling_info=None), SimpleNamespace())]
-    )
 
     try:
         SchedulerDisaggregationDecodeMixin.event_loop_overlap_disagg_decode(
