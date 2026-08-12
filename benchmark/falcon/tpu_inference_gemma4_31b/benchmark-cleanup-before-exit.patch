@@ -1,0 +1,15 @@
+diff --git a/.buildkite/benchmark/scripts/run_bm.sh b/.buildkite/benchmark/scripts/run_bm.sh
+--- a/.buildkite/benchmark/scripts/run_bm.sh
++++ b/.buildkite/benchmark/scripts/run_bm.sh
+@@ -204,6 +204,11 @@ report_and_exit() {
+   echo "--- Calling report_result.sh for RECORD_ID=${record_id} with exit_code=${exit_code}"
+   bash "$SCRIPT_DIR/report_result.sh" "$record_id" "$exit_code" || exit $?
+
++  # Run the idempotent cleanup before leaving the function.  Exiting from a
++  # function while the EXIT trap force-terminates a multiprocess server can
++  # otherwise trip Bash's pop_var_context error after valid results are saved.
++  cleanup || true
++  trap - EXIT INT TERM
+   # Exit with the originally provided exit code.
+   exit "$exit_code"
+ }

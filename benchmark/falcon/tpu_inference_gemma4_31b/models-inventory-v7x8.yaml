@@ -1,0 +1,66 @@
+name: gemma4-models-gcsfuse-inventory-cache-dirs-20260810-154500z
+exp_type: TRAINING
+artifact_type: GCS
+cluster_name: tpu-training-antgroup
+priority: 0
+model_version: google-gemma-4-31b-it
+config: '{"kind":"model-inventory","mount":"/models","bucket":"inference-model-storage-poc-tpu-hns","hardware":"v7x-8"}'
+tags: [diagnostic, model-inventory, gemma4]
+role_to_task_spec:
+  worker:
+    command: |
+      set -eu
+      OUT="${ARTIFACT_LOCAL_DIR:-/tmp/falcon-artifacts}"
+      mkdir -p "$OUT"
+      ulimit -c 0
+
+      {
+        echo 'root=/models'
+        ls -lah /models
+        for candidate in \
+          /models/*gemma* \
+          /models/*Gemma* \
+          /models/*/*gemma* \
+          /models/*/*Gemma* \
+          /models/models--google--gemma-4-31B-it/snapshots/* \
+          /models/hub/models--google--gemma-4-31B-it/snapshots/*; do
+          if [ -d "$candidate" ]; then
+            echo "candidate=$candidate"
+            ls -lah "$candidate"
+          fi
+        done
+        for cache_dir in \
+          /models/.hf_cache \
+          /models/huggingface \
+          /models/hf \
+          /models/model-cache \
+          /models/inference-model-storage-poc-tpu-hns; do
+          if [ -d "$cache_dir" ]; then
+            echo "cache_dir=$cache_dir"
+            ls -lah "$cache_dir"
+          fi
+        done
+      } > "$OUT/models-inventory.txt" 2>&1
+      cat "$OUT/models-inventory.txt"
+    replica: 1
+    image: vllm/vllm-tpu:nightly-20260810-a5596b2-f5bb701
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x1
+    mounts:
+      - name: models
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        mount_path: /models
+        read_only: true
+        mount_options:
+          - implicit-dirs
+          - metadata-cache:ttl-secs:-1
+          - metadata-cache:stat-cache-max-size-mb:-1
+          - metadata-cache:type-cache-max-size-mb:-1
+          - file-system:kernel-list-cache-ttl-secs:-1
+          - read:enable-buffered-read:true
+          - read:block-size-mb:32
+          - read:max-blocks-per-handle:64
+          - read:global-max-blocks:2048
+          - read_ahead_kb=1024

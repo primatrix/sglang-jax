@@ -1,0 +1,83 @@
+schema_version: 1
+exp_id: exp-prrux3n44r
+spec:
+  name: tpu-inference-serving-benchmark-summary
+  command: /bin/sh "$FALCON_SCRIPT_PATH"
+  script_content: |
+    #!/usr/bin/env sh
+    set -eu
+
+    result_file=""
+    for candidate in "$ARTIFACT_LOCAL_DIR"/*.result; do
+      if [ -f "$candidate" ]; then
+        result_file="$candidate"
+        break
+      fi
+    done
+    if [ -z "$result_file" ]; then
+      echo "no top-level .result file found" >&2
+      exit 1
+    fi
+
+    metric() {
+      awk -F= -v key="$1" '$1 == key { print $2; exit }' "$result_file"
+    }
+
+    throughput="$(metric Throughput)"
+    output_throughput="$(metric OutputTokenThroughput)"
+    total_throughput="$(metric TotalTokenThroughput)"
+    median_ttft="$(metric MedianTTFT)"
+    p99_ttft="$(metric P99TTFT)"
+    median_tpot="$(metric MedianTPOT)"
+    p99_tpot="$(metric P99TPOT)"
+    median_itl="$(metric MedianITL)"
+    p99_itl="$(metric P99ITL)"
+    median_e2el="$(metric MedianETEL)"
+    p99_e2el="$(metric P99ETEL)"
+
+    cat > "$RESULT_LOCAL_DIR/summary.json" <<EOF
+    {
+      "result_file": "$(basename "$result_file")",
+      "request_throughput_req_s": $throughput,
+      "output_token_throughput_tok_s": $output_throughput,
+      "total_token_throughput_tok_s": $total_throughput,
+      "median_ttft_ms": $median_ttft,
+      "p99_ttft_ms": $p99_ttft,
+      "median_tpot_ms": $median_tpot,
+      "p99_tpot_ms": $p99_tpot,
+      "median_itl_ms": $median_itl,
+      "p99_itl_ms": $p99_itl,
+      "median_e2el_ms": $median_e2el,
+      "p99_e2el_ms": $p99_e2el
+    }
+    EOF
+
+    cat > "$RESULT_LOCAL_DIR/report.md" <<EOF
+    # tpu-inference serving benchmark
+
+    Source: \`$(basename "$result_file")\`
+
+    | Metric | Value |
+    | --- | ---: |
+    | Request throughput | $throughput req/s |
+    | Output token throughput | $output_throughput tok/s |
+    | Total token throughput | $total_throughput tok/s |
+    | Median / P99 TTFT | $median_ttft / $p99_ttft ms |
+    | Median / P99 TPOT | $median_tpot / $p99_tpot ms |
+    | Median / P99 ITL | $median_itl / $p99_itl ms |
+    | Median / P99 E2EL | $median_e2el / $p99_e2el ms |
+    EOF
+  outputs:
+    - path: summary.json
+      type: json
+      required: true
+      description: Structured vLLM serving benchmark metrics
+    - path: report.md
+      type: markdown
+      required: true
+      description: Human-readable vLLM serving benchmark summary
+  params:
+    workload: text-spmd
+    model: google/gemma-4-31B-it
+  resources:
+    memory_limit: 256Mi
