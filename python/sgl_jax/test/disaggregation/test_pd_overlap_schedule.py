@@ -134,7 +134,12 @@ def test_prefill_chunk_snapshot_keeps_mid_chunk_when_global_state_advances():
     assert calls == [False]
 
 
-def test_decode_overlap_polls_transfer_queue_after_launch_before_result_processing():
+def test_decode_overlap_drains_forward_thread_before_decode_queue():
+    """The overlap decode loop must drain the previous batch result (forward
+    thread) BEFORE calling process_decode_queue (SPMD collective).  This
+    prevents process_allgather in process_decode_queue from racing with
+    jit_jitted_sampler on the forward thread, which causes E0200 on
+    multi-host TPU.  See commit 3c301255."""
     from sgl_jax.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 
     class StopLoop(Exception):
@@ -160,6 +165,7 @@ def test_decode_overlap_polls_transfer_queue_after_launch_before_result_processi
         _comm_backend = None
         _engine_paused = False
         last_batch = object()
+        result_queue = None
 
         def recv_requests(self):
             calls.append("recv")
@@ -172,10 +178,8 @@ def test_decode_overlap_polls_transfer_queue_after_launch_before_result_processi
             calls.append("process_input")
 
         def process_decode_queue(self):
-            if "run_batch" in calls:
-                calls.append("after_launch_poll")
-                raise StopLoop
-            calls.append("pre_launch_poll")
+            calls.append("decode_queue")
+            raise StopLoop
 
         def get_next_batch_to_run(self):
             calls.append("get_next_batch")
@@ -189,10 +193,13 @@ def test_decode_overlap_polls_transfer_queue_after_launch_before_result_processi
             return SimpleNamespace(cur_sampling_info=None)
 
         def process_batch_result(self, batch, result, launch_done=None):
-            raise AssertionError(
-                "decode overlap loop processed a batch result before polling "
-                "the transfer queue after launch"
-            )
+            calls.append("batch_result")
+
+    from collections import deque
+
+    FakeScheduler.result_queue = deque(
+        [(SimpleNamespace(next_batch_sampling_info=None), SimpleNamespace())]
+    )
 
     try:
         SchedulerDisaggregationDecodeMixin.event_loop_overlap_disagg_decode(
@@ -201,4 +208,9 @@ def test_decode_overlap_polls_transfer_queue_after_launch_before_result_processi
     except StopLoop:
         pass
 
-    assert calls.index("after_launch_poll") > calls.index("run_batch")
+    assert "batch_result" in calls, "process_batch_result was never called"
+    assert "decode_queue" in calls, "process_decode_queue was never called"
+    assert calls.index("batch_result") < calls.index("decode_queue"), (
+        "process_batch_result must run BEFORE process_decode_queue to prevent "
+        "SPMD race between forward thread and decode queue collective"
+    )
