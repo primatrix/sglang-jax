@@ -829,6 +829,13 @@ def swa_eviction_interval(sliding_window_size: int, page_size: int) -> int:
     return (interval // page_size) * page_size
 
 
+def swa_eviction_peak_tokens(sliding_window_size: int, page_size: int) -> int:
+    """Maximum live SWA tokens held by a decoding request between evictions."""
+    return (
+        sliding_window_size + swa_eviction_interval(sliding_window_size, page_size) + 2 * page_size
+    )
+
+
 @dataclasses.dataclass
 class ScheduleBatch:
     """Store all information of a batch on the scheduler.
@@ -1489,13 +1496,11 @@ class ScheduleBatch:
             )
 
             # Retract until sufficient for this rank
-            first_iter = True
-            while first_iter or (not has_sufficient_memory(dp_rank, sorted_indices)):
+            while not has_sufficient_memory(dp_rank, sorted_indices):
                 if len(sorted_indices) == 1:
                     # Keep at least one request in the loop; handle OOM below.
                     break
 
-                first_iter = False
                 retract_idx = sorted_indices.pop()
                 req = info.reqs[retract_idx]
                 retracted_reqs.append(req)
