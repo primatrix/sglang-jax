@@ -402,6 +402,48 @@ class PrefillAdder:
         )
         return max(0, self._swa_decode_peak_tokens() - live_tokens)
 
+    def _full_page_headroom_for_req(self, req: Req, *, input_allocated: bool) -> int:
+        """Return worst-case future full-attention KV demand in allocator units."""
+        max_new_tokens = min(
+            req.sampling_params.max_new_tokens,
+            CLIP_MAX_NEW_TOKENS_ESTIMATION,
+        )
+        # The last generated token is returned to the client but never becomes
+        # a KV-cache input. The allocator still reserves whole pages.
+        final_kv_tokens = len(req.origin_input_ids) + max(0, max_new_tokens - 1)
+        final_pages = self.ceil_paged_tokens(final_kv_tokens)
+        current_pages = self.ceil_paged_tokens(req.kv_allocated_len) if input_allocated else 0
+        return max(0, final_pages - current_pages)
+
+    def _has_full_page_headroom(self, req: Req, dp_rank: int) -> bool:
+        """Check page-exact full-attention demand for ignore-EOS admission.
+
+        The lifecycle simulation below works in logical-token units. This
+        guard mirrors the real paged allocator so a synchronized page-boundary
+        burst cannot over-admit the full-attention pool.
+        """
+        running_reqs = []
+        if self.running_batch is not None:
+            running_reqs = self.running_batch.reqs_info[dp_rank].reqs or []
+        pending_reqs = self.can_run_list.get(dp_rank, [])
+        required = sum(
+            self._full_page_headroom_for_req(r, input_allocated=True) for r in running_reqs
+        )
+        required += sum(
+            self._full_page_headroom_for_req(r, input_allocated=False) for r in pending_reqs
+        )
+        required += self._full_page_headroom_for_req(req, input_allocated=False)
+
+        if self.is_hybrid:
+            available = self.token_to_kv_pool_allocator.full_available_size(
+                dp_rank=dp_rank
+            ) + self.tree_cache.full_evictable_size(dp_rank=dp_rank)
+        else:
+            available = self.token_to_kv_pool_allocator.available_size(
+                dp_rank=dp_rank
+            ) + self.tree_cache.evictable_size(dp_rank=dp_rank)
+        return required <= available
+
     @property
     def rem_total_tokens(self):
         """Global remaining total tokens (minimum across all DP ranks).
@@ -541,6 +583,8 @@ class PrefillAdder:
         if self.is_hybrid and self._swa_budget_for_req(
             req.extend_input_len, dp_rank
         ) > self.rem_swa_tokens_for_dp(dp_rank):
+            return AddReqResult.NO_TOKEN
+        if not self._has_full_page_headroom(req, dp_rank):
             return AddReqResult.NO_TOKEN
 
         def add_req_state(r, insert_sort=False):

@@ -19,10 +19,17 @@ from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.utils import cdiv
+from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import device_array
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
 logger = logging.getLogger(__name__)
+
+USE_BATCHED_RPA_KERNEL = get_bool_env_var("SGL_JAX_USE_BATCHED_RPA_KERNEL")
+if USE_BATCHED_RPA_KERNEL:
+    from sgl_jax.srt.kernels.batched_ragged_paged_attention.wrapper import (
+        ragged_paged_attention as batched_ragged_paged_attention,
+    )
 
 
 def _per_dp_cumsum(lens, dp_size: int, per_dp_bs: int) -> np.ndarray:
@@ -107,6 +114,8 @@ class FlashAttention(AttentionBackend):
         self.attention_data_partition_axis = attention_data_partition_axis
         self.forward_metadata = nnx.data(FlashAttentionMetadata())
         self.mesh = mesh
+        if USE_BATCHED_RPA_KERNEL:
+            logger.info("Using experimental Batched RPA kernel")
         # SWA dual-pool support: set by model_runner after pool creation.
         # Accessed on host during metadata construction.
 
@@ -579,23 +588,46 @@ class FlashAttention(AttentionBackend):
             queries, keys, values, kv_cache_fused = args[:4]
             other_args = args[4:]
 
-            # Call fused KV kernel with head interleaving
-            result, updated_kv_cache_fused = ragged_paged_attention_v3(
-                queries,
-                keys,
-                values,
-                kv_cache_fused,
-                *other_args,
-                causal=causal,
-                sm_scale=scale,
-                sliding_window=layer.sliding_window_size,
-                soft_cap=layer.logit_cap,
-                xai_temperature_len=(
-                    layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
-                ),
-                softmax_dtype=layer.softmax_dtype,
-                mask_aligned_to_cu_kv=mask_aligned_to_cu_kv,
+            use_batched_rpa = (
+                USE_BATCHED_RPA_KERNEL
+                and self.forward_metadata.custom_mask is None
+                and attention_sink is None
+                and causal == 1
+                and layer.xai_temperature_len <= 0
             )
+            if use_batched_rpa:
+                kv_lens, page_indices, cu_q_lens, _, distribution = other_args[:5]
+                result, updated_kv_cache_fused = batched_ragged_paged_attention(
+                    queries,
+                    keys,
+                    values,
+                    kv_cache_fused,
+                    kv_lens,
+                    page_indices,
+                    cu_q_lens,
+                    distribution,
+                    sm_scale=scale,
+                    sliding_window=layer.sliding_window_size,
+                    soft_cap=layer.logit_cap,
+                )
+            else:
+                # Call fused KV kernel with head interleaving
+                result, updated_kv_cache_fused = ragged_paged_attention_v3(
+                    queries,
+                    keys,
+                    values,
+                    kv_cache_fused,
+                    *other_args,
+                    causal=causal,
+                    sm_scale=scale,
+                    sliding_window=layer.sliding_window_size,
+                    soft_cap=layer.logit_cap,
+                    xai_temperature_len=(
+                        layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
+                    ),
+                    softmax_dtype=layer.softmax_dtype,
+                    mask_aligned_to_cu_kv=mask_aligned_to_cu_kv,
+                )
 
             return result, updated_kv_cache_fused
 

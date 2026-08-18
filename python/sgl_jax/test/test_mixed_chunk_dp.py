@@ -14,6 +14,14 @@ class _DummyAllocator:
         return 1_000_000
 
 
+class _CapacityAllocator:
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+
+    def available_size(self, dp_rank: int = 0):
+        return self.capacity
+
+
 class _DummyTreeCache:
     def evictable_size(self, dp_rank: int = 0):
         return 0
@@ -217,6 +225,34 @@ class TestMixedChunkDP(unittest.TestCase):
             self.assertEqual(len(adder.can_run_list[dp]), 1)
             self.assertIs(adder.new_chunked_reqs[dp], adder.can_run_list[dp][0])
             self.assertEqual(adder.can_run_list[dp][0].extend_input_len, 2048)
+
+    def test_ignore_eos_admission_uses_page_exact_full_headroom(self):
+        adder = PrefillAdder(
+            page_size=128,
+            tree_cache=_DummyTreeCache(),
+            token_to_kv_pool_allocator=_CapacityAllocator(4096),
+            running_batch=None,
+            new_token_ratio=1.0,
+            rem_input_tokens=10_000,
+            rem_chunk_tokens=None,
+            dp_size=1,
+        )
+
+        results = []
+        for i in range(3):
+            req = _make_req(f"page-{i}", dp_rank=0, input_len=1467, output_len=0)
+            req.sampling_params.max_new_tokens = 500
+            req.sampling_params.ignore_eos = True
+            req.fill_ids = req.origin_input_ids
+            req.extend_input_len = len(req.fill_ids)
+            results.append(adder.add_one_req(req))
+
+        # ceil((1467 + 500 - 1) / 128) * 128 == 2048, so a 4096-token
+        # pool admits exactly two requests and rejects the third.
+        self.assertEqual(
+            results,
+            [AddReqResult.CONTINUE, AddReqResult.CONTINUE, AddReqResult.NO_TOKEN],
+        )
 
 
 if __name__ == "__main__":
