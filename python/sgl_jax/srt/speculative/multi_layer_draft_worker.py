@@ -136,7 +136,19 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         model_worker_batch: ModelWorkerBatch,
         hidden_states: jax.Array,
         next_token_ids: jax.Array,
-    ) -> None:
+        *,
+        relay_buffers=None,
+        relay_future_indices=None,
+        relay_valid_mask=None,
+    ) -> object | None:
+        """Run the fused NEXTN prefix draft pass.
+
+        With ``relay_buffers`` set (overlap scheduling), the prefix chain is
+        published into the relay buffers inside the same JIT and the returned
+        draft state is pure relay indices, so the first decode can merge into
+        an active relay batch without a parked bootstrap round. Returns the
+        updated relay buffers in that case, otherwise ``None``.
+        """
         selector = np.asarray(model_worker_batch.logits_indices_selector)
         verified_id = np.asarray(jax.device_get(next_token_ids))[selector]
         model_worker_batch.spec_info_padded = EagleDraftInput(
@@ -155,17 +167,43 @@ class MultiLayerDraftWorker(EagleDraftWorker):
 
         from sgl_jax.srt.speculative.draft_extend_fused import mtp_prefill_draft_extend
 
-        selected_hidden, token_chain = mtp_prefill_draft_extend(
+        if relay_buffers is not None:
+            _, _, updated_relay_buffers = mtp_prefill_draft_extend(
+                self,
+                model_worker_batch,
+                hidden_states,
+                next_token_ids,
+                relay_buffers=relay_buffers,
+                relay_future_indices=relay_future_indices,
+                relay_valid_mask=relay_valid_mask,
+            )
+            # Relay-form state: only req indices + allocation lengths cross the
+            # scheduler boundary; the chain/hidden/verified_id live in the
+            # relay buffers and are gathered by the first fused verify.
+            model_worker_batch.spec_info_padded = EagleDraftInput(
+                future_indices=np.asarray(
+                    model_worker_batch.req_pool_indices, dtype=np.int32
+                )[selector],
+                allocate_lens=np.asarray(model_worker_batch.seq_lens, dtype=np.int32)[selector],
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                num_tokens_per_batch=np.asarray(1, dtype=jnp.int32),
+                num_tokens_for_logprob_per_batch=np.asarray(1, dtype=jnp.int32),
+            )
+            return updated_relay_buffers
+
+        selected_hidden, token_chain, _ = mtp_prefill_draft_extend(
             self,
             model_worker_batch,
             hidden_states,
+            next_token_ids,
         )
         model_worker_batch.spec_info_padded.hidden_states = selected_hidden
         model_worker_batch.spec_info_padded.topk_index = token_chain
         model_worker_batch.spec_info_padded.verified_id = verified_id
-        model_worker_batch.spec_info_padded.allocate_lens = np.asarray(model_worker_batch.seq_lens)[
-            selector
-        ]
+        model_worker_batch.spec_info_padded.allocate_lens = np.asarray(
+            model_worker_batch.seq_lens
+        )[selector]
+        return None
 
     def draft_extend_for_decode(
         self,

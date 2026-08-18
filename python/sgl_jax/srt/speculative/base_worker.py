@@ -44,7 +44,16 @@ class BaseDraftWorker(ABC):
         pass
 
     @abstractmethod
-    def draft_extend_for_prefill(self, model_worker_batch, hidden_states, next_token_ids):
+    def draft_extend_for_prefill(
+        self,
+        model_worker_batch,
+        hidden_states,
+        next_token_ids,
+        *,
+        relay_buffers=None,
+        relay_future_indices=None,
+        relay_valid_mask=None,
+    ):
         pass
 
     @abstractmethod
@@ -246,9 +255,34 @@ class BaseSpecWorker:
                 from jax.experimental.multihost_utils import process_allgather
 
                 next_token_ids = process_allgather(next_token_ids, tiled=True)
-            self.draft_worker.draft_extend_for_prefill(
-                model_worker_batch, logits_output.hidden_states, next_token_ids
-            )
+            if (
+                getattr(self, "_can_use_fused_mtp_verify", False)
+                and self.spec_relay_buffers is not None
+            ):
+                # Multi-layer NEXTN/MTP: publish the prefix chain into the
+                # relay buffers at prefill time so the first decode can merge
+                # into an active relay batch directly. Without this, the
+                # scheduler parks the running batch for one isolated bootstrap
+                # round per prefill, which costs throughput proportional to the
+                # running batch size.
+                self.init_spec_relay_buffers()
+                from sgl_jax.srt.speculative.relay_buffer import build_relay_batch_plan
+
+                relay_plan = build_relay_batch_plan(model_worker_batch)
+                updated_relay_buffers = self.draft_worker.draft_extend_for_prefill(
+                    model_worker_batch,
+                    logits_output.hidden_states,
+                    next_token_ids,
+                    relay_buffers=self.spec_relay_buffers,
+                    relay_future_indices=relay_plan.padded_indices,
+                    relay_valid_mask=relay_plan.valid_mask,
+                )
+                if updated_relay_buffers is not None:
+                    self.spec_relay_buffers = updated_relay_buffers
+            else:
+                self.draft_worker.draft_extend_for_prefill(
+                    model_worker_batch, logits_output.hidden_states, next_token_ids
+                )
             # The generic overlap loop waits for the current batch to finish
             # enqueueing before it resolves the previous batch.
             batch_launch_done = getattr(model_worker_batch, "launch_done", None)

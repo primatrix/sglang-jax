@@ -530,7 +530,7 @@ def _build_mtp_prefill_draft_extend(num_layers: int):
     @partial(
         jax.jit,
         donate_argnames=["all_memory_pools"],
-        static_argnames=["model_state_def", "num_layers", "dp_size"],
+        static_argnames=["model_state_def", "num_layers", "update_relay", "dp_size"],
     )
     def fused_mtp_prefill_draft_extend(
         model_def,
@@ -540,10 +540,15 @@ def _build_mtp_prefill_draft_extend(num_layers: int):
         all_memory_pools,
         logits_metadata,
         target_hidden,
+        verified_id,
         draft_logits_indices,
         allocated_lens,
+        relay_buffers,
+        relay_future_indices,
+        relay_valid_mask,
         *,
         num_layers,
+        update_relay,
         dp_size,
     ):
         page_layout = forward_batch.attn_backend.forward_metadata
@@ -607,16 +612,34 @@ def _build_mtp_prefill_draft_extend(num_layers: int):
         )
         stacked_tokens = jnp.stack(token_chain, axis=1)
 
-        sharding = jax.typeof(stacked_tokens).sharding
-        if isinstance(sharding, NamedSharding) and not sharding.mesh.empty:
-            replicated = NamedSharding(sharding.mesh, P())
-            selected_hidden = jax.sharding.reshard(selected_hidden, replicated)
-            stacked_tokens = jax.sharding.reshard(stacked_tokens, replicated)
+        updated_relay_buffers = relay_buffers
+        if update_relay:
+            updated_relay_buffers = scatter_relay_buffers(
+                relay_buffers,
+                relay_future_indices,
+                relay_valid_mask,
+                SpecRelayBuffers(
+                    topk_index=stacked_tokens,
+                    hidden_states=selected_hidden,
+                    verified_id=verified_id,
+                    # The prefill committed one token per request, so the
+                    # relay length starts at seq_lens + 1 (== committed).
+                    new_seq_lens=forward_batch.seq_lens + 1,
+                ),
+                dp_size=dp_size,
+            )
+        else:
+            sharding = jax.typeof(stacked_tokens).sharding
+            if isinstance(sharding, NamedSharding) and not sharding.mesh.empty:
+                replicated = NamedSharding(sharding.mesh, P())
+                selected_hidden = jax.sharding.reshard(selected_hidden, replicated)
+                stacked_tokens = jax.sharding.reshard(stacked_tokens, replicated)
 
         return (
             selected_hidden,
             stacked_tokens,
             tuple(all_pool_updates),
+            updated_relay_buffers,
         )
 
     return fused_mtp_prefill_draft_extend
@@ -1524,9 +1547,25 @@ def _make_forward_batch(batch, model_runner):
     )
 
 
-def mtp_prefill_draft_extend(draft_worker, model_worker_batch, target_hidden):
-    """Run all NEXTN prefix layers in one fused topk=1 draft JIT."""
+def mtp_prefill_draft_extend(
+    draft_worker,
+    model_worker_batch,
+    target_hidden,
+    verified_id,
+    *,
+    relay_buffers=None,
+    relay_future_indices=None,
+    relay_valid_mask=None,
+):
+    """Run all NEXTN prefix layers in one fused topk=1 draft JIT.
+
+    With ``relay_buffers`` set, the resulting chain is published into the
+    relay buffers inside the same JIT (prefill-time relay-ization); otherwise
+    the selected hidden/chain are copied to host for direct draft state.
+    """
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+
+    update_relay = relay_buffers is not None
 
     runner0 = draft_worker.draft_model_runner
     runner0.attn_backend.forward_metadata = runner0.attn_backend.prepare_paged_kv_layout(
@@ -1546,6 +1585,22 @@ def mtp_prefill_draft_extend(draft_worker, model_worker_batch, target_hidden):
         data_sharding,
         "mtp_prefill.allocate_lens",
     )
+    verified_id_device = _prepare_device_array(
+        verified_id,
+        data_sharding,
+        "mtp_prefill.verified_id",
+    )
+    if update_relay:
+        relay_future_indices = _prepare_device_array(
+            relay_future_indices,
+            data_sharding,
+            "mtp_prefill.relay_future_indices",
+        )
+        relay_valid_mask = _prepare_device_array(
+            relay_valid_mask,
+            data_sharding,
+            "mtp_prefill.relay_valid_mask",
+        )
 
     all_memory_pools = tuple(worker.model_runner.memory_pools for worker in draft_worker._workers)
     all_leaves = tuple(
@@ -1557,7 +1612,7 @@ def mtp_prefill_draft_extend(draft_worker, model_worker_batch, target_hidden):
         )
 
     with jax.set_mesh(draft_worker.mesh):
-        selected_hidden, token_chain, all_pool_updates = (
+        selected_hidden, token_chain, all_pool_updates, updated_relay_buffers = (
             draft_worker._fused_mtp_prefill_draft_extend_jit_fn(
                 runner0._model_def,
                 runner0._model_state_def,
@@ -1566,9 +1621,14 @@ def mtp_prefill_draft_extend(draft_worker, model_worker_batch, target_hidden):
                 all_memory_pools,
                 logits_metadata,
                 target_hidden,
+                verified_id_device,
                 draft_logits_indices,
                 allocated_lens,
+                relay_buffers,
+                relay_future_indices,
+                relay_valid_mask,
                 num_layers=draft_worker.speculative_num_steps,
+                update_relay=update_relay,
                 dp_size=model_worker_batch.dp_size,
             )
         )
@@ -1576,10 +1636,19 @@ def mtp_prefill_draft_extend(draft_worker, model_worker_batch, target_hidden):
     for layer_idx, worker in enumerate(draft_worker._workers):
         worker.model_runner.memory_pools.replace_all(all_pool_updates[layer_idx])
 
+    if update_relay:
+        # No host round-trip on the relay path: the chain lives in the relay
+        # buffers and the request state is published as relay indices.
+        return None, None, updated_relay_buffers
+
     jax.copy_to_host_async(selected_hidden)
     jax.copy_to_host_async(token_chain)
     selector = np.asarray(model_worker_batch.logits_indices_selector)
-    return np.asarray(selected_hidden)[selector], np.asarray(token_chain)[selector]
+    return (
+        np.asarray(selected_hidden)[selector],
+        np.asarray(token_chain)[selector],
+        None,
+    )
 
 
 def eagle_prefill_draft_extend(draft_worker, model_worker_batch):
