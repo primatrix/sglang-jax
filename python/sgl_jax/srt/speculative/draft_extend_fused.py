@@ -1392,6 +1392,11 @@ def _prepare_verify(
         verify_input = EagleVerifyInput(
             draft_token=jax.device_put(np.zeros((flat,), dtype=np.int32), data_sharding),
             positions=jax.device_put(np.zeros((flat,), dtype=np.int32), data_sharding),
+            # Restores the target-verify tuned RPA block sizes: the attention
+            # backend clamps the tuned bq to draft_token_num (bq_4_4 at 4 draft
+            # tokens); without it the kernel falls back to the generic
+            # heuristic bq_32_32, which regressed full-attention RPA ~4.3x.
+            draft_token_num=n,
         )
         placeholder_cache[placeholder_key] = verify_input
     model_worker_batch.spec_info_padded = verify_input

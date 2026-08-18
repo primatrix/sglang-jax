@@ -543,19 +543,26 @@ class EagleVerifyInput:
     #: device ``(b*draft_token_num,)`` — verify positions (follows
     #: ``ForwardBatch`` host/device convention).
     positions: jax.Array
+    #: static int — number of draft tokens per request in this verify round.
+    #: Consumed by the attention backend to select the target-verify tuned RPA
+    #: block sizes (bq is clamped to this value). Removing it falls back to the
+    #: generic heuristic (bq_32_32 instead of bq_4_4), which regressed full
+    #: attention RPA ~4.3x.
+    draft_token_num: int = 0
 
     def tree_flatten(self):
         children = (
             self.draft_token,
             self.positions,
         )
-        return (children, None)
+        return (children, {"draft_token_num": int(self.draft_token_num)})
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         obj = cls.__new__(cls)
         obj.draft_token = children[0]
         obj.positions = children[1]
+        obj.draft_token_num = aux_data["draft_token_num"]
 
         return obj
 
