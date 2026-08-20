@@ -1371,6 +1371,7 @@ def _prepare_verify(
         verify_input = EagleVerifyInput(
             draft_token=jax.device_put(np.zeros((flat,), dtype=np.int32), data_sharding),
             positions=jax.device_put(np.zeros((flat,), dtype=np.int32), data_sharding),
+            draft_token_num=n,
         )
         placeholder_cache[placeholder_key] = verify_input
     model_worker_batch.spec_info_padded = verify_input

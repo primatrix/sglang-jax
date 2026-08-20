@@ -18,6 +18,7 @@ def test_verify_inputs_implement_forward_input_protocol():
         EagleVerifyInput(
             draft_token=draft_token,
             positions=np.array([0, 1], dtype=np.int32),
+            draft_token_num=2,
         ),
         SpecVerifyInput,
     )
@@ -191,6 +192,7 @@ def test_eagle_verify_input_pytree_round_trip():
     verify_input = EagleVerifyInput(
         draft_token=np.arange(8, dtype=np.int32),
         positions=np.arange(8, dtype=np.int32),
+        draft_token_num=4,
     )
 
     leaves, tree = jax.tree_util.tree_flatten(verify_input)
@@ -198,3 +200,4 @@ def test_eagle_verify_input_pytree_round_trip():
 
     np.testing.assert_array_equal(restored.draft_token, verify_input.draft_token)
     np.testing.assert_array_equal(restored.positions, verify_input.positions)
+    assert restored.draft_token_num == 4
