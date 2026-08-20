@@ -590,18 +590,32 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 # if there is no aux layer, set to None
                 eagle_aux_hidden_state_layer_ids = None
             self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
-        elif self.server_args.speculative_algorithm == "DFLASH" and not self.is_draft_worker:
+        elif (
+            self.server_args.speculative_algorithm in ("DFLASH", "DSPARK")
+            and not self.is_draft_worker
+        ):
             # The captured layers must match the draft checkpoint's projection input.
-            from sgl_jax.srt.speculative.dflash_util import parse_dflash_draft_config
+            if self.server_args.speculative_algorithm == "DSPARK":
+                from sgl_jax.srt.speculative.dspark_util import (
+                    parse_dspark_draft_config as parse_draft_config,
+                )
+            else:
+                from sgl_jax.srt.speculative.dflash_util import (
+                    parse_dflash_draft_config as parse_draft_config,
+                )
 
             try:
-                dflash_cfg = parse_dflash_draft_config(
+                dflash_cfg = parse_draft_config(
                     self.server_args.speculative_draft_model_path,
                     self.server_args.speculative_draft_model_revision,
                 )
                 dflash_layer_ids = dflash_cfg.target_layer_ids
             except Exception as e:
-                logger.warning("DFLASH: failed to parse draft config for aux layer capture: %s", e)
+                logger.warning(
+                    "%s: failed to parse draft config for aux layer capture: %s",
+                    self.server_args.speculative_algorithm,
+                    e,
+                )
                 dflash_layer_ids = None
             if hasattr(self.model, "set_dflash_layers_to_capture"):
                 self.model.set_dflash_layers_to_capture(dflash_layer_ids)
