@@ -97,10 +97,17 @@ class DSparkConfidenceHead(nnx.Module):
                 "DSPARK confidence hidden/Markov leading shapes differ: "
                 f"{hidden_states.shape} vs {markov_embeddings.shape}."
             )
-        features = jnp.concatenate(
-            [hidden_states, markov_embeddings.astype(hidden_states.dtype)],
-            axis=-1,
-        )
+        # Explicit-sharding JAX requires concatenate operands to carry the
+        # same layout. Draft hidden features are TP-sharded on their last
+        # dimension while the replicated W1 lookup naturally produces a
+        # data-sharded Markov embedding, so align the embedding to the hidden
+        # feature layout before concatenating them.
+        markov_embeddings = markov_embeddings.astype(hidden_states.dtype)
+        hidden_sharding = jax.typeof(hidden_states).sharding
+        hidden_mesh = getattr(hidden_sharding, "mesh", None)
+        if hidden_mesh is not None and hidden_mesh.axis_names:
+            markov_embeddings = jax.sharding.reshard(markov_embeddings, hidden_sharding)
+        features = jnp.concatenate([hidden_states, markov_embeddings], axis=-1)
         raw, _ = self.proj(features)
         return raw[..., 0]
 

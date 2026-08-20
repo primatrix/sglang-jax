@@ -4,7 +4,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax._src.mesh import AxisType
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 
 def _mesh():
@@ -119,6 +120,32 @@ def test_confidence_head_uses_markov_embedding():
         np.asarray([0.5, jax.nn.sigmoid(2.0)]),
         rtol=1e-6,
     )
+
+
+def test_confidence_head_aligns_markov_embedding_sharding():
+    from sgl_jax.srt.models.dspark import DSparkConfidenceHead
+
+    mesh = _mesh()
+    with jax.set_mesh(mesh):
+        head = DSparkConfidenceHead(
+            hidden_size=2,
+            markov_rank=1,
+            mesh=mesh,
+            dtype=jnp.float32,
+        )
+    head.proj.weight.value = jnp.zeros((3, 1), dtype=jnp.float32)
+    head.proj.bias.value = jnp.zeros((1,), dtype=jnp.float32)
+    hidden_states = jax.device_put(
+        jnp.zeros((2, 2), dtype=jnp.float32),
+        NamedSharding(mesh, P(None, "tensor")),
+    )
+    markov_embeddings = jax.device_put(
+        jnp.zeros((2, 1), dtype=jnp.float32),
+        NamedSharding(mesh, P("data", None)),
+    )
+
+    raw_confidence = jax.jit(head.raw_confidence)(hidden_states, markov_embeddings)
+    np.testing.assert_allclose(np.asarray(raw_confidence), 0.0)
 
 
 def test_dspark_weight_mapping_matches_official_checkpoint_names():
