@@ -206,6 +206,7 @@ class ServerArgs:
     speculative_num_draft_tokens: int = 4
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
+    enable_dspark_tuned_config: bool = False
 
     # For deterministic sampling
     enable_deterministic_sampling: bool = False
@@ -1536,6 +1537,15 @@ class ServerArgs:
             help="The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc).",
             default=ServerArgs.speculative_accept_threshold_acc,
         )
+        parser.add_argument(
+            "--enable-dspark-tuned-config",
+            action="store_true",
+            default=ServerArgs.enable_dspark_tuned_config,
+            help=(
+                "Enable the built-in DSpark STS/SPS tune table. An exact deployment-key "
+                "miss falls back to fixed verify-all serving."
+            ),
+        )
 
         # For deterministic sampling
         parser.add_argument(
@@ -1861,6 +1871,9 @@ class ServerArgs:
 
         # Check LoRA configuration
         self.check_lora_server_args()
+
+        if self.enable_dspark_tuned_config and self.speculative_algorithm != "DSPARK":
+            raise ValueError("--enable-dspark-tuned-config requires --speculative-algorithm DSPARK.")
 
         # Speculative overlap uses the fused NEXTN path or DFlash's dedicated
         # relay-backed draft/verify path.

@@ -684,13 +684,19 @@ DP 下全局 shape 是 `[dp_size,M_bucket,...]`。第一版各 rank 独立算期
 
 新增 `SpeculativeAlgorithm.DSPARK` 和 `is_dflash_family()`。
 
-建议参数：
+内置调优表采用与 TPU kernel tune config 相同的精确 key 查找。用户只需启用：
 
 ~~~text
 --speculative-algorithm DSPARK
 --speculative-draft-model-path <path>
---speculative-dspark-step-time-table-path <json>
---speculative-dspark-confidence-sts-path <json>
+--enable-dspark-tuned-config
+~~~
+
+key 至少包含 target/draft checkpoint ID 与 revision、TPU 型号和 device 数、dtype/quantization、TP/DP、`gamma`、page size、attention backend 和 overlap 模式。SPS profile 内部再按 context bucket 选择。只有精确匹配才启用；路径 `/models/Qwen3-8B` 与 HF ID `Qwen/Qwen3-8B` 会规范化为相同 basename。
+
+高级预算参数在 planner 落地后再增加：
+
+~~~text
 --speculative-dspark-min-verify-len <int>
 --speculative-dspark-max-verify-len <int>
 --speculative-dspark-token-buckets <list[int]>
@@ -702,7 +708,9 @@ Fallback：
 
 | 条件 | 行为 |
 |---|---|
-| 无 SPS/step-time 表 | verify-all |
+| 未启用 tuned config | verify-all |
+| tuned config key miss | verify-all，并记录完整 miss key |
+| 当前 context 超过所有 SPS bucket | verify-all |
 | 无 STS | temperature=1.0，并告警 |
 | confidence stale | survival=1.0 |
 | 无精确 bucket | 向上取 bucket |
@@ -773,7 +781,7 @@ RPA 已支持 ragged，删除的是新 kernel 的工作量；compact gather/scat
 4. 各 TPU 代际的默认 token bucket 网格？
 5. SPS 使用二维查表还是 additive fit？
 6. DP common bucket 如何权衡 padding 和公平性？
-7. STS artifact 如何与 checkpoint 一起版本化？
+7. 新 checkpoint/revision 的 STS 与 SPS 何时允许进入内置 tune table？
 8. Sampling 后续如何保持 rejection sampling 分布严格正确？
 
 ## 20. 预期文件

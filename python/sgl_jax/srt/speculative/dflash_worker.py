@@ -753,6 +753,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         draft_width = self.draft_width
         verify_width = self.verify_width
         is_dspark = self.speculative_algorithm.is_dspark()
+        dspark_sts_temperatures = getattr(self, "_dspark_sts_temperatures", None)
         proposal_hidden_start = self._proposal_hidden_start
         vocab_size = self._target_vocab_size
         embedding_sharding = NamedSharding(runner.mesh, P("data", "tensor"))
@@ -882,6 +883,14 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                     proposal_hidden,
                     seed[:, 0],
                 )
+                if dspark_sts_temperatures is not None:
+                    from sgl_jax.srt.speculative.dspark_tuned_config import (
+                        calibrate_dspark_confidence,
+                    )
+
+                    confidence = calibrate_dspark_confidence(
+                        confidence, dspark_sts_temperatures
+                    )
             else:
                 draft_next = jnp.argmax(logits, axis=-1).astype(jnp.int32)
                 confidence = jnp.zeros(draft_next.shape, dtype=jnp.float32)

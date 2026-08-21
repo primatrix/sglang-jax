@@ -54,6 +54,31 @@ def test_dspark_rejects_explicit_gamma_mismatch(monkeypatch):
         raise AssertionError("DSPARK must reject a gamma/checkpoint mismatch")
 
 
+def test_dspark_tuned_config_cli_is_opt_in():
+    args = ServerArgs.from_cli(
+        [
+            "--model-path",
+            "target",
+            "--speculative-algorithm",
+            "DSPARK",
+            "--speculative-draft-model-path",
+            "draft",
+            "--enable-dspark-tuned-config",
+        ]
+    )
+    assert args.enable_dspark_tuned_config is True
+
+
+def test_dspark_tuned_config_rejects_other_algorithms():
+    args = ServerArgs(model_path="target", enable_dspark_tuned_config=True)
+    try:
+        args.check_server_args()
+    except ValueError as exc:
+        assert "requires --speculative-algorithm DSPARK" in str(exc)
+    else:
+        raise AssertionError("DSpark tuned config must not apply to other algorithms")
+
+
 def test_dspark_worker_uses_separate_draft_and_verify_metadata_widths():
     from sgl_jax.srt.speculative.dspark_worker import DSparkWorker
 
