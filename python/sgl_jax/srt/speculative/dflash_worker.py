@@ -80,6 +80,7 @@ class TargetVerifyPlan:
     allocated_lens: jax.Array
     relay_future_indices: jax.Array
     relay_valid_mask: jax.Array
+    draft_confidence: jax.Array | None = None
     update_relay: bool = False
 
 
@@ -186,11 +187,16 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         )
 
     def _configure_widths(self, block_config) -> None:
-        if int(block_config.block_size) != self.verify_width:
+        if int(block_config.verify_width) != self.verify_width:
             raise ValueError(
-                "DFLASH checkpoint block_size must match the internal verify width: "
-                f"{block_config.block_size} vs {self.verify_width}."
+                "DFLASH checkpoint verify width must match the internal verify width: "
+                f"{block_config.verify_width} vs {self.verify_width} "
+                f"(dialect={block_config.dialect}, block_size={block_config.block_size})."
             )
+        self.draft_width = int(block_config.draft_width)
+        self.verify_width = int(block_config.verify_width)
+        self.block_size = self.verify_width
+        self._proposal_hidden_start = int(block_config.proposal_hidden_start)
 
     @property
     def draft_model_runner(self):
@@ -239,6 +245,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             resolved_target_prefix_lens,
             resolved_positions,
             resolved_cache_loc,
+            draft_confidence,
         ) = self._run_jit_draft_block(draft_plan)
 
         # JAX dispatch is asynchronous. Bind the target model to the draft
@@ -250,6 +257,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             resolved_target_prefix_lens,
             resolved_positions,
             resolved_cache_loc,
+            draft_confidence,
         )
         self.target_worker.model_runner.attn_backend.forward_metadata = target_plan.forward_metadata
         model_worker_batch._dflash_target_verify_plan = target_plan
@@ -626,6 +634,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         resolved_target_prefix_lens: jax.Array,
         resolved_positions: jax.Array,
         resolved_cache_loc: jax.Array,
+        draft_confidence: jax.Array,
     ) -> TargetVerifyPlan:
         bs = draft_plan.bs
         target_mwb = copy.copy(model_worker_batch)
@@ -690,6 +699,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             allocated_lens=draft_plan.allocated_lens,
             relay_future_indices=draft_plan.relay_future_indices,
             relay_valid_mask=draft_plan.relay_valid_mask,
+            draft_confidence=draft_confidence,
         )
 
     def _make_draft_block_mwb(
@@ -743,6 +753,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         draft_width = self.draft_width
         verify_width = self.verify_width
         is_dspark = self.speculative_algorithm.is_dspark()
+        proposal_hidden_start = self._proposal_hidden_start
         vocab_size = self._target_vocab_size
         embedding_sharding = NamedSharding(runner.mesh, P("data", "tensor"))
         logits_sharding = NamedSharding(runner.mesh, P("data", "tensor"))
@@ -855,7 +866,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             draft_hidden = output.hidden_states.reshape(
                 (-1, draft_width, output.hidden_states.shape[-1])
             )
-            proposal_hidden = draft_hidden if is_dspark else draft_hidden[:, 1:, :]
+            proposal_hidden = draft_hidden[:, proposal_hidden_start:, :]
             proposal_flat = proposal_hidden.reshape((-1, proposal_hidden.shape[-1]))
             logits = jnp.dot(
                 proposal_flat,
@@ -866,13 +877,14 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             seed = forward_batch.input_ids.reshape((-1, draft_width))[:, :1]
             seed = jax.sharding.reshard(seed, cache_row_sharding)
             if is_dspark:
-                draft_next, _confidence = model.generate_markov_block(
+                draft_next, confidence = model.generate_markov_block(
                     logits,
                     proposal_hidden,
                     seed[:, 0],
                 )
             else:
                 draft_next = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+                confidence = jnp.zeros(draft_next.shape, dtype=jnp.float32)
             draft_next = jax.sharding.reshard(draft_next, cache_row_sharding)
             draft_token = jnp.concatenate([seed, draft_next], axis=1).reshape(-1)
             draft_token = jax.sharding.reshard(draft_token, token_sharding)
@@ -890,6 +902,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 target_prefix_lens,
                 verify_positions,
                 selected_verify_cache_loc,
+                confidence,
             )
 
         self._jit_draft_block = _partial(
@@ -913,6 +926,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 target_prefix_lens,
                 positions,
                 cache_loc,
+                confidence,
             ) = self._jit_draft_block(
                 runner.model_state_leaves,
                 forward_batch,
@@ -928,7 +942,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 dp_size=plan.dp_size,
             )
             self._replace_memory_pools(runner, pool_updates)
-            return draft_token, target_prefix_lens, positions, cache_loc
+            return draft_token, target_prefix_lens, positions, cache_loc, confidence
 
         with self._dispatch_context(runner):
             return _call_and_replace()
@@ -1719,6 +1733,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             resolved_prefix_lens,
             resolved_positions,
             resolved_cache_loc,
+            draft_confidence,
         ) = self._run_jit_draft_block(draft_plan)
 
         # Match the serving dependency and sharding exactly: target verify
@@ -1735,6 +1750,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             resolved_prefix_lens,
             resolved_positions,
             resolved_cache_loc,
+            draft_confidence,
         )
         target_plan = replace(target_plan, update_relay=use_relay_state)
         self.target_worker.model_runner.attn_backend.forward_metadata = target_plan.forward_metadata

@@ -14,6 +14,10 @@ class DFlashDraftConfig:
     """DFlash settings consumed outside the draft model implementation."""
 
     block_size: int
+    draft_width: int
+    verify_width: int
+    proposal_hidden_start: int
+    dialect: str
     target_layer_ids: list[int] | None
     mask_token: str
     mask_token_id: int | None
@@ -67,6 +71,32 @@ def parse_dflash_draft_config(
     if block_size <= 1:
         raise ValueError(f"DFLASH block_size must be > 1, got {block_size}.")
 
+    architectures = set(getattr(hf_config, "architectures", []) or [])
+    deepspec_architectures = {"Qwen3DSparkModel", "Gemma4DSparkModel"}
+    is_deepspec_dflash = bool(architectures & deepspec_architectures)
+    if is_deepspec_dflash:
+        markov_rank = int(getattr(hf_config, "markov_rank", 0))
+        if markov_rank != 0:
+            raise ValueError(
+                "DFLASH only supports DeepSpec DSpark-format checkpoints with "
+                f"markov_rank=0, got markov_rank={markov_rank}. Use DSPARK for "
+                "checkpoints with a Markov head."
+            )
+        # DeepSpec trains one prediction at every draft position. Its block_size
+        # is the proposal count, while target verification also includes the
+        # already-verified anchor token.
+        draft_width = block_size
+        verify_width = block_size + 1
+        proposal_hidden_start = 0
+        dialect = "deepspec"
+    else:
+        # Legacy z-lab checkpoints include the anchor in block_size. The first
+        # draft hidden state belongs to that anchor and is not a proposal.
+        draft_width = block_size
+        verify_width = block_size
+        proposal_hidden_start = 1
+        dialect = "legacy"
+
     raw_layer_ids = _cfg_get(dflash, hf_config, "target_layer_ids", None)
     if raw_layer_ids is not None:
         target_layer_ids = [int(x) for x in raw_layer_ids]
@@ -86,6 +116,10 @@ def parse_dflash_draft_config(
 
     return DFlashDraftConfig(
         block_size=block_size,
+        draft_width=draft_width,
+        verify_width=verify_width,
+        proposal_hidden_start=proposal_hidden_start,
+        dialect=dialect,
         target_layer_ids=target_layer_ids,
         mask_token=str(mask_token),
         mask_token_id=mask_token_id,

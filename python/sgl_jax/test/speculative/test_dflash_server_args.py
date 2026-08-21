@@ -18,12 +18,26 @@ def _dflash_args(**overrides):
     return ServerArgs(**kwargs)
 
 
+def _legacy_config(block_size):
+    return SimpleNamespace(
+        block_size=block_size,
+        draft_width=block_size,
+        verify_width=block_size,
+        dialect="legacy",
+    )
+
+
 def test_dflash_server_args_infers_default_block_size(monkeypatch):
     calls = []
 
     def fake_parse(model_path, revision=None, trust_remote_code=True):
         calls.append((model_path, revision, trust_remote_code))
-        return SimpleNamespace(block_size=16)
+        return SimpleNamespace(
+            block_size=16,
+            draft_width=16,
+            verify_width=16,
+            dialect="legacy",
+        )
 
     monkeypatch.setattr(dflash_util, "parse_dflash_draft_config", fake_parse)
 
@@ -34,11 +48,47 @@ def test_dflash_server_args_infers_default_block_size(monkeypatch):
     assert args.speculative_num_draft_tokens == 16
 
 
-def test_dflash_server_args_preserves_nondefault_block_size(monkeypatch):
-    def fail_parse(*args, **kwargs):
-        raise AssertionError("non-default DFlash draft token count should not be inferred")
+def test_dflash_server_args_normalizes_deepspec_block_to_verify_width(monkeypatch):
+    monkeypatch.setattr(
+        dflash_util,
+        "parse_dflash_draft_config",
+        lambda *a, **k: SimpleNamespace(
+            block_size=7,
+            draft_width=7,
+            verify_width=8,
+            dialect="deepspec",
+        ),
+    )
 
-    monkeypatch.setattr(dflash_util, "parse_dflash_draft_config", fail_parse)
+    args = _dflash_args()
+    args.check_server_args()
+
+    assert args.speculative_num_draft_tokens == 8
+    args.check_server_args()
+    assert args.speculative_num_draft_tokens == 8
+
+
+def test_dflash_server_args_accepts_explicit_deepspec_proposal_count(monkeypatch):
+    monkeypatch.setattr(
+        dflash_util,
+        "parse_dflash_draft_config",
+        lambda *a, **k: SimpleNamespace(
+            block_size=7,
+            draft_width=7,
+            verify_width=8,
+            dialect="deepspec",
+        ),
+    )
+    args = _dflash_args(speculative_num_draft_tokens=7)
+    args._explicit_cli_args = {"--speculative-num-draft-tokens"}
+
+    args.check_server_args()
+
+    assert args.speculative_num_draft_tokens == 8
+
+
+def test_dflash_server_args_preserves_nondefault_block_size(monkeypatch):
+    monkeypatch.setattr(dflash_util, "parse_dflash_draft_config", lambda *a, **k: _legacy_config(8))
 
     args = _dflash_args(speculative_num_draft_tokens=8)
     args.check_server_args()
@@ -47,10 +97,7 @@ def test_dflash_server_args_preserves_nondefault_block_size(monkeypatch):
 
 
 def test_dflash_server_args_preserves_explicit_default_block_size(monkeypatch):
-    def fail_parse(*args, **kwargs):
-        raise AssertionError("explicit DFlash draft token count should not be inferred")
-
-    monkeypatch.setattr(dflash_util, "parse_dflash_draft_config", fail_parse)
+    monkeypatch.setattr(dflash_util, "parse_dflash_draft_config", lambda *a, **k: _legacy_config(4))
 
     args = ServerArgs.from_cli(
         [
@@ -77,10 +124,9 @@ def test_dflash_server_args_preserves_explicit_default_block_size(monkeypatch):
 
 
 def test_dflash_server_args_allows_tensor_parallel(monkeypatch):
-    def fail_parse(*args, **kwargs):
-        raise AssertionError("non-default DFlash draft token count should not be inferred")
-
-    monkeypatch.setattr(dflash_util, "parse_dflash_draft_config", fail_parse)
+    monkeypatch.setattr(
+        dflash_util, "parse_dflash_draft_config", lambda *a, **k: _legacy_config(16)
+    )
 
     args = _dflash_args(speculative_num_draft_tokens=16, tp_size=4, dp_size=1)
     args.check_server_args()
@@ -89,10 +135,9 @@ def test_dflash_server_args_allows_tensor_parallel(monkeypatch):
 
 
 def test_dflash_server_args_allows_data_parallel_attention(monkeypatch):
-    def fail_parse(*args, **kwargs):
-        raise AssertionError("non-default DFlash draft token count should not be inferred")
-
-    monkeypatch.setattr(dflash_util, "parse_dflash_draft_config", fail_parse)
+    monkeypatch.setattr(
+        dflash_util, "parse_dflash_draft_config", lambda *a, **k: _legacy_config(16)
+    )
 
     args = _dflash_args(speculative_num_draft_tokens=16, tp_size=4, dp_size=2)
     args.check_server_args()

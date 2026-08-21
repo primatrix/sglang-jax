@@ -1899,27 +1899,42 @@ class ServerArgs:
                 or str(arg).startswith("--speculative-num-draft-tokens=")
                 for arg in explicit_cli_args
             )
-            if (
-                not explicit_draft_tokens
-                and self.speculative_num_draft_tokens == ServerArgs.speculative_num_draft_tokens
-            ):
-                from sgl_jax.srt.speculative.dflash_util import (
-                    parse_dflash_draft_config,
-                )
+            from sgl_jax.srt.speculative.dflash_util import parse_dflash_draft_config
 
-                draft_config = parse_dflash_draft_config(
-                    self.speculative_draft_model_path,
-                    revision=self.speculative_draft_model_revision,
-                    trust_remote_code=self.trust_remote_code,
-                )
-                if draft_config.block_size != self.speculative_num_draft_tokens:
-                    logger.info(
-                        "DFLASH: using draft config block_size=%d for "
-                        "--speculative-num-draft-tokens (default was %d).",
-                        draft_config.block_size,
-                        self.speculative_num_draft_tokens,
+            draft_config = parse_dflash_draft_config(
+                self.speculative_draft_model_path,
+                revision=self.speculative_draft_model_revision,
+                trust_remote_code=self.trust_remote_code,
+            )
+            widths_already_normalized = bool(getattr(self, "_dflash_widths_normalized", False))
+            if explicit_draft_tokens and not widths_already_normalized:
+                if self.speculative_num_draft_tokens != draft_config.block_size:
+                    raise ValueError(
+                        "DFLASH --speculative-num-draft-tokens must match checkpoint "
+                        f"block_size={draft_config.block_size}, got "
+                        f"{self.speculative_num_draft_tokens}."
                     )
-                    self.speculative_num_draft_tokens = draft_config.block_size
+            elif (
+                not widths_already_normalized
+                and self.speculative_num_draft_tokens != ServerArgs.speculative_num_draft_tokens
+                and self.speculative_num_draft_tokens != draft_config.block_size
+            ):
+                # Preserve programmatic callers that explicitly supplied a
+                # non-default width even though they have no CLI provenance.
+                raise ValueError(
+                    "DFLASH speculative_num_draft_tokens must match checkpoint "
+                    f"block_size={draft_config.block_size}, got "
+                    f"{self.speculative_num_draft_tokens}."
+                )
+            self.speculative_num_draft_tokens = draft_config.verify_width
+            self._dflash_widths_normalized = True
+            logger.info(
+                "DFLASH %s checkpoint: block_size=%d, draft_width=%d, verify_width=%d.",
+                draft_config.dialect,
+                draft_config.block_size,
+                draft_config.draft_width,
+                draft_config.verify_width,
+            )
             if self.enable_lora or self.enable_static_lora or self.lora_paths:
                 raise ValueError("DFLASH does not support LoRA.")
             if self.grammar_backend not in (None, "none"):

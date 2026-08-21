@@ -15,6 +15,41 @@ def _bare_worker(**attrs):
     return w
 
 
+def test_configure_widths_preserves_legacy_dflash_semantics():
+    worker = _bare_worker(verify_width=16)
+    config = SimpleNamespace(
+        block_size=16,
+        draft_width=16,
+        verify_width=16,
+        proposal_hidden_start=1,
+        dialect="legacy",
+    )
+
+    worker._configure_widths(config)
+
+    assert worker.draft_width == 16
+    assert worker.verify_width == 16
+    assert worker._proposal_hidden_start == 1
+
+
+def test_configure_widths_uses_deepspec_proposals_plus_anchor():
+    worker = _bare_worker(verify_width=8)
+    config = SimpleNamespace(
+        block_size=7,
+        draft_width=7,
+        verify_width=8,
+        proposal_hidden_start=0,
+        dialect="deepspec",
+    )
+
+    worker._configure_widths(config)
+
+    assert worker.draft_width == 7
+    assert worker.verify_width == 8
+    assert worker.block_size == 8
+    assert worker._proposal_hidden_start == 0
+
+
 def test_prefill_draft_extend_metadata_preserves_dp_rank_sections():
     # DP=2, four token rows per rank. Rank-local padding must stay between
     # rank 0's real rows and rank 1's real rows.
