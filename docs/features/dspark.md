@@ -112,6 +112,28 @@ current confidence
 5. TP/DP 下 global argmax、共同 bucket 和状态一致性。
 6. Markov/Confidence Head 与权重加载。
 
+### 2.4 Target Verify 核心逻辑不需要修改
+
+当前 Stage 1 已经证明这条复用路径成立：
+
+~~~text
+DSparkWorker(DFlashWorker)
+    -> 继承 _init_jit_target_verify()
+    -> target model forward
+    -> dflash_greedy_verify()
+~~~
+
+DSpark 与 DFlash 的 target verify 都是同一条 top-1 greedy chain。区别只在于 DSpark 的 `verify_width = gamma + 1`，而不是另一套接受算法。
+
+后续增加动态 `verify_len` 时，也不应修改 target forward 或 `dflash_greedy_verify()` 的核心逻辑。新增内容放在它们的边界上：
+
+- Verify 前：planner 选择 budget，构造 compact `ForwardBatch`、metadata 和 cache locations。
+- Verify 后：把 compact prediction/hidden scatter 回固定 `[batch, verify_width]` 逻辑视图。
+- 调用共享 greedy verify 核心前：在每个请求的 cutoff 位置把候选 token 替换为不可能匹配的 sentinel，使原逻辑自然停止。
+- Verify 后的状态更新继续消费原函数产生的 `accept_lens_out` 和 bonus token。
+
+所以这里需要的是 adapter 和 layout plumbing，不是改写 target verify。
+
 ## 3. 目标与非目标
 
 目标：
@@ -207,6 +229,8 @@ DSparkDraftModel(DFlashDraftModel)
 
 可复用独立 draft worker、共享 allocator、embedding/LM Head 共享、DP/TP batch、overlap relay、fused JIT、KV materialization 和 precompile 基础设施。
 
+尤其是 `_init_jit_target_verify()`、`_run_jit_target_verify()` 和 `dflash_greedy_verify()` 应保持算法语义不变。DSpark Stage 1 已经通过继承 `DFlashWorker` 复用了这三部分。
+
 不建议复制整个 worker。先抽取 block-draft 公共 helper，DSpark 只维护算法特有状态。
 
 ### 5.4 FlashAttention metadata 与 RPA
@@ -243,9 +267,9 @@ DSparkDraftModel(DFlashDraftModel)
 2. Current confidence 在 device 侧把固定 budget 分配给请求。
 3. 生成 `verify_lens`。
 4. compact token、position 和 cache location。
-5. RPA 使用 variable `cu_q_lens`。
-6. Target logits/hidden 映射回请求坐标。
-7. Greedy accept，只提交有效状态。
+5. 既有 target model forward 使用 variable `cu_q_lens`，模型逻辑不变。
+6. Target logits/hidden 映射回固定请求坐标。
+7. Cutoff adapter 屏蔽 `verify_len` 以外的候选，再调用从 `dflash_greedy_verify()` 复用的 token-ID verify 核心。
 8. Current confidence 异步发布给未来轮次。
 
 ~~~text
@@ -579,9 +603,45 @@ valid_token_mask: [dp,M_bucket]
 
 仅让 RPA ragged 而不压缩 dense token dimension，只能节省 attention 内部工作。要节省 QKV、MLP 和 LM Head，必须同时使用更小的静态 `M_bucket`。
 
-## 13. Accept、KV 与 Hidden Commit
+## 13. 复用 Target Verify、KV 与 Hidden Commit
 
 Compact logits 先做 argmax，只把 token IDs scatter 到 `[dp,bs_bucket,verify_width]`。
+
+Target model forward 和 greedy acceptance 不做算法修改。动态路径不应把 compact full-vocab logits scatter 成 `[batch,verify_width,vocab]`，否则会产生很大的临时张量。建议把当前函数按无语义变化的方式拆成：
+
+~~~text
+dflash_greedy_verify(draft_token, target_logits)
+    -> argmax(target_logits)
+    -> greedy_verify_predictions(candidates, target_predict)
+
+DSpark compact path
+    -> argmax(compact_logits)
+    -> scatter compact token IDs
+    -> greedy_verify_predictions(candidates, target_predict)
+~~~
+
+其中 `greedy_verify_predictions()` 直接搬用当前 `dflash_greedy_verify()` 中的 match、cumprod、bonus selection 和 `accept_lens_out` 计算。这是接口抽取，不是修改 target verify 逻辑。
+
+Adapter 构造：
+
+~~~text
+target_predict_2d: [dp,bs_bucket,verify_width]
+verify_candidates: [dp,bs_bucket,verify_width]
+~~~
+
+对 `verify_len=L < verify_width` 的请求，在 target forward 完成后设置：
+
+~~~text
+verify_candidates[r,L] = -1
+~~~
+
+这里的 `-1` 只用于 prediction/candidate 比较，不进入模型 embedding。它使原有比较：
+
+~~~text
+matches = candidates[:,1:] == target_predict[:,:-1]
+~~~
+
+在第 `L-1` 个 match 处必然停止。若之前的草稿全部匹配，共享逻辑会选择 `target_predict[r,L-1]` 作为 bonus，正好对应动态窗口最后一个有效 prediction。`L=verify_width` 时不需要 sentinel。
 
 每个请求：
 
@@ -592,7 +652,7 @@ Compact logits 先做 argmax，只把 token IDs scatter 到 `[dp,bs_bucket,verif
 
 Target KV 可以写入预留物理 slot，但只有 committed 位置能进入 request-to-token mapping。Padding location 不得污染 live cache。
 
-Draft KV materialization 只处理 committed compact hidden；rejected、scheduler-trimmed 和 padding 位置都不写。复用并泛化 DFlash `_mask_draft_kv_writes()` 语义。
+Compact hidden 可以先 scatter 回现有固定逻辑视图，再让当前 KV materialization 根据原有 `accept_lens_out` 选择 committed rows。Rejected、scheduler-trimmed 和 padding 位置都不写。优先复用当前 DFlash `_mask_draft_kv_writes()` 和 sequence-state 更新语义。
 
 Host 可继续为每请求预留 `verify_width` 个候选 slot，使 allocator 不依赖动态 `verify_lens`。
 
@@ -675,11 +735,11 @@ Attention/layout 测试：`query_lens=[8,3,5,1]`、per-DP cumsum reset、compact
 
 ### Phase 2：Confidence 与逻辑 Cutoff
 
-增加 STS、lagged relay、budget 和 `verify_lens`；物理 target shape 暂时 verify-all，只在 accept 阶段 cutoff。
+增加 STS、lagged relay、budget 和 `verify_lens`；物理 target shape 暂时 verify-all，通过 candidate sentinel adapter 实现 cutoff，继续调用原有 `dflash_greedy_verify()`。
 
 ### Phase 3：Compact RPA
 
-打通动态 query lengths，compact token/position/cache，运行现有 RPA，映射 logits/hidden，只提交 accepted state。
+打通动态 query lengths，compact token/position/cache，运行现有 target forward/RPA，把 logits/hidden 映射回固定逻辑视图，然后复用原 target verify 和状态提交路径。
 
 ### Phase 4：TPU Bucket Scheduler
 

@@ -421,6 +421,7 @@ class SchedulerOutputProcessorMixin:
             self.num_generated_tokens += batch.batch_size()
         else:
             active_spec_reqs = 0
+            accepted_spec_tokens = 0
             per_dp_bs = batch.per_dp_bs_size
             for dp_rank, info in enumerate(batch.reqs_info):
                 base = dp_rank * per_dp_bs
@@ -432,9 +433,12 @@ class SchedulerOutputProcessorMixin:
                     accepted = len(next_token_ids[base + j])
                     self.num_generated_tokens += accepted
                     self.accept_token += accepted
+                    accepted_spec_tokens += accepted
                     active_spec_reqs += 1
             self.spec_num_forward_ct += active_spec_reqs
             self.draft_token += active_spec_reqs * self.draft_worker.speculative_num_draft_tokens
+            self.spec_num_total_accepted_tokens += accepted_spec_tokens
+            self.spec_num_total_forward_ct += active_spec_reqs
         # FIXME(pc) add spec decode metrics
 
         if self.enable_overlap:

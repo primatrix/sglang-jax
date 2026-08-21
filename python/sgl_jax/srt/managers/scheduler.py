@@ -1469,6 +1469,13 @@ class Scheduler(
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(global_server_args_dict)
         ret["last_gen_throughput"] = self.last_gen_throughput
+        ret["spec_num_total_accepted_tokens"] = self.spec_num_total_accepted_tokens
+        ret["spec_num_total_forward_ct"] = self.spec_num_total_forward_ct
+        ret["spec_avg_accept_length"] = (
+            self.spec_num_total_accepted_tokens / self.spec_num_total_forward_ct
+            if self.spec_num_total_forward_ct > 0
+            else 0.0
+        )
         ret["memory_usage"] = {
             "kvcache": round(self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2),
             "token_capacity": int(self.max_total_num_tokens),
@@ -1520,6 +1527,11 @@ class Scheduler(
         # counters
         ret["num_generated_tokens"] = self.num_generated_tokens
         ret["forward_ct_decode"] = self.forward_ct_decode
+        if self.step_time_dict:
+            ret["decode_step_time_by_batch_size"] = {
+                str(batch_size): list(step_times)
+                for batch_size, step_times in self.step_time_dict.items()
+            }
         ret["new_token_ratio"] = self.new_token_ratio
         ret["init_new_token_ratio"] = self.init_new_token_ratio
 
