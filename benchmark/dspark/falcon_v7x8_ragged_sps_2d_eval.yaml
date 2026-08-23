@@ -1,0 +1,31 @@
+name: qwen3-spec-stage3-ragged-sps-2d
+exp_type: TRAINING
+artifact_type: GCS
+config: '{"target":"Qwen/Qwen3-8B","draft":"deepseek-ai/dspark_qwen3_8b_block7","stage":3,"ragged_verify":true,"sps":"T(R,M)","datasets":{"gsm8k":500,"math500":500,"aime25":30},"seed":980406,"enable_thinking":false,"max_tokens":2048,"temperature":0.0,"concurrency":64,"hardware":"v7x-8","jax":"0.10.2","evalscope":"1.9.0","tp":8,"dp":2,"commit":"3c0c1a4a48b34d901f4353a3fcfff897a3c31f3b"}'
+cluster_name: tpu-training-antgroup
+priority: 0
+model_version: qwen3-spec-stage03-ragged-sps-2d
+role_to_task_spec:
+  worker:
+    command: |
+      set -eu
+      export TMPDIR="${TMPDIR:-/tmp/tpu_logs/tmp}"
+      export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/tmp/tpu_logs/pip-cache}"
+      export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/tpu_logs/uv-cache}"
+      export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-300}"
+      mkdir -p "$TMPDIR" "$PIP_CACHE_DIR" "$UV_CACHE_DIR"
+      ulimit -c 0
+      git clone --branch epic/dspark-qwen3 --single-branch https://github.com/primatrix/sglang-jax.git /tmp/sglang-jax
+      git -C /tmp/sglang-jax checkout --detach 3c0c1a4a48b34d901f4353a3fcfff897a3c31f3b
+      test "$(git -C /tmp/sglang-jax rev-parse HEAD)" = "3c0c1a4a48b34d901f4353a3fcfff897a3c31f3b"
+      echo "Checkout ready; waiting for SPS-2D evaluation runner"
+      while [ ! -f /tmp/dspark-ragged-sps2d-runner.ready ]; do sleep 2; done
+      DSPARK_ENABLE_TUNED=1 \
+      DSPARK_EXPECTED_COMMIT=3c0c1a4a48b34d901f4353a3fcfff897a3c31f3b \
+      DSPARK_RESULT_ROOT=/tmp/dspark_ragged_sps_2d_deepspec \
+        bash /tmp/sglang-jax/benchmark/dspark/run_v7x8_ragged_eval.sh
+    replica: 1
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x1
