@@ -698,17 +698,21 @@ def _make_target_verify_metadata(
     speculative_num_draft_tokens: int,
     page_size: int,
     dp_size: int,
+    query_lens=None,
 ):
     from sgl_jax.srt.layers.attention.flashattention_backend import (
         FlashAttentionMetadata,
     )
 
     valid = verify_seq_lens > 0
-    extend_seq_lens = jnp.where(
-        valid,
-        jnp.full_like(verify_seq_lens, speculative_num_draft_tokens),
-        jnp.zeros_like(verify_seq_lens),
-    )
+    if query_lens is None:
+        extend_seq_lens = jnp.where(
+            valid,
+            jnp.full_like(verify_seq_lens, speculative_num_draft_tokens),
+            jnp.zeros_like(verify_seq_lens),
+        )
+    else:
+        extend_seq_lens = jnp.where(valid, query_lens.astype(jnp.int32), 0)
     cu_q_lens = _per_dp_cumsum_device(extend_seq_lens, dp_size)
     metadata_seq_lens = verify_seq_lens + extend_seq_lens
     aligned_seq_lens = ((metadata_seq_lens + page_size - 1) // page_size) * page_size

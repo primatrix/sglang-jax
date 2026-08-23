@@ -1,11 +1,12 @@
 # SGLang JAX 适配 DSpark 设计文档
 
-状态：Stage 1 已实现（模型与固定 verify-all；TPU serving 验证待完成）
+状态：Stage 1 已完成；Stage 2 第一版已实现（tuned config、动态预算与 compact ragged verify，TPU serving 验证待完成）
 
-当前实现边界：只包含必要的公共接线、vanilla Markov Head、带 Markov
-embedding 的 Confidence Head、官方 checkpoint 直载、`gamma/draft_width=7`
-与固定 `verify_width=8`。STS、confidence relay、动态预算、compact RPA 和
-TPU bucket scheduler 均留到后续 stage，本阶段不会启用。
+当前默认路径仍是 Stage 1：vanilla Markov Head、带 Markov embedding 的
+Confidence Head、官方 checkpoint 直载、`gamma/draft_width=7` 与固定
+`verify_width=8`。显式传入 `--enable-dspark-tuned-config` 且 deployment key
+精确命中时，启用 Stage 2 第一版的 STS、SPS planner、逐请求 `verify_len`、
+compact RPA 和静态 token bucket；key miss 自动回退固定 verify-all。
 
 Stage 1 启动示例（checkpoint 的 `block_size=7` 对应 7 个 proposal，内部固定
 验证宽度会归一化为 8）：
@@ -114,7 +115,7 @@ current confidence
 
 ### 2.4 Target Verify 核心逻辑不需要修改
 
-当前 Stage 1 已经证明这条复用路径成立：
+Stage 1 已经证明固定宽度复用路径成立：
 
 ~~~text
 DSparkWorker(DFlashWorker)
@@ -125,14 +126,14 @@ DSparkWorker(DFlashWorker)
 
 DSpark 与 DFlash 的 target verify 都是同一条 top-1 greedy chain。区别只在于 DSpark 的 `verify_width = gamma + 1`，而不是另一套接受算法。
 
-后续增加动态 `verify_len` 时，也不应修改 target forward 或 `dflash_greedy_verify()` 的核心逻辑。新增内容放在它们的边界上：
+Stage 2 动态 `verify_len` 仍不修改 target model forward 的算法逻辑，并把 `dflash_greedy_verify()` 拆成 logits argmax 与共享 prediction verify 两层。新增内容位于它们的边界上：
 
 - Verify 前：planner 选择 budget，构造 compact `ForwardBatch`、metadata 和 cache locations。
 - Verify 后：把 compact prediction/hidden scatter 回固定 `[batch, verify_width]` 逻辑视图。
 - 调用共享 greedy verify 核心前：在每个请求的 cutoff 位置把候选 token 替换为不可能匹配的 sentinel，使原逻辑自然停止。
 - Verify 后的状态更新继续消费原函数产生的 `accept_lens_out` 和 bonus token。
 
-所以这里需要的是 adapter 和 layout plumbing，不是改写 target verify。
+当前实现遵守这一边界：新增的是 adapter 和 layout plumbing，不是另一套 target acceptance 算法。
 
 ## 3. 目标与非目标
 
@@ -403,20 +404,101 @@ a[r,k] = product(c[r,0:k+1])
 
 STS 使用逐位置 temperature 校准。没有 STS 时可用 1.0，但要告警，SPS 调度可退化到 verify-all。
 
-不能等待当前完整 confidence 再选择当前 executable，否则会导致 device-to-host 同步。设计分为：
-
-- lagged confidence：决定未来 step 的总 budget 和静态 bucket。
-- current confidence：只在已固定 budget 内决定预算给哪些请求。
-
-Relay 必须按 request pool index 和 generation 保存：
+不能等待当前完整 confidence 再选择当前 executable，否则会导致 device-to-host 同步。所有运行模式统一固定：
 
 ~~~text
-confidence[req_pool_size,gamma]
-generation[req_pool_size]
-source_forward_id[req_pool_size]
+capacity_lag = 2
+M_bucket[t]  = planner(C[t-2], R[t], context[t], T(R,M))
+verify_lens[t] = allocator(C[t], M_bucket[t])
 ~~~
 
-槽位 generation 不匹配时按 survival=1.0 处理，保守走更大验证预算。
+其中 `t` 是每个请求自己的 decode round，不是 scheduler 的全局 batch/forward ID。请求被 filter、merge 或暂时未调度时，全局 forward ID 会跳变，但该请求的 decode round 只在它真正参与一次 decode 时递增。
+
+- `C[t-2]`：只决定当前总 budget 和静态 executable bucket。
+- `C[t]`：只在已经固定的 budget 内决定预算分给哪些请求，全程留在 device。
+- `C[t-1]`：明确不用于容量选择，避免 overlap/non-overlap 产生两套时序。
+
+### 8.1 Capacity Relay 的存储 Contract
+
+现有 `DFlashRelayBuffers` 只携带下一轮 seed token 和 sequence length，不能承担 capacity relay。新增独立结构：
+
+~~~text
+DSparkConfidenceRelayDevice:
+    confidence[ring_size,dp_size,req_pool_size,gamma]
+    slot_generation[ring_size,dp_size,req_pool_size]
+    source_decode_round[ring_size,dp_size,req_pool_size]
+
+DSparkConfidenceRelayHost:
+    confidence[ring_size,dp_size,req_pool_size,gamma]
+    slot_generation[ring_size,dp_size,req_pool_size]
+    source_decode_round[ring_size,dp_size,req_pool_size]
+    ready[ring_size,dp_size,req_pool_size]
+~~~
+
+固定 `ring_size=3`。容量只读取两轮前的数据，但三槽可以避免当前 `C[t]` 发布时覆盖仍在被 host 读取的 `C[t-2]`，也给异步 D2H copy 留出额外一轮余量。ring slot 使用：
+
+~~~text
+write_slot = source_decode_round % 3
+read_slot  = (current_decode_round - 2) % 3
+~~~
+
+`ReqToTokenPool` 增加 host-side `slot_generation[req_pool_size]`。每次把一个新请求分配到空闲 `req_pool_idx` 时 generation 加一，并把 `(req_pool_idx,slot_generation)` 带入 `ModelWorkerBatch`；chunked prefill 复用同一请求 slot 时不能增加。这样旧请求即使恰好在两轮前写过同一个 slot，也不能污染新请求。
+
+### 8.2 Publish、读取与永不等待原则
+
+Draft round `t` 生成校准后的 `C[t]` 后执行两条独立路径：
+
+1. device hot path 立即用 `C[t]` 和已选 `extra_budget[t]` 生成 `verify_lens[t]`。
+2. confidence、request pool index、slot generation 和 decode round scatter 到 device relay，并调用 `copy_to_host_async()`；后台 publisher 线程等待 copy 完成后更新 host relay。
+
+Scheduler/worker 在准备容量时只读取已经 materialized 的 host relay，禁止对 confidence future 调用同步 `device_get()`：
+
+~~~text
+expected_round = current_decode_round - 2
+slot = expected_round % 3
+valid = (
+    expected_round >= 0
+    and host.ready[slot,dp,req_pool_idx]
+    and host.slot_generation[slot,dp,req_pool_idx] == current_slot_generation
+    and host.source_decode_round[slot,dp,req_pool_idx] == expected_round
+)
+survival = cumprod(host.confidence[slot,...]) if valid else ones(gamma)
+~~~
+
+后台 copy 未及时完成时不能等待；该请求本轮直接按 stale fallback 处理。第一次和第二次 decode、刚进入 decode 的新请求、slot generation 不匹配、ring tag 不匹配都属于正常 stale，不应告警刷屏，只累计 metric。
+
+### 8.3 Batch、DP 与生命周期
+
+容量选择按当前 batch 请求重新 gather，不保存 batch-row 状态：
+
+1. 使用当前 `req_pool_indices/slot_generations/decode_rounds` 从 host relay gather `C[t-2]`。
+2. 每个 DP rank 根据自己的 `R`、context bucket 和 survival 选择 `(local_M_bucket,local_extra_budget)`。
+3. 所有 rank 对 `local_M_bucket` 取 max，得到共同静态 `M_bucket`；各 rank 保留自己的 `local_extra_budget`，多余容量为 padding。
+4. current confidence 在 device 上按各 rank 的 local budget 生成 `verify_lens`。
+
+Filter、merge 和请求顺序变化不需要搬运 relay 数据，因为 relay 始终以 `(dp_rank,req_pool_idx,slot_generation)` 寻址。请求结束时无需清零大 buffer；下一次 slot allocation 增加 generation 即完成逻辑失效。server reset/clear 时 generation 全量递增或显式清空 ready/tag，不能只重置 free list。
+
+建议暴露以下观测指标：
+
+~~~text
+dspark_capacity_relay_hit
+dspark_capacity_relay_stale_warmup
+dspark_capacity_relay_stale_generation
+dspark_capacity_relay_stale_not_ready
+dspark_selected_token_bucket_per_dp
+dspark_actual_verify_tokens_per_dp
+dspark_ragged_padding_ratio
+~~~
+
+### 8.4 实现边界与落地顺序
+
+`capacity_lag` 不提供 CLI 参数，固定常量为 2，避免线上出现未经 profile 的时序变体。建议按以下提交边界实现：
+
+1. `ReqToTokenPool` 增加 slot generation，并把 generation/decode round 带到 `ModelWorkerBatch`；先用 slot-reuse 单测锁定生命周期。
+2. 在 `relay_buffer.py` 新增 DSpark confidence device/host relay，不修改现有 DFlash state relay 的结构和语义。
+3. DSpark draft JIT 发布 `C[t]`；后台 publisher 只负责异步 materialize host snapshot，scheduler thread 永不等待。
+4. `_build_target_verify_plan()` 从 host relay gather `C[t-2]` 替换当前 `survival=1` bootstrap；current-confidence allocator 和 compact ragged verify 保持不变。
+5. 增加 warmup、not-ready、request churn、filter/merge、slot reuse、DP unequal batch 和 ring wraparound 测试，再进行 TPU overlap timeline profile。
 
 ## 9. SPS 的定义和计算
 
@@ -694,6 +776,68 @@ DP 下全局 shape 是 `[dp_size,M_bucket,...]`。第一版各 rank 独立算期
 
 key 至少包含 target/draft checkpoint ID 与 revision、TPU 型号和 device 数、dtype/quantization、TP/DP、`gamma`、page size、attention backend 和 overlap 模式。SPS profile 内部再按 context bucket 选择。只有精确匹配才启用；路径 `/models/Qwen3-8B` 与 HF ID `Qwen/Qwen3-8B` 会规范化为相同 basename。
 
+### 15.1 Tuned Config 命中后的 Ragged Verify 数据流
+
+内置表不是直接返回某个固定 `verify_len`。它提供两类信息：
+
+- STS temperature：把 Confidence Head 的输出校准成可比较的逐位置条件接受概率。
+- SPS/step-time profile：估算不同静态 target token bucket 的执行成本。
+
+运行时必须先选择整个 DP rank 共用的物理 bucket，再在这个 bucket 内为每个请求分配逻辑长度：
+
+~~~text
+tuned key exact hit
+        |
+        v
+calibrate confidence with STS
+        |
+        +------------------------------+
+        | lagged confidence            | current confidence
+        v                              v
+score SPS points and choose M_bucket   distribute extra_budget
+                                       |
+                                       v
+                              verify_lens[request]
+                                       |
+                                       v
+compact ids / positions / cache slots
+                                       |
+                                       v
+query_lens + cu_q_lens -> target ragged verify
+                                       |
+                                       v
+scatter predictions -> greedy acceptance -> KV/hidden commit
+~~~
+
+具体步骤如下：
+
+1. 启动时根据实际部署参数构造 `DSparkTunedKey`。只有 exact hit 才保存 `DSparkTunedConfig`；miss 保持固定 verify-all。
+2. draft forward 对每个位置应用 STS，得到 `c[r,k]`，再计算 `a[r,k]=cumprod(c[r,:])`。lagged survival 只用于选择未来 step 的 executable，避免 device-to-host 同步。
+3. planner 取能覆盖当前最大 context 的最小 SPS profile。对每个候选 `M_bucket`，令 `extra_cap=min(M_bucket-R,R*(verify_width-1))`，用历史 survival 的前 `extra_cap` 项计算预期产出，再除以表中的 `median_step_time_ms`。得分最大的点决定 `M_bucket` 和 `extra_budget`。
+4. 若启用 DP，每个 rank 先独立提出 bucket，再 collective max 得到所有 rank 共用的 `M_bucket`；每个 rank 仍按自己的 current confidence 分配预算，剩余位置只做静态 padding。
+5. device 端对 current survival 做稳定排序，以 `rank < extra_budget` 生成 prefix-preserving mask，最终得到 `verify_lens[r]=1+selected_extra[r]`。这里 `sum(verify_lens) <= M_bucket`，而不是要求所有请求采用相同长度。
+6. 按 `verify_lens` 压紧 draft token、position 和 cache location，并生成 `query_lens=verify_lens`、逐 DP rank 从零累计的 `cu_q_lens`、`compact_to_row/pos` 以及 padding mask。target forward 的静态 token shape 是 `M_bucket`，RPA 看到的有效 query 则是真实 ragged lengths。
+7. target logits 只做 compact argmax；将 token ID scatter 回固定逻辑窗口后，用 sentinel 截断 `verify_len` 外的比较，复用现有 greedy acceptance。只有 accepted/bonus 对应的位置才能更新 request-to-token mapping、KV 和 hidden state。
+
+上述流程中有两个不能混淆的长度：
+
+~~~text
+M_bucket                 = JIT executable 的每 DP rank 静态 token shape
+sum(verify_lens[rank])   = 该 rank 本 step 的有效 ragged query 数
+~~~
+
+`M_bucket` 决定 QKV、MLP、LM Head 的实际计算桶；`verify_lens` 决定每个请求验证多少行以及 RPA 的 ragged 边界。只生成 `verify_lens` 而仍运行 verify-all dense shape，只能验证调度语义，不能获得完整性能收益。
+
+当前代码已落地第一版完整执行链：exact-key tuned config、Qwen3-8B v7x8 STS/SPS 数据、SPS bucket planner、固定 `capacity_lag=2` confidence relay、current-confidence `verify_lens` 分配、compact gather/scatter、动态 `query_lens/cu_q_lens` 和 ragged target executable。它不会修改 checkpoint 的固定 `verify_width`，而是在 target JIT 内把固定逻辑窗口压入选中的静态 `M_bucket`。
+
+Capacity relay 使用 `ReqToTokenPool.slot_generation` 和逐请求 `decode_batch_idx` 做身份校验。当前 `C[t]` 写入三槽 device ring 后调用异步 host copy；planner 只读取已经 materialize 且 generation/source-round 同时匹配的 `C[t-2]`，永不等待 future。前两轮、copy 未完成和 slot reuse 都逐请求回退到 `survival=1`。
+
+第一版仍有一个明确限制：
+
+1. 当前 SPS 数据来自 verify-all serving frontier，采集时 `R` 与 `M=R*verify_width` 绑定；运行时暂按一维 `T(M)` bootstrap 使用。它足以验证 ragged plumbing 和 lag-2 容量选择，但最终性能决策必须补测固定 `R_bucket` 下的多个 `M_bucket`，构造二维 `T(R,M)`。
+
+下一步需要补齐二维 SPS 表，并预编译表中允许的 bucket variants，避免请求运行中出现意外编译。
+
 高级预算参数在 planner 落地后再增加：
 
 ~~~text
@@ -743,11 +887,11 @@ Attention/layout 测试：`query_lens=[8,3,5,1]`、per-DP cumsum reset、compact
 
 ### Phase 2：Confidence 与逻辑 Cutoff
 
-增加 STS、lagged relay、budget 和 `verify_lens`；物理 target shape 暂时 verify-all，通过 candidate sentinel adapter 实现 cutoff，继续调用原有 `dflash_greedy_verify()`。
+增加 STS、lagged relay、SPS planner、budget 和 `verify_lens`；物理 target shape 暂时 verify-all，通过 candidate sentinel adapter 验证动态长度的 acceptance 语义，继续调用原有 `dflash_greedy_verify()`。这一阶段不宣称获得 ragged verify 的性能收益。
 
 ### Phase 3：Compact RPA
 
-打通动态 query lengths，compact token/position/cache，运行现有 target forward/RPA，把 logits/hidden 映射回固定逻辑视图，然后复用原 target verify 和状态提交路径。
+将 Phase 2 生成的 `verify_lens` 变成实际 ragged target workload：选择 `M_bucket`，compact token/position/cache，构造 `query_lens/cu_q_lens`，运行现有 target forward/RPA，把 logits/hidden 映射回固定逻辑视图，然后复用原 target verify 和状态提交路径。退出条件是 `sum(verify_lens) < R*verify_width` 时 target dense shape 确实下降，且输出与 verify-all greedy 完全一致。
 
 ### Phase 4：TPU Bucket Scheduler
 

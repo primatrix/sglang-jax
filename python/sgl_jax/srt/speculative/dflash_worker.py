@@ -25,6 +25,7 @@ from sgl_jax.srt.speculative.dflash_info import (
     _mask_draft_kv_writes,
     build_dflash_draft_block,
     dflash_greedy_verify,
+    dflash_greedy_verify_predictions,
 )
 from sgl_jax.srt.speculative.dflash_util import (
     parse_dflash_draft_config,
@@ -82,6 +83,8 @@ class TargetVerifyPlan:
     relay_valid_mask: jax.Array
     draft_confidence: jax.Array | None = None
     update_relay: bool = False
+    dspark_extra_budget_per_dp: jax.Array | None = None
+    dspark_per_dp_token_bucket: int | None = None
 
 
 class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
@@ -218,9 +221,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
 
     def draft(self, model_worker_batch: ModelWorkerBatch) -> None:
         draft_input: DFlashDraftInput = model_worker_batch.spec_info_padded
-        assert isinstance(
-            draft_input, DFlashDraftInput
-        ), "DFLASH decode requires DFlashDraftInput carried over from prefill."
+        assert isinstance(draft_input, DFlashDraftInput), (
+            "DFLASH decode requires DFlashDraftInput carried over from prefill."
+        )
 
         bs = int(model_worker_batch.seq_lens.shape[0])
         seq_lens = np.asarray(model_worker_batch.seq_lens, dtype=np.int32)
@@ -888,9 +891,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                         calibrate_dspark_confidence,
                     )
 
-                    confidence = calibrate_dspark_confidence(
-                        confidence, dspark_sts_temperatures
-                    )
+                    confidence = calibrate_dspark_confidence(confidence, dspark_sts_temperatures)
             else:
                 draft_next = jnp.argmax(logits, axis=-1).astype(jnp.int32)
                 confidence = jnp.zeros(draft_next.shape, dtype=jnp.float32)
@@ -986,6 +987,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 "update_relay",
                 "page_size",
                 "dp_size",
+                "dspark_per_dp_token_bucket",
             ],
         )
         def target_verify(
@@ -1001,15 +1003,60 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             relay_buffers,
             relay_future_indices,
             relay_valid_mask,
+            draft_confidence,
+            dspark_extra_budget_per_dp,
             *,
             draft_token_num: int,
             use_relay_state: bool,
             update_relay: bool,
             page_size: int,
             dp_size: int,
+            dspark_per_dp_token_bucket: int | None,
         ):
             forward_batch.seq_lens = target_prefix_lens
-            if use_relay_state:
+            verify_lens = None
+            compact_to_logical = None
+            logical_token_count = draft_token.shape[0]
+            if dspark_per_dp_token_bucket is not None:
+                from sgl_jax.srt.speculative.dspark_planner import (
+                    allocate_dspark_verify_lens,
+                    compact_dspark_verify_inputs,
+                )
+
+                verify_lens = allocate_dspark_verify_lens(
+                    draft_confidence,
+                    relay_valid_mask,
+                    dspark_extra_budget_per_dp,
+                    dp_size=dp_size,
+                )
+                (
+                    compact_ids,
+                    compact_positions,
+                    compact_cache_loc,
+                    compact_to_logical,
+                    _,
+                ) = compact_dspark_verify_inputs(
+                    draft_token,
+                    forward_batch.positions,
+                    forward_batch.out_cache_loc,
+                    verify_lens,
+                    dp_size=dp_size,
+                    verify_width=draft_token_num,
+                    per_dp_token_bucket=dspark_per_dp_token_bucket,
+                )
+                forward_batch.input_ids = compact_ids
+                forward_batch.positions = compact_positions
+                forward_batch.out_cache_loc = compact_cache_loc
+                forward_batch.attn_backend.forward_metadata = _make_target_verify_metadata(
+                    forward_batch.attn_backend.forward_metadata,
+                    target_prefix_lens,
+                    allocated_lens,
+                    speculative_num_draft_tokens=draft_token_num,
+                    page_size=page_size,
+                    dp_size=dp_size,
+                    query_lens=verify_lens,
+                )
+            elif use_relay_state:
                 forward_batch.attn_backend.forward_metadata = _make_target_verify_metadata(
                     forward_batch.attn_backend.forward_metadata,
                     target_prefix_lens,
@@ -1025,11 +1072,37 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 output, pool_updates, _, layers_topk_ids = model(
                     forward_batch, memory_pools, logits_metadata
                 )
-            accept_lens_out, next_token_ids_flat, new_verified_id, _ = dflash_greedy_verify(
-                draft_token,
-                output.next_token_logits,
-                draft_token_num=draft_token_num,
-            )
+            if verify_lens is None:
+                accept_lens_out, next_token_ids_flat, new_verified_id, _ = dflash_greedy_verify(
+                    draft_token,
+                    output.next_token_logits,
+                    draft_token_num=draft_token_num,
+                )
+            else:
+                from sgl_jax.srt.speculative.dspark_planner import (
+                    scatter_dspark_compact_rows,
+                )
+
+                compact_predict = jnp.argmax(output.next_token_logits, axis=-1).astype(jnp.int32)
+                target_predict = scatter_dspark_compact_rows(
+                    compact_predict,
+                    compact_to_logical,
+                    logical_token_count,
+                )
+                accept_lens_out, next_token_ids_flat, new_verified_id, _ = (
+                    dflash_greedy_verify_predictions(
+                        draft_token,
+                        target_predict,
+                        draft_token_num=draft_token_num,
+                        verify_lens=verify_lens,
+                    )
+                )
+                logical_hidden = scatter_dspark_compact_rows(
+                    output.hidden_states,
+                    compact_to_logical,
+                    logical_token_count,
+                )
+                output = replace(output, hidden_states=logical_hidden)
             accept_lens_out = jax.sharding.reshard(accept_lens_out, token_sharding)
             next_token_ids_flat = jax.sharding.reshard(next_token_ids_flat, token_sharding)
             new_verified_id = jax.sharding.reshard(new_verified_id, token_sharding)
@@ -1099,9 +1172,12 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                     self.spec_relay_buffers if plan.update_relay else None,
                     plan.relay_future_indices,
                     plan.relay_valid_mask,
+                    plan.draft_confidence,
+                    plan.dspark_extra_budget_per_dp,
                     use_relay_state=plan.update_relay,
                     update_relay=plan.update_relay,
                     dp_size=plan.model_worker_batch.dp_size,
+                    dspark_per_dp_token_bucket=plan.dspark_per_dp_token_bucket,
                 )
                 cache_miss_count = count()
 

@@ -8,6 +8,7 @@ from sgl_jax.srt.speculative.dflash_info import (
     DFlashVerifyInput,
     build_dflash_draft_block,
     dflash_greedy_verify,
+    dflash_greedy_verify_predictions,
 )
 from sgl_jax.srt.speculative.overlap_utils import (
     can_merge_spec_non_overlap_prefill,
@@ -51,6 +52,21 @@ def test_dflash_greedy_verify_from_logits():
     np.testing.assert_array_equal(np.asarray(accept_len_draft), np.array([3, 1], dtype=np.int32))
     np.testing.assert_array_equal(np.asarray(new_verified_id), np.array([99, 77], dtype=np.int32))
     np.testing.assert_array_equal(np.asarray(next_token_ids_flat).reshape(2, 4), target_predict)
+
+
+def test_dflash_greedy_verify_predictions_stops_at_ragged_lengths():
+    draft = jnp.array([[10, 11, 12, 13], [20, 21, 22, 23]], dtype=jnp.int32)
+    predictions = jnp.array([[11, 12, 99, 0], [21, 0, 0, 0]], dtype=jnp.int32)
+    accept_lens, _, bonus, accepted_draft = dflash_greedy_verify_predictions(
+        draft.reshape(-1),
+        predictions.reshape(-1),
+        draft_token_num=4,
+        verify_lens=jnp.array([3, 1], dtype=jnp.int32),
+    )
+
+    np.testing.assert_array_equal(np.asarray(accepted_draft), np.array([2, 0]))
+    np.testing.assert_array_equal(np.asarray(accept_lens), np.array([3, 1]))
+    np.testing.assert_array_equal(np.asarray(bonus), np.array([99, 21]))
 
 
 def test_dflash_greedy_verify_keeps_outputs_data_sharded():

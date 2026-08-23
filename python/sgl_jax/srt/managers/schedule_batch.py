@@ -2600,6 +2600,21 @@ class ScheduleBatch:
             logits_indices_selector,
         ) = self._merge_batch_metadata(per_dp_bs, total_bs)
         sampling_info = self._merge_sampling_info(per_dp_bs, total_bs)
+        req_pool_slot_generations = np.zeros((total_bs,), dtype=np.int32)
+        dspark_decode_rounds = np.full((total_bs,), -1, dtype=np.int32)
+        for dp_rank, info in enumerate(self.reqs_info):
+            reqs = info.reqs or []
+            if not reqs:
+                continue
+            start = dp_rank * per_dp_bs
+            end = start + len(reqs)
+            req_indices = np.asarray(info.req_pool_indices, dtype=np.int32)
+            req_pool_slot_generations[start:end] = self.req_to_token_pool.slot_generation[
+                req_indices
+            ]
+            dspark_decode_rounds[start:end] = np.asarray(
+                [req.decode_batch_idx for req in reqs], dtype=np.int32
+            )
         for dp_rank, info in enumerate(self.reqs_info):
             spec_info_dp = info.spec_info
             future_indices = getattr(spec_info_dp, "future_indices", None)
@@ -2699,6 +2714,8 @@ class ScheduleBatch:
             launch_done=self.launch_done,
             spec_info_padded=spec_info,
             spec_algorithm=self.spec_algorithm,
+            req_pool_slot_generations=req_pool_slot_generations,
+            dspark_decode_rounds=dspark_decode_rounds,
             tree_cache=self.tree_cache,
             mrope_positions=None,
         )
@@ -3737,6 +3754,9 @@ class ModelWorkerBatch:
     speculative_num_steps: int = 0
     speculative_eagle_topk: int = 0
     speculative_num_draft_tokens: int = 0
+    # DP-padded request identity for the DSpark lag-2 capacity relay.
+    req_pool_slot_generations: np.ndarray | None = None
+    dspark_decode_rounds: np.ndarray | None = None
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
 

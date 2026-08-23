@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+from dataclasses import replace
+from functools import partial
 
 import jax
 import numpy as np
@@ -14,13 +16,41 @@ logger = logging.getLogger(__name__)
 
 
 class DSparkWorker(DFlashWorker):
-    """DSpark stage1 worker: Markov draft plus fixed verify-all."""
+    """DSpark Markov draft with fixed or tuned compact ragged verification."""
 
     def __init__(self, server_args, target_worker):
         self._sts_capture_path = os.getenv("SGL_JAX_DSPARK_STS_CAPTURE_PATH")
         self.dspark_tuned_config = None
         self._dspark_sts_temperatures = None
+        self._dspark_seen_ragged_plans = set()
+        self._dspark_capacity_relay_metrics = {
+            "hit": 0,
+            "stale_warmup": 0,
+            "stale_generation": 0,
+            "stale_not_ready": 0,
+        }
+        self._dspark_last_relay_stats = dict(self._dspark_capacity_relay_metrics)
+        self._dspark_logged_first_relay_hit = False
         super().__init__(server_args, target_worker)
+        self._dspark_confidence_relay_device = None
+        self._dspark_confidence_relay_host = None
+        if self.dspark_tuned_config is not None:
+            from sgl_jax.srt.speculative.relay_buffer import (
+                DSparkConfidenceRelayHost,
+                create_dspark_confidence_relay_buffers,
+            )
+
+            self._dspark_confidence_relay_device = create_dspark_confidence_relay_buffers(
+                self.mesh,
+                self.req_to_token_pool,
+                dp_size=self.server_args.dp_size,
+                gamma=self.draft_width,
+            )
+            self._dspark_confidence_relay_host = DSparkConfidenceRelayHost(
+                dp_size=self.server_args.dp_size,
+                capacity=self.req_to_token_pool.req_to_token.shape[0],
+                gamma=self.draft_width,
+            )
 
     @staticmethod
     def _draft_model_class():
@@ -77,9 +107,7 @@ class DSparkWorker(DFlashWorker):
                 )
             else:
                 self._dspark_sts_temperatures = self.dspark_tuned_config.sts_temperatures
-                logger.info(
-                    "Using DSPARK tuned config: %s", self.dspark_tuned_config.provenance
-                )
+                logger.info("Using DSPARK tuned config: %s", self.dspark_tuned_config.provenance)
 
     def verify(self, model_worker_batch, cur_allocate_lens=None, *, update_relay=False):
         plan = getattr(model_worker_batch, "_dflash_target_verify_plan", None)
@@ -110,3 +138,191 @@ class DSparkWorker(DFlashWorker):
                         + "\n"
                     )
         return result
+
+    def _build_target_verify_plan(
+        self,
+        model_worker_batch,
+        draft_plan,
+        draft_token,
+        resolved_target_prefix_lens,
+        resolved_positions,
+        resolved_cache_loc,
+        draft_confidence,
+    ):
+        plan = super()._build_target_verify_plan(
+            model_worker_batch,
+            draft_plan,
+            draft_token,
+            resolved_target_prefix_lens,
+            resolved_positions,
+            resolved_cache_loc,
+            draft_confidence,
+        )
+        if self.dspark_tuned_config is None:
+            return plan
+
+        from jax.sharding import NamedSharding
+        from jax.sharding import PartitionSpec as P
+
+        from sgl_jax.srt.speculative.dspark_planner import select_dspark_verify_budget
+        from sgl_jax.srt.speculative.dspark_tuned_config import select_dspark_sps_profile
+
+        active = self._active_decode_slot_mask(model_worker_batch, draft_plan.bs)
+        lagged_confidence = self._publish_and_gather_lagged_confidence(
+            model_worker_batch,
+            draft_confidence,
+            active,
+        )
+        active_prefix_lens = draft_plan.target_prefix_lens[active]
+        context_length = (
+            int(active_prefix_lens.max()) + self.verify_width if active_prefix_lens.size else 0
+        )
+        profile = select_dspark_sps_profile(self.dspark_tuned_config, context_length)
+        if profile is None:
+            logger.warning(
+                "DSPARK has no SPS profile for context_length=%d; keeping fixed verify-all.",
+                context_length,
+            )
+            return plan
+
+        dp_size = int(model_worker_batch.dp_size)
+        per_dp_bs = draft_plan.bs // dp_size
+        active_rows = active.reshape((dp_size, per_dp_bs))
+        extra_budget_per_dp = np.zeros((dp_size,), dtype=np.int32)
+        token_buckets = []
+        for dp_rank in range(dp_size):
+            num_requests = int(active_rows[dp_rank].sum())
+            if num_requests == 0:
+                continue
+            rank_confidence = lagged_confidence.reshape((dp_size, per_dp_bs, -1))[dp_rank]
+            lagged_survival = np.cumprod(rank_confidence[active_rows[dp_rank]], axis=-1)
+            decision = select_dspark_verify_budget(profile, lagged_survival)
+            if decision is None:
+                logger.warning(
+                    "DSPARK SPS profile has no usable token bucket for rank=%d requests=%d; "
+                    "keeping fixed verify-all.",
+                    dp_rank,
+                    num_requests,
+                )
+                return plan
+            token_buckets.append(decision.token_bucket)
+            extra_budget_per_dp[dp_rank] = decision.extra_budget
+
+        if not token_buckets:
+            return plan
+        per_dp_token_bucket = max(token_buckets)
+        log_key = (
+            profile.context_bucket,
+            per_dp_token_bucket,
+            tuple(extra_budget_per_dp.tolist()),
+        )
+        if log_key not in self._dspark_seen_ragged_plans:
+            logger.info(
+                "DSPARK ragged verify plan: context_bucket=%d, token_bucket_per_dp=%d, "
+                "active_requests_per_dp=%s, extra_budget_per_dp=%s, "
+                "capacity_lag=2, relay_stats=%s",
+                profile.context_bucket,
+                per_dp_token_bucket,
+                active_rows.sum(axis=1).tolist(),
+                extra_budget_per_dp.tolist(),
+                self._dspark_last_relay_stats,
+            )
+            self._dspark_seen_ragged_plans.add(log_key)
+        data_sharding = NamedSharding(self.mesh, P("data"))
+        return replace(
+            plan,
+            dspark_extra_budget_per_dp=jax.device_put(
+                extra_budget_per_dp,
+                data_sharding,
+            ),
+            dspark_per_dp_token_bucket=per_dp_token_bucket,
+        )
+
+    def _publish_and_gather_lagged_confidence(
+        self,
+        model_worker_batch,
+        draft_confidence,
+        active_mask: np.ndarray,
+    ) -> np.ndarray:
+        """Publish C[t] asynchronously and gather only materialized C[t-2]."""
+        total_bs = int(active_mask.size)
+        fallback = np.ones((total_bs, self.draft_width), dtype=np.float32)
+        relay_host = self._dspark_confidence_relay_host
+        relay_device = self._dspark_confidence_relay_device
+        slot_generations = model_worker_batch.req_pool_slot_generations
+        decode_rounds = model_worker_batch.dspark_decode_rounds
+        if (
+            relay_host is None
+            or relay_device is None
+            or slot_generations is None
+            or decode_rounds is None
+        ):
+            self._dspark_last_relay_stats = {
+                "hit": 0,
+                "stale_warmup": 0,
+                "stale_generation": 0,
+                "stale_not_ready": int(active_mask.sum()),
+            }
+            return fallback
+
+        from jax.sharding import NamedSharding
+        from jax.sharding import PartitionSpec as P
+
+        from sgl_jax.srt.speculative.relay_buffer import (
+            update_dspark_confidence_relay_buffers,
+        )
+
+        req_pool_indices = np.asarray(model_worker_batch.req_pool_indices, dtype=np.int32)
+        slot_generations = np.asarray(slot_generations, dtype=np.int32)
+        decode_rounds = np.asarray(decode_rounds, dtype=np.int32)
+        safe_indices = np.where(active_mask, req_pool_indices, 0).astype(np.int32)
+        data_sharding = NamedSharding(self.mesh, P("data"))
+
+        if not hasattr(self, "_jit_update_dspark_confidence_relay"):
+
+            # Do not donate the ring: the background publisher retains this
+            # immutable snapshot until its asynchronous D2H copy materializes.
+            @partial(jax.jit, static_argnames=["dp_size"])
+            def update(buffers, indices, generations, rounds, valid, confidence, *, dp_size):
+                return update_dspark_confidence_relay_buffers(
+                    buffers,
+                    indices,
+                    generations,
+                    rounds,
+                    valid,
+                    confidence,
+                    dp_size=dp_size,
+                )
+
+            self._jit_update_dspark_confidence_relay = update
+
+        with jax.set_mesh(self.mesh):
+            self._dspark_confidence_relay_device = (
+                self._jit_update_dspark_confidence_relay(
+                    relay_device,
+                    jax.device_put(safe_indices, data_sharding),
+                    jax.device_put(slot_generations, data_sharding),
+                    jax.device_put(decode_rounds, data_sharding),
+                    jax.device_put(active_mask, data_sharding),
+                    draft_confidence,
+                    dp_size=int(model_worker_batch.dp_size),
+                )
+            )
+        relay_host.publish(self._dspark_confidence_relay_device)
+        lagged_confidence, stats = relay_host.gather_lagged_confidence(
+            safe_indices,
+            slot_generations,
+            decode_rounds,
+            active_mask,
+        )
+        self._dspark_last_relay_stats = stats
+        for name, value in stats.items():
+            self._dspark_capacity_relay_metrics[name] += value
+        if stats["hit"] and not self._dspark_logged_first_relay_hit:
+            logger.info(
+                "DSPARK capacity relay first lag-2 hit: step_stats=%s, cumulative=%s",
+                stats,
+                self._dspark_capacity_relay_metrics,
+            )
+            self._dspark_logged_first_relay_hit = True
+        return lagged_confidence

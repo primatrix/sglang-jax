@@ -81,8 +81,23 @@ def dflash_greedy_verify(
     draft_token_num: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Pure JAX target-logits argmax and greedy DFlash verification."""
-    candidates = draft_token.reshape((-1, int(draft_token_num)))
     target_predict_flat = jnp.argmax(target_logits, axis=-1).astype(jnp.int32)
+    return dflash_greedy_verify_predictions(
+        draft_token,
+        target_predict_flat,
+        draft_token_num=draft_token_num,
+    )
+
+
+def dflash_greedy_verify_predictions(
+    draft_token: jax.Array,
+    target_predict_flat: jax.Array,
+    *,
+    draft_token_num: int,
+    verify_lens: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Verify greedy predictions, optionally cutting each row at verify_lens."""
+    candidates = draft_token.reshape((-1, int(draft_token_num)))
     mesh = getattr(jax.typeof(target_predict_flat).sharding, "mesh", None)
     if mesh is not None and getattr(mesh, "empty", False):
         mesh = None
@@ -96,6 +111,14 @@ def dflash_greedy_verify(
         target_predict = jax.sharding.reshard(target_predict, data_2d)
 
     matches = candidates[:, 1:] == target_predict[:, :-1]
+    if verify_lens is not None:
+        verify_lens = verify_lens.astype(jnp.int32)
+        valid_matches = jnp.arange(candidates.shape[1] - 1, dtype=jnp.int32)[None, :] < (
+            verify_lens[:, None] - 1
+        )
+        if mesh is not None:
+            valid_matches = jax.sharding.reshard(valid_matches, data_2d)
+        matches = matches & valid_matches
     accept_len_draft = jnp.sum(jnp.cumprod(matches.astype(jnp.int32), axis=1), axis=1)
     target_predict_flat = target_predict.reshape(-1).astype(jnp.int32)
     if mesh is None:

@@ -39,6 +39,10 @@ class TestReqToTokenPoolAlloc(CustomTestCase):
             self.assertEqual(req.req_pool_idx, idx)
         self.assertEqual(len(set(indices)), len(indices), "indices must be unique")
         self.assertEqual(self.pool.available_size(), 4 - len(reqs))
+        np.testing.assert_array_equal(
+            self.pool.slot_generation[indices],
+            np.ones(len(indices), dtype=np.int32),
+        )
 
     def test_alloc_atomic_on_capacity_miss(self):
         # Shrink free_slots to two slots so a 3-req batch overflows.
@@ -68,6 +72,24 @@ class TestReqToTokenPoolAlloc(CustomTestCase):
         self.assertEqual(fresh_a.req_pool_idx, 1)
         self.assertEqual(fresh_b.req_pool_idx, 2)
         self.assertEqual(self.pool.free_slots, [3])
+        self.assertEqual(self.pool.slot_generation[0], 0, "retained owner must not advance")
+        self.assertEqual(self.pool.slot_generation[1], 1)
+        self.assertEqual(self.pool.slot_generation[2], 1)
+
+    def test_slot_generation_advances_on_reuse_and_clear(self):
+        pool = ReqToTokenPool(size=1, max_context_len=16, dtype=np.int32)
+        first = FakeReq()
+        pool.alloc([first])
+        self.assertEqual(pool.slot_generation[0], 1)
+
+        pool.free(first)
+        second = FakeReq()
+        pool.alloc([second])
+        self.assertEqual(second.req_pool_idx, 0)
+        self.assertEqual(pool.slot_generation[0], 2)
+
+        pool.clear()
+        self.assertEqual(pool.slot_generation[0], 3)
 
     def test_alloc_atomic_with_partial_reuse(self):
         retained = FakeReq(req_pool_idx=5, is_chunked=1)  # outside [0, size); ok for the test

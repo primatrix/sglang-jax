@@ -114,6 +114,10 @@ class ReqToTokenPool:
         # Use simple list to manage free slots
         self.free_slots = list(range(size))
 
+        # Host-side lifetime tag for req-indexed asynchronous relays. A fresh
+        # owner increments the generation; chunked prefill keeps it unchanged.
+        self.slot_generation = np.zeros((size,), dtype=np.int32)
+
         # Persistent host scratch buffer reused by
         # ScheduleBatch._merge_cache_loc to avoid a fresh np.zeros every step.
         # Allocated once at startup via init_cache_loc_host_buffer (its size is
@@ -143,6 +147,7 @@ class ReqToTokenPool:
         obj.max_context_len = aux_data["max_context_len"]
         obj.dtype = aux_data["dtype"]
         obj.free_slots = aux_data["free_slots"]
+        obj.slot_generation = np.zeros((obj.size,), dtype=np.int32)
 
         obj.req_to_token = children[0]
         # Host scratch buffer is transient host memory, not model state, so it
@@ -188,6 +193,7 @@ class ReqToTokenPool:
         for r in reqs:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_indices[offset]
+                self.slot_generation[r.req_pool_idx] += 1
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
@@ -200,6 +206,7 @@ class ReqToTokenPool:
     def clear(self):
         """Clear all allocation states"""
         self.free_slots = list(range(self.size))
+        self.slot_generation += 1
 
 
 class HybridReqToTokenPool(ReqToTokenPool):

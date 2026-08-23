@@ -1953,7 +1953,7 @@ class ServerArgs:
             if self.grammar_backend not in (None, "none"):
                 raise ValueError("DFLASH does not support constrained decoding.")
 
-        # DSPARK stage1: seven semi-AR proposals and fixed verify-all (anchor + gamma).
+        # DSPARK: seven semi-AR proposals and a maximum verify window of anchor + gamma.
         if self.speculative_algorithm == "DSPARK":
             if self.tp_size < 1:
                 raise ValueError("DSPARK requires --tp-size>=1.")
@@ -1998,7 +1998,7 @@ class ServerArgs:
             self.speculative_num_draft_tokens = draft_config.verify_width
             self._dspark_widths_normalized = True
             logger.info(
-                "DSPARK stage1: gamma=%d, draft_width=%d, fixed verify_width=%d.",
+                "DSPARK: gamma=%d, draft_width=%d, max_verify_width=%d.",
                 draft_config.gamma,
                 draft_config.draft_width,
                 draft_config.verify_width,
