@@ -606,13 +606,13 @@ tau(m) = R + sum(s1..sm)
 M(m) = R + m
 ~~~
 
-使用一维 SPS 表：
+legacy 一维 SPS bootstrap 可写成：
 
 ~~~text
 theta(m) = tau(m) * SPS(M(m))
 ~~~
 
-使用 step-time 表：
+当前二维 step-time 表使用：
 
 ~~~text
 theta(m) = tau(m) / T(R,M(m))
@@ -843,15 +843,17 @@ sum(verify_lens[rank])   = 该 rank 本 step 的有效 ragged query 数
 
 Capacity relay 使用 `ReqToTokenPool.slot_generation` 和逐请求 `decode_batch_idx` 做身份校验。当前 `C[t]` 写入三槽 device ring 后调用异步 host copy；planner 只读取已经 materialize 且 generation/source-round 同时匹配的 `C[t-2]`，永不等待 future。前两轮、copy 未完成和 slot reuse 都逐请求回退到 `survival=1`。
 
-第一版仍有一个明确限制：
-
-1. 当前 SPS 数据来自 verify-all serving frontier，采集时 `R` 与 `M=R*verify_width` 绑定；运行时暂按一维 `T(M)` bootstrap 使用。它足以验证 ragged plumbing 和 lag-2 容量选择，但最终性能决策必须补测固定 `R_bucket` 下的多个 `M_bucket`，构造二维 `T(R,M)`。
+当前 SPS 使用二维 `T(R,M)`：`R` 是每 DP 的 request bucket，`M` 是每 DP
+的静态 compact token bucket。planner 选择能够覆盖实时请求数的最小 `R`
+行，再只比较该行的 `M` 候选。实时请求数低于 `R` 时，多余行保持 padding，
+不会因为 31/33 之类的 DP 瞬时不均衡回退到 verify-all。
 
 Qwen3-8B 的内置 STS 温度已由 Falcon `exp-ksphva699n` 在 v7x-8 上用
 GSM8K-500、raw confidence logits 和上述 Sequential STS 重新生成；完整拟合产物位于
-`benchmark/dspark/tables/qwen3_8b_v7x8_sts.json`。SPS 仍保留上面的二维补测限制。
+`benchmark/dspark/tables/qwen3_8b_v7x8_sts.json`。v7x-8 的二维 SPS 原始表位于
+`benchmark/dspark/tables/qwen3_8b_v7x8_sps_2d.json`。
 
-下一步需要补齐二维 SPS 表，并预编译表中允许的 bucket variants，避免请求运行中出现意外编译。
+部署时应预编译表中允许的 bucket variants，避免请求运行中出现意外编译。
 
 高级预算参数在 planner 落地后再增加：
 

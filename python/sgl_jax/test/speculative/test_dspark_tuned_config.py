@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from sgl_jax.srt.speculative.dspark_planner import select_dspark_verify_budget
 from sgl_jax.srt.speculative.dspark_tuned_config import (
     calibrate_dspark_confidence,
     get_tuned_dspark_config,
@@ -43,13 +44,29 @@ def test_qwen3_v7x8_tuned_config_exact_hit():
 
     assert config is not None
     assert len(config.sts_temperatures) == 7
-    assert config.sps_profiles[0].points[-1].verify_tokens_per_dp == 2048
+    points = config.sps_profiles[0].points
+    assert {point.request_bucket_per_dp for point in points} == {32, 64}
+    assert {
+        point.verify_tokens_per_dp for point in points if point.request_bucket_per_dp == 32
+    } == {32, 64, 128, 256}
 
 
 def test_tuned_config_shape_or_revision_mismatch_is_a_miss():
     assert get_tuned_dspark_config(_key(tp_size=4)) is None
     assert get_tuned_dspark_config(_key(page_size=128)) is None
     assert get_tuned_dspark_config(_key(draft_revision="new-revision")) is None
+
+
+def test_qwen3_v7x8_2d_profile_avoids_legacy_m64_cliff_at_r33():
+    profile = get_tuned_dspark_config(_key()).sps_profiles[0]
+    conditional_confidence = np.full((33, 7), 0.8, dtype=np.float32)
+
+    decision = select_dspark_verify_budget(
+        profile,
+        np.cumprod(conditional_confidence, axis=-1),
+    )
+
+    assert decision.token_bucket == 256
 
 
 def test_sps_context_bucket_never_extrapolates_upward():

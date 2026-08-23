@@ -117,10 +117,11 @@ _QWEN3_8B_BLOCK7_V7X8 = make_dspark_tuned_key(
 )
 
 
-# SPS values measured by Falcon exp-6p32vpmjw6. Sequential STS values were
-# regenerated from raw confidence logits by Falcon exp-ksphva699n. Both runs
-# used JAX 0.10.2/libtpu 0.0.42.1 on v7x-8.
-# The SPS profile used random input=256/output=512, represented by the next
+# Two-dimensional ragged SPS values were measured by Falcon exp-525gl93cv9,
+# with padded boundary points corrected by exp-xi9gjnux5z. Sequential STS
+# values were regenerated from raw confidence logits by exp-ksphva699n. All
+# runs used JAX 0.10.2/libtpu 0.0.42.1 on v7x-8.
+# The SPS profile used random input=256/output=256, represented by the next
 # power-of-two context bucket. Runtime selection must not use it above 1024.
 TUNED_DSPARK_CONFIGS: dict[DSparkTunedKey, DSparkTunedConfig] = {
     _QWEN3_8B_BLOCK7_V7X8: DSparkTunedConfig(
@@ -137,21 +138,20 @@ TUNED_DSPARK_CONFIGS: dict[DSparkTunedKey, DSparkTunedConfig] = {
             DSparkSPSProfile(
                 context_bucket=1024,
                 points=(
-                    DSparkSPSPoint(8, 7.724172000052931, 129.46371468594268),
-                    DSparkSPSPoint(16, 7.523665499775234, 132.91393670144885),
-                    DSparkSPSPoint(32, 7.512431000577635, 133.11270345419604),
-                    DSparkSPSPoint(64, 7.834330000150658, 127.64333388825459),
-                    DSparkSPSPoint(128, 43.44934499977171, 23.015306675054692),
-                    DSparkSPSPoint(256, 44.429992999539536, 22.507318423623516),
-                    DSparkSPSPoint(512, 46.34686200006399, 21.576433804701153),
-                    DSparkSPSPoint(1024, 50.05107099987072, 19.979592444736756),
-                    DSparkSPSPoint(2048, 67.99853949996759, 14.706198211808308),
+                    DSparkSPSPoint(32, 10.906374999649415, 91.68949353310747, 32),
+                    DSparkSPSPoint(64, 11.128035500405531, 89.86312094021966, 32),
+                    DSparkSPSPoint(128, 11.181399000633974, 89.43424699747331, 32),
+                    DSparkSPSPoint(256, 11.40483300014239, 87.68212563809702, 32),
+                    DSparkSPSPoint(64, 11.165372500272497, 89.56261871026645, 64),
+                    DSparkSPSPoint(128, 12.116556500131992, 82.53169949639623, 64),
+                    DSparkSPSPoint(256, 13.09894699988945, 76.3420143625621, 64),
+                    DSparkSPSPoint(512, 16.603519999989658, 60.22819257606959, 64),
                 ),
             ),
         ),
         provenance=(
             "Falcon exp-ksphva699n raw-logit sequential STS (GSM8K-500); "
-            "exp-6p32vpmjw6 random-256/512 SPS"
+            "exp-525gl93cv9 + exp-xi9gjnux5z random-256/256 ragged T(R,M) SPS"
         ),
     ),
 }

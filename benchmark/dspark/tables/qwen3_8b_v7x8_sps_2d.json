@@ -1,0 +1,88 @@
+{
+  "schema_version": 2,
+  "kind": "dspark_ragged_sps_t_r_m",
+  "target": "Qwen/Qwen3-8B",
+  "draft": "deepseek-ai/dspark_qwen3_8b_block7",
+  "hardware": "v7x-8",
+  "gamma": 7,
+  "verify_width": 8,
+  "tp_size": 8,
+  "dp_size": 2,
+  "input_len": 256,
+  "output_len": 256,
+  "seed": 980406,
+  "versions": {
+    "jax": "0.10.2",
+    "libtpu": "0.0.42.1"
+  },
+  "provenance": {
+    "base_experiment": "exp-525gl93cv9",
+    "boundary_correction_experiment": "exp-xi9gjnux5z"
+  },
+  "points": [
+    {
+      "request_bucket_per_dp": 32,
+      "verify_tokens_per_dp": 32,
+      "step_samples": 735,
+      "median_step_time_ms": 10.906374999649415,
+      "p90_step_time_ms": 11.432575999697292,
+      "steps_per_second": 91.68949353310747
+    },
+    {
+      "request_bucket_per_dp": 32,
+      "verify_tokens_per_dp": 64,
+      "step_samples": 268,
+      "median_step_time_ms": 11.128035500405531,
+      "p90_step_time_ms": 26.519140899290505,
+      "steps_per_second": 89.86312094021966
+    },
+    {
+      "request_bucket_per_dp": 32,
+      "verify_tokens_per_dp": 128,
+      "step_samples": 160,
+      "median_step_time_ms": 11.181399000633974,
+      "p90_step_time_ms": 47.093877199495175,
+      "steps_per_second": 89.43424699747331
+    },
+    {
+      "request_bucket_per_dp": 32,
+      "verify_tokens_per_dp": 256,
+      "step_samples": 160,
+      "median_step_time_ms": 11.40483300014239,
+      "p90_step_time_ms": 65.35263459918497,
+      "steps_per_second": 87.68212563809702
+    },
+    {
+      "request_bucket_per_dp": 64,
+      "verify_tokens_per_dp": 64,
+      "step_samples": 512,
+      "median_step_time_ms": 11.165372500272497,
+      "p90_step_time_ms": 12.108638299923768,
+      "steps_per_second": 89.56261871026645
+    },
+    {
+      "request_bucket_per_dp": 64,
+      "verify_tokens_per_dp": 128,
+      "step_samples": 188,
+      "median_step_time_ms": 12.116556500131992,
+      "p90_step_time_ms": 29.252707900377573,
+      "steps_per_second": 82.53169949639623
+    },
+    {
+      "request_bucket_per_dp": 64,
+      "verify_tokens_per_dp": 256,
+      "step_samples": 41,
+      "median_step_time_ms": 13.09894699988945,
+      "p90_step_time_ms": 31.16694300024392,
+      "steps_per_second": 76.3420143625621
+    },
+    {
+      "request_bucket_per_dp": 64,
+      "verify_tokens_per_dp": 512,
+      "step_samples": 70,
+      "median_step_time_ms": 16.603519999989658,
+      "p90_step_time_ms": 37.02004390015645,
+      "steps_per_second": 60.22819257606959
+    }
+  ]
+}
