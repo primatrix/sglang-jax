@@ -1,3 +1,4 @@
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -58,16 +59,23 @@ def test_sps_context_bucket_never_extrapolates_upward():
     assert select_dspark_sps_profile(config, 1025) is None
 
 
-def test_sts_temperature_one_is_identity_and_width_is_checked():
-    confidence = jnp.asarray([[0.1, 0.5, 0.9]], dtype=jnp.float32)
+def test_sts_temperature_one_is_plain_sigmoid_and_width_is_checked():
+    confidence_logits = jnp.asarray([[-2.0, 0.0, 2.0]], dtype=jnp.float32)
     np.testing.assert_allclose(
-        np.asarray(calibrate_dspark_confidence(confidence, (1.0, 1.0, 1.0))),
-        np.asarray(confidence),
+        np.asarray(calibrate_dspark_confidence(confidence_logits, (1.0, 1.0, 1.0))),
+        np.asarray(jax.nn.sigmoid(confidence_logits)),
         rtol=1e-6,
     )
     try:
-        calibrate_dspark_confidence(confidence, (1.0, 1.0))
+        calibrate_dspark_confidence(confidence_logits, (1.0, 1.0))
     except ValueError as exc:
         assert "STS width" in str(exc)
     else:
         raise AssertionError("STS width mismatch must be rejected")
+
+
+def test_sts_scales_each_raw_logit_column_before_sigmoid():
+    confidence_logits = jnp.full((2, 3), 2.0, dtype=jnp.float32)
+    calibrated = calibrate_dspark_confidence(confidence_logits, (0.5, 1.0, 2.0))
+    expected = jax.nn.sigmoid(confidence_logits / jnp.asarray([0.5, 1.0, 2.0], dtype=jnp.float32))
+    np.testing.assert_allclose(np.asarray(calibrated), np.asarray(expected), rtol=1e-6)

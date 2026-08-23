@@ -111,13 +111,13 @@ def test_confidence_head_uses_markov_embedding():
         )
     head.proj.weight.value = jnp.asarray([[0.0], [0.0], [2.0]], dtype=jnp.float32)
     head.proj.bias.value = jnp.asarray([0.0], dtype=jnp.float32)
-    confidence = head(
+    confidence_logits = head(
         jnp.zeros((2, 2), dtype=jnp.float32),
         jnp.asarray([[0.0], [1.0]], dtype=jnp.float32),
     )
     np.testing.assert_allclose(
-        np.asarray(confidence),
-        np.asarray([0.5, jax.nn.sigmoid(2.0)]),
+        np.asarray(confidence_logits),
+        np.asarray([0.0, 2.0]),
         rtol=1e-6,
     )
 
@@ -161,7 +161,7 @@ def test_dspark_weight_mapping_matches_official_checkpoint_names():
     assert "lm_head.weight" not in mappings
 
 
-def test_dspark_markov_block_returns_gamma_tokens_and_confidence():
+def test_dspark_markov_block_returns_gamma_tokens_and_confidence_logits():
     from sgl_jax.srt.models.dspark import DSparkDraftModel
 
     mesh = _mesh()
@@ -176,12 +176,12 @@ def test_dspark_markov_block_returns_gamma_tokens_and_confidence():
     base_logits = jnp.zeros((2, cfg.block_size, cfg.vocab_size))
     base_logits = base_logits.at[:, :, 3].set(1.0)
     run = jax.jit(model.generate_markov_block)
-    tokens, confidence = run(
+    tokens, confidence_logits = run(
         base_logits,
         jnp.zeros((2, cfg.block_size, cfg.hidden_size)),
         jnp.asarray([0, 1], dtype=jnp.int32),
     )
     assert tokens.shape == (2, cfg.block_size)
-    assert confidence.shape == (2, cfg.block_size)
+    assert confidence_logits.shape == (2, cfg.block_size)
     assert np.asarray(tokens).tolist() == [[3, 3, 3], [3, 3, 3]]
-    np.testing.assert_allclose(np.asarray(confidence), 0.5)
+    np.testing.assert_allclose(np.asarray(confidence_logits), 0.0)

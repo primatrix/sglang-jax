@@ -106,6 +106,11 @@ class DSparkWorker(DFlashWorker):
                     "DSPARK tuned-config lookup miss for key=%s; keeping fixed verify-all.", key
                 )
             else:
+                if self._sts_capture_path:
+                    raise ValueError(
+                        "DSPARK STS capture requires uncalibrated fixed verify-all execution; "
+                        "omit --enable-dspark-tuned-config while collecting raw logits."
+                    )
                 self._dspark_sts_temperatures = self.dspark_tuned_config.sts_temperatures
                 logger.info("Using DSPARK tuned config: %s", self.dspark_tuned_config.provenance)
 
@@ -116,21 +121,23 @@ class DSparkWorker(DFlashWorker):
             cur_allocate_lens,
             update_relay=update_relay,
         )
-        if self._sts_capture_path and plan is not None and plan.draft_confidence is not None:
-            confidence, accept_lens, active_mask = jax.device_get(
-                (plan.draft_confidence, result.accept_lens, plan.active_mask)
+        if self._sts_capture_path and plan is not None and plan.draft_confidence_logits is not None:
+            confidence_logits, accept_lens, active_mask = jax.device_get(
+                (plan.draft_confidence_logits, result.accept_lens, plan.active_mask)
             )
-            confidence = np.asarray(confidence, dtype=np.float32)
+            confidence_logits = np.asarray(confidence_logits, dtype=np.float32)
             accepted_draft = np.asarray(accept_lens, dtype=np.int32) - 1
             active_mask = np.asarray(active_mask, dtype=np.bool_)
             with open(self._sts_capture_path, "a", encoding="utf-8") as capture:
                 for row, accepted in zip(
-                    confidence[active_mask], accepted_draft[active_mask], strict=True
+                    confidence_logits[active_mask], accepted_draft[active_mask], strict=True
                 ):
+                    prefix_mask = np.arange(row.shape[0], dtype=np.int32) < int(accepted)
                     capture.write(
                         json.dumps(
                             {
-                                "confidence": row.tolist(),
+                                "logits": row.tolist(),
+                                "prefix_mask": prefix_mask.astype(np.int32).tolist(),
                                 "accepted_draft": int(accepted),
                             },
                             separators=(",", ":"),
@@ -148,6 +155,7 @@ class DSparkWorker(DFlashWorker):
         resolved_positions,
         resolved_cache_loc,
         draft_confidence,
+        draft_confidence_logits,
     ):
         plan = super()._build_target_verify_plan(
             model_worker_batch,
@@ -157,6 +165,7 @@ class DSparkWorker(DFlashWorker):
             resolved_positions,
             resolved_cache_loc,
             draft_confidence,
+            draft_confidence_logits,
         )
         if self.dspark_tuned_config is None:
             return plan
@@ -279,7 +288,6 @@ class DSparkWorker(DFlashWorker):
         data_sharding = NamedSharding(self.mesh, P("data"))
 
         if not hasattr(self, "_jit_update_dspark_confidence_relay"):
-
             # Do not donate the ring: the background publisher retains this
             # immutable snapshot until its asynchronous D2H copy materializes.
             @partial(jax.jit, static_argnames=["dp_size"])
@@ -297,16 +305,14 @@ class DSparkWorker(DFlashWorker):
             self._jit_update_dspark_confidence_relay = update
 
         with jax.set_mesh(self.mesh):
-            self._dspark_confidence_relay_device = (
-                self._jit_update_dspark_confidence_relay(
-                    relay_device,
-                    jax.device_put(safe_indices, data_sharding),
-                    jax.device_put(slot_generations, data_sharding),
-                    jax.device_put(decode_rounds, data_sharding),
-                    jax.device_put(active_mask, data_sharding),
-                    draft_confidence,
-                    dp_size=int(model_worker_batch.dp_size),
-                )
+            self._dspark_confidence_relay_device = self._jit_update_dspark_confidence_relay(
+                relay_device,
+                jax.device_put(safe_indices, data_sharding),
+                jax.device_put(slot_generations, data_sharding),
+                jax.device_put(decode_rounds, data_sharding),
+                jax.device_put(active_mask, data_sharding),
+                draft_confidence,
+                dp_size=int(model_worker_batch.dp_size),
             )
         relay_host.publish(self._dspark_confidence_relay_device)
         lagged_confidence, stats = relay_host.gather_lagged_confidence(

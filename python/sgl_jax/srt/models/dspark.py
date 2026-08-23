@@ -116,9 +116,13 @@ class DSparkConfidenceHead(nnx.Module):
         hidden_states: jax.Array,
         markov_embeddings: jax.Array,
     ) -> jax.Array:
-        return jax.nn.sigmoid(
-            self.raw_confidence(hidden_states, markov_embeddings).astype(jnp.float32)
-        )
+        """Return uncalibrated confidence logits.
+
+        STS owns the only sigmoid so calibration can apply ``sigmoid(logit / T)``
+        directly without losing saturated-logit information through a
+        probability round trip.
+        """
+        return self.raw_confidence(hidden_states, markov_embeddings)
 
 
 class DSparkDraftModel(DFlashDraftModel):
@@ -152,11 +156,11 @@ class DSparkDraftModel(DFlashDraftModel):
         hidden_states: jax.Array,
         first_prev_tokens: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
-        """Generate ``gamma`` proposals serially and compute current confidence.
+        """Generate ``gamma`` proposals serially and return confidence logits.
 
-        Stage1 always verifies every generated proposal. Confidence is still
-        computed and returned so checkpoint/head parity can be tested now; it
-        is not used for scheduling until a later stage.
+        Stage1 always verifies every generated proposal. Raw logits are still
+        returned so checkpoint/head parity can be tested and later stages can
+        apply STS without a sigmoid/logit round trip.
         """
 
         if base_logits.ndim != 3 or base_logits.shape[1] != self.gamma:
@@ -172,7 +176,7 @@ class DSparkDraftModel(DFlashDraftModel):
 
         prev_tokens = first_prev_tokens.astype(jnp.int32)
         tokens = []
-        confidence = []
+        confidence_logits = []
         for step in range(self.gamma):
             corrected_logits, markov_embedding = self.markov_head.apply_step_logits(
                 base_logits[:, step, :],
@@ -180,9 +184,11 @@ class DSparkDraftModel(DFlashDraftModel):
             )
             next_tokens = jnp.argmax(corrected_logits, axis=-1).astype(jnp.int32)
             tokens.append(next_tokens)
-            confidence.append(self.confidence_head(hidden_states[:, step, :], markov_embedding))
+            confidence_logits.append(
+                self.confidence_head(hidden_states[:, step, :], markov_embedding)
+            )
             prev_tokens = next_tokens
-        return jnp.stack(tokens, axis=1), jnp.stack(confidence, axis=1)
+        return jnp.stack(tokens, axis=1), jnp.stack(confidence_logits, axis=1)
 
     def _create_weight_mappings(self) -> dict[str, WeightMapping]:
         # Call the base implementation explicitly so mapping-only coverage tests

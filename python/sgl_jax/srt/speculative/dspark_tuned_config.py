@@ -113,19 +113,21 @@ _QWEN3_8B_BLOCK7_V7X8 = make_dspark_tuned_key(
 )
 
 
-# Values measured by Falcon exp-6p32vpmjw6 with JAX 0.10.2/libtpu 0.0.42.1.
+# SPS values measured by Falcon exp-6p32vpmjw6. Sequential STS values were
+# regenerated from raw confidence logits by Falcon exp-ksphva699n. Both runs
+# used JAX 0.10.2/libtpu 0.0.42.1 on v7x-8.
 # The SPS profile used random input=256/output=512, represented by the next
 # power-of-two context bucket. Runtime selection must not use it above 1024.
 TUNED_DSPARK_CONFIGS: dict[DSparkTunedKey, DSparkTunedConfig] = {
     _QWEN3_8B_BLOCK7_V7X8: DSparkTunedConfig(
         sts_temperatures=(
-            1.3641735918087372,
-            1.4598175559757278,
-            1.4473119097728904,
-            1.5129510918519498,
-            1.546768085781109,
-            1.4756634186648716,
-            1.3486279015720892,
+            1.9952623149688797,
+            2.511886431509581,
+            2.23872113856834,
+            2.511886431509581,
+            2.511886431509581,
+            2.511886431509581,
+            2.23872113856834,
         ),
         sps_profiles=(
             DSparkSPSProfile(
@@ -143,7 +145,10 @@ TUNED_DSPARK_CONFIGS: dict[DSparkTunedKey, DSparkTunedConfig] = {
                 ),
             ),
         ),
-        provenance="Falcon exp-6p32vpmjw6; GSM8K-500 STS; random-256/512 SPS",
+        provenance=(
+            "Falcon exp-ksphva699n raw-logit sequential STS (GSM8K-500); "
+            "exp-6p32vpmjw6 random-256/512 SPS"
+        ),
     ),
 }
 
@@ -162,20 +167,18 @@ def select_dspark_sps_profile(
     return None
 
 
-def calibrate_dspark_confidence(confidence, temperatures):
-    """Apply per-position temperature scaling to confidence probabilities."""
+def calibrate_dspark_confidence(confidence_logits, temperatures):
+    """Apply per-position STS directly to uncalibrated confidence logits."""
     import jax
     import jax.numpy as jnp
 
     temperature = jnp.asarray(temperatures, dtype=jnp.float32)
-    if confidence.shape[-1] != temperature.shape[0]:
+    if confidence_logits.shape[-1] != temperature.shape[0]:
         raise ValueError(
             "DSPARK STS width must match confidence width: "
-            f"{temperature.shape[0]} vs {confidence.shape[-1]}."
+            f"{temperature.shape[0]} vs {confidence_logits.shape[-1]}."
         )
-    clipped = jnp.clip(confidence.astype(jnp.float32), 1e-6, 1.0 - 1e-6)
-    logits = jnp.log(clipped) - jnp.log1p(-clipped)
-    return jax.nn.sigmoid(logits / temperature)
+    return jax.nn.sigmoid(confidence_logits.astype(jnp.float32) / temperature)
 
 
 __all__ = [

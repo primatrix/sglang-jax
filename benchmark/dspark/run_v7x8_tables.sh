@@ -95,8 +95,7 @@ stop_dspark
 python/.venv/bin/python benchmark/dspark/fit_sts.py \
   "$RESULT_ROOT/sts_capture.jsonl" \
   --output "$RESULT_ROOT/sts_table.json" \
-  --seed 980406 \
-  --train-fraction 0.8
+  --num-bins 15
 
 python/.venv/bin/python - <<'PY'
 import json

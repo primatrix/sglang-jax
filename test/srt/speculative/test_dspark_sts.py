@@ -1,33 +1,59 @@
+import json
+
 import numpy as np
 
-from benchmark.dspark.fit_sts import _calibrated_probability, fit_sts, fit_temperature
+from benchmark.dspark.fit_sts import (
+    default_temperature_grid,
+    expected_calibration_error,
+    fit_sts,
+    load_capture,
+)
 
 
-def test_fit_temperature_recovers_synthetic_scale():
+def test_fit_sts_recovers_scale_and_reduces_prefix_ece():
     rng = np.random.default_rng(7)
-    logits = rng.normal(size=200_000)
-    true_temperature = 2.5
-    labels = rng.random(logits.shape) < 1.0 / (1.0 + np.exp(-logits / true_temperature))
-    uncalibrated = 1.0 / (1.0 + np.exp(-logits))
+    num_samples, gamma, scale = 60_000, 4, 2.5
+    base_logit = np.asarray([2.0, 1.2, 0.8, 0.4])
+    true_logits = base_logit[None, :] + rng.normal(scale=0.5, size=(num_samples, gamma))
+    true_probability = 1.0 / (1.0 + np.exp(-true_logits))
+    accepted = rng.random(true_probability.shape) < true_probability
+    prefix_mask = np.cumprod(accepted.astype(np.int32), axis=1).astype(np.float64)
 
-    fitted = fit_temperature(uncalibrated, labels.astype(np.float64))
+    result = fit_sts(
+        true_logits * scale,
+        prefix_mask,
+        grid=default_temperature_grid(),
+    )
 
-    assert abs(fitted - true_temperature) < 0.08
-
-
-def test_fit_sts_uses_conditional_at_risk_rows():
-    confidence = np.full((10, 3), 0.5, dtype=np.float64)
-    accepted = np.asarray([0, 0, 1, 1, 1, 2, 2, 3, 3, 3], dtype=np.int32)
-
-    result = fit_sts(confidence, accepted, seed=1, train_fraction=0.5)
-
-    assert result["gamma"] == 3
-    assert result["positions"][0]["empirical_acceptance"] == 0.8
-    assert result["positions"][1]["empirical_acceptance"] == 0.625
-    assert result["positions"][2]["empirical_acceptance"] == 0.6
-    assert np.all(np.isfinite(result["temperatures"]))
+    assert result["method"] == "sequential_temperature_scaling"
+    assert len(result["temperatures"]) == gamma
+    for temperature in result["temperatures"]:
+        assert scale / 1.5 < temperature < scale * 1.5
+    mean_before = np.mean([row["ece_before"] for row in result["positions"]])
+    mean_after = np.mean([row["ece_after"] for row in result["positions"]])
+    assert mean_after < 0.25 * mean_before
 
 
-def test_temperature_one_preserves_probability():
-    confidence = np.asarray([0.1, 0.5, 0.9])
-    np.testing.assert_allclose(_calibrated_probability(confidence, 1.0), confidence)
+def test_expected_calibration_error_distinguishes_calibrated_probability():
+    rng = np.random.default_rng(11)
+    calibrated = np.full(20_000, 0.3)
+    targets = (rng.random(calibrated.shape) < 0.3).astype(np.float64)
+    assert expected_calibration_error(calibrated, targets) < 0.02
+    assert expected_calibration_error(np.full_like(calibrated, 0.95), targets) > 0.5
+
+
+def test_load_capture_prefers_raw_logits_and_builds_legacy_prefix(tmp_path):
+    capture = tmp_path / "capture.jsonl"
+    records = [
+        {"logits": [2.0, 1.0, -1.0], "prefix_mask": [1, 1, 0]},
+        {"confidence": [0.5, 0.5, 0.5], "accepted_draft": 1},
+    ]
+    capture.write_text(
+        "".join(json.dumps(row) + "\n" for row in records), encoding="utf-8"
+    )
+
+    logits, prefix_mask = load_capture(capture)
+
+    np.testing.assert_allclose(logits[0], [2.0, 1.0, -1.0])
+    np.testing.assert_allclose(logits[1], 0.0, atol=1e-12)
+    np.testing.assert_array_equal(prefix_mask, [[1, 1, 0], [1, 0, 0]])

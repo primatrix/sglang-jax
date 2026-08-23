@@ -402,7 +402,18 @@ a[r,k] = product(c[r,0:k+1])
 
 因此每个请求内部 `a[r,0] >= a[r,1] >= ...`。额外验证一行的期望收益，就是到达该行所需的 prefix survival。
 
-STS 使用逐位置 temperature 校准。没有 STS 时可用 1.0，但要告警，SPS 调度可退化到 verify-all。
+STS 使用 Sequential Temperature Scaling。Confidence Head 在运行时保留未经过
+sigmoid 的 `confidence_logits`，统一计算
+`confidence = sigmoid(confidence_logits / temperature)`；temperature 为 1 时就是
+未校准概率。STS capture 保存 raw logits 和实际 `prefix_mask`，不再保存概率后通过
+`logit()` 反解。采集必须关闭 tuned config 并走 fixed verify-all，否则 ragged cutoff
+会让后缀标签受到当前调度策略截尾，不能再作为无偏 calibration 样本。
+
+离线拟合从左到右进行。位置 `k` 固定前面已经选择的 temperature，针对候选
+`T_k` 计算累计 survival
+`a_k = a_{k-1} * sigmoid(confidence_logits[k] / T_k)`，并选择使 `a_k` 相对实际
+prefix-survival label 的 ECE 最小的温度。这与论文及 SGLang GPU 实现一致；没有
+STS 时使用 1.0，SPS 调度仍可退化到 verify-all。
 
 不能等待当前完整 confidence 再选择当前 executable，否则会导致 device-to-host 同步。所有运行模式统一固定：
 
@@ -835,6 +846,10 @@ Capacity relay 使用 `ReqToTokenPool.slot_generation` 和逐请求 `decode_batc
 第一版仍有一个明确限制：
 
 1. 当前 SPS 数据来自 verify-all serving frontier，采集时 `R` 与 `M=R*verify_width` 绑定；运行时暂按一维 `T(M)` bootstrap 使用。它足以验证 ragged plumbing 和 lag-2 容量选择，但最终性能决策必须补测固定 `R_bucket` 下的多个 `M_bucket`，构造二维 `T(R,M)`。
+
+Qwen3-8B 的内置 STS 温度已由 Falcon `exp-ksphva699n` 在 v7x-8 上用
+GSM8K-500、raw confidence logits 和上述 Sequential STS 重新生成；完整拟合产物位于
+`benchmark/dspark/tables/qwen3_8b_v7x8_sts.json`。SPS 仍保留上面的二维补测限制。
 
 下一步需要补齐二维 SPS 表，并预编译表中允许的 bucket variants，避免请求运行中出现意外编译。
 

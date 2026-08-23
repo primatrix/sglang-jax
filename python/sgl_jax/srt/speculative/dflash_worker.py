@@ -82,6 +82,7 @@ class TargetVerifyPlan:
     relay_future_indices: jax.Array
     relay_valid_mask: jax.Array
     draft_confidence: jax.Array | None = None
+    draft_confidence_logits: jax.Array | None = None
     update_relay: bool = False
     dspark_extra_budget_per_dp: jax.Array | None = None
     dspark_per_dp_token_bucket: int | None = None
@@ -249,6 +250,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             resolved_positions,
             resolved_cache_loc,
             draft_confidence,
+            draft_confidence_logits,
         ) = self._run_jit_draft_block(draft_plan)
 
         # JAX dispatch is asynchronous. Bind the target model to the draft
@@ -261,6 +263,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             resolved_positions,
             resolved_cache_loc,
             draft_confidence,
+            draft_confidence_logits,
         )
         self.target_worker.model_runner.attn_backend.forward_metadata = target_plan.forward_metadata
         model_worker_batch._dflash_target_verify_plan = target_plan
@@ -638,6 +641,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         resolved_positions: jax.Array,
         resolved_cache_loc: jax.Array,
         draft_confidence: jax.Array,
+        draft_confidence_logits: jax.Array,
     ) -> TargetVerifyPlan:
         bs = draft_plan.bs
         target_mwb = copy.copy(model_worker_batch)
@@ -703,6 +707,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             relay_future_indices=draft_plan.relay_future_indices,
             relay_valid_mask=draft_plan.relay_valid_mask,
             draft_confidence=draft_confidence,
+            draft_confidence_logits=draft_confidence_logits,
         )
 
     def _make_draft_block_mwb(
@@ -881,7 +886,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             seed = forward_batch.input_ids.reshape((-1, draft_width))[:, :1]
             seed = jax.sharding.reshard(seed, cache_row_sharding)
             if is_dspark:
-                draft_next, confidence = model.generate_markov_block(
+                draft_next, confidence_logits = model.generate_markov_block(
                     logits,
                     proposal_hidden,
                     seed[:, 0],
@@ -891,10 +896,15 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                         calibrate_dspark_confidence,
                     )
 
-                    confidence = calibrate_dspark_confidence(confidence, dspark_sts_temperatures)
+                    confidence = calibrate_dspark_confidence(
+                        confidence_logits, dspark_sts_temperatures
+                    )
+                else:
+                    confidence = jax.nn.sigmoid(confidence_logits.astype(jnp.float32))
             else:
                 draft_next = jnp.argmax(logits, axis=-1).astype(jnp.int32)
                 confidence = jnp.zeros(draft_next.shape, dtype=jnp.float32)
+                confidence_logits = jnp.zeros(draft_next.shape, dtype=jnp.float32)
             draft_next = jax.sharding.reshard(draft_next, cache_row_sharding)
             draft_token = jnp.concatenate([seed, draft_next], axis=1).reshape(-1)
             draft_token = jax.sharding.reshard(draft_token, token_sharding)
@@ -913,6 +923,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 verify_positions,
                 selected_verify_cache_loc,
                 confidence,
+                confidence_logits,
             )
 
         self._jit_draft_block = _partial(
@@ -937,6 +948,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 positions,
                 cache_loc,
                 confidence,
+                confidence_logits,
             ) = self._jit_draft_block(
                 runner.model_state_leaves,
                 forward_batch,
@@ -952,7 +964,14 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 dp_size=plan.dp_size,
             )
             self._replace_memory_pools(runner, pool_updates)
-            return draft_token, target_prefix_lens, positions, cache_loc, confidence
+            return (
+                draft_token,
+                target_prefix_lens,
+                positions,
+                cache_loc,
+                confidence,
+                confidence_logits,
+            )
 
         with self._dispatch_context(runner):
             return _call_and_replace()
@@ -1819,6 +1838,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             resolved_positions,
             resolved_cache_loc,
             draft_confidence,
+            draft_confidence_logits,
         ) = self._run_jit_draft_block(draft_plan)
 
         # Match the serving dependency and sharding exactly: target verify
@@ -1836,6 +1856,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             resolved_positions,
             resolved_cache_loc,
             draft_confidence,
+            draft_confidence_logits,
         )
         target_plan = replace(target_plan, update_relay=use_relay_state)
         self.target_worker.model_runner.attn_backend.forward_metadata = target_plan.forward_metadata
