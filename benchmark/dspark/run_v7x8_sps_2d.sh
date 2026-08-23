@@ -72,7 +72,7 @@ collect_point() {
     --output "$RESULT_ROOT/points/r${requests}_m${token_bucket}.json"
 }
 
-for token_bucket in 32 64 128 256 512; do
+for token_bucket in ${DSPARK_TOKEN_BUCKETS:-32 64 128 256 512}; do
   launch_server "$token_bucket"
   if [ "$token_bucket" -le 256 ]; then
     collect_point 32 "$token_bucket"

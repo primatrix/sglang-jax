@@ -67,7 +67,13 @@ def select_dspark_verify_budget(
         bucket = int(point.verify_tokens_per_dp)
         if forced_token_bucket is not None and bucket != forced_token_bucket:
             continue
-        if bucket < num_requests or bucket > max_tokens:
+        if bucket < num_requests:
+            continue
+        # A request-bucket executable may legitimately contain padding when
+        # the live row count is below its covering R bucket.  The benchmark
+        # force path needs the same behavior to measure boundary points such
+        # as T(32, 256) while DP routing briefly yields 31 live rows.
+        if bucket > max_tokens and selected_request_bucket is None and forced_token_bucket is None:
             continue
         extra_budget = min(bucket - num_requests, flat.size)
         expected_tokens = float(num_requests + flat[:extra_budget].sum())

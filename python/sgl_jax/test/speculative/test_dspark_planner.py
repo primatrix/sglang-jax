@@ -79,6 +79,23 @@ def test_budget_planner_can_force_token_bucket_for_tpu_collection():
     assert decision.extra_budget == 14
 
 
+def test_forced_bucket_allows_static_padding_above_live_verify_all():
+    profile = DSparkSPSProfile(
+        context_bucket=1024,
+        points=(DSparkSPSPoint(256, 10.0, 100.0),),
+    )
+
+    decision = select_dspark_verify_budget(
+        profile,
+        np.ones((31, 7), dtype=np.float32),
+        forced_token_bucket=256,
+    )
+
+    assert decision.token_bucket == 256
+    assert decision.extra_budget == 217
+    assert decision.expected_tokens == 248
+
+
 def test_budget_planner_rejects_request_count_above_2d_table():
     profile = DSparkSPSProfile(
         context_bucket=1024,
