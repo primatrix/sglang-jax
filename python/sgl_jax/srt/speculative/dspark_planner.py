@@ -25,6 +25,8 @@ class DSparkBudgetDecision:
 def select_dspark_verify_budget(
     profile: DSparkSPSProfile,
     survival: np.ndarray,
+    *,
+    forced_token_bucket: int | None = None,
 ) -> DSparkBudgetDecision | None:
     """Choose the SPS point with the best expected accepted tokens per ms.
 
@@ -44,9 +46,27 @@ def select_dspark_verify_budget(
 
     flat = np.sort(np.clip(survival, 0.0, 1.0).reshape(-1))[::-1]
     max_tokens = num_requests * (gamma + 1)
+    request_buckets = sorted(
+        {
+            int(point.request_bucket_per_dp)
+            for point in profile.points
+            if point.request_bucket_per_dp is not None
+        }
+    )
+    selected_request_bucket = next(
+        (bucket for bucket in request_buckets if bucket >= num_requests),
+        None,
+    )
+    if request_buckets and selected_request_bucket is None:
+        return None
+
     best: DSparkBudgetDecision | None = None
     for point in profile.points:
+        if request_buckets and point.request_bucket_per_dp != selected_request_bucket:
+            continue
         bucket = int(point.verify_tokens_per_dp)
+        if forced_token_bucket is not None and bucket != forced_token_bucket:
+            continue
         if bucket < num_requests or bucket > max_tokens:
             continue
         extra_budget = min(bucket - num_requests, flat.size)

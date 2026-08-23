@@ -20,6 +20,12 @@ class DSparkWorker(DFlashWorker):
 
     def __init__(self, server_args, target_worker):
         self._sts_capture_path = os.getenv("SGL_JAX_DSPARK_STS_CAPTURE_PATH")
+        forced_token_bucket = os.getenv("SGL_JAX_DSPARK_FORCE_TOKEN_BUCKET_PER_DP")
+        self._dspark_forced_token_bucket = (
+            int(forced_token_bucket) if forced_token_bucket is not None else None
+        )
+        if self._dspark_forced_token_bucket is not None and self._dspark_forced_token_bucket <= 0:
+            raise ValueError("SGL_JAX_DSPARK_FORCE_TOKEN_BUCKET_PER_DP must be positive.")
         self.dspark_tuned_config = None
         self._dspark_sts_temperatures = None
         self._dspark_seen_ragged_plans = set()
@@ -205,7 +211,11 @@ class DSparkWorker(DFlashWorker):
                 continue
             rank_confidence = lagged_confidence.reshape((dp_size, per_dp_bs, -1))[dp_rank]
             lagged_survival = np.cumprod(rank_confidence[active_rows[dp_rank]], axis=-1)
-            decision = select_dspark_verify_budget(profile, lagged_survival)
+            decision = select_dspark_verify_budget(
+                profile,
+                lagged_survival,
+                forced_token_bucket=self._dspark_forced_token_bucket,
+            )
             if decision is None:
                 logger.warning(
                     "DSPARK SPS profile has no usable token bucket for rank=%d requests=%d; "

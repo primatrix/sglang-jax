@@ -39,6 +39,10 @@ class DSparkSPSPoint:
     verify_tokens_per_dp: int
     median_step_time_ms: float
     steps_per_second: float
+    # None denotes the legacy one-dimensional T(M) bootstrap table.  A
+    # measured ragged point records the per-DP request bucket as well, making
+    # its cost T(R, M).
+    request_bucket_per_dp: int | None = None
 
 
 @dataclass(frozen=True)

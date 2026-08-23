@@ -39,6 +39,61 @@ def test_budget_planner_maximizes_expected_tokens_per_step_time():
     assert np.isclose(decision.expected_tokens, 3.7)
 
 
+def test_budget_planner_selects_smallest_covering_request_bucket():
+    profile = DSparkSPSProfile(
+        context_bucket=1024,
+        points=(
+            DSparkSPSPoint(16, 1.0, 1000.0, request_bucket_per_dp=8),
+            DSparkSPSPoint(32, 2.0, 500.0, request_bucket_per_dp=8),
+            DSparkSPSPoint(16, 100.0, 10.0, request_bucket_per_dp=16),
+            DSparkSPSPoint(32, 10.0, 100.0, request_bucket_per_dp=16),
+            DSparkSPSPoint(64, 20.0, 50.0, request_bucket_per_dp=16),
+        ),
+    )
+
+    decision = select_dspark_verify_budget(
+        profile,
+        np.ones((9, 3), dtype=np.float32),
+    )
+
+    assert decision.token_bucket == 32
+    assert decision.extra_budget == 23
+
+
+def test_budget_planner_can_force_token_bucket_for_tpu_collection():
+    profile = DSparkSPSProfile(
+        context_bucket=1024,
+        points=(
+            DSparkSPSPoint(8, 1.0, 1000.0),
+            DSparkSPSPoint(16, 2.0, 500.0),
+        ),
+    )
+
+    decision = select_dspark_verify_budget(
+        profile,
+        np.ones((2, 7), dtype=np.float32),
+        forced_token_bucket=16,
+    )
+
+    assert decision.token_bucket == 16
+    assert decision.extra_budget == 14
+
+
+def test_budget_planner_rejects_request_count_above_2d_table():
+    profile = DSparkSPSProfile(
+        context_bucket=1024,
+        points=(DSparkSPSPoint(16, 1.0, 1000.0, request_bucket_per_dp=8),),
+    )
+
+    assert (
+        select_dspark_verify_budget(
+            profile,
+            np.ones((9, 7), dtype=np.float32),
+        )
+        is None
+    )
+
+
 def test_verify_len_allocation_preserves_prefix_and_tie_break():
     verify_lens = allocate_dspark_verify_lens(
         jnp.ones((2, 2), dtype=jnp.float32),
