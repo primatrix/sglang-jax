@@ -14,6 +14,7 @@ placeholder-range helpers.  It differs in two ways:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import copy
 import io
@@ -243,7 +244,10 @@ class MiMoV2Processor(QwenVLProcessor):
         image_sources = self.normalize_data(image_data)
         video_data = self.normalize_data(getattr(request_obj, "video_data", None))
         video_config = self._build_video_config(request_obj)
-        videos = await self._load_videos_async(video_data, video_config)
+        images, videos = await asyncio.gather(
+            self.load_images_async(image_sources),
+            self._load_videos_async(video_data, video_config),
+        )
         processor_kwargs = {}
         if videos:
             from sgl_jax.srt.multimodal.processors.qwen_vl import FPS
@@ -253,13 +257,17 @@ class MiMoV2Processor(QwenVLProcessor):
                 "fps": video_config.get("fps", FPS),
             }
 
-        processor_output = await self._run_hf_processor_async(
+        return await self.process_and_combine_mm_data_async(
             input_text,
-            image_sources,
-            videos,
-            processor_kwargs,
+            images=images,
+            videos=videos,
+            **processor_kwargs,
         )
 
+    def collect_mm_items_from_processor_output(
+        self, processor_output, **kwargs
+    ) -> MultimodalInputs:
+        del kwargs
         input_ids_array = self._to_numpy(processor_output.get("input_ids"))
         if input_ids_array is None:
             raise ValueError("MiMoV2 HF processor did not return input_ids.")

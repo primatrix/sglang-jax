@@ -17,19 +17,6 @@ class Gemma4Processor(BaseMultimodalProcessor):
     supports_mm_processor_concurrency = True
 
     @staticmethod
-    def _to_numpy(value):
-        if value is None:
-            return None
-        if hasattr(value, "detach"):
-            value = value.detach().cpu()
-            # NumPy has no portable bfloat16 representation. Pixel values are
-            # host-side inputs, so float32 is the lossless interchange format.
-            if str(getattr(value, "dtype", "")) == "torch.bfloat16":
-                value = value.float()
-            value = value.numpy()
-        return np.asarray(value)
-
-    @staticmethod
     def _placeholder_runs(input_ids: list[int], token_id: int) -> list[tuple[int, int]]:
         runs = []
         start = None
@@ -56,12 +43,20 @@ class Gemma4Processor(BaseMultimodalProcessor):
             raise ValueError("Gemma 4 audio inputs are not supported yet.")
 
         image_sources = self.normalize_data(image_data)
-        processor_output = await self._run_hf_processor_async(
+        images = await self.load_images_async(image_sources)
+        return await self.process_and_combine_mm_data_async(
             input_text,
-            image_sources,
-            None,
-            {},
+            images=images,
         )
+
+    def collect_mm_items_from_processor_output(
+        self,
+        processor_output,
+        images: list | None = None,
+        **kwargs,
+    ) -> MultimodalInputs:
+        del kwargs
+        image_count = len(images or [])
         input_ids_array = self._to_numpy(processor_output.get("input_ids"))
         if input_ids_array is None:
             raise ValueError("Gemma 4 processor did not return input_ids.")
@@ -73,7 +68,6 @@ class Gemma4Processor(BaseMultimodalProcessor):
             # vLLM's Gemma 4 input contract uses this compatibility name.
             pixel_position_ids = self._to_numpy(processor_output.get("pixel_position_ids"))
         image_token_id = int(self.hf_config.image_token_id)
-        image_count = len(image_sources)
         if not image_count:
             return MultimodalInputs(mm_items=[], input_ids=input_ids)
         if pixel_values is None or pixel_position_ids is None:
