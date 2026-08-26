@@ -409,9 +409,13 @@ def select_dflash_ngram_tokens(
         & ((base_scores - ngram_scores) <= ngram_bonus.astype(base_scores.dtype))
     )
     if max_rerank_positions == 1:
-        first_position = jnp.argmax(selected.astype(jnp.int32), axis=-1)
-        positions = jnp.arange(selected.shape[-1], dtype=jnp.int32)[None, :]
-        selected &= positions == first_position[:, None]
+        seen = jnp.zeros(selected.shape[:-1], dtype=jnp.bool_)
+        earliest_columns = []
+        for position in range(selected.shape[-1]):
+            take = selected[..., position] & ~seen
+            earliest_columns.append(take)
+            seen |= selected[..., position]
+        selected = jnp.stack(earliest_columns, axis=-1)
     elif max_rerank_positions > 1:
         selection_rank = jnp.cumsum(selected.astype(jnp.int32), axis=-1)
         selected &= selection_rank <= int(max_rerank_positions)
