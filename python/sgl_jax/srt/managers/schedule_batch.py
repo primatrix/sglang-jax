@@ -2723,6 +2723,20 @@ class ScheduleBatch:
                 out[selector] = a
                 return out
 
+            def _scatter_dflash_feedback(arr, field: str, *, dtype):
+                if arr is None:
+                    return None
+                a = np.asarray(arr, dtype=dtype)
+                if a.shape[0] != len(selector):
+                    raise ValueError(
+                        "DFLASH feedback length does not match real request slots before "
+                        f"DP scatter: field={field}, state_bs={a.shape[0]}, "
+                        f"real_bs={len(selector)}."
+                    )
+                out = np.zeros((total_bs,) + a.shape[1:], dtype=dtype)
+                out[selector] = a
+                return out
+
             relay_state = flat.future_indices is not None
             return DFlashDraftInput(
                 verified_id=(
@@ -2749,6 +2763,33 @@ class ScheduleBatch:
                     None
                     if flat.future_indices is None
                     else _scatter_dflash_1d(flat.future_indices, "future_indices")
+                ),
+                flashback_token_ids=(
+                    None
+                    if relay_state
+                    else _scatter_dflash_feedback(
+                        flat.flashback_token_ids,
+                        "flashback_token_ids",
+                        dtype=np.int32,
+                    )
+                ),
+                flashback_target_margins=(
+                    None
+                    if relay_state
+                    else _scatter_dflash_feedback(
+                        flat.flashback_target_margins,
+                        "flashback_target_margins",
+                        dtype=np.float32,
+                    )
+                ),
+                flashback_valid_mask=(
+                    None
+                    if relay_state
+                    else _scatter_dflash_feedback(
+                        flat.flashback_valid_mask,
+                        "flashback_valid_mask",
+                        dtype=np.bool_,
+                    )
                 ),
                 block_size=flat.block_size,
             )
@@ -2837,6 +2878,17 @@ class ScheduleBatch:
                         allocate_lens=_slice(flat.allocate_lens, offset, end),
                         reservation_base_lens=_slice(flat.reservation_base_lens, offset, end),
                         future_indices=_slice(flat.future_indices, offset, end),
+                        flashback_token_ids=(
+                            None if relay_state else _slice(flat.flashback_token_ids, offset, end)
+                        ),
+                        flashback_target_margins=(
+                            None
+                            if relay_state
+                            else _slice(flat.flashback_target_margins, offset, end)
+                        ),
+                        flashback_valid_mask=(
+                            None if relay_state else _slice(flat.flashback_valid_mask, offset, end)
+                        ),
                         block_size=flat.block_size,
                     )
                 )
@@ -2941,6 +2993,9 @@ class ScheduleBatch:
                 "allocate_lens",
                 "reservation_base_lens",
                 "future_indices",
+                "flashback_token_ids",
+                "flashback_target_margins",
+                "flashback_valid_mask",
             )
         else:
             has_future_indices = any(
@@ -2978,6 +3033,9 @@ class ScheduleBatch:
                     "ctx_lens",
                     "draft_seq_lens",
                     "target_hidden",
+                    "flashback_token_ids",
+                    "flashback_target_margins",
+                    "flashback_valid_mask",
                 )
             ):
                 kwargs[f] = None

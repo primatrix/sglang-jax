@@ -206,6 +206,10 @@ class ServerArgs:
     speculative_num_draft_tokens: int = 4
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
+    enable_dflash_flashback: bool = False
+    dflash_flashback_bonus: float = 1.0
+    dflash_flashback_target_margin_weight: float = 1.0
+    dflash_flashback_position_decay: float = 0.5
 
     # For deterministic sampling
     enable_deterministic_sampling: bool = False
@@ -1526,6 +1530,33 @@ class ServerArgs:
             default=ServerArgs.speculative_num_draft_tokens,
         )
         parser.add_argument(
+            "--enable-dflash-flashback",
+            action="store_true",
+            default=ServerArgs.enable_dflash_flashback,
+            help=(
+                "Enable training-free DFlash reranking with counterfactual suffix "
+                "feedback from the previous target verification round."
+            ),
+        )
+        parser.add_argument(
+            "--dflash-flashback-bonus",
+            type=float,
+            default=ServerArgs.dflash_flashback_bonus,
+            help="Maximum sparse logit bonus for the first recycled suffix position.",
+        )
+        parser.add_argument(
+            "--dflash-flashback-target-margin-weight",
+            type=float,
+            default=ServerArgs.dflash_flashback_target_margin_weight,
+            help="Weight applied to the stale token's previous target-logit margin.",
+        )
+        parser.add_argument(
+            "--dflash-flashback-position-decay",
+            type=float,
+            default=ServerArgs.dflash_flashback_position_decay,
+            help="Per-position decay of the FlashBack sparse reranking bonus.",
+        )
+        parser.add_argument(
             "--speculative-accept-threshold-single",
             type=float,
             help="Accept a draft token if its probability in the target model is greater than this threshold.",
@@ -1938,6 +1969,15 @@ class ServerArgs:
                 raise ValueError("DFLASH does not support LoRA.")
             if self.grammar_backend not in (None, "none"):
                 raise ValueError("DFLASH does not support constrained decoding.")
+            if self.enable_dflash_flashback:
+                if self.dflash_flashback_bonus <= 0:
+                    raise ValueError("--dflash-flashback-bonus must be > 0.")
+                if self.dflash_flashback_target_margin_weight < 0:
+                    raise ValueError("--dflash-flashback-target-margin-weight must be >= 0.")
+                if not 0 < self.dflash_flashback_position_decay <= 1:
+                    raise ValueError("--dflash-flashback-position-decay must be in (0, 1].")
+        elif self.enable_dflash_flashback:
+            raise ValueError("--enable-dflash-flashback requires --speculative-algorithm DFLASH.")
 
     def check_lora_server_args(self):
         """Validate and normalize LoRA-related server arguments."""

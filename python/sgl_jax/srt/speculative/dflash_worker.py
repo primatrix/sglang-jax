@@ -24,7 +24,9 @@ from sgl_jax.srt.speculative.dflash_info import (
     DFlashVerifyInput,
     _mask_draft_kv_writes,
     build_dflash_draft_block,
+    build_dflash_flashback_feedback,
     dflash_greedy_verify,
+    select_dflash_flashback_tokens,
 )
 from sgl_jax.srt.speculative.dflash_util import (
     parse_dflash_draft_config,
@@ -60,6 +62,9 @@ class DraftForwardPlan:
     reservation_base_lens: jax.Array
     relay_future_indices: jax.Array
     relay_valid_mask: jax.Array
+    flashback_token_ids: jax.Array
+    flashback_target_margins: jax.Array
+    flashback_valid_mask: jax.Array
     use_relay_state: bool
     dp_size: int
     bs: int
@@ -93,6 +98,12 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             self,
         )
         self.block_size = self.speculative_num_draft_tokens
+        self._flashback_enabled = bool(server_args.enable_dflash_flashback)
+        self._flashback_bonus = float(server_args.dflash_flashback_bonus)
+        self._flashback_target_margin_weight = float(
+            server_args.dflash_flashback_target_margin_weight
+        )
+        self._flashback_position_decay = float(server_args.dflash_flashback_position_decay)
         self._target_impl = getattr(target_worker, "worker", target_worker)
         self._target_compilation_manager = self._target_impl.compilation_manager
 
@@ -160,11 +171,17 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
 
         logger.info(
             "Initialized DFLASH worker: block_size=%d, mask_token_id=%d, "
-            "draft_layers=%d, page_indices_pool_capacity=%d, "
+            "draft_layers=%d, flashback=%s, flashback_bonus=%.3f, "
+            "flashback_target_margin_weight=%.3f, flashback_position_decay=%.3f, "
+            "page_indices_pool_capacity=%d, "
             "page_indices_per_seq_capacity=%d",
             self.block_size,
             self._mask_token_id,
             self.draft_layers,
+            self._flashback_enabled,
+            self._flashback_bonus,
+            self._flashback_target_margin_weight,
+            self._flashback_position_decay,
             self._page_indices_pool_capacity,
             self._page_indices_per_seq_capacity,
         )
@@ -185,13 +202,14 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 self.mesh,
                 self.req_to_token_pool,
                 dp_size=self.server_args.dp_size,
+                feedback_width=self.block_size - 1,
             )
 
     def draft(self, model_worker_batch: ModelWorkerBatch) -> None:
         draft_input: DFlashDraftInput = model_worker_batch.spec_info_padded
-        assert isinstance(
-            draft_input, DFlashDraftInput
-        ), "DFLASH decode requires DFlashDraftInput carried over from prefill."
+        assert isinstance(draft_input, DFlashDraftInput), (
+            "DFLASH decode requires DFlashDraftInput carried over from prefill."
+        )
 
         bs = int(model_worker_batch.seq_lens.shape[0])
         seq_lens = np.asarray(model_worker_batch.seq_lens, dtype=np.int32)
@@ -252,6 +270,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             next_token_ids_flat,
             new_verified_id,
             new_seq_lens,
+            flashback_token_ids,
+            flashback_target_margins,
+            flashback_valid_mask,
             layers_topk_ids,
         ) = self._run_jit_target_verify(
             plan,
@@ -262,6 +283,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             target_hidden=logits_output.hidden_states,
             ctx_lens=accept_lens_out,
             draft_seq_lens=None,
+            flashback_token_ids=flashback_token_ids,
+            flashback_target_margins=flashback_target_margins,
+            flashback_valid_mask=flashback_valid_mask,
             block_size=self.block_size,
         )
         next_draft_input.new_seq_lens = new_seq_lens
@@ -271,7 +295,15 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         # They can overlap draft KV materialization and are consumed only after
         # this method returns to draft_extend_for_decode.
         if not update_relay:
-            jax.copy_to_host_async((accept_lens_out, new_verified_id))
+            jax.copy_to_host_async(
+                (
+                    accept_lens_out,
+                    new_verified_id,
+                    flashback_token_ids,
+                    flashback_target_margins,
+                    flashback_valid_mask,
+                )
+            )
         self._run_jit_draft_extend(
             logits_output.hidden_states,
             plan.draft_extend_positions,
@@ -329,12 +361,29 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         if not isinstance(plan, TargetVerifyPlan):
             raise RuntimeError("DFLASH draft extend is missing its target verify plan.")
 
-        accept_lens, verified_id = jax.device_get(
-            (next_draft_input.ctx_lens, next_draft_input.verified_id)
+        (
+            accept_lens,
+            verified_id,
+            flashback_token_ids,
+            flashback_target_margins,
+            flashback_valid_mask,
+        ) = jax.device_get(
+            (
+                next_draft_input.ctx_lens,
+                next_draft_input.verified_id,
+                next_draft_input.flashback_token_ids,
+                next_draft_input.flashback_target_margins,
+                next_draft_input.flashback_valid_mask,
+            )
         )
         accept_lens = np.asarray(accept_lens, dtype=np.int32)
         verified_id = np.asarray(verified_id, dtype=np.int32)
         next_draft_input.verified_id = verified_id
+        next_draft_input.flashback_token_ids = np.asarray(flashback_token_ids, dtype=np.int32)
+        next_draft_input.flashback_target_margins = np.asarray(
+            flashback_target_margins, dtype=np.float32
+        )
+        next_draft_input.flashback_valid_mask = np.asarray(flashback_valid_mask, dtype=np.bool_)
         next_draft_input.ctx_lens = np.zeros_like(accept_lens)
         next_draft_input.draft_seq_lens = plan.target_prefix_lens + accept_lens
         next_draft_input.new_seq_lens = plan.seq_lens + accept_lens
@@ -579,6 +628,19 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         )
         relay_future_indices = np.where(active_mask, relay_future_indices, 0)
         data_sharding = NamedSharding(self.mesh, P("data"))
+        feedback_sharding = NamedSharding(self.mesh, P("data", None))
+        if use_relay_state:
+            feedback_shape = (bs, self.block_size - 1)
+            flashback_token_ids = np.zeros(feedback_shape, dtype=np.int32)
+            flashback_target_margins = np.zeros(feedback_shape, dtype=np.float32)
+            flashback_valid_mask = np.zeros(feedback_shape, dtype=np.bool_)
+        else:
+            (
+                flashback_token_ids,
+                flashback_target_margins,
+                flashback_valid_mask,
+            ) = draft_input._flashback_rows(bs)
+            flashback_valid_mask = flashback_valid_mask & active_mask[:, None]
         return DraftForwardPlan(
             forward_batch=forward_batch,
             forward_metadata=metadata,
@@ -589,6 +651,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             reservation_base_lens=jax.device_put(reservation_base_lens, data_sharding),
             relay_future_indices=jax.device_put(relay_future_indices, data_sharding),
             relay_valid_mask=jax.device_put(active_mask, data_sharding),
+            flashback_token_ids=jax.device_put(flashback_token_ids, feedback_sharding),
+            flashback_target_margins=jax.device_put(flashback_target_margins, feedback_sharding),
+            flashback_valid_mask=jax.device_put(flashback_valid_mask, feedback_sharding),
             use_relay_state=use_relay_state,
             dp_size=int(model_worker_batch.dp_size),
             bs=bs,
@@ -717,6 +782,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 "block_size",
                 "vocab_size",
                 "use_relay_state",
+                "flashback_enabled",
                 "dp_size",
             ],
         )
@@ -733,15 +799,25 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             relay_valid_mask,
             allocated_lens,
             reservation_base_lens,
+            flashback_token_ids,
+            flashback_target_margins,
+            flashback_valid_mask,
             *,
             block_size: int,
             vocab_size: int,
             use_relay_state: bool,
+            flashback_enabled: bool,
             dp_size: int,
         ):
             target_prefix_lens = forward_batch.seq_lens
             if use_relay_state:
-                verified_id, relay_new_seq_lens = gather_dflash_relay_buffers(
+                (
+                    verified_id,
+                    relay_new_seq_lens,
+                    flashback_token_ids,
+                    flashback_target_margins,
+                    flashback_valid_mask,
+                ) = gather_dflash_relay_buffers(
                     relay_buffers,
                     relay_future_indices,
                     dp_size=dp_size,
@@ -819,8 +895,19 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 lm_head.T,
                 out_sharding=logits_sharding,
             )[:, :vocab_size]
-            draft_next = jnp.argmax(logits, axis=-1).astype(jnp.int32)
-            draft_next = draft_next.reshape(proposal_hidden.shape[:-1])
+            logits = logits.reshape(proposal_hidden.shape[:-1] + (vocab_size,))
+            if flashback_enabled:
+                draft_next = select_dflash_flashback_tokens(
+                    logits,
+                    flashback_token_ids,
+                    flashback_target_margins,
+                    flashback_valid_mask,
+                    bonus=self._flashback_bonus,
+                    target_margin_weight=self._flashback_target_margin_weight,
+                    position_decay=self._flashback_position_decay,
+                )
+            else:
+                draft_next = jnp.argmax(logits, axis=-1).astype(jnp.int32)
             seed = forward_batch.input_ids.reshape((-1, block_size))[:, :1]
             seed = jax.sharding.reshard(seed, cache_row_sharding)
             draft_next = jax.sharding.reshard(draft_next, cache_row_sharding)
@@ -840,6 +927,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             model_state_def,
             block_size=block_size,
             vocab_size=vocab_size,
+            flashback_enabled=self._flashback_enabled,
         )
 
     def _run_jit_draft_block(self, plan: DraftForwardPlan):
@@ -865,6 +953,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 plan.relay_valid_mask,
                 plan.allocated_lens,
                 plan.reservation_base_lens,
+                plan.flashback_token_ids,
+                plan.flashback_target_margins,
+                plan.flashback_valid_mask,
                 use_relay_state=plan.use_relay_state,
                 dp_size=plan.dp_size,
             )
@@ -893,6 +984,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         model_state_def = runner._model_state_def
         draft_token_num = self.block_size
         token_sharding = NamedSharding(runner.mesh, P("data"))
+        feedback_sharding = NamedSharding(runner.mesh, P("data", None))
 
         @_partial(
             jax.jit,
@@ -902,6 +994,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 "draft_token_num",
                 "use_relay_state",
                 "update_relay",
+                "flashback_enabled",
                 "page_size",
                 "dp_size",
             ],
@@ -923,6 +1016,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             draft_token_num: int,
             use_relay_state: bool,
             update_relay: bool,
+            flashback_enabled: bool,
             page_size: int,
             dp_size: int,
         ):
@@ -943,11 +1037,37 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 output, pool_updates, _, layers_topk_ids = model(
                     forward_batch, memory_pools, logits_metadata
                 )
-            accept_lens_out, next_token_ids_flat, new_verified_id, _ = dflash_greedy_verify(
+            (
+                accept_lens_out,
+                next_token_ids_flat,
+                new_verified_id,
+                accept_len_draft,
+            ) = dflash_greedy_verify(
                 draft_token,
                 output.next_token_logits,
                 draft_token_num=draft_token_num,
             )
+            if flashback_enabled:
+                (
+                    flashback_token_ids,
+                    flashback_target_margins,
+                    flashback_valid_mask,
+                ) = build_dflash_flashback_feedback(
+                    draft_token,
+                    output.next_token_logits,
+                    accept_len_draft,
+                    draft_token_num=draft_token_num,
+                )
+            else:
+                feedback_shape = (accept_lens_out.shape[0], draft_token_num - 1)
+                flashback_token_ids = jnp.zeros(feedback_shape, dtype=jnp.int32)
+                flashback_target_margins = jnp.zeros(feedback_shape, dtype=jnp.float32)
+                flashback_valid_mask = jnp.zeros(feedback_shape, dtype=jnp.bool_)
+            flashback_token_ids = jax.sharding.reshard(flashback_token_ids, feedback_sharding)
+            flashback_target_margins = jax.sharding.reshard(
+                flashback_target_margins.astype(jnp.float32), feedback_sharding
+            )
+            flashback_valid_mask = jax.sharding.reshard(flashback_valid_mask, feedback_sharding)
             accept_lens_out = jax.sharding.reshard(accept_lens_out, token_sharding)
             next_token_ids_flat = jax.sharding.reshard(next_token_ids_flat, token_sharding)
             new_verified_id = jax.sharding.reshard(new_verified_id, token_sharding)
@@ -961,6 +1081,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                     relay_valid_mask,
                     new_verified_id,
                     new_seq_lens,
+                    flashback_token_ids,
+                    flashback_target_margins,
+                    flashback_valid_mask,
                     dp_size=dp_size,
                 )
             return (
@@ -971,6 +1094,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 next_token_ids_flat,
                 new_verified_id,
                 new_seq_lens,
+                flashback_token_ids,
+                flashback_target_margins,
+                flashback_valid_mask,
                 updated_relay_buffers,
             )
 
@@ -979,6 +1105,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             model_def,
             model_state_def,
             draft_token_num=draft_token_num,
+            flashback_enabled=self._flashback_enabled,
             page_size=self.page_size,
         )
 
@@ -1005,6 +1132,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                     next_token_ids_flat,
                     new_verified_id,
                     new_seq_lens,
+                    flashback_token_ids,
+                    flashback_target_margins,
+                    flashback_valid_mask,
                     updated_relay_buffers,
                 ) = self._jit_target_verify(
                     runner.model_state_leaves,
@@ -1032,6 +1162,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 next_token_ids_flat,
                 new_verified_id,
                 new_seq_lens,
+                flashback_token_ids,
+                flashback_target_margins,
+                flashback_valid_mask,
                 updated_relay_buffers,
             )
 
@@ -1044,6 +1177,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 next_token_ids_flat,
                 new_verified_id,
                 new_seq_lens,
+                flashback_token_ids,
+                flashback_target_margins,
+                flashback_valid_mask,
                 updated_relay_buffers,
             ) = _call_and_replace()
 
@@ -1057,6 +1193,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             next_token_ids_flat,
             new_verified_id,
             new_seq_lens,
+            flashback_token_ids,
+            flashback_target_margins,
+            flashback_valid_mask,
             layers_topk_ids,
         )
 
@@ -1224,6 +1363,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         new_seq_lens,
         future_indices,
         valid_mask,
+        flashback_token_ids=None,
+        flashback_target_margins=None,
+        flashback_valid_mask=None,
         *,
         dp_size: int,
     ):
@@ -1233,21 +1375,44 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         from jax.sharding import PartitionSpec as P
 
         data_sharding = NamedSharding(self.mesh, P("data"))
+        feedback_sharding = NamedSharding(self.mesh, P("data", None))
+        feedback_shape = (verified_id.shape[0], self.block_size - 1)
+        if flashback_token_ids is None:
+            flashback_token_ids = jnp.zeros(feedback_shape, dtype=jnp.int32)
+            flashback_target_margins = jnp.zeros(feedback_shape, dtype=jnp.float32)
+            flashback_valid_mask = jnp.zeros(feedback_shape, dtype=jnp.bool_)
 
         if not hasattr(self, "_jit_update_dflash_relay"):
 
             @_partial(jax.jit, donate_argnames=["buffers"], static_argnames=["dp_size"])
-            def update(buffers, indices, mask, token_ids, seq_lens, *, dp_size: int):
+            def update(
+                buffers,
+                indices,
+                mask,
+                token_ids,
+                seq_lens,
+                feedback_ids,
+                feedback_margins,
+                feedback_valid,
+                *,
+                dp_size: int,
+            ):
                 indices = jax.sharding.reshard(indices, data_sharding)
                 mask = jax.sharding.reshard(mask, data_sharding)
                 token_ids = jax.sharding.reshard(token_ids, data_sharding)
                 seq_lens = jax.sharding.reshard(seq_lens, data_sharding)
+                feedback_ids = jax.sharding.reshard(feedback_ids, feedback_sharding)
+                feedback_margins = jax.sharding.reshard(feedback_margins, feedback_sharding)
+                feedback_valid = jax.sharding.reshard(feedback_valid, feedback_sharding)
                 return update_dflash_relay_buffers(
                     buffers,
                     indices,
                     mask,
                     token_ids,
                     seq_lens,
+                    feedback_ids,
+                    feedback_margins,
+                    feedback_valid,
                     dp_size=dp_size,
                 )
 
@@ -1260,6 +1425,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 valid_mask,
                 verified_id,
                 new_seq_lens,
+                flashback_token_ids,
+                flashback_target_margins,
+                flashback_valid_mask,
                 dp_size=dp_size,
             )
 
@@ -1269,11 +1437,25 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         selector: np.ndarray,
     ) -> None:
         selector = np.asarray(selector, dtype=np.int32)
-        for field in ("verified_id", "ctx_lens", "draft_seq_lens"):
+        for field in (
+            "verified_id",
+            "ctx_lens",
+            "draft_seq_lens",
+            "flashback_token_ids",
+            "flashback_target_margins",
+            "flashback_valid_mask",
+        ):
             value = getattr(draft_input, field, None)
             if value is None:
                 continue
-            value = np.asarray(value, dtype=np.int32)
+            dtype = (
+                np.float32
+                if field == "flashback_target_margins"
+                else np.bool_
+                if field == "flashback_valid_mask"
+                else np.int32
+            )
+            value = np.asarray(value, dtype=dtype)
             if selector.size and int(selector.max()) >= value.shape[0]:
                 raise ValueError(
                     "DFLASH state selector is out of bounds: "
@@ -1297,6 +1479,14 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             draft_input.draft_seq_lens = draft_seq_lens[:bs]
             draft_input.verified_id = verified_id[:bs]
             draft_input.ctx_lens = ctx_lens[:bs]
+            for field in (
+                "flashback_token_ids",
+                "flashback_target_margins",
+                "flashback_valid_mask",
+            ):
+                value = getattr(draft_input, field, None)
+                if value is not None:
+                    setattr(draft_input, field, value[:bs])
             return
 
         raise ValueError(
@@ -1610,6 +1800,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         from jax.sharding import PartitionSpec as P
 
         data_sharding = NamedSharding(self.mesh, P("data"))
+        feedback_sharding = NamedSharding(self.mesh, P("data", None))
         prefix_lens = np.asarray(draft_batch.seq_lens, dtype=np.int32)
         active_mask = template.active_mask
         if use_relay_state:
@@ -1641,6 +1832,18 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             reservation_base_lens=jax.device_put(prefix_lens, data_sharding),
             relay_future_indices=relay_future_indices,
             relay_valid_mask=active_mask,
+            flashback_token_ids=jax.device_put(
+                np.zeros((bs, self.block_size - 1), dtype=np.int32),
+                feedback_sharding,
+            ),
+            flashback_target_margins=jax.device_put(
+                np.zeros((bs, self.block_size - 1), dtype=np.float32),
+                feedback_sharding,
+            ),
+            flashback_valid_mask=jax.device_put(
+                np.zeros((bs, self.block_size - 1), dtype=np.bool_),
+                feedback_sharding,
+            ),
             use_relay_state=use_relay_state,
             dp_size=int(draft_batch.dp_size),
             bs=bs,

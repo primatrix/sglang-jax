@@ -22,6 +22,9 @@ class SpecRelayBuffers(NamedTuple):
 class DFlashRelayBuffers(NamedTuple):
     verified_id: jax.Array
     new_seq_lens: jax.Array
+    flashback_token_ids: jax.Array
+    flashback_target_margins: jax.Array
+    flashback_valid_mask: jax.Array
 
 
 def create_spec_relay_buffers(
@@ -63,14 +66,27 @@ def create_dflash_relay_buffers(
     req_to_token_pool,
     *,
     dp_size: int,
+    feedback_width: int,
 ) -> DFlashRelayBuffers:
-    """Create the minimal req-indexed state needed by DFlash overlap."""
+    """Create req-indexed DFlash state, including fixed-width FlashBack feedback."""
     capacity = int(req_to_token_pool.req_to_token.shape[0])
     sharding = NamedSharding(mesh, RELAY_ID_SPEC)
     shape = (dp_size, capacity)
     return DFlashRelayBuffers(
         verified_id=jax.device_put(jnp.zeros(shape, dtype=jnp.int32), sharding),
         new_seq_lens=jax.device_put(jnp.zeros(shape, dtype=jnp.int32), sharding),
+        flashback_token_ids=jax.device_put(
+            jnp.zeros(shape + (feedback_width,), dtype=jnp.int32),
+            NamedSharding(mesh, RELAY_STATE_SPEC),
+        ),
+        flashback_target_margins=jax.device_put(
+            jnp.zeros(shape + (feedback_width,), dtype=jnp.float32),
+            NamedSharding(mesh, RELAY_STATE_SPEC),
+        ),
+        flashback_valid_mask=jax.device_put(
+            jnp.zeros(shape + (feedback_width,), dtype=jnp.bool_),
+            NamedSharding(mesh, RELAY_STATE_SPEC),
+        ),
     )
 
 
@@ -131,6 +147,9 @@ def update_dflash_relay_buffers(
     valid_mask,
     verified_id,
     new_seq_lens,
+    flashback_token_ids,
+    flashback_target_margins,
+    flashback_valid_mask,
     *,
     dp_size: int,
 ) -> DFlashRelayBuffers:
@@ -146,6 +165,10 @@ def update_dflash_relay_buffers(
     )
     verified_id = verified_id.reshape((dp_size, per_dp_bs))
     new_seq_lens = new_seq_lens.reshape((dp_size, per_dp_bs))
+    feedback_shape = (dp_size, per_dp_bs, buffers.flashback_token_ids.shape[-1])
+    flashback_token_ids = flashback_token_ids.reshape(feedback_shape)
+    flashback_target_margins = flashback_target_margins.reshape(feedback_shape)
+    flashback_valid_mask = flashback_valid_mask.reshape(feedback_shape)
     return DFlashRelayBuffers(
         verified_id=buffers.verified_id.at[dp_indices, scatter_indices].set(
             verified_id,
@@ -156,6 +179,23 @@ def update_dflash_relay_buffers(
             new_seq_lens,
             mode="drop",
             out_sharding=RELAY_ID_SPEC,
+        ),
+        flashback_token_ids=buffers.flashback_token_ids.at[dp_indices, scatter_indices].set(
+            flashback_token_ids,
+            mode="drop",
+            out_sharding=RELAY_STATE_SPEC,
+        ),
+        flashback_target_margins=buffers.flashback_target_margins.at[
+            dp_indices, scatter_indices
+        ].set(
+            flashback_target_margins,
+            mode="drop",
+            out_sharding=RELAY_STATE_SPEC,
+        ),
+        flashback_valid_mask=buffers.flashback_valid_mask.at[dp_indices, scatter_indices].set(
+            flashback_valid_mask,
+            mode="drop",
+            out_sharding=RELAY_STATE_SPEC,
         ),
     )
 
@@ -220,11 +260,37 @@ def gather_dflash_relay_buffers(
         .get(out_sharding=RELAY_ID_SPEC)
         .reshape(future_indices.shape)
     )
+    feedback_shape = future_indices.shape + (buffers.flashback_token_ids.shape[-1],)
+    flashback_token_ids = (
+        buffers.flashback_token_ids.at[dp_indices, indices]
+        .get(out_sharding=RELAY_STATE_SPEC)
+        .reshape(feedback_shape)
+    )
+    flashback_target_margins = (
+        buffers.flashback_target_margins.at[dp_indices, indices]
+        .get(out_sharding=RELAY_STATE_SPEC)
+        .reshape(feedback_shape)
+    )
+    flashback_valid_mask = (
+        buffers.flashback_valid_mask.at[dp_indices, indices]
+        .get(out_sharding=RELAY_STATE_SPEC)
+        .reshape(feedback_shape)
+    )
     flat_sharding = jax.typeof(future_indices).sharding
     if isinstance(flat_sharding, NamedSharding) and not flat_sharding.mesh.empty:
         verified_id = jax.sharding.reshard(verified_id, flat_sharding)
         new_seq_lens = jax.sharding.reshard(new_seq_lens, flat_sharding)
-    return verified_id, new_seq_lens
+        state_sharding = NamedSharding(flat_sharding.mesh, P("data", None))
+        flashback_token_ids = jax.sharding.reshard(flashback_token_ids, state_sharding)
+        flashback_target_margins = jax.sharding.reshard(flashback_target_margins, state_sharding)
+        flashback_valid_mask = jax.sharding.reshard(flashback_valid_mask, state_sharding)
+    return (
+        verified_id,
+        new_seq_lens,
+        flashback_token_ids,
+        flashback_target_margins,
+        flashback_valid_mask,
+    )
 
 
 def make_dp_valid_mask(real_bs_per_dp, *, total_bs: int, per_dp_bs: int) -> np.ndarray:

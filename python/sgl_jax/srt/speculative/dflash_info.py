@@ -124,6 +124,113 @@ def dflash_greedy_verify(
     return accept_lens_out, target_predict_flat, bonus, accept_len_draft.astype(jnp.int32)
 
 
+def build_dflash_flashback_feedback(
+    draft_token: jax.Array,
+    target_logits: jax.Array,
+    accept_len_draft: jax.Array,
+    *,
+    draft_token_num: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Extract one-round counterfactual suffix feedback for FlashBack.
+
+    ``draft_token[:, 0]`` is the verified anchor.  If ``r`` proposal tokens
+    were accepted, proposal ``r + 1`` is the first rejected token and is
+    replaced by the target bonus token.  Only the proposals after that first
+    rejection are aligned with the next round, so this function carries
+    ``draft_token[:, r + 2:]`` and their target-logit margins forward.
+
+    The suffix logits were evaluated under a counterfactual (now stale)
+    prefix.  Their margins are therefore evidence for sparse reranking, not
+    verification results.  The returned validity mask keeps that distinction
+    explicit and gives every request a fixed ``draft_token_num - 1`` shape.
+    """
+    block_size = int(draft_token_num)
+    candidates = draft_token.reshape((-1, block_size))
+    logits = target_logits.reshape((candidates.shape[0], block_size, -1))
+    proposal_width = block_size - 1
+
+    # Logits row i predicts candidate i + 1.  Compute the target margin for
+    # every proposal before dynamically shifting the stale suffix.
+    proposal_logits = logits[:, :proposal_width, :]
+    proposal_ids = candidates[:, 1:]
+    proposal_scores = jnp.take_along_axis(
+        proposal_logits,
+        proposal_ids[..., None],
+        axis=-1,
+    )[..., 0]
+    proposal_margins = proposal_scores - jnp.max(proposal_logits, axis=-1)
+
+    next_offsets = jnp.arange(proposal_width, dtype=jnp.int32)[None, :]
+    source_candidate_indices = accept_len_draft[:, None] + 2 + next_offsets
+    valid = source_candidate_indices < block_size
+    source_proposal_indices = jnp.clip(
+        source_candidate_indices - 1,
+        0,
+        proposal_width - 1,
+    )
+    stale_token_ids = jnp.take_along_axis(
+        proposal_ids,
+        source_proposal_indices,
+        axis=1,
+    )
+    target_margins = jnp.take_along_axis(
+        proposal_margins,
+        source_proposal_indices,
+        axis=1,
+    )
+    stale_token_ids = jnp.where(valid, stale_token_ids, jnp.int32(0))
+    target_margins = jnp.where(valid, target_margins, jnp.asarray(0, target_margins.dtype))
+    return stale_token_ids.astype(jnp.int32), target_margins, valid
+
+
+def select_dflash_flashback_tokens(
+    draft_logits: jax.Array,
+    stale_token_ids: jax.Array,
+    stale_target_margins: jax.Array,
+    stale_valid_mask: jax.Array,
+    *,
+    bonus: float,
+    target_margin_weight: float,
+    position_decay: float,
+) -> jax.Array:
+    """Select DFlash proposals after training-free sparse FlashBack reranking.
+
+    Adding a bonus to one sparse vocabulary entry is equivalent to comparing
+    that entry against the row maximum.  Implementing the comparison directly
+    avoids materializing or scattering a ``[batch, block, vocab]`` bias tensor.
+    """
+    if draft_logits.ndim != 3:
+        raise ValueError(f"draft_logits must be [batch, block, vocab], got {draft_logits.shape}.")
+    expected = draft_logits.shape[:-1]
+    for name, value in (
+        ("stale_token_ids", stale_token_ids),
+        ("stale_target_margins", stale_target_margins),
+        ("stale_valid_mask", stale_valid_mask),
+    ):
+        if value.shape != expected:
+            raise ValueError(f"{name} must have shape {expected}, got {value.shape}.")
+
+    base_token_ids = jnp.argmax(draft_logits, axis=-1).astype(jnp.int32)
+    base_scores = jnp.max(draft_logits, axis=-1)
+    stale_scores = jnp.take_along_axis(
+        draft_logits,
+        stale_token_ids[..., None],
+        axis=-1,
+    )[..., 0]
+    offsets = jnp.arange(draft_logits.shape[1], dtype=base_scores.dtype)[None, :]
+    position_bonus = jnp.asarray(bonus, base_scores.dtype) * jnp.power(
+        jnp.asarray(position_decay, base_scores.dtype),
+        offsets,
+    )
+    effective_bonus = position_bonus + jnp.asarray(
+        target_margin_weight, base_scores.dtype
+    ) * stale_target_margins.astype(base_scores.dtype)
+    use_stale = (
+        stale_valid_mask & (effective_bonus > 0) & ((base_scores - stale_scores) <= effective_bonus)
+    )
+    return jnp.where(use_stale, stale_token_ids, base_token_ids).astype(jnp.int32)
+
+
 @dataclass
 class DFlashDraftInput:
     """Host-side DFlash state carried between decode iterations."""
@@ -135,26 +242,37 @@ class DFlashDraftInput:
     allocate_lens: np.ndarray = None
     reservation_base_lens: np.ndarray = None
     future_indices: np.ndarray = None
+    flashback_token_ids: jax.Array | np.ndarray = None
+    flashback_target_margins: jax.Array | np.ndarray = None
+    flashback_valid_mask: jax.Array | np.ndarray = None
     block_size: int = 16
     capture_hidden_mode = CaptureHiddenMode.FULL
 
     def _ensure_host(self) -> None:
-        fields = (
+        int_fields = (
             "verified_id",
             "ctx_lens",
             "draft_seq_lens",
             "allocate_lens",
             "reservation_base_lens",
             "future_indices",
+            "flashback_token_ids",
         )
+        fields = int_fields + ("flashback_target_margins", "flashback_valid_mask")
         for f in fields:
             v = getattr(self, f, None)
             if v is not None and hasattr(v, "copy_to_host_async"):
                 v.copy_to_host_async()
-        for f in fields:
+        for f in int_fields:
             v = getattr(self, f, None)
             if v is not None:
                 setattr(self, f, np.asarray(v, dtype=np.int32))
+        if self.flashback_target_margins is not None:
+            self.flashback_target_margins = np.asarray(
+                self.flashback_target_margins, dtype=np.float32
+            )
+        if self.flashback_valid_mask is not None:
+            self.flashback_valid_mask = np.asarray(self.flashback_valid_mask, dtype=np.bool_)
 
     def new_tokens_required_next_decode(self, requests, page_size: int) -> int:
         total = 0
@@ -167,6 +285,34 @@ class DFlashDraftInput:
                 (cur + page_size - 1) // page_size
             ) * page_size
         return total
+
+    def _flashback_rows(self, bs: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        width = int(self.block_size) - 1
+        expected = (int(bs), width)
+        token_ids = self.flashback_token_ids
+        target_margins = self.flashback_target_margins
+        valid_mask = self.flashback_valid_mask
+        if token_ids is None and target_margins is None and valid_mask is None:
+            return (
+                np.zeros(expected, dtype=np.int32),
+                np.zeros(expected, dtype=np.float32),
+                np.zeros(expected, dtype=np.bool_),
+            )
+        if token_ids is None or target_margins is None or valid_mask is None:
+            raise ValueError(
+                "DFLASH FlashBack state must carry ids, margins, and validity together."
+            )
+        token_ids = np.asarray(token_ids, dtype=np.int32)
+        target_margins = np.asarray(target_margins, dtype=np.float32)
+        valid_mask = np.asarray(valid_mask, dtype=np.bool_)
+        for name, value in (
+            ("flashback_token_ids", token_ids),
+            ("flashback_target_margins", target_margins),
+            ("flashback_valid_mask", valid_mask),
+        ):
+            if value.shape != expected:
+                raise ValueError(f"DFLASH {name} must have shape {expected}, got {value.shape}.")
+        return token_ids, target_margins, valid_mask
 
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True) -> None:
         self._ensure_host()
@@ -200,6 +346,14 @@ class DFlashDraftInput:
             value = getattr(self, field, None)
             if value is not None:
                 setattr(self, field, np.asarray(value, dtype=np.int32)[selected])
+        for field in (
+            "flashback_token_ids",
+            "flashback_target_margins",
+            "flashback_valid_mask",
+        ):
+            value = getattr(self, field, None)
+            if value is not None:
+                setattr(self, field, np.asarray(value)[selected])
 
         if self.target_hidden is not None and self.target_hidden.shape[0] != 0:
             raise ValueError("DFLASH target_hidden must be materialized before filtering.")
@@ -330,6 +484,9 @@ class DFlashDraftInput:
             self.ctx_lens = np.empty((0,), dtype=np.int32)
             self.draft_seq_lens = np.empty((0,), dtype=np.int32)
             self.target_hidden = None
+            self.flashback_token_ids = None
+            self.flashback_target_margins = None
+            self.flashback_valid_mask = None
             return
 
         self.verified_id = np.concatenate(
@@ -341,6 +498,10 @@ class DFlashDraftInput:
         self.draft_seq_lens = np.concatenate(
             [np.asarray(state.draft_seq_lens, dtype=np.int32) for state in rank_states]
         )
+        feedback = [state._flashback_rows(len(state.draft_seq_lens)) for state in rank_states]
+        self.flashback_token_ids = np.concatenate([rows[0] for rows in feedback], axis=0)
+        self.flashback_target_margins = np.concatenate([rows[1] for rows in feedback], axis=0)
+        self.flashback_valid_mask = np.concatenate([rows[2] for rows in feedback], axis=0)
 
         hidden_parts = [state.target_hidden for state in rank_states]
         if all(hidden is None for hidden in hidden_parts):
@@ -361,10 +522,14 @@ class DFlashDraftInput:
         verified_id = np.asarray(self.verified_id, dtype=np.int32)
         ctx_lens = np.asarray(self.ctx_lens, dtype=np.int32)
         draft_seq_lens = np.asarray(self.draft_seq_lens, dtype=np.int32)
+        feedback_ids, feedback_margins, feedback_valid = self._flashback_rows(state_bs)
         if state_bs > bs:
             self.verified_id = verified_id[:bs]
             self.ctx_lens = ctx_lens[:bs]
             self.draft_seq_lens = draft_seq_lens[:bs]
+            self.flashback_token_ids = feedback_ids[:bs]
+            self.flashback_target_margins = feedback_margins[:bs]
+            self.flashback_valid_mask = feedback_valid[:bs]
             return
 
         missing_reqs = reqs[state_bs:bs]
@@ -381,6 +546,17 @@ class DFlashDraftInput:
         )
         self.draft_seq_lens = np.concatenate(
             [draft_seq_lens, committed_lens[state_bs:bs].astype(np.int32)], axis=0
+        )
+        missing = bs - state_bs
+        width = int(self.block_size) - 1
+        self.flashback_token_ids = np.concatenate(
+            [feedback_ids, np.zeros((missing, width), dtype=np.int32)], axis=0
+        )
+        self.flashback_target_margins = np.concatenate(
+            [feedback_margins, np.zeros((missing, width), dtype=np.float32)], axis=0
+        )
+        self.flashback_valid_mask = np.concatenate(
+            [feedback_valid, np.zeros((missing, width), dtype=np.bool_)], axis=0
         )
 
     def merge_batch(self, other: DFlashDraftInput) -> None:
@@ -404,6 +580,9 @@ class DFlashDraftInput:
             self.ctx_lens = None
             self.draft_seq_lens = None
             self.target_hidden = None
+            self.flashback_token_ids = None
+            self.flashback_target_margins = None
+            self.flashback_valid_mask = None
             return
 
         self.verified_id = np.concatenate(
@@ -411,6 +590,13 @@ class DFlashDraftInput:
         )
         self.ctx_lens = np.concatenate([self.ctx_lens, other.ctx_lens], axis=0)
         self.draft_seq_lens = np.concatenate([self.draft_seq_lens, other.draft_seq_lens], axis=0)
+        self_feedback = self._flashback_rows(len(self.verified_id) - len(other.verified_id))
+        other_feedback = other._flashback_rows(len(other.verified_id))
+        self.flashback_token_ids = np.concatenate([self_feedback[0], other_feedback[0]], axis=0)
+        self.flashback_target_margins = np.concatenate(
+            [self_feedback[1], other_feedback[1]], axis=0
+        )
+        self.flashback_valid_mask = np.concatenate([self_feedback[2], other_feedback[2]], axis=0)
         for field in ("allocate_lens", "reservation_base_lens"):
             lhs = getattr(self, field, None)
             rhs = getattr(other, field, None)

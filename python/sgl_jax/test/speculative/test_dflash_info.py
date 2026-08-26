@@ -7,11 +7,18 @@ from sgl_jax.srt.speculative.dflash_info import (
     DFlashDraftInput,
     DFlashVerifyInput,
     build_dflash_draft_block,
+    build_dflash_flashback_feedback,
     dflash_greedy_verify,
+    select_dflash_flashback_tokens,
 )
 from sgl_jax.srt.speculative.overlap_utils import (
     can_merge_spec_non_overlap_prefill,
     use_legacy_eagle3_non_overlap,
+)
+from sgl_jax.srt.speculative.relay_buffer import (
+    create_dflash_relay_buffers,
+    gather_dflash_relay_buffers,
+    update_dflash_relay_buffers,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -87,12 +94,116 @@ def test_dflash_greedy_verify_keeps_outputs_data_sharded():
     np.testing.assert_array_equal(np.asarray(verified_id), np.full(bs, 99, dtype=np.int32))
 
 
+def test_build_dflash_flashback_feedback_skips_first_rejection_and_aligns_suffix():
+    # Three accepted proposals: d4 is rejected/replaced, so d5..d8 align with
+    # the first four proposal positions of the next round.
+    candidates = jnp.asarray([[10, 11, 12, 13, 14, 15, 16, 17]], dtype=jnp.int32)
+    vocab_size = 32
+    logits = np.full((1, 8, vocab_size), -10.0, dtype=np.float32)
+    target_top1 = np.array([11, 12, 13, 19, 15, 21, 17, 22], dtype=np.int32)
+    for row, token_id in enumerate(target_top1):
+        logits[0, row, token_id] = 5.0
+    # d5 and d7 are target top-1 on the stale path. d6 is two logits behind.
+    logits[0, 5, 16] = 3.0
+
+    stale_ids, target_margins, valid = build_dflash_flashback_feedback(
+        candidates.reshape(-1),
+        jnp.asarray(logits.reshape(-1, vocab_size)),
+        jnp.asarray([3], dtype=jnp.int32),
+        draft_token_num=8,
+    )
+
+    np.testing.assert_array_equal(np.asarray(stale_ids[0, :4]), np.array([15, 16, 17, 0]))
+    np.testing.assert_array_equal(
+        np.asarray(valid),
+        np.array([[True, True, True, False, False, False, False]]),
+    )
+    np.testing.assert_allclose(np.asarray(target_margins[0, :3]), np.array([0.0, -2.0, 0.0]))
+
+
+def test_select_dflash_flashback_tokens_uses_sparse_target_discounted_bonus():
+    logits = np.array(
+        [
+            [
+                [0.0, 5.0, 4.4, 0.0],  # stale 2 trails by 0.6: recycled
+                [0.0, 5.0, 4.4, 0.0],  # target margin discounts bonus: rejected
+                [0.0, 5.0, 4.4, 0.0],  # position decay leaves 0.25: rejected
+            ]
+        ],
+        dtype=np.float32,
+    )
+    selected = select_dflash_flashback_tokens(
+        jnp.asarray(logits),
+        jnp.asarray([[2, 2, 2]], dtype=jnp.int32),
+        jnp.asarray([[0.0, -0.6, 0.0]], dtype=jnp.float32),
+        jnp.asarray([[True, True, True]], dtype=jnp.bool_),
+        bonus=1.0,
+        target_margin_weight=1.0,
+        position_decay=0.5,
+    )
+    np.testing.assert_array_equal(np.asarray(selected), np.array([[2, 1, 1]], dtype=np.int32))
+
+
+def test_dflash_relay_round_trips_flashback_feedback():
+    from types import SimpleNamespace
+
+    from jax.sharding import Mesh, NamedSharding
+    from jax.sharding import PartitionSpec as P
+
+    devices = np.asarray(jax.devices())
+    mesh = Mesh(
+        devices.reshape(1, -1),
+        ("data", "tensor"),
+        axis_types=(jax.sharding.AxisType.Explicit,) * 2,
+    )
+    req_pool = SimpleNamespace(req_to_token=np.zeros((4, 1), dtype=np.int32))
+    buffers = create_dflash_relay_buffers(
+        mesh,
+        req_pool,
+        dp_size=1,
+        feedback_width=3,
+    )
+    vector_sharding = NamedSharding(mesh, P("data"))
+    feedback_sharding = NamedSharding(mesh, P("data", None))
+    with jax.set_mesh(mesh):
+        buffers = update_dflash_relay_buffers(
+            buffers,
+            jax.device_put(np.array([2, 0], dtype=np.int32), vector_sharding),
+            jax.device_put(np.array([True, False]), vector_sharding),
+            jax.device_put(np.array([9, 7], dtype=np.int32), vector_sharding),
+            jax.device_put(np.array([21, 19], dtype=np.int32), vector_sharding),
+            jax.device_put(np.array([[4, 5, 0], [8, 8, 8]], dtype=np.int32), feedback_sharding),
+            jax.device_put(
+                np.array([[0.0, -0.5, 0.0], [0, 0, 0]], dtype=np.float32),
+                feedback_sharding,
+            ),
+            jax.device_put(np.array([[True, True, False], [True, True, True]]), feedback_sharding),
+            dp_size=1,
+        )
+        gathered = gather_dflash_relay_buffers(
+            buffers,
+            jax.device_put(np.array([2, 1], dtype=np.int32), vector_sharding),
+            dp_size=1,
+        )
+
+    verified_id, seq_lens, stale_ids, margins, valid = map(np.asarray, gathered)
+    np.testing.assert_array_equal(verified_id, np.array([9, 0], dtype=np.int32))
+    np.testing.assert_array_equal(seq_lens, np.array([21, 0], dtype=np.int32))
+    np.testing.assert_array_equal(stale_ids[0], np.array([4, 5, 0], dtype=np.int32))
+    np.testing.assert_allclose(margins[0], np.array([0.0, -0.5, 0.0], dtype=np.float32))
+    np.testing.assert_array_equal(valid[0], np.array([True, True, False]))
+
+
 def test_dflash_draft_input_filter_batch():
     di = DFlashDraftInput(
         verified_id=np.array([10, 20, 30], dtype=np.int32),
         target_hidden=None,
         ctx_lens=np.array([1, 2, 3], dtype=np.int32),
         draft_seq_lens=np.array([5, 6, 7], dtype=np.int32),
+        flashback_token_ids=np.array([[1, 2], [3, 4], [5, 6]], dtype=np.int32),
+        flashback_target_margins=np.array([[0, -1], [-2, 0], [0, 0]], dtype=np.float32),
+        flashback_valid_mask=np.array([[1, 1], [1, 1], [1, 0]], dtype=np.bool_),
+        block_size=3,
     )
 
     di.filter_batch(np.array([2, 0], dtype=np.int32), has_been_filtered=False)
@@ -100,6 +211,8 @@ def test_dflash_draft_input_filter_batch():
     np.testing.assert_array_equal(di.verified_id, np.array([30, 10], dtype=np.int32))
     np.testing.assert_array_equal(di.ctx_lens, np.array([3, 1], dtype=np.int32))
     np.testing.assert_array_equal(di.draft_seq_lens, np.array([7, 5], dtype=np.int32))
+    np.testing.assert_array_equal(di.flashback_token_ids, np.array([[5, 6], [1, 2]]))
+    np.testing.assert_array_equal(di.flashback_valid_mask, np.array([[True, False], [True, True]]))
 
 
 def test_dflash_draft_input_new_tokens_required_next_decode_page_aligned():
