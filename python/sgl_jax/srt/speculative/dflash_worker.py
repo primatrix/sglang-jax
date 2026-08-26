@@ -22,6 +22,7 @@ from sgl_jax.srt.speculative.base_worker import BaseDraftWorker, BaseSpecWorker
 from sgl_jax.srt.speculative.dflash_info import (
     DFlashDraftInput,
     DFlashVerifyInput,
+    _gather_dflash_vocab_scores,
     _mask_draft_kv_writes,
     build_dflash_draft_block,
     build_dflash_flashback_feedback,
@@ -53,6 +54,17 @@ _DFLASH_FEEDBACK_SHADOW_SOURCES = (
     "ngram_len2",
     "ngram_len3plus",
 )
+_DFLASH_FEEDBACK_AGREEMENT_SOURCES = (
+    "agree_rejected_stale",
+    "agree_rejected_ngram",
+    "agree_stale_ngram",
+    "agree_all_three",
+)
+_DFLASH_FEEDBACK_ALL_SOURCES = (
+    _DFLASH_FEEDBACK_SHADOW_SOURCES + _DFLASH_FEEDBACK_AGREEMENT_SOURCES
+)
+_DFLASH_MARGIN_THRESHOLDS = np.asarray((0.25, 0.5, 1.0, 2.0, 4.0, 8.0), dtype=np.float32)
+_DFLASH_CONDITION_SOURCES = ("rejected_draft", "stale_suffix", "ngram_len3plus")
 
 
 @dataclass(frozen=True)
@@ -80,6 +92,7 @@ class DraftForwardPlan:
     flashback_valid_mask: jax.Array
     rejected_draft_token_ids: jax.Array
     rejection_valid_mask: jax.Array
+    previous_accept_lens: jax.Array
     target_correction_token_ids: jax.Array
     ngram_token_ids: jax.Array
     ngram_bonus: jax.Array
@@ -110,7 +123,9 @@ class TargetVerifyPlan:
     flashback_valid_mask: jax.Array
     rejected_draft_token_ids: jax.Array
     rejection_valid_mask: jax.Array
+    previous_accept_lens: jax.Array
     target_correction_token_ids: jax.Array
+    candidate_margins: jax.Array
     ngram_selected_mask: jax.Array
     ngram_token_ids: jax.Array
     ngram_valid_mask: jax.Array
@@ -166,8 +181,39 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                     "accepted_chain",
                 )
             }
-            for source in _DFLASH_FEEDBACK_SHADOW_SOURCES
+            for source in _DFLASH_FEEDBACK_ALL_SOURCES
         }
+        margin_bin_count = len(_DFLASH_MARGIN_THRESHOLDS) + 1
+        self._feedback_margin_stats = {
+            source: {
+                metric: np.zeros((margin_bin_count,), dtype=np.int64)
+                for metric in ("valid", "target_match", "target_novel")
+            }
+            for source in _DFLASH_FEEDBACK_ALL_SOURCES
+            if source != "target_correction"
+        }
+        self._feedback_condition_stats = {
+            source: {
+                metric: np.zeros(
+                    (self.block_size + 1, self.block_size - 1), dtype=np.int64
+                )
+                for metric in ("valid", "target_match")
+            }
+            for source in _DFLASH_CONDITION_SOURCES
+        }
+        self._feedback_oracle_rejected_rounds = 0
+        self._feedback_oracle_repair_rounds = 0
+        self._feedback_oracle_local_novel = 0
+        self._feedback_oracle_rejection_position = np.zeros(
+            (self.block_size - 1,), dtype=np.int64
+        )
+        self._feedback_oracle_repair_position = np.zeros(
+            (self.block_size - 1,), dtype=np.int64
+        )
+        self._feedback_oracle_source_repairs = {
+            source: 0 for source in ("rejected_draft", "stale_suffix", "historical_ngram")
+        }
+        self._feedback_oracle_agreement_repairs = 0
         self._flashback_enabled = bool(server_args.enable_dflash_flashback)
         self._flashback_bonus = float(server_args.dflash_flashback_bonus)
         self._flashback_target_margin_weight = float(
@@ -324,6 +370,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             resolved_positions,
             resolved_cache_loc,
             ngram_selected_mask,
+            candidate_margins,
         ) = self._run_jit_draft_block(draft_plan)
 
         # JAX dispatch is asynchronous. Bind the target model to the draft
@@ -336,6 +383,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             resolved_positions,
             resolved_cache_loc,
             ngram_selected_mask,
+            candidate_margins,
         )
         self.target_worker.model_runner.attn_backend.forward_metadata = target_plan.forward_metadata
         model_worker_batch._dflash_target_verify_plan = target_plan
@@ -465,7 +513,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             prior_flashback_valid_mask,
             rejected_draft_token_ids,
             rejection_valid_mask,
+            previous_accept_lens,
             target_correction_token_ids,
+            candidate_margins,
             ngram_selected_mask,
             ngram_token_ids,
             ngram_valid_mask,
@@ -483,7 +533,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 plan.flashback_valid_mask,
                 plan.rejected_draft_token_ids,
                 plan.rejection_valid_mask,
+                plan.previous_accept_lens,
                 plan.target_correction_token_ids,
+                plan.candidate_margins,
                 plan.ngram_selected_mask,
                 plan.ngram_token_ids,
                 plan.ngram_valid_mask,
@@ -525,6 +577,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 ngram_token_ids=np.asarray(ngram_token_ids, dtype=np.int32),
                 ngram_valid_mask=np.asarray(ngram_valid_mask, dtype=np.bool_),
                 ngram_match_lens=np.asarray(ngram_match_lens, dtype=np.int32),
+                previous_accept_lens=np.asarray(previous_accept_lens, dtype=np.int32),
+                candidate_margins=np.asarray(candidate_margins, dtype=np.float32),
                 selector=selector,
             )
         active_mask = np.zeros((accept_lens.shape[0],), dtype=np.bool_)
@@ -538,6 +592,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             active_mask,
             block_size=self.block_size,
         )
+        next_draft_input.previous_accept_lens = np.where(
+            active_mask, accept_lens, 0
+        ).astype(np.int32)
         next_draft_input.ctx_lens = np.zeros_like(accept_lens)
         next_draft_input.draft_seq_lens = plan.target_prefix_lens + accept_lens
         next_draft_input.new_seq_lens = plan.seq_lens + accept_lens
@@ -631,6 +688,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         ngram_token_ids: np.ndarray,
         ngram_valid_mask: np.ndarray,
         ngram_match_lens: np.ndarray,
+        previous_accept_lens: np.ndarray,
+        candidate_margins: np.ndarray,
         selector: np.ndarray,
     ) -> None:
         """Measure prior-round signals against the untouched current DFlash block."""
@@ -675,29 +734,119 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             padded_bs, proposal_width
         )[selector]
         match_lens = np.asarray(ngram_match_lens, dtype=np.int32).reshape(padded_bs)[selector]
+        previous_accept_lens = np.asarray(previous_accept_lens, dtype=np.int32).reshape(
+            padded_bs
+        )[selector]
+        candidate_margins = np.asarray(candidate_margins, dtype=np.float32).reshape(
+            padded_bs, proposal_width, 3
+        )[selector]
         sources = {
-            "rejected_draft": (rejected_ids, scalar_valid),
-            "target_correction": (correction_ids, scalar_valid),
-            "stale_suffix": (stale_ids, stale_valid),
-            "ngram_len1": (ngram_ids, ngram_valid & (match_lens[:, None] == 1)),
-            "ngram_len2": (ngram_ids, ngram_valid & (match_lens[:, None] == 2)),
-            "ngram_len3plus": (ngram_ids, ngram_valid & (match_lens[:, None] >= 3)),
+            "rejected_draft": (rejected_ids, scalar_valid, 0),
+            "target_correction": (correction_ids, scalar_valid, None),
+            "stale_suffix": (stale_ids, stale_valid, 1),
+            "ngram_len1": (
+                ngram_ids,
+                ngram_valid & (match_lens[:, None] == 1),
+                2,
+            ),
+            "ngram_len2": (
+                ngram_ids,
+                ngram_valid & (match_lens[:, None] == 2),
+                2,
+            ),
+            "ngram_len3plus": (
+                ngram_ids,
+                ngram_valid & (match_lens[:, None] >= 3),
+                2,
+            ),
         }
+        rejected_stale = scalar_valid & stale_valid & (rejected_ids == stale_ids)
+        rejected_ngram = scalar_valid & ngram_valid & (rejected_ids == ngram_ids)
+        stale_ngram = stale_valid & ngram_valid & (stale_ids == ngram_ids)
+        all_three = rejected_stale & ngram_valid & (rejected_ids == ngram_ids)
+        sources.update(
+            {
+                "agree_rejected_stale": (stale_ids, rejected_stale, 1),
+                "agree_rejected_ngram": (ngram_ids, rejected_ngram, 2),
+                "agree_stale_ngram": (ngram_ids, stale_ngram, 2),
+                "agree_all_three": (ngram_ids, all_three, 2),
+            }
+        )
 
         self._feedback_shadow_batches += 1
         self._feedback_shadow_rounds += int(selector.size)
-        for source, (candidate, valid) in sources.items():
+        for source, (candidate, valid, margin_index) in sources.items():
             draft_reuse = valid & (candidate == draft)
             target_match = valid & (candidate == target)
+            target_novel = target_match & ~draft_reuse
             counters = self._feedback_shadow_stats[source]
             counters["valid"] += valid.sum(axis=0, dtype=np.int64)
             counters["draft_reuse"] += draft_reuse.sum(axis=0, dtype=np.int64)
             counters["target_match"] += target_match.sum(axis=0, dtype=np.int64)
-            counters["target_novel"] += (target_match & ~draft_reuse).sum(axis=0, dtype=np.int64)
+            counters["target_novel"] += target_novel.sum(axis=0, dtype=np.int64)
             counters["draft_target_match"] += (draft_reuse & target_match).sum(
                 axis=0, dtype=np.int64
             )
             counters["accepted_chain"] += (draft_reuse & accepted_mask).sum(axis=0, dtype=np.int64)
+
+            if margin_index is not None:
+                margin_bins = np.digitize(
+                    candidate_margins[..., margin_index],
+                    _DFLASH_MARGIN_THRESHOLDS,
+                    right=True,
+                )
+                margin_stats = self._feedback_margin_stats[source]
+                for bin_index in range(len(_DFLASH_MARGIN_THRESHOLDS) + 1):
+                    in_bin = valid & (margin_bins == bin_index)
+                    margin_stats["valid"][bin_index] += int(in_bin.sum())
+                    margin_stats["target_match"][bin_index] += int(
+                        (in_bin & target_match).sum()
+                    )
+                    margin_stats["target_novel"][bin_index] += int(
+                        (in_bin & target_novel).sum()
+                    )
+
+            if source in self._feedback_condition_stats:
+                condition = self._feedback_condition_stats[source]
+                clipped_previous = np.clip(previous_accept_lens, 0, self.block_size)
+                for previous_len in range(1, self.block_size + 1):
+                    previous_rows = clipped_previous == previous_len
+                    condition["valid"][previous_len] += valid[previous_rows].sum(
+                        axis=0, dtype=np.int64
+                    )
+                    condition["target_match"][previous_len] += target_match[
+                        previous_rows
+                    ].sum(axis=0, dtype=np.int64)
+
+        algorithm_ids = np.stack([rejected_ids, stale_ids, ngram_ids], axis=-1)
+        algorithm_valid = np.stack([scalar_valid, stale_valid, ngram_valid], axis=-1)
+        algorithm_target = algorithm_valid & (algorithm_ids == target[..., None])
+        self._feedback_oracle_local_novel += int(
+            (algorithm_target.any(axis=-1) & (draft != target)).sum()
+        )
+        current_rejection = (accept_lens > 0) & (accept_lens <= proposal_width)
+        current_rejection_position = np.clip(accept_lens - 1, 0, proposal_width - 1)
+        rows = np.arange(accept_lens.shape[0], dtype=np.int32)
+        repair_matches = algorithm_target[rows, current_rejection_position]
+        repair_matches &= current_rejection[:, None]
+        repairable = repair_matches.any(axis=1)
+        self._feedback_oracle_rejected_rounds += int(current_rejection.sum())
+        self._feedback_oracle_repair_rounds += int(repairable.sum())
+        self._feedback_oracle_rejection_position += np.bincount(
+            current_rejection_position[current_rejection], minlength=proposal_width
+        )
+        self._feedback_oracle_repair_position += np.bincount(
+            current_rejection_position[repairable], minlength=proposal_width
+        )
+        for source_index, source in enumerate(
+            ("rejected_draft", "stale_suffix", "historical_ngram")
+        ):
+            self._feedback_oracle_source_repairs[source] += int(
+                repair_matches[:, source_index].sum()
+            )
+        self._feedback_oracle_agreement_repairs += int(
+            (repair_matches.sum(axis=1) >= 2).sum()
+        )
 
         if self._feedback_shadow_batches % 100 != 0:
             return
@@ -730,6 +879,64 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 counters["target_novel"].tolist(),
                 counters["draft_target_match"].tolist(),
                 counters["accepted_chain"].tolist(),
+            )
+        rejected_rounds = max(1, self._feedback_oracle_rejected_rounds)
+        total_positions = max(1, self._feedback_shadow_rounds * proposal_width)
+        logger.info(
+            "[DFLASH-FEEDBACK-ORACLE] batches=%d rounds=%d rejected_rounds=%d "
+            "repair_rounds=%d repair_rate=%.6f local_novel_positions=%d "
+            "local_novel_rate=%.6f source_repairs=%s agreement_repairs=%d "
+            "rejection_position=%s repair_position=%s",
+            self._feedback_shadow_batches,
+            self._feedback_shadow_rounds,
+            self._feedback_oracle_rejected_rounds,
+            self._feedback_oracle_repair_rounds,
+            self._feedback_oracle_repair_rounds / rejected_rounds,
+            self._feedback_oracle_local_novel,
+            self._feedback_oracle_local_novel / total_positions,
+            self._feedback_oracle_source_repairs,
+            self._feedback_oracle_agreement_repairs,
+            self._feedback_oracle_rejection_position.tolist(),
+            self._feedback_oracle_repair_position.tolist(),
+        )
+        if self._feedback_shadow_batches % 500 != 0:
+            return
+        for source in _DFLASH_FEEDBACK_AGREEMENT_SOURCES:
+            counters = self._feedback_shadow_stats[source]
+            valid = max(1, int(counters["valid"].sum()))
+            logger.info(
+                "[DFLASH-FEEDBACK-AGREEMENT] batches=%d source=%s valid=%d "
+                "target_match_rate=%.6f target_novel_rate=%.6f position_valid=%s "
+                "position_target=%s position_novel=%s",
+                self._feedback_shadow_batches,
+                source,
+                int(counters["valid"].sum()),
+                counters["target_match"].sum() / valid,
+                counters["target_novel"].sum() / valid,
+                counters["valid"].tolist(),
+                counters["target_match"].tolist(),
+                counters["target_novel"].tolist(),
+            )
+        for source, counters in self._feedback_margin_stats.items():
+            logger.info(
+                "[DFLASH-FEEDBACK-MARGIN] batches=%d source=%s thresholds=%s "
+                "valid=%s target=%s novel=%s",
+                self._feedback_shadow_batches,
+                source,
+                _DFLASH_MARGIN_THRESHOLDS.tolist(),
+                counters["valid"].tolist(),
+                counters["target_match"].tolist(),
+                counters["target_novel"].tolist(),
+            )
+        for source, counters in self._feedback_condition_stats.items():
+            logger.info(
+                "[DFLASH-FEEDBACK-CONDITION] batches=%d source=%s "
+                "previous_accept_by_position_valid=%s "
+                "previous_accept_by_position_target=%s",
+                self._feedback_shadow_batches,
+                source,
+                counters["valid"].tolist(),
+                counters["target_match"].tolist(),
             )
 
     def forward_batch_speculative_prefill_overlap(self, model_worker_batch: ModelWorkerBatch):
@@ -978,6 +1185,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             flashback_valid_mask = np.zeros(feedback_shape, dtype=np.bool_)
             rejected_draft_token_ids = np.zeros((bs,), dtype=np.int32)
             rejection_valid_mask = np.zeros((bs,), dtype=np.bool_)
+            previous_accept_lens = np.zeros((bs,), dtype=np.int32)
         else:
             (
                 flashback_token_ids,
@@ -987,6 +1195,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             flashback_valid_mask = flashback_valid_mask & active_mask[:, None]
             rejected_draft_token_ids, rejection_valid_mask = draft_input._rejection_rows(bs)
             rejection_valid_mask = rejection_valid_mask & active_mask
+            previous_accept_lens = draft_input._previous_accept_rows(bs)
+            previous_accept_lens = np.where(active_mask, previous_accept_lens, 0)
         target_correction_token_ids = np.where(active_mask, verified_id, 0).astype(np.int32)
         ngram_token_ids, ngram_bonus, ngram_valid_mask, ngram_match_lens = (
             draft_input._ngram_rows(bs)
@@ -1006,8 +1216,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             flashback_token_ids=jax.device_put(flashback_token_ids, feedback_sharding),
             flashback_target_margins=jax.device_put(flashback_target_margins, feedback_sharding),
             flashback_valid_mask=jax.device_put(flashback_valid_mask, feedback_sharding),
-            rejected_draft_token_ids=rejected_draft_token_ids,
+            rejected_draft_token_ids=jax.device_put(rejected_draft_token_ids, data_sharding),
             rejection_valid_mask=rejection_valid_mask,
+            previous_accept_lens=previous_accept_lens,
             target_correction_token_ids=target_correction_token_ids,
             ngram_token_ids=jax.device_put(ngram_token_ids, feedback_sharding),
             ngram_bonus=jax.device_put(ngram_bonus, feedback_sharding),
@@ -1027,6 +1238,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         resolved_positions: jax.Array,
         resolved_cache_loc: jax.Array,
         ngram_selected_mask: jax.Array,
+        candidate_margins: jax.Array,
     ) -> TargetVerifyPlan:
         bs = draft_plan.bs
         target_mwb = copy.copy(model_worker_batch)
@@ -1097,7 +1309,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             flashback_valid_mask=draft_plan.flashback_valid_mask,
             rejected_draft_token_ids=draft_plan.rejected_draft_token_ids,
             rejection_valid_mask=draft_plan.rejection_valid_mask,
+            previous_accept_lens=draft_plan.previous_accept_lens,
             target_correction_token_ids=draft_plan.target_correction_token_ids,
+            candidate_margins=candidate_margins,
             ngram_selected_mask=ngram_selected_mask,
             ngram_token_ids=draft_plan.ngram_token_ids,
             ngram_valid_mask=draft_plan.ngram_valid_mask,
@@ -1160,6 +1374,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         logits_sharding = NamedSharding(runner.mesh, P("data", "tensor"))
         token_sharding = NamedSharding(runner.mesh, P("data"))
         cache_row_sharding = NamedSharding(runner.mesh, P("data", None))
+        candidate_margin_sharding = NamedSharding(runner.mesh, P("data", None, None))
 
         @_partial(
             jax.jit,
@@ -1173,6 +1388,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 "use_relay_state",
                 "ngram_enabled",
                 "flashback_enabled",
+                "feedback_shadow_enabled",
                 "dp_size",
             ],
         )
@@ -1192,6 +1408,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             flashback_token_ids,
             flashback_target_margins,
             flashback_valid_mask,
+            rejected_draft_token_ids,
             ngram_token_ids,
             ngram_bonus,
             ngram_valid_mask,
@@ -1203,6 +1420,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             use_relay_state: bool,
             ngram_enabled: bool,
             flashback_enabled: bool,
+            feedback_shadow_enabled: bool,
             dp_size: int,
         ):
             target_prefix_lens = forward_batch.seq_lens
@@ -1327,6 +1545,31 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 )
             else:
                 draft_next = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+            if feedback_shadow_enabled:
+                base_token_ids = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+                base_scores = _gather_dflash_vocab_scores(logits, base_token_ids)
+                rejected_rows = jnp.broadcast_to(
+                    rejected_draft_token_ids[:, None], base_token_ids.shape
+                )
+                candidate_scores = jnp.stack(
+                    [
+                        _gather_dflash_vocab_scores(logits, rejected_rows),
+                        _gather_dflash_vocab_scores(logits, flashback_token_ids),
+                        _gather_dflash_vocab_scores(logits, ngram_token_ids),
+                    ],
+                    axis=-1,
+                )
+                candidate_margins = (base_scores[..., None] - candidate_scores).astype(
+                    jnp.float32
+                )
+                candidate_margins = jax.sharding.reshard(
+                    candidate_margins, candidate_margin_sharding
+                )
+            else:
+                candidate_margins = jax.sharding.reshard(
+                    jnp.zeros(logits.shape[:-1] + (3,), dtype=jnp.float32),
+                    candidate_margin_sharding,
+                )
             seed = forward_batch.input_ids.reshape((-1, draft_block_size))[:, :1]
             seed = jax.sharding.reshard(seed, cache_row_sharding)
             draft_next = jax.sharding.reshard(draft_next, cache_row_sharding)
@@ -1344,6 +1587,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 verify_positions,
                 selected_verify_cache_loc,
                 ngram_selected_mask,
+                candidate_margins,
             )
 
         self._jit_draft_block = _partial(
@@ -1356,6 +1600,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             vocab_size=vocab_size,
             ngram_enabled=self._ngram_enabled,
             flashback_enabled=self._flashback_enabled,
+            feedback_shadow_enabled=self._feedback_shadow_enabled,
         )
 
     def _run_jit_draft_block(self, plan: DraftForwardPlan):
@@ -1371,6 +1616,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 positions,
                 cache_loc,
                 ngram_selected_mask,
+                candidate_margins,
             ) = self._jit_draft_block(
                 runner.model_state_leaves,
                 forward_batch,
@@ -1385,6 +1631,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 plan.flashback_token_ids,
                 plan.flashback_target_margins,
                 plan.flashback_valid_mask,
+                plan.rejected_draft_token_ids,
                 plan.ngram_token_ids,
                 plan.ngram_bonus,
                 plan.ngram_valid_mask,
@@ -1398,6 +1645,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 positions,
                 cache_loc,
                 ngram_selected_mask,
+                candidate_margins,
             )
 
         with self._dispatch_context(runner):
@@ -1885,6 +2133,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             "flashback_valid_mask",
             "rejected_draft_token_ids",
             "rejection_valid_mask",
+            "previous_accept_lens",
             "ngram_token_ids",
             "ngram_bonus",
             "ngram_valid_mask",
@@ -1937,6 +2186,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 "flashback_valid_mask",
                 "rejected_draft_token_ids",
                 "rejection_valid_mask",
+                "previous_accept_lens",
                 "ngram_token_ids",
                 "ngram_bonus",
                 "ngram_valid_mask",
@@ -2302,8 +2552,11 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 np.zeros((bs, self.block_size - 1), dtype=np.bool_),
                 feedback_sharding,
             ),
-            rejected_draft_token_ids=np.zeros((bs,), dtype=np.int32),
+            rejected_draft_token_ids=jax.device_put(
+                np.zeros((bs,), dtype=np.int32), data_sharding
+            ),
             rejection_valid_mask=np.zeros((bs,), dtype=np.bool_),
+            previous_accept_lens=np.zeros((bs,), dtype=np.int32),
             target_correction_token_ids=np.zeros((bs,), dtype=np.int32),
             ngram_token_ids=jax.device_put(
                 np.zeros((bs, self.block_size - 1), dtype=np.int32),
@@ -2328,6 +2581,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             resolved_positions,
             resolved_cache_loc,
             ngram_selected_mask,
+            candidate_margins,
         ) = self._run_jit_draft_block(draft_plan)
 
         # Match the serving dependency and sharding exactly: target verify
@@ -2379,7 +2633,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             flashback_valid_mask=draft_plan.flashback_valid_mask,
             rejected_draft_token_ids=draft_plan.rejected_draft_token_ids,
             rejection_valid_mask=draft_plan.rejection_valid_mask,
+            previous_accept_lens=draft_plan.previous_accept_lens,
             target_correction_token_ids=draft_plan.target_correction_token_ids,
+            candidate_margins=candidate_margins,
             ngram_selected_mask=ngram_selected_mask,
             ngram_token_ids=draft_plan.ngram_token_ids,
             ngram_valid_mask=draft_plan.ngram_valid_mask,

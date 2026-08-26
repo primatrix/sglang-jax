@@ -2046,6 +2046,13 @@ class ServerArgs:
                 raise ValueError(
                     "--enable-dflash-feedback-shadow currently requires --disable-overlap-schedule."
                 )
+            if self.enable_dflash_feedback_shadow and (
+                self.enable_dflash_ngram or self.enable_dflash_flashback
+            ):
+                raise ValueError(
+                    "--enable-dflash-feedback-shadow requires DFlash N-gram and "
+                    "FlashBack reranking to remain disabled."
+                )
             if self.enable_dflash_ngram:
                 if not self.disable_overlap_schedule:
                     raise ValueError(

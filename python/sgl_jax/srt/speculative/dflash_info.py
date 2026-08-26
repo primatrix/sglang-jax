@@ -432,6 +432,7 @@ class DFlashDraftInput:
     flashback_valid_mask: jax.Array | np.ndarray = None
     rejected_draft_token_ids: jax.Array | np.ndarray = None
     rejection_valid_mask: jax.Array | np.ndarray = None
+    previous_accept_lens: jax.Array | np.ndarray = None
     ngram_token_ids: jax.Array | np.ndarray = None
     ngram_bonus: jax.Array | np.ndarray = None
     ngram_valid_mask: jax.Array | np.ndarray = None
@@ -456,6 +457,7 @@ class DFlashDraftInput:
             "future_indices",
             "flashback_token_ids",
             "rejected_draft_token_ids",
+            "previous_accept_lens",
             "ngram_token_ids",
             "ngram_match_lens",
         )
@@ -582,6 +584,17 @@ class DFlashDraftInput:
             )
         return token_ids, valid_mask
 
+    def _previous_accept_rows(self, bs: int) -> np.ndarray:
+        if self.previous_accept_lens is None:
+            return np.zeros((int(bs),), dtype=np.int32)
+        accept_lens = np.asarray(self.previous_accept_lens, dtype=np.int32)
+        if accept_lens.shape != (int(bs),):
+            raise ValueError(
+                "DFLASH previous accept lengths must have shape "
+                f"({int(bs)},), got {accept_lens.shape}."
+            )
+        return accept_lens
+
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True) -> None:
         self._ensure_host()
         new_indices = np.asarray(new_indices, dtype=np.int32)
@@ -620,6 +633,7 @@ class DFlashDraftInput:
             "flashback_valid_mask",
             "rejected_draft_token_ids",
             "rejection_valid_mask",
+            "previous_accept_lens",
             "ngram_token_ids",
             "ngram_bonus",
             "ngram_valid_mask",
@@ -797,6 +811,7 @@ class DFlashDraftInput:
             self.flashback_valid_mask = None
             self.rejected_draft_token_ids = None
             self.rejection_valid_mask = None
+            self.previous_accept_lens = None
             self.ngram_token_ids = None
             self.ngram_bonus = None
             self.ngram_valid_mask = None
@@ -819,6 +834,10 @@ class DFlashDraftInput:
         rejection = [state._rejection_rows(len(state.draft_seq_lens)) for state in rank_states]
         self.rejected_draft_token_ids = np.concatenate([rows[0] for rows in rejection], axis=0)
         self.rejection_valid_mask = np.concatenate([rows[1] for rows in rejection], axis=0)
+        self.previous_accept_lens = np.concatenate(
+            [state._previous_accept_rows(len(state.draft_seq_lens)) for state in rank_states],
+            axis=0,
+        )
         ngram = [state._ngram_rows(len(state.draft_seq_lens)) for state in rank_states]
         self.ngram_token_ids = np.concatenate([rows[0] for rows in ngram], axis=0)
         self.ngram_bonus = np.concatenate([rows[1] for rows in ngram], axis=0)
@@ -846,6 +865,7 @@ class DFlashDraftInput:
         draft_seq_lens = np.asarray(self.draft_seq_lens, dtype=np.int32)
         feedback_ids, feedback_margins, feedback_valid = self._flashback_rows(state_bs)
         rejected_ids, rejection_valid = self._rejection_rows(state_bs)
+        previous_accept_lens = self._previous_accept_rows(state_bs)
         ngram_ids, ngram_bonus, ngram_valid, ngram_match_lens = self._ngram_rows(state_bs)
         if state_bs > bs:
             self.verified_id = verified_id[:bs]
@@ -856,6 +876,7 @@ class DFlashDraftInput:
             self.flashback_valid_mask = feedback_valid[:bs]
             self.rejected_draft_token_ids = rejected_ids[:bs]
             self.rejection_valid_mask = rejection_valid[:bs]
+            self.previous_accept_lens = previous_accept_lens[:bs]
             self.ngram_token_ids = ngram_ids[:bs]
             self.ngram_bonus = ngram_bonus[:bs]
             self.ngram_valid_mask = ngram_valid[:bs]
@@ -893,6 +914,9 @@ class DFlashDraftInput:
         )
         self.rejection_valid_mask = np.concatenate(
             [rejection_valid, np.zeros((missing,), dtype=np.bool_)], axis=0
+        )
+        self.previous_accept_lens = np.concatenate(
+            [previous_accept_lens, np.zeros((missing,), dtype=np.int32)], axis=0
         )
         self.ngram_token_ids = np.concatenate(
             [ngram_ids, np.zeros((missing, width), dtype=np.int32)], axis=0
@@ -933,6 +957,7 @@ class DFlashDraftInput:
             self.flashback_valid_mask = None
             self.rejected_draft_token_ids = None
             self.rejection_valid_mask = None
+            self.previous_accept_lens = None
             self.ngram_token_ids = None
             self.ngram_bonus = None
             self.ngram_valid_mask = None
@@ -957,6 +982,13 @@ class DFlashDraftInput:
             [self_rejection[0], other_rejection[0]], axis=0
         )
         self.rejection_valid_mask = np.concatenate([self_rejection[1], other_rejection[1]], axis=0)
+        self.previous_accept_lens = np.concatenate(
+            [
+                self._previous_accept_rows(len(self.verified_id) - len(other.verified_id)),
+                other._previous_accept_rows(len(other.verified_id)),
+            ],
+            axis=0,
+        )
         self_ngram = self._ngram_rows(len(self.verified_id) - len(other.verified_id))
         other_ngram = other._ngram_rows(len(other.verified_id))
         self.ngram_token_ids = np.concatenate([self_ngram[0], other_ngram[0]], axis=0)

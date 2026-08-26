@@ -2803,6 +2803,14 @@ class ScheduleBatch:
                     if relay_state
                     else _scatter_dflash_1d(rejection_rows[1], "rejection_valid_mask")
                 ),
+                previous_accept_lens=(
+                    None
+                    if relay_state
+                    else _scatter_dflash_1d(
+                        flat._previous_accept_rows(len(selector)),
+                        "previous_accept_lens",
+                    )
+                ),
                 ngram_token_ids=(
                     None
                     if relay_state
@@ -2948,6 +2956,11 @@ class ScheduleBatch:
                         rejection_valid_mask=(
                             None if relay_state else _slice(flat.rejection_valid_mask, offset, end)
                         ),
+                        previous_accept_lens=(
+                            None
+                            if relay_state
+                            else _slice(flat.previous_accept_lens, offset, end)
+                        ),
                         ngram_token_ids=(
                             None if relay_state else _slice(flat.ngram_token_ids, offset, end)
                         ),
@@ -3076,6 +3089,7 @@ class ScheduleBatch:
                 "flashback_valid_mask",
                 "rejected_draft_token_ids",
                 "rejection_valid_mask",
+                "previous_accept_lens",
                 "ngram_token_ids",
                 "ngram_bonus",
                 "ngram_valid_mask",
@@ -3132,6 +3146,7 @@ class ScheduleBatch:
                     "flashback_valid_mask",
                     "rejected_draft_token_ids",
                     "rejection_valid_mask",
+                    "previous_accept_lens",
                     "ngram_token_ids",
                     "ngram_bonus",
                     "ngram_valid_mask",
