@@ -1,14 +1,17 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+from types import SimpleNamespace
 
 from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
 from sgl_jax.srt.speculative.dflash_info import (
     DFlashDraftInput,
+    DFlashNgramIndex,
     DFlashVerifyInput,
     build_dflash_draft_block,
     build_dflash_flashback_feedback,
     build_dflash_ngram_continuation,
+    build_dflash_ngram_continuation_incremental,
     build_dflash_rejection_feedback,
     dflash_greedy_verify,
     select_dflash_ngram_tokens,
@@ -78,6 +81,59 @@ def test_build_dflash_ngram_continuation_weights_verified_output_more_than_promp
     assert match_len == 3
     assert valid[0]
     assert bonuses[0] == 1.5
+
+
+def test_incremental_ngram_index_matches_full_history_scan_at_every_step():
+    tokens = [11, 12, 13, 21, 11, 12, 13, 22, 11, 12, 13, 21, 11, 12, 13]
+    prompt_len = 5
+    req = SimpleNamespace(origin_input_ids=tokens[:prompt_len], output_ids=[])
+
+    for end in range(prompt_len, len(tokens) + 1):
+        req.output_ids = tokens[prompt_len:end]
+        incremental = build_dflash_ngram_continuation_incremental(
+            req,
+            proposal_width=7,
+            min_match=1,
+            max_match=8,
+            bonus=1.5,
+            prompt_weight=0.7,
+            output_weight=1.0,
+            position_decay=0.8,
+            capacity=4096,
+        )
+        scanned = build_dflash_ngram_continuation(
+            tokens[:end],
+            prompt_len=prompt_len,
+            proposal_width=7,
+            min_match=1,
+            max_match=8,
+            bonus=1.5,
+            prompt_weight=0.7,
+            output_weight=1.0,
+            position_decay=0.8,
+        )
+        for actual, expected in zip(incremental[:3], scanned[:3]):
+            np.testing.assert_array_equal(actual, expected)
+        assert incremental[3] == scanned[3]
+
+
+def test_incremental_ngram_index_is_bounded_and_rebuilds_after_rewind():
+    index = DFlashNgramIndex(
+        proposal_width=4,
+        min_match=1,
+        max_match=4,
+        capacity=8,
+    )
+    prompt = list(range(20))
+    output = [20, 21, 22, 23]
+    index.sync(prompt, output)
+    assert index.entry_count <= 8
+    assert index.tokens == prompt + output
+
+    replacement = [90, 91]
+    index.sync(prompt, replacement)
+    assert index.entry_count <= 8
+    assert index.tokens == prompt + replacement
 
 
 def test_select_dflash_ngram_tokens_only_overrides_within_margin():

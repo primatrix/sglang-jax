@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, field
 
 import jax
 import jax.numpy as jnp
@@ -8,6 +9,11 @@ import numpy as np
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+
+_DFLASH_NGRAM_INDEX_CAPACITY = 4096
+_DFLASH_NGRAM_HASH_BASE = 1_000_003
+_DFLASH_NGRAM_HASH_MASK = (1 << 64) - 1
 
 
 def _mask_draft_kv_writes(
@@ -148,6 +154,231 @@ def build_dflash_ngram_continuation(
         return continuation, bonuses, valid, match_len
 
     return continuation, bonuses, valid, 0
+
+
+@dataclass
+class _DFlashNgramEntry:
+    latest_full_start: int | None = None
+    recent_starts: list[int] = field(default_factory=list)
+
+
+class DFlashNgramIndex:
+    """Bounded incremental index for request-local historical N-grams.
+
+    A 64-bit rolling hash identifies each context in O(1). Each key retains
+    the latest occurrence with a complete fixed-width continuation plus the
+    few recent occurrences whose continuations are still growing. This
+    preserves the legacy preference for the longest available continuation,
+    then the most recent occurrence, without rescanning the request history.
+    """
+
+    def __init__(
+        self,
+        *,
+        proposal_width: int,
+        min_match: int,
+        max_match: int,
+        capacity: int = _DFLASH_NGRAM_INDEX_CAPACITY,
+    ) -> None:
+        self.proposal_width = int(proposal_width)
+        self.min_match = max(1, int(min_match))
+        self.max_match = max(self.min_match, int(max_match))
+        self.capacity = max(1, int(capacity))
+        self.tokens: list[int] = []
+        self._prefix_hashes: list[int] = [0]
+        self._powers = [1]
+        for _ in range(self.max_match):
+            self._powers.append(
+                (self._powers[-1] * _DFLASH_NGRAM_HASH_BASE)
+                & _DFLASH_NGRAM_HASH_MASK
+            )
+        self._entries: OrderedDict[tuple[int, int], _DFlashNgramEntry] = OrderedDict()
+        self.prompt_len: int | None = None
+
+    @property
+    def entry_count(self) -> int:
+        return len(self._entries)
+
+    def _subsequence_hash(self, start: int, end: int) -> int:
+        length = int(end) - int(start)
+        return (
+            self._prefix_hashes[end]
+            - self._prefix_hashes[start] * self._powers[length]
+        ) & _DFLASH_NGRAM_HASH_MASK
+
+    def _refresh_entry(self, entry: _DFlashNgramEntry) -> None:
+        full_cutoff = len(self.tokens) - self.proposal_width
+        full_starts = [start for start in entry.recent_starts if start <= full_cutoff]
+        if full_starts:
+            newest_full = max(full_starts)
+            if entry.latest_full_start is None or newest_full > entry.latest_full_start:
+                entry.latest_full_start = newest_full
+            entry.recent_starts = [
+                start for start in entry.recent_starts if start > full_cutoff
+            ]
+
+    def _append(self, token_id: int) -> None:
+        position = len(self.tokens)
+        token_id = int(token_id)
+        self.tokens.append(token_id)
+        self._prefix_hashes.append(
+            (
+                self._prefix_hashes[-1] * _DFLASH_NGRAM_HASH_BASE
+                + token_id
+                + 1
+            )
+            & _DFLASH_NGRAM_HASH_MASK
+        )
+        upper = min(self.max_match, position)
+        for match_len in range(self.min_match, upper + 1):
+            key = (
+                match_len,
+                self._subsequence_hash(position - match_len, position),
+            )
+            entry = self._entries.get(key)
+            if entry is None:
+                entry = _DFlashNgramEntry()
+                self._entries[key] = entry
+                if len(self._entries) > self.capacity:
+                    self._entries.popitem(last=False)
+            else:
+                self._entries.move_to_end(key)
+            self._refresh_entry(entry)
+            entry.recent_starts.append(position)
+
+    @staticmethod
+    def _token_at(
+        position: int,
+        prompt_ids: list[int] | tuple[int, ...] | np.ndarray,
+        output_ids: list[int] | tuple[int, ...] | np.ndarray,
+    ) -> int:
+        prompt_len = len(prompt_ids)
+        return int(prompt_ids[position] if position < prompt_len else output_ids[position - prompt_len])
+
+    def sync(
+        self,
+        prompt_ids: list[int] | tuple[int, ...] | np.ndarray,
+        output_ids: list[int] | tuple[int, ...] | np.ndarray,
+    ) -> None:
+        """Append newly verified tokens, rebuilding only if request history rewinds."""
+        prompt_len = len(prompt_ids)
+        total_len = prompt_len + len(output_ids)
+        must_rebuild = self.prompt_len is not None and self.prompt_len != prompt_len
+        must_rebuild |= total_len < len(self.tokens)
+        if self.tokens and not must_rebuild:
+            must_rebuild = self.tokens[-1] != self._token_at(
+                len(self.tokens) - 1, prompt_ids, output_ids
+            )
+        if must_rebuild:
+            self.tokens.clear()
+            self._prefix_hashes = [0]
+            self._entries.clear()
+        self.prompt_len = prompt_len
+        for position in range(len(self.tokens), total_len):
+            self._append(self._token_at(position, prompt_ids, output_ids))
+
+    def continuation(
+        self,
+        *,
+        bonus: float,
+        prompt_weight: float,
+        output_weight: float,
+        position_decay: float,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+        width = self.proposal_width
+        continuation = np.zeros((width,), dtype=np.int32)
+        bonuses = np.zeros((width,), dtype=np.float32)
+        valid = np.zeros((width,), dtype=np.bool_)
+        if width <= 0 or self.prompt_len is None:
+            return continuation, bonuses, valid, 0
+
+        token_count = len(self.tokens)
+        upper = min(self.max_match, token_count - 1)
+        for match_len in range(upper, self.min_match - 1, -1):
+            suffix_start = token_count - match_len
+            key = (
+                match_len,
+                self._subsequence_hash(suffix_start, token_count),
+            )
+            entry = self._entries.get(key)
+            if entry is None:
+                continue
+            self._entries.move_to_end(key)
+            self._refresh_entry(entry)
+            starts = list(entry.recent_starts)
+            if entry.latest_full_start is not None:
+                starts.append(entry.latest_full_start)
+            matches = []
+            suffix = self.tokens[suffix_start:token_count]
+            for continuation_start in starts:
+                context_start = continuation_start - match_len
+                if self.tokens[context_start:continuation_start] != suffix:
+                    continue
+                available = min(width, token_count - continuation_start)
+                if available > 0:
+                    matches.append((available, continuation_start))
+            if not matches:
+                continue
+
+            available, continuation_start = max(matches)
+            continuation[:available] = self.tokens[
+                continuation_start : continuation_start + available
+            ]
+            valid[:available] = True
+            source_weight = (
+                float(prompt_weight)
+                if continuation_start < self.prompt_len
+                else float(output_weight)
+            )
+            offsets = np.arange(available, dtype=np.float32)
+            bonuses[:available] = (
+                float(bonus)
+                * source_weight
+                * np.power(float(position_decay), offsets)
+            )
+            return continuation, bonuses, valid, match_len
+
+        return continuation, bonuses, valid, 0
+
+
+def build_dflash_ngram_continuation_incremental(
+    req,
+    *,
+    proposal_width: int,
+    min_match: int,
+    max_match: int,
+    bonus: float,
+    prompt_weight: float,
+    output_weight: float,
+    position_decay: float,
+    capacity: int = _DFLASH_NGRAM_INDEX_CAPACITY,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """Lookup a continuation through a persistent bounded request-local index."""
+    config = (
+        int(proposal_width),
+        int(min_match),
+        int(max_match),
+        int(capacity),
+    )
+    index = getattr(req, "_dflash_ngram_index", None)
+    if not isinstance(index, DFlashNgramIndex) or getattr(
+        req, "_dflash_ngram_index_config", None
+    ) != config:
+        index = DFlashNgramIndex(
+            proposal_width=proposal_width,
+            min_match=min_match,
+            max_match=max_match,
+            capacity=capacity,
+        )
+        req._dflash_ngram_index = index
+        req._dflash_ngram_index_config = config
+    index.sync(req.origin_input_ids, req.output_ids)
+    return index.continuation(
+        bonus=bonus,
+        prompt_weight=prompt_weight,
+        output_weight=output_weight,
+        position_decay=position_decay,
+    )
 
 
 def select_dflash_ngram_tokens(
@@ -665,9 +896,8 @@ class DFlashDraftInput:
         if self.enable_ngram:
             reqs = [req for info in schedule_batch.reqs_info for req in (info.reqs or [])]
             rows = [
-                build_dflash_ngram_continuation(
-                    req.origin_input_ids + req.output_ids,
-                    prompt_len=len(req.origin_input_ids),
+                build_dflash_ngram_continuation_incremental(
+                    req,
                     proposal_width=int(self.block_size) - 1,
                     min_match=self.ngram_min_match,
                     max_match=self.ngram_max_match,
