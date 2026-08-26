@@ -124,9 +124,68 @@ def dflash_greedy_verify(
     return accept_lens_out, target_predict_flat, bonus, accept_len_draft.astype(jnp.int32)
 
 
+def _gather_dflash_vocab_scores(
+    logits: jax.Array,
+    token_ids: jax.Array,
+) -> jax.Array:
+    """Gather sparse token scores without replicating a TP-sharded vocabulary.
+
+    DFlash logits shard their vocabulary dimension over ``tensor``.  A plain
+    ``take_along_axis`` leaves GSPMD free to replicate that dimension before
+    gathering, which is especially costly when this operation is fused into
+    the target/draft model JIT.  Instead each TP rank reads only a candidate
+    that falls inside its local vocabulary slice and the ranks combine those
+    scalar scores with ``pmax``.
+    """
+    if logits.shape[:-1] != token_ids.shape:
+        raise ValueError(
+            "DFLASH sparse score ids must match logits leading shape: "
+            f"{token_ids.shape} vs {logits.shape}."
+        )
+
+    logits_sharding = jax.typeof(logits).sharding
+    mesh = getattr(logits_sharding, "mesh", None)
+    if mesh is None or getattr(mesh, "empty", False) or "tensor" not in mesh.axis_names:
+        return jnp.take_along_axis(logits, token_ids[..., None], axis=-1)[..., 0]
+
+    from jax.sharding import NamedSharding
+    from jax.sharding import PartitionSpec as P
+
+    logits_spec = P("data", *(None for _ in logits.shape[1:-1]), "tensor")
+    ids_spec = P("data", *(None for _ in token_ids.shape[1:]))
+    logits = jax.sharding.reshard(logits, NamedSharding(mesh, logits_spec))
+    token_ids = jax.sharding.reshard(token_ids, NamedSharding(mesh, ids_spec))
+
+    def _gather_local(local_logits, global_token_ids):
+        local_vocab_size = local_logits.shape[-1]
+        vocab_start = jax.lax.axis_index("tensor") * local_vocab_size
+        local_token_ids = global_token_ids - vocab_start
+        owns_token = (local_token_ids >= 0) & (local_token_ids < local_vocab_size)
+        safe_token_ids = jnp.clip(local_token_ids, 0, local_vocab_size - 1)
+        local_scores = jnp.take_along_axis(
+            local_logits,
+            safe_token_ids[..., None],
+            axis=-1,
+        )[..., 0]
+        local_scores = jnp.where(
+            owns_token,
+            local_scores,
+            jnp.asarray(-jnp.inf, dtype=local_logits.dtype),
+        )
+        return jax.lax.pmax(local_scores, "tensor")
+
+    return jax.shard_map(
+        _gather_local,
+        mesh=mesh,
+        in_specs=(logits_spec, ids_spec),
+        out_specs=ids_spec,
+    )(logits, token_ids)
+
+
 def build_dflash_flashback_feedback(
     draft_token: jax.Array,
     target_logits: jax.Array,
+    target_predict: jax.Array,
     accept_len_draft: jax.Array,
     *,
     draft_token_num: int,
@@ -147,18 +206,17 @@ def build_dflash_flashback_feedback(
     block_size = int(draft_token_num)
     candidates = draft_token.reshape((-1, block_size))
     logits = target_logits.reshape((candidates.shape[0], block_size, -1))
+    target_predict = target_predict.reshape(candidates.shape)
     proposal_width = block_size - 1
 
     # Logits row i predicts candidate i + 1.  Compute the target margin for
     # every proposal before dynamically shifting the stale suffix.
     proposal_logits = logits[:, :proposal_width, :]
     proposal_ids = candidates[:, 1:]
-    proposal_scores = jnp.take_along_axis(
-        proposal_logits,
-        proposal_ids[..., None],
-        axis=-1,
-    )[..., 0]
-    proposal_margins = proposal_scores - jnp.max(proposal_logits, axis=-1)
+    target_top1_ids = target_predict[:, :proposal_width]
+    proposal_scores = _gather_dflash_vocab_scores(proposal_logits, proposal_ids)
+    target_top1_scores = _gather_dflash_vocab_scores(proposal_logits, target_top1_ids)
+    proposal_margins = proposal_scores - target_top1_scores
 
     next_offsets = jnp.arange(proposal_width, dtype=jnp.int32)[None, :]
     source_candidate_indices = accept_len_draft[:, None] + 2 + next_offsets
@@ -211,12 +269,8 @@ def select_dflash_flashback_tokens(
             raise ValueError(f"{name} must have shape {expected}, got {value.shape}.")
 
     base_token_ids = jnp.argmax(draft_logits, axis=-1).astype(jnp.int32)
-    base_scores = jnp.max(draft_logits, axis=-1)
-    stale_scores = jnp.take_along_axis(
-        draft_logits,
-        stale_token_ids[..., None],
-        axis=-1,
-    )[..., 0]
+    base_scores = _gather_dflash_vocab_scores(draft_logits, base_token_ids)
+    stale_scores = _gather_dflash_vocab_scores(draft_logits, stale_token_ids)
     offsets = jnp.arange(draft_logits.shape[1], dtype=base_scores.dtype)[None, :]
     position_bonus = jnp.asarray(bonus, base_scores.dtype) * jnp.power(
         jnp.asarray(position_decay, base_scores.dtype),

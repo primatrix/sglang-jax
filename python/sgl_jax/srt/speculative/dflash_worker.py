@@ -1055,6 +1055,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 ) = build_dflash_flashback_feedback(
                     draft_token,
                     output.next_token_logits,
+                    next_token_ids_flat,
                     accept_len_draft,
                     draft_token_num=draft_token_num,
                 )

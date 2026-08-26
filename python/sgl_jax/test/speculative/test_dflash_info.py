@@ -109,6 +109,7 @@ def test_build_dflash_flashback_feedback_skips_first_rejection_and_aligns_suffix
     stale_ids, target_margins, valid = build_dflash_flashback_feedback(
         candidates.reshape(-1),
         jnp.asarray(logits.reshape(-1, vocab_size)),
+        jnp.asarray(target_top1.reshape(-1)),
         jnp.asarray([3], dtype=jnp.int32),
         draft_token_num=8,
     )
@@ -142,6 +143,39 @@ def test_select_dflash_flashback_tokens_uses_sparse_target_discounted_bonus():
         position_decay=0.5,
     )
     np.testing.assert_array_equal(np.asarray(selected), np.array([[2, 1, 1]], dtype=np.int32))
+
+
+def test_select_dflash_flashback_tokens_gathers_across_tensor_shards():
+    from jax.sharding import Mesh, NamedSharding
+    from jax.sharding import PartitionSpec as P
+
+    devices = np.asarray(jax.devices())
+    tensor_size = devices.size
+    mesh = Mesh(
+        devices.reshape(1, tensor_size),
+        ("data", "tensor"),
+        axis_types=(jax.sharding.AxisType.Explicit,) * 2,
+    )
+    vocab_size = tensor_size * 8
+    logits = np.zeros((1, 1, vocab_size), dtype=np.float32)
+    logits[0, 0, vocab_size - 1] = 5.0
+    logits[0, 0, 1] = 4.5
+    logits = jax.device_put(logits, NamedSharding(mesh, P("data", None, "tensor")))
+    feedback_sharding = NamedSharding(mesh, P("data", None))
+
+    with jax.set_mesh(mesh):
+        selected = select_dflash_flashback_tokens(
+            logits,
+            jax.device_put(np.array([[1]], dtype=np.int32), feedback_sharding),
+            jax.device_put(np.array([[0.0]], dtype=np.float32), feedback_sharding),
+            jax.device_put(np.array([[True]], dtype=np.bool_), feedback_sharding),
+            bonus=1.0,
+            target_margin_weight=1.0,
+            position_decay=0.5,
+        )
+
+    assert selected.sharding.spec == P("data", None)
+    np.testing.assert_array_equal(np.asarray(selected), np.array([[1]], dtype=np.int32))
 
 
 def test_dflash_relay_round_trips_flashback_feedback():
