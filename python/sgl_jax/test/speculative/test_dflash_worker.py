@@ -242,6 +242,7 @@ def test_record_ngram_stats_separates_candidate_match_from_chain_acceptance():
         _ngram_stats_selected=0,
         _ngram_stats_selected_accepted=0,
         _ngram_stats_candidate_matches=0,
+        _ngram_stats_match_len_hist=np.zeros((9,), dtype=np.int64),
         _ngram_stats_position_covered=np.zeros((2,), dtype=np.int64),
         _ngram_stats_position_selected=np.zeros((2,), dtype=np.int64),
         _ngram_stats_position_accepted=np.zeros((2,), dtype=np.int64),
@@ -263,6 +264,10 @@ def test_record_ngram_stats_separates_candidate_match_from_chain_acceptance():
     assert worker._ngram_stats_selected == 3
     assert worker._ngram_stats_selected_accepted == 1
     assert worker._ngram_stats_candidate_matches == 3
+    np.testing.assert_array_equal(
+        worker._ngram_stats_match_len_hist,
+        np.array([0, 0, 0, 1, 1, 0, 0, 0, 0], dtype=np.int64),
+    )
 
 
 def test_verify_write_cache_loc_selects_valid_half_per_dp_rank():

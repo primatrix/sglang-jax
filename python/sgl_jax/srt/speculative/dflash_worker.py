@@ -120,6 +120,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self._ngram_stats_selected = 0
         self._ngram_stats_selected_accepted = 0
         self._ngram_stats_candidate_matches = 0
+        self._ngram_stats_match_len_hist = np.zeros(
+            (int(server_args.dflash_ngram_max_match) + 1,), dtype=np.int64
+        )
         self._ngram_stats_position_covered = np.zeros(
             (self.block_size - 1,), dtype=np.int64
         )
@@ -497,6 +500,15 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self._ngram_stats_selected += int(selected_mask.sum())
         self._ngram_stats_selected_accepted += int(selected_accepted.sum())
         self._ngram_stats_candidate_matches += int(candidate_matches.sum())
+        clipped_match_lens = np.clip(
+            match_lens,
+            0,
+            len(self._ngram_stats_match_len_hist) - 1,
+        )
+        self._ngram_stats_match_len_hist += np.bincount(
+            clipped_match_lens,
+            minlength=len(self._ngram_stats_match_len_hist),
+        )
         self._ngram_stats_position_covered += valid_mask.sum(axis=0, dtype=np.int64)
         self._ngram_stats_position_selected += selected_mask.sum(axis=0, dtype=np.int64)
         self._ngram_stats_position_accepted += selected_accepted.sum(axis=0, dtype=np.int64)
@@ -509,8 +521,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         logger.info(
             "[DFLASH-NGRAM] batches=%d rounds=%d covered_rounds=%d "
             "coverage_rate=%.6f selected_rate=%.6f selected_accept_rate=%.6f "
-            "candidate_match_rate=%.6f position_covered=%s position_selected=%s "
-            "position_accepted=%s",
+            "candidate_match_rate=%.6f match_len_hist=%s position_covered=%s "
+            "position_selected=%s position_accepted=%s",
             self._ngram_stats_batches,
             self._ngram_stats_rounds,
             self._ngram_stats_covered_rounds,
@@ -518,6 +530,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             self._ngram_stats_selected / covered,
             self._ngram_stats_selected_accepted / selected,
             self._ngram_stats_candidate_matches / covered,
+            self._ngram_stats_match_len_hist.tolist(),
             self._ngram_stats_position_covered.tolist(),
             self._ngram_stats_position_selected.tolist(),
             self._ngram_stats_position_accepted.tolist(),
