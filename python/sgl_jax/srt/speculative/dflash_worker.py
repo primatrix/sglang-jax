@@ -155,6 +155,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self.block_size = self.draft_block_size + int(self.enable_anchor)
         self.speculative_verify_token_num = self.block_size
         self._ngram_enabled = bool(server_args.enable_dflash_ngram)
+        self._ngram_max_rerank_positions = int(
+            server_args.dflash_ngram_max_rerank_positions
+        )
         self._feedback_shadow_enabled = bool(server_args.enable_dflash_feedback_shadow)
         self._ngram_stats_batches = 0
         self._ngram_stats_rounds = 0
@@ -335,6 +338,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             "Initialized DFLASH worker: draft_block_size=%d, verify_block_size=%d, "
             "enable_anchor=%s, mask_token_id=%d, "
             "draft_layers=%d, ngram=%s, feedback_shadow=%s, flashback=%s, "
+            "ngram_max_rerank_positions=%d, "
             "flashback_bonus=%.3f, "
             "flashback_target_margin_weight=%.3f, flashback_position_decay=%.3f, "
             "page_indices_pool_capacity=%d, "
@@ -347,6 +351,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             self._ngram_enabled,
             self._feedback_shadow_enabled,
             self._flashback_enabled,
+            self._ngram_max_rerank_positions,
             self._flashback_bonus,
             self._flashback_target_margin_weight,
             self._flashback_position_decay,
@@ -1652,6 +1657,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             ngram_enabled: bool,
             flashback_enabled: bool,
             feedback_shadow_enabled: bool,
+            ngram_max_rerank_positions: int,
             dp_size: int,
         ):
             target_prefix_lens = forward_batch.seq_lens
@@ -1773,6 +1779,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                     ngram_token_ids,
                     ngram_bonus,
                     ngram_valid_mask,
+                    max_rerank_positions=ngram_max_rerank_positions,
                 )
             else:
                 draft_next = jnp.argmax(logits, axis=-1).astype(jnp.int32)
@@ -1832,6 +1839,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             ngram_enabled=self._ngram_enabled,
             flashback_enabled=self._flashback_enabled,
             feedback_shadow_enabled=self._feedback_shadow_enabled,
+            ngram_max_rerank_positions=self._ngram_max_rerank_positions,
         )
 
     def _run_jit_draft_block(self, plan: DraftForwardPlan):

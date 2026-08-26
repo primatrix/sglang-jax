@@ -198,6 +198,8 @@ def test_dflash_server_args_parses_ngram_controls(monkeypatch):
             "1.5",
             "--dflash-ngram-position-decay",
             "0.75",
+            "--dflash-ngram-max-rerank-positions",
+            "1",
             "--grammar-backend",
             "none",
         ]
@@ -207,6 +209,7 @@ def test_dflash_server_args_parses_ngram_controls(monkeypatch):
     assert args.enable_dflash_ngram
     assert args.dflash_ngram_bonus == 1.5
     assert args.dflash_ngram_position_decay == 0.75
+    assert args.dflash_ngram_max_rerank_positions == 1
 
 
 def test_dflash_ngram_requires_non_overlap():

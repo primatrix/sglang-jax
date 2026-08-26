@@ -386,6 +386,8 @@ def select_dflash_ngram_tokens(
     ngram_token_ids: jax.Array,
     ngram_bonus: jax.Array,
     ngram_valid_mask: jax.Array,
+    *,
+    max_rerank_positions: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     """Margin-gated sparse N-gram reranking with a fixed candidate shape."""
     expected = draft_logits.shape[:-1]
@@ -406,6 +408,9 @@ def select_dflash_ngram_tokens(
         & (ngram_bonus > 0)
         & ((base_scores - ngram_scores) <= ngram_bonus.astype(base_scores.dtype))
     )
+    if max_rerank_positions > 0:
+        selection_rank = jnp.cumsum(selected.astype(jnp.int32), axis=-1)
+        selected &= selection_rank <= int(max_rerank_positions)
     return jnp.where(selected, ngram_token_ids, base_token_ids).astype(jnp.int32), selected
 
 

@@ -153,6 +153,27 @@ def test_select_dflash_ngram_tokens_only_overrides_within_margin():
     np.testing.assert_array_equal(np.asarray(selected), np.array([[True, False]]))
 
 
+def test_select_dflash_ngram_tokens_limits_reranks_to_earliest_positions():
+    logits = jnp.array(
+        [[[0.0, 4.0, 3.8], [0.0, 4.0, 3.7], [0.0, 4.0, 3.6]]],
+        dtype=jnp.float32,
+    )
+    token_ids = jnp.array([[2, 2, 2]], dtype=jnp.int32)
+    bonus = jnp.full((1, 3), 0.5, dtype=jnp.float32)
+    valid = jnp.ones((1, 3), dtype=jnp.bool_)
+
+    selected_tokens, selected = select_dflash_ngram_tokens(
+        logits,
+        token_ids,
+        bonus,
+        valid,
+        max_rerank_positions=1,
+    )
+
+    np.testing.assert_array_equal(np.asarray(selected_tokens), np.array([[2, 1, 1]]))
+    np.testing.assert_array_equal(np.asarray(selected), np.array([[True, False, False]]))
+
+
 def test_dflash_verify_input_pytree_round_trip():
     vi = DFlashVerifyInput(
         draft_token=jnp.arange(8, dtype=jnp.int32),

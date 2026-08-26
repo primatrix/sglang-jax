@@ -215,6 +215,7 @@ class ServerArgs:
     dflash_ngram_prompt_weight: float = 0.7
     dflash_ngram_output_weight: float = 1.0
     dflash_ngram_position_decay: float = 0.8
+    dflash_ngram_max_rerank_positions: int = 0
     enable_dflash_flashback: bool = False
     dflash_flashback_bonus: float = 1.0
     dflash_flashback_target_margin_weight: float = 1.0
@@ -1596,6 +1597,12 @@ class ServerArgs:
             default=ServerArgs.dflash_ngram_position_decay,
         )
         parser.add_argument(
+            "--dflash-ngram-max-rerank-positions",
+            type=int,
+            default=ServerArgs.dflash_ngram_max_rerank_positions,
+            help="Maximum N-gram replacements per fixed block; 0 keeps all eligible positions.",
+        )
+        parser.add_argument(
             "--enable-dflash-flashback",
             action="store_true",
             default=ServerArgs.enable_dflash_flashback,
@@ -2076,6 +2083,10 @@ class ServerArgs:
                     raise ValueError("--dflash-ngram-output-weight must be >= 0.")
                 if not 0 < self.dflash_ngram_position_decay <= 1:
                     raise ValueError("--dflash-ngram-position-decay must be in (0, 1].")
+                if self.dflash_ngram_max_rerank_positions < 0:
+                    raise ValueError(
+                        "--dflash-ngram-max-rerank-positions must be >= 0."
+                    )
         else:
             if self.enable_dflash_anchor:
                 raise ValueError("--enable-dflash-anchor requires --speculative-algorithm DFLASH.")
