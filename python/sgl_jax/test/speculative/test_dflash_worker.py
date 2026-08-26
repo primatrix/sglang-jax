@@ -55,6 +55,19 @@ def _feedback_worker(block_size: int):
             for source in _DFLASH_FEEDBACK_ALL_SOURCES
             if source != "target_correction"
         },
+        _feedback_first_rejection_stats={
+            source: {
+                metric: np.zeros((len(_DFLASH_MARGIN_THRESHOLDS) + 1,), dtype=np.int64)
+                for metric in (
+                    "valid",
+                    "alternative",
+                    "candidate_target",
+                    "base_target",
+                )
+            }
+            for source in _DFLASH_FEEDBACK_ALL_SOURCES
+            if source != "target_correction"
+        },
         _feedback_condition_stats={
             source: {
                 metric: np.zeros((block_size + 1, width), dtype=np.int64)
@@ -448,6 +461,12 @@ def test_feedback_shadow_separates_reuse_novel_target_and_accepted_chain():
     assert worker._feedback_margin_stats["ngram_len3plus"]["target_match"][0] == 1
     assert worker._feedback_margin_stats["ngram_len3plus"]["alternative"][0] == 1
     assert worker._feedback_margin_stats["ngram_len3plus"]["base_target"][0] == 1
+    assert worker._feedback_first_rejection_stats["ngram_len1"]["valid"][0] == 1
+    assert worker._feedback_first_rejection_stats["ngram_len1"]["alternative"][0] == 1
+    assert worker._feedback_first_rejection_stats["ngram_len1"]["candidate_target"][0] == 1
+    assert worker._feedback_first_rejection_stats["ngram_len1"]["base_target"][0] == 0
+    assert worker._feedback_first_rejection_stats["ngram_len3plus"]["valid"][0] == 1
+    assert worker._feedback_first_rejection_stats["ngram_len3plus"]["alternative"][0] == 0
     assert worker._feedback_condition_stats["rejected_draft"]["valid"][3].sum() == 3
     assert worker._feedback_oracle_rejected_rounds == 2
     assert worker._feedback_oracle_repair_rounds == 2

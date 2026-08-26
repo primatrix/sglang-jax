@@ -198,6 +198,19 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             for source in _DFLASH_FEEDBACK_ALL_SOURCES
             if source != "target_correction"
         }
+        self._feedback_first_rejection_stats = {
+            source: {
+                metric: np.zeros((margin_bin_count,), dtype=np.int64)
+                for metric in (
+                    "valid",
+                    "alternative",
+                    "candidate_target",
+                    "base_target",
+                )
+            }
+            for source in _DFLASH_FEEDBACK_ALL_SOURCES
+            if source != "target_correction"
+        }
         self._feedback_condition_stats = {
             source: {
                 metric: np.zeros(
@@ -779,6 +792,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 "agree_all_three": (ngram_ids, all_three, 2),
             }
         )
+        current_rejection = (accept_lens > 0) & (accept_lens <= proposal_width)
+        current_rejection_position = np.clip(accept_lens - 1, 0, proposal_width - 1)
+        rows = np.arange(accept_lens.shape[0], dtype=np.int32)
 
         self._feedback_shadow_batches += 1
         self._feedback_shadow_rounds += int(selector.size)
@@ -803,6 +819,18 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                     right=True,
                 )
                 margin_stats = self._feedback_margin_stats[source]
+                first_stats = self._feedback_first_rejection_stats[source]
+                first_valid = current_rejection & valid[rows, current_rejection_position]
+                first_alternative = first_valid & ~draft_reuse[
+                    rows, current_rejection_position
+                ]
+                first_candidate_target = first_alternative & target_match[
+                    rows, current_rejection_position
+                ]
+                first_base_target = first_alternative & base_target[
+                    rows, current_rejection_position
+                ]
+                first_margin_bins = margin_bins[rows, current_rejection_position]
                 for bin_index in range(len(_DFLASH_MARGIN_THRESHOLDS) + 1):
                     in_bin = valid & (margin_bins == bin_index)
                     margin_stats["valid"][bin_index] += int(in_bin.sum())
@@ -817,6 +845,17 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                     )
                     margin_stats["base_target"][bin_index] += int(
                         (in_bin & ~draft_reuse & base_target).sum()
+                    )
+                    first_in_bin = first_valid & (first_margin_bins == bin_index)
+                    first_stats["valid"][bin_index] += int(first_in_bin.sum())
+                    first_stats["alternative"][bin_index] += int(
+                        (first_in_bin & first_alternative).sum()
+                    )
+                    first_stats["candidate_target"][bin_index] += int(
+                        (first_in_bin & first_candidate_target).sum()
+                    )
+                    first_stats["base_target"][bin_index] += int(
+                        (first_in_bin & first_base_target).sum()
                     )
 
             if source in self._feedback_condition_stats:
@@ -837,9 +876,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self._feedback_oracle_local_novel += int(
             (algorithm_target.any(axis=-1) & (draft != target)).sum()
         )
-        current_rejection = (accept_lens > 0) & (accept_lens <= proposal_width)
-        current_rejection_position = np.clip(accept_lens - 1, 0, proposal_width - 1)
-        rows = np.arange(accept_lens.shape[0], dtype=np.int32)
         repair_matches = algorithm_target[rows, current_rejection_position]
         repair_matches &= current_rejection[:, None]
         repairable = repair_matches.any(axis=1)
@@ -942,6 +978,22 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 counters["target_match"].tolist(),
                 counters["target_novel"].tolist(),
                 counters["base_target"].tolist(),
+            )
+        for source, counters in self._feedback_first_rejection_stats.items():
+            logger.info(
+                "[DFLASH-FEEDBACK-FIRST-REJECTION] batches=%d source=%s "
+                "thresholds=%s valid=%s alternative=%s candidate_target=%s "
+                "base_target=%s net=%s",
+                self._feedback_shadow_batches,
+                source,
+                _DFLASH_MARGIN_THRESHOLDS.tolist(),
+                counters["valid"].tolist(),
+                counters["alternative"].tolist(),
+                counters["candidate_target"].tolist(),
+                counters["base_target"].tolist(),
+                (
+                    counters["candidate_target"] - counters["base_target"]
+                ).tolist(),
             )
         for source, counters in self._feedback_condition_stats.items():
             logger.info(
