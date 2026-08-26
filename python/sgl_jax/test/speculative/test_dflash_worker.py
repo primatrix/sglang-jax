@@ -232,6 +232,48 @@ def test_ngram_metadata_scatter_preserves_dp_padded_slot_alignment():
     assert padded.enable_ngram
 
 
+def test_ngram_metadata_concat_preserves_rows_and_runtime_config():
+    ranks = [
+        DFlashDraftInput(
+            verified_id=np.array([10], dtype=np.int32),
+            ctx_lens=np.array([1], dtype=np.int32),
+            draft_seq_lens=np.array([11], dtype=np.int32),
+            ngram_token_ids=np.array([[101, 102]], dtype=np.int32),
+            ngram_bonus=np.array([[1.0, 0.5]], dtype=np.float32),
+            ngram_valid_mask=np.ones((1, 2), dtype=np.bool_),
+            ngram_match_lens=np.array([3], dtype=np.int32),
+            enable_ngram=True,
+            ngram_min_match=2,
+            ngram_max_match=6,
+            ngram_base_bonus=1.5,
+            block_size=3,
+        ),
+        DFlashDraftInput(
+            verified_id=np.array([20], dtype=np.int32),
+            ctx_lens=np.array([2], dtype=np.int32),
+            draft_seq_lens=np.array([12], dtype=np.int32),
+            ngram_token_ids=np.array([[201, 202]], dtype=np.int32),
+            ngram_bonus=np.array([[2.0, 1.0]], dtype=np.float32),
+            ngram_valid_mask=np.ones((1, 2), dtype=np.bool_),
+            ngram_match_lens=np.array([4], dtype=np.int32),
+            enable_ngram=True,
+            ngram_min_match=2,
+            ngram_max_match=6,
+            ngram_base_bonus=1.5,
+            block_size=3,
+        ),
+    ]
+
+    flat = ScheduleBatch._concat_spec_info_per_rank(ranks)
+
+    np.testing.assert_array_equal(flat.ngram_token_ids, np.array([[101, 102], [201, 202]]))
+    np.testing.assert_array_equal(flat.ngram_match_lens, np.array([3, 4]))
+    assert flat.enable_ngram
+    assert flat.ngram_min_match == 2
+    assert flat.ngram_max_match == 6
+    assert flat.ngram_base_bonus == 1.5
+
+
 def test_record_ngram_stats_separates_candidate_match_from_chain_acceptance():
     worker = _bare_worker(
         block_size=3,

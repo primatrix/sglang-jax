@@ -3055,6 +3055,10 @@ class ScheduleBatch:
                 "flashback_token_ids",
                 "flashback_target_margins",
                 "flashback_valid_mask",
+                "ngram_token_ids",
+                "ngram_bonus",
+                "ngram_valid_mask",
+                "ngram_match_lens",
             )
         else:
             has_future_indices = any(
@@ -3080,7 +3084,17 @@ class ScheduleBatch:
 
         kwargs = {} if is_dflash else {"capture_hidden_mode": nonempty[0].capture_hidden_mode}
         if is_dflash:
-            kwargs["block_size"] = nonempty[0].block_size
+            for field in (
+                "enable_ngram",
+                "ngram_min_match",
+                "ngram_max_match",
+                "ngram_base_bonus",
+                "ngram_prompt_weight",
+                "ngram_output_weight",
+                "ngram_position_decay",
+                "block_size",
+            ):
+                kwargs[field] = getattr(nonempty[0], field)
         for f in per_req_fields:
             vals = [getattr(s, f, None) for s in nonempty]
             if (
@@ -3095,6 +3109,10 @@ class ScheduleBatch:
                     "flashback_token_ids",
                     "flashback_target_margins",
                     "flashback_valid_mask",
+                    "ngram_token_ids",
+                    "ngram_bonus",
+                    "ngram_valid_mask",
+                    "ngram_match_lens",
                 )
             ):
                 kwargs[f] = None
