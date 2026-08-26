@@ -44,7 +44,13 @@ def _feedback_worker(block_size: int):
         _feedback_margin_stats={
             source: {
                 metric: np.zeros((len(_DFLASH_MARGIN_THRESHOLDS) + 1,), dtype=np.int64)
-                for metric in ("valid", "alternative", "target_match", "target_novel")
+                for metric in (
+                    "valid",
+                    "alternative",
+                    "target_match",
+                    "target_novel",
+                    "base_target",
+                )
             }
             for source in _DFLASH_FEEDBACK_ALL_SOURCES
             if source != "target_correction"
@@ -441,6 +447,7 @@ def test_feedback_shadow_separates_reuse_novel_target_and_accepted_chain():
     assert worker._feedback_shadow_stats["agree_stale_ngram"]["target_match"].sum() == 2
     assert worker._feedback_margin_stats["ngram_len3plus"]["target_match"][0] == 1
     assert worker._feedback_margin_stats["ngram_len3plus"]["alternative"][0] == 1
+    assert worker._feedback_margin_stats["ngram_len3plus"]["base_target"][0] == 1
     assert worker._feedback_condition_stats["rejected_draft"]["valid"][3].sum() == 3
     assert worker._feedback_oracle_rejected_rounds == 2
     assert worker._feedback_oracle_repair_rounds == 2

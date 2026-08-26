@@ -187,7 +187,13 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self._feedback_margin_stats = {
             source: {
                 metric: np.zeros((margin_bin_count,), dtype=np.int64)
-                for metric in ("valid", "alternative", "target_match", "target_novel")
+                for metric in (
+                    "valid",
+                    "alternative",
+                    "target_match",
+                    "target_novel",
+                    "base_target",
+                )
             }
             for source in _DFLASH_FEEDBACK_ALL_SOURCES
             if source != "target_correction"
@@ -705,6 +711,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         )[selector, :proposal_width]
         offsets = np.arange(proposal_width, dtype=np.int32)[None, :]
         accepted_mask = offsets < np.maximum(accept_lens[:, None] - 1, 0)
+        base_target = draft == target
 
         rejection_valid = np.asarray(rejection_valid_mask, dtype=np.bool_).reshape(padded_bs)[
             selector, None
@@ -807,6 +814,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                     )
                     margin_stats["target_novel"][bin_index] += int(
                         (in_bin & target_novel).sum()
+                    )
+                    margin_stats["base_target"][bin_index] += int(
+                        (in_bin & ~draft_reuse & base_target).sum()
                     )
 
             if source in self._feedback_condition_stats:
@@ -923,7 +933,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         for source, counters in self._feedback_margin_stats.items():
             logger.info(
                 "[DFLASH-FEEDBACK-MARGIN] batches=%d source=%s thresholds=%s "
-                "valid=%s alternative=%s target=%s novel=%s",
+                "valid=%s alternative=%s target=%s novel=%s base_target=%s",
                 self._feedback_shadow_batches,
                 source,
                 _DFLASH_MARGIN_THRESHOLDS.tolist(),
@@ -931,6 +941,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 counters["alternative"].tolist(),
                 counters["target_match"].tolist(),
                 counters["target_novel"].tolist(),
+                counters["base_target"].tolist(),
             )
         for source, counters in self._feedback_condition_stats.items():
             logger.info(
