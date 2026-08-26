@@ -9,6 +9,7 @@ from sgl_jax.srt.speculative.dflash_info import (
     build_dflash_draft_block,
     build_dflash_flashback_feedback,
     dflash_greedy_verify,
+    select_dflash_proposal_hidden,
     select_dflash_flashback_tokens,
 )
 from sgl_jax.srt.speculative.overlap_utils import (
@@ -21,6 +22,18 @@ from sgl_jax.srt.speculative.relay_buffer import (
     update_dflash_relay_buffers,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
+
+def test_select_dflash_proposal_hidden_anchor_layout_uses_every_row():
+    hidden = jax.numpy.arange(2 * 7 * 3).reshape(2, 7, 3)
+
+    anchored = select_dflash_proposal_hidden(hidden, enable_anchor=True)
+    legacy = select_dflash_proposal_hidden(hidden, enable_anchor=False)
+
+    np.testing.assert_array_equal(np.asarray(anchored), np.asarray(hidden))
+    np.testing.assert_array_equal(np.asarray(legacy), np.asarray(hidden[:, 1:, :]))
+    assert anchored.shape[1] == 7
+    assert legacy.shape[1] == 6
 
 
 def test_dflash_verify_input_pytree_round_trip():
@@ -58,6 +71,24 @@ def test_dflash_greedy_verify_from_logits():
     np.testing.assert_array_equal(np.asarray(accept_len_draft), np.array([3, 1], dtype=np.int32))
     np.testing.assert_array_equal(np.asarray(new_verified_id), np.array([99, 77], dtype=np.int32))
     np.testing.assert_array_equal(np.asarray(next_token_ids_flat).reshape(2, 4), target_predict)
+
+
+def test_dflash_anchor_block7_can_accept_seven_proposals_plus_bonus():
+    # Official block7 semantics verify [anchor + 7 proposals], hence width 8.
+    draft_token = jnp.arange(10, 18, dtype=jnp.int32)
+    logits = jnp.full((8, 32), -100.0)
+    logits = logits.at[jnp.arange(7), jnp.arange(11, 18)].set(100.0)
+    logits = logits.at[7, 18].set(100.0)
+
+    accept_lens, _, bonus, accept_len_draft = dflash_greedy_verify(
+        draft_token,
+        logits,
+        draft_token_num=8,
+    )
+
+    np.testing.assert_array_equal(np.asarray(accept_len_draft), np.array([7]))
+    np.testing.assert_array_equal(np.asarray(accept_lens), np.array([8]))
+    np.testing.assert_array_equal(np.asarray(bonus), np.array([18]))
 
 
 def test_dflash_greedy_verify_keeps_outputs_data_sharded():

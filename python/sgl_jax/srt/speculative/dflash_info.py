@@ -73,6 +73,23 @@ def build_dflash_draft_block(
     return block_ids, positions.astype(np.int32)
 
 
+def select_dflash_proposal_hidden(
+    draft_hidden: jax.Array,
+    *,
+    enable_anchor: bool,
+) -> jax.Array:
+    """Select hidden rows that predict DFlash proposals.
+
+    DeepSpec's anchor layout feeds ``[anchor, mask, ...]`` but every hidden
+    row predicts a future proposal, so a block_size-N draft produces N
+    proposals.  The legacy layout treats row zero as the already-verified
+    token and therefore produces only N-1 proposals.
+    """
+    if draft_hidden.ndim < 2:
+        raise ValueError(f"DFLASH draft hidden must have a block axis, got {draft_hidden.shape}.")
+    return draft_hidden if enable_anchor else draft_hidden[:, 1:, ...]
+
+
 # TODO: Share greedy chain verification through common speculative helpers.
 def dflash_greedy_verify(
     draft_token: jax.Array,

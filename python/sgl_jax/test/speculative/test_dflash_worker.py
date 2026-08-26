@@ -81,6 +81,29 @@ def test_verify_bucket_template_is_cached_by_active_slots():
     np.testing.assert_array_equal(np.asarray(first.distribution), np.array([0, 2, 2]))
 
 
+def test_verify_bucket_template_distinguishes_draft_and_anchor_verify_widths():
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()).reshape(1, 1), ("data", "tensor"))
+    worker = _bare_worker(
+        block_size=8,
+        draft_block_size=7,
+        mesh=mesh,
+        _verify_bucket_templates={},
+    )
+    mwb = SimpleNamespace(
+        dp_size=1,
+        per_dp_bs_size=2,
+        real_bs=2,
+        logits_indices_selector=np.array([0, 1], dtype=np.int32),
+    )
+
+    draft = worker._get_verify_bucket_template(mwb, bs=2, token_num=7)
+    target = worker._get_verify_bucket_template(mwb, bs=2, token_num=8)
+
+    np.testing.assert_array_equal(draft.extend_seq_lens, np.array([7, 7]))
+    np.testing.assert_array_equal(target.extend_seq_lens, np.array([8, 8]))
+    assert draft is not target
+
+
 def test_build_page_indices_preserves_dp_rank_sections():
     req_to_token = np.arange(200, dtype=np.int32).reshape(10, 20)
     w = _bare_worker(
@@ -184,6 +207,21 @@ def test_verify_write_cache_loc_selects_valid_half_per_dp_rank():
         w._verify_write_cache_loc(batch),
         np.arange(1, 9, dtype=np.int32),
     )
+
+
+def test_verify_write_cache_loc_can_keep_anchor_verify_width():
+    w = _bare_worker(block_size=8)
+    batch = SimpleNamespace(
+        dp_size=1,
+        per_dp_bs_size=2,
+        out_cache_loc=np.concatenate(
+            [np.arange(1, 17, dtype=np.int32), np.full(16, -1, dtype=np.int32)]
+        ),
+    )
+
+    selected = w._verify_write_cache_loc(batch, token_num=8)
+
+    np.testing.assert_array_equal(selected, np.arange(1, 17, dtype=np.int32))
 
 
 def test_trim_draft_state_drops_stale_tail():

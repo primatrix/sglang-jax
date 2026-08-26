@@ -206,6 +206,7 @@ class ServerArgs:
     speculative_num_draft_tokens: int = 4
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
+    enable_dflash_anchor: bool = False
     enable_dflash_flashback: bool = False
     dflash_flashback_bonus: float = 1.0
     dflash_flashback_target_margin_weight: float = 1.0
@@ -1530,6 +1531,15 @@ class ServerArgs:
             default=ServerArgs.speculative_num_draft_tokens,
         )
         parser.add_argument(
+            "--enable-dflash-anchor",
+            action="store_true",
+            default=ServerArgs.enable_dflash_anchor,
+            help=(
+                "Interpret DFlash block_size as proposal count: use the first "
+                "draft input as an anchor and verify anchor + block_size tokens."
+            ),
+        )
+        parser.add_argument(
             "--enable-dflash-flashback",
             action="store_true",
             default=ServerArgs.enable_dflash_flashback,
@@ -1976,8 +1986,13 @@ class ServerArgs:
                     raise ValueError("--dflash-flashback-target-margin-weight must be >= 0.")
                 if not 0 < self.dflash_flashback_position_decay <= 1:
                     raise ValueError("--dflash-flashback-position-decay must be in (0, 1].")
-        elif self.enable_dflash_flashback:
-            raise ValueError("--enable-dflash-flashback requires --speculative-algorithm DFLASH.")
+        else:
+            if self.enable_dflash_anchor:
+                raise ValueError("--enable-dflash-anchor requires --speculative-algorithm DFLASH.")
+            if self.enable_dflash_flashback:
+                raise ValueError(
+                    "--enable-dflash-flashback requires --speculative-algorithm DFLASH."
+                )
 
     def check_lora_server_args(self):
         """Validate and normalize LoRA-related server arguments."""

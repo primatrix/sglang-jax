@@ -2653,7 +2653,11 @@ class Scheduler(
                 precompile_cache_loc_paddings,
                 self.page_size,
                 self.server_args.enable_static_lora,
-                draft_token_num=self.draft_worker.speculative_num_draft_tokens,
+                draft_token_num=getattr(
+                    self.draft_worker,
+                    "speculative_verify_token_num",
+                    self.draft_worker.speculative_num_draft_tokens,
+                ),
             )
 
         use_spec_decode_overlap = can_use_spec_decode_overlap(

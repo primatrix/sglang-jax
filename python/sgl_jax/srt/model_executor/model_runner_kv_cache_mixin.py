@@ -793,6 +793,11 @@ class ModelRunnerKVCacheMixin:
                     * self.server_args.speculative_num_steps
                     * self.server_args.speculative_eagle_topk
                     + max_num_reqs * self.server_args.speculative_num_draft_tokens
+                    + max_num_reqs
+                    * int(
+                        self.server_args.speculative_algorithm == "DFLASH"
+                        and self.server_args.enable_dflash_anchor
+                    )
                     + 100
                 )
                 self.max_total_num_tokens += spec_headroom

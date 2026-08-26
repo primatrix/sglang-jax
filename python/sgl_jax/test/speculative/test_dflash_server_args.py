@@ -140,7 +140,42 @@ def test_dflash_server_args_parses_flashback_controls(monkeypatch):
     assert args.dflash_flashback_position_decay == 0.6
 
 
+def test_dflash_server_args_parses_anchor_layout(monkeypatch):
+    monkeypatch.setattr(
+        dflash_util,
+        "parse_dflash_draft_config",
+        lambda *args, **kwargs: SimpleNamespace(block_size=7),
+    )
+    args = ServerArgs.from_cli(
+        [
+            "--model-path",
+            "target",
+            "--speculative-algorithm",
+            "DFLASH",
+            "--speculative-draft-model-path",
+            "draft",
+            "--speculative-num-steps",
+            "1",
+            "--speculative-eagle-topk",
+            "1",
+            "--enable-dflash-anchor",
+            "--grammar-backend",
+            "none",
+        ]
+    )
+    args.check_server_args()
+
+    assert args.enable_dflash_anchor
+    assert args.speculative_num_draft_tokens == 7
+
+
 def test_flashback_requires_dflash():
     args = ServerArgs(model_path="target", enable_dflash_flashback=True)
+    with pytest.raises(ValueError, match="requires --speculative-algorithm DFLASH"):
+        args.check_server_args()
+
+
+def test_anchor_requires_dflash():
+    args = ServerArgs(model_path="target", enable_dflash_anchor=True)
     with pytest.raises(ValueError, match="requires --speculative-algorithm DFLASH"):
         args.check_server_args()
