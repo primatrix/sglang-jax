@@ -1623,6 +1623,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 "vocab_size",
                 "use_relay_state",
                 "ngram_enabled",
+                "ngram_max_rerank_positions",
                 "flashback_enabled",
                 "feedback_shadow_enabled",
                 "dp_size",
