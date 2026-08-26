@@ -8,7 +8,9 @@ from sgl_jax.srt.speculative.dflash_info import (
     DFlashVerifyInput,
     build_dflash_draft_block,
     build_dflash_flashback_feedback,
+    build_dflash_ngram_continuation,
     dflash_greedy_verify,
+    select_dflash_ngram_tokens,
     select_dflash_proposal_hidden,
     select_dflash_flashback_tokens,
 )
@@ -34,6 +36,64 @@ def test_select_dflash_proposal_hidden_anchor_layout_uses_every_row():
     np.testing.assert_array_equal(np.asarray(legacy), np.asarray(hidden[:, 1:, :]))
     assert anchored.shape[1] == 7
     assert legacy.shape[1] == 6
+
+
+def test_build_dflash_ngram_continuation_uses_longest_suffix_match():
+    token_ids = [1, 2, 3, 9, 8, 7, 1, 2, 3]
+
+    continuation, bonuses, valid, match_len = build_dflash_ngram_continuation(
+        token_ids,
+        prompt_len=len(token_ids),
+        proposal_width=7,
+        min_match=3,
+        max_match=8,
+        bonus=2.0,
+        prompt_weight=0.5,
+        output_weight=1.0,
+        position_decay=0.8,
+    )
+
+    assert match_len == 3
+    np.testing.assert_array_equal(continuation[:6], np.array([9, 8, 7, 1, 2, 3]))
+    np.testing.assert_array_equal(valid, np.array([True, True, True, True, True, True, False]))
+    np.testing.assert_allclose(bonuses[:3], np.array([1.0, 0.8, 0.64]), rtol=1e-6)
+
+
+def test_build_dflash_ngram_continuation_weights_verified_output_more_than_prompt():
+    token_ids = [50, 60, 1, 2, 3, 9, 1, 2, 3]
+
+    _, bonuses, valid, match_len = build_dflash_ngram_continuation(
+        token_ids,
+        prompt_len=2,
+        proposal_width=4,
+        min_match=3,
+        max_match=8,
+        bonus=1.5,
+        prompt_weight=0.7,
+        output_weight=1.0,
+        position_decay=0.5,
+    )
+
+    assert match_len == 3
+    assert valid[0]
+    assert bonuses[0] == 1.5
+
+
+def test_select_dflash_ngram_tokens_only_overrides_within_margin():
+    logits = jnp.array(
+        [
+            [[0.0, 4.0, 3.5, 0.0], [0.0, 4.0, 1.0, 0.0]],
+        ],
+        dtype=jnp.float32,
+    )
+    token_ids = jnp.array([[2, 2]], dtype=jnp.int32)
+    bonus = jnp.array([[0.6, 0.6]], dtype=jnp.float32)
+    valid = jnp.array([[True, True]])
+
+    selected_tokens, selected = select_dflash_ngram_tokens(logits, token_ids, bonus, valid)
+
+    np.testing.assert_array_equal(np.asarray(selected_tokens), np.array([[2, 1]]))
+    np.testing.assert_array_equal(np.asarray(selected), np.array([[True, False]]))
 
 
 def test_dflash_verify_input_pytree_round_trip():

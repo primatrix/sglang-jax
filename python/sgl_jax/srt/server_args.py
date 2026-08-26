@@ -207,6 +207,13 @@ class ServerArgs:
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     enable_dflash_anchor: bool = False
+    enable_dflash_ngram: bool = False
+    dflash_ngram_min_match: int = 3
+    dflash_ngram_max_match: int = 8
+    dflash_ngram_bonus: float = 1.0
+    dflash_ngram_prompt_weight: float = 0.7
+    dflash_ngram_output_weight: float = 1.0
+    dflash_ngram_position_decay: float = 0.8
     enable_dflash_flashback: bool = False
     dflash_flashback_bonus: float = 1.0
     dflash_flashback_target_margin_weight: float = 1.0
@@ -1540,6 +1547,45 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
+            "--enable-dflash-ngram",
+            action="store_true",
+            default=ServerArgs.enable_dflash_ngram,
+            help=(
+                "Enable training-free longest-match N-gram continuation reranking "
+                "for fixed-width DFlash proposals."
+            ),
+        )
+        parser.add_argument(
+            "--dflash-ngram-min-match",
+            type=int,
+            default=ServerArgs.dflash_ngram_min_match,
+        )
+        parser.add_argument(
+            "--dflash-ngram-max-match",
+            type=int,
+            default=ServerArgs.dflash_ngram_max_match,
+        )
+        parser.add_argument(
+            "--dflash-ngram-bonus",
+            type=float,
+            default=ServerArgs.dflash_ngram_bonus,
+        )
+        parser.add_argument(
+            "--dflash-ngram-prompt-weight",
+            type=float,
+            default=ServerArgs.dflash_ngram_prompt_weight,
+        )
+        parser.add_argument(
+            "--dflash-ngram-output-weight",
+            type=float,
+            default=ServerArgs.dflash_ngram_output_weight,
+        )
+        parser.add_argument(
+            "--dflash-ngram-position-decay",
+            type=float,
+            default=ServerArgs.dflash_ngram_position_decay,
+        )
+        parser.add_argument(
             "--enable-dflash-flashback",
             action="store_true",
             default=ServerArgs.enable_dflash_flashback,
@@ -1986,9 +2032,34 @@ class ServerArgs:
                     raise ValueError("--dflash-flashback-target-margin-weight must be >= 0.")
                 if not 0 < self.dflash_flashback_position_decay <= 1:
                     raise ValueError("--dflash-flashback-position-decay must be in (0, 1].")
+            if self.enable_dflash_ngram:
+                if not self.disable_overlap_schedule:
+                    raise ValueError(
+                        "--enable-dflash-ngram currently requires --disable-overlap-schedule."
+                    )
+                if self.enable_dflash_flashback:
+                    raise ValueError(
+                        "--enable-dflash-ngram and --enable-dflash-flashback are mutually exclusive."
+                    )
+                if self.dflash_ngram_min_match < 1:
+                    raise ValueError("--dflash-ngram-min-match must be >= 1.")
+                if self.dflash_ngram_max_match < self.dflash_ngram_min_match:
+                    raise ValueError(
+                        "--dflash-ngram-max-match must be >= --dflash-ngram-min-match."
+                    )
+                if self.dflash_ngram_bonus <= 0:
+                    raise ValueError("--dflash-ngram-bonus must be > 0.")
+                if self.dflash_ngram_prompt_weight < 0:
+                    raise ValueError("--dflash-ngram-prompt-weight must be >= 0.")
+                if self.dflash_ngram_output_weight < 0:
+                    raise ValueError("--dflash-ngram-output-weight must be >= 0.")
+                if not 0 < self.dflash_ngram_position_decay <= 1:
+                    raise ValueError("--dflash-ngram-position-decay must be in (0, 1].")
         else:
             if self.enable_dflash_anchor:
                 raise ValueError("--enable-dflash-anchor requires --speculative-algorithm DFLASH.")
+            if self.enable_dflash_ngram:
+                raise ValueError("--enable-dflash-ngram requires --speculative-algorithm DFLASH.")
             if self.enable_dflash_flashback:
                 raise ValueError(
                     "--enable-dflash-flashback requires --speculative-algorithm DFLASH."

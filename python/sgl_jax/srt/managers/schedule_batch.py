@@ -2738,6 +2738,7 @@ class ScheduleBatch:
                 return out
 
             relay_state = flat.future_indices is not None
+            ngram_rows = None if relay_state else flat._ngram_rows(len(selector))
             return DFlashDraftInput(
                 verified_id=(
                     None if relay_state else _scatter_dflash_1d(flat.verified_id, "verified_id")
@@ -2791,6 +2792,45 @@ class ScheduleBatch:
                         dtype=np.bool_,
                     )
                 ),
+                ngram_token_ids=(
+                    None
+                    if relay_state
+                    else _scatter_dflash_feedback(
+                        ngram_rows[0],
+                        "ngram_token_ids",
+                        dtype=np.int32,
+                    )
+                ),
+                ngram_bonus=(
+                    None
+                    if relay_state
+                    else _scatter_dflash_feedback(
+                        ngram_rows[1],
+                        "ngram_bonus",
+                        dtype=np.float32,
+                    )
+                ),
+                ngram_valid_mask=(
+                    None
+                    if relay_state
+                    else _scatter_dflash_feedback(
+                        ngram_rows[2],
+                        "ngram_valid_mask",
+                        dtype=np.bool_,
+                    )
+                ),
+                ngram_match_lens=(
+                    None
+                    if relay_state
+                    else _scatter_dflash_1d(ngram_rows[3], "ngram_match_lens")
+                ),
+                enable_ngram=flat.enable_ngram,
+                ngram_min_match=flat.ngram_min_match,
+                ngram_max_match=flat.ngram_max_match,
+                ngram_base_bonus=flat.ngram_base_bonus,
+                ngram_prompt_weight=flat.ngram_prompt_weight,
+                ngram_output_weight=flat.ngram_output_weight,
+                ngram_position_decay=flat.ngram_position_decay,
                 block_size=flat.block_size,
             )
 
@@ -2889,6 +2929,25 @@ class ScheduleBatch:
                         flashback_valid_mask=(
                             None if relay_state else _slice(flat.flashback_valid_mask, offset, end)
                         ),
+                        ngram_token_ids=(
+                            None if relay_state else _slice(flat.ngram_token_ids, offset, end)
+                        ),
+                        ngram_bonus=(
+                            None if relay_state else _slice(flat.ngram_bonus, offset, end)
+                        ),
+                        ngram_valid_mask=(
+                            None if relay_state else _slice(flat.ngram_valid_mask, offset, end)
+                        ),
+                        ngram_match_lens=(
+                            None if relay_state else _slice(flat.ngram_match_lens, offset, end)
+                        ),
+                        enable_ngram=flat.enable_ngram,
+                        ngram_min_match=flat.ngram_min_match,
+                        ngram_max_match=flat.ngram_max_match,
+                        ngram_base_bonus=flat.ngram_base_bonus,
+                        ngram_prompt_weight=flat.ngram_prompt_weight,
+                        ngram_output_weight=flat.ngram_output_weight,
+                        ngram_position_decay=flat.ngram_position_decay,
                         block_size=flat.block_size,
                     )
                 )

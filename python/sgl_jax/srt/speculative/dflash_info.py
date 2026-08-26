@@ -90,6 +90,94 @@ def select_dflash_proposal_hidden(
     return draft_hidden if enable_anchor else draft_hidden[:, 1:, ...]
 
 
+def build_dflash_ngram_continuation(
+    token_ids: list[int] | np.ndarray,
+    *,
+    prompt_len: int,
+    proposal_width: int,
+    min_match: int,
+    max_match: int,
+    bonus: float,
+    prompt_weight: float,
+    output_weight: float,
+    position_decay: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """Build one fixed-width continuation from the longest suffix match.
+
+    The lookup uses only tokens that precede the current suffix, so the
+    returned continuation is historical evidence from the prompt or already
+    target-verified output.  Among equal-length matches, prefer the occurrence
+    with the longest available continuation and then the most recent one.
+    """
+    tokens = np.asarray(token_ids, dtype=np.int32)
+    width = int(proposal_width)
+    continuation = np.zeros((width,), dtype=np.int32)
+    bonuses = np.zeros((width,), dtype=np.float32)
+    valid = np.zeros((width,), dtype=np.bool_)
+    if width <= 0 or tokens.ndim != 1:
+        return continuation, bonuses, valid, 0
+
+    upper = min(int(max_match), len(tokens) - 1)
+    lower = max(1, int(min_match))
+    for match_len in range(upper, lower - 1, -1):
+        suffix = tokens[-match_len:]
+        matches = []
+        for start in range(0, len(tokens) - match_len):
+            if np.array_equal(tokens[start : start + match_len], suffix):
+                continuation_start = start + match_len
+                available = min(width, len(tokens) - continuation_start)
+                if available > 0:
+                    matches.append((available, start, continuation_start))
+        if not matches:
+            continue
+
+        available, _, continuation_start = max(matches)
+        continuation[:available] = tokens[
+            continuation_start : continuation_start + available
+        ]
+        valid[:available] = True
+        source_weight = (
+            float(prompt_weight)
+            if continuation_start < int(prompt_len)
+            else float(output_weight)
+        )
+        offsets = np.arange(available, dtype=np.float32)
+        bonuses[:available] = (
+            float(bonus) * source_weight * np.power(float(position_decay), offsets)
+        )
+        return continuation, bonuses, valid, match_len
+
+    return continuation, bonuses, valid, 0
+
+
+def select_dflash_ngram_tokens(
+    draft_logits: jax.Array,
+    ngram_token_ids: jax.Array,
+    ngram_bonus: jax.Array,
+    ngram_valid_mask: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Margin-gated sparse N-gram reranking with a fixed candidate shape."""
+    expected = draft_logits.shape[:-1]
+    for name, value in (
+        ("ngram_token_ids", ngram_token_ids),
+        ("ngram_bonus", ngram_bonus),
+        ("ngram_valid_mask", ngram_valid_mask),
+    ):
+        if value.shape != expected:
+            raise ValueError(f"{name} must have shape {expected}, got {value.shape}.")
+
+    base_token_ids = jnp.argmax(draft_logits, axis=-1).astype(jnp.int32)
+    base_scores = _gather_dflash_vocab_scores(draft_logits, base_token_ids)
+    ngram_scores = _gather_dflash_vocab_scores(draft_logits, ngram_token_ids)
+    selected = (
+        ngram_valid_mask
+        & (ngram_token_ids != base_token_ids)
+        & (ngram_bonus > 0)
+        & ((base_scores - ngram_scores) <= ngram_bonus.astype(base_scores.dtype))
+    )
+    return jnp.where(selected, ngram_token_ids, base_token_ids).astype(jnp.int32), selected
+
+
 # TODO: Share greedy chain verification through common speculative helpers.
 def dflash_greedy_verify(
     draft_token: jax.Array,
@@ -316,6 +404,17 @@ class DFlashDraftInput:
     flashback_token_ids: jax.Array | np.ndarray = None
     flashback_target_margins: jax.Array | np.ndarray = None
     flashback_valid_mask: jax.Array | np.ndarray = None
+    ngram_token_ids: jax.Array | np.ndarray = None
+    ngram_bonus: jax.Array | np.ndarray = None
+    ngram_valid_mask: jax.Array | np.ndarray = None
+    ngram_match_lens: jax.Array | np.ndarray = None
+    enable_ngram: bool = False
+    ngram_min_match: int = 3
+    ngram_max_match: int = 8
+    ngram_base_bonus: float = 1.0
+    ngram_prompt_weight: float = 0.7
+    ngram_output_weight: float = 1.0
+    ngram_position_decay: float = 0.8
     block_size: int = 16
     capture_hidden_mode = CaptureHiddenMode.FULL
 
@@ -328,8 +427,15 @@ class DFlashDraftInput:
             "reservation_base_lens",
             "future_indices",
             "flashback_token_ids",
+            "ngram_token_ids",
+            "ngram_match_lens",
         )
-        fields = int_fields + ("flashback_target_margins", "flashback_valid_mask")
+        fields = int_fields + (
+            "flashback_target_margins",
+            "flashback_valid_mask",
+            "ngram_bonus",
+            "ngram_valid_mask",
+        )
         for f in fields:
             v = getattr(self, f, None)
             if v is not None and hasattr(v, "copy_to_host_async"):
@@ -344,6 +450,10 @@ class DFlashDraftInput:
             )
         if self.flashback_valid_mask is not None:
             self.flashback_valid_mask = np.asarray(self.flashback_valid_mask, dtype=np.bool_)
+        if self.ngram_bonus is not None:
+            self.ngram_bonus = np.asarray(self.ngram_bonus, dtype=np.float32)
+        if self.ngram_valid_mask is not None:
+            self.ngram_valid_mask = np.asarray(self.ngram_valid_mask, dtype=np.bool_)
 
     def new_tokens_required_next_decode(self, requests, page_size: int) -> int:
         total = 0
@@ -385,6 +495,42 @@ class DFlashDraftInput:
                 raise ValueError(f"DFLASH {name} must have shape {expected}, got {value.shape}.")
         return token_ids, target_margins, valid_mask
 
+    def _ngram_rows(
+        self, bs: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        width = int(self.block_size) - 1
+        expected = (int(bs), width)
+        token_ids = self.ngram_token_ids
+        bonuses = self.ngram_bonus
+        valid_mask = self.ngram_valid_mask
+        match_lens = self.ngram_match_lens
+        if token_ids is None and bonuses is None and valid_mask is None and match_lens is None:
+            return (
+                np.zeros(expected, dtype=np.int32),
+                np.zeros(expected, dtype=np.float32),
+                np.zeros(expected, dtype=np.bool_),
+                np.zeros((int(bs),), dtype=np.int32),
+            )
+        if token_ids is None or bonuses is None or valid_mask is None or match_lens is None:
+            raise ValueError("DFLASH N-gram state must carry ids, bonus, validity, and match length.")
+        token_ids = np.asarray(token_ids, dtype=np.int32)
+        bonuses = np.asarray(bonuses, dtype=np.float32)
+        valid_mask = np.asarray(valid_mask, dtype=np.bool_)
+        match_lens = np.asarray(match_lens, dtype=np.int32)
+        for name, value in (
+            ("ngram_token_ids", token_ids),
+            ("ngram_bonus", bonuses),
+            ("ngram_valid_mask", valid_mask),
+        ):
+            if value.shape != expected:
+                raise ValueError(f"DFLASH {name} must have shape {expected}, got {value.shape}.")
+        if match_lens.shape != (int(bs),):
+            raise ValueError(
+                "DFLASH ngram_match_lens must have shape "
+                f"({int(bs)},), got {match_lens.shape}."
+            )
+        return token_ids, bonuses, valid_mask, match_lens
+
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True) -> None:
         self._ensure_host()
         new_indices = np.asarray(new_indices, dtype=np.int32)
@@ -421,6 +567,10 @@ class DFlashDraftInput:
             "flashback_token_ids",
             "flashback_target_margins",
             "flashback_valid_mask",
+            "ngram_token_ids",
+            "ngram_bonus",
+            "ngram_valid_mask",
+            "ngram_match_lens",
         ):
             value = getattr(self, field, None)
             if value is not None:
@@ -445,6 +595,33 @@ class DFlashDraftInput:
         reserve_tokens = block_size * (2 if schedule_batch.enable_overlap else 1)
 
         self._align_dp_state_to_reqs(schedule_batch)
+        if self.enable_ngram:
+            reqs = [req for info in schedule_batch.reqs_info for req in (info.reqs or [])]
+            rows = [
+                build_dflash_ngram_continuation(
+                    req.origin_input_ids + req.output_ids,
+                    prompt_len=len(req.origin_input_ids),
+                    proposal_width=int(self.block_size) - 1,
+                    min_match=self.ngram_min_match,
+                    max_match=self.ngram_max_match,
+                    bonus=self.ngram_base_bonus,
+                    prompt_weight=self.ngram_prompt_weight,
+                    output_weight=self.ngram_output_weight,
+                    position_decay=self.ngram_position_decay,
+                )
+                for req in reqs
+            ]
+            if rows:
+                self.ngram_token_ids = np.stack([row[0] for row in rows], axis=0)
+                self.ngram_bonus = np.stack([row[1] for row in rows], axis=0)
+                self.ngram_valid_mask = np.stack([row[2] for row in rows], axis=0)
+                self.ngram_match_lens = np.asarray([row[3] for row in rows], dtype=np.int32)
+            else:
+                width = int(self.block_size) - 1
+                self.ngram_token_ids = np.zeros((0, width), dtype=np.int32)
+                self.ngram_bonus = np.zeros((0, width), dtype=np.float32)
+                self.ngram_valid_mask = np.zeros((0, width), dtype=np.bool_)
+                self.ngram_match_lens = np.zeros((0,), dtype=np.int32)
         allocate_lens = []
         reservation_base_lens = []
 
@@ -545,6 +722,13 @@ class DFlashDraftInput:
                     ctx_lens=np.empty((0,), dtype=np.int32),
                     draft_seq_lens=np.empty((0,), dtype=np.int32),
                     block_size=self.block_size,
+                    enable_ngram=self.enable_ngram,
+                    ngram_min_match=self.ngram_min_match,
+                    ngram_max_match=self.ngram_max_match,
+                    ngram_base_bonus=self.ngram_base_bonus,
+                    ngram_prompt_weight=self.ngram_prompt_weight,
+                    ngram_output_weight=self.ngram_output_weight,
+                    ngram_position_decay=self.ngram_position_decay,
                 )
             committed_lens = np.asarray([req.kv_committed_len for req in reqs], dtype=np.int32)
             rank_state._align_to_reqs(reqs, committed_lens)
@@ -558,6 +742,10 @@ class DFlashDraftInput:
             self.flashback_token_ids = None
             self.flashback_target_margins = None
             self.flashback_valid_mask = None
+            self.ngram_token_ids = None
+            self.ngram_bonus = None
+            self.ngram_valid_mask = None
+            self.ngram_match_lens = None
             return
 
         self.verified_id = np.concatenate(
@@ -573,6 +761,11 @@ class DFlashDraftInput:
         self.flashback_token_ids = np.concatenate([rows[0] for rows in feedback], axis=0)
         self.flashback_target_margins = np.concatenate([rows[1] for rows in feedback], axis=0)
         self.flashback_valid_mask = np.concatenate([rows[2] for rows in feedback], axis=0)
+        ngram = [state._ngram_rows(len(state.draft_seq_lens)) for state in rank_states]
+        self.ngram_token_ids = np.concatenate([rows[0] for rows in ngram], axis=0)
+        self.ngram_bonus = np.concatenate([rows[1] for rows in ngram], axis=0)
+        self.ngram_valid_mask = np.concatenate([rows[2] for rows in ngram], axis=0)
+        self.ngram_match_lens = np.concatenate([rows[3] for rows in ngram], axis=0)
 
         hidden_parts = [state.target_hidden for state in rank_states]
         if all(hidden is None for hidden in hidden_parts):
@@ -594,6 +787,7 @@ class DFlashDraftInput:
         ctx_lens = np.asarray(self.ctx_lens, dtype=np.int32)
         draft_seq_lens = np.asarray(self.draft_seq_lens, dtype=np.int32)
         feedback_ids, feedback_margins, feedback_valid = self._flashback_rows(state_bs)
+        ngram_ids, ngram_bonus, ngram_valid, ngram_match_lens = self._ngram_rows(state_bs)
         if state_bs > bs:
             self.verified_id = verified_id[:bs]
             self.ctx_lens = ctx_lens[:bs]
@@ -601,6 +795,10 @@ class DFlashDraftInput:
             self.flashback_token_ids = feedback_ids[:bs]
             self.flashback_target_margins = feedback_margins[:bs]
             self.flashback_valid_mask = feedback_valid[:bs]
+            self.ngram_token_ids = ngram_ids[:bs]
+            self.ngram_bonus = ngram_bonus[:bs]
+            self.ngram_valid_mask = ngram_valid[:bs]
+            self.ngram_match_lens = ngram_match_lens[:bs]
             return
 
         missing_reqs = reqs[state_bs:bs]
@@ -629,6 +827,18 @@ class DFlashDraftInput:
         self.flashback_valid_mask = np.concatenate(
             [feedback_valid, np.zeros((missing, width), dtype=np.bool_)], axis=0
         )
+        self.ngram_token_ids = np.concatenate(
+            [ngram_ids, np.zeros((missing, width), dtype=np.int32)], axis=0
+        )
+        self.ngram_bonus = np.concatenate(
+            [ngram_bonus, np.zeros((missing, width), dtype=np.float32)], axis=0
+        )
+        self.ngram_valid_mask = np.concatenate(
+            [ngram_valid, np.zeros((missing, width), dtype=np.bool_)], axis=0
+        )
+        self.ngram_match_lens = np.concatenate(
+            [ngram_match_lens, np.zeros((missing,), dtype=np.int32)], axis=0
+        )
 
     def merge_batch(self, other: DFlashDraftInput) -> None:
         self._ensure_host()
@@ -654,6 +864,10 @@ class DFlashDraftInput:
             self.flashback_token_ids = None
             self.flashback_target_margins = None
             self.flashback_valid_mask = None
+            self.ngram_token_ids = None
+            self.ngram_bonus = None
+            self.ngram_valid_mask = None
+            self.ngram_match_lens = None
             return
 
         self.verified_id = np.concatenate(
@@ -668,6 +882,12 @@ class DFlashDraftInput:
             [self_feedback[1], other_feedback[1]], axis=0
         )
         self.flashback_valid_mask = np.concatenate([self_feedback[2], other_feedback[2]], axis=0)
+        self_ngram = self._ngram_rows(len(self.verified_id) - len(other.verified_id))
+        other_ngram = other._ngram_rows(len(other.verified_id))
+        self.ngram_token_ids = np.concatenate([self_ngram[0], other_ngram[0]], axis=0)
+        self.ngram_bonus = np.concatenate([self_ngram[1], other_ngram[1]], axis=0)
+        self.ngram_valid_mask = np.concatenate([self_ngram[2], other_ngram[2]], axis=0)
+        self.ngram_match_lens = np.concatenate([self_ngram[3], other_ngram[3]], axis=0)
         for field in ("allocate_lens", "reservation_base_lens"):
             lhs = getattr(self, field, None)
             rhs = getattr(other, field, None)

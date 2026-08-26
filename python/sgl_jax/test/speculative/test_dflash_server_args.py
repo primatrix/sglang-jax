@@ -169,6 +169,56 @@ def test_dflash_server_args_parses_anchor_layout(monkeypatch):
     assert args.speculative_num_draft_tokens == 7
 
 
+def test_dflash_server_args_parses_ngram_controls(monkeypatch):
+    monkeypatch.setattr(
+        dflash_util,
+        "parse_dflash_draft_config",
+        lambda *args, **kwargs: SimpleNamespace(block_size=7),
+    )
+    args = ServerArgs.from_cli(
+        [
+            "--model-path",
+            "target",
+            "--speculative-algorithm",
+            "DFLASH",
+            "--speculative-draft-model-path",
+            "draft",
+            "--speculative-num-steps",
+            "1",
+            "--speculative-eagle-topk",
+            "1",
+            "--enable-dflash-anchor",
+            "--enable-dflash-ngram",
+            "--disable-overlap-schedule",
+            "--dflash-ngram-min-match",
+            "3",
+            "--dflash-ngram-max-match",
+            "8",
+            "--dflash-ngram-bonus",
+            "1.5",
+            "--dflash-ngram-position-decay",
+            "0.75",
+            "--grammar-backend",
+            "none",
+        ]
+    )
+    args.check_server_args()
+
+    assert args.enable_dflash_ngram
+    assert args.dflash_ngram_bonus == 1.5
+    assert args.dflash_ngram_position_decay == 0.75
+
+
+def test_dflash_ngram_requires_non_overlap():
+    args = _dflash_args(
+        speculative_num_draft_tokens=7,
+        enable_dflash_ngram=True,
+        disable_overlap_schedule=False,
+    )
+    with pytest.raises(ValueError, match="requires --disable-overlap-schedule"):
+        args.check_server_args()
+
+
 def test_flashback_requires_dflash():
     args = ServerArgs(model_path="target", enable_dflash_flashback=True)
     with pytest.raises(ValueError, match="requires --speculative-algorithm DFLASH"):

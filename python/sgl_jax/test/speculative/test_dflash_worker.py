@@ -4,6 +4,7 @@ import jax
 import numpy as np
 
 from sgl_jax.srt.layers.attention.flashattention_backend import _pad_page_indices
+from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
 from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput, _mask_draft_kv_writes
 from sgl_jax.srt.speculative.dflash_worker import DFlashWorker
 
@@ -190,6 +191,78 @@ def test_unpad_draft_state_removes_dp_padding_but_keeps_new_seq_lens():
     np.testing.assert_array_equal(di.ctx_lens, np.array([1, 2, 3], dtype=np.int32))
     np.testing.assert_array_equal(di.draft_seq_lens, np.array([5, 6, 7], dtype=np.int32))
     np.testing.assert_array_equal(di.new_seq_lens, np.array([6, 8, 0, 10, 0, 0]))
+
+
+def test_ngram_metadata_scatter_preserves_dp_padded_slot_alignment():
+    flat = DFlashDraftInput(
+        verified_id=np.array([10, 20, 30], dtype=np.int32),
+        ctx_lens=np.array([1, 2, 3], dtype=np.int32),
+        draft_seq_lens=np.array([11, 12, 13], dtype=np.int32),
+        ngram_token_ids=np.array(
+            [[101, 102], [201, 202], [301, 302]], dtype=np.int32
+        ),
+        ngram_bonus=np.array([[1.0, 0.5], [2.0, 1.0], [3.0, 1.5]], dtype=np.float32),
+        ngram_valid_mask=np.ones((3, 2), dtype=np.bool_),
+        ngram_match_lens=np.array([3, 4, 5], dtype=np.int32),
+        enable_ngram=True,
+        block_size=3,
+    )
+
+    padded = ScheduleBatch._scatter_spec_info_to_dp_slots(
+        flat,
+        selector=np.array([0, 1, 3], dtype=np.int32),
+        total_bs=6,
+    )
+
+    np.testing.assert_array_equal(
+        padded.ngram_token_ids,
+        np.array(
+            [
+                [101, 102],
+                [201, 202],
+                [0, 0],
+                [301, 302],
+                [0, 0],
+                [0, 0],
+            ],
+            dtype=np.int32,
+        ),
+    )
+    np.testing.assert_array_equal(padded.ngram_match_lens, np.array([3, 4, 0, 5, 0, 0]))
+    assert padded.enable_ngram
+
+
+def test_record_ngram_stats_separates_candidate_match_from_chain_acceptance():
+    worker = _bare_worker(
+        block_size=3,
+        _ngram_stats_batches=0,
+        _ngram_stats_rounds=0,
+        _ngram_stats_covered_rounds=0,
+        _ngram_stats_covered=0,
+        _ngram_stats_selected=0,
+        _ngram_stats_selected_accepted=0,
+        _ngram_stats_candidate_matches=0,
+        _ngram_stats_position_covered=np.zeros((2,), dtype=np.int64),
+        _ngram_stats_position_selected=np.zeros((2,), dtype=np.int64),
+        _ngram_stats_position_accepted=np.zeros((2,), dtype=np.int64),
+    )
+
+    worker._record_ngram_stats(
+        accept_lens=np.array([2, 0, 1], dtype=np.int32),
+        selected_mask=np.array([[True, True], [False, False], [True, False]]),
+        candidate_ids=np.array([[7, 8], [0, 0], [9, 0]], dtype=np.int32),
+        valid_mask=np.array([[True, True], [False, False], [True, False]]),
+        match_lens=np.array([3, 0, 4], dtype=np.int32),
+        target_predict_flat=np.array([[7, 8, 0], [0, 0, 0], [9, 0, 0]], dtype=np.int32),
+        selector=np.array([0, 2], dtype=np.int32),
+    )
+
+    assert worker._ngram_stats_rounds == 2
+    assert worker._ngram_stats_covered_rounds == 2
+    assert worker._ngram_stats_covered == 3
+    assert worker._ngram_stats_selected == 3
+    assert worker._ngram_stats_selected_accepted == 1
+    assert worker._ngram_stats_candidate_matches == 3
 
 
 def test_verify_write_cache_loc_selects_valid_half_per_dp_rank():
