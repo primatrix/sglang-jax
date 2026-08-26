@@ -10,6 +10,7 @@ from sgl_jax.srt.speculative.dflash_worker import (
     _DFLASH_CONDITION_SOURCES,
     _DFLASH_FEEDBACK_ALL_SOURCES,
     _DFLASH_MARGIN_THRESHOLDS,
+    _DFLASH_PREDICTOR_POLICIES,
     DFlashWorker,
 )
 
@@ -85,6 +86,23 @@ def _feedback_worker(block_size: int):
             for source in ("rejected_draft", "stale_suffix", "historical_ngram")
         },
         _feedback_oracle_agreement_repairs=0,
+        _feedback_predictor_stats={
+            policy: {
+                "predictions": 0,
+                "rejected_predictions": 0,
+                "position_hits": 0,
+                "candidate_target": 0,
+                "repairs": 0,
+                "harms": 0,
+                "neutral": 0,
+                "accept_gain": 0,
+                "accept_loss": 0,
+                "accept_delta": 0,
+                "selected_position": np.zeros((width,), dtype=np.int64),
+                "hit_position": np.zeros((width,), dtype=np.int64),
+            }
+            for policy in _DFLASH_PREDICTOR_POLICIES
+        },
     )
 
 
@@ -432,7 +450,7 @@ def test_feedback_shadow_separates_reuse_novel_target_and_accepted_chain():
         ngram_valid_mask=np.array([[True, True, True], [False, False, False], [True, True, False]]),
         ngram_match_lens=np.array([3, 0, 1], dtype=np.int32),
         previous_accept_lens=np.array([3, 0, 1], dtype=np.int32),
-        candidate_margins=np.zeros((3, 3, 3), dtype=np.float32),
+        candidate_margins=np.zeros((3, 3, 4), dtype=np.float32),
         selector=np.array([0, 2], dtype=np.int32),
     )
 
@@ -476,6 +494,45 @@ def test_feedback_shadow_separates_reuse_novel_target_and_accepted_chain():
         "stale_suffix": 1,
         "historical_ngram": 1,
     }
+    for counters in worker._feedback_predictor_stats.values():
+        assert counters["predictions"] == 1
+        assert counters["position_hits"] == 0
+        assert counters["repairs"] == 0
+        assert counters["harms"] == 1
+        assert counters["accept_delta"] == -1
+
+
+def test_feedback_predictor_compares_single_position_policies_counterfactually():
+    worker = _feedback_worker(block_size=4)
+    draft = np.array([[10, 20, 30]], dtype=np.int32)
+    target = np.array([[10, 99, 30]], dtype=np.int32)
+    ngram = np.array([[11, 99, 31]], dtype=np.int32)
+    margins = np.zeros((1, 3, 4), dtype=np.float32)
+    margins[..., 2] = np.array([[0.1, 0.4, 0.2]], dtype=np.float32)
+    margins[..., 3] = np.array([[1.0, 0.1, 0.5]], dtype=np.float32)
+
+    worker._record_feedback_predictor_stats(
+        draft=draft,
+        target=target,
+        ngram_ids=ngram,
+        ngram_valid=np.ones((1, 3), dtype=np.bool_),
+        match_lens=np.array([3], dtype=np.int32),
+        previous_accept_lens=np.array([2], dtype=np.int32),
+        candidate_margins=margins,
+    )
+
+    for policy in ("draft_uncertainty", "combined_margin", "lagged_accept"):
+        counters = worker._feedback_predictor_stats[policy]
+        assert counters["position_hits"] == 1
+        assert counters["repairs"] == 1
+        assert counters["accept_gain"] == 2
+        assert counters["accept_delta"] == 2
+    for policy in ("earliest", "ngram_competition"):
+        counters = worker._feedback_predictor_stats[policy]
+        assert counters["position_hits"] == 0
+        assert counters["harms"] == 1
+        assert counters["accept_loss"] == 1
+        assert counters["accept_delta"] == -1
 
 
 def test_verify_write_cache_loc_selects_valid_half_per_dp_rank():

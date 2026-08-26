@@ -65,6 +65,14 @@ _DFLASH_FEEDBACK_ALL_SOURCES = (
 )
 _DFLASH_MARGIN_THRESHOLDS = np.asarray((0.25, 0.5, 1.0, 2.0, 4.0, 8.0), dtype=np.float32)
 _DFLASH_CONDITION_SOURCES = ("rejected_draft", "stale_suffix", "ngram_len3plus")
+_DFLASH_PREDICTOR_POLICIES = (
+    "earliest",
+    "draft_uncertainty",
+    "ngram_competition",
+    "combined_margin",
+    "lagged_accept",
+)
+_DFLASH_PREDICTOR_NGRAM_MARGIN = 0.5
 
 
 @dataclass(frozen=True)
@@ -233,6 +241,25 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             source: 0 for source in ("rejected_draft", "stale_suffix", "historical_ngram")
         }
         self._feedback_oracle_agreement_repairs = 0
+        self._feedback_predictor_stats = {
+            policy: {
+                "predictions": 0,
+                "rejected_predictions": 0,
+                "position_hits": 0,
+                "candidate_target": 0,
+                "repairs": 0,
+                "harms": 0,
+                "neutral": 0,
+                "accept_gain": 0,
+                "accept_loss": 0,
+                "accept_delta": 0,
+                "selected_position": np.zeros(
+                    (self.block_size - 1,), dtype=np.int64
+                ),
+                "hit_position": np.zeros((self.block_size - 1,), dtype=np.int64),
+            }
+            for policy in _DFLASH_PREDICTOR_POLICIES
+        }
         self._flashback_enabled = bool(server_args.enable_dflash_flashback)
         self._flashback_bonus = float(server_args.dflash_flashback_bonus)
         self._flashback_target_margin_weight = float(
@@ -758,7 +785,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             padded_bs
         )[selector]
         candidate_margins = np.asarray(candidate_margins, dtype=np.float32).reshape(
-            padded_bs, proposal_width, 3
+            padded_bs, proposal_width, 4
         )[selector]
         sources = {
             "rejected_draft": (rejected_ids, scalar_valid, 0),
@@ -791,6 +818,15 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 "agree_stale_ngram": (ngram_ids, stale_ngram, 2),
                 "agree_all_three": (ngram_ids, all_three, 2),
             }
+        )
+        self._record_feedback_predictor_stats(
+            draft=draft,
+            target=target,
+            ngram_ids=ngram_ids,
+            ngram_valid=ngram_valid,
+            match_lens=match_lens,
+            previous_accept_lens=previous_accept_lens,
+            candidate_margins=candidate_margins,
         )
         current_rejection = (accept_lens > 0) & (accept_lens <= proposal_width)
         current_rejection_position = np.clip(accept_lens - 1, 0, proposal_width - 1)
@@ -1004,6 +1040,120 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 source,
                 counters["valid"].tolist(),
                 counters["target_match"].tolist(),
+            )
+        for policy, counters in self._feedback_predictor_stats.items():
+            predictions = max(1, counters["predictions"])
+            rejected_predictions = max(1, counters["rejected_predictions"])
+            logger.info(
+                "[DFLASH-FEEDBACK-PREDICTOR] batches=%d policy=%s "
+                "predictions=%d rejected_predictions=%d hit_at1=%.6f "
+                "candidate_precision=%.6f repairs=%d harms=%d neutral=%d "
+                "repair_rate=%.6f harm_rate=%.6f accept_gain=%d accept_loss=%d "
+                "accept_delta=%d selected_position=%s hit_position=%s",
+                self._feedback_shadow_batches,
+                policy,
+                counters["predictions"],
+                counters["rejected_predictions"],
+                counters["position_hits"] / rejected_predictions,
+                counters["candidate_target"] / predictions,
+                counters["repairs"],
+                counters["harms"],
+                counters["neutral"],
+                counters["repairs"] / predictions,
+                counters["harms"] / predictions,
+                counters["accept_gain"],
+                counters["accept_loss"],
+                counters["accept_delta"],
+                counters["selected_position"].tolist(),
+                counters["hit_position"].tolist(),
+            )
+
+    def _record_feedback_predictor_stats(
+        self,
+        *,
+        draft: np.ndarray,
+        target: np.ndarray,
+        ngram_ids: np.ndarray,
+        ngram_valid: np.ndarray,
+        match_lens: np.ndarray,
+        previous_accept_lens: np.ndarray,
+        candidate_margins: np.ndarray,
+    ) -> None:
+        """Evaluate single-position N-gram policies without changing proposals."""
+        batch_size, proposal_width = draft.shape
+        positions = np.arange(proposal_width, dtype=np.float32)[None, :]
+        ngram_margins = candidate_margins[..., 2]
+        draft_margins = candidate_margins[..., 3]
+        eligible = (
+            ngram_valid
+            & (match_lens[:, None] >= 3)
+            & (ngram_ids != draft)
+            & (ngram_margins <= _DFLASH_PREDICTOR_NGRAM_MARGIN)
+        )
+        combined_margins = draft_margins + ngram_margins
+        lagged_positions = np.clip(
+            previous_accept_lens.astype(np.float32) - 1,
+            0,
+            proposal_width - 1,
+        )[:, None]
+        policy_scores = {
+            "earliest": np.broadcast_to(positions, draft.shape),
+            "draft_uncertainty": draft_margins,
+            "ngram_competition": ngram_margins,
+            "combined_margin": combined_margins,
+            "lagged_accept": (
+                np.abs(positions - lagged_positions) * 1024.0 + combined_margins
+            ),
+        }
+
+        base_matches = draft == target
+        base_prefix = np.where(
+            base_matches.all(axis=1),
+            proposal_width,
+            np.argmax(~base_matches, axis=1),
+        )
+        rows = np.arange(batch_size, dtype=np.int32)
+        for policy, scores in policy_scores.items():
+            predicted = eligible.any(axis=1)
+            selected_position = np.argmin(
+                np.where(eligible, scores, np.inf), axis=1
+            ).astype(np.int32)
+            selected_candidate_target = predicted & (
+                ngram_ids[rows, selected_position]
+                == target[rows, selected_position]
+            )
+            modified_matches = base_matches.copy()
+            modified_matches[rows[predicted], selected_position[predicted]] = (
+                selected_candidate_target[predicted]
+            )
+            modified_prefix = np.where(
+                modified_matches.all(axis=1),
+                proposal_width,
+                np.argmax(~modified_matches, axis=1),
+            )
+            accept_delta = np.where(predicted, modified_prefix - base_prefix, 0)
+            rejected = base_prefix < proposal_width
+            position_hit = predicted & rejected & (selected_position == base_prefix)
+            repair = predicted & (accept_delta > 0)
+            harm = predicted & (accept_delta < 0)
+            neutral = predicted & (accept_delta == 0)
+
+            counters = self._feedback_predictor_stats[policy]
+            counters["predictions"] += int(predicted.sum())
+            counters["rejected_predictions"] += int((predicted & rejected).sum())
+            counters["position_hits"] += int(position_hit.sum())
+            counters["candidate_target"] += int(selected_candidate_target.sum())
+            counters["repairs"] += int(repair.sum())
+            counters["harms"] += int(harm.sum())
+            counters["neutral"] += int(neutral.sum())
+            counters["accept_gain"] += int(accept_delta[repair].sum())
+            counters["accept_loss"] += int(-accept_delta[harm].sum())
+            counters["accept_delta"] += int(accept_delta.sum())
+            counters["selected_position"] += np.bincount(
+                selected_position[predicted], minlength=proposal_width
+            )
+            counters["hit_position"] += np.bincount(
+                selected_position[position_hit], minlength=proposal_width
             )
 
     def forward_batch_speculative_prefill_overlap(self, model_worker_batch: ModelWorkerBatch):
@@ -1613,8 +1763,10 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             else:
                 draft_next = jnp.argmax(logits, axis=-1).astype(jnp.int32)
             if feedback_shadow_enabled:
-                base_token_ids = jnp.argmax(logits, axis=-1).astype(jnp.int32)
-                base_scores = _gather_dflash_vocab_scores(logits, base_token_ids)
+                top2_scores, top2_token_ids = jax.lax.top_k(logits, 2)
+                base_token_ids = top2_token_ids[..., 0].astype(jnp.int32)
+                base_scores = top2_scores[..., 0]
+                draft_confidence_margins = top2_scores[..., 0] - top2_scores[..., 1]
                 rejected_rows = jnp.broadcast_to(
                     rejected_draft_token_ids[:, None], base_token_ids.shape
                 )
@@ -1626,15 +1778,21 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                     ],
                     axis=-1,
                 )
-                candidate_margins = (base_scores[..., None] - candidate_scores).astype(
-                    jnp.float32
+                candidate_margins = jnp.concatenate(
+                    [
+                        base_scores[..., None] - candidate_scores,
+                        draft_confidence_margins[..., None],
+                    ],
+                    axis=-1,
+                ).astype(
+                    jnp.float32,
                 )
                 candidate_margins = jax.sharding.reshard(
                     candidate_margins, candidate_margin_sharding
                 )
             else:
                 candidate_margins = jax.sharding.reshard(
-                    jnp.zeros(logits.shape[:-1] + (3,), dtype=jnp.float32),
+                    jnp.zeros(logits.shape[:-1] + (4,), dtype=jnp.float32),
                     candidate_margin_sharding,
                 )
             seed = forward_batch.input_ids.reshape((-1, draft_block_size))[:, :1]
