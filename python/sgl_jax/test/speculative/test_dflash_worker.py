@@ -450,7 +450,7 @@ def test_feedback_shadow_separates_reuse_novel_target_and_accepted_chain():
         ngram_valid_mask=np.array([[True, True, True], [False, False, False], [True, True, False]]),
         ngram_match_lens=np.array([3, 0, 1], dtype=np.int32),
         previous_accept_lens=np.array([3, 0, 1], dtype=np.int32),
-        candidate_margins=np.zeros((3, 3, 4), dtype=np.float32),
+        candidate_margins=np.zeros((3, 3, 3), dtype=np.float32),
         selector=np.array([0, 2], dtype=np.int32),
     )
 
@@ -507,9 +507,9 @@ def test_feedback_predictor_compares_single_position_policies_counterfactually()
     draft = np.array([[10, 20, 30]], dtype=np.int32)
     target = np.array([[10, 99, 30]], dtype=np.int32)
     ngram = np.array([[11, 99, 31]], dtype=np.int32)
-    margins = np.zeros((1, 3, 4), dtype=np.float32)
+    margins = np.zeros((1, 3, 3), dtype=np.float32)
+    margins[..., 0] = np.array([[1.0, 0.1, 0.5]], dtype=np.float32)
     margins[..., 2] = np.array([[0.1, 0.4, 0.2]], dtype=np.float32)
-    margins[..., 3] = np.array([[1.0, 0.1, 0.5]], dtype=np.float32)
 
     worker._record_feedback_predictor_stats(
         draft=draft,
@@ -519,9 +519,12 @@ def test_feedback_predictor_compares_single_position_policies_counterfactually()
         match_lens=np.array([3], dtype=np.int32),
         previous_accept_lens=np.array([2], dtype=np.int32),
         candidate_margins=margins,
+        sparse_candidate_valid=np.array(
+            [[[True, False], [True, False], [True, False]]], dtype=np.bool_
+        ),
     )
 
-    for policy in ("draft_uncertainty", "combined_margin", "lagged_accept"):
+    for policy in ("feedback_uncertainty", "combined_margin", "lagged_accept"):
         counters = worker._feedback_predictor_stats[policy]
         assert counters["position_hits"] == 1
         assert counters["repairs"] == 1

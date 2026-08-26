@@ -67,7 +67,7 @@ _DFLASH_MARGIN_THRESHOLDS = np.asarray((0.25, 0.5, 1.0, 2.0, 4.0, 8.0), dtype=np
 _DFLASH_CONDITION_SOURCES = ("rejected_draft", "stale_suffix", "ngram_len3plus")
 _DFLASH_PREDICTOR_POLICIES = (
     "earliest",
-    "draft_uncertainty",
+    "feedback_uncertainty",
     "ngram_competition",
     "combined_margin",
     "lagged_accept",
@@ -785,7 +785,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             padded_bs
         )[selector]
         candidate_margins = np.asarray(candidate_margins, dtype=np.float32).reshape(
-            padded_bs, proposal_width, 4
+            padded_bs, proposal_width, 3
         )[selector]
         sources = {
             "rejected_draft": (rejected_ids, scalar_valid, 0),
@@ -827,6 +827,13 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             match_lens=match_lens,
             previous_accept_lens=previous_accept_lens,
             candidate_margins=candidate_margins,
+            sparse_candidate_valid=np.stack(
+                [
+                    scalar_valid & (rejected_ids != draft),
+                    stale_valid & (stale_ids != draft),
+                ],
+                axis=-1,
+            ),
         )
         current_rejection = (accept_lens > 0) & (accept_lens <= proposal_width)
         current_rejection_position = np.clip(accept_lens - 1, 0, proposal_width - 1)
@@ -1078,19 +1085,26 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         match_lens: np.ndarray,
         previous_accept_lens: np.ndarray,
         candidate_margins: np.ndarray,
+        sparse_candidate_valid: np.ndarray,
     ) -> None:
         """Evaluate single-position N-gram policies without changing proposals."""
         batch_size, proposal_width = draft.shape
         positions = np.arange(proposal_width, dtype=np.float32)[None, :]
         ngram_margins = candidate_margins[..., 2]
-        draft_margins = candidate_margins[..., 3]
+        sparse_margins = np.min(
+            np.where(sparse_candidate_valid, candidate_margins[..., :2], np.inf),
+            axis=-1,
+        )
+        sparse_margins = np.where(
+            np.isfinite(sparse_margins), sparse_margins, ngram_margins
+        )
         eligible = (
             ngram_valid
             & (match_lens[:, None] >= 3)
             & (ngram_ids != draft)
             & (ngram_margins <= _DFLASH_PREDICTOR_NGRAM_MARGIN)
         )
-        combined_margins = draft_margins + ngram_margins
+        combined_margins = sparse_margins + ngram_margins
         lagged_positions = np.clip(
             previous_accept_lens.astype(np.float32) - 1,
             0,
@@ -1098,7 +1112,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         )[:, None]
         policy_scores = {
             "earliest": np.broadcast_to(positions, draft.shape),
-            "draft_uncertainty": draft_margins,
+            "feedback_uncertainty": sparse_margins,
             "ngram_competition": ngram_margins,
             "combined_margin": combined_margins,
             "lagged_accept": (
@@ -1763,10 +1777,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             else:
                 draft_next = jnp.argmax(logits, axis=-1).astype(jnp.int32)
             if feedback_shadow_enabled:
-                top2_scores, top2_token_ids = jax.lax.top_k(logits, 2)
-                base_token_ids = top2_token_ids[..., 0].astype(jnp.int32)
-                base_scores = top2_scores[..., 0]
-                draft_confidence_margins = top2_scores[..., 0] - top2_scores[..., 1]
+                base_token_ids = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+                base_scores = _gather_dflash_vocab_scores(logits, base_token_ids)
                 rejected_rows = jnp.broadcast_to(
                     rejected_draft_token_ids[:, None], base_token_ids.shape
                 )
@@ -1778,21 +1790,15 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                     ],
                     axis=-1,
                 )
-                candidate_margins = jnp.concatenate(
-                    [
-                        base_scores[..., None] - candidate_scores,
-                        draft_confidence_margins[..., None],
-                    ],
-                    axis=-1,
-                ).astype(
-                    jnp.float32,
+                candidate_margins = (base_scores[..., None] - candidate_scores).astype(
+                    jnp.float32
                 )
                 candidate_margins = jax.sharding.reshard(
                     candidate_margins, candidate_margin_sharding
                 )
             else:
                 candidate_margins = jax.sharding.reshard(
-                    jnp.zeros(logits.shape[:-1] + (4,), dtype=jnp.float32),
+                    jnp.zeros(logits.shape[:-1] + (3,), dtype=jnp.float32),
                     candidate_margin_sharding,
                 )
             seed = forward_batch.input_ids.reshape((-1, draft_block_size))[:, :1]
