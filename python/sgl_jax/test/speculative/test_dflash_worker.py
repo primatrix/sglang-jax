@@ -6,7 +6,10 @@ import numpy as np
 from sgl_jax.srt.layers.attention.flashattention_backend import _pad_page_indices
 from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
 from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput, _mask_draft_kv_writes
-from sgl_jax.srt.speculative.dflash_worker import DFlashWorker
+from sgl_jax.srt.speculative.dflash_worker import (
+    _DFLASH_FEEDBACK_SHADOW_SOURCES,
+    DFlashWorker,
+)
 
 
 def _bare_worker(**attrs):
@@ -204,6 +207,8 @@ def test_ngram_metadata_scatter_preserves_dp_padded_slot_alignment():
         ngram_bonus=np.array([[1.0, 0.5], [2.0, 1.0], [3.0, 1.5]], dtype=np.float32),
         ngram_valid_mask=np.ones((3, 2), dtype=np.bool_),
         ngram_match_lens=np.array([3, 4, 5], dtype=np.int32),
+        rejected_draft_token_ids=np.array([91, 92, 93], dtype=np.int32),
+        rejection_valid_mask=np.array([True, False, True]),
         enable_ngram=True,
         block_size=3,
     )
@@ -229,6 +234,14 @@ def test_ngram_metadata_scatter_preserves_dp_padded_slot_alignment():
         ),
     )
     np.testing.assert_array_equal(padded.ngram_match_lens, np.array([3, 4, 0, 5, 0, 0]))
+    np.testing.assert_array_equal(
+        padded.rejected_draft_token_ids,
+        np.array([91, 92, 0, 93, 0, 0], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        padded.rejection_valid_mask,
+        np.array([True, False, False, True, False, False]),
+    )
     assert padded.enable_ngram
 
 
@@ -242,6 +255,8 @@ def test_ngram_metadata_concat_preserves_rows_and_runtime_config():
             ngram_bonus=np.array([[1.0, 0.5]], dtype=np.float32),
             ngram_valid_mask=np.ones((1, 2), dtype=np.bool_),
             ngram_match_lens=np.array([3], dtype=np.int32),
+            rejected_draft_token_ids=np.array([91], dtype=np.int32),
+            rejection_valid_mask=np.array([True]),
             enable_ngram=True,
             ngram_min_match=2,
             ngram_max_match=6,
@@ -256,6 +271,8 @@ def test_ngram_metadata_concat_preserves_rows_and_runtime_config():
             ngram_bonus=np.array([[2.0, 1.0]], dtype=np.float32),
             ngram_valid_mask=np.ones((1, 2), dtype=np.bool_),
             ngram_match_lens=np.array([4], dtype=np.int32),
+            rejected_draft_token_ids=np.array([92], dtype=np.int32),
+            rejection_valid_mask=np.array([False]),
             enable_ngram=True,
             ngram_min_match=2,
             ngram_max_match=6,
@@ -268,6 +285,8 @@ def test_ngram_metadata_concat_preserves_rows_and_runtime_config():
 
     np.testing.assert_array_equal(flat.ngram_token_ids, np.array([[101, 102], [201, 202]]))
     np.testing.assert_array_equal(flat.ngram_match_lens, np.array([3, 4]))
+    np.testing.assert_array_equal(flat.rejected_draft_token_ids, np.array([91, 92]))
+    np.testing.assert_array_equal(flat.rejection_valid_mask, np.array([True, False]))
     assert flat.enable_ngram
     assert flat.ngram_min_match == 2
     assert flat.ngram_max_match == 6
@@ -310,6 +329,73 @@ def test_record_ngram_stats_separates_candidate_match_from_chain_acceptance():
         worker._ngram_stats_match_len_hist,
         np.array([0, 0, 0, 1, 1, 0, 0, 0, 0], dtype=np.int64),
     )
+
+
+def test_feedback_shadow_separates_reuse_novel_target_and_accepted_chain():
+    width = 3
+    worker = _bare_worker(
+        block_size=4,
+        _feedback_shadow_batches=0,
+        _feedback_shadow_rounds=0,
+        _feedback_shadow_stats={
+            source: {
+                metric: np.zeros((width,), dtype=np.int64)
+                for metric in (
+                    "valid",
+                    "draft_reuse",
+                    "target_match",
+                    "target_novel",
+                    "draft_target_match",
+                    "accepted_chain",
+                )
+            }
+            for source in _DFLASH_FEEDBACK_SHADOW_SOURCES
+        },
+    )
+
+    worker._record_feedback_shadow_stats(
+        accept_lens=np.array([2, 0, 1], dtype=np.int32),
+        draft_token=np.array(
+            [[10, 11, 12, 13], [0, 0, 0, 0], [30, 31, 32, 33]],
+            dtype=np.int32,
+        ),
+        target_predict_flat=np.array(
+            [[11, 99, 13, 0], [0, 0, 0, 0], [40, 32, 33, 0]],
+            dtype=np.int32,
+        ),
+        rejected_draft_token_ids=np.array([11, 0, 31], dtype=np.int32),
+        rejection_valid_mask=np.array([True, False, True]),
+        target_correction_token_ids=np.array([99, 0, 40], dtype=np.int32),
+        stale_suffix_token_ids=np.array([[11, 99, 13], [0, 0, 0], [31, 32, 44]], dtype=np.int32),
+        stale_suffix_valid_mask=np.array(
+            [[True, True, True], [False, False, False], [True, True, True]]
+        ),
+        ngram_token_ids=np.array([[20, 12, 13], [0, 0, 0], [40, 32, 0]], dtype=np.int32),
+        ngram_valid_mask=np.array([[True, True, True], [False, False, False], [True, True, False]]),
+        ngram_match_lens=np.array([3, 0, 1], dtype=np.int32),
+        selector=np.array([0, 2], dtype=np.int32),
+    )
+
+    rejected = worker._feedback_shadow_stats["rejected_draft"]
+    assert rejected["valid"].sum() == 6
+    assert rejected["draft_reuse"].sum() == 2
+    assert rejected["target_match"].sum() == 1
+    assert rejected["draft_target_match"].sum() == 1
+    assert rejected["accepted_chain"].sum() == 1
+
+    correction = worker._feedback_shadow_stats["target_correction"]
+    assert correction["target_match"].sum() == 2
+    assert correction["target_novel"].sum() == 2
+    assert correction["draft_reuse"].sum() == 0
+
+    stale = worker._feedback_shadow_stats["stale_suffix"]
+    assert stale["target_match"].sum() == 4
+    assert stale["draft_reuse"].sum() == 4
+    assert stale["draft_target_match"].sum() == 3
+    assert stale["accepted_chain"].sum() == 1
+
+    assert worker._feedback_shadow_stats["ngram_len1"]["target_novel"].sum() == 1
+    assert worker._feedback_shadow_stats["ngram_len3plus"]["target_match"].sum() == 1
 
 
 def test_verify_write_cache_loc_selects_valid_half_per_dp_rank():

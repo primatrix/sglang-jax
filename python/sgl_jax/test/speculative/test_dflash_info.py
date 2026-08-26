@@ -9,6 +9,7 @@ from sgl_jax.srt.speculative.dflash_info import (
     build_dflash_draft_block,
     build_dflash_flashback_feedback,
     build_dflash_ngram_continuation,
+    build_dflash_rejection_feedback,
     dflash_greedy_verify,
     select_dflash_ngram_tokens,
     select_dflash_proposal_hidden,
@@ -131,6 +132,21 @@ def test_dflash_greedy_verify_from_logits():
     np.testing.assert_array_equal(np.asarray(accept_len_draft), np.array([3, 1], dtype=np.int32))
     np.testing.assert_array_equal(np.asarray(new_verified_id), np.array([99, 77], dtype=np.int32))
     np.testing.assert_array_equal(np.asarray(next_token_ids_flat).reshape(2, 4), target_predict)
+
+
+def test_build_dflash_rejection_feedback_carries_first_rejected_proposal():
+    rejected, valid = build_dflash_rejection_feedback(
+        draft_token=np.array(
+            [[10, 11, 12, 13], [20, 21, 22, 23], [30, 31, 32, 33]],
+            dtype=np.int32,
+        ),
+        accept_lens=np.array([1, 3, 4], dtype=np.int32),
+        active_mask=np.array([True, True, True]),
+        block_size=4,
+    )
+
+    np.testing.assert_array_equal(rejected, np.array([11, 23, 0], dtype=np.int32))
+    np.testing.assert_array_equal(valid, np.array([True, True, False]))
 
 
 def test_dflash_anchor_block7_can_accept_seven_proposals_plus_bonus():

@@ -25,6 +25,7 @@ from sgl_jax.srt.speculative.dflash_info import (
     _mask_draft_kv_writes,
     build_dflash_draft_block,
     build_dflash_flashback_feedback,
+    build_dflash_rejection_feedback,
     dflash_greedy_verify,
     select_dflash_proposal_hidden,
     select_dflash_ngram_tokens,
@@ -43,6 +44,15 @@ from sgl_jax.srt.speculative.relay_buffer import (
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
+
+_DFLASH_FEEDBACK_SHADOW_SOURCES = (
+    "rejected_draft",
+    "target_correction",
+    "stale_suffix",
+    "ngram_len1",
+    "ngram_len2",
+    "ngram_len3plus",
+)
 
 
 @dataclass(frozen=True)
@@ -68,6 +78,9 @@ class DraftForwardPlan:
     flashback_token_ids: jax.Array
     flashback_target_margins: jax.Array
     flashback_valid_mask: jax.Array
+    rejected_draft_token_ids: jax.Array
+    rejection_valid_mask: jax.Array
+    target_correction_token_ids: jax.Array
     ngram_token_ids: jax.Array
     ngram_bonus: jax.Array
     ngram_valid_mask: jax.Array
@@ -92,6 +105,12 @@ class TargetVerifyPlan:
     allocated_lens: jax.Array
     relay_future_indices: jax.Array
     relay_valid_mask: jax.Array
+    draft_token: jax.Array
+    flashback_token_ids: jax.Array
+    flashback_valid_mask: jax.Array
+    rejected_draft_token_ids: jax.Array
+    rejection_valid_mask: jax.Array
+    target_correction_token_ids: jax.Array
     ngram_selected_mask: jax.Array
     ngram_token_ids: jax.Array
     ngram_valid_mask: jax.Array
@@ -113,6 +132,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self.block_size = self.draft_block_size + int(self.enable_anchor)
         self.speculative_verify_token_num = self.block_size
         self._ngram_enabled = bool(server_args.enable_dflash_ngram)
+        self._feedback_shadow_enabled = bool(server_args.enable_dflash_feedback_shadow)
         self._ngram_stats_batches = 0
         self._ngram_stats_rounds = 0
         self._ngram_stats_covered_rounds = 0
@@ -132,6 +152,22 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self._ngram_stats_position_accepted = np.zeros(
             (self.block_size - 1,), dtype=np.int64
         )
+        self._feedback_shadow_batches = 0
+        self._feedback_shadow_rounds = 0
+        self._feedback_shadow_stats = {
+            source: {
+                metric: np.zeros((self.block_size - 1,), dtype=np.int64)
+                for metric in (
+                    "valid",
+                    "draft_reuse",
+                    "target_match",
+                    "target_novel",
+                    "draft_target_match",
+                    "accepted_chain",
+                )
+            }
+            for source in _DFLASH_FEEDBACK_SHADOW_SOURCES
+        }
         self._flashback_enabled = bool(server_args.enable_dflash_flashback)
         self._flashback_bonus = float(server_args.dflash_flashback_bonus)
         self._flashback_target_margin_weight = float(
@@ -206,7 +242,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         logger.info(
             "Initialized DFLASH worker: draft_block_size=%d, verify_block_size=%d, "
             "enable_anchor=%s, mask_token_id=%d, "
-            "draft_layers=%d, ngram=%s, flashback=%s, flashback_bonus=%.3f, "
+            "draft_layers=%d, ngram=%s, feedback_shadow=%s, flashback=%s, "
+            "flashback_bonus=%.3f, "
             "flashback_target_margin_weight=%.3f, flashback_position_decay=%.3f, "
             "page_indices_pool_capacity=%d, "
             "page_indices_per_seq_capacity=%d",
@@ -216,6 +253,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             self._mask_token_id,
             self.draft_layers,
             self._ngram_enabled,
+            self._feedback_shadow_enabled,
             self._flashback_enabled,
             self._flashback_bonus,
             self._flashback_target_margin_weight,
@@ -236,8 +274,10 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
 
     def _draft_input_config(self) -> dict:
         return {
-            "enable_ngram": self._ngram_enabled,
-            "ngram_min_match": self.server_args.dflash_ngram_min_match,
+            "enable_ngram": self._ngram_enabled or self._feedback_shadow_enabled,
+            "ngram_min_match": (
+                1 if self._feedback_shadow_enabled else self.server_args.dflash_ngram_min_match
+            ),
             "ngram_max_match": self.server_args.dflash_ngram_max_match,
             "ngram_base_bonus": self.server_args.dflash_ngram_bonus,
             "ngram_prompt_weight": self.server_args.dflash_ngram_prompt_weight,
@@ -417,9 +457,15 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         (
             accept_lens,
             verified_id,
-            flashback_token_ids,
-            flashback_target_margins,
-            flashback_valid_mask,
+            next_flashback_token_ids,
+            next_flashback_target_margins,
+            next_flashback_valid_mask,
+            draft_token,
+            prior_flashback_token_ids,
+            prior_flashback_valid_mask,
+            rejected_draft_token_ids,
+            rejection_valid_mask,
+            target_correction_token_ids,
             ngram_selected_mask,
             ngram_token_ids,
             ngram_valid_mask,
@@ -432,6 +478,12 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 next_draft_input.flashback_token_ids,
                 next_draft_input.flashback_target_margins,
                 next_draft_input.flashback_valid_mask,
+                plan.draft_token,
+                plan.flashback_token_ids,
+                plan.flashback_valid_mask,
+                plan.rejected_draft_token_ids,
+                plan.rejection_valid_mask,
+                plan.target_correction_token_ids,
                 plan.ngram_selected_mask,
                 plan.ngram_token_ids,
                 plan.ngram_valid_mask,
@@ -442,12 +494,15 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         accept_lens = np.asarray(accept_lens, dtype=np.int32)
         verified_id = np.asarray(verified_id, dtype=np.int32)
         next_draft_input.verified_id = verified_id
-        next_draft_input.flashback_token_ids = np.asarray(flashback_token_ids, dtype=np.int32)
+        next_draft_input.flashback_token_ids = np.asarray(next_flashback_token_ids, dtype=np.int32)
         next_draft_input.flashback_target_margins = np.asarray(
-            flashback_target_margins, dtype=np.float32
+            next_flashback_target_margins, dtype=np.float32
         )
-        next_draft_input.flashback_valid_mask = np.asarray(flashback_valid_mask, dtype=np.bool_)
-        if self._ngram_enabled:
+        next_draft_input.flashback_valid_mask = np.asarray(
+            next_flashback_valid_mask, dtype=np.bool_
+        )
+        selector = np.asarray(model_worker_batch.logits_indices_selector, dtype=np.int32)
+        if self._ngram_enabled or self._feedback_shadow_enabled:
             self._record_ngram_stats(
                 accept_lens,
                 np.asarray(ngram_selected_mask, dtype=np.bool_),
@@ -455,8 +510,34 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 np.asarray(ngram_valid_mask, dtype=np.bool_),
                 np.asarray(ngram_match_lens, dtype=np.int32),
                 np.asarray(target_predict, dtype=np.int32),
-                np.asarray(model_worker_batch.logits_indices_selector, dtype=np.int32),
+                selector,
             )
+        if self._feedback_shadow_enabled:
+            self._record_feedback_shadow_stats(
+                accept_lens=accept_lens,
+                draft_token=np.asarray(draft_token, dtype=np.int32),
+                target_predict_flat=np.asarray(target_predict, dtype=np.int32),
+                rejected_draft_token_ids=np.asarray(rejected_draft_token_ids, dtype=np.int32),
+                rejection_valid_mask=np.asarray(rejection_valid_mask, dtype=np.bool_),
+                target_correction_token_ids=np.asarray(target_correction_token_ids, dtype=np.int32),
+                stale_suffix_token_ids=np.asarray(prior_flashback_token_ids, dtype=np.int32),
+                stale_suffix_valid_mask=np.asarray(prior_flashback_valid_mask, dtype=np.bool_),
+                ngram_token_ids=np.asarray(ngram_token_ids, dtype=np.int32),
+                ngram_valid_mask=np.asarray(ngram_valid_mask, dtype=np.bool_),
+                ngram_match_lens=np.asarray(ngram_match_lens, dtype=np.int32),
+                selector=selector,
+            )
+        active_mask = np.zeros((accept_lens.shape[0],), dtype=np.bool_)
+        active_mask[selector] = True
+        (
+            next_draft_input.rejected_draft_token_ids,
+            next_draft_input.rejection_valid_mask,
+        ) = build_dflash_rejection_feedback(
+            np.asarray(draft_token, dtype=np.int32),
+            accept_lens,
+            active_mask,
+            block_size=self.block_size,
+        )
         next_draft_input.ctx_lens = np.zeros_like(accept_lens)
         next_draft_input.draft_seq_lens = plan.target_prefix_lens + accept_lens
         next_draft_input.new_seq_lens = plan.seq_lens + accept_lens
@@ -464,7 +545,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         batch_output.accept_lens = accept_lens
         self._unpad_draft_state(
             next_draft_input,
-            model_worker_batch.logits_indices_selector,
+            selector,
         )
         model_worker_batch.spec_info_padded = next_draft_input
         del next_draft_input._target_verify_plan
@@ -535,6 +616,121 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             self._ngram_stats_position_selected.tolist(),
             self._ngram_stats_position_accepted.tolist(),
         )
+
+    def _record_feedback_shadow_stats(
+        self,
+        *,
+        accept_lens: np.ndarray,
+        draft_token: np.ndarray,
+        target_predict_flat: np.ndarray,
+        rejected_draft_token_ids: np.ndarray,
+        rejection_valid_mask: np.ndarray,
+        target_correction_token_ids: np.ndarray,
+        stale_suffix_token_ids: np.ndarray,
+        stale_suffix_valid_mask: np.ndarray,
+        ngram_token_ids: np.ndarray,
+        ngram_valid_mask: np.ndarray,
+        ngram_match_lens: np.ndarray,
+        selector: np.ndarray,
+    ) -> None:
+        """Measure prior-round signals against the untouched current DFlash block."""
+        proposal_width = self.block_size - 1
+        padded_bs = int(np.asarray(accept_lens).reshape(-1).shape[0])
+        selector = np.asarray(selector, dtype=np.int32)
+        accept_lens = np.asarray(accept_lens, dtype=np.int32).reshape(padded_bs)[selector]
+        draft = np.asarray(draft_token, dtype=np.int32).reshape(padded_bs, self.block_size)[
+            selector, 1:
+        ]
+        target = np.asarray(target_predict_flat, dtype=np.int32).reshape(
+            padded_bs, self.block_size
+        )[selector, :proposal_width]
+        offsets = np.arange(proposal_width, dtype=np.int32)[None, :]
+        accepted_mask = offsets < np.maximum(accept_lens[:, None] - 1, 0)
+
+        rejection_valid = np.asarray(rejection_valid_mask, dtype=np.bool_).reshape(padded_bs)[
+            selector, None
+        ]
+        rejected_ids = np.broadcast_to(
+            np.asarray(rejected_draft_token_ids, dtype=np.int32).reshape(padded_bs)[selector, None],
+            draft.shape,
+        )
+        correction_ids = np.broadcast_to(
+            np.asarray(target_correction_token_ids, dtype=np.int32).reshape(padded_bs)[
+                selector, None
+            ],
+            draft.shape,
+        )
+        scalar_valid = np.broadcast_to(rejection_valid, draft.shape)
+
+        stale_ids = np.asarray(stale_suffix_token_ids, dtype=np.int32).reshape(
+            padded_bs, proposal_width
+        )[selector]
+        stale_valid = np.asarray(stale_suffix_valid_mask, dtype=np.bool_).reshape(
+            padded_bs, proposal_width
+        )[selector]
+        ngram_ids = np.asarray(ngram_token_ids, dtype=np.int32).reshape(padded_bs, proposal_width)[
+            selector
+        ]
+        ngram_valid = np.asarray(ngram_valid_mask, dtype=np.bool_).reshape(
+            padded_bs, proposal_width
+        )[selector]
+        match_lens = np.asarray(ngram_match_lens, dtype=np.int32).reshape(padded_bs)[selector]
+        sources = {
+            "rejected_draft": (rejected_ids, scalar_valid),
+            "target_correction": (correction_ids, scalar_valid),
+            "stale_suffix": (stale_ids, stale_valid),
+            "ngram_len1": (ngram_ids, ngram_valid & (match_lens[:, None] == 1)),
+            "ngram_len2": (ngram_ids, ngram_valid & (match_lens[:, None] == 2)),
+            "ngram_len3plus": (ngram_ids, ngram_valid & (match_lens[:, None] >= 3)),
+        }
+
+        self._feedback_shadow_batches += 1
+        self._feedback_shadow_rounds += int(selector.size)
+        for source, (candidate, valid) in sources.items():
+            draft_reuse = valid & (candidate == draft)
+            target_match = valid & (candidate == target)
+            counters = self._feedback_shadow_stats[source]
+            counters["valid"] += valid.sum(axis=0, dtype=np.int64)
+            counters["draft_reuse"] += draft_reuse.sum(axis=0, dtype=np.int64)
+            counters["target_match"] += target_match.sum(axis=0, dtype=np.int64)
+            counters["target_novel"] += (target_match & ~draft_reuse).sum(axis=0, dtype=np.int64)
+            counters["draft_target_match"] += (draft_reuse & target_match).sum(
+                axis=0, dtype=np.int64
+            )
+            counters["accepted_chain"] += (draft_reuse & accepted_mask).sum(axis=0, dtype=np.int64)
+
+        if self._feedback_shadow_batches % 100 != 0:
+            return
+        for source in _DFLASH_FEEDBACK_SHADOW_SOURCES:
+            counters = self._feedback_shadow_stats[source]
+            valid = max(1, int(counters["valid"].sum()))
+            reuse = max(1, int(counters["draft_reuse"].sum()))
+            logger.info(
+                "[DFLASH-FEEDBACK-SHADOW] batches=%d rounds=%d source=%s "
+                "valid=%d draft_reuse_rate=%.6f target_match_rate=%.6f "
+                "target_novel_rate=%.6f reuse_target_precision=%.6f "
+                "reuse_wrong_rate=%.6f accepted_chain_rate=%.6f "
+                "accepted_given_reuse=%.6f position_valid=%s position_reuse=%s "
+                "position_target=%s position_novel=%s position_reuse_target=%s "
+                "position_chain=%s",
+                self._feedback_shadow_batches,
+                self._feedback_shadow_rounds,
+                source,
+                int(counters["valid"].sum()),
+                counters["draft_reuse"].sum() / valid,
+                counters["target_match"].sum() / valid,
+                counters["target_novel"].sum() / valid,
+                counters["draft_target_match"].sum() / reuse,
+                (counters["draft_reuse"].sum() - counters["draft_target_match"].sum()) / valid,
+                counters["accepted_chain"].sum() / valid,
+                counters["accepted_chain"].sum() / reuse,
+                counters["valid"].tolist(),
+                counters["draft_reuse"].tolist(),
+                counters["target_match"].tolist(),
+                counters["target_novel"].tolist(),
+                counters["draft_target_match"].tolist(),
+                counters["accepted_chain"].tolist(),
+            )
 
     def forward_batch_speculative_prefill_overlap(self, model_worker_batch: ModelWorkerBatch):
         from jax.sharding import NamedSharding
@@ -780,6 +976,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             flashback_token_ids = np.zeros(feedback_shape, dtype=np.int32)
             flashback_target_margins = np.zeros(feedback_shape, dtype=np.float32)
             flashback_valid_mask = np.zeros(feedback_shape, dtype=np.bool_)
+            rejected_draft_token_ids = np.zeros((bs,), dtype=np.int32)
+            rejection_valid_mask = np.zeros((bs,), dtype=np.bool_)
         else:
             (
                 flashback_token_ids,
@@ -787,6 +985,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 flashback_valid_mask,
             ) = draft_input._flashback_rows(bs)
             flashback_valid_mask = flashback_valid_mask & active_mask[:, None]
+            rejected_draft_token_ids, rejection_valid_mask = draft_input._rejection_rows(bs)
+            rejection_valid_mask = rejection_valid_mask & active_mask
+        target_correction_token_ids = np.where(active_mask, verified_id, 0).astype(np.int32)
         ngram_token_ids, ngram_bonus, ngram_valid_mask, ngram_match_lens = (
             draft_input._ngram_rows(bs)
         )
@@ -805,6 +1006,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             flashback_token_ids=jax.device_put(flashback_token_ids, feedback_sharding),
             flashback_target_margins=jax.device_put(flashback_target_margins, feedback_sharding),
             flashback_valid_mask=jax.device_put(flashback_valid_mask, feedback_sharding),
+            rejected_draft_token_ids=rejected_draft_token_ids,
+            rejection_valid_mask=rejection_valid_mask,
+            target_correction_token_ids=target_correction_token_ids,
             ngram_token_ids=jax.device_put(ngram_token_ids, feedback_sharding),
             ngram_bonus=jax.device_put(ngram_bonus, feedback_sharding),
             ngram_valid_mask=jax.device_put(ngram_valid_mask, feedback_sharding),
@@ -888,6 +1092,12 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             allocated_lens=draft_plan.allocated_lens,
             relay_future_indices=draft_plan.relay_future_indices,
             relay_valid_mask=draft_plan.relay_valid_mask,
+            draft_token=draft_token,
+            flashback_token_ids=draft_plan.flashback_token_ids,
+            flashback_valid_mask=draft_plan.flashback_valid_mask,
+            rejected_draft_token_ids=draft_plan.rejected_draft_token_ids,
+            rejection_valid_mask=draft_plan.rejection_valid_mask,
+            target_correction_token_ids=draft_plan.target_correction_token_ids,
             ngram_selected_mask=ngram_selected_mask,
             ngram_token_ids=draft_plan.ngram_token_ids,
             ngram_valid_mask=draft_plan.ngram_valid_mask,
@@ -1334,7 +1544,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             model_def,
             model_state_def,
             draft_token_num=draft_token_num,
-            flashback_enabled=self._flashback_enabled,
+            flashback_enabled=(self._flashback_enabled or self._feedback_shadow_enabled),
             page_size=self.page_size,
         )
 
@@ -1673,6 +1883,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             "flashback_token_ids",
             "flashback_target_margins",
             "flashback_valid_mask",
+            "rejected_draft_token_ids",
+            "rejection_valid_mask",
             "ngram_token_ids",
             "ngram_bonus",
             "ngram_valid_mask",
@@ -1684,9 +1896,16 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             dtype = (
                 np.float32
                 if field in ("flashback_target_margins", "ngram_bonus")
-                else np.bool_
-                if field in ("flashback_valid_mask", "ngram_valid_mask")
-                else np.int32
+                else (
+                    np.bool_
+                    if field
+                    in (
+                        "flashback_valid_mask",
+                        "rejection_valid_mask",
+                        "ngram_valid_mask",
+                    )
+                    else np.int32
+                )
             )
             value = np.asarray(value, dtype=dtype)
             if selector.size and int(selector.max()) >= value.shape[0]:
@@ -1716,6 +1935,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 "flashback_token_ids",
                 "flashback_target_margins",
                 "flashback_valid_mask",
+                "rejected_draft_token_ids",
+                "rejection_valid_mask",
                 "ngram_token_ids",
                 "ngram_bonus",
                 "ngram_valid_mask",
@@ -2081,6 +2302,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 np.zeros((bs, self.block_size - 1), dtype=np.bool_),
                 feedback_sharding,
             ),
+            rejected_draft_token_ids=np.zeros((bs,), dtype=np.int32),
+            rejection_valid_mask=np.zeros((bs,), dtype=np.bool_),
+            target_correction_token_ids=np.zeros((bs,), dtype=np.int32),
             ngram_token_ids=jax.device_put(
                 np.zeros((bs, self.block_size - 1), dtype=np.int32),
                 feedback_sharding,
@@ -2150,6 +2374,12 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             allocated_lens=draft_plan.allocated_lens,
             relay_future_indices=draft_plan.relay_future_indices,
             relay_valid_mask=draft_plan.relay_valid_mask,
+            draft_token=draft_token,
+            flashback_token_ids=draft_plan.flashback_token_ids,
+            flashback_valid_mask=draft_plan.flashback_valid_mask,
+            rejected_draft_token_ids=draft_plan.rejected_draft_token_ids,
+            rejection_valid_mask=draft_plan.rejection_valid_mask,
+            target_correction_token_ids=draft_plan.target_correction_token_ids,
             ngram_selected_mask=ngram_selected_mask,
             ngram_token_ids=draft_plan.ngram_token_ids,
             ngram_valid_mask=draft_plan.ngram_valid_mask,

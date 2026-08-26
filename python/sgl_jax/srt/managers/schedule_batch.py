@@ -2739,6 +2739,7 @@ class ScheduleBatch:
 
             relay_state = flat.future_indices is not None
             ngram_rows = None if relay_state else flat._ngram_rows(len(selector))
+            rejection_rows = None if relay_state else flat._rejection_rows(len(selector))
             return DFlashDraftInput(
                 verified_id=(
                     None if relay_state else _scatter_dflash_1d(flat.verified_id, "verified_id")
@@ -2791,6 +2792,16 @@ class ScheduleBatch:
                         "flashback_valid_mask",
                         dtype=np.bool_,
                     )
+                ),
+                rejected_draft_token_ids=(
+                    None
+                    if relay_state
+                    else _scatter_dflash_1d(rejection_rows[0], "rejected_draft_token_ids")
+                ),
+                rejection_valid_mask=(
+                    None
+                    if relay_state
+                    else _scatter_dflash_1d(rejection_rows[1], "rejection_valid_mask")
                 ),
                 ngram_token_ids=(
                     None
@@ -2929,6 +2940,14 @@ class ScheduleBatch:
                         flashback_valid_mask=(
                             None if relay_state else _slice(flat.flashback_valid_mask, offset, end)
                         ),
+                        rejected_draft_token_ids=(
+                            None
+                            if relay_state
+                            else _slice(flat.rejected_draft_token_ids, offset, end)
+                        ),
+                        rejection_valid_mask=(
+                            None if relay_state else _slice(flat.rejection_valid_mask, offset, end)
+                        ),
                         ngram_token_ids=(
                             None if relay_state else _slice(flat.ngram_token_ids, offset, end)
                         ),
@@ -3055,6 +3074,8 @@ class ScheduleBatch:
                 "flashback_token_ids",
                 "flashback_target_margins",
                 "flashback_valid_mask",
+                "rejected_draft_token_ids",
+                "rejection_valid_mask",
                 "ngram_token_ids",
                 "ngram_bonus",
                 "ngram_valid_mask",
@@ -3109,6 +3130,8 @@ class ScheduleBatch:
                     "flashback_token_ids",
                     "flashback_target_margins",
                     "flashback_valid_mask",
+                    "rejected_draft_token_ids",
+                    "rejection_valid_mask",
                     "ngram_token_ids",
                     "ngram_bonus",
                     "ngram_valid_mask",

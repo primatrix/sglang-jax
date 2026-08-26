@@ -178,6 +178,32 @@ def select_dflash_ngram_tokens(
     return jnp.where(selected, ngram_token_ids, base_token_ids).astype(jnp.int32), selected
 
 
+def build_dflash_rejection_feedback(
+    draft_token: np.ndarray,
+    accept_lens: np.ndarray,
+    active_mask: np.ndarray,
+    *,
+    block_size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extract the first rejected proposal for use by the next decode round."""
+    candidates = np.asarray(draft_token, dtype=np.int32).reshape((-1, int(block_size)))
+    accept_lens = np.asarray(accept_lens, dtype=np.int32).reshape(-1)
+    active_mask = np.asarray(active_mask, dtype=np.bool_).reshape(-1)
+    if candidates.shape[0] != accept_lens.shape[0] or accept_lens.shape != active_mask.shape:
+        raise ValueError(
+            "DFLASH rejection feedback batch shapes differ: "
+            f"candidates={candidates.shape}, accept_lens={accept_lens.shape}, "
+            f"active_mask={active_mask.shape}."
+        )
+
+    proposal_width = int(block_size) - 1
+    accepted_proposals = np.maximum(accept_lens - 1, 0)
+    valid = active_mask & (accept_lens > 0) & (accepted_proposals < proposal_width)
+    rejected_indices = np.clip(accepted_proposals + 1, 1, proposal_width)
+    rejected = candidates[np.arange(candidates.shape[0]), rejected_indices]
+    return np.where(valid, rejected, 0).astype(np.int32), valid
+
+
 # TODO: Share greedy chain verification through common speculative helpers.
 def dflash_greedy_verify(
     draft_token: jax.Array,
@@ -404,6 +430,8 @@ class DFlashDraftInput:
     flashback_token_ids: jax.Array | np.ndarray = None
     flashback_target_margins: jax.Array | np.ndarray = None
     flashback_valid_mask: jax.Array | np.ndarray = None
+    rejected_draft_token_ids: jax.Array | np.ndarray = None
+    rejection_valid_mask: jax.Array | np.ndarray = None
     ngram_token_ids: jax.Array | np.ndarray = None
     ngram_bonus: jax.Array | np.ndarray = None
     ngram_valid_mask: jax.Array | np.ndarray = None
@@ -427,12 +455,14 @@ class DFlashDraftInput:
             "reservation_base_lens",
             "future_indices",
             "flashback_token_ids",
+            "rejected_draft_token_ids",
             "ngram_token_ids",
             "ngram_match_lens",
         )
         fields = int_fields + (
             "flashback_target_margins",
             "flashback_valid_mask",
+            "rejection_valid_mask",
             "ngram_bonus",
             "ngram_valid_mask",
         )
@@ -450,6 +480,8 @@ class DFlashDraftInput:
             )
         if self.flashback_valid_mask is not None:
             self.flashback_valid_mask = np.asarray(self.flashback_valid_mask, dtype=np.bool_)
+        if self.rejection_valid_mask is not None:
+            self.rejection_valid_mask = np.asarray(self.rejection_valid_mask, dtype=np.bool_)
         if self.ngram_bonus is not None:
             self.ngram_bonus = np.asarray(self.ngram_bonus, dtype=np.float32)
         if self.ngram_valid_mask is not None:
@@ -531,6 +563,25 @@ class DFlashDraftInput:
             )
         return token_ids, bonuses, valid_mask, match_lens
 
+    def _rejection_rows(self, bs: int) -> tuple[np.ndarray, np.ndarray]:
+        token_ids = self.rejected_draft_token_ids
+        valid_mask = self.rejection_valid_mask
+        if token_ids is None and valid_mask is None:
+            return (
+                np.zeros((int(bs),), dtype=np.int32),
+                np.zeros((int(bs),), dtype=np.bool_),
+            )
+        if token_ids is None or valid_mask is None:
+            raise ValueError("DFLASH rejection feedback must carry ids and validity together.")
+        token_ids = np.asarray(token_ids, dtype=np.int32)
+        valid_mask = np.asarray(valid_mask, dtype=np.bool_)
+        if token_ids.shape != (int(bs),) or valid_mask.shape != (int(bs),):
+            raise ValueError(
+                "DFLASH rejection feedback must have shape "
+                f"({int(bs)},), got ids={token_ids.shape}, valid={valid_mask.shape}."
+            )
+        return token_ids, valid_mask
+
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True) -> None:
         self._ensure_host()
         new_indices = np.asarray(new_indices, dtype=np.int32)
@@ -567,6 +618,8 @@ class DFlashDraftInput:
             "flashback_token_ids",
             "flashback_target_margins",
             "flashback_valid_mask",
+            "rejected_draft_token_ids",
+            "rejection_valid_mask",
             "ngram_token_ids",
             "ngram_bonus",
             "ngram_valid_mask",
@@ -742,6 +795,8 @@ class DFlashDraftInput:
             self.flashback_token_ids = None
             self.flashback_target_margins = None
             self.flashback_valid_mask = None
+            self.rejected_draft_token_ids = None
+            self.rejection_valid_mask = None
             self.ngram_token_ids = None
             self.ngram_bonus = None
             self.ngram_valid_mask = None
@@ -761,6 +816,9 @@ class DFlashDraftInput:
         self.flashback_token_ids = np.concatenate([rows[0] for rows in feedback], axis=0)
         self.flashback_target_margins = np.concatenate([rows[1] for rows in feedback], axis=0)
         self.flashback_valid_mask = np.concatenate([rows[2] for rows in feedback], axis=0)
+        rejection = [state._rejection_rows(len(state.draft_seq_lens)) for state in rank_states]
+        self.rejected_draft_token_ids = np.concatenate([rows[0] for rows in rejection], axis=0)
+        self.rejection_valid_mask = np.concatenate([rows[1] for rows in rejection], axis=0)
         ngram = [state._ngram_rows(len(state.draft_seq_lens)) for state in rank_states]
         self.ngram_token_ids = np.concatenate([rows[0] for rows in ngram], axis=0)
         self.ngram_bonus = np.concatenate([rows[1] for rows in ngram], axis=0)
@@ -787,6 +845,7 @@ class DFlashDraftInput:
         ctx_lens = np.asarray(self.ctx_lens, dtype=np.int32)
         draft_seq_lens = np.asarray(self.draft_seq_lens, dtype=np.int32)
         feedback_ids, feedback_margins, feedback_valid = self._flashback_rows(state_bs)
+        rejected_ids, rejection_valid = self._rejection_rows(state_bs)
         ngram_ids, ngram_bonus, ngram_valid, ngram_match_lens = self._ngram_rows(state_bs)
         if state_bs > bs:
             self.verified_id = verified_id[:bs]
@@ -795,6 +854,8 @@ class DFlashDraftInput:
             self.flashback_token_ids = feedback_ids[:bs]
             self.flashback_target_margins = feedback_margins[:bs]
             self.flashback_valid_mask = feedback_valid[:bs]
+            self.rejected_draft_token_ids = rejected_ids[:bs]
+            self.rejection_valid_mask = rejection_valid[:bs]
             self.ngram_token_ids = ngram_ids[:bs]
             self.ngram_bonus = ngram_bonus[:bs]
             self.ngram_valid_mask = ngram_valid[:bs]
@@ -826,6 +887,12 @@ class DFlashDraftInput:
         )
         self.flashback_valid_mask = np.concatenate(
             [feedback_valid, np.zeros((missing, width), dtype=np.bool_)], axis=0
+        )
+        self.rejected_draft_token_ids = np.concatenate(
+            [rejected_ids, np.zeros((missing,), dtype=np.int32)], axis=0
+        )
+        self.rejection_valid_mask = np.concatenate(
+            [rejection_valid, np.zeros((missing,), dtype=np.bool_)], axis=0
         )
         self.ngram_token_ids = np.concatenate(
             [ngram_ids, np.zeros((missing, width), dtype=np.int32)], axis=0
@@ -864,6 +931,8 @@ class DFlashDraftInput:
             self.flashback_token_ids = None
             self.flashback_target_margins = None
             self.flashback_valid_mask = None
+            self.rejected_draft_token_ids = None
+            self.rejection_valid_mask = None
             self.ngram_token_ids = None
             self.ngram_bonus = None
             self.ngram_valid_mask = None
@@ -882,6 +951,12 @@ class DFlashDraftInput:
             [self_feedback[1], other_feedback[1]], axis=0
         )
         self.flashback_valid_mask = np.concatenate([self_feedback[2], other_feedback[2]], axis=0)
+        self_rejection = self._rejection_rows(len(self.verified_id) - len(other.verified_id))
+        other_rejection = other._rejection_rows(len(other.verified_id))
+        self.rejected_draft_token_ids = np.concatenate(
+            [self_rejection[0], other_rejection[0]], axis=0
+        )
+        self.rejection_valid_mask = np.concatenate([self_rejection[1], other_rejection[1]], axis=0)
         self_ngram = self._ngram_rows(len(self.verified_id) - len(other.verified_id))
         other_ngram = other._ngram_rows(len(other.verified_id))
         self.ngram_token_ids = np.concatenate([self_ngram[0], other_ngram[0]], axis=0)
