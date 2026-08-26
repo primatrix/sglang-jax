@@ -187,7 +187,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self._feedback_margin_stats = {
             source: {
                 metric: np.zeros((margin_bin_count,), dtype=np.int64)
-                for metric in ("valid", "target_match", "target_novel")
+                for metric in ("valid", "alternative", "target_match", "target_novel")
             }
             for source in _DFLASH_FEEDBACK_ALL_SOURCES
             if source != "target_correction"
@@ -799,6 +799,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 for bin_index in range(len(_DFLASH_MARGIN_THRESHOLDS) + 1):
                     in_bin = valid & (margin_bins == bin_index)
                     margin_stats["valid"][bin_index] += int(in_bin.sum())
+                    margin_stats["alternative"][bin_index] += int(
+                        (in_bin & ~draft_reuse).sum()
+                    )
                     margin_stats["target_match"][bin_index] += int(
                         (in_bin & target_match).sum()
                     )
@@ -920,11 +923,12 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         for source, counters in self._feedback_margin_stats.items():
             logger.info(
                 "[DFLASH-FEEDBACK-MARGIN] batches=%d source=%s thresholds=%s "
-                "valid=%s target=%s novel=%s",
+                "valid=%s alternative=%s target=%s novel=%s",
                 self._feedback_shadow_batches,
                 source,
                 _DFLASH_MARGIN_THRESHOLDS.tolist(),
                 counters["valid"].tolist(),
+                counters["alternative"].tolist(),
                 counters["target_match"].tolist(),
                 counters["target_novel"].tolist(),
             )
