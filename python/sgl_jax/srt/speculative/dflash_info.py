@@ -408,7 +408,11 @@ def select_dflash_ngram_tokens(
         & (ngram_bonus > 0)
         & ((base_scores - ngram_scores) <= ngram_bonus.astype(base_scores.dtype))
     )
-    if max_rerank_positions > 0:
+    if max_rerank_positions == 1:
+        first_position = jnp.argmax(selected.astype(jnp.int32), axis=-1)
+        positions = jnp.arange(selected.shape[-1], dtype=jnp.int32)[None, :]
+        selected &= positions == first_position[:, None]
+    elif max_rerank_positions > 1:
         selection_rank = jnp.cumsum(selected.astype(jnp.int32), axis=-1)
         selected &= selection_rank <= int(max_rerank_positions)
     return jnp.where(selected, ngram_token_ids, base_token_ids).astype(jnp.int32), selected
