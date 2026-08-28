@@ -256,6 +256,7 @@ def test_replicated_moe_matches_local_dense_reference():
 def test_ling3_kda_lower_bound_is_threaded_to_prefill(monkeypatch):
     # This unit only checks lower_bound plumbing into the prefill kernel. Keep
     # it independent of the process-wide virtual-device count used by DP tests.
+    monkeypatch.setenv("SGLANG_JAX_KDA_PREFILL_KERNEL", "chunked")
     mesh = _single_device_mesh()
     backend = KDAAttnBackend(mesh=mesh)
     captured = {}
