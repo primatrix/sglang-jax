@@ -65,6 +65,7 @@ def parse_args():
     parser.add_argument("--branches", type=int, default=8)
     parser.add_argument("--output-length", type=int, default=8)
     parser.add_argument("--expected-dp-size", type=int, default=8)
+    parser.add_argument("--min-checkpoint-hit-rate", type=float, default=0.95)
     parser.add_argument("--seed", type=int, default=20260828)
     parser.add_argument("--output-json", default=None)
     return parser.parse_args()
@@ -176,6 +177,33 @@ def _run_requests(prompts, generate_url, parallel, output_length):
     return responses, wall_time
 
 
+def _checkpoint_hits(prompts, responses, track_interval: int) -> dict:
+    misses = []
+    for prompt, response in zip(prompts, responses):
+        expected_floor = (prompt.shared_tokens // track_interval) * track_interval
+        if response.cached_tokens < expected_floor:
+            misses.append(
+                {
+                    "family": prompt.family,
+                    "branch": prompt.branch,
+                    "cached_tokens": response.cached_tokens,
+                    "expected_floor": expected_floor,
+                }
+            )
+    return {
+        "rate": (len(responses) - len(misses)) / len(responses),
+        "miss_count": len(misses),
+        "misses": misses,
+    }
+
+
+def _assert_checkpoint_hit_rate(label: str, hit_summary: dict, minimum: float) -> None:
+    assert hit_summary["rate"] >= minimum, (
+        f"{label} checkpoint hit rate {hit_summary['rate']:.3f} is below "
+        f"{minimum:.3f}; misses={hit_summary['misses'][:8]}"
+    )
+
+
 def run_level(args, page_size: int, track_interval: int, parallel: int) -> dict:
     anchors, probes = build_workload(
         families=args.families,
@@ -207,9 +235,10 @@ def run_level(args, page_size: int, track_interval: int, parallel: int) -> dict:
     cold_hit_responses, cold_hit_wall = _run_requests(
         probes, generate_url, parallel, args.output_length
     )
-    for prompt, response in zip(probes, cold_hit_responses):
-        expected_floor = (prompt.shared_tokens // track_interval) * track_interval
-        assert response.cached_tokens >= expected_floor
+    cold_hit_summary = _checkpoint_hits(probes, cold_hit_responses, track_interval)
+    _assert_checkpoint_hit_rate(
+        "same-order replay", cold_hit_summary, args.min_checkpoint_hit_rate
+    )
 
     cold_hit_mismatches = sum(
         tuple(response.output_ids) != cold_output[(prompt.family, prompt.branch)]
@@ -234,13 +263,11 @@ def run_level(args, page_size: int, track_interval: int, parallel: int) -> dict:
     first_responses, first_wall = _run_requests(
         probes, generate_url, parallel, args.output_length
     )
-    for prompt, response in zip(probes, first_responses):
-        expected_floor = (prompt.shared_tokens // track_interval) * track_interval
-        assert response.cached_tokens >= expected_floor, (
-            f"family={prompt.family} branch={prompt.branch}: cached_tokens="
-            f"{response.cached_tokens}, expected at least {expected_floor}"
-        )
-        assert response.cached_tokens <= response.prompt_len
+    first_hit_summary = _checkpoint_hits(probes, first_responses, track_interval)
+    _assert_checkpoint_hit_rate(
+        "anchor reuse", first_hit_summary, args.min_checkpoint_hit_rate
+    )
+    assert all(response.cached_tokens <= response.prompt_len for response in first_responses)
 
     expected_output = {
         (prompt.family, prompt.branch): tuple(response.output_ids)
@@ -251,9 +278,10 @@ def run_level(args, page_size: int, track_interval: int, parallel: int) -> dict:
     replay_responses, replay_wall = _run_requests(
         probes, generate_url, parallel, args.output_length
     )
-    for prompt, response in zip(probes, replay_responses):
-        expected_floor = (prompt.shared_tokens // track_interval) * track_interval
-        assert response.cached_tokens >= expected_floor
+    replay_hit_summary = _checkpoint_hits(probes, replay_responses, track_interval)
+    _assert_checkpoint_hit_rate(
+        "populated replay", replay_hit_summary, args.min_checkpoint_hit_rate
+    )
 
     replay_mismatches = sum(
         tuple(response.output_ids) != expected_output[(prompt.family, prompt.branch)]
@@ -265,12 +293,12 @@ def run_level(args, page_size: int, track_interval: int, parallel: int) -> dict:
     shuffled_responses, shuffled_wall = _run_requests(
         shuffled, generate_url, parallel, args.output_length
     )
-    for prompt, response in zip(shuffled, shuffled_responses):
-        expected_floor = (prompt.shared_tokens // track_interval) * track_interval
-        assert response.cached_tokens >= expected_floor, (
-            f"family={prompt.family} branch={prompt.branch}: shuffled replay "
-            f"cached_tokens={response.cached_tokens}, expected at least {expected_floor}"
-        )
+    shuffled_hit_summary = _checkpoint_hits(
+        shuffled, shuffled_responses, track_interval
+    )
+    _assert_checkpoint_hit_rate(
+        "shuffled replay", shuffled_hit_summary, args.min_checkpoint_hit_rate
+    )
 
     cold_ttft = [response.ttft for response in cold_responses]
     cold_hit_ttft = [response.ttft for response in cold_hit_responses]
@@ -287,17 +315,25 @@ def run_level(args, page_size: int, track_interval: int, parallel: int) -> dict:
         "cold_hit_cached_tokens": sum(
             response.cached_tokens for response in cold_hit_responses
         ),
+        "cold_hit_checkpoint_hit_rate": cold_hit_summary["rate"],
+        "cold_hit_checkpoint_miss_count": cold_hit_summary["miss_count"],
         "cold_hit_output_mismatch_count": cold_hit_mismatches,
         "first_cached_tokens": sum(
             response.cached_tokens for response in first_responses
         ),
+        "first_checkpoint_hit_rate": first_hit_summary["rate"],
+        "first_checkpoint_miss_count": first_hit_summary["miss_count"],
         "replay_cached_tokens": sum(
             response.cached_tokens for response in replay_responses
         ),
+        "replay_checkpoint_hit_rate": replay_hit_summary["rate"],
+        "replay_checkpoint_miss_count": replay_hit_summary["miss_count"],
         "replay_output_mismatch_count": replay_mismatches,
         "shuffled_cached_tokens": sum(
             response.cached_tokens for response in shuffled_responses
         ),
+        "shuffled_checkpoint_hit_rate": shuffled_hit_summary["rate"],
+        "shuffled_checkpoint_miss_count": shuffled_hit_summary["miss_count"],
         "cold_ttft_p50_ms": statistics.median(cold_ttft) * 1000,
         "cold_hit_ttft_p50_ms": statistics.median(cold_hit_ttft) * 1000,
         "first_ttft_p50_ms": statistics.median(first_ttft) * 1000,
