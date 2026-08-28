@@ -351,7 +351,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         layer: RadixLinearAttention,
         scale: float | None = None,
     ) -> tuple[jax.Array, jax.Array]:
-        """Prefill via Mega KDA, with a guarded fallback to the chunked kernel."""
+        """Prefill via Mega KDA, with guarded fallbacks to the chunked kernel."""
         if layer.A_log is None or layer.dt_bias is None:
             raise ValueError("KDA gate activation requires layer.A_log and layer.dt_bias")
         H = q.shape[-2]
@@ -417,7 +417,15 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
                 cu_seqlens,
                 padded_tokens,
             )
-            return jax.lax.cond(layout_supported, _mega, _chunked, operands)
+            # Mega is numerically stable for the first (zero-state) prefill,
+            # but multi-request recurrent state chaining can corrupt Ling-3
+            # outputs when fine-grained radix snapshots force several EXTEND
+            # forwards. Preserve the fast first segment and use the established
+            # chunked implementation once any request carries recurrent state.
+            # This device-side guard also covers mixed cold/cache-hit batches.
+            has_recurrent_state = jnp.any(initial_state != 0)
+            mega_supported = layout_supported & ~has_recurrent_state
+            return jax.lax.cond(mega_supported, _mega, _chunked, operands)
 
         sharded = jax.shard_map(
             _prefill_call,
