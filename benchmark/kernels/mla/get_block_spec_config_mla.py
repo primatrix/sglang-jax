@@ -298,7 +298,7 @@ def _sweep_decode(
             continue
         print(
             f"# [{i + 1}/{len(candidates)}] decode mnt={max_num_tokens} "
-            f"bkv_p={bkv_p} bq={bq} dbs={dbs} t={t_ms * 1000:.4f}ms",
+            f"bkv_p={bkv_p} bq={bq} dbs={dbs} t={t_ms:.4f}ms",
             flush=True,
         )
         if (bkv_p, bq, dbs) == _HEURISTIC_DECODE:
@@ -380,7 +380,7 @@ def _sweep_mixed(
             continue
         print(
             f"# [{i + 1}/{len(candidates)}] mixed mnt={max_num_tokens} "
-            f"bkv_p={bkv_p} bq={bq} t={t_ms * 1000:.4f}ms",
+            f"bkv_p={bkv_p} bq={bq} t={t_ms:.4f}ms",
             flush=True,
         )
         if (bkv_p, bq) == _HEURISTIC_MIXED:
@@ -587,8 +587,8 @@ def main():
         rows.append((key, best, best_t, heur, heur_t, delta_pct, n_attempted, n_failed))
         win = "WIN " if delta_pct >= args.write_threshold_pct else "skip"
         print(
-            f"# [{win}] {key}: heur={heur} {heur_t * 1000:.4f}ms "
-            f"best={best} {best_t * 1000:.4f}ms Δ={delta_pct:+.1f}% "
+            f"# [{win}] {key}: heur={heur} {heur_t:.4f}ms "
+            f"best={best} {best_t:.4f}ms Δ={delta_pct:+.1f}% "
             f"(tried {n_attempted}, failed {n_failed})"
         )
 
@@ -629,8 +629,8 @@ def main():
                     "max_num_tokens": max_num_tokens,
                     "best_config": list(best),
                     "heuristic_config": list(heur),
-                    "latency_ms": best_t * 1000.0,
-                    "heuristic_latency_ms": heur_t * 1000.0,
+                    "latency_ms": best_t,
+                    "heuristic_latency_ms": heur_t,
                     "speedup_pct": delta_pct,
                     "candidate_count": attempted,
                     "failed_candidate_count": failed,
@@ -641,8 +641,8 @@ def main():
     print("# --- All measured (for audit) ---")
     for key, best, best_t, heur, heur_t, delta_pct, n_attempted, n_failed in rows:
         print(
-            f"# {key}: best={best} ({best_t * 1000:.4f}ms) "
-            f"heur={heur} ({heur_t * 1000:.4f}ms) Δ={delta_pct:+.1f}% "
+            f"# {key}: best={best} ({best_t:.4f}ms) "
+            f"heur={heur} ({heur_t:.4f}ms) Δ={delta_pct:+.1f}% "
             f"(tried {n_attempted}, failed {n_failed})"
         )
 
