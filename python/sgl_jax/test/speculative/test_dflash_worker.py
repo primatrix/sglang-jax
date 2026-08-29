@@ -149,6 +149,39 @@ def test_redenoise_stats_separate_repairs_harms_and_accept_delta():
     np.testing.assert_array_equal(worker._redenoise_stats_start_accept_delta, [0, 0, 0, 0])
 
 
+def test_top2_shadow_measures_first_rejection_branch_coverage():
+    worker = _bare_worker(
+        block_size=4,
+        draft_block_size=3,
+        _top2_shadow_batches=0,
+        _top2_shadow_rounds=0,
+        _top2_shadow_rejections=0,
+        _top2_shadow_hits=0,
+        _top2_shadow_width_hits=np.zeros((3,), dtype=np.int64),
+        _top2_shadow_reject_position=np.zeros((3,), dtype=np.int64),
+        _top2_shadow_hit_position=np.zeros((3,), dtype=np.int64),
+    )
+    worker._record_top2_shadow_stats(
+        accept_lens=np.array([2, 1, 4], dtype=np.int32),
+        base_draft_token=np.array([[10, 1, 2, 3], [20, 4, 5, 6], [30, 7, 8, 9]], dtype=np.int32),
+        top2_draft_token=np.array(
+            [[10, 11, 9, 13], [20, 8, 15, 16], [30, 17, 18, 19]], dtype=np.int32
+        ),
+        top2_margins=np.array(
+            [[0.1, 10.0, 5.0], [0.2, 0.1, 3.0], [1.0, 2.0, 3.0]], dtype=np.float32
+        ),
+        target_predict_flat=np.array([[1, 9, 3, 99], [8, 5, 6, 99], [7, 8, 9, 99]], dtype=np.int32),
+        selector=np.array([0, 1, 2], dtype=np.int32),
+    )
+
+    assert worker._top2_shadow_rounds == 3
+    assert worker._top2_shadow_rejections == 2
+    assert worker._top2_shadow_hits == 2
+    np.testing.assert_array_equal(worker._top2_shadow_width_hits, [0, 2, 2])
+    np.testing.assert_array_equal(worker._top2_shadow_reject_position, [1, 1, 0])
+    np.testing.assert_array_equal(worker._top2_shadow_hit_position, [1, 1, 0])
+
+
 def test_prefill_draft_extend_metadata_preserves_dp_rank_sections():
     # DP=2, four token rows per rank. Rank-local padding must stay between
     # rank 0's real rows and rank 1's real rows.

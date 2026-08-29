@@ -206,6 +206,7 @@ class ServerArgs:
     speculative_accept_threshold_acc: float = 1.0
     enable_dflash_anchor: bool = False
     enable_dflash_feedback_shadow: bool = False
+    enable_dflash_top2_shadow: bool = False
     enable_dflash_ngram: bool = False
     dflash_ngram_min_match: int = 3
     dflash_ngram_max_match: int = 8
@@ -1559,6 +1560,15 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
+            "--enable-dflash-top2-shadow",
+            action="store_true",
+            default=ServerArgs.enable_dflash_top2_shadow,
+            help=(
+                "Measure whether a fixed set of top-2 single-position DFlash "
+                "branches covers the first greedy rejection, without changing proposals."
+            ),
+        )
+        parser.add_argument(
             "--enable-dflash-ngram",
             action="store_true",
             default=ServerArgs.enable_dflash_ngram,
@@ -2090,6 +2100,24 @@ class ServerArgs:
                 raise ValueError(
                     "--enable-dflash-feedback-shadow currently requires --disable-overlap-schedule."
                 )
+            if self.enable_dflash_top2_shadow and not self.disable_overlap_schedule:
+                raise ValueError(
+                    "--enable-dflash-top2-shadow currently requires --disable-overlap-schedule."
+                )
+            if self.enable_dflash_top2_shadow:
+                if not self.enable_dflash_anchor:
+                    raise ValueError(
+                        "--enable-dflash-top2-shadow currently requires --enable-dflash-anchor."
+                    )
+                if (
+                    self.enable_dflash_ngram
+                    or self.enable_dflash_flashback
+                    or self.enable_dflash_redenoise
+                ):
+                    raise ValueError(
+                        "--enable-dflash-top2-shadow requires DFlash proposal reranking "
+                        "and re-denoising to remain disabled."
+                    )
             if self.enable_dflash_feedback_shadow and (
                 self.enable_dflash_ngram or self.enable_dflash_flashback
             ):
@@ -2144,6 +2172,10 @@ class ServerArgs:
             if self.enable_dflash_feedback_shadow:
                 raise ValueError(
                     "--enable-dflash-feedback-shadow requires --speculative-algorithm DFLASH."
+                )
+            if self.enable_dflash_top2_shadow:
+                raise ValueError(
+                    "--enable-dflash-top2-shadow requires --speculative-algorithm DFLASH."
                 )
             if self.enable_dflash_ngram:
                 raise ValueError("--enable-dflash-ngram requires --speculative-algorithm DFLASH.")

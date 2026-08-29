@@ -293,6 +293,20 @@ def test_dflash_feedback_shadow_parses_and_requires_non_overlap():
         args.check_server_args()
 
 
+def test_dflash_top2_shadow_parses_and_requires_non_overlap():
+    args = _dflash_args(
+        speculative_num_draft_tokens=7,
+        enable_dflash_anchor=True,
+        enable_dflash_top2_shadow=True,
+    )
+    args.check_server_args()
+    assert args.enable_dflash_top2_shadow
+
+    args.disable_overlap_schedule = False
+    with pytest.raises(ValueError, match="requires --disable-overlap-schedule"):
+        args.check_server_args()
+
+
 def test_dflash_feedback_shadow_rejects_active_reranking():
     args = _dflash_args(
         speculative_num_draft_tokens=7,

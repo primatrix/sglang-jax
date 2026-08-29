@@ -130,6 +130,8 @@ class TargetVerifyPlan:
     relay_valid_mask: jax.Array
     draft_token: jax.Array
     base_draft_token: jax.Array
+    top2_draft_token: jax.Array
+    top2_margins: jax.Array
     redenoise_candidate_token: jax.Array
     redenoise_prefix_lens: jax.Array
     flashback_token_ids: jax.Array
@@ -162,6 +164,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self._ngram_enabled = bool(server_args.enable_dflash_ngram)
         self._ngram_max_rerank_positions = int(server_args.dflash_ngram_max_rerank_positions)
         self._feedback_shadow_enabled = bool(server_args.enable_dflash_feedback_shadow)
+        self._top2_shadow_enabled = bool(server_args.enable_dflash_top2_shadow)
         self._redenoise_enabled = bool(server_args.enable_dflash_redenoise)
         self._redenoise_margin_threshold = float(server_args.dflash_redenoise_margin_threshold)
         self._redenoise_prefix_len = int(server_args.dflash_redenoise_prefix_len)
@@ -180,6 +183,13 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self._redenoise_stats_start_accept_delta = np.zeros(
             (self.draft_block_size + 1,), dtype=np.int64
         )
+        self._top2_shadow_batches = 0
+        self._top2_shadow_rounds = 0
+        self._top2_shadow_rejections = 0
+        self._top2_shadow_hits = 0
+        self._top2_shadow_width_hits = np.zeros((3,), dtype=np.int64)
+        self._top2_shadow_reject_position = np.zeros((self.draft_block_size,), dtype=np.int64)
+        self._top2_shadow_hit_position = np.zeros((self.draft_block_size,), dtype=np.int64)
         self._ngram_stats_batches = 0
         self._ngram_stats_rounds = 0
         self._ngram_stats_covered_rounds = 0
@@ -344,7 +354,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         logger.info(
             "Initialized DFLASH worker: draft_block_size=%d, verify_block_size=%d, "
             "enable_anchor=%s, mask_token_id=%d, "
-            "draft_layers=%d, ngram=%s, feedback_shadow=%s, flashback=%s, redenoise=%s, "
+            "draft_layers=%d, ngram=%s, feedback_shadow=%s, top2_shadow=%s, "
+            "flashback=%s, redenoise=%s, "
             "ngram_max_rerank_positions=%d, "
             "redenoise_margin_threshold=%.3f, redenoise_prefix_len=%d, "
             "redenoise_apply_start=%d, "
@@ -359,6 +370,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             self.draft_layers,
             self._ngram_enabled,
             self._feedback_shadow_enabled,
+            self._top2_shadow_enabled,
             self._flashback_enabled,
             self._redenoise_enabled,
             self._ngram_max_rerank_positions,
@@ -431,6 +443,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         (
             draft_token,
             base_draft_token,
+            top2_draft_token,
+            top2_margins,
             redenoise_candidate_token,
             redenoise_prefix_lens,
             resolved_target_prefix_lens,
@@ -447,6 +461,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             draft_plan,
             draft_token,
             base_draft_token,
+            top2_draft_token,
+            top2_margins,
             redenoise_candidate_token,
             redenoise_prefix_lens,
             resolved_target_prefix_lens,
@@ -580,6 +596,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             next_flashback_valid_mask,
             draft_token,
             base_draft_token,
+            top2_draft_token,
+            top2_margins,
             redenoise_candidate_token,
             redenoise_prefix_lens,
             prior_flashback_token_ids,
@@ -603,6 +621,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 next_draft_input.flashback_valid_mask,
                 plan.draft_token,
                 plan.base_draft_token,
+                plan.top2_draft_token,
+                plan.top2_margins,
                 plan.redenoise_candidate_token,
                 plan.redenoise_prefix_lens,
                 plan.flashback_token_ids,
@@ -665,6 +685,15 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 final_draft_token=np.asarray(draft_token, dtype=np.int32),
                 target_predict_flat=np.asarray(target_predict, dtype=np.int32),
                 prefix_lens=np.asarray(redenoise_prefix_lens, dtype=np.int32),
+                selector=selector,
+            )
+        if self._top2_shadow_enabled:
+            self._record_top2_shadow_stats(
+                accept_lens=accept_lens,
+                base_draft_token=np.asarray(base_draft_token, dtype=np.int32),
+                top2_draft_token=np.asarray(top2_draft_token, dtype=np.int32),
+                top2_margins=np.asarray(top2_margins, dtype=np.float32),
+                target_predict_flat=np.asarray(target_predict, dtype=np.int32),
                 selector=selector,
             )
         active_mask = np.zeros((accept_lens.shape[0],), dtype=np.bool_)
@@ -777,6 +806,77 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             self._redenoise_stats_position_repairs.tolist(),
             self._redenoise_stats_position_harms.tolist(),
             (self._redenoise_stats_start_accept_delta / rounds).tolist(),
+        )
+
+    def _record_top2_shadow_stats(
+        self,
+        *,
+        accept_lens: np.ndarray,
+        base_draft_token: np.ndarray,
+        top2_draft_token: np.ndarray,
+        top2_margins: np.ndarray,
+        target_predict_flat: np.ndarray,
+        selector: np.ndarray,
+    ) -> None:
+        """Measure fixed-width top-2 branch coverage at the first rejection.
+
+        Only the token at the first rejected proposal has a target label that
+        is valid under the verified prefix.  Consequently this reports a
+        conservative one-token lower bound instead of pretending that logits
+        after the rejection describe the corrected branch.
+        """
+        padded_bs = int(accept_lens.shape[0])
+        proposal_width = self.block_size - 1
+        base = base_draft_token.reshape(padded_bs, self.block_size)[selector, 1:]
+        top2 = top2_draft_token.reshape(padded_bs, self.block_size)[selector, 1:]
+        margins = top2_margins.reshape(padded_bs, proposal_width)[selector]
+        target = target_predict_flat.reshape(padded_bs, self.block_size)[selector, :proposal_width]
+        selected_accept = accept_lens.reshape(padded_bs)[selector]
+        reject_positions = selected_accept - 1
+        rejected = (reject_positions >= 0) & (reject_positions < proposal_width)
+        rows = np.arange(len(selector), dtype=np.int32)
+        safe_positions = np.clip(reject_positions, 0, proposal_width - 1)
+        first_reject_consistent = base[rows, safe_positions] != target[rows, safe_positions]
+        rejected &= first_reject_consistent
+        hits = rejected & (top2[rows, safe_positions] == target[rows, safe_positions])
+
+        self._top2_shadow_batches += 1
+        self._top2_shadow_rounds += len(selector)
+        self._top2_shadow_rejections += int(rejected.sum())
+        self._top2_shadow_hits += int(hits.sum())
+        self._top2_shadow_reject_position += np.bincount(
+            safe_positions[rejected], minlength=proposal_width
+        )[:proposal_width]
+        self._top2_shadow_hit_position += np.bincount(
+            safe_positions[hits], minlength=proposal_width
+        )[:proposal_width]
+
+        ranked_positions = np.argsort(margins, axis=1, kind="stable")
+        for width_index, chain_width in enumerate((2, 4, 8)):
+            alternative_count = min(chain_width - 1, proposal_width)
+            selected_positions = ranked_positions[:, :alternative_count]
+            covered = np.any(selected_positions == safe_positions[:, None], axis=1)
+            self._top2_shadow_width_hits[width_index] += int((hits & covered).sum())
+
+        if self._top2_shadow_batches % 100 != 0:
+            return
+        rounds = max(1, self._top2_shadow_rounds)
+        rejections = max(1, self._top2_shadow_rejections)
+        logger.info(
+            "[DFLASH-TOP2-SHADOW] batches=%d rounds=%d rejection_rate=%.6f "
+            "top2_first_reject_hit_rate=%.6f lower_bound_accept_gain=%.6f "
+            "margin_width2_gain=%.6f margin_width4_gain=%.6f "
+            "all_positions_gain=%.6f reject_position=%s hit_position=%s",
+            self._top2_shadow_batches,
+            self._top2_shadow_rounds,
+            self._top2_shadow_rejections / rounds,
+            self._top2_shadow_hits / rejections,
+            self._top2_shadow_hits / rounds,
+            self._top2_shadow_width_hits[0] / rounds,
+            self._top2_shadow_width_hits[1] / rounds,
+            self._top2_shadow_width_hits[2] / rounds,
+            self._top2_shadow_reject_position.tolist(),
+            self._top2_shadow_hit_position.tolist(),
         )
 
     def _record_ngram_stats(
@@ -1574,6 +1674,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         draft_plan: DraftForwardPlan,
         draft_token: jax.Array,
         base_draft_token: jax.Array,
+        top2_draft_token: jax.Array,
+        top2_margins: jax.Array,
         redenoise_candidate_token: jax.Array,
         redenoise_prefix_lens: jax.Array,
         resolved_target_prefix_lens: jax.Array,
@@ -1648,6 +1750,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             relay_valid_mask=draft_plan.relay_valid_mask,
             draft_token=draft_token,
             base_draft_token=base_draft_token,
+            top2_draft_token=top2_draft_token,
+            top2_margins=top2_margins,
             redenoise_candidate_token=redenoise_candidate_token,
             redenoise_prefix_lens=redenoise_prefix_lens,
             flashback_token_ids=draft_plan.flashback_token_ids,
@@ -1715,6 +1819,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         verify_block_size = self.block_size
         enable_anchor = self.enable_anchor
         redenoise_enabled = self._redenoise_enabled
+        top2_shadow_enabled = self._top2_shadow_enabled
         redenoise_margin_threshold = self._redenoise_margin_threshold
         redenoise_prefix_len = self._redenoise_prefix_len
         redenoise_apply_start = self._redenoise_apply_start
@@ -1740,6 +1845,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 "flashback_enabled",
                 "feedback_shadow_enabled",
                 "redenoise_enabled",
+                "top2_shadow_enabled",
                 "redenoise_apply_start",
                 "dp_size",
             ],
@@ -1774,6 +1880,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             flashback_enabled: bool,
             feedback_shadow_enabled: bool,
             redenoise_enabled: bool,
+            top2_shadow_enabled: bool,
             redenoise_apply_start: int,
             ngram_max_rerank_positions: int,
             dp_size: int,
@@ -1902,6 +2009,13 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             else:
                 draft_next = jnp.argmax(logits, axis=-1).astype(jnp.int32)
             base_draft_next = draft_next
+            if top2_shadow_enabled:
+                top2_values, top2_ids = jax.lax.top_k(logits, 2)
+                top2_next = top2_ids[..., 1].astype(jnp.int32)
+                top2_margins = (top2_values[..., 0] - top2_values[..., 1]).astype(jnp.float32)
+            else:
+                top2_next = draft_next
+                top2_margins = jnp.zeros(logits.shape[:-1], dtype=jnp.float32)
             redenoise_candidate_next = draft_next
             prefix_lens = jnp.zeros((draft_next.shape[0],), dtype=jnp.int32)
             if redenoise_enabled:
@@ -1991,6 +2105,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             seed = forward_batch.input_ids.reshape((-1, draft_block_size))[:, :1]
             seed = jax.sharding.reshard(seed, cache_row_sharding)
             base_draft_next = jax.sharding.reshard(base_draft_next, cache_row_sharding)
+            top2_next = jax.sharding.reshard(top2_next, cache_row_sharding)
+            top2_margins = jax.sharding.reshard(top2_margins, cache_row_sharding)
             redenoise_candidate_next = jax.sharding.reshard(
                 redenoise_candidate_next, cache_row_sharding
             )
@@ -1998,6 +2114,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             prefix_lens = jax.sharding.reshard(prefix_lens, token_sharding)
             base_draft_token = jnp.concatenate([seed, base_draft_next], axis=1).reshape(-1)
             base_draft_token = jax.sharding.reshard(base_draft_token, token_sharding)
+            top2_draft_token = jnp.concatenate([seed, top2_next], axis=1).reshape(-1)
+            top2_draft_token = jax.sharding.reshard(top2_draft_token, token_sharding)
             redenoise_candidate_token = jnp.concatenate(
                 [seed, redenoise_candidate_next], axis=1
             ).reshape(-1)
@@ -2015,6 +2133,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 pool_updates,
                 draft_token,
                 base_draft_token,
+                top2_draft_token,
+                top2_margins,
                 redenoise_candidate_token,
                 prefix_lens,
                 target_prefix_lens,
@@ -2036,6 +2156,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             flashback_enabled=self._flashback_enabled,
             feedback_shadow_enabled=self._feedback_shadow_enabled,
             redenoise_enabled=redenoise_enabled,
+            top2_shadow_enabled=top2_shadow_enabled,
             redenoise_apply_start=redenoise_apply_start,
             ngram_max_rerank_positions=self._ngram_max_rerank_positions,
         )
@@ -2050,6 +2171,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 pool_updates,
                 draft_token,
                 base_draft_token,
+                top2_draft_token,
+                top2_margins,
                 redenoise_candidate_token,
                 prefix_lens,
                 target_prefix_lens,
@@ -2082,6 +2205,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             return (
                 draft_token,
                 base_draft_token,
+                top2_draft_token,
+                top2_margins,
                 redenoise_candidate_token,
                 prefix_lens,
                 target_prefix_lens,
