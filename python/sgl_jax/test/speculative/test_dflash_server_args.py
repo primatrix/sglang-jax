@@ -193,6 +193,8 @@ def test_dflash_server_args_parses_redenoise_controls(monkeypatch):
             "1.5",
             "--dflash-redenoise-prefix-len",
             "2",
+            "--dflash-redenoise-apply-start",
+            "4",
             "--grammar-backend",
             "none",
         ]
@@ -202,6 +204,7 @@ def test_dflash_server_args_parses_redenoise_controls(monkeypatch):
     assert args.enable_dflash_redenoise
     assert args.dflash_redenoise_margin_threshold == 1.5
     assert args.dflash_redenoise_prefix_len == 2
+    assert args.dflash_redenoise_apply_start == 4
 
 
 def test_dflash_redenoise_defaults_to_tpu_safe_fixed_prefix():

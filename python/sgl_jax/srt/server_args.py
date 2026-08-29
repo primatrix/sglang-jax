@@ -221,6 +221,7 @@ class ServerArgs:
     enable_dflash_redenoise: bool = False
     dflash_redenoise_margin_threshold: float = 1.0
     dflash_redenoise_prefix_len: int = 2
+    dflash_redenoise_apply_start: int = -1
 
     # For deterministic sampling
     enable_deterministic_sampling: bool = False
@@ -1657,6 +1658,15 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
+            "--dflash-redenoise-apply-start",
+            type=int,
+            default=ServerArgs.dflash_redenoise_apply_start,
+            help=(
+                "First proposal position allowed to use pass-two tokens; -1 starts "
+                "at the visible prefix boundary. Set it to block_size for shadow mode."
+            ),
+        )
+        parser.add_argument(
             "--speculative-accept-threshold-single",
             type=float,
             help="Accept a draft token if its probability in the target model is greater than this threshold.",
@@ -2126,6 +2136,8 @@ class ServerArgs:
                     raise ValueError("--dflash-redenoise-margin-threshold must be >= 0.")
                 if self.dflash_redenoise_prefix_len < -1:
                     raise ValueError("--dflash-redenoise-prefix-len must be >= -1.")
+                if self.dflash_redenoise_apply_start < -1:
+                    raise ValueError("--dflash-redenoise-apply-start must be >= -1.")
         else:
             if self.enable_dflash_anchor:
                 raise ValueError("--enable-dflash-anchor requires --speculative-algorithm DFLASH.")

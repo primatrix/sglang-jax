@@ -118,6 +118,9 @@ def _redenoise_worker(block_size: int):
         _redenoise_stats_final_accept=0,
         _redenoise_stats_accept_delta=0,
         _redenoise_stats_prefix_hist=np.zeros((block_size - 1,), dtype=np.int64),
+        _redenoise_stats_position_repairs=np.zeros((block_size - 1,), dtype=np.int64),
+        _redenoise_stats_position_harms=np.zeros((block_size - 1,), dtype=np.int64),
+        _redenoise_stats_start_accept_delta=np.zeros((block_size,), dtype=np.int64),
     )
 
 
@@ -126,6 +129,7 @@ def test_redenoise_stats_separate_repairs_harms_and_accept_delta():
     worker._record_redenoise_stats(
         accept_lens=np.array([4, 2], dtype=np.int32),
         base_draft_token=np.array([[10, 1, 2, 3], [20, 4, 5, 6]], dtype=np.int32),
+        candidate_draft_token=np.array([[10, 1, 9, 3], [20, 4, 8, 6]], dtype=np.int32),
         final_draft_token=np.array([[10, 1, 9, 3], [20, 4, 8, 6]], dtype=np.int32),
         target_predict_flat=np.array([[1, 9, 3, 99], [4, 5, 6, 99]], dtype=np.int32),
         prefix_lens=np.array([1, 1], dtype=np.int32),
@@ -140,6 +144,9 @@ def test_redenoise_stats_separate_repairs_harms_and_accept_delta():
     assert worker._redenoise_stats_final_accept == 6
     assert worker._redenoise_stats_accept_delta == 0
     np.testing.assert_array_equal(worker._redenoise_stats_prefix_hist, [0, 2, 0])
+    np.testing.assert_array_equal(worker._redenoise_stats_position_repairs, [0, 1, 0])
+    np.testing.assert_array_equal(worker._redenoise_stats_position_harms, [0, 1, 0])
+    np.testing.assert_array_equal(worker._redenoise_stats_start_accept_delta, [0, 0, 0, 0])
 
 
 def test_prefill_draft_extend_metadata_preserves_dp_rank_sections():

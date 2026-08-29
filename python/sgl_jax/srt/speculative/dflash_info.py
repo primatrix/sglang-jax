@@ -184,6 +184,8 @@ def merge_dflash_redenoise_tokens(
     first_pass_tokens: jax.Array,
     second_pass_tokens: jax.Array,
     prefix_lens: jax.Array,
+    *,
+    apply_start: int = -1,
 ) -> jax.Array:
     """Keep the frozen prefix and take the remasked suffix from pass two."""
     if first_pass_tokens.shape != second_pass_tokens.shape:
@@ -196,8 +198,11 @@ def merge_dflash_redenoise_tokens(
             "DFLASH re-denoise prefix shape differs from proposal batch: "
             f"{prefix_lens.shape} vs {first_pass_tokens.shape[:-1]}."
         )
+    keep_lens = prefix_lens
+    if int(apply_start) >= 0:
+        keep_lens = jnp.maximum(keep_lens, jnp.int32(apply_start))
     offsets = jnp.arange(first_pass_tokens.shape[-1], dtype=jnp.int32)
-    keep_first = offsets < prefix_lens[..., None]
+    keep_first = offsets < keep_lens[..., None]
     proposal_sharding = jax.typeof(first_pass_tokens).sharding
     proposal_mesh = getattr(proposal_sharding, "mesh", None)
     if proposal_mesh is not None and proposal_mesh.axis_names:

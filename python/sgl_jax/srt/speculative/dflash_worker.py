@@ -130,6 +130,7 @@ class TargetVerifyPlan:
     relay_valid_mask: jax.Array
     draft_token: jax.Array
     base_draft_token: jax.Array
+    redenoise_candidate_token: jax.Array
     redenoise_prefix_lens: jax.Array
     flashback_token_ids: jax.Array
     flashback_valid_mask: jax.Array
@@ -164,6 +165,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self._redenoise_enabled = bool(server_args.enable_dflash_redenoise)
         self._redenoise_margin_threshold = float(server_args.dflash_redenoise_margin_threshold)
         self._redenoise_prefix_len = int(server_args.dflash_redenoise_prefix_len)
+        self._redenoise_apply_start = int(server_args.dflash_redenoise_apply_start)
         self._redenoise_stats_batches = 0
         self._redenoise_stats_rounds = 0
         self._redenoise_stats_changed = 0
@@ -173,6 +175,11 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self._redenoise_stats_final_accept = 0
         self._redenoise_stats_accept_delta = 0
         self._redenoise_stats_prefix_hist = np.zeros((self.draft_block_size,), dtype=np.int64)
+        self._redenoise_stats_position_repairs = np.zeros((self.draft_block_size,), dtype=np.int64)
+        self._redenoise_stats_position_harms = np.zeros((self.draft_block_size,), dtype=np.int64)
+        self._redenoise_stats_start_accept_delta = np.zeros(
+            (self.draft_block_size + 1,), dtype=np.int64
+        )
         self._ngram_stats_batches = 0
         self._ngram_stats_rounds = 0
         self._ngram_stats_covered_rounds = 0
@@ -340,6 +347,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             "draft_layers=%d, ngram=%s, feedback_shadow=%s, flashback=%s, redenoise=%s, "
             "ngram_max_rerank_positions=%d, "
             "redenoise_margin_threshold=%.3f, redenoise_prefix_len=%d, "
+            "redenoise_apply_start=%d, "
             "flashback_bonus=%.3f, "
             "flashback_target_margin_weight=%.3f, flashback_position_decay=%.3f, "
             "page_indices_pool_capacity=%d, "
@@ -356,6 +364,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             self._ngram_max_rerank_positions,
             self._redenoise_margin_threshold,
             self._redenoise_prefix_len,
+            self._redenoise_apply_start,
             self._flashback_bonus,
             self._flashback_target_margin_weight,
             self._flashback_position_decay,
@@ -422,6 +431,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         (
             draft_token,
             base_draft_token,
+            redenoise_candidate_token,
             redenoise_prefix_lens,
             resolved_target_prefix_lens,
             resolved_positions,
@@ -437,6 +447,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             draft_plan,
             draft_token,
             base_draft_token,
+            redenoise_candidate_token,
             redenoise_prefix_lens,
             resolved_target_prefix_lens,
             resolved_positions,
@@ -569,6 +580,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             next_flashback_valid_mask,
             draft_token,
             base_draft_token,
+            redenoise_candidate_token,
             redenoise_prefix_lens,
             prior_flashback_token_ids,
             prior_flashback_valid_mask,
@@ -591,6 +603,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 next_draft_input.flashback_valid_mask,
                 plan.draft_token,
                 plan.base_draft_token,
+                plan.redenoise_candidate_token,
                 plan.redenoise_prefix_lens,
                 plan.flashback_token_ids,
                 plan.flashback_valid_mask,
@@ -648,6 +661,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             self._record_redenoise_stats(
                 accept_lens=accept_lens,
                 base_draft_token=np.asarray(base_draft_token, dtype=np.int32),
+                candidate_draft_token=np.asarray(redenoise_candidate_token, dtype=np.int32),
                 final_draft_token=np.asarray(draft_token, dtype=np.int32),
                 target_predict_flat=np.asarray(target_predict, dtype=np.int32),
                 prefix_lens=np.asarray(redenoise_prefix_lens, dtype=np.int32),
@@ -685,6 +699,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         *,
         accept_lens: np.ndarray,
         base_draft_token: np.ndarray,
+        candidate_draft_token: np.ndarray,
         final_draft_token: np.ndarray,
         target_predict_flat: np.ndarray,
         prefix_lens: np.ndarray,
@@ -693,6 +708,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         padded_bs = int(accept_lens.shape[0])
         proposal_width = self.block_size - 1
         base = base_draft_token.reshape(padded_bs, self.block_size)[selector, 1:]
+        candidate = candidate_draft_token.reshape(padded_bs, self.block_size)[selector, 1:]
         final = final_draft_token.reshape(padded_bs, self.block_size)[selector, 1:]
         target = target_predict_flat.reshape(padded_bs, self.block_size)[selector, :proposal_width]
         prefix_lens = prefix_lens.reshape(padded_bs)[selector]
@@ -711,9 +727,25 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self._redenoise_stats_changed += int(changed.sum())
         self._redenoise_stats_repairs += int(repairs.sum())
         self._redenoise_stats_harms += int(harms.sum())
+        self._redenoise_stats_position_repairs += (~base_correct & (candidate == target)).sum(
+            axis=0, dtype=np.int64
+        )
+        self._redenoise_stats_position_harms += (base_correct & (candidate != target)).sum(
+            axis=0, dtype=np.int64
+        )
         self._redenoise_stats_base_accept += int(base_accept.sum())
         self._redenoise_stats_final_accept += int(final_accept.sum())
         self._redenoise_stats_accept_delta += int((final_accept - base_accept).sum())
+        positions = np.arange(proposal_width, dtype=np.int32)[None, :]
+        for apply_start in range(proposal_width + 1):
+            simulated = np.where(positions < apply_start, base, candidate)
+            simulated_correct = simulated == target
+            simulated_accept = (
+                np.logical_and.accumulate(simulated_correct, axis=1).sum(axis=1, dtype=np.int32) + 1
+            )
+            self._redenoise_stats_start_accept_delta[apply_start] += int(
+                (simulated_accept - base_accept).sum()
+            )
         clipped_prefix_lens = np.clip(
             prefix_lens,
             0,
@@ -731,7 +763,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         logger.info(
             "[DFLASH-REDENOISE] batches=%d rounds=%d base_accept_len=%.6f "
             "final_accept_len=%.6f accept_delta=%.6f changed_per_round=%.6f "
-            "repair_rate=%.6f harm_rate=%.6f prefix_hist=%s",
+            "repair_rate=%.6f harm_rate=%.6f prefix_hist=%s "
+            "position_repairs=%s position_harms=%s start_accept_delta=%s",
             self._redenoise_stats_batches,
             self._redenoise_stats_rounds,
             self._redenoise_stats_base_accept / rounds,
@@ -741,6 +774,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             self._redenoise_stats_repairs / changed_count,
             self._redenoise_stats_harms / changed_count,
             self._redenoise_stats_prefix_hist.tolist(),
+            self._redenoise_stats_position_repairs.tolist(),
+            self._redenoise_stats_position_harms.tolist(),
+            (self._redenoise_stats_start_accept_delta / rounds).tolist(),
         )
 
     def _record_ngram_stats(
@@ -1538,6 +1574,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         draft_plan: DraftForwardPlan,
         draft_token: jax.Array,
         base_draft_token: jax.Array,
+        redenoise_candidate_token: jax.Array,
         redenoise_prefix_lens: jax.Array,
         resolved_target_prefix_lens: jax.Array,
         resolved_positions: jax.Array,
@@ -1611,6 +1648,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             relay_valid_mask=draft_plan.relay_valid_mask,
             draft_token=draft_token,
             base_draft_token=base_draft_token,
+            redenoise_candidate_token=redenoise_candidate_token,
             redenoise_prefix_lens=redenoise_prefix_lens,
             flashback_token_ids=draft_plan.flashback_token_ids,
             flashback_valid_mask=draft_plan.flashback_valid_mask,
@@ -1679,6 +1717,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         redenoise_enabled = self._redenoise_enabled
         redenoise_margin_threshold = self._redenoise_margin_threshold
         redenoise_prefix_len = self._redenoise_prefix_len
+        redenoise_apply_start = self._redenoise_apply_start
         vocab_size = self._target_vocab_size
         embedding_sharding = NamedSharding(runner.mesh, P("data", "tensor"))
         logits_sharding = NamedSharding(runner.mesh, P("data", "tensor"))
@@ -1701,6 +1740,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 "flashback_enabled",
                 "feedback_shadow_enabled",
                 "redenoise_enabled",
+                "redenoise_apply_start",
                 "dp_size",
             ],
         )
@@ -1734,6 +1774,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             flashback_enabled: bool,
             feedback_shadow_enabled: bool,
             redenoise_enabled: bool,
+            redenoise_apply_start: int,
             ngram_max_rerank_positions: int,
             dp_size: int,
         ):
@@ -1861,6 +1902,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             else:
                 draft_next = jnp.argmax(logits, axis=-1).astype(jnp.int32)
             base_draft_next = draft_next
+            redenoise_candidate_next = draft_next
             prefix_lens = jnp.zeros((draft_next.shape[0],), dtype=jnp.int32)
             if redenoise_enabled:
                 first_pass_tokens = draft_next
@@ -1908,10 +1950,12 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                     second_proposal_hidden.shape[:-1] + (vocab_size,)
                 )
                 second_tokens = jnp.argmax(second_logits, axis=-1).astype(jnp.int32)
+                redenoise_candidate_next = second_tokens
                 draft_next = merge_dflash_redenoise_tokens(
                     first_pass_tokens,
                     second_tokens,
                     prefix_lens,
+                    apply_start=redenoise_apply_start,
                 )
             if feedback_shadow_enabled:
                 base_token_ids = jnp.argmax(logits, axis=-1).astype(jnp.int32)
@@ -1939,10 +1983,19 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             seed = forward_batch.input_ids.reshape((-1, draft_block_size))[:, :1]
             seed = jax.sharding.reshard(seed, cache_row_sharding)
             base_draft_next = jax.sharding.reshard(base_draft_next, cache_row_sharding)
+            redenoise_candidate_next = jax.sharding.reshard(
+                redenoise_candidate_next, cache_row_sharding
+            )
             draft_next = jax.sharding.reshard(draft_next, cache_row_sharding)
             prefix_lens = jax.sharding.reshard(prefix_lens, token_sharding)
             base_draft_token = jnp.concatenate([seed, base_draft_next], axis=1).reshape(-1)
             base_draft_token = jax.sharding.reshard(base_draft_token, token_sharding)
+            redenoise_candidate_token = jnp.concatenate(
+                [seed, redenoise_candidate_next], axis=1
+            ).reshape(-1)
+            redenoise_candidate_token = jax.sharding.reshard(
+                redenoise_candidate_token, token_sharding
+            )
             draft_token = jnp.concatenate([seed, draft_next], axis=1).reshape(-1)
             draft_token = jax.sharding.reshard(draft_token, token_sharding)
             verify_positions = (
@@ -1954,6 +2007,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 pool_updates,
                 draft_token,
                 base_draft_token,
+                redenoise_candidate_token,
                 prefix_lens,
                 target_prefix_lens,
                 verify_positions,
@@ -1974,6 +2028,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             flashback_enabled=self._flashback_enabled,
             feedback_shadow_enabled=self._feedback_shadow_enabled,
             redenoise_enabled=redenoise_enabled,
+            redenoise_apply_start=redenoise_apply_start,
             ngram_max_rerank_positions=self._ngram_max_rerank_positions,
         )
 
@@ -1987,6 +2042,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 pool_updates,
                 draft_token,
                 base_draft_token,
+                redenoise_candidate_token,
                 prefix_lens,
                 target_prefix_lens,
                 positions,
@@ -2018,6 +2074,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             return (
                 draft_token,
                 base_draft_token,
+                redenoise_candidate_token,
                 prefix_lens,
                 target_prefix_lens,
                 positions,
@@ -2954,6 +3011,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         (
             draft_token,
             base_draft_token,
+            redenoise_candidate_token,
             redenoise_prefix_lens,
             resolved_prefix_lens,
             resolved_positions,
@@ -3008,6 +3066,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             relay_valid_mask=draft_plan.relay_valid_mask,
             draft_token=draft_token,
             base_draft_token=base_draft_token,
+            redenoise_candidate_token=redenoise_candidate_token,
             redenoise_prefix_lens=redenoise_prefix_lens,
             flashback_token_ids=draft_plan.flashback_token_ids,
             flashback_valid_mask=draft_plan.flashback_valid_mask,

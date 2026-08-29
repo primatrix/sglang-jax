@@ -106,6 +106,14 @@ def test_dflash_redenoise_fixed_prefix_clamps_and_preserves_it():
         np.array([[11, 12, 13, 24]], dtype=np.int32),
     )
 
+    delayed = merge_dflash_redenoise_tokens(
+        first,
+        second,
+        prefix_lens,
+        apply_start=4,
+    )
+    np.testing.assert_array_equal(np.asarray(delayed), np.asarray(first))
+
 
 def test_build_dflash_ngram_continuation_uses_longest_suffix_match():
     token_ids = [1, 2, 3, 9, 8, 7, 1, 2, 3]
