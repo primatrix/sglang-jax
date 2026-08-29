@@ -198,6 +198,11 @@ def merge_dflash_redenoise_tokens(
         )
     offsets = jnp.arange(first_pass_tokens.shape[-1], dtype=jnp.int32)
     keep_first = offsets < prefix_lens[..., None]
+    proposal_sharding = jax.typeof(first_pass_tokens).sharding
+    proposal_mesh = getattr(proposal_sharding, "mesh", None)
+    if proposal_mesh is not None and proposal_mesh.axis_names:
+        keep_first = jax.sharding.reshard(keep_first, proposal_sharding)
+        second_pass_tokens = jax.sharding.reshard(second_pass_tokens, proposal_sharding)
     return jnp.where(keep_first, first_pass_tokens, second_pass_tokens)
 
 
