@@ -3145,6 +3145,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         (
             draft_token,
             base_draft_token,
+            _top2_draft_token,
+            _top2_margins,
             redenoise_candidate_token,
             redenoise_prefix_lens,
             resolved_prefix_lens,
