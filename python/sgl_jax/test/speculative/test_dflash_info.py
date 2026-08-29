@@ -12,10 +12,14 @@ from sgl_jax.srt.speculative.dflash_info import (
     build_dflash_flashback_feedback,
     build_dflash_ngram_continuation,
     build_dflash_ngram_continuation_incremental,
+    build_dflash_redenoise_block,
     build_dflash_rejection_feedback,
     dflash_greedy_verify,
+    dflash_top2_margins,
+    merge_dflash_redenoise_tokens,
     select_dflash_ngram_tokens,
     select_dflash_proposal_hidden,
+    select_dflash_redenoise_prefix_lens,
     select_dflash_flashback_tokens,
 )
 from sgl_jax.srt.speculative.overlap_utils import (
@@ -40,6 +44,67 @@ def test_select_dflash_proposal_hidden_anchor_layout_uses_every_row():
     np.testing.assert_array_equal(np.asarray(legacy), np.asarray(hidden[:, 1:, :]))
     assert anchored.shape[1] == 7
     assert legacy.shape[1] == 6
+
+
+def test_dflash_redenoise_builds_confidence_guided_partial_block():
+    logits = jnp.array(
+        [
+            [
+                [0.0, 5.0, 1.0],
+                [0.0, 4.0, 1.0],
+                [0.0, 3.0, 2.5],
+                [0.0, 3.0, 1.0],
+            ],
+            [
+                [0.0, 4.0, 1.0],
+                [0.0, 4.0, 1.0],
+                [0.0, 4.0, 1.0],
+                [0.0, 4.0, 1.0],
+            ],
+        ],
+        dtype=jnp.float32,
+    )
+    margins = dflash_top2_margins(logits)
+    prefix_lens = select_dflash_redenoise_prefix_lens(
+        margins,
+        margin_threshold=1.0,
+        max_prefix_len=3,
+    )
+    block = build_dflash_redenoise_block(
+        jnp.array([10, 20], dtype=jnp.int32),
+        jnp.array([[11, 12, 13, 14], [21, 22, 23, 24]], dtype=jnp.int32),
+        prefix_lens,
+        mask_token_id=99,
+        draft_block_size=4,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(margins),
+        np.array([[4.0, 3.0, 0.5, 2.0], [3.0, 3.0, 3.0, 3.0]]),
+    )
+    np.testing.assert_array_equal(np.asarray(prefix_lens), np.array([2, 3]))
+    np.testing.assert_array_equal(
+        np.asarray(block),
+        np.array([[10, 11, 12, 99], [20, 21, 22, 23]], dtype=np.int32),
+    )
+
+
+def test_dflash_redenoise_fixed_prefix_clamps_and_preserves_it():
+    first = jnp.array([[11, 12, 13, 14]], dtype=jnp.int32)
+    second = jnp.array([[21, 22, 23, 24]], dtype=jnp.int32)
+    prefix_lens = select_dflash_redenoise_prefix_lens(
+        jnp.ones((1, 4), dtype=jnp.float32),
+        margin_threshold=1.0,
+        fixed_prefix_len=9,
+        max_prefix_len=3,
+    )
+    merged = merge_dflash_redenoise_tokens(first, second, prefix_lens)
+
+    np.testing.assert_array_equal(np.asarray(prefix_lens), np.array([3]))
+    np.testing.assert_array_equal(
+        np.asarray(merged),
+        np.array([[11, 12, 13, 24]], dtype=np.int32),
+    )
 
 
 def test_build_dflash_ngram_continuation_uses_longest_suffix_match():

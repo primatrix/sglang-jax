@@ -169,6 +169,50 @@ def test_dflash_server_args_parses_anchor_layout(monkeypatch):
     assert args.speculative_num_draft_tokens == 7
 
 
+def test_dflash_server_args_parses_redenoise_controls(monkeypatch):
+    monkeypatch.setattr(
+        dflash_util,
+        "parse_dflash_draft_config",
+        lambda *args, **kwargs: SimpleNamespace(block_size=7),
+    )
+    args = ServerArgs.from_cli(
+        [
+            "--model-path",
+            "target",
+            "--speculative-algorithm",
+            "DFLASH",
+            "--speculative-draft-model-path",
+            "draft",
+            "--speculative-num-steps",
+            "1",
+            "--speculative-eagle-topk",
+            "1",
+            "--enable-dflash-anchor",
+            "--enable-dflash-redenoise",
+            "--dflash-redenoise-margin-threshold",
+            "1.5",
+            "--dflash-redenoise-prefix-len",
+            "2",
+            "--grammar-backend",
+            "none",
+        ]
+    )
+    args.check_server_args()
+
+    assert args.enable_dflash_redenoise
+    assert args.dflash_redenoise_margin_threshold == 1.5
+    assert args.dflash_redenoise_prefix_len == 2
+
+
+def test_dflash_redenoise_requires_anchor():
+    args = _dflash_args(
+        speculative_num_draft_tokens=7,
+        enable_dflash_redenoise=True,
+    )
+    with pytest.raises(ValueError, match="requires --enable-dflash-anchor"):
+        args.check_server_args()
+
+
 def test_dflash_server_args_parses_ngram_controls(monkeypatch):
     monkeypatch.setattr(
         dflash_util,

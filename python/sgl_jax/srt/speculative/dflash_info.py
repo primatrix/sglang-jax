@@ -96,6 +96,111 @@ def select_dflash_proposal_hidden(
     return draft_hidden if enable_anchor else draft_hidden[:, 1:, ...]
 
 
+def dflash_top2_margins(logits: jax.Array) -> jax.Array:
+    """Return the top-1 minus top-2 logit margin for every proposal row."""
+    if logits.ndim < 2 or logits.shape[-1] < 2:
+        raise ValueError(
+            "DFLASH confidence requires logits with at least two vocabulary entries, "
+            f"got shape={logits.shape}."
+        )
+    top2, _ = jax.lax.top_k(logits, 2)
+    return (top2[..., 0] - top2[..., 1]).astype(jnp.float32)
+
+
+def select_dflash_redenoise_prefix_lens(
+    margins: jax.Array,
+    *,
+    margin_threshold: float,
+    fixed_prefix_len: int = -1,
+    max_prefix_len: int | None = None,
+) -> jax.Array:
+    """Choose how many first-pass proposals become visible to pass two.
+
+    ``fixed_prefix_len >= 0`` is an ablation mode. Otherwise the first row
+    whose top-1/top-2 margin is below ``margin_threshold`` starts the remasked
+    suffix. If every row is confident, the largest representable prefix is
+    used. The returned shape is ``margins.shape[:-1]``.
+    """
+    if margins.ndim < 1:
+        raise ValueError(f"DFLASH margins need a proposal axis, got {margins.shape}.")
+    proposal_width = int(margins.shape[-1])
+    representable = max(0, proposal_width - 1)
+    if max_prefix_len is not None:
+        representable = min(representable, max(0, int(max_prefix_len)))
+
+    if int(fixed_prefix_len) >= 0:
+        prefix_len = min(int(fixed_prefix_len), representable)
+        return jnp.full(margins.shape[:-1], prefix_len, dtype=jnp.int32)
+
+    uncertain = margins < jnp.asarray(margin_threshold, dtype=margins.dtype)
+    first_uncertain = jnp.argmax(uncertain, axis=-1).astype(jnp.int32)
+    prefix_lens = jnp.where(
+        jnp.any(uncertain, axis=-1),
+        first_uncertain,
+        jnp.int32(representable),
+    )
+    return jnp.minimum(prefix_lens, jnp.int32(representable))
+
+
+def build_dflash_redenoise_block(
+    anchor_ids: jax.Array,
+    first_pass_tokens: jax.Array,
+    prefix_lens: jax.Array,
+    *,
+    mask_token_id: int,
+    draft_block_size: int,
+) -> jax.Array:
+    """Build ``[anchor, visible proposal prefix, remasked suffix]`` rows."""
+    if anchor_ids.ndim != 1:
+        raise ValueError(f"DFLASH anchors must be 1D, got {anchor_ids.shape}.")
+    if first_pass_tokens.ndim != 2 or first_pass_tokens.shape[0] != anchor_ids.shape[0]:
+        raise ValueError(
+            "DFLASH first-pass tokens must be [batch, proposals], got "
+            f"{first_pass_tokens.shape} for anchors {anchor_ids.shape}."
+        )
+    if prefix_lens.shape != anchor_ids.shape:
+        raise ValueError(
+            "DFLASH re-denoise prefix lengths must match anchors, got "
+            f"{prefix_lens.shape} vs {anchor_ids.shape}."
+        )
+    visible_width = int(draft_block_size) - 1
+    if visible_width < 0 or first_pass_tokens.shape[1] < visible_width:
+        raise ValueError(
+            "DFLASH re-denoise needs enough proposal tokens for the draft input: "
+            f"draft_block_size={draft_block_size}, proposals={first_pass_tokens.shape[1]}."
+        )
+
+    offsets = jnp.arange(visible_width, dtype=jnp.int32)[None, :]
+    visible = offsets < prefix_lens[:, None]
+    suffix = jnp.where(
+        visible,
+        first_pass_tokens[:, :visible_width],
+        jnp.int32(mask_token_id),
+    )
+    return jnp.concatenate([anchor_ids[:, None], suffix], axis=1)
+
+
+def merge_dflash_redenoise_tokens(
+    first_pass_tokens: jax.Array,
+    second_pass_tokens: jax.Array,
+    prefix_lens: jax.Array,
+) -> jax.Array:
+    """Keep the frozen prefix and take the remasked suffix from pass two."""
+    if first_pass_tokens.shape != second_pass_tokens.shape:
+        raise ValueError(
+            "DFLASH re-denoise proposal shapes differ: "
+            f"{first_pass_tokens.shape} vs {second_pass_tokens.shape}."
+        )
+    if prefix_lens.shape != first_pass_tokens.shape[:-1]:
+        raise ValueError(
+            "DFLASH re-denoise prefix shape differs from proposal batch: "
+            f"{prefix_lens.shape} vs {first_pass_tokens.shape[:-1]}."
+        )
+    offsets = jnp.arange(first_pass_tokens.shape[-1], dtype=jnp.int32)
+    keep_first = offsets < prefix_lens[..., None]
+    return jnp.where(keep_first, first_pass_tokens, second_pass_tokens)
+
+
 def build_dflash_ngram_continuation(
     token_ids: list[int] | np.ndarray,
     *,
@@ -138,14 +243,10 @@ def build_dflash_ngram_continuation(
             continue
 
         available, _, continuation_start = max(matches)
-        continuation[:available] = tokens[
-            continuation_start : continuation_start + available
-        ]
+        continuation[:available] = tokens[continuation_start : continuation_start + available]
         valid[:available] = True
         source_weight = (
-            float(prompt_weight)
-            if continuation_start < int(prompt_len)
-            else float(output_weight)
+            float(prompt_weight) if continuation_start < int(prompt_len) else float(output_weight)
         )
         offsets = np.arange(available, dtype=np.float32)
         bonuses[:available] = (
@@ -189,8 +290,7 @@ class DFlashNgramIndex:
         self._powers = [1]
         for _ in range(self.max_match):
             self._powers.append(
-                (self._powers[-1] * _DFLASH_NGRAM_HASH_BASE)
-                & _DFLASH_NGRAM_HASH_MASK
+                (self._powers[-1] * _DFLASH_NGRAM_HASH_BASE) & _DFLASH_NGRAM_HASH_MASK
             )
         self._entries: OrderedDict[tuple[int, int], _DFlashNgramEntry] = OrderedDict()
         self.prompt_len: int | None = None
@@ -202,8 +302,7 @@ class DFlashNgramIndex:
     def _subsequence_hash(self, start: int, end: int) -> int:
         length = int(end) - int(start)
         return (
-            self._prefix_hashes[end]
-            - self._prefix_hashes[start] * self._powers[length]
+            self._prefix_hashes[end] - self._prefix_hashes[start] * self._powers[length]
         ) & _DFLASH_NGRAM_HASH_MASK
 
     def _refresh_entry(self, entry: _DFlashNgramEntry) -> None:
@@ -213,20 +312,14 @@ class DFlashNgramIndex:
             newest_full = max(full_starts)
             if entry.latest_full_start is None or newest_full > entry.latest_full_start:
                 entry.latest_full_start = newest_full
-            entry.recent_starts = [
-                start for start in entry.recent_starts if start > full_cutoff
-            ]
+            entry.recent_starts = [start for start in entry.recent_starts if start > full_cutoff]
 
     def _append(self, token_id: int) -> None:
         position = len(self.tokens)
         token_id = int(token_id)
         self.tokens.append(token_id)
         self._prefix_hashes.append(
-            (
-                self._prefix_hashes[-1] * _DFLASH_NGRAM_HASH_BASE
-                + token_id
-                + 1
-            )
+            (self._prefix_hashes[-1] * _DFLASH_NGRAM_HASH_BASE + token_id + 1)
             & _DFLASH_NGRAM_HASH_MASK
         )
         upper = min(self.max_match, position)
@@ -253,7 +346,9 @@ class DFlashNgramIndex:
         output_ids: list[int] | tuple[int, ...] | np.ndarray,
     ) -> int:
         prompt_len = len(prompt_ids)
-        return int(prompt_ids[position] if position < prompt_len else output_ids[position - prompt_len])
+        return int(
+            prompt_ids[position] if position < prompt_len else output_ids[position - prompt_len]
+        )
 
     def sync(
         self,
@@ -332,9 +427,7 @@ class DFlashNgramIndex:
             )
             offsets = np.arange(available, dtype=np.float32)
             bonuses[:available] = (
-                float(bonus)
-                * source_weight
-                * np.power(float(position_decay), offsets)
+                float(bonus) * source_weight * np.power(float(position_decay), offsets)
             )
             return continuation, bonuses, valid, match_len
 
@@ -361,9 +454,10 @@ def build_dflash_ngram_continuation_incremental(
         int(capacity),
     )
     index = getattr(req, "_dflash_ngram_index", None)
-    if not isinstance(index, DFlashNgramIndex) or getattr(
-        req, "_dflash_ngram_index_config", None
-    ) != config:
+    if (
+        not isinstance(index, DFlashNgramIndex)
+        or getattr(req, "_dflash_ngram_index_config", None) != config
+    ):
         index = DFlashNgramIndex(
             proposal_width=proposal_width,
             min_match=min_match,
@@ -773,9 +867,7 @@ class DFlashDraftInput:
                 raise ValueError(f"DFLASH {name} must have shape {expected}, got {value.shape}.")
         return token_ids, target_margins, valid_mask
 
-    def _ngram_rows(
-        self, bs: int
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def _ngram_rows(self, bs: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         width = int(self.block_size) - 1
         expected = (int(bs), width)
         token_ids = self.ngram_token_ids
@@ -790,7 +882,9 @@ class DFlashDraftInput:
                 np.zeros((int(bs),), dtype=np.int32),
             )
         if token_ids is None or bonuses is None or valid_mask is None or match_lens is None:
-            raise ValueError("DFLASH N-gram state must carry ids, bonus, validity, and match length.")
+            raise ValueError(
+                "DFLASH N-gram state must carry ids, bonus, validity, and match length."
+            )
         token_ids = np.asarray(token_ids, dtype=np.int32)
         bonuses = np.asarray(bonuses, dtype=np.float32)
         valid_mask = np.asarray(valid_mask, dtype=np.bool_)
@@ -804,8 +898,7 @@ class DFlashDraftInput:
                 raise ValueError(f"DFLASH {name} must have shape {expected}, got {value.shape}.")
         if match_lens.shape != (int(bs),):
             raise ValueError(
-                "DFLASH ngram_match_lens must have shape "
-                f"({int(bs)},), got {match_lens.shape}."
+                f"DFLASH ngram_match_lens must have shape ({int(bs)},), got {match_lens.shape}."
             )
         return token_ids, bonuses, valid_mask, match_lens
 

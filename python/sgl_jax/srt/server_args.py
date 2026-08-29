@@ -34,8 +34,7 @@ _REJECTED_PD_HOST_ALIASES = frozenset({"localhost"})
 def _validate_disaggregation_host_ip(host_ip: str) -> str:
     if host_ip in _REJECTED_PD_HOST_ALIASES:
         raise ValueError(
-            "--disaggregation-host-ip must be a routable address; "
-            f"got loopback alias {host_ip!r}"
+            f"--disaggregation-host-ip must be a routable address; got loopback alias {host_ip!r}"
         )
     try:
         addr = ipaddress.ip_address(host_ip)
@@ -44,8 +43,7 @@ def _validate_disaggregation_host_ip(host_ip: str) -> str:
     if addr.is_loopback or addr.is_unspecified:
         kind = "loopback" if addr.is_loopback else "bind/unspecified"
         raise ValueError(
-            "--disaggregation-host-ip must be a routable address; "
-            f"got {kind} address {host_ip!r}"
+            f"--disaggregation-host-ip must be a routable address; got {kind} address {host_ip!r}"
         )
     return host_ip
 
@@ -220,6 +218,9 @@ class ServerArgs:
     dflash_flashback_bonus: float = 1.0
     dflash_flashback_target_margin_weight: float = 1.0
     dflash_flashback_position_decay: float = 0.5
+    enable_dflash_redenoise: bool = False
+    dflash_redenoise_margin_threshold: float = 1.0
+    dflash_redenoise_prefix_len: int = -1
 
     # For deterministic sampling
     enable_deterministic_sampling: bool = False
@@ -1023,8 +1024,7 @@ class ServerArgs:
             dest="pd_prefill_ep_size",
             type=int,
             default=ServerArgs.pd_prefill_ep_size,
-            help="Prefill-side ep_size for pathways PD hetero-TP. "
-            "0 = scale ep_size by tp_p/tp_d.",
+            help="Prefill-side ep_size for pathways PD hetero-TP. 0 = scale ep_size by tp_p/tp_d.",
         )
 
         parser.add_argument(
@@ -1630,6 +1630,30 @@ class ServerArgs:
             help="Per-position decay of the FlashBack sparse reranking bonus.",
         )
         parser.add_argument(
+            "--enable-dflash-redenoise",
+            action="store_true",
+            default=ServerArgs.enable_dflash_redenoise,
+            help=(
+                "Run a second training-free DFlash pass after exposing the "
+                "high-confidence first-pass proposal prefix."
+            ),
+        )
+        parser.add_argument(
+            "--dflash-redenoise-margin-threshold",
+            type=float,
+            default=ServerArgs.dflash_redenoise_margin_threshold,
+            help=(
+                "Top-1/top-2 logit margin below which the DFlash suffix is "
+                "remasked; used when --dflash-redenoise-prefix-len is -1."
+            ),
+        )
+        parser.add_argument(
+            "--dflash-redenoise-prefix-len",
+            type=int,
+            default=ServerArgs.dflash_redenoise_prefix_len,
+            help="Fixed visible proposal prefix for pass two; -1 selects it from margins.",
+        )
+        parser.add_argument(
             "--speculative-accept-threshold-single",
             type=float,
             help="Accept a draft token if its probability in the target model is greater than this threshold.",
@@ -1835,7 +1859,7 @@ class ServerArgs:
             "--disaggregation-bootstrap-timeout-seconds",
             type=float,
             default=ServerArgs.disaggregation_bootstrap_timeout_seconds,
-            help="Bootstrap-server query timeout in seconds. <=0 to " "disable.",
+            help="Bootstrap-server query timeout in seconds. <=0 to disable.",
         )
         parser.add_argument(
             "--disaggregation-pull-timeout-seconds",
@@ -1860,7 +1884,7 @@ class ServerArgs:
             "--disaggregation-orphan-reaper-interval-seconds",
             type=float,
             default=ServerArgs.disaggregation_orphan_reaper_interval_seconds,
-            help="How often the background reaper scans for orphan " "senders/receivers.",
+            help="How often the background reaper scans for orphan senders/receivers.",
         )
         parser.add_argument(
             "--disaggregation-decode-watchdog-seconds",
@@ -2084,9 +2108,21 @@ class ServerArgs:
                 if not 0 < self.dflash_ngram_position_decay <= 1:
                     raise ValueError("--dflash-ngram-position-decay must be in (0, 1].")
                 if self.dflash_ngram_max_rerank_positions < 0:
+                    raise ValueError("--dflash-ngram-max-rerank-positions must be >= 0.")
+            if self.enable_dflash_redenoise:
+                if not self.enable_dflash_anchor:
                     raise ValueError(
-                        "--dflash-ngram-max-rerank-positions must be >= 0."
+                        "--enable-dflash-redenoise currently requires --enable-dflash-anchor."
                     )
+                if self.enable_dflash_ngram or self.enable_dflash_flashback:
+                    raise ValueError(
+                        "--enable-dflash-redenoise cannot be combined with DFlash N-gram "
+                        "or FlashBack reranking."
+                    )
+                if self.dflash_redenoise_margin_threshold < 0:
+                    raise ValueError("--dflash-redenoise-margin-threshold must be >= 0.")
+                if self.dflash_redenoise_prefix_len < -1:
+                    raise ValueError("--dflash-redenoise-prefix-len must be >= -1.")
         else:
             if self.enable_dflash_anchor:
                 raise ValueError("--enable-dflash-anchor requires --speculative-algorithm DFLASH.")
@@ -2099,6 +2135,10 @@ class ServerArgs:
             if self.enable_dflash_flashback:
                 raise ValueError(
                     "--enable-dflash-flashback requires --speculative-algorithm DFLASH."
+                )
+            if self.enable_dflash_redenoise:
+                raise ValueError(
+                    "--enable-dflash-redenoise requires --speculative-algorithm DFLASH."
                 )
 
     def check_lora_server_args(self):

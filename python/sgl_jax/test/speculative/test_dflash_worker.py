@@ -82,8 +82,7 @@ def _feedback_worker(block_size: int):
         _feedback_oracle_rejection_position=np.zeros((width,), dtype=np.int64),
         _feedback_oracle_repair_position=np.zeros((width,), dtype=np.int64),
         _feedback_oracle_source_repairs={
-            source: 0
-            for source in ("rejected_draft", "stale_suffix", "historical_ngram")
+            source: 0 for source in ("rejected_draft", "stale_suffix", "historical_ngram")
         },
         _feedback_oracle_agreement_repairs=0,
         _feedback_predictor_stats={
@@ -104,6 +103,43 @@ def _feedback_worker(block_size: int):
             for policy in _DFLASH_PREDICTOR_POLICIES
         },
     )
+
+
+def _redenoise_worker(block_size: int):
+    return _bare_worker(
+        block_size=block_size,
+        draft_block_size=block_size - 1,
+        _redenoise_stats_batches=0,
+        _redenoise_stats_rounds=0,
+        _redenoise_stats_changed=0,
+        _redenoise_stats_repairs=0,
+        _redenoise_stats_harms=0,
+        _redenoise_stats_base_accept=0,
+        _redenoise_stats_final_accept=0,
+        _redenoise_stats_accept_delta=0,
+        _redenoise_stats_prefix_hist=np.zeros((block_size - 1,), dtype=np.int64),
+    )
+
+
+def test_redenoise_stats_separate_repairs_harms_and_accept_delta():
+    worker = _redenoise_worker(block_size=4)
+    worker._record_redenoise_stats(
+        accept_lens=np.array([4, 2], dtype=np.int32),
+        base_draft_token=np.array([[10, 1, 2, 3], [20, 4, 5, 6]], dtype=np.int32),
+        final_draft_token=np.array([[10, 1, 9, 3], [20, 4, 8, 6]], dtype=np.int32),
+        target_predict_flat=np.array([[1, 9, 3, 99], [4, 5, 6, 99]], dtype=np.int32),
+        prefix_lens=np.array([1, 1], dtype=np.int32),
+        selector=np.array([0, 1], dtype=np.int32),
+    )
+
+    assert worker._redenoise_stats_rounds == 2
+    assert worker._redenoise_stats_changed == 2
+    assert worker._redenoise_stats_repairs == 1
+    assert worker._redenoise_stats_harms == 1
+    assert worker._redenoise_stats_base_accept == 6
+    assert worker._redenoise_stats_final_accept == 6
+    assert worker._redenoise_stats_accept_delta == 0
+    np.testing.assert_array_equal(worker._redenoise_stats_prefix_hist, [0, 2, 0])
 
 
 def test_prefill_draft_extend_metadata_preserves_dp_rank_sections():
@@ -288,9 +324,7 @@ def test_ngram_metadata_scatter_preserves_dp_padded_slot_alignment():
         verified_id=np.array([10, 20, 30], dtype=np.int32),
         ctx_lens=np.array([1, 2, 3], dtype=np.int32),
         draft_seq_lens=np.array([11, 12, 13], dtype=np.int32),
-        ngram_token_ids=np.array(
-            [[101, 102], [201, 202], [301, 302]], dtype=np.int32
-        ),
+        ngram_token_ids=np.array([[101, 102], [201, 202], [301, 302]], dtype=np.int32),
         ngram_bonus=np.array([[1.0, 0.5], [2.0, 1.0], [3.0, 1.5]], dtype=np.float32),
         ngram_valid_mask=np.ones((3, 2), dtype=np.bool_),
         ngram_match_lens=np.array([3, 4, 5], dtype=np.int32),
