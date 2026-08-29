@@ -153,6 +153,7 @@ def dflash_sharded_top_k(logits: jax.Array, k: int) -> tuple[jax.Array, jax.Arra
         mesh=mesh,
         in_specs=(logits_spec,),
         out_specs=(result_spec, result_spec),
+        check_vma=False,
     )(logits)
 
 
