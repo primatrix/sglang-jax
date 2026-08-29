@@ -220,7 +220,7 @@ class ServerArgs:
     dflash_flashback_position_decay: float = 0.5
     enable_dflash_redenoise: bool = False
     dflash_redenoise_margin_threshold: float = 1.0
-    dflash_redenoise_prefix_len: int = -1
+    dflash_redenoise_prefix_len: int = 2
 
     # For deterministic sampling
     enable_deterministic_sampling: bool = False
@@ -1644,14 +1644,17 @@ class ServerArgs:
             default=ServerArgs.dflash_redenoise_margin_threshold,
             help=(
                 "Top-1/top-2 logit margin below which the DFlash suffix is "
-                "remasked; used when --dflash-redenoise-prefix-len is -1."
+                "remasked; used only when --dflash-redenoise-prefix-len is -1."
             ),
         )
         parser.add_argument(
             "--dflash-redenoise-prefix-len",
             type=int,
             default=ServerArgs.dflash_redenoise_prefix_len,
-            help="Fixed visible proposal prefix for pass two; -1 selects it from margins.",
+            help=(
+                "Fixed visible proposal prefix for pass two; -1 enables the "
+                "experimental full-vocabulary margin selector."
+            ),
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",

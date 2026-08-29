@@ -1864,7 +1864,10 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             prefix_lens = jnp.zeros((draft_next.shape[0],), dtype=jnp.int32)
             if redenoise_enabled:
                 first_pass_tokens = draft_next
-                margins = dflash_top2_margins(logits)
+                if redenoise_prefix_len >= 0:
+                    margins = jnp.zeros(logits.shape[:-1], dtype=jnp.float32)
+                else:
+                    margins = dflash_top2_margins(logits)
                 prefix_lens = select_dflash_redenoise_prefix_lens(
                     margins,
                     margin_threshold=redenoise_margin_threshold,

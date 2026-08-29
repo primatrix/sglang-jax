@@ -204,6 +204,17 @@ def test_dflash_server_args_parses_redenoise_controls(monkeypatch):
     assert args.dflash_redenoise_prefix_len == 2
 
 
+def test_dflash_redenoise_defaults_to_tpu_safe_fixed_prefix():
+    args = _dflash_args(
+        speculative_num_draft_tokens=7,
+        enable_dflash_anchor=True,
+        enable_dflash_redenoise=True,
+    )
+    args.check_server_args()
+
+    assert args.dflash_redenoise_prefix_len == 2
+
+
 def test_dflash_redenoise_requires_anchor():
     args = _dflash_args(
         speculative_num_draft_tokens=7,
