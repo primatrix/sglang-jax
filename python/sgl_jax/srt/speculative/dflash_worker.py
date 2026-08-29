@@ -3228,6 +3228,62 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             accept_lens=accept_lens,
             active_mask=target_plan.active_mask,
         )
+        self._maybe_benchmark_target_verify(target_plan, bs=bs, context_len=row_width)
+
+    def _maybe_benchmark_target_verify(
+        self,
+        target_plan: TargetVerifyPlan,
+        *,
+        bs: int,
+        context_len: int,
+    ) -> None:
+        iterations = int(os.getenv("SGL_JAX_DFLASH_VERIFY_BENCH_ITERS", "0"))
+        if iterations <= 0:
+            return
+
+        import time
+
+        warmup = int(os.getenv("SGL_JAX_DFLASH_VERIFY_BENCH_WARMUP", "5"))
+        logical_requests = int(os.getenv("SGL_JAX_DFLASH_VERIFY_BENCH_R", str(bs)))
+        if warmup < 0:
+            raise ValueError("SGL_JAX_DFLASH_VERIFY_BENCH_WARMUP must be >= 0.")
+        if logical_requests <= 0 or bs % logical_requests != 0:
+            raise ValueError(
+                "SGL_JAX_DFLASH_VERIFY_BENCH_R must be positive and divide the "
+                f"physical batch size: R={logical_requests}, bs={bs}."
+            )
+
+        def _run_once() -> None:
+            result = self._run_jit_target_verify(target_plan)
+            jax.block_until_ready(result[2])
+
+        for _ in range(warmup):
+            _run_once()
+
+        samples_ms = []
+        for _ in range(iterations):
+            start = time.perf_counter()
+            _run_once()
+            samples_ms.append((time.perf_counter() - start) * 1000.0)
+
+        samples = np.asarray(samples_ms, dtype=np.float64)
+        logger.info(
+            "[DFLASH-VERIFY-MICROBENCH] logical_requests=%d chain_width=%d "
+            "physical_bs=%d context_len=%d verify_width=%d iterations=%d "
+            "latency_mean_ms=%.6f latency_p50_ms=%.6f latency_p95_ms=%.6f "
+            "latency_min_ms=%.6f latency_max_ms=%.6f",
+            logical_requests,
+            bs // logical_requests,
+            bs,
+            context_len,
+            self.block_size,
+            iterations,
+            float(samples.mean()),
+            float(np.percentile(samples, 50)),
+            float(np.percentile(samples, 95)),
+            float(samples.min()),
+            float(samples.max()),
+        )
 
     def _verify_write_cache_loc(
         self,
