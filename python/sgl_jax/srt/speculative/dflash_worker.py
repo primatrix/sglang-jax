@@ -3202,6 +3202,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             relay_valid_mask=draft_plan.relay_valid_mask,
             draft_token=draft_token,
             base_draft_token=base_draft_token,
+            top2_draft_token=_top2_draft_token,
+            top2_margins=_top2_margins,
             redenoise_candidate_token=redenoise_candidate_token,
             redenoise_prefix_lens=redenoise_prefix_lens,
             flashback_token_ids=draft_plan.flashback_token_ids,
