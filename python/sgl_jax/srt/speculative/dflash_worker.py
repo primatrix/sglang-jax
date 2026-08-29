@@ -1905,6 +1905,13 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             redenoise_candidate_next = draft_next
             prefix_lens = jnp.zeros((draft_next.shape[0],), dtype=jnp.int32)
             if redenoise_enabled:
+                # The second pass is proposal-only.  Persisting its KV writes
+                # would make even a shadow run change the next draft round,
+                # because the re-denoise input contains a different mix of
+                # visible and masked tokens than the canonical DFlash pass.
+                # Keep the first-pass cache as the authoritative draft state
+                # and discard the second-pass pool updates below.
+                first_pass_pool_updates = pool_updates
                 first_pass_tokens = draft_next
                 if redenoise_prefix_len >= 0:
                     margins = jnp.zeros(logits.shape[:-1], dtype=jnp.float32)
@@ -1932,7 +1939,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 )
                 memory_pools.replace_all(pool_updates)
                 with LoraBatchContext.set_batch(forward_batch):
-                    second_output, pool_updates, _, _ = model(forward_batch, memory_pools, None)
+                    second_output, _, _, _ = model(forward_batch, memory_pools, None)
                 second_hidden = second_output.hidden_states.reshape(
                     (-1, draft_block_size, second_output.hidden_states.shape[-1])
                 )
@@ -1957,6 +1964,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                     prefix_lens,
                     apply_start=redenoise_apply_start,
                 )
+                pool_updates = first_pass_pool_updates
             if feedback_shadow_enabled:
                 base_token_ids = jnp.argmax(logits, axis=-1).astype(jnp.int32)
                 base_scores = _gather_dflash_vocab_scores(logits, base_token_ids)
