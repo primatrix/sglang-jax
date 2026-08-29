@@ -103,8 +103,57 @@ def dflash_top2_margins(logits: jax.Array) -> jax.Array:
             "DFLASH confidence requires logits with at least two vocabulary entries, "
             f"got shape={logits.shape}."
         )
-    top2, _ = jax.lax.top_k(logits, 2)
+    top2, _ = dflash_sharded_top_k(logits, 2)
     return (top2[..., 0] - top2[..., 1]).astype(jnp.float32)
+
+
+def dflash_sharded_top_k(logits: jax.Array, k: int) -> tuple[jax.Array, jax.Array]:
+    """Take global top-k over a TP-sharded vocabulary without replicating it.
+
+    Each tensor-parallel rank contributes only its local ``k`` winners.  A
+    small ``k * tp`` candidate set is then gathered and reduced on every rank.
+    """
+    if logits.ndim < 1 or not 0 < int(k) <= logits.shape[-1]:
+        raise ValueError(f"Invalid top-k={k} for DFlash logits shape={logits.shape}.")
+
+    logits_sharding = jax.typeof(logits).sharding
+    mesh = getattr(logits_sharding, "mesh", None)
+    if mesh is None or getattr(mesh, "empty", False) or "tensor" not in mesh.axis_names:
+        return jax.lax.top_k(logits, int(k))
+
+    from jax.sharding import NamedSharding
+    from jax.sharding import PartitionSpec as P
+
+    logits_spec = P("data", *(None for _ in logits.shape[1:-1]), "tensor")
+    result_spec = P("data", *(None for _ in logits.shape[1:]))
+    logits = jax.sharding.reshard(logits, NamedSharding(mesh, logits_spec))
+
+    def _top_k_local(local_logits):
+        local_values, local_ids = jax.lax.top_k(local_logits, int(k))
+        vocab_start = jax.lax.axis_index("tensor") * local_logits.shape[-1]
+        local_ids = local_ids + vocab_start
+        candidate_values = jax.lax.all_gather(
+            local_values,
+            "tensor",
+            axis=-1,
+            tiled=True,
+        )
+        candidate_ids = jax.lax.all_gather(
+            local_ids,
+            "tensor",
+            axis=-1,
+            tiled=True,
+        )
+        global_values, candidate_indices = jax.lax.top_k(candidate_values, int(k))
+        global_ids = jnp.take_along_axis(candidate_ids, candidate_indices, axis=-1)
+        return global_values, global_ids
+
+    return jax.shard_map(
+        _top_k_local,
+        mesh=mesh,
+        in_specs=(logits_spec,),
+        out_specs=(result_spec, result_spec),
+    )(logits)
 
 
 def select_dflash_redenoise_prefix_lens(

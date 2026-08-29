@@ -29,6 +29,7 @@ from sgl_jax.srt.speculative.dflash_info import (
     build_dflash_redenoise_block,
     build_dflash_rejection_feedback,
     dflash_greedy_verify,
+    dflash_sharded_top_k,
     dflash_top2_margins,
     merge_dflash_redenoise_tokens,
     select_dflash_redenoise_prefix_lens,
@@ -2010,7 +2011,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 draft_next = jnp.argmax(logits, axis=-1).astype(jnp.int32)
             base_draft_next = draft_next
             if top2_shadow_enabled:
-                top2_values, top2_ids = jax.lax.top_k(logits, 2)
+                top2_values, top2_ids = dflash_sharded_top_k(logits, 2)
                 top2_next = top2_ids[..., 1].astype(jnp.int32)
                 top2_margins = (top2_values[..., 0] - top2_values[..., 1]).astype(jnp.float32)
             else:

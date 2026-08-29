@@ -15,6 +15,7 @@ from sgl_jax.srt.speculative.dflash_info import (
     build_dflash_redenoise_block,
     build_dflash_rejection_feedback,
     dflash_greedy_verify,
+    dflash_sharded_top_k,
     dflash_top2_margins,
     merge_dflash_redenoise_tokens,
     select_dflash_ngram_tokens,
@@ -32,6 +33,14 @@ from sgl_jax.srt.speculative.relay_buffer import (
     update_dflash_relay_buffers,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
+
+def test_dflash_sharded_top_k_matches_regular_top_k_without_tp_mesh():
+    logits = jnp.array([[[1.0, 7.0, 3.0, 5.0], [9.0, 2.0, 8.0, 4.0]]])
+    values, token_ids = dflash_sharded_top_k(logits, 2)
+
+    np.testing.assert_array_equal(np.asarray(token_ids), [[[1, 3], [0, 2]]])
+    np.testing.assert_allclose(np.asarray(values), [[[7.0, 5.0], [9.0, 8.0]]])
 
 
 def test_select_dflash_proposal_hidden_anchor_layout_uses_every_row():
