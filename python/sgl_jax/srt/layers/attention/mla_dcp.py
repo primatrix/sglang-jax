@@ -165,12 +165,14 @@ def mla_dcp_attention_local(
         "qhl,kl->qhk",
         ql_nope_padded,
         local_kv_c.astype(jnp.float32),
+        precision=lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32,
     )
     scores += jnp.einsum(
         "qhr,kr->qhk",
         q_pe_padded,
         local_k_pe.astype(jnp.float32),
+        precision=lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32,
     )
     scores *= sm_scale
@@ -202,6 +204,7 @@ def mla_dcp_attention_local(
         "qhk,kl->qhl",
         probs,
         local_kv_c.astype(jnp.float32),
+        precision=lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32,
     )
 
