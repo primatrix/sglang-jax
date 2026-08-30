@@ -134,6 +134,7 @@ class ServerArgs:
     pd_prefill_tp_size: int = 0
     pd_prefill_ep_size: int = 0
     tp_size: int = 1
+    decode_context_parallel_size: int = 1
     ep_size: int = 1
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: str | None = None
@@ -1076,6 +1077,17 @@ class ServerArgs:
             help="The tensor parallelism size.",
         )
         parser.add_argument(
+            "--decode-context-parallel-size",
+            "--dcp-size",
+            type=int,
+            default=ServerArgs.decode_context_parallel_size,
+            help=(
+                "Decode context parallelism for absorbed MLA. The configured TP "
+                "devices are factored into model-TP and DCP ranks; DCP ranks hold "
+                "different latent-KV stripes."
+            ),
+        )
+        parser.add_argument(
             "--ep-size",
             type=int,
             default=ServerArgs.ep_size,
@@ -1944,6 +1956,40 @@ class ServerArgs:
 
     def check_server_args(self):
         assert (self.tp_size) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+
+        dcp_size = self.decode_context_parallel_size
+        if dcp_size < 1:
+            raise ValueError(
+                "decode_context_parallel_size must be >= 1, "
+                f"got {dcp_size}."
+            )
+        if self.tp_size % (self.dp_size * dcp_size) != 0:
+            raise ValueError(
+                "tp_size must be divisible by dp_size * decode_context_parallel_size: "
+                f"tp_size={self.tp_size}, dp_size={self.dp_size}, dcp_size={dcp_size}."
+            )
+        if dcp_size > 1:
+            if self.attention_backend != "fa":
+                raise ValueError(
+                    "MLA DCP currently requires --attention-backend fa, "
+                    f"got {self.attention_backend!r}."
+                )
+            if self.moe_backend in ("fused", "fused_v2"):
+                raise ValueError(
+                    "MLA DCP currently requires --moe-backend epmoe because the "
+                    "fused MoE kernels only support a 2D data/tensor mesh."
+                )
+            if self.page_size % dcp_size != 0:
+                raise ValueError(
+                    "MLA DCP requires page_size divisible by dcp_size: "
+                    f"page_size={self.page_size}, dcp_size={dcp_size}."
+                )
+            if self.pd_disaggregation or self.disaggregation_mode != "null":
+                raise ValueError("MLA DCP does not yet support PD disaggregation.")
+            if self.speculative_algorithm is not None:
+                raise ValueError("MLA DCP does not yet support speculative decoding.")
+            if self.hicache_storage != "disable":
+                raise ValueError("MLA DCP does not yet support HiCache offload.")
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).

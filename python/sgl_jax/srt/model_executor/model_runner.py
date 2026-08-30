@@ -131,7 +131,13 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
         self.tp_size = tp_size
         self.dp_size = dp_size
-        self.attention_tp_size = self.tp_size // self.dp_size
+        self.dcp_size = getattr(server_args, "decode_context_parallel_size", 1)
+        # The initial MLA DCP implementation keeps model weights sharded only
+        # over the existing tensor axis and replicates them across DCP ranks.
+        # This makes every DCP rank produce the same local Q heads while the
+        # latent KV cache is split by context. A later optimized path can fold
+        # the dcp axis back into FFN TP without changing the cache contract.
+        self.attention_tp_size = int(self.mesh.shape["tensor"])
         self.num_kv_heads = model_config.get_total_num_kv_heads_with_replication(
             self.attention_tp_size
         )
@@ -144,6 +150,10 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid = False
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
+        if self.dcp_size > 1 and not self.use_mla_backend:
+            raise ValueError(
+                "decode context parallelism currently supports absorbed MLA models only."
+            )
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
         self.forward_pass_id = 0
@@ -1108,10 +1118,12 @@ class MockModelRunner(ModelRunner):
         server_args: ServerArgs = None,
     ):
         self.server_args = server_args
+        self.mesh = mesh
         self.embedding_pool: EmbeddingPool | None = None
         self.tp_size = server_args.tp_size
         self.dp_size = server_args.dp_size
-        self.attention_tp_size = self.tp_size // self.dp_size
+        self.dcp_size = getattr(server_args, "decode_context_parallel_size", 1)
+        self.attention_tp_size = int(self.mesh.shape["tensor"])
 
         if isinstance(model_config, MockModelConfig):
             self.num_kv_heads = model_config.num_kv_heads
@@ -1130,7 +1142,6 @@ class MockModelRunner(ModelRunner):
         self.max_total_num_tokens = 1 << 15
         self.kv_cache_dtype = jnp.bfloat16
         self.page_size = 1
-        self.mesh = mesh
 
         # Validate tensor parallel configuration for MockModelRunner too
         if not isinstance(model_config, MockModelConfig):

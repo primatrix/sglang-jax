@@ -306,6 +306,79 @@ class MLAAttentionBackend(AttentionBackend):
         )
         sliding_window = layer.sliding_window_size if layer is not None else None
         soft_cap = layer.logit_cap if layer is not None else None
+        dcp_size = int(self.mesh.shape.get("dcp", 1))
+
+        if dcp_size > 1:
+            from sgl_jax.srt.layers.attention.mla_dcp import mla_dcp_attention_local
+
+            dcp_in_specs = (
+                P(dpa, "tensor", None),  # ql_nope (replicated over dcp)
+                P(dpa, "tensor", None),  # q_pe (replicated over dcp)
+                P(dpa, None),  # new_kv_c
+                P(dpa, None),  # new_k_pe
+                P(dpa, "dcp", None, None),  # context-sharded packed cache
+                P(dpa),  # seq_lens
+                P(dpa),  # page_indices
+                P(dpa),  # cu_q_lens
+                P(dpa),  # cu_kv_lens
+                P(dpa),  # distribution
+                P(dpa),  # out_cache_loc
+            )
+            dcp_out_specs = (
+                P(dpa, "tensor", None),
+                P(dpa, "dcp", None, None),
+            )
+
+            def _run_dcp(
+                ql_nope_,
+                q_pe_,
+                new_kv_c_,
+                new_k_pe_,
+                cache_,
+                seq_lens_,
+                page_indices_,
+                cu_q_lens_,
+                cu_kv_lens_,
+                distribution_,
+                out_cache_loc_,
+            ):
+                return mla_dcp_attention_local(
+                    ql_nope_,
+                    q_pe_,
+                    new_kv_c_,
+                    new_k_pe_,
+                    cache_,
+                    seq_lens_,
+                    page_indices_,
+                    cu_q_lens_,
+                    cu_kv_lens_,
+                    distribution_,
+                    out_cache_loc_,
+                    page_size=self.page_size,
+                    dcp_size=dcp_size,
+                    sm_scale=sm_scale,
+                    sliding_window=sliding_window,
+                    soft_cap=soft_cap,
+                )
+
+            return jax.shard_map(
+                _run_dcp,
+                in_specs=dcp_in_specs,
+                out_specs=dcp_out_specs,
+                check_vma=False,
+            )(
+                ql_nope,
+                q_pe,
+                new_kv_c,
+                new_k_pe,
+                cache,
+                self.forward_metadata.seq_lens,
+                self.forward_metadata.page_indices,
+                self.forward_metadata.cu_q_lens,
+                self.forward_metadata.cu_kv_lens,
+                self.forward_metadata.distribution,
+                forward_batch.out_cache_loc,
+            )
 
         in_specs = (
             P(dpa, "tensor", None),  # ql_nope    [T, n_h/tp, lkv]

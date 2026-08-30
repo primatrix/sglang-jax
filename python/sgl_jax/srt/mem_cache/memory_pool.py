@@ -1213,9 +1213,11 @@ class MLATokenToKVPool(KVCache):
       `[num_pages, align_to(page_size, kv_packing)//kv_packing, kv_packing,
         align_to(kv_lora_rank, 128) + align_to(qk_rope_head_dim, 128)]`
 
-    The cache is fully replicated across the TP mesh (single latent head, no head
-    axis to shard). Cache writes happen inside the kernel via input/output aliasing,
-    so `set_kv_buffer` is only used by non-kernel fallback paths.
+    The cache is fully replicated across the model-TP mesh (single latent head,
+    no head axis to shard). With MLA DCP enabled, the packed page axis is sharded
+    across the ``dcp`` mesh axis; each rank interprets its local page slice as the
+    tokens whose logical position satisfies ``position % dcp_size == dcp_rank``.
+    Cache writes happen inside the attention backend.
     """
 
     def __init__(
@@ -1326,8 +1328,15 @@ class MLATokenToKVPool(KVCache):
         """
         from sgl_jax.srt.kernels.mla.v2.kernel import get_kv_cache_shape
 
-        # MLA cache has no head axis to shard; page axis is sharded by DP.
-        self.kv_sharding = NamedSharding(self.mesh, P("data", None, None, None))
+        # MLA cache has no head axis to shard. Pages are sharded by DP; DCP
+        # shards the packed tokens within every logical page. The global shape
+        # remains the normal page shape, so the host allocator and radix tree
+        # continue to use the same logical cache locations.
+        dcp_size = int(self.mesh.shape.get("dcp", 1))
+        if dcp_size > 1:
+            self.kv_sharding = NamedSharding(self.mesh, P("data", "dcp", None, None))
+        else:
+            self.kv_sharding = NamedSharding(self.mesh, P("data", None, None, None))
 
         assert self.size % self.page_size == 0, "Cache size must be divisible by page size"
 
@@ -1338,6 +1347,11 @@ class MLATokenToKVPool(KVCache):
             kv_dim=self.kv_dim,
             kv_dtype=self.dtype,
         )
+        if buffer_shape[1] % dcp_size != 0:
+            raise ValueError(
+                "Packed MLA page words must be divisible by dcp_size: "
+                f"page_words={buffer_shape[1]}, dcp_size={dcp_size}."
+            )
 
         per_layer_bytes = (
             buffer_shape[0]

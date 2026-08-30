@@ -372,11 +372,24 @@ class Scheduler(
         elif self.pd == "pathways":
             self._pd_make_meshes(server_args)
         else:
-            self.mesh = create_device_mesh(
-                ici_parallelism=[self.dp_size, self.tp_size // self.dp_size],
-                dcn_parallelism=[1, 1],
-                device_indexes=server_args.device_indexes,
-            )
+            dcp_size = server_args.decode_context_parallel_size
+            if dcp_size > 1:
+                self.mesh = create_device_mesh(
+                    ici_parallelism=[
+                        self.dp_size,
+                        self.tp_size // (self.dp_size * dcp_size),
+                        dcp_size,
+                    ],
+                    dcn_parallelism=[1, 1, 1],
+                    device_indexes=server_args.device_indexes,
+                    mesh_axes=("data", "tensor", "dcp"),
+                )
+            else:
+                self.mesh = create_device_mesh(
+                    ici_parallelism=[self.dp_size, self.tp_size // self.dp_size],
+                    dcn_parallelism=[1, 1],
+                    device_indexes=server_args.device_indexes,
+                )
 
         if server_args.moe_backend in ("fused", "fused_v2"):
             mesh_ep_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)

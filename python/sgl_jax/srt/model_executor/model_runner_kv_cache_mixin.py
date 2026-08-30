@@ -344,7 +344,9 @@ class ModelRunnerKVCacheMixin:
                 )
                 cell_size += indexer_per_token * num_indexer_layers
 
-            return cell_size
+            # The packed page dimension is physically sharded across DCP ranks,
+            # so every logical token occupies storage on exactly one rank.
+            return cell_size // self.dcp_size
 
         swa_num_kv_heads = getattr(self.model_config.hf_config, "swa_num_key_value_heads", None)
         if swa_num_kv_heads is not None:
