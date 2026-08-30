@@ -1,6 +1,5 @@
 """GMM-based Expert-Parallel MoE layer and weight mapping utilities."""
 
-import math
 from functools import partial
 
 import jax
@@ -16,6 +15,7 @@ from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
 # Re-export for backward compatibility: external code imports from this module.
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE, FusedEPMoEV2  # noqa: F401
 from sgl_jax.srt.layers.gate import GateLogit, TopK  # noqa: F401
+from sgl_jax.srt.utils.mesh_utils import create_moe_mesh
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import (
     quantize_tensor,
@@ -76,16 +76,11 @@ class EPMoE(nnx.Module):
             raise ValueError(
                 f"num_experts({self.num_experts}) must be divisible by ep_size ({self.ep_size})"
             )
-        world_size = math.prod(self.mesh.shape.values())
+        world_size = int(self.mesh.devices.size)
         self.tp_size = world_size // self.ep_size
         self.experts_per_device = self.num_experts // self.ep_size
 
-        devices = self.mesh.devices.flatten()
-        self.moe_mesh = jax.sharding.Mesh(
-            devices.reshape(self.ep_size, self.tp_size),
-            axis_names=("expert", "tensor"),
-            axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
-        )
+        self.moe_mesh = create_moe_mesh(self.mesh, self.ep_size)
 
         # EPMoE runs on its own flattened 2D mesh. Reusing ``mesh.abstract_mesh``
         # via ``update`` only worked while the caller was also 2D: an MLA-DCP

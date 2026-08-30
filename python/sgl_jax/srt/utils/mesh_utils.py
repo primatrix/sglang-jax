@@ -12,6 +12,22 @@ default_mesh_axes = [
 ]
 
 
+def create_moe_mesh(mesh: jax.sharding.Mesh, ep_size: int) -> jax.sharding.Mesh:
+    """Flatten any model mesh into the canonical ``expert x tensor`` MoE mesh."""
+    world_size = int(mesh.devices.size)
+    if ep_size < 1 or world_size % ep_size != 0:
+        raise ValueError(
+            "MoE expert parallel size must divide the full model mesh: "
+            f"world_size={world_size}, ep_size={ep_size}."
+        )
+    tp_size = world_size // ep_size
+    return jax.sharding.Mesh(
+        mesh.devices.reshape(ep_size, tp_size),
+        axis_names=("expert", "tensor"),
+        axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
+    )
+
+
 def create_device_mesh(
     ici_parallelism: MutableSequence[int],
     dcn_parallelism: MutableSequence[int],

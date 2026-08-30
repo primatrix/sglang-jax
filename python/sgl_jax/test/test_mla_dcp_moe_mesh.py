@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -7,6 +8,7 @@ from flax import nnx
 from jax.sharding import Mesh
 
 from sgl_jax.srt.layers.moe import EPMoE
+from sgl_jax.srt.utils.weight_utils import WeightLoader
 
 
 class TestMLADCPMoEMesh(unittest.TestCase):
@@ -38,6 +40,15 @@ class TestMLADCPMoEMesh(unittest.TestCase):
         self.assertEqual(layer.updated_mesh.axis_names, ("expert", "tensor"))
         self.assertEqual(tuple(layer.updated_mesh.axis_sizes), (2, 2))
         self.assertEqual(len(layer.updated_mesh.axis_types), 2)
+
+        loader = WeightLoader(
+            model=object(),
+            model_config=SimpleNamespace(ep_size=2),
+            mesh=mesh,
+        )
+        self.assertEqual(loader.moe_abstract_mesh.axis_names, ("expert", "tensor"))
+        self.assertEqual(tuple(loader.moe_abstract_mesh.axis_sizes), (2, 2))
+        self.assertEqual(len(loader.moe_abstract_mesh.axis_types), 2)
 
 
 if __name__ == "__main__":

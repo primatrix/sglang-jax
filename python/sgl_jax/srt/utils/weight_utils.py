@@ -30,6 +30,7 @@ from safetensors import safe_open
 from tqdm import tqdm
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.utils.mesh_utils import create_moe_mesh
 
 logger = logging.getLogger(__name__)
 
@@ -185,13 +186,8 @@ class WeightLoader:
             self.sharding_size = 1
 
         if hasattr(model_config, "ep_size") and model_config.ep_size > 1:
-            world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
-            tp_size = world_size // model_config.ep_size
             ep_size = model_config.ep_size
-            abstract_mesh = self.mesh.abstract_mesh
-            self.moe_abstract_mesh = abstract_mesh.update(
-                axis_sizes=(ep_size, tp_size), axis_names=("expert", "tensor")
-            )
+            self.moe_abstract_mesh = create_moe_mesh(self.mesh, ep_size).abstract_mesh
         else:
             self.moe_abstract_mesh = None
 
@@ -2133,21 +2129,7 @@ class WeightLoader:
                     # 1. Pre-construct target sharding
                     if "expert" in mapping.sharding:
                         ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
-                        world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get(
-                            "tensor", 1
-                        )
-                        tp_size = world_size // ep_size
-
-                        devices = self.mesh.devices.flatten()
-                        # Construct MoE specific mesh
-                        moe_mesh = jax.sharding.Mesh(
-                            devices.reshape(ep_size, tp_size),
-                            axis_names=("expert", "tensor"),
-                            axis_types=(
-                                jax.sharding.AxisType.Explicit,
-                                jax.sharding.AxisType.Explicit,
-                            ),
-                        )
+                        moe_mesh = create_moe_mesh(self.mesh, ep_size)
                         final_sharding = jax.sharding.NamedSharding(moe_mesh, P(*mapping.sharding))
                     else:
                         # Standard Sharding
@@ -2269,19 +2251,7 @@ class WeightLoader:
                 else:
                     ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
                     if "expert" in mapping.sharding:
-                        world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get(
-                            "tensor", 1
-                        )
-                        tp_size = world_size // ep_size
-                        devices = self.mesh.devices.flatten()
-                        moe_mesh = jax.sharding.Mesh(
-                            devices.reshape(ep_size, tp_size),
-                            axis_names=("expert", "tensor"),
-                            axis_types=(
-                                jax.sharding.AxisType.Explicit,
-                                jax.sharding.AxisType.Explicit,
-                            ),
-                        )
+                        moe_mesh = create_moe_mesh(self.mesh, ep_size)
                         # Use regular mesh for loading individual expert weights (TP sharding only)
                         final_sharding = jax.sharding.NamedSharding(moe_mesh, P(*mapping.sharding))
                     else:
@@ -2431,17 +2401,7 @@ class WeightLoader:
 
             if mapping.sharding and "expert" in mapping.sharding:
                 ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
-                world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
-                tp_size = world_size // ep_size
-                devices = self.mesh.devices.flatten()
-                moe_mesh = jax.sharding.Mesh(
-                    devices.reshape(ep_size, tp_size),
-                    axis_names=("expert", "tensor"),
-                    axis_types=(
-                        jax.sharding.AxisType.Explicit,
-                        jax.sharding.AxisType.Explicit,
-                    ),
-                )
+                moe_mesh = create_moe_mesh(self.mesh, ep_size)
                 final_sharding = jax.sharding.NamedSharding(moe_mesh, P(*mapping.sharding))
             else:
                 spec = P(*mapping.sharding) if mapping.sharding else P()
