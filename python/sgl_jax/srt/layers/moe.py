@@ -87,10 +87,12 @@ class EPMoE(nnx.Module):
             axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
         )
 
-        abstract_mesh = self.mesh.abstract_mesh
-        self.updated_mesh = abstract_mesh.update(
-            axis_sizes=(self.ep_size, self.tp_size), axis_names=("expert", "tensor")
-        )
+        # EPMoE runs on its own flattened 2D mesh. Reusing ``mesh.abstract_mesh``
+        # via ``update`` only worked while the caller was also 2D: an MLA-DCP
+        # caller has three axis types (data, tensor, dcp), which cannot describe
+        # the two renamed MoE axes. The derived physical mesh is the source of
+        # truth for both sizes and axis types.
+        self.updated_mesh = self.moe_mesh.abstract_mesh
 
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
             # MOE weights' shape is (num_experts, k, n)
