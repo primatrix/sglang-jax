@@ -71,8 +71,8 @@ def pick_cache_aware_dp(
 
     Cache affinity is deliberately strict: an agent turn should not miss its
     conversation prefix merely because another rank is less loaded. Eligibility
-    (the per-rank admission cap) is still decided by the caller, so a full cache
-    holder can fall back to another rank instead of blocking admission.
+    (the per-rank admission cap) is decided by the caller; the scheduler narrows
+    it to longest-prefix holders and defers admission when every holder is full.
     """
     if not eligible:
         return None
@@ -81,10 +81,13 @@ def pick_cache_aware_dp(
         return min(ranks, key=lambda r: (counts[r], token_counts[r], r))
 
     if prompt_len > 0:
-        best_match = max(matches.get(r, 0) for r in eligible)
+        # ``matches`` covers every DP rank, including holders that are
+        # temporarily admission-ineligible. Defer if no eligible rank owns the
+        # globally longest prefix instead of spilling to a shorter hit/miss.
+        best_match = max(matches.values(), default=0)
         if best_match > 0:
             best_holders = [r for r in eligible if matches.get(r, 0) == best_match]
-            return least_loaded(best_holders)
+            return least_loaded(best_holders) if best_holders else None
 
     return pick_shape_aware_dp(eligible, input_counts, output_counts, item_input, item_output)
 

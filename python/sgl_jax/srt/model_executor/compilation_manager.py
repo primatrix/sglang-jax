@@ -62,6 +62,9 @@ class CompilationManager:
 
         self.token_buckets = self._compute_token_buckets(server_args.precompile_token_paddings)
         self.bs_buckets = self._compute_bs_buckets(server_args.precompile_bs_paddings)
+        self.extend_bs_buckets = self._compute_extend_bs_buckets(
+            server_args.precompile_extend_bs_paddings
+        )
         self.cache_loc_buckets = self._compute_cache_loc_buckets()
 
         self._compiled_variants: set[tuple] = set()
@@ -112,6 +115,28 @@ class CompilationManager:
             buckets.append(self.max_padded_batch_size)
         return buckets
 
+    def _compute_extend_bs_buckets(self, user_paddings: list[int] | None) -> list[int]:
+        """Select the BS buckets eagerly compiled for EXTEND.
+
+        Historically EXTEND only compiled the maximum batch size even when
+        runtime padding exposed several smaller BS buckets. Keep that behavior
+        by default so existing launches do not pay a larger startup cost, while
+        allowing performance-sensitive deployments to eagerly compile the
+        specific EXTEND shapes they expect to serve.
+        """
+        if user_paddings is None:
+            return [self.max_padded_batch_size]
+
+        requested = sorted(set(user_paddings))
+        invalid = [bs for bs in requested if bs not in self.bs_buckets]
+        if invalid:
+            raise ValueError(
+                "--precompile-extend-bs-paddings must be a subset of the effective "
+                f"--precompile-bs-paddings; invalid={invalid}, available={self.bs_buckets}"
+            )
+
+        return requested
+
     def _compute_cache_loc_buckets(self) -> list[int]:
         # bs reqs together can never exceed max_total_num_tokens, so cap the
         # per-bs bucket at the pool size (helps Pathways gRPC H2D; see tp_worker
@@ -157,14 +182,13 @@ class CompilationManager:
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
         start_time = time.perf_counter()
-        bs = self.max_padded_batch_size
         logger.info(
             "[EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s",
-            [bs],
+            self.extend_bs_buckets,
             self.token_buckets,
         )
 
-        pairs = list(itertools.product([bs], self.token_buckets))
+        pairs = list(itertools.product(self.extend_bs_buckets, self.token_buckets))
         with tqdm(pairs, desc="[EXTEND] PRECOMPILE", leave=False) as pbar:
             for pair in pbar:
                 bs_val, num_tokens = pair

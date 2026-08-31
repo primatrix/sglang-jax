@@ -104,13 +104,20 @@ def test_small_load_skew_keeps_affinity():
     assert _pick([0, 1], counts, tokens, matches, prompt_len=512) == 0
 
 
-def test_hot_prefix_spills_when_owning_rank_is_full():
-    # Rank 0 holds the prefix but is full (not eligible): route by load among the
-    # eligible ranks (none of which hold it).
+def test_hot_prefix_defers_when_owning_rank_is_full():
+    # Rank 0 holds the prefix but is full (not eligible): preserve affinity by
+    # deferring instead of spilling to an eligible cache-miss rank.
     counts = [0, 5, 1, 9]
     tokens = [0, 50, 10, 90]
     matches = {0: 512}
-    assert _pick([1, 2, 3], counts, tokens, matches, prompt_len=512) == 2
+    assert _pick([1, 2, 3], counts, tokens, matches, prompt_len=512) is None
+
+
+def test_longest_prefix_defers_instead_of_using_shorter_eligible_holder():
+    counts = [8, 0]
+    tokens = [800, 0]
+    matches = {0: 1024, 1: 512}
+    assert _pick([1], counts, tokens, matches, prompt_len=1200) is None
 
 
 def test_holder_and_load_tie_breaks_by_lowest_rank():

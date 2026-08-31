@@ -32,8 +32,10 @@ from __future__ import annotations
 
 import argparse
 import functools
+import json
 import os
 from math import inf
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -296,7 +298,7 @@ def _sweep_decode(
             continue
         print(
             f"# [{i + 1}/{len(candidates)}] decode mnt={max_num_tokens} "
-            f"bkv_p={bkv_p} bq={bq} dbs={dbs} t={t_ms * 1000:.4f}ms",
+            f"bkv_p={bkv_p} bq={bq} dbs={dbs} t={t_ms:.4f}ms",
             flush=True,
         )
         if (bkv_p, bq, dbs) == _HEURISTIC_DECODE:
@@ -378,7 +380,7 @@ def _sweep_mixed(
             continue
         print(
             f"# [{i + 1}/{len(candidates)}] mixed mnt={max_num_tokens} "
-            f"bkv_p={bkv_p} bq={bq} t={t_ms * 1000:.4f}ms",
+            f"bkv_p={bkv_p} bq={bq} t={t_ms:.4f}ms",
             flush=True,
         )
         if (bkv_p, bq) == _HEURISTIC_MIXED:
@@ -488,6 +490,11 @@ def main():
         default=10.0,
         help="only emit a table entry if tuned beats heuristic by ≥ this %",
     )
+    parser.add_argument(
+        "--output-jsonl",
+        default="",
+        help="optional path for one machine-readable benchmark record per tuned shape",
+    )
     args = parser.parse_args()
 
     cases = [c.strip() for c in args.cases.split(",") if c.strip()]
@@ -580,8 +587,8 @@ def main():
         rows.append((key, best, best_t, heur, heur_t, delta_pct, n_attempted, n_failed))
         win = "WIN " if delta_pct >= args.write_threshold_pct else "skip"
         print(
-            f"# [{win}] {key}: heur={heur} {heur_t * 1000:.4f}ms "
-            f"best={best} {best_t * 1000:.4f}ms Δ={delta_pct:+.1f}% "
+            f"# [{win}] {key}: heur={heur} {heur_t:.4f}ms "
+            f"best={best} {best_t:.4f}ms Δ={delta_pct:+.1f}% "
             f"(tried {n_attempted}, failed {n_failed})"
         )
 
@@ -593,11 +600,49 @@ def main():
         if delta_pct >= args.write_threshold_pct:
             print(f"        {key}: {best},")
     print()
+
+    if args.output_jsonl:
+        output_path = Path(args.output_jsonl)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w") as output_file:
+            for key, best, best_t, heur, heur_t, delta_pct, attempted, failed in rows:
+                (
+                    case_label,
+                    q_dtype,
+                    kv_dtype,
+                    num_q_heads,
+                    kv_lora_rank,
+                    qk_rope_head_dim,
+                    page_size,
+                    max_num_tokens,
+                ) = key
+                record = {
+                    "variant": f"{case_label}-mnt{max_num_tokens}",
+                    "case": case_label,
+                    "device": device,
+                    "q_dtype": q_dtype,
+                    "kv_dtype": kv_dtype,
+                    "num_q_heads": num_q_heads,
+                    "kv_lora_rank": kv_lora_rank,
+                    "qk_rope_head_dim": qk_rope_head_dim,
+                    "page_size": page_size,
+                    "max_num_tokens": max_num_tokens,
+                    "best_config": list(best),
+                    "heuristic_config": list(heur),
+                    "latency_ms": best_t,
+                    "heuristic_latency_ms": heur_t,
+                    "speedup_pct": delta_pct,
+                    "candidate_count": attempted,
+                    "failed_candidate_count": failed,
+                    "meets_write_threshold": delta_pct >= args.write_threshold_pct,
+                }
+                output_file.write(json.dumps(record, sort_keys=True) + "\n")
+        print(f"# Wrote {len(rows)} benchmark records to {output_path}")
     print("# --- All measured (for audit) ---")
     for key, best, best_t, heur, heur_t, delta_pct, n_attempted, n_failed in rows:
         print(
-            f"# {key}: best={best} ({best_t * 1000:.4f}ms) "
-            f"heur={heur} ({heur_t * 1000:.4f}ms) Δ={delta_pct:+.1f}% "
+            f"# {key}: best={best} ({best_t:.4f}ms) "
+            f"heur={heur} ({heur_t:.4f}ms) Δ={delta_pct:+.1f}% "
             f"(tried {n_attempted}, failed {n_failed})"
         )
 

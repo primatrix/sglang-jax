@@ -194,6 +194,7 @@ class ServerArgs:
 
     precompile_token_paddings: list[int] | None = None
     precompile_bs_paddings: list[int] | None = None
+    precompile_extend_bs_paddings: list[int] | None = None
 
     disable_precompile: bool = False
 
@@ -1421,6 +1422,17 @@ class ServerArgs:
             type=int,
             nargs="+",
             help="Set the list of batch sizes buckets for jax jit",
+        )
+        parser.add_argument(
+            "--precompile-extend-bs-paddings",
+            type=int,
+            nargs="+",
+            help=(
+                "Precompile EXTEND for these global batch-size buckets. Each value "
+                "must also appear in --precompile-bs-paddings. By default EXTEND "
+                "keeps the historical behavior and only precompiles the maximum "
+                "batch-size bucket."
+            ),
         )
         parser.add_argument(
             "--disable-precompile",

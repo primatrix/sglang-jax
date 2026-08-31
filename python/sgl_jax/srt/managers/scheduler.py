@@ -931,10 +931,12 @@ class Scheduler(
     ) -> int | None:
         """Route ``req`` by cache affinity with shape-aware miss fallback.
 
-        Probes each eligible rank's cached prefix length, then defers to
-        ``pick_cache_aware_dp``: prefer the longest cached prefix regardless of
-        load, break equal-match ties by load, and use shape-aware selection only
-        on a complete cache miss. Returns None if all DP ranks are full.
+        Probes every rank's cached prefix length before applying admission
+        eligibility. If all longest-prefix holders are temporarily full, return
+        None so intake defers the request instead of spilling it to a cache-miss
+        rank. Otherwise prefer the longest eligible holder, break equal-match
+        ties by load, and use shape-aware selection only on a complete cache
+        miss. Returns None if all DP ranks are full.
         """
         if self.dp_size == 1:
             return 0
@@ -949,7 +951,7 @@ class Scheduler(
         matches: dict[int, int] = {}
         prompt_len = len(token_ids) if token_ids else 0
         if token_ids:
-            for dp_rank in eligible:
+            for dp_rank in range(self.dp_size):
                 matches[dp_rank] = self._cached_prefix_len(token_ids, extra_key, dp_rank)
 
         running_input, running_output = self._get_dp_io_snapshot()

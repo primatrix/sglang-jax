@@ -256,6 +256,7 @@ def test_replicated_moe_matches_local_dense_reference():
 def test_ling3_kda_lower_bound_is_threaded_to_prefill(monkeypatch):
     # This unit only checks lower_bound plumbing into the prefill kernel. Keep
     # it independent of the process-wide virtual-device count used by DP tests.
+    monkeypatch.setenv("SGLANG_JAX_KDA_PREFILL_KERNEL", "chunked")
     mesh = _single_device_mesh()
     backend = KDAAttnBackend(mesh=mesh)
     captured = {}
@@ -291,6 +292,63 @@ def test_ling3_kda_lower_bound_is_threaded_to_prefill(monkeypatch):
     assert output.shape == qkv.shape
     assert final_state.shape == (1, 2, 2, 2)
     assert captured["lower_bound"] == -5.0
+
+
+def test_ling3_mega_kda_falls_back_for_nonzero_recurrent_state(monkeypatch):
+    monkeypatch.setenv("SGLANG_JAX_KDA_PREFILL_KERNEL", "mega")
+    mesh = _single_device_mesh()
+    backend = KDAAttnBackend(mesh=mesh)
+
+    def fake_chunk_kda(q, k, v, g, beta, *, initial_state, **kwargs):
+        return jnp.zeros_like(v), initial_state
+
+    def fake_mega(q, k, v, g, beta, *, initial_state, **kwargs):
+        return jnp.ones_like(v), initial_state
+
+    monkeypatch.setattr(
+        "sgl_jax.srt.layers.attention.linear.kda_backend.chunk_kda",
+        fake_chunk_kda,
+    )
+    monkeypatch.setattr(
+        "sgl_jax.srt.layers.attention.linear.kda_backend.kda_forward_packed",
+        fake_mega,
+    )
+    monkeypatch.setattr(
+        "sgl_jax.srt.layers.attention.linear.kda_backend.is_mega_kda_layout_supported",
+        lambda *args, **kwargs: jnp.asarray(True),
+    )
+    layer = SimpleNamespace(
+        A_log=nnx.Param(jnp.zeros((1, 1, 2, 1), dtype=jnp.float32)),
+        dt_bias=nnx.Param(jnp.zeros((4,), dtype=jnp.float32)),
+        kda_lower_bound=-5.0,
+        scale=0.5,
+    )
+    qkv = jnp.zeros((1, 2, 2), dtype=jnp.float32)
+
+    with jax.set_mesh(mesh):
+        zero_state_output, _ = backend._forward_extend(
+            qkv,
+            qkv,
+            qkv,
+            qkv,
+            jnp.zeros((1, 2), dtype=jnp.float32),
+            jnp.zeros((1, 2, 2, 2), dtype=jnp.float32),
+            jnp.array([0, 1], dtype=jnp.int32),
+            layer,
+        )
+        recurrent_output, _ = backend._forward_extend(
+            qkv,
+            qkv,
+            qkv,
+            qkv,
+            jnp.zeros((1, 2), dtype=jnp.float32),
+            jnp.ones((1, 2, 2, 2), dtype=jnp.float32),
+            jnp.array([0, 1], dtype=jnp.int32),
+            layer,
+        )
+
+    np.testing.assert_array_equal(np.asarray(zero_state_output), np.ones_like(qkv))
+    np.testing.assert_array_equal(np.asarray(recurrent_output), np.zeros_like(qkv))
 
 
 def test_ling3_replicated_moe_preserves_data_parallel_output_layout():

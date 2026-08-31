@@ -38,6 +38,7 @@ def _make_server_args(**overrides):
     args = MagicMock()
     args.precompile_token_paddings = None
     args.precompile_bs_paddings = None
+    args.precompile_extend_bs_paddings = None
     args.moe_backend = "none"
     args.enable_static_lora = False
     args.multimodal = False
@@ -200,6 +201,51 @@ class TestBucketComputation(unittest.TestCase):
         )
         assert cm.bs_buckets[-1] == 200
 
+    def test_extend_bs_buckets_default_to_max_only(self):
+        cm = CompilationManager(
+            server_args=_make_server_args(precompile_bs_paddings=[8, 16, 32, 64]),
+            max_padded_batch_size=64,
+            max_padded_num_tokens=2048,
+            dp_size=8,
+            tp_size=8,
+            page_size=128,
+            max_req_len=4096,
+            vocab_size=32000,
+        )
+        assert cm.extend_bs_buckets == [64]
+
+    def test_extend_bs_buckets_select_target_shapes(self):
+        cm = CompilationManager(
+            server_args=_make_server_args(
+                precompile_bs_paddings=[8, 16, 24, 32, 40, 48, 56, 64],
+                precompile_extend_bs_paddings=[64, 8, 32, 32],
+            ),
+            max_padded_batch_size=64,
+            max_padded_num_tokens=2048,
+            dp_size=8,
+            tp_size=8,
+            page_size=128,
+            max_req_len=4096,
+            vocab_size=32000,
+        )
+        assert cm.extend_bs_buckets == [8, 32, 64]
+
+    def test_extend_bs_buckets_must_be_runtime_bucket(self):
+        with self.assertRaisesRegex(ValueError, "must be a subset"):
+            CompilationManager(
+                server_args=_make_server_args(
+                    precompile_bs_paddings=[8, 16, 32, 64],
+                    precompile_extend_bs_paddings=[24],
+                ),
+                max_padded_batch_size=64,
+                max_padded_num_tokens=2048,
+                dp_size=8,
+                tp_size=8,
+                page_size=128,
+                max_req_len=4096,
+                vocab_size=32000,
+            )
+
     def test_cache_loc_buckets_length_matches_bs(self):
         cm = CompilationManager(
             server_args=_make_server_args(),
@@ -347,6 +393,31 @@ class TestRecurrentPrecompileStructure(unittest.TestCase):
 
         assert all(batch.recurrent_cow_src_indices is None for batch in decode_batches)
         assert all(len(key) == 4 for key in cm._compiled_variants)
+
+    def test_extend_precompiles_requested_bs_token_cross_product(self):
+        cm = CompilationManager(
+            server_args=_make_server_args(
+                precompile_token_paddings=[8, 16],
+                precompile_bs_paddings=[4, 8],
+                precompile_extend_bs_paddings=[4, 8],
+            ),
+            max_padded_batch_size=8,
+            max_padded_num_tokens=16,
+            dp_size=1,
+            tp_size=1,
+            page_size=8,
+            max_req_len=16,
+            vocab_size=32,
+        )
+
+        extend_batches = _collect_precompile_batches(cm, ForwardMode.EXTEND)
+
+        assert [(batch.real_bs, len(batch.input_ids)) for batch in extend_batches] == [
+            (4, 8),
+            (4, 16),
+            (8, 8),
+            (8, 16),
+        ]
 
 
 class TestDummyBatch(unittest.TestCase):
