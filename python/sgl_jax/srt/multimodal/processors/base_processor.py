@@ -130,6 +130,21 @@ class BaseMultimodalProcessor(ABC):
         """Process multimodal payload and return a ``MultimodalInputs``."""
         pass
 
+    async def process_encoder_mm_data_async(
+        self,
+        image_data,
+        input_text,
+        request_obj,
+        **kwargs,
+    ) -> MultimodalInputs:
+        """Process encoder inputs, with model adapters free to skip unused metadata."""
+        return await self.process_mm_data_async(
+            image_data=image_data,
+            input_text=input_text,
+            request_obj=request_obj,
+            **kwargs,
+        )
+
     # EPD input reconstruction adapted from SGLang:
     # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/multimodal/processors/base_processor.py
     @property

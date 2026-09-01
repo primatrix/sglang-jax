@@ -196,7 +196,7 @@ class MMEncoder:
             fps=request.get("fps"),
             num_frames=request.get("num_frames"),
         )
-        mm_inputs = await self.mm_processor.process_mm_data_async(
+        mm_inputs = await self.mm_processor.process_encoder_mm_data_async(
             image_data=request_obj.image_data,
             input_text=self._placeholder(modality) * len(mm_items),
             request_obj=request_obj,
