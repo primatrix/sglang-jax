@@ -5,9 +5,11 @@ from types import MethodType, SimpleNamespace
 
 import jax.numpy as jnp
 import numpy as np
+import orjson
 import pytest
+from fastapi import HTTPException, Request
 
-from sgl_jax.srt.disaggregation.encoder.server import MMEncoder
+from sgl_jax.srt.disaggregation.encoder.server import EncoderServer, MMEncoder
 from sgl_jax.srt.multimodal.common.modality_enum import (
     Modality,
     MultimodalDataItem,
@@ -39,6 +41,13 @@ def _encoder(output: jnp.ndarray, processed: list[MultimodalInputs]) -> MMEncode
 
     encoder._process_request = MethodType(process_request, encoder)
     return encoder
+
+
+def _request(body: bytes) -> Request:
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return Request({"type": "http"}, receive)
 
 
 def test_encode_batch_discards_jax_bucket_padding():
@@ -73,3 +82,33 @@ def test_encode_batch_waits_for_jax_output(monkeypatch):
 
     assert len(blocked) == 1
     assert blocked[0] is output
+
+
+def test_encoder_endpoint_decodes_json_with_orjson():
+    captured = []
+
+    class Runtime:
+        async def submit(self, payload):
+            captured.append(payload)
+            return {"req_id": payload["req_id"]}
+
+    server = object.__new__(EncoderServer)
+    server._network_rtt_s = 0
+    server.runtime = Runtime()
+
+    response = asyncio.run(
+        server.encode(_request(orjson.dumps({"req_id": "request-0", "modality": "IMAGE"})))
+    )
+
+    assert response == {"req_id": "request-0"}
+    assert captured == [{"req_id": "request-0", "modality": "IMAGE"}]
+
+
+def test_encoder_endpoint_rejects_non_object_json():
+    server = object.__new__(EncoderServer)
+    server._network_rtt_s = 0
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(server.encode(_request(b"[]")))
+
+    assert exc_info.value.status_code == 422

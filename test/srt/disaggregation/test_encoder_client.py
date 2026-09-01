@@ -5,6 +5,8 @@ import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 
+import orjson
+
 from sgl_jax.srt.disaggregation.encoder import client as encoder_client
 from sgl_jax.srt.managers.io_struct import GenerateReqInput
 from sgl_jax.srt.multimodal.common.modality_enum import Modality
@@ -162,8 +164,9 @@ def test_encoder_request_dispatcher_reuses_http_client(monkeypatch):
             self.closed = False
             clients.append(self)
 
-        async def post(self, url, *, json):
-            posts.append((url, json["req_id"]))
+        async def post(self, url, *, content, headers):
+            assert headers == {"Content-Type": "application/json"}
+            posts.append((url, orjson.loads(content)["req_id"]))
             return FakeResponse()
 
         async def aclose(self) -> None:

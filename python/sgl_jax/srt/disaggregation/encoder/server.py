@@ -12,8 +12,9 @@ from typing import Any
 import jax
 import jax.profiler
 import numpy as np
+import orjson
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 
 from sgl_jax.srt.configs.load_config import LoadConfig
@@ -362,11 +363,17 @@ class EncoderServer:
     ) -> dict[str, Any]:
         return await self.runtime.register_scheduler_receiver(request)
 
-    async def encode(self, request: dict[str, Any]) -> dict[str, Any]:
+    async def encode(self, request: Request) -> dict[str, Any]:
         # Model the language->encoder network hop (loopback has none).
         if self._network_rtt_s:
             await asyncio.sleep(self._network_rtt_s)
-        return await self.runtime.submit(request)
+        try:
+            payload = orjson.loads(await request.body())
+        except orjson.JSONDecodeError as exc:
+            raise HTTPException(400, "invalid encoder request JSON") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(422, "encoder request must be a JSON object")
+        return await self.runtime.submit(payload)
 
     async def start_profile(self, request: dict[str, Any] | None = None) -> dict[str, Any]:
         """Arm a jax.profiler trace on the encoder process.

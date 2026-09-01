@@ -12,6 +12,7 @@ from typing import Any, Protocol
 
 import httpx
 import jax
+import orjson
 import zmq
 
 from sgl_jax.srt.disaggregation.encoder.embedding_data import (
@@ -472,7 +473,8 @@ def dispatch_encoder_request(
         async def send_one(encoder_url: str, payload: dict[str, Any]) -> None:
             response = await client.post(
                 f"{encoder_url.rstrip('/')}/encode",
-                json=payload,
+                content=orjson.dumps(payload),
+                headers={"Content-Type": "application/json"},
             )
             response.raise_for_status()
 
