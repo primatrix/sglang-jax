@@ -219,6 +219,63 @@ def test_runtime_releases_each_request_when_its_publish_completes():
     asyncio.run(run())
 
 
+def test_runtime_reuses_metadata_sender_socket():
+    class FakeSocket:
+        def __init__(self):
+            self.sent = []
+            self.closed = False
+
+        def setsockopt(self, option, value):
+            pass
+
+        def connect(self, address):
+            self.address = address
+
+        async def send_pyobj(self, data):
+            self.sent.append(data)
+
+        def close(self):
+            self.closed = True
+
+    class FakeContext:
+        def __init__(self):
+            self.sockets = []
+
+        def socket(self, socket_type):
+            socket = FakeSocket()
+            self.sockets.append(socket)
+            return socket
+
+    class FakeTransfer:
+        async def release_completed(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    async def run() -> None:
+        context = FakeContext()
+        runtime = EncoderRuntime(lambda _: None, FakeTransfer())
+        runtime._zmq = context
+        data = EmbeddingData(
+            req_id="request-0",
+            num_parts=1,
+            part_idx=0,
+            grid_dim=None,
+            modality=Modality.IMAGE,
+        )
+
+        await runtime._notify("127.0.0.1:1234", data)
+        await runtime._notify("127.0.0.1:1234", data)
+
+        assert len(context.sockets) == 1
+        assert context.sockets[0].sent == [data, data]
+        await runtime.stop()
+        assert context.sockets[0].closed
+
+    asyncio.run(run())
+
+
 def test_runtime_pipelines_serial_encode_and_publish_stages():
     async def run() -> None:
         encode_started = []

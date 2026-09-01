@@ -5,6 +5,7 @@ import logging
 import random
 import threading
 import time
+from collections import deque
 from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -229,11 +230,59 @@ class EncoderReceiverBackend(Protocol):
     def close(self) -> None: ...
 
 
+class EncoderMetadataReceiver(Protocol):
+    def poll(self, req_ids: tuple[str, ...]) -> Any | None: ...
+
+    def unregister(self, req_ids: tuple[str, ...]) -> None: ...
+
+
+class EncoderMetadataRouter:
+    """Route one scheduler-wide metadata socket to pending encoder requests."""
+
+    def __init__(self, host: str) -> None:
+        self._receiver = zmq.Context.instance().socket(zmq.PULL)
+        self._receiver.setsockopt(zmq.LINGER, 0)
+        port = self._receiver.bind_to_random_port(f"tcp://{host}")
+        self.receive_url = f"{host}:{port}"
+        self._queues: dict[str, deque[Any]] = {}
+
+    def register(self, req_ids: tuple[str, ...]) -> None:
+        routes = set(req_ids)
+        if len(routes) != len(req_ids) or not routes.isdisjoint(self._queues):
+            raise ValueError(f"duplicate encoder metadata routes: {req_ids}")
+        self._queues.update((req_id, deque()) for req_id in req_ids)
+
+    def poll(self, req_ids: tuple[str, ...]) -> Any | None:
+        while True:
+            try:
+                data = self._receiver.recv_pyobj(zmq.NOBLOCK)
+            except zmq.Again:
+                break
+            queue = self._queues.get(getattr(data, "req_id", None))
+            if queue is not None:
+                queue.append(data)
+
+        for req_id in req_ids:
+            queue = self._queues.get(req_id)
+            if queue:
+                return queue.popleft()
+        return None
+
+    def unregister(self, req_ids: tuple[str, ...]) -> None:
+        for req_id in req_ids:
+            self._queues.pop(req_id, None)
+
+    def close(self) -> None:
+        self._queues.clear()
+        self._receiver.close()
+
+
 @dataclass(slots=True)
 class PendingEncoderRequest:
     recv_req: TokenizedGenerateReqInput
     started_at: float
-    receiver: zmq.Socket
+    metadata_router: EncoderMetadataReceiver
+    metadata_req_ids: tuple[str, ...]
     register_future: Future[None]
     accumulator: MultiModalEmbeddingData
     backend: EncoderReceiverBackend
@@ -248,10 +297,7 @@ class PendingEncoderRequest:
         # The ZMQ message contains EmbeddingData metadata (part identity,
         # shape/dtype, and transfer endpoints); the backend pulls the actual
         # embedding separately in _start_receive().
-        try:
-            data = self.receiver.recv_pyobj(zmq.NOBLOCK)
-        except zmq.Again:
-            data = None
+        data = self.metadata_router.poll(self.metadata_req_ids)
         if data is not None:
             self._start_receive(data)
 
@@ -285,7 +331,7 @@ class PendingEncoderRequest:
         for _, session in self.sessions.values():
             session.close()
         self.sessions.clear()
-        self.receiver.close()
+        self.metadata_router.unregister(self.metadata_req_ids)
 
 
 class EncoderClient:
@@ -297,33 +343,31 @@ class EncoderClient:
         executor: ThreadPoolExecutor,
         registration_timeout: float | None,
     ) -> None:
-        self._host = host
         self._backend = backend
         self._encoder_urls = list(encoder_urls)
         self._executor = executor
         self._registration_client = httpx.Client(timeout=registration_timeout)
+        self._metadata_router = EncoderMetadataRouter(host)
 
     def receive(self, request: TokenizedGenerateReqInput) -> PendingEncoderRequest:
         registrations = plan_encoder_registrations(request, self._encoder_urls)
-
-        receiver = zmq.Context.instance().socket(zmq.PULL)
-        receiver.setsockopt(zmq.LINGER, 0)
-        port = receiver.bind_to_random_port(f"tcp://{self._host}")
-        receive_url = f"{self._host}:{port}"
+        metadata_req_ids = tuple(registration[1] for registration in registrations)
+        self._metadata_router.register(metadata_req_ids)
         try:
             register_future = submit_scheduler_receiver_registrations(
                 self._executor,
                 registrations,
-                receive_url,
+                self._metadata_router.receive_url,
                 self._registration_client,
             )
         except Exception:
-            receiver.close()
+            self._metadata_router.unregister(metadata_req_ids)
             raise
         return PendingEncoderRequest(
             recv_req=request,
             started_at=time.monotonic(),
-            receiver=receiver,
+            metadata_router=self._metadata_router,
+            metadata_req_ids=metadata_req_ids,
             register_future=register_future,
             accumulator=MultiModalEmbeddingData(len(registrations)),
             backend=self._backend,
@@ -333,6 +377,7 @@ class EncoderClient:
         self._backend.close()
         self._executor.shutdown(cancel_futures=True)
         self._registration_client.close()
+        self._metadata_router.close()
 
 
 class EncoderRequestDispatcher:

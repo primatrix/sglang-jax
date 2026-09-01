@@ -2,11 +2,35 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from types import SimpleNamespace
 
 from sgl_jax.srt.disaggregation.encoder import client as encoder_client
 from sgl_jax.srt.managers.io_struct import GenerateReqInput
 from sgl_jax.srt.multimodal.common.modality_enum import Modality
+
+
+def test_encoder_metadata_router_routes_shared_socket_messages():
+    class FakeReceiver:
+        def __init__(self):
+            self.messages = [
+                SimpleNamespace(req_id="request-1"),
+                SimpleNamespace(req_id="request-0"),
+            ]
+
+        def recv_pyobj(self, _flags):
+            if not self.messages:
+                raise encoder_client.zmq.Again()
+            return self.messages.pop(0)
+
+    router = object.__new__(encoder_client.EncoderMetadataRouter)
+    router._receiver = FakeReceiver()
+    router._queues = {}
+    router.register(("request-0",))
+    router.register(("request-1",))
+
+    assert router.poll(("request-0",)).req_id == "request-0"
+    assert router.poll(("request-1",)).req_id == "request-1"
 
 
 def test_encoder_receiver_reuses_http_client(monkeypatch):
@@ -39,6 +63,54 @@ def test_encoder_receiver_reuses_http_client(monkeypatch):
     assert len(clients) == 1
     assert clients[0].timeout == 12.0
     assert clients[0].closed
+
+
+def test_encoder_receiver_reuses_metadata_socket(monkeypatch):
+    receive_urls = []
+
+    class FakeClient:
+        def __init__(self, *, timeout) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    class FakeBackend:
+        def close(self) -> None:
+            pass
+
+    def submit(executor, registrations, receive_url, client):
+        del executor, registrations, client
+        receive_urls.append(receive_url)
+        future = Future()
+        future.set_result(None)
+        return future
+
+    monkeypatch.setattr(encoder_client.httpx, "Client", FakeClient)
+    monkeypatch.setattr(encoder_client, "submit_scheduler_receiver_registrations", submit)
+    client = encoder_client.EncoderClient(
+        host="127.0.0.1",
+        backend=FakeBackend(),
+        encoder_urls=["http://encoder"],
+        executor=ThreadPoolExecutor(max_workers=1),
+        registration_timeout=12.0,
+    )
+    requests = [
+        SimpleNamespace(
+            rid=f"request-{index}",
+            encoder_urls=None,
+            num_items_assigned=None,
+        )
+        for index in range(2)
+    ]
+
+    pending = [client.receive(request) for request in requests]
+    for request in pending:
+        request.close()
+    client.close()
+
+    assert len(receive_urls) == 2
+    assert receive_urls[0] == receive_urls[1]
 
 
 def test_encoder_receiver_registers_parts_concurrently():

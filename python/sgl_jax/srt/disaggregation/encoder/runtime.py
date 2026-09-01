@@ -213,6 +213,8 @@ class EncoderRuntime:
         self._receiver_timeout = receiver_timeout
         self._receiver_addresses: dict[str, str] = {}
         self._receiver_events: dict[str, asyncio.Event] = {}
+        self._receiver_sockets: dict[str, zmq.asyncio.Socket] = {}
+        self._notify_lock = asyncio.Lock()
         self.scheduler = EncoderScheduler(
             self._dispatch_batch,
             max_batch_size=max_batch_size,
@@ -235,6 +237,9 @@ class EncoderRuntime:
             with suppress(asyncio.CancelledError):
                 await self._release_task
             self._release_task = None
+        for socket in self._receiver_sockets.values():
+            socket.close()
+        self._receiver_sockets.clear()
         self._transfer.close()
 
     async def register_scheduler_receiver(
@@ -419,10 +424,11 @@ class EncoderRuntime:
             self._receiver_addresses.pop(req_id, None)
 
     async def _notify(self, address: str, data: EmbeddingData) -> None:
-        socket = self._zmq.socket(PUSH)
-        socket.setsockopt(LINGER, 1000)
-        try:
-            socket.connect(f"tcp://{address}")
+        async with self._notify_lock:
+            socket = self._receiver_sockets.get(address)
+            if socket is None:
+                socket = self._zmq.socket(PUSH)
+                socket.setsockopt(LINGER, 1000)
+                socket.connect(f"tcp://{address}")
+                self._receiver_sockets[address] = socket
             await socket.send_pyobj(data)
-        finally:
-            socket.close()

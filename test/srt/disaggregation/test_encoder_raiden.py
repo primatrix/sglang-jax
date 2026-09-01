@@ -10,7 +10,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import zmq
 
 from sgl_jax.raiden import raiden_requested
 from sgl_jax.srt.disaggregation.encoder.client import PendingEncoderRequest
@@ -69,15 +68,15 @@ class _FakeRaidenWrapper:
         return self.stats
 
 
-class _NoMessageReceiver:
+class _NoMessageRouter:
     def __init__(self) -> None:
-        self.closed = False
+        self.unregistered = None
 
-    def recv_pyobj(self, _flags):
-        raise zmq.Again()
+    def poll(self, _req_ids):
+        return None
 
-    def close(self) -> None:
-        self.closed = True
+    def unregister(self, req_ids) -> None:
+        self.unregistered = req_ids
 
 
 def test_raiden_loader_recognizes_encoder_backend():
@@ -201,7 +200,7 @@ def test_raiden_request_receives_into_matching_jax_buffer(monkeypatch):
     )
     register_future: Future[None] = Future()
     register_future.set_result(None)
-    receiver = _NoMessageReceiver()
+    metadata_router = _NoMessageRouter()
     backend = RaidenReceiverBackend(
         host="10.0.0.9",
         sharding=jax.sharding.SingleDeviceSharding(jax.local_devices()[0]),
@@ -211,7 +210,8 @@ def test_raiden_request_receives_into_matching_jax_buffer(monkeypatch):
     request = PendingEncoderRequest(
         recv_req=TokenizedGenerateReqInput(rid="request-0"),
         started_at=0.0,
-        receiver=receiver,
+        metadata_router=metadata_router,
+        metadata_req_ids=("part-0",),
         register_future=register_future,
         accumulator=MultiModalEmbeddingData(1),
         backend=backend,
@@ -256,7 +256,7 @@ def test_raiden_request_receives_into_matching_jax_buffer(monkeypatch):
     np.testing.assert_array_equal(result["embeddings"][Modality.IMAGE], np.zeros((2, 3)))
     request.close()
     backend.close()
-    assert receiver.closed
+    assert metadata_router.unregistered == ("part-0",)
 
 
 def test_raiden_receiver_reuses_manager_and_pool_blocks(monkeypatch):
