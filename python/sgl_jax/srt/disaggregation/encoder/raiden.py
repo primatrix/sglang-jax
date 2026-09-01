@@ -5,10 +5,10 @@ import hashlib
 import logging
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -64,7 +64,7 @@ def _normalize_endpoints(endpoints: object, peer_host: str) -> list[dict[str, An
 
 
 class RaidenEncoderServerTransfer:
-    """Binds each produced embedding to its own Raiden transfer session."""
+    """Publish encoder output through short-lived Raiden transfer sessions."""
 
     def __init__(
         self,
@@ -109,6 +109,67 @@ class RaidenEncoderServerTransfer:
         self._sessions[transfer_id] = session
         return metadata
 
+    async def publish_batch(
+        self,
+        items: list[tuple[str, jax.Array]],
+    ) -> list[dict[str, Any]]:
+        """Publish one contiguous transfer and return a row view for each item."""
+        if not items:
+            return []
+        if len(items) == 1:
+            transfer_id, embedding = items[0]
+            return [await self.publish(transfer_id, embedding)]
+
+        transfer_ids = [transfer_id for transfer_id, _ in items]
+        if len(set(transfer_ids)) != len(transfer_ids):
+            raise ValueError("duplicate Raiden transfer_id in batch")
+        embeddings = [embedding for _, embedding in items]
+        hidden_size = embeddings[0].shape[-1] if embeddings[0].ndim == 2 else None
+        dtype = embeddings[0].dtype
+        if any(
+            embedding.ndim != 2
+            or embedding.shape[0] <= 0
+            or embedding.shape[1] != hidden_size
+            or embedding.dtype != dtype
+            for embedding in embeddings
+        ):
+            raise ValueError("batched Raiden embeddings must have matching width and dtype")
+
+        digest = _uuid_to_int("\0".join(transfer_ids))
+        group_id = f"{transfer_ids[0]}:batch:{digest}"
+        if group_id in self._sessions or group_id in self._preparing:
+            raise ValueError(f"duplicate Raiden transfer_id: {group_id}")
+
+        offsets = []
+        offset = 0
+        for embedding in embeddings:
+            offsets.append(offset)
+            offset += embedding.shape[0]
+        packed = jnp.concatenate(embeddings, axis=0)
+
+        self._preparing.add(group_id)
+        try:
+            session, common = await asyncio.get_running_loop().run_in_executor(
+                self._executor,
+                self._prepare,
+                group_id,
+                packed,
+            )
+        finally:
+            self._preparing.discard(group_id)
+        self._sessions[group_id] = session
+
+        transfer_shape = tuple(int(dim) for dim in packed.shape)
+        return [
+            {
+                **common,
+                "transfer_group_size": len(items),
+                "transfer_shape": transfer_shape,
+                "transfer_offset": item_offset,
+            }
+            for item_offset in offsets
+        ]
+
     def _prepare(
         self,
         transfer_id: str,
@@ -117,6 +178,7 @@ class RaidenEncoderServerTransfer:
         # Treat one embedding as one physical major slice. The leading transfer
         # axis makes TPU tile padding part of the slice instead of row stride.
         buffer = embedding[jnp.newaxis, ...]
+        jax.block_until_ready(buffer)
         block_ids = [0]
         transfer_uuid = _uuid_to_int(transfer_id)
         session = RaidenTransferWrapper(
@@ -192,6 +254,12 @@ class RaidenReceiveSession:
     def close(self) -> None:
         if self.pool is not None and not self._done:
             self.pool.abandon(self.transfer_id)
+
+
+class _RaidenPollingSession(Protocol):
+    def poll(self) -> jax.Array | None: ...
+
+    def close(self) -> None: ...
 
 
 class _RaidenReceivePool:
@@ -335,9 +403,9 @@ class _RaidenReceivePool:
 class DeferredRaidenReceiveSession:
     """Expose a non-blocking session while Raiden setup runs off-loop."""
 
-    def __init__(self, future: Future[RaidenReceiveSession]) -> None:
+    def __init__(self, future: Future[_RaidenPollingSession]) -> None:
         self._future = future
-        self._session: RaidenReceiveSession | None = None
+        self._session: _RaidenPollingSession | None = None
         self._closed = False
 
     def poll(self) -> jax.Array | None:
@@ -357,13 +425,101 @@ class DeferredRaidenReceiveSession:
             self._future.add_done_callback(self._close_session)
 
     @staticmethod
-    def _close_session(future: Future[RaidenReceiveSession]) -> None:
+    def _close_session(future: Future[_RaidenPollingSession]) -> None:
         if future.cancelled():
             return
         try:
             future.result().close()
         except Exception:
             logger.exception("Deferred Raiden receiver setup failed during cleanup")
+
+
+class _RaidenReceiveGroup:
+    """Fan one physical transfer out to request-sized immutable JAX views."""
+
+    def __init__(
+        self,
+        transfer_id: str,
+        shape: tuple[int, int],
+        size: int,
+        session: RaidenReceiveSession,
+        on_done: Callable[[str, _RaidenReceiveGroup], None],
+    ) -> None:
+        self.transfer_id = transfer_id
+        self.shape = shape
+        self.size = size
+        self._session = session
+        self._on_done = on_done
+        self._members: set[str] = set()
+        self._finished: set[str] = set()
+        self._buffer: jax.Array | None = None
+        self._lock = threading.Lock()
+
+    def attach(
+        self,
+        member_id: str,
+        offset: int,
+        shape: tuple[int, int],
+    ) -> _GroupedRaidenReceiveSession:
+        if shape[1] != self.shape[1] or offset < 0 or offset + shape[0] > self.shape[0]:
+            raise ValueError("Raiden transfer group slice is out of bounds")
+        with self._lock:
+            if member_id in self._members:
+                raise ValueError(f"duplicate Raiden transfer group member: {member_id}")
+            if len(self._members) >= self.size:
+                raise ValueError("Raiden transfer group has too many members")
+            self._members.add(member_id)
+        return _GroupedRaidenReceiveSession(self, member_id, offset, shape[0])
+
+    def poll(self, member_id: str, offset: int, rows: int) -> jax.Array | None:
+        with self._lock:
+            if member_id in self._finished:
+                return None
+            if self._buffer is None:
+                self._buffer = self._session.poll()
+                if self._buffer is None:
+                    return None
+            result = self._buffer[offset : offset + rows]
+            self._finish_locked(member_id)
+            return result
+
+    def finish(self, member_id: str) -> None:
+        with self._lock:
+            self._finish_locked(member_id)
+
+    def close(self) -> None:
+        with self._lock:
+            self._session.close()
+            self._finished.update(self._members)
+
+    def _finish_locked(self, member_id: str) -> None:
+        if member_id in self._finished:
+            return
+        self._finished.add(member_id)
+        if len(self._finished) == self.size:
+            self._session.close()
+            self._on_done(self.transfer_id, self)
+
+
+@dataclass(slots=True)
+class _GroupedRaidenReceiveSession:
+    group: _RaidenReceiveGroup
+    member_id: str
+    offset: int
+    rows: int
+    _done: bool = False
+
+    def poll(self) -> jax.Array | None:
+        if self._done:
+            return None
+        result = self.group.poll(self.member_id, self.offset, self.rows)
+        self._done = result is not None
+        return result
+
+    def close(self) -> None:
+        if not self._done:
+            self.group.finish(self.member_id)
+        self._done = True
 
 
 class RaidenReceiverBackend:
@@ -380,6 +536,8 @@ class RaidenReceiverBackend:
         self._transfer_timeout_s = float(transfer_timeout_s)
         self._pools: dict[tuple[tuple[int, int], jnp.dtype], _RaidenReceivePool] = {}
         self._pool_lock = threading.Lock()
+        self._groups: dict[str, _RaidenReceiveGroup] = {}
+        self._group_lock = threading.Lock()
         self._closed = False
         # Pool creation and Raiden control-plane calls stay off the event loop.
         self._executor = ThreadPoolExecutor(max_workers=1)
@@ -387,13 +545,58 @@ class RaidenReceiverBackend:
     def start(self, data: EmbeddingData) -> DeferredRaidenReceiveSession:
         return DeferredRaidenReceiveSession(self._executor.submit(self._start, data))
 
-    def _start(self, data: EmbeddingData) -> RaidenReceiveSession:
+    def _start(self, data: EmbeddingData) -> _RaidenPollingSession:
         if data.shape is None or data.dtype is None:
             raise ValueError("embedding shape and dtype are required")
         shape = tuple(int(dim) for dim in data.shape)
         if len(shape) != 2 or shape[0] <= 0:
             raise ValueError("Raiden embedding must be a non-empty matrix")
 
+        group_size = int(getattr(data, "transfer_group_size", 1))
+        if group_size <= 1:
+            return self._start_transfer(data, shape)
+        transfer_shape = tuple(int(dim) for dim in getattr(data, "transfer_shape", ()))
+        offset = int(getattr(data, "transfer_offset", -1))
+        if (
+            len(transfer_shape) != 2
+            or transfer_shape[0] <= 0
+            or transfer_shape[1] != shape[1]
+            or offset < 0
+            or offset + shape[0] > transfer_shape[0]
+        ):
+            raise ValueError("Raiden transfer group metadata does not match embedding shape")
+
+        transfer_id = getattr(data, "transfer_id", None)
+        if not transfer_id:
+            raise ValueError("Raiden transfer identity is incomplete")
+        with self._group_lock:
+            group = self._groups.get(transfer_id)
+        if group is None:
+            candidate = _RaidenReceiveGroup(
+                transfer_id,
+                transfer_shape,
+                group_size,
+                self._start_transfer(data, transfer_shape),
+                self._release_group,
+            )
+            with self._group_lock:
+                if self._closed:
+                    candidate.close()
+                    raise RuntimeError("Raiden receiver is closed")
+                group = self._groups.setdefault(transfer_id, candidate)
+            if group is not candidate:
+                candidate.close()
+        elif group.shape != transfer_shape or group.size != group_size:
+            raise ValueError("inconsistent Raiden transfer group metadata")
+
+        member_id = f"{data.req_id}:{data.part_idx}"
+        return group.attach(member_id, offset, shape)
+
+    def _start_transfer(
+        self,
+        data: EmbeddingData,
+        shape: tuple[int, int],
+    ) -> RaidenReceiveSession:
         transfer_id = getattr(data, "transfer_id", None)
         transfer_uuid = getattr(data, "transfer_uuid", None)
         remote_block_ids = getattr(data, "transfer_block_ids", None)
@@ -438,7 +641,17 @@ class RaidenReceiverBackend:
             remote_block_ids,
         )
 
+    def _release_group(self, transfer_id: str, group: _RaidenReceiveGroup) -> None:
+        with self._group_lock:
+            if self._groups.get(transfer_id) is group:
+                self._groups.pop(transfer_id, None)
+
     def close(self) -> None:
+        with self._group_lock:
+            groups = list(self._groups.values())
+            self._groups.clear()
+        for group in groups:
+            group.close()
         with self._pool_lock:
             self._closed = True
             pools = list(self._pools.values())

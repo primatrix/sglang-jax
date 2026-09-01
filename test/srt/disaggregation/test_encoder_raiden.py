@@ -140,7 +140,46 @@ def test_raiden_server_prepares_batch_transfers_concurrently(monkeypatch):
     assert len(_FakeRaidenWrapper.instances) == 2
 
 
-def test_raiden_server_setup_concurrency_is_independent_from_transfer_channels(monkeypatch):
+def test_raiden_server_publishes_batch_as_one_contiguous_transfer(monkeypatch):
+    _FakeRaidenWrapper.instances.clear()
+    monkeypatch.setattr(
+        "sgl_jax.srt.disaggregation.encoder.raiden.RaidenTransferWrapper",
+        _FakeRaidenWrapper,
+    )
+    transfer = RaidenEncoderServerTransfer("10.0.0.4", parallelism=2)
+    first = jnp.arange(6, dtype=jnp.float32).reshape(2, 3)
+    second = jnp.arange(9, dtype=jnp.float32).reshape(3, 3) + 10
+
+    metadata = asyncio.run(
+        transfer.publish_batch(
+            [
+                ("part-0:embedding", first),
+                ("part-1:embedding", second),
+            ]
+        )
+    )
+
+    assert len(_FakeRaidenWrapper.instances) == 1
+    session = _FakeRaidenWrapper.instances[0]
+    buffers, options = session.started
+    np.testing.assert_array_equal(buffers[0][0], jnp.concatenate([first, second]))
+    assert buffers[0].shape == (1, 5, 3)
+    assert options == {"max_blocks": 1, "num_slots": 1, "timeout_s": 300.0}
+    assert metadata[0]["transfer_id"] == metadata[1]["transfer_id"]
+    assert [item["transfer_offset"] for item in metadata] == [0, 2]
+    assert all(item["transfer_shape"] == (5, 3) for item in metadata)
+    assert all(item["transfer_group_size"] == 2 for item in metadata)
+    assert session.registered == (
+        metadata[0]["transfer_id"],
+        metadata[0]["transfer_uuid"],
+        [0],
+    )
+    transfer.close()
+
+
+def test_raiden_server_setup_concurrency_is_independent_from_transfer_channels(
+    monkeypatch,
+):
     _FakeRaidenWrapper.instances.clear()
     _FakeRaidenWrapper.start_barrier = threading.Barrier(2)
     monkeypatch.setattr(
@@ -308,6 +347,54 @@ def test_raiden_receiver_reuses_manager_and_pool_blocks(monkeypatch):
     assert third.transfer is first.transfer
     assert third.lane_id == first.lane_id
     third.close()
+    backend.close()
+
+
+def test_raiden_receiver_pulls_group_once_and_returns_request_views(monkeypatch):
+    _FakeRaidenWrapper.instances.clear()
+    monkeypatch.setattr(
+        "sgl_jax.srt.disaggregation.encoder.raiden.RaidenTransferWrapper",
+        _FakeRaidenWrapper,
+    )
+    backend = RaidenReceiverBackend(
+        host="10.0.0.9",
+        sharding=jax.sharding.SingleDeviceSharding(jax.local_devices()[0]),
+        parallelism=2,
+        transfer_timeout_s=30.0,
+    )
+
+    def metadata(req_id: str, shape: tuple[int, int], offset: int) -> EmbeddingData:
+        return EmbeddingData(
+            req_id=req_id,
+            num_parts=1,
+            part_idx=0,
+            grid_dim=None,
+            modality=Modality.IMAGE,
+            embedding_shape=shape,
+            dtype="float32",
+            transfer_id="batch-0:embedding",
+            transfer_uuid=17,
+            transfer_address=[{"endpoint": "127.0.0.1:7788", "shards": [0]}],
+            transfer_host="10.0.0.8",
+            transfer_block_ids=[0],
+            transfer_group_size=2,
+            transfer_shape=(5, 3),
+            transfer_offset=offset,
+        )
+
+    first = backend.start(metadata("part-0", (2, 3), 0))._future.result(timeout=1)
+    second = backend.start(metadata("part-1", (3, 3), 2))._future.result(timeout=1)
+
+    assert first.group is second.group
+    physical = first.group._session
+    transfer = physical.transfer
+    packed = jnp.arange(15, dtype=jnp.float32).reshape(1, 5, 3)
+    physical.pool._lanes[physical.lane_id] = (packed, transfer)
+    transfer.stats = ([], [physical.transfer_id], [])
+
+    np.testing.assert_array_equal(first.poll(), packed[0, :2])
+    np.testing.assert_array_equal(second.poll(), packed[0, 2:])
+    assert "batch-0:embedding" not in backend._groups
     backend.close()
 
 

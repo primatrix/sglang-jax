@@ -232,6 +232,64 @@ def test_runtime_releases_each_request_when_its_publish_completes():
     asyncio.run(run())
 
 
+def test_runtime_groups_batch_transfer_by_receiver():
+    class BatchTransfer:
+        def __init__(self):
+            self.calls = []
+
+        async def publish_batch(self, items):
+            self.calls.append(items)
+            return [
+                {
+                    "transfer_id": "group-0",
+                    "transfer_offset": offset,
+                }
+                for offset in (0, items[0][1].shape[0])
+            ]
+
+        async def publish(self, transfer_id, embedding):
+            raise AssertionError("multi-request batches must use publish_batch")
+
+        async def release_completed(self) -> None:
+            pass
+
+        def release(self, transfer_id) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    async def run() -> tuple[BatchTransfer, list[PendingRequest]]:
+        transfer = BatchTransfer()
+
+        async def encode(_requests):
+            return [
+                (jnp.zeros((2, 3)), {}),
+                (jnp.ones((4, 3)), {}),
+            ]
+
+        runtime = EncoderRuntime(encode, transfer)
+        pending = [
+            PendingRequest({"req_id": f"request-{idx}", "modality": "IMAGE"}) for idx in range(2)
+        ]
+        for item in pending:
+            item.mark_dequeued()
+            await runtime.register_scheduler_receiver(
+                {"req_id": item.request["req_id"], "receive_url": "127.0.0.1:1234"}
+            )
+        await runtime._dispatch_batch(pending)
+        return transfer, pending
+
+    transfer, pending = asyncio.run(run())
+    assert len(transfer.calls) == 1
+    assert [item[0] for item in transfer.calls[0]] == [
+        "request-0:0:embedding",
+        "request-1:0:embedding",
+    ]
+    assert [item.future.result().data.transfer_offset for item in pending] == [0, 2]
+    assert {item.future.result().transfer_id for item in pending} == {"group-0"}
+
+
 def test_runtime_reuses_metadata_sender_socket():
     class FakeSocket:
         def __init__(self):
