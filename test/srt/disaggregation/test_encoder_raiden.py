@@ -125,7 +125,7 @@ def test_raiden_server_publishes_equal_shaped_embeddings_as_blocks(monkeypatch):
         "sgl_jax.srt.disaggregation.encoder.raiden.RaidenTransferWrapper",
         _FakeRaidenWrapper,
     )
-    transfer = RaidenEncoderServerTransfer("10.0.0.4", max_batch_size=16)
+    transfer = RaidenEncoderServerTransfer("10.0.0.4", parallelism=3, max_batch_size=16)
     embeddings = [jnp.full((2, 3), value) for value in range(3)]
 
     metadata = asyncio.run(
@@ -139,7 +139,7 @@ def test_raiden_server_publishes_equal_shaped_embeddings_as_blocks(monkeypatch):
     buffers, options = session.started
     assert buffers[0].shape == (4, 2, 3)
     np.testing.assert_array_equal(buffers[0][:3], jnp.stack(embeddings))
-    assert options == {"max_blocks": 1, "num_slots": 3, "timeout_s": 300.0}
+    assert options == {"max_blocks": 4, "num_slots": 3, "timeout_s": 300.0}
     assert [registration[-1] for registration in session.registrations] == [[0], [1], [2]]
     assert [item["transfer_buffer_capacity"] for item in metadata] == [4, 4, 4]
     assert [item["transfer_block_ids"] for item in metadata] == [[0], [1], [2]]
@@ -336,6 +336,9 @@ def test_raiden_receiver_reuses_manager_and_pool_blocks(monkeypatch):
 
     assert len(_FakeRaidenWrapper.instances) == 1
     assert first.transfer is second.transfer
+    buffers, options = first.transfer.started
+    assert buffers[0].shape == (2, 2, 3)
+    assert options == {"max_blocks": 2, "num_slots": 2, "timeout_s": 30.0}
     assert [first.block_id, second.block_id] == [0, 1]
     assert [read[-1] for read in first.transfer.reads] == [[0], [1]]
 
