@@ -170,6 +170,7 @@ class RaidenReceiveSession:
     buffer: jax.Array
     transfer: RaidenTransferWrapper
     block_id: int = 0
+    lane_id: int = 0
     pool: _RaidenReceivePool | None = None
     _done: bool = False
 
@@ -177,7 +178,7 @@ class RaidenReceiveSession:
         if self._done:
             return None
         if self.pool is not None:
-            result = self.pool.poll(self.transfer_id, self.block_id)
+            result = self.pool.poll(self.transfer_id, self.lane_id)
             self._done = result is not None
             return result
         _, received, failed = self.transfer.poll_stats()
@@ -194,7 +195,7 @@ class RaidenReceiveSession:
 
 
 class _RaidenReceivePool:
-    """One reusable Raiden manager for equal-shaped embedding buffers."""
+    """Reusable single-block Raiden lanes for equal-shaped embeddings."""
 
     def __init__(
         self,
@@ -203,25 +204,25 @@ class _RaidenReceivePool:
         dtype: jnp.dtype,
         sharding: jax.sharding.Sharding,
         parallelism: int,
-        capacity: int,
         timeout_s: float,
     ) -> None:
         self._sharding = sharding
         self._timeout_s = timeout_s
-        self.buffer = jnp.zeros((capacity, *shape), dtype=dtype, device=sharding)
-        jax.block_until_ready(self.buffer)
-        self.transfer = RaidenTransferWrapper(host, 0, parallelism=parallelism)
-        self.transfer.start(
-            [self.buffer],
-            max_blocks=capacity,
-            num_slots=min(capacity, parallelism),
-            timeout_s=timeout_s,
-        )
+        buffers = [jnp.zeros((1, *shape), dtype=dtype, device=sharding) for _ in range(parallelism)]
+        jax.block_until_ready(buffers)
+        self._lanes: list[tuple[jax.Array, RaidenTransferWrapper]] = []
+        for buffer in buffers:
+            transfer = RaidenTransferWrapper(host, 0, parallelism=parallelism)
+            transfer.start(
+                [buffer],
+                max_blocks=1,
+                num_slots=1,
+                timeout_s=timeout_s,
+            )
+            self._lanes.append((buffer, transfer))
         self._condition = threading.Condition()
-        self._free = list(range(capacity - 1, -1, -1))
+        self._free = list(range(parallelism - 1, -1, -1))
         self._active: dict[str, int] = {}
-        self._completed: set[str] = set()
-        self._failed: set[str] = set()
         self._abandoned: set[str] = set()
         self._materializing: set[str] = set()
         self._closed = False
@@ -236,45 +237,50 @@ class _RaidenReceivePool:
         deadline = time.monotonic() + self._timeout_s
         with self._condition:
             while not self._free and not self._closed:
+                self._reap_abandoned_locked()
+                if self._free:
+                    break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("timed out waiting for a Raiden embedding buffer")
-                self._condition.wait(remaining)
+                self._condition.wait(min(remaining, 0.01))
             if self._closed:
                 raise RuntimeError("Raiden receiver is closed")
             if transfer_id in self._active:
                 raise ValueError(f"duplicate Raiden transfer_id: {transfer_id}")
-            block_id = self._free.pop()
-            self._active[transfer_id] = block_id
+            lane_id = self._free.pop()
+            self._active[transfer_id] = lane_id
+            buffer, transfer = self._lanes[lane_id]
             try:
-                self.transfer.start_read(
+                transfer.start_read(
                     transfer_id,
                     transfer_uuid,
                     remote_endpoints,
                     remote_block_ids,
-                    [block_id],
+                    [0],
                 )
             except Exception:
                 self._release_locked(transfer_id)
                 raise
         return RaidenReceiveSession(
             transfer_id,
-            self.buffer,
-            self.transfer,
-            block_id=block_id,
+            buffer,
+            transfer,
+            lane_id=lane_id,
             pool=self,
         )
 
-    def poll(self, transfer_id: str, block_id: int) -> jax.Array | None:
+    def poll(self, transfer_id: str, lane_id: int) -> jax.Array | None:
         with self._condition:
-            self._drain_locked()
-            if transfer_id in self._failed:
+            if self._active.get(transfer_id) != lane_id:
+                raise RuntimeError(f"Raiden embedding lane changed: {transfer_id}")
+            buffer, transfer = self._lanes[lane_id]
+            _, received, failed = transfer.poll_stats()
+            if transfer_id in failed:
                 self._release_locked(transfer_id)
                 raise RuntimeError(f"Raiden embedding transfer failed: {transfer_id}")
-            if transfer_id not in self._completed:
+            if transfer_id not in received:
                 return None
-            if self._active.get(transfer_id) != block_id:
-                raise RuntimeError(f"Raiden embedding block changed: {transfer_id}")
             if transfer_id in self._materializing:
                 return None
             self._materializing.add(transfer_id)
@@ -283,7 +289,7 @@ class _RaidenReceivePool:
             # Raiden writes outside JAX's dependency graph. Copy the completed
             # block and synchronize it before making the pool slot reusable.
             embedding = jax.device_put(
-                self.buffer[block_id],
+                buffer[0],
                 self._sharding,
                 may_alias=False,
             )
@@ -299,26 +305,25 @@ class _RaidenReceivePool:
                 return
             self._abandoned.add(transfer_id)
             try:
-                self._drain_locked()
+                self._reap_abandoned_locked()
             except Exception:
                 logger.exception("Raiden receiver poll failed while abandoning %s", transfer_id)
 
-    def _drain_locked(self) -> None:
-        _, received, failed = self.transfer.poll_stats()
-        self._completed.update(received)
-        self._failed.update(failed)
-        for transfer_id in self._abandoned & (self._completed | self._failed):
-            if transfer_id not in self._materializing:
+    def _reap_abandoned_locked(self) -> None:
+        for transfer_id in list(self._abandoned):
+            lane_id = self._active.get(transfer_id)
+            if lane_id is None or transfer_id in self._materializing:
+                continue
+            _, received, failed = self._lanes[lane_id][1].poll_stats()
+            if transfer_id in received or transfer_id in failed:
                 self._release_locked(transfer_id)
 
     def _release_locked(self, transfer_id: str) -> None:
-        block_id = self._active.pop(transfer_id, None)
-        self._completed.discard(transfer_id)
-        self._failed.discard(transfer_id)
+        lane_id = self._active.pop(transfer_id, None)
         self._abandoned.discard(transfer_id)
         self._materializing.discard(transfer_id)
-        if block_id is not None:
-            self._free.append(block_id)
+        if lane_id is not None:
+            self._free.append(lane_id)
             self._condition.notify()
 
     def close(self) -> None:
@@ -367,13 +372,11 @@ class RaidenReceiverBackend:
         host: str,
         sharding: jax.sharding.Sharding,
         parallelism: int,
-        pool_capacity: int,
         transfer_timeout_s: float,
     ) -> None:
         self._host = host
         self._sharding = sharding
         self._parallelism = max(1, int(parallelism))
-        self._pool_capacity = max(1, int(pool_capacity))
         self._transfer_timeout_s = float(transfer_timeout_s)
         self._pools: dict[tuple[tuple[int, int], jnp.dtype], _RaidenReceivePool] = {}
         self._pool_lock = threading.Lock()
@@ -425,7 +428,6 @@ class RaidenReceiverBackend:
                     dtype,
                     self._sharding,
                     self._parallelism,
-                    self._pool_capacity,
                     self._transfer_timeout_s,
                 )
                 self._pools[key] = pool
@@ -466,10 +468,6 @@ def create_raiden_client(
         host=host,
         sharding=sharding,
         parallelism=server_args.disaggregation_channel_number,
-        pool_capacity=(
-            max(1, int(server_args.encoder_max_batch_size))
-            * max(1, int(server_args.encoder_max_inflight_batches))
-        ),
         transfer_timeout_s=transfer_timeout,
     )
     return EncoderClient(

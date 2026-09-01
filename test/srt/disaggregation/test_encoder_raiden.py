@@ -206,7 +206,6 @@ def test_raiden_request_receives_into_matching_jax_buffer(monkeypatch):
         host="10.0.0.9",
         sharding=jax.sharding.SingleDeviceSharding(jax.local_devices()[0]),
         parallelism=2,
-        pool_capacity=2,
         transfer_timeout_s=30.0,
     )
     request = PendingEncoderRequest(
@@ -239,10 +238,10 @@ def test_raiden_request_receives_into_matching_jax_buffer(monkeypatch):
     session = receive_session._future.result(timeout=1)
     transfer = session.transfer
     buffers, options = transfer.started
-    assert buffers[0].shape == (2, 2, 3)
+    assert buffers[0].shape == (1, 2, 3)
     assert buffers[0].dtype == jnp.float32
-    assert session.buffer.shape == (2, 2, 3)
-    assert options == {"max_blocks": 2, "num_slots": 2, "timeout_s": 30.0}
+    assert session.buffer.shape == (1, 2, 3)
+    assert options == {"max_blocks": 1, "num_slots": 1, "timeout_s": 30.0}
     assert transfer.read == (
         "part-0:embedding",
         17,
@@ -270,7 +269,6 @@ def test_raiden_receiver_reuses_manager_and_pool_blocks(monkeypatch):
         host="10.0.0.9",
         sharding=jax.sharding.SingleDeviceSharding(jax.local_devices()[0]),
         parallelism=2,
-        pool_capacity=2,
         transfer_timeout_s=30.0,
     )
 
@@ -293,21 +291,22 @@ def test_raiden_receiver_reuses_manager_and_pool_blocks(monkeypatch):
     first = backend.start(metadata(1))._future.result(timeout=1)
     second = backend.start(metadata(2))._future.result(timeout=1)
 
-    assert len(_FakeRaidenWrapper.instances) == 1
-    assert first.transfer is second.transfer
-    assert [first.block_id, second.block_id] == [0, 1]
-    assert [read[-1] for read in first.transfer.reads] == [[0], [1]]
+    assert len(_FakeRaidenWrapper.instances) == 2
+    assert first.transfer is not second.transfer
+    assert [first.lane_id, second.lane_id] == [0, 1]
+    assert first.transfer.read[-1] == [0]
+    assert second.transfer.read[-1] == [0]
 
     third_future = backend.start(metadata(3))._future
     assert not third_future.done()
-    first.transfer.stats = ([], [first.transfer_id, second.transfer_id], [])
+    first.transfer.stats = ([], [first.transfer_id], [])
     assert first.poll().shape == (2, 3)
     third = third_future.result(timeout=1)
-    first.transfer.stats = ([], [], [])
+    second.transfer.stats = ([], [second.transfer_id], [])
     assert second.poll().shape == (2, 3)
 
     assert third.transfer is first.transfer
-    assert third.block_id in (0, 1)
+    assert third.lane_id == first.lane_id
     third.close()
     backend.close()
 
