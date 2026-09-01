@@ -46,7 +46,6 @@ class _FakeRaidenWrapper:
         self.endpoints = [{"endpoint": "127.0.0.1:7788", "shards": [0]}]
         self.started = None
         self.registered = None
-        self.registrations = []
         self.read = None
         self.reads = []
         self.stats = ([], [], [])
@@ -59,7 +58,6 @@ class _FakeRaidenWrapper:
 
     def register_read(self, *args) -> bool:
         self.registered = args
-        self.registrations.append(args)
         return True
 
     def start_read(self, *args) -> None:
@@ -115,34 +113,6 @@ def test_raiden_server_binds_the_produced_embedding(monkeypatch):
     )
     assert metadata["transfer_address"] == session.endpoints
     assert metadata["transfer_host"] == "10.0.0.4"
-    assert metadata["transfer_buffer_capacity"] == 1
-    transfer.close()
-
-
-def test_raiden_server_publishes_equal_shaped_embeddings_as_blocks(monkeypatch):
-    _FakeRaidenWrapper.instances.clear()
-    monkeypatch.setattr(
-        "sgl_jax.srt.disaggregation.encoder.raiden.RaidenTransferWrapper",
-        _FakeRaidenWrapper,
-    )
-    transfer = RaidenEncoderServerTransfer("10.0.0.4", max_batch_size=16)
-    embeddings = [jnp.full((2, 3), value) for value in range(3)]
-
-    metadata = asyncio.run(
-        transfer.publish_batch(
-            [(f"part-{index}:embedding", embedding) for index, embedding in enumerate(embeddings)]
-        )
-    )
-
-    assert len(_FakeRaidenWrapper.instances) == 1
-    session = _FakeRaidenWrapper.instances[0]
-    buffers, options = session.started
-    assert buffers[0].shape == (4, 2, 3)
-    np.testing.assert_array_equal(buffers[0][:3], jnp.stack(embeddings))
-    assert options == {"max_blocks": 1, "num_slots": 3, "timeout_s": 300.0}
-    assert [registration[-1] for registration in session.registrations] == [[0], [1], [2]]
-    assert [item["transfer_buffer_capacity"] for item in metadata] == [4, 4, 4]
-    assert [item["transfer_block_ids"] for item in metadata] == [[0], [1], [2]]
     transfer.close()
 
 
@@ -204,20 +174,9 @@ def test_raiden_server_reaps_completed_sender(monkeypatch):
         "sgl_jax.srt.disaggregation.encoder.raiden.RaidenTransferWrapper",
         _FakeRaidenWrapper,
     )
-    transfer = RaidenEncoderServerTransfer("10.0.0.4", max_batch_size=2)
-    asyncio.run(
-        transfer.publish_batch(
-            [
-                ("part-0:embedding", jnp.zeros((2, 3))),
-                ("part-1:embedding", jnp.ones((2, 3))),
-            ]
-        )
-    )
-    _FakeRaidenWrapper.instances[0].stats = (
-        ["part-0:embedding", "part-1:embedding"],
-        [],
-        [],
-    )
+    transfer = RaidenEncoderServerTransfer("10.0.0.4")
+    asyncio.run(transfer.publish("part-0:embedding", jnp.zeros((2, 3))))
+    _FakeRaidenWrapper.instances[0].stats = (["part-0:embedding"], [], [])
 
     async def stop_after_poll(_delay):
         raise asyncio.CancelledError
@@ -230,7 +189,6 @@ def test_raiden_server_reaps_completed_sender(monkeypatch):
         asyncio.run(transfer.release_completed())
 
     assert not transfer._sessions
-    assert not transfer._batches
     transfer.close()
 
 
@@ -327,28 +285,28 @@ def test_raiden_receiver_reuses_manager_and_pool_blocks(monkeypatch):
             transfer_uuid=index,
             transfer_address=[{"endpoint": "127.0.0.1:7788", "shards": [0]}],
             transfer_host="10.0.0.8",
-            transfer_block_ids=[(index - 1) % 2],
-            transfer_buffer_capacity=2,
+            transfer_block_ids=[0],
         )
 
     first = backend.start(metadata(1))._future.result(timeout=1)
     second = backend.start(metadata(2))._future.result(timeout=1)
 
-    assert len(_FakeRaidenWrapper.instances) == 1
-    assert first.transfer is second.transfer
-    assert [first.block_id, second.block_id] == [0, 1]
-    assert [read[-1] for read in first.transfer.reads] == [[0], [1]]
+    assert len(_FakeRaidenWrapper.instances) == 2
+    assert first.transfer is not second.transfer
+    assert [first.lane_id, second.lane_id] == [0, 1]
+    assert first.transfer.read[-1] == [0]
+    assert second.transfer.read[-1] == [0]
 
     third_future = backend.start(metadata(3))._future
     assert not third_future.done()
-    first.transfer.stats = ([], [first.transfer_id, second.transfer_id], [])
+    first.transfer.stats = ([], [first.transfer_id], [])
     assert first.poll().shape == (2, 3)
     third = third_future.result(timeout=1)
-    first.transfer.stats = ([], [], [])
+    second.transfer.stats = ([], [second.transfer_id], [])
     assert second.poll().shape == (2, 3)
 
     assert third.transfer is first.transfer
-    assert third.block_id == first.block_id
+    assert third.lane_id == first.lane_id
     third.close()
     backend.close()
 

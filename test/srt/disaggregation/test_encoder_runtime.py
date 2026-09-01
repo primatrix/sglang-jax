@@ -25,52 +25,6 @@ def test_sim_server_transfer_publish_is_awaitable():
     asyncio.run(run())
 
 
-def test_runtime_uses_transfer_batch_publish_when_available():
-    class BatchTransfer:
-        def __init__(self):
-            self.items = []
-
-        async def publish_batch(self, items):
-            self.items.append(items)
-            return [{"transfer_id": transfer_id} for transfer_id, _ in items]
-
-        async def publish(self, transfer_id, embedding):
-            raise AssertionError("batch-aware transfer must not publish one request at a time")
-
-        async def release_completed(self) -> None:
-            pass
-
-        def release(self, transfer_id) -> None:
-            pass
-
-        def close(self) -> None:
-            pass
-
-    async def run() -> BatchTransfer:
-        transfer = BatchTransfer()
-
-        async def encode(requests):
-            return [(jnp.full((1, 2), index), {}) for index, _ in enumerate(requests)]
-
-        runtime = EncoderRuntime(encode, transfer)
-        pending = [
-            PendingRequest({"req_id": f"request-{index}", "modality": "IMAGE"})
-            for index in range(2)
-        ]
-        for item in pending:
-            item.mark_dequeued()
-        await runtime._dispatch_batch(pending)
-        assert all(item.future.done() for item in pending)
-        return transfer
-
-    transfer = asyncio.run(run())
-    assert len(transfer.items) == 1
-    assert [transfer_id for transfer_id, _ in transfer.items[0]] == [
-        "request-0:0:embedding",
-        "request-1:0:embedding",
-    ]
-
-
 def test_runtime_skips_transfer_for_request_cancelled_during_encode():
     published = []
 

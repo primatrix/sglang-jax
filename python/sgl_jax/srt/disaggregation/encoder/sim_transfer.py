@@ -54,16 +54,13 @@ class SimEncoderServerTransfer:
         )
 
     async def publish(self, transfer_id: str, embedding: jax.Array) -> dict[str, Any]:
-        return (await self.publish_batch([(transfer_id, embedding)]))[0]
-
-    async def publish_batch(self, items: list[tuple[str, jax.Array]]) -> list[dict[str, Any]]:
-        if any(embedding.ndim != 2 or embedding.shape[0] <= 0 for _, embedding in items):
+        if embedding.ndim != 2 or embedding.shape[0] <= 0:
             raise ValueError("Sim embedding must be a non-empty matrix")
         async with self._setup_slots:
             if self._setup_ms:
                 await asyncio.sleep(self._setup_ms / 1000.0)
         # No transfer endpoints: the receiver reconstructs zeros from shape/dtype.
-        return [{"transfer_id": transfer_id} for transfer_id, _ in items]
+        return {"transfer_id": transfer_id}
 
     async def release_completed(self) -> None:
         # No real sessions to reap; stay alive for the server lifetime.
