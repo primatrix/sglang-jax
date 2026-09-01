@@ -339,10 +339,13 @@ def test_runtime_pipelines_serial_encode_and_publish_stages():
     asyncio.run(run())
 
 
-def test_runtime_overlaps_preprocess_with_previous_encode():
+def test_runtime_pipelines_preprocess_and_encode_stages():
     async def run() -> None:
+        first_preprocess_started = asyncio.Event()
         first_encode_started = asyncio.Event()
+        second_preprocess_started = asyncio.Event()
         second_preprocess_done = asyncio.Event()
+        release_first_preprocess = asyncio.Event()
         release_first_encode = asyncio.Event()
 
         class FakeTransfer:
@@ -360,7 +363,11 @@ def test_runtime_overlaps_preprocess_with_previous_encode():
 
         async def preprocess(requests):
             req_id = requests[0]["req_id"]
-            if req_id == "request-1":
+            if req_id == "request-0":
+                first_preprocess_started.set()
+                await release_first_preprocess.wait()
+            else:
+                second_preprocess_started.set()
                 second_preprocess_done.set()
             return req_id
 
@@ -385,8 +392,13 @@ def test_runtime_overlaps_preprocess_with_previous_encode():
         second.mark_dequeued()
 
         first_task = asyncio.create_task(runtime._dispatch_batch([first]))
-        await asyncio.wait_for(first_encode_started.wait(), 1)
+        await asyncio.wait_for(first_preprocess_started.wait(), 1)
         second_task = asyncio.create_task(runtime._dispatch_batch([second]))
+        await asyncio.sleep(0)
+        assert not second_preprocess_started.is_set()
+
+        release_first_preprocess.set()
+        await asyncio.wait_for(first_encode_started.wait(), 1)
         await asyncio.wait_for(second_preprocess_done.wait(), 1)
         assert not first_task.done()
         assert not second_task.done()

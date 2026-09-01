@@ -214,6 +214,7 @@ class EncoderRuntime:
         self._batch_preprocess_fn = batch_preprocess_fn
         self._batch_encode_preprocessed_fn = batch_encode_preprocessed_fn
         self._transfer = transfer
+        self._preprocess_lock = asyncio.Lock()
         self._encode_lock = asyncio.Lock()
         self._publish_lock = asyncio.Lock()
 
@@ -293,8 +294,9 @@ class EncoderRuntime:
                     preprocess_start_ns = time.time_ns()
                     results = await self._encode_batch(requests)
             else:
-                preprocess_start_ns = time.time_ns()
-                prepared = await self._batch_preprocess_fn(requests)
+                async with self._preprocess_lock:
+                    preprocess_start_ns = time.time_ns()
+                    prepared = await self._batch_preprocess_fn(requests)
                 async with self._encode_lock:
                     assert self._batch_encode_preprocessed_fn is not None
                     results = await self._batch_encode_preprocessed_fn(prepared)
