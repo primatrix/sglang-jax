@@ -186,8 +186,8 @@ class RaidenEncoderServerTransfer:
         )
         session.start(
             [buffer],
-            max_blocks=capacity,
-            num_slots=min(count, self._parallelism),
+            max_blocks=1,
+            num_slots=count,
             timeout_s=self._timeout_s,
         )
         result = []
@@ -294,7 +294,7 @@ class _RaidenReceivePool:
         slots = min(capacity, parallelism)
         self.transfer.start(
             [self.buffer],
-            max_blocks=capacity,
+            max_blocks=1,
             num_slots=slots,
             timeout_s=timeout_s,
         )
