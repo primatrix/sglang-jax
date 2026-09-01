@@ -177,6 +177,34 @@ def test_raiden_server_publishes_batch_as_one_contiguous_transfer(monkeypatch):
     transfer.close()
 
 
+def test_raiden_server_bounds_contiguous_groups_by_channel_parallelism(monkeypatch):
+    _FakeRaidenWrapper.instances.clear()
+    monkeypatch.setattr(
+        "sgl_jax.srt.disaggregation.encoder.raiden.RaidenTransferWrapper",
+        _FakeRaidenWrapper,
+    )
+    transfer = RaidenEncoderServerTransfer("10.0.0.4", parallelism=2)
+    embeddings = [jnp.full((2, 3), index, dtype=jnp.float32) for index in range(5)]
+
+    metadata = asyncio.run(
+        transfer.publish_batch(
+            [(f"part-{index}:embedding", embedding) for index, embedding in enumerate(embeddings)]
+        )
+    )
+
+    assert len(_FakeRaidenWrapper.instances) == 3
+    assert [session.started[0][0].shape for session in _FakeRaidenWrapper.instances] == [
+        (1, 4, 3),
+        (1, 4, 3),
+        (1, 2, 3),
+    ]
+    assert [item["transfer_group_size"] for item in metadata] == [2, 2, 2, 2, 1]
+    assert metadata[0]["transfer_id"] == metadata[1]["transfer_id"]
+    assert metadata[2]["transfer_id"] == metadata[3]["transfer_id"]
+    assert len({item["transfer_id"] for item in metadata}) == 3
+    transfer.close()
+
+
 def test_raiden_server_setup_concurrency_is_independent_from_transfer_channels(
     monkeypatch,
 ):

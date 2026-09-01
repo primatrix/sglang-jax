@@ -113,7 +113,7 @@ class RaidenEncoderServerTransfer:
         self,
         items: list[tuple[str, jax.Array]],
     ) -> list[dict[str, Any]]:
-        """Publish one contiguous transfer and return a row view for each item."""
+        """Publish bounded contiguous groups without imposing a full-batch barrier."""
         if not items:
             return []
         if len(items) == 1:
@@ -135,6 +135,27 @@ class RaidenEncoderServerTransfer:
         ):
             raise ValueError("batched Raiden embeddings must have matching width and dtype")
 
+        groups = [
+            items[offset : offset + self._parallelism]
+            for offset in range(0, len(items), self._parallelism)
+        ]
+        results = await asyncio.gather(
+            *(self._publish_group(group) for group in groups),
+            return_exceptions=True,
+        )
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if errors:
+            for result in results:
+                if isinstance(result, list) and result:
+                    self.release(result[0]["transfer_id"])
+            raise errors[0]
+        return [item for group in results if isinstance(group, list) for item in group]
+
+    async def _publish_group(
+        self,
+        items: list[tuple[str, jax.Array]],
+    ) -> list[dict[str, Any]]:
+        transfer_ids = [transfer_id for transfer_id, _ in items]
         digest = _uuid_to_int("\0".join(transfer_ids))
         group_id = f"{transfer_ids[0]}:batch:{digest}"
         if group_id in self._sessions or group_id in self._preparing:
@@ -142,9 +163,11 @@ class RaidenEncoderServerTransfer:
 
         offsets = []
         offset = 0
-        for embedding in embeddings:
+        embeddings = []
+        for _, embedding in items:
             offsets.append(offset)
             offset += embedding.shape[0]
+            embeddings.append(embedding)
         packed = jnp.concatenate(embeddings, axis=0)
 
         self._preparing.add(group_id)
