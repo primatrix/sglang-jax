@@ -69,17 +69,24 @@ class RaidenEncoderServerTransfer:
         host_ip: str,
         *,
         parallelism: int = 1,
+        setup_parallelism: int | None = None,
         timeout_s: float = 300.0,
         poll_interval_s: float = 0.001,
     ) -> None:
         require_raiden_preloaded()
         self._host_ip = host_ip
         self._parallelism = max(1, int(parallelism))
+        self._setup_parallelism = max(
+            1,
+            int(setup_parallelism if setup_parallelism is not None else parallelism),
+        )
         self._timeout_s = float(timeout_s)
         self._poll_interval_s = float(poll_interval_s)
         self._sessions: dict[str, RaidenTransferWrapper] = {}
         self._preparing: set[str] = set()
-        self._executor = ThreadPoolExecutor(max_workers=self._parallelism)
+        # Starting a manager is control-plane work. Do not serialize a request
+        # batch behind Raiden's per-transfer data-plane channel count.
+        self._executor = ThreadPoolExecutor(max_workers=self._setup_parallelism)
 
     async def publish(self, transfer_id: str, embedding: jax.Array) -> dict[str, Any]:
         if transfer_id in self._sessions or transfer_id in self._preparing:

@@ -421,12 +421,14 @@ def launch(server_args: ServerArgs) -> None:
             transfer = SimEncoderServerTransfer(
                 setup_ms=server_args.simulate_transfer_setup_ms,
                 parallelism=server_args.disaggregation_channel_number,
+                setup_parallelism=server_args.encoder_max_batch_size,
             )
         else:
             host_ip = resolve_host_ip(server_args.disaggregation_host_ip)
             transfer = RaidenEncoderServerTransfer(
                 host_ip,
                 parallelism=server_args.disaggregation_channel_number,
+                setup_parallelism=server_args.encoder_max_batch_size,
                 timeout_s=server_args.encoder_request_timeout_seconds,
             )
         advertise_host = f"[{host_ip}]" if ":" in host_ip else host_ip

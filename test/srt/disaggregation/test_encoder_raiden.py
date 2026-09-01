@@ -139,6 +139,34 @@ def test_raiden_server_prepares_batch_transfers_concurrently(monkeypatch):
     assert len(_FakeRaidenWrapper.instances) == 2
 
 
+def test_raiden_server_setup_concurrency_is_independent_from_transfer_channels(monkeypatch):
+    _FakeRaidenWrapper.instances.clear()
+    _FakeRaidenWrapper.start_barrier = threading.Barrier(2)
+    monkeypatch.setattr(
+        "sgl_jax.srt.disaggregation.encoder.raiden.RaidenTransferWrapper",
+        _FakeRaidenWrapper,
+    )
+    transfer = RaidenEncoderServerTransfer(
+        "10.0.0.4",
+        parallelism=1,
+        setup_parallelism=2,
+    )
+
+    async def publish_batch() -> None:
+        await asyncio.gather(
+            transfer.publish("part-0:embedding", jnp.zeros((2, 3))),
+            transfer.publish("part-1:embedding", jnp.zeros((2, 3))),
+        )
+
+    try:
+        asyncio.run(publish_batch())
+    finally:
+        _FakeRaidenWrapper.start_barrier = None
+        transfer.close()
+
+    assert [session.parallelism for session in _FakeRaidenWrapper.instances] == [1, 1]
+
+
 def test_raiden_server_reaps_completed_sender(monkeypatch):
     _FakeRaidenWrapper.instances.clear()
     monkeypatch.setattr(

@@ -38,9 +38,20 @@ class SimEncoderServerTransfer:
     register-and-return behavior.
     """
 
-    def __init__(self, *, setup_ms: float = 0.0, parallelism: int = 1) -> None:
+    def __init__(
+        self,
+        *,
+        setup_ms: float = 0.0,
+        parallelism: int = 1,
+        setup_parallelism: int | None = None,
+    ) -> None:
         self._setup_ms = max(0.0, float(setup_ms))
-        self._setup_slots = asyncio.Semaphore(max(1, int(parallelism)))
+        self._setup_slots = asyncio.Semaphore(
+            max(
+                1,
+                int(setup_parallelism if setup_parallelism is not None else parallelism),
+            )
+        )
 
     async def publish(self, transfer_id: str, embedding: jax.Array) -> dict[str, Any]:
         if embedding.ndim != 2 or embedding.shape[0] <= 0:
