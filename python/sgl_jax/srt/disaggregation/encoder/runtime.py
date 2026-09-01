@@ -391,7 +391,10 @@ class EncoderRuntime:
         publish_done_ns = time.time_ns()
 
         metadata = dict(metadata)
-        encoder_timing = metadata.pop("_encoder_timing", {})
+        encoder_timing = {
+            "encode_done_ns": encode_done_ns,
+            **metadata.pop("_encoder_timing", {}),
+        }
         data = EmbeddingData(
             req_id=req_id,
             num_parts=request.get("num_parts", 1),
@@ -404,14 +407,12 @@ class EncoderRuntime:
             enqueue_ns=pending.enqueue_ns,
             dequeue_ns=pending.dequeue_ns,
             preprocess_start_ns=preprocess_start_ns,
-            preprocess_done_ns=encoder_timing.get("preprocess_done_ns"),
-            encode_start_ns=encoder_timing.get("encode_start_ns"),
-            encode_done_ns=encoder_timing.get("encode_done_ns", encode_done_ns),
             publish_done_ns=publish_done_ns,
             queue_duration_ns=queue_duration_ns,
             queue_ms=queue_duration_ns / 1_000_000,
             **transfer_metadata,
             **metadata,
+            **encoder_timing,
         )
         return PublishedEmbedding(req_id, transfer_id, data)
 

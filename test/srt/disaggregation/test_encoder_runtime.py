@@ -152,11 +152,22 @@ def test_runtime_publishes_queue_timing_metadata():
             pass
 
     async def run() -> EmbeddingData:
-        pending = PendingRequest({"req_id": "request-0", "modality": "IMAGE"})
+        pending = PendingRequest(
+            {
+                "req_id": "request-0",
+                "modality": "IMAGE",
+                "dispatch_start_ns": 1,
+            }
+        )
         pending.mark_dequeued()
 
         async def encode(_requests):
-            return [(jnp.zeros((1, 2)), {})]
+            return [
+                (
+                    jnp.zeros((1, 2)),
+                    {"_encoder_timing": {"processor_start_ns": 2}},
+                )
+            ]
 
         runtime = EncoderRuntime(encode, FakeTransfer())
         await runtime._dispatch_batch([pending])
@@ -168,6 +179,8 @@ def test_runtime_publishes_queue_timing_metadata():
     assert data.dequeue_ns <= data.encode_done_ns <= data.publish_done_ns
     assert data.queue_duration_ns >= 0
     assert data.queue_ms == data.queue_duration_ns / 1_000_000
+    assert data.dispatch_start_ns == 1
+    assert data.processor_start_ns == 2
 
 
 def test_runtime_releases_each_request_when_its_publish_completes():
