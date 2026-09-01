@@ -16,6 +16,7 @@ from sgl_jax.srt.disaggregation.encoder.embedding_data import EmbeddingData
 from sgl_jax.srt.multimodal.common.modality_enum import Modality
 
 EncodeResult = tuple[jax.Array, dict[str, Any]]
+PublishItem = tuple[str, jax.Array]
 BatchEncodeFn = Callable[
     [list[dict[str, Any]]],
     Awaitable[list[EncodeResult]],
@@ -297,6 +298,15 @@ class EncoderRuntime:
             if not pending.future.done()
         ]
         async with self._publish_lock:
+            publish_batch = getattr(self._transfer, "publish_batch", None)
+            if publish_batch is not None:
+                await self._publish_batch(
+                    publish_batch,
+                    publish_items,
+                    preprocess_start_ns,
+                    encode_done_ns,
+                )
+                return
             await asyncio.gather(
                 *(
                     self._publish_pending(
@@ -308,6 +318,55 @@ class EncoderRuntime:
                     for pending, result in publish_items
                 )
             )
+
+    async def _publish_batch(
+        self,
+        publish_batch: Callable[[list[PublishItem]], Awaitable[list[dict[str, Any]]]],
+        publish_items: list[tuple[PendingRequest, EncodeResult]],
+        preprocess_start_ns: int,
+        encode_done_ns: int,
+    ) -> None:
+        transfer_ids = [self._transfer_id(pending) for pending, _ in publish_items]
+        try:
+            transfer_metadata = await publish_batch(
+                [
+                    (transfer_id, result[0])
+                    for transfer_id, (_, result) in zip(transfer_ids, publish_items)
+                ]
+            )
+            if len(transfer_metadata) != len(publish_items):
+                raise RuntimeError(
+                    "publish_batch returned "
+                    f"{len(transfer_metadata)} results for {len(publish_items)} requests"
+                )
+            publish_done_ns = time.time_ns()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            for pending, _ in publish_items:
+                if not pending.future.done():
+                    pending.future.set_exception(exc)
+            return
+
+        for (pending, (embedding, metadata)), transfer_id, item_metadata in zip(
+            publish_items,
+            transfer_ids,
+            transfer_metadata,
+        ):
+            published = self._build_published(
+                pending,
+                transfer_id,
+                embedding,
+                metadata,
+                item_metadata,
+                preprocess_start_ns,
+                encode_done_ns,
+                publish_done_ns,
+            )
+            if pending.future.done():
+                self._transfer.release(transfer_id)
+            else:
+                pending.future.set_result(published)
 
     async def _publish_pending(
         self,
@@ -360,14 +419,41 @@ class EncoderRuntime:
         preprocess_start_ns: int,
         encode_done_ns: int,
     ) -> PublishedEmbedding:
+        transfer_id = self._transfer_id(pending)
+        transfer_metadata = await self._transfer.publish(transfer_id, embedding)
+        publish_done_ns = time.time_ns()
+
+        return self._build_published(
+            pending,
+            transfer_id,
+            embedding,
+            metadata,
+            transfer_metadata,
+            preprocess_start_ns,
+            encode_done_ns,
+            publish_done_ns,
+        )
+
+    @staticmethod
+    def _transfer_id(pending: PendingRequest) -> str:
+        request = pending.request
+        return f"{request['req_id']}:{request.get('part_idx', 0)}:embedding"
+
+    @staticmethod
+    def _build_published(
+        pending: PendingRequest,
+        transfer_id: str,
+        embedding: jax.Array,
+        metadata: dict[str, Any],
+        transfer_metadata: dict[str, Any],
+        preprocess_start_ns: int,
+        encode_done_ns: int,
+        publish_done_ns: int,
+    ) -> PublishedEmbedding:
         request = pending.request
         req_id = request["req_id"]
         modality = Modality.from_str(request["modality"])
         queue_duration_ns = pending.queue_duration_ns
-
-        transfer_id = f"{req_id}:{request.get('part_idx', 0)}:embedding"
-        transfer_metadata = await self._transfer.publish(transfer_id, embedding)
-        publish_done_ns = time.time_ns()
 
         metadata = dict(metadata)
         encoder_timing = metadata.pop("_encoder_timing", {})

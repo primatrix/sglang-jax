@@ -429,6 +429,7 @@ def launch(server_args: ServerArgs) -> None:
                 host_ip,
                 parallelism=server_args.disaggregation_channel_number,
                 setup_parallelism=server_args.encoder_max_batch_size,
+                max_batch_size=server_args.encoder_max_batch_size,
                 timeout_s=server_args.encoder_request_timeout_seconds,
             )
         advertise_host = f"[{host_ip}]" if ":" in host_ip else host_ip
