@@ -163,6 +163,7 @@ def test_encoder_request_dispatcher_reuses_http_client(monkeypatch):
             clients.append(self)
 
         async def post(self, url, *, json):
+            assert isinstance(json["dispatch_start_ns"], int)
             posts.append((url, json["req_id"]))
             return FakeResponse()
 

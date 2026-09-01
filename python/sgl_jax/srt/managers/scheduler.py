@@ -2758,6 +2758,49 @@ class Scheduler(
                     _elapsed_ms(timing, "enqueue_ns", "language_prefill_done_ns"),
                 )
 
+                preprocess_fields = (
+                    "dispatch_start_ns",
+                    "preprocess_request_start_ns",
+                    "image_load_start_ns",
+                    "image_load_done_ns",
+                    "processor_submit_ns",
+                    "processor_start_ns",
+                    "processor_done_ns",
+                    "preprocess_request_done_ns",
+                )
+                if all(name in timing for name in preprocess_fields):
+                    logger.info(
+                        "ENCODER-PREPROCESS-TIME req_id=%s dispatch_ms=%.3f "
+                        "admission_ms=%.3f image_load_ms=%.3f processor_queue_ms=%.3f "
+                        "processor_ms=%.3f finalize_ms=%.3f request_total_ms=%.3f "
+                        "batch_tail_ms=%.3f",
+                        req.rid,
+                        _elapsed_ms(timing, "dispatch_start_ns", "enqueue_ns"),
+                        _elapsed_ms(
+                            timing,
+                            "preprocess_start_ns",
+                            "preprocess_request_start_ns",
+                        ),
+                        _elapsed_ms(timing, "image_load_start_ns", "image_load_done_ns"),
+                        _elapsed_ms(timing, "processor_submit_ns", "processor_start_ns"),
+                        _elapsed_ms(timing, "processor_start_ns", "processor_done_ns"),
+                        _elapsed_ms(
+                            timing,
+                            "processor_done_ns",
+                            "preprocess_request_done_ns",
+                        ),
+                        _elapsed_ms(
+                            timing,
+                            "preprocess_request_start_ns",
+                            "preprocess_request_done_ns",
+                        ),
+                        _elapsed_ms(
+                            timing,
+                            "preprocess_request_done_ns",
+                            "preprocess_done_ns",
+                        ),
+                    )
+
     def run_batch(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run a batch."""
         self.forward_ct += 1

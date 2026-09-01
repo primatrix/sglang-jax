@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import tempfile
+import time
 
 import numpy as np
 from PIL import Image
@@ -309,6 +310,7 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         image_data,
         input_text,
         request_obj,
+        encoder_timing: dict[str, int] | None = None,
         **kwargs,
     ) -> MultimodalInputs:
         """Prepare image features without tokenizer or MRoPE work unused by the encoder."""
@@ -327,15 +329,32 @@ class QwenVLProcessor(BaseMultimodalProcessor):
                 **kwargs,
             )
 
+        if encoder_timing is not None:
+            encoder_timing["image_load_start_ns"] = time.time_ns()
         images = await self.load_images_async(self.normalize_data(image_data))
+        if encoder_timing is not None:
+            encoder_timing["image_load_done_ns"] = time.time_ns()
+            encoder_timing["processor_submit_ns"] = time.time_ns()
         return await self.mm_processor_executor.run(
             self._process_encoder_images,
             images,
+            encoder_timing=encoder_timing,
         )
 
-    def _process_encoder_images(self, images: list[Image.Image], *, processor):
+    def _process_encoder_images(
+        self,
+        images: list[Image.Image],
+        *,
+        processor,
+        encoder_timing: dict[str, int] | None = None,
+    ):
+        if encoder_timing is not None:
+            encoder_timing["processor_start_ns"] = time.time_ns()
         processor_output = processor.image_processor(images=images, return_tensors="pt")
-        return self._collect_encoder_images(processor_output)
+        result = self._collect_encoder_images(processor_output)
+        if encoder_timing is not None:
+            encoder_timing["processor_done_ns"] = time.time_ns()
+        return result
 
     def _collect_encoder_images(self, processor_output) -> MultimodalInputs:
         features = self._to_numpy(processor_output.get("pixel_values"))

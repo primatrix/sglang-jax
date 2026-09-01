@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -49,7 +50,14 @@ from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
 
 logger = logging.getLogger(__name__)
-PreparedEncoderBatch = tuple[Modality, list[MultimodalInputs], int]
+
+
+@dataclass(slots=True)
+class PreparedEncoderBatch:
+    modality: Modality
+    inputs: list[MultimodalInputs]
+    request_timings: list[dict[str, int]]
+    done_ns: int
 
 
 class MMEncoder:
@@ -75,6 +83,7 @@ class MMEncoder:
         self._simulate_compute = server_args.simulate_compute
         self._sim_encoder_base_ms = server_args.simulate_compute_encoder_base_ms
         self._sim_encoder_ms_per_token = server_args.simulate_compute_encoder_ms_per_token
+        self._log_timing = server_args.enable_request_time_stats_logging
 
         config = self.model_config.hf_config
         config.vision_encoder_parallel = server_args.vision_encoder_parallel
@@ -128,15 +137,17 @@ class MMEncoder:
         if any(Modality.from_str(request["modality"]) != modality for request in requests):
             raise ValueError("MMEncoder batches must contain one modality")
 
-        processed = await asyncio.gather(
+        prepared = await asyncio.gather(
             *(self._process_request(request, modality) for request in requests)
         )
-        return modality, processed, time.time_ns()
+        processed, timings = map(list, zip(*prepared))
+        return PreparedEncoderBatch(modality, processed, timings, time.time_ns())
 
     async def encode_preprocessed(
         self, batch: PreparedEncoderBatch
     ) -> list[tuple[jax.Array, dict[str, Any]]]:
-        modality, processed, preprocess_done_ns = batch
+        modality = batch.modality
+        processed = batch.inputs
         encode_start_ns = time.time_ns()
         simulate = getattr(self, "_simulate_compute", False)
         if simulate:
@@ -168,14 +179,14 @@ class MMEncoder:
         encode_done_ns = time.time_ns()
 
         encoder_timing = {
-            "preprocess_done_ns": preprocess_done_ns,
+            "preprocess_done_ns": batch.done_ns,
             "encode_start_ns": encode_start_ns,
             "encode_done_ns": encode_done_ns,
         }
 
         results = []
         offset = 0
-        for mm_inputs in processed:
+        for mm_inputs, request_timing in zip(processed, batch.request_timings):
             token_count = sum(
                 end - start
                 for item in mm_inputs.mm_items
@@ -187,7 +198,7 @@ class MMEncoder:
             if embedding.shape[0] != token_count:
                 raise ValueError(f"incomplete {modality.name} encoder output")
             metadata = self._metadata(mm_inputs, modality)
-            metadata["_encoder_timing"] = encoder_timing
+            metadata["_encoder_timing"] = {**encoder_timing, **request_timing}
             results.append((embedding, metadata))
             offset += token_count
         # JAX keeps bucket padding in the encoder output to preserve static shapes.
@@ -196,7 +207,10 @@ class MMEncoder:
 
     async def _process_request(
         self, request: dict[str, Any], modality: Modality
-    ) -> MultimodalInputs:
+    ) -> tuple[MultimodalInputs, dict[str, int]]:
+        timing = {}
+        if getattr(self, "_log_timing", False):
+            timing["preprocess_request_start_ns"] = time.time_ns()
         mm_items = request.get("mm_items") or []
         if not mm_items:
             raise ValueError("encoder request contains no multimodal items")
@@ -211,6 +225,7 @@ class MMEncoder:
             image_data=request_obj.image_data,
             input_text=self._placeholder(modality) * len(mm_items),
             request_obj=request_obj,
+            encoder_timing=timing if timing else None,
         )
         items = [item for item in mm_inputs.mm_items if item.modality == modality]
         if len(items) != len(mm_items):
@@ -218,7 +233,9 @@ class MMEncoder:
                 f"processor produced {len(items)} {modality.name} items for {len(mm_items)} inputs"
             )
         mm_inputs.mm_items = items
-        return mm_inputs
+        if timing:
+            timing["preprocess_request_done_ns"] = time.time_ns()
+        return mm_inputs, timing
 
     def _placeholder(self, modality: Modality) -> str:
         config = self.mm_processor.hf_config

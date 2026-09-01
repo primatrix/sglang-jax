@@ -35,7 +35,7 @@ def _encoder(output: jnp.ndarray, processed: list[MultimodalInputs]) -> MMEncode
     pending = iter(processed)
 
     async def process_request(self, request, modality):
-        return next(pending)
+        return next(pending), {}
 
     encoder._process_request = MethodType(process_request, encoder)
     return encoder

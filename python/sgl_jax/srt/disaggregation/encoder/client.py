@@ -411,6 +411,7 @@ def dispatch_encoder_request(
         raise ValueError("encoder request requires a single rid")
     if not encoder_urls:
         raise ValueError("encoder_urls is required")
+    dispatch_start_ns = time.time_ns()
 
     items_by_modality = {}
     for name, modality in (
@@ -459,6 +460,7 @@ def dispatch_encoder_request(
                     encoder_urls[encoder_idx],
                     {
                         "req_id": create_part_req_id(request.rid, part_idx),
+                        "dispatch_start_ns": dispatch_start_ns,
                         "mm_items": items[item_offset : item_offset + count],
                         "num_parts": num_parts,
                         "part_idx": part_idx,

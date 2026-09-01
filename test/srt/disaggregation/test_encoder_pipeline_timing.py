@@ -39,3 +39,42 @@ def test_language_logs_encoder_pipeline_timing(caplog):
     assert "receive_mm_ms=4.000" in caplog.text
     assert timing["language_prefill_start_ns"] >= timing["language_ready_ns"]
     assert timing["language_prefill_done_ns"] >= timing["language_prefill_start_ns"]
+
+
+def test_language_logs_encoder_preprocess_timing(caplog):
+    timing = {
+        "dispatch_start_ns": 1_000_000,
+        "enqueue_ns": 2_000_000,
+        "dequeue_ns": 3_000_000,
+        "preprocess_start_ns": 4_000_000,
+        "preprocess_request_start_ns": 5_000_000,
+        "image_load_start_ns": 6_000_000,
+        "image_load_done_ns": 8_000_000,
+        "processor_submit_ns": 9_000_000,
+        "processor_start_ns": 12_000_000,
+        "processor_done_ns": 17_000_000,
+        "preprocess_request_done_ns": 18_000_000,
+        "preprocess_done_ns": 19_000_000,
+        "encode_start_ns": 20_000_000,
+        "encode_done_ns": 21_000_000,
+        "publish_done_ns": 22_000_000,
+        "receive_done_ns": 23_000_000,
+        "language_ready_ns": 24_000_000,
+    }
+    req = SimpleNamespace(rid="request-0", encoder_timing=timing)
+    batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_extend=lambda: True),
+        reqs_info=[SimpleNamespace(reqs=[req])],
+    )
+    scheduler = SimpleNamespace(server_args=SimpleNamespace(enable_request_time_stats_logging=True))
+
+    caplog.set_level("INFO")
+    Scheduler._mark_encoder_prefill_start(scheduler, batch)
+    Scheduler._log_encoder_pipeline_timing(scheduler, batch)
+
+    assert "ENCODER-PREPROCESS-TIME req_id=request-0" in caplog.text
+    assert "dispatch_ms=1.000" in caplog.text
+    assert "image_load_ms=2.000" in caplog.text
+    assert "processor_queue_ms=3.000" in caplog.text
+    assert "processor_ms=5.000" in caplog.text
+    assert "request_total_ms=13.000" in caplog.text

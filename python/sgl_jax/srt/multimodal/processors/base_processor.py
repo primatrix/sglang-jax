@@ -135,9 +135,11 @@ class BaseMultimodalProcessor(ABC):
         image_data,
         input_text,
         request_obj,
+        encoder_timing: dict[str, int] | None = None,
         **kwargs,
     ) -> MultimodalInputs:
         """Process encoder inputs, with model adapters free to skip unused metadata."""
+        del encoder_timing
         return await self.process_mm_data_async(
             image_data=image_data,
             input_text=input_text,

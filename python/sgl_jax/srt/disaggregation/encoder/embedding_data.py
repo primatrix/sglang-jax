@@ -34,6 +34,7 @@ class EmbeddingData:
         dtype: Any = None,
         error_msg: str | None = None,
         error_code: int | None = None,
+        dispatch_start_ns: int | None = None,
         enqueue_ns: int | None = None,
         dequeue_ns: int | None = None,
         preprocess_start_ns: int | None = None,
@@ -64,6 +65,7 @@ class EmbeddingData:
         # Encoder scheduler application-level timing. enqueue_ns/dequeue_ns
         # use Unix epoch time for cross-process correlation; queue_duration_ns
         # and queue_ms are calculated from a monotonic clock.
+        self.dispatch_start_ns = dispatch_start_ns
         self.enqueue_ns = enqueue_ns
         self.dequeue_ns = dequeue_ns
         self.preprocess_start_ns = preprocess_start_ns
@@ -173,6 +175,7 @@ class MultiModalEmbeddingData:
     def get_timing_meta(self) -> dict[str, int]:
         parts = [part for part in self._parts if part is not None]
         fields = (
+            "dispatch_start_ns",
             "enqueue_ns",
             "dequeue_ns",
             "preprocess_start_ns",
@@ -180,11 +183,26 @@ class MultiModalEmbeddingData:
             "encode_start_ns",
             "encode_done_ns",
             "publish_done_ns",
+            "preprocess_request_start_ns",
+            "image_load_start_ns",
+            "image_load_done_ns",
+            "processor_submit_ns",
+            "processor_start_ns",
+            "processor_done_ns",
+            "preprocess_request_done_ns",
         )
+        start_fields = {
+            "dispatch_start_ns",
+            "enqueue_ns",
+            "preprocess_request_start_ns",
+            "image_load_start_ns",
+            "processor_submit_ns",
+            "processor_start_ns",
+        }
         timing = {}
         for field in fields:
             values = [getattr(data, field, None) for data, _ in parts]
             values = [int(value) for value in values if value is not None]
             if values:
-                timing[field] = min(values) if field == "enqueue_ns" else max(values)
+                timing[field] = min(values) if field in start_fields else max(values)
         return timing

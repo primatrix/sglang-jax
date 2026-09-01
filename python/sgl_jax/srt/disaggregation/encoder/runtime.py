@@ -400,6 +400,7 @@ class EncoderRuntime:
             modality=modality,
             embedding_shape=embedding.shape,
             dtype=str(embedding.dtype),
+            dispatch_start_ns=request.get("dispatch_start_ns"),
             enqueue_ns=pending.enqueue_ns,
             dequeue_ns=pending.dequeue_ns,
             preprocess_start_ns=preprocess_start_ns,
