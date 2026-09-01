@@ -275,6 +275,7 @@ class EncoderRuntime:
 
         try:
             async with self._encode_lock:
+                preprocess_start_ns = time.time_ns()
                 results = await self._encode_batch(
                     [pending.request for pending in pending_requests]
                 )
@@ -293,7 +294,12 @@ class EncoderRuntime:
         async with self._publish_lock:
             await asyncio.gather(
                 *(
-                    self._publish_pending(pending, result, encode_done_ns)
+                    self._publish_pending(
+                        pending,
+                        result,
+                        preprocess_start_ns,
+                        encode_done_ns,
+                    )
                     for pending, result in publish_items
                 )
             )
@@ -302,10 +308,16 @@ class EncoderRuntime:
         self,
         pending: PendingRequest,
         result: EncodeResult,
+        preprocess_start_ns: int,
         encode_done_ns: int,
     ) -> None:
         try:
-            published = await self._publish_result(pending, *result, encode_done_ns)
+            published = await self._publish_result(
+                pending,
+                *result,
+                preprocess_start_ns,
+                encode_done_ns,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -340,6 +352,7 @@ class EncoderRuntime:
         pending: PendingRequest,
         embedding: jax.Array,
         metadata: dict[str, Any],
+        preprocess_start_ns: int,
         encode_done_ns: int,
     ) -> PublishedEmbedding:
         request = pending.request
@@ -352,6 +365,7 @@ class EncoderRuntime:
         publish_done_ns = time.time_ns()
 
         metadata = dict(metadata)
+        encoder_timing = metadata.pop("_encoder_timing", {})
         data = EmbeddingData(
             req_id=req_id,
             num_parts=request.get("num_parts", 1),
@@ -362,7 +376,10 @@ class EncoderRuntime:
             dtype=str(embedding.dtype),
             enqueue_ns=pending.enqueue_ns,
             dequeue_ns=pending.dequeue_ns,
-            encode_done_ns=encode_done_ns,
+            preprocess_start_ns=preprocess_start_ns,
+            preprocess_done_ns=encoder_timing.get("preprocess_done_ns"),
+            encode_start_ns=encoder_timing.get("encode_start_ns"),
+            encode_done_ns=encoder_timing.get("encode_done_ns", encode_done_ns),
             publish_done_ns=publish_done_ns,
             queue_duration_ns=queue_duration_ns,
             queue_ms=queue_duration_ns / 1_000_000,

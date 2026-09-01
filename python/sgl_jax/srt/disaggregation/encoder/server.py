@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from types import SimpleNamespace
@@ -124,6 +125,8 @@ class MMEncoder:
         processed = await asyncio.gather(
             *(self._process_request(request, modality) for request in requests)
         )
+        preprocess_done_ns = time.time_ns()
+        encode_start_ns = time.time_ns()
         simulate = getattr(self, "_simulate_compute", False)
         if simulate:
             token_count_total = sum(
@@ -150,6 +153,14 @@ class MMEncoder:
                 if get_feature is None:
                     raise ValueError(f"model has no {modality.name} encoder")
                 packed = get_feature(items)
+                jax.block_until_ready(packed)
+        encode_done_ns = time.time_ns()
+
+        encoder_timing = {
+            "preprocess_done_ns": preprocess_done_ns,
+            "encode_start_ns": encode_start_ns,
+            "encode_done_ns": encode_done_ns,
+        }
 
         results = []
         offset = 0
@@ -164,7 +175,9 @@ class MMEncoder:
                 embedding = jax.device_put(embedding)
             if embedding.shape[0] != token_count:
                 raise ValueError(f"incomplete {modality.name} encoder output")
-            results.append((embedding, self._metadata(mm_inputs, modality)))
+            metadata = self._metadata(mm_inputs, modality)
+            metadata["_encoder_timing"] = encoder_timing
+            results.append((embedding, metadata))
             offset += token_count
         # JAX keeps bucket padding in the encoder output to preserve static shapes.
         # Transfer only the placeholder-backed prefix, as upstream SGLang does.
@@ -430,6 +443,7 @@ def launch(server_args: ServerArgs) -> None:
             encoder_register_urls=server_args.encoder_register_urls,
             advertise_url=advertise_url,
             bootstrap_timeout=control_timeout if control_timeout > 0 else 5.0,
+            max_batch_size=server_args.encoder_max_batch_size,
             max_inflight_batches=server_args.encoder_max_inflight_batches,
             request_timeout=server_args.encoder_request_timeout_seconds,
             network_rtt_ms=(

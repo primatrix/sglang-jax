@@ -1973,7 +1973,7 @@ class Scheduler(
                 protected = self.tree_cache.protected_size(dp_rank=dp)
                 if avail + evict + protected != size_per_rank:
                     leak_msgs.append(
-                        f"[dp={dp}] expected={size_per_rank}, " f"{avail=}, {evict=}, {protected=}"
+                        f"[dp={dp}] expected={size_per_rank}, {avail=}, {evict=}, {protected=}"
                     )
             if leak_msgs:
                 raise ValueError(
@@ -2615,7 +2615,7 @@ class Scheduler(
                 )
             else:
                 logger.info(
-                    "Testing retraction." " #retracted_reqs: %d, #aborted_reqs: %d",
+                    "Testing retraction. #retracted_reqs: %d, #aborted_reqs: %d",
                     num_retracted_reqs,
                     len(reqs_to_abort),
                 )
@@ -2701,6 +2701,9 @@ class Scheduler(
                 required = (
                     "enqueue_ns",
                     "dequeue_ns",
+                    "preprocess_start_ns",
+                    "preprocess_done_ns",
+                    "encode_start_ns",
                     "encode_done_ns",
                     "publish_done_ns",
                     "receive_done_ns",
@@ -2713,15 +2716,22 @@ class Scheduler(
 
                 logger.info(
                     "ENCODER-PIPELINE-TIME req_id=%s enqueue_ns=%d dequeue_ns=%d "
-                    "encode_done_ns=%d publish_done_ns=%d receive_done_ns=%d "
+                    "preprocess_start_ns=%d preprocess_done_ns=%d encode_start_ns=%d "
+                    "encode_done_ns=%d "
+                    "publish_done_ns=%d receive_done_ns=%d "
                     "language_ready_ns=%d language_prefill_start_ns=%d "
-                    "language_prefill_done_ns=%d queue_ms=%.3f encode_ms=%.3f "
+                    "language_prefill_done_ns=%d queue_ms=%.3f encode_stage_wait_ms=%.3f "
+                    "preprocess_ms=%.3f encode_wait_ms=%.3f encode_compute_ms=%.3f "
+                    "encode_ms=%.3f "
                     "publish_ms=%.3f receive_ms=%.3f mm_prepare_ms=%.3f "
                     "receive_mm_ms=%.3f language_queue_ms=%.3f prefill_ms=%.3f "
                     "total_to_prefill_ms=%.3f total_to_prefill_done_ms=%.3f",
                     req.rid,
                     timing["enqueue_ns"],
                     timing["dequeue_ns"],
+                    timing["preprocess_start_ns"],
+                    timing["preprocess_done_ns"],
+                    timing["encode_start_ns"],
                     timing["encode_done_ns"],
                     timing["publish_done_ns"],
                     timing["receive_done_ns"],
@@ -2729,6 +2739,10 @@ class Scheduler(
                     timing["language_prefill_start_ns"],
                     timing["language_prefill_done_ns"],
                     _elapsed_ms(timing, "enqueue_ns", "dequeue_ns"),
+                    _elapsed_ms(timing, "dequeue_ns", "preprocess_start_ns"),
+                    _elapsed_ms(timing, "preprocess_start_ns", "preprocess_done_ns"),
+                    _elapsed_ms(timing, "preprocess_done_ns", "encode_start_ns"),
+                    _elapsed_ms(timing, "encode_start_ns", "encode_done_ns"),
                     _elapsed_ms(timing, "dequeue_ns", "encode_done_ns"),
                     _elapsed_ms(timing, "encode_done_ns", "publish_done_ns"),
                     _elapsed_ms(timing, "publish_done_ns", "receive_done_ns"),
@@ -2773,7 +2787,6 @@ class Scheduler(
                 with jax.profiler.TraceAnnotation(
                     f"forward_batch_generation_overlap {self.forward_ct}"
                 ):
-
                     logits_output, next_token_ids, cache_miss_count = (
                         self.tp_worker.forward_batch_generation(
                             model_worker_batch, sampling_metadata=None

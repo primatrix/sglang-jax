@@ -36,6 +36,9 @@ class EmbeddingData:
         error_code: int | None = None,
         enqueue_ns: int | None = None,
         dequeue_ns: int | None = None,
+        preprocess_start_ns: int | None = None,
+        preprocess_done_ns: int | None = None,
+        encode_start_ns: int | None = None,
         encode_done_ns: int | None = None,
         publish_done_ns: int | None = None,
         queue_duration_ns: int | None = None,
@@ -63,6 +66,9 @@ class EmbeddingData:
         # and queue_ms are calculated from a monotonic clock.
         self.enqueue_ns = enqueue_ns
         self.dequeue_ns = dequeue_ns
+        self.preprocess_start_ns = preprocess_start_ns
+        self.preprocess_done_ns = preprocess_done_ns
+        self.encode_start_ns = encode_start_ns
         self.encode_done_ns = encode_done_ns
         self.publish_done_ns = publish_done_ns
         self.queue_duration_ns = queue_duration_ns
@@ -166,7 +172,15 @@ class MultiModalEmbeddingData:
 
     def get_timing_meta(self) -> dict[str, int]:
         parts = [part for part in self._parts if part is not None]
-        fields = ("enqueue_ns", "dequeue_ns", "encode_done_ns", "publish_done_ns")
+        fields = (
+            "enqueue_ns",
+            "dequeue_ns",
+            "preprocess_start_ns",
+            "preprocess_done_ns",
+            "encode_start_ns",
+            "encode_done_ns",
+            "publish_done_ns",
+        )
         timing = {}
         for field in fields:
             values = [getattr(data, field, None) for data, _ in parts]

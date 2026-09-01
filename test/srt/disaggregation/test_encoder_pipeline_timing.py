@@ -7,10 +7,13 @@ def test_language_logs_encoder_pipeline_timing(caplog):
     timing = {
         "enqueue_ns": 1_000_000,
         "dequeue_ns": 2_000_000,
-        "encode_done_ns": 4_000_000,
-        "publish_done_ns": 7_000_000,
-        "receive_done_ns": 9_000_000,
-        "language_ready_ns": 11_000_000,
+        "preprocess_start_ns": 3_000_000,
+        "preprocess_done_ns": 4_000_000,
+        "encode_start_ns": 5_000_000,
+        "encode_done_ns": 7_000_000,
+        "publish_done_ns": 8_000_000,
+        "receive_done_ns": 10_000_000,
+        "language_ready_ns": 12_000_000,
     }
     req = SimpleNamespace(rid="request-0", encoder_timing=timing)
     batch = SimpleNamespace(
@@ -25,8 +28,12 @@ def test_language_logs_encoder_pipeline_timing(caplog):
 
     assert "ENCODER-PIPELINE-TIME req_id=request-0" in caplog.text
     assert "queue_ms=1.000" in caplog.text
-    assert "encode_ms=2.000" in caplog.text
-    assert "publish_ms=3.000" in caplog.text
+    assert "encode_stage_wait_ms=1.000" in caplog.text
+    assert "preprocess_ms=1.000" in caplog.text
+    assert "encode_wait_ms=1.000" in caplog.text
+    assert "encode_compute_ms=2.000" in caplog.text
+    assert "encode_ms=5.000" in caplog.text
+    assert "publish_ms=1.000" in caplog.text
     assert "receive_ms=2.000" in caplog.text
     assert "mm_prepare_ms=2.000" in caplog.text
     assert "receive_mm_ms=4.000" in caplog.text

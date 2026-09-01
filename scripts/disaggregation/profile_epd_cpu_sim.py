@@ -13,6 +13,7 @@ Example:
 
 Only the standard library is required.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -241,6 +242,10 @@ def _summarize_encoder_pipeline(log_path: Path, *, start_ns: int, end_ns: int) -
 
     phases = (
         "queue_ms",
+        "encode_stage_wait_ms",
+        "preprocess_ms",
+        "encode_wait_ms",
+        "encode_compute_ms",
         "encode_ms",
         "publish_ms",
         "receive_ms",

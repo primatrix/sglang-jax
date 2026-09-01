@@ -57,3 +57,19 @@ def test_encode_batch_rejects_incomplete_output():
 
     with pytest.raises(ValueError, match="incomplete IMAGE encoder output"):
         asyncio.run(encoder.encode_batch([{"modality": "IMAGE"}]))
+
+
+def test_encode_batch_waits_for_jax_output(monkeypatch):
+    output = jnp.zeros((2, 2))
+    encoder = _encoder(output, [_inputs(2)])
+    blocked = []
+
+    monkeypatch.setattr(
+        "sgl_jax.srt.disaggregation.encoder.server.jax.block_until_ready",
+        lambda value: blocked.append(value),
+    )
+
+    asyncio.run(encoder.encode_batch([{"modality": "IMAGE"}]))
+
+    assert len(blocked) == 1
+    assert blocked[0] is output
