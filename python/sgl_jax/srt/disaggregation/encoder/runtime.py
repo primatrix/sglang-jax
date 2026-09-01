@@ -359,6 +359,15 @@ class EncoderRuntime:
         groups: dict[str, list[tuple[PendingRequest, EncodeResult]]] = defaultdict(list)
         for address, item in zip(addresses, items):
             groups[address].append(item)
+        group_size = max(
+            1,
+            int(getattr(self._transfer, "publish_group_size", len(items))),
+        )
+        publish_groups = [
+            group[offset : offset + group_size]
+            for group in groups.values()
+            for offset in range(0, len(group), group_size)
+        ]
         await asyncio.gather(
             *(
                 self._publish_group(
@@ -367,7 +376,7 @@ class EncoderRuntime:
                     preprocess_start_ns,
                     encode_done_ns,
                 )
-                for group in groups.values()
+                for group in publish_groups
             )
         )
 

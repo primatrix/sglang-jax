@@ -290,6 +290,59 @@ def test_runtime_groups_batch_transfer_by_receiver():
     assert {item.future.result().transfer_id for item in pending} == {"group-0"}
 
 
+def test_runtime_publishes_each_bounded_group_as_soon_as_it_is_ready():
+    class StreamingTransfer:
+        publish_group_size = 1
+
+        def __init__(self):
+            self.release_second = asyncio.Event()
+
+        async def publish_batch(self, items):
+            transfer_id, _ = items[0]
+            if transfer_id.startswith("request-1:"):
+                await self.release_second.wait()
+            return [{"transfer_id": transfer_id}]
+
+        async def publish(self, transfer_id, embedding):
+            raise AssertionError("multi-request batches must use publish_batch")
+
+        async def release_completed(self) -> None:
+            pass
+
+        def release(self, transfer_id) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    async def run() -> None:
+        transfer = StreamingTransfer()
+
+        async def encode(requests):
+            return [(jnp.zeros((2, 3)), {}) for _ in requests]
+
+        runtime = EncoderRuntime(encode, transfer)
+        pending = [
+            PendingRequest({"req_id": f"request-{idx}", "modality": "IMAGE"}) for idx in range(2)
+        ]
+        for item in pending:
+            item.mark_dequeued()
+            await runtime.register_scheduler_receiver(
+                {"req_id": item.request["req_id"], "receive_url": "127.0.0.1:1234"}
+            )
+
+        dispatch = asyncio.create_task(runtime._dispatch_batch(pending))
+        await asyncio.wait_for(asyncio.shield(pending[0].future), 1)
+        assert not pending[1].future.done()
+        assert not dispatch.done()
+
+        transfer.release_second.set()
+        await dispatch
+        assert pending[1].future.done()
+
+    asyncio.run(run())
+
+
 def test_runtime_reuses_metadata_sender_socket():
     class FakeSocket:
         def __init__(self):

@@ -90,6 +90,11 @@ class RaidenEncoderServerTransfer:
         # batch behind Raiden's per-transfer data-plane channel count.
         self._executor = ThreadPoolExecutor(max_workers=self._setup_parallelism)
 
+    @property
+    def publish_group_size(self) -> int:
+        """Maximum group that can enter the data plane without queueing channels."""
+        return self._parallelism
+
     async def publish(self, transfer_id: str, embedding: jax.Array) -> dict[str, Any]:
         if transfer_id in self._sessions or transfer_id in self._preparing:
             raise ValueError(f"duplicate Raiden transfer_id: {transfer_id}")
