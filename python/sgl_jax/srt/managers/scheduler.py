@@ -132,6 +132,11 @@ from sgl_jax.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
+
+def _elapsed_ms(timing: dict[str, int], start: str, end: str) -> float:
+    return max(0, timing[end] - timing[start]) / 1_000_000
+
+
 # Test retract decode for debugging purposes
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
 TEST_RETRACT_INTERVAL = int(os.environ.get("SGLANG_TEST_RETRACT_INTERVAL", "3"))
@@ -1443,11 +1448,16 @@ class Scheduler(
         embeddings = result.get("embeddings")
         if embeddings is None:
             raise ValueError("encoder result contains no embeddings")
+        encoder_timing = result.get("encoder_timing")
         prompt = recv_req.text if recv_req.text is not None else recv_req.input_ids
         mm_inputs = self._mm_processor.get_mm_data(
             prompt,
             embeddings,
-            **{key: value for key, value in result.items() if key != "embeddings"},
+            **{
+                key: value
+                for key, value in result.items()
+                if key not in ("embeddings", "encoder_timing")
+            },
         )
         if mm_inputs.input_ids is None:
             raise ValueError("multimodal processor produced no input_ids")
@@ -1455,6 +1465,11 @@ class Scheduler(
         recv_req.input_ids = mm_inputs.input_ids
         recv_req.radix_input_ids = build_radix_input_ids(recv_req.input_ids, mm_inputs)
         recv_req.need_wait_for_mm_inputs = False
+        if encoder_timing:
+            recv_req.encoder_timing = {
+                **encoder_timing,
+                "language_ready_ns": time.time_ns(),
+            }
 
     @staticmethod
     def _needs_encoder(recv_req) -> bool:
@@ -1509,6 +1524,7 @@ class Scheduler(
             return_hidden_states=recv_req.return_hidden_states,
         )
         req.tokenizer = self.tokenizer
+        req.encoder_timing = getattr(recv_req, "encoder_timing", None)
         # PD disaggregation routing keys.
         req.bootstrap_host = recv_req.bootstrap_host
         req.bootstrap_port = recv_req.bootstrap_port
@@ -2653,12 +2669,88 @@ class Scheduler(
                     dp_rank * per_dp_bs_size : dp_rank * per_dp_bs_size + num_real_reqs
                 ]
 
+    def _mark_encoder_prefill_start(self, batch: ScheduleBatch) -> None:
+        if (
+            not getattr(self.server_args, "enable_request_time_stats_logging", False)
+            or not batch.forward_mode.is_extend()
+        ):
+            return
+
+        prefill_start_ns = time.time_ns()
+        for info in batch.reqs_info:
+            for req in info.reqs or ():
+                timing = getattr(req, "encoder_timing", None)
+                if not timing or "language_prefill_start_ns" in timing:
+                    continue
+                timing["language_prefill_start_ns"] = prefill_start_ns
+
+    def _log_encoder_pipeline_timing(self, batch: ScheduleBatch) -> None:
+        if (
+            not getattr(self.server_args, "enable_request_time_stats_logging", False)
+            or not batch.forward_mode.is_extend()
+        ):
+            return
+
+        prefill_done_ns = time.time_ns()
+        for info in batch.reqs_info:
+            for req in info.reqs or ():
+                timing = getattr(req, "encoder_timing", None)
+                if not timing or "language_prefill_done_ns" in timing:
+                    continue
+                timing["language_prefill_done_ns"] = prefill_done_ns
+                required = (
+                    "enqueue_ns",
+                    "dequeue_ns",
+                    "encode_done_ns",
+                    "publish_done_ns",
+                    "receive_done_ns",
+                    "language_ready_ns",
+                    "language_prefill_start_ns",
+                    "language_prefill_done_ns",
+                )
+                if not all(name in timing for name in required):
+                    continue
+
+                logger.info(
+                    "ENCODER-PIPELINE-TIME req_id=%s enqueue_ns=%d dequeue_ns=%d "
+                    "encode_done_ns=%d publish_done_ns=%d receive_done_ns=%d "
+                    "language_ready_ns=%d language_prefill_start_ns=%d "
+                    "language_prefill_done_ns=%d queue_ms=%.3f encode_ms=%.3f "
+                    "publish_ms=%.3f receive_ms=%.3f mm_prepare_ms=%.3f "
+                    "receive_mm_ms=%.3f language_queue_ms=%.3f prefill_ms=%.3f "
+                    "total_to_prefill_ms=%.3f total_to_prefill_done_ms=%.3f",
+                    req.rid,
+                    timing["enqueue_ns"],
+                    timing["dequeue_ns"],
+                    timing["encode_done_ns"],
+                    timing["publish_done_ns"],
+                    timing["receive_done_ns"],
+                    timing["language_ready_ns"],
+                    timing["language_prefill_start_ns"],
+                    timing["language_prefill_done_ns"],
+                    _elapsed_ms(timing, "enqueue_ns", "dequeue_ns"),
+                    _elapsed_ms(timing, "dequeue_ns", "encode_done_ns"),
+                    _elapsed_ms(timing, "encode_done_ns", "publish_done_ns"),
+                    _elapsed_ms(timing, "publish_done_ns", "receive_done_ns"),
+                    _elapsed_ms(timing, "receive_done_ns", "language_ready_ns"),
+                    _elapsed_ms(timing, "publish_done_ns", "language_ready_ns"),
+                    _elapsed_ms(timing, "language_ready_ns", "language_prefill_start_ns"),
+                    _elapsed_ms(
+                        timing,
+                        "language_prefill_start_ns",
+                        "language_prefill_done_ns",
+                    ),
+                    _elapsed_ms(timing, "enqueue_ns", "language_prefill_start_ns"),
+                    _elapsed_ms(timing, "enqueue_ns", "language_prefill_done_ns"),
+                )
+
     def run_batch(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run a batch."""
         self.forward_ct += 1
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
+        self._mark_encoder_prefill_start(batch)
 
         # Run forward
         assert self.is_generation
@@ -2790,6 +2882,7 @@ class Scheduler(
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result, launch_done)
         elif batch.forward_mode.is_extend():
+            self._log_encoder_pipeline_timing(batch)
             if self.pd:
                 with self._pd_swap_p_pool():
                     self.process_batch_result_prefill(batch, result, launch_done)

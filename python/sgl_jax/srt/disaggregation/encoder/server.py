@@ -71,7 +71,6 @@ class MMEncoder:
         self._simulate_compute = server_args.simulate_compute
         self._sim_encoder_base_ms = server_args.simulate_compute_encoder_base_ms
         self._sim_encoder_ms_per_token = server_args.simulate_compute_encoder_ms_per_token
-        self._sim_encode_lock = asyncio.Lock()
 
         config = self.model_config.hf_config
         config.vision_encoder_parallel = server_args.vision_encoder_parallel
@@ -133,14 +132,12 @@ class MMEncoder:
                 for item in mm_inputs.mm_items
                 for start, end in item.placeholder_ranges or ()
             )
-            async with self._sim_encode_lock:
-                with jax.profiler.TraceAnnotation(f"mm_encode:{modality.name}:{len(requests)}"):
-                    sleep_ms = (
-                        self._sim_encoder_base_ms
-                        + self._sim_encoder_ms_per_token * token_count_total
-                    )
-                    if sleep_ms > 0:
-                        await asyncio.sleep(sleep_ms / 1000.0)
+            with jax.profiler.TraceAnnotation(f"mm_encode:{modality.name}:{len(requests)}"):
+                sleep_ms = (
+                    self._sim_encoder_base_ms + self._sim_encoder_ms_per_token * token_count_total
+                )
+                if sleep_ms > 0:
+                    await asyncio.sleep(sleep_ms / 1000.0)
             packed = np.zeros(
                 (token_count_total, self.model_config.hidden_size),
                 dtype=self.model_config.dtype,
@@ -408,7 +405,10 @@ def launch(server_args: ServerArgs) -> None:
         if server_args.simulate_compute:
             # Sim transfer needs no routable peer IP; bind/advertise on loopback.
             host_ip = server_args.disaggregation_host_ip or "127.0.0.1"
-            transfer = SimEncoderServerTransfer()
+            transfer = SimEncoderServerTransfer(
+                setup_ms=server_args.simulate_transfer_setup_ms,
+                parallelism=server_args.disaggregation_channel_number,
+            )
         else:
             host_ip = resolve_host_ip(server_args.disaggregation_host_ip)
             transfer = RaidenEncoderServerTransfer(

@@ -289,6 +289,7 @@ class ServerArgs:
     simulate_compute_prefill_ms_per_token: float = 0.0  # x input_ids.shape[0]
     simulate_compute_decode_base_ms: float = 0.0
     simulate_compute_decode_ms_per_seq: float = 0.0  # x batch_size, per decode step
+    simulate_transfer_setup_ms: float = 0.0  # per embedding, channel-limited setup
     simulate_transfer_ms_per_mb: float = 0.0  # x embedding bytes / 1MiB
     # One-way network latency added to each cross-tier hop (language<->encoder
     # HTTP request and the embedding delivery), so a single-box sim can model
@@ -1799,6 +1800,13 @@ class ServerArgs:
             type=float,
             default=ServerArgs.simulate_compute_decode_ms_per_seq,
             help="Decode sleep (ms) per sequence in the batch, per step, under --simulate-compute.",
+        )
+        parser.add_argument(
+            "--simulate-transfer-setup-ms",
+            type=float,
+            default=ServerArgs.simulate_transfer_setup_ms,
+            help="Per-embedding publisher setup sleep (ms), bounded by the "
+            "disaggregation channel count, under --simulate-compute.",
         )
         parser.add_argument(
             "--simulate-transfer-ms-per-mb",

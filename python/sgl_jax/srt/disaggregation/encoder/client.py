@@ -208,8 +208,11 @@ def validate_encoder_response(
 
 
 def build_encoder_result(accumulator: MultiModalEmbeddingData) -> dict[str, Any]:
+    timing = accumulator.get_timing_meta()
+    timing["receive_done_ns"] = time.time_ns()
     return {
         "embeddings": accumulator.get_embedding(is_concat=True),
+        "encoder_timing": timing,
         **accumulator.get_mm_extra_meta(),
     }
 

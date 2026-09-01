@@ -165,5 +165,118 @@ def test_runtime_publishes_queue_timing_metadata():
     data = asyncio.run(run())
     assert isinstance(data.enqueue_ns, int)
     assert isinstance(data.dequeue_ns, int)
+    assert data.dequeue_ns <= data.encode_done_ns <= data.publish_done_ns
     assert data.queue_duration_ns >= 0
     assert data.queue_ms == data.queue_duration_ns / 1_000_000
+
+
+def test_runtime_releases_each_request_when_its_publish_completes():
+    class ControlledTransfer:
+        def __init__(self):
+            self.events = {
+                "request-0:0:embedding": asyncio.Event(),
+                "request-1:0:embedding": asyncio.Event(),
+            }
+
+        async def publish(self, transfer_id, embedding):
+            await self.events[transfer_id].wait()
+            return {"transfer_id": transfer_id}
+
+        async def release_completed(self) -> None:
+            pass
+
+        def release(self, transfer_id) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    async def run() -> None:
+        transfer = ControlledTransfer()
+
+        async def encode(requests):
+            return [(jnp.zeros((1, 2)), {}) for _ in requests]
+
+        runtime = EncoderRuntime(encode, transfer)
+        pending = [
+            PendingRequest({"req_id": f"request-{idx}", "modality": "IMAGE"}) for idx in range(2)
+        ]
+        for item in pending:
+            item.mark_dequeued()
+
+        dispatch = asyncio.create_task(runtime._dispatch_batch(pending))
+        await asyncio.sleep(0)
+        transfer.events["request-0:0:embedding"].set()
+        await asyncio.wait_for(asyncio.shield(pending[0].future), 1)
+
+        assert not pending[1].future.done()
+        assert not dispatch.done()
+
+        transfer.events["request-1:0:embedding"].set()
+        await dispatch
+        assert pending[1].future.done()
+
+    asyncio.run(run())
+
+
+def test_runtime_pipelines_serial_encode_and_publish_stages():
+    async def run() -> None:
+        encode_started = []
+        publish_started = []
+        release_first_encode = asyncio.Event()
+        release_first_publish = asyncio.Event()
+        second_encode_done = asyncio.Event()
+        second_publish_started = asyncio.Event()
+
+        class ControlledTransfer:
+            async def publish(self, transfer_id, embedding):
+                publish_started.append(transfer_id)
+                if transfer_id.startswith("request-0:"):
+                    await release_first_publish.wait()
+                else:
+                    second_publish_started.set()
+                return {"transfer_id": transfer_id}
+
+            async def release_completed(self) -> None:
+                pass
+
+            def release(self, transfer_id) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        async def encode(requests):
+            req_id = requests[0]["req_id"]
+            encode_started.append(req_id)
+            if req_id == "request-0":
+                await release_first_encode.wait()
+            else:
+                second_encode_done.set()
+            return [(jnp.zeros((1, 2)), {})]
+
+        runtime = EncoderRuntime(encode, ControlledTransfer())
+        first = PendingRequest({"req_id": "request-0", "modality": "IMAGE"})
+        second = PendingRequest({"req_id": "request-1", "modality": "IMAGE"})
+        first.mark_dequeued()
+        second.mark_dequeued()
+
+        first_task = asyncio.create_task(runtime._dispatch_batch([first]))
+        await asyncio.sleep(0)
+        second_task = asyncio.create_task(runtime._dispatch_batch([second]))
+        await asyncio.sleep(0)
+
+        assert encode_started == ["request-0"]
+        release_first_encode.set()
+        await asyncio.wait_for(second_encode_done.wait(), 1)
+        assert publish_started == ["request-0:0:embedding"]
+
+        release_first_publish.set()
+        await asyncio.wait_for(second_publish_started.wait(), 1)
+        await asyncio.gather(first_task, second_task)
+        assert publish_started == [
+            "request-0:0:embedding",
+            "request-1:0:embedding",
+        ]
+
+    asyncio.run(run())

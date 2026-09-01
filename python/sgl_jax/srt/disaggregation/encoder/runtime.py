@@ -206,6 +206,8 @@ class EncoderRuntime:
     ) -> None:
         self._batch_encode_fn = batch_encode_fn
         self._transfer = transfer
+        self._encode_lock = asyncio.Lock()
+        self._publish_lock = asyncio.Lock()
 
         self._zmq = zmq.asyncio.Context.instance()
         self._receiver_timeout = receiver_timeout
@@ -272,7 +274,11 @@ class EncoderRuntime:
             return
 
         try:
-            results = await self._encode_batch([pending.request for pending in pending_requests])
+            async with self._encode_lock:
+                results = await self._encode_batch(
+                    [pending.request for pending in pending_requests]
+                )
+                encode_done_ns = time.time_ns()
         except Exception as exc:
             for pending in pending_requests:
                 if not pending.future.done():
@@ -284,20 +290,33 @@ class EncoderRuntime:
             for pending, result in zip(pending_requests, results)
             if not pending.future.done()
         ]
-        published = await asyncio.gather(
-            *(self._publish_result(pending, *result) for pending, result in publish_items),
-            return_exceptions=True,
-        )
-        for (pending, _), result in zip(publish_items, published):
-            if isinstance(result, Exception):
-                if not pending.future.done():
-                    pending.future.set_exception(result)
-                continue
+        async with self._publish_lock:
+            await asyncio.gather(
+                *(
+                    self._publish_pending(pending, result, encode_done_ns)
+                    for pending, result in publish_items
+                )
+            )
 
-            if pending.future.done():
-                self._transfer.release(result.transfer_id)
-                continue
-            pending.future.set_result(result)
+    async def _publish_pending(
+        self,
+        pending: PendingRequest,
+        result: EncodeResult,
+        encode_done_ns: int,
+    ) -> None:
+        try:
+            published = await self._publish_result(pending, *result, encode_done_ns)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not pending.future.done():
+                pending.future.set_exception(exc)
+            return
+
+        if pending.future.done():
+            self._transfer.release(published.transfer_id)
+        else:
+            pending.future.set_result(published)
 
     async def _encode_batch(self, requests: list[dict[str, Any]]) -> list[EncodeResult]:
         results = await self._batch_encode_fn(requests)
@@ -321,6 +340,7 @@ class EncoderRuntime:
         pending: PendingRequest,
         embedding: jax.Array,
         metadata: dict[str, Any],
+        encode_done_ns: int,
     ) -> PublishedEmbedding:
         request = pending.request
         req_id = request["req_id"]
@@ -329,6 +349,7 @@ class EncoderRuntime:
 
         transfer_id = f"{req_id}:{request.get('part_idx', 0)}:embedding"
         transfer_metadata = await self._transfer.publish(transfer_id, embedding)
+        publish_done_ns = time.time_ns()
 
         metadata = dict(metadata)
         data = EmbeddingData(
@@ -341,6 +362,8 @@ class EncoderRuntime:
             dtype=str(embedding.dtype),
             enqueue_ns=pending.enqueue_ns,
             dequeue_ns=pending.dequeue_ns,
+            encode_done_ns=encode_done_ns,
+            publish_done_ns=publish_done_ns,
             queue_duration_ns=queue_duration_ns,
             queue_ms=queue_duration_ns / 1_000_000,
             **transfer_metadata,

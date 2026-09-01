@@ -38,9 +38,16 @@ class SimEncoderServerTransfer:
     register-and-return behavior.
     """
 
+    def __init__(self, *, setup_ms: float = 0.0, parallelism: int = 1) -> None:
+        self._setup_ms = max(0.0, float(setup_ms))
+        self._setup_slots = asyncio.Semaphore(max(1, int(parallelism)))
+
     async def publish(self, transfer_id: str, embedding: jax.Array) -> dict[str, Any]:
         if embedding.ndim != 2 or embedding.shape[0] <= 0:
             raise ValueError("Sim embedding must be a non-empty matrix")
+        async with self._setup_slots:
+            if self._setup_ms:
+                await asyncio.sleep(self._setup_ms / 1000.0)
         # No transfer endpoints: the receiver reconstructs zeros from shape/dtype.
         return {"transfer_id": transfer_id}
 
