@@ -22,6 +22,8 @@ from sgl_jax.srt.disaggregation.encoder.bootstrap import EncoderBootstrapClient
 from sgl_jax.srt.disaggregation.encoder.raiden import RaidenEncoderServerTransfer
 from sgl_jax.srt.disaggregation.encoder.runtime import (
     BatchEncodeFn,
+    BatchEncodePreprocessedFn,
+    BatchPreprocessFn,
     EncoderRuntime,
     EncoderServerTransfer,
 )
@@ -47,6 +49,7 @@ from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
 
 logger = logging.getLogger(__name__)
+PreparedEncoderBatch = tuple[Modality, list[MultimodalInputs], int]
 
 
 class MMEncoder:
@@ -116,8 +119,11 @@ class MMEncoder:
     async def encode_batch(
         self, requests: list[dict[str, Any]]
     ) -> list[tuple[jax.Array, dict[str, Any]]]:
+        return await self.encode_preprocessed(await self.preprocess_batch(requests))
+
+    async def preprocess_batch(self, requests: list[dict[str, Any]]) -> PreparedEncoderBatch:
         if not requests:
-            return []
+            raise ValueError("MMEncoder batches must not be empty")
         modality = Modality.from_str(requests[0]["modality"])
         if any(Modality.from_str(request["modality"]) != modality for request in requests):
             raise ValueError("MMEncoder batches must contain one modality")
@@ -125,7 +131,12 @@ class MMEncoder:
         processed = await asyncio.gather(
             *(self._process_request(request, modality) for request in requests)
         )
-        preprocess_done_ns = time.time_ns()
+        return modality, processed, time.time_ns()
+
+    async def encode_preprocessed(
+        self, batch: PreparedEncoderBatch
+    ) -> list[tuple[jax.Array, dict[str, Any]]]:
+        modality, processed, preprocess_done_ns = batch
         encode_start_ns = time.time_ns()
         simulate = getattr(self, "_simulate_compute", False)
         if simulate:
@@ -135,7 +146,7 @@ class MMEncoder:
                 for item in mm_inputs.mm_items
                 for start, end in item.placeholder_ranges or ()
             )
-            with jax.profiler.TraceAnnotation(f"mm_encode:{modality.name}:{len(requests)}"):
+            with jax.profiler.TraceAnnotation(f"mm_encode:{modality.name}:{len(processed)}"):
                 sleep_ms = (
                     self._sim_encoder_base_ms + self._sim_encoder_ms_per_token * token_count_total
                 )
@@ -146,7 +157,7 @@ class MMEncoder:
                 dtype=self.model_config.dtype,
             )
         else:
-            with jax.profiler.TraceAnnotation(f"mm_encode:{modality.name}:{len(requests)}"):
+            with jax.profiler.TraceAnnotation(f"mm_encode:{modality.name}:{len(processed)}"):
                 items = [item for mm_inputs in processed for item in mm_inputs.mm_items]
                 target = self.model.thinker if hasattr(self.model, "thinker") else self.model
                 get_feature = getattr(target, f"get_{modality.name.lower()}_feature", None)
@@ -242,6 +253,8 @@ class EncoderServer:
         self,
         batch_encode_fn: BatchEncodeFn,
         transfer: EncoderServerTransfer,
+        batch_preprocess_fn: BatchPreprocessFn | None = None,
+        batch_encode_preprocessed_fn: BatchEncodePreprocessedFn | None = None,
         receiver_timeout: float | None = 300.0,
         encoder_register_urls: list[str] | None = None,
         advertise_url: str | None = None,
@@ -260,6 +273,8 @@ class EncoderServer:
         self.runtime = EncoderRuntime(
             batch_encode_fn,
             transfer,
+            batch_preprocess_fn=batch_preprocess_fn,
+            batch_encode_preprocessed_fn=batch_encode_preprocessed_fn,
             receiver_timeout=receiver_timeout,
             max_batch_size=max_batch_size,
             max_inflight_batches=max_inflight_batches,
@@ -441,6 +456,8 @@ def launch(server_args: ServerArgs) -> None:
         server = EncoderServer(
             encoder.encode_batch,
             transfer,
+            batch_preprocess_fn=encoder.preprocess_batch,
+            batch_encode_preprocessed_fn=encoder.encode_preprocessed,
             receiver_timeout=server_args.encoder_request_timeout_seconds,
             encoder_register_urls=server_args.encoder_register_urls,
             advertise_url=advertise_url,

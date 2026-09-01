@@ -337,3 +337,61 @@ def test_runtime_pipelines_serial_encode_and_publish_stages():
         ]
 
     asyncio.run(run())
+
+
+def test_runtime_overlaps_preprocess_with_previous_encode():
+    async def run() -> None:
+        first_encode_started = asyncio.Event()
+        second_preprocess_done = asyncio.Event()
+        release_first_encode = asyncio.Event()
+
+        class FakeTransfer:
+            async def publish(self, transfer_id, embedding):
+                return {"transfer_id": transfer_id}
+
+            async def release_completed(self) -> None:
+                pass
+
+            def release(self, transfer_id) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        async def preprocess(requests):
+            req_id = requests[0]["req_id"]
+            if req_id == "request-1":
+                second_preprocess_done.set()
+            return req_id
+
+        async def encode_preprocessed(req_id):
+            if req_id == "request-0":
+                first_encode_started.set()
+                await release_first_encode.wait()
+            return [(jnp.zeros((1, 2)), {})]
+
+        async def encode(_requests):
+            raise AssertionError("staged encoder must use its preprocessed path")
+
+        runtime = EncoderRuntime(
+            encode,
+            FakeTransfer(),
+            batch_preprocess_fn=preprocess,
+            batch_encode_preprocessed_fn=encode_preprocessed,
+        )
+        first = PendingRequest({"req_id": "request-0", "modality": "IMAGE"})
+        second = PendingRequest({"req_id": "request-1", "modality": "IMAGE"})
+        first.mark_dequeued()
+        second.mark_dequeued()
+
+        first_task = asyncio.create_task(runtime._dispatch_batch([first]))
+        await asyncio.wait_for(first_encode_started.wait(), 1)
+        second_task = asyncio.create_task(runtime._dispatch_batch([second]))
+        await asyncio.wait_for(second_preprocess_done.wait(), 1)
+        assert not first_task.done()
+        assert not second_task.done()
+
+        release_first_encode.set()
+        await asyncio.gather(first_task, second_task)
+
+    asyncio.run(run())

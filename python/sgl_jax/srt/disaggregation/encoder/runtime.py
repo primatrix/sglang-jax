@@ -20,6 +20,8 @@ BatchEncodeFn = Callable[
     [list[dict[str, Any]]],
     Awaitable[list[EncodeResult]],
 ]
+BatchPreprocessFn = Callable[[list[dict[str, Any]]], Awaitable[Any]]
+BatchEncodePreprocessedFn = Callable[[Any], Awaitable[list[EncodeResult]]]
 logger = logging.getLogger(__name__)
 
 
@@ -198,13 +200,19 @@ class EncoderRuntime:
         batch_encode_fn: BatchEncodeFn,
         transfer: EncoderServerTransfer,
         *,
+        batch_preprocess_fn: BatchPreprocessFn | None = None,
+        batch_encode_preprocessed_fn: BatchEncodePreprocessedFn | None = None,
         receiver_timeout: float | None = 300.0,
         max_batch_size: int = 8,
         max_inflight_batches: int = 1,
         request_timeout: float | None = 300.0,
         log_queue_timing: bool = False,
     ) -> None:
+        if (batch_preprocess_fn is None) != (batch_encode_preprocessed_fn is None):
+            raise ValueError("preprocess and preprocessed encode functions must be paired")
         self._batch_encode_fn = batch_encode_fn
+        self._batch_preprocess_fn = batch_preprocess_fn
+        self._batch_encode_preprocessed_fn = batch_encode_preprocessed_fn
         self._transfer = transfer
         self._encode_lock = asyncio.Lock()
         self._publish_lock = asyncio.Lock()
@@ -279,12 +287,23 @@ class EncoderRuntime:
             return
 
         try:
-            async with self._encode_lock:
+            requests = [pending.request for pending in pending_requests]
+            if self._batch_preprocess_fn is None:
+                async with self._encode_lock:
+                    preprocess_start_ns = time.time_ns()
+                    results = await self._encode_batch(requests)
+            else:
                 preprocess_start_ns = time.time_ns()
-                results = await self._encode_batch(
-                    [pending.request for pending in pending_requests]
-                )
-                encode_done_ns = time.time_ns()
+                prepared = await self._batch_preprocess_fn(requests)
+                async with self._encode_lock:
+                    assert self._batch_encode_preprocessed_fn is not None
+                    results = await self._batch_encode_preprocessed_fn(prepared)
+                    if len(results) != len(requests):
+                        raise RuntimeError(
+                            "batch_encode_preprocessed_fn returned "
+                            f"{len(results)} results for {len(requests)} requests"
+                        )
+            encode_done_ns = time.time_ns()
         except Exception as exc:
             for pending in pending_requests:
                 if not pending.future.done():
