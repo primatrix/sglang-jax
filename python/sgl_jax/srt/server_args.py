@@ -271,6 +271,7 @@ class ServerArgs:
     encoder_bootstrap_port: int | None = None
     encoder_register_urls: list[str] | None = None
     encoder_transfer_backend: str = "raiden"
+    encoder_transfer_pool_size: int = 32
     encoder_control_timeout_seconds: float = 300.0
     encoder_request_timeout_seconds: float = 300.0
     encoder_max_batch_size: int = 8
@@ -617,6 +618,8 @@ class ServerArgs:
                 "--encoder-transfer-backend only supports 'raiden', "
                 f"got {self.encoder_transfer_backend!r}"
             )
+        if encoder_disaggregation and self.encoder_transfer_pool_size <= 0:
+            raise ValueError("--encoder-transfer-pool-size must be positive")
         if encoder_disaggregation and self.encoder_request_timeout_seconds <= 0:
             raise ValueError(
                 "Raiden encoder transfer requires a positive " "--encoder-request-timeout-seconds"
@@ -1737,6 +1740,12 @@ class ServerArgs:
             choices=["raiden"],
             default=ServerArgs.encoder_transfer_backend,
             help="Encoder embedding transfer backend. Only Raiden is supported.",
+        )
+        parser.add_argument(
+            "--encoder-transfer-pool-size",
+            type=int,
+            default=ServerArgs.encoder_transfer_pool_size,
+            help="Number of request slots in each registered Encoder transfer pool.",
         )
         parser.add_argument(
             "--encoder-control-timeout-seconds",
