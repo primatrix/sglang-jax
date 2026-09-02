@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import threading
 import time
 from collections.abc import Mapping
@@ -21,6 +22,7 @@ from sgl_jax.srt.disaggregation.raiden_transfer.wrapper import RaidenTransferWra
 
 logger = logging.getLogger(__name__)
 _LOCAL_ENDPOINT_HOSTS = {"", "0.0.0.0", "127.0.0.1", "::", "::1", "localhost"}
+_TPU_TILE_SHAPE = (8, 128)
 
 
 def _uuid_to_int(value: str) -> int:
@@ -71,16 +73,32 @@ def _pool_sharding(sharding: jax.sharding.Sharding) -> jax.sharding.Sharding:
     return sharding
 
 
+def _pool_block_shape(shape: tuple[int, int]) -> tuple[int, int, int, int]:
+    """Keep each request contiguous in TPU's canonical rank-5 KV layout."""
+
+    rows, width = shape
+    tile_width = math.prod(_TPU_TILE_SHAPE)
+    return max(2, rows), max(2, math.ceil(width / tile_width)), *_TPU_TILE_SHAPE
+
+
 @partial(jax.jit, donate_argnums=(0,))
 def _copy_into_slot(pool: jax.Array, value: jax.Array, slot: jax.Array) -> jax.Array:
-    return jax.lax.dynamic_update_slice_in_dim(pool, value[None], slot, axis=0)
+    block_shape = pool.shape[1:]
+    padded_shape = (block_shape[0], math.prod(block_shape[1:]))
+    padding = tuple(
+        (0, padded - size) for padded, size in zip(padded_shape, value.shape)
+    )
+    block = jnp.pad(value, padding).reshape(block_shape)
+    return jax.lax.dynamic_update_slice_in_dim(pool, block[None], slot, axis=0)
 
 
 def _compile_donated_copy(
     pool: jax.Array,
     value: jax.Array,
 ) -> Any:
-    compiled = _copy_into_slot.lower(pool, value, jnp.asarray(0, dtype=jnp.int32)).compile()
+    compiled = _copy_into_slot.lower(
+        pool, value, jnp.asarray(0, dtype=jnp.int32)
+    ).compile()
     stats = compiled.memory_analysis()
     stats = stats if isinstance(stats, (list, tuple)) else (stats,)
     if not stats or any(
@@ -89,7 +107,9 @@ def _compile_donated_copy(
         < int(getattr(stat, "output_size_in_bytes", 0))
         for stat in stats
     ):
-        raise RuntimeError("Raiden encoder pool update did not fully alias its donated input")
+        raise RuntimeError(
+            "Raiden encoder pool update did not fully alias its donated input"
+        )
     return compiled
 
 
@@ -110,8 +130,9 @@ class _RaidenSendPool:
         self.sharding = sample.sharding
         self._timeout_s = timeout_s
         pool_sharding = _pool_sharding(sample.sharding)
+        self._block_shape = _pool_block_shape(self.shape)
         self._buffer = jnp.zeros(
-            (capacity, *self.shape),
+            (capacity, *self._block_shape),
             dtype=self.dtype,
             device=pool_sharding,
         )
@@ -145,7 +166,9 @@ class _RaidenSendPool:
             while not self._free and not self._closed:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError("timed out waiting for a Raiden encoder pool slot")
+                    raise TimeoutError(
+                        "timed out waiting for a Raiden encoder pool slot"
+                    )
                 self._condition.wait(remaining)
             if self._closed:
                 raise RuntimeError("Raiden encoder pool is closed")
@@ -335,9 +358,11 @@ class _RaidenReceivePool:
         timeout_s: float,
     ) -> None:
         self._sharding = sharding
+        self._shape = shape
         self._timeout_s = timeout_s
+        self._block_shape = _pool_block_shape(shape)
         self._buffer = jnp.zeros(
-            (capacity, *shape),
+            (capacity, *self._block_shape),
             dtype=dtype,
             device=_pool_sharding(sharding),
         )
@@ -373,7 +398,9 @@ class _RaidenReceivePool:
                     break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError("timed out waiting for a Raiden embedding buffer")
+                    raise TimeoutError(
+                        "timed out waiting for a Raiden embedding buffer"
+                    )
                 self._condition.wait(min(remaining, 0.01))
             if self._closed:
                 raise RuntimeError("Raiden receiver is closed")
@@ -417,8 +444,9 @@ class _RaidenReceivePool:
         try:
             # Raiden writes outside JAX's dependency graph. Copy the completed
             # block and synchronize it before making the pool slot reusable.
+            block = self._buffer[lane_id].reshape(self._block_shape[0], -1)
             embedding = jax.device_put(
-                self._buffer[lane_id],
+                block[: self._shape[0], : self._shape[1]],
                 self._sharding,
                 may_alias=False,
             )
@@ -436,7 +464,9 @@ class _RaidenReceivePool:
             try:
                 self._reap_abandoned_locked()
             except Exception:
-                logger.exception("Raiden receiver poll failed while abandoning %s", transfer_id)
+                logger.exception(
+                    "Raiden receiver poll failed while abandoning %s", transfer_id
+                )
 
     def _reap_abandoned_locked(self) -> None:
         self._drain_stats_locked()

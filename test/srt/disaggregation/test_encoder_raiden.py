@@ -110,10 +110,11 @@ def test_raiden_server_uses_donated_request_pool(monkeypatch):
     session = _FakeRaidenWrapper.instances[0]
     buffers, options = session.started
     assert len(buffers) == 1
-    assert buffers[0].shape == (2, 4, 3)
+    assert buffers[0].shape == (2, 4, 2, 8, 128)
     assert options == {"max_blocks": 1, "num_slots": 2, "timeout_s": 12.0}
-    np.testing.assert_array_equal(transfer._pools[0]._buffer[0], first)
-    np.testing.assert_array_equal(transfer._pools[0]._buffer[1], second)
+    buffer = transfer._pools[0]._buffer.reshape(2, 4, -1)
+    np.testing.assert_array_equal(buffer[0, :, :3], first)
+    np.testing.assert_array_equal(buffer[1, :, :3], second)
     assert transfer._pools[0]._buffer.unsafe_buffer_pointer() == pool_pointer
     assert session.registrations == [
         ("part-0:embedding", first_metadata["transfer_uuid"], [0]),
@@ -135,7 +136,9 @@ def test_raiden_server_backpressures_when_pool_is_full(monkeypatch):
 
     async def run() -> None:
         await transfer.publish("part-0:embedding", jnp.zeros((2, 3)))
-        blocked = asyncio.create_task(transfer.publish("part-1:embedding", jnp.ones((2, 3))))
+        blocked = asyncio.create_task(
+            transfer.publish("part-1:embedding", jnp.ones((2, 3)))
+        )
         await asyncio.sleep(0.05)
         assert not blocked.done()
         transfer.release("part-0:embedding")
@@ -216,9 +219,9 @@ def test_raiden_request_receives_into_matching_jax_buffer(monkeypatch):
     session = receive_session._future.result(timeout=1)
     transfer = session.transfer
     buffers, options = transfer.started
-    assert buffers[0].shape == (2, 2, 3)
+    assert buffers[0].shape == (2, 2, 2, 8, 128)
     assert buffers[0].dtype == jnp.float32
-    assert session.buffer.shape == (2, 2, 3)
+    assert session.buffer.shape == (2, 2, 2, 8, 128)
     assert options == {"max_blocks": 1, "num_slots": 2, "timeout_s": 30.0}
     assert transfer.read == (
         "part-0:embedding",
@@ -231,7 +234,9 @@ def test_raiden_request_receives_into_matching_jax_buffer(monkeypatch):
     transfer.stats = ([], ["part-0:embedding"], [])
     result = request.poll()
 
-    np.testing.assert_array_equal(result["embeddings"][Modality.IMAGE], np.zeros((2, 3)))
+    np.testing.assert_array_equal(
+        result["embeddings"][Modality.IMAGE], np.zeros((2, 3))
+    )
     request.close()
     backend.close()
     assert metadata_router.unregistered == ("part-0",)
