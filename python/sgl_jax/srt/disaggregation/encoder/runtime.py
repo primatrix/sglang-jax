@@ -63,11 +63,6 @@ class PublishedEmbedding:
 class EncoderServerTransfer(Protocol):
     async def publish(self, transfer_id: str, embedding: jax.Array) -> dict[str, Any]: ...
 
-    async def publish_batch(
-        self,
-        items: list[tuple[str, jax.Array]],
-    ) -> list[dict[str, Any]]: ...
-
     async def release_completed(self) -> None: ...
 
     def release(self, transfer_id: str) -> None: ...
@@ -323,71 +318,13 @@ class EncoderRuntime:
             if not pending.future.done()
         ]
         async with self._publish_lock:
-            if len(publish_items) > 1:
-                await self._publish_batch(
-                    publish_items,
-                    preprocess_start_ns,
-                    encode_done_ns,
-                )
-            else:
-                await asyncio.gather(
-                    *(
-                        self._publish_pending(
-                            pending,
-                            result,
-                            preprocess_start_ns,
-                            encode_done_ns,
-                        )
-                        for pending, result in publish_items
-                    )
-                )
-
-    async def _publish_batch(
-        self,
-        items: list[tuple[PendingRequest, EncodeResult]],
-        preprocess_start_ns: int,
-        encode_done_ns: int,
-    ) -> None:
-        active = [(pending, result) for pending, result in items if not pending.future.done()]
-        if not active:
-            return
-        try:
-            await asyncio.gather(
-                *(self._wait_for_receiver(pending.request["req_id"]) for pending, _ in active)
-            )
-            transfer_metadata = await self._transfer.publish_batch(
-                [(self._transfer_id(pending.request), result[0]) for pending, result in active]
-            )
-            if len(transfer_metadata) != len(active):
-                raise RuntimeError(
-                    f"publish_batch returned {len(transfer_metadata)} results "
-                    f"for {len(active)} embeddings"
-                )
-            publish_done_ns = time.time_ns()
-            published = [
-                self._build_published(
+            for pending, result in publish_items:
+                await self._publish_pending(
                     pending,
-                    *result,
-                    metadata,
+                    result,
                     preprocess_start_ns,
                     encode_done_ns,
-                    publish_done_ns,
                 )
-                for (pending, result), metadata in zip(active, transfer_metadata)
-            ]
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            for pending, _ in active:
-                if not pending.future.done():
-                    pending.future.set_exception(exc)
-            return
-
-        for (pending, _), item in zip(active, published):
-            if pending.future.done():
-                self._transfer.release(item.transfer_id)
-            else:
-                pending.future.set_result(item)
 
     async def _publish_pending(
         self,

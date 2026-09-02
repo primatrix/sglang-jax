@@ -97,43 +97,30 @@ def test_raiden_server_uses_donated_request_pool(monkeypatch):
     transfer = RaidenEncoderServerTransfer(
         "10.0.0.4",
         parallelism=3,
-        pool_size=3,
+        pool_size=2,
         timeout_s=12.0,
     )
     first = jnp.arange(12, dtype=jnp.float32).reshape(4, 3)
     second = first + 20
-    third = first + 40
 
     first_metadata = asyncio.run(transfer.publish("part-0:embedding", first))
     pool_pointer = transfer._pools[0]._buffer.unsafe_buffer_pointer()
-    batch_metadata = asyncio.run(
-        transfer.publish_batch(
-            [
-                ("part-1:embedding", second),
-                ("part-2:embedding", third),
-            ]
-        )
-    )
+    second_metadata = asyncio.run(transfer.publish("part-1:embedding", second))
 
     session = _FakeRaidenWrapper.instances[0]
     buffers, options = session.started
     assert len(buffers) == 1
-    assert buffers[0].shape == (3, 4, 2, 8, 128)
-    assert options == {"max_blocks": 1, "num_slots": 3, "timeout_s": 12.0}
-    buffer = transfer._pools[0]._buffer.reshape(3, 4, -1)
+    assert buffers[0].shape == (2, 4, 2, 8, 128)
+    assert options == {"max_blocks": 1, "num_slots": 2, "timeout_s": 12.0}
+    buffer = transfer._pools[0]._buffer.reshape(2, 4, -1)
     np.testing.assert_array_equal(buffer[0, :, :3], first)
     np.testing.assert_array_equal(buffer[1, :, :3], second)
-    np.testing.assert_array_equal(buffer[2, :, :3], third)
     assert transfer._pools[0]._buffer.unsafe_buffer_pointer() == pool_pointer
     assert session.registrations == [
         ("part-0:embedding", first_metadata["transfer_uuid"], [0]),
-        ("part-1:embedding", batch_metadata[0]["transfer_uuid"], [1]),
-        ("part-2:embedding", batch_metadata[1]["transfer_uuid"], [2]),
+        ("part-1:embedding", second_metadata["transfer_uuid"], [1]),
     ]
-    assert {metadata["transfer_id"] for metadata in batch_metadata} == {
-        "part-1:embedding",
-        "part-2:embedding",
-    }
+    assert first_metadata["transfer_id"] != second_metadata["transfer_id"]
     assert first_metadata["transfer_address"] == session.endpoints
     assert first_metadata["transfer_host"] == "10.0.0.4"
     transfer.close()
@@ -145,18 +132,11 @@ def test_raiden_server_backpressures_when_pool_is_full(monkeypatch):
         "sgl_jax.srt.disaggregation.encoder.raiden.RaidenTransferWrapper",
         _FakeRaidenWrapper,
     )
-    transfer = RaidenEncoderServerTransfer("10.0.0.4", pool_size=2)
+    transfer = RaidenEncoderServerTransfer("10.0.0.4", pool_size=1)
 
     async def run() -> None:
         await transfer.publish("part-0:embedding", jnp.zeros((2, 3)))
-        blocked = asyncio.create_task(
-            transfer.publish_batch(
-                [
-                    ("part-1:embedding", jnp.ones((2, 3))),
-                    ("part-2:embedding", jnp.full((2, 3), 2, dtype=jnp.float32)),
-                ]
-            )
-        )
+        blocked = asyncio.create_task(transfer.publish("part-1:embedding", jnp.ones((2, 3))))
         await asyncio.sleep(0.05)
         assert not blocked.done()
         transfer.release("part-0:embedding")
