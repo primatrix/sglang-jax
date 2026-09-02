@@ -120,7 +120,7 @@ class _RaidenSendPool:
         self.transfer = RaidenTransferWrapper(host, 0, parallelism=parallelism)
         self.transfer.start(
             [self._buffer],
-            max_blocks=capacity,
+            max_blocks=1,
             num_slots=capacity,
             timeout_s=timeout_s,
         )
@@ -345,7 +345,7 @@ class _RaidenReceivePool:
         self._transfer = RaidenTransferWrapper(host, 0, parallelism=parallelism)
         self._transfer.start(
             [self._buffer],
-            max_blocks=capacity,
+            max_blocks=1,
             num_slots=capacity,
             timeout_s=timeout_s,
         )
