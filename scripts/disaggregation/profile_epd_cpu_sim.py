@@ -32,6 +32,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 
+from sgl_jax.srt.disaggregation.encoder.metrics import summarize_raiden_transfer_inflight
+
 DEFAULT_PROFILER_DIR = "/tmp/epd-sim-profile"
 _QUEUE_RE = re.compile(
     r"enqueue_ns=(\d+).*?queue_ms=([0-9.]+).*?batch_size=(\d+).*?queue_depth=(\d+)"
@@ -312,6 +314,11 @@ def _run_aligned_benchmark(args, encoder_urls: list[str]) -> int:
         start_ns=start_ns,
         end_ns=end_ns,
     )
+    transfer_inflight = summarize_raiden_transfer_inflight(
+        [output_dir / f"encoder_{idx}.log" for idx in range(len(encoder_urls))],
+        start_ns=start_ns,
+        end_ns=end_ns,
+    )
     if queue["n"] != args.n_requests or pipeline["n"] != args.n_requests:
         raise RuntimeError(
             "formal-window coverage: "
@@ -336,6 +343,7 @@ def _run_aligned_benchmark(args, encoder_urls: list[str]) -> int:
         "benchmark": {key: result[key] for key in _BENCHMARK_KEYS if key in result},
         "encoder_queue": queue,
         "encoder_pipeline": pipeline,
+        "encoder_transfer_inflight": transfer_inflight,
     }
     summary_path = output_dir / "aligned-summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")

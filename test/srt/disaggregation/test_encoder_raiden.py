@@ -259,6 +259,39 @@ def test_raiden_server_reaps_completed_sender(monkeypatch):
     transfer.close()
 
 
+def test_raiden_server_logs_group_and_request_inflight(monkeypatch, caplog):
+    transfer = RaidenEncoderServerTransfer(
+        "10.0.0.4",
+        parallelism=2,
+        log_inflight=True,
+    )
+    first = mock.Mock()
+    first.poll_stats.return_value = (["group-0"], [], [])
+    second = mock.Mock()
+    second.poll_stats.return_value = (["group-1"], [], [])
+
+    caplog.set_level("INFO", logger="sgl_jax.srt.disaggregation.encoder.raiden")
+    transfer._register_session("group-0", first, group_size=2)
+    transfer._register_session("group-1", second, group_size=2)
+
+    assert "event=start" in caplog.text
+    assert "group_size=2 inflight_groups=2 inflight_requests=4" in caplog.text
+
+    async def stop_after_poll(_delay):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        "sgl_jax.srt.disaggregation.encoder.raiden.asyncio.sleep",
+        stop_after_poll,
+    )
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(transfer.release_completed())
+
+    assert "event=sent" in caplog.text
+    assert "group_size=2 inflight_groups=0 inflight_requests=0" in caplog.text
+    transfer.close()
+
+
 def test_raiden_request_receives_into_matching_jax_buffer(monkeypatch):
     _FakeRaidenWrapper.instances.clear()
     monkeypatch.setattr(

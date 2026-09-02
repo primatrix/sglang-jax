@@ -74,6 +74,7 @@ class RaidenEncoderServerTransfer:
         setup_parallelism: int | None = None,
         timeout_s: float = 300.0,
         poll_interval_s: float = 0.001,
+        log_inflight: bool = False,
     ) -> None:
         require_raiden_preloaded()
         self._host_ip = host_ip
@@ -84,7 +85,9 @@ class RaidenEncoderServerTransfer:
         )
         self._timeout_s = float(timeout_s)
         self._poll_interval_s = float(poll_interval_s)
+        self._log_inflight = bool(log_inflight)
         self._sessions: dict[str, RaidenTransferWrapper] = {}
+        self._session_group_sizes: dict[str, int] = {}
         self._preparing: set[str] = set()
         # Starting a manager is control-plane work. Do not serialize a request
         # batch behind Raiden's per-transfer data-plane channel count.
@@ -111,7 +114,7 @@ class RaidenEncoderServerTransfer:
             )
         finally:
             self._preparing.discard(transfer_id)
-        self._sessions[transfer_id] = session
+        self._register_session(transfer_id, session, group_size=1)
         return metadata
 
     async def publish_batch(
@@ -185,7 +188,7 @@ class RaidenEncoderServerTransfer:
             )
         finally:
             self._preparing.discard(group_id)
-        self._sessions[group_id] = session
+        self._register_session(group_id, session, group_size=len(items))
 
         transfer_shape = tuple(int(dim) for dim in packed.shape)
         return [
@@ -240,18 +243,50 @@ class RaidenEncoderServerTransfer:
                     sent, _, _ = session.poll_stats()
                 except Exception:
                     logger.exception("Raiden encoder sender poll failed for %s", transfer_id)
-                    self._sessions.pop(transfer_id, None)
+                    self._discard_session(transfer_id, event="poll_error")
                     continue
                 if transfer_id in sent:
-                    self._sessions.pop(transfer_id, None)
+                    self._discard_session(transfer_id, event="sent")
             await asyncio.sleep(self._poll_interval_s)
 
     def release(self, transfer_id: str) -> None:
-        self._sessions.pop(transfer_id, None)
+        self._discard_session(transfer_id, event="release")
 
     def close(self) -> None:
-        self._sessions.clear()
+        for transfer_id in list(self._sessions):
+            self._discard_session(transfer_id, event="close")
         self._executor.shutdown(cancel_futures=True)
+
+    def _register_session(
+        self,
+        transfer_id: str,
+        session: RaidenTransferWrapper,
+        *,
+        group_size: int,
+    ) -> None:
+        self._sessions[transfer_id] = session
+        self._session_group_sizes[transfer_id] = group_size
+        self._log_inflight_event("start", transfer_id, group_size)
+
+    def _discard_session(self, transfer_id: str, *, event: str) -> None:
+        session = self._sessions.pop(transfer_id, None)
+        group_size = self._session_group_sizes.pop(transfer_id, 0)
+        if session is not None:
+            self._log_inflight_event(event, transfer_id, group_size)
+
+    def _log_inflight_event(self, event: str, transfer_id: str, group_size: int) -> None:
+        if not self._log_inflight:
+            return
+        logger.info(
+            "ENCODER-RAIDEN-INFLIGHT time_ns=%d event=%s transfer_id=%s "
+            "group_size=%d inflight_groups=%d inflight_requests=%d",
+            time.time_ns(),
+            event,
+            transfer_id,
+            group_size,
+            len(self._sessions),
+            sum(self._session_group_sizes.values()),
+        )
 
 
 @dataclass(slots=True)
