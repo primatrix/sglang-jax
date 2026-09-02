@@ -85,9 +85,7 @@ def _pool_block_shape(shape: tuple[int, int]) -> tuple[int, int, int, int]:
 def _copy_into_slot(pool: jax.Array, value: jax.Array, slot: jax.Array) -> jax.Array:
     block_shape = pool.shape[1:]
     padded_shape = (block_shape[0], math.prod(block_shape[1:]))
-    padding = tuple(
-        (0, padded - size) for padded, size in zip(padded_shape, value.shape)
-    )
+    padding = tuple((0, padded - size) for padded, size in zip(padded_shape, value.shape))
     block = jnp.pad(value, padding).reshape(block_shape)
     return jax.lax.dynamic_update_slice_in_dim(pool, block[None], slot, axis=0)
 
@@ -96,9 +94,7 @@ def _compile_donated_copy(
     pool: jax.Array,
     value: jax.Array,
 ) -> Any:
-    compiled = _copy_into_slot.lower(
-        pool, value, jnp.asarray(0, dtype=jnp.int32)
-    ).compile()
+    compiled = _copy_into_slot.lower(pool, value, jnp.asarray(0, dtype=jnp.int32)).compile()
     stats = compiled.memory_analysis()
     stats = stats if isinstance(stats, (list, tuple)) else (stats,)
     if not stats or any(
@@ -107,9 +103,7 @@ def _compile_donated_copy(
         < int(getattr(stat, "output_size_in_bytes", 0))
         for stat in stats
     ):
-        raise RuntimeError(
-            "Raiden encoder pool update did not fully alias its donated input"
-        )
+        raise RuntimeError("Raiden encoder pool update did not fully alias its donated input")
     return compiled
 
 
@@ -166,9 +160,7 @@ class _RaidenSendPool:
             while not self._free and not self._closed:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError(
-                        "timed out waiting for a Raiden encoder pool slot"
-                    )
+                    raise TimeoutError("timed out waiting for a Raiden encoder pool slot")
                 self._condition.wait(remaining)
             if self._closed:
                 raise RuntimeError("Raiden encoder pool is closed")
@@ -229,6 +221,7 @@ class RaidenEncoderServerTransfer:
         pool_size: int = 32,
         timeout_s: float = 300.0,
         poll_interval_s: float = 0.001,
+        log_inflight: bool = False,
     ) -> None:
         require_raiden_preloaded()
         self._host_ip = host_ip
@@ -240,6 +233,7 @@ class RaidenEncoderServerTransfer:
         self._pool_size = max(1, int(pool_size))
         self._timeout_s = float(timeout_s)
         self._poll_interval_s = float(poll_interval_s)
+        self._log_inflight = bool(log_inflight)
         self._pools: list[_RaidenSendPool] = []
         self._pool_lock = threading.Lock()
         self._active: dict[str, _RaidenSendPool] = {}
@@ -263,6 +257,7 @@ class RaidenEncoderServerTransfer:
         finally:
             self._preparing.discard(transfer_id)
         self._active[transfer_id] = pool
+        self._log_inflight_event("start", transfer_id)
         return metadata
 
     def _prepare(
@@ -291,20 +286,42 @@ class RaidenEncoderServerTransfer:
                 except Exception:
                     logger.exception("Raiden encoder sender pool poll failed")
                     continue
-                for transfer_id in (*sent, *failed):
-                    self._active.pop(transfer_id, None)
+                for transfer_id in sent:
+                    self._discard_active(transfer_id, event="sent")
+                for transfer_id in failed:
+                    self._discard_active(transfer_id, event="failed")
             await asyncio.sleep(self._poll_interval_s)
 
     def release(self, transfer_id: str) -> None:
         pool = self._active.pop(transfer_id, None)
         if pool is not None:
             pool.release(transfer_id)
+            self._log_inflight_event("release", transfer_id)
 
     def close(self) -> None:
         for pool in self._pools:
             pool.close()
-        self._active.clear()
+        for transfer_id in list(self._active):
+            self._discard_active(transfer_id, event="close")
         self._executor.shutdown(cancel_futures=True)
+
+    def _discard_active(self, transfer_id: str, *, event: str) -> None:
+        if self._active.pop(transfer_id, None) is not None:
+            self._log_inflight_event(event, transfer_id)
+
+    def _log_inflight_event(self, event: str, transfer_id: str) -> None:
+        if not self._log_inflight:
+            return
+        inflight = len(self._active)
+        logger.info(
+            "ENCODER-RAIDEN-INFLIGHT time_ns=%d event=%s transfer_id=%s "
+            "group_size=1 inflight_groups=%d inflight_requests=%d",
+            time.time_ns(),
+            event,
+            transfer_id,
+            inflight,
+            inflight,
+        )
 
 
 @dataclass(slots=True)
@@ -398,9 +415,7 @@ class _RaidenReceivePool:
                     break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError(
-                        "timed out waiting for a Raiden embedding buffer"
-                    )
+                    raise TimeoutError("timed out waiting for a Raiden embedding buffer")
                 self._condition.wait(min(remaining, 0.01))
             if self._closed:
                 raise RuntimeError("Raiden receiver is closed")
@@ -464,9 +479,7 @@ class _RaidenReceivePool:
             try:
                 self._reap_abandoned_locked()
             except Exception:
-                logger.exception(
-                    "Raiden receiver poll failed while abandoning %s", transfer_id
-                )
+                logger.exception("Raiden receiver poll failed while abandoning %s", transfer_id)
 
     def _reap_abandoned_locked(self) -> None:
         self._drain_stats_locked()
