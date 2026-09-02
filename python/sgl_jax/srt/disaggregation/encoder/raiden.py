@@ -154,7 +154,7 @@ class _RaidenSendPool:
             num_slots=capacity,
             timeout_s=timeout_s,
         )
-        self._condition = threading.Condition()
+        self._slots_released = asyncio.Event()
         self._free = list(range(capacity - 1, -1, -1))
         self._active: dict[str, int] = {}
         self._closed = False
@@ -166,72 +166,74 @@ class _RaidenSendPool:
             and value.sharding == self.sharding
         )
 
-    def publish_batch(
-        self,
-        items: list[tuple[str, jax.Array]],
-    ) -> list[dict[str, Any]]:
-        if not items:
+    async def reserve(self, transfer_ids: list[str]) -> list[int]:
+        if not transfer_ids:
             return []
-        transfer_ids = [transfer_id for transfer_id, _ in items]
         if len(set(transfer_ids)) != len(transfer_ids):
             raise ValueError("duplicate Raiden transfer_id in batch")
-        if any(not self.matches(value) for _, value in items):
-            raise ValueError("Raiden pool batch contains incompatible embeddings")
+        duplicate = next(
+            (transfer_id for transfer_id in transfer_ids if transfer_id in self._active),
+            None,
+        )
+        if duplicate is not None:
+            raise ValueError(f"duplicate Raiden transfer_id: {duplicate}")
+        if len(transfer_ids) > len(self._buffer):
+            raise ValueError("Raiden publish batch exceeds encoder pool capacity")
 
         deadline = time.monotonic() + self._timeout_s
-        with self._condition:
-            duplicate = next(
-                (transfer_id for transfer_id in transfer_ids if transfer_id in self._active),
-                None,
-            )
-            if duplicate is not None:
-                raise ValueError(f"duplicate Raiden transfer_id: {duplicate}")
-            if len(items) > len(self._buffer):
-                raise ValueError("Raiden publish batch exceeds encoder pool capacity")
-            while len(self._free) < len(items) and not self._closed:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("timed out waiting for Raiden encoder pool slots")
-                self._condition.wait(remaining)
-            if self._closed:
-                raise RuntimeError("Raiden encoder pool is closed")
-            slots = [self._free.pop() for _ in items]
-            self._active.update(zip(transfer_ids, slots))
+        while len(self._free) < len(transfer_ids) and not self._closed:
+            self._slots_released.clear()
+            if len(self._free) >= len(transfer_ids):
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out waiting for Raiden encoder pool slots")
+            try:
+                await asyncio.wait_for(self._slots_released.wait(), remaining)
+            except TimeoutError:
+                raise TimeoutError("timed out waiting for Raiden encoder pool slots") from None
+        if self._closed:
+            raise RuntimeError("Raiden encoder pool is closed")
 
-        registered = 0
-        try:
-            values = tuple(value for _, value in items)
-            copy = self._copies.get(len(values))
-            if copy is None:
-                copy = _compile_donated_copy(self._buffer, values)
-                self._copies[len(values)] = copy
-            self._buffer = copy(
-                self._buffer,
-                jnp.asarray(slots, dtype=jnp.int32),
-                *values,
-            )
-            jax.block_until_ready(self._buffer)
+        slots = [self._free.pop() for _ in transfer_ids]
+        self._active.update(zip(transfer_ids, slots))
+        return slots
 
-            metadata = []
-            for (transfer_id, _), slot in zip(items, slots):
-                transfer_uuid = _uuid_to_int(transfer_id)
-                if not self.transfer.register_read(transfer_id, transfer_uuid, [slot]):
-                    raise RuntimeError(f"Raiden rejected encoder transfer {transfer_id!r}")
-                registered += 1
-                metadata.append(
-                    {
-                        "transfer_id": transfer_id,
-                        "transfer_uuid": transfer_uuid,
-                        "transfer_address": self.transfer.endpoints,
-                        "transfer_host": self.transfer.host_ip,
-                        "transfer_block_ids": [slot],
-                    }
-                )
-            return metadata
-        except Exception:
-            for transfer_id in transfer_ids[registered:]:
-                self.release(transfer_id)
-            raise
+    def copy_batch(
+        self,
+        items: list[tuple[str, jax.Array]],
+        slots: list[int],
+    ) -> jax.Array:
+        if not items:
+            return self._buffer
+        if any(not self.matches(value) for _, value in items):
+            raise ValueError("Raiden pool batch contains incompatible embeddings")
+        if len(items) != len(slots):
+            raise ValueError("Raiden pool batch has mismatched slots")
+
+        values = tuple(value for _, value in items)
+        copy = self._copies.get(len(values))
+        if copy is None:
+            copy = _compile_donated_copy(self._buffer, values)
+            self._copies[len(values)] = copy
+        self._buffer = copy(
+            self._buffer,
+            jnp.asarray(slots, dtype=jnp.int32),
+            *values,
+        )
+        return self._buffer
+
+    def register(self, transfer_id: str, slot: int) -> dict[str, Any]:
+        transfer_uuid = _uuid_to_int(transfer_id)
+        if not self.transfer.register_read(transfer_id, transfer_uuid, [slot]):
+            raise RuntimeError(f"Raiden rejected encoder transfer {transfer_id!r}")
+        return {
+            "transfer_id": transfer_id,
+            "transfer_uuid": transfer_uuid,
+            "transfer_address": self.transfer.endpoints,
+            "transfer_host": self.transfer.host_ip,
+            "transfer_block_ids": [slot],
+        }
 
     def poll(self) -> tuple[list[str], list[str]]:
         sent, _, failed = self.transfer.poll_stats()
@@ -240,16 +242,14 @@ class _RaidenSendPool:
         return sent, failed
 
     def release(self, transfer_id: str) -> None:
-        with self._condition:
-            slot = self._active.pop(transfer_id, None)
-            if slot is not None:
-                self._free.append(slot)
-                self._condition.notify()
+        slot = self._active.pop(transfer_id, None)
+        if slot is not None:
+            self._free.append(slot)
+            self._slots_released.set()
 
     def close(self) -> None:
-        with self._condition:
-            self._closed = True
-            self._condition.notify_all()
+        self._closed = True
+        self._slots_released.set()
 
 
 class RaidenEncoderServerTransfer:
@@ -260,7 +260,6 @@ class RaidenEncoderServerTransfer:
         host_ip: str,
         *,
         parallelism: int = 1,
-        setup_parallelism: int | None = None,
         pool_size: int = 32,
         timeout_s: float = 300.0,
         poll_interval_s: float = 0.001,
@@ -269,19 +268,13 @@ class RaidenEncoderServerTransfer:
         require_raiden_preloaded()
         self._host_ip = host_ip
         self._parallelism = max(1, int(parallelism))
-        self._setup_parallelism = max(
-            1,
-            int(setup_parallelism if setup_parallelism is not None else parallelism),
-        )
         self._pool_size = max(1, int(pool_size))
         self._timeout_s = float(timeout_s)
         self._poll_interval_s = float(poll_interval_s)
         self._log_inflight = bool(log_inflight)
         self._pools: list[_RaidenSendPool] = []
-        self._pool_lock = threading.Lock()
         self._active: dict[str, _RaidenSendPool] = {}
         self._preparing: set[str] = set()
-        self._executor = ThreadPoolExecutor(max_workers=self._setup_parallelism)
 
     async def publish(self, transfer_id: str, embedding: jax.Array) -> dict[str, Any]:
         return (await self.publish_batch([(transfer_id, embedding)]))[0]
@@ -310,19 +303,12 @@ class RaidenEncoderServerTransfer:
 
         self._preparing.update(transfer_ids)
         try:
-            prepared = await asyncio.get_running_loop().run_in_executor(
-                self._executor,
-                self._prepare_batch,
-                items,
-            )
+            prepared = await self._prepare_batch(items)
         finally:
             self._preparing.difference_update(transfer_ids)
-        for transfer_id, (pool, _) in zip(transfer_ids, prepared):
-            self._active[transfer_id] = pool
-            self._log_inflight_event("start", transfer_id)
         return [metadata for _, metadata in prepared]
 
-    def _prepare_batch(
+    async def _prepare_batch(
         self,
         items: list[tuple[str, jax.Array]],
     ) -> list[tuple[_RaidenSendPool, dict[str, Any]]]:
@@ -332,28 +318,45 @@ class RaidenEncoderServerTransfer:
             grouped.setdefault(pool, []).append((index, transfer_id, embedding))
 
         prepared: list[tuple[_RaidenSendPool, dict[str, Any]] | None] = [None] * len(items)
-        for pool, group in grouped.items():
-            metadata = pool.publish_batch(
-                [(transfer_id, embedding) for _, transfer_id, embedding in group]
-            )
-            for (index, _, _), item_metadata in zip(group, metadata):
-                prepared[index] = (pool, item_metadata)
+        reserved: dict[str, _RaidenSendPool] = {}
+        registered: set[str] = set()
+        try:
+            for pool, group in grouped.items():
+                transfer_ids = [transfer_id for _, transfer_id, _ in group]
+                slots = await pool.reserve(transfer_ids)
+                reserved.update((transfer_id, pool) for transfer_id in transfer_ids)
+                staged = pool.copy_batch(
+                    [(transfer_id, embedding) for _, transfer_id, embedding in group],
+                    slots,
+                )
+                while not staged.is_ready():
+                    await asyncio.sleep(0)
+                for (index, transfer_id, _), slot in zip(group, slots):
+                    metadata = pool.register(transfer_id, slot)
+                    registered.add(transfer_id)
+                    self._active[transfer_id] = pool
+                    self._log_inflight_event("start", transfer_id)
+                    prepared[index] = (pool, metadata)
+        except BaseException:
+            for transfer_id, pool in reserved.items():
+                if transfer_id not in registered:
+                    pool.release(transfer_id)
+            raise
         if any(item is None for item in prepared):
             raise RuntimeError("Raiden batch publication returned incomplete metadata")
         return [item for item in prepared if item is not None]
 
     def _pool_for(self, embedding: jax.Array) -> _RaidenSendPool:
-        with self._pool_lock:
-            pool = next((pool for pool in self._pools if pool.matches(embedding)), None)
-            if pool is None:
-                pool = _RaidenSendPool(
-                    self._host_ip,
-                    embedding,
-                    capacity=self._pool_size,
-                    parallelism=self._parallelism,
-                    timeout_s=self._timeout_s,
-                )
-                self._pools.append(pool)
+        pool = next((pool for pool in self._pools if pool.matches(embedding)), None)
+        if pool is None:
+            pool = _RaidenSendPool(
+                self._host_ip,
+                embedding,
+                capacity=self._pool_size,
+                parallelism=self._parallelism,
+                timeout_s=self._timeout_s,
+            )
+            self._pools.append(pool)
         return pool
 
     async def release_completed(self) -> None:
@@ -381,7 +384,6 @@ class RaidenEncoderServerTransfer:
             pool.close()
         for transfer_id in list(self._active):
             self._discard_active(transfer_id, event="close")
-        self._executor.shutdown(cancel_futures=True)
 
     def _discard_active(self, transfer_id: str, *, event: str) -> None:
         if self._active.pop(transfer_id, None) is not None:

@@ -460,7 +460,6 @@ def launch(server_args: ServerArgs) -> None:
             transfer = RaidenEncoderServerTransfer(
                 host_ip,
                 parallelism=server_args.disaggregation_channel_number,
-                setup_parallelism=server_args.encoder_max_batch_size,
                 pool_size=server_args.encoder_transfer_pool_size,
                 timeout_s=server_args.encoder_request_timeout_seconds,
                 log_inflight=server_args.enable_request_time_stats_logging,
