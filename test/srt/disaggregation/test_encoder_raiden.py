@@ -111,7 +111,7 @@ def test_raiden_server_uses_donated_request_pool(monkeypatch):
     buffers, options = session.started
     assert len(buffers) == 1
     assert buffers[0].shape == (2, 4, 3)
-    assert options == {"max_blocks": 1, "num_slots": 2, "timeout_s": 12.0}
+    assert options == {"max_blocks": 2, "num_slots": 2, "timeout_s": 12.0}
     np.testing.assert_array_equal(transfer._pools[0]._buffer[0], first)
     np.testing.assert_array_equal(transfer._pools[0]._buffer[1], second)
     assert transfer._pools[0]._buffer.unsafe_buffer_pointer() == pool_pointer
@@ -219,7 +219,7 @@ def test_raiden_request_receives_into_matching_jax_buffer(monkeypatch):
     assert buffers[0].shape == (2, 2, 3)
     assert buffers[0].dtype == jnp.float32
     assert session.buffer.shape == (2, 2, 3)
-    assert options == {"max_blocks": 1, "num_slots": 2, "timeout_s": 30.0}
+    assert options == {"max_blocks": 2, "num_slots": 2, "timeout_s": 30.0}
     assert transfer.read == (
         "part-0:embedding",
         17,
