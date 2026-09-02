@@ -63,6 +63,11 @@ class PublishedEmbedding:
 class EncoderServerTransfer(Protocol):
     async def publish(self, transfer_id: str, embedding: jax.Array) -> dict[str, Any]: ...
 
+    async def publish_batch(
+        self,
+        items: list[tuple[str, jax.Array]],
+    ) -> list[dict[str, Any]]: ...
+
     async def release_completed(self) -> None: ...
 
     def release(self, transfer_id: str) -> None: ...
@@ -318,11 +323,9 @@ class EncoderRuntime:
             if not pending.future.done()
         ]
         async with self._publish_lock:
-            publish_batch = getattr(self._transfer, "publish_batch", None)
-            if callable(publish_batch) and len(publish_items) > 1:
-                await self._publish_grouped(
+            if len(publish_items) > 1:
+                await self._publish_batch(
                     publish_items,
-                    publish_batch,
                     preprocess_start_ns,
                     encode_done_ns,
                 )
@@ -339,66 +342,22 @@ class EncoderRuntime:
                     )
                 )
 
-    async def _publish_grouped(
+    async def _publish_batch(
         self,
         items: list[tuple[PendingRequest, EncodeResult]],
-        publish_batch: Callable[[list[tuple[str, jax.Array]]], Awaitable[list[dict[str, Any]]]],
-        preprocess_start_ns: int,
-        encode_done_ns: int,
-    ) -> None:
-        try:
-            addresses = await asyncio.gather(
-                *(self._wait_for_receiver(pending.request["req_id"]) for pending, _ in items)
-            )
-        except Exception as exc:
-            for pending, _ in items:
-                if not pending.future.done():
-                    pending.future.set_exception(exc)
-            return
-
-        groups: dict[str, list[tuple[PendingRequest, EncodeResult]]] = defaultdict(list)
-        for address, item in zip(addresses, items):
-            groups[address].append(item)
-        group_size = max(
-            1,
-            int(getattr(self._transfer, "publish_group_size", len(items))),
-        )
-        publish_groups = [
-            group[offset : offset + group_size]
-            for group in groups.values()
-            for offset in range(0, len(group), group_size)
-        ]
-        await asyncio.gather(
-            *(
-                self._publish_group(
-                    group,
-                    publish_batch,
-                    preprocess_start_ns,
-                    encode_done_ns,
-                )
-                for group in publish_groups
-            )
-        )
-
-    async def _publish_group(
-        self,
-        items: list[tuple[PendingRequest, EncodeResult]],
-        publish_batch: Callable[[list[tuple[str, jax.Array]]], Awaitable[list[dict[str, Any]]]],
         preprocess_start_ns: int,
         encode_done_ns: int,
     ) -> None:
         active = [(pending, result) for pending, result in items if not pending.future.done()]
         if not active:
             return
-        transfer_items = [
-            (
-                self._transfer_id(pending.request),
-                result[0],
-            )
-            for pending, result in active
-        ]
         try:
-            transfer_metadata = await publish_batch(transfer_items)
+            await asyncio.gather(
+                *(self._wait_for_receiver(pending.request["req_id"]) for pending, _ in active)
+            )
+            transfer_metadata = await self._transfer.publish_batch(
+                [(self._transfer_id(pending.request), result[0]) for pending, result in active]
+            )
             if len(transfer_metadata) != len(active):
                 raise RuntimeError(
                     f"publish_batch returned {len(transfer_metadata)} results "
@@ -425,7 +384,9 @@ class EncoderRuntime:
             return
 
         for (pending, _), item in zip(active, published):
-            if not pending.future.done():
+            if pending.future.done():
+                self._transfer.release(item.transfer_id)
+            else:
                 pending.future.set_result(item)
 
     async def _publish_pending(

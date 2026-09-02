@@ -62,6 +62,14 @@ class SimEncoderServerTransfer:
         # No transfer endpoints: the receiver reconstructs zeros from shape/dtype.
         return {"transfer_id": transfer_id}
 
+    async def publish_batch(
+        self,
+        items: list[tuple[str, jax.Array]],
+    ) -> list[dict[str, Any]]:
+        return await asyncio.gather(
+            *(self.publish(transfer_id, embedding) for transfer_id, embedding in items)
+        )
+
     async def release_completed(self) -> None:
         # No real sessions to reap; stay alive for the server lifetime.
         while True:

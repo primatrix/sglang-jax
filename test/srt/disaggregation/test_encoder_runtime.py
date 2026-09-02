@@ -183,17 +183,19 @@ def test_runtime_publishes_queue_timing_metadata():
     assert data.processor_start_ns == 2
 
 
-def test_runtime_releases_each_request_when_its_publish_completes():
+def test_runtime_publishes_one_encoder_batch():
     class ControlledTransfer:
         def __init__(self):
-            self.events = {
-                "request-0:0:embedding": asyncio.Event(),
-                "request-1:0:embedding": asyncio.Event(),
-            }
+            self.calls = []
+            self.release_batch = asyncio.Event()
+
+        async def publish_batch(self, items):
+            self.calls.append(items)
+            await self.release_batch.wait()
+            return [{"transfer_id": transfer_id} for transfer_id, _ in items]
 
         async def publish(self, transfer_id, embedding):
-            await self.events[transfer_id].wait()
-            return {"transfer_id": transfer_id}
+            raise AssertionError("multi-request batches must use publish_batch")
 
         async def release_completed(self) -> None:
             pass
@@ -216,36 +218,34 @@ def test_runtime_releases_each_request_when_its_publish_completes():
         ]
         for item in pending:
             item.mark_dequeued()
+            await runtime.register_scheduler_receiver(
+                {"req_id": item.request["req_id"], "receive_url": "127.0.0.1:1234"}
+            )
 
         dispatch = asyncio.create_task(runtime._dispatch_batch(pending))
-        await asyncio.sleep(0)
-        transfer.events["request-0:0:embedding"].set()
-        await asyncio.wait_for(asyncio.shield(pending[0].future), 1)
-
+        async with asyncio.timeout(1):
+            while not transfer.calls:
+                await asyncio.sleep(0)
+        assert len(transfer.calls) == 1
+        assert not pending[0].future.done()
         assert not pending[1].future.done()
         assert not dispatch.done()
 
-        transfer.events["request-1:0:embedding"].set()
+        transfer.release_batch.set()
         await dispatch
-        assert pending[1].future.done()
+        assert all(item.future.done() for item in pending)
 
     asyncio.run(run())
 
 
-def test_runtime_groups_batch_transfer_by_receiver():
+def test_runtime_keeps_copy_batch_across_receivers():
     class BatchTransfer:
         def __init__(self):
             self.calls = []
 
         async def publish_batch(self, items):
             self.calls.append(items)
-            return [
-                {
-                    "transfer_id": "group-0",
-                    "transfer_offset": offset,
-                }
-                for offset in (0, items[0][1].shape[0])
-            ]
+            return [{"transfer_id": transfer_id} for transfer_id, _ in items]
 
         async def publish(self, transfer_id, embedding):
             raise AssertionError("multi-request batches must use publish_batch")
@@ -272,10 +272,13 @@ def test_runtime_groups_batch_transfer_by_receiver():
         pending = [
             PendingRequest({"req_id": f"request-{idx}", "modality": "IMAGE"}) for idx in range(2)
         ]
-        for item in pending:
+        for index, item in enumerate(pending):
             item.mark_dequeued()
             await runtime.register_scheduler_receiver(
-                {"req_id": item.request["req_id"], "receive_url": "127.0.0.1:1234"}
+                {
+                    "req_id": item.request["req_id"],
+                    "receive_url": f"127.0.0.1:{1234 + index}",
+                }
             )
         await runtime._dispatch_batch(pending)
         return transfer, pending
@@ -286,61 +289,10 @@ def test_runtime_groups_batch_transfer_by_receiver():
         "request-0:0:embedding",
         "request-1:0:embedding",
     ]
-    assert [item.future.result().data.transfer_offset for item in pending] == [0, 2]
-    assert {item.future.result().transfer_id for item in pending} == {"group-0"}
-
-
-def test_runtime_publishes_each_bounded_group_as_soon_as_it_is_ready():
-    class StreamingTransfer:
-        publish_group_size = 1
-
-        def __init__(self):
-            self.release_second = asyncio.Event()
-
-        async def publish_batch(self, items):
-            transfer_id, _ = items[0]
-            if transfer_id.startswith("request-1:"):
-                await self.release_second.wait()
-            return [{"transfer_id": transfer_id}]
-
-        async def publish(self, transfer_id, embedding):
-            raise AssertionError("multi-request batches must use publish_batch")
-
-        async def release_completed(self) -> None:
-            pass
-
-        def release(self, transfer_id) -> None:
-            pass
-
-        def close(self) -> None:
-            pass
-
-    async def run() -> None:
-        transfer = StreamingTransfer()
-
-        async def encode(requests):
-            return [(jnp.zeros((2, 3)), {}) for _ in requests]
-
-        runtime = EncoderRuntime(encode, transfer)
-        pending = [
-            PendingRequest({"req_id": f"request-{idx}", "modality": "IMAGE"}) for idx in range(2)
-        ]
-        for item in pending:
-            item.mark_dequeued()
-            await runtime.register_scheduler_receiver(
-                {"req_id": item.request["req_id"], "receive_url": "127.0.0.1:1234"}
-            )
-
-        dispatch = asyncio.create_task(runtime._dispatch_batch(pending))
-        await asyncio.wait_for(asyncio.shield(pending[0].future), 1)
-        assert not pending[1].future.done()
-        assert not dispatch.done()
-
-        transfer.release_second.set()
-        await dispatch
-        assert pending[1].future.done()
-
-    asyncio.run(run())
+    assert [item.future.result().transfer_id for item in pending] == [
+        "request-0:0:embedding",
+        "request-1:0:embedding",
+    ]
 
 
 def test_runtime_reuses_metadata_sender_socket():
