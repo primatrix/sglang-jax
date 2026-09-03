@@ -919,7 +919,9 @@ class Scheduler(
             req_counts[req.dp_rank] += 1
             token_counts[req.dp_rank] += self._estimate_req_tokens(req)
 
-        for req in self._iter_encoder_waiting_reqs():
+        for pending in self.encoder_waiting.values():
+            req = pending.recv_req
+            assert req.dp_rank is not None
             req_counts[req.dp_rank] += 1
             token_counts[req.dp_rank] += self._estimate_req_tokens(req)
 
@@ -1074,7 +1076,9 @@ class Scheduler(
             if req.dp_rank is not None:
                 add(req, req.dp_rank)
 
-        for req in self._iter_encoder_waiting_reqs():
+        for pending in self.encoder_waiting.values():
+            req = pending.recv_req
+            assert req.dp_rank is not None
             add(req, req.dp_rank)
 
         return input_counts, output_counts

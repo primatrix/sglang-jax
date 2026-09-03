@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 from sgl_jax.srt.disaggregation.encoder.client import (
@@ -325,12 +324,3 @@ class SchedulerDisaggregationEncoderMixin:
                             "preprocess_done_ns",
                         ),
                     )
-
-    def _iter_encoder_waiting_reqs(
-        self: Scheduler,
-    ) -> Iterable[TokenizedGenerateReqInput]:
-        """Yield EPD requests that already own a DP rank."""
-        for pending in self.encoder_waiting.values():
-            req = pending.recv_req
-            if req.dp_rank is not None:
-                yield req
