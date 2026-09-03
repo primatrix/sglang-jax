@@ -275,6 +275,7 @@ class ServerArgs:
     encoder_control_timeout_seconds: float = 300.0
     encoder_request_timeout_seconds: float = 300.0
     encoder_max_batch_size: int = 8
+    encoder_batch_coalesce_ms: float = 0.0
     encoder_max_inflight_batches: int = 1
 
     # CPU simulation: replace real device compute (encoder / prefill / decode
@@ -1764,6 +1765,15 @@ class ServerArgs:
             type=int,
             default=ServerArgs.encoder_max_batch_size,
             help="Maximum number of requests in one multimodal Encoder batch.",
+        )
+        parser.add_argument(
+            "--encoder-batch-coalesce-ms",
+            type=float,
+            default=ServerArgs.encoder_batch_coalesce_ms,
+            help=(
+                "Maximum time to collect an underfilled multimodal Encoder batch. "
+                "The deadline is per batch and existing backlog dispatches immediately."
+            ),
         )
         parser.add_argument(
             "--encoder-max-inflight-batches",

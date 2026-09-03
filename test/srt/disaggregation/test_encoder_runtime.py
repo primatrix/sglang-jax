@@ -135,6 +135,71 @@ def test_scheduler_records_enqueue_and_dequeue_timestamps(caplog):
     assert "ENCODER-QUEUE-TIME req_id=request-0" in caplog.text
 
 
+def test_scheduler_coalesces_requests_with_one_bounded_deadline():
+    batches = []
+
+    async def run() -> None:
+        class RecordingRuntime:
+            async def execute_batch(self, requests, on_result):
+                batches.append([request["req_id"] for request in requests])
+                for index, request in enumerate(requests):
+                    on_result(index, _data(request["req_id"]))
+
+            def release(self, transfer_id):
+                pass
+
+        scheduler = DisaggEncoderScheduler(
+            RecordingRuntime(),
+            max_batch_size=4,
+            batch_coalesce_ms=50,
+        )
+        scheduler.start()
+        first = asyncio.create_task(scheduler.submit({"req_id": "request-0", "modality": "IMAGE"}))
+        await asyncio.sleep(0.01)
+        second = asyncio.create_task(scheduler.submit({"req_id": "request-1", "modality": "IMAGE"}))
+        try:
+            await asyncio.gather(first, second)
+        finally:
+            await scheduler.stop()
+
+    asyncio.run(run())
+    assert batches == [["request-0", "request-1"]]
+
+
+def test_scheduler_dispatches_full_batch_without_waiting_for_deadline():
+    batches = []
+
+    async def run() -> None:
+        dispatched = asyncio.Event()
+
+        class RecordingRuntime:
+            async def execute_batch(self, requests, on_result):
+                batches.append([request["req_id"] for request in requests])
+                dispatched.set()
+                for index, request in enumerate(requests):
+                    on_result(index, _data(request["req_id"]))
+
+            def release(self, transfer_id):
+                pass
+
+        scheduler = DisaggEncoderScheduler(
+            RecordingRuntime(),
+            max_batch_size=2,
+            batch_coalesce_ms=500,
+        )
+        first = asyncio.create_task(scheduler.submit({"req_id": "request-0", "modality": "IMAGE"}))
+        second = asyncio.create_task(scheduler.submit({"req_id": "request-1", "modality": "IMAGE"}))
+        scheduler.start()
+        try:
+            await asyncio.wait_for(dispatched.wait(), 0.1)
+            await asyncio.gather(first, second)
+        finally:
+            await scheduler.stop()
+
+    asyncio.run(run())
+    assert batches == [["request-0", "request-1"]]
+
+
 def test_scheduler_pipelines_bounded_inflight_batches():
     started = []
 

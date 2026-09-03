@@ -30,10 +30,8 @@ from sgl_jax.srt.constrained.base_grammar_backend import (
     create_grammar_backend,
 )
 from sgl_jax.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
-from sgl_jax.srt.disaggregation.encoder.client import (
-    EncoderClient,
-    PendingEncoderRequest,
-    create_encoder_client,
+from sgl_jax.srt.disaggregation.encoder.scheduler_mixin import (
+    SchedulerDisaggregationEncoderMixin,
 )
 from sgl_jax.srt.disaggregation.pathways_scheduler import PathwaysPDSchedulerMixin
 from sgl_jax.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
@@ -97,7 +95,6 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     recurrent_admission_blocked,
 )
-from sgl_jax.srt.multimodal.common.modality_enum import build_radix_input_ids
 from sgl_jax.srt.multimodal.manager.multimodal_processor import (
     get_mm_processor,
     import_processors,
@@ -131,10 +128,6 @@ from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
-
-
-def _elapsed_ms(timing: dict[str, int], start: str, end: str) -> float:
-    return max(0, timing[end] - timing[start]) / 1_000_000
 
 
 # Test retract decode for debugging purposes
@@ -224,6 +217,7 @@ class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerProfilerMixin,
     SchedulerMetricsMixin,
+    SchedulerDisaggregationEncoderMixin,
     SchedulerDisaggregationPrefillMixin,
     SchedulerDisaggregationDecodeMixin,
     PathwaysPDSchedulerMixin,
@@ -282,9 +276,6 @@ class Scheduler(
         # resolution) + reqs deferred because no prefill was registered yet.
         self.disagg_prefill_info_cache = None
         self._pd_pending_bootstrap = []
-
-        self.encoder_client: EncoderClient | None = None
-        self.encoder_waiting: dict[str, PendingEncoderRequest] = {}
 
         # LoRA configurations
         self.lora_paths = server_args.lora_paths
@@ -599,8 +590,7 @@ class Scheduler(
             ]
         )
 
-        if server_args.language_only:
-            self.init_encoder_disaggregation()
+        self.init_encoder_disaggregation()
 
         if not server_args.disable_precompile and not self.pd:
             if self.spec_algorithm is None or self.spec_algorithm.is_none():
@@ -889,13 +879,6 @@ class Scheduler(
         """Estimate per-request token load as input + expected output."""
         input_token_len, est_output_tokens = self._estimate_req_input_output_tokens(req)
         return input_token_len + est_output_tokens
-
-    def _iter_encoder_waiting_reqs(self) -> Iterable[TokenizedGenerateReqInput]:
-        """Yield EPD requests that already own a DP rank."""
-        for pending in self.encoder_waiting.values():
-            req = pending.recv_req
-            if req.dp_rank is not None:
-                yield req
 
     def _get_dp_load_snapshot(self) -> tuple[list[int], list[int]]:
         """Return per-DP (request_count, token_count) for in-flight scheduled work."""
@@ -1383,142 +1366,6 @@ class Scheduler(
         for recv_req in recv_reqs:
             output = self._request_dispatcher(recv_req)
             if output is not None:
-                if self._comm_backend is not None:
-                    self._comm_backend.send_pyobj(output)
-                else:
-                    self.send_to_tokenizer.send_pyobj(output)
-
-    def init_encoder_disaggregation(self) -> None:
-        if self.nnodes > 1:
-            raise RuntimeError("encoder disaggregation does not support multi-host schedulers yet")
-        if self._mm_processor is None:
-            raise ValueError("encoder disaggregation requires a multimodal processor")
-        self.encoder_client = create_encoder_client(self.server_args, self.mesh)
-
-    def process_encoder_requests(self, recv_reqs: list) -> list:
-        ready = []
-        now = time.monotonic()
-
-        for recv_req in recv_reqs:
-            if not self._needs_encoder(recv_req):
-                ready.append(recv_req)
-                continue
-            if recv_req.rid in self.encoder_waiting:
-                continue
-
-            try:
-                pending = self.encoder_client.receive(recv_req)
-            except Exception as exc:
-                self._abort_encoder_request(recv_req, str(exc))
-                continue
-
-            self.encoder_waiting[recv_req.rid] = pending
-
-        timeout = self.server_args.encoder_request_timeout_seconds
-        log_poll_time = getattr(
-            self.server_args,
-            "enable_request_time_stats_logging",
-            False,
-        )
-        for rid, pending in list(self.encoder_waiting.items()):
-            recv_req = pending.recv_req
-
-            result = None
-            poll_error = None
-            poll_start_ns = time.monotonic_ns()
-            try:
-                result = pending.poll()
-            except Exception as exc:
-                poll_error = exc
-            poll_duration_ns = time.monotonic_ns() - poll_start_ns
-
-            if log_poll_time:
-                if poll_error is not None:
-                    poll_status = "error"
-                elif result is not None:
-                    poll_status = "ready"
-                else:
-                    poll_status = "pending"
-                logger.info(
-                    "ENCODER-POLL-TIME req_id=%s duration_ns=%d duration_ms=%.3f status=%s",
-                    rid,
-                    poll_duration_ns,
-                    poll_duration_ns / 1_000_000,
-                    poll_status,
-                )
-
-            if poll_error is not None:
-                self._abort_encoder_request(recv_req, str(poll_error))
-                self._remove_encoder_waiting(rid)
-                continue
-
-            if result is not None:
-                try:
-                    self._apply_encoder_result(recv_req, result)
-                except Exception as exc:
-                    self._abort_encoder_request(recv_req, str(exc))
-                else:
-                    ready.append(recv_req)
-                self._remove_encoder_waiting(rid)
-                continue
-
-            if timeout > 0 and now - pending.started_at >= timeout:
-                self._abort_encoder_request(
-                    recv_req,
-                    f"encoder timed out after {timeout}s",
-                )
-                self._remove_encoder_waiting(rid)
-
-        return ready
-
-    def _apply_encoder_result(self, recv_req, result: dict) -> None:
-        embeddings = result.get("embeddings")
-        if embeddings is None:
-            raise ValueError("encoder result contains no embeddings")
-        encoder_timing = result.get("encoder_timing")
-        prompt = recv_req.text if recv_req.text is not None else recv_req.input_ids
-        mm_inputs = self._mm_processor.get_mm_data(
-            prompt,
-            embeddings,
-            **{
-                key: value
-                for key, value in result.items()
-                if key not in ("embeddings", "encoder_timing")
-            },
-        )
-        recv_req.mm_inputs = mm_inputs
-        recv_req.input_ids = mm_inputs.input_ids
-        recv_req.radix_input_ids = build_radix_input_ids(recv_req.input_ids, mm_inputs)
-        recv_req.need_wait_for_mm_inputs = False
-        if encoder_timing:
-            recv_req.encoder_timing = {
-                **encoder_timing,
-                "language_ready_ns": time.time_ns(),
-            }
-
-    @staticmethod
-    def _needs_encoder(recv_req) -> bool:
-        return isinstance(recv_req, TokenizedGenerateReqInput) and bool(
-            recv_req.need_wait_for_mm_inputs
-        )
-
-    def _abort_encoder_request(self, recv_req, error_msg: str) -> None:
-        logger.error("Encoder request failed. rid=%s error=%s", recv_req.rid, error_msg)
-        output = AbortReq(rid=recv_req.rid, aborted_message=error_msg)
-        if self._comm_backend is not None:
-            self._comm_backend.send_pyobj(output)
-        else:
-            self.send_to_tokenizer.send_pyobj(output)
-
-    def _remove_encoder_waiting(self, rid: str) -> None:
-        pending = self.encoder_waiting.pop(rid)
-        pending.close()
-
-    def _cancel_encoder_requests(self, recv_req: AbortReq) -> None:
-        for rid in list(self.encoder_waiting):
-            if recv_req.abort_all or rid.startswith(recv_req.rid):
-                self._remove_encoder_waiting(rid)
-                output = AbortReq(rid=rid)
                 if self._comm_backend is not None:
                     self._comm_backend.send_pyobj(output)
                 else:
@@ -2693,138 +2540,6 @@ class Scheduler(
                 info.output_ids = next_token_ids_flat[
                     dp_rank * per_dp_bs_size : dp_rank * per_dp_bs_size + num_real_reqs
                 ]
-
-    def _mark_encoder_prefill_start(self, batch: ScheduleBatch) -> None:
-        if (
-            not getattr(self.server_args, "enable_request_time_stats_logging", False)
-            or not batch.forward_mode.is_extend()
-        ):
-            return
-
-        prefill_start_ns = time.time_ns()
-        for info in batch.reqs_info:
-            for req in info.reqs or ():
-                timing = getattr(req, "encoder_timing", None)
-                if not timing or "language_prefill_start_ns" in timing:
-                    continue
-                timing["language_prefill_start_ns"] = prefill_start_ns
-
-    def _log_encoder_pipeline_timing(self, batch: ScheduleBatch) -> None:
-        if (
-            not getattr(self.server_args, "enable_request_time_stats_logging", False)
-            or not batch.forward_mode.is_extend()
-        ):
-            return
-
-        prefill_done_ns = time.time_ns()
-        for info in batch.reqs_info:
-            for req in info.reqs or ():
-                timing = getattr(req, "encoder_timing", None)
-                if not timing or "language_prefill_done_ns" in timing:
-                    continue
-                timing["language_prefill_done_ns"] = prefill_done_ns
-                required = (
-                    "enqueue_ns",
-                    "dequeue_ns",
-                    "preprocess_start_ns",
-                    "preprocess_done_ns",
-                    "encode_start_ns",
-                    "encode_done_ns",
-                    "publish_done_ns",
-                    "receive_done_ns",
-                    "language_ready_ns",
-                    "language_prefill_start_ns",
-                    "language_prefill_done_ns",
-                )
-                if not all(name in timing for name in required):
-                    continue
-
-                logger.info(
-                    "ENCODER-PIPELINE-TIME req_id=%s enqueue_ns=%d dequeue_ns=%d "
-                    "preprocess_start_ns=%d preprocess_done_ns=%d encode_start_ns=%d "
-                    "encode_done_ns=%d "
-                    "publish_done_ns=%d receive_done_ns=%d "
-                    "language_ready_ns=%d language_prefill_start_ns=%d "
-                    "language_prefill_done_ns=%d queue_ms=%.3f encode_stage_wait_ms=%.3f "
-                    "preprocess_ms=%.3f encode_wait_ms=%.3f encode_compute_ms=%.3f "
-                    "encode_ms=%.3f "
-                    "publish_ms=%.3f receive_ms=%.3f mm_prepare_ms=%.3f "
-                    "receive_mm_ms=%.3f language_queue_ms=%.3f prefill_ms=%.3f "
-                    "total_to_prefill_ms=%.3f total_to_prefill_done_ms=%.3f",
-                    req.rid,
-                    timing["enqueue_ns"],
-                    timing["dequeue_ns"],
-                    timing["preprocess_start_ns"],
-                    timing["preprocess_done_ns"],
-                    timing["encode_start_ns"],
-                    timing["encode_done_ns"],
-                    timing["publish_done_ns"],
-                    timing["receive_done_ns"],
-                    timing["language_ready_ns"],
-                    timing["language_prefill_start_ns"],
-                    timing["language_prefill_done_ns"],
-                    _elapsed_ms(timing, "enqueue_ns", "dequeue_ns"),
-                    _elapsed_ms(timing, "dequeue_ns", "preprocess_start_ns"),
-                    _elapsed_ms(timing, "preprocess_start_ns", "preprocess_done_ns"),
-                    _elapsed_ms(timing, "preprocess_done_ns", "encode_start_ns"),
-                    _elapsed_ms(timing, "encode_start_ns", "encode_done_ns"),
-                    _elapsed_ms(timing, "dequeue_ns", "encode_done_ns"),
-                    _elapsed_ms(timing, "encode_done_ns", "publish_done_ns"),
-                    _elapsed_ms(timing, "publish_done_ns", "receive_done_ns"),
-                    _elapsed_ms(timing, "receive_done_ns", "language_ready_ns"),
-                    _elapsed_ms(timing, "publish_done_ns", "language_ready_ns"),
-                    _elapsed_ms(timing, "language_ready_ns", "language_prefill_start_ns"),
-                    _elapsed_ms(
-                        timing,
-                        "language_prefill_start_ns",
-                        "language_prefill_done_ns",
-                    ),
-                    _elapsed_ms(timing, "enqueue_ns", "language_prefill_start_ns"),
-                    _elapsed_ms(timing, "enqueue_ns", "language_prefill_done_ns"),
-                )
-
-                preprocess_fields = (
-                    "dispatch_start_ns",
-                    "preprocess_request_start_ns",
-                    "image_load_start_ns",
-                    "image_load_done_ns",
-                    "processor_submit_ns",
-                    "processor_start_ns",
-                    "processor_done_ns",
-                    "preprocess_request_done_ns",
-                )
-                if all(name in timing for name in preprocess_fields):
-                    logger.info(
-                        "ENCODER-PREPROCESS-TIME req_id=%s dispatch_ms=%.3f "
-                        "admission_ms=%.3f image_load_ms=%.3f processor_queue_ms=%.3f "
-                        "processor_ms=%.3f finalize_ms=%.3f request_total_ms=%.3f "
-                        "batch_tail_ms=%.3f",
-                        req.rid,
-                        _elapsed_ms(timing, "dispatch_start_ns", "enqueue_ns"),
-                        _elapsed_ms(
-                            timing,
-                            "preprocess_start_ns",
-                            "preprocess_request_start_ns",
-                        ),
-                        _elapsed_ms(timing, "image_load_start_ns", "image_load_done_ns"),
-                        _elapsed_ms(timing, "processor_submit_ns", "processor_start_ns"),
-                        _elapsed_ms(timing, "processor_start_ns", "processor_done_ns"),
-                        _elapsed_ms(
-                            timing,
-                            "processor_done_ns",
-                            "preprocess_request_done_ns",
-                        ),
-                        _elapsed_ms(
-                            timing,
-                            "preprocess_request_start_ns",
-                            "preprocess_request_done_ns",
-                        ),
-                        _elapsed_ms(
-                            timing,
-                            "preprocess_request_done_ns",
-                            "preprocess_done_ns",
-                        ),
-                    )
 
     def run_batch(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run a batch."""

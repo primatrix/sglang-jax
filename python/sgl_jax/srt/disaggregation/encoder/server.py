@@ -265,6 +265,7 @@ class EncoderServer:
         advertise_url: str | None = None,
         bootstrap_timeout: float = 5.0,
         max_batch_size: int = 8,
+        batch_coalesce_ms: float = 0.0,
         max_inflight_batches: int = 1,
         request_timeout: float | None = 300.0,
         network_rtt_ms: float = 0.0,
@@ -279,6 +280,7 @@ class EncoderServer:
         self.scheduler = DisaggEncoderScheduler(
             self.runtime,
             max_batch_size=max_batch_size,
+            batch_coalesce_ms=batch_coalesce_ms,
             max_inflight_batches=max_inflight_batches,
             request_timeout=request_timeout,
             log_queue_timing=log_queue_timing,
@@ -544,6 +546,7 @@ def launch(server_args: ServerArgs) -> None:
             advertise_url=advertise_url,
             bootstrap_timeout=control_timeout if control_timeout > 0 else 5.0,
             max_batch_size=server_args.encoder_max_batch_size,
+            batch_coalesce_ms=server_args.encoder_batch_coalesce_ms,
             max_inflight_batches=server_args.encoder_max_inflight_batches,
             request_timeout=server_args.encoder_request_timeout_seconds,
             network_rtt_ms=(

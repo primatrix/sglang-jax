@@ -24,8 +24,11 @@ from sgl_jax.srt.disaggregation.encoder.embedding_data import (
 from sgl_jax.srt.disaggregation.encoder.raiden import (
     RaidenEncoderServerTransfer,
     RaidenReceiverBackend,
+)
+from sgl_jax.srt.disaggregation.encoder.raiden_pool import (
+    RaidenReceivePool,
     RaidenReceiveSession,
-    _RaidenReceivePool,
+    RaidenSendPool,
 )
 from sgl_jax.srt.managers.io_struct import TokenizedGenerateReqInput
 from sgl_jax.srt.multimodal.common.modality_enum import Modality
@@ -110,7 +113,7 @@ def test_raiden_loader_recognizes_encoder_backend():
 def test_raiden_server_uses_donated_request_pool(monkeypatch):
     _FakeRaidenWrapper.instances.clear()
     monkeypatch.setattr(
-        "sgl_jax.srt.disaggregation.encoder.raiden.RaidenTransferWrapper",
+        "sgl_jax.srt.disaggregation.encoder.raiden_pool.RaidenTransferWrapper",
         _FakeRaidenWrapper,
     )
     transfer = RaidenEncoderServerTransfer(
@@ -123,6 +126,7 @@ def test_raiden_server_uses_donated_request_pool(monkeypatch):
     second = first + 20
 
     first_metadata = asyncio.run(_publish(transfer, "part-0:embedding", first))
+    assert isinstance(transfer._pools[0], RaidenSendPool)
     pool_pointer = transfer._pools[0]._buffer.unsafe_buffer_pointer()
     second_metadata = asyncio.run(_publish(transfer, "part-1:embedding", second))
 
@@ -148,7 +152,7 @@ def test_raiden_server_uses_donated_request_pool(monkeypatch):
 def test_raiden_server_backpressures_when_pool_is_full(monkeypatch):
     _FakeRaidenWrapper.instances.clear()
     monkeypatch.setattr(
-        "sgl_jax.srt.disaggregation.encoder.raiden.RaidenTransferWrapper",
+        "sgl_jax.srt.disaggregation.encoder.raiden_pool.RaidenTransferWrapper",
         _FakeRaidenWrapper,
     )
     transfer = RaidenEncoderServerTransfer("10.0.0.4", pool_size=1)
@@ -168,7 +172,7 @@ def test_raiden_server_backpressures_when_pool_is_full(monkeypatch):
 def test_raiden_server_reaps_completed_sender(monkeypatch):
     _FakeRaidenWrapper.instances.clear()
     monkeypatch.setattr(
-        "sgl_jax.srt.disaggregation.encoder.raiden.RaidenTransferWrapper",
+        "sgl_jax.srt.disaggregation.encoder.raiden_pool.RaidenTransferWrapper",
         _FakeRaidenWrapper,
     )
     transfer = RaidenEncoderServerTransfer("10.0.0.4")
@@ -192,7 +196,7 @@ def test_raiden_server_reaps_completed_sender(monkeypatch):
 def test_raiden_request_receives_into_matching_jax_buffer(monkeypatch):
     _FakeRaidenWrapper.instances.clear()
     monkeypatch.setattr(
-        "sgl_jax.srt.disaggregation.encoder.raiden.RaidenTransferWrapper",
+        "sgl_jax.srt.disaggregation.encoder.raiden_pool.RaidenTransferWrapper",
         _FakeRaidenWrapper,
     )
     register_future: Future[None] = Future()
@@ -260,7 +264,7 @@ def test_raiden_request_receives_into_matching_jax_buffer(monkeypatch):
 def test_raiden_receiver_reuses_manager_and_pool_blocks(monkeypatch):
     _FakeRaidenWrapper.instances.clear()
     monkeypatch.setattr(
-        "sgl_jax.srt.disaggregation.encoder.raiden.RaidenTransferWrapper",
+        "sgl_jax.srt.disaggregation.encoder.raiden_pool.RaidenTransferWrapper",
         _FakeRaidenWrapper,
     )
     backend = RaidenReceiverBackend(
@@ -331,7 +335,7 @@ def test_raiden_receive_poll_does_not_wait_for_device_copy(monkeypatch):
 
     transfer_id = "part-0:embedding"
     pending_copy = PendingCopy()
-    pool = object.__new__(_RaidenReceivePool)
+    pool = object.__new__(RaidenReceivePool)
     pool._sharding = jax.sharding.SingleDeviceSharding(jax.local_devices()[0])
     pool._shape = (2, 3)
     pool._block_shape = (2, 2, 8, 128)
@@ -347,7 +351,7 @@ def test_raiden_receive_poll_does_not_wait_for_device_copy(monkeypatch):
     pool._failed = set()
 
     monkeypatch.setattr(
-        "sgl_jax.srt.disaggregation.encoder.raiden.jax.device_put",
+        "sgl_jax.srt.disaggregation.encoder.raiden_pool.jax.device_put",
         lambda *_args, **_kwargs: pending_copy,
     )
     session = RaidenReceiveSession(transfer_id=transfer_id, lane_id=0, pool=pool)

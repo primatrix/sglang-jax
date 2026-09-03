@@ -39,12 +39,14 @@ class DisaggEncoderScheduler:
         self,
         runtime: EncoderRuntime,
         max_batch_size: int = 8,
+        batch_coalesce_ms: float = 0.0,
         request_timeout: float | None = 300.0,
         log_queue_timing: bool = False,
         max_inflight_batches: int = 1,
     ) -> None:
         self._runtime = runtime
         self._max_batch_size = max(1, int(max_batch_size))
+        self._batch_coalesce_s = max(0.0, float(batch_coalesce_ms)) / 1000.0
         self._max_inflight_batches = max(1, int(max_inflight_batches))
         self._request_timeout = request_timeout
         self._log_queue_timing = log_queue_timing
@@ -89,17 +91,29 @@ class DisaggEncoderScheduler:
 
     async def _collect_batch(self) -> list[_PendingRequest]:
         first = await self._pending_queue.get()
-        first.dequeue_ns = time.time_ns()
-        first.queue_duration_ns = max(0, time.monotonic_ns() - first._enqueue_mono_ns)
         batch = [first]
+        deadline = asyncio.get_running_loop().time() + self._batch_coalesce_s
         while len(batch) < self._max_batch_size:
             try:
                 pending = self._pending_queue.get_nowait()
             except asyncio.QueueEmpty:
-                break
-            pending.dequeue_ns = time.time_ns()
-            pending.queue_duration_ns = max(0, time.monotonic_ns() - pending._enqueue_mono_ns)
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    pending = await asyncio.wait_for(
+                        self._pending_queue.get(),
+                        timeout=remaining,
+                    )
+                except TimeoutError:
+                    break
             batch.append(pending)
+
+        dequeue_ns = time.time_ns()
+        dequeue_mono_ns = time.monotonic_ns()
+        for pending in batch:
+            pending.dequeue_ns = dequeue_ns
+            pending.queue_duration_ns = max(0, dequeue_mono_ns - pending._enqueue_mono_ns)
 
         if self._log_queue_timing:
             queue_depth = self._pending_queue.qsize()
