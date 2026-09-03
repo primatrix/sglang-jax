@@ -281,7 +281,9 @@ class ModelWorkerClient:
             penalizer_orchestrator=None,
         )
 
-        if sampling_metadata is None:
+        if sampling_metadata is None and not self.worker._use_simulated_sampling(
+            model_worker_batch
+        ):
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
                 model_worker_batch,
                 0,

@@ -14,20 +14,18 @@ import jax
 import jax.profiler
 import numpy as np
 import uvicorn
+import zmq.asyncio
 from fastapi import FastAPI
 from fastapi.responses import Response
+from zmq.constants import LINGER, PUSH
 
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.disaggregation.encoder.bootstrap import EncoderBootstrapClient
+from sgl_jax.srt.disaggregation.encoder.embedding_data import EmbeddingData
 from sgl_jax.srt.disaggregation.encoder.raiden import RaidenEncoderServerTransfer
-from sgl_jax.srt.disaggregation.encoder.runtime import (
-    BatchEncodeFn,
-    BatchEncodePreprocessedFn,
-    BatchPreprocessFn,
-    EncoderRuntime,
-    EncoderServerTransfer,
-)
+from sgl_jax.srt.disaggregation.encoder.runtime import EncoderRuntime
+from sgl_jax.srt.disaggregation.encoder.scheduler import DisaggEncoderScheduler
 from sgl_jax.srt.disaggregation.encoder.sim_transfer import SimEncoderServerTransfer
 from sgl_jax.srt.disaggregation.host_ip import resolve_host_ip
 from sgl_jax.srt.hf_transformers_utils import (
@@ -78,7 +76,7 @@ class MMEncoder:
         if not self.model_config.is_multimodal:
             raise ValueError("--encoder-only requires an in-model multimodal architecture")
 
-        # CPU simulation: skip the real vision encoder forward in ``encode_batch``
+        # CPU simulation: skip the real vision encoder forward in ``encode``
         # and emit a modeled sleep + zero embedding of the correct shape/dtype.
         self._simulate_compute = server_args.simulate_compute
         self._sim_encoder_base_ms = server_args.simulate_compute_encoder_base_ms
@@ -89,7 +87,7 @@ class MMEncoder:
         config.vision_encoder_parallel = server_args.vision_encoder_parallel
         config.precompile_vision_patch_paddings = server_args.precompile_vision_patch_paddings
         if self._simulate_compute:
-            # encode_batch replaces get_feature() with a sleep + zeros, so the
+            # ``encode()`` replaces get_feature() with a sleep + zeros, so the
             # vision tower is never executed — don't build it or allocate weights.
             self.model = None
         else:
@@ -125,12 +123,7 @@ class MMEncoder:
         self.mm_processor = get_mm_processor(config, server_args, processor)
         self.tokenizer = get_tokenizer_from_processor(processor)
 
-    async def encode_batch(
-        self, requests: list[dict[str, Any]]
-    ) -> list[tuple[jax.Array, dict[str, Any]]]:
-        return await self.encode_preprocessed(await self.preprocess_batch(requests))
-
-    async def preprocess_batch(self, requests: list[dict[str, Any]]) -> PreparedEncoderBatch:
+    async def preprocess(self, requests: list[dict[str, Any]]) -> PreparedEncoderBatch:
         if not requests:
             raise ValueError("MMEncoder batches must not be empty")
         modality = Modality.from_str(requests[0]["modality"])
@@ -143,9 +136,7 @@ class MMEncoder:
         processed, timings = map(list, zip(*prepared))
         return PreparedEncoderBatch(modality, processed, timings, time.time_ns())
 
-    async def encode_preprocessed(
-        self, batch: PreparedEncoderBatch
-    ) -> list[tuple[jax.Array, dict[str, Any]]]:
+    def encode(self, batch: PreparedEncoderBatch) -> list[tuple[jax.Array, dict[str, Any]]]:
         modality = batch.modality
         processed = batch.inputs
         encode_start_ns = time.time_ns()
@@ -162,7 +153,7 @@ class MMEncoder:
                     self._sim_encoder_base_ms + self._sim_encoder_ms_per_token * token_count_total
                 )
                 if sleep_ms > 0:
-                    await asyncio.sleep(sleep_ms / 1000.0)
+                    time.sleep(sleep_ms / 1000.0)
             packed = np.zeros(
                 (token_count_total, self.model_config.hidden_size),
                 dtype=self.model_config.dtype,
@@ -175,7 +166,6 @@ class MMEncoder:
                 if get_feature is None:
                     raise ValueError(f"model has no {modality.name} encoder")
                 packed = get_feature(items)
-                jax.block_until_ready(packed)
         encode_done_ns = time.time_ns()
 
         encoder_timing = {
@@ -268,10 +258,8 @@ class MMEncoder:
 class EncoderServer:
     def __init__(
         self,
-        batch_encode_fn: BatchEncodeFn,
-        transfer: EncoderServerTransfer,
-        batch_preprocess_fn: BatchPreprocessFn | None = None,
-        batch_encode_preprocessed_fn: BatchEncodePreprocessedFn | None = None,
+        encoder: MMEncoder,
+        transfer: Any,
         receiver_timeout: float | None = 300.0,
         encoder_register_urls: list[str] | None = None,
         advertise_url: str | None = None,
@@ -287,17 +275,20 @@ class EncoderServer:
             raise ValueError("encoder_register_urls and advertise_url must be configured together")
 
         self._network_rtt_s = max(0.0, float(network_rtt_ms)) / 1000.0
-        self.runtime = EncoderRuntime(
-            batch_encode_fn,
-            transfer,
-            batch_preprocess_fn=batch_preprocess_fn,
-            batch_encode_preprocessed_fn=batch_encode_preprocessed_fn,
-            receiver_timeout=receiver_timeout,
+        self.runtime = EncoderRuntime(encoder, transfer)
+        self.scheduler = DisaggEncoderScheduler(
+            self.runtime,
             max_batch_size=max_batch_size,
             max_inflight_batches=max_inflight_batches,
             request_timeout=request_timeout,
             log_queue_timing=log_queue_timing,
         )
+        self._zmq = zmq.asyncio.Context.instance()
+        self._receiver_timeout = receiver_timeout
+        self._receiver_addresses: dict[str, str] = {}
+        self._receiver_events: dict[str, asyncio.Event] = {}
+        self._receiver_sockets: dict[str, zmq.asyncio.Socket] = {}
+        self._notify_lock = asyncio.Lock()
 
         @asynccontextmanager
         async def lifespan(_: FastAPI):
@@ -316,12 +307,12 @@ class EncoderServer:
                         advertise_url.rstrip("/"),
                     )
                 )
-            self.runtime.start()
+            self.start()
             try:
                 yield
             finally:
                 try:
-                    await self.runtime.stop()
+                    await self.stop()
                 finally:
                     if registration_task is not None:
                         registration_task.cancel()
@@ -346,6 +337,23 @@ class EncoderServer:
         self.app.add_api_route("/start_profile", self.start_profile, methods=["POST"])
         self.app.add_api_route("/stop_profile", self.stop_profile, methods=["POST"])
         self.app.add_api_route("/profile_status", self.profile_status, methods=["GET"])
+
+    def start(self) -> None:
+        self.runtime.start()
+        self.scheduler.start()
+
+    async def stop(self) -> None:
+        try:
+            await self.scheduler.stop()
+        finally:
+            try:
+                await self.runtime.stop()
+            finally:
+                for socket in self._receiver_sockets.values():
+                    socket.close()
+                self._receiver_sockets.clear()
+                self._receiver_events.clear()
+                self._receiver_addresses.clear()
 
     @staticmethod
     async def _register_with_bootstraps(
@@ -392,20 +400,73 @@ class EncoderServer:
         self,
         request: dict[str, Any],
     ) -> dict[str, Any]:
-        return await self.runtime.register_scheduler_receiver(request)
+        req_id = request["req_id"]
+        self._receiver_addresses[req_id] = request["receive_url"]
+        self._receiver_events.setdefault(req_id, asyncio.Event()).set()
+        return {"req_id": req_id}
 
     async def encode(self, request: dict[str, Any]) -> dict[str, Any]:
         # Model the language->encoder network hop (loopback has none).
         if self._network_rtt_s:
             await asyncio.sleep(self._network_rtt_s)
-        return await self.runtime.submit(request)
+        try:
+            data = await self.scheduler.submit(request)
+        except Exception as exc:
+            try:
+                req_id = request["req_id"]
+                await self.send_to_scheduler(
+                    req_id,
+                    EmbeddingData(
+                        req_id=req_id,
+                        num_parts=request.get("num_parts", 1),
+                        part_idx=request.get("part_idx", 0),
+                        grid_dim=None,
+                        modality=Modality.from_str(request["modality"]),
+                        error_msg=str(exc),
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "Encoder error delivery failed. req_id=%s",
+                    request.get("req_id"),
+                )
+            raise
+
+        try:
+            await self.send_to_scheduler(data.req_id, data)
+        except Exception:
+            self.runtime.release(data.transfer_id)
+            raise
+        # The response is only an ACK. Metadata travels over ZMQ and the
+        # embedding itself travels over the configured transfer backend.
+        return {"req_id": request["req_id"]}
+
+    async def send_to_scheduler(self, req_id: str, data: EmbeddingData) -> None:
+        try:
+            event = self._receiver_events.setdefault(req_id, asyncio.Event())
+            if self._receiver_timeout is None or self._receiver_timeout <= 0:
+                await event.wait()
+            else:
+                await asyncio.wait_for(event.wait(), self._receiver_timeout)
+            address = self._receiver_addresses[req_id]
+            async with self._notify_lock:
+                socket = self._receiver_sockets.get(address)
+                if socket is None:
+                    socket = self._zmq.socket(PUSH)
+                    socket.setsockopt(LINGER, 1000)
+                    socket.connect(f"tcp://{address}")
+                    self._receiver_sockets[address] = socket
+                await socket.send_pyobj(data)
+        finally:
+            self._receiver_events.pop(req_id, None)
+            self._receiver_addresses.pop(req_id, None)
 
     async def start_profile(self, request: dict[str, Any] | None = None) -> dict[str, Any]:
         """Arm a jax.profiler trace on the encoder process.
 
-        The encoder has no Scheduler (so no SchedulerProfilerMixin); this is the
-        minimal endpoint that lets the EPD driver capture the encoder tier
-        alongside the language server's prefill/decode traces.
+        The encoder batch scheduler has no SchedulerProfilerMixin; this minimal
+        endpoint lets the EPD driver capture the encoder tier alongside the
+        language server's prefill/decode traces.
         """
         request = request or {}
         if self._trace_active:
@@ -453,7 +514,11 @@ def launch(server_args: ServerArgs) -> None:
             transfer = SimEncoderServerTransfer(
                 setup_ms=server_args.simulate_transfer_setup_ms,
                 parallelism=server_args.disaggregation_channel_number,
-                setup_parallelism=server_args.encoder_max_batch_size,
+                pool_size=server_args.encoder_transfer_pool_size,
+                timeout_s=server_args.encoder_request_timeout_seconds,
+                ms_per_mb=server_args.simulate_transfer_ms_per_mb,
+                rtt_ms=server_args.simulate_network_rtt_ms,
+                log_inflight=server_args.enable_request_time_stats_logging,
             )
         else:
             host_ip = resolve_host_ip(server_args.disaggregation_host_ip)
@@ -472,10 +537,8 @@ def launch(server_args: ServerArgs) -> None:
         )
         control_timeout = server_args.encoder_control_timeout_seconds
         server = EncoderServer(
-            encoder.encode_batch,
+            encoder,
             transfer,
-            batch_preprocess_fn=encoder.preprocess_batch,
-            batch_encode_preprocessed_fn=encoder.encode_preprocessed,
             receiver_timeout=server_args.encoder_request_timeout_seconds,
             encoder_register_urls=server_args.encoder_register_urls,
             advertise_url=advertise_url,

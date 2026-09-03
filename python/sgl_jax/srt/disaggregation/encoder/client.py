@@ -3,10 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-import threading
 import time
 from collections import deque
-from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -107,89 +106,6 @@ def register_scheduler_receiver(
     response.raise_for_status()
 
 
-def submit_scheduler_receiver_registrations(
-    executor: ThreadPoolExecutor,
-    registrations: list[tuple[str, str, Modality | None]],
-    receive_url: str,
-    client: httpx.Client,
-) -> Future[None]:
-    """Submit independent encoder registrations and aggregate their futures."""
-    combined: Future[None] = Future()
-    children: list[Future[None]] = []
-    lock = threading.Lock()
-    remaining = len(registrations)
-    first_exception: BaseException | None = None
-    child_cancelled = False
-
-    if remaining == 0:
-        combined.set_result(None)
-        return combined
-
-    def finish(child: Future[None]) -> None:
-        nonlocal child_cancelled, first_exception, remaining
-        action = None
-        with lock:
-            remaining -= 1
-            if combined.done():
-                return
-            if child.cancelled():
-                child_cancelled = True
-            else:
-                exception = child.exception()
-                if exception is not None and first_exception is None:
-                    first_exception = exception
-
-            # Match the old gather(return_exceptions=True) behavior: let every
-            # registration finish before surfacing the first failure.
-            if remaining != 0:
-                return
-            if child_cancelled:
-                action = ("cancel", None)
-            elif first_exception is not None:
-                action = ("exception", first_exception)
-            else:
-                action = ("result", None)
-
-        # ``combined.cancel()`` invokes callbacks synchronously, so complete it
-        # outside ``lock`` to avoid re-entering ``finish`` while cancelling peers.
-        try:
-            if action is None:
-                return
-            kind, value = action
-            if kind == "cancel":
-                combined.cancel()
-            elif kind == "exception":
-                combined.set_exception(value)
-            else:
-                combined.set_result(None)
-        except InvalidStateError:
-            # A caller may cancel the aggregate between the done check and the
-            # completion above. Its cancellation already represents the result.
-            pass
-
-    def cancel_children(done: Future[None]) -> None:
-        if done.cancelled():
-            for child in children:
-                child.cancel()
-
-    combined.add_done_callback(cancel_children)
-    try:
-        for registration in registrations:
-            child = executor.submit(
-                register_scheduler_receiver,
-                registration,
-                receive_url,
-                client,
-            )
-            children.append(child)
-            child.add_done_callback(finish)
-    except Exception:
-        for child in children:
-            child.cancel()
-        raise
-    return combined
-
-
 def validate_encoder_response(
     data: Any,
     expected_num_parts: int,
@@ -208,32 +124,50 @@ def validate_encoder_response(
         raise RuntimeError(data.error_msg)
 
 
-def build_encoder_result(accumulator: MultiModalEmbeddingData) -> dict[str, Any]:
-    timing = accumulator.get_timing_meta()
-    timing["receive_done_ns"] = time.time_ns()
-    return {
-        "embeddings": accumulator.get_embedding(is_concat=True),
-        "encoder_timing": timing,
-        **accumulator.get_mm_extra_meta(),
-    }
-
-
 class EncoderReceiveSession(Protocol):
     def poll(self) -> jax.Array | None: ...
 
     def close(self) -> None: ...
 
 
+class DeferredReceiveSession:
+    """Expose a non-blocking session while backend setup runs off-loop."""
+
+    def __init__(self, future: Future[EncoderReceiveSession]) -> None:
+        self._future = future
+        self._session: EncoderReceiveSession | None = None
+        self._closed = False
+
+    def poll(self) -> jax.Array | None:
+        if self._closed:
+            return None
+        if self._session is None:
+            if not self._future.done():
+                return None
+            self._session = self._future.result()
+        return self._session.poll()
+
+    def close(self) -> None:
+        self._closed = True
+        if self._session is not None:
+            self._session.close()
+        elif not self._future.cancel():
+            self._future.add_done_callback(self._close_session)
+
+    @staticmethod
+    def _close_session(future: Future[EncoderReceiveSession]) -> None:
+        if future.cancelled():
+            return
+        try:
+            future.result().close()
+        except Exception:
+            logger.exception("Deferred encoder receiver setup failed during cleanup")
+
+
 class EncoderReceiverBackend(Protocol):
     def start(self, data: EmbeddingData) -> EncoderReceiveSession: ...
 
     def close(self) -> None: ...
-
-
-class EncoderMetadataReceiver(Protocol):
-    def poll(self, req_ids: tuple[str, ...]) -> Any | None: ...
-
-    def unregister(self, req_ids: tuple[str, ...]) -> None: ...
 
 
 class EncoderMetadataRouter:
@@ -281,9 +215,9 @@ class EncoderMetadataRouter:
 class PendingEncoderRequest:
     recv_req: TokenizedGenerateReqInput
     started_at: float
-    metadata_router: EncoderMetadataReceiver
+    metadata_router: EncoderMetadataRouter
     metadata_req_ids: tuple[str, ...]
-    register_future: Future[None]
+    registration_futures: tuple[Future[None], ...]
     accumulator: MultiModalEmbeddingData
     backend: EncoderReceiverBackend
     # Keep each part's metadata alongside its in-flight transfer session so the
@@ -291,15 +225,26 @@ class PendingEncoderRequest:
     sessions: dict[int, tuple[EmbeddingData, EncoderReceiveSession]] = field(default_factory=dict)
 
     def poll(self) -> dict[str, Any] | None:
-        if self.register_future.done():
-            self.register_future.result()  # error re-thrown to the scheduler main thread
+        for future in self.registration_futures:
+            if future.done():
+                future.result()  # error re-thrown to the scheduler main thread
 
         # The ZMQ message contains EmbeddingData metadata (part identity,
         # shape/dtype, and transfer endpoints); the backend pulls the actual
-        # embedding separately in _start_receive().
+        # embedding separately through the receiver backend.
         data = self.metadata_router.poll(self.metadata_req_ids)
         if data is not None:
-            self._start_receive(data)
+            validate_encoder_response(
+                data,
+                self.accumulator.num_parts,
+                set(self.sessions),
+                {
+                    part_idx
+                    for part_idx in range(self.accumulator.num_parts)
+                    if self.accumulator.has_part(part_idx)
+                },
+            )
+            self.sessions[data.part_idx] = (data, self.backend.start(data))
 
         for part_idx, (part_data, session) in list(self.sessions.items()):
             embedding = session.poll()
@@ -311,23 +256,17 @@ class PendingEncoderRequest:
 
         if not self.accumulator.ready:
             return None
-        return build_encoder_result(self.accumulator)
-
-    def _start_receive(self, data: Any) -> None:
-        validate_encoder_response(
-            data,
-            self.accumulator.num_parts,
-            set(self.sessions),
-            {
-                part_idx
-                for part_idx in range(self.accumulator.num_parts)
-                if self.accumulator.has_part(part_idx)
-            },
-        )
-        self.sessions[data.part_idx] = (data, self.backend.start(data))
+        timing = self.accumulator.get_timing_meta()
+        timing["receive_done_ns"] = time.time_ns()
+        return {
+            "embeddings": self.accumulator.get_embedding(is_concat=True),
+            "encoder_timing": timing,
+            **self.accumulator.get_mm_extra_meta(),
+        }
 
     def close(self) -> None:
-        self.register_future.cancel()
+        for future in self.registration_futures:
+            future.cancel()
         for _, session in self.sessions.values():
             session.close()
         self.sessions.clear()
@@ -340,12 +279,12 @@ class EncoderClient:
         host: str,
         backend: EncoderReceiverBackend,
         encoder_urls: list[str],
-        executor: ThreadPoolExecutor,
+        registration_workers: int,
         registration_timeout: float | None,
     ) -> None:
         self._backend = backend
         self._encoder_urls = list(encoder_urls)
-        self._executor = executor
+        self._executor = ThreadPoolExecutor(max_workers=max(1, registration_workers))
         self._registration_client = httpx.Client(timeout=registration_timeout)
         self._metadata_router = EncoderMetadataRouter(host)
 
@@ -353,14 +292,20 @@ class EncoderClient:
         registrations = plan_encoder_registrations(request, self._encoder_urls)
         metadata_req_ids = tuple(registration[1] for registration in registrations)
         self._metadata_router.register(metadata_req_ids)
+        registration_futures = []
         try:
-            register_future = submit_scheduler_receiver_registrations(
-                self._executor,
-                registrations,
-                self._metadata_router.receive_url,
-                self._registration_client,
-            )
+            for registration in registrations:
+                registration_futures.append(
+                    self._executor.submit(
+                        register_scheduler_receiver,
+                        registration,
+                        self._metadata_router.receive_url,
+                        self._registration_client,
+                    )
+                )
         except Exception:
+            for future in registration_futures:
+                future.cancel()
             self._metadata_router.unregister(metadata_req_ids)
             raise
         return PendingEncoderRequest(
@@ -368,7 +313,7 @@ class EncoderClient:
             started_at=time.monotonic(),
             metadata_router=self._metadata_router,
             metadata_req_ids=metadata_req_ids,
-            register_future=register_future,
+            registration_futures=tuple(registration_futures),
             accumulator=MultiModalEmbeddingData(len(registrations)),
             backend=self._backend,
         )
@@ -394,7 +339,97 @@ class EncoderRequestDispatcher:
     ) -> tuple[dict[Modality, list[int]], asyncio.Task[None]]:
         if self._client is None:
             self._client = httpx.AsyncClient(timeout=self._timeout)
-        return dispatch_encoder_request(request, encoder_urls, self._client)
+        client = self._client
+
+        dispatch_start_ns = time.time_ns()
+        items_by_modality = {}
+        for name, modality in (
+            ("image_data", Modality.IMAGE),
+            ("video_data", Modality.VIDEO),
+            ("audio_data", Modality.AUDIO),
+        ):
+            data = getattr(request, name, None)
+            if data is None:
+                continue
+            items = []
+            for item in flatten_nested_list(data):
+                if item is None:
+                    continue
+                if isinstance(item, ImageData):
+                    item = item.url
+                elif isinstance(item, dict) and "url" in item:
+                    item = item["url"]
+                items.append(item)
+            if items:
+                items_by_modality[modality] = items
+
+        assignments = {}
+        encoder_indices = list(range(len(encoder_urls)))
+        random.shuffle(encoder_indices)
+        offset = 0
+        for modality, items in items_by_modality.items():
+            base, remainder = divmod(len(items), len(encoder_urls))
+            counts = [base] * len(encoder_urls)
+            for index in range(remainder):
+                counts[encoder_indices[(offset + index) % len(encoder_urls)]] += 1
+            assignments[modality] = counts
+            offset = (offset + remainder) % len(encoder_urls)
+
+        num_parts = sum(count > 0 for counts in assignments.values() for count in counts)
+        encode_requests = []
+        for modality, counts in assignments.items():
+            items = items_by_modality[modality]
+            item_offset = 0
+            for encoder_idx, count in enumerate(counts):
+                if count == 0:
+                    continue
+                part_idx = len(encode_requests)
+                encode_requests.append(
+                    (
+                        encoder_urls[encoder_idx],
+                        {
+                            "req_id": create_part_req_id(request.rid, part_idx),
+                            "dispatch_start_ns": dispatch_start_ns,
+                            "mm_items": items[item_offset : item_offset + count],
+                            "num_parts": num_parts,
+                            "part_idx": part_idx,
+                            "modality": modality.name,
+                        },
+                    )
+                )
+                item_offset += count
+
+        async def send_encode_requests() -> None:
+            async def send_one(encoder_url: str, payload: dict[str, Any]) -> None:
+                response = await client.post(
+                    f"{encoder_url.rstrip('/')}/encode",
+                    json=payload,
+                )
+                response.raise_for_status()
+
+            results = await asyncio.gather(
+                *(send_one(*encode_request) for encode_request in encode_requests),
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, Exception):
+                    raise result
+
+        task = asyncio.create_task(
+            send_encode_requests(),
+            name=f"encoder-dispatch-{request.rid}",
+        )
+
+        def finish(completed: asyncio.Task[None]) -> None:
+            if completed.cancelled():
+                return
+            try:
+                completed.result()
+            except Exception:
+                logger.exception("Encoder dispatch failed. rid=%s", request.rid)
+
+        task.add_done_callback(finish)
+        return assignments, task
 
     async def close(self) -> None:
         client, self._client = self._client, None
@@ -402,117 +437,48 @@ class EncoderRequestDispatcher:
             await client.aclose()
 
 
-def dispatch_encoder_request(
-    request: GenerateReqInput,
-    encoder_urls: list[str],
-    client: httpx.AsyncClient,
-) -> tuple[dict[Modality, list[int]], asyncio.Task[None]]:
-    if not isinstance(request.rid, str):
-        raise ValueError("encoder request requires a single rid")
-    if not encoder_urls:
-        raise ValueError("encoder_urls is required")
-    dispatch_start_ns = time.time_ns()
-
-    items_by_modality = {}
-    for name, modality in (
-        ("image_data", Modality.IMAGE),
-        ("video_data", Modality.VIDEO),
-        ("audio_data", Modality.AUDIO),
-    ):
-        data = getattr(request, name, None)
-        if data is None:
-            continue
-        items = []
-        for item in flatten_nested_list(data):
-            if item is None:
-                continue
-            if isinstance(item, ImageData):
-                item = item.url
-            elif isinstance(item, dict) and "url" in item:
-                item = item["url"]
-            items.append(item)
-        if items:
-            items_by_modality[modality] = items
-
-    assignments = {}
-    encoder_indices = list(range(len(encoder_urls)))
-    random.shuffle(encoder_indices)
-    offset = 0
-    for modality, items in items_by_modality.items():
-        base, remainder = divmod(len(items), len(encoder_urls))
-        counts = [base] * len(encoder_urls)
-        for index in range(remainder):
-            counts[encoder_indices[(offset + index) % len(encoder_urls)]] += 1
-        assignments[modality] = counts
-        offset = (offset + remainder) % len(encoder_urls)
-
-    num_parts = sum(count > 0 for counts in assignments.values() for count in counts)
-    encode_requests = []
-    for modality, counts in assignments.items():
-        items = items_by_modality[modality]
-        item_offset = 0
-        for encoder_idx, count in enumerate(counts):
-            if count == 0:
-                continue
-            part_idx = len(encode_requests)
-            encode_requests.append(
-                (
-                    encoder_urls[encoder_idx],
-                    {
-                        "req_id": create_part_req_id(request.rid, part_idx),
-                        "dispatch_start_ns": dispatch_start_ns,
-                        "mm_items": items[item_offset : item_offset + count],
-                        "num_parts": num_parts,
-                        "part_idx": part_idx,
-                        "modality": modality.name,
-                    },
-                )
-            )
-            item_offset += count
-
-    async def send_encode_requests() -> None:
-        async def send_one(encoder_url: str, payload: dict[str, Any]) -> None:
-            response = await client.post(
-                f"{encoder_url.rstrip('/')}/encode",
-                json=payload,
-            )
-            response.raise_for_status()
-
-        results = await asyncio.gather(
-            *(send_one(*encode_request) for encode_request in encode_requests),
-            return_exceptions=True,
-        )
-        for result in results:
-            if isinstance(result, Exception):
-                raise result
-
-    task = asyncio.create_task(
-        send_encode_requests(),
-        name=f"encoder-dispatch-{request.rid}",
-    )
-
-    def finish(completed: asyncio.Task[None]) -> None:
-        if completed.cancelled():
-            return
-        try:
-            completed.result()
-        except Exception:
-            logger.exception("Encoder dispatch failed. rid=%s", request.rid)
-
-    task.add_done_callback(finish)
-
-    return assignments, task
-
-
 def create_encoder_client(
     server_args,
     mesh: Any,
 ) -> EncoderClient:
+    channel_number = max(1, int(server_args.disaggregation_channel_number))
+    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    transfer_timeout = server_args.encoder_request_timeout_seconds
+
     if server_args.simulate_compute:
-        from sgl_jax.srt.disaggregation.encoder.sim_transfer import create_sim_client
+        from sgl_jax.srt.disaggregation.encoder.sim_transfer import SimReceiverBackend
 
-        return create_sim_client(server_args, mesh)
+        host = server_args.disaggregation_host_ip or "127.0.0.1"
+        backend = SimReceiverBackend(
+            sharding,
+            server_args.simulate_transfer_ms_per_mb,
+            server_args.simulate_network_rtt_ms,
+            parallelism=channel_number,
+            pool_size=server_args.encoder_transfer_pool_size,
+            transfer_timeout_s=transfer_timeout,
+        )
+    else:
+        from sgl_jax.raiden import require_raiden_preloaded
+        from sgl_jax.srt.disaggregation.encoder.raiden import RaidenReceiverBackend
+        from sgl_jax.srt.disaggregation.host_ip import resolve_host_ip
 
-    from sgl_jax.srt.disaggregation.encoder.raiden import create_raiden_client
+        require_raiden_preloaded()
+        if transfer_timeout <= 0:
+            raise ValueError("Raiden requires a positive encoder request timeout")
+        host = resolve_host_ip(server_args.disaggregation_host_ip)
+        backend = RaidenReceiverBackend(
+            host=host,
+            sharding=sharding,
+            parallelism=channel_number,
+            pool_size=server_args.encoder_transfer_pool_size,
+            transfer_timeout_s=transfer_timeout,
+        )
 
-    return create_raiden_client(server_args, mesh)
+    control_timeout = server_args.encoder_control_timeout_seconds
+    return EncoderClient(
+        host=host,
+        backend=backend,
+        encoder_urls=server_args.encoder_urls,
+        registration_workers=channel_number,
+        registration_timeout=None if control_timeout <= 0 else control_timeout,
+    )

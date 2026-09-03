@@ -28,12 +28,9 @@ class EmbeddingData:
         part_idx: int,
         grid_dim: Any,
         modality: Modality,
-        embedding: jax.Array | None = None,
         embedding_shape: list[int] | tuple[int, ...] | None = None,
-        shape: list[int] | tuple[int, ...] | None = None,
         dtype: Any = None,
         error_msg: str | None = None,
-        error_code: int | None = None,
         dispatch_start_ns: int | None = None,
         enqueue_ns: int | None = None,
         dequeue_ns: int | None = None,
@@ -51,17 +48,9 @@ class EmbeddingData:
         self.part_idx = part_idx
         self.grid_dim = grid_dim
         self.modality = modality
-        self.embedding = embedding
-        self.send_time = None
-        self.dtype = embedding.dtype if embedding is not None else dtype
-        resolved_shape = embedding_shape if embedding_shape is not None else shape
-        self.shape = (
-            resolved_shape
-            if resolved_shape is not None
-            else list(embedding.shape) if embedding is not None else None
-        )
+        self.dtype = dtype
+        self.shape = embedding_shape
         self.error_msg = error_msg
-        self.error_code = error_code
         # Encoder scheduler application-level timing. enqueue_ns/dequeue_ns
         # use Unix epoch time for cross-process correlation; queue_duration_ns
         # and queue_ms are calculated from a monotonic clock.
@@ -77,28 +66,6 @@ class EmbeddingData:
         self.queue_ms = queue_ms
         for key, value in kwargs.items():
             setattr(self, key, value)
-
-    def get_grid(self) -> Any:
-        return self.grid_dim
-
-    def get_embedding(self) -> jax.Array | None:
-        return self.embedding
-
-    def copy_without_embedding(self) -> EmbeddingData:
-        copied = EmbeddingData(
-            req_id=self.req_id,
-            num_parts=self.num_parts,
-            part_idx=self.part_idx,
-            grid_dim=self.grid_dim,
-            modality=self.modality,
-            embedding_shape=self.shape,
-            error_msg=self.error_msg,
-            error_code=self.error_code,
-        )
-        for key, value in vars(self).items():
-            if not key.startswith("_") and key != "embedding":
-                setattr(copied, key, value)
-        return copied
 
     def __repr__(self) -> str:
         return (

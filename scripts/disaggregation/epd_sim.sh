@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # One-shot EPD CPU simulation: launch the tiers, drive requests, capture a
-# profile, render the flame graph + single-request timeline, open the timeline,
-# and tear everything down. One command, no second terminal.
+# profile, render the flame graph + aligned overlap timeline, open the relevant
+# timeline, and tear everything down. One command, no second terminal.
 #
 #   MODEL_PATH=/path/to/qwen2.5-vl ./scripts/disaggregation/epd_sim.sh
 #
@@ -17,7 +17,8 @@
 # Topology / workload (env, optional):
 #   NUM_ENCODERS TP_SIZE DP_SIZE N_REQUESTS CONCURRENCY MAX_TOKENS PROFILER_DIR PY_TRACER
 #   SIM_MAX_TOTAL_TOKENS SIM_CHUNKED_PREFILL_SIZE
-#   ENCODER_MAX_BATCH_SIZE ENCODER_MAX_INFLIGHT_BATCHES MM_PROCESSOR_WORKERS MM_IO_WORKERS
+#   ENCODER_MAX_BATCH_SIZE ENCODER_MAX_INFLIGHT_BATCHES ENCODER_TRANSFER_POOL_SIZE
+#   DISAGGREGATION_CHANNEL_NUMBER MM_PROCESSOR_WORKERS MM_IO_WORKERS
 #   PREWARM_REQUESTS PREWARM_CONCURRENCY RANDOM_INPUT_LEN IMAGES_PER_REQ IMAGE_SIZE
 #
 set -euo pipefail
@@ -47,6 +48,8 @@ SIM_MAX_PREFILL_TOKENS=${SIM_MAX_PREFILL_TOKENS:-16384}
 SIM_CHUNKED_PREFILL_SIZE=${SIM_CHUNKED_PREFILL_SIZE:-4096}
 ENCODER_MAX_BATCH_SIZE=${ENCODER_MAX_BATCH_SIZE:-16}
 ENCODER_MAX_INFLIGHT_BATCHES=${ENCODER_MAX_INFLIGHT_BATCHES:-2}
+ENCODER_TRANSFER_POOL_SIZE=${ENCODER_TRANSFER_POOL_SIZE:-32}
+DISAGGREGATION_CHANNEL_NUMBER=${DISAGGREGATION_CHANNEL_NUMBER:-4}
 MM_PROCESSOR_WORKERS=${MM_PROCESSOR_WORKERS:-2}
 MM_IO_WORKERS=${MM_IO_WORKERS:-4}
 IMAGES_PER_REQ=${IMAGES_PER_REQ:-1}
@@ -135,7 +138,8 @@ common_args=(
   --model-path "${MODEL_PATH}" --tp-size "${TP_SIZE}" --dp-size "${DP_SIZE}"
   --device cpu --load-format dummy --dtype bfloat16 --attention-backend native
   --trust-remote-code --disaggregation-host-ip 127.0.0.1
-  --disaggregation-channel-number 4
+  --disaggregation-channel-number "${DISAGGREGATION_CHANNEL_NUMBER}"
+  --encoder-transfer-pool-size "${ENCODER_TRANSFER_POOL_SIZE}"
   --enable-request-time-stats-logging
 )
 
@@ -206,6 +210,9 @@ echo ">> profiling ${N_REQUESTS} requests (concurrency ${CONCURRENCY}, ${IMAGES_
 
 echo ">> rendering flame graph"
 "${PY}" "${SCRIPT_DIR}/trace_to_flamegraph.py" --profiler-dir "${PROFILER_DIR}"
+echo ">> rendering aligned overlap timeline"
+"${PY}" "${SCRIPT_DIR}/trace_to_overlap_html.py" --profiler-dir "${PROFILER_DIR}"
+OVERLAP_TIMELINE="${PROFILER_DIR}/epd_overlap.html"
 # The single-request timeline only reconstructs cleanly from a SEQUENTIAL drive;
 # under concurrency decode is batched and prefill chunked, so per-request
 # segmentation is invalid. Only build it at CONCURRENCY=1.
@@ -229,6 +236,9 @@ echo ""
 echo "=========================================================="
 echo "Done. Artifacts in ${PROFILER_DIR}:"
 echo "  epd_flamegraph.svg  <- CPU self-time flame graph (primary view)"
+echo "  epd_overlap.html    <- aligned E / transfer / P+D overlap timeline"
+echo "  epd_overlap.trace.json <- aligned spans for Perfetto"
+echo "  overlap-summary.json   <- measured overlap durations and coverage"
 if [ -n "${TIMELINE}" ]; then
   echo "  epd_timeline.html   <- single-request critical path (sequential only)"
 fi
@@ -241,16 +251,15 @@ if [ "${CONCURRENCY}" -gt 1 ]; then
   echo ""
   echo "NOTE (concurrency ${CONCURRENCY}):"
   echo "  * Requests batch in the scheduler (see #running-req in language.log)."
-  echo "  * Single-request timeline skipped (only valid for sequential drive);"
-  echo "    read the FLAME GRAPH + Perfetto. For a per-request waterfall run with"
-  echo "    CONCURRENCY=1."
+  echo "  * Single-request critical path is skipped (only valid sequentially)."
+  echo "    Use epd_overlap.html / epd_overlap.trace.json for concurrent overlap."
   echo "  * Decode uses base_ms + per_seq_ms*batch; override the SIM_DECODE_* env"
   echo "    variables to explore another serving configuration."
 fi
-# Open the timeline only when it was produced (sequential); otherwise leave the
-# flame graph SVG for the user to open.
-if [ -n "${TIMELINE}" ]; then
-  if command -v open >/dev/null 2>&1; then open "${TIMELINE}"
-  elif command -v xdg-open >/dev/null 2>&1; then xdg-open "${TIMELINE}" >/dev/null 2>&1 || true
-  else echo "open ${TIMELINE} in a browser"; fi
-fi
+# Sequential drives get the detailed critical path. Concurrent drives open the
+# cross-request overlap view that this script always produces.
+VIEW_TIMELINE="${OVERLAP_TIMELINE}"
+[ -n "${TIMELINE}" ] && VIEW_TIMELINE="${TIMELINE}"
+if command -v open >/dev/null 2>&1; then open "${VIEW_TIMELINE}"
+elif command -v xdg-open >/dev/null 2>&1; then xdg-open "${VIEW_TIMELINE}" >/dev/null 2>&1 || true
+else echo "open ${VIEW_TIMELINE} in a browser"; fi

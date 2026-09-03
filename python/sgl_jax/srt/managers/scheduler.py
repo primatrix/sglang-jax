@@ -1415,13 +1415,40 @@ class Scheduler(
             self.encoder_waiting[recv_req.rid] = pending
 
         timeout = self.server_args.encoder_request_timeout_seconds
+        log_poll_time = getattr(
+            self.server_args,
+            "enable_request_time_stats_logging",
+            False,
+        )
         for rid, pending in list(self.encoder_waiting.items()):
             recv_req = pending.recv_req
 
+            result = None
+            poll_error = None
+            poll_start_ns = time.monotonic_ns()
             try:
                 result = pending.poll()
             except Exception as exc:
-                self._abort_encoder_request(recv_req, str(exc))
+                poll_error = exc
+            poll_duration_ns = time.monotonic_ns() - poll_start_ns
+
+            if log_poll_time:
+                if poll_error is not None:
+                    poll_status = "error"
+                elif result is not None:
+                    poll_status = "ready"
+                else:
+                    poll_status = "pending"
+                logger.info(
+                    "ENCODER-POLL-TIME req_id=%s duration_ns=%d duration_ms=%.3f status=%s",
+                    rid,
+                    poll_duration_ns,
+                    poll_duration_ns / 1_000_000,
+                    poll_status,
+                )
+
+            if poll_error is not None:
+                self._abort_encoder_request(recv_req, str(poll_error))
                 self._remove_encoder_waiting(rid)
                 continue
 
@@ -1459,8 +1486,6 @@ class Scheduler(
                 if key not in ("embeddings", "encoder_timing")
             },
         )
-        if mm_inputs.input_ids is None:
-            raise ValueError("multimodal processor produced no input_ids")
         recv_req.mm_inputs = mm_inputs
         recv_req.input_ids = mm_inputs.input_ids
         recv_req.radix_input_ids = build_radix_input_ids(recv_req.input_ids, mm_inputs)

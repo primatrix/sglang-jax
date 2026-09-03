@@ -18,6 +18,8 @@ set -euo pipefail
 NUM_ENCODERS=${NUM_ENCODERS:-1}
 TP_SIZE=${TP_SIZE:-1}
 DP_SIZE=${DP_SIZE:-1}
+ENCODER_TRANSFER_POOL_SIZE=${ENCODER_TRANSFER_POOL_SIZE:-32}
+DISAGGREGATION_CHANNEL_NUMBER=${DISAGGREGATION_CHANNEL_NUMBER:-4}
 # The language scheduler builds a (dp, tp/dp) mesh, so the CPU device count must
 # equal tp*dp exactly. Default to that; override only if you know why.
 DEVICE_COUNT=${DEVICE_COUNT:-$((TP_SIZE * DP_SIZE))}
@@ -33,6 +35,7 @@ SIM_PREFILL_BASE_MS=${SIM_PREFILL_BASE_MS:-0}
 SIM_PREFILL_MS_PER_TOKEN=${SIM_PREFILL_MS_PER_TOKEN:-0}
 SIM_DECODE_BASE_MS=${SIM_DECODE_BASE_MS:-0}
 SIM_DECODE_MS_PER_SEQ=${SIM_DECODE_MS_PER_SEQ:-0}
+SIM_TRANSFER_SETUP_MS=${SIM_TRANSFER_SETUP_MS:-0}
 SIM_TRANSFER_MS_PER_MB=${SIM_TRANSFER_MS_PER_MB:-0}
 SIM_NET_RTT_MS=${SIM_NET_RTT_MS:-0}
 
@@ -69,6 +72,7 @@ sim_args=(
   --simulate-compute-prefill-ms-per-token "${SIM_PREFILL_MS_PER_TOKEN}"
   --simulate-compute-decode-base-ms "${SIM_DECODE_BASE_MS}"
   --simulate-compute-decode-ms-per-seq "${SIM_DECODE_MS_PER_SEQ}"
+  --simulate-transfer-setup-ms "${SIM_TRANSFER_SETUP_MS}"
   --simulate-transfer-ms-per-mb "${SIM_TRANSFER_MS_PER_MB}"
   --simulate-network-rtt-ms "${SIM_NET_RTT_MS}"
 )
@@ -83,6 +87,8 @@ common_args=(
   --attention-backend native
   --trust-remote-code
   --disaggregation-host-ip 127.0.0.1
+  --disaggregation-channel-number "${DISAGGREGATION_CHANNEL_NUMBER}"
+  --encoder-transfer-pool-size "${ENCODER_TRANSFER_POOL_SIZE}"
 )
 
 ENCODER_URLS=()

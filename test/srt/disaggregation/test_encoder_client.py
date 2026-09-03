@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 
 from sgl_jax.srt.disaggregation.encoder import client as encoder_client
@@ -54,7 +53,7 @@ def test_encoder_receiver_reuses_http_client(monkeypatch):
         host="127.0.0.1",
         backend=FakeBackend(),
         encoder_urls=["http://encoder"],
-        executor=ThreadPoolExecutor(max_workers=1),
+        registration_workers=1,
         registration_timeout=12.0,
     )
 
@@ -79,20 +78,17 @@ def test_encoder_receiver_reuses_metadata_socket(monkeypatch):
         def close(self) -> None:
             pass
 
-    def submit(executor, registrations, receive_url, client):
-        del executor, registrations, client
+    def register(registration, receive_url, client):
+        del registration, client
         receive_urls.append(receive_url)
-        future = Future()
-        future.set_result(None)
-        return future
 
     monkeypatch.setattr(encoder_client.httpx, "Client", FakeClient)
-    monkeypatch.setattr(encoder_client, "submit_scheduler_receiver_registrations", submit)
+    monkeypatch.setattr(encoder_client, "register_scheduler_receiver", register)
     client = encoder_client.EncoderClient(
         host="127.0.0.1",
         backend=FakeBackend(),
         encoder_urls=["http://encoder"],
-        executor=ThreadPoolExecutor(max_workers=1),
+        registration_workers=1,
         registration_timeout=12.0,
     )
     requests = [
@@ -106,6 +102,7 @@ def test_encoder_receiver_reuses_metadata_socket(monkeypatch):
 
     pending = [client.receive(request) for request in requests]
     for request in pending:
+        request.registration_futures[0].result(timeout=1)
         request.close()
     client.close()
 
@@ -113,7 +110,7 @@ def test_encoder_receiver_reuses_metadata_socket(monkeypatch):
     assert receive_urls[0] == receive_urls[1]
 
 
-def test_encoder_receiver_registers_parts_concurrently():
+def test_encoder_receiver_registers_parts_concurrently(monkeypatch):
     barrier = threading.Barrier(2)
     posts = []
 
@@ -122,29 +119,46 @@ def test_encoder_receiver_registers_parts_concurrently():
             pass
 
     class FakeClient:
+        def __init__(self, *, timeout) -> None:
+            pass
+
         def post(self, url, *, json):
             posts.append((url, json["req_id"]))
             barrier.wait(timeout=1)
             return FakeResponse()
 
-    executor = ThreadPoolExecutor(max_workers=2)
-    try:
-        future = encoder_client.submit_scheduler_receiver_registrations(
-            executor,
-            [
-                ("http://encoder-0", "request-0", Modality.IMAGE),
-                ("http://encoder-1", "request-1", Modality.IMAGE),
-            ],
-            "127.0.0.1:1234",
-            FakeClient(),
+        def close(self) -> None:
+            pass
+
+    class FakeBackend:
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(encoder_client.httpx, "Client", FakeClient)
+    client = encoder_client.EncoderClient(
+        host="127.0.0.1",
+        backend=FakeBackend(),
+        encoder_urls=["http://encoder-0", "http://encoder-1"],
+        registration_workers=2,
+        registration_timeout=12.0,
+    )
+    pending = client.receive(
+        SimpleNamespace(
+            rid="request",
+            encoder_urls=None,
+            num_items_assigned={Modality.IMAGE: [1, 1]},
         )
-        future.result(timeout=2)
+    )
+    try:
+        for future in pending.registration_futures:
+            future.result(timeout=2)
     finally:
-        executor.shutdown(cancel_futures=True)
+        pending.close()
+        client.close()
 
     assert sorted(posts) == [
-        ("http://encoder-0/scheduler_receive_url", "request-0"),
-        ("http://encoder-1/scheduler_receive_url", "request-1"),
+        ("http://encoder-0/scheduler_receive_url", "request_local_part_0"),
+        ("http://encoder-1/scheduler_receive_url", "request_local_part_1"),
     ]
 
 

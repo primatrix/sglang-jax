@@ -7,22 +7,22 @@ import math
 import threading
 import time
 from collections.abc import Mapping
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Protocol
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 
 from sgl_jax.raiden import require_raiden_preloaded
-from sgl_jax.srt.disaggregation.encoder.client import EncoderClient
+from sgl_jax.srt.disaggregation.encoder.client import DeferredReceiveSession
 from sgl_jax.srt.disaggregation.encoder.embedding_data import EmbeddingData
+from sgl_jax.srt.disaggregation.encoder.transfer_layout import encoder_pool_block_shape
 from sgl_jax.srt.disaggregation.raiden_transfer.wrapper import RaidenTransferWrapper
 
 logger = logging.getLogger(__name__)
 _LOCAL_ENDPOINT_HOSTS = {"", "0.0.0.0", "127.0.0.1", "::", "::1", "localhost"}
-_TPU_TILE_SHAPE = (8, 128)
 
 
 def _uuid_to_int(value: str) -> int:
@@ -73,14 +73,6 @@ def _pool_sharding(sharding: jax.sharding.Sharding) -> jax.sharding.Sharding:
     return sharding
 
 
-def _pool_block_shape(shape: tuple[int, int]) -> tuple[int, int, int, int]:
-    """Keep each request contiguous in TPU's canonical rank-5 KV layout."""
-
-    rows, width = shape
-    tile_width = math.prod(_TPU_TILE_SHAPE)
-    return max(2, rows), max(2, math.ceil(width / tile_width)), *_TPU_TILE_SHAPE
-
-
 @partial(jax.jit, donate_argnums=(0,))
 def _copy_into_slot(pool: jax.Array, value: jax.Array, slot: jax.Array) -> jax.Array:
     block_shape = pool.shape[1:]
@@ -124,7 +116,7 @@ class _RaidenSendPool:
         self.sharding = sample.sharding
         self._timeout_s = timeout_s
         pool_sharding = _pool_sharding(sample.sharding)
-        self._block_shape = _pool_block_shape(self.shape)
+        self._block_shape = encoder_pool_block_shape(self.shape)
         self._buffer = jnp.zeros(
             (capacity, *self._block_shape),
             dtype=self.dtype,
@@ -139,7 +131,9 @@ class _RaidenSendPool:
             num_slots=capacity,
             timeout_s=timeout_s,
         )
-        self._slots_released = asyncio.Event()
+        self._condition = threading.Condition()
+        self._copy_lock = threading.Lock()
+        self._transfer_lock = threading.Lock()
         self._free = list(range(capacity - 1, -1, -1))
         self._active: dict[str, int] = {}
         self._closed = False
@@ -151,43 +145,45 @@ class _RaidenSendPool:
             and value.sharding == self.sharding
         )
 
-    async def reserve(self, transfer_id: str) -> int:
-        if transfer_id in self._active:
-            raise ValueError(f"duplicate Raiden transfer_id: {transfer_id}")
-
+    def reserve_sync(self, transfer_id: str) -> int:
         deadline = time.monotonic() + self._timeout_s
-        while not self._free and not self._closed:
-            self._slots_released.clear()
-            if self._free:
-                break
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("timed out waiting for a Raiden encoder pool slot")
-            try:
-                await asyncio.wait_for(self._slots_released.wait(), remaining)
-            except TimeoutError:
-                raise TimeoutError("timed out waiting for a Raiden encoder pool slot") from None
-        if self._closed:
-            raise RuntimeError("Raiden encoder pool is closed")
+        with self._condition:
+            if transfer_id in self._active:
+                raise ValueError(f"duplicate Raiden transfer_id: {transfer_id}")
+            while not self._free and not self._closed:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("timed out waiting for a Raiden encoder pool slot")
+                self._condition.wait(remaining)
+            if self._closed:
+                raise RuntimeError("Raiden encoder pool is closed")
 
-        slot = self._free.pop()
-        self._active[transfer_id] = slot
-        return slot
+            slot = self._free.pop()
+            self._active[transfer_id] = slot
+            return slot
 
-    def copy(self, value: jax.Array, slot: int) -> jax.Array:
+    async def reserve(self, transfer_id: str) -> int:
+        return await asyncio.to_thread(self.reserve_sync, transfer_id)
+
+    def copy_sync(self, value: jax.Array, slot: int) -> None:
         if not self.matches(value):
             raise ValueError("Raiden pool contains an incompatible embedding")
-        self._buffer = self._copy(
-            self._buffer,
-            value,
-            jnp.asarray(slot, dtype=jnp.int32),
-        )
-        return self._buffer
+        with self._copy_lock:
+            self._buffer = self._copy(
+                self._buffer,
+                value,
+                jnp.asarray(slot, dtype=jnp.int32),
+            )
+            jax.block_until_ready(self._buffer)
+
+    async def copy(self, value: jax.Array, slot: int) -> None:
+        await asyncio.to_thread(self.copy_sync, value, slot)
 
     def register(self, transfer_id: str, slot: int) -> dict[str, Any]:
         transfer_uuid = _uuid_to_int(transfer_id)
-        if not self.transfer.register_read(transfer_id, transfer_uuid, [slot]):
-            raise RuntimeError(f"Raiden rejected encoder transfer {transfer_id!r}")
+        with self._transfer_lock:
+            if not self.transfer.register_read(transfer_id, transfer_uuid, [slot]):
+                raise RuntimeError(f"Raiden rejected encoder transfer {transfer_id!r}")
         return {
             "transfer_id": transfer_id,
             "transfer_uuid": transfer_uuid,
@@ -197,20 +193,23 @@ class _RaidenSendPool:
         }
 
     def poll(self) -> tuple[list[str], list[str]]:
-        sent, _, failed = self.transfer.poll_stats()
+        with self._transfer_lock:
+            sent, _, failed = self.transfer.poll_stats()
         for transfer_id in (*sent, *failed):
             self.release(transfer_id)
         return sent, failed
 
     def release(self, transfer_id: str) -> None:
-        slot = self._active.pop(transfer_id, None)
-        if slot is not None:
-            self._free.append(slot)
-            self._slots_released.set()
+        with self._condition:
+            slot = self._active.pop(transfer_id, None)
+            if slot is not None:
+                self._free.append(slot)
+                self._condition.notify()
 
     def close(self) -> None:
-        self._closed = True
-        self._slots_released.set()
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
 
 
 class RaidenEncoderServerTransfer:
@@ -235,82 +234,121 @@ class RaidenEncoderServerTransfer:
         self._log_inflight = bool(log_inflight)
         self._pools: list[_RaidenSendPool] = []
         self._active: dict[str, _RaidenSendPool] = {}
-        self._preparing: set[str] = set()
+        self._pending: dict[str, _RaidenSendPool | None] = {}
+        self._lock = threading.Lock()
+        self._closed = False
 
-    async def publish(self, transfer_id: str, embedding: jax.Array) -> dict[str, Any]:
-        if transfer_id in self._active or transfer_id in self._preparing:
-            raise ValueError(f"duplicate Raiden transfer_id: {transfer_id}")
+    def stage_sync(self, transfer_id: str, embedding: jax.Array) -> Any:
         if embedding.ndim != 2 or embedding.shape[0] <= 0:
             raise ValueError("Raiden embedding must be a non-empty matrix")
 
-        self._preparing.add(transfer_id)
-        pool: _RaidenSendPool | None = None
-        registered = False
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Raiden encoder transfer is closed")
+            if transfer_id in self._active or transfer_id in self._pending:
+                raise ValueError(f"duplicate Raiden transfer_id: {transfer_id}")
+            self._pending[transfer_id] = None
+            pool = next(
+                (pool for pool in self._pools if pool.matches(embedding)),
+                None,
+            )
+            if pool is None:
+                pool = _RaidenSendPool(
+                    self._host_ip,
+                    embedding,
+                    capacity=self._pool_size,
+                    parallelism=self._parallelism,
+                    timeout_s=self._timeout_s,
+                )
+                self._pools.append(pool)
+
         try:
-            pool = self._pool_for(embedding)
-            slot = await pool.reserve(transfer_id)
-            staged = pool.copy(embedding, slot)
-            while not staged.is_ready():
-                await asyncio.sleep(0.00005)
-            metadata = pool.register(transfer_id, slot)
-            registered = True
-            self._active[transfer_id] = pool
-            self._log_inflight_event("start", transfer_id)
-            return metadata
+            slot = pool.reserve_sync(transfer_id)
+            pool.copy_sync(embedding, slot)
         except BaseException:
-            if pool is not None and not registered:
+            with self._lock:
+                self._pending.pop(transfer_id, None)
+            pool.release(transfer_id)
+            raise
+
+        with self._lock:
+            self._pending[transfer_id] = pool
+        return transfer_id, pool, slot
+
+    async def stage(self, transfer_id: str, embedding: jax.Array) -> Any:
+        return await asyncio.to_thread(self.stage_sync, transfer_id, embedding)
+
+    def publish_sync(self, staged_transfer: Any) -> dict[str, Any]:
+        transfer_id, pool, slot = staged_transfer
+        try:
+            metadata = pool.register(transfer_id, slot)
+        except BaseException:
+            with self._lock:
+                pending = self._pending.pop(transfer_id, None)
+            if pending is not None:
                 pool.release(transfer_id)
             raise
-        finally:
-            self._preparing.discard(transfer_id)
 
-    def _pool_for(self, embedding: jax.Array) -> _RaidenSendPool:
-        pool = next((pool for pool in self._pools if pool.matches(embedding)), None)
-        if pool is None:
-            pool = _RaidenSendPool(
-                self._host_ip,
-                embedding,
-                capacity=self._pool_size,
-                parallelism=self._parallelism,
-                timeout_s=self._timeout_s,
-            )
-            self._pools.append(pool)
-        return pool
+        with self._lock:
+            self._pending.pop(transfer_id, None)
+            self._active[transfer_id] = pool
+        self._log_inflight_event("start", transfer_id)
+        return metadata
+
+    async def publish(self, staged_transfer: Any) -> dict[str, Any]:
+        return self.publish_sync(staged_transfer)
+
+    def poll_completed(self) -> None:
+        with self._lock:
+            pools = list(self._pools)
+        for pool in pools:
+            try:
+                sent, failed = pool.poll()
+            except Exception:
+                logger.exception("Raiden encoder sender pool poll failed")
+                continue
+            for transfer_id in sent:
+                self._discard_active(transfer_id, event="sent")
+            for transfer_id in failed:
+                self._discard_active(transfer_id, event="failed")
 
     async def release_completed(self) -> None:
         while True:
-            for pool in list(self._pools):
-                try:
-                    sent, failed = pool.poll()
-                except Exception:
-                    logger.exception("Raiden encoder sender pool poll failed")
-                    continue
-                for transfer_id in sent:
-                    self._discard_active(transfer_id, event="sent")
-                for transfer_id in failed:
-                    self._discard_active(transfer_id, event="failed")
+            self.poll_completed()
             await asyncio.sleep(self._poll_interval_s)
 
     def release(self, transfer_id: str) -> None:
-        pool = self._active.pop(transfer_id, None)
+        with self._lock:
+            pool = self._active.pop(transfer_id, None)
+            if pool is None:
+                pool = self._pending.pop(transfer_id, None)
         if pool is not None:
             pool.release(transfer_id)
             self._log_inflight_event("release", transfer_id)
 
     def close(self) -> None:
-        for pool in self._pools:
+        with self._lock:
+            self._closed = True
+            pools = list(self._pools)
+            active = list(self._active)
+            self._active.clear()
+            self._pending.clear()
+        for pool in pools:
             pool.close()
-        for transfer_id in list(self._active):
-            self._discard_active(transfer_id, event="close")
+        for transfer_id in active:
+            self._log_inflight_event("close", transfer_id)
 
     def _discard_active(self, transfer_id: str, *, event: str) -> None:
-        if self._active.pop(transfer_id, None) is not None:
+        with self._lock:
+            removed = self._active.pop(transfer_id, None)
+        if removed is not None:
             self._log_inflight_event(event, transfer_id)
 
     def _log_inflight_event(self, event: str, transfer_id: str) -> None:
         if not self._log_inflight:
             return
-        inflight = len(self._active)
+        with self._lock:
+            inflight = len(self._active)
         logger.info(
             "ENCODER-RAIDEN-INFLIGHT time_ns=%d event=%s transfer_id=%s "
             "group_size=1 inflight_groups=%d inflight_requests=%d",
@@ -325,37 +363,20 @@ class RaidenEncoderServerTransfer:
 @dataclass(slots=True)
 class RaidenReceiveSession:
     transfer_id: str
-    buffer: jax.Array
-    transfer: RaidenTransferWrapper
-    block_id: int = 0
-    lane_id: int = 0
-    pool: _RaidenReceivePool | None = None
+    lane_id: int
+    pool: _RaidenReceivePool
     _done: bool = False
 
     def poll(self) -> jax.Array | None:
         if self._done:
             return None
-        if self.pool is not None:
-            result = self.pool.poll(self.transfer_id, self.lane_id)
-            self._done = result is not None
-            return result
-        _, received, failed = self.transfer.poll_stats()
-        if self.transfer_id in failed:
-            raise RuntimeError(f"Raiden embedding transfer failed: {self.transfer_id}")
-        if self.transfer_id in received:
-            self._done = True
-            return self.buffer[self.block_id]
-        return None
+        result = self.pool.poll(self.transfer_id, self.lane_id)
+        self._done = result is not None
+        return result
 
     def close(self) -> None:
-        if self.pool is not None and not self._done:
+        if not self._done:
             self.pool.abandon(self.transfer_id)
-
-
-class _RaidenPollingSession(Protocol):
-    def poll(self) -> jax.Array | None: ...
-
-    def close(self) -> None: ...
 
 
 class _RaidenReceivePool:
@@ -375,7 +396,7 @@ class _RaidenReceivePool:
         self._sharding = sharding
         self._shape = shape
         self._timeout_s = timeout_s
-        self._block_shape = _pool_block_shape(shape)
+        self._block_shape = encoder_pool_block_shape(shape)
         self._buffer = jnp.zeros(
             (capacity, *self._block_shape),
             dtype=dtype,
@@ -393,7 +414,7 @@ class _RaidenReceivePool:
         self._free = list(range(capacity - 1, -1, -1))
         self._active: dict[str, int] = {}
         self._abandoned: set[str] = set()
-        self._materializing: set[str] = set()
+        self._materializing: dict[str, jax.Array] = {}
         self._received: set[str] = set()
         self._failed: set[str] = set()
         self._closed = False
@@ -433,9 +454,7 @@ class _RaidenReceivePool:
                 self._release_locked(transfer_id)
                 raise
         return RaidenReceiveSession(
-            transfer_id,
-            self._buffer,
-            self._transfer,
+            transfer_id=transfer_id,
             lane_id=lane_id,
             pool=self,
         )
@@ -448,26 +467,32 @@ class _RaidenReceivePool:
             if transfer_id in self._failed:
                 self._release_locked(transfer_id)
                 raise RuntimeError(f"Raiden embedding transfer failed: {transfer_id}")
-            if transfer_id not in self._received:
-                return None
-            if transfer_id in self._materializing:
-                return None
-            self._materializing.add(transfer_id)
+            embedding = self._materializing.get(transfer_id)
+            try:
+                if embedding is None:
+                    if transfer_id not in self._received:
+                        return None
 
-        try:
-            # Raiden writes outside JAX's dependency graph. Copy the completed
-            # block and synchronize it before making the pool slot reusable.
-            block = self._buffer[lane_id].reshape(self._block_shape[0], -1)
-            embedding = jax.device_put(
-                block[: self._shape[0], : self._shape[1]],
-                self._sharding,
-                may_alias=False,
-            )
-            jax.block_until_ready(embedding)
-            return embedding
-        finally:
-            with self._condition:
+                    # Raiden writes outside JAX's dependency graph. Submit a
+                    # non-aliasing copy, then let later poll calls observe its
+                    # completion without blocking the scheduler event loop.
+                    block = self._buffer[lane_id].reshape(self._block_shape[0], -1)
+                    embedding = jax.device_put(
+                        block[: self._shape[0], : self._shape[1]],
+                        self._sharding,
+                        may_alias=False,
+                    )
+                    self._materializing[transfer_id] = embedding
+
+                if not embedding.is_ready():
+                    return None
+            except Exception:
                 self._release_locked(transfer_id)
+                raise
+
+            # The source slot cannot be reused until the copy is complete.
+            self._release_locked(transfer_id)
+            return embedding
 
     def abandon(self, transfer_id: str) -> None:
         with self._condition:
@@ -482,7 +507,12 @@ class _RaidenReceivePool:
     def _reap_abandoned_locked(self) -> None:
         self._drain_stats_locked()
         for transfer_id in list(self._abandoned):
-            if transfer_id not in self._active or transfer_id in self._materializing:
+            if transfer_id not in self._active:
+                continue
+            embedding = self._materializing.get(transfer_id)
+            if embedding is not None:
+                if embedding.is_ready():
+                    self._release_locked(transfer_id)
                 continue
             if transfer_id in self._received or transfer_id in self._failed:
                 self._release_locked(transfer_id)
@@ -495,7 +525,7 @@ class _RaidenReceivePool:
     def _release_locked(self, transfer_id: str) -> None:
         lane_id = self._active.pop(transfer_id, None)
         self._abandoned.discard(transfer_id)
-        self._materializing.discard(transfer_id)
+        self._materializing.pop(transfer_id, None)
         self._received.discard(transfer_id)
         self._failed.discard(transfer_id)
         if lane_id is not None:
@@ -506,40 +536,6 @@ class _RaidenReceivePool:
         with self._condition:
             self._closed = True
             self._condition.notify_all()
-
-
-class DeferredRaidenReceiveSession:
-    """Expose a non-blocking session while Raiden setup runs off-loop."""
-
-    def __init__(self, future: Future[_RaidenPollingSession]) -> None:
-        self._future = future
-        self._session: _RaidenPollingSession | None = None
-        self._closed = False
-
-    def poll(self) -> jax.Array | None:
-        if self._closed:
-            return None
-        if self._session is None:
-            if not self._future.done():
-                return None
-            self._session = self._future.result()
-        return self._session.poll()
-
-    def close(self) -> None:
-        self._closed = True
-        if self._session is not None:
-            self._session.close()
-        elif not self._future.cancel():
-            self._future.add_done_callback(self._close_session)
-
-    @staticmethod
-    def _close_session(future: Future[_RaidenPollingSession]) -> None:
-        if future.cancelled():
-            return
-        try:
-            future.result().close()
-        except Exception:
-            logger.exception("Deferred Raiden receiver setup failed during cleanup")
 
 
 class RaidenReceiverBackend:
@@ -562,22 +558,15 @@ class RaidenReceiverBackend:
         # Pool creation and Raiden control-plane calls stay off the event loop.
         self._executor = ThreadPoolExecutor(max_workers=1)
 
-    def start(self, data: EmbeddingData) -> DeferredRaidenReceiveSession:
-        return DeferredRaidenReceiveSession(self._executor.submit(self._start, data))
+    def start(self, data: EmbeddingData) -> DeferredReceiveSession:
+        return DeferredReceiveSession(self._executor.submit(self._start, data))
 
-    def _start(self, data: EmbeddingData) -> _RaidenPollingSession:
+    def _start(self, data: EmbeddingData) -> RaidenReceiveSession:
         if data.shape is None or data.dtype is None:
             raise ValueError("embedding shape and dtype are required")
         shape = tuple(int(dim) for dim in data.shape)
         if len(shape) != 2 or shape[0] <= 0:
             raise ValueError("Raiden embedding must be a non-empty matrix")
-        return self._start_transfer(data, shape)
-
-    def _start_transfer(
-        self,
-        data: EmbeddingData,
-        shape: tuple[int, int],
-    ) -> RaidenReceiveSession:
         transfer_id = getattr(data, "transfer_id", None)
         transfer_uuid = getattr(data, "transfer_uuid", None)
         remote_block_ids = getattr(data, "transfer_block_ids", None)
@@ -630,36 +619,3 @@ class RaidenReceiverBackend:
         for pool in pools:
             pool.close()
         self._executor.shutdown(cancel_futures=True)
-
-
-RaidenEncoderClient = EncoderClient
-
-
-def create_raiden_client(
-    server_args,
-    mesh: jax.sharding.Mesh,
-) -> EncoderClient:
-    from sgl_jax.srt.disaggregation.host_ip import resolve_host_ip
-
-    require_raiden_preloaded()
-    host = resolve_host_ip(server_args.disaggregation_host_ip)
-    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
-    control_timeout = server_args.encoder_control_timeout_seconds
-    transfer_timeout = server_args.encoder_request_timeout_seconds
-    if transfer_timeout <= 0:
-        raise ValueError("Raiden requires a positive encoder request timeout")
-    executor = ThreadPoolExecutor(max_workers=server_args.disaggregation_channel_number)
-    backend = RaidenReceiverBackend(
-        host=host,
-        sharding=sharding,
-        parallelism=server_args.disaggregation_channel_number,
-        pool_size=server_args.encoder_transfer_pool_size,
-        transfer_timeout_s=transfer_timeout,
-    )
-    return EncoderClient(
-        host=host,
-        backend=backend,
-        encoder_urls=server_args.encoder_urls,
-        executor=executor,
-        registration_timeout=None if control_timeout <= 0 else control_timeout,
-    )

@@ -278,7 +278,7 @@ class ServerArgs:
     encoder_max_inflight_batches: int = 1
 
     # CPU simulation: replace real device compute (encoder / prefill / decode
-    # forward) and the Raiden embedding transfer with a modeled ``time.sleep``,
+    # forward) and the Raiden embedding transfer with modeled delays,
     # so the full EPD orchestration can run and be profiled on a local CPU box
     # without TPU. All coefficients default to 0.0 (no artificial latency);
     # when ``simulate_compute`` is False none of the sim branches are entered,
@@ -291,8 +291,8 @@ class ServerArgs:
     simulate_compute_prefill_ms_per_token: float = 0.0  # x input_ids.shape[0]
     simulate_compute_decode_base_ms: float = 0.0
     simulate_compute_decode_ms_per_seq: float = 0.0  # x batch_size, per decode step
-    simulate_transfer_setup_ms: float = 0.0  # per embedding, channel-limited setup
-    simulate_transfer_ms_per_mb: float = 0.0  # x embedding bytes / 1MiB
+    simulate_transfer_setup_ms: float = 0.0  # fixed publisher setup per embedding
+    simulate_transfer_ms_per_mb: float = 0.0  # x padded Raiden slot bytes / 1MiB
     # One-way network latency added to each cross-tier hop (language<->encoder
     # HTTP request and the embedding delivery), so a single-box sim can model
     # the cross-host RTT that real EPD pays but loopback does not.
@@ -1821,14 +1821,14 @@ class ServerArgs:
             "--simulate-transfer-setup-ms",
             type=float,
             default=ServerArgs.simulate_transfer_setup_ms,
-            help="Per-embedding publisher setup sleep (ms), bounded by the "
-            "disaggregation channel count, under --simulate-compute.",
+            help="Fixed per-embedding publisher setup delay (ms) under --simulate-compute.",
         )
         parser.add_argument(
             "--simulate-transfer-ms-per-mb",
             type=float,
             default=ServerArgs.simulate_transfer_ms_per_mb,
-            help="Embedding transfer sleep (ms) per MiB under --simulate-compute.",
+            help="Embedding transfer delay (ms) per padded Raiden slot MiB under "
+            "--simulate-compute.",
         )
         parser.add_argument(
             "--simulate-network-rtt-ms",

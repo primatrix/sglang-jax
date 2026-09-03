@@ -3,6 +3,28 @@ from types import SimpleNamespace
 from sgl_jax.srt.managers.scheduler import Scheduler
 
 
+def test_language_logs_encoder_poll_time(caplog):
+    pending = SimpleNamespace(
+        recv_req=SimpleNamespace(rid="request-0"),
+        started_at=0.0,
+        poll=lambda: None,
+    )
+    scheduler = SimpleNamespace(
+        server_args=SimpleNamespace(
+            encoder_request_timeout_seconds=0,
+            enable_request_time_stats_logging=True,
+        ),
+        encoder_waiting={"request-0": pending},
+    )
+
+    caplog.set_level("INFO")
+    assert Scheduler.process_encoder_requests(scheduler, []) == []
+
+    assert "ENCODER-POLL-TIME req_id=request-0" in caplog.text
+    assert "duration_ns=" in caplog.text
+    assert "status=pending" in caplog.text
+
+
 def test_language_logs_encoder_pipeline_timing(caplog):
     timing = {
         "enqueue_ns": 1_000_000,

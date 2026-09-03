@@ -122,14 +122,36 @@ class _SimDevice:
 
     def _run(self) -> None:
         while True:
-            duration, done = self._q.get()
-            if duration > 0:
-                time.sleep(duration)
+            duration, done, kind, bid, batch_size = self._q.get()
+            start_ns = time.time_ns()
+            with jax.profiler.TraceAnnotation(
+                f"sim_device_compute:{kind}:bid={bid}:batch={batch_size}"
+            ):
+                if duration > 0:
+                    time.sleep(duration)
+            end_ns = time.time_ns()
+            logger.info(
+                "SIM-DEVICE-COMPUTE start_ns=%d end_ns=%d kind=%s bid=%s "
+                "batch_size=%d duration_ms=%.3f",
+                start_ns,
+                end_ns,
+                kind,
+                bid,
+                batch_size,
+                (end_ns - start_ns) / 1e6,
+            )
             done.set()
 
-    def dispatch(self, duration_s: float) -> threading.Event:
+    def dispatch(
+        self,
+        duration_s: float,
+        *,
+        kind: str = "unknown",
+        bid: int | str = "unknown",
+        batch_size: int = 0,
+    ) -> threading.Event:
         done = threading.Event()
-        self._q.put((duration_s, done))
+        self._q.put((duration_s, done, kind, bid, batch_size))
         return done
 
 
@@ -996,16 +1018,46 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         with jax.profiler.TraceAnnotation("sim_device_wait"):
             done.wait()
 
-    def _simulate_logits_output(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
-        """Zero next-token logits of the shape+sharding the real forward emits."""
-        logits = jnp.zeros(
-            (int(forward_batch.batch_size), self.model_config.vocab_size),
-            dtype=jnp.float32,
+    def simulation_logits_output(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        full_vocab: bool = False,
+    ) -> LogitsProcessorOutput:
+        """Return placeholder logits for ``--simulate-compute``.
+
+        Normal simulation never consumes logits, so keep the vocab dimension at
+        one.  This avoids making CPU simulation spend most of its time allocating
+        and sampling an otherwise unused ``[batch, vocab_size]`` tensor.  The
+        full-vocab form remains available for logprob and grammar-constrained
+        requests, which still use the real sampler for compatibility.
+        """
+        vocab_size = self.model_config.vocab_size if full_vocab else 1
+        logits = np.zeros(
+            (int(forward_batch.batch_size), vocab_size),
+            dtype=np.float32,
         )
-        # Match the real logits sharding (batch over "data", vocab over "tensor")
-        # so the sampler's lax.cond branches agree on types.
-        logits = jax.device_put(logits, NamedSharding(self.mesh, P("data", "tensor")))
+        logits = jax.device_put(
+            logits,
+            NamedSharding(
+                self.mesh,
+                P("data", "tensor") if full_vocab else P("data", None),
+            ),
+        )
         return LogitsProcessorOutput(next_token_logits=logits)
+
+    def simulation_sample(self, seq_lens: np.ndarray) -> jax.Array:
+        """Generate cheap deterministic token ids for valid simulated rows."""
+        simulated_token_id = max(min(32, self.model_config.vocab_size - 1), 0)
+        next_token_ids = np.where(
+            np.asarray(seq_lens) > 0,
+            simulated_token_id,
+            0,
+        ).astype(np.int32)
+        return jax.device_put(
+            next_token_ids,
+            NamedSharding(self.mesh, P("data")),
+        )
 
     def _forward(
         self,
@@ -1017,13 +1069,19 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             # placeholder logits immediately. In overlap mode the host blocks on
             # completion later (sim_wait_next_completion at resolve); with
             # overlap disabled there is no separate resolve step, so block here.
-            done = self._sim_device.dispatch(self._sim_duration_s(forward_batch))
+            kind = "decode" if forward_batch.forward_mode.is_decode() else "prefill"
+            done = self._sim_device.dispatch(
+                self._sim_duration_s(forward_batch),
+                kind=kind,
+                bid=getattr(forward_batch, "bid", "unknown"),
+                batch_size=int(forward_batch.batch_size),
+            )
             if self.server_args.disable_overlap_schedule:
                 with jax.profiler.TraceAnnotation("sim_device_wait"):
                     done.wait()
             else:
                 self._sim_completions.put(done)
-            return self._simulate_logits_output(forward_batch), 0, None
+            return self.simulation_logits_output(forward_batch), 0, None
 
         cache_miss_count = 0
         import jax._src.test_util as jtu

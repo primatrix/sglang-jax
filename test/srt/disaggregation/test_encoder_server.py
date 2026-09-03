@@ -41,35 +41,35 @@ def _encoder(output: jnp.ndarray, processed: list[MultimodalInputs]) -> MMEncode
     return encoder
 
 
-def test_encode_batch_discards_jax_bucket_padding():
+async def _run_encoder(encoder: MMEncoder, requests: list[dict]):
+    return encoder.encode(await encoder.preprocess(requests))
+
+
+def test_encode_discards_jax_bucket_padding():
     output = jnp.arange(16, dtype=jnp.float32).reshape(8, 2)
     encoder = _encoder(output, [_inputs(2), _inputs(3)])
 
-    results = asyncio.run(encoder.encode_batch([{"modality": "IMAGE"}, {"modality": "IMAGE"}]))
+    results = asyncio.run(_run_encoder(encoder, [{"modality": "IMAGE"}, {"modality": "IMAGE"}]))
 
     np.testing.assert_array_equal(results[0][0], output[:2])
     np.testing.assert_array_equal(results[1][0], output[2:5])
     assert [embedding.shape for embedding, _ in results] == [(2, 2), (3, 2)]
 
 
-def test_encode_batch_rejects_incomplete_output():
+def test_encode_rejects_incomplete_output():
     encoder = _encoder(jnp.zeros((2, 2)), [_inputs(3)])
 
     with pytest.raises(ValueError, match="incomplete IMAGE encoder output"):
-        asyncio.run(encoder.encode_batch([{"modality": "IMAGE"}]))
+        asyncio.run(_run_encoder(encoder, [{"modality": "IMAGE"}]))
 
 
-def test_encode_batch_waits_for_jax_output(monkeypatch):
+def test_encode_does_not_wait_for_jax_output(monkeypatch):
     output = jnp.zeros((2, 2))
     encoder = _encoder(output, [_inputs(2)])
-    blocked = []
 
     monkeypatch.setattr(
         "sgl_jax.srt.disaggregation.encoder.server.jax.block_until_ready",
-        lambda value: blocked.append(value),
+        lambda _value: pytest.fail("encode must not block the event loop"),
     )
 
-    asyncio.run(encoder.encode_batch([{"modality": "IMAGE"}]))
-
-    assert len(blocked) == 1
-    assert blocked[0] is output
+    asyncio.run(_run_encoder(encoder, [{"modality": "IMAGE"}]))

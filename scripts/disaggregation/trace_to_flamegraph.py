@@ -11,6 +11,7 @@ a per-tier self-time breakdown so you can locate EPD latency from the terminal.
 The folded file works with Brendan Gregg's flamegraph.pl / inferno if you want
 an alternative renderer.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -55,6 +56,12 @@ def _fold_tier(path: str, drop_idle: bool = True) -> collections.Counter:
     with gzip.open(path) as f:
         d = json.load(f)
     ev = [e for e in d.get("traceEvents", []) if e.get("ph") == "X" and "dur" in e]
+    idle_leaves = _IDLE_LEAVES
+    if any(e["name"].startswith("sim_device_compute:") for e in ev):
+        # New CPU-sim traces contain the actual background-device intervals.
+        # The scheduler-side wait overlaps those intervals, so retaining both
+        # double-counts modeled compute in a multi-thread self-time flame graph.
+        idle_leaves = _IDLE_LEAVES | {"sim_device_wait"}
     # Keep python-tracer frames ($...) and named annotations; drop XLA op spam.
     ev = [
         e
@@ -91,7 +98,7 @@ def _fold_tier(path: str, drop_idle: bool = True) -> collections.Counter:
             excl = n["dur"] - n["child"]
             if excl <= 0:
                 continue
-            if drop_idle and n["name"] in _IDLE_LEAVES:
+            if drop_idle and n["name"] in idle_leaves:
                 continue
             path = []
             j = i
@@ -150,11 +157,11 @@ def _svg(root, out: str, title: str, width: int = 1200, rowh: int = 16) -> float
         p.append(
             f'<rect x="{x:.1f}" y="{y}" width="{max(0.6, w - 0.6):.1f}" height="{rowh - 1}" '
             f'fill="{_color(name)}" stroke="#fff" stroke-width="0.3">'
-            f"<title>{html.escape(name)} — {val/1000:.1f} ms ({val/total*100:.1f}%)</title></rect>"
+            f"<title>{html.escape(name)} — {val / 1000:.1f} ms ({val / total * 100:.1f}%)</title></rect>"
         )
         if w > 34:
             p.append(
-                f'<text x="{x + 2:.1f}" y="{y + rowh - 4}">{html.escape(name)[:int(w // 6)]}</text>'
+                f'<text x="{x + 2:.1f}" y="{y + rowh - 4}">{html.escape(name)[: int(w // 6)]}</text>'
             )
     p.append("</svg>")
     open(out, "w").write("\n".join(p))
@@ -165,7 +172,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--profiler-dir", default="/tmp/epd-sim-profile")
     ap.add_argument(
-        "--out", default=None, help="SVG path (default <profiler-dir>/epd_flamegraph.svg)"
+        "--out",
+        default=None,
+        help="SVG path (default <profiler-dir>/epd_flamegraph.svg)",
     )
     args = ap.parse_args()
 
@@ -195,7 +204,7 @@ def main() -> int:
     with open(folded_path, "w") as f:
         for s, v in sorted(combined.items(), key=lambda x: -x[1]):
             f.write(f"{s} {int(v)}\n")
-    print(f"wrote {out}  (total {total/1000:.0f} ms)")
+    print(f"wrote {out}  (total {total / 1000:.0f} ms)")
     print(f"wrote {folded_path}")
 
     for tier, folded in per_tier.items():
@@ -203,9 +212,9 @@ def main() -> int:
         agg = collections.Counter()
         for stack, us in folded.items():
             agg[stack.split(";")[-1]] += us
-        print(f"\n{tier}: {tot/1000:.0f} ms sampled self-time — top frames:")
+        print(f"\n{tier}: {tot / 1000:.0f} ms sampled self-time — top frames:")
         for name, us in agg.most_common(10):
-            print(f"   {us/1000:8.1f} ms  {name[:56]}")
+            print(f"   {us / 1000:8.1f} ms  {name[:56]}")
     return 0
 
 
