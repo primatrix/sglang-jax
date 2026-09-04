@@ -4,6 +4,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from sgl_jax.srt.multimodal.common.modality_enum import Modality
 
@@ -138,7 +139,7 @@ class MultiModalEmbeddingData:
         for data, embedding in parts:
             grouped.setdefault(data.modality, []).append(embedding)
         return {
-            modality: jnp.concatenate(embeddings, axis=0)
+            modality: embeddings[0] if len(embeddings) == 1 else jnp.concatenate(embeddings, axis=0)
             for modality, embeddings in grouped.items()
         }
 
@@ -150,21 +151,29 @@ class MultiModalEmbeddingData:
             for data, _ in parts:
                 if data.modality != modality or data.grid_dim is None:
                     continue
-                value = jnp.asarray(data.grid_dim)
+                value = np.asarray(data.grid_dim)
                 if flatten:
                     value = value.reshape(-1)
                 elif value.ndim == 0:
                     value = value.reshape(1)
                 values.append(value)
             if values:
-                result[key] = jnp.concatenate(values)
+                result[key] = values[0] if len(values) == 1 else np.concatenate(values)
+
+        item_hashes: dict[Modality, list[int]] = {}
+        for data, _ in parts:
+            values = getattr(data, "item_hashes", None)
+            if values:
+                item_hashes.setdefault(data.modality, []).extend(map(int, values))
+        if item_hashes:
+            result["item_hashes"] = item_hashes
 
         second_per_grid_ts = []
         for data, _ in parts:
             if data.modality == Modality.VIDEO:
                 values = getattr(data, "second_per_grid_ts", None)
                 if values is not None:
-                    second_per_grid_ts.extend(jnp.asarray(values).ravel().tolist())
+                    second_per_grid_ts.extend(np.asarray(values).ravel().tolist())
         if second_per_grid_ts:
             result["second_per_grid_ts"] = second_per_grid_ts
         return result

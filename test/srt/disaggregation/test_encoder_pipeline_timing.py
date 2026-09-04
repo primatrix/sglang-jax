@@ -25,6 +25,23 @@ def test_language_logs_encoder_poll_time(caplog):
     assert "status=pending" in caplog.text
 
 
+def test_language_ready_only_poll_skips_incomplete_receivers():
+    pending = SimpleNamespace(
+        recv_req=SimpleNamespace(rid="request-0"),
+        done=False,
+        poll=lambda: (_ for _ in ()).throw(AssertionError("pending receiver was polled")),
+    )
+    scheduler = SimpleNamespace(
+        server_args=SimpleNamespace(
+            encoder_request_timeout_seconds=0,
+            enable_request_time_stats_logging=True,
+        ),
+        encoder_waiting={"request-0": pending},
+    )
+
+    assert Scheduler.process_encoder_requests(scheduler, [], ready_only=True) == []
+
+
 def test_language_logs_encoder_pipeline_timing(caplog):
     timing = {
         "enqueue_ns": 1_000_000,

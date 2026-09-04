@@ -6,6 +6,7 @@ import time
 from types import SimpleNamespace
 
 import jax.numpy as jnp
+import numpy as np
 
 from sgl_jax.srt.disaggregation.encoder import client as encoder_client
 from sgl_jax.srt.disaggregation.encoder.embedding_data import EmbeddingData
@@ -248,6 +249,7 @@ def test_encoder_receiver_background_progresses_without_scheduler_poll(monkeypat
         time.sleep(0.001)
     try:
         assert result is not None
+        assert pending.done
         assert result["embeddings"][Modality.IMAGE].shape == (2, 3)
         timing = result["encoder_timing"]
         assert timing["receive_done_ns"] <= timing["receive_concat_start_ns"]
@@ -259,6 +261,26 @@ def test_encoder_receiver_background_progresses_without_scheduler_poll(monkeypat
         pending.close()
         client.close()
     assert FakeRouter.instance.closed
+
+
+def test_encoder_receiver_preserves_item_hashes_as_host_metadata():
+    accumulator = encoder_client.MultiModalEmbeddingData(1)
+    accumulator.add(
+        EmbeddingData(
+            req_id="request-0",
+            num_parts=1,
+            part_idx=0,
+            grid_dim=np.asarray([[1, 2, 4]], dtype=np.int32),
+            modality=Modality.IMAGE,
+            item_hashes=[123],
+        ),
+        jnp.zeros((2, 3)),
+    )
+
+    metadata = accumulator.get_mm_extra_meta()
+
+    assert metadata["item_hashes"] == {Modality.IMAGE: [123]}
+    assert isinstance(metadata["img_grid_thw"], np.ndarray)
 
 
 def test_encoder_request_dispatcher_reuses_http_client(monkeypatch):

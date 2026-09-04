@@ -219,6 +219,8 @@ class BaseMultimodalProcessor(ABC):
             audio_seq_lens=metadata.get("audio_feature_lens"),
         )
         consumed = {modality: 0 for modality in Modality.all()}
+        consumed_items = {modality: 0 for modality in Modality.all()}
+        item_hashes = metadata.get("item_hashes", {})
         mm_items = []
         for modality, placeholder_range in zip(modalities, ranges):
             modality_embeddings = embeddings.get(modality)
@@ -230,14 +232,18 @@ class BaseMultimodalProcessor(ABC):
             if len(embedding) != end - start:
                 raise ValueError(f"incomplete {modality.name} encoder embeddings")
 
+            hashes = item_hashes.get(modality, ())
+            item_index = consumed_items[modality]
             item = MultimodalDataItem(
                 modality=modality,
+                hash=int(hashes[item_index]) if item_index < len(hashes) else None,
                 placeholder_ranges=[placeholder_range],
                 precomputed_embeddings=embedding,
             )
             item.set_pad_value()
             mm_items.append(item)
             consumed[modality] = end
+            consumed_items[modality] += 1
 
         for modality, modality_embeddings in embeddings.items():
             if modality in consumed and consumed[modality] != len(modality_embeddings):

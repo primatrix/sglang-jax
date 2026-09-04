@@ -27,6 +27,7 @@ from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
 from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
 from sgl_jax.srt.multimodal.in_model.lane_packing import (
     encoder_num_lanes,
+    packed_output_capacity,
     precompile_mrope_vision_model,
     run_mrope_vision_model,
 )
@@ -663,6 +664,21 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         rows = encoder_num_lanes(self.mesh, self.visual.vision_tp)
         unit = self.visual.spatial_merge_unit
         return tuple(rows * bucket // unit for bucket in self.visual.input_buckets)
+
+    def get_multimodal_embedding_packed_capacity(
+        self,
+        items: list[MultimodalDataItem],
+    ) -> int | None:
+        if not hasattr(self, "visual"):
+            return None
+        if not items or any(item.feature is None for item in items):
+            return None
+        return packed_output_capacity(
+            [int(item.feature.shape[0]) for item in items],  # type: ignore[union-attr]
+            encoder_num_lanes(self.mesh, self.visual.vision_tp),
+            buckets=self.visual.input_buckets,
+            merge_unit=self.visual.spatial_merge_unit,
+        )
 
     def get_image_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
         return self._get_visual_feature(items)

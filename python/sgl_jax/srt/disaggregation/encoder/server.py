@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from functools import partial
@@ -74,6 +76,9 @@ class PreparedEncoderBatch:
     modality: Modality
     inputs: list[MultimodalInputs]
     request_timings: list[dict[str, int]]
+    token_counts: tuple[int, ...]
+    split_capacity: int | None
+    split_executable: Future[Any] | None
     done_ns: int
 
 
@@ -101,6 +106,10 @@ class MMEncoder:
         self._sim_encoder_base_ms = server_args.simulate_compute_encoder_base_ms
         self._sim_encoder_ms_per_token = server_args.simulate_compute_encoder_ms_per_token
         self._log_timing = server_args.enable_request_time_stats_logging
+        self._max_batch_size = max(1, int(server_args.encoder_max_batch_size))
+        self._split_compile_lock = threading.Lock()
+        self._split_executables: dict[tuple[int, tuple[int, ...]], Future[Any]] = {}
+        self._split_compile_pool: ThreadPoolExecutor | None = None
 
         config = self.model_config.hf_config
         config.vision_encoder_parallel = server_args.vision_encoder_parallel
@@ -129,6 +138,10 @@ class MMEncoder:
             if not server_args.disable_precompile:
                 logger.info("Precompiling multimodal encoder")
                 self.model.precompile_multimodal()
+                self._split_compile_pool = ThreadPoolExecutor(
+                    max_workers=min(4, self._max_batch_size),
+                    thread_name_prefix="encoder-split-compile",
+                )
 
         tokenizer_path = server_args.tokenizer_path
         tokenizer_subdir = resolve_tokenizer_subdir(server_args.model_path, tokenizer_path)
@@ -156,7 +169,17 @@ class MMEncoder:
             *(self._process_request(request, modality) for request in requests)
         )
         processed, timings = map(list, zip(*prepared))
-        return PreparedEncoderBatch(modality, processed, timings, time.time_ns())
+        token_counts = self._token_counts(processed)
+        split_capacity, split_executable = self._precompile_splits(processed, token_counts)
+        return PreparedEncoderBatch(
+            modality,
+            processed,
+            timings,
+            token_counts,
+            split_capacity,
+            split_executable,
+            time.time_ns(),
+        )
 
     def encode(self, batch: PreparedEncoderBatch) -> list[tuple[jax.Array, dict[str, Any]]]:
         modality = batch.modality
@@ -204,14 +227,7 @@ class MMEncoder:
         result_pack_duration_ns = 0
 
         phase_start_ns = time.perf_counter_ns()
-        token_counts = tuple(
-            sum(
-                end - start
-                for item in mm_inputs.mm_items
-                for start, end in item.placeholder_ranges or ()
-            )
-            for mm_inputs in processed
-        )
+        token_counts = batch.token_counts
         token_count_duration_ns += time.perf_counter_ns() - phase_start_ns
 
         phase_start_ns = time.perf_counter_ns()
@@ -223,6 +239,8 @@ class MMEncoder:
             for token_count in token_counts:
                 embeddings.append(jax.device_put(packed[offset : offset + token_count]))
                 offset += token_count
+        elif batch.split_executable is not None and batch.split_capacity == packed.shape[0]:
+            embeddings = batch.split_executable.result()(packed)
         else:
             embeddings = _split_packed_encoder_output(packed, token_counts=token_counts)
         if any(
@@ -303,6 +321,93 @@ class MMEncoder:
             timing["preprocess_request_done_ns"] = time.time_ns()
         return mm_inputs, timing
 
+    @staticmethod
+    def _token_counts(processed: list[MultimodalInputs]) -> tuple[int, ...]:
+        return tuple(
+            sum(
+                end - start
+                for item in mm_inputs.mm_items
+                for start, end in item.placeholder_ranges or ()
+            )
+            for mm_inputs in processed
+        )
+
+    def _precompile_splits(
+        self,
+        processed: list[MultimodalInputs],
+        token_counts: tuple[int, ...],
+    ) -> tuple[int | None, Future[Any] | None]:
+        pool = getattr(self, "_split_compile_pool", None)
+        if pool is None:
+            return None, None
+        target = self.model.thinker if hasattr(self.model, "thinker") else self.model
+        planner = getattr(target, "get_multimodal_embedding_packed_capacity", None)
+        if planner is None:
+            return None, None
+
+        items = [item for mm_inputs in processed for item in mm_inputs.mm_items]
+        capacity = planner(items)
+        if capacity is None:
+            return None, None
+        current = self._split_executable(int(capacity), token_counts)
+
+        # A serving stream is usually homogeneous. Once its first concrete item
+        # shape is known, compile every batch-size tail before it can appear.
+        signatures = [
+            tuple((item.modality, tuple(item.feature.shape)) for item in mm_inputs.mm_items)
+            for mm_inputs in processed
+        ]
+        if signatures and all(signature == signatures[0] for signature in signatures):
+            sample_items = processed[0].mm_items
+            sample_count = token_counts[0]
+            for batch_size in range(1, self._max_batch_size + 1):
+                batch_capacity = planner(sample_items * batch_size)
+                if batch_capacity is not None:
+                    self._split_executable(
+                        int(batch_capacity),
+                        (sample_count,) * batch_size,
+                    )
+        return int(capacity), current
+
+    def _split_executable(
+        self,
+        capacity: int,
+        token_counts: tuple[int, ...],
+    ) -> Future[Any]:
+        key = (capacity, token_counts)
+        with self._split_compile_lock:
+            future = self._split_executables.get(key)
+            if future is None:
+                pool = self._split_compile_pool
+                assert pool is not None
+                future = pool.submit(
+                    self._compile_split,
+                    capacity,
+                    token_counts,
+                )
+                self._split_executables[key] = future
+            return future
+
+    def _compile_split(
+        self,
+        capacity: int,
+        token_counts: tuple[int, ...],
+    ) -> Any:
+        target = self.model.thinker if hasattr(self.model, "thinker") else self.model
+        sharding = jax.sharding.NamedSharding(
+            target.mesh,
+            jax.sharding.PartitionSpec(),
+        )
+        packed = jax.ShapeDtypeStruct(
+            (capacity, self.model_config.hidden_size),
+            self.model_config.dtype,
+            sharding=sharding,
+        )
+        return _split_packed_encoder_output.lower(
+            packed,
+            token_counts=token_counts,
+        ).compile()
+
     def _placeholder(self, modality: Modality) -> str:
         config = self.mm_processor.hf_config
         token_id = getattr(config, self._TOKEN_ID_KEYS.get(modality, ""), None)
@@ -316,6 +421,9 @@ class MMEncoder:
 
     def _metadata(self, mm_inputs: MultimodalInputs, modality: Modality) -> dict[str, Any]:
         metadata: dict[str, Any] = {}
+        item_hashes = [item.hash for item in mm_inputs.mm_items]
+        if all(value is not None for value in item_hashes):
+            metadata["item_hashes"] = [int(value) for value in item_hashes]
         grid_key = self._GRID_KEYS.get(modality)
         if grid_key is not None:
             metadata["grid_dim"] = np.concatenate(
@@ -328,6 +436,9 @@ class MMEncoder:
         return metadata
 
     def shutdown(self) -> None:
+        split_compile_pool = getattr(self, "_split_compile_pool", None)
+        if split_compile_pool is not None:
+            split_compile_pool.shutdown(cancel_futures=True)
         self.mm_processor.shutdown()
 
 

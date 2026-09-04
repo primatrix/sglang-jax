@@ -249,6 +249,11 @@ class PendingEncoderRequest:
     _result: dict[str, Any] | None = field(default=None, init=False, repr=False)
     _error: Exception | None = field(default=None, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
+    _done: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
+
+    @property
+    def done(self) -> bool:
+        return self._done.is_set()
 
     def poll(self) -> dict[str, Any] | None:
         if not self.background_progress:
@@ -267,7 +272,10 @@ class PendingEncoderRequest:
                 self._result = self._poll_once()
             except Exception as exc:
                 self._error = exc
-            return self._result is not None or self._error is not None
+            done = self._result is not None or self._error is not None
+            if done:
+                self._done.set()
+            return done
 
     def _poll_once(self) -> dict[str, Any] | None:
         for future in self.registration_futures:

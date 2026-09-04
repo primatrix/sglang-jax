@@ -99,6 +99,21 @@ def _bucket_capacity(length: int, buckets: tuple[int, ...], unit: int) -> int:
     )
 
 
+def packed_output_capacity(
+    item_lengths: list[int] | tuple[int, ...],
+    num_lanes: int,
+    *,
+    buckets: tuple[int, ...],
+    merge_unit: int,
+) -> int:
+    """Plan the flattened encoder output size without allocating packed inputs."""
+    if not item_lengths:
+        raise ValueError("cannot pack an empty multimodal batch")
+    lanes = balance_lanes(item_lengths, num_lanes)
+    lane_load = max(sum(item_lengths[index] for index in lane) for lane in lanes)
+    return num_lanes * _bucket_capacity(lane_load, buckets, merge_unit) // merge_unit
+
+
 def pack_lanes(
     items: list[MultimodalDataItem],
     num_lanes: int,

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+from concurrent.futures import Future
 from types import MethodType, SimpleNamespace
 
 import jax.numpy as jnp
@@ -13,6 +15,7 @@ from sgl_jax.srt.multimodal.common.modality_enum import (
     MultimodalDataItem,
     MultimodalInputs,
 )
+from sgl_jax.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 
 
 def _inputs(token_count: int) -> MultimodalInputs:
@@ -81,3 +84,63 @@ def test_encode_does_not_wait_for_jax_output(monkeypatch):
     )
 
     asyncio.run(_run_encoder(encoder, [{"modality": "IMAGE"}]))
+
+
+def test_precompile_splits_covers_homogeneous_batch_tails():
+    class ImmediateExecutor:
+        def submit(self, function, *args):
+            future = Future()
+            future.set_result(function(*args))
+            return future
+
+    processed = [_inputs(2), _inputs(2)]
+    for mm_inputs in processed:
+        mm_inputs.mm_items[0].feature = np.zeros((8, 3), dtype=np.float32)
+
+    encoder = object.__new__(MMEncoder)
+    encoder.model = SimpleNamespace(
+        get_multimodal_embedding_packed_capacity=lambda items: 4 * len(items)
+    )
+    encoder._max_batch_size = 3
+    encoder._split_compile_lock = threading.Lock()
+    encoder._split_executables = {}
+    encoder._split_compile_pool = ImmediateExecutor()
+    encoder._compile_split = lambda capacity, counts: (capacity, counts)
+
+    capacity, executable = encoder._precompile_splits(processed, (2, 2))
+
+    assert capacity == 8
+    assert executable.result() == (8, (2, 2))
+    assert set(encoder._split_executables) == {
+        (4, (2,)),
+        (8, (2, 2)),
+        (12, (2, 2, 2)),
+    }
+
+
+def test_language_prepare_reuses_encoder_item_hash():
+    class Processor(BaseMultimodalProcessor):
+        async def process_mm_data_async(self, *args, **kwargs):
+            raise NotImplementedError
+
+    processor = object.__new__(Processor)
+    processor.hf_config = SimpleNamespace(
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+        vision_start_token_id=1,
+        vision_end_token_id=3,
+        image_token_id=2,
+        video_token_id=None,
+        audio_token_id=None,
+        audio_start_token_id=None,
+        audio_end_token_id=None,
+    )
+
+    result = processor.get_mm_data(
+        [1, 2, 3],
+        {Modality.IMAGE: jnp.zeros((2, 4))},
+        image_grid_thw=np.asarray([[1, 2, 4]], dtype=np.int32),
+        item_hashes={Modality.IMAGE: [123]},
+    )
+
+    assert result.mm_items[0].hash == 123
+    assert result.mm_items[0].pad_value == -124

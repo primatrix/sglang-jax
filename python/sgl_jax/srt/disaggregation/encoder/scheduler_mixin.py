@@ -44,7 +44,12 @@ class SchedulerDisaggregationEncoderMixin:
             raise ValueError("encoder disaggregation requires a multimodal processor")
         self.encoder_client = create_encoder_client(self.server_args, self.mesh)
 
-    def process_encoder_requests(self: Scheduler, recv_reqs: list) -> list:
+    def process_encoder_requests(
+        self: Scheduler,
+        recv_reqs: list,
+        *,
+        ready_only: bool = False,
+    ) -> list:
         ready = []
         now = time.monotonic()
 
@@ -70,6 +75,8 @@ class SchedulerDisaggregationEncoderMixin:
             False,
         )
         for rid, pending in list(self.encoder_waiting.items()):
+            if ready_only and not pending.done:
+                continue
             recv_req = pending.recv_req
 
             result = None
