@@ -223,6 +223,7 @@ class SimEncoderServerTransfer:
         transfer_id = reservation.transfer_id
         slot = reservation.slot
         copy_done_ns = time.time_ns()
+        register_start_ns = copy_done_ns
         pool = self._pool
         if pool is None:
             raise RuntimeError("simulated encoder pool is not initialized")
@@ -235,6 +236,7 @@ class SimEncoderServerTransfer:
             if self._setup_ms:
                 time.sleep(self._setup_ms / 1000.0)
             pool.schedule(transfer_id, slot)
+            register_done_ns = time.time_ns()
         except BaseException:
             with self._lock:
                 self._release_locked(transfer_id)
@@ -248,6 +250,8 @@ class SimEncoderServerTransfer:
             "transfer_reserve_done_ns": reservation.reserve_done_ns,
             "transfer_copy_submit_ns": staged_transfer.copy_submit_ns,
             "transfer_copy_done_ns": copy_done_ns,
+            "transfer_register_start_ns": register_start_ns,
+            "transfer_register_done_ns": register_done_ns,
         }
 
     def _reap_completed(self) -> None:

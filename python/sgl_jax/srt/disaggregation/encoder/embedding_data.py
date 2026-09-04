@@ -101,6 +101,8 @@ class EmbeddingData:
         transfer_copy_start_ns: int | None = None,
         transfer_copy_submit_ns: int | None = None,
         transfer_copy_done_ns: int | None = None,
+        transfer_register_start_ns: int | None = None,
+        transfer_register_done_ns: int | None = None,
         transfer_stage_done_ns: int | None = None,
         publish_done_ns: int | None = None,
         receive_metadata_ns: int | None = None,
@@ -139,6 +141,8 @@ class EmbeddingData:
         self.transfer_copy_start_ns = transfer_copy_start_ns
         self.transfer_copy_submit_ns = transfer_copy_submit_ns
         self.transfer_copy_done_ns = transfer_copy_done_ns
+        self.transfer_register_start_ns = transfer_register_start_ns
+        self.transfer_register_done_ns = transfer_register_done_ns
         self.transfer_stage_done_ns = transfer_stage_done_ns
         self.publish_done_ns = publish_done_ns
         self.receive_metadata_ns = receive_metadata_ns
@@ -284,6 +288,8 @@ class MultiModalEmbeddingData:
             "transfer_copy_start_ns",
             "transfer_copy_submit_ns",
             "transfer_copy_done_ns",
+            "transfer_register_start_ns",
+            "transfer_register_done_ns",
             "transfer_stage_done_ns",
             "publish_done_ns",
             "receive_metadata_ns",
@@ -311,6 +317,7 @@ class MultiModalEmbeddingData:
             "transfer_start_ns",
             "transfer_reserve_start_ns",
             "transfer_copy_start_ns",
+            "transfer_register_start_ns",
             "receive_metadata_ns",
             "receive_materialize_start_ns",
         }

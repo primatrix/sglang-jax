@@ -105,6 +105,8 @@ def test_language_logs_encoder_pipeline_timing(caplog):
         "transfer_enqueue_ns": 8_000_000,
         "transfer_start_ns": 10_000_000,
         "transfer_copy_done_ns": 14_000_000,
+        "transfer_register_start_ns": 14_200_000,
+        "transfer_register_done_ns": 14_800_000,
         "transfer_stage_done_ns": 14_000_000,
         "publish_done_ns": 15_000_000,
         "receive_metadata_ns": 16_000_000,
@@ -169,7 +171,9 @@ def test_language_logs_encoder_pipeline_timing(caplog):
     assert "transfer_copy_submit_ms=0.200" in caplog.text
     assert "transfer_copy_wait_ms=6.600" in caplog.text
     assert "transfer_worker_wait_ms=4.000" in caplog.text
-    assert "transfer_register_ms=1.000" in caplog.text
+    assert "transfer_post_copy_queue_ms=0.200" in caplog.text
+    assert "transfer_register_ms=0.600" in caplog.text
+    assert "transfer_publish_finalize_ms=0.200" in caplog.text
     assert "transfer_total_ms=7.900" in caplog.text
     assert "receive_ms=7.000" in caplog.text
     assert "mm_prepare_ms=2.000" in caplog.text
@@ -234,6 +238,8 @@ def test_language_logs_encoder_preprocess_timing(caplog):
         "transfer_enqueue_ns": 21_100_000,
         "transfer_start_ns": 21_200_000,
         "transfer_copy_done_ns": 21_800_000,
+        "transfer_register_start_ns": 21_820_000,
+        "transfer_register_done_ns": 21_900_000,
         "transfer_stage_done_ns": 21_800_000,
         "publish_done_ns": 22_000_000,
         "receive_metadata_ns": 22_100_000,

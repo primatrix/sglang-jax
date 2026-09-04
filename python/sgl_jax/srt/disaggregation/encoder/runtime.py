@@ -332,6 +332,13 @@ class EncoderRuntime:
                 or job.data.transfer_stage_done_ns
                 or job.data.transfer_start_ns
             )
+            job.data.transfer_register_start_ns = (
+                getattr(job.data, "transfer_register_start_ns", None)
+                or job.data.transfer_copy_done_ns
+            )
+            job.data.transfer_register_done_ns = (
+                getattr(job.data, "transfer_register_done_ns", None) or time.time_ns()
+            )
             job.data.transfer_stage_done_ns = job.data.transfer_copy_done_ns
             job.data.transfer_id = str(transfer_metadata.get("transfer_id", job.transfer_id))
             job.data.publish_done_ns = time.time_ns()

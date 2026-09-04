@@ -7,7 +7,7 @@ import logging
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import jax
@@ -74,6 +74,25 @@ class _StagedTransfer:
     ready: jax.Array
     pool_ready_ns: int
     copy_submit_ns: int
+    ready_group: _ReadyGroup | None = None
+
+
+@dataclass(slots=True)
+class _ReadyGroup:
+    tickets: tuple[jax.Array, ...]
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+    _copy_done_ns: int | None = None
+
+    def wait(self) -> int:
+        if self._copy_done_ns is not None:
+            return self._copy_done_ns
+        with self._lock:
+            if self._copy_done_ns is None:
+                for ticket in self.tickets:
+                    if not ticket.is_ready():
+                        ticket.block_until_ready()
+                self._copy_done_ns = time.time_ns()
+            return self._copy_done_ns
 
 
 class RaidenEncoderServerTransfer:
@@ -358,12 +377,14 @@ class RaidenEncoderServerTransfer:
             self.cancel_batch(reservations)
             raise
         copy_submit_ns = time.time_ns()
+        ready_group = _ReadyGroup(tuple(ready))
         return [
             _StagedTransfer(
                 reservation,
                 item_ready,
                 pool_ready_ns,
                 copy_submit_ns,
+                ready_group,
             )
             for reservation, item_ready in zip(reservations, ready)
         ]
@@ -372,9 +393,14 @@ class RaidenEncoderServerTransfer:
         reservation = staged_transfer.reservation
         transfer_id = reservation.transfer_id
         slot = reservation.slot
-        if not staged_transfer.ready.is_ready():
-            staged_transfer.ready.block_until_ready()
-        copy_done_ns = time.time_ns()
+        ready_group = getattr(staged_transfer, "ready_group", None)
+        if ready_group is not None:
+            copy_done_ns = ready_group.wait()
+        else:
+            if not staged_transfer.ready.is_ready():
+                staged_transfer.ready.block_until_ready()
+            copy_done_ns = time.time_ns()
+        register_start_ns = time.time_ns()
         try:
             with self._lock:
                 if transfer_id not in self._pending or self._slots.get(transfer_id) != slot:
@@ -384,6 +410,7 @@ class RaidenEncoderServerTransfer:
             transfer_uuid = _uuid_to_int(transfer_id)
             if not self._raiden.register_read(transfer_id, transfer_uuid, [slot]):
                 raise RuntimeError(f"Raiden rejected encoder transfer {transfer_id!r}")
+            register_done_ns = time.time_ns()
         except BaseException:
             with self._lock:
                 self._release_locked(transfer_id)
@@ -403,6 +430,8 @@ class RaidenEncoderServerTransfer:
             transfer_reserve_done_ns=reservation.reserve_done_ns,
             transfer_copy_submit_ns=staged_transfer.copy_submit_ns,
             transfer_copy_done_ns=copy_done_ns,
+            transfer_register_start_ns=register_start_ns,
+            transfer_register_done_ns=register_done_ns,
         )
         return metadata
 

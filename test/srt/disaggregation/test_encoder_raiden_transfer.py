@@ -179,6 +179,10 @@ def test_raiden_server_writes_packed_batch_directly_into_pool(monkeypatch):
     np.testing.assert_array_equal(buffer[1, :, :3], packed[2:4])
     np.testing.assert_array_equal(buffer[2, :, :3], packed[4:6])
     assert [item["transfer_block_ids"] for item in metadata] == [[0], [1], [2]]
+    assert len({item["transfer_copy_done_ns"] for item in metadata}) == 1
+    assert all(
+        item["transfer_register_start_ns"] <= item["transfer_register_done_ns"] for item in metadata
+    )
     assert len(transfer._pool._packed_copies) == 1
     assert next(iter(transfer._pool._packed_copies))[-1] is True
     transfer.close()
