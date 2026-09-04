@@ -1,0 +1,417 @@
+"""Raiden-backed encoder transfer implementations."""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import Any
+
+import jax
+import jax.numpy as jnp
+
+from sgl_jax.raiden import require_raiden_preloaded
+from sgl_jax.srt.disaggregation.encoder.client import DeferredReceiveSession
+from sgl_jax.srt.disaggregation.encoder.embedding_data import EmbeddingData
+from sgl_jax.srt.disaggregation.encoder.raiden_pool import (
+    RaidenReceivePool,
+    RaidenReceiveSession,
+    RaidenSendPool,
+)
+from sgl_jax.srt.disaggregation.raiden_transfer.wrapper import RaidenTransferWrapper
+
+logger = logging.getLogger(__name__)
+_LOCAL_ENDPOINT_HOSTS = {"", "0.0.0.0", "127.0.0.1", "::", "::1", "localhost"}
+
+
+def _uuid_to_int(value: str) -> int:
+    digest = hashlib.blake2b(value.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big") & ((1 << 50) - 1)
+
+
+def _normalize_endpoint(endpoint: object, peer_host: str) -> str:
+    value = str(endpoint)
+    host, port_text = value.rsplit(":", 1)
+    port = int(port_text)
+    host = host.strip("[]")
+    if host in _LOCAL_ENDPOINT_HOSTS:
+        host = peer_host
+    if ":" in host:
+        host = f"[{host}]"
+    return f"{host}:{port}"
+
+
+def _normalize_endpoints(endpoints: object, peer_host: str) -> list[dict[str, Any]]:
+    if not isinstance(endpoints, list) or not endpoints:
+        raise ValueError("Raiden encoder did not publish endpoint descriptors")
+    result = []
+    for item in endpoints:
+        shards = item.get("shards", [])
+        result.append(
+            {
+                "endpoint": _normalize_endpoint(item.get("endpoint", ""), peer_host),
+                "shards": [int(shard) for shard in shards],
+            }
+        )
+    return result
+
+
+@dataclass(frozen=True, slots=True)
+class _Reservation:
+    transfer_id: str
+    slot: int
+    reserve_start_ns: int
+    reserve_done_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class _StagedTransfer:
+    reservation: _Reservation
+    ready: jax.Array
+    pool_ready_ns: int
+    copy_submit_ns: int
+
+
+class RaidenEncoderServerTransfer:
+    """Publish encoder outputs from one registered source pool."""
+
+    def __init__(
+        self,
+        host_ip: str,
+        *,
+        parallelism: int = 1,
+        pool_size: int = 32,
+        timeout_s: float = 300.0,
+        poll_interval_s: float = 0.001,
+        log_inflight: bool = False,
+    ) -> None:
+        require_raiden_preloaded()
+        self._pool_size = max(1, int(pool_size))
+        self._timeout_s = float(timeout_s)
+        self._poll_interval_s = max(0.0001, float(poll_interval_s))
+        self._log_inflight = bool(log_inflight)
+        self._raiden = RaidenTransferWrapper(
+            host_ip,
+            0,
+            parallelism=max(1, int(parallelism)),
+        )
+        self._pool: RaidenSendPool | None = None
+        self._free = list(range(self._pool_size - 1, -1, -1))
+        self._slots: dict[str, int] = {}
+        self._active: set[str] = set()
+        self._pending: set[str] = set()
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def reserve_batch_sync(self, transfer_ids: list[str]) -> list[_Reservation]:
+        transfer_ids = list(transfer_ids)
+        if not transfer_ids:
+            return []
+        if len(transfer_ids) > self._pool_size:
+            raise ValueError("encoder batch exceeds Raiden pool capacity")
+        if len(set(transfer_ids)) != len(transfer_ids):
+            raise ValueError("duplicate Raiden transfer_id in encoder batch")
+
+        reserve_start_ns = time.time_ns()
+        deadline = time.monotonic() + self._timeout_s
+        while True:
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("Raiden encoder transfer is closed")
+                duplicate = next(
+                    (transfer_id for transfer_id in transfer_ids if transfer_id in self._slots),
+                    None,
+                )
+                if duplicate is not None:
+                    raise ValueError(f"duplicate Raiden transfer_id: {duplicate}")
+                if len(self._free) >= len(transfer_ids):
+                    slots = [self._free.pop() for _ in transfer_ids]
+                    self._slots.update(zip(transfer_ids, slots))
+                    self._pending.update(transfer_ids)
+                    reserve_done_ns = time.time_ns()
+                    return [
+                        _Reservation(
+                            transfer_id,
+                            slot,
+                            reserve_start_ns,
+                            reserve_done_ns,
+                        )
+                        for transfer_id, slot in zip(transfer_ids, slots)
+                    ]
+
+            self._reap_completed()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out waiting for Raiden encoder pool slots")
+            time.sleep(min(remaining, self._poll_interval_s))
+
+    def stage_batch_sync(
+        self,
+        reservations: list[_Reservation],
+        embeddings: list[jax.Array],
+    ) -> list[_StagedTransfer]:
+        if len(reservations) != len(embeddings):
+            raise ValueError("Raiden reservation and embedding counts differ")
+        if not reservations:
+            return []
+        if any(embedding.ndim != 2 or embedding.shape[0] <= 0 for embedding in embeddings):
+            raise ValueError("Raiden embedding must be a non-empty matrix")
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Raiden encoder transfer is closed")
+            for reservation in reservations:
+                if (
+                    reservation.transfer_id not in self._pending
+                    or self._slots.get(reservation.transfer_id) != reservation.slot
+                ):
+                    raise RuntimeError(
+                        f"Raiden reservation is no longer active: {reservation.transfer_id}"
+                    )
+            pool = self._pool
+
+        if pool is None:
+            pool = RaidenSendPool(
+                embeddings[0],
+                capacity=self._pool_size,
+            )
+            self._raiden.start(
+                [pool.buffer],
+                max_blocks=1,
+                num_slots=self._pool_size,
+                timeout_s=self._timeout_s,
+            )
+            with self._lock:
+                self._pool = pool
+
+        for embedding in embeddings:
+            if not pool.matches(embedding):
+                raise ValueError(
+                    "Raiden encoder pool embedding mismatch: "
+                    f"expected shape={pool.shape}, dtype={pool.dtype}, "
+                    f"sharding={pool.sharding}; got shape={tuple(embedding.shape)}, "
+                    f"dtype={embedding.dtype}, sharding={embedding.sharding}"
+                )
+        pool_ready_ns = time.time_ns()
+
+        staged = []
+        try:
+            for reservation, embedding in zip(reservations, embeddings):
+                ready = pool.copy_async(embedding, reservation.slot)
+                staged.append(
+                    _StagedTransfer(
+                        reservation,
+                        ready,
+                        pool_ready_ns,
+                        time.time_ns(),
+                    )
+                )
+        except BaseException:
+            if staged:
+                staged[-1].ready.block_until_ready()
+            self.cancel_batch(reservations)
+            raise
+        return staged
+
+    def publish_sync(self, staged_transfer: Any) -> dict[str, Any]:
+        reservation = staged_transfer.reservation
+        transfer_id = reservation.transfer_id
+        slot = reservation.slot
+        if not staged_transfer.ready.is_ready():
+            staged_transfer.ready.block_until_ready()
+        copy_done_ns = time.time_ns()
+        try:
+            with self._lock:
+                if transfer_id not in self._pending or self._slots.get(transfer_id) != slot:
+                    raise RuntimeError(f"Raiden reservation was cancelled: {transfer_id}")
+                self._pending.remove(transfer_id)
+                self._active.add(transfer_id)
+            transfer_uuid = _uuid_to_int(transfer_id)
+            if not self._raiden.register_read(transfer_id, transfer_uuid, [slot]):
+                raise RuntimeError(f"Raiden rejected encoder transfer {transfer_id!r}")
+        except BaseException:
+            with self._lock:
+                self._release_locked(transfer_id)
+            raise
+
+        metadata = {
+            "transfer_id": transfer_id,
+            "transfer_uuid": transfer_uuid,
+            "transfer_address": self._raiden.endpoints,
+            "transfer_host": self._raiden.host_ip,
+            "transfer_block_ids": [slot],
+        }
+        self._log_inflight_event("start", transfer_id)
+        metadata.update(
+            transfer_reserve_start_ns=reservation.reserve_start_ns,
+            transfer_pool_ready_ns=staged_transfer.pool_ready_ns,
+            transfer_reserve_done_ns=reservation.reserve_done_ns,
+            transfer_copy_submit_ns=staged_transfer.copy_submit_ns,
+            transfer_copy_done_ns=copy_done_ns,
+        )
+        return metadata
+
+    def _reap_completed(self) -> None:
+        with self._lock:
+            started = self._pool is not None
+        if not started:
+            return
+        try:
+            sent, _, failed = self._raiden.poll_stats()
+        except Exception:
+            logger.exception("Raiden encoder sender poll failed")
+            return
+        for transfer_id in sent:
+            self._discard_active(transfer_id, event="sent")
+        for transfer_id in failed:
+            self._discard_active(transfer_id, event="failed")
+
+    def cancel_batch(self, reservations: list[_Reservation]) -> None:
+        with self._lock:
+            for reservation in reservations:
+                transfer_id = reservation.transfer_id
+                if transfer_id in self._pending:
+                    self._release_locked(transfer_id)
+
+    def release(self, transfer_id: str) -> None:
+        event = None
+        with self._lock:
+            if transfer_id in self._pending:
+                self._release_locked(transfer_id)
+                event = "release"
+            elif transfer_id in self._active:
+                event = "defer"
+        if event is not None:
+            self._log_inflight_event(event, transfer_id)
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            active = list(self._active)
+            self._free.clear()
+            self._slots.clear()
+            self._active.clear()
+            self._pending.clear()
+        for transfer_id in active:
+            self._log_inflight_event("close", transfer_id)
+
+    def _discard_active(self, transfer_id: str, *, event: str) -> None:
+        with self._lock:
+            removed = transfer_id in self._active
+            if removed:
+                self._release_locked(transfer_id)
+        if removed:
+            self._log_inflight_event(event, transfer_id)
+
+    def _release_locked(self, transfer_id: str) -> None:
+        slot = self._slots.pop(transfer_id, None)
+        self._pending.discard(transfer_id)
+        self._active.discard(transfer_id)
+        if slot is not None:
+            self._free.append(slot)
+
+    def _log_inflight_event(self, event: str, transfer_id: str) -> None:
+        if not self._log_inflight:
+            return
+        with self._lock:
+            inflight = len(self._active)
+        logger.info(
+            "ENCODER-RAIDEN-INFLIGHT time_ns=%d event=%s transfer_id=%s "
+            "group_size=1 inflight_groups=%d inflight_requests=%d",
+            time.time_ns(),
+            event,
+            transfer_id,
+            inflight,
+            inflight,
+        )
+
+
+class RaidenReceiverBackend:
+    def __init__(
+        self,
+        host: str,
+        sharding: jax.sharding.Sharding,
+        parallelism: int,
+        pool_size: int,
+        transfer_timeout_s: float,
+    ) -> None:
+        self._host = host
+        self._sharding = sharding
+        self._parallelism = max(1, int(parallelism))
+        self._pool_size = max(1, int(pool_size))
+        self._transfer_timeout_s = float(transfer_timeout_s)
+        self._pool: RaidenReceivePool | None = None
+        self._pool_lock = threading.Lock()
+        self._closed = False
+        # Pool creation and Raiden control-plane calls stay off the event loop.
+        self._executor = ThreadPoolExecutor(max_workers=1)
+
+    def start(self, data: EmbeddingData) -> DeferredReceiveSession:
+        return DeferredReceiveSession(self._executor.submit(self._start, data))
+
+    def _start(self, data: EmbeddingData) -> RaidenReceiveSession:
+        if data.shape is None or data.dtype is None:
+            raise ValueError("embedding shape and dtype are required")
+        shape = tuple(int(dim) for dim in data.shape)
+        if len(shape) != 2 or shape[0] <= 0:
+            raise ValueError("Raiden embedding must be a non-empty matrix")
+        transfer_id = getattr(data, "transfer_id", None)
+        transfer_uuid = getattr(data, "transfer_uuid", None)
+        remote_block_ids = getattr(data, "transfer_block_ids", None)
+        endpoints = getattr(data, "transfer_address", None)
+        if not transfer_id or not isinstance(transfer_uuid, int):
+            raise ValueError("Raiden transfer identity is incomplete")
+        if not isinstance(remote_block_ids, list) or len(remote_block_ids) != 1:
+            raise ValueError("Raiden block metadata does not match embedding shape")
+        remote_block_ids = [int(block_id) for block_id in remote_block_ids]
+        if len(set(remote_block_ids)) != len(remote_block_ids) or any(
+            block_id < 0 for block_id in remote_block_ids
+        ):
+            raise ValueError("Raiden remote block IDs must be unique and non-negative")
+
+        transfer_host = getattr(data, "transfer_host", None)
+        if str(transfer_host).strip("[]") in _LOCAL_ENDPOINT_HOSTS:
+            transfer_host = None
+        if not transfer_host:
+            raise ValueError("Raiden transfer_host is required")
+        remote_endpoints = _normalize_endpoints(endpoints, transfer_host)
+
+        dtype = jnp.dtype(data.dtype)
+        with self._pool_lock:
+            if self._closed:
+                raise RuntimeError("Raiden receiver is closed")
+            pool = self._pool
+            if pool is None:
+                pool = RaidenReceivePool(
+                    self._host,
+                    shape,
+                    dtype,
+                    self._sharding,
+                    parallelism=self._parallelism,
+                    capacity=self._pool_size,
+                    timeout_s=self._transfer_timeout_s,
+                )
+                self._pool = pool
+            elif shape != pool.shape or dtype != pool.dtype:
+                raise ValueError(
+                    "Raiden receiver pool embedding mismatch: "
+                    f"expected shape={pool.shape}, dtype={pool.dtype}; "
+                    f"got shape={shape}, dtype={dtype}"
+                )
+        return pool.start(
+            transfer_id,
+            transfer_uuid,
+            remote_endpoints,
+            remote_block_ids,
+        )
+
+    def close(self) -> None:
+        with self._pool_lock:
+            self._closed = True
+            pool = self._pool
+        if pool is not None:
+            pool.close()
+        self._executor.shutdown(cancel_futures=True)

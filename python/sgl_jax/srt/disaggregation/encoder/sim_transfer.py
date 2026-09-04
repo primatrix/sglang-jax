@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import threading
 import time
@@ -25,22 +24,19 @@ def _transfer_duration_ns(shape, dtype, ms_per_mb: float, rtt_ms: float) -> int:
 
 
 class _SimSendPool:
-    """Shape-specific sender pool with bounded slots and transfer channels."""
+    """Sender timing model; slot ownership lives in the transfer backend."""
 
     def __init__(
         self,
         sample: jax.Array,
         *,
-        capacity: int,
         parallelism: int,
-        timeout_s: float,
         ms_per_mb: float,
         rtt_ms: float,
     ) -> None:
         self.shape = tuple(int(dim) for dim in sample.shape)
         self.dtype = sample.dtype
         self.sharding = sample.sharding
-        self._timeout_s = float(timeout_s)
         self._duration_ns = _transfer_duration_ns(
             self.shape,
             self.dtype,
@@ -48,10 +44,8 @@ class _SimSendPool:
             rtt_ms,
         )
         self._channel_ready_ns = [0] * max(1, int(parallelism))
-        self._condition = threading.Condition()
-        self._free = list(range(max(1, int(capacity)) - 1, -1, -1))
         self._active: dict[str, tuple[int, int]] = {}
-        self._closed = False
+        self._lock = threading.Lock()
 
     def matches(self, value: jax.Array) -> bool:
         return (
@@ -60,36 +54,8 @@ class _SimSendPool:
             and value.sharding == self.sharding
         )
 
-    def reserve_sync(self, transfer_id: str) -> int:
-        deadline = time.monotonic() + self._timeout_s
-        with self._condition:
-            if transfer_id in self._active:
-                raise ValueError(f"duplicate simulated transfer_id: {transfer_id}")
-            while not self._free and not self._closed:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("timed out waiting for a simulated encoder pool slot")
-                self._condition.wait(remaining)
-            if self._closed:
-                raise RuntimeError("simulated encoder pool is closed")
-
-            slot = self._free.pop()
-            self._active[transfer_id] = (slot, 0)
-            return slot
-
-    async def reserve(self, transfer_id: str) -> int:
-        try:
-            return await asyncio.to_thread(self.reserve_sync, transfer_id)
-        except TimeoutError:
-            # Keep the async API's historical error message.
-            if not self._closed:
-                raise TimeoutError("timed out waiting for a simulated encoder pool slot") from None
-            raise
-
     def schedule(self, transfer_id: str, slot: int) -> int:
-        with self._condition:
-            if self._active.get(transfer_id, (None, None))[0] != slot:
-                raise RuntimeError(f"simulated encoder slot changed: {transfer_id}")
+        with self._lock:
             channel = min(
                 range(len(self._channel_ready_ns)),
                 key=self._channel_ready_ns.__getitem__,
@@ -100,38 +66,42 @@ class _SimSendPool:
             return ready_ns
 
     def poll(self) -> list[str]:
-        with self._condition:
+        with self._lock:
             now_ns = time.monotonic_ns()
             completed = [
                 transfer_id
                 for transfer_id, (_, ready_ns) in self._active.items()
-                if ready_ns and ready_ns <= now_ns
+                if ready_ns <= now_ns
             ]
             for transfer_id in completed:
-                self._release_locked(transfer_id)
+                self._active.pop(transfer_id, None)
             return completed
 
-    def release(self, transfer_id: str) -> None:
-        with self._condition:
-            self._release_locked(transfer_id)
-
-    def _release_locked(self, transfer_id: str) -> None:
-        active = self._active.pop(transfer_id, None)
-        if active is not None:
-            self._free.append(active[0])
-            self._condition.notify()
-
     def close(self) -> None:
-        with self._condition:
-            self._closed = True
-            self._condition.notify_all()
+        with self._lock:
+            self._active.clear()
+
+
+@dataclass(frozen=True, slots=True)
+class _SimReservation:
+    transfer_id: str
+    slot: int
+    reserve_start_ns: int
+    reserve_done_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class _SimStagedTransfer:
+    reservation: _SimReservation
+    pool_ready_ns: int
+    copy_submit_ns: int
 
 
 class SimEncoderServerTransfer:
     """Resource-aware stand-in for ``RaidenEncoderServerTransfer``.
 
     No embedding is sent over the wire. The model preserves Raiden's
-    shape-specific pool capacity, channel contention, padded payload size, and
+    single-pool capacity, channel contention, padded payload size, and
     asynchronous sender completion lifecycle.
     """
 
@@ -153,119 +123,186 @@ class SimEncoderServerTransfer:
         self._timeout_s = float(timeout_s)
         self._ms_per_mb = float(ms_per_mb)
         self._rtt_ms = float(rtt_ms)
-        self._poll_interval_s = float(poll_interval_s)
+        self._poll_interval_s = max(0.0001, float(poll_interval_s))
         self._log_inflight = bool(log_inflight)
-        self._pools: list[_SimSendPool] = []
-        self._active: dict[str, _SimSendPool] = {}
-        self._pending: dict[str, _SimSendPool | None] = {}
+        self._pool: _SimSendPool | None = None
+        self._free = list(range(self._pool_size - 1, -1, -1))
+        self._slots: dict[str, int] = {}
+        self._active: set[str] = set()
+        self._pending: set[str] = set()
         self._closed = False
         self._lock = threading.Lock()
 
-    def stage_sync(self, transfer_id: str, embedding: jax.Array) -> Any:
-        if embedding.ndim != 2 or embedding.shape[0] <= 0:
+    def reserve_batch_sync(self, transfer_ids: list[str]) -> list[_SimReservation]:
+        transfer_ids = list(transfer_ids)
+        if not transfer_ids:
+            return []
+        if len(transfer_ids) > self._pool_size:
+            raise ValueError("encoder batch exceeds simulated pool capacity")
+        if len(set(transfer_ids)) != len(transfer_ids):
+            raise ValueError("duplicate simulated transfer_id in encoder batch")
+
+        reserve_start_ns = time.time_ns()
+        deadline = time.monotonic() + self._timeout_s
+        while True:
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("simulated encoder transfer is closed")
+                duplicate = next(
+                    (transfer_id for transfer_id in transfer_ids if transfer_id in self._slots),
+                    None,
+                )
+                if duplicate is not None:
+                    raise ValueError(f"duplicate simulated transfer_id: {duplicate}")
+                if len(self._free) >= len(transfer_ids):
+                    slots = [self._free.pop() for _ in transfer_ids]
+                    self._slots.update(zip(transfer_ids, slots))
+                    self._pending.update(transfer_ids)
+                    reserve_done_ns = time.time_ns()
+                    return [
+                        _SimReservation(
+                            transfer_id,
+                            slot,
+                            reserve_start_ns,
+                            reserve_done_ns,
+                        )
+                        for transfer_id, slot in zip(transfer_ids, slots)
+                    ]
+
+            self._reap_completed()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out waiting for simulated encoder pool slots")
+            time.sleep(min(remaining, self._poll_interval_s))
+
+    def stage_batch_sync(
+        self,
+        reservations: list[_SimReservation],
+        embeddings: list[jax.Array],
+    ) -> list[_SimStagedTransfer]:
+        if len(reservations) != len(embeddings):
+            raise ValueError("simulated reservation and embedding counts differ")
+        if not reservations:
+            return []
+        if any(embedding.ndim != 2 or embedding.shape[0] <= 0 for embedding in embeddings):
             raise ValueError("Sim embedding must be a non-empty matrix")
 
         with self._lock:
             if self._closed:
                 raise RuntimeError("simulated encoder transfer is closed")
-            if transfer_id in self._active or transfer_id in self._pending:
-                raise ValueError(f"duplicate simulated transfer_id: {transfer_id}")
-            self._pending[transfer_id] = None
-            pool = next(
-                (pool for pool in self._pools if pool.matches(embedding)),
-                None,
-            )
+            pool = self._pool
             if pool is None:
                 pool = _SimSendPool(
-                    embedding,
-                    capacity=self._pool_size,
+                    embeddings[0],
                     parallelism=self._parallelism,
-                    timeout_s=self._timeout_s,
                     ms_per_mb=self._ms_per_mb,
                     rtt_ms=self._rtt_ms,
                 )
-                self._pools.append(pool)
+                self._pool = pool
 
-        try:
-            slot = pool.reserve_sync(transfer_id)
-        except BaseException:
-            with self._lock:
-                self._pending.pop(transfer_id, None)
-            if pool is not None:
-                pool.release(transfer_id)
-            raise
-
-        with self._lock:
-            self._pending[transfer_id] = pool
-        return transfer_id, pool, slot
-
-    async def stage(self, transfer_id: str, embedding: jax.Array) -> Any:
-        return await asyncio.to_thread(self.stage_sync, transfer_id, embedding)
+        for embedding in embeddings:
+            if not pool.matches(embedding):
+                raise ValueError(
+                    "simulated encoder pool embedding mismatch: "
+                    f"expected shape={pool.shape}, dtype={pool.dtype}, "
+                    f"sharding={pool.sharding}; got shape={tuple(embedding.shape)}, "
+                    f"dtype={embedding.dtype}, sharding={embedding.sharding}"
+                )
+        pool_ready_ns = time.time_ns()
+        return [
+            _SimStagedTransfer(
+                reservation,
+                pool_ready_ns,
+                time.time_ns(),
+            )
+            for reservation in reservations
+        ]
 
     def publish_sync(self, staged_transfer: Any) -> dict[str, Any]:
-        transfer_id, pool, slot = staged_transfer
+        reservation = staged_transfer.reservation
+        transfer_id = reservation.transfer_id
+        slot = reservation.slot
+        copy_done_ns = time.time_ns()
+        pool = self._pool
+        if pool is None:
+            raise RuntimeError("simulated encoder pool is not initialized")
         try:
+            with self._lock:
+                if transfer_id not in self._pending or self._slots.get(transfer_id) != slot:
+                    raise RuntimeError(f"simulated reservation was cancelled: {transfer_id}")
+                self._pending.remove(transfer_id)
+                self._active.add(transfer_id)
             if self._setup_ms:
                 time.sleep(self._setup_ms / 1000.0)
             pool.schedule(transfer_id, slot)
         except BaseException:
             with self._lock:
-                pending = self._pending.pop(transfer_id, None)
-            if pending is not None:
-                pool.release(transfer_id)
+                self._release_locked(transfer_id)
             raise
 
-        with self._lock:
-            self._pending.pop(transfer_id, None)
-            self._active[transfer_id] = pool
         self._log_inflight_event("start", transfer_id)
-        return {"transfer_id": transfer_id}
+        return {
+            "transfer_id": transfer_id,
+            "transfer_reserve_start_ns": reservation.reserve_start_ns,
+            "transfer_pool_ready_ns": staged_transfer.pool_ready_ns,
+            "transfer_reserve_done_ns": reservation.reserve_done_ns,
+            "transfer_copy_submit_ns": staged_transfer.copy_submit_ns,
+            "transfer_copy_done_ns": copy_done_ns,
+        }
 
-    async def publish(self, staged_transfer: Any) -> dict[str, Any]:
-        return await asyncio.to_thread(self.publish_sync, staged_transfer)
-
-    def poll_completed(self) -> None:
+    def _reap_completed(self) -> None:
         with self._lock:
-            pools = list(self._pools)
-        for pool in pools:
-            for transfer_id in pool.poll():
-                self._discard_active(transfer_id, event="sent")
+            pool = self._pool
+        if pool is None:
+            return
+        for transfer_id in pool.poll():
+            self._discard_active(transfer_id, event="sent")
 
-    async def release_completed(self) -> None:
-        while True:
-            self.poll_completed()
-            await asyncio.sleep(self._poll_interval_s)
+    def cancel_batch(self, reservations: list[_SimReservation]) -> None:
+        with self._lock:
+            for reservation in reservations:
+                if reservation.transfer_id in self._pending:
+                    self._release_locked(reservation.transfer_id)
 
     def release(self, transfer_id: str) -> None:
+        event = None
         with self._lock:
-            pool = self._active.pop(transfer_id, None)
-            if pool is None:
-                pool = self._pending.pop(transfer_id, None)
-        if pool is not None:
-            pool.release(transfer_id)
-            self._log_inflight_event("release", transfer_id)
+            if transfer_id in self._pending:
+                self._release_locked(transfer_id)
+                event = "release"
+            elif transfer_id in self._active:
+                event = "defer"
+        if event is not None:
+            self._log_inflight_event(event, transfer_id)
 
     def close(self) -> None:
         with self._lock:
             self._closed = True
-            pools = list(self._pools)
+            pool = self._pool
             active = list(self._active)
-            pending = list(self._pending.values())
+            self._free.clear()
+            self._slots.clear()
             self._active.clear()
             self._pending.clear()
-        for pool in pools:
+        if pool is not None:
             pool.close()
         for transfer_id in active:
             self._log_inflight_event("close", transfer_id)
-        for pool in pending:
-            if pool is not None:
-                pool.close()
 
     def _discard_active(self, transfer_id: str, *, event: str) -> None:
         with self._lock:
-            removed = self._active.pop(transfer_id, None)
-        if removed is not None:
+            removed = transfer_id in self._active
+            if removed:
+                self._release_locked(transfer_id)
+        if removed:
             self._log_inflight_event(event, transfer_id)
+
+    def _release_locked(self, transfer_id: str) -> None:
+        slot = self._slots.pop(transfer_id, None)
+        self._pending.discard(transfer_id)
+        self._active.discard(transfer_id)
+        if slot is not None:
+            self._free.append(slot)
 
     def _log_inflight_event(self, event: str, transfer_id: str) -> None:
         if not self._log_inflight:
@@ -319,6 +356,8 @@ class _SimReceivePool:
         ms_per_mb: float,
         rtt_ms: float,
     ) -> None:
+        self.shape = shape
+        self.dtype = jnp.dtype(dtype)
         self._timeout_s = float(timeout_s)
         self._duration_ns = _transfer_duration_ns(shape, dtype, ms_per_mb, rtt_ms)
         self._buffer = jax.device_put(np.zeros(shape, dtype=dtype), sharding)
@@ -416,7 +455,7 @@ class SimReceiverBackend:
         self._parallelism = max(1, int(parallelism))
         self._pool_size = max(1, int(pool_size))
         self._transfer_timeout_s = float(transfer_timeout_s)
-        self._pools: dict[tuple[tuple[int, int], jnp.dtype], _SimReceivePool] = {}
+        self._pool: _SimReceivePool | None = None
         self._pool_lock = threading.Lock()
         self._closed = False
         self._executor = ThreadPoolExecutor(max_workers=1)
@@ -435,11 +474,10 @@ class SimReceiverBackend:
             raise ValueError("simulated transfer_id is required")
 
         dtype = jnp.dtype(data.dtype)
-        key = (shape, dtype)
         with self._pool_lock:
             if self._closed:
                 raise RuntimeError("simulated receiver is closed")
-            pool = self._pools.get(key)
+            pool = self._pool
             if pool is None:
                 pool = _SimReceivePool(
                     shape,
@@ -451,13 +489,19 @@ class SimReceiverBackend:
                     ms_per_mb=self._ms_per_mb,
                     rtt_ms=self._rtt_ms,
                 )
-                self._pools[key] = pool
+                self._pool = pool
+            elif shape != pool.shape or dtype != pool.dtype:
+                raise ValueError(
+                    "simulated receiver pool embedding mismatch: "
+                    f"expected shape={pool.shape}, dtype={pool.dtype}; "
+                    f"got shape={shape}, dtype={dtype}"
+                )
         return pool.start(str(transfer_id))
 
     def close(self) -> None:
         with self._pool_lock:
             self._closed = True
-            pools = list(self._pools.values())
-        for pool in pools:
+            pool = self._pool
+        if pool is not None:
             pool.close()
         self._executor.shutdown(cancel_futures=True)

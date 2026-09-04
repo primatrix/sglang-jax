@@ -34,22 +34,19 @@ class _FakeTransfer:
         self.released = []
         self.closed = False
 
-    def stage_sync(self, transfer_id, embedding):
-        return transfer_id, embedding
+    def reserve_batch_sync(self, transfer_ids):
+        return list(transfer_ids)
 
-    async def stage(self, transfer_id, embedding):
-        return self.stage_sync(transfer_id, embedding)
+    def stage_batch_sync(self, reservations, embeddings):
+        return list(zip(reservations, embeddings))
+
+    def cancel_batch(self, reservations):
+        self.released.extend(reservations)
 
     def publish_sync(self, staged_transfer):
         transfer_id, embedding = staged_transfer
         self.published.append((transfer_id, embedding))
         return {"transfer_id": transfer_id}
-
-    async def publish(self, staged_transfer):
-        return self.publish_sync(staged_transfer)
-
-    async def release_completed(self) -> None:
-        pass
 
     def release(self, transfer_id) -> None:
         self.released.append(transfer_id)
@@ -84,14 +81,13 @@ async def _collect(runtime: EncoderRuntime, requests: list[dict]):
     return results
 
 
-def test_sim_server_transfer_publish_is_awaitable():
-    async def run() -> None:
-        transfer = SimEncoderServerTransfer()
-        staged = await transfer.stage("request-0:embedding", jnp.zeros((1, 2)))
-        metadata = await transfer.publish(staged)
-        assert metadata == {"transfer_id": "request-0:embedding"}
-
-    asyncio.run(run())
+def test_sim_server_transfer_reserves_stages_and_publishes():
+    transfer = SimEncoderServerTransfer()
+    reservations = transfer.reserve_batch_sync(["request-0:embedding"])
+    staged = transfer.stage_batch_sync(reservations, [jnp.zeros((1, 2))])
+    metadata = transfer.publish_sync(staged[0])
+    assert metadata["transfer_id"] == "request-0:embedding"
+    transfer.close()
 
 
 def test_server_owns_scheduler_and_runtime():
@@ -349,7 +345,7 @@ def test_runtime_builds_transfer_metadata_without_scheduler_state():
 
 
 def test_runtime_uses_event_loop_for_preprocess_and_threads_for_data_path():
-    async def run() -> tuple[str, str, list[str]]:
+    async def run() -> tuple[str, str, list[str], list[str]]:
         preprocess_thread = ""
         encode_thread = ""
 
@@ -366,11 +362,16 @@ def test_runtime_uses_event_loop_for_preprocess_and_threads_for_data_path():
         class RecordingTransfer(_FakeTransfer):
             def __init__(self):
                 super().__init__()
-                self.threads = []
+                self.copy_threads = []
+                self.publish_threads = []
 
-            def stage_sync(self, transfer_id, embedding):
-                self.threads.append(threading.current_thread().name)
-                return super().stage_sync(transfer_id, embedding)
+            def stage_batch_sync(self, reservations, embeddings):
+                self.copy_threads.append(threading.current_thread().name)
+                return super().stage_batch_sync(reservations, embeddings)
+
+            def publish_sync(self, staged_transfer):
+                self.publish_threads.append(threading.current_thread().name)
+                return super().publish_sync(staged_transfer)
 
         runtime = EncoderRuntime(
             _TestEncoder(encode, preprocess),
@@ -382,15 +383,53 @@ def test_runtime_uses_event_loop_for_preprocess_and_threads_for_data_path():
                 runtime,
                 [{"req_id": "request-0", "modality": "IMAGE"}],
             )
-            return preprocess_thread, encode_thread, transfer.threads
+            return (
+                preprocess_thread,
+                encode_thread,
+                transfer.copy_threads,
+                transfer.publish_threads,
+            )
         finally:
             await runtime.stop()
 
-    preprocess_thread, encode_thread, transfer_threads = asyncio.run(run())
+    preprocess_thread, encode_thread, copy_threads, publish_threads = asyncio.run(run())
 
     assert preprocess_thread == "MainThread"
     assert encode_thread == "sgl-jax-encoder-vit"
-    assert transfer_threads == ["sgl-jax-encoder-transfer"]
+    assert copy_threads == ["sgl-jax-encoder-vit"]
+    assert publish_threads == ["sgl-jax-encoder-transfer"]
+
+
+def test_runtime_reserves_before_forward():
+    events = []
+
+    class RecordingTransfer(_FakeTransfer):
+        def reserve_batch_sync(self, transfer_ids):
+            events.append("reserve")
+            return super().reserve_batch_sync(transfer_ids)
+
+        def stage_batch_sync(self, reservations, embeddings):
+            events.append("copy")
+            return super().stage_batch_sync(reservations, embeddings)
+
+        def publish_sync(self, staged_transfer):
+            events.append("publish")
+            return super().publish_sync(staged_transfer)
+
+    def encode(_requests):
+        events.append("forward")
+        return [(jnp.zeros((1, 2)), {})]
+
+    async def run() -> None:
+        runtime = EncoderRuntime(_TestEncoder(encode), RecordingTransfer())
+        try:
+            await _collect(runtime, [{"req_id": "request-0", "modality": "IMAGE"}])
+            assert not hasattr(runtime, "_progress_thread")
+        finally:
+            await runtime.stop()
+
+    asyncio.run(run())
+    assert events == ["reserve", "forward", "copy", "publish"]
 
 
 def test_runtime_queues_results_and_completes_each_after_publish():
@@ -640,23 +679,20 @@ def test_runtime_does_not_block_vit_on_large_transfer_batch():
         loop = asyncio.get_running_loop()
 
         class ControlledTransfer(_FakeTransfer):
-            def stage_sync(self, transfer_id, embedding):
+            def publish_sync(self, staged_transfer):
+                transfer_id, _ = staged_transfer
                 if transfer_id.startswith("request-0:"):
                     first_transfer_started.set()
                     if not release_first_transfer.wait(1):
                         raise TimeoutError("test did not release first transfer")
-                return super().stage_sync(transfer_id, embedding)
+                return super().publish_sync(staged_transfer)
 
         def encode(requests):
             if requests[0]["req_id"] == "request-next":
                 loop.call_soon_threadsafe(second_encode_started.set)
             return [(jnp.zeros((1, 2)), {}) for _ in requests]
 
-        runtime = EncoderRuntime(
-            _TestEncoder(encode),
-            ControlledTransfer(),
-            transfer_queue_depth=8,
-        )
+        runtime = EncoderRuntime(_TestEncoder(encode), ControlledTransfer())
         first_batch = [
             {
                 "req_id": f"request-{index}",

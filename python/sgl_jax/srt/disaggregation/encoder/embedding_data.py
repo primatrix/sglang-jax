@@ -40,8 +40,11 @@ class EmbeddingData:
         encode_done_ns: int | None = None,
         transfer_enqueue_ns: int | None = None,
         transfer_start_ns: int | None = None,
+        transfer_reserve_start_ns: int | None = None,
         transfer_pool_ready_ns: int | None = None,
         transfer_reserve_done_ns: int | None = None,
+        transfer_copy_start_ns: int | None = None,
+        transfer_copy_submit_ns: int | None = None,
         transfer_copy_done_ns: int | None = None,
         transfer_stage_done_ns: int | None = None,
         publish_done_ns: int | None = None,
@@ -75,8 +78,11 @@ class EmbeddingData:
         self.encode_done_ns = encode_done_ns
         self.transfer_enqueue_ns = transfer_enqueue_ns
         self.transfer_start_ns = transfer_start_ns
+        self.transfer_reserve_start_ns = transfer_reserve_start_ns
         self.transfer_pool_ready_ns = transfer_pool_ready_ns
         self.transfer_reserve_done_ns = transfer_reserve_done_ns
+        self.transfer_copy_start_ns = transfer_copy_start_ns
+        self.transfer_copy_submit_ns = transfer_copy_submit_ns
         self.transfer_copy_done_ns = transfer_copy_done_ns
         self.transfer_stage_done_ns = transfer_stage_done_ns
         self.publish_done_ns = publish_done_ns
@@ -175,8 +181,11 @@ class MultiModalEmbeddingData:
             "encode_done_ns",
             "transfer_enqueue_ns",
             "transfer_start_ns",
+            "transfer_reserve_start_ns",
             "transfer_pool_ready_ns",
             "transfer_reserve_done_ns",
+            "transfer_copy_start_ns",
+            "transfer_copy_submit_ns",
             "transfer_copy_done_ns",
             "transfer_stage_done_ns",
             "publish_done_ns",
@@ -203,6 +212,8 @@ class MultiModalEmbeddingData:
             "processor_start_ns",
             "transfer_enqueue_ns",
             "transfer_start_ns",
+            "transfer_reserve_start_ns",
+            "transfer_copy_start_ns",
             "receive_metadata_ns",
             "receive_materialize_start_ns",
         }

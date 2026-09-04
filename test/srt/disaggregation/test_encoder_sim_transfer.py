@@ -5,6 +5,7 @@ import time
 
 import jax
 import jax.numpy as jnp
+import pytest
 
 from sgl_jax.srt.disaggregation.encoder.embedding_data import EmbeddingData
 from sgl_jax.srt.disaggregation.encoder.sim_transfer import (
@@ -32,7 +33,12 @@ def _metadata(transfer_id: str, shape: tuple[int, int] = (4, 3584)) -> Embedding
 
 
 async def _publish(transfer, transfer_id, embedding):
-    return await transfer.publish(await transfer.stage(transfer_id, embedding))
+    reservations = await asyncio.to_thread(
+        transfer.reserve_batch_sync,
+        [transfer_id],
+    )
+    staged = transfer.stage_batch_sync(reservations, [embedding])
+    return await asyncio.to_thread(transfer.publish_sync, staged[0])
 
 
 def test_sim_transfer_uses_raiden_padded_payload_size():
@@ -49,8 +55,6 @@ def test_sim_sender_backpressures_when_pool_is_full():
         blocked = asyncio.create_task(_publish(transfer, "part-1:embedding", embedding))
         await asyncio.sleep(0.01)
         assert not blocked.done()
-
-        transfer.release("part-0:embedding")
         await asyncio.wait_for(blocked, 1)
 
     asyncio.run(run())
@@ -66,8 +70,30 @@ def test_sim_sender_serializes_transfers_per_channel():
         await _publish(transfer, "part-1:embedding", embedding)
 
     asyncio.run(run())
-    ready_times = [ready_ns for _, ready_ns in transfer._pools[0]._active.values()]
+    ready_times = [ready_ns for _, ready_ns in transfer._pool._active.values()]
     assert ready_times[1] - ready_times[0] >= 19_000_000
+    transfer.close()
+
+
+def test_sim_sender_rejects_embedding_that_does_not_match_single_pool():
+    transfer = SimEncoderServerTransfer()
+    asyncio.run(
+        _publish(
+            transfer,
+            "part-0:embedding",
+            jnp.zeros((4, 3584), dtype=jnp.bfloat16),
+        )
+    )
+
+    with pytest.raises(ValueError, match="pool embedding mismatch"):
+        asyncio.run(
+            _publish(
+                transfer,
+                "part-1:embedding",
+                jnp.zeros((8, 3584), dtype=jnp.bfloat16),
+            )
+        )
+
     transfer.close()
 
 
@@ -80,24 +106,14 @@ def test_sim_sender_reports_inflight_completion(caplog):
     )
 
     async def run() -> None:
-        reaper = asyncio.create_task(transfer.release_completed())
-        try:
-            await _publish(
-                transfer,
-                "part-0:embedding",
-                jnp.zeros((4, 3584), dtype=jnp.bfloat16),
-            )
-            for _ in range(100):
-                if not transfer._active:
-                    break
-                await asyncio.sleep(0.001)
-            assert not transfer._active
-        finally:
-            reaper.cancel()
-            try:
-                await reaper
-            except asyncio.CancelledError:
-                pass
+        embedding = jnp.zeros((4, 3584), dtype=jnp.bfloat16)
+        await _publish(transfer, "part-0:embedding", embedding)
+        reservations = await asyncio.to_thread(
+            transfer.reserve_batch_sync,
+            ["part-1:embedding"],
+        )
+        transfer.cancel_batch(reservations)
+        assert not transfer._active
 
     caplog.set_level("INFO")
     asyncio.run(run())
@@ -126,4 +142,18 @@ def test_sim_receiver_backpressures_and_reuses_buffer():
     assert second_buffer is not None
     assert first_buffer.unsafe_buffer_pointer() == second_buffer.unsafe_buffer_pointer()
 
+    backend.close()
+
+
+def test_sim_receiver_rejects_embedding_that_does_not_match_single_pool():
+    backend = SimReceiverBackend(
+        jax.sharding.SingleDeviceSharding(jax.local_devices()[0]),
+        ms_per_mb=0,
+    )
+    first = backend.start(_metadata("part-0:embedding"))._future.result(timeout=1)
+
+    with pytest.raises(ValueError, match="pool embedding mismatch"):
+        backend.start(_metadata("part-1:embedding", shape=(8, 3584)))._future.result(timeout=1)
+
+    first.close()
     backend.close()

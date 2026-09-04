@@ -249,6 +249,12 @@ def test_encoder_receiver_background_progresses_without_scheduler_poll(monkeypat
     try:
         assert result is not None
         assert result["embeddings"][Modality.IMAGE].shape == (2, 3)
+        timing = result["encoder_timing"]
+        assert timing["receive_done_ns"] <= timing["receive_concat_start_ns"]
+        assert timing["receive_concat_start_ns"] <= timing["receive_concat_done_ns"]
+        assert timing["receive_concat_done_ns"] <= timing["receive_extra_meta_start_ns"]
+        assert timing["receive_extra_meta_start_ns"] <= timing["receive_extra_meta_done_ns"]
+        assert timing["receive_extra_meta_done_ns"] <= timing["receive_result_ready_ns"]
     finally:
         pending.close()
         client.close()

@@ -31,12 +31,15 @@ def test_language_logs_encoder_pipeline_timing(caplog):
         "dequeue_ns": 2_000_000,
         "preprocess_start_ns": 3_000_000,
         "preprocess_done_ns": 4_000_000,
+        "transfer_reserve_start_ns": 4_200_000,
+        "transfer_reserve_done_ns": 4_500_000,
         "encode_start_ns": 5_000_000,
         "encode_done_ns": 7_000_000,
+        "transfer_copy_start_ns": 7_100_000,
+        "transfer_pool_ready_ns": 7_200_000,
+        "transfer_copy_submit_ns": 7_400_000,
         "transfer_enqueue_ns": 8_000_000,
         "transfer_start_ns": 10_000_000,
-        "transfer_pool_ready_ns": 11_000_000,
-        "transfer_reserve_done_ns": 12_000_000,
         "transfer_copy_done_ns": 14_000_000,
         "transfer_stage_done_ns": 14_000_000,
         "publish_done_ns": 15_000_000,
@@ -47,6 +50,14 @@ def test_language_logs_encoder_pipeline_timing(caplog):
         "receive_materialize_done_ns": 20_000_000,
         "receive_embedding_ns": 21_000_000,
         "receive_done_ns": 22_000_000,
+        "receive_concat_start_ns": 22_100_000,
+        "receive_concat_done_ns": 22_300_000,
+        "receive_extra_meta_start_ns": 22_400_000,
+        "receive_extra_meta_done_ns": 22_700_000,
+        "receive_result_ready_ns": 22_800_000,
+        "language_apply_start_ns": 23_000_000,
+        "language_get_mm_data_done_ns": 23_500_000,
+        "language_radix_done_ns": 23_800_000,
         "language_ready_ns": 24_000_000,
     }
     req = SimpleNamespace(rid="request-0", encoder_timing=timing)
@@ -64,18 +75,20 @@ def test_language_logs_encoder_pipeline_timing(caplog):
     assert "queue_ms=1.000" in caplog.text
     assert "encode_stage_wait_ms=1.000" in caplog.text
     assert "preprocess_ms=1.000" in caplog.text
-    assert "encode_wait_ms=1.000" in caplog.text
+    assert "encode_wait_ms=0.200" in caplog.text
+    assert "transfer_reserve_ms=0.300" in caplog.text
+    assert "encode_dispatch_ms=0.500" in caplog.text
     assert "encode_compute_ms=2.000" in caplog.text
     assert "encode_ms=5.000" in caplog.text
     assert "publish_ms=8.000" in caplog.text
     assert "transfer_handoff_ms=1.000" in caplog.text
     assert "transfer_queue_ms=2.000" in caplog.text
-    assert "transfer_pool_setup_ms=1.000" in caplog.text
-    assert "transfer_reserve_ms=1.000" in caplog.text
-    assert "transfer_copy_ms=2.000" in caplog.text
-    assert "transfer_stage_ms=4.000" in caplog.text
+    assert "transfer_pool_setup_ms=0.100" in caplog.text
+    assert "transfer_copy_submit_ms=0.200" in caplog.text
+    assert "transfer_copy_wait_ms=6.600" in caplog.text
+    assert "transfer_worker_wait_ms=4.000" in caplog.text
     assert "transfer_register_ms=1.000" in caplog.text
-    assert "transfer_total_ms=7.000" in caplog.text
+    assert "transfer_total_ms=7.900" in caplog.text
     assert "receive_ms=7.000" in caplog.text
     assert "mm_prepare_ms=2.000" in caplog.text
     assert "receive_metadata_wait_ms=1.000" in caplog.text
@@ -85,6 +98,12 @@ def test_language_logs_encoder_pipeline_timing(caplog):
     assert "receive_materialize_wait_ms=1.000" in caplog.text
     assert "receive_poll_delay_ms=1.000" in caplog.text
     assert "receive_finalize_ms=1.000" in caplog.text
+    assert "receive_concat_ms=0.200" in caplog.text
+    assert "receive_extra_meta_ms=0.300" in caplog.text
+    assert "receive_result_pack_ms=0.800" in caplog.text
+    assert "language_pickup_wait_ms=0.200" in caplog.text
+    assert "language_get_mm_data_ms=0.500" in caplog.text
+    assert "language_radix_finalize_ms=0.500" in caplog.text
     assert "receive_mm_ms=9.000" in caplog.text
     assert timing["language_prefill_start_ns"] >= timing["language_ready_ns"]
     assert timing["language_prefill_done_ns"] >= timing["language_prefill_start_ns"]
@@ -104,12 +123,15 @@ def test_language_logs_encoder_preprocess_timing(caplog):
         "processor_done_ns": 17_000_000,
         "preprocess_request_done_ns": 18_000_000,
         "preprocess_done_ns": 19_000_000,
+        "transfer_reserve_start_ns": 19_100_000,
+        "transfer_reserve_done_ns": 19_200_000,
         "encode_start_ns": 20_000_000,
         "encode_done_ns": 21_000_000,
+        "transfer_copy_start_ns": 21_020_000,
+        "transfer_pool_ready_ns": 21_030_000,
+        "transfer_copy_submit_ns": 21_050_000,
         "transfer_enqueue_ns": 21_100_000,
         "transfer_start_ns": 21_200_000,
-        "transfer_pool_ready_ns": 21_300_000,
-        "transfer_reserve_done_ns": 21_400_000,
         "transfer_copy_done_ns": 21_800_000,
         "transfer_stage_done_ns": 21_800_000,
         "publish_done_ns": 22_000_000,
@@ -120,6 +142,14 @@ def test_language_logs_encoder_preprocess_timing(caplog):
         "receive_materialize_done_ns": 22_400_000,
         "receive_embedding_ns": 22_500_000,
         "receive_done_ns": 23_000_000,
+        "receive_concat_start_ns": 23_050_000,
+        "receive_concat_done_ns": 23_100_000,
+        "receive_extra_meta_start_ns": 23_150_000,
+        "receive_extra_meta_done_ns": 23_200_000,
+        "receive_result_ready_ns": 23_250_000,
+        "language_apply_start_ns": 23_300_000,
+        "language_get_mm_data_done_ns": 23_500_000,
+        "language_radix_done_ns": 23_800_000,
         "language_ready_ns": 24_000_000,
     }
     req = SimpleNamespace(rid="request-0", encoder_timing=timing)

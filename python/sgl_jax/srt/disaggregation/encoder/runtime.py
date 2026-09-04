@@ -36,7 +36,7 @@ class _TransferJob:
     batch: _EncodeJob
     index: int
     transfer_id: str
-    embedding: Any
+    staged_transfer: Any
     data: EmbeddingData
 
 
@@ -48,27 +48,19 @@ class EncoderRuntime:
         transfer: Any,
         *,
         pipeline_depth: int = 2,
-        transfer_queue_depth: int = 2,
-        transfer_poll_interval_s: float = 0.001,
     ) -> None:
         self._encoder = encoder
         self._transfer = transfer
         depth = max(1, int(pipeline_depth))
         self._encode_queue: queue.Queue[_EncodeJob | object] = queue.Queue(depth)
-        # A ViT batch expands into one transfer job per request. This queue must
-        # be sized in requests rather than batches, otherwise the ViT worker is
-        # serialized behind device copies while enqueueing one batch.
-        self._transfer_queue: queue.Queue[_TransferJob | object] = queue.Queue(
-            max(1, int(transfer_queue_depth))
-        )
-        self._transfer_poll_interval_s = max(0.0001, float(transfer_poll_interval_s))
-        self._stop_event = threading.Event()
+        # Pool reservations provide backpressure. This queue carries only small
+        # ready tickets, so it does not need a second capacity limit.
+        self._transfer_queue: queue.SimpleQueue[_TransferJob | object] = queue.SimpleQueue()
         self._start_lock = threading.Lock()
         self._started = False
         self._accepting = True
         self._vit_thread: threading.Thread | None = None
         self._transfer_thread: threading.Thread | None = None
-        self._progress_thread: threading.Thread | None = None
 
     def start(self) -> None:
         with self._start_lock:
@@ -90,14 +82,6 @@ class EncoderRuntime:
             self._vit_thread.start()
             self._transfer_thread.start()
 
-            if callable(getattr(self._transfer, "poll_completed", None)):
-                self._progress_thread = threading.Thread(
-                    target=self._progress_worker,
-                    name="sgl-jax-encoder-transfer-progress",
-                    daemon=True,
-                )
-                self._progress_thread.start()
-
     async def stop(self) -> None:
         with self._start_lock:
             if not self._started:
@@ -108,9 +92,7 @@ class EncoderRuntime:
         await asyncio.to_thread(self._stop_workers)
 
     def _stop_workers(self) -> None:
-        # Drain each stage before stopping the next one. The progress thread
-        # remains alive while transfer staging drains so that pool credits can
-        # still be reclaimed.
+        # Drain each stage before stopping the next one.
         self._encode_queue.put(_STOP)
         if self._vit_thread is not None:
             self._vit_thread.join()
@@ -118,10 +100,6 @@ class EncoderRuntime:
         self._transfer_queue.put(_STOP)
         if self._transfer_thread is not None:
             self._transfer_thread.join()
-
-        self._stop_event.set()
-        if self._progress_thread is not None:
-            self._progress_thread.join()
         self._transfer.close()
 
         with self._start_lock:
@@ -165,12 +143,19 @@ class EncoderRuntime:
             try:
                 if item is _STOP:
                     return
+                assert isinstance(item, _EncodeJob)
                 self._run_vit(item)
             finally:
                 self._encode_queue.task_done()
 
     def _run_vit(self, job: _EncodeJob) -> None:
+        transfer_ids = [
+            f"{request['req_id']}:{request.get('part_idx', 0)}:embedding"
+            for request in job.requests
+        ]
+        reservations = None
         try:
+            reservations = self._transfer.reserve_batch_sync(transfer_ids)
             results = self._encoder.encode(job.prepared)
             if len(results) != len(job.requests):
                 raise RuntimeError(
@@ -178,8 +163,10 @@ class EncoderRuntime:
                 )
             encode_done_ns = time.time_ns()
             transfer_jobs = []
-            for index, (request, (embedding, metadata)) in enumerate(zip(job.requests, results)):
-                transfer_id = f"{request['req_id']}:{request.get('part_idx', 0)}:embedding"
+            embeddings = []
+            for index, (request, transfer_id, (embedding, metadata)) in enumerate(
+                zip(job.requests, transfer_ids, results)
+            ):
                 metadata = dict(metadata)
                 encoder_timing = {
                     "encode_done_ns": encode_done_ns,
@@ -198,33 +185,45 @@ class EncoderRuntime:
                     **metadata,
                     **encoder_timing,
                 )
-                transfer_jobs.append(_TransferJob(job, index, transfer_id, embedding, data))
-            for transfer_job in transfer_jobs:
+                embeddings.append(embedding)
+                transfer_jobs.append((index, transfer_id, data))
+
+            copy_start_ns = time.time_ns()
+            for _, _, data in transfer_jobs:
+                data.transfer_copy_start_ns = copy_start_ns
+            staged_transfers = self._transfer.stage_batch_sync(reservations, embeddings)
+            if len(staged_transfers) != len(transfer_jobs):
+                raise RuntimeError("transfer returned an incomplete staged batch")
+            for (index, transfer_id, data), staged_transfer in zip(
+                transfer_jobs,
+                staged_transfers,
+            ):
+                transfer_job = _TransferJob(
+                    job,
+                    index,
+                    transfer_id,
+                    staged_transfer,
+                    data,
+                )
                 transfer_job.data.transfer_enqueue_ns = time.time_ns()
                 self._transfer_queue.put(transfer_job)
         except Exception as exc:
+            if reservations is not None:
+                self._transfer.cancel_batch(reservations)
             job.fail_batch(exc)
 
     def _transfer_worker(self) -> None:
         while True:
             item = self._transfer_queue.get()
-            try:
-                if item is _STOP:
-                    return
-                assert isinstance(item, _TransferJob)
-                self._run_transfer(item)
-            finally:
-                self._transfer_queue.task_done()
+            if item is _STOP:
+                return
+            assert isinstance(item, _TransferJob)
+            self._run_transfer(item)
 
     def _run_transfer(self, job: _TransferJob) -> None:
         try:
             job.data.transfer_start_ns = time.time_ns()
-            staged_transfer = self._transfer.stage_sync(
-                job.transfer_id,
-                job.embedding,
-            )
-            job.data.transfer_stage_done_ns = time.time_ns()
-            transfer_metadata = self._transfer.publish_sync(staged_transfer)
+            transfer_metadata = self._transfer.publish_sync(job.staged_transfer)
             for key, value in transfer_metadata.items():
                 setattr(job.data, key, value)
             # Backends may optionally expose the pool/reservation/copy split.
@@ -252,7 +251,9 @@ class EncoderRuntime:
                     None,
                 )
                 or job.data.transfer_stage_done_ns
+                or job.data.transfer_start_ns
             )
+            job.data.transfer_stage_done_ns = job.data.transfer_copy_done_ns
             job.data.transfer_id = str(transfer_metadata.get("transfer_id", job.transfer_id))
             job.data.publish_done_ns = time.time_ns()
         except Exception as exc:
@@ -260,11 +261,6 @@ class EncoderRuntime:
             job.batch.deliver(job.index, exc)
         else:
             job.batch.deliver(job.index, job.data)
-
-    def _progress_worker(self) -> None:
-        while not self._stop_event.wait(self._transfer_poll_interval_s):
-            self._transfer.poll_completed()
-        self._transfer.poll_completed()
 
     def release(self, transfer_id: str) -> None:
         self._transfer.release(transfer_id)

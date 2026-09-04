@@ -21,14 +21,14 @@ from sgl_jax.srt.disaggregation.encoder.embedding_data import (
     EmbeddingData,
     MultiModalEmbeddingData,
 )
-from sgl_jax.srt.disaggregation.encoder.raiden import (
-    RaidenEncoderServerTransfer,
-    RaidenReceiverBackend,
-)
 from sgl_jax.srt.disaggregation.encoder.raiden_pool import (
     RaidenReceivePool,
     RaidenReceiveSession,
     RaidenSendPool,
+)
+from sgl_jax.srt.disaggregation.encoder.raiden_transfer import (
+    RaidenEncoderServerTransfer,
+    RaidenReceiverBackend,
 )
 from sgl_jax.srt.managers.io_struct import TokenizedGenerateReqInput
 from sgl_jax.srt.multimodal.common.modality_enum import Modality
@@ -37,7 +37,7 @@ from sgl_jax.srt.multimodal.common.modality_enum import Modality
 @pytest.fixture(autouse=True)
 def _pretend_raiden_is_preloaded(monkeypatch):
     monkeypatch.setattr(
-        "sgl_jax.srt.disaggregation.encoder.raiden.require_raiden_preloaded",
+        "sgl_jax.srt.disaggregation.encoder.raiden_transfer.require_raiden_preloaded",
         lambda: None,
     )
 
@@ -101,7 +101,12 @@ def _poll_until_ready(session):
 
 
 async def _publish(transfer, transfer_id, embedding):
-    return await transfer.publish(await transfer.stage(transfer_id, embedding))
+    reservations = await asyncio.to_thread(
+        transfer.reserve_batch_sync,
+        [transfer_id],
+    )
+    staged = transfer.stage_batch_sync(reservations, [embedding])
+    return await asyncio.to_thread(transfer.publish_sync, staged[0])
 
 
 def test_raiden_loader_recognizes_encoder_backend():
@@ -113,7 +118,7 @@ def test_raiden_loader_recognizes_encoder_backend():
 def test_raiden_server_uses_donated_request_pool(monkeypatch):
     _FakeRaidenWrapper.instances.clear()
     monkeypatch.setattr(
-        "sgl_jax.srt.disaggregation.encoder.raiden_pool.RaidenTransferWrapper",
+        "sgl_jax.srt.disaggregation.encoder.raiden_transfer.RaidenTransferWrapper",
         _FakeRaidenWrapper,
     )
     transfer = RaidenEncoderServerTransfer(
@@ -126,19 +131,21 @@ def test_raiden_server_uses_donated_request_pool(monkeypatch):
     second = first + 20
 
     first_metadata = asyncio.run(_publish(transfer, "part-0:embedding", first))
-    assert isinstance(transfer._pools[0], RaidenSendPool)
-    pool_pointer = transfer._pools[0]._buffer.unsafe_buffer_pointer()
+    assert isinstance(transfer._pool, RaidenSendPool)
+    pool_pointer = transfer._pool._buffer.unsafe_buffer_pointer()
     second_metadata = asyncio.run(_publish(transfer, "part-1:embedding", second))
 
     session = _FakeRaidenWrapper.instances[0]
+    assert transfer._raiden is session
+    assert not hasattr(transfer._pool, "transfer")
     buffers, options = session.started
     assert len(buffers) == 1
     assert buffers[0].shape == (2, 4, 2, 8, 128)
     assert options == {"max_blocks": 1, "num_slots": 2, "timeout_s": 12.0}
-    buffer = transfer._pools[0]._buffer.reshape(2, 4, -1)
+    buffer = transfer._pool._buffer.reshape(2, 4, -1)
     np.testing.assert_array_equal(buffer[0, :, :3], first)
     np.testing.assert_array_equal(buffer[1, :, :3], second)
-    assert transfer._pools[0]._buffer.unsafe_buffer_pointer() == pool_pointer
+    assert transfer._pool._buffer.unsafe_buffer_pointer() == pool_pointer
     assert session.registrations == [
         ("part-0:embedding", first_metadata["transfer_uuid"], [0]),
         ("part-1:embedding", second_metadata["transfer_uuid"], [1]),
@@ -149,10 +156,26 @@ def test_raiden_server_uses_donated_request_pool(monkeypatch):
     transfer.close()
 
 
+def test_raiden_server_rejects_embedding_that_does_not_match_single_pool(monkeypatch):
+    _FakeRaidenWrapper.instances.clear()
+    monkeypatch.setattr(
+        "sgl_jax.srt.disaggregation.encoder.raiden_transfer.RaidenTransferWrapper",
+        _FakeRaidenWrapper,
+    )
+    transfer = RaidenEncoderServerTransfer("10.0.0.4")
+    asyncio.run(_publish(transfer, "part-0:embedding", jnp.zeros((2, 3))))
+
+    with pytest.raises(ValueError, match="pool embedding mismatch"):
+        asyncio.run(_publish(transfer, "part-1:embedding", jnp.zeros((4, 3))))
+
+    assert len(_FakeRaidenWrapper.instances) == 1
+    transfer.close()
+
+
 def test_raiden_server_backpressures_when_pool_is_full(monkeypatch):
     _FakeRaidenWrapper.instances.clear()
     monkeypatch.setattr(
-        "sgl_jax.srt.disaggregation.encoder.raiden_pool.RaidenTransferWrapper",
+        "sgl_jax.srt.disaggregation.encoder.raiden_transfer.RaidenTransferWrapper",
         _FakeRaidenWrapper,
     )
     transfer = RaidenEncoderServerTransfer("10.0.0.4", pool_size=1)
@@ -162,7 +185,7 @@ def test_raiden_server_backpressures_when_pool_is_full(monkeypatch):
         blocked = asyncio.create_task(_publish(transfer, "part-1:embedding", jnp.ones((2, 3))))
         await asyncio.sleep(0.05)
         assert not blocked.done()
-        transfer.release("part-0:embedding")
+        _FakeRaidenWrapper.instances[0].stats = (["part-0:embedding"], [], [])
         await asyncio.wait_for(blocked, 1)
 
     asyncio.run(run())
@@ -172,24 +195,78 @@ def test_raiden_server_backpressures_when_pool_is_full(monkeypatch):
 def test_raiden_server_reaps_completed_sender(monkeypatch):
     _FakeRaidenWrapper.instances.clear()
     monkeypatch.setattr(
-        "sgl_jax.srt.disaggregation.encoder.raiden_pool.RaidenTransferWrapper",
+        "sgl_jax.srt.disaggregation.encoder.raiden_transfer.RaidenTransferWrapper",
         _FakeRaidenWrapper,
     )
-    transfer = RaidenEncoderServerTransfer("10.0.0.4")
+    transfer = RaidenEncoderServerTransfer("10.0.0.4", pool_size=1)
     asyncio.run(_publish(transfer, "part-0:embedding", jnp.zeros((2, 3))))
     _FakeRaidenWrapper.instances[0].stats = (["part-0:embedding"], [], [])
 
-    async def stop_after_poll(_delay):
-        raise asyncio.CancelledError
-
-    monkeypatch.setattr(
-        "sgl_jax.srt.disaggregation.encoder.raiden.asyncio.sleep",
-        stop_after_poll,
-    )
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(transfer.release_completed())
+    reservations = transfer.reserve_batch_sync(["part-1:embedding"])
+    transfer.cancel_batch(reservations)
 
     assert not transfer._active
+    transfer.close()
+
+
+def test_raiden_reaps_only_when_reservation_needs_capacity(monkeypatch):
+    _FakeRaidenWrapper.instances.clear()
+    monkeypatch.setattr(
+        "sgl_jax.srt.disaggregation.encoder.raiden_transfer.RaidenTransferWrapper",
+        _FakeRaidenWrapper,
+    )
+    transfer = RaidenEncoderServerTransfer("10.0.0.4", pool_size=2)
+    asyncio.run(_publish(transfer, "part-0:embedding", jnp.zeros((2, 3))))
+    session = _FakeRaidenWrapper.instances[0]
+    session.stats = (["part-0:embedding"], [], [])
+
+    spare = transfer.reserve_batch_sync(["part-1:embedding"])
+    assert "part-0:embedding" in transfer._active
+    assert session.stats[0] == ["part-0:embedding"]
+    transfer.cancel_batch(spare)
+
+    full_batch = transfer.reserve_batch_sync(["part-2:embedding", "part-3:embedding"])
+    assert "part-0:embedding" not in transfer._active
+    transfer.cancel_batch(full_batch)
+    transfer.close()
+
+
+def test_raiden_register_waits_for_copy_ticket(monkeypatch):
+    class PendingReady:
+        def __init__(self):
+            self.done = threading.Event()
+
+        def block_until_ready(self):
+            assert self.done.wait(1)
+
+        def is_ready(self):
+            return self.done.is_set()
+
+    _FakeRaidenWrapper.instances.clear()
+    monkeypatch.setattr(
+        "sgl_jax.srt.disaggregation.encoder.raiden_transfer.RaidenTransferWrapper",
+        _FakeRaidenWrapper,
+    )
+    ready = PendingReady()
+    monkeypatch.setattr(RaidenSendPool, "copy_async", lambda *_args: ready)
+    transfer = RaidenEncoderServerTransfer("10.0.0.4", pool_size=1)
+    reservations = transfer.reserve_batch_sync(["part-0:embedding"])
+    staged = transfer.stage_batch_sync(reservations, [jnp.zeros((2, 3))])
+    published = threading.Event()
+
+    def publish():
+        transfer.publish_sync(staged[0])
+        published.set()
+
+    thread = threading.Thread(target=publish)
+    thread.start()
+    time.sleep(0.02)
+    assert not _FakeRaidenWrapper.instances[0].registrations
+
+    ready.done.set()
+    assert published.wait(1)
+    thread.join()
+    assert _FakeRaidenWrapper.instances[0].registrations
     transfer.close()
 
 
@@ -313,6 +390,45 @@ def test_raiden_receiver_reuses_manager_and_pool_blocks(monkeypatch):
     backend.close()
 
 
+def test_raiden_receiver_rejects_embedding_that_does_not_match_single_pool(monkeypatch):
+    _FakeRaidenWrapper.instances.clear()
+    monkeypatch.setattr(
+        "sgl_jax.srt.disaggregation.encoder.raiden_pool.RaidenTransferWrapper",
+        _FakeRaidenWrapper,
+    )
+    backend = RaidenReceiverBackend(
+        host="10.0.0.9",
+        sharding=jax.sharding.SingleDeviceSharding(jax.local_devices()[0]),
+        parallelism=1,
+        pool_size=2,
+        transfer_timeout_s=30.0,
+    )
+
+    def metadata(transfer_id: str, shape: tuple[int, int]) -> EmbeddingData:
+        return EmbeddingData(
+            req_id=transfer_id,
+            num_parts=1,
+            part_idx=0,
+            grid_dim=None,
+            modality=Modality.IMAGE,
+            embedding_shape=shape,
+            dtype="float32",
+            transfer_id=transfer_id,
+            transfer_uuid=1,
+            transfer_address=[{"endpoint": "127.0.0.1:7788", "shards": [0]}],
+            transfer_host="10.0.0.8",
+            transfer_block_ids=[0],
+        )
+
+    first = backend.start(metadata("part-0:embedding", (2, 3)))._future.result(timeout=1)
+    with pytest.raises(ValueError, match="pool embedding mismatch"):
+        backend.start(metadata("part-1:embedding", (4, 3)))._future.result(timeout=1)
+
+    assert len(_FakeRaidenWrapper.instances) == 1
+    first.close()
+    backend.close()
+
+
 def test_raiden_request_surfaces_receive_failure():
     pool = mock.Mock()
     pool.poll.side_effect = RuntimeError("Raiden embedding transfer failed: part-0:embedding")
@@ -337,7 +453,7 @@ def test_raiden_receive_poll_does_not_wait_for_device_copy(monkeypatch):
     pending_copy = PendingCopy()
     pool = object.__new__(RaidenReceivePool)
     pool._sharding = jax.sharding.SingleDeviceSharding(jax.local_devices()[0])
-    pool._shape = (2, 3)
+    pool.shape = (2, 3)
     pool._block_shape = (2, 2, 8, 128)
     pool._buffer = jnp.zeros((1, *pool._block_shape))
     pool._transfer = mock.Mock()

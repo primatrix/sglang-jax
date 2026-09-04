@@ -307,11 +307,19 @@ class PendingEncoderRequest:
             return None
         timing = self.accumulator.get_timing_meta()
         timing["receive_done_ns"] = time.time_ns()
-        return {
-            "embeddings": self.accumulator.get_embedding(is_concat=True),
-            "encoder_timing": timing,
-            **self.accumulator.get_mm_extra_meta(),
+        timing["receive_concat_start_ns"] = time.time_ns()
+        embeddings = self.accumulator.get_embedding(is_concat=True)
+        timing["receive_concat_done_ns"] = time.time_ns()
+        timing["receive_extra_meta_start_ns"] = time.time_ns()
+        extra_meta = self.accumulator.get_mm_extra_meta()
+        timing["receive_extra_meta_done_ns"] = time.time_ns()
+        result = {
+            "embeddings": embeddings,
+            **extra_meta,
         }
+        timing["receive_result_ready_ns"] = time.time_ns()
+        result["encoder_timing"] = timing
+        return result
 
     def close(self) -> None:
         with self._lock:
@@ -583,7 +591,9 @@ def create_encoder_client(
         )
     else:
         from sgl_jax.raiden import require_raiden_preloaded
-        from sgl_jax.srt.disaggregation.encoder.raiden import RaidenReceiverBackend
+        from sgl_jax.srt.disaggregation.encoder.raiden_transfer import (
+            RaidenReceiverBackend,
+        )
         from sgl_jax.srt.disaggregation.host_ip import resolve_host_ip
 
         require_raiden_preloaded()
