@@ -11,6 +11,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.disaggregation.encoder.embedding_data import PooledEmbedding
 from sgl_jax.srt.models.registry import ModelRegistry
 from sgl_jax.srt.multimodal.common.modality_enum import (
     Modality,
@@ -49,11 +50,17 @@ _MultimodalBatch = dict[Modality, tuple[ItemTask, ...]]
 def _encode_tasks(
     tasks: Sequence[ItemTask],
     encode_func,
-) -> jax.Array:
+) -> jax.Array | PooledEmbedding:
     precomputed = [task.item.precomputed_embeddings for task in tasks]
     if all(value is not None for value in precomputed):
         if len(precomputed) == 1:
-            return jnp.asarray(precomputed[0])
+            value = precomputed[0]
+            return value if isinstance(value, PooledEmbedding) else jnp.asarray(value)
+        if any(isinstance(value, PooledEmbedding) for value in precomputed):
+            precomputed = [
+                value.materialize() if isinstance(value, PooledEmbedding) else value
+                for value in precomputed
+            ]
         return jnp.concatenate([jnp.asarray(value) for value in precomputed], axis=0)
     if any(value is not None for value in precomputed):
         raise ValueError("cannot mix local and precomputed embeddings for one modality")
@@ -220,7 +227,7 @@ def _apply_gather(
 
 def _gather_merge(
     running: jax.Array,
-    packed: jax.Array,
+    packed: jax.Array | PooledEmbedding,
     tasks: tuple[ItemTask, ...],
     mesh: Mesh | None,
 ) -> jax.Array:
@@ -232,7 +239,34 @@ def _gather_merge(
             f"{min_capacity}, got {packed.shape}"
         )
     pos_idx, mask = _build_gather_indices(tasks, running.shape[0])
+    if isinstance(packed, PooledEmbedding):
+        packed_buffer = packed.buffer.reshape(
+            packed.buffer.shape[0] * packed.block_shape[0],
+            -1,
+        )
+        pos_idx[mask] += packed.flat_row_start
+        packed = packed_buffer
     return _apply_gather(running, packed, pos_idx, mask, mesh)
+
+
+def _release_pooled_tasks(
+    tasks: Sequence[ItemTask],
+    running: jax.Array,
+    pool: EmbeddingPool | None,
+) -> None:
+    leases: dict[int, tuple[object, bool]] = {}
+    for task in tasks:
+        embedding = task.item.precomputed_embeddings
+        if not isinstance(embedding, PooledEmbedding):
+            continue
+        key = id(embedding.lease)
+        lease, releasable = leases.get(key, (embedding.lease, True))
+        leases[key] = (lease, releasable and not task.has_unmerged_tail)
+
+    dependencies = (running, pool.pages) if pool is not None else running
+    for lease, releasable in leases.values():
+        if releasable:
+            lease.release_after(dependencies)
 
 
 def _build_pool_gather_indices(
@@ -380,6 +414,7 @@ def embed_multimodal_inputs(
 
             if embedding_pool is None:
                 running = _merge_encoded_tasks(running, tasks, encode_func, mesh)
+                _release_pooled_tasks(tasks, running, None)
                 continue
 
             # Pool present: split hits from misses by item hash. Misses run the
@@ -409,5 +444,6 @@ def embed_multimodal_inputs(
                     mesh,
                     embedding_pool,
                 )
+            _release_pooled_tasks(tasks, running, embedding_pool)
 
         return _split_embeddings(running, hidden, deepstack_dim, mesh)

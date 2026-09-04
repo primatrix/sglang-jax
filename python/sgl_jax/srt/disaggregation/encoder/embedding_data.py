@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import jax
@@ -17,6 +18,59 @@ _MODALITY_GRID_KEYS = {
     Modality.VIDEO: ("video_grid_thw", False),
     Modality.AUDIO: ("audio_feature_lens", True),
 }
+
+
+@dataclass(frozen=True, slots=True)
+class PooledEmbedding:
+    """A row view into a registered receive pool without a device-side slice."""
+
+    buffer: jax.Array
+    slot: int
+    block_shape: tuple[int, ...]
+    shape: tuple[int, int]
+    lease: Any
+    row_offset: int = 0
+
+    @property
+    def dtype(self):
+        return self.buffer.dtype
+
+    @property
+    def ndim(self) -> int:
+        return 2
+
+    @property
+    def flat_row_start(self) -> int:
+        return self.slot * self.block_shape[0] + self.row_offset
+
+    def __len__(self) -> int:
+        return self.shape[0]
+
+    def __getitem__(self, index: slice) -> PooledEmbedding:
+        if not isinstance(index, slice) or index.step not in (None, 1):
+            raise TypeError("pooled embeddings support contiguous row slices only")
+        start, stop, step = index.indices(self.shape[0])
+        if step != 1:
+            raise TypeError("pooled embeddings support contiguous row slices only")
+        return PooledEmbedding(
+            self.buffer,
+            self.slot,
+            self.block_shape,
+            (stop - start, self.shape[1]),
+            self.lease,
+            self.row_offset + start,
+        )
+
+    def materialize(self) -> jax.Array:
+        source = self.buffer.reshape(
+            self.buffer.shape[0] * self.block_shape[0],
+            -1,
+        )
+        return jax.lax.dynamic_slice(
+            source,
+            (self.flat_row_start, 0),
+            self.shape,
+        )
 
 
 class EmbeddingData:
@@ -110,9 +164,11 @@ class MultiModalEmbeddingData:
         if num_parts <= 0:
             raise ValueError("num_parts must be positive")
         self.num_parts = num_parts
-        self._parts: list[tuple[EmbeddingData, jax.Array] | None] = [None] * num_parts
+        self._parts: list[tuple[EmbeddingData, jax.Array | PooledEmbedding] | None] = [
+            None
+        ] * num_parts
 
-    def add(self, data: EmbeddingData, embedding: jax.Array) -> None:
+    def add(self, data: EmbeddingData, embedding: jax.Array | PooledEmbedding) -> None:
         if data.num_parts != self.num_parts:
             raise ValueError("inconsistent num_parts")
         if not 0 <= data.part_idx < self.num_parts:
@@ -138,10 +194,25 @@ class MultiModalEmbeddingData:
         grouped: dict[Modality, list[jax.Array]] = {}
         for data, embedding in parts:
             grouped.setdefault(data.modality, []).append(embedding)
-        return {
-            modality: embeddings[0] if len(embeddings) == 1 else jnp.concatenate(embeddings, axis=0)
-            for modality, embeddings in grouped.items()
-        }
+        result = {}
+        for modality, embeddings in grouped.items():
+            if len(embeddings) == 1:
+                result[modality] = embeddings[0]
+                continue
+            materialized = [
+                embedding.materialize() if isinstance(embedding, PooledEmbedding) else embedding
+                for embedding in embeddings
+            ]
+            combined = jnp.concatenate(materialized, axis=0)
+            leases = {
+                id(embedding.lease): embedding.lease
+                for embedding in embeddings
+                if isinstance(embedding, PooledEmbedding)
+            }
+            for lease in leases.values():
+                lease.release_after(combined)
+            result[modality] = combined
+        return result
 
     def get_mm_extra_meta(self) -> dict[str, Any]:
         result = {}

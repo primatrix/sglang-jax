@@ -30,6 +30,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jax.typing import ArrayLike
 
+from sgl_jax.srt.disaggregation.encoder.embedding_data import PooledEmbedding
 from sgl_jax.srt.multimodal.in_model.lane_packing import replicate_across_mesh
 
 
@@ -65,6 +66,22 @@ def _scatter_rows(buffer: jax.Array, slots: jax.Array, rows: jax.Array) -> jax.A
     safe_slots = jnp.where(flat_slots >= 0, flat_slots, flat.shape[0])
     flat = flat.at[safe_slots].set(flat_rows.astype(buffer.dtype), mode="drop")
     return flat.reshape(buffer.shape)
+
+
+@partial(jax.jit, donate_argnames=("buffer",))
+def _scatter_pooled_rows(
+    buffer: jax.Array,
+    slots: jax.Array,
+    source: jax.Array,
+    source_start: jax.Array,
+) -> jax.Array:
+    source = source.reshape(source.shape[0] * source.shape[1], -1)
+    rows = jax.lax.dynamic_slice(
+        source,
+        (source_start, 0),
+        (slots.shape[0], buffer.shape[-1]),
+    )
+    return _scatter_rows(buffer, slots, rows)
 
 
 class EmbeddingPool:
@@ -154,7 +171,7 @@ class EmbeddingPool:
     def write_packed(
         self,
         item_hashes: Sequence[int],
-        packed_embeddings: ArrayLike,
+        packed_embeddings: ArrayLike | PooledEmbedding,
         lengths: Sequence[int],
         *,
         write_mask: Sequence[bool] | None = None,
@@ -168,7 +185,9 @@ class EmbeddingPool:
         if len(write_mask) != len(lengths):
             raise ValueError(f"mask/length count mismatch: {len(write_mask)} != {len(lengths)}")
 
-        packed_embeddings = self._replicate(packed_embeddings)
+        pooled = isinstance(packed_embeddings, PooledEmbedding)
+        if not pooled:
+            packed_embeddings = self._replicate(packed_embeddings)
         if packed_embeddings.ndim != 2 or packed_embeddings.shape[1] != self.hidden:
             raise ValueError(
                 "packed embeddings must have shape "
@@ -205,7 +224,15 @@ class EmbeddingPool:
 
         if any(entry is not None and entry.length for entry in results):
             slots = self._replicate(slots)
-            self._pages = _scatter_rows(self._pages, slots, packed_embeddings)
+            if pooled:
+                self._pages = _scatter_pooled_rows(
+                    self._pages,
+                    slots,
+                    packed_embeddings.buffer,
+                    self._replicate(np.asarray(packed_embeddings.flat_row_start, np.int32)),
+                )
+            else:
+                self._pages = _scatter_rows(self._pages, slots, packed_embeddings)
         return tuple(results)
 
     def precompile_packed_write(self, capacity: int) -> None:

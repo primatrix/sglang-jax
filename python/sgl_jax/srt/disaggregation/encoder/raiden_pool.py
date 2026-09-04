@@ -11,6 +11,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
+from sgl_jax.srt.disaggregation.encoder.embedding_data import PooledEmbedding
 from sgl_jax.srt.disaggregation.encoder.transfer_layout import encoder_pool_block_shape
 from sgl_jax.srt.disaggregation.raiden_transfer.wrapper import RaidenTransferWrapper
 
@@ -280,7 +281,7 @@ class RaidenReceiveSession:
     _done: bool = False
     timing_meta: dict[str, int] = field(default_factory=dict)
 
-    def poll(self, *, refresh_backend: bool = True) -> jax.Array | None:
+    def poll(self, *, refresh_backend: bool = True) -> PooledEmbedding | None:
         if self._done:
             return None
         result = self.pool.poll(
@@ -299,6 +300,35 @@ class RaidenReceiveSession:
             self.pool.abandon(self.transfer_id)
 
 
+class RaidenReceiveLease:
+    """Release a receive slot only after its Language-side readers finish."""
+
+    def __init__(self, pool: RaidenReceivePool, transfer_id: str, lane_id: int) -> None:
+        self._pool = pool
+        self._transfer_id = transfer_id
+        self._lane_id = lane_id
+        self._lock = threading.Lock()
+        self._released = False
+
+    def release_after(self, dependency: Any) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        self._pool.release_after(
+            self._transfer_id,
+            self._lane_id,
+            dependency,
+        )
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        self._pool.release(self._transfer_id, self._lane_id)
+
+
 class RaidenReceivePool:
     """One registered destination buffer with bounded request slots."""
 
@@ -313,7 +343,6 @@ class RaidenReceivePool:
         capacity: int,
         timeout_s: float,
     ) -> None:
-        self._sharding = sharding
         self.shape = shape
         self.dtype = jnp.dtype(dtype)
         self._timeout_s = timeout_s
@@ -335,9 +364,8 @@ class RaidenReceivePool:
         self._free = list(range(capacity - 1, -1, -1))
         self._active: dict[str, int] = {}
         self._abandoned: set[str] = set()
-        self._materializing: dict[str, jax.Array] = {}
+        self._deferred_releases: dict[str, tuple[jax.Array, ...]] = {}
         self._received_ns: dict[str, int] = {}
-        self._materialize_start_ns: dict[str, int] = {}
         self._received: set[str] = set()
         self._failed: set[str] = set()
         self._closed = False
@@ -352,6 +380,7 @@ class RaidenReceivePool:
         deadline = time.monotonic() + self._timeout_s
         with self._condition:
             while not self._free and not self._closed:
+                self._reap_deferred_locked()
                 self._reap_abandoned_locked()
                 if self._free:
                     break
@@ -388,7 +417,7 @@ class RaidenReceivePool:
         lane_id: int,
         *,
         refresh_backend: bool = True,
-    ) -> tuple[jax.Array, dict[str, int]] | None:
+    ) -> tuple[PooledEmbedding, dict[str, int]] | None:
         with self._condition:
             if self._active.get(transfer_id) != lane_id:
                 raise RuntimeError(f"Raiden embedding lane changed: {transfer_id}")
@@ -397,40 +426,25 @@ class RaidenReceivePool:
             if transfer_id in self._failed:
                 self._release_locked(transfer_id)
                 raise RuntimeError(f"Raiden embedding transfer failed: {transfer_id}")
-            embedding = self._materializing.get(transfer_id)
-            try:
-                if embedding is None:
-                    if transfer_id not in self._received:
-                        return None
-
-                    # Raiden writes outside JAX's dependency graph. Submit a
-                    # non-aliasing copy, then let later poll calls observe its
-                    # completion without blocking the scheduler event loop.
-                    block = self._buffer[lane_id].reshape(self._block_shape[0], -1)
-                    embedding = jax.device_put(
-                        block[: self.shape[0], : self.shape[1]],
-                        self._sharding,
-                        may_alias=False,
-                    )
-                    self._materializing[transfer_id] = embedding
-                    self._materialize_start_ns[transfer_id] = time.time_ns()
-
-                if not embedding.is_ready():
-                    return None
-            except Exception:
-                self._release_locked(transfer_id)
-                raise
-
-            # The source slot cannot be reused until the copy is complete.
+            if transfer_id not in self._received:
+                return None
+            materialize_ns = time.time_ns()
+            lease = RaidenReceiveLease(self, transfer_id, lane_id)
+            embedding = PooledEmbedding(
+                self._buffer,
+                lane_id,
+                self._block_shape,
+                self.shape,
+                lease,
+            )
             timing = {
                 "receive_transfer_done_ns": self._received_ns.get(
                     transfer_id,
-                    self._materialize_start_ns[transfer_id],
+                    materialize_ns,
                 ),
-                "receive_materialize_start_ns": self._materialize_start_ns[transfer_id],
-                "receive_materialize_done_ns": time.time_ns(),
+                "receive_materialize_start_ns": materialize_ns,
+                "receive_materialize_done_ns": materialize_ns,
             }
-            self._release_locked(transfer_id)
             return embedding, timing
 
     def progress(self) -> None:
@@ -439,7 +453,30 @@ class RaidenReceivePool:
             if self._closed:
                 return
             self._drain_stats_locked()
+            self._reap_deferred_locked()
             self._release_abandoned_locked()
+
+    def release_after(
+        self,
+        transfer_id: str,
+        lane_id: int,
+        dependency: Any,
+    ) -> None:
+        leaves = tuple(
+            leaf for leaf in jax.tree_util.tree_leaves(dependency) if isinstance(leaf, jax.Array)
+        )
+        with self._condition:
+            if self._active.get(transfer_id) != lane_id:
+                return
+            if not leaves or all(leaf.is_ready() for leaf in leaves):
+                self._release_locked(transfer_id)
+            else:
+                self._deferred_releases[transfer_id] = leaves
+
+    def release(self, transfer_id: str, lane_id: int) -> None:
+        with self._condition:
+            if self._active.get(transfer_id) == lane_id:
+                self._release_locked(transfer_id)
 
     def abandon(self, transfer_id: str) -> None:
         with self._condition:
@@ -459,12 +496,12 @@ class RaidenReceivePool:
         for transfer_id in list(self._abandoned):
             if transfer_id not in self._active:
                 continue
-            embedding = self._materializing.get(transfer_id)
-            if embedding is not None:
-                if embedding.is_ready():
-                    self._release_locked(transfer_id)
-                continue
             if transfer_id in self._received or transfer_id in self._failed:
+                self._release_locked(transfer_id)
+
+    def _reap_deferred_locked(self) -> None:
+        for transfer_id, dependencies in list(self._deferred_releases.items()):
+            if all(dependency.is_ready() for dependency in dependencies):
                 self._release_locked(transfer_id)
 
     def _drain_stats_locked(self) -> None:
@@ -478,9 +515,8 @@ class RaidenReceivePool:
     def _release_locked(self, transfer_id: str) -> None:
         lane_id = self._active.pop(transfer_id, None)
         self._abandoned.discard(transfer_id)
-        self._materializing.pop(transfer_id, None)
+        self._deferred_releases.pop(transfer_id, None)
         self._received_ns.pop(transfer_id, None)
-        self._materialize_start_ns.pop(transfer_id, None)
         self._received.discard(transfer_id)
         self._failed.discard(transfer_id)
         if lane_id is not None:

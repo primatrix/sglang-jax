@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
 
+from sgl_jax.srt.disaggregation.encoder.embedding_data import PooledEmbedding
 from sgl_jax.srt.managers.schedule_batch import (
     ModelWorkerBatch,
     ScheduleBatch,
@@ -743,6 +744,47 @@ def test_precomputed_embeddings_merge_per_item_to_keep_jit_shape_static():
 
     np.testing.assert_array_equal(output[:, 0], [10, 11, 20, 21])
     assert [call.args[1].shape for call in merge.call_args_list] == [(2, 1), (2, 1)]
+
+
+def test_pooled_embedding_merges_without_materializing_and_releases_lazily():
+    class Lease:
+        dependency = None
+
+        def release_after(self, dependency):
+            self.dependency = dependency
+
+    lease = Lease()
+    raw = np.zeros((2, 2, 2, 8, 128), dtype=np.float32)
+    raw[1].reshape(2, -1)[:, :1] = np.asarray([[10.0], [11.0]])
+    pooled = PooledEmbedding(
+        jnp.asarray(raw),
+        slot=1,
+        block_shape=(2, 2, 8, 128),
+        shape=(2, 1),
+        lease=lease,
+    )
+    item = MultimodalDataItem(
+        Modality.IMAGE,
+        hash=1,
+        placeholder_ranges=[(0, 2)],
+        precomputed_embeddings=pooled,
+    )
+    batch = _batch([item], extend=2, per_dp_token=2)
+    model = _TestInModelModel(jnp.zeros((2, 1), dtype=jnp.float32))
+
+    with patch.object(
+        PooledEmbedding,
+        "materialize",
+        side_effect=AssertionError("merge must gather directly from the receive pool"),
+    ):
+        output, _ = host_orchestration.embed_multimodal_inputs(
+            batch,
+            jnp.zeros(2, dtype=jnp.int32),
+            model,
+        )
+
+    np.testing.assert_array_equal(output[:, 0], [10, 11])
+    assert lease.dependency is output
 
 
 def test_embedding_pool_skips_write_after_final_merge():

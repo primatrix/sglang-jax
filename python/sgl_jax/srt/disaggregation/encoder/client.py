@@ -19,6 +19,7 @@ import zmq
 from sgl_jax.srt.disaggregation.encoder.embedding_data import (
     EmbeddingData,
     MultiModalEmbeddingData,
+    PooledEmbedding,
 )
 from sgl_jax.srt.managers.io_struct import (
     GenerateReqInput,
@@ -128,7 +129,7 @@ def validate_encoder_response(
 
 
 class EncoderReceiveSession(Protocol):
-    def poll(self, *, refresh_backend: bool = True) -> jax.Array | None: ...
+    def poll(self, *, refresh_backend: bool = True) -> jax.Array | PooledEmbedding | None: ...
 
     def close(self) -> None: ...
 

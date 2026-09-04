@@ -20,6 +20,7 @@ from sgl_jax.srt.disaggregation.encoder.client import (
 from sgl_jax.srt.disaggregation.encoder.embedding_data import (
     EmbeddingData,
     MultiModalEmbeddingData,
+    PooledEmbedding,
 )
 from sgl_jax.srt.disaggregation.encoder.raiden_pool import (
     RaidenReceivePool,
@@ -357,7 +358,12 @@ def test_raiden_request_receives_into_matching_jax_buffer(monkeypatch):
     transfer.stats = ([], ["part-0:embedding"], [])
     result = _poll_until_ready(request)
 
-    np.testing.assert_array_equal(result["embeddings"][Modality.IMAGE], np.zeros((2, 3)))
+    embedding = result["embeddings"][Modality.IMAGE]
+    assert isinstance(embedding, PooledEmbedding)
+    materialized = embedding.materialize()
+    np.testing.assert_array_equal(materialized, np.zeros((2, 3)))
+    embedding.lease.release_after(materialized)
+    backend.progress()
     request.close()
     backend.close()
     assert metadata_router.unregistered == ("part-0",)
@@ -404,10 +410,15 @@ def test_raiden_receiver_reuses_manager_and_pool_blocks(monkeypatch):
     third_future = backend.start(metadata(3))._future
     assert not third_future.done()
     first.pool._transfer.stats = ([], [first.transfer_id], [])
-    assert _poll_until_ready(first).shape == (2, 3)
+    first_embedding = _poll_until_ready(first)
+    assert first_embedding.shape == (2, 3)
+    assert not third_future.done()
+    first_embedding.lease.release_after(jnp.zeros(()))
     third = third_future.result(timeout=1)
     second.pool._transfer.stats = ([], [second.transfer_id], [])
-    assert _poll_until_ready(second).shape == (2, 3)
+    second_embedding = _poll_until_ready(second)
+    assert second_embedding.shape == (2, 3)
+    second_embedding.lease.release_after(jnp.zeros(()))
 
     assert third.pool is first.pool
     assert third.lane_id == first.lane_id
@@ -467,15 +478,8 @@ def test_raiden_request_surfaces_receive_failure():
         session.poll()
 
 
-def test_raiden_receive_poll_does_not_wait_for_device_copy(monkeypatch):
-    class PendingCopy:
-        ready = False
-
-        def is_ready(self) -> bool:
-            return self.ready
-
+def test_raiden_receive_poll_returns_pool_view_and_defers_slot_release(monkeypatch):
     transfer_id = "part-0:embedding"
-    pending_copy = PendingCopy()
     pool = object.__new__(RaidenReceivePool)
     pool._sharding = jax.sharding.SingleDeviceSharding(jax.local_devices()[0])
     pool.shape = (2, 3)
@@ -487,7 +491,7 @@ def test_raiden_receive_poll_does_not_wait_for_device_copy(monkeypatch):
     pool._free = []
     pool._active = {transfer_id: 0}
     pool._abandoned = set()
-    pool._materializing = {}
+    pool._deferred_releases = {}
     pool._received_ns = {transfer_id: time.time_ns()}
     pool._materialize_start_ns = {}
     pool._received = {transfer_id}
@@ -495,21 +499,23 @@ def test_raiden_receive_poll_does_not_wait_for_device_copy(monkeypatch):
 
     monkeypatch.setattr(
         "sgl_jax.srt.disaggregation.encoder.raiden_pool.jax.device_put",
-        lambda *_args, **_kwargs: pending_copy,
+        lambda *_args, **_kwargs: pytest.fail("receive poll must not copy the pool slot"),
     )
     session = RaidenReceiveSession(transfer_id=transfer_id, lane_id=0, pool=pool)
 
-    assert session.poll() is None
+    embedding = session.poll()
+    assert isinstance(embedding, PooledEmbedding)
+    assert embedding.buffer is pool._buffer
+    assert embedding.slot == 0
     assert pool._active == {transfer_id: 0}
     assert pool._free == []
 
-    pending_copy.ready = True
-    assert session.poll() is pending_copy
     assert session.timing_meta["receive_transfer_done_ns"] > 0
     assert (
         session.timing_meta["receive_materialize_done_ns"]
-        >= session.timing_meta["receive_materialize_start_ns"]
+        == session.timing_meta["receive_materialize_start_ns"]
     )
+    embedding.lease.release_after(jnp.zeros(()))
     assert pool._active == {}
     assert pool._free == [0]
 
@@ -522,7 +528,7 @@ def test_raiden_receive_pool_can_reuse_one_shared_stats_refresh():
     pool._closed = False
     pool._active = {"part-0:embedding": 0, "part-1:embedding": 1}
     pool._abandoned = set()
-    pool._materializing = {}
+    pool._deferred_releases = {}
     pool._received_ns = {}
     pool._received = set()
     pool._failed = set()
