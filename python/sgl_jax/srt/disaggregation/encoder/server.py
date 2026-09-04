@@ -6,6 +6,7 @@ import os
 import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -44,6 +45,22 @@ from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.server_args import ServerArgs, apply_multimodal_model_defaults
 from sgl_jax.srt.utils import configure_logger, set_uvicorn_logging_configs
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
+
+
+@partial(jax.jit, static_argnames=("token_counts",))
+def _split_packed_encoder_output(
+    packed: jax.Array,
+    *,
+    token_counts: tuple[int, ...],
+) -> tuple[jax.Array, ...]:
+    """Split one packed encoder output with one JAX dispatch per batch."""
+    offset = 0
+    embeddings = []
+    for token_count in token_counts:
+        embeddings.append(jax.lax.dynamic_slice_in_dim(packed, offset, token_count, axis=0))
+        offset += token_count
+    return tuple(embeddings)
+
 
 # Adapted for JAX from SGLang's encoder server:
 # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/disaggregation/encoder/server.py
@@ -181,28 +198,45 @@ class MMEncoder:
         }
 
         results = []
-        offset = 0
         token_count_duration_ns = 0
         embedding_slice_duration_ns = 0
         metadata_duration_ns = 0
         result_pack_duration_ns = 0
-        for mm_inputs, request_timing in zip(processed, batch.request_timings):
-            phase_start_ns = time.perf_counter_ns()
-            token_count = sum(
+
+        phase_start_ns = time.perf_counter_ns()
+        token_counts = tuple(
+            sum(
                 end - start
                 for item in mm_inputs.mm_items
                 for start, end in item.placeholder_ranges or ()
             )
-            token_count_duration_ns += time.perf_counter_ns() - phase_start_ns
+            for mm_inputs in processed
+        )
+        token_count_duration_ns += time.perf_counter_ns() - phase_start_ns
 
-            phase_start_ns = time.perf_counter_ns()
-            embedding = packed[offset : offset + token_count]
-            if simulate:
-                embedding = jax.device_put(embedding)
-            if embedding.shape[0] != token_count:
-                raise ValueError(f"incomplete {modality.name} encoder output")
-            embedding_slice_duration_ns += time.perf_counter_ns() - phase_start_ns
+        phase_start_ns = time.perf_counter_ns()
+        if sum(token_counts) > packed.shape[0]:
+            raise ValueError(f"incomplete {modality.name} encoder output")
+        if simulate:
+            offset = 0
+            embeddings = []
+            for token_count in token_counts:
+                embeddings.append(jax.device_put(packed[offset : offset + token_count]))
+                offset += token_count
+        else:
+            embeddings = _split_packed_encoder_output(packed, token_counts=token_counts)
+        if any(
+            embedding.shape[0] != token_count
+            for embedding, token_count in zip(embeddings, token_counts)
+        ):
+            raise ValueError(f"incomplete {modality.name} encoder output")
+        embedding_slice_duration_ns += time.perf_counter_ns() - phase_start_ns
 
+        for embedding, mm_inputs, request_timing in zip(
+            embeddings,
+            processed,
+            batch.request_timings,
+        ):
             phase_start_ns = time.perf_counter_ns()
             metadata = self._metadata(mm_inputs, modality)
             metadata_duration_ns += time.perf_counter_ns() - phase_start_ns
@@ -210,7 +244,6 @@ class MMEncoder:
             phase_start_ns = time.perf_counter_ns()
             metadata["_encoder_timing"] = {**encoder_timing, **request_timing}
             results.append((embedding, metadata))
-            offset += token_count
             result_pack_duration_ns += time.perf_counter_ns() - phase_start_ns
 
         postprocess_done_ns = time.time_ns()
