@@ -6,7 +6,7 @@ import hashlib
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,6 +20,7 @@ from sgl_jax.srt.disaggregation.encoder.raiden_pool import (
     RaidenReceivePool,
     RaidenReceiveSession,
     RaidenSendPool,
+    compile_packed_pool_copy,
 )
 from sgl_jax.srt.disaggregation.raiden_transfer.wrapper import RaidenTransferWrapper
 
@@ -104,7 +105,56 @@ class RaidenEncoderServerTransfer:
         self._active: set[str] = set()
         self._pending: set[str] = set()
         self._lock = threading.Lock()
+        self._compile_lock = threading.Lock()
+        self._compile_pool = ThreadPoolExecutor(
+            max_workers=4,
+            thread_name_prefix="encoder-pool-write-compile",
+        )
+        self._packed_executables: dict[tuple[Any, ...], Future[Any]] = {}
         self._closed = False
+
+    @staticmethod
+    def _packed_key(
+        packed: jax.Array | jax.ShapeDtypeStruct,
+        token_counts: tuple[int, ...],
+    ) -> tuple[Any, ...]:
+        return (
+            tuple(int(dim) for dim in packed.shape),
+            str(packed.dtype),
+            repr(packed.sharding),
+            token_counts,
+        )
+
+    def _packed_executable(
+        self,
+        packed: jax.Array | jax.ShapeDtypeStruct,
+        token_counts: tuple[int, ...],
+    ) -> Future[Any]:
+        if not token_counts or any(token_count != token_counts[0] for token_count in token_counts):
+            raise ValueError("Raiden source pool requires one embedding shape")
+        key = self._packed_key(packed, token_counts)
+        with self._compile_lock:
+            future = self._packed_executables.get(key)
+            if future is None:
+                future = self._compile_pool.submit(
+                    compile_packed_pool_copy,
+                    packed,
+                    (token_counts[0], int(packed.shape[1])),
+                    capacity=self._pool_size,
+                    token_counts=token_counts,
+                )
+                self._packed_executables[key] = future
+        return future
+
+    def precompile_packed_batches(
+        self,
+        specs: tuple[
+            tuple[jax.ShapeDtypeStruct, tuple[int, ...]],
+            ...,
+        ],
+    ) -> None:
+        for packed, token_counts in specs:
+            self._packed_executable(packed, token_counts)
 
     def reserve_batch_sync(self, transfer_ids: list[str]) -> list[_Reservation]:
         transfer_ids = list(transfer_ids)
@@ -274,10 +324,12 @@ class RaidenEncoderServerTransfer:
         pool_ready_ns = time.time_ns()
 
         try:
+            executable = self._packed_executable(packed, token_counts).result()
             ready = pool.copy_packed_batch_async(
                 packed,
                 [reservation.slot for reservation in reservations],
                 token_counts,
+                executable=executable,
             )
         except BaseException:
             self.cancel_batch(reservations)
@@ -374,6 +426,7 @@ class RaidenEncoderServerTransfer:
             self._pending.clear()
         for transfer_id in active:
             self._log_inflight_event("close", transfer_id)
+        self._compile_pool.shutdown(cancel_futures=True)
 
     def _discard_active(self, transfer_id: str, *, event: str) -> None:
         with self._lock:

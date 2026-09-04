@@ -131,6 +131,30 @@ def _compile_donated_packed_copy(
     return compiled
 
 
+def compile_packed_pool_copy(
+    packed: jax.Array | jax.ShapeDtypeStruct,
+    request_shape: tuple[int, int],
+    *,
+    capacity: int,
+    token_counts: tuple[int, ...],
+) -> Any:
+    block_shape = encoder_pool_block_shape(request_shape)
+    pool = jax.ShapeDtypeStruct(
+        (capacity, *block_shape),
+        packed.dtype,
+        sharding=_pool_sharding(packed.sharding),
+    )
+    start_ns = time.perf_counter_ns()
+    compiled = _compile_donated_packed_copy(pool, packed, token_counts)
+    logger.info(
+        "ENCODER-POOL-WRITE-PRECOMPILE capacity=%d batch_size=%d duration_ms=%.3f",
+        packed.shape[0],
+        len(token_counts),
+        (time.perf_counter_ns() - start_ns) / 1_000_000,
+    )
+    return compiled
+
+
 class RaidenSendPool:
     """Reusable source buffer with bounded, request-sized slots."""
 
@@ -210,6 +234,7 @@ class RaidenSendPool:
         packed: jax.Array,
         slots: list[int],
         token_counts: tuple[int, ...],
+        executable: Any | None = None,
     ) -> tuple[jax.Array, ...]:
         if len(slots) != len(token_counts):
             raise ValueError("Raiden slot and packed item counts differ")
@@ -227,10 +252,15 @@ class RaidenSendPool:
             raise ValueError("Raiden packed output does not match the source pool")
 
         key = (tuple(int(dim) for dim in packed.shape), token_counts)
-        copy = self._packed_copies.get(key)
+        copy = executable or self._packed_copies.get(key)
         if copy is None:
-            copy = _compile_donated_packed_copy(self._buffer, packed, token_counts)
-            self._packed_copies[key] = copy
+            copy = compile_packed_pool_copy(
+                packed,
+                self.shape,
+                capacity=self._buffer.shape[0],
+                token_counts=token_counts,
+            )
+        self._packed_copies[key] = copy
         self._buffer, ready = copy(
             self._buffer,
             packed,

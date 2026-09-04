@@ -79,6 +79,7 @@ class PreparedEncoderBatch:
     token_counts: tuple[int, ...]
     split_capacity: int | None
     split_executable: Future[Any] | None
+    transfer_specs: tuple[tuple[jax.ShapeDtypeStruct, tuple[int, ...]], ...]
     done_ns: int
 
 
@@ -178,6 +179,11 @@ class MMEncoder:
         processed, timings = map(list, zip(*prepared))
         token_counts = self._token_counts(processed)
         split_capacity, split_executable = self._precompile_splits(processed, token_counts)
+        transfer_specs = self._packed_transfer_specs(
+            processed,
+            token_counts,
+            split_capacity,
+        )
         return PreparedEncoderBatch(
             modality,
             processed,
@@ -185,6 +191,7 @@ class MMEncoder:
             token_counts,
             split_capacity,
             split_executable,
+            transfer_specs,
             time.time_ns(),
         )
 
@@ -445,6 +452,53 @@ class MMEncoder:
                         (sample_count,) * batch_size,
                     )
         return int(capacity), current
+
+    def _packed_transfer_specs(
+        self,
+        processed: list[MultimodalInputs],
+        token_counts: tuple[int, ...],
+        capacity: int | None,
+    ) -> tuple[tuple[jax.ShapeDtypeStruct, tuple[int, ...]], ...]:
+        if capacity is None or getattr(self, "_simulate_compute", False):
+            return ()
+        target = self.model.thinker if hasattr(self.model, "thinker") else self.model
+        planner = getattr(target, "get_multimodal_embedding_packed_capacity", None)
+        if planner is None:
+            return ()
+
+        variants = {(int(capacity), token_counts)}
+        signatures = [
+            tuple((item.modality, tuple(item.feature.shape)) for item in mm_inputs.mm_items)
+            for mm_inputs in processed
+        ]
+        if signatures and all(signature == signatures[0] for signature in signatures):
+            sample_items = processed[0].mm_items
+            sample_count = token_counts[0]
+            for batch_size in range(1, self._max_batch_size + 1):
+                batch_capacity = planner(sample_items * batch_size)
+                if batch_capacity is not None:
+                    variants.add(
+                        (
+                            int(batch_capacity),
+                            (sample_count,) * batch_size,
+                        )
+                    )
+
+        sharding = jax.sharding.NamedSharding(
+            target.mesh,
+            jax.sharding.PartitionSpec(),
+        )
+        return tuple(
+            (
+                jax.ShapeDtypeStruct(
+                    (packed_capacity, self.model_config.hidden_size),
+                    self.model_config.dtype,
+                    sharding=sharding,
+                ),
+                counts,
+            )
+            for packed_capacity, counts in sorted(variants, key=lambda value: len(value[1]))
+        )
 
     def _split_executable(
         self,

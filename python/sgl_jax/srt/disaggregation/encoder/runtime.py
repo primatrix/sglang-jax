@@ -120,6 +120,10 @@ class EncoderRuntime:
         # delegates image loading and HF processing to their own executors.
         preprocess_start_ns = time.time_ns()
         prepared = await self._encoder.preprocess(requests)
+        precompile_packed = getattr(self._transfer, "precompile_packed_batches", None)
+        transfer_specs = getattr(prepared, "transfer_specs", ())
+        if callable(precompile_packed) and transfer_specs:
+            precompile_packed(transfer_specs)
         if not self._accepting:
             raise RuntimeError("EncoderRuntime stopped during preprocessing")
         job = _EncodeJob(
