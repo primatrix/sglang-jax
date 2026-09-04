@@ -52,12 +52,37 @@ def _encode_tasks(
 ) -> jax.Array:
     precomputed = [task.item.precomputed_embeddings for task in tasks]
     if all(value is not None for value in precomputed):
+        if len(precomputed) == 1:
+            return jnp.asarray(precomputed[0])
         return jnp.concatenate([jnp.asarray(value) for value in precomputed], axis=0)
     if any(value is not None for value in precomputed):
         raise ValueError("cannot mix local and precomputed embeddings for one modality")
     if encode_func is None:
         raise ValueError(f"no embedding function for modality {tasks[0].item.modality}")
     return encode_func([task.item for task in tasks])
+
+
+def _merge_encoded_tasks(
+    running: jax.Array,
+    tasks: tuple[ItemTask, ...],
+    encode_func,
+    mesh: Mesh | None,
+    pool: EmbeddingPool | None = None,
+) -> jax.Array:
+    """Keep EPD overlays item-shaped so request batch size is not a JIT dimension."""
+    if all(task.item.precomputed_embeddings is not None for task in tasks):
+        for task in tasks:
+            packed = _encode_tasks((task,), encode_func)
+            running = _gather_merge(running, packed, (task,), mesh)
+            if pool is not None:
+                _write_misses_to_pool(pool, packed, (task,))
+        return running
+
+    packed = _encode_tasks(tasks, encode_func)
+    running = _gather_merge(running, packed, tasks, mesh)
+    if pool is not None:
+        _write_misses_to_pool(pool, packed, tasks)
+    return running
 
 
 def _build_item_task(
@@ -354,8 +379,7 @@ def embed_multimodal_inputs(
             encode_func = encode_funcs.get(modality)
 
             if embedding_pool is None:
-                packed = _encode_tasks(tasks, encode_func)
-                running = _gather_merge(running, packed, tasks, mesh)
+                running = _merge_encoded_tasks(running, tasks, encode_func, mesh)
                 continue
 
             # Pool present: split hits from misses by item hash. Misses run the
@@ -378,8 +402,12 @@ def embed_multimodal_inputs(
             if hit_tasks:
                 running = _gather_from_pool(running, embedding_pool, hit_tasks, hit_entries, mesh)
             if miss_tasks:
-                packed = _encode_tasks(miss_tasks, encode_func)
-                running = _gather_merge(running, packed, tuple(miss_tasks), mesh)
-                _write_misses_to_pool(embedding_pool, packed, miss_tasks)
+                running = _merge_encoded_tasks(
+                    running,
+                    tuple(miss_tasks),
+                    encode_func,
+                    mesh,
+                    embedding_pool,
+                )
 
         return _split_embeddings(running, hidden, deepstack_dim, mesh)

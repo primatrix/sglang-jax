@@ -714,6 +714,37 @@ def test_packed_gather_merge_handles_chunk_split():
     np.testing.assert_array_equal(out[:, 0], [11, 12, 13])
 
 
+def test_precomputed_embeddings_merge_per_item_to_keep_jit_shape_static():
+    first = MultimodalDataItem(
+        Modality.IMAGE,
+        hash=1,
+        placeholder_ranges=[(0, 2)],
+        precomputed_embeddings=jnp.asarray([[10.0], [11.0]]),
+    )
+    second = MultimodalDataItem(
+        Modality.IMAGE,
+        hash=2,
+        placeholder_ranges=[(2, 4)],
+        precomputed_embeddings=jnp.asarray([[20.0], [21.0]]),
+    )
+    batch = _batch([first, second], extend=4, per_dp_token=4)
+    model = _TestInModelModel(jnp.zeros((4, 1), dtype=jnp.float32))
+
+    with patch.object(
+        host_orchestration,
+        "_gather_merge",
+        wraps=host_orchestration._gather_merge,
+    ) as merge:
+        output, _ = host_orchestration.embed_multimodal_inputs(
+            batch,
+            jnp.zeros(4, dtype=jnp.int32),
+            model,
+        )
+
+    np.testing.assert_array_equal(output[:, 0], [10, 11, 20, 21])
+    assert [call.args[1].shape for call in merge.call_args_list] == [(2, 1), (2, 1)]
+
+
 def test_embedding_pool_skips_write_after_final_merge():
     item = MultimodalDataItem(
         Modality.IMAGE, hash=5, feature=np.ones((2, 1)), placeholder_ranges=[(0, 2)]
