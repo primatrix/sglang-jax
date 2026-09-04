@@ -414,6 +414,7 @@ class EncoderClient:
         self._preparing: dict[int, PendingEncoderRequest] = {}
         self._pending_lock = threading.Lock()
         self._completed: SimpleQueue[PendingEncoderRequest] = SimpleQueue()
+        self._completed_ready = threading.Event()
         self._prepare_executor = (
             ThreadPoolExecutor(
                 max_workers=min(2, max(1, registration_workers)),
@@ -463,10 +464,17 @@ class EncoderClient:
     def drain_completed(self) -> list[PendingEncoderRequest]:
         completed = []
         while True:
-            try:
-                completed.append(self._completed.get_nowait())
-            except Empty:
+            self._completed_ready.clear()
+            while True:
+                try:
+                    completed.append(self._completed.get_nowait())
+                except Empty:
+                    break
+            if not self._completed_ready.is_set():
                 return completed
+
+    def has_completed(self) -> bool:
+        return self._completed_ready.is_set()
 
     def receive(self, request: TokenizedGenerateReqInput) -> PendingEncoderRequest:
         registrations = plan_encoder_registrations(request, self._encoder_urls)
@@ -574,6 +582,7 @@ class EncoderClient:
             if self._preparing.get(key) is request:
                 self._preparing.pop(key, None)
         self._completed.put(request)
+        self._completed_ready.set()
 
     def close(self) -> None:
         self._progress_stop.set()

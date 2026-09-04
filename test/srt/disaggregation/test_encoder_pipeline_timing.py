@@ -42,6 +42,36 @@ def test_language_drains_only_completed_background_receivers():
     assert Scheduler.process_encoder_requests(scheduler, []) == []
 
 
+def test_language_admits_signaled_encoder_completions():
+    calls = []
+    scheduler = SimpleNamespace(
+        encoder_client=SimpleNamespace(
+            background_progress=True,
+            has_completed=lambda: True,
+        ),
+        process_input_requests=lambda requests: calls.append(requests),
+    )
+
+    Scheduler._admit_completed_encoder_requests(scheduler)
+
+    assert calls == [[]]
+
+
+def test_language_skips_completed_admission_without_signal():
+    calls = []
+    scheduler = SimpleNamespace(
+        encoder_client=SimpleNamespace(
+            background_progress=True,
+            has_completed=lambda: False,
+        ),
+        process_input_requests=lambda requests: calls.append(requests),
+    )
+
+    Scheduler._admit_completed_encoder_requests(scheduler)
+
+    assert calls == []
+
+
 def test_language_logs_encoder_pipeline_timing(caplog):
     timing = {
         "enqueue_ns": 1_000_000,

@@ -1190,6 +1190,7 @@ class Scheduler(
                 if self._comm_backend is not None:
                     self._comm_backend.wait_for_new_requests(0.001)
 
+            self._admit_completed_encoder_requests()
             self.last_batch = batch
 
     def event_loop_overlap(self):
@@ -1265,6 +1266,11 @@ class Scheduler(
                     )
                     with jax.profiler.TraceAnnotation("process_batch_result"):
                         self.process_batch_result(tmp_batch, None, batch.launch_done)
+
+            # The accelerator is already running the selected batch. Admit any
+            # newly ready encoder results while that work is in flight so the
+            # next scheduler iteration can consume them immediately.
+            self._admit_completed_encoder_requests()
 
             if self.last_batch:
                 # Process the results of the last batch
@@ -1374,6 +1380,11 @@ class Scheduler(
                     self._comm_backend.send_pyobj(output)
                 else:
                     self.send_to_tokenizer.send_pyobj(output)
+
+    def _admit_completed_encoder_requests(self) -> None:
+        client = self.encoder_client
+        if client is not None and client.background_progress and client.has_completed():
+            self.process_input_requests([])
 
     def handle_generate_request(
         self,

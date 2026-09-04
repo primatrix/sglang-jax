@@ -287,6 +287,7 @@ def test_encoder_receiver_background_progresses_without_scheduler_poll(monkeypat
             completed = client.drain_completed()
             time.sleep(0.001)
         assert completed == [pending]
+        assert not client.has_completed()
     finally:
         pending.close()
         client.close()
