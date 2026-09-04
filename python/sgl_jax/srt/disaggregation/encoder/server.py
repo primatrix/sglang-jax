@@ -16,9 +16,10 @@ from typing import Any
 import jax
 import jax.profiler
 import numpy as np
+import orjson
 import uvicorn
 import zmq.asyncio
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import Response
 from zmq.constants import LINGER, PUSH
 
@@ -69,6 +70,8 @@ def _split_packed_encoder_output(
 
 
 logger = logging.getLogger(__name__)
+
+_ENCODER_ORJSON_REQUEST = os.environ.get("SGLANG_ENCODER_ORJSON_REQUEST", "1") != "0"
 
 
 @dataclass(slots=True)
@@ -737,7 +740,10 @@ class EncoderServer:
         self._receiver_events.setdefault(req_id, asyncio.Event()).set()
         return {"req_id": req_id}
 
-    async def encode(self, request: dict[str, Any]) -> dict[str, Any]:
+    async def encode(self, request: Request) -> dict[str, Any]:
+        if not isinstance(request, dict):
+            body = await request.body()
+            request = orjson.loads(body) if _ENCODER_ORJSON_REQUEST else await request.json()
         # Model the language->encoder network hop (loopback has none).
         if self._network_rtt_s:
             await asyncio.sleep(self._network_rtt_s)
