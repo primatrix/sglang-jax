@@ -31,10 +31,6 @@ from sgl_jax.srt.managers.io_struct import (
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, flatten_nested_list
 
 logger = logging.getLogger(__name__)
-_DISPATCH_CONNECTION_LIMIT = max(
-    1,
-    int(os.environ.get("SGLANG_ENCODER_DISPATCH_CONNECTION_LIMIT", "256")),
-)
 _DISPATCH_ORJSON = os.environ.get("SGLANG_ENCODER_DISPATCH_ORJSON", "1") != "0"
 
 
@@ -631,14 +627,7 @@ class EncoderRequestDispatcher:
         encoder_urls: list[str],
     ) -> tuple[dict[Modality, list[int]], asyncio.Task[None]]:
         if self._client is None:
-            self._client = httpx.AsyncClient(
-                timeout=self._timeout,
-                limits=httpx.Limits(
-                    max_connections=_DISPATCH_CONNECTION_LIMIT,
-                    max_keepalive_connections=_DISPATCH_CONNECTION_LIMIT,
-                    keepalive_expiry=30.0,
-                ),
-            )
+            self._client = httpx.AsyncClient(timeout=self._timeout)
         client = self._client
 
         dispatch_start_ns = time.time_ns()

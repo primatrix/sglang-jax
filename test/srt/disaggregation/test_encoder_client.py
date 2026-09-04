@@ -326,9 +326,8 @@ def test_encoder_request_dispatcher_reuses_http_client(monkeypatch):
             pass
 
     class FakeAsyncClient:
-        def __init__(self, *, timeout, limits) -> None:
+        def __init__(self, *, timeout) -> None:
             self.timeout = timeout
-            self.limits = limits
             self.closed = False
             clients.append(self)
 
@@ -362,8 +361,6 @@ def test_encoder_request_dispatcher_reuses_http_client(monkeypatch):
 
     assert len(clients) == 1
     assert clients[0].timeout == 12.0
-    assert clients[0].limits.max_connections == 256
-    assert clients[0].limits.max_keepalive_connections == 256
     assert clients[0].closed
     assert posts == [
         ("http://encoder/encode", "request-0_local_part_0"),

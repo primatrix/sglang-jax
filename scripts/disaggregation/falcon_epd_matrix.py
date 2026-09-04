@@ -41,7 +41,6 @@ class Variant:
     max_prefill_tokens: int = 8192
     encoder_cpu_threads: int | None = None
     language_cpu_threads: int | None = None
-    dispatch_connection_limit: int = 256
     dispatch_orjson: bool = True
 
 
@@ -72,22 +71,8 @@ def _variants() -> list[Variant]:
         replace(base, name="encoder-cpu-threads-4", encoder_cpu_threads=4),
         replace(base, name="encoder-cpu-threads-8", encoder_cpu_threads=8),
         replace(base, name="language-cpu-threads-4", language_cpu_threads=4),
-        replace(base, name="dispatch-connections-20", dispatch_connection_limit=20),
-        replace(base, name="dispatch-connections-256", dispatch_connection_limit=256),
         replace(base, name="encoder-cpu4-json", encoder_cpu_threads=4, dispatch_orjson=False),
         replace(base, name="encoder-cpu4-orjson", encoder_cpu_threads=4, dispatch_orjson=True),
-        replace(
-            base,
-            name="encoder-cpu4-dispatch-20",
-            encoder_cpu_threads=4,
-            dispatch_connection_limit=20,
-        ),
-        replace(
-            base,
-            name="encoder-cpu4-dispatch-256",
-            encoder_cpu_threads=4,
-            dispatch_connection_limit=256,
-        ),
         Variant(
             "wide-pipeline",
             pool_size=128,
@@ -141,7 +126,6 @@ def _server_env(
     cache_dir: Path,
     chips: str,
     cpu_threads: int | None,
-    dispatch_connection_limit: int | None = None,
     dispatch_orjson: bool | None = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
@@ -158,8 +142,6 @@ def _server_env(
     if cpu_threads is not None:
         env["OMP_NUM_THREADS"] = str(cpu_threads)
         env["MKL_NUM_THREADS"] = str(cpu_threads)
-    if dispatch_connection_limit is not None:
-        env["SGLANG_ENCODER_DISPATCH_CONNECTION_LIMIT"] = str(dispatch_connection_limit)
     if dispatch_orjson is not None:
         env["SGLANG_ENCODER_DISPATCH_ORJSON"] = "1" if dispatch_orjson else "0"
     return env
@@ -280,7 +262,6 @@ def _start_servers(
             args.cache_root / "language",
             "2,3",
             variant.language_cpu_threads,
-            variant.dispatch_connection_limit,
             variant.dispatch_orjson,
         ),
         stdout=language_log,
