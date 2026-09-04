@@ -40,6 +40,7 @@ class Variant:
     channels: int = 4
     max_prefill_tokens: int = 8192
     cpu_threads: int | None = None
+    receiver_progress_interval_ms: float = 1.0
 
 
 def _variants() -> list[Variant]:
@@ -63,6 +64,10 @@ def _variants() -> list[Variant]:
         replace(base, name="cpu-threads-1", cpu_threads=1),
         replace(base, name="cpu-threads-4", cpu_threads=4),
         replace(base, name="cpu-threads-16", cpu_threads=16),
+        replace(base, name="receiver-tick-0.1ms", receiver_progress_interval_ms=0.1),
+        replace(base, name="receiver-tick-0.25ms", receiver_progress_interval_ms=0.25),
+        replace(base, name="receiver-tick-0.5ms", receiver_progress_interval_ms=0.5),
+        replace(base, name="receiver-tick-2ms", receiver_progress_interval_ms=2.0),
         Variant(
             "wide-pipeline",
             pool_size=128,
@@ -238,6 +243,8 @@ def _start_servers(
             "--dp-schedule-policy",
             "min_running_queue",
             "--encoder-receiver-background-progress",
+            "--encoder-receiver-progress-interval-seconds",
+            str(variant.receiver_progress_interval_ms / 1000.0),
             "--host",
             "0.0.0.0",
             "--port",
