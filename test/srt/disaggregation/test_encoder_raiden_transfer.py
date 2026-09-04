@@ -157,7 +157,7 @@ def test_raiden_server_uses_donated_request_pool(monkeypatch):
     transfer.close()
 
 
-def test_raiden_server_streams_packed_slices_into_reserved_slots(monkeypatch):
+def test_raiden_server_fuses_packed_slices_into_reserved_slots(monkeypatch):
     _FakeRaidenWrapper.instances.clear()
     monkeypatch.setattr(
         "sgl_jax.srt.disaggregation.encoder.raiden_transfer.RaidenTransferWrapper",
@@ -171,7 +171,7 @@ def test_raiden_server_streams_packed_slices_into_reserved_slots(monkeypatch):
     staged = transfer.stage_batch_sync(reservations, embeddings)
     staged[0].ready.block_until_ready()
 
-    assert staged[0].ready is not staged[1].ready
+    assert staged[0].ready is staged[1].ready
     buffer = transfer._pool._buffer.reshape(2, 2, -1)
     np.testing.assert_array_equal(buffer[0, :, :3], packed[:2])
     np.testing.assert_array_equal(buffer[1, :, :3], packed[2:4])

@@ -38,11 +38,12 @@ def _copy_into_slot(pool: jax.Array, value: jax.Array, slot: jax.Array) -> jax.A
 
 
 @partial(jax.jit, donate_argnums=(0,), static_argnames=("rows",))
-def _copy_packed_slice_into_slot_with_token(
+def _copy_packed_slices_into_slots_with_token(
     pool: jax.Array,
     packed: jax.Array,
-    offset: jax.Array,
-    slot: jax.Array,
+    offsets: jax.Array,
+    slots: jax.Array,
+    valid: jax.Array,
     *,
     rows: int,
 ) -> tuple[jax.Array, jax.Array]:
@@ -52,11 +53,15 @@ def _copy_packed_slice_into_slot_with_token(
         (0, padded_shape[0] - rows),
         (0, padded_shape[1] - packed.shape[1]),
     )
-    value = jax.lax.dynamic_slice_in_dim(packed, offset, rows, axis=0)
-    block = jnp.pad(value, padding).reshape(block_shape)[None]
-    pool = jax.lax.dynamic_update_slice_in_dim(pool, block, slot, axis=0)
+    for index in range(offsets.shape[0]):
+        value = jax.lax.dynamic_slice_in_dim(packed, offsets[index], rows, axis=0)
+        block = jnp.pad(value, padding).reshape(block_shape)[None]
+        old_block = jax.lax.dynamic_slice_in_dim(pool, slots[index], 1, axis=0)
+        block = jnp.where(valid[index], block, old_block)
+        pool = jax.lax.dynamic_update_slice_in_dim(pool, block, slots[index], axis=0)
+
     block_size = math.prod(pool.shape[1:])
-    ready = pool.reshape(-1)[slot * block_size]
+    ready = pool.reshape(-1)[slots[0] * block_size]
     return pool, ready
 
 
@@ -103,12 +108,16 @@ def _compile_donated_packed_copy(
     sample: PackedEmbeddingSlice,
     packed: jax.Array | jax.ShapeDtypeStruct,
 ) -> Any:
-    index = jax.ShapeDtypeStruct((), jnp.int32)
-    compiled = _copy_packed_slice_into_slot_with_token.lower(
+    max_batch_size = sample.max_batch_size
+    offsets = jax.ShapeDtypeStruct((max_batch_size,), jnp.int32)
+    slots = jax.ShapeDtypeStruct((max_batch_size,), jnp.int32)
+    valid = jax.ShapeDtypeStruct((max_batch_size,), jnp.bool_)
+    compiled = _copy_packed_slices_into_slots_with_token.lower(
         pool,
         packed,
-        index,
-        index,
+        offsets,
+        slots,
+        valid,
         rows=sample.rows,
     ).compile()
     _validate_donated_copy(compiled)
@@ -230,16 +239,22 @@ class RaidenSendPool:
             compiled = _compile_donated_packed_copy(self._buffer, first, first.packed)
             self._packed_copies[packed_capacity] = compiled
 
-        readies = []
-        for value, slot in zip(packed_values, slots):
-            self._buffer, ready = compiled(
-                self._buffer,
-                first.packed,
-                np.asarray(value.offset, dtype=np.int32),
-                np.asarray(slot, dtype=np.int32),
-            )
-            readies.append(ready)
-        return readies
+        max_batch_size = first.max_batch_size
+        offsets = np.zeros(max_batch_size, dtype=np.int32)
+        slot_array = np.full(max_batch_size, slots[0], dtype=np.int32)
+        valid = np.zeros(max_batch_size, dtype=np.bool_)
+        count = len(values)
+        offsets[:count] = [value.offset for value in packed_values]
+        slot_array[:count] = slots
+        valid[:count] = True
+        self._buffer, ready = compiled(
+            self._buffer,
+            first.packed,
+            offsets,
+            slot_array,
+            valid,
+        )
+        return [ready] * count
 
     def copy_sync(self, value: jax.Array, slot: int) -> None:
         self.copy_async(value, slot).block_until_ready()
