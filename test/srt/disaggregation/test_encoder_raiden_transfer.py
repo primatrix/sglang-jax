@@ -157,13 +157,14 @@ def test_raiden_server_uses_donated_request_pool(monkeypatch):
     transfer.close()
 
 
-def test_raiden_server_writes_packed_batch_directly_into_pool(monkeypatch):
+def test_raiden_server_writes_packed_batch_directly_into_pool(monkeypatch, caplog):
     _FakeRaidenWrapper.instances.clear()
     monkeypatch.setattr(
         "sgl_jax.srt.disaggregation.encoder.raiden_transfer.RaidenTransferWrapper",
         _FakeRaidenWrapper,
     )
-    transfer = RaidenEncoderServerTransfer("10.0.0.4", pool_size=4)
+    caplog.set_level("INFO")
+    transfer = RaidenEncoderServerTransfer("10.0.0.4", pool_size=4, log_inflight=True)
     reservations = transfer.reserve_batch_sync(
         ["part-0:embedding", "part-1:embedding", "part-2:embedding"]
     )
@@ -185,6 +186,8 @@ def test_raiden_server_writes_packed_batch_directly_into_pool(monkeypatch):
     )
     assert len(transfer._pool._packed_copies) == 1
     assert next(iter(transfer._pool._packed_copies))[-1] is True
+    assert caplog.text.count("event=start") == 1
+    assert "group_size=3 inflight_groups=1 inflight_requests=3" in caplog.text
     transfer.close()
 
 

@@ -29,8 +29,8 @@ def test_summarize_encoder_transfer_inflight_uses_formal_window(tmp_path):
 
     assert summary["available"] is True
     assert summary["n_events"] == 3
-    assert summary["starts"] == 1
-    assert summary["completions"] == 2
+    assert summary["starts"] == 4
+    assert summary["completions"] == 8
     assert summary["failures"] == 0
     assert summary["mean_groups"] == 1.3
     assert summary["mean_requests"] == 5.2
@@ -43,8 +43,8 @@ def test_summarize_encoder_transfer_inflight_uses_formal_window(tmp_path):
         "end_ns": 600,
         "duration_s": 4e-7,
         "n_events": 3,
-        "starts": 1,
-        "completions": 2,
+        "starts": 4,
+        "completions": 8,
         "failures": 0,
         "mean_groups": 1.5,
         "mean_requests": 6.0,

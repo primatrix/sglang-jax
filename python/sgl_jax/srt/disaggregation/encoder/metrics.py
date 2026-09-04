@@ -40,9 +40,7 @@ def _summarize_window(
         delta_ns = max(0, event_ns - cursor_ns)
         group_area_ns += current_groups * delta_ns
         request_area_ns += current_requests * delta_ns
-        time_ns_by_groups[current_groups] = (
-            time_ns_by_groups.get(current_groups, 0) + delta_ns
-        )
+        time_ns_by_groups[current_groups] = time_ns_by_groups.get(current_groups, 0) + delta_ns
 
         states[event["encoder"]] = (event["groups"], event["requests"])
         current_groups = sum(state[0] for state in states.values())
@@ -55,9 +53,7 @@ def _summarize_window(
     delta_ns = end_ns - cursor_ns
     group_area_ns += current_groups * delta_ns
     request_area_ns += current_requests * delta_ns
-    time_ns_by_groups[current_groups] = (
-        time_ns_by_groups.get(current_groups, 0) + delta_ns
-    )
+    time_ns_by_groups[current_groups] = time_ns_by_groups.get(current_groups, 0) + delta_ns
     duration_ns = end_ns - start_ns
     busy_ns = duration_ns - time_ns_by_groups.get(0, 0)
 
@@ -66,9 +62,13 @@ def _summarize_window(
         "end_ns": end_ns,
         "duration_s": duration_ns / 1e9,
         "n_events": len(window_events),
-        "starts": sum(event["event"] == "start" for event in window_events),
-        "completions": sum(event["event"] == "sent" for event in window_events),
-        "failures": sum(event["event"] == "failed" for event in window_events),
+        "starts": sum(event["group_size"] for event in window_events if event["event"] == "start"),
+        "completions": sum(
+            event["group_size"] for event in window_events if event["event"] == "sent"
+        ),
+        "failures": sum(
+            event["group_size"] for event in window_events if event["event"] == "failed"
+        ),
         "mean_groups": group_area_ns / duration_ns,
         "mean_requests": request_area_ns / duration_ns,
         "peak_groups": peak_groups,
@@ -103,6 +103,7 @@ def summarize_raiden_transfer_inflight(
                 event_ns = int(row["time_ns"])
                 groups = int(row["inflight_groups"])
                 requests = int(row["inflight_requests"])
+                group_size = int(row.get("group_size", 1))
             except (KeyError, ValueError):
                 continue
             events.append(
@@ -110,6 +111,7 @@ def summarize_raiden_transfer_inflight(
                     "time_ns": event_ns,
                     "encoder": path.name,
                     "event": row.get("event", "unknown"),
+                    "group_size": group_size,
                     "groups": groups,
                     "requests": requests,
                     "index": event_index,
@@ -124,9 +126,7 @@ def summarize_raiden_transfer_inflight(
         start_ns=start_ns,
         end_ns=end_ns,
     )
-    window_events = [
-        event for event in events if start_ns <= event["time_ns"] <= end_ns
-    ]
+    window_events = [event for event in events if start_ns <= event["time_ns"] <= end_ns]
     starts = [event for event in window_events if event["event"] == "start"]
     terminals = [event for event in window_events if event["event"] in _TERMINAL_EVENTS]
     active_start_ns = starts[0]["time_ns"] if starts else None

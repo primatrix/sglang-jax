@@ -123,6 +123,9 @@ class RaidenEncoderServerTransfer:
         self._slots: dict[str, int] = {}
         self._active: set[str] = set()
         self._pending: set[str] = set()
+        self._group_by_transfer: dict[str, str] = {}
+        self._group_members: dict[str, set[str]] = {}
+        self._group_sizes: dict[str, int] = {}
         self._lock = threading.Lock()
         self._compile_lock = threading.Lock()
         self._compile_pool = ThreadPoolExecutor(
@@ -416,13 +419,17 @@ class RaidenEncoderServerTransfer:
                 self._release_locked(transfer_id)
             raise
 
-        return self._transfer_metadata(
+        metadata = self._transfer_metadata(
             staged_transfer,
             transfer_uuid,
             copy_done_ns=copy_done_ns,
             register_start_ns=register_start_ns,
             register_done_ns=register_done_ns,
         )
+        with self._lock:
+            self._track_group_locked([transfer_id])
+        self._log_inflight_event("start", transfer_id)
+        return metadata
 
     def publish_batch_sync(
         self,
@@ -478,6 +485,19 @@ class RaidenEncoderServerTransfer:
                         register_done_ns=register_done_ns,
                     )
                 )
+            group_id = staged_transfers[0].reservation.transfer_id
+            with self._lock:
+                self._track_group_locked(
+                    [
+                        staged_transfer.reservation.transfer_id
+                        for staged_transfer in staged_transfers
+                    ]
+                )
+            self._log_inflight_event(
+                "start",
+                group_id,
+                group_size=len(staged_transfers),
+            )
             return metadata
         except BaseException:
             with self._lock:
@@ -504,7 +524,6 @@ class RaidenEncoderServerTransfer:
             "transfer_host": self._raiden.host_ip,
             "transfer_block_ids": [slot],
         }
-        self._log_inflight_event("start", transfer_id)
         metadata.update(
             transfer_reserve_start_ns=reservation.reserve_start_ns,
             transfer_pool_ready_ns=staged_transfer.pool_ready_ns,
@@ -527,10 +546,8 @@ class RaidenEncoderServerTransfer:
         except Exception:
             logger.exception("Raiden encoder sender poll failed")
             return
-        for transfer_id in sent:
-            self._discard_active(transfer_id, event="sent")
-        for transfer_id in failed:
-            self._discard_active(transfer_id, event="failed")
+        self._discard_active_many(sent, event="sent")
+        self._discard_active_many(failed, event="failed")
 
     def cancel_batch(self, reservations: list[_Reservation]) -> None:
         with self._lock:
@@ -553,43 +570,80 @@ class RaidenEncoderServerTransfer:
     def close(self) -> None:
         with self._lock:
             self._closed = True
-            active = list(self._active)
+            groups = [(group_id, self._group_sizes[group_id]) for group_id in self._group_members]
             self._free.clear()
             self._slots.clear()
             self._active.clear()
             self._pending.clear()
-        for transfer_id in active:
-            self._log_inflight_event("close", transfer_id)
+            self._group_by_transfer.clear()
+            self._group_members.clear()
+            self._group_sizes.clear()
+        for group_id, group_size in groups:
+            self._log_inflight_event("close", group_id, group_size=group_size)
         self._compile_pool.shutdown(cancel_futures=True)
 
     def _discard_active(self, transfer_id: str, *, event: str) -> None:
-        with self._lock:
-            removed = transfer_id in self._active
-            if removed:
-                self._release_locked(transfer_id)
-        if removed:
-            self._log_inflight_event(event, transfer_id)
+        self._discard_active_many([transfer_id], event=event)
 
-    def _release_locked(self, transfer_id: str) -> None:
+    def _discard_active_many(self, transfer_ids: list[str], *, event: str) -> None:
+        completed_groups = []
+        removed = []
+        with self._lock:
+            for transfer_id in transfer_ids:
+                if transfer_id in self._active:
+                    removed.append(transfer_id)
+                    completed = self._release_locked(transfer_id)
+                    if completed is not None:
+                        completed_groups.append(completed)
+        for group_id, group_size in completed_groups:
+            self._log_inflight_event(event, group_id, group_size=group_size)
+        if removed and not completed_groups:
+            self._log_inflight_event("progress", removed[0], group_size=len(removed))
+
+    def _track_group_locked(self, transfer_ids: list[str]) -> None:
+        group_id = transfer_ids[0]
+        members = set(transfer_ids)
+        self._group_members[group_id] = members
+        self._group_sizes[group_id] = len(members)
+        self._group_by_transfer.update((transfer_id, group_id) for transfer_id in members)
+
+    def _release_locked(self, transfer_id: str) -> tuple[str, int] | None:
         slot = self._slots.pop(transfer_id, None)
         self._pending.discard(transfer_id)
         self._active.discard(transfer_id)
         if slot is not None:
             self._free.append(slot)
+        group_id = self._group_by_transfer.pop(transfer_id, None)
+        if group_id is None:
+            return None
+        members = self._group_members[group_id]
+        members.discard(transfer_id)
+        if members:
+            return None
+        self._group_members.pop(group_id, None)
+        return group_id, self._group_sizes.pop(group_id)
 
-    def _log_inflight_event(self, event: str, transfer_id: str) -> None:
+    def _log_inflight_event(
+        self,
+        event: str,
+        transfer_id: str,
+        *,
+        group_size: int = 1,
+    ) -> None:
         if not self._log_inflight:
             return
         with self._lock:
-            inflight = len(self._active)
+            inflight_groups = len(self._group_members)
+            inflight_requests = len(self._active)
         logger.info(
             "ENCODER-RAIDEN-INFLIGHT time_ns=%d event=%s transfer_id=%s "
-            "group_size=1 inflight_groups=%d inflight_requests=%d",
+            "group_size=%d inflight_groups=%d inflight_requests=%d",
             time.time_ns(),
             event,
             transfer_id,
-            inflight,
-            inflight,
+            group_size,
+            inflight_groups,
+            inflight_requests,
         )
 
 
