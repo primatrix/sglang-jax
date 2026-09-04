@@ -6,6 +6,7 @@ import hashlib
 import logging
 import threading
 import time
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -154,10 +155,17 @@ class RaidenEncoderServerTransfer:
         reservations: list[_Reservation],
         embeddings: list[jax.Array | PackedEmbeddingSlice],
     ) -> list[_StagedTransfer]:
+        return list(self.stage_iter_sync(reservations, embeddings))
+
+    def stage_iter_sync(
+        self,
+        reservations: list[_Reservation],
+        embeddings: list[jax.Array | PackedEmbeddingSlice],
+    ) -> Iterator[_StagedTransfer]:
         if len(reservations) != len(embeddings):
             raise ValueError("Raiden reservation and embedding counts differ")
         if not reservations:
-            return []
+            return
         if any(embedding.ndim != 2 or embedding.shape[0] <= 0 for embedding in embeddings):
             raise ValueError("Raiden embedding must be a non-empty matrix")
 
@@ -198,28 +206,21 @@ class RaidenEncoderServerTransfer:
                 )
         pool_ready_ns = time.time_ns()
 
-        staged = []
+        last_ready = None
         try:
-            readies = pool.copy_batch_async(
-                embeddings,
-                [reservation.slot for reservation in reservations],
-            )
-            copy_submit_ns = time.time_ns()
-            for reservation, ready in zip(reservations, readies):
-                staged.append(
-                    _StagedTransfer(
-                        reservation,
-                        ready,
-                        pool_ready_ns,
-                        copy_submit_ns,
-                    )
+            for reservation, embedding in zip(reservations, embeddings):
+                last_ready = pool.copy_async(embedding, reservation.slot)
+                yield _StagedTransfer(
+                    reservation,
+                    last_ready,
+                    pool_ready_ns,
+                    time.time_ns(),
                 )
         except BaseException:
-            if staged:
-                staged[-1].ready.block_until_ready()
+            if last_ready is not None:
+                last_ready.block_until_ready()
             self.cancel_batch(reservations)
             raise
-        return staged
 
     def publish_sync(self, staged_transfer: Any) -> dict[str, Any]:
         reservation = staged_transfer.reservation
