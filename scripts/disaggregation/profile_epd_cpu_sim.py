@@ -41,6 +41,7 @@ _QUEUE_RE = re.compile(
     r"enqueue_ns=(\d+).*?queue_ms=([0-9.]+).*?batch_size=(\d+).*?queue_depth=(\d+)"
 )
 _PIPELINE_RE = re.compile(r"ENCODER-PIPELINE-TIME (?P<body>[^\n]+)")
+_PREPROCESS_RE = re.compile(r"ENCODER-PREPROCESS-TIME (?P<body>[^\n]+)")
 _KEY_VALUE_RE = re.compile(r"([a-z_]+)=([^\s]+)")
 _BENCHMARK_KEYS = (
     "completed",
@@ -237,8 +238,9 @@ def _summarize_latencies(values: list[float]) -> dict:
 
 
 def _summarize_encoder_pipeline(log_path: Path, *, start_ns: int, end_ns: int) -> dict:
+    log_text = log_path.read_text()
     rows = []
-    for match in _PIPELINE_RE.finditer(log_path.read_text()):
+    for match in _PIPELINE_RE.finditer(log_text):
         row = dict(_KEY_VALUE_RE.findall(match.group("body")))
         enqueue_ns = int(row["enqueue_ns"])
         if start_ns <= enqueue_ns <= end_ns:
@@ -294,6 +296,9 @@ def _summarize_encoder_pipeline(log_path: Path, *, start_ns: int, end_ns: int) -
         "receive_concat_ms",
         "receive_extra_meta_ms",
         "receive_result_pack_ms",
+        "language_prepare_submit_ms",
+        "language_prepare_queue_ms",
+        "language_prepare_ms",
         "language_pickup_wait_ms",
         "language_get_mm_data_ms",
         "language_radix_finalize_ms",
@@ -305,10 +310,31 @@ def _summarize_encoder_pipeline(log_path: Path, *, start_ns: int, end_ns: int) -
         "total_to_prefill_ms",
         "total_to_prefill_done_ms",
     )
+    request_ids = {row["req_id"] for row in rows}
+    preprocess_rows = [
+        row
+        for match in _PREPROCESS_RE.finditer(log_text)
+        if (row := dict(_KEY_VALUE_RE.findall(match.group("body")))).get("req_id") in request_ids
+    ]
+    preprocess_phases = (
+        "dispatch_ms",
+        "admission_ms",
+        "image_load_ms",
+        "processor_queue_ms",
+        "processor_ms",
+        "finalize_ms",
+        "request_total_ms",
+        "batch_tail_ms",
+    )
     return {
         "n": len(rows),
         "phases": {
             phase: _summarize_latencies([float(row[phase]) for row in rows]) for phase in phases
+        },
+        "preprocess_n": len(preprocess_rows),
+        "preprocess_phases": {
+            phase: _summarize_latencies([float(row[phase]) for row in preprocess_rows])
+            for phase in preprocess_phases
         },
     }
 

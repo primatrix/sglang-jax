@@ -306,6 +306,9 @@ class PendingEncoderRequest:
             error = self._error
         if error is None and result is not None and self.result_preparer is not None:
             try:
+                timing = result.get("encoder_timing")
+                if timing is not None:
+                    timing["language_prepare_start_ns"] = time.time_ns()
                 self.result_preparer(self.recv_req, result)
             except Exception as exc:
                 error = exc
@@ -417,7 +420,7 @@ class EncoderClient:
         self._completed_ready = threading.Event()
         self._prepare_executor = (
             ThreadPoolExecutor(
-                max_workers=min(2, max(1, registration_workers)),
+                max_workers=min(4, max(1, registration_workers)),
                 thread_name_prefix="encoder-language-prepare",
             )
             if self._background_progress
@@ -555,6 +558,11 @@ class EncoderClient:
                 return
             self._pending.pop(key)
             self._preparing[key] = request
+        result = request._result
+        if result is not None:
+            timing = result.get("encoder_timing")
+            if timing is not None:
+                timing["language_prepare_submit_ns"] = time.time_ns()
         executor = self._prepare_executor
         assert executor is not None
         future = executor.submit(request.prepare_result)

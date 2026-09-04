@@ -122,6 +122,8 @@ def test_language_logs_encoder_pipeline_timing(caplog):
         "receive_extra_meta_start_ns": 22_400_000,
         "receive_extra_meta_done_ns": 22_700_000,
         "receive_result_ready_ns": 22_800_000,
+        "language_prepare_submit_ns": 22_850_000,
+        "language_prepare_start_ns": 22_900_000,
         "language_apply_start_ns": 23_000_000,
         "language_get_mm_data_done_ns": 23_500_000,
         "language_radix_done_ns": 23_800_000,
@@ -189,6 +191,9 @@ def test_language_logs_encoder_pipeline_timing(caplog):
     assert "receive_concat_ms=0.200" in caplog.text
     assert "receive_extra_meta_ms=0.300" in caplog.text
     assert "receive_result_pack_ms=0.800" in caplog.text
+    assert "language_prepare_submit_ms=0.050" in caplog.text
+    assert "language_prepare_queue_ms=0.050" in caplog.text
+    assert "language_prepare_ms=1.100" in caplog.text
     assert "language_pickup_wait_ms=0.200" in caplog.text
     assert "language_get_mm_data_ms=0.500" in caplog.text
     assert "language_radix_finalize_ms=0.500" in caplog.text
@@ -257,6 +262,8 @@ def test_language_logs_encoder_preprocess_timing(caplog):
         "receive_extra_meta_start_ns": 23_150_000,
         "receive_extra_meta_done_ns": 23_200_000,
         "receive_result_ready_ns": 23_250_000,
+        "language_prepare_submit_ns": 23_260_000,
+        "language_prepare_start_ns": 23_270_000,
         "language_apply_start_ns": 23_300_000,
         "language_get_mm_data_done_ns": 23_500_000,
         "language_radix_done_ns": 23_800_000,

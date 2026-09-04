@@ -281,6 +281,8 @@ def test_encoder_receiver_background_progresses_without_scheduler_poll(monkeypat
         assert timing["receive_concat_done_ns"] <= timing["receive_extra_meta_start_ns"]
         assert timing["receive_extra_meta_start_ns"] <= timing["receive_extra_meta_done_ns"]
         assert timing["receive_extra_meta_done_ns"] <= timing["receive_result_ready_ns"]
+        assert timing["receive_result_ready_ns"] <= timing["language_prepare_submit_ns"]
+        assert timing["language_prepare_submit_ns"] <= timing["language_prepare_start_ns"]
         completed = []
         deadline = time.monotonic() + 1
         while not completed and time.monotonic() < deadline:

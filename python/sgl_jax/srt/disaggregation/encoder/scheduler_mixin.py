@@ -302,6 +302,8 @@ class SchedulerDisaggregationEncoderMixin:
                     "receive_extra_meta_start_ns",
                     "receive_extra_meta_done_ns",
                     "receive_result_ready_ns",
+                    "language_prepare_submit_ns",
+                    "language_prepare_start_ns",
                     "language_apply_start_ns",
                     "language_get_mm_data_done_ns",
                     "language_radix_done_ns",
@@ -329,7 +331,8 @@ class SchedulerDisaggregationEncoderMixin:
                     "receive_materialize_done_ns=%d receive_embedding_ns=%d "
                     "receive_concat_start_ns=%d receive_concat_done_ns=%d "
                     "receive_extra_meta_start_ns=%d receive_extra_meta_done_ns=%d "
-                    "receive_result_ready_ns=%d language_apply_start_ns=%d "
+                    "receive_result_ready_ns=%d language_prepare_submit_ns=%d "
+                    "language_prepare_start_ns=%d language_apply_start_ns=%d "
                     "language_get_mm_data_done_ns=%d language_radix_done_ns=%d "
                     "language_ready_ns=%d language_scheduler_pickup_ns=%d "
                     "language_prefill_start_ns=%d "
@@ -359,7 +362,9 @@ class SchedulerDisaggregationEncoderMixin:
                     "receive_materialize_wait_ms=%.3f "
                     "receive_poll_delay_ms=%.3f receive_finalize_ms=%.3f "
                     "receive_concat_ms=%.3f receive_extra_meta_ms=%.3f "
-                    "receive_result_pack_ms=%.3f language_pickup_wait_ms=%.3f "
+                    "receive_result_pack_ms=%.3f language_prepare_submit_ms=%.3f "
+                    "language_prepare_queue_ms=%.3f language_prepare_ms=%.3f "
+                    "language_pickup_wait_ms=%.3f "
                     "language_get_mm_data_ms=%.3f language_radix_finalize_ms=%.3f "
                     "receive_mm_ms=%.3f language_admission_wait_ms=%.3f "
                     "language_queue_after_pickup_ms=%.3f language_queue_ms=%.3f "
@@ -397,6 +402,8 @@ class SchedulerDisaggregationEncoderMixin:
                     timing["receive_extra_meta_start_ns"],
                     timing["receive_extra_meta_done_ns"],
                     timing["receive_result_ready_ns"],
+                    timing["language_prepare_submit_ns"],
+                    timing["language_prepare_start_ns"],
                     timing["language_apply_start_ns"],
                     timing["language_get_mm_data_done_ns"],
                     timing["language_radix_done_ns"],
@@ -497,6 +504,17 @@ class SchedulerDisaggregationEncoderMixin:
                         "receive_extra_meta_done_ns",
                     ),
                     _elapsed_ms(timing, "receive_done_ns", "receive_result_ready_ns"),
+                    _elapsed_ms(
+                        timing,
+                        "receive_result_ready_ns",
+                        "language_prepare_submit_ns",
+                    ),
+                    _elapsed_ms(
+                        timing,
+                        "language_prepare_submit_ns",
+                        "language_prepare_start_ns",
+                    ),
+                    _elapsed_ms(timing, "language_prepare_start_ns", "language_ready_ns"),
                     _elapsed_ms(
                         timing,
                         "receive_result_ready_ns",
