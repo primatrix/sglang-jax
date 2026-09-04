@@ -155,20 +155,52 @@ class EncoderRuntime:
         reservations = None
         try:
             reservations = self._transfer.reserve_batch_sync(transfer_ids)
-            results = self._encoder.encode(job.prepared)
-            runtime_encode_return_ns = time.time_ns()
-            runtime_postprocess_start_ns = time.perf_counter_ns()
+            encode_packed = getattr(self._encoder, "encode_packed", None)
+            metadata_for_packed = getattr(self._encoder, "metadata_for_packed", None)
+            stage_packed = getattr(self._transfer, "stage_packed_batch_sync", None)
+            use_packed = all(
+                callable(method) for method in (encode_packed, metadata_for_packed, stage_packed)
+            )
+            staged_transfers = None
+            if use_packed:
+                packed_output = encode_packed(job.prepared)
+                runtime_encode_return_ns = time.time_ns()
+                copy_start_ns = time.time_ns()
+                staged_transfers = stage_packed(
+                    reservations,
+                    packed_output.packed,
+                    packed_output.batch.token_counts,
+                )
+                runtime_postprocess_start_ns = time.perf_counter_ns()
+                packed_metadata = metadata_for_packed(packed_output)
+                results = [
+                    (
+                        (token_count, int(packed_output.packed.shape[1])),
+                        packed_output.packed.dtype,
+                        metadata,
+                    )
+                    for token_count, metadata in zip(
+                        packed_output.batch.token_counts,
+                        packed_metadata,
+                    )
+                ]
+            else:
+                encoded = self._encoder.encode(job.prepared)
+                runtime_encode_return_ns = time.time_ns()
+                runtime_postprocess_start_ns = time.perf_counter_ns()
+                results = [
+                    (embedding.shape, embedding.dtype, metadata) for embedding, metadata in encoded
+                ]
             if len(results) != len(job.requests):
                 raise RuntimeError(
                     f"encoder returned {len(results)} results for {len(job.requests)} requests"
                 )
             encode_done_ns = time.time_ns()
             transfer_jobs = []
-            embeddings = []
             metadata_prepare_duration_ns = 0
             embedding_data_duration_ns = 0
             result_pack_duration_ns = 0
-            for index, (request, transfer_id, (embedding, metadata)) in enumerate(
+            for index, (request, transfer_id, (embedding_shape, dtype, metadata)) in enumerate(
                 zip(job.requests, transfer_ids, results)
             ):
                 phase_start_ns = time.perf_counter_ns()
@@ -186,8 +218,8 @@ class EncoderRuntime:
                     part_idx=request.get("part_idx", 0),
                     grid_dim=metadata.pop("grid_dim", None),
                     modality=Modality.from_str(request["modality"]),
-                    embedding_shape=embedding.shape,
-                    dtype=str(embedding.dtype),
+                    embedding_shape=embedding_shape,
+                    dtype=str(dtype),
                     dispatch_start_ns=request.get("dispatch_start_ns"),
                     preprocess_start_ns=job.preprocess_start_ns,
                     **metadata,
@@ -196,7 +228,6 @@ class EncoderRuntime:
                 embedding_data_duration_ns += time.perf_counter_ns() - phase_start_ns
 
                 phase_start_ns = time.perf_counter_ns()
-                embeddings.append(embedding)
                 transfer_jobs.append((index, transfer_id, data))
                 result_pack_duration_ns += time.perf_counter_ns() - phase_start_ns
 
@@ -226,10 +257,16 @@ class EncoderRuntime:
             for _, _, data in transfer_jobs:
                 data.runtime_timing_attach_duration_ns = timing_attach_duration_ns
 
-            copy_start_ns = time.time_ns()
+            if not use_packed:
+                copy_start_ns = time.time_ns()
             for _, _, data in transfer_jobs:
                 data.transfer_copy_start_ns = copy_start_ns
-            staged_transfers = self._transfer.stage_batch_sync(reservations, embeddings)
+            if staged_transfers is None:
+                encoded_embeddings = [embedding for embedding, _ in encoded]
+                staged_transfers = self._transfer.stage_batch_sync(
+                    reservations,
+                    encoded_embeddings,
+                )
             if len(staged_transfers) != len(transfer_jobs):
                 raise RuntimeError("transfer returned an incomplete staged batch")
             for (index, transfer_id, data), staged_transfer in zip(

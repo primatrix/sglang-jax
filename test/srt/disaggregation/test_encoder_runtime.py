@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from contextlib import suppress
+from types import SimpleNamespace
 
 import jax.numpy as jnp
 
@@ -349,6 +350,53 @@ def test_runtime_builds_transfer_metadata_without_scheduler_state():
     assert data.runtime_result_pack_duration_ns >= 0
     assert data.runtime_postprocess_residual_ns >= 0
     assert data.runtime_timing_attach_duration_ns >= 0
+
+
+def test_runtime_stages_packed_output_before_building_metadata():
+    events = []
+
+    class PackedEncoder:
+        async def preprocess(self, _requests):
+            return SimpleNamespace(token_counts=(1, 1))
+
+        def encode(self, _prepared):
+            raise AssertionError("legacy split path must not run")
+
+        def encode_packed(self, prepared):
+            events.append("encode")
+            return SimpleNamespace(
+                batch=prepared,
+                packed=jnp.arange(4, dtype=jnp.float32).reshape(2, 2),
+            )
+
+        def metadata_for_packed(self, _output):
+            events.append("metadata")
+            return [{}, {}]
+
+    class PackedTransfer(_FakeTransfer):
+        def stage_batch_sync(self, _reservations, _embeddings):
+            raise AssertionError("legacy per-item copy path must not run")
+
+        def stage_packed_batch_sync(self, reservations, packed, token_counts):
+            events.append("stage")
+            assert token_counts == (1, 1)
+            return [(reservation, packed) for reservation in reservations]
+
+    async def run():
+        runtime = EncoderRuntime(PackedEncoder(), PackedTransfer())
+        requests = [
+            {"req_id": "request-0", "modality": "IMAGE"},
+            {"req_id": "request-1", "modality": "IMAGE"},
+        ]
+        try:
+            return await _collect(runtime, requests)
+        finally:
+            await runtime.stop()
+
+    results = asyncio.run(run())
+    assert events == ["encode", "stage", "metadata"]
+    assert [result.shape for _, result in results] == [(1, 2), (1, 2)]
+    assert all(result.dtype == "float32" for _, result in results)
 
 
 def test_runtime_uses_event_loop_for_preprocess_and_threads_for_data_path():

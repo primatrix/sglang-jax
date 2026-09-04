@@ -216,6 +216,83 @@ class RaidenEncoderServerTransfer:
             raise
         return staged
 
+    def stage_packed_batch_sync(
+        self,
+        reservations: list[_Reservation],
+        packed: jax.Array,
+        token_counts: tuple[int, ...],
+    ) -> list[_StagedTransfer]:
+        if len(reservations) != len(token_counts):
+            raise ValueError("Raiden reservation and packed item counts differ")
+        if not reservations:
+            return []
+        if (
+            packed.ndim != 2
+            or not token_counts
+            or any(token_count <= 0 for token_count in token_counts)
+        ):
+            raise ValueError("Raiden packed output must contain non-empty matrices")
+        if any(token_count != token_counts[0] for token_count in token_counts):
+            raise ValueError("Raiden source pool requires one embedding shape")
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Raiden encoder transfer is closed")
+            for reservation in reservations:
+                if (
+                    reservation.transfer_id not in self._pending
+                    or self._slots.get(reservation.transfer_id) != reservation.slot
+                ):
+                    raise RuntimeError(
+                        f"Raiden reservation is no longer active: {reservation.transfer_id}"
+                    )
+            pool = self._pool
+
+        shape = (token_counts[0], int(packed.shape[1]))
+        if pool is None:
+            pool = RaidenSendPool.for_shape(
+                shape,
+                packed.dtype,
+                packed.sharding,
+                capacity=self._pool_size,
+            )
+            self._raiden.start(
+                [pool.buffer],
+                max_blocks=1,
+                num_slots=self._pool_size,
+                timeout_s=self._timeout_s,
+            )
+            with self._lock:
+                self._pool = pool
+        elif pool.shape != shape or pool.dtype != packed.dtype or pool.sharding != packed.sharding:
+            raise ValueError(
+                "Raiden encoder pool packed output mismatch: "
+                f"expected shape={pool.shape}, dtype={pool.dtype}, "
+                f"sharding={pool.sharding}; got shape={shape}, "
+                f"dtype={packed.dtype}, sharding={packed.sharding}"
+            )
+        pool_ready_ns = time.time_ns()
+
+        try:
+            ready = pool.copy_packed_batch_async(
+                packed,
+                [reservation.slot for reservation in reservations],
+                token_counts,
+            )
+        except BaseException:
+            self.cancel_batch(reservations)
+            raise
+        copy_submit_ns = time.time_ns()
+        return [
+            _StagedTransfer(
+                reservation,
+                item_ready,
+                pool_ready_ns,
+                copy_submit_ns,
+            )
+            for reservation, item_ready in zip(reservations, ready)
+        ]
+
     def publish_sync(self, staged_transfer: Any) -> dict[str, Any]:
         reservation = staged_transfer.reservation
         transfer_id = reservation.transfer_id

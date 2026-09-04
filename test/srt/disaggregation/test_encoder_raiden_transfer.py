@@ -156,6 +156,31 @@ def test_raiden_server_uses_donated_request_pool(monkeypatch):
     transfer.close()
 
 
+def test_raiden_server_writes_packed_batch_directly_into_pool(monkeypatch):
+    _FakeRaidenWrapper.instances.clear()
+    monkeypatch.setattr(
+        "sgl_jax.srt.disaggregation.encoder.raiden_transfer.RaidenTransferWrapper",
+        _FakeRaidenWrapper,
+    )
+    transfer = RaidenEncoderServerTransfer("10.0.0.4", pool_size=4)
+    reservations = transfer.reserve_batch_sync(
+        ["part-0:embedding", "part-1:embedding", "part-2:embedding"]
+    )
+    packed = jnp.arange(24, dtype=jnp.float32).reshape(8, 3)
+
+    staged = transfer.stage_packed_batch_sync(reservations, packed, (2, 2, 2))
+    metadata = [transfer.publish_sync(item) for item in staged]
+
+    assert isinstance(transfer._pool, RaidenSendPool)
+    buffer = np.asarray(transfer._pool.buffer).reshape(4, 2, -1)
+    np.testing.assert_array_equal(buffer[0, :, :3], packed[0:2])
+    np.testing.assert_array_equal(buffer[1, :, :3], packed[2:4])
+    np.testing.assert_array_equal(buffer[2, :, :3], packed[4:6])
+    assert [item["transfer_block_ids"] for item in metadata] == [[0], [1], [2]]
+    assert len(transfer._pool._packed_copies) == 1
+    transfer.close()
+
+
 def test_raiden_server_rejects_embedding_that_does_not_match_single_pool(monkeypatch):
     _FakeRaidenWrapper.instances.clear()
     monkeypatch.setattr(

@@ -67,6 +67,70 @@ def _compile_donated_copy(
     return compiled
 
 
+@partial(jax.jit, donate_argnums=(0,), static_argnames=("token_counts",))
+def _copy_packed_batch_into_slots(
+    pool: jax.Array,
+    packed: jax.Array,
+    slots: jax.Array,
+    *,
+    token_counts: tuple[int, ...],
+) -> tuple[jax.Array, tuple[jax.Array, ...]]:
+    """Split one packed output directly into donated Raiden pool slots."""
+
+    updated = pool
+    block_shape = pool.shape[1:]
+    padded_shape = (block_shape[0], math.prod(block_shape[1:]))
+    offset = 0
+    for index, token_count in enumerate(token_counts):
+        value = jax.lax.dynamic_slice_in_dim(packed, offset, token_count, axis=0)
+        padding = tuple((0, padded - size) for padded, size in zip(padded_shape, value.shape))
+        block = jnp.pad(value, padding).reshape(block_shape)
+        updated = jax.lax.dynamic_update_slice_in_dim(
+            updated,
+            block[None],
+            slots[index],
+            axis=0,
+        )
+        offset += token_count
+
+    ready = tuple(
+        jax.lax.dynamic_index_in_dim(
+            updated,
+            slots[index],
+            axis=0,
+            keepdims=False,
+        ).reshape(
+            -1
+        )[0]
+        for index in range(len(token_counts))
+    )
+    return updated, ready
+
+
+def _compile_donated_packed_copy(
+    pool: jax.Array,
+    packed: jax.Array,
+    token_counts: tuple[int, ...],
+) -> Any:
+    compiled = _copy_packed_batch_into_slots.lower(
+        pool,
+        packed,
+        jnp.zeros((len(token_counts),), dtype=jnp.int32),
+        token_counts=token_counts,
+    ).compile()
+    stats = compiled.memory_analysis()
+    stats = stats if isinstance(stats, (list, tuple)) else (stats,)
+    if not stats or any(
+        stat is None
+        or int(getattr(stat, "alias_size_in_bytes", 0)) <= 0
+        or int(getattr(stat, "alias_size_in_bytes", 0)) * 100
+        < int(getattr(stat, "output_size_in_bytes", 0)) * 99
+        for stat in stats
+    ):
+        raise RuntimeError("Raiden packed pool update did not alias its donated input")
+    return compiled
+
+
 class RaidenSendPool:
     """Reusable source buffer with bounded, request-sized slots."""
 
@@ -76,10 +140,39 @@ class RaidenSendPool:
         *,
         capacity: int,
     ) -> None:
-        self.shape = tuple(int(dim) for dim in sample.shape)
-        self.dtype = sample.dtype
-        self.sharding = sample.sharding
-        pool_sharding = _pool_sharding(sample.sharding)
+        self._initialize(
+            tuple(int(dim) for dim in sample.shape),
+            sample.dtype,
+            sample.sharding,
+            capacity,
+        )
+        self._copy = _compile_donated_copy(self._buffer, sample)
+
+    @classmethod
+    def for_shape(
+        cls,
+        shape: tuple[int, int],
+        dtype: jnp.dtype,
+        sharding: jax.sharding.Sharding,
+        *,
+        capacity: int,
+    ) -> RaidenSendPool:
+        pool = cls.__new__(cls)
+        pool._initialize(shape, dtype, sharding, capacity)
+        pool._copy = None
+        return pool
+
+    def _initialize(
+        self,
+        shape: tuple[int, int],
+        dtype: jnp.dtype,
+        sharding: jax.sharding.Sharding,
+        capacity: int,
+    ) -> None:
+        self.shape = tuple(int(dim) for dim in shape)
+        self.dtype = jnp.dtype(dtype)
+        self.sharding = sharding
+        pool_sharding = _pool_sharding(sharding)
         self._block_shape = encoder_pool_block_shape(self.shape)
         self._buffer = jnp.zeros(
             (capacity, *self._block_shape),
@@ -87,7 +180,7 @@ class RaidenSendPool:
             device=pool_sharding,
         )
         jax.block_until_ready(self._buffer)
-        self._copy = _compile_donated_copy(self._buffer, sample)
+        self._packed_copies: dict[tuple[tuple[int, ...], tuple[int, ...]], Any] = {}
 
     @property
     def buffer(self) -> jax.Array:
@@ -103,10 +196,45 @@ class RaidenSendPool:
     def copy_async(self, value: jax.Array, slot: int) -> jax.Array:
         if not self.matches(value):
             raise ValueError("Raiden pool contains an incompatible embedding")
+        if self._copy is None:
+            self._copy = _compile_donated_copy(self._buffer, value)
         self._buffer, ready = self._copy(
             self._buffer,
             value,
             jnp.asarray(slot, dtype=jnp.int32),
+        )
+        return ready
+
+    def copy_packed_batch_async(
+        self,
+        packed: jax.Array,
+        slots: list[int],
+        token_counts: tuple[int, ...],
+    ) -> tuple[jax.Array, ...]:
+        if len(slots) != len(token_counts):
+            raise ValueError("Raiden slot and packed item counts differ")
+        if not token_counts:
+            return ()
+        if any(token_count != self.shape[0] for token_count in token_counts):
+            raise ValueError("Raiden packed output contains incompatible item shapes")
+        if (
+            packed.ndim != 2
+            or packed.shape[1] != self.shape[1]
+            or packed.dtype != self.dtype
+            or packed.sharding != self.sharding
+            or sum(token_counts) > packed.shape[0]
+        ):
+            raise ValueError("Raiden packed output does not match the source pool")
+
+        key = (tuple(int(dim) for dim in packed.shape), token_counts)
+        copy = self._packed_copies.get(key)
+        if copy is None:
+            copy = _compile_donated_packed_copy(self._buffer, packed, token_counts)
+            self._packed_copies[key] = copy
+        self._buffer, ready = copy(
+            self._buffer,
+            packed,
+            jnp.asarray(slots, dtype=jnp.int32),
         )
         return ready
 

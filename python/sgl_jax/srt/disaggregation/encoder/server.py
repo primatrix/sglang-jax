@@ -82,6 +82,13 @@ class PreparedEncoderBatch:
     done_ns: int
 
 
+@dataclass(slots=True)
+class PackedEncoderOutput:
+    batch: PreparedEncoderBatch
+    packed: jax.Array
+    encoder_timing: dict[str, int]
+
+
 class MMEncoder:
     """Run the model's native multimodal encoder for EPD requests."""
 
@@ -181,7 +188,10 @@ class MMEncoder:
             time.time_ns(),
         )
 
-    def encode(self, batch: PreparedEncoderBatch) -> list[tuple[jax.Array, dict[str, Any]]]:
+    def _forward_packed(
+        self,
+        batch: PreparedEncoderBatch,
+    ) -> tuple[jax.Array, dict[str, int]]:
         modality = batch.modality
         processed = batch.inputs
         encode_start_ns = time.time_ns()
@@ -212,13 +222,69 @@ class MMEncoder:
                     raise ValueError(f"model has no {modality.name} encoder")
                 packed = get_feature(items)
         encode_done_ns = time.time_ns()
-        postprocess_start_ns = time.perf_counter_ns()
-
         encoder_timing = {
             "preprocess_done_ns": batch.done_ns,
             "encode_start_ns": encode_start_ns,
             "encode_done_ns": encode_done_ns,
         }
+        if sum(batch.token_counts) > packed.shape[0]:
+            raise ValueError(f"incomplete {modality.name} encoder output")
+        return packed, encoder_timing
+
+    def encode_packed(self, batch: PreparedEncoderBatch) -> PackedEncoderOutput:
+        packed, encoder_timing = self._forward_packed(batch)
+        return PackedEncoderOutput(batch, packed, encoder_timing)
+
+    def metadata_for_packed(
+        self,
+        output: PackedEncoderOutput,
+    ) -> list[dict[str, Any]]:
+        postprocess_start_ns = time.perf_counter_ns()
+        metadata_duration_ns = 0
+        result_pack_duration_ns = 0
+        results = []
+        for mm_inputs, request_timing in zip(
+            output.batch.inputs,
+            output.batch.request_timings,
+        ):
+            phase_start_ns = time.perf_counter_ns()
+            metadata = self._metadata(mm_inputs, output.batch.modality)
+            metadata_duration_ns += time.perf_counter_ns() - phase_start_ns
+
+            phase_start_ns = time.perf_counter_ns()
+            metadata["_encoder_timing"] = {
+                **output.encoder_timing,
+                **request_timing,
+            }
+            results.append(metadata)
+            result_pack_duration_ns += time.perf_counter_ns() - phase_start_ns
+
+        postprocess_done_ns = time.time_ns()
+        postprocess_duration_ns = time.perf_counter_ns() - postprocess_start_ns
+        postprocess_timing = {
+            "encode_server_postprocess_done_ns": postprocess_done_ns,
+            "encode_server_postprocess_duration_ns": postprocess_duration_ns,
+            "encode_token_count_duration_ns": 0,
+            "encode_embedding_slice_duration_ns": 0,
+            "encode_split_compile_wait_duration_ns": 0,
+            "encode_split_dispatch_duration_ns": 0,
+            "encode_metadata_duration_ns": metadata_duration_ns,
+            "encode_result_pack_duration_ns": result_pack_duration_ns,
+            "encode_server_postprocess_residual_ns": max(
+                0,
+                postprocess_duration_ns - metadata_duration_ns - result_pack_duration_ns,
+            ),
+        }
+        for metadata in results:
+            metadata["_encoder_timing"].update(postprocess_timing)
+        return results
+
+    def encode(self, batch: PreparedEncoderBatch) -> list[tuple[jax.Array, dict[str, Any]]]:
+        packed, encoder_timing = self._forward_packed(batch)
+        modality = batch.modality
+        processed = batch.inputs
+        simulate = getattr(self, "_simulate_compute", False)
+        postprocess_start_ns = time.perf_counter_ns()
 
         results = []
         token_count_duration_ns = 0
@@ -233,8 +299,6 @@ class MMEncoder:
         token_count_duration_ns += time.perf_counter_ns() - phase_start_ns
 
         phase_start_ns = time.perf_counter_ns()
-        if sum(token_counts) > packed.shape[0]:
-            raise ValueError(f"incomplete {modality.name} encoder output")
         if simulate:
             offset = 0
             embeddings = []
