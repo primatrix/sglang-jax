@@ -352,14 +352,22 @@ def main() -> int:
     parser.add_argument("--prewarm", type=int, default=128)
     parser.add_argument("--first-prewarm", type=int, default=256)
     parser.add_argument("--startup-timeout", type=float, default=900)
+    parser.add_argument("--only", nargs="*", default=None)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     args.cache_root.mkdir(parents=True, exist_ok=True)
 
     matrix_path = args.output_dir / "matrix.jsonl"
+    variants = _variants()
+    if args.only:
+        selected = set(args.only)
+        variants = [variant for variant in variants if variant.name in selected]
+        missing = selected - {variant.name for variant in variants}
+        if missing:
+            parser.error(f"unknown variants: {sorted(missing)}")
     succeeded = 0
     with matrix_path.open("w") as matrix:
-        for index, variant in enumerate(_variants()):
+        for index, variant in enumerate(variants):
             print(f"EPD-MATRIX-START index={index} variant={variant.name}", flush=True)
             summary = _run_variant(args, variant, index)
             matrix.write(json.dumps(summary) + "\n")
@@ -374,13 +382,14 @@ def main() -> int:
     aggregate = {
         "schema_version": 1,
         "source_commit": args.source_commit,
-        "attempted": len(_variants()),
+        "attempted": len(variants),
         "succeeded": succeeded,
-        "failed": len(_variants()) - succeeded,
+        "failed": len(variants) - succeeded,
     }
     (args.output_dir / "matrix-summary.json").write_text(json.dumps(aggregate, indent=2))
     print(json.dumps(aggregate), flush=True)
-    return 0 if succeeded >= 10 else 1
+    required = min(10, len(variants))
+    return 0 if succeeded >= required else 1
 
 
 if __name__ == "__main__":
