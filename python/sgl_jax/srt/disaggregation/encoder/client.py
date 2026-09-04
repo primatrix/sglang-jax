@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import random
 import threading
 import time
@@ -31,7 +30,6 @@ from sgl_jax.srt.managers.io_struct import (
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, flatten_nested_list
 
 logger = logging.getLogger(__name__)
-_DISPATCH_ORJSON = os.environ.get("SGLANG_ENCODER_DISPATCH_ORJSON", "1") != "0"
 
 
 def create_part_req_id(req_id: str, part_idx: int) -> str:
@@ -691,14 +689,11 @@ class EncoderRequestDispatcher:
         async def send_encode_requests() -> None:
             async def send_one(encoder_url: str, payload: dict[str, Any]) -> None:
                 url = f"{encoder_url.rstrip('/')}/encode"
-                if _DISPATCH_ORJSON:
-                    response = await client.post(
-                        url,
-                        content=orjson.dumps(payload),
-                        headers={"content-type": "application/json"},
-                    )
-                else:
-                    response = await client.post(url, json=payload)
+                response = await client.post(
+                    url,
+                    content=orjson.dumps(payload),
+                    headers={"content-type": "application/json"},
+                )
                 response.raise_for_status()
 
             results = await asyncio.gather(

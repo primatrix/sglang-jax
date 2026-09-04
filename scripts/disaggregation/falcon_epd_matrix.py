@@ -41,8 +41,6 @@ class Variant:
     max_prefill_tokens: int = 8192
     encoder_cpu_threads: int | None = None
     language_cpu_threads: int | None = None
-    dispatch_orjson: bool = True
-    encoder_orjson_request: bool = True
     timing_logging: bool = True
 
 
@@ -73,34 +71,6 @@ def _variants() -> list[Variant]:
         replace(base, name="encoder-cpu-threads-4", encoder_cpu_threads=4),
         replace(base, name="encoder-cpu-threads-8", encoder_cpu_threads=8),
         replace(base, name="language-cpu-threads-4", language_cpu_threads=4),
-        replace(base, name="encoder-cpu4-json", encoder_cpu_threads=4, dispatch_orjson=False),
-        replace(base, name="encoder-cpu4-orjson", encoder_cpu_threads=4, dispatch_orjson=True),
-        replace(
-            base,
-            name="encoder-cpu4-server-json",
-            encoder_cpu_threads=4,
-            encoder_orjson_request=False,
-        ),
-        replace(
-            base,
-            name="encoder-cpu4-server-orjson",
-            encoder_cpu_threads=4,
-            encoder_orjson_request=True,
-        ),
-        replace(
-            base,
-            name="encoder-cpu4-wire-json",
-            encoder_cpu_threads=4,
-            dispatch_orjson=False,
-            encoder_orjson_request=False,
-        ),
-        replace(
-            base,
-            name="encoder-cpu4-wire-orjson",
-            encoder_cpu_threads=4,
-            dispatch_orjson=True,
-            encoder_orjson_request=True,
-        ),
         replace(base, name="encoder-cpu4-timing-on", encoder_cpu_threads=4),
         replace(
             base,
@@ -161,8 +131,6 @@ def _server_env(
     cache_dir: Path,
     chips: str,
     cpu_threads: int | None,
-    dispatch_orjson: bool | None = None,
-    encoder_orjson_request: bool | None = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
     env.update(
@@ -178,10 +146,6 @@ def _server_env(
     if cpu_threads is not None:
         env["OMP_NUM_THREADS"] = str(cpu_threads)
         env["MKL_NUM_THREADS"] = str(cpu_threads)
-    if dispatch_orjson is not None:
-        env["SGLANG_ENCODER_DISPATCH_ORJSON"] = "1" if dispatch_orjson else "0"
-    if encoder_orjson_request is not None:
-        env["SGLANG_ENCODER_ORJSON_REQUEST"] = "1" if encoder_orjson_request else "0"
     return env
 
 
@@ -260,7 +224,6 @@ def _start_servers(
             args.cache_root / "encoder",
             "0,1",
             variant.encoder_cpu_threads,
-            encoder_orjson_request=variant.encoder_orjson_request,
         ),
         stdout=encoder_log,
         stderr=subprocess.STDOUT,
@@ -303,7 +266,6 @@ def _start_servers(
             args.cache_root / "language",
             "2,3",
             variant.language_cpu_threads,
-            variant.dispatch_orjson,
         ),
         stdout=language_log,
         stderr=subprocess.STDOUT,

@@ -71,8 +71,6 @@ def _split_packed_encoder_output(
 
 logger = logging.getLogger(__name__)
 
-_ENCODER_ORJSON_REQUEST = os.environ.get("SGLANG_ENCODER_ORJSON_REQUEST", "1") != "0"
-
 
 @dataclass(slots=True)
 class PreparedEncoderBatch:
@@ -742,8 +740,7 @@ class EncoderServer:
 
     async def encode(self, request: Request) -> dict[str, Any]:
         if not isinstance(request, dict):
-            body = await request.body()
-            request = orjson.loads(body) if _ENCODER_ORJSON_REQUEST else await request.json()
+            request = orjson.loads(await request.body())
         # Model the language->encoder network hop (loopback has none).
         if self._network_rtt_s:
             await asyncio.sleep(self._network_rtt_s)
