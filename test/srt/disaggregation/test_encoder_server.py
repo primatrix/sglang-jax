@@ -146,3 +146,4 @@ def test_language_prepare_reuses_encoder_item_hash():
 
     assert result.mm_items[0].hash == 123
     assert result.mm_items[0].pad_value == -124
+    assert result.radix_input_ids == [1, -124, -124, 3]

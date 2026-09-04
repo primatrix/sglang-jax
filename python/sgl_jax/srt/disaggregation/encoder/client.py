@@ -6,8 +6,10 @@ import random
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from queue import Empty, SimpleQueue
 from typing import Any, Protocol
 
 import httpx
@@ -241,6 +243,7 @@ class PendingEncoderRequest:
     registration_futures: tuple[Future[None], ...]
     accumulator: MultiModalEmbeddingData
     backend: EncoderReceiverBackend
+    result_preparer: Callable[[TokenizedGenerateReqInput, dict[str, Any]], None] | None = None
     # Keep each part's metadata alongside its in-flight transfer session so the
     # completed embedding can later be assembled with the correct modality and grid.
     sessions: dict[int, tuple[EmbeddingData, EncoderReceiveSession]] = field(default_factory=dict)
@@ -259,6 +262,8 @@ class PendingEncoderRequest:
         if not self.background_progress:
             return self._poll_once()
         with self._lock:
+            if not self._done.is_set():
+                return None
             if self._error is not None:
                 raise self._error
             return self._result
@@ -272,10 +277,28 @@ class PendingEncoderRequest:
                 self._result = self._poll_once()
             except Exception as exc:
                 self._error = exc
-            done = self._result is not None or self._error is not None
-            if done:
-                self._done.set()
-            return done
+            return self._result is not None or self._error is not None
+
+    @property
+    def prepared_in_background(self) -> bool:
+        return self.background_progress and self.result_preparer is not None
+
+    def prepare_result(self) -> None:
+        """Finish pure CPU reconstruction without occupying the scheduler loop."""
+        with self._lock:
+            if self._closed:
+                return
+            result = self._result
+            error = self._error
+        if error is None and result is not None and self.result_preparer is not None:
+            try:
+                self.result_preparer(self.recv_req, result)
+            except Exception as exc:
+                error = exc
+        with self._lock:
+            if error is not None:
+                self._error = error
+            self._done.set()
 
     def _poll_once(self) -> dict[str, Any] | None:
         for future in self.registration_futures:
@@ -358,9 +381,22 @@ class EncoderClient:
         self._executor = ThreadPoolExecutor(max_workers=max(1, registration_workers))
         self._registration_client = httpx.Client(timeout=registration_timeout)
         self._background_progress = bool(background_progress)
+        self._result_preparer: (
+            Callable[[TokenizedGenerateReqInput, dict[str, Any]], None] | None
+        ) = None
         self._progress_interval_s = max(0.0001, float(progress_interval_s))
         self._pending: dict[int, PendingEncoderRequest] = {}
+        self._preparing: dict[int, PendingEncoderRequest] = {}
         self._pending_lock = threading.Lock()
+        self._completed: SimpleQueue[PendingEncoderRequest] = SimpleQueue()
+        self._prepare_executor = (
+            ThreadPoolExecutor(
+                max_workers=min(2, max(1, registration_workers)),
+                thread_name_prefix="encoder-language-prepare",
+            )
+            if self._background_progress
+            else None
+        )
         self._progress_stop = threading.Event()
         self._progress_ready = threading.Event()
         self._progress_error: Exception | None = None
@@ -388,6 +424,24 @@ class EncoderClient:
         if self._metadata_router is None:
             raise RuntimeError("encoder metadata router is not initialized")
         return self._metadata_router
+
+    @property
+    def background_progress(self) -> bool:
+        return self._background_progress
+
+    def set_result_preparer(
+        self,
+        preparer: Callable[[TokenizedGenerateReqInput, dict[str, Any]], None],
+    ) -> None:
+        self._result_preparer = preparer
+
+    def drain_completed(self) -> list[PendingEncoderRequest]:
+        completed = []
+        while True:
+            try:
+                completed.append(self._completed.get_nowait())
+            except Empty:
+                return completed
 
     def receive(self, request: TokenizedGenerateReqInput) -> PendingEncoderRequest:
         registrations = plan_encoder_registrations(request, self._encoder_urls)
@@ -418,6 +472,7 @@ class EncoderClient:
             registration_futures=tuple(registration_futures),
             accumulator=MultiModalEmbeddingData(len(registrations)),
             backend=self._backend,
+            result_preparer=self._result_preparer,
             background_progress=self._background_progress,
         )
         if self._background_progress:
@@ -446,18 +501,51 @@ class EncoderClient:
                         for key, request in completed:
                             if self._pending.get(key) is request:
                                 self._pending.pop(key, None)
+                                self._preparing[key] = request
+                    for key, request in completed:
+                        with self._pending_lock:
+                            if self._preparing.get(key) is not request:
+                                continue
+                        executor = self._prepare_executor
+                        assert executor is not None
+                        future = executor.submit(request.prepare_result)
+                        future.add_done_callback(
+                            lambda completed_future, key=key, request=request: (
+                                self._publish_completed(key, request, completed_future)
+                            )
+                        )
         finally:
             self._router.close()
+
+    def _publish_completed(
+        self,
+        key: int,
+        request: PendingEncoderRequest,
+        future: Future[None],
+    ) -> None:
+        try:
+            future.result()
+        except Exception as exc:
+            with request._lock:
+                request._error = exc
+                request._done.set()
+        with self._pending_lock:
+            if self._preparing.get(key) is request:
+                self._preparing.pop(key, None)
+        self._completed.put(request)
 
     def close(self) -> None:
         self._progress_stop.set()
         if self._progress_thread is not None:
             self._progress_thread.join()
         with self._pending_lock:
-            pending = list(self._pending.values())
+            pending = [*self._pending.values(), *self._preparing.values()]
             self._pending.clear()
+            self._preparing.clear()
         for request in pending:
             request.close()
+        if self._prepare_executor is not None:
+            self._prepare_executor.shutdown(cancel_futures=True)
         self._backend.close()
         self._executor.shutdown(cancel_futures=True)
         self._registration_client.close()

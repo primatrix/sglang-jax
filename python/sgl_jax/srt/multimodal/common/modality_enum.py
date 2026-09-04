@@ -279,6 +279,7 @@ class MultimodalInputs:
     # List of data items
     mm_items: list[MultimodalDataItem]
     input_ids: list[int] | None = None
+    radix_input_ids: list[int] | None = None
     image_pad_len: list | None = None
     num_image_tokens: int | None = None
 
@@ -320,6 +321,7 @@ class MultimodalInputs:
             item.set_pad_value()
 
         optional_args = [
+            "radix_input_ids",
             "mrope_positions",
             "mrope_position_delta",
             "im_token_id",

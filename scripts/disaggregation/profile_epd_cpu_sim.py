@@ -295,6 +295,8 @@ def _summarize_encoder_pipeline(log_path: Path, *, start_ns: int, end_ns: int) -
         "language_get_mm_data_ms",
         "language_radix_finalize_ms",
         "receive_mm_ms",
+        "language_admission_wait_ms",
+        "language_queue_after_pickup_ms",
         "language_queue_ms",
         "prefill_ms",
         "total_to_prefill_ms",

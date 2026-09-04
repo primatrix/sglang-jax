@@ -25,21 +25,21 @@ def test_language_logs_encoder_poll_time(caplog):
     assert "status=pending" in caplog.text
 
 
-def test_language_ready_only_poll_skips_incomplete_receivers():
-    pending = SimpleNamespace(
-        recv_req=SimpleNamespace(rid="request-0"),
-        done=False,
-        poll=lambda: (_ for _ in ()).throw(AssertionError("pending receiver was polled")),
+def test_language_drains_only_completed_background_receivers():
+    client = SimpleNamespace(
+        background_progress=True,
+        drain_completed=lambda: [],
     )
     scheduler = SimpleNamespace(
+        encoder_client=client,
         server_args=SimpleNamespace(
             encoder_request_timeout_seconds=0,
             enable_request_time_stats_logging=True,
         ),
-        encoder_waiting={"request-0": pending},
+        encoder_waiting={"request-0": object()},
     )
 
-    assert Scheduler.process_encoder_requests(scheduler, [], ready_only=True) == []
+    assert Scheduler.process_encoder_requests(scheduler, []) == []
 
 
 def test_language_logs_encoder_pipeline_timing(caplog):
@@ -93,6 +93,7 @@ def test_language_logs_encoder_pipeline_timing(caplog):
         "language_get_mm_data_done_ns": 23_500_000,
         "language_radix_done_ns": 23_800_000,
         "language_ready_ns": 24_000_000,
+        "language_scheduler_pickup_ns": 24_100_000,
     }
     req = SimpleNamespace(rid="request-0", encoder_timing=timing)
     batch = SimpleNamespace(
@@ -155,6 +156,8 @@ def test_language_logs_encoder_pipeline_timing(caplog):
     assert "language_pickup_wait_ms=0.200" in caplog.text
     assert "language_get_mm_data_ms=0.500" in caplog.text
     assert "language_radix_finalize_ms=0.500" in caplog.text
+    assert "language_admission_wait_ms=0.100" in caplog.text
+    assert "language_queue_after_pickup_ms=" in caplog.text
     assert "receive_mm_ms=9.000" in caplog.text
     assert timing["language_prefill_start_ns"] >= timing["language_ready_ns"]
     assert timing["language_prefill_done_ns"] >= timing["language_prefill_start_ns"]
@@ -219,6 +222,7 @@ def test_language_logs_encoder_preprocess_timing(caplog):
         "language_get_mm_data_done_ns": 23_500_000,
         "language_radix_done_ns": 23_800_000,
         "language_ready_ns": 24_000_000,
+        "language_scheduler_pickup_ns": 24_100_000,
     }
     req = SimpleNamespace(rid="request-0", encoder_timing=timing)
     batch = SimpleNamespace(

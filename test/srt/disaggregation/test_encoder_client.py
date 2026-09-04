@@ -232,9 +232,15 @@ def test_encoder_receiver_background_progresses_without_scheduler_poll(monkeypat
         registration_timeout=12.0,
         background_progress=True,
     )
-    pending = client.receive(
-        SimpleNamespace(rid="request-0", encoder_urls=None, num_items_assigned=None)
-    )
+    prepare_threads = []
+
+    def prepare_result(request, result):
+        prepare_threads.append(threading.current_thread().name)
+        request.prepared_shape = result["embeddings"][Modality.IMAGE].shape
+
+    client.set_result_preparer(prepare_result)
+    request = SimpleNamespace(rid="request-0", encoder_urls=None, num_items_assigned=None)
+    pending = client.receive(request)
     FakeRouter.instance.message = EmbeddingData(
         req_id="request-0",
         num_parts=1,
@@ -250,6 +256,8 @@ def test_encoder_receiver_background_progresses_without_scheduler_poll(monkeypat
     try:
         assert result is not None
         assert pending.done
+        assert request.prepared_shape == (2, 3)
+        assert prepare_threads[0].startswith("encoder-language-prepare")
         assert result["embeddings"][Modality.IMAGE].shape == (2, 3)
         timing = result["encoder_timing"]
         assert timing["receive_done_ns"] <= timing["receive_concat_start_ns"]
@@ -257,6 +265,12 @@ def test_encoder_receiver_background_progresses_without_scheduler_poll(monkeypat
         assert timing["receive_concat_done_ns"] <= timing["receive_extra_meta_start_ns"]
         assert timing["receive_extra_meta_start_ns"] <= timing["receive_extra_meta_done_ns"]
         assert timing["receive_extra_meta_done_ns"] <= timing["receive_result_ready_ns"]
+        completed = []
+        deadline = time.monotonic() + 1
+        while not completed and time.monotonic() < deadline:
+            completed = client.drain_completed()
+            time.sleep(0.001)
+        assert completed == [pending]
     finally:
         pending.close()
         client.close()

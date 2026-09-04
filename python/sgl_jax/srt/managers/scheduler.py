@@ -1245,12 +1245,6 @@ class Scheduler(
                     result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), result))
 
-                # Encoder completions can arrive while this batch is being built
-                # and dispatched. Admit them before waiting on the previous
-                # Language result so they are ready for the next scheduling tick.
-                if self.encoder_waiting:
-                    self.process_input_requests([], encoder_ready_only=True)
-
                 if self.last_batch is None:
                     # Create a dummy first batch to start the pipeline for overlap schedule.
                     # It is now used for triggering the sampling_info_done event.
@@ -1369,12 +1363,9 @@ class Scheduler(
             recv_reqs = self.broadcast_pyobj(recv_reqs)
         return recv_reqs
 
-    def process_input_requests(self, recv_reqs: list, *, encoder_ready_only: bool = False):
+    def process_input_requests(self, recv_reqs: list):
         if self.encoder_client is not None:
-            recv_reqs = self.process_encoder_requests(
-                recv_reqs,
-                ready_only=encoder_ready_only,
-            )
+            recv_reqs = self.process_encoder_requests(recv_reqs)
 
         for recv_req in recv_reqs:
             output = self._request_dispatcher(recv_req)

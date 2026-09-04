@@ -43,12 +43,12 @@ class SchedulerDisaggregationEncoderMixin:
         if self._mm_processor is None:
             raise ValueError("encoder disaggregation requires a multimodal processor")
         self.encoder_client = create_encoder_client(self.server_args, self.mesh)
+        if self.encoder_client.background_progress:
+            self.encoder_client.set_result_preparer(self._apply_encoder_result)
 
     def process_encoder_requests(
         self: Scheduler,
         recv_reqs: list,
-        *,
-        ready_only: bool = False,
     ) -> list:
         ready = []
         now = time.monotonic()
@@ -74,8 +74,19 @@ class SchedulerDisaggregationEncoderMixin:
             "enable_request_time_stats_logging",
             False,
         )
-        for rid, pending in list(self.encoder_waiting.items()):
-            if ready_only and not pending.done:
+        encoder_client = getattr(self, "encoder_client", None)
+        background_progress = bool(
+            encoder_client is not None and encoder_client.background_progress
+        )
+        if background_progress:
+            pending_items = [
+                (pending.recv_req.rid, pending) for pending in encoder_client.drain_completed()
+            ]
+        else:
+            pending_items = list(self.encoder_waiting.items())
+
+        for rid, pending in pending_items:
+            if self.encoder_waiting.get(rid) is not pending:
                 continue
             recv_req = pending.recv_req
 
@@ -110,7 +121,16 @@ class SchedulerDisaggregationEncoderMixin:
 
             if result is not None:
                 try:
-                    self._apply_encoder_result(recv_req, result)
+                    pickup_ns = time.time_ns()
+                    if getattr(pending, "prepared_in_background", False):
+                        encoder_timing = getattr(recv_req, "encoder_timing", None)
+                        if encoder_timing is not None:
+                            encoder_timing["language_scheduler_pickup_ns"] = pickup_ns
+                    else:
+                        encoder_timing = result.get("encoder_timing")
+                        if encoder_timing is not None:
+                            encoder_timing["language_scheduler_pickup_ns"] = pickup_ns
+                        self._apply_encoder_result(recv_req, result)
                 except Exception as exc:
                     self._abort_encoder_request(recv_req, str(exc))
                 else:
@@ -125,6 +145,16 @@ class SchedulerDisaggregationEncoderMixin:
                 )
                 self._remove_encoder_waiting(rid)
 
+        if background_progress and timeout > 0:
+            for rid, pending in list(self.encoder_waiting.items()):
+                if now - pending.started_at < timeout:
+                    continue
+                self._abort_encoder_request(
+                    pending.recv_req,
+                    f"encoder timed out after {timeout}s",
+                )
+                self._remove_encoder_waiting(rid)
+
         return ready
 
     def _apply_encoder_result(self: Scheduler, recv_req, result: dict) -> None:
@@ -134,7 +164,7 @@ class SchedulerDisaggregationEncoderMixin:
         encoder_timing = result.get("encoder_timing")
         if encoder_timing is not None:
             encoder_timing.setdefault("language_apply_start_ns", time.time_ns())
-        prompt = recv_req.text if recv_req.text is not None else recv_req.input_ids
+        prompt = recv_req.input_ids if recv_req.input_ids is not None else recv_req.text
         mm_inputs = self._mm_processor.get_mm_data(
             prompt,
             embeddings,
@@ -148,7 +178,9 @@ class SchedulerDisaggregationEncoderMixin:
             encoder_timing["language_get_mm_data_done_ns"] = time.time_ns()
         recv_req.mm_inputs = mm_inputs
         recv_req.input_ids = mm_inputs.input_ids
-        recv_req.radix_input_ids = build_radix_input_ids(recv_req.input_ids, mm_inputs)
+        recv_req.radix_input_ids = mm_inputs.radix_input_ids or build_radix_input_ids(
+            recv_req.input_ids, mm_inputs
+        )
         if encoder_timing is not None:
             encoder_timing["language_radix_done_ns"] = time.time_ns()
         recv_req.need_wait_for_mm_inputs = False
@@ -265,6 +297,7 @@ class SchedulerDisaggregationEncoderMixin:
                     "language_get_mm_data_done_ns",
                     "language_radix_done_ns",
                     "language_ready_ns",
+                    "language_scheduler_pickup_ns",
                     "language_prefill_start_ns",
                     "language_prefill_done_ns",
                 )
@@ -287,7 +320,8 @@ class SchedulerDisaggregationEncoderMixin:
                     "receive_extra_meta_start_ns=%d receive_extra_meta_done_ns=%d "
                     "receive_result_ready_ns=%d language_apply_start_ns=%d "
                     "language_get_mm_data_done_ns=%d language_radix_done_ns=%d "
-                    "language_ready_ns=%d language_prefill_start_ns=%d "
+                    "language_ready_ns=%d language_scheduler_pickup_ns=%d "
+                    "language_prefill_start_ns=%d "
                     "language_prefill_done_ns=%d queue_ms=%.3f "
                     "encode_stage_wait_ms=%.3f preprocess_ms=%.3f "
                     "encode_wait_ms=%.3f transfer_reserve_ms=%.3f "
@@ -314,7 +348,9 @@ class SchedulerDisaggregationEncoderMixin:
                     "receive_concat_ms=%.3f receive_extra_meta_ms=%.3f "
                     "receive_result_pack_ms=%.3f language_pickup_wait_ms=%.3f "
                     "language_get_mm_data_ms=%.3f language_radix_finalize_ms=%.3f "
-                    "receive_mm_ms=%.3f language_queue_ms=%.3f prefill_ms=%.3f "
+                    "receive_mm_ms=%.3f language_admission_wait_ms=%.3f "
+                    "language_queue_after_pickup_ms=%.3f language_queue_ms=%.3f "
+                    "prefill_ms=%.3f "
                     "total_to_prefill_ms=%.3f total_to_prefill_done_ms=%.3f",
                     req.rid,
                     timing["enqueue_ns"],
@@ -349,6 +385,7 @@ class SchedulerDisaggregationEncoderMixin:
                     timing["language_get_mm_data_done_ns"],
                     timing["language_radix_done_ns"],
                     timing["language_ready_ns"],
+                    timing["language_scheduler_pickup_ns"],
                     timing["language_prefill_start_ns"],
                     timing["language_prefill_done_ns"],
                     _elapsed_ms(timing, "enqueue_ns", "dequeue_ns"),
@@ -445,6 +482,16 @@ class SchedulerDisaggregationEncoderMixin:
                         "language_ready_ns",
                     ),
                     _elapsed_ms(timing, "publish_done_ns", "language_ready_ns"),
+                    _elapsed_ms(
+                        timing,
+                        "language_ready_ns",
+                        "language_scheduler_pickup_ns",
+                    ),
+                    _elapsed_ms(
+                        timing,
+                        "language_scheduler_pickup_ns",
+                        "language_prefill_start_ns",
+                    ),
                     _elapsed_ms(
                         timing,
                         "language_ready_ns",

@@ -222,6 +222,7 @@ class BaseMultimodalProcessor(ABC):
         consumed_items = {modality: 0 for modality in Modality.all()}
         item_hashes = metadata.get("item_hashes", {})
         mm_items = []
+        radix_input_ids = list(input_ids)
         for modality, placeholder_range in zip(modalities, ranges):
             modality_embeddings = embeddings.get(modality)
             if modality_embeddings is None:
@@ -241,6 +242,8 @@ class BaseMultimodalProcessor(ABC):
                 precomputed_embeddings=embedding,
             )
             item.set_pad_value()
+            range_start, range_end = placeholder_range
+            radix_input_ids[range_start:range_end] = [item.pad_value] * (range_end - range_start)
             mm_items.append(item)
             consumed[modality] = end
             consumed_items[modality] += 1
@@ -252,6 +255,7 @@ class BaseMultimodalProcessor(ABC):
         return MultimodalInputs(
             mm_items=mm_items,
             input_ids=input_ids,
+            radix_input_ids=radix_input_ids,
             im_start_id=getattr(self.hf_config, "vision_start_token_id", None),
             im_end_id=getattr(self.hf_config, "vision_end_token_id", None),
             im_token_id=getattr(self.hf_config, "image_token_id", None),
