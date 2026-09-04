@@ -32,7 +32,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 
-from sgl_jax.srt.disaggregation.encoder.metrics import summarize_raiden_transfer_inflight
+from sgl_jax.srt.disaggregation.encoder.metrics import (
+    summarize_raiden_transfer_inflight,
+)
 
 DEFAULT_PROFILER_DIR = "/tmp/epd-sim-profile"
 _QUEUE_RE = re.compile(
@@ -250,8 +252,23 @@ def _summarize_encoder_pipeline(log_path: Path, *, start_ns: int, end_ns: int) -
         "encode_compute_ms",
         "encode_ms",
         "publish_ms",
+        "transfer_handoff_ms",
+        "transfer_queue_ms",
+        "transfer_pool_setup_ms",
+        "transfer_reserve_ms",
+        "transfer_copy_ms",
+        "transfer_stage_ms",
+        "transfer_register_ms",
+        "transfer_total_ms",
         "receive_ms",
         "mm_prepare_ms",
+        "receive_metadata_wait_ms",
+        "receive_setup_ms",
+        "receive_transfer_wait_ms",
+        "receive_completion_to_materialize_ms",
+        "receive_materialize_wait_ms",
+        "receive_poll_delay_ms",
+        "receive_finalize_ms",
         "receive_mm_ms",
         "language_queue_ms",
         "prefill_ms",

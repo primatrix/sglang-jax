@@ -270,13 +270,19 @@ class EncoderServer:
         request_timeout: float | None = 300.0,
         network_rtt_ms: float = 0.0,
         log_queue_timing: bool = False,
+        transfer_queue_size: int = 2,
     ) -> None:
         encoder_register_urls = list(encoder_register_urls or ())
         if bool(encoder_register_urls) != bool(advertise_url):
             raise ValueError("encoder_register_urls and advertise_url must be configured together")
 
         self._network_rtt_s = max(0.0, float(network_rtt_ms)) / 1000.0
-        self.runtime = EncoderRuntime(encoder, transfer)
+        self.runtime = EncoderRuntime(
+            encoder,
+            transfer,
+            pipeline_depth=max_inflight_batches,
+            transfer_queue_depth=transfer_queue_size,
+        )
         self.scheduler = DisaggEncoderScheduler(
             self.runtime,
             max_batch_size=max_batch_size,
@@ -553,6 +559,7 @@ def launch(server_args: ServerArgs) -> None:
                 server_args.simulate_network_rtt_ms if server_args.simulate_compute else 0.0
             ),
             log_queue_timing=server_args.enable_request_time_stats_logging,
+            transfer_queue_size=server_args.encoder_transfer_queue_size,
         )
         server.run(server_args.host, server_args.port)
     finally:

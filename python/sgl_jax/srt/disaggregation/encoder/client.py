@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import threading
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -137,6 +138,11 @@ class DeferredReceiveSession:
         self._future = future
         self._session: EncoderReceiveSession | None = None
         self._closed = False
+        self._setup_done_ns: int | None = None
+        future.add_done_callback(self._mark_setup_done)
+
+    def _mark_setup_done(self, _future: Future[EncoderReceiveSession]) -> None:
+        self._setup_done_ns = time.time_ns()
 
     def poll(self) -> jax.Array | None:
         if self._closed:
@@ -146,6 +152,15 @@ class DeferredReceiveSession:
                 return None
             self._session = self._future.result()
         return self._session.poll()
+
+    @property
+    def timing_meta(self) -> dict[str, int]:
+        timing = {}
+        if self._setup_done_ns is not None:
+            timing["receive_setup_done_ns"] = self._setup_done_ns
+        if self._session is not None:
+            timing.update(getattr(self._session, "timing_meta", {}))
+        return timing
 
     def close(self) -> None:
         self._closed = True
@@ -179,12 +194,14 @@ class EncoderMetadataRouter:
         port = self._receiver.bind_to_random_port(f"tcp://{host}")
         self.receive_url = f"{host}:{port}"
         self._queues: dict[str, deque[Any]] = {}
+        self._lock = threading.Lock()
 
     def register(self, req_ids: tuple[str, ...]) -> None:
         routes = set(req_ids)
-        if len(routes) != len(req_ids) or not routes.isdisjoint(self._queues):
-            raise ValueError(f"duplicate encoder metadata routes: {req_ids}")
-        self._queues.update((req_id, deque()) for req_id in req_ids)
+        with self._lock:
+            if len(routes) != len(req_ids) or not routes.isdisjoint(self._queues):
+                raise ValueError(f"duplicate encoder metadata routes: {req_ids}")
+            self._queues.update((req_id, deque()) for req_id in req_ids)
 
     def poll(self, req_ids: tuple[str, ...]) -> Any | None:
         while True:
@@ -192,22 +209,26 @@ class EncoderMetadataRouter:
                 data = self._receiver.recv_pyobj(zmq.NOBLOCK)
             except zmq.Again:
                 break
-            queue = self._queues.get(getattr(data, "req_id", None))
-            if queue is not None:
-                queue.append(data)
+            with self._lock:
+                queue = self._queues.get(getattr(data, "req_id", None))
+                if queue is not None:
+                    queue.append(data)
 
-        for req_id in req_ids:
-            queue = self._queues.get(req_id)
-            if queue:
-                return queue.popleft()
+        with self._lock:
+            for req_id in req_ids:
+                queue = self._queues.get(req_id)
+                if queue:
+                    return queue.popleft()
         return None
 
     def unregister(self, req_ids: tuple[str, ...]) -> None:
-        for req_id in req_ids:
-            self._queues.pop(req_id, None)
+        with self._lock:
+            for req_id in req_ids:
+                self._queues.pop(req_id, None)
 
     def close(self) -> None:
-        self._queues.clear()
+        with self._lock:
+            self._queues.clear()
         self._receiver.close()
 
 
@@ -223,8 +244,32 @@ class PendingEncoderRequest:
     # Keep each part's metadata alongside its in-flight transfer session so the
     # completed embedding can later be assembled with the correct modality and grid.
     sessions: dict[int, tuple[EmbeddingData, EncoderReceiveSession]] = field(default_factory=dict)
+    background_progress: bool = False
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _result: dict[str, Any] | None = field(default=None, init=False, repr=False)
+    _error: Exception | None = field(default=None, init=False, repr=False)
+    _closed: bool = field(default=False, init=False, repr=False)
 
     def poll(self) -> dict[str, Any] | None:
+        if not self.background_progress:
+            return self._poll_once()
+        with self._lock:
+            if self._error is not None:
+                raise self._error
+            return self._result
+
+    def progress(self) -> bool:
+        """Advance one request from a dedicated receiver progress thread."""
+        with self._lock:
+            if self._closed or self._result is not None or self._error is not None:
+                return True
+            try:
+                self._result = self._poll_once()
+            except Exception as exc:
+                self._error = exc
+            return self._result is not None or self._error is not None
+
+    def _poll_once(self) -> dict[str, Any] | None:
         for future in self.registration_futures:
             if future.done():
                 future.result()  # error re-thrown to the scheduler main thread
@@ -234,6 +279,7 @@ class PendingEncoderRequest:
         # embedding separately through the receiver backend.
         data = self.metadata_router.poll(self.metadata_req_ids)
         if data is not None:
+            data.receive_metadata_ns = time.time_ns()
             validate_encoder_response(
                 data,
                 self.accumulator.num_parts,
@@ -250,6 +296,9 @@ class PendingEncoderRequest:
             embedding = session.poll()
             if embedding is None:
                 continue
+            for key, value in getattr(session, "timing_meta", {}).items():
+                setattr(part_data, key, value)
+            part_data.receive_embedding_ns = time.time_ns()
             self.accumulator.add(part_data, embedding)
             self.sessions.pop(part_idx)
             session.close()
@@ -265,12 +314,16 @@ class PendingEncoderRequest:
         }
 
     def close(self) -> None:
-        for future in self.registration_futures:
-            future.cancel()
-        for _, session in self.sessions.values():
-            session.close()
-        self.sessions.clear()
-        self.metadata_router.unregister(self.metadata_req_ids)
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            for future in self.registration_futures:
+                future.cancel()
+            for _, session in self.sessions.values():
+                session.close()
+            self.sessions.clear()
+            self.metadata_router.unregister(self.metadata_req_ids)
 
 
 class EncoderClient:
@@ -281,17 +334,50 @@ class EncoderClient:
         encoder_urls: list[str],
         registration_workers: int,
         registration_timeout: float | None,
+        background_progress: bool = False,
+        progress_interval_s: float = 0.001,
     ) -> None:
         self._backend = backend
         self._encoder_urls = list(encoder_urls)
         self._executor = ThreadPoolExecutor(max_workers=max(1, registration_workers))
         self._registration_client = httpx.Client(timeout=registration_timeout)
-        self._metadata_router = EncoderMetadataRouter(host)
+        self._background_progress = bool(background_progress)
+        self._progress_interval_s = max(0.0001, float(progress_interval_s))
+        self._pending: dict[int, PendingEncoderRequest] = {}
+        self._pending_lock = threading.Lock()
+        self._progress_stop = threading.Event()
+        self._progress_ready = threading.Event()
+        self._progress_error: Exception | None = None
+        self._metadata_router: EncoderMetadataRouter | None = None
+        self._progress_thread: threading.Thread | None = None
+        if self._background_progress:
+            self._progress_thread = threading.Thread(
+                target=self._progress_loop,
+                args=(host,),
+                name="encoder-receiver-progress",
+                daemon=True,
+            )
+            self._progress_thread.start()
+            if not self._progress_ready.wait(30):
+                raise TimeoutError("timed out starting encoder receiver progress thread")
+            if self._progress_error is not None:
+                raise RuntimeError("failed to start encoder receiver progress thread") from (
+                    self._progress_error
+                )
+        else:
+            self._metadata_router = EncoderMetadataRouter(host)
+
+    @property
+    def _router(self) -> EncoderMetadataRouter:
+        if self._metadata_router is None:
+            raise RuntimeError("encoder metadata router is not initialized")
+        return self._metadata_router
 
     def receive(self, request: TokenizedGenerateReqInput) -> PendingEncoderRequest:
         registrations = plan_encoder_registrations(request, self._encoder_urls)
         metadata_req_ids = tuple(registration[1] for registration in registrations)
-        self._metadata_router.register(metadata_req_ids)
+        router = self._router
+        router.register(metadata_req_ids)
         registration_futures = []
         try:
             for registration in registrations:
@@ -306,23 +392,61 @@ class EncoderClient:
         except Exception:
             for future in registration_futures:
                 future.cancel()
-            self._metadata_router.unregister(metadata_req_ids)
+            router.unregister(metadata_req_ids)
             raise
-        return PendingEncoderRequest(
+        pending = PendingEncoderRequest(
             recv_req=request,
             started_at=time.monotonic(),
-            metadata_router=self._metadata_router,
+            metadata_router=router,
             metadata_req_ids=metadata_req_ids,
             registration_futures=tuple(registration_futures),
             accumulator=MultiModalEmbeddingData(len(registrations)),
             backend=self._backend,
+            background_progress=self._background_progress,
         )
+        if self._background_progress:
+            with self._pending_lock:
+                self._pending[id(pending)] = pending
+        return pending
+
+    def _progress_loop(self, host: str) -> None:
+        try:
+            self._metadata_router = EncoderMetadataRouter(host)
+        except Exception as exc:
+            self._progress_error = exc
+            self._progress_ready.set()
+            return
+        self._progress_ready.set()
+        try:
+            while not self._progress_stop.wait(self._progress_interval_s):
+                with self._pending_lock:
+                    pending = list(self._pending.items())
+                completed = []
+                for key, request in pending:
+                    if request.progress():
+                        completed.append((key, request))
+                if completed:
+                    with self._pending_lock:
+                        for key, request in completed:
+                            if self._pending.get(key) is request:
+                                self._pending.pop(key, None)
+        finally:
+            self._router.close()
 
     def close(self) -> None:
+        self._progress_stop.set()
+        if self._progress_thread is not None:
+            self._progress_thread.join()
+        with self._pending_lock:
+            pending = list(self._pending.values())
+            self._pending.clear()
+        for request in pending:
+            request.close()
         self._backend.close()
         self._executor.shutdown(cancel_futures=True)
         self._registration_client.close()
-        self._metadata_router.close()
+        if self._progress_thread is None:
+            self._router.close()
 
 
 class EncoderRequestDispatcher:
@@ -481,4 +605,9 @@ def create_encoder_client(
         encoder_urls=server_args.encoder_urls,
         registration_workers=channel_number,
         registration_timeout=None if control_timeout <= 0 else control_timeout,
+        background_progress=getattr(
+            server_args,
+            "encoder_receiver_background_progress",
+            False,
+        ),
     )

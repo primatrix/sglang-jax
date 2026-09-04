@@ -205,7 +205,19 @@ class SchedulerDisaggregationEncoderMixin:
                     "preprocess_done_ns",
                     "encode_start_ns",
                     "encode_done_ns",
+                    "transfer_enqueue_ns",
+                    "transfer_start_ns",
+                    "transfer_pool_ready_ns",
+                    "transfer_reserve_done_ns",
+                    "transfer_copy_done_ns",
+                    "transfer_stage_done_ns",
                     "publish_done_ns",
+                    "receive_metadata_ns",
+                    "receive_setup_done_ns",
+                    "receive_transfer_done_ns",
+                    "receive_materialize_start_ns",
+                    "receive_materialize_done_ns",
+                    "receive_embedding_ns",
                     "receive_done_ns",
                     "language_ready_ns",
                     "language_prefill_start_ns",
@@ -217,13 +229,27 @@ class SchedulerDisaggregationEncoderMixin:
                 logger.info(
                     "ENCODER-PIPELINE-TIME req_id=%s enqueue_ns=%d dequeue_ns=%d "
                     "preprocess_start_ns=%d preprocess_done_ns=%d encode_start_ns=%d "
-                    "encode_done_ns=%d "
+                    "encode_done_ns=%d transfer_enqueue_ns=%d transfer_start_ns=%d "
+                    "transfer_pool_ready_ns=%d transfer_reserve_done_ns=%d "
+                    "transfer_copy_done_ns=%d transfer_stage_done_ns=%d "
                     "publish_done_ns=%d receive_done_ns=%d "
+                    "receive_metadata_ns=%d receive_setup_done_ns=%d "
+                    "receive_transfer_done_ns=%d receive_materialize_start_ns=%d "
+                    "receive_materialize_done_ns=%d receive_embedding_ns=%d "
                     "language_ready_ns=%d language_prefill_start_ns=%d "
                     "language_prefill_done_ns=%d queue_ms=%.3f "
                     "encode_stage_wait_ms=%.3f preprocess_ms=%.3f "
                     "encode_wait_ms=%.3f encode_compute_ms=%.3f encode_ms=%.3f "
-                    "publish_ms=%.3f receive_ms=%.3f mm_prepare_ms=%.3f "
+                    "publish_ms=%.3f transfer_handoff_ms=%.3f "
+                    "transfer_queue_ms=%.3f transfer_pool_setup_ms=%.3f "
+                    "transfer_reserve_ms=%.3f transfer_copy_ms=%.3f "
+                    "transfer_stage_ms=%.3f transfer_register_ms=%.3f "
+                    "transfer_total_ms=%.3f receive_ms=%.3f mm_prepare_ms=%.3f "
+                    "receive_metadata_wait_ms=%.3f receive_setup_ms=%.3f "
+                    "receive_transfer_wait_ms=%.3f "
+                    "receive_completion_to_materialize_ms=%.3f "
+                    "receive_materialize_wait_ms=%.3f "
+                    "receive_poll_delay_ms=%.3f receive_finalize_ms=%.3f "
                     "receive_mm_ms=%.3f language_queue_ms=%.3f prefill_ms=%.3f "
                     "total_to_prefill_ms=%.3f total_to_prefill_done_ms=%.3f",
                     req.rid,
@@ -233,8 +259,20 @@ class SchedulerDisaggregationEncoderMixin:
                     timing["preprocess_done_ns"],
                     timing["encode_start_ns"],
                     timing["encode_done_ns"],
+                    timing["transfer_enqueue_ns"],
+                    timing["transfer_start_ns"],
+                    timing["transfer_pool_ready_ns"],
+                    timing["transfer_reserve_done_ns"],
+                    timing["transfer_copy_done_ns"],
+                    timing["transfer_stage_done_ns"],
                     timing["publish_done_ns"],
                     timing["receive_done_ns"],
+                    timing["receive_metadata_ns"],
+                    timing["receive_setup_done_ns"],
+                    timing["receive_transfer_done_ns"],
+                    timing["receive_materialize_start_ns"],
+                    timing["receive_materialize_done_ns"],
+                    timing["receive_embedding_ns"],
                     timing["language_ready_ns"],
                     timing["language_prefill_start_ns"],
                     timing["language_prefill_done_ns"],
@@ -245,8 +283,35 @@ class SchedulerDisaggregationEncoderMixin:
                     _elapsed_ms(timing, "encode_start_ns", "encode_done_ns"),
                     _elapsed_ms(timing, "dequeue_ns", "encode_done_ns"),
                     _elapsed_ms(timing, "encode_done_ns", "publish_done_ns"),
+                    _elapsed_ms(timing, "encode_done_ns", "transfer_enqueue_ns"),
+                    _elapsed_ms(timing, "transfer_enqueue_ns", "transfer_start_ns"),
+                    _elapsed_ms(timing, "transfer_start_ns", "transfer_pool_ready_ns"),
+                    _elapsed_ms(timing, "transfer_pool_ready_ns", "transfer_reserve_done_ns"),
+                    _elapsed_ms(timing, "transfer_reserve_done_ns", "transfer_copy_done_ns"),
+                    _elapsed_ms(timing, "transfer_start_ns", "transfer_stage_done_ns"),
+                    _elapsed_ms(timing, "transfer_stage_done_ns", "publish_done_ns"),
+                    _elapsed_ms(timing, "transfer_enqueue_ns", "publish_done_ns"),
                     _elapsed_ms(timing, "publish_done_ns", "receive_done_ns"),
                     _elapsed_ms(timing, "receive_done_ns", "language_ready_ns"),
+                    _elapsed_ms(timing, "publish_done_ns", "receive_metadata_ns"),
+                    _elapsed_ms(timing, "receive_metadata_ns", "receive_setup_done_ns"),
+                    _elapsed_ms(timing, "receive_setup_done_ns", "receive_transfer_done_ns"),
+                    _elapsed_ms(
+                        timing,
+                        "receive_transfer_done_ns",
+                        "receive_materialize_start_ns",
+                    ),
+                    _elapsed_ms(
+                        timing,
+                        "receive_materialize_start_ns",
+                        "receive_materialize_done_ns",
+                    ),
+                    _elapsed_ms(
+                        timing,
+                        "receive_materialize_done_ns",
+                        "receive_embedding_ns",
+                    ),
+                    _elapsed_ms(timing, "receive_embedding_ns", "receive_done_ns"),
                     _elapsed_ms(timing, "publish_done_ns", "language_ready_ns"),
                     _elapsed_ms(
                         timing,

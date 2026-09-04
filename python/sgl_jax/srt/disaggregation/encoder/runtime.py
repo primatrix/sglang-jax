@@ -48,13 +48,19 @@ class EncoderRuntime:
         transfer: Any,
         *,
         pipeline_depth: int = 2,
+        transfer_queue_depth: int = 2,
         transfer_poll_interval_s: float = 0.001,
     ) -> None:
         self._encoder = encoder
         self._transfer = transfer
         depth = max(1, int(pipeline_depth))
         self._encode_queue: queue.Queue[_EncodeJob | object] = queue.Queue(depth)
-        self._transfer_queue: queue.Queue[_TransferJob | object] = queue.Queue(depth)
+        # A ViT batch expands into one transfer job per request. This queue must
+        # be sized in requests rather than batches, otherwise the ViT worker is
+        # serialized behind device copies while enqueueing one batch.
+        self._transfer_queue: queue.Queue[_TransferJob | object] = queue.Queue(
+            max(1, int(transfer_queue_depth))
+        )
         self._transfer_poll_interval_s = max(0.0001, float(transfer_poll_interval_s))
         self._stop_event = threading.Event()
         self._start_lock = threading.Lock()
@@ -194,6 +200,7 @@ class EncoderRuntime:
                 )
                 transfer_jobs.append(_TransferJob(job, index, transfer_id, embedding, data))
             for transfer_job in transfer_jobs:
+                transfer_job.data.transfer_enqueue_ns = time.time_ns()
                 self._transfer_queue.put(transfer_job)
         except Exception as exc:
             job.fail_batch(exc)
@@ -211,13 +218,41 @@ class EncoderRuntime:
 
     def _run_transfer(self, job: _TransferJob) -> None:
         try:
+            job.data.transfer_start_ns = time.time_ns()
             staged_transfer = self._transfer.stage_sync(
                 job.transfer_id,
                 job.embedding,
             )
+            job.data.transfer_stage_done_ns = time.time_ns()
             transfer_metadata = self._transfer.publish_sync(staged_transfer)
             for key, value in transfer_metadata.items():
                 setattr(job.data, key, value)
+            # Backends may optionally expose the pool/reservation/copy split.
+            # Keep a complete timing chain for simpler downstream aggregation.
+            job.data.transfer_pool_ready_ns = (
+                getattr(
+                    job.data,
+                    "transfer_pool_ready_ns",
+                    None,
+                )
+                or job.data.transfer_start_ns
+            )
+            job.data.transfer_reserve_done_ns = (
+                getattr(
+                    job.data,
+                    "transfer_reserve_done_ns",
+                    None,
+                )
+                or job.data.transfer_pool_ready_ns
+            )
+            job.data.transfer_copy_done_ns = (
+                getattr(
+                    job.data,
+                    "transfer_copy_done_ns",
+                    None,
+                )
+                or job.data.transfer_stage_done_ns
+            )
             job.data.transfer_id = str(transfer_metadata.get("transfer_id", job.transfer_id))
             job.data.publish_done_ns = time.time_ns()
         except Exception as exc:

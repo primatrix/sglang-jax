@@ -632,6 +632,54 @@ def test_runtime_overlaps_forward_with_background_publish():
     asyncio.run(run())
 
 
+def test_runtime_does_not_block_vit_on_large_transfer_batch():
+    async def run() -> None:
+        first_transfer_started = threading.Event()
+        release_first_transfer = threading.Event()
+        second_encode_started = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        class ControlledTransfer(_FakeTransfer):
+            def stage_sync(self, transfer_id, embedding):
+                if transfer_id.startswith("request-0:"):
+                    first_transfer_started.set()
+                    if not release_first_transfer.wait(1):
+                        raise TimeoutError("test did not release first transfer")
+                return super().stage_sync(transfer_id, embedding)
+
+        def encode(requests):
+            if requests[0]["req_id"] == "request-next":
+                loop.call_soon_threadsafe(second_encode_started.set)
+            return [(jnp.zeros((1, 2)), {}) for _ in requests]
+
+        runtime = EncoderRuntime(
+            _TestEncoder(encode),
+            ControlledTransfer(),
+            transfer_queue_depth=8,
+        )
+        first_batch = [
+            {
+                "req_id": f"request-{index}",
+                "part_idx": index,
+                "modality": "IMAGE",
+            }
+            for index in range(8)
+        ]
+        first_task = asyncio.create_task(_collect(runtime, first_batch))
+        second_task = asyncio.create_task(
+            _collect(runtime, [{"req_id": "request-next", "modality": "IMAGE"}])
+        )
+        try:
+            assert await asyncio.to_thread(first_transfer_started.wait, 1)
+            await asyncio.wait_for(second_encode_started.wait(), 1)
+        finally:
+            release_first_transfer.set()
+            await asyncio.gather(first_task, second_task)
+            await runtime.stop()
+
+    asyncio.run(run())
+
+
 def test_runtime_forward_runs_with_four_transfers_inflight():
     async def run() -> list[tuple[str, int]]:
         class WindowedTransfer(_FakeTransfer):

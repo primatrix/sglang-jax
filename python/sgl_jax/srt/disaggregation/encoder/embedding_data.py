@@ -38,7 +38,19 @@ class EmbeddingData:
         preprocess_done_ns: int | None = None,
         encode_start_ns: int | None = None,
         encode_done_ns: int | None = None,
+        transfer_enqueue_ns: int | None = None,
+        transfer_start_ns: int | None = None,
+        transfer_pool_ready_ns: int | None = None,
+        transfer_reserve_done_ns: int | None = None,
+        transfer_copy_done_ns: int | None = None,
+        transfer_stage_done_ns: int | None = None,
         publish_done_ns: int | None = None,
+        receive_metadata_ns: int | None = None,
+        receive_setup_done_ns: int | None = None,
+        receive_transfer_done_ns: int | None = None,
+        receive_materialize_start_ns: int | None = None,
+        receive_materialize_done_ns: int | None = None,
+        receive_embedding_ns: int | None = None,
         queue_duration_ns: int | None = None,
         queue_ms: float | None = None,
         **kwargs: Any,
@@ -61,7 +73,19 @@ class EmbeddingData:
         self.preprocess_done_ns = preprocess_done_ns
         self.encode_start_ns = encode_start_ns
         self.encode_done_ns = encode_done_ns
+        self.transfer_enqueue_ns = transfer_enqueue_ns
+        self.transfer_start_ns = transfer_start_ns
+        self.transfer_pool_ready_ns = transfer_pool_ready_ns
+        self.transfer_reserve_done_ns = transfer_reserve_done_ns
+        self.transfer_copy_done_ns = transfer_copy_done_ns
+        self.transfer_stage_done_ns = transfer_stage_done_ns
         self.publish_done_ns = publish_done_ns
+        self.receive_metadata_ns = receive_metadata_ns
+        self.receive_setup_done_ns = receive_setup_done_ns
+        self.receive_transfer_done_ns = receive_transfer_done_ns
+        self.receive_materialize_start_ns = receive_materialize_start_ns
+        self.receive_materialize_done_ns = receive_materialize_done_ns
+        self.receive_embedding_ns = receive_embedding_ns
         self.queue_duration_ns = queue_duration_ns
         self.queue_ms = queue_ms
         for key, value in kwargs.items():
@@ -149,7 +173,19 @@ class MultiModalEmbeddingData:
             "preprocess_done_ns",
             "encode_start_ns",
             "encode_done_ns",
+            "transfer_enqueue_ns",
+            "transfer_start_ns",
+            "transfer_pool_ready_ns",
+            "transfer_reserve_done_ns",
+            "transfer_copy_done_ns",
+            "transfer_stage_done_ns",
             "publish_done_ns",
+            "receive_metadata_ns",
+            "receive_setup_done_ns",
+            "receive_transfer_done_ns",
+            "receive_materialize_start_ns",
+            "receive_materialize_done_ns",
+            "receive_embedding_ns",
             "preprocess_request_start_ns",
             "image_load_start_ns",
             "image_load_done_ns",
@@ -165,6 +201,10 @@ class MultiModalEmbeddingData:
             "image_load_start_ns",
             "processor_submit_ns",
             "processor_start_ns",
+            "transfer_enqueue_ns",
+            "transfer_start_ns",
+            "receive_metadata_ns",
+            "receive_materialize_start_ns",
         }
         timing = {}
         for field in fields:

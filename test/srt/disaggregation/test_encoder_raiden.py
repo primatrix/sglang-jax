@@ -347,6 +347,8 @@ def test_raiden_receive_poll_does_not_wait_for_device_copy(monkeypatch):
     pool._active = {transfer_id: 0}
     pool._abandoned = set()
     pool._materializing = {}
+    pool._received_ns = {transfer_id: time.time_ns()}
+    pool._materialize_start_ns = {}
     pool._received = {transfer_id}
     pool._failed = set()
 
@@ -362,5 +364,10 @@ def test_raiden_receive_poll_does_not_wait_for_device_copy(monkeypatch):
 
     pending_copy.ready = True
     assert session.poll() is pending_copy
+    assert session.timing_meta["receive_transfer_done_ns"] > 0
+    assert (
+        session.timing_meta["receive_materialize_done_ns"]
+        >= session.timing_meta["receive_materialize_start_ns"]
+    )
     assert pool._active == {}
     assert pool._free == [0]

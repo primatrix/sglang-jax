@@ -6,7 +6,7 @@ import logging
 import math
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from typing import Any
 
@@ -176,13 +176,17 @@ class RaidenReceiveSession:
     lane_id: int
     pool: RaidenReceivePool
     _done: bool = False
+    timing_meta: dict[str, int] = field(default_factory=dict)
 
     def poll(self) -> jax.Array | None:
         if self._done:
             return None
         result = self.pool.poll(self.transfer_id, self.lane_id)
         self._done = result is not None
-        return result
+        if result is None:
+            return None
+        embedding, self.timing_meta = result
+        return embedding
 
     def close(self) -> None:
         if not self._done:
@@ -225,6 +229,8 @@ class RaidenReceivePool:
         self._active: dict[str, int] = {}
         self._abandoned: set[str] = set()
         self._materializing: dict[str, jax.Array] = {}
+        self._received_ns: dict[str, int] = {}
+        self._materialize_start_ns: dict[str, int] = {}
         self._received: set[str] = set()
         self._failed: set[str] = set()
         self._closed = False
@@ -269,7 +275,11 @@ class RaidenReceivePool:
             pool=self,
         )
 
-    def poll(self, transfer_id: str, lane_id: int) -> jax.Array | None:
+    def poll(
+        self,
+        transfer_id: str,
+        lane_id: int,
+    ) -> tuple[jax.Array, dict[str, int]] | None:
         with self._condition:
             if self._active.get(transfer_id) != lane_id:
                 raise RuntimeError(f"Raiden embedding lane changed: {transfer_id}")
@@ -293,6 +303,7 @@ class RaidenReceivePool:
                         may_alias=False,
                     )
                     self._materializing[transfer_id] = embedding
+                    self._materialize_start_ns[transfer_id] = time.time_ns()
 
                 if not embedding.is_ready():
                     return None
@@ -301,8 +312,16 @@ class RaidenReceivePool:
                 raise
 
             # The source slot cannot be reused until the copy is complete.
+            timing = {
+                "receive_transfer_done_ns": self._received_ns.get(
+                    transfer_id,
+                    self._materialize_start_ns[transfer_id],
+                ),
+                "receive_materialize_start_ns": self._materialize_start_ns[transfer_id],
+                "receive_materialize_done_ns": time.time_ns(),
+            }
             self._release_locked(transfer_id)
-            return embedding
+            return embedding, timing
 
     def abandon(self, transfer_id: str) -> None:
         with self._condition:
@@ -329,6 +348,9 @@ class RaidenReceivePool:
 
     def _drain_stats_locked(self) -> None:
         _, received, failed = self._transfer.poll_stats()
+        received_ns = time.time_ns()
+        for transfer_id in received:
+            self._received_ns.setdefault(transfer_id, received_ns)
         self._received.update(received)
         self._failed.update(failed)
 
@@ -336,6 +358,8 @@ class RaidenReceivePool:
         lane_id = self._active.pop(transfer_id, None)
         self._abandoned.discard(transfer_id)
         self._materializing.pop(transfer_id, None)
+        self._received_ns.pop(transfer_id, None)
+        self._materialize_start_ns.pop(transfer_id, None)
         self._received.discard(transfer_id)
         self._failed.discard(transfer_id)
         if lane_id is not None:

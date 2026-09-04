@@ -272,6 +272,8 @@ class ServerArgs:
     encoder_register_urls: list[str] | None = None
     encoder_transfer_backend: str = "raiden"
     encoder_transfer_pool_size: int = 32
+    encoder_transfer_queue_size: int = 2
+    encoder_receiver_background_progress: bool = True
     encoder_control_timeout_seconds: float = 300.0
     encoder_request_timeout_seconds: float = 300.0
     encoder_max_batch_size: int = 8
@@ -621,6 +623,8 @@ class ServerArgs:
             )
         if encoder_disaggregation and self.encoder_transfer_pool_size <= 0:
             raise ValueError("--encoder-transfer-pool-size must be positive")
+        if encoder_disaggregation and self.encoder_transfer_queue_size <= 0:
+            raise ValueError("--encoder-transfer-queue-size must be positive")
         if encoder_disaggregation and self.encoder_request_timeout_seconds <= 0:
             raise ValueError(
                 "Raiden encoder transfer requires a positive " "--encoder-request-timeout-seconds"
@@ -1747,6 +1751,24 @@ class ServerArgs:
             type=int,
             default=ServerArgs.encoder_transfer_pool_size,
             help="Number of request slots in each registered Encoder transfer pool.",
+        )
+        parser.add_argument(
+            "--encoder-transfer-queue-size",
+            type=int,
+            default=ServerArgs.encoder_transfer_queue_size,
+            help=(
+                "Encoder request-transfer queue capacity. A shallow queue preserves "
+                "backpressure without blocking the ViT worker on every request."
+            ),
+        )
+        parser.add_argument(
+            "--encoder-receiver-background-progress",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.encoder_receiver_background_progress,
+            help=(
+                "Continuously advance encoder metadata, Raiden receive, and device "
+                "materialization on one dedicated progress thread."
+            ),
         )
         parser.add_argument(
             "--encoder-control-timeout-seconds",

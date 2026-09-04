@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from types import SimpleNamespace
 
+import jax.numpy as jnp
+
 from sgl_jax.srt.disaggregation.encoder import client as encoder_client
+from sgl_jax.srt.disaggregation.encoder.embedding_data import EmbeddingData
 from sgl_jax.srt.managers.io_struct import GenerateReqInput
 from sgl_jax.srt.multimodal.common.modality_enum import Modality
 
@@ -25,6 +29,7 @@ def test_encoder_metadata_router_routes_shared_socket_messages():
     router = object.__new__(encoder_client.EncoderMetadataRouter)
     router._receiver = FakeReceiver()
     router._queues = {}
+    router._lock = threading.Lock()
     router.register(("request-0",))
     router.register(("request-1",))
 
@@ -160,6 +165,94 @@ def test_encoder_receiver_registers_parts_concurrently(monkeypatch):
         ("http://encoder-0/scheduler_receive_url", "request_local_part_0"),
         ("http://encoder-1/scheduler_receive_url", "request_local_part_1"),
     ]
+
+
+def test_encoder_receiver_background_progresses_without_scheduler_poll(monkeypatch):
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            pass
+
+    class FakeClient:
+        def __init__(self, *, timeout) -> None:
+            del timeout
+
+        def post(self, _url, *, json):
+            del json
+            return FakeResponse()
+
+        def close(self) -> None:
+            pass
+
+    class FakeSession:
+        timing_meta = {}
+
+        def poll(self):
+            return jnp.zeros((2, 3))
+
+        def close(self) -> None:
+            pass
+
+    class FakeBackend:
+        def start(self, _data):
+            return FakeSession()
+
+        def close(self) -> None:
+            pass
+
+    class FakeRouter:
+        instance = None
+
+        def __init__(self, host) -> None:
+            self.receive_url = f"{host}:1234"
+            self.message = None
+            self.closed = False
+            FakeRouter.instance = self
+
+        def register(self, _req_ids) -> None:
+            pass
+
+        def poll(self, _req_ids):
+            message, self.message = self.message, None
+            return message
+
+        def unregister(self, _req_ids) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(encoder_client.httpx, "Client", FakeClient)
+    monkeypatch.setattr(encoder_client, "EncoderMetadataRouter", FakeRouter)
+    client = encoder_client.EncoderClient(
+        host="127.0.0.1",
+        backend=FakeBackend(),
+        encoder_urls=["http://encoder"],
+        registration_workers=1,
+        registration_timeout=12.0,
+        background_progress=True,
+    )
+    pending = client.receive(
+        SimpleNamespace(rid="request-0", encoder_urls=None, num_items_assigned=None)
+    )
+    FakeRouter.instance.message = EmbeddingData(
+        req_id="request-0",
+        num_parts=1,
+        part_idx=0,
+        grid_dim=None,
+        modality=Modality.IMAGE,
+    )
+    result = None
+    deadline = time.monotonic() + 1
+    while result is None and time.monotonic() < deadline:
+        result = pending.poll()
+        time.sleep(0.001)
+    try:
+        assert result is not None
+        assert result["embeddings"][Modality.IMAGE].shape == (2, 3)
+    finally:
+        pending.close()
+        client.close()
+    assert FakeRouter.instance.closed
 
 
 def test_encoder_request_dispatcher_reuses_http_client(monkeypatch):

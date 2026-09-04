@@ -33,9 +33,21 @@ def test_language_logs_encoder_pipeline_timing(caplog):
         "preprocess_done_ns": 4_000_000,
         "encode_start_ns": 5_000_000,
         "encode_done_ns": 7_000_000,
-        "publish_done_ns": 8_000_000,
-        "receive_done_ns": 10_000_000,
-        "language_ready_ns": 12_000_000,
+        "transfer_enqueue_ns": 8_000_000,
+        "transfer_start_ns": 10_000_000,
+        "transfer_pool_ready_ns": 11_000_000,
+        "transfer_reserve_done_ns": 12_000_000,
+        "transfer_copy_done_ns": 14_000_000,
+        "transfer_stage_done_ns": 14_000_000,
+        "publish_done_ns": 15_000_000,
+        "receive_metadata_ns": 16_000_000,
+        "receive_setup_done_ns": 17_000_000,
+        "receive_transfer_done_ns": 18_000_000,
+        "receive_materialize_start_ns": 19_000_000,
+        "receive_materialize_done_ns": 20_000_000,
+        "receive_embedding_ns": 21_000_000,
+        "receive_done_ns": 22_000_000,
+        "language_ready_ns": 24_000_000,
     }
     req = SimpleNamespace(rid="request-0", encoder_timing=timing)
     batch = SimpleNamespace(
@@ -55,10 +67,25 @@ def test_language_logs_encoder_pipeline_timing(caplog):
     assert "encode_wait_ms=1.000" in caplog.text
     assert "encode_compute_ms=2.000" in caplog.text
     assert "encode_ms=5.000" in caplog.text
-    assert "publish_ms=1.000" in caplog.text
-    assert "receive_ms=2.000" in caplog.text
+    assert "publish_ms=8.000" in caplog.text
+    assert "transfer_handoff_ms=1.000" in caplog.text
+    assert "transfer_queue_ms=2.000" in caplog.text
+    assert "transfer_pool_setup_ms=1.000" in caplog.text
+    assert "transfer_reserve_ms=1.000" in caplog.text
+    assert "transfer_copy_ms=2.000" in caplog.text
+    assert "transfer_stage_ms=4.000" in caplog.text
+    assert "transfer_register_ms=1.000" in caplog.text
+    assert "transfer_total_ms=7.000" in caplog.text
+    assert "receive_ms=7.000" in caplog.text
     assert "mm_prepare_ms=2.000" in caplog.text
-    assert "receive_mm_ms=4.000" in caplog.text
+    assert "receive_metadata_wait_ms=1.000" in caplog.text
+    assert "receive_setup_ms=1.000" in caplog.text
+    assert "receive_transfer_wait_ms=1.000" in caplog.text
+    assert "receive_completion_to_materialize_ms=1.000" in caplog.text
+    assert "receive_materialize_wait_ms=1.000" in caplog.text
+    assert "receive_poll_delay_ms=1.000" in caplog.text
+    assert "receive_finalize_ms=1.000" in caplog.text
+    assert "receive_mm_ms=9.000" in caplog.text
     assert timing["language_prefill_start_ns"] >= timing["language_ready_ns"]
     assert timing["language_prefill_done_ns"] >= timing["language_prefill_start_ns"]
 
@@ -79,7 +106,19 @@ def test_language_logs_encoder_preprocess_timing(caplog):
         "preprocess_done_ns": 19_000_000,
         "encode_start_ns": 20_000_000,
         "encode_done_ns": 21_000_000,
+        "transfer_enqueue_ns": 21_100_000,
+        "transfer_start_ns": 21_200_000,
+        "transfer_pool_ready_ns": 21_300_000,
+        "transfer_reserve_done_ns": 21_400_000,
+        "transfer_copy_done_ns": 21_800_000,
+        "transfer_stage_done_ns": 21_800_000,
         "publish_done_ns": 22_000_000,
+        "receive_metadata_ns": 22_100_000,
+        "receive_setup_done_ns": 22_200_000,
+        "receive_transfer_done_ns": 22_300_000,
+        "receive_materialize_start_ns": 22_300_000,
+        "receive_materialize_done_ns": 22_400_000,
+        "receive_embedding_ns": 22_500_000,
         "receive_done_ns": 23_000_000,
         "language_ready_ns": 24_000_000,
     }

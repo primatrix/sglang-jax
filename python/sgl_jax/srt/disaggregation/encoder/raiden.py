@@ -109,10 +109,13 @@ class RaidenEncoderServerTransfer:
                     timeout_s=self._timeout_s,
                 )
                 self._pools.append(pool)
+            pool_ready_ns = time.time_ns()
 
         try:
             slot = pool.reserve_sync(transfer_id)
+            reserve_done_ns = time.time_ns()
             pool.copy_sync(embedding, slot)
+            copy_done_ns = time.time_ns()
         except BaseException:
             with self._lock:
                 self._pending.pop(transfer_id, None)
@@ -121,13 +124,27 @@ class RaidenEncoderServerTransfer:
 
         with self._lock:
             self._pending[transfer_id] = pool
-        return transfer_id, pool, slot
+        return (
+            transfer_id,
+            pool,
+            slot,
+            pool_ready_ns,
+            reserve_done_ns,
+            copy_done_ns,
+        )
 
     async def stage(self, transfer_id: str, embedding: jax.Array) -> Any:
         return await asyncio.to_thread(self.stage_sync, transfer_id, embedding)
 
     def publish_sync(self, staged_transfer: Any) -> dict[str, Any]:
-        transfer_id, pool, slot = staged_transfer
+        (
+            transfer_id,
+            pool,
+            slot,
+            pool_ready_ns,
+            reserve_done_ns,
+            copy_done_ns,
+        ) = staged_transfer
         try:
             metadata = pool.register(transfer_id, slot)
         except BaseException:
@@ -141,6 +158,11 @@ class RaidenEncoderServerTransfer:
             self._pending.pop(transfer_id, None)
             self._active[transfer_id] = pool
         self._log_inflight_event("start", transfer_id)
+        metadata.update(
+            transfer_pool_ready_ns=pool_ready_ns,
+            transfer_reserve_done_ns=reserve_done_ns,
+            transfer_copy_done_ns=copy_done_ns,
+        )
         return metadata
 
     async def publish(self, staged_transfer: Any) -> dict[str, Any]:
