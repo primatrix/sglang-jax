@@ -42,6 +42,7 @@ class Variant:
     encoder_cpu_threads: int | None = None
     language_cpu_threads: int | None = None
     dispatch_connection_limit: int = 256
+    dispatch_orjson: bool = True
 
 
 def _variants() -> list[Variant]:
@@ -73,6 +74,8 @@ def _variants() -> list[Variant]:
         replace(base, name="language-cpu-threads-4", language_cpu_threads=4),
         replace(base, name="dispatch-connections-20", dispatch_connection_limit=20),
         replace(base, name="dispatch-connections-256", dispatch_connection_limit=256),
+        replace(base, name="encoder-cpu4-json", encoder_cpu_threads=4, dispatch_orjson=False),
+        replace(base, name="encoder-cpu4-orjson", encoder_cpu_threads=4, dispatch_orjson=True),
         replace(
             base,
             name="encoder-cpu4-dispatch-20",
@@ -139,6 +142,7 @@ def _server_env(
     chips: str,
     cpu_threads: int | None,
     dispatch_connection_limit: int | None = None,
+    dispatch_orjson: bool | None = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
     env.update(
@@ -156,6 +160,8 @@ def _server_env(
         env["MKL_NUM_THREADS"] = str(cpu_threads)
     if dispatch_connection_limit is not None:
         env["SGLANG_ENCODER_DISPATCH_CONNECTION_LIMIT"] = str(dispatch_connection_limit)
+    if dispatch_orjson is not None:
+        env["SGLANG_ENCODER_DISPATCH_ORJSON"] = "1" if dispatch_orjson else "0"
     return env
 
 
@@ -275,6 +281,7 @@ def _start_servers(
             "2,3",
             variant.language_cpu_threads,
             variant.dispatch_connection_limit,
+            variant.dispatch_orjson,
         ),
         stdout=language_log,
         stderr=subprocess.STDOUT,

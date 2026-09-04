@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 from types import SimpleNamespace
@@ -331,9 +332,11 @@ def test_encoder_request_dispatcher_reuses_http_client(monkeypatch):
             self.closed = False
             clients.append(self)
 
-        async def post(self, url, *, json):
-            assert isinstance(json["dispatch_start_ns"], int)
-            posts.append((url, json["req_id"]))
+        async def post(self, url, *, content, headers):
+            assert headers == {"content-type": "application/json"}
+            payload = json.loads(content)
+            assert isinstance(payload["dispatch_start_ns"], int)
+            posts.append((url, payload["req_id"]))
             return FakeResponse()
 
         async def aclose(self) -> None:
