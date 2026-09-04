@@ -531,33 +531,31 @@ class EncoderClient:
 
                 with self._pending_lock:
                     pending = list(self._pending.items())
-                completed = []
                 for key, request in pending:
                     if request.progress(
                         metadata_drained=metadata_drained,
                         backend_progressed=backend_progressed,
                     ):
-                        completed.append((key, request))
-                if completed:
-                    with self._pending_lock:
-                        for key, request in completed:
-                            if self._pending.get(key) is request:
-                                self._pending.pop(key, None)
-                                self._preparing[key] = request
-                    for key, request in completed:
-                        with self._pending_lock:
-                            if self._preparing.get(key) is not request:
-                                continue
-                        executor = self._prepare_executor
-                        assert executor is not None
-                        future = executor.submit(request.prepare_result)
-                        future.add_done_callback(
-                            lambda completed_future, key=key, request=request: (
-                                self._publish_completed(key, request, completed_future)
-                            )
-                        )
+                        self._submit_prepare(key, request)
         finally:
             self._router.close()
+
+    def _submit_prepare(self, key: int, request: PendingEncoderRequest) -> None:
+        with self._pending_lock:
+            if self._pending.get(key) is not request:
+                return
+            self._pending.pop(key)
+            self._preparing[key] = request
+        executor = self._prepare_executor
+        assert executor is not None
+        future = executor.submit(request.prepare_result)
+        future.add_done_callback(
+            lambda completed_future: self._publish_completed(
+                key,
+                request,
+                completed_future,
+            )
+        )
 
     def _publish_completed(
         self,
