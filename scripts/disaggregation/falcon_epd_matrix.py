@@ -73,6 +73,18 @@ def _variants() -> list[Variant]:
         replace(base, name="language-cpu-threads-4", language_cpu_threads=4),
         replace(base, name="dispatch-connections-20", dispatch_connection_limit=20),
         replace(base, name="dispatch-connections-256", dispatch_connection_limit=256),
+        replace(
+            base,
+            name="encoder-cpu4-dispatch-20",
+            encoder_cpu_threads=4,
+            dispatch_connection_limit=20,
+        ),
+        replace(
+            base,
+            name="encoder-cpu4-dispatch-256",
+            encoder_cpu_threads=4,
+            dispatch_connection_limit=256,
+        ),
         Variant(
             "wide-pipeline",
             pool_size=128,
