@@ -342,6 +342,13 @@ def test_runtime_builds_transfer_metadata_without_scheduler_state():
     assert data.dispatch_start_ns == 1
     assert data.processor_start_ns == 2
     assert data.encode_done_ns <= data.publish_done_ns
+    assert data.runtime_encode_return_ns <= data.runtime_postprocess_done_ns
+    assert data.runtime_postprocess_duration_ns >= 0
+    assert data.runtime_metadata_prepare_duration_ns >= 0
+    assert data.runtime_embedding_data_duration_ns >= 0
+    assert data.runtime_result_pack_duration_ns >= 0
+    assert data.runtime_postprocess_residual_ns >= 0
+    assert data.runtime_timing_attach_duration_ns >= 0
 
 
 def test_runtime_uses_event_loop_for_preprocess_and_threads_for_data_path():

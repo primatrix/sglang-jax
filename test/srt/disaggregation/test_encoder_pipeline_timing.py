@@ -35,6 +35,21 @@ def test_language_logs_encoder_pipeline_timing(caplog):
         "transfer_reserve_done_ns": 4_500_000,
         "encode_start_ns": 5_000_000,
         "encode_done_ns": 7_000_000,
+        "encode_server_postprocess_done_ns": 7_040_000,
+        "encode_server_postprocess_duration_ns": 40_000,
+        "encode_token_count_duration_ns": 5_000,
+        "encode_embedding_slice_duration_ns": 10_000,
+        "encode_metadata_duration_ns": 12_000,
+        "encode_result_pack_duration_ns": 8_000,
+        "encode_server_postprocess_residual_ns": 5_000,
+        "runtime_encode_return_ns": 7_050_000,
+        "runtime_postprocess_done_ns": 7_090_000,
+        "runtime_postprocess_duration_ns": 40_000,
+        "runtime_metadata_prepare_duration_ns": 10_000,
+        "runtime_embedding_data_duration_ns": 15_000,
+        "runtime_result_pack_duration_ns": 5_000,
+        "runtime_postprocess_residual_ns": 10_000,
+        "runtime_timing_attach_duration_ns": 5_000,
         "transfer_copy_start_ns": 7_100_000,
         "transfer_pool_ready_ns": 7_200_000,
         "transfer_copy_submit_ns": 7_400_000,
@@ -80,6 +95,21 @@ def test_language_logs_encoder_pipeline_timing(caplog):
     assert "encode_dispatch_ms=0.500" in caplog.text
     assert "encode_compute_ms=2.000" in caplog.text
     assert "encode_ms=5.000" in caplog.text
+    assert "post_vit_to_copy_ms=0.100" in caplog.text
+    assert "server_postprocess_ms=0.040" in caplog.text
+    assert "server_token_count_ms=0.005" in caplog.text
+    assert "server_embedding_slice_ms=0.010" in caplog.text
+    assert "server_metadata_ms=0.012" in caplog.text
+    assert "server_result_pack_ms=0.008" in caplog.text
+    assert "server_postprocess_residual_ms=0.005" in caplog.text
+    assert "runtime_return_gap_ms=0.010" in caplog.text
+    assert "runtime_postprocess_ms=0.040" in caplog.text
+    assert "runtime_metadata_prepare_ms=0.010" in caplog.text
+    assert "runtime_embedding_data_ms=0.015" in caplog.text
+    assert "runtime_result_pack_ms=0.005" in caplog.text
+    assert "runtime_postprocess_residual_ms=0.010" in caplog.text
+    assert "runtime_timing_attach_ms=0.005" in caplog.text
+    assert "runtime_to_copy_gap_ms=0.010" in caplog.text
     assert "publish_ms=8.000" in caplog.text
     assert "transfer_handoff_ms=1.000" in caplog.text
     assert "transfer_queue_ms=2.000" in caplog.text
@@ -127,6 +157,21 @@ def test_language_logs_encoder_preprocess_timing(caplog):
         "transfer_reserve_done_ns": 19_200_000,
         "encode_start_ns": 20_000_000,
         "encode_done_ns": 21_000_000,
+        "encode_server_postprocess_done_ns": 21_005_000,
+        "encode_server_postprocess_duration_ns": 5_000,
+        "encode_token_count_duration_ns": 1_000,
+        "encode_embedding_slice_duration_ns": 1_000,
+        "encode_metadata_duration_ns": 1_000,
+        "encode_result_pack_duration_ns": 1_000,
+        "encode_server_postprocess_residual_ns": 1_000,
+        "runtime_encode_return_ns": 21_006_000,
+        "runtime_postprocess_done_ns": 21_015_000,
+        "runtime_postprocess_duration_ns": 9_000,
+        "runtime_metadata_prepare_duration_ns": 2_000,
+        "runtime_embedding_data_duration_ns": 3_000,
+        "runtime_result_pack_duration_ns": 1_000,
+        "runtime_postprocess_residual_ns": 3_000,
+        "runtime_timing_attach_duration_ns": 2_000,
         "transfer_copy_start_ns": 21_020_000,
         "transfer_pool_ready_ns": 21_030_000,
         "transfer_copy_submit_ns": 21_050_000,

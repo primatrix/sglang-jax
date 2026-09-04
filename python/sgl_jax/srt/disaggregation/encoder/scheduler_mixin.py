@@ -23,6 +23,10 @@ def _elapsed_ms(timing: dict[str, int], start: str, end: str) -> float:
     return max(0, timing[end] - timing[start]) / 1_000_000
 
 
+def _duration_ms(timing: dict[str, int], field: str) -> float:
+    return max(0, timing[field]) / 1_000_000
+
+
 class SchedulerDisaggregationEncoderMixin:
     """Encoder-disaggregation request handling for the language scheduler."""
 
@@ -211,6 +215,21 @@ class SchedulerDisaggregationEncoderMixin:
                     "preprocess_done_ns",
                     "encode_start_ns",
                     "encode_done_ns",
+                    "encode_server_postprocess_done_ns",
+                    "encode_server_postprocess_duration_ns",
+                    "encode_token_count_duration_ns",
+                    "encode_embedding_slice_duration_ns",
+                    "encode_metadata_duration_ns",
+                    "encode_result_pack_duration_ns",
+                    "encode_server_postprocess_residual_ns",
+                    "runtime_encode_return_ns",
+                    "runtime_postprocess_done_ns",
+                    "runtime_postprocess_duration_ns",
+                    "runtime_metadata_prepare_duration_ns",
+                    "runtime_embedding_data_duration_ns",
+                    "runtime_result_pack_duration_ns",
+                    "runtime_postprocess_residual_ns",
+                    "runtime_timing_attach_duration_ns",
                     "transfer_enqueue_ns",
                     "transfer_start_ns",
                     "transfer_reserve_start_ns",
@@ -264,6 +283,14 @@ class SchedulerDisaggregationEncoderMixin:
                     "encode_stage_wait_ms=%.3f preprocess_ms=%.3f "
                     "encode_wait_ms=%.3f transfer_reserve_ms=%.3f "
                     "encode_dispatch_ms=%.3f encode_compute_ms=%.3f encode_ms=%.3f "
+                    "post_vit_to_copy_ms=%.3f server_postprocess_ms=%.3f "
+                    "server_token_count_ms=%.3f server_embedding_slice_ms=%.3f "
+                    "server_metadata_ms=%.3f server_result_pack_ms=%.3f "
+                    "server_postprocess_residual_ms=%.3f runtime_return_gap_ms=%.3f "
+                    "runtime_postprocess_ms=%.3f runtime_metadata_prepare_ms=%.3f "
+                    "runtime_embedding_data_ms=%.3f runtime_result_pack_ms=%.3f "
+                    "runtime_postprocess_residual_ms=%.3f "
+                    "runtime_timing_attach_ms=%.3f runtime_to_copy_gap_ms=%.3f "
                     "publish_ms=%.3f transfer_handoff_ms=%.3f "
                     "transfer_queue_ms=%.3f transfer_pool_setup_ms=%.3f "
                     "transfer_copy_submit_ms=%.3f transfer_copy_wait_ms=%.3f "
@@ -326,6 +353,29 @@ class SchedulerDisaggregationEncoderMixin:
                     _elapsed_ms(timing, "transfer_reserve_done_ns", "encode_start_ns"),
                     _elapsed_ms(timing, "encode_start_ns", "encode_done_ns"),
                     _elapsed_ms(timing, "dequeue_ns", "encode_done_ns"),
+                    _elapsed_ms(timing, "encode_done_ns", "transfer_copy_start_ns"),
+                    _duration_ms(timing, "encode_server_postprocess_duration_ns"),
+                    _duration_ms(timing, "encode_token_count_duration_ns"),
+                    _duration_ms(timing, "encode_embedding_slice_duration_ns"),
+                    _duration_ms(timing, "encode_metadata_duration_ns"),
+                    _duration_ms(timing, "encode_result_pack_duration_ns"),
+                    _duration_ms(timing, "encode_server_postprocess_residual_ns"),
+                    _elapsed_ms(
+                        timing,
+                        "encode_server_postprocess_done_ns",
+                        "runtime_encode_return_ns",
+                    ),
+                    _duration_ms(timing, "runtime_postprocess_duration_ns"),
+                    _duration_ms(timing, "runtime_metadata_prepare_duration_ns"),
+                    _duration_ms(timing, "runtime_embedding_data_duration_ns"),
+                    _duration_ms(timing, "runtime_result_pack_duration_ns"),
+                    _duration_ms(timing, "runtime_postprocess_residual_ns"),
+                    _duration_ms(timing, "runtime_timing_attach_duration_ns"),
+                    _elapsed_ms(
+                        timing,
+                        "runtime_postprocess_done_ns",
+                        "transfer_copy_start_ns",
+                    ),
                     _elapsed_ms(timing, "encode_done_ns", "publish_done_ns"),
                     _elapsed_ms(timing, "encode_done_ns", "transfer_enqueue_ns"),
                     _elapsed_ms(timing, "transfer_enqueue_ns", "transfer_start_ns"),

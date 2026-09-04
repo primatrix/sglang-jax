@@ -41,7 +41,6 @@ class _TransferJob:
 
 
 class EncoderRuntime:
-
     def __init__(
         self,
         encoder: Any,
@@ -157,21 +156,30 @@ class EncoderRuntime:
         try:
             reservations = self._transfer.reserve_batch_sync(transfer_ids)
             results = self._encoder.encode(job.prepared)
+            runtime_encode_return_ns = time.time_ns()
+            runtime_postprocess_start_ns = time.perf_counter_ns()
             if len(results) != len(job.requests):
                 raise RuntimeError(
-                    f"encoder returned {len(results)} results for " f"{len(job.requests)} requests"
+                    f"encoder returned {len(results)} results for {len(job.requests)} requests"
                 )
             encode_done_ns = time.time_ns()
             transfer_jobs = []
             embeddings = []
+            metadata_prepare_duration_ns = 0
+            embedding_data_duration_ns = 0
+            result_pack_duration_ns = 0
             for index, (request, transfer_id, (embedding, metadata)) in enumerate(
                 zip(job.requests, transfer_ids, results)
             ):
+                phase_start_ns = time.perf_counter_ns()
                 metadata = dict(metadata)
                 encoder_timing = {
                     "encode_done_ns": encode_done_ns,
                     **metadata.pop("_encoder_timing", {}),
                 }
+                metadata_prepare_duration_ns += time.perf_counter_ns() - phase_start_ns
+
+                phase_start_ns = time.perf_counter_ns()
                 data = EmbeddingData(
                     req_id=request["req_id"],
                     num_parts=request.get("num_parts", 1),
@@ -185,8 +193,38 @@ class EncoderRuntime:
                     **metadata,
                     **encoder_timing,
                 )
+                embedding_data_duration_ns += time.perf_counter_ns() - phase_start_ns
+
+                phase_start_ns = time.perf_counter_ns()
                 embeddings.append(embedding)
                 transfer_jobs.append((index, transfer_id, data))
+                result_pack_duration_ns += time.perf_counter_ns() - phase_start_ns
+
+            runtime_postprocess_done_ns = time.time_ns()
+            runtime_postprocess_duration_ns = time.perf_counter_ns() - runtime_postprocess_start_ns
+            runtime_postprocess_residual_ns = max(
+                0,
+                runtime_postprocess_duration_ns
+                - metadata_prepare_duration_ns
+                - embedding_data_duration_ns
+                - result_pack_duration_ns,
+            )
+            runtime_timing = {
+                "runtime_encode_return_ns": runtime_encode_return_ns,
+                "runtime_postprocess_done_ns": runtime_postprocess_done_ns,
+                "runtime_postprocess_duration_ns": runtime_postprocess_duration_ns,
+                "runtime_metadata_prepare_duration_ns": metadata_prepare_duration_ns,
+                "runtime_embedding_data_duration_ns": embedding_data_duration_ns,
+                "runtime_result_pack_duration_ns": result_pack_duration_ns,
+                "runtime_postprocess_residual_ns": runtime_postprocess_residual_ns,
+            }
+            timing_attach_start_ns = time.perf_counter_ns()
+            for _, _, data in transfer_jobs:
+                for key, value in runtime_timing.items():
+                    setattr(data, key, value)
+            timing_attach_duration_ns = time.perf_counter_ns() - timing_attach_start_ns
+            for _, _, data in transfer_jobs:
+                data.runtime_timing_attach_duration_ns = timing_attach_duration_ns
 
             copy_start_ns = time.time_ns()
             for _, _, data in transfer_jobs:

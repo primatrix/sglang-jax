@@ -54,6 +54,14 @@ def test_encode_discards_jax_bucket_padding():
     np.testing.assert_array_equal(results[0][0], output[:2])
     np.testing.assert_array_equal(results[1][0], output[2:5])
     assert [embedding.shape for embedding, _ in results] == [(2, 2), (3, 2)]
+    timing = results[0][1]["_encoder_timing"]
+    assert timing["encode_server_postprocess_done_ns"] >= timing["encode_done_ns"]
+    assert timing["encode_server_postprocess_duration_ns"] >= 0
+    assert timing["encode_token_count_duration_ns"] >= 0
+    assert timing["encode_embedding_slice_duration_ns"] >= 0
+    assert timing["encode_metadata_duration_ns"] >= 0
+    assert timing["encode_result_pack_duration_ns"] >= 0
+    assert timing["encode_server_postprocess_residual_ns"] >= 0
 
 
 def test_encode_rejects_incomplete_output():
