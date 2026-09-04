@@ -86,6 +86,20 @@ def _variants() -> list[Variant]:
             encoder_cpu_threads=4,
             encoder_orjson_request=True,
         ),
+        replace(
+            base,
+            name="encoder-cpu4-wire-json",
+            encoder_cpu_threads=4,
+            dispatch_orjson=False,
+            encoder_orjson_request=False,
+        ),
+        replace(
+            base,
+            name="encoder-cpu4-wire-orjson",
+            encoder_cpu_threads=4,
+            dispatch_orjson=True,
+            encoder_orjson_request=True,
+        ),
         Variant(
             "wide-pipeline",
             pool_size=128,
