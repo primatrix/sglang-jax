@@ -420,7 +420,7 @@ class EncoderClient:
         self._completed_ready = threading.Event()
         self._prepare_executor = (
             ThreadPoolExecutor(
-                max_workers=min(4, max(1, registration_workers)),
+                max_workers=min(2, max(1, registration_workers)),
                 thread_name_prefix="encoder-language-prepare",
             )
             if self._background_progress
