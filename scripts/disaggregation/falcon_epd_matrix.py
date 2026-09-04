@@ -86,15 +86,25 @@ def _wait_for_url(url: str, process: subprocess.Popen, timeout_s: float) -> None
     raise TimeoutError(f"server did not become ready: {url}")
 
 
-def _stop(process: subprocess.Popen | None) -> None:
-    if process is None or process.poll() is not None:
-        return
-    process.send_signal(signal.SIGTERM)
-    try:
-        process.wait(timeout=30)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=10)
+def _signal_process_group(process: subprocess.Popen, sig: int) -> None:
+    if process.poll() is None:
+        os.killpg(process.pid, sig)
+
+
+def _stop_many(*processes: subprocess.Popen | None) -> None:
+    """Stop all server trees concurrently so teardown is paid only once."""
+    running = [process for process in processes if process is not None and process.poll() is None]
+    for process in running:
+        _signal_process_group(process, signal.SIGTERM)
+    deadline = time.monotonic() + 10
+    while running and time.monotonic() < deadline:
+        running = [process for process in running if process.poll() is None]
+        if running:
+            time.sleep(0.1)
+    for process in running:
+        _signal_process_group(process, signal.SIGKILL)
+    for process in running:
+        process.wait(timeout=5)
 
 
 def _server_env(code_root: Path, cache_dir: Path, chips: str) -> dict[str, str]:
@@ -183,6 +193,7 @@ def _start_servers(
         env=_server_env(args.code_root, args.cache_root / "encoder", "0,1"),
         stdout=encoder_log,
         stderr=subprocess.STDOUT,
+        start_new_session=True,
     )
     language = None
     try:
@@ -222,6 +233,7 @@ def _start_servers(
             env=_server_env(args.code_root, args.cache_root / "language", "2,3"),
             stdout=language_log,
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
         _wait_for_url(
             "http://127.0.0.1:30000/get_server_info",
@@ -230,8 +242,7 @@ def _start_servers(
         )
         return encoder, language, encoder_log, language_log
     except BaseException:
-        _stop(language)
-        _stop(encoder)
+        _stop_many(language, encoder)
         encoder_log.close()
         language_log.close()
         raise
@@ -328,12 +339,12 @@ def _run_variant(
             "error": f"{type(exc).__name__}: {exc}",
         }
     finally:
-        _stop(language)
-        _stop(encoder)
+        _stop_many(language, encoder)
         if encoder_log is not None:
             encoder_log.close()
         if language_log is not None:
             language_log.close()
+    summary["wall_s"] = time.monotonic() - started
     (variant_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     return summary
 
@@ -347,10 +358,10 @@ def main() -> int:
     parser.add_argument("--download-dir", required=True)
     parser.add_argument("--host-ip", required=True)
     parser.add_argument("--source-commit", required=True)
-    parser.add_argument("--prompts", type=int, default=512)
+    parser.add_argument("--prompts", type=int, default=384)
     parser.add_argument("--concurrency", type=int, default=64)
-    parser.add_argument("--prewarm", type=int, default=128)
-    parser.add_argument("--first-prewarm", type=int, default=256)
+    parser.add_argument("--prewarm", type=int, default=32)
+    parser.add_argument("--first-prewarm", type=int, default=128)
     parser.add_argument("--startup-timeout", type=float, default=900)
     parser.add_argument("--only", nargs="*", default=None)
     args = parser.parse_args()
@@ -374,7 +385,7 @@ def main() -> int:
             matrix.flush()
             print(
                 f"EPD-MATRIX-DONE index={index} variant={variant.name} "
-                f"status={summary['status']}",
+                f"status={summary['status']} wall_s={summary['wall_s']:.1f}",
                 flush=True,
             )
             succeeded += summary["status"] == "SUCCEEDED"
