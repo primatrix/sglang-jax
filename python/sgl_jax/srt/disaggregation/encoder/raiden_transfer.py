@@ -408,6 +408,15 @@ class RaidenReceiverBackend:
             remote_block_ids,
         )
 
+    def progress(self) -> bool:
+        """Refresh the shared Raiden completion queue once per client tick."""
+        with self._pool_lock:
+            pool = self._pool
+        if pool is None:
+            return False
+        pool.progress()
+        return True
+
     def close(self) -> None:
         with self._pool_lock:
             self._closed = True

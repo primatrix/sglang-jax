@@ -329,7 +329,8 @@ class SimReceiveSession:
     pool: _SimReceivePool
     _done: bool = False
 
-    def poll(self) -> jax.Array | None:
+    def poll(self, *, refresh_backend: bool = True) -> jax.Array | None:
+        del refresh_backend
         if self._done or time.monotonic_ns() < self.ready_at_ns:
             return None
         self.pool.complete(self.transfer_id, self.lane_id)

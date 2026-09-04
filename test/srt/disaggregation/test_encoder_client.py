@@ -34,8 +34,9 @@ def test_encoder_metadata_router_routes_shared_socket_messages():
     router.register(("request-0",))
     router.register(("request-1",))
 
-    assert router.poll(("request-0",)).req_id == "request-0"
-    assert router.poll(("request-1",)).req_id == "request-1"
+    router.drain()
+    assert router.pop(("request-0",)).req_id == "request-0"
+    assert router.pop(("request-1",)).req_id == "request-1"
 
 
 def test_encoder_receiver_reuses_http_client(monkeypatch):
@@ -187,15 +188,22 @@ def test_encoder_receiver_background_progresses_without_scheduler_poll(monkeypat
     class FakeSession:
         timing_meta = {}
 
-        def poll(self):
+        def poll(self, *, refresh_backend=True):
+            assert not refresh_backend
             return jnp.zeros((2, 3))
 
         def close(self) -> None:
             pass
 
     class FakeBackend:
+        progress_calls = 0
+
         def start(self, _data):
             return FakeSession()
+
+        def progress(self):
+            self.progress_calls += 1
+            return True
 
         def close(self) -> None:
             pass
@@ -213,6 +221,13 @@ def test_encoder_receiver_background_progresses_without_scheduler_poll(monkeypat
             pass
 
         def poll(self, _req_ids):
+            message, self.message = self.message, None
+            return message
+
+        def drain(self):
+            pass
+
+        def pop(self, _req_ids):
             message, self.message = self.message, None
             return message
 
@@ -256,6 +271,7 @@ def test_encoder_receiver_background_progresses_without_scheduler_poll(monkeypat
     try:
         assert result is not None
         assert pending.done
+        assert client._backend.progress_calls > 0
         assert request.prepared_shape == (2, 3)
         assert prepare_threads[0].startswith("encoder-language-prepare")
         assert result["embeddings"][Modality.IMAGE].shape == (2, 3)

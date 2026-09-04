@@ -128,7 +128,7 @@ def validate_encoder_response(
 
 
 class EncoderReceiveSession(Protocol):
-    def poll(self) -> jax.Array | None: ...
+    def poll(self, *, refresh_backend: bool = True) -> jax.Array | None: ...
 
     def close(self) -> None: ...
 
@@ -146,14 +146,14 @@ class DeferredReceiveSession:
     def _mark_setup_done(self, _future: Future[EncoderReceiveSession]) -> None:
         self._setup_done_ns = time.time_ns()
 
-    def poll(self) -> jax.Array | None:
+    def poll(self, *, refresh_backend: bool = True) -> jax.Array | None:
         if self._closed:
             return None
         if self._session is None:
             if not self._future.done():
                 return None
             self._session = self._future.result()
-        return self._session.poll()
+        return self._session.poll(refresh_backend=refresh_backend)
 
     @property
     def timing_meta(self) -> dict[str, int]:
@@ -205,7 +205,7 @@ class EncoderMetadataRouter:
                 raise ValueError(f"duplicate encoder metadata routes: {req_ids}")
             self._queues.update((req_id, deque()) for req_id in req_ids)
 
-    def poll(self, req_ids: tuple[str, ...]) -> Any | None:
+    def drain(self) -> None:
         while True:
             try:
                 data = self._receiver.recv_pyobj(zmq.NOBLOCK)
@@ -216,12 +216,17 @@ class EncoderMetadataRouter:
                 if queue is not None:
                     queue.append(data)
 
+    def pop(self, req_ids: tuple[str, ...]) -> Any | None:
         with self._lock:
             for req_id in req_ids:
                 queue = self._queues.get(req_id)
                 if queue:
                     return queue.popleft()
         return None
+
+    def poll(self, req_ids: tuple[str, ...]) -> Any | None:
+        self.drain()
+        return self.pop(req_ids)
 
     def unregister(self, req_ids: tuple[str, ...]) -> None:
         with self._lock:
@@ -268,13 +273,21 @@ class PendingEncoderRequest:
                 raise self._error
             return self._result
 
-    def progress(self) -> bool:
+    def progress(
+        self,
+        *,
+        metadata_drained: bool = False,
+        backend_progressed: bool = False,
+    ) -> bool:
         """Advance one request from a dedicated receiver progress thread."""
         with self._lock:
             if self._closed or self._result is not None or self._error is not None:
                 return True
             try:
-                self._result = self._poll_once()
+                self._result = self._poll_once(
+                    metadata_drained=metadata_drained,
+                    backend_progressed=backend_progressed,
+                )
             except Exception as exc:
                 self._error = exc
             return self._result is not None or self._error is not None
@@ -300,7 +313,12 @@ class PendingEncoderRequest:
                 self._error = error
             self._done.set()
 
-    def _poll_once(self) -> dict[str, Any] | None:
+    def _poll_once(
+        self,
+        *,
+        metadata_drained: bool = False,
+        backend_progressed: bool = False,
+    ) -> dict[str, Any] | None:
         for future in self.registration_futures:
             if future.done():
                 future.result()  # error re-thrown to the scheduler main thread
@@ -308,7 +326,11 @@ class PendingEncoderRequest:
         # The ZMQ message contains EmbeddingData metadata (part identity,
         # shape/dtype, and transfer endpoints); the backend pulls the actual
         # embedding separately through the receiver backend.
-        data = self.metadata_router.poll(self.metadata_req_ids)
+        data = (
+            self.metadata_router.pop(self.metadata_req_ids)
+            if metadata_drained
+            else self.metadata_router.poll(self.metadata_req_ids)
+        )
         if data is not None:
             data.receive_metadata_ns = time.time_ns()
             validate_encoder_response(
@@ -324,7 +346,9 @@ class PendingEncoderRequest:
             self.sessions[data.part_idx] = (data, self.backend.start(data))
 
         for part_idx, (part_data, session) in list(self.sessions.items()):
-            embedding = session.poll()
+            embedding = (
+                session.poll(refresh_backend=False) if backend_progressed else session.poll()
+            )
             if embedding is None:
                 continue
             for key, value in getattr(session, "timing_meta", {}).items():
@@ -490,11 +514,29 @@ class EncoderClient:
         self._progress_ready.set()
         try:
             while not self._progress_stop.wait(self._progress_interval_s):
+                metadata_drained = False
+                try:
+                    self._router.drain()
+                    metadata_drained = True
+                except Exception:
+                    logger.exception("Failed to drain encoder metadata")
+
+                backend_progressed = False
+                progress_backend = getattr(self._backend, "progress", None)
+                if progress_backend is not None:
+                    try:
+                        backend_progressed = bool(progress_backend())
+                    except Exception:
+                        logger.exception("Failed to progress encoder receive backend")
+
                 with self._pending_lock:
                     pending = list(self._pending.items())
                 completed = []
                 for key, request in pending:
-                    if request.progress():
+                    if request.progress(
+                        metadata_drained=metadata_drained,
+                        backend_progressed=backend_progressed,
+                    ):
                         completed.append((key, request))
                 if completed:
                     with self._pending_lock:

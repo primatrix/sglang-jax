@@ -487,3 +487,23 @@ def test_raiden_receive_poll_does_not_wait_for_device_copy(monkeypatch):
     )
     assert pool._active == {}
     assert pool._free == [0]
+
+
+def test_raiden_receive_pool_can_reuse_one_shared_stats_refresh():
+    pool = object.__new__(RaidenReceivePool)
+    pool._transfer = mock.Mock()
+    pool._transfer.poll_stats.return_value = ([], [], [])
+    pool._condition = threading.Condition()
+    pool._closed = False
+    pool._active = {"part-0:embedding": 0, "part-1:embedding": 1}
+    pool._abandoned = set()
+    pool._materializing = {}
+    pool._received_ns = {}
+    pool._received = set()
+    pool._failed = set()
+
+    pool.progress()
+    assert pool.poll("part-0:embedding", 0, refresh_backend=False) is None
+    assert pool.poll("part-1:embedding", 1, refresh_backend=False) is None
+
+    pool._transfer.poll_stats.assert_called_once_with()

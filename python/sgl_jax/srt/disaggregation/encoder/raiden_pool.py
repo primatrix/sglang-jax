@@ -122,10 +122,14 @@ class RaidenReceiveSession:
     _done: bool = False
     timing_meta: dict[str, int] = field(default_factory=dict)
 
-    def poll(self) -> jax.Array | None:
+    def poll(self, *, refresh_backend: bool = True) -> jax.Array | None:
         if self._done:
             return None
-        result = self.pool.poll(self.transfer_id, self.lane_id)
+        result = self.pool.poll(
+            self.transfer_id,
+            self.lane_id,
+            refresh_backend=refresh_backend,
+        )
         self._done = result is not None
         if result is None:
             return None
@@ -224,11 +228,14 @@ class RaidenReceivePool:
         self,
         transfer_id: str,
         lane_id: int,
+        *,
+        refresh_backend: bool = True,
     ) -> tuple[jax.Array, dict[str, int]] | None:
         with self._condition:
             if self._active.get(transfer_id) != lane_id:
                 raise RuntimeError(f"Raiden embedding lane changed: {transfer_id}")
-            self._drain_stats_locked()
+            if refresh_backend:
+                self._drain_stats_locked()
             if transfer_id in self._failed:
                 self._release_locked(transfer_id)
                 raise RuntimeError(f"Raiden embedding transfer failed: {transfer_id}")
@@ -268,6 +275,14 @@ class RaidenReceivePool:
             self._release_locked(transfer_id)
             return embedding, timing
 
+    def progress(self) -> None:
+        """Refresh shared transfer state once for all receive sessions."""
+        with self._condition:
+            if self._closed:
+                return
+            self._drain_stats_locked()
+            self._release_abandoned_locked()
+
     def abandon(self, transfer_id: str) -> None:
         with self._condition:
             if transfer_id not in self._active:
@@ -280,6 +295,9 @@ class RaidenReceivePool:
 
     def _reap_abandoned_locked(self) -> None:
         self._drain_stats_locked()
+        self._release_abandoned_locked()
+
+    def _release_abandoned_locked(self) -> None:
         for transfer_id in list(self._abandoned):
             if transfer_id not in self._active:
                 continue
