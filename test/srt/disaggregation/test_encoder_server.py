@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from sgl_jax.srt.disaggregation.encoder.server import MMEncoder
+from sgl_jax.srt.disaggregation.encoder.transfer_layout import PackedEmbeddingSlice
 from sgl_jax.srt.multimodal.common.modality_enum import (
     Modality,
     MultimodalDataItem,
@@ -51,8 +52,12 @@ def test_encode_discards_jax_bucket_padding():
 
     results = asyncio.run(_run_encoder(encoder, [{"modality": "IMAGE"}, {"modality": "IMAGE"}]))
 
-    np.testing.assert_array_equal(results[0][0], output[:2])
-    np.testing.assert_array_equal(results[1][0], output[2:5])
+    first, second = results[0][0], results[1][0]
+    assert isinstance(first, PackedEmbeddingSlice)
+    assert isinstance(second, PackedEmbeddingSlice)
+    assert first.packed is second.packed
+    assert (first.offset, first.rows) == (0, 2)
+    assert (second.offset, second.rows) == (2, 3)
     assert [embedding.shape for embedding, _ in results] == [(2, 2), (3, 2)]
     timing = results[0][1]["_encoder_timing"]
     assert timing["encode_server_postprocess_done_ns"] >= timing["encode_done_ns"]

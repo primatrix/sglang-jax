@@ -30,6 +30,7 @@ from sgl_jax.srt.disaggregation.encoder.raiden_transfer import (
     RaidenEncoderServerTransfer,
     RaidenReceiverBackend,
 )
+from sgl_jax.srt.disaggregation.encoder.transfer_layout import PackedEmbeddingSlice
 from sgl_jax.srt.managers.io_struct import TokenizedGenerateReqInput
 from sgl_jax.srt.multimodal.common.modality_enum import Modality
 
@@ -153,6 +154,27 @@ def test_raiden_server_uses_donated_request_pool(monkeypatch):
     assert first_metadata["transfer_id"] != second_metadata["transfer_id"]
     assert first_metadata["transfer_address"] == session.endpoints
     assert first_metadata["transfer_host"] == "10.0.0.4"
+    transfer.close()
+
+
+def test_raiden_server_fuses_packed_slices_into_reserved_slots(monkeypatch):
+    _FakeRaidenWrapper.instances.clear()
+    monkeypatch.setattr(
+        "sgl_jax.srt.disaggregation.encoder.raiden_transfer.RaidenTransferWrapper",
+        _FakeRaidenWrapper,
+    )
+    transfer = RaidenEncoderServerTransfer("10.0.0.4", pool_size=2)
+    packed = jnp.arange(24, dtype=jnp.float32).reshape(8, 3)
+    embeddings = [PackedEmbeddingSlice(packed, offset, 2, 2, (8,)) for offset in (0, 2)]
+    reservations = transfer.reserve_batch_sync(["part-0:embedding", "part-1:embedding"])
+
+    staged = transfer.stage_batch_sync(reservations, embeddings)
+    staged[0].ready.block_until_ready()
+
+    assert staged[0].ready is staged[1].ready
+    buffer = transfer._pool._buffer.reshape(2, 2, -1)
+    np.testing.assert_array_equal(buffer[0, :, :3], packed[:2])
+    np.testing.assert_array_equal(buffer[1, :, :3], packed[2:4])
     transfer.close()
 
 

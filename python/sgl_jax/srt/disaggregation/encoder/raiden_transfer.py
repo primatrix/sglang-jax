@@ -21,6 +21,7 @@ from sgl_jax.srt.disaggregation.encoder.raiden_pool import (
     RaidenReceiveSession,
     RaidenSendPool,
 )
+from sgl_jax.srt.disaggregation.encoder.transfer_layout import PackedEmbeddingSlice
 from sgl_jax.srt.disaggregation.raiden_transfer.wrapper import RaidenTransferWrapper
 
 logger = logging.getLogger(__name__)
@@ -151,7 +152,7 @@ class RaidenEncoderServerTransfer:
     def stage_batch_sync(
         self,
         reservations: list[_Reservation],
-        embeddings: list[jax.Array],
+        embeddings: list[jax.Array | PackedEmbeddingSlice],
     ) -> list[_StagedTransfer]:
         if len(reservations) != len(embeddings):
             raise ValueError("Raiden reservation and embedding counts differ")
@@ -199,14 +200,18 @@ class RaidenEncoderServerTransfer:
 
         staged = []
         try:
-            for reservation, embedding in zip(reservations, embeddings):
-                ready = pool.copy_async(embedding, reservation.slot)
+            readies = pool.copy_batch_async(
+                embeddings,
+                [reservation.slot for reservation in reservations],
+            )
+            copy_submit_ns = time.time_ns()
+            for reservation, ready in zip(reservations, readies):
                 staged.append(
                     _StagedTransfer(
                         reservation,
                         ready,
                         pool_ready_ns,
-                        time.time_ns(),
+                        copy_submit_ns,
                     )
                 )
         except BaseException:
