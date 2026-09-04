@@ -27,6 +27,12 @@ def _duration_ms(timing: dict[str, int], field: str) -> float:
     return max(0, timing[field]) / 1_000_000
 
 
+def _overlap_ms(timing: dict[str, int], first: tuple[str, str], second: tuple[str, str]) -> float:
+    start = max(timing[first[0]], timing[second[0]])
+    end = min(timing[first[1]], timing[second[1]])
+    return max(0, end - start) / 1_000_000
+
+
 class SchedulerDisaggregationEncoderMixin:
     """Encoder-disaggregation request handling for the language scheduler."""
 
@@ -281,6 +287,7 @@ class SchedulerDisaggregationEncoderMixin:
                     "transfer_copy_done_ns",
                     "transfer_register_start_ns",
                     "transfer_register_done_ns",
+                    "transfer_publish_ready_ns",
                     "transfer_stage_done_ns",
                     "publish_done_ns",
                     "receive_metadata_ns",
@@ -314,7 +321,8 @@ class SchedulerDisaggregationEncoderMixin:
                     "transfer_reserve_done_ns=%d transfer_copy_start_ns=%d "
                     "transfer_copy_submit_ns=%d "
                     "transfer_copy_done_ns=%d transfer_register_start_ns=%d "
-                    "transfer_register_done_ns=%d transfer_stage_done_ns=%d "
+                    "transfer_register_done_ns=%d transfer_publish_ready_ns=%d "
+                    "transfer_stage_done_ns=%d "
                     "publish_done_ns=%d receive_done_ns=%d "
                     "receive_metadata_ns=%d receive_setup_done_ns=%d "
                     "receive_transfer_done_ns=%d receive_materialize_start_ns=%d "
@@ -342,7 +350,8 @@ class SchedulerDisaggregationEncoderMixin:
                     "transfer_queue_ms=%.3f transfer_pool_setup_ms=%.3f "
                     "transfer_copy_submit_ms=%.3f transfer_copy_wait_ms=%.3f "
                     "transfer_worker_wait_ms=%.3f transfer_post_copy_queue_ms=%.3f "
-                    "transfer_register_ms=%.3f transfer_publish_finalize_ms=%.3f "
+                    "transfer_register_ms=%.3f transfer_copy_register_overlap_ms=%.3f "
+                    "transfer_publish_finalize_ms=%.3f "
                     "transfer_total_ms=%.3f receive_ms=%.3f mm_prepare_ms=%.3f "
                     "receive_metadata_wait_ms=%.3f receive_setup_ms=%.3f "
                     "receive_transfer_wait_ms=%.3f "
@@ -373,6 +382,7 @@ class SchedulerDisaggregationEncoderMixin:
                     timing["transfer_copy_done_ns"],
                     timing["transfer_register_start_ns"],
                     timing["transfer_register_done_ns"],
+                    timing["transfer_publish_ready_ns"],
                     timing["transfer_stage_done_ns"],
                     timing["publish_done_ns"],
                     timing["receive_done_ns"],
@@ -448,7 +458,12 @@ class SchedulerDisaggregationEncoderMixin:
                         "transfer_register_start_ns",
                         "transfer_register_done_ns",
                     ),
-                    _elapsed_ms(timing, "transfer_register_done_ns", "publish_done_ns"),
+                    _overlap_ms(
+                        timing,
+                        ("transfer_copy_submit_ns", "transfer_copy_done_ns"),
+                        ("transfer_register_start_ns", "transfer_register_done_ns"),
+                    ),
+                    _elapsed_ms(timing, "transfer_publish_ready_ns", "publish_done_ns"),
                     _elapsed_ms(timing, "transfer_copy_start_ns", "publish_done_ns"),
                     _elapsed_ms(timing, "publish_done_ns", "receive_done_ns"),
                     _elapsed_ms(timing, "receive_done_ns", "language_ready_ns"),

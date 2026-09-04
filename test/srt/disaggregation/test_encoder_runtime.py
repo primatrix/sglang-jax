@@ -586,6 +586,42 @@ def test_runtime_publishes_requests_independently_across_receivers():
     ]
 
 
+def test_runtime_uses_backend_batch_publish_when_available():
+    class BatchTransfer(_FakeTransfer):
+        def __init__(self):
+            super().__init__()
+            self.batch_threads = []
+
+        def publish_batch_sync(self, staged_transfers):
+            self.batch_threads.append(threading.current_thread().name)
+            return [self.publish_sync(staged_transfer) for staged_transfer in staged_transfers]
+
+    def encode(requests):
+        return [(jnp.zeros((1, 2)), {}) for _ in requests]
+
+    async def run():
+        transfer = BatchTransfer()
+        runtime = EncoderRuntime(_TestEncoder(encode), transfer)
+        try:
+            results = await _collect(
+                runtime,
+                [
+                    {"req_id": "request-0", "modality": "IMAGE"},
+                    {"req_id": "request-1", "modality": "IMAGE"},
+                ],
+            )
+            return transfer, results
+        finally:
+            await runtime.stop()
+
+    transfer, results = asyncio.run(run())
+    assert transfer.batch_threads == ["sgl-jax-encoder-transfer"]
+    assert [result.transfer_id for _, result in results] == [
+        "request-0:0:embedding",
+        "request-1:0:embedding",
+    ]
+
+
 def test_server_reuses_metadata_sender_socket():
     class FakeSocket:
         def __init__(self):

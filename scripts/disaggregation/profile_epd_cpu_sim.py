@@ -279,6 +279,7 @@ def _summarize_encoder_pipeline(log_path: Path, *, start_ns: int, end_ns: int) -
         "transfer_worker_wait_ms",
         "transfer_post_copy_queue_ms",
         "transfer_register_ms",
+        "transfer_copy_register_overlap_ms",
         "transfer_publish_finalize_ms",
         "transfer_total_ms",
         "receive_ms",

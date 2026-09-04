@@ -252,6 +252,7 @@ class SimEncoderServerTransfer:
             "transfer_copy_done_ns": copy_done_ns,
             "transfer_register_start_ns": register_start_ns,
             "transfer_register_done_ns": register_done_ns,
+            "transfer_publish_ready_ns": max(copy_done_ns, register_done_ns),
         }
 
     def _reap_completed(self) -> None:

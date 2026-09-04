@@ -416,6 +416,87 @@ class RaidenEncoderServerTransfer:
                 self._release_locked(transfer_id)
             raise
 
+        return self._transfer_metadata(
+            staged_transfer,
+            transfer_uuid,
+            copy_done_ns=copy_done_ns,
+            register_start_ns=register_start_ns,
+            register_done_ns=register_done_ns,
+        )
+
+    def publish_batch_sync(
+        self,
+        staged_transfers: list[_StagedTransfer],
+    ) -> list[dict[str, Any]]:
+        """Overlap source registration with the in-flight packed pool write."""
+        if not staged_transfers:
+            return []
+        registrations = []
+        try:
+            for staged_transfer in staged_transfers:
+                reservation = staged_transfer.reservation
+                transfer_id = reservation.transfer_id
+                slot = reservation.slot
+                register_start_ns = time.time_ns()
+                with self._lock:
+                    if transfer_id not in self._pending or self._slots.get(transfer_id) != slot:
+                        raise RuntimeError(f"Raiden reservation was cancelled: {transfer_id}")
+                    self._pending.remove(transfer_id)
+                    self._active.add(transfer_id)
+                transfer_uuid = _uuid_to_int(transfer_id)
+                if not self._raiden.register_read(transfer_id, transfer_uuid, [slot]):
+                    raise RuntimeError(f"Raiden rejected encoder transfer {transfer_id!r}")
+                registrations.append(
+                    (staged_transfer, transfer_uuid, register_start_ns, time.time_ns())
+                )
+
+            copy_done_by_group: dict[int, int] = {}
+            metadata = []
+            for (
+                staged_transfer,
+                transfer_uuid,
+                register_start_ns,
+                register_done_ns,
+            ) in registrations:
+                ready_group = staged_transfer.ready_group
+                if ready_group is None:
+                    if not staged_transfer.ready.is_ready():
+                        staged_transfer.ready.block_until_ready()
+                    copy_done_ns = time.time_ns()
+                else:
+                    group_key = id(ready_group)
+                    copy_done_ns = copy_done_by_group.get(group_key, 0)
+                    if not copy_done_ns:
+                        copy_done_ns = ready_group.wait()
+                        copy_done_by_group[group_key] = copy_done_ns
+                metadata.append(
+                    self._transfer_metadata(
+                        staged_transfer,
+                        transfer_uuid,
+                        copy_done_ns=copy_done_ns,
+                        register_start_ns=register_start_ns,
+                        register_done_ns=register_done_ns,
+                    )
+                )
+            return metadata
+        except BaseException:
+            with self._lock:
+                for staged_transfer in staged_transfers:
+                    self._release_locked(staged_transfer.reservation.transfer_id)
+            raise
+
+    def _transfer_metadata(
+        self,
+        staged_transfer: _StagedTransfer,
+        transfer_uuid: int,
+        *,
+        copy_done_ns: int,
+        register_start_ns: int,
+        register_done_ns: int,
+    ) -> dict[str, Any]:
+        reservation = staged_transfer.reservation
+        transfer_id = reservation.transfer_id
+        slot = reservation.slot
         metadata = {
             "transfer_id": transfer_id,
             "transfer_uuid": transfer_uuid,
@@ -432,6 +513,7 @@ class RaidenEncoderServerTransfer:
             transfer_copy_done_ns=copy_done_ns,
             transfer_register_start_ns=register_start_ns,
             transfer_register_done_ns=register_done_ns,
+            transfer_publish_ready_ns=max(copy_done_ns, register_done_ns),
         )
         return metadata
 

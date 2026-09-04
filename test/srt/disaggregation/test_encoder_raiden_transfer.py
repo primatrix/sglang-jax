@@ -171,7 +171,7 @@ def test_raiden_server_writes_packed_batch_directly_into_pool(monkeypatch):
     packed = jnp.arange(24, dtype=jnp.float32).reshape(8, 3)
 
     staged = transfer.stage_packed_batch_sync(reservations, packed, (2, 2, 2))
-    metadata = [transfer.publish_sync(item) for item in staged]
+    metadata = transfer.publish_batch_sync(staged)
 
     assert isinstance(transfer._pool, RaidenSendPool)
     buffer = np.asarray(transfer._pool.buffer).reshape(4, 2, -1)
@@ -185,6 +185,58 @@ def test_raiden_server_writes_packed_batch_directly_into_pool(monkeypatch):
     )
     assert len(transfer._pool._packed_copies) == 1
     assert next(iter(transfer._pool._packed_copies))[-1] is True
+    transfer.close()
+
+
+def test_raiden_batch_registers_while_packed_copy_is_inflight(monkeypatch):
+    class PendingReady:
+        def __init__(self):
+            self.done = threading.Event()
+
+        def block_until_ready(self):
+            assert self.done.wait(1)
+
+        def is_ready(self):
+            return self.done.is_set()
+
+    _FakeRaidenWrapper.instances.clear()
+    monkeypatch.setattr(
+        "sgl_jax.srt.disaggregation.encoder.raiden_transfer.RaidenTransferWrapper",
+        _FakeRaidenWrapper,
+    )
+    ready = PendingReady()
+    monkeypatch.setattr(
+        RaidenSendPool,
+        "copy_packed_batch_async",
+        lambda *_args, **_kwargs: (ready, ready),
+    )
+    executable: Future[object] = Future()
+    executable.set_result(object())
+    transfer = RaidenEncoderServerTransfer("10.0.0.4", pool_size=2)
+    monkeypatch.setattr(transfer, "_packed_executable", lambda *_args, **_kwargs: executable)
+    reservations = transfer.reserve_batch_sync(["part-0:embedding", "part-1:embedding"])
+    staged = transfer.stage_packed_batch_sync(
+        reservations,
+        jnp.arange(12, dtype=jnp.float32).reshape(4, 3),
+        (2, 2),
+    )
+    published = threading.Event()
+
+    def publish():
+        transfer.publish_batch_sync(staged)
+        published.set()
+
+    thread = threading.Thread(target=publish)
+    thread.start()
+    deadline = time.monotonic() + 1
+    while len(_FakeRaidenWrapper.instances[0].registrations) < 2:
+        assert time.monotonic() < deadline
+        time.sleep(0.001)
+    assert not published.is_set()
+
+    ready.done.set()
+    assert published.wait(1)
+    thread.join()
     transfer.close()
 
 

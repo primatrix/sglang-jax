@@ -40,6 +40,11 @@ class _TransferJob:
     data: EmbeddingData
 
 
+@dataclass(slots=True)
+class _TransferBatchJob:
+    jobs: list[_TransferJob]
+
+
 class EncoderRuntime:
     def __init__(
         self,
@@ -54,7 +59,7 @@ class EncoderRuntime:
         self._encode_queue: queue.Queue[_EncodeJob | object] = queue.Queue(depth)
         # Pool reservations provide backpressure. This queue carries only small
         # ready tickets, so it does not need a second capacity limit.
-        self._transfer_queue: queue.SimpleQueue[_TransferJob | object] = queue.SimpleQueue()
+        self._transfer_queue: queue.SimpleQueue[_TransferBatchJob | object] = queue.SimpleQueue()
         self._start_lock = threading.Lock()
         self._started = False
         self._accepting = True
@@ -273,19 +278,23 @@ class EncoderRuntime:
                 )
             if len(staged_transfers) != len(transfer_jobs):
                 raise RuntimeError("transfer returned an incomplete staged batch")
+            queued_jobs = []
+            transfer_enqueue_ns = time.time_ns()
             for (index, transfer_id, data), staged_transfer in zip(
                 transfer_jobs,
                 staged_transfers,
             ):
-                transfer_job = _TransferJob(
-                    job,
-                    index,
-                    transfer_id,
-                    staged_transfer,
-                    data,
+                data.transfer_enqueue_ns = transfer_enqueue_ns
+                queued_jobs.append(
+                    _TransferJob(
+                        job,
+                        index,
+                        transfer_id,
+                        staged_transfer,
+                        data,
+                    )
                 )
-                transfer_job.data.transfer_enqueue_ns = time.time_ns()
-                self._transfer_queue.put(transfer_job)
+            self._transfer_queue.put(_TransferBatchJob(queued_jobs))
         except Exception as exc:
             if reservations is not None:
                 self._transfer.cancel_batch(reservations)
@@ -296,57 +305,70 @@ class EncoderRuntime:
             item = self._transfer_queue.get()
             if item is _STOP:
                 return
-            assert isinstance(item, _TransferJob)
-            self._run_transfer(item)
+            assert isinstance(item, _TransferBatchJob)
+            self._run_transfer_batch(item)
+
+    def _run_transfer_batch(self, batch: _TransferBatchJob) -> None:
+        publish_batch = getattr(self._transfer, "publish_batch_sync", None)
+        if not callable(publish_batch):
+            for job in batch.jobs:
+                self._run_transfer(job)
+            return
+
+        transfer_start_ns = time.time_ns()
+        for job in batch.jobs:
+            job.data.transfer_start_ns = transfer_start_ns
+        try:
+            metadata = publish_batch([job.staged_transfer for job in batch.jobs])
+            if len(metadata) != len(batch.jobs):
+                raise RuntimeError("transfer returned incomplete batch metadata")
+        except Exception as exc:
+            for job in batch.jobs:
+                self._transfer.release(job.transfer_id)
+                job.batch.deliver(job.index, exc)
+            return
+        for job, item_metadata in zip(batch.jobs, metadata):
+            self._complete_transfer(job, item_metadata)
 
     def _run_transfer(self, job: _TransferJob) -> None:
         try:
             job.data.transfer_start_ns = time.time_ns()
             transfer_metadata = self._transfer.publish_sync(job.staged_transfer)
-            for key, value in transfer_metadata.items():
-                setattr(job.data, key, value)
-            # Backends may optionally expose the pool/reservation/copy split.
-            # Keep a complete timing chain for simpler downstream aggregation.
-            job.data.transfer_pool_ready_ns = (
-                getattr(
-                    job.data,
-                    "transfer_pool_ready_ns",
-                    None,
-                )
-                or job.data.transfer_start_ns
-            )
-            job.data.transfer_reserve_done_ns = (
-                getattr(
-                    job.data,
-                    "transfer_reserve_done_ns",
-                    None,
-                )
-                or job.data.transfer_pool_ready_ns
-            )
-            job.data.transfer_copy_done_ns = (
-                getattr(
-                    job.data,
-                    "transfer_copy_done_ns",
-                    None,
-                )
-                or job.data.transfer_stage_done_ns
-                or job.data.transfer_start_ns
-            )
-            job.data.transfer_register_start_ns = (
-                getattr(job.data, "transfer_register_start_ns", None)
-                or job.data.transfer_copy_done_ns
-            )
-            job.data.transfer_register_done_ns = (
-                getattr(job.data, "transfer_register_done_ns", None) or time.time_ns()
-            )
-            job.data.transfer_stage_done_ns = job.data.transfer_copy_done_ns
-            job.data.transfer_id = str(transfer_metadata.get("transfer_id", job.transfer_id))
-            job.data.publish_done_ns = time.time_ns()
         except Exception as exc:
             self._transfer.release(job.transfer_id)
             job.batch.deliver(job.index, exc)
         else:
-            job.batch.deliver(job.index, job.data)
+            self._complete_transfer(job, transfer_metadata)
+
+    def _complete_transfer(self, job: _TransferJob, transfer_metadata: dict[str, Any]) -> None:
+        for key, value in transfer_metadata.items():
+            setattr(job.data, key, value)
+        # Backends may optionally expose the pool/reservation/copy split.
+        # Keep a complete timing chain for simpler downstream aggregation.
+        job.data.transfer_pool_ready_ns = (
+            getattr(job.data, "transfer_pool_ready_ns", None) or job.data.transfer_start_ns
+        )
+        job.data.transfer_reserve_done_ns = (
+            getattr(job.data, "transfer_reserve_done_ns", None) or job.data.transfer_pool_ready_ns
+        )
+        job.data.transfer_copy_done_ns = (
+            getattr(job.data, "transfer_copy_done_ns", None)
+            or job.data.transfer_stage_done_ns
+            or job.data.transfer_start_ns
+        )
+        job.data.transfer_register_start_ns = (
+            getattr(job.data, "transfer_register_start_ns", None) or job.data.transfer_copy_done_ns
+        )
+        job.data.transfer_register_done_ns = (
+            getattr(job.data, "transfer_register_done_ns", None) or time.time_ns()
+        )
+        job.data.transfer_publish_ready_ns = getattr(
+            job.data, "transfer_publish_ready_ns", None
+        ) or max(job.data.transfer_copy_done_ns, job.data.transfer_register_done_ns)
+        job.data.transfer_stage_done_ns = job.data.transfer_copy_done_ns
+        job.data.transfer_id = str(transfer_metadata.get("transfer_id", job.transfer_id))
+        job.data.publish_done_ns = time.time_ns()
+        job.batch.deliver(job.index, job.data)
 
     def release(self, transfer_id: str) -> None:
         self._transfer.release(transfer_id)
