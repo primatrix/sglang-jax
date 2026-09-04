@@ -10,12 +10,8 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
-from sgl_jax.srt.disaggregation.encoder.transfer_layout import (
-    PackedEmbeddingSlice,
-    encoder_pool_block_shape,
-)
+from sgl_jax.srt.disaggregation.encoder.transfer_layout import encoder_pool_block_shape
 from sgl_jax.srt.disaggregation.raiden_transfer.wrapper import RaidenTransferWrapper
 
 logger = logging.getLogger(__name__)
@@ -35,34 +31,6 @@ def _copy_into_slot(pool: jax.Array, value: jax.Array, slot: jax.Array) -> jax.A
     padding = tuple((0, padded - size) for padded, size in zip(padded_shape, value.shape))
     block = jnp.pad(value, padding).reshape(block_shape)
     return jax.lax.dynamic_update_slice_in_dim(pool, block[None], slot, axis=0)
-
-
-@partial(jax.jit, donate_argnums=(0,), static_argnames=("rows",))
-def _copy_packed_slices_into_slots_with_token(
-    pool: jax.Array,
-    packed: jax.Array,
-    offsets: jax.Array,
-    slots: jax.Array,
-    valid: jax.Array,
-    *,
-    rows: int,
-) -> tuple[jax.Array, jax.Array]:
-    block_shape = pool.shape[1:]
-    padded_shape = (block_shape[0], math.prod(block_shape[1:]))
-    padding = (
-        (0, padded_shape[0] - rows),
-        (0, padded_shape[1] - packed.shape[1]),
-    )
-    for index in range(offsets.shape[0]):
-        value = jax.lax.dynamic_slice_in_dim(packed, offsets[index], rows, axis=0)
-        block = jnp.pad(value, padding).reshape(block_shape)[None]
-        old_block = jax.lax.dynamic_slice_in_dim(pool, slots[index], 1, axis=0)
-        block = jnp.where(valid[index], block, old_block)
-        pool = jax.lax.dynamic_update_slice_in_dim(pool, block, slots[index], axis=0)
-
-    block_size = math.prod(pool.shape[1:])
-    ready = pool.reshape(-1)[slots[0] * block_size]
-    return pool, ready
 
 
 @partial(jax.jit, donate_argnums=(0,))
@@ -86,11 +54,6 @@ def _compile_donated_copy(
         value,
         jnp.asarray(0, dtype=jnp.int32),
     ).compile()
-    _validate_donated_copy(compiled)
-    return compiled
-
-
-def _validate_donated_copy(compiled: Any) -> None:
     stats = compiled.memory_analysis()
     stats = stats if isinstance(stats, (list, tuple)) else (stats,)
     if not stats or any(
@@ -101,44 +64,7 @@ def _validate_donated_copy(compiled: Any) -> None:
         for stat in stats
     ):
         raise RuntimeError("Raiden encoder pool update did not fully alias its donated input")
-
-
-def _compile_donated_packed_copy(
-    pool: jax.Array,
-    sample: PackedEmbeddingSlice,
-    packed: jax.Array | jax.ShapeDtypeStruct,
-) -> Any:
-    max_batch_size = sample.max_batch_size
-    offsets = jax.ShapeDtypeStruct((max_batch_size,), jnp.int32)
-    slots = jax.ShapeDtypeStruct((max_batch_size,), jnp.int32)
-    valid = jax.ShapeDtypeStruct((max_batch_size,), jnp.bool_)
-    compiled = _copy_packed_slices_into_slots_with_token.lower(
-        pool,
-        packed,
-        offsets,
-        slots,
-        valid,
-        rows=sample.rows,
-    ).compile()
-    _validate_donated_copy(compiled)
     return compiled
-
-
-def _relevant_packed_capacities(sample: PackedEmbeddingSlice) -> tuple[int, ...]:
-    actual = int(sample.packed.shape[0])
-    capacities = sorted(
-        {
-            actual,
-            *(int(capacity) for capacity in sample.packed_capacities if capacity > 0),
-        }
-    )
-    relevant = {actual}
-    for batch_size in range(1, sample.max_batch_size + 1):
-        required = batch_size * sample.rows
-        capacity = next((item for item in capacities if item >= required), None)
-        if capacity is not None:
-            relevant.add(capacity)
-    return tuple(sorted(relevant))
 
 
 class RaidenSendPool:
@@ -146,7 +72,7 @@ class RaidenSendPool:
 
     def __init__(
         self,
-        sample: jax.Array | PackedEmbeddingSlice,
+        sample: jax.Array,
         *,
         capacity: int,
     ) -> None:
@@ -161,100 +87,28 @@ class RaidenSendPool:
             device=pool_sharding,
         )
         jax.block_until_ready(self._buffer)
-        self._copy = None
-        self._packed_copies: dict[int, Any] = {}
-        self._packed_max_batch_size: int | None = None
-        if isinstance(sample, PackedEmbeddingSlice):
-            self._packed_max_batch_size = sample.max_batch_size
-            for packed_capacity in _relevant_packed_capacities(sample):
-                packed = jax.ShapeDtypeStruct(
-                    (packed_capacity, sample.shape[1]),
-                    sample.dtype,
-                    sharding=sample.sharding,
-                )
-                self._packed_copies[packed_capacity] = _compile_donated_packed_copy(
-                    self._buffer,
-                    sample,
-                    packed,
-                )
-        else:
-            self._copy = _compile_donated_copy(self._buffer, sample)
+        self._copy = _compile_donated_copy(self._buffer, sample)
 
     @property
     def buffer(self) -> jax.Array:
         return self._buffer
 
-    def matches(self, value: jax.Array | PackedEmbeddingSlice) -> bool:
+    def matches(self, value: jax.Array) -> bool:
         return (
             tuple(value.shape) == self.shape
             and value.dtype == self.dtype
             and value.sharding == self.sharding
         )
 
-    def copy_async(self, value: jax.Array | PackedEmbeddingSlice, slot: int) -> jax.Array:
+    def copy_async(self, value: jax.Array, slot: int) -> jax.Array:
         if not self.matches(value):
             raise ValueError("Raiden pool contains an incompatible embedding")
-        if isinstance(value, PackedEmbeddingSlice):
-            return self.copy_batch_async([value], [slot])[0]
-        if self._copy is None:
-            raise ValueError("Raiden pool copy mode changed after initialization")
         self._buffer, ready = self._copy(
             self._buffer,
             value,
             jnp.asarray(slot, dtype=jnp.int32),
         )
         return ready
-
-    def copy_batch_async(
-        self,
-        values: list[jax.Array | PackedEmbeddingSlice],
-        slots: list[int],
-    ) -> list[jax.Array]:
-        if len(values) != len(slots):
-            raise ValueError("Raiden pool value and slot counts differ")
-        if not values:
-            return []
-        if not all(self.matches(value) for value in values):
-            raise ValueError("Raiden pool contains an incompatible embedding")
-        if not isinstance(values[0], PackedEmbeddingSlice):
-            if any(isinstance(value, PackedEmbeddingSlice) for value in values):
-                raise ValueError("Raiden pool cannot mix packed and materialized embeddings")
-            return [self.copy_async(value, slot) for value, slot in zip(values, slots)]
-
-        packed_values = [value for value in values if isinstance(value, PackedEmbeddingSlice)]
-        if len(packed_values) != len(values):
-            raise ValueError("Raiden pool cannot mix packed and materialized embeddings")
-        first = packed_values[0]
-        if (
-            self._packed_max_batch_size != first.max_batch_size
-            or len(values) > first.max_batch_size
-            or any(value.max_batch_size != first.max_batch_size for value in packed_values)
-            or any(value.packed is not first.packed for value in packed_values)
-        ):
-            raise ValueError("incompatible packed embedding batch")
-
-        packed_capacity = int(first.packed.shape[0])
-        compiled = self._packed_copies.get(packed_capacity)
-        if compiled is None:
-            compiled = _compile_donated_packed_copy(self._buffer, first, first.packed)
-            self._packed_copies[packed_capacity] = compiled
-
-        max_batch_size = first.max_batch_size
-        offsets = np.zeros(max_batch_size, dtype=np.int32)
-        slot_array = np.full(max_batch_size, slots[0], dtype=np.int32)
-        valid = np.zeros(max_batch_size, dtype=np.bool_)
-        count = len(values)
-        offsets[:count] = [value.offset for value in packed_values]
-        slot_array[:count] = slots
-        valid[:count] = True
-        self._buffer, ready = compiled(
-            self._buffer,
-            first.packed,
-            offsets,
-            slot_array,
-            valid,
-        )
-        return [ready] * count
 
     def copy_sync(self, value: jax.Array, slot: int) -> None:
         self.copy_async(value, slot).block_until_ready()

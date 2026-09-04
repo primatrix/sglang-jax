@@ -6,6 +6,7 @@ import os
 import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -29,7 +30,6 @@ from sgl_jax.srt.disaggregation.encoder.raiden_transfer import (
 from sgl_jax.srt.disaggregation.encoder.runtime import EncoderRuntime
 from sgl_jax.srt.disaggregation.encoder.scheduler import DisaggEncoderScheduler
 from sgl_jax.srt.disaggregation.encoder.sim_transfer import SimEncoderServerTransfer
-from sgl_jax.srt.disaggregation.encoder.transfer_layout import PackedEmbeddingSlice
 from sgl_jax.srt.disaggregation.host_ip import resolve_host_ip
 from sgl_jax.srt.hf_transformers_utils import (
     get_processor,
@@ -45,6 +45,22 @@ from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.server_args import ServerArgs, apply_multimodal_model_defaults
 from sgl_jax.srt.utils import configure_logger, set_uvicorn_logging_configs
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
+
+
+@partial(jax.jit, static_argnames=("token_counts",))
+def _split_packed_encoder_output(
+    packed: jax.Array,
+    *,
+    token_counts: tuple[int, ...],
+) -> tuple[jax.Array, ...]:
+    """Split one packed encoder output with one JAX dispatch per batch."""
+    offset = 0
+    embeddings = []
+    for token_count in token_counts:
+        embeddings.append(jax.lax.dynamic_slice_in_dim(packed, offset, token_count, axis=0))
+        offset += token_count
+    return tuple(embeddings)
+
 
 # Adapted for JAX from SGLang's encoder server:
 # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/disaggregation/encoder/server.py
@@ -85,8 +101,6 @@ class MMEncoder:
         self._sim_encoder_base_ms = server_args.simulate_compute_encoder_base_ms
         self._sim_encoder_ms_per_token = server_args.simulate_compute_encoder_ms_per_token
         self._log_timing = server_args.enable_request_time_stats_logging
-        self._max_batch_size = max(1, int(server_args.encoder_max_batch_size))
-        self._packed_capacities: tuple[int, ...] = ()
 
         config = self.model_config.hf_config
         config.vision_encoder_parallel = server_args.vision_encoder_parallel
@@ -115,13 +129,6 @@ class MMEncoder:
             if not server_args.disable_precompile:
                 logger.info("Precompiling multimodal encoder")
                 self.model.precompile_multimodal()
-            get_capacities = getattr(
-                self.model,
-                "get_multimodal_embedding_packed_capacities",
-                None,
-            )
-            if get_capacities is not None:
-                self._packed_capacities = tuple(map(int, get_capacities()))
 
         tokenizer_path = server_args.tokenizer_path
         tokenizer_subdir = resolve_tokenizer_subdir(server_args.model_path, tokenizer_path)
@@ -217,24 +224,7 @@ class MMEncoder:
                 embeddings.append(jax.device_put(packed[offset : offset + token_count]))
                 offset += token_count
         else:
-            offset = 0
-            max_batch_size = max(
-                len(token_counts),
-                getattr(self, "_max_batch_size", len(token_counts)),
-            )
-            packed_capacities = getattr(self, "_packed_capacities", ())
-            embeddings = []
-            for token_count in token_counts:
-                embeddings.append(
-                    PackedEmbeddingSlice(
-                        packed=packed,
-                        offset=offset,
-                        rows=token_count,
-                        max_batch_size=max_batch_size,
-                        packed_capacities=packed_capacities,
-                    )
-                )
-                offset += token_count
+            embeddings = _split_packed_encoder_output(packed, token_counts=token_counts)
         if any(
             embedding.shape[0] != token_count
             for embedding, token_count in zip(embeddings, token_counts)
