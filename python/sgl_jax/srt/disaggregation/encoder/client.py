@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 import threading
 import time
@@ -29,7 +30,10 @@ from sgl_jax.srt.managers.io_struct import (
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, flatten_nested_list
 
 logger = logging.getLogger(__name__)
-_DISPATCH_CONNECTION_LIMIT = 256
+_DISPATCH_CONNECTION_LIMIT = max(
+    1,
+    int(os.environ.get("SGLANG_ENCODER_DISPATCH_CONNECTION_LIMIT", "256")),
+)
 
 
 def create_part_req_id(req_id: str, part_idx: int) -> str:
