@@ -39,7 +39,8 @@ class Variant:
     processor_workers: int = 4
     channels: int = 4
     max_prefill_tokens: int = 8192
-    cpu_threads: int | None = None
+    encoder_cpu_threads: int | None = None
+    language_cpu_threads: int | None = None
     receiver_progress_interval_ms: float = 1.0
 
 
@@ -61,9 +62,11 @@ def _variants() -> list[Variant]:
         replace(base, name="channels-8", channels=8),
         replace(base, name="prefill-4096", max_prefill_tokens=4096),
         replace(base, name="prefill-16384", max_prefill_tokens=16384),
-        replace(base, name="cpu-threads-1", cpu_threads=1),
-        replace(base, name="cpu-threads-4", cpu_threads=4),
-        replace(base, name="cpu-threads-16", cpu_threads=16),
+        replace(base, name="cpu-threads-1", encoder_cpu_threads=1, language_cpu_threads=1),
+        replace(base, name="cpu-threads-4", encoder_cpu_threads=4, language_cpu_threads=4),
+        replace(base, name="cpu-threads-16", encoder_cpu_threads=16, language_cpu_threads=16),
+        replace(base, name="encoder-cpu-threads-4", encoder_cpu_threads=4),
+        replace(base, name="language-cpu-threads-4", language_cpu_threads=4),
         replace(base, name="receiver-tick-0.1ms", receiver_progress_interval_ms=0.1),
         replace(base, name="receiver-tick-0.25ms", receiver_progress_interval_ms=0.25),
         replace(base, name="receiver-tick-0.5ms", receiver_progress_interval_ms=0.5),
@@ -211,7 +214,7 @@ def _start_servers(
             args.code_root,
             args.cache_root / "encoder",
             "0,1",
-            variant.cpu_threads,
+            variant.encoder_cpu_threads,
         ),
         stdout=encoder_log,
         stderr=subprocess.STDOUT,
@@ -255,7 +258,7 @@ def _start_servers(
             args.code_root,
             args.cache_root / "language",
             "2,3",
-            variant.cpu_threads,
+            variant.language_cpu_threads,
         ),
         stdout=language_log,
         stderr=subprocess.STDOUT,
