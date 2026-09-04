@@ -614,6 +614,8 @@ def test_runtime_publishes_requests_independently_across_receivers():
 
 
 def test_runtime_uses_backend_batch_publish_when_available():
+    published_batches = []
+
     class BatchTransfer(_FakeTransfer):
         def __init__(self):
             super().__init__()
@@ -628,7 +630,13 @@ def test_runtime_uses_backend_batch_publish_when_available():
 
     async def run():
         transfer = BatchTransfer()
-        runtime = EncoderRuntime(_TestEncoder(encode), transfer)
+        runtime = EncoderRuntime(
+            _TestEncoder(encode),
+            transfer,
+            result_batch_publisher=lambda data: published_batches.append(
+                ([item.req_id for item in data], threading.current_thread().name)
+            ),
+        )
         try:
             results = await _collect(
                 runtime,
@@ -643,6 +651,7 @@ def test_runtime_uses_backend_batch_publish_when_available():
 
     transfer, results = asyncio.run(run())
     assert transfer.batch_threads == ["sgl-jax-encoder-transfer"]
+    assert published_batches == [(["request-0", "request-1"], "sgl-jax-encoder-transfer")]
     assert [result.transfer_id for _, result in results] == [
         "request-0:0:embedding",
         "request-1:0:embedding",
@@ -729,7 +738,7 @@ def test_server_reuses_metadata_sender_socket(monkeypatch):
             await server.register_scheduler_receiver(
                 {"req_id": data.req_id, "receive_url": "127.0.0.1:1234"}
             )
-            await server.send_to_scheduler(data.req_id, data)
+        await asyncio.to_thread(server._metadata_publisher.publish_many, [first, second])
 
         assert len(context.sockets) == 1
         assert context.sockets[0].sent == [first, second]

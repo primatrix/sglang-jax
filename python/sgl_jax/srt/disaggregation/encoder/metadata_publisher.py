@@ -15,7 +15,7 @@ _STOP = object()
 
 @dataclass(slots=True)
 class _PublishJob:
-    data: EmbeddingData
+    data: tuple[EmbeddingData, ...]
     done: Future[None]
 
 
@@ -43,11 +43,16 @@ class EncoderMetadataPublisher:
             self._condition.notify_all()
 
     def publish(self, data: EmbeddingData) -> None:
+        self.publish_many([data])
+
+    def publish_many(self, data: list[EmbeddingData]) -> None:
+        if not data:
+            return
         done: Future[None] = Future()
         with self._condition:
             if self._closed:
                 raise RuntimeError("encoder metadata publisher is closed")
-            self._jobs.put(_PublishJob(data, done))
+            self._jobs.put(_PublishJob(tuple(data), done))
         timeout = self._timeout_s
         done.result(timeout=None if timeout is None or timeout <= 0 else timeout)
 
@@ -86,14 +91,15 @@ class EncoderMetadataPublisher:
                     return
                 assert isinstance(item, _PublishJob)
                 try:
-                    address = self._wait_for_address(item.data.req_id)
-                    socket = sockets.get(address)
-                    if socket is None:
-                        socket = context.socket(zmq.PUSH)
-                        socket.setsockopt(zmq.LINGER, 1000)
-                        socket.connect(f"tcp://{address}")
-                        sockets[address] = socket
-                    socket.send_pyobj(item.data)
+                    for data in item.data:
+                        address = self._wait_for_address(data.req_id)
+                        socket = sockets.get(address)
+                        if socket is None:
+                            socket = context.socket(zmq.PUSH)
+                            socket.setsockopt(zmq.LINGER, 1000)
+                            socket.connect(f"tcp://{address}")
+                            sockets[address] = socket
+                        socket.send_pyobj(data)
                 except BaseException as exc:
                     item.done.set_exception(exc)
                 else:

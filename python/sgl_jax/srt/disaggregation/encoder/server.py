@@ -609,6 +609,7 @@ class EncoderServer:
             transfer,
             pipeline_depth=max_inflight_batches,
             result_publisher=self._metadata_publisher.publish,
+            result_batch_publisher=self._metadata_publisher.publish_many,
         )
         self.scheduler = DisaggEncoderScheduler(
             self.runtime,
