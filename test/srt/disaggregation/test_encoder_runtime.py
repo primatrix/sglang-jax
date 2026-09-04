@@ -407,46 +407,6 @@ def test_runtime_uses_event_loop_for_preprocess_and_threads_for_data_path():
     assert publish_threads == ["sgl-jax-encoder-transfer"]
 
 
-def test_runtime_publishes_each_streamed_stage_before_staging_the_next():
-    events = []
-    first_published = threading.Event()
-
-    class StreamingTransfer(_FakeTransfer):
-        def stage_iter_sync(self, reservations, embeddings):
-            for index, staged in enumerate(zip(reservations, embeddings)):
-                events.append(f"stage-{index}")
-                yield staged
-                if index == 0:
-                    assert first_published.wait(timeout=1)
-
-        def publish_sync(self, staged_transfer):
-            transfer_id, _ = staged_transfer
-            events.append(f"publish-{transfer_id.split(':', 1)[0][-1]}")
-            if transfer_id.startswith("request-0:"):
-                first_published.set()
-            return super().publish_sync(staged_transfer)
-
-    async def run() -> None:
-        runtime = EncoderRuntime(
-            _TestEncoder(lambda requests: [(jnp.zeros((1, 2)), {}) for _ in requests]),
-            StreamingTransfer(),
-        )
-        try:
-            results = await _collect(
-                runtime,
-                [
-                    {"req_id": "request-0", "modality": "IMAGE"},
-                    {"req_id": "request-1", "modality": "IMAGE"},
-                ],
-            )
-            assert all(not isinstance(result, Exception) for _, result in results)
-        finally:
-            await runtime.stop()
-
-    asyncio.run(run())
-    assert events == ["stage-0", "publish-0", "stage-1", "publish-1"]
-
-
 def test_runtime_reserves_before_forward():
     events = []
 

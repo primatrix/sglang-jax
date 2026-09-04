@@ -229,15 +229,12 @@ class EncoderRuntime:
             copy_start_ns = time.time_ns()
             for _, _, data in transfer_jobs:
                 data.transfer_copy_start_ns = copy_start_ns
-            stage_iter_sync = getattr(self._transfer, "stage_iter_sync", None)
-            if stage_iter_sync is None:
-                staged_transfers = iter(self._transfer.stage_batch_sync(reservations, embeddings))
-            else:
-                staged_transfers = stage_iter_sync(reservations, embeddings)
+            staged_transfers = self._transfer.stage_batch_sync(reservations, embeddings)
+            if len(staged_transfers) != len(transfer_jobs):
+                raise RuntimeError("transfer returned an incomplete staged batch")
             for (index, transfer_id, data), staged_transfer in zip(
                 transfer_jobs,
                 staged_transfers,
-                strict=True,
             ):
                 transfer_job = _TransferJob(
                     job,
