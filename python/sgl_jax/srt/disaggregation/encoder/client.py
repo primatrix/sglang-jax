@@ -774,9 +774,4 @@ def create_encoder_client(
             "encoder_receiver_background_progress",
             False,
         ),
-        progress_interval_s=getattr(
-            server_args,
-            "encoder_receiver_progress_interval_seconds",
-            0.001,
-        ),
     )

@@ -273,7 +273,6 @@ class ServerArgs:
     encoder_transfer_backend: str = "raiden"
     encoder_transfer_pool_size: int = 32
     encoder_receiver_background_progress: bool = True
-    encoder_receiver_progress_interval_seconds: float = 0.001
     encoder_control_timeout_seconds: float = 300.0
     encoder_request_timeout_seconds: float = 300.0
     encoder_max_batch_size: int = 8
@@ -1762,12 +1761,6 @@ class ServerArgs:
                 "Continuously advance encoder metadata, Raiden receive, and device "
                 "materialization on one dedicated progress thread."
             ),
-        )
-        parser.add_argument(
-            "--encoder-receiver-progress-interval-seconds",
-            type=float,
-            default=ServerArgs.encoder_receiver_progress_interval_seconds,
-            help="Polling interval for the encoder receiver progress thread.",
         )
         parser.add_argument(
             "--encoder-control-timeout-seconds",
