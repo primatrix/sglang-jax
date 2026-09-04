@@ -108,17 +108,71 @@ def _copy_packed_batch_into_slots(
     return updated, ready
 
 
+@partial(jax.jit, donate_argnums=(0,), static_argnames=("token_counts",))
+def _copy_contiguous_packed_batch_into_slots(
+    pool: jax.Array,
+    packed: jax.Array,
+    start_slot: jax.Array,
+    *,
+    token_counts: tuple[int, ...],
+) -> tuple[jax.Array, tuple[jax.Array, ...]]:
+    """Write one packed batch into a contiguous pool extent with one DUS."""
+
+    rows = token_counts[0]
+    batch_size = len(token_counts)
+    block_shape = pool.shape[1:]
+    padded_width = math.prod(block_shape[1:])
+    values = jax.lax.dynamic_slice_in_dim(
+        packed,
+        0,
+        batch_size * rows,
+        axis=0,
+    )
+    blocks = jnp.pad(
+        values,
+        ((0, 0), (0, padded_width - packed.shape[1])),
+    ).reshape((batch_size, *block_shape))
+    updated = jax.lax.dynamic_update_slice_in_dim(
+        pool,
+        blocks,
+        start_slot,
+        axis=0,
+    )
+    ready = tuple(
+        jax.lax.dynamic_index_in_dim(
+            updated,
+            start_slot + index,
+            axis=0,
+            keepdims=False,
+        ).reshape(
+            -1
+        )[0]
+        for index in range(batch_size)
+    )
+    return updated, ready
+
+
 def _compile_donated_packed_copy(
     pool: jax.Array,
     packed: jax.Array,
     token_counts: tuple[int, ...],
+    *,
+    contiguous: bool,
 ) -> Any:
-    compiled = _copy_packed_batch_into_slots.lower(
-        pool,
-        packed,
-        jnp.zeros((len(token_counts),), dtype=jnp.int32),
-        token_counts=token_counts,
-    ).compile()
+    if contiguous:
+        compiled = _copy_contiguous_packed_batch_into_slots.lower(
+            pool,
+            packed,
+            jnp.asarray(0, dtype=jnp.int32),
+            token_counts=token_counts,
+        ).compile()
+    else:
+        compiled = _copy_packed_batch_into_slots.lower(
+            pool,
+            packed,
+            jnp.zeros((len(token_counts),), dtype=jnp.int32),
+            token_counts=token_counts,
+        ).compile()
     stats = compiled.memory_analysis()
     stats = stats if isinstance(stats, (list, tuple)) else (stats,)
     if not stats or any(
@@ -138,6 +192,7 @@ def compile_packed_pool_copy(
     *,
     capacity: int,
     token_counts: tuple[int, ...],
+    contiguous: bool = False,
 ) -> Any:
     block_shape = encoder_pool_block_shape(request_shape)
     pool = jax.ShapeDtypeStruct(
@@ -146,12 +201,18 @@ def compile_packed_pool_copy(
         sharding=_pool_sharding(packed.sharding),
     )
     start_ns = time.perf_counter_ns()
-    compiled = _compile_donated_packed_copy(pool, packed, token_counts)
+    compiled = _compile_donated_packed_copy(
+        pool,
+        packed,
+        token_counts,
+        contiguous=contiguous,
+    )
     logger.info(
-        "ENCODER-POOL-WRITE-PRECOMPILE capacity=%d batch_size=%d duration_ms=%.3f",
+        "ENCODER-POOL-WRITE-PRECOMPILE capacity=%d batch_size=%d duration_ms=%.3f " "contiguous=%s",
         packed.shape[0],
         len(token_counts),
         (time.perf_counter_ns() - start_ns) / 1_000_000,
+        contiguous,
     )
     return compiled
 
@@ -205,7 +266,7 @@ class RaidenSendPool:
             device=pool_sharding,
         )
         jax.block_until_ready(self._buffer)
-        self._packed_copies: dict[tuple[tuple[int, ...], tuple[int, ...]], Any] = {}
+        self._packed_copies: dict[tuple[tuple[int, ...], tuple[int, ...], bool], Any] = {}
 
     @property
     def buffer(self) -> jax.Array:
@@ -236,6 +297,8 @@ class RaidenSendPool:
         slots: list[int],
         token_counts: tuple[int, ...],
         executable: Any | None = None,
+        *,
+        contiguous: bool | None = None,
     ) -> tuple[jax.Array, ...]:
         if len(slots) != len(token_counts):
             raise ValueError("Raiden slot and packed item counts differ")
@@ -252,7 +315,12 @@ class RaidenSendPool:
         ):
             raise ValueError("Raiden packed output does not match the source pool")
 
-        key = (tuple(int(dim) for dim in packed.shape), token_counts)
+        inferred_contiguous = slots == list(range(slots[0], slots[0] + len(slots)))
+        if contiguous is None:
+            contiguous = inferred_contiguous
+        elif contiguous != inferred_contiguous:
+            raise ValueError("Raiden contiguous pool-write mode does not match slots")
+        key = (tuple(int(dim) for dim in packed.shape), token_counts, contiguous)
         copy = executable or self._packed_copies.get(key)
         if copy is None:
             copy = compile_packed_pool_copy(
@@ -260,13 +328,21 @@ class RaidenSendPool:
                 self.shape,
                 capacity=self._buffer.shape[0],
                 token_counts=token_counts,
+                contiguous=contiguous,
             )
         self._packed_copies[key] = copy
-        self._buffer, ready = copy(
-            self._buffer,
-            packed,
-            jnp.asarray(slots, dtype=jnp.int32),
-        )
+        if contiguous:
+            self._buffer, ready = copy(
+                self._buffer,
+                packed,
+                jnp.asarray(slots[0], dtype=jnp.int32),
+            )
+        else:
+            self._buffer, ready = copy(
+                self._buffer,
+                packed,
+                jnp.asarray(slots, dtype=jnp.int32),
+            )
         return ready
 
     def copy_sync(self, value: jax.Array, slot: int) -> None:

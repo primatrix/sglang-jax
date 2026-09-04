@@ -167,6 +167,7 @@ def test_raiden_server_writes_packed_batch_directly_into_pool(monkeypatch):
     reservations = transfer.reserve_batch_sync(
         ["part-0:embedding", "part-1:embedding", "part-2:embedding"]
     )
+    assert [reservation.slot for reservation in reservations] == [0, 1, 2]
     packed = jnp.arange(24, dtype=jnp.float32).reshape(8, 3)
 
     staged = transfer.stage_packed_batch_sync(reservations, packed, (2, 2, 2))
@@ -179,6 +180,7 @@ def test_raiden_server_writes_packed_batch_directly_into_pool(monkeypatch):
     np.testing.assert_array_equal(buffer[2, :, :3], packed[4:6])
     assert [item["transfer_block_ids"] for item in metadata] == [[0], [1], [2]]
     assert len(transfer._pool._packed_copies) == 1
+    assert next(iter(transfer._pool._packed_copies))[-1] is True
     transfer.close()
 
 

@@ -117,22 +117,26 @@ class RaidenEncoderServerTransfer:
     def _packed_key(
         packed: jax.Array | jax.ShapeDtypeStruct,
         token_counts: tuple[int, ...],
+        contiguous: bool,
     ) -> tuple[Any, ...]:
         return (
             tuple(int(dim) for dim in packed.shape),
             str(packed.dtype),
             repr(packed.sharding),
             token_counts,
+            contiguous,
         )
 
     def _packed_executable(
         self,
         packed: jax.Array | jax.ShapeDtypeStruct,
         token_counts: tuple[int, ...],
+        *,
+        contiguous: bool,
     ) -> Future[Any]:
         if not token_counts or any(token_count != token_counts[0] for token_count in token_counts):
             raise ValueError("Raiden source pool requires one embedding shape")
-        key = self._packed_key(packed, token_counts)
+        key = self._packed_key(packed, token_counts, contiguous)
         with self._compile_lock:
             future = self._packed_executables.get(key)
             if future is None:
@@ -142,6 +146,7 @@ class RaidenEncoderServerTransfer:
                     (token_counts[0], int(packed.shape[1])),
                     capacity=self._pool_size,
                     token_counts=token_counts,
+                    contiguous=contiguous,
                 )
                 self._packed_executables[key] = future
         return future
@@ -154,7 +159,18 @@ class RaidenEncoderServerTransfer:
         ],
     ) -> None:
         for packed, token_counts in specs:
-            self._packed_executable(packed, token_counts)
+            self._packed_executable(packed, token_counts, contiguous=True)
+            self._packed_executable(packed, token_counts, contiguous=False)
+
+    def _reserve_slots_locked(self, count: int) -> list[int]:
+        available = set(self._free)
+        for start in sorted(available):
+            slots = list(range(start, start + count))
+            if all(slot in available for slot in slots):
+                reserved = set(slots)
+                self._free = [slot for slot in self._free if slot not in reserved]
+                return slots
+        return [self._free.pop() for _ in range(count)]
 
     def reserve_batch_sync(self, transfer_ids: list[str]) -> list[_Reservation]:
         transfer_ids = list(transfer_ids)
@@ -178,7 +194,7 @@ class RaidenEncoderServerTransfer:
                 if duplicate is not None:
                     raise ValueError(f"duplicate Raiden transfer_id: {duplicate}")
                 if len(self._free) >= len(transfer_ids):
-                    slots = [self._free.pop() for _ in transfer_ids]
+                    slots = self._reserve_slots_locked(len(transfer_ids))
                     self._slots.update(zip(transfer_ids, slots))
                     self._pending.update(transfer_ids)
                     reserve_done_ns = time.time_ns()
@@ -322,14 +338,21 @@ class RaidenEncoderServerTransfer:
                 f"dtype={packed.dtype}, sharding={packed.sharding}"
             )
         pool_ready_ns = time.time_ns()
+        slots = [reservation.slot for reservation in reservations]
+        contiguous = slots == list(range(slots[0], slots[0] + len(slots)))
 
         try:
-            executable = self._packed_executable(packed, token_counts).result()
+            executable = self._packed_executable(
+                packed,
+                token_counts,
+                contiguous=contiguous,
+            ).result()
             ready = pool.copy_packed_batch_async(
                 packed,
-                [reservation.slot for reservation in reservations],
+                slots,
                 token_counts,
                 executable=executable,
+                contiguous=contiguous,
             )
         except BaseException:
             self.cancel_batch(reservations)
