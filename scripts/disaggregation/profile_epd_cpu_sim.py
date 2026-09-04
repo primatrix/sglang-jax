@@ -257,6 +257,8 @@ def _summarize_encoder_pipeline(log_path: Path, *, start_ns: int, end_ns: int) -
         "server_postprocess_ms",
         "server_token_count_ms",
         "server_embedding_slice_ms",
+        "server_split_compile_wait_ms",
+        "server_split_dispatch_ms",
         "server_metadata_ms",
         "server_result_pack_ms",
         "server_postprocess_residual_ms",

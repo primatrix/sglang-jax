@@ -56,6 +56,8 @@ def test_language_logs_encoder_pipeline_timing(caplog):
         "encode_server_postprocess_duration_ns": 40_000,
         "encode_token_count_duration_ns": 5_000,
         "encode_embedding_slice_duration_ns": 10_000,
+        "encode_split_compile_wait_duration_ns": 2_000,
+        "encode_split_dispatch_duration_ns": 8_000,
         "encode_metadata_duration_ns": 12_000,
         "encode_result_pack_duration_ns": 8_000,
         "encode_server_postprocess_residual_ns": 5_000,
@@ -116,6 +118,8 @@ def test_language_logs_encoder_pipeline_timing(caplog):
     assert "server_postprocess_ms=0.040" in caplog.text
     assert "server_token_count_ms=0.005" in caplog.text
     assert "server_embedding_slice_ms=0.010" in caplog.text
+    assert "server_split_compile_wait_ms=0.002" in caplog.text
+    assert "server_split_dispatch_ms=0.008" in caplog.text
     assert "server_metadata_ms=0.012" in caplog.text
     assert "server_result_pack_ms=0.008" in caplog.text
     assert "server_postprocess_residual_ms=0.005" in caplog.text
@@ -178,6 +182,8 @@ def test_language_logs_encoder_preprocess_timing(caplog):
         "encode_server_postprocess_duration_ns": 5_000,
         "encode_token_count_duration_ns": 1_000,
         "encode_embedding_slice_duration_ns": 1_000,
+        "encode_split_compile_wait_duration_ns": 0,
+        "encode_split_dispatch_duration_ns": 1_000,
         "encode_metadata_duration_ns": 1_000,
         "encode_result_pack_duration_ns": 1_000,
         "encode_server_postprocess_residual_ns": 1_000,

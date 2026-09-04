@@ -192,6 +192,8 @@ class MultiModalEmbeddingData:
             "encode_server_postprocess_duration_ns",
             "encode_token_count_duration_ns",
             "encode_embedding_slice_duration_ns",
+            "encode_split_compile_wait_duration_ns",
+            "encode_split_dispatch_duration_ns",
             "encode_metadata_duration_ns",
             "encode_result_pack_duration_ns",
             "encode_server_postprocess_residual_ns",

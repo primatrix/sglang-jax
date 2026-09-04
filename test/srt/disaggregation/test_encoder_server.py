@@ -62,6 +62,8 @@ def test_encode_discards_jax_bucket_padding():
     assert timing["encode_server_postprocess_duration_ns"] >= 0
     assert timing["encode_token_count_duration_ns"] >= 0
     assert timing["encode_embedding_slice_duration_ns"] >= 0
+    assert timing["encode_split_compile_wait_duration_ns"] >= 0
+    assert timing["encode_split_dispatch_duration_ns"] >= 0
     assert timing["encode_metadata_duration_ns"] >= 0
     assert timing["encode_result_pack_duration_ns"] >= 0
     assert timing["encode_server_postprocess_residual_ns"] >= 0

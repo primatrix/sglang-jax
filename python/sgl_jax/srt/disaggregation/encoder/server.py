@@ -223,6 +223,8 @@ class MMEncoder:
         results = []
         token_count_duration_ns = 0
         embedding_slice_duration_ns = 0
+        split_compile_wait_duration_ns = 0
+        split_dispatch_duration_ns = 0
         metadata_duration_ns = 0
         result_pack_duration_ns = 0
 
@@ -236,13 +238,22 @@ class MMEncoder:
         if simulate:
             offset = 0
             embeddings = []
+            split_dispatch_start_ns = time.perf_counter_ns()
             for token_count in token_counts:
                 embeddings.append(jax.device_put(packed[offset : offset + token_count]))
                 offset += token_count
+            split_dispatch_duration_ns = time.perf_counter_ns() - split_dispatch_start_ns
         elif batch.split_executable is not None and batch.split_capacity == packed.shape[0]:
-            embeddings = batch.split_executable.result()(packed)
+            split_wait_start_ns = time.perf_counter_ns()
+            executable = batch.split_executable.result()
+            split_compile_wait_duration_ns = time.perf_counter_ns() - split_wait_start_ns
+            split_dispatch_start_ns = time.perf_counter_ns()
+            embeddings = executable(packed)
+            split_dispatch_duration_ns = time.perf_counter_ns() - split_dispatch_start_ns
         else:
+            split_dispatch_start_ns = time.perf_counter_ns()
             embeddings = _split_packed_encoder_output(packed, token_counts=token_counts)
+            split_dispatch_duration_ns = time.perf_counter_ns() - split_dispatch_start_ns
         if any(
             embedding.shape[0] != token_count
             for embedding, token_count in zip(embeddings, token_counts)
@@ -279,6 +290,8 @@ class MMEncoder:
             "encode_server_postprocess_duration_ns": postprocess_duration_ns,
             "encode_token_count_duration_ns": token_count_duration_ns,
             "encode_embedding_slice_duration_ns": embedding_slice_duration_ns,
+            "encode_split_compile_wait_duration_ns": split_compile_wait_duration_ns,
+            "encode_split_dispatch_duration_ns": split_dispatch_duration_ns,
             "encode_metadata_duration_ns": metadata_duration_ns,
             "encode_result_pack_duration_ns": result_pack_duration_ns,
             "encode_server_postprocess_residual_ns": postprocess_residual_ns,
@@ -393,6 +406,7 @@ class MMEncoder:
         capacity: int,
         token_counts: tuple[int, ...],
     ) -> Any:
+        start_ns = time.perf_counter_ns()
         target = self.model.thinker if hasattr(self.model, "thinker") else self.model
         sharding = jax.sharding.NamedSharding(
             target.mesh,
@@ -403,10 +417,17 @@ class MMEncoder:
             self.model_config.dtype,
             sharding=sharding,
         )
-        return _split_packed_encoder_output.lower(
+        executable = _split_packed_encoder_output.lower(
             packed,
             token_counts=token_counts,
         ).compile()
+        logger.info(
+            "ENCODER-SPLIT-PRECOMPILE capacity=%d batch_size=%d duration_ms=%.3f",
+            capacity,
+            len(token_counts),
+            (time.perf_counter_ns() - start_ns) / 1_000_000,
+        )
+        return executable
 
     def _placeholder(self, modality: Modality) -> str:
         config = self.mm_processor.hf_config

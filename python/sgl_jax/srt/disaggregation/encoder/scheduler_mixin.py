@@ -226,6 +226,8 @@ class SchedulerDisaggregationEncoderMixin:
                     "encode_server_postprocess_duration_ns",
                     "encode_token_count_duration_ns",
                     "encode_embedding_slice_duration_ns",
+                    "encode_split_compile_wait_duration_ns",
+                    "encode_split_dispatch_duration_ns",
                     "encode_metadata_duration_ns",
                     "encode_result_pack_duration_ns",
                     "encode_server_postprocess_residual_ns",
@@ -292,6 +294,7 @@ class SchedulerDisaggregationEncoderMixin:
                     "encode_dispatch_ms=%.3f encode_compute_ms=%.3f encode_ms=%.3f "
                     "post_vit_to_copy_ms=%.3f server_postprocess_ms=%.3f "
                     "server_token_count_ms=%.3f server_embedding_slice_ms=%.3f "
+                    "server_split_compile_wait_ms=%.3f server_split_dispatch_ms=%.3f "
                     "server_metadata_ms=%.3f server_result_pack_ms=%.3f "
                     "server_postprocess_residual_ms=%.3f runtime_return_gap_ms=%.3f "
                     "runtime_postprocess_ms=%.3f runtime_metadata_prepare_ms=%.3f "
@@ -364,6 +367,8 @@ class SchedulerDisaggregationEncoderMixin:
                     _duration_ms(timing, "encode_server_postprocess_duration_ns"),
                     _duration_ms(timing, "encode_token_count_duration_ns"),
                     _duration_ms(timing, "encode_embedding_slice_duration_ns"),
+                    _duration_ms(timing, "encode_split_compile_wait_duration_ns"),
+                    _duration_ms(timing, "encode_split_dispatch_duration_ns"),
                     _duration_ms(timing, "encode_metadata_duration_ns"),
                     _duration_ms(timing, "encode_result_pack_duration_ns"),
                     _duration_ms(timing, "encode_server_postprocess_residual_ns"),
