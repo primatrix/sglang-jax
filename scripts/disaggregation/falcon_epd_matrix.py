@@ -43,6 +43,7 @@ class Variant:
     language_cpu_threads: int | None = None
     dispatch_orjson: bool = True
     encoder_orjson_request: bool = True
+    timing_logging: bool = True
 
 
 def _variants() -> list[Variant]:
@@ -99,6 +100,13 @@ def _variants() -> list[Variant]:
             encoder_cpu_threads=4,
             dispatch_orjson=True,
             encoder_orjson_request=True,
+        ),
+        replace(base, name="encoder-cpu4-timing-on", encoder_cpu_threads=4),
+        replace(
+            base,
+            name="encoder-cpu4-timing-off",
+            encoder_cpu_threads=4,
+            timing_logging=False,
         ),
         Variant(
             "wide-pipeline",
@@ -178,7 +186,7 @@ def _server_env(
 
 
 def _common_server_args(args: argparse.Namespace, variant: Variant) -> list[str]:
-    return [
+    result = [
         sys.executable,
         "-u",
         "-m",
@@ -213,12 +221,14 @@ def _common_server_args(args: argparse.Namespace, variant: Variant) -> list[str]
         str(variant.channels),
         "--disaggregation-host-ip",
         args.host_ip,
-        "--enable-request-time-stats-logging",
         "--random-seed",
         "0",
         "--download-dir",
         args.download_dir,
     ]
+    if variant.timing_logging:
+        result.append("--enable-request-time-stats-logging")
+    return result
 
 
 def _start_servers(
@@ -377,7 +387,7 @@ def _run_variant(
             start_ns=formal_start_ns,
             end_ns=formal_end_ns,
         )
-        if queue["n"] != args.prompts or pipeline["n"] != args.prompts:
+        if variant.timing_logging and (queue["n"] != args.prompts or pipeline["n"] != args.prompts):
             raise RuntimeError(f"formal coverage queue={queue['n']} pipeline={pipeline['n']}")
         summary = {
             "schema_version": 1,
