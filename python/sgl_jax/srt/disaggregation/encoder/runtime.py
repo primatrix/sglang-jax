@@ -12,8 +12,6 @@ from sgl_jax.srt.disaggregation.encoder.embedding_data import EmbeddingData
 from sgl_jax.srt.multimodal.common.modality_enum import Modality
 
 _ResultCallback = Callable[[int, EmbeddingData | Exception], None]
-_ResultPublisher = Callable[[EmbeddingData], None]
-_ResultBatchPublisher = Callable[[list[EmbeddingData]], None]
 _STOP = object()
 
 
@@ -63,13 +61,9 @@ class EncoderRuntime:
         transfer: Any,
         *,
         pipeline_depth: int = 2,
-        result_publisher: _ResultPublisher | None = None,
-        result_batch_publisher: _ResultBatchPublisher | None = None,
     ) -> None:
         self._encoder = encoder
         self._transfer = transfer
-        self._result_publisher = result_publisher
-        self._result_batch_publisher = result_batch_publisher
         depth = max(1, int(pipeline_depth))
         self._encode_queue: queue.Queue[_EncodeJob | object] = queue.Queue(depth)
         # Pool reservations provide backpressure. This queue carries only small
@@ -346,25 +340,10 @@ class EncoderRuntime:
                 batch.jobs[0].batch.deliver_many(deliveries)
             return
         deliveries = []
-        try:
-            for job, item_metadata in zip(batch.jobs, metadata):
-                deliveries.append(
-                    (
-                        job.index,
-                        self._complete_transfer(
-                            job,
-                            item_metadata,
-                            deliver=False,
-                            publish=self._result_batch_publisher is None,
-                        ),
-                    )
-                )
-            if self._result_batch_publisher is not None:
-                self._result_batch_publisher([data for _, data in deliveries])
-        except Exception as exc:
-            for job in batch.jobs:
-                self._transfer.release(job.transfer_id)
-            deliveries = [(job.index, exc) for job in batch.jobs]
+        for job, item_metadata in zip(batch.jobs, metadata):
+            deliveries.append(
+                (job.index, self._complete_transfer(job, item_metadata, deliver=False))
+            )
         if batch.jobs:
             batch.jobs[0].batch.deliver_many(deliveries)
 
@@ -372,10 +351,11 @@ class EncoderRuntime:
         try:
             job.data.transfer_start_ns = time.time_ns()
             transfer_metadata = self._transfer.publish_sync(job.staged_transfer)
-            self._complete_transfer(job, transfer_metadata)
         except Exception as exc:
             self._transfer.release(job.transfer_id)
             job.batch.deliver(job.index, exc)
+        else:
+            self._complete_transfer(job, transfer_metadata)
 
     def _complete_transfer(
         self,
@@ -383,7 +363,6 @@ class EncoderRuntime:
         transfer_metadata: dict[str, Any],
         *,
         deliver: bool = True,
-        publish: bool = True,
     ) -> EmbeddingData:
         for key, value in transfer_metadata.items():
             setattr(job.data, key, value)
@@ -412,8 +391,6 @@ class EncoderRuntime:
         job.data.transfer_stage_done_ns = job.data.transfer_copy_done_ns
         job.data.transfer_id = str(transfer_metadata.get("transfer_id", job.transfer_id))
         job.data.publish_done_ns = time.time_ns()
-        if publish and self._result_publisher is not None:
-            self._result_publisher(job.data)
         if deliver:
             job.batch.deliver(job.index, job.data)
         return job.data
