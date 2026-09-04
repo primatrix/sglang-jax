@@ -39,6 +39,7 @@ class Variant:
     processor_workers: int = 4
     channels: int = 4
     max_prefill_tokens: int = 8192
+    cpu_threads: int | None = None
 
 
 def _variants() -> list[Variant]:
@@ -59,6 +60,9 @@ def _variants() -> list[Variant]:
         replace(base, name="channels-8", channels=8),
         replace(base, name="prefill-4096", max_prefill_tokens=4096),
         replace(base, name="prefill-16384", max_prefill_tokens=16384),
+        replace(base, name="cpu-threads-1", cpu_threads=1),
+        replace(base, name="cpu-threads-4", cpu_threads=4),
+        replace(base, name="cpu-threads-16", cpu_threads=16),
         Variant(
             "wide-pipeline",
             pool_size=128,
@@ -107,7 +111,12 @@ def _stop_many(*processes: subprocess.Popen | None) -> None:
         process.wait(timeout=5)
 
 
-def _server_env(code_root: Path, cache_dir: Path, chips: str) -> dict[str, str]:
+def _server_env(
+    code_root: Path,
+    cache_dir: Path,
+    chips: str,
+    cpu_threads: int | None,
+) -> dict[str, str]:
     env = os.environ.copy()
     env.update(
         {
@@ -119,6 +128,9 @@ def _server_env(code_root: Path, cache_dir: Path, chips: str) -> dict[str, str]:
             "PYTHONPATH": f"{code_root / 'python'}:{code_root}",
         }
     )
+    if cpu_threads is not None:
+        env["OMP_NUM_THREADS"] = str(cpu_threads)
+        env["MKL_NUM_THREADS"] = str(cpu_threads)
     return env
 
 
@@ -190,7 +202,12 @@ def _start_servers(
             "30001",
         ],
         cwd=args.code_root,
-        env=_server_env(args.code_root, args.cache_root / "encoder", "0,1"),
+        env=_server_env(
+            args.code_root,
+            args.cache_root / "encoder",
+            "0,1",
+            variant.cpu_threads,
+        ),
         stdout=encoder_log,
         stderr=subprocess.STDOUT,
         start_new_session=True,
@@ -227,7 +244,12 @@ def _start_servers(
             "30000",
         ],
         cwd=args.code_root,
-        env=_server_env(args.code_root, args.cache_root / "language", "2,3"),
+        env=_server_env(
+            args.code_root,
+            args.cache_root / "language",
+            "2,3",
+            variant.cpu_threads,
+        ),
         stdout=language_log,
         stderr=subprocess.STDOUT,
         start_new_session=True,
