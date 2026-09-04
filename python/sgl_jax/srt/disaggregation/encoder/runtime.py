@@ -26,9 +26,18 @@ class _EncodeJob:
     def deliver(self, index: int, result: EmbeddingData | Exception) -> None:
         self.callback_loop.call_soon_threadsafe(self.callback, index, result)
 
+    def deliver_many(self, results: list[tuple[int, EmbeddingData | Exception]]) -> None:
+        self.callback_loop.call_soon_threadsafe(self._deliver_many_on_loop, tuple(results))
+
+    def _deliver_many_on_loop(
+        self,
+        results: tuple[tuple[int, EmbeddingData | Exception], ...],
+    ) -> None:
+        for index, result in results:
+            self.callback(index, result)
+
     def fail_batch(self, exc: Exception) -> None:
-        for index in range(len(self.requests)):
-            self.deliver(index, exc)
+        self.deliver_many([(index, exc) for index in range(len(self.requests))])
 
 
 @dataclass(slots=True)
@@ -323,12 +332,20 @@ class EncoderRuntime:
             if len(metadata) != len(batch.jobs):
                 raise RuntimeError("transfer returned incomplete batch metadata")
         except Exception as exc:
+            deliveries = []
             for job in batch.jobs:
                 self._transfer.release(job.transfer_id)
-                job.batch.deliver(job.index, exc)
+                deliveries.append((job.index, exc))
+            if batch.jobs:
+                batch.jobs[0].batch.deliver_many(deliveries)
             return
+        deliveries = []
         for job, item_metadata in zip(batch.jobs, metadata):
-            self._complete_transfer(job, item_metadata)
+            deliveries.append(
+                (job.index, self._complete_transfer(job, item_metadata, deliver=False))
+            )
+        if batch.jobs:
+            batch.jobs[0].batch.deliver_many(deliveries)
 
     def _run_transfer(self, job: _TransferJob) -> None:
         try:
@@ -340,7 +357,13 @@ class EncoderRuntime:
         else:
             self._complete_transfer(job, transfer_metadata)
 
-    def _complete_transfer(self, job: _TransferJob, transfer_metadata: dict[str, Any]) -> None:
+    def _complete_transfer(
+        self,
+        job: _TransferJob,
+        transfer_metadata: dict[str, Any],
+        *,
+        deliver: bool = True,
+    ) -> EmbeddingData:
         for key, value in transfer_metadata.items():
             setattr(job.data, key, value)
         # Backends may optionally expose the pool/reservation/copy split.
@@ -368,7 +391,9 @@ class EncoderRuntime:
         job.data.transfer_stage_done_ns = job.data.transfer_copy_done_ns
         job.data.transfer_id = str(transfer_metadata.get("transfer_id", job.transfer_id))
         job.data.publish_done_ns = time.time_ns()
-        job.batch.deliver(job.index, job.data)
+        if deliver:
+            job.batch.deliver(job.index, job.data)
+        return job.data
 
     def release(self, transfer_id: str) -> None:
         self._transfer.release(transfer_id)

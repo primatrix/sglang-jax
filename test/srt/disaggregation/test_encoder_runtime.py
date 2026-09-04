@@ -4,11 +4,12 @@ import asyncio
 import threading
 from contextlib import suppress
 from types import SimpleNamespace
+from typing import cast
 
 import jax.numpy as jnp
 
 from sgl_jax.srt.disaggregation.encoder.embedding_data import EmbeddingData
-from sgl_jax.srt.disaggregation.encoder.runtime import EncoderRuntime
+from sgl_jax.srt.disaggregation.encoder.runtime import EncoderRuntime, _EncodeJob
 from sgl_jax.srt.disaggregation.encoder.scheduler import DisaggEncoderScheduler
 from sgl_jax.srt.disaggregation.encoder.server import EncoderServer
 from sgl_jax.srt.disaggregation.encoder.sim_transfer import SimEncoderServerTransfer
@@ -80,6 +81,32 @@ async def _collect(runtime: EncoderRuntime, requests: list[dict]):
     if requests:
         await done.wait()
     return results
+
+
+def test_encode_job_batches_cross_thread_deliveries_into_one_wakeup():
+    class RecordingLoop:
+        def __init__(self):
+            self.calls = 0
+
+        def call_soon_threadsafe(self, callback, *args):
+            self.calls += 1
+            callback(*args)
+
+    delivered = []
+    loop = RecordingLoop()
+    job = _EncodeJob(
+        requests=[{}, {}],
+        prepared=None,
+        preprocess_start_ns=0,
+        callback=lambda index, result: delivered.append((index, result)),
+        callback_loop=cast(asyncio.AbstractEventLoop, loop),
+    )
+    first = _data("first")
+    second = _data("second")
+    job.deliver_many([(0, first), (1, second)])
+
+    assert loop.calls == 1
+    assert delivered == [(0, first), (1, second)]
 
 
 def test_sim_server_transfer_reserves_stages_and_publishes():
