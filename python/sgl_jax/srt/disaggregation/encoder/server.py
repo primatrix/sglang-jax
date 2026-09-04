@@ -17,15 +17,16 @@ import jax
 import jax.profiler
 import numpy as np
 import uvicorn
-import zmq.asyncio
 from fastapi import FastAPI
 from fastapi.responses import Response
-from zmq.constants import LINGER, PUSH
 
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.disaggregation.encoder.bootstrap import EncoderBootstrapClient
 from sgl_jax.srt.disaggregation.encoder.embedding_data import EmbeddingData
+from sgl_jax.srt.disaggregation.encoder.metadata_publisher import (
+    EncoderMetadataPublisher,
+)
 from sgl_jax.srt.disaggregation.encoder.raiden_transfer import (
     RaidenEncoderServerTransfer,
 )
@@ -602,10 +603,12 @@ class EncoderServer:
             raise ValueError("encoder_register_urls and advertise_url must be configured together")
 
         self._network_rtt_s = max(0.0, float(network_rtt_ms)) / 1000.0
+        self._metadata_publisher = EncoderMetadataPublisher(receiver_timeout)
         self.runtime = EncoderRuntime(
             encoder,
             transfer,
             pipeline_depth=max_inflight_batches,
+            result_publisher=self._metadata_publisher.publish,
         )
         self.scheduler = DisaggEncoderScheduler(
             self.runtime,
@@ -615,12 +618,6 @@ class EncoderServer:
             request_timeout=request_timeout,
             log_queue_timing=log_queue_timing,
         )
-        self._zmq = zmq.asyncio.Context.instance()
-        self._receiver_timeout = receiver_timeout
-        self._receiver_addresses: dict[str, str] = {}
-        self._receiver_events: dict[str, asyncio.Event] = {}
-        self._receiver_sockets: dict[str, zmq.asyncio.Socket] = {}
-        self._notify_lock = asyncio.Lock()
 
         @asynccontextmanager
         async def lifespan(_: FastAPI):
@@ -681,11 +678,7 @@ class EncoderServer:
             try:
                 await self.runtime.stop()
             finally:
-                for socket in self._receiver_sockets.values():
-                    socket.close()
-                self._receiver_sockets.clear()
-                self._receiver_events.clear()
-                self._receiver_addresses.clear()
+                self._metadata_publisher.close()
 
     @staticmethod
     async def _register_with_bootstraps(
@@ -733,8 +726,7 @@ class EncoderServer:
         request: dict[str, Any],
     ) -> dict[str, Any]:
         req_id = request["req_id"]
-        self._receiver_addresses[req_id] = request["receive_url"]
-        self._receiver_events.setdefault(req_id, asyncio.Event()).set()
+        self._metadata_publisher.register(req_id, request["receive_url"])
         return {"req_id": req_id}
 
     async def encode(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -742,7 +734,7 @@ class EncoderServer:
         if self._network_rtt_s:
             await asyncio.sleep(self._network_rtt_s)
         try:
-            data = await self.scheduler.submit(request)
+            await self.scheduler.submit(request)
         except Exception as exc:
             try:
                 req_id = request["req_id"]
@@ -764,34 +756,14 @@ class EncoderServer:
                 )
             raise
 
-        try:
-            await self.send_to_scheduler(data.req_id, data)
-        except Exception:
-            self.runtime.release(data.transfer_id)
-            raise
         # The response is only an ACK. Metadata travels over ZMQ and the
         # embedding itself travels over the configured transfer backend.
         return {"req_id": request["req_id"]}
 
     async def send_to_scheduler(self, req_id: str, data: EmbeddingData) -> None:
-        try:
-            event = self._receiver_events.setdefault(req_id, asyncio.Event())
-            if self._receiver_timeout is None or self._receiver_timeout <= 0:
-                await event.wait()
-            else:
-                await asyncio.wait_for(event.wait(), self._receiver_timeout)
-            address = self._receiver_addresses[req_id]
-            async with self._notify_lock:
-                socket = self._receiver_sockets.get(address)
-                if socket is None:
-                    socket = self._zmq.socket(PUSH)
-                    socket.setsockopt(LINGER, 1000)
-                    socket.connect(f"tcp://{address}")
-                    self._receiver_sockets[address] = socket
-                await socket.send_pyobj(data)
-        finally:
-            self._receiver_events.pop(req_id, None)
-            self._receiver_addresses.pop(req_id, None)
+        if req_id != data.req_id:
+            raise ValueError("encoder metadata request ID mismatch")
+        await asyncio.to_thread(self._metadata_publisher.publish, data)
 
     async def start_profile(self, request: dict[str, Any] | None = None) -> dict[str, Any]:
         """Arm a jax.profiler trace on the encoder process.
