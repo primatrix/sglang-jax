@@ -677,6 +677,9 @@ class EncoderRequestDispatcher:
                         {
                             "req_id": create_part_req_id(request.rid, part_idx),
                             "dispatch_start_ns": dispatch_start_ns,
+                            "collect_request_time_stats": (
+                                request.request_time_stats is not None
+                            ),
                             "mm_items": items[item_offset : item_offset + count],
                             "num_parts": num_parts,
                             "part_idx": part_idx,

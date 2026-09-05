@@ -165,6 +165,8 @@ class ServerArgs:
     bucket_e2e_request_latency: list[float] | None = None
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
+    request_time_stats_sample_rate: float = 1.0
+    defer_request_time_stats_logging: bool = False
     kv_events_config: str | None = None
 
     # API related
@@ -366,6 +368,11 @@ class ServerArgs:
     disaggregation_max_inflight_transfers: int = 8
 
     def __post_init__(self):
+        if not 0.0 <= self.request_time_stats_sample_rate <= 1.0:
+            raise ValueError(
+                "--request-time-stats-sample-rate must be between 0 and 1, "
+                f"got {self.request_time_stats_sample_rate}."
+            )
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
@@ -1290,6 +1297,24 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_request_time_stats_logging,
             help="Enable per request time stats logging",
+        )
+        parser.add_argument(
+            "--request-time-stats-sample-rate",
+            type=float,
+            default=ServerArgs.request_time_stats_sample_rate,
+            help=(
+                "Deterministic fraction of request IDs to trace when request time stats "
+                "logging is enabled. Use the same value in bench_serving."
+            ),
+        )
+        parser.add_argument(
+            "--defer-request-time-stats-logging",
+            action="store_true",
+            default=ServerArgs.defer_request_time_stats_logging,
+            help=(
+                "Suppress synchronous legacy timing logs on the request path. The sampled "
+                "correlated trace is emitted after the first content body is sent to ASGI."
+            ),
         )
         parser.add_argument(
             "--kv-events-config",

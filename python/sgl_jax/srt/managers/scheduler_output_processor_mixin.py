@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from typing import TYPE_CHECKING
 
 import jax
@@ -805,6 +806,7 @@ class SchedulerOutputProcessorMixin:
         spec_accepted_tokens = []
         output_hidden_states = None
         output_routed_experts = None
+        request_time_stats = []
 
         output_hidden_states_for_mm = None
         if return_logprob:
@@ -865,8 +867,12 @@ class SchedulerOutputProcessorMixin:
                 if isinstance(req.rid, list):
                     # if rid is a list, extend the list to rids
                     rids.extend(req.rid)
+                    request_time_stats.extend(
+                        [getattr(req, "encoder_timing", None)] * len(req.rid)
+                    )
                 else:
                     rids.append(req.rid)
+                    request_time_stats.append(getattr(req, "encoder_timing", None))
                 finished_reasons.append(
                     req.finished_reason.to_json() if req.finished_reason else None
                 )
@@ -957,6 +963,10 @@ class SchedulerOutputProcessorMixin:
                 output_routed_experts.append(req.routed_experts)
         # Send to detokenizer
         if rids:
+            output_ready_ns = time.time_ns()
+            for stats in request_time_stats:
+                if stats is not None:
+                    stats.setdefault("scheduler_output_ready_ns", output_ready_ns)
             out = BatchTokenIDOut(
                 rids,
                 finished_reasons,
@@ -986,7 +996,14 @@ class SchedulerOutputProcessorMixin:
                 output_hidden_states_for_mm,
                 cache_miss_count,
                 output_routed_experts,
+                request_time_stats,
             )
+            scheduler_send_start_ns = time.time_ns()
+            for stats in request_time_stats:
+                if stats is not None:
+                    stats.setdefault(
+                        "scheduler_output_send_start_ns", scheduler_send_start_ns
+                    )
             if self._comm_backend is not None:
                 self._comm_backend.send_pyobj(out)
             else:

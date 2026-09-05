@@ -72,6 +72,7 @@ from sgl_jax.srt.managers.template_manager import TemplateManager
 from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.reasoning_parser import ReasoningParser
+from sgl_jax.srt.request_time_stats import RequestTimeStatsMiddleware
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils import (
     add_api_key_middleware,
@@ -145,6 +146,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(RequestTimeStatsMiddleware)
 
 
 # Custom exception handlers to change validation error status codes

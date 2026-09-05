@@ -378,7 +378,9 @@ class MMEncoder:
         self, request: dict[str, Any], modality: Modality
     ) -> tuple[MultimodalInputs, dict[str, int]]:
         timing = {}
-        if getattr(self, "_log_timing", False):
+        if getattr(self, "_log_timing", False) and request.get(
+            "collect_request_time_stats", False
+        ):
             timing["preprocess_request_start_ns"] = time.time_ns()
         mm_items = request.get("mm_items") or []
         if not mm_items:
@@ -842,6 +844,10 @@ def launch(server_args: ServerArgs) -> None:
     configure_logger(server_args)
     set_uvicorn_logging_configs()
     encoder = MMEncoder(server_args)
+    legacy_timing_logs = (
+        server_args.enable_request_time_stats_logging
+        and not server_args.defer_request_time_stats_logging
+    )
     try:
         if server_args.simulate_compute:
             # Sim transfer needs no routable peer IP; bind/advertise on loopback.
@@ -853,7 +859,7 @@ def launch(server_args: ServerArgs) -> None:
                 timeout_s=server_args.encoder_request_timeout_seconds,
                 ms_per_mb=server_args.simulate_transfer_ms_per_mb,
                 rtt_ms=server_args.simulate_network_rtt_ms,
-                log_inflight=server_args.enable_request_time_stats_logging,
+                log_inflight=legacy_timing_logs,
             )
         else:
             host_ip = resolve_host_ip(server_args.disaggregation_host_ip)
@@ -862,7 +868,7 @@ def launch(server_args: ServerArgs) -> None:
                 parallelism=server_args.disaggregation_channel_number,
                 pool_size=server_args.encoder_transfer_pool_size,
                 timeout_s=server_args.encoder_request_timeout_seconds,
-                log_inflight=server_args.enable_request_time_stats_logging,
+                log_inflight=legacy_timing_logs,
             )
         advertise_host = f"[{host_ip}]" if ":" in host_ip else host_ip
         advertise_url = (
@@ -885,7 +891,7 @@ def launch(server_args: ServerArgs) -> None:
             network_rtt_ms=(
                 server_args.simulate_network_rtt_ms if server_args.simulate_compute else 0.0
             ),
-            log_queue_timing=server_args.enable_request_time_stats_logging,
+            log_queue_timing=legacy_timing_logs,
         )
         server.run(server_args.host, server_args.port)
     finally:

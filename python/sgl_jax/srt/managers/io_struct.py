@@ -90,6 +90,9 @@ class BatchStrOut:
     # The routed experts for each output token
     output_routed_experts: list[str | None] = None
 
+    # Sampled end-to-end request timestamps, aligned with ``rids``.
+    request_time_stats: list[dict[str, int] | None] | None = None
+
 
 @dataclass
 class BatchTokenIDOut:
@@ -135,6 +138,9 @@ class BatchTokenIDOut:
 
     # The routed experts for each output token
     output_routed_experts: list[np.ndarray] = None
+
+    # Sampled end-to-end request timestamps, aligned with ``rids``.
+    request_time_stats: list[dict[str, int] | None] | None = None
 
 
 @dataclass
@@ -188,6 +194,8 @@ class TokenizedGenerateReqInput:
     # to ``rid``; callers that may reuse ``rid`` across retries should
     # provide a per-attempt value to isolate late acks.
     disagg_transfer_id: str | None = None
+    # Present only for deterministically sampled request-time traces.
+    request_time_stats: dict[str, int] | None = None
 
     def __post_init__(self):
         if not self.radix_input_ids and self.input_ids:
@@ -354,6 +362,8 @@ class GenerateReqInput:
     bootstrap_room: list[int] | int | None = None
     disagg_prefill_dp_rank: list[int] | int | None = None
     disagg_transfer_id: list[str] | str | None = None
+    # Sampled HTTP/frontend timestamps propagated through the serving pipeline.
+    request_time_stats: list[dict[str, int] | None] | dict[str, int] | None = None
 
     def contains_mm_input(self) -> bool:
         return (
@@ -597,6 +607,11 @@ class GenerateReqInput:
             ),
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
+            request_time_stats=(
+                self.request_time_stats[i]
+                if isinstance(self.request_time_stats, list)
+                else self.request_time_stats
+            ),
             return_logprob=self.return_logprob[i],
             logprob_start_len=self.logprob_start_len[i],
             top_logprobs_num=self.top_logprobs_num[i],

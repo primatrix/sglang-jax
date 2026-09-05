@@ -118,6 +118,8 @@ class DisaggEncoderScheduler:
         if self._log_queue_timing:
             queue_depth = self._pending_queue.qsize()
             for pending in batch:
+                if not pending.request.get("collect_request_time_stats", False):
+                    continue
                 queue_duration_ns = pending.queue_duration_ns
                 logger.info(
                     "ENCODER-QUEUE-TIME req_id=%s part_idx=%s enqueue_ns=%d "

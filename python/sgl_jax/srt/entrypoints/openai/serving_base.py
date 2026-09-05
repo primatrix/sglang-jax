@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 import uuid
 from abc import ABC, abstractmethod
 from typing import Any
@@ -10,6 +11,11 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 from sgl_jax.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sgl_jax.srt.managers.io_struct import GenerateReqInput
 from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
+from sgl_jax.srt.request_time_stats import (
+    REQUEST_TIME_STATS_RID_STATE_KEY,
+    REQUEST_TIME_STATS_STATE_KEY,
+    should_sample_request,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,24 +31,58 @@ class OpenAIServingBase(ABC):
         self, request: OpenAIServingRequest, raw_request: Request
     ) -> Any | StreamingResponse | ErrorResponse:
         """Handle the specific request type with common pattern"""
+        request_time_stats = None
         try:
+            server_args = self.tokenizer_manager.server_args
+            if server_args.enable_request_time_stats_logging:
+                request_id = getattr(request, "rid", None)
+                if request_id is None:
+                    request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
+                    request.rid = request_id
+                if isinstance(request_id, list):
+                    request_id = request_id[0] if len(request_id) == 1 else None
+                if request_id is not None and should_sample_request(
+                    request_id, server_args.request_time_stats_sample_rate
+                ):
+                    state = raw_request.scope.setdefault("state", {})
+                    request_time_stats = state.get(REQUEST_TIME_STATS_STATE_KEY)
+                    if request_time_stats is None:
+                        request_time_stats = {}
+                    request_time_stats["openai_handler_enter_ns"] = time.time_ns()
+                    state[REQUEST_TIME_STATS_STATE_KEY] = request_time_stats
+                    state[REQUEST_TIME_STATS_RID_STATE_KEY] = request_id
+                else:
+                    raw_request.scope.setdefault("state", {})[
+                        REQUEST_TIME_STATS_STATE_KEY
+                    ] = None
+
             # Validate request
             error_msg = self._validate_request(request)
+            if request_time_stats is not None:
+                request_time_stats["openai_validation_done_ns"] = time.time_ns()
             if error_msg:
                 return self.create_error_response(error_msg)
 
             # Convert to internal format
+            if request_time_stats is not None:
+                request_time_stats["openai_convert_start_ns"] = time.time_ns()
             adapted_request, processed_request = self._convert_to_internal_request(request)
+            if request_time_stats is not None:
+                request_time_stats["openai_convert_done_ns"] = time.time_ns()
+                adapted_request.request_time_stats = request_time_stats
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
-                return await self._handle_streaming_request(
+                response = await self._handle_streaming_request(
                     adapted_request, processed_request, raw_request
                 )
             else:
-                return await self._handle_non_streaming_request(
+                response = await self._handle_non_streaming_request(
                     adapted_request, processed_request, raw_request
                 )
+            if request_time_stats is not None:
+                request_time_stats["openai_handler_return_ns"] = time.time_ns()
+            return response
 
         except Exception as e:
             logger.exception("Error in request: %s", e)

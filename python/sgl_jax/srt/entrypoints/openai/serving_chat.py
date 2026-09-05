@@ -42,6 +42,10 @@ from sgl_jax.srt.managers.template_manager import TemplateManager
 from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
 from sgl_jax.srt.multimodal.manager.io_struct import GenerateOmniReqInput
 from sgl_jax.srt.reasoning_parser import ReasoningParser
+from sgl_jax.srt.request_time_stats import (
+    REQUEST_TIME_STATS_RID_STATE_KEY,
+    REQUEST_TIME_STATS_STATE_KEY,
+)
 from sgl_jax.utils import convert_json_schema_to_str
 
 logger = logging.getLogger(__name__)
@@ -461,6 +465,14 @@ Assistant: {% endif %}"""
                 adapted_request, raw_request
             ):
                 index = content.get("index", 0)
+                request_time_stats = content["meta_info"].get("request_time_stats")
+                if request_time_stats is not None:
+                    request_time_stats.setdefault(
+                        "openai_stream_content_received_ns", time.time_ns()
+                    )
+                    state = raw_request.scope.setdefault("state", {})
+                    state[REQUEST_TIME_STATS_STATE_KEY] = request_time_stats
+                    state[REQUEST_TIME_STATS_RID_STATE_KEY] = content["meta_info"]["id"]
 
                 prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                 completion_tokens[index] = content["meta_info"]["completion_tokens"]
@@ -499,7 +511,16 @@ Assistant: {% endif %}"""
                         choices=[choice_data],
                         model=request.model,
                     )
-                    yield f"data: {chunk.model_dump_json()}\n\n"
+                    if request_time_stats is not None:
+                        request_time_stats.setdefault(
+                            "openai_role_serialize_start_ns", time.time_ns()
+                        )
+                    serialized_chunk = chunk.model_dump_json()
+                    if request_time_stats is not None:
+                        request_time_stats.setdefault(
+                            "openai_role_chunk_ready_ns", time.time_ns()
+                        )
+                    yield f"data: {serialized_chunk}\n\n"
 
                 # Process content delta
                 stream_buffer = stream_buffers.get(index, "")
@@ -527,7 +548,16 @@ Assistant: {% endif %}"""
                             choices=[choice_data],
                             model=request.model,
                         )
-                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        if request_time_stats is not None:
+                            request_time_stats.setdefault(
+                                "openai_reasoning_serialize_start_ns", time.time_ns()
+                            )
+                        serialized_chunk = chunk.model_dump_json()
+                        if request_time_stats is not None:
+                            request_time_stats.setdefault(
+                                "openai_reasoning_chunk_ready_ns", time.time_ns()
+                            )
+                        yield f"data: {serialized_chunk}\n\n"
 
                     if not delta:
                         continue
@@ -569,7 +599,16 @@ Assistant: {% endif %}"""
                             choices=[choice_data],
                             model=request.model,
                         )
-                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        if request_time_stats is not None and delta:
+                            request_time_stats.setdefault(
+                                "openai_content_serialize_start_ns", time.time_ns()
+                            )
+                        serialized_chunk = chunk.model_dump_json()
+                        if request_time_stats is not None and delta:
+                            request_time_stats.setdefault(
+                                "openai_first_content_ready_ns", time.time_ns()
+                            )
+                        yield f"data: {serialized_chunk}\n\n"
 
             # Final chunk with finish_reason
             finish_reason_chunk = ChatCompletionStreamResponse(

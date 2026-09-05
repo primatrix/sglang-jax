@@ -1411,7 +1411,9 @@ class Scheduler(
             return_hidden_states=recv_req.return_hidden_states,
         )
         req.tokenizer = self.tokenizer
-        req.encoder_timing = getattr(recv_req, "encoder_timing", None)
+        req.encoder_timing = getattr(recv_req, "encoder_timing", None) or getattr(
+            recv_req, "request_time_stats", None
+        )
         # PD disaggregation routing keys.
         req.bootstrap_host = recv_req.bootstrap_host
         req.bootstrap_port = recv_req.bootstrap_port

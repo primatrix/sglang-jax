@@ -79,7 +79,7 @@ class SchedulerDisaggregationEncoderMixin:
             self.server_args,
             "enable_request_time_stats_logging",
             False,
-        )
+        ) and not getattr(self.server_args, "defer_request_time_stats_logging", False)
         encoder_client = getattr(self, "encoder_client", None)
         background_progress = bool(
             encoder_client is not None and encoder_client.background_progress
@@ -98,14 +98,19 @@ class SchedulerDisaggregationEncoderMixin:
 
             result = None
             poll_error = None
-            poll_start_ns = time.monotonic_ns()
+            trace_poll_time = bool(
+                log_poll_time and getattr(recv_req, "request_time_stats", None) is not None
+            )
+            poll_start_ns = time.monotonic_ns() if trace_poll_time else 0
             try:
                 result = pending.poll()
             except Exception as exc:
                 poll_error = exc
-            poll_duration_ns = time.monotonic_ns() - poll_start_ns
+            poll_duration_ns = (
+                time.monotonic_ns() - poll_start_ns if trace_poll_time else 0
+            )
 
-            if log_poll_time:
+            if trace_poll_time:
                 if poll_error is not None:
                     poll_status = "error"
                 elif result is not None:
@@ -167,6 +172,7 @@ class SchedulerDisaggregationEncoderMixin:
         embeddings = result.get("embeddings")
         if embeddings is None:
             raise ValueError("encoder result contains no embeddings")
+        frontend_time_stats = getattr(recv_req, "request_time_stats", None)
         encoder_timing = result.get("encoder_timing")
         if encoder_timing is not None:
             encoder_timing.setdefault("language_apply_start_ns", time.time_ns())
@@ -190,9 +196,10 @@ class SchedulerDisaggregationEncoderMixin:
         if encoder_timing is not None:
             encoder_timing["language_radix_done_ns"] = time.time_ns()
         recv_req.need_wait_for_mm_inputs = False
-        if encoder_timing:
+        if frontend_time_stats is not None:
             recv_req.encoder_timing = {
-                **encoder_timing,
+                **frontend_time_stats,
+                **(encoder_timing or {}),
                 "language_ready_ns": time.time_ns(),
             }
 
@@ -253,6 +260,10 @@ class SchedulerDisaggregationEncoderMixin:
                 if not timing or "language_prefill_done_ns" in timing:
                     continue
                 timing["language_prefill_done_ns"] = prefill_done_ns
+                if getattr(
+                    self.server_args, "defer_request_time_stats_logging", False
+                ):
+                    continue
                 required = (
                     "enqueue_ns",
                     "dequeue_ns",

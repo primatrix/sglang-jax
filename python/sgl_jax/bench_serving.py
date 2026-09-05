@@ -51,6 +51,8 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
+from sgl_jax.srt.request_time_stats import should_sample_request
+
 ASSISTANT_SUFFIX = "Assistant:"
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
@@ -67,7 +69,16 @@ def _get_bool_env_var(name: str, default: str = "false") -> bool:
     return value.lower() in ("true", "1")
 
 
-def _create_bench_client_session():
+def _parse_sample_rate(value: str) -> float:
+    sample_rate = float(value)
+    if not 0.0 <= sample_rate <= 1.0:
+        raise argparse.ArgumentTypeError("sample rate must be between 0 and 1")
+    return sample_rate
+
+
+def _create_bench_client_session(
+    trace_configs: list[aiohttp.TraceConfig] | None = None,
+):
     # When the pressure is big, the read buffer could be full before aio thread read
     # the content. We increase the read_bufsize from 64K to 10M.
     # Define constants for timeout and buffer size for clarity and maintainability
@@ -76,8 +87,33 @@ def _create_bench_client_session():
 
     aiohttp_timeout = aiohttp.ClientTimeout(total=BENCH_AIOHTTP_TIMEOUT_SECONDS)
     return aiohttp.ClientSession(
-        timeout=aiohttp_timeout, read_bufsize=BENCH_AIOHTTP_READ_BUFSIZE_BYTES
+        timeout=aiohttp_timeout,
+        read_bufsize=BENCH_AIOHTTP_READ_BUFSIZE_BYTES,
+        trace_configs=trace_configs,
     )
+
+
+def _create_request_time_trace(timestamps_ns: dict[str, int]) -> aiohttp.TraceConfig:
+    """Create sampled aiohttp hooks without changing request serialization."""
+
+    trace = aiohttp.TraceConfig()
+
+    def mark_once(field: str):
+        async def callback(*_):
+            timestamps_ns.setdefault(field, time.time_ns())
+
+        return callback
+
+    trace.on_request_start.append(mark_once("client_aiohttp_request_start_ns"))
+    trace.on_connection_queued_start.append(mark_once("client_connection_queued_start_ns"))
+    trace.on_connection_queued_end.append(mark_once("client_connection_queued_done_ns"))
+    trace.on_connection_create_start.append(mark_once("client_connection_create_start_ns"))
+    trace.on_connection_create_end.append(mark_once("client_connection_create_done_ns"))
+    trace.on_connection_reuseconn.append(mark_once("client_connection_reused_ns"))
+    trace.on_request_headers_sent.append(mark_once("client_request_headers_sent_ns"))
+    trace.on_request_chunk_sent.append(mark_once("client_request_body_sent_ns"))
+    trace.on_response_chunk_received.append(mark_once("client_response_chunk_signal_ns"))
+    return trace
 
 
 @dataclass
@@ -107,6 +143,7 @@ class RequestFuncOutput:
     output_len: int = 0
     cached_tokens: int = 0
     start_time: float = 0.0
+    request_time_stats: dict[str, Any] | None = None
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -335,9 +372,24 @@ async def async_request_openai_chat_completions(
         "chat/completions"
     ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
 
+    request_time_stats_sample_rate = float(
+        getattr(args, "request_time_stats_sample_rate", 0.0)
+    )
+    if request_time_stats_sample_rate > 0 and args.backend != "sglang-oai-chat":
+        raise ValueError(
+            "--request-time-stats-sample-rate is only supported by "
+            "--backend sglang-oai-chat"
+        )
+    rid = None
+    if request_time_stats_sample_rate > 0 or getattr(args, "print_requests", False):
+        rid = f"bench-{uuid.uuid4().hex}"
+    collect_request_time_stats = bool(
+        rid is not None
+        and should_sample_request(rid, request_time_stats_sample_rate)
+    )
+
     # TODO put it to other functions when `pbar` logic is refactored
     if getattr(args, "print_requests", False):
-        rid = str(uuid.uuid4())
         input_partial = deepcopy(request_func_input)
         input_partial.prompt = "..."
         request_start_time = time.time()
@@ -366,7 +418,17 @@ async def async_request_openai_chat_completions(
     else:
         messages = [{"role": "user", "content": request_func_input.prompt}]
 
-    async with _create_bench_client_session() as session:
+    request_time_stats = None
+    trace_configs = None
+    if collect_request_time_stats:
+        request_time_stats = {
+            "schema_version": 1,
+            "request_id": rid,
+            "timestamps_ns": {},
+        }
+        trace_configs = [_create_request_time_trace(request_time_stats["timestamps_ns"])]
+
+    async with _create_bench_client_session(trace_configs=trace_configs) as session:
         payload = {
             "model": request_func_input.model,
             "messages": messages,
@@ -376,6 +438,8 @@ async def async_request_openai_chat_completions(
             "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
         }
+        if request_time_stats_sample_rate > 0:
+            payload["rid"] = rid
 
         # hack to accommodate different LoRA conventions between SGLang and vLLM.
         if request_func_input.lora_name:
@@ -387,19 +451,32 @@ async def async_request_openai_chat_completions(
             headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
+        output.request_time_stats = request_time_stats
 
         generated_text = ""
         output_len = request_func_input.output_len
         ttft = 0.0
         st = time.perf_counter()
+        if output.request_time_stats is not None:
+            output.request_time_stats["timestamps_ns"][
+                "client_request_start_ns"
+            ] = time.time_ns()
         output.start_time = st
         most_recent_timestamp = st
         try:
             async with session.post(url=api_url, json=payload, headers=headers) as response:
+                if output.request_time_stats is not None:
+                    output.request_time_stats["timestamps_ns"][
+                        "client_response_headers_ns"
+                    ] = time.time_ns()
                 if response.status == 200:
                     if args.disable_stream:
                         # Non-streaming response
                         response_json = await response.json()
+                        if output.request_time_stats is not None:
+                            output.request_time_stats["timestamps_ns"][
+                                "client_first_content_ns"
+                            ] = time.time_ns()
                         output.generated_text = response_json["choices"][0]["message"]["content"]
                         output.success = True
                         output.latency = time.perf_counter() - st
@@ -414,12 +491,21 @@ async def async_request_openai_chat_completions(
                             if not chunk_bytes:
                                 continue
 
+                            if output.request_time_stats is not None:
+                                output.request_time_stats["timestamps_ns"].setdefault(
+                                    "client_first_sse_chunk_ns", time.time_ns()
+                                )
+
                             chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
                             latency = time.perf_counter() - st
                             if chunk == "[DONE]":
                                 pass
                             else:
                                 data = json.loads(chunk)
+                                if output.request_time_stats is not None:
+                                    output.request_time_stats["timestamps_ns"].setdefault(
+                                        "client_first_sse_parsed_ns", time.time_ns()
+                                    )
 
                                 # Check if this chunk contains content
                                 delta = data.get("choices", [{}])[0].get("delta", {})
@@ -431,6 +517,10 @@ async def async_request_openai_chat_completions(
                                     if ttft == 0.0:
                                         ttft = timestamp - st
                                         output.ttft = ttft
+                                        if output.request_time_stats is not None:
+                                            output.request_time_stats["timestamps_ns"][
+                                                "client_first_content_ns"
+                                            ] = time.time_ns()
 
                                     # Decoding phase
                                     else:
@@ -456,6 +546,11 @@ async def async_request_openai_chat_completions(
             output.success = False
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
+
+        if output.request_time_stats is not None:
+            output.request_time_stats["timestamps_ns"][
+                "client_request_done_ns"
+            ] = time.time_ns()
 
     # TODO put it to other functions when `pbar` logic is refactored
     if getattr(args, "print_requests", False):
@@ -2561,6 +2656,13 @@ async def benchmark(
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
+    sampled_request_time_stats = [
+        output.request_time_stats
+        for output in outputs
+        if output.request_time_stats is not None
+    ]
+    if sampled_request_time_stats:
+        result["request_time_stats"] = sampled_request_time_stats
 
     # Append results to a JSONL file
     with open(output_file_name, "a") as file:
@@ -2961,6 +3063,15 @@ if __name__ == "__main__":
         "--print-requests",
         action="store_true",
         help="Print requests immediately during benchmarking. Useful to quickly realize issues.",
+    )
+    parser.add_argument(
+        "--request-time-stats-sample-rate",
+        type=_parse_sample_rate,
+        default=0.0,
+        help=(
+            "Deterministically sample OpenAI chat requests for correlated client/server "
+            "timestamps. Use the same value on launch_server."
+        ),
     )
     parser.add_argument(
         "--disable-tqdm",

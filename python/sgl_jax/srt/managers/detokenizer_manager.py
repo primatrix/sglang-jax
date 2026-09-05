@@ -15,6 +15,7 @@ import zmq
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 from sgl_jax.srt.managers.io_struct import BatchStrOut, BatchTokenIDOut
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
+from sgl_jax.srt.request_time_stats import mark_batch_time_stats
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils import (
     configure_logger,
@@ -95,7 +96,9 @@ class DetokenizerManager:
         """The event loop that handles requests"""
         while True:
             recv_obj = self.recv_from_scheduler.recv_pyobj()
+            mark_batch_time_stats(recv_obj, "detokenizer_receive_ns")
             output = self._request_dispatcher(recv_obj)
+            mark_batch_time_stats(output, "detokenizer_send_ns")
             self.send_to_tokenizer.send_pyobj(output)
 
     def trim_matched_stop(self, output: str | list[int], finished_reason: dict, no_stop_trim: bool):
@@ -132,6 +135,7 @@ class DetokenizerManager:
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOut):
         bs = len(recv_obj.rids)
+        mark_batch_time_stats(recv_obj, "detokenizer_decode_start_ns")
 
         # Initialize decode status
         read_ids, surr_ids = [], []
@@ -276,6 +280,7 @@ class DetokenizerManager:
             output_ids_list.append(processed_new_token_ids)
 
         output_routed_experts = self._extract_routed_experts(recv_obj)
+        mark_batch_time_stats(recv_obj, "detokenizer_decode_done_ns")
 
         return BatchStrOut(
             rids=recv_obj.rids,
@@ -300,6 +305,7 @@ class DetokenizerManager:
             output_hidden_states=recv_obj.output_hidden_states,
             cache_miss_count=recv_obj.cache_miss_count,
             output_routed_experts=output_routed_experts,
+            request_time_stats=recv_obj.request_time_stats,
         )
 
 

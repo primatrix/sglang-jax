@@ -74,6 +74,7 @@ from sgl_jax.srt.multimodal.manager.multimodal_processor import (
     import_processors,
 )
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
+from sgl_jax.srt.request_time_stats import mark_batch_time_stats, should_sample_request
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 from sgl_jax.srt.server_args import (
     PortArgs,
@@ -329,13 +330,29 @@ class TokenizerManager:
         obj: GenerateReqInput | EmbeddingReqInput,
         request: fastapi.Request | None = None,
     ):
-
+        generate_start_ns = time.time_ns()
+        request_time_stats = getattr(obj, "request_time_stats", None)
+        if request_time_stats is not None:
+            request_time_stats["tokenizer_generate_start_ns"] = generate_start_ns
         created_time = time.time()
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
+        if (
+            request_time_stats is None
+            and self.server_args.enable_request_time_stats_logging
+            and isinstance(obj.rid, str)
+            and should_sample_request(
+                obj.rid, self.server_args.request_time_stats_sample_rate
+            )
+        ):
+            request_time_stats = obj.request_time_stats = {
+                "tokenizer_generate_start_ns": generate_start_ns
+            }
+        if request_time_stats is not None:
+            request_time_stats["tokenizer_normalize_done_ns"] = time.time_ns()
 
         if (
             isinstance(obj, GenerateReqInput)
@@ -377,6 +394,10 @@ class TokenizerManager:
     ):
         """Tokenize one request."""
 
+        request_time_stats = getattr(obj, "request_time_stats", None)
+        if request_time_stats is not None:
+            request_time_stats["tokenizer_process_start_ns"] = time.time_ns()
+
         # Tokenize
         input_text = obj.text
         input_ids = obj.input_ids
@@ -393,11 +414,15 @@ class TokenizerManager:
                 raise ValueError(
                     "Multimodal input was provided, but the model has no multimodal processor."
                 )
+            if request_time_stats is not None:
+                request_time_stats["tokenizer_mm_preprocess_start_ns"] = time.time_ns()
             mm_inputs = await self.mm_processor.process_mm_data_async(
                 image_data=obj.image_data,
                 input_text=input_text or input_ids,
                 request_obj=obj,
             )
+            if request_time_stats is not None:
+                request_time_stats["tokenizer_mm_preprocess_done_ns"] = time.time_ns()
             if mm_inputs is None:
                 raise ValueError("The multimodal processor produced no output.")
             if mm_inputs.input_ids is not None:
@@ -407,7 +432,11 @@ class TokenizerManager:
                 raise ValueError(
                     "Tokenizer is not initialized but input_text requires tokenization"
                 )
+            if request_time_stats is not None:
+                request_time_stats["tokenizer_text_encode_start_ns"] = time.time_ns()
             encoded = self.tokenizer(input_text)
+            if request_time_stats is not None:
+                request_time_stats["tokenizer_text_encode_done_ns"] = time.time_ns()
             input_ids = encoded["input_ids"]
 
         self._validate_one_request(obj, input_ids)
@@ -425,6 +454,8 @@ class TokenizerManager:
             tokenized_obj.encoder_urls = encoder_urls
             tokenized_obj.need_wait_for_mm_inputs = True
 
+        if request_time_stats is not None:
+            request_time_stats["tokenizer_process_done_ns"] = time.time_ns()
         return tokenized_obj
 
     def _encoder_disaggregation_enabled(self) -> bool:
@@ -507,6 +538,7 @@ class TokenizerManager:
 
         tokenized_obj = TokenizedGenerateReqInput(
             rid=obj.rid,
+            request_time_stats=obj.request_time_stats,
             text=input_text,
             input_ids=input_ids,
             radix_input_ids=build_radix_input_ids(input_ids, mm_inputs),
@@ -657,7 +689,12 @@ class TokenizerManager:
         tokenized_obj: TokenizedGenerateReqInput | TokenizedEmbeddingReqInput,
         created_time: float | None = None,
     ):
+        request_time_stats = getattr(obj, "request_time_stats", None)
+        if request_time_stats is not None:
+            request_time_stats["tokenizer_scheduler_send_start_ns"] = time.time_ns()
         self.send_to_scheduler.send_pyobj(tokenized_obj)
+        if request_time_stats is not None:
+            request_time_stats["tokenizer_scheduler_send_done_ns"] = time.time_ns()
         # Capture the caller's event loop so that _notify_state_event can use
         # call_soon_threadsafe when handle_loop runs on a different thread
         # (e.g. enable_engine_loop_run_forever_daemon mode).
@@ -1193,6 +1230,7 @@ class TokenizerManager:
         """The event loop that handles requests"""
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            mark_batch_time_stats(recv_obj, "tokenizer_manager_receive_ns")
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.perf_counter()
 
@@ -1200,6 +1238,7 @@ class TokenizerManager:
         self,
         recv_obj: BatchStrOut | BatchEmbeddingOut | BatchTokenIDOut,
     ):
+        received_time_stats = getattr(recv_obj, "request_time_stats", None)
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
@@ -1209,12 +1248,27 @@ class TokenizerManager:
                 )
                 continue
 
+            request_time_stats = (
+                received_time_stats[i]
+                if received_time_stats is not None and i < len(received_time_stats)
+                else None
+            )
+            frontend_time_stats = getattr(state.obj, "request_time_stats", None)
+            if frontend_time_stats is not None:
+                if request_time_stats is None:
+                    request_time_stats = dict(frontend_time_stats)
+                else:
+                    for key, value in frontend_time_stats.items():
+                        request_time_stats.setdefault(key, value)
+
             # Build meta_info and return value
             meta_info = {
                 "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
             }
+            if request_time_stats is not None:
+                meta_info["request_time_stats"] = request_time_stats
             dp_rank = getattr(state.obj, "dp_rank", None)
             if dp_rank is not None:
                 meta_info["dp_rank"] = dp_rank
@@ -1301,6 +1355,8 @@ class TokenizerManager:
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
                 del self.rid_to_state[rid]
 
+            if request_time_stats is not None:
+                request_time_stats["tokenizer_manager_state_ready_ns"] = time.time_ns()
             state.out_list.append(out_dict)
             self._notify_state_event(state)
 
