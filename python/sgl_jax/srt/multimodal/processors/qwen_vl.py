@@ -13,6 +13,7 @@ from sgl_jax.srt.multimodal.common.modality_enum import (
     MultimodalDataItem,
     MultimodalInputs,
 )
+from sgl_jax.srt.multimodal.common.vision_layout import build_vision_layout
 from sgl_jax.srt.multimodal.manager.mrope_utils import (
     compute_mrope_positions,
     compute_qwen3vl_mrope_positions,
@@ -391,9 +392,22 @@ class QwenVLProcessor(BaseMultimodalProcessor):
             Modality.IMAGE,
             "image_grid_thw",
         )
+        self._prepare_vision_layouts(items)
         for item in items:
             item.set_pad_value()
         return MultimodalInputs(mm_items=items)
+
+    def _prepare_vision_layouts(self, items: list[MultimodalDataItem]) -> None:
+        if "Qwen2_5_VLForConditionalGeneration" not in getattr(self.hf_config, "architectures", ()):
+            return
+        config = self.hf_config.vision_config
+        merge = config.spatial_merge_size
+        window = config.window_size // merge // config.patch_size
+        for item in items:
+            grid = item.get("image_grid_thw")
+            if grid is None:
+                grid = item.get("video_grid_thw")
+            item["vision_layout"] = build_vision_layout(grid, merge, window)
 
     def collect_mm_items_from_processor_output(
         self,
@@ -481,6 +495,7 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         )
         self._set_video_timing(video_items, second_per_grid_ts)
         mm_items.extend(video_items)
+        self._prepare_vision_layouts(mm_items)
         for item in mm_items:
             item.set_pad_value()
 

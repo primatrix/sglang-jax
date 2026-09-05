@@ -21,6 +21,10 @@ from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.qwen2 import Qwen2Model
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
+from sgl_jax.srt.multimodal.common.vision_layout import (
+    VisionLayout,
+    build_vision_layout,
+)
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
     QwenVLModelVitConfig,
 )
@@ -431,8 +435,10 @@ class Qwen2_5_VisionTransformer(nnx.Module):
         self,
         patches: ArrayLike,
         grid_thw: np.ndarray,
+        *,
+        lane_layouts: list[list[VisionLayout | None]] | None = None,
     ) -> jax.Array:
-        return self.encode(patches, grid_thw)
+        return self.encode(patches, grid_thw, lane_layouts=lane_layouts)
 
     def _forward(
         self,
@@ -476,10 +482,12 @@ class Qwen2_5_VisionTransformer(nnx.Module):
         self,
         patches: ArrayLike,
         grid_thw: np.ndarray,
+        *,
+        lane_layouts: list[list[VisionLayout | None]] | None = None,
     ) -> jax.Array:
         batch_sharding = self.specs.sharding(self.specs.batch_axis)
         patches = jax.device_put(patches, batch_sharding)
-        metadata = self._build_metadata(grid_thw, patches.shape[1])
+        metadata = self._build_metadata(grid_thw, patches.shape[1], lane_layouts=lane_layouts)
         metadata = jax.device_put(metadata, batch_sharding)
         with jax.set_mesh(self.mesh):
             return self._encode_jit(patches, *metadata)
@@ -500,6 +508,8 @@ class Qwen2_5_VisionTransformer(nnx.Module):
         self,
         lane_grids: np.ndarray,
         capacity: int,
+        *,
+        lane_layouts: list[list[VisionLayout | None]] | None = None,
     ) -> tuple[np.ndarray, np.ndarray, VisionAttentionMetadata, VisionAttentionMetadata]:
         lane_grids = np.asarray(lane_grids, dtype=np.int32)
         if lane_grids.ndim == 2:
@@ -514,50 +524,31 @@ class Qwen2_5_VisionTransformer(nnx.Module):
         position_ids = np.zeros((batch, capacity, 2), dtype=np.int32)
         cu_seqlens = np.zeros((batch, 2, num_units + 1), dtype=np.int32)
 
-        def grid_layout(t: int, h: int, w: int):
-            grid_h, grid_w = h // merge, w // merge
-            index = np.arange(t * grid_h * grid_w).reshape(t, grid_h, grid_w)
-            pad_h, pad_w = (-grid_h) % window, (-grid_w) % window
-            windows_h, windows_w = (grid_h + pad_h) // window, (grid_w + pad_w) // window
-            index = np.pad(index, ((0, 0), (0, pad_h), (0, pad_w)), constant_values=-1)
-            index = index.reshape(t, windows_h, window, windows_w, window)
-            index = index.transpose(0, 1, 3, 2, 4).reshape(-1, window, window)
-            window_lengths = (index != -1).sum(axis=(1, 2)).astype(np.int32) * unit
-            index = index.reshape(-1)
-            index = index[index != -1].astype(np.int32)
-
-            y, x = np.indices((h, w))
-            coords = np.stack((y, x), axis=-1)
-            coords = coords.reshape(grid_h, merge, grid_w, merge, 2)
-            coords = coords.transpose(0, 2, 1, 3, 4).reshape(h * w, 2)
-            coords = np.tile(coords, (t, 1))
-            coords = coords.reshape(-1, unit, 2)[index].reshape(t * h * w, 2)
-            return index, window_lengths, coords
-
         for lane, grids in enumerate(lane_grids):
             patch_offset = unit_offset = 0
-            window_ends = []
-            frame_ends = []
-            for grid in grids:
+            segment_offsets = [1, 1]
+            for item_index, grid in enumerate(grids):
                 if not np.any(grid):
                     continue
-                t, h, w = map(int, grid)
-                patch_count = t * h * w
-                window_index, window_lengths, coords = grid_layout(t, h, w)
-                unit_count = patch_count // unit
+                layout = None if lane_layouts is None else lane_layouts[lane][item_index]
+                if layout is None:
+                    # Direct model calls and precompilation have no processor output.
+                    layout = build_vision_layout(grid, merge, window)
+                patch_count = len(layout.position_ids)
+                unit_count = len(layout.indices)
                 patch_slice = slice(patch_offset, patch_offset + patch_count)
                 unit_slice = slice(unit_offset, unit_offset + unit_count)
-                indices[lane, unit_slice, 0] = window_index + unit_offset
-                position_ids[lane, patch_slice] = coords
-                window_ends.extend(patch_offset + np.cumsum(window_lengths))
-                frame_ends.extend(patch_offset + np.arange(1, t + 1, dtype=np.int32) * h * w)
+                np.add(layout.indices, unit_offset, out=indices[lane, unit_slice])
+                position_ids[lane, patch_slice] = layout.position_ids
+                for kind, ends in enumerate((layout.window_ends, layout.frame_ends)):
+                    start = segment_offsets[kind]
+                    end = start + len(ends)
+                    np.add(ends, patch_offset, out=cu_seqlens[lane, kind, start:end])
+                    segment_offsets[kind] = end
                 patch_offset += patch_count
                 unit_offset += unit_count
-            indices[lane, :, 1] = np.argsort(indices[lane, :, 0]).astype(np.int32)
-            for layout, ends in enumerate((window_ends, frame_ends)):
-                count = len(ends)
-                cu_seqlens[lane, layout, 1 : count + 1] = ends
-                cu_seqlens[lane, layout, count + 1 :] = patch_offset
+            for kind, start in enumerate(segment_offsets):
+                cu_seqlens[lane, kind, start:] = patch_offset
         # cu_seqlens[:, 0] is the window layout, [:, 1] the full-frame layout.
         window_cu_seqlens = cu_seqlens[:, 0]
         full_cu_seqlens = cu_seqlens[:, 1]

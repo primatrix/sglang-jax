@@ -121,7 +121,7 @@ def _items(grids, ranges, modality=Modality.IMAGE):
 
 
 def _pack_qwen2(visual, items):
-    patches, grid_thw, output_indices = pack_vision_inputs(
+    patches, grid_thw, output_indices, _ = pack_vision_inputs(
         items,
         num_lanes=encoder_num_lanes(visual.mesh, visual.vision_tp),
         buckets=visual.input_buckets,
@@ -261,7 +261,8 @@ def test_vision_batch_layout_uses_all_encoder_lanes(vision_tp, expected_lanes):
 def _assert_vision_precompile(visual):
     calls = []
 
-    def encode(patches, grid_thw):
+    def encode(patches, grid_thw, *, lane_layouts=None):
+        assert lane_layouts is None
         calls.append((patches.shape, np.asarray(grid_thw).tolist()))
         return jnp.zeros(
             (
@@ -988,6 +989,7 @@ def test_model_runner_forward_embeds_multimodal_inputs():
     expected = ("forwarded", 0)
     runner = SimpleNamespace(
         forward_pass_id=0,
+        server_args=SimpleNamespace(simulate_compute=False),
         model=model,
         embedding_pool=embedding_pool,
         _forward_raw=lambda batch, metadata: expected,
@@ -1200,3 +1202,40 @@ def test_qwen2_metadata_is_host_planned_and_bucket_stable():
     )
     jax.block_until_ready(visual.encode(second_patches, second_grid_thw))
     assert visual._encode_jit._cache_size() == cache_size
+
+
+@pytest.mark.parametrize("num_lanes", [1, 2, 4])
+def test_qwen2_preprocessed_layouts_follow_dynamic_lane_packing(monkeypatch, num_lanes):
+    config = _vision_config(spatial_merge_size=2, window_size=4)
+    visual = _visual(config=config, input_buckets=(64,))
+    # Different sizes, video frames, a partial window, and an empty lane at DP=4.
+    items = _items([(1, 6, 2), (1, 4, 6)], [(0, 3), (3, 9)])
+    items += _items([(2, 2, 6)], [(0, 6)], Modality.VIDEO)
+
+    def pack():
+        return pack_vision_inputs(
+            items, num_lanes=num_lanes, buckets=(64,), merge_unit=4, dtype=np.float32
+        )
+
+    patches, grids, output_indices, _ = pack()
+    expected = visual._build_metadata(grids, 64)
+    expected_output = _run_grid_vision(visual, items) if num_lanes == 1 else None
+    processor = object.__new__(QwenVLProcessor)
+    processor.hf_config = SimpleNamespace(architectures=[ARCH], vision_config=config)
+    processor._prepare_vision_layouts(items)
+
+    def unexpected_planning(*args, **kwargs):
+        pytest.fail("The ViT thread must reuse per-image layouts from preprocessing")
+
+    monkeypatch.setattr("sgl_jax.srt.models.qwen2_5_vl.build_vision_layout", unexpected_planning)
+    packed, packed_grids, packed_output_indices, layouts = pack()
+    np.testing.assert_array_equal(packed, patches)
+    np.testing.assert_array_equal(packed_grids, grids)
+    np.testing.assert_array_equal(packed_output_indices, output_indices)
+    actual = visual._build_metadata(grids, 64, lane_layouts=layouts)
+    for want, got in zip(jax.tree.leaves(expected), jax.tree.leaves(actual), strict=True):
+        np.testing.assert_array_equal(got, want)
+    assert actual[2].max_seq_len == expected[2].max_seq_len
+    assert actual[3].max_seq_len == expected[3].max_seq_len
+    if num_lanes == 1:
+        np.testing.assert_array_equal(_run_grid_vision(visual, items), expected_output)

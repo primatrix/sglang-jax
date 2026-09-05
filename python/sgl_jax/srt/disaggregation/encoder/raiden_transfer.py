@@ -138,10 +138,14 @@ class RaidenEncoderServerTransfer:
         token_counts: tuple[int, ...],
         contiguous: bool,
     ) -> tuple[Any, ...]:
+        sharding = packed.sharding
+        if isinstance(sharding, jax.sharding.NamedSharding) and sharding.is_fully_replicated:
+            # P() and P(None, None) describe the same replicated packed output.
+            sharding = sharding.update(spec=jax.sharding.PartitionSpec())
         return (
             tuple(int(dim) for dim in packed.shape),
             str(packed.dtype),
-            repr(packed.sharding),
+            sharding,
             token_counts,
             contiguous,
         )

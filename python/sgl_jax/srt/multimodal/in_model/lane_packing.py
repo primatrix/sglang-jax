@@ -15,6 +15,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jax.typing import ArrayLike
 
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
+from sgl_jax.srt.multimodal.common.vision_layout import VisionLayout
 from sgl_jax.srt.utils.jax_utils import canonicalize_sharding
 
 
@@ -167,7 +168,7 @@ def pack_vision_inputs(
     buckets: tuple[int, ...],
     merge_unit: int,
     dtype: np.dtype | type,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[list[VisionLayout | None]]]:
     _validate_vision_items(items, merge_unit)
     packed = pack_lanes(
         items,
@@ -180,10 +181,12 @@ def pack_vision_inputs(
         (num_lanes, max(map(len, packed.lanes)), 3),
         dtype=np.int32,
     )
+    lane_layouts = []
     for lane_index, lane in enumerate(packed.lanes):
+        lane_layouts.append([items[index].get("vision_layout") for index in lane])
         for item_offset, item_index in enumerate(lane):
             grid_thw[lane_index, item_offset] = get_grid_thw(items[item_index])
-    return packed.features, grid_thw, packed.output_indices
+    return packed.features, grid_thw, packed.output_indices, lane_layouts
 
 
 def pack_2d_position_inputs(
@@ -308,14 +311,17 @@ def run_mrope_vision_model(
         )
         output = vision_model(patches, position_ids, patch_counts)
     elif rope_type in ("rope_3d", "rope_2d"):
-        patches, grid_thw, output_indices = pack_vision_inputs(
+        patches, grid_thw, output_indices, lane_layouts = pack_vision_inputs(
             items,
             num_lanes=num_lanes,
             buckets=buckets,
             merge_unit=merge_unit,
             dtype=dtype,
         )
-        output = vision_model(patches, grid_thw)
+        if any(layout is not None for lane in lane_layouts for layout in lane):
+            output = vision_model(patches, grid_thw, lane_layouts=lane_layouts)
+        else:
+            output = vision_model(patches, grid_thw)
     else:
         raise ValueError(f"Unsupported vision RoPE type: {rope_type}")
 

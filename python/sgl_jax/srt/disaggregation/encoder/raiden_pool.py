@@ -10,6 +10,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from sgl_jax.srt.disaggregation.encoder.embedding_data import PooledEmbedding
 from sgl_jax.srt.disaggregation.encoder.transfer_layout import encoder_pool_block_shape
@@ -116,20 +117,11 @@ def _compile_donated_packed_copy(
     *,
     contiguous: bool,
 ) -> Any:
-    if contiguous:
-        compiled = _copy_contiguous_packed_batch_into_slots.lower(
-            pool,
-            packed,
-            jnp.asarray(0, dtype=jnp.int32),
-            token_counts=token_counts,
-        ).compile()
-    else:
-        compiled = _copy_packed_batch_into_slots.lower(
-            pool,
-            packed,
-            jnp.zeros((len(token_counts),), dtype=jnp.int32),
-            token_counts=token_counts,
-        ).compile()
+    copy_fn = (
+        _copy_contiguous_packed_batch_into_slots if contiguous else _copy_packed_batch_into_slots
+    )
+    slot_spec = jax.ShapeDtypeStruct(() if contiguous else (len(token_counts),), np.int32)
+    compiled = copy_fn.lower(pool, packed, slot_spec, token_counts=token_counts).compile()
     stats = compiled.memory_analysis()
     stats = stats if isinstance(stats, (list, tuple)) else (stats,)
     if not stats or any(
@@ -228,18 +220,9 @@ class RaidenSendPool:
         inferred_contiguous = slots == list(range(slots[0], slots[0] + len(slots)))
         if contiguous != inferred_contiguous:
             raise ValueError("Raiden contiguous pool-write mode does not match slots")
-        if contiguous:
-            self._buffer, ready = executable(
-                self._buffer,
-                packed,
-                jnp.asarray(slots[0], dtype=jnp.int32),
-            )
-        else:
-            self._buffer, ready = executable(
-                self._buffer,
-                packed,
-                jnp.asarray(slots, dtype=jnp.int32),
-            )
+        # Host slot IDs need a transfer, not a shape-specific conversion JIT.
+        slot_indices = jax.device_put(np.asarray(slots[0] if contiguous else slots, dtype=np.int32))
+        self._buffer, ready = executable(self._buffer, packed, slot_indices)
         return ready
 
 
