@@ -8,7 +8,6 @@ from types import MethodType, SimpleNamespace
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from sgl_jax.srt.disaggregation.encoder.server import MMEncoder
 from sgl_jax.srt.multimodal.common.modality_enum import (
     Modality,
@@ -45,14 +44,19 @@ def _encoder(output: jnp.ndarray, processed: list[MultimodalInputs]) -> MMEncode
 
 
 async def _run_encoder(encoder: MMEncoder, requests: list[dict]):
-    return encoder.encode(await encoder.preprocess(requests))
+    prepared = await asyncio.gather(
+        *(encoder.preprocess_request(request) for request in requests)
+    )
+    return encoder.encode(encoder.build_batch(prepared))
 
 
 def test_encode_discards_jax_bucket_padding():
     output = jnp.arange(16, dtype=jnp.float32).reshape(8, 2)
     encoder = _encoder(output, [_inputs(2), _inputs(3)])
 
-    results = asyncio.run(_run_encoder(encoder, [{"modality": "IMAGE"}, {"modality": "IMAGE"}]))
+    results = asyncio.run(
+        _run_encoder(encoder, [{"modality": "IMAGE"}, {"modality": "IMAGE"}])
+    )
 
     np.testing.assert_array_equal(results[0][0], output[:2])
     np.testing.assert_array_equal(results[1][0], output[2:5])

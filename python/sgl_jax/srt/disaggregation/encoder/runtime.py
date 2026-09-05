@@ -4,40 +4,56 @@ import asyncio
 import queue
 import threading
 import time
-from collections.abc import Callable
+from collections import deque
+from collections.abc import Callable, Hashable
 from dataclasses import dataclass
 from typing import Any
 
 from sgl_jax.srt.disaggregation.encoder.embedding_data import EmbeddingData
 from sgl_jax.srt.multimodal.common.modality_enum import Modality
 
-_ResultCallback = Callable[[int, EmbeddingData | Exception], None]
+_ResultCallback = Callable[[EmbeddingData | Exception], None]
 _STOP = object()
 
 
 @dataclass(slots=True)
-class _EncodeJob:
-    requests: list[dict[str, Any]]
-    prepared: Any
+class PreprocessedRequest:
+    request: dict[str, Any]
+    value: Any
+    batch_key: Hashable
     preprocess_start_ns: int
+
+
+@dataclass(slots=True)
+class _ReadyJob:
+    prepared: PreprocessedRequest
     callback: _ResultCallback
     callback_loop: asyncio.AbstractEventLoop
 
+
+@dataclass(slots=True)
+class _EncodeJob:
+    items: list[_ReadyJob]
+    prepared: Any
+
     def deliver(self, index: int, result: EmbeddingData | Exception) -> None:
-        self.callback_loop.call_soon_threadsafe(self.callback, index, result)
+        item = self.items[index]
+        item.callback_loop.call_soon_threadsafe(item.callback, result)
 
     def deliver_many(self, results: list[tuple[int, EmbeddingData | Exception]]) -> None:
-        self.callback_loop.call_soon_threadsafe(self._deliver_many_on_loop, tuple(results))
+        loop = self.items[0].callback_loop
+        deliveries = tuple((self.items[index].callback, result) for index, result in results)
+        loop.call_soon_threadsafe(self._deliver_many_on_loop, deliveries)
 
+    @staticmethod
     def _deliver_many_on_loop(
-        self,
-        results: tuple[tuple[int, EmbeddingData | Exception], ...],
+        deliveries: tuple[tuple[_ResultCallback, EmbeddingData | Exception], ...],
     ) -> None:
-        for index, result in results:
-            self.callback(index, result)
+        for callback, result in deliveries:
+            callback(result)
 
     def fail_batch(self, exc: Exception) -> None:
-        self.deliver_many([(index, exc) for index in range(len(self.requests))])
+        self.deliver_many([(index, exc) for index in range(len(self.items))])
 
 
 @dataclass(slots=True)
@@ -55,17 +71,25 @@ class _TransferBatchJob:
 
 
 class EncoderRuntime:
+    """Collect completed preprocessing and run ViT/transfer pipeline stages."""
+
     def __init__(
         self,
         encoder: Any,
         transfer: Any,
         *,
         pipeline_depth: int = 2,
+        max_batch_size: int = 8,
+        batch_coalesce_ms: float = 0.0,
     ) -> None:
         self._encoder = encoder
         self._transfer = transfer
         depth = max(1, int(pipeline_depth))
-        self._encode_queue: queue.Queue[_EncodeJob | object] = queue.Queue(depth)
+        self._max_batch_size = max(1, int(max_batch_size))
+        self._batch_coalesce_s = max(0.0, float(batch_coalesce_ms)) / 1000.0
+        # This is the completed-preprocess reservoir. The ViT thread drains it
+        # only when the device is ready, so a future batch is never frozen early.
+        self._vit_queue: queue.Queue[_ReadyJob | object] = queue.Queue(depth * self._max_batch_size)
         # Pool reservations provide backpressure. This queue carries only small
         # ready tickets, so it does not need a second capacity limit.
         self._transfer_queue: queue.SimpleQueue[_TransferBatchJob | object] = queue.SimpleQueue()
@@ -74,6 +98,16 @@ class EncoderRuntime:
         self._accepting = True
         self._vit_thread: threading.Thread | None = None
         self._transfer_thread: threading.Thread | None = None
+
+    @property
+    def preprocess_concurrency(self) -> int:
+        return max(
+            1,
+            min(
+                self._max_batch_size,
+                int(getattr(self._encoder, "preprocess_concurrency", self._max_batch_size)),
+            ),
+        )
 
     def start(self) -> None:
         with self._start_lock:
@@ -106,7 +140,7 @@ class EncoderRuntime:
 
     def _stop_workers(self) -> None:
         # Drain each stage before stopping the next one.
-        self._encode_queue.put(_STOP)
+        self._vit_queue.put(_STOP)
         if self._vit_thread is not None:
             self._vit_thread.join()
 
@@ -118,57 +152,123 @@ class EncoderRuntime:
         with self._start_lock:
             self._started = False
 
-    async def execute_batch(
+    async def preprocess_request(self, request: dict[str, Any]) -> PreprocessedRequest:
+        if not self._accepting:
+            raise RuntimeError("EncoderRuntime is stopped")
+        preprocess_start_ns = time.time_ns()
+        value = await self._encoder.preprocess_request(request)
+        return PreprocessedRequest(
+            request=request,
+            value=value,
+            batch_key=self._encoder.batch_key(value),
+            preprocess_start_ns=preprocess_start_ns,
+        )
+
+    async def enqueue_preprocessed(
         self,
-        requests: list[dict[str, Any]],
+        prepared: PreprocessedRequest,
         on_result_callback: _ResultCallback,
     ) -> None:
-        if not requests:
-            return
         if not self._accepting:
             raise RuntimeError("EncoderRuntime is stopped")
         if not self._started:
             self.start()
-
-        # This coroutine performs orchestration only. MMEncoder.preprocess
-        # delegates image loading and HF processing to their own executors.
-        preprocess_start_ns = time.time_ns()
-        prepared = await self._encoder.preprocess(requests)
-        precompile_packed = getattr(self._transfer, "precompile_packed_batches", None)
-        transfer_specs = getattr(prepared, "transfer_specs", ())
-        if callable(precompile_packed) and transfer_specs:
-            precompile_packed(transfer_specs)
-        if not self._accepting:
-            raise RuntimeError("EncoderRuntime stopped during preprocessing")
-        job = _EncodeJob(
-            requests=requests,
-            prepared=prepared,
-            preprocess_start_ns=preprocess_start_ns,
-            callback=on_result_callback,
-            callback_loop=asyncio.get_running_loop(),
-        )
+        job = _ReadyJob(prepared, on_result_callback, asyncio.get_running_loop())
         try:
-            self._encode_queue.put_nowait(job)
+            self._vit_queue.put_nowait(job)
         except queue.Full:
-            # Backpressure is intentionally offloaded instead of blocking the
-            # server event loop. With pipeline_depth >= 2 this is a cold path.
-            await asyncio.to_thread(self._encode_queue.put, job)
+            await asyncio.to_thread(self._vit_queue.put, job)
 
     def _vit_worker(self) -> None:
+        backlog: deque[_ReadyJob] = deque()
+        stopping = False
         while True:
-            item = self._encode_queue.get()
-            try:
+            if backlog:
+                item = backlog.popleft()
+            elif stopping:
+                return
+            else:
+                item = self._get_vit_queue()
                 if item is _STOP:
                     return
-                assert isinstance(item, _EncodeJob)
-                self._run_vit(item)
-            finally:
-                self._encode_queue.task_done()
+            assert isinstance(item, _ReadyJob)
+            batch, saw_stop = self._collect_ready(item, backlog)
+            stopping = stopping or saw_stop
+            job = _EncodeJob(batch, None)
+            try:
+                job.prepared = self._encoder.build_batch([item.prepared.value for item in batch])
+                precompile_packed = getattr(self._transfer, "precompile_packed_batches", None)
+                transfer_specs = getattr(job.prepared, "transfer_specs", ())
+                if callable(precompile_packed) and transfer_specs:
+                    precompile_packed(transfer_specs)
+            except Exception as exc:
+                job.fail_batch(exc)
+            else:
+                self._run_vit(job)
+
+    def _get_vit_queue(self, timeout: float | None = None) -> Any:
+        if timeout is None:
+            item = self._vit_queue.get()
+        elif timeout <= 0:
+            item = self._vit_queue.get_nowait()
+        else:
+            item = self._vit_queue.get(timeout=timeout)
+        self._vit_queue.task_done()
+        return item
+
+    def _collect_ready(
+        self,
+        first: _ReadyJob,
+        backlog: deque[_ReadyJob],
+    ) -> tuple[list[_ReadyJob], bool]:
+        batch = [first]
+        key = first.prepared.batch_key
+
+        retained: deque[_ReadyJob] = deque()
+        while backlog:
+            item = backlog.popleft()
+            if (
+                item.callback_loop is first.callback_loop
+                and item.prepared.batch_key == key
+                and len(batch) < self._max_batch_size
+            ):
+                batch.append(item)
+            else:
+                retained.append(item)
+        backlog.extend(retained)
+
+        deadline = time.monotonic() + self._batch_coalesce_s
+        saw_stop = False
+        while len(batch) < self._max_batch_size:
+            try:
+                item = self._get_vit_queue(timeout=0)
+            except queue.Empty:
+                # A ready incompatible request is immediately actionable; do
+                # not leave the device idle waiting for this key to grow.
+                if backlog:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    item = self._get_vit_queue(timeout=remaining)
+                except queue.Empty:
+                    break
+
+            if item is _STOP:
+                saw_stop = True
+                break
+            assert isinstance(item, _ReadyJob)
+            if item.callback_loop is first.callback_loop and item.prepared.batch_key == key:
+                batch.append(item)
+            else:
+                backlog.append(item)
+        return batch, saw_stop
 
     def _run_vit(self, job: _EncodeJob) -> None:
+        requests = [item.prepared.request for item in job.items]
         transfer_ids = [
-            f"{request['req_id']}:{request.get('part_idx', 0)}:embedding"
-            for request in job.requests
+            f"{request['req_id']}:{request.get('part_idx', 0)}:embedding" for request in requests
         ]
         reservations = None
         try:
@@ -181,6 +281,9 @@ class EncoderRuntime:
             )
             staged_transfers = None
             if use_packed:
+                assert callable(encode_packed)
+                assert callable(metadata_for_packed)
+                assert callable(stage_packed)
                 packed_output = encode_packed(job.prepared)
                 runtime_encode_return_ns = time.time_ns()
                 copy_start_ns = time.time_ns()
@@ -209,9 +312,9 @@ class EncoderRuntime:
                 results = [
                     (embedding.shape, embedding.dtype, metadata) for embedding, metadata in encoded
                 ]
-            if len(results) != len(job.requests):
+            if len(results) != len(requests):
                 raise RuntimeError(
-                    f"encoder returned {len(results)} results for {len(job.requests)} requests"
+                    f"encoder returned {len(results)} results for {len(requests)} requests"
                 )
             encode_done_ns = time.time_ns()
             transfer_jobs = []
@@ -219,7 +322,7 @@ class EncoderRuntime:
             embedding_data_duration_ns = 0
             result_pack_duration_ns = 0
             for index, (request, transfer_id, (embedding_shape, dtype, metadata)) in enumerate(
-                zip(job.requests, transfer_ids, results)
+                zip(requests, transfer_ids, results)
             ):
                 phase_start_ns = time.perf_counter_ns()
                 metadata = dict(metadata)
@@ -239,7 +342,7 @@ class EncoderRuntime:
                     embedding_shape=embedding_shape,
                     dtype=str(dtype),
                     dispatch_start_ns=request.get("dispatch_start_ns"),
-                    preprocess_start_ns=job.preprocess_start_ns,
+                    preprocess_start_ns=job.items[index].prepared.preprocess_start_ns,
                     **metadata,
                     **encoder_timing,
                 )
@@ -332,7 +435,7 @@ class EncoderRuntime:
             if len(metadata) != len(batch.jobs):
                 raise RuntimeError("transfer returned incomplete batch metadata")
         except Exception as exc:
-            deliveries = []
+            deliveries: list[tuple[int, EmbeddingData | Exception]] = []
             for job in batch.jobs:
                 self._transfer.release(job.transfer_id)
                 deliveries.append((job.index, exc))
@@ -385,6 +488,8 @@ class EncoderRuntime:
         job.data.transfer_register_done_ns = (
             getattr(job.data, "transfer_register_done_ns", None) or time.time_ns()
         )
+        assert job.data.transfer_copy_done_ns is not None
+        assert job.data.transfer_register_done_ns is not None
         job.data.transfer_publish_ready_ns = getattr(
             job.data, "transfer_publish_ready_ns", None
         ) or max(job.data.transfer_copy_done_ns, job.data.transfer_register_done_ns)

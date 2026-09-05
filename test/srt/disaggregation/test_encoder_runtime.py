@@ -7,9 +7,13 @@ from types import SimpleNamespace
 from typing import cast
 
 import jax.numpy as jnp
-
 from sgl_jax.srt.disaggregation.encoder.embedding_data import EmbeddingData
-from sgl_jax.srt.disaggregation.encoder.runtime import EncoderRuntime, _EncodeJob
+from sgl_jax.srt.disaggregation.encoder.runtime import (
+    EncoderRuntime,
+    PreprocessedRequest,
+    _EncodeJob,
+    _ReadyJob,
+)
 from sgl_jax.srt.disaggregation.encoder.scheduler import DisaggEncoderScheduler
 from sgl_jax.srt.disaggregation.encoder.server import EncoderServer
 from sgl_jax.srt.disaggregation.encoder.sim_transfer import SimEncoderServerTransfer
@@ -17,14 +21,30 @@ from sgl_jax.srt.multimodal.common.modality_enum import Modality
 
 
 class _TestEncoder:
+    preprocess_concurrency = 8
+
     def __init__(self, encode, preprocess=None):
         self._encode = encode
         self._preprocess = preprocess
 
-    async def preprocess(self, requests):
+    async def preprocess_request(self, request):
         if self._preprocess is None:
-            return requests
-        return await self._preprocess(requests)
+            return request
+        return await self._preprocess([request])
+
+    @staticmethod
+    def batch_key(prepared):
+        request = prepared[0] if isinstance(prepared, list) else prepared
+        if isinstance(request, dict):
+            return request.get("modality"), request.get("token_count", 1)
+        return request
+
+    def build_batch(self, prepared):
+        if self._preprocess is None:
+            return prepared
+        if all(isinstance(item, list) for item in prepared):
+            return [request for item in prepared for request in item]
+        return prepared[0] if len(prepared) == 1 else prepared
 
     def encode(self, prepared):
         return self._encode(prepared)
@@ -77,10 +97,22 @@ async def _collect(runtime: EncoderRuntime, requests: list[dict]):
         if len(results) == len(requests):
             done.set()
 
-    await runtime.execute_batch(requests, complete)
+    await _enqueue(runtime, requests, complete)
     if requests:
         await done.wait()
     return results
+
+
+async def _enqueue(runtime: EncoderRuntime, requests: list[dict], callback):
+    prepared = await asyncio.gather(
+        *(runtime.preprocess_request(request) for request in requests)
+    )
+    for index, item in enumerate(prepared):
+
+        def complete(result, index=index):
+            callback(index, result)
+
+        await runtime.enqueue_preprocessed(item, complete)
 
 
 def test_encode_job_batches_cross_thread_deliveries_into_one_wakeup():
@@ -95,11 +127,15 @@ def test_encode_job_batches_cross_thread_deliveries_into_one_wakeup():
     delivered = []
     loop = RecordingLoop()
     job = _EncodeJob(
-        requests=[{}, {}],
+        items=[
+            _ReadyJob(
+                PreprocessedRequest({}, None, None, 0),
+                lambda result, index=index: delivered.append((index, result)),
+                cast(asyncio.AbstractEventLoop, loop),
+            )
+            for index in range(2)
+        ],
         prepared=None,
-        preprocess_start_ns=0,
-        callback=lambda index, result: delivered.append((index, result)),
-        callback_loop=cast(asyncio.AbstractEventLoop, loop),
     )
     first = _data("first")
     second = _data("second")
@@ -126,141 +162,33 @@ def test_server_owns_scheduler_and_runtime():
 
 
 def test_scheduler_records_enqueue_and_dequeue_timestamps(caplog):
-    class RecordingRuntime:
-        def __init__(self):
-            self.requests = []
-
-        async def execute_batch(self, requests, on_result):
-            self.requests.extend(requests)
-            for index, request in enumerate(requests):
-                on_result(index, _data(request["req_id"]))
-
-        def release(self, transfer_id):
-            pass
-
     async def run():
-        runtime = RecordingRuntime()
+        runtime = EncoderRuntime(
+            _TestEncoder(lambda requests: [(jnp.zeros((1, 2)), {}) for _ in requests]),
+            _FakeTransfer(),
+        )
         scheduler = DisaggEncoderScheduler(runtime, log_queue_timing=True)
         scheduler.start()
         try:
-            data = await scheduler.submit({"req_id": "request-0", "modality": "IMAGE"})
-            return runtime, data
+            return await scheduler.submit(
+                {
+                    "req_id": "request-0",
+                    "modality": "IMAGE",
+                    "collect_request_time_stats": True,
+                }
+            )
         finally:
             await scheduler.stop()
+            await runtime.stop()
 
     caplog.set_level("INFO")
-    runtime, data = asyncio.run(run())
+    data = asyncio.run(run())
 
-    assert [request["req_id"] for request in runtime.requests] == ["request-0"]
     assert isinstance(data.enqueue_ns, int)
     assert isinstance(data.dequeue_ns, int)
     assert data.queue_duration_ns >= 0
     assert data.queue_ms == data.queue_duration_ns / 1_000_000
     assert "ENCODER-QUEUE-TIME req_id=request-0" in caplog.text
-
-
-def test_scheduler_coalesces_requests_with_one_bounded_deadline():
-    batches = []
-
-    async def run() -> None:
-        class RecordingRuntime:
-            async def execute_batch(self, requests, on_result):
-                batches.append([request["req_id"] for request in requests])
-                for index, request in enumerate(requests):
-                    on_result(index, _data(request["req_id"]))
-
-            def release(self, transfer_id):
-                pass
-
-        scheduler = DisaggEncoderScheduler(
-            RecordingRuntime(),
-            max_batch_size=4,
-            batch_coalesce_ms=50,
-        )
-        scheduler.start()
-        first = asyncio.create_task(scheduler.submit({"req_id": "request-0", "modality": "IMAGE"}))
-        await asyncio.sleep(0.01)
-        second = asyncio.create_task(scheduler.submit({"req_id": "request-1", "modality": "IMAGE"}))
-        try:
-            await asyncio.gather(first, second)
-        finally:
-            await scheduler.stop()
-
-    asyncio.run(run())
-    assert batches == [["request-0", "request-1"]]
-
-
-def test_scheduler_dispatches_full_batch_without_waiting_for_deadline():
-    batches = []
-
-    async def run() -> None:
-        dispatched = asyncio.Event()
-
-        class RecordingRuntime:
-            async def execute_batch(self, requests, on_result):
-                batches.append([request["req_id"] for request in requests])
-                dispatched.set()
-                for index, request in enumerate(requests):
-                    on_result(index, _data(request["req_id"]))
-
-            def release(self, transfer_id):
-                pass
-
-        scheduler = DisaggEncoderScheduler(
-            RecordingRuntime(),
-            max_batch_size=2,
-            batch_coalesce_ms=500,
-        )
-        first = asyncio.create_task(scheduler.submit({"req_id": "request-0", "modality": "IMAGE"}))
-        second = asyncio.create_task(scheduler.submit({"req_id": "request-1", "modality": "IMAGE"}))
-        scheduler.start()
-        try:
-            await asyncio.wait_for(dispatched.wait(), 0.1)
-            await asyncio.gather(first, second)
-        finally:
-            await scheduler.stop()
-
-    asyncio.run(run())
-    assert batches == [["request-0", "request-1"]]
-
-
-def test_scheduler_pipelines_bounded_inflight_batches():
-    started = []
-
-    async def run() -> None:
-        both_started = asyncio.Event()
-        release = asyncio.Event()
-
-        class ControlledRuntime:
-            async def execute_batch(self, requests, on_result):
-                req_id = requests[0]["req_id"]
-                started.append(req_id)
-                if len(started) == 2:
-                    both_started.set()
-                await release.wait()
-                on_result(0, _data(req_id))
-
-            def release(self, transfer_id):
-                pass
-
-        scheduler = DisaggEncoderScheduler(
-            ControlledRuntime(),
-            max_batch_size=1,
-            max_inflight_batches=2,
-        )
-        scheduler.start()
-        first = asyncio.create_task(scheduler.submit({"req_id": "request-0", "modality": "IMAGE"}))
-        second = asyncio.create_task(scheduler.submit({"req_id": "request-1", "modality": "IMAGE"}))
-        try:
-            await asyncio.wait_for(both_started.wait(), 1)
-            release.set()
-            await asyncio.gather(first, second)
-        finally:
-            release.set()
-            await scheduler.stop()
-
-    asyncio.run(run())
-    assert started == ["request-0", "request-1"]
 
 
 def test_scheduler_preprocesses_next_batch_while_vit_is_busy():
@@ -282,10 +210,16 @@ def test_scheduler_preprocesses_next_batch_while_vit_is_busy():
                     raise TimeoutError("test did not release first encoder batch")
             return [(jnp.zeros((1, 2)), {})]
 
-        runtime = EncoderRuntime(_TestEncoder(encode, preprocess), _FakeTransfer())
-        scheduler = DisaggEncoderScheduler(runtime, max_batch_size=1)
+        runtime = EncoderRuntime(
+            _TestEncoder(encode, preprocess),
+            _FakeTransfer(),
+            max_batch_size=1,
+        )
+        scheduler = DisaggEncoderScheduler(runtime)
         scheduler.start()
-        first = asyncio.create_task(scheduler.submit({"req_id": "request-0", "modality": "IMAGE"}))
+        first = asyncio.create_task(
+            scheduler.submit({"req_id": "request-0", "modality": "IMAGE"})
+        )
         try:
             await asyncio.wait_for(first_encode_started.wait(), 1)
             second = asyncio.create_task(
@@ -297,6 +231,7 @@ def test_scheduler_preprocesses_next_batch_while_vit_is_busy():
         finally:
             release_first_encode.set()
             await scheduler.stop()
+            await runtime.stop()
 
     asyncio.run(run())
 
@@ -336,6 +271,7 @@ def test_scheduler_releases_result_cancelled_during_encode():
         finally:
             finish_encode.set()
             await scheduler.stop()
+            await runtime.stop()
         return transfer
 
     transfer = asyncio.run(run())
@@ -383,8 +319,16 @@ def test_runtime_stages_packed_output_before_building_metadata():
     events = []
 
     class PackedEncoder:
-        async def preprocess(self, _requests):
-            return SimpleNamespace(token_counts=(1, 1))
+        async def preprocess_request(self, _request):
+            return None
+
+        @staticmethod
+        def batch_key(_prepared):
+            return "image", 1
+
+        @staticmethod
+        def build_batch(prepared):
+            return SimpleNamespace(token_counts=(1,) * len(prepared))
 
         def encode(self, _prepared):
             raise AssertionError("legacy split path must not run")
@@ -410,7 +354,11 @@ def test_runtime_stages_packed_output_before_building_metadata():
             return [(reservation, packed) for reservation in reservations]
 
     async def run():
-        runtime = EncoderRuntime(PackedEncoder(), PackedTransfer())
+        runtime = EncoderRuntime(
+            PackedEncoder(),
+            PackedTransfer(),
+            batch_coalesce_ms=20,
+        )
         requests = [
             {"req_id": "request-0", "modality": "IMAGE"},
             {"req_id": "request-1", "modality": "IMAGE"},
@@ -550,7 +498,8 @@ def test_runtime_queues_results_and_completes_each_after_publish():
             completed[index].set()
 
         task = asyncio.create_task(
-            runtime.execute_batch(
+            _enqueue(
+                runtime,
                 [
                     {"req_id": "request-0", "modality": "IMAGE"},
                     {"req_id": "request-1", "modality": "IMAGE"},
@@ -621,7 +570,10 @@ def test_runtime_uses_backend_batch_publish_when_available():
 
         def publish_batch_sync(self, staged_transfers):
             self.batch_threads.append(threading.current_thread().name)
-            return [self.publish_sync(staged_transfer) for staged_transfer in staged_transfers]
+            return [
+                self.publish_sync(staged_transfer)
+                for staged_transfer in staged_transfers
+            ]
 
     def encode(requests):
         return [(jnp.zeros((1, 2)), {}) for _ in requests]
@@ -765,13 +717,14 @@ def test_runtime_overlaps_forward_with_background_publish():
         first_task = asyncio.create_task(
             _collect(runtime, [{"req_id": "request-0", "modality": "IMAGE"}])
         )
-        await asyncio.sleep(0)
+        for _ in range(100):
+            if encode_started:
+                break
+            await asyncio.sleep(0.001)
+        assert encode_started == ["request-0"]
         second_task = asyncio.create_task(
             _collect(runtime, [{"req_id": "request-1", "modality": "IMAGE"}])
         )
-        await asyncio.sleep(0)
-
-        assert encode_started == ["request-0"]
         release_first_encode.set()
         await asyncio.wait_for(second_encode_started.wait(), 1)
         assert await asyncio.to_thread(first_publish_started.wait, 1)
@@ -883,7 +836,7 @@ def test_runtime_progress_thread_releases_transfer_backpressure():
         def encode(requests):
             return [(jnp.zeros((1, 2)), {}) for _ in requests]
 
-        runtime = EncoderRuntime(_TestEncoder(encode), transfer)
+        runtime = EncoderRuntime(_TestEncoder(encode), transfer, max_batch_size=1)
         try:
             first = asyncio.create_task(
                 _collect(runtime, [{"req_id": "request-0", "modality": "IMAGE"}])
@@ -956,3 +909,87 @@ def test_runtime_allows_concurrent_preprocess_before_serial_encode():
         await asyncio.gather(first_task, second_task)
 
     asyncio.run(run())
+
+
+def test_preprocessed_requests_batch_at_vit_boundary():
+    async def run() -> list[list[str]]:
+        first_encode_started = asyncio.Event()
+        rest_preprocessed = asyncio.Event()
+        release_first_encode = threading.Event()
+        loop = asyncio.get_running_loop()
+        batches = []
+        prepared_count = 0
+
+        class BufferedEncoder:
+            preprocess_concurrency = 3
+
+            async def preprocess_request(self, request):
+                nonlocal prepared_count
+                if request["req_id"] != "request-0":
+                    prepared_count += 1
+                    if prepared_count == 3:
+                        rest_preprocessed.set()
+                return request
+
+            @staticmethod
+            def batch_key(request):
+                return request["modality"], request["token_count"]
+
+            @staticmethod
+            def build_batch(requests):
+                return requests
+
+            def encode(self, requests):
+                req_ids = [request["req_id"] for request in requests]
+                batches.append(req_ids)
+                if req_ids == ["request-0"]:
+                    loop.call_soon_threadsafe(first_encode_started.set)
+                    if not release_first_encode.wait(1):
+                        raise TimeoutError("test did not release first encoder batch")
+                return [(jnp.zeros((1, 2)), {}) for _ in requests]
+
+        runtime = EncoderRuntime(
+            BufferedEncoder(),
+            _FakeTransfer(),
+            pipeline_depth=1,
+            max_batch_size=3,
+        )
+        scheduler = DisaggEncoderScheduler(runtime)
+        scheduler.start()
+        first = asyncio.create_task(
+            scheduler.submit(
+                {
+                    "req_id": "request-0",
+                    "modality": "IMAGE",
+                    "token_count": 1,
+                }
+            )
+        )
+        try:
+            await asyncio.wait_for(first_encode_started.wait(), 1)
+            rest = [
+                asyncio.create_task(
+                    scheduler.submit(
+                        {
+                            "req_id": f"request-{index}",
+                            "modality": "IMAGE",
+                            "token_count": 1,
+                        }
+                    )
+                )
+                for index in range(1, 4)
+            ]
+            await asyncio.wait_for(rest_preprocessed.wait(), 1)
+            assert batches == [["request-0"]]
+            release_first_encode.set()
+            await asyncio.gather(first, *rest)
+            return batches
+        finally:
+            release_first_encode.set()
+            await scheduler.stop()
+            await runtime.stop()
+
+    assert asyncio.run(run()) == [
+        ["request-0"],
+        ["request-1", "request-2", "request-3"],
+    ]

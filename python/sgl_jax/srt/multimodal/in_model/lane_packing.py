@@ -15,6 +15,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jax.typing import ArrayLike
 
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
+from sgl_jax.srt.utils.jax_utils import canonicalize_sharding
 
 
 def get_grid_thw(item: MultimodalDataItem) -> tuple[int, int, int]:
@@ -253,12 +254,13 @@ def pack_2d_position_inputs(
 
 def _restore_input_order(
     output: jax.Array,
-    indices: jax.Array,
-    mask: jax.Array,
+    output_indices: jax.Array,
     *,
     out_sharding: NamedSharding,
 ) -> jax.Array:
     output = output.reshape(-1, output.shape[-1])
+    mask = output_indices >= 0
+    indices = jnp.maximum(output_indices, 0)
     output = output.at[indices].get(out_sharding=out_sharding)
     return jnp.where(mask[:, None], output, jnp.zeros((), output.dtype))
 
@@ -272,13 +274,14 @@ def restore_encoder_output(
     mesh: Mesh,
 ) -> jax.Array:
     output_indices = np.asarray(output_indices, dtype=np.int32)
-    mask = output_indices >= 0
-    indices = np.maximum(output_indices, 0)
-    out_sharding = NamedSharding(mesh, PartitionSpec())
+    out_sharding = canonicalize_sharding(NamedSharding(mesh, PartitionSpec()))
+    # Multi-device pjit cannot prepare host NumPy inputs on its C++ fast path.
+    # Put the one metadata argument on the mesh before entering the JIT; derive
+    # the mask and safe gather indices inside the compiled computation.
+    output_indices_device = jax.device_put(output_indices, out_sharding)
     return _restore_input_order_jit(
         output,
-        indices,
-        mask,
+        output_indices_device,
         out_sharding=out_sharding,
     )
 

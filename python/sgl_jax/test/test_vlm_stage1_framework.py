@@ -20,7 +20,7 @@ from sgl_jax.srt.multimodal.common.modality_enum import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sgl_jax.srt.multimodal.in_model import host_orchestration
+from sgl_jax.srt.multimodal.in_model import host_orchestration, lane_packing
 from sgl_jax.srt.multimodal.in_model.embedding_pool import EmbeddingPool
 from sgl_jax.srt.multimodal.in_model.host_orchestration import (
     _MergeMapping,
@@ -427,6 +427,29 @@ def test_replicate_across_mesh_reuses_rank_explicit_replication():
     )
 
     assert replicate_across_mesh(value, mesh) is value
+
+
+def test_restore_encoder_output_puts_metadata_on_mesh_before_jit():
+    mesh = _mesh()
+    sharding = NamedSharding(mesh, PartitionSpec())
+    output = jax.device_put(np.arange(8, dtype=np.float32).reshape(4, 2), sharding)
+    output_indices = np.asarray([1, -1, 0, 2], dtype=np.int32)
+    captured = {}
+
+    def restore(output_arg, output_indices_arg, *, out_sharding):
+        captured["indices"] = output_indices_arg
+        captured["out_sharding"] = out_sharding
+        return output_arg
+
+    with patch.object(lane_packing, "_restore_input_order_jit", side_effect=restore):
+        restored = lane_packing.restore_encoder_output(output, output_indices, mesh)
+
+    assert restored is output
+    assert isinstance(captured["indices"], jax.Array)
+    assert captured["indices"].sharding.is_fully_replicated
+    assert captured["indices"].sharding.device_set == set(mesh.devices.flat)
+    assert captured["out_sharding"].device_set == set(mesh.devices.flat)
+    np.testing.assert_array_equal(np.asarray(captured["indices"]), output_indices)
 
 
 def test_batch_separates_patch_and_placeholder_counts():

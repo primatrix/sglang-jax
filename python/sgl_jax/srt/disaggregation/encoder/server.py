@@ -73,6 +73,15 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
+class PreparedEncoderRequest:
+    modality: Modality
+    inputs: MultimodalInputs
+    request_timing: dict[str, int]
+    token_count: int
+    done_ns: int
+
+
+@dataclass(slots=True)
 class PreparedEncoderBatch:
     modality: Modality
     inputs: list[MultimodalInputs]
@@ -167,18 +176,38 @@ class MMEncoder:
         self.mm_processor = get_mm_processor(config, server_args, processor)
         self.tokenizer = get_tokenizer_from_processor(processor)
 
-    async def preprocess(self, requests: list[dict[str, Any]]) -> PreparedEncoderBatch:
+    async def preprocess_request(self, request: dict[str, Any]) -> PreparedEncoderRequest:
+        """Preprocess one request without committing it to a ViT batch."""
+        modality = Modality.from_str(request["modality"])
+        inputs, timing = await self._process_request(request, modality)
+        done_ns = time.time_ns()
+        timing["preprocess_done_ns"] = done_ns
+        return PreparedEncoderRequest(
+            modality=modality,
+            inputs=inputs,
+            request_timing=timing,
+            token_count=self._token_counts([inputs])[0],
+            done_ns=done_ns,
+        )
+
+    @staticmethod
+    def batch_key(prepared: PreparedEncoderRequest) -> tuple[Modality, int]:
+        """Requests sharing this key can use one packed transfer batch."""
+        return prepared.modality, prepared.token_count
+
+    def build_batch(
+        self,
+        requests: list[PreparedEncoderRequest],
+    ) -> PreparedEncoderBatch:
         if not requests:
             raise ValueError("MMEncoder batches must not be empty")
-        modality = Modality.from_str(requests[0]["modality"])
-        if any(Modality.from_str(request["modality"]) != modality for request in requests):
+        modality = requests[0].modality
+        if any(request.modality != modality for request in requests):
             raise ValueError("MMEncoder batches must contain one modality")
 
-        prepared = await asyncio.gather(
-            *(self._process_request(request, modality) for request in requests)
-        )
-        processed, timings = map(list, zip(*prepared))
-        token_counts = self._token_counts(processed)
+        processed = [request.inputs for request in requests]
+        timings = [request.request_timing for request in requests]
+        token_counts = tuple(request.token_count for request in requests)
         split_capacity, split_executable = self._precompile_splits(processed, token_counts)
         transfer_specs = self._packed_transfer_specs(
             processed,
@@ -193,7 +222,15 @@ class MMEncoder:
             split_capacity,
             split_executable,
             transfer_specs,
-            time.time_ns(),
+            max(request.done_ns for request in requests),
+        )
+
+    @property
+    def preprocess_concurrency(self) -> int:
+        """Keep the independent I/O and processor pools simultaneously busy."""
+        return min(
+            self._max_batch_size,
+            self.mm_processor.mm_io_worker_num + self.mm_processor.mm_processor_worker_num,
         )
 
     def _forward_packed(
@@ -378,9 +415,7 @@ class MMEncoder:
         self, request: dict[str, Any], modality: Modality
     ) -> tuple[MultimodalInputs, dict[str, int]]:
         timing = {}
-        if getattr(self, "_log_timing", False) and request.get(
-            "collect_request_time_stats", False
-        ):
+        if getattr(self, "_log_timing", False) and request.get("collect_request_time_stats", False):
             timing["preprocess_request_start_ns"] = time.time_ns()
         mm_items = request.get("mm_items") or []
         if not mm_items:
@@ -609,12 +644,11 @@ class EncoderServer:
             encoder,
             transfer,
             pipeline_depth=max_inflight_batches,
+            max_batch_size=max_batch_size,
+            batch_coalesce_ms=batch_coalesce_ms,
         )
         self.scheduler = DisaggEncoderScheduler(
             self.runtime,
-            max_batch_size=max_batch_size,
-            batch_coalesce_ms=batch_coalesce_ms,
-            max_inflight_batches=max_inflight_batches,
             request_timeout=request_timeout,
             log_queue_timing=log_queue_timing,
         )

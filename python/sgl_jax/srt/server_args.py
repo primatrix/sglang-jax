@@ -1818,7 +1818,7 @@ class ServerArgs:
             "--encoder-max-inflight-batches",
             type=int,
             default=ServerArgs.encoder_max_inflight_batches,
-            help="Maximum Encoder batches concurrently preprocessing or awaiting transfer.",
+            help="Completed-preprocess batches buffered ahead of the vision encoder.",
         )
 
         # CPU compute/transfer simulation (local EPD profiling without TPU)
