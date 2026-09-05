@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax._src import util as jax_util
 
 from sgl_jax.raiden import raiden_requested
 from sgl_jax.srt.disaggregation.encoder.client import (
@@ -145,6 +146,59 @@ def test_pool_write_needs_no_tracing_after_abstract_precompile(contiguous):
         np.testing.assert_array_equal(
             actual[slots, :, :3], packed_np[: count * 2].reshape(count, 2, 3)
         )
+
+
+@pytest.mark.parametrize("contiguous", [True, False])
+@pytest.mark.parametrize("axis_type", [jax.sharding.AxisType.Auto, jax.sharding.AxisType.Explicit])
+def test_pool_write_avoids_array_sharding_fallback(monkeypatch, contiguous, axis_type):
+    devices = jax.local_devices()
+    if len(devices) < 2:
+        pytest.skip("requires multiple devices to exercise input sharding fallback")
+    # On a >=3-device host, the default device is deliberately outside the mesh.
+    mesh = jax.sharding.Mesh(np.array(devices[-2:]), ("x",), axis_types=(axis_type,))
+    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(None, None))
+    packed_np = np.arange(24, dtype=np.float32).reshape(8, 3)
+    packed = jax.device_put(packed_np, sharding)
+    pool = RaidenSendPool((2, 3), np.float32, sharding, capacity=8)
+    executable = compile_packed_pool_copy(
+        jax.ShapeDtypeStruct(packed.shape, packed.dtype, sharding=sharding),
+        (2, 3),
+        capacity=8,
+        token_counts=(2, 2),
+        contiguous=contiguous,
+    )
+    slots = [0, 1] if contiguous else [0, 2]
+    # Warm the executable under the same dispatch context as the measured calls.
+    with jax.default_device(devices[0]), jax.no_tracing(True):
+        for _ in range(2):
+            jax.block_until_ready(
+                pool.copy_packed_batch_async(
+                    packed, slots, (2, 2), executable, contiguous=contiguous
+                )
+            )
+    expected = np.zeros((8, 2, 3), dtype=np.float32)
+    expected[slots] = packed_np[:4].reshape(2, 2, 3)
+
+    # JAX emits this event when C++ dispatch falls back to the Python array
+    # sharding handler. Host NumPy device_put uses a different handler.
+    events = []
+    with monkeypatch.context() as patcher:
+        patcher.setattr(jax_util, "test_event_listener", lambda name, *args: events.append(name))
+        with jax.default_device(devices[0]), jax.no_tracing(True):
+            for start in (3, 4):
+                values = packed_np + start * 100
+                packed = jax.device_put(values, sharding)
+                slots = [start, start + 1] if contiguous else [start, start + 2]
+                ready = pool.copy_packed_batch_async(
+                    packed, slots, (2, 2), executable, contiguous=contiguous
+                )
+                jax.block_until_ready(ready)
+                expected[slots] = values[:4].reshape(2, 2, 3)
+
+    assert "_array_shard_arg" not in events
+    actual = np.asarray(pool.buffer).reshape(8, 2, -1)
+    np.testing.assert_array_equal(actual[:, :, :3], expected)
+    np.testing.assert_array_equal(actual[:, :, 3:], 0)
 
 
 def test_raiden_server_uses_donated_request_pool(monkeypatch):

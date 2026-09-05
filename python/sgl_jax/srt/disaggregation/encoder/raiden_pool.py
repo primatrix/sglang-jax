@@ -220,8 +220,12 @@ class RaidenSendPool:
         inferred_contiguous = slots == list(range(slots[0], slots[0] + len(slots)))
         if contiguous != inferred_contiguous:
             raise ValueError("Raiden contiguous pool-write mode does not match slots")
-        # Host slot IDs need a transfer, not a shape-specific conversion JIT.
-        slot_indices = jax.device_put(np.asarray(slots[0] if contiguous else slots, dtype=np.int32))
+        # Place slot IDs directly on the executable's mesh. An uncommitted
+        # default-device array forces cpp_pjit_shard_arg_fallback on every call.
+        slot_indices = jax.device_put(
+            np.asarray(slots[0] if contiguous else slots, dtype=np.int32),
+            executable.input_shardings[0][2],
+        )
         self._buffer, ready = executable(self._buffer, packed, slot_indices)
         return ready
 

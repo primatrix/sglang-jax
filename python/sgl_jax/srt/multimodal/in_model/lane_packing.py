@@ -16,6 +16,7 @@ from jax.typing import ArrayLike
 
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 from sgl_jax.srt.multimodal.common.vision_layout import VisionLayout
+from sgl_jax.srt.multimodal.in_model.packing_copy import copy_features
 from sgl_jax.srt.utils.jax_utils import canonicalize_sharding
 
 
@@ -124,35 +125,39 @@ def pack_lanes(
     merge_unit: int,
     dtype: np.dtype | type,
 ) -> PackedLanes:
-    features_np = [np.asarray(item.feature) for item in items]
-    lengths = [feature.shape[0] for feature in features_np]
-    lanes = balance_lanes(lengths, num_lanes)
-    lane_loads = [sum(lengths[index] for index in lane) for lane in lanes]
-    cap = _bucket_capacity(max(lane_loads), buckets, merge_unit)
-    features = np.zeros((num_lanes, cap, *features_np[0].shape[1:]), dtype=dtype)
-    output_cap = cap // merge_unit
-    output_starts = np.zeros(len(items), dtype=np.int32)
+    with jax.profiler.TraceAnnotation("encoder_pack_lane_plan"):
+        features_np = [np.asarray(item.feature) for item in items]
+        lengths = [feature.shape[0] for feature in features_np]
+        lanes = balance_lanes(lengths, num_lanes)
+        lane_loads = [sum(lengths[index] for index in lane) for lane in lanes]
+        cap = _bucket_capacity(max(lane_loads), buckets, merge_unit)
+    with jax.profiler.TraceAnnotation("encoder_pack_allocate"):
+        features = np.zeros((num_lanes, cap, *features_np[0].shape[1:]), dtype=dtype)
+        output_cap = cap // merge_unit
+        output_starts = np.zeros(len(items), dtype=np.int32)
 
-    for lane_index, lane in enumerate(lanes):
-        input_offset = 0
-        output_offset = 0
-        for item_index in lane:
-            feature = features_np[item_index]
-            end = input_offset + feature.shape[0]
-            features[lane_index, input_offset:end] = feature
-            out_len = feature.shape[0] // merge_unit
-            output_starts[item_index] = lane_index * output_cap + output_offset
-            input_offset = end
-            output_offset += out_len
+    with jax.profiler.TraceAnnotation("encoder_pack_copy_cast"):
+        for lane_index, lane in enumerate(lanes):
+            input_offset = 0
+            output_offset = 0
+            for item_index in lane:
+                feature = features_np[item_index]
+                end = input_offset + feature.shape[0]
+                copy_features(features[lane_index, input_offset:end], feature)
+                out_len = feature.shape[0] // merge_unit
+                output_starts[item_index] = lane_index * output_cap + output_offset
+                input_offset = end
+                output_offset += out_len
 
-    output_indices = np.full(num_lanes * output_cap, -1, dtype=np.int32)
-    cursor = 0
-    for length, source_start in zip(lengths, output_starts, strict=True):
-        output_len = length // merge_unit
-        output_indices[cursor : cursor + output_len] = source_start + np.arange(
-            output_len, dtype=np.int32
-        )
-        cursor += output_len
+    with jax.profiler.TraceAnnotation("encoder_pack_output_indices"):
+        output_indices = np.full(num_lanes * output_cap, -1, dtype=np.int32)
+        cursor = 0
+        for length, source_start in zip(lengths, output_starts, strict=True):
+            output_len = length // merge_unit
+            output_indices[cursor : cursor + output_len] = source_start + np.arange(
+                output_len, dtype=np.int32
+            )
+            cursor += output_len
     return PackedLanes(
         features=features,
         output_indices=output_indices,
@@ -169,7 +174,8 @@ def pack_vision_inputs(
     merge_unit: int,
     dtype: np.dtype | type,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[list[VisionLayout | None]]]:
-    _validate_vision_items(items, merge_unit)
+    with jax.profiler.TraceAnnotation("encoder_pack_validate"):
+        _validate_vision_items(items, merge_unit)
     packed = pack_lanes(
         items,
         num_lanes,
@@ -177,15 +183,16 @@ def pack_vision_inputs(
         merge_unit=merge_unit,
         dtype=dtype,
     )
-    grid_thw = np.zeros(
-        (num_lanes, max(map(len, packed.lanes)), 3),
-        dtype=np.int32,
-    )
-    lane_layouts = []
-    for lane_index, lane in enumerate(packed.lanes):
-        lane_layouts.append([items[index].get("vision_layout") for index in lane])
-        for item_offset, item_index in enumerate(lane):
-            grid_thw[lane_index, item_offset] = get_grid_thw(items[item_index])
+    with jax.profiler.TraceAnnotation("encoder_pack_lane_metadata"):
+        grid_thw = np.zeros(
+            (num_lanes, max(map(len, packed.lanes)), 3),
+            dtype=np.int32,
+        )
+        lane_layouts = []
+        for lane_index, lane in enumerate(packed.lanes):
+            lane_layouts.append([items[index].get("vision_layout") for index in lane])
+            for item_offset, item_index in enumerate(lane):
+                grid_thw[lane_index, item_offset] = get_grid_thw(items[item_index])
     return packed.features, grid_thw, packed.output_indices, lane_layouts
 
 
