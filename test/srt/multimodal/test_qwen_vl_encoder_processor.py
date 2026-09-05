@@ -51,11 +51,22 @@ def test_encoder_loads_and_processes_requests_on_processor_workers(monkeypatch, 
             }
 
     processor = QwenVLProcessor(
-        SimpleNamespace(vision_config=SimpleNamespace(spatial_merge_size=2)),
+        SimpleNamespace(
+            architectures=["Qwen2_5_VLForConditionalGeneration"],
+            vision_config=SimpleNamespace(spatial_merge_size=2, window_size=4, patch_size=1),
+        ),
         SimpleNamespace(mm_processor_worker_num=workers),
         SimpleNamespace(image_processor=ImageProcessor()),
     )
     monkeypatch.setattr(processor, "load_image", load_image)
+    prepare_layouts = processor._prepare_vision_layouts
+
+    def prepare_on_worker(items):
+        source = int(items[0].feature[0, 0])
+        stages[source].append(threading.get_ident())
+        prepare_layouts(items)
+
+    monkeypatch.setattr(processor, "_prepare_vision_layouts", prepare_on_worker)
     timings = [{} for _ in range(workers)]
     event_loop_thread_id = threading.get_ident()
 
@@ -80,8 +91,13 @@ def test_encoder_loads_and_processes_requests_on_processor_workers(monkeypatch, 
     assert len(set(hf_processors.values())) == workers
     assert len({thread_ids[0] for thread_ids in stages.values()}) == workers
     for source, (result, timing) in enumerate(zip(results, timings)):
-        assert stages[source][0] == stages[source][1] != event_loop_thread_id
+        assert stages[source][0] == stages[source][1] == stages[source][2] != event_loop_thread_id
         np.testing.assert_array_equal(result.mm_items[0].feature, np.full((4, 2), source))
+        layout = result.mm_items[0].get("vision_layout")
+        np.testing.assert_array_equal(layout.indices, [[0, 0]])
+        np.testing.assert_array_equal(layout.position_ids, [[0, 0], [0, 1], [1, 0], [1, 1]])
+        np.testing.assert_array_equal(layout.window_ends, [4])
+        np.testing.assert_array_equal(layout.frame_ends, [4])
         assert (
             timing["processor_submit_ns"]
             <= timing["processor_start_ns"]

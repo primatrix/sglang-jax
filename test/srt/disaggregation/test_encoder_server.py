@@ -8,6 +8,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from sgl_jax.srt.disaggregation.encoder.raiden_transfer import (
+    RaidenEncoderServerTransfer,
+)
 from sgl_jax.srt.disaggregation.encoder.server import MMEncoder
 from sgl_jax.srt.multimodal.common.modality_enum import (
     Modality,
@@ -93,14 +96,15 @@ def test_encode_does_not_wait_for_jax_output(monkeypatch):
     asyncio.run(_run_encoder(encoder, [{"modality": "IMAGE"}]))
 
 
-def test_transfer_precompile_covers_homogeneous_batch_tails():
+@pytest.mark.parametrize("axis_type", [jax.sharding.AxisType.Auto, jax.sharding.AxisType.Explicit])
+def test_transfer_precompile_covers_homogeneous_batch_tails(axis_type):
     processed = [_inputs(2), _inputs(2)]
     for mm_inputs in processed:
         mm_inputs.mm_items[0].feature = np.zeros((8, 3), dtype=np.float32)
     encoder = object.__new__(MMEncoder)
     encoder.model = SimpleNamespace(
         get_multimodal_embedding_packed_capacity=lambda items: 4 * len(items),
-        mesh=jax.sharding.Mesh(np.array(jax.devices()), ("x",)),
+        mesh=jax.sharding.Mesh(np.array(jax.devices()), ("x",), axis_types=(axis_type,)),
     )
     encoder.model_config = SimpleNamespace(hidden_size=2, dtype=jnp.float32)
     encoder._max_batch_size = 3
@@ -108,6 +112,18 @@ def test_transfer_precompile_covers_homogeneous_batch_tails():
     encoder._precompile = True
 
     specs = encoder._packed_transfer_specs(processed, (2, 2))
+    for spec, counts in specs:
+        # JAX expands replicated output shardings to the result rank.
+        packed = jax.jit(
+            lambda value: value,
+            out_shardings=jax.sharding.NamedSharding(
+                encoder.model.mesh, jax.sharding.PartitionSpec()
+            ),
+        )(np.zeros(spec.shape, dtype=spec.dtype))
+        for contiguous in (True, False):
+            assert RaidenEncoderServerTransfer._packed_key(
+                spec, counts, contiguous
+            ) == RaidenEncoderServerTransfer._packed_key(packed, counts, contiguous)
 
     assert [(spec.shape, counts) for spec, counts in specs] == [
         ((4, 2), (2,)),

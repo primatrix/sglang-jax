@@ -26,6 +26,7 @@ from sgl_jax.srt.disaggregation.encoder.raiden_pool import (
     RaidenReceivePool,
     RaidenReceiveSession,
     RaidenSendPool,
+    compile_packed_pool_copy,
 )
 from sgl_jax.srt.disaggregation.encoder.raiden_transfer import (
     RaidenEncoderServerTransfer,
@@ -116,6 +117,34 @@ def test_raiden_loader_recognizes_encoder_backend():
     assert raiden_requested(["--encoder-transfer-backend", "raiden"])
     assert raiden_requested(["--encoder-transfer-backend=raiden"])
     assert not raiden_requested(["--encoder-transfer-backend", "jax_pull"])
+
+
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_pool_write_needs_no_tracing_after_abstract_precompile(contiguous):
+    jax.clear_caches()
+    sharding = jax.sharding.NamedSharding(
+        jax.sharding.Mesh(np.array(jax.devices()), ("x",)),
+        jax.sharding.PartitionSpec(None, None),
+    )
+    pool = RaidenSendPool((2, 3), jnp.float32, sharding, capacity=32)
+    packed_np = np.arange(32 * 3, dtype=np.float32).reshape(32, 3)
+    packed = jax.device_put(packed_np, sharding)
+    packed_spec = jax.ShapeDtypeStruct(packed.shape, packed.dtype, sharding=sharding)
+    for count in (5, 11, 7):
+        counts = (2,) * count
+        executable = compile_packed_pool_copy(
+            packed_spec, (2, 3), capacity=32, token_counts=counts, contiguous=contiguous
+        )
+        slots = list(range(1, count + 1)) if contiguous else list(range(1, 2 * count, 2))
+        with jax.no_tracing(True):
+            ready = pool.copy_packed_batch_async(
+                packed, slots, counts, executable, contiguous=contiguous
+            )
+            jax.block_until_ready(ready)
+        actual = np.asarray(pool.buffer).reshape(32, 2, -1)
+        np.testing.assert_array_equal(
+            actual[slots, :, :3], packed_np[: count * 2].reshape(count, 2, 3)
+        )
 
 
 def test_raiden_server_uses_donated_request_pool(monkeypatch):
