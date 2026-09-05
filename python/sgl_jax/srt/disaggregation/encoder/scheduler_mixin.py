@@ -246,7 +246,25 @@ class SchedulerDisaggregationEncoderMixin:
                     continue
                 timing["language_prefill_start_ns"] = prefill_start_ns
 
-    def _log_encoder_pipeline_timing(self: Scheduler, batch: ScheduleBatch) -> None:
+    def _mark_encoder_result_process_start(
+        self: Scheduler, batch: ScheduleBatch
+    ) -> None:
+        if (
+            not getattr(self.server_args, "enable_request_time_stats_logging", False)
+            or not batch.forward_mode.is_extend()
+        ):
+            return
+
+        process_start_ns = time.time_ns()
+        for info in batch.reqs_info:
+            for req in info.reqs or ():
+                timing = getattr(req, "encoder_timing", None)
+                if timing is not None:
+                    timing.setdefault(
+                        "language_result_process_start_ns", process_start_ns
+                    )
+
+    def _mark_encoder_prefill_done(self: Scheduler, batch: ScheduleBatch) -> None:
         if (
             not getattr(self.server_args, "enable_request_time_stats_logging", False)
             or not batch.forward_mode.is_extend()
@@ -257,12 +275,21 @@ class SchedulerDisaggregationEncoderMixin:
         for info in batch.reqs_info:
             for req in info.reqs or ():
                 timing = getattr(req, "encoder_timing", None)
-                if not timing or "language_prefill_done_ns" in timing:
-                    continue
-                timing["language_prefill_done_ns"] = prefill_done_ns
-                if getattr(
-                    self.server_args, "defer_request_time_stats_logging", False
-                ):
+                if timing is not None:
+                    timing.setdefault("language_prefill_done_ns", prefill_done_ns)
+
+    def _log_encoder_pipeline_timing(self: Scheduler, batch: ScheduleBatch) -> None:
+        if (
+            not getattr(self.server_args, "enable_request_time_stats_logging", False)
+            or getattr(self.server_args, "defer_request_time_stats_logging", False)
+            or not batch.forward_mode.is_extend()
+        ):
+            return
+
+        for info in batch.reqs_info:
+            for req in info.reqs or ():
+                timing = getattr(req, "encoder_timing", None)
+                if not timing or timing.get("_encoder_pipeline_logged"):
                     continue
                 required = (
                     "enqueue_ns",
@@ -573,6 +600,7 @@ class SchedulerDisaggregationEncoderMixin:
                         "language_prefill_done_ns",
                     ),
                 )
+                timing["_encoder_pipeline_logged"] = 1
 
                 preprocess_fields = (
                     "dispatch_start_ns",

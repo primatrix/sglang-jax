@@ -15,6 +15,7 @@ from sgl_jax.srt.managers.io_struct import AbortReq, BatchTokenIDOut
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 from sgl_jax.srt.mem_cache.common import release_kv_cache
 from sgl_jax.srt.precision_tracer import precision_tracer
+from sgl_jax.srt.request_time_stats import mark_request_time_stats
 from sgl_jax.srt.speculative.overlap_utils import (
     resolve_spec_prefill_token_ids,
     use_legacy_eagle3_non_overlap,
@@ -100,6 +101,17 @@ def _materialize_input_token_logprobs(input_token_logprobs, lens_per_dp: list[in
     return tuple(values)
 
 
+def _request_time_stats_for_batch(batch: ScheduleBatch) -> list[dict[str, int]]:
+    """Return only sampled request timing dictionaries for a scheduler batch."""
+
+    return [
+        stats
+        for info in batch.reqs_info
+        for req in info.reqs or ()
+        if (stats := getattr(req, "encoder_timing", None)) is not None
+    ]
+
+
 class SchedulerOutputProcessorMixin:
     """
     This class implements the output processing logic for Scheduler.
@@ -151,6 +163,7 @@ class SchedulerOutputProcessorMixin:
         skip_stream_reqs: set = set()
 
         assert self.is_generation
+        request_time_stats = _request_time_stats_for_batch(batch)
         (
             logits_output,
             next_token_ids,
@@ -164,14 +177,26 @@ class SchedulerOutputProcessorMixin:
             result.extend_logprob_start_len_per_req,
             result.cache_miss_count,
         )
+        mark_request_time_stats(
+            request_time_stats, "language_result_resolve_start_ns"
+        )
         if self.enable_overlap and not self.pd:
             if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
                 next_token_ids = resolve_spec_prefill_token_ids(result)
+                mark_request_time_stats(
+                    request_time_stats, "language_result_materialize_done_ns"
+                )
+                self._mark_encoder_prefill_done(batch)
                 if launch_done is not None:
                     launch_done.wait()
+                mark_request_time_stats(
+                    request_time_stats, "language_launch_wait_done_ns"
+                )
             else:
                 logits_output, next_token_ids, cache_miss_count = (
-                    self.tp_worker.resolve_last_batch_result(launch_done)
+                    self.tp_worker.resolve_last_batch_result(
+                        launch_done, request_time_stats=request_time_stats
+                    )
                 )
         else:
             # Move next_token_ids and logprobs to cpu
@@ -184,6 +209,15 @@ class SchedulerOutputProcessorMixin:
                     logits_output.next_token_logprobs
                 ).astype(float)
 
+        # For overlap mode the worker records the detailed queue/D2H phases.
+        # For non-overlap and speculative paths this is the first host-observable
+        # point at which the prefill result has been fully resolved.
+        mark_request_time_stats(
+            request_time_stats, "language_result_materialize_done_ns"
+        )
+        self._mark_encoder_prefill_done(batch)
+        self._log_encoder_pipeline_timing(batch)
+
         # Compact the per-DP padded scalar input_token_logprobs so the logprob_pt
         # walk below stays aligned. Runs for overlap (resolve_last_batch_result
         # leaves it flat-padded) and non-overlap; no-op when already compact.
@@ -192,6 +226,9 @@ class SchedulerOutputProcessorMixin:
                 logits_output.input_token_logprobs,
                 _input_logprob_lens_per_dp(batch),
             )
+        mark_request_time_stats(
+            request_time_stats, "language_logprob_compaction_done_ns"
+        )
         hidden_state_offset = 0
         per_dp_bs_size = batch.per_dp_bs_size
 
@@ -335,6 +372,10 @@ class SchedulerOutputProcessorMixin:
                                 logprob_pt += num_input_logprobs
                 req_idx += 1
 
+        mark_request_time_stats(
+            request_time_stats, "language_request_state_update_done_ns"
+        )
+
         batch.cache_miss_count = cache_miss_count
 
         if batch.cache_miss_count > 0:
@@ -345,9 +386,12 @@ class SchedulerOutputProcessorMixin:
         for info in batch.reqs_info:
             if info.reqs:
                 all_reqs.extend(info.reqs)
+        mark_request_time_stats(request_time_stats, "language_batch_collect_done_ns")
 
         self.set_next_batch_sampling_info_done(batch)
+        mark_request_time_stats(request_time_stats, "language_sampling_info_done_ns")
 
+        mark_request_time_stats(request_time_stats, "language_stream_output_start_ns")
         self.stream_output(
             all_reqs,
             batch.return_logprob,

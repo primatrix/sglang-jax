@@ -22,6 +22,7 @@ from sgl_jax.srt.managers.utils import (
     set_future_token_ids,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.request_time_stats import mark_request_time_stats
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.utils import get_exception_traceback
@@ -178,7 +179,11 @@ class ModelWorkerClient:
                 next_token_ids.copy_to_host_async()
             self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
 
-    def resolve_last_batch_result(self, launch_done: threading.Event | None = None):
+    def resolve_last_batch_result(
+        self,
+        launch_done: threading.Event | None = None,
+        request_time_stats: list[dict[str, int] | None] | None = None,
+    ):
         """
         This function is called to resolve the last batch result and
         wait for the current batch to be launched. Used in overlap mode.
@@ -188,14 +193,26 @@ class ModelWorkerClient:
         overlap on PCIe rather than serializing the per-array sync that
         jax.device_get does.
         """
+        mark_request_time_stats(
+            request_time_stats, "language_result_resolve_start_ns"
+        )
         _r0 = time.perf_counter()
         _, logits_output, next_token_ids, cache_miss_count = self.output_queue.get()
+        mark_request_time_stats(
+            request_time_stats, "language_result_queue_get_done_ns"
+        )
         # --simulate-compute: the worker dispatched this batch to the background
         # device and moved on; block here (as the real device_get would) until
         # the modeled forward completes, so host scheduling overlapped with it.
         self.worker.model_runner.sim_wait_next_completion()
+        mark_request_time_stats(
+            request_time_stats, "language_forward_completion_wait_done_ns"
+        )
         _r1 = time.perf_counter()
         # Step 1: kick off async D2H copies for everything we need
+        mark_request_time_stats(
+            request_time_stats, "language_aux_d2h_submit_start_ns"
+        )
         async_next_logprobs = (
             jax.copy_to_host_async(logits_output.next_token_logprobs)
             if logits_output.next_token_logprobs is not None
@@ -210,6 +227,12 @@ class ModelWorkerClient:
             jax.copy_to_host_async(logits_output.hidden_states)
             if logits_output.hidden_states is not None
             else None
+        )
+        mark_request_time_stats(
+            request_time_stats, "language_aux_d2h_submit_done_ns"
+        )
+        mark_request_time_stats(
+            request_time_stats, "language_next_token_materialize_start_ns"
         )
         if os.environ.get("SGLANG_PD_DBG_NTOK"):
             try:
@@ -232,19 +255,35 @@ class ModelWorkerClient:
                 _sh,
             )
         next_token_ids = jax.device_get(next_token_ids).tolist()
+        mark_request_time_stats(
+            request_time_stats, "language_next_token_d2h_done_ns"
+        )
 
         # Step 2: materialize. The first np.asarray waits for that array's
         # copy; the others have been making progress in parallel.
+        mark_request_time_stats(
+            request_time_stats, "language_aux_materialize_start_ns"
+        )
         if async_next_logprobs is not None:
             logits_output.next_token_logprobs = np.asarray(async_next_logprobs).tolist()
         if async_input_logprobs is not None:
             logits_output.input_token_logprobs = np.asarray(async_input_logprobs).tolist()
         if async_hidden_states is not None:
             logits_output.hidden_states = np.asarray(async_hidden_states)
+        mark_request_time_stats(
+            request_time_stats, "language_aux_materialize_done_ns"
+        )
+        mark_request_time_stats(
+            request_time_stats, "language_result_materialize_done_ns"
+        )
+        # The prior batch is now host-observable. Waiting for the current
+        # batch's launch below is overlap bookkeeping, not prefill compute.
+        mark_request_time_stats(request_time_stats, "language_prefill_done_ns")
         _r2 = _r2a = _r3 = time.perf_counter()
 
         if launch_done is not None:
             launch_done.wait()
+        mark_request_time_stats(request_time_stats, "language_launch_wait_done_ns")
         _r4 = time.perf_counter()
         if os.environ.get("SGLANG_PD_DBG") and _r4 - _r0 > 0.5:
             import gc as _gc

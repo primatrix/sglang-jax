@@ -2695,7 +2695,7 @@ class Scheduler(
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result, launch_done)
         elif batch.forward_mode.is_extend():
-            self._log_encoder_pipeline_timing(batch)
+            self._mark_encoder_result_process_start(batch)
             if self.pd:
                 with self._pd_swap_p_pool():
                     self.process_batch_result_prefill(batch, result, launch_done)

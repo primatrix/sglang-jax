@@ -51,7 +51,10 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
-from sgl_jax.srt.request_time_stats import should_sample_request
+from sgl_jax.srt.request_time_stats import (
+    REQUEST_TIME_STATS_SCHEMA_VERSION,
+    should_sample_request,
+)
 
 ASSISTANT_SUFFIX = "Assistant:"
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
@@ -422,7 +425,7 @@ async def async_request_openai_chat_completions(
     trace_configs = None
     if collect_request_time_stats:
         request_time_stats = {
-            "schema_version": 1,
+            "schema_version": REQUEST_TIME_STATS_SCHEMA_VERSION,
             "request_id": rid,
             "timestamps_ns": {},
         }

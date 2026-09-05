@@ -11,13 +11,14 @@ import hashlib
 import json
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 REQUEST_TIME_STATS_STATE_KEY = "request_time_stats"
 REQUEST_TIME_STATS_RID_STATE_KEY = "request_time_stats_rid"
+REQUEST_TIME_STATS_SCHEMA_VERSION = 2
 
 
 def should_sample_request(request_id: str, sample_rate: float) -> bool:
@@ -38,16 +39,34 @@ def should_sample_request(request_id: str, sample_rate: float) -> bool:
     return bucket < int(sample_rate * (1 << 64))
 
 
+def mark_request_time_stats(
+    stats_iterable: Iterable[dict[str, int] | None] | None,
+    field: str,
+    timestamp_ns: int | None = None,
+) -> None:
+    """Set one shared timestamp on each sampled request in an iterable.
+
+    The clock is read lazily, so an empty list or a batch containing only
+    unsampled requests adds no ``time.time_ns()`` call to the hot path.
+    """
+
+    if stats_iterable is None:
+        return
+    value = timestamp_ns
+    for stats in stats_iterable:
+        if stats is None:
+            continue
+        if value is None:
+            value = time.time_ns()
+        stats.setdefault(field, value)
+
+
 def mark_batch_time_stats(batch: Any, field: str, timestamp_ns: int | None = None) -> None:
     """Set a timestamp on every sampled request carried by a batch output."""
 
-    stats_list = getattr(batch, "request_time_stats", None)
-    if not stats_list:
-        return
-    value = time.time_ns() if timestamp_ns is None else timestamp_ns
-    for stats in stats_list:
-        if stats is not None:
-            stats.setdefault(field, value)
+    mark_request_time_stats(
+        getattr(batch, "request_time_stats", None), field, timestamp_ns
+    )
 
 
 class RequestTimeStatsMiddleware:
@@ -137,7 +156,7 @@ class RequestTimeStatsMiddleware:
                 current_stats["server_first_content_send_done_ns"] = time.time_ns()
                 request_id = state.get(REQUEST_TIME_STATS_RID_STATE_KEY)
                 payload = {
-                    "schema_version": 1,
+                    "schema_version": REQUEST_TIME_STATS_SCHEMA_VERSION,
                     "request_id": request_id,
                     "timestamps_ns": current_stats,
                 }

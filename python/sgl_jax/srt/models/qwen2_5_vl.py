@@ -577,7 +577,10 @@ class Qwen2_5_VisionTransformer(nnx.Module):
             ),
         )
 
-    @jax.jit
+    # The inference weights are loaded before this is first compiled and remain
+    # immutable.  Keeping ``self`` static avoids flattening the full ViT parameter
+    # pytree on every warm call just to form the JIT cache key.
+    @partial(jax.jit, static_argnums=(0,))
     def _encode_jit(
         self,
         patches: jax.Array,

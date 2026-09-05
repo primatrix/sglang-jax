@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import concurrent.futures
 import io
 import logging
@@ -8,6 +7,7 @@ from abc import ABC, abstractmethod
 from urllib.parse import unquote, urlparse
 
 import numpy as np
+import pybase64
 import requests
 from PIL import Image
 
@@ -60,10 +60,10 @@ def _normalize_image_source(source) -> bytes | str:
     if source.startswith("file://"):
         return unquote(urlparse(source).path)
     if source.startswith("data:"):
-        return base64.b64decode(source.split(",", 1)[1], validate=True)
+        return pybase64.b64decode(source.split(",", 1)[1], validate=True)
     if os.path.isfile(source):
         return source
-    return base64.b64decode(source, validate=True)
+    return pybase64.b64decode(source, validate=True)
 
 
 class BaseMultimodalProcessor(ABC):

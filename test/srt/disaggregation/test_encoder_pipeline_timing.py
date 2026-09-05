@@ -140,8 +140,14 @@ def test_language_logs_encoder_pipeline_timing(caplog):
     caplog.set_level("INFO")
     Scheduler._mark_encoder_prefill_start(scheduler, batch)
     Scheduler._log_encoder_pipeline_timing(scheduler, batch)
+    assert "ENCODER-PIPELINE-TIME req_id=request-0" not in caplog.text
 
-    assert "ENCODER-PIPELINE-TIME req_id=request-0" in caplog.text
+    Scheduler._mark_encoder_result_process_start(scheduler, batch)
+    Scheduler._mark_encoder_prefill_done(scheduler, batch)
+    Scheduler._log_encoder_pipeline_timing(scheduler, batch)
+    Scheduler._log_encoder_pipeline_timing(scheduler, batch)
+
+    assert caplog.text.count("ENCODER-PIPELINE-TIME req_id=request-0") == 1
     assert "queue_ms=1.000" in caplog.text
     assert "encode_stage_wait_ms=1.000" in caplog.text
     assert "preprocess_ms=1.000" in caplog.text
@@ -201,6 +207,7 @@ def test_language_logs_encoder_pipeline_timing(caplog):
     assert "language_queue_after_pickup_ms=" in caplog.text
     assert "receive_mm_ms=9.000" in caplog.text
     assert timing["language_prefill_start_ns"] >= timing["language_ready_ns"]
+    assert timing["language_result_process_start_ns"] >= timing["language_prefill_start_ns"]
     assert timing["language_prefill_done_ns"] >= timing["language_prefill_start_ns"]
 
 
@@ -279,6 +286,7 @@ def test_language_logs_encoder_preprocess_timing(caplog):
 
     caplog.set_level("INFO")
     Scheduler._mark_encoder_prefill_start(scheduler, batch)
+    Scheduler._mark_encoder_prefill_done(scheduler, batch)
     Scheduler._log_encoder_pipeline_timing(scheduler, batch)
 
     assert "ENCODER-PREPROCESS-TIME req_id=request-0" in caplog.text

@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import logging
 import math
 import os
@@ -7,6 +6,7 @@ import tempfile
 import time
 
 import numpy as np
+import pybase64
 from PIL import Image
 
 from sgl_jax.srt.multimodal.common.modality_enum import (
@@ -197,10 +197,10 @@ def preprocess_video(source, video_config: dict) -> np.ndarray:
                 vr = VideoReader(tmp_path, ctx=ctx)
             elif source.startswith("data:") and "base64," in source:
                 payload = source.split("base64,", 1)[1]
-                tmp_path = _write_temp_video(base64.b64decode(payload))
+                tmp_path = _write_temp_video(pybase64.b64decode(payload))
                 vr = VideoReader(tmp_path, ctx=ctx)
             else:
-                tmp_path = _write_temp_video(base64.b64decode(source, validate=True))
+                tmp_path = _write_temp_video(pybase64.b64decode(source, validate=True))
                 vr = VideoReader(tmp_path, ctx=ctx)
         else:
             raise ValueError(f"Unsupported video input type: {type(source)}")

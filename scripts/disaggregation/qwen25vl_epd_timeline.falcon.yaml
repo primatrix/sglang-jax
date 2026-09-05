@@ -1,0 +1,585 @@
+# Timeline-only Qwen2.5-VL EPD profile: one synchronized capture, two XPlanes.
+# Change `name` before each submission:
+#   falcon workflow profile submit -f scripts/disaggregation/qwen25vl_epd_timeline.falcon.yaml --output json
+name: qwen25vl-epd-timeline-v7x8
+exp_type: PROFILING
+artifact_type: trace
+cluster_name: tpu-training-antgroup
+profile: true
+tags: [profile, epd, qwen25vl, timeline, compile-clean]
+config: '{"kind":"qwen25vl-epd-timeline","source_commit":"4c2a99f4d0b4d26bb1d44a59047d92d1feaeba32","runtime":"jax0.10.2-flax0.12.4","hardware":"v7x-8","layout":"encoder4-language4","load":"image512-isl128-osl1-prompts128-concurrency64","capture":"one-run-two-xplanes","compile_guard":true,"scope_guard":true}'
+
+role_to_task_spec:
+  worker:
+    command: |
+      bash <<'BASH'
+      set -euo pipefail
+      ulimit -c 0
+
+      readonly SOURCE_SHA=4c2a99f4d0b4d26bb1d44a59047d92d1feaeba32
+      readonly CODE_ROOT=/workspace/sglang-jax
+      readonly OUT="${ARTIFACT_LOCAL_DIR:?missing ARTIFACT_LOCAL_DIR}/profiling"
+      readonly LOG_DIR=/tmp/tpu_logs/runtime
+      readonly PROFILE_HOOK_DIR=/tmp/epd-profile-hook
+      readonly ENCODER_PORT=30001 LANGUAGE_PORT=30000
+      readonly ENCODER_PROFILER_PORT=9998 LANGUAGE_PROFILER_PORT=9999
+      readonly XPROF_DELAY_MS=3000 XPROF_DURATION_MS=12000
+
+      mkdir -p "$OUT" "$LOG_DIR" "$CODE_ROOT" "$PROFILE_HOOK_DIR" \
+        /tmp/tpu_logs/{tmp,pip-cache,uv-cache,xdg-cache,huggingface/hub,jax-cache}
+      export TMPDIR=/tmp/tpu_logs/tmp
+      export PIP_CACHE_DIR=/tmp/tpu_logs/pip-cache
+      export UV_CACHE_DIR=/tmp/tpu_logs/uv-cache
+      export XDG_CACHE_HOME=/tmp/tpu_logs/xdg-cache
+      export HF_HOME=/tmp/tpu_logs/huggingface
+      export HF_HUB_CACHE=/tmp/tpu_logs/huggingface/hub
+      export TRANSFORMERS_CACHE=/tmp/tpu_logs/huggingface/hub
+      export PYTHONUNBUFFERED=1
+
+      git -C "$CODE_ROOT" init
+      git -C "$CODE_ROOT" remote add origin https://github.com/primatrix/sglang-jax.git
+      git -C "$CODE_ROOT" fetch --depth=1 origin "$SOURCE_SHA"
+      git -C "$CODE_ROOT" checkout --detach FETCH_HEAD
+      test "$(git -C "$CODE_ROOT" rev-parse HEAD)" = "$SOURCE_SHA"
+
+      # Gate only the profile client's request loop. The client can finish
+      # imports/tokenizer/dataset preparation before the XProf window opens.
+      git -C "$CODE_ROOT" apply <<'PATCH'
+      diff --git a/python/sgl_jax/bench_serving.py b/python/sgl_jax/bench_serving.py
+      --- a/python/sgl_jax/bench_serving.py
+      +++ b/python/sgl_jax/bench_serving.py
+      @@ -2304,5 +2304,17 @@ async def benchmark(
+       
+           # Run all requests
+      +    profile_gate_path = os.environ.get("SGLANG_PROFILE_GATE_PATH")
+      +    profile_ready_path = os.environ.get("SGLANG_PROFILE_READY_PATH")
+      +    profile_window_path = os.environ.get("SGLANG_PROFILE_WINDOW_PATH")
+      +    if profile_gate_path:
+      +        if not profile_ready_path or not profile_window_path:
+      +            raise RuntimeError("profile gate requires ready and window paths")
+      +        profile_gate = Path(profile_gate_path)
+      +        Path(profile_ready_path).write_text(f"{time.time_ns()}\n")
+      +        while not profile_gate.is_file():
+      +            await asyncio.sleep(0.01)
+      +        Path(profile_window_path).write_text(f"{time.time_ns()}\n")
+      +
+           benchmark_start_time = time.perf_counter()
+           tasks: list[asyncio.Task] = []
+           pbar_total = len(input_requests)
+      @@ -2367,5 +2379,9 @@ async def benchmark(
+               )
+           outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+      +    if profile_gate_path:
+      +        with Path(profile_window_path).open("a") as profile_window:
+      +            profile_window.write(f"{time.time_ns()}\n")
+      +
+           if is_multi_turn:
+               outputs = [x for output in outputs for x in output]
+       
+      PATCH
+      git -C "$CODE_ROOT" diff --check
+      git -C "$CODE_ROOT" diff -- python/sgl_jax/bench_serving.py \
+        > "$OUT/benchmark-profile-gate.patch"
+
+      python3 -m pip install -q -e "$CODE_ROOT/python"
+      python3 -m pip install -q torch torchvision --index-url https://download.pytorch.org/whl/cpu
+      python3 -m pip install -q imageio-ffmpeg decord 'xprof==2.23.1'
+      python3 -m pip install -q --upgrade --force-reinstall \
+        'jax[tpu]==0.10.2' 'numpy==2.2.6' 'requests==2.32.4' \
+        -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+      readonly RAIDEN_WHEEL=/gcs/experiments/exp-uh39qcozjo/artifacts/art-yl0s5obatw/profiling/raiden-wheel/tpu_raiden_jax-0.0.1-cp312-cp312-manylinux_2_31_x86_64.whl
+      test -f "$RAIDEN_WHEEL"
+      echo '220c0b9f38da0185ee392eef81ed1c7a9e798df4326121c3fa1bf7628318942d  '"$RAIDEN_WHEEL" | sha256sum -c -
+      python3 -m pip install -q --no-deps "$RAIDEN_WHEEL"
+
+      MODEL_PATH=""
+      for candidate in \
+        /models/Qwen/Qwen2.5-VL-3B-Instruct \
+        /models/Qwen2.5-VL-3B-Instruct \
+        /models/qwen/Qwen2.5-VL-3B-Instruct \
+        /models/models--Qwen--Qwen2.5-VL-3B-Instruct/snapshots/* \
+        /models/.hf_cache/hub/models--Qwen--Qwen2.5-VL-3B-Instruct/snapshots/* \
+        /models/hub/models--Qwen--Qwen2.5-VL-3B-Instruct/snapshots/* \
+        /models/huggingface/hub/models--Qwen--Qwen2.5-VL-3B-Instruct/snapshots/*; do
+        if test -f "$candidate/config.json"; then MODEL_PATH="$candidate"; break; fi
+      done
+      if test -z "$MODEL_PATH"; then MODEL_PATH=Qwen/Qwen2.5-VL-3B-Instruct; fi
+      export MODEL_PATH
+
+      python3 - <<'PY' > "$OUT/versions.txt"
+      import importlib.metadata as md
+      for package in ("jax", "jaxlib", "libtpu", "flax", "sglang-jax", "xprof"):
+          print(f"{package}={md.version(package)}")
+      PY
+      printf '%s\n' "$MODEL_PATH" > "$OUT/model-path.txt"
+
+      # This hook is loaded by the launcher and every spawned child. It installs
+      # scopes before model compilation, then starts the profiler service only
+      # after the process that owns the TPU backend has initialized it.
+      cat > "$PROFILE_HOOK_DIR/sitecustomize.py" <<'PY'
+      import functools
+      import inspect
+      import json
+      import os
+      import traceback
+      from pathlib import Path
+
+      def _install():
+          # multiprocessing spawn imports sitecustomize before restoring the
+          # launch_server argv, so the argv-gated helper cannot detect Raiden.
+          # preload_raiden() is idempotent once the extension is in sys.modules.
+          from sgl_jax.raiden import preload_raiden
+          preload_raiden()
+
+          import jax
+
+          role = os.environ["EPD_PROFILE_ROLE"]
+          device_scopes = []
+          host_annotations = []
+          profiler_owner = None
+          profiler_server = None
+
+          def add_named_scope(cls, method, name):
+              original = getattr(cls, method)
+              @functools.wraps(original)
+              def wrapped(*args, **kwargs):
+                  with jax.named_scope(name):
+                      return original(*args, **kwargs)
+              setattr(cls, method, wrapped)
+              device_scopes.append(name)
+
+          def add_host_annotation(cls, method, name):
+              original = getattr(cls, method)
+              if inspect.iscoroutinefunction(original):
+                  @functools.wraps(original)
+                  async def wrapped(*args, **kwargs):
+                      with jax.profiler.TraceAnnotation(name):
+                          return await original(*args, **kwargs)
+              else:
+                  @functools.wraps(original)
+                  def wrapped(*args, **kwargs):
+                      with jax.profiler.TraceAnnotation(name):
+                          return original(*args, **kwargs)
+              setattr(cls, method, wrapped)
+              host_annotations.append(name)
+
+          def start_profiler_after_init(cls, owner):
+              original = cls.__init__
+              @functools.wraps(original)
+              def wrapped(instance, *args, **kwargs):
+                  nonlocal profiler_server
+                  original(instance, *args, **kwargs)
+                  if profiler_server is None:
+                      profiler_server = jax.profiler.start_server(
+                          int(os.environ["JAX_PROFILER_PORT"])
+                      )
+                      print(
+                          f"EPD_PROFILER_READY role={role} owner={owner} "
+                          f"port={os.environ['JAX_PROFILER_PORT']}",
+                          flush=True,
+                      )
+              cls.__init__ = wrapped
+
+          def precompile_async_gather(cls):
+              original = cls.__init__
+              @functools.wraps(original)
+              def wrapped(instance, *args, **kwargs):
+                  original(instance, *args, **kwargs)
+                  import numpy as np
+                  from jax.sharding import NamedSharding, PartitionSpec
+                  input_sharding = NamedSharding(instance.mesh, PartitionSpec("data"))
+                  for batch_size in range(2, 65, 2):
+                      token_ids = jax.device_put(
+                          np.zeros((batch_size,), dtype=np.int32), input_sharding
+                      )
+                      instance.async_gather_fn(token_ids).block_until_ready()
+                  print(
+                      "EPD_ASYNC_GATHER_PRECOMPILED even_batch_sizes=2..64",
+                      flush=True,
+                  )
+              cls.__init__ = wrapped
+
+          from sgl_jax.srt.models import qwen2, qwen2_5_vl
+          if role == "encoder":
+              for cls, method, name in (
+                  (qwen2_5_vl.Qwen2_5_VisionTransformer, "_forward", "vision_transformer"),
+                  (qwen2_5_vl.Qwen2_5_VisionPatchEmbed, "__call__", "vision_patch_embed"),
+                  (qwen2_5_vl.Qwen2_5_VisionBlock, "__call__", "vision_block"),
+                  (qwen2_5_vl.Qwen2_5_VisionAttention, "__call__", "vision_attention"),
+                  (qwen2_5_vl.Qwen2_5_VLMLP, "__call__", "vision_mlp"),
+                  (qwen2_5_vl.Qwen2_5_VisionPatchMerger, "__call__", "vision_patch_merge"),
+              ):
+                  add_named_scope(cls, method, name)
+              from sgl_jax.srt.disaggregation.encoder.raiden_transfer import RaidenEncoderServerTransfer
+              from sgl_jax.srt.disaggregation.encoder.server import EncoderServer, MMEncoder
+              for cls, method, name in (
+                  (MMEncoder, "preprocess", "encoder_preprocess"),
+                  (MMEncoder, "encode", "encoder_encode_batch"),
+                  (RaidenEncoderServerTransfer, "stage_batch_sync", "encoder_transfer_stage"),
+                  (RaidenEncoderServerTransfer, "publish_sync", "encoder_transfer_publish"),
+                  (EncoderServer, "send_to_scheduler", "encoder_send_to_language"),
+              ):
+                  add_host_annotation(cls, method, name)
+              start_profiler_after_init(MMEncoder, "MMEncoder")
+              profiler_owner = "MMEncoder"
+          elif role == "language":
+              from sgl_jax.srt.layers.logits_processor import LogitsProcessor
+              from sgl_jax.srt.layers.sampler import Sampler
+              from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
+              precompile_async_gather(ModelWorkerClient)
+              for cls, method, name in (
+                  (qwen2_5_vl.Qwen2_5_VLForConditionalGeneration, "__call__", "language_model"),
+                  (qwen2.Qwen2Model, "__call__", "transformer"),
+                  (qwen2.Qwen2DecoderLayer, "__call__", "decoder_layer"),
+                  (qwen2.Qwen2Attention, "__call__", "self_attention"),
+                  (qwen2.Qwen2MLP, "__call__", "language_mlp"),
+                  (LogitsProcessor, "__call__", "logits"),
+                  (Sampler, "__call__", "sampling"),
+              ):
+                  add_named_scope(cls, method, name)
+              from sgl_jax.srt.disaggregation.encoder.client import EncoderClient, PendingEncoderRequest
+              from sgl_jax.srt.disaggregation.encoder.raiden_transfer import RaidenReceiverBackend
+              from sgl_jax.srt.disaggregation.encoder.scheduler_mixin import SchedulerDisaggregationEncoderMixin
+              for cls, method, name in (
+                  (EncoderClient, "receive", "language_encoder_receive_submit"),
+                  (PendingEncoderRequest, "prepare_result", "language_encoder_receive_ready"),
+                  (RaidenReceiverBackend, "_start", "language_transfer_start"),
+                  (SchedulerDisaggregationEncoderMixin, "_apply_encoder_result", "language_apply_encoder_result"),
+                  (SchedulerDisaggregationEncoderMixin, "_mark_encoder_prefill_start", "language_prefill_admit"),
+              ):
+                  add_host_annotation(cls, method, name)
+              from sgl_jax.srt.managers.scheduler import Scheduler
+              start_profiler_after_init(Scheduler, "Scheduler")
+              profiler_owner = "Scheduler"
+          else:
+              raise ValueError(f"unknown EPD_PROFILE_ROLE={role}")
+
+          output = Path(os.environ["EPD_SCOPE_OUTPUT"])
+          tmp = output.with_name(f"{output.name}.{os.getpid()}.tmp")
+          tmp.write_text(json.dumps({
+              "role": role,
+              "device_named_scopes": device_scopes,
+              "host_trace_annotations": host_annotations,
+              "profiler_owner": profiler_owner,
+          }, indent=2, sort_keys=True) + "\n")
+          os.replace(tmp, output)
+
+      try:
+          _install()
+      except BaseException:
+          traceback.print_exc()
+          os._exit(97)
+      PY
+
+      readonly HOST_IP=$(hostname -I | awk '{print $1}')
+      test -n "$HOST_IP"
+      unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+      export NO_PROXY='*' no_proxy='*'
+
+      ENCODER_PID= LANGUAGE_PID= PROFILE_LOAD_PID= XPROF_COLLECTOR_PID= LAST_PID=
+      stop_pid() {
+        local pid=$1
+        test -n "$pid" && kill -0 "$pid" 2>/dev/null || return 0
+        kill "$pid" 2>/dev/null || true
+        for _ in $(seq 1 30); do
+          kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null || true; return 0; }
+          sleep 1
+        done
+        kill -9 "$pid" 2>/dev/null || true
+      }
+      cleanup() {
+        local rc=$?
+        trap - EXIT INT TERM
+        stop_pid "$XPROF_COLLECTOR_PID"
+        stop_pid "$PROFILE_LOAD_PID"
+        stop_pid "$LANGUAGE_PID"
+        stop_pid "$ENCODER_PID"
+        if test "$rc" -ne 0; then
+          tail -n 300 /tmp/compile-warmup.jsonl.log 2>/dev/null || true
+          tail -n 300 /tmp/steady-warmup.jsonl.log 2>/dev/null || true
+          tail -n 300 /tmp/singleton-warmup.jsonl.log 2>/dev/null || true
+          tail -n 300 "$OUT/profile-load.jsonl.log" 2>/dev/null || true
+          tail -n 300 "$OUT/language-compile-after-warmup.log" 2>/dev/null || true
+          tail -n 300 "$LOG_DIR/encoder.log" 2>/dev/null || true
+          tail -n 300 "$LOG_DIR/language.log" 2>/dev/null || true
+          tail -n 300 "$OUT/xprof-collector.log" 2>/dev/null || true
+        fi
+        exit "$rc"
+      }
+      trap cleanup EXIT INT TERM
+
+      wait_for_url() {
+        local url=$1 pid=$2 log=$3
+        for _ in $(seq 1 240); do
+          curl -fsS "$url" >/dev/null 2>&1 && return 0
+          kill -0 "$pid" 2>/dev/null || { tail -n 500 "$log"; return 1; }
+          sleep 10
+        done
+        tail -n 500 "$log"
+        return 1
+      }
+
+      wait_for_port() {
+        local port=$1 pid=$2 log=$3
+        for _ in $(seq 1 120); do
+          python3 - "$port" <<'PY' >/dev/null 2>&1 && return 0
+      import socket
+      import sys
+      with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=1):
+          pass
+      PY
+          kill -0 "$pid" 2>/dev/null || { tail -n 500 "$log"; return 1; }
+          sleep 1
+        done
+        tail -n 500 "$log"
+        return 1
+      }
+
+      start_server() {
+        local role=$1 visible_chips=$2 profiler_port=$3 log=$4
+        shift 4
+        EPD_PROFILE_ROLE="$role" \
+        EPD_SCOPE_OUTPUT="$OUT/scopes-$role.json" \
+        TPU_CHIPS_PER_PROCESS_BOUNDS=1,2,1 \
+        TPU_PROCESS_BOUNDS=1,1,1 \
+        TPU_VISIBLE_CHIPS="$visible_chips" \
+        ALLOW_MULTIPLE_LIBTPU_LOAD=true \
+        JAX_COMPILATION_CACHE_DIR="/tmp/tpu_logs/jax-cache/$role" \
+        JAX_LOG_COMPILES=1 \
+        JAX_PROFILER_PORT="$profiler_port" \
+        PYTHONPATH="$PROFILE_HOOK_DIR:$CODE_ROOT/python" \
+        python3 -u -m sgl_jax.launch_server "$@" > "$log" 2>&1 &
+        LAST_PID=$!
+      }
+
+      cd "$CODE_ROOT"
+      start_server encoder 0,1 "$ENCODER_PROFILER_PORT" "$LOG_DIR/encoder.log" \
+        --model-path "$MODEL_PATH" --trust-remote-code --skip-server-warmup \
+        --device tpu --tp-size 4 --dp-size 2 --dtype bfloat16 \
+        --vision-encoder-parallel dp \
+        --mm-io-worker-num 4 --mm-processor-worker-num 4 \
+        --encoder-max-batch-size 16 --encoder-max-inflight-batches 1 \
+        --encoder-batch-coalesce-ms 0 --random-seed 0 \
+        --download-dir /tmp/tpu_logs/huggingface/hub \
+        --encoder-only --encoder-transfer-backend raiden \
+        --encoder-transfer-pool-size 256 \
+        --encoder-control-timeout-seconds 300 --encoder-request-timeout-seconds 900 \
+        --disaggregation-channel-number 4 --disaggregation-host-ip "$HOST_IP" \
+        --host 0.0.0.0 --port "$ENCODER_PORT"
+      ENCODER_PID=$LAST_PID
+      wait_for_url "http://127.0.0.1:$ENCODER_PORT/health" "$ENCODER_PID" "$LOG_DIR/encoder.log"
+      wait_for_port "$ENCODER_PROFILER_PORT" "$ENCODER_PID" "$LOG_DIR/encoder.log"
+
+      start_server language 2,3 "$LANGUAGE_PROFILER_PORT" "$LOG_DIR/language.log" \
+        --model-path "$MODEL_PATH" --trust-remote-code --skip-server-warmup \
+        --device tpu --tp-size 4 --dp-size 2 \
+        --dtype bfloat16 --kv-cache-dtype bf16 \
+        --context-length 2048 --max-seq-len 2048 \
+        --max-running-requests 512 --max-prefill-tokens 8192 \
+        --chunked-prefill-size 4096 \
+        --mem-fraction-static 0.9 --page-size 128 --disable-radix-cache \
+        --dp-schedule-policy min_running_queue \
+        --vision-encoder-parallel dp \
+        --mm-io-worker-num 4 --mm-processor-worker-num 4 --random-seed 0 \
+        --download-dir /tmp/tpu_logs/huggingface/hub \
+        --language-only --encoder-urls "http://127.0.0.1:$ENCODER_PORT" \
+        --encoder-transfer-backend raiden --encoder-transfer-pool-size 256 \
+        --encoder-receiver-background-progress \
+        --encoder-control-timeout-seconds 300 --encoder-request-timeout-seconds 900 \
+        --disaggregation-channel-number 4 --disaggregation-host-ip "$HOST_IP" \
+        --host 0.0.0.0 --port "$LANGUAGE_PORT"
+      LANGUAGE_PID=$LAST_PID
+      wait_for_url "http://127.0.0.1:$LANGUAGE_PORT/get_server_info" "$LANGUAGE_PID" "$LOG_DIR/language.log"
+      wait_for_port "$LANGUAGE_PROFILER_PORT" "$LANGUAGE_PID" "$LOG_DIR/language.log"
+
+      run_load() {
+        local label=$1 output=$2 flush=$3 seed=$4
+        local prompts=${5:-128} concurrency=${6:-64}
+        local flush_arg=()
+        test "$flush" = 1 && flush_arg=(--flush-cache)
+        PYTHONPATH="$CODE_ROOT/python" python3 -m sgl_jax.bench_serving \
+          --backend sglang-oai-chat --host 127.0.0.1 --port "$LANGUAGE_PORT" \
+          --model "$MODEL_PATH" --tokenizer "$MODEL_PATH" \
+          --dataset-name image --num-prompts "$prompts" --max-concurrency "$concurrency" \
+          --random-input-len 128 --random-output-len 1 --random-range-ratio 1.0 \
+          --image-count 1 --image-resolution 512x512 \
+          --image-format jpeg --image-content random \
+          --request-rate inf --seed "$seed" --warmup-requests 0 \
+          "${flush_arg[@]}" --output-file "$output" > "$output.log" 2>&1
+        echo "$label complete"
+      }
+
+      # Compile and stabilize with the exact traced request shape.
+      run_load compile-warmup /tmp/compile-warmup.jsonl 1 101
+      run_load steady-warmup /tmp/steady-warmup.jsonl 1 102
+      # XProf can perturb the final batch into a singleton. Precompile its
+      # per-item multimodal overlay instead of accepting a compile in trace.
+      run_load singleton-warmup /tmp/singleton-warmup.jsonl 1 103 1 1
+      curl -fsS -X POST "http://127.0.0.1:$LANGUAGE_PORT/flush_cache" >/dev/null
+      sleep 5
+      readonly ENCODER_LOG_OFFSET=$(stat -c%s "$LOG_DIR/encoder.log")
+      readonly LANGUAGE_LOG_OFFSET=$(stat -c%s "$LOG_DIR/language.log")
+
+      readonly XPROF_DIR="$OUT/xprof"
+      readonly XPROF_READY="$OUT/xprof-collector.ready"
+      readonly PROFILE_GATE="$OUT/profile-load.go"
+      readonly PROFILE_READY="$OUT/profile-load.ready"
+      readonly PROFILE_WINDOW="$OUT/profile-load-window.ns"
+      mkdir -p "$XPROF_DIR"
+      rm -f "$PROFILE_GATE" "$PROFILE_READY" "$PROFILE_WINDOW"
+
+      SGLANG_PROFILE_GATE_PATH="$PROFILE_GATE" \
+      SGLANG_PROFILE_READY_PATH="$PROFILE_READY" \
+      SGLANG_PROFILE_WINDOW_PATH="$PROFILE_WINDOW" \
+      PYTHONPATH="$CODE_ROOT/python" python3 -m sgl_jax.bench_serving \
+        --backend sglang-oai-chat --host 127.0.0.1 --port "$LANGUAGE_PORT" \
+        --model "$MODEL_PATH" --tokenizer "$MODEL_PATH" \
+        --dataset-name image --num-prompts 128 --max-concurrency 64 \
+        --random-input-len 128 --random-output-len 1 --random-range-ratio 1.0 \
+        --image-count 1 --image-resolution 512x512 \
+        --image-format jpeg --image-content random \
+        --request-rate inf --seed 7 --warmup-requests 0 \
+        --output-file "$OUT/profile-load.jsonl" \
+        > "$OUT/profile-load.jsonl.log" 2>&1 &
+      PROFILE_LOAD_PID=$!
+      for _ in $(seq 1 1200); do
+        test -f "$PROFILE_READY" && break
+        kill -0 "$PROFILE_LOAD_PID" 2>/dev/null || { wait "$PROFILE_LOAD_PID"; exit 1; }
+        sleep 0.1
+      done
+      test -f "$PROFILE_READY"
+
+      python3 -u - "$XPROF_DIR" "$XPROF_READY" \
+        "$XPROF_DURATION_MS" "$XPROF_DELAY_MS" \
+        "$ENCODER_PROFILER_PORT" "$LANGUAGE_PROFILER_PORT" \
+        > "$OUT/xprof-collector.log" 2>&1 <<'PY' &
+      import json
+      import sys
+      import time
+      from pathlib import Path
+      from xprof.convert import _pywrap_profiler_plugin
+
+      logdir, ready, duration_ms, delay_ms, encoder_port, language_port = sys.argv[1:]
+      duration_ms, delay_ms = int(duration_ms), int(delay_ms)
+      addresses = f"127.0.0.1:{encoder_port},127.0.0.1:{language_port}"
+      request_ns = time.time_ns()
+      Path(ready).write_text(str(request_ns) + "\n")
+      _pywrap_profiler_plugin.trace(addresses, logdir, "", True, duration_ms, 3, {
+          "delay_ms": delay_ms,
+          "host_tracer_level": 2,
+          "device_tracer_level": 1,
+          "python_tracer_level": 0,
+      })
+      Path(logdir, "capture.json").write_text(json.dumps({
+          "schema_version": 1,
+          "service_addresses": addresses.split(","),
+          "request_ns": request_ns,
+          "expected_trace_start_ns": request_ns + delay_ms * 1_000_000,
+          "expected_trace_end_ns": request_ns + (delay_ms + duration_ms) * 1_000_000,
+          "collector_return_ns": time.time_ns(),
+          "duration_ms": duration_ms,
+          "delay_ms": delay_ms,
+          "host_tracer_level": 2,
+          "device_tracer_level": 1,
+          "python_tracer_level": 0,
+      }, indent=2, sort_keys=True) + "\n")
+      PY
+      XPROF_COLLECTOR_PID=$!
+
+      for _ in $(seq 1 100); do
+        test -f "$XPROF_READY" && break
+        kill -0 "$XPROF_COLLECTOR_PID" 2>/dev/null || { wait "$XPROF_COLLECTOR_PID"; exit 1; }
+        sleep 0.1
+      done
+      test -f "$XPROF_READY"
+      sleep 3.2
+      touch "$PROFILE_GATE"
+      wait "$PROFILE_LOAD_PID"
+      PROFILE_LOAD_PID=
+      echo 'xprof-load complete'
+      wait "$XPROF_COLLECTOR_PID"
+      XPROF_COLLECTOR_PID=
+
+      mapfile -t PROFILE_WINDOW_NS < "$PROFILE_WINDOW"
+      test "${#PROFILE_WINDOW_NS[@]}" -eq 2
+      profile_load_start_ns=${PROFILE_WINDOW_NS[0]}
+      profile_load_end_ns=${PROFILE_WINDOW_NS[1]}
+
+      check_no_compile() {
+        local role=$1 log=$2 offset=$3
+        if tail -c "+$((offset + 1))" "$log" | grep -E '(^| )Compiling ' > "$OUT/$role-compile-after-warmup.log"; then
+          echo "JAX compilation detected after warmup in $role" >&2
+          return 1
+        fi
+        rm -f "$OUT/$role-compile-after-warmup.log"
+      }
+      check_no_compile encoder "$LOG_DIR/encoder.log" "$ENCODER_LOG_OFFSET"
+      check_no_compile language "$LOG_DIR/language.log" "$LANGUAGE_LOG_OFFSET"
+      echo 'PASS: no JAX compilation logged after warmup' > "$OUT/compile-check.txt"
+
+      python3 - "$XPROF_DIR" "$OUT" "$profile_load_start_ns" "$profile_load_end_ns" <<'PY'
+      import json
+      import sys
+      from pathlib import Path
+
+      xprof, out, load_start, load_end = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+      capture = json.loads((xprof / "capture.json").read_text())
+      runs = [path for path in (xprof / "plugins" / "profile").iterdir() if path.is_dir()]
+      if len(runs) != 1:
+          raise SystemExit(f"expected one XProf run, found {len(runs)}")
+      xplanes = sorted(runs[0].glob("*.xplane.pb"))
+      if len(xplanes) != 2:
+          raise SystemExit(f"expected E and P XPlanes in one run, found {[p.name for p in xplanes]}")
+      if load_start < capture["expected_trace_start_ns"] or load_end > capture["expected_trace_end_ns"]:
+          raise SystemExit("profile workload is not fully contained in the trace window")
+
+      expected = {
+          "encoder": {"vision_transformer", "vision_patch_embed", "vision_block", "vision_attention", "vision_mlp", "vision_patch_merge"},
+          "language": {"language_model", "transformer", "decoder_layer", "self_attention", "language_mlp", "logits", "sampling"},
+      }
+      scope_evidence = {}
+      for role, names in expected.items():
+          registered = set(json.loads((out / f"scopes-{role}.json").read_text())["device_named_scopes"])
+          if names - registered:
+              raise SystemExit(f"missing registered {role} scopes: {sorted(names - registered)}")
+          plane = next((path for path in xplanes if ("9998" if role == "encoder" else "9999") in path.name), None)
+          if plane is None:
+              raise SystemExit(f"cannot identify {role} XPlane")
+          payload = plane.read_bytes()
+          present = sorted(name for name in names if name.encode() in payload)
+          missing_visible = names - set(present)
+          if missing_visible:
+              raise SystemExit(f"named_scope missing from {role} XPlane: {sorted(missing_visible)}")
+          scope_evidence[role] = {"registered": sorted(registered), "visible_in_xplane": present}
+
+      capture.update({
+          "run": runs[0].name,
+          "xplanes": [path.name for path in xplanes],
+          "profile_load_start_ns": load_start,
+          "profile_load_end_ns": load_end,
+          "compile_clean": True,
+          "scope_evidence": scope_evidence,
+      })
+      (xprof / "capture.json").write_text(json.dumps(capture, indent=2, sort_keys=True) + "\n")
+      print(f"compile-clean combined E/P XProf: {runs[0]}")
+      PY
+      BASH
+    replica: 1
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x1
+    mounts:
+      - name: models
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        mount_path: /models
+        read_only: true
+        mount_options:
+          - implicit-dirs
+          - metadata-cache:ttl-secs:-1
+          - metadata-cache:stat-cache-max-size-mb:-1
+          - metadata-cache:type-cache-max-size-mb:-1
+          - file-system:kernel-list-cache-ttl-secs:-1
+          - read:enable-buffered-read:true
