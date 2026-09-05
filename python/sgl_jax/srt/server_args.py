@@ -263,7 +263,6 @@ class ServerArgs:
     # Multimodal
     multimodal: bool = False
     limit_mm_data_per_request: dict[str, int] | None = None
-    mm_io_worker_num: int = 0
     mm_processor_worker_num: int = 0
 
     # Encoder disaggregation
@@ -274,7 +273,6 @@ class ServerArgs:
     encoder_register_urls: list[str] | None = None
     encoder_transfer_backend: str = "raiden"
     encoder_transfer_pool_size: int = 32
-    encoder_receiver_background_progress: bool = True
     encoder_control_timeout_seconds: float = 300.0
     encoder_request_timeout_seconds: float = 300.0
     encoder_max_batch_size: int = 8
@@ -574,8 +572,6 @@ class ServerArgs:
             self.model_path = download_from_hf(self.model_path, allow_patterns=None)
             if self.limit_mm_data_per_request is None:
                 self.limit_mm_data_per_request = {"image": 16}
-        if self.mm_io_worker_num < 0:
-            raise ValueError("--mm-io-worker-num must be non-negative")
         if self.mm_processor_worker_num < 0:
             raise ValueError("--mm-processor-worker-num must be non-negative")
 
@@ -1723,16 +1719,13 @@ class ServerArgs:
             help="JSON object that limits the number of multimodal items per request, e.g. '{\"image\": 16}'.",
         )
         parser.add_argument(
-            "--mm-io-worker-num",
-            type=int,
-            default=ServerArgs.mm_io_worker_num,
-            help="Number of multimodal data loading workers. 0 uses the model default.",
-        )
-        parser.add_argument(
             "--mm-processor-worker-num",
             type=int,
             default=ServerArgs.mm_processor_worker_num,
-            help="Number of multimodal processor workers. 0 uses the model default.",
+            help=(
+                "Number of workers for multimodal loading and processing. "
+                "0 uses the model default."
+            ),
         )
         parser.add_argument(
             "--encoder-only",
@@ -1777,15 +1770,6 @@ class ServerArgs:
             type=int,
             default=ServerArgs.encoder_transfer_pool_size,
             help="Number of request slots in each registered Encoder transfer pool.",
-        )
-        parser.add_argument(
-            "--encoder-receiver-background-progress",
-            action=argparse.BooleanOptionalAction,
-            default=ServerArgs.encoder_receiver_background_progress,
-            help=(
-                "Continuously advance encoder metadata, Raiden receive, and device "
-                "materialization on one dedicated progress thread."
-            ),
         )
         parser.add_argument(
             "--encoder-control-timeout-seconds",

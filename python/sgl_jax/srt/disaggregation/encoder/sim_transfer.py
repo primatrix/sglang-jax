@@ -175,17 +175,28 @@ class SimEncoderServerTransfer:
                 raise TimeoutError("timed out waiting for simulated encoder pool slots")
             time.sleep(min(remaining, self._poll_interval_s))
 
-    def stage_batch_sync(
+    def precompile_packed_batches(self, specs) -> None:
+        pass
+
+    def stage_packed_batch_sync(
         self,
         reservations: list[_SimReservation],
-        embeddings: list[jax.Array],
+        packed: jax.Array,
+        token_counts: tuple[int, ...],
     ) -> list[_SimStagedTransfer]:
-        if len(reservations) != len(embeddings):
+        if len(reservations) != len(token_counts):
             raise ValueError("simulated reservation and embedding counts differ")
         if not reservations:
             return []
-        if any(embedding.ndim != 2 or embedding.shape[0] <= 0 for embedding in embeddings):
-            raise ValueError("Sim embedding must be a non-empty matrix")
+        if packed.ndim != 2 or any(count <= 0 for count in token_counts):
+            raise ValueError("Sim packed output must contain non-empty matrices")
+        if any(count != token_counts[0] for count in token_counts):
+            raise ValueError("simulated source pool requires one embedding shape")
+        if sum(token_counts) > packed.shape[0]:
+            raise ValueError("incomplete simulated packed output")
+        sample = jax.ShapeDtypeStruct(
+            (token_counts[0], packed.shape[1]), packed.dtype, sharding=packed.sharding
+        )
 
         with self._lock:
             if self._closed:
@@ -193,21 +204,20 @@ class SimEncoderServerTransfer:
             pool = self._pool
             if pool is None:
                 pool = _SimSendPool(
-                    embeddings[0],
+                    sample,
                     parallelism=self._parallelism,
                     ms_per_mb=self._ms_per_mb,
                     rtt_ms=self._rtt_ms,
                 )
                 self._pool = pool
 
-        for embedding in embeddings:
-            if not pool.matches(embedding):
-                raise ValueError(
-                    "simulated encoder pool embedding mismatch: "
-                    f"expected shape={pool.shape}, dtype={pool.dtype}, "
-                    f"sharding={pool.sharding}; got shape={tuple(embedding.shape)}, "
-                    f"dtype={embedding.dtype}, sharding={embedding.sharding}"
-                )
+        if not pool.matches(sample):
+            raise ValueError(
+                "simulated encoder pool embedding mismatch: "
+                f"expected shape={pool.shape}, dtype={pool.dtype}, "
+                f"sharding={pool.sharding}; got shape={sample.shape}, "
+                f"dtype={sample.dtype}, sharding={sample.sharding}"
+            )
         pool_ready_ns = time.time_ns()
         return [
             _SimStagedTransfer(
@@ -218,7 +228,12 @@ class SimEncoderServerTransfer:
             for reservation in reservations
         ]
 
-    def publish_sync(self, staged_transfer: Any) -> dict[str, Any]:
+    def publish_batch_sync(
+        self, staged_transfers: list[_SimStagedTransfer]
+    ) -> list[dict[str, Any]]:
+        return [self._publish(staged) for staged in staged_transfers]
+
+    def _publish(self, staged_transfer: _SimStagedTransfer) -> dict[str, Any]:
         reservation = staged_transfer.reservation
         transfer_id = reservation.transfer_id
         slot = reservation.slot
@@ -333,6 +348,10 @@ class SimReceiveSession:
     lane_id: int
     pool: _SimReceivePool
     _done: bool = False
+
+    @property
+    def timing_meta(self) -> dict[str, int]:
+        return {}
 
     def poll(self, *, refresh_backend: bool = True) -> jax.Array | None:
         del refresh_backend
@@ -503,6 +522,10 @@ class SimReceiverBackend:
                     f"got shape={shape}, dtype={dtype}"
                 )
         return pool.start(str(transfer_id))
+
+    def progress(self) -> bool:
+        # Simulated sessions become ready from their own monotonic deadlines.
+        return True
 
     def close(self) -> None:
         with self._pool_lock:

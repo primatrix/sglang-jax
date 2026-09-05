@@ -25,49 +25,6 @@ def _pool_sharding(sharding: jax.sharding.Sharding) -> jax.sharding.Sharding:
     return sharding
 
 
-@partial(jax.jit, donate_argnums=(0,))
-def _copy_into_slot(pool: jax.Array, value: jax.Array, slot: jax.Array) -> jax.Array:
-    block_shape = pool.shape[1:]
-    padded_shape = (block_shape[0], math.prod(block_shape[1:]))
-    padding = tuple((0, padded - size) for padded, size in zip(padded_shape, value.shape))
-    block = jnp.pad(value, padding).reshape(block_shape)
-    return jax.lax.dynamic_update_slice_in_dim(pool, block[None], slot, axis=0)
-
-
-@partial(jax.jit, donate_argnums=(0,))
-def _copy_into_slot_with_token(
-    pool: jax.Array,
-    value: jax.Array,
-    slot: jax.Array,
-) -> tuple[jax.Array, jax.Array]:
-    updated = _copy_into_slot(pool, value, slot)
-    block_size = math.prod(updated.shape[1:])
-    ready = updated.reshape(-1)[slot * block_size]
-    return updated, ready
-
-
-def _compile_donated_copy(
-    pool: jax.Array,
-    value: jax.Array,
-) -> Any:
-    compiled = _copy_into_slot_with_token.lower(
-        pool,
-        value,
-        jnp.asarray(0, dtype=jnp.int32),
-    ).compile()
-    stats = compiled.memory_analysis()
-    stats = stats if isinstance(stats, (list, tuple)) else (stats,)
-    if not stats or any(
-        stat is None
-        or int(getattr(stat, "alias_size_in_bytes", 0)) <= 0
-        or int(getattr(stat, "alias_size_in_bytes", 0)) * 100
-        < int(getattr(stat, "output_size_in_bytes", 0)) * 99
-        for stat in stats
-    ):
-        raise RuntimeError("Raiden encoder pool update did not fully alias its donated input")
-    return compiled
-
-
 @partial(jax.jit, donate_argnums=(0,), static_argnames=("token_counts",))
 def _copy_packed_batch_into_slots(
     pool: jax.Array,
@@ -208,7 +165,7 @@ def compile_packed_pool_copy(
         contiguous=contiguous,
     )
     logger.info(
-        "ENCODER-POOL-WRITE-PRECOMPILE capacity=%d batch_size=%d duration_ms=%.3f " "contiguous=%s",
+        "ENCODER-POOL-WRITE-PRECOMPILE capacity=%d batch_size=%d duration_ms=%.3f contiguous=%s",
         packed.shape[0],
         len(token_counts),
         (time.perf_counter_ns() - start_ns) / 1_000_000,
@@ -222,37 +179,10 @@ class RaidenSendPool:
 
     def __init__(
         self,
-        sample: jax.Array,
-        *,
-        capacity: int,
-    ) -> None:
-        self._initialize(
-            tuple(int(dim) for dim in sample.shape),
-            sample.dtype,
-            sample.sharding,
-            capacity,
-        )
-        self._copy = _compile_donated_copy(self._buffer, sample)
-
-    @classmethod
-    def for_shape(
-        cls,
         shape: tuple[int, int],
         dtype: jnp.dtype,
         sharding: jax.sharding.Sharding,
         *,
-        capacity: int,
-    ) -> RaidenSendPool:
-        pool = cls.__new__(cls)
-        pool._initialize(shape, dtype, sharding, capacity)
-        pool._copy = None
-        return pool
-
-    def _initialize(
-        self,
-        shape: tuple[int, int],
-        dtype: jnp.dtype,
-        sharding: jax.sharding.Sharding,
         capacity: int,
     ) -> None:
         self.shape = tuple(int(dim) for dim in shape)
@@ -266,39 +196,19 @@ class RaidenSendPool:
             device=pool_sharding,
         )
         jax.block_until_ready(self._buffer)
-        self._packed_copies: dict[tuple[tuple[int, ...], tuple[int, ...], bool], Any] = {}
 
     @property
     def buffer(self) -> jax.Array:
         return self._buffer
-
-    def matches(self, value: jax.Array) -> bool:
-        return (
-            tuple(value.shape) == self.shape
-            and value.dtype == self.dtype
-            and value.sharding == self.sharding
-        )
-
-    def copy_async(self, value: jax.Array, slot: int) -> jax.Array:
-        if not self.matches(value):
-            raise ValueError("Raiden pool contains an incompatible embedding")
-        if self._copy is None:
-            self._copy = _compile_donated_copy(self._buffer, value)
-        self._buffer, ready = self._copy(
-            self._buffer,
-            value,
-            jnp.asarray(slot, dtype=jnp.int32),
-        )
-        return ready
 
     def copy_packed_batch_async(
         self,
         packed: jax.Array,
         slots: list[int],
         token_counts: tuple[int, ...],
-        executable: Any | None = None,
+        executable: Any,
         *,
-        contiguous: bool | None = None,
+        contiguous: bool,
     ) -> tuple[jax.Array, ...]:
         if len(slots) != len(token_counts):
             raise ValueError("Raiden slot and packed item counts differ")
@@ -316,37 +226,21 @@ class RaidenSendPool:
             raise ValueError("Raiden packed output does not match the source pool")
 
         inferred_contiguous = slots == list(range(slots[0], slots[0] + len(slots)))
-        if contiguous is None:
-            contiguous = inferred_contiguous
-        elif contiguous != inferred_contiguous:
+        if contiguous != inferred_contiguous:
             raise ValueError("Raiden contiguous pool-write mode does not match slots")
-        key = (tuple(int(dim) for dim in packed.shape), token_counts, contiguous)
-        copy = executable or self._packed_copies.get(key)
-        if copy is None:
-            copy = compile_packed_pool_copy(
-                packed,
-                self.shape,
-                capacity=self._buffer.shape[0],
-                token_counts=token_counts,
-                contiguous=contiguous,
-            )
-        self._packed_copies[key] = copy
         if contiguous:
-            self._buffer, ready = copy(
+            self._buffer, ready = executable(
                 self._buffer,
                 packed,
                 jnp.asarray(slots[0], dtype=jnp.int32),
             )
         else:
-            self._buffer, ready = copy(
+            self._buffer, ready = executable(
                 self._buffer,
                 packed,
                 jnp.asarray(slots, dtype=jnp.int32),
             )
         return ready
-
-    def copy_sync(self, value: jax.Array, slot: int) -> None:
-        self.copy_async(value, slot).block_until_ready()
 
 
 @dataclass(slots=True)

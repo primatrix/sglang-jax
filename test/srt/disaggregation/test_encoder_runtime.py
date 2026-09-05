@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from contextlib import suppress
 from types import SimpleNamespace
 from typing import cast
 
 import jax.numpy as jnp
+import pytest
+
 from sgl_jax.srt.disaggregation.encoder.embedding_data import EmbeddingData
 from sgl_jax.srt.disaggregation.encoder.runtime import (
     EncoderRuntime,
@@ -39,15 +42,26 @@ class _TestEncoder:
             return request.get("modality"), request.get("token_count", 1)
         return request
 
-    def build_batch(self, prepared):
+    def _batch_requests(self, prepared):
         if self._preprocess is None:
             return prepared
         if all(isinstance(item, list) for item in prepared):
             return [request for item in prepared for request in item]
         return prepared[0] if len(prepared) == 1 else prepared
 
-    def encode(self, prepared):
-        return self._encode(prepared)
+    def build_batch(self, prepared):
+        return SimpleNamespace(inputs=self._batch_requests(prepared), transfer_specs=())
+
+    def encode_packed(self, prepared):
+        results = self._encode(prepared.inputs)
+        return SimpleNamespace(
+            batch=SimpleNamespace(token_counts=tuple(value.shape[0] for value, _ in results)),
+            packed=jnp.concatenate([value for value, _ in results]),
+            metadata=[metadata for _, metadata in results],
+        )
+
+    def metadata_for_packed(self, output):
+        return output.metadata
 
 
 class _FakeTransfer:
@@ -59,13 +73,30 @@ class _FakeTransfer:
     def reserve_batch_sync(self, transfer_ids):
         return list(transfer_ids)
 
-    def stage_batch_sync(self, reservations, embeddings):
-        return list(zip(reservations, embeddings))
+    def precompile_packed_batches(self, specs):
+        pass
+
+    def stage_packed_batch_sync(self, reservations, packed, token_counts):
+        offsets = [0]
+        for count in token_counts:
+            offsets.append(offsets[-1] + count)
+        return [
+            (reservation, packed[start:end])
+            for reservation, start, end in zip(reservations, offsets, offsets[1:])
+        ]
+
+    def publish_batch_sync(self, staged_transfers):
+        metadata = []
+        for staged in staged_transfers:
+            result = self._publish(staged)
+            result["transfer_copy_done_ns"] = time.time_ns()
+            metadata.append(result)
+        return metadata
 
     def cancel_batch(self, reservations):
         self.released.extend(reservations)
 
-    def publish_sync(self, staged_transfer):
+    def _publish(self, staged_transfer):
         transfer_id, embedding = staged_transfer
         self.published.append((transfer_id, embedding))
         return {"transfer_id": transfer_id}
@@ -99,14 +130,12 @@ async def _collect(runtime: EncoderRuntime, requests: list[dict]):
 
     await _enqueue(runtime, requests, complete)
     if requests:
-        await done.wait()
+        await asyncio.wait_for(done.wait(), 5)
     return results
 
 
 async def _enqueue(runtime: EncoderRuntime, requests: list[dict], callback):
-    prepared = await asyncio.gather(
-        *(runtime.preprocess_request(request) for request in requests)
-    )
+    prepared = await asyncio.gather(*(runtime.preprocess_request(request) for request in requests))
     for index, item in enumerate(prepared):
 
         def complete(result, index=index):
@@ -148,10 +177,43 @@ def test_encode_job_batches_cross_thread_deliveries_into_one_wakeup():
 def test_sim_server_transfer_reserves_stages_and_publishes():
     transfer = SimEncoderServerTransfer()
     reservations = transfer.reserve_batch_sync(["request-0:embedding"])
-    staged = transfer.stage_batch_sync(reservations, [jnp.zeros((1, 2))])
-    metadata = transfer.publish_sync(staged[0])
+    staged = transfer.stage_packed_batch_sync(reservations, jnp.zeros((1, 2)), (1,))
+    metadata = transfer.publish_batch_sync(staged)[0]
     assert metadata["transfer_id"] == "request-0:embedding"
     transfer.close()
+
+
+@pytest.mark.parametrize("phase", ["stage_packed_batch_sync", "publish_batch_sync"])
+def test_runtime_releases_entire_batch_when_transfer_fails(monkeypatch, phase):
+    transfer = _FakeTransfer()
+
+    def fail(*args):
+        raise RuntimeError("transfer failed")
+
+    monkeypatch.setattr(transfer, phase, fail)
+
+    async def run():
+        runtime = EncoderRuntime(
+            _TestEncoder(lambda requests: [(jnp.zeros((1, 2)), {}) for _ in requests]),
+            transfer,
+            batch_coalesce_ms=20,
+        )
+        try:
+            return await _collect(
+                runtime,
+                [
+                    {"req_id": "request-0", "modality": "IMAGE"},
+                    {"req_id": "request-1", "modality": "IMAGE"},
+                ],
+            )
+        finally:
+            await runtime.stop()
+
+    results = asyncio.run(run())
+
+    assert [index for index, _ in results] == [0, 1]
+    assert all(isinstance(result, RuntimeError) for _, result in results)
+    assert sorted(transfer.released) == ["request-0:0:embedding", "request-1:0:embedding"]
 
 
 def test_server_owns_scheduler_and_runtime():
@@ -217,9 +279,7 @@ def test_scheduler_preprocesses_next_batch_while_vit_is_busy():
         )
         scheduler = DisaggEncoderScheduler(runtime)
         scheduler.start()
-        first = asyncio.create_task(
-            scheduler.submit({"req_id": "request-0", "modality": "IMAGE"})
-        )
+        first = asyncio.create_task(scheduler.submit({"req_id": "request-0", "modality": "IMAGE"}))
         try:
             await asyncio.wait_for(first_encode_started.wait(), 1)
             second = asyncio.create_task(
@@ -319,6 +379,8 @@ def test_runtime_stages_packed_output_before_building_metadata():
     events = []
 
     class PackedEncoder:
+        preprocess_concurrency = 8
+
         async def preprocess_request(self, _request):
             return None
 
@@ -328,10 +390,7 @@ def test_runtime_stages_packed_output_before_building_metadata():
 
         @staticmethod
         def build_batch(prepared):
-            return SimpleNamespace(token_counts=(1,) * len(prepared))
-
-        def encode(self, _prepared):
-            raise AssertionError("legacy split path must not run")
+            return SimpleNamespace(token_counts=(1,) * len(prepared), transfer_specs=())
 
         def encode_packed(self, prepared):
             events.append("encode")
@@ -345,9 +404,6 @@ def test_runtime_stages_packed_output_before_building_metadata():
             return [{}, {}]
 
     class PackedTransfer(_FakeTransfer):
-        def stage_batch_sync(self, _reservations, _embeddings):
-            raise AssertionError("legacy per-item copy path must not run")
-
         def stage_packed_batch_sync(self, reservations, packed, token_counts):
             events.append("stage")
             assert token_counts == (1, 1)
@@ -395,13 +451,13 @@ def test_runtime_uses_event_loop_for_preprocess_and_threads_for_data_path():
                 self.copy_threads = []
                 self.publish_threads = []
 
-            def stage_batch_sync(self, reservations, embeddings):
+            def stage_packed_batch_sync(self, reservations, packed, token_counts):
                 self.copy_threads.append(threading.current_thread().name)
-                return super().stage_batch_sync(reservations, embeddings)
+                return super().stage_packed_batch_sync(reservations, packed, token_counts)
 
-            def publish_sync(self, staged_transfer):
+            def _publish(self, staged_transfer):
                 self.publish_threads.append(threading.current_thread().name)
-                return super().publish_sync(staged_transfer)
+                return super()._publish(staged_transfer)
 
         runtime = EncoderRuntime(
             _TestEncoder(encode, preprocess),
@@ -438,13 +494,13 @@ def test_runtime_reserves_before_forward():
             events.append("reserve")
             return super().reserve_batch_sync(transfer_ids)
 
-        def stage_batch_sync(self, reservations, embeddings):
+        def stage_packed_batch_sync(self, reservations, packed, token_counts):
             events.append("copy")
-            return super().stage_batch_sync(reservations, embeddings)
+            return super().stage_packed_batch_sync(reservations, packed, token_counts)
 
-        def publish_sync(self, staged_transfer):
+        def _publish(self, staged_transfer):
             events.append("publish")
-            return super().publish_sync(staged_transfer)
+            return super()._publish(staged_transfer)
 
     def encode(_requests):
         events.append("forward")
@@ -462,7 +518,7 @@ def test_runtime_reserves_before_forward():
     assert events == ["reserve", "forward", "copy", "publish"]
 
 
-def test_runtime_queues_results_and_completes_each_after_publish():
+def test_runtime_delivers_batch_only_after_all_publishes():
     class ControlledTransfer(_FakeTransfer):
         def __init__(self):
             super().__init__()
@@ -475,7 +531,7 @@ def test_runtime_queues_results_and_completes_each_after_publish():
                 "request-1:0:embedding": threading.Event(),
             }
 
-        def publish_sync(self, staged_transfer):
+        def _publish(self, staged_transfer):
             transfer_id, embedding = staged_transfer
             self.published.append((transfer_id, embedding))
             self.started[transfer_id].set()
@@ -514,8 +570,7 @@ def test_runtime_queues_results_and_completes_each_after_publish():
         assert [item[0] for item in transfer.published] == ["request-0:0:embedding"]
         await task
         transfer.events["request-0:0:embedding"].set()
-        await asyncio.wait_for(completed[0].wait(), 1)
-        assert results[0][0] == 0
+        assert not completed[0].is_set()
 
         assert await asyncio.to_thread(
             transfer.started["request-1:0:embedding"].wait,
@@ -526,8 +581,9 @@ def test_runtime_queues_results_and_completes_each_after_publish():
             "request-1:0:embedding",
         ]
         transfer.events["request-1:0:embedding"].set()
-        await asyncio.wait_for(completed[1].wait(), 1)
-        assert results[1][0] == 1
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in completed)), 1)
+        assert [index for index, _ in results] == [0, 1]
+        await runtime.stop()
 
     asyncio.run(run())
 
@@ -562,7 +618,7 @@ def test_runtime_publishes_requests_independently_across_receivers():
     ]
 
 
-def test_runtime_uses_backend_batch_publish_when_available():
+def test_runtime_publishes_on_transfer_thread():
     class BatchTransfer(_FakeTransfer):
         def __init__(self):
             super().__init__()
@@ -570,10 +626,7 @@ def test_runtime_uses_backend_batch_publish_when_available():
 
         def publish_batch_sync(self, staged_transfers):
             self.batch_threads.append(threading.current_thread().name)
-            return [
-                self.publish_sync(staged_transfer)
-                for staged_transfer in staged_transfers
-            ]
+            return super().publish_batch_sync(staged_transfers)
 
     def encode(requests):
         return [(jnp.zeros((1, 2)), {}) for _ in requests]
@@ -640,13 +693,58 @@ def test_server_reuses_metadata_sender_socket():
             await server.register_scheduler_receiver(
                 {"req_id": data.req_id, "receive_url": "127.0.0.1:1234"}
             )
-            await server.send_to_scheduler(data.req_id, data)
+        await asyncio.gather(
+            *(server.send_to_scheduler(data.req_id, data) for data in (first, second))
+        )
 
         assert len(context.sockets) == 1
         assert context.sockets[0].sent == [first, second]
         await server.stop()
         assert context.sockets[0].closed
         assert transfer.closed
+
+    asyncio.run(run())
+
+
+def test_server_notification_backpressure_is_local_to_receiver():
+    async def run() -> None:
+        blocked = asyncio.Event()
+        release = asyncio.Event()
+
+        class FakeSocket:
+            def __init__(self):
+                self.sent = []
+
+            async def send_pyobj(self, data):
+                if data.req_id == "slow":
+                    blocked.set()
+                    await release.wait()
+                self.sent.append(data)
+
+            def close(self):
+                pass
+
+        server = EncoderServer(_TestEncoder(lambda _: None), _FakeTransfer())
+        slow, healthy = _data("slow"), _data("healthy")
+        sockets = {data.req_id: FakeSocket() for data in (slow, healthy)}
+        server._receiver_sockets.update(sockets)
+        for data in (slow, healthy):
+            await server.register_scheduler_receiver(
+                {"req_id": data.req_id, "receive_url": data.req_id}
+            )
+
+        slow_send = asyncio.create_task(server.send_to_scheduler(slow.req_id, slow))
+        try:
+            await asyncio.wait_for(blocked.wait(), 1)
+            await asyncio.wait_for(server.send_to_scheduler(healthy.req_id, healthy), 1)
+            assert sockets["healthy"].sent == [healthy]
+            assert not slow_send.done()
+            assert set(server._receiver_addresses) == {"slow"}
+            assert set(server._receiver_events) == {"slow"}
+        finally:
+            release.set()
+            await slow_send
+            await server.stop()
 
     asyncio.run(run())
 
@@ -690,7 +788,7 @@ def test_runtime_overlaps_forward_with_background_publish():
         loop = asyncio.get_running_loop()
 
         class ControlledTransfer(_FakeTransfer):
-            def publish_sync(self, staged_transfer):
+            def _publish(self, staged_transfer):
                 transfer_id, _ = staged_transfer
                 publish_started.append(transfer_id)
                 if transfer_id.startswith("request-0:"):
@@ -750,13 +848,13 @@ def test_runtime_does_not_block_vit_on_large_transfer_batch():
         loop = asyncio.get_running_loop()
 
         class ControlledTransfer(_FakeTransfer):
-            def publish_sync(self, staged_transfer):
+            def _publish(self, staged_transfer):
                 transfer_id, _ = staged_transfer
                 if transfer_id.startswith("request-0:"):
                     first_transfer_started.set()
                     if not release_first_transfer.wait(1):
                         raise TimeoutError("test did not release first transfer")
-                return super().publish_sync(staged_transfer)
+                return super()._publish(staged_transfer)
 
         def encode(requests):
             if requests[0]["req_id"] == "request-next":
@@ -794,10 +892,10 @@ def test_runtime_forward_runs_with_four_transfers_inflight():
                 super().__init__()
                 self.active = set()
 
-            def publish_sync(self, staged_transfer):
+            def _publish(self, staged_transfer):
                 transfer_id, _ = staged_transfer
                 self.active.add(transfer_id)
-                return super().publish_sync(staged_transfer)
+                return super()._publish(staged_transfer)
 
             def release(self, transfer_id) -> None:
                 self.active.discard(transfer_id)
@@ -920,8 +1018,11 @@ def test_preprocessed_requests_batch_at_vit_boundary():
         batches = []
         prepared_count = 0
 
-        class BufferedEncoder:
+        class BufferedEncoder(_TestEncoder):
             preprocess_concurrency = 3
+
+            def __init__(self):
+                super().__init__(self._encode_requests)
 
             async def preprocess_request(self, request):
                 nonlocal prepared_count
@@ -935,11 +1036,7 @@ def test_preprocessed_requests_batch_at_vit_boundary():
             def batch_key(request):
                 return request["modality"], request["token_count"]
 
-            @staticmethod
-            def build_batch(requests):
-                return requests
-
-            def encode(self, requests):
+            def _encode_requests(self, requests):
                 req_ids = [request["req_id"] for request in requests]
                 batches.append(req_ids)
                 if req_ids == ["request-0"]:
@@ -993,3 +1090,73 @@ def test_preprocessed_requests_batch_at_vit_boundary():
         ["request-0"],
         ["request-1", "request-2", "request-3"],
     ]
+
+
+def test_runtime_overlaps_next_vit_with_previous_metadata():
+    metadata_started = threading.Event()
+    release_metadata = threading.Event()
+    second_encoded = threading.Event()
+
+    class Encoder(_TestEncoder):
+        def metadata_for_packed(self, output):
+            assert threading.current_thread().name == "sgl-jax-encoder-transfer"
+            if not metadata_started.is_set():
+                metadata_started.set()
+                assert release_metadata.wait(2)
+            return super().metadata_for_packed(output)
+
+    def encode(requests):
+        if requests[0]["req_id"] == "second":
+            second_encoded.set()
+        return [(jnp.zeros((1, 2)), {}) for _ in requests]
+
+    async def run():
+        runtime = EncoderRuntime(Encoder(encode), _FakeTransfer(), max_batch_size=1)
+        first = asyncio.create_task(_collect(runtime, [{"req_id": "first", "modality": "IMAGE"}]))
+        second = None
+        try:
+            assert await asyncio.to_thread(metadata_started.wait, 1)
+            second = asyncio.create_task(
+                _collect(runtime, [{"req_id": "second", "modality": "IMAGE"}])
+            )
+            assert await asyncio.to_thread(second_encoded.wait, 1)
+            release_metadata.set()
+            results = await asyncio.gather(first, second)
+            assert all(isinstance(rows[0][1], EmbeddingData) for rows in results)
+        finally:
+            release_metadata.set()
+            await asyncio.gather(
+                *(task for task in (first, second) if task), return_exceptions=True
+            )
+            await runtime.stop()
+
+    asyncio.run(run())
+
+
+def test_runtime_metadata_failure_releases_batch_and_keeps_transfer_worker_alive():
+    class Encoder(_TestEncoder):
+        fail = True
+
+        def metadata_for_packed(self, output):
+            if self.fail:
+                self.fail = False
+                raise ValueError("invalid metadata")
+            return super().metadata_for_packed(output)
+
+    async def run():
+        transfer = _FakeTransfer()
+        runtime = EncoderRuntime(
+            Encoder(lambda requests: [(jnp.zeros((1, 2)), {}) for _ in requests]),
+            transfer,
+            max_batch_size=1,
+        )
+        try:
+            failed = await _collect(runtime, [{"req_id": "failed", "modality": "IMAGE"}])
+            assert isinstance(failed[0][1], ValueError)
+            assert transfer.released == ["failed:0:embedding"]
+            ready = await _collect(runtime, [{"req_id": "ready", "modality": "IMAGE"}])
+            assert isinstance(ready[0][1], EmbeddingData)
+        finally:
+            await runtime.stop()
+
+    asyncio.run(run())

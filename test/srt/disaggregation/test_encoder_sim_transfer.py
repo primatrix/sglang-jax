@@ -37,8 +37,8 @@ async def _publish(transfer, transfer_id, embedding):
         transfer.reserve_batch_sync,
         [transfer_id],
     )
-    staged = transfer.stage_batch_sync(reservations, [embedding])
-    return await asyncio.to_thread(transfer.publish_sync, staged[0])
+    staged = transfer.stage_packed_batch_sync(reservations, embedding, (embedding.shape[0],))
+    return (await asyncio.to_thread(transfer.publish_batch_sync, staged))[0]
 
 
 def test_sim_transfer_uses_raiden_padded_payload_size():

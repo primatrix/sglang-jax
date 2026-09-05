@@ -53,6 +53,9 @@ def test_encoder_receiver_reuses_http_client(monkeypatch):
             self.closed = True
 
     class FakeBackend:
+        def progress(self):
+            return True
+
         def close(self) -> None:
             pass
 
@@ -60,7 +63,7 @@ def test_encoder_receiver_reuses_http_client(monkeypatch):
     client = encoder_client.EncoderClient(
         host="127.0.0.1",
         backend=FakeBackend(),
-        encoder_urls=["http://encoder"],
+        result_preparer=lambda request, result: None,
         registration_workers=1,
         registration_timeout=12.0,
     )
@@ -83,6 +86,9 @@ def test_encoder_receiver_reuses_metadata_socket(monkeypatch):
             pass
 
     class FakeBackend:
+        def progress(self):
+            return True
+
         def close(self) -> None:
             pass
 
@@ -95,15 +101,15 @@ def test_encoder_receiver_reuses_metadata_socket(monkeypatch):
     client = encoder_client.EncoderClient(
         host="127.0.0.1",
         backend=FakeBackend(),
-        encoder_urls=["http://encoder"],
+        result_preparer=lambda request, result: None,
         registration_workers=1,
         registration_timeout=12.0,
     )
     requests = [
         SimpleNamespace(
             rid=f"request-{index}",
-            encoder_urls=None,
-            num_items_assigned=None,
+            encoder_urls=["http://encoder"],
+            num_items_assigned={Modality.IMAGE: [1]},
         )
         for index in range(2)
     ]
@@ -139,6 +145,9 @@ def test_encoder_receiver_registers_parts_concurrently(monkeypatch):
             pass
 
     class FakeBackend:
+        def progress(self):
+            return True
+
         def close(self) -> None:
             pass
 
@@ -146,14 +155,14 @@ def test_encoder_receiver_registers_parts_concurrently(monkeypatch):
     client = encoder_client.EncoderClient(
         host="127.0.0.1",
         backend=FakeBackend(),
-        encoder_urls=["http://encoder-0", "http://encoder-1"],
+        result_preparer=lambda request, result: None,
         registration_workers=2,
         registration_timeout=12.0,
     )
     pending = client.receive(
         SimpleNamespace(
             rid="request",
-            encoder_urls=None,
+            encoder_urls=["http://encoder-0", "http://encoder-1"],
             num_items_assigned={Modality.IMAGE: [1, 1]},
         )
     )
@@ -240,25 +249,27 @@ def test_encoder_receiver_background_progresses_without_scheduler_poll(monkeypat
 
     monkeypatch.setattr(encoder_client.httpx, "Client", FakeClient)
     monkeypatch.setattr(encoder_client, "EncoderMetadataRouter", FakeRouter)
-    client = encoder_client.EncoderClient(
-        host="127.0.0.1",
-        backend=FakeBackend(),
-        encoder_urls=["http://encoder"],
-        registration_workers=1,
-        registration_timeout=12.0,
-        background_progress=True,
-    )
     prepare_threads = []
 
     def prepare_result(request, result):
         prepare_threads.append(threading.current_thread().name)
         request.prepared_shape = result["embeddings"][Modality.IMAGE].shape
 
-    client.set_result_preparer(prepare_result)
-    request = SimpleNamespace(rid="request-0", encoder_urls=None, num_items_assigned=None)
+    client = encoder_client.EncoderClient(
+        host="127.0.0.1",
+        backend=FakeBackend(),
+        result_preparer=prepare_result,
+        registration_workers=1,
+        registration_timeout=12.0,
+    )
+    request = SimpleNamespace(
+        rid="request-0",
+        encoder_urls=["http://encoder"],
+        num_items_assigned={Modality.IMAGE: [1]},
+    )
     pending = client.receive(request)
     FakeRouter.instance.message = EmbeddingData(
-        req_id="request-0",
+        req_id="request-0_local_part_0",
         num_parts=1,
         part_idx=0,
         grid_dim=None,
@@ -314,7 +325,7 @@ def test_encoder_receiver_preserves_item_hashes_as_host_metadata():
     metadata = accumulator.get_mm_extra_meta()
 
     assert metadata["item_hashes"] == {Modality.IMAGE: [123]}
-    assert isinstance(metadata["img_grid_thw"], np.ndarray)
+    assert isinstance(metadata["image_grid_thw"], np.ndarray)
 
 
 def test_encoder_request_dispatcher_reuses_http_client(monkeypatch):

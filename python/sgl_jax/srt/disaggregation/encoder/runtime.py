@@ -36,10 +36,6 @@ class _EncodeJob:
     items: list[_ReadyJob]
     prepared: Any
 
-    def deliver(self, index: int, result: EmbeddingData | Exception) -> None:
-        item = self.items[index]
-        item.callback_loop.call_soon_threadsafe(item.callback, result)
-
     def deliver_many(self, results: list[tuple[int, EmbeddingData | Exception]]) -> None:
         loop = self.items[0].callback_loop
         deliveries = tuple((self.items[index].callback, result) for index, result in results)
@@ -57,17 +53,14 @@ class _EncodeJob:
 
 
 @dataclass(slots=True)
-class _TransferJob:
-    batch: _EncodeJob
-    index: int
-    transfer_id: str
-    staged_transfer: Any
-    data: EmbeddingData
-
-
-@dataclass(slots=True)
 class _TransferBatchJob:
-    jobs: list[_TransferJob]
+    batch: _EncodeJob
+    output: Any
+    staged_transfers: list[Any]
+    transfer_ids: list[str]
+    encode_return_ns: int
+    copy_start_ns: int
+    enqueue_ns: int
 
 
 class EncoderRuntime:
@@ -105,7 +98,7 @@ class EncoderRuntime:
             1,
             min(
                 self._max_batch_size,
-                int(getattr(self._encoder, "preprocess_concurrency", self._max_batch_size)),
+                self._encoder.preprocess_concurrency,
             ),
         )
 
@@ -197,10 +190,7 @@ class EncoderRuntime:
             job = _EncodeJob(batch, None)
             try:
                 job.prepared = self._encoder.build_batch([item.prepared.value for item in batch])
-                precompile_packed = getattr(self._transfer, "precompile_packed_batches", None)
-                transfer_specs = getattr(job.prepared, "transfer_specs", ())
-                if callable(precompile_packed) and transfer_specs:
-                    precompile_packed(transfer_specs)
+                self._transfer.precompile_packed_batches(job.prepared.transfer_specs)
             except Exception as exc:
                 job.fail_batch(exc)
             else:
@@ -273,144 +263,119 @@ class EncoderRuntime:
         reservations = None
         try:
             reservations = self._transfer.reserve_batch_sync(transfer_ids)
-            encode_packed = getattr(self._encoder, "encode_packed", None)
-            metadata_for_packed = getattr(self._encoder, "metadata_for_packed", None)
-            stage_packed = getattr(self._transfer, "stage_packed_batch_sync", None)
-            use_packed = all(
-                callable(method) for method in (encode_packed, metadata_for_packed, stage_packed)
+            packed_output = self._encoder.encode_packed(job.prepared)
+            runtime_encode_return_ns = time.time_ns()
+            copy_start_ns = time.time_ns()
+            staged_transfers = self._transfer.stage_packed_batch_sync(
+                reservations,
+                packed_output.packed,
+                packed_output.batch.token_counts,
             )
-            staged_transfers = None
-            if use_packed:
-                assert callable(encode_packed)
-                assert callable(metadata_for_packed)
-                assert callable(stage_packed)
-                packed_output = encode_packed(job.prepared)
-                runtime_encode_return_ns = time.time_ns()
-                copy_start_ns = time.time_ns()
-                staged_transfers = stage_packed(
-                    reservations,
-                    packed_output.packed,
-                    packed_output.batch.token_counts,
-                )
-                runtime_postprocess_start_ns = time.perf_counter_ns()
-                packed_metadata = metadata_for_packed(packed_output)
-                results = [
-                    (
-                        (token_count, int(packed_output.packed.shape[1])),
-                        packed_output.packed.dtype,
-                        metadata,
-                    )
-                    for token_count, metadata in zip(
-                        packed_output.batch.token_counts,
-                        packed_metadata,
-                    )
-                ]
-            else:
-                encoded = self._encoder.encode(job.prepared)
-                runtime_encode_return_ns = time.time_ns()
-                runtime_postprocess_start_ns = time.perf_counter_ns()
-                results = [
-                    (embedding.shape, embedding.dtype, metadata) for embedding, metadata in encoded
-                ]
-            if len(results) != len(requests):
-                raise RuntimeError(
-                    f"encoder returned {len(results)} results for {len(requests)} requests"
-                )
-            encode_done_ns = time.time_ns()
-            transfer_jobs = []
-            metadata_prepare_duration_ns = 0
-            embedding_data_duration_ns = 0
-            result_pack_duration_ns = 0
-            for index, (request, transfer_id, (embedding_shape, dtype, metadata)) in enumerate(
-                zip(requests, transfer_ids, results)
-            ):
-                phase_start_ns = time.perf_counter_ns()
-                metadata = dict(metadata)
-                encoder_timing = {
-                    "encode_done_ns": encode_done_ns,
-                    **metadata.pop("_encoder_timing", {}),
-                }
-                metadata_prepare_duration_ns += time.perf_counter_ns() - phase_start_ns
-
-                phase_start_ns = time.perf_counter_ns()
-                data = EmbeddingData(
-                    req_id=request["req_id"],
-                    num_parts=request.get("num_parts", 1),
-                    part_idx=request.get("part_idx", 0),
-                    grid_dim=metadata.pop("grid_dim", None),
-                    modality=Modality.from_str(request["modality"]),
-                    embedding_shape=embedding_shape,
-                    dtype=str(dtype),
-                    dispatch_start_ns=request.get("dispatch_start_ns"),
-                    preprocess_start_ns=job.items[index].prepared.preprocess_start_ns,
-                    **metadata,
-                    **encoder_timing,
-                )
-                embedding_data_duration_ns += time.perf_counter_ns() - phase_start_ns
-
-                phase_start_ns = time.perf_counter_ns()
-                transfer_jobs.append((index, transfer_id, data))
-                result_pack_duration_ns += time.perf_counter_ns() - phase_start_ns
-
-            runtime_postprocess_done_ns = time.time_ns()
-            runtime_postprocess_duration_ns = time.perf_counter_ns() - runtime_postprocess_start_ns
-            runtime_postprocess_residual_ns = max(
-                0,
-                runtime_postprocess_duration_ns
-                - metadata_prepare_duration_ns
-                - embedding_data_duration_ns
-                - result_pack_duration_ns,
-            )
-            runtime_timing = {
-                "runtime_encode_return_ns": runtime_encode_return_ns,
-                "runtime_postprocess_done_ns": runtime_postprocess_done_ns,
-                "runtime_postprocess_duration_ns": runtime_postprocess_duration_ns,
-                "runtime_metadata_prepare_duration_ns": metadata_prepare_duration_ns,
-                "runtime_embedding_data_duration_ns": embedding_data_duration_ns,
-                "runtime_result_pack_duration_ns": result_pack_duration_ns,
-                "runtime_postprocess_residual_ns": runtime_postprocess_residual_ns,
-            }
-            timing_attach_start_ns = time.perf_counter_ns()
-            for _, _, data in transfer_jobs:
-                for key, value in runtime_timing.items():
-                    setattr(data, key, value)
-            timing_attach_duration_ns = time.perf_counter_ns() - timing_attach_start_ns
-            for _, _, data in transfer_jobs:
-                data.runtime_timing_attach_duration_ns = timing_attach_duration_ns
-
-            if not use_packed:
-                copy_start_ns = time.time_ns()
-            for _, _, data in transfer_jobs:
-                data.transfer_copy_start_ns = copy_start_ns
-            if staged_transfers is None:
-                encoded_embeddings = [embedding for embedding, _ in encoded]
-                staged_transfers = self._transfer.stage_batch_sync(
-                    reservations,
-                    encoded_embeddings,
-                )
-            if len(staged_transfers) != len(transfer_jobs):
+            if len(staged_transfers) != len(requests):
                 raise RuntimeError("transfer returned an incomplete staged batch")
-            queued_jobs = []
-            transfer_enqueue_ns = time.time_ns()
-            for (index, transfer_id, data), staged_transfer in zip(
-                transfer_jobs,
-                staged_transfers,
-            ):
-                data.transfer_enqueue_ns = transfer_enqueue_ns
-                queued_jobs.append(
-                    _TransferJob(
-                        job,
-                        index,
-                        transfer_id,
-                        staged_transfer,
-                        data,
-                    )
+            # The transfer worker builds host metadata while the next ViT batch
+            # is dispatched. Pool reservations remain the only transfer limit.
+            self._transfer_queue.put(
+                _TransferBatchJob(
+                    job,
+                    packed_output,
+                    staged_transfers,
+                    transfer_ids,
+                    runtime_encode_return_ns,
+                    copy_start_ns,
+                    time.time_ns(),
                 )
-            self._transfer_queue.put(_TransferBatchJob(queued_jobs))
+            )
         except Exception as exc:
             if reservations is not None:
                 self._transfer.cancel_batch(reservations)
             job.fail_batch(exc)
+
+    def _prepare_transfer_metadata(self, batch: _TransferBatchJob) -> list[EmbeddingData]:
+        job, packed_output = batch.batch, batch.output
+        requests = [item.prepared.request for item in job.items]
+        runtime_postprocess_start_ns = time.perf_counter_ns()
+        packed_metadata = self._encoder.metadata_for_packed(packed_output)
+        results = [
+            (
+                (token_count, int(packed_output.packed.shape[1])),
+                packed_output.packed.dtype,
+                metadata,
+            )
+            for token_count, metadata in zip(
+                packed_output.batch.token_counts, packed_metadata, strict=True
+            )
+        ]
+        if len(results) != len(requests):
+            raise RuntimeError(
+                f"encoder returned {len(results)} results for {len(requests)} requests"
+            )
+        encode_done_ns = time.time_ns()
+        data_items = []
+        metadata_prepare_duration_ns = 0
+        embedding_data_duration_ns = 0
+        result_pack_duration_ns = 0
+        for index, (request, (embedding_shape, dtype, metadata)) in enumerate(
+            zip(requests, results)
+        ):
+            phase_start_ns = time.perf_counter_ns()
+            metadata = dict(metadata)
+            encoder_timing = {
+                "encode_done_ns": encode_done_ns,
+                **metadata.pop("_encoder_timing", {}),
+            }
+            metadata_prepare_duration_ns += time.perf_counter_ns() - phase_start_ns
+
+            phase_start_ns = time.perf_counter_ns()
+            data = EmbeddingData(
+                req_id=request["req_id"],
+                num_parts=request.get("num_parts", 1),
+                part_idx=request.get("part_idx", 0),
+                grid_dim=metadata.pop("grid_dim", None),
+                modality=Modality.from_str(request["modality"]),
+                embedding_shape=embedding_shape,
+                dtype=str(dtype),
+                dispatch_start_ns=request.get("dispatch_start_ns"),
+                preprocess_start_ns=job.items[index].prepared.preprocess_start_ns,
+                **metadata,
+                **encoder_timing,
+            )
+            embedding_data_duration_ns += time.perf_counter_ns() - phase_start_ns
+
+            phase_start_ns = time.perf_counter_ns()
+            data_items.append(data)
+            result_pack_duration_ns += time.perf_counter_ns() - phase_start_ns
+
+        runtime_postprocess_done_ns = time.time_ns()
+        runtime_postprocess_duration_ns = time.perf_counter_ns() - runtime_postprocess_start_ns
+        runtime_postprocess_residual_ns = max(
+            0,
+            runtime_postprocess_duration_ns
+            - metadata_prepare_duration_ns
+            - embedding_data_duration_ns
+            - result_pack_duration_ns,
+        )
+        runtime_timing = {
+            "runtime_encode_return_ns": batch.encode_return_ns,
+            "runtime_postprocess_done_ns": runtime_postprocess_done_ns,
+            "runtime_postprocess_duration_ns": runtime_postprocess_duration_ns,
+            "runtime_metadata_prepare_duration_ns": metadata_prepare_duration_ns,
+            "runtime_embedding_data_duration_ns": embedding_data_duration_ns,
+            "runtime_result_pack_duration_ns": result_pack_duration_ns,
+            "runtime_postprocess_residual_ns": runtime_postprocess_residual_ns,
+        }
+        timing_attach_start_ns = time.perf_counter_ns()
+        for data in data_items:
+            for key, value in runtime_timing.items():
+                setattr(data, key, value)
+        timing_attach_duration_ns = time.perf_counter_ns() - timing_attach_start_ns
+        for data in data_items:
+            data.runtime_timing_attach_duration_ns = timing_attach_duration_ns
+
+        for data in data_items:
+            data.transfer_copy_start_ns = batch.copy_start_ns
+            data.transfer_enqueue_ns = batch.enqueue_ns
+        return data_items
 
     def _transfer_worker(self) -> None:
         while True:
@@ -421,84 +386,30 @@ class EncoderRuntime:
             self._run_transfer_batch(item)
 
     def _run_transfer_batch(self, batch: _TransferBatchJob) -> None:
-        publish_batch = getattr(self._transfer, "publish_batch_sync", None)
-        if not callable(publish_batch):
-            for job in batch.jobs:
-                self._run_transfer(job)
-            return
-
         transfer_start_ns = time.time_ns()
-        for job in batch.jobs:
-            job.data.transfer_start_ns = transfer_start_ns
         try:
-            metadata = publish_batch([job.staged_transfer for job in batch.jobs])
-            if len(metadata) != len(batch.jobs):
+            data_items = self._prepare_transfer_metadata(batch)
+            for data in data_items:
+                data.transfer_start_ns = transfer_start_ns
+            metadata = self._transfer.publish_batch_sync(batch.staged_transfers)
+            if len(metadata) != len(data_items):
                 raise RuntimeError("transfer returned incomplete batch metadata")
         except Exception as exc:
-            deliveries: list[tuple[int, EmbeddingData | Exception]] = []
-            for job in batch.jobs:
-                self._transfer.release(job.transfer_id)
-                deliveries.append((job.index, exc))
-            if batch.jobs:
-                batch.jobs[0].batch.deliver_many(deliveries)
+            for transfer_id in batch.transfer_ids:
+                self._transfer.release(transfer_id)
+            batch.batch.fail_batch(exc)
             return
         deliveries = []
-        for job, item_metadata in zip(batch.jobs, metadata):
-            deliveries.append(
-                (job.index, self._complete_transfer(job, item_metadata, deliver=False))
-            )
-        if batch.jobs:
-            batch.jobs[0].batch.deliver_many(deliveries)
-
-    def _run_transfer(self, job: _TransferJob) -> None:
-        try:
-            job.data.transfer_start_ns = time.time_ns()
-            transfer_metadata = self._transfer.publish_sync(job.staged_transfer)
-        except Exception as exc:
-            self._transfer.release(job.transfer_id)
-            job.batch.deliver(job.index, exc)
-        else:
-            self._complete_transfer(job, transfer_metadata)
-
-    def _complete_transfer(
-        self,
-        job: _TransferJob,
-        transfer_metadata: dict[str, Any],
-        *,
-        deliver: bool = True,
-    ) -> EmbeddingData:
-        for key, value in transfer_metadata.items():
-            setattr(job.data, key, value)
-        # Backends may optionally expose the pool/reservation/copy split.
-        # Keep a complete timing chain for simpler downstream aggregation.
-        job.data.transfer_pool_ready_ns = (
-            getattr(job.data, "transfer_pool_ready_ns", None) or job.data.transfer_start_ns
-        )
-        job.data.transfer_reserve_done_ns = (
-            getattr(job.data, "transfer_reserve_done_ns", None) or job.data.transfer_pool_ready_ns
-        )
-        job.data.transfer_copy_done_ns = (
-            getattr(job.data, "transfer_copy_done_ns", None)
-            or job.data.transfer_stage_done_ns
-            or job.data.transfer_start_ns
-        )
-        job.data.transfer_register_start_ns = (
-            getattr(job.data, "transfer_register_start_ns", None) or job.data.transfer_copy_done_ns
-        )
-        job.data.transfer_register_done_ns = (
-            getattr(job.data, "transfer_register_done_ns", None) or time.time_ns()
-        )
-        assert job.data.transfer_copy_done_ns is not None
-        assert job.data.transfer_register_done_ns is not None
-        job.data.transfer_publish_ready_ns = getattr(
-            job.data, "transfer_publish_ready_ns", None
-        ) or max(job.data.transfer_copy_done_ns, job.data.transfer_register_done_ns)
-        job.data.transfer_stage_done_ns = job.data.transfer_copy_done_ns
-        job.data.transfer_id = str(transfer_metadata.get("transfer_id", job.transfer_id))
-        job.data.publish_done_ns = time.time_ns()
-        if deliver:
-            job.batch.deliver(job.index, job.data)
-        return job.data
+        for index, (data, transfer_id, item_metadata) in enumerate(
+            zip(data_items, batch.transfer_ids, metadata)
+        ):
+            for key, value in item_metadata.items():
+                setattr(data, key, value)
+            data.transfer_stage_done_ns = data.transfer_copy_done_ns
+            data.transfer_id = transfer_id
+            data.publish_done_ns = time.time_ns()
+            deliveries.append((index, data))
+        batch.batch.deliver_many(deliveries)
 
     def release(self, transfer_id: str) -> None:
         self._transfer.release(transfer_id)

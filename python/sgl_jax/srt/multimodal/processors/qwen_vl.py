@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import math
 import os
@@ -228,6 +227,7 @@ def preprocess_video(source, video_config: dict) -> np.ndarray:
 class QwenVLProcessor(BaseMultimodalProcessor):
     auto_mm_processor_worker_num = 2
     supports_mm_processor_concurrency = True
+    use_torchcodec_image_decode = True
     models = (
         "Qwen2VLForConditionalGeneration",
         "Qwen2_5_VLForConditionalGeneration",
@@ -240,9 +240,7 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         """Add Qwen MRoPE metadata to the generic disaggregated output."""
         hf_config = self.hf_config
         mm_inputs = super().get_mm_data(prompt, embeddings, **metadata)
-        image_grids = self._to_grid_list(
-            metadata.get("image_grid_thw", metadata.get("img_grid_thw"))
-        )
+        image_grids = self._to_grid_list(metadata.get("image_grid_thw"))
         video_grids = self._to_grid_list(metadata.get("video_grid_thw"))
         second_per_grid_ts = metadata.get("second_per_grid_ts")
         second_per_grid_ts = (
@@ -284,10 +282,27 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         image_sources = self.normalize_data(image_data)
         video_data = self.normalize_data(getattr(request_obj, "video_data", None))
         video_config = self._build_video_config(request_obj)
-        images, videos = await asyncio.gather(
-            self.load_images_async(image_sources),
-            self._load_videos_async(video_data, video_config),
+        return await self.mm_processor_executor.run(
+            self._process_mm_data,
+            input_text,
+            image_sources,
+            video_data,
+            video_config,
         )
+
+    def _process_mm_data(
+        self,
+        input_text,
+        image_sources,
+        video_data,
+        video_config,
+        *,
+        processor,
+    ) -> MultimodalInputs:
+        images = [self.load_image(source) for source in image_sources]
+        videos = [
+            preprocess_video(self.unwrap_source(source), video_config) for source in video_data
+        ]
         processor_kwargs = {}
         if videos:
             processor_kwargs["videos_kwargs"] = {
@@ -298,10 +313,11 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         if uses_qwen3vl_processor:
             processor_kwargs["return_mm_token_type_ids"] = True
 
-        return await self.process_and_combine_mm_data_async(
+        return self.process_and_combine_mm_data(
             input_text,
             images=images,
             videos=videos,
+            processor=processor,
             **processor_kwargs,
         )
 
@@ -330,26 +346,26 @@ class QwenVLProcessor(BaseMultimodalProcessor):
             )
 
         if encoder_timing is not None:
-            encoder_timing["image_load_start_ns"] = time.time_ns()
-        images = await self.load_images_async(self.normalize_data(image_data))
-        if encoder_timing is not None:
-            encoder_timing["image_load_done_ns"] = time.time_ns()
             encoder_timing["processor_submit_ns"] = time.time_ns()
         return await self.mm_processor_executor.run(
             self._process_encoder_images,
-            images,
+            self.normalize_data(image_data),
             encoder_timing=encoder_timing,
         )
 
     def _process_encoder_images(
         self,
-        images: list[Image.Image],
+        image_sources: list,
         *,
         processor,
         encoder_timing: dict[str, int] | None = None,
     ):
         if encoder_timing is not None:
             encoder_timing["processor_start_ns"] = time.time_ns()
+            encoder_timing["image_load_start_ns"] = time.time_ns()
+        images = [self.load_image(source) for source in image_sources]
+        if encoder_timing is not None:
+            encoder_timing["image_load_done_ns"] = time.time_ns()
         processor_output = processor.image_processor(images=images, return_tensors="pt")
         result = self._collect_encoder_images(processor_output)
         if encoder_timing is not None:
@@ -611,14 +627,6 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         if offset != len(groups):
             raise ValueError("Qwen3-VL has unmatched vision token groups.")
         return result
-
-    async def _load_videos_async(self, video_data, video_config):
-        return await asyncio.gather(
-            *(
-                self._run_io_async(preprocess_video, self.unwrap_source(item), video_config)
-                for item in video_data
-            )
-        )
 
     def _build_video_config(self, request_obj):
         vision_config = self.hf_config.vision_config

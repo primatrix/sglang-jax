@@ -1,9 +1,10 @@
-import asyncio
-import concurrent.futures
+from __future__ import annotations
+
 import io
 import logging
 import os
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlparse
 
 import numpy as np
@@ -17,6 +18,9 @@ from sgl_jax.srt.multimodal.common.modality_enum import (
     MultimodalInputs,
 )
 from sgl_jax.srt.multimodal.processors.executor import MultimodalProcessorExecutor
+
+if TYPE_CHECKING:
+    import torch
 
 logger = logging.getLogger(__name__)
 
@@ -68,29 +72,15 @@ def _normalize_image_source(source) -> bytes | str:
 
 class BaseMultimodalProcessor(ABC):
     models: tuple[str, ...] = ()
-    auto_mm_io_worker_num = 4
     auto_mm_processor_worker_num = 1
     supports_mm_processor_concurrency = False
+    use_torchcodec_image_decode = False
 
     def __init__(self, hf_config, server_args, processor):
         self.hf_config = hf_config
         self.server_args = server_args
         self.processor = processor
         self._shutdown = False
-
-        requested_io_workers = getattr(server_args, "mm_io_worker_num", 0)
-        env_io_workers = os.environ.get("SGLANG_IO_WORKERS")
-        self.mm_io_worker_num = (
-            requested_io_workers
-            or (int(env_io_workers) if env_io_workers is not None else 0)
-            or self.auto_mm_io_worker_num
-        )
-        if self.mm_io_worker_num <= 0:
-            raise ValueError("Multimodal I/O worker count must be positive.")
-        self.io_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.mm_io_worker_num,
-            thread_name_prefix="sgl-jax-mm-io",
-        )
 
         self.mm_processor_worker_num = (
             getattr(server_args, "mm_processor_worker_num", 0) or self.auto_mm_processor_worker_num
@@ -156,7 +146,7 @@ class BaseMultimodalProcessor(ABC):
     def build_input_ids(
         self,
         prompt,
-        img_grid_thw=None,
+        image_grid_thw=None,
         video_grid_thw=None,
         audio_seq_lens=None,
     ):
@@ -165,7 +155,7 @@ class BaseMultimodalProcessor(ABC):
             prompt = self.processor.tokenizer(prompt)["input_ids"]
 
         grids = {
-            Modality.IMAGE: self._to_grid_list(img_grid_thw),
+            Modality.IMAGE: self._to_grid_list(image_grid_thw),
             Modality.VIDEO: self._to_grid_list(video_grid_thw),
         }
         audio_lengths = (
@@ -214,7 +204,7 @@ class BaseMultimodalProcessor(ABC):
         """Rebuild native multimodal inputs from encoder-disaggregated outputs."""
         input_ids, ranges, modalities = self.build_input_ids(
             prompt,
-            img_grid_thw=metadata.get("img_grid_thw", metadata.get("image_grid_thw")),
+            image_grid_thw=metadata.get("image_grid_thw"),
             video_grid_thw=metadata.get("video_grid_thw"),
             audio_seq_lens=metadata.get("audio_feature_lens"),
         )
@@ -286,7 +276,7 @@ class BaseMultimodalProcessor(ABC):
         return source
 
     @classmethod
-    def load_image(cls, source) -> Image.Image:
+    def load_image(cls, source) -> Image.Image | torch.Tensor:
         source = cls.unwrap_source(source)
         if isinstance(source, Image.Image):
             return source.convert("RGB")
@@ -294,19 +284,18 @@ class BaseMultimodalProcessor(ABC):
             return Image.fromarray(source).convert("RGB")
 
         payload = _normalize_image_source(source)
+        if cls.use_torchcodec_image_decode:
+            from torchcodec.decoders import decode_image
+
+            try:
+                image = decode_image(payload, mode="RGB")
+                if image.ndim == 3:
+                    return image
+            except (RuntimeError, ValueError):
+                logger.debug("Falling back to Pillow image decode", exc_info=True)
         if isinstance(payload, bytes):
             return Image.open(io.BytesIO(payload)).convert("RGB")
         return Image.open(payload).convert("RGB")
-
-    async def _run_io_async(self, function, *args):
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self.io_executor, function, *args)
-
-    async def load_image_async(self, source) -> Image.Image:
-        return await self._run_io_async(self.load_image, source)
-
-    async def load_images_async(self, image_sources: list) -> list[Image.Image]:
-        return await asyncio.gather(*(self.load_image_async(source) for source in image_sources))
 
     @staticmethod
     def _to_numpy(value):
@@ -333,9 +322,7 @@ class BaseMultimodalProcessor(ABC):
     ):
         """Run the Hugging Face processor synchronously.
 
-        This mirrors upstream SGLang's processor layering. Callers should use
-        ``process_and_combine_mm_data_async`` so this CPU work runs in the
-        isolated multimodal processor executor.
+        Call this from a multimodal processor worker, after loading its inputs.
         """
         processor_inputs = {
             "text": [input_text],
@@ -394,27 +381,8 @@ class BaseMultimodalProcessor(ABC):
             audios=audios,
         )
 
-    async def process_and_combine_mm_data_async(
-        self,
-        input_text: str,
-        images: list | None = None,
-        videos: list | None = None,
-        audios: list | None = None,
-        **processor_kwargs,
-    ) -> MultimodalInputs:
-        """Run HF processing and output collection outside the event loop."""
-        return await self.mm_processor_executor.run(
-            self.process_and_combine_mm_data,
-            input_text,
-            images,
-            videos,
-            audios,
-            **processor_kwargs,
-        )
-
     def shutdown(self) -> None:
         if self._shutdown:
             return
         self._shutdown = True
-        self.io_executor.shutdown(wait=False, cancel_futures=True)
         self.mm_processor_executor.shutdown()

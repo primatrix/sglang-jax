@@ -1,33 +1,70 @@
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+import pytest
+
+from sgl_jax.srt.disaggregation.encoder.scheduler_mixin import (
+    SchedulerDisaggregationEncoderMixin,
+)
 from sgl_jax.srt.managers.scheduler import Scheduler
 
 
-def test_language_logs_encoder_poll_time(caplog):
+@pytest.mark.parametrize("failed", [False, True])
+def test_language_admits_or_aborts_completed_request(failed):
+    request = SimpleNamespace(rid="request-0", encoder_timing={})
     pending = SimpleNamespace(
-        recv_req=SimpleNamespace(rid="request-0"),
-        started_at=0.0,
-        poll=lambda: None,
+        recv_req=request,
+        poll=Mock(side_effect=RuntimeError("receive failed") if failed else None),
+        close=Mock(),
     )
-    scheduler = SimpleNamespace(
-        server_args=SimpleNamespace(
-            encoder_request_timeout_seconds=0,
-            enable_request_time_stats_logging=True,
-        ),
-        encoder_waiting={"request-0": pending},
-    )
+    scheduler = SchedulerDisaggregationEncoderMixin()
+    scheduler.encoder_client = SimpleNamespace(drain_completed=lambda: [pending])
+    scheduler.encoder_waiting = {request.rid: pending}
+    scheduler.server_args = SimpleNamespace(encoder_request_timeout_seconds=0)
+    scheduler._abort_encoder_request = Mock()
 
-    caplog.set_level("INFO")
-    assert Scheduler.process_encoder_requests(scheduler, []) == []
+    ready = scheduler.process_encoder_requests([])
 
-    assert "ENCODER-POLL-TIME req_id=request-0" in caplog.text
-    assert "duration_ns=" in caplog.text
-    assert "status=pending" in caplog.text
+    assert ready == ([] if failed else [request])
+    assert scheduler.encoder_waiting == {}
+    pending.close.assert_called_once()
+    if failed:
+        scheduler._abort_encoder_request.assert_called_once_with(request, "receive failed")
+    else:
+        scheduler._abort_encoder_request.assert_not_called()
+        assert request.encoder_timing["language_scheduler_pickup_ns"] > 0
+
+
+def test_language_ignores_completion_for_cancelled_or_reused_id():
+    stale = SimpleNamespace(recv_req=SimpleNamespace(rid="request-0"), poll=Mock())
+    replacement = object()
+    scheduler = SchedulerDisaggregationEncoderMixin()
+    scheduler.encoder_client = SimpleNamespace(drain_completed=lambda: [stale])
+    scheduler.encoder_waiting = {"request-0": replacement}
+    scheduler.server_args = SimpleNamespace(encoder_request_timeout_seconds=0)
+
+    assert scheduler.process_encoder_requests([]) == []
+    assert scheduler.encoder_waiting == {"request-0": replacement}
+    stale.poll.assert_not_called()
+
+
+def test_language_times_out_request_without_completion():
+    request = SimpleNamespace(rid="request-0")
+    pending = SimpleNamespace(recv_req=request, started_at=0, close=Mock())
+    scheduler = SchedulerDisaggregationEncoderMixin()
+    scheduler.encoder_client = SimpleNamespace(drain_completed=lambda: [])
+    scheduler.encoder_waiting = {request.rid: pending}
+    scheduler.server_args = SimpleNamespace(encoder_request_timeout_seconds=1)
+    scheduler._abort_encoder_request = Mock()
+
+    assert scheduler.process_encoder_requests([]) == []
+    assert scheduler.encoder_waiting == {}
+    scheduler._abort_encoder_request.assert_called_once_with(request, "encoder timed out after 1s")
+    pending.close.assert_called_once()
 
 
 def test_language_drains_only_completed_background_receivers():
     client = SimpleNamespace(
-        background_progress=True,
         drain_completed=lambda: [],
     )
     scheduler = SimpleNamespace(
@@ -46,7 +83,6 @@ def test_language_admits_signaled_encoder_completions():
     calls = []
     scheduler = SimpleNamespace(
         encoder_client=SimpleNamespace(
-            background_progress=True,
             has_completed=lambda: True,
         ),
         process_input_requests=lambda requests: calls.append(requests),
@@ -61,7 +97,6 @@ def test_language_skips_completed_admission_without_signal():
     calls = []
     scheduler = SimpleNamespace(
         encoder_client=SimpleNamespace(
-            background_progress=True,
             has_completed=lambda: False,
         ),
         process_input_requests=lambda requests: calls.append(requests),
@@ -153,8 +188,8 @@ def test_language_logs_encoder_pipeline_timing(caplog):
     assert "preprocess_ms=1.000" in caplog.text
     assert "encode_wait_ms=0.200" in caplog.text
     assert "transfer_reserve_ms=0.300" in caplog.text
-    assert "encode_dispatch_ms=0.500" in caplog.text
-    assert "encode_compute_ms=2.000" in caplog.text
+    assert "encode_launch_gap_ms=0.500" in caplog.text
+    assert "encode_host_dispatch_ms=2.000" in caplog.text
     assert "encode_ms=5.000" in caplog.text
     assert "post_vit_to_copy_ms=0.100" in caplog.text
     assert "server_postprocess_ms=0.040" in caplog.text
@@ -165,14 +200,14 @@ def test_language_logs_encoder_pipeline_timing(caplog):
     assert "server_metadata_ms=0.012" in caplog.text
     assert "server_result_pack_ms=0.008" in caplog.text
     assert "server_postprocess_residual_ms=0.005" in caplog.text
-    assert "runtime_return_gap_ms=0.010" in caplog.text
+    assert "runtime_return_gap_ms=0.050" in caplog.text
     assert "runtime_postprocess_ms=0.040" in caplog.text
     assert "runtime_metadata_prepare_ms=0.010" in caplog.text
     assert "runtime_embedding_data_ms=0.015" in caplog.text
     assert "runtime_result_pack_ms=0.005" in caplog.text
     assert "runtime_postprocess_residual_ms=0.010" in caplog.text
     assert "runtime_timing_attach_ms=0.005" in caplog.text
-    assert "runtime_to_copy_gap_ms=0.010" in caplog.text
+    assert "runtime_to_copy_gap_ms=0.050" in caplog.text
     assert "publish_ms=8.000" in caplog.text
     assert "transfer_handoff_ms=1.000" in caplog.text
     assert "transfer_queue_ms=2.000" in caplog.text
@@ -200,7 +235,7 @@ def test_language_logs_encoder_pipeline_timing(caplog):
     assert "language_prepare_submit_ms=0.050" in caplog.text
     assert "language_prepare_queue_ms=0.050" in caplog.text
     assert "language_prepare_ms=1.100" in caplog.text
-    assert "language_pickup_wait_ms=0.200" in caplog.text
+    assert "language_prepare_wait_ms=0.200" in caplog.text
     assert "language_get_mm_data_ms=0.500" in caplog.text
     assert "language_radix_finalize_ms=0.500" in caplog.text
     assert "language_admission_wait_ms=0.100" in caplog.text

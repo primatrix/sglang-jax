@@ -84,7 +84,7 @@ class _NoMessageRouter:
     def __init__(self) -> None:
         self.unregistered = None
 
-    def poll(self, _req_ids):
+    def pop(self, _req_ids):
         return None
 
     def unregister(self, req_ids) -> None:
@@ -94,6 +94,8 @@ class _NoMessageRouter:
 def _poll_until_ready(session):
     deadline = time.monotonic() + 1
     while time.monotonic() < deadline:
+        if isinstance(session, PendingEncoderRequest) and session.progress():
+            session.prepare_result()
         result = session.poll()
         if result is not None:
             return result
@@ -106,8 +108,8 @@ async def _publish(transfer, transfer_id, embedding):
         transfer.reserve_batch_sync,
         [transfer_id],
     )
-    staged = transfer.stage_batch_sync(reservations, [embedding])
-    return await asyncio.to_thread(transfer.publish_sync, staged[0])
+    staged = transfer.stage_packed_batch_sync(reservations, embedding, (embedding.shape[0],))
+    return (await asyncio.to_thread(transfer.publish_batch_sync, staged))[0]
 
 
 def test_raiden_loader_recognizes_encoder_backend():
@@ -184,8 +186,8 @@ def test_raiden_server_writes_packed_batch_directly_into_pool(monkeypatch, caplo
     assert all(
         item["transfer_register_start_ns"] <= item["transfer_register_done_ns"] for item in metadata
     )
-    assert len(transfer._pool._packed_copies) == 1
-    assert next(iter(transfer._pool._packed_copies))[-1] is True
+    assert len(transfer._packed_executables) == 1
+    assert next(iter(transfer._packed_executables))[-1] is True
     assert caplog.text.count("event=start") == 1
     assert "group_size=3 inflight_groups=1 inflight_requests=3" in caplog.text
     transfer.close()
@@ -252,7 +254,7 @@ def test_raiden_server_rejects_embedding_that_does_not_match_single_pool(monkeyp
     transfer = RaidenEncoderServerTransfer("10.0.0.4")
     asyncio.run(_publish(transfer, "part-0:embedding", jnp.zeros((2, 3))))
 
-    with pytest.raises(ValueError, match="pool embedding mismatch"):
+    with pytest.raises(ValueError, match="pool packed output mismatch"):
         asyncio.run(_publish(transfer, "part-1:embedding", jnp.zeros((4, 3))))
 
     assert len(_FakeRaidenWrapper.instances) == 1
@@ -318,7 +320,7 @@ def test_raiden_reaps_only_when_reservation_needs_capacity(monkeypatch):
     transfer.close()
 
 
-def test_raiden_register_waits_for_copy_ticket(monkeypatch):
+def test_raiden_publish_waits_for_copy_after_registering(monkeypatch):
     class PendingReady:
         def __init__(self):
             self.done = threading.Event()
@@ -335,20 +337,21 @@ def test_raiden_register_waits_for_copy_ticket(monkeypatch):
         _FakeRaidenWrapper,
     )
     ready = PendingReady()
-    monkeypatch.setattr(RaidenSendPool, "copy_async", lambda *_args: ready)
+    monkeypatch.setattr(RaidenSendPool, "copy_packed_batch_async", lambda *args, **kwargs: [ready])
     transfer = RaidenEncoderServerTransfer("10.0.0.4", pool_size=1)
     reservations = transfer.reserve_batch_sync(["part-0:embedding"])
-    staged = transfer.stage_batch_sync(reservations, [jnp.zeros((2, 3))])
+    staged = transfer.stage_packed_batch_sync(reservations, jnp.zeros((2, 3)), (2,))
     published = threading.Event()
 
     def publish():
-        transfer.publish_sync(staged[0])
+        transfer.publish_batch_sync(staged)
         published.set()
 
     thread = threading.Thread(target=publish)
     thread.start()
     time.sleep(0.02)
-    assert not _FakeRaidenWrapper.instances[0].registrations
+    assert _FakeRaidenWrapper.instances[0].registrations
+    assert not published.is_set()
 
     ready.done.set()
     assert published.wait(1)
@@ -381,6 +384,7 @@ def test_raiden_request_receives_into_matching_jax_buffer(monkeypatch):
         registration_futures=(register_future,),
         accumulator=MultiModalEmbeddingData(1),
         backend=backend,
+        result_preparer=lambda request, result: None,
     )
     data = EmbeddingData(
         req_id="part-0",

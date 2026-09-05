@@ -14,7 +14,7 @@ from sgl_jax.srt.multimodal.common.modality_enum import Modality
 
 
 _MODALITY_GRID_KEYS = {
-    Modality.IMAGE: ("img_grid_thw", False),
+    Modality.IMAGE: ("image_grid_thw", False),
     Modality.VIDEO: ("video_grid_thw", False),
     Modality.AUDIO: ("audio_feature_lens", True),
 }

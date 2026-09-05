@@ -7,7 +7,7 @@ import logging
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import jax
@@ -71,28 +71,25 @@ class _Reservation:
 @dataclass(frozen=True, slots=True)
 class _StagedTransfer:
     reservation: _Reservation
-    ready: jax.Array
     pool_ready_ns: int
     copy_submit_ns: int
-    ready_group: _ReadyGroup | None = None
+    ready_group: _ReadyGroup
 
 
 @dataclass(slots=True)
 class _ReadyGroup:
+    """Copy completion cached by the single transfer worker."""
+
     tickets: tuple[jax.Array, ...]
-    _lock: threading.Lock = field(default_factory=threading.Lock)
     _copy_done_ns: int | None = None
 
     def wait(self) -> int:
-        if self._copy_done_ns is not None:
-            return self._copy_done_ns
-        with self._lock:
-            if self._copy_done_ns is None:
-                for ticket in self.tickets:
-                    if not ticket.is_ready():
-                        ticket.block_until_ready()
-                self._copy_done_ns = time.time_ns()
-            return self._copy_done_ns
+        if self._copy_done_ns is None:
+            for ticket in self.tickets:
+                if not ticket.is_ready():
+                    ticket.block_until_ready()
+            self._copy_done_ns = time.time_ns()
+        return self._copy_done_ns
 
 
 class RaidenEncoderServerTransfer:
@@ -127,11 +124,11 @@ class RaidenEncoderServerTransfer:
         self._group_members: dict[str, set[str]] = {}
         self._group_sizes: dict[str, int] = {}
         self._lock = threading.Lock()
-        self._compile_lock = threading.Lock()
         self._compile_pool = ThreadPoolExecutor(
             max_workers=4,
             thread_name_prefix="encoder-pool-write-compile",
         )
+        # Only the ViT worker accesses this cache; compile workers return via futures.
         self._packed_executables: dict[tuple[Any, ...], Future[Any]] = {}
         self._closed = False
 
@@ -159,18 +156,17 @@ class RaidenEncoderServerTransfer:
         if not token_counts or any(token_count != token_counts[0] for token_count in token_counts):
             raise ValueError("Raiden source pool requires one embedding shape")
         key = self._packed_key(packed, token_counts, contiguous)
-        with self._compile_lock:
-            future = self._packed_executables.get(key)
-            if future is None:
-                future = self._compile_pool.submit(
-                    compile_packed_pool_copy,
-                    packed,
-                    (token_counts[0], int(packed.shape[1])),
-                    capacity=self._pool_size,
-                    token_counts=token_counts,
-                    contiguous=contiguous,
-                )
-                self._packed_executables[key] = future
+        future = self._packed_executables.get(key)
+        if future is None:
+            future = self._compile_pool.submit(
+                compile_packed_pool_copy,
+                packed,
+                (token_counts[0], int(packed.shape[1])),
+                capacity=self._pool_size,
+                token_counts=token_counts,
+                contiguous=contiguous,
+            )
+            self._packed_executables[key] = future
         return future
 
     def precompile_packed_batches(
@@ -236,74 +232,6 @@ class RaidenEncoderServerTransfer:
                 raise TimeoutError("timed out waiting for Raiden encoder pool slots")
             time.sleep(min(remaining, self._poll_interval_s))
 
-    def stage_batch_sync(
-        self,
-        reservations: list[_Reservation],
-        embeddings: list[jax.Array],
-    ) -> list[_StagedTransfer]:
-        if len(reservations) != len(embeddings):
-            raise ValueError("Raiden reservation and embedding counts differ")
-        if not reservations:
-            return []
-        if any(embedding.ndim != 2 or embedding.shape[0] <= 0 for embedding in embeddings):
-            raise ValueError("Raiden embedding must be a non-empty matrix")
-
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("Raiden encoder transfer is closed")
-            for reservation in reservations:
-                if (
-                    reservation.transfer_id not in self._pending
-                    or self._slots.get(reservation.transfer_id) != reservation.slot
-                ):
-                    raise RuntimeError(
-                        f"Raiden reservation is no longer active: {reservation.transfer_id}"
-                    )
-            pool = self._pool
-
-        if pool is None:
-            pool = RaidenSendPool(
-                embeddings[0],
-                capacity=self._pool_size,
-            )
-            self._raiden.start(
-                [pool.buffer],
-                max_blocks=1,
-                num_slots=self._pool_size,
-                timeout_s=self._timeout_s,
-            )
-            with self._lock:
-                self._pool = pool
-
-        for embedding in embeddings:
-            if not pool.matches(embedding):
-                raise ValueError(
-                    "Raiden encoder pool embedding mismatch: "
-                    f"expected shape={pool.shape}, dtype={pool.dtype}, "
-                    f"sharding={pool.sharding}; got shape={tuple(embedding.shape)}, "
-                    f"dtype={embedding.dtype}, sharding={embedding.sharding}"
-                )
-        pool_ready_ns = time.time_ns()
-
-        staged = []
-        try:
-            for reservation, embedding in zip(reservations, embeddings):
-                ready = pool.copy_async(embedding, reservation.slot)
-                staged.append(
-                    _StagedTransfer(
-                        reservation,
-                        ready,
-                        pool_ready_ns,
-                        time.time_ns(),
-                    )
-                )
-        except BaseException:
-            if staged:
-                staged[-1].ready.block_until_ready()
-            self.cancel_batch(reservations)
-            raise
-        return staged
-
     def stage_packed_batch_sync(
         self,
         reservations: list[_Reservation],
@@ -338,7 +266,7 @@ class RaidenEncoderServerTransfer:
 
         shape = (token_counts[0], int(packed.shape[1]))
         if pool is None:
-            pool = RaidenSendPool.for_shape(
+            pool = RaidenSendPool(
                 shape,
                 packed.dtype,
                 packed.sharding,
@@ -384,52 +312,12 @@ class RaidenEncoderServerTransfer:
         return [
             _StagedTransfer(
                 reservation,
-                item_ready,
                 pool_ready_ns,
                 copy_submit_ns,
                 ready_group,
             )
-            for reservation, item_ready in zip(reservations, ready)
+            for reservation in reservations
         ]
-
-    def publish_sync(self, staged_transfer: Any) -> dict[str, Any]:
-        reservation = staged_transfer.reservation
-        transfer_id = reservation.transfer_id
-        slot = reservation.slot
-        ready_group = getattr(staged_transfer, "ready_group", None)
-        if ready_group is not None:
-            copy_done_ns = ready_group.wait()
-        else:
-            if not staged_transfer.ready.is_ready():
-                staged_transfer.ready.block_until_ready()
-            copy_done_ns = time.time_ns()
-        register_start_ns = time.time_ns()
-        try:
-            with self._lock:
-                if transfer_id not in self._pending or self._slots.get(transfer_id) != slot:
-                    raise RuntimeError(f"Raiden reservation was cancelled: {transfer_id}")
-                self._pending.remove(transfer_id)
-                self._active.add(transfer_id)
-            transfer_uuid = _uuid_to_int(transfer_id)
-            if not self._raiden.register_read(transfer_id, transfer_uuid, [slot]):
-                raise RuntimeError(f"Raiden rejected encoder transfer {transfer_id!r}")
-            register_done_ns = time.time_ns()
-        except BaseException:
-            with self._lock:
-                self._release_locked(transfer_id)
-            raise
-
-        metadata = self._transfer_metadata(
-            staged_transfer,
-            transfer_uuid,
-            copy_done_ns=copy_done_ns,
-            register_start_ns=register_start_ns,
-            register_done_ns=register_done_ns,
-        )
-        with self._lock:
-            self._track_group_locked([transfer_id])
-        self._log_inflight_event("start", transfer_id)
-        return metadata
 
     def publish_batch_sync(
         self,
@@ -457,7 +345,6 @@ class RaidenEncoderServerTransfer:
                     (staged_transfer, transfer_uuid, register_start_ns, time.time_ns())
                 )
 
-            copy_done_by_group: dict[int, int] = {}
             metadata = []
             for (
                 staged_transfer,
@@ -465,17 +352,7 @@ class RaidenEncoderServerTransfer:
                 register_start_ns,
                 register_done_ns,
             ) in registrations:
-                ready_group = staged_transfer.ready_group
-                if ready_group is None:
-                    if not staged_transfer.ready.is_ready():
-                        staged_transfer.ready.block_until_ready()
-                    copy_done_ns = time.time_ns()
-                else:
-                    group_key = id(ready_group)
-                    copy_done_ns = copy_done_by_group.get(group_key, 0)
-                    if not copy_done_ns:
-                        copy_done_ns = ready_group.wait()
-                        copy_done_by_group[group_key] = copy_done_ns
+                copy_done_ns = staged_transfer.ready_group.wait()
                 metadata.append(
                     self._transfer_metadata(
                         staged_transfer,

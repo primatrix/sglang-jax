@@ -3,12 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -49,22 +46,6 @@ from sgl_jax.srt.server_args import ServerArgs, apply_multimodal_model_defaults
 from sgl_jax.srt.utils import configure_logger, set_uvicorn_logging_configs
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
-
-@partial(jax.jit, static_argnames=("token_counts",))
-def _split_packed_encoder_output(
-    packed: jax.Array,
-    *,
-    token_counts: tuple[int, ...],
-) -> tuple[jax.Array, ...]:
-    """Split one packed encoder output with one JAX dispatch per batch."""
-    offset = 0
-    embeddings = []
-    for token_count in token_counts:
-        embeddings.append(jax.lax.dynamic_slice_in_dim(packed, offset, token_count, axis=0))
-        offset += token_count
-    return tuple(embeddings)
-
-
 # Adapted for JAX from SGLang's encoder server:
 # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/disaggregation/encoder/server.py
 
@@ -87,8 +68,6 @@ class PreparedEncoderBatch:
     inputs: list[MultimodalInputs]
     request_timings: list[dict[str, int]]
     token_counts: tuple[int, ...]
-    split_capacity: int | None
-    split_executable: Future[Any] | None
     transfer_specs: tuple[tuple[jax.ShapeDtypeStruct, tuple[int, ...]], ...]
     done_ns: int
 
@@ -125,9 +104,7 @@ class MMEncoder:
         self._sim_encoder_ms_per_token = server_args.simulate_compute_encoder_ms_per_token
         self._log_timing = server_args.enable_request_time_stats_logging
         self._max_batch_size = max(1, int(server_args.encoder_max_batch_size))
-        self._split_compile_lock = threading.Lock()
-        self._split_executables: dict[tuple[int, tuple[int, ...]], Future[Any]] = {}
-        self._split_compile_pool: ThreadPoolExecutor | None = None
+        self._precompile = not server_args.disable_precompile
 
         config = self.model_config.hf_config
         config.vision_encoder_parallel = server_args.vision_encoder_parallel
@@ -156,10 +133,6 @@ class MMEncoder:
             if not server_args.disable_precompile:
                 logger.info("Precompiling multimodal encoder")
                 self.model.precompile_multimodal()
-                self._split_compile_pool = ThreadPoolExecutor(
-                    max_workers=min(4, self._max_batch_size),
-                    thread_name_prefix="encoder-split-compile",
-                )
 
         tokenizer_path = server_args.tokenizer_path
         tokenizer_subdir = resolve_tokenizer_subdir(server_args.model_path, tokenizer_path)
@@ -208,55 +181,41 @@ class MMEncoder:
         processed = [request.inputs for request in requests]
         timings = [request.request_timing for request in requests]
         token_counts = tuple(request.token_count for request in requests)
-        split_capacity, split_executable = self._precompile_splits(processed, token_counts)
-        transfer_specs = self._packed_transfer_specs(
-            processed,
-            token_counts,
-            split_capacity,
-        )
+        transfer_specs = self._packed_transfer_specs(processed, token_counts)
         return PreparedEncoderBatch(
             modality,
             processed,
             timings,
             token_counts,
-            split_capacity,
-            split_executable,
             transfer_specs,
             max(request.done_ns for request in requests),
         )
 
     @property
     def preprocess_concurrency(self) -> int:
-        """Keep the independent I/O and processor pools simultaneously busy."""
-        return min(
-            self._max_batch_size,
-            self.mm_processor.mm_io_worker_num + self.mm_processor.mm_processor_worker_num,
-        )
+        """Keep the processor workers busy with complete preprocessing requests."""
+        return min(self._max_batch_size, self.mm_processor.mm_processor_worker_num)
 
-    def _forward_packed(
+    def encode_packed(
         self,
         batch: PreparedEncoderBatch,
-    ) -> tuple[jax.Array, dict[str, int]]:
+    ) -> PackedEncoderOutput:
         modality = batch.modality
         processed = batch.inputs
         encode_start_ns = time.time_ns()
-        simulate = getattr(self, "_simulate_compute", False)
-        if simulate:
-            token_count_total = sum(
-                end - start
-                for mm_inputs in processed
-                for item in mm_inputs.mm_items
-                for start, end in item.placeholder_ranges or ()
-            )
+        if self._simulate_compute:
+            token_count_total = sum(batch.token_counts)
             with jax.profiler.TraceAnnotation(f"mm_encode:{modality.name}:{len(processed)}"):
                 sleep_ms = (
                     self._sim_encoder_base_ms + self._sim_encoder_ms_per_token * token_count_total
                 )
                 if sleep_ms > 0:
                     time.sleep(sleep_ms / 1000.0)
-            packed = np.zeros(
-                (token_count_total, self.model_config.hidden_size),
-                dtype=self.model_config.dtype,
+            packed = jax.device_put(
+                np.zeros(
+                    (token_count_total, self.model_config.hidden_size),
+                    dtype=self.model_config.dtype,
+                )
             )
         else:
             with jax.profiler.TraceAnnotation(f"mm_encode:{modality.name}:{len(processed)}"):
@@ -274,10 +233,6 @@ class MMEncoder:
         }
         if sum(batch.token_counts) > packed.shape[0]:
             raise ValueError(f"incomplete {modality.name} encoder output")
-        return packed, encoder_timing
-
-    def encode_packed(self, batch: PreparedEncoderBatch) -> PackedEncoderOutput:
-        packed, encoder_timing = self._forward_packed(batch)
         return PackedEncoderOutput(batch, packed, encoder_timing)
 
     def metadata_for_packed(
@@ -324,98 +279,11 @@ class MMEncoder:
             metadata["_encoder_timing"].update(postprocess_timing)
         return results
 
-    def encode(self, batch: PreparedEncoderBatch) -> list[tuple[jax.Array, dict[str, Any]]]:
-        packed, encoder_timing = self._forward_packed(batch)
-        modality = batch.modality
-        processed = batch.inputs
-        simulate = getattr(self, "_simulate_compute", False)
-        postprocess_start_ns = time.perf_counter_ns()
-
-        results = []
-        token_count_duration_ns = 0
-        embedding_slice_duration_ns = 0
-        split_compile_wait_duration_ns = 0
-        split_dispatch_duration_ns = 0
-        metadata_duration_ns = 0
-        result_pack_duration_ns = 0
-
-        phase_start_ns = time.perf_counter_ns()
-        token_counts = batch.token_counts
-        token_count_duration_ns += time.perf_counter_ns() - phase_start_ns
-
-        phase_start_ns = time.perf_counter_ns()
-        if simulate:
-            offset = 0
-            embeddings = []
-            split_dispatch_start_ns = time.perf_counter_ns()
-            for token_count in token_counts:
-                embeddings.append(jax.device_put(packed[offset : offset + token_count]))
-                offset += token_count
-            split_dispatch_duration_ns = time.perf_counter_ns() - split_dispatch_start_ns
-        elif batch.split_executable is not None and batch.split_capacity == packed.shape[0]:
-            split_wait_start_ns = time.perf_counter_ns()
-            executable = batch.split_executable.result()
-            split_compile_wait_duration_ns = time.perf_counter_ns() - split_wait_start_ns
-            split_dispatch_start_ns = time.perf_counter_ns()
-            embeddings = executable(packed)
-            split_dispatch_duration_ns = time.perf_counter_ns() - split_dispatch_start_ns
-        else:
-            split_dispatch_start_ns = time.perf_counter_ns()
-            embeddings = _split_packed_encoder_output(packed, token_counts=token_counts)
-            split_dispatch_duration_ns = time.perf_counter_ns() - split_dispatch_start_ns
-        if any(
-            embedding.shape[0] != token_count
-            for embedding, token_count in zip(embeddings, token_counts)
-        ):
-            raise ValueError(f"incomplete {modality.name} encoder output")
-        embedding_slice_duration_ns += time.perf_counter_ns() - phase_start_ns
-
-        for embedding, mm_inputs, request_timing in zip(
-            embeddings,
-            processed,
-            batch.request_timings,
-        ):
-            phase_start_ns = time.perf_counter_ns()
-            metadata = self._metadata(mm_inputs, modality)
-            metadata_duration_ns += time.perf_counter_ns() - phase_start_ns
-
-            phase_start_ns = time.perf_counter_ns()
-            metadata["_encoder_timing"] = {**encoder_timing, **request_timing}
-            results.append((embedding, metadata))
-            result_pack_duration_ns += time.perf_counter_ns() - phase_start_ns
-
-        postprocess_done_ns = time.time_ns()
-        postprocess_duration_ns = time.perf_counter_ns() - postprocess_start_ns
-        postprocess_residual_ns = max(
-            0,
-            postprocess_duration_ns
-            - token_count_duration_ns
-            - embedding_slice_duration_ns
-            - metadata_duration_ns
-            - result_pack_duration_ns,
-        )
-        postprocess_timing = {
-            "encode_server_postprocess_done_ns": postprocess_done_ns,
-            "encode_server_postprocess_duration_ns": postprocess_duration_ns,
-            "encode_token_count_duration_ns": token_count_duration_ns,
-            "encode_embedding_slice_duration_ns": embedding_slice_duration_ns,
-            "encode_split_compile_wait_duration_ns": split_compile_wait_duration_ns,
-            "encode_split_dispatch_duration_ns": split_dispatch_duration_ns,
-            "encode_metadata_duration_ns": metadata_duration_ns,
-            "encode_result_pack_duration_ns": result_pack_duration_ns,
-            "encode_server_postprocess_residual_ns": postprocess_residual_ns,
-        }
-        for _, metadata in results:
-            metadata["_encoder_timing"].update(postprocess_timing)
-        # JAX keeps bucket padding in the encoder output to preserve static shapes.
-        # Transfer only the placeholder-backed prefix, as upstream SGLang does.
-        return results
-
     async def _process_request(
         self, request: dict[str, Any], modality: Modality
     ) -> tuple[MultimodalInputs, dict[str, int]]:
         timing = {}
-        if getattr(self, "_log_timing", False) and request.get("collect_request_time_stats", False):
+        if self._log_timing and request.get("collect_request_time_stats", False):
             timing["preprocess_request_start_ns"] = time.time_ns()
         mm_items = request.get("mm_items") or []
         if not mm_items:
@@ -454,56 +322,22 @@ class MMEncoder:
             for mm_inputs in processed
         )
 
-    def _precompile_splits(
-        self,
-        processed: list[MultimodalInputs],
-        token_counts: tuple[int, ...],
-    ) -> tuple[int | None, Future[Any] | None]:
-        pool = getattr(self, "_split_compile_pool", None)
-        if pool is None:
-            return None, None
-        target = self.model.thinker if hasattr(self.model, "thinker") else self.model
-        planner = getattr(target, "get_multimodal_embedding_packed_capacity", None)
-        if planner is None:
-            return None, None
-
-        items = [item for mm_inputs in processed for item in mm_inputs.mm_items]
-        capacity = planner(items)
-        if capacity is None:
-            return None, None
-        current = self._split_executable(int(capacity), token_counts)
-
-        # A serving stream is usually homogeneous. Once its first concrete item
-        # shape is known, compile every batch-size tail before it can appear.
-        signatures = [
-            tuple((item.modality, tuple(item.feature.shape)) for item in mm_inputs.mm_items)
-            for mm_inputs in processed
-        ]
-        if signatures and all(signature == signatures[0] for signature in signatures):
-            sample_items = processed[0].mm_items
-            sample_count = token_counts[0]
-            for batch_size in range(1, self._max_batch_size + 1):
-                batch_capacity = planner(sample_items * batch_size)
-                if batch_capacity is not None:
-                    self._split_executable(
-                        int(batch_capacity),
-                        (sample_count,) * batch_size,
-                    )
-        return int(capacity), current
-
     def _packed_transfer_specs(
         self,
         processed: list[MultimodalInputs],
         token_counts: tuple[int, ...],
-        capacity: int | None,
     ) -> tuple[tuple[jax.ShapeDtypeStruct, tuple[int, ...]], ...]:
-        if capacity is None or getattr(self, "_simulate_compute", False):
+        if not self._precompile or self._simulate_compute:
             return ()
         target = self.model.thinker if hasattr(self.model, "thinker") else self.model
         planner = getattr(target, "get_multimodal_embedding_packed_capacity", None)
         if planner is None:
             return ()
 
+        items = [item for mm_inputs in processed for item in mm_inputs.mm_items]
+        capacity = planner(items)
+        if capacity is None:
+            return ()
         variants = {(int(capacity), token_counts)}
         signatures = [
             tuple((item.modality, tuple(item.feature.shape)) for item in mm_inputs.mm_items)
@@ -538,53 +372,6 @@ class MMEncoder:
             for packed_capacity, counts in sorted(variants, key=lambda value: len(value[1]))
         )
 
-    def _split_executable(
-        self,
-        capacity: int,
-        token_counts: tuple[int, ...],
-    ) -> Future[Any]:
-        key = (capacity, token_counts)
-        with self._split_compile_lock:
-            future = self._split_executables.get(key)
-            if future is None:
-                pool = self._split_compile_pool
-                assert pool is not None
-                future = pool.submit(
-                    self._compile_split,
-                    capacity,
-                    token_counts,
-                )
-                self._split_executables[key] = future
-            return future
-
-    def _compile_split(
-        self,
-        capacity: int,
-        token_counts: tuple[int, ...],
-    ) -> Any:
-        start_ns = time.perf_counter_ns()
-        target = self.model.thinker if hasattr(self.model, "thinker") else self.model
-        sharding = jax.sharding.NamedSharding(
-            target.mesh,
-            jax.sharding.PartitionSpec(),
-        )
-        packed = jax.ShapeDtypeStruct(
-            (capacity, self.model_config.hidden_size),
-            self.model_config.dtype,
-            sharding=sharding,
-        )
-        executable = _split_packed_encoder_output.lower(
-            packed,
-            token_counts=token_counts,
-        ).compile()
-        logger.info(
-            "ENCODER-SPLIT-PRECOMPILE capacity=%d batch_size=%d duration_ms=%.3f",
-            capacity,
-            len(token_counts),
-            (time.perf_counter_ns() - start_ns) / 1_000_000,
-        )
-        return executable
-
     def _placeholder(self, modality: Modality) -> str:
         config = self.mm_processor.hf_config
         token_id = getattr(config, self._TOKEN_ID_KEYS.get(modality, ""), None)
@@ -613,9 +400,6 @@ class MMEncoder:
         return metadata
 
     def shutdown(self) -> None:
-        split_compile_pool = getattr(self, "_split_compile_pool", None)
-        if split_compile_pool is not None:
-            split_compile_pool.shutdown(cancel_futures=True)
         self.mm_processor.shutdown()
 
 
@@ -657,7 +441,6 @@ class EncoderServer:
         self._receiver_addresses: dict[str, str] = {}
         self._receiver_events: dict[str, asyncio.Event] = {}
         self._receiver_sockets: dict[str, zmq.asyncio.Socket] = {}
-        self._notify_lock = asyncio.Lock()
 
         @asynccontextmanager
         async def lifespan(_: FastAPI):
@@ -820,14 +603,15 @@ class EncoderServer:
             else:
                 await asyncio.wait_for(event.wait(), self._receiver_timeout)
             address = self._receiver_addresses[req_id]
-            async with self._notify_lock:
-                socket = self._receiver_sockets.get(address)
-                if socket is None:
-                    socket = self._zmq.socket(PUSH)
-                    socket.setsockopt(LINGER, 1000)
-                    socket.connect(f"tcp://{address}")
-                    self._receiver_sockets[address] = socket
-                await socket.send_pyobj(data)
+            # Socket creation stays on this event loop without yielding. PyZMQ
+            # queues complete messages, so backpressure stays local to each socket.
+            socket = self._receiver_sockets.get(address)
+            if socket is None:
+                socket = self._zmq.socket(PUSH)
+                socket.setsockopt(LINGER, 1000)
+                socket.connect(f"tcp://{address}")
+                self._receiver_sockets[address] = socket
+            await socket.send_pyobj(data)
         finally:
             self._receiver_events.pop(req_id, None)
             self._receiver_addresses.pop(req_id, None)
@@ -878,7 +662,7 @@ def launch(server_args: ServerArgs) -> None:
     configure_logger(server_args)
     set_uvicorn_logging_configs()
     encoder = MMEncoder(server_args)
-    legacy_timing_logs = (
+    log_timing = (
         server_args.enable_request_time_stats_logging
         and not server_args.defer_request_time_stats_logging
     )
@@ -893,7 +677,7 @@ def launch(server_args: ServerArgs) -> None:
                 timeout_s=server_args.encoder_request_timeout_seconds,
                 ms_per_mb=server_args.simulate_transfer_ms_per_mb,
                 rtt_ms=server_args.simulate_network_rtt_ms,
-                log_inflight=legacy_timing_logs,
+                log_inflight=log_timing,
             )
         else:
             host_ip = resolve_host_ip(server_args.disaggregation_host_ip)
@@ -902,7 +686,7 @@ def launch(server_args: ServerArgs) -> None:
                 parallelism=server_args.disaggregation_channel_number,
                 pool_size=server_args.encoder_transfer_pool_size,
                 timeout_s=server_args.encoder_request_timeout_seconds,
-                log_inflight=legacy_timing_logs,
+                log_inflight=log_timing,
             )
         advertise_host = f"[{host_ip}]" if ":" in host_ip else host_ip
         advertise_url = (
@@ -925,7 +709,7 @@ def launch(server_args: ServerArgs) -> None:
             network_rtt_ms=(
                 server_args.simulate_network_rtt_ms if server_args.simulate_compute else 0.0
             ),
-            log_queue_timing=legacy_timing_logs,
+            log_queue_timing=log_timing,
         )
         server.run(server_args.host, server_args.port)
     finally:

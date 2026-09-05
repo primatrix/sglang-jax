@@ -18,7 +18,7 @@
 #   NUM_ENCODERS TP_SIZE DP_SIZE N_REQUESTS CONCURRENCY MAX_TOKENS PROFILER_DIR PY_TRACER
 #   SIM_MAX_TOTAL_TOKENS SIM_CHUNKED_PREFILL_SIZE
 #   ENCODER_MAX_BATCH_SIZE ENCODER_MAX_INFLIGHT_BATCHES ENCODER_TRANSFER_POOL_SIZE
-#   DISAGGREGATION_CHANNEL_NUMBER MM_PROCESSOR_WORKERS MM_IO_WORKERS
+#   DISAGGREGATION_CHANNEL_NUMBER MM_PROCESSOR_WORKERS
 #   PREWARM_REQUESTS PREWARM_CONCURRENCY RANDOM_INPUT_LEN IMAGES_PER_REQ IMAGE_SIZE
 #
 set -euo pipefail
@@ -51,7 +51,6 @@ ENCODER_MAX_INFLIGHT_BATCHES=${ENCODER_MAX_INFLIGHT_BATCHES:-2}
 ENCODER_TRANSFER_POOL_SIZE=${ENCODER_TRANSFER_POOL_SIZE:-32}
 DISAGGREGATION_CHANNEL_NUMBER=${DISAGGREGATION_CHANNEL_NUMBER:-4}
 MM_PROCESSOR_WORKERS=${MM_PROCESSOR_WORKERS:-2}
-MM_IO_WORKERS=${MM_IO_WORKERS:-4}
 IMAGES_PER_REQ=${IMAGES_PER_REQ:-1}
 IMAGE_SIZE=${IMAGE_SIZE:-512}         # generated benchmark image, in square pixels
 PY_TRACER=${PY_TRACER:-0}   # 0 = clean stage view (good for flame graph + timeline)
@@ -152,7 +151,6 @@ for ((i = 0; i < NUM_ENCODERS; i++)); do
     --encoder-max-batch-size "${ENCODER_MAX_BATCH_SIZE}" \
     --encoder-max-inflight-batches "${ENCODER_MAX_INFLIGHT_BATCHES}" \
     --vision-encoder-parallel dp \
-    --mm-io-worker-num "${MM_IO_WORKERS}" \
     --mm-processor-worker-num "${MM_PROCESSOR_WORKERS}" \
     --host 127.0.0.1 --port "${port}" \
     > "${PROFILER_DIR}/encoder_${i}.log" 2>&1 &
@@ -171,7 +169,6 @@ echo ">> starting language server on :${LANG_PORT}"
   --max-running-requests "${MAX_RUNNING}" --mem-fraction-static 0.1 \
   --dp-schedule-policy min_running_queue \
   --vision-encoder-parallel dp \
-  --mm-io-worker-num "${MM_IO_WORKERS}" \
   --mm-processor-worker-num "${MM_PROCESSOR_WORKERS}" \
   --host 127.0.0.1 --port "${LANG_PORT}" > "${PROFILER_DIR}/language.log" 2>&1 &
 PIDS+=($!)

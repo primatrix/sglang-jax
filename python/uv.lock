@@ -2322,6 +2322,7 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "uvicorn" },
     { name = "uvloop" },
+    { name = "xxhash" },
 ]
 
 [package.optional-dependencies]
@@ -2348,6 +2349,8 @@ multimodal = [
     { name = "torch", version = "2.14.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
     { name = "torchaudio", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
     { name = "torchaudio", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
+    { name = "torchcodec", version = "0.16.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
+    { name = "torchcodec", version = "0.16.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
     { name = "torchvision", version = "0.29.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
     { name = "torchvision", version = "0.29.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
 ]
@@ -2401,11 +2404,13 @@ requires-dist = [
     { name = "tiktoken", specifier = ">=0.10.0" },
     { name = "torch", marker = "extra == 'multimodal'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchaudio", marker = "extra == 'multimodal'", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torchcodec", marker = "extra == 'multimodal'", specifier = ">=0.16.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchvision", marker = "extra == 'multimodal'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "transformers", specifier = "~=4.57.1" },
     { name = "typing-extensions", specifier = "~=4.14.1" },
     { name = "uvicorn", specifier = "~=0.35.0" },
     { name = "uvloop", specifier = "~=0.21.0" },
+    { name = "xxhash", specifier = ">=3.0.0" },
 ]
 provides-extras = ["dev", "fastokens", "tpu", "gpu", "cpu", "all", "multimodal"]
 
@@ -2738,6 +2743,40 @@ wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torchaudio-2.11.0%2Bcpu-cp313-cp313t-manylinux_2_28_aarch64.whl", hash = "sha256:5d665234def325e22c15518c581b0107a651c9f843176e3192360b092ebcb656", upload-time = "2026-03-23T15:50:10Z" },
     { url = "https://download-r2.pytorch.org/whl/cpu/torchaudio-2.11.0%2Bcpu-cp313-cp313t-manylinux_2_28_x86_64.whl", hash = "sha256:a3df9c41706a22de0f43fe2734f54db31cb5a7314cc92ecc84657a8492b3ff8d", upload-time = "2026-03-23T15:50:10Z" },
     { url = "https://download-r2.pytorch.org/whl/cpu/torchaudio-2.11.0%2Bcpu-cp313-cp313t-win_amd64.whl", hash = "sha256:18818a326b779abc7bfd5cfb9fe88501916dde144cb1944fc9e7b4fb6208dfc7", upload-time = "2026-03-23T15:50:10Z" },
+]
+
+[[package]]
+name = "torchcodec"
+version = "0.16.0"
+source = { registry = "https://download.pytorch.org/whl/cpu" }
+resolution-markers = [
+    "python_full_version >= '3.13' and sys_platform == 'darwin'",
+    "python_full_version < '3.13' and sys_platform == 'darwin'",
+]
+wheels = [
+    { url = "https://download.pytorch.org/whl/cpu/torchcodec-0.16.0-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:9a899bf100cc40a0401fafc14f47c79979311d1df3fbe418c5d1019cde69d607", upload-time = "2026-08-13T11:55:29Z" },
+    { url = "https://download.pytorch.org/whl/cpu/torchcodec-0.16.0-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:154c5cf6c2dd2801700dcf0939081f614c50dcbf99f5ecc7f6854e98b7959339", upload-time = "2026-08-13T11:55:29Z" },
+]
+
+[[package]]
+name = "torchcodec"
+version = "0.16.0+cpu"
+source = { registry = "https://download.pytorch.org/whl/cpu" }
+resolution-markers = [
+    "python_full_version >= '3.13' and sys_platform == 'win32'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version < '3.13' and sys_platform == 'win32'",
+    "python_full_version < '3.13' and sys_platform == 'emscripten'",
+    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+]
+wheels = [
+    { url = "https://download.pytorch.org/whl/cpu/torchcodec-0.16.0%2Bcpu-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:2db163ad01533b6531c606a83d002e6716e2984ac775a1fc07300e59ebcda469", upload-time = "2026-08-13T11:55:29Z" },
+    { url = "https://download.pytorch.org/whl/cpu/torchcodec-0.16.0%2Bcpu-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b1014ea437a95d8565b13a56d604d5297b38edf4b6b72c279126a890b3a21efc", upload-time = "2026-08-13T11:55:29Z" },
+    { url = "https://download.pytorch.org/whl/cpu/torchcodec-0.16.0%2Bcpu-cp312-cp312-win_amd64.whl", hash = "sha256:90c304849769301c964fb9e22994dc7e5749f28a5a09c7dc4a5a7467500adab7", upload-time = "2026-08-13T11:55:29Z" },
+    { url = "https://download.pytorch.org/whl/cpu/torchcodec-0.16.0%2Bcpu-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:7a5c8b0047d76aa68c54877085df289ca8eafc32145f914731dde85e122952e7", upload-time = "2026-08-13T11:55:29Z" },
+    { url = "https://download.pytorch.org/whl/cpu/torchcodec-0.16.0%2Bcpu-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5c8631a707f8bf0e68d7bc9f6b03b5cc43173091bc7fe0e0605db95be506ef15", upload-time = "2026-08-13T11:55:29Z" },
+    { url = "https://download.pytorch.org/whl/cpu/torchcodec-0.16.0%2Bcpu-cp313-cp313-win_amd64.whl", hash = "sha256:35887a78ff6eb4f17881cf17e63546c3310042ad8e4c4fd26d89624d15f0704d", upload-time = "2026-08-13T11:55:29Z" },
 ]
 
 [[package]]

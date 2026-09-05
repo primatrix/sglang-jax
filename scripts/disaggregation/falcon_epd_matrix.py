@@ -35,7 +35,6 @@ class Variant:
     pool_size: int = 256
     encoder_batch_size: int = 16
     inflight_batches: int = 1
-    io_workers: int = 4
     processor_workers: int = 4
     channels: int = 4
     max_prefill_tokens: int = 8192
@@ -54,8 +53,6 @@ def _variants() -> list[Variant]:
         replace(base, name="batch-32", encoder_batch_size=32),
         replace(base, name="inflight-2", inflight_batches=2),
         replace(base, name="inflight-4", inflight_batches=4),
-        replace(base, name="io-workers-2", io_workers=2),
-        replace(base, name="io-workers-8", io_workers=8),
         replace(base, name="processor-workers-2", processor_workers=2),
         replace(base, name="processor-workers-8", processor_workers=8),
         replace(base, name="channels-2", channels=2),
@@ -83,7 +80,6 @@ def _variants() -> list[Variant]:
             pool_size=128,
             encoder_batch_size=32,
             inflight_batches=2,
-            io_workers=8,
             processor_workers=8,
             channels=8,
             max_prefill_tokens=16384,
@@ -169,8 +165,6 @@ def _common_server_args(args: argparse.Namespace, variant: Variant) -> list[str]
         "bfloat16",
         "--vision-encoder-parallel",
         "dp",
-        "--mm-io-worker-num",
-        str(variant.io_workers),
         "--mm-processor-worker-num",
         str(variant.processor_workers),
         "--encoder-transfer-backend",
@@ -254,7 +248,6 @@ def _start_servers(
             "--disable-radix-cache",
             "--dp-schedule-policy",
             "min_running_queue",
-            "--encoder-receiver-background-progress",
             "--host",
             "0.0.0.0",
             "--port",

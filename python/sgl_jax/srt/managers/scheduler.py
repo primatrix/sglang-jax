@@ -1383,7 +1383,7 @@ class Scheduler(
 
     def _admit_completed_encoder_requests(self) -> None:
         client = self.encoder_client
-        if client is not None and client.background_progress and client.has_completed():
+        if client is not None and client.has_completed():
             self.process_input_requests([])
 
     def handle_generate_request(

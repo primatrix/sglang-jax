@@ -214,10 +214,10 @@ role_to_task_spec:
               from sgl_jax.srt.disaggregation.encoder.raiden_transfer import RaidenEncoderServerTransfer
               from sgl_jax.srt.disaggregation.encoder.server import EncoderServer, MMEncoder
               for cls, method, name in (
-                  (MMEncoder, "preprocess", "encoder_preprocess"),
-                  (MMEncoder, "encode", "encoder_encode_batch"),
-                  (RaidenEncoderServerTransfer, "stage_batch_sync", "encoder_transfer_stage"),
-                  (RaidenEncoderServerTransfer, "publish_sync", "encoder_transfer_publish"),
+                  (MMEncoder, "preprocess_request", "encoder_preprocess"),
+                  (MMEncoder, "encode_packed", "encoder_encode_batch"),
+                  (RaidenEncoderServerTransfer, "stage_packed_batch_sync", "encoder_transfer_stage"),
+                  (RaidenEncoderServerTransfer, "publish_batch_sync", "encoder_transfer_publish"),
                   (EncoderServer, "send_to_scheduler", "encoder_send_to_language"),
               ):
                   add_host_annotation(cls, method, name)
@@ -358,7 +358,7 @@ role_to_task_spec:
         --model-path "$MODEL_PATH" --trust-remote-code --skip-server-warmup \
         --device tpu --tp-size 4 --dp-size 2 --dtype bfloat16 \
         --vision-encoder-parallel dp \
-        --mm-io-worker-num 4 --mm-processor-worker-num 4 \
+        --mm-processor-worker-num 4 \
         --encoder-max-batch-size 16 --encoder-max-inflight-batches 1 \
         --encoder-batch-coalesce-ms 0 --random-seed 0 \
         --download-dir /tmp/tpu_logs/huggingface/hub \
@@ -381,11 +381,10 @@ role_to_task_spec:
         --mem-fraction-static 0.9 --page-size 128 --disable-radix-cache \
         --dp-schedule-policy min_running_queue \
         --vision-encoder-parallel dp \
-        --mm-io-worker-num 4 --mm-processor-worker-num 4 --random-seed 0 \
+        --mm-processor-worker-num 4 --random-seed 0 \
         --download-dir /tmp/tpu_logs/huggingface/hub \
         --language-only --encoder-urls "http://127.0.0.1:$ENCODER_PORT" \
         --encoder-transfer-backend raiden --encoder-transfer-pool-size 256 \
-        --encoder-receiver-background-progress \
         --encoder-control-timeout-seconds 300 --encoder-request-timeout-seconds 900 \
         --disaggregation-channel-number 4 --disaggregation-host-ip "$HOST_IP" \
         --host 0.0.0.0 --port "$LANGUAGE_PORT"

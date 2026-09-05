@@ -70,6 +70,7 @@ all = [
 ]
 multimodal = [
     "torch",
+    "torchcodec>=0.16.0",
     "torchvision",
     "torchaudio",
     "decord",
@@ -197,5 +198,6 @@ explicit = true
 
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
+torchcodec = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }
