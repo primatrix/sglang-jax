@@ -126,7 +126,6 @@ def _pack_qwen2(visual, items):
         num_lanes=encoder_num_lanes(visual.mesh, visual.vision_tp),
         buckets=visual.input_buckets,
         merge_unit=visual.spatial_merge_unit,
-        dtype=visual.dtype,
     )
     batch_sharding = visual.specs.sharding(visual.specs.batch_axis)
     patches = jax.device_put(patches, batch_sharding)
@@ -149,7 +148,6 @@ def _run_grid_vision(visual, items):
         buckets=visual.input_buckets,
         merge_unit=visual.spatial_merge_unit,
         rope_type="rope_3d",
-        dtype=visual.dtype,
     )
 
 
@@ -1213,9 +1211,7 @@ def test_qwen2_preprocessed_layouts_follow_dynamic_lane_packing(monkeypatch, num
     items += _items([(2, 2, 6)], [(0, 6)], Modality.VIDEO)
 
     def pack():
-        return pack_vision_inputs(
-            items, num_lanes=num_lanes, buckets=(64,), merge_unit=4, dtype=np.float32
-        )
+        return pack_vision_inputs(items, num_lanes=num_lanes, buckets=(64,), merge_unit=4)
 
     patches, grids, output_indices, _ = pack()
     expected = visual._build_metadata(grids, 64)

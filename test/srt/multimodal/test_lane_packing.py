@@ -4,10 +4,7 @@ import pytest
 
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 from sgl_jax.srt.multimodal.in_model import lane_packing
-from sgl_jax.srt.multimodal.in_model.packing_copy import (
-    _copy_f32_to_bf16_bits,
-    copy_features,
-)
+from sgl_jax.srt.multimodal.in_model.packing_copy import copy_features
 
 
 @pytest.mark.parametrize("readonly", [False, True])
@@ -96,14 +93,7 @@ def _items(lengths, width, readonly):
     return result
 
 
-def test_dynamic_packing_reuses_compilation_and_matches_numpy(monkeypatch):
-    signatures = tuple(_copy_f32_to_bf16_bits.signatures)
-    assert len(signatures) == 1  # Already compiled at module import.
-
-    def unexpected_compilation(*args, **kwargs):
-        pytest.fail("packing must not compile on the request path")
-
-    monkeypatch.setattr(_copy_f32_to_bf16_bits, "compile", unexpected_compilation)
+def test_dynamic_packing_preserves_features_and_order():
     cases = [
         ((4,), 4, 3, False),
         ((12, 4, 8), 2, 7, True),
@@ -113,24 +103,14 @@ def test_dynamic_packing_reuses_compilation_and_matches_numpy(monkeypatch):
     for lengths, num_lanes, width, readonly in cases:
         items = _items(lengths, width, readonly)
         source_bytes = [item.feature.tobytes() for item in items]
-        kwargs = dict(
-            num_lanes=num_lanes, buckets=(8, 16, 32), merge_unit=4, dtype=ml_dtypes.bfloat16
-        )
+        kwargs = dict(num_lanes=num_lanes, buckets=(8, 16, 32), merge_unit=4)
         actual = lane_packing.pack_vision_inputs(items, **kwargs)
-        with monkeypatch.context() as patcher:
-            patcher.setattr(lane_packing, "copy_features", lambda dst, src: np.copyto(dst, src))
-            expected = lane_packing.pack_vision_inputs(items, **kwargs)
-        for got, want in zip(actual[:3], expected[:3], strict=True):
-            assert got.shape == want.shape and got.dtype == want.dtype
-            assert got.tobytes() == want.tobytes()
-        assert actual[3] == expected[3]
-
         patches, _, indices, layouts = actual
+        assert patches.dtype == items[0].feature.dtype
         valid_indices = indices[indices >= 0]
         restored = patches.reshape(-1, 4, width)[valid_indices].reshape(-1, width)
-        original = np.concatenate([item.feature for item in items]).astype(ml_dtypes.bfloat16)
-        np.testing.assert_array_equal(restored.view(np.uint16), original.view(np.uint16))
+        original = np.concatenate([item.feature for item in items])
+        np.testing.assert_array_equal(restored, original)
         assert sum(map(len, layouts)) == len(items)
         assert [item.feature.tobytes() for item in items] == source_bytes
         assert [item.hash for item in items] == list(range(1, len(items) + 1))
-    assert tuple(_copy_f32_to_bf16_bits.signatures) == signatures

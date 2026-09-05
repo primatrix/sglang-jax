@@ -501,7 +501,6 @@ class Qwen2_5_VisionTransformer(nnx.Module):
             patch_dim=self.patch_dim,
             merge_unit=self.spatial_merge_unit,
             rope_type="rope_3d",
-            dtype=self.dtype,
         )
 
     def _build_metadata(
@@ -580,6 +579,8 @@ class Qwen2_5_VisionTransformer(nnx.Module):
         window_attn: VisionAttentionMetadata,
         full_attn: VisionAttentionMetadata,
     ) -> jax.Array:
+        # Cast after transfer so host packing preserves the processor dtype.
+        patches = patches.astype(self.dtype)
         features = self._forward(patches, indices, position_ids, window_attn, full_attn)
         # Keep the DP lane-to-replicated transition inside the compiled encode.
         # An eager reshard of a multi-device result can otherwise stage through
@@ -690,7 +691,6 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
             buckets=self.visual.input_buckets,
             merge_unit=self.visual.spatial_merge_unit,
             rope_type="rope_3d",
-            dtype=self.dtype,
         )
 
     def get_multimodal_encode_funcs(self):

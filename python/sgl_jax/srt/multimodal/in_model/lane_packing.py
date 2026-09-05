@@ -16,7 +16,6 @@ from jax.typing import ArrayLike
 
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 from sgl_jax.srt.multimodal.common.vision_layout import VisionLayout
-from sgl_jax.srt.multimodal.in_model.packing_copy import copy_features
 from sgl_jax.srt.utils.jax_utils import canonicalize_sharding
 
 
@@ -123,7 +122,6 @@ def pack_lanes(
     *,
     buckets: tuple[int, ...],
     merge_unit: int,
-    dtype: np.dtype | type,
 ) -> PackedLanes:
     with jax.profiler.TraceAnnotation("encoder_pack_lane_plan"):
         features_np = [np.asarray(item.feature) for item in items]
@@ -132,18 +130,21 @@ def pack_lanes(
         lane_loads = [sum(lengths[index] for index in lane) for lane in lanes]
         cap = _bucket_capacity(max(lane_loads), buckets, merge_unit)
     with jax.profiler.TraceAnnotation("encoder_pack_allocate"):
-        features = np.zeros((num_lanes, cap, *features_np[0].shape[1:]), dtype=dtype)
+        features = np.zeros(
+            (num_lanes, cap, *features_np[0].shape[1:]),
+            dtype=np.result_type(*(feature.dtype for feature in features_np)),
+        )
         output_cap = cap // merge_unit
         output_starts = np.zeros(len(items), dtype=np.int32)
 
-    with jax.profiler.TraceAnnotation("encoder_pack_copy_cast"):
+    with jax.profiler.TraceAnnotation("encoder_pack_copy"):
         for lane_index, lane in enumerate(lanes):
             input_offset = 0
             output_offset = 0
             for item_index in lane:
                 feature = features_np[item_index]
                 end = input_offset + feature.shape[0]
-                copy_features(features[lane_index, input_offset:end], feature)
+                features[lane_index, input_offset:end] = feature
                 out_len = feature.shape[0] // merge_unit
                 output_starts[item_index] = lane_index * output_cap + output_offset
                 input_offset = end
@@ -172,7 +173,6 @@ def pack_vision_inputs(
     num_lanes: int,
     buckets: tuple[int, ...],
     merge_unit: int,
-    dtype: np.dtype | type,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[list[VisionLayout | None]]]:
     with jax.profiler.TraceAnnotation("encoder_pack_validate"):
         _validate_vision_items(items, merge_unit)
@@ -181,7 +181,6 @@ def pack_vision_inputs(
         num_lanes,
         buckets=buckets,
         merge_unit=merge_unit,
-        dtype=dtype,
     )
     with jax.profiler.TraceAnnotation("encoder_pack_lane_metadata"):
         grid_thw = np.zeros(
@@ -202,7 +201,6 @@ def pack_2d_position_inputs(
     num_lanes: int,
     buckets: tuple[int, ...],
     merge_unit: int,
-    dtype: np.dtype | type,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Pack vision inputs that carry explicit per-patch 2D positions."""
     item_positions = []
@@ -239,7 +237,6 @@ def pack_2d_position_inputs(
         num_lanes,
         buckets=buckets,
         merge_unit=merge_unit,
-        dtype=dtype,
     )
     position_ids = np.full(
         (num_lanes, packed.cap, 2),
@@ -305,7 +302,6 @@ def run_mrope_vision_model(
     buckets: tuple[int, ...],
     merge_unit: int,
     rope_type: Literal["rope_3d", "rope_2d", "rope_2d_packed"],
-    dtype: np.dtype | type,
 ) -> jax.Array:
     """Pack, run, and restore a sharded vision model with RoPE metadata."""
     if rope_type == "rope_2d_packed":
@@ -314,7 +310,6 @@ def run_mrope_vision_model(
             num_lanes=num_lanes,
             buckets=buckets,
             merge_unit=merge_unit,
-            dtype=dtype,
         )
         output = vision_model(patches, position_ids, patch_counts)
     elif rope_type in ("rope_3d", "rope_2d"):
@@ -323,7 +318,6 @@ def run_mrope_vision_model(
             num_lanes=num_lanes,
             buckets=buckets,
             merge_unit=merge_unit,
-            dtype=dtype,
         )
         if any(layout is not None for lane in lane_layouts for layout in lane):
             output = vision_model(patches, grid_thw, lane_layouts=lane_layouts)
@@ -345,7 +339,6 @@ def precompile_mrope_vision_model(
     patch_dim: int,
     merge_unit: int,
     rope_type: Literal["rope_3d", "rope_2d", "rope_2d_packed"],
-    dtype: np.dtype | type,
 ) -> None:
     merge_size = math.isqrt(merge_unit)
     for capacity in buckets:
@@ -359,7 +352,7 @@ def precompile_mrope_vision_model(
             )
         item = MultimodalDataItem(
             modality=Modality.IMAGE,
-            feature=np.zeros((capacity, patch_dim), dtype=dtype),
+            feature=np.zeros((capacity, patch_dim), dtype=np.float32),
             placeholder_ranges=[(0, capacity // merge_unit)],
             model_specific_data=model_specific_data,
         )
@@ -371,6 +364,5 @@ def precompile_mrope_vision_model(
             buckets=buckets,
             merge_unit=merge_unit,
             rope_type=rope_type,
-            dtype=dtype,
         )
         jax.block_until_ready(output)
