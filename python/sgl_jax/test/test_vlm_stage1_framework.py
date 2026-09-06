@@ -120,23 +120,24 @@ def _items(grids, ranges, modality=Modality.IMAGE):
 
 
 def _pack_qwen2(visual, items):
-    patches, grid_thw, output_indices = pack_vision_inputs(
+    batch_sharding = visual.specs.sharding(visual.specs.batch_axis)
+    num_lanes = encoder_num_lanes(visual.mesh, visual.vision_tp)
+    patches, output_indices, grid_thw = pack_vision_inputs(
         items,
-        num_lanes=encoder_num_lanes(visual.mesh, visual.vision_tp),
+        num_lanes=num_lanes,
         buckets=visual.input_buckets,
         merge_unit=visual.spatial_merge_unit,
-        dtype=visual.dtype,
+        input_sharding=batch_sharding,
     )
-    batch_sharding = visual.specs.sharding(visual.specs.batch_axis)
-    patches = jax.device_put(patches, batch_sharding)
-    return patches, grid_thw, output_indices
+    # Tests inspecting per-lane metadata use the host planning layout.
+    return patches.reshape(num_lanes, -1, visual.patch_dim), grid_thw, output_indices
 
 
 def _qwen2_metadata(visual, grid_thw, capacity):
-    return jax.device_put(
-        visual._build_metadata(grid_thw, capacity),
-        visual.specs.sharding(visual.specs.batch_axis),
+    metadata = visual.prepare_metadata(
+        grid_thw, capacity, sharding=visual.specs.sharding(visual.specs.batch_axis)
     )
+    return visual._metadata_views(metadata.reshape(len(grid_thw), -1), capacity)
 
 
 def _run_grid_vision(visual, items):
@@ -148,7 +149,8 @@ def _run_grid_vision(visual, items):
         buckets=visual.input_buckets,
         merge_unit=visual.spatial_merge_unit,
         rope_type="rope_3d",
-        dtype=visual.dtype,
+        input_sharding=visual.specs.sharding(visual.specs.batch_axis),
+        output_sharding=visual.specs.sharding(),
     )
 
 
@@ -260,15 +262,17 @@ def test_vision_batch_layout_uses_all_encoder_lanes(vision_tp, expected_lanes):
 def _assert_vision_precompile(visual):
     calls = []
 
-    def encode(patches, grid_thw):
-        calls.append((patches.shape, np.asarray(grid_thw).tolist()))
-        return jnp.zeros(
-            (
-                patches.shape[0],
-                patches.shape[1] // visual.spatial_merge_unit,
-                1,
-            )
-        )
+    def encode(patches, metadata):
+        sharding = visual.specs.sharding(visual.specs.batch_axis)
+        for value in (patches, metadata):
+            assert isinstance(value, jax.Array)
+            assert value.ndim == 1
+            assert value.sharding.is_equivalent_to(sharding, ndim=1)
+        assert metadata.dtype == jnp.int32
+        calls.append((patches.shape, metadata.shape))
+        num_lanes = encoder_num_lanes(visual.mesh, visual.vision_tp)
+        capacity = patches.size // (num_lanes * visual.patch_dim)
+        return jnp.zeros((num_lanes * capacity // visual.spatial_merge_unit, 1))
 
     with patch.object(type(visual), "encode", side_effect=encode):
         visual.precompile()
@@ -284,8 +288,8 @@ def test_qwen2_vision_precompile_warms_configured_buckets():
         deepstack_visual_indexes=[],
     )
     assert _assert_vision_precompile(_visual(config=config, input_buckets=(4, 8))) == [
-        ((1, 4, 1), [[[1, 2, 2]]]),
-        ((1, 8, 1), [[[1, 2, 4]]]),
+        ((4,), (14,)),
+        ((8,), (26,)),
     ]
 
 
@@ -308,8 +312,8 @@ def test_qwen2_global_batch_spmd(encoder_tp):
     )
     patches, grid_thw, output_indices = _pack_qwen2(visual, items)
     metadata = _qwen2_metadata(visual, grid_thw, patches.shape[1])
-    _, _, _, full_attn = metadata
-    valid = full_attn.cu_seqlens[:, -1]
+    _, _, _, full_cu_seqlens = metadata
+    valid = full_cu_seqlens[:, -1]
 
     if encoder_tp:
         np.testing.assert_array_equal(
@@ -361,11 +365,16 @@ def test_qwen2_global_batch_spmd(encoder_tp):
         for shard in valid.addressable_shards
     }
     patch_shards = {
-        shard.device: tuple(int(value) for value in np.asarray(shard.data).reshape(-1))
+        shard.device: tuple(
+            int(value)
+            for value in np.asarray(shard.data).reshape(-1)[: sum(valid_shards[shard.device])]
+        )
         for shard in patches.addressable_shards
     }
     assert valid_shards == expected_valid
-    assert patch_shards == expected_patches
+    assert patch_shards == {
+        device: values[: sum(valid_shards[device])] for device, values in expected_patches.items()
+    }
 
 
 @pytest.mark.parametrize("encoder_tp", [False, True])
@@ -378,15 +387,23 @@ def test_qwen2_get_image_feature_spmd(encoder_tp):
     )
     items = _items([(1, 1, 4), (1, 1, 2)], [(0, 4), (4, 6)])
     patches, grid_thw, output_indices = _pack_qwen2(visual, items)
-    encoded = visual.encode(patches, grid_thw)
-    assert encoded.sharding.is_fully_replicated
-    assert encoded.sharding.spec == PartitionSpec(None, None, None)
+    metadata = visual.prepare_metadata(
+        grid_thw,
+        patches.shape[1],
+        sharding=visual.specs.sharding(visual.specs.batch_axis),
+    )
+    with jax.set_mesh(mesh):
+        encoded = visual.encode(patches.reshape(-1), metadata)
+    assert encoded.ndim == 2
+    assert encoded.sharding.is_equivalent_to(visual.specs.sharding(visual.specs.batch_axis), ndim=2)
     packed = _run_grid_vision(visual, items)
     assert packed.sharding.is_fully_replicated
     assert packed.sharding.device_set == set(mesh.devices.flat)
     expected_rows = encoder_num_lanes(visual.mesh, visual.vision_tp)
     assert packed.shape[0] == expected_rows * visual.input_buckets[0]
-    expected = encoded.reshape(-1, encoded.shape[-1])[output_indices[output_indices >= 0]]
+    expected = np.asarray(encoded).reshape(-1, encoded.shape[-1])[
+        output_indices[output_indices >= 0]
+    ]
     np.testing.assert_allclose(packed[: len(expected)], expected)
     np.testing.assert_array_equal(packed[len(expected) :], 0)
     calls = 0
@@ -1064,12 +1081,10 @@ def test_qwen2_metadata_is_host_planned_and_bucket_stable():
     first = _items([(1, 4, 6)], [(0, 6)])
     patches, grid_thw, output_indices = _pack_qwen2(visual, first)
     metadata = _qwen2_metadata(visual, grid_thw, patches.shape[1])
-    indices, position_ids, window_attn, full_attn = metadata
+    indices, position_ids, window_cu_seqlens, full_cu_seqlens = metadata
     indices = np.asarray(indices)
     position_ids = np.asarray(position_ids)
 
-    assert window_attn.max_seq_len == 16
-    assert full_attn.max_seq_len == 32
     np.testing.assert_array_equal(output_indices[:6], np.arange(6))
     assert position_ids.shape == (1, 32, 2)
     np.testing.assert_array_equal(indices[0, :, 0], [0, 1, 3, 4, 2, 5, 6, 7])
@@ -1078,29 +1093,65 @@ def test_qwen2_metadata_is_host_planned_and_bucket_stable():
         position_ids[0, [0, 4, 8, 12, 16, 20]],
         [[0, 0], [0, 2], [2, 0], [2, 2], [0, 4], [2, 4]],
     )
-    # window layout at [:, 0], full-frame at [:, 1]; tails repeat the final end.
+    # Window and full-frame boundary tails repeat the final end.
     np.testing.assert_array_equal(
-        np.asarray(window_attn.cu_seqlens)[0], [0, 16, 24, 24, 24, 24, 24, 24, 24]
+        np.asarray(window_cu_seqlens)[0], [0, 16, 24, 24, 24, 24, 24, 24, 24]
     )
     np.testing.assert_array_equal(
-        np.asarray(full_attn.cu_seqlens)[0], [0, 24, 24, 24, 24, 24, 24, 24, 24]
+        np.asarray(full_cu_seqlens)[0], [0, 24, 24, 24, 24, 24, 24, 24, 24]
     )
     np.testing.assert_array_equal(
-        visual._build_metadata(np.zeros((1, 1, 3), dtype=np.int32), 32)[2].cu_seqlens,
+        _qwen2_metadata(visual, np.zeros((1, 1, 3), dtype=np.int32), 32)[2],
         np.zeros((1, 9), dtype=np.int32),
     )
-    _assert_no_grid_layout_planning(
-        jax.make_jaxpr(lambda p, *m: visual._forward(p, *m))(patches, *metadata)
-    )
+    backend_type = type(visual.blocks[0].attn.attn_backend)
+    with patch.object(
+        backend_type, "__call__", autospec=True, side_effect=backend_type.__call__
+    ) as attention:
+        flat_metadata = visual.prepare_metadata(
+            grid_thw, 32, sharding=visual.specs.sharding(visual.specs.batch_axis)
+        )
+        with jax.set_mesh(visual.mesh):
+            _assert_no_grid_layout_planning(
+                jax.make_jaxpr(visual.encode)(patches.reshape(-1), flat_metadata)
+            )
+    bounds = [call.kwargs["max_seq_len"] for call in attention.call_args_list]
+    assert all(isinstance(bound, int) for bound in bounds)
+    assert bounds == [16, 32]
 
-    jax.block_until_ready(visual.encode(patches, grid_thw))
-    cache_size = visual._encode_jit._cache_size()
+    jax.block_until_ready(_run_grid_vision(visual, first))
+    cache_size = visual.encode._cache_size()
     second = _items([(1, 4, 4), (2, 2, 2)], [(0, 4), (4, 6)])
     second_patches, second_grid_thw, _ = _pack_qwen2(visual, second)
     second_metadata = _qwen2_metadata(visual, second_grid_thw, second_patches.shape[1])
     np.testing.assert_array_equal(
-        np.asarray(second_metadata[3].cu_seqlens)[0],
+        np.asarray(second_metadata[3])[0],
         [0, 16, 20, 24, 24, 24, 24, 24, 24],
     )
-    jax.block_until_ready(visual.encode(second_patches, second_grid_thw))
-    assert visual._encode_jit._cache_size() == cache_size
+    jax.block_until_ready(_run_grid_vision(visual, second))
+    assert visual.encode._cache_size() == cache_size
+
+
+@pytest.mark.parametrize("encoder_tp", [False, True])
+def test_packed_vision_matches_individual_images_with_empty_lanes(encoder_tp):
+    config = _vision_config(
+        hidden_size=8,
+        num_heads=2,
+        spatial_merge_size=2,
+        window_size=4,
+        depth=2,
+        fullatt_block_indexes=[1],
+    )
+    reference = _visual(config, input_buckets=(32,))
+    visual = _visual(config, _mesh(dp=2, tp=2), encoder_tp, input_buckets=(32,))
+    items = _items([(1, 2, 2), (1, 4, 6)], [(0, 1), (1, 7)])
+    items += _items([(2, 2, 4)], [(0, 4)], Modality.VIDEO)
+    expected = np.concatenate(
+        [
+            np.asarray(_run_grid_vision(reference, [item]))[: len(item.feature) // 4]
+            for item in items
+        ]
+    )
+    actual = np.asarray(_run_grid_vision(visual, items))
+    np.testing.assert_allclose(actual[: len(expected)], expected, rtol=2e-5, atol=2e-5)
+    np.testing.assert_array_equal(actual[len(expected) :], 0)
