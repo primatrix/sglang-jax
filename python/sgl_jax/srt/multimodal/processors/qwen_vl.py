@@ -233,6 +233,35 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         "Qwen3VLForConditionalGeneration",
     )
 
+    # Qwen-VL EPD reconstruction adapted from SGLang:
+    # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/multimodal/processors/qwen_vl.py
+    def get_mm_data(self, prompt, embeddings, **metadata) -> MultimodalInputs:
+        """Add Qwen MRoPE metadata to the generic disaggregated output."""
+        hf_config = self.hf_config
+        mm_inputs = super().get_mm_data(prompt, embeddings, **metadata)
+        image_grids = self._to_grid_list(metadata.get("image_grid_thw"))
+        video_grids = self._to_grid_list(metadata.get("video_grid_thw"))
+        second_per_grid_ts = metadata.get("second_per_grid_ts")
+        second_per_grid_ts = (
+            []
+            if second_per_grid_ts is None
+            else np.asarray(second_per_grid_ts).reshape(-1).tolist()
+        )
+        mrope_positions, mrope_position_delta = compute_mrope_positions(
+            input_ids=mm_inputs.input_ids,
+            image_grid_thw=image_grids or None,
+            video_grid_thw=video_grids or None,
+            second_per_grid_ts=second_per_grid_ts or None,
+            vision_start_token_id=hf_config.vision_start_token_id,
+            image_token_id=hf_config.image_token_id,
+            video_token_id=getattr(hf_config, "video_token_id", None),
+            spatial_merge_size=self.spatial_merge_size,
+            tokens_per_second=getattr(hf_config.vision_config, "tokens_per_second", None),
+        )
+        mm_inputs.mrope_positions = mrope_positions
+        mm_inputs.mrope_position_delta = np.asarray([[mrope_position_delta]], dtype=np.int32)
+        return mm_inputs
+
     async def process_mm_data_async(
         self,
         image_data,
@@ -290,6 +319,67 @@ class QwenVLProcessor(BaseMultimodalProcessor):
             processor=processor,
             **processor_kwargs,
         )
+
+    async def process_encoder_mm_data_async(
+        self,
+        image_data,
+        input_text,
+        request_obj,
+        **kwargs,
+    ) -> MultimodalInputs:
+        """Prepare image features without tokenizer or MRoPE work unused by the encoder."""
+        if getattr(request_obj, "audio_data", None) is not None:
+            raise ValueError("Qwen-VL does not support audio inputs.")
+        if isinstance(input_text, list):
+            raise ValueError(
+                "Multimodal input_ids are not supported for Qwen-VL. "
+                "Please provide text input instead."
+            )
+        if self.normalize_data(getattr(request_obj, "video_data", None)):
+            return await self.process_mm_data_async(
+                image_data=image_data,
+                input_text=input_text,
+                request_obj=request_obj,
+                **kwargs,
+            )
+
+        return await self.mm_processor_executor.run(
+            self._process_encoder_images,
+            self.normalize_data(image_data),
+        )
+
+    def _process_encoder_images(
+        self,
+        image_sources: list,
+        *,
+        processor,
+    ):
+        images = [self.load_image(source) for source in image_sources]
+        processor_output = processor.image_processor(images=images, return_tensors="pt")
+        return self._collect_encoder_images(processor_output)
+
+    def _collect_encoder_images(self, processor_output) -> MultimodalInputs:
+        features = self._to_numpy(processor_output.get("pixel_values"))
+        grids = self._to_grid_list(processor_output.get("image_grid_thw"))
+        if features is None or not grids:
+            raise ValueError("Qwen-VL image processor did not return image features.")
+
+        placeholder_ranges = []
+        offset = 0
+        for grid in grids:
+            token_count = int(np.prod(grid) // (self.spatial_merge_size**2))
+            placeholder_ranges.append((offset, offset + token_count))
+            offset += token_count
+        items = self._build_items(
+            features,
+            grids,
+            placeholder_ranges,
+            Modality.IMAGE,
+            "image_grid_thw",
+        )
+        for item in items:
+            item.set_pad_value()
+        return MultimodalInputs(mm_items=items)
 
     def collect_mm_items_from_processor_output(
         self,

@@ -10,6 +10,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 from sgl_jax.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sgl_jax.srt.managers.io_struct import GenerateReqInput
 from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
+from sgl_jax.srt.request_time_stats import begin_request_time_stats
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +26,18 @@ class OpenAIServingBase(ABC):
         self, request: OpenAIServingRequest, raw_request: Request
     ) -> Any | StreamingResponse | ErrorResponse:
         """Handle the specific request type with common pattern"""
+        request_time_stats = None
         try:
+            server_args = self.tokenizer_manager.server_args
+            if server_args.enable_request_time_stats_logging:
+                request_id = getattr(request, "rid", None)
+                if request_id is None:
+                    request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
+                    request.rid = request_id
+                if isinstance(request_id, list):
+                    request_id = request_id[0] if len(request_id) == 1 else None
+                request_time_stats = begin_request_time_stats(raw_request, request_id, server_args)
+
             # Validate request
             error_msg = self._validate_request(request)
             if error_msg:
@@ -33,6 +45,7 @@ class OpenAIServingBase(ABC):
 
             # Convert to internal format
             adapted_request, processed_request = self._convert_to_internal_request(request)
+            adapted_request.request_time_stats = request_time_stats
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:

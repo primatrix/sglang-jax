@@ -21,7 +21,14 @@ from sgl_jax.srt.multimodal.in_model.embedding_pool import (
     EmbeddingPool,
     EmbeddingPoolEntry,
 )
-from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
+from sgl_jax.srt.multimodal.in_model.embedding_view import (
+    EmbeddingLease,
+    PooledEmbedding,
+)
+from sgl_jax.srt.multimodal.in_model.interface import (
+    InModelMultimodalContract,
+    MultimodalEncodeFunc,
+)
 
 
 @dataclass(frozen=True)
@@ -110,6 +117,28 @@ def build_multimodal_batch(
     return {modality: tuple(tasks) for modality, tasks in grouped.items()}
 
 
+def release_consumed_embeddings(
+    tasks: Sequence[ItemTask],
+    dependency: jax.Array | tuple[jax.Array, ...] | None = None,
+) -> None:
+    """Release each shared lease after its final slice and chunk have been consumed."""
+    leases: dict[int, EmbeddingLease] = {}
+    retained: set[int] = set()
+    for task in tasks:
+        embedding = task.item.precomputed_embeddings
+        if not isinstance(embedding, PooledEmbedding):
+            continue
+        key = id(embedding.lease)
+        if task.has_unmerged_tail:
+            retained.add(key)
+        elif embedding.is_last_slice:
+            leases[key] = embedding.lease
+
+    for key, lease in leases.items():
+        if key not in retained:
+            lease.release_after(dependency)
+
+
 @partial(jax.jit, static_argnames=("out_sharding",))
 def _gather_overlay(
     running: jax.Array,
@@ -181,7 +210,7 @@ def _apply_gather(
 
 def _gather_merge(
     running: jax.Array,
-    packed: jax.Array,
+    packed: jax.Array | PooledEmbedding,
     tasks: tuple[ItemTask, ...],
     mesh: Mesh | None,
 ) -> jax.Array:
@@ -193,6 +222,9 @@ def _gather_merge(
             f"{min_capacity}, got {packed.shape}"
         )
     pos_idx, mask = _build_gather_indices(tasks, running.shape[0])
+    if isinstance(packed, PooledEmbedding):
+        pos_idx[mask] += packed.flat_row_start
+        packed = packed.flat_buffer
     return _apply_gather(running, packed, pos_idx, mask, mesh)
 
 
@@ -237,11 +269,39 @@ def _gather_from_pool(
     )
 
 
-def _write_misses_to_pool(
-    pool: EmbeddingPool,
-    packed: jax.Array,
+def _merge_cached_embeddings(
+    running: jax.Array,
+    tasks: tuple[ItemTask, ...],
+    pool: EmbeddingPool | None,
+    mesh: Mesh | None,
+) -> tuple[jax.Array, tuple[ItemTask, ...]]:
+    """Consume hits before any miss writes can evict their pages."""
+    if pool is None:
+        return running, tasks
+    hit_tasks: list[ItemTask] = []
+    hit_entries: list[EmbeddingPoolEntry] = []
+    miss_tasks: list[ItemTask] = []
+    for task in tasks:
+        if task.item.hash is None:
+            task.item.set_pad_value()
+        entry = pool.lookup(task.item.hash)
+        if entry is None:
+            miss_tasks.append(task)
+        else:
+            hit_tasks.append(task)
+            hit_entries.append(entry)
+    if hit_tasks:
+        running = _gather_from_pool(running, pool, hit_tasks, hit_entries, mesh)
+    return running, tuple(miss_tasks)
+
+
+def _cache_unfinished_items(
+    pool: EmbeddingPool | None,
+    packed: jax.Array | PooledEmbedding,
     tasks: Sequence[ItemTask],
 ) -> None:
+    if pool is None:
+        return
     write_mask = tuple(task.has_unmerged_tail for task in tasks)
     if not any(write_mask):
         return
@@ -251,6 +311,31 @@ def _write_misses_to_pool(
         tuple(task.output_len for task in tasks),
         write_mask=write_mask,
     )
+
+
+def _resolve_embedding_batches(
+    tasks: tuple[ItemTask, ...],
+    encode_func: MultimodalEncodeFunc | None,
+) -> list[tuple[jax.Array | PooledEmbedding, tuple[ItemTask, ...]]]:
+    """Resolve local or received outputs while preserving each gather's source shape."""
+    if not tasks:
+        return []
+    uses_received_embeddings = tasks[0].item.precomputed_embeddings is not None
+    if any(
+        (task.item.precomputed_embeddings is not None) != uses_received_embeddings for task in tasks
+    ):
+        raise ValueError("cannot mix local and precomputed embeddings for one modality")
+    if uses_received_embeddings:
+        batches = []
+        for task in tasks:
+            embeddings = task.item.precomputed_embeddings
+            if not isinstance(embeddings, PooledEmbedding):
+                embeddings = jnp.asarray(embeddings)
+            batches.append((embeddings, (task,)))
+        return batches
+    if encode_func is None:
+        raise ValueError(f"no embedding function for modality {tasks[0].item.modality}")
+    return [(encode_func([task.item for task in tasks]), tasks)]
 
 
 def _split_embeddings(
@@ -337,40 +422,12 @@ def embed_multimodal_inputs(
 
         encode_funcs = multimodal_model.get_multimodal_encode_funcs()
         for modality, tasks in multimodal_batch.items():
-            encode_func = encode_funcs.get(modality)
-            if encode_func is None:
-                raise ValueError(
-                    f"no embedding function for modality {modality}; "
-                    "in-model multimodal models must expose one"
-                )
-
-            if embedding_pool is None:
-                packed = encode_func([task.item for task in tasks])
-                running = _gather_merge(running, packed, tasks, mesh)
-                continue
-
-            # Pool present: split hits from misses by item hash. Misses run the
-            # encoder and merge from its packed output (same cost as the no-pool
-            # path) then are written back for reuse; hits merge straight from the
-            # pool's paged buffers.
-            hit_tasks: list[ItemTask] = []
-            hit_entries: list[EmbeddingPoolEntry] = []
-            miss_tasks: list[ItemTask] = []
-            for task in tasks:
-                if task.item.hash is None:
-                    task.item.set_pad_value()
-                entry = embedding_pool.lookup(task.item.hash)
-                if entry is not None:
-                    hit_tasks.append(task)
-                    hit_entries.append(entry)
-                else:
-                    miss_tasks.append(task)
-            # Consume hits before a miss write is allowed to evict their pages.
-            if hit_tasks:
-                running = _gather_from_pool(running, embedding_pool, hit_tasks, hit_entries, mesh)
-            if miss_tasks:
-                packed = encode_func([task.item for task in miss_tasks])
-                running = _gather_merge(running, packed, tuple(miss_tasks), mesh)
-                _write_misses_to_pool(embedding_pool, packed, miss_tasks)
+            running, misses = _merge_cached_embeddings(running, tasks, embedding_pool, mesh)
+            batches = _resolve_embedding_batches(misses, encode_funcs.get(modality))
+            for packed, source_tasks in batches:
+                running = _gather_merge(running, packed, source_tasks, mesh)
+                _cache_unfinished_items(embedding_pool, packed, source_tasks)
+            dependency = (running, embedding_pool.pages) if embedding_pool is not None else running
+            release_consumed_embeddings(tasks, dependency)
 
         return _split_embeddings(running, hidden, deepstack_dim, mesh)

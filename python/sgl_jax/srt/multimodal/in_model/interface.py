@@ -24,6 +24,14 @@ class InModelMultimodalContract(ABC):
         """Return finite packed-array capacities for warmup."""
         return ()
 
+    def get_multimodal_embedding_packed_capacity(
+        self,
+        items: list[MultimodalDataItem],
+    ) -> int | None:
+        """Return the packed output capacity for one concrete encoder batch."""
+        del items
+        return None
+
     @abstractmethod
     def get_input_embeddings(self) -> Callable[[jax.Array], jax.Array]:
         raise NotImplementedError

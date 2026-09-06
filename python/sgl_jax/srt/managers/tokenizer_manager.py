@@ -30,6 +30,8 @@ import zmq.asyncio
 from fastapi import BackgroundTasks
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.disaggregation.encoder.bootstrap import EncoderBootstrapServer
+from sgl_jax.srt.disaggregation.encoder.dispatcher import EncoderRequestDispatcher
 from sgl_jax.srt.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -72,6 +74,11 @@ from sgl_jax.srt.multimodal.manager.multimodal_processor import (
     import_processors,
 )
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
+from sgl_jax.srt.request_time_stats import (
+    mark_batch_time_stats,
+    mark_time_stats,
+    should_sample_request,
+)
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 from sgl_jax.srt.server_args import (
     PortArgs,
@@ -240,6 +247,21 @@ class TokenizerManager:
         self.max_req_input_len = None
         self.asyncio_tasks = set()
 
+        # The local bootstrap and the request path share this list by reference.
+        # Static URLs remain available and dynamic registrations are added in place.
+        self.encoder_urls = list(server_args.encoder_urls)
+        timeout = server_args.encoder_control_timeout_seconds
+        self.encoder_request_dispatcher = EncoderRequestDispatcher(
+            None if timeout <= 0 else timeout
+        )
+        self.encoder_bootstrap_server: EncoderBootstrapServer | None = None
+        if server_args.encoder_bootstrap_port is not None:
+            self.encoder_bootstrap_server = EncoderBootstrapServer(
+                host=server_args.host,
+                port=server_args.encoder_bootstrap_port,
+                urls=self.encoder_urls,
+            )
+
         # For load balancing
         self.current_load = 0
         self.current_load_lock = asyncio.Lock()
@@ -303,18 +325,37 @@ class TokenizerManager:
         if self.mm_processor is not None:
             self.mm_processor.shutdown()
 
+    async def aclose(self) -> None:
+        self.shutdown()
+        await self.encoder_request_dispatcher.close()
+
     async def generate_request(
         self,
         obj: GenerateReqInput | EmbeddingReqInput,
         request: fastapi.Request | None = None,
     ):
-
+        request_time_stats = getattr(obj, "request_time_stats", None)
         created_time = time.time()
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
+        if (
+            request_time_stats is None
+            and self.server_args.enable_request_time_stats_logging
+            and isinstance(obj.rid, str)
+            and should_sample_request(obj.rid, self.server_args.request_time_stats_sample_rate)
+        ):
+            request_time_stats = obj.request_time_stats = {}
+
+        if (
+            isinstance(obj, GenerateReqInput)
+            and self._encoder_disaggregation_enabled()
+            and obj.contains_mm_input()
+            and getattr(obj, "parallel_sample_num", 1) > 1
+        ):
+            raise ValueError("encoder disaggregation does not support parallel sampling yet")
 
         # Acquire LoRA ID if lora_path is provided
         if isinstance(obj, GenerateReqInput) and self.server_args.enable_lora and obj.lora_path:
@@ -348,16 +389,25 @@ class TokenizerManager:
     ):
         """Tokenize one request."""
 
+        request_time_stats = getattr(obj, "request_time_stats", None)
+        mark_time_stats(request_time_stats, "tokenizer_process_start_ns")
+
         # Tokenize
         input_text = obj.text
         input_ids = obj.input_ids
         mm_inputs = None
+        use_remote_encoder = (
+            isinstance(obj, GenerateReqInput)
+            and self._encoder_disaggregation_enabled()
+            and obj.contains_mm_input()
+        )
         if isinstance(obj, GenerateReqInput) and obj.contains_mm_input():
+            self._validate_mm_limits(obj)
+        if isinstance(obj, GenerateReqInput) and obj.contains_mm_input() and not use_remote_encoder:
             if self.mm_processor is None:
                 raise ValueError(
                     "Multimodal input was provided, but the model has no multimodal processor."
                 )
-            self._validate_mm_limits(obj)
             mm_inputs = await self.mm_processor.process_mm_data_async(
                 image_data=obj.image_data,
                 input_text=input_text or input_ids,
@@ -376,7 +426,35 @@ class TokenizerManager:
             input_ids = encoded["input_ids"]
 
         self._validate_one_request(obj, input_ids)
-        return self._create_tokenized_object(obj, input_text, input_ids, mm_inputs)
+        tokenized_obj = self._create_tokenized_object(obj, input_text, input_ids, mm_inputs)
+
+        if use_remote_encoder:
+            encoder_urls = await self._get_encoder_urls()
+            assignments, dispatch_task = self.encoder_request_dispatcher.dispatch(
+                obj,
+                encoder_urls,
+            )
+            self.asyncio_tasks.add(dispatch_task)
+            dispatch_task.add_done_callback(self.asyncio_tasks.discard)
+            tokenized_obj.num_items_assigned = assignments
+            tokenized_obj.encoder_urls = encoder_urls
+            tokenized_obj.need_wait_for_mm_inputs = True
+
+        mark_time_stats(request_time_stats, "tokenizer_process_done_ns")
+        return tokenized_obj
+
+    def _encoder_disaggregation_enabled(self) -> bool:
+        return self.server_args.language_only
+
+    async def _get_encoder_urls(self) -> list[str]:
+        encoder_urls = (
+            self.encoder_bootstrap_server.list_urls()
+            if self.encoder_bootstrap_server is not None
+            else list(self.encoder_urls)
+        )
+        if not encoder_urls:
+            raise RuntimeError("no Encoder workers are registered")
+        return encoder_urls
 
     def _validate_one_request(
         self, obj: GenerateReqInput | EmbeddingReqInput, input_ids: list[int]
@@ -445,6 +523,7 @@ class TokenizerManager:
 
         tokenized_obj = TokenizedGenerateReqInput(
             rid=obj.rid,
+            request_time_stats=obj.request_time_stats,
             text=input_text,
             input_ids=input_ids,
             radix_input_ids=build_radix_input_ids(input_ids, mm_inputs),
@@ -595,6 +674,8 @@ class TokenizerManager:
         tokenized_obj: TokenizedGenerateReqInput | TokenizedEmbeddingReqInput,
         created_time: float | None = None,
     ):
+        request_time_stats = getattr(obj, "request_time_stats", None)
+        mark_time_stats(request_time_stats, "tokenizer_scheduler_send_start_ns")
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         # Capture the caller's event loop so that _notify_state_event can use
         # call_soon_threadsafe when handle_loop runs on a different thread
@@ -1121,7 +1202,9 @@ class TokenizerManager:
                 self.dump_requests_before_crash()
                 break
 
-        self.shutdown()
+        await self.aclose()
+        if self.encoder_bootstrap_server is not None:
+            self.encoder_bootstrap_server.close()
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(0)
 
@@ -1129,6 +1212,7 @@ class TokenizerManager:
         """The event loop that handles requests"""
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            mark_batch_time_stats(recv_obj, "tokenizer_manager_receive_ns")
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.perf_counter()
 
@@ -1136,6 +1220,7 @@ class TokenizerManager:
         self,
         recv_obj: BatchStrOut | BatchEmbeddingOut | BatchTokenIDOut,
     ):
+        received_time_stats = getattr(recv_obj, "request_time_stats", None)
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
@@ -1145,12 +1230,27 @@ class TokenizerManager:
                 )
                 continue
 
+            request_time_stats = (
+                received_time_stats[i]
+                if received_time_stats is not None and i < len(received_time_stats)
+                else None
+            )
+            frontend_time_stats = getattr(state.obj, "request_time_stats", None)
+            if frontend_time_stats is not None:
+                if request_time_stats is None:
+                    request_time_stats = dict(frontend_time_stats)
+                else:
+                    for key, value in frontend_time_stats.items():
+                        request_time_stats.setdefault(key, value)
+
             # Build meta_info and return value
             meta_info = {
                 "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
             }
+            if request_time_stats is not None:
+                meta_info["request_time_stats"] = request_time_stats
             dp_rank = getattr(state.obj, "dp_rank", None)
             if dp_rank is not None:
                 meta_info["dp_rank"] = dp_rank

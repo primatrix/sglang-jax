@@ -13,6 +13,7 @@ import requests
 from PIL import Image
 
 from sgl_jax.srt.multimodal.common.modality_enum import MultimodalInputs
+from sgl_jax.srt.multimodal.processors.encoder import EncoderInputMixin
 from sgl_jax.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 
 if TYPE_CHECKING:
@@ -66,7 +67,7 @@ def _normalize_image_source(source) -> bytes | str:
     return pybase64.b64decode(source, validate=True)
 
 
-class BaseMultimodalProcessor(ABC):
+class BaseMultimodalProcessor(EncoderInputMixin, ABC):
     models: tuple[str, ...] = ()
     auto_mm_processor_worker_num = 1
     supports_mm_processor_concurrency = False
@@ -115,6 +116,21 @@ class BaseMultimodalProcessor(ABC):
     ) -> MultimodalInputs:
         """Process multimodal payload and return a ``MultimodalInputs``."""
         pass
+
+    async def process_encoder_mm_data_async(
+        self,
+        image_data,
+        input_text,
+        request_obj,
+        **kwargs,
+    ) -> MultimodalInputs:
+        """Process encoder inputs, with model adapters free to skip unused metadata."""
+        return await self.process_mm_data_async(
+            image_data=image_data,
+            input_text=input_text,
+            request_obj=request_obj,
+            **kwargs,
+        )
 
     @staticmethod
     def normalize_data(data) -> list:

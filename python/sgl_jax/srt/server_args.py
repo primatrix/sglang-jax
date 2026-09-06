@@ -165,6 +165,7 @@ class ServerArgs:
     bucket_e2e_request_latency: list[float] | None = None
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
+    request_time_stats_sample_rate: float = 1.0
     kv_events_config: str | None = None
 
     # API related
@@ -263,6 +264,20 @@ class ServerArgs:
     limit_mm_data_per_request: dict[str, int] | None = None
     mm_processor_worker_num: int = 0
 
+    # Encoder disaggregation
+    encoder_only: bool = False
+    language_only: bool = False
+    encoder_urls: list[str] | None = None
+    encoder_bootstrap_port: int | None = None
+    encoder_register_urls: list[str] | None = None
+    encoder_transfer_backend: str = "raiden"
+    encoder_transfer_pool_size: int = 32
+    encoder_control_timeout_seconds: float = 300.0
+    encoder_request_timeout_seconds: float = 300.0
+    encoder_max_batch_size: int = 8
+    encoder_batch_coalesce_ms: float = 0.0
+    encoder_max_inflight_batches: int = 1
+
     enable_return_routed_experts: bool = False
     enable_expert_balance_debug: bool = False
     expert_balance_segment_counter: int = 100
@@ -329,9 +344,16 @@ class ServerArgs:
     disaggregation_max_inflight_transfers: int = 8
 
     def __post_init__(self):
+        if not 0.0 <= self.request_time_stats_sample_rate <= 1.0:
+            raise ValueError(
+                "--request-time-stats-sample-rate must be between 0 and 1, "
+                f"got {self.request_time_stats_sample_rate}."
+            )
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
+        self.encoder_urls = list(self.encoder_urls or ())
+        self.encoder_register_urls = list(self.encoder_register_urls or ())
 
         from sgl_jax.srt.disaggregation.pd_auth import resolve_secret
 
@@ -552,6 +574,39 @@ class ServerArgs:
                 f"--disaggregation-mode must be one of {valid_modes}, "
                 f"got {self.disaggregation_mode!r}"
             )
+        if self.encoder_only and self.language_only:
+            raise ValueError("--encoder-only and --language-only are mutually exclusive")
+        if self.encoder_only and (self.encoder_urls or self.encoder_bootstrap_port is not None):
+            raise ValueError("--encoder-only cannot consume external encoders")
+        if self.language_only and not (
+            self.encoder_urls or self.encoder_bootstrap_port is not None
+        ):
+            raise ValueError("--language-only requires --encoder-urls or --encoder-bootstrap-port")
+        if (
+            self.encoder_urls or self.encoder_bootstrap_port is not None
+        ) and not self.language_only:
+            raise ValueError("--encoder-urls and --encoder-bootstrap-port require --language-only")
+        if self.encoder_register_urls and not self.encoder_only:
+            raise ValueError("--encoder-register-urls requires --encoder-only")
+
+        encoder_disaggregation = self.encoder_only or self.language_only
+        if encoder_disaggregation and self.disaggregation_mode == "decode":
+            raise ValueError("Encoder disaggregation is not used by a decode-only server")
+        if self.encoder_bootstrap_port is not None and not (
+            1 <= self.encoder_bootstrap_port <= 65535
+        ):
+            raise ValueError("--encoder-bootstrap-port must be in [1, 65535]")
+        if self.encoder_transfer_backend != "raiden":
+            raise ValueError(
+                "--encoder-transfer-backend only supports 'raiden', "
+                f"got {self.encoder_transfer_backend!r}"
+            )
+        if encoder_disaggregation and self.encoder_transfer_pool_size <= 0:
+            raise ValueError("--encoder-transfer-pool-size must be positive")
+        if encoder_disaggregation and self.encoder_request_timeout_seconds <= 0:
+            raise ValueError(
+                "Raiden encoder transfer requires a positive " "--encoder-request-timeout-seconds"
+            )
         if self.pd_disaggregation and self.disaggregation_mode != "null":
             raise ValueError(
                 "--pd-disaggregation (single-controller) and --disaggregation-mode "
@@ -614,7 +669,11 @@ class ServerArgs:
             # null mode ignores the PD fields; warn so a misconfigured
             # deployment isn't silently ignored.
             pd_overrides = [
-                ("disaggregation_bootstrap_url", self.disaggregation_bootstrap_url, None),
+                (
+                    "disaggregation_bootstrap_url",
+                    self.disaggregation_bootstrap_url,
+                    None,
+                ),
                 # Compare against the current default so "user did
                 # nothing" does not trigger the warning.
                 (
@@ -1214,6 +1273,15 @@ class ServerArgs:
             help="Enable per request time stats logging",
         )
         parser.add_argument(
+            "--request-time-stats-sample-rate",
+            type=float,
+            default=ServerArgs.request_time_stats_sample_rate,
+            help=(
+                "Deterministic fraction of request IDs to trace when request time stats "
+                "logging is enabled. Use the same value in bench_serving."
+            ),
+        )
+        parser.add_argument(
             "--kv-events-config",
             type=str,
             default=None,
@@ -1623,7 +1691,87 @@ class ServerArgs:
             "--mm-processor-worker-num",
             type=int,
             default=ServerArgs.mm_processor_worker_num,
-            help="Number of multimodal processor workers. 0 uses the model default.",
+            help=(
+                "Number of workers for multimodal loading and processing. "
+                "0 uses the model default."
+            ),
+        )
+        parser.add_argument(
+            "--encoder-only",
+            action="store_true",
+            help="Run only the multimodal encoder as an EPD worker.",
+        )
+        parser.add_argument(
+            "--language-only",
+            action="store_true",
+            help="Load only the language model and consume external encoder outputs.",
+        )
+        parser.add_argument(
+            "--encoder-urls",
+            type=str,
+            nargs="+",
+            default=None,
+            help="Static HTTP base URLs of external multimodal encoders.",
+        )
+        parser.add_argument(
+            "--encoder-bootstrap-port",
+            type=int,
+            default=ServerArgs.encoder_bootstrap_port,
+            help="Port for the local Encoder bootstrap server. Setting this enables "
+            "dynamic Encoder registration; 8997 is recommended.",
+        )
+        parser.add_argument(
+            "--encoder-register-urls",
+            type=str,
+            nargs="+",
+            default=None,
+            help="Language-server Encoder bootstrap URLs to register with.",
+        )
+        parser.add_argument(
+            "--encoder-transfer-backend",
+            type=str,
+            choices=["raiden"],
+            default=ServerArgs.encoder_transfer_backend,
+            help="Encoder embedding transfer backend. Only Raiden is supported.",
+        )
+        parser.add_argument(
+            "--encoder-transfer-pool-size",
+            type=int,
+            default=ServerArgs.encoder_transfer_pool_size,
+            help="Number of request slots in each registered Encoder transfer pool.",
+        )
+        parser.add_argument(
+            "--encoder-control-timeout-seconds",
+            type=float,
+            default=ServerArgs.encoder_control_timeout_seconds,
+            help="Timeout for encoder control requests. <=0 disables it.",
+        )
+        parser.add_argument(
+            "--encoder-request-timeout-seconds",
+            type=float,
+            default=ServerArgs.encoder_request_timeout_seconds,
+            help="Timeout for completing an encoder request. <=0 disables it.",
+        )
+        parser.add_argument(
+            "--encoder-max-batch-size",
+            type=int,
+            default=ServerArgs.encoder_max_batch_size,
+            help="Maximum number of requests in one multimodal Encoder batch.",
+        )
+        parser.add_argument(
+            "--encoder-batch-coalesce-ms",
+            type=float,
+            default=ServerArgs.encoder_batch_coalesce_ms,
+            help=(
+                "Maximum time to collect an underfilled multimodal Encoder batch. "
+                "The deadline is per batch and existing backlog dispatches immediately."
+            ),
+        )
+        parser.add_argument(
+            "--encoder-max-inflight-batches",
+            type=int,
+            default=ServerArgs.encoder_max_inflight_batches,
+            help="Completed-preprocess batches buffered ahead of the vision encoder.",
         )
 
         # LoRA
