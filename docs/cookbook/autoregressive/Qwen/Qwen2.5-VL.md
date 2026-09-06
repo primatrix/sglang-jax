@@ -71,7 +71,6 @@ python -u -m sgl_jax.launch_server \
   --max-prefill-tokens 16384 --chunked-prefill-size 4096 \
   --mem-fraction-static 0.9 --page-size 128 \
   --vision-encoder-parallel dp \
-  --mm-io-worker-num 4 \
   --mm-processor-worker-num 16 \
   --random-seed 0 \
   --skip-server-warmup \
@@ -79,6 +78,9 @@ python -u -m sgl_jax.launch_server \
 ```
 
 The regular server recognizes the model's multimodal contract. The separate `--multimodal` staged runtime is used by diffusion recipes and is not needed here.
+
+Each multimodal processor worker loads, decodes, and processes a request's images and videos.
+Set `--mm-processor-worker-num` to control this shared concurrency.
 
 ### 2.4 Configuration Tips
 
@@ -311,7 +313,10 @@ run_task(task_cfg=task_cfg)
 | Cache | Radix Cache disabled; cache flushed before each case |
 | Traffic | 1,000 requests, request rate `inf`, 500 output tokens |
 
-**Serving Flags Used**
+**Serving Flags (current equivalent)**
+
+The measurements above used separate I/O and processor pools. The current implementation
+performs loading and processing in the processor workers; remeasure when comparing performance.
 
 ```bash
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache \
@@ -325,7 +330,7 @@ python -u -m sgl_jax.launch_server \
   --max-prefill-tokens 16384 --chunked-prefill-size 4096 \
   --mem-fraction-static 0.9 --page-size 128 \
   --disable-radix-cache --vision-encoder-parallel dp \
-  --mm-io-worker-num 4 --mm-processor-worker-num 16 \
+  --mm-processor-worker-num 16 \
   --random-seed 0 --host 0.0.0.0 --port 30000
 ```
 

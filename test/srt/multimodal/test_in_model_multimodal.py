@@ -10,6 +10,7 @@ from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
 from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, ScheduleReqsInfo
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.models.qwen2_5_vl import Qwen2_5_VisionTransformer
+from sgl_jax.srt.models.qwen3_vl import Qwen3VLVisionModel
 from sgl_jax.srt.multimodal.common.modality_enum import (
     Modality,
     MultimodalDataItem,
@@ -96,36 +97,53 @@ def _visual(config=None, mesh=None, encoder_tp=False, input_buckets=(32,)):
         )
 
 
-def _items(grids, ranges):
+def _qwen3_visual(config=None, mesh=None, encoder_tp=False, input_buckets=(32,)):
+    mesh = mesh or _mesh()
+    with jax.set_mesh(mesh):
+        return Qwen3VLVisionModel(
+            config
+            or _vision_config(
+                num_position_embeddings=16,
+                deepstack_visual_indexes=[],
+            ),
+            jnp.float32,
+            mesh=mesh,
+            tp=encoder_tp,
+            input_buckets=input_buckets,
+        )
+
+
+def _items(grids, ranges, modality=Modality.IMAGE):
     rows = sum(int(np.prod(grid)) for grid in grids)
     features = np.arange(rows, dtype=np.float32).reshape(rows, 1)
     return QwenVLProcessor._build_items(
         features,
         grids,
         ranges,
-        Modality.IMAGE,
+        modality,
         "image_grid_thw",
     )
 
 
 def _pack_qwen2(visual, items):
-    patches, grid_thw, output_indices = pack_vision_inputs(
+    batch_sharding = visual.specs.sharding(visual.specs.batch_axis)
+    num_lanes = encoder_num_lanes(visual.mesh, visual.vision_tp)
+    patches, output_indices, grid_thw = pack_vision_inputs(
         items,
-        num_lanes=encoder_num_lanes(visual.mesh, visual.vision_tp),
+        num_lanes=num_lanes,
         buckets=visual.input_buckets,
         merge_unit=visual.spatial_merge_unit,
-        dtype=visual.dtype,
+        input_sharding=batch_sharding,
     )
-    batch_sharding = visual.specs.sharding(visual.specs.batch_axis)
-    patches = jax.device_put(patches, batch_sharding)
-    return patches, grid_thw, output_indices
+    # Tests inspecting per-lane metadata use the host planning layout.
+    return patches.reshape(num_lanes, -1, visual.patch_dim), grid_thw, output_indices
 
 
 def _qwen2_metadata(visual, grid_thw, capacity):
-    return jax.device_put(
-        visual._build_metadata(grid_thw, capacity),
-        visual.specs.sharding(visual.specs.batch_axis),
+    metadata = visual.prepare_metadata(
+        grid_thw, capacity, sharding=visual.specs.sharding(visual.specs.batch_axis)
     )
+    return visual._metadata_views(metadata.reshape(len(grid_thw), -1), capacity)
 
 
 def _run_grid_vision(visual, items):
@@ -137,7 +155,8 @@ def _run_grid_vision(visual, items):
         buckets=visual.input_buckets,
         merge_unit=visual.spatial_merge_unit,
         rope_type="rope_3d",
-        dtype=visual.dtype,
+        input_sharding=visual.specs.sharding(visual.specs.batch_axis),
+        output_sharding=visual.specs.sharding(),
     )
 
 
@@ -227,15 +246,17 @@ def _schedule_batch(req, model_config=None):
 def _assert_vision_precompile(visual):
     calls = []
 
-    def encode(patches, grid_thw):
-        calls.append((patches.shape, np.asarray(grid_thw).tolist()))
-        return jnp.zeros(
-            (
-                patches.shape[0],
-                patches.shape[1] // visual.spatial_merge_unit,
-                1,
-            )
-        )
+    def encode(patches, metadata):
+        sharding = visual.specs.sharding(visual.specs.batch_axis)
+        for value in (patches, metadata):
+            assert isinstance(value, jax.Array)
+            assert value.ndim == 1
+            assert value.sharding.is_equivalent_to(sharding, ndim=1)
+        assert metadata.dtype == jnp.int32
+        calls.append((patches.shape, metadata.shape))
+        num_lanes = encoder_num_lanes(visual.mesh, visual.vision_tp)
+        capacity = patches.size // (num_lanes * visual.patch_dim)
+        return jnp.zeros((num_lanes * capacity // visual.spatial_merge_unit, 1))
 
     with patch.object(type(visual), "encode", side_effect=encode):
         visual.precompile()
@@ -251,9 +272,76 @@ def test_qwen2_vision_precompile_warms_configured_buckets():
         deepstack_visual_indexes=[],
     )
     assert _assert_vision_precompile(_visual(config=config, input_buckets=(4, 8))) == [
-        ((1, 4, 1), [[[1, 2, 2]]]),
-        ((1, 8, 1), [[[1, 2, 4]]]),
+        ((4,), (14,)),
+        ((8,), (26,)),
     ]
+
+
+def test_qwen3_vision_precompile_uses_flat_buffers():
+    config = _vision_config(
+        spatial_merge_size=2,
+        num_position_embeddings=16,
+        deepstack_visual_indexes=[],
+    )
+    assert _assert_vision_precompile(_qwen3_visual(config, input_buckets=(4, 8))) == [
+        ((4,), (42,)),
+        ((8,), (83,)),
+    ]
+
+
+def test_qwen3_vision_deepstack_stays_token_major():
+    config = _vision_config(
+        spatial_merge_size=2,
+        num_position_embeddings=16,
+        depth=1,
+        deepstack_visual_indexes=[0],
+    )
+    visual = _qwen3_visual(config, input_buckets=(4,))
+    item = _items([(1, 2, 2)], [(0, 1)])[0]
+    patch_embed_type = type(visual.patch_embed)
+
+    with patch.object(
+        patch_embed_type,
+        "__call__",
+        autospec=True,
+        side_effect=patch_embed_type.__call__,
+    ) as patch_embed:
+        output = _run_grid_vision(visual, [item])
+
+    assert patch_embed.call_args.args[1].ndim == 2
+    assert output.shape == (1, 8)
+    assert output.sharding.is_fully_replicated
+
+
+@pytest.mark.parametrize("encoder_tp", [False, True])
+def test_qwen3_flat_vision_matches_across_encoder_sharding(encoder_tp):
+    config = _vision_config(
+        hidden_size=8,
+        intermediate_size=16,
+        num_heads=2,
+        spatial_merge_size=2,
+        num_position_embeddings=16,
+        depth=1,
+        deepstack_visual_indexes=[0],
+        out_hidden_size=8,
+    )
+    items = _items(
+        [(1, 2, 2)] * 4,
+        [(0, 1), (1, 2), (2, 3), (3, 4)],
+    )
+    reference = _qwen3_visual(config, input_buckets=(16,))
+    visual = _qwen3_visual(
+        config,
+        _mesh(dp=2, tp=2),
+        encoder_tp,
+        input_buckets=(8,),
+    )
+
+    expected = np.asarray(_run_grid_vision(reference, items))
+    actual = np.asarray(_run_grid_vision(visual, items))
+
+    np.testing.assert_allclose(actual[: len(expected)], expected, rtol=2e-5, atol=2e-5)
+    np.testing.assert_array_equal(actual[len(expected) :], 0)
 
 
 @pytest.mark.parametrize("encoder_tp", [False, True])
@@ -648,7 +736,13 @@ def test_mixed_chunk_keeps_multimodal_items():
     assert task.merge_mappings == (_MergeMapping(0, 1, 1),)
 
 
-def test_qwen2_vision_metadata_is_bucket_stable():
+def _assert_no_grid_layout_planning(jaxpr):
+    text = str(jaxpr)
+    for primitive in ("cumsum", "repeat", "scatter", "sort"):
+        assert f"= {primitive}[" not in text
+
+
+def test_qwen2_metadata_is_host_planned_and_bucket_stable():
     config = _vision_config(
         spatial_merge_size=2,
         window_size=4,
@@ -659,16 +753,76 @@ def test_qwen2_vision_metadata_is_bucket_stable():
     first = _items([(1, 4, 6)], [(0, 6)])
     patches, grid_thw, output_indices = _pack_qwen2(visual, first)
     metadata = _qwen2_metadata(visual, grid_thw, patches.shape[1])
-    _, position_ids, window_attn, full_attn = metadata
+    indices, position_ids, window_cu_seqlens, full_cu_seqlens = metadata
+    indices = np.asarray(indices)
+    position_ids = np.asarray(position_ids)
 
-    assert window_attn.max_seq_len == 16
-    assert full_attn.max_seq_len == 32
     np.testing.assert_array_equal(output_indices[:6], np.arange(6))
     assert position_ids.shape == (1, 32, 2)
+    np.testing.assert_array_equal(indices[0, :, 0], [0, 1, 3, 4, 2, 5, 6, 7])
+    np.testing.assert_array_equal(indices[0, :, 1], [0, 1, 4, 2, 3, 5, 6, 7])
+    np.testing.assert_array_equal(
+        position_ids[0, [0, 4, 8, 12, 16, 20]],
+        [[0, 0], [0, 2], [2, 0], [2, 2], [0, 4], [2, 4]],
+    )
+    np.testing.assert_array_equal(
+        np.asarray(window_cu_seqlens)[0], [0, 16, 24, 24, 24, 24, 24, 24, 24]
+    )
+    np.testing.assert_array_equal(
+        np.asarray(full_cu_seqlens)[0], [0, 24, 24, 24, 24, 24, 24, 24, 24]
+    )
+    np.testing.assert_array_equal(
+        _qwen2_metadata(visual, np.zeros((1, 1, 3), dtype=np.int32), 32)[2],
+        np.zeros((1, 9), dtype=np.int32),
+    )
+    backend_type = type(visual.blocks[0].attn.attn_backend)
+    with patch.object(
+        backend_type, "__call__", autospec=True, side_effect=backend_type.__call__
+    ) as attention:
+        flat_metadata = visual.prepare_metadata(
+            grid_thw, 32, sharding=visual.specs.sharding(visual.specs.batch_axis)
+        )
+        with jax.set_mesh(visual.mesh):
+            _assert_no_grid_layout_planning(
+                jax.make_jaxpr(visual.encode)(patches.reshape(-1), flat_metadata)
+            )
+    bounds = [call.kwargs["max_seq_len"] for call in attention.call_args_list]
+    assert all(isinstance(bound, int) for bound in bounds)
+    assert bounds == [16, 32]
 
-    jax.block_until_ready(visual.encode(patches, grid_thw))
-    cache_size = visual._encode_jit._cache_size()
+    jax.block_until_ready(_run_grid_vision(visual, first))
+    cache_size = visual.encode._cache_size()
     second = _items([(1, 4, 4), (2, 2, 2)], [(0, 4), (4, 6)])
     second_patches, second_grid_thw, _ = _pack_qwen2(visual, second)
-    jax.block_until_ready(visual.encode(second_patches, second_grid_thw))
-    assert visual._encode_jit._cache_size() == cache_size
+    second_metadata = _qwen2_metadata(visual, second_grid_thw, second_patches.shape[1])
+    np.testing.assert_array_equal(
+        np.asarray(second_metadata[3])[0],
+        [0, 16, 20, 24, 24, 24, 24, 24, 24],
+    )
+    jax.block_until_ready(_run_grid_vision(visual, second))
+    assert visual.encode._cache_size() == cache_size
+
+
+@pytest.mark.parametrize("encoder_tp", [False, True])
+def test_packed_vision_matches_individual_images_with_empty_lanes(encoder_tp):
+    config = _vision_config(
+        hidden_size=8,
+        num_heads=2,
+        spatial_merge_size=2,
+        window_size=4,
+        depth=2,
+        fullatt_block_indexes=[1],
+    )
+    reference = _visual(config, input_buckets=(32,))
+    visual = _visual(config, _mesh(dp=2, tp=2), encoder_tp, input_buckets=(32,))
+    items = _items([(1, 2, 2), (1, 4, 6)], [(0, 1), (1, 7)])
+    items += _items([(2, 2, 4)], [(0, 4)], Modality.VIDEO)
+    expected = np.concatenate(
+        [
+            np.asarray(_run_grid_vision(reference, [item]))[: len(item.feature) // 4]
+            for item in items
+        ]
+    )
+    actual = np.asarray(_run_grid_vision(visual, items))
+    np.testing.assert_allclose(actual[: len(expected)], expected, rtol=2e-5, atol=2e-5)
+    np.testing.assert_array_equal(actual[len(expected) :], 0)
