@@ -517,21 +517,36 @@ def create_encoder_client(
     sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
     transfer_timeout = server_args.encoder_request_timeout_seconds
 
-    from sgl_jax.raiden import require_raiden_preloaded
-    from sgl_jax.srt.disaggregation.encoder.raiden_receiver import RaidenReceiverBackend
-    from sgl_jax.srt.disaggregation.host_ip import resolve_host_ip
+    if server_args.simulate_compute:
+        from sgl_jax.srt.disaggregation.encoder.sim_transfer import SimReceiverBackend
 
-    require_raiden_preloaded()
-    if transfer_timeout <= 0:
-        raise ValueError("Raiden requires a positive encoder request timeout")
-    host = resolve_host_ip(server_args.disaggregation_host_ip)
-    backend = RaidenReceiverBackend(
-        host=host,
-        sharding=sharding,
-        parallelism=channel_number,
-        pool_size=server_args.encoder_transfer_pool_size,
-        transfer_timeout_s=transfer_timeout,
-    )
+        host = server_args.disaggregation_host_ip or "127.0.0.1"
+        backend = SimReceiverBackend(
+            sharding,
+            server_args.simulate_transfer_ms_per_mb,
+            server_args.simulate_network_rtt_ms,
+            parallelism=channel_number,
+            pool_size=server_args.encoder_transfer_pool_size,
+            transfer_timeout_s=transfer_timeout,
+        )
+    else:
+        from sgl_jax.raiden import require_raiden_preloaded
+        from sgl_jax.srt.disaggregation.encoder.raiden_receiver import (
+            RaidenReceiverBackend,
+        )
+        from sgl_jax.srt.disaggregation.host_ip import resolve_host_ip
+
+        require_raiden_preloaded()
+        if transfer_timeout <= 0:
+            raise ValueError("Raiden requires a positive encoder request timeout")
+        host = resolve_host_ip(server_args.disaggregation_host_ip)
+        backend = RaidenReceiverBackend(
+            host=host,
+            sharding=sharding,
+            parallelism=channel_number,
+            pool_size=server_args.encoder_transfer_pool_size,
+            transfer_timeout_s=transfer_timeout,
+        )
 
     control_timeout = server_args.encoder_control_timeout_seconds
     return EncoderClient(

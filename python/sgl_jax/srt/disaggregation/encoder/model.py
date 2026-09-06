@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -67,31 +68,41 @@ class MMEncoder:
         if not self.model_config.is_multimodal:
             raise ValueError("--encoder-only requires an in-model multimodal architecture")
 
+        # CPU simulation: skip the real vision encoder forward in ``encode``
+        # and emit a modeled sleep + zero embedding of the correct shape/dtype.
+        self._simulate_compute = server_args.simulate_compute
+        self._sim_encoder_base_ms = server_args.simulate_compute_encoder_base_ms
+        self._sim_encoder_ms_per_token = server_args.simulate_compute_encoder_ms_per_token
         self._max_batch_size = max(1, int(server_args.encoder_max_batch_size))
         self._precompile = not server_args.disable_precompile
 
         config = self.model_config.hf_config
         config.vision_encoder_parallel = server_args.vision_encoder_parallel
         config.precompile_vision_patch_paddings = server_args.precompile_vision_patch_paddings
-        mesh = create_device_mesh(
-            ici_parallelism=[
-                server_args.dp_size,
-                server_args.tp_size // server_args.dp_size,
-            ],
-            dcn_parallelism=[1, 1],
-            device_indexes=server_args.device_indexes,
-        )
-        self.model = get_model(
-            model_config=self.model_config,
-            load_config=LoadConfig(
-                load_format=server_args.load_format,
-                download_dir=server_args.download_dir,
-            ),
-            mesh=mesh,
-        )
-        if not server_args.disable_precompile:
-            logger.info("Precompiling multimodal encoder")
-            self.model.precompile_multimodal()
+        if self._simulate_compute:
+            # ``encode()`` replaces get_feature() with a sleep + zeros, so the
+            # vision tower is never executed — don't build it or allocate weights.
+            self.model = None
+        else:
+            mesh = create_device_mesh(
+                ici_parallelism=[
+                    server_args.dp_size,
+                    server_args.tp_size // server_args.dp_size,
+                ],
+                dcn_parallelism=[1, 1],
+                device_indexes=server_args.device_indexes,
+            )
+            self.model = get_model(
+                model_config=self.model_config,
+                load_config=LoadConfig(
+                    load_format=server_args.load_format,
+                    download_dir=server_args.download_dir,
+                ),
+                mesh=mesh,
+            )
+            if not server_args.disable_precompile:
+                logger.info("Precompiling multimodal encoder")
+                self.model.precompile_multimodal()
 
         tokenizer_path = server_args.tokenizer_path
         tokenizer_subdir = resolve_tokenizer_subdir(server_args.model_path, tokenizer_path)
@@ -154,13 +165,34 @@ class MMEncoder:
     ) -> PackedEncoderOutput:
         modality = batch.modality
         processed = batch.inputs
-        with jax.profiler.TraceAnnotation(f"mm_encode:{modality.name}:{len(processed)}"):
-            items = [item for mm_inputs in processed for item in mm_inputs.mm_items]
-            target = self.model.thinker if hasattr(self.model, "thinker") else self.model
-            get_feature = getattr(target, f"get_{modality.name.lower()}_feature", None)
-            if get_feature is None:
-                raise ValueError(f"model has no {modality.name} encoder")
-            packed = get_feature(items)
+        if self._simulate_compute:
+            token_count_total = sum(batch.token_counts)
+            with jax.profiler.TraceAnnotation(
+                f"mm_encode:{modality.name}:{len(processed)}"
+            ) as trace:
+                if trace.is_enabled():
+                    trace.set_metadata(start_ns=time.time_ns())
+                sleep_ms = (
+                    self._sim_encoder_base_ms + self._sim_encoder_ms_per_token * token_count_total
+                )
+                if sleep_ms > 0:
+                    time.sleep(sleep_ms / 1000.0)
+                if trace.is_enabled():
+                    trace.set_metadata(end_ns=time.time_ns())
+            packed = jax.device_put(
+                np.zeros(
+                    (token_count_total, self.model_config.hidden_size),
+                    dtype=self.model_config.dtype,
+                )
+            )
+        else:
+            with jax.profiler.TraceAnnotation(f"mm_encode:{modality.name}:{len(processed)}"):
+                items = [item for mm_inputs in processed for item in mm_inputs.mm_items]
+                target = self.model.thinker if hasattr(self.model, "thinker") else self.model
+                get_feature = getattr(target, f"get_{modality.name.lower()}_feature", None)
+                if get_feature is None:
+                    raise ValueError(f"model has no {modality.name} encoder")
+                packed = get_feature(items)
         if sum(batch.token_counts) > packed.shape[0]:
             raise ValueError(f"incomplete {modality.name} encoder output")
         return PackedEncoderOutput(batch, packed)
@@ -213,7 +245,7 @@ class MMEncoder:
         processed: list[MultimodalInputs],
         token_counts: tuple[int, ...],
     ) -> tuple[tuple[jax.ShapeDtypeStruct, tuple[int, ...]], ...]:
-        if not self._precompile:
+        if not self._precompile or self._simulate_compute:
             return ()
         target = self.model.thinker if hasattr(self.model, "thinker") else self.model
         planner = getattr(target, "get_multimodal_embedding_packed_capacity", None)

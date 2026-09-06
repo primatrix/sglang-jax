@@ -909,6 +909,7 @@ def test_model_runner_forward_embeds_multimodal_inputs():
     expected = ("forwarded", 0)
     runner = SimpleNamespace(
         forward_pass_id=0,
+        server_args=SimpleNamespace(simulate_compute=False),
         model=model,
         embedding_pool=embedding_pool,
         _forward_raw=lambda batch, metadata: expected,

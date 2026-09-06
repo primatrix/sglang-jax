@@ -4,6 +4,7 @@ import contextlib
 import dataclasses
 import logging
 import os
+import queue
 from functools import partial
 
 import jax
@@ -44,6 +45,7 @@ from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
     _build_non_hybrid_memory_pools,
 )
+from sgl_jax.srt.model_executor.simulation import SimulatedDevice, SimulationMixin
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.models.registry import ModelRegistry
 from sgl_jax.srt.multimodal.in_model.embedding_pool import EmbeddingPool
@@ -100,7 +102,7 @@ def _maybe_apply_recurrent_cow(forward_batch, memory_pools):
     return type(memory_pools)(**pools)
 
 
-class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
+class ModelRunner(SimulationMixin, ModelRunnerKVCacheMixin, BaseModelRunner):
     """ModelRunner runs the forward passes of the models."""
 
     def __init__(
@@ -187,6 +189,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
         # Load the model
         self.sampler = Sampler(nnx.Rngs(server_args.random_seed), mesh=self.mesh)
+        # Background "device" for --simulate-compute: forward is dispatched here
+        # (returns instantly) and the host blocks on completion only at result
+        # resolution, preserving host/device overlap.
+        self._sim_device = SimulatedDevice() if server_args.simulate_compute else None
+        self._sim_completions: queue.Queue = queue.Queue()
+        self._sim_precompiling = False
         total_device_memory = self.get_available_device_memory()
         self.init_attention_backend()
         self.load_model()
@@ -274,6 +282,10 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         )
 
     def initialize_jit(self):
+        if self.server_args.simulate_compute:
+            self.initialize_simulation_jit()
+            return
+
         model_def, model_state = nnx.split(self.model)
         # note export for external modification
         self.model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
@@ -603,6 +615,19 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             with jax.set_mesh(self.mesh):
                 init_expert_location_metadata(self.server_args, self.model_config)
 
+        if self.server_args.simulate_compute:
+            # The simulator replaces the forward with a sleep, so no weights are
+            # ever executed. Skip building the model entirely — the KV pool and
+            # attention backend only need the config set up above. This keeps the
+            # process tiny (no dummy weight allocation) and starts instantly.
+            self.model = None
+            self.sliding_window_size = self.model_config.sliding_window
+            self.dtype = self.model_config.dtype
+            self.start_layer = 0
+            self.end_layer = self.model_config.num_hidden_layers
+            self.num_effective_layers = self.end_layer - self.start_layer
+            return
+
         self.model = self.model_loader.load_model(
             model_config=self.model_config,
         )
@@ -857,6 +882,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
     ):
+        if self.server_args.simulate_compute:
+            return self.simulation_forward(forward_batch)
+
         cache_miss_count = 0
         import jax._src.test_util as jtu
 
@@ -885,6 +913,14 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
     def forward_and_sample(self, forward_batch, logits_metadata, sampling_metadata, future_map):
         import jax._src.test_util as jtu
+
+        if self.server_args.simulate_compute:
+            # The fused run_model+sample path is Pathways-PD only and is never
+            # taken by the E+L combined server that --simulate-compute targets.
+            raise NotImplementedError(
+                "--simulate-compute does not support the Pathways-PD fused decode "
+                "path; run the standard (non-fused) worker."
+            )
 
         self.forward_pass_id += 1
         # NOTE: no use_mesh here (unlike _forward_raw): wrapping sampler in the
@@ -926,7 +962,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.forward_pass_id += 1
         precision_tracer.start_batch_trace(forward_batch.bid)
         precision_tracer.set_current_forward_pass_id(self.forward_pass_id)
-        if forward_batch.multimodal_batch is not None:
+        if forward_batch.multimodal_batch is not None and not self.server_args.simulate_compute:
             input_embedding, deepstack = embed_multimodal_inputs(
                 multimodal_batch=forward_batch.multimodal_batch,
                 input_ids=forward_batch.input_ids,

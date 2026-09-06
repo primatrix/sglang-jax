@@ -267,6 +267,7 @@ class ModelWorker:
             self.model_config.is_multimodal
             and ModelRegistry.is_in_model_multimodal(self.model_config.hf_config.architectures)
             and not use_multistage_multimodal
+            and not server_args.simulate_compute
         )
         self.compilation_manager = CompilationManager(
             server_args=server_args,
@@ -337,12 +338,13 @@ class ModelWorker:
             prepare_lora,
             future_token_ids_map,
         )
-        if only == "extend":
-            self.compilation_manager._precompile_extend(*args)
-        elif only == "decode":
-            self.compilation_manager._precompile_decode(*args)
-        else:
-            self.compilation_manager.precompile_all(*args)
+        with self.model_runner.simulation_precompile():
+            if only == "extend":
+                self.compilation_manager._precompile_extend(*args)
+            elif only == "decode":
+                self.compilation_manager._precompile_decode(*args)
+            else:
+                self.compilation_manager.precompile_all(*args)
 
     def set_forward_metadata(self, model_worker_batch: ModelWorkerBatch):
         self.model_runner.attn_backend.forward_metadata = (
@@ -470,9 +472,20 @@ class ModelWorker:
         materializes logprob fields."""
         return (
             self._pd_fuse_sample
+            and not self.server_args.simulate_compute
             and model_worker_batch.forward_mode.is_decode()
             and not model_worker_batch.return_logprob
             and not model_worker_batch.return_output_logprob_only
+        )
+
+    def _use_simulated_sampling(self, model_worker_batch: ModelWorkerBatch) -> bool:
+        """Whether a simulated batch can skip full logits and the JAX sampler."""
+        grammars = getattr(model_worker_batch.sampling_info, "grammars", None)
+        return (
+            self.server_args.simulate_compute
+            and not model_worker_batch.return_logprob
+            and not model_worker_batch.return_output_logprob_only
+            and not any(grammar is not None for grammar in grammars or ())
         )
 
     def forward_batch_generation(
@@ -500,7 +513,9 @@ class ModelWorker:
                 model_worker_batch
             )
 
-        if sampling_metadata is None:
+        use_simulated_sampling = self._use_simulated_sampling(model_worker_batch)
+
+        if sampling_metadata is None and not use_simulated_sampling:
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
                 model_worker_batch,
                 0,
@@ -542,6 +557,21 @@ class ModelWorker:
             logits_metadata=logits_metadata,
         )
 
+        save_logits_file_info = os.getenv("DUMP_LAST_LAYER_LOGITS_FILENAMES", None)
+
+        # Logprob and grammar-constrained requests retain the old simulated
+        # behavior: materialize the full vocabulary and run the real sampler
+        # below. Logits dumps also keep their historical full-vocab shape.
+        # Ordinary simulation keeps the one-column placeholder returned by
+        # ModelRunner.forward().
+        if self.server_args.simulate_compute and (
+            not use_simulated_sampling or save_logits_file_info
+        ):
+            logits_output = self.model_runner.simulation_logits_output(
+                forward_batch,
+                full_vocab=True,
+            )
+
         self.dump_topk_ids(layers_topk_ids, model_worker_batch)
 
         if launch_done is not None:
@@ -555,7 +585,6 @@ class ModelWorker:
         )
 
         # SAVE last layer logits
-        save_logits_file_info = os.getenv("DUMP_LAST_LAYER_LOGITS_FILENAMES", None)
         if save_logits_file_info:
             save_logits_with_txt(
                 logits_output.next_token_logits[: model_worker_batch.real_bs, :],
@@ -565,6 +594,9 @@ class ModelWorker:
 
         if skip_sample:
             next_token_ids_device = None
+            new_logits_output = None
+        elif use_simulated_sampling:
+            next_token_ids_device = self.model_runner.simulation_sample(model_worker_batch.seq_lens)
             new_logits_output = None
         else:
             import jax._src.test_util as jtu

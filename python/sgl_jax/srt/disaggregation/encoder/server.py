@@ -23,6 +23,7 @@ from sgl_jax.srt.disaggregation.encoder.raiden_transfer import (
 )
 from sgl_jax.srt.disaggregation.encoder.runtime import EncoderRuntime
 from sgl_jax.srt.disaggregation.encoder.scheduler import DisaggEncoderScheduler
+from sgl_jax.srt.disaggregation.encoder.sim_transfer import SimEncoderServerTransfer
 from sgl_jax.srt.disaggregation.host_ip import resolve_host_ip
 from sgl_jax.srt.multimodal.common.modality_enum import Modality
 from sgl_jax.srt.server_args import ServerArgs
@@ -44,12 +45,14 @@ class EncoderServer:
         batch_coalesce_ms: float = 0.0,
         max_inflight_batches: int = 1,
         request_timeout: float | None = 300.0,
+        network_rtt_ms: float = 0.0,
         enable_time_stats: bool = False,
     ) -> None:
         encoder_register_urls = list(encoder_register_urls or ())
         if bool(encoder_register_urls) != bool(advertise_url):
             raise ValueError("encoder_register_urls and advertise_url must be configured together")
 
+        self._network_rtt_s = max(0.0, float(network_rtt_ms)) / 1000.0
         self.runtime = EncoderRuntime(
             encoder,
             transfer,
@@ -186,6 +189,9 @@ class EncoderServer:
     async def encode(self, request: Request) -> dict[str, Any]:
         if not isinstance(request, dict):
             request = orjson.loads(await request.body())
+        # Model the language->encoder network hop (loopback has none).
+        if self._network_rtt_s:
+            await asyncio.sleep(self._network_rtt_s)
         try:
             data = await self.scheduler.submit(request)
         except Exception as exc:
@@ -286,13 +292,25 @@ def launch(server_args: ServerArgs) -> None:
     set_uvicorn_logging_configs()
     encoder = MMEncoder(server_args)
     try:
-        host_ip = resolve_host_ip(server_args.disaggregation_host_ip)
-        transfer = RaidenEncoderServerTransfer(
-            host_ip,
-            parallelism=server_args.disaggregation_channel_number,
-            pool_size=server_args.encoder_transfer_pool_size,
-            timeout_s=server_args.encoder_request_timeout_seconds,
-        )
+        if server_args.simulate_compute:
+            # Sim transfer needs no routable peer IP; bind/advertise on loopback.
+            host_ip = server_args.disaggregation_host_ip or "127.0.0.1"
+            transfer = SimEncoderServerTransfer(
+                setup_ms=server_args.simulate_transfer_setup_ms,
+                parallelism=server_args.disaggregation_channel_number,
+                pool_size=server_args.encoder_transfer_pool_size,
+                timeout_s=server_args.encoder_request_timeout_seconds,
+                ms_per_mb=server_args.simulate_transfer_ms_per_mb,
+                rtt_ms=server_args.simulate_network_rtt_ms,
+            )
+        else:
+            host_ip = resolve_host_ip(server_args.disaggregation_host_ip)
+            transfer = RaidenEncoderServerTransfer(
+                host_ip,
+                parallelism=server_args.disaggregation_channel_number,
+                pool_size=server_args.encoder_transfer_pool_size,
+                timeout_s=server_args.encoder_request_timeout_seconds,
+            )
         advertise_host = f"[{host_ip}]" if ":" in host_ip else host_ip
         advertise_url = (
             f"http://{advertise_host}:{server_args.port}"
@@ -311,6 +329,9 @@ def launch(server_args: ServerArgs) -> None:
             batch_coalesce_ms=server_args.encoder_batch_coalesce_ms,
             max_inflight_batches=server_args.encoder_max_inflight_batches,
             request_timeout=server_args.encoder_request_timeout_seconds,
+            network_rtt_ms=(
+                server_args.simulate_network_rtt_ms if server_args.simulate_compute else 0.0
+            ),
             enable_time_stats=server_args.enable_request_time_stats_logging,
         )
         server.run(server_args.host, server_args.port)
