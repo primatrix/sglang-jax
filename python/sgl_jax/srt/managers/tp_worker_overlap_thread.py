@@ -22,6 +22,7 @@ from sgl_jax.srt.managers.utils import (
     set_future_token_ids,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.request_time_stats import mark_request_time_stats
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.utils import get_exception_traceback
@@ -178,7 +179,11 @@ class ModelWorkerClient:
                 next_token_ids.copy_to_host_async()
             self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
 
-    def resolve_last_batch_result(self, launch_done: threading.Event | None = None):
+    def resolve_last_batch_result(
+        self,
+        launch_done: threading.Event | None = None,
+        request_time_stats: list[dict[str, int] | None] | None = None,
+    ):
         """
         This function is called to resolve the last batch result and
         wait for the current batch to be launched. Used in overlap mode.
@@ -237,6 +242,9 @@ class ModelWorkerClient:
             logits_output.input_token_logprobs = np.asarray(async_input_logprobs).tolist()
         if async_hidden_states is not None:
             logits_output.hidden_states = np.asarray(async_hidden_states)
+        # The prior batch is now host-observable. Waiting for the current
+        # batch's launch below is overlap bookkeeping, not prefill compute.
+        mark_request_time_stats(request_time_stats, "language_prefill_done_ns")
         _r2 = _r2a = _r3 = time.perf_counter()
 
         if launch_done is not None:

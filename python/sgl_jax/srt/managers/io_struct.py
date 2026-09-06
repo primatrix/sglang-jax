@@ -9,6 +9,7 @@ import numpy as np
 
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason
 from sgl_jax.srt.multimodal.common.modality_enum import (
+    Modality,
     MultimodalInputs,
     build_radix_input_ids,
     flatten_nested_list,
@@ -89,6 +90,9 @@ class BatchStrOut:
     # The routed experts for each output token
     output_routed_experts: list[str | None] = None
 
+    # Sampled end-to-end request timestamps, aligned with ``rids``.
+    request_time_stats: list[dict[str, int] | None] | None = None
+
 
 @dataclass
 class BatchTokenIDOut:
@@ -135,6 +139,9 @@ class BatchTokenIDOut:
     # The routed experts for each output token
     output_routed_experts: list[np.ndarray] = None
 
+    # Sampled end-to-end request timestamps, aligned with ``rids``.
+    request_time_stats: list[dict[str, int] | None] | None = None
+
 
 @dataclass
 class TokenizedGenerateReqInput:
@@ -172,6 +179,9 @@ class TokenizedGenerateReqInput:
     return_hidden_states: bool = False
     # multimodal inputs (e.g., mrope positions, embeddings)
     mm_inputs: MultimodalInputs | dict | None = None
+    need_wait_for_mm_inputs: bool = False
+    num_items_assigned: dict[Modality, list[int]] | None = None
+    encoder_urls: list[str] | None = None
     # Decode DP rank selected by request routing.
     dp_rank: int | None = None
     # PD disaggregation routing keys.
@@ -184,6 +194,8 @@ class TokenizedGenerateReqInput:
     # to ``rid``; callers that may reuse ``rid`` across retries should
     # provide a per-attempt value to isolate late acks.
     disagg_transfer_id: str | None = None
+    # Present only for deterministically sampled request-time traces.
+    request_time_stats: dict[str, int] | None = None
 
     def __post_init__(self):
         if not self.radix_input_ids and self.input_ids:
@@ -350,6 +362,8 @@ class GenerateReqInput:
     bootstrap_room: list[int] | int | None = None
     disagg_prefill_dp_rank: list[int] | int | None = None
     disagg_transfer_id: list[str] | str | None = None
+    # Sampled HTTP/frontend timestamps propagated through the serving pipeline.
+    request_time_stats: list[dict[str, int] | None] | dict[str, int] | None = None
 
     def contains_mm_input(self) -> bool:
         return (
@@ -582,11 +596,22 @@ class GenerateReqInput:
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
             input_embeds=self.input_embeds[i] if self.input_embeds is not None else None,
-            image_data=self.image_data[i] if self.image_data is not None else None,
-            video_data=self.video_data[i] if self.video_data is not None else None,
-            audio_data=self.audio_data[i] if self.audio_data is not None else None,
+            image_data=(
+                self.image_data[i] if isinstance(self.image_data, list) else self.image_data
+            ),
+            video_data=(
+                self.video_data[i] if isinstance(self.video_data, list) else self.video_data
+            ),
+            audio_data=(
+                self.audio_data[i] if isinstance(self.audio_data, list) else self.audio_data
+            ),
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
+            request_time_stats=(
+                self.request_time_stats[i]
+                if isinstance(self.request_time_stats, list)
+                else self.request_time_stats
+            ),
             return_logprob=self.return_logprob[i],
             logprob_start_len=self.logprob_start_len[i],
             top_logprobs_num=self.top_logprobs_num[i],

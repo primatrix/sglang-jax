@@ -14,6 +14,7 @@ from sgl_jax.srt.managers.io_struct import AbortReq, BatchTokenIDOut
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 from sgl_jax.srt.mem_cache.common import release_kv_cache
 from sgl_jax.srt.precision_tracer import precision_tracer
+from sgl_jax.srt.request_time_stats import mark_request_time_stats
 from sgl_jax.srt.speculative.overlap_utils import (
     resolve_spec_prefill_token_ids,
     use_legacy_eagle3_non_overlap,
@@ -99,6 +100,17 @@ def _materialize_input_token_logprobs(input_token_logprobs, lens_per_dp: list[in
     return tuple(values)
 
 
+def _request_time_stats_for_batch(batch: ScheduleBatch) -> list[dict[str, int]]:
+    """Return only sampled request timing dictionaries for a scheduler batch."""
+
+    return [
+        stats
+        for info in batch.reqs_info
+        for req in info.reqs or ()
+        if (stats := getattr(req, "encoder_timing", None)) is not None
+    ]
+
+
 class SchedulerOutputProcessorMixin:
     """
     This class implements the output processing logic for Scheduler.
@@ -150,6 +162,7 @@ class SchedulerOutputProcessorMixin:
         skip_stream_reqs: set = set()
 
         assert self.is_generation
+        request_time_stats = _request_time_stats_for_batch(batch)
         (
             logits_output,
             next_token_ids,
@@ -166,11 +179,14 @@ class SchedulerOutputProcessorMixin:
         if self.enable_overlap and not self.pd:
             if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
                 next_token_ids = resolve_spec_prefill_token_ids(result)
+                self._mark_encoder_batch(batch, "language_prefill_done_ns")
                 if launch_done is not None:
                     launch_done.wait()
             else:
                 logits_output, next_token_ids, cache_miss_count = (
-                    self.tp_worker.resolve_last_batch_result(launch_done)
+                    self.tp_worker.resolve_last_batch_result(
+                        launch_done, request_time_stats=request_time_stats
+                    )
                 )
         else:
             # Move next_token_ids and logprobs to cpu
@@ -182,6 +198,9 @@ class SchedulerOutputProcessorMixin:
                 logits_output.next_token_logprobs = jax.device_get(
                     logits_output.next_token_logprobs
                 ).astype(float)
+
+        # Record host-observed completion; this includes dispatch and result retrieval.
+        self._mark_encoder_batch(batch, "language_prefill_done_ns")
 
         # Compact the per-DP padded scalar input_token_logprobs so the logprob_pt
         # walk below stays aligned. Runs for overlap (resolve_last_batch_result
@@ -816,6 +835,7 @@ class SchedulerOutputProcessorMixin:
         spec_accepted_tokens = []
         output_hidden_states = None
         output_routed_experts = None
+        request_time_stats = []
 
         output_hidden_states_for_mm = None
         if return_logprob:
@@ -876,8 +896,10 @@ class SchedulerOutputProcessorMixin:
                 if isinstance(req.rid, list):
                     # if rid is a list, extend the list to rids
                     rids.extend(req.rid)
+                    request_time_stats.extend([getattr(req, "encoder_timing", None)] * len(req.rid))
                 else:
                     rids.append(req.rid)
+                    request_time_stats.append(getattr(req, "encoder_timing", None))
                 finished_reasons.append(
                     req.finished_reason.to_json() if req.finished_reason else None
                 )
@@ -997,7 +1019,9 @@ class SchedulerOutputProcessorMixin:
                 output_hidden_states_for_mm,
                 cache_miss_count,
                 output_routed_experts,
+                request_time_stats,
             )
+            mark_request_time_stats(request_time_stats, "scheduler_output_send_start_ns")
             if self._comm_backend is not None:
                 self._comm_backend.send_pyobj(out)
             else:

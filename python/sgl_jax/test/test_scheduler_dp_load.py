@@ -7,6 +7,7 @@ from sgl_jax.srt.managers.scheduler import Scheduler
 def test_sticky_waiting_request_is_included_in_dp_load_snapshots():
     scheduler = object.__new__(Scheduler)
     scheduler.dp_size = 2
+    scheduler.encoder_waiting = {}
     scheduler.running_batch = SimpleNamespace(
         reqs_info=[SimpleNamespace(reqs=[]), SimpleNamespace(reqs=[])]
     )
