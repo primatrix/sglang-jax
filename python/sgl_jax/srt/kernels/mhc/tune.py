@@ -40,31 +40,38 @@ _PLATFORMS = (
         name="TPU v7x",
         device_markers=("tpu7x", "v7x", "tpu v7"),
         lane_width=128,
-        vmem_bytes=64 * 1024 * 1024,
-        # Only ``select_post_backend`` reads this, and only to decide where XLA
-        # starts spilling and Pallas takes over. Deliberately set equal to the
-        # scoped budget rather than guessed higher: understating it makes the
-        # crossover happen sooner, i.e. picks the Pallas post kernel earlier,
-        # which is the path the correctness suite covers and the faster one at
-        # large N. Overstating it would keep us on a spilling XLA post. Worth
-        # measuring, but wrong in the harmless direction until then.
-        xla_vmem_bytes=64 * 1024 * 1024,
+        # v7x has 64 MiB of VMEM in total, but ``vmem_bytes`` is not the total --
+        # it is the *scoped* allocation the compiler grants a Pallas call without
+        # an explicit override, and that is 32 MiB, same as v6e. Measured, from
+        # the compiler refusing a larger tile:
+        #   RESOURCE_EXHAUSTED: E1001: CompileTimeScopedVmemOom: ... Scoped
+        #   allocation with size 37.99M and limit 32.00M exceeded scoped vmem
+        #   limit by 5.99M     (%mhc-collapse-pre, bf16[256,4096])
+        # Setting this to 64 MiB makes the selector choose tiles the compiler
+        # then rejects, which is a hard failure at every token count above 128
+        # rather than a slowdown.
+        vmem_bytes=32 * 1024 * 1024,
+        # Cross-program VMEM left for XLA once the scoped reserve is taken:
+        # total - scoped. That is the relation the v6e entry already encodes
+        # (128 MiB total - 32 MiB scoped = 96 MiB), so v7x is 64 - 32 = 32 MiB.
+        # This is the one field where v7x genuinely differs from v6e, and it
+        # matters: with a third of v6e's cross-program VMEM, XLA starts spilling
+        # the post op above ~681 tokens instead of ~2046, so
+        # ``select_post_backend`` hands over to the Pallas post kernel much
+        # earlier. Getting it wrong is a perf issue, not a correctness one.
+        xla_vmem_bytes=32 * 1024 * 1024,
         xla_vmem_reserve_bytes=64 * 1024,
         # The block lists are candidate sets, not tuned constants -- selection is
         # analytic (``_largest_fitting`` against the closed-form VMEM models
-        # below), so a bigger budget already buys bigger tiles without new
-        # entries. Against the shipped Flash 0731 geometry (hc_mult=4,
-        # hidden=4096, mix_hc=24) at 64 MiB:
-        #   collapse bf16: 256 -> 61.55 MiB fits, 512 -> 121.59 MiB does not,
-        #                  so 256 already saturates the list (v6e stops at 128).
-        #   post bf16:     256 -> 52.04 MiB fits, 512 -> 104.08 MiB does not,
-        #                  likewise saturated (v6e stops at 128).
-        #   gates:         2048 -> 0.81 MiB, never the binding constraint.
-        # The one list that does need a new entry is the f32/HIGHEST collapse
-        # path: 128 costs 41.52 MiB, which does not fit v6e's 32 MiB but does
-        # fit here, so capping at 64 would leave the budget unused.
+        # below). Since the scoped budget matches v6e's, the candidate sets match
+        # too, and the selected tiles come out the same. Against the shipped
+        # Flash 0731 geometry (hc_mult=4, hidden=4096, mix_hc=24) at 32 MiB:
+        #   collapse bf16: 128 -> 31.52 MiB fits, 256 -> 61.55 MiB does not
+        #   post bf16:     128 -> 26.02 MiB fits, 256 -> 52.04 MiB does not
+        #   collapse f32:  64  -> 21.51 MiB fits, 128 -> 41.52 MiB does not
+        #   gates:         2048 -> 0.81 MiB, never the binding constraint
         collapse_blocks=(8, 16, 32, 64, 128, 256),
-        highest_collapse_blocks=(8, 16, 32, 64, 128),
+        highest_collapse_blocks=(8, 16, 32, 64),
         gates_blocks=(512, 1024, 2048),
         post_blocks=(8, 16, 32, 64, 128, 256),
     ),

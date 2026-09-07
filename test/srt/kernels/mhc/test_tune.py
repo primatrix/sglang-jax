@@ -15,6 +15,7 @@ from sgl_jax.srt.kernels.mhc.tune import (
     collapse_vmem_bytes,
     post_vmem_bytes,
     select_collapse_block_tokens,
+    select_post_backend,
     select_post_block_tokens,
 )
 
@@ -60,9 +61,26 @@ def test_unknown_device_still_raises_and_lists_both():
         assert "TPU v7x" in str(exc)
 
 
-def test_v7x_has_twice_the_scoped_budget():
-    assert _platform_parameters(V7X_DEVICE_KIND).vmem_bytes == 64 * MIB
+def test_v7x_scoped_budget_is_32mib_not_its_64mib_total():
+    """v7x has 64 MiB of VMEM in total, but ``vmem_bytes`` is the *scoped*
+    allocation the compiler grants without an override, and that is 32 MiB.
+
+    Measured the hard way: with 64 MiB here, the selector picks tiles the
+    compiler then rejects --
+      CompileTimeScopedVmemOom: Scoped allocation with size 37.99M and limit
+      32.00M exceeded scoped vmem limit by 5.99M
+    -- which fails outright at every token count above 128 rather than merely
+    running slower.
+    """
+    assert _platform_parameters(V7X_DEVICE_KIND).vmem_bytes == 32 * MIB
     assert _platform_parameters(V6E).vmem_bytes == 32 * MIB
+
+
+def test_xla_vmem_is_total_minus_scoped():
+    """The relation the v6e entry already encodes: 128 MiB total - 32 MiB scoped
+    = 96 MiB. v7x's 64 MiB total gives 64 - 32 = 32 MiB."""
+    assert _platform_parameters(V6E).xla_vmem_bytes == 96 * MIB
+    assert _platform_parameters(V7X_DEVICE_KIND).xla_vmem_bytes == 32 * MIB
 
 
 @pytest.mark.parametrize("platform", _PLATFORMS, ids=lambda p: p.name)
@@ -126,27 +144,39 @@ def test_selected_post_block_fits_its_own_budget(platform):
         assert over > platform.vmem_bytes
 
 
-def test_the_bigger_budget_actually_buys_bigger_tiles():
-    """Otherwise the v7x entry would be a no-op relative to v6e."""
-    kw = dict(tokens=8192, hc_mult=HC, hidden=HIDDEN, activation_bytes=2)
-    v6e = select_collapse_block_tokens(V6E, **kw)
-    v7x = select_collapse_block_tokens(V7X_DEVICE_KIND, **kw)
-    assert v7x > v6e, (v6e, v7x)
+def test_v7x_selects_the_same_tiles_as_v6e():
+    """Equal scoped budgets must give equal tile choices. This is the assertion
+    that would have caught the 64 MiB mistake: it picked collapse 256, which the
+    compiler rejects on v7x."""
+    collapse_kw = dict(tokens=8192, hc_mult=HC, hidden=HIDDEN, activation_bytes=2)
+    assert select_collapse_block_tokens(V7X_DEVICE_KIND, **collapse_kw) == 128
+    assert select_collapse_block_tokens(V6E, **collapse_kw) == 128
+
+    highest_kw = dict(
+        tokens=8192, hc_mult=HC, hidden=HIDDEN, activation_bytes=4, highest_precision=True
+    )
+    assert select_collapse_block_tokens(V7X_DEVICE_KIND, **highest_kw) == 64
+    assert select_collapse_block_tokens(V6E, **highest_kw) == 64
 
     post_kw = dict(tokens=8192, hc_mult=HC, hidden=HIDDEN, x_bytes=2, residual_bytes=2)
-    assert select_post_block_tokens(V7X_DEVICE_KIND, **post_kw) > select_post_block_tokens(
-        V6E, **post_kw
-    )
+    assert select_post_block_tokens(V7X_DEVICE_KIND, **post_kw) == 128
+    assert select_post_block_tokens(V6E, **post_kw) == 128
 
 
-def test_highest_precision_collapse_gains_a_candidate_on_v7x():
-    """The one list that needed a new entry: f32 collapse at 128 costs 41.52 MiB,
-    which does not fit v6e's 32 MiB but does fit v7x's 64 MiB."""
-    kw = dict(tokens=8192, hc_mult=HC, hidden=HIDDEN, activation_bytes=4, highest_precision=True)
-    assert select_collapse_block_tokens(V6E, **kw) == 64
-    assert select_collapse_block_tokens(V7X_DEVICE_KIND, **kw) == 128
-    cost_128 = collapse_vmem_bytes(128, hc_mult=HC, hidden=HIDDEN, rows=MIX_HC, activation_bytes=4)
-    assert 32 * MIB < cost_128 <= 64 * MIB
+def test_v7x_hands_the_post_op_to_pallas_much_earlier():
+    """The one place v7x behaves differently, and the reason the entry is not
+    just an alias for v6e: a third of the cross-program VMEM means XLA starts
+    spilling the post op above ~681 tokens instead of ~2046."""
+    kw = dict(hc_mult=HC, hidden=HIDDEN, activation_bytes=2)
+    # Below both thresholds: XLA on both.
+    assert select_post_backend(V6E, tokens=512, **kw) == "xla"
+    assert select_post_backend(V7X_DEVICE_KIND, tokens=512, **kw) == "xla"
+    # Between the two thresholds: this is the divergence.
+    assert select_post_backend(V6E, tokens=1024, **kw) == "xla"
+    assert select_post_backend(V7X_DEVICE_KIND, tokens=1024, **kw) == "pallas"
+    # Above both: Pallas on both.
+    assert select_post_backend(V6E, tokens=2048, **kw) == "pallas"
+    assert select_post_backend(V7X_DEVICE_KIND, tokens=2048, **kw) == "pallas"
 
 
 def test_short_inputs_still_clamp_to_64_on_both_platforms():
