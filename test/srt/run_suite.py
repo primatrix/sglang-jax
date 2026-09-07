@@ -320,6 +320,11 @@ suites = {
             runner="pytest",
         ),
         TestFile(
+            "python/sgl_jax/test/layers/attention/test_deepseek_v4_compressor.py",
+            0.3,
+            runner="pytest",
+        ),
+        TestFile(
             "python/sgl_jax/test/configs/test_deepseek_v4_config.py",
             0.1,
             runner="pytest",
