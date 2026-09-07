@@ -26,6 +26,53 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("page_size", [1, 2])
+def test_c1_small_page_dma(page_size):
+    """Compile the native tiny-page DMA in isolation before full HCA chains."""
+    import jax.experimental.pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    from sgl_jax.srt.kernels.hca.attention import _gather_small_compressed_pages
+
+    cache = (
+        jnp.arange(7 * page_size * 512, dtype=jnp.float32)
+        .reshape(7, 1, page_size, 512)
+        .astype(jnp.bfloat16)
+    )
+    pages = jnp.asarray([4, 1, 5], jnp.int32)
+
+    def kernel(indices, source, output, scratch, semaphore):
+        _gather_small_compressed_pages(
+            source,
+            indices,
+            jnp.int32(0),
+            jnp.int32(3 * page_size - 1),
+            jnp.int32(0),
+            output,
+            scratch,
+            semaphore,
+            page_size=page_size,
+            compressed_tile=128,
+        )
+
+    actual = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=(pl.BlockSpec(memory_space=pltpu.HBM),),
+            out_specs=pl.BlockSpec((128, 512), lambda *_: (0, 0)),
+            scratch_shapes=(pltpu.VMEM((page_size, 512), jnp.bfloat16), pltpu.SemaphoreType.DMA),
+        ),
+        out_shape=jax.ShapeDtypeStruct((128, 512), jnp.bfloat16),
+        interpret=jax.default_backend() != "tpu",
+    )(pages, cache)
+    transferred_pages = (3 * page_size - 1 + page_size - 1) // page_size
+    expected = np.zeros((128, 512), np.float32)
+    rows = np.asarray(cache, np.float32)[np.asarray(pages)[:transferred_pages]].reshape(-1, 512)
+    expected[: rows.shape[0]] = rows
+    np.testing.assert_array_equal(np.asarray(actual, np.float32), expected)
+
+
 class C1Driver:
     def __init__(self, batch, page_size, weights, *, dp=1, tp=1):
         if jax.device_count() < dp * tp:

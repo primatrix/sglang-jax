@@ -284,7 +284,7 @@ class DeepseekV4HCABackend(HCABackend):
         state_view = state.reshape(state.shape[0], 128, 2, self.head_dim)
         window_view = window.reshape(-1, self.page_size // 2, 2, self.head_dim)
         compressed_view = compressed.reshape(
-            compressed.shape[0], self.page_size // 128, 1, self.head_dim
+            compressed.shape[0], 1, self.page_size // 128, self.head_dim
         )
         # These contain views only. Ownership, allocation and update validation
         # stay with C1; the standalone HCA allocator/pools are never constructed.

@@ -143,6 +143,7 @@ def get_hca_kernel_schedule(
             + swa_buffers
             + compressed_buffers
             + score_tile
+            + min(page_size, 2) * head_dim * 2  # small-page DMA scratch
         )
 
     compatible = tuple(
