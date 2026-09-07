@@ -34,6 +34,40 @@ _PLATFORMS = (
         gates_blocks=(512, 1024, 2048),
         post_blocks=(8, 16, 32, 64, 128, 256),
     ),
+    MHCPlatform(
+        # ``device_kind`` reports exactly "TPU7x" (not "TPU v7x"), so "tpu7x" is
+        # the marker that actually fires; the others are spelling insurance.
+        name="TPU v7x",
+        device_markers=("tpu7x", "v7x", "tpu v7"),
+        lane_width=128,
+        vmem_bytes=64 * 1024 * 1024,
+        # Only ``select_post_backend`` reads this, and only to decide where XLA
+        # starts spilling and Pallas takes over. Deliberately set equal to the
+        # scoped budget rather than guessed higher: understating it makes the
+        # crossover happen sooner, i.e. picks the Pallas post kernel earlier,
+        # which is the path the correctness suite covers and the faster one at
+        # large N. Overstating it would keep us on a spilling XLA post. Worth
+        # measuring, but wrong in the harmless direction until then.
+        xla_vmem_bytes=64 * 1024 * 1024,
+        xla_vmem_reserve_bytes=64 * 1024,
+        # The block lists are candidate sets, not tuned constants -- selection is
+        # analytic (``_largest_fitting`` against the closed-form VMEM models
+        # below), so a bigger budget already buys bigger tiles without new
+        # entries. Against the shipped Flash 0731 geometry (hc_mult=4,
+        # hidden=4096, mix_hc=24) at 64 MiB:
+        #   collapse bf16: 256 -> 61.55 MiB fits, 512 -> 121.59 MiB does not,
+        #                  so 256 already saturates the list (v6e stops at 128).
+        #   post bf16:     256 -> 52.04 MiB fits, 512 -> 104.08 MiB does not,
+        #                  likewise saturated (v6e stops at 128).
+        #   gates:         2048 -> 0.81 MiB, never the binding constraint.
+        # The one list that does need a new entry is the f32/HIGHEST collapse
+        # path: 128 costs 41.52 MiB, which does not fit v6e's 32 MiB but does
+        # fit here, so capping at 64 would leave the budget unused.
+        collapse_blocks=(8, 16, 32, 64, 128, 256),
+        highest_collapse_blocks=(8, 16, 32, 64, 128),
+        gates_blocks=(512, 1024, 2048),
+        post_blocks=(8, 16, 32, 64, 128, 256),
+    ),
 )
 
 
