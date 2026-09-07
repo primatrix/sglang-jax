@@ -278,9 +278,9 @@ def _gather_small_compressed_pages(
         transfer = pltpu.make_async_copy(cache_ref.at[physical_page, 0], page_ref, semaphore)
         transfer.start()
         transfer.wait()
-        rows = jnp.arange(compressed_tile, dtype=jnp.int32)
+        rows = jax.lax.broadcasted_iota(jnp.int32, destination.shape, 0)
         values = jnp.tile(page_ref[...], (pages_per_tile, 1))
-        destination[...] = jnp.where((rows // page_size == page)[:, None], values, destination[...])
+        destination[...] = jnp.where(rows // page_size == page, values, destination[...])
         return ()
 
     jax.lax.fori_loop(0, count, copy_page, ())
