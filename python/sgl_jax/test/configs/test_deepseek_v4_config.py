@@ -12,6 +12,7 @@ import pathlib
 import pytest
 
 from sgl_jax.srt.configs.deepseek_v4 import (
+    _FLASH_0731_COMPRESS_RATIOS,
     DeepseekV4Config,
     DeepseekV4LayerType,
     classify_layers,
@@ -48,6 +49,52 @@ def test_shipped_ratios_are_longer_than_the_trunk():
     assert cfg.compress_ratios == FLASH_0731_RATIOS
     assert len(trunk_compress_ratios(cfg)) == 43
     assert trunk_compress_ratios(cfg) == tuple(FLASH_0731_RATIOS[:43])
+
+
+def test_each_config_owns_its_own_compress_ratios():
+    """Default-constructed configs must not share one mutable list.
+
+    Regression: the default branch handed out the module-level list itself, so
+    `a.compress_ratios[2] = 128` reclassified layer 2 for `b` -- and, because the
+    module default had been rewritten, for every config built afterwards too. The
+    failure is silent: a config that was never touched starts reporting C128A for
+    a C4A layer.
+    """
+    a, b = DeepseekV4Config(), DeepseekV4Config()
+    assert a.compress_ratios is not b.compress_ratios
+
+    a.compress_ratios[2] = 128
+    assert classify_layers(a)[2] is DeepseekV4LayerType.C128A  # the edit took effect
+    # ... and reached nothing else: a pre-existing instance,
+    assert classify_layers(b)[2] is DeepseekV4LayerType.C4A
+    # a later-built one,
+    assert classify_layers(DeepseekV4Config())[2] is DeepseekV4LayerType.C4A
+    # and the module-level default.
+    assert FLASH_0731_RATIOS[2] == 4
+    assert list(_FLASH_0731_COMPRESS_RATIOS) == FLASH_0731_RATIOS
+
+
+def test_module_default_ratios_are_immutable():
+    """Belt and braces on the above: a tuple cannot be edited in place at all."""
+    assert isinstance(_FLASH_0731_COMPRESS_RATIOS, tuple)
+    with pytest.raises(TypeError):
+        _FLASH_0731_COMPRESS_RATIOS[0] = 4  # type: ignore[index]
+
+
+def test_explicitly_passed_ratios_are_also_copied():
+    caller_owned = [0, 0, 4, 128, 4]
+    cfg = DeepseekV4Config(num_hidden_layers=5, compress_ratios=caller_owned)
+    assert cfg.compress_ratios is not caller_owned
+    caller_owned[2] = 128
+    assert classify_layers(cfg)[2] is DeepseekV4LayerType.C4A
+
+
+def test_rope_scaling_default_is_per_instance():
+    a, b = DeepseekV4Config(), DeepseekV4Config()
+    assert a.rope_scaling is not b.rope_scaling
+    a.rope_scaling["factor"] = 1
+    assert b.rope_scaling["factor"] == 16
+    assert DeepseekV4Config().rope_scaling["factor"] == 16
 
 
 def test_classification_of_the_shipped_config():
