@@ -262,3 +262,37 @@ def test_sharded_views_reset_reused_slot_and_preserve_other_families(runtime, mo
         MemoryPools(token_to_kv_pool=rt.kv, compressor_state_pool=rt.state).replace_all(replacement)
         assert rt.kv.buffers["c4"][0] is untouched
         assert rt.state.buffers["c128"][0] is update[0]
+
+
+def test_ragged_padding_does_not_restore_active_request_state(monkeypatch):
+    """Exact token count + an empty request row must not clamp onto a live slot."""
+    from sgl_jax.srt.kernels.hca import compressor
+
+    def projection(x, *_args, **_kwargs):
+        return jnp.full((x.shape[0], 2, 512), 3, jnp.float32)
+
+    monkeypatch.setattr(compressor, "hca_project_fused_pallas", projection)
+    schedule = get_hca_kernel_schedule(
+        "TPU7x", page_size=1, max_compressed_entries=1, local_heads=64, head_dim=512
+    )
+    initial = np.full((2, 128, 2, 512), 7, np.float32)
+    initial[1] = 55
+    _, _, updated = compressor.hca_state_pool_update_ragged_fused_pallas.__wrapped__(
+        jnp.zeros((1, 4096)),
+        jnp.asarray(initial),
+        None,
+        None,
+        jnp.ones((512,)),
+        jnp.ones((1, 32)),
+        jnp.zeros((1, 32)),
+        jnp.array([0]),
+        jnp.array([0]),
+        jnp.array([0, 1]),
+        jnp.array([0, 0]),
+        jnp.array([1, 0]),
+        jnp.array([], jnp.int32),
+        schedule=schedule,
+    )
+    np.testing.assert_array_equal(np.asarray(updated)[0, 0], 3)
+    np.testing.assert_array_equal(np.asarray(updated)[0, 1:], 7)
+    np.testing.assert_array_equal(np.asarray(updated)[1], 55)

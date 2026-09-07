@@ -111,7 +111,7 @@ class C1Driver:
     def put(self, value, spec, dtype):
         return jax.device_put(np.asarray(value).astype(dtype), NamedSharding(self.mesh, spec))
 
-    def step(self, stream, query_lengths, mode):
+    def step(self, stream, query_lengths, mode, *, request_padding=0):
         query_lengths = np.asarray(query_lengths, np.int32)
         prefixes = self.lengths.copy()
         ends = prefixes + query_lengths
@@ -148,15 +148,23 @@ class C1Driver:
                 arrays[name].append(np.pad(local, padding))
         arrays = {name: np.concatenate(parts) for name, parts in arrays.items()}
         with jax.set_mesh(self.mesh):
+
+            def pad_requests(values, fill=0):
+                return np.pad(
+                    np.asarray(values).reshape(self.dp, per_rank),
+                    ((0, 0), (0, request_padding)),
+                    constant_values=fill,
+                ).reshape(-1)
+
             worker = SimpleNamespace(
                 forward_mode=mode,
-                req_pool_indices=self.slots,
-                seq_lens=ends,
+                req_pool_indices=pad_requests(self.slots, -1),
+                seq_lens=pad_requests(ends),
                 positions=arrays["positions"],
-                extend_seq_lens=query_lengths,
-                extend_prefix_lens=prefixes,
+                extend_seq_lens=pad_requests(query_lengths),
+                extend_prefix_lens=pad_requests(prefixes),
                 dp_size=self.dp,
-                per_dp_bs_size=per_rank,
+                per_dp_bs_size=per_rank + request_padding,
             )
             self.backend.forward_metadata = self.backend.get_forward_metadata(
                 worker, request_pool=self.requests, allocator=self.allocator
@@ -239,4 +247,21 @@ def test_c1_hca_dp2_tp2_padded_chunks_and_decode():
         output, plan = driver.step(stream, query_lengths, ForwardMode.EXTEND)
         _check(output, stream, plan, weights)
     output, plan = driver.step(stream, [1, 1], ForwardMode.DECODE)
+    _check(output, stream, plan, weights)
+
+
+def test_c1_hca_request_padding_preserves_continuation_state():
+    weights = _weights(20260911)
+    stream = _stream(1, 128, 85)
+    driver = C1Driver(1, 128, weights)
+    output, plan = driver.step(stream, [127], ForwardMode.EXTEND, request_padding=2)
+    _check(output, stream, plan, weights)
+    expected_contents = stream["hidden"][0, :127] @ weights["wkv"].T
+    np.testing.assert_allclose(
+        np.asarray(driver.state.get_buffer("c128", 0), np.float32)[0, :127, :512],
+        expected_contents,
+        rtol=2e-2,
+        atol=1e-2,
+    )
+    output, plan = driver.step(stream, [1], ForwardMode.DECODE)
     _check(output, stream, plan, weights)

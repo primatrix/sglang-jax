@@ -1,7 +1,8 @@
 # DeepSeek V4 C128 HCA
 
 This branch rebases upstream PR #1549 (`df52b39cf8e074f7bc757927e7c65855eaaf68ed`)
-onto `primatrix/sglang-jax` `epic/dsv4@1910da714`. It retains the upstream
+onto `primatrix/sglang-jax` `epic/dsv4@1910da714`, then integrates
+`epic/dsv4@7a0181618` (config and mHC v7x schedules). It retains the upstream
 compressor, SWA-plus-compressed attention, standalone backend, benchmark, and
 NumPy oracle. `DeepseekV4HCABackend` adapts those kernels to the C1 resources
 already on the epic branch. It is a C128 backend consumer, not complete Flash
@@ -85,7 +86,10 @@ metadata inputs rather than fields captured in the Flax model graph.
 The added v7x schedule starts from v6e's conservative 32 MiB **scoped** VMEM
 budget. This does not transfer the upstream v6e benchmark speedups to v7x.
 Small C1 record pages use the scatter update instead of the standalone
-packed two-lane DMA writer.
+packed two-lane DMA writer. Attention reads each small page into a whole-page
+VMEM scratch buffer, then inserts its values into the attention tile. This
+avoids both sub-tile DMA slices and per-request compressed-history staging
+in HBM. The transport is a correctness baseline, not a tuned performance result.
 
 CPU resource and metadata tests:
 
@@ -104,7 +108,9 @@ PYTHONPATH=python:. python -m pytest -v -rA --tb=short test/srt/kernels/hca
 `test_v4_hca.py` checks C1-backed results against the independent dense NumPy
 oracle for both page sizes, a 382-token prefill followed by four decode
 steps, recycled request state, nonaligned ragged chunks and DP=2/TP=2 with
-unequal per-rank query lengths. The CPU sharded probe verifies ownership and
+unequal per-rank query lengths. A request-padding regression checks that empty
+rows do not clamp onto a live slot and restore its old compressor state. The
+CPU sharded probe verifies ownership and
 update packaging; it does not replace TPU numerical validation.
 
 Full model weight loading, C4/CSA and SWA-only dispatch, serving quality,
