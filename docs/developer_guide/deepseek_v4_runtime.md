@@ -42,6 +42,10 @@ indices and inert token-index sentinels are **rank-local**. Consumers must
 partition the leading dimension on `data` before interpreting these indices.
 Global request slots are preserved, including slot zero on any rank.
 
+The HCA consumer supplies Q with `P("data", "tensor", None)` and shared K/V
+with `P("data", None)`. Explicit mesh axis names must match even when a mesh
+axis has size one; reshaping a packed input does not add the head sharding.
+
 All lengths, masks, slot IDs, addresses and compression events are int32/bool
 dynamic arrays. The runtime checks that live output addresses match the
 request mapping and still own SWA storage. Zero-prefix requests initialize

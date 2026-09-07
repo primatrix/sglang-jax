@@ -105,7 +105,7 @@ def _validate_v4_pool_updates(memory_pools, updates):
     """Check the complete V4 result while tracing, before dispatch donates inputs."""
     from sgl_jax.srt.mem_cache.deepseek_v4_memory_pool import DeepseekV4TokenToKVPool
 
-    if isinstance(memory_pools.token_to_kv_pool, DeepseekV4TokenToKVPool):
+    if isinstance(getattr(memory_pools, "token_to_kv_pool", None), DeepseekV4TokenToKVPool):
         if not isinstance(updates, dict) or set(updates) != set(memory_pools._pools):
             raise ValueError("V4 updates must exactly match both MemoryPools owner keys")
         for key, owner in memory_pools._pools.items():
@@ -771,7 +771,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
     def _get_attention_backend(self):
         if self._is_deepseek_v4():
-            from sgl_jax.srt.layers.attention.dsv4.runtime import DeepseekV4RuntimeBackend
+            from sgl_jax.srt.layers.attention.dsv4.runtime import (
+                DeepseekV4RuntimeBackend,
+            )
 
             # V4's shared KV and compressor state cannot use the MLA/FA route.
             return DeepseekV4RuntimeBackend(
