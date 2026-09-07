@@ -305,6 +305,11 @@ suites = {
     "unit-test-cpu": [
         TestFile("test/srt/kernels/mhc/test_tune.py", 0.1, runner="pytest"),
         TestFile(
+            "python/sgl_jax/test/layers/attention/test_deepseek_v4_metadata.py",
+            0.1,
+            runner="pytest",
+        ),
+        TestFile(
             "python/sgl_jax/test/configs/test_deepseek_v4_config.py",
             0.1,
             runner="pytest",
