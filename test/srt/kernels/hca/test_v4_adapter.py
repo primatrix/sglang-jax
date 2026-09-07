@@ -98,8 +98,8 @@ def test_c1_pages_keep_original_token_units_and_request_slot_zero(runtime, page_
     pages = loc[::page_size] // page_size
     n = (2 + page_size // 128 - 1) // (page_size // 128)
     np.testing.assert_array_equal(np.asarray(kernel.compressed_page_indices)[:n], pages[:n])
-    assert kernel.compressed_cu_kv_lens[1] == n * (page_size // 128)
-    assert kernel.window_cu_kv_lens[1] == len(pages) * page_size
+    assert np.asarray(kernel.compressed_cu_kv_lens)[1] == n * (page_size // 128)
+    assert np.asarray(kernel.window_cu_kv_lens)[1] == len(pages) * page_size
     assert md.use_uniform_prefill_fast_path
 
 
@@ -133,7 +133,7 @@ def test_same_decode_shape_survives_compression_boundary(runtime):
         signatures.append(
             (jax.tree.structure(md), [(x.shape, x.dtype) for x in jax.tree.leaves(md)])
         )
-        assert int(md.kernel.compressed_kv_lens[0]) == length // 128
+        assert int(np.asarray(md.kernel.compressed_kv_lens)[0]) == length // 128
     assert signatures[0] == signatures[1] == signatures[2]
 
 
