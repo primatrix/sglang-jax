@@ -264,6 +264,7 @@ suites = {
         TestFile("python/sgl_jax/test/kernels/kda_test.py", 10, runner="pytest"),
         TestFile("test/srt/kernels/mhc/test_mhc.py", 2, runner="pytest"),
         TestFile("test/srt/kernels/hca/test_hca.py", 8, runner="pytest"),
+        TestFile("test/srt/kernels/hca/test_v4_hca.py", 15, runner="pytest"),
         # Pytest tears down the shared FlashAttention mesh cleanly on JAX 0.10.2.
         TestFile("python/sgl_jax/test/test_flashattention_mha.py", 11, runner="pytest"),
         TestFile("python/sgl_jax/test/test_flashattention_gqa.py", 11, runner="pytest"),
@@ -306,6 +307,7 @@ suites = {
     # have a conditional CPU pin gated on USE_DEVICE_TYPE=cpu — the
     # cpu-test CI job sets that env var.
     "unit-test-cpu": [
+        TestFile("test/srt/kernels/hca/test_v4_adapter.py", 0.2, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/test_embedding_pool.py",
             0.1,

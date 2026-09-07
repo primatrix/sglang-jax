@@ -1057,8 +1057,6 @@ def ragged_attention(
     valid_token_mask = valid_token_mask.astype(jnp.bool_)
     window_flat, window_page_size = _cache_layout(window_cache, head_dim)
     compressed_flat, compressed_page_size = _cache_layout(compressed_cache, head_dim)
-    if window_page_size != compressed_page_size:
-        raise ValueError("window and compressed cache page sizes must match")
     # The q-block DMA path slices VMEM/HBM on TPU's eight-row tile boundary.
     if window_page_size % schedule.sublanes:
         raise ValueError(f"HCA page_size must be a multiple of {schedule.sublanes}")
@@ -1077,7 +1075,9 @@ def ragged_attention(
     )
     # HCA emits at most one value for each absolute compression boundary, so
     # compressed destinations are unique inside a forward call.
-    if jax.default_backend() == "tpu":
+    # C1 stores one or two compressed records per original-token page. Its
+    # unpacked view cannot use the legacy two-lane read/modify/write DMA.
+    if jax.default_backend() == "tpu" and compressed_cache.shape[2] == 2:
         compressed_cache = _write_cache_rows(
             compressed_cache,
             compressed_write_locs,
@@ -1293,8 +1293,6 @@ def uniform_prefill_attention(
 
     window_flat, window_page_size = _cache_layout(window_cache, head_dim)
     compressed_flat, compressed_page_size = _cache_layout(compressed_cache, head_dim)
-    if window_page_size != compressed_page_size:
-        raise ValueError("window and compressed cache page sizes must match")
 
     # Only the last window survives in serving state; limiting the scatter to
     # those rows also avoids duplicate destinations when the prompt wraps the ring.

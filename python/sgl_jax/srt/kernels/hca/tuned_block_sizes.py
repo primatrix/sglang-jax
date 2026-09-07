@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 def _align(value: int, multiple: int) -> int:
@@ -80,6 +80,16 @@ _PLATFORMS = (
         swa_dma_tile=512,
         swa_compute_tile=256,
         compressed_tiles=(128, 256, 512, 1024, 2048),
+    ),
+)
+
+# v7x uses the same 32 MiB scoped allocation as v6e. These conservative tiles
+# are a bring-up schedule; v6e benchmark results do not establish v7x speedups.
+_PLATFORMS += (
+    replace(
+        _PLATFORMS[0],
+        name="TPU v7x",
+        device_markers=("tpu7x", "v7x", "tpu v7"),
     ),
 )
 
