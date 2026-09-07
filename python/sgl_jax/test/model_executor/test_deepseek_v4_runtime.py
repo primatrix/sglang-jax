@@ -4,6 +4,7 @@ The CPU consumer tests device dependencies with C1 buffers. The TPU test below
 uses the real C128 HCA kernels through the same ModelRunner entry point.
 """
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import jax
@@ -11,7 +12,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import nnx
-from jax.sharding import NamedSharding, PartitionSpec as P
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.hca.tuned_block_sizes import get_hca_kernel_schedule
 from sgl_jax.srt.layers.attention import deepseek_v4_hca_backend as hca_adapter
@@ -28,6 +30,13 @@ from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.model_executor.model_runner import ModelRunner
 from sgl_jax.srt.server_args import ServerArgs
+
+
+@pytest.fixture(autouse=True)
+def oracle_import_path(monkeypatch):
+    # Some CPython distributions ship a top-level `test` package, which shadows
+    # the repository's namespace directory. Import the existing HCA package.
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[4] / "test/srt/kernels"))
 
 
 @pytest.fixture(autouse=True)
@@ -377,23 +386,8 @@ def test_precompile_worker_entry_reuses_both_modes(monkeypatch):
         assert len(traces) == 2
 
 
-@pytest.mark.skipif(jax.default_backend() != "tpu", reason="requires real HCA Mosaic lowering")
-@pytest.mark.parametrize("page_size,dp,tp", [(128, 1, 1), (256, 1, 1), (128, 2, 2)])
-def test_real_hca_consumer_precompile_donation_and_reuse(page_size, dp, tp, monkeypatch):
-    from test.srt.kernels.hca.test_hca import (
-        HEAD_DIM,
-        HEADS,
-        SOFTMAX_SCALE,
-        _check,
-        _stream,
-        _weights,
-    )
-
-    monkeypatch.setenv("SGLANG_JAX_AOT_DISPATCH", "0")
-    h = Harness(page_size, dp, tp)
-    weights = _weights(20260912)
-    traces = []
-    width = 4096 + HEADS * HEAD_DIM + HEAD_DIM
+def make_hca_consumer(h, weights, traces):
+    from hca.test_hca import HEAD_DIM, HEADS, SOFTMAX_SCALE
 
     class HCAConsumer(nnx.Module):
         def __init__(self):
@@ -412,7 +406,9 @@ def test_real_hca_consumer_precompile_donation_and_reuse(page_size, dp, tp, monk
         def __call__(self, batch, pools, logits_metadata):
             traces.append((batch.forward_mode, batch.input_ids.shape))
             hidden, q, kv = jnp.split(batch.input_embedding, [4096, 4096 + HEADS * HEAD_DIM], 1)
-            q = q.reshape(-1, HEADS, HEAD_DIM)
+            q = jax.reshard(
+                q.reshape(-1, HEADS, HEAD_DIM), NamedSharding(h.mesh, P("data", "tensor", None))
+            )
             w = self.weights
             output, updated = batch.attn_backend(
                 q,
@@ -437,6 +433,20 @@ def test_real_hca_consumer_precompile_donation_and_reuse(page_size, dp, tp, monk
                 pools.compressor_state_pool,
             )
             return output, updates, None, None
+
+    return HCAConsumer()
+
+
+@pytest.mark.skipif(jax.default_backend() != "tpu", reason="requires real HCA Mosaic lowering")
+@pytest.mark.parametrize("page_size,dp,tp", [(128, 1, 1), (256, 1, 1), (128, 2, 2)])
+def test_real_hca_consumer_precompile_donation_and_reuse(page_size, dp, tp, monkeypatch):
+    from hca.test_hca import HEAD_DIM, HEADS, _check, _stream, _weights
+
+    monkeypatch.setenv("SGLANG_JAX_AOT_DISPATCH", "0")
+    h = Harness(page_size, dp, tp)
+    weights = _weights(20260912)
+    traces = []
+    width = 4096 + HEADS * HEAD_DIM + HEAD_DIM
 
     def step(stream, queries, mode, capacity):
         prefixes = h.lengths.copy()
@@ -466,7 +476,7 @@ def test_real_hca_consumer_precompile_donation_and_reuse(page_size, dp, tp, monk
         )
 
     with jax.set_mesh(h.mesh):
-        h.install(HCAConsumer())
+        h.install(make_hca_consumer(h, weights, traces))
         worker = worker_for(h)
         original = jax.tree.map(np.asarray, h.runner.memory_pools)
         precompile(h, worker, embedding_width=width)
@@ -557,3 +567,24 @@ def test_multiple_live_requests_reorder_boundary_owner():
         np.testing.assert_array_equal(np.asarray(md.c128.boundary_request_ids)[mask], [1])
         np.testing.assert_array_equal(np.asarray(md.c128.boundary_state_slots)[mask], [h.slots[0]])
         np.testing.assert_array_equal(md.query_request_ids[:132], [0] * 3 + [1] * 129)
+
+
+@pytest.mark.parametrize("page_size,dp,tp", [(128, 1, 1), (256, 1, 1), (128, 2, 2)])
+def test_hca_consumer_abstract_forward_sharding(page_size, dp, tp, monkeypatch):
+    from hca.test_hca import HEAD_DIM, HEADS, _weights
+
+    if jax.default_backend() == "cpu":
+        from sgl_jax.srt.layers.attention.hca_backend import HCABackend
+
+        # This is shape/sharding tracing only, not CPU execution of TPU math.
+        monkeypatch.setattr(HCABackend, "_check_constants", lambda *args, **kwargs: None)
+    h = Harness(page_size, dp, tp)
+    with jax.set_mesh(h.mesh):
+        batch = h.batch([127] * dp)
+        batch.input_embedding = np.zeros((256 * dp, 4096 + HEADS * HEAD_DIM + HEAD_DIM), np.float32)
+        model = make_hca_consumer(h, _weights(20260912), [])
+        fb = h.forward_batch(batch)
+        output = jax.eval_shape(lambda b, p: model(b, p, None), fb, h.runner.memory_pools)
+        assert output[0].shape == (256 * dp, HEADS * HEAD_DIM)
+        for name, owner in h.runner.memory_pools._pools.items():
+            owner.validate_buffer_updates(output[1][name])

@@ -11,7 +11,8 @@ from dataclasses import dataclass
 import jax
 import numpy as np
 from flax import nnx
-from jax.sharding import NamedSharding, PartitionSpec as P
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.attention.deepseek_v4_hca_backend import (
     DeepseekV4HCABackend,
