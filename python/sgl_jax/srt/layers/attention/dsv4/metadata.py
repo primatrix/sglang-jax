@@ -18,7 +18,9 @@ queries must not see compressed groups completed by its later tokens. This modul
 publishes per-request counts plus each query's absolute `position`; the attention
 kernel narrows that per query. Doing it here would mean materialising a
 per-query-per-group structure for no benefit. `visible_groups_for_positions` is
-the reference rule the kernel has to honour, and it is tested here.
+the reference rule the kernel has to honour -- a group is visible once complete,
+`(position + 1) // ratio`, and the compressed set is a *union* with the sliding
+window rather than a complement.
 """
 
 from __future__ import annotations
@@ -59,21 +61,35 @@ def complete_groups(consumed: np.ndarray, ratio: int) -> np.ndarray:
     return np.asarray(consumed, np.int64) // ratio
 
 
-def visible_groups_for_positions(positions: np.ndarray, ratio: int, window_size: int) -> np.ndarray:
-    """Compressed groups a query at each position may attend to.
+def visible_groups_for_positions(positions: np.ndarray, ratio: int, window_size=None) -> np.ndarray:
+    """Compressed groups a query at each position may attend to: ``(position+1)//ratio``.
 
-    The sliding window already carries the most recent `window_size` tokens
-    uncompressed, so the compressed side contributes only groups lying entirely
-    older than that window: group ``g`` qualifies when
-    ``(g+1)*ratio - 1 <= position - window_size``.
+    A group is visible once it is **complete**, and that is the only condition.
+    The compressed set is a *union* with the sliding window, not a complement:
+    at ratio == window_size == 128, a query at position 255 attends both to window
+    tokens 128..255 and to the compressed record of group 1, which covers those
+    same tokens. The overlap is deliberate.
 
-    This is the rule M2.4 must implement per query. It is stated and tested here
-    so the kernel has something to be checked against rather than a comment.
+    This matches what the HCA path in `kernels/hca` actually implements --
+    `attention.py` masks with `key_positions < (chunk_positions + 1) // 128` and
+    derives `compressed_entries = (positions + 1) // ratio - 1` -- and it is the
+    same rule as `dsv4.indexer.visible_entries_for_query`, which delegates here so
+    there is one definition.
+
+    `window_size` is accepted and ignored; it is retained so existing callers keep
+    working, and because an earlier version of this function wrongly used it (see
+    below).
+
+    Earlier this computed ``(position - window_size + 1) // ratio``, i.e. only
+    groups lying entirely older than the window. That was wrong: it hides the most
+    recent complete group from every query, and at ratio == window_size it is off
+    by exactly one group for any position that is not a group boundary. It was
+    stated as "the rule M2.4 must implement", so it would have been propagated
+    into the attention kernel as a silent numerical mismatch.
     """
-    if ratio <= 0 or window_size <= 0:
-        raise ValueError("ratio and window_size must be positive")
-    older_than_window = np.asarray(positions, np.int64) - window_size + 1
-    return np.maximum(0, older_than_window) // ratio
+    if ratio <= 0:
+        raise ValueError(f"ratio must be positive, got {ratio}")
+    return (np.asarray(positions, np.int64) + 1) // ratio
 
 
 def boundary_capacity(num_tokens: int, num_requests: int, ratio: int) -> int:

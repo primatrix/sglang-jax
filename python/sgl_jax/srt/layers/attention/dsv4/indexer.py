@@ -58,7 +58,7 @@ _NEG_INF = jnp.finfo(jnp.float32).min
 
 
 def visible_entries_for_query(query_positions, ratio: int):
-    """Compressed entries a query at each position may select.
+    """Compressed entries a query at each position may select: ``(position+1)//ratio``.
 
     An entry is selectable only once its group is **complete**, i.e. the token at
     ``(entry + 1) * ratio - 1`` has been consumed. Returns the count, so entry
@@ -66,6 +66,11 @@ def visible_entries_for_query(query_positions, ratio: int):
 
     This is what makes a selection stable: it depends only on tokens at or before
     the query, so later tokens in the same chunk cannot change it.
+
+    Same rule as `dsv4.metadata.visible_groups_for_positions` and as the HCA path
+    in `kernels/hca` -- kept as a jnp implementation here because this runs inside
+    a jitted selection, while the metadata one is host-side NumPy. The equality is
+    pinned by a test.
     """
     if ratio <= 0:
         raise ValueError(f"ratio must be positive, got {ratio}")
