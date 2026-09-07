@@ -29,8 +29,7 @@ import ml_dtypes
 import numpy as np
 
 FP4_CODEBOOK = np.asarray(
-    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
     dtype=np.float32,
 )
 FP8_DTYPE = ml_dtypes.float8_e4m3fn
@@ -67,15 +66,9 @@ def _as_u8_bytes(array: np.ndarray, *, name: str) -> np.ndarray:
 
 
 def _validate_names(weight_name: str, scale_name: str) -> None:
-    expected = (
-        f"{weight_name[:-len('.weight')]}.scale"
-        if weight_name.endswith(".weight")
-        else None
-    )
+    expected = f"{weight_name[:-len('.weight')]}.scale" if weight_name.endswith(".weight") else None
     if expected is None:
-        raise Mxfp4ConversionError(
-            f"MXFP4 weight name must end in .weight, got {weight_name!r}"
-        )
+        raise Mxfp4ConversionError(f"MXFP4 weight name must end in .weight, got {weight_name!r}")
     if scale_name != expected:
         raise Mxfp4ConversionError(
             f"MXFP4 source pair mismatch: {weight_name!r} requires {expected!r}, "
@@ -132,9 +125,7 @@ def _decode_chunk(packed: np.ndarray, scale_e8m0: np.ndarray, *, scale_name: str
     nibbles[:, 1::2] = packed_u8 >> np.uint8(4)
     values = FP4_CODEBOOK[nibbles]
     scales = _decode_e8m0(scale_u8, name=scale_name)
-    decoded = (values.reshape(rows, columns // 32, 32) * scales[:, :, None]).reshape(
-        rows, columns
-    )
+    decoded = (values.reshape(rows, columns // 32, 32) * scales[:, :, None]).reshape(rows, columns)
     if not np.all(np.isfinite(decoded)):
         raise Mxfp4ConversionError(f"decoded MXFP4 pair {scale_name!r} is non-finite")
     return np.asarray(decoded, dtype=np.float32)
@@ -478,7 +469,8 @@ def convert_mxfp4_pair_from_reader(
         exact_match_count=exact_count,
         underflow_count=underflow_count,
         max_abs_error=max_abs_error,
-        rel_l2=math.sqrt(squared_error) / (math.sqrt(squared_reference) if squared_reference else 1.0),
+        rel_l2=math.sqrt(squared_error)
+        / (math.sqrt(squared_reference) if squared_reference else 1.0),
         row_chunk_size=row_chunk_size,
         source_weight_bytes=rows * packed_columns,
         source_scale_bytes=rows * (columns // 32),
@@ -561,7 +553,9 @@ def convert_mxfp4_pair_from_safetensors(
     weight_path = Path(weight_file)
     scale_path = Path(scale_file if scale_file is not None else weight_file)
     weight_entries = _read_safetensors_header(weight_path)
-    scale_entries = weight_entries if scale_path == weight_path else _read_safetensors_header(scale_path)
+    scale_entries = (
+        weight_entries if scale_path == weight_path else _read_safetensors_header(scale_path)
+    )
     try:
         weight_entry = weight_entries[weight_name]
         scale_entry = scale_entries[scale_name]
@@ -577,7 +571,10 @@ def convert_mxfp4_pair_from_safetensors(
         )
     expected_weight_bytes = int(np.prod(weight_entry.shape, dtype=np.int64))
     expected_scale_bytes = int(np.prod(scale_entry.shape, dtype=np.int64))
-    if weight_entry.byte_size != expected_weight_bytes or scale_entry.byte_size != expected_scale_bytes:
+    if (
+        weight_entry.byte_size != expected_weight_bytes
+        or scale_entry.byte_size != expected_scale_bytes
+    ):
         raise Mxfp4ConversionError(
             f"one-byte metadata mismatch for {weight_name}/{scale_name}: "
             f"data bytes={weight_entry.byte_size}/{scale_entry.byte_size}, "
@@ -591,7 +588,9 @@ def convert_mxfp4_pair_from_safetensors(
                 try:
                     streams[path] = stack.enter_context(path.open("rb"))
                 except OSError as exc:
-                    raise Mxfp4ConversionError(f"cannot open safetensors file {path}: {exc}") from exc
+                    raise Mxfp4ConversionError(
+                        f"cannot open safetensors file {path}: {exc}"
+                    ) from exc
 
         def read_weight_rows(rows: slice) -> np.ndarray:
             return _read_one_byte_rows(streams[weight_path], weight_entry, rows)
@@ -653,10 +652,7 @@ def _checkpoint_locations(
     if not isinstance(weight_map, dict) or not weight_map:
         raise Mxfp4ConversionError(f"safetensors index {index_path} has no non-empty weight_map")
 
-    checkpoint_files = {
-        path.relative_to(checkpoint).as_posix()
-        for path in files
-    }
+    checkpoint_files = {path.relative_to(checkpoint).as_posix() for path in files}
     indexed_files = {str(filename) for filename in weight_map.values()}
     missing_files = sorted(indexed_files - checkpoint_files)
     if missing_files:

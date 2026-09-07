@@ -22,9 +22,7 @@ def _pack_codes(codes: np.ndarray) -> np.ndarray:
 
 def test_reader_is_row_bounded_and_returns_existing_moe_layout() -> None:
     rows, columns = 5, 256
-    codes = np.tile(np.arange(16, dtype=np.uint8), rows * columns // 16).reshape(
-        rows, columns
-    )
+    codes = np.tile(np.arange(16, dtype=np.uint8), rows * columns // 16).reshape(rows, columns)
     packed = _pack_codes(codes)
     scales = np.full((rows, columns // 32), 127, dtype=np.uint8)
     weight_reads: list[int] = []
