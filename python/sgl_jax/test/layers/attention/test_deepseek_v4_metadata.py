@@ -83,26 +83,46 @@ def test_complete_groups_counts_only_filled_groups(ratio):
     assert complete_groups(np.array([2 * ratio]), ratio)[0] == 2
 
 
-def test_visible_groups_excludes_the_sliding_window():
-    """A query only reaches compressed groups that are entirely older than its
-    window; the window itself carries those tokens uncompressed."""
-    ratio, window = 128, 128
-    # Inside the first window: nothing compressed is reachable yet.
-    assert visible_groups_for_positions(np.array([0, 127]), ratio, window).tolist() == [0, 0]
-    # One full group has aged out of the window.
-    assert visible_groups_for_positions(np.array([255]), ratio, window).tolist() == [1]
-    assert visible_groups_for_positions(np.array([383]), ratio, window).tolist() == [2]
-    # Boundary: position 254 is one short of retiring group 1.
-    assert visible_groups_for_positions(np.array([254]), ratio, window).tolist() == [0]
+def test_visible_groups_is_completed_groups_and_overlaps_the_window():
+    """A group is visible as soon as it is complete -- that is the only condition.
+
+    The compressed set is a *union* with the sliding window, not a complement. At
+    ratio == window == 128 a query at position 255 attends both to window tokens
+    128..255 and to the compressed record of group 1, which covers the same
+    tokens. This mirrors `kernels/hca/attention.py`, which masks with
+    `key_positions < (chunk_positions + 1) // 128`.
+    """
+    ratio = 128
+    assert visible_groups_for_positions(np.array([0, 126]), ratio).tolist() == [0, 0]
+    # Position 127 completes group 0, so it is immediately visible.
+    assert visible_groups_for_positions(np.array([127]), ratio).tolist() == [1]
+    assert visible_groups_for_positions(np.array([254]), ratio).tolist() == [1]
+    assert visible_groups_for_positions(np.array([255]), ratio).tolist() == [2]
 
 
-def test_visible_groups_is_monotone_and_never_reaches_the_present():
-    ratio, window = 4, 128
-    pos = np.arange(0, 2048)
-    vis = visible_groups_for_positions(pos, ratio, window)
-    assert np.all(np.diff(vis) >= 0)
-    # The newest group a query can see must end before its window opens.
-    assert np.all(vis * ratio <= np.maximum(0, pos - window + 1))
+def test_visible_groups_never_includes_an_incomplete_group():
+    """The property that keeps a selection stable: a group counts only once every
+    one of its tokens has been consumed, so a later token cannot change it."""
+    for ratio in (4, 128):
+        pos = np.arange(0, 1024)
+        vis = visible_groups_for_positions(pos, ratio)
+        assert np.all(np.diff(vis) >= 0)
+        # The newest visible group must have ended at or before the query.
+        assert np.all(vis * ratio <= pos + 1)
+
+
+def test_visible_groups_agrees_with_the_indexer_and_the_hca_kernel_rule():
+    """One rule, three places. `dsv4.indexer` runs it under jit and `kernels/hca`
+    open-codes it; a disagreement is a silent numerical mismatch, so pin it."""
+    from sgl_jax.srt.layers.attention.dsv4.indexer import visible_entries_for_query
+
+    pos = np.arange(0, 600)
+    for ratio in (4, 128):
+        host = visible_groups_for_positions(pos, ratio)
+        jitted = np.asarray(visible_entries_for_query(pos, ratio))
+        np.testing.assert_array_equal(host, jitted)
+        # The literal expression kernels/hca/attention.py uses.
+        np.testing.assert_array_equal(host, (pos + 1) // ratio)
 
 
 def test_boundary_capacity_depends_only_on_padded_shape():
