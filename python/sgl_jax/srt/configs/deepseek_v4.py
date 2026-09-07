@@ -152,7 +152,11 @@ _FLASH_0731_ROPE_SCALING: dict = {
 # are NOT layers. 46 total against ``num_hidden_layers=43``; see
 # ``trunk_compress_ratios`` for why the tail must be truncated.
 # ``test_deepseek_v4_config.py`` pins this against the real config.json.
-_FLASH_0731_COMPRESS_RATIOS: list[int] = [0, 0] + [4, 128] * 20 + [4] + [0, 0, 0]
+#
+# A tuple, not a list, on purpose: every instance gets its own ``list()`` copy of
+# it, and making the module-level default immutable means an in-place edit of one
+# config's ratios cannot reach back and rewrite the default for the whole process.
+_FLASH_0731_COMPRESS_RATIOS: tuple[int, ...] = (0, 0) + (4, 128) * 20 + (4,) + (0, 0, 0)
 
 
 class DeepseekV4Config(PretrainedConfig):
@@ -237,8 +241,12 @@ class DeepseekV4Config(PretrainedConfig):
         )
         self.compress_rope_theta = compress_rope_theta
         self.sliding_window = sliding_window
-        self.compress_ratios = (
-            list(compress_ratios) if compress_ratios is not None else _FLASH_0731_COMPRESS_RATIOS
+        # Copy on both branches. Handing out the module-level default directly
+        # meant every default-constructed config aliased the same list, so an
+        # in-place edit to one config's ratios silently reclassified the layers
+        # of every other config in the process -- including ones built later.
+        self.compress_ratios = list(
+            compress_ratios if compress_ratios is not None else _FLASH_0731_COMPRESS_RATIOS
         )
 
         self.hc_mult = hc_mult
