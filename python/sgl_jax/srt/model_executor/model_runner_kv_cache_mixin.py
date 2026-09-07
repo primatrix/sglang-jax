@@ -293,7 +293,6 @@ def _build_non_hybrid_memory_pools(token_to_kv_pool) -> MemoryPools:
 
 
 class ModelRunnerKVCacheMixin:
-
     def _dsa_indexer_cache_params(self: ModelRunner) -> tuple[int, int]:
         """``(indexer_key_dim, num_indexer_layers)``, or ``(0, 0)`` when no DSA
         indexer key cache is allocated.
@@ -668,6 +667,27 @@ class ModelRunnerKVCacheMixin:
 
     def _init_pools(self: ModelRunner, max_num_reqs: int, dp_size: int):
         """Create ReqToTokenPool, KV pool, allocator, and MemoryPools."""
+        if self._is_deepseek_v4():
+            from sgl_jax.srt.mem_cache.deepseek_v4_pool_factory import (
+                build_deepseek_v4_pools,
+            )
+
+            if self.token_to_kv_pool_allocator is not None:
+                raise ValueError("V4 pool initialization cannot reuse an existing allocator")
+            self.req_to_token_pool, self.memory_pools, self.token_to_kv_pool_allocator = (
+                build_deepseek_v4_pools(
+                    self._deepseek_v4_cache_spec,
+                    self.deepseek_v4_pool_budget,
+                    self.page_size,
+                    self.mesh,
+                    self.model_config.context_len + 4,
+                    dp_size,
+                    self.req_to_token_pool,
+                )
+            )
+            self.token_to_kv_pool = self.memory_pools.token_to_kv_pool
+            return
+
         self._validate_kv_pool_compatibility()
 
         from sgl_jax.srt.mem_cache.allocator import (
@@ -807,6 +827,12 @@ class ModelRunnerKVCacheMixin:
         dp_size: int = 1,
     ):
         """Initialize memory pool for KV cache (+ recurrent state if hybrid)."""
+        if self._is_deepseek_v4():
+            self._init_deepseek_v4_memory_pool(
+                max_num_reqs, max_total_tokens, total_device_memory, dp_size
+            )
+            return
+
         # 1. kv_cache_dtype
         self._init_kv_cache_dtype()
 
@@ -872,6 +898,61 @@ class ModelRunnerKVCacheMixin:
                 "swa_index_mapping",
                 self.token_to_kv_pool_allocator.full_to_swa_index_mapping,
             )
+
+    def _is_deepseek_v4(self):
+        cfg = getattr(getattr(self, "model_config", None), "hf_config", None)
+        return getattr(cfg, "model_type", None) == "deepseek_v4" or "DeepseekV4ForCausalLM" in (
+            getattr(cfg, "architectures", None) or ()
+        )
+
+    def _init_deepseek_v4_memory_pool(
+        self, max_num_reqs, max_total_tokens, total_device_memory, dp_size
+    ):
+        from sgl_jax.srt.mem_cache.deepseek_v4_memory_pool import DeepseekV4CacheSpec
+        from sgl_jax.srt.mem_cache.deepseek_v4_pool_factory import (
+            plan_deepseek_v4_pools,
+        )
+
+        sa = self.server_args
+        if not sa.disable_overlap_schedule or not sa.disable_radix_cache:
+            raise ValueError(
+                "V4 initial resources require --disable-overlap-schedule and --disable-radix-cache"
+            )
+        if getattr(sa, "enable_mixed_chunk", False):
+            raise ValueError("V4 initial resources do not support mixed prefill/decode")
+        if self.is_draft_worker or (
+            self.spec_algorithm is not None and not self.spec_algorithm.is_none()
+        ):
+            raise ValueError("V4 initial resources do not support speculative decoding")
+        if sa.kv_cache_dtype not in ("auto", "bf16"):
+            raise ValueError("V4 initial KV cache requires BF16")
+        self.kv_cache_dtype = jnp.bfloat16
+        self._deepseek_v4_cache_spec = DeepseekV4CacheSpec.from_config(self.model_config.hf_config)
+        available = self._profile_available_bytes(total_device_memory)
+        # Existing CI/user limits are applied before planning, so they cannot
+        # inflate one resource after the state and padding budget is fixed.
+        ci_size = os.environ.get("SGLANG_CI_SMALL_KV_SIZE")
+        if ci_size:
+            max_total_tokens = (
+                min(int(ci_size), max_total_tokens)
+                if max_total_tokens is not None
+                else int(ci_size)
+            )
+        self.deepseek_v4_pool_budget = plan_deepseek_v4_pools(
+            self._deepseek_v4_cache_spec,
+            available,
+            max_num_reqs,
+            self.page_size,
+            dp_size,
+            sa.swa_full_tokens_ratio,
+            max_total_tokens,
+        )
+        budget = self.deepseek_v4_pool_budget
+        self.max_total_num_tokens = budget.history_tokens
+        self.full_max_total_num_tokens = budget.history_tokens
+        self.swa_max_total_num_tokens = budget.swa_tokens
+        logger.info("V4 pool budget (TP replicated, request slots per DP): %s", budget)
+        self._init_pools(budget.max_num_reqs, dp_size)
 
     # ── Properties ──
 
