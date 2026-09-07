@@ -119,7 +119,9 @@ class DeepseekV4HCABackend(HCABackend):
             np.asarray(a, np.int32) for a in (window, window_cu, compressed, compressed_cu)
         )
 
-    def get_forward_metadata(self, batch, *, request_pool, allocator, state_init_mask=None):
+    def get_forward_metadata(
+        self, batch, *, request_pool, allocator, state_init_mask=None, fixed_bucket=False
+    ):
         dp = int(self.mesh.shape["data"])
         if allocator.dp_size != dp or allocator.page_size != self.page_size:
             raise ValueError("HCA and C1 allocator page/DP geometry disagree")
@@ -183,21 +185,40 @@ class DeepseekV4HCABackend(HCABackend):
         ]
         window_capacity = _bucket_capacity(max(len(x[0]) for x in tables), 8)
         compressed_capacity = _bucket_capacity(max(len(x[2]) for x in tables), 8)
+        # Runtime precompile keys use capacities, never the live sequence lengths.
+        # Standalone numerical/benchmark callers retain their adaptive schedule.
+        if fixed_bucket:
+            cache_tokens = np.asarray(batch.cache_loc).size // dp
+            if cache_tokens < self.page_size or cache_tokens % self.page_size:
+                raise ValueError("V4 cache bucket must contain whole pages per DP rank")
+            window_capacity = cache_tokens // self.page_size + b
+            compressed_capacity = window_capacity
         schedule = get_hca_kernel_schedule(
             str(np.asarray(self.mesh.devices).reshape(-1)[0].device_kind),
             page_size=self.page_size // self.compress_ratio,
-            max_compressed_entries=max(1, int(lengths.max()) // self.compress_ratio),
+            max_compressed_entries=max(
+                1,
+                (self.max_context_len if fixed_bucket else int(lengths.max()))
+                // self.compress_ratio,
+            ),
             local_heads=self.num_heads // int(self.mesh.shape.get("tensor", 1)),
             head_dim=self.head_dim,
         )
         uniform = bool(
-            batch.forward_mode == ForwardMode.EXTEND
+            not fixed_bucket
+            and batch.forward_mode == ForwardMode.EXTEND
             and np.all(active)
             and np.all(prefixes == 0)
             and np.all(local_queries.sum(axis=1) == t)
             and np.all(q_lens == q_lens[0])
         )
         max_queries = max(1, _bucket_max_queries(int(q_lens.max()), schedule.query_block_size))
+        if fixed_bucket:
+            max_queries = (
+                1
+                if batch.forward_mode == ForwardMode.DECODE
+                else max(1, _bucket_max_queries(t, schedule.query_block_size))
+            )
         metadata = []
         for rank in range(dp):
             qs = local_queries[rank]

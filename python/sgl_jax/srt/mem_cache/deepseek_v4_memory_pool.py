@@ -97,7 +97,7 @@ class _V4Buffers:
     def mem_usage(self):
         return self.nbytes / 1024**3
 
-    def replace_buffer(self, buffers):
+    def validate_buffer_updates(self, buffers):
         if set(buffers) != set(self.buffers):
             raise ValueError("V4 update must contain every buffer family")
         for family, old in self.buffers.items():
@@ -106,6 +106,9 @@ class _V4Buffers:
                 a.shape != b.shape or a.dtype != b.dtype for a, b in zip(old, new)
             ):
                 raise ValueError(f"V4 {family} update shape/dtype mismatch")
+
+    def replace_buffer(self, buffers):
+        self.validate_buffer_updates(buffers)
         self.buffers = {key: tuple(arrays) for key, arrays in buffers.items()}
 
 
