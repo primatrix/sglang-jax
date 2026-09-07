@@ -88,23 +88,28 @@ class DeepseekV4HCABackend(HCABackend):
                 compressed_cu.append(compressed_cu[-1] + cp)
                 continue
             locations = np.asarray(request_pool.req_to_token[slot, :length], np.int32)
-            if np.any((locations < p) | (locations >= mapping.size)):
-                raise ValueError("V4 request mapping must cover every reserved history token")
-            if np.any(locations % p != np.arange(length) % p):
-                raise ValueError("V4 request history must preserve original-token page offsets")
-            pages = locations[::p] // p
-            if np.any(locations // p != np.repeat(pages, p)[:length]):
-                raise ValueError("V4 logical pages must map to contiguous physical pages")
-            swa = mapping[locations]
-            # The earliest query still needs its old SWA prefix. Released older
-            # pages may be zero; the kernel reads current-chunk KV directly.
+            # C1 owns within-page contiguity. Inspect page anchors and the
+            # bounded live SWA span, not every historical token on each decode.
+            anchors = locations[::p]
+            if np.any((anchors < p) | (anchors >= mapping.size) | (anchors % p != 0)):
+                raise ValueError("V4 request mapping must contain allocated page anchors")
+            pages = anchors // p
             history_start = max(0, int(prefix) - self.window_size + 1)
-            needed = np.concatenate((swa[history_start:prefix], swa[max(prefix, length - 128) :]))
-            if np.any(needed == 0):
+            required_positions = np.concatenate(
+                (
+                    np.arange(history_start, prefix),
+                    np.arange(max(prefix, length - self.window_size), length),
+                )
+            )
+            required_locations = locations[required_positions]
+            expected_locations = anchors[required_positions // p] + required_positions % p
+            if not np.array_equal(required_locations, expected_locations):
+                raise ValueError("V4 logical pages must preserve original-token offsets")
+            if np.any(mapping[required_locations] == 0):
                 raise ValueError(
                     "V4 SWA pages required by this HCA step were released or unallocated"
                 )
-            window.extend((mapping[locations[::p]] // p).tolist())
+            window.extend((mapping[anchors] // p).tolist())
             window_cu.append(window_cu[-1] + len(pages) * p)
             completed = int(length) // self.compress_ratio
             count = max(1, (completed + cp - 1) // cp)
