@@ -47,6 +47,12 @@ def main():
     p.add_argument("--output-len", type=int, default=128)
     p.add_argument("--concurrency", type=int, nargs="+", default=[2, 4, 8, 16, 32])
     p.add_argument("--groups", choices=["A", "C"], nargs="+", default=["A", "C"])
+    p.add_argument(
+        "--skip-points",
+        nargs="*",
+        default=[],
+        help="Completed group:concurrency points, e.g. A:2 A:4",
+    )
     p.add_argument("--repeats", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--dry-run", action="store_true")
@@ -294,6 +300,8 @@ def main():
                     time.sleep(5)
         for group in args.groups:
             for concurrency in args.concurrency:
+                if f"{group}:{concurrency}" in args.skip_points:
+                    continue
                 # Warm each shape/concurrency separately; preserve logs so that
                 # remaining compilation in measured runs can be detected.
                 run_bench(
