@@ -275,6 +275,7 @@ suites = {
         TestFile("python/sgl_jax/test/test_mla_attention.py", 2.5),
         TestFile("test/srt/kernels/hca/test_backend.py", 15, runner="pytest"),
         TestFile("python/sgl_jax/test/test_moe_topk.py", 0.3),
+        TestFile("python/sgl_jax/test/test_deepseek_v4_moe.py", 3, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v1_test.py", 9),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v2_test.py", 3),
         TestFile("python/sgl_jax/test/kernels/biased_topk_test.py", 1, runner="pytest"),
@@ -310,6 +311,7 @@ suites = {
     # have a conditional CPU pin gated on USE_DEVICE_TYPE=cpu — the
     # cpu-test CI job sets that env var.
     "unit-test-cpu": [
+        TestFile("python/sgl_jax/test/test_deepseek_v4_moe.py", 0.3, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/model_executor/test_deepseek_v4_runtime.py", 0.3, runner="pytest"
         ),
