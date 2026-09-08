@@ -61,7 +61,7 @@ def write_fixture(path, model):
         if key.endswith(".scale"):
             linear = get_param(model, mapping.target_path.rsplit(".", 1)[0])
             n, k = linear.weight_q.value.shape
-            value = np.full((n // 128, k // 128), 0.015625, np.float32)
+            value = np.full((n // 128, k // 128), 0.25, np.float32)
             kind = "F32"
         elif key.endswith("tid2eid"):
             value = np.tile(np.array([[3, 1], [0, 2]], np.int32), (16, 1))
@@ -81,7 +81,12 @@ def write_fixture(path, model):
         tensors[key] = (value, kind)
     for layer in range(3):
         for expert in range(4):
-            for w, (n, k) in {"w1": (512, 512), "w3": (512, 512), "w2": (512, 512)}.items():
+            hidden, intermediate = model.config.hidden_size, model.config.moe_intermediate_size
+            for w, (n, k) in {
+                "w1": (intermediate, hidden),
+                "w3": (intermediate, hidden),
+                "w2": (hidden, intermediate),
+            }.items():
                 stem = f"layers.{layer}.ffn.experts.{expert}.{w}"
                 tensors[stem + ".weight"] = (np.full((n, k // 2), 0x21, np.int8), "I8")
                 tensors[stem + ".scale"] = (np.full((n, k // 32), 119, np.uint8), "F8_E8M0")
@@ -102,7 +107,7 @@ def write_fixture(path, model):
     path.write_bytes(struct.pack("<Q", len(raw)) + raw + b"".join(payload))
 
 
-def make_model(dp=1, tp=1):
+def make_model(dp=1, tp=1, cfg=None):
     if jax.device_count() < dp * tp:
         pytest.skip("requires four devices")
     mesh = jax.sharding.Mesh(
@@ -110,18 +115,29 @@ def make_model(dp=1, tp=1):
         ("data", "tensor"),
         axis_types=(jax.sharding.AxisType.Explicit,) * 2,
     )
-    cfg = tiny_config()
+    cfg = tiny_config() if cfg is None else cfg
     with jax.set_mesh(mesh):
         model = nnx.eval_shape(lambda: DeepseekV4ForCausalLM(cfg, mesh))
     return model, mesh
 
 
 @pytest.mark.parametrize("dp,tp", [(1, 1), (2, 2)])
-def test_real_mixed_checkpoint_load(tmp_path, dp, tp):
+def test_real_mixed_checkpoint_load(tmp_path, dp, tp, monkeypatch):
     model, mesh = make_model(dp, tp)
     write_fixture(tmp_path / "model.safetensors", model)
+    from sgl_jax.srt.utils.quantization import mxfp4_fp8_loader
+
+    convert = mxfp4_fp8_loader.convert_mxfp4_pair_from_safetensors
+    calls = []
+
+    def counted_convert(*args, **kwargs):
+        calls.append(args[1])
+        return convert(*args, **kwargs)
+
+    monkeypatch.setattr(mxfp4_fp8_loader, "convert_mxfp4_pair_from_safetensors", counted_convert)
     with jax.set_mesh(mesh):
         model.load_weights(SimpleNamespace(model_path=str(tmp_path)))
+    assert len(calls) == len(set(calls)) == 3 * 4 * 3
     for _, p in nnx.state(model, nnx.Param).flat_state():
         assert isinstance(p.value, jax.Array)
         assert np.isfinite(np.asarray(p.value, dtype=np.float32)).all()
@@ -230,3 +246,102 @@ def test_complete_trunk_chunk_and_decode_equivalence(tmp_path, dp, tp):
         assert np.isfinite(split.astype(np.float32)).all()
         assert np.any(np.asarray(pools.token_to_kv_pool.get_buffer("c4", 1)))
         assert np.any(np.asarray(pools.token_to_kv_pool.get_buffer("c128", 2)))
+
+
+@pytest.mark.parametrize("layer_id", [0, 1, 2])
+@pytest.mark.parametrize("dp,tp", [(1, 1), (2, 2)])
+def test_attention_chunk_decode_with_real_pools(tmp_path, layer_id, dp, tp):
+    from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+
+    model, mesh = make_model(dp, tp)
+    write_fixture(tmp_path / "model.safetensors", model)
+    if jax.default_backend() == "cpu":
+        # The production BF16 load path dequantizes non-expert checkpoint FP8;
+        # CPU cannot lower the TPU FP8 matmul. Keep the same on-disk fixture.
+        cfg = tiny_config()
+        cfg.quantization_config = None
+        with jax.set_mesh(mesh):
+            model = nnx.eval_shape(lambda: DeepseekV4ForCausalLM(cfg, mesh))
+    with jax.set_mesh(mesh):
+        model.load_weights(SimpleNamespace(model_path=str(tmp_path)))
+        layer = model.model.layers[layer_id].self_attn
+        rope = model.model.rope_plain.value if layer_id == 0 else model.model.rope_compressed.value
+
+        def run(chunks):
+            h = harness_for(model, dp, tp)
+            output = []
+            for count, mode in chunks:
+                b = h.batch([count] * dp, mode, capacity=256)
+                fb = h.forward_batch(b)
+                # Same hidden activations for a position regardless of chunk boundaries.
+                hidden = np.sin(
+                    np.asarray(b.positions)[:, None] * 0.11 + np.arange(512)[None, :] * 0.017
+                ).astype(jnp.bfloat16)
+                hidden = jax.device_put(
+                    hidden,
+                    jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data", None)),
+                )
+                y, update = jax.jit(lambda x, f, p: layer(x, f, p, rope))(
+                    hidden, fb, h.runner.memory_pools
+                )
+                y.block_until_ready()
+                output.append(
+                    np.stack([np.asarray(y)[r * 256 : r * 256 + count] for r in range(dp)], axis=0)
+                )
+                packed = h.runner.attn_backend.pack_pool_updates(
+                    {layer_id: update},
+                    h.runner.memory_pools.token_to_kv_pool,
+                    h.runner.memory_pools.compressor_state_pool,
+                )
+                h.runner.memory_pools.replace_all(packed)
+            return np.concatenate(output, axis=1)
+
+        whole = run([(129, ForwardMode.EXTEND)])
+        split = run([(63, ForwardMode.EXTEND), (65, ForwardMode.EXTEND), (1, ForwardMode.DECODE)])
+        assert np.isfinite(whole.astype(np.float32)).all()
+        assert np.max(np.abs(whole.astype(np.float32))) > 0.01
+        np.testing.assert_allclose(
+            split.astype(np.float32), whole.astype(np.float32), rtol=0.03, atol=0.0003
+        )
+
+
+@pytest.mark.skipif(jax.default_backend() != "tpu", reason="Flash HCA uses Mosaic kernels")
+def test_flash_attention_geometry_complete_trunk(tmp_path):
+    from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+
+    cfg = DeepseekV4Config(
+        num_hidden_layers=3,
+        compress_ratios=[0, 4, 128],
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        num_hash_layers=1,
+        vocab_size=32,
+        max_position_embeddings=256,
+    )
+    cfg.quantization_config = tiny_config().quantization_config
+    model, mesh = make_model(1, 8, cfg)
+    write_fixture(tmp_path / "model.safetensors", model)
+    with jax.set_mesh(mesh):
+        model.load_weights(SimpleNamespace(model_path=str(tmp_path)))
+
+        def run(chunks):
+            h = harness_for(model, 1, 8)
+            assert h.runner.attn_backend.use_pallas_hca
+            result = []
+            for count, mode in chunks:
+                b = h.batch([count], mode, capacity=256)
+                start = h.lengths[0] - count
+                b.input_ids[:count] = np.arange(start, start + count) % 32
+                fb = h.forward_batch(b)
+                output, updates, _ = jax.jit(lambda f, p: model.model(f, p))(
+                    fb, h.runner.memory_pools
+                )
+                output.block_until_ready()
+                result.append(np.asarray(output)[:count].astype(np.float32))
+                h.runner.memory_pools.replace_all(updates)
+            return np.concatenate(result)
+
+        whole = run([(129, ForwardMode.EXTEND)])
+        split = run([(63, ForwardMode.EXTEND), (65, ForwardMode.EXTEND), (1, ForwardMode.DECODE)])
+        assert np.isfinite(whole).all() and np.max(np.abs(whole)) > 0.1
+        np.testing.assert_allclose(split, whole, rtol=0.04, atol=0.04)

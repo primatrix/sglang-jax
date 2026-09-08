@@ -592,6 +592,9 @@ def _linear(input_size, output_size, mesh, dtype, axes, name, quantized=False):
         kernel_axes=axes,
         params_dtype=dtype,
         weight_block_size=(128, 128),
+        # As in ModelConfig's static-FP8 loader: scales came from checkpoint,
+        # not the online narrow-N quantizer the guard protects against.
+        allow_narrow_n_blockwise=True,
         scope_name=name,
     )
 
@@ -1074,9 +1077,39 @@ class DeepseekV4ForCausalLM(nnx.Module):
                 assign(parameter(path), value.T if mapping.transpose else value, key)
 
     def _load_expert_weights(self, info):
+        from jax.sharding import SingleDeviceSharding
+
         from sgl_jax.srt.utils.quantization.mxfp4_fp8_loader import (
             convert_mxfp4_pair_from_safetensors,
         )
+
+        def on_device(call, device, *args):
+            local_mesh = jax.sharding.Mesh(
+                np.asarray([device]), ("loader",), axis_types=(jax.sharding.AxisType.Explicit,)
+            )
+            with jax.set_mesh(local_mesh):
+                return call(*args)
+
+        def empty_shards(param, mesh):
+            old = param.value
+            sharding = NamedSharding(mesh, old.sharding.spec)
+            shards = {}
+            for device, index in sharding.addressable_devices_indices_map(old.shape).items():
+                local_shape = tuple(len(range(*sl.indices(n))) for sl, n in zip(index, old.shape))
+                placement = SingleDeviceSharding(device)
+                initialize = jax.jit(
+                    lambda shape=local_shape, dtype=old.dtype: jnp.zeros(shape, dtype),
+                    out_shardings=placement,
+                )
+                update = jax.jit(
+                    lambda buffer, row, offset: jax.lax.dynamic_update_slice(
+                        buffer, row[None], (offset,) + (0,) * (buffer.ndim - 1)
+                    ),
+                    donate_argnums=(0,),
+                    out_shardings=placement,
+                )
+                shards[device] = [index, on_device(initialize, device), update]
+            return sharding, shards
 
         for layer_id, layer in enumerate(self.model.layers):
             experts = layer.mlp.experts
@@ -1085,48 +1118,61 @@ class DeepseekV4ForCausalLM(nnx.Module):
                     "V4 checkpoint loading currently requires identity expert placement"
                 )
             for source, target in (("w1", "wi_0"), ("w3", "wi_1"), ("w2", "wo")):
-                for is_scale in (False, True):
-                    param = getattr(experts, target + ("_scale" if is_scale else ""))
-                    if param is None:
+                weight_param = getattr(experts, target)
+                scale_param = getattr(experts, target + "_scale")
+                parameters = [(weight_param, False)]
+                if scale_param is not None:
+                    parameters.append((scale_param, True))
+                buffers = [
+                    (param, scale, *empty_shards(param, experts.moe_mesh))
+                    for param, scale in parameters
+                ]
+                # One conversion per local logical expert, shared by all its TP
+                # slices and both weight/scale arrays. Only one expert's host
+                # payload is live; final expert stacks are assembled on devices.
+                for expert_id in range(experts.num_experts):
+                    local = any(
+                        expert_id in range(*index[0].indices(weight_param.value.shape[0]))
+                        for index, _, _ in buffers[0][3].values()
+                    )
+                    if not local:
                         continue
-                    old = param.value
-
-                    def load_slice(
-                        index,
-                        source=source,
-                        is_scale=is_scale,
-                        shape=old.shape,
-                        dtype=old.dtype,
-                        layer_id=layer_id,
-                    ):
-                        ranges = [range(*sl.indices(n)) for sl, n in zip(index, shape)]
-                        result = np.empty(tuple(len(r) for r in ranges), dtype=dtype)
-                        for dest, expert_id in enumerate(ranges[0]):
-                            stem = f"layers.{layer_id}.ffn.experts.{expert_id}.{source}"
-                            wk, sk = stem + ".weight", stem + ".scale"
-                            converted = convert_mxfp4_pair_from_safetensors(
-                                info[wk][0]["file"],
-                                wk,
-                                sk,
-                                scale_file=info[sk][0]["file"],
-                                strict=True,
+                    stem = f"layers.{layer_id}.ffn.experts.{expert_id}.{source}"
+                    wk, sk = stem + ".weight", stem + ".scale"
+                    converted = convert_mxfp4_pair_from_safetensors(
+                        info[wk][0]["file"], wk, sk, scale_file=info[sk][0]["file"], strict=True
+                    )
+                    for param, is_scale, _, shards in buffers:
+                        if is_scale:
+                            value = converted.scale_fp32[None, None, :]
+                        elif np.dtype(param.value.dtype) == np.dtype(jnp.float8_e4m3fn):
+                            value = converted.weight_fp8.T
+                        else:
+                            value = converted.dequantize().T
+                        if value.shape != param.value.shape[1:]:
+                            raise ValueError(
+                                f"{stem}: decoded expert shape {value.shape} != {param.value.shape[1:]}"
                             )
-                            if is_scale:
-                                value = converted.scale_fp32[None, None, :]
-                            elif np.dtype(dtype) == np.dtype(jnp.float8_e4m3fn):
-                                value = converted.weight_fp8.T
-                            else:
-                                value = converted.dequantize().T
-                            if value.shape != shape[1:]:
-                                raise ValueError(
-                                    f"{stem}: decoded expert shape {value.shape} != {shape[1:]}"
-                                )
-                            result[dest] = value[index[1:]]
-                        return result
-
-                    sharding = NamedSharding(experts.moe_mesh, old.sharding.spec)
-                    param.value = jax.make_array_from_callback(old.shape, sharding, load_slice)
-                    param.value.block_until_ready()
+                        for device, shard in shards.items():
+                            index, array, update = shard
+                            owned = range(*index[0].indices(param.value.shape[0]))
+                            if expert_id not in owned:
+                                continue
+                            placement = SingleDeviceSharding(device)
+                            row = jax.device_put(
+                                np.ascontiguousarray(value[index[1:]], dtype=param.value.dtype),
+                                placement,
+                            )
+                            offset = jax.device_put(np.int32(owned.index(expert_id)), placement)
+                            shard[1] = on_device(update, device, array, row, offset)
+                    # Bound outstanding host transfers before releasing this expert.
+                    for _, _, _, shards in buffers:
+                        for _, array, _ in shards.values():
+                            array.block_until_ready()
+                for param, _, sharding, shards in buffers:
+                    param.value = jax.make_array_from_single_device_arrays(
+                        param.value.shape, sharding, [array for _, array, _ in shards.values()]
+                    )
 
 
 EntryClass = [DeepseekV4ForCausalLM]

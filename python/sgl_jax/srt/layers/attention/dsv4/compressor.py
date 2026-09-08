@@ -280,11 +280,16 @@ def compress_chunk(
     )
     records = jnp.where(bvalid[:, None], records, 0.0)
 
-    new_state = _save_tail(state, rows, positions, query_request_ids, state_slots, window)
+    # Metadata pads query_request_ids with zero. Those rows must never write
+    # request zero's ring, even when their zero position is inside its tail.
+    valid_tokens = jnp.arange(num_tokens) < cu_q_lens[-1]
+    new_state = _save_tail(
+        state, rows, positions, query_request_ids, state_slots, window, valid_tokens
+    )
     return records, bvalid, new_state
 
 
-def _save_tail(state, rows, positions, query_request_ids, state_slots, window):
+def _save_tail(state, rows, positions, query_request_ids, state_slots, window, valid_tokens):
     """Write only each request's last `window` chunk tokens into its ring.
 
     Restricting the write to the tail is what makes a chunk longer than the ring
@@ -296,13 +301,13 @@ def _save_tail(state, rows, positions, query_request_ids, state_slots, window):
     # positions so it needs no per-request loop: the last token of a request has
     # the largest position among that request's tokens.
     last_position = jax.ops.segment_max(
-        positions,
+        jnp.where(valid_tokens, positions, -1),
         query_request_ids,
         num_segments=state_slots.shape[0],
         indices_are_sorted=False,
     )
     from_end = last_position[query_request_ids] - positions
-    keep = from_end < window
+    keep = valid_tokens & (from_end < window)
     flat_index = token_slot * window + jnp.mod(positions, window)
     flat = state.reshape(-1, state.shape[-1])
     flat_index = jnp.where(keep, flat_index, flat.shape[0])
