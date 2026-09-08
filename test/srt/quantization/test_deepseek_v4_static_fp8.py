@@ -5,6 +5,7 @@ import struct
 
 import numpy as np
 import pytest
+
 from sgl_jax.srt.utils.quantization.deepseek_v4_static_fp8 import (
     COMPLETE,
     CONFIG_KEY,
@@ -143,3 +144,20 @@ def test_modified_config_and_metadata_not_accepted(tmp_path):
     (output / "config.json").write_text("{}")
     with pytest.raises(ValueError, match="metadata"):
         validate_static_checkpoint(output)
+
+
+@pytest.mark.parametrize("bad_code", [0x7F, 0xFF])
+def test_explicit_pair_validation_rejects_both_fp8_nan_encodings(tmp_path, bad_code):
+    source, output = tmp_path / "source", tmp_path / "output"
+    fixture(source)
+    export(source, output)
+    index = json.loads((output / "model.safetensors.index.json").read_text())["weight_map"]
+    weight = "layers.0.ffn.experts.0.w1.weight"
+    scale = "layers.0.ffn.experts.0.w1.scale"
+    path = output / index[weight]
+    entry = _read_safetensors_header(path)[weight]
+    with path.open("r+b") as handle:
+        handle.seek(entry.byte_offset)
+        handle.write(bytes([bad_code]))
+    with pytest.raises(ValueError, match="nonfinite"):
+        read_static_pair(path, weight, output / index[scale], scale)

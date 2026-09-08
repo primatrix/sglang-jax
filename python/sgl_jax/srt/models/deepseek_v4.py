@@ -1046,7 +1046,10 @@ class DeepseekV4ForCausalLM(nnx.Module):
             logger.info(
                 "Loaded DeepSeek V4 non-expert parameters in %.1fs", time.monotonic() - started
             )
-            self._load_expert_weights(info)
+            if expert_format == FORMAT:
+                self._load_static_expert_weights(loader, info)
+            else:
+                self._load_expert_weights(info)
         # eval_shape creates placeholders for these non-parameter tables too.
         with jax.set_mesh(self.mesh):
             self.model.rope_plain.value = _rope_cache(self.config, 0)
@@ -1084,7 +1087,7 @@ class DeepseekV4ForCausalLM(nnx.Module):
                 raise ValueError(
                     f"{key}: checkpoint {array.shape} does not match model {old.shape}"
                 )
-            if not np.isfinite(array.astype(np.float32)).all():
+            if not np.isfinite(array).all():
                 raise ValueError(f"{key}: non-finite checkpoint tensor")
             param.value = jax.device_put(
                 array.astype(old.dtype), NamedSharding(self.mesh, old.sharding.spec)
@@ -1122,19 +1125,77 @@ class DeepseekV4ForCausalLM(nnx.Module):
             else:
                 assign(parameter(path), value.T if mapping.transpose else value, key)
 
+    def _load_static_expert_weights(self, loader, info):
+        """Map published FP8 experts into the shared parallel weight loader.
+
+        Export validates values and exact conversion; publication records hashes.
+        Startup checks tensor metadata here, without rereading every value through
+        the offline validation/conversion helpers.
+        """
+        for layer_id, layer in enumerate(self.model.layers):
+            started = time.monotonic()
+            experts = layer.mlp.experts
+            if experts.num_experts != self.config.n_routed_experts:
+                raise ValueError(
+                    "V4 checkpoint loading currently requires identity expert placement"
+                )
+            mappings = {}
+            for source, target in (("w1", "wi_0"), ("w3", "wi_1"), ("w2", "wo")):
+                weight = getattr(experts, target).value
+                scale_param = getattr(experts, target + "_scale")
+                if weight.dtype != jnp.float8_e4m3fn or scale_param is None:
+                    raise ValueError("Static V4 experts require resident FP8 weights and scales")
+                scale = scale_param.value
+                prefix = f"model.layers.{layer_id}.mlp.experts.{target}"
+                keys = [
+                    f"layers.{layer_id}.ffn.experts.{expert_id}.{source}"
+                    for expert_id in range(experts.num_experts)
+                ]
+                for key in keys:
+                    for suffix, dtype, shape, size in (
+                        (".weight", "F8_E4M3", (weight.shape[2], weight.shape[1]), 1),
+                        (".scale", "F32", (weight.shape[-1],), 4),
+                    ):
+                        entries = info.get(key + suffix, [])
+                        if len(entries) != 1:
+                            raise ValueError(f"{key + suffix}: expected exactly one tensor")
+                        entry = entries[0]
+                        if (
+                            entry["dtype"] != dtype
+                            or tuple(entry["shape"]) != shape
+                            or entry["byte_size"] != int(np.prod(shape)) * size
+                        ):
+                            raise ValueError(
+                                f"{key + suffix}: invalid static FP8 dtype/shape/bytes"
+                            )
+                mappings["__MOE_EXPERTS__" + prefix] = WeightMapping(
+                    target_path=[prefix] + [key + ".weight" for key in keys],
+                    transpose=True,
+                    sharding=tuple(weight.sharding.spec),
+                )
+                mappings["__MOE_EXPERTS__" + prefix + "_scale"] = WeightMapping(
+                    target_path=[prefix + "_scale"] + [key + ".scale" for key in keys],
+                    transpose=False,
+                    sharding=(scale.sharding.spec[0], scale.sharding.spec[-1]),
+                )
+            # Scale expansion performs JAX operations on the expert/tensor mesh.
+            with jax.set_mesh(experts.moe_mesh):
+                loader.load_weights_from_safetensors(mappings)
+            for target in ("wi_0", "wi_1", "wo", "wi_0_scale", "wi_1_scale", "wo_scale"):
+                getattr(experts, target).value.block_until_ready()
+            logger.info(
+                "Loaded DeepSeek V4 layer %d/%d static FP8 experts via WeightLoader in %.1fs",
+                layer_id + 1,
+                len(self.model.layers),
+                time.monotonic() - started,
+            )
+
     def _load_expert_weights(self, info):
         from jax.sharding import SingleDeviceSharding
 
-        from sgl_jax.srt.utils.quantization.deepseek_v4_static_fp8 import (
-            CONFIG_KEY,
-            FORMAT,
-            read_static_pair,
-        )
         from sgl_jax.srt.utils.quantization.mxfp4_fp8_loader import (
             convert_mxfp4_pair_from_safetensors,
         )
-
-        static_fp8 = getattr(self.config, CONFIG_KEY, None) == FORMAT
 
         def on_device(call, device, *args):
             local_mesh = jax.sharding.Mesh(
@@ -1193,19 +1254,10 @@ class DeepseekV4ForCausalLM(nnx.Module):
                         continue
                     stem = f"layers.{layer_id}.ffn.experts.{expert_id}.{source}"
                     wk, sk = stem + ".weight", stem + ".scale"
-                    if static_fp8:
-                        weight, scale = read_static_pair(
-                            info[wk][0]["file"],
-                            wk,
-                            info[sk][0]["file"],
-                            sk,
-                            entries=(info[wk][0], info[sk][0]),
-                        )
-                    else:
-                        converted = convert_mxfp4_pair_from_safetensors(
-                            info[wk][0]["file"], wk, sk, scale_file=info[sk][0]["file"], strict=True
-                        )
-                        weight, scale = converted.weight_fp8, converted.scale_fp32
+                    converted = convert_mxfp4_pair_from_safetensors(
+                        info[wk][0]["file"], wk, sk, scale_file=info[sk][0]["file"], strict=True
+                    )
+                    weight, scale = converted.weight_fp8, converted.scale_fp32
                     for param, is_scale, _, shards in buffers:
                         if is_scale:
                             value = scale[None, None, :]
@@ -1243,7 +1295,7 @@ class DeepseekV4ForCausalLM(nnx.Module):
                     len(self.model.layers),
                     source,
                     time.monotonic() - started,
-                    "static FP8 load" if static_fp8 else "strict MXFP4 conversion",
+                    "strict MXFP4 conversion",
                 )
 
 
