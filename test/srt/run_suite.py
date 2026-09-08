@@ -313,6 +313,9 @@ suites = {
         TestFile(
             "python/sgl_jax/test/model_executor/test_deepseek_v4_runtime.py", 0.3, runner="pytest"
         ),
+        TestFile(
+            "python/sgl_jax/test/managers/test_deepseek_v4_lifecycle.py", 0.2, runner="pytest"
+        ),
         TestFile("test/srt/kernels/hca/test_v4_adapter.py", 0.2, runner="pytest"),
         TestFile("test/srt/kernels/mhc/test_tune.py", 0.1, runner="pytest"),
         TestFile(
