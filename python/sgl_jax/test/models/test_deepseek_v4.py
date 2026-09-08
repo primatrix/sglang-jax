@@ -483,3 +483,44 @@ def test_flash_checkpoint_headers_match_model_parameters():
             else:
                 expected = p.shape[::-1] if mapping.transpose else p.shape
         assert tuple(header["shape"]) == expected, key
+
+
+@pytest.mark.parametrize("dp,tp", [(1, 1), (2, 2)])
+def test_static_fp8_load_matches_dynamic_without_conversion(tmp_path, dp, tp, monkeypatch):
+    from sgl_jax.srt.utils.quantization import mxfp4_fp8_loader
+    from sgl_jax.srt.utils.quantization.deepseek_v4_static_fp8 import (
+        CONFIG_KEY,
+        FORMAT,
+        export_checkpoint,
+    )
+
+    source, output = tmp_path / "source", tmp_path / "static"
+    source.mkdir()
+    original, mesh = make_model(dp, tp)
+    write_fixture(source / "model.safetensors", original)
+    header = mxfp4_fp8_loader._read_safetensors_header(source / "model.safetensors")
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: "model.safetensors" for key in header}})
+    )
+    (source / "config.json").write_text(json.dumps({"num_hidden_layers": 3, "n_routed_experts": 4}))
+    with jax.set_mesh(mesh):
+        original.load_weights(SimpleNamespace(model_path=str(source)))
+    export_checkpoint(source, output, source_revision="fixture", converter_revision="test")
+    loaded, static_mesh = make_model(dp, tp)
+    setattr(loaded.config, CONFIG_KEY, FORMAT)
+
+    def forbidden_conversion(*args, **kwargs):
+        raise AssertionError("Static loader must never invoke MXFP4 conversion")
+
+    monkeypatch.setattr(
+        mxfp4_fp8_loader, "convert_mxfp4_pair_from_safetensors", forbidden_conversion
+    )
+    with jax.set_mesh(static_mesh):
+        loaded.load_weights(SimpleNamespace(model_path=str(output)))
+    expected = dict(nnx.state(original, nnx.Param).flat_state())
+    actual = dict(nnx.state(loaded, nnx.Param).flat_state())
+    assert expected.keys() == actual.keys()
+    for key in expected:
+        a, b = np.asarray(expected[key].value), np.asarray(actual[key].value)
+        assert a.dtype == b.dtype and a.shape == b.shape
+        np.testing.assert_array_equal(a.view(np.uint8), b.view(np.uint8), err_msg=str(key))
