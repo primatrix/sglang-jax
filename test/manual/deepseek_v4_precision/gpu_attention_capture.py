@@ -25,6 +25,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--component", choices=("attention", "layer"), default="attention")
+    p.add_argument("--layer", type=int, choices=(0, 2, 3))
     args = p.parse_args()
     torch.cuda.set_device(0)
     torch.set_default_dtype(torch.bfloat16)
@@ -36,7 +38,7 @@ def main():
     from sglang.srt.layers.moe.utils import initialize_moe_config
     from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
     from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-    from sglang.srt.models.deepseek_v4 import MQALayer
+    from sglang.srt.models.deepseek_v4 import MQALayer, DeepseekV4DecoderLayer
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -68,7 +70,8 @@ def main():
     for k, v in cp.config.items():
         setattr(cfg, k, v)
     cfg.quantization_config = None
-    cfg.max_position_embeddings = 256
+    cfg.max_position_embeddings = 512
+    cfg.router_fp32 = True
     cap = Capture(args.out)
     meta = dict(
         source=os.environ.get("SGLANG_SHA"),
@@ -80,7 +83,9 @@ def main():
         ep=1,
         weight_path="source-dequantized-BF16",
         kv_cache="native-fp8",
-        rope_cache_length=256,
+        rope_cache_length=512,
+        component=args.component,
+        mhc_path="native SGLang decoder (default TileLang pre/post)",
         cases=[],
         errors=[],
     )
@@ -93,7 +98,7 @@ def main():
         assert param.shape == value.shape, (param.shape, value.shape)
         param.copy_(value)
 
-    ids_np = np.random.default_rng(17).integers(0, cfg.vocab_size, size=129, dtype=np.int32)
+    ids_np = np.random.default_rng(17).integers(0, cfg.vocab_size, size=257, dtype=np.int32)
     ids = torch.from_numpy(ids_np.astype(np.int64)).cuda()
     with torch.device("cuda"):
         embed = VocabParallelEmbedding(
@@ -103,6 +108,10 @@ def main():
     hidden = embed(ids).contiguous()
     cap.save("input/token_ids", ids)
     cap.save("input/hidden", hidden)
+    streams = torch.stack(
+        [torch.roll(hidden, shifts=i * 7, dims=0) for i in range(cfg.hc_mult)], dim=1
+    ).contiguous()
+    cap.save("input/streams", streams)
     del embed
     gc.collect()
     torch.cuda.empty_cache()
@@ -117,23 +126,45 @@ def main():
         module.load_ape_weight(module.ape, tensor(cp.read(stem + ".ape"), module.ape.dtype))
         copy(module.norm.weight, cp.read(stem + ".norm.weight"))
 
-    for layer in (2, 3):
+    for layer in (0, 2, 3):
+        if args.layer is not None and layer != args.layer:
+            continue
         ratio = cfg.compress_ratios[layer]
         with torch.device("cuda"):
-            module = MQALayer(cfg, layer, quant_config=None)
+            block = (
+                DeepseekV4DecoderLayer(cfg, layer, quant_config=None)
+                if args.component == "layer"
+                else None
+            )
+            module = (
+                block.self_attn if block is not None else MQALayer(cfg, layer, quant_config=None)
+            )
         stem = f"layers.{layer}.attn"
         for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
             copy(getattr(module, name).weight, cp.block_fp8(stem + "." + name))
         for name in ("q_norm", "kv_norm"):
             copy(getattr(module, name).weight, cp.read(stem + "." + name + ".weight"))
         copy(module.attn_sink, cp.read(stem + ".attn_sink"))
-        load_compressor(module.compressor, stem + ".compressor")
+        if module.compressor is not None:
+            load_compressor(module.compressor, stem + ".compressor")
         if module.indexer is not None:
             copy(module.indexer.wq_b.weight, cp.block_fp8(stem + ".indexer.wq_b"))
             copy(module.indexer.weights_proj.weight, cp.read(stem + ".indexer.weights_proj.weight"))
             load_compressor(module.indexer.compressor, stem + ".indexer.compressor")
-        for schedule, lengths in (("whole128", [128]), ("whole129", [129]), ("split", [63, 65, 1])):
-            prefix = f"attention/l{layer}/{schedule}"
+        if block is not None:
+            from gpu_layer_weights import load_layer_weights
+
+            load_layer_weights(block, cp, cfg, layer, copy, tensor)
+            # Complete one layer, including its final FFN mHC post.
+            block.use_fused_mhc_post_pre = False
+        for schedule, lengths in (
+            ("whole128", [128]),
+            ("whole129", [129]),
+            ("split", [63, 65, 1]),
+            ("whole257", [257]),
+            ("split257", [127, 129, 1]),
+        ):
+            prefix = f"{args.component}/l{layer}/{schedule}"
             try:
                 pool = DeepSeekV4TokenToKVPool(
                     max_num_reqs=1,
@@ -158,13 +189,13 @@ def main():
                     end_layer=layer + 1,
                 )
                 pool.register_mapping(torch.arange(2048, device="cuda", dtype=torch.int64))
-                table = torch.zeros((2, 256), device="cuda", dtype=torch.int32)
-                table[0] = torch.arange(256, 512, device="cuda", dtype=torch.int32)
+                table = torch.zeros((2, 512), device="cuda", dtype=torch.int32)
+                table[0] = torch.arange(256, 768, device="cuda", dtype=torch.int32)
                 req_pool = SimpleNamespace(req_to_token=table, size=1)
                 runner = SimpleNamespace(
                     device="cuda",
                     model_config=SimpleNamespace(
-                        context_len=256,
+                        context_len=512,
                         head_dim=512,
                         v_head_dim=512,
                         hf_text_config=cfg,
@@ -205,6 +236,10 @@ def main():
                         lambda m, a: cap.save(current["name"] + "/wo_a", a[0])
                     )
                 )
+                if block is not None:
+                    from gpu_layer_weights import attach_layer_capture
+
+                    handles.extend(attach_layer_capture(block, cap, current))
                 start = 0
                 for step, count in enumerate(lengths):
                     end = start + count
@@ -235,7 +270,18 @@ def main():
                     fb.global_num_token_non_padded_cpu = count
                     with forward_context(ForwardContext(backend)):
                         backend.init_forward_metadata(fb)
-                        value = module(hidden[start:end].contiguous(), positions, fb)
+                        if block is None:
+                            value = module(hidden[start:end].contiguous(), positions, fb)
+                        else:
+                            current["pre_count"] = current["post_count"] = 0
+                            value, residual_tail, post_tail, comb_tail = block(
+                                positions,
+                                streams[start:end].contiguous(),
+                                ids[start:end],
+                                fb,
+                                input_ids_global=ids[start:end],
+                            )
+                            assert residual_tail is post_tail is comb_tail is None
                     cap.save(current["name"] + "/output", value)
                     cap.save(current["name"] + "/positions", positions)
                     # Actual native cache values, decoded by the SGLang cache kernel.
@@ -245,7 +291,7 @@ def main():
                         128,
                     )
                     cap.save(current["name"] + "/swa_cache", sw)
-                    if end // ratio:
+                    if ratio and end // ratio:
                         ck = dequantize_k_cache_paged(
                             pool.get_extra_key_buffer(layer),
                             torch.arange(
@@ -283,7 +329,7 @@ def main():
                     handle.remove()
                 Path(args.out, "run.json").write_text(json.dumps(meta, indent=2))
                 Path(args.out, "weights.json").write_text(json.dumps(cp.digests, indent=2))
-        del module
+        del module, block
         gc.collect()
         torch.cuda.empty_cache()
     print("GPU_ATTENTION_COMPLETE", len(meta["cases"]), "errors", len(meta["errors"]), flush=True)
