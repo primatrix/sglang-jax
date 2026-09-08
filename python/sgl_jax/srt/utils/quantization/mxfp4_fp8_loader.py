@@ -22,6 +22,7 @@ import math
 import struct
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -148,6 +149,52 @@ def _power2_scales(decoded: np.ndarray, *, weight_name: str) -> np.ndarray:
     if not np.all(np.isfinite(scales)) or np.any(scales <= 0):
         raise Mxfp4ConversionError(f"{weight_name} produced invalid FP32 power-of-two scales")
     return scales
+
+
+@lru_cache(maxsize=1)
+def _exact_fp8_tables():
+    # A normalized FP4 value is codebook[nibble] * 2**exponent_difference.
+    values = np.ldexp(FP4_CODEBOOK[None, :], np.arange(-32, 33)[:, None])
+    quantized = np.clip(values, -FP8_MAX, FP8_MAX).astype(FP8_DTYPE)
+    encoded = quantized.view(np.uint8).reshape(-1)
+    exact = (quantized.astype(np.float32) == values).reshape(-1)
+    encoded.setflags(write=False)
+    exact.setflags(write=False)
+    # ceil(log2(abs(codebook) / 448)); zero must not determine a row's scale.
+    shifts = np.asarray([-30000, -9, -8, -8, -7, -7, -6, -6], np.int16)
+    return encoded, exact, shifts
+
+
+def _try_exact_fp8_chunk(packed: np.ndarray, scales: np.ndarray):
+    """Lossless byte conversion for normal FP32 source values, else defer.
+
+    Restrict source exponents to [-100, 100], so neither source decoding nor
+    power-of-two rescaling encounters FP32 underflow/overflow. The largest
+    magnitude code in each K32 block determines its required row-scale exponent.
+    A lookup entry is admitted only when FP8 reconstructs its normalized value
+    exactly. Exceptional exponents and lossy entries use the reference path.
+    """
+    if np.any((scales < 27) | (scales > 227)):
+        return None
+    encoded, exact, shifts = _exact_fp8_tables()
+    rows, packed_columns = packed.shape
+    nibbles = np.empty((rows, packed_columns * 2), np.uint8)
+    nibbles[:, 0::2] = packed & np.uint8(15)
+    nibbles[:, 1::2] = packed >> np.uint8(4)
+    blocks = nibbles.reshape(rows, -1, 32)
+    max_codes = (blocks & np.uint8(7)).max(axis=-1)
+    exponents = scales.astype(np.int16) - 127
+    row_exponents = (exponents + shifts[max_codes]).max(axis=1)
+    row_exponents = np.where(max_codes.max(axis=1) > 0, row_exponents, 0).astype(np.int16)
+    delta = exponents - row_exponents[:, None]
+    if np.any(((delta < -32) | (delta > 32)) & (max_codes > 0)):
+        return None
+    indices = ((np.clip(delta, -32, 32) + 32) * 16)[:, :, None] + blocks
+    if not np.all(exact[indices]):
+        return None
+    output = encoded[indices].reshape(rows, packed_columns * 2)
+    output_scales = np.ldexp(np.ones(rows, np.float32), row_exponents.astype(np.int32))
+    return output, output_scales
 
 
 @dataclass(frozen=True)
@@ -448,6 +495,16 @@ def convert_mxfp4_pair_from_reader(
                 f"reader returned {scale_name} shape={scale_chunk.shape}, expected "
                 f"{(stop - start, columns // 32)}"
             )
+
+        if strict:
+            exact_chunk = _try_exact_fp8_chunk(packed_chunk, scale_chunk)
+            if exact_chunk is not None:
+                output_bytes[row_slice], output_scale[row_slice] = exact_chunk
+                exact_count += (stop - start) * columns
+                # Every admitted element is exact, so all error metrics are zero.
+                # strict=True never returns a lossy report. The report-only path
+                # below retains complete FP64 norm accounting for strict=False.
+                continue
 
         decoded = _decode_chunk(packed_chunk, scale_chunk, scale_name=scale_name)
         scales = _power2_scales(decoded, weight_name=weight_name)

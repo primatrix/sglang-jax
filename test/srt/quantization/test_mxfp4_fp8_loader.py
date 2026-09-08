@@ -190,3 +190,87 @@ def test_real_sample_roundtrip_when_evidence_dir_is_provided() -> None:
                 converted.logical_shape[1],
                 converted.logical_shape[0],
             )
+
+
+@pytest.mark.parametrize("spread", [0, 1, 4, 8, 14])
+def test_exact_shortcut_matches_reference_for_all_codes_and_normal_exponents(spread):
+    high = np.arange(27 + spread, 228, dtype=np.uint8)
+    scales = np.stack((high, high - spread), axis=1)
+    codes = np.tile(np.arange(16, dtype=np.uint8), (len(high), 4))
+    packed = _pack_codes(codes)
+    kwargs = dict(
+        weight_name="layers.0.ffn.experts.0.w1.weight",
+        scale_name="layers.0.ffn.experts.0.w1.scale",
+        row_chunk_size=17,
+    )
+    reference = convert_mxfp4_pair(packed, scales, strict=False, **kwargs)
+    actual = convert_mxfp4_pair(packed, scales, strict=True, **kwargs)
+    assert reference.report.exact and actual.report.exact
+    np.testing.assert_array_equal(
+        actual.weight_fp8.view(np.uint8), reference.weight_fp8.view(np.uint8)
+    )
+    np.testing.assert_array_equal(actual.scale_fp32, reference.scale_fp32)
+    assert actual.report.rel_l2 == reference.report.rel_l2 == 0
+
+
+def test_exact_shortcut_preserves_signed_zero_and_loss_rejection():
+    codes = np.tile(np.array([0, 8], np.uint8), (3, 32))
+    scales = np.array([[27, 227], [126, 127], [227, 27]], np.uint8)
+    kwargs = dict(
+        weight_name="layers.0.ffn.experts.0.w1.weight",
+        scale_name="layers.0.ffn.experts.0.w1.scale",
+    )
+    reference = convert_mxfp4_pair(_pack_codes(codes), scales, strict=False, **kwargs)
+    actual = convert_mxfp4_pair(_pack_codes(codes), scales, **kwargs)
+    np.testing.assert_array_equal(
+        actual.weight_fp8.view(np.uint8), reference.weight_fp8.view(np.uint8)
+    )
+    np.testing.assert_array_equal(actual.scale_fp32, np.ones(3, np.float32))
+    packed = _pack_codes(np.tile(np.arange(16, dtype=np.uint8), (2, 4)))
+    # The first chunk is exact; the second exceeds the FP8 subnormal grid.
+    scales = np.array([[127, 127], [127, 112]], np.uint8)
+    reference = convert_mxfp4_pair(packed, scales, strict=False, row_chunk_size=1, **kwargs)
+    assert not reference.report.exact and reference.report.underflow_count > 0
+    with pytest.raises(Mxfp4ConversionError, match="lossy MXFP4->FP8"):
+        convert_mxfp4_pair(packed, scales, strict=True, row_chunk_size=1, **kwargs)
+
+
+@pytest.mark.parametrize("source_scale", [0, 26, 228, 253, 254, 255])
+def test_shortcut_fallback_keeps_reference_extreme_exponent_behavior(source_scale):
+    packed = _pack_codes(np.tile(np.arange(16, dtype=np.uint8), (1, 2)))
+    scales = np.full((1, 1), source_scale, np.uint8)
+    kwargs = dict(
+        weight_name="layers.0.ffn.experts.0.w1.weight", scale_name="layers.0.ffn.experts.0.w1.scale"
+    )
+    try:
+        reference = convert_mxfp4_pair(packed, scales, strict=False, **kwargs)
+    except Mxfp4ConversionError:
+        with pytest.raises(Mxfp4ConversionError):
+            convert_mxfp4_pair(packed, scales, strict=True, **kwargs)
+    else:
+        actual = convert_mxfp4_pair(packed, scales, strict=True, **kwargs)
+        np.testing.assert_array_equal(
+            actual.weight_fp8.view(np.uint8), reference.weight_fp8.view(np.uint8)
+        )
+        np.testing.assert_array_equal(actual.scale_fp32, reference.scale_fp32)
+
+
+def test_shortcut_row_scale_covers_each_maximum_magnitude_code():
+    rng = np.random.default_rng(340)
+    maxima = np.tile(np.arange(8), 16)
+    codes = np.stack([rng.integers(0, int(m) + 1, 128, dtype=np.uint8) for m in maxima])
+    codes |= rng.integers(0, 2, codes.shape, dtype=np.uint8) << 3
+    scales = rng.integers(40, 200, (128, 1), dtype=np.uint8) + rng.integers(
+        0, 8, (128, 4), dtype=np.uint8
+    )
+    kwargs = dict(
+        weight_name="layers.0.ffn.experts.0.w1.weight",
+        scale_name="layers.0.ffn.experts.0.w1.scale",
+        row_chunk_size=17,
+    )
+    reference = convert_mxfp4_pair(_pack_codes(codes), scales, strict=False, **kwargs)
+    actual = convert_mxfp4_pair(_pack_codes(codes), scales, **kwargs)
+    np.testing.assert_array_equal(
+        actual.weight_fp8.view(np.uint8), reference.weight_fp8.view(np.uint8)
+    )
+    np.testing.assert_array_equal(actual.scale_fp32, reference.scale_fp32)
