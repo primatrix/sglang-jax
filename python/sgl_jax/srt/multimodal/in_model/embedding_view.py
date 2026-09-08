@@ -1,30 +1,29 @@
-"""A zero-copy view whose lease protects an asynchronous embedding buffer."""
+"""Host-only views over a fixed device pool; slicing never moves embeddings."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Protocol
 
 import jax
+import numpy as np
 
 
 class EmbeddingLease(Protocol):
-    def release_after(self, dependency: Any) -> None: ...
+    def record_read(self, result: jax.Array) -> None: ...
     def release(self) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
 class PooledEmbedding:
-    """A row view into a registered receive pool without a device-side slice."""
-
     buffer: jax.Array
-    slot: int
-    block_shape: tuple[int, ...]
-    shape: tuple[int, int]
-    lease: EmbeddingLease
-    row_offset: int = 0
-    # Preserve the full transfer extent when individual items take row slices.
-    total_rows: int | None = None
+    row_indices: np.ndarray
+    width: int
+    leases: tuple[EmbeddingLease, ...]
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return len(self.row_indices), self.width
 
     @property
     def dtype(self):
@@ -35,39 +34,44 @@ class PooledEmbedding:
         return 2
 
     @property
-    def flat_row_start(self) -> int:
-        return self.slot * self.block_shape[0] + self.row_offset
-
-    @property
     def flat_buffer(self) -> jax.Array:
-        return self.buffer.reshape(self.buffer.shape[0] * self.block_shape[0], -1)
-
-    @property
-    def is_last_slice(self) -> bool:
-        return self.total_rows is None or self.row_offset + self.shape[0] == self.total_rows
+        return self.buffer.reshape(self.buffer.shape[0] * self.buffer.shape[1], -1)
 
     def __len__(self) -> int:
-        return self.shape[0]
+        return len(self.row_indices)
 
     def __getitem__(self, index: slice) -> PooledEmbedding:
         if not isinstance(index, slice) or index.step not in (None, 1):
             raise TypeError("pooled embeddings support contiguous row slices only")
-        start, stop, step = index.indices(self.shape[0])
-        if step != 1:
-            raise TypeError("pooled embeddings support contiguous row slices only")
+        return PooledEmbedding(self.buffer, self.row_indices[index], self.width, self.leases)
+
+    @staticmethod
+    def concatenate(embeddings: list[PooledEmbedding]) -> PooledEmbedding:
+        first = embeddings[0]
+        if len(embeddings) == 1:
+            return first
+        if any(e.buffer is not first.buffer or e.width != first.width for e in embeddings):
+            raise ValueError("Received embeddings must share one pool and width")
+        leases = {id(lease): lease for e in embeddings for lease in e.leases}
         return PooledEmbedding(
-            self.buffer,
-            self.slot,
-            self.block_shape,
-            (max(0, stop - start), self.shape[1]),
-            self.lease,
-            self.row_offset + start,
-            self.total_rows if self.total_rows is not None else self.row_offset + self.shape[0],
+            first.buffer,
+            np.concatenate([e.row_indices for e in embeddings]),
+            first.width,
+            tuple(leases.values()),
         )
 
-    def materialize(self) -> jax.Array:
-        return jax.lax.dynamic_slice(
-            self.flat_buffer,
-            (self.flat_row_start, 0),
-            self.shape,
-        )
+    def record_read(self, result: jax.Array) -> None:
+        for lease in self.leases:
+            lease.record_read(result)
+
+    def release(self) -> None:
+        for lease in self.leases:
+            lease.release()
+
+
+def release_received_embeddings(mm_inputs) -> None:
+    """End request ownership; leases still wait for outstanding device reads."""
+    for item in getattr(mm_inputs, "mm_items", ()):
+        if isinstance(item.precomputed_embeddings, PooledEmbedding):
+            item.precomputed_embeddings.release()
+            item.precomputed_embeddings = None

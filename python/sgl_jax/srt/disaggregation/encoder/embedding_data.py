@@ -76,7 +76,7 @@ class MultiModalEmbeddingData:
         if not is_concat:
             return [embedding for _, embedding in parts]
 
-        grouped: dict[Modality, list[jax.Array]] = {}
+        grouped: dict[Modality, list[jax.Array | PooledEmbedding]] = {}
         for data, embedding in parts:
             grouped.setdefault(data.modality, []).append(embedding)
         result = {}
@@ -84,19 +84,12 @@ class MultiModalEmbeddingData:
             if len(embeddings) == 1:
                 result[modality] = embeddings[0]
                 continue
-            materialized = [
-                embedding.materialize() if isinstance(embedding, PooledEmbedding) else embedding
-                for embedding in embeddings
-            ]
-            combined = jnp.concatenate(materialized, axis=0)
-            leases = {
-                id(embedding.lease): embedding.lease
-                for embedding in embeddings
-                if isinstance(embedding, PooledEmbedding)
-            }
-            for lease in leases.values():
-                lease.release_after(combined)
-            result[modality] = combined
+            if all(isinstance(embedding, PooledEmbedding) for embedding in embeddings):
+                result[modality] = PooledEmbedding.concatenate(embeddings)
+            elif any(isinstance(embedding, PooledEmbedding) for embedding in embeddings):
+                raise ValueError("Cannot mix pooled and materialized embedding parts")
+            else:
+                result[modality] = jnp.concatenate(embeddings, axis=0)
         return result
 
     def get_mm_extra_meta(self) -> dict[str, Any]:
@@ -148,4 +141,4 @@ class MultiModalEmbeddingData:
         """Release received parts when their request is cancelled before admission."""
         for part in self._parts:
             if part is not None and isinstance(part[1], PooledEmbedding):
-                part[1].lease.release()
+                part[1].release()

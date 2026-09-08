@@ -25,7 +25,7 @@ class PreprocessedRequest:
 
 
 @dataclass(slots=True)
-class _ReadyRequest:
+class _EncodeRequest:
     preprocessed: PreprocessedRequest
     on_result: _ResultCallback
     callback_loop: asyncio.AbstractEventLoop
@@ -33,7 +33,7 @@ class _ReadyRequest:
 
 @dataclass(slots=True)
 class _EncodeBatch:
-    requests: list[_ReadyRequest]
+    requests: list[_EncodeRequest]
     model_input: Any
 
     def mark(self, stage: str) -> None:
@@ -86,11 +86,11 @@ class EncoderRuntime:
         self._batch_coalesce_s = max(0.0, float(batch_coalesce_ms)) / 1000.0
         # This is the completed-preprocess reservoir. The ViT thread drains it
         # when submitting the next batch, without waiting for device completion.
-        self._ready_queue: queue.Queue[_ReadyRequest | object] = queue.Queue(
+        self._encode_queue: queue.Queue[_EncodeRequest | object] = queue.Queue(
             depth * self._max_batch_size
         )
-        # Reserve pool slots before encoding; they bound queued outputs until
-        # transfer completion reclaims the slots. No second queue limit is needed.
+        # Reserve pool pages before encoding; they bound queued outputs until
+        # transfer completion reclaims them. No second queue limit is needed.
         self._transfer_queue: queue.SimpleQueue[_TransferBatch | object] = queue.SimpleQueue()
         self._start_lock = threading.Lock()
         self._started = False
@@ -136,7 +136,7 @@ class EncoderRuntime:
 
     def _stop_workers(self) -> None:
         # Drain each stage before stopping the next one.
-        self._ready_queue.put(_STOP)
+        self._encode_queue.put(_STOP)
         if self._encode_thread is not None:
             self._encode_thread.join()
 
@@ -170,14 +170,14 @@ class EncoderRuntime:
             raise RuntimeError("EncoderRuntime is stopped")
         if not self._started:
             self.start()
-        job = _ReadyRequest(prepared, on_result, asyncio.get_running_loop())
+        job = _EncodeRequest(prepared, on_result, asyncio.get_running_loop())
         try:
-            self._ready_queue.put_nowait(job)
+            self._encode_queue.put_nowait(job)
         except queue.Full:
-            await asyncio.to_thread(self._ready_queue.put, job)
+            await asyncio.to_thread(self._encode_queue.put, job)
 
     def _encode_worker(self) -> None:
-        backlog: deque[_ReadyRequest] = deque()
+        backlog: deque[_EncodeRequest] = deque()
         stopping = False
         while True:
             if backlog:
@@ -185,45 +185,41 @@ class EncoderRuntime:
             elif stopping:
                 return
             else:
-                item = self._next_ready_request()
+                item = self._encode_queue.get()
                 if item is _STOP:
                     return
-            assert isinstance(item, _ReadyRequest)
-            batch, saw_stop = self._collect_ready(item, backlog)
+            assert isinstance(item, _EncodeRequest)
+            batch, saw_stop = self._collect_batch(item, backlog)
             stopping = stopping or saw_stop
             job = _EncodeBatch(batch, None)
             try:
                 job.model_input = self._encoder.build_batch(
                     [item.preprocessed.model_input for item in batch]
                 )
-                self._transfer.precompile_packed_batches(job.model_input.transfer_specs)
             except Exception as exc:
                 job.fail_batch(exc)
             else:
                 self._encode_batch(job)
 
-    def _next_ready_request(self, timeout: float | None = None) -> Any:
-        if timeout is None:
-            return self._ready_queue.get()
-        if timeout <= 0:
-            return self._ready_queue.get_nowait()
-        return self._ready_queue.get(timeout=timeout)
-
-    def _collect_ready(
+    def _collect_batch(
         self,
-        first: _ReadyRequest,
-        backlog: deque[_ReadyRequest],
-    ) -> tuple[list[_ReadyRequest], bool]:
+        first: _EncodeRequest,
+        backlog: deque[_EncodeRequest],
+    ) -> tuple[list[_EncodeRequest], bool]:
         batch = [first]
         key = first.preprocessed.batch_key
+        limit = min(
+            self._max_batch_size,
+            self._transfer.batch_capacity(first.preprocessed.model_input.token_count),
+        )
 
-        retained: deque[_ReadyRequest] = deque()
+        retained: deque[_EncodeRequest] = deque()
         while backlog:
             item = backlog.popleft()
             if (
                 item.callback_loop is first.callback_loop
                 and item.preprocessed.batch_key == key
-                and len(batch) < self._max_batch_size
+                and len(batch) < limit
             ):
                 batch.append(item)
             else:
@@ -232,9 +228,9 @@ class EncoderRuntime:
 
         deadline = time.monotonic() + self._batch_coalesce_s
         saw_stop = False
-        while len(batch) < self._max_batch_size:
+        while len(batch) < limit:
             try:
-                item = self._next_ready_request(timeout=0)
+                item = self._encode_queue.get_nowait()
             except queue.Empty:
                 # A ready incompatible request is immediately actionable; do
                 # not leave the device idle waiting for this key to grow.
@@ -244,14 +240,14 @@ class EncoderRuntime:
                 if remaining <= 0:
                     break
                 try:
-                    item = self._next_ready_request(timeout=remaining)
+                    item = self._encode_queue.get(timeout=remaining)
                 except queue.Empty:
                     break
 
             if item is _STOP:
                 saw_stop = True
                 break
-            assert isinstance(item, _ReadyRequest)
+            assert isinstance(item, _EncodeRequest)
             if item.callback_loop is first.callback_loop and item.preprocessed.batch_key == key:
                 batch.append(item)
             else:
@@ -266,14 +262,15 @@ class EncoderRuntime:
         reservations = None
         try:
             job.mark("transfer_reserve_start_ns")
-            reservations = self._transfer.reserve_batch_sync(transfer_ids)
+            reservations = self._transfer.reserve_batch_sync(
+                transfer_ids, job.model_input.token_counts
+            )
             job.mark("encoder_dispatch_start_ns")
             packed_output = self._encoder.encode_packed(job.model_input)
             job.mark("encoder_dispatch_done_ns")
             staged_transfers = self._transfer.stage_packed_batch_sync(
                 reservations,
                 packed_output.packed,
-                packed_output.batch.token_counts,
             )
             if len(staged_transfers) != len(requests):
                 raise RuntimeError("transfer returned an incomplete staged batch")

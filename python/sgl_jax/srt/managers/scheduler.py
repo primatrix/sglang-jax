@@ -99,6 +99,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     recurrent_admission_blocked,
 )
+from sgl_jax.srt.multimodal.in_model.embedding_view import release_received_embeddings
 from sgl_jax.srt.multimodal.manager.multimodal_processor import (
     get_mm_processor,
     import_processors,
@@ -2883,6 +2884,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            release_received_embeddings(req.mm_inputs)
             abort_out = AbortReq(rid=req.rid)
             if self._comm_backend is not None:
                 self._comm_backend.send_pyobj(abort_out)
@@ -2897,6 +2899,7 @@ class Scheduler(
                 if req.grammar:
                     req.grammar.cancel()
                 req.set_finish_with_abort("Aborted by AbortReq.")
+                release_received_embeddings(req.mm_inputs)
 
         # Delete requests in the running batch
         reqs = []

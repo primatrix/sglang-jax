@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from functools import partial
 
 from sgl_jax.srt.disaggregation.encoder.embedding_data import EmbeddingData
 from sgl_jax.srt.disaggregation.encoder.runtime import EncoderRuntime
@@ -30,9 +31,9 @@ class DisaggEncoderScheduler:
         self._runtime = runtime
         self._request_timeout = request_timeout
         self._enable_time_stats = enable_time_stats
-        self._pending_queue: asyncio.Queue[_PendingRequest] = asyncio.Queue()
-        self._workers: set[asyncio.Task[None]] = set()
-        self._requests: set[_PendingRequest] = set()
+        self._preprocess_queue: asyncio.Queue[_PendingRequest] = asyncio.Queue()
+        self._preprocess_workers: set[asyncio.Task[None]] = set()
+        self._inflight_requests: set[_PendingRequest] = set()
         self._running = False
 
     def start(self) -> None:
@@ -44,28 +45,28 @@ class DisaggEncoderScheduler:
                 self._preprocess_worker(),
                 name=f"encoder-preprocess-{index}",
             )
-            self._workers.add(task)
-            task.add_done_callback(self._workers.discard)
+            self._preprocess_workers.add(task)
+            task.add_done_callback(self._preprocess_workers.discard)
 
     async def stop(self) -> None:
         self._running = False
-        workers = tuple(self._workers)
+        workers = tuple(self._preprocess_workers)
         for task in workers:
             task.cancel()
         if workers:
             await asyncio.gather(*workers, return_exceptions=True)
-        self._workers.clear()
+        self._preprocess_workers.clear()
 
         error = RuntimeError("DisaggEncoderScheduler stopped")
-        for pending in self._requests:
+        for pending in self._inflight_requests:
             if not pending.future.done():
                 pending.future.set_exception(error)
         while True:
             try:
-                self._pending_queue.get_nowait()
+                self._preprocess_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-            self._pending_queue.task_done()
+            self._preprocess_queue.task_done()
 
     async def submit(self, request: dict) -> EmbeddingData:
         if not self._running:
@@ -78,18 +79,18 @@ class DisaggEncoderScheduler:
         request["request_time_stats"] = timing
         mark_time_stats(timing, "enqueue_ns")
         pending = _PendingRequest(request)
-        self._requests.add(pending)
-        await self._pending_queue.put(pending)
+        self._inflight_requests.add(pending)
+        await self._preprocess_queue.put(pending)
         try:
             if self._request_timeout is None or self._request_timeout <= 0:
                 return await pending.future
             return await asyncio.wait_for(pending.future, self._request_timeout)
         finally:
-            self._requests.discard(pending)
+            self._inflight_requests.discard(pending)
 
     async def _preprocess_worker(self) -> None:
         while True:
-            pending = await self._pending_queue.get()
+            pending = await self._preprocess_queue.get()
             try:
                 if pending.future.done():
                     continue
@@ -97,20 +98,14 @@ class DisaggEncoderScheduler:
                 if pending.future.done():
                     continue
 
-                def complete(
-                    result: EmbeddingData | Exception,
-                    pending: _PendingRequest = pending,
-                ) -> None:
-                    self._complete(pending, result)
-
-                await self._runtime.enqueue_preprocessed(prepared, complete)
+                await self._runtime.enqueue_preprocessed(prepared, partial(self._complete, pending))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.exception("Encoder preprocessing failed")
                 self._complete(pending, exc)
             finally:
-                self._pending_queue.task_done()
+                self._preprocess_queue.task_done()
 
     def _complete(
         self,

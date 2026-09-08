@@ -24,16 +24,14 @@ class Encoder:
         self.batches = []
 
     async def preprocess_request(self, request):
-        return request
+        return SimpleNamespace(**request, token_count=request["tokens"])
 
     def batch_key(self, request):
-        return request["tokens"]
+        return request.tokens
 
     def build_batch(self, requests):
-        self.batches.append([request["req_id"] for request in requests])
-        return SimpleNamespace(
-            token_counts=tuple(request["tokens"] for request in requests), transfer_specs=()
-        )
+        self.batches.append([request.req_id for request in requests])
+        return SimpleNamespace(token_counts=tuple(request.tokens for request in requests))
 
     def encode_packed(self, batch):
         return SimpleNamespace(batch=batch, packed=np.zeros((sum(batch.token_counts), 2)))
@@ -51,14 +49,14 @@ class Transfer:
         self.allow_publish = threading.Event()
         self.allow_publish.set()
 
-    def precompile_packed_batches(self, specs):
-        pass
+    def batch_capacity(self, token_count):
+        return 8
 
-    def reserve_batch_sync(self, ids):
+    def reserve_batch_sync(self, ids, token_counts):
         self.reserved.update(ids)
         return ids
 
-    def stage_packed_batch_sync(self, reservations, packed, token_counts):
+    def stage_packed_batch_sync(self, reservations, packed):
         if self.fail == "copy":
             raise RuntimeError("copy failed")
         return reservations
@@ -164,9 +162,9 @@ def test_out_of_order_parts_preserve_order_and_reject_duplicates():
     np.testing.assert_array_equal(parts.get_mm_extra_meta()["image_grid_thw"], [[1, 2, 2]] * 2)
     with pytest.raises(ValueError):
         MultiModalEmbeddingData(0)
-    view = PooledEmbedding(np.zeros((2, 4, 3)), 1, (4, 3), (4, 3), object())
+    view = PooledEmbedding(np.zeros((2, 4, 3)), np.arange(4, 8), 3, (object(),))
     assert view[3:1].shape == (0, 3)
-    assert view[-2:].flat_row_start == 6
+    np.testing.assert_array_equal(view[-2:].row_indices, [6, 7])
 
 
 @pytest.mark.parametrize("claimed", [False, True])
@@ -179,7 +177,7 @@ def test_cancelled_completed_request_releases_only_unclaimed_embeddings(claimed)
     parts = MultiModalEmbeddingData(1)
     parts.add(
         EmbeddingData("request", 1, 0, Modality.IMAGE),
-        PooledEmbedding(np.zeros((1, 2, 3)), 0, (2, 3), (2, 3), lease),
+        PooledEmbedding(np.zeros((1, 2, 3)), np.arange(2), 3, (lease,)),
     )
     pending = PendingEncoderRequest(SimpleNamespace(), 0, Mock(), (), (), parts, Mock(), Mock())
     pending._result = {}

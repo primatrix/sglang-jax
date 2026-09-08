@@ -13,6 +13,7 @@ from sgl_jax.srt.layers.routed_experts_capturer import get_global_experts_captur
 from sgl_jax.srt.managers.io_struct import AbortReq, BatchTokenIDOut
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 from sgl_jax.srt.mem_cache.common import release_kv_cache
+from sgl_jax.srt.multimodal.in_model.embedding_view import release_received_embeddings
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.request_time_stats import mark_request_time_stats
 from sgl_jax.srt.speculative.overlap_utils import (
@@ -123,6 +124,7 @@ class SchedulerOutputProcessorMixin:
         assert req.is_chunked == 0
         req.check_finished()
         assert req.finished(), f"Chunked abort did not finish request {req.rid}"
+        release_received_embeddings(req.mm_inputs)
         _complete_precision_trace(req)
         self._release_prefill_host_buffer(req)
         release_kv_cache(
@@ -873,6 +875,7 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             if req.finished():
+                release_received_embeddings(getattr(req, "mm_inputs", None))
                 if req.finished_output:
                     # With the overlap schedule, a request will try to output twice and hit this line twice
                     # because of the one additional delayed token. This "continue" prevented the dummy output.

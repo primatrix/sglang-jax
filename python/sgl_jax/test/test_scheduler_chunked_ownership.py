@@ -64,6 +64,9 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.dp_size = dp_size
         scheduler.pd = ""
+        scheduler.server_args = SimpleNamespace(enable_request_time_stats_logging=False)
+        scheduler.encoder_waiting = {}
+        scheduler.encoder_client = None
         scheduler._engine_paused = False
         scheduler.enable_overlap = False
         scheduler.chunked_reqs = active_reqs

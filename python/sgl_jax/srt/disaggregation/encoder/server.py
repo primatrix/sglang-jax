@@ -18,6 +18,7 @@ from zmq.constants import LINGER, PUSH
 from sgl_jax.srt.disaggregation.encoder.bootstrap import EncoderBootstrapClient
 from sgl_jax.srt.disaggregation.encoder.embedding_data import EmbeddingData
 from sgl_jax.srt.disaggregation.encoder.model import MMEncoder
+from sgl_jax.srt.disaggregation.encoder.raiden_pool import create_encoder_pool
 from sgl_jax.srt.disaggregation.encoder.raiden_transfer import (
     RaidenEncoderServerTransfer,
 )
@@ -277,18 +278,21 @@ class EncoderServer:
     async def profile_status(self) -> dict[str, Any]:
         return {"status": "in_progress" if self._trace_active else "idle"}
 
-    def run(self, host: str, port: int) -> None:
-        uvicorn.run(self.app, host=host, port=port)
-
 
 def launch(server_args: ServerArgs) -> None:
     configure_logger(server_args)
     set_uvicorn_logging_configs()
     encoder = MMEncoder(server_args)
     try:
+        model = getattr(encoder.model, "thinker", encoder.model)
+        pool = create_encoder_pool(server_args, encoder.model_config, model.mesh)
+        if not server_args.disable_precompile:
+            for capacity in model.get_multimodal_embedding_packed_capacities():
+                pool.warmup(capacity)
         host_ip = resolve_host_ip(server_args.disaggregation_host_ip)
         transfer = RaidenEncoderServerTransfer(
             host_ip,
+            pool,
             parallelism=server_args.disaggregation_channel_number,
             pool_size=server_args.encoder_transfer_pool_size,
             timeout_s=server_args.encoder_request_timeout_seconds,
@@ -313,6 +317,6 @@ def launch(server_args: ServerArgs) -> None:
             request_timeout=server_args.encoder_request_timeout_seconds,
             enable_time_stats=server_args.enable_request_time_stats_logging,
         )
-        server.run(server_args.host, server_args.port)
+        uvicorn.run(server.app, host=server_args.host, port=server_args.port)
     finally:
         encoder.shutdown()

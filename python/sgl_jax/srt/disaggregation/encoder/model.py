@@ -40,7 +40,6 @@ class PreparedEncoderBatch:
     modality: Modality
     inputs: list[MultimodalInputs]
     token_counts: tuple[int, ...]
-    transfer_specs: tuple[tuple[jax.ShapeDtypeStruct, tuple[int, ...]], ...]
 
 
 @dataclass(slots=True)
@@ -66,9 +65,6 @@ class MMEncoder:
         apply_multimodal_model_defaults(server_args, self.model_config)
         if not self.model_config.is_multimodal:
             raise ValueError("--encoder-only requires an in-model multimodal architecture")
-
-        self._max_batch_size = max(1, int(server_args.encoder_max_batch_size))
-        self._precompile = not server_args.disable_precompile
 
         config = self.model_config.hf_config
         config.vision_encoder_parallel = server_args.vision_encoder_parallel
@@ -111,11 +107,33 @@ class MMEncoder:
     async def preprocess_request(self, request: dict[str, Any]) -> PreparedEncoderRequest:
         """Preprocess one request without committing it to a ViT batch."""
         modality = Modality.from_str(request["modality"])
-        inputs = await self._process_request(request, modality)
+        mm_items = request.get("mm_items") or []
+        if not mm_items:
+            raise ValueError("encoder request contains no multimodal items")
+        request_obj = SimpleNamespace(
+            image_data=mm_items if modality == Modality.IMAGE else None,
+            video_data=mm_items if modality == Modality.VIDEO else None,
+            audio_data=mm_items if modality == Modality.AUDIO else None,
+            fps=request.get("fps"),
+            num_frames=request.get("num_frames"),
+        )
+        inputs = await self.mm_processor.process_encoder_mm_data_async(
+            image_data=request_obj.image_data,
+            input_text=self._placeholder(modality) * len(mm_items),
+            request_obj=request_obj,
+        )
+        items = [item for item in inputs.mm_items if item.modality == modality]
+        if len(items) != len(mm_items):
+            raise ValueError(
+                f"processor produced {len(items)} {modality.name} items for {len(mm_items)} inputs"
+            )
+        inputs.mm_items = items
         return PreparedEncoderRequest(
             modality=modality,
             inputs=inputs,
-            token_count=self._token_counts([inputs])[0],
+            token_count=sum(
+                end - start for item in items for start, end in item.placeholder_ranges or ()
+            ),
         )
 
     @staticmethod
@@ -135,12 +153,10 @@ class MMEncoder:
 
         processed = [request.inputs for request in requests]
         token_counts = tuple(request.token_count for request in requests)
-        transfer_specs = self._packed_transfer_specs(processed, token_counts)
         return PreparedEncoderBatch(
             modality,
             processed,
             token_counts,
-            transfer_specs,
         )
 
     @property
@@ -156,7 +172,7 @@ class MMEncoder:
         processed = batch.inputs
         with jax.profiler.TraceAnnotation(f"mm_encode:{modality.name}:{len(processed)}"):
             items = [item for mm_inputs in processed for item in mm_inputs.mm_items]
-            target = self.model.thinker if hasattr(self.model, "thinker") else self.model
+            target = getattr(self.model, "thinker", self.model)
             get_feature = getattr(target, f"get_{modality.name.lower()}_feature", None)
             if get_feature is None:
                 raise ValueError(f"model has no {modality.name} encoder")
@@ -170,93 +186,6 @@ class MMEncoder:
         output: PackedEncoderOutput,
     ) -> list[dict[str, Any]]:
         return [self._metadata(inputs, output.batch.modality) for inputs in output.batch.inputs]
-
-    async def _process_request(
-        self, request: dict[str, Any], modality: Modality
-    ) -> MultimodalInputs:
-        mm_items = request.get("mm_items") or []
-        if not mm_items:
-            raise ValueError("encoder request contains no multimodal items")
-        request_obj = SimpleNamespace(
-            image_data=mm_items if modality == Modality.IMAGE else None,
-            video_data=mm_items if modality == Modality.VIDEO else None,
-            audio_data=mm_items if modality == Modality.AUDIO else None,
-            fps=request.get("fps"),
-            num_frames=request.get("num_frames"),
-        )
-        mm_inputs = await self.mm_processor.process_encoder_mm_data_async(
-            image_data=request_obj.image_data,
-            input_text=self._placeholder(modality) * len(mm_items),
-            request_obj=request_obj,
-        )
-        items = [item for item in mm_inputs.mm_items if item.modality == modality]
-        if len(items) != len(mm_items):
-            raise ValueError(
-                f"processor produced {len(items)} {modality.name} items for {len(mm_items)} inputs"
-            )
-        mm_inputs.mm_items = items
-        return mm_inputs
-
-    @staticmethod
-    def _token_counts(processed: list[MultimodalInputs]) -> tuple[int, ...]:
-        return tuple(
-            sum(
-                end - start
-                for item in mm_inputs.mm_items
-                for start, end in item.placeholder_ranges or ()
-            )
-            for mm_inputs in processed
-        )
-
-    def _packed_transfer_specs(
-        self,
-        processed: list[MultimodalInputs],
-        token_counts: tuple[int, ...],
-    ) -> tuple[tuple[jax.ShapeDtypeStruct, tuple[int, ...]], ...]:
-        if not self._precompile:
-            return ()
-        target = self.model.thinker if hasattr(self.model, "thinker") else self.model
-        planner = getattr(target, "get_multimodal_embedding_packed_capacity", None)
-        if planner is None:
-            return ()
-
-        items = [item for mm_inputs in processed for item in mm_inputs.mm_items]
-        capacity = planner(items)
-        if capacity is None:
-            return ()
-        variants = {(int(capacity), token_counts)}
-        signatures = [
-            tuple((item.modality, tuple(item.feature.shape)) for item in mm_inputs.mm_items)
-            for mm_inputs in processed
-        ]
-        if signatures and all(signature == signatures[0] for signature in signatures):
-            sample_items = processed[0].mm_items
-            sample_count = token_counts[0]
-            for batch_size in range(1, self._max_batch_size + 1):
-                batch_capacity = planner(sample_items * batch_size)
-                if batch_capacity is not None:
-                    variants.add(
-                        (
-                            int(batch_capacity),
-                            (sample_count,) * batch_size,
-                        )
-                    )
-
-        sharding = jax.sharding.NamedSharding(
-            target.mesh,
-            jax.sharding.PartitionSpec(),
-        )
-        return tuple(
-            (
-                jax.ShapeDtypeStruct(
-                    (packed_capacity, self.model_config.hidden_size),
-                    self.model_config.dtype,
-                    sharding=sharding,
-                ),
-                counts,
-            )
-            for packed_capacity, counts in sorted(variants, key=lambda value: len(value[1]))
-        )
 
     def _placeholder(self, modality: Modality) -> str:
         config = self.mm_processor.hf_config

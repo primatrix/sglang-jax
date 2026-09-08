@@ -16,6 +16,8 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, MockModelConfig, ModelConfig
+from sgl_jax.srt.disaggregation.encoder.raiden_pool import create_encoder_pool
+from sgl_jax.srt.disaggregation.encoder.transfer_layout import encoder_transfer_nbytes
 from sgl_jax.srt.eplb.expert_location import (
     init_expert_location_metadata,
     set_global_server_args,
@@ -71,6 +73,14 @@ def _embedding_pool_bytes(
     multimodal_model=None,
 ) -> int:
     """Per-device byte budget reserved for the multimodal embedding pool."""
+    if getattr(server_args, "language_only", False) and not is_draft_worker:
+        vision = getattr(model_config.hf_config, "vision_config", None)
+        width = model_config.hidden_size * (
+            1 + len(getattr(vision, "deepstack_visual_indexes", ()))
+        )
+        return encoder_transfer_nbytes(
+            (server_args.encoder_transfer_max_tokens, width), model_config.dtype
+        )
     enabled = (
         getattr(model_config, "is_multimodal", False)
         and ModelRegistry.is_in_model_multimodal(model_config.hf_config.architectures)
@@ -140,6 +150,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.moe_dp_size = server_args.moe_dp_size
         self.server_args = server_args
         self.embedding_pool: EmbeddingPool | None = None
+        self.encoder_embedding_pool = None
         self.is_generation = model_config.is_generation
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
@@ -241,6 +252,11 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         :meth:`_profile_available_bytes`.
         """
         if not self.embedding_pool_bytes:
+            return
+        if getattr(self.server_args, "language_only", False):
+            self.encoder_embedding_pool = create_encoder_pool(
+                self.server_args, self.model_config, self.mesh
+            )
             return
         page_size = self.server_args.page_size
         packed_hidden = _packed_embedding_hidden(self.model_config, self.model)

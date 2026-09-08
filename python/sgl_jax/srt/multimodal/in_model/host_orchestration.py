@@ -21,10 +21,7 @@ from sgl_jax.srt.multimodal.in_model.embedding_pool import (
     EmbeddingPool,
     EmbeddingPoolEntry,
 )
-from sgl_jax.srt.multimodal.in_model.embedding_view import (
-    EmbeddingLease,
-    PooledEmbedding,
-)
+from sgl_jax.srt.multimodal.in_model.embedding_view import PooledEmbedding
 from sgl_jax.srt.multimodal.in_model.interface import (
     InModelMultimodalContract,
     MultimodalEncodeFunc,
@@ -117,28 +114,6 @@ def build_multimodal_batch(
     return {modality: tuple(tasks) for modality, tasks in grouped.items()}
 
 
-def release_consumed_embeddings(
-    tasks: Sequence[ItemTask],
-    dependency: jax.Array | tuple[jax.Array, ...] | None = None,
-) -> None:
-    """Release each shared lease after its final slice and chunk have been consumed."""
-    leases: dict[int, EmbeddingLease] = {}
-    retained: set[int] = set()
-    for task in tasks:
-        embedding = task.item.precomputed_embeddings
-        if not isinstance(embedding, PooledEmbedding):
-            continue
-        key = id(embedding.lease)
-        if task.has_unmerged_tail:
-            retained.add(key)
-        elif embedding.is_last_slice:
-            leases[key] = embedding.lease
-
-    for key, lease in leases.items():
-        if key not in retained:
-            lease.release_after(dependency)
-
-
 @partial(jax.jit, static_argnames=("out_sharding",))
 def _gather_overlay(
     running: jax.Array,
@@ -152,6 +127,8 @@ def _gather_overlay(
         gathered = source[pos_idx]
     else:
         gathered = source.at[pos_idx].get(out_sharding=out_sharding)
+    # Raiden rows may include trailing physical tile padding.
+    gathered = gathered[:, : running.shape[-1]]
     return jnp.where(mask[:, None], gathered, running)
 
 
@@ -223,8 +200,10 @@ def _gather_merge(
         )
     pos_idx, mask = _build_gather_indices(tasks, running.shape[0])
     if isinstance(packed, PooledEmbedding):
-        pos_idx[mask] += packed.flat_row_start
-        packed = packed.flat_buffer
+        pos_idx[mask] = packed.row_indices[pos_idx[mask]]
+        running = _apply_gather(running, packed.flat_buffer, pos_idx, mask, mesh)
+        packed.record_read(running)
+        return running
     return _apply_gather(running, packed, pos_idx, mask, mesh)
 
 
@@ -300,7 +279,7 @@ def _cache_unfinished_items(
     packed: jax.Array | PooledEmbedding,
     tasks: Sequence[ItemTask],
 ) -> None:
-    if pool is None:
+    if pool is None or isinstance(packed, PooledEmbedding):
         return
     write_mask = tuple(task.has_unmerged_tail for task in tasks)
     if not any(write_mask):
@@ -332,6 +311,11 @@ def _resolve_embedding_batches(
             if not isinstance(embeddings, PooledEmbedding):
                 embeddings = jnp.asarray(embeddings)
             batches.append((embeddings, (task,)))
+        if all(isinstance(packed, PooledEmbedding) for packed, _ in batches):
+            packed = PooledEmbedding.concatenate(
+                [packed[: task.output_len] for packed, (task,) in batches]
+            )
+            return [(packed, tasks)]
         return batches
     if encode_func is None:
         raise ValueError(f"no embedding function for modality {tasks[0].item.modality}")
@@ -396,6 +380,36 @@ def precompile_multimodal_inputs(
     return input_embedding, deepstack, deepstack_dim > 0
 
 
+def precompile_received_embeddings(
+    receive_buffer: jax.Array,
+    multimodal_model: InModelMultimodalContract,
+    token_buckets: Sequence[int],
+) -> None:
+    """Warm actual receive-buffer shapes before Raiden can write into them."""
+    mesh = multimodal_model.mesh
+    with jax.set_mesh(mesh) if mesh is not None else nullcontext():
+        source = receive_buffer.reshape(receive_buffer.shape[0] * receive_buffer.shape[1], -1)
+        for num_tokens in token_buckets:
+            input_ids = jnp.zeros(
+                num_tokens,
+                jnp.int32,
+                device=NamedSharding(mesh, PartitionSpec("data")) if mesh is not None else None,
+            )
+            running = multimodal_model.get_input_embeddings()(input_ids)
+            hidden = running.shape[-1]
+            deepstack_dim = multimodal_model.deepstack_visual_layers
+            if deepstack_dim:
+                running = jnp.pad(running, ((0, 0), (0, hidden * deepstack_dim)))
+            running = _apply_gather(
+                running,
+                source,
+                np.zeros(num_tokens, np.int32),
+                np.ones(num_tokens, np.bool_),
+                mesh,
+            )
+            jax.block_until_ready(_split_embeddings(running, hidden, deepstack_dim, mesh))
+
+
 def precompile_multimodal_components(
     multimodal_model: InModelMultimodalContract,
     embedding_pool: EmbeddingPool | None = None,
@@ -438,8 +452,6 @@ def embed_multimodal_inputs(
             for packed, source_tasks in batches:
                 running = _gather_merge(running, packed, source_tasks, mesh)
                 _cache_unfinished_items(embedding_pool, packed, source_tasks)
-            dependency = (running, embedding_pool.pages) if embedding_pool is not None else running
-            release_consumed_embeddings(tasks, dependency)
 
         input_embedding, deepstack = _split_embeddings(running, hidden, deepstack_dim, mesh)
         apply_for_deepstack = deepstack_dim > 0 and multimodal_batch is not None

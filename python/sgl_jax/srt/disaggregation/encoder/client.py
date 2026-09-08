@@ -7,6 +7,7 @@ from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from functools import partial
 from queue import Empty, SimpleQueue
 from typing import Any, Protocol
 
@@ -19,6 +20,7 @@ from sgl_jax.srt.disaggregation.encoder.embedding_data import (
     EmbeddingData,
     MultiModalEmbeddingData,
 )
+from sgl_jax.srt.disaggregation.encoder.raiden_pool import RaidenPool
 from sgl_jax.srt.managers.io_struct import TokenizedGenerateReqInput
 from sgl_jax.srt.multimodal.common.modality_enum import Modality
 from sgl_jax.srt.multimodal.in_model.embedding_view import PooledEmbedding
@@ -159,15 +161,15 @@ class EncoderMetadataRouter:
         self._receiver.setsockopt(zmq.LINGER, 0)
         port = self._receiver.bind_to_random_port(f"tcp://{host}")
         self.receive_url = f"{host}:{port}"
-        self._queues: dict[str, deque[Any]] = {}
+        self._request_queues: dict[str, deque[Any]] = {}
         self._lock = threading.Lock()
 
     def register(self, req_ids: tuple[str, ...]) -> None:
         routes = set(req_ids)
         with self._lock:
-            if len(routes) != len(req_ids) or not routes.isdisjoint(self._queues):
+            if len(routes) != len(req_ids) or not routes.isdisjoint(self._request_queues):
                 raise ValueError(f"duplicate encoder metadata routes: {req_ids}")
-            self._queues.update((req_id, deque()) for req_id in req_ids)
+            self._request_queues.update((req_id, deque()) for req_id in req_ids)
 
     def drain(self) -> None:
         while True:
@@ -176,14 +178,14 @@ class EncoderMetadataRouter:
             except zmq.Again:
                 break
             with self._lock:
-                queue = self._queues.get(getattr(data, "req_id", None))
+                queue = self._request_queues.get(getattr(data, "req_id", None))
                 if queue is not None:
                     queue.append(data)
 
     def pop(self, req_ids: tuple[str, ...]) -> Any | None:
         with self._lock:
             for req_id in req_ids:
-                queue = self._queues.get(req_id)
+                queue = self._request_queues.get(req_id)
                 if queue:
                     return queue.popleft()
         return None
@@ -191,11 +193,11 @@ class EncoderMetadataRouter:
     def unregister(self, req_ids: tuple[str, ...]) -> None:
         with self._lock:
             for req_id in req_ids:
-                self._queues.pop(req_id, None)
+                self._request_queues.pop(req_id, None)
 
     def close(self) -> None:
         with self._lock:
-            self._queues.clear()
+            self._request_queues.clear()
         self._receiver.close()
 
 
@@ -232,19 +234,13 @@ class PendingEncoderRequest:
             self._claimed = True
             return self._result
 
-    def progress(
-        self,
-        *,
-        backend_progressed: bool = False,
-    ) -> bool:
+    def progress(self, *, backend_progressed: bool = False) -> bool:
         """Advance one request from a dedicated receiver progress thread."""
         with self._lock:
             if self._closed or self._result is not None or self._error is not None:
                 return True
             try:
-                self._result = self._poll_once(
-                    backend_progressed=backend_progressed,
-                )
+                self._result = self._poll_once(backend_progressed=backend_progressed)
             except Exception as exc:
                 self._error = exc
             return self._result is not None or self._error is not None
@@ -268,11 +264,7 @@ class PendingEncoderRequest:
                 self._error = error
             self._done.set()
 
-    def _poll_once(
-        self,
-        *,
-        backend_progressed: bool = False,
-    ) -> dict[str, Any] | None:
+    def _poll_once(self, *, backend_progressed: bool = False) -> dict[str, Any] | None:
         for future in self.registration_futures:
             if future.done():
                 future.result()  # error re-thrown to the scheduler main thread
@@ -296,9 +288,7 @@ class PendingEncoderRequest:
             self.sessions[data.part_idx] = (data, self.backend.start(data))
 
         for part_idx, (part_data, session) in list(self.sessions.items()):
-            embedding = (
-                session.poll(refresh_backend=False) if backend_progressed else session.poll()
-            )
+            embedding = session.poll(refresh_backend=not backend_progressed)
             if embedding is None:
                 continue
             mark_time_stats(part_data.timing, "receive_done_ns")
@@ -340,22 +330,22 @@ class EncoderClient:
         progress_interval_s: float = 0.001,
     ) -> None:
         self._backend = backend
-        self._executor = ThreadPoolExecutor(max_workers=max(1, registration_workers))
+        self._registration_executor = ThreadPoolExecutor(max_workers=max(1, registration_workers))
         self._registration_client = httpx.Client(timeout=registration_timeout)
         self._result_preparer = result_preparer
         self._progress_interval_s = max(0.0001, float(progress_interval_s))
-        self._pending: dict[int, PendingEncoderRequest] = {}
-        self._preparing: dict[int, PendingEncoderRequest] = {}
-        self._pending_lock = threading.Lock()
-        self._completed: SimpleQueue[PendingEncoderRequest] = SimpleQueue()
+        self._receiving_requests: dict[int, PendingEncoderRequest] = {}
+        self._preparing_requests: dict[int, PendingEncoderRequest] = {}
+        self._requests_lock = threading.Lock()
+        self._completed_queue: SimpleQueue[PendingEncoderRequest] = SimpleQueue()
         self._completed_ready = threading.Event()
         self._prepare_executor = ThreadPoolExecutor(
             max_workers=min(2, max(1, registration_workers)),
             thread_name_prefix="encoder-language-prepare",
         )
         self._progress_stop = threading.Event()
-        self._progress_ready = threading.Event()
-        self._progress_error: Exception | None = None
+        self._startup_done = threading.Event()
+        self._startup_error: Exception | None = None
         self._metadata_router: EncoderMetadataRouter | None = None
         self._progress_thread = threading.Thread(
             target=self._progress_loop,
@@ -364,14 +354,14 @@ class EncoderClient:
             daemon=True,
         )
         self._progress_thread.start()
-        if not self._progress_ready.wait(30):
+        if not self._startup_done.wait(30):
             self.close()
             raise TimeoutError("timed out starting encoder receiver progress thread")
-        if self._progress_error is not None:
+        if self._startup_error is not None:
             self.close()
             raise RuntimeError(
                 "failed to start encoder receiver progress thread"
-            ) from self._progress_error
+            ) from self._startup_error
 
     @property
     def _router(self) -> EncoderMetadataRouter:
@@ -385,7 +375,7 @@ class EncoderClient:
             self._completed_ready.clear()
             while True:
                 try:
-                    completed.append(self._completed.get_nowait())
+                    completed.append(self._completed_queue.get_nowait())
                 except Empty:
                     break
             if not self._completed_ready.is_set():
@@ -403,10 +393,10 @@ class EncoderClient:
         try:
             for registration in registrations:
                 registration_futures.append(
-                    self._executor.submit(
+                    self._registration_executor.submit(
                         register_scheduler_receiver,
                         registration,
-                        self._metadata_router.receive_url,
+                        router.receive_url,
                         self._registration_client,
                     )
                 )
@@ -425,18 +415,18 @@ class EncoderClient:
             backend=self._backend,
             result_preparer=self._result_preparer,
         )
-        with self._pending_lock:
-            self._pending[id(pending)] = pending
+        with self._requests_lock:
+            self._receiving_requests[id(pending)] = pending
         return pending
 
     def _progress_loop(self, host: str) -> None:
         try:
             self._metadata_router = EncoderMetadataRouter(host)
         except Exception as exc:
-            self._progress_error = exc
-            self._progress_ready.set()
+            self._startup_error = exc
+            self._startup_done.set()
             return
-        self._progress_ready.set()
+        self._startup_done.set()
         try:
             while not self._progress_stop.wait(self._progress_interval_s):
                 try:
@@ -450,30 +440,22 @@ class EncoderClient:
                 except Exception:
                     logger.exception("Failed to progress encoder receive backend")
 
-                with self._pending_lock:
-                    pending = list(self._pending.items())
+                with self._requests_lock:
+                    pending = list(self._receiving_requests.items())
                 for key, request in pending:
-                    if request.progress(
-                        backend_progressed=backend_progressed,
-                    ):
+                    if request.progress(backend_progressed=backend_progressed):
                         self._submit_prepare(key, request)
         finally:
             self._router.close()
 
     def _submit_prepare(self, key: int, request: PendingEncoderRequest) -> None:
-        with self._pending_lock:
-            if self._pending.get(key) is not request:
+        with self._requests_lock:
+            if self._receiving_requests.get(key) is not request:
                 return
-            self._pending.pop(key)
-            self._preparing[key] = request
+            self._receiving_requests.pop(key)
+            self._preparing_requests[key] = request
         future = self._prepare_executor.submit(request.prepare_result)
-        future.add_done_callback(
-            lambda completed_future: self._publish_completed(
-                key,
-                request,
-                completed_future,
-            )
-        )
+        future.add_done_callback(partial(self._publish_completed, key, request))
 
     def _publish_completed(
         self,
@@ -487,34 +469,33 @@ class EncoderClient:
             with request._lock:
                 request._error = exc
                 request._done.set()
-        with self._pending_lock:
-            if self._preparing.get(key) is request:
-                self._preparing.pop(key, None)
-        self._completed.put(request)
+        with self._requests_lock:
+            if self._preparing_requests.get(key) is request:
+                self._preparing_requests.pop(key, None)
+        self._completed_queue.put(request)
         self._completed_ready.set()
 
     def close(self) -> None:
         self._progress_stop.set()
         self._progress_thread.join()
-        with self._pending_lock:
-            pending = [*self._pending.values(), *self._preparing.values()]
-            self._pending.clear()
-            self._preparing.clear()
+        with self._requests_lock:
+            pending = [*self._receiving_requests.values(), *self._preparing_requests.values()]
+            self._receiving_requests.clear()
+            self._preparing_requests.clear()
         for request in pending:
             request.close()
         self._prepare_executor.shutdown(cancel_futures=True)
         self._backend.close()
-        self._executor.shutdown(cancel_futures=True)
+        self._registration_executor.shutdown(cancel_futures=True)
         self._registration_client.close()
 
 
 def create_encoder_client(
     server_args,
-    mesh: Any,
+    pool: RaidenPool,
     result_preparer: Callable[[TokenizedGenerateReqInput, dict[str, Any]], None],
 ) -> EncoderClient:
     channel_number = max(1, int(server_args.disaggregation_channel_number))
-    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
     transfer_timeout = server_args.encoder_request_timeout_seconds
 
     from sgl_jax.raiden import require_raiden_preloaded
@@ -527,7 +508,7 @@ def create_encoder_client(
     host = resolve_host_ip(server_args.disaggregation_host_ip)
     backend = RaidenReceiverBackend(
         host=host,
-        sharding=sharding,
+        pool=pool,
         parallelism=channel_number,
         pool_size=server_args.encoder_transfer_pool_size,
         transfer_timeout_s=transfer_timeout,

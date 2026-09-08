@@ -10,6 +10,9 @@ from sgl_jax.srt.disaggregation.encoder.client import (
     create_encoder_client,
 )
 from sgl_jax.srt.managers.io_struct import AbortReq, TokenizedGenerateReqInput
+from sgl_jax.srt.multimodal.in_model.host_orchestration import (
+    precompile_received_embeddings,
+)
 from sgl_jax.srt.request_time_stats import mark_request_time_stats, mark_time_stats
 
 if TYPE_CHECKING:
@@ -34,8 +37,16 @@ class SchedulerDisaggregationEncoderMixin:
             raise RuntimeError("encoder disaggregation does not support multi-host schedulers yet")
         if self._mm_processor is None:
             raise ValueError("encoder disaggregation requires a multimodal processor")
+        runner = self.tp_worker.model_runner
+        pool = runner.encoder_embedding_pool
+        if not self.server_args.disable_precompile:
+            precompile_received_embeddings(
+                pool.buffer,
+                runner.model,
+                self.tp_worker.compilation_manager.token_buckets,
+            )
         self.encoder_client = create_encoder_client(
-            self.server_args, self.mesh, self._apply_encoder_result
+            self.server_args, pool, self._apply_encoder_result
         )
 
     def process_encoder_requests(
@@ -46,7 +57,10 @@ class SchedulerDisaggregationEncoderMixin:
         now = time.monotonic()
 
         for recv_req in recv_reqs:
-            if not self._needs_encoder(recv_req):
+            if (
+                not isinstance(recv_req, TokenizedGenerateReqInput)
+                or not recv_req.need_wait_for_mm_inputs
+            ):
                 ready.append(recv_req)
                 continue
             if recv_req.rid in self.encoder_waiting:
@@ -112,12 +126,6 @@ class SchedulerDisaggregationEncoderMixin:
                 **(encoder_timing or {}),
             }
             mark_time_stats(recv_req.encoder_timing, "language_ready_ns")
-
-    @staticmethod
-    def _needs_encoder(recv_req) -> bool:
-        return isinstance(recv_req, TokenizedGenerateReqInput) and bool(
-            recv_req.need_wait_for_mm_inputs
-        )
 
     def _abort_encoder_request(self: Scheduler, recv_req, error_msg: str) -> None:
         logger.error("Encoder request failed. rid=%s error=%s", recv_req.rid, error_msg)

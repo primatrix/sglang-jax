@@ -6,10 +6,11 @@ from collections.abc import Sequence
 import jax.numpy as jnp
 
 TPU_TILE_SHAPE = (8, 128)
+ENCODER_PAGE_SIZE = 128
 
 
 def encoder_pool_block_shape(shape: Sequence[int]) -> tuple[int, int, int, int]:
-    """Return the request-slot shape registered with Raiden."""
+    """Return the physical shape of one page registered with Raiden."""
 
     if len(shape) != 2:
         raise ValueError("encoder embedding must be a matrix")
@@ -21,6 +22,12 @@ def encoder_pool_block_shape(shape: Sequence[int]) -> tuple[int, int, int, int]:
 
 
 def encoder_transfer_nbytes(shape: Sequence[int], dtype: object) -> int:
-    """Return bytes transferred for one padded Raiden request slot."""
+    """Return bytes transferred for all pages covering an embedding."""
 
-    return math.prod(encoder_pool_block_shape(shape)) * jnp.dtype(dtype).itemsize
+    rows, width = shape
+    pages = math.ceil(rows / ENCODER_PAGE_SIZE)
+    return (
+        pages
+        * math.prod(encoder_pool_block_shape((ENCODER_PAGE_SIZE, width)))
+        * jnp.dtype(dtype).itemsize
+    )
