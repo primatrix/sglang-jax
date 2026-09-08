@@ -359,6 +359,11 @@ suites = {
             runner="pytest",
         ),
         TestFile(
+            "python/sgl_jax/test/configs/test_deepseek_v4_weights.py",
+            0.3,
+            runner="pytest",
+        ),
+        TestFile(
             "python/sgl_jax/test/test_embedding_pool.py",
             0.1,
             runner="pytest",
