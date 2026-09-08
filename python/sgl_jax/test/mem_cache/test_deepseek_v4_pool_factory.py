@@ -11,7 +11,9 @@ from sgl_jax.srt.mem_cache.deepseek_v4.capacity import (
     plan_deepseek_v4_pools,
 )
 from sgl_jax.srt.mem_cache.deepseek_v4.pool import DeepseekV4CacheSpec
-from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import ModelRunnerKVCacheMixin
+from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
+    ModelRunnerKVCacheMixin,
+)
 
 
 @pytest.fixture(autouse=True)

@@ -634,7 +634,9 @@ class DeepseekV4Compressor(nnx.Module):
         self.norm = RMSNorm(head_dim, epsilon=config.rms_norm_eps, param_dtype=jnp.float32)
 
     def weights(self, cache):
-        from sgl_jax.srt.layers.attention.deepseek_v4_csa_backend import CompressorWeights
+        from sgl_jax.srt.layers.attention.deepseek_v4_csa_backend import (
+            CompressorWeights,
+        )
 
         return CompressorWeights(
             self.wkv.value, self.wgate.value, self.ape.value, self.norm.scale.value, cache
@@ -922,7 +924,10 @@ class DeepseekV4Model(nnx.Module):
         self.rope_compressed = nnx.Variable(_rope_cache(config, 4))
 
     def __call__(self, batch, pools):
-        from sgl_jax.srt.layers.deepseek_v4_mhc import collapse_head_reference, expand_streams
+        from sgl_jax.srt.layers.deepseek_v4_mhc import (
+            collapse_head_reference,
+            expand_streams,
+        )
 
         hidden = self.embed_tokens(batch.input_ids)
         if batch.input_embedding is not None:

@@ -8,7 +8,10 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh
 
-from sgl_jax.srt.mem_cache.deepseek_v4.pool import DeepseekV4CacheSpec, DeepseekV4TokenToKVPool
+from sgl_jax.srt.mem_cache.deepseek_v4.pool import (
+    DeepseekV4CacheSpec,
+    DeepseekV4TokenToKVPool,
+)
 from sgl_jax.srt.mem_cache.deepseek_v4.state import DeepseekV4CompressStatePool
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
 

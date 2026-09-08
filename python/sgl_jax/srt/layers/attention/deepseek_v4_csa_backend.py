@@ -14,7 +14,11 @@ from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.layers.attention.dsv4.dispatch import ReadTables, read_tables, run_layer
+from sgl_jax.srt.layers.attention.dsv4.dispatch import (
+    ReadTables,
+    read_tables,
+    run_layer,
+)
 
 
 class CompressorWeights(NamedTuple):

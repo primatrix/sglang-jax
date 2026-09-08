@@ -481,7 +481,9 @@ class _Layer:
 def test_layer_ratio_comes_from_c1s_spec():
     """One classification, not a third derivation: the ratio is read straight off
     C1's spec, which is the same list `configs/deepseek_v4.classify_layers` uses."""
-    from sgl_jax.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttentionBackend
+    from sgl_jax.srt.layers.attention.deepseek_v4_backend import (
+        DeepseekV4AttentionBackend,
+    )
 
     layer_ratio = DeepseekV4AttentionBackend.__dict__["layer_ratio"]
     assert [layer_ratio(None, _Layer(i), _KVPool()) for i in range(5)] == [0, 0, 4, 128, 4]
@@ -489,7 +491,9 @@ def test_layer_ratio_comes_from_c1s_spec():
 
 def test_layer_outside_the_backbone_is_rejected():
     """The 46-vs-43 trap again: an index past the trunk must not silently classify."""
-    from sgl_jax.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttentionBackend
+    from sgl_jax.srt.layers.attention.deepseek_v4_backend import (
+        DeepseekV4AttentionBackend,
+    )
 
     layer_ratio = DeepseekV4AttentionBackend.__dict__["layer_ratio"]
     with pytest.raises(ValueError, match="outside the V4 backbone"):

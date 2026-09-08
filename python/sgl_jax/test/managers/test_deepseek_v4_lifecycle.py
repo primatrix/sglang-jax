@@ -12,7 +12,10 @@ from sgl_jax.srt.mem_cache.cache_init_params import CacheInitParams
 from sgl_jax.srt.mem_cache.chunk_cache import DeepseekV4ChunkCache
 from sgl_jax.srt.mem_cache.common import reclaim_completed_v4_swa, release_kv_cache
 from sgl_jax.srt.mem_cache.deepseek_v4.allocator import DeepseekV4TokenToKVPoolAllocator
-from sgl_jax.srt.mem_cache.deepseek_v4.pool import DeepseekV4CacheSpec, DeepseekV4TokenToKVPool
+from sgl_jax.srt.mem_cache.deepseek_v4.pool import (
+    DeepseekV4CacheSpec,
+    DeepseekV4TokenToKVPool,
+)
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 from sgl_jax.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
@@ -197,7 +200,9 @@ def test_factory_routes_v4_without_chunking_and_rejects_overlap():
 
 
 def scheduler(c, r):
-    from sgl_jax.test.test_scheduler_chunked_ownership import TestSchedulerChunkedOwnership
+    from sgl_jax.test.test_scheduler_chunked_ownership import (
+        TestSchedulerChunkedOwnership,
+    )
 
     helper = TestSchedulerChunkedOwnership()
     s, _ = helper._make_scheduler(r, active_reqs=r)
@@ -234,7 +239,9 @@ def test_scheduler_finish_and_abort_release_every_owner(kind):
 
 
 def test_retract_requeue_chunk_recompute_and_stream_sends_only_new_token():
-    from sgl_jax.srt.managers.scheduler_output_processor_mixin import SchedulerOutputProcessorMixin
+    from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
+        SchedulerOutputProcessorMixin,
+    )
 
     c = cache()
     r = request(prompt=127)

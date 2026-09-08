@@ -16,7 +16,11 @@ import re
 
 import pytest
 
-from sgl_jax.srt.configs.deepseek_v4 import DeepseekV4Config, DeepseekV4LayerType, classify_layers
+from sgl_jax.srt.configs.deepseek_v4 import (
+    DeepseekV4Config,
+    DeepseekV4LayerType,
+    classify_layers,
+)
 from sgl_jax.srt.models.deepseek_v4 import (
     Disposition,
     build_weight_mappings,

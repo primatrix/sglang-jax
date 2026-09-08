@@ -164,7 +164,9 @@ def test_missing_weights_fail_before_forward(tmp_path):
 
 
 def harness_for(model, dp, tp):
-    from sgl_jax.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttentionBackend
+    from sgl_jax.srt.layers.attention.deepseek_v4_backend import (
+        DeepseekV4AttentionBackend,
+    )
     from sgl_jax.srt.mem_cache.deepseek_v4.pool import DeepseekV4CacheSpec
     from sgl_jax.test.model_executor.test_deepseek_v4_runtime import Harness
 
@@ -179,7 +181,10 @@ def harness_for(model, dp, tp):
 @pytest.mark.parametrize("dp,tp", [(1, 1), (2, 2)])
 def test_complete_trunk_abstract_prefill_decode(tmp_path, dp, tp):
     from sgl_jax.srt.layers.logits_processor import LogitsMetadata
-    from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+    from sgl_jax.srt.model_executor.forward_batch_info import (
+        CaptureHiddenMode,
+        ForwardMode,
+    )
 
     model, mesh = make_model(dp, tp)
     write_fixture(tmp_path / "model.safetensors", model)
