@@ -33,7 +33,9 @@ else
 fi
 tar -czf /tmp/gpu-reference.tar.gz -C /tmp gpu-reference
 cp /tmp/gpu-reference.tar.gz "$ROOT/rank-0/benchmark/"
-sha256sum /tmp/gpu-reference.tar.gz > "$ROOT/rank-0/benchmark/gpu-reference.sha256"
+sha256sum /tmp/gpu-reference.tar.gz > /tmp/gpu-reference.sha256
+cp /tmp/gpu-reference.sha256 "$ROOT/rank-0/benchmark/gpu-reference.sha256"
+printf '%s\n' '{"schema_version":1,"operator_family":"deepseek-v4","operator_name":"attention-and-decoder-precision","dimensions":{"tokens":257,"tp_size":1,"ep_size":1},"layers":[0,2,3]}' > "$ROOT/manifest.json"
 printf '%s\n' "$status" > /tmp/module-validation-exit
 echo "GPU_CAPTURE_READY status=$status"
 for ((i=0;i<720;i++)); do

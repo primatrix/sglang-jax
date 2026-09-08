@@ -32,7 +32,7 @@ The GPU source-dequantization decoder is a format adapter; it is not a reference
 implementation of MoE/MLP/mHC. Those computations remain in SGLang.
 
 
-## Second batch: native attention
+## Original second batch: native attention
 
 After reviewing the first batch, the operator approved one paired H100/TPU
 attention batch. `gpu_attention_capture.py` calls the real SGLang MQALayer and
@@ -83,3 +83,9 @@ remain source-dequantized BF16 on both sides. Cross-layer mHC fusion is disabled
 to complete the final post within the one-layer boundary. This still does not
 cover native MXFP4/dynamic-FP8 expert execution, topk pruning, or multi-device
 precision. `run_layer_gpu.sh` launches each selected layer in a separate process.
+
+When handing the archive to another workload, wait for a complete 64-hex checksum
+and verify the copied archive before extraction. File existence alone is not a
+publication barrier: the initial follow-up TPU attempt observed an empty checksum
+file while the producer was still hashing. Preserve that attempt separately from
+the successful numerical retry.
