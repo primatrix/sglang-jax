@@ -197,10 +197,30 @@ def test_complete_trunk_abstract_prefill_decode(tmp_path, dp, tp):
                     jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data")),
                 ),
             )
-            result = jax.eval_shape(lambda f, p, lm=lm: model(f, p, lm), fb, h.runner.memory_pools)
+            definition, state = nnx.split(model)
+
+            def call(s, f, p, lm=lm):
+                return nnx.merge(definition, s)(f, p, lm)
+
+            result = jax.eval_shape(call, state, fb, h.runner.memory_pools)
+            jaxpr = jax.make_jaxpr(call)(state, fb, h.runner.memory_pools)
+            assert sum(np.asarray(value).nbytes for value in jaxpr.consts) < 1024 * 1024
             assert result[0].next_token_logits.shape[-1] == 32
             assert len(result[3]) == 3
             assert set(result[1]) == {"token_to_kv_pool", "compressor_state_pool"}
+
+
+def compiled_trunk(model):
+    # Match ModelRunner: weights are dynamic inputs, never multi-GB JIT constants.
+    definition, state = nnx.split(model)
+    traces = []
+
+    @jax.jit
+    def forward(model_state, batch, pools):
+        traces.append(batch.forward_mode)
+        return nnx.merge(definition, model_state).model(batch, pools)
+
+    return lambda batch, pools: forward(state, batch, pools), traces
 
 
 @pytest.mark.skipif(jax.default_backend() != "tpu", reason="actual GMM and FP8 matmul require TPU")
@@ -212,6 +232,7 @@ def test_complete_trunk_chunk_and_decode_equivalence(tmp_path, dp, tp):
     write_fixture(tmp_path / "model.safetensors", model)
     with jax.set_mesh(mesh):
         model.load_weights(SimpleNamespace(model_path=str(tmp_path)))
+        forward, traces = compiled_trunk(model)
 
         def run(chunks):
             h = harness_for(model, dp, tp)
@@ -224,9 +245,7 @@ def test_complete_trunk_chunk_and_decode_equivalence(tmp_path, dp, tp):
                         np.arange(start, start + count) % 32
                     )
                 fb = h.forward_batch(b)
-                out, updates, ids = jax.jit(lambda f, p: model.model(f, p))(
-                    fb, h.runner.memory_pools
-                )
+                out, updates, ids = forward(fb, h.runner.memory_pools)
                 out.block_until_ready()
                 outputs.append(
                     np.stack(
@@ -243,6 +262,7 @@ def test_complete_trunk_chunk_and_decode_equivalence(tmp_path, dp, tp):
         np.testing.assert_allclose(
             split.astype(np.float32), whole.astype(np.float32), rtol=0.04, atol=0.04
         )
+        assert len(traces) == 2
         assert np.isfinite(split.astype(np.float32)).all()
         assert np.any(np.asarray(pools.token_to_kv_pool.get_buffer("c4", 1)))
         assert np.any(np.asarray(pools.token_to_kv_pool.get_buffer("c128", 2)))
@@ -323,6 +343,7 @@ def test_flash_attention_geometry_complete_trunk(tmp_path):
     write_fixture(tmp_path / "model.safetensors", model)
     with jax.set_mesh(mesh):
         model.load_weights(SimpleNamespace(model_path=str(tmp_path)))
+        forward, traces = compiled_trunk(model)
 
         def run(chunks):
             h = harness_for(model, 1, 8)
@@ -333,9 +354,7 @@ def test_flash_attention_geometry_complete_trunk(tmp_path):
                 start = h.lengths[0] - count
                 b.input_ids[:count] = np.arange(start, start + count) % 32
                 fb = h.forward_batch(b)
-                output, updates, _ = jax.jit(lambda f, p: model.model(f, p))(
-                    fb, h.runner.memory_pools
-                )
+                output, updates, _ = forward(fb, h.runner.memory_pools)
                 output.block_until_ready()
                 result.append(np.asarray(output)[:count].astype(np.float32))
                 h.runner.memory_pools.replace_all(updates)
@@ -343,6 +362,7 @@ def test_flash_attention_geometry_complete_trunk(tmp_path):
 
         whole = run([(129, ForwardMode.EXTEND)])
         split = run([(63, ForwardMode.EXTEND), (65, ForwardMode.EXTEND), (1, ForwardMode.DECODE)])
+        assert len(traces) == 2
         assert np.isfinite(whole).all() and np.max(np.abs(whole)) > 0.1
         np.testing.assert_allclose(split, whole, rtol=0.04, atol=0.04)
 
