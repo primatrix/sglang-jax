@@ -2,6 +2,10 @@
 set -euo pipefail
 ulimit -c 0
 export PYTHONUNBUFFERED=1
+# GKE mounts the driver here; the image ldconfig cache may point to absent compat libs.
+if [ -f /usr/local/nvidia/lib64/libcuda.so.1 ]; then
+  export TRITON_LIBCUDA_PATH=/usr/local/nvidia/lib64
+fi
 TASK_DIR=/workspace/sglang-jax/test/manual/deepseek_v4_precision
 ROOT="${ARTIFACT_LOCAL_DIR:?}"
 mkdir -p "$ROOT/rank-0/benchmark" "$ROOT/profiling"
