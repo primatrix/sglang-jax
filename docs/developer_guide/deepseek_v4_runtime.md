@@ -20,7 +20,8 @@ addressing, rollback, reclamation and no-prefix-reuse contracts remain in force.
 
 Real loading checks every trunk key, rejects unknown and missing tensors, and
 validates target shapes and integer hash IDs. Non-expert FP8 uses K128/N128
-scales; routed MXFP4 is converted strictly to per-channel power-of-two FP8.
+E8M0 block scales (decoded explicitly from their bytes); routed MXFP4 is
+converted strictly to per-channel power-of-two FP8.
 Expert loading fills device slices one expert at a time, without assembling
 all experts on the host. Conversion errors abort loading. Expert placement
 must be identity; MTP, EPLB checkpoint remapping and static converted-checkpoint
@@ -127,3 +128,15 @@ CPU covers actual BF16/FP8/MXFP4 loading and abstract prefill/decode through
 the complete graph on one device and DP=2/TP=2. TPU-only tests compare a
 whole prefill against split chunks plus decode across C4/C128 boundaries.
 The synthetic fixture is not real-model quality or full-checkpoint acceptance.
+
+The pinned Flash 0731 revision `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
+was checked against all 48 shard headers (72,317 tensors). All 1,564 regular
+mappings and 66,048 expert source shapes match the abstract 43-layer model
+created through ModelConfig and the model registry. The committed representative
+header fixture covers root parameters and SWA/CSA/HCA layers. Header agreement
+establishes the loading contract, not full-payload conversion or model quality.
+
+The model suite is registered in CPU and TPU CI. On eight TPU devices, it also
+runs a three-layer trunk with the full Flash attention geometry and verifies
+that HCA uses the Pallas backend. This fixture reduces layer/expert/vocabulary
+counts and must not be described as a full Flash checkpoint run.
