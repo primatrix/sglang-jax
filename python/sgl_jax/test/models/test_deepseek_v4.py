@@ -61,8 +61,8 @@ def write_fixture(path, model):
         if key.endswith(".scale"):
             linear = get_param(model, mapping.target_path.rsplit(".", 1)[0])
             n, k = linear.weight_q.value.shape
-            value = np.full((n // 128, k // 128), 0.25, np.float32)
-            kind = "F32"
+            value = np.full((n // 128, k // 128), 125, np.uint8)  # E8M0: 2**-2
+            kind = "F8_E8M0"
         elif key.endswith("tid2eid"):
             value = np.tile(np.array([[3, 1], [0, 2]], np.int32), (16, 1))
             kind = "I32"
@@ -395,3 +395,66 @@ def test_csa_batched_requests_match_individual_requests(tmp_path):
         batched = run(inputs)
         individual = np.concatenate([run([item]) for item in inputs])
         np.testing.assert_allclose(batched, individual, rtol=0.02, atol=0.0003)
+
+
+def test_flash_grouped_projection_sharding_in_complete_graph():
+    cfg = DeepseekV4Config(
+        num_hidden_layers=3,
+        compress_ratios=[0, 4, 128],
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        num_hash_layers=1,
+        vocab_size=32,
+        max_position_embeddings=256,
+    )
+    cfg.quantization_config = tiny_config().quantization_config
+    model, mesh = make_model(1, 4, cfg)
+    with jax.set_mesh(mesh):
+        h = harness_for(model, 1, 4)
+        fb = h.forward_batch(h.batch([129], capacity=256))
+        result = nnx.eval_shape(lambda m, b, p: m.model(b, p), model, fb, h.runner.memory_pools)
+    assert result[0].shape == (256, 4096)
+
+
+def test_reserved_nonexpert_e8m0_scale_is_rejected(tmp_path):
+    model, mesh = make_model()
+    path = tmp_path / "model.safetensors"
+    write_fixture(path, model)
+    raw = bytearray(path.read_bytes())
+    size = struct.unpack("<Q", raw[:8])[0]
+    header = json.loads(raw[8 : 8 + size])
+    offset = 8 + size + header["layers.0.attn.wq_a.scale"]["data_offsets"][0]
+    raw[offset] = 255
+    path.write_bytes(raw)
+    with jax.set_mesh(mesh), pytest.raises(ValueError, match="reserved E8M0 scale code"):
+        model.load_weights(SimpleNamespace(model_path=str(tmp_path)))
+
+
+def test_flash_checkpoint_headers_match_model_parameters():
+    from pathlib import Path
+
+    metadata = json.loads(
+        (
+            Path(__file__).parents[1] / "configs/deepseek_v4_flash_0731_tensor_metadata.json"
+        ).read_text()
+    )
+    cfg = DeepseekV4Config()
+    cfg.quantization_config = tiny_config().quantization_config
+    model, _ = make_model(cfg=cfg)
+    mappings = build_weight_mappings(cfg)
+    for key, header in metadata["tensors"].items():
+        if ".ffn.experts." in key:
+            _, layer, _, _, _, stem, kind = key.split(".")
+            expert = model.model.layers[int(layer)].mlp.experts
+            shape = getattr(expert, {"w1": "wi_0", "w3": "wi_1", "w2": "wo"}[stem]).value.shape
+            expected = (shape[2], shape[1] // (2 if kind == "weight" else 32))
+        else:
+            mapping = mappings[key]
+            p = get_param(model, mapping.target_path).value
+            if key.endswith(".scale"):
+                matrix = get_param(model, mapping.target_path.rsplit(".", 1)[0]).weight_q.value
+                expected = (matrix.shape[0] // 128, matrix.shape[1] // 128)
+                assert header["dtype"] == "F8_E8M0"
+            else:
+                expected = p.shape[::-1] if mapping.transpose else p.shape
+        assert tuple(header["shape"]) == expected, key

@@ -121,8 +121,12 @@ def project_tokens(x, wkv, wgate, ape, positions, *, ratio: int):
         raise ValueError(
             f"ape must be [ratio, coff*D] = [{ratio}, {coff_width}], got {jnp.asarray(ape).shape}"
         )
-    kv = jnp.einsum("th,oh->to", x, jnp.asarray(wkv, jnp.float32))
-    score = jnp.einsum("th,oh->to", x, jnp.asarray(wgate, jnp.float32))
+    kv = jnp.einsum(
+        "th,oh->to", x, jnp.asarray(wkv, jnp.float32), precision=jax.lax.Precision.HIGHEST
+    )
+    score = jnp.einsum(
+        "th,oh->to", x, jnp.asarray(wgate, jnp.float32), precision=jax.lax.Precision.HIGHEST
+    )
     score = score + jnp.asarray(ape, jnp.float32)[jnp.asarray(positions) % ratio]
     return kv, score
 

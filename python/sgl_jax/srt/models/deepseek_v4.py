@@ -792,8 +792,16 @@ class DeepseekV4Attention(nnx.Module):
         output = apply_dsv4_partial_rope(
             output, cos[:, None, :], sin[:, None, :], rope_head_dim=self.rope_head_dim, inverse=True
         )
-        grouped = output.reshape(output.shape[0], self.num_groups, -1)
-        weights = group_wo_a(_checkpoint_matrix(self.wo_a), num_groups=self.num_groups)
+        grouped = jax.lax.reshape(
+            output,
+            (output.shape[0], self.num_groups, self.num_heads // self.num_groups * self.head_dim),
+            out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
+        )
+        weights = group_wo_a(
+            _checkpoint_matrix(self.wo_a),
+            num_groups=self.num_groups,
+            out_sharding=NamedSharding(self.mesh, P("tensor", None, None)),
+        )
         reduced = jnp.einsum("tgd,gdr->tgr", grouped, weights, preferred_element_type=jnp.float32)
         reduced = reduced.reshape(reduced.shape[0], -1).astype(self.dtype)
         output, _ = self.wo_b(reduced)
@@ -1023,7 +1031,20 @@ class DeepseekV4ForCausalLM(nnx.Module):
         from safetensors import safe_open
 
         def read(key):
-            with safe_open(info[key][0]["file"], framework="numpy") as handle:
+            entry = info[key][0]
+            if entry["dtype"] == "F8_E8M0":
+                # safetensors' NumPy API cannot expose E8M0. Non-expert block
+                # scales use this format too, not only the MXFP4 expert scales.
+                with open(entry["file"], "rb") as source:
+                    source.seek(entry["byte_offset"])
+                    raw = source.read(entry["byte_size"])
+                if len(raw) != entry["byte_size"] or len(raw) != int(np.prod(entry["shape"])):
+                    raise ValueError(f"{key}: truncated E8M0 scale payload")
+                codes = np.frombuffer(raw, np.uint8).reshape(entry["shape"])
+                if np.any(codes == 255):
+                    raise ValueError(f"{key}: reserved E8M0 scale code 255")
+                return np.ldexp(np.ones(codes.shape, np.float32), codes.astype(np.int16) - 127)
+            with safe_open(entry["file"], framework="numpy") as handle:
                 return handle.get_tensor(key)
 
         def parameter(path):
