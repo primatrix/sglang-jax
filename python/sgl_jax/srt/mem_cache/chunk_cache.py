@@ -104,3 +104,43 @@ class SWAChunkCache(ChunkCache):
 
     def swa_protected_size(self, dp_rank: int = 0) -> int:
         return 0
+
+
+class DeepseekV4ChunkCache(SWAChunkCache):
+    """Request-owned history and continuation state; no cross-request reuse.
+
+    Device state is invalidated by dropping its request owner. A new zero-prefix
+    forward resets the recycled global slot through M2's state_init_mask, inside
+    the donated model graph, rather than mutating a stale host-side pool wrapper.
+    """
+
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        result = super().match_prefix(params)
+        req = params.req
+        if req is not None and req.req_pool_idx is not None:
+            result = result._replace(
+                device_indices=self.req_to_token_pool.read(req.req_pool_idx, req.kv_committed_len)
+            )
+        return result
+
+    def cache_unfinished_req(self, req: Req):
+        req.prefix_indices = self.req_to_token_pool.read(req.req_pool_idx, req.kv_committed_len)
+
+    def release_req(self, req: Req):
+        if req.req_pool_idx is None:
+            return
+        # Free the complete extent together: a committed prefix and an allocated
+        # tail can share one C1 page and must not be released independently.
+        slot = req.req_pool_idx
+        indices = self.req_to_token_pool.read(slot, req.kv_allocated_len)
+        self.token_to_kv_pool_allocator.free(
+            indices[indices != 0], req.dp_rank if req.dp_rank is not None else 0
+        )
+        self.req_to_token_pool.req_to_token[slot].fill(0)
+        req.prefix_indices = np.empty(0, dtype=np.int32)
+        req.last_node = req.last_host_node = None
+        req.cache_protected_len = 0
+        req.kv_committed_freed = req.kv_overallocated_freed = True
+        req.kv_committed_len = req.kv_allocated_len = 0
+        req.swa_evicted_seqlen = 0
+        self.req_to_token_pool.free(req)

@@ -12,7 +12,7 @@ from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.layers.routed_experts_capturer import get_global_experts_capturer
 from sgl_jax.srt.managers.io_struct import AbortReq, BatchTokenIDOut
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
-from sgl_jax.srt.mem_cache.common import release_kv_cache
+from sgl_jax.srt.mem_cache.common import reclaim_completed_v4_swa, release_kv_cache
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.speculative.overlap_utils import (
     resolve_spec_prefill_token_ids,
@@ -222,6 +222,7 @@ class SchedulerOutputProcessorMixin:
                     req_idx += 1
                     continue
 
+                reclaim_completed_v4_swa(req, self.tree_cache)
                 req.latest_bid = result.bid
 
                 if req.is_chunked <= 0:
@@ -486,6 +487,7 @@ class SchedulerOutputProcessorMixin:
                     req_idx += 1
                     continue
 
+                reclaim_completed_v4_swa(req, self.tree_cache)
                 req.latest_bid = result.bid
 
                 new_accepted_len = 1

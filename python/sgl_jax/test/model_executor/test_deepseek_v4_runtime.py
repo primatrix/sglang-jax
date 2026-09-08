@@ -439,7 +439,8 @@ def make_hca_consumer(h, weights, traces):
 
 @pytest.mark.skipif(jax.default_backend() != "tpu", reason="requires real HCA Mosaic lowering")
 @pytest.mark.parametrize("page_size,dp,tp", [(128, 1, 1), (256, 1, 1), (128, 2, 2)])
-def test_real_hca_consumer_precompile_donation_and_reuse(page_size, dp, tp, monkeypatch):
+@pytest.mark.parametrize("lifecycle", [False, True])
+def test_real_hca_consumer_precompile_donation_and_reuse(page_size, dp, tp, monkeypatch, lifecycle):
     from hca.test_hca import HEAD_DIM, HEADS, _check, _stream, _weights
 
     monkeypatch.setenv("SGLANG_JAX_AOT_DISPATCH", "0")
@@ -447,6 +448,15 @@ def test_real_hca_consumer_precompile_donation_and_reuse(page_size, dp, tp, monk
     weights = _weights(20260912)
     traces = []
     width = 4096 + HEADS * HEAD_DIM + HEAD_DIM
+    from sgl_jax.srt.mem_cache.chunk_cache import DeepseekV4ChunkCache
+    from sgl_jax.srt.mem_cache.common import reclaim_completed_v4_swa, release_kv_cache
+
+    cache = DeepseekV4ChunkCache(
+        h.runner.req_to_token_pool, h.runner.token_to_kv_pool_allocator, page_size, 128
+    )
+    for rank, owner in enumerate(h.owners):
+        owner.dp_rank = rank
+        owner.swa_evicted_seqlen = 0
 
     def step(stream, queries, mode, capacity):
         prefixes = h.lengths.copy()
@@ -474,6 +484,10 @@ def test_real_hca_consumer_precompile_donation_and_reuse(page_size, dp, tp, monk
         _check(
             np.concatenate([output[r, :n] for r, n in enumerate(queries)]), stream, plan, weights
         )
+        if lifecycle:
+            for rank, owner in enumerate(h.owners):
+                owner.kv_committed_len = owner.kv_allocated_len = int(h.lengths[rank])
+                reclaim_completed_v4_swa(owner, cache)
 
     with jax.set_mesh(h.mesh):
         h.install(make_hca_consumer(h, weights, traces))
@@ -491,11 +505,22 @@ def test_real_hca_consumer_precompile_donation_and_reuse(page_size, dp, tp, monk
         # Recycle owners and exercise a changed slot without a new compilation.
         r = h.runner
         for rank, owner in enumerate(h.owners):
+            if lifecycle:
+                assert owner.swa_evicted_seqlen > 0
+                release_kv_cache(owner, cache)
+                continue
             r.token_to_kv_pool_allocator.free(
                 r.req_to_token_pool.req_to_token[h.slots[rank], : h.lengths[rank]].copy(),
                 dp_rank=rank,
             )
             r.req_to_token_pool.free(owner)
+        if lifecycle:
+            # Force exact global-slot reuse, so the new stream's oracle detects
+            # stale compressor state left by the previous request.
+            old_slots = h.slots.tolist()
+            r.req_to_token_pool.free_slots = old_slots + [
+                s for s in r.req_to_token_pool.free_slots if s not in old_slots
+            ]
         h.slots = np.asarray(r.req_to_token_pool.alloc(h.owners), np.int32)
         h.lengths.fill(0)
         step(_stream(dp, 129, 92), [129] * dp, ForwardMode.EXTEND, 256)
