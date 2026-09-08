@@ -7,6 +7,23 @@ import sys
 from collections.abc import Sequence
 
 _RAIDEN_EXTENSION = "tpu_raiden.frameworks.jax._tpu_raiden_jax"
+_RAIDEN_EXTENSIONS = (_RAIDEN_EXTENSION, "tpu_sync.frameworks.jax._tpu_raiden_jax")
+
+
+def import_raiden_module(suffix: str):
+    """Support both names of the upstream package, preserving dependency errors."""
+    roots = [name.split(".")[0] for name in _RAIDEN_EXTENSIONS if name in sys.modules]
+    roots += [root for root in ("tpu_raiden", "tpu_sync") if root not in roots]
+    missing = None
+    for root in roots:
+        name = f"{root}.{suffix}"
+        try:
+            return importlib.import_module(name)
+        except ModuleNotFoundError as exc:
+            if exc.name != name and not name.startswith(f"{exc.name}."):
+                raise
+            missing = exc
+    raise ModuleNotFoundError("Neither tpu_raiden nor tpu_sync provides " + suffix) from missing
 
 
 def raiden_requested(argv: Sequence[str] | None = None) -> bool:
@@ -43,12 +60,12 @@ def raiden_requested(argv: Sequence[str] | None = None) -> bool:
 
 
 def preload_raiden() -> None:
-    if _RAIDEN_EXTENSION in sys.modules:
+    if any(name in sys.modules for name in _RAIDEN_EXTENSIONS):
         return
     if "jax" in sys.modules or "jaxlib" in sys.modules:
         raise RuntimeError("tpu-raiden must be preloaded before jax/jaxlib")
     try:
-        importlib.import_module(_RAIDEN_EXTENSION)
+        import_raiden_module("frameworks.jax._tpu_raiden_jax")
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
             "tpu-raiden is not installed; install a wheel matching JAX and libtpu"
@@ -65,7 +82,7 @@ def preload_raiden_if_requested(argv: Sequence[str] | None = None) -> None:
 
 
 def require_raiden_preloaded() -> None:
-    if _RAIDEN_EXTENSION not in sys.modules:
+    if not any(name in sys.modules for name in _RAIDEN_EXTENSIONS):
         raise RuntimeError(
             "tpu-raiden was not preloaded. Use sgl_jax.launch_server or call "
             "sgl_jax.raiden.preload_raiden() before importing JAX."

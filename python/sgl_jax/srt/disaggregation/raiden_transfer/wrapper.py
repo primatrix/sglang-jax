@@ -76,7 +76,9 @@ class RaidenTransferWrapper:
             if self._engines:
                 return self.engine
             try:
-                from tpu_raiden.api.jax.kv_cache_manager import KVCacheManager
+                from sgl_jax.raiden import import_raiden_module
+
+                KVCacheManager = import_raiden_module("api.jax.kv_cache_manager").KVCacheManager
             except ModuleNotFoundError as exc:
                 raise RuntimeError(
                     "Raiden is enabled but tpu_raiden is not installed; install "
