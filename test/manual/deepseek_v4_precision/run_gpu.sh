@@ -28,7 +28,7 @@ fi
 printf '%s\n' "$status" > /tmp/module-validation-exit
 tokens=128
 if [ "${GPU_CAPTURE_SCRIPT:-gpu_capture.py}" = "gpu_attention_capture.py" ]; then
-  tokens=129
+  tokens=257
 fi
 printf '{"schema_version":1,"workflow":"operator-optimization","operator_family":"deepseek-v4","operator_name":"module-precision-gpu-reference","dimensions":{"tokens":%s,"tp_size":1,"ep_size":1}}\n' "$tokens" > "$ROOT/manifest.json"
 echo "GPU_CAPTURE_READY status=$status; waiting up to 1800s for Falcon transfer/release"

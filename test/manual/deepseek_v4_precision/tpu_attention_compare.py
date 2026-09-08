@@ -15,7 +15,12 @@ import numpy as np
 from flax import nnx
 from jax.sharding import NamedSharding, PartitionSpec as P
 from common import Capture, Checkpoint, compare
-from sgl_jax.srt.models.deepseek_v4 import DeepseekV4Attention, _rope_cache
+from sgl_jax.srt.models.deepseek_v4 import (
+    DeepseekV4Attention,
+    DeepseekV4DecoderLayer,
+    DeepseekV4MoE,
+    _rope_cache,
+)
 from sgl_jax.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttentionBackend
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.mem_cache.deepseek_v4.pool import DeepseekV4CacheSpec
@@ -28,8 +33,9 @@ def main():
     p.add_argument("--model", required=True)
     p.add_argument("--reference", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--schedule", choices=("whole128", "whole129", "split"))
-    p.add_argument("--layer", type=int, choices=(2, 3))
+    p.add_argument("--schedule", choices=("whole128", "whole129", "split", "whole257", "split257"))
+    p.add_argument("--layer", type=int, choices=(0, 2, 3))
+    p.add_argument("--component", choices=("attention", "layer"), default="attention")
     args = p.parse_args()
     refroot = Path(args.reference)
     refmeta = json.loads((refroot / "run.json").read_text())
@@ -38,7 +44,9 @@ def main():
     assert cp.identity == refmeta["checkpoint"]
     cfg = SimpleNamespace(**cp.config)
     cfg.quantization_config = None
-    cfg.max_position_embeddings = 256
+    cfg.max_position_embeddings = 512
+    cfg.expert_dtype = "bf16"
+    cfg.ep_size = cfg.moe_dp_size = 1
     cfg.num_hidden_layers = 4
     cfg.compress_ratios = cfg.compress_ratios[:4]
     out = Path(args.out)
@@ -52,6 +60,7 @@ def main():
         reference=refmeta,
         weight_path="source-dequantized-BF16",
         kv_cache="BF16",
+        component=args.component,
         cases=[],
     )
 
@@ -61,7 +70,8 @@ def main():
         assert hashlib.sha256(path.read_bytes()).hexdigest() == item["sha256"]
         return np.load(path, allow_pickle=False)
 
-    hidden = ref("input/hidden")
+    hidden = ref("input/streams" if args.component == "layer" else "input/hidden")
+    token_ids = ref("input/token_ids")
 
     def assign(param, value):
         assert param.value.shape == value.shape, (param.value.shape, value.shape)
@@ -111,57 +121,108 @@ def main():
             captures["wo_a"] = x
         return result
 
+    original_pre = DeepseekV4DecoderLayer._mhc_pre
+    original_post = DeepseekV4DecoderLayer._mhc_post
+    original_attention = DeepseekV4Attention.__call__
+    original_moe = DeepseekV4MoE.__call__
+
+    def pre_call(self, *a, **kw):
+        result = original_pre(self, *a, **kw)
+        kind = "attn" if "attn_post_gate" not in captures else "ffn"
+        captures[kind + "_pre"] = result[0]
+        captures[kind + "_post_gate"] = result[1]
+        captures[kind + "_comb"] = result[2]
+        return result
+
+    def post_call(self, *a, **kw):
+        result = original_post(self, *a, **kw)
+        kind = "attn" if "attn_post" not in captures else "ffn"
+        captures[kind + "_post"] = result
+        return result
+
+    def attention_call(self, x, *a, **kw):
+        captures["attn_input"] = x
+        result = original_attention(self, x, *a, **kw)
+        captures["attn_output"] = result[0]
+        return result
+
+    def moe_call(self, x, *a, **kw):
+        captures["ffn_input"] = x
+        result = original_moe(self, x, *a, **kw)
+        captures["ffn_output"], captures["route_ids"] = result
+        return result
+
+    DeepseekV4DecoderLayer._mhc_pre = pre_call
+    DeepseekV4DecoderLayer._mhc_post = post_call
+    DeepseekV4Attention.__call__ = attention_call
+    DeepseekV4MoE.__call__ = moe_call
     DeepseekV4AttentionBackend.__call__ = backend_call
     LinearBase.__call__ = linear_call
     try:
-        for layer in (2, 3):
+        for layer in (0, 2, 3):
             if args.layer is not None and layer != args.layer:
                 continue
+            model_harness = Harness(spec=DeepseekV4CacheSpec.from_config(cfg))
+            mesh = model_harness.mesh
+            with jax.set_mesh(mesh):
+                block = (
+                    DeepseekV4DecoderLayer(cfg, mesh, layer, jnp.bfloat16)
+                    if args.component == "layer"
+                    else None
+                )
+                module = (
+                    block.self_attn
+                    if block is not None
+                    else DeepseekV4Attention(cfg, mesh, layer, jnp.bfloat16)
+                )
+                stem = f"layers.{layer}.attn"
+                for field in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
+                    assign(getattr(module, field).weight, cp.block_fp8(stem + "." + field).T)
+                for field in ("q_norm", "kv_norm"):
+                    assign(
+                        getattr(module, field).scale,
+                        cp.read(stem + "." + field + ".weight"),
+                    )
+                assign(module.attn_sink, cp.read(stem + ".attn_sink"))
+                if module.compressor is not None:
+                    compressor(module.compressor, stem + ".compressor")
+                if module.indexer is not None:
+                    assign(module.indexer.wq_b.weight, cp.block_fp8(stem + ".indexer.wq_b").T)
+                    assign(
+                        module.indexer.weights_proj,
+                        cp.read(stem + ".indexer.weights_proj.weight"),
+                    )
+                    compressor(module.indexer.compressor, stem + ".indexer.compressor")
+                rope = _rope_cache(cfg, cfg.compress_ratios[layer])
+                if block is not None:
+                    from tpu_layer_weights import load_layer_weights
+
+                    load_layer_weights(block, cp, cfg, layer, assign)
+                graph, state = nnx.split(block if block is not None else module)
             for schedule, lengths in (
                 ("whole128", [128]),
                 ("whole129", [129]),
                 ("split", [63, 65, 1]),
+                ("whole257", [257]),
+                ("split257", [127, 129, 1]),
             ):
                 if args.schedule and schedule != args.schedule:
                     continue
-                name = f"attention/l{layer}/{schedule}"
+                name = f"{args.component}/l{layer}/{schedule}"
                 try:
                     h = Harness(spec=DeepseekV4CacheSpec.from_config(cfg))
                     mesh = h.mesh
                     with jax.set_mesh(mesh):
                         h.runner.attn_backend = DeepseekV4AttentionBackend(
-                            mesh=mesh, page_size=128, max_context_len=256, config=cfg
+                            mesh=mesh, page_size=128, max_context_len=512, config=cfg
                         )
                         h.runner.bind_attention_resources()
-                        module = DeepseekV4Attention(cfg, mesh, layer, jnp.bfloat16)
-                        stem = f"layers.{layer}.attn"
-                        for field in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
-                            assign(
-                                getattr(module, field).weight, cp.block_fp8(stem + "." + field).T
-                            )
-                        for field in ("q_norm", "kv_norm"):
-                            assign(
-                                getattr(module, field).scale,
-                                cp.read(stem + "." + field + ".weight"),
-                            )
-                        assign(module.attn_sink, cp.read(stem + ".attn_sink"))
-                        compressor(module.compressor, stem + ".compressor")
-                        if module.indexer is not None:
-                            assign(
-                                module.indexer.wq_b.weight, cp.block_fp8(stem + ".indexer.wq_b").T
-                            )
-                            assign(
-                                module.indexer.weights_proj,
-                                cp.read(stem + ".indexer.weights_proj.weight"),
-                            )
-                            compressor(module.indexer.compressor, stem + ".indexer.compressor")
-                        rope = _rope_cache(cfg, cfg.compress_ratios[layer])
-                        graph, state = nnx.split(module)
 
                         def forward(state, x, fb, pools, rope):
                             captures.clear()
                             mod = nnx.merge(graph, state)
-                            y, update = mod(x, fb, pools, rope)
+                            result = mod(x, fb, pools, rope)
+                            y, update = result[:2]
                             return y, update, dict(captures)
 
                         compiled = jax.jit(forward)
@@ -170,14 +231,19 @@ def main():
                             mode = (
                                 ForwardMode.DECODE if count == 1 and start else ForwardMode.EXTEND
                             )
-                            capacity = 2 if mode == ForwardMode.DECODE else 256
+                            capacity = (
+                                2 if mode == ForwardMode.DECODE else (512 if count > 256 else 256)
+                            )
                             batch = h.batch([count], mode, capacity=capacity)
+                            batch.input_ids[:count] = token_ids[start : start + count]
                             fb = h.forward_batch(batch)
                             x = np.zeros(
-                                (batch.positions.size, cfg.hidden_size), dtype=jnp.bfloat16
+                                (batch.positions.size, *hidden.shape[1:]), dtype=jnp.bfloat16
                             )
                             x[:count] = hidden[start : start + count]
-                            x = jax.device_put(x, NamedSharding(mesh, P("data", None)))
+                            x = jax.device_put(
+                                x, NamedSharding(mesh, P("data", *([None] * (x.ndim - 1))))
+                            )
                             y, update, aux = compiled(state, x, fb, h.runner.memory_pools, rope)
                             jax.block_until_ready((y, update, aux))
                             prefix = f"{name}/step{step}"
@@ -196,7 +262,7 @@ def main():
                             swa = np.asarray(update["swa"]).reshape(-1, cfg.head_dim)[swa_rows]
                             record(prefix + "/swa_cache", swa[:, None, :])
                             ratio = cfg.compress_ratios[layer]
-                            if end // ratio:
+                            if ratio and end // ratio:
                                 compressed_rows = (
                                     locations[np.arange(end // ratio) * ratio] // ratio
                                 )
@@ -220,7 +286,9 @@ def main():
                                     "HCA Pallas"
                                     if cfg.compress_ratios[layer] == 128
                                     and h.runner.attn_backend.use_pallas_hca
-                                    else "CSA XLA"
+                                    else (
+                                        "CSA XLA" if cfg.compress_ratios[layer] == 4 else "SWA XLA"
+                                    )
                                 ),
                             )
                         )
@@ -233,8 +301,17 @@ def main():
                     (out / "run.json").write_text(json.dumps(info, indent=2))
                     (out / "weights.json").write_text(json.dumps(cp.digests, indent=2))
     finally:
+        DeepseekV4DecoderLayer._mhc_pre = original_pre
+        DeepseekV4DecoderLayer._mhc_post = original_post
+        DeepseekV4Attention.__call__ = original_attention
+        DeepseekV4MoE.__call__ = original_moe
         DeepseekV4AttentionBackend.__call__ = original_backend
         LinearBase.__call__ = original_linear
+    gpu_weights = json.loads((refroot / "weights.json").read_text())
+    for key, digest in cp.digests.items():
+        assert key in gpu_weights and gpu_weights[key] == digest, key
+    info["matched_weight_payloads"] = len(cp.digests)
+    (out / "run.json").write_text(json.dumps(info, indent=2))
     if errors:
         raise RuntimeError("TPU attention cases failed; inspect errors.json")
 
