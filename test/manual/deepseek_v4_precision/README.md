@@ -66,3 +66,20 @@ Falcon runs: GPU `exp-5fsnkttdcv`, TPU `exp-l8arc30kyy`. Supplemental isolation,
 cache and coordinate-intervention runs reuse the same TPU allocation and retain
 their own status/logs. Final metrics and limitations belong in the experiment
 report; no model-quality or performance acceptance follows from this harness.
+
+## Follow-up: one SWA, CSA and HCA decoder layer
+
+Use `--component attention|layer --layer 0|2|3` on the paired attention scripts.
+Layer 0 is SWA, layer 2 CSA/4 and layer 3 HCA/128. Each decoder call executes the
+native mHC, norms, attention, routed/shared experts and final mHC post, recording
+intermediate boundaries and routing IDs. Residual streams are different token
+rolls of the same real embedding sequence, shared exactly across platforms.
+
+The schedules include whole128, whole129, 63+65+1, whole257 and 127+129+1. The
+last token of each split runs DECODE. RoPE allocation is extended to 512 while
+preserving checkpoint YaRN parameters. HCA now emits its second compressed group.
+GPU uses its native default TileLang mHC pre/post and FP8/BF16 cache; weights
+remain source-dequantized BF16 on both sides. Cross-layer mHC fusion is disabled
+to complete the final post within the one-layer boundary. This still does not
+cover native MXFP4/dynamic-FP8 expert execution, topk pruning, or multi-device
+precision. `run_layer_gpu.sh` launches each selected layer in a separate process.
