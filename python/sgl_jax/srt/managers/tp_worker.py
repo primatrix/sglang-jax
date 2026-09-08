@@ -345,8 +345,8 @@ class ModelWorker:
             self.compilation_manager.precompile_all(*args)
 
     def set_forward_metadata(self, model_worker_batch: ModelWorkerBatch):
-        self.model_runner.attn_backend.forward_metadata = (
-            self.model_runner.attn_backend.get_forward_metadata(model_worker_batch)
+        self.model_runner.attn_backend.forward_metadata = self.model_runner.get_attention_metadata(
+            model_worker_batch
         )
 
     def get_max_padded_size(self):
@@ -496,9 +496,7 @@ class ModelWorker:
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
         if forward_metadata is None:
-            forward_metadata = self.model_runner.attn_backend.get_forward_metadata(
-                model_worker_batch
-            )
+            forward_metadata = self.model_runner.get_attention_metadata(model_worker_batch)
 
         if sampling_metadata is None:
             sampling_metadata = SamplingMetadata.from_model_worker_batch(

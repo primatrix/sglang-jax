@@ -101,6 +101,17 @@ def _maybe_apply_recurrent_cow(forward_batch, memory_pools):
     return type(memory_pools)(**pools)
 
 
+def _validate_v4_pool_updates(memory_pools, updates):
+    """Check the complete V4 result while tracing, before dispatch donates inputs."""
+    from sgl_jax.srt.mem_cache.deepseek_v4_memory_pool import DeepseekV4TokenToKVPool
+
+    if isinstance(getattr(memory_pools, "token_to_kv_pool", None), DeepseekV4TokenToKVPool):
+        if not isinstance(updates, dict) or set(updates) != set(memory_pools._pools):
+            raise ValueError("V4 updates must exactly match both MemoryPools owner keys")
+        for key, owner in memory_pools._pools.items():
+            owner.validate_buffer_updates(updates[key])
+
+
 class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
     """ModelRunner runs the forward passes of the models."""
 
@@ -144,7 +155,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid = False
-        self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
+        self.use_mla_backend = (
+            self.model_config.attention_arch == AttentionArch.MLA and not self._is_deepseek_v4()
+        )
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
         self.forward_pass_id = 0
@@ -207,7 +220,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
         self._sampler_base_rng = jax.random.PRNGKey(server_args.random_seed)
         self._sampler_step = 0
-        if not self.is_draft_worker:
+        if not self.is_draft_worker and not self._is_deepseek_v4():
             self.initialize_jit()
 
         # Init memory pool and attention backends
@@ -217,6 +230,10 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             total_device_memory,
             dp_size=server_args.dp_size,
         )
+        self.bind_attention_resources()
+        if not self.is_draft_worker and self._is_deepseek_v4():
+            # Freeze the model graph only after the actual C1 capacities are bound.
+            self.initialize_jit()
         self._build_embedding_pool()
 
         # Init routed experts capturer
@@ -340,7 +357,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             model = nnx.merge(model_def, model_state)
             memory_pools = _maybe_apply_recurrent_cow(forward_batch, memory_pools)
             with LoraBatchContext.set_batch(forward_batch):
-                return model(forward_batch, memory_pools, logits_metadata)
+                result = model(forward_batch, memory_pools, logits_metadata)
+                _validate_v4_pool_updates(memory_pools, result[1])
+                return result
 
         # Capture base RNG key as a constant in the JIT closure.
         # fold_in(constant, dynamic_step) is computed inside JIT, avoiding
@@ -490,6 +509,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 output, pool_updates, aux, layers_topk_ids = model(
                     forward_batch, memory_pools, logits_metadata
                 )
+            _validate_v4_pool_updates(memory_pools, pool_updates)
             s_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, s_state)
             rng_key = jax.random.fold_in(base_rng_key, rng_step)
@@ -585,12 +605,16 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         # KV via kv_b_proj and run standard attention. Read by
         # DeepseekV3DecoderLayer to construct DeepseekV3Attention; harmless on
         # non-MLA models that ignore the attribute.
-        self.model_config.hf_config.use_absorbed_mla = self.server_args.attention_backend in (
-            "fa",
-            "dsa_sparse",
+        self.model_config.hf_config.use_absorbed_mla = (
+            not self._is_deepseek_v4()
+            and self.server_args.attention_backend
+            in (
+                "fa",
+                "dsa_sparse",
+            )
         )
         self.model_config.hf_config.use_dsa_sparse = (
-            self.server_args.attention_backend == "dsa_sparse"
+            not self._is_deepseek_v4() and self.server_args.attention_backend == "dsa_sparse"
         )
         self.model_config.hf_config.enable_sequence_parallel = (
             self.server_args.enable_sequence_parallel
@@ -717,7 +741,47 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         """Init attention kernel backend."""
         self.attn_backend = self._get_attention_backend()
 
+    def bind_attention_resources(self):
+        from sgl_jax.srt.layers.attention.dsv4.runtime import DeepseekV4RuntimeBackend
+
+        if isinstance(self.attn_backend, DeepseekV4RuntimeBackend):
+            self.attn_backend.bind_resources(
+                self.req_to_token_pool, self.token_to_kv_pool_allocator
+            )
+
+    def get_attention_metadata(self, batch):
+        from sgl_jax.srt.layers.attention.dsv4.runtime import DeepseekV4RuntimeBackend
+
+        if isinstance(self.attn_backend, DeepseekV4RuntimeBackend):
+            return self.attn_backend.get_forward_metadata(
+                batch,
+                request_pool=self.req_to_token_pool,
+                allocator=self.token_to_kv_pool_allocator,
+            )
+        return self.attn_backend.get_forward_metadata(batch)
+
+    def prepare_dummy_batch(self, batch):
+        from sgl_jax.srt.layers.attention.dsv4.runtime import (
+            DeepseekV4RuntimeBackend,
+            prepare_dummy_batch,
+        )
+
+        if isinstance(self.attn_backend, DeepseekV4RuntimeBackend):
+            prepare_dummy_batch(batch, self.attn_backend)
+
     def _get_attention_backend(self):
+        if self._is_deepseek_v4():
+            from sgl_jax.srt.layers.attention.dsv4.runtime import (
+                DeepseekV4RuntimeBackend,
+            )
+
+            # V4's shared KV and compressor state cannot use the MLA/FA route.
+            return DeepseekV4RuntimeBackend(
+                mesh=self.mesh,
+                page_size=self.page_size,
+                max_context_len=self.model_config.context_len,
+            )
+
         def _has_softmax_dtype(config) -> bool:
             from sgl_jax.srt.configs.dtype_config import DtypeConfig
 
