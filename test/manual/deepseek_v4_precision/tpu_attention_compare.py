@@ -28,6 +28,9 @@ def main():
     p.add_argument("--model", required=True)
     p.add_argument("--reference", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--schedule", choices=("whole128", "whole129", "split"))
+    p.add_argument("--layer", type=int, choices=(2, 3))
+    p.add_argument("--diagnostic-csa-token-rope", action="store_true")
     args = p.parse_args()
     refroot = Path(args.reference)
     refmeta = json.loads((refroot / "run.json").read_text())
@@ -50,6 +53,7 @@ def main():
         reference=refmeta,
         weight_path="source-dequantized-BF16",
         kv_cache="BF16",
+        diagnostic_csa_token_rope=args.diagnostic_csa_token_rope,
         cases=[],
     )
 
@@ -80,6 +84,10 @@ def main():
         cap.save(name, value)
         if name in arrays:
             expected = ref(name)
+            # HCA commits only the final live SWA span; expired physical rows are not comparable.
+            if name.endswith("/swa_cache"):
+                value = value[-cfg.sliding_window :]
+                expected = expected[-cfg.sliding_window :]
             if value.size == expected.size:
                 value = value.reshape(expected.shape)
             row = dict(case=name, **compare(value, expected))
@@ -87,6 +95,18 @@ def main():
             print("ATTENTION_METRIC", json.dumps(row), flush=True)
 
     captures = {}
+    from sgl_jax.srt.layers.attention.dsv4 import dispatch
+
+    original_compress = dispatch.compress_chunk
+    if args.diagnostic_csa_token_rope:
+
+        def diagnostic_compress(*a, **kw):
+            # Diagnostic intervention only. Baseline calls retain production semantics.
+            if kw["ratio"] == 4:
+                kw["boundary_compressed_pos"] = kw["boundary_compressed_pos"] * 4
+            return original_compress(*a, **kw)
+
+        dispatch.compress_chunk = diagnostic_compress
     original_backend = DeepseekV4AttentionBackend.__call__
 
     def backend_call(self, q, k, v, *a, **kw):
@@ -109,11 +129,15 @@ def main():
     LinearBase.__call__ = linear_call
     try:
         for layer in (2, 3):
+            if args.layer is not None and layer != args.layer:
+                continue
             for schedule, lengths in (
                 ("whole128", [128]),
                 ("whole129", [129]),
                 ("split", [63, 65, 1]),
             ):
+                if args.schedule and schedule != args.schedule:
+                    continue
                 name = f"attention/l{layer}/{schedule}"
                 try:
                     h = Harness(spec=DeepseekV4CacheSpec.from_config(cfg))
@@ -174,6 +198,26 @@ def main():
                             record(prefix + "/output", np.asarray(y)[:count])
                             for field, value in aux.items():
                                 record(prefix + "/" + field, np.asarray(value)[:count])
+                            # Resolve logical cache rows through the same allocator ledger used by the backend.
+                            end = start + count
+                            locations = np.asarray(
+                                h.runner.req_to_token_pool.req_to_token[h.slots[0], :end], np.int32
+                            )
+                            mapping = h.runner.token_to_kv_pool_allocator.full_to_swa_index_mapping
+                            if isinstance(mapping, list):
+                                mapping = mapping[0]
+                            swa_rows = np.asarray(mapping)[locations]
+                            swa = np.asarray(update["swa"]).reshape(-1, cfg.head_dim)[swa_rows]
+                            record(prefix + "/swa_cache", swa[:, None, :])
+                            ratio = cfg.compress_ratios[layer]
+                            if end // ratio:
+                                compressed_rows = (
+                                    locations[np.arange(end // ratio) * ratio] // ratio
+                                )
+                                compressed_values = np.asarray(update[f"c{ratio}"]).reshape(
+                                    -1, cfg.head_dim
+                                )[compressed_rows]
+                                record(prefix + "/compressed_cache", compressed_values[:, None, :])
                             packed = h.runner.attn_backend.pack_pool_updates(
                                 {layer: update},
                                 h.runner.memory_pools.token_to_kv_pool,
@@ -186,7 +230,12 @@ def main():
                             dict(
                                 name=name,
                                 chunks=lengths,
-                                pallas_hca=h.runner.attn_backend.use_pallas_hca,
+                                kernel=(
+                                    "HCA Pallas"
+                                    if cfg.compress_ratios[layer] == 128
+                                    and h.runner.attn_backend.use_pallas_hca
+                                    else "CSA XLA"
+                                ),
                             )
                         )
                 except Exception as e:
@@ -198,6 +247,7 @@ def main():
                     (out / "run.json").write_text(json.dumps(info, indent=2))
                     (out / "weights.json").write_text(json.dumps(cp.digests, indent=2))
     finally:
+        dispatch.compress_chunk = original_compress
         DeepseekV4AttentionBackend.__call__ = original_backend
         LinearBase.__call__ = original_linear
     if errors:

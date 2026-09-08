@@ -26,7 +26,11 @@ if [ -d /tmp/gpu-reference ]; then
   cp /tmp/gpu-reference.tar.gz "$ROOT/rank-0/benchmark/gpu-reference.tar.gz"
 fi
 printf '%s\n' "$status" > /tmp/module-validation-exit
-printf '{"schema_version":1,"workflow":"operator-optimization","operator_family":"deepseek-v4","operator_name":"module-precision-gpu-reference","dimensions":{"tokens":128,"tp_size":1,"ep_size":1}}\n' > "$ROOT/manifest.json"
+tokens=128
+if [ "${GPU_CAPTURE_SCRIPT:-gpu_capture.py}" = "gpu_attention_capture.py" ]; then
+  tokens=129
+fi
+printf '{"schema_version":1,"workflow":"operator-optimization","operator_family":"deepseek-v4","operator_name":"module-precision-gpu-reference","dimensions":{"tokens":%s,"tp_size":1,"ep_size":1}}\n' "$tokens" > "$ROOT/manifest.json"
 echo "GPU_CAPTURE_READY status=$status; waiting up to 1800s for Falcon transfer/release"
 for ((i=0;i<360;i++)); do
   [ -f /tmp/module-validation-release ] && break
