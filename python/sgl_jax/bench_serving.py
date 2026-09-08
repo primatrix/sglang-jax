@@ -29,7 +29,7 @@ import warnings
 from argparse import ArgumentParser
 from collections.abc import AsyncGenerator, Callable
 from copy import deepcopy
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from functools import lru_cache
 from json import JSONDecodeError
@@ -1849,7 +1849,7 @@ def sample_image_requests(
 @lru_cache(maxsize=1)
 def get_available_tokens(tokenizer):
     """Get all available token ids from the tokenizer vocabulary."""
-    return list(tokenizer.get_vocab().values())
+    return sorted(tokenizer.get_vocab().values())
 
 
 def gen_prompt(tokenizer, token_num):
@@ -1868,7 +1868,14 @@ def gen_mm_prompt(tokenizer, image_pad_id, token_num):
         token for token in get_available_tokens(tokenizer) if token not in excluded_tokens
     ]
     selected_tokens = random.choices(all_available_tokens, k=token_num)
-    return tokenizer.decode(selected_tokens)
+    for _ in range(100):
+        prompt = tokenizer.decode(selected_tokens)
+        encoded = tokenizer.encode(prompt, add_special_tokens=False)
+        if len(encoded) == token_num and not excluded_tokens.intersection(encoded):
+            return prompt
+        selected_tokens = [t for t in encoded[:token_num] if t not in excluded_tokens]
+        selected_tokens += random.choices(all_available_tokens, k=token_num - len(selected_tokens))
+    raise ValueError(f"Could not generate exactly {token_num} text tokens")
 
 
 def get_gen_prefix_cache_path(args, tokenizer):
@@ -2655,9 +2662,11 @@ async def benchmark(
         # analysis. Like ttfts/itls, these durations are in seconds.
         "latencies": [output.latency for output in outputs],
         "tpots": [
-            (output.latency - output.ttft) / (output.output_len - 1)
-            if output.success and output.output_len > 1
-            else None
+            (
+                (output.latency - output.ttft) / (output.output_len - 1)
+                if output.success and output.output_len > 1
+                else None
+            )
             for output in outputs
         ],
         "successes": [output.success for output in outputs],
@@ -2852,7 +2861,47 @@ def run_benchmark(args_: argparse.Namespace):
     model_id = args.served_model_name or args.model
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer = get_tokenizer(tokenizer_id)
-    input_requests = get_dataset(args, tokenizer, model_id)
+    request_file = getattr(args, "image_request_file", None)
+    if request_file and args.dataset_name != "image":
+        raise ValueError("--image-request-file requires --dataset-name image")
+    request_config = {
+        key: getattr(args, key, None)
+        for key in (
+            "backend",
+            "num_prompts",
+            "random_input_len",
+            "random_output_len",
+            "random_range_ratio",
+            "image_count",
+            "image_resolution",
+            "image_format",
+            "image_content",
+            "random_image_count",
+            "seed",
+        )
+    } | {"model": model_id, "tokenizer": tokenizer_id}
+    if request_file and Path(request_file).exists():
+        saved = json.loads(Path(request_file).read_text())
+        if saved["config"] != request_config:
+            raise ValueError("Saved image request configuration differs from this run")
+        input_requests = [DatasetRow(**row) for row in saved["requests"]]
+        if len(input_requests) != args.num_prompts:
+            raise ValueError("Saved request count mismatch")
+    else:
+        input_requests = get_dataset(args, tokenizer, model_id)
+        if request_file:
+            with Path(request_file).open("x") as f:
+                json.dump(
+                    {
+                        "config": request_config,
+                        "requests": [asdict(row) for row in input_requests],
+                    },
+                    f,
+                )
+    if request_file:
+        for row in input_requests:
+            if len(tokenizer.encode(row.prompt, add_special_tokens=False)) != args.random_input_len:
+                raise ValueError("Image request text does not match exact ISL")
 
     # compatible with SimpleNamespace
     if not hasattr(args, "flush_cache"):
@@ -3005,6 +3054,11 @@ if __name__ == "__main__":
         help="Range of sampled ratio of input/output length, "
         "used only for random and image dataset.",
     )
+    parser.add_argument(
+        "--image-request-file",
+        help="Save/replay image requests with matching configuration",
+    )
+
     # image dataset args
     parser.add_argument(
         "--image-count",

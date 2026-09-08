@@ -36,16 +36,29 @@ def main():
     p.add_argument("--launch-server", action="store_true")
     p.add_argument("--num-prompts", type=int, default=100)
     p.add_argument(
-        "--input-len", type=int, default=256, help="Text input tokens; excludes vision tokens"
+        "--input-len",
+        type=int,
+        default=1024,
+        help="Text input tokens; excludes vision tokens",
     )
+    p.add_argument("--image-resolution", default="640x640")
     p.add_argument("--output-len", type=int, default=128)
-    p.add_argument("--concurrency", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32])
+    p.add_argument("--concurrency", type=int, nargs="+", default=[2, 4, 8, 16, 32])
     p.add_argument("--groups", choices=["A", "C"], nargs="+", default=["A", "C"])
     p.add_argument("--repeats", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
-    if min(args.num_prompts, args.repeats, args.input_len, args.output_len, *args.concurrency) < 1:
+    if (
+        min(
+            args.num_prompts,
+            args.repeats,
+            args.input_len,
+            args.output_len,
+            *args.concurrency,
+        )
+        < 1
+    ):
         p.error("request counts, repeats, and concurrency must be positive")
     if args.launch_server and args.host != "127.0.0.1":
         p.error("--launch-server requires --host 127.0.0.1")
@@ -94,7 +107,10 @@ def main():
         "--port",
         str(args.port),
     ]
-    metadata = vars(args) | {"output_dir": str(args.output_dir), "server_command": server_cmd}
+    metadata = vars(args) | {
+        "output_dir": str(args.output_dir),
+        "server_command": server_cmd,
+    }
     metadata["revision"] = subprocess.run(
         ["git", "rev-parse", "HEAD"], capture_output=True, text=True
     ).stdout.strip()
@@ -122,7 +138,7 @@ def main():
             "--image-count",
             "1" if group == "A" else "4",
             "--image-resolution",
-            "512x512",
+            args.image_resolution,
             "--image-format",
             "jpeg",
             "--image-content",
@@ -150,6 +166,11 @@ def main():
             "--output-file",
             str(output),
         ]
+        if not stem.startswith("prewarm_"):
+            cmd += [
+                "--image-request-file",
+                str(args.output_dir / f"requests_{group}_seed{seed}.json"),
+            ]
         print(json.dumps({"run": stem, "command": cmd}), flush=True)
         if args.dry_run:
             return None
@@ -224,9 +245,14 @@ def main():
                         "run": stem,
                         "group": group,
                         "concurrency": concurrency,
+                        "image_resolution": args.image_resolution,
+                        "image_count": 1 if group == "A" else 4,
                         "text_input_len": args.input_len,
                         "output_len": args.output_len,
+                        "submitted": args.num_prompts,
                         "completed": result["completed"],
+                        "failed": args.num_prompts - result["completed"],
+                        "failure_rate": 1 - result["completed"] / args.num_prompts,
                         "duration_s": result["duration"],
                         "request_throughput": result["request_throughput"],
                         "output_throughput": result["output_throughput"],
@@ -239,8 +265,22 @@ def main():
                         ("tpots", "tpot"),
                         ("latencies", "e2e"),
                     ]:
-                        for q in (50, 95, 99):
-                            summary[f"p{q}_{prefix}_ms"] = percentile(result[field], q / 100)
+                        values = [
+                            v
+                            for v, ok in zip(result[field], result["successes"])
+                            if ok and v is not None
+                        ]
+                        summary[f"samples_{prefix}"] = len(values)
+                        for name, value in (
+                            ("mean", sum(values) / len(values) if values else None),
+                            ("min", min(values) if values else None),
+                            ("max", max(values) if values else None),
+                        ):
+                            summary[f"{name}_{prefix}_ms"] = (
+                                value * 1000 if value is not None else None
+                            )
+                        for q in (50, 90, 95, 99):
+                            summary[f"p{q}_{prefix}_ms"] = percentile(values, q / 100)
                     with (args.output_dir / "summary.jsonl").open("a") as output:
                         output.write(json.dumps(summary) + "\n")
                     print("BASELINE_RESULT " + json.dumps(summary), flush=True)
