@@ -147,6 +147,7 @@ class RequestFuncOutput:
     cached_tokens: int = 0
     start_time: float = 0.0
     request_time_stats: dict[str, Any] | None = None
+    usage: dict[str, Any] | None = None
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -475,6 +476,7 @@ async def async_request_openai_chat_completions(
                                 "client_first_content_ns"
                             ] = time.time_ns()
                         output.generated_text = response_json["choices"][0]["message"]["content"]
+                        output.usage = response_json.get("usage")
                         output.success = True
                         output.latency = time.perf_counter() - st
                         output.ttft = output.latency  # For non-streaming, TTFT = total latency
@@ -505,7 +507,7 @@ async def async_request_openai_chat_completions(
                                     )
 
                                 # Check if this chunk contains content
-                                delta = data.get("choices", [{}])[0].get("delta", {})
+                                delta = (data.get("choices") or [{}])[0].get("delta", {})
                                 content = delta.get("content", "")
 
                                 if content:
@@ -528,6 +530,8 @@ async def async_request_openai_chat_completions(
                                     generated_text += content
 
                                 # Check for usage info in final chunk
+                                if data.get("usage"):
+                                    output.usage = data["usage"]
                                 output_len = (data.get("usage") or {}).get(
                                     "completion_tokens", output_len
                                 )
@@ -2647,6 +2651,17 @@ async def benchmark(
         "output_lens": output_lens,
         "cached_tokens": [output.cached_tokens for output in outputs],
         "ttfts": [output.ttft for output in outputs],
+        # Preserve request-level timing for offline percentiles and joint SLO
+        # analysis. Like ttfts/itls, these durations are in seconds.
+        "latencies": [output.latency for output in outputs],
+        "tpots": [
+            (output.latency - output.ttft) / (output.output_len - 1)
+            if output.success and output.output_len > 1
+            else None
+            for output in outputs
+        ],
+        "successes": [output.success for output in outputs],
+        "usages": [output.usage for output in outputs],
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
