@@ -20,9 +20,9 @@ import ml_dtypes
 import numpy as np
 
 from sgl_jax.srt.utils.quantization.mxfp4_fp8_loader import (
-    _SafetensorsTensor,
     _checkpoint_locations,
     _read_safetensors_header,
+    _SafetensorsTensor,
     convert_mxfp4_pair_from_safetensors,
 )
 
@@ -85,11 +85,7 @@ def read_static_pair(weight_file, weight_name, scale_file, scale_name, *, entrie
     w = read(wh, ml_dtypes.float8_e4m3fn)
     s = read(sh, "<f4")
     mantissa, _ = np.frexp(s)
-    if (
-        not np.isfinite(w.astype(np.float32)).all()
-        or not np.isfinite(s).all()
-        or not np.all(mantissa == 0.5)
-    ):
+    if not np.isfinite(w).all() or not np.isfinite(s).all() or not np.all(mantissa == 0.5):
         raise ValueError(f"nonfinite weight or nonpositive/non-power-of-two scale: {weight_name}")
     return w, s
 

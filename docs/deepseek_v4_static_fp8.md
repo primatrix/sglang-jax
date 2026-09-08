@@ -48,10 +48,16 @@ sizes; full shard SHA256 verification can be run separately with
 
 ## Serve and validate
 
-Point the normal V4 serving command at the exported directory. The loader logs
-`static FP8 load` for each expert projection. No conversion flag is needed.
-Runtime parameter identity is tested on single-device and DP2/TP2 CPU meshes with
-the conversion function forbidden during static loading.
+Point the normal V4 serving command at the exported directory. The loader maps
+static experts into the shared parallel `WeightLoader` and logs
+`static FP8 experts via WeightLoader` for each layer. It checks expert dtype/shape
+and payload sizes from headers without repeating offline value validation or
+expanding FP8 weights into FP32 for a NaN scan. No conversion flag is needed.
+Runtime parameter identity is tested on single-device and DP2/TP2 CPU meshes,
+including EP2, with the conversion and offline pair reader forbidden during
+static loading. Non-expert tensors retain their value checks because export
+copies their original bytes without conversion; these checks do not expand
+weights into FP32.
 
 A full artifact still needs a real TPU load and request check. Compare the same
 prompts and generated token IDs against the original load-time-conversion run.
