@@ -11,8 +11,8 @@ from sgl_jax.srt.managers.schedule_batch import Req, ScheduleBatch
 from sgl_jax.srt.mem_cache.cache_init_params import CacheInitParams
 from sgl_jax.srt.mem_cache.chunk_cache import DeepseekV4ChunkCache
 from sgl_jax.srt.mem_cache.common import reclaim_completed_v4_swa, release_kv_cache
-from sgl_jax.srt.mem_cache.deepseek_v4_allocator import DeepseekV4TokenToKVPoolAllocator
-from sgl_jax.srt.mem_cache.deepseek_v4_memory_pool import (
+from sgl_jax.srt.mem_cache.deepseek_v4.allocator import DeepseekV4TokenToKVPoolAllocator
+from sgl_jax.srt.mem_cache.deepseek_v4.pool import (
     DeepseekV4CacheSpec,
     DeepseekV4TokenToKVPool,
 )

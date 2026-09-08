@@ -131,7 +131,17 @@ def _oracle(
     return out
 
 
-def _run(prefix_lens, q_lens, ratio, *, seed=0, state=None, state_slots=None, page_size=256):
+def _run(
+    prefix_lens,
+    q_lens,
+    ratio,
+    *,
+    seed=0,
+    state=None,
+    state_slots=None,
+    page_size=256,
+    padded_tokens=None,
+):
     prefix_lens = np.asarray(prefix_lens, np.int64)
     q_lens = np.asarray(q_lens, np.int64)
     B = q_lens.size
@@ -146,6 +156,11 @@ def _run(prefix_lens, q_lens, ratio, *, seed=0, state=None, state_slots=None, pa
     T = positions.size
     cu_q = np.concatenate(([0], np.cumsum(q_lens)))
     request_ids = np.repeat(np.arange(B), q_lens)
+    live_tokens = T
+    if padded_tokens is not None:
+        positions = np.pad(positions, (0, padded_tokens - T))
+        request_ids = np.pad(request_ids, (0, padded_tokens - T))
+        T = padded_tokens
 
     # Reuse M2.1 for the boundary metadata so the two stay consistent.
     md = derive_attention_metadata(
@@ -165,6 +180,8 @@ def _run(prefix_lens, q_lens, ratio, *, seed=0, state=None, state_slots=None, pa
     compressed_pos = np.where(live, np.asarray(rm.boundary_group_ids), 0).astype(np.int64)
 
     x = _activations(seed, state_slots, request_ids, positions)
+    if padded_tokens is not None:
+        x[live_tokens:] = 100.0  # deliberately differs from request zero's first row
     w = _weights(ratio, seed)
 
     records, valid, new_state = compress_chunk(
@@ -233,9 +250,7 @@ def test_ring_depth_follows_the_overlap_factor():
 
 
 def test_state_shape_matches_c1s_pool():
-    from sgl_jax.srt.mem_cache.deepseek_v4_compress_state import (
-        DeepseekV4CompressStatePool,
-    )
+    from sgl_jax.srt.mem_cache.deepseek_v4.state import DeepseekV4CompressStatePool
 
     assert DeepseekV4CompressStatePool  # imported for provenance, not called
     for ratio, middle, last in ((4, 8, 4), (128, 128, 2)):
@@ -453,3 +468,12 @@ def test_rejects_bad_ape_and_projection_shapes():
         )
     with pytest.raises(ValueError, match="ratio must be positive"):
         overlap_factor(0)
+
+
+@pytest.mark.parametrize("ratio", [4, 128])
+@pytest.mark.parametrize("live", [0, 3])
+def test_padding_never_overwrites_request_zero_state(ratio, live):
+    initial = _empty_state(2, ratio)
+    padded = _run([0], [live], ratio, state=initial, padded_tokens=16)
+    expected = initial if live == 0 else _run([0], [live], ratio, state=initial)["new_state"]
+    np.testing.assert_array_equal(padded["new_state"], expected)

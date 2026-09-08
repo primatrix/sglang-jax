@@ -103,7 +103,7 @@ def _maybe_apply_recurrent_cow(forward_batch, memory_pools):
 
 def _validate_v4_pool_updates(memory_pools, updates):
     """Check the complete V4 result while tracing, before dispatch donates inputs."""
-    from sgl_jax.srt.mem_cache.deepseek_v4_memory_pool import DeepseekV4TokenToKVPool
+    from sgl_jax.srt.mem_cache.deepseek_v4.pool import DeepseekV4TokenToKVPool
 
     if isinstance(getattr(memory_pools, "token_to_kv_pool", None), DeepseekV4TokenToKVPool):
         if not isinstance(updates, dict) or set(updates) != set(memory_pools._pools):
@@ -742,17 +742,21 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.attn_backend = self._get_attention_backend()
 
     def bind_attention_resources(self):
-        from sgl_jax.srt.layers.attention.dsv4.runtime import DeepseekV4RuntimeBackend
+        from sgl_jax.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttentionBackend,
+        )
 
-        if isinstance(self.attn_backend, DeepseekV4RuntimeBackend):
+        if isinstance(self.attn_backend, DeepseekV4AttentionBackend):
             self.attn_backend.bind_resources(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
 
     def get_attention_metadata(self, batch):
-        from sgl_jax.srt.layers.attention.dsv4.runtime import DeepseekV4RuntimeBackend
+        from sgl_jax.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttentionBackend,
+        )
 
-        if isinstance(self.attn_backend, DeepseekV4RuntimeBackend):
+        if isinstance(self.attn_backend, DeepseekV4AttentionBackend):
             return self.attn_backend.get_forward_metadata(
                 batch,
                 request_pool=self.req_to_token_pool,
@@ -761,25 +765,26 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         return self.attn_backend.get_forward_metadata(batch)
 
     def prepare_dummy_batch(self, batch):
-        from sgl_jax.srt.layers.attention.dsv4.runtime import (
-            DeepseekV4RuntimeBackend,
+        from sgl_jax.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttentionBackend,
             prepare_dummy_batch,
         )
 
-        if isinstance(self.attn_backend, DeepseekV4RuntimeBackend):
+        if isinstance(self.attn_backend, DeepseekV4AttentionBackend):
             prepare_dummy_batch(batch, self.attn_backend)
 
     def _get_attention_backend(self):
         if self._is_deepseek_v4():
-            from sgl_jax.srt.layers.attention.dsv4.runtime import (
-                DeepseekV4RuntimeBackend,
+            from sgl_jax.srt.layers.attention.deepseek_v4_backend import (
+                DeepseekV4AttentionBackend,
             )
 
             # V4's shared KV and compressor state cannot use the MLA/FA route.
-            return DeepseekV4RuntimeBackend(
+            return DeepseekV4AttentionBackend(
                 mesh=self.mesh,
                 page_size=self.page_size,
                 max_context_len=self.model_config.context_len,
+                config=getattr(self.model_config, "hf_text_config", None),
             )
 
         def _has_softmax_dtype(config) -> bool:

@@ -6,11 +6,11 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh
 
-from sgl_jax.srt.mem_cache.deepseek_v4_memory_pool import DeepseekV4CacheSpec
-from sgl_jax.srt.mem_cache.deepseek_v4_pool_factory import (
+from sgl_jax.srt.mem_cache.deepseek_v4.capacity import (
     build_deepseek_v4_pools,
     plan_deepseek_v4_pools,
 )
+from sgl_jax.srt.mem_cache.deepseek_v4.pool import DeepseekV4CacheSpec
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )

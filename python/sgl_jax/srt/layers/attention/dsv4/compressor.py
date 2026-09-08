@@ -121,8 +121,12 @@ def project_tokens(x, wkv, wgate, ape, positions, *, ratio: int):
         raise ValueError(
             f"ape must be [ratio, coff*D] = [{ratio}, {coff_width}], got {jnp.asarray(ape).shape}"
         )
-    kv = jnp.einsum("th,oh->to", x, jnp.asarray(wkv, jnp.float32))
-    score = jnp.einsum("th,oh->to", x, jnp.asarray(wgate, jnp.float32))
+    kv = jnp.einsum(
+        "th,oh->to", x, jnp.asarray(wkv, jnp.float32), precision=jax.lax.Precision.HIGHEST
+    )
+    score = jnp.einsum(
+        "th,oh->to", x, jnp.asarray(wgate, jnp.float32), precision=jax.lax.Precision.HIGHEST
+    )
     score = score + jnp.asarray(ape, jnp.float32)[jnp.asarray(positions) % ratio]
     return kv, score
 
@@ -205,7 +209,8 @@ def compress_chunk(
         to a chunk row.
       state_slots: ``[B]`` state-pool slot per request.
       boundary_token_indices, boundary_valid_mask: from M2.1's ratio metadata.
-      boundary_compressed_pos: ``[N]`` index into `cos_sin_cache` for each record.
+      boundary_compressed_pos: ``[N]`` original-token group starts used to index
+        `cos_sin_cache`, not compressed group ids (for ratio 4: 0, 4, 8, ...).
 
     Returns:
       ``(records, record_valid, new_state)`` with ``records`` ``[N, D]``.
@@ -280,11 +285,16 @@ def compress_chunk(
     )
     records = jnp.where(bvalid[:, None], records, 0.0)
 
-    new_state = _save_tail(state, rows, positions, query_request_ids, state_slots, window)
+    # Metadata pads query_request_ids with zero. Those rows must never write
+    # request zero's ring, even when their zero position is inside its tail.
+    valid_tokens = jnp.arange(num_tokens) < cu_q_lens[-1]
+    new_state = _save_tail(
+        state, rows, positions, query_request_ids, state_slots, window, valid_tokens
+    )
     return records, bvalid, new_state
 
 
-def _save_tail(state, rows, positions, query_request_ids, state_slots, window):
+def _save_tail(state, rows, positions, query_request_ids, state_slots, window, valid_tokens):
     """Write only each request's last `window` chunk tokens into its ring.
 
     Restricting the write to the tail is what makes a chunk longer than the ring
@@ -296,13 +306,13 @@ def _save_tail(state, rows, positions, query_request_ids, state_slots, window):
     # positions so it needs no per-request loop: the last token of a request has
     # the largest position among that request's tokens.
     last_position = jax.ops.segment_max(
-        positions,
+        jnp.where(valid_tokens, positions, -1),
         query_request_ids,
         num_segments=state_slots.shape[0],
         indices_are_sorted=False,
     )
     from_end = last_position[query_request_ids] - positions
-    keep = from_end < window
+    keep = valid_tokens & (from_end < window)
     flat_index = token_slot * window + jnp.mod(positions, window)
     flat = state.reshape(-1, state.shape[-1])
     flat_index = jnp.where(keep, flat_index, flat.shape[0])

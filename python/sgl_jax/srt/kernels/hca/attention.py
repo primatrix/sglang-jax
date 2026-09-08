@@ -1165,7 +1165,10 @@ def ragged_attention(
         compressed_page_size
     )
 
-    if max_queries == 1:
+    if max_queries == 1 and tokens == batch:
+        # The per-request decode shortcut requires one token buffer row per
+        # request. Runtime token buckets may be padded independently; those
+        # use the general gather/scatter path below.
         # Row ``j`` holds absolute position ``window_start + j``: below
         # ``prefix_lens`` from the ring, the decode token from ``new_kv``.
         window_start = jnp.maximum(seq_lens.astype(jnp.int32) - window_size, 0)

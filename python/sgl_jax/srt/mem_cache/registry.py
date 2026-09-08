@@ -29,7 +29,7 @@ class TreeCacheBuildContext:
 def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     params = ctx.params
 
-    from sgl_jax.srt.mem_cache.deepseek_v4_allocator import (
+    from sgl_jax.srt.mem_cache.deepseek_v4.allocator import (
         DeepseekV4TokenToKVPoolAllocator,
     )
 

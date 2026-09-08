@@ -32,6 +32,7 @@ def _oracle(
     entry_request_ids,
     valid_token_mask,
     *,
+    entry_group_ids,
     k,
     ratio,
     num_kv_heads=None,
@@ -54,7 +55,10 @@ def _oracle(
         complete = (query_positions[t] + 1) // ratio
         cand = []
         for e in range(E):
-            if entry_request_ids[e] != query_request_ids[t] or e >= complete:
+            if (
+                entry_request_ids[e] != query_request_ids[t]
+                or not 0 <= entry_group_ids[e] < complete
+            ):
                 continue
             s = 0.0
             for h in range(H):
@@ -106,6 +110,9 @@ def _fixture(
         query_positions=positions,
         query_request_ids=request_ids,
         entry_request_ids=entry_request_ids,
+        entry_group_ids=np.concatenate(
+            [np.arange(n) for n in entries_per_request] + [np.full(pad_entries, -1)]
+        ).astype(np.int32),
         valid_token_mask=valid,
     )
 
@@ -323,3 +330,10 @@ def test_rejects_bad_shapes_and_budgets():
         csa_indexer_scores(fx["q"], fx["weights"][:, :1], fx["keys"])
     with pytest.raises(ValueError, match="q must be"):
         csa_indexer_scores(fx["q"][0], fx["weights"], fx["keys"])
+
+
+def test_each_requests_first_completed_group_is_selectable():
+    fx = _fixture([4, 4], [0, 0], [1, 1])
+    got, _ = _both(fx, k=1)
+    # Both requests have completed group zero, at different gathered row indices.
+    np.testing.assert_array_equal(got[[3, 7]], [[0], [1]])

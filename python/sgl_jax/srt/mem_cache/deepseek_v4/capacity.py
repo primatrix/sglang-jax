@@ -3,9 +3,9 @@
 import math
 from dataclasses import dataclass
 
-from sgl_jax.srt.mem_cache.deepseek_v4_allocator import DeepseekV4TokenToKVPoolAllocator
-from sgl_jax.srt.mem_cache.deepseek_v4_compress_state import DeepseekV4CompressStatePool
-from sgl_jax.srt.mem_cache.deepseek_v4_memory_pool import DeepseekV4TokenToKVPool
+from sgl_jax.srt.mem_cache.deepseek_v4.allocator import DeepseekV4TokenToKVPoolAllocator
+from sgl_jax.srt.mem_cache.deepseek_v4.pool import DeepseekV4TokenToKVPool
+from sgl_jax.srt.mem_cache.deepseek_v4.state import DeepseekV4CompressStatePool
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools, ReqToTokenPool
 
 
