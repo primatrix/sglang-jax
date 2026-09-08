@@ -1019,6 +1019,17 @@ class DeepseekV4ForCausalLM(nnx.Module):
                     ) % self.config.n_routed_experts
                     layer.mlp.load_hash_table(table)
         else:
+            from sgl_jax.srt.utils.quantization.deepseek_v4_static_fp8 import (
+                CONFIG_KEY,
+                FORMAT,
+                validate_static_checkpoint,
+            )
+
+            expert_format = getattr(self.config, CONFIG_KEY, None)
+            if expert_format is not None:
+                if expert_format != FORMAT:
+                    raise ValueError(f"Unsupported V4 expert format: {expert_format}")
+                validate_static_checkpoint(model_config.model_path)
             loader = WeightLoader(self, model_config, self.mesh, self.dtype)
             info = loader._scan_weight_info()
             classify_checkpoint(self.config, info)
@@ -1114,9 +1125,16 @@ class DeepseekV4ForCausalLM(nnx.Module):
     def _load_expert_weights(self, info):
         from jax.sharding import SingleDeviceSharding
 
+        from sgl_jax.srt.utils.quantization.deepseek_v4_static_fp8 import (
+            CONFIG_KEY,
+            FORMAT,
+            read_static_pair,
+        )
         from sgl_jax.srt.utils.quantization.mxfp4_fp8_loader import (
             convert_mxfp4_pair_from_safetensors,
         )
+
+        static_fp8 = getattr(self.config, CONFIG_KEY, None) == FORMAT
 
         def on_device(call, device, *args):
             local_mesh = jax.sharding.Mesh(
@@ -1175,16 +1193,26 @@ class DeepseekV4ForCausalLM(nnx.Module):
                         continue
                     stem = f"layers.{layer_id}.ffn.experts.{expert_id}.{source}"
                     wk, sk = stem + ".weight", stem + ".scale"
-                    converted = convert_mxfp4_pair_from_safetensors(
-                        info[wk][0]["file"], wk, sk, scale_file=info[sk][0]["file"], strict=True
-                    )
+                    if static_fp8:
+                        weight, scale = read_static_pair(
+                            info[wk][0]["file"],
+                            wk,
+                            info[sk][0]["file"],
+                            sk,
+                            entries=(info[wk][0], info[sk][0]),
+                        )
+                    else:
+                        converted = convert_mxfp4_pair_from_safetensors(
+                            info[wk][0]["file"], wk, sk, scale_file=info[sk][0]["file"], strict=True
+                        )
+                        weight, scale = converted.weight_fp8, converted.scale_fp32
                     for param, is_scale, _, shards in buffers:
                         if is_scale:
-                            value = converted.scale_fp32[None, None, :]
+                            value = scale[None, None, :]
                         elif np.dtype(param.value.dtype) == np.dtype(jnp.float8_e4m3fn):
-                            value = converted.weight_fp8.T
+                            value = weight.T
                         else:
-                            value = converted.dequantize().T
+                            value = (weight.astype(np.float32) * scale[:, None]).T
                         if value.shape != param.value.shape[1:]:
                             raise ValueError(
                                 f"{stem}: decoded expert shape {value.shape} != {param.value.shape[1:]}"
@@ -1210,11 +1238,12 @@ class DeepseekV4ForCausalLM(nnx.Module):
                         param.value.shape, sharding, [array for _, array, _ in shards.values()]
                     )
                 logger.info(
-                    "Loaded DeepSeek V4 layer %d/%d routed %s in %.1fs (strict MXFP4 conversion)",
+                    "Loaded DeepSeek V4 layer %d/%d routed %s in %.1fs (%s)",
                     layer_id + 1,
                     len(self.model.layers),
                     source,
                     time.monotonic() - started,
+                    "static FP8 load" if static_fp8 else "strict MXFP4 conversion",
                 )
 
 
