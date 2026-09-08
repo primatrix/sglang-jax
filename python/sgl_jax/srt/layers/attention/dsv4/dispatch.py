@@ -283,6 +283,7 @@ def run_layer(
                 metadata.query_request_ids,
                 jnp.asarray(tables.compressed_request_ids),
                 metadata.valid_token_mask,
+                entry_group_ids=jnp.asarray(tables.compressed_entry_ids),
                 k=index_topk,
                 ratio=ratio,
             )

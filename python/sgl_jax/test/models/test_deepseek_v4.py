@@ -345,3 +345,53 @@ def test_flash_attention_geometry_complete_trunk(tmp_path):
         split = run([(63, ForwardMode.EXTEND), (65, ForwardMode.EXTEND), (1, ForwardMode.DECODE)])
         assert np.isfinite(whole).all() and np.max(np.abs(whole)) > 0.1
         np.testing.assert_allclose(split, whole, rtol=0.04, atol=0.04)
+
+
+def test_csa_batched_requests_match_individual_requests(tmp_path):
+    model, mesh = make_model()
+    write_fixture(tmp_path / "model.safetensors", model)
+    if jax.default_backend() == "cpu":
+        cfg = tiny_config()
+        cfg.quantization_config = None
+        with jax.set_mesh(mesh):
+            model = nnx.eval_shape(lambda: DeepseekV4ForCausalLM(cfg, mesh))
+    with jax.set_mesh(mesh):
+        model.load_weights(SimpleNamespace(model_path=str(tmp_path)))
+        layer = model.model.layers[1].self_attn
+        cache = model.model.rope_compressed.value
+        inputs = [
+            np.sin(np.arange(8)[:, None] * 0.11 + np.arange(512)[None, :] * 0.017),
+            np.cos(np.arange(8)[:, None] * 0.13 + np.arange(512)[None, :] * 0.023),
+        ]
+
+        def run(items):
+            h = harness_for(model, 1, 1)
+            b = h.batch([8], capacity=256)
+            if len(items) == 2:
+                r = h.runner
+                slot = r.req_to_token_pool.alloc([SimpleNamespace(req_pool_idx=None)])[0]
+                loc = r.token_to_kv_pool_allocator.alloc_extend(
+                    np.array([0]), np.array([8]), np.array([-1]), 8, dp_rank=0
+                )
+                r.req_to_token_pool.req_to_token[slot, :8] = loc
+                b.seq_lens[1] = 8
+                b.req_pool_indices[1] = slot
+                b.positions[8:16] = np.arange(8)
+                b.out_cache_loc[8:16] = loc
+                b.extend_seq_lens[1] = 8
+                b.extend_prefix_lens[1] = 0
+                b.real_bs = 2
+                b.real_bs_per_dp = [2]
+                b.real_input_ids_len = 16
+            fb = h.forward_batch(b)
+            hidden = np.zeros((256, 512), jnp.bfloat16)
+            hidden[: 8 * len(items)] = np.concatenate(items)
+            hidden = jax.device_put(
+                hidden, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data", None))
+            )
+            y, _ = jax.jit(lambda x, f, p: layer(x, f, p, cache))(hidden, fb, h.runner.memory_pools)
+            return np.asarray(y)[: 8 * len(items)].astype(np.float32)
+
+        batched = run(inputs)
+        individual = np.concatenate([run([item]) for item in inputs])
+        np.testing.assert_allclose(batched, individual, rtol=0.02, atol=0.0003)
