@@ -35,6 +35,7 @@ both MXU operands fp8, neither of which changes the arithmetic.
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 from sgl_jax.srt.layers.attention.dsv4.rope import apply_dsv4_partial_rope
@@ -52,7 +53,7 @@ __all__ = [
 STANDARD_HEADS_PER_GROUP = 8
 
 
-def group_wo_a(wo_a, *, num_groups: int):
+def group_wo_a(wo_a, *, num_groups: int, out_sharding=None):
     """Reshape checkpoint ``wo_a`` ``[G*R, D]`` into ``[G, D, R]``.
 
     The checkpoint's output index is ``g * R + r`` -- group-major -- which is what
@@ -69,7 +70,8 @@ def group_wo_a(wo_a, *, num_groups: int):
             f"wo_a output width {out_features} is not divisible by o_groups {num_groups}"
         )
     lora_rank = out_features // num_groups
-    return jnp.transpose(wo_a.reshape(num_groups, lora_rank, reduction), (0, 2, 1))
+    grouped = jax.lax.reshape(wo_a, (num_groups, lora_rank, reduction), out_sharding=out_sharding)
+    return jnp.transpose(grouped, (0, 2, 1))
 
 
 def grouped_output_projection(

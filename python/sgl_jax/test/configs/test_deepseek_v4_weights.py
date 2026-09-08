@@ -21,7 +21,7 @@ from sgl_jax.srt.configs.deepseek_v4 import (
     DeepseekV4LayerType,
     classify_layers,
 )
-from sgl_jax.srt.models.deepseek_v4_weights import (
+from sgl_jax.srt.models.deepseek_v4 import (
     Disposition,
     build_weight_mappings,
     classify_checkpoint,
@@ -120,7 +120,7 @@ def test_every_checkpoint_key_is_classified(inventory, cfg):
     for f in facts.values():
         counts[f.disposition] += 1
     experts = cfg.num_hidden_layers * cfg.n_routed_experts * 3 * 2  # w1/w2/w3, weight+scale
-    assert counts[Disposition.EXPERT_PENDING] == experts == 66048
+    assert counts[Disposition.EXPERT_CONVERTED] == experts == 66048
     assert counts[Disposition.DROPPED] == 4705
     assert counts[Disposition.CLAIMED] == 72317 - experts - 4705
     assert sum(counts.values()) == 72317
@@ -215,7 +215,7 @@ def test_routed_experts_are_pending_and_shared_experts_are_not(cfg):
     """The mixed-format split: routed experts are FP4 and wait on M0.2's layout;
     shared experts are ordinary FP8 block-scale linears."""
     routed = classify_key(cfg, "layers.0.ffn.experts.0.w1.scale")
-    assert routed.disposition is Disposition.EXPERT_PENDING
+    assert routed.disposition is Disposition.EXPERT_CONVERTED
     assert "M0.2" in routed.reason
     shared = classify_key(cfg, "layers.0.ffn.shared_experts.w1.scale")
     assert shared.disposition is Disposition.CLAIMED

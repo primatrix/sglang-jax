@@ -11,8 +11,8 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 from sgl_jax.srt.layers.activation import silu_and_mul_with_clamp
-from sgl_jax.srt.layers.deepseek_v4_moe import DeepseekV4MoE
 from sgl_jax.srt.layers.gate import GateLogit, TopK
+from sgl_jax.srt.models.deepseek_v4 import DeepseekV4MoE
 
 
 def mesh_for(data=1, tensor=1):

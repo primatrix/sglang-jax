@@ -136,6 +136,7 @@ def csa_indexer_topk(
     entry_request_ids,
     valid_token_mask,
     *,
+    entry_group_ids,
     k: int,
     ratio: int,
     num_kv_heads: int | None = None,
@@ -151,6 +152,8 @@ def csa_indexer_topk(
       entry_request_ids: ``[E]`` request each key row belongs to. Rows that belong
         to no request must carry a value no query has.
       valid_token_mask: ``[T]`` padded query slots are False.
+      entry_group_ids: `[E]` group number within each row's own request,
+        distinct from the gathered row index returned by top-k.
       k: selection budget (`index_topk`).
       ratio: compression ratio of these layers (4 for CSA).
 
@@ -175,9 +178,13 @@ def csa_indexer_topk(
 
     scores = csa_indexer_scores(q, weights, keys, num_kv_heads=num_kv_heads)
 
-    entry_ids = jnp.arange(num_entries, dtype=jnp.int32)[None, :]  # [1, E]
+    entry_ids = jnp.asarray(entry_group_ids, jnp.int32)[None, :]
+    if entry_ids.shape[1] != num_entries:
+        raise ValueError("entry_group_ids must describe every gathered key row")
     same_request = query_request_ids[:, None] == entry_request_ids[None, :]
-    complete = entry_ids < visible_entries_for_query(query_positions, ratio)[:, None]
+    complete = (entry_ids >= 0) & (
+        entry_ids < visible_entries_for_query(query_positions, ratio)[:, None]
+    )
     legal = same_request & complete & valid_token_mask[:, None]
 
     scores = jnp.where(legal, scores, _NEG_INF)

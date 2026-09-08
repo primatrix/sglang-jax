@@ -28,7 +28,7 @@ from sgl_jax.srt.layers.attention.hca_backend import (
     _pad_capacity,
     _query_schedule,
 )
-from sgl_jax.srt.mem_cache.deepseek_v4_memory_pool import scatter_sharding
+from sgl_jax.srt.mem_cache.deepseek_v4.pool import scatter_sharding
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 
@@ -272,7 +272,17 @@ class DeepseekV4HCABackend(HCABackend):
         return DeepseekV4HCAMetadata(combined, schedule, uniform, init_slots)
 
     def __call__(
-        self, q, k, v, layer, forward_batch, token_to_kv_pool, *, compressor_state_pool, **kwargs
+        self,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        token_to_kv_pool,
+        *,
+        compressor_state_pool,
+        metadata=None,
+        **kwargs,
     ):
         """Use reshape views of C1 buffers and return native C1-shaped updates."""
         layer_id = int(layer.layer_id)
@@ -284,7 +294,8 @@ class DeepseekV4HCABackend(HCABackend):
         state = compressor_state_pool.get_buffer("c128", layer_id)
         window = token_to_kv_pool.get_buffer("swa", layer_id)
         compressed = token_to_kv_pool.get_buffer("c128", layer_id)
-        init_slots = self.forward_metadata.state_init_slots
+        metadata = self.forward_metadata if metadata is None else metadata
+        init_slots = metadata.state_init_slots
         if init_slots is None:
             raise RuntimeError("V4 HCA metadata has not been prepared")
         dp = int(self.mesh.shape["data"])
@@ -324,6 +335,7 @@ class DeepseekV4HCABackend(HCABackend):
             forward_batch,
             kv_view,
             recurrent_state_pool=state_proxy,
+            metadata=metadata,
             **kwargs,
         )
         return output, (

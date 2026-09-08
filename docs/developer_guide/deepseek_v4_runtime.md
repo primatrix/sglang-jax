@@ -1,13 +1,35 @@
-# DeepSeek V4 runtime and precompilation (C3 / INFERENCE-95)
+# DeepSeek V4 model and runtime
 
-The runtime bridge connects the existing C1 resources and M2.1 metadata to
-`ModelWorkerBatch -> ForwardBatch -> ModelRunner`. Its first real consumer is
-C128 HCA. Full model construction, C4/CSA and SWA-only layer dispatch remain
-M1/M2 work; allocation, reclamation and retract policy remain C2/C4 work.
+`models/deepseek_v4.py` owns the full trunk parameter tree, checkpoint mapping
+and paired MXFP4 expert conversion. The forward graph includes embeddings,
+mHC pre/post, attention and FFN norms, SWA/CSA/HCA, grouped output projection,
+hash/learned MoE routing, shared experts, mHC head collapse and LM logits.
+MTP checkpoint tensors are explicitly excluded.
+
+`DeepseekV4AttentionBackend` selects the native CSA/SWA backend or the tuned
+Flash-geometry HCA backend. Native HCA also supports smaller validation models.
+All three return `[tokens, heads, head_dim]` and complete cache updates.
+CSA currently uses native JAX compression, indexing and masked attention;
+this does not establish long-context throughput or production HBM efficiency.
+
+`mem_cache/deepseek_v4/` groups `pool.py` (KV families), `state.py` (request
+compressor state), `allocator.py` (history/SWA ownership) and `capacity.py`
+(budget and construction). As in SGLang, request compression state remains
+separate from KV storage and allocation. Existing global slot, original-token
+addressing, rollback, reclamation and no-prefix-reuse contracts remain in force.
+
+Real loading checks every trunk key, rejects unknown and missing tensors, and
+validates target shapes and integer hash IDs. Non-expert FP8 uses K128/N128
+E8M0 block scales (decoded explicitly from their bytes); routed MXFP4 is
+converted strictly to per-channel power-of-two FP8.
+Expert loading fills device slices one expert at a time, without assembling
+all experts on the host. Conversion errors abort loading. Expert placement
+must be identity; MTP, EPLB checkpoint remapping and static converted-checkpoint
+export are outside this entry point.
 
 ## Initialization and ownership
 
-`ModelRunner._get_attention_backend` routes V4 to `DeepseekV4RuntimeBackend`
+`ModelRunner._get_attention_backend` routes V4 to `DeepseekV4AttentionBackend`
 before loading the model, independently of the MLA/FA default. V4 does not
 set the MLA absorption or V3 DSA flags. After C1 creates its request pool,
 allocator and two device pool owners, `bind_attention_resources` binds the
@@ -94,3 +116,27 @@ across steps, then reports pool bytes and device memory statistics.
 The initial V4 restrictions remain: no overlap, mixed batches, speculative
 decoding or cross-request radix reuse; BF16 KV and FP32 state. Runtime tests
 do not establish complete V4 serving, quality or performance acceptance.
+
+Full graph and actual mixed-checkpoint fixture tests:
+
+```sh
+PYTHONPATH=python:. python -m pytest -v --tb=short \
+  python/sgl_jax/test/models/test_deepseek_v4.py
+```
+
+CPU covers actual BF16/FP8/MXFP4 loading and abstract prefill/decode through
+the complete graph on one device and DP=2/TP=2. TPU-only tests compare a
+whole prefill against split chunks plus decode across C4/C128 boundaries.
+The synthetic fixture is not real-model quality or full-checkpoint acceptance.
+
+The pinned Flash 0731 revision `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
+was checked against all 48 shard headers (72,317 tensors). All 1,564 regular
+mappings and 66,048 expert source shapes match the abstract 43-layer model
+created through ModelConfig and the model registry. The committed representative
+header fixture covers root parameters and SWA/CSA/HCA layers. Header agreement
+establishes the loading contract, not full-payload conversion or model quality.
+
+The model suite is registered in CPU and TPU CI. On eight TPU devices, it also
+runs a three-layer trunk with the full Flash attention geometry and verifies
+that HCA uses the Pallas backend. This fixture reduces layer/expert/vocabulary
+counts and must not be described as a full Flash checkpoint run.
