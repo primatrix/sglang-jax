@@ -64,7 +64,7 @@ def main():
         assert param.value.shape == value.shape, (param.value.shape, value.shape)
         param.value = jax.device_put(
             np.asarray(value, dtype=param.value.dtype),
-            NamedSharding(mesh, param.value.sharding.spec),
+            param.value.sharding,
         )
         param.value.block_until_ready()
 
