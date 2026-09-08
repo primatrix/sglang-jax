@@ -199,7 +199,7 @@ def test_complete_trunk_abstract_prefill_decode(tmp_path, dp, tp):
             )
             definition, state = nnx.split(model)
 
-            def call(s, f, p, lm=lm):
+            def call(s, f, p, lm=lm, definition=definition):
                 return nnx.merge(definition, s)(f, p, lm)
 
             result = jax.eval_shape(call, state, fb, h.runner.memory_pools)
