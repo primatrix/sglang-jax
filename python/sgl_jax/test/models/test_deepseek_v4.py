@@ -485,8 +485,8 @@ def test_flash_checkpoint_headers_match_model_parameters():
         assert tuple(header["shape"]) == expected, key
 
 
-@pytest.mark.parametrize("dp,tp", [(1, 1), (2, 2)])
-def test_static_fp8_load_matches_dynamic_without_conversion(tmp_path, dp, tp, monkeypatch):
+@pytest.mark.parametrize("dp,tp,ep", [(1, 1, 1), (2, 2, 1), (2, 2, 2)])
+def test_static_fp8_load_matches_dynamic_without_conversion(tmp_path, dp, tp, ep, monkeypatch):
     from sgl_jax.srt.utils.quantization import mxfp4_fp8_loader
     from sgl_jax.srt.utils.quantization.deepseek_v4_static_fp8 import (
         CONFIG_KEY,
@@ -496,7 +496,9 @@ def test_static_fp8_load_matches_dynamic_without_conversion(tmp_path, dp, tp, mo
 
     source, output = tmp_path / "source", tmp_path / "static"
     source.mkdir()
-    original, mesh = make_model(dp, tp)
+    cfg = tiny_config()
+    cfg.ep_size = ep
+    original, mesh = make_model(dp, tp, cfg)
     write_fixture(source / "model.safetensors", original)
     header = mxfp4_fp8_loader._read_safetensors_header(source / "model.safetensors")
     (source / "model.safetensors.index.json").write_text(
@@ -506,7 +508,7 @@ def test_static_fp8_load_matches_dynamic_without_conversion(tmp_path, dp, tp, mo
     with jax.set_mesh(mesh):
         original.load_weights(SimpleNamespace(model_path=str(source)))
     export_checkpoint(source, output, source_revision="fixture", converter_revision="test")
-    loaded, static_mesh = make_model(dp, tp)
+    loaded, static_mesh = make_model(dp, tp, cfg)
     setattr(loaded.config, CONFIG_KEY, FORMAT)
 
     def forbidden_conversion(*args, **kwargs):
@@ -515,8 +517,19 @@ def test_static_fp8_load_matches_dynamic_without_conversion(tmp_path, dp, tp, mo
     monkeypatch.setattr(
         mxfp4_fp8_loader, "convert_mxfp4_pair_from_safetensors", forbidden_conversion
     )
+    from sgl_jax.srt.utils.quantization import deepseek_v4_static_fp8
+
+    monkeypatch.setattr(deepseek_v4_static_fp8, "read_static_pair", forbidden_conversion)
+    monkeypatch.setattr(loaded, "_load_expert_weights", forbidden_conversion)
     with jax.set_mesh(static_mesh):
-        loaded.load_weights(SimpleNamespace(model_path=str(output)))
+        loaded.load_weights(
+            SimpleNamespace(
+                model_path=str(output),
+                hf_config=loaded.config,
+                ep_size=ep,
+                quantization_config=loaded.config.quantization_config,
+            )
+        )
     expected = dict(nnx.state(original, nnx.Param).flat_state())
     actual = dict(nnx.state(loaded, nnx.Param).flat_state())
     assert expected.keys() == actual.keys()
