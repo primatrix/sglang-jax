@@ -30,7 +30,6 @@ def main():
     p.add_argument("--out", required=True)
     p.add_argument("--schedule", choices=("whole128", "whole129", "split"))
     p.add_argument("--layer", type=int, choices=(2, 3))
-    p.add_argument("--diagnostic-csa-token-rope", action="store_true")
     args = p.parse_args()
     refroot = Path(args.reference)
     refmeta = json.loads((refroot / "run.json").read_text())
@@ -53,7 +52,6 @@ def main():
         reference=refmeta,
         weight_path="source-dequantized-BF16",
         kv_cache="BF16",
-        diagnostic_csa_token_rope=args.diagnostic_csa_token_rope,
         cases=[],
     )
 
@@ -95,18 +93,6 @@ def main():
             print("ATTENTION_METRIC", json.dumps(row), flush=True)
 
     captures = {}
-    from sgl_jax.srt.layers.attention.dsv4 import dispatch
-
-    original_compress = dispatch.compress_chunk
-    if args.diagnostic_csa_token_rope:
-
-        def diagnostic_compress(*a, **kw):
-            # Diagnostic intervention only. Baseline calls retain production semantics.
-            if kw["ratio"] == 4:
-                kw["boundary_compressed_pos"] = kw["boundary_compressed_pos"] * 4
-            return original_compress(*a, **kw)
-
-        dispatch.compress_chunk = diagnostic_compress
     original_backend = DeepseekV4AttentionBackend.__call__
 
     def backend_call(self, q, k, v, *a, **kw):
@@ -247,7 +233,6 @@ def main():
                     (out / "run.json").write_text(json.dumps(info, indent=2))
                     (out / "weights.json").write_text(json.dumps(cp.digests, indent=2))
     finally:
-        dispatch.compress_chunk = original_compress
         DeepseekV4AttentionBackend.__call__ = original_backend
         LinearBase.__call__ = original_linear
     if errors:

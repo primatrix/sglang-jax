@@ -209,7 +209,8 @@ def compress_chunk(
         to a chunk row.
       state_slots: ``[B]`` state-pool slot per request.
       boundary_token_indices, boundary_valid_mask: from M2.1's ratio metadata.
-      boundary_compressed_pos: ``[N]`` index into `cos_sin_cache` for each record.
+      boundary_compressed_pos: ``[N]`` original-token group starts used to index
+        `cos_sin_cache`, not compressed group ids (for ratio 4: 0, 4, 8, ...).
 
     Returns:
       ``(records, record_valid, new_state)`` with ``records`` ``[N, D]``.

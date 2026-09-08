@@ -223,6 +223,9 @@ def run_layer(
             raise ValueError(f"ratio {ratio} needs compressor weights")
         if compressor_input is None:
             raise ValueError("compressed layers require original hidden compressor_input")
+        # Cache addresses and visibility use group ids; RoPE uses the group's
+        # start in original-token coordinates (SGLang: seq_len - ratio).
+        rope_positions = ratio_md.boundary_group_ids * ratio
         records, record_valid, new_state = compress_chunk(
             compressor_input,
             state=state,
@@ -233,7 +236,7 @@ def run_layer(
             state_slots=metadata.request_slots,
             boundary_token_indices=ratio_md.boundary_token_indices,
             boundary_valid_mask=ratio_md.boundary_valid_mask,
-            boundary_compressed_pos=ratio_md.boundary_group_ids,
+            boundary_compressed_pos=rope_positions,
             ratio=ratio,
             head_dim=head_dim,
             rope_head_dim=rope_head_dim,
@@ -262,7 +265,7 @@ def run_layer(
                 state_slots=metadata.request_slots,
                 boundary_token_indices=ratio_md.boundary_token_indices,
                 boundary_valid_mask=ratio_md.boundary_valid_mask,
-                boundary_compressed_pos=ratio_md.boundary_group_ids,
+                boundary_compressed_pos=rope_positions,
                 ratio=ratio,
                 head_dim=indexer["head_dim"],
                 rope_head_dim=indexer.get("rope_head_dim", rope_head_dim),

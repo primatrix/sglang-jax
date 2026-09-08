@@ -55,12 +55,12 @@ attention arithmetic from projection, compressor and cache-quantization changes.
 At <=129 tokens the CSA indexer has at most 32 entries for topk=512, so these cases
 do not validate pruning or long-context selection.
 
-`--diagnostic-csa-token-rope` is an explicitly labeled intervention: multiply the
-CSA compressor's group coordinate by four before looking up RoPE. It is disabled
-by default, restores the original function on exit, and does not edit production
-code. The paired 2026-09-08 experiment isolated a group-id versus original-token
-coordinate discrepancy; the intervention is evidence for a proposed fix, not a
-claim that the model implementation has been fixed.
+The paired 2026-09-08 experiment isolated a group-id versus original-token
+coordinate discrepancy using a temporary compressor lookup intervention. The
+production dispatch now converts group ids to original-token group starts for
+both core and indexer compressors. Historical intervention scripts remain in the
+experiment artifact; the current harness runs the corrected production path
+without a coordinate override.
 
 Falcon runs: GPU `exp-5fsnkttdcv`, TPU `exp-l8arc30kyy`. Supplemental isolation,
 cache and coordinate-intervention runs reuse the same TPU allocation and retain

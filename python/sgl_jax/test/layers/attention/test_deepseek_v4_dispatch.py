@@ -543,3 +543,40 @@ def test_first_token_attends_to_its_own_kv():
         head_dim=D,
     )
     np.testing.assert_allclose(out, np.broadcast_to(value / 2, (1, H, D)), atol=1e-6)
+
+
+@pytest.mark.parametrize("ratio", [4, 128])
+@pytest.mark.parametrize("chunked", [False, True])
+def test_compressed_rope_uses_original_token_group_start(ratio, chunked):
+    """A second group rotates at ratio, not at group id 1, including decode emission.
+
+    Compare to an identity-RoPE execution and rotate its stored records with
+    NumPy. This checks core and indexer compressors without sharing the dispatch
+    coordinate calculation or the production RoPE implementation.
+    """
+    plain, rotated = _Harness(ratio, seed=117), _Harness(ratio, seed=117)
+    frequencies = np.array([0.17, 0.31], np.float32)
+    angles = np.arange(512, dtype=np.float32)[:, None] * frequencies
+    for baseline_weights, rotated_weights in ((plain.cw, rotated.cw), (plain.iw, rotated.iw)):
+        baseline_weights["cos_sin_cache"] = np.tile([1, 1, 0, 0], (512, 1)).astype(np.float32)
+        rotated_weights["cos_sin_cache"] = np.concatenate([np.cos(angles), np.sin(angles)], axis=-1)
+    chunks = [ratio - 1, 1, ratio - 1, 1] if chunked else [2 * ratio]
+    prefix = 0
+    for count in chunks:
+        _, base_update, _, _ = plain.step([0], [prefix], [count])
+        _, actual_update, tables, _ = rotated.step([0], [prefix], [count])
+        plain.commit(base_update)
+        rotated.commit(actual_update)
+        prefix += count
+        if prefix < ratio:
+            continue
+        rows = np.asarray(tables.compressed_rows)
+        # Derive starts from completed original-token boundaries, independently of metadata.
+        starts = np.arange(0, prefix - ratio + 1, ratio)
+        theta = starts[:, None] * frequencies
+        for family in ["compressed", "indexer"] if ratio == 4 else ["compressed"]:
+            expected = base_update[family][rows].copy()
+            even, odd = expected[:, -4::2].copy(), expected[:, -3::2].copy()
+            expected[:, -4::2] = even * np.cos(theta) - odd * np.sin(theta)
+            expected[:, -3::2] = even * np.sin(theta) + odd * np.cos(theta)
+            np.testing.assert_allclose(actual_update[family][rows], expected, rtol=2e-5, atol=2e-5)
