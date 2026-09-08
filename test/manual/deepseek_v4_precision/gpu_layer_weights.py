@@ -82,8 +82,9 @@ def attach_layer_capture(block, cap, current):
     handles.append(Restore())
     for name, module in (("attn_input", block.self_attn), ("ffn_input", block.mlp)):
 
-        def before(m, args, name=name):
-            cap.save(current["name"] + "/" + name, args[0].clone())
+        def before(m, args, kwargs, name=name):
+            value = args[0] if args else kwargs["x"]
+            cap.save(current["name"] + "/" + name, value.clone())
 
-        handles.append(module.register_forward_pre_hook(before))
+        handles.append(module.register_forward_pre_hook(before, with_kwargs=True))
     return handles
