@@ -7,7 +7,9 @@ V4 weights, including compressors, indexer, mHC and routing, are owned here.
 from __future__ import annotations
 
 import enum
+import logging
 import re
+import time
 from dataclasses import dataclass
 
 import jax
@@ -27,6 +29,8 @@ from sgl_jax.srt.layers.gate import GateLogit, TopK
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.utils.weight_utils import WeightMapping
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "Disposition",
@@ -1025,7 +1029,12 @@ class DeepseekV4ForCausalLM(nnx.Module):
                 )
             if any(len(entries) != 1 for entries in info.values()):
                 raise ValueError("V4 tensors must occur exactly once across checkpoint shards")
+            started = time.monotonic()
+            logger.info("Loading DeepSeek V4 non-expert parameters")
             self._load_regular_weights(info)
+            logger.info(
+                "Loaded DeepSeek V4 non-expert parameters in %.1fs", time.monotonic() - started
+            )
             self._load_expert_weights(info)
         # eval_shape creates placeholders for these non-parameter tables too.
         with jax.set_mesh(self.mesh):
@@ -1144,6 +1153,7 @@ class DeepseekV4ForCausalLM(nnx.Module):
                     "V4 checkpoint loading currently requires identity expert placement"
                 )
             for source, target in (("w1", "wi_0"), ("w3", "wi_1"), ("w2", "wo")):
+                started = time.monotonic()
                 weight_param = getattr(experts, target)
                 scale_param = getattr(experts, target + "_scale")
                 parameters = [(weight_param, False)]
@@ -1199,6 +1209,13 @@ class DeepseekV4ForCausalLM(nnx.Module):
                     param.value = jax.make_array_from_single_device_arrays(
                         param.value.shape, sharding, [array for _, array, _ in shards.values()]
                     )
+                logger.info(
+                    "Loaded DeepSeek V4 layer %d/%d routed %s in %.1fs (strict MXFP4 conversion)",
+                    layer_id + 1,
+                    len(self.model.layers),
+                    source,
+                    time.monotonic() - started,
+                )
 
 
 EntryClass = [DeepseekV4ForCausalLM]

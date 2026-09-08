@@ -565,6 +565,13 @@ def test_initialize_binds_actual_capacity_before_freezing_graph(monkeypatch):
     with jax.set_mesh(h.mesh):
         r.initialize()
     assert events == ["model", "pools", "bound", "jit"]
+    # TpWorker queries this after ModelRunner.initialize, before HTTP readiness.
+    assert (
+        r.attn_backend.get_max_running_reqests(
+            r.attn_backend.max_context_len, r.attn_backend.page_size
+        )
+        > 0
+    )
 
 
 def test_multiple_live_requests_reorder_boundary_owner():

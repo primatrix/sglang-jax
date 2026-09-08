@@ -75,6 +75,12 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self.resources_bound = False
         self.forward_metadata = nnx.data(DeepseekV4RuntimeMetadata())
 
+    @staticmethod
+    def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
+        # TpWorker combines this kernel metadata limit with the actual request
+        # pool capacity. Reuse the HCA scalar-prefetch budget for mixed V4 layers.
+        return DeepseekV4HCABackend.get_max_running_reqests(max_context_len, page_size)
+
     def bind_resources(self, request_pool, allocator):
         if allocator.dp_size != self.mesh.shape["data"] or allocator.page_size != self.page_size:
             raise ValueError("V4 runtime and resource geometry disagree")
