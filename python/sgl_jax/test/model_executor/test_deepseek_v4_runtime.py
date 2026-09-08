@@ -17,14 +17,14 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.hca.tuned_block_sizes import get_hca_kernel_schedule
 from sgl_jax.srt.layers.attention import deepseek_v4_hca_backend as hca_adapter
-from sgl_jax.srt.layers.attention.dsv4.runtime import DeepseekV4RuntimeBackend
-from sgl_jax.srt.mem_cache.deepseek_v4_allocator import DeepseekV4TokenToKVPoolAllocator
-from sgl_jax.srt.mem_cache.deepseek_v4_compress_state import DeepseekV4CompressStatePool
-from sgl_jax.srt.mem_cache.deepseek_v4_memory_pool import (
+from sgl_jax.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttentionBackend
+from sgl_jax.srt.mem_cache.deepseek_v4.allocator import DeepseekV4TokenToKVPoolAllocator
+from sgl_jax.srt.mem_cache.deepseek_v4.pool import (
     DeepseekV4CacheSpec,
     DeepseekV4TokenToKVPool,
     scatter_sharding,
 )
+from sgl_jax.srt.mem_cache.deepseek_v4.state import DeepseekV4CompressStatePool
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools, ReqToTokenPool
 from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -229,7 +229,7 @@ def test_binding_required_and_ordinary_backend_unchanged():
     h = Harness()
     r = h.runner
     r.attn_backend = r._get_attention_backend()
-    assert isinstance(r.attn_backend, DeepseekV4RuntimeBackend)
+    assert isinstance(r.attn_backend, DeepseekV4AttentionBackend)
     with pytest.raises(RuntimeError, match="bound"):
         r.get_attention_metadata(h.batch([1]))
     r.bind_attention_resources()
@@ -432,7 +432,7 @@ def make_hca_consumer(h, weights, traces):
                 pools.token_to_kv_pool,
                 pools.compressor_state_pool,
             )
-            return output, updates, None, None
+            return output.reshape(output.shape[0], -1), updates, None, None
 
     return HCAConsumer()
 

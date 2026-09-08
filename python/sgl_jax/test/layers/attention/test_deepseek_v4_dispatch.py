@@ -140,7 +140,7 @@ class _Harness:
         indexer = None
         if self.ratio == 4:
             indexer = dict(
-                new_kv=self.rng.normal(size=(T, DI)).astype(np.float32),
+                compressor_input=self.rng.normal(size=(T, DI)).astype(np.float32),
                 q=self.rng.normal(size=(T, HI, DI)).astype(np.float32),
                 weights=self.rng.normal(size=(T, HI)).astype(np.float32),
                 state=self.idx_state,
@@ -151,6 +151,7 @@ class _Harness:
         out, updates = run_layer(
             q=q,
             new_kv=new_kv,
+            compressor_input=new_kv,
             layer_id=0,
             ratio=self.ratio,
             metadata=md,
@@ -401,6 +402,7 @@ def test_csa_needs_its_indexer():
         run_layer(
             q=np.zeros((4, H, D), np.float32),
             new_kv=np.zeros((4, D), np.float32),
+            compressor_input=np.zeros((4, D), np.float32),
             layer_id=0,
             ratio=4,
             metadata=md_args,
@@ -434,6 +436,7 @@ def test_compressed_route_needs_compressor_weights():
         run_layer(
             q=np.zeros((4, H, D), np.float32),
             new_kv=np.zeros((4, D), np.float32),
+            compressor_input=np.zeros((4, D), np.float32),
             layer_id=0,
             ratio=128,
             metadata=md,
@@ -478,16 +481,61 @@ class _Layer:
 def test_layer_ratio_comes_from_c1s_spec():
     """One classification, not a third derivation: the ratio is read straight off
     C1's spec, which is the same list `configs/deepseek_v4.classify_layers` uses."""
-    from sgl_jax.srt.layers.attention.dsv4.runtime import DeepseekV4RuntimeBackend
+    from sgl_jax.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttentionBackend
 
-    layer_ratio = DeepseekV4RuntimeBackend.__dict__["layer_ratio"]
+    layer_ratio = DeepseekV4AttentionBackend.__dict__["layer_ratio"]
     assert [layer_ratio(None, _Layer(i), _KVPool()) for i in range(5)] == [0, 0, 4, 128, 4]
 
 
 def test_layer_outside_the_backbone_is_rejected():
     """The 46-vs-43 trap again: an index past the trunk must not silently classify."""
-    from sgl_jax.srt.layers.attention.dsv4.runtime import DeepseekV4RuntimeBackend
+    from sgl_jax.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttentionBackend
 
-    layer_ratio = DeepseekV4RuntimeBackend.__dict__["layer_ratio"]
+    layer_ratio = DeepseekV4AttentionBackend.__dict__["layer_ratio"]
     with pytest.raises(ValueError, match="outside the V4 backbone"):
         layer_ratio(None, _Layer(5), _KVPool())
+
+
+def test_first_token_attends_to_its_own_kv():
+    """A zero query and zero sink split mass equally between self KV and sink."""
+    h = _Harness(0)
+    out, updates, _, _ = h.step([0], [0], [1])
+    # Read the exact generated KV from its committed physical row. Re-run with
+    # q=0 below so the independent oracle is simply value / 2.
+    row = int(h.alloc.full_to_swa_index_mapping[h.pool.req_to_token[0, 0]])
+    value = np.asarray(updates["swa"])[row]
+    md = derive_attention_metadata(
+        q_lens=[1],
+        prefix_lens=[0],
+        positions=[0],
+        request_slots=[0],
+        history_write_loc=[PAGE],
+        swa_write_loc=[row],
+        pages_per_request=[1],
+        page_size=PAGE,
+        window_size=WINDOW,
+    )
+    out, _ = run_layer(
+        q=np.zeros((1, H, D), np.float32),
+        new_kv=value[None],
+        layer_id=0,
+        ratio=0,
+        metadata=md,
+        tables=read_tables(
+            request_pool=h.pool,
+            allocator=h.alloc,
+            slots=[0],
+            lengths=[1],
+            q_lens=[1],
+            ratio=0,
+            window_size=WINDOW,
+            page_size=PAGE,
+        ),
+        kv_buffers={"swa": h.swa},
+        state=None,
+        attention_sink=np.zeros(H),
+        softmax_scale=SCALE,
+        window_size=WINDOW,
+        head_dim=D,
+    )
+    np.testing.assert_allclose(out, np.broadcast_to(value / 2, (1, H, D)), atol=1e-6)

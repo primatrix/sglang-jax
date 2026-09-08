@@ -233,9 +233,7 @@ def test_ring_depth_follows_the_overlap_factor():
 
 
 def test_state_shape_matches_c1s_pool():
-    from sgl_jax.srt.mem_cache.deepseek_v4_compress_state import (
-        DeepseekV4CompressStatePool,
-    )
+    from sgl_jax.srt.mem_cache.deepseek_v4.state import DeepseekV4CompressStatePool
 
     assert DeepseekV4CompressStatePool  # imported for provenance, not called
     for ratio, middle, last in ((4, 8, 4), (128, 128, 2)):

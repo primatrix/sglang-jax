@@ -296,6 +296,7 @@ class JAXModelLoader(DefaultModelLoader):
         if (
             hasattr(model_config, "quantization_config")
             and model_config.quantization_config is not None
+            and not getattr(model_class, "owns_quantization_structure", False)
         ):
             is_static = model_config.quantization_config.is_static_checkpoint
 

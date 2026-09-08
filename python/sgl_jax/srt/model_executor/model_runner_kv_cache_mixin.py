@@ -16,11 +16,7 @@ from typing import TYPE_CHECKING
 import jax.numpy as jnp
 import numpy as np
 
-from sgl_jax.srt.mem_cache.memory_pool import (
-    HybridReqToTokenPool,
-    MemoryPools,
-    MLATokenToKVPool,
-)
+from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, MemoryPools, MLATokenToKVPool
 from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 
 if TYPE_CHECKING:
@@ -668,9 +664,7 @@ class ModelRunnerKVCacheMixin:
     def _init_pools(self: ModelRunner, max_num_reqs: int, dp_size: int):
         """Create ReqToTokenPool, KV pool, allocator, and MemoryPools."""
         if self._is_deepseek_v4():
-            from sgl_jax.srt.mem_cache.deepseek_v4_pool_factory import (
-                build_deepseek_v4_pools,
-            )
+            from sgl_jax.srt.mem_cache.deepseek_v4.capacity import build_deepseek_v4_pools
 
             if self.token_to_kv_pool_allocator is not None:
                 raise ValueError("V4 pool initialization cannot reuse an existing allocator")
@@ -695,11 +689,7 @@ class ModelRunnerKVCacheMixin:
             SWATokenToKVPoolAllocator,
             TokenToKVPoolAllocator,
         )
-        from sgl_jax.srt.mem_cache.memory_pool import (
-            MHATokenToKVPool,
-            ReqToTokenPool,
-            SWAKVPool,
-        )
+        from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool, SWAKVPool
 
         has_recurrent_state = self.linear_recurrent_config is not None
 
@@ -908,10 +898,8 @@ class ModelRunnerKVCacheMixin:
     def _init_deepseek_v4_memory_pool(
         self, max_num_reqs, max_total_tokens, total_device_memory, dp_size
     ):
-        from sgl_jax.srt.mem_cache.deepseek_v4_memory_pool import DeepseekV4CacheSpec
-        from sgl_jax.srt.mem_cache.deepseek_v4_pool_factory import (
-            plan_deepseek_v4_pools,
-        )
+        from sgl_jax.srt.mem_cache.deepseek_v4.capacity import plan_deepseek_v4_pools
+        from sgl_jax.srt.mem_cache.deepseek_v4.pool import DeepseekV4CacheSpec
 
         sa = self.server_args
         if not sa.disable_overlap_schedule or not sa.disable_radix_cache:

@@ -14,10 +14,7 @@ from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.kernels.hca.attention import INERT_QUERY_OFFSET
 from sgl_jax.srt.kernels.hca.hca import HCAMetadata, fused_projection_weight, hca_step
-from sgl_jax.srt.kernels.hca.tuned_block_sizes import (
-    HCAKernelSchedule,
-    get_hca_kernel_schedule,
-)
+from sgl_jax.srt.kernels.hca.tuned_block_sizes import HCAKernelSchedule, get_hca_kernel_schedule
 from sgl_jax.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     AttentionBackendMetadata,
@@ -394,10 +391,11 @@ class HCABackend(AttentionBackend):
         sin: jax.Array,
         attention_sink: jax.Array,
         fused_weight: jax.Array | None = None,
+        metadata=None,
         **_kwargs,
     ) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array]]:
         """Run complete cache-aware HCA and return explicit pool updates."""
-        metadata = self.forward_metadata
+        metadata = self.forward_metadata if metadata is None else metadata
         if metadata.kernel is None:
             raise RuntimeError("HCABackend.forward_metadata has not been prepared")
         if metadata.schedule is None:

@@ -3,11 +3,7 @@
 import jax
 import jax.numpy as jnp
 
-from sgl_jax.srt.mem_cache.deepseek_v4_memory_pool import (
-    _V4Buffers,
-    allocate_buffer,
-    scatter_sharding,
-)
+from sgl_jax.srt.mem_cache.deepseek_v4.pool import _V4Buffers, allocate_buffer, scatter_sharding
 
 
 @jax.tree_util.register_pytree_node_class

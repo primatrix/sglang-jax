@@ -10,12 +10,9 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.attention.deepseek_v4_hca_backend import DeepseekV4HCABackend
-from sgl_jax.srt.mem_cache.deepseek_v4_allocator import DeepseekV4TokenToKVPoolAllocator
-from sgl_jax.srt.mem_cache.deepseek_v4_compress_state import DeepseekV4CompressStatePool
-from sgl_jax.srt.mem_cache.deepseek_v4_memory_pool import (
-    DeepseekV4CacheSpec,
-    DeepseekV4TokenToKVPool,
-)
+from sgl_jax.srt.mem_cache.deepseek_v4.allocator import DeepseekV4TokenToKVPoolAllocator
+from sgl_jax.srt.mem_cache.deepseek_v4.pool import DeepseekV4CacheSpec, DeepseekV4TokenToKVPool
+from sgl_jax.srt.mem_cache.deepseek_v4.state import DeepseekV4CompressStatePool
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools, ReqToTokenPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 

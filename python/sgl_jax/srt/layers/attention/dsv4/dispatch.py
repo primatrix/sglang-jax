@@ -32,6 +32,7 @@ that the Pallas path has a same-repo reference to be compared against.
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -46,6 +47,7 @@ __all__ = [
 ]
 
 
+@jax.tree_util.register_pytree_node_class
 class ReadTables:
     """Flat read addresses for one step, one DP rank.
 
@@ -71,6 +73,13 @@ class ReadTables:
     def __init__(self, **kw):
         for name in self.__slots__:
             setattr(self, name, kw[name])
+
+    def tree_flatten(self):
+        return tuple(getattr(self, name) for name in self.__slots__), None
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        return cls(**dict(zip(cls.__slots__, children, strict=True)))
 
     def __repr__(self):  # pragma: no cover - debugging aid
         return (
@@ -173,6 +182,7 @@ def run_layer(
     kv_buffers,
     state,
     compressor_weights=None,
+    compressor_input=None,
     indexer=None,
     attention_sink,
     softmax_scale: float,
@@ -191,6 +201,7 @@ def run_layer(
         and (ratio 4) `"indexer"` [E_all, Di]; C1 buffers flattened over their first
         two axes so a compressed address indexes them directly.
       state: [S, window, 2*coff*D] compressor state, or None for ratio 0.
+      compressor_input: original [T, hidden] sublayer input, separate from projected KV.
       compressor_weights: `wkv`/`wgate`/`ape`/`norm_weight`/`cos_sin_cache` for the
         main compressor; required when ratio > 0.
       indexer: for ratio 4, a dict with the indexer's own `compressor_weights`,
@@ -210,8 +221,10 @@ def run_layer(
     if ratio > 0:
         if compressor_weights is None:
             raise ValueError(f"ratio {ratio} needs compressor weights")
+        if compressor_input is None:
+            raise ValueError("compressed layers require original hidden compressor_input")
         records, record_valid, new_state = compress_chunk(
-            new_kv,
+            compressor_input,
             state=state,
             positions=metadata.query_positions,
             query_request_ids=metadata.query_request_ids,
@@ -240,7 +253,7 @@ def run_layer(
             if indexer is None or index_topk is None:
                 raise ValueError("CSA layers need the indexer and index_topk")
             idx_records, idx_valid, idx_state = compress_chunk(
-                indexer["new_kv"],
+                indexer["compressor_input"],
                 state=indexer["state"],
                 positions=metadata.query_positions,
                 query_request_ids=metadata.query_request_ids,
@@ -274,7 +287,13 @@ def run_layer(
                 ratio=ratio,
             )
 
-    window_kv = jnp.take(kv_buffers["swa"], jnp.asarray(tables.window_rows), axis=0)
+    # C1 retains all SWA pages read by this chunk until it completes. Publish
+    # current-token KV before the read; causal positions, not write ordering,
+    # prevent a query from attending to later tokens in the chunk.
+    updates["swa"] = update_window_kv(
+        kv_buffers["swa"], new_kv, metadata.swa_write_loc, metadata.valid_token_mask
+    )
+    window_kv = jnp.take(updates["swa"], jnp.asarray(tables.window_rows), axis=0)
     out = dsv4_attention(
         q,
         window_kv,
@@ -293,11 +312,6 @@ def run_layer(
         selected_entries=selected,
     )
 
-    # The window write happens after the read, so a query never attends to a row
-    # this same step overwrote.
-    updates["swa"] = update_window_kv(
-        kv_buffers["swa"], new_kv, metadata.swa_write_loc, metadata.valid_token_mask
-    )
     return out, updates
 
 

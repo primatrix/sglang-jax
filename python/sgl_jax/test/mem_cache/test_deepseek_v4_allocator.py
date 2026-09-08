@@ -4,11 +4,8 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh
 
-from sgl_jax.srt.mem_cache.deepseek_v4_allocator import DeepseekV4TokenToKVPoolAllocator
-from sgl_jax.srt.mem_cache.deepseek_v4_memory_pool import (
-    DeepseekV4CacheSpec,
-    DeepseekV4TokenToKVPool,
-)
+from sgl_jax.srt.mem_cache.deepseek_v4.allocator import DeepseekV4TokenToKVPoolAllocator
+from sgl_jax.srt.mem_cache.deepseek_v4.pool import DeepseekV4CacheSpec, DeepseekV4TokenToKVPool
 
 
 @pytest.fixture(autouse=True)

@@ -16,10 +16,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, MockModelConfig, ModelConfig
-from sgl_jax.srt.eplb.expert_location import (
-    init_expert_location_metadata,
-    set_global_server_args,
-)
+from sgl_jax.srt.eplb.expert_location import init_expert_location_metadata, set_global_server_args
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.layers.routed_experts_capturer import (
     RoutedExpertsCapturer,
@@ -28,16 +25,10 @@ from sgl_jax.srt.layers.routed_experts_capturer import (
 )
 from sgl_jax.srt.layers.sampler import Sampler, compute_logprobs
 from sgl_jax.srt.lora.context_manager import LoraBatchContext
-from sgl_jax.srt.managers.schedule_batch import (
-    GLOBAL_SERVER_ARGS_KEYS,
-    global_server_args_dict,
-)
+from sgl_jax.srt.managers.schedule_batch import GLOBAL_SERVER_ARGS_KEYS, global_server_args_dict
 from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
-from sgl_jax.srt.model_executor.aot_dispatch import (
-    AotDispatcher,
-    aot_dispatch_requested,
-)
+from sgl_jax.srt.model_executor.aot_dispatch import AotDispatcher, aot_dispatch_requested
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
@@ -103,7 +94,7 @@ def _maybe_apply_recurrent_cow(forward_batch, memory_pools):
 
 def _validate_v4_pool_updates(memory_pools, updates):
     """Check the complete V4 result while tracing, before dispatch donates inputs."""
-    from sgl_jax.srt.mem_cache.deepseek_v4_memory_pool import DeepseekV4TokenToKVPool
+    from sgl_jax.srt.mem_cache.deepseek_v4.pool import DeepseekV4TokenToKVPool
 
     if isinstance(getattr(memory_pools, "token_to_kv_pool", None), DeepseekV4TokenToKVPool):
         if not isinstance(updates, dict) or set(updates) != set(memory_pools._pools):
@@ -742,17 +733,17 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.attn_backend = self._get_attention_backend()
 
     def bind_attention_resources(self):
-        from sgl_jax.srt.layers.attention.dsv4.runtime import DeepseekV4RuntimeBackend
+        from sgl_jax.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttentionBackend
 
-        if isinstance(self.attn_backend, DeepseekV4RuntimeBackend):
+        if isinstance(self.attn_backend, DeepseekV4AttentionBackend):
             self.attn_backend.bind_resources(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
 
     def get_attention_metadata(self, batch):
-        from sgl_jax.srt.layers.attention.dsv4.runtime import DeepseekV4RuntimeBackend
+        from sgl_jax.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttentionBackend
 
-        if isinstance(self.attn_backend, DeepseekV4RuntimeBackend):
+        if isinstance(self.attn_backend, DeepseekV4AttentionBackend):
             return self.attn_backend.get_forward_metadata(
                 batch,
                 request_pool=self.req_to_token_pool,
@@ -761,25 +752,24 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         return self.attn_backend.get_forward_metadata(batch)
 
     def prepare_dummy_batch(self, batch):
-        from sgl_jax.srt.layers.attention.dsv4.runtime import (
-            DeepseekV4RuntimeBackend,
+        from sgl_jax.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttentionBackend,
             prepare_dummy_batch,
         )
 
-        if isinstance(self.attn_backend, DeepseekV4RuntimeBackend):
+        if isinstance(self.attn_backend, DeepseekV4AttentionBackend):
             prepare_dummy_batch(batch, self.attn_backend)
 
     def _get_attention_backend(self):
         if self._is_deepseek_v4():
-            from sgl_jax.srt.layers.attention.dsv4.runtime import (
-                DeepseekV4RuntimeBackend,
-            )
+            from sgl_jax.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttentionBackend
 
             # V4's shared KV and compressor state cannot use the MLA/FA route.
-            return DeepseekV4RuntimeBackend(
+            return DeepseekV4AttentionBackend(
                 mesh=self.mesh,
                 page_size=self.page_size,
                 max_context_len=self.model_config.context_len,
+                config=getattr(self.model_config, "hf_text_config", None),
             )
 
         def _has_softmax_dtype(config) -> bool:
@@ -826,9 +816,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
         elif backend == "dsa_sparse" and self.use_mla_backend:
             from sgl_jax.srt.kernels.dsa.ref import build_index_share_map
-            from sgl_jax.srt.layers.attention.dsa_sparse_backend import (
-                DSASparseAttentionBackend,
-            )
+            from sgl_jax.srt.layers.attention.dsa_sparse_backend import DSASparseAttentionBackend
 
             cfg = self.model_config.hf_text_config
             full_slot, _, _ = build_index_share_map(
@@ -889,9 +877,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             )
 
         elif backend in ("fa", "fa_mha"):
-            from sgl_jax.srt.layers.attention.flashattention_backend import (
-                FlashAttention,
-            )
+            from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
 
             if backend == "fa_mha" and self.use_mla_backend:
                 cfg = self.model_config.hf_text_config
@@ -913,9 +899,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             raise ValueError(f"Unsupported attention backend: {self.server_args.attention_backend}")
 
         # Always go through the wrapper — it's a no-op when no hybrid config is set.
-        from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
-            attn_backend_wrapper,
-        )
+        from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import attn_backend_wrapper
 
         return attn_backend_wrapper(self, full_attn_backend)
 
