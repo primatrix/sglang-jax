@@ -40,7 +40,7 @@ from sgl_jax.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     MatchPrefixParams,
 )
-from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
+from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache, DeepseekV4ChunkCache
 from sgl_jax.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -1577,6 +1577,10 @@ class ScheduleBatch:
 
     def maybe_evict_swa(self, sliding_window_size=None):
         """Evict SWA pool slots outside the sliding window for all requests."""
+        if isinstance(self.tree_cache, DeepseekV4ChunkCache):
+            # V4 reclaims at result completion; prepared lengths may describe
+            # a long chunk whose earliest query still needs the old window.
+            return
         if not self.is_hybrid:
             return
         if sliding_window_size is None:
