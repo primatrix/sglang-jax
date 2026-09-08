@@ -126,7 +126,7 @@ def main():
             "--encoder-urls",
             "http://127.0.0.1:31001",
             "--device-indexes",
-            *map(str, range(encoder_devices, 8)),
+            *map(str, range(pd_devices)),
         ]
         encoder_cmd = [
             sys.executable,
@@ -262,11 +262,29 @@ def main():
                 log = (args.output_dir / "server.log").open("w")
                 server_env = os.environ.copy()
                 if encoder_cmd:
-                    server_env["ALLOW_MULTIPLE_LIBTPU_LOAD"] = "1"
+                    server_env.pop("ALLOW_MULTIPLE_LIBTPU_LOAD", None)
+                    server_env["TPU_VISIBLE_CHIPS"] = ",".join(
+                        map(str, range(encoder_devices // 2, 4))
+                    )
+                    server_env["TPU_CHIPS_PER_PROCESS_BOUNDS"] = f"{pd_devices // 2},1,1"
+                    server_env["TPU_PROCESS_BOUNDS"] = "1,1,1"
+                    encoder_env = server_env | {
+                        "TPU_VISIBLE_CHIPS": ",".join(map(str, range(encoder_devices // 2))),
+                        "TPU_CHIPS_PER_PROCESS_BOUNDS": f"{encoder_devices // 2},1,1",
+                    }
+                    print(
+                        json.dumps(
+                            {
+                                "encoder_chips": encoder_env["TPU_VISIBLE_CHIPS"],
+                                "pd_chips": server_env["TPU_VISIBLE_CHIPS"],
+                            }
+                        ),
+                        flush=True,
+                    )
                     encoder_log = (args.output_dir / "encoder.log").open("w")
                     print(json.dumps({"encoder_command": encoder_cmd}), flush=True)
                     encoder = subprocess.Popen(
-                        encoder_cmd, stdout=encoder_log, stderr=subprocess.STDOUT, env=server_env
+                        encoder_cmd, stdout=encoder_log, stderr=subprocess.STDOUT, env=encoder_env
                     )
                     deadline = time.monotonic() + 1800
                     while True:
