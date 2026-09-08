@@ -2,8 +2,11 @@
 
 Host request/allocator objects stay on ModelRunner. Only their array-derived
 metadata enters ForwardBatch, so neither a donated pool nor a mutable host page
-ledger is captured in the Flax model graph. M2.5 can extend layer dispatch here;
-the first executable consumer is the C128 HCA backend.
+ledger is captured in the Flax model graph.
+
+M2.5 filled in the layer dispatch: C128 stays on #349's Pallas kernel and the
+SWA-only / CSA routes go through `dsv4.dispatch.run_layer`, which needs the
+per-layer weight bundle M1.4 owns.
 """
 
 from dataclasses import dataclass
@@ -18,6 +21,7 @@ from sgl_jax.srt.layers.attention.deepseek_v4_hca_backend import (
     DeepseekV4HCABackend,
     DeepseekV4HCAMetadata,
 )
+from sgl_jax.srt.layers.attention.dsv4.dispatch import run_layer
 from sgl_jax.srt.layers.attention.dsv4.metadata import (
     DeepseekV4AttentionMetadata,
     derive_attention_metadata,
@@ -126,10 +130,46 @@ class DeepseekV4RuntimeBackend(DeepseekV4HCABackend):
             attention,
         )
 
+    def layer_ratio(self, layer, token_to_kv_pool) -> int:
+        """Compression ratio of a layer, from C1's spec -- the single classification.
+
+        C1's `spec.compress_ratios` is the same list `configs/deepseek_v4.classify_layers`
+        reads, so this does not add a third derivation.
+        """
+        layer_id = int(layer.layer_id)
+        ratios = token_to_kv_pool.spec.compress_ratios
+        if not 0 <= layer_id < len(ratios):
+            raise ValueError(f"layer {layer_id} is outside the V4 backbone")
+        return int(ratios[layer_id])
+
     def __call__(self, q, k, v, layer, forward_batch, token_to_kv_pool, **kwargs):
-        if int(layer.layer_id) not in token_to_kv_pool.spec.layers(128):
-            raise NotImplementedError("V4 runtime consumer currently implements C128 HCA only")
-        return super().__call__(q, k, v, layer, forward_batch, token_to_kv_pool, **kwargs)
+        ratio = self.layer_ratio(layer, token_to_kv_pool)
+        if ratio == 128:
+            # Production C128 stays on #349's Pallas kernel.
+            return super().__call__(q, k, v, layer, forward_batch, token_to_kv_pool, **kwargs)
+        if ratio not in (0, 4):
+            raise ValueError(f"unsupported V4 compression ratio {ratio}")
+
+        # M2.5's native route for SWA-only and CSA layers. The per-layer weight bundle
+        # (compressor wkv/wgate/ape/norm, the indexer's own compressor and projections,
+        # the attention sink) belongs to the model, so M1.4 supplies it; there is no
+        # sensible default to invent here.
+        bundle = kwargs.get("dsv4_layer")
+        if bundle is None:
+            raise NotImplementedError(
+                f"V4 ratio-{ratio} layers need the per-layer weight bundle from M1.4; "
+                "pass it as the `dsv4_layer` keyword. See layers/attention/dsv4/dispatch.py "
+                "for the expected contents."
+            )
+        return run_layer(
+            q=q,
+            new_kv=k,
+            layer_id=int(layer.layer_id),
+            ratio=ratio,
+            metadata=self.forward_metadata.attention,
+            window_size=self.window_size,
+            **bundle,
+        )
 
 
 def prepare_dummy_batch(batch, backend):
