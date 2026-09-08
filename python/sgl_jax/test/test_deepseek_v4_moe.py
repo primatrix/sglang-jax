@@ -92,29 +92,35 @@ def test_clamp_is_before_silu_and_gate_has_no_lower_bound():
 
 
 @pytest.mark.parametrize("data,tensor", [(1, 1), (2, 2)])
-def test_hash_table_roundtrip_hidden_dependence_and_padding(data, tensor):
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+def test_hash_table_roundtrip_hidden_dependence_and_padding(data, tensor, sequence_parallel):
     mesh = mesh_for(data, tensor)
     with jax.set_mesh(mesh):
         layer = DeepseekV4MoE(config(), mesh, 0)
-        table = np.tile([3, 1], (16, 1)).astype(np.int64)
+        table = np.tile([[3, 1], [0, 2]], (8, 1)).astype(np.int64)
         layer.load_hash_table(table)
         assert layer.gate.tid2eid.value.dtype == jnp.int32
         assert layer.gate.tid2eid.value.sharding.spec == P(None, None)
         assign(layer.gate.kernel, np.arange(32).reshape(8, 4) / 32)
-        sharding = NamedSharding(mesh, P("data", None))
+        token_axis = ("data", "tensor") if sequence_parallel else "data"
+        sharding = NamedSharding(mesh, P(token_axis, None))
         x = jax.device_put(np.ones((4, 8), np.float32), sharding)
         input_ids = jax.device_put(
-            np.array([7, 7, -1, 100], np.int32), NamedSharding(mesh, P("data"))
+            np.array([7, 6, -1, 100], np.int32), NamedSharding(mesh, P(token_axis))
         )
         run = jax.jit(lambda h, t: layer.route(h, t, routing_sharding=sharding))
         weights, ids = run(x, input_ids)
         other, other_ids = run(-x, input_ids)
         weights, other = np.asarray(weights), np.asarray(other)
-        np.testing.assert_array_equal(ids, np.tile([3, 1], (4, 1)))
+        np.testing.assert_array_equal(ids, [[0, 2], [3, 1], [3, 1], [3, 1]])
         np.testing.assert_array_equal(ids, other_ids)
         assert not np.allclose(weights[:2], other[:2])
         np.testing.assert_array_equal(weights[2:], 0)
         np.testing.assert_allclose(weights[:2].sum(-1), 1.5)
+        changed_ids = jax.device_put(np.array([6, 7, -1, 100], np.int32), input_ids.sharding)
+        changed_weights, changed = run(x, changed_ids)
+        np.testing.assert_array_equal(np.asarray(changed)[:2], [[3, 1], [0, 2]])
+        np.testing.assert_allclose(np.asarray(changed_weights)[:2], weights[:2][::-1])
         masked, _ = layer.route(x, input_ids, token_valid_mask=jnp.array([False] * 4))
         np.testing.assert_array_equal(masked, 0)
         with pytest.raises(ValueError, match="requires input_ids"):
@@ -131,12 +137,20 @@ def test_hash_table_roundtrip_hidden_dependence_and_padding(data, tensor):
 
 @pytest.mark.skipif(jax.default_backend() != "tpu", reason="real TPU GMM required")
 @pytest.mark.parametrize(
-    "ep,data,tensor,replicated",
-    [(1, 1, 1, False), (2, 1, 2, False), (1, 1, 2, False), (1, 2, 2, True)],
+    "ep,data,tensor,replicated,sequence_parallel",
+    [
+        (1, 1, 1, False, False),
+        (2, 1, 2, False, False),
+        (1, 1, 2, False, False),
+        (1, 2, 2, True, False),
+        (1, 1, 2, False, True),
+    ],
 )
 @pytest.mark.parametrize("hash_layer", [True, False])
 @pytest.mark.parametrize("fp8", [False, True])
-def test_tpu_full_block_against_numpy(ep, data, tensor, replicated, hash_layer, fp8):
+def test_tpu_full_block_against_numpy(
+    ep, data, tensor, replicated, sequence_parallel, hash_layer, fp8
+):
     if fp8 and replicated:
         pytest.skip("replicated EPMoE only supports unquantized weights")
     mesh = mesh_for(data, tensor)
@@ -179,9 +193,10 @@ def test_tpu_full_block_against_numpy(ep, data, tensor, replicated, hash_layer, 
             layer.load_hash_table(np.tile([[3, 0], [1, 2]], (8, 1)))
         else:
             assign(layer.gate.bias, [0.2, -0.3, 0.5, 0.0])
-        shard = NamedSharding(mesh, P("data", None))
+        token_axis = ("data", "tensor") if sequence_parallel else "data"
+        shard = NamedSharding(mesh, P(token_axis, None))
         x = jax.device_put(rng.normal(0, 2, (16, 256)).astype(jnp.bfloat16), shard)
-        tids = jax.device_put(np.arange(16, dtype=np.int32), NamedSharding(mesh, P("data")))
+        tids = jax.device_put(np.arange(16, dtype=np.int32), NamedSharding(mesh, P(token_axis)))
         mask = jnp.arange(16) < 13
         out, ids = jax.jit(lambda h, t, m: layer(h, t, token_valid_mask=m, out_sharding=shard))(
             x, tids, mask
@@ -226,3 +241,20 @@ def test_tpu_full_block_against_numpy(ep, data, tensor, replicated, hash_layer, 
             np.asarray(out, dtype=np.float32), expected, atol=0.12, rtol=0.035
         )
         np.testing.assert_array_equal(np.asarray(out)[13:], 0)
+
+
+def test_preselected_ids_gather_logical_weights_before_eplb(monkeypatch):
+    from sgl_jax.srt.layers import gate as gate_module
+
+    def translate(ids, metadata, layer_id):
+        assert metadata == "dispatch" and layer_id == 2
+        return ids + 4
+
+    monkeypatch.setattr(gate_module, "topk_ids_logical_to_physical", translate)
+    weights, ids = TopK(2, True, layer_id=2)(
+        jnp.array([[1.0, 2.0, 3.0, 4.0]]),
+        dispatch_info="dispatch",
+        selected_experts=jnp.array([[3, 0]], dtype=jnp.int32),
+    )
+    np.testing.assert_array_equal(ids, [[7, 4]])
+    np.testing.assert_allclose(weights, [[0.8, 0.2]])
