@@ -29,6 +29,8 @@ def percentile(values, q):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--deployment", choices=["N1", "E1", "E2"], default="N1")
+    p.add_argument("--request-dir", type=Path, help="Directory of saved image requests to replay")
     p.add_argument("--model", default="Qwen/Qwen3-VL-8B-Instruct")
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--host", default="127.0.0.1")
@@ -107,9 +109,53 @@ def main():
         "--port",
         str(args.port),
     ]
+    encoder_cmd = None
+    if args.deployment != "N1":
+        encoder_devices = 4 if args.deployment == "E1" else 2
+        pd_devices = 8 - encoder_devices
+        server_cmd[server_cmd.index("--tp-size") + 1] = str(pd_devices)
+        server_cmd[server_cmd.index("--dp-size") + 1] = str(pd_devices // 2)
+        server_cmd += [
+            "--language-only",
+            "--encoder-urls",
+            "http://127.0.0.1:31001",
+            "--device-indexes",
+            *map(str, range(encoder_devices, 8)),
+        ]
+        encoder_cmd = [
+            sys.executable,
+            "-u",
+            "-m",
+            "sgl_jax.launch_server",
+            "--model-path",
+            args.model,
+            "--trust-remote-code",
+            "--device",
+            "tpu",
+            "--encoder-only",
+            "--tp-size",
+            str(encoder_devices),
+            "--dp-size",
+            str(encoder_devices),
+            "--vision-encoder-parallel",
+            "dp",
+            "--dtype",
+            "bfloat16",
+            "--disable-radix-cache",
+            "--mm-processor-worker-num",
+            "2",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "31001",
+            "--device-indexes",
+            *map(str, range(encoder_devices)),
+        ]
     metadata = vars(args) | {
         "output_dir": str(args.output_dir),
         "server_command": server_cmd,
+        "encoder_command": encoder_cmd,
+        "request_dir": str(args.request_dir) if args.request_dir else None,
     }
     metadata["revision"] = subprocess.run(
         ["git", "rev-parse", "HEAD"], capture_output=True, text=True
@@ -169,7 +215,7 @@ def main():
         if not stem.startswith("prewarm_"):
             cmd += [
                 "--image-request-file",
-                str(args.output_dir / f"requests_{group}_seed{seed}.json"),
+                str((args.request_dir or args.output_dir) / f"requests_{group}_seed{seed}.json"),
             ]
         print(json.dumps({"run": stem, "command": cmd}), flush=True)
         if args.dry_run:
@@ -201,12 +247,35 @@ def main():
 
     server = None
     log = None
+    encoder = None
+    encoder_log = None
     try:
         if args.launch_server:
             print(json.dumps({"server_command": server_cmd}), flush=True)
             if not args.dry_run:
                 log = (args.output_dir / "server.log").open("w")
-                server = subprocess.Popen(server_cmd, stdout=log, stderr=subprocess.STDOUT)
+                server_env = os.environ.copy()
+                if encoder_cmd:
+                    server_env["ALLOW_MULTIPLE_LIBTPU_LOAD"] = "1"
+                    encoder_log = (args.output_dir / "encoder.log").open("w")
+                    print(json.dumps({"encoder_command": encoder_cmd}), flush=True)
+                    encoder = subprocess.Popen(
+                        encoder_cmd, stdout=encoder_log, stderr=subprocess.STDOUT, env=server_env
+                    )
+                    deadline = time.monotonic() + 1800
+                    while True:
+                        if encoder.poll() is not None:
+                            raise RuntimeError("encoder exited before readiness")
+                        try:
+                            with urllib.request.urlopen("http://127.0.0.1:31001/health", timeout=5):
+                                break
+                        except OSError:
+                            if time.monotonic() >= deadline:
+                                raise RuntimeError("encoder readiness timed out")
+                            time.sleep(5)
+                server = subprocess.Popen(
+                    server_cmd, stdout=log, stderr=subprocess.STDOUT, env=server_env
+                )
         if not args.dry_run:
             deadline = time.monotonic() + (1800 if server else 30)
             while True:
@@ -235,7 +304,7 @@ def main():
                     args.seed,
                 )
                 for repeat in range(args.repeats):
-                    stem = f"N1_{group}_c{concurrency}_r{repeat + 1}_seed{args.seed + repeat}"
+                    stem = f"{args.deployment}_{group}_c{concurrency}_r{repeat + 1}_seed{args.seed + repeat}"
                     result = run_bench(
                         group, concurrency, args.num_prompts, stem, args.seed + repeat
                     )
@@ -243,6 +312,7 @@ def main():
                         continue
                     summary = {
                         "run": stem,
+                        "deployment": args.deployment,
                         "group": group,
                         "concurrency": concurrency,
                         "image_resolution": args.image_resolution,
@@ -300,6 +370,15 @@ def main():
             except subprocess.TimeoutExpired:
                 server.kill()
                 server.wait()
+        if encoder and encoder.poll() is None:
+            encoder.terminate()
+            try:
+                encoder.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                encoder.kill()
+                encoder.wait()
+        if encoder_log:
+            encoder_log.close()
         if log:
             log.close()
 

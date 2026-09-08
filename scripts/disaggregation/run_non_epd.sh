@@ -30,7 +30,13 @@ if ! python -c 'from torchcodec.decoders import decode_image'; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ffmpeg
   fi
 fi
-JAX_PLATFORMS=cpu python - <<'IMAGE_PREFLIGHT'
+if [[ -n "${RAIDEN_WHEEL_DIR:-}" ]]; then
+  wheel=$(<"$RAIDEN_WHEEL_DIR/READY")
+  (cd "$RAIDEN_WHEEL_DIR" && sha256sum -c SHA256SUMS)
+  python -m pip install --no-deps "$RAIDEN_WHEEL_DIR/$wheel"
+  python -c 'from sgl_jax.raiden import preload_raiden; preload_raiden()'
+fi
+JAX_PLATFORMS=cpu python - <<'IMAGE_PREFLIGHT' 
 import io,base64
 from PIL import Image
 from torchcodec.decoders import decode_image
