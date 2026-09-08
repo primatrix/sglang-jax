@@ -190,6 +190,9 @@ class CompilationManager:
                     dp_size=self.dp_size,
                     per_dp_bs_size=bs_val // self.dp_size,
                 )
+                prepare_dummy = getattr(model_runner, "prepare_dummy_batch", None)
+                if prepare_dummy is not None:
+                    prepare_dummy(batch)
                 if prepare_lora_fn is not None:
                     prepare_lora_fn(batch)
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
@@ -264,6 +267,9 @@ class CompilationManager:
                     dp_size=self.dp_size,
                     per_dp_bs_size=bs_val // self.dp_size,
                 )
+                prepare_dummy = getattr(model_runner, "prepare_dummy_batch", None)
+                if prepare_dummy is not None:
+                    prepare_dummy(batch)
                 if prepare_lora_fn is not None:
                     prepare_lora_fn(batch)
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
