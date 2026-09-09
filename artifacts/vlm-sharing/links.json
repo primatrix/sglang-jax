@@ -1,0 +1,116 @@
+{
+  "document": {
+    "id": "f8327539-f4ff-41d9-a626-42d9d0853158",
+    "title": "VLM分享",
+    "url": "https://outline.infiscale-tech.com/doc/vlm-eosNGzaACl",
+    "local_path": "document.md"
+  },
+  "reference_document_url": "https://outline.infiscale-tech.com/doc/vlm-qUsIZr3SfP",
+  "benchmark_pr_url": "https://github.com/sgl-project/sglang-jax/pull/1610",
+  "photo_source_url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
+  "attachments": [
+    {
+      "attachment_id": "2eb22716-be67-4c26-ab9b-b5500f3dd808",
+      "url": "https://outline.infiscale-tech.com/api/attachments.redirect?id=2eb22716-be67-4c26-ab9b-b5500f3dd808",
+      "local_path": "excalidraw/04-vlm-component-comparison.png",
+      "sha256": "077b1b7a5830274caea84e973a92229f08c669a2d8a95cfad94846f1c06edcd7"
+    },
+    {
+      "attachment_id": "e8facc69-af45-4a46-93df-6d6c5f92412f",
+      "url": "https://outline.infiscale-tech.com/api/attachments.redirect?id=e8facc69-af45-4a46-93df-6d6c5f92412f",
+      "local_path": "excalidraw/04-vlm-component-comparison.excalidraw",
+      "sha256": "a0bde2c06fefd61c4237f7229bbdbfe54e3956ab5bbe7013578c1e3e2b4f37e2"
+    },
+    {
+      "attachment_id": "c950e101-d29e-47cd-8b71-9035f4844231",
+      "url": "https://outline.infiscale-tech.com/api/attachments.redirect?id=c950e101-d29e-47cd-8b71-9035f4844231",
+      "local_path": "excalidraw/00-vlm-patches-placeholders.png",
+      "sha256": "d4c134f5d3cc6ebae3cf4f66b6c0d7a83de3975a4cdf0916bd9faac9101b6b68"
+    },
+    {
+      "attachment_id": "6970c49f-63cc-4bab-95d8-572beda54cfb",
+      "url": "https://outline.infiscale-tech.com/api/attachments.redirect?id=6970c49f-63cc-4bab-95d8-572beda54cfb",
+      "local_path": "excalidraw/00-vlm-patches-placeholders.excalidraw",
+      "sha256": "7b6b6b2acd9c5d49cd33e43a663eada5fec813078fde1b7520b42aec63387ae3"
+    },
+    {
+      "attachment_id": "f18b386c-f539-4b7f-9fd2-e30e0e1af1cc",
+      "url": "https://outline.infiscale-tech.com/api/attachments.redirect?id=f18b386c-f539-4b7f-9fd2-e30e0e1af1cc",
+      "local_path": "excalidraw/01-vlm-request-flow.png",
+      "sha256": "ea7ed106570e9cfd1a7a6e4b75be8d19daffd6b006d2103765b96f9748a02427"
+    },
+    {
+      "attachment_id": "03bd567f-18a0-43bb-9c7f-b2e7dce6e75e",
+      "url": "https://outline.infiscale-tech.com/api/attachments.redirect?id=03bd567f-18a0-43bb-9c7f-b2e7dce6e75e",
+      "local_path": "excalidraw/01-vlm-request-flow.excalidraw",
+      "sha256": "ab9eff8c9b54645a564b49dbb042fd8e961edc2eff1bf6c65db057604e4ff072"
+    },
+    {
+      "attachment_id": "133d5e08-0880-4747-b316-8eef12c943df",
+      "url": "https://outline.infiscale-tech.com/api/attachments.redirect?id=133d5e08-0880-4747-b316-8eef12c943df",
+      "local_path": "attachments/133d5e08-0880-4747-b316-8eef12c943df.svg",
+      "sha256": "db60e3d504aa6c3714934e6ef14aea23a077c1b39ec9c6a6461d837d76299cd4"
+    },
+    {
+      "attachment_id": "6aa98a34-b1d9-4e50-b0fe-b197a2a8af74",
+      "url": "https://outline.infiscale-tech.com/api/attachments.redirect?id=6aa98a34-b1d9-4e50-b0fe-b197a2a8af74",
+      "local_path": "excalidraw/02-vlm-lane-packing.png",
+      "sha256": "a35f801f1c79fbd48f8a099d41a55c06730dbd58a33215289b072478fe162ec0"
+    },
+    {
+      "attachment_id": "04da6651-83d0-424e-ba55-0a55fb61ffe8",
+      "url": "https://outline.infiscale-tech.com/api/attachments.redirect?id=04da6651-83d0-424e-ba55-0a55fb61ffe8",
+      "local_path": "excalidraw/02-vlm-lane-packing.excalidraw",
+      "sha256": "8e508cf4486167bfe3627e8a4368f0e133a6e6d45475620732e3659316030c6a"
+    },
+    {
+      "attachment_id": "c8352902-9b01-405d-a064-e1ac203bcd11",
+      "url": "https://outline.infiscale-tech.com/api/attachments.redirect?id=c8352902-9b01-405d-a064-e1ac203bcd11",
+      "local_path": "excalidraw/03-vlm-chunked-prefill.png",
+      "sha256": "597ceda0d4a72bd8f02a92d8acf4e3c9d98269e5542a94f5831834fb09be1bbf"
+    },
+    {
+      "attachment_id": "fb8212b9-0b5a-430c-9f94-6eb38d1599af",
+      "url": "https://outline.infiscale-tech.com/api/attachments.redirect?id=fb8212b9-0b5a-430c-9f94-6eb38d1599af",
+      "local_path": "excalidraw/03-vlm-chunked-prefill.excalidraw",
+      "sha256": "387440baa6b462f8db7134d5bdd649b484210235b6bc477ec1fcaf02a056a5e6"
+    },
+    {
+      "attachment_id": "5d79646a-e0e4-4b2d-b9ef-8330a8c12a52",
+      "url": "https://outline.infiscale-tech.com/api/attachments.redirect?id=5d79646a-e0e4-4b2d-b9ef-8330a8c12a52",
+      "local_path": "attachments/5d79646a-e0e4-4b2d-b9ef-8330a8c12a52.png",
+      "sha256": "c7a1ab37c74a18b5064f1a0e7472c4f4e59ccda16e06b1c8a7081cd1ed709063"
+    },
+    {
+      "attachment_id": "ec1062ce-e9af-4993-a2af-f6012584f78b",
+      "url": "https://outline.infiscale-tech.com/api/attachments.redirect?id=ec1062ce-e9af-4993-a2af-f6012584f78b",
+      "local_path": "excalidraw/05-vlm-overlap.excalidraw",
+      "sha256": "b27fc33f1098f9339c79b2d7f8a6ef03076590ba0c4b0e28ddc3354d741f3edf"
+    },
+    {
+      "attachment_id": "620383cd-1f40-4810-aa7b-4a5689204490",
+      "url": "https://outline.infiscale-tech.com/api/attachments.redirect?id=620383cd-1f40-4810-aa7b-4a5689204490",
+      "local_path": "excalidraw/07-epd-implementation.png",
+      "sha256": "0e9fb5e05306696e17cfb84e7173a78160d11bff5fb3a9907b98b60f0612ae87"
+    },
+    {
+      "attachment_id": "ab8e5971-b344-4f69-96d2-c91cac4ea918",
+      "url": "https://outline.infiscale-tech.com/api/attachments.redirect?id=ab8e5971-b344-4f69-96d2-c91cac4ea918",
+      "local_path": "excalidraw/07-epd-implementation.excalidraw",
+      "sha256": "5d52a18888fb31bb52a8cfe83fa17d1ef12f4e80f690bbfdb271f9d10fecd907"
+    },
+    {
+      "attachment_id": "1113b081-0d91-43c5-9f3f-2f8296222040",
+      "url": "https://outline.infiscale-tech.com/api/attachments.redirect?id=1113b081-0d91-43c5-9f3f-2f8296222040",
+      "local_path": "excalidraw/08-epd-overlap.png",
+      "sha256": "3896d8dfb32eec4e693f9bad49b026d8f95d89f1c640fcb00728a8cb6c7b3ac4"
+    },
+    {
+      "attachment_id": "f576860f-741f-4e00-b616-cfb17b555fe9",
+      "url": "https://outline.infiscale-tech.com/api/attachments.redirect?id=f576860f-741f-4e00-b616-cfb17b555fe9",
+      "local_path": "excalidraw/08-epd-overlap.excalidraw",
+      "sha256": "72e53badb8b6a7d8bf2ddd5dbf0211080f911dd698d73503c41d7dbde18ca19b"
+    }
+  ],
+  "repository_base_commit": "2b1c144b588166e80d783f392258e5382d937a07"
+}
