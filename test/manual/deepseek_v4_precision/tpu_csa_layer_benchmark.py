@@ -202,6 +202,7 @@ def main():
     p.add_argument("--repeats", type=int, default=7)
     p.add_argument("--checkpoint-layer", type=int, default=2)
     p.add_argument("--profile", action="store_true")
+    p.add_argument("--dump-cache", action="store_true", help="Save cache arrays for numerical attribution")
     args = p.parse_args()
     if args.tp < 1 or args.repeats < 1:
         p.error("--tp and --repeats must be positive")
@@ -281,6 +282,13 @@ def main():
             for family, arrays in updated.compressor_state_pool.buffers.items():
                 for index, array in enumerate(arrays):
                     np.save(args.out / f"{name}-state-{family}-{index}.npy", np.asarray(array))
+            if args.dump_cache:
+                for family, arrays in updated.token_to_kv_pool.buffers.items():
+                    for index, array in enumerate(arrays):
+                        np.save(
+                            args.out / f"{name}-cache-{family}-{index}.npy",
+                            np.asarray(array).astype(np.float32),
+                        )
             samples = []
             del updated, y
             # Separate first execution and one additional warmup from samples.

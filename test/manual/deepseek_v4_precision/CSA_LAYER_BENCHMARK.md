@@ -199,8 +199,9 @@ output arrays and the 12 saved FP32 state arrays.
 Only two of the twelve continuation arrays differed: CSA c4 state for BS32
 steady and BS32 completing a new group. Their maximum absolute differences
 were 1.4305115e-6 and 1.9073486e-6, relative L2 6.7671e-8 and 6.9049e-8.
-Nonfinite patterns matched. All BF16 cache leaves and indexer states were
-bitwise identical, including the new-group completion cases. This quantifies
+Nonfinite patterns matched. All indexer states were bitwise identical. The BS32 new-group completion case
+also differs in BF16 compressed KV (pytree leaf 2); its cache-array numerical
+attribution is being collected. All other BF16 cache leaves match. This quantifies
 the change; it does not establish its compiler-level cause or long-run impact.
 Zero/one-group valid decode outputs were bitwise identical. Small single-query
 latencies varied by +3.2% / +1.6%; this change targets batched long-history decode.
