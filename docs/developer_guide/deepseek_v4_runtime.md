@@ -85,8 +85,8 @@ the adaptive schedule and uniform-prefill optimization.
 `CompilationManager` asks the runner to prepare V4 dummy batches before
 creating `ForwardBatch`. Every request/query is inactive; request slots use
 C1's padding slot, and no real request or page is allocated. The dummy still
-has the full metadata structure and kernel schedule for its bucket. The real
-HCA test verifies that executing both dummy modes preserves all pool arrays.
+has the full metadata structure and kernel schedule for its bucket. Executing
+either dummy mode must preserve all pool arrays.
 The compile key can change with mode or padded shape; changing only live
 lengths, slots or events must not create a new model trace.
 
