@@ -89,3 +89,14 @@ and verify the copied archive before extraction. File existence alone is not a
 publication barrier: the initial follow-up TPU attempt observed an empty checksum
 file while the producer was still hashing. Preserve that attempt separately from
 the successful numerical retry.
+
+## Runtime setup
+
+`runtime_harness.py` owns the resource setup used by `tpu_attention_compare.py`.
+The precision workflows are self-contained and do not import ordinary unit-test modules.
+
+## Full static checkpoint smoke
+
+`static_fp8_smoke.py --model /models/static-v4 --out /tmp/static-smoke` launches
+the complete model and checks three native-encoded greedy responses against the
+original-conversion token IDs, including normal EOS.

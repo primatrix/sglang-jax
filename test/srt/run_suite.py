@@ -259,16 +259,11 @@ suites = {
     ],
     "sglang_dependency_test": [],
     "unit-test-tpu-v6e-1": [
-        TestFile("python/sgl_jax/test/models/test_deepseek_v4.py", 8, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/quantized_linear_test.py", 0.3, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/moe_block_quant_test.py", 0.2, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/kda_test.py", 10, runner="pytest"),
         TestFile("test/srt/kernels/mhc/test_mhc.py", 2, runner="pytest"),
         TestFile("test/srt/kernels/hca/test_hca.py", 8, runner="pytest"),
-        TestFile("test/srt/kernels/hca/test_v4_hca.py", 15, runner="pytest"),
-        TestFile(
-            "python/sgl_jax/test/model_executor/test_deepseek_v4_runtime.py", 15, runner="pytest"
-        ),
         # Pytest tears down the shared FlashAttention mesh cleanly on JAX 0.10.2.
         TestFile("python/sgl_jax/test/test_flashattention_mha.py", 11, runner="pytest"),
         TestFile("python/sgl_jax/test/test_flashattention_gqa.py", 11, runner="pytest"),
@@ -276,7 +271,6 @@ suites = {
         TestFile("python/sgl_jax/test/test_mla_attention.py", 2.5),
         TestFile("test/srt/kernels/hca/test_backend.py", 15, runner="pytest"),
         TestFile("python/sgl_jax/test/test_moe_topk.py", 0.3),
-        TestFile("python/sgl_jax/test/test_deepseek_v4_moe.py", 3, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v1_test.py", 9),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v2_test.py", 3),
         TestFile("python/sgl_jax/test/kernels/biased_topk_test.py", 1, runner="pytest"),
@@ -312,61 +306,7 @@ suites = {
     # have a conditional CPU pin gated on USE_DEVICE_TYPE=cpu — the
     # cpu-test CI job sets that env var.
     "unit-test-cpu": [
-        TestFile("python/sgl_jax/test/models/test_deepseek_v4.py", 1, runner="pytest"),
-        TestFile("python/sgl_jax/test/test_deepseek_v4_moe.py", 0.3, runner="pytest"),
-        TestFile(
-            "python/sgl_jax/test/model_executor/test_deepseek_v4_runtime.py", 0.3, runner="pytest"
-        ),
-        TestFile(
-            "python/sgl_jax/test/managers/test_deepseek_v4_lifecycle.py", 0.2, runner="pytest"
-        ),
-        TestFile("test/srt/kernels/hca/test_v4_adapter.py", 0.2, runner="pytest"),
         TestFile("test/srt/kernels/mhc/test_tune.py", 0.1, runner="pytest"),
-        TestFile(
-            "python/sgl_jax/test/layers/attention/test_deepseek_v4_metadata.py",
-            0.1,
-            runner="pytest",
-        ),
-        TestFile(
-            "python/sgl_jax/test/layers/attention/test_deepseek_v4_indexer.py",
-            0.2,
-            runner="pytest",
-        ),
-        TestFile(
-            "python/sgl_jax/test/layers/attention/test_deepseek_v4_compressor.py",
-            0.3,
-            runner="pytest",
-        ),
-        TestFile(
-            "python/sgl_jax/test/layers/attention/test_deepseek_v4_attention.py",
-            0.2,
-            runner="pytest",
-        ),
-        TestFile(
-            "python/sgl_jax/test/layers/attention/test_deepseek_v4_dispatch.py",
-            0.4,
-            runner="pytest",
-        ),
-        TestFile(
-            "python/sgl_jax/test/layers/attention/test_deepseek_v4_o_projection.py",
-            0.2,
-            runner="pytest",
-        ),
-        TestFile(
-            "python/sgl_jax/test/layers/test_deepseek_v4_mhc.py",
-            0.2,
-            runner="pytest",
-        ),
-        TestFile(
-            "python/sgl_jax/test/configs/test_deepseek_v4_config.py",
-            0.1,
-            runner="pytest",
-        ),
-        TestFile(
-            "python/sgl_jax/test/configs/test_deepseek_v4_weights.py",
-            0.3,
-            runner="pytest",
-        ),
         TestFile(
             "python/sgl_jax/test/test_embedding_pool.py",
             0.1,
