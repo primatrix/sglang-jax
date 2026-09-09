@@ -48,6 +48,7 @@ def padded_read_tables(
     max_context_len,
     token_capacity,
     rank,
+    compressed_capacity=None,
 ):
     tables = read_tables(
         request_pool=request_pool,
@@ -60,11 +61,15 @@ def padded_read_tables(
         page_size=page_size,
         rank=rank,
     )
-    # Capacities depend on compile buckets, never on the live request lengths.
+    # Window reads are bounded by the query bucket and sliding-window halo.
     window_capacity = max(
         1, min(len(slots) * max_context_len, token_capacity + len(slots) * (window_size - 1))
     )
-    compressed_capacity = max(1, len(slots) * (max_context_len // ratio)) if ratio else 1
+    if compressed_capacity is None:
+        # Bucket actual gathered history, not padded request slots times the
+        # configured maximum context. The caller shares this bucket across DP.
+        count = len(tables.compressed_rows)
+        compressed_capacity = max(128, 1 << (max(1, count) - 1).bit_length()) if ratio else 1
     values = {}
     for name in ReadTables.__slots__:
         value = getattr(tables, name)

@@ -38,6 +38,7 @@ M2.4 owns the window.
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 __all__ = [
@@ -100,8 +101,19 @@ def admissible_mask(
     if selected_entries is not None:
         selected = jnp.asarray(selected_entries)
         num_entries = entry_ids.shape[1]
-        rows = jnp.arange(num_entries, dtype=selected.dtype)[None, None, :]
-        chosen = jnp.any((selected[:, :, None] == rows) & (selected[:, :, None] >= 0), axis=1)
+        # TPU A/B favors the fused reduction for small candidate buckets;
+        # scatter avoids the large logical [T, K, E] reduction for long history.
+        if num_entries <= 2048:
+            rows = jnp.arange(num_entries, dtype=selected.dtype)[None, None, :]
+            chosen = jnp.any((selected[:, :, None] == rows) & (selected[:, :, None] >= 0), axis=1)
+        else:
+            valid_selection = (selected >= 0) & (selected < num_entries)
+            destination = jnp.where(valid_selection, selected, num_entries)
+
+            def membership(indices):
+                return jnp.zeros(num_entries + 1, dtype=bool).at[indices].set(True)[:-1]
+
+            chosen = jax.vmap(membership)(destination)
         compressed_mask = compressed_mask & chosen
 
     return window_mask, compressed_mask
