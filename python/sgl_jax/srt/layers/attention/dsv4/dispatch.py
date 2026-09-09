@@ -74,7 +74,7 @@ class ReadTables:
 
     def __init__(self, **kw):
         for name in self.__slots__:
-            setattr(self, name, kw.get(name))
+            setattr(self, name, kw.get(name) if name.startswith("decode_") else kw[name])
 
     def tree_flatten(self):
         return tuple(getattr(self, name) for name in self.__slots__), None

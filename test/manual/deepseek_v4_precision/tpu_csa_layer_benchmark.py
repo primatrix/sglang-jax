@@ -11,18 +11,18 @@ import argparse
 import gc
 import hashlib
 import json
-from pathlib import Path
 import subprocess
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import nnx
-from jax.sharding import NamedSharding, PartitionSpec as P
-
 from common import Checkpoint
+from flax import nnx
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttentionBackend
 from sgl_jax.srt.mem_cache.deepseek_v4.allocator import DeepseekV4TokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.deepseek_v4.pool import (
@@ -46,6 +46,10 @@ CASES = {
     "decode64": (64, 64, 8192, 1, 64),
     "decode32_steady": (32, 32, 8224, 1, 32),
     "decode64_steady": (64, 64, 8224, 1, 64),
+    "decode32_complete": (32, 32, 8227, 1, 32),
+    "decode29_padded": (29, 32, 8227, 1, 32),
+    "decode1_empty": (1, 1, 2, 1, 1),
+    "decode1_first": (1, 1, 3, 1, 1),
 }
 
 
@@ -216,18 +220,18 @@ def main():
         ("data", "tensor"),
         axis_types=(jax.sharding.AxisType.Explicit,) * 2,
     )
-    info = dict(
-        source_sha=subprocess.check_output(
+    info = {
+        "source_sha": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True
         ).strip(),
-        checkpoint=cp.identity,
-        checkpoint_layer=args.checkpoint_layer,
-        jax=jax.__version__,
-        devices=[str(d) for d in mesh.devices.flat],
-        inputs="seeded synthetic hidden/cache; real static FP8 attention weights",
-        timing="synchronized host wall; donated pool clone excluded; no server/scheduler",
-        cases=[],
-    )
+        "checkpoint": cp.identity,
+        "checkpoint_layer": args.checkpoint_layer,
+        "jax": jax.__version__,
+        "devices": [str(d) for d in mesh.devices.flat],
+        "inputs": "seeded synthetic hidden/cache; real static FP8 attention weights",
+        "timing": "synchronized host wall; donated pool clone excluded; no server/scheduler",
+        "cases": [],
+    }
     with jax.set_mesh(mesh):
         graph, params = load_attention(cp, cfg, mesh, args.checkpoint_layer)
         rope = _rope_cache(cfg, 4)
@@ -235,7 +239,7 @@ def main():
         (args.out / "weights.json").write_text(json.dumps(cp.digests, indent=2))
         for case_index, name in enumerate(args.cases):
             print("LAYER_CASE_START", name, flush=True)
-            r, fb, x, slots, metadata_ms = resources(
+            r, fb, x, _slots, metadata_ms = resources(
                 cfg, mesh, CASES[name], 1700 + list(CASES).index(name)
             )
             pools = r.memory_pools
@@ -252,7 +256,9 @@ def main():
                 return y, memory
 
             compiled = jax.jit(forward, donate_argnums=(3,))
-            clone = jax.jit(lambda memory: jax.tree.map(lambda a: a.copy(), memory))
+            clone = jax.jit(
+                lambda memory: jax.tree.map(lambda leaf: leaf.copy(), memory)
+            )
 
             def fresh(source=pools, copy_pools=clone):
                 result = copy_pools(source)
@@ -297,14 +303,14 @@ def main():
                             jax.block_until_ready(result)
                             del result
                 del prepared
-            row = dict(
-                name=name,
-                geometry=CASES[name],
-                metadata_ms=metadata_ms,
-                compressed_capacity=int(
+            row = {
+                "name": name,
+                "geometry": CASES[name],
+                "metadata_ms": metadata_ms,
+                "compressed_capacity": int(
                     fb.attn_backend.forward_metadata.read_tables[1].compressed_rows.size
                 ),
-                decode_compressed_capacity=(
+                "decode_compressed_capacity": (
                     fb.attn_backend.forward_metadata.read_tables[
                         1
                     ].decode_page_indices.shape[1]
@@ -318,12 +324,12 @@ def main():
                     is not None
                     else None
                 ),
-                compile_seconds=compile_seconds,
-                warm_ms=samples,
-                median_ms=float(np.median(samples)),
-                input_hashes=input_hashes,
-                updated_pool_hashes=output_hashes,
-            )
+                "compile_seconds": compile_seconds,
+                "warm_ms": samples,
+                "median_ms": float(np.median(samples)),
+                "input_hashes": input_hashes,
+                "updated_pool_hashes": output_hashes,
+            }
             info["cases"].append(row)
             (args.out / "result.json").write_text(json.dumps(info, indent=2))
             print("LAYER_CASE_RESULT", json.dumps(row), flush=True)
