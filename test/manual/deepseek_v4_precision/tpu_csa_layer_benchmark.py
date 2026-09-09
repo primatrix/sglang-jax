@@ -11,21 +11,24 @@ import argparse
 import gc
 import hashlib
 import json
-from pathlib import Path
 import subprocess
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import nnx
-from jax.sharding import NamedSharding, PartitionSpec as P
-
 from common import Checkpoint
+from flax import nnx
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttentionBackend
 from sgl_jax.srt.mem_cache.deepseek_v4.allocator import DeepseekV4TokenToKVPoolAllocator
-from sgl_jax.srt.mem_cache.deepseek_v4.pool import DeepseekV4CacheSpec, DeepseekV4TokenToKVPool
+from sgl_jax.srt.mem_cache.deepseek_v4.pool import (
+    DeepseekV4CacheSpec,
+    DeepseekV4TokenToKVPool,
+)
 from sgl_jax.srt.mem_cache.deepseek_v4.state import DeepseekV4CompressStatePool
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools, ReqToTokenPool
 from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
@@ -43,6 +46,10 @@ CASES = {
     "decode64": (64, 64, 8192, 1, 64),
     "decode32_steady": (32, 32, 8224, 1, 32),
     "decode64_steady": (64, 64, 8224, 1, 64),
+    "decode32_complete": (32, 32, 8227, 1, 32),
+    "decode29_padded": (29, 32, 8227, 1, 32),
+    "decode1_empty": (1, 1, 2, 1, 1),
+    "decode1_first": (1, 1, 3, 1, 1),
 }
 
 
@@ -65,7 +72,9 @@ def load_attention(cp, cfg, mesh, checkpoint_layer):
         scale = cp.read(name + ".scale")
         if cp.entry(name + ".scale")[2]["dtype"] == "F8_E8M0":
             assert not np.any(scale == 255)
-            scale = np.ldexp(np.ones(scale.shape, np.float32), scale.astype(np.int16) - 127)
+            scale = np.ldexp(
+                np.ones(scale.shape, np.float32), scale.astype(np.int16) - 127
+            )
         assert scale.shape == (w.shape[0] // 128, w.shape[1] // 128)
         assign(mod.weight_q, w)
         assign(mod.weight_scale, np.repeat(scale, 128, axis=0).T[:, None, :])
@@ -121,7 +130,12 @@ def resources(cfg, mesh, case, seed):
     compiler = CompilationManager(r.server_args, 64, 2048, 1, r.tp_size, 128, 16384, 32)
     mode = ForwardMode.DECODE if count == 1 else ForwardMode.EXTEND
     batch = compiler._make_dummy_batch(
-        padded_bs, capacity, mode, padded_bs * 16384, dp_size=1, per_dp_bs_size=padded_bs
+        padded_bs,
+        capacity,
+        mode,
+        padded_bs * 16384,
+        dp_size=1,
+        per_dp_bs_size=padded_bs,
     )
     batch.seq_lens = np.zeros(padded_bs, np.int32)
     batch.req_pool_indices = np.full(padded_bs, 64, np.int32)
@@ -151,7 +165,9 @@ def resources(cfg, mesh, case, seed):
     # Identical nonzero BF16 cache tensors in both variants. Keep empty state on
     # fresh prefills; use finite synthetic continuation state for long histories.
     key = jax.random.key(seed)
-    for pool_index, pool in enumerate((r.token_to_kv_pool, r.memory_pools.compressor_state_pool)):
+    for pool_index, pool in enumerate(
+        (r.token_to_kv_pool, r.memory_pools.compressor_state_pool)
+    ):
         for family_index, (family, arrays) in enumerate(pool.buffers.items()):
             if pool_index == 1 and prefix == 0:
                 continue
@@ -186,6 +202,7 @@ def main():
     p.add_argument("--repeats", type=int, default=7)
     p.add_argument("--checkpoint-layer", type=int, default=2)
     p.add_argument("--profile", action="store_true")
+    p.add_argument("--dump-cache", action="store_true", help="Save cache arrays for numerical attribution")
     args = p.parse_args()
     if args.tp < 1 or args.repeats < 1:
         p.error("--tp and --repeats must be positive")
@@ -204,16 +221,18 @@ def main():
         ("data", "tensor"),
         axis_types=(jax.sharding.AxisType.Explicit,) * 2,
     )
-    info = dict(
-        source_sha=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-        checkpoint=cp.identity,
-        checkpoint_layer=args.checkpoint_layer,
-        jax=jax.__version__,
-        devices=[str(d) for d in mesh.devices.flat],
-        inputs="seeded synthetic hidden/cache; real static FP8 attention weights",
-        timing="synchronized host wall; donated pool clone excluded; no server/scheduler",
-        cases=[],
-    )
+    info = {
+        "source_sha": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip(),
+        "checkpoint": cp.identity,
+        "checkpoint_layer": args.checkpoint_layer,
+        "jax": jax.__version__,
+        "devices": [str(d) for d in mesh.devices.flat],
+        "inputs": "seeded synthetic hidden/cache; real static FP8 attention weights",
+        "timing": "synchronized host wall; donated pool clone excluded; no server/scheduler",
+        "cases": [],
+    }
     with jax.set_mesh(mesh):
         graph, params = load_attention(cp, cfg, mesh, args.checkpoint_layer)
         rope = _rope_cache(cfg, 4)
@@ -221,7 +240,7 @@ def main():
         (args.out / "weights.json").write_text(json.dumps(cp.digests, indent=2))
         for case_index, name in enumerate(args.cases):
             print("LAYER_CASE_START", name, flush=True)
-            r, fb, x, slots, metadata_ms = resources(
+            r, fb, x, _slots, metadata_ms = resources(
                 cfg, mesh, CASES[name], 1700 + list(CASES).index(name)
             )
             pools = r.memory_pools
@@ -238,7 +257,9 @@ def main():
                 return y, memory
 
             compiled = jax.jit(forward, donate_argnums=(3,))
-            clone = jax.jit(lambda memory: jax.tree.map(lambda a: a.copy(), memory))
+            clone = jax.jit(
+                lambda memory: jax.tree.map(lambda leaf: leaf.copy(), memory)
+            )
 
             def fresh(source=pools, copy_pools=clone):
                 result = copy_pools(source)
@@ -256,6 +277,18 @@ def main():
             assert np.isfinite(output).all(), name
             np.save(args.out / f"{name}-output.npy", output)
             output_hashes = [digest(a) for a in jax.tree.leaves(updated)]
+            # Preserve small continuation arrays for numerical attribution when
+            # a graph change alters FP32 compiler fusion or reduction order.
+            for family, arrays in updated.compressor_state_pool.buffers.items():
+                for index, array in enumerate(arrays):
+                    np.save(args.out / f"{name}-state-{family}-{index}.npy", np.asarray(array))
+            if args.dump_cache:
+                for family, arrays in updated.token_to_kv_pool.buffers.items():
+                    for index, array in enumerate(arrays):
+                        np.save(
+                            args.out / f"{name}-cache-{family}-{index}.npy",
+                            np.asarray(array).astype(np.float32),
+                        )
             samples = []
             del updated, y
             # Separate first execution and one additional warmup from samples.
@@ -272,26 +305,44 @@ def main():
                 # Prepare donated inputs before tracing: profiles contain only
                 # production layer invocations and their synchronization.
                 prepared = [fresh() for _ in range(3)]
-                with jax.profiler.trace(str(args.out / name), create_perfetto_link=False):
+                with jax.profiler.trace(
+                    str(args.out / name), create_perfetto_link=False
+                ):
                     for step, memory in enumerate(prepared):
-                        with jax.profiler.StepTraceAnnotation("csa_attention_layer", step_num=step):
+                        with jax.profiler.StepTraceAnnotation(
+                            "csa_attention_layer", step_num=step
+                        ):
                             result = executable(params, x, fb, memory, rope)
                             jax.block_until_ready(result)
                             del result
                 del prepared
-            row = dict(
-                name=name,
-                geometry=CASES[name],
-                metadata_ms=metadata_ms,
-                compressed_capacity=int(
+            row = {
+                "name": name,
+                "geometry": CASES[name],
+                "metadata_ms": metadata_ms,
+                "compressed_capacity": int(
                     fb.attn_backend.forward_metadata.read_tables[1].compressed_rows.size
                 ),
-                compile_seconds=compile_seconds,
-                warm_ms=samples,
-                median_ms=float(np.median(samples)),
-                input_hashes=input_hashes,
-                updated_pool_hashes=output_hashes,
-            )
+                "decode_compressed_capacity": (
+                    fb.attn_backend.forward_metadata.read_tables[
+                        1
+                    ].decode_page_indices.shape[1]
+                    * r.page_size
+                    // 4
+                    if getattr(
+                        fb.attn_backend.forward_metadata.read_tables[1],
+                        "decode_page_indices",
+                        None,
+                    )
+                    is not None
+                    else None
+                ),
+                "compile_seconds": compile_seconds,
+                "warm_ms": samples,
+                "median_ms": float(np.median(samples)),
+                "input_hashes": input_hashes,
+                "updated_pool_hashes": output_hashes,
+            }
             info["cases"].append(row)
             (args.out / "result.json").write_text(json.dumps(info, indent=2))
             print("LAYER_CASE_RESULT", json.dumps(row), flush=True)

@@ -49,6 +49,7 @@ def padded_read_tables(
     token_capacity,
     rank,
     compressed_capacity=None,
+    decode_capacity=None,
 ):
     tables = read_tables(
         request_pool=request_pool,
@@ -73,11 +74,38 @@ def padded_read_tables(
     values = {}
     for name in ReadTables.__slots__:
         value = getattr(tables, name)
+        if value is None:
+            continue
         capacity = window_capacity if name.startswith("window") else compressed_capacity
         if len(value) > capacity:
             raise ValueError(f"{name} exceeds the configured V4 metadata capacity")
         fill = 0 if name.endswith("rows") else -1
         values[name] = np.pad(value, (0, capacity - len(value)), constant_values=fill)
+    if decode_capacity is not None:
+        if ratio != 4 or np.any((q_lens != 0) & (q_lens != 1)):
+            raise ValueError("request-local CSA tables require one decode query per request")
+        compressed_page_size = page_size // ratio
+        pages = np.zeros((token_capacity, decode_capacity // compressed_page_size), np.int32)
+        windows = np.zeros((token_capacity, window_size), np.int32)
+        mapping = allocator.full_to_swa_index_mapping
+        mapping = mapping[rank] if isinstance(mapping, list) else mapping
+        token = 0
+        for slot, length, count in zip(slots, lengths, q_lens, strict=True):
+            if not count:
+                continue
+            complete = int(length) // ratio
+            page_count = (complete + compressed_page_size - 1) // compressed_page_size
+            starts = np.arange(page_count, dtype=np.int32) * page_size
+            anchors = np.asarray(request_pool.req_to_token[int(slot), starts], np.int32)
+            if np.any(anchors < page_size) or np.any(anchors % page_size):
+                raise ValueError("CSA compressed pages must start at allocated page boundaries")
+            pages[token, :page_count] = anchors // page_size
+            positions = np.arange(max(0, int(length) - window_size), int(length))
+            locations = np.asarray(request_pool.req_to_token[int(slot), positions], np.int32)
+            windows[token, -len(positions) :] = mapping[locations]
+            token += 1
+        values["decode_page_indices"] = pages
+        values["decode_window_rows"] = windows
     return ReadTables(**values)
 
 
