@@ -25,7 +25,10 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from common import Checkpoint
 from sgl_jax.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttentionBackend
 from sgl_jax.srt.mem_cache.deepseek_v4.allocator import DeepseekV4TokenToKVPoolAllocator
-from sgl_jax.srt.mem_cache.deepseek_v4.pool import DeepseekV4CacheSpec, DeepseekV4TokenToKVPool
+from sgl_jax.srt.mem_cache.deepseek_v4.pool import (
+    DeepseekV4CacheSpec,
+    DeepseekV4TokenToKVPool,
+)
 from sgl_jax.srt.mem_cache.deepseek_v4.state import DeepseekV4CompressStatePool
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools, ReqToTokenPool
 from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
@@ -65,7 +68,9 @@ def load_attention(cp, cfg, mesh, checkpoint_layer):
         scale = cp.read(name + ".scale")
         if cp.entry(name + ".scale")[2]["dtype"] == "F8_E8M0":
             assert not np.any(scale == 255)
-            scale = np.ldexp(np.ones(scale.shape, np.float32), scale.astype(np.int16) - 127)
+            scale = np.ldexp(
+                np.ones(scale.shape, np.float32), scale.astype(np.int16) - 127
+            )
         assert scale.shape == (w.shape[0] // 128, w.shape[1] // 128)
         assign(mod.weight_q, w)
         assign(mod.weight_scale, np.repeat(scale, 128, axis=0).T[:, None, :])
@@ -121,7 +126,12 @@ def resources(cfg, mesh, case, seed):
     compiler = CompilationManager(r.server_args, 64, 2048, 1, r.tp_size, 128, 16384, 32)
     mode = ForwardMode.DECODE if count == 1 else ForwardMode.EXTEND
     batch = compiler._make_dummy_batch(
-        padded_bs, capacity, mode, padded_bs * 16384, dp_size=1, per_dp_bs_size=padded_bs
+        padded_bs,
+        capacity,
+        mode,
+        padded_bs * 16384,
+        dp_size=1,
+        per_dp_bs_size=padded_bs,
     )
     batch.seq_lens = np.zeros(padded_bs, np.int32)
     batch.req_pool_indices = np.full(padded_bs, 64, np.int32)
@@ -151,7 +161,9 @@ def resources(cfg, mesh, case, seed):
     # Identical nonzero BF16 cache tensors in both variants. Keep empty state on
     # fresh prefills; use finite synthetic continuation state for long histories.
     key = jax.random.key(seed)
-    for pool_index, pool in enumerate((r.token_to_kv_pool, r.memory_pools.compressor_state_pool)):
+    for pool_index, pool in enumerate(
+        (r.token_to_kv_pool, r.memory_pools.compressor_state_pool)
+    ):
         for family_index, (family, arrays) in enumerate(pool.buffers.items()):
             if pool_index == 1 and prefix == 0:
                 continue
@@ -205,7 +217,9 @@ def main():
         axis_types=(jax.sharding.AxisType.Explicit,) * 2,
     )
     info = dict(
-        source_sha=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+        source_sha=subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip(),
         checkpoint=cp.identity,
         checkpoint_layer=args.checkpoint_layer,
         jax=jax.__version__,
@@ -272,9 +286,13 @@ def main():
                 # Prepare donated inputs before tracing: profiles contain only
                 # production layer invocations and their synchronization.
                 prepared = [fresh() for _ in range(3)]
-                with jax.profiler.trace(str(args.out / name), create_perfetto_link=False):
+                with jax.profiler.trace(
+                    str(args.out / name), create_perfetto_link=False
+                ):
                     for step, memory in enumerate(prepared):
-                        with jax.profiler.StepTraceAnnotation("csa_attention_layer", step_num=step):
+                        with jax.profiler.StepTraceAnnotation(
+                            "csa_attention_layer", step_num=step
+                        ):
                             result = executable(params, x, fb, memory, rope)
                             jax.block_until_ready(result)
                             del result
@@ -285,6 +303,20 @@ def main():
                 metadata_ms=metadata_ms,
                 compressed_capacity=int(
                     fb.attn_backend.forward_metadata.read_tables[1].compressed_rows.size
+                ),
+                decode_compressed_capacity=(
+                    fb.attn_backend.forward_metadata.read_tables[
+                        1
+                    ].decode_page_indices.shape[1]
+                    * r.page_size
+                    // 4
+                    if getattr(
+                        fb.attn_backend.forward_metadata.read_tables[1],
+                        "decode_page_indices",
+                        None,
+                    )
+                    is not None
+                    else None
                 ),
                 compile_seconds=compile_seconds,
                 warm_ms=samples,

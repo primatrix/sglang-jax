@@ -68,11 +68,13 @@ class ReadTables:
         "compressed_rows",
         "compressed_entry_ids",
         "compressed_request_ids",
+        "decode_page_indices",
+        "decode_window_rows",
     )
 
     def __init__(self, **kw):
         for name in self.__slots__:
-            setattr(self, name, kw[name])
+            setattr(self, name, kw.get(name))
 
     def tree_flatten(self):
         return tuple(getattr(self, name) for name in self.__slots__), None
@@ -82,10 +84,7 @@ class ReadTables:
         return cls(**dict(zip(cls.__slots__, children, strict=True)))
 
     def __repr__(self):  # pragma: no cover - debugging aid
-        return (
-            f"ReadTables(window={len(self.window_rows)}, "
-            f"compressed={len(self.compressed_rows)})"
-        )
+        return f"ReadTables(window={len(self.window_rows)}, compressed={len(self.compressed_rows)})"
 
 
 def read_tables(
@@ -250,7 +249,8 @@ def run_layer(
             kv_buffers["compressed"], records, ratio_md.boundary_write_entries, record_valid
         )
         updates["compressed"] = compressed_buffer
-        compressed_kv = jnp.take(compressed_buffer, jnp.asarray(tables.compressed_rows), axis=0)
+        if tables.decode_page_indices is None:
+            compressed_kv = jnp.take(compressed_buffer, jnp.asarray(tables.compressed_rows), axis=0)
 
         if ratio == 4:
             if indexer is None or index_topk is None:
@@ -277,19 +277,20 @@ def run_layer(
                 kv_buffers["indexer"], idx_records, ratio_md.boundary_write_entries, idx_valid
             )
             updates["indexer"] = indexer_buffer
-            indexer_keys = jnp.take(indexer_buffer, jnp.asarray(tables.compressed_rows), axis=0)
-            selected = csa_indexer_topk(
-                indexer["q"],
-                indexer["weights"],
-                indexer_keys,
-                metadata.query_positions,
-                metadata.query_request_ids,
-                jnp.asarray(tables.compressed_request_ids),
-                metadata.valid_token_mask,
-                entry_group_ids=jnp.asarray(tables.compressed_entry_ids),
-                k=index_topk,
-                ratio=ratio,
-            )
+            if tables.decode_page_indices is None:
+                indexer_keys = jnp.take(indexer_buffer, jnp.asarray(tables.compressed_rows), axis=0)
+                selected = csa_indexer_topk(
+                    indexer["q"],
+                    indexer["weights"],
+                    indexer_keys,
+                    metadata.query_positions,
+                    metadata.query_request_ids,
+                    jnp.asarray(tables.compressed_request_ids),
+                    metadata.valid_token_mask,
+                    entry_group_ids=jnp.asarray(tables.compressed_entry_ids),
+                    k=index_topk,
+                    ratio=ratio,
+                )
 
     # C1 retains all SWA pages read by this chunk until it completes. Publish
     # current-token KV before the read; causal positions, not write ordering,
@@ -297,6 +298,27 @@ def run_layer(
     updates["swa"] = update_window_kv(
         kv_buffers["swa"], new_kv, metadata.swa_write_loc, metadata.valid_token_mask
     )
+    if tables.decode_page_indices is not None:
+        from sgl_jax.srt.layers.attention.dsv4.decode import csa_decode_attention
+
+        out = csa_decode_attention(
+            q,
+            indexer["q"],
+            indexer["weights"],
+            updates["indexer"],
+            updates["compressed"],
+            updates["swa"],
+            tables.decode_page_indices,
+            tables.decode_window_rows,
+            query_positions=metadata.query_positions,
+            valid_token_mask=metadata.valid_token_mask,
+            attention_sink=attention_sink,
+            softmax_scale=softmax_scale,
+            compressed_page_size=metadata.page_size // ratio,
+            index_topk=index_topk,
+            ratio=ratio,
+        )
+        return out, updates
     window_kv = jnp.take(updates["swa"], jnp.asarray(tables.window_rows), axis=0)
     out = dsv4_attention(
         q,
