@@ -47,11 +47,14 @@ print('IMAGE_DECODE_PREFLIGHT_OK',type(image),getattr(image,'shape',None),flush=
 IMAGE_PREFLIGHT
 python -m pip freeze > "$OUT/packages.txt"
 python - <<'DEVICES'
-import jax,json,os,importlib.metadata as md
+import json,os,importlib.metadata as md
 from pathlib import Path
-devices=jax.devices()
-assert len(devices)==8 and all(d.platform=='tpu' for d in devices),devices
-info={'devices':[str(d) for d in devices],'packages':{p:md.version(p) for p in ['jax','jaxlib','libtpu','flax','torch','torchcodec','transformers']}}
+devices=[]
+if not os.environ.get('RAIDEN_WHEEL_DIR'):
+ import jax
+ devices=jax.devices()
+ assert len(devices)==8 and all(d.platform=='tpu' for d in devices),devices
+info={'device_check':'deferred to isolated E/PD role initialization' if not devices else 'full N1 slice verified','devices':[str(d) for d in devices],'packages':{p:md.version(p) for p in ['jax','jaxlib','libtpu','flax','torch','torchcodec','transformers']}}
 Path(os.environ['ARTIFACT_LOCAL_DIR'],'environment.json').write_text(json.dumps(info,indent=2))
 print(json.dumps(info),flush=True)
 DEVICES

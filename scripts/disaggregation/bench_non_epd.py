@@ -262,15 +262,29 @@ def main():
                 log = (args.output_dir / "server.log").open("w")
                 server_env = os.environ.copy()
                 if encoder_cmd:
-                    server_env.pop("ALLOW_MULTIPLE_LIBTPU_LOAD", None)
+                    server_env["ALLOW_MULTIPLE_LIBTPU_LOAD"] = "true"
+                    for key in (
+                        "TPU_CHIPS_PER_HOST_BOUNDS",
+                        "TPU_HOST_BOUNDS",
+                        "TPU_MESH_CONTROLLER_ADDRESS",
+                        "TPU_MESH_CONTROLLER_PORT",
+                        "HTTP_PROXY",
+                        "HTTPS_PROXY",
+                        "ALL_PROXY",
+                        "http_proxy",
+                        "https_proxy",
+                        "all_proxy",
+                    ):
+                        server_env.pop(key, None)
+                    server_env["NO_PROXY"] = server_env["no_proxy"] = "*"
                     server_env["TPU_VISIBLE_CHIPS"] = ",".join(
                         map(str, range(encoder_devices // 2, 4))
                     )
-                    server_env["TPU_CHIPS_PER_PROCESS_BOUNDS"] = f"{pd_devices // 2},1,1"
+                    server_env["TPU_CHIPS_PER_PROCESS_BOUNDS"] = f"1,{pd_devices // 2},1"
                     server_env["TPU_PROCESS_BOUNDS"] = "1,1,1"
                     encoder_env = server_env | {
                         "TPU_VISIBLE_CHIPS": ",".join(map(str, range(encoder_devices // 2))),
-                        "TPU_CHIPS_PER_PROCESS_BOUNDS": f"{encoder_devices // 2},1,1",
+                        "TPU_CHIPS_PER_PROCESS_BOUNDS": f"1,{encoder_devices // 2},1",
                     }
                     print(
                         json.dumps(

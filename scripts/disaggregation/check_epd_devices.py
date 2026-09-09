@@ -40,10 +40,24 @@ def main():
     try:
         for role, chips in [("encoder", list(range(n))), ("pd", list(range(n, 4)))]:
             env = os.environ.copy()
-            env.pop("ALLOW_MULTIPLE_LIBTPU_LOAD", None)
+            env["ALLOW_MULTIPLE_LIBTPU_LOAD"] = "true"
+            for key in (
+                "TPU_CHIPS_PER_HOST_BOUNDS",
+                "TPU_HOST_BOUNDS",
+                "TPU_MESH_CONTROLLER_ADDRESS",
+                "TPU_MESH_CONTROLLER_PORT",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+            ):
+                env.pop(key, None)
+            env["NO_PROXY"] = env["no_proxy"] = "*"
             env.update(
                 TPU_VISIBLE_CHIPS=",".join(map(str, chips)),
-                TPU_CHIPS_PER_PROCESS_BOUNDS=f"{len(chips)},1,1",
+                TPU_CHIPS_PER_PROCESS_BOUNDS=f"1,{len(chips)},1",
                 TPU_PROCESS_BOUNDS="1,1,1",
                 PROBE_OUTPUT=str(args.output_dir),
                 PROBE_ROLE=role,

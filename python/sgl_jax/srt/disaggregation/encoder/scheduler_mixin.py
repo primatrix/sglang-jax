@@ -43,7 +43,7 @@ class SchedulerDisaggregationEncoderMixin:
             precompile_received_embeddings(
                 pool.buffer,
                 runner.model,
-                self.tp_worker.compilation_manager.token_buckets,
+                self.tp_worker.get_precompile_paddings()[0],
             )
         self.encoder_client = create_encoder_client(
             self.server_args, pool, self._apply_encoder_result
