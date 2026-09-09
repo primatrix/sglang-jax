@@ -140,32 +140,10 @@ per-device and does not divide these replicated dimensions by TP. The runner
 requires page size 128/256, overlap/radix reuse disabled, ordinary (non-mixed)
 forward and no speculative/draft execution. KV `auto` resolves to BF16.
 
-## Validation and remaining integration
+## Validation
 
-Run on a compatible CPU JAX/Flax installation:
-
-```bash
-PYTHONPATH=python JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=4 \
-python -m pytest -q python/sgl_jax/test/mem_cache/test_deepseek_v4_*.py \
-  python/sgl_jax/test/test_model_runner_kv_cache_mixin.py \
-  python/sgl_jax/test/mem_cache/test_swa_allocator.py \
-  python/sgl_jax/test/mem_cache/test_paged_allocator_multi_dp.py \
-  python/sgl_jax/test/mem_cache/test_req_to_token_pool.py
-```
-
-Coverage includes 43-layer mapping, 128/256 pages, BF16/FP32 bytes, complete
-pool update round trips, same-shape JIT reuse, slot 0 and padding, state reuse,
-DP/TP layouts, 127→128→129, nonaligned chunks, single-resource exhaustion,
-atomic rollback, SWA-only release, grouped release, and randomized resource
-conservation. No test loads complete Flash weights or runs TPU kernels.
-C2–C4 and M2 still need to consume these interfaces; J0 owns real HBM,
-full-model quality and serving/retract acceptance.
-
-Local acceptance on 2026-09-07: **103 passed** (41 V4 tests and 62 existing
-pool/allocator/runner regressions), JAX 0.11.1, Flax 0.12.9, four virtual CPU
-devices. This includes an Explicit DP=2/TP=2 mesh JIT update, in addition to
-Auto mesh coverage. Ruff 0.13.3, Black 24.10.0 and isort 5.13.2 checks passed.
-The shared local environment had incompatible Flax 0.12.0; regression tests
-used a temporary Flax 0.12.9 overlay without changing repository dependencies.
-No remote CI or TPU/full-model validation is claimed by this result.
+Use the focused [real-weight precision workflows](../../test/manual/deepseek_v4_precision/README.md)
+for GPU/TPU module and layer comparisons. Full-model request acceptance uses
+`test/manual/deepseek_v4_precision/static_fp8_smoke.py` against a published static
+checkpoint. The smoke checks native-encoded greedy token IDs and normal EOS;
+it does not establish long-context, concurrency or broad model-quality coverage.

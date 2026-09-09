@@ -85,8 +85,8 @@ the adaptive schedule and uniform-prefill optimization.
 `CompilationManager` asks the runner to prepare V4 dummy batches before
 creating `ForwardBatch`. Every request/query is inactive; request slots use
 C1's padding slot, and no real request or page is allocated. The dummy still
-has the full metadata structure and kernel schedule for its bucket. The real
-HCA test verifies that executing both dummy modes preserves all pool arrays.
+has the full metadata structure and kernel schedule for its bucket. Executing
+either dummy mode must preserve all pool arrays.
 The compile key can change with mode or padded shape; changing only live
 lengths, slots or events must not create a new model trace.
 
@@ -96,47 +96,8 @@ validation fixture's memory use is not a full-model HBM sizing result.
 
 ## Validation
 
-```sh
-PYTHONPATH=python:. JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=4 \
-python -m pytest -q python/sgl_jax/test/model_executor/test_deepseek_v4_runtime.py
-
-# On real TPU; includes numeric HCA plus runtime/CPU-style contract tests.
-PYTHONPATH=python:. python -m pytest -v -s --tb=short \
-  python/sgl_jax/test/model_executor/test_deepseek_v4_runtime.py
-```
-
-The real HCA consumer goes through `CompilationManager`, `ModelWorker`,
-`ForwardBatch` and the donated ModelRunner JIT. It compares chunked prefill,
-decode and a recycled request against the independent NumPy oracle at page
-sizes 128/256 and DP=2/TP=2. It checks two model traces (EXTEND and DECODE),
-preservation of pools during dummy execution and consumption of updated state
-across steps, then reports pool bytes and device memory statistics.
-
-The initial V4 restrictions remain: no overlap, mixed batches, speculative
-decoding or cross-request radix reuse; BF16 KV and FP32 state. Runtime tests
-do not establish complete V4 serving, quality or performance acceptance.
-
-Full graph and actual mixed-checkpoint fixture tests:
-
-```sh
-PYTHONPATH=python:. python -m pytest -v --tb=short \
-  python/sgl_jax/test/models/test_deepseek_v4.py
-```
-
-CPU covers actual BF16/FP8/MXFP4 loading and abstract prefill/decode through
-the complete graph on one device and DP=2/TP=2. TPU-only tests compare a
-whole prefill against split chunks plus decode across C4/C128 boundaries.
-The synthetic fixture is not real-model quality or full-checkpoint acceptance.
-
-The pinned Flash 0731 revision `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
-was checked against all 48 shard headers (72,317 tensors). All 1,564 regular
-mappings and 66,048 expert source shapes match the abstract 43-layer model
-created through ModelConfig and the model registry. The committed representative
-header fixture covers root parameters and SWA/CSA/HCA layers. Header agreement
-establishes the loading contract, not full-payload conversion or model quality.
-
-The model suite is registered in CPU and TPU CI. On eight TPU devices, it also
-runs a three-layer trunk with the full Flash attention geometry and verifies
-that HCA uses the Pallas backend. This fixture reduces layer/expert/vocabulary
-counts and must not be described as a full Flash checkpoint run.
+Use the focused [real-weight precision workflows](../../test/manual/deepseek_v4_precision/README.md)
+for GPU/TPU module and layer comparisons. Full-model request acceptance uses
+`test/manual/deepseek_v4_precision/static_fp8_smoke.py` against a published static
+checkpoint. The smoke checks native-encoded greedy token IDs and normal EOS;
+it does not establish long-context, concurrency or broad model-quality coverage.
