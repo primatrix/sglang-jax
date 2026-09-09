@@ -200,8 +200,8 @@ Only two of the twelve continuation arrays differed: CSA c4 state for BS32
 steady and BS32 completing a new group. Their maximum absolute differences
 were 1.4305115e-6 and 1.9073486e-6, relative L2 6.7671e-8 and 6.9049e-8.
 Nonfinite patterns matched. All indexer states were bitwise identical. The BS32 new-group completion case
-also differs in BF16 compressed KV (pytree leaf 2); its cache-array numerical
-attribution is being collected. All other BF16 cache leaves match. This quantifies
+also differs in BF16 compressed KV (pytree leaf 2); the third run below quantifies
+that difference. All other BF16 cache leaves match. This quantifies
 the change; it does not establish its compiler-level cause or long-run impact.
 Zero/one-group valid decode outputs were bitwise identical. Small single-query
 latencies varied by +3.2% / +1.6%; this change targets batched long-history decode.
@@ -213,3 +213,25 @@ excluded from reported forward timings, so these speedups must not be quoted
 as server throughput gains. Full-model quality and multi-step recurrent-state
 accumulation remain unmeasured for this follow-up. The PR is left for review
 and is not automatically merged.
+
+### Group-completion cache attribution
+
+`exp-4yynma8c0w` / `art-a505k4kfpl`, candidate `657b16d02`, repeats
+`decode32_complete` with `--dump-cache`. The option saves full cache arrays as
+portable FP32 **outside** the timing interval. Independent analysis
+`an-44mgqq96if` scans those arrays in bounded chunks and separately normalizes
+the error over all 32 newly written compressed records, rather than diluting it
+with the whole historical cache.
+
+Only **one BF16 value** differs, at physical `[page=650, entry=8, channel=510]`,
+a record completed by this call. Baseline is -2.4437904357910156e-5; candidate
+is -2.4318695068359375e-5, absolute difference **1.1920928955078125e-7**
+(one adjacent BF16 representable step). Relative L2 over the newly written
+records is **1.1329478e-9**. Every other compressed-cache value, and all indexer
+and SWA cache values, are identical. The mapping to this step's write entries
+is reconstructed from this benchmark's sequential page allocation and geometry.
+
+This repeat measured 12.0603 -> 1.2852 ms (9.38x); its output relative L2 exactly
+reproduces the preceding boundary run. This resolves the size/location of the
+hash mismatch, not its compiler-level cause or full-model quality impact.
+All three experiments and their independent numerical analyses succeeded.
