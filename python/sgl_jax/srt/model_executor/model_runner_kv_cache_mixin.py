@@ -912,10 +912,10 @@ class ModelRunnerKVCacheMixin:
         from sgl_jax.srt.mem_cache.deepseek_v4.pool import DeepseekV4CacheSpec
 
         sa = self.server_args
-        if not sa.disable_overlap_schedule or not sa.disable_radix_cache:
-            raise ValueError(
-                "V4 initial resources require --disable-overlap-schedule and --disable-radix-cache"
-            )
+        # Experimental ablation: allow overlap without claiming cache compatibility.
+        # Retain the independent radix-cache and other resource constraints.
+        if not sa.disable_radix_cache:
+            raise ValueError("V4 initial resources require --disable-radix-cache")
         if getattr(sa, "enable_mixed_chunk", False):
             raise ValueError("V4 initial resources do not support mixed prefill/decode")
         if self.is_draft_worker or (
