@@ -17,7 +17,7 @@ root=Path(os.environ['PROBE_OUTPUT'])
 devices=jax.devices()
 checks=[]
 for device in devices:
- x=jax.device_put([1,2,3],device)
+ x=jax.device_put(jnp.asarray([1,2,3]),device)
  checks.append(int(jnp.sum(x).block_until_ready())==6)
 result={'devices':[str(d) for d in devices], 'count':len(devices),'compute_ok':all(checks),
         'visible_chips':os.environ['TPU_VISIBLE_CHIPS']}
