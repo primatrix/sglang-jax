@@ -276,6 +276,11 @@ def main():
             assert np.isfinite(output).all(), name
             np.save(args.out / f"{name}-output.npy", output)
             output_hashes = [digest(a) for a in jax.tree.leaves(updated)]
+            # Preserve small continuation arrays for numerical attribution when
+            # a graph change alters FP32 compiler fusion or reduction order.
+            for family, arrays in updated.compressor_state_pool.buffers.items():
+                for index, array in enumerate(arrays):
+                    np.save(args.out / f"{name}-state-{family}-{index}.npy", np.asarray(array))
             samples = []
             del updated, y
             # Separate first execution and one additional warmup from samples.
