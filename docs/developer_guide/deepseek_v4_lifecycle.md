@@ -46,13 +46,8 @@ separate integration step.
 
 ## Validation
 
-`python/sgl_jax/test/managers/test_deepseek_v4_lifecycle.py` exercises real C1
-allocation, scheduler preparation, finish/abort exits, parked retraction, and
-stream output. It covers page sizes 128/256, DP-local pages with global request
-slot zero, resource conservation, partial tails, cleanup reentry and slot reuse.
-
-The real HCA consumer in `test_deepseek_v4_runtime.py` runs with and without C4
-reclaim/release against the same independent NumPy oracle. The lifecycle variant
-forces exact request-slot reuse with a different stream, checking state reset and
-unchanged compilation count. These are compact C128 fixtures, not complete model
-or serving performance measurements.
+Use the focused [real-weight precision workflows](../../test/manual/deepseek_v4_precision/README.md)
+for GPU/TPU module and layer comparisons. Full-model request acceptance uses
+`test/manual/deepseek_v4_precision/static_fp8_smoke.py` against a published static
+checkpoint. The smoke checks native-encoded greedy token IDs and normal EOS;
+it does not establish long-context, concurrency or broad model-quality coverage.

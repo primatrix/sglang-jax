@@ -91,27 +91,7 @@ VMEM scratch buffer, then inserts its values into the attention tile. This
 avoids both sub-tile DMA slices and per-request compressed-history staging
 in HBM. The transport is a correctness baseline, not a tuned performance result.
 
-CPU resource and metadata tests:
-
-```sh
-PYTHONPATH=python:. JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=4 \
-python -m pytest -q test/srt/kernels/hca/test_v4_adapter.py
-```
-
-Real TPU tests, including the upstream standalone suite:
-
-```sh
-PYTHONPATH=python:. python -m pytest -v -rA --tb=short test/srt/kernels/hca
-```
-
-`test_v4_hca.py` checks C1-backed results against the independent dense NumPy
-oracle for both page sizes, a 382-token prefill followed by four decode
-steps, recycled request state, nonaligned ragged chunks and DP=2/TP=2 with
-unequal per-rank query lengths. A request-padding regression checks that empty
-rows do not clamp onto a live slot and restore its old compressor state. The
-CPU sharded probe verifies ownership and
-update packaging; it does not replace TPU numerical validation.
-
-Full model weight loading, C4/CSA and SWA-only dispatch, serving quality,
-retract integration and performance measurements remain separate work.
+The standalone HCA kernel tests and benchmarks remain under
+`test/srt/kernels/hca/`. For V4 model integration, use the
+[real-weight attention and layer comparisons](../../test/manual/deepseek_v4_precision/README.md),
+which exercise the production resource bridge against native SGLang GPU captures.

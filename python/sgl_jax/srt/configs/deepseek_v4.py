@@ -108,7 +108,6 @@ def mix_hc_width(hc_mult: int) -> int:
 
     Must stay equal to ``sgl_jax.srt.kernels.mhc.mix_hc_width``; duplicated
     rather than imported so the config module carries no Pallas dependency.
-    ``test_deepseek_v4_config.py`` pins the two together.
     """
     return (2 + hc_mult) * hc_mult
 
@@ -151,7 +150,6 @@ _FLASH_0731_ROPE_SCALING: dict = {
 # then a trailing 4 -- that is 43 trunk layers -- followed by three entries that
 # are NOT layers. 46 total against ``num_hidden_layers=43``; see
 # ``trunk_compress_ratios`` for why the tail must be truncated.
-# ``test_deepseek_v4_config.py`` pins this against the real config.json.
 #
 # A tuple, not a list, on purpose: every instance gets its own ``list()`` copy of
 # it, and making the module-level default immutable means an in-place edit of one

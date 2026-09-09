@@ -25,7 +25,7 @@ from sgl_jax.srt.layers.attention.deepseek_v4_backend import DeepseekV4Attention
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.mem_cache.deepseek_v4.pool import DeepseekV4CacheSpec
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
-from sgl_jax.test.model_executor.test_deepseek_v4_runtime import Harness
+from runtime_harness import Harness
 
 
 def main():
