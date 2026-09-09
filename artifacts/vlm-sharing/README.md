@@ -19,7 +19,10 @@
 | 06-epd-why | [图源](excalidraw/06-epd-why.excalidraw) | [PNG](excalidraw/06-epd-why.png) | [SVG](excalidraw/06-epd-why.svg) |
 | 07-epd-implementation | [图源](excalidraw/07-epd-implementation.excalidraw) | [PNG](excalidraw/07-epd-implementation.png) | [SVG](excalidraw/07-epd-implementation.svg) |
 | 08-epd-overlap | [图源](excalidraw/08-epd-overlap.excalidraw) | [PNG](excalidraw/08-epd-overlap.png) | [SVG](excalidraw/08-epd-overlap.svg) |
+| 09-encoder-dp-tp | [图源](excalidraw/09-encoder-dp-tp.excalidraw) | [PNG](excalidraw/09-encoder-dp-tp.png) | [SVG](excalidraw/09-encoder-dp-tp.svg) |
 
 [下载全部配图](vlm-excalidraw-diagrams.zip)。`attachments/` 保存在线文档中另外上传的图片；完整的网址与文件校验值见 `links.json`。
 
 第 7.3 节的图源含线程泳道、队列任务卡片与连续 Encode / 传输时间线。已从在线文档移除的 EPD 动机图也保留在本地素材中。
+
+新增本地材料：[DP-Encoder / TP-Encoder 对比与取舍](encoder-dp-tp.md)，联系 lane 分配与 bucket 编译复用，未上传至 Outline。
