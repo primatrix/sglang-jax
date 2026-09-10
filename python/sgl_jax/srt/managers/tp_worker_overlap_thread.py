@@ -285,7 +285,7 @@ class ModelWorkerClient:
                 self.worker.model_config.vocab_size,
             )
 
-        forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
+        forward_metadata = self.worker.model_runner.get_attention_metadata(
             model_worker_batch
         )
 
