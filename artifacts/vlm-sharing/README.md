@@ -23,6 +23,7 @@
 | 10-encoder-input-sharding | [图源](excalidraw/10-encoder-input-sharding.excalidraw) | [PNG](excalidraw/10-encoder-input-sharding.png) | [SVG](excalidraw/10-encoder-input-sharding.svg) |
 | 11-vlm-chunk-embedding-integration | [图源](excalidraw/11-vlm-chunk-embedding-integration.excalidraw) | [PNG](excalidraw/11-vlm-chunk-embedding-integration.png) | [SVG](excalidraw/11-vlm-chunk-embedding-integration.svg) |
 | 12-vlm-core-principle | [图源](excalidraw/12-vlm-core-principle.excalidraw) | [PNG](excalidraw/12-vlm-core-principle.png) | [SVG](excalidraw/12-vlm-core-principle.svg) |
+| 13-encoder-replicated-output | [图源](excalidraw/13-encoder-replicated-output.excalidraw) | [PNG](excalidraw/13-encoder-replicated-output.png) | [SVG](excalidraw/13-encoder-replicated-output.svg) |
 
 [下载全部配图](vlm-excalidraw-diagrams.zip)。`attachments/` 保存在线文档中另外上传的图片；完整的网址与文件校验值见 `links.json`。
 
@@ -35,3 +36,5 @@
 [Chunk 任务与 embedding 的架构接入](chunk-embedding-integration.md)：任务筛选、完整 item 载荷、按映射 overlay，以及语言模型 forward 前的接入点。
 
 [文档开头的小横图](vlm-core-principle.md)：图片转视觉 embedding、按占位位置与文本合并、复用 LLM 推理框架。
+
+[全 Mesh 复制输出的取舍](encoder-replicated-output.md)：原序分组的单 lane 容量问题、固定总容量紧密重排与 pool 写入。

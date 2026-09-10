@@ -23,6 +23,8 @@ https://outline.infiscale-tech.com/doc/vlm-eosNGzaACl
 
 - `12-vlm-core-principle`：用于文档开头的小横图，展示视觉特征接入统一 embedding 序列及 LLM 推理框架复用；[说明](../vlm-core-principle.md)。
 
+- `13-encoder-replicated-output`：DP 编码后的容量不变量、原序整 item 分 lane 的溢出反例，以及全复制输出 / pool 的编译与存储取舍；[说明](../encoder-replicated-output.md)。
+
 每张图提供 `.excalidraw`（可编辑源文件）、`.svg` 与 `.png`。
 将 `.excalidraw` 文件拖入 https://excalidraw.com 即可修改。图形、文字和箭头均为独立元素；节点文字与框体已分组。
 
