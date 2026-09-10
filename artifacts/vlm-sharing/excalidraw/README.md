@@ -17,7 +17,7 @@ https://outline.infiscale-tech.com/doc/vlm-eosNGzaACl
 
 - `09-encoder-dp-tp`：完整 item 的 lane 分配、DP 权重复制 / TP 权重分片、层内通信与输出汇合；[三句取舍说明](../encoder-dp-tp.md)。
 
-- `10-encoder-input-sharding`：输入数组第 0 维的切分对比：DP 为 DP × TP 个整宽切片，TP 为 DP 个整宽切片；[说明](../encoder-input-sharding.md)。
+- `10-encoder-input-sharding`：输入数组第 0 维的切分对比：DP 为 DP × TP 个整宽切片，TP 为 DP 个整宽切片，每条 lane 均展示有效 patches 与 bucket padding；[说明](../encoder-input-sharding.md)。
 
 每张图提供 `.excalidraw`（可编辑源文件）、`.svg` 与 `.png`。
 将 `.excalidraw` 文件拖入 https://excalidraw.com 即可修改。图形、文字和箭头均为独立元素；节点文字与框体已分组。

@@ -28,4 +28,4 @@
 
 新增本地材料：[DP-Encoder / TP-Encoder 对比与取舍](encoder-dp-tp.md)，联系 lane 分配与 bucket 编译复用，未上传至 Outline。
 
-[输入数组切分对比](encoder-input-sharding.md)：用数组块与分界线展示两个 mesh 轴共同切第 0 维和仅沿 data 切第 0 维的区别，仅保存在本地仓库。
+[输入数组切分对比](encoder-input-sharding.md)：用数组块与分界线展示 DP / TP 对第 0 维的不同切分，并标出每条 lane 内补齐到 bucket 的 padding，仅保存在本地仓库。
