@@ -129,6 +129,17 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             raise ValueError("V4 prefix plus query length must equal sequence length")
         local = []
         tables_by_ratio = {ratio: [] for ratio in (0, 4, 128)}
+        # All DP ranks must have identical local array extents for shard_map.
+        # Only requests with queries contribute rows to read_tables; bound their
+        # completed groups with a power-of-two bucket shared across ranks.
+        compressed_capacities = {0: 1}
+        for ratio in (4, 128):
+            count = int(np.max(np.sum(np.where(queries > 0, lengths // ratio, 0), axis=1)))
+            compressed_capacities[ratio] = max(128, 1 << (max(1, count) - 1).bit_length())
+        decode_capacity = None
+        if batch.forward_mode == ForwardMode.DECODE and self.page_size == 128:
+            count = int(np.max(lengths // 4))
+            decode_capacity = max(128, 1 << (max(1, count) - 1).bit_length())
         for rank in range(dp):
             live = int(queries[rank].sum())
             mapping = allocator.full_to_swa_index_mapping
@@ -165,6 +176,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                         max_context_len=self.max_context_len,
                         token_capacity=positions.shape[1],
                         rank=rank,
+                        compressed_capacity=compressed_capacities[ratio],
+                        decode_capacity=decode_capacity if ratio == 4 else None,
                     )
                 )
             local.append(

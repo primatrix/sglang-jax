@@ -39,7 +39,7 @@ from sgl_jax.srt.model_executor.aot_dispatch import (
     aot_dispatch_requested,
 )
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
     _build_non_hybrid_memory_pools,
@@ -48,6 +48,7 @@ from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.models.registry import ModelRegistry
 from sgl_jax.srt.multimodal.in_model.embedding_pool import EmbeddingPool
 from sgl_jax.srt.multimodal.in_model.host_orchestration import embed_multimodal_inputs
+from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
@@ -338,6 +339,13 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 "Enabling TPU log recorder for JIT compilation "
                 "(compiler_options: xla_tpu_enable_log_recorder=true)."
             )
+        backend_compiler_options = getattr(self.attn_backend, "compiler_options", None)
+        sampler_compiler_options = getattr(self.attn_backend, "sampler_compiler_options", None)
+        if backend_compiler_options:
+            jit_compiler_options = {
+                **backend_compiler_options,
+                **(jit_compiler_options or {}),
+            }
 
         @partial(
             jax.jit,
@@ -353,6 +361,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             memory_pools,
             logits_metadata,
         ):
+            prepare_model_state = getattr(self.attn_backend, "prepare_model_state", None)
+            if prepare_model_state is not None:
+                model_state_leaves = prepare_model_state(model_state_leaves)
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
             memory_pools = _maybe_apply_recurrent_cow(forward_batch, memory_pools)
@@ -361,13 +372,17 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 _validate_v4_pool_updates(memory_pools, result[1])
                 return result
 
-        # Capture base RNG key as a constant in the JIT closure.
-        # fold_in(constant, dynamic_step) is computed inside JIT, avoiding
-        # the eager jax.random.split that would serialize the host-device pipeline.
+        # Capture the base RNG key as a constant in the JIT closure. The sampler
+        # folds in the dynamic step inside its regular-sampling cond branch, so
+        # greedy decoding does not execute PRNG operations.
         base_rng_key = self._sampler_base_rng
         _fused_mesh = self.mesh
 
-        @partial(jax.jit, static_argnames=["sampler_state_def", "use_sort_for_toppk_minp"])
+        @partial(
+            jax.jit,
+            static_argnames=["sampler_state_def", "use_sort_for_toppk_minp"],
+            compiler_options=sampler_compiler_options,
+        )
         def jitted_sampler(
             sampler_def,
             sampler_state_def,
@@ -378,9 +393,11 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         ):
             model_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, model_state)
-            rng_key = jax.random.fold_in(base_rng_key, rng_step)
             return sampler(
-                *args, use_sort_for_toppk_minp=use_sort_for_toppk_minp, rng_override=rng_key
+                *args,
+                use_sort_for_toppk_minp=use_sort_for_toppk_minp,
+                rng_override=base_rng_key,
+                rng_step=rng_step,
             )
 
         @partial(jax.jit, static_argnames=["mesh"])
@@ -512,12 +529,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             _validate_v4_pool_updates(memory_pools, pool_updates)
             s_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, s_state)
-            rng_key = jax.random.fold_in(base_rng_key, rng_step)
             next_ids, token_logprobs, _new_output = sampler(
                 output,
                 sampling_metadata,
                 use_sort_for_toppk_minp=use_sort_for_toppk_minp,
-                rng_override=rng_key,
+                rng_override=base_rng_key,
+                rng_step=rng_step,
             )
             # async_gather + set_future_token_ids inlined. Per-request slot
             # scatter (req_pool_idx + 1); padding rows (seq_lens == 0) go out
@@ -619,11 +636,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.model_config.hf_config.enable_sequence_parallel = (
             self.server_args.enable_sequence_parallel
         )
-        self.model_config.hf_config.vision_encoder_parallel = getattr(
-            self.server_args, "vision_encoder_parallel", "dp"
+        self.model_config.hf_config.vision_encoder_parallel = (
+            self.server_args.vision_encoder_parallel
         )
-        self.model_config.hf_config.precompile_vision_patch_paddings = getattr(
-            self.server_args, "precompile_vision_patch_paddings", None
+
+        self.model_config.hf_config.precompile_vision_patch_paddings = (
+            self.server_args.precompile_vision_patch_paddings
         )
 
         if self.server_args.ep_dispatch_algorithm:
@@ -914,6 +932,14 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 mesh=self.mesh,
             )
 
+        elif backend == "tt":
+            from sgl_jax.srt.hardware_backend.tt.attention.tt_backend import TTAttention
+
+            full_attn_backend = TTAttention(
+                page_size=self.page_size,
+                mesh=self.mesh,
+            )
+
         else:
             raise ValueError(f"Unsupported attention backend: {self.server_args.attention_backend}")
 
@@ -998,8 +1024,11 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.forward_pass_id += 1
         precision_tracer.start_batch_trace(forward_batch.bid)
         precision_tracer.set_current_forward_pass_id(self.forward_pass_id)
-        if forward_batch.multimodal_batch is not None:
-            input_embedding, deepstack = embed_multimodal_inputs(
+        if isinstance(self.model, InModelMultimodalContract) and forward_batch.forward_mode in (
+            ForwardMode.EXTEND,
+            ForwardMode.MIXED,
+        ):
+            input_embedding, deepstack, apply_for_deepstack = embed_multimodal_inputs(
                 multimodal_batch=forward_batch.multimodal_batch,
                 input_ids=forward_batch.input_ids,
                 multimodal_model=self.model,
@@ -1007,7 +1036,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             )
             forward_batch.input_embedding = input_embedding
             forward_batch.deepstack_visual_embedding = deepstack
-            forward_batch.apply_for_deepstack = deepstack is not None
+            forward_batch.apply_for_deepstack = apply_for_deepstack
         with jax.profiler.TraceAnnotation("_forward_raw"):
             ret = self._forward_raw(forward_batch, logits_metadata)
         return ret

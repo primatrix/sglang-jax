@@ -111,19 +111,33 @@ def csa_indexer_scores(q, weights, keys, *, num_kv_heads: int | None = None):
     if weights.shape != (q.shape[0], num_heads):
         raise ValueError(f"weights must be [T, H], got {weights.shape}")
 
+    if kv_heads != keys.shape[1]:
+        raise ValueError("num_kv_heads must match the key head dimension")
     group = num_heads // kv_heads
+    if q.shape[0] == 0 or keys.shape[0] == 0:
+        return jnp.zeros((q.shape[0], keys.shape[0]), jnp.float32)
 
-    # [T, H, E] would be the natural intermediate but it is the memory blow-up the
-    # DSA reference also avoids; accumulate over heads instead.
-    def head_step(h, acc):
-        q_h = jax.lax.dynamic_index_in_dim(q, h, axis=1, keepdims=False)  # [T, D]
-        k_h = jax.lax.dynamic_index_in_dim(keys, h // group, axis=1, keepdims=False)  # [E, D]
-        w_h = jax.lax.dynamic_index_in_dim(weights, h, axis=1, keepdims=True)  # [T, 1]
-        inner = jnp.einsum("td,ed->te", q_h, k_h, preferred_element_type=jnp.float32)
-        return acc + jax.nn.relu(inner) * w_h
+    # As in the private DSA query-tile scorer, expose all heads to the MXU
+    # together. Target an 8 MiB [Bq, H, E] FP32 temporary, with at least
+    # one query per tile, instead of materializing all T queries at once.
+    tile = min(32, max(1, (2 << 20) // max(1, num_heads * keys.shape[0])))
+    padding = (-q.shape[0]) % tile
+    tiled_q = jnp.pad(q, ((0, padding), (0, 0), (0, 0))).reshape(
+        -1, tile, kv_heads, group, head_dim
+    )
+    tiled_w = jnp.pad(weights, ((0, padding), (0, 0))).reshape(-1, tile, kv_heads, group)
 
-    zeros = jnp.zeros((q.shape[0], keys.shape[0]), jnp.float32)
-    return jax.lax.fori_loop(0, num_heads, head_step, zeros)
+    def score_tile(inputs):
+        queries, head_weights = inputs
+        similarities = jnp.einsum(
+            "tngd,end->tnge", queries, keys, preferred_element_type=jnp.float32
+        )
+        # Keep the FP32 weights out of a second MXU dot: its default
+        # precision can round them to BF16 on TPU.
+        return jnp.sum(jax.nn.relu(similarities) * head_weights[..., None], axis=(1, 2))
+
+    scores = jax.lax.map(score_tile, (tiled_q, tiled_w))
+    return scores.reshape(-1, keys.shape[0])[: q.shape[0]]
 
 
 @functools.partial(jax.jit, static_argnames=("k", "ratio", "num_kv_heads"))
