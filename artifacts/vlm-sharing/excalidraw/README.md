@@ -1,6 +1,6 @@
 # VLM 分享配图
 
-原有九张图对应 Outline 文档的第 1、2.1、2.2、3.1、4、5、7 节；新增的 DP / TP 对比图与输入分片图仅保存在本地仓库：
+原有九张图对应 Outline 文档的第 1、2.1、2.2、3.1、4、5、7 节；后续新增配图仅保存在本地仓库：
 https://outline.infiscale-tech.com/doc/vlm-eosNGzaACl
 
 - `04-vlm-component-comparison`：原有 LLM 组件、原组件扩展与 VLM 新增模块。
@@ -18,6 +18,8 @@ https://outline.infiscale-tech.com/doc/vlm-eosNGzaACl
 - `09-encoder-dp-tp`：完整 item 的 lane 分配、DP 权重复制 / TP 权重分片、层内通信与输出汇合；[三句取舍说明](../encoder-dp-tp.md)。
 
 - `10-encoder-input-sharding`：输入数组第 0 维的切分对比：DP 为 DP × TP 个整宽切片，TP 为 DP 个整宽切片，每条 lane 均展示有效 patches 与 bucket padding；[说明](../encoder-input-sharding.md)。
+
+- `11-vlm-chunk-embedding-integration`：ScheduleBatch 的任务筛选、完整 item 与 merge mapping 载荷、Runner 的 embedding overlay 与语言模型接入；[说明](../chunk-embedding-integration.md)。
 
 每张图提供 `.excalidraw`（可编辑源文件）、`.svg` 与 `.png`。
 将 `.excalidraw` 文件拖入 https://excalidraw.com 即可修改。图形、文字和箭头均为独立元素；节点文字与框体已分组。
