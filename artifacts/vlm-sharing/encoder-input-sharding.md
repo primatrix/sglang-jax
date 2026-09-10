@@ -4,7 +4,7 @@
 
 [可编辑 Excalidraw](excalidraw/10-encoder-input-sharding.excalidraw) · [SVG](excalidraw/10-encoder-input-sharding.svg)
 
-先将完整 item 装入各条 lane，按最大 lane 负载选择 bucket 容量 `B`，每条 lane 都以“有效 patch 行 + 尾部 padding 行”补齐到 `B`；padding 行数可以为零。图中彩色区域表示有效 patches，灰色区域表示各条 lane 自己的 padding，右侧括号覆盖整条 `B × F` 切片。
+先将完整 item 装入各条 lane，按最大 lane 负载选择 bucket 容量 `B`，每条 lane 都以“有效 patch 行 + 尾部 padding 行”补齐到 `B`；padding 行数可以为零。图中彩色区域表示有效 patches，灰色区域表示各条 lane 自己的 padding，右侧括号覆盖整条 `B × F` 切片。灰色尾部只示意 padding 的位置，不代表实测占比。
 
 DP-Encoder 的 `P(("data", "tensor"))` 将两个 mesh 轴放在同一个位置，共同切分第 0 维，形成 `DP × TP` 条 lane；TP-Encoder 的输入使用 `P("data")`，仅沿 data 切分第 0 维，形成 `DP` 条 lane。两种模式的输入特征维 `F` 都完整保留。
 
