@@ -22,6 +22,7 @@
 | 09-encoder-dp-tp | [图源](excalidraw/09-encoder-dp-tp.excalidraw) | [PNG](excalidraw/09-encoder-dp-tp.png) | [SVG](excalidraw/09-encoder-dp-tp.svg) |
 | 10-encoder-input-sharding | [图源](excalidraw/10-encoder-input-sharding.excalidraw) | [PNG](excalidraw/10-encoder-input-sharding.png) | [SVG](excalidraw/10-encoder-input-sharding.svg) |
 | 11-vlm-chunk-embedding-integration | [图源](excalidraw/11-vlm-chunk-embedding-integration.excalidraw) | [PNG](excalidraw/11-vlm-chunk-embedding-integration.png) | [SVG](excalidraw/11-vlm-chunk-embedding-integration.svg) |
+| 12-vlm-core-principle | [图源](excalidraw/12-vlm-core-principle.excalidraw) | [PNG](excalidraw/12-vlm-core-principle.png) | [SVG](excalidraw/12-vlm-core-principle.svg) |
 
 [下载全部配图](vlm-excalidraw-diagrams.zip)。`attachments/` 保存在线文档中另外上传的图片；完整的网址与文件校验值见 `links.json`。
 
@@ -32,3 +33,5 @@
 [输入数组切分对比](encoder-input-sharding.md)：用数组块与分界线展示 DP / TP 对第 0 维的不同切分，并标出每条 lane 内补齐到 bucket 的 padding，仅保存在本地仓库。
 
 [Chunk 任务与 embedding 的架构接入](chunk-embedding-integration.md)：任务筛选、完整 item 载荷、按映射 overlay，以及语言模型 forward 前的接入点。
+
+[文档开头的小横图](vlm-core-principle.md)：图片转视觉 embedding、按占位位置与文本合并、复用 LLM 推理框架。

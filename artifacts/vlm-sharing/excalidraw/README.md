@@ -21,6 +21,8 @@ https://outline.infiscale-tech.com/doc/vlm-eosNGzaACl
 
 - `11-vlm-chunk-embedding-integration`：ScheduleBatch 的任务筛选、完整 item 与 merge mapping 载荷、Runner 的 embedding overlay 与语言模型接入；[说明](../chunk-embedding-integration.md)。
 
+- `12-vlm-core-principle`：用于文档开头的小横图，展示视觉特征接入统一 embedding 序列及 LLM 推理框架复用；[说明](../vlm-core-principle.md)。
+
 每张图提供 `.excalidraw`（可编辑源文件）、`.svg` 与 `.png`。
 将 `.excalidraw` 文件拖入 https://excalidraw.com 即可修改。图形、文字和箭头均为独立元素；节点文字与框体已分组。
 
