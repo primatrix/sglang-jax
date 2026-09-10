@@ -86,8 +86,9 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     if isinstance(params.token_to_kv_pool_allocator, DeepseekV4TokenToKVPoolAllocator):
         from sgl_jax.srt.mem_cache.chunk_cache import DeepseekV4ChunkCache
 
-        if not ctx.disable_radix_cache or not ctx.server_args.disable_overlap_schedule:
-            raise ValueError("V4 lifecycle requires radix reuse and schedule overlap disabled")
+        # Experimental ablation: allow overlap, retaining radix-reuse protection.
+        if not ctx.disable_radix_cache:
+            raise ValueError("V4 lifecycle requires radix reuse disabled")
         window = params.sliding_window_size
         if window is None:
             window = getattr(ctx.model_config, "sliding_window", None)
