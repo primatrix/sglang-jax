@@ -1792,7 +1792,17 @@ class Scheduler(
         self.waiting_queue.extend(reqs)
 
     def check_memory(self):
-        if self.is_hybrid:
+        from sgl_jax.srt.mem_cache.chunk_cache import DeepseekV4ChunkCache
+
+        if isinstance(self.tree_cache, DeepseekV4ChunkCache):
+            allocator = self.token_to_kv_pool_allocator
+            for dp in range(self.dp_size):
+                if (
+                    allocator.full_available_size(dp) != allocator.size_per_rank
+                    or allocator.swa_available_size(dp) != allocator.size_swa // self.dp_size
+                ):
+                    raise ValueError(f"V4 history/SWA memory leak detected in DP rank {dp}")
+        elif self.is_hybrid:
             # Per-rank invariant: available + evictable + protected == size_per_rank.
             # Checking per-rank avoids one rank's over-count masking another's leak.
             full_size_per_rank = self.token_to_kv_pool_allocator.full_attn_allocator.size_per_rank

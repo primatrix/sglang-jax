@@ -100,6 +100,8 @@ class GateLogit(nnx.Module):
                 logits = jax.nn.sigmoid(logits)
             elif self.score_func == "tanh":
                 logits = jax.nn.tanh(logits)
+            elif self.score_func == "sqrtsoftplus":
+                logits = jnp.sqrt(jax.nn.softplus(logits.astype(jnp.float32)))
             else:
                 raise ValueError("unknown score func")
 
@@ -132,11 +134,24 @@ class TopK(nnx.Module):
         correction_bias: jax.Array = None,
         dispatch_info: ExpertLocationMetadata | None = None,
         routing_sharding: jax.sharding.Sharding | None = None,
+        *,
+        selected_experts: jax.Array | None = None,
     ):
         router_logits = router_logits.astype(jnp.float32)
         routing_spec = _routing_partition_spec(routing_sharding)
 
-        if self.num_expert_group > 0 or self.topk_group > 0:
+        if selected_experts is not None:
+            if correction_bias is not None:
+                raise ValueError("preselected experts cannot use correction bias")
+            if selected_experts.shape != (router_logits.shape[0], self.topk):
+                raise ValueError("preselected experts must have shape [tokens, topk]")
+            if not jnp.issubdtype(selected_experts.dtype, jnp.integer):
+                raise ValueError("preselected expert IDs must be integers")
+            # Hash routing chooses logical IDs; weights still depend on the gate.
+            # Gather before EPLB translates IDs to physical expert locations.
+            topk_ids = selected_experts.astype(jnp.int32)
+            topk_weights = jnp.take_along_axis(router_logits, topk_ids, axis=-1)
+        elif self.num_expert_group > 0 or self.topk_group > 0:
             if correction_bias is not None:
                 topk_weights, topk_ids = self._biased_grouped_topk(
                     router_logits,

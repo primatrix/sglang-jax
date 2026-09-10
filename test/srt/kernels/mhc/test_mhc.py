@@ -19,7 +19,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from sgl_jax.srt.kernels.mhc import (
     mhc_gates,
     mhc_head_collapse_fused,

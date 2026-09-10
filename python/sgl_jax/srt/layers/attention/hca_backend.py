@@ -394,10 +394,11 @@ class HCABackend(AttentionBackend):
         sin: jax.Array,
         attention_sink: jax.Array,
         fused_weight: jax.Array | None = None,
+        metadata=None,
         **_kwargs,
     ) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array]]:
         """Run complete cache-aware HCA and return explicit pool updates."""
-        metadata = self.forward_metadata
+        metadata = self.forward_metadata if metadata is None else metadata
         if metadata.kernel is None:
             raise RuntimeError("HCABackend.forward_metadata has not been prepared")
         if metadata.schedule is None:

@@ -12,6 +12,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
+from sgl_jax.srt.layers.activation import silu_and_mul_with_clamp
 
 # Re-export for backward compatibility: external code imports from this module.
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE, FusedEPMoEV2  # noqa: F401
@@ -41,6 +42,7 @@ class EPMoE(nnx.Module):
         physical_to_logical_map: "jax.Array | None" = None,
         pre_gather_quant_dtype=None,
         moe_dp_size: int = 1,
+        swiglu_limit: float | None = None,
     ):
         self.num_experts_per_tok = num_experts_per_tok
         self.physical_to_logical_map = physical_to_logical_map
@@ -62,6 +64,11 @@ class EPMoE(nnx.Module):
         self.original_mesh = mesh
         self.mesh = mesh
         self.activation = activation
+        if swiglu_limit is not None and (
+            activation != "silu" or not math.isfinite(swiglu_limit) or swiglu_limit <= 0
+        ):
+            raise ValueError("swiglu_limit requires silu and a finite positive limit")
+        self.swiglu_limit = swiglu_limit
         self.hidden_size = hidden_size
 
         # Get quantization settings from config
@@ -727,13 +734,16 @@ class EPMoE(nnx.Module):
         )
 
         # === Activation ===
-        if self.activation == "silu":
-            layer_act = jax.nn.silu(layer_w0)
-        elif self.activation == "gelu":
-            layer_act = jax.nn.gelu(layer_w0)
+        if self.swiglu_limit is not None:
+            intermediate_layer = silu_and_mul_with_clamp(layer_w0, layer_w1, self.swiglu_limit)
         else:
-            raise ValueError(f"Unsupported activation function {self.activation}")
-        intermediate_layer = jnp.multiply(layer_act, layer_w1)
+            if self.activation == "silu":
+                layer_act = jax.nn.silu(layer_w0)
+            elif self.activation == "gelu":
+                layer_act = jax.nn.gelu(layer_w0)
+            else:
+                raise ValueError(f"Unsupported activation function {self.activation}")
+            intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
         # === GEMM2: intermediate @ wo ===
         return gmm(

@@ -79,6 +79,28 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     params = ctx.params
     validate_unified_hybrid_swa_route(ctx)
 
+    from sgl_jax.srt.mem_cache.deepseek_v4.allocator import (
+        DeepseekV4TokenToKVPoolAllocator,
+    )
+
+    if isinstance(params.token_to_kv_pool_allocator, DeepseekV4TokenToKVPoolAllocator):
+        from sgl_jax.srt.mem_cache.chunk_cache import DeepseekV4ChunkCache
+
+        # Experimental ablation: allow overlap, retaining radix-reuse protection.
+        if not ctx.disable_radix_cache:
+            raise ValueError("V4 lifecycle requires radix reuse disabled")
+        window = params.sliding_window_size
+        if window is None:
+            window = getattr(ctx.model_config, "sliding_window", None)
+        if not window or window <= 0:
+            raise ValueError("V4 lifecycle requires a positive sliding window")
+        return DeepseekV4ChunkCache(
+            req_to_token_pool=params.req_to_token_pool,
+            token_to_kv_pool_allocator=params.token_to_kv_pool_allocator,
+            page_size=params.page_size,
+            sliding_window_size=window,
+        )
+
     if ctx.is_hybrid_swa:
         if ctx.disable_radix_cache:
             from sgl_jax.srt.mem_cache.chunk_cache import SWAChunkCache
