@@ -46,6 +46,8 @@ class DecodeStatus:
     read_offset: int
     # Offset that's sent to tokenizer for incremental update.
     sent_offset: int = 0
+    # Absolute offset in decode_ids, independent of printable-text progress.
+    sent_token_offset: int = 0
 
 
 class DetokenizerManager:
@@ -143,6 +145,7 @@ class DetokenizerManager:
                     decode_ids=recv_obj.decode_ids[i],
                     surr_offset=0,
                     read_offset=recv_obj.read_offsets[i],
+                    sent_token_offset=recv_obj.read_offsets[i],
                 )
                 self.decode_status[rid] = s
             else:
@@ -246,7 +249,12 @@ class DetokenizerManager:
                     "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
                 ) from e
             new_text = read_texts[i][len(surr_texts[i]) :]
-            new_token_ids = read_ids[i][len(surr_ids[i]) :]
+            # Text decoding may retain an incomplete UTF-8 suffix for many
+            # steps. Those IDs have already been sent: do not append them to
+            # the cumulative response again while read_offset is stalled.
+            # read_ids is stop-trimmed and starts at surr_offset.
+            new_token_ids = read_ids[i][s.sent_token_offset - s.surr_offset :]
+            s.sent_token_offset = len(s.decode_ids)
             if recv_obj.finished_reasons[i] is None:
                 # Streaming chunk: update the decode status
                 if len(new_text) > 0 and not new_text.endswith("�"):
