@@ -283,6 +283,12 @@ class DetokenizerManager:
             output_strs.append(incremental_output)
             output_ids_list.append(processed_new_token_ids)
 
+            if recv_obj.finished_reasons[i] is not None:
+                # Release only after producing the final text/ID delta. A later
+                # request may reuse this rid and starts with a new prompt tail;
+                # retaining this state would emit that tail as generated IDs.
+                del self.decode_status[recv_obj.rids[i]]
+
         output_routed_experts = self._extract_routed_experts(recv_obj)
 
         return BatchStrOut(

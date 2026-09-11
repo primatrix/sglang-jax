@@ -86,6 +86,56 @@ class TestDetokenizerTokenOffsets(unittest.TestCase):
         self.assertEqual(self.send([0xB8], rid="a").output_ids, [[0xB8]])
         self.assertEqual(self.send([66], rid="b").output_ids, [[66]])
 
+    def test_completed_request_releases_decode_status(self):
+        self.send([65], finished={"type": "length"})
+        self.assertNotIn("r", self.manager.decode_status)
+
+    def test_reused_request_id_does_not_emit_new_prompt_tail(self):
+        self.send([0xE4], prefix=[80] * 5)
+        self.send([0xB8, 0xAD], finished={"type": "length"})
+        first = self.send([65], prefix=[81] * 5)
+        last = self.send([66], finished={"type": "length"})
+        self.assertEqual(first.output_ids[0] + last.output_ids[0], [65, 66])
+        self.assertEqual(first.output_strs[0] + last.output_strs[0], "AB")
+
+    def test_reuse_with_different_prompt_surrounding_lengths(self):
+        for prefix in ([80] * 5, [], [81] * 2):
+            result = self.send([65, 66], prefix=prefix, finished={"type": "length"})
+            self.assertEqual(result.output_ids, [[65, 66]])
+            self.assertEqual(result.output_strs, ["AB"])
+
+    def test_abort_final_message_releases_state(self):
+        self.send([0xE4])
+        self.send([], finished={"type": "abort", "message": "cancelled"})
+        self.assertNotIn("r", self.manager.decode_status)
+        self.assertEqual(self.send([65], prefix=[80] * 5).output_ids, [[65]])
+
+    def test_finishing_one_request_preserves_other_request(self):
+        self.send([65], rid="a")
+        self.send([0xE4], rid="b")
+        self.send([66], rid="a", finished={"type": "length"})
+        self.assertNotIn("a", self.manager.decode_status)
+        self.assertIn("b", self.manager.decode_status)
+        self.assertEqual(self.send([0xB8, 0xAD], rid="b").output_ids, [[0xB8, 0xAD]])
+
+    def test_exact_ids_across_filtering_and_final_stop(self):
+        for skip in (True, False):
+            for no_trim in (True, False):
+                rid = f"{skip}-{no_trim}"
+                chunks = ([65, 1000, 0xE4], [], [0xB8, 0xAD, 1000], [66, 33])
+                actual = []
+                for i, chunk in enumerate(chunks):
+                    result = self.send(chunk, rid=rid, prefix=[80]*5 if i==0 else [],
+                        skip=skip, no_trim=no_trim,
+                        finished={"matched": 33} if i==len(chunks)-1 else None)
+                    actual.extend(result.output_ids[0])
+                expected = [65, 1000, 0xE4, 0xB8, 0xAD, 1000, 66, 33]
+                if not no_trim:
+                    expected = expected[:-1]
+                if skip:
+                    expected = [x for x in expected if x != 1000]
+                self.assertEqual(actual, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
