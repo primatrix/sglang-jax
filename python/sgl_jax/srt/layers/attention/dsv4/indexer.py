@@ -38,16 +38,32 @@ this module becomes a thin wrapper over it.
 from __future__ import annotations
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
 
 __all__ = [
+    "INDEXER_BACKEND_ENV",
     "INVALID_ENTRY",
     "csa_indexer_scores",
     "csa_indexer_topk",
+    "csa_indexer_topk_kernel",
+    "kernel_read_layout",
+    "resolve_indexer_backend",
     "visible_entries_for_query",
 ]
+
+# Which implementation scores and selects compressed entries during prefill:
+#   "reference": the native-JAX path below (materializes [T, E] scores, lax.top_k);
+#   "kernel":    kernels/dsa/streamindex_topk (Pallas scoring straight from the paged
+#                indexer cache, completed-groups mask, exact SparseCore selection);
+#   "auto":      "kernel" on TPU, "reference" elsewhere.
+INDEXER_BACKEND_ENV = "DSV4_INDEXER_BACKEND"
+# Kernel block sizes. The compressed page holds page_size // 4 = 32 entries, and the
+# kernel needs whole 128-entry KV blocks, so kv pages per block must be a multiple of 4.
+_KERNEL_KV_PAGES_PER_BLOCK = int(os.environ.get("DSV4_INDEXER_KV_PAGES_PER_BLOCK", "64"))
+_KERNEL_QUERIES_PER_BLOCK = (1, 64, 64)
 
 # Packed at the end of each top-k row. -1 rather than an out-of-range positive
 # value because that is what kernels/dsa already emits and what the downstream
@@ -217,3 +233,106 @@ def csa_indexer_topk(
     if take < k:
         selected = jnp.pad(selected, ((0, 0), (0, k - take)), constant_values=INVALID_ENTRY)
     return selected
+
+
+def resolve_indexer_backend(backend: str = "auto") -> str:
+    """Resolve ``auto`` (env ``DSV4_INDEXER_BACKEND`` first, then the JAX backend)."""
+    if backend not in ("auto", "kernel", "reference"):
+        raise ValueError(f"unknown CSA indexer backend {backend!r}")
+    if backend == "auto":
+        backend = os.environ.get(INDEXER_BACKEND_ENV, "auto")
+        if backend not in ("auto", "kernel", "reference"):
+            raise ValueError(f"{INDEXER_BACKEND_ENV}={backend!r} must be auto, kernel or reference")
+    if backend == "auto":
+        return "kernel" if jax.default_backend() == "tpu" else "reference"
+    return backend
+
+
+def kernel_read_layout(compressed_rows, seq_lens, q_lens, *, ratio: int, compressed_page_size: int):
+    """Per-request page table and gathered-row offsets from the flat read tables.
+
+    ``read_tables`` lists every request's completed entries in order, request after
+    request, at flat row ``page * compressed_page_size + entry % compressed_page_size``.
+    So request ``r`` owns rows ``[offset_r, offset_r + count_r)`` of the gathered array,
+    and the page of its ``p``-th page-aligned entry is that row's page.
+
+    Returns ``(page_indices [B, pages_per_seq], offsets [B])``; entries past a request's
+    count are clamped to real rows so every page index is a valid page, and the kernel
+    never reads them because ``seq_lens`` bounds each request.
+    """
+    compressed_rows = jnp.asarray(compressed_rows, jnp.int32)
+    seq_lens = jnp.asarray(seq_lens, jnp.int32)
+    counts = jnp.where(jnp.asarray(q_lens) > 0, seq_lens // ratio, 0).astype(jnp.int32)
+    offsets = jnp.cumsum(counts) - counts
+    capacity = compressed_rows.shape[0]
+    pages_per_seq = max(1, -(-capacity // compressed_page_size))
+    first = (
+        offsets[:, None]
+        + jnp.arange(pages_per_seq, dtype=jnp.int32)[None, :] * compressed_page_size
+    )
+    first = jnp.clip(first, 0, capacity - 1)
+    return compressed_rows[first] // compressed_page_size, offsets
+
+
+def csa_indexer_topk_kernel(
+    q,
+    weights,
+    indexer_buffer,
+    *,
+    compressed_rows,
+    seq_lens,
+    q_lens,
+    cu_q_lens,
+    query_request_ids,
+    valid_token_mask,
+    k: int,
+    ratio: int,
+    compressed_page_size: int,
+    topk_backend: str = "auto",
+):
+    """`csa_indexer_topk` semantics through ``kernels/dsa/streamindex_topk``.
+
+    Args:
+      q: ``[T, H, D]`` indexer queries, request-major in ``cu_q_lens`` order.
+      weights: ``[T, H]`` per-head weights.
+      indexer_buffer: ``[pages * compressed_page_size, D]`` flat paged indexer cache
+        (the ``kv_buffers["indexer"]`` view), already holding this step's records.
+      compressed_rows: flat read table (see `kernel_read_layout`).
+      seq_lens, q_lens, cu_q_lens: ``[B]``, ``[B]``, ``[B + 1]`` from the metadata.
+      query_request_ids, valid_token_mask: ``[T]``.
+      k, ratio, compressed_page_size: ``index_topk``, 4, ``page_size // ratio``.
+
+    Returns:
+      ``[T, k]`` int32 row indices into the gathered compressed key array (the same
+      coordinates `csa_indexer_topk` returns), ``INVALID_ENTRY`` packed at the tail.
+    """
+    from sgl_jax.srt.kernels.dsa.streamindex_topk import streamindex_topk
+
+    if compressed_page_size % 2:
+        raise ValueError("compressed_page_size must be even for the paged indexer layout")
+    if _KERNEL_KV_PAGES_PER_BLOCK * compressed_page_size % 128:
+        raise ValueError("kv pages per block times compressed page size must be a multiple of 128")
+    q = jnp.asarray(q)
+    num_requests = jnp.asarray(seq_lens).shape[0]
+    pages, offsets = kernel_read_layout(
+        compressed_rows, seq_lens, q_lens, ratio=ratio, compressed_page_size=compressed_page_size
+    )
+    cache_kv = jnp.asarray(indexer_buffer).reshape(-1, compressed_page_size // 2, 2, q.shape[-1])
+    active = jnp.asarray(q_lens) > 0
+    selected = streamindex_topk(
+        q=q.astype(jnp.bfloat16),
+        indexer_weights=jnp.asarray(weights, jnp.float32),
+        cache_kv=cache_kv,
+        seq_lens=jnp.where(active, jnp.asarray(seq_lens), 0).astype(jnp.int32),
+        page_indices=pages.reshape(-1).astype(jnp.int32),
+        cu_q_lens=jnp.asarray(cu_q_lens, jnp.int32),
+        distribution=jnp.asarray((0, 0, num_requests), jnp.int32),
+        k=k,
+        compression_ratio=ratio,
+        num_kv_pages_per_block=_KERNEL_KV_PAGES_PER_BLOCK,
+        num_queries_per_block=_KERNEL_QUERIES_PER_BLOCK,
+        topk_backend=topk_backend,
+    )
+    request = jnp.clip(jnp.asarray(query_request_ids), 0, num_requests - 1)
+    keep = jnp.asarray(valid_token_mask, bool)[:, None] & (selected >= 0)
+    return jnp.where(keep, selected + offsets[request][:, None], INVALID_ENTRY).astype(jnp.int32)
