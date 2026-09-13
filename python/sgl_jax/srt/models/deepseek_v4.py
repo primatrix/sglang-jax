@@ -896,12 +896,13 @@ class DeepseekV4DecoderLayer(nnx.Module):
 class DeepseekV4Model(nnx.Module):
     def __init__(self, config, mesh, dtype):
         from sgl_jax.srt.configs.deepseek_v4 import mhc_param_shapes
+        from sgl_jax.srt.layers.deepseek_v4_mhc import DeepseekV4MHC
         from sgl_jax.srt.layers.embeddings import Embed
         from sgl_jax.srt.layers.layernorm import RMSNorm
 
-        self.hc_mult = config.hc_mult
-        self.norm_eps = config.rms_norm_eps
-        self.hc_eps = config.hc_eps
+        self.mhc = DeepseekV4MHC(config)
+        self.mesh = mesh
+        self.dtype = dtype
         self.embed_tokens = Embed(
             config.vocab_size,
             config.hidden_size,
@@ -927,31 +928,38 @@ class DeepseekV4Model(nnx.Module):
         self.rope_plain = nnx.Variable(_rope_cache(config, 0))
         self.rope_compressed = nnx.Variable(_rope_cache(config, 4))
 
-    def __call__(self, batch, pools):
-        from sgl_jax.srt.layers.deepseek_v4_mhc import (
-            collapse_head_reference,
-            expand_streams,
+    def _collapse_head(self, streams):
+        params = (self.hc_head_fn.value, self.hc_head_base.value, self.hc_head_scale.value)
+        if self.mhc.backend != "pallas":
+            return self.mhc.collapse_head(streams, *params)
+        spec = P("data", None)
+        compute = jax.shard_map(
+            self.mhc.collapse_head,
+            mesh=None,
+            in_specs=(P("data", None, None), P(), P(), P()),
+            out_specs=spec,
+            check_vma=False,
         )
+        compute = jax.sharding.auto_axes(
+            compute, axes=self.mesh.axis_names, out_sharding=NamedSharding(self.mesh, spec)
+        )
+        return compute(streams, *params)
+
+    def __call__(self, batch, pools):
+        from sgl_jax.srt.layers.deepseek_v4_mhc import expand_streams
 
         hidden = self.embed_tokens(batch.input_ids)
         if batch.input_embedding is not None:
             hidden = batch.input_embedding
-        streams = expand_streams(hidden, self.hc_mult).astype(hidden.dtype)
+        streams = expand_streams(hidden, self.mhc.hc_mult).astype(hidden.dtype)
         updates, ids = {}, []
         for i, layer in enumerate(self.layers):
             cache = self.rope_compressed if layer.self_attn.ratio else self.rope_plain
             streams, updates[i], route_ids = layer(streams, batch, pools, cache.value)
             ids.append(route_ids)
-        hidden = collapse_head_reference(
-            streams,
-            self.hc_head_fn.value,
-            self.hc_head_scale.value,
-            self.hc_head_base.value,
-            norm_eps=self.norm_eps,
-            hc_eps=self.hc_eps,
-        )
+        hidden = self._collapse_head(streams)
         return (
-            self.norm(hidden),
+            self.norm(hidden.astype(self.dtype)),
             batch.attn_backend.pack_pool_updates(
                 updates, pools.token_to_kv_pool, pools.compressor_state_pool
             ),

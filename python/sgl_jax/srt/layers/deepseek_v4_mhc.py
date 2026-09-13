@@ -165,16 +165,18 @@ def collapse_head_reference(x_streams, hc_fn, hc_scale, hc_base, *, norm_eps: fl
 
 
 class DeepseekV4MHC:
-    """The mHC parameters of one decoder layer, plus its pre/post pair.
+    """Stateless mHC helper for one decoder layer: its pre/post pair.
 
-    Holds two independent gate parameter sets -- one for the attention sublayer and
-    one for the FFN -- because each sublayer gets its own pre/post. The model-level
-    head parameters live on the model, not here; `collapse_head` is exposed as a
-    static entry point for it.
+    Holds no parameters -- only config scalars, the resolved backend, and the
+    expected parameter shapes. The decoder layer owns two independent gate
+    parameter sets -- one for the attention sublayer and one for the FFN, because
+    each sublayer gets its own pre/post -- and passes one set to each `pre` call.
+    The model-level head parameters likewise live on the model; `collapse_head` is
+    exposed as a static entry point for it.
 
-    Parameters are float32 and must stay float32: they are gate coefficients fed to a
-    Sinkhorn normalisation, not projections, so they do not follow the model's
-    activation dtype.
+    Those parameters are float32 and must stay float32: they are gate coefficients
+    fed to a Sinkhorn normalisation, not projections, so they do not follow the
+    model's activation dtype.
     """
 
     def __init__(self, config, *, backend: str = "auto"):
@@ -243,7 +245,8 @@ class DeepseekV4MHC:
         """The model-level ``hc -> 1`` collapse before the final norm and LM head.
 
         Order matters and is easy to invert: this runs **before** the final RMSNorm,
-        which runs before the LM head.
+        which runs before the LM head. The output follows the streams' dtype on both
+        backends.
         """
         self.check_params(head_fn, head_base, head_scale, kind="head_fn")
         if self.backend == "pallas":
@@ -265,7 +268,7 @@ class DeepseekV4MHC:
             head_base,
             norm_eps=self.norm_eps,
             hc_eps=self.hc_eps,
-        )
+        ).astype(jnp.asarray(x_streams).dtype)
 
     # -- the sequencing one sublayer needs -------------------------------------
 
