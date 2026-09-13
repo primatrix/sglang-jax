@@ -322,6 +322,11 @@ class ForwardBatch:
         jax_arrays_str = ", ".join(jax_array_fields)
         return f"ForwardBatch(forward_mode={self.forward_mode}, batch_size={self.batch_size}, {jax_arrays_str})"
 
+    @property
+    def deepseek_v4_metadata(self):
+        """Dynamic M2 metadata transported once, through the backend PyTree child."""
+        return getattr(getattr(self.attn_backend, "forward_metadata", None), "attention", None)
+
     def get_token_valid_mask(
         self,
         num_tokens: int,

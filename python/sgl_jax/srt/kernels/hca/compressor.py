@@ -685,8 +685,14 @@ def hca_state_pool_update_ragged_fused_pallas(
 
     # Resolve each request's physical recurrent row once: after arbitrary alloc,
     # free and reuse, slots are neither dense nor request-major in the pool.
-    request_rows = request_slots[query_starts].astype(jnp.int32)
-    selected_state = state_pool.at[request_rows].get(mode="promise_in_bounds")
+    active_requests = seq_lens > prefix_lens
+    safe_starts = jnp.minimum(query_starts, tokens - 1)
+    request_rows = jnp.where(
+        active_requests,
+        request_slots[safe_starts],
+        state_pool.shape[0] + jnp.arange(batch, dtype=jnp.int32),
+    ).astype(jnp.int32)
+    selected_state = state_pool.at[request_rows].get(mode="fill", fill_value=0.0)
 
     projected = hca_project_fused_pallas(
         x,
@@ -750,11 +756,12 @@ def hca_state_pool_update_ragged_fused_pallas(
     safe_current = jnp.clip(current_indices, 0, tokens - 1)
     current = projected[safe_current]
     updated_selected = jnp.where(current_valid[:, :, None, None], current, selected_state)
-    # The batch contract (one live request per row) keeps ``request_rows``
-    # unique; padded requests, if ever added, must use dropped rows as above.
+    # Empty request rows can have query_start == tokens. Never let a clamped
+    # gather resolve these to the last live slot and overwrite its new state.
+    # Distinct dropped rows also keep unique_indices true with several pads.
     updated_pool = state_pool.at[request_rows].set(
         updated_selected,
-        mode="promise_in_bounds",
+        mode="drop",
         indices_are_sorted=False,
         unique_indices=True,
     )
