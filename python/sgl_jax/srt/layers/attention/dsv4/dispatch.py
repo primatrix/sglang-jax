@@ -38,7 +38,11 @@ import numpy as np
 
 from sgl_jax.srt.layers.attention.dsv4.attention import dsv4_attention, update_window_kv
 from sgl_jax.srt.layers.attention.dsv4.compressor import compress_chunk
-from sgl_jax.srt.layers.attention.dsv4.indexer import csa_indexer_topk
+from sgl_jax.srt.layers.attention.dsv4.indexer import (
+    csa_indexer_topk,
+    csa_indexer_topk_kernel,
+    resolve_indexer_backend,
+)
 
 __all__ = [
     "ReadTables",
@@ -278,19 +282,39 @@ def run_layer(
             )
             updates["indexer"] = indexer_buffer
             if tables.decode_page_indices is None:
-                indexer_keys = jnp.take(indexer_buffer, jnp.asarray(tables.compressed_rows), axis=0)
-                selected = csa_indexer_topk(
-                    indexer["q"],
-                    indexer["weights"],
-                    indexer_keys,
-                    metadata.query_positions,
-                    metadata.query_request_ids,
-                    jnp.asarray(tables.compressed_request_ids),
-                    metadata.valid_token_mask,
-                    entry_group_ids=jnp.asarray(tables.compressed_entry_ids),
-                    k=index_topk,
-                    ratio=ratio,
-                )
+                if resolve_indexer_backend() == "kernel":
+                    # Pallas scoring straight from the paged cache; same gathered-row
+                    # coordinates as the reference, no [T, E] key gather.
+                    selected = csa_indexer_topk_kernel(
+                        indexer["q"],
+                        indexer["weights"],
+                        indexer_buffer,
+                        compressed_rows=jnp.asarray(tables.compressed_rows),
+                        seq_lens=metadata.seq_lens,
+                        q_lens=metadata.q_lens,
+                        cu_q_lens=metadata.cu_q_lens,
+                        query_request_ids=metadata.query_request_ids,
+                        valid_token_mask=metadata.valid_token_mask,
+                        k=index_topk,
+                        ratio=ratio,
+                        compressed_page_size=metadata.page_size // ratio,
+                    )
+                else:
+                    indexer_keys = jnp.take(
+                        indexer_buffer, jnp.asarray(tables.compressed_rows), axis=0
+                    )
+                    selected = csa_indexer_topk(
+                        indexer["q"],
+                        indexer["weights"],
+                        indexer_keys,
+                        metadata.query_positions,
+                        metadata.query_request_ids,
+                        jnp.asarray(tables.compressed_request_ids),
+                        metadata.valid_token_mask,
+                        entry_group_ids=jnp.asarray(tables.compressed_entry_ids),
+                        k=index_topk,
+                        ratio=ratio,
+                    )
 
     # C1 retains all SWA pages read by this chunk until it completes. Publish
     # current-token KV before the read; causal positions, not write ordering,

@@ -4,8 +4,22 @@ import jax
 import jax.numpy as jnp
 
 from sgl_jax.srt.kernels.csa_decode import paged_csa_decode_scores
+from sgl_jax.srt.kernels.dsa.streamindex_topk import select_topk_indices
 
 _NEG_INF = jnp.finfo(jnp.float32).min
+
+
+def select_decode_entries(scores, lengths, *, take: int, topk_backend: str = "auto"):
+    """Exact top-``take`` entries per decode query, ``(selected [B, take], valid [B, take])``.
+
+    Uses the shared DSA exit-stage selector (SparseCore radix select on chips that have
+    one, XLA otherwise) instead of a full-row sort. ``scores`` marks unusable entries
+    with ``_NEG_INF``; entries at or beyond ``lengths`` are also invalid.
+    """
+    masked = jnp.where(scores > _NEG_INF, scores, -jnp.inf)
+    selected = select_topk_indices(masked, take, backend=topk_backend)
+    valid = (selected >= 0) & (selected < lengths[:, None])
+    return selected, valid
 
 
 def csa_decode_attention(
@@ -43,8 +57,7 @@ def csa_decode_attention(
         interpret=jax.default_backend() != "tpu",
     )
     take = min(index_topk, scores.shape[-1])
-    values, selected = jax.lax.top_k(scores, take)
-    selected_valid = (selected < lengths[:, None]) & (values > _NEG_INF)
+    selected, selected_valid = select_decode_entries(scores, lengths, take=take)
     # Preserve original entry order during attention and gather nearby slots
     # together. Exact top-k is unchanged; invalid selections sort to the end.
     selected = jnp.sort(jnp.where(selected_valid, selected, scores.shape[-1]), axis=-1)
