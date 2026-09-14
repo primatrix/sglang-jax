@@ -35,6 +35,46 @@ from sgl_jax.srt.layers.attention.dsv4.metadata import (
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 
+def pack_metadata(*trees):
+    """Flatten integer/bool pytrees into one int32 vector plus a static layout.
+
+    The per-step attention metadata and read tables are ~60 small arrays. Uploading
+    them one by one costs ~230 us each on an 8-device mesh (each leaf is copied to
+    every device), ~15 ms per decode step. Packing them into a single vector makes it
+    one transfer; `unpack_metadata` restores the pytrees with static slices inside jit.
+    """
+    leaves, treedef = jax.tree_util.tree_flatten(trees)
+    specs, chunks, offset = [], [], 0
+    for leaf in leaves:
+        array = np.asarray(leaf)
+        if array.dtype == np.bool_:
+            kind = "bool"
+        elif np.issubdtype(array.dtype, np.integer) and array.dtype.itemsize <= 4:
+            kind = str(array.dtype)
+        else:
+            raise TypeError(f"metadata leaf dtype {array.dtype} cannot be packed as int32")
+        flat = array.astype(np.int32).reshape(-1)
+        specs.append((offset, flat.size, tuple(array.shape), kind))
+        chunks.append(flat)
+        offset += flat.size
+    packed = np.concatenate(chunks) if chunks else np.zeros((0,), np.int32)
+    return packed, (treedef, tuple(specs))
+
+
+def unpack_metadata(packed, layout):
+    """Inverse of `pack_metadata`; works on host arrays and inside jit."""
+    treedef, specs = layout
+    leaves = []
+    for offset, size, shape, kind in specs:
+        leaf = jax.lax.slice_in_dim(packed, offset, offset + size).reshape(shape)
+        if kind == "bool":
+            leaf = leaf != 0
+        elif kind != "int32":
+            leaf = leaf.astype(kind)
+        leaves.append(leaf)
+    return jax.tree_util.tree_unflatten(treedef, leaves)
+
+
 @jax.tree_util.register_pytree_node_class
 @dataclass
 class DeepseekV4RuntimeMetadata(DeepseekV4HCAMetadata):
@@ -42,16 +82,51 @@ class DeepseekV4RuntimeMetadata(DeepseekV4HCAMetadata):
     # to a rank, including cu_q_lens and the compression-boundary sentinels.
     attention: DeepseekV4AttentionMetadata | None = None
     read_tables: tuple = ()
+    # When set, `attention`/`read_tables` travel as one int32 vector (see pack_metadata)
+    # and `resolve()` rebuilds them; `layout` is static.
+    packed: jax.Array | None = None
+    layout: tuple | None = None
+
+    def has_metadata(self) -> bool:
+        return self.packed is not None or (self.attention is not None and bool(self.read_tables))
+
+    def resolve(self):
+        """``(attention, read_tables)`` whether or not the metadata is packed."""
+        if self.packed is None:
+            return self.attention, self.read_tables
+        attention, tables = unpack_metadata(self.packed, self.layout)
+        return attention, tuple(tables)
 
     def tree_flatten(self):
-        return (self.kernel, self.state_init_slots, self.attention, self.read_tables), (
-            self.schedule,
-            self.use_uniform_prefill_fast_path,
-        )
+        return (
+            self.kernel,
+            self.state_init_slots,
+            self.attention,
+            self.read_tables,
+            self.packed,
+        ), (self.schedule, self.use_uniform_prefill_fast_path, self.layout)
 
     @classmethod
     def tree_unflatten(cls, aux, children):
-        return cls(children[0], aux[0], aux[1], children[1], children[2], children[3])
+        return cls(
+            children[0],
+            aux[0],
+            aux[1],
+            children[1],
+            children[2],
+            children[3],
+            children[4],
+            aux[2],
+        )
+
+
+class _PrecompileContextBox:
+    """Mutable holder that hashes by identity so its value stays out of jit cache keys."""
+
+    __slots__ = ("context_len",)
+
+    def __init__(self):
+        self.context_len: int | None = None
 
 
 class DeepseekV4AttentionBackend(AttentionBackend):
@@ -74,6 +149,23 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         ) == (4096, 64, 512, 64, 128)
         self.resources_bound = False
         self.forward_metadata = nnx.data(DeepseekV4RuntimeMetadata())
+        # Set by the compilation manager while precompiling dummy batches: derive the
+        # read-table capacity buckets from this context length instead of the (zero)
+        # dummy sequence lengths, so every power-of-two bucket a real request can reach
+        # is compiled at startup rather than on first use (~48 s per bucket on v7x).
+        # Kept in an identity-hashed box: a plain attribute would become part of the
+        # nnx graphdef and therefore of the jit cache key, so precompiled executables
+        # (context_len=N) would never match runtime calls (context_len=None) and every
+        # first use would still re-trace (~6 s each with the persistent cache).
+        self._precompile_box = _PrecompileContextBox()
+
+    @property
+    def precompile_context_len(self) -> int | None:
+        return self._precompile_box.context_len
+
+    @precompile_context_len.setter
+    def precompile_context_len(self, value: int | None) -> None:
+        self._precompile_box.context_len = value
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
@@ -135,11 +227,15 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         compressed_capacities = {0: 1}
         for ratio in (4, 128):
             count = int(np.max(np.sum(np.where(queries > 0, lengths // ratio, 0), axis=1)))
-            compressed_capacities[ratio] = max(128, 1 << (max(1, count) - 1).bit_length())
+            compressed_capacities[ratio] = capacity_bucket(count)
         decode_capacity = None
         if batch.forward_mode == ForwardMode.DECODE and self.page_size == 128:
-            count = int(np.max(lengths // 4))
-            decode_capacity = max(128, 1 << (max(1, count) - 1).bit_length())
+            decode_capacity = capacity_bucket(int(np.max(lengths // 4)))
+        if self.precompile_context_len is not None:
+            ladder = precompile_capacities(self.precompile_context_len)
+            compressed_capacities.update(ladder)
+            if decode_capacity is not None:
+                decode_capacity = ladder[4]
         for rank in range(dp):
             live = int(queries[rank].sum())
             mapping = allocator.full_to_swa_index_mapping
@@ -195,21 +291,25 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 )
             )
         sharding = NamedSharding(self.mesh, P("data"))
-        attention = jax.tree.map(
-            lambda *arrays: jax.device_put(np.concatenate(arrays), sharding), *local
+        # Concatenate the DP ranks on the host, then upload the whole metadata pytree
+        # in ONE device_put: the ~60 leaves cost ~230 us each when uploaded one by one
+        # (~15 ms per step, the dominant host cost of a decode step), but a single
+        # batched transfer amortises the per-call dispatch and sharding work.
+        host_attention = jax.tree.map(lambda *arrays: np.concatenate(arrays), *local)
+        host_tables = tuple(
+            jax.tree.map(lambda *arrays: np.concatenate(arrays), *tables)
+            for tables in tables_by_ratio.values()
         )
+        packed_host, layout = pack_metadata(host_attention, host_tables)
         return DeepseekV4RuntimeMetadata(
             hca.kernel,
             hca.schedule,
             hca.use_uniform_prefill_fast_path,
             hca.state_init_slots,
-            attention,
-            tuple(
-                jax.tree.map(
-                    lambda *arrays: jax.device_put(np.concatenate(arrays), sharding), *tables
-                )
-                for tables in tables_by_ratio.values()
-            ),
+            None,
+            (),
+            jax.device_put(packed_host, sharding),
+            layout,
         )
 
     def layer_ratio(self, layer, token_to_kv_pool) -> int:
@@ -277,16 +377,17 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
             return output.reshape(q.shape), {"state": state, "swa": window, "c128": history}
         md = self.forward_metadata
-        if md.attention is None or not md.read_tables:
+        if not md.has_metadata():
             raise RuntimeError("V4 attention metadata has not been prepared")
+        attention, read_tables = md.resolve()
         return self.csa(
             q,
             k[:, 0] if k.ndim == 3 else k,
             hidden_states=compressor_input,
             layer_id=int(layer.layer_id),
             ratio=ratio,
-            metadata=md.attention,
-            tables=md.read_tables[(0, 4, 128).index(ratio)],
+            metadata=attention,
+            tables=read_tables[(0, 4, 128).index(ratio)],
             token_to_kv_pool=token_to_kv_pool,
             compressor_state_pool=compressor_state_pool,
             compressor=compressor,
@@ -314,6 +415,16 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             "token_to_kv_pool": {name: tuple(arrays) for name, arrays in kv.items()},
             "compressor_state_pool": {name: tuple(arrays) for name, arrays in state.items()},
         }
+
+
+def capacity_bucket(count: int) -> int:
+    """Power-of-two read-table capacity for ``count`` completed entries (minimum 128)."""
+    return max(128, 1 << (max(1, count) - 1).bit_length())
+
+
+def precompile_capacities(context_len: int) -> dict[int, int]:
+    """Capacity buckets a request of ``context_len`` tokens reaches, per compression ratio."""
+    return {ratio: capacity_bucket(context_len // ratio) for ratio in (4, 128)}
 
 
 def prepare_dummy_batch(batch, backend):
