@@ -120,6 +120,15 @@ class DeepseekV4RuntimeMetadata(DeepseekV4HCAMetadata):
         )
 
 
+class _PrecompileContextBox:
+    """Mutable holder that hashes by identity so its value stays out of jit cache keys."""
+
+    __slots__ = ("context_len",)
+
+    def __init__(self):
+        self.context_len: int | None = None
+
+
 class DeepseekV4AttentionBackend(AttentionBackend):
     def __init__(self, *, mesh, page_size, max_context_len, config=None):
         self.mesh = mesh
@@ -140,6 +149,23 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         ) == (4096, 64, 512, 64, 128)
         self.resources_bound = False
         self.forward_metadata = nnx.data(DeepseekV4RuntimeMetadata())
+        # Set by the compilation manager while precompiling dummy batches: derive the
+        # read-table capacity buckets from this context length instead of the (zero)
+        # dummy sequence lengths, so every power-of-two bucket a real request can reach
+        # is compiled at startup rather than on first use (~48 s per bucket on v7x).
+        # Kept in an identity-hashed box: a plain attribute would become part of the
+        # nnx graphdef and therefore of the jit cache key, so precompiled executables
+        # (context_len=N) would never match runtime calls (context_len=None) and every
+        # first use would still re-trace (~6 s each with the persistent cache).
+        self._precompile_box = _PrecompileContextBox()
+
+    @property
+    def precompile_context_len(self) -> int | None:
+        return self._precompile_box.context_len
+
+    @precompile_context_len.setter
+    def precompile_context_len(self, value: int | None) -> None:
+        self._precompile_box.context_len = value
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
@@ -201,11 +227,15 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         compressed_capacities = {0: 1}
         for ratio in (4, 128):
             count = int(np.max(np.sum(np.where(queries > 0, lengths // ratio, 0), axis=1)))
-            compressed_capacities[ratio] = max(128, 1 << (max(1, count) - 1).bit_length())
+            compressed_capacities[ratio] = capacity_bucket(count)
         decode_capacity = None
         if batch.forward_mode == ForwardMode.DECODE and self.page_size == 128:
-            count = int(np.max(lengths // 4))
-            decode_capacity = max(128, 1 << (max(1, count) - 1).bit_length())
+            decode_capacity = capacity_bucket(int(np.max(lengths // 4)))
+        if self.precompile_context_len is not None:
+            ladder = precompile_capacities(self.precompile_context_len)
+            compressed_capacities.update(ladder)
+            if decode_capacity is not None:
+                decode_capacity = ladder[4]
         for rank in range(dp):
             live = int(queries[rank].sum())
             mapping = allocator.full_to_swa_index_mapping
@@ -385,6 +415,16 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             "token_to_kv_pool": {name: tuple(arrays) for name, arrays in kv.items()},
             "compressor_state_pool": {name: tuple(arrays) for name, arrays in state.items()},
         }
+
+
+def capacity_bucket(count: int) -> int:
+    """Power-of-two read-table capacity for ``count`` completed entries (minimum 128)."""
+    return max(128, 1 << (max(1, count) - 1).bit_length())
+
+
+def precompile_capacities(context_len: int) -> dict[int, int]:
+    """Capacity buckets a request of ``context_len`` tokens reaches, per compression ratio."""
+    return {ratio: capacity_bucket(context_len // ratio) for ratio in (4, 128)}
 
 
 def prepare_dummy_batch(batch, backend):
