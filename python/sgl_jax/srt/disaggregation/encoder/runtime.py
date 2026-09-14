@@ -262,8 +262,10 @@ class EncoderRuntime:
         reservations = None
         try:
             job.mark("transfer_reserve_start_ns")
+            output_indices = getattr(job.model_input, "output_indices", None)
+            kwargs = {} if output_indices is None else {"output_indices": output_indices}
             reservations = self._transfer.reserve_batch_sync(
-                transfer_ids, job.model_input.token_counts
+                transfer_ids, job.model_input.token_counts, **kwargs
             )
             job.mark("encoder_dispatch_start_ns")
             packed_output = self._encoder.encode_packed(job.model_input)

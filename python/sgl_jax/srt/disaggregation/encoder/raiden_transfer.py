@@ -115,6 +115,8 @@ class RaidenEncoderServerTransfer:
         self,
         reservations: list[_SendReservation],
         packed: jax.Array,
+        *,
+        source_rows=None,
     ) -> list[_SendReservation]:
         try:
             if not reservations:
@@ -126,6 +128,7 @@ class RaidenEncoderServerTransfer:
                     packed,
                     [item.page_ids for item in reservations],
                     tuple(item.token_count for item in reservations),
+                    source_rows=source_rows,
                 )
                 for reservation in reservations:
                     reservation.write = write

@@ -17,7 +17,10 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, MockModelConfig, ModelConfig
 from sgl_jax.srt.disaggregation.encoder.raiden_pool import create_encoder_pool
-from sgl_jax.srt.disaggregation.encoder.transfer_layout import encoder_transfer_nbytes
+from sgl_jax.srt.disaggregation.encoder.transfer_layout import (
+    ENCODER_PAGE_SIZE,
+    encoder_transfer_nbytes,
+)
 from sgl_jax.srt.eplb.expert_location import (
     init_expert_location_metadata,
     set_global_server_args,
@@ -78,9 +81,13 @@ def _embedding_pool_bytes(
         width = model_config.hidden_size * (
             1 + len(getattr(vision, "deepstack_visual_indexes", ()))
         )
-        return encoder_transfer_nbytes(
-            (server_args.encoder_transfer_max_tokens, width), model_config.dtype
-        )
+        target = getattr(multimodal_model, "thinker", multimodal_model)
+        tokens = server_args.encoder_transfer_max_tokens
+        if hasattr(target, "get_lane_packed_feature"):
+            # Match the per-shard page rounding in create_encoder_pool.
+            unit = ENCODER_PAGE_SIZE * target.mesh.size
+            tokens = -(-tokens // unit) * ENCODER_PAGE_SIZE
+        return encoder_transfer_nbytes((tokens, width), model_config.dtype)
     enabled = (
         getattr(model_config, "is_multimodal", False)
         and ModelRegistry.is_in_model_multimodal(model_config.hf_config.architectures)
@@ -255,7 +262,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             return
         if getattr(self.server_args, "language_only", False):
             self.encoder_embedding_pool = create_encoder_pool(
-                self.server_args, self.model_config, self.mesh
+                self.server_args,
+                self.model_config,
+                self.mesh,
+                sharded=hasattr(
+                    getattr(self.model, "thinker", self.model), "get_lane_packed_feature"
+                ),
             )
             return
         page_size = self.server_args.page_size

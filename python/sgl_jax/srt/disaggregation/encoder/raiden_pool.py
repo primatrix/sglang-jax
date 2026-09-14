@@ -22,12 +22,18 @@ logger = logging.getLogger(__name__)
 def _write_rows(pool, packed, destination_rows, source_rows):
     rows = packed[jnp.maximum(source_rows, 0)]
     rows = jnp.where((source_rows >= 0)[:, None], rows, 0)
-    flat = pool.reshape(pool.shape[0] * pool.shape[1], -1)
-    rows = jnp.pad(rows, ((0, 0), (0, flat.shape[1] - packed.shape[1])))
-    flat = flat.at[destination_rows].set(rows, mode="drop")
+    page_size = pool.shape[1]
+    width = math.prod(pool.shape[2:])
+    rows = jnp.pad(rows, ((0, 0), (0, width - packed.shape[1])))
+    # Destinations contain complete pages, including zeroed request tails.
+    # Convert only the updates; flattening the pool reformats the entire buffer.
+    pages = rows.reshape(-1, *pool.shape[1:])
+    page_ids = destination_rows[::page_size] // page_size
+    pool = pool.at[page_ids].set(pages, mode="drop")
     # A separate completion value survives the next donation of the pool.
-    ready = flat[jnp.minimum(destination_rows[0], flat.shape[0] - 1), 0]
-    return flat.reshape(pool.shape), ready
+    row = jnp.minimum(destination_rows[0], pool.shape[0] * page_size - 1)
+    ready = pool[row // page_size, row % page_size, 0, 0, 0]
+    return pool, ready
 
 
 class RaidenPool:
@@ -37,8 +43,6 @@ class RaidenPool:
         self.page_size, self.width = map(int, shape)
         if self.page_size < 2 or capacity <= 0:
             raise ValueError("Raiden needs page_size >= 2 and positive page capacity")
-        if not sharding.is_fully_replicated:
-            raise ValueError("Encoder pools require replicated embeddings")
         self.dtype = jnp.dtype(dtype)
         self.sharding = sharding
         self.num_pages = int(capacity)
@@ -47,7 +51,7 @@ class RaidenPool:
         self.buffer = jnp.zeros(
             (self.num_pages, *encoder_pool_block_shape(shape)),
             self.dtype,
-            device=self._sharding(5),
+            device=sharding,
         )
         jax.block_until_ready(self.buffer)
 
@@ -65,11 +69,28 @@ class RaidenPool:
             raise ValueError("Encoder request exceeds the pool token capacity")
         return (tokens + self.page_size - 1) // self.page_size
 
-    def allocate(self, tokens: int) -> tuple[int, ...] | None:
+    def allocate(self, tokens: int, *, shard: int | None = None) -> tuple[int, ...] | None:
         count = self.pages_needed(tokens)
+        if shard is not None:
+            size = self.num_pages // len(self.sharding.device_set)
+            pages = tuple(page for page in reversed(self._free_pages) if page // size == shard)[
+                :count
+            ]
+            if len(pages) != count:
+                return None
+            chosen = set(pages)
+            self._free_pages = [page for page in self._free_pages if page not in chosen]
+            return pages
         if count > self.available_pages:
             return None
         return tuple(self._free_pages.pop() for _ in range(count))
+
+    def available_pages_by_shard(self) -> list[int]:
+        size = self.num_pages // len(self.sharding.device_set)
+        return np.bincount(
+            np.asarray(self._free_pages, np.int32) // size,
+            minlength=len(self.sharding.device_set),
+        ).tolist()
 
     def release(self, page_ids: tuple[int, ...]) -> None:
         self._free_pages.extend(reversed(page_ids))
@@ -101,7 +122,7 @@ class RaidenPool:
         jax.block_until_ready((self.buffer, ready))
         logger.info("Encoder pool warmed: packed_capacity=%d", packed_capacity)
 
-    def write_packed(self, packed, allocations, token_counts) -> jax.Array:
+    def write_packed(self, packed, allocations, token_counts, *, source_rows=None) -> jax.Array:
         if (
             len(allocations) != len(token_counts)
             or not allocations
@@ -125,8 +146,10 @@ class RaidenPool:
                 np.asarray(pages, np.int32)[:, None] * self.page_size + np.arange(self.page_size)
             ).reshape(-1)
             # Zero the page tail as well, so no stale rows are exposed by transport.
-            sources[row_offset : row_offset + tokens] = np.arange(
-                token_offset, token_offset + tokens, dtype=np.int32
+            sources[row_offset : row_offset + tokens] = (
+                np.arange(token_offset, token_offset + tokens, dtype=np.int32)
+                if source_rows is None
+                else source_rows[token_offset : token_offset + tokens]
             )
             row_offset = end
             token_offset += tokens
@@ -139,13 +162,20 @@ class RaidenPool:
         return ready
 
 
-def create_encoder_pool(server_args, model_config, mesh) -> RaidenPool:
+def create_encoder_pool(server_args, model_config, mesh, *, sharded=False) -> RaidenPool:
     vision = getattr(model_config.hf_config, "vision_config", None)
     width = model_config.hidden_size * (1 + len(getattr(vision, "deepstack_visual_indexes", ())))
+    shards = mesh.size if sharded else 1
+    pages = math.ceil(server_args.encoder_transfer_max_tokens / (ENCODER_PAGE_SIZE * shards))
+    spec = (
+        jax.sharding.PartitionSpec(tuple(mesh.axis_names))
+        if sharded
+        else jax.sharding.PartitionSpec()
+    )
     return RaidenPool(
         (ENCODER_PAGE_SIZE, width),
         model_config.dtype,
-        jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec()),
-        capacity=math.ceil(server_args.encoder_transfer_max_tokens / ENCODER_PAGE_SIZE),
+        jax.sharding.NamedSharding(mesh, spec),
+        capacity=pages * shards,
         max_batch_size=server_args.encoder_max_batch_size,
     )

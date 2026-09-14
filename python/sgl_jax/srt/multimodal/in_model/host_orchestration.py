@@ -123,10 +123,17 @@ def _gather_overlay(
     *,
     out_sharding: NamedSharding | None,
 ) -> jax.Array:
-    if out_sharding is None:
-        gathered = source[pos_idx]
+    if source.ndim > 2:
+        # Gather the requested rows before reshaping. Flattening the fixed pool
+        # outside this JIT can reformat the entire registered buffer.
+        indices = (pos_idx // source.shape[1], pos_idx % source.shape[1])
     else:
-        gathered = source.at[pos_idx].get(out_sharding=out_sharding)
+        indices = pos_idx
+    if out_sharding is None:
+        gathered = source[indices]
+    else:
+        gathered = source.at[indices].get(out_sharding=out_sharding)
+    gathered = gathered.reshape(pos_idx.shape[0], -1)
     # Raiden rows may include trailing physical tile padding.
     gathered = gathered[:, : running.shape[-1]]
     return jnp.where(mask[:, None], gathered, running)
@@ -201,7 +208,7 @@ def _gather_merge(
     pos_idx, mask = _build_gather_indices(tasks, running.shape[0])
     if isinstance(packed, PooledEmbedding):
         pos_idx[mask] = packed.row_indices[pos_idx[mask]]
-        running = _apply_gather(running, packed.flat_buffer, pos_idx, mask, mesh)
+        running = _apply_gather(running, packed.buffer, pos_idx, mask, mesh)
         packed.record_read(running)
         return running
     return _apply_gather(running, packed, pos_idx, mask, mesh)
@@ -388,7 +395,6 @@ def precompile_received_embeddings(
     """Warm actual receive-buffer shapes before Raiden can write into them."""
     mesh = multimodal_model.mesh
     with jax.set_mesh(mesh) if mesh is not None else nullcontext():
-        source = receive_buffer.reshape(receive_buffer.shape[0] * receive_buffer.shape[1], -1)
         for num_tokens in token_buckets:
             input_ids = jnp.zeros(
                 num_tokens,
@@ -402,7 +408,7 @@ def precompile_received_embeddings(
                 running = jnp.pad(running, ((0, 0), (0, hidden * deepstack_dim)))
             running = _apply_gather(
                 running,
-                source,
+                receive_buffer,
                 np.zeros(num_tokens, np.int32),
                 np.ones(num_tokens, np.bool_),
                 mesh,

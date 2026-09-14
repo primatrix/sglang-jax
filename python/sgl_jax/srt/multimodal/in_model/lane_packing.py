@@ -129,6 +129,25 @@ def _build_output_indices(lengths, output_starts, output_size, merge_unit):
     return output_indices
 
 
+def plan_encoder_output_indices(item_lengths, num_lanes, *, buckets, merge_unit):
+    """Map logical tokens to lane-local encoder output without device work."""
+    lengths = np.asarray(item_lengths, dtype=np.int32)
+    lanes = balance_lanes(lengths.tolist(), num_lanes)
+    capacity = (
+        _bucket_capacity(
+            max(sum(int(lengths[index]) for index in lane) for lane in lanes), buckets, merge_unit
+        )
+        // merge_unit
+    )
+    starts = np.empty(len(lengths), dtype=np.int32)
+    for rank, lane in enumerate(lanes):
+        offset = rank * capacity
+        for index in lane:
+            starts[index] = offset
+            offset += int(lengths[index]) // merge_unit
+    return _build_output_indices(lengths, starts, num_lanes * capacity, merge_unit)
+
+
 def pack_lanes(
     items: list[MultimodalDataItem],
     num_lanes: int,
@@ -293,6 +312,10 @@ def _restore_input_order(
     out_sharding: NamedSharding,
 ) -> jax.Array:
     output = output.reshape(-1, output.shape[-1])
+    # Replicate lane outputs before indexing, rather than all-reducing a full
+    # reordered output from every lane. Keep sharded consumers on their path.
+    if out_sharding.is_fully_replicated:
+        output = jax.sharding.reshard(output, out_sharding)
     mask = output_indices >= 0
     indices = jnp.maximum(output_indices, 0)
     output = output.at[indices].get(out_sharding=out_sharding)
@@ -338,6 +361,7 @@ def run_mrope_vision_model(
     rope_type: Literal["rope_3d", "rope_2d", "rope_2d_packed"],
     input_sharding: NamedSharding,
     output_sharding: NamedSharding,
+    restore_order: bool = True,
 ) -> jax.Array:
     """Prepare sharded patch/metadata buffers, run the model, and restore order.
 
@@ -377,6 +401,8 @@ def run_mrope_vision_model(
     with jax.set_mesh(mesh):
         with jax.profiler.TraceAnnotation("encoder_vision_dispatch"):
             output = vision_model(patches, metadata)
+        if not restore_order:
+            return output
         return restore_encoder_output(output, output_indices, output_sharding)
 
 

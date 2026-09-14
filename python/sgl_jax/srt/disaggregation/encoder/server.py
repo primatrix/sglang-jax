@@ -285,18 +285,25 @@ def launch(server_args: ServerArgs) -> None:
     encoder = MMEncoder(server_args)
     try:
         model = getattr(encoder.model, "thinker", encoder.model)
-        pool = create_encoder_pool(server_args, encoder.model_config, model.mesh)
-        if not server_args.disable_precompile:
-            for capacity in model.get_multimodal_embedding_packed_capacities():
-                pool.warmup(capacity)
         host_ip = resolve_host_ip(server_args.disaggregation_host_ip)
-        transfer = RaidenEncoderServerTransfer(
-            host_ip,
-            pool,
-            parallelism=server_args.disaggregation_channel_number,
-            pool_size=server_args.encoder_transfer_pool_size,
-            timeout_s=server_args.encoder_request_timeout_seconds,
-        )
+        if encoder.sharded_transfer:
+            from sgl_jax.srt.disaggregation.encoder.sharded_transfer import (
+                ShardedEncoderTransfer,
+            )
+
+            transfer = ShardedEncoderTransfer(host_ip, server_args, encoder.model_config, model)
+        else:
+            pool = create_encoder_pool(server_args, encoder.model_config, model.mesh)
+            if not server_args.disable_precompile:
+                for capacity in model.get_multimodal_embedding_packed_capacities():
+                    pool.warmup(capacity)
+            transfer = RaidenEncoderServerTransfer(
+                host_ip,
+                pool,
+                parallelism=server_args.disaggregation_channel_number,
+                pool_size=server_args.encoder_transfer_pool_size,
+                timeout_s=server_args.encoder_request_timeout_seconds,
+            )
         advertise_host = f"[{host_ip}]" if ":" in host_ip else host_ip
         advertise_url = (
             f"http://{advertise_host}:{server_args.port}"

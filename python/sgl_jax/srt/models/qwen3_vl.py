@@ -21,6 +21,7 @@ from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalData
 from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
 from sgl_jax.srt.multimodal.in_model.lane_packing import (
     encoder_num_lanes,
+    plan_encoder_output_indices,
     precompile_mrope_vision_model,
     run_mrope_vision_model,
 )
@@ -681,7 +682,20 @@ class Qwen3VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
     def get_video_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
         return self._get_visual_feature(items)
 
-    def _get_visual_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
+    def plan_encoder_transfer(self, items):
+        return plan_encoder_output_indices(
+            [item.feature.shape[0] for item in items],
+            encoder_num_lanes(self.mesh, self.visual.vision_tp),
+            buckets=self.visual.input_buckets,
+            merge_unit=self.visual.spatial_merge_unit,
+        )
+
+    def get_lane_packed_feature(self, items):
+        return self._get_visual_feature(items, restore_order=False)
+
+    def _get_visual_feature(
+        self, items: list[MultimodalDataItem], *, restore_order: bool = True
+    ) -> jax.Array:
         num_lanes = encoder_num_lanes(self.mesh, self.visual.vision_tp)
         return run_mrope_vision_model(
             self.visual,
@@ -693,6 +707,7 @@ class Qwen3VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
             rope_type="rope_3d",
             input_sharding=self.visual.specs.sharding(self.visual.specs.batch_axis),
             output_sharding=self.visual.specs.sharding(),
+            restore_order=restore_order,
         )
 
     def get_multimodal_encode_funcs(self):

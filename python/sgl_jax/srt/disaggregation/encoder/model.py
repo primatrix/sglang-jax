@@ -40,6 +40,7 @@ class PreparedEncoderBatch:
     modality: Modality
     inputs: list[MultimodalInputs]
     token_counts: tuple[int, ...]
+    output_indices: np.ndarray | None = None
 
 
 @dataclass(slots=True)
@@ -85,6 +86,8 @@ class MMEncoder:
             ),
             mesh=mesh,
         )
+        target = getattr(self.model, "thinker", self.model)
+        self.sharded_transfer = hasattr(target, "get_lane_packed_feature")
         if not server_args.disable_precompile:
             logger.info("Precompiling multimodal encoder")
             self.model.precompile_multimodal()
@@ -153,11 +156,13 @@ class MMEncoder:
 
         processed = [request.inputs for request in requests]
         token_counts = tuple(request.token_count for request in requests)
-        return PreparedEncoderBatch(
-            modality,
-            processed,
-            token_counts,
-        )
+        output_indices = None
+        if self.sharded_transfer:
+            target = getattr(self.model, "thinker", self.model)
+            output_indices = target.plan_encoder_transfer(
+                [item for inputs in processed for item in inputs.mm_items]
+            )
+        return PreparedEncoderBatch(modality, processed, token_counts, output_indices)
 
     @property
     def preprocess_concurrency(self) -> int:
@@ -176,7 +181,11 @@ class MMEncoder:
             get_feature = getattr(target, f"get_{modality.name.lower()}_feature", None)
             if get_feature is None:
                 raise ValueError(f"model has no {modality.name} encoder")
-            packed = get_feature(items)
+            packed = (
+                target.get_lane_packed_feature(items)
+                if batch.output_indices is not None
+                else get_feature(items)
+            )
         if sum(batch.token_counts) > packed.shape[0]:
             raise ValueError(f"incomplete {modality.name} encoder output")
         return PackedEncoderOutput(batch, packed)
