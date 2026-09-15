@@ -17,7 +17,12 @@ def post(base, path, payload):
         {"Content-Type": "application/json"},
     )
     with urlopen(req, timeout=1800) as response:
-        return json.load(response)
+        body = response.read()
+    # The close endpoint acknowledges success with HTTP 200 and no body.
+    # Generation must still return valid JSON; do not hide an empty response.
+    if path == "/close_session" and not body:
+        return None
+    return json.loads(body)
 
 
 def generate(base, tokens, sid=None):
