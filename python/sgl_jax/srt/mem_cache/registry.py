@@ -83,6 +83,20 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         DeepseekV4TokenToKVPoolAllocator,
     )
 
+    sessions = getattr(ctx.server_args, "enable_streaming_session", False)
+    if sessions and (
+        not isinstance(params.token_to_kv_pool_allocator, DeepseekV4TokenToKVPoolAllocator)
+        or not ctx.disable_radix_cache
+        or ctx.has_speculative
+        or ctx.server_args.dp_size != 1
+        or bool(ctx.server_args.pd_disaggregation)
+        or ctx.server_args.disaggregation_mode != "null"
+    ):
+        raise ValueError(
+            "Streaming sessions require V4, --disable-radix-cache, DP=1, "
+            "and no speculative decoding or disaggregation"
+        )
+
     if isinstance(params.token_to_kv_pool_allocator, DeepseekV4TokenToKVPoolAllocator):
         from sgl_jax.srt.mem_cache.chunk_cache import DeepseekV4ChunkCache
 
@@ -94,11 +108,24 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             window = getattr(ctx.model_config, "sliding_window", None)
         if not window or window <= 0:
             raise ValueError("V4 lifecycle requires a positive sliding window")
-        return DeepseekV4ChunkCache(
+        cache_class = DeepseekV4ChunkCache
+        session_options = {}
+        if sessions:
+            from sgl_jax.srt.mem_cache.deepseek_v4.session_cache import (
+                DeepseekV4SessionCache,
+            )
+
+            cache_class = DeepseekV4SessionCache
+            session_options = dict(
+                session_timeout=ctx.server_args.streaming_session_timeout,
+                max_sessions=ctx.server_args.max_streaming_sessions,
+            )
+        return cache_class(
             req_to_token_pool=params.req_to_token_pool,
             token_to_kv_pool_allocator=params.token_to_kv_pool_allocator,
             page_size=params.page_size,
             sliding_window_size=window,
+            **session_options,
         )
 
     if ctx.is_hybrid_swa:

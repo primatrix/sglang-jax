@@ -71,6 +71,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             prompt_kwargs = {"input_ids": prompt}
 
         adapted_request = GenerateReqInput(
+            session_params=request.session_params,
             **prompt_kwargs,
             sampling_params=sampling_params,
             return_logprob=request.logprobs is not None,
