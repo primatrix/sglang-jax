@@ -39,7 +39,6 @@ from sgl_jax.srt.multimodal.in_model.lane_packing import (
 )
 from sgl_jax.srt.multimodal.layers.vision_sharding import (
     VisionShardSpecs,
-    apply_data_sharding,
     resolve_encoder_tp,
 )
 from sgl_jax.srt.utils.common_utils import resolve_vision_patch_buckets
@@ -69,31 +68,21 @@ def _value(config: ConfigLike | None, name: str, default: Any = None) -> Any:
 
 
 def _apply_rope(x: jax.Array, freqs: jax.Array) -> jax.Array:
-    """RoPE for the ViT: *x* is ``[B, T, heads, head_dim]``, *freqs* ``[B, T, head_dim]``."""
+    """Apply RoPE to vision or audio activations, broadcasting over heads."""
     original_dtype = x.dtype
     x = x.astype(jnp.float32)
     half = x.shape[-1] // 2
     rotated = jnp.concatenate((-x[..., half:], x[..., :half]), axis=-1)
-    cos = jnp.cos(freqs)[:, :, None, :]
-    sin = jnp.sin(freqs)[:, :, None, :]
+    cos = jnp.cos(freqs)[..., None, :]
+    sin = jnp.sin(freqs)[..., None, :]
     return (x * cos + rotated * sin).astype(original_dtype)
-
-
-def _take_units(x: jax.Array, index: jax.Array, unit: int) -> jax.Array:
-    """Reorder *x* ``[B, L, ...]`` in blocks of ``unit`` rows by ``index`` ``[B, L/unit]``."""
-    batch, length = x.shape[:2]
-    tail = x.shape[2:]
-    x = x.reshape(batch, length // unit, unit, *tail)
-    gather = index.reshape(batch, index.shape[1], *([1] * (x.ndim - 2)))
-    gather = jnp.broadcast_to(gather, (batch, index.shape[1], *x.shape[2:]))
-    return jnp.take_along_axis(x, gather, axis=1).reshape(batch, length, *tail)
 
 
 def _encode_first_key_attention_bias(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
-    cu_seqlens: jax.Array,
+    first_key_mask: jax.Array,
     sinks: jax.Array,
     sm_scale: float,
     out_sharding: NamedSharding | None = None,
@@ -106,23 +95,12 @@ def _encode_first_key_attention_bias(
     starts produces that exact logit bias; an appended zero V dimension keeps
     the value output unchanged and is sliced off after attention.
     """
-    q_per_kv = q.shape[2] // k.shape[2]
+    q_per_kv = q.shape[1] // k.shape[1]
     if q_per_kv > 1:
-        k = jnp.repeat(k, q_per_kv, axis=2, out_sharding=out_sharding)
-        v = jnp.repeat(v, q_per_kv, axis=2, out_sharding=out_sharding)
+        k = jnp.repeat(k, q_per_kv, axis=1, out_sharding=out_sharding)
+        v = jnp.repeat(v, q_per_kv, axis=1, out_sharding=out_sharding)
 
-    starts = cu_seqlens[:, :-1]
-    valid_segments = jnp.diff(cu_seqlens, axis=1) > 0
-    positions = jnp.arange(q.shape[1], dtype=cu_seqlens.dtype)
-    is_first_key = jnp.any(
-        (positions[None, :, None] == starts[:, None, :]) & valid_segments[:, None, :],
-        axis=-1,
-    )
-    key_bias = jnp.where(
-        is_first_key[:, :, None],
-        sinks[None, None, :] / sm_scale,
-        0,
-    ).astype(k.dtype)
+    key_bias = jnp.where(first_key_mask[:, None], sinks[None, :] / sm_scale, 0).astype(k.dtype)
     q_padding = jnp.ones((*q.shape[:-1], 1), dtype=q.dtype, out_sharding=out_sharding)
     k_padding = key_bias[..., None]
     v_padding = jnp.zeros((*v.shape[:-1], 1), dtype=v.dtype, out_sharding=out_sharding)
@@ -194,20 +172,13 @@ class MiMoVisionPatchEmbed(nnx.Module):
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        B, S, _ = x.shape
+        tokens = x.shape[0]
         C, T, P = self.in_channels, self.temporal_patch_size, self.patch_size
-        x = x.reshape(B, S, C, T, P, P)
-        if self.mesh is not None:
-            x = apply_data_sharding(x, self.mesh, PartitionSpec(self.specs.batch_axis))
-        x = jnp.transpose(x, (0, 1, 3, 4, 5, 2))  # [B, S, T, P, P, C]
-
-        sh = None
-        if self.mesh is not None and "data" in self.mesh.abstract_mesh.explicit_axes:
-            sh = self.specs.sharding(self.specs.batch_axis)
-        x = x.reshape(B * S, T, P, P, C, out_sharding=sh)
-        x = self.proj(x, out_sharding=sh)
-        x = x.reshape(B, S, self.hidden_size, out_sharding=sh)
-        return x
+        sharding = self.specs.sharding(self.specs.batch_axis)
+        x = x.reshape(tokens, C, T, P, P, out_sharding=sharding)
+        x = jnp.transpose(x, (0, 2, 3, 4, 1))
+        x = self.proj(x, out_sharding=sharding)
+        return x.reshape(tokens, self.hidden_size, out_sharding=sharding)
 
 
 class MiMoVisionMLP(nnx.Module):
@@ -246,7 +217,7 @@ class MiMoVisionMLP(nnx.Module):
 
     def __call__(self, x: jax.Array) -> jax.Array:
         specs = self.specs
-        col = specs.sharding(specs.batch_axis, None, specs.tensor_axis)
+        col = specs.sharding(specs.batch_axis, specs.tensor_axis)
         row = specs.sharding(specs.batch_axis)
         gate, _ = self.gate_proj(x, out_sharding=col)
         up, _ = self.up_proj(x, out_sharding=col)
@@ -329,76 +300,73 @@ class MiMoVisionAttention(nnx.Module):
         else:
             self.attn_backend = None
 
-    def __call__(self, x, freqs, cu_seqlens, window_size) -> jax.Array:
-        B, T, _ = x.shape
+    def __call__(self, x, freqs, cu_seqlens, first_key_mask, window_size, *, max_seq_len):
+        tokens = x.shape[0]
         specs = self.specs
-        col = specs.sharding(specs.batch_axis, None, specs.tensor_axis)
-        hs = specs.sharding(specs.batch_axis, None, specs.tensor_axis, None)
-
+        col = specs.sharding(specs.batch_axis, specs.tensor_axis)
         q, _ = self.q_proj(x, out_sharding=col)
         k, _ = self.k_proj(x, out_sharding=col)
         v, _ = self.v_proj(x, out_sharding=col)
-        q = q.reshape(B, T, self.num_heads, self.head_dim, out_sharding=hs)
-        k = k.reshape(B, T, self.num_kv_heads, self.head_dim, out_sharding=hs)
-        v = v.reshape(B, T, self.num_kv_heads, self.head_dim, out_sharding=hs)
-
+        q = q.reshape(tokens, self.num_heads, self.head_dim, out_sharding=col)
+        k = k.reshape(tokens, self.num_kv_heads, self.head_dim, out_sharding=col)
+        v = v.reshape(tokens, self.num_kv_heads, self.head_dim, out_sharding=col)
         q = _apply_rope(q, freqs)
         k = _apply_rope(k, freqs)
-
-        if isinstance(window_size, int):
-            ragged_window = (-1, -1) if window_size <= 0 else (window_size, window_size)
-        else:
-            ragged_window = window_size
-        sm_scale = 1.0 / math.sqrt(self.head_dim)
-        has_sink_bias = self.sinks is not None
-        if has_sink_bias:
+        window = (-1, -1) if window_size <= 0 else (window_size, window_size)
+        if self.sinks is not None:
             q, k, v = _encode_first_key_attention_bias(
                 q,
                 k,
                 v,
-                cu_seqlens,
+                first_key_mask,
                 self.sinks[...],
-                sm_scale,
-                out_sharding=hs,
+                1.0 / math.sqrt(self.head_dim),
+                out_sharding=col,
             )
         if self.attn_backend is None:
-            from sgl_jax.srt.multimodal.kernels.varlen_attention import (
-                ref_varlen_attention,
-                varlen_attention,
-            )
-
-            attention = ref_varlen_attention if jax.default_backend() == "cpu" else varlen_attention
-
-            out = jnp.stack(
-                [
-                    attention(
-                        q[index],
-                        k[index],
-                        v[index],
-                        cu_seqlens[index],
-                        jnp.sum(jnp.diff(cu_seqlens[index]) > 0, dtype=jnp.int32).reshape(1),
-                        sm_scale=sm_scale,
-                        window_size=ragged_window,
-                        attention_sink=None,
-                    )
-                    for index in range(B)
-                ]
-            )
+            out = self._reference_attention(q, k, v, cu_seqlens, window)
         else:
             out = self.attn_backend(
-                q,
-                k,
-                v,
-                cu_seqlens,
-                None,
-                window_size=ragged_window,
+                q, k, v, cu_seqlens, window_size=window, max_seq_len=max_seq_len
             )
-
-        if has_sink_bias:
+        if self.sinks is not None:
             out = out[..., : self.head_dim]
-        out = out.reshape(B, T, self.num_heads * self.head_dim, out_sharding=col)
+        out = out.reshape(tokens, self.num_heads * self.head_dim, out_sharding=col)
         out, _ = self.proj(out, out_sharding=specs.sharding(specs.batch_axis))
         return out
+
+    def _reference_attention(self, q, k, v, cu_seqlens, window):
+        """Dense CPU reference with the same per-shard contract as TPU varlen."""
+        from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
+            vision_segment_ids_from_cu_seqlens,
+        )
+
+        def attend(q, k, v, cu):
+            k = jnp.repeat(k, q.shape[1] // k.shape[1], axis=1)
+            v = jnp.repeat(v, q.shape[1] // v.shape[1], axis=1)
+            ids = vision_segment_ids_from_cu_seqlens(cu[None], q.shape[0]).q[0]
+            positions = jnp.arange(q.shape[0])
+            mask = (ids[:, None] == ids[None, :]) & (ids[None, :] >= 0)
+            if window[0] >= 0:
+                mask &= positions[None, :] >= positions[:, None] - window[0]
+            if window[1] >= 0:
+                mask &= positions[None, :] <= positions[:, None] + window[1]
+            # Varlen never reads padding; the dense reference must mask values
+            # explicitly because the packer leaves unused feature rows undefined.
+            v = jnp.where((ids >= 0)[:, None, None], v, 0)
+            logits = jnp.einsum("thd,shd->hts", q.astype(jnp.float32), k.astype(jnp.float32))
+            logits *= 1.0 / math.sqrt(self.head_dim)
+            probs = jax.nn.softmax(jnp.where(mask[None], logits, -1e30), axis=-1)
+            return jnp.einsum("hts,shd->thd", probs, v.astype(jnp.float32)).astype(q.dtype)
+
+        spec = PartitionSpec(self.specs.batch_axis, self.specs.tensor_axis)
+        return jax.shard_map(
+            attend,
+            mesh=self.mesh,
+            in_specs=(spec, spec, spec, PartitionSpec(self.specs.batch_axis)),
+            out_specs=spec,
+            check_vma=False,
+        )(q, k, v, cu_seqlens)
 
 
 class MiMoVisionBlock(nnx.Module):
@@ -411,14 +379,21 @@ class MiMoVisionBlock(nnx.Module):
         self.attn = MiMoVisionAttention(config, dtype, rngs, mesh, vision_tp, use_sinks)
         self.mlp = MiMoVisionMLP(config, dtype, rngs, mesh, vision_tp)
 
-    def __call__(self, x, freqs, cu_seqlens, window_size) -> jax.Array:
-        x = x + self.attn(self.norm1(x), freqs, cu_seqlens, window_size)
+    def __call__(self, x, freqs, cu_seqlens, first_key_mask, window_size, *, max_seq_len):
+        x = x + self.attn(
+            self.norm1(x),
+            freqs,
+            cu_seqlens,
+            first_key_mask,
+            window_size,
+            max_seq_len=max_seq_len,
+        )
         x = x + self.mlp(self.norm2(x))
         return x
 
 
 class MiMoVisionPatchMerger(nnx.Module):
-    """LayerNorm → reshape(sms²) → 2-layer MLP → [B, T/sms², out_hidden]."""
+    """LayerNorm → spatial merge → MLP over flat output tokens."""
 
     def __init__(self, config, dtype, rngs, mesh, vision_tp):
         context = int(_value(config, "hidden_size"))
@@ -456,10 +431,8 @@ class MiMoVisionPatchMerger(nnx.Module):
         specs = self.specs
         row = specs.sharding(specs.batch_axis)
         x = self.ln_q(x)
-        x = x.reshape(x.shape[0], -1, self.hidden_size, out_sharding=row)
-        x, _ = self.mlp_fc1(
-            x, out_sharding=specs.sharding(specs.batch_axis, None, specs.tensor_axis)
-        )
+        x = x.reshape(-1, self.hidden_size, out_sharding=row)
+        x, _ = self.mlp_fc1(x, out_sharding=specs.sharding(specs.batch_axis, specs.tensor_axis))
         x = jax.nn.gelu(x, approximate=False)
         x, _ = self.mlp_fc2(x, out_sharding=row)
         return x
@@ -514,36 +487,45 @@ class MiMoVisionTransformer(nnx.Module):
 
     # -- forward ----------------------------------------------------------
 
-    def __call__(self, patches, grid_thw) -> jax.Array:
-        return self.encode(patches, grid_thw)
+    def __call__(self, patches, **metadata) -> jax.Array:
+        return self.encode(patches, **metadata)
 
-    def _forward(self, patches, meta: _MiMoVisionMetadata, valid) -> jax.Array:
+    def _reorder_units(self, x, indices):
+        """Reorder spatial merge units within each device's lane, as in Qwen2.5-VL."""
+        shape = x.shape
+        units = x.reshape(-1, self.spatial_merge_unit, *shape[1:])
+        spec = PartitionSpec(self.specs.batch_axis)
+        units = jax.shard_map(
+            lambda values, order: values[order],
+            mesh=self.mesh,
+            in_specs=(spec, spec),
+            out_specs=spec,
+            check_vma=False,
+        )(units, indices)
+        return units.reshape(shape)
+
+    def _forward(self, patches, meta: _MiMoVisionMetadata, first_key_mask) -> jax.Array:
         col_index = jnp.asarray(meta.col_index)
         reverse_col_index = jnp.asarray(meta.reverse_col_index)
         rotary_freqs = jnp.asarray(meta.rotary_freqs)
         cu_seqlens = jnp.asarray(meta.cu_seqlens)
 
         hidden = self.patch_embed(patches)
-        col_freqs = _take_units(rotary_freqs, col_index, self.spatial_merge_unit)
+        col_freqs = self._reorder_units(rotary_freqs, col_index)
 
+        capacity = patches.shape[0] // encoder_num_lanes(self.mesh, self.vision_tp)
         for index, block in enumerate(self.blocks):
             col = self.window_types[index] == 1
             previous_col = index > 0 and self.window_types[index - 1] == 1
             if col and not previous_col:
-                hidden = _take_units(hidden, col_index, self.spatial_merge_unit)
+                hidden = self._reorder_units(hidden, col_index)
             elif previous_col and not col:
-                hidden = _take_units(hidden, reverse_col_index, self.spatial_merge_unit)
+                hidden = self._reorder_units(hidden, reverse_col_index)
             freqs = col_freqs if col else rotary_freqs
             window = -1 if index in self.full_blocks else self.window_size
-            hidden = block(hidden, freqs, cu_seqlens, window)
+            hidden = block(hidden, freqs, cu_seqlens, first_key_mask, window, max_seq_len=capacity)
 
-        output = self.merger(hidden)
-        output_valid = valid // self.spatial_merge_unit
-        return jnp.where(
-            jnp.arange(output.shape[1])[None, :, None] < output_valid[:, None, None],
-            output,
-            0,
-        )
+        return self.merger(hidden)
 
     # -- metadata ---------------------------------------------------------
 
@@ -618,40 +600,39 @@ class MiMoVisionTransformer(nnx.Module):
         return _MiMoVisionMetadata(col_index, reverse_col_index, freqs, cu_seqlens)
 
     @jax.jit
-    def _encode_jit(self, patches, meta, valid) -> jax.Array:
-        features = self._forward(patches, meta, valid)
-        if self.mesh is None:
-            return features
-        return jax.sharding.reshard(
-            features,
-            NamedSharding(self.mesh, PartitionSpec(*([None] * features.ndim))),
-        )
+    def encode(self, patches, *, meta, first_key_mask) -> jax.Array:
+        token_sharding = self.specs.sharding(self.specs.batch_axis)
+        patches = patches.reshape(-1, self.patch_dim, out_sharding=token_sharding)
+        return self._forward(patches.astype(self.dtype), meta, first_key_mask)
 
-    def encode(self, patches, grid_thw: np.ndarray | jax.Array) -> jax.Array:
-        batch_sharding = self.specs.sharding(self.specs.batch_axis)
-        patches = jax.device_put(patches, batch_sharding)
-        meta, valid = self._build_metadata(grid_thw, patches.shape[1])
-        meta = jax.device_put(meta, batch_sharding)
-        valid = jax.device_put(valid, batch_sharding)
-        if self.mesh is None:
-            return self._encode_jit(patches, meta, valid)
-        with jax.set_mesh(self.mesh):
-            return self._encode_jit(patches, meta, valid)
-
-    def _build_metadata(self, grid_thw: np.ndarray | jax.Array, capacity: int):
-        grid_thw = np.asarray(jax.device_get(grid_thw), dtype=np.int32)
+    def prepare_metadata(self, grid_thw, capacity: int, *, sharding: NamedSharding):
+        grid_thw = np.asarray(grid_thw, dtype=np.int32)
         if grid_thw.ndim == 2:
             grid_thw = grid_thw[None]
-        empty = self._pad_metadata(self._empty_metadata(capacity), capacity)
+        if grid_thw.ndim != 3 or grid_thw.shape[-1] != 3:
+            raise ValueError("grid_thw must have shape [items, 3] or [lanes, items, 3]")
+        meta, first_key_mask = self._build_metadata(grid_thw, capacity)
+        return jax.device_put({"meta": meta, "first_key_mask": first_key_mask}, sharding)
+
+    def _build_metadata(self, grid_thw: np.ndarray, capacity: int):
         metadata = []
-        valid = np.zeros(len(grid_thw), dtype=np.int32)
+        first_key_mask = np.zeros((len(grid_thw), capacity), dtype=np.bool_)
         for lane_index, lane in enumerate(grid_thw):
             grids = [tuple(map(int, grid)) for grid in lane if np.any(grid)]
-            metadata.append(
-                self._pad_metadata(self._pack_metadata(grids), capacity) if grids else empty
-            )
-            valid[lane_index] = sum(int(np.prod(grid)) for grid in grids)
-        return jax.tree.map(lambda *values: np.stack(values), *metadata), valid
+            if sum(math.prod(grid) for grid in grids) > capacity:
+                raise ValueError("vision grids exceed the lane capacity")
+            if grids:
+                meta = self._pad_metadata(self._pack_metadata(grids), capacity)
+                starts = meta.cu_seqlens[:-1][np.diff(meta.cu_seqlens) > 0]
+                first_key_mask[lane_index, starts] = True
+            else:
+                meta = self._pad_metadata(self._empty_metadata(capacity), capacity)
+                meta.cu_seqlens.fill(0)
+            metadata.append(meta)
+        # Indices and cumulative lengths remain lane-local, just as in Qwen-VL.
+        return jax.tree.map(
+            lambda *values: np.concatenate(values), *metadata
+        ), first_key_mask.reshape(-1)
 
     def precompile(self) -> None:
         precompile_mrope_vision_model(
@@ -662,6 +643,8 @@ class MiMoVisionTransformer(nnx.Module):
             patch_dim=self.patch_dim,
             merge_unit=self.spatial_merge_unit,
             rope_type="rope_3d",
+            input_sharding=self.specs.sharding(self.specs.batch_axis),
+            output_sharding=self.specs.sharding(),
         )
 
 
@@ -963,23 +946,19 @@ class _MiMoV2MultimodalMixin(InModelMultimodalContract):
             raise ValueError("MiMoV2 multimodal models require a device mesh.")
         super().__init__(config, mesh, dtype)
 
-        from sgl_jax.srt.managers.schedule_batch import global_server_args_dict
-
         vision_config = _value(config, "vision_config", None)
         audio_config = _value(config, "audio_config", None)
         if vision_config is None and audio_config is None:
             raise ValueError("MiMoV2 VLM requires config.vision_config or config.audio_config.")
 
-        self.encoder_tp = resolve_encoder_tp(
-            mesh, global_server_args_dict.get("vision_encoder_parallel", "dp")
-        )
+        self.encoder_tp = resolve_encoder_tp(mesh, getattr(config, "vision_encoder_parallel", "dp"))
         self.vision_tp = self.encoder_tp
         if vision_config is None:
             self.visual = None
         else:
             input_buckets = tuple(
                 resolve_vision_patch_buckets(
-                    global_server_args_dict.get("precompile_vision_patch_paddings")
+                    getattr(config, "precompile_vision_patch_paddings", None)
                 )
             )
             self.visual = MiMoVisionTransformer(
@@ -1038,33 +1017,39 @@ class _MiMoV2MultimodalMixin(InModelMultimodalContract):
             buckets=visual.input_buckets,
             merge_unit=visual.spatial_merge_unit,
             rope_type="rope_3d",
-            dtype=self.dtype,
+            input_sharding=visual.specs.sharding(visual.specs.batch_axis),
+            output_sharding=visual.specs.sharding(),
         )
 
     def get_audio_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
         encoder = self.audio_encoder
         if encoder is None:
             raise ValueError("This MiMoV2 checkpoint has no audio encoder.")
-        packed = pack_lanes(
+        num_lanes = encoder_num_lanes(self.mesh, encoder.encoder_tp)
+        batch_sharding = encoder.specs.sharding(encoder.specs.batch_axis)
+        codes, output_indices, lanes = pack_lanes(
             items,
-            encoder_num_lanes(self.mesh, encoder.encoder_tp),
+            num_lanes,
             buckets=encoder.input_buckets,
             merge_unit=encoder.group_size,
+            input_sharding=batch_sharding,
             dtype=np.int32,
         )
         valid = np.asarray(
             [
                 sum(int(np.asarray(items[item_index].feature).shape[0]) for item_index in lane)
-                for lane in packed.lanes
+                for lane in lanes
             ],
             dtype=np.int32,
         )
-        batch_sharding = encoder.specs.sharding(encoder.specs.batch_axis)
-        output = encoder.encode(
-            jax.device_put(packed.features, batch_sharding),
-            jax.device_put(valid, batch_sharding),
-        )
-        return restore_encoder_output(output, packed.output_indices, self.mesh)
+        channels = items[0].feature.shape[-1]
+        with jax.set_mesh(self.mesh):
+            output = encoder.encode(
+                codes.reshape(num_lanes, -1, channels, out_sharding=batch_sharding),
+                jax.device_put(valid, batch_sharding),
+            )
+            output = output.reshape(-1, output.shape[-1])
+            return restore_encoder_output(output, output_indices, encoder.specs.sharding())
 
     def get_multimodal_encode_funcs(self):
         funcs = {}

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
 
 from sgl_jax.srt.configs.model_config import _adapt_mimo_v2_multimodal_architecture
@@ -18,7 +19,11 @@ from sgl_jax.srt.models.mimo_v2_mm import (
     _encode_first_key_attention_bias,
     _MiMoV2MultimodalMixin,
 )
-from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalInputs
+from sgl_jax.srt.multimodal.common.modality_enum import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
 from sgl_jax.srt.multimodal.layers.vision_sharding import VisionShardSpecs
 from sgl_jax.srt.multimodal.processors.mimo_v2 import MiMoV2Processor
@@ -71,7 +76,15 @@ def _processor(*, vision=True, audio=False):
     )
 
 
-def _tiny_mimo_model(monkeypatch, *, audio=False):
+def _tiny_mimo_model(
+    monkeypatch,
+    *,
+    audio=False,
+    materialize=False,
+    mesh_shape=(1, 1),
+    windowed=False,
+    encoder_tp=False,
+):
     from flax import nnx
 
     def fake_text_init(self, config, mesh, dtype):
@@ -81,11 +94,9 @@ def _tiny_mimo_model(monkeypatch, *, audio=False):
         self.model = SimpleNamespace(embed_tokens=lambda values: values)
 
     monkeypatch.setattr(MiMoV2ForCausalLM, "__init__", fake_text_init)
-    from sgl_jax.srt.managers.schedule_batch import global_server_args_dict
-
-    monkeypatch.setitem(global_server_args_dict, "vision_encoder_parallel", "dp")
-    monkeypatch.setitem(global_server_args_dict, "precompile_vision_patch_paddings", [4])
     config = _hf_config(audio=audio)
+    config.vision_encoder_parallel = "tp" if encoder_tp else "dp"
+    config.precompile_vision_patch_paddings = [4]
     config.vision_config = SimpleNamespace(
         patch_size=2,
         temporal_patch_size=1,
@@ -94,15 +105,15 @@ def _tiny_mimo_model(monkeypatch, *, audio=False):
         hidden_size=8,
         intermediate_size=16,
         out_hidden_size=8,
-        num_heads=2,
-        num_key_value_heads=1,
+        num_heads=4,
+        num_key_value_heads=2,
         qk_channels=4,
-        depth=1,
-        fullatt_block_indexes=[0],
+        depth=3 if windowed else 1,
+        fullatt_block_indexes=[0, 2] if windowed else [0],
         hidden_act="silu",
         use_sink=True,
         visual_token_window_size=4,
-        vit_window_attn_types=[-1],
+        vit_window_attn_types=[-1, 1, -1] if windowed else [-1],
     )
     if audio:
         config.audio_config = SimpleNamespace(
@@ -122,16 +133,18 @@ def _tiny_mimo_model(monkeypatch, *, audio=False):
             partial_rotary_factor=1.0,
             rope_theta=10000,
         )
-    devices = np.asarray(jax.devices()[:1]).reshape(1, 1)
+    devices = np.asarray(jax.devices()[: np.prod(mesh_shape)]).reshape(mesh_shape)
     mesh = Mesh(
         devices,
         ("data", "tensor"),
         axis_types=(AxisType.Explicit, AxisType.Explicit),
     )
     with jax.set_mesh(mesh):
-        model = nnx.eval_shape(
-            lambda: MiMoV2ForConditionalGeneration(config, mesh=mesh, dtype=jnp.bfloat16)
-        )
+
+        def build_model():
+            return MiMoV2ForConditionalGeneration(config, mesh=mesh, dtype=jnp.bfloat16)
+
+        model = build_model() if materialize else nnx.eval_shape(build_model)
     return model, mesh
 
 
@@ -229,22 +242,22 @@ def test_mimo_v25_restores_and_loads_towers_outside_text_graph(monkeypatch):
 
 
 def test_first_key_sink_bias_matches_official_vision_logits():
-    q = jnp.arange(1 * 5 * 4 * 2, dtype=jnp.float32).reshape(1, 5, 4, 2) / 10
-    k = jnp.arange(1 * 5 * 2 * 2, dtype=jnp.float32).reshape(1, 5, 2, 2) / 7
+    q = jnp.arange(1 * 5 * 4 * 2, dtype=jnp.float32).reshape(5, 4, 2) / 10
+    k = jnp.arange(1 * 5 * 2 * 2, dtype=jnp.float32).reshape(5, 2, 2) / 7
     v = jnp.ones_like(k)
-    cu_seqlens = jnp.asarray([[0, 2, 5, 5]], dtype=jnp.int32)
+    first_key_mask = jnp.asarray([True, False, True, False, False])
     sinks = jnp.asarray([0.1, -0.2, 0.3, -0.4], dtype=jnp.float32)
     scale = 0.25
 
-    q_aug, k_aug, v_aug = _encode_first_key_attention_bias(q, k, v, cu_seqlens, sinks, scale)
-    logits = jnp.einsum("bthd,bshd->bhts", q_aug, k_aug) * scale
+    q_aug, k_aug, v_aug = _encode_first_key_attention_bias(q, k, v, first_key_mask, sinks, scale)
+    logits = jnp.einsum("thd,shd->hts", q_aug, k_aug) * scale
 
-    repeated_k = jnp.repeat(k, 2, axis=2)
-    expected = jnp.einsum("bthd,bshd->bhts", q, repeated_k) * scale
-    expected = expected.at[:, :, :, 0].add(sinks[None, :, None])
-    expected = expected.at[:, :, :, 2].add(sinks[None, :, None])
+    repeated_k = jnp.repeat(k, 2, axis=1)
+    expected = jnp.einsum("thd,shd->hts", q, repeated_k) * scale
+    expected = expected.at[:, :, 0].add(sinks[:, None])
+    expected = expected.at[:, :, 2].add(sinks[:, None])
     np.testing.assert_allclose(logits, expected, rtol=1e-6, atol=1e-6)
-    np.testing.assert_array_equal(v_aug[..., :-1], jnp.repeat(v, 2, axis=2))
+    np.testing.assert_array_equal(v_aug[..., :-1], jnp.repeat(v, 2, axis=1))
     np.testing.assert_array_equal(v_aug[..., -1], 0)
 
 
@@ -255,27 +268,29 @@ def test_first_key_sink_bias_preserves_explicit_attention_sharding():
         ("data", "tensor"),
         axis_types=(AxisType.Explicit, AxisType.Explicit),
     )
-    attention_sharding = NamedSharding(mesh, PartitionSpec("data", None, "tensor", None))
-    sequence_sharding = NamedSharding(mesh, PartitionSpec("data", None))
+    attention_sharding = NamedSharding(mesh, PartitionSpec("data", "tensor", None))
+    sequence_sharding = NamedSharding(mesh, PartitionSpec("data"))
     sink_sharding = NamedSharding(mesh, PartitionSpec("tensor"))
 
     with jax.set_mesh(mesh):
-        q = jax.device_put(jnp.ones((1, 5, 4, 2)), attention_sharding)
-        k = jax.device_put(jnp.ones((1, 5, 2, 2)), attention_sharding)
-        v = jax.device_put(jnp.ones((1, 5, 2, 2)), attention_sharding)
-        cu_seqlens = jax.device_put(jnp.asarray([[0, 2, 5, 5]], dtype=jnp.int32), sequence_sharding)
+        q = jax.device_put(jnp.ones((5, 4, 2)), attention_sharding)
+        k = jax.device_put(jnp.ones((5, 2, 2)), attention_sharding)
+        v = jax.device_put(jnp.ones((5, 2, 2)), attention_sharding)
+        first_key_mask = jax.device_put(
+            jnp.asarray([True, False, True, False, False]), sequence_sharding
+        )
         sinks = jax.device_put(jnp.ones((4,)), sink_sharding)
         q_aug, k_aug, v_aug = jax.jit(
-            lambda q, k, v, cu_seqlens, sinks: _encode_first_key_attention_bias(
+            lambda q, k, v, first_key_mask, sinks: _encode_first_key_attention_bias(
                 q,
                 k,
                 v,
-                cu_seqlens,
+                first_key_mask,
                 sinks,
                 0.25,
                 out_sharding=attention_sharding,
             )
-        )(q, k, v, cu_seqlens, sinks)
+        )(q, k, v, first_key_mask, sinks)
 
     assert q_aug.sharding == attention_sharding
     assert k_aug.sharding == attention_sharding
@@ -339,42 +354,56 @@ def test_multimodal_tower_weight_mappings_follow_official_names():
     )
 
 
-def test_processor_loads_vision_inputs_and_keeps_standard_rope():
-    processor = _processor()
+def test_processor_loads_vision_inputs_and_keeps_standard_rope(monkeypatch):
+    from sgl_jax.srt.multimodal.processors import mimo_v2
 
-    async def run_processor():
-        async def load_images(sources):
-            assert sources == ["image-source"]
-            return ["loaded-image"]
-
-        async def load_videos(sources, video_config):
-            assert sources == ["video-source"]
-            assert video_config["fps"] == 1.0
-            assert video_config["factor"] == 32
-            return ["loaded-video"]
-
-        async def combine(input_text, images=None, videos=None, **kwargs):
-            assert input_text == "prompt"
-            assert images == ["loaded-image"]
-            assert videos == ["loaded-video"]
+    class FakeHFProcessor:
+        def __call__(self, **kwargs):
+            assert kwargs["text"] == ["prompt"]
+            assert kwargs["images"] == ["loaded-image"]
+            assert kwargs["videos"] == ["loaded-video"]
             assert kwargs["images_kwargs"] == {"max_pixels": 1024 * 16**2}
             assert kwargs["videos_kwargs"]["do_sample_frames"] is False
-            return MultimodalInputs(mm_items=[], input_ids=[10, 11])
+            return {
+                "input_ids": np.asarray([[1, IMAGE_TOKEN, IMAGE_TOKEN, 151656, 2]]),
+                "pixel_values": np.ones((8, 6), dtype=np.float32),
+                "image_grid_thw": np.asarray([[1, 2, 4]], dtype=np.int32),
+                "pixel_values_videos": np.ones((4, 6), dtype=np.float32),
+                "video_grid_thw": np.asarray([[1, 2, 2]], dtype=np.int32),
+            }
 
-        processor.load_images_async = load_images
-        processor._load_videos_async = load_videos
-        processor.process_and_combine_mm_data_async = combine
-        return await processor.process_mm_data_async(
-            "image-source",
-            "prompt",
-            SimpleNamespace(audio_data=None, video_data="video-source"),
-        )
+    processor = MiMoV2Processor(
+        _hf_config(),
+        SimpleNamespace(model_path="unused", precompile_vision_patch_paddings=[256, 1024]),
+        FakeHFProcessor(),
+    )
 
+    def load_image(source):
+        assert source == "image-source"
+        return "loaded-image"
+
+    def load_video(source, video_config):
+        assert source == "video-source"
+        assert video_config["fps"] == 1.0
+        assert video_config["factor"] == 32
+        return "loaded-video"
+
+    monkeypatch.setattr(processor, "load_image", load_image)
+    monkeypatch.setattr(mimo_v2, "preprocess_video", load_video)
     try:
-        output = asyncio.run(run_processor())
+        output = asyncio.run(
+            processor.process_mm_data_async(
+                "image-source",
+                "prompt",
+                SimpleNamespace(audio_data=None, video_data="video-source"),
+            )
+        )
     finally:
         processor.shutdown()
-    assert output.input_ids == [10, 11]
+    assert output.input_ids == [1, IMAGE_TOKEN, IMAGE_TOKEN, 151656, 2]
+    assert [item.modality for item in output.mm_items] == [Modality.IMAGE, Modality.VIDEO]
+    assert output.mrope_positions is None
+    assert output.mrope_position_delta is None
 
 
 def test_processor_collects_vision_without_language_mrope():
@@ -397,6 +426,33 @@ def test_processor_collects_vision_without_language_mrope():
     assert len(output.mm_items) == 1
     assert output.mm_items[0].modality is Modality.IMAGE
     assert output.mm_items[0].placeholder_ranges == [(1, 3)]
+
+
+def test_audio_encoder_forward_and_precompile(monkeypatch):
+    model, mesh = _tiny_mimo_model(monkeypatch, audio=True, materialize=True)
+    encoder = model.audio_encoder
+    encoder.input_buckets = (8,)
+    with jax.set_mesh(mesh):
+        encoder.precompile()
+        codes = np.arange(16, dtype=np.int32).reshape(1, 8, 2) % 15
+        sharding = encoder.specs.sharding(encoder.specs.batch_axis)
+        features = encoder.encode(
+            jax.device_put(codes, sharding),
+            jax.device_put(np.array([6], dtype=np.int32), sharding),
+        )
+        individual = encoder.encode(
+            jax.device_put(codes[:, :2], sharding),
+            jax.device_put(np.array([2], dtype=np.int32), sharding),
+        )
+    assert features.shape == (1, 4, 8)
+    assert np.isfinite(np.asarray(features, dtype=np.float32)).all()
+    np.testing.assert_array_equal(features[:, 3:], 0)
+    np.testing.assert_allclose(
+        np.asarray(features[:, :1], dtype=np.float32),
+        np.asarray(individual, dtype=np.float32),
+        rtol=0.02,
+        atol=0.02,
+    )
 
 
 def test_audio_placeholder_expansion_and_lane_valid_lengths():
@@ -444,3 +500,40 @@ def test_audio_placeholder_expansion_and_lane_valid_lengths():
     model.get_audio_feature = lambda items: items
     encode_funcs = _MiMoV2MultimodalMixin.get_multimodal_encode_funcs(model)
     assert set(encode_funcs) == {Modality.AUDIO}
+
+
+@pytest.mark.parametrize(
+    "mesh_shape, encoder_tp", [((1, 1), False), ((1, 4), False), ((2, 2), True)]
+)
+@pytest.mark.parametrize("windowed", [False, True])
+def test_vision_flat_api_matches_individual_images(monkeypatch, mesh_shape, encoder_tp, windowed):
+    if len(jax.devices()) < np.prod(mesh_shape):
+        pytest.skip("Set JAX_NUM_CPU_DEVICES=4 to cover empty and multiple lanes")
+    model, mesh = _tiny_mimo_model(
+        monkeypatch,
+        materialize=True,
+        mesh_shape=mesh_shape,
+        windowed=windowed,
+        encoder_tp=encoder_tp,
+    )
+    visual = model.visual
+    visual.input_buckets = (32,)
+    rng = np.random.default_rng(42)
+    items = [
+        MultimodalDataItem(
+            modality=Modality.IMAGE,
+            feature=rng.normal(size=(length, visual.patch_dim)).astype(np.float32),
+            placeholder_ranges=[(0, length // 4)],
+            model_specific_data={"image_grid_thw": np.asarray(grid)},
+        )
+        for length, grid in ((4, (1, 2, 2)), (24, (1, 4, 6)))
+    ]
+
+    expected = np.concatenate(
+        [np.asarray(model.get_image_feature([item]))[: len(item.feature) // 4] for item in items]
+    )
+    actual = np.asarray(model.get_image_feature(items))
+    np.testing.assert_allclose(actual[:7], expected, rtol=0.02, atol=0.02)
+    np.testing.assert_array_equal(actual[7:], 0)
+    np.testing.assert_array_equal(model.get_video_feature(items), actual)
+    visual.precompile()

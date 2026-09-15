@@ -14,7 +14,6 @@ placeholder-range helpers.  It differs in two ways:
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import copy
 import io
@@ -37,7 +36,7 @@ from sgl_jax.srt.multimodal.common.modality_enum import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sgl_jax.srt.multimodal.processors.qwen_vl import QwenVLProcessor
+from sgl_jax.srt.multimodal.processors.qwen_vl import QwenVLProcessor, preprocess_video
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils.common_utils import resolve_vision_patch_buckets
 
@@ -192,7 +191,6 @@ class _MiMoAudioCodec:
 
 
 class MiMoV2Processor(QwenVLProcessor):
-    auto_mm_io_worker_num = 4
     auto_mm_processor_worker_num = 1
     supports_mm_processor_concurrency = False
     models = ("MiMoV2ForConditionalGeneration",)
@@ -241,31 +239,41 @@ class MiMoV2Processor(QwenVLProcessor):
         if sources and not self._has_audio:
             raise ValueError("This MiMoV2 checkpoint has no audio encoder.")
 
-        if has_vision:
-            output = await self._process_vision(image_data, input_text, request_obj)
-        else:
-            if self.normalize_data(image_data) or self.normalize_data(
-                getattr(request_obj, "video_data", None)
-            ):
-                raise ValueError("This MiMoV2 checkpoint has no vision encoder.")
-            output = await self.process_and_combine_mm_data_async(input_text)
+        image_sources = self.normalize_data(image_data)
+        video_data = self.normalize_data(getattr(request_obj, "video_data", None))
+        if not has_vision and (image_sources or video_data):
+            raise ValueError("This MiMoV2 checkpoint has no vision encoder.")
+        return await self.mm_processor_executor.run(
+            self._process_mm_data,
+            input_text,
+            image_sources,
+            video_data,
+            self._build_video_config(request_obj),
+            sources,
+        )
 
-        if not sources:
-            return output
-        codes = await self._run_io_async(lambda: [self._encode_audio(s) for s in sources])
-        self._merge_audio(output, codes)
+    def _process_mm_data(
+        self, input_text, image_sources, video_data, video_config, audio_sources, *, processor
+    ) -> MultimodalInputs:
+        if getattr(self.hf_config, "vision_config", None) is not None:
+            output = self._process_vision(
+                input_text, image_sources, video_data, video_config, processor=processor
+            )
+        else:
+            output = self.process_and_combine_mm_data(input_text, processor=processor)
+        if audio_sources:
+            self._merge_audio(output, [self._encode_audio(source) for source in audio_sources])
         return output
 
     # -- vision -----------------------------------------------------------
 
-    async def _process_vision(self, image_data, input_text, request_obj) -> MultimodalInputs:
-        image_sources = self.normalize_data(image_data)
-        video_data = self.normalize_data(getattr(request_obj, "video_data", None))
-        video_config = self._build_video_config(request_obj)
-        images, videos = await asyncio.gather(
-            self.load_images_async(image_sources),
-            self._load_videos_async(video_data, video_config),
-        )
+    def _process_vision(
+        self, input_text, image_sources, video_data, video_config, *, processor
+    ) -> MultimodalInputs:
+        images = [self.load_image(source) for source in image_sources]
+        videos = [
+            preprocess_video(self.unwrap_source(source), video_config) for source in video_data
+        ]
         processor_kwargs = {}
         if videos:
             processor_kwargs["videos_kwargs"] = {
@@ -297,10 +305,11 @@ class MiMoV2Processor(QwenVLProcessor):
                 "max_pixels": min(compiled_max_pixels, configured_max_pixels)
             }
 
-        return await self.process_and_combine_mm_data_async(
+        return self.process_and_combine_mm_data(
             input_text,
             images=images,
             videos=videos,
+            processor=processor,
             **processor_kwargs,
         )
 
