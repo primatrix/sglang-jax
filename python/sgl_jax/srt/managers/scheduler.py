@@ -499,6 +499,7 @@ class Scheduler(
             dp_size=self.dp_size,
             spec_algorithm=self.spec_algorithm,
             mesh=self.mesh,
+            embedding_pool=self.embedding_pool,
         )
         if self.pd == "pathways":
             self._pd_init_decode_extras()
@@ -733,6 +734,7 @@ class Scheduler(
         from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = self.tp_worker.get_memory_pool()
+        self.embedding_pool = self.tp_worker.get_embedding_pool()
         self.tree_cache = build_kv_cache(
             server_args=self.server_args,
             model_config=self.model_config,
@@ -1058,6 +1060,7 @@ class Scheduler(
                         dp_size=self.dp_size,
                         spec_algorithm=self.spec_algorithm,
                         mesh=self.mesh,
+                        embedding_pool=self.embedding_pool,
                     )
                     tmp_batch.forward_mode = ForwardMode.DUMMY_FIRST
                     tmp_batch.next_batch_sampling_info = (
@@ -1567,6 +1570,7 @@ class Scheduler(
             dp_size=self.dp_size,
             spec_algorithm=self.spec_algorithm,
             mesh=self.mesh,
+            embedding_pool=self.embedding_pool,
         )
         self.pending_dp_reqs = []
         self.chunked_reqs = [None] * self.dp_size
@@ -2259,6 +2263,7 @@ class Scheduler(
             chunked_reqs=chunked_reqs_per_dp,
             mesh=self.mesh,
             spec_algorithm=self.spec_algorithm,
+            embedding_pool=self.embedding_pool,
         )
 
         new_batch.prepare_for_extend()
@@ -2290,6 +2295,7 @@ class Scheduler(
                 dp_size=self.dp_size,
                 spec_algorithm=self.spec_algorithm,
                 mesh=self.mesh,
+                embedding_pool=self.embedding_pool,
             )
 
         new_batch.bid = acc_global_bid()
@@ -2429,6 +2435,7 @@ class Scheduler(
                 precompile_cache_loc_paddings,
                 self.page_size,
                 self.server_args.enable_static_lora,
+                num_encoder_lanes=_worker.get_num_encoder_lanes(),
             )
 
             if self.enable_overlap and not (self.pd and batch.forward_mode.is_extend()):
@@ -2585,6 +2592,7 @@ class Scheduler(
                 precompile_cache_loc_paddings,
                 self.page_size,
                 self.server_args.enable_static_lora,
+                num_encoder_lanes=self.tp_worker.get_num_encoder_lanes(),
             )
         else:
             model_worker_batch = batch.get_spec_model_worker_batch(

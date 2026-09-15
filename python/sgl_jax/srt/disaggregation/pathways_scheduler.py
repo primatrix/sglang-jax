@@ -396,7 +396,10 @@ class PathwaysPDSchedulerMixin:
         def _disp(b):
             _t0 = time.perf_counter()
             _mwb = b.get_model_worker_batch(
-                *paddings, self.page_size, self.server_args.enable_static_lora
+                *paddings,
+                self.page_size,
+                self.server_args.enable_static_lora,
+                num_encoder_lanes=worker.get_num_encoder_lanes(),
             )
             # logprob batches take the unfused path inside
             # forward_batch_generation, which host-materializes all logprob
@@ -1375,6 +1378,7 @@ class PathwaysPDSchedulerMixin:
         saved = (
             self.tree_cache,
             self.req_to_token_pool,
+            self.embedding_pool,
             self.token_to_kv_pool_allocator,
             self.mesh,
             self.running_batch,
@@ -1384,6 +1388,7 @@ class PathwaysPDSchedulerMixin:
         self.chunked_reqs = self.p_chunked_reqs[p_idx]
         self.tree_cache = self.p_trees[p_idx]
         self.req_to_token_pool = self.p_r2ts[p_idx]
+        self.embedding_pool = self.tp_workers_p[p_idx].get_embedding_pool()
         self.token_to_kv_pool_allocator = self.p_allocs[p_idx]
         self.max_total_num_tokens = self.tp_workers_p[p_idx].max_total_num_tokens
         self.mesh = self.p_meshes[p_idx]
@@ -1402,6 +1407,7 @@ class PathwaysPDSchedulerMixin:
             (
                 self.tree_cache,
                 self.req_to_token_pool,
+                self.embedding_pool,
                 self.token_to_kv_pool_allocator,
                 self.mesh,
                 self.running_batch,

@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import jax.numpy as jnp
@@ -20,7 +21,7 @@ def _read(pool, entry):
 def _write(pool, item_hash, emb):
     """Cache one item through the pool's packed writer."""
     emb = jnp.asarray(emb)
-    (entry,) = pool.write_packed((item_hash,), emb, (emb.shape[0],))
+    (entry,) = pool.write_packed([item_hash], emb, [emb.shape[0]])
     return entry
 
 
@@ -71,7 +72,7 @@ def test_write_packed_roundtrips_items_and_drops_padding():
         ]
     )
 
-    (entry,) = pool.write_packed((1,), packed, (3,))
+    (entry,) = pool.write_packed([1], packed, [3])
 
     assert entry is not None
     assert entry.length == 3
@@ -91,8 +92,8 @@ def test_write_packed_keeps_writer_shape_fixed_across_true_lengths():
         "_scatter_rows",
         wraps=embedding_pool_module._scatter_rows,
     ) as scatter:
-        pool.write_packed((1, 2), packed, (1, 3))
-        pool.write_packed((3,), packed, (2,))
+        pool.write_packed([1, 2], packed, [1, 3])
+        pool.write_packed([3], packed, [2])
 
     assert [call.args[1].shape for call in scatter.call_args_list] == [(8,), (8,)]
     assert [call.args[2].shape for call in scatter.call_args_list] == [
@@ -117,7 +118,7 @@ def test_write_packed_preserves_wide_feature_rows():
         ]
     )
 
-    (entry,) = pool.write_packed((1,), packed, (2,))
+    (entry,) = pool.write_packed([1], packed, [2])
 
     assert entry is not None
     np.testing.assert_array_equal(
@@ -136,9 +137,9 @@ def test_write_packed_scatter_once_and_skips_entries_evicted_during_planning():
         wraps=embedding_pool_module._scatter_rows,
     ) as scatter:
         entries = pool.write_packed(
-            (1, 2, 3),
+            [1, 2, 3],
             packed,
-            (1, 1, 1),
+            [1, 1, 1],
         )
 
     scatter.assert_called_once()
@@ -155,9 +156,9 @@ def test_write_packed_duplicate_hash_keeps_only_last_placement():
     packed = jnp.asarray([[10.0], [20.0]])
 
     first, last = pool.write_packed(
-        (1, 1),
+        [1, 1],
         packed,
-        (1, 1),
+        [1, 1],
     )
 
     assert first is None
@@ -172,9 +173,9 @@ def test_write_packed_oversized_item_does_not_disturb_other_entries():
     packed = jnp.asarray([[10.0], [11.0], [12.0], [20.0]])
 
     oversized, normal = pool.write_packed(
-        (1, 2),
+        [1, 2],
         packed,
-        (3, 1),
+        [3, 1],
     )
 
     assert oversized is None
@@ -191,3 +192,14 @@ def test_clear_resets_free_list():
     pool.clear()
     assert pool.lookup(1) is None
     assert len(pool._free_pages) == 4
+
+
+def test_pool_defers_reuse_until_device_read_finishes():
+    pool = EmbeddingPool(1, 2, 1, jnp.float32)
+    pool.write_packed([0], np.ones((2, 1)), [2])
+    lease = pool.acquire(0)
+    completed = False
+    lease.release(SimpleNamespace(is_ready=lambda: completed))
+    assert pool.write_packed([1], np.zeros((2, 1)), [2]) == [None]
+    completed = True
+    assert pool.write_packed([1], np.zeros((2, 1)), [2])[0] is not None

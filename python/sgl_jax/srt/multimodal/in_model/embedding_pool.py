@@ -19,10 +19,10 @@ is updated in place (eager ``.at[].set`` would copy the whole pool per write).
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
-from functools import partial
+from functools import partial, wraps
+from threading import RLock
 
 import jax
 import jax.numpy as jnp
@@ -44,6 +44,33 @@ class EmbeddingPoolEntry:
 
     page_ids: np.ndarray  # [num_pages_for_item], int32
     length: int
+
+
+def _locked(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self.lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
+
+class EmbeddingLease:
+    """Pin a cache entry from scheduling until its device read completes."""
+
+    def __init__(self, pool, entry):
+        self.pool = pool
+        self.entry = entry
+        self._released = False
+
+    def release(self, completion=None):
+        with self.pool.lock:
+            if not self._released:
+                self._released = True
+                self.pool.release(self.entry, completion)
+
+    def __del__(self):
+        self.release()
 
 
 @partial(jax.jit, donate_argnames=("buffer",))
@@ -81,6 +108,9 @@ class EmbeddingPool:
     ) -> None:
         if num_pages <= 0 or page_size <= 0:
             raise ValueError("embedding pool needs positive num_pages and page_size")
+        self.lock = RLock()
+        self._pins: dict[int, int] = {}
+        self._pending_reads: list[tuple[EmbeddingPoolEntry, jax.Array]] = []
         self.num_pages = num_pages
         self.page_size = page_size
         self.hidden = hidden
@@ -117,11 +147,17 @@ class EmbeddingPool:
 
     def _alloc(self, n_pages: int) -> np.ndarray | None:
         """Reserve ``n_pages`` pages, evicting LRU entries under pressure."""
-        while len(self._free_pages) < n_pages and self._entries:
-            _, evicted = self._entries.popitem(last=False)
-            self._free_pages = np.concatenate([self._free_pages, evicted.page_ids])
-        if len(self._free_pages) < n_pages:
+        self._reap_reads()
+        evictable = [
+            (key, entry) for key, entry in self._entries.items() if not self._pins.get(id(entry), 0)
+        ]
+        if len(self._free_pages) + sum(len(entry.page_ids) for _, entry in evictable) < n_pages:
             return None
+        for key, entry in evictable:
+            if len(self._free_pages) >= n_pages:
+                break
+            del self._entries[key]
+            self._free_pages = np.concatenate([self._free_pages, entry.page_ids])
         out = self._free_pages[:n_pages].copy()
         self._free_pages = self._free_pages[n_pages:]
         return out
@@ -134,6 +170,10 @@ class EmbeddingPool:
         """
         if n_pages > self.num_pages:
             return None
+        self._reap_reads()
+        previous = self._entries.get(item_hash)
+        if previous is not None and self._pins.get(id(previous), 0):
+            return None
         previous = self._entries.pop(item_hash, None)
         if previous is not None:
             self._free_pages = np.concatenate([self._free_pages, previous.page_ids])
@@ -144,6 +184,7 @@ class EmbeddingPool:
         return (page_ids[:, None] * self.page_size + np.arange(self.page_size)).reshape(-1)
 
     # -- public API --------------------------------------------------------
+    @_locked
     def lookup(self, item_hash: int) -> EmbeddingPoolEntry | None:
         """Return the entry for ``item_hash`` (moved to MRU) or ``None``."""
         entry = self._entries.pop(item_hash, None)
@@ -151,18 +192,51 @@ class EmbeddingPool:
             self._entries[item_hash] = entry
         return entry
 
+    def _unpin(self, entry):
+        key = id(entry)
+        count = self._pins[key] - 1
+        if count:
+            self._pins[key] = count
+        else:
+            del self._pins[key]
+
+    def _reap_reads(self):
+        pending = []
+        for entry, completion in self._pending_reads:
+            if completion.is_ready():
+                self._unpin(entry)
+            else:
+                pending.append((entry, completion))
+        self._pending_reads = pending
+
+    @_locked
+    def acquire(self, item_hash: int) -> EmbeddingLease | None:
+        self._reap_reads()
+        entry = self.lookup(item_hash)
+        if entry is None:
+            return None
+        self._pins[id(entry)] = self._pins.get(id(entry), 0) + 1
+        return EmbeddingLease(self, entry)
+
+    @_locked
+    def release(self, entry, completion=None):
+        if completion is not None and not completion.is_ready():
+            self._pending_reads.append((entry, completion))
+        else:
+            self._unpin(entry)
+
+    @_locked
     def write_packed(
         self,
-        item_hashes: Sequence[int],
+        item_hashes: list[int],
         packed_embeddings: ArrayLike,
-        lengths: Sequence[int],
+        lengths: list[int],
         *,
-        write_mask: Sequence[bool] | None = None,
-    ) -> tuple[EmbeddingPoolEntry | None, ...]:
+        write_mask: list[bool] | None = None,
+    ) -> list[EmbeddingPoolEntry | None]:
         """Cache one padded encoder output whose items are packed in input order."""
-        item_hashes = tuple(map(int, item_hashes))
-        lengths = tuple(map(int, lengths))
-        write_mask = (True,) * len(lengths) if write_mask is None else tuple(map(bool, write_mask))
+        if write_mask is None:
+            write_mask = [True] * len(lengths)
         if len(item_hashes) != len(lengths):
             raise ValueError(f"item/length count mismatch: {len(item_hashes)} != {len(lengths)}")
         if len(write_mask) != len(lengths):
@@ -181,6 +255,7 @@ class EmbeddingPool:
         planned: list[tuple[int, EmbeddingPoolEntry, int, int] | None] = []
         offset = 0
         for item_hash, length, should_write in zip(item_hashes, lengths, write_mask, strict=True):
+            item_hash, length = int(item_hash), int(length)
             page_ids = self._reserve(item_hash, self._pages_for(length)) if should_write else None
             if page_ids is None:
                 planned.append(None)
@@ -206,8 +281,9 @@ class EmbeddingPool:
         if any(entry is not None and entry.length for entry in results):
             slots = self._replicate(slots)
             self._pages = _scatter_rows(self._pages, slots, packed_embeddings)
-        return tuple(results)
+        return results
 
+    @_locked
     def precompile_packed_write(self, capacity: int) -> None:
         """Compile the packed writer for one encoder bucket without changing LRU state."""
         if capacity <= 0:
@@ -218,7 +294,11 @@ class EmbeddingPool:
             self._pages = _scatter_rows(self._pages, slots, rows)
             jax.block_until_ready(self._pages)
 
+    @_locked
     def clear(self) -> None:
         """Free all pages (buffers are kept; only the free-list/table reset)."""
+        self._reap_reads()
+        if self._pins:
+            raise RuntimeError("cannot clear embedding pool with active reads or scheduled batches")
         self._entries.clear()
         self._free_pages = np.arange(self.num_pages, dtype=np.int32)

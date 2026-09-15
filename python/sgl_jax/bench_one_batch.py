@@ -66,6 +66,7 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 from sgl_jax.srt.managers.schedule_batch import Req, ScheduleBatch
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.model_executor.model_runner import ModelRunner
+from sgl_jax.srt.multimodal.in_model.lane_packing import encoder_num_lanes
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
@@ -260,6 +261,7 @@ def extend(reqs, model_runner):
         dp_size=1,
         enable_custom_logit_processor=False,
         chunked_reqs=None,
+        embedding_pool=model_runner.embedding_pool,
     )
     batch.prepare_for_extend()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
@@ -309,6 +311,10 @@ def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg:
         [cache_loc_needed],
         page_size,
         False,
+        num_encoder_lanes=encoder_num_lanes(
+            model_runner.mesh,
+            tensor_parallel=model_runner.model_config.hf_config.vision_encoder_parallel == "tp",
+        ),
     )
 
     # Prepare attention forward metadata (required by FlashAttention backend)
@@ -319,7 +325,11 @@ def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg:
     logits_metadata = LogitsMetadata.from_model_worker_batch(
         model_worker_batch, mesh=model_runner.mesh
     )
-    logits_output, _ = model_runner.forward(forward_batch, logits_metadata=logits_metadata)
+    logits_output, _ = model_runner.forward(
+        forward_batch,
+        logits_metadata=logits_metadata,
+        multimodal_batch=model_worker_batch.multimodal_batch,
+    )
 
     pad_size = len(model_worker_batch.seq_lens) - model_worker_batch.real_bs
     sampling_metadata = SamplingMetadata.from_model_worker_batch(

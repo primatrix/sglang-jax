@@ -44,7 +44,9 @@ def _validate_vision_items(items: list[MultimodalDataItem], merge_unit: int) -> 
             )
 
 
-def encoder_num_lanes(mesh: Mesh, tensor_parallel: bool) -> int:
+def encoder_num_lanes(mesh: Mesh | None, tensor_parallel: bool) -> int:
+    if mesh is None:
+        return 1
     data_size = int(mesh.shape.get("data", 1))
     tensor_size = int(mesh.shape.get("tensor", 1))
     return data_size * (1 if tensor_parallel else tensor_size)
@@ -115,8 +117,7 @@ def _build_output_indices(lengths, output_starts, output_size, merge_unit):
 
 
 def pack_lanes(
-    items: list[MultimodalDataItem],
-    num_lanes: int,
+    items_per_lane: list[list[MultimodalDataItem]],
     *,
     buckets: tuple[int, ...],
     merge_unit: int,
@@ -124,12 +125,18 @@ def pack_lanes(
     dtype: np.dtype | type | None = None,
 ) -> tuple[jax.Array, jax.Array, list[list[int]]]:
 
-    with jax.profiler.TraceAnnotation("encoder_pack_lane_plan"):
+    num_lanes = len(items_per_lane)
+    items = [item for lane in items_per_lane for item in lane]
+    lanes = []
+    offset = 0
+    for lane in items_per_lane:
+        lanes.append(list(range(offset, offset + len(lane))))
+        offset += len(lane)
+    with jax.profiler.TraceAnnotation("encoder_pack_layout"):
         if not items:
             raise ValueError("cannot pack an empty multimodal batch")
         item_features = [np.asarray(item.feature) for item in items]
         lengths = np.asarray([feature.shape[0] for feature in item_features], dtype=np.int32)
-        lanes = balance_lanes(lengths.tolist(), num_lanes)
         lane_loads = [sum(int(lengths[index]) for index in lane) for lane in lanes]
         cap = _bucket_capacity(max(lane_loads), buckets, merge_unit)
         feature_shape = item_features[0].shape[1:]
@@ -173,19 +180,19 @@ def pack_lanes(
 
 
 def pack_vision_inputs(
-    items: list[MultimodalDataItem],
+    items_per_lane: list[list[MultimodalDataItem]],
     *,
-    num_lanes: int,
     buckets: tuple[int, ...],
     merge_unit: int,
     input_sharding: NamedSharding,
     dtype: np.dtype | type | None = None,
 ) -> tuple[jax.Array, jax.Array, np.ndarray]:
+    num_lanes = len(items_per_lane)
+    items = [item for lane in items_per_lane for item in lane]
     with jax.profiler.TraceAnnotation("encoder_pack_validate"):
         _validate_vision_items(items, merge_unit)
     features, output_indices, lanes = pack_lanes(
-        items,
-        num_lanes,
+        items_per_lane,
         buckets=buckets,
         merge_unit=merge_unit,
         input_sharding=input_sharding,
@@ -203,15 +210,16 @@ def pack_vision_inputs(
 
 
 def pack_2d_position_inputs(
-    items: list[MultimodalDataItem],
+    items_per_lane: list[list[MultimodalDataItem]],
     *,
-    num_lanes: int,
     buckets: tuple[int, ...],
     merge_unit: int,
     input_sharding: NamedSharding,
     dtype: np.dtype | type | None = None,
 ) -> tuple[jax.Array, jax.Array, np.ndarray, np.ndarray]:
     """Pack vision inputs that carry explicit per-patch 2D positions."""
+    num_lanes = len(items_per_lane)
+    items = [item for lane in items_per_lane for item in lane]
     item_positions = []
     for item_index, item in enumerate(items):
         positions_value = item.get("pixel_position_ids")
@@ -242,8 +250,7 @@ def pack_2d_position_inputs(
         item_positions.append(positions)
 
     features, output_indices, lanes = pack_lanes(
-        items,
-        num_lanes,
+        items_per_lane,
         buckets=buckets,
         merge_unit=merge_unit,
         input_sharding=input_sharding,
@@ -278,6 +285,10 @@ def _restore_input_order(
     out_sharding: NamedSharding,
 ) -> jax.Array:
     output = output.reshape(-1, output.shape[-1])
+    # Replicate lane outputs before indexing, rather than all-reducing a full
+    # reordered output from every lane. Keep sharded consumers on their path.
+    if out_sharding.is_fully_replicated:
+        output = jax.sharding.reshard(output, out_sharding)
     mask = output_indices >= 0
     indices = jnp.maximum(output_indices, 0)
     output = output.at[indices].get(out_sharding=out_sharding)
@@ -314,7 +325,7 @@ def restore_encoder_output(
 
 def run_mrope_vision_model(
     vision_model,
-    items: list[MultimodalDataItem],
+    items_per_lane: list[list[MultimodalDataItem]],
     *,
     mesh: Mesh,
     num_lanes: int,
@@ -330,13 +341,14 @@ def run_mrope_vision_model(
     plus ``capacity`` and ``sharding`` and returns a dict of model-specific device arrays.
     Patches are flat; metadata arrays retain their field shapes. Both use
     contiguous lane slices following ``input_sharding``.
-    The restored encoder output uses ``output_sharding``.
+    The output follows lane-major item order and uses ``output_sharding``.
     Patches retain their input dtype; the model casts them inside its encode JIT.
     """
+    if len(items_per_lane) != num_lanes:
+        raise ValueError("item lane count does not match the encoder topology")
     if rope_type == "rope_2d_packed":
         patches, output_indices, position_ids, patch_counts = pack_2d_position_inputs(
-            items,
-            num_lanes=num_lanes,
+            items_per_lane,
             buckets=buckets,
             merge_unit=merge_unit,
             input_sharding=input_sharding,
@@ -344,8 +356,7 @@ def run_mrope_vision_model(
         metadata_args = (position_ids, patch_counts)
     elif rope_type in ("rope_3d", "rope_2d"):
         patches, output_indices, grid_thw = pack_vision_inputs(
-            items,
-            num_lanes=num_lanes,
+            items_per_lane,
             buckets=buckets,
             merge_unit=merge_unit,
             input_sharding=input_sharding,
@@ -395,7 +406,7 @@ def precompile_mrope_vision_model(
         )
         output = run_mrope_vision_model(
             vision_model,
-            [item],
+            [[item]] + [[] for _ in range(num_lanes - 1)],
             mesh=mesh,
             num_lanes=num_lanes,
             buckets=buckets,

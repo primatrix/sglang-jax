@@ -8,7 +8,7 @@ from jax.sharding import Mesh
 
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 
-MultimodalEncodeFunc = Callable[[list[MultimodalDataItem]], jax.Array]
+MultimodalEncodeFunc = Callable[[list[list[MultimodalDataItem]]], jax.Array]
 MultimodalEncodeFuncs = Mapping[Modality, MultimodalEncodeFunc]
 
 
@@ -29,5 +29,5 @@ class InModelMultimodalContract(ABC):
         raise NotImplementedError
 
     def get_multimodal_encode_funcs(self) -> MultimodalEncodeFuncs:
-        """Return per-modality encoders producing padded, item-ordered arrays."""
+        """Return encoders accepting items per lane, with outputs in lane-major item order."""
         return {}

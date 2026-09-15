@@ -653,17 +653,17 @@ class Qwen3VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         unit = self.visual.spatial_merge_unit
         return tuple(rows * bucket // unit for bucket in self.visual.input_buckets)
 
-    def get_image_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
-        return self._get_visual_feature(items)
+    def get_image_feature(self, items_per_lane: list[list[MultimodalDataItem]]) -> jax.Array:
+        return self._get_visual_feature(items_per_lane)
 
-    def get_video_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
-        return self._get_visual_feature(items)
+    def get_video_feature(self, items_per_lane: list[list[MultimodalDataItem]]) -> jax.Array:
+        return self._get_visual_feature(items_per_lane)
 
-    def _get_visual_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
+    def _get_visual_feature(self, items_per_lane: list[list[MultimodalDataItem]]) -> jax.Array:
         num_lanes = encoder_num_lanes(self.mesh, self.visual.vision_tp)
         return run_mrope_vision_model(
             self.visual,
-            items,
+            items_per_lane,
             mesh=self.mesh,
             num_lanes=num_lanes,
             buckets=self.visual.input_buckets,

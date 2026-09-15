@@ -96,6 +96,12 @@ class ModelWorkerClient:
     def get_kv_cache(self):
         return self.worker.model_runner.token_to_kv_pool
 
+    def get_embedding_pool(self):
+        return self.worker.get_embedding_pool()
+
+    def get_num_encoder_lanes(self):
+        return self.worker.get_num_encoder_lanes()
+
     def get_max_padded_size(self):
         return self.worker.get_max_padded_size()
 
