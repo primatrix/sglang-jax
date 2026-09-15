@@ -338,3 +338,89 @@ def test_gemma4_overflow_bucket_preserves_nine_patch_pooling_groups():
     expected = jnp.concatenate([encode([item]) for item in items])
     np.testing.assert_allclose(actual[:4], expected, rtol=1e-5, atol=1e-5)
     np.testing.assert_array_equal(actual[4:], 0)
+
+
+def test_default_precompile_covers_two_images_per_lane_without_retracing(monkeypatch):
+    from sgl_jax.srt.multimodal.in_model.lane_packing import run_mrope_vision_model
+
+    traces = []
+    original = Gemma4VisionModel._forward
+
+    def record_trace(self, patches, metadata):
+        traces.append(patches.shape)
+        return original(self, patches, metadata)
+
+    monkeypatch.setattr(Gemma4VisionModel, "_forward", record_trace)
+    mesh = _mesh()
+    with jax.set_mesh(mesh):
+        model = Gemma4VisionModel(
+            _vision_config(),
+            text_hidden_size=12,
+            dtype=jnp.float32,
+            rngs=None,
+            mesh=mesh,
+            vision_tp=False,
+        )
+    model.precompile()
+    precompiled_traces = len(traces)
+    items = [_item(6, 3), _item(6, 3)]
+    output = run_mrope_vision_model(
+        model,
+        items,
+        mesh=mesh,
+        num_lanes=1,
+        buckets=model.input_buckets,
+        merge_unit=9,
+        rope_type="rope_2d_packed",
+        input_sharding=model.specs.sharding(model.specs.batch_axis),
+        output_sharding=model.specs.sharding(),
+    )
+    jax.block_until_ready(output)
+    assert len(traces) == precompiled_traces, "two-image batch missed startup precompile"
+    assert output.shape == (4, 12), "two-image batch should not use an oversized fallback"
+
+
+def test_lane_packing_restores_distinct_images_across_devices():
+    import pytest
+
+    from sgl_jax.srt.multimodal.in_model.lane_packing import run_mrope_vision_model
+
+    if len(jax.devices()) < 8:
+        pytest.skip(
+            "requires eight devices; set XLA_FLAGS=--xla_force_host_platform_device_count=8"
+        )
+    mesh = Mesh(
+        np.asarray(jax.devices()[:8]).reshape(4, 2),
+        ("data", "tensor"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit),
+    )
+    with jax.set_mesh(mesh):
+        model = Gemma4VisionModel(
+            _vision_config(),
+            text_hidden_size=12,
+            dtype=jnp.float32,
+            rngs=None,
+            mesh=mesh,
+            vision_tp=False,
+        )
+    items = [_item(3 if i % 3 == 0 else 6, 3) for i in range(13)]
+    for i, item in enumerate(items):
+        item.feature[:] = 0.1 + i * 0.05
+
+    def encode(batch):
+        return run_mrope_vision_model(
+            model,
+            batch,
+            mesh=mesh,
+            num_lanes=8,
+            buckets=model.input_buckets,
+            merge_unit=9,
+            rope_type="rope_2d_packed",
+            input_sharding=model.specs.sharding(model.specs.batch_axis),
+            output_sharding=model.specs.sharding(),
+        )
+
+    actual = encode(items)
+    expected = jnp.concatenate([encode([item])[: len(item.feature) // 9] for item in items])
+    np.testing.assert_allclose(actual[: len(expected)], expected, rtol=1e-5, atol=1e-5)
+    np.testing.assert_array_equal(actual[len(expected) :], 0)

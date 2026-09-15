@@ -417,7 +417,10 @@ class Gemma4VisionModel(nnx.Module):
         self.pooling_kernel_size = int(config.pooling_kernel_size)
         self.pooling_unit = self.pooling_kernel_size**2
         default_capacity = int(config.default_output_length) * self.pooling_unit
-        buckets = input_buckets or (default_capacity,)
+        # Prefill batches can place two images on one vision lane. Warm both
+        # capacities so the first such batch does not compile an oversized
+        # power-of-two fallback while requests are waiting.
+        buckets = input_buckets or (default_capacity, 2 * default_capacity)
         self.input_buckets = tuple(
             sorted(
                 {
