@@ -27,7 +27,7 @@ def request(tokens, output=()):
         is_chunked=0,
         prefix_indices=np.empty(0, np.int32),
         extra_key=None,
-        lora_id=None,
+        lora_id="0",
         return_logprob=False,
         return_hidden_states=False,
         mm_inputs=None,
@@ -57,6 +57,43 @@ def allocate(cache, req, length):
     assert slots is not None
     pool.req_to_token[req.req_pool_idx, prefix:length] = slots
     req.kv_committed_len = req.kv_allocated_len = length
+
+
+def test_real_base_model_request_can_attach(cache):
+    from sgl_jax.srt.managers.schedule_batch import Req
+    from sgl_jax.srt.sampling.sampling_params import SamplingParams
+
+    req = Req("base-model", "", [1, 2, 3], SamplingParams())
+    assert req.lora_id == "0"
+    cache.attach(req, {"id": "a"})
+    assert cache.sessions.sessions["a"].active is req
+    assert req.session_id == "a"
+
+
+@pytest.mark.parametrize("lora_id", [None, "0"])
+def test_base_model_markers_can_attach(cache, lora_id):
+    req = request([1, 2, 3])
+    req.lora_id = lora_id
+    cache.attach(req, {"id": "a"})
+    assert req.session_id == "a"
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("lora_id", "adapter-1"),
+        ("return_logprob", True),
+        ("return_hidden_states", True),
+        ("mm_inputs", {"image": "present"}),
+    ],
+)
+def test_unsupported_requests_rejected_before_session_acquisition(cache, field, value):
+    req = request([1, 2, 3])
+    setattr(req, field, value)
+    with pytest.raises(ValueError, match="text-only, base-model"):
+        cache.attach(req, {"id": "a"})
+    assert req.session_id is None
+    assert not cache.sessions.sessions
 
 
 def finish(cache, req, reason="length"):

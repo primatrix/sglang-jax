@@ -32,7 +32,13 @@ class DeepseekV4SessionCache(DeepseekV4ChunkCache):
             raise ValueError('Use session_params={"id": "..."} with full input each turn')
         # Logprob/hidden-state requests can require recomputing the prompt.
         # LoRA and multimodal continuation need their own cache identity rules.
-        if req.lora_id or req.return_logprob or req.return_hidden_states or req.mm_inputs:
+        # Req normalizes an absent adapter to the base-model sentinel "0".
+        if (
+            req.lora_id not in (None, "0")
+            or req.return_logprob
+            or req.return_hidden_states
+            or req.mm_inputs
+        ):
             raise ValueError("V4 sessions currently support text-only, base-model generation")
         self.sessions.acquire(params["id"], req)
         req.session_id = params["id"]
