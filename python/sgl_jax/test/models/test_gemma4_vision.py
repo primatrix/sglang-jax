@@ -302,3 +302,39 @@ def test_shared_vision_runner_restores_images_and_precompiles():
     expected = jnp.concatenate([encode([item]) for item in items])
     np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
     model.precompile()
+
+
+def test_gemma4_overflow_bucket_preserves_nine_patch_pooling_groups():
+    from sgl_jax.srt.multimodal.in_model.lane_packing import run_mrope_vision_model
+
+    mesh = _mesh()
+    with jax.set_mesh(mesh):
+        model = Gemma4VisionModel(
+            _vision_config(),
+            text_hidden_size=12,
+            dtype=jnp.float32,
+            rngs=None,
+            mesh=mesh,
+            vision_tp=False,
+            input_buckets=(18,),
+        )
+    items = [_item(6, 3), _item(6, 3)]
+    items[1].feature[:] = 0.75
+
+    def encode(items):
+        return run_mrope_vision_model(
+            model,
+            items,
+            mesh=mesh,
+            num_lanes=1,
+            buckets=model.input_buckets,
+            merge_unit=9,
+            rope_type="rope_2d_packed",
+            input_sharding=model.specs.sharding(model.specs.batch_axis),
+            output_sharding=model.specs.sharding(),
+        )
+
+    actual = encode(items)
+    expected = jnp.concatenate([encode([item]) for item in items])
+    np.testing.assert_allclose(actual[:4], expected, rtol=1e-5, atol=1e-5)
+    np.testing.assert_array_equal(actual[4:], 0)
