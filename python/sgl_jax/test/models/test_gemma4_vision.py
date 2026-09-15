@@ -274,7 +274,7 @@ def test_shared_vision_runner_restores_images_and_precompiles():
     mesh = _mesh()
     with jax.set_mesh(mesh):
         model = Gemma4VisionModel(
-            _vision_config(),
+            _vision_config(standardize=False),
             text_hidden_size=12,
             dtype=jnp.float32,
             rngs=None,
@@ -310,7 +310,7 @@ def test_gemma4_overflow_bucket_preserves_nine_patch_pooling_groups():
     mesh = _mesh()
     with jax.set_mesh(mesh):
         model = Gemma4VisionModel(
-            _vision_config(),
+            _vision_config(standardize=False),
             text_hidden_size=12,
             dtype=jnp.float32,
             rngs=None,
@@ -396,7 +396,7 @@ def test_lane_packing_restores_distinct_images_across_devices():
     )
     with jax.set_mesh(mesh):
         model = Gemma4VisionModel(
-            _vision_config(),
+            _vision_config(num_hidden_layers=1, standardize=False),
             text_hidden_size=12,
             dtype=jnp.float32,
             rngs=None,
@@ -420,6 +420,7 @@ def test_lane_packing_restores_distinct_images_across_devices():
             output_sharding=model.specs.sharding(),
         )
 
+    assert not np.allclose(encode([items[1]])[0], encode([items[2]])[0])
     actual = encode(items)
     expected = jnp.concatenate([encode([item])[: len(item.feature) // 9] for item in items])
     np.testing.assert_allclose(actual[: len(expected)], expected, rtol=1e-5, atol=1e-5)

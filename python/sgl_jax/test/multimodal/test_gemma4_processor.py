@@ -104,3 +104,35 @@ def test_gemma4_processor_rejects_unsupported_modalities(field):
 
     with pytest.raises(ValueError, match="not supported"):
         asyncio.run(processor.process_mm_data_async(None, "prompt", request))
+
+
+def test_gemma4_requests_use_concurrent_worker_local_processors(monkeypatch):
+    import threading
+
+    processor = Gemma4Processor(
+        _config(), SimpleNamespace(mm_processor_worker_num=2), _FakeProcessor({})
+    )
+    barrier = threading.Barrier(2, timeout=5)
+    calls = []
+    monkeypatch.setattr(processor, "load_image", lambda item: item)
+
+    def combine(input_text, *, images, processor, **kwargs):
+        calls.append((id(processor), threading.get_ident()))
+        barrier.wait()
+        return input_text
+
+    monkeypatch.setattr(processor, "process_and_combine_mm_data", combine)
+
+    async def run():
+        request = SimpleNamespace(video_data=None, audio_data=None)
+        return await asyncio.gather(
+            processor.process_mm_data_async("image-a", "request-a", request),
+            processor.process_mm_data_async("image-b", "request-b", request),
+        )
+
+    try:
+        assert asyncio.run(run()) == ["request-a", "request-b"]
+        assert len({call[0] for call in calls}) == 2
+        assert len({call[1] for call in calls}) == 2
+    finally:
+        processor.shutdown()
