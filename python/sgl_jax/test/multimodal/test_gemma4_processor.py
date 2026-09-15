@@ -49,7 +49,7 @@ def test_gemma4_processor_builds_dynamic_image_item(monkeypatch):
         }
     )
     processor = Gemma4Processor(_config(), SimpleNamespace(), hf_processor)
-    monkeypatch.setattr(processor, "_load_images", _one_image)
+    monkeypatch.setattr(processor, "load_image", lambda item: object())
     request = SimpleNamespace(video_data=None, audio_data=None)
 
     result = asyncio.run(
@@ -71,7 +71,7 @@ def test_gemma4_processor_builds_dynamic_image_item(monkeypatch):
     assert item.placeholder_ranges == [(1, 2)]
     np.testing.assert_array_equal(item.get("pixel_position_ids"), position_ids[:9])
     assert item.pad_value is not None
-    assert hf_processor.calls[0]["return_tensors"] == "pt"
+    processor.shutdown()
 
 
 def test_gemma4_processor_accepts_vllm_position_name(monkeypatch):
@@ -83,7 +83,7 @@ def test_gemma4_processor_accepts_vllm_position_name(monkeypatch):
         }
     )
     processor = Gemma4Processor(_config(), SimpleNamespace(), hf_processor)
-    monkeypatch.setattr(processor, "_load_images", _one_image)
+    monkeypatch.setattr(processor, "load_image", lambda item: object())
 
     result = asyncio.run(
         processor.process_mm_data_async(

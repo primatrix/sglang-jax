@@ -18,10 +18,9 @@ from sgl_jax.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.multimodal.in_model.lane_packing import (
     encoder_num_lanes,
-    put_sharded_batch,
+    precompile_mrope_vision_model,
 )
 from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
-    VisionAttentionMetadata,
     make_vision_attention_backend,
 )
 from sgl_jax.srt.multimodal.layers.vision_sharding import VisionShardSpecs
@@ -30,12 +29,25 @@ POSITIONS_PAD_VALUE = -1
 
 
 @dataclasses.dataclass
+class Gemma4AttentionMetadata:
+    cu_seqlens: Any
+    max_seq_len: int
+
+
+jax.tree_util.register_dataclass(
+    Gemma4AttentionMetadata,
+    data_fields=["cu_seqlens"],
+    meta_fields=["max_seq_len"],
+)
+
+
+@dataclasses.dataclass
 class Gemma4VisionMetadata:
     """Bucket-shaped host metadata consumed by the Gemma 4 vision tower."""
 
     position_ids: Any  # int32[B, patch_capacity, 2]
     pool_indices: Any  # int32[B, patch_capacity], -1 for padding
-    attention: VisionAttentionMetadata
+    attention: Gemma4AttentionMetadata
 
 
 jax.tree_util.register_dataclass(
@@ -213,7 +225,7 @@ class Gemma4VisionAttention(nnx.Module):
         self,
         hidden_states: jax.Array,
         position_ids: jax.Array,
-        attention: VisionAttentionMetadata,
+        attention: Gemma4AttentionMetadata,
     ) -> jax.Array:
         batch, length, _ = hidden_states.shape
         col = self.specs.sharding(
@@ -252,7 +264,22 @@ class Gemma4VisionAttention(nnx.Module):
             self.dtype
         )
         v = self.v_norm(v).astype(self.dtype)
-        output = self.backend(q, k, v, attention)
+        flat_head_sharding = self.specs.sharding(
+            self.specs.batch_axis, self.specs.tensor_axis, None
+        )
+        q, k, v = (
+            value.reshape(-1, value.shape[-2], self.head_dim, out_sharding=flat_head_sharding)
+            for value in (q, k, v)
+        )
+        output = self.backend(
+            q,
+            k,
+            v,
+            attention.cu_seqlens.reshape(
+                -1, out_sharding=self.specs.sharding(self.specs.batch_axis)
+            ),
+            max_seq_len=attention.max_seq_len,
+        )
         output = output.reshape(
             batch,
             length,
@@ -470,8 +497,8 @@ class Gemma4VisionModel(nnx.Module):
         )
         return pooled * math.sqrt(hidden_size), mask > 0
 
-    def __call__(self, patches, position_ids, patch_counts):
-        return self.encode(patches, position_ids, patch_counts)
+    def __call__(self, patches, *, metadata):
+        return self.encode(patches, metadata=metadata)
 
     def _forward(self, patches, metadata: Gemma4VisionMetadata):
         hidden_states = self.patch_embedder(patches, metadata.position_ids)
@@ -549,41 +576,42 @@ class Gemma4VisionModel(nnx.Module):
         return Gemma4VisionMetadata(
             position_ids=position_ids,
             pool_indices=pool_indices,
-            attention=VisionAttentionMetadata(cu_seqlens, max_seq_len=capacity),
+            attention=Gemma4AttentionMetadata(cu_seqlens, max_seq_len=capacity),
         )
 
     @jax.jit
-    def _encode_jit(self, patches, metadata):
-        return self._forward(patches, metadata)
-
-    def encode(self, patches, position_ids, patch_counts):
-        patches = put_sharded_batch(patches, self.mesh, self.specs.batch_axis)
-        metadata = put_sharded_batch(
-            self._build_metadata(position_ids, patch_counts),
-            self.mesh,
-            self.specs.batch_axis,
+    def encode(self, patches, *, metadata):
+        lanes = encoder_num_lanes(self.mesh, self.vision_tp)
+        patches = patches.reshape(
+            lanes,
+            -1,
+            self.patch_dim,
+            out_sharding=self.specs.sharding(self.specs.batch_axis),
+        ).astype(self.dtype)
+        output = self._forward(patches, metadata)
+        return output.reshape(
+            -1, output.shape[-1], out_sharding=self.specs.sharding(self.specs.batch_axis)
         )
-        if self.mesh is None:
-            return self._encode_jit(patches, metadata)
-        with jax.set_mesh(self.mesh):
-            return self._encode_jit(patches, metadata)
+
+    def prepare_metadata(self, position_ids, patch_counts, *, capacity, sharding):
+        if position_ids.shape[1] != capacity:
+            raise ValueError("Gemma 4 position capacity does not match packed patches")
+        metadata = self._build_metadata(position_ids, patch_counts)
+        return {"metadata": jax.device_put(metadata, sharding)}
 
     def get_packed_capacities(self) -> tuple[int, ...]:
         rows = encoder_num_lanes(self.mesh, self.vision_tp)
         return tuple(rows * capacity // self.pooling_unit for capacity in self.input_buckets)
 
     def precompile(self) -> None:
-        num_lanes = encoder_num_lanes(self.mesh, self.vision_tp)
-        kernel = self.pooling_kernel_size
-        for capacity in self.input_buckets:
-            rows, columns = kernel, capacity // kernel
-            y, x = np.indices((rows, columns))
-            patches = np.zeros(
-                (num_lanes, capacity, self.patch_dim),
-                dtype=np.float32,
-            )
-            position_ids = np.full((num_lanes, capacity, 2), POSITIONS_PAD_VALUE, dtype=np.int32)
-            position_ids[0] = np.stack((x, y), axis=-1).reshape(-1, 2)
-            patch_counts = np.zeros((num_lanes, 1), dtype=np.int32)
-            patch_counts[0, 0] = capacity
-            jax.block_until_ready(self.encode(patches, position_ids, patch_counts))
+        precompile_mrope_vision_model(
+            self,
+            mesh=self.mesh,
+            num_lanes=encoder_num_lanes(self.mesh, self.vision_tp),
+            buckets=self.input_buckets,
+            patch_dim=self.patch_dim,
+            merge_unit=self.pooling_unit,
+            rope_type="rope_2d_packed",
+            input_sharding=self.specs.sharding(self.specs.batch_axis),
+            output_sharding=self.specs.sharding(),
+        )

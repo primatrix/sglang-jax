@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-
 import numpy as np
 
 from sgl_jax.srt.multimodal.common.modality_enum import (
@@ -16,6 +14,8 @@ from sgl_jax.srt.multimodal.processors.base_processor import BaseMultimodalProce
 
 class Gemma4Processor(BaseMultimodalProcessor):
     models = ("Gemma4ForConditionalGeneration",)
+    auto_mm_processor_worker_num = 2
+    supports_mm_processor_concurrency = True
 
     @staticmethod
     def _to_numpy(value):
@@ -56,13 +56,17 @@ class Gemma4Processor(BaseMultimodalProcessor):
         if self.normalize_data(getattr(request_obj, "audio_data", None)):
             raise ValueError("Gemma 4 audio inputs are not supported yet.")
 
-        images = await self._load_images(image_data)
-        processor_output = self.processor(
-            text=[input_text],
-            images=images or None,
-            padding=True,
-            return_tensors="pt",
+        return await self.mm_processor_executor.run(self._process_request, image_data, input_text)
+
+    def _process_request(self, image_data, input_text, *, processor):
+        images = [self.load_image(item) for item in self.normalize_data(image_data)]
+        return self.process_and_combine_mm_data(
+            input_text, images=images, processor=processor, return_tensors="pt"
         )
+
+    def collect_mm_items_from_processor_output(
+        self, processor_output, images=None, videos=None, audios=None, **kwargs
+    ) -> MultimodalInputs:
         input_ids_array = self._to_numpy(processor_output.get("input_ids"))
         if input_ids_array is None:
             raise ValueError("Gemma 4 processor did not return input_ids.")
@@ -137,9 +141,4 @@ class Gemma4Processor(BaseMultimodalProcessor):
             im_start_id=getattr(self.hf_config, "boi_token_id", None),
             im_end_id=getattr(self.hf_config, "eoi_token_id", None),
             im_token_id=image_token_id,
-        )
-
-    async def _load_images(self, image_data):
-        return await asyncio.gather(
-            *(self.load_image_async(item) for item in self.normalize_data(image_data))
         )

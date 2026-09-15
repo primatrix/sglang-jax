@@ -15,7 +15,7 @@ from sgl_jax.srt.models.gemma4_vision import (
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 from sgl_jax.srt.multimodal.in_model.lane_packing import (
     encoder_num_lanes,
-    pack_lanes,
+    pack_2d_position_inputs,
     restore_encoder_output,
 )
 
@@ -62,22 +62,25 @@ def _item(width: int, height: int) -> MultimodalDataItem:
 
 def _pack(model, items):
     num_lanes = encoder_num_lanes(model.mesh, model.vision_tp)
-    packed = pack_lanes(
+    patches, indices, positions, counts = pack_2d_position_inputs(
         items,
-        num_lanes,
+        num_lanes=num_lanes,
         buckets=model.input_buckets,
         merge_unit=model.pooling_unit,
+        input_sharding=model.specs.sharding(model.specs.batch_axis),
     )
-    position_ids = np.full((num_lanes, packed.cap, 2), -1, dtype=np.int32)
-    patch_counts = np.zeros((num_lanes, max(map(len, packed.lanes))), dtype=np.int32)
-    for lane_index, lane in enumerate(packed.lanes):
-        offset = 0
-        for item_offset, item_index in enumerate(lane):
-            positions = items[item_index].get("pixel_position_ids")
-            position_ids[lane_index, offset : offset + len(positions)] = positions
-            patch_counts[lane_index, item_offset] = len(positions)
-            offset += len(positions)
-    return packed.features, position_ids, patch_counts, packed.output_indices
+    return patches, positions, counts, indices
+
+
+def _encode(model, patches, positions, counts):
+    metadata = model.prepare_metadata(
+        positions,
+        counts,
+        capacity=positions.shape[1],
+        sharding=model.specs.sharding(model.specs.batch_axis),
+    )
+    with jax.set_mesh(model.mesh):
+        return model.encode(patches, **metadata)
 
 
 def test_gemma4_config_builds_typed_vision_config():
@@ -156,7 +159,7 @@ def test_vision_tower_uses_varlen_backend_and_returns_item_ordered_array(monkeyp
     backend_options = {}
 
     class IdentityAttention:
-        def __call__(self, query, key, value, metadata):
+        def __call__(self, query, key, value, metadata, **kwargs):
             del key, value, metadata
             return query
 
@@ -183,8 +186,8 @@ def test_vision_tower_uses_varlen_backend_and_returns_item_ordered_array(monkeyp
 
     item = _item(3, 3)
     patches, position_ids, patch_counts, output_indices = _pack(model, [item])
-    output = model.encode(patches, position_ids, patch_counts)
-    packed = restore_encoder_output(output, output_indices, mesh)
+    output = _encode(model, patches, position_ids, patch_counts)
+    packed = restore_encoder_output(output, output_indices, model.specs.sharding())
 
     assert backend_options["use_varlen"] is True
     assert packed.shape == (1, 12)
@@ -200,7 +203,7 @@ def test_vision_attention_casts_projection_outputs_to_model_dtype(monkeypatch):
             return inputs.astype(jnp.float32), None
 
     class IdentityAttention:
-        def __call__(self, query, key, value, metadata):
+        def __call__(self, query, key, value, metadata, **kwargs):
             del metadata
             attention_dtypes.update(q=query.dtype, k=key.dtype, v=value.dtype)
             return query
@@ -228,8 +231,8 @@ def test_vision_attention_casts_projection_outputs_to_model_dtype(monkeypatch):
 
     item = _item(3, 3)
     patches, position_ids, patch_counts, output_indices = _pack(model, [item])
-    output = model.encode(patches, position_ids, patch_counts)
-    packed = restore_encoder_output(output, output_indices, mesh)
+    output = _encode(model, patches, position_ids, patch_counts)
+    packed = restore_encoder_output(output, output_indices, model.specs.sharding())
 
     assert attention_dtypes == {"q": jnp.bfloat16, "k": jnp.bfloat16, "v": jnp.bfloat16}
     assert bool(jnp.all(jnp.isfinite(packed)))
@@ -263,3 +266,39 @@ def test_vision_weight_mappings_match_gemma4_checkpoint_layout():
         == "visual.projector.embedding_projection.weight"
     )
     assert "model.vision_tower.std_scale" in mappings
+
+
+def test_shared_vision_runner_restores_images_and_precompiles():
+    from sgl_jax.srt.multimodal.in_model.lane_packing import run_mrope_vision_model
+
+    mesh = _mesh()
+    with jax.set_mesh(mesh):
+        model = Gemma4VisionModel(
+            _vision_config(),
+            text_hidden_size=12,
+            dtype=jnp.float32,
+            rngs=None,
+            mesh=mesh,
+            vision_tp=False,
+            input_buckets=(9, 18, 27),
+        )
+    items = [_item(3, 3), _item(6, 3)]
+    items[1].feature[:] = 0.75
+
+    def encode(items):
+        return run_mrope_vision_model(
+            model,
+            items,
+            mesh=mesh,
+            num_lanes=1,
+            buckets=model.input_buckets,
+            merge_unit=9,
+            rope_type="rope_2d_packed",
+            input_sharding=model.specs.sharding(model.specs.batch_axis),
+            output_sharding=model.specs.sharding(),
+        )
+
+    actual = encode(items)
+    expected = jnp.concatenate([encode([item]) for item in items])
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+    model.precompile()
