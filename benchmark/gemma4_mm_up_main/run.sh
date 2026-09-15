@@ -38,8 +38,15 @@ python -m pip show jax jaxlib libtpu transformers torch > "$ROOT/profiling/pytho
 SERVER_PID=""
 cleanup_server() {
   if test -n "$SERVER_PID"; then
-    kill "$SERVER_PID" 2>/dev/null || true
+    # The server spawns scheduler/detokenizer workers. Terminate the whole
+    # session so a later variant cannot share TPU resources with orphans.
+    kill -TERM -- "-$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
+    for i in $(seq 1 50); do
+      if ! kill -0 -- "-$SERVER_PID" 2>/dev/null; then break; fi
+      sleep 0.1
+    done
+    kill -KILL -- "-$SERVER_PID" 2>/dev/null || true
     SERVER_PID=""
   fi
 }
@@ -51,7 +58,7 @@ run_variant() {
   mkdir -p "$VARIANT_DIR"
   SERVER_LOG="$VARIANT_DIR/server.log"
 
-  python -u -m sgl_jax.launch_server \
+  setsid python -u -m sgl_jax.launch_server \
     --model-path "$MODEL_PATH" \
     --trust-remote-code --skip-server-warmup \
     --device tpu --tp-size 8 --dp-size 4 --attention-backend fa \
