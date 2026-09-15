@@ -71,7 +71,7 @@ all = [
 ]
 multimodal = [
     "torch",
-    "torchcodec",
+    "torchcodec>=0.16.0",
     "torchvision",
     "torchaudio",
     "decord",

@@ -25,6 +25,7 @@ from sgl_jax.srt.managers.schedule_batch import (
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.model_executor.model_runner import MockModelRunner, ModelRunner
+from sgl_jax.srt.multimodal.in_model.lane_packing import encoder_num_lanes
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.utils import get_exception_traceback
@@ -438,6 +439,16 @@ class ModelWorker:
             self.model_runner.token_to_kv_pool_allocator,
         )
 
+    def get_embedding_pool(self):
+        return self.model_runner.embedding_pool
+
+    def get_num_encoder_lanes(self):
+        runner = self.model_runner
+        return encoder_num_lanes(
+            runner.mesh,
+            tensor_parallel=runner.model_config.hf_config.vision_encoder_parallel == "tp",
+        )
+
     def _update_grammar_vocab_mask(
         self, batch: ModelWorkerBatch, sampling_metadata: SamplingMetadata
     ):
@@ -535,6 +546,7 @@ class ModelWorker:
         logits_output, cache_miss_count, layers_topk_ids = self.model_runner.forward(
             forward_batch,
             logits_metadata=logits_metadata,
+            multimodal_batch=model_worker_batch.multimodal_batch,
         )
 
         self.dump_topk_ids(layers_topk_ids, model_worker_batch)
@@ -793,6 +805,12 @@ class MockModelWorker:
 
     def get_memory_pool(self):
         return (self.model_runner.req_to_token_pool, self.model_runner.token_to_kv_pool)
+
+    def get_embedding_pool(self):
+        return self.model_runner.embedding_pool
+
+    def get_num_encoder_lanes(self):
+        return 1
 
     def forward_batch_generation(
         self,
