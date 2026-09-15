@@ -54,14 +54,13 @@ run_variant() {
   python -u -m sgl_jax.launch_server \
     --model-path "$MODEL_PATH" \
     --trust-remote-code --skip-server-warmup \
-    --device tpu --tp-size 8 --dp-size 4 \
+    --device tpu --tp-size 8 --dp-size 4 --attention-backend fa \
     --dtype bfloat16 --kv-cache-dtype bf16 \
     --context-length 2048 --max-seq-len 2048 \
     --max-running-requests 1024 \
     --max-prefill-tokens 16384 --chunked-prefill-size 4096 \
     --mem-fraction-static 0.9 --page-size 128 \
     --disable-radix-cache --vision-encoder-parallel dp \
-    --mm-embedding-cache-size-mb 256 --mm-embedding-page-size 64 \
     --mm-processor-worker-num 2 \
     --random-seed 0 --download-dir /tmp/tpu_logs/huggingface/hub \
     --host 0.0.0.0 --port 30000 \
