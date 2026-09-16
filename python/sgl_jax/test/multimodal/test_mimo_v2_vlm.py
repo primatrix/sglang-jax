@@ -4,10 +4,11 @@ from types import SimpleNamespace
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax.sharding import AxisType, Mesh
 
-from sgl_jax.srt.configs.model_config import _adapt_mimo_v2_multimodal_architecture
 from sgl_jax.srt.models import mimo_v2_mm
+from sgl_jax.srt.models.registry import ModelRegistry
 from sgl_jax.srt.models.mimo_v2_mm import (
     MiMoV2ForCausalLM,
     MiMoV2ForConditionalGeneration,
@@ -20,7 +21,6 @@ from sgl_jax.srt.multimodal.common.modality_enum import (
     Modality,
     MultimodalDataItem,
 )
-from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
 from sgl_jax.srt.multimodal.processors.mimo_v2 import MiMoV2Processor
 
 IMAGE_TOKEN = 151655
@@ -100,31 +100,28 @@ def _tiny_mimo_model(
     return model, mesh
 
 
-def test_mimo_v25_native_architecture_routes_only_multimodal_targets():
-    multimodal = SimpleNamespace(
-        architectures=["MiMoV2ForCausalLM"],
-        vision_config={},
-        audio_config={},
+@pytest.mark.parametrize(
+    "architecture, vision, audio, expected",
+    [
+        ("MiMoV2ForCausalLM", None, None, "MiMoV2ForCausalLM"),
+        ("MiMoV2ForCausalLM", {}, None, "MiMoV2ForConditionalGeneration"),
+        ("MiMoV2ForCausalLM", None, {}, "MiMoV2ForConditionalGeneration"),
+        ("MiMoV2ForConditionalGeneration", {}, {}, "MiMoV2ForConditionalGeneration"),
+        ("MiMoV2MTPForCausalLM", {}, {}, "MiMoV2MTPForCausalLM"),
+    ],
+)
+def test_mimo_resolution_preserves_checkpoint_architecture(architecture, vision, audio, expected):
+    config = SimpleNamespace(
+        architectures=[architecture], vision_config=vision, audio_config=audio
     )
-    _adapt_mimo_v2_multimodal_architecture(multimodal, is_draft_model=False)
-    assert multimodal.architectures == ["MiMoV2ForConditionalGeneration"]
-
-    text_only = SimpleNamespace(
-        architectures=["MiMoV2ForCausalLM"],
-        vision_config=None,
-        audio_config=None,
-    )
-    _adapt_mimo_v2_multimodal_architecture(text_only, is_draft_model=False)
-    assert text_only.architectures == ["MiMoV2ForCausalLM"]
-
-    draft = SimpleNamespace(
-        architectures=["MiMoV2ForCausalLM"],
-        vision_config={},
-        audio_config={},
-    )
-    _adapt_mimo_v2_multimodal_architecture(draft, is_draft_model=True)
-    assert draft.architectures == ["MiMoV2ForCausalLM"]
-    assert issubclass(MiMoV2ForConditionalGeneration, InModelMultimodalContract)
+    model_cls, arch = ModelRegistry.resolve_model_cls(config.architectures, hf_config=config)
+    assert model_cls.__name__ == expected
+    assert arch == architecture
+    assert config.architectures == [architecture]
+    assert ModelRegistry.is_in_model_multimodal(
+        config.architectures, hf_config=config
+    ) == (expected == "MiMoV2ForConditionalGeneration")
+    assert "MiMoV2ForCausalLM" in MiMoV2Processor.models
 
 
 def test_mimo_v25_constructs_visual_tower_under_nnx_eval_shape(monkeypatch):

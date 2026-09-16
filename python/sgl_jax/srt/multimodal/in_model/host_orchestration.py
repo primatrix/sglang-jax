@@ -76,7 +76,9 @@ def build_multimodal_batch(
     per_dp_token: int,
 ) -> _MultimodalBatch | None:
     """Build tasks for placeholders visible in this prefill chunk."""
-    if not ModelRegistry.is_in_model_multimodal(model_config.hf_config.architectures):
+    if not ModelRegistry.is_in_model_multimodal(
+        model_config.hf_config.architectures, hf_config=model_config.hf_config
+    ):
         return None
 
     grouped: dict[Modality, list[ItemTask]] = {}

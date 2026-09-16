@@ -74,7 +74,9 @@ def _embedding_pool_bytes(
     """Per-device byte budget reserved for the multimodal embedding pool."""
     enabled = (
         getattr(model_config, "is_multimodal", False)
-        and ModelRegistry.is_in_model_multimodal(model_config.hf_config.architectures)
+        and ModelRegistry.is_in_model_multimodal(
+            model_config.hf_config.architectures, hf_config=model_config.hf_config
+        )
         and not is_draft_worker
         and not server_args.multimodal
         and not server_args.enable_lora

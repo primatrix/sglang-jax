@@ -72,7 +72,7 @@ def get_model_architecture(model_config: ModelConfig) -> tuple[Any, str]:
     if not is_native_supported or model_config.model_impl == ModelImpl.TRANSFORMERS:
         architectures = resolve_transformers_arch(model_config, architectures)
 
-    return ModelRegistry.resolve_model_cls(architectures)
+    return ModelRegistry.resolve_model_cls(architectures, hf_config=model_config.hf_config)
 
 
 def get_architecture_class_name(model_config: ModelConfig) -> str:

@@ -91,29 +91,6 @@ def _assert_moe_data_parallel_supported(
         raise ValueError("MoE data parallelism currently supports unquantized experts only")
 
 
-def _adapt_mimo_v2_multimodal_architecture(
-    hf_config: PretrainedConfig, *, is_draft_model: bool
-) -> None:
-    """Route native MiMo-V2.5 checkpoints through the in-model VLM wrapper.
-
-    Xiaomi's multimodal and text-only MiMo-V2 checkpoints both advertise
-    ``MiMoV2ForCausalLM``.  The presence of a vision or audio sub-config is the
-    discriminator; keep text-only Pro/Flash and MTP draft runners unchanged.
-    """
-    architectures = getattr(hf_config, "architectures", None)
-    if (
-        is_draft_model
-        or not architectures
-        or architectures[0] != "MiMoV2ForCausalLM"
-        or (
-            getattr(hf_config, "vision_config", None) is None
-            and getattr(hf_config, "audio_config", None) is None
-        )
-    ):
-        return
-    architectures[0] = "MiMoV2ForConditionalGeneration"
-
-
 class ModelConfig:
     def __init__(
         self,
@@ -276,11 +253,6 @@ class ModelConfig:
                 ignored = list(self.quantization_config.ignored_layers or [])
                 ignored.extend(["model.eh_proj", "model.mtp_block.self_attn.o_proj"])
                 self.quantization_config.ignored_layers = ignored
-
-        _adapt_mimo_v2_multimodal_architecture(
-            self.hf_config,
-            is_draft_model=is_draft_model,
-        )
 
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
@@ -600,7 +572,9 @@ class ModelConfig:
         from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
 
         try:
-            model_cls, _ = ModelRegistry.resolve_model_cls(self.hf_config.architectures)
+            model_cls, _ = ModelRegistry.resolve_model_cls(
+                self.hf_config.architectures, hf_config=self.hf_config
+            )
         except ValueError:
             return
         self.is_multimodal |= issubclass(model_cls, InModelMultimodalContract)

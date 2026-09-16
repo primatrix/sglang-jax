@@ -264,7 +264,9 @@ class ModelWorker:
         use_multistage_multimodal = server_args.multimodal
         use_in_model_multimodal = (
             self.model_config.is_multimodal
-            and ModelRegistry.is_in_model_multimodal(self.model_config.hf_config.architectures)
+            and ModelRegistry.is_in_model_multimodal(
+                self.model_config.hf_config.architectures, hf_config=self.model_config.hf_config
+            )
             and not use_multistage_multimodal
         )
         self.compilation_manager = CompilationManager(
