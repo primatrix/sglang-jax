@@ -18,8 +18,22 @@ one extra history page and one extra SWA page, both numbered zero. History
 uses one shared logical page ledger across its three buffer families; there
 is no full uncompressed history tensor.
 
-`get_buffer(family, layer_id)` returns a whole global array. Layer-to-buffer
-maps are available as `layer_to_buffer[family]`. The per-rank shapes, including
+The KV pool directly implements the `KVCache` resource-management contract.
+Backends use `get_swa_buffer(layer_id)`, `get_compressed_buffer(layer_id)`,
+`get_compressed_page_size(layer_id)`, and `get_indexer_buffer(layer_id)`.
+These accessors return existing global arrays (or the compressed page size),
+routing by the layer's compression ratio. An out-of-range layer raises
+`IndexError`; a layer without the requested resource raises `ValueError`.
+The ordinary single-buffer `get_fused_kv_buffer`, `get_kv_buffer`, and
+`set_kv_buffer` interfaces are deliberately unsupported: SWA alone does not
+represent a compressed-attention layer. CPU snapshots are also unsupported.
+
+The family-level `get_buffer/set_buffer/write` interfaces remain available
+for reference paths. `get_kv_size_bytes()` returns global logical bytes,
+including all four families and per-rank padding, excluding compressor state.
+`mem_usage` is the same amount in GiB, not the sum of physical TP/EP replicas.
+
+The per-rank shapes, including
 padding, are:
 
 | Family | Per-layer, per-DP-shard shape |
@@ -70,18 +84,38 @@ request slot alone does not initialize its old state or erase old KV;
 consumers must honor initialization masks and generated-history lengths.
 
 Both pools are PyTrees with static metadata and `.buffers` dictionaries of
-array tuples. A model step returns **both** keys:
+array tuples. PyTree reconstruction restores metadata without allocating arrays.
+The KV pool and compressor state remain separate owners; state is not a
+`KVCache` and continues to use request slots.
+
+Each owner provides `build_buffer_updates(layer_updates)`, which merges partial
+per-layer updates into a complete payload without mutating the owner:
 
 ```python
+kv_updates = kv_pool.build_buffer_updates({
+    layer_id: {"swa": new_swa, "compressed": new_compressed},
+})
+state_updates = state_pool.build_buffer_updates({
+    layer_id: {"compressor": new_compressor_state},
+})
 updates = {
-    "token_to_kv_pool": updated_kv_buffers,
-    "compressor_state_pool": updated_state_buffers,
+    "token_to_kv_pool": kv_updates,
+    "compressor_state_pool": state_updates,
 }
 memory_pools.replace_all(updates)
 ```
 
-Pool replacements validate all family counts, shapes and dtypes. Normal
-model/backend integration and donation scheduling are owned by C3/M2.
+KV resources are `swa`, `compressed` (C4 or C128 according to the layer), and
+`indexer` (C4 only). State resources are `compressor` and `indexer` (C4 only).
+Omitted resources retain their arrays. Unknown resources, invalid layers, or
+shape/dtype changes fail before any replacement. Backend update dictionaries
+use semantic `compressed` rather than physical `c4/c128` family names; the
+final owner payload still contains the original physical family keys.
+
+ModelRunner validates the complete two-owner result while tracing, before
+input donation. `replace_buffer` validates and commits a complete family
+payload after execution; these checks do not introduce host reads of array
+contents. Both owners must be returned even when only one has changed.
 
 ## Allocator transactions and release
 

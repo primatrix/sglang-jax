@@ -4,14 +4,16 @@ import jax
 import jax.numpy as jnp
 
 from sgl_jax.srt.mem_cache.deepseek_v4.pool import (
-    _V4Buffers,
+    _buffer_nbytes,
+    _build_buffer_updates,
+    _validate_buffer_updates,
     allocate_buffer,
     scatter_sharding,
 )
 
 
 @jax.tree_util.register_pytree_node_class
-class DeepseekV4CompressStatePool(_V4Buffers):
+class DeepseekV4CompressStatePool:
     """Each DP shard indexes global ReqToTokenPool slots directly, including 0.
 
     ReqToTokenPool does not partition its free list by DP. Therefore each shard
@@ -53,6 +55,35 @@ class DeepseekV4CompressStatePool(_V4Buffers):
             f: {layer: i for i, layer in enumerate(layers)}
             for f, (layers, _) in self.layout.items()
         }
+
+    def tree_flatten(self):
+        return (self.buffers,), self._metadata
+
+    @classmethod
+    def tree_unflatten(cls, metadata, children):
+        obj = object.__new__(cls)
+        obj._configure(*metadata)
+        obj.buffers = children[0]
+        return obj
+
+    @property
+    def nbytes(self):
+        return _buffer_nbytes(self.buffers)
+
+    @property
+    def mem_usage(self):
+        return self.nbytes / 1024**3
+
+    def validate_buffer_updates(self, buffers):
+        _validate_buffer_updates(self.buffers, buffers)
+
+    def replace_buffer(self, buffers):
+        self.validate_buffer_updates(buffers)
+        self.buffers = {key: tuple(arrays) for key, arrays in buffers.items()}
+
+    def build_buffer_updates(self, layer_updates):
+        """Merge {layer_id: {compressor/indexer: array}} without committing state."""
+        return _build_buffer_updates(self, layer_updates, state=True)
 
     def state_indices(self, request_slots, valid_mask):
         return jnp.where(

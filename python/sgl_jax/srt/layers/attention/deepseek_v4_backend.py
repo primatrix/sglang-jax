@@ -275,7 +275,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 attention_sink=attention_sink,
                 metadata=self.forward_metadata,
             )
-            return output.reshape(q.shape), {"state": state, "swa": window, "c128": history}
+            return output.reshape(q.shape), {"state": state, "swa": window, "compressed": history}
         md = self.forward_metadata
         if md.attention is None or not md.read_tables:
             raise RuntimeError("V4 attention metadata has not been prepared")
@@ -300,19 +300,18 @@ class DeepseekV4AttentionBackend(AttentionBackend):
 
     @staticmethod
     def pack_pool_updates(layer_updates, token_to_kv_pool, compressor_state_pool):
-        kv = {name: list(arrays) for name, arrays in token_to_kv_pool.buffers.items()}
-        state = {name: list(arrays) for name, arrays in compressor_state_pool.buffers.items()}
+        kv_updates, state_updates = {}, {}
         for layer_id, updates in layer_updates.items():
-            ratio = token_to_kv_pool.spec.compress_ratios[layer_id]
+            kv_updates[layer_id], state_updates[layer_id] = {}, {}
             for name, array in updates.items():
                 if name in ("state", "indexer_state"):
-                    family = f"c{ratio}" if name == "state" else "indexer"
-                    state[family][compressor_state_pool.layer_to_buffer[family][layer_id]] = array
+                    resource = "compressor" if name == "state" else "indexer"
+                    state_updates[layer_id][resource] = array
                 else:
-                    kv[name][token_to_kv_pool.layer_to_buffer[name][layer_id]] = array
+                    kv_updates[layer_id][name] = array
         return {
-            "token_to_kv_pool": {name: tuple(arrays) for name, arrays in kv.items()},
-            "compressor_state_pool": {name: tuple(arrays) for name, arrays in state.items()},
+            "token_to_kv_pool": token_to_kv_pool.build_buffer_updates(kv_updates),
+            "compressor_state_pool": compressor_state_pool.build_buffer_updates(state_updates),
         }
 
 
