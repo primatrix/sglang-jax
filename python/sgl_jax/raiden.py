@@ -4,19 +4,22 @@ from __future__ import annotations
 
 import importlib
 import sys
-from collections.abc import Sequence
 
-_RAIDEN_EXTENSION = "tpu_raiden.frameworks.jax._tpu_raiden_jax"
+_RAIDEN_EXTENSION = "tpu_sync.frameworks.jax._tpu_raiden_jax"
 
 
-def raiden_requested(argv: Sequence[str] | None = None) -> bool:
-    requested = False
-    for arg in sys.argv[1:] if argv is None else argv:
+def raiden_requested(argv: list[str] | None = None) -> bool:
+    args = list(sys.argv[1:] if argv is None else argv)
+    pd_requested = False
+    encoder_requested = False
+    for arg in args:
         if arg == "--disaggregation-use-raiden":
-            requested = True
+            pd_requested = True
         elif arg == "--no-disaggregation-use-raiden":
-            requested = False
-    return requested
+            pd_requested = False
+        elif arg in ("--encoder-only", "--language-only"):
+            encoder_requested = True
+    return pd_requested or encoder_requested
 
 
 def preload_raiden() -> None:
@@ -41,7 +44,7 @@ def preload_raiden() -> None:
         ) from exc
 
 
-def preload_raiden_if_requested(argv: Sequence[str] | None = None) -> None:
+def preload_raiden_if_requested(argv: list[str] | None = None) -> None:
     if raiden_requested(argv):
         preload_raiden()
 
