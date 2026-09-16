@@ -19,7 +19,6 @@ from sgl_jax.srt.multimodal.common.modality_enum import (
 from sgl_jax.srt.multimodal.in_model import host_orchestration
 from sgl_jax.srt.multimodal.in_model.embedding_pool import EmbeddingPool
 from sgl_jax.srt.multimodal.in_model.host_orchestration import (
-    MergeMapping,
     MultimodalBatch,
     build_multimodal_batch,
 )
@@ -29,6 +28,7 @@ from sgl_jax.srt.multimodal.in_model.lane_packing import (
     pack_vision_inputs,
     run_mrope_vision_model,
 )
+from sgl_jax.srt.multimodal.in_model.mm_utils import MergeMapping
 from sgl_jax.srt.multimodal.processors.qwen_vl import QwenVLProcessor
 from sgl_jax.srt.server_args import apply_multimodal_model_defaults
 
@@ -565,8 +565,8 @@ def test_precompile_multimodal_inputs_matches_runtime_layout():
     expected = jax.device_put(jnp.ones((4, 8), jnp.float32), tokens)
     with patch.object(
         host_orchestration,
-        "_gather_merge",
-        wraps=host_orchestration._gather_merge,
+        "gather_merge",
+        wraps=host_orchestration.gather_merge,
     ) as merge:
         output, deepstack, apply_for_deepstack = host_orchestration.precompile_multimodal_inputs(
             jax.device_put(jnp.arange(4), data),
@@ -645,7 +645,7 @@ def test_model_runner_forward_embeds_multimodal_inputs():
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
 
     input_ids = jnp.asarray([1], dtype=jnp.int32)
-    multimodal_batch = MultimodalBatch(per_lane_tasks=[{}], ready_embeddings=[])
+    multimodal_batch = MultimodalBatch(per_lane_tasks=[{}], cached_embeddings=[])
     model = _TestInModelModel()
     embedding_pool = object()
     forward_batch = SimpleNamespace(
