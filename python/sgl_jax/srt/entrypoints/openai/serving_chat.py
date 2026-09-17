@@ -87,6 +87,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
 
         adapted_request = GenerateReqInput(
+            session_params=request.session_params,
             **prompt_kwargs,
             image_data=processed_messages.image_data,
             video_data=processed_messages.video_data,

@@ -45,11 +45,14 @@ from sgl_jax.srt.managers.dp_schedule_policy import (
 )
 from sgl_jax.srt.managers.io_struct import (
     AbortReq,
+    CloseSessionReqInput,
     ContinueGenerationReqInput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    OpenSessionReqInput,
+    OpenSessionReqOutput,
     PauseGenerationReqInput,
     ProfileReq,
     SetInternalStateReq,
@@ -573,6 +576,8 @@ class Scheduler(
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (AbortReq, self.abort_request),
+                (OpenSessionReqInput, self.open_session),
+                (CloseSessionReqInput, self.close_session),
                 (ProfileReq, self.profile),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
                 (GetInternalStateReq, self.get_internal_state),
@@ -1344,6 +1349,8 @@ class Scheduler(
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: list):
+        if self.server_args.enable_streaming_session:
+            self.tree_cache.maintenance()
         for recv_req in recv_reqs:
             output = self._request_dispatcher(recv_req)
             if output is not None:
@@ -1351,6 +1358,26 @@ class Scheduler(
                     self._comm_backend.send_pyobj(output)
                 else:
                     self.send_to_tokenizer.send_pyobj(output)
+
+    def open_session(self, recv_req):
+        try:
+            if not self.server_args.enable_streaming_session:
+                raise ValueError("Streaming sessions are disabled")
+            self.tree_cache.sessions.open(recv_req.session_id)
+            return OpenSessionReqOutput(
+                request_id=recv_req.request_id, session_id=recv_req.session_id
+            )
+        except ValueError as exc:
+            return OpenSessionReqOutput(
+                request_id=recv_req.request_id,
+                session_id=recv_req.session_id,
+                success=False,
+                error_msg=str(exc),
+            )
+
+    def close_session(self, recv_req):
+        if self.server_args.enable_streaming_session:
+            self.tree_cache.sessions.close(recv_req.session_id)
 
     def handle_generate_request(
         self,
@@ -1477,6 +1504,15 @@ class Scheduler(
                     if value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
                         error_msg = f"Invalid grammar request with cache hit: {key=}"
                         req.set_finish_with_abort(error_msg)
+
+        if recv_req.session_params is not None and not req.finished():
+            try:
+                if not self.server_args.enable_streaming_session:
+                    raise ValueError("Start the server with --enable-streaming-session")
+                self.tree_cache.attach(req, recv_req.session_params)
+            except ValueError as exc:
+                req.set_finish_with_abort(str(exc))
+                add_to_grammar_queue = False
 
         if add_to_grammar_queue:
             req.queue_time_start = time.perf_counter()
@@ -1797,9 +1833,15 @@ class Scheduler(
         if isinstance(self.tree_cache, DeepseekV4ChunkCache):
             allocator = self.token_to_kv_pool_allocator
             for dp in range(self.dp_size):
+                held_full, held_swa, _ = (
+                    self.tree_cache.held_sizes(dp)
+                    if self.server_args.enable_streaming_session
+                    else (0, 0, 0)
+                )
                 if (
-                    allocator.full_available_size(dp) != allocator.size_per_rank
-                    or allocator.swa_available_size(dp) != allocator.size_swa // self.dp_size
+                    allocator.full_available_size(dp) + held_full != allocator.size_per_rank
+                    or allocator.swa_available_size(dp) + held_swa
+                    != allocator.size_swa // self.dp_size
                 ):
                     raise ValueError(f"V4 history/SWA memory leak detected in DP rank {dp}")
         elif self.is_hybrid:
@@ -1909,6 +1951,8 @@ class Scheduler(
                 )
 
         req_total_size = self.req_to_token_pool.size
+        if self.server_args.enable_streaming_session:
+            req_total_size -= self.tree_cache.held_sizes()[2]
 
         if len(self.req_to_token_pool.free_slots) != req_total_size:
             msg = (
@@ -2079,6 +2123,13 @@ class Scheduler(
             self._add_request_to_queue(req)
 
     def get_next_batch_to_run(self) -> ScheduleBatch | None:
+        if self.server_args.enable_streaming_session and (
+            self.waiting_queue or not self.running_batch.is_empty()
+        ):
+            reserve = self.chunked_prefill_size or self.page_size
+            if self.waiting_queue:
+                reserve += max(r.sampling_params.max_new_tokens for r in self.waiting_queue)
+            self.tree_cache.reserve_headroom(reserve)
         if self.pd == "pathways":
             return self._pd_get_next_batch_async()
         # PD: retry migrating the batch parked when D pool was full (D running
@@ -2360,6 +2411,14 @@ class Scheduler(
                 continue  # host pool full: leave req in waiting_queue, retry next round
 
             req.init_next_round_input(self.tree_cache)
+
+            if self.server_args.enable_streaming_session and req.req_pool_idx is None:
+                needed = 1 + sum(r.req_pool_idx is None for r in adder.can_run_list[dp_rank])
+                while self.req_to_token_pool.available_size() < needed:
+                    if not self.tree_cache.sessions.evict_one():
+                        break
+                if self.req_to_token_pool.available_size() < needed:
+                    continue
 
             # Post-match refinement: a prefix hit locks its matched snapshot
             # (non-evictable for the req's lifetime); discount it so admission at
@@ -2906,6 +2965,8 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            if self.server_args.enable_streaming_session:
+                self.tree_cache.cancel(req)
             abort_out = AbortReq(rid=req.rid)
             if self._comm_backend is not None:
                 self._comm_backend.send_pyobj(abort_out)
