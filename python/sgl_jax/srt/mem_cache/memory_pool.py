@@ -175,7 +175,14 @@ class ReqToTokenPool:
     def alloc(self, reqs: list[Req]) -> list[int] | None:
         """Allocate request slots, reusing existing slot for chunked reqs."""
         chunked = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
-        assert len(chunked) <= 1, "only one chunked request may reuse req_pool_idx in a batch"
+        assert (
+            sum(
+                not getattr(r, "session_restored", False)
+                for r in reqs
+                if r.req_pool_idx is not None
+            )
+            <= 1
+        ), "only one non-session chunked request may reuse req_pool_idx in a batch"
         assert all(
             reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in chunked
         ), "request has req_pool_idx but is not chunked"

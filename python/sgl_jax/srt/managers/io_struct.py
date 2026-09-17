@@ -138,6 +138,7 @@ class BatchTokenIDOut:
 
 @dataclass
 class TokenizedGenerateReqInput:
+    session_params: dict | None = field(default=None, kw_only=True)
     # The request id.
     rid: list[str] | str | None = None
     # The input prompt. It can be a single prompt or a batch of prompts.
@@ -299,6 +300,8 @@ class EmbeddingReqInput:
 class GenerateReqInput:
     """Request input for text generation."""
 
+    # Full-context session handle; keyword-only preserves positional API compatibility.
+    session_params: dict | None = field(default=None, kw_only=True)
     batch_size: int = 1
     rid: list[str] | str | None = None
     text: list[str] | str | None = None
@@ -387,6 +390,17 @@ class GenerateReqInput:
         self._validate_inputs()
         self._determine_batch_size()
         self._handle_parallel_sampling()
+
+        if self.session_params is not None:
+            if not self.is_single or self.parallel_sample_num != 1:
+                raise ValueError("Session requests must contain one input and n=1")
+            if (
+                not isinstance(self.session_params, dict)
+                or set(self.session_params) != {"id"}
+                or not isinstance(self.session_params["id"], str)
+                or not self.session_params["id"].strip()
+            ):
+                raise ValueError('Expected session_params={"id": "nonempty-session-id"}')
 
         if self.is_single:
             self._normalize_single_inputs()
@@ -672,7 +686,7 @@ class BatchEmbeddingOut:
 class OpenSessionReqInput(RpcReqInput):
     """Request to open a session."""
 
-    session_id: str
+    session_id: str | None = None
 
 
 @dataclass
