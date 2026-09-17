@@ -1,0 +1,42 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: niu-overlap-demo
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-tpu-topology: 2x2
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+      containers:
+      - name: demo
+        image: python:3.11-slim
+        command:
+        - bash
+        - -c
+        - |
+          set -ex
+          pip install -U --pre jax jaxlib libtpu \
+            -i https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
+            -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+          python -c 'import jax; print("TPU devices:", jax.device_count())'
+          echo "Ready. Use: kubectl exec -it <pod> -- bash"
+          sleep infinity
+        resources:
+          limits:
+            google.com/tpu: "4"
+          requests:
+            google.com/tpu: "4"
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
