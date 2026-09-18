@@ -5,7 +5,7 @@ on the existing attention ``data`` mesh axis. No raw full-history KV is stored.
 """
 
 from dataclasses import dataclass
-from functools import lru_cache, partial
+from functools import partial
 from math import prod
 from operator import index
 
@@ -59,16 +59,10 @@ class DeepseekV4CacheSpec:
         )
 
 
-@lru_cache(maxsize=128)
-def _zero_allocator(shape, dtype, mesh):
-    # Cache the compiled constructor, never an array shared between layers.
-    sharding = NamedSharding(mesh, P("data", *([None] * (len(shape) - 1))))
-    return jax.jit(partial(jnp.zeros, shape, dtype), out_shardings=sharding)
-
-
 def allocate_buffer(shape, dtype, mesh):
+    sharding = NamedSharding(mesh, P("data", *([None] * (len(shape) - 1))))
     with jax.set_mesh(mesh):
-        return _zero_allocator(tuple(shape), dtype, mesh)()
+        return jax.jit(partial(jnp.zeros, tuple(shape), dtype), out_shardings=sharding)()
 
 
 def scatter_sharding(mesh, ndim):
