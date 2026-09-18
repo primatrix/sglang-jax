@@ -292,8 +292,8 @@ class DeepseekV4HCABackend(HCABackend):
         ):
             raise ValueError("HCA and C1 pool geometry disagree")
         state = compressor_state_pool.get_buffer("c128", layer_id)
-        window = token_to_kv_pool.get_buffer("swa", layer_id)
-        compressed = token_to_kv_pool.get_buffer("c128", layer_id)
+        window = token_to_kv_pool.get_swa_buffer(layer_id)
+        compressed = token_to_kv_pool.get_compressed_buffer(layer_id)
         metadata = self.forward_metadata if metadata is None else metadata
         init_slots = metadata.state_init_slots
         if init_slots is None:
@@ -316,7 +316,10 @@ class DeepseekV4HCABackend(HCABackend):
         state_view = state.reshape(state.shape[0], 128, 2, self.head_dim)
         window_view = window.reshape(-1, self.page_size // 2, 2, self.head_dim)
         compressed_view = compressed.reshape(
-            compressed.shape[0], 1, self.page_size // 128, self.head_dim
+            compressed.shape[0],
+            1,
+            token_to_kv_pool.get_compressed_page_size(layer_id),
+            self.head_dim,
         )
         # These contain views only. Ownership, allocation and update validation
         # stay with C1; the standalone HCA allocator/pools are never constructed.
@@ -347,13 +350,11 @@ class DeepseekV4HCABackend(HCABackend):
     @staticmethod
     def pack_pool_updates(layer_updates, token_to_kv_pool, compressor_state_pool):
         """Merge {layer_id: (state, SWA, C128)} into complete C1 update families."""
-        kv = {name: list(arrays) for name, arrays in token_to_kv_pool.buffers.items()}
-        state = {name: list(arrays) for name, arrays in compressor_state_pool.buffers.items()}
-        for layer_id, (s, w, c) in layer_updates.items():
-            state["c128"][compressor_state_pool.layer_to_buffer["c128"][layer_id]] = s
-            kv["swa"][token_to_kv_pool.layer_to_buffer["swa"][layer_id]] = w
-            kv["c128"][token_to_kv_pool.layer_to_buffer["c128"][layer_id]] = c
         return {
-            "token_to_kv_pool": {k: tuple(v) for k, v in kv.items()},
-            "compressor_state_pool": {k: tuple(v) for k, v in state.items()},
+            "token_to_kv_pool": token_to_kv_pool.build_buffer_updates(
+                {layer: {"swa": w, "compressed": c} for layer, (_, w, c) in layer_updates.items()}
+            ),
+            "compressor_state_pool": compressor_state_pool.build_buffer_updates(
+                {layer: {"compressor": s} for layer, (s, _, _) in layer_updates.items()}
+            ),
         }

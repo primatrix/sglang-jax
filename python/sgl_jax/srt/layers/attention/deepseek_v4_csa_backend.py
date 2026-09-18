@@ -146,10 +146,10 @@ class DeepseekV4CSABackend(nnx.Module):
         kv_pool = token_to_kv_pool
         states = compressor_state_pool
         family = f"c{ratio}"
-        window = kv_pool.get_buffer("swa", layer_id)
-        compressed = kv_pool.get_buffer(family, layer_id) if ratio else None
+        window = kv_pool.get_swa_buffer(layer_id)
+        compressed = kv_pool.get_compressed_buffer(layer_id) if ratio else None
         state = states.get_buffer(family, layer_id) if ratio else None
-        index_cache = kv_pool.get_buffer("indexer", layer_id) if ratio == 4 else None
+        index_cache = kv_pool.get_indexer_buffer(layer_id) if ratio == 4 else None
         index_state = states.get_buffer("indexer", layer_id) if ratio == 4 else None
         if ratio and compressor is None:
             raise ValueError("compressed attention requires model compressor weights")
@@ -215,7 +215,7 @@ class DeepseekV4CSABackend(nnx.Module):
             )
             out = {"swa": updates["swa"].reshape(window_.shape)}
             if ratio:
-                out[family] = updates["compressed"].reshape(compressed_.shape)
+                out["compressed"] = updates["compressed"].reshape(compressed_.shape)
                 out["state"] = updates["state"]
             if ratio == 4:
                 out["indexer"] = updates["indexer"].reshape(index_cache_.shape)
@@ -225,7 +225,7 @@ class DeepseekV4CSABackend(nnx.Module):
         replica = lambda tree: jax.tree.map(lambda a: P(*([None] * a.ndim)), tree)
         outputs = {"swa": P("data", None)}
         if ratio:
-            outputs.update({family: P("data", None, None), "state": P("data", None, None)})
+            outputs.update({"compressed": P("data", None, None), "state": P("data", None, None)})
         if ratio == 4:
             outputs.update(
                 {"indexer": P("data", None, None), "indexer_state": P("data", None, None)}
