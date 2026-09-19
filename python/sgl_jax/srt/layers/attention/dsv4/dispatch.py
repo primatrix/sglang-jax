@@ -268,6 +268,16 @@ def run_layer(
     selected = None
     selected_mask = None
 
+    # Mixed chunked prefill: the decode tables cover only the requests decoding inside
+    # this extend step (one row per request slot, ``decode_token_index`` -> token row);
+    # the batch still takes the extend path and those rows are overlaid at the end.
+    # Pure decode (one table row per token) skips the extend path.
+    mixed_decode = (
+        tables.decode_page_indices is not None
+        and tables.decode_token_index is not None
+        and int(tables.decode_page_indices.shape[0]) != int(q.shape[0])
+    )
+    extend_path = tables.decode_page_indices is None or mixed_decode
     if ratio > 0:
         if compressor_weights is None:
             raise ValueError(f"ratio {ratio} needs compressor weights")
@@ -337,7 +347,7 @@ def run_layer(
             run=metadata.page_size // ratio,
         )
         updates["compressed"] = compressed_buffer
-        if tables.decode_page_indices is None:
+        if extend_path:
             compressed_kv = jnp.take(compressed_buffer, jnp.asarray(tables.compressed_rows), axis=0)
 
         if ratio == 4:
@@ -370,7 +380,7 @@ def run_layer(
                 run=metadata.page_size // ratio,
             )
             updates["indexer"] = indexer_buffer
-            if tables.decode_page_indices is None:
+            if extend_path:
                 if resolve_indexer_backend() == "kernel":
                     # Pallas scoring straight from the paged cache; same gathered-row
                     # coordinates as the reference, no [T, E] key gather.
@@ -445,14 +455,6 @@ def run_layer(
     # prevent a query from attending to later tokens in the chunk.
     updates["swa"] = update_window_kv(
         kv_buffers["swa"], new_kv, metadata.swa_write_loc, metadata.valid_token_mask
-    )
-    # Mixed chunked prefill: the decode tables cover only the requests decoding inside
-    # this extend step (one row per request slot, ``decode_token_index`` -> token row);
-    # they are read after the extend attention below and overlaid on its rows.
-    mixed_decode = (
-        tables.decode_page_indices is not None
-        and tables.decode_token_index is not None
-        and int(tables.decode_page_indices.shape[0]) != int(q.shape[0])
     )
     if tables.decode_page_indices is not None and not mixed_decode:
         from sgl_jax.srt.layers.attention.dsv4.decode import csa_decode_attention
