@@ -38,6 +38,7 @@ def _config_value(config: object, name: str, default: Any = None) -> Any:
 class MiMoV2Processor(MiMoV2AudioProcessorMixin, QwenVLProcessor):
     auto_mm_processor_worker_num = 1
     supports_mm_processor_concurrency = False
+    use_torchcodec_image_decode = False
     models = ("MiMoV2ForCausalLM", "MiMoV2ForConditionalGeneration")
 
     def __init__(
