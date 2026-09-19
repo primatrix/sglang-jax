@@ -72,8 +72,17 @@ def padded_read_tables(
     compressed_capacity=None,
     decode_capacity=None,
     minimal=False,
+    decode_rows=None,
 ):
-    if decode_capacity is not None or minimal:
+    """``decode_rows`` (bool [B], mixed chunked-prefill batches): requests that are
+    decoding inside an extend step. They are dropped from the flat shared-history
+    tables (built for the prefill requests only) and get request-local decode tables
+    instead, addressed by ``decode_token_index`` (their token row in the batch)."""
+    decode_rows = None if decode_rows is None else np.asarray(decode_rows, bool)
+    mixed = decode_rows is not None and decode_capacity is not None
+    q_lens = np.asarray(q_lens)
+    generic_q_lens = np.where(decode_rows, 0, q_lens) if mixed else q_lens
+    if (decode_capacity is not None and not mixed) or minimal:
         # Request-local decode: the layer reads through ``decode_page_indices`` /
         # ``decode_window_rows`` only, so the flat shared-history tables (every
         # compressed entry of every request: ~150k rows at bs=64 / 9K, 7 ms of host
@@ -95,7 +104,7 @@ def padded_read_tables(
             allocator=allocator,
             slots=slots,
             lengths=lengths,
-            q_lens=q_lens,
+            q_lens=generic_q_lens,
             ratio=ratio,
             window_size=window_size,
             page_size=page_size,
@@ -124,18 +133,29 @@ def padded_read_tables(
         padded[: len(value)] = value
         values[name] = padded
     if decode_capacity is not None:
-        if ratio != 4 or np.any((q_lens != 0) & (q_lens != 1)):
-            raise ValueError("request-local CSA tables require one decode query per request")
+        if ratio != 4:
+            raise ValueError("request-local CSA tables are a ratio-4 feature")
+        if mixed:
+            if np.any(decode_rows & (q_lens != 1)):
+                raise ValueError("mixed-batch decode rows must be one-token extends")
+            live = np.flatnonzero(decode_rows & (q_lens > 0))
+        else:
+            if np.any((q_lens != 0) & (q_lens != 1)):
+                raise ValueError("request-local CSA tables require one decode query per request")
+            live = np.flatnonzero(q_lens > 0)
+        rows = len(slots)  # one row per request slot of the bucket (== tokens in pure decode)
         compressed_page_size = page_size // ratio
         table_width = decode_capacity // compressed_page_size
-        pages = np.zeros((token_capacity, table_width), np.int32)
-        page_counts = np.zeros((token_capacity,), np.int32)
-        windows = np.zeros((token_capacity, window_size), np.int32)
+        pages = np.zeros((rows, table_width), np.int32)
+        page_counts = np.zeros((rows,), np.int32)
+        windows = np.zeros((rows, window_size), np.int32)
+        token_index = np.full((rows,), -1, np.int32)
+        cu = np.concatenate(([0], np.cumsum(q_lens)))
+        token_index[: live.size] = cu[live]
         mapping = allocator.full_to_swa_index_mapping
         mapping = mapping[rank] if isinstance(mapping, list) else mapping
         # One decode query per live request, packed in request order (rows past the
         # live count stay zero); vectorised across requests.
-        live = np.flatnonzero(np.asarray(q_lens) > 0)
         if live.size:
             live_slots = np.asarray(slots, np.int64)[live]
             live_lengths = np.asarray(lengths, np.int64)[live]
@@ -160,6 +180,7 @@ def padded_read_tables(
             windows[: live.size] = np.where(in_range, mapping[locations], 0)
         values["decode_page_indices"] = pages
         values["decode_window_rows"] = windows
+        values["decode_token_index"] = token_index
         # DMA segments for the request-local scorer (runs of consecutive physical pages),
         # built once per step here rather than per CSA layer on device.
         segments, segment_counts = page_run_segments(

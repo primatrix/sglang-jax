@@ -335,13 +335,27 @@ class DeepseekV4AttentionBackend(AttentionBackend, DeepseekV4HCABackendMixin):
         # All DP ranks must have identical local array extents for shard_map.
         # Only requests with queries contribute rows to read_tables; bound their
         # completed groups with a power-of-two bucket shared across ranks.
+        # Mixed chunked prefill (``mix_with_running`` presents it as EXTEND): requests
+        # decoding inside the step are one-token extends with history. They take the
+        # request-local decode tables and are kept out of the shared-history tables,
+        # whose size otherwise grows with every decoding request's whole history.
+        mixed_rows = None
+        if batch.forward_mode == ForwardMode.EXTEND and self.page_size == 128:
+            candidates = (queries == 1) & (lengths - queries > 0)
+            if np.any(candidates):
+                mixed_rows = candidates
         compressed_capacities = {0: 1}
         for ratio in (4, 128):
-            count = int(np.max(np.sum(np.where(queries > 0, lengths // ratio, 0), axis=1)))
+            in_tables = queries > 0
+            if mixed_rows is not None:
+                in_tables = in_tables & ~mixed_rows
+            count = int(np.max(np.sum(np.where(in_tables, lengths // ratio, 0), axis=1)))
             compressed_capacities[ratio] = capacity_bucket(count)
         decode_capacity = None
         if batch.forward_mode == ForwardMode.DECODE and self.page_size == 128:
             decode_capacity = capacity_bucket(int(np.max(lengths // 4)))
+        elif mixed_rows is not None:
+            decode_capacity = capacity_bucket(int(np.max(np.where(mixed_rows, lengths, 0) // 4)))
         if self.precompile_context_len is not None:
             ladder = precompile_capacities(self.precompile_context_len)
             compressed_capacities.update(ladder)
@@ -386,6 +400,9 @@ class DeepseekV4AttentionBackend(AttentionBackend, DeepseekV4HCABackendMixin):
                         compressed_capacity=compressed_capacities[ratio],
                         decode_capacity=decode_capacity if ratio == 4 else None,
                         minimal=ratio == 128 and self.use_pallas_hca,
+                        decode_rows=(
+                            mixed_rows[rank] if (mixed_rows is not None and ratio == 4) else None
+                        ),
                     )
                 )
             local.append(
