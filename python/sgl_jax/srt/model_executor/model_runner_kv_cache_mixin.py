@@ -918,7 +918,14 @@ class ModelRunnerKVCacheMixin:
         if not sa.disable_radix_cache:
             raise ValueError("V4 initial resources require --disable-radix-cache")
         if getattr(sa, "enable_mixed_chunk", False):
-            raise ValueError("V4 initial resources do not support mixed prefill/decode")
+            # ``mix_with_running`` presents the mixed batch as EXTEND with the decode
+            # requests as one-token extends (prefix = seq_len - 1), which is the
+            # per-request path the V4 metadata and kernels already take; validated on
+            # v7x 09-19 (throughput chain + GSM gates) rather than blocked here.
+            logger.warning(
+                "V4 with --enable-mixed-chunk: decode requests ride the extend path of "
+                "chunked prefill steps (experimental)"
+            )
         if self.is_draft_worker or (
             self.spec_algorithm is not None and not self.spec_algorithm.is_none()
         ):
