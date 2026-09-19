@@ -57,29 +57,21 @@ class _ModelRegistry:
     def resolve_model_cls(
         self,
         architectures: str | list[str],
-        *,
-        hf_config: Any = None,
     ) -> tuple[type[Any], str]:
         architectures = self._normalize_archs(architectures)
 
         for arch in architectures:
             model_cls = self._try_load_model_cls(arch)
             if model_cls is not None:
-                # Some checkpoints share an architecture name across modalities.
-                resolver = getattr(model_cls, "resolve_model_class", None)
-                if hf_config is not None and resolver is not None:
-                    model_cls = resolver(hf_config)
                 return (model_cls, arch)
 
         return self._raise_for_unsupported(architectures)
 
-    def is_in_model_multimodal(
-        self, architectures: str | list[str], *, hf_config: Any = None
-    ) -> bool:
+    def is_in_model_multimodal(self, architectures: str | list[str]) -> bool:
         from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
 
         try:
-            model_cls, _ = self.resolve_model_cls(architectures, hf_config=hf_config)
+            model_cls, _ = self.resolve_model_cls(architectures)
         except ValueError:
             return False
         return issubclass(model_cls, InModelMultimodalContract)

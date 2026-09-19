@@ -5,7 +5,7 @@ from sgl_jax.srt.configs.bailing_hybrid import (
     BailingHybridConfig,
     get_bailing_hybrid_config,
 )
-from sgl_jax.srt.model_loader.arch import get_model_architecture
+from sgl_jax.srt.model_loader.arch import resolve_model_architecture
 from sgl_jax.srt.models.bailing_moe_linear import (
     BailingMoEGQAAttention,
     BailingMoELinearAttention,
@@ -121,7 +121,7 @@ def test_bailing_hybrid_config_exposes_runner_linear_state_params():
 
 
 def test_bailing_moe_v2_5_resolves_from_bailing_moe_linear_file():
-    model_cls, arch = get_model_architecture(
+    model_cls, arch = resolve_model_architecture(
         type(
             "DummyModelConfig",
             (),

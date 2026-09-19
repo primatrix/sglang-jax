@@ -78,6 +78,7 @@ def _qwen_config():
 def _model_config(arch=ARCH):
     return SimpleNamespace(
         is_multimodal=True,
+        is_in_model_multimodal=arch == ARCH,
         hf_config=SimpleNamespace(
             architectures=[arch],
             vision_config=_qwen_config(),

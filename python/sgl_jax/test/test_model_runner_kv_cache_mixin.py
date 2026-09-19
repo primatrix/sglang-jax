@@ -349,6 +349,7 @@ def test_embedding_pool_bytes_only_for_in_model_prefill():
 
     config = types.SimpleNamespace(
         is_multimodal=True,
+        is_in_model_multimodal=True,
         hidden_size=8,
         dtype=jnp.bfloat16,
         hf_config=types.SimpleNamespace(architectures=["Qwen2_5_VLForConditionalGeneration"]),
@@ -376,6 +377,7 @@ def test_deepstack_embedding_pool_uses_packed_feature_width():
 
     config = types.SimpleNamespace(
         is_multimodal=True,
+        is_in_model_multimodal=True,
         hidden_size=8,
         dtype=jnp.bfloat16,
         hf_config=types.SimpleNamespace(architectures=["Qwen2_5_VLForConditionalGeneration"]),
@@ -415,6 +417,7 @@ def test_embedding_pool_capacity_and_pages_follow_lm_limits():
 
     config = types.SimpleNamespace(
         is_multimodal=True,
+        is_in_model_multimodal=True,
         hidden_size=8,
         dtype=jnp.bfloat16,
         hf_config=types.SimpleNamespace(architectures=["Qwen2_5_VLForConditionalGeneration"]),

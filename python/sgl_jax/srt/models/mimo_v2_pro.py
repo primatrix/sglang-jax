@@ -21,18 +21,6 @@ logger = logging.getLogger(__name__)
 
 class MiMoV2ForCausalLM(MiMoV2FlashForCausalLM):
 
-    @classmethod
-    def resolve_model_class(cls, config):
-        """Select the modality wrapper without rewriting checkpoint metadata."""
-        if cls is MiMoV2ForCausalLM and (
-            getattr(config, "vision_config", None) is not None
-            or getattr(config, "audio_config", None) is not None
-        ):
-            from sgl_jax.srt.models.mimo_v2_mm import MiMoV2ForConditionalGeneration
-
-            return MiMoV2ForConditionalGeneration
-        return cls
-
     def __init__(
         self,
         config: PretrainedConfig,

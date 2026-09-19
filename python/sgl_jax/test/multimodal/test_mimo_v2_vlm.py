@@ -7,8 +7,9 @@ import numpy as np
 import pytest
 from jax.sharding import AxisType, Mesh
 
+from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.model_loader.arch import get_model_architecture
 from sgl_jax.srt.models import mimo_v2_mm
-from sgl_jax.srt.models.registry import ModelRegistry
 from sgl_jax.srt.models.mimo_v2_mm import (
     MiMoV2ForCausalLM,
     MiMoV2ForConditionalGeneration,
@@ -114,14 +115,52 @@ def test_mimo_resolution_preserves_checkpoint_architecture(architecture, vision,
     config = SimpleNamespace(
         architectures=[architecture], vision_config=vision, audio_config=audio
     )
-    model_cls, arch = ModelRegistry.resolve_model_cls(config.architectures, hf_config=config)
+    model_config = ModelConfig.__new__(ModelConfig)
+    model_config.hf_config = config
+    model_config.model_impl = "auto"
+    model_config.is_multimodal = False
+    model_config._apply_model_specific_config()
+    model_cls, arch = get_model_architecture(model_config)
     assert model_cls.__name__ == expected
     assert arch == architecture
     assert config.architectures == [architecture]
-    assert ModelRegistry.is_in_model_multimodal(
-        config.architectures, hf_config=config
-    ) == (expected == "MiMoV2ForConditionalGeneration")
+    assert model_config.is_in_model_multimodal == (expected == "MiMoV2ForConditionalGeneration")
+    assert model_config.model_class is model_cls
     assert "MiMoV2ForCausalLM" in MiMoV2Processor.models
+
+
+@pytest.mark.parametrize(
+    "model_impl, architecture",
+    [("transformers", "MiMoV2ForCausalLM"), ("auto", "UnknownModel")],
+)
+def test_model_resolution_caches_transformers_fallback_without_mutating_config(
+    monkeypatch, model_impl, architecture
+):
+    from sgl_jax.srt.model_loader import arch as arch_module
+    from sgl_jax.srt.models.registry import ModelRegistry
+
+    class TransformersModel:
+        pass
+
+    monkeypatch.setitem(ModelRegistry.models, "TransformersForCausalLM", TransformersModel)
+    calls = []
+
+    def resolve_transformers(config, architectures):
+        calls.append(list(architectures))
+        architectures[:] = ["TransformersForCausalLM"]
+        return architectures
+
+    monkeypatch.setattr(arch_module, "resolve_transformers_arch", resolve_transformers)
+    config = ModelConfig.__new__(ModelConfig)
+    config.hf_config = SimpleNamespace(architectures=[architecture], vision_config={})
+    config.model_impl = model_impl
+    config.is_multimodal = False
+    config._apply_model_specific_config()
+    assert get_model_architecture(config) == (TransformersModel, "TransformersForCausalLM")
+    assert config.model_class is TransformersModel
+    assert not config.is_in_model_multimodal
+    assert config.hf_config.architectures == [architecture]
+    assert calls == [[architecture]]
 
 
 def test_mimo_v25_constructs_visual_tower_under_nnx_eval_shape(monkeypatch):
@@ -172,6 +211,82 @@ def test_mimo_v25_loads_visual_tower_outside_text_graph(monkeypatch):
     assert len(tower_loads) == 1
     assert isinstance(tower_loads[0], MiMoVisionTransformer)
     assert model.visual is visual
+
+
+@pytest.mark.parametrize("with_audio", [False, True])
+def test_mimo_static_fp8_preparation_preserves_modality_weight_paths(monkeypatch, with_audio):
+    from flax import nnx
+
+    from sgl_jax.srt.configs.quantization_config import QuantizationConfig
+    from sgl_jax.srt.layers.linear import LinearBase, QuantizedLinear
+    from sgl_jax.srt.models.mimo_v2_audio import MiMoAudioEncoder
+    from sgl_jax.srt.utils.quantization.quantization_utils import apply_linear_quantization
+    from sgl_jax.srt.utils.weight_utils import WeightLoader
+
+    model, mesh = _tiny_mimo_model(monkeypatch)
+    buckets = model.visual.input_buckets
+    with jax.set_mesh(mesh):
+        # A text layer must remain quantized while modality towers are restored.
+        model.text_linear = nnx.eval_shape(
+            lambda: LinearBase(8, 8, mesh=mesh, kernel_axes=(None, None))
+        )
+        if with_audio:
+            model.config.audio_config = SimpleNamespace(
+                audio_channels=2,
+                group_size=2,
+                input_local_dim=8,
+                out_hidden_size=8,
+                speech_vocab_size=[16, 16],
+                speech_zeroemb_idx=[0, 0],
+                input_local_layers=1,
+                input_local_attn_heads=2,
+                input_local_intermediate_size=16,
+            )
+            model.audio_encoder = nnx.data(
+                nnx.eval_shape(
+                    lambda: MiMoAudioEncoder(model.config.audio_config, model.dtype, mesh, False)
+                )
+            )
+        quant_config = SimpleNamespace(
+            quantization_config=QuantizationConfig(
+                is_static_checkpoint=True,
+                linear_rules=[{"module_path": ".*", "weight_dtype": "float8_e4m3fn"}],
+            )
+        )
+        apply_linear_quantization(quant_config, model, is_static_input=True)
+    assert isinstance(model.visual.merger.mlp_fc1, QuantizedLinear)
+    if with_audio:
+        assert isinstance(model.audio_encoder.proj_fc1, QuantizedLinear)
+
+    def fake_text_load(self, config):
+        assert not hasattr(self, "visual")
+        if with_audio:
+            assert not hasattr(self, "audio_encoder")
+        assert isinstance(self.text_linear, QuantizedLinear)
+
+    monkeypatch.setattr(MiMoV2ForCausalLM, "load_weights", fake_text_load)
+    checked = []
+
+    class CheckingWeightLoader:
+        def __init__(self, tower, config, loader_mesh, dtype):
+            self.tower = tower
+            assert loader_mesh is mesh
+
+        def load_weights_from_safetensors(self, mappings):
+            state = nnx.state(self.tower)
+            for mapping in mappings.values():
+                paths = mapping.target_path
+                for path in paths if isinstance(paths, list) else [paths]:
+                    param = WeightLoader._get_param(None, state, path)
+                    assert param.value.dtype == jnp.bfloat16
+            checked.append(self.tower)
+
+    monkeypatch.setattr(mimo_v2_mm, "WeightLoader", CheckingWeightLoader)
+    model.load_weights(SimpleNamespace(model_path="unused"))
+    assert len(checked) == (2 if with_audio else 1)
+    assert isinstance(model.visual.merger.mlp_fc1, LinearBase)
+    assert model.visual.input_buckets == buckets
+    assert isinstance(model.text_linear, QuantizedLinear)
 
 
 def test_first_key_sink_bias_matches_official_vision_logits():

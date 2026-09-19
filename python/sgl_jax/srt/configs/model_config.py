@@ -3,6 +3,7 @@ import json
 import logging
 import os
 from enum import Enum, IntEnum, auto
+from functools import cached_property
 
 import jax.numpy as jnp
 from transformers import PretrainedConfig
@@ -559,6 +560,17 @@ class ModelConfig:
         logger.info("No quantization config found in HF config or user config")
         return None
 
+    @cached_property
+    def resolved_model_architecture(self) -> tuple[type, str]:
+        """Resolve once, after draft architecture selection, without changing HF metadata."""
+        from sgl_jax.srt.model_loader.arch import resolve_model_architecture
+
+        return resolve_model_architecture(self)
+
+    @property
+    def model_class(self) -> type:
+        return self.resolved_model_architecture[0]
+
     def _apply_model_specific_config(self) -> None:
         """Invoke the model class's optional `patch_model_config` hook so model
         files can own their own config overrides (attention_arch, head_dim,
@@ -568,16 +580,15 @@ class ModelConfig:
         `attention_arch` for backend selection — so patches land in time.
         Import is lazy because model modules import ModelConfig back.
         """
-        from sgl_jax.srt.models.registry import ModelRegistry
         from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
 
+        self.is_in_model_multimodal = False
         try:
-            model_cls, _ = ModelRegistry.resolve_model_cls(
-                self.hf_config.architectures, hf_config=self.hf_config
-            )
+            model_cls = self.model_class
         except ValueError:
             return
-        self.is_multimodal |= issubclass(model_cls, InModelMultimodalContract)
+        self.is_in_model_multimodal = issubclass(model_cls, InModelMultimodalContract)
+        self.is_multimodal |= self.is_in_model_multimodal
         patch = getattr(model_cls, "patch_model_config", None)
         if patch is not None:
             patch(self)

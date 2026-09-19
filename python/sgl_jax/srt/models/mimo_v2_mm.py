@@ -13,6 +13,7 @@ import numpy as np
 from flax import nnx
 from jax.sharding import Mesh
 
+from sgl_jax.srt.layers.linear import QuantizedLinear
 from sgl_jax.srt.models.mimo_v2_audio import MiMoAudioEncoder
 from sgl_jax.srt.models.mimo_v2_pro import MiMoV2ForCausalLM
 from sgl_jax.srt.models.mimo_v2_vision import MiMoVisionTransformer
@@ -175,6 +176,36 @@ class MiMoV2ForConditionalGeneration(InModelMultimodalContract, MiMoV2ForCausalL
         The text loader replaces graph state, so towers must be detached during
         that step and restored even if loading fails.
         """
+        # Static FP8 preparation currently applies text rules to the entire graph.
+        # MiMo modality mappings expect unquantized weights. Restore towers before
+        # loading them; eval_shape avoids allocating random full-size parameters.
+        with jax.set_mesh(self.mesh):
+            if self.visual is not None and isinstance(self.visual.merger.mlp_fc1, QuantizedLinear):
+                logger.info("Restoring MiMoV2 vision tower to its unquantized structure.")
+                input_buckets = self.visual.input_buckets
+                self.visual = nnx.eval_shape(
+                    lambda: MiMoVisionTransformer(
+                        _value(self.config, "vision_config"),
+                        self.dtype,
+                        nnx.Rngs(0),
+                        self.mesh,
+                        self.encoder_tp,
+                        input_buckets,
+                    )
+                )
+            if self.audio_encoder is not None and isinstance(
+                self.audio_encoder.proj_fc1, QuantizedLinear
+            ):
+                logger.info("Restoring MiMoV2 audio tower to its unquantized structure.")
+                self.audio_encoder = nnx.eval_shape(
+                    lambda: MiMoAudioEncoder(
+                        _value(self.config, "audio_config"),
+                        self.dtype,
+                        self.mesh,
+                        self.encoder_tp,
+                    )
+                )
+
         visual = self.visual
         audio_encoder = self.audio_encoder
         if visual is not None:
