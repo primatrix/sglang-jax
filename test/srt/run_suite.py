@@ -496,6 +496,19 @@ suites = {
         TestFile("test/srt/test_deepseek_v4_decode_short_kv.py", 0.4, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_hca_tile_bucket.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_membership_mask.py", 0.1, runner="pytest"),
+        # DeepSeek V4 model and runtime (CPU)
+        TestFile("python/sgl_jax/test/kernels/blockwise_tuned_value_test.py", 0.1, runner="pytest"),
+        TestFile("python/sgl_jax/test/kernels/sc_moe_permute_test.py", 0.3, runner="pytest"),
+        TestFile("test/srt/model_executor/test_aot_dispatch.py", 0.1, runner="pytest"),
+        TestFile("test/srt/model_executor/test_sampler_device_inputs.py", 0.1, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_compressor_fused_proj.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_moe_merged_gate_up.py", 0.5, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_packed_metadata.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_precompile_ladder.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_rope_cache_pad.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_moe_rank_permutation.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_precision_tracer.py", 0.1, runner="pytest"),
+        TestFile("test/srt/test_step_pack.py", 0.1, runner="pytest"),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile(
