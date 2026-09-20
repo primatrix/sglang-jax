@@ -1,5 +1,5 @@
-"""V4 pool planning: the SWA/history split reproduces the budgets logged on v7x
-(09-19 thrbu / thrc1 servers) and the V4 default ratio is 0.2, not the generic 0.8."""
+"""V4 pool planning: the SWA/history split reproduces two budgets logged by v7x
+servers (generic 0.8 ratio vs 0.2) and the V4 default ratio is 0.2, not the generic 0.8."""
 
 from sgl_jax.srt.mem_cache.deepseek_v4.capacity import plan_deepseek_v4_pools
 from sgl_jax.srt.mem_cache.deepseek_v4.pool import DeepseekV4CacheSpec
@@ -15,12 +15,12 @@ def test_flash_spec_bytes():
     assert _FLASH.swa_bytes_per_token == 44_032  # 43 layers x 512 x bf16 window rows
 
 
-def test_generic_ratio_reproduces_thrbu_budget():
+def test_generic_ratio_reproduces_logged_budget():
     b = plan_deepseek_v4_pools(_FLASH, _AVAILABLE, 256, 128, swa_full_tokens_ratio=0.8)
     assert (b.history_tokens, b.swa_tokens) == (902_784, 722_304)
 
 
-def test_v4_ratio_reproduces_thrc1_budget():
+def test_v4_ratio_reproduces_logged_budget():
     b = plan_deepseek_v4_pools(_FLASH, _AVAILABLE, 256, 128, swa_full_tokens_ratio=0.2)
     assert (b.history_tokens, b.swa_tokens) == (2_423_680, 484_736)
     assert b.allocated_bytes_per_device <= _AVAILABLE
