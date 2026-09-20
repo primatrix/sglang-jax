@@ -483,6 +483,19 @@ suites = {
         TestFile("test/srt/test_deepseek_v4_hca_search.py", 0.1, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_hca_small_page_gather.py", 2.6, runner="pytest"),
         TestFile("test/srt/test_hca_scatter_compaction.py", 0.8, runner="pytest"),
+        # DeepSeek V4 attention backends and dispatch (CPU interpret; the
+        # decode_indexer_kernel test needs a TPU and stays out of this suite)
+        TestFile("test/srt/test_deepseek_v4_compressor_fields.py", 0.1, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_compressor_rope.py", 0.1, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_compressor_tail.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_compressor_row_shard.py", 0.5, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_indexer_row_shard.py", 0.3, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_csa_fused_attention.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_csa_sparse_attention.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_decode_page_take.py", 0.1, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_decode_short_kv.py", 0.4, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_hca_tile_bucket.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_membership_mask.py", 0.1, runner="pytest"),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile(
