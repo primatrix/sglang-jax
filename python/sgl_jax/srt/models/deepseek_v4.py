@@ -25,6 +25,10 @@ from sgl_jax.srt.configs.deepseek_v4 import (
     classify_layers,
     hash_moe_layer_flags,
 )
+from sgl_jax.srt.kernels.dsv4.q_head_norm_rope import (
+    kernel_enabled as q_norm_rope_kernel_enabled,
+)
+from sgl_jax.srt.kernels.dsv4.q_head_norm_rope import q_head_norm_rope
 from sgl_jax.srt.kernels.sparse_core.moe_permute import moe_sc_permute_enabled_by_env
 from sgl_jax.srt.layers.activation import silu_and_mul_with_clamp
 from sgl_jax.srt.layers.gate import GateLogit, TopK
@@ -885,10 +889,22 @@ class DeepseekV4Indexer(nnx.Module):
         from sgl_jax.srt.layers.attention.dsv4.rope import apply_dsv4_partial_rope
 
         q, _ = self.wq_b(q_lora)
-        q = q.reshape(-1, self.num_heads, self.head_dim)
-        q = apply_dsv4_partial_rope(
-            q, cos[:, None, :], sin[:, None, :], rope_head_dim=self.rope_head_dim
-        ).astype(dtype)
+        if q_norm_rope_kernel_enabled():
+            q = q_head_norm_rope(
+                q,
+                cos,
+                sin,
+                heads=self.num_heads,
+                head_dim=self.head_dim,
+                rope_head_dim=self.rope_head_dim,
+                normalize=False,
+                out_dtype=dtype,
+            ).reshape(-1, self.num_heads, self.head_dim)
+        else:
+            q = q.reshape(-1, self.num_heads, self.head_dim)
+            q = apply_dsv4_partial_rope(
+                q, cos[:, None, :], sin[:, None, :], rope_head_dim=self.rope_head_dim
+            ).astype(dtype)
         return IndexerInputs(q, weights * self.weight_scale, self.compressor.weights(cache))
 
     def __call__(self, hidden, q_lora, cos, sin, cache):
@@ -1034,14 +1050,6 @@ class DeepseekV4Attention(nnx.Module):
             q_lora, _ = self.wq_a(hidden)
             q_lora = self.q_norm(q_lora)
         q, _ = self.wq_b(q_lora)
-        q = q.reshape(-1, self.num_heads, self.head_dim)
-        # V4 normalizes q again per head after wq_b, with no learned weight.
-        q = (
-            q.astype(jnp.float32)
-            * jax.lax.rsqrt(
-                jnp.mean(jnp.square(q.astype(jnp.float32)), axis=-1, keepdims=True) + self.norm_eps
-            )
-        ).astype(self.dtype)
         if not sp_local:
             kv, _ = self.wkv(hidden)
             kv = self.kv_norm(kv)
@@ -1050,9 +1058,33 @@ class DeepseekV4Attention(nnx.Module):
             out_sharding=NamedSharding(self.mesh, P("data", None))
         )
         cos, sin = jnp.split(selected[:, : self.rope_head_dim], 2, axis=-1)
-        q = apply_dsv4_partial_rope(
-            q, cos[:, None, :], sin[:, None, :], rope_head_dim=self.rope_head_dim
-        ).astype(self.dtype)
+        if q_norm_rope_kernel_enabled():
+            # One pass over the [T, H*D] projection: per-head norm + partial rope,
+            # written straight in the attention kernels' [T*H, D] row order.
+            q = q_head_norm_rope(
+                q,
+                cos,
+                sin,
+                heads=self.num_heads,
+                head_dim=self.head_dim,
+                rope_head_dim=self.rope_head_dim,
+                normalize=True,
+                eps=self.norm_eps,
+                out_dtype=self.dtype,
+            ).reshape(-1, self.num_heads, self.head_dim)
+        else:
+            q = q.reshape(-1, self.num_heads, self.head_dim)
+            # V4 normalizes q again per head after wq_b, with no learned weight.
+            q = (
+                q.astype(jnp.float32)
+                * jax.lax.rsqrt(
+                    jnp.mean(jnp.square(q.astype(jnp.float32)), axis=-1, keepdims=True)
+                    + self.norm_eps
+                )
+            ).astype(self.dtype)
+            q = apply_dsv4_partial_rope(
+                q, cos[:, None, :], sin[:, None, :], rope_head_dim=self.rope_head_dim
+            ).astype(self.dtype)
         kv = apply_dsv4_partial_rope(kv, cos, sin, rope_head_dim=self.rope_head_dim).astype(
             self.dtype
         )
