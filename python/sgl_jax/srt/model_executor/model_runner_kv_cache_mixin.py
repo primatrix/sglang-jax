@@ -937,13 +937,18 @@ class ModelRunnerKVCacheMixin:
                 if max_total_tokens is not None
                 else int(ci_size)
             )
+        # V4's SWA pool holds only the 128-token HCA window (plus page slack) per running
+        # request, so the generic 0.8 tokens ratio parks most of the KV budget in it at
+        # 44 KB/token; 0.2 still leaves several times the measured peak while the history
+        # pool grows 2.7x (v7x cc=256 A/B, 2026-09-19).
+        swa_ratio = 0.2 if sa.swa_full_tokens_ratio is None else sa.swa_full_tokens_ratio
         self.deepseek_v4_pool_budget = plan_deepseek_v4_pools(
             self._deepseek_v4_cache_spec,
             available,
             max_num_reqs,
             self.page_size,
             dp_size,
-            sa.swa_full_tokens_ratio,
+            swa_ratio,
             max_total_tokens,
         )
         budget = self.deepseek_v4_pool_budget

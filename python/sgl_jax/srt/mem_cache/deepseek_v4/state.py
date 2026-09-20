@@ -3,13 +3,26 @@
 import jax
 import jax.numpy as jnp
 
-from sgl_jax.srt.mem_cache.deepseek_v4.pool import (
+from sgl_jax.srt.mem_cache.deepseek_v4.pool import (  # noqa: F401 (re-exported)
     _buffer_nbytes,
     _build_buffer_updates,
     _validate_buffer_updates,
     allocate_buffer,
+    native_hca_layout,
     scatter_sharding,
 )
+
+
+def score_slice(shape):
+    """Index selecting the score half of an empty state of ``shape``.
+
+    C4/indexer states are ``[.., 8, 4*D]`` = [two contents | two scores] on the last
+    axis; the C128 state is ``[.., 128, 2*D]`` = [content | score], or in the native
+    HCA layout ``[.., 128, 2, D]`` where the score is index 1 of the packing axis.
+    """
+    if len(shape) == 4:
+        return (Ellipsis, 1, slice(None))
+    return (Ellipsis, slice(shape[-1] // 2, None))
 
 
 @jax.tree_util.register_pytree_node_class
@@ -32,9 +45,7 @@ class DeepseekV4CompressStatePool:
         with jax.set_mesh(mesh):
             self.buffers = {
                 family: tuple(
-                    allocate_buffer(shape, jnp.float32, mesh)
-                    .at[..., shape[-1] // 2 :]
-                    .set(-jnp.inf)
+                    allocate_buffer(shape, jnp.float32, mesh).at[score_slice(shape)].set(-jnp.inf)
                     for _ in layers
                 )
                 for family, (layers, shape) in self.layout.items()
@@ -46,9 +57,14 @@ class DeepseekV4CompressStatePool:
         self.padding_index = size
         self.slots_per_rank = size + 1
         slots = (size + 1) * dp_size
+        c128_shape = (
+            (slots, 128, 2, spec.head_dim)
+            if native_hca_layout()
+            else (slots, 128, 2 * spec.head_dim)
+        )
         self.layout = {
             "c4": (spec.layers(4), (slots, 8, 4 * spec.head_dim)),
-            "c128": (spec.layers(128), (slots, 128, 2 * spec.head_dim)),
+            "c128": (spec.layers(128), c128_shape),
             "indexer": (spec.layers(4), (slots, 8, 4 * spec.index_head_dim)),
         }
         self.layer_to_buffer = {
@@ -106,7 +122,7 @@ class DeepseekV4CompressStatePool:
             array.shape[0],
         )
         arrays[i] = array.at[indices].set(
-            values, mode="drop", out_sharding=scatter_sharding(self.mesh, 3)
+            values, mode="drop", out_sharding=scatter_sharding(self.mesh, array.ndim)
         )
         self.buffers = {**self.buffers, family: tuple(arrays)}
 
@@ -115,5 +131,5 @@ class DeepseekV4CompressStatePool:
         for family, arrays in self.buffers.items():
             for layer, i in self.layer_to_buffer[family].items():
                 shape = (request_slots.shape[0], *arrays[i].shape[1:])
-                empty = jnp.zeros(shape, jnp.float32).at[..., shape[-1] // 2 :].set(-jnp.inf)
+                empty = jnp.zeros(shape, jnp.float32).at[score_slice(shape)].set(-jnp.inf)
                 self.write(family, layer, request_slots, empty, valid_mask, dp_rank)
