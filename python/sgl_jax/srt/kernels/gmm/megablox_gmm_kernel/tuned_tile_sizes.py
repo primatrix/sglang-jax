@@ -13,10 +13,9 @@ from sgl_jax.srt.utils.jax_utils import get_device_name
 LARGE_M_FLOOR = 4096
 
 
-def _small_m_tile() -> int:
-    import os
-
-    return int(os.environ.get("SGL_JAX_GMM_V2_SMALL_M_TILE", "32"))
+# tile_m for the small-m wildcard rows below; 32 measured best on v7x for the
+# DeepSeek V4-Flash decode shapes (bs=64: ~12 rows per group).
+SMALL_M_TILE = 32
 
 
 TUNED_TILE_SIZES_GMM_V2 = {
@@ -30,17 +29,16 @@ TUNED_TILE_SIZES_GMM_V2 = {
         # rows over 32 groups, ~12 per group). The auto-tiler picks tm=128 with full K/N,
         # so every group multiplies a 128-row tile that is mostly padding: ~30 us of MXU
         # work inside a 72 us call that is otherwise weight-bandwidth bound. Small-m
-        # wildcard (size_m == 0): any m below LARGE_M_FLOOR. tile_m from
-        # SGL_JAX_GMM_V2_SMALL_M_TILE (default 32) while the sweep is open.
+        # wildcard (size_m == 0): any m below LARGE_M_FLOOR, tile_m = SMALL_M_TILE.
         # The lhs key is the *quantized* activation dtype: gmm_v2 quantizes bf16
         # activations to fp8 when the weights are fp8 and the chip has fp8 MXU ops
         # (maybe_quantize_lhs), so the decode calls look up ("float8_e4m3fn", ...);
         # a "bfloat16" key never matches and the auto-tiler runs silently (kernel
         # name tm_128). Both keys are listed for the no-quantization fallback.
-        ("float8_e4m3fn", "float8_e4m3fn", 32, 0, 4096, 2048): (_small_m_tile(), 4096, 2048),
-        ("float8_e4m3fn", "float8_e4m3fn", 32, 0, 2048, 4096): (_small_m_tile(), 2048, 4096),
-        ("bfloat16", "float8_e4m3fn", 32, 0, 4096, 2048): (_small_m_tile(), 4096, 2048),
-        ("bfloat16", "float8_e4m3fn", 32, 0, 2048, 4096): (_small_m_tile(), 2048, 4096),
+        ("float8_e4m3fn", "float8_e4m3fn", 32, 0, 4096, 2048): (SMALL_M_TILE, 4096, 2048),
+        ("float8_e4m3fn", "float8_e4m3fn", 32, 0, 2048, 4096): (SMALL_M_TILE, 2048, 4096),
+        ("bfloat16", "float8_e4m3fn", 32, 0, 4096, 2048): (SMALL_M_TILE, 4096, 2048),
+        ("bfloat16", "float8_e4m3fn", 32, 0, 2048, 4096): (SMALL_M_TILE, 2048, 4096),
         # Ling-3.0-tiny replicated EPMoE, decode BS=1 hot wi shape.
         # Measured kernel latency: 0.555ms -> 0.382ms (31.1% lower).
         ("bfloat16", "bfloat16", 128, 32, 1536, 512): (32, 768, 512),
