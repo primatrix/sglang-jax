@@ -45,14 +45,10 @@ import jax.numpy as jnp
 # Fused CSA kernel tiling (queries x heads rows per block, keys per tile); the
 # defaults are the measured v7x choice, the envs exist for A/B sweeps.
 _CSA_FUSED_BLOCK_Q = int(os.environ.get("DSV4_CSA_FUSED_BLOCK_Q", "256"))
-_CSA_FUSED_BLOCK_K = int(
-    os.environ.get("DSV4_CSA_FUSED_BLOCK_K", "1024")
-)  # default since pfbase14 (09-19)
+_CSA_FUSED_BLOCK_K = int(os.environ.get("DSV4_CSA_FUSED_BLOCK_K", "1024"))
 # ``DSV4_PAGED_KV_WRITE=1``: prefill-sized window KV writes go through the page-run
 # DMA writer instead of an XLA scatter (decode buckets keep the scatter).
-_PAGED_KV_WRITE = (
-    os.environ.get("DSV4_PAGED_KV_WRITE", "1") == "1"
-)  # default on since pfbase14 (09-19)
+_PAGED_KV_WRITE = os.environ.get("DSV4_PAGED_KV_WRITE", "1") == "1"
 _PAGED_KV_WRITE_MIN_TOKENS = int(os.environ.get("DSV4_PAGED_KV_WRITE_MIN_TOKENS", "256"))
 # Queries per program on the sparse CSA path (the block's selected-unit union is fetched once).
 _CSA_SPARSE_QUERY_BLOCK = int(os.environ.get("DSV4_CSA_SPARSE_QUERY_BLOCK", 0))  # 0 = auto

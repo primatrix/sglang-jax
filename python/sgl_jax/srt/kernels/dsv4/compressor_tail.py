@@ -23,9 +23,7 @@ from sgl_jax.srt.kernels.dsv4.wo_a_projection import LANE, _rotate_gptj, widen_c
 
 # ``DSV4_TAIL_INKERNEL_MASK=1|2``: apply the window validity mask inside the tail
 # kernel (1) and additionally skip the row pad with a partial last block (2).
-_INKERNEL_MASK = int(
-    os.environ.get("DSV4_TAIL_INKERNEL_MASK", "2")
-)  # default since pfbase14 (09-19)
+_INKERNEL_MASK = int(os.environ.get("DSV4_TAIL_INKERNEL_MASK", "2"))
 
 
 def _kernel(comb_ref, nw_ref, cs_ref, out_ref, *, ratio, coff, head_dim, width, eps):

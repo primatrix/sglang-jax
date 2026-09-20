@@ -28,9 +28,7 @@ def resolve_decode_indexer_backend(backend: str = "auto") -> str:
     if backend not in ("auto", "kernel", "p370"):
         raise ValueError(f"unknown CSA decode indexer backend {backend!r}")
     if backend == "auto":
-        backend = os.environ.get(
-            DECODE_INDEXER_BACKEND_ENV, "p370"
-        )  # default since pfbase14 (09-19)
+        backend = os.environ.get(DECODE_INDEXER_BACKEND_ENV, "p370")
         if backend not in ("auto", "kernel", "p370"):
             raise ValueError(
                 f"{DECODE_INDEXER_BACKEND_ENV}={backend!r} must be auto, kernel or p370"
@@ -135,9 +133,7 @@ def select_decode_entries(scores, lengths, *, take: int, topk_backend: str = "au
 
 def short_kv_kernel_enabled() -> bool:
     """``DSV4_DECODE_SHORT_KV_KERNEL=1``: stream pages through the HCA Pallas kernel."""
-    return (
-        os.environ.get("DSV4_DECODE_SHORT_KV_KERNEL", "1") == "1"
-    )  # default on since pfbase14 (09-19)
+    return os.environ.get("DSV4_DECODE_SHORT_KV_KERNEL", "1") == "1"
 
 
 def _short_kv_streaming_attention(
@@ -226,14 +222,14 @@ def _take_pages(pages, page_index):
 
     XLA lowers both the batched ``take_along_axis(pages, idx, axis=1)`` and the flat
     1-D gather on TPU into a per-element s32 gather slow path (64 rows x 512 entries:
-    4.2 ms and 3.9 ms per step at bs=64 in the 09-19 profiles). The default expresses
+    4.2 ms and 3.9 ms per step at bs=64 in v7x decode profiles). The default expresses
     the lookup as one-hot matmuls instead (``_take_pages_onehot``). ``DSV4_DECODE_PAGE_TAKE``
     selects a fallback: ``gather`` (flat 1-D take), ``2d`` (batched take_along_axis).
-    A Pallas SMEM scalar-lookup kernel was measured 3 ms/step slower than the gather
-    (thrbx2, 09-19) and removed.
+    A Pallas SMEM scalar-lookup kernel measured 3 ms/step slower than the gather
+    and was removed.
     """
     mode = os.environ.get("DSV4_DECODE_PAGE_TAKE", "onehot")
-    if mode == "2d" or os.environ.get("DSV4_DECODE_PAGE_TAKE_2D", "0") == "1":
+    if mode == "2d":
         return jnp.take_along_axis(pages, page_index, axis=1)
     if mode == "gather":
         rows, table = pages.shape

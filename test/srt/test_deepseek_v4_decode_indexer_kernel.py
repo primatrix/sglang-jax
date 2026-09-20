@@ -43,7 +43,7 @@ def _batch(lengths_tokens, *, valid, pages_per_seq, seed=0):
 
 def test_resolve_decode_indexer_backend(monkeypatch):
     monkeypatch.delenv("DSV4_DECODE_INDEXER_BACKEND", raising=False)
-    assert resolve_decode_indexer_backend("auto") == "p370"  # default since pfbase14 (09-19)
+    assert resolve_decode_indexer_backend("auto") == "p370"
     monkeypatch.setenv("DSV4_DECODE_INDEXER_BACKEND", "auto")
     expected = "kernel" if jax.default_backend() == "tpu" else "p370"
     assert resolve_decode_indexer_backend("auto") == expected

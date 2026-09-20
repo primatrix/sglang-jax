@@ -237,9 +237,7 @@ def _window_rows(state, chunk_rows, positions_in_window, chunk_index, from_chunk
 
 def _fused_tail() -> bool:
     """``DSV4_FUSED_COMPRESSOR_TAIL=1``: field select + pool + RMSNorm + RoPE as one kernel."""
-    return (
-        os.environ.get("DSV4_FUSED_COMPRESSOR_TAIL", "1") == "1"
-    )  # default on since pfbase14 (09-19)
+    return os.environ.get("DSV4_FUSED_COMPRESSOR_TAIL", "1") == "1"
 
 
 def compress_chunk(

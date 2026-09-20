@@ -242,9 +242,7 @@ def canonicalize_sharding(sharding):
     return sharding
 
 
-_LAZY_HOST_ARGS = (
-    os.environ.get("SGLANG_JAX_LAZY_HOST_ARGS", "1") == "1"
-)  # default on since pfbase14 (09-19)
+_LAZY_HOST_ARGS = os.environ.get("SGLANG_JAX_LAZY_HOST_ARGS", "1") == "1"
 
 
 def lazy_host_args() -> bool:

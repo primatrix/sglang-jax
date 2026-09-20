@@ -58,29 +58,25 @@ _FUSED_MIN_TOKENS = int(os.environ.get("DSV4_CSA_FUSED_MIN_TOKENS", "64"))
 # ``DSV4_CSA_TOPK_MASK=1``: on single-request steps the indexer returns the top-k
 # membership mask (score >= k-th largest, bisection kernel) instead of an index list,
 # skipping approx_max_k's per-row sort and the [T, K, E] membership reduction.
-_TOPK_MASK = os.environ.get("DSV4_CSA_TOPK_MASK", "1") == "1"  # default on since pfbase14 (09-19)
+_TOPK_MASK = os.environ.get("DSV4_CSA_TOPK_MASK", "1") == "1"
 # ``DSV4_INDEXER_ROW_SHARD=1``: inside the attention shard_map every device holds the
 # full [T, H, D] indexer queries and scores all of them (8x redundant work on the
 # exposed path, ~1.3 ms/layer at 8K). Score only this device's T/n row block and
 # all-gather the [T/n, E] top-k membership back along "tensor" (2 MB at 8K).
 # Single-request batches only; others keep the replicated path.
-_INDEXER_ROW_SHARD = (
-    os.environ.get("DSV4_INDEXER_ROW_SHARD", "1") == "1"
-)  # default on since pfbase14 (09-19)
+_INDEXER_ROW_SHARD = os.environ.get("DSV4_INDEXER_ROW_SHARD", "1") == "1"
 # ``DSV4_COMPRESSOR_ROW_SHARD=1``: same idea for the two ratio-4 compressors, which
 # every device ran over the full chunk (~1.6 ms/layer exposed at 8K). Each device
 # compresses its own T/n rows (with a 7-row halo so every window is local), only
 # its own N/n boundary slots, and all-gathers the records; the state ring is
 # written from the request's last 8 tokens re-projected from the full input.
-_COMPRESSOR_ROW_SHARD = (
-    os.environ.get("DSV4_COMPRESSOR_ROW_SHARD", "1") == "1"
-)  # default on since pfbase14 (09-19)
+_COMPRESSOR_ROW_SHARD = os.environ.get("DSV4_COMPRESSOR_ROW_SHARD", "1") == "1"
 _ROW_SHARD_AXIS = os.environ.get("DSV4_INDEXER_ROW_SHARD_AXIS", "tensor")
 
 
 def resolve_csa_attention_backend() -> str:
     """``DSV4_CSA_ATTENTION=auto|sparse|dense|fused`` (auto == dense; fused = Pallas flash kernel)."""
-    mode = os.environ.get("DSV4_CSA_ATTENTION", "fused").lower()  # default since pfbase14 (09-19)
+    mode = os.environ.get("DSV4_CSA_ATTENTION", "fused").lower()
     if mode == "auto":
         # The gathered kernels only pay off when the per-block selection union is far
         # smaller than the candidate set; CSA's per-query top-512 over <=32K history
@@ -512,9 +508,7 @@ def run_layer(
 # ratio`` of them), which the writer DMAs as one segment; segments that are not a
 # tile-aligned contiguous run fall back to its row path, so any layout stays
 # correct. The scatter costs ~0.28 ms per call (two per CSA layer) on an 8K chunk.
-_PAGED_RECORD_WRITE = (
-    os.environ.get("DSV4_PAGED_RECORD_WRITE", "1") == "1"
-)  # default on since pfbase14 (09-19)
+_PAGED_RECORD_WRITE = os.environ.get("DSV4_PAGED_RECORD_WRITE", "1") == "1"
 
 _PAGED_RECORD_MIN = int(os.environ.get("DSV4_PAGED_RECORD_WRITE_MIN_RECORDS", "256"))
 

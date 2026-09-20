@@ -137,7 +137,7 @@ def grouped_output_projection(
 
 def use_fused_wo_a() -> bool:
     """``DSV4_FUSED_WO_A=1``: inverse RoPE + grouped wo_a as one Pallas kernel per layer."""
-    return os.environ.get("DSV4_FUSED_WO_A", "1") == "1"  # default on since pfbase14 (09-19)
+    return os.environ.get("DSV4_FUSED_WO_A", "1") == "1"
 
 
 def fuse_wo_a_weights(grouped, *, mesh=None):
