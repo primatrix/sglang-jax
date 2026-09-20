@@ -748,6 +748,55 @@ _MERGED_GATE_UP = os.environ.get("DSV4_MOE_MERGED_GATE_UP", "0") == "1"
 # instead of the 4096-wide hidden; the compressors then run on local rows with a
 # ppermute halo (needs DSV4_COMPRESSOR_ROW_SHARD=1). HCA layers keep the full gather.
 _LOWRANK_AG = os.environ.get("DSV4_LOWRANK_AG", "1") == "1"
+
+
+def _q_norm_rope(q, cos, sin, *, heads, head_dim, rope_head_dim, normalize, eps, out_dtype):
+    """`q_head_norm_rope` on a ``[T, heads*head_dim]`` projection -> ``[T, heads, head_dim]``.
+
+    A head-parallel projection (lanes sharded over ``tensor``) runs the kernel per
+    shard on its local heads; a replicated one runs it directly.
+    """
+    spec = jax.typeof(q).sharding.spec
+    lane_axis = spec[1] if len(spec) > 1 else None
+    if lane_axis is None:
+        return q_head_norm_rope(
+            q,
+            cos,
+            sin,
+            heads=heads,
+            head_dim=head_dim,
+            rope_head_dim=rope_head_dim,
+            normalize=normalize,
+            eps=eps,
+            out_dtype=out_dtype,
+        ).reshape(-1, heads, head_dim)
+    mesh = jax.sharding.get_abstract_mesh()
+    shards = int(mesh.shape[lane_axis]) if isinstance(lane_axis, str) else 1
+    local_heads = heads // shards
+
+    def per_shard(q_local, cos_local, sin_local):
+        out = q_head_norm_rope(
+            q_local,
+            cos_local,
+            sin_local,
+            heads=local_heads,
+            head_dim=head_dim,
+            rope_head_dim=rope_head_dim,
+            normalize=normalize,
+            eps=eps,
+            out_dtype=out_dtype,
+        )
+        return out.reshape(-1, local_heads, head_dim)
+
+    return jax.shard_map(
+        per_shard,
+        mesh=None,
+        in_specs=(P(None, lane_axis), P(None, None), P(None, None)),
+        out_specs=P(None, lane_axis, None),
+        check_vma=False,
+    )(q, cos, sin)
+
+
 # ``DSV4_HCA_FUSED_PROJ=1`` (default): build the HCA compressor's fused ``[Wkv|Wgate]^T`` bf16
 # projection once after loading instead of converting the f32 gate weight and
 # concatenating on every step in every HCA layer.
@@ -890,7 +939,7 @@ class DeepseekV4Indexer(nnx.Module):
 
         q, _ = self.wq_b(q_lora)
         if q_norm_rope_kernel_enabled():
-            q = q_head_norm_rope(
+            q = _q_norm_rope(
                 q,
                 cos,
                 sin,
@@ -898,8 +947,9 @@ class DeepseekV4Indexer(nnx.Module):
                 head_dim=self.head_dim,
                 rope_head_dim=self.rope_head_dim,
                 normalize=False,
+                eps=0.0,
                 out_dtype=dtype,
-            ).reshape(-1, self.num_heads, self.head_dim)
+            )
         else:
             q = q.reshape(-1, self.num_heads, self.head_dim)
             q = apply_dsv4_partial_rope(
@@ -1061,7 +1111,7 @@ class DeepseekV4Attention(nnx.Module):
         if q_norm_rope_kernel_enabled():
             # One pass over the [T, H*D] projection: per-head norm + partial rope,
             # written straight in the attention kernels' [T*H, D] row order.
-            q = q_head_norm_rope(
+            q = _q_norm_rope(
                 q,
                 cos,
                 sin,
@@ -1071,7 +1121,7 @@ class DeepseekV4Attention(nnx.Module):
                 normalize=True,
                 eps=self.norm_eps,
                 out_dtype=self.dtype,
-            ).reshape(-1, self.num_heads, self.head_dim)
+            )
         else:
             q = q.reshape(-1, self.num_heads, self.head_dim)
             # V4 normalizes q again per head after wq_b, with no learned weight.
