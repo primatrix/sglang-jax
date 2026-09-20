@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, replace
 
 
@@ -117,6 +118,17 @@ def get_hca_kernel_schedule(
     platform = _platform_parameters(device_kind)
     if head_dim % platform.mxu_lanes:
         raise ValueError(f"head_dim={head_dim} must be aligned to {platform.mxu_lanes}")
+    # Queries per grid step.  The chunk kernel's per-step cost is mostly fixed
+    # (q/SWA/output DMAs, accumulator init), so larger blocks amortise it;
+    # the platform default keeps the VMEM footprint small.
+    query_block_size = int(
+        os.environ.get("DSV4_HCA_QUERY_BLOCK", "128")
+    )  # default since pfbase14 (09-19)
+    if query_block_size <= 0 or query_block_size % platform.query_compute_block_size:
+        raise ValueError(
+            f"DSV4_HCA_QUERY_BLOCK={query_block_size} must be a positive multiple of "
+            f"{platform.query_compute_block_size}"
+        )
 
     def vmem_bytes(compressed_tile: int, query_compute: int) -> int:
         """Peak VMEM of one chunk-attention program, in bytes.
@@ -126,7 +138,7 @@ def get_hca_kernel_schedule(
         multiple, matching the kernel's own layout.
         """
         heads = _align(local_heads, platform.sublanes)
-        rows = platform.query_block_size * heads
+        rows = query_block_size * heads
         q_buffers = 2 * rows * head_dim * 2  # double-buffered across grid steps
         output_staging = rows * head_dim * 2
         accumulators = rows * head_dim * 4
@@ -173,7 +185,7 @@ def get_hca_kernel_schedule(
         cache_write_tile=platform.cache_write_tile,
         boundary_small_tile=small_boundary,
         boundary_large_tile=large_boundary,
-        query_block_size=platform.query_block_size,
+        query_block_size=query_block_size,
         query_compute_block_size=query_compute,
         swa_dma_tile=platform.swa_dma_tile,
         swa_compute_tile=platform.swa_compute_tile,
