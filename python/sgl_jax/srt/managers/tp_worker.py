@@ -16,7 +16,7 @@ from jax.experimental.multihost_utils import broadcast_one_to_all
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.configs.model_config import ModelConfig, is_deepseek_v4_config
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.layers.routed_experts_capturer import get_global_experts_capturer
 from sgl_jax.srt.managers.schedule_batch import (
@@ -31,6 +31,13 @@ from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+
+def _fuse_sample_enabled(model_config) -> bool:
+    env = os.getenv("SGLANG_JAX_FUSE_SAMPLE")
+    if env is not None:
+        return env == "1"
+    return is_deepseek_v4_config(model_config)
 
 
 class _WorkerIterStats:
@@ -93,15 +100,6 @@ class ModelWorker:
         # Parse args
         self.tp_size = server_args.tp_size
         self.dp_size = server_args.dp_size
-        # One jit per decode tick (resolve futures + run_model + sampler +
-        # set futures): built for Pathways-PD, and opt-in for any deployment
-        # with SGLANG_JAX_FUSE_SAMPLE=1 (saves the four extra dispatches).
-        self._pd_fuse_sample = (
-            server_args.pd_disaggregation == "pathways"
-            and os.getenv("SGLANG_PD_FUSE_SAMPLE") == "1"
-        ) or os.getenv(
-            "SGLANG_JAX_FUSE_SAMPLE", "1"
-        ) == "1"  # default on since pfbase14 (09-19)
         from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
@@ -131,6 +129,13 @@ class ModelWorker:
             ),
             is_draft_model=is_draft_worker,
         )
+        # One jit per decode tick (resolve futures + run_model + sampler + set
+        # futures): built for Pathways-PD; SGLANG_JAX_FUSE_SAMPLE decides when set,
+        # otherwise only DeepSeek V4 turns it on (saves four dispatches per tick).
+        self._pd_fuse_sample = (
+            server_args.pd_disaggregation == "pathways"
+            and os.getenv("SGLANG_PD_FUSE_SAMPLE") == "1"
+        ) or _fuse_sample_enabled(self.model_config)
 
         self.mesh = mesh
         self.page_size = server_args.page_size

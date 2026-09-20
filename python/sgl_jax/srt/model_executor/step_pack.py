@@ -31,9 +31,7 @@ FORWARD_BATCH_FIELDS = (
 # shape on the host before the jit (grammar mask sizing).
 SAMPLING_FIELDS = ("top_ps", "top_ks", "min_ps", "positions", "sampling_seeds")
 
-_ENABLED = (
-    os.environ.get("SGLANG_JAX_PACK_STEP_ARGS", "1") == "1"
-)  # default on since pfbase14 (09-19)
+_ENABLED = os.environ.get("SGLANG_JAX_PACK_STEP_ARGS", "1") == "1"
 
 
 def pack_step_enabled() -> bool:

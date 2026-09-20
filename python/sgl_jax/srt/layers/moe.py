@@ -32,20 +32,17 @@ from sgl_jax.srt.utils.quantization.quantization_utils import (
 )
 from sgl_jax.srt.utils.weight_utils import WeightMapping
 
-# ``SGL_JAX_MOE_INVERSE_BY_SORT=1``: build the un-permute index with argsort
-# instead of a scatter (same values; see EPMoE._unpermute).
-_INVERSE_BY_SORT = (
-    os.environ.get("SGL_JAX_MOE_INVERSE_BY_SORT", "1") == "1"
-)  # default on since pfbase14 (09-19)
+# ``SGL_JAX_MOE_INVERSE_BY_SORT``: when set, overrides the per-layer
+# ``sort_free_permute`` choice of how the un-permute index is built ("1" =
+# argsort, "0" = scatter; same values, see EPMoE._unpermute).
+_INVERSE_BY_SORT_ENV = os.environ.get("SGL_JAX_MOE_INVERSE_BY_SORT")
 # ``SGL_JAX_MOE_ACT_ROWS=1``: run the SwiGLU activation only over the local experts'
 # rows of the gather buffer (kernels/dsv4/moe_act.silu_mul_rows).
-_ACT_ROWS = os.environ.get("SGL_JAX_MOE_ACT_ROWS", "1") == "1"  # default on since pfbase14 (09-19)
+_ACT_ROWS = os.environ.get("SGL_JAX_MOE_ACT_ROWS", "1") == "1"
 # ``SGL_JAX_MOE_GMM2_NO_ZERO_INIT=1``: skip the second grouped matmul's zero fill of
 # the unvisited output rows when the SparseCore combine (which never reads them) is
 # the consumer.
-_GMM2_NO_ZERO_INIT = (
-    os.environ.get("SGL_JAX_MOE_GMM2_NO_ZERO_INIT", "1") == "1"
-)  # default on since pfbase14 (09-19)
+_GMM2_NO_ZERO_INIT = os.environ.get("SGL_JAX_MOE_GMM2_NO_ZERO_INIT", "1") == "1"
 
 
 logger = logging.getLogger(__name__)
@@ -57,6 +54,7 @@ logger = logging.getLogger(__name__)
 # from an [N, N] comparison instead: rank(i) = #{j: key_j < key_i} + #{j < i: key_j ==
 # key_i} is exactly the stable argsort's inverse, and the forward permutation is its
 # one-hot transpose. Same permutation, no sort. Larger vectors (prefill) keep the sort.
+# Layers opt in with ``EPMoE(sort_free_permute=True)``; the default keeps the sort.
 _RANK_SORT_MAX_ENTRIES = int(os.environ.get("SGL_JAX_MOE_RANK_SORT_MAX_ENTRIES", "1024"))
 
 
@@ -104,8 +102,17 @@ class EPMoE(nnx.Module):
         moe_dp_size: int = 1,
         swiglu_limit: float | None = None,
         use_sc_permute: bool | None = None,
+        sort_free_permute: bool = False,
     ):
         self.num_experts_per_tok = num_experts_per_tok
+        # Opt-in sort-free routing permutations for small decode batches (see
+        # _stable_argsort_small); the env override applies to the inverse only.
+        self.sort_free_permute = bool(sort_free_permute)
+        self.inverse_by_sort = (
+            _INVERSE_BY_SORT_ENV == "1"
+            if _INVERSE_BY_SORT_ENV is not None
+            else self.sort_free_permute
+        )
         # Opt-in SparseCore permute/unpermute kernels; ``None`` defers to the env flag.
         self.use_sc_permute = (
             moe_sc_permute_enabled_by_env() if use_sc_permute is None else bool(use_sc_permute)
@@ -1002,7 +1009,10 @@ class EPMoE(nnx.Module):
             )
 
         flatten_selected_experts = jnp.ravel(top_k_indices)
-        sorted_selected_experts = _stable_argsort_small(flatten_selected_experts)
+        if self.sort_free_permute:
+            sorted_selected_experts = _stable_argsort_small(flatten_selected_experts)
+        else:
+            sorted_selected_experts = jnp.argsort(flatten_selected_experts, stable=True)
         # token_indices: maps each sorted position to the original token index.
         # Pass to _gmm_compute so the gather happens there (indexed_gmm pattern),
         # avoiding a full [M*top_k, D] materialization in _permute.
@@ -1042,7 +1052,7 @@ class EPMoE(nnx.Module):
                 padding = jnp.zeros((padding_size, intermediate.shape[1]), dtype=intermediate.dtype)
                 intermediate = jnp.concatenate([intermediate, padding], axis=0)
 
-        if _INVERSE_BY_SORT:
+        if self.inverse_by_sort:
             # The inverse of a permutation is its argsort; XLA lowers the
             # scatter form below to a serial TC scatter (0.19 ms per layer at
             # 8K on v7x, 4x the cost of the sort that produced the permutation).

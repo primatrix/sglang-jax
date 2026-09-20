@@ -173,7 +173,7 @@ def _calculate_num_column_partitions(
 
     # Keep splitting until num_row_partitions <= num_simd_lanes (hard limit),
     # even when that means dropping below the preferred pipeline depth
-    # (upstream tpu-inference #3513).
+    # (upstream fix: https://github.com/vllm-project/tpu-inference/pull/3513).
     while num_cores // num_column_partitions > num_simd_lanes and _can_split_further(
         num_column_partitions
     ):

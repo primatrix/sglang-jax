@@ -24,7 +24,7 @@ from sgl_jax.srt.utils.common_utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
-# Switch read by EPMoE when ``use_sc_permute`` is not given (default on since pfbase14).
+# Switch read by EPMoE when ``use_sc_permute`` is not given (off unless set).
 ENV_FLAG = "SGL_JAX_MOE_SC_PERMUTE"
 
 # Below this fraction of TensorCore VMEM a plain TC gather beats the SC round-trip
@@ -33,8 +33,8 @@ _SMALL_INPUT_VMEM_FRACTION = 0.6
 _SUPPORTED_GATHER_BITS = (8, 16, 32)
 
 
-def moe_sc_permute_enabled_by_env() -> bool:
-    return get_bool_env_var(ENV_FLAG, "true")  # default on since pfbase14 (09-19)
+def moe_sc_permute_enabled_by_env(default: str = "false") -> bool:
+    return get_bool_env_var(ENV_FLAG, default)
 
 
 @functools.lru_cache(maxsize=1)

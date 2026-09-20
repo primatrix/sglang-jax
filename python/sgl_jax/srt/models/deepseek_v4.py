@@ -25,6 +25,7 @@ from sgl_jax.srt.configs.deepseek_v4 import (
     classify_layers,
     hash_moe_layer_flags,
 )
+from sgl_jax.srt.kernels.sparse_core.moe_permute import moe_sc_permute_enabled_by_env
 from sgl_jax.srt.layers.activation import silu_and_mul_with_clamp
 from sgl_jax.srt.layers.gate import GateLogit, TopK
 from sgl_jax.srt.layers.linear import LinearBase
@@ -426,6 +427,10 @@ class DeepseekV4MoE(nnx.Module):
             layer_id=layer_id,
             quantization_config=getattr(config, "quantization_config", None),
             swiglu_limit=config.swiglu_limit,
+            # V4 defaults: SparseCore permute/combine (SGL_JAX_MOE_SC_PERMUTE=false
+            # turns it off) and sort-free routing permutations for decode.
+            use_sc_permute=moe_sc_permute_enabled_by_env("true"),
+            sort_free_permute=True,
         )
         if getattr(config, "expert_dtype", None) == "fp4":
             if self.experts.replicate_experts:
@@ -731,16 +736,14 @@ _FUSED_MOE_MIN_TOKENS = int(os.environ.get("DSV4_FUSED_MOE_MIN_TOKENS", "256"))
 # RMSNorm (per row) and the bf16 cast on the T/tp rows and all-gather the result,
 # instead of gathering the raw stream and normalising all T rows on every device.
 # Same values; the gather carries bf16 instead of the stream dtype.
-_SP_NORM_BEFORE_GATHER = (
-    os.environ.get("DSV4_SP_NORM_BEFORE_GATHER", "1") == "1"
-)  # default on since pfbase14 (09-19)
+_SP_NORM_BEFORE_GATHER = os.environ.get("DSV4_SP_NORM_BEFORE_GATHER", "1") == "1"
 # ``DSV4_MOE_MERGED_GATE_UP=1``: run the routed experts' gate and up projections as one gmm.
 _MERGED_GATE_UP = os.environ.get("DSV4_MOE_MERGED_GATE_UP", "0") == "1"
 # ``DSV4_LOWRANK_AG=1``: on CSA layers under sequence parallelism, project q_lora / kv /
 # indexer weights on the local T/tp rows and all-gather those (1024+512+64 columns)
 # instead of the 4096-wide hidden; the compressors then run on local rows with a
 # ppermute halo (needs DSV4_COMPRESSOR_ROW_SHARD=1). HCA layers keep the full gather.
-_LOWRANK_AG = os.environ.get("DSV4_LOWRANK_AG", "1") == "1"  # default on since pfbase14 (09-19)
+_LOWRANK_AG = os.environ.get("DSV4_LOWRANK_AG", "1") == "1"
 # ``DSV4_HCA_FUSED_PROJ=1`` (default): build the HCA compressor's fused ``[Wkv|Wgate]^T`` bf16
 # projection once after loading instead of converting the f32 gate weight and
 # concatenating on every step in every HCA layer.
@@ -748,12 +751,12 @@ _HCA_FUSED_PROJ = os.environ.get("DSV4_HCA_FUSED_PROJ", "1") == "1"
 _WGATE_F32 = os.environ.get("DSV4_COMPRESSOR_WGATE_F32", "0") == "1"
 # ``DSV4_W8A8_DENSE=1``: fp8 activations for the dense fp8 linears (weights are
 # already fp8); default keeps bf16 activations.
-_W8A8_DENSE = os.environ.get("DSV4_W8A8_DENSE", "1") == "1"  # default on since pfbase14 (09-19)
+_W8A8_DENSE = os.environ.get("DSV4_W8A8_DENSE", "1") == "1"
 # ``DSV4_W8A8_DENSE_NAMES=wq_b,wo_b``: restrict fp8 activations to these linears (an empty
 # value means all of them).
 _W8A8_DENSE_NAMES_ENV = os.environ.get(
     "DSV4_W8A8_DENSE_NAMES", "wq_a,wkv,wo_a,wo_b,indexer_wq_b,gate_proj,up_proj,down_proj"
-)  # default since pfbase14 (09-19)
+)
 _W8A8_DENSE_NAMES = (
     frozenset(x.strip() for x in _W8A8_DENSE_NAMES_ENV.split(",") if x.strip())
     if _W8A8_DENSE_NAMES_ENV
@@ -776,9 +779,7 @@ def _use_fused_moe(experts) -> bool:
 # padded to a multiple of 128. With 64 lanes XLA picks a column-major layout for the jit
 # parameter and inserts a full-table relayout copy (2 x 268 MB) at the top of every step
 # (measured 0.71 ms/step on v7x). Consumers slice the first ``rope_head_dim`` lanes.
-_ROPE_CACHE_LANE_PAD = (
-    os.environ.get("DSV4_ROPE_CACHE_LANE_PAD", "1") == "1"
-)  # default on since pfbase14 (09-19)
+_ROPE_CACHE_LANE_PAD = os.environ.get("DSV4_ROPE_CACHE_LANE_PAD", "1") == "1"
 
 
 def _split_rope_cache(cache, rope_dim):
@@ -1138,7 +1139,7 @@ _MHC_SEAM_MIN_TOKENS = int(os.environ.get("DSV4_MHC_SEAM_MIN_TOKENS", "64"))
 # ICI (RS + AG == AR); the replicated compute shrinks by the tensor size. Only
 # prefill buckets take the path (rows >= DSV4_SEQ_PARALLEL_MIN_TOKENS and
 # divisible by the tensor axis); decode keeps the replicated form.
-_SEQ_PARALLEL = os.environ.get("DSV4_SEQ_PARALLEL", "1") == "1"  # default on since pfbase14 (09-19)
+_SEQ_PARALLEL = os.environ.get("DSV4_SEQ_PARALLEL", "1") == "1"
 _SEQ_PARALLEL_MIN_TOKENS = int(os.environ.get("DSV4_SEQ_PARALLEL_MIN_TOKENS", "256"))
 
 
@@ -1161,7 +1162,7 @@ def _sp_rows(mesh, x):
 
 def _use_mhc_seam() -> bool:
     """``DSV4_MHC_SEAM=1``: fuse each sublayer's mHC post with the next sublayer's pre."""
-    return os.environ.get("DSV4_MHC_SEAM", "1") == "1"  # default on since pfbase14 (09-19)
+    return os.environ.get("DSV4_MHC_SEAM", "1") == "1"
 
 
 class DeepseekV4DecoderLayer(nnx.Module):
@@ -1263,9 +1264,7 @@ class DeepseekV4DecoderLayer(nnx.Module):
         tp = int(self.mesh.shape.get("tensor", 1))
         if not _sp_active(self.mesh, hidden.shape[0] * tp):
             return False
-        if (
-            os.environ.get("DSV4_COMPRESSOR_ROW_SHARD", "1") != "1"
-        ):  # default on since pfbase14 (09-19)
+        if os.environ.get("DSV4_COMPRESSOR_ROW_SHARD", "1") != "1":
             raise ValueError("DSV4_LOWRANK_AG needs DSV4_COMPRESSOR_ROW_SHARD=1")
         return int(batch.seq_lens.shape[0]) == 1
 

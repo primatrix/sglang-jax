@@ -40,7 +40,7 @@ from jax._src.lib import xla_client as _xc
 
 logger = logging.getLogger(__name__)
 
-_ENV = os.environ.get("SGLANG_JAX_AOT_DISPATCH", "auto")  # default (auto) since pfbase14 (09-19)
+_ENV = os.environ.get("SGLANG_JAX_AOT_DISPATCH", "auto")
 _AUTO_MIN_ARGS = 512
 
 _FALLBACK = object()

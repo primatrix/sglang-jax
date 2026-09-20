@@ -21,11 +21,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Mirror of schedule_batch._EXTEND_BS_BUCKETS: precompile every extend bs bucket.
-_EXTEND_BS_BUCKETS = (
-    os.environ.get("SGLANG_JAX_EXTEND_BS_BUCKETS", "1") == "1"
-)  # default on since pfbase14 (09-19)
-
 
 class CompilationManager:
     """Owns bucket computation, dummy batch construction, and pre-compilation."""
@@ -223,15 +218,23 @@ class CompilationManager:
         prepare_lora_fn: Callable | None,
         future_token_ids_map,
     ):
-        from sgl_jax.srt.managers.schedule_batch import ForwardMode
+        from sgl_jax.srt.managers.schedule_batch import (
+            ForwardMode,
+            extend_bs_buckets_enabled,
+        )
         from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
         start_time = time.perf_counter()
         bs = self.max_padded_batch_size
-        # With SGLANG_JAX_EXTEND_BS_BUCKETS the runtime pads extend batches to the
-        # smallest fitting bucket, so every bucket needs its compiled variants.
-        extend_bs = list(self.bs_buckets) if _EXTEND_BS_BUCKETS else [bs]
+        # When the runtime pads extend batches to the smallest fitting bucket
+        # (schedule_batch.extend_bs_buckets_enabled), every bucket needs its
+        # compiled variants.
+        extend_bs = (
+            list(self.bs_buckets)
+            if extend_bs_buckets_enabled(getattr(model_runner, "model_config", None))
+            else [bs]
+        )
         multimodal_options = (True,) if self.precompile_in_model_multimodal else (False,)
         logger.info(
             "[EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s multimodal=%s",

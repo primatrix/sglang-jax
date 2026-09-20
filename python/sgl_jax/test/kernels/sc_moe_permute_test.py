@@ -190,7 +190,7 @@ class EPMoEScPermuteTest(absltest.TestCase):
         self.assertEqual(texts[0], texts[1])
         self.assertNotIn("sc_ragged_gather", texts[1])
 
-    def test_env_flag_default_on(self):
+    def test_env_flag_default_off(self):
         ndev = len(jax.devices())
         mesh = create_device_mesh(ici_parallelism=[1, ndev], dcn_parallelism=[1, 1])
         with jax.set_mesh(mesh):
@@ -202,13 +202,14 @@ class EPMoEScPermuteTest(absltest.TestCase):
                 mesh=mesh,
                 intermediate_dim=128,
             )
-        self.assertTrue(layer.use_sc_permute)  # default on since pfbase14 (09-19)
+        self.assertFalse(layer.use_sc_permute)
         self.assertNotIn("SGL_JAX_MOE_SC_PERMUTE", os.environ)
 
 
 class ColumnPartitionHardLimitTest(parameterized.TestCase):
     """Host-side regression for the num_row_partitions <= num_simd_lanes hard
-    limit (upstream tpu-inference #3513): the preferred-pipeline-depth loop
+    limit (upstream fix https://github.com/vllm-project/tpu-inference/pull/3513): the
+    preferred-pipeline-depth loop
     must not stop splitting before the hardware constraint is satisfied."""
 
     @parameterized.parameters(

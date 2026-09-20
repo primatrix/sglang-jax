@@ -22,6 +22,14 @@ from sgl_jax.srt.utils.common_utils import get_bool_env_var
 logger = logging.getLogger(__name__)
 
 
+def is_deepseek_v4_config(model_config) -> bool:
+    """True when ``model_config`` describes a DeepSeek V4 checkpoint."""
+    cfg = getattr(model_config, "hf_config", None)
+    return getattr(cfg, "model_type", None) == "deepseek_v4" or "DeepseekV4ForCausalLM" in (
+        getattr(cfg, "architectures", None) or ()
+    )
+
+
 class AttentionArch(IntEnum):
     MLA = auto()
     MHA = auto()
