@@ -267,7 +267,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             queries = np.asarray(batch.extend_seq_lens, np.int32).reshape(dp, -1)
         per_request = np.where(queries > 0, lengths // 128, 0)
         if os.environ.get("DSV4_HCA_TILE_BUCKET_SUM", "0") == "1":
-            # Legacy (pre 09-19): bucket the batch total. The compressed tile is a
+            # Previous behaviour: bucket the batch total. The compressed tile is a
             # per-request, per-token quantity, so this over-sized decode tiles
             # (64 x 9K requests -> 4608 records -> a 2048+ tile with 72 live
             # entries) and never matched the per-request precompile ladder.

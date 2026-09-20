@@ -62,7 +62,7 @@ def _run(inputs, sched):
 
 def test_boundary_native_matches_gather_path(monkeypatch):
     # state_pool is donated by the update: build the inputs afresh for each run.
-    monkeypatch.setenv("DSV4_HCA_BOUNDARY_NATIVE", "0")  # default on since pfbase14 (09-19)
+    monkeypatch.setenv("DSV4_HCA_BOUNDARY_NATIVE", "0")
     ref, ref_mask, ref_pool = _run(*_inputs())
     monkeypatch.setenv("DSV4_HCA_BOUNDARY_NATIVE", "1")
     assert hca._boundary_native_enabled()

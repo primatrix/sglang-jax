@@ -121,9 +121,7 @@ def get_hca_kernel_schedule(
     # Queries per grid step.  The chunk kernel's per-step cost is mostly fixed
     # (q/SWA/output DMAs, accumulator init), so larger blocks amortise it;
     # the platform default keeps the VMEM footprint small.
-    query_block_size = int(
-        os.environ.get("DSV4_HCA_QUERY_BLOCK", "128")
-    )  # default since pfbase14 (09-19)
+    query_block_size = int(os.environ.get("DSV4_HCA_QUERY_BLOCK", "128"))
     if query_block_size <= 0 or query_block_size % platform.query_compute_block_size:
         raise ValueError(
             f"DSV4_HCA_QUERY_BLOCK={query_block_size} must be a positive multiple of "

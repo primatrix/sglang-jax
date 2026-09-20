@@ -44,7 +44,7 @@ def nopad_small_enabled() -> bool:
     decode), run the mHC kernels on a block equal to the batch instead of padding
     the streams to 8 rows (and the gate mixes to a lane block) in every layer; the
     pad and the slice back cost ~4 us each per kernel per layer at bs=1."""
-    return os.environ.get("DSV4_MHC_NOPAD_SMALL", "1") == "1"  # default on since pfbase14 (09-19)
+    return os.environ.get("DSV4_MHC_NOPAD_SMALL", "1") == "1"
 
 
 def get_interpret() -> bool:

@@ -23,7 +23,7 @@ def _emit_native_layout() -> bool:
     straight from the ``[slots, 128, 2, 512]`` state pool.  The default path reshapes
     the pool to ``[slots, 128, 2, 4, 128]`` first, which XLA materialises as a copy of
     the whole pool in every HCA layer of every step (11 us per layer on v7x)."""
-    return os.environ.get("DSV4_HCA_EMIT_NATIVE", "1") == "1"  # default on since pfbase14 (09-19)
+    return os.environ.get("DSV4_HCA_EMIT_NATIVE", "1") == "1"
 
 
 def _interpret_pallas() -> bool:
@@ -588,9 +588,7 @@ def _hca_emit_boundary_native_kernel(
 
 
 def _boundary_native_enabled() -> bool:
-    return (
-        os.environ.get("DSV4_HCA_BOUNDARY_NATIVE", "1") == "1"
-    )  # default on since pfbase14 (09-19)
+    return os.environ.get("DSV4_HCA_BOUNDARY_NATIVE", "1") == "1"
 
 
 @functools.partial(jax.jit, static_argnames=("norm_eps",))

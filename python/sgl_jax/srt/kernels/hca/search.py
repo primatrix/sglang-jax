@@ -12,9 +12,7 @@ import os
 
 import jax.numpy as jnp
 
-_COMPARE = (
-    os.environ.get("DSV4_HCA_SEARCH_COMPARE", "1") == "1"
-)  # default on since pfbase14 (09-19)
+_COMPARE = os.environ.get("DSV4_HCA_SEARCH_COMPARE", "1") == "1"
 
 
 def searchsorted_right(table, values):

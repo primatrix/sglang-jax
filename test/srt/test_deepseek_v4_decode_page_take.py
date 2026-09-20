@@ -10,7 +10,6 @@ from sgl_jax.srt.layers.attention.dsv4 import decode as m
 
 
 def _run(pages, idx, monkeypatch, mode):
-    monkeypatch.delenv("DSV4_DECODE_PAGE_TAKE_2D", raising=False)
     if mode is None:
         monkeypatch.delenv("DSV4_DECODE_PAGE_TAKE", raising=False)
     else:
