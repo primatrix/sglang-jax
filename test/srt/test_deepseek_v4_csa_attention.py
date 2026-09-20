@@ -79,3 +79,26 @@ def test_selected_mask_equals_selected_entries():
         want_d = np.asarray(att.dsv4_dense_attention(**kw))
         got_d = np.asarray(att.dsv4_dense_attention(**kw2))
         np.testing.assert_array_equal(got_d, want_d)
+
+
+def test_inkernel_mask_matches_dense(monkeypatch):
+    """Mask built in VMEM from metadata == dense reference (threshold and no-selection paths)."""
+    from sgl_jax.srt.layers.attention.dsv4.attention import packed_membership
+
+    monkeypatch.setattr(att, "_CSA_INKERNEL_MASK", True)
+    for T, W, E, H, D, K, ratio, seed in (
+        (16, 40, 100, 8, 128, 8, 4, 0),
+        (13, 300, 700, 4, 128, 32, 4, 1),
+        (24, 0, 64, 2, 128, 4, 4, 2),  # no window rows at all
+        (9, 50, 30, 2, 128, 4, 128, 5),  # HCA-style: every completed record admitted
+    ):
+        kw = _case(T, W, E, H, D, K, ratio, seed)
+        if ratio == 128:
+            kw["selected_entries"] = None
+        else:
+            kw["selected_mask"] = packed_membership(kw.pop("selected_entries"), E)
+        want = np.asarray(att.dsv4_dense_attention(**kw))
+        got = np.asarray(att.csa_fused_attention(**kw, interpret=True))
+        assert got.shape == want.shape
+        np.testing.assert_allclose(got, want, rtol=1e-3, atol=1e-3)
+        np.testing.assert_array_equal(got[~np.asarray(kw["valid_token_mask"])], 0.0)
