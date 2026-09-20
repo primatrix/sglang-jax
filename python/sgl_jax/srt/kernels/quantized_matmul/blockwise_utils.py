@@ -61,10 +61,8 @@ _TRIED_LOADING_BLOCKWISE_TUNING = False
 # local batch is at least that large. The tuning table has no bf16-activation rows
 # for prefill-sized batches, and the nearest entry it borrows for (n_batch 8192,
 # n_in 1024, bf16 x fp8) is batch_block 64: 128 grid steps of a 64-row matmul.
-# 0 keeps the table's choice.
-_MIN_BATCH_BLOCK = int(
-    os.environ.get("SGLANG_JAX_QMM_MIN_BATCH_BLOCK", "512")
-)  # default since pfbase14 (09-19)
+# Opt-in: 0 (the default) keeps the table's choice; the DeepSeek V4 recipe sets 512.
+_MIN_BATCH_BLOCK = int(os.environ.get("SGLANG_JAX_QMM_MIN_BATCH_BLOCK", "0"))  # 0: table choice
 
 
 def get_blockwise_kernel():
