@@ -29,6 +29,7 @@ from sgl_jax.srt.layers.attention.hca_backend import (
     _query_schedule,
 )
 from sgl_jax.srt.mem_cache.deepseek_v4.pool import scatter_sharding
+from sgl_jax.srt.mem_cache.deepseek_v4.state import score_slice
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 
@@ -305,13 +306,13 @@ class DeepseekV4HCABackend(HCABackend):
             ranks * (self.request_capacity + 1) + init_slots,
             state.shape[0],
         )
-        empty = (
-            jnp.zeros((init_slots.shape[0], *state.shape[1:]), state.dtype)
-            .at[..., self.head_dim :]
-            .set(-jnp.inf)
-        )
+        # ``score_slice`` picks the score half by the pool's layout ([.., 128, 2*D]
+        # or the native [.., 128, 2, D]); a fixed last-axis slice would leave the
+        # native layout's score rows at 0 instead of -inf.
+        empty_shape = (init_slots.shape[0], *state.shape[1:])
+        empty = jnp.zeros(empty_shape, state.dtype).at[score_slice(empty_shape)].set(-jnp.inf)
         state = state.at[destinations].set(
-            empty, mode="drop", out_sharding=scatter_sharding(self.mesh, 3)
+            empty, mode="drop", out_sharding=scatter_sharding(self.mesh, state.ndim)
         )
         state_view = state.reshape(state.shape[0], 128, 2, self.head_dim)
         window_view = window.reshape(-1, self.page_size // 2, 2, self.head_dim)

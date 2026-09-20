@@ -21,7 +21,10 @@ from sgl_jax.srt.mem_cache.deepseek_v4.pool import (
     DeepseekV4CacheSpec,
     DeepseekV4TokenToKVPool,
 )
-from sgl_jax.srt.mem_cache.deepseek_v4.state import DeepseekV4CompressStatePool
+from sgl_jax.srt.mem_cache.deepseek_v4.state import (
+    DeepseekV4CompressStatePool,
+    score_slice,
+)
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 
 
@@ -137,8 +140,9 @@ class TestDeepseekV4Pool(unittest.TestCase):
         state.replace_buffer(state_updates)
         state.reset(jnp.array([0]), jnp.array([True]))
         reset = np.asarray(state.get_buffer("c128", 2))
-        np.testing.assert_array_equal(reset[0, :, :8], 0)
-        self.assertTrue(np.isneginf(reset[0, :, 8:]).all())
+        empty = np.zeros(reset.shape[1:], reset.dtype)
+        empty[score_slice(reset.shape)] = -np.inf
+        np.testing.assert_array_equal(reset[0], empty)
         np.testing.assert_array_equal(reset[1:], 1)
 
     def test_reference_write_address_units_and_dp(self):
@@ -161,9 +165,11 @@ class TestDeepseekV4Pool(unittest.TestCase):
             np.testing.assert_array_equal(actual, expected)
         for arrays in state.buffers.values():
             for array in arrays:
-                half = array.shape[-1] // 2
-                np.testing.assert_array_equal(np.asarray(array)[..., :half], 0)
-                self.assertTrue(np.isneginf(np.asarray(array)[..., half:]).all())
+                empty = np.zeros(array.shape[1:], array.dtype)
+                empty[score_slice(array.shape)] = -np.inf
+                np.testing.assert_array_equal(
+                    np.asarray(array), np.broadcast_to(empty, array.shape)
+                )
 
     def test_jit_donation_and_complete_commit(self):
         kv, state = self.make_pools()
