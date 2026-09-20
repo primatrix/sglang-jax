@@ -14,6 +14,11 @@ from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.kernels.csa_decode import page_run_segments, scorer_pages_per_block
+from sgl_jax.srt.kernels.dsv4.state_init import (
+    init_state_slots,
+    state_init_kernel_enabled,
+)
 from sgl_jax.srt.layers.attention.dsv4.dispatch import (
     ReadTables,
     read_tables,
@@ -27,6 +32,23 @@ class CompressorWeights(NamedTuple):
     ape: jax.Array
     norm_weight: jax.Array
     cos_sin_cache: jax.Array
+    # Optional pre-split halves of ``cos_sin_cache`` (built once at load): the HCA
+    # kernel takes separate cos/sin tables, and slicing the full table inside the
+    # jitted step costs a relayout of the whole table every step.
+    cos_table: jax.Array | None = None
+    sin_table: jax.Array | None = None
+    # Optional ``[hidden, 2*D]`` bf16 ``[Wkv|Wgate]^T`` built once at load for the HCA
+    # kernels (see ``DeepseekV4Compressor.prepare_fused_projection``).
+    fused: jax.Array | None = None
+
+
+_COMPRESS_FIELDS = ("wkv", "wgate", "ape", "norm_weight", "cos_sin_cache")
+
+
+def _compress_kwargs(weights):
+    """The `compress_chunk` keyword arguments of a CompressorWeights (drops the pre-split tables)."""
+    d = weights._asdict()
+    return {k: d[k] for k in _COMPRESS_FIELDS}
 
 
 class IndexerInputs(NamedTuple):
@@ -50,22 +72,40 @@ def padded_read_tables(
     rank,
     compressed_capacity=None,
     decode_capacity=None,
+    minimal=False,
 ):
-    tables = read_tables(
-        request_pool=request_pool,
-        allocator=allocator,
-        slots=slots,
-        lengths=lengths,
-        q_lens=q_lens,
-        ratio=ratio,
-        window_size=window_size,
-        page_size=page_size,
-        rank=rank,
-    )
-    # Window reads are bounded by the query bucket and sliding-window halo.
-    window_capacity = max(
-        1, min(len(slots) * max_context_len, token_capacity + len(slots) * (window_size - 1))
-    )
+    if decode_capacity is not None or minimal:
+        # Request-local decode: the layer reads through ``decode_page_indices`` /
+        # ``decode_window_rows`` only, so the flat shared-history tables (every
+        # compressed entry of every request: ~150k rows at bs=64 / 9K, 7 ms of host
+        # time per step to enumerate and 3 MB to upload) are not built; one inert row
+        # keeps the pytree shape. ``minimal`` asks for the same when the ratio's layers
+        # never read these tables (ratio 128 under the Pallas HCA backend).
+        tables = ReadTables(
+            window_rows=np.zeros((1,), np.int32),
+            window_positions=np.full((1,), -1, np.int32),
+            window_request_ids=np.full((1,), -1, np.int32),
+            compressed_rows=np.zeros((1,), np.int32),
+            compressed_entry_ids=np.full((1,), -1, np.int32),
+            compressed_request_ids=np.full((1,), -1, np.int32),
+        )
+        window_capacity = compressed_capacity = 1
+    else:
+        tables = read_tables(
+            request_pool=request_pool,
+            allocator=allocator,
+            slots=slots,
+            lengths=lengths,
+            q_lens=q_lens,
+            ratio=ratio,
+            window_size=window_size,
+            page_size=page_size,
+            rank=rank,
+        )
+        # Window reads are bounded by the query bucket and sliding-window halo.
+        window_capacity = max(
+            1, min(len(slots) * max_context_len, token_capacity + len(slots) * (window_size - 1))
+        )
     if compressed_capacity is None:
         # Bucket actual gathered history, not padded request slots times the
         # configured maximum context. The caller shares this bucket across DP.
@@ -80,32 +120,54 @@ def padded_read_tables(
         if len(value) > capacity:
             raise ValueError(f"{name} exceeds the configured V4 metadata capacity")
         fill = 0 if name.endswith("rows") else -1
-        values[name] = np.pad(value, (0, capacity - len(value)), constant_values=fill)
+        value = np.asarray(value)
+        padded = np.full((capacity,) + value.shape[1:], fill, value.dtype)
+        padded[: len(value)] = value
+        values[name] = padded
     if decode_capacity is not None:
         if ratio != 4 or np.any((q_lens != 0) & (q_lens != 1)):
             raise ValueError("request-local CSA tables require one decode query per request")
         compressed_page_size = page_size // ratio
-        pages = np.zeros((token_capacity, decode_capacity // compressed_page_size), np.int32)
+        table_width = decode_capacity // compressed_page_size
+        pages = np.zeros((token_capacity, table_width), np.int32)
+        page_counts = np.zeros((token_capacity,), np.int32)
         windows = np.zeros((token_capacity, window_size), np.int32)
         mapping = allocator.full_to_swa_index_mapping
         mapping = mapping[rank] if isinstance(mapping, list) else mapping
-        token = 0
-        for slot, length, count in zip(slots, lengths, q_lens, strict=True):
-            if not count:
-                continue
-            complete = int(length) // ratio
-            page_count = (complete + compressed_page_size - 1) // compressed_page_size
-            starts = np.arange(page_count, dtype=np.int32) * page_size
-            anchors = np.asarray(request_pool.req_to_token[int(slot), starts], np.int32)
-            if np.any(anchors < page_size) or np.any(anchors % page_size):
+        # One decode query per live request, packed in request order (rows past the
+        # live count stay zero); vectorised across requests.
+        live = np.flatnonzero(np.asarray(q_lens) > 0)
+        if live.size:
+            live_slots = np.asarray(slots, np.int64)[live]
+            live_lengths = np.asarray(lengths, np.int64)[live]
+            complete = live_lengths // ratio
+            counts = (complete + compressed_page_size - 1) // compressed_page_size  # [L]
+            if np.any(counts > table_width):
+                raise ValueError("CSA decode page table narrower than a request's history")
+            starts = np.arange(table_width, dtype=np.int64) * page_size  # [N]
+            page_mask = starts[None, :] < counts[:, None] * page_size
+            anchors = np.asarray(
+                request_pool.req_to_token[live_slots[:, None], starts[None, :]], np.int64
+            )
+            if np.any(page_mask & ((anchors < page_size) | (anchors % page_size != 0))):
                 raise ValueError("CSA compressed pages must start at allocated page boundaries")
-            pages[token, :page_count] = anchors // page_size
-            positions = np.arange(max(0, int(length) - window_size), int(length))
-            locations = np.asarray(request_pool.req_to_token[int(slot), positions], np.int32)
-            windows[token, -len(positions) :] = mapping[locations]
-            token += 1
+            pages[: live.size] = np.where(page_mask, anchors // page_size, 0)
+            page_counts[: live.size] = counts
+            positions = live_lengths[:, None] - window_size + np.arange(window_size)[None, :]
+            in_range = positions >= 0
+            locations = np.asarray(
+                request_pool.req_to_token[live_slots[:, None], np.maximum(positions, 0)], np.int64
+            )
+            windows[: live.size] = np.where(in_range, mapping[locations], 0)
         values["decode_page_indices"] = pages
         values["decode_window_rows"] = windows
+        # DMA segments for the request-local scorer (runs of consecutive physical pages),
+        # built once per step here rather than per CSA layer on device.
+        segments, segment_counts = page_run_segments(
+            pages, page_counts, scorer_pages_per_block(decode_capacity, compressed_page_size)
+        )
+        values["decode_page_segments"] = segments
+        values["decode_page_segment_counts"] = segment_counts
     return ReadTables(**values)
 
 
@@ -114,6 +176,12 @@ def _reset_state(state, metadata):
     slots = metadata.request_slots
     valid = metadata.state_init_mask & metadata.request_valid_mask & (slots >= 0) & (slots < limit)
     destinations = jnp.where(valid, slots, state.shape[0])
+    if state_init_kernel_enabled():
+        # One template slot, DMA'd only into the valid destinations (none in decode).
+        template = (
+            jnp.zeros(state.shape[1:], state.dtype).at[..., state.shape[-1] // 2 :].set(-jnp.inf)
+        )
+        return init_state_slots(state, destinations, template)
     empty = jnp.zeros((slots.shape[0], *state.shape[1:]), state.dtype)
     empty = empty.at[..., state.shape[-1] // 2 :].set(-jnp.inf)
     return state.at[destinations].set(empty, mode="drop")
@@ -142,6 +210,7 @@ class DeepseekV4CSABackend(nnx.Module):
         rope_head_dim,
         norm_eps,
         index_topk,
+        hidden_local=False,
     ):
         kv_pool = token_to_kv_pool
         states = compressor_state_pool
@@ -174,7 +243,9 @@ class DeepseekV4CSABackend(nnx.Module):
             sink,
         ):
             valid = md.valid_token_mask[:, None]
-            x_ = jnp.where(valid, x_, 0)
+            if not hidden_local:
+                # row-block input: the row-sharded compressors never read padded rows
+                x_ = jnp.where(valid, x_, 0)
             kv_ = jnp.where(valid, kv_, 0)
             q_ = jnp.where(valid[:, :, None], q_, 0)
             buffers = {"swa": window_.reshape(-1, window_.shape[-1])}
@@ -191,7 +262,7 @@ class DeepseekV4CSABackend(nnx.Module):
                     state=_reset_state(index_state_, md),
                     head_dim=iq.shape[-1],
                     rope_head_dim=rope_head_dim,
-                    compressor_weights=icw._asdict(),
+                    compressor_weights=_compress_kwargs(icw),
                 )
             output, updates = run_layer(
                 q=q_,
@@ -203,7 +274,7 @@ class DeepseekV4CSABackend(nnx.Module):
                 tables=read,
                 kv_buffers=buffers,
                 state=state_,
-                compressor_weights=None if cw is None else cw._asdict(),
+                compressor_weights=None if cw is None else _compress_kwargs(cw),
                 indexer=idx,
                 attention_sink=sink,
                 softmax_scale=softmax_scale,
@@ -238,7 +309,9 @@ class DeepseekV4CSABackend(nnx.Module):
             in_specs=(
                 P("data", "tensor", None),
                 P("data", None),
-                P("data", None),
+                # hidden: full chunk on every device, or this device's row block only
+                # (DSV4_LOWRANK_AG: the compressors run on local rows + a ppermute halo)
+                P("tensor", None) if hidden_local else P("data", None),
                 P("data", None),
                 P("data", None, None) if ratio else None,
                 P("data", None, None) if ratio else None,

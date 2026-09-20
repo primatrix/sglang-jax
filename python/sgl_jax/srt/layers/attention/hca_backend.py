@@ -90,7 +90,10 @@ def _pad_capacity(values: np.ndarray, capacity: int, fill) -> np.ndarray:
     values = np.asarray(values, np.int32)
     if values.shape[0] > capacity:
         raise ValueError(f"HCA metadata length {values.shape[0]} exceeds capacity {capacity}")
-    return np.pad(values, (0, capacity - values.shape[0]), constant_values=fill)
+    # np.pad costs ~20 us per call; this runs several times per decode tick.
+    padded = np.full((capacity,) + values.shape[1:], fill, np.int32)
+    padded[: values.shape[0]] = values
+    return padded
 
 
 def _bucket_capacity(length: int, floor: int, bound: int | None = None) -> int:
@@ -441,6 +444,10 @@ class HCABackend(AttentionBackend):
             "compress_ratio": self.compress_ratio,
             "head_dim": self.head_dim,
             "window_size": self.window_size,
+            "page_size": self.page_size,
+            # Compressed records per original-token page: the kernels need it when
+            # the compressed pool is handed over in its flat [rows, D] layout.
+            "compressed_page_size": max(1, self.page_size // self.compress_ratio),
             "schedule": metadata.schedule,
         }
         fused_weight = fused_projection_weight(wkv, wgate, fused_weight)
@@ -496,6 +503,9 @@ class HCABackend(AttentionBackend):
             )
             return output.reshape(output.shape[0], -1), state, window, compressed
 
+        state_arg = recurrent_state_pool.get_hca_state(int(layer.layer_id))
+        window_arg = token_to_kv_pool.window_buffer[layer_index]
+        compressed_arg = token_to_kv_pool.compressed_buffer[layer_index]
         output, state, window, compressed = jax.shard_map(
             rank_local,
             mesh=self.mesh,
@@ -503,9 +513,9 @@ class HCABackend(AttentionBackend):
                 P("data", None),  # compressor_input [T, hidden]
                 P("data", "tensor", None),  # q                [T, H/tp, D]
                 P("data", None),  # new_kv           [T, D]
-                P("data", None, None, None),  # recurrent state pool
-                P("data", None, None, None),  # window cache
-                P("data", None, None, None),  # compressed cache
+                _data_spec(state_arg),  # recurrent state pool (rank follows the buffer)
+                _data_spec(window_arg),  # window cache
+                _data_spec(compressed_arg),  # compressed cache
                 P(None, None),  # wkv
                 P(None, None),  # wgate
                 P(None, None),  # ape
@@ -519,18 +529,18 @@ class HCABackend(AttentionBackend):
             ),
             out_specs=(
                 P("data", "tensor"),  # output [T, H/tp*D]
-                P("data", None, None, None),  # state pool
-                P("data", None, None, None),  # window cache
-                P("data", None, None, None),  # compressed cache
+                _data_spec(state_arg),  # state pool
+                _data_spec(window_arg),  # window cache
+                _data_spec(compressed_arg),  # compressed cache
             ),
             check_vma=False,
         )(
             compressor_input,
             q,
             new_kv,
-            recurrent_state_pool.get_hca_state(int(layer.layer_id)),
-            token_to_kv_pool.window_buffer[layer_index],
-            token_to_kv_pool.compressed_buffer[layer_index],
+            state_arg,
+            window_arg,
+            compressed_arg,
             wkv,
             wgate,
             ape,
@@ -563,3 +573,8 @@ class HCABackend(AttentionBackend):
 
 
 __all__ = ["HCABackend", "HCABackendMetadata"]
+
+
+def _data_spec(array) -> P:
+    """``P("data", None, ...)`` matching the array rank (flat or 4D pool views)."""
+    return P("data", *([None] * (array.ndim - 1)))

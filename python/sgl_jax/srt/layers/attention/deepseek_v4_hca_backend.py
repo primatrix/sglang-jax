@@ -7,6 +7,7 @@ neither a second allocator nor a recurrent-slot free list.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -17,6 +18,10 @@ from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.kernels.dsv4.state_init import (
+    init_state_slots,
+    state_init_kernel_enabled,
+)
 from sgl_jax.srt.kernels.hca.attention import INERT_QUERY_OFFSET
 from sgl_jax.srt.kernels.hca.hca import HCAMetadata
 from sgl_jax.srt.kernels.hca.tuned_block_sizes import get_hca_kernel_schedule
@@ -25,10 +30,12 @@ from sgl_jax.srt.layers.attention.hca_backend import (
     HCABackendMetadata,
     _bucket_capacity,
     _bucket_max_queries,
+    _data_spec,
     _pad_capacity,
     _query_schedule,
 )
 from sgl_jax.srt.mem_cache.deepseek_v4.pool import scatter_sharding
+from sgl_jax.srt.mem_cache.deepseek_v4.state import native_hca_layout, score_slice
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 
@@ -47,6 +54,13 @@ class DeepseekV4HCAMetadata(HCABackendMetadata):
     @classmethod
     def tree_unflatten(cls, aux, children):
         return cls(children[0], aux[0], aux[1], children[1])
+
+
+def flat_compressed_pool() -> bool:
+    """``DSV4_HCA_FLAT_COMPRESSED=1``: pass the ratio-128 compressed pool to the HCA
+    kernels as flat ``[rows, D]`` instead of a ``[pages, 1, 1, D]`` view (which XLA
+    materialises with a copy of the whole pool per layer per step)."""
+    return os.environ.get("DSV4_HCA_FLAT_COMPRESSED", "0") == "1"
 
 
 class DeepseekV4HCABackend(HCABackend):
@@ -120,7 +134,15 @@ class DeepseekV4HCABackend(HCABackend):
         )
 
     def get_forward_metadata(
-        self, batch, *, request_pool, allocator, state_init_mask=None, fixed_bucket=False
+        self,
+        batch,
+        *,
+        request_pool,
+        allocator,
+        state_init_mask=None,
+        fixed_bucket=False,
+        device=True,
+        max_compressed_entries=None,
     ):
         dp = int(self.mesh.shape["data"])
         if allocator.dp_size != dp or allocator.page_size != self.page_size:
@@ -196,10 +218,17 @@ class DeepseekV4HCABackend(HCABackend):
         schedule = get_hca_kernel_schedule(
             str(np.asarray(self.mesh.devices).reshape(-1)[0].device_kind),
             page_size=self.page_size // self.compress_ratio,
+            # The compressed tile is static; sizing it from the whole context
+            # makes an 8K chunk consume a 2048-entry tile with 64 live entries.
+            # Callers that bucket their read tables pass that bucket instead.
             max_compressed_entries=max(
                 1,
-                (self.max_context_len if fixed_bucket else int(lengths.max()))
-                // self.compress_ratio,
+                (
+                    int(max_compressed_entries)
+                    if max_compressed_entries is not None
+                    else (self.max_context_len if fixed_bucket else int(lengths.max()))
+                    // self.compress_ratio
+                ),
             ),
             local_heads=self.num_heads // int(self.mesh.shape.get("tensor", 1)),
             head_dim=self.head_dim,
@@ -262,13 +291,17 @@ class DeepseekV4HCABackend(HCABackend):
                     max_queries_per_request=max_queries,
                 )
             )
+        init_slots_host = np.where(init, slots, self.request_capacity).astype(np.int32)
+        if not device:
+            # Host arrays only: the caller packs them with the rest of the step metadata
+            # into one transfer (14 separate device_puts cost ~3.5 ms per step).
+            combined = jax.tree.map(lambda *leaves: np.concatenate(leaves), *metadata)
+            return DeepseekV4HCAMetadata(combined, schedule, uniform, init_slots_host)
         sharding = NamedSharding(self.mesh, P("data"))
         combined = jax.tree.map(
             lambda *leaves: jax.device_put(np.concatenate(leaves), sharding), *metadata
         )
-        init_slots = jax.device_put(
-            np.where(init, slots, self.request_capacity).astype(np.int32), sharding
-        )
+        init_slots = jax.device_put(init_slots_host, sharding)
         return DeepseekV4HCAMetadata(combined, schedule, uniform, init_slots)
 
     def __call__(
@@ -298,29 +331,72 @@ class DeepseekV4HCABackend(HCABackend):
         init_slots = metadata.state_init_slots
         if init_slots is None:
             raise RuntimeError("V4 HCA metadata has not been prepared")
-        dp = int(self.mesh.shape["data"])
-        ranks = jnp.repeat(jnp.arange(dp, dtype=jnp.int32), init_slots.shape[0] // dp)
-        destinations = jnp.where(
-            init_slots < self.request_capacity,
-            ranks * (self.request_capacity + 1) + init_slots,
-            state.shape[0],
-        )
-        empty = (
-            jnp.zeros((init_slots.shape[0], *state.shape[1:]), state.dtype)
-            .at[..., self.head_dim :]
-            .set(-jnp.inf)
-        )
-        state = state.at[destinations].set(
-            empty, mode="drop", out_sharding=scatter_sharding(self.mesh, 3)
-        )
-        state_view = state.reshape(state.shape[0], 128, 2, self.head_dim)
-        window_view = window.reshape(-1, self.page_size // 2, 2, self.head_dim)
-        compressed_view = compressed.reshape(
-            compressed.shape[0],
-            1,
-            token_to_kv_pool.get_compressed_page_size(layer_id),
-            self.head_dim,
-        )
+        # The init destinations and the empty rows are identical for every HCA layer
+        # of a forward: build them once per metadata object (== once per trace) instead
+        # of re-emitting the index math and the -inf broadcast in each layer.
+        cache = metadata.__dict__.setdefault("_hca_init_cache", {})
+        key = (tuple(state.shape), str(state.dtype))
+        if state_init_kernel_enabled():
+            # DMA one template slot into each new request's local slot (rank-local
+            # indices under the data shard_map; the ``request_capacity`` sentinel and
+            # the padding slot are skipped). Decode steps have no new requests, so the
+            # kernel only scans the batch.
+            if key not in cache:
+                # ``score_slice`` picks by the pool rank and indexes with an Ellipsis,
+                # so the state's slice applies unchanged to one slot.
+                cache[key] = (
+                    jnp.zeros(state.shape[1:], state.dtype)
+                    .at[score_slice(state.shape)]
+                    .set(-jnp.inf)
+                )
+            template = cache[key]
+            state = jax.shard_map(
+                lambda state_, slots_, template_: init_state_slots(
+                    state_, slots_, template_, capacity=self.request_capacity
+                ),
+                mesh=self.mesh,
+                in_specs=(_data_spec(state), P("data"), P(*([None] * template.ndim))),
+                out_specs=_data_spec(state),
+                check_vma=False,
+            )(state, init_slots, template)
+        else:
+            if key not in cache:
+                dp = int(self.mesh.shape["data"])
+                ranks = jnp.repeat(jnp.arange(dp, dtype=jnp.int32), init_slots.shape[0] // dp)
+                destinations = jnp.where(
+                    init_slots < self.request_capacity,
+                    ranks * (self.request_capacity + 1) + init_slots,
+                    state.shape[0],
+                )
+                empty_shape = (init_slots.shape[0], *state.shape[1:])
+                empty = (
+                    jnp.zeros(empty_shape, state.dtype).at[score_slice(empty_shape)].set(-jnp.inf)
+                )
+                cache[key] = (destinations, empty)
+            destinations, empty = cache[key]
+            state = state.at[destinations].set(
+                empty, mode="drop", out_sharding=scatter_sharding(self.mesh, state.ndim)
+            )
+        if native_hca_layout():
+            # The state pool is already allocated in the kernels' [S, 128, 2, D] layout
+            # and the kernels address the window as flat rows (page size passed by the
+            # base backend), so neither buffer is relaid out on the way in or out.
+            state_view = state
+            window_view = window
+        else:
+            state_view = state.reshape(state.shape[0], 128, 2, self.head_dim)
+            window_view = window.reshape(-1, self.page_size // 2, 2, self.head_dim)
+        if compressed.ndim == 4 or flat_compressed_pool():
+            # The kernels address the flat pool by (page, records-per-page); the
+            # 4-D view costs an XLA relayout copy of the whole pool per layer.
+            compressed_view = compressed
+        else:
+            compressed_view = compressed.reshape(
+                compressed.shape[0],
+                1,
+                token_to_kv_pool.get_compressed_page_size(layer_id),
+                self.head_dim,
+            )
         # These contain views only. Ownership, allocation and update validation
         # stay with C1; the standalone HCA allocator/pools are never constructed.
         kv_view = SimpleNamespace(

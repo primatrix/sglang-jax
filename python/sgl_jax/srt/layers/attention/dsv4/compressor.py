@@ -44,8 +44,11 @@ axis and scores in the second, empty contents zero and empty scores ``-inf``.
 
 from __future__ import annotations
 
+import os
+
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 __all__ = [
     "compress_chunk",
@@ -73,11 +76,36 @@ def state_window(ratio: int) -> int:
     return overlap_factor(ratio) * ratio
 
 
+def _rope_constants(head_dim: int, rope_head_dim: int):
+    """Constant matrices for a slice-free interleaved RoPE (see `interleaved_rope`)."""
+    start = head_dim - rope_head_dim
+    half = rope_head_dim // 2
+    # partner[d, e]: e = 2i+1 <- -x[2i]... expressed as x @ J: J[2i+1, 2i] = -1, J[2i, 2i+1] = +1
+    # so that (x @ J)[2i] = -x[2i+1] and (x @ J)[2i+1] = x[2i] inside the trailing block.
+    j = np.zeros((head_dim, head_dim), np.float32)
+    for i in range(half):
+        e, o = start + 2 * i, start + 2 * i + 1
+        j[o, e] = -1.0
+        j[e, o] = 1.0
+    # spread[i, d]: cos_i / sin_i land on both members of pair i.
+    spread = np.zeros((half, head_dim), np.float32)
+    for i in range(half):
+        spread[i, start + 2 * i] = 1.0
+        spread[i, start + 2 * i + 1] = 1.0
+    head_ones = np.zeros((head_dim,), np.float32)
+    head_ones[:start] = 1.0
+    return j, spread, head_ones
+
+
 def interleaved_rope(x, cos, sin, rope_head_dim: int):
     """Interleaved (GPT-J) RoPE on the trailing ``rope_head_dim`` features.
 
-    Pairs are ``(even, odd)`` *within* the trailing block, which is why this cannot
-    be written as a half-rotate over the whole head.
+    Pairs are ``(even, odd)`` *within* the trailing block. Written without strided
+    slices / stack / concatenate (which each relayout the lane axis on TPU): the
+    pair partner is ``x @ J`` for a constant signed permutation matrix, and the
+    per-pair cos/sin are spread onto both lanes with a constant 0/1 matrix, so the
+    rotation is ``x * cos_full + (x @ J) * sin_full``. Every matmul has exactly one
+    nonzero term per output, so the result is bit-identical to the slice form.
     """
     head_dim = x.shape[-1]
     if rope_head_dim % 2 or rope_head_dim > head_dim:
@@ -86,13 +114,21 @@ def interleaved_rope(x, cos, sin, rope_head_dim: int):
         )
     if rope_head_dim == 0:
         return x
-    start = head_dim - rope_head_dim
-    head, tail = x[..., :start], x[..., start:]
-    even, odd = tail[..., 0::2], tail[..., 1::2]
-    rotated_even = even * cos - odd * sin
-    rotated_odd = even * sin + odd * cos
-    tail = jnp.stack((rotated_even, rotated_odd), axis=-1).reshape(tail.shape)
-    return jnp.concatenate((head, tail), axis=-1)
+    j, spread, head_ones = _rope_constants(head_dim, rope_head_dim)
+    hi = jax.lax.Precision.HIGHEST
+    x = jnp.asarray(x, jnp.float32)
+    cos_full = jnp.einsum(
+        "...i,id->...d", jnp.asarray(cos, jnp.float32), jnp.asarray(spread), precision=hi
+    )
+    sin_full = jnp.einsum(
+        "...i,id->...d", jnp.asarray(sin, jnp.float32), jnp.asarray(spread), precision=hi
+    )
+    cos_full = cos_full + jnp.asarray(head_ones)
+    partner = jnp.einsum("...d,de->...e", x, jnp.asarray(j), precision=hi)
+    return x * cos_full + partner * sin_full
+
+
+_LANE = 128
 
 
 def project_tokens(x, wkv, wgate, ape, positions, *, ratio: int):
@@ -121,14 +157,16 @@ def project_tokens(x, wkv, wgate, ape, positions, *, ratio: int):
         raise ValueError(
             f"ape must be [ratio, coff*D] = [{ratio}, {coff_width}], got {jnp.asarray(ape).shape}"
         )
-    kv = jnp.einsum(
-        "th,oh->to", x, jnp.asarray(wkv, jnp.float32), precision=jax.lax.Precision.HIGHEST
-    )
-    score = jnp.einsum(
-        "th,oh->to", x, jnp.asarray(wgate, jnp.float32), precision=jax.lax.Precision.HIGHEST
-    )
+    kv = _project(x, wkv)
+    score = _project(x, wgate)
     score = score + jnp.asarray(ape, jnp.float32)[jnp.asarray(positions) % ratio]
     return kv, score
+
+
+def _project(x, w):
+    """``x @ w.T`` in f32 with f32-exact products (``Precision.HIGHEST``)."""
+    w = jnp.asarray(w)
+    return jnp.einsum("th,oh->to", x, w.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST)
 
 
 def pool_normalize_rope(
@@ -163,6 +201,25 @@ def pool_normalize_rope(
     return interleaved_rope(normed, cos, sin, rope_head_dim)
 
 
+def select_window_fields(combined, offsets, *, ratio: int, coff: int, head_dim: int, width: int):
+    """Pick each window row's content/score field: ``(kv_window, score_window)``, ``[N, W, D]``.
+
+    With ``coff == 2`` the older half of the window reads field 0 and the newer half
+    field 1; with ``coff == 1`` both halves read the single field. Written as static
+    lane slices plus one select (no per-element gather): identical values to a
+    ``take_along_axis`` with ``cols = field + arange(D)``.
+    """
+    offsets = jnp.asarray(offsets)
+    if coff == 2:
+        newer = (offsets >= ratio)[None, :, None]
+        kv_window = jnp.where(newer, combined[..., head_dim:width], combined[..., :head_dim])
+        score_window = jnp.where(
+            newer, combined[..., width + head_dim :], combined[..., width : width + head_dim]
+        )
+        return kv_window, score_window
+    return combined[..., :width], combined[..., width:]
+
+
 def _window_rows(state, chunk_rows, positions_in_window, chunk_index, from_chunk):
     """One window's rows, taken from the old ring or from this chunk.
 
@@ -171,9 +228,18 @@ def _window_rows(state, chunk_rows, positions_in_window, chunk_index, from_chunk
     """
     window = positions_in_window.shape[-1]
     ring_slot = jnp.clip(jnp.mod(positions_in_window, window), 0, window - 1)
-    from_state = jnp.take_along_axis(state, ring_slot[..., None], axis=1)
-    from_new = chunk_rows[jnp.clip(chunk_index, 0, chunk_rows.shape[0] - 1)]
+    from_state = jnp.take_along_axis(state, ring_slot[..., None], axis=1, mode="promise_in_bounds")
+    from_new = chunk_rows.at[jnp.clip(chunk_index, 0, chunk_rows.shape[0] - 1)].get(
+        mode="promise_in_bounds"
+    )
     return jnp.where(from_chunk[..., None], from_new, from_state)
+
+
+def _fused_tail() -> bool:
+    """``DSV4_FUSED_COMPRESSOR_TAIL=1``: field select + pool + RMSNorm + RoPE as one kernel."""
+    return (
+        os.environ.get("DSV4_FUSED_COMPRESSOR_TAIL", "1") == "1"
+    )  # default on since pfbase14 (09-19)
 
 
 def compress_chunk(
@@ -255,34 +321,48 @@ def compress_chunk(
     from_chunk = in_sequence & (win_pos >= chunk_start)
     chunk_index = cu_q_lens[req][:, None] + (win_pos - chunk_start)
 
-    slot_state = state[jnp.clip(slot, 0, state.shape[0] - 1)]  # [N, W, 2*width]
+    slot_state = state.at[jnp.clip(slot, 0, state.shape[0] - 1)].get(
+        mode="promise_in_bounds"
+    )  # [N, W, 2*width]; clipped, so no fill select over the gathered rows
     combined = _window_rows(slot_state, rows, win_pos, chunk_index, from_chunk)
 
     # The overlap: the older half of the window reads content/score field 0, the
     # newer half reads field 1. With coff == 1 both halves read the same field.
-    field = (
-        (offsets >= ratio).astype(jnp.int32) * head_dim
-        if coff == 2
-        else jnp.zeros((window,), jnp.int32)
+    kv_window, score_window = select_window_fields(
+        combined, offsets, ratio=ratio, coff=coff, head_dim=head_dim, width=width
     )
-    cols = field[None, :, None] + jnp.arange(head_dim)[None, None, :]
-    kv_window = jnp.take_along_axis(combined[..., :width], cols, axis=2)
-    score_window = jnp.take_along_axis(combined[..., width:], cols, axis=2)
 
     cos_sin = jnp.asarray(cos_sin_cache, jnp.float32)[jnp.asarray(boundary_compressed_pos)]
     half = rope_head_dim // 2
     cos, sin = cos_sin[:, :half], cos_sin[:, half : 2 * half]
 
-    records = pool_normalize_rope(
-        kv_window,
-        score_window,
-        in_sequence,
-        norm_weight,
-        cos,
-        sin,
-        rope_head_dim=rope_head_dim,
-        norm_eps=norm_eps,
-    )
+    if _fused_tail():
+        from sgl_jax.srt.kernels.dsv4.compressor_tail import compressor_tail_pallas
+
+        records = compressor_tail_pallas(
+            combined,
+            in_sequence,
+            norm_weight,
+            cos,
+            sin,
+            ratio=ratio,
+            coff=coff,
+            head_dim=head_dim,
+            width=width,
+            rope_head_dim=rope_head_dim,
+            norm_eps=norm_eps,
+        )
+    else:
+        records = pool_normalize_rope(
+            kv_window,
+            score_window,
+            in_sequence,
+            norm_weight,
+            cos,
+            sin,
+            rope_head_dim=rope_head_dim,
+            norm_eps=norm_eps,
+        )
     records = jnp.where(bvalid[:, None], records, 0.0)
 
     # Metadata pads query_request_ids with zero. Those rows must never write

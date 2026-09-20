@@ -127,9 +127,7 @@ def _qblock_kernel(
     kv_hbm,  # flat: [B, T(+RBF), Dk_pad]; paged: [1, num_pages*PS, Dk_pad] HBM
     pt_ref,  # [1, 1, 1, PTW]      SMEM  packed page table (paged only)
     o_ref,  # [1, 1, QBHp, Dv]
-    kv_scratch,  # [NBUF, RBF, Dk_pad] VMEM  DMA ring
-    sem,  # DMA semaphores (NBUF,)
-    *,
+    *rest,  # [lse_ref [1,1,1,QBHp] when emit_lse] + kv_scratch [NBUF, RBF, Dk_pad] + sem (NBUF,)
     sm_scale: float,
     Dv: int,
     RB: int,
@@ -137,6 +135,8 @@ def _qblock_kernel(
     paged: bool,
     PS: int,  # page size (paged only; == RB in v1 paged mode)
     PTW: int,
+    emit_lse: bool = False,
+    single_row_aligned: bool = False,  # flat RB==1: DMA the aligned RBF-row block holding row u
 ):
     """Query-block sparse-MLA kernel, ring-prefetched (flat or packed-paged KV).
 
@@ -147,6 +147,11 @@ def _qblock_kernel(
     broadcast, which is what lets one block hold queries from different
     requests.
     """
+    if emit_lse:
+        lse_ref, kv_scratch, sem = rest
+    else:
+        lse_ref = None
+        kv_scratch, sem = rest
     b = pl.program_id(0)
     QBHp = q_ref.shape[2]
     q = q_ref[0, 0]  # [QBHp, Dk_pad]
@@ -165,6 +170,9 @@ def _qblock_kernel(
             pp = pt_ref[0, 0, 0, jnp.minimum(u, PTW - 1)]
             r8 = pp * (PS // 8)
             src = kv_hbm.at[0, pl.ds(r8 * 8, RBF), :]
+        elif single_row_aligned:
+            start = pl.multiple_of((u // RBF) * RBF, RBF)
+            src = kv_hbm.at[b, pl.ds(start, RBF), :]
         else:
             src = kv_hbm.at[b, pl.ds(u * RB, RBF), :]
         return pltpu.make_async_copy(src, kv_scratch.at[slot], sem.at[slot])
@@ -204,10 +212,16 @@ def _qblock_kernel(
         # seq-local key positions per (key row, query row): kp = u*RB + r - base.
         # For queries of a different request than the unit's owner this is
         # garbage, but their membership bit is 0 so the lane is -inf anyway.
-        kp = (u * RB + rows) - base_row  # [RBF, QBHp]
-        valid = (mem_row > 0) & (kp <= qpos_row) & (kp < kvlen_row)
-        if RBF > RB:
-            valid &= rows < RB  # drop sublane over-fetch rows
+        if single_row_aligned:
+            # the block holds rows [start, start+RBF); only row u - start is unit u
+            kp = jnp.broadcast_to(u - base_row, (RBF, base_row.shape[-1]))
+            valid = (mem_row > 0) & (kp <= qpos_row) & (kp < kvlen_row)
+            valid &= rows == (u - (u // RBF) * RBF)
+        else:
+            kp = (u * RB + rows) - base_row  # [RBF, QBHp]
+            valid = (mem_row > 0) & (kp <= qpos_row) & (kp < kvlen_row)
+            if RBF > RB:
+                valid &= rows < RB  # drop sublane over-fetch rows
         bias = jnp.where(valid, 0.0, -jnp.inf)  # [RBF, QBHp] fp32
 
         _copy(j, slot).wait()
@@ -242,6 +256,9 @@ def _qblock_kernel(
     m_i, l_i, acc = jax.lax.fori_loop(0, cnt, unit_body, (m0, l0, acc0))
     out = acc / jnp.where(l_i == 0.0, 1.0, l_i)[:, None]
     o_ref[0, 0] = out.astype(o_ref.dtype)
+    if emit_lse:
+        lse = jnp.where(l_i == 0.0, -jnp.inf, m_i + jnp.log(jnp.where(l_i == 0.0, 1.0, l_i)))
+        lse_ref[0, 0] = lse[None, :].astype(lse_ref.dtype)
 
 
 def sparse_mla_attention_qblock(
@@ -256,6 +273,7 @@ def sparse_mla_attention_qblock(
     u_max: int | None = None,  # per-block union cap; default makes overflow impossible
     sm_scale: float,
     interpret: bool = False,
+    return_lse: bool = False,  # also return the per-(b, s, h) log-sum-exp of attended logits
     # ── packed-ragged mode (multi-request extend; mirrors sparse_mla_attention) ──
     page_size: int | None = None,
     q_seq_id=None,  # [total_tokens] int32  token -> request id (enables ragged mode)
@@ -390,10 +408,17 @@ def sparse_mla_attention_qblock(
         paged=ragged,
         PS=ps,
         PTW=PTW,
+        emit_lse=return_lse,
+        single_row_aligned=(RB == 1 and not ragged),
     )
     smem = pltpu.SMEM
     row_spec = pl.BlockSpec((1, 1, 1, QBHp), lambda b, n: (b, n, 0, 0))
-    out = pl.pallas_call(
+    out_specs = pl.BlockSpec((1, 1, QBHp, Dv), lambda b, n: (b, n, 0, 0))
+    out_shape = jax.ShapeDtypeStruct((B, nQB, QBHp, Dv), jnp.float32)
+    if return_lse:
+        out_specs = (out_specs, row_spec)
+        out_shape = (out_shape, jax.ShapeDtypeStruct((B, nQB, 1, QBHp), jnp.float32))
+    res = pl.pallas_call(
         kernel,
         grid=(B, nQB),
         in_specs=[
@@ -407,8 +432,8 @@ def sparse_mla_attention_qblock(
             pl.BlockSpec(memory_space=pltpu.HBM),  # kv (untiled, DMA-gathered)
             pl.BlockSpec((1, 1, 1, PTW), lambda b, n: (b, 0, 0, 0), memory_space=smem),
         ],
-        out_specs=pl.BlockSpec((1, 1, QBHp, Dv), lambda b, n: (b, n, 0, 0)),
-        out_shape=jax.ShapeDtypeStruct((B, nQB, QBHp, Dv), jnp.float32),
+        out_specs=out_specs,
+        out_shape=out_shape,
         scratch_shapes=[
             pltpu.VMEM((_NBUF, RBF, Dk_pad), kv2.dtype),
             pltpu.SemaphoreType.DMA((_NBUF,)),
@@ -416,8 +441,13 @@ def sparse_mla_attention_qblock(
         interpret=interpret,
     )(q4, units4, counts4, pos_rows, kvlen_rows, base_rows, memt, kv2, pt_arg)
 
-    out = out[:, :, :QBH, :].reshape(B, Sp, H, Dv)
-    return out[:, :S]
+    if return_lse:
+        out, lse = res
+        lse = lse[:, :, 0, :QBH].reshape(B, Sp, H)[:, :S]
+    else:
+        out = res
+    out = out[:, :, :QBH, :].reshape(B, Sp, H, Dv)[:, :S]
+    return (out, lse) if return_lse else out
 
 
 def prefill_write_and_attend_ragged_qblock(

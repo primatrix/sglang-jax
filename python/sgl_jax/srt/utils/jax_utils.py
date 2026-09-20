@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import gc
+import os
 from collections import defaultdict
 from functools import cache
 from typing import Any
@@ -241,21 +242,30 @@ def canonicalize_sharding(sharding):
     return sharding
 
 
-def device_array(data, sharding=None, **kwargs) -> jax.Array:
+_LAZY_HOST_ARGS = (
+    os.environ.get("SGLANG_JAX_LAZY_HOST_ARGS", "1") == "1"
+)  # default on since pfbase14 (09-19)
+
+
+def lazy_host_args() -> bool:
+    """``SGLANG_JAX_LAZY_HOST_ARGS=1``: per-step batch arrays stay on the host and are
+    uploaded by the AOT dispatcher in one batched ``device_put`` at dispatch time,
+    instead of one ``device_put`` per constructor (ForwardBatch, SamplingMetadata,
+    LogitsMetadata, attention metadata) per step."""
+    return _LAZY_HOST_ARGS
+
+
+def device_array(data, sharding=None, lazy: bool = False, **kwargs) -> jax.Array:
+    if lazy and _LAZY_HOST_ARGS:
+        return jax.tree.map(np.asarray, data)
     if sharding is None:
         return jax.device_put(data, device=sharding, **kwargs)
 
     sharding = canonicalize_sharding(sharding)
-
-    def _to_device(arr):
-        arr = np.asarray(arr)
-
-        def fn(idx, a=arr):
-            return a[idx]
-
-        return jax.make_array_from_callback(arr.shape, sharding, fn)
-
-    return jax.tree.map(_to_device, data)
+    # One batched transfer for the whole pytree: per-leaf make_array_from_callback
+    # dispatches each array (and each device shard) separately, which at bs=1 decode
+    # was ~4 ms of host time per step for the ~20 small batch fields.
+    return jax.device_put(jax.tree.map(np.asarray, data), sharding)
 
 
 _IS_TPU_RUNTIME_CACHED: bool | None = None
