@@ -46,6 +46,9 @@ import jax.numpy as jnp
 # defaults are the measured v7x choice, the envs exist for A/B sweeps.
 _CSA_FUSED_BLOCK_Q = int(os.environ.get("DSV4_CSA_FUSED_BLOCK_Q", "256"))
 _CSA_FUSED_BLOCK_K = int(os.environ.get("DSV4_CSA_FUSED_BLOCK_K", "1024"))
+# ``DSV4_CSA_MASK_INT8=1``: convert the admissibility mask to int8 before the
+# concatenation so the flash kernel operand needs no separate convert pass.
+_CSA_MASK_INT8 = os.environ.get("DSV4_CSA_MASK_INT8", "0") == "1"
 # ``DSV4_CSA_INKERNEL_MASK=1``: the fused kernel derives the mask from per-row
 # metadata in VMEM (threshold / no-selection paths; the index path keeps the mask).
 _CSA_INKERNEL_MASK = os.environ.get("DSV4_CSA_INKERNEL_MASK", "0") == "1"
@@ -310,6 +313,11 @@ def csa_fused_attention(
         selected_mask=selected_mask,
     )
     keys = jnp.concatenate((jnp.asarray(window_kv), jnp.asarray(compressed_kv)), axis=0)
+    if _CSA_MASK_INT8:
+        # Hand the kernel int8 straight from the mask fusions: the bool [T, N] mask
+        # otherwise costs a second full pass (pad + pred->int8 convert) per layer.
+        window_mask = window_mask.astype(jnp.int8)
+        compressed_mask = compressed_mask.astype(jnp.int8)
     mask = jnp.concatenate((window_mask, compressed_mask), axis=1)
     out = csa_flash_attention(
         q,
