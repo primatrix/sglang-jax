@@ -39,6 +39,14 @@ def mix_hc_width(hc_mult: int) -> int:
     return (2 + hc_mult) * hc_mult
 
 
+def nopad_small_enabled() -> bool:
+    """``DSV4_MHC_NOPAD_SMALL=1``: when a batch is smaller than one token block (bs=1
+    decode), run the mHC kernels on a block equal to the batch instead of padding
+    the streams to 8 rows (and the gate mixes to a lane block) in every layer; the
+    pad and the slice back cost ~4 us each per kernel per layer at bs=1."""
+    return os.environ.get("DSV4_MHC_NOPAD_SMALL", "1") == "1"  # default on since pfbase14 (09-19)
+
+
 def get_interpret() -> bool:
     return os.environ.get("PALLAS_INTERPRET", "").strip().lower() in ("1", "true")
 
@@ -115,6 +123,8 @@ def mhc_gates(
     mixes_t = mixes.reshape(-1, mix_hc).T
     n = mixes_t.shape[1]
     bt = select_gates_block_tokens(_device_kind(), tokens=n, hc_mult=hc, block_tokens=block_tokens)
+    if n < bt and nopad_small_enabled():
+        bt = n
     n_pad = -(-n // bt) * bt  # round up
     if n_pad != n:
         mixes_t = jnp.pad(mixes_t, ((0, 0), (0, n_pad - n)))
@@ -175,17 +185,21 @@ def _collapse_kernel(
     x = x_ref[...]  # [BT, hc, d]
     bt = x.shape[0]
     y_ref, *extra_outs = outs
+    x_flat = x.reshape(bt, hc * d)
+
+    def stream_of(i):
+        return x[:, i, :]
+
     # Fuse RMS with projection to reuse the resident activation. Its reduction
     # tree differs from XLA's, so a few ULP of output drift are expected.
     rms = jax.lax.rsqrt(
-        jnp.sum(jnp.square(x.astype(jnp.float32).reshape(bt, hc * d)), axis=-1, keepdims=True)
-        / (hc * d)
+        jnp.sum(jnp.square(x_flat.astype(jnp.float32)), axis=-1, keepdims=True) / (hc * d)
         + norm_eps
     )
 
     if mode == "head":
         # Head requires the FP32 normalize -> BF16 round -> projection boundary.
-        xf = x.astype(jnp.float32).reshape(bt, hc * d)
+        xf = x_flat.astype(jnp.float32)
         normalized = (xf * rms).astype(jnp.bfloat16)
         if dot_precision == jax.lax.Precision.HIGHEST:
             # Preserve the BF16 boundary, then widen for the FP32 MXU contract.
@@ -198,8 +212,8 @@ def _collapse_kernel(
             preferred_element_type=jnp.float32,
         )
     else:
-        xf = x.astype(jnp.float32).reshape(bt, hc * d)
         # Pre moves the RMS scalar after the linear projection.
+        xf = x_flat.astype(jnp.float32)
         mixes = (
             jax.lax.dot_general(
                 xf,
@@ -225,7 +239,7 @@ def _collapse_kernel(
     # Stream each residual into one accumulator instead of widening [BT, hc, d].
     collapsed = jnp.zeros((bt, d), dtype=jnp.float32)
     for stream in range(hc):
-        collapsed = collapsed + pre[:, stream, None] * x[:, stream, :].astype(jnp.float32)
+        collapsed = collapsed + pre[:, stream, None] * stream_of(stream).astype(jnp.float32)
     y_ref[...] = collapsed.astype(y_ref.dtype)
 
 
@@ -274,6 +288,8 @@ def _run(
             highest_precision=dot_precision == jax.lax.Precision.HIGHEST,
         )
     bt = max(8, int(block_tokens))
+    if n < bt and nopad_small_enabled():
+        bt = n
     n_pad = -(-n // bt) * bt
     if n_pad != n:
         x_streams = jnp.pad(x_streams, ((0, n_pad - n), (0, 0), (0, 0)))
@@ -546,6 +562,8 @@ def mhc_post_fused(
             residual_bytes=jnp.dtype(residual_streams.dtype).itemsize,
         )
     bt = max(8, int(block_tokens))
+    if n < bt and nopad_small_enabled():
+        bt = n
     n_pad = -(-n // bt) * bt
     if n_pad != n:
         pad = n_pad - n
