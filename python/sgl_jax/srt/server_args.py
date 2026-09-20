@@ -115,7 +115,7 @@ class ServerArgs:
     schedule_policy: str = "fcfs"
     schedule_conservativeness: float = 1.0
     page_size: int = 1
-    swa_full_tokens_ratio: float = 0.8
+    swa_full_tokens_ratio: float | None = None  # None: 0.8; DeepSeek V4 planner uses 0.2
     recurrent_state_memory_ratio: float = 0.9
     max_recurrent_state_size: int | None = None
     recurrent_track_interval: int | None = None
@@ -955,7 +955,9 @@ class ServerArgs:
             type=float,
             default=ServerArgs.swa_full_tokens_ratio,
             help="The ratio of SWA layer KV tokens / full layer KV tokens, regardless of the number of swa:full layers. It should be between 0 and 1. "
-            "E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens.",
+            "E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens. "
+            "Default 0.8; the DeepSeek V4 pool planner defaults to 0.2 because its SWA pool only "
+            "holds the 128-token HCA window per running request.",
         )
         parser.add_argument(
             "--recurrent-state-memory-ratio",
