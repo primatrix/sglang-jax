@@ -1,6 +1,5 @@
 """Slice-free interleaved RoPE equals the reference slice/stack form (CPU-only)."""
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 

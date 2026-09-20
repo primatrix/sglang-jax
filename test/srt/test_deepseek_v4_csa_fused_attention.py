@@ -1,9 +1,7 @@
 """The fused CSA attention kernel (interpret mode) matches the dense reference."""
 
-import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 from sgl_jax.srt.layers.attention.dsv4 import attention as att
 

@@ -1,6 +1,5 @@
 """csa_sparse_attention (gather-then-dense) matches the dense dsv4_attention (CPU-only)."""
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -34,7 +33,10 @@ def _case(seed, T=6, H=4, D=128, W=8, E=40, K=5, ratio=4, window_size=6):
     compressed_kv = (rng.standard_normal((E, D)) * 0.5).astype(np.float32)
     sink = rng.uniform(-2, 2, size=H).astype(np.float32)
     # round to bf16 so the dense f32 reference sees the same operands the kernel does
-    rb = lambda a: np.asarray(jnp.asarray(a).astype(jnp.bfloat16).astype(jnp.float32))
+
+    def rb(a):
+        return np.asarray(jnp.asarray(a).astype(jnp.bfloat16).astype(jnp.float32))
+
     kw = dict(
         query_positions=qpos,
         query_request_ids=qreq,
