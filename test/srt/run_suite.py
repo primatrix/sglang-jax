@@ -467,6 +467,9 @@ suites = {
         TestFile("test/srt/test_recurrent_split_equivalence.py", 0.3),
         TestFile("test/srt/test_prepare_for_extend_protected_len.py", 0.2),
         TestFile("test/srt/test_native_attention_paged_decode.py", 1),
+        # DeepSeek V4 pools
+        TestFile("test/srt/test_deepseek_v4_hca_layout.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_pool_budget.py", 0.2, runner="pytest"),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile(
