@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Quantized matmul kernel with blockwise quantization support."""
 
+import os
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -74,6 +76,12 @@ def quantized_matmul_kernel(
     if orig_n_batch > 1 and batch_block_size % 8 != 0:
         batch_block_size = next_multiple(batch_block_size, 8)
     out_block_size = tuned_value.out_block_size
+    if os.environ.get("SGLANG_JAX_QMM_ACC_F32", "0") == "1":
+        # The tuned tiles assume a bf16 accumulator; an fp32 scratch of the same
+        # tile overflowed VMEM at 512x4096.  Halve the batch block until the
+        # accumulator stays within 4 MiB.
+        while batch_block_size > 8 and batch_block_size * out_block_size * 4 > 4 * 1024 * 1024:
+            batch_block_size = max(8, next_multiple(batch_block_size // 2, 8))
     in_block_size = tuned_value.in_block_size
     n_lane_multiplier = tuned_value.n_lane_multiplier
     # The num_blocks should become 1 in case of channelwise.
@@ -106,8 +114,12 @@ def quantized_matmul_kernel(
     # used per batch.
     save_x_q = quantize_activation and n_in == 1 and n_out > 1
 
-    # TODO(amandaliang): Make this configurable.
-    acc_dtype = jnp.bfloat16
+    # bf16 accumulation across K blocks is the historical default; with fp8
+    # activations the rounding compounds, so allow fp32 accumulation (the GPU
+    # DeepGEMM path accumulates in fp32) via SGLANG_JAX_QMM_ACC_F32=1.
+    acc_dtype = (
+        jnp.float32 if os.environ.get("SGLANG_JAX_QMM_ACC_F32", "0") == "1" else jnp.bfloat16
+    )
     if (
         quantize_activation
         and jnp.issubdtype(w_q.dtype, jnp.integer)
