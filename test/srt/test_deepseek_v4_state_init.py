@@ -4,12 +4,10 @@ Covers valid / out-of-range / sentinel / duplicate slots and the padding slot ke
 ``capacity``. Runs on CPU in interpret mode.
 """
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from sgl_jax.srt.kernels.dsv4 import state_init
 from sgl_jax.srt.kernels.dsv4.state_init import init_state_slots
 
 
