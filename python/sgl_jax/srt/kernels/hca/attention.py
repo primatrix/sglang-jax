@@ -189,7 +189,7 @@ def _scatter_physical_rows(flat_cache, locations, values, valid, *, max_rows=Non
         ((0, 0), (0, flat_cache.shape[-1] - values.shape[-1])),
     )
     if (
-        _PAGED_ROW_WRITE
+        _paged_row_write_enabled()
         and flat_cache.ndim == 2
         and flat_cache.dtype == jnp.bfloat16
         and _data_out_sharding(flat_cache.ndim) is None
@@ -217,17 +217,20 @@ def _scatter_physical_rows(flat_cache, locations, values, valid, *, max_rows=Non
     return update.set(padded, **kwargs)
 
 
-# ``DSV4_HCA_VEC_EPILOGUE=1``: normalise a chunk-prefill query block in one shot
-# instead of one small op per query (see ``_chunk_attention_kernel``).
-_VEC_EPILOGUE = os.environ.get("DSV4_HCA_VEC_EPILOGUE", "0") == "1"
-# ``DSV4_HCA_ALIGNED_SWA=1``: the chunk kernel reads its sliding-window rows from a
-# 16-row-aligned start directly out of the bf16 ``combined_kv`` (the extra leading
-# rows are masked), which removes the byte-plane repack of the whole window buffer
-# (u8 split + convert + stack: ~10 ms of an 8K prefill step on v7x).
-_ALIGNED_SWA = os.environ.get("DSV4_HCA_ALIGNED_SWA", "1") == "1"
-# ``DSV4_HCA_PAGED_ROW_WRITE=1``: commit window rows / compressed records to the
-# flat caches with `kernels/dsv4/paged_row_write` instead of an XLA scatter.
-_PAGED_ROW_WRITE = os.environ.get("DSV4_HCA_PAGED_ROW_WRITE", "1") == "1"
+def _aligned_swa_enabled() -> bool:
+    """``DSV4_HCA_ALIGNED_SWA`` (default on): the chunk kernel reads its sliding-window
+    rows from a 16-row-aligned start directly out of the bf16 ``combined_kv`` (the
+    extra leading rows are masked), which removes the byte-plane repack of the whole
+    window buffer (u8 split + convert + stack: ~10 ms of an 8K prefill step on v7x).
+    ``0`` restores the repack path."""
+    return os.environ.get("DSV4_HCA_ALIGNED_SWA", "1") == "1"
+
+
+def _paged_row_write_enabled() -> bool:
+    """``DSV4_HCA_PAGED_ROW_WRITE`` (default on): commit window rows / compressed
+    records to the flat caches with ``kernels/dsv4/paged_row_write`` instead of an
+    XLA scatter."""
+    return os.environ.get("DSV4_HCA_PAGED_ROW_WRITE", "1") == "1"
 
 
 def _paged_kv_write_enabled(tokens: int) -> bool:
@@ -1246,25 +1249,12 @@ def _chunk_attention_kernel(
     sink = attention_sink_ref[...].astype(jnp.float32)
     # Stage into a dedicated buffer: writing back into the q slots would
     # order these stores against the in-flight next-block q prefetch.
-    if _VEC_EPILOGUE:
-        # One normalisation over the whole [queries*heads, D] block instead of
-        # ``queries_per_block`` per-query slices (128 small ops per grid step).
-        sink_rows = jnp.concatenate([sink[:, None]] * queries_per_block, axis=0)
-        denominator = l_ref[...] + jnp.exp(sink_rows - m_ref[...])
-        normalised = acc_ref[...] * pl.reciprocal(
-            broadcast_minor(denominator, head_dim), approx=True
-        )
-        out_stage_ref[...] = normalised.reshape(queries_per_block, heads, head_dim).astype(
-            jnp.bfloat16
-        )
-    else:
-        for query in range(queries_per_block):
-            head_slice = pl.ds(query * heads, heads)
-            denominator = l_ref[head_slice, ...] + jnp.exp(sink[:, None] - m_ref[head_slice, ...])
-            out_stage_ref[query, ...] = (
-                acc_ref[head_slice]
-                * pl.reciprocal(broadcast_minor(denominator, head_dim), approx=True)
-            ).astype(jnp.bfloat16)
+    for query in range(queries_per_block):
+        head_slice = pl.ds(query * heads, heads)
+        denominator = l_ref[head_slice, ...] + jnp.exp(sink[:, None] - m_ref[head_slice, ...])
+        out_stage_ref[query, ...] = (
+            acc_ref[head_slice] * pl.reciprocal(broadcast_minor(denominator, head_dim), approx=True)
+        ).astype(jnp.bfloat16)
     # Spill into a later request's rows is safe: the grid runs in order and each
     # DMA is waited, so the owner overwrites it.  End-crossers use the tail output.
     if not may_cross_end:
@@ -1354,7 +1344,7 @@ def _chunk_attention(
         q_tail = jnp.zeros((2 * queries_per_block, padded_heads, head_dim), q.dtype)
     # Each window DMA reads ``swa_dma_tile`` rows from an arbitrary start, so
     # the buffer needs a tile of slack behind the last query row.
-    if _ALIGNED_SWA:
+    if _aligned_swa_enabled():
         # bf16 source read from 16-row-aligned starts (see the kernel); one extra
         # tile of slack behind the last row as before, plus the alignment shift.
         combined_kv = jnp.pad(
@@ -1400,7 +1390,7 @@ def _chunk_attention(
             swa_compute_tile=schedule.swa_compute_tile,
             sublanes=schedule.sublanes,
             may_cross_end=may_cross_end,
-            aligned_swa=_ALIGNED_SWA,
+            aligned_swa=_aligned_swa_enabled(),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=8,
@@ -1421,7 +1411,7 @@ def _chunk_attention(
                 pltpu.VMEM((queries_per_block, padded_heads, head_dim), jnp.bfloat16),
                 (
                     pltpu.VMEM((2, schedule.swa_dma_tile, head_dim), jnp.bfloat16)
-                    if _ALIGNED_SWA
+                    if _aligned_swa_enabled()
                     else pltpu.VMEM(
                         (
                             2,

@@ -9,7 +9,6 @@ decode output against the dense HCA reference and the row-by-row path.
 """
 
 import importlib.util
-import os
 import pathlib
 
 import jax

@@ -48,7 +48,10 @@ def _build(reqs, cpage, key):
     bcap = T // 32 + b
     pos = np.asarray(pos, np.int32)
     boundary = np.flatnonzero((pos + 1) % 128 == 0).astype(np.int32)
-    ints = lambda a: jnp.asarray(np.asarray(a, np.int32))
+
+    def ints(a):
+        return jnp.asarray(np.asarray(a, np.int32))
+
     md = HCAMetadata(
         state_slots=ints(seq_ids),
         query_seq_ids=ints(seq_ids),
@@ -105,7 +108,10 @@ def _build(reqs, cpage, key):
 def _reference(reqs, args, aux):
     """Dense HCA per query: last-128 window (history rows + this chunk) and records < (pos+1)//128."""
     q, new_kv, window_cache, _, _, write_vals, _, sink, _ = args
-    f32 = lambda a: np.asarray(jnp.asarray(a).astype(jnp.float32))
+
+    def f32(a):
+        return np.asarray(jnp.asarray(a).astype(jnp.float32))
+
     q, new_kv, window_cache, write_vals, sink = map(
         f32, (q, new_kv, window_cache, write_vals, sink)
     )

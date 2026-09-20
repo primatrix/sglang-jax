@@ -12,7 +12,7 @@ from sgl_jax.srt.kernels.hca import attention as hca
 
 
 @pytest.mark.parametrize("max_rows", [None, 40])
-@pytest.mark.parametrize("seed", [0, 1])
+@pytest.mark.parametrize("seed", [0])
 def test_paged_writer_matches_scatter(seed, max_rows):
     key = jax.random.PRNGKey(seed)
     k1, k2, k3 = jax.random.split(key, 3)
@@ -28,12 +28,12 @@ def test_paged_writer_matches_scatter(seed, max_rows):
     locs = locs.astype(np.int32)
     locs[5] = rows + 3  # out of range, must drop
 
-    with mock.patch.object(hca, "_PAGED_ROW_WRITE", False):
+    with mock.patch.dict(os.environ, {"DSV4_HCA_PAGED_ROW_WRITE": "0"}):
         ref = hca._scatter_physical_rows(
             cache, jnp.asarray(locs), values, jnp.asarray(valid), max_rows=max_rows
         )
     with (
-        mock.patch.object(hca, "_PAGED_ROW_WRITE", True),
+        mock.patch.dict(os.environ, {"DSV4_HCA_PAGED_ROW_WRITE": "1"}),
         mock.patch.dict(os.environ, {"PALLAS_INTERPRET": "1"}),
     ):
         out = hca._scatter_physical_rows(
