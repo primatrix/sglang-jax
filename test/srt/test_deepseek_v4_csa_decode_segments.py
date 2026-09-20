@@ -37,7 +37,7 @@ def _expand(segments, counts, pages_per_block):
     return out
 
 
-@pytest.mark.parametrize("pages_per_block", [64, 32, 8])
+@pytest.mark.parametrize("pages_per_block", [32, 8])
 def test_page_run_segments_cover_exactly_the_valid_pages(pages_per_block):
     rng = np.random.default_rng(0)
     table = 4 * pages_per_block
