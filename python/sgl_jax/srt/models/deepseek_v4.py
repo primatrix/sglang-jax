@@ -773,6 +773,7 @@ def _q_norm_rope(q, cos, sin, *, heads, head_dim, rope_head_dim, normalize, eps,
     mesh = jax.sharding.get_abstract_mesh()
     shards = int(mesh.shape[lane_axis]) if isinstance(lane_axis, str) else 1
     local_heads = heads // shards
+    row_axis = spec[0]  # tokens may be sharded over data; keep whatever the input has
 
     def per_shard(q_local, cos_local, sin_local):
         out = q_head_norm_rope(
@@ -788,11 +789,13 @@ def _q_norm_rope(q, cos, sin, *, heads, head_dim, rope_head_dim, normalize, eps,
         )
         return out.reshape(-1, local_heads, head_dim)
 
+    cos_spec = jax.typeof(cos).sharding.spec
+    sin_spec = jax.typeof(sin).sharding.spec
     return jax.shard_map(
         per_shard,
         mesh=None,
-        in_specs=(P(None, lane_axis), P(None, None), P(None, None)),
-        out_specs=P(None, lane_axis, None),
+        in_specs=(P(row_axis, lane_axis), P(*cos_spec), P(*sin_spec)),
+        out_specs=P(row_axis, lane_axis, None),
         check_vma=False,
     )(q, cos, sin)
 
