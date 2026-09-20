@@ -224,20 +224,14 @@ _VEC_EPILOGUE = os.environ.get("DSV4_HCA_VEC_EPILOGUE", "0") == "1"
 # 16-row-aligned start directly out of the bf16 ``combined_kv`` (the extra leading
 # rows are masked), which removes the byte-plane repack of the whole window buffer
 # (u8 split + convert + stack: ~10 ms of an 8K prefill step on v7x).
-_ALIGNED_SWA = (
-    os.environ.get("DSV4_HCA_ALIGNED_SWA", "1") == "1"
-)  # default on since pfbase14 (09-19)
+_ALIGNED_SWA = os.environ.get("DSV4_HCA_ALIGNED_SWA", "1") == "1"
 # ``DSV4_HCA_PAGED_ROW_WRITE=1``: commit window rows / compressed records to the
 # flat caches with `kernels/dsv4/paged_row_write` instead of an XLA scatter.
-_PAGED_ROW_WRITE = (
-    os.environ.get("DSV4_HCA_PAGED_ROW_WRITE", "1") == "1"
-)  # default on since pfbase14 (09-19)
+_PAGED_ROW_WRITE = os.environ.get("DSV4_HCA_PAGED_ROW_WRITE", "1") == "1"
 
 
 def _paged_kv_write_enabled(tokens: int) -> bool:
-    return os.environ.get(
-        "DSV4_PAGED_KV_WRITE", "1"
-    ) == "1" and tokens >= int(  # default on since pfbase14 (09-19)
+    return os.environ.get("DSV4_PAGED_KV_WRITE", "1") == "1" and tokens >= int(
         os.environ.get("DSV4_PAGED_KV_WRITE_MIN_TOKENS", "256")
     )
 

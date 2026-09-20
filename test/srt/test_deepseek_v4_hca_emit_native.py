@@ -39,7 +39,7 @@ def _emit(inputs):
 
 def test_native_layout_emit_matches_default(monkeypatch):
     inputs = _inputs(jax.random.PRNGKey(5))
-    monkeypatch.setenv("DSV4_HCA_EMIT_NATIVE", "0")  # default on since pfbase14 (09-19)
+    monkeypatch.setenv("DSV4_HCA_EMIT_NATIVE", "0")
     default = _emit(inputs)
     monkeypatch.setenv("DSV4_HCA_EMIT_NATIVE", "1")
     assert hca_compressor._emit_native_layout()
