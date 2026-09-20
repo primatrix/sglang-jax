@@ -467,6 +467,12 @@ suites = {
         TestFile("test/srt/test_recurrent_split_equivalence.py", 0.3),
         TestFile("test/srt/test_prepare_for_extend_protected_len.py", 0.2),
         TestFile("test/srt/test_native_attention_paged_decode.py", 1),
+        # DeepSeek V4 small kernels (CPU interpret)
+        TestFile("test/srt/test_deepseek_v4_mhc_nopad_small.py", 0.3, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_mhc_seam.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_moe_act_rows.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_wo_a_projection.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_quantized_matmul_batch_block.py", 0.1, runner="pytest"),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile(
