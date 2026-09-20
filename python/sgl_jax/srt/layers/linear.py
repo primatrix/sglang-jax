@@ -489,22 +489,34 @@ class QuantizedLinear(nnx.Module):
         # as q_b_proj. Explicitly reshard the scale to its expected spec — a no-op
         # when it is already correctly sharded.
         scale_val = jax.sharding.reshard(scale_val, NamedSharding(self.mesh, w_scale_spec))
-        in_specs = (P("data", input_axis), P(output_axis, input_axis), w_scale_spec)
+        # The activation's row axis follows its committed sharding: "data" (replicated
+        # rows, the usual case) or "tensor" when an SP-aware caller hands over its own
+        # row block (DSV4_LOWRANK_AG: q_lora / kv projections on local rows, weights
+        # replicated). Only legal without a contraction over the same axis.
+        act_rows = "data"
+        try:
+            x_spec = jax.typeof(x_2d).sharding.spec
+            if len(x_spec) > 0 and x_spec[0] is not None and x_spec[0] != input_axis:
+                act_rows = x_spec[0]
+        except Exception:  # sharding not in the type (non-explicit mesh): keep "data"
+            pass
+        in_specs = (P(act_rows, input_axis), P(output_axis, input_axis), w_scale_spec)
 
         target = out_sharding or NamedSharding(self.mesh, P("data", output_axis))
         output_partition_dim = _shard_map_output_partition_dim(target, input_axis)
 
+        local = partial(
+            xla_quantized_matmul_local,
+            quantize_activation=quantize_activation,
+            reduce_axis=input_axis,
+            compute_dtype=self.compute_dtype,
+            weight_block_size=self.weight_block_size,
+            activation_quant_dtype=self.activation_dtype,
+            allow_narrow_n_blockwise=self.allow_narrow_n_blockwise,
+            output_scatter_dimension=output_partition_dim,
+        )
         output = shard_map(
-            partial(
-                xla_quantized_matmul_local,
-                quantize_activation=quantize_activation,
-                reduce_axis=input_axis,
-                compute_dtype=self.compute_dtype,
-                weight_block_size=self.weight_block_size,
-                activation_quant_dtype=self.activation_dtype,
-                allow_narrow_n_blockwise=self.allow_narrow_n_blockwise,
-                output_scatter_dimension=output_partition_dim,
-            ),
+            local,
             mesh=self.mesh,
             in_specs=in_specs,
             out_specs=target.spec,

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -465,6 +466,94 @@ class DeepseekV4MoE(nnx.Module):
         else:
             self.shared_experts = None
 
+    def _fused_experts(self, hidden_states, topk_weights, topk_ids, out_sharding):
+        """Route the routed experts through kernels/fused_moe v2 (one Pallas call per layer).
+
+        Uses the EPMoE module's own expert-sharded FP8 weights and per-channel scales
+        (``wi_0``/``wi_1``/``wo`` == kernel ``w1``/``w3``/``w2``); V4's biased grouped
+        top-k and the shared experts stay exactly as they are. Requires expert-parallel
+        weights (ep_size == number of devices), see ``_use_fused_moe``.
+        """
+        from sgl_jax.srt.kernels.fused_moe.v2.kernel import fused_ep_moe_v2
+        from sgl_jax.srt.kernels.fused_moe.v2.tuned_block_configs import (
+            get_tuned_fused_moe_v2_block_config,
+        )
+
+        ex = self.experts
+        mesh = ex.mesh
+        tok_sh = jax.sharding.NamedSharding(mesh, P(("data", "tensor"), None))
+        w_sh = jax.sharding.NamedSharding(mesh, P(("data", "tensor"), None, None))
+        s_sh = jax.sharding.NamedSharding(mesh, P(("data", "tensor"), None, None, None))
+        # The kernel shards tokens over every device: pad the token axis to a multiple
+        # of the device count (zero rows routed to expert 0 with weight 0), slice after.
+        n_tokens = hidden_states.shape[0]
+        n_dev = int(np.prod(list(mesh.shape.values())))
+        pad = (-n_tokens) % n_dev
+        if pad:
+            hidden_states = jnp.pad(hidden_states, ((0, pad), (0, 0)))
+            topk_weights = jnp.pad(topk_weights, ((0, pad), (0, 0)))
+            topk_ids = jnp.pad(topk_ids, ((0, pad), (0, 0)))
+        x = jax.sharding.reshard(hidden_states, tok_sh)
+        tw = jax.sharding.reshard(topk_weights.astype(jnp.float32), tok_sh)
+        ti = jax.sharding.reshard(topk_ids.astype(jnp.int32), tok_sh)
+        w1 = jax.sharding.reshard(ex.wi_0.value, w_sh)
+        w3 = jax.sharding.reshard(ex.wi_1.value, w_sh)
+        w2 = jax.sharding.reshard(ex.wo.value, w_sh)
+        scales = [
+            (
+                None
+                if getattr(ex, n, None) is None
+                else jax.sharding.reshard(getattr(ex, n).value, s_sh)
+            )
+            for n in ("wi_0_scale", "wi_1_scale", "wo_scale")
+        ]
+        quant_mode = "none" if scales[0] is None else "per_channel"
+        # fp8 per-token activation quant inside the kernel (what EPMoE does via qmm);
+        # opt-in while we measure it against the bf16-activation path.
+        act_quant = os.environ.get("DSV4_FUSED_ACT_QUANT", "0") == "1" and scales[0] is not None
+        block_config = get_tuned_fused_moe_v2_block_config(
+            num_tokens=x.shape[0],
+            num_experts=ex.num_experts,
+            top_k=self.top_k,
+            hidden_size=self.hidden_size,
+            intermediate_size=ex.intermediate_dim,
+            dtype=x.dtype,
+            weight_dtype=w1.dtype,
+            ep_size=ex.ep_size,
+            use_shared_expert=False,
+            use_grouped_topk=False,
+            enable_act_quant=act_quant,
+            quant_mode=quant_mode,
+        )
+        out = fused_ep_moe_v2(
+            mesh,
+            x,
+            w1,
+            w2,
+            w3,
+            tw,
+            ti,
+            self.top_k,
+            act_fn="silu",
+            swiglu_limit=ex.swiglu_limit,
+            block_config=block_config,
+            quant_block_k=None,
+            w1_scale=scales[0],
+            w2_scale=scales[2],
+            w3_scale=scales[1],
+            enable_act_quant=act_quant,
+            direct_scaled_dot=scales[0] is not None,
+            dp_axis_name="data",
+            tp_axis_name="tensor",
+        )
+        # Reshard before dropping the pad rows: slicing the (data, tensor)-sharded
+        # token axis down to a size the 8 devices cannot divide is rejected.
+        target = out_sharding or jax.sharding.NamedSharding(mesh, P("data", None))
+        out = jax.sharding.reshard(out, target)
+        if pad:
+            out = out[:n_tokens]
+        return out
+
     def load_hash_table(self, table):
         """Load a host checkpoint tensor without floating-point dtype conversion."""
         if not self.is_hash_layer:
@@ -533,7 +622,14 @@ class DeepseekV4MoE(nnx.Module):
         token_valid_mask=None,
         dispatch_info=None,
         out_sharding=None,
+        output_sharding=None,
     ):
+        # ``output_sharding``: sharding of the returned rows only (the routing keeps
+        # ``out_sharding``); DSV4_SEQ_PARALLEL asks for P("tensor", None) so the
+        # expert combine is a reduce-scatter and the shared-expert / mask terms
+        # are brought onto the same rows.
+        if output_sharding is None:
+            output_sharding = out_sharding
         weights, ids = self.route(
             hidden_states,
             input_ids,
@@ -548,14 +644,25 @@ class DeepseekV4MoE(nnx.Module):
         if self.is_hash_layer:
             valid = valid & (input_ids >= 0) & (input_ids < self.vocab_size)
         hidden_states = jnp.where(valid[:, None], hidden_states, 0)
-        output = self.experts(hidden_states, weights, ids, out_sharding=out_sharding)
+        if _use_fused_moe(self.experts) and hidden_states.shape[0] >= _FUSED_MOE_MIN_TOKENS:
+            # Auto-tuned v7x blocks: the fused kernel is -17% per layer on 8K prefill
+            # chunks but +35% on decode buckets (~90 us fixed cost per call).
+            output = self._fused_experts(hidden_states, weights, ids, output_sharding)
+        else:
+            output = self.experts(hidden_states, weights, ids, out_sharding=output_sharding)
         if self.shared_experts is not None:
             # routed_scaling_factor applies only to routed weights, exactly once.
             shared = self.shared_experts(hidden_states)
-            if out_sharding is not None:
-                shared = jax.sharding.reshard(shared, out_sharding)
+            if output_sharding is not None:
+                shared = jax.sharding.reshard(shared, output_sharding)
             output = output + shared
-        return jnp.where(valid[:, None], output, 0), ids
+        return jnp.where(self._rows_like(valid, output_sharding)[:, None], output, 0), ids
+
+    def _rows_like(self, valid, output_sharding):
+        """``valid`` [T] on the same row sharding as the output (a slice when sharded)."""
+        if output_sharding is None:
+            return valid
+        return jax.sharding.reshard(valid, NamedSharding(self.mesh, P(output_sharding.spec[0])))
 
 
 def _static_fp8(config):
@@ -591,7 +698,13 @@ def _linear(input_size, output_size, mesh, dtype, axes, name, quantized=False):
             (input_size // 128, 1, output_size), jnp.float32, out_sharding=P(axes[0], None, axes[1])
         ),
         bias=None,
-        activation_dtype=None,
+        # W8A8 when requested: the blockwise qmm quantizes activations per token
+        # (GPU serving runs every dense fp8 GEMM w8a8; default here stays w8a16).
+        activation_dtype=(
+            jnp.float8_e4m3fn
+            if _W8A8_DENSE and (_W8A8_DENSE_NAMES is None or name in _W8A8_DENSE_NAMES)
+            else None
+        ),
         mesh=mesh,
         kernel_axes=axes,
         params_dtype=dtype,
@@ -613,12 +726,76 @@ def _checkpoint_matrix(linear):
     return linear.weight.value.T
 
 
+_FUSED_MOE_MIN_TOKENS = int(os.environ.get("DSV4_FUSED_MOE_MIN_TOKENS", "256"))
+# ``DSV4_SP_NORM_BEFORE_GATHER=1``: under sequence parallelism apply the sublayer
+# RMSNorm (per row) and the bf16 cast on the T/tp rows and all-gather the result,
+# instead of gathering the raw stream and normalising all T rows on every device.
+# Same values; the gather carries bf16 instead of the stream dtype.
+_SP_NORM_BEFORE_GATHER = (
+    os.environ.get("DSV4_SP_NORM_BEFORE_GATHER", "1") == "1"
+)  # default on since pfbase14 (09-19)
+# ``DSV4_MOE_MERGED_GATE_UP=1``: run the routed experts' gate and up projections as one gmm.
+_MERGED_GATE_UP = os.environ.get("DSV4_MOE_MERGED_GATE_UP", "0") == "1"
+# ``DSV4_LOWRANK_AG=1``: on CSA layers under sequence parallelism, project q_lora / kv /
+# indexer weights on the local T/tp rows and all-gather those (1024+512+64 columns)
+# instead of the 4096-wide hidden; the compressors then run on local rows with a
+# ppermute halo (needs DSV4_COMPRESSOR_ROW_SHARD=1). HCA layers keep the full gather.
+_LOWRANK_AG = os.environ.get("DSV4_LOWRANK_AG", "1") == "1"  # default on since pfbase14 (09-19)
+# ``DSV4_HCA_FUSED_PROJ=1`` (default): build the HCA compressor's fused ``[Wkv|Wgate]^T`` bf16
+# projection once after loading instead of converting the f32 gate weight and
+# concatenating on every step in every HCA layer.
+_HCA_FUSED_PROJ = os.environ.get("DSV4_HCA_FUSED_PROJ", "1") == "1"
+_WGATE_F32 = os.environ.get("DSV4_COMPRESSOR_WGATE_F32", "0") == "1"
+# ``DSV4_W8A8_DENSE=1``: fp8 activations for the dense fp8 linears (weights are
+# already fp8); default keeps bf16 activations.
+_W8A8_DENSE = os.environ.get("DSV4_W8A8_DENSE", "1") == "1"  # default on since pfbase14 (09-19)
+# ``DSV4_W8A8_DENSE_NAMES=wq_b,wo_b``: restrict fp8 activations to these linears (an empty
+# value means all of them).
+_W8A8_DENSE_NAMES_ENV = os.environ.get(
+    "DSV4_W8A8_DENSE_NAMES", "wq_a,wkv,wo_a,wo_b,indexer_wq_b,gate_proj,up_proj,down_proj"
+)  # default since pfbase14 (09-19)
+_W8A8_DENSE_NAMES = (
+    frozenset(x.strip() for x in _W8A8_DENSE_NAMES_ENV.split(",") if x.strip())
+    if _W8A8_DENSE_NAMES_ENV
+    else None
+)
+
+
+def _use_fused_moe(experts) -> bool:
+    """``DSV4_MOE_BACKEND=fused`` routes routed experts through kernels/fused_moe v2.
+
+    Only meaningful with expert-parallel weights (``--ep-size`` == device count);
+    otherwise the EPMoE tensor-parallel path is kept regardless of the flag.
+    """
+    if os.environ.get("DSV4_MOE_BACKEND", "epmoe").lower() != "fused":
+        return False
+    return int(getattr(experts, "ep_size", 1)) == int(np.prod(list(experts.mesh.shape.values())))
+
+
+# DSV4_ROPE_CACHE_LANE_PAD=1: store the [max_position, cos|sin] tables with the lane axis
+# padded to a multiple of 128. With 64 lanes XLA picks a column-major layout for the jit
+# parameter and inserts a full-table relayout copy (2 x 268 MB) at the top of every step
+# (measured 0.71 ms/step on v7x). Consumers slice the first ``rope_head_dim`` lanes.
+_ROPE_CACHE_LANE_PAD = (
+    os.environ.get("DSV4_ROPE_CACHE_LANE_PAD", "1") == "1"
+)  # default on since pfbase14 (09-19)
+
+
+def _split_rope_cache(cache, rope_dim):
+    """``[N, >=rope_dim]`` cos|sin table -> (cos, sin) halves, materialised once (not per step)."""
+    half = rope_dim // 2
+    return cache[:, :half], cache[:, half : 2 * half]
+
+
 def _rope_cache(config, ratio):
     from sgl_jax.srt.layers.attention.dsv4.rope import build_dsv4_rope
 
     rope = build_dsv4_rope(config, ratio, dtype=jnp.float32)
     cos, sin = rope._compute_cos_sin(jnp.arange(config.max_position_embeddings, dtype=jnp.int32))
-    return jnp.concatenate((cos, sin), axis=-1)
+    cache = jnp.concatenate((cos, sin), axis=-1)
+    if _ROPE_CACHE_LANE_PAD and cache.shape[-1] % 128:
+        cache = jnp.pad(cache, ((0, 0), (0, -cache.shape[-1] % 128)))
+    return cache
 
 
 class DeepseekV4Compressor(nnx.Module):
@@ -631,19 +808,51 @@ class DeepseekV4Compressor(nnx.Module):
         self.wkv = nnx.Param(
             jnp.zeros((width, config.hidden_size), dtype, out_sharding=P(None, None))
         )
+        # The checkpoint stores wgate in BF16; keeping the parameter in BF16 is exact
+        # and halves the bytes every compress projection streams per layer per step
+        # (the projections cast to f32 / HIGHEST themselves). DSV4_COMPRESSOR_WGATE_F32=1
+        # restores the previous f32 storage for A/B.
         self.wgate = nnx.Param(
-            jnp.zeros((width, config.hidden_size), jnp.float32, out_sharding=P(None, None))
+            jnp.zeros(
+                (width, config.hidden_size),
+                jnp.float32 if _WGATE_F32 else dtype,
+                out_sharding=P(None, None),
+            )
         )
         self.ape = nnx.Param(jnp.zeros((ratio, width), jnp.float32, out_sharding=P(None, None)))
         self.norm = RMSNorm(head_dim, epsilon=config.rms_norm_eps, param_dtype=jnp.float32)
+        self.ratio = ratio
 
-    def weights(self, cache):
+    def prepare_fused_projection(self, mesh):
+        """Materialise the HCA kernels' fused ``[hidden, 2*D]`` bf16 projection once.
+
+        Without it ``fused_projection_weight`` rebuilds it in every HCA layer on every
+        step: an f32->bf16 convert of ``wgate`` (8 MB prefetched through VMEM), a
+        concatenation and a transpose.
+        """
+        with jax.set_mesh(mesh):
+            fused = jnp.concatenate(
+                (self.wkv.value.astype(jnp.bfloat16), self.wgate.value.astype(jnp.bfloat16)),
+                axis=0,
+            ).T
+        self.fused_proj = nnx.Variable(fused)
+
+    def weights(self, cache, halves=None):
         from sgl_jax.srt.layers.attention.deepseek_v4_csa_backend import (
             CompressorWeights,
         )
 
+        cos_table, sin_table = halves if halves is not None else (None, None)
+        fused = getattr(self, "fused_proj", None)
         return CompressorWeights(
-            self.wkv.value, self.wgate.value, self.ape.value, self.norm.scale.value, cache
+            self.wkv.value,
+            self.wgate.value,
+            self.ape.value,
+            self.norm.scale.value,
+            cache,
+            cos_table,
+            sin_table,
+            None if fused is None else fused.value,
         )
 
 
@@ -667,7 +876,12 @@ class DeepseekV4Indexer(nnx.Module):
         )
         self.compressor = DeepseekV4Compressor(config, self.head_dim, 4, dtype)
 
-    def __call__(self, hidden, q_lora, cos, sin, cache):
+    def weights_from_hidden(self, hidden):
+        """``[rows, H_idx]`` f32 per-head indexer weights (row-local, no communication)."""
+        return jnp.dot(hidden.astype(jnp.float32), self.weights_proj.value.T.astype(jnp.float32))
+
+    def project(self, q_lora, weights, cos, sin, cache, dtype):
+        """Indexer inputs from an already-gathered ``q_lora`` and the raw weights."""
         from sgl_jax.srt.layers.attention.deepseek_v4_csa_backend import IndexerInputs
         from sgl_jax.srt.layers.attention.dsv4.rope import apply_dsv4_partial_rope
 
@@ -675,9 +889,11 @@ class DeepseekV4Indexer(nnx.Module):
         q = q.reshape(-1, self.num_heads, self.head_dim)
         q = apply_dsv4_partial_rope(
             q, cos[:, None, :], sin[:, None, :], rope_head_dim=self.rope_head_dim
-        ).astype(hidden.dtype)
-        weights = jnp.dot(hidden.astype(jnp.float32), self.weights_proj.value.T.astype(jnp.float32))
+        ).astype(dtype)
         return IndexerInputs(q, weights * self.weight_scale, self.compressor.weights(cache))
+
+    def __call__(self, hidden, q_lora, cos, sin, cache):
+        return self.project(q_lora, self.weights_from_hidden(hidden), cos, sin, cache, hidden.dtype)
 
 
 class DeepseekV4Attention(nnx.Module):
@@ -748,12 +964,76 @@ class DeepseekV4Attention(nnx.Module):
         )
         self.indexer = DeepseekV4Indexer(config, mesh, dtype) if self.ratio == 4 else None
 
-    def __call__(self, hidden, batch, pools, rope_cache):
+    def prepare_grouped_wo_a(self):
+        """Materialise the grouped, dequantised wo_a once after loading.
+
+        The forward used to dequantise (scale broadcast + multiply) and regroup wo_a on
+        every step; at bs=1 that was ~0.9 ms per decode step across the layers.
+        """
+        from sgl_jax.srt.layers.attention.dsv4.o_projection import (
+            fuse_wo_a_weights,
+            group_wo_a,
+            use_fused_wo_a,
+        )
+
+        with jax.set_mesh(self.mesh):
+            weights = group_wo_a(
+                _checkpoint_matrix(self.wo_a),
+                num_groups=self.num_groups,
+                out_sharding=NamedSharding(self.mesh, P("tensor", None, None)),
+            )
+            if use_fused_wo_a():
+                # The fused kernel wants [8*head_dim, G*R]; keep only that copy.
+                self.wo_a_fused = nnx.Param(fuse_wo_a_weights(weights, mesh=self.mesh))
+                return
+        self.wo_a_grouped = nnx.Param(weights)
+
+    def __call__(
+        self,
+        hidden,
+        batch,
+        pools,
+        rope_cache,
+        rope_halves=None,
+        wo_out_sharding=None,
+        sp_local=False,
+    ):
         from sgl_jax.srt.layers.attention.dsv4.o_projection import group_wo_a
         from sgl_jax.srt.layers.attention.dsv4.rope import apply_dsv4_partial_rope
 
-        q_lora, _ = self.wq_a(hidden)
-        q_lora = self.q_norm(q_lora)
+        indexer_weights = None
+        if sp_local:
+            # ``hidden`` is this device's T/tp rows (DSV4_LOWRANK_AG): project locally,
+            # gather the narrow results once. Row-wise norms commute with the gather.
+            rows_sh = NamedSharding(self.mesh, P("tensor", None))
+            q_lora_l, _ = self.wq_a(hidden, out_sharding=rows_sh)
+            q_lora_l = self.q_norm(q_lora_l)
+            kv_l, _ = self.wkv(hidden, out_sharding=rows_sh)
+            kv_l = self.kv_norm(kv_l)
+            parts = [q_lora_l.astype(self.dtype), kv_l.astype(self.dtype)]
+            if self.indexer is not None:
+                # f32 weights ride along as two bf16 halves (exact round trip)
+                w32 = jax.lax.bitcast_convert_type(
+                    self.indexer.weights_from_hidden(hidden), jnp.uint32
+                )
+                parts.append(
+                    jax.lax.bitcast_convert_type((w32 >> 16).astype(jnp.uint16), jnp.bfloat16)
+                )
+                parts.append(
+                    jax.lax.bitcast_convert_type((w32 & 0xFFFF).astype(jnp.uint16), jnp.bfloat16)
+                )
+            packed = _sp_gather(self.mesh, jnp.concatenate(parts, axis=-1))
+            widths = [p.shape[-1] for p in parts]
+            cuts = np.cumsum(widths)[:-1].tolist()
+            pieces = jnp.split(packed, cuts, axis=-1)
+            q_lora, kv = pieces[0], pieces[1]
+            if self.indexer is not None:
+                hi = jax.lax.bitcast_convert_type(pieces[2], jnp.uint16).astype(jnp.uint32)
+                lo = jax.lax.bitcast_convert_type(pieces[3], jnp.uint16).astype(jnp.uint32)
+                indexer_weights = jax.lax.bitcast_convert_type((hi << 16) | lo, jnp.float32)
+        else:
+            q_lora, _ = self.wq_a(hidden)
+            q_lora = self.q_norm(q_lora)
         q, _ = self.wq_b(q_lora)
         q = q.reshape(-1, self.num_heads, self.head_dim)
         # V4 normalizes q again per head after wq_b, with no learned weight.
@@ -763,22 +1043,28 @@ class DeepseekV4Attention(nnx.Module):
                 jnp.mean(jnp.square(q.astype(jnp.float32)), axis=-1, keepdims=True) + self.norm_eps
             )
         ).astype(self.dtype)
-        kv, _ = self.wkv(hidden)
-        kv = self.kv_norm(kv)
+        if not sp_local:
+            kv, _ = self.wkv(hidden)
+            kv = self.kv_norm(kv)
         positions = batch.positions
         selected = rope_cache.at[positions].get(
             out_sharding=NamedSharding(self.mesh, P("data", None))
         )
-        cos, sin = jnp.split(selected, 2, axis=-1)
+        cos, sin = jnp.split(selected[:, : self.rope_head_dim], 2, axis=-1)
         q = apply_dsv4_partial_rope(
             q, cos[:, None, :], sin[:, None, :], rope_head_dim=self.rope_head_dim
         ).astype(self.dtype)
         kv = apply_dsv4_partial_rope(kv, cos, sin, rope_head_dim=self.rope_head_dim).astype(
             self.dtype
         )
-        indexer = (
-            None if self.indexer is None else self.indexer(hidden, q_lora, cos, sin, rope_cache)
-        )
+        if self.indexer is None:
+            indexer = None
+        elif sp_local:
+            indexer = self.indexer.project(
+                q_lora, indexer_weights, cos, sin, rope_cache, self.dtype
+            )
+        else:
+            indexer = self.indexer(hidden, q_lora, cos, sin, rope_cache)
         output, updates = batch.attn_backend(
             q,
             kv,
@@ -788,13 +1074,34 @@ class DeepseekV4Attention(nnx.Module):
             pools.token_to_kv_pool,
             compressor_state_pool=pools.compressor_state_pool,
             compressor_input=hidden,
-            compressor=None if self.compressor is None else self.compressor.weights(rope_cache),
+            compressor_input_local=sp_local,
+            compressor=(
+                None
+                if self.compressor is None
+                else self.compressor.weights(rope_cache, rope_halves)
+            ),
             indexer=indexer,
             attention_sink=self.attn_sink.value,
             rope_head_dim=self.rope_head_dim,
             norm_eps=self.norm_eps,
             index_topk=self.index_topk,
         )
+        if getattr(self, "wo_a_fused", None) is not None:
+            from sgl_jax.srt.layers.attention.dsv4.o_projection import (
+                fused_wo_a_projection,
+            )
+
+            reduced = fused_wo_a_projection(
+                output,
+                cos,
+                sin,
+                self.wo_a_fused.value,
+                mesh=self.mesh,
+                rope_head_dim=self.rope_head_dim,
+                dtype=self.dtype,
+            )
+            output, _ = self.wo_b(reduced, out_sharding=wo_out_sharding)
+            return output, updates
         output = apply_dsv4_partial_rope(
             output, cos[:, None, :], sin[:, None, :], rope_head_dim=self.rope_head_dim, inverse=True
         )
@@ -803,15 +1110,58 @@ class DeepseekV4Attention(nnx.Module):
             (output.shape[0], self.num_groups, self.num_heads // self.num_groups * self.head_dim),
             out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
         )
-        weights = group_wo_a(
-            _checkpoint_matrix(self.wo_a),
-            num_groups=self.num_groups,
-            out_sharding=NamedSharding(self.mesh, P("tensor", None, None)),
-        )
+        if getattr(self, "wo_a_grouped", None) is not None:
+            weights = self.wo_a_grouped.value
+        else:
+            weights = group_wo_a(
+                _checkpoint_matrix(self.wo_a),
+                num_groups=self.num_groups,
+                out_sharding=NamedSharding(self.mesh, P("tensor", None, None)),
+            )
         reduced = jnp.einsum("tgd,gdr->tgr", grouped, weights, preferred_element_type=jnp.float32)
         reduced = reduced.reshape(reduced.shape[0], -1).astype(self.dtype)
-        output, _ = self.wo_b(reduced)
+        output, _ = self.wo_b(reduced, out_sharding=wo_out_sharding)
         return output, updates
+
+
+_MHC_SEAM_MIN_TOKENS = int(os.environ.get("DSV4_MHC_SEAM_MIN_TOKENS", "64"))
+
+
+# ``DSV4_SEQ_PARALLEL=1``: sequence parallelism for the mHC / norm / residual work.
+# Today every TP rank runs the mHC pre/post/seam kernels, the layer norms and the
+# residual adds over all T rows (P("data", ...) = replicated across "tensor"):
+# ~55 ms of an 8K prefill step on v7x that each of the 8 ranks repeats. With the
+# flag the streams live row-sharded over the tensor axis (P("tensor", ...)), the
+# row-parallel wo_b returns a reduce-scatter instead of an all-reduce, and the
+# hidden states are all-gathered only where a full row set is needed (the
+# attention projections, the MoE dispatch, the final norm). Same bytes on the
+# ICI (RS + AG == AR); the replicated compute shrinks by the tensor size. Only
+# prefill buckets take the path (rows >= DSV4_SEQ_PARALLEL_MIN_TOKENS and
+# divisible by the tensor axis); decode keeps the replicated form.
+_SEQ_PARALLEL = os.environ.get("DSV4_SEQ_PARALLEL", "1") == "1"  # default on since pfbase14 (09-19)
+_SEQ_PARALLEL_MIN_TOKENS = int(os.environ.get("DSV4_SEQ_PARALLEL_MIN_TOKENS", "256"))
+
+
+def _sp_active(mesh, rows: int) -> bool:
+    if not _SEQ_PARALLEL:
+        return False
+    tp = int(mesh.shape.get("tensor", 1))
+    return tp > 1 and rows >= _SEQ_PARALLEL_MIN_TOKENS and rows % tp == 0
+
+
+def _sp_gather(mesh, x):
+    """Row-sharded ``[T/tp, ...]`` -> replicated ``[T, ...]`` (all-gather over tensor)."""
+    return jax.sharding.reshard(x, NamedSharding(mesh, P("data", *([None] * (x.ndim - 1)))))
+
+
+def _sp_rows(mesh, x):
+    """Replicated ``[T, ...]`` -> row-sharded over the tensor axis (a local slice)."""
+    return jax.sharding.reshard(x, NamedSharding(mesh, P("tensor", *([None] * (x.ndim - 1)))))
+
+
+def _use_mhc_seam() -> bool:
+    """``DSV4_MHC_SEAM=1``: fuse each sublayer's mHC post with the next sublayer's pre."""
+    return os.environ.get("DSV4_MHC_SEAM", "1") == "1"  # default on since pfbase14 (09-19)
 
 
 class DeepseekV4DecoderLayer(nnx.Module):
@@ -841,11 +1191,12 @@ class DeepseekV4DecoderLayer(nnx.Module):
     def _mhc_pre(self, streams, fn, base, scale):
         if self.mhc.backend != "pallas":
             return self.mhc.pre(streams, fn, base, scale)
-        specs = (P("data", None), P("data", None), P("data", None, None))
+        row = "tensor" if _sp_active(self.mesh, streams.shape[0] * self._sp_tp(streams)) else "data"
+        specs = (P(row, None), P(row, None), P(row, None, None))
         compute = jax.shard_map(
             self.mhc.pre,
             mesh=None,
-            in_specs=(P("data", None, None), P(), P(), P()),
+            in_specs=(P(row, None, None), P(), P(), P()),
             out_specs=specs,
             check_vma=False,
         )
@@ -859,11 +1210,14 @@ class DeepseekV4DecoderLayer(nnx.Module):
     def _mhc_post(self, output, residual, post, comb):
         if self.mhc.backend != "pallas":
             return self.mhc.post(output, residual, post, comb)
-        spec = P("data", None, None)
+        row = (
+            "tensor" if _sp_active(self.mesh, residual.shape[0] * self._sp_tp(residual)) else "data"
+        )
+        spec = P(row, None, None)
         compute = jax.shard_map(
             self.mhc.post,
             mesh=None,
-            in_specs=(P("data", None), spec, P("data", None), spec),
+            in_specs=(P(row, None), spec, P(row, None), spec),
             out_specs=spec,
             check_vma=False,
         )
@@ -872,23 +1226,176 @@ class DeepseekV4DecoderLayer(nnx.Module):
         )
         return compute(output, residual, post, comb)
 
-    def __call__(self, streams, batch, pools, rope_cache):
+    def _mhc_seam(self, output, residual, post, comb, fn, base, scale):
+        """post(output) fused with the next sublayer's pre: one kernel, streams stored once."""
+        row = (
+            "tensor" if _sp_active(self.mesh, residual.shape[0] * self._sp_tp(residual)) else "data"
+        )
+        stream_spec = P(row, None, None)
+        out_specs = (stream_spec, P(row, None), P(row, None), stream_spec)
+        compute = jax.shard_map(
+            self.mhc.seam,
+            mesh=None,
+            in_specs=(P(row, None), stream_spec, P(row, None), stream_spec, P(), P(), P()),
+            out_specs=out_specs,
+            check_vma=False,
+        )
+        compute = jax.sharding.auto_axes(
+            compute,
+            axes=self.mesh.axis_names,
+            out_sharding=tuple(NamedSharding(self.mesh, spec) for spec in out_specs),
+        )
+        return compute(output, residual, post, comb, fn, base, scale)
+
+    def attn_params(self):
+        return (self.hc_attn_fn.value, self.hc_attn_base.value, self.hc_attn_scale.value)
+
+    def _sp_tp(self, x):
+        # Global arrays carry the global row count whether replicated or sharded; the
+        # gate below only needs T itself, so this is 1 (kept for readability).
+        return 1
+
+    def _lowrank_attn(self, hidden, batch) -> bool:
+        """DSV4_LOWRANK_AG applies on CSA layers, under SP, for single-request batches
+        (the row-local compressors have no multi-request path)."""
+        if not _LOWRANK_AG or getattr(self.self_attn, "ratio", None) != 4:
+            return False
+        tp = int(self.mesh.shape.get("tensor", 1))
+        if not _sp_active(self.mesh, hidden.shape[0] * tp):
+            return False
+        if (
+            os.environ.get("DSV4_COMPRESSOR_ROW_SHARD", "1") != "1"
+        ):  # default on since pfbase14 (09-19)
+            raise ValueError("DSV4_LOWRANK_AG needs DSV4_COMPRESSOR_ROW_SHARD=1")
+        return int(batch.seq_lens.shape[0]) == 1
+
+    def _sp_full(self, hidden):
+        """All-gather a row-sharded pre-output before the attention / MoE projections."""
+        if _sp_active(self.mesh, hidden.shape[0]):
+            return _sp_gather(self.mesh, hidden)
+        return hidden
+
+    def _sp_shard(self, x):
+        """Bring a sublayer output onto the streams' row sharding (no-op if already there)."""
+        if _sp_active(self.mesh, x.shape[0]):
+            return _sp_rows(self.mesh, x)
+        return x
+
+    def _sp_wo_sharding(self, rows: int):
+        if _sp_active(self.mesh, rows):
+            return NamedSharding(self.mesh, P("tensor", None))
+        return None
+
+    def call_seam(
+        self, streams, hidden, post, comb, next_params, batch, pools, rope_cache, rope_halves
+    ):
+        """Seam-fused layer step: ``(streams, hidden, post, comb)`` in and out.
+
+        ``hidden/post/comb`` are this layer's attention-side pre outputs (from the
+        previous seam or the model's first pre); ``next_params`` are the next layer's
+        attention hc params, or None for the last layer (plain post, hidden None).
+        """
+        lowrank = self._lowrank_attn(hidden, batch)
+        if lowrank:
+            # DSV4_LOWRANK_AG: hand the attention the local rows; it gathers q_lora/kv
+            full_rows = hidden.shape[0] * int(self.mesh.shape["tensor"])
+            attn_in = self.attn_norm(hidden.astype(self.dtype))
+        elif _SP_NORM_BEFORE_GATHER:
+            # RMSNorm is per row: normalise (and cast) the T/tp rows, then gather bf16.
+            hidden_full = self._sp_full(self.attn_norm(hidden.astype(self.dtype)))
+            attn_in = hidden_full
+            full_rows = hidden_full.shape[0]
+        else:
+            hidden_full = self._sp_full(hidden)
+            attn_in = self.attn_norm(hidden_full.astype(self.dtype))
+            full_rows = hidden_full.shape[0]
+        attn, updates = self.self_attn(
+            attn_in,
+            batch,
+            pools,
+            rope_cache,
+            rope_halves,
+            wo_out_sharding=self._sp_wo_sharding(full_rows),
+            sp_local=lowrank,
+        )
+        attn = self._sp_shard(attn)
+        streams, hidden, post, comb = self._mhc_seam(
+            attn,
+            streams,
+            post,
+            comb,
+            self.hc_ffn_fn.value,
+            self.hc_ffn_base.value,
+            self.hc_ffn_scale.value,
+        )
+        streams = streams.astype(self.dtype)
+        if _SP_NORM_BEFORE_GATHER:
+            rows = self.ffn_norm(hidden.astype(self.dtype))
+            hidden_full = self._sp_full(rows)
+            ffn_in = hidden_full
+        else:
+            hidden_full = self._sp_full(hidden)
+            ffn_in = self.ffn_norm(hidden_full.astype(self.dtype))
+        ffn, ids = self.mlp(
+            ffn_in,
+            batch.input_ids,
+            token_valid_mask=batch.get_token_valid_mask(hidden_full.shape[0]),
+            dispatch_info=batch.expert_location_metadata,
+        )
+        ffn = self._sp_shard(ffn)
+        if next_params is None:
+            streams = self._mhc_post(ffn, streams, post, comb).astype(self.dtype)
+            return streams, None, None, None, updates, ids
+        fn, base, scale = next_params
+        streams, hidden, post, comb = self._mhc_seam(ffn, streams, post, comb, fn, base, scale)
+        return streams.astype(self.dtype), hidden, post, comb, updates, ids
+
+    def __call__(self, streams, batch, pools, rope_cache, rope_halves=None):
         hidden, post, comb = self._mhc_pre(
             streams, self.hc_attn_fn.value, self.hc_attn_base.value, self.hc_attn_scale.value
         )
+        lowrank = self._lowrank_attn(hidden, batch)
+        if lowrank:
+            # DSV4_LOWRANK_AG: hand the attention the local rows; it gathers q_lora/kv
+            full_rows = hidden.shape[0] * int(self.mesh.shape["tensor"])
+            attn_in = self.attn_norm(hidden.astype(self.dtype))
+        elif _SP_NORM_BEFORE_GATHER:
+            # RMSNorm is per row: normalise (and cast) the T/tp rows, then gather bf16.
+            hidden_full = self._sp_full(self.attn_norm(hidden.astype(self.dtype)))
+            attn_in = hidden_full
+            full_rows = hidden_full.shape[0]
+        else:
+            hidden_full = self._sp_full(hidden)
+            attn_in = self.attn_norm(hidden_full.astype(self.dtype))
+            full_rows = hidden_full.shape[0]
         attn, updates = self.self_attn(
-            self.attn_norm(hidden.astype(self.dtype)), batch, pools, rope_cache
+            attn_in,
+            batch,
+            pools,
+            rope_cache,
+            rope_halves,
+            wo_out_sharding=self._sp_wo_sharding(full_rows),
+            sp_local=lowrank,
         )
+        attn = self._sp_shard(attn)
         streams = self._mhc_post(attn, streams, post, comb).astype(self.dtype)
         hidden, post, comb = self._mhc_pre(
             streams, self.hc_ffn_fn.value, self.hc_ffn_base.value, self.hc_ffn_scale.value
         )
+        if _SP_NORM_BEFORE_GATHER:
+            rows = self.ffn_norm(hidden.astype(self.dtype))
+            hidden_full = self._sp_full(rows)
+            ffn_in = hidden_full
+        else:
+            hidden_full = self._sp_full(hidden)
+            ffn_in = self.ffn_norm(hidden_full.astype(self.dtype))
         ffn, ids = self.mlp(
-            self.ffn_norm(hidden.astype(self.dtype)),
+            ffn_in,
             batch.input_ids,
-            token_valid_mask=batch.get_token_valid_mask(hidden.shape[0]),
+            token_valid_mask=batch.get_token_valid_mask(hidden_full.shape[0]),
             dispatch_info=batch.expert_location_metadata,
         )
+        ffn = self._sp_shard(ffn)
         streams = self._mhc_post(ffn, streams, post, comb).astype(self.dtype)
         return streams, updates, ids
 
@@ -927,16 +1434,20 @@ class DeepseekV4Model(nnx.Module):
         self.norm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, dtype=dtype)
         self.rope_plain = nnx.Variable(_rope_cache(config, 0))
         self.rope_compressed = nnx.Variable(_rope_cache(config, 4))
+        cos, sin = _split_rope_cache(self.rope_compressed.value, config.qk_rope_head_dim)
+        self.rope_compressed_cos = nnx.Variable(cos)
+        self.rope_compressed_sin = nnx.Variable(sin)
 
     def _collapse_head(self, streams):
         params = (self.hc_head_fn.value, self.hc_head_base.value, self.hc_head_scale.value)
         if self.mhc.backend != "pallas":
             return self.mhc.collapse_head(streams, *params)
-        spec = P("data", None)
+        row = "tensor" if _sp_active(self.mesh, streams.shape[0]) else "data"
+        spec = P(row, None)
         compute = jax.shard_map(
             self.mhc.collapse_head,
             mesh=None,
-            in_specs=(P("data", None, None), P(), P(), P()),
+            in_specs=(P(row, None, None), P(), P(), P()),
             out_specs=spec,
             check_vma=False,
         )
@@ -952,12 +1463,37 @@ class DeepseekV4Model(nnx.Module):
         if batch.input_embedding is not None:
             hidden = batch.input_embedding
         streams = expand_streams(hidden, self.mhc.hc_mult).astype(hidden.dtype)
+        if _sp_active(self.mesh, streams.shape[0]):
+            streams = _sp_rows(self.mesh, streams)
         updates, ids = {}, []
+        # The seam pays on prefill chunks (8K TTFT -10 ms, 32K -20 ms) and costs
+        # +0.4 ms/step on decode buckets, so it is gated on the token count.
+        seam = (
+            _use_mhc_seam()
+            and self.mhc.backend == "pallas"
+            and streams.shape[0] >= _MHC_SEAM_MIN_TOKENS
+        )
+        if seam:
+            first = self.layers[0]
+            hidden, post, comb = first._mhc_pre(streams, *first.attn_params())
         for i, layer in enumerate(self.layers):
             cache = self.rope_compressed if layer.self_attn.ratio else self.rope_plain
-            streams, updates[i], route_ids = layer(streams, batch, pools, cache.value)
+            halves = (
+                (self.rope_compressed_cos.value, self.rope_compressed_sin.value)
+                if layer.self_attn.ratio
+                else None
+            )
+            if seam:
+                nxt = self.layers[i + 1].attn_params() if i + 1 < len(self.layers) else None
+                streams, hidden, post, comb, updates[i], route_ids = layer.call_seam(
+                    streams, hidden, post, comb, nxt, batch, pools, cache.value, halves
+                )
+            else:
+                streams, updates[i], route_ids = layer(streams, batch, pools, cache.value, halves)
             ids.append(route_ids)
         hidden = self._collapse_head(streams)
+        if _sp_active(self.mesh, hidden.shape[0]):
+            hidden = _sp_gather(self.mesh, hidden)
         return (
             self.norm(hidden.astype(self.dtype)),
             batch.attn_backend.pack_pool_updates(
@@ -1062,6 +1598,19 @@ class DeepseekV4ForCausalLM(nnx.Module):
         with jax.set_mesh(self.mesh):
             self.model.rope_plain.value = _rope_cache(self.config, 0)
             self.model.rope_compressed.value = _rope_cache(self.config, 4)
+            cos, sin = _split_rope_cache(
+                self.model.rope_compressed.value, self.config.qk_rope_head_dim
+            )
+            self.model.rope_compressed_cos.value = cos
+            self.model.rope_compressed_sin.value = sin
+        # Per-step work that only depends on loaded weights is done once here.
+        for layer in self.model.layers:
+            layer.self_attn.prepare_grouped_wo_a()
+            if _MERGED_GATE_UP and hasattr(layer.mlp, "experts"):
+                layer.mlp.experts.prepare_merged_gate_up()
+            compressor = getattr(layer.self_attn, "compressor", None)
+            if _HCA_FUSED_PROJ and compressor is not None and compressor.ratio == 128:
+                compressor.prepare_fused_projection(self.mesh)
 
     def _load_regular_weights(self, info):
         from safetensors import safe_open

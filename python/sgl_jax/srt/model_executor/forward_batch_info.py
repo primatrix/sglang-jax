@@ -214,6 +214,11 @@ class ForwardBatch:
 
     # Host-only multimodal batch consumed before the backbone JIT.
     multimodal_batch: object | None = None
+    # SGLANG_JAX_PACK_STEP_ARGS: the per-step host arrays of this batch (and of the
+    # step's SamplingMetadata) packed into one int32 vector plus a static layout;
+    # see model_executor/step_pack.py.
+    step_packed: jax.Array | None = None
+    step_layout: tuple | None = None
 
     def tree_flatten(self):
         children = (
@@ -240,6 +245,7 @@ class ForwardBatch:
             self.recurrent_cow_src_indices,
             self.recurrent_track_indices,
             self.recurrent_track_mask,
+            self.step_packed,
         )
 
         aux_data = {
@@ -248,6 +254,7 @@ class ForwardBatch:
             "spec_algorithm": self.spec_algorithm,
             "capture_hidden_mode": self.capture_hidden_mode,
             "deterministic": self.deterministic,
+            "step_layout": self.step_layout,
         }
         return (children, aux_data)
 
@@ -291,6 +298,8 @@ class ForwardBatch:
         obj.recurrent_cow_src_indices = children[20]
         obj.recurrent_track_indices = children[21]
         obj.recurrent_track_mask = children[22]
+        obj.step_packed = children[23] if len(children) > 23 else None
+        obj.step_layout = aux_data.get("step_layout")
         # Host-only attribute, never a pytree child; reset so attribute access on
         # an unflattened ForwardBatch never raises (the routine that consumes it
         # runs on the original, pre-jit ForwardBatch).
@@ -384,6 +393,7 @@ class ForwardBatch:
                 batch.extend_seq_lens,
             ),
             sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
+            lazy=True,
         )
         mrope_positions = batch.mrope_positions
         mrope_position_axes = getattr(

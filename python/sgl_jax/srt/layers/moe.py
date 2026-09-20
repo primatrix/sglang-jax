@@ -1,6 +1,8 @@
 """GMM-based Expert-Parallel MoE layer and weight mapping utilities."""
 
+import logging
 import math
+import os
 from functools import partial
 
 import jax
@@ -12,6 +14,12 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
+from sgl_jax.srt.kernels.sparse_core.moe_permute import (
+    moe_sc_permute_enabled_by_env,
+    sc_combine,
+    sc_dispatch_gather,
+    should_use_sparse_core,
+)
 from sgl_jax.srt.layers.activation import silu_and_mul_with_clamp
 
 # Re-export for backward compatibility: external code imports from this module.
@@ -23,6 +31,58 @@ from sgl_jax.srt.utils.quantization.quantization_utils import (
     quantize_tensor_simple,
 )
 from sgl_jax.srt.utils.weight_utils import WeightMapping
+
+# ``SGL_JAX_MOE_INVERSE_BY_SORT=1``: build the un-permute index with argsort
+# instead of a scatter (same values; see EPMoE._unpermute).
+_INVERSE_BY_SORT = (
+    os.environ.get("SGL_JAX_MOE_INVERSE_BY_SORT", "1") == "1"
+)  # default on since pfbase14 (09-19)
+# ``SGL_JAX_MOE_ACT_ROWS=1``: run the SwiGLU activation only over the local experts'
+# rows of the gather buffer (kernels/dsv4/moe_act.silu_mul_rows).
+_ACT_ROWS = os.environ.get("SGL_JAX_MOE_ACT_ROWS", "1") == "1"  # default on since pfbase14 (09-19)
+# ``SGL_JAX_MOE_GMM2_NO_ZERO_INIT=1``: skip the second grouped matmul's zero fill of
+# the unvisited output rows when the SparseCore combine (which never reads them) is
+# the consumer.
+_GMM2_NO_ZERO_INIT = (
+    os.environ.get("SGL_JAX_MOE_GMM2_NO_ZERO_INIT", "1") == "1"
+)  # default on since pfbase14 (09-19)
+
+
+logger = logging.getLogger(__name__)
+
+
+# Decode routes at most a few hundred (token, expert) pairs per layer; XLA's sort of
+# that vector costs ~4 us per call on v7x (0.33 ms per bs=64 decode step over the two
+# sorts of 43 layers). Below ``_RANK_SORT_MAX_ENTRIES`` both permutations are taken
+# from an [N, N] comparison instead: rank(i) = #{j: key_j < key_i} + #{j < i: key_j ==
+# key_i} is exactly the stable argsort's inverse, and the forward permutation is its
+# one-hot transpose. Same permutation, no sort. Larger vectors (prefill) keep the sort.
+_RANK_SORT_MAX_ENTRIES = int(os.environ.get("SGL_JAX_MOE_RANK_SORT_MAX_ENTRIES", "1024"))
+
+
+def _stable_argsort_small(keys):
+    """``jnp.argsort(keys, stable=True)`` for a short 1-D integer vector, sort-free."""
+    n = int(keys.shape[0])
+    if n > _RANK_SORT_MAX_ENTRIES:
+        return jnp.argsort(keys, stable=True)
+    keys = jnp.asarray(keys, jnp.int32)
+    index = jnp.arange(n, dtype=jnp.int32)
+    before = (keys[None, :] < keys[:, None]) | (
+        (keys[None, :] == keys[:, None]) & (index[None, :] < index[:, None])
+    )
+    rank = jnp.sum(before.astype(jnp.int32), axis=1)  # inverse permutation
+    # forward permutation: position p holds the index whose rank is p
+    return jnp.sum(jnp.where(rank[:, None] == index[None, :], index[:, None], 0), axis=0)
+
+
+def _inverse_permutation_small(perm):
+    """``jnp.argsort(perm)`` for a short permutation vector, sort-free."""
+    n = int(perm.shape[0])
+    if n > _RANK_SORT_MAX_ENTRIES:
+        return jnp.argsort(perm).astype(jnp.int32)
+    index = jnp.arange(n, dtype=jnp.int32)
+    perm = jnp.asarray(perm, jnp.int32)
+    return jnp.sum(jnp.where(perm[None, :] == index[:, None], index[None, :], 0), axis=1)
 
 
 class EPMoE(nnx.Module):
@@ -43,8 +103,13 @@ class EPMoE(nnx.Module):
         pre_gather_quant_dtype=None,
         moe_dp_size: int = 1,
         swiglu_limit: float | None = None,
+        use_sc_permute: bool | None = None,
     ):
         self.num_experts_per_tok = num_experts_per_tok
+        # Opt-in SparseCore permute/unpermute kernels; ``None`` defers to the env flag.
+        self.use_sc_permute = (
+            moe_sc_permute_enabled_by_env() if use_sc_permute is None else bool(use_sc_permute)
+        )
         self.physical_to_logical_map = physical_to_logical_map
         self.pre_gather_quant_dtype = pre_gather_quant_dtype
         self.moe_dp_size = moe_dp_size
@@ -447,6 +512,58 @@ class EPMoE(nnx.Module):
                 out_sharding=P("expert", None, None, None),
             )
 
+    def prepare_merged_gate_up(self):
+        """Concatenate wi_0 | wi_1 per device so the gate and up projections run as one gmm.
+
+        At decode batch sizes every gmm call costs a fixed ~13 us on v7x, so one
+        call over ``[E, k, 2n]`` instead of two over ``[E, k, n]`` saves that per
+        layer.  The concatenation is done inside a shard_map so each device's
+        local column shard is ``[w0_local | w1_local]``; the kernel splits the
+        result at the local width.  Not supported for replicated experts.
+        """
+        if self.replicate_experts or getattr(self, "merged_gate_up", False):
+            return
+        if self.wi_0.value.shape[-1] != self.wi_1.value.shape[-1]:
+            raise ValueError("wi_0 and wi_1 must share the intermediate width")
+        w_spec = P("expert", None, "tensor")
+        s_spec = P("expert", None, None, "tensor")
+        with jax.sharding.use_abstract_mesh(self.updated_mesh):
+            concat = jax.jit(
+                shard_map(
+                    lambda a, b: jnp.concatenate([a, b], axis=-1),
+                    mesh=self.moe_mesh,
+                    in_specs=(w_spec, w_spec),
+                    out_specs=w_spec,
+                    check_vma=False,
+                )
+            )
+            self.wi_01 = nnx.Param(concat(self.wi_0.value, self.wi_1.value), out_sharding=w_spec)
+            if self.wi_0_scale is not None:
+                s0 = self._normalize_scale_for_gmm(
+                    self.wi_0_scale.value, self.wi_0.value, scale_name="wi_0_scale"
+                )
+                s1 = self._normalize_scale_for_gmm(
+                    self.wi_1_scale.value, self.wi_1.value, scale_name="wi_1_scale"
+                )
+                concat_s = jax.jit(
+                    shard_map(
+                        lambda a, b: jnp.concatenate([a, b], axis=-1),
+                        mesh=self.moe_mesh,
+                        in_specs=(s_spec, s_spec),
+                        out_specs=s_spec,
+                        check_vma=False,
+                    )
+                )
+                self.wi_01_scale = nnx.Param(concat_s(s0, s1), out_sharding=s_spec)
+            else:
+                self.wi_01_scale = None
+        self.merged_gate_up = True
+        logger.info(
+            "EPMoE layer %s: merged gate/up gmm enabled, wi_01 %s",
+            getattr(self, "layer_id", "?"),
+            tuple(self.wi_01.value.shape),
+        )
+
     @named_scope
     def __call__(
         self,
@@ -483,6 +600,18 @@ class EPMoE(nnx.Module):
             ]
         )
         scatter_on_tensor = "tensor" in out_specs
+        # Pure expert parallelism (tp_size == 1): the caller's row axis "tensor" on the
+        # model mesh is this mesh's "expert" axis (same devices, same order), so a
+        # row-sharded request is served by a reduce-scatter over "expert" instead
+        # of the all-reduce in _combine (half the ICI bytes, and the consumer is
+        # already row-sharded under DSV4_SEQ_PARALLEL).
+        scatter_on_expert = False
+        if self.tp_size == 1 and self.ep_size > 1 and len(out_sharding.spec) > 0:
+            s0 = out_sharding.spec[0]
+            if s0 == "tensor" or (isinstance(s0, tuple) and "tensor" in s0):
+                scatter_on_expert = True
+                out_specs = P("expert", *out_specs[1:])
+                scatter_on_tensor = False
 
         # Run MoE computation on the expert-parallel mesh
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
@@ -491,16 +620,25 @@ class EPMoE(nnx.Module):
             topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
 
             # Normalize scales to GMM's 4D layout [E, k_blocks, 1, out_dim]
-            w0_scale = self._normalize_scale_for_gmm(
-                self.wi_0_scale.value if self.wi_0_scale is not None else None,
-                self.wi_0.value,
-                scale_name="wi_0_scale",
-            )
-            w1_scale = self._normalize_scale_for_gmm(
-                self.wi_1_scale.value if self.wi_1_scale is not None else None,
-                self.wi_1.value,
-                scale_name="wi_1_scale",
-            )
+            merged = getattr(self, "merged_gate_up", False)
+            if merged:
+                # One buffer serves both gmm slots; _gmm_compute reads only the first.
+                w0_weights = w1_weights = self.wi_01.value
+                w0_scale = w1_scale = (
+                    self.wi_01_scale.value if self.wi_01_scale is not None else None
+                )
+            else:
+                w0_weights, w1_weights = self.wi_0.value, self.wi_1.value
+                w0_scale = self._normalize_scale_for_gmm(
+                    self.wi_0_scale.value if self.wi_0_scale is not None else None,
+                    self.wi_0.value,
+                    scale_name="wi_0_scale",
+                )
+                w1_scale = self._normalize_scale_for_gmm(
+                    self.wi_1_scale.value if self.wi_1_scale is not None else None,
+                    self.wi_1.value,
+                    scale_name="wi_1_scale",
+                )
             wo_scale = self._normalize_scale_for_gmm(
                 self.wo_scale.value if self.wo_scale is not None else None,
                 self.wo.value,
@@ -508,7 +646,11 @@ class EPMoE(nnx.Module):
             )
 
             result = shard_map(
-                partial(self._forward, scatter_on_tensor=scatter_on_tensor),
+                partial(
+                    self._forward,
+                    scatter_on_tensor=scatter_on_tensor,
+                    scatter_on_expert=scatter_on_expert,
+                ),
                 mesh=self.moe_mesh,
                 in_specs=(
                     P(None),
@@ -533,8 +675,8 @@ class EPMoE(nnx.Module):
                 hidden_states_reshard,
                 topk_weights_reshard,
                 topk_ids_reshard,
-                self.wi_0.value,
-                self.wi_1.value,
+                w0_weights,
+                w1_weights,
                 self.wo.value,
                 w0_scale,
                 w1_scale,
@@ -612,6 +754,7 @@ class EPMoE(nnx.Module):
         wo_kernel_bias=None,
         *,
         scatter_on_tensor: bool = False,
+        scatter_on_expert: bool = False,
     ):
         expert_shard_id = (
             jnp.array(0, dtype=jnp.int32)
@@ -627,6 +770,25 @@ class EPMoE(nnx.Module):
 
         group_offset = self._dispatch(group_sizes, expert_shard_id)
 
+        local_range = None
+        valid_mask = None
+        # Trace-time gate: small (decode-sized) batches keep the exact XLA path so
+        # their HLO is identical to the flag-off build.
+        if self.use_sc_permute and should_use_sparse_core(
+            token_indices.shape[0], inputs_2d.shape[-1], self.dtype
+        ):
+            # Sorted-row range owned by this expert shard, and which routed slots
+            # (token-major order) landed on a local expert.
+            csum = jnp.cumsum(group_sizes)
+            start = jnp.where(group_offset == 0, 0, csum[jnp.maximum(group_offset - 1, 0)])
+            end = csum[group_offset + self.experts_per_device - 1]
+            if self.ep_size > 1:
+                local_range = (start.astype(jnp.int32), end.astype(jnp.int32))
+            flat_experts = jnp.ravel(topk_ids)
+            valid_mask = (flat_experts >= group_offset) & (
+                flat_experts < group_offset + self.experts_per_device
+            )
+
         intermediate_output = self._gmm_compute(
             inputs_2d,
             token_indices,
@@ -641,12 +803,14 @@ class EPMoE(nnx.Module):
             w0_kernel_bias,
             w1_kernel_bias,
             wo_kernel_bias,
+            local_range=local_range,
         )
 
         output = self._unpermute(
             intermediate_output,
             sorted_selected_experts,
             topk_weights,
+            valid_mask=valid_mask,
         )
 
         # Reduce on the "tensor" axis. RS (psum_scatter) when caller asked
@@ -658,7 +822,10 @@ class EPMoE(nnx.Module):
             else:
                 output = jax.lax.psum(output, "tensor")
         if self.ep_size > 1:
-            output = self._combine(output)
+            if scatter_on_expert:
+                output = jax.lax.psum_scatter(output, "expert", scatter_dimension=0, tiled=True)
+            else:
+                output = self._combine(output)
 
         return output
 
@@ -677,6 +844,7 @@ class EPMoE(nnx.Module):
         w0_kernel_bias=None,
         w1_kernel_bias=None,
         wo_kernel_bias=None,
+        local_range=None,
     ):
         if token_indices.shape[0] == 0:
             return jnp.zeros((0, wo_kernel.shape[-1]), dtype=inputs_2d.dtype)
@@ -690,6 +858,10 @@ class EPMoE(nnx.Module):
             x = x_q[token_indices]
             x_scale = x_scale[token_indices]
             x = (x.astype(jnp.float32) * x_scale).astype(self.dtype)
+        elif local_range is not None:
+            # SparseCore ragged gather: only rows [start, end) (local experts) are
+            # materialized; gmm never reads the others thanks to group_offset.
+            x = sc_dispatch_gather(inputs_2d, token_indices, *local_range).astype(self.dtype)
         else:
             x = inputs_2d[token_indices].astype(self.dtype)
 
@@ -714,27 +886,55 @@ class EPMoE(nnx.Module):
         )
 
         # === GEMM1: x @ w0 and x @ w1 ===
-        layer_w0 = gmm(
-            lhs=x,
-            rhs=w0_kernel,
-            rhs_scale=w0_kernel_scale,
-            rhs_bias=w0_kernel_bias,
-            zero_initialize=False,
-            activation_quantized_dtype=act_q_dtype,
-            **gmm_kwargs,
-        )
-        layer_w1 = gmm(
-            lhs=x,
-            rhs=w1_kernel,
-            rhs_scale=w1_kernel_scale,
-            rhs_bias=w1_kernel_bias,
-            zero_initialize=False,
-            activation_quantized_dtype=act_q_dtype,
-            **gmm_kwargs,
-        )
+        if getattr(self, "merged_gate_up", False):
+            # w0_kernel is [E, k, 2n] = [w0 | w1] per device: one call, split at n.
+            layer_w01 = gmm(
+                lhs=x,
+                rhs=w0_kernel,
+                rhs_scale=w0_kernel_scale,
+                rhs_bias=w0_kernel_bias,
+                zero_initialize=False,
+                activation_quantized_dtype=act_q_dtype,
+                **gmm_kwargs,
+            )
+            half = layer_w01.shape[-1] // 2
+            layer_w0 = layer_w01[:, :half]
+            layer_w1 = layer_w01[:, half:]
+        else:
+            layer_w0 = gmm(
+                lhs=x,
+                rhs=w0_kernel,
+                rhs_scale=w0_kernel_scale,
+                rhs_bias=w0_kernel_bias,
+                zero_initialize=False,
+                activation_quantized_dtype=act_q_dtype,
+                **gmm_kwargs,
+            )
+            layer_w1 = gmm(
+                lhs=x,
+                rhs=w1_kernel,
+                rhs_scale=w1_kernel_scale,
+                rhs_bias=w1_kernel_bias,
+                zero_initialize=False,
+                activation_quantized_dtype=act_q_dtype,
+                **gmm_kwargs,
+            )
 
         # === Activation ===
-        if self.swiglu_limit is not None:
+        if self.swiglu_limit is not None and _ACT_ROWS and local_range is not None:
+            # Only the local experts' rows [start, end) of the statically sized
+            # gather buffer are real; skip streaming the rest (see kernels/dsv4/moe_act).
+            from sgl_jax.srt.kernels.dsv4.moe_act import silu_mul_rows
+
+            intermediate_layer = silu_mul_rows(
+                layer_w0,
+                layer_w1,
+                local_range[0],
+                local_range[1],
+                limit=self.swiglu_limit,
+                interpret=os.environ.get("PALLAS_INTERPRET", "0") == "1",
+            )
+        elif self.swiglu_limit is not None:
             intermediate_layer = silu_and_mul_with_clamp(layer_w0, layer_w1, self.swiglu_limit)
         else:
             if self.activation == "silu":
@@ -746,12 +946,16 @@ class EPMoE(nnx.Module):
             intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
         # === GEMM2: intermediate @ wo ===
+        # With the SparseCore combine only the local experts' rows are ever read
+        # back (ragged_gather_reduce partitions valid sources to the front), so the
+        # zero DMA over the other 7/8 of the [T*top_k, D] output can be skipped.
+        zero_init = not (_GMM2_NO_ZERO_INIT and local_range is not None and self.use_sc_permute)
         return gmm(
             lhs=intermediate_layer,
             rhs=wo_kernel,
             rhs_scale=wo_kernel_scale,
             rhs_bias=wo_kernel_bias,
-            zero_initialize=True,
+            zero_initialize=zero_init,
             activation_quantized_dtype=act_q_dtype,
             **gmm_kwargs,
         )
@@ -798,7 +1002,7 @@ class EPMoE(nnx.Module):
             )
 
         flatten_selected_experts = jnp.ravel(top_k_indices)
-        sorted_selected_experts = jnp.argsort(flatten_selected_experts, stable=True)
+        sorted_selected_experts = _stable_argsort_small(flatten_selected_experts)
         # token_indices: maps each sorted position to the original token index.
         # Pass to _gmm_compute so the gather happens there (indexed_gmm pattern),
         # avoiding a full [M*top_k, D] materialization in _permute.
@@ -813,7 +1017,7 @@ class EPMoE(nnx.Module):
             group_sizes,
         )
 
-    def _unpermute(self, intermediate, sorted_selected_experts, weights):
+    def _unpermute(self, intermediate, sorted_selected_experts, weights, valid_mask=None):
         top_k = self.num_experts_per_tok
         if weights.ndim != 2 or weights.shape[1] != top_k:
             raise ValueError(
@@ -838,11 +1042,28 @@ class EPMoE(nnx.Module):
                 padding = jnp.zeros((padding_size, intermediate.shape[1]), dtype=intermediate.dtype)
                 intermediate = jnp.concatenate([intermediate, padding], axis=0)
 
-        argsort_indices = (
-            jnp.zeros(expected_tokens, dtype=jnp.int32)
-            .at[sorted_selected_experts]
-            .set(jnp.arange(expected_tokens, dtype=jnp.int32))
-        )
+        if _INVERSE_BY_SORT:
+            # The inverse of a permutation is its argsort; XLA lowers the
+            # scatter form below to a serial TC scatter (0.19 ms per layer at
+            # 8K on v7x, 4x the cost of the sort that produced the permutation).
+            argsort_indices = _inverse_permutation_small(sorted_selected_experts)
+        else:
+            argsort_indices = (
+                jnp.zeros(expected_tokens, dtype=jnp.int32)
+                .at[sorted_selected_experts]
+                .set(jnp.arange(expected_tokens, dtype=jnp.int32))
+            )
+        if self.use_sc_permute and valid_mask is not None:
+            # SparseCore fused gather + top-k weighted reduce (falls back to XLA when
+            # SparseCore is absent or the problem is too small to benefit).
+            return sc_combine(
+                intermediate,
+                argsort_indices,
+                jnp.reshape(weights, (-1,)),
+                valid_mask,
+                self.num_experts_per_tok,
+            ).astype(self.dtype)
+
         grouped_indices = jnp.reshape(argsort_indices, (weights.shape[0], top_k))
         weights_fp32 = weights.astype(jnp.float32)
 

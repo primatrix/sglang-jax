@@ -97,6 +97,12 @@ global_server_args_dict = {k: getattr(ServerArgs, k) for k in GLOBAL_SERVER_ARGS
 
 logger = logging.getLogger(__name__)
 
+# ``SGLANG_JAX_EXTEND_BS_BUCKETS=1``: pad extend batches to the smallest precompiled
+# bs bucket instead of always the largest (see get_model_worker_batch).
+_EXTEND_BS_BUCKETS = (
+    os.environ.get("SGLANG_JAX_EXTEND_BS_BUCKETS", "1") == "1"
+)  # default on since pfbase14 (09-19)
+
 
 class BaseFinishReason:
     def __init__(self, is_error: bool = False):
@@ -3068,9 +3074,13 @@ class ScheduleBatch:
     ) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
             token_paddings = bs_paddings
-        else:
+        elif not _EXTEND_BS_BUCKETS:
             bs_paddings = bs_paddings[-1:]
             cache_loc_paddings = cache_loc_paddings[-1:]
+        # else: extend pads its batch size to the smallest precompiled bucket that
+        # fits (CompilationManager precompiles every bucket in this mode); the
+        # per-request buffers of a single long prefill no longer carry
+        # max_running_requests - 1 empty slots.
 
         bid = acc_global_bid()
 
