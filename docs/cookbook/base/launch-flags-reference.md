@@ -48,7 +48,7 @@ grep -n 'add_argument' python/sgl_jax/srt/server_args.py
 | `--chunked-prefill-size` | `None` (→ `4096`) | Tokens per prefill chunk. `-1` disables chunking. |
 | `--max-prefill-tokens` | `16384` | Cap on prefill batch tokens. |
 | `--max-running-requests` | `None` | Concurrent decode bound. `128` for v6e-16, `512` for v6e-64 / v7x-16. |
-| `--swa-full-tokens-ratio` | `0.8` | **Per-layer** KV-token ratio: `swa_tokens_per_layer / full_tokens_per_layer` (independent of how many SWA vs full layers the model has). E.g. `0.5` → each SWA layer gets half the KV tokens of each full layer. MiMo recipes pin much smaller values (0.15–0.25); see those recipes for the empirically tuned numbers. |
+| `--swa-full-tokens-ratio` | `0.8` (DeepSeek V4: `0.2` when unset) | **Per-layer** KV-token ratio: `swa_tokens_per_layer / full_tokens_per_layer` (independent of how many SWA vs full layers the model has). E.g. `0.5` → each SWA layer gets half the KV tokens of each full layer. MiMo recipes pin much smaller values (0.15–0.25); see those recipes for the empirically tuned numbers. |
 | `--disable-radix-cache` | `False` | Disables RadixAttention prefix sharing. Set in benchmarks where prefix caching would skew results. |
 
 ## 4. Memory
