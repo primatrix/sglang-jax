@@ -387,7 +387,7 @@ def membership_from_scores(
     kept: `select_topk_indices` + per-request offsets + `packed_membership`.
     """
     from sgl_jax.srt.kernels.dsa.streamindex_topk import select_topk_indices
-    from sgl_jax.srt.kernels.dsv4.topk_threshold import topk_mask
+    from sgl_jax.srt.kernels.dsv4.topk_threshold import topk_membership_mask
     from sgl_jax.srt.layers.attention.dsv4.attention import packed_membership
 
     scores = jnp.asarray(scores, jnp.float32)
@@ -403,7 +403,7 @@ def membership_from_scores(
         return jnp.pad(mask, ((0, 0), (0, num_entries - width)))
 
     def by_threshold(s):
-        return _fit(topk_mask(s, k)) & rows_valid
+        return _fit(topk_membership_mask(s, k)) & rows_valid
 
     def by_indices(s):
         selected = select_topk_indices(s, k, backend=topk_backend)[:, :k]

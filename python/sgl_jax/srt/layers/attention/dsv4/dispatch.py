@@ -590,7 +590,7 @@ def _compressor_row_shard_plan(x, metadata, ratio_md, ratio):
     or T / N not divisible by the axis size).
 
     ``x`` is either the full chunk ``[T, hidden]`` (every device slices its block) or,
-    under ``DSV4_LOWRANK_AG``, this device's block ``[T/n, hidden]`` only (local mode:
+    in local mode, this device's block ``[T/n, hidden]`` only (the caller all-gathers the low-rank projections itself:
     the previous block's last rows arrive by ppermute). Local mode has no fallback,
     so a failed gate there is a configuration error.
     """
@@ -601,7 +601,7 @@ def _compressor_row_shard_plan(x, metadata, ratio_md, ratio):
     local = n is not None and int(x.shape[0]) != tokens
     if not _COMPRESSOR_ROW_SHARD:
         if local:
-            raise ValueError("DSV4_LOWRANK_AG needs DSV4_COMPRESSOR_ROW_SHARD=1")
+            raise ValueError("local-mode compression needs DSV4_COMPRESSOR_ROW_SHARD=1")
         return None
     if n is None or n < 2 or int(metadata.cu_q_lens.shape[0]) != 2:
         if local:

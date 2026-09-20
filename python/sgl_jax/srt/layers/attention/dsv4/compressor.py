@@ -128,9 +128,6 @@ def interleaved_rope(x, cos, sin, rope_head_dim: int):
     return x * cos_full + partner * sin_full
 
 
-_LANE = 128
-
-
 def project_tokens(x, wkv, wgate, ape, positions, *, ratio: int):
     """Per-token content and score projections.
 

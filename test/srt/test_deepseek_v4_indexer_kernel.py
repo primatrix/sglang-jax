@@ -6,8 +6,6 @@ The kernel reads the paged indexer cache directly; the reference reads the gathe
 gathered-row ordering that ``dispatch.read_tables`` produces.
 """
 
-import os
-
 import jax
 import jax.numpy as jnp
 import numpy as np

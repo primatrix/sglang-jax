@@ -170,6 +170,8 @@ def _short_kv_streaming_attention(
     order = (jnp.arange(window, dtype=jnp.int32)[None, :] + shift[:, None]) % window
     rotated_rows = jnp.take_along_axis(window_rows, order, axis=1)
     window_kv = jnp.take(window_cache, rotated_rows, axis=0).astype(jnp.bfloat16)
+    # Off-TPU (CPU interpret tests) there is no device kind to key the schedule
+    # table; use the v7x row, which is what the interpret tests exercise.
     device_kind = jax.devices()[0].device_kind if jax.default_backend() == "tpu" else "TPU7x"
     schedule = get_hca_kernel_schedule(
         device_kind,

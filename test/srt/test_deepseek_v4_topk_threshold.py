@@ -6,7 +6,7 @@ import numpy as np
 
 from sgl_jax.srt.kernels.dsv4.topk_threshold import (
     score_key,
-    topk_mask,
+    topk_membership_mask,
     topk_threshold,
     topk_threshold_xla,
 )
@@ -44,7 +44,7 @@ def test_threshold_matches_reference():
         s[2, :] = 0.25  # all ties
         s[3, 5] = s[3, 6]  # a tie at some rank
         want = _reference_mask(s, k)
-        got = np.asarray(topk_mask(jnp.asarray(s), k, interpret=True))
+        got = np.asarray(topk_membership_mask(jnp.asarray(s), k, interpret=True))
         np.testing.assert_array_equal(got, want)
         thr_k = np.asarray(topk_threshold(jnp.asarray(s), k, interpret=True))
         thr_x = np.asarray(topk_threshold_xla(jnp.asarray(s), k))
@@ -56,7 +56,7 @@ def test_padding_rows_and_lanes():
     T, E, k = 13, 200, 16  # E not a lane multiple, T not a sublane multiple
     s = rng.standard_normal((T, E)).astype(np.float32)
     want = _reference_mask(s, k)
-    got = np.asarray(topk_mask(jnp.asarray(s), k, interpret=True))
+    got = np.asarray(topk_membership_mask(jnp.asarray(s), k, interpret=True))
     np.testing.assert_array_equal(got, want)
     assert got.sum(1).min() == k
 
@@ -135,7 +135,6 @@ def test_membership_from_scores_single_and_multi_request():
 
 
 def test_membership_from_scores_under_explicit_mesh():
-    import jax
     from jax.sharding import AxisType, NamedSharding
     from jax.sharding import PartitionSpec as P
 

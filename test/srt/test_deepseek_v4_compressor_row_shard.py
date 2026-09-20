@@ -1,5 +1,9 @@
 """DSV4_COMPRESSOR_ROW_SHARD: per-device row-block compression + all-gathered records equals the
-full-chunk compress_chunk (CPU, 8 host devices, shard_map over 'tensor')."""
+full-chunk compress_chunk (CPU, 8 host devices, shard_map over 'tensor').
+
+Runs in its own process: the XLA_FLAGS / JAX_PLATFORMS / DSV4_* settings below must be
+in place before jax initialises, and they stay set for anything imported afterwards
+(run_suite starts one process per file)."""
 
 import os
 import types
@@ -12,6 +16,11 @@ os.environ["DSV4_COMPRESSOR_ROW_SHARD"] = "1"
 
 import jax
 import jax.numpy as jnp
+
+if len(jax.devices()) < 8:
+    pytest.skip(
+        "needs 8 host devices (XLA_FLAGS set before jax initialised)", allow_module_level=True
+    )
 import numpy as np
 import pytest
 from jax.sharding import Mesh

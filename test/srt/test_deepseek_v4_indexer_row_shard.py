@@ -1,5 +1,9 @@
 """DSV4_INDEXER_ROW_SHARD: per-device row-block indexer scoring + all-gathered membership equals
-the replicated full-T membership (CPU, 8 host devices, shard_map over 'tensor')."""
+the replicated full-T membership (CPU, 8 host devices, shard_map over 'tensor').
+
+Runs in its own process: the XLA_FLAGS / JAX_PLATFORMS / DSV4_* settings below must be
+in place before jax initialises, and they stay set for anything imported afterwards
+(run_suite starts one process per file)."""
 
 import os
 import types
@@ -11,10 +15,17 @@ os.environ["DSV4_INDEXER_ROW_SHARD"] = "1"
 
 import jax
 import jax.numpy as jnp
+
+if len(jax.devices()) < 8:
+    pytest.skip(
+        "needs 8 host devices (XLA_FLAGS set before jax initialised)", allow_module_level=True
+    )
+
 import numpy as np
 import pytest
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
+from test_deepseek_v4_indexer_kernel import CPS, RATIO, K, _synthetic_batch
 
 from sgl_jax.srt.layers.attention.dsv4 import dispatch
 from sgl_jax.srt.layers.attention.dsv4.indexer import (
@@ -54,9 +65,6 @@ def cpu_scorer(
     legal = (entries[None, :] < visible[:, None]) & jnp.asarray(valid_token_mask, bool)[:, None]
     legal = legal & (jnp.arange(tokens) < q_len)[:, None]
     return jnp.where(legal, scores, -jnp.inf), jnp.zeros((1,), jnp.int32)
-
-
-from test_deepseek_v4_indexer_kernel import CPS, RATIO, K, _synthetic_batch
 
 
 @pytest.mark.parametrize("prefix,q_len,padded", [(0, 512, 0), (256, 300, 212), (0, 40, 472)])

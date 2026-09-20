@@ -110,7 +110,7 @@ def topk_threshold(scores, k: int, *, block_rows: int | None = None, interpret: 
     return _from_signed(out[:T, 0])
 
 
-def topk_mask(scores, k: int, *, interpret: bool | None = None):
+def topk_membership_mask(scores, k: int, *, interpret: bool | None = None):
     """``[T, E]`` bool: score is finite and >= the row's k-th largest score."""
     scores = jnp.asarray(scores, jnp.float32)
     thr = topk_threshold(scores, k, interpret=interpret)
