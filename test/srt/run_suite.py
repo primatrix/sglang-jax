@@ -467,6 +467,13 @@ suites = {
         TestFile("test/srt/test_recurrent_split_equivalence.py", 0.3),
         TestFile("test/srt/test_prepare_for_extend_protected_len.py", 0.2),
         TestFile("test/srt/test_native_attention_paged_decode.py", 1),
+        # DeepSeek V4 CSA kernels (CPU interpret)
+        TestFile("test/srt/test_deepseek_v4_csa_flash_attention_kernel.py", 0.1, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_csa_decode_attention_kernel.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_csa_decode_segments.py", 1.5, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_topk_threshold.py", 0.3, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_paged_row_write.py", 1.3, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_state_init.py", 0.1, runner="pytest"),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile(
