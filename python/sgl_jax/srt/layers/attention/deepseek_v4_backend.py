@@ -23,9 +23,12 @@ from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.attention.dsv4.execution import (
     CompressorWeights,
     padded_read_tables,
-    run_native_attention,
+    run_dsv4_attention,
 )
-from sgl_jax.srt.layers.attention.dsv4.hca import DeepseekV4HCAMetadata, HCAExecution
+from sgl_jax.srt.layers.attention.dsv4.hca import (
+    DeepseekV4HCABackendMixin,
+    DeepseekV4HCAMetadata,
+)
 from sgl_jax.srt.layers.attention.dsv4.metadata import (
     DeepseekV4AttentionMetadata,
     derive_attention_metadata,
@@ -192,23 +195,29 @@ class _PrecompileContextBox:
         self.context_len: int | None = None
 
 
-class DeepseekV4AttentionBackend(AttentionBackend):
+class DeepseekV4AttentionBackend(AttentionBackend, DeepseekV4HCABackendMixin):
     """Model-facing owner of V4 metadata, layer routing, and cache updates.
 
-    Like SGLang's V4 backend, one entry point handles ratios 0/4/128. Internal
-    executors choose kernels; they are not independently registered backends.
+    Like SGLang's V4 backend, one entry point handles ratios 0/4/128. HCA helpers
+    are mixed into this backend and share its configuration and metadata owner.
     Unlike PyTorch, JAX returns replacement cache arrays through the model jit.
     """
 
     def __init__(self, *, mesh, page_size, max_context_len, config=None):
+        if mesh is None:
+            raise ValueError("V4 attention requires the SGLang device mesh")
+        if page_size not in (128, 256):
+            raise ValueError("V4 attention requires original-token page size 128 or 256")
+        if max_context_len <= 0:
+            raise ValueError("V4 context capacity must be positive")
         self.mesh = mesh
         self.page_size = page_size
         self.max_context_len = max_context_len
         self.request_capacity = 1
         self.window_size = int(getattr(config, "sliding_window", 128))
-        self.hca = HCAExecution(
-            mesh=mesh, page_size=page_size, max_context_len=max_context_len, request_capacity=1
-        )
+        # This selects a shape-specialized TPU implementation, not a different
+        # attention algorithm. The general ratio-128 path uses all visible C128
+        # records without an indexer, and remains reachable for other geometries.
         self.use_pallas_hca = jax.default_backend() == "tpu" and (
             getattr(config, "hidden_size", 4096),
             getattr(config, "num_attention_heads", 64),
@@ -247,7 +256,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if allocator.dp_size != self.mesh.shape["data"] or allocator.page_size != self.page_size:
             raise ValueError("V4 runtime and resource geometry disagree")
         self.request_capacity = request_pool.size
-        self.hca.request_capacity = request_pool.size
         self.resources_bound = True
 
     def hca_entry_bucket(self, batch) -> int | None:
@@ -282,7 +290,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if not self.resources_bound:
             raise RuntimeError("V4 runtime resources must be bound after pool initialization")
         hca = (
-            self.hca.get_forward_metadata(
+            self._get_hca_metadata(
                 batch,
                 request_pool=request_pool,
                 allocator=allocator,
@@ -471,7 +479,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             if compressor is None:
                 raise ValueError("HCA requires model compressor weights")
             cache = compressor.cos_sin_cache
-            output, (state, window, history) = self.hca.forward(
+            output, (state, window, history) = self._forward_hca(
                 q,
                 k,
                 v,
@@ -503,7 +511,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if not md.has_metadata():
             raise RuntimeError("V4 attention metadata has not been prepared")
         attention, read_tables = md.resolve()
-        return run_native_attention(
+        return run_dsv4_attention(
             self.mesh,
             q,
             k[:, 0] if k.ndim == 3 else k,
