@@ -1,9 +1,4 @@
-"""The HCA compressor's fused ``[Wkv|Wgate]^T`` projection is built once at load.
-
-``fused_projection_weight`` rebuilt it in every HCA layer on every step (an f32->bf16
-convert of ``wgate``, a concatenation and a transpose).  ``prepare_fused_projection``
-materialises the same array once and ``weights()`` hands it to the HCA backend.
-"""
+"""Compressor weight preparation and fused-tail numerical regressions."""
 
 from types import SimpleNamespace
 
@@ -12,7 +7,9 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh
 
+from sgl_jax.srt.kernels.dsv4.compressor_tail import compressor_tail_pallas
 from sgl_jax.srt.kernels.hca.hca import fused_projection_weight
+from sgl_jax.srt.layers.attention.dsv4.ref.compressor import compressor_tail_ref
 from sgl_jax.srt.models.deepseek_v4 import DeepseekV4Compressor
 
 HIDDEN, D = 256, 64
@@ -66,3 +63,57 @@ def test_xla_projection_matches_a_numpy_reference(monkeypatch):
     ref[:, 1] += apef[np.asarray(pos) % 128]
     assert got.shape == (tokens, 2, head)
     np.testing.assert_allclose(got, ref, rtol=1e-5, atol=1e-4)
+
+
+def _tail_inputs(N, D, ratio, coff, seed):
+    rng = np.random.default_rng(seed)
+    W, width = coff * ratio, coff * D
+    combined = jnp.asarray(rng.standard_normal((N, W, 2 * width)), jnp.float32)
+    valid = rng.random((N, W)) > 0.3
+    valid[:, -1] = True  # the record's own row is always in sequence
+    ang = rng.uniform(0, 6.28, size=(N, 32))
+    return dict(
+        combined=combined,
+        valid=jnp.asarray(valid),
+        norm_weight=jnp.asarray(rng.uniform(0.5, 1.5, size=D), jnp.float32),
+        cos=jnp.asarray(np.cos(ang), jnp.float32),
+        sin=jnp.asarray(np.sin(ang), jnp.float32),
+        ratio=ratio,
+        coff=coff,
+        head_dim=D,
+        width=width,
+    )
+
+
+def test_tail_matches_reference():
+    for N, D, ratio, coff, seed in ((5, 512, 4, 2, 0), (16, 128, 4, 2, 1), (3, 128, 8, 1, 2)):
+        c = _tail_inputs(N, D, ratio, coff, seed)
+        want = compressor_tail_ref(
+            c["combined"],
+            c["valid"],
+            c["norm_weight"],
+            c["cos"],
+            c["sin"],
+            ratio=ratio,
+            coff=coff,
+            head_dim=D,
+            width=c["width"],
+            rope_head_dim=64,
+            norm_eps=1e-6,
+        )
+        got = compressor_tail_pallas(
+            c["combined"],
+            c["valid"],
+            c["norm_weight"],
+            c["cos"],
+            c["sin"],
+            ratio=ratio,
+            coff=coff,
+            head_dim=D,
+            width=c["width"],
+            rope_head_dim=64,
+            norm_eps=1e-6,
+            interpret=True,
+        )
+        assert got.shape == (N, D)
+        np.testing.assert_allclose(np.asarray(got), np.asarray(want), rtol=1e-4, atol=1e-4)

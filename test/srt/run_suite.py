@@ -469,35 +469,28 @@ suites = {
         # DeepSeek V4 pools
         TestFile("test/srt/test_deepseek_v4_hca_layout.py", 0.2, runner="pytest"),
         # DeepSeek V4 small kernels (CPU interpret)
-        TestFile("test/srt/test_deepseek_v4_mhc_seam.py", 0.2, runner="pytest"),
+        TestFile("test/srt/kernels/mhc/test_mhc.py", 0.5, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_wo_a_projection.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_quantized_matmul_batch_block.py", 0.1, runner="pytest"),
         # DeepSeek V4 CSA kernels (CPU interpret)
-        TestFile("test/srt/test_deepseek_v4_csa_decode_attention_kernel.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_csa_decode.py", 0.7, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_csa_decode_segments.py", 1.5, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_topk_threshold.py", 0.3, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_paged_row_write.py", 1.3, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_state_init.py", 0.1, runner="pytest"),
         # DeepSeek V4 HCA kernels (CPU interpret)
-        TestFile("test/srt/test_deepseek_v4_hca_boundary_native.py", 0.2, runner="pytest"),
-        TestFile("test/srt/test_deepseek_v4_hca_emit_native.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_hca_compressor.py", 0.4, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_hca_decode_dense.py", 0.6, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_hca_small_page_gather.py", 2.6, runner="pytest"),
         # DeepSeek V4 attention backends and dispatch (CPU interpret)
-        TestFile("test/srt/test_deepseek_v4_compressor_tail.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_compressor.py", 0.4, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_compressor_row_shard.py", 0.5, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_indexer_row_shard.py", 0.3, runner="pytest"),
-        TestFile("test/srt/test_deepseek_v4_csa_fused_attention.py", 0.2, runner="pytest"),
-        TestFile("test/srt/test_deepseek_v4_decode_short_kv.py", 0.4, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_csa_attention.py", 0.4, runner="pytest"),
         # Optional production adapters and optimized paths (CPU interpret)
-        TestFile("test/srt/test_deepseek_v4_mhc_nopad_small.py", 0.3, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_moe_act_rows.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_hca_paged_row_write.py", 1.8, runner="pytest"),
-        TestFile("test/srt/test_deepseek_v4_hca_project_xla.py", 0.1, runner="pytest"),
         TestFile("test/srt/test_hca_scatter_compaction.py", 0.8, runner="pytest"),
-        TestFile("test/srt/test_deepseek_v4_csa_sparse_attention.py", 0.2, runner="pytest"),
-        TestFile("test/srt/test_deepseek_v4_decode_page_take.py", 0.1, runner="pytest"),
-        TestFile("test/srt/test_deepseek_v4_compressor_fused_proj.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_moe_merged_gate_up.py", 0.5, runner="pytest"),
         TestFile("test/srt/test_moe_rank_permutation.py", 0.2, runner="pytest"),
         # DeepSeek V4 model and runtime (CPU)

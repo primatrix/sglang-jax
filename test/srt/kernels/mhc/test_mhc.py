@@ -19,16 +19,20 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+
 from sgl_jax.srt.kernels.mhc import (
+    mhc,
     mhc_gates,
     mhc_head_collapse_fused,
     mhc_post_fused,
     mhc_pre_fused,
 )
+from sgl_jax.srt.kernels.mhc.seam import mhc_seam_fused
+from sgl_jax.srt.layers.deepseek_v4_mhc import post_reference, pre_reference
 
 from . import ref
 
-pytestmark = pytest.mark.skipif(
+_requires_tpu = pytest.mark.skipif(
     jax.default_backend() != "tpu", reason="mHC kernels require real Mosaic lowering"
 )
 
@@ -75,6 +79,7 @@ def _close(got, want, label, tol=PROJECTED):
         )
 
 
+@_requires_tpu
 @pytest.mark.parametrize("n", TOKENS + RAGGED_TOKENS)
 def test_gates_match_reference(n):
     """Gate kernel: [n, mix_hc] -> post, comb."""
@@ -88,6 +93,7 @@ def test_gates_match_reference(n):
     )
 
 
+@_requires_tpu
 @pytest.mark.parametrize("n", TOKENS + RAGGED_TOKENS)
 def test_pre_matches_reference(n):
     """Pre-block mixing: collapse hc streams to one and emit the gates."""
@@ -97,6 +103,7 @@ def test_pre_matches_reference(n):
     _close(mhc_pre_fused(*args, **kw), ref.pre(*args, **kw), f"pre n={n}")
 
 
+@_requires_tpu
 @pytest.mark.parametrize("n", TOKENS + RAGGED_TOKENS)
 def test_post_matches_reference(n):
     """Post-block mixing: expand one stream back to hc and remix the residual."""
@@ -112,6 +119,7 @@ def test_post_matches_reference(n):
     )
 
 
+@_requires_tpu
 @pytest.mark.parametrize("backend", ["xla", "pallas"])
 def test_post_preserves_leading_dimensions(backend):
     """Post accepts the same [..., hc, d] residual contract as pre and head."""
@@ -130,6 +138,7 @@ def test_post_preserves_leading_dimensions(backend):
     )
 
 
+@_requires_tpu
 @pytest.mark.parametrize("n", TOKENS + RAGGED_TOKENS)
 def test_head_matches_reference(n):
     """Head collapse: the final hc -> 1 before the LM head."""
@@ -142,6 +151,7 @@ def test_head_matches_reference(n):
     )
 
 
+@_requires_tpu
 @pytest.mark.parametrize("hidden", [4096, 7168])
 def test_highest_precision_matches_reference(hidden):
     """The six-pass projection fits VMEM and preserves the head BF16 boundary."""
@@ -192,6 +202,7 @@ def test_highest_precision_matches_reference(hidden):
     )
 
 
+@_requires_tpu
 @pytest.mark.parametrize("hidden", [4096, 7168])
 @pytest.mark.parametrize("hc", [2, 4, 8])
 def test_shapes_beyond_the_shipped_config(hc, hidden):
@@ -203,6 +214,7 @@ def test_shapes_beyond_the_shipped_config(hc, hidden):
     _close(mhc_pre_fused(*args, **kw), ref.pre(*args, **kw), f"pre hc={hc} hidden={hidden}")
 
 
+@_requires_tpu
 def test_f32_activations_fit_vmem():
     d = _inputs(512)
     x = d["x"].astype(jnp.float32)
@@ -211,6 +223,7 @@ def test_f32_activations_fit_vmem():
     _close(mhc_pre_fused(*args, **kw), ref.pre(*args, **kw), "pre f32")
 
 
+@_requires_tpu
 @pytest.mark.parametrize("iters", [1, 2, 40])
 def test_iteration_counts_other_than_the_shipped_twenty(iters):
     d = _inputs(512)
@@ -223,6 +236,7 @@ def test_iteration_counts_other_than_the_shipped_twenty(iters):
     )
 
 
+@_requires_tpu
 def test_comb_is_a_near_doubly_stochastic_mixing_matrix():
     """The property the Sinkhorn exists to establish.
 
@@ -237,3 +251,90 @@ def test_comb_is_a_near_doubly_stochastic_mixing_matrix():
     assert comb.min() > 0.0
     np.testing.assert_allclose(comb.sum(axis=-2), 1.0, atol=1e-5)
     np.testing.assert_allclose(comb.sum(axis=-1), 1.0, atol=0.2)
+
+
+# CPU interpret regressions for small batches and the fused layer seam.
+SMALL_HC, SMALL_HIDDEN = 4, 512
+
+
+def _interpret(monkeypatch):
+    monkeypatch.setenv("PALLAS_INTERPRET", "1")
+    monkeypatch.setattr(mhc, "_device_kind", lambda: "TPU7x")
+
+
+def _pre(n, key):
+    k1, k2, k3 = jax.random.split(key, 3)
+    rows = (2 + SMALL_HC) * SMALL_HC
+    x = jax.random.normal(k1, (n, SMALL_HC, SMALL_HIDDEN), jnp.bfloat16)
+    fn = jax.random.normal(k2, (rows, SMALL_HC * SMALL_HIDDEN), jnp.float32) * 0.02
+    scale = jnp.asarray([0.7, 1.1, 0.9], jnp.float32)
+    base = jax.random.normal(k3, (rows,), jnp.float32) * 0.1
+    return mhc_pre_fused(
+        x, fn, scale, base, hc_mult=SMALL_HC, sinkhorn_iters=20, norm_eps=1e-6, hc_eps=1e-6
+    )
+
+
+def _post(n, key):
+    k1, k2, k3, k4 = jax.random.split(key, 4)
+    x = jax.random.normal(k1, (n, SMALL_HIDDEN), jnp.bfloat16)
+    res = jax.random.normal(k2, (n, SMALL_HC, SMALL_HIDDEN), jnp.bfloat16)
+    post = jax.random.normal(k3, (n, SMALL_HC), jnp.float32)
+    comb = jax.random.normal(k4, (n, SMALL_HC, SMALL_HC), jnp.float32)
+    return mhc_post_fused(x, res, post, comb, backend="pallas")
+
+
+def _gates(n, key):
+    k1, k2 = jax.random.split(key, 2)
+    mix_hc = mhc.mix_hc_width(SMALL_HC)
+    mixes = jax.random.normal(k1, (n, mix_hc), jnp.float32)
+    base = jax.random.normal(k2, (mix_hc,), jnp.float32) * 0.1
+    scale = jnp.asarray([0.7, 1.1, 0.9], jnp.float32)
+    return mhc_gates(mixes, scale, base, hc_mult=SMALL_HC, sinkhorn_iters=20, eps=1e-6)
+
+
+def _leaves(out):
+    return [np.asarray(jnp.asarray(a).astype(jnp.float32)) for a in jax.tree.leaves(out)]
+
+
+@pytest.mark.parametrize("n", [1, 3])
+@pytest.mark.parametrize("fn", [_pre, _post, _gates])
+def test_small_batch_unpadded_matches_padded(monkeypatch, n, fn):
+    _interpret(monkeypatch)
+    key = jax.random.PRNGKey(n)
+    monkeypatch.setenv("DSV4_MHC_NOPAD_SMALL", "0")
+    padded = _leaves(fn(n, key))
+    monkeypatch.setenv("DSV4_MHC_NOPAD_SMALL", "1")
+    assert mhc.nopad_small_enabled()
+    unpadded = _leaves(fn(n, key))
+    assert len(padded) == len(unpadded)
+    for a, b in zip(padded, unpadded, strict=True):
+        assert a.shape == b.shape
+        np.testing.assert_allclose(b, a, rtol=1e-2, atol=2e-2)
+
+
+def test_seam_matches_post_then_pre():
+    rng = np.random.default_rng(0)
+    T, hc, d = 21, 4, 256
+    y = jnp.asarray(rng.standard_normal((T, d)), jnp.bfloat16)
+    streams = jnp.asarray(rng.standard_normal((T, hc, d)), jnp.bfloat16)
+    post = jnp.asarray(rng.uniform(0.5, 1.5, size=(T, hc)), jnp.float32)
+    comb = jnp.asarray(rng.dirichlet(np.ones(hc), size=(T, hc)), jnp.float32)
+    fn = jnp.asarray(rng.standard_normal((hc * hc + 2 * hc, hc * d)) * 0.02, jnp.float32)
+    scale = jnp.asarray([0.7, 1.1, 0.9], jnp.float32)
+    base = jnp.asarray(rng.standard_normal(hc * hc + 2 * hc) * 0.1, jnp.float32)
+    kw = dict(hc_mult=hc, sinkhorn_iters=3, norm_eps=1e-6, hc_eps=1e-6)
+
+    want_streams = post_reference(y, streams, post, comb).astype(jnp.bfloat16)
+    want_hidden, want_post, want_comb = pre_reference(want_streams, fn, scale, base, **kw)
+
+    got_streams, got_hidden, got_post, got_comb = mhc_seam_fused(
+        y, streams, post, comb, fn, scale, base, interpret=True, **kw
+    )
+    f32 = lambda a: np.asarray(a, np.float32)  # noqa: E731
+    # bf16 streams: one-ulp differences from summation order are expected
+    np.testing.assert_allclose(f32(got_streams), f32(want_streams), rtol=1e-2, atol=1e-2)
+    np.testing.assert_allclose(
+        f32(got_hidden), f32(want_hidden.astype(jnp.bfloat16)), rtol=1e-2, atol=1e-2
+    )
+    np.testing.assert_allclose(f32(got_post), f32(want_post), rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(f32(got_comb), f32(want_comb), rtol=1e-4, atol=1e-5)
