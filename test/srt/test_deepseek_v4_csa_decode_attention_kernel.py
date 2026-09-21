@@ -4,12 +4,10 @@ Long-path decode (capacity above the top-k budget): scorer -> exact top-k -> gat
 attention; the kernel replaces only the last stage. Runs on CPU in interpret mode.
 """
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from sgl_jax.srt.kernels.dsv4 import csa_decode_attention as kernel_mod
 from sgl_jax.srt.kernels.dsv4.csa_decode_attention import gathered_decode_attention
 
 NEG = float(jnp.finfo(jnp.float32).min)
@@ -62,32 +60,3 @@ def test_kernel_matches_numpy_reference(tokens, rows):
     assert out.shape == (tokens, H, D)
     np.testing.assert_allclose(out, ref, rtol=2e-4, atol=2e-4)
     assert np.all(out[0] == 0)
-
-
-def _long_path_inputs(seed=0):
-    B, H, D, DIDX, PAGE, NPAGES, W, RATIO, TOPK = 5, 8, 512, 128, 8, 128, 128, 4, 512
-    k = jax.random.split(jax.random.PRNGKey(seed), 8)
-    total_pages = 1 + B * NPAGES
-    rng = np.random.default_rng(seed)
-    pages = np.zeros((B, NPAGES), np.int32)
-    for b in range(B):
-        pages[b] = 1 + b * NPAGES + np.arange(NPAGES)
-    positions = jnp.asarray([4095, 3000, 0, 2049, 700], jnp.int32)
-    valid = jnp.asarray([True, True, False, True, True])
-    return dict(
-        q=jax.random.normal(k[0], (B, H, D), jnp.bfloat16),
-        index_q=jax.random.normal(k[1], (B, 64, DIDX), jnp.bfloat16),
-        index_weights=jax.nn.softmax(jax.random.normal(k[2], (B, 64), jnp.float32), axis=-1),
-        index_cache=jax.random.normal(k[3], (total_pages * PAGE, DIDX), jnp.bfloat16),
-        compressed_cache=jax.random.normal(k[4], (total_pages * PAGE, D), jnp.bfloat16),
-        window_cache=jax.random.normal(k[5], (4096, D), jnp.bfloat16),
-        pages=jnp.asarray(pages),
-        window_rows=jnp.asarray(rng.permutation(4096)[: B * W].reshape(B, W).astype(np.int32)),
-        query_positions=positions,
-        valid_token_mask=valid,
-        attention_sink=jax.random.normal(k[6], (H,), jnp.float32),
-        softmax_scale=D**-0.5,
-        compressed_page_size=PAGE,
-        index_topk=TOPK,
-        ratio=RATIO,
-    )

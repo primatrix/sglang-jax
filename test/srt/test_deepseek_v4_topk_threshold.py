@@ -1,12 +1,11 @@
 """Bisection top-k threshold (interpret) == exact top-k membership from lax.top_k."""
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.kernels.dsv4.topk_threshold import (
     score_key,
-    topk_mask,
+    topk_membership_mask,
     topk_threshold,
     topk_threshold_xla,
 )
@@ -44,7 +43,7 @@ def test_threshold_matches_reference():
         s[2, :] = 0.25  # all ties
         s[3, 5] = s[3, 6]  # a tie at some rank
         want = _reference_mask(s, k)
-        got = np.asarray(topk_mask(jnp.asarray(s), k, interpret=True))
+        got = np.asarray(topk_membership_mask(jnp.asarray(s), k, interpret=True))
         np.testing.assert_array_equal(got, want)
         thr_k = np.asarray(topk_threshold(jnp.asarray(s), k, interpret=True))
         thr_x = np.asarray(topk_threshold_xla(jnp.asarray(s), k))
@@ -56,29 +55,6 @@ def test_padding_rows_and_lanes():
     T, E, k = 13, 200, 16  # E not a lane multiple, T not a sublane multiple
     s = rng.standard_normal((T, E)).astype(np.float32)
     want = _reference_mask(s, k)
-    got = np.asarray(topk_mask(jnp.asarray(s), k, interpret=True))
+    got = np.asarray(topk_membership_mask(jnp.asarray(s), k, interpret=True))
     np.testing.assert_array_equal(got, want)
     assert got.sum(1).min() == k
-
-
-def _membership_case(rng, T, Ep, k, q_lens, counts):
-    """Scores in request-local columns for a request-major token layout."""
-    from sgl_jax.srt.layers.attention.dsv4.indexer import INVALID_ENTRY  # noqa: F401
-
-    B = len(q_lens)
-    req_ids = np.concatenate([np.full(n, r, np.int32) for r, n in enumerate(q_lens)])
-    assert req_ids.size == T
-    scores = np.full((T, Ep), -np.inf, np.float32)
-    for t in range(T):
-        r = req_ids[t]
-        scores[t, : counts[r]] = rng.standard_normal(counts[r])
-    offsets = np.cumsum(counts) - np.asarray(counts)
-    valid = np.ones(T, bool)
-    return (
-        scores,
-        offsets.astype(np.int32),
-        np.asarray(q_lens, np.int32),
-        req_ids,
-        valid,
-        sum(counts),
-    )
