@@ -15,7 +15,8 @@ from sgl_jax.srt.kernels.hca.attention import INERT_QUERY_OFFSET
 from sgl_jax.srt.kernels.hca.hca import HCAMetadata
 from sgl_jax.srt.kernels.hca.tuned_block_sizes import get_hca_kernel_schedule
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
-from sgl_jax.srt.layers.attention.hca_execution import (
+from sgl_jax.srt.layers.attention.hca_execution import run_hca
+from sgl_jax.srt.layers.attention.hca_metadata import (
     _BOUNDARY_FLOOR,
     _COMPRESSED_TABLE_FLOOR,
     _DECODE_IDS_FLOOR,
@@ -25,7 +26,6 @@ from sgl_jax.srt.layers.attention.hca_execution import (
     _bucket_max_queries,
     _pad_capacity,
     _query_schedule,
-    run_hca,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.jax_utils import device_array

@@ -13,7 +13,6 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
@@ -24,14 +23,13 @@ from sgl_jax.srt.kernels.dsv4.state_init import (
 from sgl_jax.srt.kernels.hca.attention import INERT_QUERY_OFFSET
 from sgl_jax.srt.kernels.hca.hca import HCAMetadata
 from sgl_jax.srt.kernels.hca.tuned_block_sizes import get_hca_kernel_schedule
-from sgl_jax.srt.layers.attention.hca_execution import (
+from sgl_jax.srt.layers.attention.hca_execution import _data_spec, run_hca
+from sgl_jax.srt.layers.attention.hca_metadata import (
     HCABackendMetadata,
     _bucket_capacity,
     _bucket_max_queries,
-    _data_spec,
     _pad_capacity,
     _query_schedule,
-    run_hca,
 )
 from sgl_jax.srt.mem_cache.deepseek_v4.pool import scatter_sharding
 from sgl_jax.srt.mem_cache.deepseek_v4.state import native_hca_layout, score_slice
@@ -62,33 +60,24 @@ def flat_compressed_pool() -> bool:
     return os.environ.get("DSV4_HCA_FLAT_COMPRESSED", "0") == "1"
 
 
-class HCAExecution(nnx.Module):
-    """Internal HCA metadata builder and executor for the unified V4 backend.
+class DeepseekV4HCABackendMixin:
+    """HCA helpers on the model's single backend, like SGLang's V4 mixins.
 
-    The parent backend owns per-forward metadata. This module retains only
-    static geometry and passes actual buffer views to the shared HCA executor.
+    Mesh, page/context sizes, request capacity and forward metadata belong to
+    DeepseekV4AttentionBackend. This mixin has no constructor or owned state.
+    The constants below describe the specialized TPU kernels, not the model's
+    general geometry; unsupported geometries use run_dsv4_attention instead.
     """
 
-    def __init__(self, *, mesh, page_size=128, max_context_len, request_capacity):
-        if mesh is None:
-            raise ValueError("HCA execution requires the SGLang device mesh")
-        if page_size not in (128, 256):
-            raise ValueError("V4 HCA requires original-token page size 128 or 256")
-        if max_context_len <= 0 or request_capacity <= 0:
-            raise ValueError("V4 HCA context and request capacities must be positive")
-        self.mesh = mesh
-        self.num_heads = 64
-        self.head_dim = 512
-        self.compress_ratio = 128
-        self.window_size = 128
-        self.page_size = page_size
-        self.max_context_len = max_context_len
-        self.request_capacity = request_capacity
+    _hca_num_heads = 64
+    _hca_head_dim = 512
+    _hca_compress_ratio = 128
+    _hca_window_size = 128
 
-    def _page_tables(self, slots, lengths, prefixes, rank, request_pool, allocator):
+    def _hca_page_tables(self, slots, lengths, prefixes, rank, request_pool, allocator):
         """Read both physical tiers from the same original-token ownership map."""
         p = self.page_size
-        cp = p // self.compress_ratio
+        cp = p // self._hca_compress_ratio
         mapping = allocator.full_to_swa_index_mapping
         mapping = mapping[rank] if isinstance(mapping, list) else mapping
         window, compressed, window_cu, compressed_cu = [], [], [0], [0]
@@ -106,11 +95,11 @@ class HCAExecution(nnx.Module):
             if np.any((anchors < p) | (anchors >= mapping.size) | (anchors % p != 0)):
                 raise ValueError("V4 request mapping must contain allocated page anchors")
             pages = anchors // p
-            history_start = max(0, int(prefix) - self.window_size + 1)
+            history_start = max(0, int(prefix) - self._hca_window_size + 1)
             required_positions = np.concatenate(
                 (
                     np.arange(history_start, prefix),
-                    np.arange(max(prefix, length - self.window_size), length),
+                    np.arange(max(prefix, length - self._hca_window_size), length),
                 )
             )
             required_locations = locations[required_positions]
@@ -123,7 +112,7 @@ class HCAExecution(nnx.Module):
                 )
             window.extend((mapping[anchors] // p).tolist())
             window_cu.append(window_cu[-1] + len(pages) * p)
-            completed = int(length) // self.compress_ratio
+            completed = int(length) // self._hca_compress_ratio
             count = max(1, (completed + cp - 1) // cp)
             compressed.extend(pages[:count].tolist() if completed else [0])
             compressed_cu.append(compressed_cu[-1] + count * cp)
@@ -131,7 +120,7 @@ class HCAExecution(nnx.Module):
             np.asarray(a, np.int32) for a in (window, window_cu, compressed, compressed_cu)
         )
 
-    def get_forward_metadata(
+    def _get_hca_metadata(
         self,
         batch,
         *,
@@ -198,7 +187,7 @@ class HCAExecution(nnx.Module):
         if np.any(local_queries.sum(axis=1) > t):
             raise ValueError("HCA queries exceed the padded token capacity on a DP rank")
         tables = [
-            self._page_tables(
+            self._hca_page_tables(
                 local_slots[r], local_lengths[r], local_prefixes[r], r, request_pool, allocator
             )
             for r in range(dp)
@@ -215,7 +204,7 @@ class HCAExecution(nnx.Module):
             compressed_capacity = window_capacity
         schedule = get_hca_kernel_schedule(
             str(np.asarray(self.mesh.devices).reshape(-1)[0].device_kind),
-            page_size=self.page_size // self.compress_ratio,
+            page_size=self.page_size // self._hca_compress_ratio,
             # The compressed tile is static; sizing it from the whole context
             # makes an 8K chunk consume a 2048-entry tile with 64 live entries.
             # Callers that bucket their read tables pass that bucket instead.
@@ -225,11 +214,11 @@ class HCAExecution(nnx.Module):
                     int(max_compressed_entries)
                     if max_compressed_entries is not None
                     else (self.max_context_len if fixed_bucket else int(lengths.max()))
-                    // self.compress_ratio
+                    // self._hca_compress_ratio
                 ),
             ),
-            local_heads=self.num_heads // int(self.mesh.shape.get("tensor", 1)),
-            head_dim=self.head_dim,
+            local_heads=self._hca_num_heads // int(self.mesh.shape.get("tensor", 1)),
+            head_dim=self._hca_head_dim,
         )
         uniform = bool(
             not fixed_bucket
@@ -302,7 +291,7 @@ class HCAExecution(nnx.Module):
         init_slots = jax.device_put(init_slots_host, sharding)
         return DeepseekV4HCAMetadata(combined, schedule, uniform, init_slots)
 
-    def forward(
+    def _forward_hca(
         self,
         q,
         k,
@@ -381,8 +370,8 @@ class HCAExecution(nnx.Module):
             state_view = state
             window_view = window
         else:
-            state_view = state.reshape(state.shape[0], 128, 2, self.head_dim)
-            window_view = window.reshape(-1, self.page_size // 2, 2, self.head_dim)
+            state_view = state.reshape(state.shape[0], 128, 2, self._hca_head_dim)
+            window_view = window.reshape(-1, self.page_size // 2, 2, self._hca_head_dim)
         if compressed.ndim == 4 or flat_compressed_pool():
             # The kernels address the flat pool by (page, records-per-page); the
             # 4-D view costs an XLA relayout copy of the whole pool per layer.
@@ -392,7 +381,7 @@ class HCAExecution(nnx.Module):
                 compressed.shape[0],
                 1,
                 token_to_kv_pool.get_compressed_page_size(layer_id),
-                self.head_dim,
+                self._hca_head_dim,
             )
         output, (new_state, new_window, new_compressed) = run_hca(
             q,

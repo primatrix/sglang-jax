@@ -13,7 +13,7 @@ Two halves, deliberately separated so each is testable on its own:
 
 **Host** (`read_tables`) turns C1's ownership map into flat read addresses. C1 owns
 `req_to_token` and the allocator's original-token -> SWA mapping; nothing here
-invents an address. `dsv4.hca.HCAExecution._page_tables` does the same job at page
+invents an address. `dsv4.hca.DeepseekV4HCABackendMixin._hca_page_tables` does the same job at page
 granularity for its Pallas kernel; this produces per-row indices because the M2.4
 path is dense native JAX.
 

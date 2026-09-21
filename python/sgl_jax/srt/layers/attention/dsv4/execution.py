@@ -186,7 +186,7 @@ def _reset_state(state, metadata):
     return state.at[destinations].set(empty, mode="drop")
 
 
-def run_native_attention(
+def run_dsv4_attention(
     mesh,
     q,
     new_kv,
