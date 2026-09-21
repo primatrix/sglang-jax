@@ -83,6 +83,9 @@ def test_hca_layer_init_under_data_mesh():
     state = jnp.asarray(rng.standard_normal((capacity + 1, 128, 2, 32)), jnp.float32)
     init_slots = jnp.asarray([capacity, 1, capacity, capacity, 3, capacity, capacity, capacity])
     template = jnp.zeros(state.shape[1:], state.dtype).at[score_slice(state.shape)].set(-jnp.inf)
+    state = jax.device_put(state, jax.sharding.NamedSharding(mesh, _data_spec(state)))
+    init_slots = jax.device_put(init_slots, jax.sharding.NamedSharding(mesh, P("data")))
+    template = jax.device_put(template, jax.sharding.NamedSharding(mesh, P(None, None, None)))
     out = jax.shard_map(
         lambda s, i, t: init_state_slots(s, i, t, capacity=capacity, interpret=True),
         mesh=mesh,
