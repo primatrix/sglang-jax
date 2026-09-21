@@ -100,9 +100,11 @@ def compressor_tail_pallas(
     rope_head_dim: int,
     norm_eps: float,
     block_n: int = 16,
-    interpret: bool = False,
+    interpret: bool | None = None,
 ):
     """``[N, W, 2*width]`` gathered window rows -> ``[N, head_dim]`` f32 records."""
+    if interpret is None:
+        interpret = jax.default_backend() != "tpu"
     combined = jnp.asarray(combined, jnp.float32)
     n, window, two_width = combined.shape
     if two_width != 2 * width or width != coff * head_dim or head_dim % LANE:

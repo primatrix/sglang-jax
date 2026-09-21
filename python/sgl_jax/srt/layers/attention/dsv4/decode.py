@@ -7,10 +7,7 @@ import jax.numpy as jnp
 
 from sgl_jax.srt.kernels.csa_decode import paged_csa_decode_scores
 from sgl_jax.srt.kernels.dsa.streamindex_topk import select_topk_indices
-from sgl_jax.srt.kernels.dsv4.csa_decode_attention import (
-    decode_attention_kernel_enabled,
-    gathered_decode_attention,
-)
+from sgl_jax.srt.kernels.dsv4.csa_decode_attention import gathered_decode_attention
 
 _NEG_INF = jnp.finfo(jnp.float32).min
 
@@ -331,22 +328,7 @@ def csa_decode_attention(
         query_positions[:, None] - window_rows.shape[1] + 1 + jnp.arange(window_rows.shape[1])
     )
     window_valid = valid_token_mask[:, None] & (window_positions >= 0)
-    if decode_attention_kernel_enabled():
-        out = gathered_decode_attention(
-            q,
-            window,
-            compressed,
-            window_valid,
-            selected_valid,
-            attention_sink,
-            softmax_scale=softmax_scale,
-        )
-        return jnp.where(valid_token_mask[:, None, None], out, 0.0)
-    from sgl_jax.srt.layers.attention.dsv4.ref.decode_attention import (
-        gathered_decode_attention_ref,
-    )
-
-    out = gathered_decode_attention_ref(
+    out = gathered_decode_attention(
         q,
         window,
         compressed,

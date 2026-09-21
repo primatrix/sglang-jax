@@ -22,13 +22,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 _NEG_INF = jnp.finfo(jnp.float32).min
-ATTN_KERNEL_ENV = "DSV4_CSA_DECODE_ATTN_KERNEL"  # "0" falls back to the XLA einsums
 ROWS_ENV = "DSV4_CSA_DECODE_ATTN_ROWS"
 DEFAULT_ROWS = 4
-
-
-def decode_attention_kernel_enabled() -> bool:
-    return os.environ.get(ATTN_KERNEL_ENV, "1") == "1"
 
 
 def _kernel(q_ref, window_ref, comp_ref, bias_ref, sink_ref, out_ref, *, softmax_scale, rows):
