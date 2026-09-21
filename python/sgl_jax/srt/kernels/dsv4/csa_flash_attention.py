@@ -191,7 +191,10 @@ def _kernel_meta(
         compressed_mask = same & (kpos < (qpos + 1) // ratio) & (member_ref[...] != 0)
     else:
         compressed_mask = jnp.zeros_like(window_mask)
-    mask = jnp.where(j < window_tiles, window_mask, compressed_mask)  # [tq, tk]
+    # Boolean algebra rather than a select: Mosaic cannot legalize arith.select on i1
+    # vectors. ``j`` is a scalar, so this is one broadcast and two ands.
+    in_window = j < window_tiles
+    mask = (window_mask & in_window) | (compressed_mask & jnp.logical_not(in_window))  # [tq, tk]
 
     @pl.when(jnp.any(mask))
     def _tile():
