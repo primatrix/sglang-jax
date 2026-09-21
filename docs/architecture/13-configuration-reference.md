@@ -112,7 +112,7 @@ The table below summarizes the most commonly used launch parameters, recommended
 | `schedule_policy` | `str` | `"fcfs"` | Scheduling policy (`lpm` / `random` / `fcfs` / `dfs-weight`) |
 | `schedule_conservativeness` | `float` | `1.0` | Scheduling conservativeness (higher = more conservative) |
 | `page_size` | `int` | `1` | KV cache page size (tokens/page) |
-| `swa_full_tokens_ratio` | `float` | `0.8` (DeepSeek V4: `0.2` when unset) | Ratio of SWA-layer KV tokens to full layers |
+| `swa_full_tokens_ratio` | `float` | `0.8` | Ratio of SWA-layer KV tokens to full layers |
 | `recurrent_state_memory_ratio` | `float` | `0.9` | Memory ratio between recurrent state and KV cache for hybrid recurrent models (e.g., Kimi-Linear); `state_budget = available * ratio / (1 + ratio)`, used only when `max_recurrent_state_size` is unset and either radix cache is enabled or `max_running_requests` is unset |
 | `max_recurrent_state_size` | `int \| None` | `None` | Total recurrent-state slots across all DP ranks for hybrid models; resolution priority: (1) explicit setting, (2) `max_running_requests` when `--disable-radix-cache`, (3) derived from `recurrent_state_memory_ratio` and available HBM; must be divisible by `dp_size` when set explicitly |
 | `disable_hybrid_swa_memory` | `bool` | `False` | Disable hybrid SWA memory optimization |

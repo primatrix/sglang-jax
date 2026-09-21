@@ -151,6 +151,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.ep_size = server_args.ep_size
         self.moe_dp_size = server_args.moe_dp_size
         self.server_args = server_args
+        if self._is_deepseek_v4():
+            self.server_args.swa_full_tokens_ratio = 0.1
         self.embedding_pool: EmbeddingPool | None = None
         self.is_generation = model_config.is_generation
         self.page_size = server_args.page_size

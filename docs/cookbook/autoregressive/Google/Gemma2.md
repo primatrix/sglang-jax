@@ -71,7 +71,7 @@ The 27B-it `--mem-fraction-static 0.85` leaves room for the dual (global + slidi
 
 **Hybrid Attention (Gemma-specific):**
 - Gemma 2 alternates global (8K context) and sliding-window (4K) attention layers. SGL-JAX manages two KV pools — global and sliding — which is more memory-sensitive than uniform-attention models at the same parameter count.
-- `--swa-full-tokens-ratio` (default 0.8; DeepSeek V4 uses 0.2 when unset) controls the per-layer ratio of sliding-window vs full-attention layers and gates pool sizing. If you see sliding-window pool exhaustion at high concurrency, lower this ratio to give the sliding pool more capacity. See [troubleshooting §SWA pool exhaustion](../../deployment/troubleshooting.md#swa-pool-exhaustion-mimo-hybrid-attention-models).
+- `--swa-full-tokens-ratio` (default 0.8) controls the per-layer ratio of sliding-window vs full-attention layers and gates pool sizing. If you see sliding-window pool exhaustion at high concurrency, lower this ratio to give the sliding pool more capacity. See [troubleshooting §SWA pool exhaustion](../../deployment/troubleshooting.md#swa-pool-exhaustion-mimo-hybrid-attention-models).
 
 **Compilation Cache Hygiene:**
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles.
