@@ -20,15 +20,12 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
-from sgl_jax.srt.layers.attention.deepseek_v4_csa_backend import (
+from sgl_jax.srt.layers.attention.dsv4.execution import (
     CompressorWeights,
-    DeepseekV4CSABackend,
     padded_read_tables,
+    run_native_attention,
 )
-from sgl_jax.srt.layers.attention.deepseek_v4_hca_backend import (
-    DeepseekV4HCABackend,
-    DeepseekV4HCAMetadata,
-)
+from sgl_jax.srt.layers.attention.dsv4.hca import DeepseekV4HCAMetadata, HCAExecution
 from sgl_jax.srt.layers.attention.dsv4.metadata import (
     DeepseekV4AttentionMetadata,
     derive_attention_metadata,
@@ -125,9 +122,7 @@ class DeepseekV4RuntimeMetadata(DeepseekV4HCAMetadata):
         expects every metadata leaf on ``P("data")`` (the spec the host upload used),
         so reshard them when a mesh is given (a no-op layout for dp == 1).
         """
-        from sgl_jax.srt.layers.attention.deepseek_v4_hca_backend import (
-            DeepseekV4HCAMetadata,
-        )
+        from sgl_jax.srt.layers.attention.dsv4.hca import DeepseekV4HCAMetadata
 
         if self.packed is None or len(self._unpacked()) < 4:
             return DeepseekV4HCAMetadata(
@@ -198,16 +193,22 @@ class _PrecompileContextBox:
 
 
 class DeepseekV4AttentionBackend(AttentionBackend):
+    """Model-facing owner of V4 metadata, layer routing, and cache updates.
+
+    Like SGLang's V4 backend, one entry point handles ratios 0/4/128. Internal
+    executors choose kernels; they are not independently registered backends.
+    Unlike PyTorch, JAX returns replacement cache arrays through the model jit.
+    """
+
     def __init__(self, *, mesh, page_size, max_context_len, config=None):
         self.mesh = mesh
         self.page_size = page_size
         self.max_context_len = max_context_len
         self.request_capacity = 1
         self.window_size = int(getattr(config, "sliding_window", 128))
-        self.hca = DeepseekV4HCABackend(
+        self.hca = HCAExecution(
             mesh=mesh, page_size=page_size, max_context_len=max_context_len, request_capacity=1
         )
-        self.csa = DeepseekV4CSABackend(mesh)
         self.use_pallas_hca = jax.default_backend() == "tpu" and (
             getattr(config, "hidden_size", 4096),
             getattr(config, "num_attention_heads", 64),
@@ -239,7 +240,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
         # TpWorker combines this kernel metadata limit with the actual request
         # pool capacity. Reuse the HCA scalar-prefetch budget for mixed V4 layers.
-        return DeepseekV4HCABackend.get_max_running_reqests(max_context_len, page_size)
+        pages_per_request = (max_context_len + page_size - 1) // page_size
+        return max(1, 1024 * 1024 // 2 // pages_per_request // 4)
 
     def bind_resources(self, request_pool, allocator):
         if allocator.dp_size != self.mesh.shape["data"] or allocator.page_size != self.page_size:
@@ -469,7 +471,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             if compressor is None:
                 raise ValueError("HCA requires model compressor weights")
             cache = compressor.cos_sin_cache
-            output, (state, window, history) = self.hca(
+            output, (state, window, history) = self.hca.forward(
                 q,
                 k,
                 v,
@@ -501,7 +503,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if not md.has_metadata():
             raise RuntimeError("V4 attention metadata has not been prepared")
         attention, read_tables = md.resolve()
-        return self.csa(
+        return run_native_attention(
+            self.mesh,
             q,
             k[:, 0] if k.ndim == 3 else k,
             hidden_states=compressor_input,

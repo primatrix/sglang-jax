@@ -839,9 +839,7 @@ class DeepseekV4Compressor(nnx.Module):
         self.fused_proj = nnx.Variable(fused)
 
     def weights(self, cache, halves=None):
-        from sgl_jax.srt.layers.attention.deepseek_v4_csa_backend import (
-            CompressorWeights,
-        )
+        from sgl_jax.srt.layers.attention.dsv4.execution import CompressorWeights
 
         cos_table, sin_table = halves if halves is not None else (None, None)
         fused = getattr(self, "fused_proj", None)
@@ -883,7 +881,7 @@ class DeepseekV4Indexer(nnx.Module):
 
     def project(self, q_lora, weights, cos, sin, cache, dtype):
         """Indexer inputs from an already-gathered ``q_lora`` and the raw weights."""
-        from sgl_jax.srt.layers.attention.deepseek_v4_csa_backend import IndexerInputs
+        from sgl_jax.srt.layers.attention.dsv4.execution import IndexerInputs
         from sgl_jax.srt.layers.attention.dsv4.rope import apply_dsv4_partial_rope
 
         q, _ = self.wq_b(q_lora)

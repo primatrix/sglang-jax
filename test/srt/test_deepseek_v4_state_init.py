@@ -15,7 +15,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.dsv4 import state_init
 from sgl_jax.srt.kernels.dsv4.state_init import init_state_slots
-from sgl_jax.srt.layers.attention.deepseek_v4_csa_backend import _reset_state
+from sgl_jax.srt.layers.attention.dsv4.execution import _reset_state
 from sgl_jax.srt.mem_cache.deepseek_v4.state import score_slice
 
 
@@ -75,7 +75,7 @@ def test_csa_reset_state_kernel_matches_scatter(monkeypatch):
 
 
 def test_hca_layer_init_under_data_mesh():
-    from sgl_jax.srt.layers.attention.hca_backend import _data_spec
+    from sgl_jax.srt.layers.attention.hca_execution import _data_spec
 
     mesh = jax.make_mesh((1, 1), ("data", "tensor"))
     capacity = 4
