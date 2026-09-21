@@ -5,10 +5,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from sgl_jax.srt.kernels.dsv4 import csa_decode_attention as kernel_mod
 from sgl_jax.srt.kernels.dsv4.csa_decode_attention import gathered_decode_attention
 from sgl_jax.srt.layers.attention.dsv4 import decode as m
 from sgl_jax.srt.layers.attention.dsv4.decode import csa_decode_attention
+from sgl_jax.srt.layers.attention.dsv4.ref.decode_attention import (
+    gathered_decode_attention_ref,
+)
 
 NEG = float(jnp.finfo(jnp.float32).min)
 
@@ -95,9 +97,9 @@ def test_decode_long_path_kernel_matches_xla(monkeypatch):
     monkeypatch.setenv("DSV4_DECODE_INDEXER_BACKEND", "p370")
     inputs = _long_path_inputs()
     assert inputs["pages"].shape[1] * inputs["compressed_page_size"] > inputs["index_topk"]
-    monkeypatch.setenv(kernel_mod.ATTN_KERNEL_ENV, "0")
-    ref = np.asarray(csa_decode_attention(**inputs))
-    monkeypatch.setenv(kernel_mod.ATTN_KERNEL_ENV, "1")
+    with monkeypatch.context() as patch:
+        patch.setattr(m, "gathered_decode_attention", gathered_decode_attention_ref)
+        ref = np.asarray(csa_decode_attention(**inputs))
     out = np.asarray(csa_decode_attention(**inputs))
     assert np.isfinite(out).all()
     np.testing.assert_allclose(out, ref, rtol=2e-4, atol=2e-4)

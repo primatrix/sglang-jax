@@ -28,9 +28,8 @@ contraction as ``einsum("tgd,dgr->tgr", ...)`` and fuses the inverse RoPE into i
 DeepSeek-V3's plain ``o_proj`` cannot be reused for any of this, which is why
 nothing in this repo covered it.
 
-This is native JAX. The fused Pallas version is a later optimisation; the fusion in
-tpu-inference exists to avoid materialising the un-rotated activation and to keep
-both MXU operands fp8, neither of which changes the arithmetic.
+This module prepares grouped weights and wraps the fused inverse-RoPE + wo_a
+kernel. The model owns the final wo_b projection.
 """
 
 from __future__ import annotations
@@ -42,19 +41,7 @@ import jax.numpy as jnp
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.layers.attention.dsv4.rope import apply_dsv4_partial_rope
-
-__all__ = [
-    "STANDARD_HEADS_PER_GROUP",
-    "group_wo_a",
-    "grouped_output_projection",
-]
-
-# tpu-inference's kernel asserts heads_per_group == 8 because it equals the TPU
-# sublane count, which is what makes its tiling simple. Flash 0731 satisfies it
-# (64 heads / 8 groups). Not required by the arithmetic here, but worth naming so a
-# config that violates it is recognised as a kernel problem rather than a maths one.
-STANDARD_HEADS_PER_GROUP = 8
+__all__ = ["group_wo_a"]
 
 
 def group_wo_a(wo_a, *, num_groups: int, out_sharding=None):
@@ -76,63 +63,6 @@ def group_wo_a(wo_a, *, num_groups: int, out_sharding=None):
     lora_rank = out_features // num_groups
     grouped = jax.lax.reshape(wo_a, (num_groups, lora_rank, reduction), out_sharding=out_sharding)
     return jnp.transpose(grouped, (0, 2, 1))
-
-
-def grouped_output_projection(
-    attn_out,
-    *,
-    wo_a,
-    wo_b,
-    cos,
-    sin,
-    num_groups: int,
-    rope_head_dim: int,
-    apply_inverse_rope: bool = True,
-):
-    """Project attention output back to hidden width.
-
-    Args:
-      attn_out: ``[T, n_heads, head_dim]`` float array, the attention output.
-      wo_a: ``[G*R, H*head_dim]`` in checkpoint layout.
-      wo_b: ``[hidden, G*R]`` in checkpoint layout.
-      cos, sin: ``[T, rope_head_dim // 2]`` for the inverse rotation.
-      num_groups: ``o_groups``.
-      apply_inverse_rope: leave False only to inspect the projection in isolation;
-        production always inverts, because the attention output is still rotated.
-
-    Returns:
-      ``[T, hidden]`` float32.
-    """
-    attn_out = jnp.asarray(attn_out, jnp.float32)
-    if attn_out.ndim != 3:
-        raise ValueError(f"attn_out must be [T, n_heads, head_dim], got {attn_out.shape}")
-    num_tokens, num_heads, head_dim = attn_out.shape
-    if num_heads % num_groups:
-        raise ValueError(f"{num_heads} heads do not split into {num_groups} groups")
-    heads_per_group = num_heads // num_groups
-
-    if apply_inverse_rope:
-        attn_out = apply_dsv4_partial_rope(
-            attn_out, cos[:, None, :], sin[:, None, :], rope_head_dim=rope_head_dim, inverse=True
-        )
-
-    grouped = group_wo_a(wo_a, num_groups=num_groups)  # [G, D, R]
-    reduction = heads_per_group * head_dim
-    if grouped.shape[1] != reduction:
-        raise ValueError(
-            f"wo_a reduction {grouped.shape[1]} != heads_per_group*head_dim {reduction}"
-        )
-
-    x = attn_out.reshape(num_tokens, num_groups, reduction)
-    # Per group, no cross-group term: group g sees only its own heads and its own
-    # slice of wo_a. Mixing here would be invisible in the output shape.
-    y = jnp.einsum("tgd,gdr->tgr", x, grouped.astype(jnp.float32))
-
-    wo_b = jnp.asarray(wo_b, jnp.float32)
-    flat = y.reshape(num_tokens, -1)
-    if wo_b.shape[1] != flat.shape[1]:
-        raise ValueError(f"wo_b input width {wo_b.shape[1]} != G*R {flat.shape[1]}")
-    return flat @ wo_b.T
 
 
 def use_fused_wo_a() -> bool:

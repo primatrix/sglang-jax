@@ -44,8 +44,6 @@ axis and scores in the second, empty contents zero and empty scores ``-inf``.
 
 from __future__ import annotations
 
-import os
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -199,11 +197,6 @@ def _window_rows(state, chunk_rows, positions_in_window, chunk_index, from_chunk
     return jnp.where(from_chunk[..., None], from_new, from_state)
 
 
-def _fused_tail() -> bool:
-    """``DSV4_FUSED_COMPRESSOR_TAIL=1``: field select + pool + RMSNorm + RoPE as one kernel."""
-    return os.environ.get("DSV4_FUSED_COMPRESSOR_TAIL", "1") == "1"
-
-
 def compress_chunk(
     x,
     *,
@@ -292,38 +285,21 @@ def compress_chunk(
     half = rope_head_dim // 2
     cos, sin = cos_sin[:, :half], cos_sin[:, half : 2 * half]
 
-    if _fused_tail():
-        from sgl_jax.srt.kernels.dsv4.compressor_tail import compressor_tail_pallas
+    from sgl_jax.srt.kernels.dsv4.compressor_tail import compressor_tail_pallas
 
-        records = compressor_tail_pallas(
-            combined,
-            in_sequence,
-            norm_weight,
-            cos,
-            sin,
-            ratio=ratio,
-            coff=coff,
-            head_dim=head_dim,
-            width=width,
-            rope_head_dim=rope_head_dim,
-            norm_eps=norm_eps,
-        )
-    else:
-        from sgl_jax.srt.layers.attention.dsv4.ref.compressor import compressor_tail_ref
-
-        records = compressor_tail_ref(
-            combined,
-            in_sequence,
-            norm_weight,
-            cos,
-            sin,
-            ratio=ratio,
-            coff=coff,
-            head_dim=head_dim,
-            width=width,
-            rope_head_dim=rope_head_dim,
-            norm_eps=norm_eps,
-        )
+    records = compressor_tail_pallas(
+        combined,
+        in_sequence,
+        norm_weight,
+        cos,
+        sin,
+        ratio=ratio,
+        coff=coff,
+        head_dim=head_dim,
+        width=width,
+        rope_head_dim=rope_head_dim,
+        norm_eps=norm_eps,
+    )
     records = jnp.where(bvalid[:, None], records, 0.0)
 
     # Metadata pads query_request_ids with zero. Those rows must never write

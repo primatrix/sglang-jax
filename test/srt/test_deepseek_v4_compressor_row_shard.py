@@ -11,7 +11,6 @@ import types
 os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ["PALLAS_INTERPRET"] = "1"
-os.environ["DSV4_FUSED_COMPRESSOR_TAIL"] = "0"
 os.environ["DSV4_COMPRESSOR_ROW_SHARD"] = "1"
 
 import jax

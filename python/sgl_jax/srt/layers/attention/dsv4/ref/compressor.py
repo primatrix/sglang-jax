@@ -1,4 +1,4 @@
-"""Unfused compressor tail reference, also used when tail fusion is disabled."""
+"""Unfused compressor tail reference for numerical validation."""
 
 import jax
 import jax.numpy as jnp
