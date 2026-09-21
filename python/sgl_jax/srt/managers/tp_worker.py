@@ -4,6 +4,7 @@ import logging
 import os
 import signal
 import threading
+import time
 from queue import Queue
 
 import jax
@@ -15,8 +16,7 @@ from jax.experimental.multihost_utils import broadcast_one_to_all
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.constrained.bitmask_ops import allocate_token_bitmask
+from sgl_jax.srt.configs.model_config import ModelConfig, is_deepseek_v4_config
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.layers.routed_experts_capturer import get_global_experts_capturer
 from sgl_jax.srt.managers.schedule_batch import (
@@ -31,6 +31,33 @@ from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+
+def _fuse_sample_enabled(model_config) -> bool:
+    env = os.getenv("SGLANG_JAX_FUSE_SAMPLE")
+    if env is not None:
+        return env == "1"
+    return is_deepseek_v4_config(model_config)
+
+
+class _WorkerIterStats:
+    def __init__(self, every: int = 200):
+        self.every, self.n, self.sums = every, 0, {}
+
+    def add(self, **ms):
+        for k, v in ms.items():
+            self.sums[k] = self.sums.get(k, 0.0) + v
+        self.n += 1
+        if self.n >= self.every:
+            parts = " ".join(f"{k}={v / self.n:.2f}ms" for k, v in self.sums.items())
+            logger.info("[iter-trace:worker] n=%d %s", self.n, parts)
+            self.n, self.sums = 0, {}
+
+
+_WORKER_STATS = _WorkerIterStats() if os.environ.get("SGLANG_JAX_ITER_TRACE") else None
+_WORKER_EXTEND_STATS = (
+    _WorkerIterStats(every=1) if os.environ.get("SGLANG_JAX_ITER_TRACE") else None
+)
 
 
 def _iter_padded_input_logprob_reqs(model_worker_batch, padded_rows: int):
@@ -73,10 +100,6 @@ class ModelWorker:
         # Parse args
         self.tp_size = server_args.tp_size
         self.dp_size = server_args.dp_size
-        self._pd_fuse_sample = (
-            server_args.pd_disaggregation == "pathways"
-            and os.getenv("SGLANG_PD_FUSE_SAMPLE") == "1"
-        )
         from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
@@ -106,6 +129,13 @@ class ModelWorker:
             ),
             is_draft_model=is_draft_worker,
         )
+        # One jit per decode tick (resolve futures + run_model + sampler + set
+        # futures): built for Pathways-PD; SGLANG_JAX_FUSE_SAMPLE decides when set,
+        # otherwise only DeepSeek V4 turns it on (saves four dispatches per tick).
+        self._pd_fuse_sample = (
+            server_args.pd_disaggregation == "pathways"
+            and os.getenv("SGLANG_PD_FUSE_SAMPLE") == "1"
+        ) or _fuse_sample_enabled(self.model_config)
 
         self.mesh = mesh
         self.page_size = server_args.page_size
@@ -448,14 +478,9 @@ class ModelWorker:
                 batch.sampling_info.sampling_info_done.wait()
             else:
                 batch.sampling_info.update_grammar_vocab_mask()
-        if batch.sampling_info.vocab_mask is None:
-            sampling_metadata.apply_vocab_mask = False
-            sampling_metadata.vocab_mask = allocate_token_bitmask(
-                len(batch.sampling_info.temperatures), batch.sampling_info.vocab_size
-            )
-        else:
-            sampling_metadata.apply_vocab_mask = True
-            sampling_metadata.vocab_mask = batch.sampling_info.vocab_mask
+        sampling_metadata.update_vocab_mask(
+            batch.sampling_info.vocab_mask, self.mesh, self.model_config.vocab_size
+        )
 
     def _pd_fuse_for_batch(self, model_worker_batch: ModelWorkerBatch) -> bool:
         """Batch-level fused-sample eligibility. The single source of truth
@@ -496,8 +521,10 @@ class ModelWorker:
         else:
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
+        _t0 = time.perf_counter() if _WORKER_STATS else 0.0
         if forward_metadata is None:
             forward_metadata = self.model_runner.get_attention_metadata(model_worker_batch)
+        _t1 = time.perf_counter() if _WORKER_STATS else 0.0
 
         if sampling_metadata is None:
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
@@ -506,9 +533,11 @@ class ModelWorker:
                 self.mesh,
                 self.model_config.vocab_size,
             )
+        _t1s = time.perf_counter() if _WORKER_STATS else 0.0
 
         self.model_runner.attn_backend.forward_metadata = forward_metadata
         logits_metadata = LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh)
+        _t1l = time.perf_counter() if _WORKER_STATS else 0.0
 
         # Pathways-PD: fuse run_model+sampler+resolve/set into one jit so a
         # decode tick is a single Execute through the ordered dispatch queue.
@@ -518,6 +547,7 @@ class ModelWorker:
             if model_worker_batch.sampling_info:
                 self._update_grammar_vocab_mask(model_worker_batch, sampling_metadata)
             fmap = future_map if future_map is not None else self._pd_dummy_future_map
+            _tf0 = time.perf_counter() if _WORKER_STATS else 0.0
             (
                 next_token_ids_device,
                 logits_output,
@@ -528,10 +558,17 @@ class ModelWorker:
             ) = self.model_runner.forward_and_sample(
                 forward_batch, logits_metadata, sampling_metadata, fmap
             )
+            _tf1 = time.perf_counter() if _WORKER_STATS else 0.0
             self.dump_topk_ids(layers_topk_ids, model_worker_batch)
             if launch_done is not None:
                 launch_done.set()
             self.sync_queue.put((layers_topk_ids, model_worker_batch))
+            if _WORKER_STATS and model_worker_batch.forward_mode.is_decode():
+                _WORKER_STATS.add(
+                    fused_pre=(_tf0 - _t0) * 1e3,
+                    fused_call=(_tf1 - _tf0) * 1e3,
+                    fused_post=(time.perf_counter() - _tf1) * 1e3,
+                )
             if future_map is not None:
                 return (logits_output, next_token_ids_device, cache_miss_count, new_future_map)
             return (logits_output, next_token_ids_device, cache_miss_count)
@@ -540,6 +577,20 @@ class ModelWorker:
             forward_batch,
             logits_metadata=logits_metadata,
         )
+        if _WORKER_STATS and model_worker_batch.forward_mode.is_decode():
+            _t2 = time.perf_counter()
+            _WORKER_STATS.add(
+                metadata=(_t1 - _t0) * 1e3,
+                sampling_meta_and_forward_dispatch=(_t2 - _t1) * 1e3,
+            )
+        elif _WORKER_EXTEND_STATS and model_worker_batch.forward_mode.is_extend():
+            _t2 = time.perf_counter()
+            _WORKER_EXTEND_STATS.add(
+                extend_metadata=(_t1 - _t0) * 1e3,
+                extend_sampling_meta=(_t1s - _t1) * 1e3,
+                extend_logits_meta=(_t1l - _t1s) * 1e3,
+                extend_forward_dispatch=(_t2 - _t1l) * 1e3,
+            )
 
         self.dump_topk_ids(layers_topk_ids, model_worker_batch)
 

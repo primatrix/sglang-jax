@@ -24,31 +24,64 @@ tp16 for GLM-5.2 753B — device-independent).
 Donation is unaffected: XLA input-output aliasing is baked into the
 executable, and ``ExecuteReplicated`` adds no Python-side donation logic.
 
-Enabling: ``SGLANG_JAX_AOT_DISPATCH`` = ``auto`` (default: on when the
-function sees >= ``_AUTO_MIN_ARGS`` flat args), ``1`` (always), ``0`` (off).
+Enabling: ``SGLANG_JAX_AOT_DISPATCH`` = ``auto`` (on when the function sees
+>= ``_AUTO_MIN_ARGS`` flat args), ``1`` (always), ``0`` (default, off).
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import time
 
 import jax
+import numpy as np
 from jax._src.lib import xla_client as _xc
 
 logger = logging.getLogger(__name__)
 
-_ENV = os.environ.get("SGLANG_JAX_AOT_DISPATCH", "0")
+_ENV = os.environ.get("SGLANG_JAX_AOT_DISPATCH", "auto")
 _AUTO_MIN_ARGS = 512
 
 _FALLBACK = object()
+_TRACE = bool(os.environ.get("SGLANG_JAX_ITER_TRACE"))
+
+
+class _DispatchStats:
+    """Rolling split of the steady-state AOT dispatch (SGLANG_JAX_ITER_TRACE)."""
+
+    def __init__(self, name: str, every: int = 200):
+        self.name, self.every, self.n, self.sums = name, every, 0, {}
+
+    def add(self, **ms):
+        for k, v in ms.items():
+            self.sums[k] = self.sums.get(k, 0.0) + v
+        self.n += 1
+        if self.n >= self.every:
+            parts = " ".join(f"{k}={v / self.n:.2f}ms" for k, v in self.sums.items())
+            logger.info("[iter-trace:aot-dispatch:%s] n=%d %s", self.name, self.n, parts)
+            self.n, self.sums = 0, {}
+
+
+def _leaf_signature(a):
+    """(shape, dtype, weak_type) of a dynamic leaf without building an aval.
+
+    ``jax.typeof`` constructs a ShapedArray per leaf (~185 leaves per V4 decode
+    step); arrays answer the same question from their attributes directly.
+    """
+    if isinstance(a, jax.Array):
+        return (a.shape, a.dtype, bool(getattr(a, "weak_type", False)))
+    if isinstance(a, np.ndarray):
+        return (a.shape, a.dtype, False)
+    aval = jax.typeof(a)
+    return (aval.shape, aval.dtype, aval.weak_type)
 
 
 def aot_dispatch_requested() -> bool:
     """True when SGLANG_JAX_AOT_DISPATCH is set to "auto" or "1".
 
-    Default is off: when this returns False callers should not construct an
-    AotDispatcher at all, keeping the stock pjit dispatch path untouched.
+    Default is "auto" (on for functions with >= _AUTO_MIN_ARGS flat args); set
+    "0" to keep the stock pjit dispatch path.
     """
     return _ENV in ("auto", "1")
 
@@ -85,6 +118,7 @@ class AotDispatcher:
         self._cache = {}
         self._name = name
         self._enabled = None  # decided on first call from flat arg count
+        self._stats = _DispatchStats(name) if _TRACE else None
 
     def invalidate(self) -> None:
         self._cache.clear()
@@ -117,9 +151,13 @@ class AotDispatcher:
             self._stable_ids = tuple(id(a) for a in self._stable_flat_args)
             self._cache.clear()
 
-        dyn_leaves = jax.tree_util.tree_leaves(dyn_args)
-        key = tuple((getattr(a, "shape", None), getattr(a, "dtype", None)) for a in dyn_leaves)
+        _t0 = time.perf_counter() if self._stats is not None else 0.0
+        dyn_leaves, dyn_tree = jax.tree_util.tree_flatten(dyn_args)
+        # Batch mode and other pytree metadata can change the program even
+        # when all array shapes match. Scalar types also affect compilation.
+        key = (dyn_tree, tuple(_leaf_signature(a) for a in dyn_leaves))
         entry = self._cache.get(key)
+        _t1 = time.perf_counter() if self._stats is not None else 0.0
         if entry is None:
             return self._compile_and_first_call(key, dyn_args)
         if entry is _FALLBACK:
@@ -135,15 +173,34 @@ class AotDispatcher:
             dyn_layouts,
             dyn_copy,
         ) = entry
-        args_flat, _ = jax.tree_util.tree_flatten((self._stable_flat_args + dyn_args, {}))
         from jax._src.interpreters import pxla
 
-        dyn_bufs = pxla.shard_args(
-            dyn_shardings, dyn_layouts, dyn_copy, [args_flat[i] for i in dyn_kept]
-        )
+        kept = [dyn_leaves[i] for i in dyn_kept]
+        # Host arrays reach the device one transfer per leaf inside shard_args
+        # (~40 us each; V4 has ~170 dynamic leaves per step). Ship every numpy
+        # leaf in one batched device_put first, so shard_args only sees device
+        # arrays.
+        np_pos = [j for j, a in enumerate(kept) if isinstance(a, np.ndarray)]
+        if np_pos:
+            put = jax.device_put([kept[j] for j in np_pos], [dyn_shardings[j] for j in np_pos])
+            for j, arr in zip(np_pos, put):
+                kept[j] = arr
+        _t2 = time.perf_counter() if self._stats is not None else 0.0
+        dyn_bufs = pxla.shard_args(dyn_shardings, dyn_layouts, dyn_copy, kept)
+        _t3 = time.perf_counter() if self._stats is not None else 0.0
         results = xla_exec.execute_sharded(static_bufs + list(dyn_bufs))
         out_flat = results.consume_with_handlers(out_handlers)
-        return jax.tree_util.tree_unflatten(out_tree, out_flat)
+        out = jax.tree_util.tree_unflatten(out_tree, out_flat)
+        if self._stats is not None:
+            _t4 = time.perf_counter()
+            self._stats.add(
+                flatten_key=(_t1 - _t0) * 1e3,
+                host_put=(_t2 - _t1) * 1e3,
+                shard_args=(_t3 - _t2) * 1e3,
+                execute=(_t4 - _t3) * 1e3,
+                n_np=float(len(np_pos)),
+            )
+        return out
 
     def _compile_and_first_call(self, key, dyn_args):
         from jax._src.interpreters import pxla
@@ -200,16 +257,19 @@ class AotDispatcher:
             unsafe.out_handler.handlers,
             compiled._params.out_tree,
             static_bufs,
-            dyn_kept,
+            [i - n_stable for i in dyn_kept],
             shardings[n_static:],
             layouts[n_static:],
             [_xc.ArrayCopySemantics.REUSE_INPUT] * len(dyn_kept),
         )
+        first_leaves = jax.tree_util.tree_leaves(dyn_args)
+        n_np = sum(1 for i in dyn_kept if isinstance(first_leaves[i - n_stable], np.ndarray))
         logger.info(
-            "[aot-dispatch:%s] compiled shape key (%d stable + %d dyn kept args)",
+            "[aot-dispatch:%s] compiled shape key (%d stable + %d dyn kept args, %d numpy)",
             self._name,
             n_static,
             len(dyn_kept),
+            n_np,
         )
         # First call goes through the checked path: validates that every
         # input's sharding/layout matches what the executable expects.

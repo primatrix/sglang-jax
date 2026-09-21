@@ -18,15 +18,43 @@ from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.managers.utils import (
     future_slot_indices,
+    get_token_ids_gather,
     resolve_future_token_ids,
     set_future_token_ids,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_executor.step_pack import pack_step_arrays, pack_step_enabled
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
+from sgl_jax.srt.utils.jax_utils import lazy_host_args
 from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+_OVERLAP_TRACE = bool(os.environ.get("SGLANG_JAX_ITER_TRACE"))
+
+
+class _DecodeSplitStats:
+    """Rolling split of the overlap client's decode run_batch work (no profiler)."""
+
+    def __init__(self, every: int = 200):
+        self.every, self.n, self.sums = every, 0, {}
+
+    def add(self, **ms):
+        for k, v in ms.items():
+            self.sums[k] = self.sums.get(k, 0.0) + v
+        self.n += 1
+        if self.n >= self.every:
+            parts = " ".join(f"{k}={v / self.n:.2f}ms" for k, v in self.sums.items())
+            logger.info(
+                "[iter-trace:overlap-decode:%s] n=%d %s", next(iter(self.sums)), self.n, parts
+            )
+            self.n, self.sums = 0, {}
+
+
+_DECODE_SPLIT = _DecodeSplitStats() if _OVERLAP_TRACE else None
+# Worker-thread side of a fused decode tick (dispatch) and the scheduler's resolve split.
+_FUSED_DISPATCH = _DecodeSplitStats() if _OVERLAP_TRACE else None
+_RESOLVE_SPLIT = _DecodeSplitStats() if _OVERLAP_TRACE else None
 
 
 class ModelWorkerClient:
@@ -67,8 +95,7 @@ class ModelWorkerClient:
         )
         self.forward_thread.start()
         self.parent_process = psutil.Process().parent()
-        replicated_sharding = NamedSharding(mesh, PartitionSpec())
-        self.async_gather_fn = jax.jit(lambda x: x, out_shardings=replicated_sharding)
+        self.async_gather_fn = get_token_ids_gather(mesh)
 
     @property
     def model_runner(self):
@@ -126,6 +153,7 @@ class ModelWorkerClient:
                 # Batch-level check (not the worker flag): logprob batches take
                 # the regular 3-tuple path inside forward_batch_generation, so
                 # selecting the fused 4-tuple unpack here would crash on them.
+                _f0 = time.perf_counter() if _FUSED_DISPATCH is not None else 0.0
                 with jax.profiler.TraceAnnotation(
                     f"forward_batch_generation {model_worker_batch.bid}"
                 ):
@@ -140,6 +168,8 @@ class ModelWorkerClient:
                         )
                     )
                 self.future_token_ids_map = new_future_map
+                if _FUSED_DISPATCH is not None and model_worker_batch.forward_mode.is_decode():
+                    _FUSED_DISPATCH.add(fused_dispatch=(time.perf_counter() - _f0) * 1e3)
                 self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
                 continue
 
@@ -163,7 +193,8 @@ class ModelWorkerClient:
             # set_future's cpp-fastpath cache hits; async_gather afterwards.
             self.future_token_ids_map = set_future_token_ids(
                 self.future_token_ids_map,
-                future_slot_indices_np,
+                model_worker_batch.forward_batch.seq_lens,
+                model_worker_batch.forward_batch.req_pool_indices,
                 next_token_ids,
                 self.mesh,
             )
@@ -238,6 +269,8 @@ class ModelWorkerClient:
         if async_hidden_states is not None:
             logits_output.hidden_states = np.asarray(async_hidden_states)
         _r2 = _r2a = _r3 = time.perf_counter()
+        if _RESOLVE_SPLIT is not None:
+            _RESOLVE_SPLIT.add(queue_wait=(_r1 - _r0) * 1e3, device_get=(_r2 - _r1) * 1e3)
 
         if launch_done is not None:
             launch_done.wait()
@@ -277,6 +310,10 @@ class ModelWorkerClient:
             penalizer_orchestrator=None,
         )
 
+        _trace_extend = _OVERLAP_TRACE and model_worker_batch.forward_mode.is_extend()
+        _trace_decode = _DECODE_SPLIT is not None and model_worker_batch.forward_mode.is_decode()
+        _timed = _trace_extend or _trace_decode
+        _ta = time.perf_counter() if _timed else 0.0
         if sampling_metadata is None:
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
                 model_worker_batch,
@@ -284,10 +321,10 @@ class ModelWorkerClient:
                 self.mesh,
                 self.worker.model_config.vocab_size,
             )
+        _tb = time.perf_counter() if _timed else 0.0
 
-        forward_metadata = self.worker.model_runner.get_attention_metadata(
-            model_worker_batch
-        )
+        forward_metadata = self.worker.model_runner.get_attention_metadata(model_worker_batch)
+        _tc = time.perf_counter() if _timed else 0.0
 
         # Prepare LoRA batch if LoRA is enabled
         if self.worker.server_args.enable_lora:
@@ -296,10 +333,33 @@ class ModelWorkerClient:
         model_worker_batch.forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.worker.get_model_runner()
         )
+        if _trace_extend:
+            _td = time.perf_counter()
+            logger.info(
+                "[iter-trace:overlap-extend] tokens=%d sampling_meta=%.2fms attn_meta=%.2fms "
+                "init_new=%.2fms",
+                (
+                    int(np.sum(model_worker_batch.extend_seq_lens))
+                    if model_worker_batch.extend_seq_lens is not None
+                    else 0
+                ),
+                (_tb - _ta) * 1e3,
+                (_tc - _tb) * 1e3,
+                (_td - _tc) * 1e3,
+            )
 
         # Per-request slots: placeholder value -(req_pool_idx + 1) round-trips
         # through resolve_future_token_ids (map[-id]); padding rows get 0
         # (a non-negative id, resolved as-is and never consumed).
+        if (
+            pack_step_enabled()
+            and lazy_host_args()
+            and self.worker._pd_fuse_for_batch(model_worker_batch)
+        ):
+            model_worker_batch.forward_batch, sampling_metadata = pack_step_arrays(
+                model_worker_batch.forward_batch, sampling_metadata
+            )
+        _td = time.perf_counter() if _trace_decode else 0.0
         seq_lens_np = np.asarray(model_worker_batch.seq_lens)
         req_pool_np = np.asarray(model_worker_batch.req_pool_indices)
         slots = future_slot_indices(seq_lens_np, req_pool_np, self.future_map_size)
@@ -315,6 +375,14 @@ class ModelWorkerClient:
         )
 
         future_next_token_ids = np.where(seq_lens_np > 0, -slots, 0).astype(np.int32)
+        if _trace_decode:
+            _te = time.perf_counter()
+            _DECODE_SPLIT.add(
+                sampling_meta=(_tb - _ta) * 1e3,
+                attn_meta=(_tc - _tb) * 1e3,
+                init_new=(_td - _tc) * 1e3,
+                enqueue=(_te - _td) * 1e3,
+            )
         return None, future_next_token_ids, 0
 
     def run_precompile(self, only: str | None = None):

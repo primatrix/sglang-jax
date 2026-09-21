@@ -44,6 +44,7 @@ from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
     _build_non_hybrid_memory_pools,
 )
+from sgl_jax.srt.model_executor.step_pack import unpack_step_arrays
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.models.registry import ModelRegistry
 from sgl_jax.srt.multimodal.in_model.embedding_pool import EmbeddingPool
@@ -54,7 +55,7 @@ from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
-from sgl_jax.srt.utils.jax_utils import get_available_device_memory
+from sgl_jax.srt.utils.jax_utils import get_available_device_memory, lazy_host_args
 
 logger = logging.getLogger(__name__)
 
@@ -220,7 +221,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             self.init_lora_manager()
 
         self._sampler_base_rng = jax.random.PRNGKey(server_args.random_seed)
-        self._sampler_step = 0
+        self._sampler_step = jax.device_put(np.int32(0), NamedSharding(self.mesh, P()))
         if not self.is_draft_worker and not self._is_deepseek_v4():
             self.initialize_jit()
 
@@ -347,6 +348,43 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 **(jit_compiler_options or {}),
             }
 
+        _lazy_data_sharding = NamedSharding(self.mesh, P("data"))
+        # Per-layer routed-expert ids are extra jit outputs; keep them only when a
+        # consumer exists (return_routed_experts / the experts capturer).
+        _keep_topk_ids = bool(getattr(self.server_args, "enable_return_routed_experts", False))
+
+        def _reshard_lazy(obj, fields):
+            # SGLANG_JAX_LAZY_HOST_ARGS: per-step arrays enter jit as replicated host
+            # arrays; give the batch fields their P("data") type before the model's
+            # shard_maps check them. No-op (identity) when the mode is off.
+            if obj is None or not lazy_host_args():
+                return obj
+            updates = {
+                f: jax.sharding.reshard(v, _lazy_data_sharding)
+                for f in fields
+                if (v := getattr(obj, f, None)) is not None and isinstance(v, jax.Array)
+            }
+            return dataclasses.replace(obj, **updates) if updates else obj
+
+        _LAZY_FB = (
+            "input_ids",
+            "seq_lens",
+            "out_cache_loc",
+            "positions",
+            "req_pool_indices",
+            "cache_loc",
+            "extend_prefix_lens",
+            "extend_seq_lens",
+        )
+        _LAZY_SM = ("temperatures", "top_ps", "top_ks", "min_ps", "positions", "sampling_seeds")
+        _LAZY_LM = (
+            "extend_seq_lens",
+            "logits_indices",
+            "accept_lens",
+            "extend_input_logprob_token_ids_device",
+            "input_logprob_indices_device",
+        )
+
         @partial(
             jax.jit,
             donate_argnames=["memory_pools"],
@@ -361,6 +399,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             memory_pools,
             logits_metadata,
         ):
+            forward_batch = _reshard_lazy(forward_batch, _LAZY_FB)
+            logits_metadata = _reshard_lazy(logits_metadata, _LAZY_LM)
             prepare_model_state = getattr(self.attn_backend, "prepare_model_state", None)
             if prepare_model_state is not None:
                 model_state_leaves = prepare_model_state(model_state_leaves)
@@ -370,6 +410,11 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             with LoraBatchContext.set_batch(forward_batch):
                 result = model(forward_batch, memory_pools, logits_metadata)
                 _validate_v4_pool_updates(memory_pools, result[1])
+                if not _keep_topk_ids and len(result) == 4:
+                    # The per-layer routed-expert ids are only consumed when
+                    # return_routed_experts is on; dropping them here removes ~40
+                    # output arrays (x8 shards) from every step's dispatch.
+                    result = (result[0], result[1], result[2], ())
                 return result
 
         # Capture the base RNG key as a constant in the JIT closure. The sampler
@@ -393,12 +438,16 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         ):
             model_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, model_state)
-            return sampler(
+            rng_step = rng_step + jnp.int32(1)
+            if len(args) >= 2:
+                args = (args[0], _reshard_lazy(args[1], _LAZY_SM)) + tuple(args[2:])
+            result = sampler(
                 *args,
                 use_sort_for_toppk_minp=use_sort_for_toppk_minp,
                 rng_override=base_rng_key,
                 rng_step=rng_step,
             )
+            return result, rng_step
 
         @partial(jax.jit, static_argnames=["mesh"])
         def jitted_compute_logprobs(mesh, logits, next_tokens):
@@ -458,8 +507,35 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
             self.jitted_sampler = self._sampler_dispatcher
         else:
+            _seen_keys: set = set()
+
+            def _log_jit_key(forward_batch, logits_metadata):
+                # Debug aid (DSV4_LOG_JIT_KEY=1): log the jit cache signature of the
+                # dynamic args so precompile vs runtime keys can be diffed offline.
+                import hashlib
+
+                leaves, treedef = jax.tree_util.tree_flatten((forward_batch, logits_metadata))
+                parts = []
+                for i, leaf in enumerate(leaves):
+                    try:
+                        a = jax.typeof(leaf)
+                        parts.append(f"{i}:{a.dtype}{tuple(a.shape)}w{int(a.weak_type)}")
+                    except Exception:
+                        parts.append(f"{i}:{type(leaf).__name__}")
+                sig = str(treedef) + "|" + ",".join(parts)
+                h = hashlib.md5(sig.encode()).hexdigest()[:10]
+                mode = getattr(forward_batch, "forward_mode", None)
+                if h not in _seen_keys:
+                    _seen_keys.add(h)
+                    logger.info(
+                        "JITKEY new %s mode=%s nleaves=%d sig=%s", h, mode, len(leaves), sig
+                    )
+                else:
+                    logger.info("JITKEY hit %s mode=%s", h, mode)
 
             def run_model_wrapper(forward_batch, logits_metadata):
+                if os.environ.get("DSV4_LOG_JIT_KEY"):
+                    _log_jit_key(forward_batch, logits_metadata)
                 return jitted_run_model(
                     model_def,
                     model_state_def,
@@ -484,13 +560,14 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         # Pathways-PD: fuse resolve_future_token_ids + run_model + sampler +
         # async_gather + set_future_token_ids into one jit so a decode tick is
         # a single Execute through the ordered dispatch queue.
-        @partial(
+        _fused_jit = partial(
             jax.jit,
             donate_argnames=["memory_pools"],
             static_argnames=["model_state_def", "sampler_state_def", "use_sort_for_toppk_minp"],
             compiler_options=jit_compiler_options,
         )
-        def jitted_run_and_sample(
+
+        def _run_and_sample_body(
             model_def,
             model_state_def,
             model_state_leaves,
@@ -506,18 +583,20 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             future_token_ids_map,
         ):
             # resolve_future_token_ids inlined: negative ids are future placeholders.
+            forward_batch, sampling_metadata = unpack_step_arrays(forward_batch, sampling_metadata)
+            forward_batch = _reshard_lazy(forward_batch, _LAZY_FB)
+            logits_metadata = _reshard_lazy(logits_metadata, _LAZY_LM)
+            sampling_metadata = _reshard_lazy(sampling_metadata, _LAZY_SM)
+            # Same idiom as managers.utils.resolve_future_token_ids: reshard (not a
+            # sharding constraint) so the select operands agree under Explicit axes.
             ids = forward_batch.input_ids
-            ids_g = jax.lax.with_sharding_constraint(ids, NamedSharding(_fused_mesh, P()))
+            ids_g = jax.sharding.reshard(ids, NamedSharding(_fused_mesh, P()))
             resolved = jnp.where(
                 ids_g < 0,
-                future_token_ids_map.at[jnp.clip(-ids_g, min=0)].get(
-                    out_sharding=NamedSharding(_fused_mesh, P())
-                ),
+                future_token_ids_map[jnp.clip(-ids_g, min=0)],
                 ids_g,
             )
-            resolved = jax.lax.with_sharding_constraint(
-                resolved, NamedSharding(_fused_mesh, P("data"))
-            )
+            resolved = jax.sharding.reshard(resolved, NamedSharding(_fused_mesh, P("data")))
             forward_batch = dataclasses.replace(forward_batch, input_ids=resolved)
 
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
@@ -527,8 +606,11 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                     forward_batch, memory_pools, logits_metadata
                 )
             _validate_v4_pool_updates(memory_pools, pool_updates)
+            if not _keep_topk_ids:
+                layers_topk_ids = ()
             s_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, s_state)
+            rng_step = rng_step + jnp.int32(1)
             next_ids, token_logprobs, _new_output = sampler(
                 output,
                 sampling_metadata,
@@ -539,14 +621,14 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             # async_gather + set_future_token_ids inlined. Per-request slot
             # scatter (req_pool_idx + 1); padding rows (seq_lens == 0) go out
             # of bounds and are dropped. See managers/utils.set_future_token_ids.
-            next_ids = jax.lax.with_sharding_constraint(next_ids, NamedSharding(_fused_mesh, P()))
+            next_ids_g = jax.sharding.reshard(next_ids, NamedSharding(_fused_mesh, P()))
             slot_ids = jnp.where(
                 forward_batch.seq_lens > 0,
                 forward_batch.req_pool_indices.astype(jnp.int32) + 1,
                 jnp.int32(future_token_ids_map.shape[0]),
             )
-            slot_ids = jax.lax.with_sharding_constraint(slot_ids, NamedSharding(_fused_mesh, P()))
-            new_future_map = future_token_ids_map.at[slot_ids].set(next_ids, mode="drop")
+            slot_ids = jax.sharding.reshard(slot_ids, NamedSharding(_fused_mesh, P()))
+            new_future_map = future_token_ids_map.at[slot_ids].set(next_ids_g, mode="drop")
             return (
                 next_ids,
                 output,
@@ -555,25 +637,104 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 layers_topk_ids,
                 token_logprobs,
                 new_future_map,
+                rng_step,
             )
 
-        def run_and_sample_wrapper(forward_batch, logits_metadata, sampling_metadata, future_map):
-            self._sampler_step += 1
-            return jitted_run_and_sample(
+        jitted_run_and_sample = _fused_jit(_run_and_sample_body)
+
+        # Same program with every stable (weight / sampler) argument first, so
+        # AotDispatcher can capture their sharded buffers once like run_model.
+        @_fused_jit
+        def jitted_run_and_sample_aot(
+            model_def,
+            model_state_def,
+            model_state_leaves,
+            sampler_def,
+            sampler_state_def,
+            sampler_state_leaves,
+            use_sort_for_toppk_minp,
+            forward_batch,
+            memory_pools,
+            logits_metadata,
+            rng_step,
+            sampling_metadata,
+            future_token_ids_map,
+        ):
+            return _run_and_sample_body(
                 model_def,
                 model_state_def,
-                self.model_state_leaves,
+                model_state_leaves,
                 forward_batch,
-                self.memory_pools,
+                memory_pools,
                 logits_metadata,
                 sampler_def,
                 sampler_state_def,
                 sampler_state_leaves,
-                self.use_sort_for_toppk_minp,
-                self._sampler_step,
+                use_sort_for_toppk_minp,
+                rng_step,
                 sampling_metadata,
-                future_map,
+                future_token_ids_map,
             )
+
+        if use_aot_dispatch:
+
+            def _fused_stable():
+                return (
+                    (
+                        model_def,
+                        model_state_def,
+                        self.model_state_leaves,
+                        sampler_def,
+                        sampler_state_def,
+                        sampler_state_leaves,
+                        self.use_sort_for_toppk_minp,
+                    ),
+                    (model_def, self.model_state_leaves, sampler_def, sampler_state_leaves),
+                )
+
+            call_args, flat_args = _fused_stable()
+            self._run_and_sample_dispatcher = AotDispatcher(
+                jitted_run_and_sample_aot,
+                stable_call_args=call_args,
+                stable_flat_args=flat_args,
+                name="run_and_sample",
+            )
+
+            def run_and_sample_wrapper(
+                forward_batch, logits_metadata, sampling_metadata, future_map
+            ):
+                self._run_and_sample_dispatcher.ensure_stable_args(*_fused_stable())
+                *result, self._sampler_step = self._run_and_sample_dispatcher(
+                    forward_batch,
+                    self.memory_pools,
+                    logits_metadata,
+                    self._sampler_step,
+                    sampling_metadata,
+                    future_map,
+                )
+                return tuple(result)
+
+        else:
+
+            def run_and_sample_wrapper(
+                forward_batch, logits_metadata, sampling_metadata, future_map
+            ):
+                *result, self._sampler_step = jitted_run_and_sample(
+                    model_def,
+                    model_state_def,
+                    self.model_state_leaves,
+                    forward_batch,
+                    self.memory_pools,
+                    logits_metadata,
+                    sampler_def,
+                    sampler_state_def,
+                    sampler_state_leaves,
+                    self.use_sort_for_toppk_minp,
+                    self._sampler_step,
+                    sampling_metadata,
+                    future_map,
+                )
+                return tuple(result)
 
         self.jitted_run_and_sample = run_and_sample_wrapper
 
@@ -1079,15 +1240,13 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         Returns:
             A list of next_token_ids
         """
-        # Advance step counter (pure Python, zero device overhead).
-        # fold_in(base_key, step) inside JIT produces a unique RNG per step.
-        self._sampler_step += 1
-        # Penalty application has been moved to the Sampler for better JIT performance
-        return self.jitted_sampler(
+        # Advance the device counter inside JIT; fold_in uses steps 1, 2, ... .
+        result, self._sampler_step = self.jitted_sampler(
             self._sampler_step,
             logits_output,
             sampling_metadata,
         )
+        return result
 
     def compute_logprobs(self, logits, token_ids: jax.Array) -> jax.Array:
         return self.jitted_compute_logprobs(logits, token_ids)

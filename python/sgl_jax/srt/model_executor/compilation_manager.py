@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import os
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -64,9 +65,66 @@ class CompilationManager:
 
         self.token_buckets = self._compute_token_buckets(server_args.precompile_token_paddings)
         self.bs_buckets = self._compute_bs_buckets(server_args.precompile_bs_paddings)
+        # Optional context-length ladder (SGLANG_JAX_PRECOMPILE_CONTEXT_LADDER: comma
+        # separated tokens, or "full" for every capacity bucket up to max_req_len).
+        # Backends whose compiled shapes depend on the history length (DeepSeek-V4
+        # read-table capacity buckets) get one precompile pass per rung; other backends
+        # ignore it. [None] keeps the stock single pass. Chunked prefill of one long
+        # request walks through every bucket below its final length, so a partial
+        # ladder still leaves one compile per uncovered bucket on the first request.
+        self.context_ladder = self._compute_context_ladder(max_req_len)
         self.cache_loc_buckets = self._compute_cache_loc_buckets()
         self._compiled_variants: set[tuple] = set()
         self._compiled_multimodal_extend_shapes: set[tuple[int, int]] = set()
+
+    @staticmethod
+    def _compute_context_ladder(max_context_len: int | None = None) -> list[int | None]:
+        raw = os.environ.get("SGLANG_JAX_PRECOMPILE_CONTEXT_LADDER", "").strip()
+        if not raw:
+            return [None]
+        if raw.lower() == "full":
+            if not max_context_len or max_context_len <= 0:
+                raise ValueError("SGLANG_JAX_PRECOMPILE_CONTEXT_LADDER=full needs max_req_len")
+            return CompilationManager._full_context_ladder(max_context_len)
+        rungs = sorted({int(x) for x in raw.split(",") if x.strip()})
+        if any(r <= 0 for r in rungs):
+            raise ValueError("SGLANG_JAX_PRECOMPILE_CONTEXT_LADDER entries must be positive")
+        return list(rungs)
+
+    @staticmethod
+    def _full_context_ladder(max_context_len: int) -> list[int]:
+        """One rung per distinct capacity-bucket combination reachable below max_context_len.
+
+        Power-of-two context lengths from 512 upward each move the ratio-4 bucket; the
+        ratio-128 bucket only starts moving at 32K. The final rung is max_context_len
+        itself so the largest bucket is always covered.
+        """
+        from sgl_jax.srt.layers.attention.deepseek_v4_backend import (
+            precompile_capacities,
+        )
+
+        rungs: list[int] = []
+        seen: set[tuple[int, int]] = set()
+        ctx = 512
+        candidates = []
+        while ctx < max_context_len:
+            candidates.append(ctx)
+            ctx *= 2
+        candidates.append(max_context_len)
+        for ctx in candidates:
+            caps = precompile_capacities(ctx)
+            key = (caps[4], caps[128])
+            if key in seen:
+                continue
+            seen.add(key)
+            rungs.append(ctx)
+        return rungs
+
+    @staticmethod
+    def _set_precompile_context(model_runner, context_len: int | None) -> None:
+        backend = getattr(model_runner, "attn_backend", None)
+        if backend is not None and hasattr(backend, "precompile_context_len"):
+            backend.precompile_context_len = context_len
 
     def _compute_token_buckets(self, user_paddings: list[int] | None) -> list[int]:
         dp_size = self.dp_size
@@ -160,25 +218,43 @@ class CompilationManager:
         prepare_lora_fn: Callable | None,
         future_token_ids_map,
     ):
-        from sgl_jax.srt.managers.schedule_batch import ForwardMode
+        from sgl_jax.srt.managers.schedule_batch import (
+            ForwardMode,
+            extend_bs_buckets_enabled,
+        )
         from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
         start_time = time.perf_counter()
         bs = self.max_padded_batch_size
+        # When the runtime pads extend batches to the smallest fitting bucket
+        # (schedule_batch.extend_bs_buckets_enabled), every bucket needs its
+        # compiled variants.
+        extend_bs = (
+            list(self.bs_buckets)
+            if extend_bs_buckets_enabled(getattr(model_runner, "model_config", None))
+            else [bs]
+        )
         multimodal_options = (True,) if self.precompile_in_model_multimodal else (False,)
         logger.info(
             "[EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s multimodal=%s",
-            [bs],
+            extend_bs,
             self.token_buckets,
             self.precompile_in_model_multimodal,
         )
 
-        pairs = list(itertools.product(multimodal_options, [bs], self.token_buckets))
+        pairs = list(
+            itertools.product(
+                self.context_ladder, multimodal_options, extend_bs, self.token_buckets
+            )
+        )
         with tqdm(pairs, desc="[EXTEND] PRECOMPILE", leave=False) as pbar:
             for pair in pbar:
-                use_multimodal_input, bs_val, num_tokens = pair
-                pbar.set_postfix(multimodal=use_multimodal_input, bs=bs_val, tokens=num_tokens)
+                context_len, use_multimodal_input, bs_val, num_tokens = pair
+                self._set_precompile_context(model_runner, context_len)
+                pbar.set_postfix(
+                    ctx=context_len, multimodal=use_multimodal_input, bs=bs_val, tokens=num_tokens
+                )
                 if bs_val > num_tokens:
                     logger.warning("bs=%s > num_tokens=%s, skip this pair", bs_val, num_tokens)
                     continue
@@ -229,6 +305,7 @@ class CompilationManager:
                     self._compiled_multimodal_extend_shapes.add((num_tokens, bs_val))
 
         end_time = time.perf_counter()
+        self._set_precompile_context(model_runner, None)
         logger.info("[EXTEND] Precompile finished in %.0f secs", end_time - start_time)
 
     def _precompile_decode(
@@ -249,14 +326,11 @@ class CompilationManager:
             self.bs_buckets,
         )
 
-        with tqdm(
-            enumerate(self.bs_buckets),
-            desc="[DECODE] PRECOMPILE",
-            leave=False,
-            total=len(self.bs_buckets),
-        ) as pbar:
-            for i, bs_val in pbar:
-                pbar.set_postfix(bs=bs_val)
+        items = list(itertools.product(self.context_ladder, enumerate(self.bs_buckets)))
+        with tqdm(items, desc="[DECODE] PRECOMPILE", leave=False, total=len(items)) as pbar:
+            for context_len, (i, bs_val) in pbar:
+                self._set_precompile_context(model_runner, context_len)
+                pbar.set_postfix(ctx=context_len, bs=bs_val)
                 aligned_cache_loc_size = self.cache_loc_buckets[i]
                 batch = self._make_dummy_batch(
                     bs_val,
@@ -277,6 +351,7 @@ class CompilationManager:
                 batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
                 if future_token_ids_map is not None:
                     from sgl_jax.srt.managers.utils import (
+                        get_token_ids_gather,
                         resolve_future_token_ids,
                         set_future_token_ids,
                     )
@@ -292,17 +367,18 @@ class CompilationManager:
                 )
                 if future_token_ids_map is not None:
                     _, next_token_ids, _ = result
-                    from sgl_jax.srt.managers.utils import future_slot_indices
-
-                    slots = future_slot_indices(
-                        np.asarray(batch.seq_lens),
-                        np.asarray(batch.req_pool_indices),
-                        future_token_ids_map.shape[0],
+                    set_future_token_ids(
+                        future_token_ids_map,
+                        batch.forward_batch.seq_lens,
+                        batch.forward_batch.req_pool_indices,
+                        next_token_ids,
+                        mesh,
                     )
-                    set_future_token_ids(future_token_ids_map, slots, next_token_ids, mesh)
+                    get_token_ids_gather(mesh)(next_token_ids).block_until_ready()
                 self._compiled_variants.add((ForwardMode.DECODE, bs_val, bs_val, False))
 
         end_time = time.perf_counter()
+        self._set_precompile_context(model_runner, None)
         logger.info("[DECODE] Precompile finished in %.0f secs", end_time - start_time)
 
     # ---- Dummy batch construction ----

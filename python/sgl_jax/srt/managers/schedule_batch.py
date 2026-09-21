@@ -30,7 +30,7 @@ import numpy as np
 from jax._src import mesh as mesh_lib
 
 from sgl_jax.global_config import global_config
-from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.configs.model_config import ModelConfig, is_deepseek_v4_config
 from sgl_jax.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -96,6 +96,18 @@ PADDING_BUCKETS = [1 << i for i in range(6, 21)]
 global_server_args_dict = {k: getattr(ServerArgs, k) for k in GLOBAL_SERVER_ARGS_KEYS}
 
 logger = logging.getLogger(__name__)
+
+
+def extend_bs_buckets_enabled(model_config) -> bool:
+    """Pad extend batches to the smallest precompiled bs bucket instead of the
+    largest (see get_model_worker_batch; CompilationManager then precompiles every
+    bucket). ``SGLANG_JAX_EXTEND_BS_BUCKETS`` decides when set; otherwise only
+    DeepSeek V4 turns it on, whose per-request buffers make the largest bucket
+    costly for a single long prefill."""
+    env = os.environ.get("SGLANG_JAX_EXTEND_BS_BUCKETS")
+    if env is not None:
+        return env == "1"
+    return is_deepseek_v4_config(model_config)
 
 
 class BaseFinishReason:
@@ -3068,9 +3080,13 @@ class ScheduleBatch:
     ) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
             token_paddings = bs_paddings
-        else:
+        elif not extend_bs_buckets_enabled(self.model_config):
             bs_paddings = bs_paddings[-1:]
             cache_loc_paddings = cache_loc_paddings[-1:]
+        # else: extend pads its batch size to the smallest precompiled bucket that
+        # fits (CompilationManager precompiles every bucket in this mode); the
+        # per-request buffers of a single long prefill no longer carry
+        # max_running_requests - 1 empty slots.
 
         bid = acc_global_bid()
 

@@ -214,6 +214,7 @@ class LogitsMetadata:
                 batch.input_logprob_indices,
             ),
             sharding=sharding,
+            lazy=True,
         )
 
         return cls(
