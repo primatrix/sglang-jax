@@ -756,14 +756,17 @@ def _q_norm_rope(q, cos, sin, *, heads, head_dim, rope_head_dim, normalize, eps,
     A head-parallel projection (lanes sharded over ``tensor``) runs the kernel per
     shard on its local heads; a replicated one runs it directly.
     """
-    spec = jax.typeof(q).sharding.spec
+    sharding = jax.typeof(q).sharding
+    spec = sharding.spec
     lane_axis = spec[1] if len(spec) > 1 else None
-    # A lane-replicated q runs the kernel directly when there is no mesh (CPU tests) or
-    # when every mesh axis is already Manual (inside the decode step's shard_map, where
-    # q is a per-device value). Under explicit axes (the prefill program) it must go
-    # through shard_map: pallas_call requires Manual axes, and a direct call traced the
-    # kernel body with sharded block values and failed on the first iota-vs-block select.
-    mesh = jax.sharding.get_abstract_mesh()
+    # The step function traces without a mesh context (run_and_sample sets none), so the
+    # projection's own sharding mesh is the only reliable source of axis names and types.
+    # A lane-replicated q runs the kernel directly when that mesh is empty (CPU tests) or
+    # when every axis is already Manual (inside the decode step's shard_map, where q is a
+    # per-device value). Under explicit axes (the prefill program) it must go through
+    # shard_map: pallas_call requires Manual axes, and a direct call traced the kernel
+    # body with sharded block values and failed on the first iota-vs-block select.
+    mesh = sharding.mesh
     manual = not mesh.shape or all(
         t == jax.sharding.AxisType.Manual for t in getattr(mesh, "axis_types", ())
     )
@@ -801,7 +804,7 @@ def _q_norm_rope(q, cos, sin, *, heads, head_dim, rope_head_dim, normalize, eps,
     sin_spec = jax.typeof(sin).sharding.spec
     return jax.shard_map(
         per_shard,
-        mesh=None,
+        mesh=mesh,
         in_specs=(P(row_axis, lane_axis), P(*cos_spec), P(*sin_spec)),
         out_specs=P(row_axis, lane_axis, None),
         check_vma=False,
