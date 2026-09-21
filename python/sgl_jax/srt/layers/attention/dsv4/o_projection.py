@@ -35,8 +35,12 @@ both MXU operands fp8, neither of which changes the arithmetic.
 
 from __future__ import annotations
 
+import os
+
 import jax
 import jax.numpy as jnp
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.attention.dsv4.rope import apply_dsv4_partial_rope
 
@@ -129,3 +133,42 @@ def grouped_output_projection(
     if wo_b.shape[1] != flat.shape[1]:
         raise ValueError(f"wo_b input width {wo_b.shape[1]} != G*R {flat.shape[1]}")
     return flat @ wo_b.T
+
+
+def use_fused_wo_a() -> bool:
+    """``DSV4_FUSED_WO_A=1``: inverse RoPE + grouped wo_a as one Pallas kernel per layer."""
+    return os.environ.get("DSV4_FUSED_WO_A", "1") == "1"
+
+
+def fuse_wo_a_weights(grouped, *, mesh=None):
+    """``[G, D, R]`` grouped wo_a -> the kernel's ``[D, G*R]`` (column ``g*R + r``)."""
+    grouped = jnp.asarray(grouped)
+    num_groups, reduction, lora_rank = grouped.shape
+    kwargs = {}
+    if mesh is not None:
+        kwargs["out_sharding"] = NamedSharding(mesh, P(None, "tensor"))
+    return jax.lax.reshape(
+        jnp.transpose(grouped, (1, 0, 2)), (reduction, num_groups * lora_rank), **kwargs
+    )
+
+
+def fused_wo_a_projection(
+    attn_out, cos, sin, wo_a_fused, *, mesh, rope_head_dim: int, dtype, interpret: bool = False
+):
+    """``[T, H, D]`` attention output -> ``[T, G*R]``: inverse partial RoPE and the grouped
+    wo_a contraction in one kernel per device (heads and wo_a columns follow the
+    ``tensor`` axis; each device owns whole groups of eight heads)."""
+    from sgl_jax.srt.kernels.dsv4.wo_a_projection import widen_cos_sin, wo_a_projection
+
+    cos_sin = widen_cos_sin(cos, sin, rope_head_dim=rope_head_dim, inverse=True)
+
+    def local(x_, w_, cs_):
+        return wo_a_projection(x_, w_, cs_, out_dtype=dtype, interpret=interpret)
+
+    return jax.shard_map(
+        local,
+        mesh=mesh,
+        in_specs=(P("data", "tensor", None), P(None, "tensor"), P("data", None)),
+        out_specs=P("data", "tensor"),
+        check_vma=False,
+    )(jnp.asarray(attn_out).astype(jnp.bfloat16), wo_a_fused, cos_sin)

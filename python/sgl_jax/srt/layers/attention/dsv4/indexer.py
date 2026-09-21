@@ -63,7 +63,14 @@ INDEXER_BACKEND_ENV = "DSV4_INDEXER_BACKEND"
 # Kernel block sizes. The compressed page holds page_size // 4 = 32 entries, and the
 # kernel needs whole 128-entry KV blocks, so kv pages per block must be a multiple of 4.
 _KERNEL_KV_PAGES_PER_BLOCK = int(os.environ.get("DSV4_INDEXER_KV_PAGES_PER_BLOCK", "64"))
-_KERNEL_QUERIES_PER_BLOCK = (1, 64, 64)
+# ``DSV4_INDEXER_QUERIES_PER_BLOCK``: query rows per grid step of the prefill /
+# mixed indexer kernel (decode stays at 1). 64 is the decode-era default; the
+# 8K prefill scores block is [64, N] per step.
+_KERNEL_QUERIES_PER_BLOCK = (
+    1,
+    int(os.environ.get("DSV4_INDEXER_QUERIES_PER_BLOCK", "64")),
+    int(os.environ.get("DSV4_INDEXER_QUERIES_PER_BLOCK", "64")),
+)
 
 # Packed at the end of each top-k row. -1 rather than an out-of-range positive
 # value because that is what kernels/dsa already emits and what the downstream
@@ -289,6 +296,7 @@ def csa_indexer_topk_kernel(
     ratio: int,
     compressed_page_size: int,
     topk_backend: str = "auto",
+    return_scores: bool = False,
 ):
     """`csa_indexer_topk` semantics through ``kernels/dsa/streamindex_topk``.
 
@@ -305,6 +313,10 @@ def csa_indexer_topk_kernel(
     Returns:
       ``[T, k]`` int32 row indices into the gathered compressed key array (the same
       coordinates `csa_indexer_topk` returns), ``INVALID_ENTRY`` packed at the tail.
+      With ``return_scores``: ``(scores [T, E_padded] f32, offsets [B] int32)`` -- the
+      raw indexer scores (-inf where a query may not see the entry; column = entry
+      index within the query's own request) and each request's first gathered row,
+      for `membership_from_scores`.
     """
     from sgl_jax.srt.kernels.dsa.streamindex_topk import streamindex_topk
 
@@ -319,6 +331,23 @@ def csa_indexer_topk_kernel(
     )
     cache_kv = jnp.asarray(indexer_buffer).reshape(-1, compressed_page_size // 2, 2, q.shape[-1])
     active = jnp.asarray(q_lens) > 0
+    if return_scores:
+        scores = streamindex_topk(
+            q=q.astype(jnp.bfloat16),
+            indexer_weights=jnp.asarray(weights, jnp.float32),
+            cache_kv=cache_kv,
+            seq_lens=jnp.where(active, jnp.asarray(seq_lens), 0).astype(jnp.int32),
+            page_indices=pages.reshape(-1).astype(jnp.int32),
+            cu_q_lens=jnp.asarray(cu_q_lens, jnp.int32),
+            distribution=jnp.asarray((0, 0, num_requests), jnp.int32),
+            k=k,
+            compression_ratio=ratio,
+            num_kv_pages_per_block=_KERNEL_KV_PAGES_PER_BLOCK,
+            num_queries_per_block=_KERNEL_QUERIES_PER_BLOCK,
+            topk_backend=topk_backend,
+            return_scores=True,
+        )
+        return scores, offsets
     selected = streamindex_topk(
         q=q.astype(jnp.bfloat16),
         indexer_weights=jnp.asarray(weights, jnp.float32),
@@ -336,3 +365,51 @@ def csa_indexer_topk_kernel(
     request = jnp.clip(jnp.asarray(query_request_ids), 0, num_requests - 1)
     keep = jnp.asarray(valid_token_mask, bool)[:, None] & (selected >= 0)
     return jnp.where(keep, selected + offsets[request][:, None], INVALID_ENTRY).astype(jnp.int32)
+
+
+def membership_from_scores(
+    scores,
+    offsets,
+    *,
+    q_lens,
+    query_request_ids,
+    valid_token_mask,
+    k: int,
+    num_entries: int,
+    topk_backend: str = "auto",
+):
+    """``[T, num_entries]`` bool top-k membership from the indexer scores.
+
+    Two ways to the same mask, chosen at run time: when exactly one request is
+    active its gathered rows start at 0, so a row's score column *is* its gathered
+    row and the mask is ``score >= k-th largest`` (`kernels/dsv4/topk_threshold`,
+    linear in E, no sort; ties admit every tied entry). Otherwise the index path is
+    kept: `select_topk_indices` + per-request offsets + `packed_membership`.
+    """
+    from sgl_jax.srt.kernels.dsa.streamindex_topk import select_topk_indices
+    from sgl_jax.srt.kernels.dsv4.topk_threshold import topk_membership_mask
+    from sgl_jax.srt.layers.attention.dsv4.attention import packed_membership
+
+    scores = jnp.asarray(scores, jnp.float32)
+    offsets = jnp.asarray(offsets, jnp.int32)
+    num_requests = offsets.shape[0]
+    rows_valid = jnp.asarray(valid_token_mask, bool)[:, None]
+    request = jnp.clip(jnp.asarray(query_request_ids), 0, num_requests - 1)
+
+    def _fit(mask):
+        width = mask.shape[1]
+        if width >= num_entries:
+            return mask[:, :num_entries]
+        return jnp.pad(mask, ((0, 0), (0, num_entries - width)))
+
+    def by_threshold(s):
+        return _fit(topk_membership_mask(s, k)) & rows_valid
+
+    def by_indices(s):
+        selected = select_topk_indices(s, k, backend=topk_backend)[:, :k]
+        keep = rows_valid & (selected >= 0)
+        selected = jnp.where(keep, selected + offsets[request][:, None], INVALID_ENTRY)
+        return packed_membership(selected.astype(jnp.int32), num_entries)
+
+    single = jnp.sum((jnp.asarray(q_lens) > 0).astype(jnp.int32)) == 1
+    return jax.lax.cond(single, by_threshold, by_indices, scores)

@@ -38,16 +38,60 @@ M2.4 owns the window.
 
 from __future__ import annotations
 
-import jax
+import os
+
 import jax.numpy as jnp
+
+# Fused CSA kernel tiling (queries x heads rows per block, keys per tile); the
+# defaults are the measured v7x choice, the envs exist for A/B sweeps.
+_CSA_FUSED_BLOCK_Q = int(os.environ.get("DSV4_CSA_FUSED_BLOCK_Q", "256"))
+_CSA_FUSED_BLOCK_K = int(os.environ.get("DSV4_CSA_FUSED_BLOCK_K", "1024"))
+# ``DSV4_PAGED_KV_WRITE=1``: prefill-sized window KV writes go through the page-run
+# DMA writer instead of an XLA scatter (decode buckets keep the scatter).
+_PAGED_KV_WRITE = os.environ.get("DSV4_PAGED_KV_WRITE", "1") == "1"
+_PAGED_KV_WRITE_MIN_TOKENS = int(os.environ.get("DSV4_PAGED_KV_WRITE_MIN_TOKENS", "256"))
+# Queries per program on the sparse CSA path (the block's selected-unit union is fetched once).
+_CSA_SPARSE_QUERY_BLOCK = int(os.environ.get("DSV4_CSA_SPARSE_QUERY_BLOCK", 0))  # 0 = auto
+
+
+def _csa_query_block(num_queries: int, local_heads: int) -> int:
+    """Queries per program for the blocked kernel: keep QB*H <= 512 rows so the f32
+    output block, the q block and the union membership table fit scoped VMEM
+    (QB=256 with 8 local heads overflowed on v7x)."""
+    qb = _CSA_SPARSE_QUERY_BLOCK or max(8, (512 // max(1, local_heads)) // 8 * 8)
+    return int(min(qb, max(8, -(-num_queries // 8) * 8)))
+
 
 __all__ = [
     "admissible_mask",
+    "csa_sparse_attention",
     "dsv4_attention",
     "update_window_kv",
 ]
 
 _NEG_INF = jnp.finfo(jnp.float32).min
+
+
+def packed_membership(selected, num_entries):
+    """``[T, E]`` bool: entry ``e`` is one of row ``t``'s ``selected`` ([T, K], -1 = unused).
+
+    Builds ``[T, ceil(E/32)]`` uint32 words by OR-reducing, over K, each selection's
+    single bit placed in its word (a fused reduction over a logical [T, K, W] tensor,
+    W = E/32), then expands each word's 32 bits back to the entry axis. Exact: no
+    threshold, no approximation, out-of-range selections are ignored.
+    """
+    selected = jnp.asarray(selected)
+    num_words = (num_entries + 31) // 32
+    valid = (selected >= 0) & (selected < num_entries)
+    word = jnp.where(valid, selected >> 5, num_words).astype(jnp.int32)  # invalid -> no lane
+    bit = jnp.left_shift(jnp.uint32(1), (selected & 31).astype(jnp.uint32))
+    lanes = jnp.arange(num_words, dtype=jnp.int32)[None, None, :]
+    placed = jnp.where(word[:, :, None] == lanes, bit[:, :, None], jnp.uint32(0))  # [T, K, W]
+    words = jnp.bitwise_or.reduce(placed, axis=1)  # [T, W]
+    expanded = jnp.broadcast_to(words[:, :, None], (words.shape[0], num_words, 32))
+    expanded = expanded.reshape(words.shape[0], num_words * 32)[:, :num_entries]
+    shifts = (jnp.arange(num_entries, dtype=jnp.int32) & 31).astype(jnp.uint32)[None, :]
+    return (jnp.right_shift(expanded, shifts) & jnp.uint32(1)) != 0
 
 
 def admissible_mask(
@@ -62,6 +106,7 @@ def admissible_mask(
     window_size: int,
     ratio: int,
     selected_entries=None,
+    selected_mask=None,
 ):
     """Which keys each query may attend to.
 
@@ -101,20 +146,14 @@ def admissible_mask(
     if selected_entries is not None:
         selected = jnp.asarray(selected_entries)
         num_entries = entry_ids.shape[1]
-        # TPU A/B favors the fused reduction for small candidate buckets;
-        # scatter avoids the large logical [T, K, E] reduction for long history.
-        if num_entries <= 2048:
-            rows = jnp.arange(num_entries, dtype=selected.dtype)[None, None, :]
-            chosen = jnp.any((selected[:, :, None] == rows) & (selected[:, :, None] >= 0), axis=1)
-        else:
-            valid_selection = (selected >= 0) & (selected < num_entries)
-            destination = jnp.where(valid_selection, selected, num_entries)
-
-            def membership(indices):
-                return jnp.zeros(num_entries + 1, dtype=bool).at[indices].set(True)[:-1]
-
-            chosen = jax.vmap(membership)(destination)
+        # The [T, E] membership of the indexer's top-k rows is built by reducing a
+        # logical [T, K, E/32] tensor of one-bit words (see ``packed_membership``).
+        chosen = packed_membership(selected, num_entries)
         compressed_mask = compressed_mask & chosen
+    if selected_mask is not None:
+        # ``[T, E]`` membership already in gathered-row coordinates (the indexer's
+        # threshold path); intersects the completeness rule like ``selected_entries``.
+        compressed_mask = compressed_mask & jnp.asarray(selected_mask, bool)
 
     return window_mask, compressed_mask
 
@@ -136,6 +175,7 @@ def dsv4_attention(
     window_size: int,
     ratio: int,
     selected_entries=None,
+    selected_mask=None,
 ):
     """Attention output for one V4 layer.
 
@@ -175,6 +215,7 @@ def dsv4_attention(
         window_size=window_size,
         ratio=ratio,
         selected_entries=selected_entries,
+        selected_mask=selected_mask,
     )
 
     keys = jnp.concatenate((window_kv, compressed_kv), axis=0)  # [W+E, D]
@@ -191,6 +232,64 @@ def dsv4_attention(
     denominator = jnp.sum(probs, axis=-1, keepdims=True) + jnp.exp(sink[None, :, None] - shift)
     out = jnp.einsum("thk,kd->thd", probs, keys, preferred_element_type=jnp.float32)
     out = out / denominator
+    return jnp.where(jnp.asarray(valid_token_mask, bool)[:, None, None], out, 0.0)
+
+
+def csa_fused_attention(
+    q,
+    window_kv,
+    compressed_kv,
+    *,
+    query_positions,
+    query_request_ids,
+    valid_token_mask,
+    window_positions,
+    window_request_ids,
+    compressed_entry_ids,
+    compressed_request_ids,
+    attention_sink,
+    softmax_scale: float,
+    window_size: int,
+    ratio: int,
+    selected_entries=None,
+    selected_mask=None,
+    interpret: bool = False,
+):
+    """`dsv4_attention` computed by the fused flash-style kernel.
+
+    Same admissibility as the dense path (`admissible_mask`, including the
+    indexer's top-k membership); the kernel streams key tiles with an online
+    softmax and skips tiles no query of the block may attend, instead of three
+    full passes over a ``[T, H, W+E]`` f32 score tensor.
+    """
+    from sgl_jax.srt.kernels.dsv4.csa_flash_attention import csa_flash_attention
+
+    q = jnp.asarray(q)
+    window_mask, compressed_mask = admissible_mask(
+        query_positions=query_positions,
+        query_request_ids=query_request_ids,
+        valid_token_mask=valid_token_mask,
+        window_positions=window_positions,
+        window_request_ids=window_request_ids,
+        compressed_entry_ids=compressed_entry_ids,
+        compressed_request_ids=compressed_request_ids,
+        window_size=window_size,
+        ratio=ratio,
+        selected_entries=selected_entries,
+        selected_mask=selected_mask,
+    )
+    keys = jnp.concatenate((jnp.asarray(window_kv), jnp.asarray(compressed_kv)), axis=0)
+    mask = jnp.concatenate((window_mask, compressed_mask), axis=1)
+    out = csa_flash_attention(
+        q,
+        keys,
+        mask,
+        jnp.asarray(attention_sink, jnp.float32),
+        sm_scale=float(softmax_scale),
+        block_q=_CSA_FUSED_BLOCK_Q,
+        block_k=_CSA_FUSED_BLOCK_K,
+        interpret=interpret,
+    )
     return jnp.where(jnp.asarray(valid_token_mask, bool)[:, None, None], out, 0.0)
 
 
@@ -212,5 +311,100 @@ def update_window_kv(window_kv, new_kv, write_loc, valid_mask):
     new_kv = jnp.asarray(new_kv, window_kv.dtype)
     loc = jnp.asarray(write_loc)
     keep = jnp.asarray(valid_mask, bool) & (loc >= 0) & (loc < window_kv.shape[0])
+    if _PAGED_KV_WRITE and new_kv.shape[0] >= _PAGED_KV_WRITE_MIN_TOKENS and window_kv.ndim == 2:
+        # Prefill chunks write thousands of page-contiguous rows; XLA's scatter does
+        # them one row at a time (1.2 ms per layer for 8K on v7x).
+        from sgl_jax.srt.kernels.dsv4.paged_row_write import paged_row_write
+
+        return paged_row_write(window_kv, new_kv, loc, keep)
     loc = jnp.where(keep, loc, window_kv.shape[0])
     return window_kv.at[loc].set(new_kv, mode="drop")
+
+
+def csa_sparse_attention(
+    q,
+    window_kv,
+    compressed_kv,
+    *,
+    query_positions,
+    query_request_ids,
+    valid_token_mask,
+    window_positions,
+    window_request_ids,
+    compressed_entry_ids,
+    compressed_request_ids,
+    attention_sink,
+    softmax_scale: float,
+    window_size: int,
+    ratio: int,
+    selected_entries,
+    interpret: bool = False,
+):
+    """`dsv4_attention` for the CSA path, attending only to the selected records.
+
+    The dense path scores every one of the ``E`` gathered records and masks the
+    non-selected ones, so its cost grows with the history; this path hands the
+    ``kernels/dsa`` gathered-attention kernel one unit table made of the ``E``
+    records followed by the ``W`` window rows, with per-query unit lists
+    ``[selected (completeness/request filtered, else -1) | admissible window rows]``.
+    Causality is enforced by that filtering, so the kernel's own positional bound
+    is disabled (query position == last unit). The attention sink is applied
+    afterwards from the kernel's log-sum-exp: ``out * L / (L + exp(sink))``.
+    """
+    from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import (
+        sparse_mla_attention_qblock,
+    )
+
+    q = jnp.asarray(q)
+    window_kv = jnp.asarray(window_kv)
+    compressed_kv = jnp.asarray(compressed_kv)
+    if q.ndim != 3:
+        raise ValueError(f"q must be [T, H, D], got {q.shape}")
+    T, H, D = q.shape
+    W, E = window_kv.shape[0], compressed_kv.shape[0]
+    if window_kv.shape[-1] != D or compressed_kv.shape[-1] != D:
+        raise ValueError("window/compressed KV must share the query head dim")
+    if ratio <= 0:
+        raise ValueError("csa_sparse_attention requires a positive compression ratio")
+    sink = jnp.asarray(attention_sink, jnp.float32)
+    if sink.shape != (H,):
+        raise ValueError(f"attention_sink must be [H] = [{H}], got {sink.shape}")
+
+    qpos = jnp.asarray(query_positions, jnp.int32)[:, None]
+    qreq = jnp.asarray(query_request_ids, jnp.int32)[:, None]
+    valid = jnp.asarray(valid_token_mask, bool)[:, None]
+    wpos = jnp.asarray(window_positions, jnp.int32)[None, :]
+    wreq = jnp.asarray(window_request_ids, jnp.int32)[None, :]
+    window_mask = valid & (wreq == qreq) & (wpos <= qpos) & (wpos > qpos - window_size)
+    window_units = jnp.where(window_mask, E + jnp.arange(W, dtype=jnp.int32)[None, :], -1)
+
+    sel = jnp.asarray(selected_entries, jnp.int32)
+    entry_ids = jnp.asarray(compressed_entry_ids, jnp.int32)
+    creq = jnp.asarray(compressed_request_ids, jnp.int32)
+    safe = jnp.clip(sel, 0, max(E - 1, 0))
+    complete = entry_ids[safe] < ((qpos + 1) // ratio)
+    ok = (sel >= 0) & (sel < E) & valid & (creq[safe] == qreq) & complete
+    selected_units = jnp.where(ok, sel, -1)
+
+    indices = jnp.concatenate((selected_units, window_units), axis=1)  # [T, K+W]
+    units = jnp.concatenate((compressed_kv, window_kv), axis=0)  # [E+W, D]
+    kdt = units.dtype if units.dtype in (jnp.bfloat16, jnp.float32) else jnp.bfloat16
+    units = units.astype(kdt)
+    positions = jnp.full((1, T), E + W - 1, jnp.int32)  # kernel bound disabled
+    out, lse = sparse_mla_attention_qblock(
+        q.astype(kdt)[None],
+        units[None],
+        indices[None],
+        positions,
+        kv_lora_rank=D,
+        read_block=1,
+        query_block=_csa_query_block(T, H),
+        sm_scale=float(softmax_scale),
+        return_lse=True,
+        interpret=interpret,
+    )
+    out, lse = out[0], lse[0]  # [T, H, D], [T, H]
+    # L / (L + exp(sink)) == 1 / (1 + exp(sink - lse)); lse == -inf (nothing attended) -> 0.
+    keep = 1.0 / (1.0 + jnp.exp(sink[None, :] - lse))
+    out = out * keep[..., None]
+    return jnp.where(valid[:, :, None], out, 0.0)

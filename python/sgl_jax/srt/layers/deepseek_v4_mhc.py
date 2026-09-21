@@ -233,6 +233,28 @@ class DeepseekV4MHC:
             hc_eps=self.hc_eps,
         )
 
+    def seam(self, y, residual_streams, post_gate, comb, fn_next, base_next, scale_next):
+        """``post`` of one sublayer fused with ``pre`` of the next (Pallas only).
+
+        Returns ``(new_streams, next sublayer input, post_next, comb_next)``.
+        """
+        self.check_params(fn_next, base_next, scale_next)
+        from sgl_jax.srt.kernels.mhc.seam import mhc_seam_fused
+
+        return mhc_seam_fused(
+            y,
+            residual_streams,
+            post_gate,
+            comb,
+            fn_next,
+            scale_next,
+            base_next,
+            hc_mult=self.hc_mult,
+            sinkhorn_iters=self.sinkhorn_iters,
+            norm_eps=self.norm_eps,
+            hc_eps=self.hc_eps,
+        )
+
     def post(self, y, residual_streams, post_gate, comb):
         """``(sublayer output, residual streams, gates)`` -> new streams."""
         if self.backend == "pallas":

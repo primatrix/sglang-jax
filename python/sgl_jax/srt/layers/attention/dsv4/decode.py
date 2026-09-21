@@ -7,6 +7,10 @@ import jax.numpy as jnp
 
 from sgl_jax.srt.kernels.csa_decode import paged_csa_decode_scores
 from sgl_jax.srt.kernels.dsa.streamindex_topk import select_topk_indices
+from sgl_jax.srt.kernels.dsv4.csa_decode_attention import (
+    decode_attention_kernel_enabled,
+    gathered_decode_attention,
+)
 
 _NEG_INF = jnp.finfo(jnp.float32).min
 
@@ -24,7 +28,7 @@ def resolve_decode_indexer_backend(backend: str = "auto") -> str:
     if backend not in ("auto", "kernel", "p370"):
         raise ValueError(f"unknown CSA decode indexer backend {backend!r}")
     if backend == "auto":
-        backend = os.environ.get(DECODE_INDEXER_BACKEND_ENV, "auto")
+        backend = os.environ.get(DECODE_INDEXER_BACKEND_ENV, "p370")
         if backend not in ("auto", "kernel", "p370"):
             raise ValueError(
                 f"{DECODE_INDEXER_BACKEND_ENV}={backend!r} must be auto, kernel or p370"
@@ -45,15 +49,25 @@ def csa_decode_select_p370(
     ratio,
     compressed_page_size,
     topk_backend="auto",
+    page_segments=None,
+    page_segment_counts=None,
 ):
-    """Request-local Pallas scorer + exact selector: ``(selected [B, take], valid [B, take])``."""
+    """Request-local Pallas scorer + exact selector: ``(selected [B, take], valid [B, take])``.
+
+    ``page_segments`` / ``page_segment_counts`` are the host page-run segmentation of
+    ``pages`` (``kernels.csa_decode.page_run_segments``); without them the scorer splits
+    the table into single pages on device.
+    """
     del ratio
     scores = paged_csa_decode_scores(
         index_q,
         index_weights,
-        index_cache.reshape(-1, compressed_page_size, index_cache.shape[-1]),
+        index_cache.reshape(-1, index_cache.shape[-1]),
         lengths,
         pages,
+        page_size=compressed_page_size,
+        segments=page_segments,
+        segment_counts=page_segment_counts,
         interpret=jax.default_backend() != "tpu",
     )
     return select_decode_entries(scores, lengths, take=take, topk_backend=topk_backend)
@@ -117,6 +131,115 @@ def select_decode_entries(scores, lengths, *, take: int, topk_backend: str = "au
     return selected, valid
 
 
+def short_kv_kernel_enabled() -> bool:
+    """``DSV4_DECODE_SHORT_KV_KERNEL=1``: stream pages through the HCA Pallas kernel."""
+    return os.environ.get("DSV4_DECODE_SHORT_KV_KERNEL", "1") == "1"
+
+
+def _short_kv_streaming_attention(
+    q,
+    compressed_cache,
+    window_cache,
+    pages,
+    window_rows,
+    *,
+    lengths,
+    query_positions,
+    valid_token_mask,
+    attention_sink,
+    softmax_scale,
+    compressed_page_size,
+    capacity,
+):
+    """All entries attend: reuse the HCA paged streaming kernel over the C4 pool.
+
+    The kernel reads compressed pages by page table (no gather of the whole
+    bucket), keeps the SWA rows as one gathered tile, and treats the first
+    ``window_len`` window rows as valid, so the CSA window (newest last,
+    invalid rows first for positions < window) is rotated valid-first.
+    """
+    from sgl_jax.srt.kernels.hca.attention import _streaming_attention
+    from sgl_jax.srt.kernels.hca.tuned_block_sizes import get_hca_kernel_schedule
+
+    tokens, heads, head_dim = q.shape
+    window = window_rows.shape[1]
+    window_len = jnp.where(valid_token_mask, jnp.clip(query_positions + 1, 0, window), 0).astype(
+        jnp.int32
+    )
+    shift = window - window_len
+    order = (jnp.arange(window, dtype=jnp.int32)[None, :] + shift[:, None]) % window
+    rotated_rows = jnp.take_along_axis(window_rows, order, axis=1)
+    window_kv = jnp.take(window_cache, rotated_rows, axis=0).astype(jnp.bfloat16)
+    # Off-TPU (CPU interpret tests) there is no device kind to key the schedule
+    # table; use the v7x row, which is what the interpret tests exercise.
+    device_kind = jax.devices()[0].device_kind if jax.default_backend() == "tpu" else "TPU7x"
+    schedule = get_hca_kernel_schedule(
+        device_kind,
+        page_size=compressed_page_size,
+        max_compressed_entries=capacity,
+        local_heads=heads,
+        head_dim=head_dim,
+    )
+    out = _streaming_attention(
+        q.astype(jnp.bfloat16),
+        window_kv,
+        window_len,
+        compressed_cache,
+        pages.reshape(-1).astype(jnp.int32),
+        (jnp.arange(tokens, dtype=jnp.int32) * pages.shape[1]),
+        lengths.astype(jnp.int32),
+        attention_sink.astype(jnp.float32),
+        schedule=schedule,
+        softmax_scale=softmax_scale,
+        compressed_page_size=compressed_page_size,
+    )
+    return jnp.where(valid_token_mask[:, None, None], out.astype(jnp.float32), 0.0)
+
+
+def _take_pages_onehot(pages, page_index):
+    """Page lookup as three small MXU matmuls (exact for page ids below 2**24).
+
+    ``onehot[t, k, n] = (n == page_index[t, k])`` in bf16 against the page table split
+    into three bytes (each byte is an integer <= 255, exactly representable in bf16; a
+    single non-zero product per output element keeps the f32 sum exact). The one-hot
+    tensor is ``T x K x N`` bf16 (64 x 512 x 512 = 32 MiB at 64K context), which XLA
+    streams at HBM rate, against the per-element gather slow path it replaces.
+    """
+    rows, table = pages.shape
+    pages = pages.astype(jnp.int32)
+    digits = jnp.stack(
+        ((pages & 0xFF), ((pages >> 8) & 0xFF), ((pages >> 16) & 0xFF)), axis=-1
+    ).astype(jnp.bfloat16)
+    onehot = (
+        jnp.arange(table, dtype=jnp.int32)[None, None, :]
+        == page_index.astype(jnp.int32)[:, :, None]
+    ).astype(jnp.bfloat16)
+    values = jnp.einsum("tkn,tnc->tkc", onehot, digits, preferred_element_type=jnp.float32)
+    values = values.astype(jnp.int32)
+    return values[..., 0] | (values[..., 1] << 8) | (values[..., 2] << 16)
+
+
+def _take_pages(pages, page_index):
+    """``pages[b, page_index[b, k]]`` for every decode row.
+
+    XLA lowers both the batched ``take_along_axis(pages, idx, axis=1)`` and the flat
+    1-D gather on TPU into a per-element s32 gather slow path (64 rows x 512 entries:
+    4.2 ms and 3.9 ms per step at bs=64 in v7x decode profiles). The default expresses
+    the lookup as one-hot matmuls instead (``_take_pages_onehot``). ``DSV4_DECODE_PAGE_TAKE``
+    selects a fallback: ``gather`` (flat 1-D take), ``2d`` (batched take_along_axis).
+    A Pallas SMEM scalar-lookup kernel measured 3 ms/step slower than the gather
+    and was removed.
+    """
+    mode = os.environ.get("DSV4_DECODE_PAGE_TAKE", "onehot")
+    if mode == "2d":
+        return jnp.take_along_axis(pages, page_index, axis=1)
+    if mode == "gather":
+        rows, table = pages.shape
+        offsets = (jnp.arange(rows, dtype=jnp.int32) * table)[:, None]
+        return jnp.take(pages.reshape(-1), offsets + page_index.astype(jnp.int32), axis=0)
+    return _take_pages_onehot(pages, page_index)
+
+
 def csa_decode_attention(
     q,
     index_q,
@@ -134,6 +257,8 @@ def csa_decode_attention(
     compressed_page_size,
     index_topk,
     ratio,
+    page_segments=None,
+    page_segment_counts=None,
 ):
     """Read selected compressed slots plus the SWA union, including the sink.
 
@@ -143,37 +268,80 @@ def csa_decode_attention(
     score matrices, global top-k, and gathering every compressed KV candidate.
     """
     lengths = jnp.where(valid_token_mask, (query_positions + 1) // ratio, 0)
-    take = min(index_topk, pages.shape[1] * compressed_page_size)
-    select = (
-        csa_decode_select_kernel
-        if resolve_decode_indexer_backend() == "kernel"
-        else csa_decode_select_p370
-    )
-    selected, selected_valid = select(
-        index_q,
-        index_weights,
-        index_cache,
-        pages,
-        lengths,
-        take=take,
-        ratio=ratio,
-        compressed_page_size=compressed_page_size,
-    )
-    scores_width = pages.shape[1] * compressed_page_size
-    # Preserve original entry order during attention and gather nearby slots
-    # together. Exact top-k is unchanged; invalid selections sort to the end.
-    selected = jnp.sort(jnp.where(selected_valid, selected, scores_width), axis=-1)
-    selected_valid = selected < lengths[:, None]
+    capacity = pages.shape[1] * compressed_page_size
+    if capacity <= index_topk:
+        if short_kv_kernel_enabled():
+            return _short_kv_streaming_attention(
+                q,
+                compressed_cache,
+                window_cache,
+                pages,
+                window_rows,
+                lengths=lengths,
+                query_positions=query_positions,
+                valid_token_mask=valid_token_mask,
+                attention_sink=attention_sink,
+                softmax_scale=softmax_scale,
+                compressed_page_size=compressed_page_size,
+                capacity=capacity,
+            )
+        # Every entry of this decode bucket fits in the top-k budget, so exact
+        # top-k selects all valid entries: skip indexer scoring, selection, and
+        # the sort (the GPU serving path takes the same kv_len <= topk shortcut).
+        selected = jnp.broadcast_to(
+            jnp.arange(capacity, dtype=jnp.int32)[None, :], (lengths.shape[0], capacity)
+        )
+        selected_valid = selected < lengths[:, None]
+    else:
+        take = min(index_topk, capacity)
+        select = (
+            csa_decode_select_kernel
+            if resolve_decode_indexer_backend() == "kernel"
+            else csa_decode_select_p370
+        )
+        extra = {}
+        if select is csa_decode_select_p370:
+            extra = dict(page_segments=page_segments, page_segment_counts=page_segment_counts)
+        selected, selected_valid = select(
+            index_q,
+            index_weights,
+            index_cache,
+            pages,
+            lengths,
+            take=take,
+            ratio=ratio,
+            compressed_page_size=compressed_page_size,
+            **extra,
+        )
+        # Preserve original entry order during attention and gather nearby slots
+        # together. Exact top-k is unchanged; invalid selections sort to the end.
+        selected = jnp.sort(jnp.where(selected_valid, selected, capacity), axis=-1)
+        selected_valid = selected < lengths[:, None]
     safe_selected = jnp.where(selected_valid, selected, 0)
-    physical_pages = jnp.take_along_axis(pages, safe_selected // compressed_page_size, axis=1)
+    physical_pages = _take_pages(pages, safe_selected // compressed_page_size)
     slots = physical_pages * compressed_page_size + safe_selected % compressed_page_size
 
-    compressed = jnp.take(compressed_cache, slots, axis=0)
-    window = jnp.take(window_cache, window_rows, axis=0)
+    # Both index sets are in bounds by construction (page table entries and window
+    # rows are allocator slots, padded rows point at row 0); ``promise_in_bounds``
+    # drops the fill select XLA otherwise runs over the gathered [T, 512+128, D] block
+    # (0.7 ms per bs=64 step over the CSA layers on v7x).
+    compressed = compressed_cache.at[slots].get(mode="promise_in_bounds")
+    window = window_cache.at[window_rows].get(mode="promise_in_bounds")
     window_positions = (
         query_positions[:, None] - window_rows.shape[1] + 1 + jnp.arange(window_rows.shape[1])
     )
     window_valid = valid_token_mask[:, None] & (window_positions >= 0)
+    if decode_attention_kernel_enabled():
+        out = gathered_decode_attention(
+            q,
+            window,
+            compressed,
+            window_valid,
+            selected_valid,
+            attention_sink,
+            softmax_scale=softmax_scale,
+        )
+        return jnp.where(valid_token_mask[:, None, None], out, 0.0)
     mask = jnp.concatenate((window_valid, selected_valid), axis=1)
     keys = jnp.concatenate((window, compressed), axis=1).astype(jnp.float32)
     keys = jnp.where(mask[:, :, None], keys, 0.0)

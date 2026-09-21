@@ -9,6 +9,7 @@ SWA-only / CSA routes go through `dsv4.dispatch.run_layer`, which needs the
 per-layer weight bundle M1.4 owns.
 """
 
+import os
 from dataclasses import dataclass
 
 import jax
@@ -33,6 +34,58 @@ from sgl_jax.srt.layers.attention.dsv4.metadata import (
     derive_attention_metadata,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+from sgl_jax.srt.utils.jax_utils import lazy_host_args
+
+_PACK_LAYOUTS: dict = {}
+
+
+def pack_metadata(*trees):
+    """Flatten integer/bool pytrees into one int32 vector plus a static layout.
+
+    The per-step attention metadata and read tables are ~60 small arrays. Uploading
+    them one by one costs ~230 us each on an 8-device mesh (each leaf is copied to
+    every device), ~15 ms per decode step. Packing them into a single vector makes it
+    one transfer; `unpack_metadata` restores the pytrees with static slices inside jit.
+    """
+    leaves, treedef = jax.tree_util.tree_flatten(trees)
+    arrays = [np.asarray(leaf) for leaf in leaves]
+    # The layout depends only on the (bucketed) shapes and dtypes: compute it once
+    # per signature instead of re-deriving ~60 specs (and dtype names) every step.
+    key = (treedef, tuple((a.shape, a.dtype.str) for a in arrays))
+    entry = _PACK_LAYOUTS.get(key)
+    if entry is None:
+        specs, offset = [], 0
+        for array in arrays:
+            if array.dtype == np.bool_:
+                kind = "bool"
+            elif np.issubdtype(array.dtype, np.integer) and array.dtype.itemsize <= 4:
+                kind = str(array.dtype)
+            else:
+                raise TypeError(f"metadata leaf dtype {array.dtype} cannot be packed as int32")
+            specs.append((offset, array.size, tuple(array.shape), kind))
+            offset += array.size
+        if len(_PACK_LAYOUTS) >= 1024:
+            _PACK_LAYOUTS.clear()
+        entry = _PACK_LAYOUTS[key] = (tuple(specs), offset)
+    specs, total = entry
+    packed = np.empty((total,), np.int32)
+    for array, (offset, size, _, _) in zip(arrays, specs):
+        packed[offset : offset + size] = array.reshape(-1)
+    return packed, (treedef, specs)
+
+
+def unpack_metadata(packed, layout):
+    """Inverse of `pack_metadata`; works on host arrays and inside jit."""
+    treedef, specs = layout
+    leaves = []
+    for offset, size, shape, kind in specs:
+        leaf = jax.lax.slice_in_dim(packed, offset, offset + size).reshape(shape)
+        if kind == "bool":
+            leaf = leaf != 0
+        elif kind != "int32":
+            leaf = leaf.astype(kind)
+        leaves.append(leaf)
+    return jax.tree_util.tree_unflatten(treedef, leaves)
 
 
 @jax.tree_util.register_pytree_node_class
@@ -42,16 +95,106 @@ class DeepseekV4RuntimeMetadata(DeepseekV4HCAMetadata):
     # to a rank, including cu_q_lens and the compression-boundary sentinels.
     attention: DeepseekV4AttentionMetadata | None = None
     read_tables: tuple = ()
+    # When set, `attention`/`read_tables` travel as one int32 vector (see pack_metadata)
+    # and `resolve()` rebuilds them; `layout` is static.
+    packed: jax.Array | None = None
+    layout: tuple | None = None
+    # Sharding the host would have uploaded `packed` with; under
+    # SGLANG_JAX_LAZY_HOST_ARGS the vector enters jit as a replicated host array and
+    # is resharded here once per trace instead.
+    sharding: NamedSharding | None = None
+
+    def has_metadata(self) -> bool:
+        return self.packed is not None or (self.attention is not None and bool(self.read_tables))
+
+    def _unpacked(self):
+        """All packed trees, unpacked once per instance (== once per trace)."""
+        cached = self.__dict__.get("_unpacked_trees")
+        if cached is None:
+            packed = self.packed
+            if lazy_host_args() and self.sharding is not None and isinstance(packed, jax.Array):
+                packed = jax.sharding.reshard(packed, self.sharding)
+            cached = tuple(unpack_metadata(packed, self.layout))
+            self.__dict__["_unpacked_trees"] = cached
+        return cached
+
+    def hca_metadata(self, mesh=None):
+        """The HCA view ``(kernel, schedule, uniform, state_init_slots)`` of this step.
+
+        Leaves unpacked inside the jitted step come out replicated; the HCA shard_map
+        expects every metadata leaf on ``P("data")`` (the spec the host upload used),
+        so reshard them when a mesh is given (a no-op layout for dp == 1).
+        """
+        from sgl_jax.srt.layers.attention.deepseek_v4_hca_backend import (
+            DeepseekV4HCAMetadata,
+        )
+
+        if self.packed is None or len(self._unpacked()) < 4:
+            return DeepseekV4HCAMetadata(
+                self.kernel,
+                self.schedule,
+                self.use_uniform_prefill_fast_path,
+                self.state_init_slots,
+            )
+        cached = self.__dict__.get("_hca_view")
+        if cached is None:
+            trees = self._unpacked()
+            kernel, init_slots = trees[2], trees[3]
+            if mesh is not None:
+                sharding = NamedSharding(mesh, P("data"))
+                kernel = jax.tree.map(lambda a: jax.sharding.reshard(a, sharding), kernel)
+                init_slots = jax.sharding.reshard(init_slots, sharding)
+            cached = DeepseekV4HCAMetadata(
+                kernel, self.schedule, self.use_uniform_prefill_fast_path, init_slots
+            )
+            self.__dict__["_hca_view"] = cached
+        return cached
+
+    def resolve(self):
+        """``(attention, read_tables)`` whether or not the metadata is packed.
+
+        The unpacked tree is memoized on the instance: every decoder layer calls the
+        backend with the same metadata object, so without the memo each layer re-emits
+        the ~60 static slices (thousands of small copy ops per step at 64 layers).
+        The memo never crosses a trace: jit rebuilds the object per trace and the host
+        builds a new one per step.
+        """
+        if self.packed is None:
+            return self.attention, self.read_tables
+        trees = self._unpacked()
+        return trees[0], tuple(trees[1])
 
     def tree_flatten(self):
-        return (self.kernel, self.state_init_slots, self.attention, self.read_tables), (
-            self.schedule,
-            self.use_uniform_prefill_fast_path,
-        )
+        return (
+            self.kernel,
+            self.state_init_slots,
+            self.attention,
+            self.read_tables,
+            self.packed,
+        ), (self.schedule, self.use_uniform_prefill_fast_path, self.layout, self.sharding)
 
     @classmethod
     def tree_unflatten(cls, aux, children):
-        return cls(children[0], aux[0], aux[1], children[1], children[2], children[3])
+        return cls(
+            children[0],
+            aux[0],
+            aux[1],
+            children[1],
+            children[2],
+            children[3],
+            children[4],
+            aux[2],
+            aux[3] if len(aux) > 3 else None,
+        )
+
+
+class _PrecompileContextBox:
+    """Mutable holder that hashes by identity so its value stays out of jit cache keys."""
+
+    __slots__ = ("context_len",)
+
+    def __init__(self):
+        self.context_len: int | None = None
 
 
 class DeepseekV4AttentionBackend(AttentionBackend):
@@ -74,6 +217,23 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         ) == (4096, 64, 512, 64, 128)
         self.resources_bound = False
         self.forward_metadata = nnx.data(DeepseekV4RuntimeMetadata())
+        # Set by the compilation manager while precompiling dummy batches: derive the
+        # read-table capacity buckets from this context length instead of the (zero)
+        # dummy sequence lengths, so every power-of-two bucket a real request can reach
+        # is compiled at startup rather than on first use (~48 s per bucket on v7x).
+        # Kept in an identity-hashed box: a plain attribute would become part of the
+        # nnx graphdef and therefore of the jit cache key, so precompiled executables
+        # (context_len=N) would never match runtime calls (context_len=None) and every
+        # first use would still re-trace (~6 s each with the persistent cache).
+        self._precompile_box = _PrecompileContextBox()
+
+    @property
+    def precompile_context_len(self) -> int | None:
+        return self._precompile_box.context_len
+
+    @precompile_context_len.setter
+    def precompile_context_len(self, value: int | None) -> None:
+        self._precompile_box.context_len = value
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
@@ -88,12 +248,45 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self.hca.request_capacity = request_pool.size
         self.resources_bound = True
 
+    def hca_entry_bucket(self, batch) -> int | None:
+        """Ratio-128 capacity bucket that sizes the HCA compressed tile.
+
+        Uses the same power-of-two rule and precompile-ladder override as the
+        ratio-128 read table, so the kernel variant set equals the read-table
+        bucket set.  Returns ``None`` (whole-context sizing) when disabled.
+        """
+        if os.environ.get("DSV4_HCA_TILE_BUCKET", "1") != "1":
+            return None
+        if self.precompile_context_len is not None:
+            return precompile_capacities(self.precompile_context_len)[128]
+        dp = int(self.mesh.shape["data"])
+        lengths = np.asarray(batch.seq_lens, np.int32).reshape(dp, -1)
+        if batch.forward_mode == ForwardMode.DECODE:
+            queries = (lengths > 0).astype(np.int32)
+        else:
+            queries = np.asarray(batch.extend_seq_lens, np.int32).reshape(dp, -1)
+        per_request = np.where(queries > 0, lengths // 128, 0)
+        if os.environ.get("DSV4_HCA_TILE_BUCKET_SUM", "0") == "1":
+            # Previous behaviour: bucket the batch total. The compressed tile is a
+            # per-request, per-token quantity, so this over-sized decode tiles
+            # (64 x 9K requests -> 4608 records -> a 2048+ tile with 72 live
+            # entries) and never matched the per-request precompile ladder.
+            count = int(np.max(np.sum(per_request, axis=1)))
+        else:
+            count = int(np.max(per_request))
+        return capacity_bucket(count)
+
     def get_forward_metadata(self, batch, *, request_pool, allocator):
         if not self.resources_bound:
             raise RuntimeError("V4 runtime resources must be bound after pool initialization")
         hca = (
             self.hca.get_forward_metadata(
-                batch, request_pool=request_pool, allocator=allocator, fixed_bucket=True
+                batch,
+                request_pool=request_pool,
+                allocator=allocator,
+                fixed_bucket=True,
+                device=False,
+                max_compressed_entries=self.hca_entry_bucket(batch),
             )
             if self.use_pallas_hca
             else DeepseekV4HCAMetadata()
@@ -135,11 +328,15 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         compressed_capacities = {0: 1}
         for ratio in (4, 128):
             count = int(np.max(np.sum(np.where(queries > 0, lengths // ratio, 0), axis=1)))
-            compressed_capacities[ratio] = max(128, 1 << (max(1, count) - 1).bit_length())
+            compressed_capacities[ratio] = capacity_bucket(count)
         decode_capacity = None
         if batch.forward_mode == ForwardMode.DECODE and self.page_size == 128:
-            count = int(np.max(lengths // 4))
-            decode_capacity = max(128, 1 << (max(1, count) - 1).bit_length())
+            decode_capacity = capacity_bucket(int(np.max(lengths // 4)))
+        if self.precompile_context_len is not None:
+            ladder = precompile_capacities(self.precompile_context_len)
+            compressed_capacities.update(ladder)
+            if decode_capacity is not None:
+                decode_capacity = ladder[4]
         for rank in range(dp):
             live = int(queries[rank].sum())
             mapping = allocator.full_to_swa_index_mapping
@@ -178,6 +375,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                         rank=rank,
                         compressed_capacity=compressed_capacities[ratio],
                         decode_capacity=decode_capacity if ratio == 4 else None,
+                        minimal=ratio == 128 and self.use_pallas_hca,
                     )
                 )
             local.append(
@@ -195,21 +393,30 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 )
             )
         sharding = NamedSharding(self.mesh, P("data"))
-        attention = jax.tree.map(
-            lambda *arrays: jax.device_put(np.concatenate(arrays), sharding), *local
+        # Concatenate the DP ranks on the host, then upload the whole metadata pytree
+        # in ONE device_put: the ~60 leaves cost ~230 us each when uploaded one by one
+        # (~15 ms per step, the dominant host cost of a decode step), but a single
+        # batched transfer amortises the per-call dispatch and sharding work.
+        host_attention = jax.tree.map(lambda *arrays: np.concatenate(arrays), *local)
+        host_tables = tuple(
+            jax.tree.map(lambda *arrays: np.concatenate(arrays), *tables)
+            for tables in tables_by_ratio.values()
+        )
+        # The HCA kernel table (14 leaves) and the init slots ride in the same vector;
+        # `hca_metadata()` rebuilds the HCA view inside the jitted step.
+        packed_host, layout = pack_metadata(
+            host_attention, host_tables, hca.kernel, hca.state_init_slots
         )
         return DeepseekV4RuntimeMetadata(
-            hca.kernel,
+            None,
             hca.schedule,
             hca.use_uniform_prefill_fast_path,
-            hca.state_init_slots,
-            attention,
-            tuple(
-                jax.tree.map(
-                    lambda *arrays: jax.device_put(np.concatenate(arrays), sharding), *tables
-                )
-                for tables in tables_by_ratio.values()
-            ),
+            None,
+            None,
+            (),
+            packed_host if lazy_host_args() else jax.device_put(packed_host, sharding),
+            layout,
+            sharding,
         )
 
     def layer_ratio(self, layer, token_to_kv_pool) -> int:
@@ -241,9 +448,14 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         rope_head_dim=64,
         norm_eps=1e-6,
         index_topk=None,
+        compressor_input_local=False,
         **kwargs,
     ):
         ratio = self.layer_ratio(layer, token_to_kv_pool)
+        if compressor_input_local and ratio != 4:
+            raise ValueError(
+                "a row-local compressor input is only supported on CSA (ratio 4) layers"
+            )
         if compressor is None and "wkv" in kwargs:
             # The standalone HCA interface also accepts separate cosine/sine tables.
             compressor = CompressorWeights(
@@ -270,23 +482,33 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 wgate=compressor.wgate,
                 ape=compressor.ape,
                 norm_weight=compressor.norm_weight,
-                cos=cache[:, : cache.shape[-1] // 2],
-                sin=cache[:, cache.shape[-1] // 2 :],
+                cos=(
+                    compressor.cos_table
+                    if getattr(compressor, "cos_table", None) is not None
+                    else cache[:, : cache.shape[-1] // 2]
+                ),
+                sin=(
+                    compressor.sin_table
+                    if getattr(compressor, "sin_table", None) is not None
+                    else cache[:, cache.shape[-1] // 2 :]
+                ),
                 attention_sink=attention_sink,
-                metadata=self.forward_metadata,
+                fused_weight=getattr(compressor, "fused", None),
+                metadata=self.forward_metadata.hca_metadata(self.mesh),
             )
             return output.reshape(q.shape), {"state": state, "swa": window, "compressed": history}
         md = self.forward_metadata
-        if md.attention is None or not md.read_tables:
+        if not md.has_metadata():
             raise RuntimeError("V4 attention metadata has not been prepared")
+        attention, read_tables = md.resolve()
         return self.csa(
             q,
             k[:, 0] if k.ndim == 3 else k,
             hidden_states=compressor_input,
             layer_id=int(layer.layer_id),
             ratio=ratio,
-            metadata=md.attention,
-            tables=md.read_tables[(0, 4, 128).index(ratio)],
+            metadata=attention,
+            tables=read_tables[(0, 4, 128).index(ratio)],
             token_to_kv_pool=token_to_kv_pool,
             compressor_state_pool=compressor_state_pool,
             compressor=compressor,
@@ -296,6 +518,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             rope_head_dim=rope_head_dim,
             norm_eps=norm_eps,
             index_topk=index_topk,
+            hidden_local=compressor_input_local,
         )
 
     @staticmethod
@@ -313,6 +536,16 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             "token_to_kv_pool": token_to_kv_pool.build_buffer_updates(kv_updates),
             "compressor_state_pool": compressor_state_pool.build_buffer_updates(state_updates),
         }
+
+
+def capacity_bucket(count: int) -> int:
+    """Power-of-two read-table capacity for ``count`` completed entries (minimum 128)."""
+    return max(128, 1 << (max(1, count) - 1).bit_length())
+
+
+def precompile_capacities(context_len: int) -> dict[int, int]:
+    """Capacity buckets a request of ``context_len`` tokens reaches, per compression ratio."""
+    return {ratio: capacity_bucket(context_len // ratio) for ratio in (4, 128)}
 
 
 def prepare_dummy_batch(batch, backend):

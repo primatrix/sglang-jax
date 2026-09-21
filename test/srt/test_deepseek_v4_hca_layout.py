@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from sgl_jax.srt.kernels.hca.attention import _cache_layout
 from sgl_jax.srt.mem_cache.deepseek_v4.pool import (
     DeepseekV4CacheSpec,
     DeepseekV4TokenToKVPool,
@@ -65,6 +66,22 @@ def test_score_slice_selects_the_score_half():
     four = np.zeros((2, 128, 2, D), np.float32)
     four[score_slice(four.shape)] = 1
     assert four[..., 0, :].sum() == 0 and four[..., 1, :].all()
+
+
+def test_cache_layout_accepts_flat_rows_with_explicit_page_size():
+    flat = jnp.zeros((4 * 128, D), jnp.bfloat16)
+    rows, page = _cache_layout(flat, D, 128)
+    assert rows is flat and page == 128
+    paged = flat.reshape(4, 64, 2, D)
+    rows4, page4 = _cache_layout(paged, D)
+    assert rows4.shape == flat.shape and page4 == 128
+    assert _cache_layout(paged, D, 128)[1] == 128
+    with pytest.raises(ValueError):
+        _cache_layout(flat, D)  # flat rows need the page size
+    with pytest.raises(ValueError):
+        _cache_layout(paged, D, 256)  # shape and argument disagree
+    with pytest.raises(ValueError):
+        _cache_layout(jnp.zeros((4 * 128 + 1, D), jnp.bfloat16), D, 128)
 
 
 def test_native_kv_c128_family_is_paged_4d(monkeypatch):

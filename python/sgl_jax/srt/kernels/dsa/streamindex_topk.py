@@ -766,6 +766,7 @@ def select_topk_indices(scores: jax.Array, k: int, *, backend: str = "auto") -> 
         "vmem_limit_bytes",
         "decode_req_batch_size",
         "topk_backend",
+        "return_scores",
     ),
 )
 def streamindex_topk(
@@ -784,6 +785,7 @@ def streamindex_topk(
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_req_batch_size: int = 4,
     topk_backend: str = "auto",
+    return_scores: bool = False,
 ) -> jax.Array:
     """StreamIndex Top-K retrieval.
 
@@ -1050,6 +1052,10 @@ def streamindex_topk(
     )
 
     scores = scores.reshape(q.shape[0], -1)
+    if return_scores:
+        # ``[T, E_padded]`` f32, -inf where a query may not see the entry; the
+        # caller derives a membership mask (dsv4 prefill) instead of an index list.
+        return scores[: q.shape[0]]
     topk_idxs = select_topk_indices(scores, k, backend=topk_backend)
     return topk_idxs[: q.shape[0], :k]
 
