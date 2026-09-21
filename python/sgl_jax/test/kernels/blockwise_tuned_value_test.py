@@ -5,6 +5,7 @@ borrow batch_block_size=8 (from the n_batch=8 entry) for a padded 16-row decode
 bucket, and jax >= 0.11 rejects an 8-row block on a bf16 operand tiled (16, 128).
 """
 
+import os
 from unittest import mock
 
 import jax.numpy as jnp
@@ -59,7 +60,7 @@ def test_exact_and_small_batches_unchanged(n_batch):
 def _tuned_prefill(n_batch, n_out, n_in, x_dtype, min_block):
     with (
         mock.patch.object(blockwise_utils, "_get_current_tpu_version", return_value=7),
-        mock.patch.object(blockwise_utils, "_MIN_BATCH_BLOCK", min_block),
+        mock.patch.dict(os.environ, {"SGLANG_JAX_QMM_MIN_BATCH_BLOCK": str(min_block)}),
     ):
         return blockwise_utils.get_safe_blockwise_tuned_value(
             n_batch=n_batch,
