@@ -96,8 +96,7 @@ validation fixture's memory use is not a full-model HBM sizing result.
 
 ## Validation
 
-Use the focused [real-weight precision workflows](../../test/manual/deepseek_v4_precision/README.md)
-for GPU/TPU module and layer comparisons. Full-model request acceptance uses
-`test/manual/deepseek_v4_precision/static_fp8_smoke.py` against a published static
-checkpoint. The smoke checks native-encoded greedy token IDs and normal EOS;
-it does not establish long-context, concurrency or broad model-quality coverage.
+Full-model acceptance requires GPU/TPU module and layer comparisons and a real
+TPU serving check against a published static checkpoint. Check native-encoded
+greedy token IDs and normal EOS separately from long-context, concurrency and
+broad model-quality coverage.

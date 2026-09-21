@@ -15,17 +15,17 @@ os.environ["DSV4_INDEXER_ROW_SHARD"] = "1"
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+import pytest
+from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
+from test_deepseek_v4_indexer_kernel import CPS, RATIO, K, _synthetic_batch
 
 if len(jax.devices()) < 8:
     pytest.skip(
         "needs 8 host devices (XLA_FLAGS set before jax initialised)", allow_module_level=True
     )
 
-import numpy as np
-import pytest
-from jax.sharding import Mesh
-from jax.sharding import PartitionSpec as P
-from test_deepseek_v4_indexer_kernel import CPS, RATIO, K, _synthetic_batch
 
 from sgl_jax.srt.layers.attention.dsv4 import dispatch
 from sgl_jax.srt.layers.attention.dsv4.indexer import (

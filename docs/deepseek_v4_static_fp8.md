@@ -53,8 +53,7 @@ static experts into the shared parallel `WeightLoader` and logs
 `static FP8 experts via WeightLoader` for each layer. It checks expert dtype/shape
 and payload sizes from headers without repeating offline value validation or
 expanding FP8 weights into FP32 for a NaN scan. No conversion flag is needed.
-Use the [real-weight precision workflows](../test/manual/deepseek_v4_precision/README.md)
-for conversion and GPU/TPU parameter/output comparisons. Non-expert tensors
+Non-expert tensors
 retain their value checks because export copies their original bytes without
 conversion; these checks do not expand weights into FP32.
 

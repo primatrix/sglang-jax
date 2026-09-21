@@ -92,6 +92,5 @@ avoids both sub-tile DMA slices and per-request compressed-history staging
 in HBM. The transport is a correctness baseline, not a tuned performance result.
 
 The standalone HCA kernel tests and benchmarks remain under
-`test/srt/kernels/hca/`. For V4 model integration, use the
-[real-weight attention and layer comparisons](../../test/manual/deepseek_v4_precision/README.md),
-which exercise the production resource bridge against native SGLang GPU captures.
+`test/srt/kernels/hca/`. V4 model integration still requires real-weight
+attention and layer comparisons against native SGLang GPU captures.
