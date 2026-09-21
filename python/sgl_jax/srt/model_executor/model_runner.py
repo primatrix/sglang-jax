@@ -1137,6 +1137,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         full_layers_num = len(full_attention_layer_ids)
         swa_layers_num = len(swa_attention_layer_ids)
         swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
+        if swa_full_tokens_ratio is None:
+            swa_full_tokens_ratio = 0.8
 
         swa_num_kv_heads = getattr(self.model_config.hf_config, "swa_num_key_value_heads", None)
         if swa_num_kv_heads is not None:
