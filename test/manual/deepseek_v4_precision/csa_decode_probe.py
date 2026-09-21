@@ -7,12 +7,13 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+
 from sgl_jax.srt.kernels.csa_decode import paged_csa_decode_scores
 from sgl_jax.srt.layers.attention.dsv4.attention import dsv4_attention
 from sgl_jax.srt.layers.attention.dsv4.decode import csa_decode_attention
-from sgl_jax.srt.layers.attention.dsv4.indexer import (
-    csa_indexer_scores,
-    csa_indexer_topk,
+from sgl_jax.srt.layers.attention.dsv4.ref.indexer import (
+    csa_indexer_scores_ref,
+    csa_indexer_topk_ref,
 )
 
 parser = argparse.ArgumentParser()
@@ -32,9 +33,7 @@ pages = (
     .reshape(t, cap // page_size)
     .astype(np.int32)
 )
-key_cache = jnp.asarray(
-    rng.normal(0, 0.1, (1 + t * cap // page_size, page_size, d)), jnp.bfloat16
-)
+key_cache = jnp.asarray(rng.normal(0, 0.1, (1 + t * cap // page_size, page_size, d)), jnp.bfloat16)
 compressed_cache = jnp.asarray(
     rng.normal(0, 0.1, (key_cache.shape[0] * page_size, ad)), jnp.bfloat16
 )
@@ -57,7 +56,7 @@ for dtype in (jnp.bfloat16, jnp.float32):
         iq = jnp.asarray(rng.normal(0, 0.1, (t, h, d)), dtype)
         if tie:
             iq = jnp.zeros_like(iq)
-        native = csa_indexer_scores(iq, weights, flat_keys)
+        native = csa_indexer_scores_ref(iq, weights, flat_keys)
         expected = jnp.stack([native[i, i * cap : (i + 1) * cap] for i in range(t)])
         scores = paged_csa_decode_scores(
             iq,
@@ -73,7 +72,7 @@ for dtype in (jnp.bfloat16, jnp.float32):
         assert np.all(sa[~mask] == np.finfo(np.float32).min)
         max_abs = float(np.max(np.abs(sa[mask] - se[mask])))
         assert max_abs < 1e-5, max_abs
-        reference_selected = csa_indexer_topk(
+        reference_selected = csa_indexer_topk_ref(
             iq,
             weights,
             flat_keys,
@@ -126,9 +125,7 @@ for dtype in (jnp.bfloat16, jnp.float32):
                 query_request_ids=query_ids,
                 valid_token_mask=valid,
                 window_positions=window_positions,
-                window_request_ids=jnp.where(
-                    window_positions >= 0, jnp.repeat(query_ids, 128), -1
-                ),
+                window_request_ids=jnp.where(window_positions >= 0, jnp.repeat(query_ids, 128), -1),
                 compressed_entry_ids=entry_ids,
                 compressed_request_ids=entry_requests,
                 attention_sink=sink,

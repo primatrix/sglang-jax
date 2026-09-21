@@ -1,5 +1,5 @@
 """CSA indexer through ``kernels/dsa/streamindex_topk`` (completed-groups mask + exact
-SparseCore selection) versus the native-JAX ``csa_indexer_topk`` reference.
+SparseCore selection) versus the native-JAX ``csa_indexer_topk_ref`` reference.
 
 The kernel reads the paged indexer cache directly; the reference reads the gathered
 ``[E, D]`` key array. Both must select the same compressed entries for the same
@@ -14,11 +14,11 @@ import pytest
 from sgl_jax.srt.layers.attention.dsv4.decode import select_decode_entries
 from sgl_jax.srt.layers.attention.dsv4.indexer import (
     INVALID_ENTRY,
-    csa_indexer_topk,
     csa_indexer_topk_kernel,
     kernel_read_layout,
     resolve_indexer_backend,
 )
+from sgl_jax.srt.layers.attention.dsv4.ref.indexer import csa_indexer_topk_ref
 
 RATIO, PAGE_SIZE, CPS = 4, 128, 32  # CPS = compressed entries per page
 H, D, K = 64, 128, 512
@@ -109,7 +109,7 @@ def test_kernel_selection_matches_reference(padded_queries):
     b = _synthetic_batch([(300, 100), (0, 257), (1000, 1), (0, 0)], padded_queries=padded_queries)
     keys = jnp.take(b["indexer_buffer"], b["tables"]["compressed_rows"], axis=0)
     reference = np.asarray(
-        csa_indexer_topk(
+        csa_indexer_topk_ref(
             b["q"],
             b["weights"],
             keys,

@@ -8,8 +8,8 @@ from sgl_jax.srt.kernels.dsv4.topk_threshold import (
     score_key,
     topk_membership_mask,
     topk_threshold,
-    topk_threshold_xla,
 )
+from sgl_jax.srt.layers.attention.dsv4.ref.topk_threshold import topk_threshold_ref
 
 
 def _reference_mask(scores, k):
@@ -47,7 +47,7 @@ def test_threshold_matches_reference():
         got = np.asarray(topk_membership_mask(jnp.asarray(s), k, interpret=True))
         np.testing.assert_array_equal(got, want)
         thr_k = np.asarray(topk_threshold(jnp.asarray(s), k, interpret=True))
-        thr_x = np.asarray(topk_threshold_xla(jnp.asarray(s), k))
+        thr_x = np.asarray(topk_threshold_ref(jnp.asarray(s), k))
         np.testing.assert_array_equal(thr_k, thr_x)
 
 

@@ -122,7 +122,7 @@ def admissible_mask(
     `dsv4.indexer.visible_entries_for_query`. `ratio == 0` admits nothing.
 
     `selected_entries`, when given, is ``[T, k]`` of **row indices into the
-    compressed key array** (exactly what `dsv4.indexer.csa_indexer_topk` returns for
+    compressed key array** (exactly what `dsv4.ref.indexer.csa_indexer_topk_ref` returns for
     the same row ordering), with -1 for unused slots. Selection intersects the
     completeness rule rather than replacing it, so a stale or over-eager selection
     still cannot reach an unwritten group.

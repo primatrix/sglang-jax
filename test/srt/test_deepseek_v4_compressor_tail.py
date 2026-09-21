@@ -1,13 +1,10 @@
-"""Fused compressor tail kernel (interpret) matches select_window_fields + pool_normalize_rope."""
+"""Fused compressor tail kernel (interpret) matches the unfused compressor_tail_ref."""
 
 import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.kernels.dsv4.compressor_tail import compressor_tail_pallas
-from sgl_jax.srt.layers.attention.dsv4.compressor import (
-    pool_normalize_rope,
-    select_window_fields,
-)
+from sgl_jax.srt.layers.attention.dsv4.ref.compressor import compressor_tail_ref
 
 
 def _case(N, D, ratio, coff, seed):
@@ -33,17 +30,16 @@ def _case(N, D, ratio, coff, seed):
 def test_tail_matches_reference():
     for N, D, ratio, coff, seed in ((5, 512, 4, 2, 0), (16, 128, 4, 2, 1), (3, 128, 8, 1, 2)):
         c = _case(N, D, ratio, coff, seed)
-        offsets = jnp.arange(coff * ratio)
-        kv_w, sc_w = select_window_fields(
-            c["combined"], offsets, ratio=ratio, coff=coff, head_dim=D, width=c["width"]
-        )
-        want = pool_normalize_rope(
-            kv_w,
-            sc_w,
+        want = compressor_tail_ref(
+            c["combined"],
             c["valid"],
             c["norm_weight"],
             c["cos"],
             c["sin"],
+            ratio=ratio,
+            coff=coff,
+            head_dim=D,
+            width=c["width"],
             rope_head_dim=64,
             norm_eps=1e-6,
         )
