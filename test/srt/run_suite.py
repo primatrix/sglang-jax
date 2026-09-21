@@ -489,6 +489,17 @@ suites = {
         TestFile("test/srt/test_deepseek_v4_indexer_row_shard.py", 0.3, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_csa_fused_attention.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_decode_short_kv.py", 0.4, runner="pytest"),
+        # Optional production adapters and optimized paths (CPU interpret)
+        TestFile("test/srt/test_deepseek_v4_mhc_nopad_small.py", 0.3, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_moe_act_rows.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_hca_paged_row_write.py", 1.8, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_hca_project_xla.py", 0.1, runner="pytest"),
+        TestFile("test/srt/test_hca_scatter_compaction.py", 0.8, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_csa_sparse_attention.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_decode_page_take.py", 0.1, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_compressor_fused_proj.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_moe_merged_gate_up.py", 0.5, runner="pytest"),
+        TestFile("test/srt/test_moe_rank_permutation.py", 0.2, runner="pytest"),
         # DeepSeek V4 model and runtime (CPU)
         TestFile("python/sgl_jax/test/kernels/sc_moe_permute_test.py", 0.3, runner="pytest"),
         TestFile("test/srt/model_executor/test_aot_dispatch.py", 0.1, runner="pytest"),
