@@ -12,10 +12,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from common import Capture, Checkpoint, compare
-from sgl_jax.srt.layers.attention.dsv4.attention import dsv4_attention
+
 from sgl_jax.srt.kernels.hca.attention import ragged_attention
 from sgl_jax.srt.kernels.hca.hca import HCAMetadata
 from sgl_jax.srt.kernels.hca.tuned_block_sizes import get_hca_kernel_schedule
+from sgl_jax.srt.layers.attention.dsv4.attention import dsv4_dense_attention
 from sgl_jax.srt.layers.attention.hca_backend import _query_schedule
 
 
@@ -65,7 +66,7 @@ def main():
             assert end // ratio <= cp.config["index_topk"]
 
             def xla(q, w, c, sink):
-                return dsv4_attention(
+                return dsv4_dense_attention(
                     q,
                     w,
                     c,

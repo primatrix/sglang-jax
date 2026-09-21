@@ -42,7 +42,7 @@ import numpy as np
 from sgl_jax.srt.layers.attention.dsv4.attention import (
     csa_fused_attention,
     csa_sparse_attention,
-    dsv4_attention,
+    dsv4_dense_attention,
     update_window_kv,
 )
 from sgl_jax.srt.layers.attention.dsv4.compressor import compress_chunk
@@ -478,7 +478,7 @@ def run_layer(
         # path over a few hundred keys is cheaper than a pallas_call per layer.
         attend = csa_fused_attention
     else:
-        attend = dsv4_attention
+        attend = dsv4_dense_attention
     mask_kwargs = {} if attend is csa_sparse_attention else {"selected_mask": selected_mask}
     out = attend(
         q,

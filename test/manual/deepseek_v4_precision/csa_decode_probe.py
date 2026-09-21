@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.kernels.csa_decode import paged_csa_decode_scores
-from sgl_jax.srt.layers.attention.dsv4.attention import dsv4_attention
+from sgl_jax.srt.layers.attention.dsv4.attention import dsv4_dense_attention
 from sgl_jax.srt.layers.attention.dsv4.decode import csa_decode_attention
 from sgl_jax.srt.layers.attention.dsv4.ref.indexer import (
     csa_indexer_scores_ref,
@@ -117,7 +117,7 @@ for dtype in (jnp.bfloat16, jnp.float32):
                 index_topk=budget,
                 ratio=4,
             )
-            ref = dsv4_attention(
+            ref = dsv4_dense_attention(
                 q,
                 window_cache[window_rows.reshape(-1)],
                 compressed_cache[flat_slots],
