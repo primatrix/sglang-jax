@@ -71,6 +71,11 @@ def test_fused_wo_a_projection_wrapper_single_device():
     wo_a_ck = jnp.asarray(rng.standard_normal((G * R, 8 * D)) * 0.05, jnp.bfloat16)
     want = np.asarray(_reference(x, cos, sin, wo_a_ck, num_groups=G, rope_head_dim=RD), np.float32)
     with jax.set_mesh(mesh):
+        x = jax.device_put(
+            x, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data", "tensor", None))
+        )
+        rope_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data", None))
+        cos, sin = jax.device_put((cos, sin), (rope_sharding, rope_sharding))
         fused_w = fuse_wo_a_weights(group_wo_a(wo_a_ck, num_groups=G), mesh=mesh)
         got = fused_wo_a_projection(
             x, cos, sin, fused_w, mesh=mesh, rope_head_dim=RD, dtype=jnp.bfloat16, interpret=True
