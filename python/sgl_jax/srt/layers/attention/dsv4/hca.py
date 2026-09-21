@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -25,14 +24,14 @@ from sgl_jax.srt.kernels.dsv4.state_init import (
 from sgl_jax.srt.kernels.hca.attention import INERT_QUERY_OFFSET
 from sgl_jax.srt.kernels.hca.hca import HCAMetadata
 from sgl_jax.srt.kernels.hca.tuned_block_sizes import get_hca_kernel_schedule
-from sgl_jax.srt.layers.attention.hca_backend import (
-    HCABackend,
+from sgl_jax.srt.layers.attention.hca_execution import (
     HCABackendMetadata,
     _bucket_capacity,
     _bucket_max_queries,
     _data_spec,
     _pad_capacity,
     _query_schedule,
+    run_hca,
 )
 from sgl_jax.srt.mem_cache.deepseek_v4.pool import scatter_sharding
 from sgl_jax.srt.mem_cache.deepseek_v4.state import native_hca_layout, score_slice
@@ -63,29 +62,28 @@ def flat_compressed_pool() -> bool:
     return os.environ.get("DSV4_HCA_FLAT_COMPRESSED", "0") == "1"
 
 
-class DeepseekV4HCABackend(HCABackend):
-    """HCA math with C1 resources supplied explicitly for host metadata."""
+class HCAExecution(nnx.Module):
+    """Internal HCA metadata builder and executor for the unified V4 backend.
+
+    The parent backend owns per-forward metadata. This module retains only
+    static geometry and passes actual buffer views to the shared HCA executor.
+    """
 
     def __init__(self, *, mesh, page_size=128, max_context_len, request_capacity):
+        if mesh is None:
+            raise ValueError("HCA execution requires the SGLang device mesh")
         if page_size not in (128, 256):
             raise ValueError("V4 HCA requires original-token page size 128 or 256")
         if max_context_len <= 0 or request_capacity <= 0:
             raise ValueError("V4 HCA context and request capacities must be positive")
-        # The standalone HCA backend uses equal-sized ring/record pages. C1's
-        # two tiers instead have P and P/128 rows, without changing the math.
-        super().__init__(mesh=mesh, page_size=128)
+        self.mesh = mesh
+        self.num_heads = 64
+        self.head_dim = 512
+        self.compress_ratio = 128
+        self.window_size = 128
         self.page_size = page_size
         self.max_context_len = max_context_len
         self.request_capacity = request_capacity
-        self.forward_metadata = nnx.data(DeepseekV4HCAMetadata())
-
-    def tree_flatten(self):
-        return (self.forward_metadata,), dict(
-            mesh=self.mesh,
-            page_size=self.page_size,
-            max_context_len=self.max_context_len,
-            request_capacity=self.request_capacity,
-        )
 
     def _page_tables(self, slots, lengths, prefixes, rank, request_pool, allocator):
         """Read both physical tiers from the same original-token ownership map."""
@@ -304,7 +302,7 @@ class DeepseekV4HCABackend(HCABackend):
         init_slots = jax.device_put(init_slots_host, sharding)
         return DeepseekV4HCAMetadata(combined, schedule, uniform, init_slots)
 
-    def __call__(
+    def forward(
         self,
         q,
         k,
@@ -314,7 +312,7 @@ class DeepseekV4HCABackend(HCABackend):
         token_to_kv_pool,
         *,
         compressor_state_pool,
-        metadata=None,
+        metadata,
         **kwargs,
     ):
         """Use reshape views of C1 buffers and return native C1-shaped updates."""
@@ -327,7 +325,6 @@ class DeepseekV4HCABackend(HCABackend):
         state = compressor_state_pool.get_buffer("c128", layer_id)
         window = token_to_kv_pool.get_swa_buffer(layer_id)
         compressed = token_to_kv_pool.get_compressed_buffer(layer_id)
-        metadata = self.forward_metadata if metadata is None else metadata
         init_slots = metadata.state_init_slots
         if init_slots is None:
             raise RuntimeError("V4 HCA metadata has not been prepared")
@@ -380,7 +377,7 @@ class DeepseekV4HCABackend(HCABackend):
         if native_hca_layout():
             # The state pool is already allocated in the kernels' [S, 128, 2, D] layout
             # and the kernels address the window as flat rows (page size passed by the
-            # base backend), so neither buffer is relaid out on the way in or out.
+            # executor), so neither buffer is relaid out on the way in or out.
             state_view = state
             window_view = window
         else:
@@ -397,23 +394,19 @@ class DeepseekV4HCABackend(HCABackend):
                 token_to_kv_pool.get_compressed_page_size(layer_id),
                 self.head_dim,
             )
-        # These contain views only. Ownership, allocation and update validation
-        # stay with C1; the standalone HCA allocator/pools are never constructed.
-        kv_view = SimpleNamespace(
-            max_context_len=self.max_context_len,
-            _layer_index=lambda _: 0,
-            window_buffer=(window_view,),
-            compressed_buffer=(compressed_view,),
-        )
-        state_proxy = SimpleNamespace(_layer_index=lambda _: 0, get_hca_state=lambda _: state_view)
-        output, (new_state, new_window, new_compressed) = super().__call__(
+        output, (new_state, new_window, new_compressed) = run_hca(
             q,
             k,
             v,
-            layer,
-            forward_batch,
-            kv_view,
-            recurrent_state_pool=state_proxy,
+            mesh=self.mesh,
+            page_size=self.page_size,
+            max_context_len=self.max_context_len,
+            positions=forward_batch.positions,
+            forward_mode=forward_batch.forward_mode,
+            softmax_scale=getattr(layer, "scaling", None),
+            state_arg=state_view,
+            window_arg=window_view,
+            compressed_arg=compressed_view,
             metadata=metadata,
             **kwargs,
         )
@@ -422,15 +415,3 @@ class DeepseekV4HCABackend(HCABackend):
             new_window.reshape(window.shape),
             new_compressed.reshape(compressed.shape),
         )
-
-    @staticmethod
-    def pack_pool_updates(layer_updates, token_to_kv_pool, compressor_state_pool):
-        """Merge {layer_id: (state, SWA, C128)} into complete C1 update families."""
-        return {
-            "token_to_kv_pool": token_to_kv_pool.build_buffer_updates(
-                {layer: {"swa": w, "compressed": c} for layer, (_, w, c) in layer_updates.items()}
-            ),
-            "compressor_state_pool": compressor_state_pool.build_buffer_updates(
-                {layer: {"compressor": s} for layer, (s, _, _) in layer_updates.items()}
-            ),
-        }
