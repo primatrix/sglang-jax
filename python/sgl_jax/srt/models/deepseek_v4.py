@@ -758,11 +758,16 @@ def _q_norm_rope(q, cos, sin, *, heads, head_dim, rope_head_dim, normalize, eps,
     """
     spec = jax.typeof(q).sharding.spec
     lane_axis = spec[1] if len(spec) > 1 else None
-    # Under an explicit-axes mesh even a lane-replicated q must reach the kernel through
-    # shard_map (pallas_call requires Manual axes; a direct call traced the kernel body
-    # with sharded block values and failed on the first iota-vs-block select). Only a
-    # mesh-less call (CPU tests) runs the kernel directly.
-    if lane_axis is None and not jax.sharding.get_abstract_mesh().shape:
+    # A lane-replicated q runs the kernel directly when there is no mesh (CPU tests) or
+    # when every mesh axis is already Manual (inside the decode step's shard_map, where
+    # q is a per-device value). Under explicit axes (the prefill program) it must go
+    # through shard_map: pallas_call requires Manual axes, and a direct call traced the
+    # kernel body with sharded block values and failed on the first iota-vs-block select.
+    mesh = jax.sharding.get_abstract_mesh()
+    manual = not mesh.shape or all(
+        t == jax.sharding.AxisType.Manual for t in getattr(mesh, "axis_types", ())
+    )
+    if lane_axis is None and manual:
         return q_head_norm_rope(
             q,
             cos,
@@ -774,7 +779,6 @@ def _q_norm_rope(q, cos, sin, *, heads, head_dim, rope_head_dim, normalize, eps,
             eps=eps,
             out_dtype=out_dtype,
         ).reshape(-1, heads, head_dim)
-    mesh = jax.sharding.get_abstract_mesh()
     shards = int(mesh.shape[lane_axis]) if isinstance(lane_axis, str) else 1
     local_heads = heads // shards
     row_axis = spec[0]  # tokens may be sharded over data; keep whatever the input has
