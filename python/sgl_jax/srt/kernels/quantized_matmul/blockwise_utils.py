@@ -30,6 +30,7 @@ import functools
 import importlib
 import logging
 import math
+import os
 import re
 
 import jax
@@ -55,6 +56,16 @@ _BLOCKWISE_TUNED_VALUE_CLS = None  # e.g. TunedValue namedtuple class
 _BLOCKWISE_GET_TUNED_BLOCK_SIZES = None  # e.g. get_tuned_block_sizes()
 _BLOCKWISE_TUNED_BLOCK_SIZES = None  # e.g. TUNED_BLOCK_SIZES dict
 _TRIED_LOADING_BLOCKWISE_TUNING = False
+
+
+def _min_batch_block() -> int:
+    """``SGLANG_JAX_QMM_MIN_BATCH_BLOCK``: floor for the borrowed batch tile once the
+    local batch is at least that large. The tuning table has no bf16-activation rows
+    for prefill-sized batches, and the nearest entry it borrows for (n_batch 8192,
+    n_in 1024, bf16 x fp8) is batch_block 64: 128 grid steps of a 64-row matmul.
+    Opt-in: 0 (the default) keeps the table's choice; the DeepSeek V4 recipe sets 512.
+    Read at call time so tests and launchers can set it after import."""
+    return int(os.environ.get("SGLANG_JAX_QMM_MIN_BATCH_BLOCK", "0"))
 
 
 def get_blockwise_kernel():
@@ -114,6 +125,12 @@ def _next_multiple(x: int, m: int) -> int:
     if m <= 0:
         return x
     return ((x + m - 1) // m) * m
+
+
+def sublane_tile_rows(x_q_dtype) -> int:
+    """Rows of one native sublane tile for activations of ``x_q_dtype``: 256 bits per
+    sublane, so fp32 8, bf16 16, fp8/int8 32 (never below 8)."""
+    return max(8, 256 // max(8, jnp.dtype(x_q_dtype).itemsize * 8))
 
 
 def _floor_multiple(x: int, m: int) -> int:
@@ -367,14 +384,25 @@ def get_safe_blockwise_tuned_value(
     n_lane_multiplier = max(1, int(tuned.n_lane_multiplier))
     compute_tile_n = 256 * n_lane_multiplier
 
-    # batch: cap to actual batch size, then enforce the Pallas TPU block-shape
-    # constraint (block_m % 8 == 0 OR block_m == array_m). When Tier-1 fuzzy
-    # match returns a small batch_block_size (e.g. 1 from a #1191 entry) but
-    # n_batch is in (1, 8), the unaligned block triggers a lowering ValueError.
+    # batch: cap to actual batch size, then enforce the Mosaic block-shape
+    # constraint: block_m must equal array_m or divide the operand's sublane
+    # tiling evenly. jax >= 0.11 tiles operands at their native sublane
+    # granularity (256 / dtype_bits rows: fp32 8, bf16 16, fp8/int8 32) and
+    # rejects smaller blocks with E2002, so a borrowed batch_block_size from a
+    # nearest-neighbour table entry (e.g. the n_batch=8 entry serving a padded
+    # 16-row decode bucket) must be aligned up to the tile floor. This applies
+    # to every quantized linear layer that resolves its tiles here.
     n_batch_i = int(n_batch)
+    sublane_m = sublane_tile_rows(x_q_dtype)
     batch_block_size = max(1, min(int(tuned.batch_block_size), n_batch_i))
-    if batch_block_size < n_batch_i and batch_block_size % 8 != 0:
-        batch_block_size = n_batch_i if n_batch_i <= 8 else max(8, batch_block_size & ~7)
+    if batch_block_size < n_batch_i and batch_block_size % sublane_m != 0:
+        if n_batch_i <= sublane_m:
+            batch_block_size = n_batch_i
+        else:
+            batch_block_size = min(n_batch_i, _next_multiple(batch_block_size, sublane_m))
+    min_batch_block = _min_batch_block()
+    if min_batch_block > 0 and n_batch_i >= min_batch_block:
+        batch_block_size = max(batch_block_size, _next_multiple(min_batch_block, sublane_m))
 
     # out (N): round up to compute_tile_n, cap to matrix N, then snap to
     # nearest power-of-two multiple for TPU alignment.

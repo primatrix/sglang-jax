@@ -32,6 +32,13 @@ logger = logging.getLogger(__name__)
 # fmt: off
 TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
     "TPU v7": {
+        # DeepSeek V4-Flash: E=256, H=4096, I=2048, top_k=6, routed FP8 per-channel,
+        # ep=8 (2x2x1 v7x, 8 JAX devices), no shared expert in kernel, no grouped top-k.
+        # Auto-tuned 2026-09-15 (bench_v2 BENCH_TUNE=1, BENCH_DIRECT_SCALED_DOT=1):
+        # tokens=8 0.088 ms, 256 0.318 ms, 8192 1.651 ms per call.
+        ('bfloat16', 'float8_e4m3fn', 8, 256, 6, 4096, 2048, 8, False, False, False, 'per_channel'): (8, 1024, 8, 256, 8),
+        ('bfloat16', 'float8_e4m3fn', 256, 256, 6, 4096, 2048, 8, False, False, False, 'per_channel'): (32, 1024, 16, 256, 16),
+        ('bfloat16', 'float8_e4m3fn', 8192, 256, 6, 4096, 2048, 8, False, False, False, 'per_channel'): (512, 1024, 120, 256, 120),
         # MiMo V2 Pro: E=384, H=6144, I=2048, top_k=8, fp8 e4m3, ep=32
         # Decode configs (tuned 2026-05-21)
         ('bfloat16', 'float8_e4m3fn', 64, 384, 8, 6144, 2048, 32, False, False): (8, 512, 8, 256, 8),
