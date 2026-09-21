@@ -2,7 +2,7 @@
 
 The host segmentation (``page_run_segments``) and the device per-page split
 (``trivial_segments``) must drive the multi-row kernel to the same scores, and both
-must match the legacy one-page-per-DMA kernel and a numpy reference. Runs on CPU in
+must match a NumPy reference. Runs on CPU in
 interpret mode.
 """
 
@@ -118,10 +118,7 @@ def _case(seed, tokens, table, lengths):
         (4, 80, [2560, 2304, 2049, 513], 4),  # fine bucket 2560: five 512-row tiles
     ],
 )
-def test_segment_kernel_matches_reference_and_legacy(
-    monkeypatch, tokens, table, lengths, rows_per_step
-):
-    monkeypatch.delenv(csa_decode.SCORER_ENV, raising=False)
+def test_segment_kernel_matches_reference(tokens, table, lengths, rows_per_step):
     case = _case(1, tokens, table, lengths)
     capacity = table * CPS
     pages_per_block = scorer_pages_per_block(capacity, CPS)
@@ -148,11 +145,8 @@ def test_segment_kernel_matches_reference_and_legacy(
         )
     )
     got_dev = np.asarray(paged_csa_decode_scores(*args, rows_per_step=rows_per_step, **kw))
-    monkeypatch.setenv(csa_decode.SCORER_ENV, "legacy")
-    got_legacy = np.asarray(paged_csa_decode_scores(*args, **kw))
     assert got_host.shape == (tokens, capacity)
     np.testing.assert_array_equal(got_host, got_dev)
-    np.testing.assert_array_equal(got_host, got_legacy)
     valid = ref > NEG
     np.testing.assert_array_equal(got_host > NEG, valid)
     np.testing.assert_allclose(got_host[valid], ref[valid], rtol=2e-2, atol=2e-2)

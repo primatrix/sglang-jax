@@ -54,7 +54,6 @@ __all__ = [
     "compress_chunk",
     "interleaved_rope",
     "overlap_factor",
-    "pool_normalize_rope",
     "project_tokens",
     "state_window",
 ]
@@ -164,38 +163,6 @@ def _project(x, w):
     """``x @ w.T`` in f32 with f32-exact products (``Precision.HIGHEST``)."""
     w = jnp.asarray(w)
     return jnp.einsum("th,oh->to", x, w.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST)
-
-
-def pool_normalize_rope(
-    kv_window,
-    score_window,
-    valid_mask,
-    norm_weight,
-    cos,
-    sin,
-    *,
-    rope_head_dim: int,
-    norm_eps: float,
-):
-    """Window softmax-pool, RMSNorm, interleaved RoPE.
-
-    Args:
-      kv_window: ``[N, W, D]`` content rows of each record's window.
-      score_window: ``[N, W, D]`` score rows.
-      valid_mask: ``[N, W]`` False where the window runs off the start of the
-        sequence (a record near position 0 pools fewer than W rows).
-      cos, sin: ``[N, rope_head_dim//2]``.
-
-    The softmax is per feature over the window axis, and masked entries go to
-    ``-inf`` so they contribute nothing -- not zero, which would still take a share
-    of the normalisation.
-    """
-    score_window = jnp.where(valid_mask[..., None], score_window, -jnp.inf)
-    weights = jax.nn.softmax(score_window, axis=1)
-    pooled = jnp.sum(weights * kv_window, axis=1)
-    variance = jnp.mean(jnp.square(pooled), axis=-1, keepdims=True)
-    normed = pooled * jax.lax.rsqrt(variance + norm_eps) * jnp.asarray(norm_weight, jnp.float32)
-    return interleaved_rope(normed, cos, sin, rope_head_dim)
 
 
 def select_window_fields(combined, offsets, *, ratio: int, coff: int, head_dim: int, width: int):
@@ -321,12 +288,6 @@ def compress_chunk(
     )  # [N, W, 2*width]; clipped, so no fill select over the gathered rows
     combined = _window_rows(slot_state, rows, win_pos, chunk_index, from_chunk)
 
-    # The overlap: the older half of the window reads content/score field 0, the
-    # newer half reads field 1. With coff == 1 both halves read the same field.
-    kv_window, score_window = select_window_fields(
-        combined, offsets, ratio=ratio, coff=coff, head_dim=head_dim, width=width
-    )
-
     cos_sin = jnp.asarray(cos_sin_cache, jnp.float32)[jnp.asarray(boundary_compressed_pos)]
     half = rope_head_dim // 2
     cos, sin = cos_sin[:, :half], cos_sin[:, half : 2 * half]
@@ -348,13 +309,18 @@ def compress_chunk(
             norm_eps=norm_eps,
         )
     else:
-        records = pool_normalize_rope(
-            kv_window,
-            score_window,
+        from sgl_jax.srt.layers.attention.dsv4.ref.compressor import compressor_tail_ref
+
+        records = compressor_tail_ref(
+            combined,
             in_sequence,
             norm_weight,
             cos,
             sin,
+            ratio=ratio,
+            coff=coff,
+            head_dim=head_dim,
+            width=width,
             rope_head_dim=rope_head_dim,
             norm_eps=norm_eps,
         )

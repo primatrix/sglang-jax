@@ -1,6 +1,6 @@
 """Fused masked attention for the DSv4 CSA prefill path (Pallas TPU).
 
-The reference (`layers/attention/dsv4/attention.py::dsv4_attention`) scores every
+The reference (`layers/attention/dsv4/attention.py::dsv4_dense_attention`) scores every
 query against every gathered key (`[T, H, N]` f32), masks, takes a softmax with the
 attention sink and multiplies back: three full passes over a `[T, H, N]` tensor
 per layer. This kernel streams key tiles past query blocks with an online softmax,

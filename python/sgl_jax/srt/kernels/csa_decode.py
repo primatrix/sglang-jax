@@ -1,21 +1,9 @@
-"""Request-local paged CSA decode scores.
+"""Request-local paged CSA decode scores with multi-row, double-buffered DMA.
 
-Two kernels share one contract (``paged_csa_decode_scores``):
-
-* the default (``rows_per_step`` rows per grid step, page-run DMA segments): every grid
-  step owns several decode rows, issues the first two key tiles of every row before it
-  waits for any of them, and reads each tile through DMA *segments* -- runs of physically
-  contiguous allocator pages, split into power-of-two page counts -- instead of one DMA
-  per page. Pages a request received from one allocation are consecutive physical pages,
-  so an 8K prefill's 64 pages arrive as a single 512 KiB DMA rather than 64 x 8 KiB ones
-  (64 rows x 42 pages = 2688 page DMAs per layer per step at bs=64, 9K context: 4.7 ms of
-  the 36 ms decode step before this rewrite). The segments come from the host page table
-  (``page_run_segments``, built once per step next to ``decode_page_indices``) or, when
-  a caller has none, from a per-page split done on device (``trivial_segments``).
-* ``DSV4_CSA_SCORER=legacy``: the one-row-per-step, one-DMA-per-page kernel this replaces.
-
-V4 uses completed compression-group lengths and an explicit FP32 weighted head reduction,
-matching the production CSA indexer.
+Each grid step owns several queries and prefetches two key tiles per query.
+Host-built page-run segments combine contiguous physical pages into larger DMAs;
+callers without segments use the device-side single-page segmentation.
+Both schedules compute completed-group scores with an FP32 weighted head reduction.
 """
 
 import functools
@@ -33,7 +21,6 @@ _NEG_INF = jnp.finfo(jnp.float32).min
 MAX_BLOCK_K = 2048
 DEFAULT_ROWS_PER_STEP = 8
 ROWS_PER_STEP_ENV = "DSV4_CSA_SCORER_ROWS"
-SCORER_ENV = "DSV4_CSA_SCORER"  # "" (default kernel) | "legacy"
 
 # One int32 per DMA segment: physical page << 10 | page offset inside the block << 3 | log2(pages)
 _SEG_SIZE_BITS = 3
@@ -145,7 +132,7 @@ def trivial_segments(pages, page_counts, pages_per_block: int):
     """Device (jnp) segmentation with one single-page segment per valid page.
 
     Same contract as ``page_run_segments``; used when a caller has no host-built
-    segments (tests, the legacy kernel's callers). Both feed the same kernel.
+    segments (including tests). Both feed the same kernel.
     """
     pages = jnp.asarray(pages, jnp.int32)
     rows, table = pages.shape
@@ -277,87 +264,6 @@ def _segments_kernel(
     lax.fori_loop(0, max_blocks, step_blocks, 0)
 
 
-def _legacy_score_kernel(lengths, pages, q, weights, cache, output, keys, sems, *, page_size):
-    row = pl.program_id(0)
-    length = lengths[row]
-    block_k = keys.shape[1]
-    pages_per_block = block_k // page_size
-    blocks = (length + block_k - 1) // block_k
-    output[...] = jnp.full(output.shape, _NEG_INF, jnp.float32)
-
-    def fetch(block, buffer):
-        dst = keys.at[buffer]
-        dst[...] = jnp.zeros(dst.shape, dst.dtype)
-        count = jnp.minimum(
-            pages_per_block, (length + page_size - 1) // page_size - block * pages_per_block
-        )
-
-        def page_copy(p, _):
-            physical = pages[row, block * pages_per_block + p]
-            pltpu.make_async_copy(
-                cache.at[physical], dst.at[pl.ds(p * page_size, page_size)], sems.at[buffer]
-            ).start()
-            return None
-
-        lax.fori_loop(0, count, page_copy, None)
-
-    @pl.when(length > 0)
-    def score_request():
-        fetch(0, 0)
-
-        def step(block, _):
-            buffer = block % 2
-            dst = keys.at[buffer]
-            count = jnp.minimum(
-                pages_per_block,
-                (length + page_size - 1) // page_size - block * pages_per_block,
-            )
-
-            def wait_page(p, _):
-                page_dst = dst.at[pl.ds(p * page_size, page_size)]
-                pltpu.make_async_copy(page_dst, page_dst, sems.at[buffer]).wait()
-                return None
-
-            lax.fori_loop(0, count, wait_page, None)
-
-            @pl.when(block + 1 < blocks)
-            def prefetch():
-                fetch(block + 1, 1 - buffer)
-
-            _score_tile(q[0], keys[buffer], weights[0, 0], length, block, block_k, output, 0)
-            return None
-
-        lax.fori_loop(0, blocks, step, None)
-
-
-def _legacy_scores(q, weights, cache, lengths, pages, *, page_size, interpret):
-    tokens, heads, dim = q.shape
-    capacity = pages.shape[1] * page_size
-    block_k = scorer_block_k(capacity)
-    cache = cache.reshape(-1, page_size, dim)
-    return pl.pallas_call(
-        functools.partial(_legacy_score_kernel, page_size=page_size),
-        out_shape=jax.ShapeDtypeStruct((tokens, 1, capacity), jnp.float32),
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
-            grid=(tokens,),
-            in_specs=[
-                pl.BlockSpec((1, heads, dim), lambda row, *_: (row, 0, 0)),
-                pl.BlockSpec((1, 1, heads), lambda row, *_: (row, 0, 0)),
-                pl.BlockSpec(memory_space=pltpu.HBM),
-            ],
-            out_specs=pl.BlockSpec((1, 1, capacity), lambda row, *_: (row, 0, 0)),
-            scratch_shapes=[
-                pltpu.VMEM((2, block_k, dim), cache.dtype),
-                pltpu.SemaphoreType.DMA((2,)),
-            ],
-        ),
-        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
-        interpret=interpret,
-        name="csa_request_local_decode_scores",
-    )(lengths, pages, q, weights[:, None, :], cache)[:, 0, :]
-
-
 def resolve_rows_per_step(rows_per_step=None) -> int:
     if rows_per_step is None:
         rows_per_step = int(os.environ.get(ROWS_PER_STEP_ENV, DEFAULT_ROWS_PER_STEP))
@@ -403,10 +309,6 @@ def paged_csa_decode_scores(
         raise ValueError("CSA decode requires aligned cache pages and 128-wide key dimensions")
     block_k = scorer_block_k(capacity)
     pages_per_block = scorer_pages_per_block(capacity, page_size)
-    if os.environ.get(SCORER_ENV, "") == "legacy":
-        return _legacy_scores(
-            q, weights, cache, lengths, pages, page_size=page_size, interpret=interpret
-        )
     blocks = capacity // block_k
     lengths = jnp.asarray(lengths, jnp.int32)
     if segments is None:

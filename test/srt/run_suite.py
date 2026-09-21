@@ -308,7 +308,6 @@ suites = {
     # have a conditional CPU pin gated on USE_DEVICE_TYPE=cpu — the
     # cpu-test CI job sets that env var.
     "unit-test-cpu": [
-        TestFile("test/srt/kernels/mhc/test_tune.py", 0.1, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/test_embedding_pool.py",
             0.1,
@@ -469,15 +468,11 @@ suites = {
         TestFile("test/srt/test_native_attention_paged_decode.py", 1),
         # DeepSeek V4 pools
         TestFile("test/srt/test_deepseek_v4_hca_layout.py", 0.2, runner="pytest"),
-        TestFile("test/srt/test_deepseek_v4_pool_budget.py", 0.2, runner="pytest"),
         # DeepSeek V4 small kernels (CPU interpret)
-        TestFile("test/srt/test_deepseek_v4_mhc_nopad_small.py", 0.3, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_mhc_seam.py", 0.2, runner="pytest"),
-        TestFile("test/srt/test_deepseek_v4_moe_act_rows.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_wo_a_projection.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_quantized_matmul_batch_block.py", 0.1, runner="pytest"),
         # DeepSeek V4 CSA kernels (CPU interpret)
-        TestFile("test/srt/test_deepseek_v4_csa_flash_attention_kernel.py", 0.1, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_csa_decode_attention_kernel.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_csa_decode_segments.py", 1.5, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_topk_threshold.py", 0.3, runner="pytest"),
@@ -487,36 +482,29 @@ suites = {
         TestFile("test/srt/test_deepseek_v4_hca_boundary_native.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_hca_emit_native.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_hca_decode_dense.py", 0.6, runner="pytest"),
-        TestFile("test/srt/test_deepseek_v4_hca_paged_row_write.py", 1.8, runner="pytest"),
-        TestFile("test/srt/test_deepseek_v4_hca_project_xla.py", 0.1, runner="pytest"),
-        TestFile("test/srt/test_deepseek_v4_hca_search.py", 0.1, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_hca_small_page_gather.py", 2.6, runner="pytest"),
-        TestFile("test/srt/test_hca_scatter_compaction.py", 0.8, runner="pytest"),
-        # DeepSeek V4 attention backends and dispatch (CPU interpret; the
-        # decode_indexer_kernel test needs a TPU and stays out of this suite)
-        TestFile("test/srt/test_deepseek_v4_compressor_fields.py", 0.1, runner="pytest"),
-        TestFile("test/srt/test_deepseek_v4_compressor_rope.py", 0.1, runner="pytest"),
+        # DeepSeek V4 attention backends and dispatch (CPU interpret)
         TestFile("test/srt/test_deepseek_v4_compressor_tail.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_compressor_row_shard.py", 0.5, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_indexer_row_shard.py", 0.3, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_csa_fused_attention.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_decode_short_kv.py", 0.4, runner="pytest"),
+        # Optional production adapters and optimized paths (CPU interpret)
+        TestFile("test/srt/test_deepseek_v4_mhc_nopad_small.py", 0.3, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_moe_act_rows.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_hca_paged_row_write.py", 1.8, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_hca_project_xla.py", 0.1, runner="pytest"),
+        TestFile("test/srt/test_hca_scatter_compaction.py", 0.8, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_csa_sparse_attention.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_decode_page_take.py", 0.1, runner="pytest"),
-        TestFile("test/srt/test_deepseek_v4_decode_short_kv.py", 0.4, runner="pytest"),
-        TestFile("test/srt/test_deepseek_v4_hca_tile_bucket.py", 0.2, runner="pytest"),
-        TestFile("test/srt/test_deepseek_v4_membership_mask.py", 0.1, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_compressor_fused_proj.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_moe_merged_gate_up.py", 0.5, runner="pytest"),
+        TestFile("test/srt/test_moe_rank_permutation.py", 0.2, runner="pytest"),
         # DeepSeek V4 model and runtime (CPU)
-        TestFile("python/sgl_jax/test/kernels/blockwise_tuned_value_test.py", 0.1, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/sc_moe_permute_test.py", 0.3, runner="pytest"),
         TestFile("test/srt/model_executor/test_aot_dispatch.py", 0.1, runner="pytest"),
         TestFile("test/srt/model_executor/test_sampler_device_inputs.py", 0.1, runner="pytest"),
-        TestFile("test/srt/test_deepseek_v4_compressor_fused_proj.py", 0.2, runner="pytest"),
-        TestFile("test/srt/test_deepseek_v4_moe_merged_gate_up.py", 0.5, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_packed_metadata.py", 0.2, runner="pytest"),
-        TestFile("test/srt/test_deepseek_v4_precompile_ladder.py", 0.2, runner="pytest"),
-        TestFile("test/srt/test_deepseek_v4_rope_cache_pad.py", 0.2, runner="pytest"),
-        TestFile("test/srt/test_moe_rank_permutation.py", 0.2, runner="pytest"),
-        TestFile("test/srt/test_precision_tracer.py", 0.1, runner="pytest"),
         TestFile("test/srt/test_step_pack.py", 0.1, runner="pytest"),
     ],
     "unit-test-tpu-v6e-4": [

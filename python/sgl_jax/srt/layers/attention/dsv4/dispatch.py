@@ -42,16 +42,16 @@ import numpy as np
 from sgl_jax.srt.layers.attention.dsv4.attention import (
     csa_fused_attention,
     csa_sparse_attention,
-    dsv4_attention,
+    dsv4_dense_attention,
     update_window_kv,
 )
 from sgl_jax.srt.layers.attention.dsv4.compressor import compress_chunk
 from sgl_jax.srt.layers.attention.dsv4.indexer import (
-    csa_indexer_topk,
     csa_indexer_topk_kernel,
     membership_from_scores,
     resolve_indexer_backend,
 )
+from sgl_jax.srt.layers.attention.dsv4.ref.indexer import csa_indexer_topk_ref
 
 # Token count from which the fused CSA kernel replaces the XLA dense path.
 _FUSED_MIN_TOKENS = int(os.environ.get("DSV4_CSA_FUSED_MIN_TOKENS", "64"))
@@ -426,7 +426,7 @@ def run_layer(
                     indexer_keys = jnp.take(
                         indexer_buffer, jnp.asarray(tables.compressed_rows), axis=0
                     )
-                    selected = csa_indexer_topk(
+                    selected = csa_indexer_topk_ref(
                         indexer["q"],
                         indexer["weights"],
                         indexer_keys,
@@ -478,7 +478,7 @@ def run_layer(
         # path over a few hundred keys is cheaper than a pallas_call per layer.
         attend = csa_fused_attention
     else:
-        attend = dsv4_attention
+        attend = dsv4_dense_attention
     mask_kwargs = {} if attend is csa_sparse_attention else {"selected_mask": selected_mask}
     out = attend(
         q,

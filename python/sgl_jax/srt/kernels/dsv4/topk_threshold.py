@@ -66,12 +66,6 @@ def _kernel(skey_ref, out_ref, *, k):
     out_ref[...] = _bisect(skey_ref[...], k)
 
 
-def topk_threshold_xla(scores, k: int):
-    """Reference / fallback: same bisection in plain XLA. Returns uint32 [T]."""
-    skey = _to_signed(score_key(scores))
-    return _from_signed(_bisect(skey, k))[:, 0]
-
-
 def _default_interpret() -> bool:
     return os.environ.get("PALLAS_INTERPRET", "0") == "1" or jax.default_backend() == "cpu"
 

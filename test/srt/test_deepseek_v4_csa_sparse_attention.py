@@ -1,11 +1,11 @@
-"""csa_sparse_attention (gather-then-dense) matches the dense dsv4_attention (CPU-only)."""
+"""csa_sparse_attention (gather-then-dense) matches the dense dsv4_dense_attention (CPU-only)."""
 
 import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.layers.attention.dsv4.attention import (
     csa_sparse_attention,
-    dsv4_attention,
+    dsv4_dense_attention,
 )
 
 
@@ -57,7 +57,7 @@ def _case(seed, T=6, H=4, D=128, W=8, E=40, K=5, ratio=4, window_size=6):
 def test_sparse_matches_dense():
     for seed in (0, 1, 2):
         q, wkv, ckv, kw = _case(seed)
-        dense = np.asarray(dsv4_attention(q, wkv, ckv, **kw))
+        dense = np.asarray(dsv4_dense_attention(q, wkv, ckv, **kw))
         sparse = np.asarray(csa_sparse_attention(q, wkv, ckv, interpret=True, **kw))
         assert dense.shape == sparse.shape
         np.testing.assert_allclose(sparse, dense, rtol=2e-2, atol=2e-2)
@@ -69,6 +69,6 @@ def test_sparse_no_selection_row_gives_window_only():
     sel = kw["selected_entries"].copy()
     sel[0, :] = -1
     kw["selected_entries"] = sel
-    dense = np.asarray(dsv4_attention(q, wkv, ckv, **kw))
+    dense = np.asarray(dsv4_dense_attention(q, wkv, ckv, **kw))
     sparse = np.asarray(csa_sparse_attention(q, wkv, ckv, interpret=True, **kw))
     np.testing.assert_allclose(sparse, dense, rtol=2e-2, atol=2e-2)

@@ -15,25 +15,25 @@ os.environ["DSV4_INDEXER_ROW_SHARD"] = "1"
 
 import jax
 import jax.numpy as jnp
-
-if len(jax.devices()) < 8:
-    pytest.skip(
-        "needs 8 host devices (XLA_FLAGS set before jax initialised)", allow_module_level=True
-    )
-
 import numpy as np
 import pytest
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 from test_deepseek_v4_indexer_kernel import CPS, RATIO, K, _synthetic_batch
 
+if len(jax.devices()) < 8:
+    pytest.skip(
+        "needs 8 host devices (XLA_FLAGS set before jax initialised)", allow_module_level=True
+    )
+
+
 from sgl_jax.srt.layers.attention.dsv4 import dispatch
 from sgl_jax.srt.layers.attention.dsv4.indexer import (
-    csa_indexer_scores,
     csa_indexer_topk_kernel,
     membership_from_scores,
     visible_entries_for_query,
 )
+from sgl_jax.srt.layers.attention.dsv4.ref.indexer import csa_indexer_scores_ref
 
 
 def cpu_scorer(
@@ -56,7 +56,7 @@ def cpu_scorer(
     queries are the last positions of seq_len; scores [T, E] over the gathered rows,
     entries not yet complete at a query's position (or padded rows) get -inf."""
     keys = jnp.asarray(buf)[jnp.asarray(compressed_rows)][:, None, :]
-    scores = csa_indexer_scores(jnp.asarray(q), jnp.asarray(w), keys)
+    scores = csa_indexer_scores_ref(jnp.asarray(q), jnp.asarray(w), keys)
     tokens = q.shape[0]
     q_len = jnp.asarray(q_lens)[0]
     pos = jnp.asarray(seq_lens)[0] - q_len + jnp.arange(tokens, dtype=jnp.int32)

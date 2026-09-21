@@ -39,7 +39,7 @@ def _case(T, W, E, H, D, K, ratio, seed):
 def test_fused_matches_dense():
     for T, W, E, H, D, K, seed in ((16, 40, 100, 8, 128, 8, 0), (13, 300, 700, 4, 128, 32, 1)):
         kw = _case(T, W, E, H, D, K, 4, seed)
-        want = np.asarray(att.dsv4_attention(**kw))
+        want = np.asarray(att.dsv4_dense_attention(**kw))
         got = np.asarray(att.csa_fused_attention(**kw, interpret=True))
         assert got.shape == want.shape
         np.testing.assert_allclose(got, want, rtol=1e-3, atol=1e-3)
@@ -66,8 +66,8 @@ def test_selected_mask_equals_selected_entries():
         kw2 = dict(kw, selected_entries=None, selected_mask=mask)
         got = np.asarray(att.csa_fused_attention(**kw2, interpret=True))
         np.testing.assert_array_equal(got, want)
-        want_d = np.asarray(att.dsv4_attention(**kw))
-        got_d = np.asarray(att.dsv4_attention(**kw2))
+        want_d = np.asarray(att.dsv4_dense_attention(**kw))
+        got_d = np.asarray(att.dsv4_dense_attention(**kw2))
         np.testing.assert_array_equal(got_d, want_d)
 
 
@@ -77,6 +77,6 @@ def test_fused_other_tilings_match_dense(monkeypatch):
         monkeypatch.setattr(att, "_CSA_FUSED_BLOCK_Q", bq)
         monkeypatch.setattr(att, "_CSA_FUSED_BLOCK_K", bk)
         kw = _case(13, 300, 700, 4, 128, 32, 4, 1)
-        want = np.asarray(att.dsv4_attention(**kw))
+        want = np.asarray(att.dsv4_dense_attention(**kw))
         got = np.asarray(att.csa_fused_attention(**kw, interpret=True))
         np.testing.assert_allclose(got, want, rtol=1e-3, atol=1e-3)

@@ -65,7 +65,7 @@ def _csa_query_block(num_queries: int, local_heads: int) -> int:
 __all__ = [
     "admissible_mask",
     "csa_sparse_attention",
-    "dsv4_attention",
+    "dsv4_dense_attention",
     "update_window_kv",
 ]
 
@@ -122,7 +122,7 @@ def admissible_mask(
     `dsv4.indexer.visible_entries_for_query`. `ratio == 0` admits nothing.
 
     `selected_entries`, when given, is ``[T, k]`` of **row indices into the
-    compressed key array** (exactly what `dsv4.indexer.csa_indexer_topk` returns for
+    compressed key array** (exactly what `dsv4.ref.indexer.csa_indexer_topk_ref` returns for
     the same row ordering), with -1 for unused slots. Selection intersects the
     completeness rule rather than replacing it, so a stale or over-eager selection
     still cannot reach an unwritten group.
@@ -158,7 +158,7 @@ def admissible_mask(
     return window_mask, compressed_mask
 
 
-def dsv4_attention(
+def dsv4_dense_attention(
     q,
     window_kv,
     compressed_kv,
@@ -255,7 +255,7 @@ def csa_fused_attention(
     selected_mask=None,
     interpret: bool = False,
 ):
-    """`dsv4_attention` computed by the fused flash-style kernel.
+    """`dsv4_dense_attention` computed by the fused flash-style kernel.
 
     Same admissibility as the dense path (`admissible_mask`, including the
     indexer's top-k membership); the kernel streams key tiles with an online
@@ -340,7 +340,7 @@ def csa_sparse_attention(
     selected_entries,
     interpret: bool = False,
 ):
-    """`dsv4_attention` for the CSA path, attending only to the selected records.
+    """`dsv4_dense_attention` for the CSA path, attending only to the selected records.
 
     The dense path scores every one of the ``E`` gathered records and masks the
     non-selected ones, so its cost grows with the history; this path hands the
