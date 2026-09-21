@@ -758,7 +758,11 @@ def _q_norm_rope(q, cos, sin, *, heads, head_dim, rope_head_dim, normalize, eps,
     """
     spec = jax.typeof(q).sharding.spec
     lane_axis = spec[1] if len(spec) > 1 else None
-    if lane_axis is None:
+    # Under an explicit-axes mesh even a lane-replicated q must reach the kernel through
+    # shard_map (pallas_call requires Manual axes; a direct call traced the kernel body
+    # with sharded block values and failed on the first iota-vs-block select). Only a
+    # mesh-less call (CPU tests) runs the kernel directly.
+    if lane_axis is None and not jax.sharding.get_abstract_mesh().shape:
         return q_head_norm_rope(
             q,
             cos,

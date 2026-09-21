@@ -74,6 +74,11 @@ def _kernel(q_ref, cos_ref, sin_ref, out_ref, acc_ref, *, heads, head_dim, norma
     sin_full = sin_ref[...]
     lane = jax.lax.broadcasted_iota(jnp.int32, (rows, _LANE), 1)
     even = (lane % 2) == 0
+    # Lane parity as arithmetic masks: under explicit-sharding meshes a select whose
+    # predicate is an unsharded iota and whose cases carry the block's sharding is
+    # rejected (ShardingTypeError); x * 1 + y * 0 is exact for finite x, y.
+    on_even = jnp.where(even, 1.0, 0.0).astype(jnp.float32)
+    on_odd = 1.0 - on_even
     keep = head_dim - _LANE
     for h in range(heads):
         xh = q_ref[:, h * head_dim : (h + 1) * head_dim].astype(jnp.float32)
@@ -86,7 +91,7 @@ def _kernel(q_ref, cos_ref, sin_ref, out_ref, acc_ref, *, heads, head_dim, norma
         # partner[2i] = -x[2i+1] (the lane to the right), partner[2i+1] = x[2i] (left).
         right = pltpu.roll(tail, shift=_LANE - 1, axis=1)
         left = pltpu.roll(tail, shift=1, axis=1)
-        partner = jnp.where(even, -right, left)
+        partner = left * on_odd - right * on_even
         tail = tail * cos_full + partner * sin_full
         head_out = jnp.concatenate([xh[:, :keep], tail], axis=1) if keep else tail
         # Mosaic's strided (sublane-interleaving) store wants a 128-lane base ref:
