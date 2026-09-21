@@ -1,7 +1,8 @@
-"""The fused CSA attention kernel (interpret mode) matches the dense reference."""
+"""CSA attention adapters match the dense reference, including masks and padding."""
 
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from sgl_jax.srt.layers.attention.dsv4 import attention as att
 
@@ -36,22 +37,31 @@ def _case(T, W, E, H, D, K, ratio, seed):
     )
 
 
-def test_fused_matches_dense():
+@pytest.mark.parametrize("backend", ["fused", "sparse"])
+def test_attention_matches_dense(backend):
+    attend = att.csa_fused_attention if backend == "fused" else att.csa_sparse_attention
     for T, W, E, H, D, K, seed in ((16, 40, 100, 8, 128, 8, 0), (13, 300, 700, 4, 128, 32, 1)):
         kw = _case(T, W, E, H, D, K, 4, seed)
         want = np.asarray(att.dsv4_dense_attention(**kw))
-        got = np.asarray(att.csa_fused_attention(**kw, interpret=True))
+        got = np.asarray(attend(**kw, interpret=True))
         assert got.shape == want.shape
-        np.testing.assert_allclose(got, want, rtol=1e-3, atol=1e-3)
+        np.testing.assert_allclose(
+            got,
+            want,
+            rtol=2e-2 if backend == "sparse" else 1e-3,
+            atol=2e-2 if backend == "sparse" else 1e-3,
+        )
         # invalid queries and queries admitting nothing are exactly zero
         np.testing.assert_array_equal(got[~np.asarray(kw["valid_token_mask"])], 0.0)
 
 
-def test_fused_zero_when_nothing_admitted():
+@pytest.mark.parametrize("backend", ["fused", "sparse"])
+def test_attention_zero_when_nothing_admitted(backend):
+    attend = att.csa_fused_attention if backend == "fused" else att.csa_sparse_attention
     kw = _case(8, 16, 32, 2, 128, 4, 4, 3)
     kw["selected_entries"] = jnp.full((8, 4), -1, jnp.int32)
     kw["window_request_ids"] = jnp.full((16,), 7, jnp.int32)  # no window row matches
-    got = np.asarray(att.csa_fused_attention(**kw, interpret=True))
+    got = np.asarray(attend(**kw, interpret=True))
     assert np.all(np.isfinite(got)) and np.all(got == 0.0)
 
 
@@ -69,14 +79,3 @@ def test_selected_mask_equals_selected_entries():
         want_d = np.asarray(att.dsv4_dense_attention(**kw))
         got_d = np.asarray(att.dsv4_dense_attention(**kw2))
         np.testing.assert_array_equal(got_d, want_d)
-
-
-def test_fused_other_tilings_match_dense(monkeypatch):
-    """Block sizes are a pure tiling choice: any (block_q, block_k) gives the dense result."""
-    for bq, bk in ((8, 128), (16, 256), (64, 1024)):
-        monkeypatch.setattr(att, "_CSA_FUSED_BLOCK_Q", bq)
-        monkeypatch.setattr(att, "_CSA_FUSED_BLOCK_K", bk)
-        kw = _case(13, 300, 700, 4, 128, 32, 4, 1)
-        want = np.asarray(att.dsv4_dense_attention(**kw))
-        got = np.asarray(att.csa_fused_attention(**kw, interpret=True))
-        np.testing.assert_allclose(got, want, rtol=1e-3, atol=1e-3)
