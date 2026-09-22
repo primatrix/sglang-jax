@@ -468,6 +468,7 @@ suites = {
         TestFile("test/srt/test_native_attention_paged_decode.py", 1),
         # DeepSeek V4 pools
         TestFile("test/srt/test_deepseek_v4_hca_layout.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_pool_budget.py", 0.2, runner="pytest"),
         # DeepSeek V4 small kernels (CPU interpret)
         TestFile("test/srt/kernels/mhc/test_mhc.py", 0.5, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_wo_a_projection.py", 0.2, runner="pytest"),
@@ -482,6 +483,7 @@ suites = {
         TestFile("test/srt/test_deepseek_v4_hca_compressor.py", 0.4, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_hca_decode_dense.py", 0.6, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_hca_small_page_gather.py", 2.6, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_hca_tile_bucket.py", 0.2, runner="pytest"),
         # DeepSeek V4 attention backends and dispatch (CPU interpret)
         TestFile("test/srt/test_deepseek_v4_compressor.py", 0.4, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_compressor_row_shard.py", 0.5, runner="pytest"),
@@ -498,6 +500,7 @@ suites = {
         TestFile("test/srt/model_executor/test_aot_dispatch.py", 0.1, runner="pytest"),
         TestFile("test/srt/model_executor/test_sampler_device_inputs.py", 0.1, runner="pytest"),
         TestFile("test/srt/test_deepseek_v4_packed_metadata.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_precompile_ladder.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_step_pack.py", 0.1, runner="pytest"),
     ],
     "unit-test-tpu-v6e-4": [
