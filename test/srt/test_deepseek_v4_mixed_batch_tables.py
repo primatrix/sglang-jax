@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import jax.numpy as jnp
 import numpy as np
 
-from sgl_jax.srt.layers.attention.deepseek_v4_csa_backend import padded_read_tables
+from sgl_jax.srt.layers.attention.dsv4.execution import padded_read_tables
 
 PAGE, WIN, RATIO = 128, 128, 4
 
