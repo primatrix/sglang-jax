@@ -89,8 +89,13 @@ def _kernel(q_ref, cos_ref, sin_ref, out_ref, acc_ref, *, heads, head_dim, norma
         partner = jnp.where(even, -right, left)
         tail = tail * cos_full + partner * sin_full
         head_out = jnp.concatenate([xh[:, :keep], tail], axis=1) if keep else tail
-        acc_ref[pl.ds(h, rows, stride=heads), :] = head_out
-    out_ref[...] = acc_ref[...].astype(out_ref.dtype)
+        # Mosaic's strided (sublane-interleaving) store wants a 128-lane base ref:
+        # scatter each 128-lane tile of the head's rows into its own scratch plane.
+        for t in range(head_dim // _LANE):
+            acc_ref[t, pl.ds(h, rows, stride=heads), :] = head_out[:, t * _LANE : (t + 1) * _LANE]
+    out_ref[...] = jnp.concatenate([acc_ref[t] for t in range(head_dim // _LANE)], axis=1).astype(
+        out_ref.dtype
+    )
 
 
 def q_head_norm_rope(
@@ -117,7 +122,7 @@ def q_head_norm_rope(
         raise ValueError("rope_head_dim must be even and fit the trailing 128-lane tile")
     if cos.shape != (tokens, rope_head_dim // 2) or sin.shape != cos.shape:
         raise ValueError("cos/sin must be [T, rope_head_dim // 2]")
-    rows = rows_per_step or int(os.environ.get("DSV4_Q_NORM_ROPE_ROWS", "16"))
+    rows = rows_per_step or int(os.environ.get("DSV4_Q_NORM_ROPE_ROWS", "64"))  # v7x: 64 > 32 > 16
     if rows % 16:
         raise ValueError("rows_per_step must be a multiple of 16")
     padded = -(-tokens // rows) * rows
@@ -139,7 +144,7 @@ def q_head_norm_rope(
         ],
         out_specs=pl.BlockSpec((rows * heads, head_dim), lambda i: (i, 0)),
         out_shape=jax.ShapeDtypeStruct((padded * heads, head_dim), out_dtype),
-        scratch_shapes=[pltpu.VMEM((rows * heads, head_dim), jnp.float32)],
+        scratch_shapes=[pltpu.VMEM((head_dim // _LANE, rows * heads, _LANE), jnp.float32)],
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel",), vmem_limit_bytes=32 * 1024 * 1024
         ),
