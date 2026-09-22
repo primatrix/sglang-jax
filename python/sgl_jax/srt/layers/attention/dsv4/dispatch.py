@@ -119,6 +119,7 @@ class ReadTables:
         "decode_window_rows",
         "decode_page_segments",
         "decode_page_segment_counts",
+        "decode_token_index",
     )
 
     def __init__(self, **kw):
@@ -267,6 +268,16 @@ def run_layer(
     selected = None
     selected_mask = None
 
+    # Mixed chunked prefill: the decode tables cover only the requests decoding inside
+    # this extend step (one row per request slot, ``decode_token_index`` -> token row);
+    # the batch still takes the extend path and those rows are overlaid at the end.
+    # Pure decode (one table row per token) skips the extend path.
+    mixed_decode = (
+        tables.decode_page_indices is not None
+        and tables.decode_token_index is not None
+        and int(tables.decode_page_indices.shape[0]) != int(q.shape[0])
+    )
+    extend_path = tables.decode_page_indices is None or mixed_decode
     if ratio > 0:
         if compressor_weights is None:
             raise ValueError(f"ratio {ratio} needs compressor weights")
@@ -336,7 +347,7 @@ def run_layer(
             run=metadata.page_size // ratio,
         )
         updates["compressed"] = compressed_buffer
-        if tables.decode_page_indices is None:
+        if extend_path:
             compressed_kv = jnp.take(compressed_buffer, jnp.asarray(tables.compressed_rows), axis=0)
 
         if ratio == 4:
@@ -369,7 +380,7 @@ def run_layer(
                 run=metadata.page_size // ratio,
             )
             updates["indexer"] = indexer_buffer
-            if tables.decode_page_indices is None:
+            if extend_path:
                 if resolve_indexer_backend() == "kernel":
                     # Pallas scoring straight from the paged cache; same gathered-row
                     # coordinates as the reference, no [T, E] key gather.
@@ -445,7 +456,7 @@ def run_layer(
     updates["swa"] = update_window_kv(
         kv_buffers["swa"], new_kv, metadata.swa_write_loc, metadata.valid_token_mask
     )
-    if tables.decode_page_indices is not None:
+    if tables.decode_page_indices is not None and not mixed_decode:
         from sgl_jax.srt.layers.attention.dsv4.decode import csa_decode_attention
 
         out = csa_decode_attention(
@@ -498,8 +509,59 @@ def run_layer(
         selected_entries=selected,
         **mask_kwargs,
     )
+    if mixed_decode:
+        out = _overlay_mixed_decode_rows(
+            out,
+            q,
+            indexer,
+            updates,
+            tables,
+            metadata,
+            attention_sink=attention_sink,
+            softmax_scale=softmax_scale,
+            ratio=ratio,
+            index_topk=index_topk,
+        )
 
     return out, updates
+
+
+def _overlay_mixed_decode_rows(
+    out, q, indexer, updates, tables, metadata, *, attention_sink, softmax_scale, ratio, index_topk
+):
+    """Recompute the decoding requests of a mixed batch through the request-local
+    decode path and write their rows over the extend result.
+
+    The extend path above ran those tokens against shared-history tables that hold
+    only the prefill requests, so their rows are placeholders; every write (KV,
+    records, states) already happened on the extend path for all tokens."""
+    from sgl_jax.srt.layers.attention.dsv4.decode import csa_decode_attention
+
+    token_index = jnp.asarray(tables.decode_token_index, jnp.int32)
+    live = token_index >= 0
+    rows = jnp.where(live, token_index, 0)
+    valid = live & metadata.valid_token_mask[rows]
+    decode_out = csa_decode_attention(
+        q[rows],
+        indexer["q"][rows],
+        indexer["weights"][rows],
+        updates["indexer"],
+        updates["compressed"],
+        updates["swa"],
+        tables.decode_page_indices,
+        tables.decode_window_rows,
+        query_positions=metadata.query_positions[rows],
+        valid_token_mask=valid,
+        attention_sink=attention_sink,
+        softmax_scale=softmax_scale,
+        compressed_page_size=metadata.page_size // ratio,
+        index_topk=index_topk,
+        ratio=ratio,
+        page_segments=tables.decode_page_segments,
+        page_segment_counts=tables.decode_page_segment_counts,
+    )
+    target = jnp.where(valid, token_index, out.shape[0])
+    return out.at[target].set(decode_out.astype(out.dtype), mode="drop")
 
 
 # ``DSV4_PAGED_RECORD_WRITE=1``: on prefill-sized boundary sets, place the compressed
