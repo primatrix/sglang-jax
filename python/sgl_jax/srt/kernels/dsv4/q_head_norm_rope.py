@@ -69,7 +69,9 @@ def rope_tail_tables(cos, sin, rope_head_dim: int):
     return cos_full, sin_full
 
 
-def _kernel(q_ref, cos_ref, sin_ref, out_ref, acc_ref, *, heads, head_dim, normalize, eps, rows):
+def _kernel(
+    q_ref, cos_ref, sin_ref, out_ref, acc_ref, *, heads, head_dim, normalize, eps, rows, interpret
+):
     cos_full = cos_ref[...]
     sin_full = sin_ref[...]
     lane = jax.lax.broadcasted_iota(jnp.int32, (rows, _LANE), 1)
@@ -80,6 +82,7 @@ def _kernel(q_ref, cos_ref, sin_ref, out_ref, acc_ref, *, heads, head_dim, norma
     on_even = jnp.where(even, 1.0, 0.0).astype(jnp.float32)
     on_odd = 1.0 - on_even
     keep = head_dim - _LANE
+    head_outs = []
     for h in range(heads):
         xh = q_ref[:, h * head_dim : (h + 1) * head_dim].astype(jnp.float32)
         if normalize:
@@ -94,10 +97,20 @@ def _kernel(q_ref, cos_ref, sin_ref, out_ref, acc_ref, *, heads, head_dim, norma
         partner = left * on_odd - right * on_even
         tail = tail * cos_full + partner * sin_full
         head_out = jnp.concatenate([xh[:, :keep], tail], axis=1) if keep else tail
+        if interpret:
+            # The interpreter cannot discharge strided ref stores; interleave in registers.
+            head_outs.append(head_out)
+            continue
         # Mosaic's strided (sublane-interleaving) store wants a 128-lane base ref:
         # scatter each 128-lane tile of the head's rows into its own scratch plane.
         for t in range(head_dim // _LANE):
             acc_ref[t, pl.ds(h, rows, stride=heads), :] = head_out[:, t * _LANE : (t + 1) * _LANE]
+    if interpret:
+        # row r * heads + h holds head h of token r, the same order as the strided stores
+        out_ref[...] = (
+            jnp.stack(head_outs, axis=1).reshape(rows * heads, head_dim).astype(out_ref.dtype)
+        )
+        return
     out_ref[...] = jnp.concatenate([acc_ref[t] for t in range(head_dim // _LANE)], axis=1).astype(
         out_ref.dtype
     )
@@ -139,7 +152,13 @@ def q_head_norm_rope(
         sin_full = jnp.pad(sin_full, (pad, (0, 0)))
     out = pl.pallas_call(
         functools.partial(
-            _kernel, heads=heads, head_dim=head_dim, normalize=normalize, eps=float(eps), rows=rows
+            _kernel,
+            heads=heads,
+            head_dim=head_dim,
+            normalize=normalize,
+            eps=float(eps),
+            rows=rows,
+            interpret=bool(interpret),
         ),
         grid=(padded // rows,),
         in_specs=[
