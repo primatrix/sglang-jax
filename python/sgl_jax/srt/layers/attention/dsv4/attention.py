@@ -46,6 +46,12 @@ import jax.numpy as jnp
 # defaults are the measured v7x choice, the envs exist for A/B sweeps.
 _CSA_FUSED_BLOCK_Q = int(os.environ.get("DSV4_CSA_FUSED_BLOCK_Q", "256"))
 _CSA_FUSED_BLOCK_K = int(os.environ.get("DSV4_CSA_FUSED_BLOCK_K", "1024"))
+# ``DSV4_CSA_MASK_INT8=1``: convert the admissibility mask to int8 before the
+# concatenation so the flash kernel operand needs no separate convert pass.
+_CSA_MASK_INT8 = os.environ.get("DSV4_CSA_MASK_INT8", "0") == "1"
+# ``DSV4_CSA_INKERNEL_MASK=1``: the fused kernel derives the mask from per-row
+# metadata in VMEM (threshold / no-selection paths; the index path keeps the mask).
+_CSA_INKERNEL_MASK = os.environ.get("DSV4_CSA_INKERNEL_MASK", "0") == "1"
 # ``DSV4_PAGED_KV_WRITE=1``: prefill-sized window KV writes go through the page-run
 # DMA writer instead of an XLA scatter (decode buckets keep the scatter).
 _PAGED_KV_WRITE = os.environ.get("DSV4_PAGED_KV_WRITE", "1") == "1"
@@ -262,9 +268,37 @@ def csa_fused_attention(
     softmax and skips tiles no query of the block may attend, instead of three
     full passes over a ``[T, H, W+E]`` f32 score tensor.
     """
-    from sgl_jax.srt.kernels.dsv4.csa_flash_attention import csa_flash_attention
+    from sgl_jax.srt.kernels.dsv4.csa_flash_attention import (
+        csa_flash_attention,
+        csa_flash_attention_meta,
+    )
 
     q = jnp.asarray(q)
+    if _CSA_INKERNEL_MASK and selected_entries is None:
+        # Build the [T, N] admissibility mask tile by tile inside the kernel from
+        # per-row metadata instead of materialising it (84 MB bool + an int8 pass
+        # per layer for an 8K chunk).
+        out = csa_flash_attention_meta(
+            q,
+            jnp.asarray(window_kv),
+            jnp.asarray(compressed_kv),
+            jnp.asarray(attention_sink, jnp.float32),
+            query_positions=query_positions,
+            query_request_ids=query_request_ids,
+            valid_token_mask=valid_token_mask,
+            window_positions=window_positions,
+            window_request_ids=window_request_ids,
+            compressed_entry_ids=compressed_entry_ids,
+            compressed_request_ids=compressed_request_ids,
+            membership=selected_mask,
+            sm_scale=float(softmax_scale),
+            window_size=window_size,
+            ratio=ratio,
+            block_q=_CSA_FUSED_BLOCK_Q,
+            block_k=_CSA_FUSED_BLOCK_K,
+            interpret=interpret,
+        )
+        return jnp.where(jnp.asarray(valid_token_mask, bool)[:, None, None], out, 0.0)
     window_mask, compressed_mask = admissible_mask(
         query_positions=query_positions,
         query_request_ids=query_request_ids,
@@ -279,6 +313,11 @@ def csa_fused_attention(
         selected_mask=selected_mask,
     )
     keys = jnp.concatenate((jnp.asarray(window_kv), jnp.asarray(compressed_kv)), axis=0)
+    if _CSA_MASK_INT8:
+        # Hand the kernel int8 straight from the mask fusions: the bool [T, N] mask
+        # otherwise costs a second full pass (pad + pred->int8 convert) per layer.
+        window_mask = window_mask.astype(jnp.int8)
+        compressed_mask = compressed_mask.astype(jnp.int8)
     mask = jnp.concatenate((window_mask, compressed_mask), axis=1)
     out = csa_flash_attention(
         q,

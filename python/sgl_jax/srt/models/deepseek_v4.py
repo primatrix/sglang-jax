@@ -25,6 +25,10 @@ from sgl_jax.srt.configs.deepseek_v4 import (
     classify_layers,
     hash_moe_layer_flags,
 )
+from sgl_jax.srt.kernels.dsv4.q_head_norm_rope import (
+    kernel_enabled as q_norm_rope_kernel_enabled,
+)
+from sgl_jax.srt.kernels.dsv4.q_head_norm_rope import q_head_norm_rope
 from sgl_jax.srt.kernels.sparse_core.moe_permute import moe_sc_permute_enabled_by_env
 from sgl_jax.srt.layers.activation import silu_and_mul_with_clamp
 from sgl_jax.srt.layers.gate import GateLogit, TopK
@@ -744,6 +748,69 @@ _MERGED_GATE_UP = os.environ.get("DSV4_MOE_MERGED_GATE_UP", "0") == "1"
 # instead of the 4096-wide hidden; the compressors then run on local rows with a
 # ppermute halo (needs DSV4_COMPRESSOR_ROW_SHARD=1). HCA layers keep the full gather.
 _LOWRANK_AG = os.environ.get("DSV4_LOWRANK_AG", "1") == "1"
+
+
+def _q_norm_rope(q, cos, sin, *, heads, head_dim, rope_head_dim, normalize, eps, out_dtype):
+    """`q_head_norm_rope` on a ``[T, heads*head_dim]`` projection -> ``[T, heads, head_dim]``.
+
+    A head-parallel projection (lanes sharded over ``tensor``) runs the kernel per
+    shard on its local heads; a replicated one runs it directly.
+    """
+    sharding = jax.typeof(q).sharding
+    spec = sharding.spec
+    lane_axis = spec[1] if len(spec) > 1 else None
+    # The step function traces without a mesh context (run_and_sample sets none), so the
+    # projection's own sharding mesh is the only reliable source of axis names and types.
+    # A lane-replicated q runs the kernel directly when that mesh is empty (CPU tests) or
+    # when every axis is already Manual (inside the decode step's shard_map, where q is a
+    # per-device value). Under explicit axes (the prefill program) it must go through
+    # shard_map: pallas_call requires Manual axes, and a direct call traced the kernel
+    # body with sharded block values and failed on the first iota-vs-block select.
+    mesh = sharding.mesh
+    manual = not mesh.shape or all(
+        t == jax.sharding.AxisType.Manual for t in getattr(mesh, "axis_types", ())
+    )
+    if lane_axis is None and manual:
+        return q_head_norm_rope(
+            q,
+            cos,
+            sin,
+            heads=heads,
+            head_dim=head_dim,
+            rope_head_dim=rope_head_dim,
+            normalize=normalize,
+            eps=eps,
+            out_dtype=out_dtype,
+        ).reshape(-1, heads, head_dim)
+    shards = int(mesh.shape[lane_axis]) if isinstance(lane_axis, str) else 1
+    local_heads = heads // shards
+    row_axis = spec[0]  # tokens may be sharded over data; keep whatever the input has
+
+    def per_shard(q_local, cos_local, sin_local):
+        out = q_head_norm_rope(
+            q_local,
+            cos_local,
+            sin_local,
+            heads=local_heads,
+            head_dim=head_dim,
+            rope_head_dim=rope_head_dim,
+            normalize=normalize,
+            eps=eps,
+            out_dtype=out_dtype,
+        )
+        return out.reshape(-1, local_heads, head_dim)
+
+    cos_spec = jax.typeof(cos).sharding.spec
+    sin_spec = jax.typeof(sin).sharding.spec
+    return jax.shard_map(
+        per_shard,
+        mesh=mesh,
+        in_specs=(P(row_axis, lane_axis), P(*cos_spec), P(*sin_spec)),
+        out_specs=P(row_axis, lane_axis, None),
+        check_vma=False,
+    )(q, cos, sin)
+
+
 # ``DSV4_HCA_FUSED_PROJ=1`` (default): build the HCA compressor's fused ``[Wkv|Wgate]^T`` bf16
 # projection once after loading instead of converting the f32 gate weight and
 # concatenating on every step in every HCA layer.
@@ -885,10 +952,23 @@ class DeepseekV4Indexer(nnx.Module):
         from sgl_jax.srt.layers.attention.dsv4.rope import apply_dsv4_partial_rope
 
         q, _ = self.wq_b(q_lora)
-        q = q.reshape(-1, self.num_heads, self.head_dim)
-        q = apply_dsv4_partial_rope(
-            q, cos[:, None, :], sin[:, None, :], rope_head_dim=self.rope_head_dim
-        ).astype(dtype)
+        if q_norm_rope_kernel_enabled():
+            q = _q_norm_rope(
+                q,
+                cos,
+                sin,
+                heads=self.num_heads,
+                head_dim=self.head_dim,
+                rope_head_dim=self.rope_head_dim,
+                normalize=False,
+                eps=0.0,
+                out_dtype=dtype,
+            )
+        else:
+            q = q.reshape(-1, self.num_heads, self.head_dim)
+            q = apply_dsv4_partial_rope(
+                q, cos[:, None, :], sin[:, None, :], rope_head_dim=self.rope_head_dim
+            ).astype(dtype)
         return IndexerInputs(q, weights * self.weight_scale, self.compressor.weights(cache))
 
     def __call__(self, hidden, q_lora, cos, sin, cache):
@@ -1034,14 +1114,6 @@ class DeepseekV4Attention(nnx.Module):
             q_lora, _ = self.wq_a(hidden)
             q_lora = self.q_norm(q_lora)
         q, _ = self.wq_b(q_lora)
-        q = q.reshape(-1, self.num_heads, self.head_dim)
-        # V4 normalizes q again per head after wq_b, with no learned weight.
-        q = (
-            q.astype(jnp.float32)
-            * jax.lax.rsqrt(
-                jnp.mean(jnp.square(q.astype(jnp.float32)), axis=-1, keepdims=True) + self.norm_eps
-            )
-        ).astype(self.dtype)
         if not sp_local:
             kv, _ = self.wkv(hidden)
             kv = self.kv_norm(kv)
@@ -1050,9 +1122,33 @@ class DeepseekV4Attention(nnx.Module):
             out_sharding=NamedSharding(self.mesh, P("data", None))
         )
         cos, sin = jnp.split(selected[:, : self.rope_head_dim], 2, axis=-1)
-        q = apply_dsv4_partial_rope(
-            q, cos[:, None, :], sin[:, None, :], rope_head_dim=self.rope_head_dim
-        ).astype(self.dtype)
+        if q_norm_rope_kernel_enabled():
+            # One pass over the [T, H*D] projection: per-head norm + partial rope,
+            # written straight in the attention kernels' [T*H, D] row order.
+            q = _q_norm_rope(
+                q,
+                cos,
+                sin,
+                heads=self.num_heads,
+                head_dim=self.head_dim,
+                rope_head_dim=self.rope_head_dim,
+                normalize=True,
+                eps=self.norm_eps,
+                out_dtype=self.dtype,
+            )
+        else:
+            q = q.reshape(-1, self.num_heads, self.head_dim)
+            # V4 normalizes q again per head after wq_b, with no learned weight.
+            q = (
+                q.astype(jnp.float32)
+                * jax.lax.rsqrt(
+                    jnp.mean(jnp.square(q.astype(jnp.float32)), axis=-1, keepdims=True)
+                    + self.norm_eps
+                )
+            ).astype(self.dtype)
+            q = apply_dsv4_partial_rope(
+                q, cos[:, None, :], sin[:, None, :], rope_head_dim=self.rope_head_dim
+            ).astype(self.dtype)
         kv = apply_dsv4_partial_rope(kv, cos, sin, rope_head_dim=self.rope_head_dim).astype(
             self.dtype
         )
