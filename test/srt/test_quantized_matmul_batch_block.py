@@ -29,7 +29,8 @@ def _install_table(monkeypatch, x_dtype, seed_batch_block):
         blockwise_utils, "_get_blockwise_tuning_api", lambda: (TunedValue, None, table)
     )
     monkeypatch.setattr(blockwise_utils, "_get_current_tpu_version", lambda: 7)
-    monkeypatch.delenv("SGLANG_JAX_QMM_MIN_BATCH_BLOCK", raising=False)
+    # pin the floor off: the tests below assert the table's own choice first
+    monkeypatch.setenv("SGLANG_JAX_QMM_MIN_BATCH_BLOCK", "0")
 
 
 def _resolve(n_batch, x_dtype):
@@ -72,3 +73,26 @@ def test_min_batch_block_floor_is_read_at_call_time(monkeypatch):
     monkeypatch.setenv("SGLANG_JAX_QMM_MIN_BATCH_BLOCK", "512")
     assert _resolve(8192, jnp.bfloat16).batch_block_size == 512
     assert _resolve(256, jnp.bfloat16).batch_block_size == 64  # below the floor's batch
+
+
+def test_min_batch_block_default_is_512(monkeypatch):
+    _install_table(monkeypatch, jnp.bfloat16, 64)
+    monkeypatch.delenv("SGLANG_JAX_QMM_MIN_BATCH_BLOCK", raising=False)
+    assert _resolve(8192, jnp.bfloat16).batch_block_size == 512
+    assert _resolve(256, jnp.bfloat16).batch_block_size == 64  # below the floor's batch
+
+
+def test_min_batch_block_floor_only_changes_the_batch_tile(monkeypatch):
+    # The floor may only widen the row (batch) tile. The reduction tiles that
+    # decide the fp32 accumulation order of every output element stay the
+    # table's, so a floored call computes each row exactly as the unfloored one.
+    _install_table(monkeypatch, jnp.bfloat16, 64)
+    monkeypatch.setenv("SGLANG_JAX_QMM_MIN_BATCH_BLOCK", "0")
+    table = _resolve(8192, jnp.bfloat16)
+    monkeypatch.setenv("SGLANG_JAX_QMM_MIN_BATCH_BLOCK", "512")
+    floored = _resolve(8192, jnp.bfloat16)
+    assert floored.batch_block_size == 512 and table.batch_block_size == 64
+    assert (floored.out_block_size, floored.in_block_size) == (
+        table.out_block_size,
+        table.in_block_size,
+    )

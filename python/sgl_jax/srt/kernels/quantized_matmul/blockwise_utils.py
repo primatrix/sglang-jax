@@ -63,9 +63,10 @@ def _min_batch_block() -> int:
     local batch is at least that large. The tuning table has no bf16-activation rows
     for prefill-sized batches, and the nearest entry it borrows for (n_batch 8192,
     n_in 1024, bf16 x fp8) is batch_block 64: 128 grid steps of a 64-row matmul.
-    Opt-in: 0 (the default) keeps the table's choice; the DeepSeek V4 recipe sets 512.
+    Default 512 (the DeepSeek V4 prefill recipe); 0 keeps the table's choice. Only
+    batches of at least the floor are affected, so decode-sized calls are unchanged.
     Read at call time so tests and launchers can set it after import."""
-    return int(os.environ.get("SGLANG_JAX_QMM_MIN_BATCH_BLOCK", "0"))
+    return int(os.environ.get("SGLANG_JAX_QMM_MIN_BATCH_BLOCK", "512"))
 
 
 def get_blockwise_kernel():
