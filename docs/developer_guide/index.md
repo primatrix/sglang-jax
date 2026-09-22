@@ -15,3 +15,4 @@ For model-specific onboarding, use the [cookbook overview](../cookbook_overview.
 | [Release Process](release_process.md) | Release checklist. |
 | [TPU Resources Guide](tpu_resources_guide.md) | TPU access and usage notes. |
 | [How to Join Community](how_to_join_community.md) | Community channels and onboarding. |
+| [DeepSeek V4 TPU v7x Baseline](deepseek_v4_tpu_v7x_baseline.md) | How the DeepSeek-V4-Flash numbers on one TPU v7x 2x2x1 host are measured and reproduced. |

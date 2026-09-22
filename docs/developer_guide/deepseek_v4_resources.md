@@ -398,3 +398,7 @@ Full-model acceptance requires GPU/TPU module and layer comparisons and a real
 TPU serving check against a published static checkpoint. Check native-encoded
 greedy token IDs and normal EOS separately from long-context, concurrency and
 broad model-quality coverage.
+
+The launch flags, client parameters, pass rules and GSM8K gate behind the
+numbers quoted for the current head on one TPU v7x 2x2x1 host are described in
+[deepseek_v4_tpu_v7x_baseline.md](deepseek_v4_tpu_v7x_baseline.md).
