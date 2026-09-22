@@ -187,6 +187,9 @@ class ServerArgs:
 
     # Optimization/debug options
     disable_radix_cache: bool = False
+    enable_streaming_session: bool = False
+    streaming_session_timeout: float = 300.0
+    max_streaming_sessions: int = 128
     enable_unified_radix_tree: bool = False
 
     # HiCache (L1<->L2 KV cache offloading). hicache_storage: "disable" off,
@@ -1370,6 +1373,23 @@ class ServerArgs:
             help="Route non-hybrid (full-attention) models to UnifiedRadixCache "
             "(component-agnostic prefix cache). Default off. Also required to route "
             "hybrid recurrent models (e.g. Kimi-Linear) into UnifiedRadixCache.",
+        )
+        parser.add_argument(
+            "--enable-streaming-session",
+            action="store_true",
+            help="Enable V4 full-context sessions with radix cache disabled.",
+        )
+        parser.add_argument(
+            "--streaming-session-timeout",
+            type=float,
+            default=300.0,
+            help="Idle session TTL in seconds.",
+        )
+        parser.add_argument(
+            "--max-streaming-sessions",
+            type=int,
+            default=128,
+            help="Maximum sessions; idle sessions are evicted LRU.",
         )
         parser.add_argument(
             "--hicache-storage",

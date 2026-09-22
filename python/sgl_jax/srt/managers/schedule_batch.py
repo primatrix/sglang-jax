@@ -211,6 +211,9 @@ class Req:
     ):
         # Input and output info
         self.rid = rid
+        self.session_id: str | None = None
+        self.session_restored = False
+        self.session_reserved_sizes: tuple[int, int] = (0, 0)
         self.origin_input_text = origin_input_text
 
         self.origin_input_ids_unpadded = (

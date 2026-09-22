@@ -444,6 +444,7 @@ class TokenizerManager:
         # Build return object
 
         tokenized_obj = TokenizedGenerateReqInput(
+            session_params=obj.session_params,
             rid=obj.rid,
             text=input_text,
             input_ids=input_ids,
@@ -877,6 +878,8 @@ class TokenizerManager:
         await self.resume_memory_occupation_communicator(obj)
 
     async def open_session(self, obj: OpenSessionReqInput, request: fastapi.Request | None = None):
+        if not self.server_args.enable_streaming_session:
+            raise ValueError("Start the server with --enable-streaming-session")
         self.auto_create_handle_loop()
 
         if obj.session_id is None:
@@ -884,12 +887,12 @@ class TokenizerManager:
         elif obj.session_id in self.session_futures:
             return None
 
-        self.send_to_scheduler.send_pyobj(obj)
-
         self.session_futures[obj.session_id] = asyncio.Future()
-        session_id = await self.session_futures[obj.session_id]
-        del self.session_futures[obj.session_id]
-        return session_id
+        try:
+            await self.send_to_scheduler.send_pyobj(obj)
+            return await asyncio.wait_for(self.session_futures[obj.session_id], timeout=30)
+        finally:
+            self.session_futures.pop(obj.session_id, None)
 
     async def close_session(
         self, obj: CloseSessionReqInput, request: fastapi.Request | None = None
@@ -1424,9 +1427,9 @@ class TokenizerManager:
         state.event.set()
 
     def _handle_open_session_req_output(self, recv_obj):
-        self.session_futures[recv_obj.session_id].set_result(
-            recv_obj.session_id if recv_obj.success else None
-        )
+        future = self.session_futures.get(recv_obj.session_id)
+        if future is not None and not future.done():
+            future.set_result(recv_obj.session_id if recv_obj.success else None)
 
     async def score_request(
         self,
