@@ -34,8 +34,9 @@ def _interpret_pallas() -> bool:
 
 
 def _project_xla_enabled() -> bool:
-    """``DSV4_HCA_PROJECT_XLA=1``: run the HCA state projection as an XLA dot (opt-in)."""
-    return os.environ.get("DSV4_HCA_PROJECT_XLA", "0") == "1"
+    """Run the HCA state projection as an XLA dot (default). ``DSV4_HCA_PROJECT_XLA=0``
+    selects the in-kernel projection instead."""
+    return os.environ.get("DSV4_HCA_PROJECT_XLA", "1") == "1"
 
 
 def _projection_tile_k(hidden: int, schedule: HCAKernelSchedule) -> int:
