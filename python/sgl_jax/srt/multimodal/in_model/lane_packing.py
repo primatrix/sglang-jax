@@ -422,14 +422,19 @@ def mrope_vision_dummy_inputs(
         }
     )
     for capacity in capacities:
+        if spec.rope_type == "rope_2d_packed":
+            y, x = np.indices((merge_size, capacity // merge_size), dtype=np.int32)
+            model_specific_data = {"pixel_position_ids": np.stack((x, y), axis=-1).reshape(-1, 2)}
+        else:
+            model_specific_data = {
+                ("video_grid_thw" if modality == Modality.VIDEO else "image_grid_thw"): np.asarray(
+                    (1, merge_size, capacity // merge_size), dtype=np.int32
+                ),
+            }
         item = MultimodalDataItem(
             modality=modality,
             feature=np.zeros((capacity, spec.patch_dim), dtype=spec.dtype),
             placeholder_ranges=[(0, capacity // merge_unit)],
-            model_specific_data={
-                ("video_grid_thw" if modality == Modality.VIDEO else "image_grid_thw"): np.asarray(
-                    (1, merge_size, capacity // merge_size), dtype=np.int32
-                ),
-            },
+            model_specific_data=model_specific_data,
         )
         yield modality, [[item]] + [[] for _ in range(num_lanes - 1)]

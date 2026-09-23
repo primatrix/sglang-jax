@@ -139,10 +139,10 @@ def test_merge_keeps_request_offsets_and_deepstack_sharding(dp):
     )
     expected = np.full(4 * dp, -1.0)
     expected[[1, 2]] = [10, 20]
-    np.testing.assert_array_equal(result[:, 0], expected)
+    np.testing.assert_array_equal(np.asarray(result)[:, 0], expected)
     expected_deepstack = np.zeros(4 * dp)
     expected_deepstack[[1, 2]] = [11, 21]
-    np.testing.assert_array_equal(deepstack[0, :, 0], expected_deepstack)
+    np.testing.assert_array_equal(np.asarray(deepstack)[0, :, 0], expected_deepstack)
     assert result.sharding.spec == PartitionSpec("data", None)
     assert deepstack.sharding.spec == PartitionSpec(None, "data", None)
     assert enabled and model.calls == 1
@@ -351,3 +351,45 @@ def test_retracted_prefill_continues_mrope_positions_past_prompt():
         result["mrope_positions"],
         [[30, 31, 3, 4, 5], [40, 41, 3, 4, 5], [50, 51, 3, 4, 5]],
     )
+
+
+@pytest.mark.parametrize("merge_size", [2, 3])
+def test_gemma4_vision_lane_inputs_and_warmup(monkeypatch, merge_size):
+    from sgl_jax.srt.configs.gemma4 import Gemma4VisionConfig
+    from sgl_jax.srt.models.gemma4 import Gemma4ForCausalLM, Gemma4ForConditionalGeneration
+
+    # Exercise the real vision tower without allocating the language decoder.
+    def init_text(self, config, mesh, dtype):
+        self.config = config.text_config
+        self.mesh = mesh
+        self.dtype = dtype
+
+    monkeypatch.setattr(Gemma4ForCausalLM, "__init__", init_text)
+    mesh = _mesh(dp=2)
+    config = SimpleNamespace(
+        text_config=SimpleNamespace(hidden_size=8),
+        vision_config=Gemma4VisionConfig(
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=0,
+            patch_size=2,
+            pooling_kernel_size=merge_size,
+            position_embedding_size=32,
+        ),
+    )
+    with jax.set_mesh(mesh):
+        model = Gemma4ForConditionalGeneration(config, mesh, jnp.float32)
+    merge_unit = merge_size**2
+    paddings = [merge_unit, 2 * merge_unit]
+    capacities = orchestration.precompile_multimodal_encoder(
+        model, num_lanes=2, patch_paddings=paddings
+    )
+    assert capacities == (2, 4)
+    _, lanes = next(mrope_vision_dummy_inputs(model.vision_input_spec, [merge_unit], num_lanes=2))
+    item = lanes[0][0]
+    item.feature[:] = np.arange(item.feature.size).reshape(item.feature.shape)
+    first_lane = np.asarray(model.get_image_feature(lanes))
+    second_lane = np.asarray(model.get_image_feature([[], [item]]))
+    np.testing.assert_allclose(first_lane, second_lane)
+    assert np.isfinite(first_lane).all()
+    np.testing.assert_array_equal(first_lane[1:], 0)

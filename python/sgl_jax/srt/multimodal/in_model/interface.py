@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from typing import Literal
 
 import jax
 import numpy as np
@@ -33,6 +34,7 @@ class VisionInputSpec:
     patch_dim: int
     spatial_merge_size: int
     dtype: np.dtype = np.dtype("float32")
+    rope_type: Literal["rope_3d", "rope_2d", "rope_2d_packed"] = "rope_3d"
 
 
 class InModelMultimodalContract(ABC):
