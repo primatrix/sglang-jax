@@ -12,6 +12,7 @@ from typing import Any
 
 import huggingface_hub
 import jax
+import jax.numpy as jnp
 from flax import nnx
 from safetensors import safe_open
 
@@ -29,6 +30,12 @@ class BaseModelLoader(ABC):
 
     def __init__(self, load_config: LoadConfig):
         self.load_config = load_config
+
+    def _initialize_model(self, model_config: ModelConfig) -> Any:
+        if not isinstance(model_config, ModelConfig) or self.load_config.model_class is not None:
+            return getattr(model_config, "model_class", None) or self.load_config.model_class
+        model_class, _ = get_model_architecture(model_config)
+        return model_class
 
     @abstractmethod
     def download_model(self, model_config: ModelConfig) -> None:
@@ -261,15 +268,7 @@ class JAXModelLoader(DefaultModelLoader):
         return jit_model
 
     def _initialize_model(self, model_config: ModelConfig) -> Any:
-        if not isinstance(model_config, ModelConfig) or self.load_config.model_class is not None:
-            model_class = (
-                model_config.model_class
-                if hasattr(model_config, "model_class") and model_config.model_class is not None
-                else self.load_config.model_class
-            )
-        else:
-            model_class, _ = get_model_architecture(model_config)
-
+        model_class = super()._initialize_model(model_config)
         if not hasattr(model_class, "load_weights"):
             raise ValueError(
                 f"Model class {model_class.__name__} does not support weights loading. "
@@ -323,7 +322,7 @@ class JAXModelLoader(DefaultModelLoader):
 
 
 class JAXDummyModelLoader(BaseModelLoader):
-    """Model loader that will set model weights to random values for JAX models."""
+    """Initialize dummy JAX weights without downloading a checkpoint."""
 
     def __init__(self, load_config: LoadConfig, mesh: jax.sharding.Mesh):
         super().__init__(load_config)
@@ -338,10 +337,33 @@ class JAXDummyModelLoader(BaseModelLoader):
         # Nothing to download for dummy loader
         return None
 
-    def _initialize_model(self, model_config: ModelConfig) -> Any:
-        # Do not require a load_weights method for dummy loader
-        model_class, _ = get_model_architecture(model_config)
-        return model_class
+    def _materialize_model(self, model: nnx.Module) -> None:
+        # eval_shape retains the parameter specs but replaces physical meshes
+        # with AbstractMesh. Recover the concrete meshes from the model graph,
+        # including expert meshes whose axes differ from the language-model mesh.
+        meshes = {tuple(self.mesh.shape.items()): self.mesh}
+        for _, value in nnx.iter_graph(model):
+            if isinstance(value, jax.sharding.Mesh):
+                meshes[tuple(value.shape.items())] = value
+
+        def materialize(value):
+            if not isinstance(value, jax.ShapeDtypeStruct):
+                return value
+            sharding = value.sharding
+            if isinstance(sharding, jax.sharding.NamedSharding):
+                if isinstance(sharding.mesh, jax.sharding.AbstractMesh):
+                    key = tuple(sharding.mesh.shape.items())
+                    if key not in meshes:
+                        raise ValueError(
+                            f"No concrete mesh for dummy parameter sharding {sharding}"
+                        )
+                    sharding = jax.sharding.NamedSharding(meshes[key], sharding.spec)
+            else:
+                sharding = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
+            # Device-side constants avoid staging full model weights on the host.
+            return jax.jit(lambda: jnp.zeros(value.shape, value.dtype), out_shardings=sharding)()
+
+        nnx.update(model, jax.tree.map(materialize, nnx.state(model)))
 
     def load_model(
         self,
@@ -349,18 +371,26 @@ class JAXDummyModelLoader(BaseModelLoader):
         model_config: ModelConfig,
     ) -> Any:
         model_class = self._initialize_model(model_config)
+        config = model_config.hf_config if isinstance(model_config, ModelConfig) else model_config
 
         kwargs = {"dtype": model_config.dtype, "mesh": self.mesh}
         if "dtype_config" in inspect.signature(model_class.__init__).parameters:
             kwargs["dtype_config"] = getattr(model_config, "dtype_config", None)
 
         with jax.set_mesh(self.mesh):
-            model = nnx.eval_shape(lambda: model_class(model_config.hf_config, **kwargs))
+            model = nnx.eval_shape(lambda: model_class(config, **kwargs))
 
-        # Use model's load_weights with dummy mode to ensure correct sharding
-        # Set a marker in model_config to indicate dummy mode
-        model_config._dummy_mode = True
-        model.load_weights(model_config)
+        from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
+
+        if isinstance(model, InModelMultimodalContract):
+            # VLM constructors declare both towers, including fused parameters.
+            # Dummy loading must not depend on checkpoint-specific model code.
+            self._materialize_model(model)
+        else:
+            # Legacy loaders also perform required post-load transformations
+            # (e.g. absorbed MLA); retain that contract for existing models.
+            model_config._dummy_mode = True
+            model.load_weights(model_config)
 
         return model
 

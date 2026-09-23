@@ -38,6 +38,13 @@ class VisionInputSpec:
 
 
 class InModelMultimodalContract(ABC):
+    """A VLM whose constructor declares the complete inference state.
+
+    Declare parameter shapes, dtypes, and shardings for both language and encoder
+    modules during construction. The common dummy loader materializes this state
+    directly without calling the checkpoint-specific ``load_weights`` method.
+    """
+
     mesh: Mesh | None = None
 
     deepstack_visual_layers: int = 0

@@ -22,7 +22,7 @@ class VitModelRunner(BaseModelRunner):
     ):
         self.mesh = mesh
         self.model_loader = get_model_loader(
-            load_config=LoadConfig(model_class=model_class),
+            load_config=LoadConfig(load_format=server_args.load_format, model_class=model_class),
             mesh=self.mesh,
         )
         self.model_class = model_class
